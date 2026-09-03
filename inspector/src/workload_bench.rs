@@ -85,6 +85,13 @@ pub(crate) struct WorkloadBenchCommand {
     #[arg(long)]
     host_tcp_echo_port: Option<u16>,
 
+    /// Record a workload that fails as a `failure` record and go on to the
+    /// next one, instead of ending the run at the first failure. The
+    /// benchmark suite runs this way so every cell of its report is
+    /// accounted for; the exit status stays zero and the JSONL is the record.
+    #[arg(long)]
+    pub(crate) keep_going: bool,
+
     /// Write folded kernel/user profile samples collected during the workload run.
     #[arg(long)]
     pub(crate) profile_output: Option<PathBuf>,
@@ -210,6 +217,16 @@ enum JsonlRecord<'a> {
         stderr: StreamValidation<'a>,
         validation: ValidationSummary,
     },
+    /// A workload that did not produce a summary: how far it got is in
+    /// the iteration records before this one, and `error` says why it
+    /// stopped. Written only under `--keep-going`.
+    Failure {
+        workload: &'a str,
+        class: WorkloadClass,
+        headline: bool,
+        runner: WorkloadRunner,
+        error: String,
+    },
     Summary {
         workload: &'a str,
         class: WorkloadClass,
@@ -277,64 +294,27 @@ pub(crate) async fn run_inner(
         selected_workloads,
     })?;
 
+    let mut failed = Vec::new();
     for workload in workloads {
-        let mut elapsed_ms = Vec::new();
-        for iteration in 1..=command.iterations {
-            let output = match workload.runner {
-                WorkloadRunner::Shell => {
-                    under_deadline(
-                        &workload,
-                        iteration,
-                        command,
-                        run_shell_workload(client, &workload, command),
-                    )
-                    .await?
-                }
-                WorkloadRunner::Program => {
-                    under_deadline(
-                        &workload,
-                        iteration,
-                        command,
-                        run_program_workload(client, &workload, command),
-                    )
-                    .await?
-                }
-                WorkloadRunner::HeliosAot => {
-                    under_deadline(
-                        &workload,
-                        iteration,
-                        command,
-                        run_aot_workload(client, &workload, iteration),
-                    )
-                    .await?
-                }
-            };
-            let validation = validate_output(&workload, &output.stdout, &output.stderr)
-                .with_context(|| {
-                    format!(
-                        "workload {} iteration {} failed validation",
-                        workload.name, iteration
-                    )
+        let elapsed_ms = match measure_workload(client, &workload, command).await {
+            Ok(elapsed_ms) => elapsed_ms,
+            Err(error) if command.keep_going => {
+                eprintln!(
+                    "helios-inspector: workload {} failed; recorded and continuing: {error:#}",
+                    workload.name
+                );
+                write_record(&JsonlRecord::Failure {
+                    workload: &workload.name,
+                    class: workload.class,
+                    headline: workload.headline,
+                    runner: workload.runner,
+                    error: format!("{error:#}"),
                 })?;
-            elapsed_ms.push(output.elapsed_ms);
-            write_record(&JsonlRecord::Iteration {
-                workload: &workload.name,
-                class: workload.class,
-                headline: workload.headline,
-                runner: workload.runner,
-                iteration,
-                elapsed_ms: output.elapsed_ms,
-                metrics: parse_metrics(&output.stdout)?,
-                throughput_bytes: workload.throughput_bytes,
-                throughput_mib_per_second: throughput_mib_per_second(
-                    workload.throughput_bytes,
-                    output.elapsed_ms,
-                ),
-                stdout: stream_validation(&workload, &output.stdout, false),
-                stderr: stream_validation(&workload, &output.stderr, workload.stderr_empty),
-                validation,
-            })?;
-        }
+                failed.push(workload.name.clone());
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         let median = median(&elapsed_ms)?;
         write_record(&JsonlRecord::Summary {
             workload: &workload.name,
@@ -349,7 +329,80 @@ pub(crate) async fn run_inner(
             validation: ValidationSummary { ok: true },
         })?;
     }
+    if !failed.is_empty() {
+        eprintln!(
+            "helios-inspector: {} workload(s) recorded as failed: {}",
+            failed.len(),
+            failed.join(", ")
+        );
+    }
     Ok(())
+}
+
+/// Times every iteration of one workload, writing its iteration records.
+async fn measure_workload(
+    client: &mut crate::serial::RpcClient,
+    workload: &Workload,
+    command: &WorkloadBenchCommand,
+) -> Result<Vec<u128>> {
+    let mut elapsed_ms = Vec::new();
+    for iteration in 1..=command.iterations {
+        let output = match workload.runner {
+            WorkloadRunner::Shell => {
+                under_deadline(
+                    workload,
+                    iteration,
+                    command,
+                    run_shell_workload(client, workload, command),
+                )
+                .await?
+            }
+            WorkloadRunner::Program => {
+                under_deadline(
+                    workload,
+                    iteration,
+                    command,
+                    run_program_workload(client, workload, command),
+                )
+                .await?
+            }
+            WorkloadRunner::HeliosAot => {
+                under_deadline(
+                    workload,
+                    iteration,
+                    command,
+                    run_aot_workload(client, workload, iteration),
+                )
+                .await?
+            }
+        };
+        let validation =
+            validate_output(workload, &output.stdout, &output.stderr).with_context(|| {
+                format!(
+                    "workload {} iteration {} failed validation",
+                    workload.name, iteration
+                )
+            })?;
+        elapsed_ms.push(output.elapsed_ms);
+        write_record(&JsonlRecord::Iteration {
+            workload: &workload.name,
+            class: workload.class,
+            headline: workload.headline,
+            runner: workload.runner,
+            iteration,
+            elapsed_ms: output.elapsed_ms,
+            metrics: parse_metrics(&output.stdout)?,
+            throughput_bytes: workload.throughput_bytes,
+            throughput_mib_per_second: throughput_mib_per_second(
+                workload.throughput_bytes,
+                output.elapsed_ms,
+            ),
+            stdout: stream_validation(workload, &output.stdout, false),
+            stderr: stream_validation(workload, &output.stderr, workload.stderr_empty),
+            validation,
+        })?;
+    }
+    Ok(elapsed_ms)
 }
 
 #[derive(Debug)]
@@ -855,6 +908,7 @@ mod tests {
             host_tcp_host: None,
             host_tcp_port: None,
             host_tcp_echo_port: None,
+            keep_going: false,
             profile_output: None,
             kernel_profile_output: None,
             user_profile_output: None,
@@ -916,6 +970,7 @@ mod tests {
             host_tcp_host: None,
             host_tcp_port: None,
             host_tcp_echo_port: None,
+            keep_going: false,
             profile_output: None,
             kernel_profile_output: None,
             user_profile_output: None,
@@ -944,6 +999,7 @@ mod tests {
             host_tcp_host: None,
             host_tcp_port: None,
             host_tcp_echo_port: None,
+            keep_going: false,
             profile_output: None,
             kernel_profile_output: None,
             user_profile_output: None,

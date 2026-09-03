@@ -113,6 +113,9 @@ def plan(options: RunOptions, manifest: Manifest, workloads: list[dict]) -> list
         "--iterations",
         str(iterations),
         "--control",
+        # Every cell of the report is accounted for: a workload that fails
+        # is recorded as failed on that side and the run goes on.
+        "--keep-going",
         "--helios-host-http-host",
         lane.net_host,
         "--helios-host-tcp-host",

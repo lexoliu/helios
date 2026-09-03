@@ -128,6 +128,9 @@ fi
 if [[ -n "${HELIOS_WORKLOAD_BENCH_HOST_TCP_ECHO_PORT:-}" ]]; then
     command+=(--host-tcp-echo-port "${HELIOS_WORKLOAD_BENCH_HOST_TCP_ECHO_PORT}")
 fi
+if [[ "${HELIOS_WORKLOAD_BENCH_KEEP_GOING:-0}" == "1" ]]; then
+    command+=(--keep-going)
+fi
 
 if [[ -n "${HELIOS_WORKLOAD_BENCH_PROFILE_OUTPUT:-}" ]]; then
     command+=(--profile-output "${HELIOS_WORKLOAD_BENCH_PROFILE_OUTPUT}")

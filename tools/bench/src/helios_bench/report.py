@@ -150,6 +150,10 @@ class WorkloadResult(BaseModel):
     description: str
     throughput_bytes: int | None
     cells: dict[Side, Cell]
+    failures: dict[Side, str] = Field(
+        default_factory=dict,
+        description="sides that could not measure this workload, with the harness's reason",
+    )
     comparisons: list[Comparison]
     parity_bug: bool = Field(
         description="compute-class workload where Helios is significantly slower than Linux + Wasmtime"

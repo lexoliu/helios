@@ -1184,6 +1184,7 @@ def runner_command(
     output_name: str,
     side: str,
     wasmtime_bin: str | None = None,
+    keep_going: bool = False,
 ) -> str:
     command = [
         "python3",
@@ -1208,6 +1209,8 @@ def runner_command(
     )
     for workload in workloads:
         command.extend(["--workload", workload["name"]])
+    if keep_going:
+        command.append("--keep-going")
     if host_http_url:
         command.extend(["--host-http-url", host_http_url])
     if host_tcp_host and host_tcp_port is not None:
@@ -1282,6 +1285,7 @@ def run_fedora_qemu_linux(
     accel: str | None = None,
     native_bin_dir: Path | None = None,
     control_workload: dict | None = None,
+    keep_going: bool = False,
 ) -> tuple[Path | None, Path | None, dict]:
     guest_arch = guest_arch or host_arch()
     accel = accel or default_accel(guest_arch)
@@ -1419,6 +1423,7 @@ def run_fedora_qemu_linux(
                     output_name,
                     side,
                     bin_path,
+                    keep_going,
                 ),
                 timeout=setup_timeout_seconds,
             )

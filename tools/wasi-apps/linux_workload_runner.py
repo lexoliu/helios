@@ -294,6 +294,10 @@ def validate_output(workload: dict, stdout: bytes, stderr: bytes) -> None:
         raise SystemExit(f"workload {workload['name']} wrote stderr")
 
 
+class WorkloadFailed(Exception):
+    """One workload could not be measured; the message says why."""
+
+
 def run_once(workload: dict, argv: list[str], env: dict[str, str]) -> tuple[float, dict[str, float]]:
     """Runs one iteration and returns the child's wall time in milliseconds."""
     started = time.perf_counter_ns()
@@ -302,7 +306,7 @@ def run_once(workload: dict, argv: list[str], env: dict[str, str]) -> tuple[floa
     if completed.returncode != 0:
         sys.stdout.buffer.write(completed.stdout)
         sys.stderr.buffer.write(completed.stderr)
-        raise SystemExit(f"workload {workload['name']} exited with code {completed.returncode}")
+        raise WorkloadFailed(f"workload {workload['name']} exited with code {completed.returncode}")
     validate_output(workload, completed.stdout, completed.stderr)
     metrics = parse_metrics(completed.stdout.decode("utf-8", errors="replace"), workload["name"])
     return elapsed_ms, metrics
@@ -322,6 +326,7 @@ def run_workloads(
     iterations: int,
     context: RenderContext,
     output: Path,
+    keep_going: bool,
 ) -> None:
     manifest = load_manifest(manifest_path)
     env = os.environ.copy()
@@ -345,8 +350,15 @@ def run_workloads(
             workload = selected_workload(manifest, name)
             argv = counterpart_command(workload, side, context)
             elapsed: list[float] = []
+            failure: str | None = None
             for iteration in range(1, iterations + 1):
-                elapsed_ms, metrics = run_once(workload, argv, env)
+                try:
+                    elapsed_ms, metrics = run_once(workload, argv, env)
+                except WorkloadFailed as error:
+                    if not keep_going:
+                        raise SystemExit(str(error)) from error
+                    failure = str(error)
+                    break
                 elapsed.append(elapsed_ms)
                 handle.write(
                     json.dumps(
@@ -365,6 +377,23 @@ def run_workloads(
                     + "\n"
                 )
                 handle.flush()
+            if failure is not None:
+                print(f"{failure}; recorded and continuing", file=sys.stderr)
+                handle.write(
+                    json.dumps(
+                        {
+                            "type": "failure",
+                            "workload": name,
+                            "class": workload["class"],
+                            "headline": workload.get("headline", False),
+                            "side": side,
+                            "error": failure,
+                        }
+                    )
+                    + "\n"
+                )
+                handle.flush()
+                continue
             handle.write(
                 json.dumps(
                     {
@@ -409,6 +438,11 @@ def main() -> None:
     run_parser.add_argument("--host-tcp-host")
     run_parser.add_argument("--host-tcp-port", type=int)
     run_parser.add_argument("--host-tcp-echo-port", type=int)
+    run_parser.add_argument(
+        "--keep-going",
+        action="store_true",
+        help="record a workload that fails as a failure record and continue with the next one",
+    )
 
     precompile_parser = subcommands.add_parser("precompile")
     precompile_parser.add_argument("--workload", dest="workloads", action="append", default=[])
@@ -427,7 +461,9 @@ def main() -> None:
             hosts=HostEndpoints(args.host_http_url, args.host_tcp_host, args.host_tcp_port, args.host_tcp_echo_port),
             workdir=Path(tempfile.mkdtemp(prefix="helios-bench-")),
         )
-        run_workloads(args.manifest, args.workloads, args.side, args.iterations, context, args.out)
+        run_workloads(
+            args.manifest, args.workloads, args.side, args.iterations, context, args.out, args.keep_going
+        )
     elif args.command == "precompile":
         precompile(args.manifest, args.workloads, args.wasmtime_bin, root)
     else:

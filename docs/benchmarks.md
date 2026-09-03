@@ -98,6 +98,13 @@ Per cell (workload × side), `iterations` executions (11 by default):
   be recomputed from its raw iterations.
 - A warm series whose CV exceeds `cv_bound` (0.15) is **rejected**: it is
   printed with a marker, excluded from comparisons and from the gate.
+- A workload a side could not measure at all is a **failed** cell, not a
+  missing one: every harness runs with `--keep-going`, records the
+  failure and its reason, and goes on to the next workload, so a report
+  accounts for every cell of the matrix. A failed cell takes part in no
+  comparison and the reason is printed under the class table. A run
+  that dies outright (the guest never boots, the harness is killed) still
+  fails the lane.
 - Machine noise is measured, not assumed: the `control_workload`
   (`quickjs-loop`) runs before and after the suite on every side, and the
   **noise floor** is the larger of the control's median drift and its CV.

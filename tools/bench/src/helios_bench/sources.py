@@ -1,8 +1,11 @@
 """Readers for the raw JSONL the two harness sides write.
 
 Both the inspector's ``workload-bench`` (Helios) and
-``linux_workload_runner.py`` (both Linux sides) write ``iteration`` and
-``summary`` records with the same fields, so one reader serves every side.
+``linux_workload_runner.py`` (both Linux sides) write ``iteration``,
+``summary`` and ``failure`` records with the same fields, so one reader
+serves every side. A ``failure`` record names a workload the side could
+not measure and why; the report carries it as a failed cell rather than
+a missing one.
 """
 
 from __future__ import annotations
@@ -29,6 +32,7 @@ SIDE_CONTROL_JSONL = {
 @dataclass
 class RawCell:
     iterations: list[Iteration] = field(default_factory=list)
+    failure: str | None = None
 
 
 @dataclass
@@ -58,6 +62,9 @@ def read_side_jsonl(path: Path, warmup_discard: int) -> RawSide:
                         metrics={name: float(value) for name, value in record.get("metrics", {}).items()},
                     )
                 )
+            elif record["type"] == "failure":
+                cell = cells.setdefault(record["workload"], RawCell())
+                cell.failure = str(record["error"])
     if not run:
         raise SystemExit(f"{path}: no run record")
     return RawSide(run=run, cells=cells)

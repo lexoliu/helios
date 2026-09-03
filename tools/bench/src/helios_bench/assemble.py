@@ -74,6 +74,7 @@ def build_workload(
     workload: dict,
     cells: dict[Side, Cell],
     floor: float,
+    failures: dict[Side, str] | None = None,
 ) -> WorkloadResult:
     comparisons = []
     parity_bug = False
@@ -100,6 +101,7 @@ def build_workload(
         description=workload["description"],
         throughput_bytes=workload.get("throughput_bytes"),
         cells=cells,
+        failures=failures or {},
         comparisons=comparisons,
         parity_bug=parity_bug,
     )
@@ -138,14 +140,18 @@ def assemble_report(
     results = []
     for workload in workloads:
         cells: dict[Side, Cell] = {}
+        failures: dict[Side, str] = {}
         for side, raw in sides.items():
             raw_cell = raw.cells.get(workload["name"])
             if raw_cell is None:
                 continue
+            if raw_cell.failure is not None:
+                failures[side] = raw_cell.failure
+                continue
             cells[side] = build_cell(side, raw_cell.iterations, thresholds)
-        if not cells:
+        if not cells and not failures:
             continue
-        results.append(build_workload(workload, cells, floor))
+        results.append(build_workload(workload, cells, floor, failures))
     return Report(
         run=run,
         hardware=hardware,

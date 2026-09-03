@@ -345,6 +345,7 @@ def run_helios(
     host_tcp_echo_port: int | None,
     timeout_seconds: int,
     control_workload: dict | None,
+    keep_going: bool,
 ) -> Path:
     log = out_dir / "helios.jsonl"
     workloads_by_class: dict[str, list[str]] = {}
@@ -369,6 +370,7 @@ def run_helios(
             host_tcp_port,
             host_tcp_echo_port,
             timeout_seconds,
+            keep_going,
         )
 
     run_control("before")
@@ -389,6 +391,7 @@ def run_helios(
                 host_tcp_port,
                 host_tcp_echo_port,
                 timeout_seconds,
+                keep_going,
             )
             class_logs.append(class_log)
         with log.open("w", encoding="utf-8") as output_handle:
@@ -409,6 +412,7 @@ def run_helios(
         host_tcp_port,
         host_tcp_echo_port,
         timeout_seconds,
+        keep_going,
     )
     run_control("after")
     return log
@@ -426,6 +430,7 @@ def run_helios_once(
     host_tcp_port: int | None,
     host_tcp_echo_port: int | None,
     timeout_seconds: int,
+    keep_going: bool,
 ) -> None:
     env = os.environ.copy()
     env["HELIOS_WORKLOAD_BENCH_ARCH"] = arch
@@ -453,6 +458,8 @@ def run_helios_once(
         env["HELIOS_WORKLOAD_BENCH_HOST_TCP_PORT"] = str(host_tcp_port)
     if host_tcp_echo_port is not None:
         env["HELIOS_WORKLOAD_BENCH_HOST_TCP_ECHO_PORT"] = str(host_tcp_echo_port)
+    if keep_going:
+        env["HELIOS_WORKLOAD_BENCH_KEEP_GOING"] = "1"
     run_isolated(["tools/wasi-apps/workload-bench.sh"], env=env, timeout_seconds=timeout_seconds)
 
 
@@ -481,6 +488,7 @@ def run_linux(
     accel: str | None,
     native_bin_dir: Path | None,
     control_workload: dict | None,
+    keep_going: bool,
 ) -> tuple[Path | None, Path | None, dict]:
     return run_fedora_qemu_linux(
         repo_root(),
@@ -507,6 +515,7 @@ def run_linux(
         accel=accel,
         native_bin_dir=native_bin_dir,
         control_workload=control_workload,
+        keep_going=keep_going,
     )
 
 
@@ -1574,6 +1583,11 @@ def main() -> None:
         action="store_true",
         help="Run the manifest's control_workload before and after the suite on every side to measure machine noise.",
     )
+    parser.add_argument(
+        "--keep-going",
+        action="store_true",
+        help="record a workload that fails and continue with the next one, on every side",
+    )
     parser.add_argument("--skip-helios", action="store_true")
     parser.add_argument("--skip-linux", action="store_true")
     parser.add_argument("--wasmtime-profile-workload", action="append", default=[])
@@ -1709,6 +1723,7 @@ def main() -> None:
                 host_tcp_echo_port,
                 args.helios_timeout_seconds,
                 control_workload,
+                args.keep_going,
             )
         if not args.skip_linux:
             linux_json, wasmtime_linux_json, linux_provenance = run_linux(
@@ -1736,6 +1751,7 @@ def main() -> None:
                 args.linux_vm_accel,
                 args.native_bin_dir,
                 control_workload,
+                args.keep_going,
             )
         if args.wasmtime_profile_workload:
             wasmtime_profiles = run_wasmtime_profiles(

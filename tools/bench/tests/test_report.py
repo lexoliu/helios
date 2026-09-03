@@ -48,3 +48,35 @@ def test_grouping_helpers(baseline_report: Report) -> None:
     ]
     assert baseline_report.control is not None
     assert 0.0 < baseline_report.control.noise_floor < 0.1
+
+
+def test_failure_records_become_failed_cells(tmp_path, baseline_report: Report) -> None:
+    from helios_bench.assemble import build_workload
+    from helios_bench.render import render_tables
+    from helios_bench.report import Side, WorkloadClass, WorkloadResult
+    from helios_bench.sources import read_side_jsonl
+
+    path = tmp_path / "helios.jsonl"
+    path.write_text(
+        '{"type": "run"}\n'
+        '{"type": "failure", "workload": "tcp-throughput", "class": "net", "headline": true,'
+        ' "error": "TcpErrorKind::Timeout: TCP read timed out"}\n',
+        encoding="utf-8",
+    )
+    raw = read_side_jsonl(path, warmup_discard=1)
+    assert raw.cells["tcp-throughput"].failure == "TcpErrorKind::Timeout: TCP read timed out"
+    assert raw.cells["tcp-throughput"].iterations == []
+
+    workload = build_workload(
+        {"name": "tcp-throughput", "class": "net", "headline": True, "description": "TCP stream"},
+        {},
+        0.0,
+        {Side.HELIOS: raw.cells["tcp-throughput"].failure},
+    )
+    assert isinstance(workload, WorkloadResult)
+    assert workload.workload_class is WorkloadClass.NET
+    assert workload.comparisons == []
+    report = baseline_report.model_copy(update={"workloads": [*baseline_report.workloads, workload]})
+    text = render_tables(report)
+    assert "| `tcp-throughput` (headline) | **failed** | n/a | n/a | n/a | n/a |" in text
+    assert "`tcp-throughput` failed on Helios: TcpErrorKind::Timeout: TCP read timed out" in text
