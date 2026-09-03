@@ -169,6 +169,18 @@ pub trait VirtioTransport: Send + Sync + 'static {
     fn device_features(&self) -> u64;
     fn set_driver_features(&self, features: u64);
     fn queue_max_size(&self, index: u16) -> u16;
+
+    /// How many virtqueues the device states it presents, where the
+    /// transport has a register that says so.
+    ///
+    /// This is the device's own count, independent of any class-specific
+    /// configuration field a driver derives a queue layout from. When
+    /// the two disagree the driver is about to program queues that are
+    /// not there, and this is the only value that can tell it so. The
+    /// MMIO register layout defines no such field.
+    fn presented_queue_count(&self) -> Option<u16> {
+        None
+    }
     fn set_queue(
         &self,
         index: u16,

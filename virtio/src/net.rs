@@ -781,13 +781,27 @@ impl RxBufferSlot {
     }
 }
 
+/// A virtio feature word, printed the way the specification numbers
+/// its bits.
+struct FeatureWord(u64);
+
+impl core::fmt::Debug for FeatureWord {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(formatter, "{:#018x}", self.0)
+    }
+}
+
 impl<T: VirtioTransport> VirtioNetDevice<T> {
     pub fn new(transport: T) -> IoResult<Self> {
         if transport.device_type() != DeviceType::Network {
             return Err(IoError::Unsupported);
         }
 
+        // The device's own offer, kept so bring-up can report what was
+        // on the table next to what the driver took.
+        let offered_features = core::cell::Cell::new(0_u64);
         let features = negotiate_with(&transport, |offered| {
+            offered_features.set(offered);
             // Only ask for MQ together with CTRL_VQ — without the
             // control queue there is no way to enable additional pairs
             // beyond the default single pair.
@@ -942,6 +956,29 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         } else {
             1
         };
+
+        // One record, before the first queue is programmed, holding
+        // everything a bring-up failure is diagnosed from: what the
+        // device offered, what the driver took, the queue layout the
+        // class configuration implies, the count the transport itself
+        // reports, and the size the device gives at every index that
+        // layout covers. A device whose `num_queues` disagrees with
+        // `2 * max_virtqueue_pairs + 1` is about to be programmed for
+        // queues it does not have, and nothing else in the boot log
+        // would say so.
+        let probed_queues = usize::from(advertised_pairs) * 2 + 1;
+        let mut queue_sizes = [0_u16; NET_MAX_QUEUE_PAIRS as usize * 2 + 1];
+        for (index, size) in queue_sizes[..probed_queues].iter_mut().enumerate() {
+            *size = transport.queue_max_size(index as u16);
+        }
+        tracing::info!(
+            offered = ?FeatureWord(offered_features.get()),
+            accepted = ?FeatureWord(features.bits()),
+            max_virtqueue_pairs = advertised_pairs,
+            presented_queues = ?transport.presented_queue_count(),
+            queue_sizes = ?&queue_sizes[..probed_queues],
+            "virtio-net bring-up"
+        );
 
         let mut queue_pairs: Vec<NetQueuePair<T>> =
             Vec::with_capacity(usize::from(advertised_pairs));
