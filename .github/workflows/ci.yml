@@ -122,9 +122,12 @@ jobs:
           # under TCG and needs an emulation-sized bring-up budget.
           HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
         run: |
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/boot"
+          mkdir -p "$runtime"
           ./target/release/helios-inspector vm --arch riscv64 --release --memory 2G \
+            --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program debugger --no-compiler-plugin \
-            shell -c 'echo ok' > boot-smoke.out
+            shell -c 'echo ok' 2>&1 > boot-smoke.out | tee "$runtime/inspector.log"
           cat boot-smoke.out
           grep -Fqx ok boot-smoke.out
       - name: Seed the wall clock from the goldfish RTC
@@ -139,7 +142,10 @@ jobs:
           # seeded clock from one that only counts uptime; the kernel's
           # own seed line stays in the trace history on this backend,
           # which does not mirror kernel logs to the serial.
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/wall-clock"
+          mkdir -p "$runtime"
           ./target/release/helios-inspector vm --arch riscv64 --release --memory 2G \
+            --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program debugger --boot-program date \
             --no-compiler-plugin \
             shell -c '/bin/date' > wall-clock-smoke.out 2>&1
@@ -158,12 +164,15 @@ jobs:
           # coreutils is one multicall WASIX module published under several
           # bootfs names, so every applet is launched by bare name and dash
           # resolves it through PATH. Issue #39 died here on riscv64.
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/coreutils"
+          mkdir -p "$runtime"
           ./target/release/helios-inspector vm --arch riscv64 --release --memory 2G \
+            --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program debugger \
             --boot-program ls --boot-program mkdir --boot-program cat \
             --no-compiler-plugin \
             shell -c 'mkdir /d; echo coreutils:ok > /d/f; cat /d/f; ls /' \
-            > coreutils-smoke.out
+            2>&1 > coreutils-smoke.out | tee "$runtime/inspector.log"
           cat coreutils-smoke.out
           grep -Fqx coreutils:ok coreutils-smoke.out
           grep -Fqx bin coreutils-smoke.out
@@ -175,11 +184,14 @@ jobs:
         run: |
           # Same interpreter and one-liner as tools/wasi-apps/smoke.sh, so the
           # riscv64 lane covers the stdlib import path that issue #39 broke.
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/cpython"
+          mkdir -p "$runtime"
           ./target/release/helios-inspector vm --arch riscv64 --release --memory 2G \
+            --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program debugger --boot-program python3 \
             --no-compiler-plugin \
             shell -c 'python3 -c "import json, pathlib; print(json.dumps({\"ok\": pathlib.PurePosixPath(\"/a\").name}, separators=(\",\",\":\")))"' \
-            > cpython-smoke.out
+            2>&1 > cpython-smoke.out | tee "$runtime/inspector.log"
           cat cpython-smoke.out
           grep -Fqx '{"ok":"a"}' cpython-smoke.out
       - name: Fetch over virtio-net with curl
@@ -193,12 +205,29 @@ jobs:
           # invoked by bare name so dash resolves it through PATH and execs
           # it with argv[0] == "curl", which is the shape that regressed in
           # issue #35; tools/wasi-apps/smoke.sh covers the bootfs-path shape.
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/curl"
+          mkdir -p "$runtime"
           ./target/release/helios-inspector vm --arch riscv64 --release --memory 2G \
+            --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program debugger \
             --boot-program curl --boot-program http-client --no-compiler-plugin \
-            shell -c 'curl http://detectportal.firefox.com/success.txt' > curl-smoke.out
+            shell -c 'curl http://detectportal.firefox.com/success.txt' 2>&1 > curl-smoke.out | tee "$runtime/inspector.log"
           cat curl-smoke.out
           grep -Fqx success curl-smoke.out
+      - name: Upload the inspector runtime directories
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-riscv64-runtime
+          # The guest console and QEMU's own stdout, stderr and -d logs.
+          # GitHub drops a step's log outright when it cannot render it, so
+          # what a failing smoke needs has to leave the job as a file rather
+          # than as console output. The disk images the runtime directory
+          # also holds are deliberately not collected.
+          path: |
+            smoke-runtime/*/*.log
+          if-no-files-found: warn
+          retention-days: 7
 
   bench:
     name: bench-${{ matrix.name }}
