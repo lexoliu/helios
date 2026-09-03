@@ -28,7 +28,8 @@ use bytes::Bytes;
 use helios_hal::cpu::{Cpu, HardwarePerfCounters};
 use helios_hal::io::IoError;
 use helios_netstack::{
-    DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DNS_PORT, DhcpClientMessage, DhcpDnsServers,
+    DEFAULT_HOP_LIMIT, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DNS_PORT, DhcpClientMessage,
+    DhcpDnsServers,
     DhcpMessageType, DhcpPacket, DnsQuestionWriter, DnsRecordType, DnsResponse, EthernetFrame,
     EthernetProtocol, FlowTuple, IcmpEchoKey, IcmpEchoReply, Icmpv4Packet, Icmpv6Packet, IpAddress,
     IpCidr, IpProtocol, Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6Cidr, Ipv6Packet,
@@ -36,7 +37,7 @@ use helios_netstack::{
     Route, RouteTable, RxChecksumOffload, RxFrame, SegmentationOffload, Stack, StackConfig,
     StackError, StackEvent, StackInstant, TcpConnectState, TcpConnectTerminalError, TcpEndpoint,
     TcpListenBacklog, TcpPacket, TcpReadIntoState, TcpReadState, UdpEndpoint, UdpPacket,
-    UdpPayload, UdpSocketBinding, UdpSocketError, flow_hash,
+    UdpEgress, UdpPayload, UdpSocketBinding, UdpSocketError, flow_hash,
 };
 use spin::{Mutex as SpinMutex, RwLock as SpinRwLock};
 
@@ -95,8 +96,9 @@ const NETWORK_PROGRESS_WAIT: Duration = Duration::from_micros(50);
 const NETWORK_RETRANSMIT_WAIT: Duration = Duration::from_millis(250);
 // AArch64/HVF local TCP diagnostics showed that matching the borrowed RX
 // batch to the virtio polling budget moves receive work in the right
-// direction without changing protocol semantics: 64 MiB raw tcp/wasix
-// medians went 92/102 ms -> 89/97 ms, and rx-drain ns/event went
+// direction without changing protocol semantics: the two 64 MiB TCP
+// throughput workloads, one over kernel sockets and one over guest
+// sockets, went 92/102 ms -> 89/97 ms, and rx-drain ns/event went
 // 915/962 -> 838/842. This is not the final network win; it just keeps the
 // device-facing receive loop from reacquiring/reposting after every 8 frames.
 const NETWORK_RX_BATCH_FRAMES: usize = 32;
@@ -110,7 +112,7 @@ const NETWORK_POLLING_TCP_READ_ROUNDS: usize = NETWORK_BUSY_POLL_ROUNDS * 2;
 // the syscall wrapper itself. The same run read 64 MiB through 11660 kernel TCP
 // reads, only about 28.8 KiB/read despite a 1 MiB guest buffer. For polling NICs
 // we therefore drain a bounded burst of already-ready RX frames before returning
-// to the guest, amortizing WIT/component-host and TCP drive cost without waiting
+// to the guest, amortizing component-host and TCP drive cost without waiting
 // for an interrupt or timer.
 const NETWORK_TCP_READ_BURST_ROUNDS: usize = NETWORK_BUSY_POLL_ROUNDS;
 
@@ -1275,14 +1277,16 @@ where
         );
         self.inner
             .runtime_state
-            .record_perf_metric_parts_events_nanos(
+            .record_perf_metric_parts(
                 crate::ProfileScope::Kernel,
                 "kernel;network;",
                 phase,
-                usize_to_u64(events, "network profile event count"),
-                elapsed_nanos,
-                counters,
-                usize_to_u64(bytes, "network profile byte count"),
+                crate::PerfSample {
+                    events: usize_to_u64(events, "network profile event count"),
+                    elapsed_nanos,
+                    counters,
+                    bytes: usize_to_u64(bytes, "network profile byte count"),
+                },
             );
     }
 

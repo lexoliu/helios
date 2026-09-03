@@ -3310,6 +3310,7 @@ where
     p1_write_filestat(caller, stat, identity, stat_value)
 }
 
+#[expect(clippy::too_many_arguments, reason = "the parameter list is the guest ABI of this call, so grouping it would hide the contract and break the one-to-one match with the linker registration")]
 pub(super) async fn p1_path_filestat_set_times<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     fd: i32,
@@ -3374,6 +3375,7 @@ where
         .map_or_else(p1_errno_from_fs, |_| p1::errno::SUCCESS)
 }
 
+#[expect(clippy::too_many_arguments, reason = "the parameter list is the guest ABI of this call, so grouping it would hide the contract and break the one-to-one match with the linker registration")]
 pub(super) async fn p1_path_link<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     old_fd: i32,
@@ -3436,7 +3438,7 @@ where
             Err(error) => return p1_errno_from_fs(error),
         };
         return service
-            .hard_link(&source_host, &destination_host)
+            .hard_link(source_host, destination_host)
             .await
             .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
             .map_or_else(p1_errno_from_fs, |_| {

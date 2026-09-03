@@ -6,7 +6,7 @@
 //! lists kernel-side resource handles surfaced to wasm, `provider` holds
 //! the hand-off slots for interfaces served by kernel plugins, `runtime`
 //! and `runtime_backend` host the component lifecycle and per-call state,
-//! and `types` declares the WASI/component resource type aliases.
+//! and `types` declares the component resource type aliases.
 
 mod cache;
 mod fs;

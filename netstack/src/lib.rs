@@ -59,7 +59,7 @@ pub use stack::{
     OutboundBatchStatus, Route, RouteTable, RxChecksumOffload, SocketId, Stack, StackConfig,
     StackEvent, StackInstant, TcpAccept, TcpConnectState, TcpConnectTerminalError,
     TcpListenBacklog, TcpReadIntoState, TcpReadState, UdpEndpoint, UdpPayload, UdpReceive,
-    UdpSocketBinding, UdpSocketError, UdpSocketId,
+    UdpEgress, UdpSocketBinding, UdpSocketError, UdpSocketId,
 };
 pub use tcp::{TCP_RECEIVE_WINDOW_BYTES, TCP_TRANSMIT_BUFFER_BYTES};
 pub use tcp::{

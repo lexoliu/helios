@@ -879,7 +879,7 @@ mod tests {
         assert_ne!(fresh.generation, handle.generation);
         assert!(handle.is_dead(pool));
         assert!(!fresh.is_dead(pool));
-        drop(entry);
+        let _ = entry;
     }
 
     #[test]

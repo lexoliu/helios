@@ -1993,7 +1993,7 @@ where
             return Ok(Err(socket_types::ErrorCode::AccessDenied));
         }
         let socket = accessor
-            .with(|mut access| access.get().table.get(&socket).map(|socket| socket.clone()))?;
+            .with(|mut access| access.get().table.get(&socket).cloned())?;
         let remote_address = match remote_address {
             Some(address) => match parse_p3_udp_socket_address(address, socket.family()) {
                 Ok(address) => Some(address),
@@ -2024,7 +2024,7 @@ where
             return Ok(Err(socket_types::ErrorCode::AccessDenied));
         }
         let socket = accessor
-            .with(|mut access| access.get().table.get(&socket).map(|socket| socket.clone()))?;
+            .with(|mut access| access.get().table.get(&socket).cloned())?;
         let result = socket
             .receive_datagram(None, u64::MAX)
             .await

@@ -79,7 +79,7 @@ const BYTE_CHANNEL_CHUNK_CAPACITY: usize = 256;
 const BYTE_CHANNEL_INLINE_CHUNKS: usize = 16;
 const BYTE_CHANNEL_OVERFLOW_INITIAL_CHUNKS: usize = 48;
 /// Waiters parked without touching the allocator. One reader and one
-/// writer task per channel is the norm; WASIX threads sharing a pipe can
+/// writer task per channel is the norm; guest threads sharing a pipe can
 /// exceed it, and those spill into [`WakerSet::overflow`] rather than
 /// panicking a kernel that a guest can drive.
 const BYTE_CHANNEL_WAKER_CAPACITY: usize = 8;
@@ -285,7 +285,7 @@ impl ByteChunks {
 ///
 /// The inline capacity covers the ordinary one-task-per-direction case
 /// without allocating. It spills instead of panicking because the number
-/// of parked tasks is guest-driven: WASIX threads can all block writing
+/// of parked tasks is guest-driven: a guest's threads can all block writing
 /// to the same pipe.
 struct WakerSet {
     inline: HeapVec<Waker, BYTE_CHANNEL_WAKER_CAPACITY>,
@@ -311,9 +311,7 @@ impl WakerSet {
         match self.inline.push(waker) {
             Ok(()) => self.len += 1,
             Err(waker) => {
-                let mut overflow = Vec::new();
-                overflow.push(waker);
-                self.overflow = Some(overflow);
+                self.overflow = Some(alloc::vec![waker]);
                 self.len += 1;
             }
         }
@@ -661,8 +659,8 @@ impl ByteWriter {
         }
     }
 
-    /// Poll-driven push for synchronous poll contexts (WASI p3 stream
-    /// consumers). On `Poll::Pending` the chunk stays in `pending` and the
+    /// Poll-driven push for synchronous poll contexts (a component's
+    /// stream consumers). On `Poll::Pending` the chunk stays in `pending` and the
     /// task is registered for the next writability wakeup.
     pub fn poll_write(
         &self,

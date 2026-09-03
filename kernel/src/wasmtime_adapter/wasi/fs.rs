@@ -442,43 +442,41 @@ where
                 self.complete(Err(fs_types::ErrorCode::NotPermitted));
                 return Poll::Ready(Ok(StreamResult::Dropped));
             }
-            loop {
-                if self.pending.is_none() {
-                    let capacity = destination.remaining(&mut store);
-                    if capacity == Some(0) {
-                        return Poll::Ready(Ok(StreamResult::Completed));
-                    }
-                    self.start_host_read(capacity);
+            if self.pending.is_none() {
+                let capacity = destination.remaining(&mut store);
+                if capacity == Some(0) {
+                    return Poll::Ready(Ok(StreamResult::Completed));
                 }
-                let pending = self
-                    .pending
-                    .as_mut()
-                    .expect("host read future must be present before polling");
-                match pending.as_mut().poll(cx) {
-                    Poll::Pending => return Poll::Pending,
-                    Poll::Ready(Ok(bytes)) if bytes.is_empty() => {
-                        self.pending = None;
-                        self.complete(Ok(()));
-                        return Poll::Ready(Ok(StreamResult::Dropped));
-                    }
-                    Poll::Ready(Ok(bytes)) => {
-                        self.pending = None;
-                        self.offset = self
-                            .offset
-                            .checked_add(
-                                u64::try_from(bytes.len()).expect("read chunk size overflowed u64"),
-                            )
-                            .ok_or_else(|| {
-                                wasmtime::Error::new(WasiAdapterTrap::FileReadOffsetOverflow)
-                            })?;
-                        destination.set_buffer(BytesStreamBuffer::new(Bytes::from(bytes)));
-                        return Poll::Ready(Ok(StreamResult::Completed));
-                    }
-                    Poll::Ready(Err(error)) => {
-                        self.pending = None;
-                        self.complete(Err(error));
-                        return Poll::Ready(Ok(StreamResult::Dropped));
-                    }
+                self.start_host_read(capacity);
+            }
+            let pending = self
+                .pending
+                .as_mut()
+                .expect("host read future must be present before polling");
+            match pending.as_mut().poll(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Ok(bytes)) if bytes.is_empty() => {
+                    self.pending = None;
+                    self.complete(Ok(()));
+                    return Poll::Ready(Ok(StreamResult::Dropped));
+                }
+                Poll::Ready(Ok(bytes)) => {
+                    self.pending = None;
+                    self.offset = self
+                        .offset
+                        .checked_add(
+                            u64::try_from(bytes.len()).expect("read chunk size overflowed u64"),
+                        )
+                        .ok_or_else(|| {
+                            wasmtime::Error::new(WasiAdapterTrap::FileReadOffsetOverflow)
+                        })?;
+                    destination.set_buffer(BytesStreamBuffer::new(Bytes::from(bytes)));
+                    return Poll::Ready(Ok(StreamResult::Completed));
+                }
+                Poll::Ready(Err(error)) => {
+                    self.pending = None;
+                    self.complete(Err(error));
+                    return Poll::Ready(Ok(StreamResult::Dropped));
                 }
             }
         }
@@ -628,36 +626,34 @@ where
                 self.complete(Err(fs_types::ErrorCode::NotPermitted));
                 return Poll::Ready(Ok(StreamResult::Dropped));
             }
-            loop {
-                if self.pending.is_none() {
-                    let available = source.remaining(&mut store);
-                    if available == 0 {
-                        return Poll::Ready(Ok(StreamResult::Completed));
-                    }
-                    let mut bytes = Vec::with_capacity(available);
-                    source.read(&mut store, &mut bytes)?;
-                    self.start_host_write(bytes);
+            if self.pending.is_none() {
+                let available = source.remaining(&mut store);
+                if available == 0 {
+                    return Poll::Ready(Ok(StreamResult::Completed));
                 }
-                let pending = self
-                    .pending
-                    .as_mut()
-                    .expect("host write future must be present before polling");
-                match pending.as_mut().poll(cx) {
-                    Poll::Pending => return Poll::Pending,
-                    Poll::Ready(Ok(written)) => {
-                        self.pending = None;
-                        if let FileWriteMode::At(offset) = &mut self.mode {
-                            *offset = offset
-                                .checked_add(written)
-                                .expect("file write offset overflowed usize");
-                        }
-                        return Poll::Ready(Ok(StreamResult::Completed));
+                let mut bytes = Vec::with_capacity(available);
+                source.read(&mut store, &mut bytes)?;
+                self.start_host_write(bytes);
+            }
+            let pending = self
+                .pending
+                .as_mut()
+                .expect("host write future must be present before polling");
+            match pending.as_mut().poll(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Ok(written)) => {
+                    self.pending = None;
+                    if let FileWriteMode::At(offset) = &mut self.mode {
+                        *offset = offset
+                            .checked_add(written)
+                            .expect("file write offset overflowed usize");
                     }
-                    Poll::Ready(Err(error)) => {
-                        self.pending = None;
-                        self.complete(Err(error));
-                        return Poll::Ready(Ok(StreamResult::Dropped));
-                    }
+                    return Poll::Ready(Ok(StreamResult::Completed));
+                }
+                Poll::Ready(Err(error)) => {
+                    self.pending = None;
+                    self.complete(Err(error));
+                    return Poll::Ready(Ok(StreamResult::Dropped));
                 }
             }
         }
@@ -1857,13 +1853,12 @@ where
             return Err(fs_types::ErrorCode::ReadOnly);
         }
 
-        if source_node.kind == FsNodeKind::Directory {
-            if destination_absolute == source_absolute
-                || crate::path_is_within_directory(&destination_absolute, &source_absolute)
+        if source_node.kind == FsNodeKind::Directory
+            && (destination_absolute == source_absolute
+                || crate::path_is_within_directory(&destination_absolute, &source_absolute))
             {
                 return Err(fs_types::ErrorCode::NotPermitted);
             }
-        }
 
         let mut state = self.snapshot.inner.lock();
         for node in &mut state.nodes {

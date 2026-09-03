@@ -291,11 +291,11 @@ impl InstanceRegistry {
                 .map(|sample| sample.active_nanos)
                 .unwrap_or(total_active_nanos);
             let delta_active_nanos = total_active_nanos.saturating_sub(previous_total);
-            let cpu_busy = if elapsed_nanos == 0 {
-                0
-            } else {
-                ((delta_active_nanos.saturating_mul(1_000)) / elapsed_nanos).min(1_000) as u16
-            };
+            let cpu_busy = delta_active_nanos
+                .saturating_mul(1_000)
+                .checked_div(elapsed_nanos)
+                .unwrap_or(0)
+                .min(1_000) as u16;
 
             next_totals.push(SampleTotal {
                 id: entry.id,

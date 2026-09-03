@@ -293,5 +293,5 @@ impl<'a> DhcpOptionParser<'a> {
 
 fn read_array<const N: usize>(bytes: &[u8], offset: usize) -> Option<[u8; N]> {
     let end = offset.checked_add(N)?;
-    Some(bytes.get(offset..end)?.try_into().ok()?)
+    bytes.get(offset..end)?.try_into().ok()
 }

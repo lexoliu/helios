@@ -66,8 +66,8 @@ fn descriptor_insert_close_reuse_with_table(
     bencher.counter(ItemsCount::new(count)).bench_local(|| {
         let mut table = new_table();
         let mut descriptors = [DescriptorId::new(0); 256];
-        for index in 0..count {
-            descriptors[index] = table
+        for (index, descriptor) in descriptors.iter_mut().enumerate().take(count) {
+            *descriptor = table
                 .insert(file(index as u64), false)
                 .expect("descriptor insert should succeed");
         }

@@ -1952,6 +1952,7 @@ where
     p1::errno::SUCCESS
 }
 
+#[expect(clippy::too_many_arguments, reason = "the parameter list is the guest ABI of this call, so grouping it would hide the contract and break the one-to-one match with the linker registration")]
 pub(super) async fn wasix_sock_recv_from<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     fd: i32,
@@ -1981,6 +1982,7 @@ where
     result
 }
 
+#[expect(clippy::too_many_arguments, reason = "the parameter list is the guest ABI of this call, so grouping it would hide the contract and break the one-to-one match with the linker registration")]
 pub(super) async fn wasix_sock_recv_from_inner<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     fd: i32,

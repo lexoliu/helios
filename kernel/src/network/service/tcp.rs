@@ -1357,7 +1357,7 @@ impl NetworkShard {
         stream: TcpStreamId,
     ) -> Result<helios_netstack::SocketId, TcpError> {
         let slot = self.decode_handle_slot(stream.into());
-        self.tcp_streams.get(slot).copied().ok_or_else(|| TcpError {
+        self.tcp_streams.get(slot).copied().ok_or(TcpError {
             kind: TcpErrorKind::Unavailable,
             detail: NetworkErrorDetail::UnknownTcpStream,
         })
@@ -1369,7 +1369,7 @@ impl NetworkShard {
     ) -> Result<&TcpListenerState, TcpError> {
         self.tcp_listeners
             .get(ReplicaHandle::from(listener).slot())
-            .ok_or_else(|| TcpError {
+            .ok_or(TcpError {
                 kind: TcpErrorKind::Unavailable,
                 detail: NetworkErrorDetail::TcpListenerClosedUnexpectedly,
             })

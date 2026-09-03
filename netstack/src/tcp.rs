@@ -33,7 +33,7 @@ use crate::{
 pub(crate) const TCP_RECEIVE_SEGMENT_BYTES: usize = 1460;
 pub const TCP_RECEIVE_WINDOW_BYTES: usize = 1024 * 1024;
 pub const MAX_TCP_RECEIVE_SEGMENTS: usize =
-    (TCP_RECEIVE_WINDOW_BYTES + TCP_RECEIVE_SEGMENT_BYTES - 1) / TCP_RECEIVE_SEGMENT_BYTES;
+    TCP_RECEIVE_WINDOW_BYTES.div_ceil(TCP_RECEIVE_SEGMENT_BYTES);
 pub const MAX_TCP_OUT_OF_ORDER_SEGMENTS: usize = 32;
 pub const MAX_TCP_QUEUED_SEGMENTS: usize = 32;
 /// In-flight (sent, unacknowledged) segment capacity. Sized so a full
@@ -354,6 +354,10 @@ impl TcpTransmitQueue {
     }
 }
 
+/// A bounded segment queue could not accept a segment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TcpQueueFull;
+
 #[derive(Clone, Debug)]
 struct TcpInFlightQueue {
     segments: VecDeque<TcpInFlightSegment>,
@@ -374,9 +378,15 @@ impl TcpInFlightQueue {
         self.segments.front_mut()
     }
 
-    fn push_back(&mut self, segment: TcpInFlightSegment) -> Result<(), TcpInFlightSegment> {
+    /// Appends a sent segment, or reports the queue full.
+    ///
+    /// A rejected segment is dropped rather than handed back: every
+    /// caller gates on [`Self::is_full`] before it commits to sending,
+    /// so a rejection here is a bug in that gate and nothing downstream
+    /// wants the bytes returned.
+    fn push_back(&mut self, segment: TcpInFlightSegment) -> Result<(), TcpQueueFull> {
         if self.is_full() {
-            return Err(segment);
+            return Err(TcpQueueFull);
         }
         self.segments.push_back(segment);
         Ok(())
@@ -825,7 +835,7 @@ where
                 retransmissions: 0,
                 sacked: false,
             })
-            .unwrap_or_else(|_| panic!("TCP in-flight queue is full"));
+            .expect("TCP in-flight queue is full");
         self.congestion
             .on_packet_sent(1, self.bytes_in_flight, now_nanos);
     }
@@ -852,7 +862,7 @@ where
                 retransmissions: 0,
                 sacked: false,
             })
-            .unwrap_or_else(|_| panic!("TCP in-flight queue is full"));
+            .expect("TCP in-flight queue is full");
         self.congestion
             .on_packet_sent(1, self.bytes_in_flight, now_nanos);
     }
@@ -1036,17 +1046,16 @@ where
             self.state,
             TcpState::Established | TcpState::CloseWait | TcpState::FinWait1 | TcpState::LastAck
         ) && !self.fin_queued
-        {
-            if let Some(segment) = self.take_data_segment(
+            && let Some(segment) = self.take_data_segment(
                 local,
                 remote,
                 available_window,
                 budget,
                 now_nanos,
                 persist_probe,
-            ) {
-                return Some(segment);
-            }
+            )
+        {
+            return Some(segment);
         }
 
         if !self.transmit_queue_is_empty() {
@@ -1113,7 +1122,7 @@ where
                     retransmissions: 0,
                     sacked: false,
                 })
-                .unwrap_or_else(|_| panic!("TCP in-flight queue is full"));
+                .expect("TCP in-flight queue is full");
         }
         Some(TcpTransmitSegment {
             local,
@@ -1277,7 +1286,7 @@ where
                         retransmissions: 0,
                         sacked: false,
                     })
-                    .unwrap_or_else(|_| panic!("TCP in-flight queue is full"));
+                    .expect("TCP in-flight queue is full");
                 offset += chunk_len;
             }
             self.schedule_next_pacing_send(sequence_len, now_nanos);
@@ -1925,12 +1934,9 @@ where
     }
 
     fn note_duplicate_ack(&mut self, now_nanos: u64) -> Option<RecoveryAction> {
-        let Some(lost_bytes) = self
+        let lost_bytes = self
             .first_unsacked_in_flight()
-            .map(|segment| segment.sequence_len)
-        else {
-            return None;
-        };
+            .map(|segment| segment.sequence_len)?;
         self.duplicate_ack_count = self.duplicate_ack_count.saturating_add(1);
         if self.duplicate_ack_count < 3 || self.fast_retransmit_pending {
             return None;
@@ -2367,7 +2373,7 @@ where
 
     pub(crate) fn record_peer_options(&mut self, packet: TcpPacket<'_>) {
         if let Some(mss) = packet.options.maximum_segment_size() {
-            self.peer_max_segment_size = usize::from(mss).min(TCP_RECEIVE_SEGMENT_BYTES).max(1);
+            self.peer_max_segment_size = usize::from(mss).clamp(1, TCP_RECEIVE_SEGMENT_BYTES);
         }
         if let Some(shift) = packet.options.window_scale() {
             self.peer_window_scale = shift.min(TCP_MAX_WINDOW_SCALE);
@@ -2482,8 +2488,8 @@ where
                 fin: false,
             });
         }
-        (matches!(self.state, TcpState::FinWait1 | TcpState::LastAck) && !self.fin_queued).then(
-            || TcpPersistProbe {
+        (matches!(self.state, TcpState::FinWait1 | TcpState::LastAck) && !self.fin_queued).then_some(
+            TcpPersistProbe {
                 sequence: self.send_next,
                 sequence_len: 1,
                 fin: true,
@@ -5201,7 +5207,7 @@ mod tests {
             TCP_INITIAL_RTO_NANOS + 10,
         );
 
-        assert_eq!(outcome.receive_backpressure, false);
+        assert!(!outcome.receive_backpressure);
         assert_eq!(socket.peer_receive_window(), 4);
     }
 

@@ -155,7 +155,7 @@ impl Ipv4Address {
         self.octets
     }
 
-    pub fn write_dotted_decimal<'a>(self, buffer: &'a mut [u8; 15]) -> &'a str {
+    pub fn write_dotted_decimal(self, buffer: &mut [u8; 15]) -> &str {
         let mut cursor = 0;
         for (index, octet) in self.octets.into_iter().enumerate() {
             if index != 0 {

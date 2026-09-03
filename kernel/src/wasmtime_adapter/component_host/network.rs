@@ -182,8 +182,8 @@ trait DynComponentHostNetworkService: Send + Sync + 'static {
         local_port: u16,
     ) -> Pin<Box<dyn Future<Output = Result<UdpBinding<u64>, UdpError>> + Send + 'a>>;
 
-    fn udp_connect<'a>(
-        &'a self,
+    fn udp_connect(
+        &self,
         socket: u64,
         remote_address: NetworkIpAddress,
         port: u16,
@@ -923,8 +923,8 @@ where
         })
     }
 
-    fn udp_connect<'a>(
-        &'a self,
+    fn udp_connect(
+        &self,
         socket: u64,
         remote_address: NetworkIpAddress,
         port: u16,

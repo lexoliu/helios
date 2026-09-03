@@ -732,7 +732,7 @@ impl<'a> TcpOptions<'a> {
                         4 if data.is_empty() => {
                             options.sack_permitted = true;
                         }
-                        5 if data.len() % 8 == 0 => {
+                        5 if data.len().is_multiple_of(8) => {
                             for block in data.chunks_exact(8) {
                                 options
                                     .sack_blocks
@@ -1522,7 +1522,7 @@ impl<'a> Icmpv6Packet<'a> {
 
 fn read_array<const N: usize>(bytes: &[u8], offset: usize) -> Option<[u8; N]> {
     let end = offset.checked_add(N)?;
-    Some(bytes.get(offset..end)?.try_into().ok()?)
+    bytes.get(offset..end)?.try_into().ok()
 }
 
 fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {

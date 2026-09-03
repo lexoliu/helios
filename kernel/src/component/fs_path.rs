@@ -11,7 +11,7 @@ pub enum ComponentFsPathError {
     NotPermitted,
 }
 
-// WASI filesystem calls resolve descriptor-relative paths repeatedly. Keep this
+// Guest filesystem calls resolve descriptor-relative paths repeatedly. Keep this
 // one-pass: local divan measured this shape at 135.2 ns / 1 allocation versus
 // the old segment-Vec rebuild path's 453.8 ns / 10 allocations.
 pub fn resolve_child_path(base: &str, child: &str) -> Result<String, ComponentFsPathError> {

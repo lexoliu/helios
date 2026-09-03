@@ -1,5 +1,22 @@
 use super::*;
 
+/// The operand tuples the WASIX spawn calls take on the wire.
+///
+/// A `func_wrap_async` closure has to spell out the guest's parameter
+/// tuple, and these two calls pass every argument as an `i32` pointer
+/// or length; the shape is the ABI, not a modelling choice.
+type WasixHostArgs13 = (i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32);
+type WasixHostArgs14 = (i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32);
+
+/// What a spawning guest hands down to its child besides the program
+/// itself. `None` means the child inherits the parent's.
+pub(super) struct WasixChildInheritance {
+    pub(super) environment: Option<Vec<(String, String)>>,
+    pub(super) authority: Option<ProcessAuthority>,
+    pub(super) descriptors: Option<Preview1DescriptorTable>,
+    pub(super) signal_dispositions: Vec<WasixSignalDisposition>,
+}
+
 pub(super) struct WasixPreparedProgram {
     pub(super) guest_name: String,
     pub(super) source: ProgramSource,
@@ -175,21 +192,7 @@ where
                 working_dir,
                 working_dir_len,
                 ret_handles,
-            ): (
-                i32,
-                i32,
-                i32,
-                i32,
-                i32,
-                i32,
-                i32,
-                i32,
-                i32,
-                i32,
-                i32,
-                i32,
-                i32,
-            )| {
+            ): WasixHostArgs13| {
                 Box::new(async move {
                     wasix_proc_spawn(
                         &mut caller,
@@ -232,22 +235,7 @@ where
                 path,
                 path_len,
                 ret_pid,
-            ): (
-                i32,
-                i32,
-                i32,
-                i32,
-                i32,
-                i32,
-                i32,
-                i32,
-                i32,
-                i32,
-                i32,
-                i32,
-                i32,
-                i32,
-            )| {
+            ): WasixHostArgs14| {
                 Box::new(async move {
                     wasix_proc_spawn2(
                         &mut caller,
@@ -1735,6 +1723,7 @@ where
     Err(wasmtime::Error::new(Preview1Exit))
 }
 
+#[expect(clippy::too_many_arguments, reason = "the parameter list is the guest ABI of this call, so grouping it would hide the contract and break the one-to-one match with the linker registration")]
 pub(super) async fn wasix_proc_exec3<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     name: u32,
@@ -1934,11 +1923,13 @@ where
         caller,
         prepared,
         argv,
-        None,
         WasixSpawnIo::from_modes(stdin, stdout, stderr),
-        Some(authority),
-        None,
-        Vec::new(),
+        WasixChildInheritance {
+            environment: None,
+            authority: Some(authority),
+            descriptors: None,
+            signal_dispositions: Vec::new(),
+        },
     )
     .await
     {
@@ -2221,11 +2212,13 @@ where
         caller,
         prepared,
         argv,
-        environment,
         WasixSpawnIo::inherit(),
-        authority,
-        descriptors,
-        signal_dispositions,
+        WasixChildInheritance {
+            environment,
+            authority,
+            descriptors,
+            signal_dispositions,
+        },
     )
     .await
     {
@@ -3065,7 +3058,7 @@ where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    let host_path = crate::guest_host_share_path(&source_path).map(ToOwned::to_owned);
+    let host_path = crate::guest_host_share_path(source_path).map(ToOwned::to_owned);
     let source_is_host = host_path.is_some();
     let source = if let Some(host_path) = host_path {
         let service = caller
@@ -3092,7 +3085,7 @@ where
         caller
             .data()
             .filesystem
-            .read_program_file_bytes(&source_path)
+            .read_program_file_bytes(source_path)
             .map_err(|_| {
                 wasmtime::Error::new(ProgramExecError {
                     kind: ProgramExecErrorKind::PermissionDenied,
@@ -3185,16 +3178,19 @@ pub(super) async fn wasix_spawn_child<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     prepared: WasixPreparedProgram,
     argv: Vec<String>,
-    environment: Option<Vec<(String, String)>>,
     io: WasixSpawnIo,
-    authority: Option<ProcessAuthority>,
-    descriptors: Option<Preview1DescriptorTable>,
-    signal_dispositions: Vec<WasixSignalDisposition>,
+    inheritance: WasixChildInheritance,
 ) -> Result<WasixSpawnResult, i32>
 where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
+    let WasixChildInheritance {
+        environment,
+        authority,
+        descriptors,
+        signal_dispositions,
+    } = inheritance;
     let prepared_io = wasix_prepare_child_io(caller.data(), io)?;
     let argv = ProgramArgv::from_caller(&prepared.guest_name, argv);
     let mut environment = environment.unwrap_or_else(|| caller.data().environment.clone());
@@ -3205,43 +3201,28 @@ where
     let authority = authority.unwrap_or_else(|| caller.data().authority.clone());
     let filesystem = Some(caller.data().filesystem.snapshot());
     let launch_started = p1_kernel_profile_start(caller.data());
-    let mut child = if let Some(descriptors) = descriptors {
-        service
-            .spawn_with_descriptors_and_output_mode(
-                exec_context,
+    let mut child = service
+        .spawn_with_output_mode(
+            exec_context,
+            prepared.source,
+            None,
+            ProgramLaunch {
                 argv,
-                environment,
-                prepared.source,
-                None,
+                env: environment,
                 authority,
                 filesystem,
                 descriptors,
                 signal_dispositions,
-                prepared_io.output_mode,
-                prepared_io.stdin_writer,
-                prepared_io.stdout_reader,
-                prepared_io.stderr_reader,
-            )
-            .await
-    } else {
-        service
-            .spawn_with_signal_dispositions_and_output_mode(
-                exec_context,
-                argv,
-                environment,
-                prepared.source,
-                None,
-                authority,
-                filesystem,
-                signal_dispositions,
-                prepared_io.output_mode,
-                prepared_io.stdin_writer,
-                prepared_io.stdout_reader,
-                prepared_io.stderr_reader,
-            )
-            .await
-    }
-    .map_err(|error| p1_errno_from_program_exec_error(&error))?;
+            },
+            prepared_io.output_mode,
+            ChildStdio {
+                stdin: prepared_io.stdin_writer,
+                stdout: prepared_io.stdout_reader,
+                stderr: prepared_io.stderr_reader,
+            },
+        )
+        .await
+        .map_err(|error| p1_errno_from_program_exec_error(&error))?;
     p1_record_optional_kernel_profile(caller.data(), "proc_spawn_child_launch", launch_started);
     let pid = u32::try_from(child.instance_id.raw()).map_err(|_| p1::errno::OVERFLOW)?;
     let configure_started = p1_kernel_profile_start(caller.data());

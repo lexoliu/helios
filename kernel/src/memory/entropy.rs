@@ -44,7 +44,7 @@ const RESEED_DOMAIN: &[u8] = b"helios.entropy.root.reseed.v1";
 const DERIVE_DOMAIN: &[u8] = b"helios.entropy.pool.derive.v1";
 
 /// A kernel image that reaches this has no way to produce unpredictable
-/// bytes, so it cannot serve `wasi:random/random`, seed an address-space
+/// bytes, so it cannot serve a guest's random source, seed an address-space
 /// layout, or pick a TCP initial sequence number. Booting on regardless
 /// would make every one of those predictable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
@@ -188,7 +188,7 @@ impl RootEntropy {
 /// firmware left them — the device tree's `/chosen/rng-seed` on the
 /// platforms that have one — and install the result on the runtime
 /// state. A platform with no cryptographic source at all panics here:
-/// the alternative is a kernel whose `wasi:random/random`, address-space
+/// the alternative is a kernel whose guest randomness, address-space
 /// layout and TCP sequence numbers are all predictable, which is worse
 /// than not booting.
 pub fn seed_root_entropy<CpuImpl>(cpu: &CpuImpl, firmware_seed: Option<&[u8]>) -> RootEntropyHandle

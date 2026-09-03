@@ -9,7 +9,10 @@ where
     CoreModule(Arc<WasmtimeCompiledCoreModule>),
     ForkedCoreModule {
         compiled: Arc<WasmtimeCompiledCoreModule>,
-        restore: CoreModuleRestore,
+        /// Boxed because a fork's restore state dwarfs the two
+        /// refcounted handles the other variants carry, and the
+        /// executable itself is moved through every launch path.
+        restore: Box<CoreModuleRestore>,
     },
 }
 
@@ -18,13 +21,28 @@ pub(super) struct CoreModuleRestore {
     pub(super) memory_spec: SharedMemorySpec,
     pub(super) descriptors: Preview1DescriptorTable,
     pub(super) signal_dispositions: Vec<WasixSignalDisposition>,
+    pub(super) rewind: WasixRewind,
+}
+
+/// The asyncify stacks and the stack window a rewind restores.
+///
+/// Asyncify unwinds a guest by copying its shadow stack out and its
+/// rewind records in; both buffers and the window they belong to are
+/// produced together and consumed together.
+pub(super) struct WasixRewind {
     pub(super) stack_lower: u32,
     pub(super) stack_upper: u32,
     pub(super) stack_pointer: u32,
     pub(super) memory_stack: Vec<u8>,
     pub(super) rewind_stack: Vec<u8>,
-    pub(super) value: u64,
+    /// The value the rewound call returns, or `None` when the guest
+    /// resumes without one.
+    pub(super) value: Option<u64>,
 }
+
+/// Pre-instantiated core modules shared across launches.
+pub(super) type CoreModuleInstancePreCache<CpuImpl, HostFs> =
+    Arc<Mutex<ComponentCache<InstancePre<Preview1ProgramStore<CpuImpl, HostFs>>>>>;
 
 pub(super) struct WasixExecReplacement<CpuImpl, HostFs>
 where
@@ -58,7 +76,9 @@ where
     HostFs: crate::HostFileSystem,
 {
     Exit(Result<ChildExit, ProgramExecError>),
-    Exec(WasixExecReplacement<CpuImpl, HostFs>),
+    /// Boxed: an exec replacement carries the whole next program,
+    /// and the common completion is a plain exit code.
+    Exec(Box<WasixExecReplacement<CpuImpl, HostFs>>),
 }
 
 pub(super) struct WasixAsyncifyState {
@@ -172,9 +192,7 @@ pub(super) async fn run_program_executable<CpuImpl, HostFs>(
     runtime: &crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl>,
     preview1_core_linker: CoreLinker<Preview1ProgramStore<CpuImpl, HostFs>>,
     shared_memory_pool: Arc<Mutex<SharedMemoryPool>>,
-    core_module_instance_pre_cache: Arc<
-        Mutex<ComponentCache<InstancePre<Preview1ProgramStore<CpuImpl, HostFs>>>>,
-    >,
+    core_module_instance_pre_cache: CoreModuleInstancePreCache<CpuImpl, HostFs>,
     launched_instance: crate::RegisteredInstance,
     output_mode: OutputMode,
 ) -> Result<ChildExit, ProgramExecError>
@@ -266,9 +284,7 @@ pub(super) async fn run_program_core_module<CpuImpl, HostFs>(
     runtime: &crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl>,
     preview1_core_linker: CoreLinker<Preview1ProgramStore<CpuImpl, HostFs>>,
     shared_memory_pool: Arc<Mutex<SharedMemoryPool>>,
-    core_module_instance_pre_cache: Arc<
-        Mutex<ComponentCache<InstancePre<Preview1ProgramStore<CpuImpl, HostFs>>>>,
-    >,
+    core_module_instance_pre_cache: CoreModuleInstancePreCache<CpuImpl, HostFs>,
     launched_instance: crate::RegisteredInstance,
     output_mode: OutputMode,
 ) -> Result<ChildExit, ProgramExecError>
@@ -456,9 +472,11 @@ where
             &run_timer,
             &progress,
             exec_context.write_serial,
-            "program:run-core",
-            run_started_at,
-            &run_done,
+            super::ComponentPhase {
+                name: "program:run-core",
+                started_at: run_started_at,
+                done: &run_done,
+            },
         );
         super::emit_program_stage_marker(exec_context.write_serial, "program:run-core-begin");
         let run_phase_started = profile_cpu.now().ticks();
@@ -494,7 +512,7 @@ where
             })),
             Err(error) => {
                 if let Some(replacement) = store.data_mut().take_exec_replacement() {
-                    CoreModuleRunCompletion::Exec(replacement)
+                    CoreModuleRunCompletion::Exec(Box::new(replacement))
                 } else {
                     CoreModuleRunCompletion::Exit(match store.data_mut().take_requested_exit() {
                         Some(code) => Ok(ChildExit {
@@ -513,11 +531,10 @@ where
     };
     record_program_kernel_profile_sample(store_teardown_profile, "core-store-teardown");
 
-    if recycle_allowed {
-        if let (Some(spec), Some(memory)) = (imported_memory_spec, recycle_memory) {
+    if recycle_allowed
+        && let (Some(spec), Some(memory)) = (imported_memory_spec, recycle_memory) {
             spawn_scrubbed_recycle(&recycle_spawner, shared_memory_pool.clone(), spec, memory);
         }
-    }
     match completion {
         CoreModuleRunCompletion::Exit(result) => result,
         CoreModuleRunCompletion::Exec(replacement) => {
@@ -559,14 +576,12 @@ pub(super) async fn run_program_core_module_with_restore<CpuImpl, HostFs>(
     spawner: crate::Spawner<CpuImpl>,
     progress: helios_hal::watchdog::ProgressCounter,
     compiled: Arc<WasmtimeCompiledCoreModule>,
-    restore: CoreModuleRestore,
+    restore: Box<CoreModuleRestore>,
     engine: &crate::wasmtime_adapter::WasmtimeEngine,
     runtime: &crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl>,
     preview1_core_linker: CoreLinker<Preview1ProgramStore<CpuImpl, HostFs>>,
     shared_memory_pool: Arc<Mutex<SharedMemoryPool>>,
-    core_module_instance_pre_cache: Arc<
-        Mutex<ComponentCache<InstancePre<Preview1ProgramStore<CpuImpl, HostFs>>>>,
-    >,
+    core_module_instance_pre_cache: CoreModuleInstancePreCache<CpuImpl, HostFs>,
     launched_instance: crate::RegisteredInstance,
     output_mode: OutputMode,
 ) -> Result<ChildExit, ProgramExecError>
@@ -660,17 +675,7 @@ where
         super::emit_program_stage_marker(exec_context.write_serial, "program:instantiate-core-ok");
 
         let rewind_profile = start_program_kernel_profile(&profile_runtime_state, &profile_cpu);
-        wasix_begin_rewind(
-            &mut store,
-            &instance,
-            restore.stack_lower,
-            restore.stack_upper,
-            restore.stack_pointer,
-            restore.memory_stack,
-            restore.rewind_stack,
-            Some(restore.value),
-        )
-        .await?;
+        wasix_begin_rewind(&mut store, &instance, restore.rewind).await?;
         record_program_kernel_profile_sample(rewind_profile, "core-begin-rewind");
 
         let resolve_start_profile =
@@ -690,9 +695,11 @@ where
             &run_timer,
             &progress,
             exec_context.write_serial,
-            "program:run-core",
-            run_started_at,
-            &run_done,
+            super::ComponentPhase {
+                name: "program:run-core",
+                started_at: run_started_at,
+                done: &run_done,
+            },
         );
         super::emit_program_stage_marker(exec_context.write_serial, "program:run-core-begin");
         let run_phase_started = profile_cpu.now().ticks();
@@ -728,7 +735,7 @@ where
             })),
             Err(error) => {
                 if let Some(replacement) = store.data_mut().take_exec_replacement() {
-                    CoreModuleRunCompletion::Exec(replacement)
+                    CoreModuleRunCompletion::Exec(Box::new(replacement))
                 } else {
                     CoreModuleRunCompletion::Exit(match store.data_mut().take_requested_exit() {
                         Some(code) => Ok(ChildExit {
@@ -902,9 +909,11 @@ where
         &run_timer,
         &progress,
         exec_context.write_serial,
-        "program:run",
-        run_started_at,
-        &run_done,
+        super::ComponentPhase {
+            name: "program:run",
+            started_at: run_started_at,
+            done: &run_done,
+        },
     );
     super::emit_program_stage_marker(exec_context.write_serial, "program:run-begin");
     let run_phase_started = profile_cpu.now().ticks();
@@ -1010,12 +1019,14 @@ where
             wasix_begin_rewind(
                 store,
                 instance,
-                stack_lower,
-                stack_upper,
-                stack_pointer,
-                memory_stack,
-                rewind_stack,
-                Some(0),
+                WasixRewind {
+                    stack_lower,
+                    stack_upper,
+                    stack_pointer,
+                    memory_stack,
+                    rewind_stack,
+                    value: Some(0),
+                },
             )
             .await?;
             Ok(true)
@@ -1041,12 +1052,14 @@ where
             wasix_begin_rewind(
                 store,
                 instance,
-                stack_lower,
-                stack_upper,
-                snapshot.stack_pointer,
-                snapshot.memory_stack,
-                snapshot.rewind_stack,
-                Some(value),
+                WasixRewind {
+                    stack_lower,
+                    stack_upper,
+                    stack_pointer: snapshot.stack_pointer,
+                    memory_stack: snapshot.memory_stack,
+                    rewind_stack: snapshot.rewind_stack,
+                    value: Some(value),
+                },
             )
             .await?;
             Ok(true)
@@ -1114,12 +1127,14 @@ where
             wasix_begin_rewind(
                 store,
                 instance,
-                stack_lower,
-                stack_upper,
-                stack_pointer,
-                memory_stack,
-                rewind_stack,
-                Some(u64::from(child_pid)),
+                WasixRewind {
+                    stack_lower,
+                    stack_upper,
+                    stack_pointer,
+                    memory_stack,
+                    rewind_stack,
+                    value: Some(u64::from(child_pid)),
+                },
             )
             .await?;
             Ok(true)
@@ -1168,12 +1183,14 @@ where
             wasix_begin_rewind(
                 store,
                 instance,
-                stack_lower,
-                stack_upper,
-                stack_pointer,
-                memory_stack,
-                rewind_stack,
-                None,
+                WasixRewind {
+                    stack_lower,
+                    stack_upper,
+                    stack_pointer,
+                    memory_stack,
+                    rewind_stack,
+                    value: None,
+                },
             )
             .await?;
             Ok(true)
@@ -1184,17 +1201,20 @@ where
 pub(super) async fn wasix_begin_rewind<CpuImpl, HostFs>(
     store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, HostFs>>,
     instance: &wasmtime::Instance,
-    stack_lower: u32,
-    stack_upper: u32,
-    stack_pointer: u32,
-    memory_stack: Vec<u8>,
-    rewind_stack: Vec<u8>,
-    value: Option<u64>,
+    rewind: WasixRewind,
 ) -> Result<(), ProgramExecError>
 where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
+    let WasixRewind {
+        stack_lower,
+        stack_upper,
+        stack_pointer,
+        memory_stack,
+        rewind_stack,
+        value,
+    } = rewind;
     if stack_lower >= stack_pointer || stack_pointer > stack_upper {
         return Err(ProgramExecError {
             kind: ProgramExecErrorKind::InvalidBinary,
@@ -1290,15 +1310,10 @@ where
         kind: ProgramExecErrorKind::OutOfMemory,
         detail: ProgramExecErrorDetail::ImportedSharedMemoryBudgetExceeded,
     })?;
-    let mut memory_bytes = Vec::with_capacity(memory_len);
-    unsafe {
-        memory_bytes.set_len(memory_len);
-        core::ptr::copy_nonoverlapping(
-            memory.as_ptr().cast::<u8>(),
-            memory_bytes.as_mut_ptr(),
-            memory_len,
-        );
-    }
+    // SAFETY: `memory` is the guest's live linear memory, so its first
+    // `memory_len` bytes are readable for the duration of this borrow.
+    let memory_bytes =
+        unsafe { core::slice::from_raw_parts(memory.as_ptr().cast::<u8>(), memory_len) }.to_vec();
     if let Some(snapshot_started) = snapshot_started {
         record_program_kernel_profile(
             &store.data().runtime_state,
@@ -1447,18 +1462,20 @@ where
             kind: ProgramExecErrorKind::InvalidBinary,
             detail: ProgramExecErrorDetail::ImageReplacementUnavailable,
         })?;
-    let restore = CoreModuleRestore {
+    let restore = Box::new(CoreModuleRestore {
         memory: fork_memory,
         memory_spec,
         descriptors: store.data().descriptors.clone(),
         signal_dispositions: store.data().signal_dispositions.clone(),
-        stack_lower,
-        stack_upper,
-        stack_pointer,
-        memory_stack,
-        rewind_stack,
-        value: 0,
-    };
+        rewind: WasixRewind {
+            stack_lower,
+            stack_upper,
+            stack_pointer,
+            memory_stack,
+            rewind_stack,
+            value: Some(0),
+        },
+    });
     // A fork inherits the parent's argument vector verbatim.
     let argv = ProgramArgv::inherited(store.data().arguments.clone()).ok_or(ProgramExecError {
         kind: ProgramExecErrorKind::InvalidBinary,
@@ -1478,17 +1495,19 @@ where
     };
     let mut child = service.spawn_loaded_with_output_mode(
         store.data().exec_context(),
-        argv,
-        environment,
         ProgramExecutable::ForkedCoreModule { compiled, restore },
-        store.data().authority.clone(),
-        Some(store.data().filesystem.snapshot()),
-        None,
-        Vec::new(),
+        ProgramLaunch::new(
+            argv,
+            environment,
+            store.data().authority.clone(),
+            Some(store.data().filesystem.snapshot()),
+        ),
         output_mode,
-        None,
-        None,
-        None,
+        ChildStdio {
+            stdin: None,
+            stdout: None,
+            stderr: None,
+        },
     )?;
     let pid = u32::try_from(child.instance_id.raw()).map_err(|_| ProgramExecError {
         kind: ProgramExecErrorKind::Internal,
@@ -1645,11 +1664,10 @@ pub(super) fn validate_preview1_program_import(
                 return Ok(());
             }
         }
-        WASIX_MODULE => {
-            if crate::wasmtime_adapter::wasix::LINKED_IMPORTS.contains(&name) {
+        WASIX_MODULE
+            if crate::wasmtime_adapter::wasix::LINKED_IMPORTS.contains(&name) => {
                 return Ok(());
             }
-        }
         _ => {}
     }
     tracing::error!(

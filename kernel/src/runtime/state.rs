@@ -9,7 +9,8 @@ use crate::{
     DEFAULT_PERF_METRIC_CAPACITY, DEFAULT_PROFILE_STACK_CAPACITY, DEFAULT_TRACE_HISTORY_CAPACITY,
     EmbeddedBootFs, FoldedProfileSample, FutexKey, FutexTable, FutexWaitRegistration,
     HEAP_SIZE_CLASS_COUNT, HeapStats, InstanceRegistry, Notify, PerfMetricFilter,
-    PerfMetricHistory, PerfMetricSample, ProfileFilter, ProfileHistory, ProfileScope, StatsSample,
+    PerfMetricHistory, PerfMetricSample, PerfSample, ProfileFilter, ProfileHistory, ProfileScope,
+    StatsSample,
     TraceEvent, TraceFilter, TraceHistory, embedded_init,
 };
 use crate::{RootEntropy, RootEntropyHandle};
@@ -262,14 +263,16 @@ fn record_heap_delta_metric(
     if events == 0 && bytes == 0 {
         return;
     }
-    metrics.lock().record_parts_events(
+    metrics.lock().record_parts(
         ProfileScope::Kernel,
         "kernel;heap;",
         name,
-        events,
-        0,
-        HardwarePerfCounterDelta::default(),
-        bytes,
+        PerfSample {
+            events,
+            elapsed_nanos: 0,
+            counters: HardwarePerfCounterDelta::default(),
+            bytes,
+        },
     );
 }
 
@@ -511,59 +514,12 @@ where
             .folded(filter, core::iter::empty(), limit)
     }
 
-    pub fn record_perf_metric_parts_nanos(
+    pub fn record_perf_metric_parts(
         &self,
         scope: ProfileScope,
         prefix: &str,
         suffix: &str,
-        elapsed_nanos: u64,
-        counters: HardwarePerfCounterDelta,
-        bytes: u64,
-    ) {
-        if !self.inner.profiling_enabled.load(Ordering::Acquire) {
-            return;
-        }
-        self.inner.perf_metrics.lock().record_parts(
-            scope,
-            prefix,
-            suffix,
-            elapsed_nanos,
-            counters,
-            bytes,
-        );
-    }
-
-    pub fn record_perf_metric_parts_events_nanos(
-        &self,
-        scope: ProfileScope,
-        prefix: &str,
-        suffix: &str,
-        events: u64,
-        elapsed_nanos: u64,
-        counters: HardwarePerfCounterDelta,
-        bytes: u64,
-    ) {
-        if !self.inner.profiling_enabled.load(Ordering::Acquire) {
-            return;
-        }
-        self.inner.perf_metrics.lock().record_parts_events(
-            scope,
-            prefix,
-            suffix,
-            events,
-            elapsed_nanos,
-            counters,
-            bytes,
-        );
-    }
-
-    pub fn record_perf_metric_str_nanos(
-        &self,
-        scope: ProfileScope,
-        name: &str,
-        elapsed_nanos: u64,
-        counters: HardwarePerfCounterDelta,
-        bytes: u64,
+        sample: PerfSample,
     ) {
         if !self.inner.profiling_enabled.load(Ordering::Acquire) {
             return;
@@ -571,7 +527,17 @@ where
         self.inner
             .perf_metrics
             .lock()
-            .record_str(scope, name, elapsed_nanos, counters, bytes);
+            .record_parts(scope, prefix, suffix, sample);
+    }
+
+    pub fn record_perf_metric_str(&self, scope: ProfileScope, name: &str, sample: PerfSample) {
+        if !self.inner.profiling_enabled.load(Ordering::Acquire) {
+            return;
+        }
+        self.inner
+            .perf_metrics
+            .lock()
+            .record_str(scope, name, sample);
     }
 
     pub fn record_kernel_heap_metrics(&self, stats: HeapStats) {
@@ -650,13 +616,7 @@ where
     }
 
     #[track_caller]
-    pub fn record_perf_metric_at_caller_nanos(
-        &self,
-        scope: ProfileScope,
-        elapsed_nanos: u64,
-        counters: HardwarePerfCounterDelta,
-        bytes: u64,
-    ) {
+    pub fn record_perf_metric_at_caller(&self, scope: ProfileScope, sample: PerfSample) {
         if !self.inner.profiling_enabled.load(Ordering::Acquire) {
             return;
         }
@@ -665,7 +625,7 @@ where
         self.inner
             .perf_metrics
             .lock()
-            .record_str(scope, &name, elapsed_nanos, counters, bytes);
+            .record_str(scope, &name, sample);
     }
 
     pub fn perf_metrics(
@@ -994,46 +954,14 @@ where
         RuntimeState::record_profile_stack_parts_nanos(self, scope, prefix, suffix, weight_nanos);
     }
 
-    fn record_perf_metric_parts_nanos(
+    fn record_perf_metric_parts(
         &self,
         scope: ProfileScope,
         prefix: &str,
         suffix: &str,
-        elapsed_nanos: u64,
-        counters: HardwarePerfCounterDelta,
-        bytes: u64,
+        sample: PerfSample,
     ) {
-        RuntimeState::record_perf_metric_parts_nanos(
-            self,
-            scope,
-            prefix,
-            suffix,
-            elapsed_nanos,
-            counters,
-            bytes,
-        );
-    }
-
-    fn record_perf_metric_parts_events_nanos(
-        &self,
-        scope: ProfileScope,
-        prefix: &str,
-        suffix: &str,
-        events: u64,
-        elapsed_nanos: u64,
-        counters: HardwarePerfCounterDelta,
-        bytes: u64,
-    ) {
-        RuntimeState::record_perf_metric_parts_events_nanos(
-            self,
-            scope,
-            prefix,
-            suffix,
-            events,
-            elapsed_nanos,
-            counters,
-            bytes,
-        );
+        RuntimeState::record_perf_metric_parts(self, scope, prefix, suffix, sample);
     }
 }
 

@@ -142,6 +142,49 @@ where
     inner: Arc<UserProgramServiceInner<CpuImpl, HostFs>>,
 }
 
+/// The program a launch runs and the credentials it runs under.
+///
+/// Distinct from [`ProgramExecContext`], which is the host the program
+/// runs *in*, and from [`ChildStdio`], which is how the caller talks to
+/// it once it is running.
+pub(super) struct ProgramLaunch {
+    argv: ProgramArgv,
+    env: Vec<(String, String)>,
+    authority: ProcessAuthority,
+    filesystem: Option<DebugFileSystemSnapshot>,
+    /// Inherited preview1 descriptors. Only core modules have a
+    /// descriptor table; a component ignores one.
+    descriptors: Option<Preview1DescriptorTable>,
+    signal_dispositions: Vec<WasixSignalDisposition>,
+}
+
+impl ProgramLaunch {
+    /// A launch that inherits nothing: no descriptors, no signal
+    /// dispositions.
+    pub(super) fn new(
+        argv: ProgramArgv,
+        env: Vec<(String, String)>,
+        authority: ProcessAuthority,
+        filesystem: Option<DebugFileSystemSnapshot>,
+    ) -> Self {
+        Self {
+            argv,
+            env,
+            authority,
+            filesystem,
+            descriptors: None,
+            signal_dispositions: Vec::new(),
+        }
+    }
+}
+
+/// The ends of a child's standard streams that stay with the parent.
+pub(super) struct ChildStdio {
+    pub(super) stdin: Option<crate::ByteWriter>,
+    pub(super) stdout: Option<crate::ByteReader>,
+    pub(super) stderr: Option<crate::ByteReader>,
+}
+
 #[derive(Clone)]
 pub(crate) struct ProgramExecContext<CpuImpl, HostFs>
 where
@@ -184,8 +227,7 @@ where
     // Release AArch64/HVF quickjs-loop evidence: caching the Preview1 core
     // InstancePre moved the median from 53 ms to 50-51 ms. Cache only modules
     // whose imports are independent of per-process shared-memory binding.
-    core_module_instance_pre_cache:
-        Arc<Mutex<ComponentCache<InstancePre<Preview1ProgramStore<CpuImpl, HostFs>>>>>,
+    core_module_instance_pre_cache: CoreModuleInstancePreCache<CpuImpl, HostFs>,
     compiler_artifact: Option<Bytes>,
     /// Lazily-built compiler kernel-plugin runtime. The plugin's
     /// `wasmtime::Module`, `InstancePre`, and 512 MiB `SharedMemory` are
@@ -421,12 +463,14 @@ where
             run_system_component(
                 component,
                 world,
-                cpu.clone(),
-                kernel.timer(),
-                kernel.spawner(),
-                debug_state.clone(),
-                read_serial,
-                write_serial,
+                super::SystemComponentHost {
+                    cpu: cpu.clone(),
+                    timer: kernel.timer(),
+                    spawner: kernel.spawner(),
+                    debug_state: debug_state.clone(),
+                    read_serial,
+                    write_serial,
+                },
             ),
             cpu.clone(),
             debug_state,
@@ -549,10 +593,13 @@ where
                     write_serial,
                 ),
                 None => {
-                    assert!(
-                        !cfg!(feature = "embedded-debugger"),
-                        "embedded init bootfs is missing the system component"
-                    );
+                    // A build that embeds the debugger must also embed
+                    // the system component that launches it, so an empty
+                    // slot there is a packaging error rather than the
+                    // ordinary no-component boot.
+                    if cfg!(feature = "embedded-debugger") {
+                        panic!("embedded init bootfs is missing the system component");
+                    }
                     run_kernel_processor_forever(cpu, kernel, debug_state);
                 }
             }
@@ -613,14 +660,16 @@ fn record_executor_metrics<CpuImpl, HostFs>(
         .uptime_nanos(ended)
         .saturating_sub(debug_state.uptime_nanos(started));
     let counter_delta = cpu.hardware_perf_counters().delta_since(counters);
-    debug_state.record_perf_metric_parts_events_nanos(
+    debug_state.record_perf_metric_parts(
         ProfileScope::Kernel,
         "kernel;executor;",
         "run",
-        usize_to_u64(progress, "executor progress count"),
-        elapsed_nanos,
-        counter_delta,
-        0,
+        crate::PerfSample {
+            events: usize_to_u64(progress, "executor progress count"),
+            elapsed_nanos,
+            counters: counter_delta,
+            bytes: 0,
+        },
     );
     record_executor_event_metric(
         debug_state,
@@ -657,14 +706,16 @@ fn record_executor_event_metric<CpuImpl, HostFs>(
     if events == 0 {
         return;
     }
-    runtime_state.record_perf_metric_parts_events_nanos(
+    runtime_state.record_perf_metric_parts(
         ProfileScope::Kernel,
         "kernel;executor;",
         name,
-        usize_to_u64(events, "executor event count"),
-        0,
-        helios_hal::cpu::HardwarePerfCounterDelta::default(),
-        0,
+        crate::PerfSample {
+            events: usize_to_u64(events, "executor event count"),
+            elapsed_nanos: 0,
+            counters: helios_hal::cpu::HardwarePerfCounterDelta::default(),
+            bytes: 0,
+        },
     );
 }
 
@@ -770,14 +821,16 @@ fn record_program_kernel_profile_sample<CpuImpl, HostFs>(
             .cpu
             .hardware_perf_counters()
             .delta_since(profile.counters);
-        profile.runtime_state.record_perf_metric_parts_events_nanos(
+        profile.runtime_state.record_perf_metric_parts(
             ProfileScope::Kernel,
             "kernel;program;",
             phase,
-            1,
-            elapsed_nanos,
-            counter_delta,
-            0,
+            crate::PerfSample {
+                events: 1,
+                elapsed_nanos,
+                counters: counter_delta,
+                bytes: 0,
+            },
         );
 
         let heap = crate::heap_stats();
@@ -830,14 +883,16 @@ fn record_program_heap_delta<CpuImpl, HostFs>(
         "heap-dealloc" => "kernel;program-heap;dealloc;",
         _ => panic!("unknown program heap metric kind {kind}"),
     };
-    runtime_state.record_perf_metric_parts_events_nanos(
+    runtime_state.record_perf_metric_parts(
         ProfileScope::Kernel,
         phase_prefix,
         phase,
-        events,
-        0,
-        helios_hal::cpu::HardwarePerfCounterDelta::default(),
-        bytes,
+        crate::PerfSample {
+            events,
+            elapsed_nanos: 0,
+            counters: helios_hal::cpu::HardwarePerfCounterDelta::default(),
+            bytes,
+        },
     );
 }
 
@@ -853,187 +908,86 @@ where
     /// Spawn a new child program. The returned handle gives the caller
     /// direct access to the child's stdin/stdout/stderr channels and a
     /// future resolving with its exit status.
-    pub(crate) async fn spawn(
+    pub(super) async fn spawn(
         &self,
         exec_context: ProgramExecContext<CpuImpl, HostFs>,
-        argv: ProgramArgv,
-        env: Vec<(String, String)>,
         source: ProgramSource,
         hint: Option<AotCompileHint>,
-        authority: ProcessAuthority,
-        filesystem: Option<DebugFileSystemSnapshot>,
-    ) -> Result<ChildHandle, ProgramExecError> {
-        self.spawn_with_signal_dispositions(
-            exec_context,
-            argv,
-            env,
-            source,
-            hint,
-            authority,
-            filesystem,
-            Vec::new(),
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn spawn_with_signal_dispositions(
-        &self,
-        exec_context: ProgramExecContext<CpuImpl, HostFs>,
-        argv: ProgramArgv,
-        env: Vec<(String, String)>,
-        source: ProgramSource,
-        hint: Option<AotCompileHint>,
-        authority: ProcessAuthority,
-        filesystem: Option<DebugFileSystemSnapshot>,
-        signal_dispositions: Vec<WasixSignalDisposition>,
+        launch: ProgramLaunch,
     ) -> Result<ChildHandle, ProgramExecError> {
         super::emit_program_stage_marker(exec_context.write_serial, "program:spawn-begin");
         let executable = self
             .load_executable(&exec_context, &source, hint, exec_context.write_serial)
             .await?;
-        self.spawn_loaded(
-            exec_context,
-            argv,
-            env,
-            executable,
-            authority,
-            filesystem,
-            None,
-            signal_dispositions,
-        )
+        self.spawn_loaded(exec_context, executable, launch)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn spawn_with_signal_dispositions_and_output_mode(
+    /// Spawn a child whose stdio the caller has already wired up.
+    ///
+    /// A preview1 descriptor table only means anything to a core
+    /// module, so one supplied alongside a component is dropped here
+    /// rather than at every call site.
+    async fn spawn_with_output_mode(
         &self,
         exec_context: ProgramExecContext<CpuImpl, HostFs>,
-        argv: ProgramArgv,
-        env: Vec<(String, String)>,
         source: ProgramSource,
         hint: Option<AotCompileHint>,
-        authority: ProcessAuthority,
-        filesystem: Option<DebugFileSystemSnapshot>,
-        signal_dispositions: Vec<WasixSignalDisposition>,
+        mut launch: ProgramLaunch,
         output_mode: OutputMode,
-        stdin: Option<crate::ByteWriter>,
-        stdout: Option<crate::ByteReader>,
-        stderr: Option<crate::ByteReader>,
+        stdio: ChildStdio,
     ) -> Result<ChildHandle, ProgramExecError> {
         super::emit_program_stage_marker(exec_context.write_serial, "program:spawn-begin");
         let executable = self
             .load_executable(&exec_context, &source, hint, exec_context.write_serial)
             .await?;
-        self.spawn_loaded_with_output_mode(
-            exec_context,
-            argv,
-            env,
-            executable,
-            authority,
-            filesystem,
-            None,
-            signal_dispositions,
-            output_mode,
-            stdin,
-            stdout,
-            stderr,
-        )
+        if matches!(executable, ProgramExecutable::Component(_)) {
+            launch.descriptors = None;
+        }
+        self.spawn_loaded_with_output_mode(exec_context, executable, launch, output_mode, stdio)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn spawn_with_descriptors_and_output_mode(
-        &self,
-        exec_context: ProgramExecContext<CpuImpl, HostFs>,
-        argv: ProgramArgv,
-        env: Vec<(String, String)>,
-        source: ProgramSource,
-        hint: Option<AotCompileHint>,
-        authority: ProcessAuthority,
-        filesystem: Option<DebugFileSystemSnapshot>,
-        descriptors: Preview1DescriptorTable,
-        signal_dispositions: Vec<WasixSignalDisposition>,
-        output_mode: OutputMode,
-        stdin: Option<crate::ByteWriter>,
-        stdout: Option<crate::ByteReader>,
-        stderr: Option<crate::ByteReader>,
-    ) -> Result<ChildHandle, ProgramExecError> {
-        super::emit_program_stage_marker(exec_context.write_serial, "program:spawn-begin");
-        let executable = self
-            .load_executable(&exec_context, &source, hint, exec_context.write_serial)
-            .await?;
-        let descriptors = match &executable {
-            ProgramExecutable::Component(_) => None,
-            ProgramExecutable::CoreModule(_) | ProgramExecutable::ForkedCoreModule { .. } => {
-                Some(descriptors)
-            }
-        };
-        self.spawn_loaded_with_output_mode(
-            exec_context,
-            argv,
-            env,
-            executable,
-            authority,
-            filesystem,
-            descriptors,
-            signal_dispositions,
-            output_mode,
-            stdin,
-            stdout,
-            stderr,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
     fn spawn_loaded(
         &self,
         exec_context: ProgramExecContext<CpuImpl, HostFs>,
-        argv: ProgramArgv,
-        env: Vec<(String, String)>,
         executable: ProgramExecutable<CpuImpl, HostFs>,
-        authority: ProcessAuthority,
-        filesystem: Option<DebugFileSystemSnapshot>,
-        descriptors: Option<Preview1DescriptorTable>,
-        signal_dispositions: Vec<WasixSignalDisposition>,
+        launch: ProgramLaunch,
     ) -> Result<ChildHandle, ProgramExecError> {
         let (stdin_writer, stdin_reader) = crate::byte_channel();
         let (stdout_writer, stdout_reader) = crate::byte_channel();
         let (stderr_writer, stderr_reader) = crate::byte_channel();
         self.spawn_loaded_with_output_mode(
             exec_context,
-            argv,
-            env,
             executable,
-            authority,
-            filesystem,
-            descriptors,
-            signal_dispositions,
+            launch,
             OutputMode::Child {
                 stdin_rx: stdin_reader,
                 stdout_tx: stdout_writer,
                 stderr_tx: stderr_writer,
             },
-            Some(stdin_writer),
-            Some(stdout_reader),
-            Some(stderr_reader),
+            ChildStdio {
+                stdin: Some(stdin_writer),
+                stdout: Some(stdout_reader),
+                stderr: Some(stderr_reader),
+            },
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn spawn_loaded_with_output_mode(
         &self,
         exec_context: ProgramExecContext<CpuImpl, HostFs>,
-        argv: ProgramArgv,
-        mut env: Vec<(String, String)>,
         executable: ProgramExecutable<CpuImpl, HostFs>,
-        authority: ProcessAuthority,
-        filesystem: Option<DebugFileSystemSnapshot>,
-        descriptors: Option<Preview1DescriptorTable>,
-        signal_dispositions: Vec<WasixSignalDisposition>,
+        launch: ProgramLaunch,
         output_mode: OutputMode,
-        stdin: Option<crate::ByteWriter>,
-        stdout: Option<crate::ByteReader>,
-        stderr: Option<crate::ByteReader>,
+        stdio: ChildStdio,
     ) -> Result<ChildHandle, ProgramExecError> {
+        let ProgramLaunch {
+            argv,
+            mut env,
+            authority,
+            filesystem,
+            descriptors,
+            signal_dispositions,
+        } = launch;
         let started_at = exec_context
             .runtime_state
             .uptime_nanos(exec_context.cpu.now().ticks());
@@ -1093,6 +1047,11 @@ where
             let _ = exit_tx.send(result);
         });
 
+        let ChildStdio {
+            stdin,
+            stdout,
+            stderr,
+        } = stdio;
         let child = ChildHandle {
             instance_id,
             signal_state,
@@ -1107,82 +1066,42 @@ where
     /// Convenience wrapper: spawn a program, feed it `stdin`, drain its
     /// stdout and stderr into buffers, and return the collected output
     /// along with the exit code.
-    pub(crate) async fn exec_buffered(
+    pub(super) async fn exec_buffered(
         &self,
         exec_context: ProgramExecContext<CpuImpl, HostFs>,
-        argv: ProgramArgv,
-        env: Vec<(String, String)>,
         source: ProgramSource,
         hint: Option<AotCompileHint>,
         stdin: Vec<u8>,
-        authority: ProcessAuthority,
-        filesystem: Option<DebugFileSystemSnapshot>,
+        launch: ProgramLaunch,
     ) -> Result<ExecResult, ProgramExecError> {
-        self.exec_buffered_with_snapshot(
-            exec_context,
-            argv,
-            env,
-            source,
-            hint,
-            stdin,
-            authority,
-            filesystem,
-        )
-        .await
-        .map(|(result, _)| result)
+        self.exec_buffered_with_snapshot(exec_context, source, hint, stdin, launch)
+            .await
+            .map(|(result, _)| result)
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn exec_buffered_with_snapshot(
         &self,
         exec_context: ProgramExecContext<CpuImpl, HostFs>,
-        argv: ProgramArgv,
-        env: Vec<(String, String)>,
         source: ProgramSource,
         hint: Option<AotCompileHint>,
         stdin: Vec<u8>,
-        authority: ProcessAuthority,
-        filesystem: Option<DebugFileSystemSnapshot>,
+        launch: ProgramLaunch,
     ) -> Result<(ExecResult, Option<DebugFileSystemSnapshot>), ProgramExecError> {
         let executable = self
             .load_executable(&exec_context, &source, hint, exec_context.write_serial)
             .await?;
-        self.exec_loaded_buffered(
-            exec_context,
-            argv,
-            env,
-            executable,
-            stdin,
-            authority,
-            filesystem,
-            None,
-            Vec::new(),
-        )
-        .await
+        self.exec_loaded_buffered(exec_context, executable, stdin, launch)
+            .await
     }
 
     async fn exec_loaded_buffered(
         &self,
         exec_context: ProgramExecContext<CpuImpl, HostFs>,
-        argv: ProgramArgv,
-        env: Vec<(String, String)>,
         executable: ProgramExecutable<CpuImpl, HostFs>,
         stdin: Vec<u8>,
-        authority: ProcessAuthority,
-        filesystem: Option<DebugFileSystemSnapshot>,
-        descriptors: Option<Preview1DescriptorTable>,
-        signal_dispositions: Vec<WasixSignalDisposition>,
+        launch: ProgramLaunch,
     ) -> Result<(ExecResult, Option<DebugFileSystemSnapshot>), ProgramExecError> {
-        let mut child = self.spawn_loaded(
-            exec_context,
-            argv,
-            env,
-            executable,
-            authority,
-            filesystem,
-            descriptors,
-            signal_dispositions,
-        )?;
+        let mut child = self.spawn_loaded(exec_context, executable, launch)?;
 
         // Feed stdin in one shot, then close the writer to signal EOF.
         if let Some(writer) = child.take_stdin() {
@@ -1589,7 +1508,7 @@ where
         let thread_pointer =
             tls_base
                 .checked_add(pthread_self_offset)
-                .ok_or_else(|| ProgramExecError {
+                .ok_or(ProgramExecError {
                     kind: ProgramExecErrorKind::Internal,
                     detail: ProgramExecErrorDetail::CompilerThreadPointerOverflow,
                 })?;
@@ -1697,15 +1616,15 @@ where
             .compiler_artifact
             .clone()
             .or_else(|| read_bootfs_artifact(&exec_context.runtime_state, COMPILER_PLUGIN_PATH))
-            .ok_or_else(|| ProgramExecError {
+            .ok_or(ProgramExecError {
                 kind: ProgramExecErrorKind::InvalidPath,
                 detail: ProgramExecErrorDetail::CompilerUnavailable,
             })
     }
 
     /// Build the compiler kernel-plugin runtime on first compile, reuse
-    /// it forever after. The cached `wasmtime::Module` + `InstancePre`
-    /// + 512 MiB `SharedMemory` are stable across calls; per-call work
+    /// it forever after. The cached `wasmtime::Module`, `InstancePre`
+    /// and 512 MiB `SharedMemory` are stable across calls; per-call work
     /// drops to a fresh `wasmtime::Store` and `instance_pre.instantiate`.
     fn ensure_compiler_plugin(
         &self,

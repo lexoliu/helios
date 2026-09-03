@@ -37,7 +37,7 @@ where
     ///
     /// One `A` and one `AAAA` question go out together under separate
     /// ids and both answers are collected before returning, because
-    /// `wasi:sockets/ip-name-lookup` hands the guest one address stream
+    /// the guest's name-lookup interface hands it one address stream
     /// covering both families and cannot ask again for the other one.
     /// A resolver that answers only one of the two still yields that
     /// family once the deadline passes rather than failing the lookup.
@@ -902,10 +902,13 @@ impl NetworkShard {
         self.stack
             .send_udp_ipv4_from(
                 Ipv4Address::UNSPECIFIED,
-                DHCP_CLIENT_PORT,
                 Ipv4Address::BROADCAST,
-                DHCP_SERVER_PORT,
-                &payload[..len],
+                UdpEgress {
+                    source_port: DHCP_CLIENT_PORT,
+                    destination_port: DHCP_SERVER_PORT,
+                    payload: &payload[..len],
+                    hop_limit: DEFAULT_HOP_LIMIT,
+                },
                 identification,
                 now,
             )

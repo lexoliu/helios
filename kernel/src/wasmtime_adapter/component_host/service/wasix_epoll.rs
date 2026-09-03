@@ -354,14 +354,13 @@ where
         }
         ready.push(interest);
     }
-    if !oneshot_fds.is_empty() {
-        if let Some(Preview1Descriptor::Epoll(epoll)) = caller.data_mut().descriptors.get_mut(epfd)
+    if !oneshot_fds.is_empty()
+        && let Some(Preview1Descriptor::Epoll(epoll)) = caller.data_mut().descriptors.get_mut(epfd)
         {
             epoll
                 .interests
                 .retain(|interest| !oneshot_fds.contains(&interest.fd));
         }
-    }
     ready
 }
 

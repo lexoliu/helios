@@ -50,8 +50,8 @@ impl Instant {
 /// (about 1.845e10 ticks). On a TSC timebase that ceiling is only a
 /// handful of seconds of uptime, and a saturating `u64` product pins
 /// the result to a constant — every wall-clock deadline derived from
-/// it (TCP pacing and retransmission timers, operation timeouts, WASI
-/// clocks) then stops advancing and the waiting tasks park forever.
+/// it (TCP pacing and retransmission timers, operation timeouts, guest
+/// clock reads) then stops advancing and the waiting tasks park forever.
 /// Timebases with a lower frequency merely hit the same cliff later,
 /// which is why the conversion lives here and is shared by every
 /// backend rather than being rewritten per platform.
