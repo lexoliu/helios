@@ -252,24 +252,15 @@ impl SwapBackend for NoSwap {
     type Token = ();
     type Error = NoSwapError;
 
-    fn swap_out<'a>(
-        &'a self,
-        _bytes: &'a [u8],
-    ) -> impl Future<Output = Result<Self::Token, Self::Error>> + Send + 'a {
-        async { Err(NoSwapError) }
+    async fn swap_out(&self, _bytes: &[u8]) -> Result<Self::Token, Self::Error> {
+        Err(NoSwapError)
     }
 
-    fn swap_in<'a>(
-        &'a self,
-        _token: Self::Token,
-        _dst: &'a mut [u8],
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
-        async { Err(NoSwapError) }
+    async fn swap_in(&self, _token: Self::Token, _dst: &mut [u8]) -> Result<(), Self::Error> {
+        Err(NoSwapError)
     }
 
-    fn release<'a>(&'a self, _token: Self::Token) -> impl Future<Output = ()> + Send + 'a {
-        async {}
-    }
+    async fn release(&self, _token: Self::Token) {}
 }
 
 /// Per-platform virtual address space. See module docs for semantics.

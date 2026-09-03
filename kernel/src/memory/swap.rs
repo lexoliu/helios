@@ -32,6 +32,30 @@
 //! outside a fiber is fatal, and it is fatal on purpose: silently
 //! resolving it would need a nested executor.
 //!
+//! The matching half of that contract is enforced here rather than at
+//! every host call: **a page is only ever detached from an instance
+//! that is not on a processor.** An executing instance may be inside a
+//! host call, and that frame already holds its fiber's blocking
+//! context, so the trampoline could not block again to fault a page
+//! back in. Both eviction phases below take that bar; the difference
+//! between them is how long the instance has to have been off.
+//!
+//! A fiber stopped in the trampoline is covered by that same bar
+//! without needing its own accounting: blocking there crosses no
+//! call-hook boundary, so the instance is still counted as on a
+//! processor for as long as its page is being read back.
+//!
+//! Two more properties keep a page that has just come back from being
+//! taken straight out again. A reinstated page is mapped with its
+//! access flag set, so it reads as hot for a full aging cycle and the
+//! `Red` phase — which takes only cold pages — passes over it; and an
+//! instance that has just taken a fault or made a host call is by
+//! definition not ten seconds idle, so the `Yellow` phase, which
+//! ignores age, has no claim on it either. That is what makes
+//! [`SwapHandle::ensure_present`] a sound contract for kernel paths:
+//! the pages it faults in stay in until the host call that asked for
+//! them has finished with them.
+//!
 //! # Order against the balloon
 //!
 //! Both this and the memory balloon (`super::balloon`) read the same
@@ -83,6 +107,26 @@ pub const SWAP_BATCH_BYTES: usize = 2 * 1024 * 1024;
 
 /// How often the policy re-reads pressure when nothing else wakes it.
 pub const SWAP_TICK: Duration = Duration::from_millis(500);
+
+/// How often the task reports what it has moved.
+///
+/// Swap is a per-page activity and a guest walking a swapped-out range
+/// takes thousands of faults in a row, so a line per page — or even per
+/// burst — is a flood on the one serial console the machine has. One
+/// summary a second keeps the fact that swap is working visible without
+/// crowding out everything else; the exact numbers live in the stats
+/// record.
+const SWAP_REPORT_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Pages one pass will look at before giving up, however few of them it
+/// found worth taking.
+///
+/// Without this a pass over a resident set with nothing cold in it walks
+/// every page, clearing access flags and invalidating translations the
+/// whole way, every tick — which costs far more than the memory it is
+/// trying to reclaim. Four times the take budget leaves room to skip
+/// hot pages and still fill a batch.
+const SCAN_BUDGET_PAGES: usize = 4 * (SWAP_BATCH_BYTES / PhysFrame::SIZE);
 
 /// Why a platform runs without swap.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
@@ -270,6 +314,9 @@ impl SwapHandle {
     /// This is what the page-fault trampoline blocks the faulting fiber
     /// on, and what [`Self::ensure_present`] calls per page.
     pub async fn fault_in(&self, addr: VirtAddr) -> Result<(), SwapFaultError> {
+        // A fault reports the address the instruction touched, not the
+        // page it lives in; everything below this point works in pages.
+        let addr = addr.page_floor();
         let reply = Arc::new(SwapFaultReply::new());
         let request = SwapFaultRequest {
             addr,
@@ -410,6 +457,7 @@ where
         cpu,
         map: SwapMap::new(),
         page: vec![0_u8; PhysFrame::SIZE].into_boxed_slice(),
+        report: SwapReport::default(),
     };
     spawner.spawn_local_detached(async move {
         service.run(timer).await;
@@ -490,6 +538,18 @@ struct SwapService<Backend: SwapBackend, CpuImpl> {
     /// The one staging buffer every transfer goes through. Owning it
     /// here is what keeps the fault path allocation-free.
     page: Box<[u8]>,
+    /// What the last summary line reported, so the next one can report
+    /// the difference. See [`SWAP_REPORT_INTERVAL`].
+    report: SwapReport,
+}
+
+/// The running total the periodic summary line subtracts from.
+#[derive(Clone, Copy, Default)]
+struct SwapReport {
+    at_nanos: u64,
+    pages_in: u64,
+    pages_out: u64,
+    fault_latency_total_nanos: u64,
 }
 
 impl<Backend, CpuImpl> SwapService<Backend, CpuImpl>
@@ -504,6 +564,7 @@ where
             self.serve_faults().await;
             self.release_orphaned_tokens().await;
             self.run_policy_pass().await;
+            self.report_activity();
             let notified = self.handle.shared.work.notified();
             futures::future::select(
                 core::pin::pin!(notified),
@@ -549,6 +610,39 @@ where
                 }
             }
         }
+    }
+
+    /// Emits at most one line per [`SWAP_REPORT_INTERVAL`] describing
+    /// what moved since the last one.
+    fn report_activity(&mut self) {
+        let now = monotonic_nanos(&self.cpu);
+        if now.saturating_sub(self.report.at_nanos) < SWAP_REPORT_INTERVAL.as_nanos() as u64 {
+            return;
+        }
+        let counters = &self.handle.shared.counters;
+        let current = SwapReport {
+            at_nanos: now,
+            pages_in: counters.pages_in.load(Ordering::Acquire),
+            pages_out: counters.pages_out.load(Ordering::Acquire),
+            fault_latency_total_nanos: counters.fault_latency_total_nanos.load(Ordering::Acquire),
+        };
+        let pages_in = current.pages_in - self.report.pages_in;
+        let pages_out = current.pages_out - self.report.pages_out;
+        // A quiet interval is the normal case and says nothing worth a
+        // line; the window it would have covered rolls into the next.
+        if pages_in == 0 && pages_out == 0 {
+            return;
+        }
+        let latency = current.fault_latency_total_nanos - self.report.fault_latency_total_nanos;
+        self.report = current;
+        tracing::info!(
+            target: "helios_kernel::swap",
+            pages_in,
+            pages_out,
+            mean_fault_latency_nanos = latency.checked_div(pages_in).unwrap_or(0),
+            used_bytes = counters.used_bytes.load(Ordering::Acquire),
+            "swap active"
+        );
     }
 
     async fn swap_in(&mut self, addr: VirtAddr) -> Result<(), SwapFaultError> {
@@ -607,6 +701,12 @@ where
         if pressure == PressureLevel::Green {
             return;
         }
+        // A queued fault is a guest stopped mid-instruction; reclaiming
+        // memory can wait for it. The loop above serves the queue and
+        // comes straight back here.
+        if !self.handle.shared.faults.is_empty() {
+            return;
+        }
 
         let now = monotonic_nanos(&self.cpu);
         let idle_after = IDLE_SWAP_AFTER.as_nanos() as u64;
@@ -635,22 +735,30 @@ where
         }
 
         if pressure != PressureLevel::Red {
-            if moved != 0 {
-                tracing::info!(
-                    target: "helios_kernel::swap",
-                    bytes = moved,
-                    idle_instances = candidates.len(),
-                    "swapped idle instances out under yellow pressure"
-                );
-            }
+            tracing::debug!(
+                target: "helios_kernel::swap",
+                bytes = moved,
+                idle_instances = candidates.len(),
+                "swapped idle instances out under yellow pressure"
+            );
             return;
         }
 
-        // Red: the idle instances were not enough. Age the running ones
-        // and take the pages the hardware has not seen since the last
-        // pass. A pass that frees nothing is the signal the OOM killer
-        // acts on — it is not this task's job to condemn anything.
-        for id in self.registry.live_instances() {
+        // Red: ten seconds of idleness was not enough of a bar. Drop it
+        // to "not on a processor right now" and take only the pages the
+        // hardware has not seen since the last pass. A pass that frees
+        // nothing is the signal the OOM killer acts on — it is not this
+        // task's job to condemn anything.
+        //
+        // The bar stays at "not executing" rather than dropping to
+        // "anything": while an instance is on a processor it may be
+        // inside a host call, whose frame already holds that fiber's
+        // blocking context and so cannot block again to fault a page
+        // back in. Never detaching a page from an executing instance is
+        // what keeps the kernel out of that corner, and it is why the
+        // pre-fault accessor is a contract for kernel paths that hold
+        // guest pointers rather than a thing every host call must do.
+        for id in self.registry.idle_instances(now, 0) {
             if moved >= SWAP_BATCH_BYTES {
                 break;
             }
@@ -662,7 +770,7 @@ where
                 )
                 .await;
         }
-        tracing::info!(
+        tracing::debug!(
             target: "helios_kernel::swap",
             bytes = moved,
             "swap pass under red pressure"
@@ -675,6 +783,7 @@ where
         let mut plan = EvictionPlan {
             pages: Vec::new(),
             remaining: budget,
+            visits_left: SCAN_BUDGET_PAGES,
             age,
         };
         (self.hooks.scan_committed_pages)(
@@ -690,13 +799,20 @@ where
 
         let mut moved = 0_usize;
         for addr in plan.pages {
+            // The swap device is the resource both halves of this task
+            // contend for, and a fault has a fiber stopped behind it.
+            // Give the device up at the first page boundary after one
+            // arrives rather than making it wait out the batch.
+            if !self.handle.shared.faults.is_empty() {
+                break;
+            }
             match self.swap_out(addr).await {
                 Ok(()) => moved += PhysFrame::SIZE,
                 Err(()) => break,
             }
         }
         if moved != 0 {
-            tracing::info!(
+            tracing::debug!(
                 target: "helios_kernel::swap",
                 instance = owner.raw(),
                 pages = moved / PhysFrame::SIZE,
@@ -771,6 +887,9 @@ enum EvictionAge {
 struct EvictionPlan {
     pages: Vec<VirtAddr>,
     remaining: usize,
+    /// Pages this pass may still look at. A scan that finds nothing
+    /// cold must still end.
+    visits_left: usize,
     age: EvictionAge,
 }
 
@@ -781,9 +900,10 @@ impl EvictionPlan {
     /// address space, so a page passed over now is a candidate on the
     /// next pass if nothing touches it in between. That is the aging.
     fn consider(&mut self, addr: VirtAddr, age: PageAge) -> bool {
-        if self.remaining < PhysFrame::SIZE {
+        if self.remaining < PhysFrame::SIZE || self.visits_left == 0 {
             return false;
         }
+        self.visits_left -= 1;
         let take = match self.age {
             EvictionAge::Any => true,
             EvictionAge::ColdOnly => age == PageAge::Cold,
@@ -862,6 +982,7 @@ mod tests {
         let mut plan = EvictionPlan {
             pages: Vec::new(),
             remaining: 2 * PhysFrame::SIZE,
+            visits_left: SCAN_BUDGET_PAGES,
             age: EvictionAge::Any,
         };
         assert!(plan.consider(VirtAddr::new(0x1000), PageAge::Hot));
@@ -878,6 +999,7 @@ mod tests {
         let mut plan = EvictionPlan {
             pages: Vec::new(),
             remaining: 8 * PhysFrame::SIZE,
+            visits_left: SCAN_BUDGET_PAGES,
             age: EvictionAge::ColdOnly,
         };
         plan.consider(VirtAddr::new(0x1000), PageAge::Hot);
@@ -889,6 +1011,24 @@ mod tests {
             [VirtAddr::new(0x2000), VirtAddr::new(0x4000)],
             "only pages the hardware has not seen may be taken"
         );
+    }
+
+    #[test]
+    fn a_scan_that_finds_nothing_cold_still_ends() {
+        let mut plan = EvictionPlan {
+            pages: Vec::new(),
+            remaining: usize::MAX,
+            visits_left: 3,
+            age: EvictionAge::ColdOnly,
+        };
+        assert!(plan.consider(VirtAddr::new(0x1000), PageAge::Hot));
+        assert!(plan.consider(VirtAddr::new(0x2000), PageAge::Hot));
+        assert!(plan.consider(VirtAddr::new(0x3000), PageAge::Hot));
+        assert!(
+            !plan.consider(VirtAddr::new(0x4000), PageAge::Hot),
+            "a pass must stop looking once its visit budget is spent"
+        );
+        assert!(plan.pages.is_empty());
     }
 
     #[test]
