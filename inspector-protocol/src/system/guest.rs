@@ -530,6 +530,19 @@ fn convert_sample(sample: host_stats::Sample) -> stats::Sample {
         block: sample.block.map(convert_block_device),
         iommu: sample.iommu.map(convert_iommu),
         balloon: sample.balloon.map(convert_memory_balloon),
+        swap: sample.swap.map(convert_swap),
+    }
+}
+
+fn convert_swap(swap: host_stats::Swap) -> stats::Swap {
+    stats::Swap {
+        backend: swap.backend,
+        capacity_bytes: swap.capacity_bytes,
+        used_bytes: swap.used_bytes,
+        pages_out: swap.pages_out,
+        pages_in: swap.pages_in,
+        faults_served: swap.faults_served,
+        mean_fault_latency: swap.mean_fault_latency,
     }
 }
 

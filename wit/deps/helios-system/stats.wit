@@ -92,6 +92,25 @@ interface stats {
     reported-bytes: u64,
   }
 
+  /// Guest pages the kernel has moved out of memory, and what it cost
+  /// to bring them back.
+  record swap {
+    /// What the pages are written to.
+    backend: string,
+    /// Bytes that store can hold.
+    capacity-bytes: u64,
+    /// Bytes of it currently holding pages.
+    used-bytes: u64,
+    /// Pages written out since boot.
+    pages-out: u64,
+    /// Pages read back in since boot.
+    pages-in: u64,
+    /// Guest faults resolved by reading a page back.
+    faults-served: u64,
+    /// Mean time a faulting guest waited, over every fault served.
+    mean-fault-latency: mono-nanos,
+  }
+
   record sample {
     timestamp: mono-nanos,
     uptime: mono-nanos,
@@ -108,6 +127,10 @@ interface stats {
     iommu: option<iommu>,
     /// Absent on a machine that gave the kernel no memory balloon.
     balloon: option<memory-balloon>,
+    /// Absent on a machine with no swap: one whose address space cannot
+    /// fault a swapped-out page back in, or that has no disk to write
+    /// pages to.
+    swap: option<swap>,
   }
 
   /// Returns the latest coherent system-wide observation snapshot.

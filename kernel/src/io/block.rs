@@ -200,6 +200,20 @@ impl BlockService {
         }
     }
 
+    /// Blocks the boot self-check writes to, at the very end of the
+    /// disk. Nothing else may be placed there.
+    pub fn self_check_blocks(&self) -> usize {
+        SELF_CHECK_BYTES.div_ceil(self.geometry.logical_block_bytes)
+    }
+
+    /// Blocks available to swap: the whole disk except the ones the
+    /// self-check owns.
+    pub fn swap_blocks(&self) -> usize {
+        self.geometry
+            .capacity_blocks
+            .saturating_sub(self.self_check_blocks())
+    }
+
     /// Proves the disk round-trips before anything depends on it.
     ///
     /// The pattern is random so a device that answers with a stale or
@@ -254,6 +268,48 @@ impl BlockService {
                 .map_err(BlockSelfCheckError::Release)?;
         }
         Ok(())
+    }
+}
+
+/// The kernel's disk is itself a block device, so anything generic over
+/// one — the swap backend, in particular — can be built on the service
+/// rather than on the driver behind it, and its requests are counted
+/// like every other.
+impl BlockDevice for BlockService {
+    async fn read_block(&self, block_id: usize, buf: &mut [u8]) -> IoResult<()> {
+        BlockService::read_block(self, block_id, buf).await
+    }
+
+    async fn write_block(&self, block_id: usize, buf: &[u8]) -> IoResult<()> {
+        BlockService::write_block(self, block_id, buf).await
+    }
+
+    async fn flush(&self) -> IoResult<()> {
+        BlockService::flush(self).await
+    }
+
+    async fn discard(&self, range: BlockRange) -> IoResult<()> {
+        BlockService::discard(self, range).await
+    }
+
+    async fn write_zeroes(&self, range: BlockRange) -> IoResult<()> {
+        BlockService::write_zeroes(self, range).await
+    }
+
+    fn geometry(&self) -> BlockGeometry {
+        self.geometry
+    }
+
+    async fn serial(&self) -> IoResult<BlockSerial> {
+        BlockService::serial(self).await
+    }
+
+    fn capabilities(&self) -> BlockDeviceCapabilities {
+        self.capabilities
+    }
+
+    fn queue_topology(&self) -> BlockQueueTopology {
+        self.topology
     }
 }
 

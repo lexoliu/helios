@@ -14,8 +14,9 @@
 //!
 //! 1. `reserve(size)` carves out a contiguous virtual range with no
 //!    physical backing. Accessing a reserved-but-uncommitted page
-//!    faults; the kernel page-fault handler decides whether to commit
-//!    on demand, swap in, or report a guard-page trap.
+//!    faults; the backend's fault entry decides whether the page is
+//!    swapped out (see [`AddressSpace::swapped_token`]) or the fault
+//!    belongs to the runtime above.
 //! 2. `commit(range, flags)` materialises physical frames behind a
 //!    sub-range and grants the requested permissions.
 //! 3. `decommit(range)` releases the physical frames; the virtual range
@@ -38,10 +39,10 @@
 
 use bitflags::bitflags;
 use core::future::Future;
+use core::num::NonZeroU32;
 
 use thiserror::Error;
 
-use crate::cpu::ProcessorId;
 use crate::pmm::PhysFrame;
 
 /// Virtual address. No alignment guarantees; ranges check
@@ -142,14 +143,61 @@ pub enum AddressSpaceError {
     PageTableExhausted,
     #[error("requested flag combination is invalid for this architecture")]
     InvalidFlags,
+    #[error("this address space cannot swap pages out")]
+    SwapUnsupported,
+    #[error("page is not swapped out")]
+    NotSwapped,
+    #[error("page buffer is not exactly one frame")]
+    BadPageBuffer,
+}
+
+/// Identity of one swapped-out page's backing store.
+///
+/// The token is deliberately narrow: an address space keeps it in the
+/// spare bits of the not-present page-table entry that replaces the
+/// page, so the page table itself is the swap map and no side table has
+/// to be consulted from trap context. Zero is not a valid token, which
+/// keeps an all-zero descriptor meaning "nothing was ever here".
+///
+/// The value is an index into whatever the kernel's swap map holds; the
+/// [`SwapBackend`]'s own token type never reaches the page table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SwapToken(NonZeroU32);
+
+impl SwapToken {
+    /// Bits an address space must be able to store to carry a token.
+    pub const BITS: u32 = u32::BITS;
+
+    pub const fn new(raw: u32) -> Option<Self> {
+        match NonZeroU32::new(raw) {
+            Some(raw) => Some(Self(raw)),
+            None => None,
+        }
+    }
+
+    pub const fn raw(self) -> u32 {
+        self.0.get()
+    }
+}
+
+/// How recently the hardware saw a committed page, as reported by
+/// [`AddressSpace::scan_committed_pages`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PageAge {
+    /// The access flag was set: something touched the page since the
+    /// last scan. Architectures with no access flag report every page
+    /// this way, which stops aging from ranking pages it cannot rank.
+    Hot,
+    /// The access flag was clear across a whole scan interval.
+    Cold,
 }
 
 /// Backend that can store decommitted user memory away from RAM and
 /// reinstate it on demand. Implementations exist on top of any
 /// persistent block-device-shaped resource: virtio-blk for the live
-/// kernel, host files for `hosted/`, ramdisks for tests. The kernel
-/// page-fault handler routes [`PageFaultOutcome::Resolved`] through
-/// this trait when the faulting address lies in a swap-out region.
+/// kernel, host files for `hosted/`, ramdisks for tests. The kernel's
+/// page-fault path routes through this trait when the faulting address
+/// carries a [`SwapToken`].
 pub trait SwapBackend: Send + Sync + 'static {
     /// Token returned from a successful `swap_out`; opaque to
     /// callers, owned by the implementation. Backing the same range
@@ -176,6 +224,16 @@ pub trait SwapBackend: Send + Sync + 'static {
         token: Self::Token,
         dst: &'a mut [u8],
     ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a;
+
+    /// Discard the storage behind `token` without reading it back.
+    ///
+    /// This is the path an instance's death takes: the pages it had
+    /// swapped out are never coming back, and holding their extents
+    /// would leak the swap device one dead instance at a time. Releasing
+    /// a token that `swap_in` already consumed is not an error, so a
+    /// caller racing a fault against a teardown does not have to
+    /// serialise them.
+    fn release<'a>(&'a self, token: Self::Token) -> impl Future<Output = ()> + Send + 'a;
 }
 
 /// Sentinel `SwapBackend` impl for kernels that do not yet expose a
@@ -207,6 +265,10 @@ impl SwapBackend for NoSwap {
         _dst: &'a mut [u8],
     ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
         async { Err(NoSwapError) }
+    }
+
+    fn release<'a>(&'a self, _token: Self::Token) -> impl Future<Output = ()> + Send + 'a {
+        async {}
     }
 }
 
@@ -276,30 +338,93 @@ pub trait AddressSpace: Send + Sync + 'static {
     fn relocate(&self, _virt: VirtRange) -> Result<(), AddressSpaceError> {
         Err(AddressSpaceError::InvalidFlags)
     }
-}
 
-/// Outcome of a kernel-supplied page-fault handler.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PageFaultOutcome {
-    /// Kernel installed (or restored) a mapping covering the faulting
-    /// address. The faulting instruction should be retried.
-    Resolved,
-    /// Fault is not the kernel VM's responsibility; the backend should
-    /// report it to the next higher fault owner.
-    NotOurs,
-    /// Fault is fatal: no reservation, no policy. The backend should
-    /// terminate the offending instance, or panic the kernel if no
-    /// instance is responsible.
-    Fatal,
-}
+    /// Detach the committed page at `addr` so its frame can be reused.
+    ///
+    /// The page's bytes are copied into `out` (exactly one frame long,
+    /// caller-owned so the address space never hands a raw frame out),
+    /// the leaf entry becomes a not-present entry carrying `token`, and
+    /// the frame goes back to this address space's own pool. Per §3.4
+    /// the call invalidates the local TLB and shoots down every other
+    /// processor that has run in this space before it returns, so no
+    /// processor can still reach the frame afterwards.
+    ///
+    /// The flags the page had are returned; [`Self::swap_in_page`]
+    /// needs them to put the page back exactly as it was.
+    fn swap_out_page(
+        &self,
+        _addr: VirtAddr,
+        _token: SwapToken,
+        _out: &mut [u8],
+    ) -> Result<PageFlags, AddressSpaceError> {
+        Err(AddressSpaceError::SwapUnsupported)
+    }
 
-/// Page-fault handler installed once at boot by `kernel/src/user_memory`.
-///
-/// The handler is a function pointer (no `dyn`) so backends store it in
-/// a static and call it directly from architecture-specific trap entry
-/// without indirection through the kernel async layer.
-pub type PageFaultHandler = fn(
-    faulting_addr: VirtAddr,
-    instruction_pointer: usize,
-    fault_processor: ProcessorId,
-) -> PageFaultOutcome;
+    /// Put a swapped-out page back at `addr`.
+    ///
+    /// A fresh frame is taken from this address space's pool, filled
+    /// from `bytes` through the kernel's own view of that frame, and
+    /// only then mapped with the flags the page had when it left. The
+    /// page therefore becomes readable at `addr` already complete: no
+    /// processor can observe a half-restored page, which matters
+    /// because the faulting processor is not the only one that may
+    /// touch it.
+    ///
+    /// The flags come from the address space's own record of the page,
+    /// so a caller putting a page back never has to remember them.
+    ///
+    /// Returns the token the entry carried, which the caller hands back
+    /// to its [`SwapBackend`].
+    fn swap_in_page(&self, _addr: VirtAddr, _bytes: &[u8]) -> Result<SwapToken, AddressSpaceError> {
+        Err(AddressSpaceError::SwapUnsupported)
+    }
+
+    /// The swap token the entry at `addr` carries, or `None` when the
+    /// page is not swapped out.
+    ///
+    /// Lock-free, because the page-fault path calls it from trap
+    /// context where taking the address space's lock would deadlock
+    /// against whichever processor is mutating the page table.
+    fn swapped_token(&self, _addr: VirtAddr) -> Option<SwapToken> {
+        None
+    }
+
+    /// Visit every committed page this address space holds for `owner`,
+    /// reporting how recently the hardware saw it and clearing the
+    /// access flag so the next scan measures a fresh interval.
+    ///
+    /// `visit` returns `false` to stop the scan early, which is how a
+    /// swap-out pass keeps its batch bounded. The return value is the
+    /// number of pages visited.
+    ///
+    /// `owner` is an opaque tag the kernel attached when the page was
+    /// committed; this layer never interprets it.
+    fn scan_committed_pages<Visit>(&self, _owner: u64, _visit: Visit) -> usize
+    where
+        Visit: FnMut(VirtAddr, PageFlags, PageAge) -> bool,
+    {
+        0
+    }
+
+    /// Bytes this address space currently has committed for `owner`.
+    fn owned_resident_bytes(&self, _owner: u64) -> u64 {
+        0
+    }
+
+    /// Take the swap tokens this address space dropped on its own.
+    ///
+    /// `release`, `decommit` and a `commit` that lands on top of a
+    /// swapped page all discard entries whose backing store is still
+    /// held by a [`SwapBackend`]. Those tokens are queued here rather
+    /// than released inline, because the address space runs under a
+    /// spinlock and releasing is asynchronous. The kernel drains the
+    /// queue from a task and hands each token to the backend.
+    ///
+    /// Returns the number of tokens visited.
+    fn drain_orphaned_swap_tokens<Visit>(&self, _visit: Visit) -> usize
+    where
+        Visit: FnMut(SwapToken),
+    {
+        0
+    }
+}

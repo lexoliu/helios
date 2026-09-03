@@ -61,6 +61,9 @@ struct RuntimeStateInner<ProgramService, NetworkService, HostFsService> {
     /// The memory balloon the host resizes this guest through. Empty on
     /// a machine that gave the kernel none.
     balloon: Once<BalloonHandle>,
+    /// Swap, once a backend with a lazy-commit address space and a disk
+    /// to write to has brought it up. Empty everywhere else.
+    swap: Once<crate::SwapHandle>,
     futex_table: Mutex<FutexTable>,
     bootfs: Mutex<Option<EmbeddedBootFs>>,
     tracing: Mutex<TraceHistory>,
@@ -358,6 +361,7 @@ where
                 block_service: Once::new(),
                 iommu_report: Once::new(),
                 balloon: Once::new(),
+                swap: Once::new(),
                 futex_table: Mutex::new(FutexTable::new()),
                 bootfs: Mutex::new(embedded_init().map(|init| init.bootfs())),
                 tracing: Mutex::new(TraceHistory::new(DEFAULT_TRACE_HISTORY_CAPACITY)),
@@ -384,6 +388,7 @@ where
                 .get()
                 .map(|report| report.snapshot()),
             balloon: self.inner.balloon.get().map(BalloonHandle::stats),
+            swap: self.inner.swap.get().map(crate::SwapHandle::stats),
         }
     }
 
@@ -874,6 +879,16 @@ where
             balloon
         });
         assert!(installed, "memory balloon was installed more than once");
+    }
+
+    /// Publishes swap, once a backend has brought it up.
+    pub fn install_swap(&self, swap: crate::SwapHandle) {
+        let mut installed = false;
+        self.inner.swap.call_once(|| {
+            installed = true;
+            swap
+        });
+        assert!(installed, "swap was installed more than once");
     }
 
     pub fn prepare_futex_wait(&self, key: FutexKey) -> FutexWaitRegistration {

@@ -28,7 +28,7 @@ use helios_kernel::runtime_memory::{
     default_memory_image_new, default_page_size,
 };
 use helios_kernel::{
-    ReservationLookup, ReservationTracker, VaCursor, allocate_user_frame_zeroed_on,
+    MemoryOwner, ReservationLookup, ReservationTracker, VaCursor, allocate_user_frame_zeroed_on,
     deallocate_user_frame_on, validate_range,
 };
 use spin::{Mutex, Once};
@@ -368,9 +368,13 @@ impl AddressSpace for X86UserAddressSpace {
 
     fn release(&self, virt: VirtRange) -> Result<(), AddressSpaceError> {
         self.assert_smp_safe();
-        let committed = self.state.lock().release(virt)?;
+        let released = self.state.lock().release(virt)?;
+        // This backend commits eagerly and has no swap, so a released
+        // reservation never holds a swap token; the assertion keeps that
+        // true if swap ever reaches this architecture (#59).
+        debug_assert!(released.swapped.is_empty());
         let mut mapper = unsafe { smp::current_mapper(self.physical_memory_offset) };
-        for region in &committed {
+        for region in &released.committed {
             self.unmap_pages(&mut mapper, region.range)?;
             self.shootdown_range(region.range);
         }
@@ -393,14 +397,16 @@ impl AddressSpace for X86UserAddressSpace {
         self.map_pages(&mut mapper, &mut frame_allocator, virt, pt_flags)?;
         self.shootdown_range(virt);
 
-        self.state.lock().record_commit(virt, flags)?;
+        self.state
+            .lock()
+            .record_commit(virt, flags, MemoryOwner::NONE)?;
         Ok(())
     }
 
     fn decommit(&self, virt: VirtRange) -> Result<(), AddressSpaceError> {
         self.assert_smp_safe();
         validate_range(virt)?;
-        self.state.lock().record_decommit(virt)?;
+        let _ = self.state.lock().record_decommit(virt)?;
 
         let mut mapper = unsafe { smp::current_mapper(self.physical_memory_offset) };
         self.unmap_pages(&mut mapper, virt)?;
