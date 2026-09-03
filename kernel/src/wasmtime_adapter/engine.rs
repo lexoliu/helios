@@ -68,6 +68,11 @@ fn build_engine_for_platform<P: Cpu + Clone>(
         platform: platform.clone(),
     })));
     config.signals_based_traps(true);
+    // The page-fault trampoline blocks the faulting fiber through
+    // `wasmtime::block_on_current_fiber`. Only a platform whose address
+    // space can take a page away needs that, and asking for it costs a
+    // TLS slot on every fiber resume, so it is asked for exactly there.
+    config.block_on_current_fiber(platform.has_lazy_commit_virtual_memory());
     let target_uses_lazy_commit =
         helios_artifact::cwasm_target_uses_lazy_commit_virtual_memory(env!("HELIOS_BUILD_TARGET"));
     assert!(
