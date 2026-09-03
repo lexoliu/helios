@@ -1,6 +1,6 @@
 //! PL031 real-time clock for the AArch64 backend.
 //!
-//! The virt board exposes an ARM PL031 next to the PL011 UART. Its data
+//! The platform exposes an ARM PL031 next to the PL011 UART. Its data
 //! register holds a free-running 32-bit counter of seconds since the
 //! Unix epoch, which firmware loads from the host clock, so the kernel
 //! reads one register once at boot and never touches the device again.
@@ -9,10 +9,10 @@
 //! the bootstrap processor before secondaries start, and the device is
 //! never interrupt-driven, so nothing here is shared.
 
-use fdt::Fdt;
 use helios_hal::rtc::{RealTimeClock, RtcError, UnixSeconds};
 
 use crate::LimineBootHandoff;
+use crate::platform::MmioRegion;
 
 /// `RTCDR`, the current counter value.
 const PL031_DATA: usize = 0x00;
@@ -26,36 +26,26 @@ impl RealTimeClock for Pl031Rtc {
     const SOURCE: &'static str = "pl031";
 
     fn read(&self) -> Result<UnixSeconds, RtcError> {
-        // SAFETY: `base` is the mapped device window of the PL031 node
-        // the device tree describes, and `RTCDR` is a 32-bit read-only
+        // SAFETY: `base` is the mapped device window the platform
+        // describes for its PL031, and `RTCDR` is a 32-bit read-only
         // register at its start.
         let seconds = unsafe { ((self.base + PL031_DATA) as *const u32).read_volatile() };
         Ok(UnixSeconds::new(u64::from(seconds)))
     }
 }
 
-/// Finds the platform's PL031 and maps its register window.
+/// Maps the register window of the platform's PL031.
 ///
-/// A machine whose device tree describes no PL031 has no calendar to
-/// read, and the caller leaves the kernel's wall clock unseeded.
-pub(crate) fn discover(
-    fdt: &Fdt<'_>,
+/// A machine that describes no PL031 has no calendar to read, and the
+/// caller leaves the kernel's wall clock unseeded.
+pub(crate) fn map(
+    region: MmioRegion,
     physical_memory_offset: usize,
     handoff: &LimineBootHandoff,
-) -> Option<Pl031Rtc> {
-    let node = fdt.all_nodes().find(|node| {
-        node.compatible()
-            .is_some_and(|compatible| compatible.all().any(|entry| entry == "arm,pl031"))
-    })?;
-    let region = node
-        .raw_reg()
-        .and_then(|mut regions| regions.next())
-        .unwrap_or_else(|| panic!("AArch64 PL031 node has no usable reg property"));
-    let size = crate::fdt_cells_to_usize(region.size, "AArch64 PL031 reg size");
-    assert!(size != 0, "AArch64 PL031 reg property has zero size");
-    let physical_base = crate::fdt_cells_to_usize(region.address, "AArch64 PL031 reg address");
-    crate::map_mmio_page(physical_base, physical_memory_offset, handoff);
-    Some(Pl031Rtc {
-        base: crate::mmio_virtual_base(physical_base, physical_memory_offset),
-    })
+) -> Pl031Rtc {
+    assert!(region.size != 0, "AArch64 PL031 window has zero size");
+    crate::map_mmio_page(region.base, physical_memory_offset, handoff);
+    Pl031Rtc {
+        base: crate::mmio_virtual_base(region.base, physical_memory_offset),
+    }
 }

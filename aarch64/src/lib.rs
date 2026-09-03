@@ -14,7 +14,6 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use arm_gic::IntId;
-use fdt::Fdt;
 use helios_hal::boot::{
     BootFirmwareTables, BootHandoff, BootKernelImage, BootMemoryKind, BootMemoryMap,
     BootMemoryRegion, BootModule, BootModules, FirmwareKind,
@@ -37,7 +36,8 @@ use limine::memmap::{Entry, MEMMAP_USABLE};
 use limine::mp::MpInfo;
 use limine::request::{
     DtbRequest, ExecutableAddressRequest, ExecutableCmdlineRequest, ExecutableFileRequest,
-    FirmwareTypeRequest, HhdmRequest, MemmapRequest, ModulesRequest, MpRequest, StackSizeRequest,
+    FirmwareTypeRequest, HhdmRequest, MemmapRequest, ModulesRequest, MpRequest, RsdpRequest,
+    StackSizeRequest,
 };
 use spin::Once;
 
@@ -63,12 +63,6 @@ const PAGE_PXN: u64 = 1 << 53;
 const PAGE_UXN: u64 = 1 << 54;
 const MAIR_DEVICE_ATTR_INDEX_SHIFT: u64 = PAGE_ATTR_DEVICE_INDEX * 8;
 const MAIR_DEVICE_NGNRNE: u64 = 0x00;
-/// Message for the one hard platform requirement: helios drives the
-/// aarch64 `virt` machine from its device tree, so the firmware must
-/// publish one. QEMU's EDK2 build installs the FDT configuration table
-/// only when it is not also publishing ACPI tables.
-const DEVICE_TREE_REQUIRED: &str =
-    "AArch64 bring-up requires the firmware device tree: boot the virt machine with acpi=off";
 const PL011_DATA: usize = 0x000;
 const PL011_FLAG: usize = 0x018;
 const PL011_FLAG_RXFE: u32 = 1 << 4;
@@ -94,6 +88,7 @@ mod entropy;
 mod gic;
 mod host_fs;
 mod net;
+mod platform;
 mod rtc;
 mod vsock;
 
@@ -137,6 +132,8 @@ static MP_REQUEST: MpRequest = MpRequest::new(0);
 static FIRMWARE_TYPE_REQUEST: FirmwareTypeRequest = FirmwareTypeRequest::new();
 #[used]
 static DEVICE_TREE_BLOB_REQUEST: DtbRequest = DtbRequest::new();
+#[used]
+static RSDP_REQUEST: RsdpRequest = RsdpRequest::new();
 #[used]
 static STACK_SIZE_REQUEST: StackSizeRequest = StackSizeRequest::new(KERNEL_STACK_BYTES as u64);
 static DEBUG_SERIAL_BASE: AtomicUsize = AtomicUsize::new(0);
@@ -326,6 +323,11 @@ impl Aarch64PlatformState {
         self.processors[0].mp_info.mpidr
     }
 
+    /// The MPIDR of every processor Limine started, bootstrap first.
+    fn processor_mpidrs(&self) -> impl Iterator<Item = u64> + Clone + '_ {
+        self.processors.iter().map(|slot| slot.mp_info.mpidr)
+    }
+
     fn bootstrap_runtime(&'static self) -> &'static ProcessorRuntime {
         &self.processors[0].runtime
     }
@@ -444,15 +446,27 @@ extern "C" fn aarch64_kernel_main() -> ! {
     install_exception_vectors();
     let handoff = limine_boot_handoff();
     let physical_memory_offset = physical_memory_offset();
-    let boot_fdt = boot_fdt(&handoff);
-    let debug_serial = DebugSerial::discover(&handoff, physical_memory_offset);
+    // The firmware description comes up before anything else, because
+    // the console is part of it and a panic from here on should reach a
+    // serial port. Reading the console out of it allocates nothing, in
+    // either description.
+    let tables = platform::PlatformTables::discover(&handoff)
+        .unwrap_or_else(|error| panic!("AArch64 platform discovery failed: {error}"));
+    let console = tables
+        .console()
+        .unwrap_or_else(|error| panic!("AArch64 console discovery failed: {error}"));
+    let debug_serial = DebugSerial::map(console, physical_memory_offset, &handoff);
     debug_serial.init();
     DEBUG_SERIAL_BASE.store(debug_serial.base, Ordering::Release);
-    let boot_fdt = boot_fdt.unwrap_or_else(|| panic!("{DEVICE_TREE_REQUIRED}"));
     let processor_count = aarch64_processor_count();
     let reserved_ranges = boot_reserved_ranges(&handoff);
     let memory_regions = boot_memory_regions(&handoff, physical_memory_offset, &reserved_ranges);
     helios_kernel::prime_bootstrap_allocator(memory_regions, processor_count);
+    // The rest of the description needs the heap: the ACPI path has to
+    // interpret AML to reach a device's `_CRS`.
+    let platform = tables
+        .describe(console)
+        .unwrap_or_else(|error| panic!("AArch64 platform description failed: {error}"));
     vmm::install_user_address_space(physical_memory_offset);
     let platform_state = Aarch64PlatformState::from_limine_mp(timer_frequency());
     activate_processor_runtime(platform_state.bootstrap_runtime());
@@ -472,22 +486,22 @@ extern "C" fn aarch64_kernel_main() -> ! {
         Some(write_debug_serial_bytes),
     );
     let mut devices = DeviceInventory::new().with_debug_serial();
-    if host_fs::has_9p_device(&boot_fdt) {
+    if host_fs::has_9p_device(&platform) {
         devices = devices.with_host_share();
     }
-    if net::has_network_device(&boot_fdt) {
+    if net::has_network_device(&platform) {
         devices = devices.with_network();
     }
-    if entropy::has_entropy_device(&boot_fdt) {
+    if entropy::has_entropy_device(&platform) {
         devices = devices.with_entropy_device();
     }
-    if balloon::has_balloon_device(&boot_fdt) {
+    if balloon::has_balloon_device(&platform) {
         devices = devices.with_memory_balloon();
     }
-    if vsock::has_vsock_device(&boot_fdt) {
+    if vsock::has_vsock_device(&platform) {
         devices = devices.with_vsock();
     }
-    let block_device_count = block::count_block_devices(&boot_fdt);
+    let block_device_count = block::count_block_devices(&platform);
     if block_device_count != 0 {
         devices = devices.with_block_devices(block_device_count);
     }
@@ -504,29 +518,38 @@ extern "C" fn aarch64_kernel_main() -> ! {
             .with_dma_model(DmaModel::Translated)
             .with_devices(devices),
     );
+    tracing::info!(
+        "platform described by {} console={:#x} gicd={:#x} gicr={:#x} virtio-slots={} rtc={}",
+        platform.source,
+        platform.console.region.base,
+        platform.gic.distributor.base,
+        platform.gic.redistributor.base,
+        platform.virtio.len(),
+        platform.rtc.is_some(),
+    );
     // The root DRBG is seeded before any component can ask for random
-    // bytes: `RNDR` where the processor implements it, plus the seed the
-    // bootloader left in `/chosen/rng-seed`. Neither is a fallback for
-    // the other, and the entropy device joins them once the executor
-    // runs. This follows `init` so the source line reaches the log the
-    // kernel just installed.
-    let root_entropy =
-        helios_kernel::seed_root_entropy(&cpu, helios_hal::entropy::device_tree_seed(&boot_fdt));
+    // bytes: `RNDR` where the processor implements it, plus whatever
+    // seed the bootloader left behind. Neither is a fallback for the
+    // other, and the entropy device joins them once the executor runs.
+    // This follows `init` so the source line reaches the log the kernel
+    // just installed.
+    let root_entropy = helios_kernel::seed_root_entropy(&cpu, platform.boot_entropy_seed);
     debug_state.install_root_entropy(root_entropy.clone());
     // The calendar is read once, here, before any component can ask
     // what time it is. The processor's timer carries wall time forward
     // from that reading; nothing re-synchronises it afterwards.
-    match rtc::discover(&boot_fdt, physical_memory_offset, &handoff) {
-        Some(rtc) => {
+    match platform.rtc {
+        Some(region) => {
+            let rtc = rtc::map(region, physical_memory_offset, &handoff);
             debug_state.seed_wall_clock(cpu.now().ticks(), &rtc);
         }
         None => {
-            tracing::warn!("no PL031 in the device tree; the wall clock reads as uptime");
+            tracing::warn!("the platform describes no PL031; the wall clock reads as uptime");
         }
     }
     let gic = platform_state.install_gic(gic::Gic::new(
-        gic::GicRegions::discover(&boot_fdt),
-        cpu.processor_count(),
+        &platform.gic,
+        platform_state.processor_mpidrs(),
         platform_state.bootstrap_mpidr(),
         physical_memory_offset,
         &handoff,
@@ -536,7 +559,7 @@ extern "C" fn aarch64_kernel_main() -> ! {
     let mut routes = DeviceInterruptRoutes::new();
     if let Some(host_fs) = host_fs::install(
         &cpu,
-        &boot_fdt,
+        &platform,
         physical_memory_offset,
         &handoff,
         &debug_state,
@@ -551,7 +574,7 @@ extern "C" fn aarch64_kernel_main() -> ! {
     if let Some(network) = net::install(
         &cpu,
         &kernel,
-        &boot_fdt,
+        &platform,
         physical_memory_offset,
         &handoff,
         &debug_state,
@@ -565,7 +588,7 @@ extern "C" fn aarch64_kernel_main() -> ! {
     }
     if let Some(entropy) = entropy::install(
         &kernel,
-        &boot_fdt,
+        &platform,
         physical_memory_offset,
         &handoff,
         root_entropy.clone(),
@@ -577,7 +600,7 @@ extern "C" fn aarch64_kernel_main() -> ! {
         );
         routes.set_entropy(entropy.interrupt, entropy.device);
     }
-    if let Some(balloon) = balloon::install(&kernel, &boot_fdt, physical_memory_offset, &handoff) {
+    if let Some(balloon) = balloon::install(&kernel, &platform, physical_memory_offset, &handoff) {
         gic.enable_device_interrupt(
             balloon.interrupt,
             balloon.trigger,
@@ -589,7 +612,7 @@ extern "C" fn aarch64_kernel_main() -> ! {
     if let Some(vsock) = vsock::install(
         &kernel,
         &cpu,
-        &boot_fdt,
+        &platform,
         physical_memory_offset,
         &handoff,
         &debug_state,
@@ -604,7 +627,7 @@ extern "C" fn aarch64_kernel_main() -> ! {
     for block in block::install(
         &cpu,
         &kernel,
-        &boot_fdt,
+        &platform,
         physical_memory_offset,
         &handoff,
         &debug_state,
@@ -1489,14 +1512,30 @@ fn matches_virtio_mmio_device(
     unsafe { helios_virtio::mmio_device_matches(virtual_base, expected) }
 }
 
-fn count_virtio_mmio_devices(fdt: &Fdt<'_>, expected: helios_virtio::DeviceType) -> usize {
+/// Every transport slot the platform describes that answers as a
+/// device of the expected type.
+///
+/// The platform describes where transports may be; only the register
+/// window itself says what is actually plugged into one, so each slot
+/// is mapped and probed here.
+fn virtio_slots<'a>(
+    platform: &'a platform::PlatformDescription,
+    physical_memory_offset: usize,
+    handoff: &'a LimineBootHandoff,
+    expected: helios_virtio::DeviceType,
+) -> impl Iterator<Item = platform::VirtioMmioSlot> + 'a {
+    platform.virtio.iter().filter(move |slot| {
+        matches_virtio_mmio_device(slot.region.base, physical_memory_offset, handoff, expected)
+    })
+}
+
+fn count_virtio_mmio_devices(
+    platform: &platform::PlatformDescription,
+    expected: helios_virtio::DeviceType,
+) -> usize {
     let handoff = limine_boot_handoff();
     let physical_memory_offset = physical_memory_offset();
-    helios_virtio::mmio_candidates(fdt)
-        .filter(|candidate| {
-            matches_virtio_mmio_device(candidate.base, physical_memory_offset, &handoff, expected)
-        })
-        .count()
+    virtio_slots(platform, physical_memory_offset, &handoff, expected).count()
 }
 
 #[derive(Clone, Copy)]
@@ -1505,33 +1544,19 @@ struct DebugSerial {
 }
 
 impl DebugSerial {
-    fn discover(handoff: &LimineBootHandoff, physical_memory_offset: usize) -> Self {
-        let fdt = boot_fdt(handoff).unwrap_or_else(|| panic!("{DEVICE_TREE_REQUIRED}"));
-        Self::discover_fdt(&fdt, physical_memory_offset, handoff)
-    }
-
-    fn discover_fdt(
-        fdt: &Fdt<'_>,
+    /// Maps the console the platform describes.
+    fn map(
+        console: platform::ConsoleDescription,
         physical_memory_offset: usize,
         handoff: &LimineBootHandoff,
     ) -> Self {
-        let node = fdt
-            .all_nodes()
-            .find(|node| {
-                node.compatible()
-                    .is_some_and(|compatible| compatible.all().any(|entry| entry == "arm,pl011"))
-            })
-            .unwrap_or_else(|| panic!("AArch64 virt platform did not expose a PL011 UART in FDT"));
-        let region = node
-            .raw_reg()
-            .and_then(|mut regions| regions.next())
-            .unwrap_or_else(|| panic!("AArch64 PL011 UART node has no usable reg property"));
-        let size = fdt_cells_to_usize(region.size, "AArch64 PL011 reg size");
-        assert!(size != 0, "AArch64 PL011 UART reg property has zero size");
-        let physical_base = fdt_cells_to_usize(region.address, "AArch64 PL011 reg address");
-        map_mmio_page(physical_base, physical_memory_offset, handoff);
+        assert!(
+            console.region.size != 0,
+            "AArch64 console UART window has zero size"
+        );
+        map_mmio_page(console.region.base, physical_memory_offset, handoff);
         Self {
-            base: mmio_virtual_base(physical_base, physical_memory_offset),
+            base: mmio_virtual_base(console.region.base, physical_memory_offset),
         }
     }
 
@@ -1599,13 +1624,6 @@ fn try_write_panic_serial_bytes(bytes: &[u8]) {
     if base != 0 {
         DebugSerial { base }.write_bytes(bytes);
     }
-}
-
-fn boot_fdt(handoff: &LimineBootHandoff) -> Option<Fdt<'static>> {
-    handoff.tables.device_tree_blob.map(|dtb| {
-        unsafe { Fdt::from_ptr(dtb as *const u8) }
-            .unwrap_or_else(|error| panic!("Limine provided an invalid AArch64 FDT: {error:?}"))
-    })
 }
 
 fn physical_memory_offset() -> usize {
@@ -1693,9 +1711,22 @@ fn limine_boot_handoff() -> LimineBootHandoff {
         },
         firmware,
         tables: BootFirmwareTables {
-            // The aarch64 platform is driven entirely from the device
-            // tree; the kernel never asks Limine for ACPI tables.
-            acpi_rsdp: None,
+            // Both descriptions are published when the firmware offers
+            // them. `platform::PlatformTables` decides which one is
+            // used; the handoff only reports what exists.
+            //
+            // Limine hands the RSDP over through its direct map at
+            // every base revision this kernel accepts, and the handoff
+            // carries the physical address, so the offset comes back
+            // off here rather than being subtracted again by every
+            // reader.
+            acpi_rsdp: RSDP_REQUEST.response().map(|response| {
+                (response.address as usize)
+                    .checked_sub(physical_memory_offset())
+                    .unwrap_or_else(|| {
+                        panic!("Limine's RSDP address is below the direct map it was mapped into")
+                    })
+            }),
             device_tree_blob: DEVICE_TREE_BLOB_REQUEST
                 .response()
                 .map(|response| response.dtb_ptr as usize),

@@ -325,6 +325,11 @@ paths, components).
   other input to the guest shell.
 - `vm` boots the selected architecture under QEMU, waits for the guest
   debugger component to come up, then drops into a `repl` session.
+- `helios-inspector vm --arch aarch64 --acpi` boots the `virt` machine with
+  ACPI tables instead of a device tree. The aarch64 kernel takes its whole
+  platform description from the firmware and QEMU publishes one description or
+  the other, never both, so both modes have to keep booting; the
+  `smoke-aarch64` CI job runs each of them.
 - `helios-inspector vm --kernel-debug --gdb <endpoint>` is the supported QEMU
   gdbstub path for symbol-level kernel debugging. Use `--gdb-wait` when the
   debugger must attach before kernel entry. Use endpoints such as `tcp::1234`

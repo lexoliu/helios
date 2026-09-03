@@ -1,8 +1,8 @@
 extern crate alloc;
 
+use crate::platform::PlatformDescription;
 use arm_gic::{IntId, Trigger};
 use bytes::BytesMut;
-use fdt::Fdt;
 use helios_hal::io::IoError;
 use helios_kernel::{ExternalInterruptHandler, HostFsTransport};
 use triomphe::Arc;
@@ -35,12 +35,12 @@ pub(crate) struct HostFsInterrupt {
 
 pub(crate) fn install(
     cpu: &crate::Aarch64Cpu,
-    fdt: &Fdt<'_>,
+    platform: &PlatformDescription,
     physical_memory_offset: usize,
     handoff: &crate::LimineBootHandoff,
     debug_state: &crate::debug_state::RuntimeState,
 ) -> Option<HostFsInterrupt> {
-    let Some(probe) = discover_9p_device(fdt, physical_memory_offset, handoff) else {
+    let Some(probe) = discover_9p_device(platform, physical_memory_offset, handoff) else {
         tracing::warn!("virtio 9p device was not discovered on the platform bus");
         return None;
     };
@@ -80,31 +80,30 @@ impl HostFsTransport for HostFsTransportService {
     }
 }
 
-pub(crate) fn has_9p_device(fdt: &Fdt<'_>) -> bool {
-    crate::count_virtio_mmio_devices(fdt, helios_virtio::DeviceType::_9P) != 0
+pub(crate) fn has_9p_device(platform: &PlatformDescription) -> bool {
+    crate::count_virtio_mmio_devices(platform, helios_virtio::DeviceType::_9P) != 0
 }
 
 fn discover_9p_device(
-    fdt: &Fdt<'_>,
+    platform: &PlatformDescription,
     physical_memory_offset: usize,
     handoff: &crate::LimineBootHandoff,
 ) -> Option<HostFsInterrupt> {
-    let candidate = helios_virtio::mmio_candidates(fdt).find(|candidate| {
-        crate::matches_virtio_mmio_device(
-            candidate.base,
-            physical_memory_offset,
-            handoff,
-            helios_virtio::DeviceType::_9P,
-        )
-    })?;
-    let (interrupt, trigger) = crate::gic::device_interrupt(candidate.interrupt, candidate.base);
+    let candidate = crate::virtio_slots(
+        platform,
+        physical_memory_offset,
+        handoff,
+        helios_virtio::DeviceType::_9P,
+    )
+    .next()?;
+    let (interrupt, trigger) = (candidate.interrupt.intid(), candidate.interrupt.trigger);
     Some(HostFsInterrupt {
         interrupt,
         trigger,
         transport: HostFsTransportService {
             device: init_9p_device(
-                candidate.base,
-                candidate.size,
+                candidate.region.base,
+                candidate.region.size,
                 physical_memory_offset,
                 handoff,
             ),

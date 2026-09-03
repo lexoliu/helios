@@ -78,7 +78,7 @@ pub fn mmio_candidates<'f>(fdt: &'f Fdt<'f>) -> impl Iterator<Item = MmioCandida
         Some(MmioCandidate {
             base,
             size,
-            interrupt: node_interrupt(fdt, node, base),
+            interrupt: node_interrupt(fdt, &node),
         })
     })
 }
@@ -100,45 +100,49 @@ pub unsafe fn mmio_device_matches(virtual_base: usize, expected: DeviceType) -> 
 
 /// Decodes the first entry of `node`'s `interrupts` property against
 /// the `#interrupt-cells` of its interrupt parent.
-fn node_interrupt<'b, 'a: 'b>(
+///
+/// Shared with the backends: a `virtio,mmio` transport and a platform
+/// UART write the same specifier shape, so the decode belongs in one
+/// place rather than once per device kind.
+pub fn node_interrupt<'b, 'a: 'b>(
     fdt: &'b Fdt<'a>,
-    node: FdtNode<'b, 'a>,
-    base: usize,
+    node: &FdtNode<'b, 'a>,
 ) -> Option<MmioInterrupt> {
     let interrupts = node.property("interrupts")?;
-    let cells = interrupt_cells(fdt, node, base);
-    let mut values = interrupt_cell_values(interrupts.value, base);
+    let name = node.name;
+    let cells = interrupt_cells(fdt, node, name);
+    let mut values = interrupt_cell_values(interrupts.value, name);
     match cells {
         NUMBER_ONLY_CELLS => Some(MmioInterrupt {
-            number: next_interrupt_cell(&mut values, base),
+            number: next_interrupt_cell(&mut values, name),
             trigger: None,
         }),
         ARM_GIC_CELLS => {
-            let kind = next_interrupt_cell(&mut values, base);
+            let kind = next_interrupt_cell(&mut values, name);
             assert!(
                 kind == ARM_GIC_KIND_SPI,
-                "virtio,mmio node at {base:#x} declares Arm GIC interrupt kind {kind}, \
+                "device tree node {name} declares Arm GIC interrupt kind {kind}, \
                  only shared peripheral interrupts are routable"
             );
-            let number = next_interrupt_cell(&mut values, base);
-            let flags = next_interrupt_cell(&mut values, base);
+            let number = next_interrupt_cell(&mut values, name);
+            let flags = next_interrupt_cell(&mut values, name);
             Some(MmioInterrupt {
                 number,
-                trigger: Some(trigger_from_flags(flags, base)),
+                trigger: Some(trigger_from_flags(flags, name)),
             })
         }
         cells => panic!(
-            "virtio,mmio node at {base:#x} has an interrupt parent with unsupported \
+            "device tree node {name} has an interrupt parent with unsupported \
              #interrupt-cells {cells}"
         ),
     }
 }
 
-fn interrupt_cells<'b, 'a: 'b>(fdt: &'b Fdt<'a>, node: FdtNode<'b, 'a>, base: usize) -> usize {
-    interrupt_parent(fdt, node, base)
+fn interrupt_cells<'b, 'a: 'b>(fdt: &'b Fdt<'a>, node: &FdtNode<'b, 'a>, name: &str) -> usize {
+    interrupt_parent(fdt, node, name)
         .interrupt_cells()
         .unwrap_or_else(|| {
-            panic!("interrupt parent of virtio,mmio node at {base:#x} has no #interrupt-cells")
+            panic!("interrupt parent of device tree node {name} has no #interrupt-cells")
         })
 }
 
@@ -147,28 +151,28 @@ fn interrupt_cells<'b, 'a: 'b>(fdt: &'b Fdt<'a>, node: FdtNode<'b, 'a>, base: us
 /// node declares for the whole tree.
 fn interrupt_parent<'b, 'a: 'b>(
     fdt: &'b Fdt<'a>,
-    node: FdtNode<'b, 'a>,
-    base: usize,
+    node: &FdtNode<'b, 'a>,
+    name: &str,
 ) -> FdtNode<'b, 'a> {
     let phandle = node
         .property("interrupt-parent")
         .or_else(|| fdt.root().property("interrupt-parent"))
         .unwrap_or_else(|| {
-            panic!("virtio,mmio node at {base:#x} declares interrupts without an interrupt parent")
+            panic!("device tree node {name} declares interrupts without an interrupt parent")
         })
         .value;
     let phandle = u32::from_be_bytes(phandle.try_into().unwrap_or_else(|_| {
-        panic!("interrupt-parent of virtio,mmio node at {base:#x} is not a single phandle cell")
+        panic!("interrupt-parent of device tree node {name} is not a single phandle cell")
     }));
     fdt.find_phandle(phandle).unwrap_or_else(|| {
-        panic!("interrupt-parent phandle {phandle:#x} of virtio,mmio node at {base:#x} is unknown")
+        panic!("interrupt-parent phandle {phandle:#x} of device tree node {name} is unknown")
     })
 }
 
-fn interrupt_cell_values(bytes: &[u8], base: usize) -> impl Iterator<Item = u32> + '_ {
+fn interrupt_cell_values<'v>(bytes: &'v [u8], name: &str) -> impl Iterator<Item = u32> + 'v {
     assert!(
         bytes.len().is_multiple_of(4),
-        "interrupts property of virtio,mmio node at {base:#x} is not a whole number of cells"
+        "interrupts property of device tree node {name} is not a whole number of cells"
     );
     bytes.chunks_exact(4).map(|cell| {
         u32::from_be_bytes(
@@ -178,19 +182,19 @@ fn interrupt_cell_values(bytes: &[u8], base: usize) -> impl Iterator<Item = u32>
     })
 }
 
-fn next_interrupt_cell(values: &mut impl Iterator<Item = u32>, base: usize) -> u32 {
+fn next_interrupt_cell(values: &mut impl Iterator<Item = u32>, name: &str) -> u32 {
     values.next().unwrap_or_else(|| {
-        panic!("interrupts property of virtio,mmio node at {base:#x} is shorter than one specifier")
+        panic!("interrupts property of device tree node {name} is shorter than one specifier")
     })
 }
 
-fn trigger_from_flags(flags: u32, base: usize) -> InterruptTrigger {
+fn trigger_from_flags(flags: u32, name: &str) -> InterruptTrigger {
     if flags & IRQ_TYPE_LEVEL != 0 {
         InterruptTrigger::Level
     } else if flags & IRQ_TYPE_EDGE != 0 {
         InterruptTrigger::Edge
     } else {
-        panic!("virtio,mmio node at {base:#x} declares interrupt flags {flags:#x} with no trigger")
+        panic!("device tree node {name} declares interrupt flags {flags:#x} with no trigger")
     }
 }
 
