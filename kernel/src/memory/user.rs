@@ -454,22 +454,6 @@ pub fn deallocate_user_frame_on(processor: ProcessorId, ptr: NonNull<u8>) {
     user_memory_pool().deallocate_bytes_on(processor, ptr, layout);
 }
 
-/// Kernel-internal uninit allocator counterpart used by the wasmtime
-/// adapter. Returns the buddy-rounded byte size alongside the pointer
-/// so the caller can drive an architecture-specific zero
-/// (`Cpu::zero_memory`) over the actual allocation rather than the
-/// requested layout size.
-pub(crate) fn allocate_user_uninit_on(
-    processor: ProcessorId,
-    layout: Layout,
-) -> Result<(NonNull<u8>, usize), ProgramOutOfMemory> {
-    user_memory_pool().allocate_uninit_on(processor, layout)
-}
-
-pub(crate) fn deallocate_user_on(processor: ProcessorId, ptr: NonNull<u8>, layout: Layout) {
-    user_memory_pool().deallocate_bytes_on(processor, ptr, layout);
-}
-
 fn buddy_allocation_size(layout: Layout) -> usize {
     layout
         .size()

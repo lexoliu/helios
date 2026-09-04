@@ -331,10 +331,6 @@ impl X86PlatformState {
         self.tsc_hz
     }
 
-    pub(crate) fn physical_memory_offset(&self) -> usize {
-        self.physical_memory_offset
-    }
-
     pub(crate) fn debug_state(&self) -> debug_state::RuntimeState {
         self.debug_state.clone()
     }

@@ -14,9 +14,19 @@ embedded-debugger = []
 # feature; the core kernel and HAL no-default path must not depend on it.
 wasmtime-runtime = ["dep:wasmtime", "dep:wasmtime-wasi-io"]
 wasmtime-host = ["wasmtime-runtime"]
-wasmtime-aarch64 = ["wasmtime-runtime", "wasmtime/custom-virtual-memory", "wasmtime/pooling-allocator"]
-wasmtime-x86 = ["wasmtime-runtime"]
-wasmtime-riscv64 = ["wasmtime-runtime"]
+# Every bare-metal backend runs the same runtime profile: its
+# `hal::vmm::AddressSpace` answers wasmtime's custom-virtual-memory ABI, and
+# the pooling instance allocator reserves per-slot linear memories through it.
+# There is deliberately no per-architecture variant of this feature — a
+# backend that cannot serve the ABI fails at engine construction rather than
+# selecting a different memory stack (AGENTS §2, §3.2).
+wasmtime-bare-metal = [
+    "wasmtime-runtime",
+    "wasmtime/custom-virtual-memory",
+    # Only compiles alongside `custom-virtual-memory` on a bare-metal target:
+    # the pooling allocator is written against wasmtime's `Mmap`.
+    "wasmtime/pooling-allocator",
+]
 
 [dependencies]
 async-lock = { version = "3.4.2", default-features = false }

@@ -34,6 +34,14 @@ impl Cpu for TestCpu {
         ProcessorId::new(0)
     }
 
+    fn has_lazy_commit_virtual_memory(&self) -> bool {
+        // The unit tests build on a hosted platform, where the operating
+        // system commits a reservation lazily on its own. A test platform
+        // that claimed otherwise could not stand in for any real backend:
+        // every one of them reserves user memory this way.
+        true
+    }
+
     fn processor_count(&self) -> usize {
         1
     }

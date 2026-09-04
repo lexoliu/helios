@@ -42,7 +42,4 @@ pub use user::{
     allocate_user_frame_zeroed_on, deallocate_user_frame, deallocate_user_frame_on,
     largest_servable_user_bytes, user_heap_stats,
 };
-pub(crate) use user::{
-    allocate_user_memory_pool, allocate_user_uninit_on, deallocate_user_on,
-    install_user_memory_pool,
-};
+pub(crate) use user::{allocate_user_memory_pool, install_user_memory_pool};

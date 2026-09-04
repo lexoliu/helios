@@ -6,6 +6,10 @@ repo_root := justfile_directory()
 default_profile := "debug"
 
 # Generate the kernel-prebuild manifest for `target` and run `cargo check` against it.
+# helios-kernel is checked with the feature set the bare-metal backends select,
+# not its host defaults: `wasmtime-host` on a `target_os = "none"` target is a
+# configuration no backend ever builds, and wasmtime's pooling allocator needs
+# the custom-virtual-memory ABI that only `wasmtime-bare-metal` turns on.
 # Usage: just check-target riscv64gc-unknown-none-elf helios-riscv
 check-target target package:
     #!/usr/bin/env bash
@@ -17,7 +21,9 @@ check-target target package:
         --profile "{{default_profile}}" \
         --cargo cargo
     manifest="${out_dir}/kernel-prebuild.json"
-    HELIOS_KERNEL_PREBUILD_MANIFEST="${manifest}" cargo check -p helios-kernel --target "{{target}}"
+    HELIOS_KERNEL_PREBUILD_MANIFEST="${manifest}" cargo check -p helios-kernel \
+        --no-default-features --features wasmtime-bare-metal,embedded-debugger \
+        --target "{{target}}"
     HELIOS_KERNEL_PREBUILD_MANIFEST="${manifest}" cargo check -p "{{package}}" --target "{{target}}"
 
 # Every clippy and rustfmt gate CI enforces.
@@ -59,7 +65,8 @@ clippy-host:
         --exclude helios \
         --exclude helios-aarch64 --exclude helios-riscv --exclude helios-x86 \
         --exclude helios-date --exclude helios-debugger --exclude helios-http-client \
-        --exclude helios-init --exclude helios-perf --exclude helios-ping \
+        --exclude helios-init --exclude helios-oob-load --exclude helios-perf \
+        --exclude helios-ping \
         -- -D warnings
 
 # Clippy each guest program on its own, denying warnings.
@@ -70,7 +77,7 @@ clippy-programs:
     # `helios-api` worlds, and a single invocation covering several of
     # them would unify those features and fail to build.
     for package in helios-date helios-debugger helios-http-client \
-        helios-init helios-perf helios-ping; do
+        helios-init helios-oob-load helios-perf helios-ping; do
         cargo clippy -p "${package}" --all-targets -- -D warnings
     done
 
@@ -102,8 +109,15 @@ clippy-target target package:
         --profile "{{default_profile}}" \
         --cargo cargo
     manifest="${out_dir}/kernel-prebuild.json"
+    # Two invocations, for the same reason `check-target` uses explicit
+    # features: cargo would otherwise unify helios-kernel's host defaults with
+    # the backend's `wasmtime-bare-metal` selection.
     HELIOS_KERNEL_PREBUILD_MANIFEST="${manifest}" cargo clippy \
-        -p helios-kernel -p "{{package}}" --target "{{target}}" -- -D warnings
+        -p helios-kernel --no-default-features \
+        --features wasmtime-bare-metal,embedded-debugger \
+        --target "{{target}}" -- -D warnings
+    HELIOS_KERNEL_PREBUILD_MANIFEST="${manifest}" cargo clippy \
+        -p "{{package}}" --target "{{target}}" -- -D warnings
 
 # Equivalent of AGENTS §7 required checks. Run before declaring a change complete.
 check-all:

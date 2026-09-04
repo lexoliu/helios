@@ -12,13 +12,24 @@ use thiserror::Error;
 
 pub const TRAILER_MAGIC: &[u8; 8] = b"HLCWSG01";
 pub const TRAILER_VERSION: u8 = 1;
-pub const CWASM_NO_VMEM_MEMORY_GUARD_SIZE: u64 = 0;
-pub const CWASM_NO_VMEM_MEMORY_RESERVATION: u64 = 0;
-pub const CWASM_NO_VMEM_MEMORY_RESERVATION_FOR_GROWTH: u64 = 1 << 20;
+/// Virtual bytes reserved behind every linear memory.
+///
+/// A wasm32 guest can only address 4 GiB, so a reservation of exactly that
+/// much means every in-bounds address is inside the reservation and Cranelift
+/// needs no explicit bounds check: an access past the guest's committed pages
+/// lands on reserved-but-uncommitted memory and faults. Both the kernel
+/// engine and the compiler plugin that produces its cwasm have to agree on
+/// this number, which is why it lives here rather than in either of them.
+pub const CWASM_MEMORY_RESERVATION: u64 = 1 << 32;
 
-pub fn cwasm_target_uses_lazy_commit_virtual_memory(target: &str) -> bool {
-    matches!(target, "aarch64-unknown-none")
-}
+/// Guard bytes reserved past the end of every linear memory.
+///
+/// Cranelift folds a static offset smaller than this into the access instead
+/// of emitting a bounds check for it, so the guard region is what makes
+/// constant-offset accesses free. 32 MiB is Wasmtime's own default and is
+/// rounded up from the largest static offset SpiderMonkey measured across a
+/// large corpus of wasm modules.
+pub const CWASM_MEMORY_GUARD_SIZE: u64 = 32 << 20;
 
 /// Whether cwasm artifacts for `target` may use 128-bit wasm SIMD.
 ///

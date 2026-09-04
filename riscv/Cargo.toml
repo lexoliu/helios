@@ -23,7 +23,7 @@ spin = { version = "0.9.8", default-features = false, features = ["mutex", "once
 trapframe = { version = "0.10.1", default-features = false }
 helios-hal.workspace = true
 i6300esb.workspace = true
-helios-kernel = { workspace = true, default-features = false, features = ["wasmtime-riscv64"] }
+helios-kernel = { workspace = true, default-features = false, features = ["wasmtime-bare-metal"] }
 helios-virtio = { path = "../virtio" }
 tracing.workspace = true
 

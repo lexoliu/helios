@@ -1,7 +1,5 @@
 use helios_artifact::{
-    CWASM_NO_VMEM_MEMORY_GUARD_SIZE, CWASM_NO_VMEM_MEMORY_RESERVATION,
-    CWASM_NO_VMEM_MEMORY_RESERVATION_FOR_GROWTH, cwasm_target_supports_wasm_simd,
-    cwasm_target_uses_lazy_commit_virtual_memory,
+    CWASM_MEMORY_GUARD_SIZE, CWASM_MEMORY_RESERVATION, cwasm_target_supports_wasm_simd,
 };
 use std::env;
 use std::num::NonZeroUsize;
@@ -171,16 +169,15 @@ fn build_engine_config(target: &str, hint: AotCompileHint, worker_count: usize) 
     // fiber stack comfortably above the wasm stack limit with host headroom.
     config.max_wasm_stack(8 * 1024 * 1024);
     config.async_stack_size(9 * 1024 * 1024);
-    if cwasm_target_uses_lazy_commit_virtual_memory(target) {
-        config.memory_init_cow(true);
-        config.memory_may_move(false);
-    } else {
-        config.signals_based_traps(true);
-        config.memory_guard_size(CWASM_NO_VMEM_MEMORY_GUARD_SIZE);
-        config.memory_reservation(CWASM_NO_VMEM_MEMORY_RESERVATION);
-        config.memory_reservation_for_growth(CWASM_NO_VMEM_MEMORY_RESERVATION_FOR_GROWTH);
-        config.memory_init_cow(false);
-    }
+    // Every helios target runs the lazy-commit memory profile, and the
+    // reservation and guard sizes compiled into a cwasm artifact are the ones
+    // the kernel engine configures for it. Compiling against a different
+    // profile would emit bounds checks (or elide checks the runtime cannot
+    // back with a guard region), so both sides read the same constants.
+    config.memory_init_cow(true);
+    config.memory_may_move(false);
+    config.memory_reservation(CWASM_MEMORY_RESERVATION);
+    config.memory_guard_size(CWASM_MEMORY_GUARD_SIZE);
     Ok(config)
 }
 

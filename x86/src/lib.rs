@@ -40,7 +40,7 @@ use helios_hal::serial::ByteSerial;
 use helios_hal::watchdog::Watchdog;
 use helios_hal::{DeviceInventory, DmaModel, Platform, ProcessorStartupPolicy, ProcessorTopology};
 use x86_64::instructions::port::{Port, PortReadOnly, PortWriteOnly};
-use x86_64::registers::control::{Cr0Flags, Cr3, Cr4Flags};
+use x86_64::registers::control::{Cr0Flags, Cr4Flags};
 
 const COM1_BASE: u16 = 0x3f8;
 const COM1_DATA: u16 = COM1_BASE;
@@ -57,11 +57,7 @@ const PIT_SPEAKER_GATE: u16 = 0x61;
 const PIT_BASE_HZ: u64 = 1_193_182;
 const PIT_CALIBRATION_HZ: u64 = 100;
 const PAGE_BYTES: usize = 4096;
-const PAGE_MASK: usize = PAGE_BYTES - 1;
 const MAX_USABLE_REGION_SEGMENTS: usize = 6;
-const PAGE_PRESENT: u64 = 1 << 0;
-const PAGE_HUGE: u64 = 1 << 7;
-const PAGE_NO_EXECUTE: u64 = 1 << 63;
 pub(crate) const KERNEL_STACK_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) static WASMTIME_NATIVE_TRAP_HANDLER: AtomicUsize = AtomicUsize::new(0);
 static CRITICAL_SECTION_STATE: helios_hal::critical_section::CriticalSectionState =
@@ -441,11 +437,12 @@ fn install_pci_devices<WatchdogImpl>(
         debug_state.install_memory_balloon(handle);
         routes.set_balloon(exceptions::BALLOON_INTERRUPT_VECTOR, handler);
     }
-    // x86 commits linear memory eagerly out of the user pool: there is
-    // no reservation to leave a not-present entry in, and Cranelift
-    // emits explicit bounds checks rather than relying on guard pages,
-    // so a swapped-out page could never fault back in. Tracked as #59.
-    helios_kernel::disable_swap(helios_kernel::SwapDisabled::NoLazyCommitAddressSpace);
+    // The x86 address space reserves and commits lazily, so a page could
+    // be taken away here — but the backend has not wired the other half:
+    // no `SwapVmHooks` table, so a not-present four-level entry carries no
+    // swap token and the fault handler has nothing to look the page up by.
+    // Extending swap to this backend is #25's follow-up to #59.
+    helios_kernel::disable_swap(helios_kernel::SwapDisabled::NoSwapHooks);
     if block_functions.is_empty() {
         tracing::warn!("virtio block device was not discovered on the PCI bus");
     }
@@ -774,36 +771,6 @@ impl X86Cpu {
         Self { state }
     }
 
-    fn update_executable_range(&self, ptr: *const u8, len: usize, executable: bool) {
-        if len == 0 {
-            return;
-        }
-
-        let start = ptr as usize;
-        let end = start.checked_add(len - 1).unwrap_or_else(|| {
-            panic!("code executable range overflow: start={start:#x}, len={len}")
-        });
-        let first_page = start & !PAGE_MASK;
-        let last_page = end & !PAGE_MASK;
-        let mut page = first_page;
-        loop {
-            unsafe {
-                update_no_execute_bit(page, self.state.physical_memory_offset(), executable);
-                asm!(
-                    "invlpg [{addr}]",
-                    addr = in(reg) page,
-                    options(nostack, preserves_flags),
-                );
-            }
-            if page == last_page {
-                break;
-            }
-            page = page
-                .checked_add(PAGE_BYTES)
-                .unwrap_or_else(|| panic!("code executable page iteration overflow at {page:#x}"));
-        }
-    }
-
     pub(crate) fn debug_state(&self) -> debug_state::RuntimeState {
         self.state.debug_state()
     }
@@ -884,15 +851,24 @@ impl Cpu for X86Cpu {
     }
 
     fn publish_executable(&self, ptr: *const u8, len: usize) {
-        self.update_executable_range(ptr, len, true);
+        helios_kernel::runtime_memory::publish_code_memory(ptr, len);
     }
 
     fn unpublish_executable(&self, ptr: *const u8, len: usize) {
-        self.update_executable_range(ptr, len, false);
+        helios_kernel::runtime_memory::unpublish_code_memory(ptr, len);
     }
 
     fn native_feature_probe(&self) -> Option<fn(&str) -> Option<bool>> {
         Some(detect_x86_native_feature)
+    }
+
+    fn has_lazy_commit_virtual_memory(&self) -> bool {
+        // `X86UserAddressSpace` reserves four-level-paging ranges without
+        // touching a frame and commits them page by page on request, so the
+        // runtime can pre-reserve a 4 GiB slot per linear memory out of the
+        // 32 TiB user window and pay physical memory only for what a guest
+        // actually touches.
+        true
     }
 
     fn fill_entropy(&self, buffer: &mut [u8]) -> Result<EntropyQuality, EntropyUnavailable> {
@@ -1050,93 +1026,6 @@ fn detect_x86_native_feature(feature: &str) -> Option<bool> {
         "lzcnt" => Some(max_extended >= 0x8000_0001 && __cpuid(0x8000_0001).ecx & (1 << 5) != 0),
         _ => None,
     }
-}
-
-unsafe fn update_no_execute_bit(
-    virtual_addr: usize,
-    physical_memory_offset: usize,
-    executable: bool,
-) {
-    let (level_4_frame, _) = Cr3::read();
-    let level_4 = unsafe {
-        page_table_from_physical(
-            level_4_frame.start_address().as_u64() as usize,
-            physical_memory_offset,
-        )
-    };
-
-    let level_4_index = (virtual_addr >> 39) & 0x1ff;
-    let level_3_index = (virtual_addr >> 30) & 0x1ff;
-    let level_2_index = (virtual_addr >> 21) & 0x1ff;
-    let level_1_index = (virtual_addr >> 12) & 0x1ff;
-
-    let level_4_entry = level_4[level_4_index];
-    assert!(
-        level_4_entry & PAGE_PRESENT != 0,
-        "missing level-4 page-table entry for virtual address {virtual_addr:#x}"
-    );
-    let level_3 = unsafe {
-        page_table_from_physical(entry_frame_address(level_4_entry), physical_memory_offset)
-    };
-    let level_3_entry = level_3[level_3_index];
-    assert!(
-        level_3_entry & PAGE_PRESENT != 0,
-        "missing level-3 page-table entry for virtual address {virtual_addr:#x}"
-    );
-    if level_3_entry & PAGE_HUGE != 0 {
-        level_3[level_3_index] = no_execute_entry(level_3_entry, executable);
-        return;
-    }
-
-    let level_2 = unsafe {
-        page_table_from_physical(entry_frame_address(level_3_entry), physical_memory_offset)
-    };
-    let level_2_entry = level_2[level_2_index];
-    assert!(
-        level_2_entry & PAGE_PRESENT != 0,
-        "missing level-2 page-table entry for virtual address {virtual_addr:#x}"
-    );
-    if level_2_entry & PAGE_HUGE != 0 {
-        level_2[level_2_index] = no_execute_entry(level_2_entry, executable);
-        return;
-    }
-
-    let level_1 = unsafe {
-        page_table_from_physical(entry_frame_address(level_2_entry), physical_memory_offset)
-    };
-    let level_1_entry = level_1[level_1_index];
-    assert!(
-        level_1_entry & PAGE_PRESENT != 0,
-        "missing level-1 page-table entry for virtual address {virtual_addr:#x}"
-    );
-    level_1[level_1_index] = no_execute_entry(level_1_entry, executable);
-}
-
-fn no_execute_entry(entry: u64, executable: bool) -> u64 {
-    if executable {
-        entry & !PAGE_NO_EXECUTE
-    } else {
-        entry | PAGE_NO_EXECUTE
-    }
-}
-
-unsafe fn page_table_from_physical(
-    table_physical_addr: usize,
-    physical_memory_offset: usize,
-) -> &'static mut [u64; 512] {
-    let table_virtual_addr = table_physical_addr
-        .checked_add(physical_memory_offset)
-        .unwrap_or_else(|| {
-            panic!(
-                "physical memory offset overflow: phys={table_physical_addr:#x}, offset={physical_memory_offset:#x}"
-            )
-        });
-    let table_ptr = table_virtual_addr as *mut [u64; 512];
-    unsafe { &mut *table_ptr }
-}
-
-fn entry_frame_address(entry: u64) -> usize {
-    (entry as usize) & 0x000f_ffff_ffff_f000
 }
 
 fn read_tsc() -> u64 {

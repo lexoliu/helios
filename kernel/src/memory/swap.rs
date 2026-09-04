@@ -132,9 +132,10 @@ const SCAN_BUDGET_PAGES: usize = 4 * (SWAP_BATCH_BYTES / PhysFrame::SIZE);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
 pub enum SwapDisabled {
     #[error(
-        "backend has no lazy-commit address space, so a swapped-out page could not fault back in"
+        "backend installs no swap hooks, so a page has no not-present encoding to carry its \
+         swap token"
     )]
-    NoLazyCommitAddressSpace,
+    NoSwapHooks,
     #[error("machine gave the kernel no scratch block device to swap to")]
     NoSwapDevice,
 }
