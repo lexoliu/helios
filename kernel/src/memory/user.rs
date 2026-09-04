@@ -512,14 +512,51 @@ mod tests {
         assert_eq!(stats.largest_allocatable_bytes(), 0);
     }
 
-    /// A pool over a leaked, page-aligned block of host memory.
-    fn pool(bytes: usize) -> UserMemoryPool {
-        let layout = Layout::from_size_align(bytes, PhysFrame::SIZE).expect("pool layout");
-        let start = unsafe { alloc::alloc::alloc(layout) } as usize;
-        assert!(start != 0, "host allocation for the user pool failed");
+    /// A pool over a leaked block of host memory placed exactly where the
+    /// caller asks: the first address at or above the allocation that is a
+    /// multiple of `alignment`, plus `offset`.
+    ///
+    /// A buddy heap's largest block is decided by where its region starts.
+    /// `add_to_heap` walks the region and takes, at each step, the largest
+    /// power-of-two block that both fits in what is left and is aligned to
+    /// the running start address, so a region starting one frame past its
+    /// natural alignment can never be one intact buddy. Backing a pool with
+    /// a plain host allocation therefore makes the test assert where the
+    /// host allocator happened to place it -- an 8 MiB request comes back
+    /// naturally 8 MiB-aligned on macOS arm64 and does not on the Linux CI
+    /// runner. Over-allocating and carving the region out at a chosen
+    /// alignment and offset makes the pool the subject instead.
+    fn pool_at(bytes: usize, alignment: usize, offset: usize) -> UserMemoryPool {
+        assert!(
+            alignment.is_power_of_two(),
+            "a buddy region aligns to a power of two, not {alignment}"
+        );
+        let layout = Layout::from_size_align(bytes + alignment + offset, PhysFrame::SIZE)
+            .expect("pool layout");
+        let base = unsafe { alloc::alloc::alloc(layout) } as usize;
+        assert!(base != 0, "host allocation for the user pool failed");
+        let start = base.next_multiple_of(alignment) + offset;
         let pool = UserMemoryPool::empty();
         pool.add_region(start, start + bytes);
         pool
+    }
+
+    /// A pool whose region is naturally aligned, which the buddy heap holds
+    /// as one intact block: it serves the whole pool in a single request.
+    fn pool(bytes: usize) -> UserMemoryPool {
+        assert!(
+            bytes.is_power_of_two(),
+            "a naturally aligned region is a power of two, not {bytes}"
+        );
+        pool_at(bytes, bytes, 0)
+    }
+
+    /// A pool whose region starts one frame past its natural alignment. The
+    /// heap carves it into ascending blocks -- one frame, two, four, up to
+    /// half the region, then a trailing frame -- so the largest block it can
+    /// ever serve is half of what the pool holds.
+    fn misaligned_pool(bytes: usize) -> UserMemoryPool {
+        pool_at(bytes, bytes, PhysFrame::SIZE)
     }
 
     /// Asserts the pool hands out exactly what it just advertised.
@@ -546,12 +583,26 @@ mod tests {
     /// advertised, which is what the guest reported verbatim: "program memory
     /// request of 536870912 bytes exceeds its memory budget:
     /// available=1048576000 reserved=0".
+    ///
+    /// The misalignment is constructed rather than hoped for: a region one
+    /// frame past its natural alignment holds every byte the bound counts and
+    /// yet cannot hand out more than half of them at once.
     #[test]
     fn the_granularity_bound_overstates_what_the_pool_serves() {
-        let pool = pool(8 * 1024 * 1024);
+        let bytes = 8 * 1024 * 1024;
+        let pool = misaligned_pool(bytes);
 
         let bound = pool.stats().largest_allocatable_bytes();
+        assert_eq!(
+            bound, bytes,
+            "the bound counts every byte of the region, aligned or not"
+        );
         let servable = assert_advertises_what_it_serves(&pool);
+        assert_eq!(
+            servable,
+            bytes / 2,
+            "the largest buddy over a region offset by one frame is half of it"
+        );
         assert!(
             servable < bound,
             "the bound claims {bound} bytes but the pool serves {servable}"
@@ -568,9 +619,31 @@ mod tests {
         pool.deallocate_with_processor(held, frame, None);
     }
 
+    /// The other half of #62: the bound never *understates* what the pool
+    /// serves. Over a naturally aligned region the two meet exactly, and
+    /// `largest_servable_bytes` must not answer with a smaller block than
+    /// the pool would hand out -- a caller that sized a spawn from it would
+    /// leave the difference unusable.
+    #[test]
+    fn an_aligned_pool_serves_exactly_its_bound() {
+        let bytes = 8 * 1024 * 1024;
+        let pool = pool(bytes);
+
+        let bound = pool.stats().largest_allocatable_bytes();
+        assert_eq!(bound, bytes);
+        assert_eq!(
+            assert_advertises_what_it_serves(&pool),
+            bound,
+            "an intact buddy serves the whole bound"
+        );
+    }
+
     #[test]
     fn an_exhausted_pool_advertises_nothing() {
-        let pool = pool(8 * 1024 * 1024);
+        // A region the heap holds as one block would drain in a single
+        // request and prove nothing; the misaligned one makes the loop walk
+        // down every buddy the carve produced.
+        let pool = misaligned_pool(8 * 1024 * 1024);
         let mut held = alloc::vec::Vec::new();
 
         // Taking the largest servable block repeatedly is the only way to
