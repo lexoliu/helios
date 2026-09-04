@@ -220,14 +220,17 @@ pub(super) fn imported_shared_memory_with_declared_maximum(
 
 /// The largest shared-memory maximum the user pool can still commit.
 ///
-/// Backends without lazy-commit virtual memory commit a shared memory's
-/// whole maximum up front, so every maximum this kernel hands out has to
-/// be one the user pool can actually satisfy *now*. Two properties make
-/// the naive "whatever is free" answer wrong, and both are covered here:
-/// the pool rounds every request up to a power of two, so a request for
-/// the raw free byte count is refused by construction, and the maximum
-/// is capped by [`PROGRAM_SHARED_MEMORY_MAX_PAGES`] so one program
-/// cannot claim a pool that later programs still need.
+/// A shared memory cannot be moved, so the runtime reserves its whole
+/// declared maximum up front — but only commits the initial pages, because
+/// every backend now runs the lazy-commit memory profile. The maximum is
+/// therefore a growth ceiling rather than an immediate charge against the
+/// user pool, and this function is what keeps that ceiling honest: a guest
+/// that grows into it has to find the frames there. Two properties make the
+/// naive "whatever is free" answer wrong, and both are covered here: the
+/// pool rounds every request up to a power of two, so a budget equal to the
+/// raw free byte count is one the allocator then refuses, and the maximum is
+/// capped by [`PROGRAM_SHARED_MEMORY_MAX_PAGES`] so one program cannot claim
+/// a pool that later programs still need.
 pub(super) fn user_shared_memory_budget_pages() -> u32 {
     // The cap is applied first so the probe never asks the pool for a block
     // larger than a single program is allowed to claim.

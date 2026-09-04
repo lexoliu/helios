@@ -194,13 +194,19 @@ pub trait Cpu: Send + Sync + 'static {
     }
 
     /// Whether this backend's virtual-memory subsystem supports
-    /// petabyte-scale lazy-commit reservations: reserving a large
+    /// terabyte-scale lazy-commit reservations: reserving a large
     /// virtual range and only materialising physical backing on access.
-    /// Hosted satisfies this through `mmap(PROT_NONE)`. Bare-metal
-    /// targets satisfy it once their `hal::vmm::AddressSpace`
-    /// implementation reaches a full reserve/commit/decommit
-    /// surface. The default `false` keeps backends that have not yet
-    /// wired this up on a conservative eager-backing strategy.
+    ///
+    /// Hosted satisfies this through `mmap(PROT_NONE)`; a bare-metal
+    /// backend satisfies it once its `hal::vmm::AddressSpace`
+    /// implementation reaches a full reserve/commit/decommit surface and
+    /// its user-VA window is large enough to hold the reservations its
+    /// runtime asks for. Every backend in this repository does.
+    ///
+    /// The default `false` is for a backend that has not wired that up
+    /// yet: there is no weaker memory strategy for it to run on, so the
+    /// consumer that needs the capability refuses to start rather than
+    /// substituting one.
     fn has_lazy_commit_virtual_memory(&self) -> bool {
         false
     }

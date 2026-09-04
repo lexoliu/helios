@@ -9,30 +9,15 @@ pub(crate) mod artifact_profile;
 pub mod bindings;
 pub(crate) mod component_host;
 pub mod config;
-#[cfg(all(
-    target_os = "none",
-    any(
-        feature = "wasmtime-aarch64",
-        feature = "wasmtime-riscv64",
-        feature = "wasmtime-x86"
-    )
-))]
+#[cfg(all(target_os = "none", feature = "wasmtime-bare-metal"))]
 pub mod custom_vm;
 pub(crate) mod cwasm;
 pub mod engine;
 pub mod store;
 pub mod swap_fault;
-#[cfg(all(
-    target_os = "none",
-    any(
-        feature = "wasmtime-aarch64",
-        feature = "wasmtime-riscv64",
-        feature = "wasmtime-x86"
-    )
-))]
+#[cfg(all(target_os = "none", feature = "wasmtime-bare-metal"))]
 mod sync;
 pub mod tls;
-pub(crate) mod user_memory;
 pub mod wasi;
 pub(crate) mod wasix;
 

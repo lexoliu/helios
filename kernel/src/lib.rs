@@ -28,14 +28,7 @@ pub(crate) mod wasmtime_adapter;
 pub use wasmtime_adapter::swap_fault::resolve_swap_fault_blocking;
 pub use wasmtime_adapter::tls::WasmtimeTlsSlots;
 
-#[cfg(all(
-    target_os = "none",
-    any(
-        feature = "wasmtime-aarch64",
-        feature = "wasmtime-riscv64",
-        feature = "wasmtime-x86"
-    )
-))]
+#[cfg(all(target_os = "none", feature = "wasmtime-bare-metal"))]
 pub mod runtime_memory {
     //! Re-export of the runtime custom-virtual-memory dispatcher
     //! so bare-metal backends can install their `RuntimeMemoryHooks`
@@ -43,6 +36,7 @@ pub mod runtime_memory {
     pub use crate::wasmtime_adapter::custom_vm::{
         RuntimeMemoryHooks, RuntimeMemoryImage, default_memory_image_free,
         default_memory_image_map_at, default_memory_image_new, default_page_size, install_hooks,
+        publish_code_memory, unpublish_code_memory,
     };
 }
 pub use bootfs::{

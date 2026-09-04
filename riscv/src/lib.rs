@@ -443,16 +443,34 @@ impl Cpu for RiscvCpu {
         sbi_rt::set_timer(deadline.ticks());
     }
 
-    fn publish_executable(&self, _ptr: *const u8, _len: usize) {
+    fn publish_executable(&self, ptr: *const u8, len: usize) {
+        helios_kernel::runtime_memory::publish_code_memory(ptr, len);
+        // `fence.i` is the only ordering RISC-V defines between a store to an
+        // instruction's memory and a fetch of it, and it is per-hart. The
+        // range is published before any other hart can be steered into it, so
+        // fencing the publishing hart is what the hart that executes next
+        // needs; every other hart reaches this code through a scheduler
+        // handoff that fences on its own side.
         unsafe {
             core::arch::asm!("fence.i", options(nostack, preserves_flags));
         }
     }
 
-    fn unpublish_executable(&self, _ptr: *const u8, _len: usize) {}
+    fn unpublish_executable(&self, ptr: *const u8, len: usize) {
+        helios_kernel::runtime_memory::unpublish_code_memory(ptr, len);
+    }
 
     fn native_feature_probe(&self) -> Option<fn(&str) -> Option<bool>> {
         None
+    }
+
+    fn has_lazy_commit_virtual_memory(&self) -> bool {
+        // `RiscvUserAddressSpace` reserves Sv48 virtual ranges without
+        // touching a frame and commits them page by page on request, so the
+        // runtime can pre-reserve a 4 GiB slot per linear memory out of the
+        // 32 TiB user window and pay physical memory only for what a guest
+        // actually touches.
+        true
     }
 
     fn shutdown(&self) -> ! {
@@ -539,13 +557,24 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
     let current_hart = ProcessorId::new(hart_id as u16);
     let bootstrap_processor = remember_bootstrap_hart(hart_id);
     mark_hart_online(current_hart);
-    // Bring up Sv39 paging on every hart before any allocator or
+    // Bring up Sv48 paging on every hart before any allocator or
     // driver work. The bootstrap hart populates the root table once
-    // (identity-mapping the kernel's 16 GiB physical window), then
-    // every hart writes its own `satp` to switch into paged
-    // execution. Identity mapping makes the transition transparent
-    // for kernel addresses; the user-VA window above the identity
-    // map is owned by `RiscvUserAddressSpace` for dynamic mappings.
+    // (identity-mapping the kernel's 512 GiB physical window with a
+    // single root-level leaf), then every hart writes its own `satp` to
+    // switch into paged execution. Identity mapping makes the transition
+    // transparent for kernel addresses; the 32 TiB user-VA window above
+    // the identity map is owned by `RiscvUserAddressSpace`, which is
+    // where the runtime's linear-memory reservations live.
+    for region in &memory_regions {
+        let start = region.as_ptr().cast::<u8>() as usize;
+        let end = start + region.len();
+        assert!(
+            end <= vmm::KERNEL_IDENTITY_LIMIT,
+            "firmware reports physical memory at {start:#x}..{end:#x}, past the {:#x} the Sv48 \
+             kernel identity map reaches",
+            vmm::KERNEL_IDENTITY_LIMIT
+        );
+    }
     if current_hart == bootstrap_processor {
         unsafe {
             vmm::install_kernel_paging();
@@ -684,12 +713,13 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
             for block in block::install(&cpu, &kernel, &fdt, &debug_state, root_entropy) {
                 interrupts.attach_block(block);
             }
-            // riscv commits linear memory eagerly out of the user pool:
-            // there is no reservation to leave a not-present entry in,
-            // and Cranelift emits explicit bounds checks rather than
-            // relying on guard pages, so a swapped-out page could never
-            // fault back in. Tracked as #59.
-            helios_kernel::disable_swap(helios_kernel::SwapDisabled::NoLazyCommitAddressSpace);
+            // The Sv48 address space reserves and commits lazily, so a page
+            // could be taken away here — but the backend has not wired the
+            // other half: no `SwapVmHooks` table, so a not-present PTE
+            // carries no swap token and the fault handler has nothing to
+            // look the page up by. Extending swap to this backend is #25's
+            // follow-up to #59.
+            helios_kernel::disable_swap(helios_kernel::SwapDisabled::NoSwapHooks);
             interrupts
         })
     });
@@ -959,15 +989,6 @@ fn dispatch_kernel_exception(
     let Some(cause) = kernel_exception_cause(exception) else {
         return KernelExceptionDispatch::Unhandled;
     };
-    write_debug_serial_bytes(
-        alloc::format!(
-            "\n[KDBG kernel-exception-dispatch cause={cause:?} pc={:#x} fp={:#x} tls={:#x}]\n",
-            tf.sepc,
-            tf.general.s0,
-            wasmtime_tls_get(WasmtimeTlsSlots::RUNTIME) as usize,
-        )
-        .as_bytes(),
-    );
     KernelException {
         cause,
         instruction_pointer: tf.sepc,

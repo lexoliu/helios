@@ -1295,30 +1295,3 @@ pub fn resolve_access_flag_fault(addr: usize) -> bool {
     };
     address_space.set_access_flag(VirtAddr::new(addr))
 }
-
-pub fn publish_code_memory(ptr: *const u8, len: usize) {
-    protect_code_memory(ptr, len, PageFlags::READ | PageFlags::EXECUTE);
-}
-
-pub fn unpublish_code_memory(ptr: *const u8, len: usize) {
-    protect_code_memory(ptr, len, PageFlags::READ | PageFlags::WRITE);
-}
-
-fn protect_code_memory(ptr: *const u8, len: usize, flags: PageFlags) {
-    if len == 0 {
-        return;
-    }
-    let start = ptr as usize;
-    assert!(
-        start.is_multiple_of(PAGE),
-        "AArch64 code-memory range start {start:#x} is not page-aligned"
-    );
-    assert!(
-        len.is_multiple_of(PAGE),
-        "AArch64 code-memory range len {len:#x} is not page-aligned"
-    );
-    let range = VirtRange::new(VirtAddr::new(start), len);
-    user_as()
-        .protect(range, flags)
-        .unwrap_or_else(|error| panic!("AArch64 code-memory protect failed: {error:?}"));
-}

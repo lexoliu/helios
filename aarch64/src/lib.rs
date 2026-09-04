@@ -831,11 +831,11 @@ impl Cpu for Aarch64Cpu {
             asm!("dsb ish", options(nostack, preserves_flags));
             asm!("isb", options(nostack, preserves_flags));
         }
-        vmm::publish_code_memory(ptr, len);
+        helios_kernel::runtime_memory::publish_code_memory(ptr, len);
     }
 
     fn unpublish_executable(&self, ptr: *const u8, len: usize) {
-        vmm::unpublish_code_memory(ptr, len);
+        helios_kernel::runtime_memory::unpublish_code_memory(ptr, len);
     }
 
     fn native_feature_probe(&self) -> Option<fn(&str) -> Option<bool>> {

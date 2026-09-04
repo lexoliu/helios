@@ -1,7 +1,7 @@
 use alloc::borrow::ToOwned;
+#[cfg(target_os = "none")]
 use alloc::sync::Arc;
 
-use crate::wasmtime_adapter::user_memory::UserMemoryCreator;
 use helios_hal::cpu::Cpu;
 #[cfg(target_os = "none")]
 use helios_hal::pmm::PhysFrame;
@@ -12,10 +12,6 @@ use wasmtime::component::{Component, Instance, TypedFunc};
 use wasmtime::{AsContextMut, Engine};
 
 const WASI_CLI_RUN_FUNC: &str = "run";
-#[cfg(any(
-    not(target_os = "none"),
-    all(target_os = "none", feature = "wasmtime-aarch64")
-))]
 const POOLING_MAX_UNUSED_WARM_SLOTS: u32 = 100;
 
 #[derive(Debug, Error)]
@@ -56,7 +52,8 @@ fn build_engine_for_platform<P: Cpu + Clone>(
     platform: &P,
     concurrency_support: bool,
 ) -> wasmtime::Result<Engine> {
-    let mut config = build_component_engine_config(env!("HELIOS_BUILD_TARGET"));
+    let target = env!("HELIOS_BUILD_TARGET");
+    let mut config = build_component_engine_config(target);
     config.concurrency_support(concurrency_support);
     if let Some(probe) = platform.native_feature_probe() {
         unsafe {
@@ -68,83 +65,41 @@ fn build_engine_for_platform<P: Cpu + Clone>(
         platform: platform.clone(),
     })));
     config.signals_based_traps(true);
-    // The page-fault trampoline blocks the faulting fiber through
-    // `wasmtime::block_on_current_fiber`. Only a platform whose address
-    // space can take a page away needs that, and asking for it costs a
-    // TLS slot on every fiber resume, so it is asked for exactly there.
-    config.block_on_current_fiber(platform.has_lazy_commit_virtual_memory());
-    let target_uses_lazy_commit =
-        helios_artifact::cwasm_target_uses_lazy_commit_virtual_memory(env!("HELIOS_BUILD_TARGET"));
+    // Every backend that gets this far serves wasmtime's virtual-memory ABI
+    // from its own `hal::vmm::AddressSpace` (bare metal) or from the host
+    // `mmap` (hosted). The pooling allocator's per-slot pre-reservations are
+    // only affordable through such an address space, and Cranelift drops
+    // linear-memory bounds checks only when the reservation and guard region
+    // behind every slot are real. A backend without that capability has no
+    // second memory stack to fall back to (AGENTS §3, §3.2), so it fails
+    // here instead.
     assert!(
-        platform.has_lazy_commit_virtual_memory() == target_uses_lazy_commit,
-        "platform lazy-commit virtual-memory capability does not match cwasm target profile"
+        platform.has_lazy_commit_virtual_memory(),
+        "backend must provide lazy-commit virtual memory to host the Wasmtime pooling allocator"
     );
-    if configure_pooling(&mut config).applied {
-        // Pooling path took ownership of the linear-memory
-        // configuration. UserMemoryCreator must not be installed —
-        // it uses the kernel buddy heap which cannot satisfy
-        // wasmtime's per-slot pre-reservations.
-        if platform.has_lazy_commit_virtual_memory() {
-            config.memory_init_cow(true);
-            config.memory_may_move(false);
-        }
-    } else if platform.has_lazy_commit_virtual_memory() {
-        // Bare-metal custom-vm builds route Wasmtime's default memory
-        // creator through the backend-installed `wasmtime_mmap_*`
-        // hooks. Do not install `UserMemoryCreator` here: combining
-        // `has_virtual_memory=true` with the buddy-heap host-memory
-        // creator drives Wasmtime through a mismatched upper/lower
-        // memory stack and is the #16 RPC-stall failure mode.
-        config.memory_init_cow(true);
-        config.memory_may_move(false);
-    } else {
-        // Backends without a real VM stack (or builds without
-        // `pooling-allocator`) rely on the kernel-side buddy heap;
-        // preserve the historical OnDemand path with explicit
-        // "no reservation, allocate exactly the wasm module's
-        // declared minimum" tuning so SharedMemory requests never
-        // grow physical RAM beyond what the wasm guest actually
-        // needs.
-        config.with_host_memory(Arc::new(UserMemoryCreator::<P>::new(platform.clone())));
-        config.memory_guard_size(helios_artifact::CWASM_NO_VMEM_MEMORY_GUARD_SIZE);
-        config.memory_reservation(helios_artifact::CWASM_NO_VMEM_MEMORY_RESERVATION);
-        config.memory_reservation_for_growth(
-            helios_artifact::CWASM_NO_VMEM_MEMORY_RESERVATION_FOR_GROWTH,
-        );
-        config.memory_init_cow(false);
-    }
-    Engine::new(&config)
+    // The page-fault trampoline blocks the faulting fiber through
+    // `wasmtime::block_on_current_fiber`. A lazily committed address space is
+    // exactly one that can take a page away underneath running guest code, so
+    // the TLS slot that costs is asked for wherever that holds.
+    config.block_on_current_fiber(true);
+    apply_pooling_config(&mut config);
+    config.memory_init_cow(true);
+    config.memory_may_move(false);
+    config.memory_reservation(helios_artifact::CWASM_MEMORY_RESERVATION);
+    config.memory_guard_size(helios_artifact::CWASM_MEMORY_GUARD_SIZE);
+    let engine = Engine::new(&config)?;
+    tracing::info!(
+        target,
+        memory_reservation = engine.get_memory_reservation(),
+        memory_guard_size = engine.get_memory_guard_size(),
+        memory_init_cow = engine.get_memory_init_cow(),
+        memory_may_move = engine.get_memory_may_move(),
+        signals_based_traps = engine.get_signals_based_traps(),
+        "component engine built with the pooling allocator on the lazy-commit memory profile"
+    );
+    Ok(engine)
 }
 
-struct PoolingConfiguration {
-    applied: bool,
-}
-
-/// Apply Wasmtime's pooling instance allocator to `config` when this
-/// build links a wasmtime variant that ships the pooling-allocator
-/// feature.
-#[cfg(all(target_os = "none", feature = "wasmtime-aarch64"))]
-fn configure_pooling(config: &mut wasmtime::Config) -> PoolingConfiguration {
-    apply_pooling_config(config);
-    PoolingConfiguration { applied: true }
-}
-
-#[cfg(all(target_os = "none", not(feature = "wasmtime-aarch64")))]
-fn configure_pooling(config: &mut wasmtime::Config) -> PoolingConfiguration {
-    config.async_stack_zeroing(false);
-    PoolingConfiguration { applied: false }
-}
-
-#[cfg(not(target_os = "none"))]
-fn configure_pooling(config: &mut wasmtime::Config) -> PoolingConfiguration {
-    apply_pooling_config(config);
-    PoolingConfiguration { applied: true }
-}
-
-#[cfg(any(
-    not(target_os = "none"),
-    all(target_os = "none", feature = "wasmtime-aarch64")
-))]
 fn apply_pooling_config(config: &mut wasmtime::Config) {
     use wasmtime::{InstanceAllocationStrategy, PoolingAllocationConfig};
     let mut pooling = PoolingAllocationConfig::default();
@@ -190,3 +145,58 @@ pub fn resolve_wasi_cli_run<T: 'static>(
 }
 
 use super::config::build_component_engine_config;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::TestCpu;
+
+    /// The memory profile is a contract between this engine and the
+    /// compiler plugin that produces its cwasm artifacts: the reservation
+    /// and guard sizes a module was compiled against are the ones its
+    /// elided bounds checks assume. Reading them back off the built engine
+    /// is what proves the whole config pipeline — including wasmtime's own
+    /// defaults and its pooling-allocator cross-checks — still resolves to
+    /// the profile `helios-artifact` publishes.
+    #[test]
+    fn engine_resolves_the_lazy_commit_memory_profile() {
+        let engine = build_component_engine_for_platform(&TestCpu::without_entropy())
+            .expect("component engine should build on the lazy-commit profile");
+
+        assert_eq!(
+            engine.get_memory_reservation(),
+            helios_artifact::CWASM_MEMORY_RESERVATION
+        );
+        assert_eq!(
+            engine.get_memory_guard_size(),
+            helios_artifact::CWASM_MEMORY_GUARD_SIZE
+        );
+        // A wasm32 guest cannot address past the reservation, so these three
+        // together are what let Cranelift drop the bounds check: the
+        // reservation never moves, the guard region catches a folded static
+        // offset, and the fault becomes a trap rather than a signal the
+        // runtime cannot see.
+        assert!(!engine.get_memory_may_move());
+        assert!(engine.get_signals_based_traps());
+        assert!(engine.get_memory_init_cow());
+    }
+
+    /// The pooling allocator requires the GC-heap tunables to match the
+    /// linear-memory ones and refuses to build an engine otherwise, so this
+    /// is also what keeps the two sets from drifting apart as either side's
+    /// defaults change.
+    #[test]
+    fn engine_gc_heap_profile_matches_linear_memory() {
+        let engine = build_component_engine_for_platform(&TestCpu::without_entropy())
+            .expect("component engine should build on the lazy-commit profile");
+
+        assert_eq!(
+            engine.get_gc_heap_reservation(),
+            engine.get_memory_reservation()
+        );
+        assert_eq!(
+            engine.get_gc_heap_guard_size(),
+            engine.get_memory_guard_size()
+        );
+    }
+}

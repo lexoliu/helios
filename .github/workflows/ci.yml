@@ -219,6 +219,37 @@ jobs:
             2>&1 > cpython-smoke.out | tee "$runtime/inspector.log"
           cat cpython-smoke.out
           grep -Fqx '{"ok":"a"}' cpython-smoke.out
+      - name: Trap an out-of-bounds guest load
+        shell: bash
+        working-directory: helios
+        env:
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+        run: |
+          # Without this the step reports tee's status, not the
+          # command's, and a runner script that fails is invisible.
+          set -o pipefail
+          # A wasm32 guest cannot form an address outside the 4 GiB the
+          # kernel reserves behind its linear memory, which is why Cranelift
+          # emits no bounds check for its loads: an access past the pages the
+          # guest has grown into lands on reserved memory and faults. That
+          # fault has to reach the runtime's trap handler and come back out as
+          # a wasm trap that kills one instance. `oob-load` prints its marker,
+          # then makes the access; the shell printing afterwards is what says
+          # the fault did not take the machine with it (#59).
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/oob-load"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch riscv64 --release --memory 2G \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger --boot-program oob-load \
+            --no-compiler-plugin \
+            shell --trace-log "$runtime/guest-tracing.log" \
+            -c '/bin/oob-load; echo guest-alive' \
+            2>&1 > oob-load-smoke.out | tee "$runtime/inspector.log"
+          cat oob-load-smoke.out
+          cat "$runtime/guest-tracing.log"
+          grep -Fqx oob-load:before-fault oob-load-smoke.out
+          grep -Fqx guest-alive oob-load-smoke.out
+          ! grep -Fq 'Kernel panic' oob-load-smoke.out
       - name: Boot riscv64 guest with the inspector RPC on vsock
         shell: bash
         working-directory: helios
@@ -488,11 +519,11 @@ jobs:
         shell: bash
         working-directory: helios
         run: |
-          # The step that #74 actually died in. Without a lazy-commit
-          # address space the plugin's shared memory is allocated at its
-          # declared maximum in one piece, so this is also the largest
-          # single allocation the user pool is ever asked for — and the
-          # only step that proves the pool can still answer it.
+          # The step that #74 actually died in. The plugin's shared memory
+          # is the largest single reservation the user address space is
+          # asked for, and its declared maximum is still capped by what the
+          # user pool could serve, so this remains the step that proves the
+          # pool answers a plugin-sized request.
           runtime="$GITHUB_WORKSPACE/smoke-runtime/compiler"
           mkdir -p "$runtime"
           ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
@@ -501,6 +532,35 @@ jobs:
             2>&1 > compiler-smoke.out | tee "$runtime/inspector.log"
           cat compiler-smoke.out
           grep -Fqx compiler:ok compiler-smoke.out
+      - name: Trap an out-of-bounds guest load
+        shell: bash
+        working-directory: helios
+        run: |
+          # Without this the step reports tee's status, not the
+          # command's, and a runner script that fails is invisible.
+          set -o pipefail
+          # A wasm32 guest cannot form an address outside the 4 GiB the
+          # kernel reserves behind its linear memory, which is why Cranelift
+          # emits no bounds check for its loads: an access past the pages the
+          # guest has grown into lands on reserved memory and faults. That
+          # fault has to reach the runtime's trap handler and come back out as
+          # a wasm trap that kills one instance. `oob-load` prints its marker,
+          # then makes the access; the shell printing afterwards is what says
+          # the fault did not take the machine with it (#59).
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/oob-load"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger --boot-program oob-load \
+            --no-compiler-plugin \
+            shell --trace-log "$runtime/guest-tracing.log" \
+            -c '/bin/oob-load; echo guest-alive' \
+            2>&1 > oob-load-smoke.out | tee "$runtime/inspector.log"
+          cat oob-load-smoke.out
+          cat "$runtime/guest-tracing.log"
+          grep -Fqx oob-load:before-fault oob-load-smoke.out
+          grep -Fqx guest-alive oob-load-smoke.out
+          ! grep -Fq 'Kernel panic' oob-load-smoke.out
       # There is no curl step here, unlike smoke-riscv64: a fetch over
       # virtio-net never completes on x86-64 (#86), and a lane covers
       # what passes. The step joins this job when that is fixed.
@@ -532,10 +592,7 @@ jobs:
           - name: x86-64-linux
             runner: ubuntu-24.04
             helios-arch: x86-64
-            # Without lazy-commit virtual memory the x86 kernel allocates
-            # WASIX shared-memory capacity eagerly, so the shell workloads
-            # need more physical guest RAM than the aarch64 lanes.
-            vm-memory: 6G
+            vm-memory: 2G
             # KVM boots in seconds; a marker hang should fail fast.
             boot-timeout: "300"
             workloads: ""

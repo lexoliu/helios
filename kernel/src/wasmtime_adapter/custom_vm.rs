@@ -109,6 +109,64 @@ pub extern "C" fn default_page_size() -> usize {
     4096
 }
 
+/// `prot_flags` bits, matching the runtime's `WASMTIME_PROT_*` constants.
+const PROT_READ: u32 = 1 << 0;
+const PROT_WRITE: u32 = 1 << 1;
+const PROT_EXEC: u32 = 1 << 2;
+
+/// Make a just-written code range executable.
+///
+/// The runtime allocates compiled code through [`wasmtime_mmap_new`] with
+/// read/write protection and then hands the text range to the platform's
+/// `Cpu::publish_executable` instead of changing the protection itself, so
+/// flipping the range to read/execute is the backend's job. Every backend
+/// does it the same way — through its own `mprotect` hook — so the walk lives
+/// here rather than once per architecture; what stays architecture-specific
+/// is the cache and pipeline maintenance the backend does around this call.
+///
+/// # Panics
+///
+/// The range must start on a page boundary (the runtime guarantees this for
+/// the text section, see `CustomCodeMemory::required_alignment`), and the
+/// backend must be able to protect it. A backend that cannot is misconfigured
+/// and there is no correct weaker permission to fall back to.
+pub fn publish_code_memory(ptr: *const u8, len: usize) {
+    protect_code_memory(ptr, len, PROT_READ | PROT_EXEC, "publish");
+}
+
+/// Return a published code range to read/write so it can be edited again.
+///
+/// The inverse of [`publish_code_memory`]; the runtime calls it through
+/// `Cpu::unpublish_executable` before patching code in place.
+pub fn unpublish_code_memory(ptr: *const u8, len: usize) {
+    protect_code_memory(ptr, len, PROT_READ | PROT_WRITE, "unpublish");
+}
+
+fn protect_code_memory(ptr: *const u8, len: usize, prot_flags: u32, operation: &str) {
+    if len == 0 {
+        return;
+    }
+    let page_size = (hooks().page_size)();
+    let start = ptr as usize;
+    assert!(
+        start.is_multiple_of(page_size),
+        "code-memory range start {start:#x} is not page-aligned"
+    );
+    // The runtime asks for the text section's exact byte length, which the
+    // linker does not pad to a page. Protection is a whole-page operation, so
+    // the tail page is included; the runtime has finished writing the range
+    // before it publishes, and everything past the text section in the same
+    // page is read-only data either way.
+    let len = len
+        .checked_next_multiple_of(page_size)
+        .unwrap_or_else(|| panic!("code-memory range length {len:#x} overflows a page boundary"));
+    let result = (hooks().mprotect)(ptr.cast_mut(), len, prot_flags);
+    assert!(
+        result == 0,
+        "code-memory {operation} of {len:#x} bytes at {start:#x} failed: errno={result}"
+    );
+}
+
 #[unsafe(no_mangle)]
 unsafe extern "C" fn wasmtime_mmap_new(size: usize, prot_flags: u32, ret: &mut *mut u8) -> c_int {
     (hooks().mmap_new)(size, prot_flags, ret)

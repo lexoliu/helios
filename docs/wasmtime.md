@@ -80,6 +80,51 @@ incompatible package identities. The files currently track the released
 `crates/wasi/src/p3/wit/deps` and `crates/wasi-http/src/p3/wit/deps` when the
 vendored revision moves, rather than pointing bindgen at the sibling tree.
 
+## Per-target memory profile
+
+Every target helios runs on — `aarch64-unknown-none`, `riscv64gc-unknown-none-elf`,
+`x86_64-unknown-none` and `hosted/` — uses one memory profile, and there is no
+second one to fall back to. The engine asserts the backend provides
+lazy-commit virtual memory (`Cpu::has_lazy_commit_virtual_memory`) and then
+configures the pooling instance allocator with:
+
+| Setting | Value | Why |
+| --- | --- | --- |
+| `memory_reservation` | 4 GiB (`helios_artifact::CWASM_MEMORY_RESERVATION`) | A wasm32 guest cannot form an address outside it, so Cranelift emits no bounds check. |
+| `memory_guard_size` | 32 MiB (`helios_artifact::CWASM_MEMORY_GUARD_SIZE`) | A static offset smaller than this is folded into the access instead of being checked. |
+| `memory_init_cow` | `true` | Instance initialization maps the module image rather than copying it. |
+| `memory_may_move` | `false` | The reservation the compiled code assumes never relocates. |
+| `signals_based_traps` | `true` | The fault a reserved page raises is what the runtime turns into a wasm trap. |
+
+The same two constants are what the compiler plugin compiles cwasm artifacts
+against (`compiler-support`), because a module's elided bounds checks are only
+sound against the reservation it was compiled for. Both halves read
+`helios-artifact`; `engine_resolves_the_lazy_commit_memory_profile` in
+`kernel/src/wasmtime_adapter/engine.rs` asserts the built engine still resolves
+to them.
+
+Each backend serves that profile from its own `hal::vmm::AddressSpace` through
+the `custom-virtual-memory` C ABI in `kernel/src/wasmtime_adapter/custom_vm.rs`,
+out of a user-VA window large enough for the reservations:
+
+| Backend | Paging | User-VA window |
+| --- | --- | --- |
+| aarch64 | 4-level, `TTBR1` | `0xFFFF_C000_0000_0000..0xFFFF_E000_0000_0000` (32 TiB) |
+| riscv64 | Sv48 | `0x0000_2000_0000_0000..0x0000_4000_0000_0000` (32 TiB) |
+| x86_64 | 4-level, Limine `CR3` | `0x0000_2000_0000_0000..0x0000_4000_0000_0000` (32 TiB) |
+
+The pool reserves `memory_reservation + memory_guard_size` per slot across
+`total_memories` slots — about 3.9 TiB per engine, and the kernel builds one
+engine for system components and one for launched programs. That is why riscv64
+runs Sv48 rather than Sv39: Sv39's entire 512 GiB address space cannot hold one
+engine's worth, and the backend fails at `activate_paging` if a hart refuses
+Sv48 rather than falling back to a profile the compiled code does not match.
+
+Swap (#25) rides on the same reservations but needs a second piece from each
+backend: a not-present page-table encoding that carries a swap token, installed
+as a `SwapVmHooks` table. Only aarch64 has that today; riscv64 and x86_64 call
+`disable_swap(SwapDisabled::NoSwapHooks)` until they do.
+
 ## Runtime-performance context
 
 The generic pooling allocator keeps a bounded set of warm async fiber stacks on
