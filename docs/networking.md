@@ -119,6 +119,28 @@ The streamed guest tracing shows the driver's
 `virtio-net link state changed` followed by the service's
 `network link down` / `network link up` lines.
 
+## Capturing the wire
+
+`--net-pcap <path>` attaches QEMU's `filter-dump` to the guest's netdev
+and writes every frame crossing it, both directions, to a pcap file. It
+works on every backend, because the filter sits between the virtio-net
+device and the host packet path, so what lands in the file is what the
+guest driver actually sent and received rather than what the host end
+saw:
+
+```bash
+helios-inspector vm --arch aarch64 --release \
+    --net-pcap /tmp/helios-net.pcap \
+    workload-bench --workload tcp-throughput --iterations 1
+```
+
+Frames are captured up to 65550 bytes, so a receive-segmentation-coalesced
+frame is recorded whole rather than truncated at the point that would hide
+what the driver negotiated. This is the first thing to reach for when a
+transfer stalls: whether the guest stopped acknowledging, whether the peer
+stopped sending, and which of the two was waiting on a timer are all
+questions the capture answers and the guest log does not.
+
 ## The `user` backend
 
 The default. QEMU's built-in slirp stack needs no privileges and no host
