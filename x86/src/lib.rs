@@ -136,6 +136,7 @@ extern "C" fn _start() -> ! {
 }
 
 fn x86_kernel_main() -> ! {
+    // The one place COM1 is configured; see `serial_uart_init`.
     serial_uart_init();
     assert!(
         boot::base_revision_supported(),
@@ -753,6 +754,11 @@ mod tests {
 /// where the transport never arrives. x86 used to mirror only under the
 /// watchdog self-test, which is why a panic in PCI bring-up left a boot
 /// log holding the panic line and nothing that explained it.
+///
+/// The port itself is already configured by the time any console exists:
+/// `serial_uart_init` runs once, on the bootstrap processor, and a
+/// console built on an application processor writes to the port that
+/// processor's siblings are already using.
 fn serial_console(
     debug_state: debug_state::RuntimeState,
 ) -> helios_kernel::RecordingConsole<
@@ -760,7 +766,6 @@ fn serial_console(
     impl FnMut() -> u64,
     impl FnMut(&[u8]),
 > {
-    serial_uart_init();
     helios_kernel::RecordingConsole::new(debug_state, read_tsc, Some(write_debug_serial_bytes))
 }
 
@@ -975,7 +980,10 @@ extern "C" fn secondary_start_rust(
 ) -> ! {
     // FPU/SSE control bits are set by the secondary wakeup trampoline
     // before any compiler-generated code runs on this processor.
-    serial_uart_init();
+    //
+    // COM1 is deliberately not configured here: the bootstrap processor
+    // configured it before it woke anyone, and configuring it again is
+    // destructive rather than idempotent. See `serial_uart_init`.
     let boot = unsafe { &*boot };
     let runtime = unsafe { &*runtime };
     smp::activate_runtime(runtime);
@@ -1209,6 +1217,24 @@ fn calibrate_tsc_via_pit() -> u64 {
     }
 }
 
+/// Configures COM1, exactly once, on the bootstrap processor before it
+/// wakes any application processor.
+///
+/// This is a reset, not an idempotent setup. Writing `0xc7` to the FIFO
+/// control register clears both FIFOs, throwing away every transmit byte
+/// the device has accepted but not yet handed to the host; and raising
+/// DLAB in the line control register turns the data port into the baud
+/// divisor latch, so a byte another processor writes during that window
+/// lands in the divisor instead of on the wire.
+///
+/// Every processor used to run this from `secondary_start_rust` and again
+/// from `serial_console`, which was harmless only while x86 mirrored the
+/// kernel log to this UART under the watchdog self-test alone. Once the
+/// console mirrored unconditionally the bootstrap processor was streaming
+/// the boot log through the FIFO while the application processors came
+/// up, and each of them silently ate part of it: issue #98 is a stage
+/// marker that reached the inspector as `"[KDBG engine:o"` because the
+/// `k]\n` behind it was cleared out of the FIFO.
 fn serial_uart_init() {
     unsafe {
         PortWriteOnly::new(COM1_INTERRUPT_ENABLE).write(0x00_u8);
@@ -1277,9 +1303,13 @@ pub(crate) fn write_debug_serial_bytes(bytes: &[u8]) {
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    serial_uart_init();
     // One indivisible message, like every other console producer: the panic
     // report shares this UART with kernel tracing and the debugger markers.
+    //
+    // The port is not reconfigured first. `x86_kernel_main` configures it
+    // before anything can panic, and reconfiguring it would clear the
+    // transmit FIFO — discarding the tail of the very log that explains
+    // the panic.
     helios_kernel::emit_console_line(|| {
         let _ = writeln!(PanicSerialWriter, "{info}");
     });
