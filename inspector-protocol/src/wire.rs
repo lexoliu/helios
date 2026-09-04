@@ -18,6 +18,15 @@ const MAX_FRAME_SIZE: usize = 1 << 20;
 #[cfg(feature = "host")]
 const GUEST_PANIC_MARKER: &str = "Kernel panic:";
 
+/// Console lines kept before the panic line so the report is whole.
+///
+/// A panic message may itself contain newlines, and the raw
+/// `panicked at <file>:<line>` line precedes the kernel's own log
+/// statement, so the line carrying the marker is the end of the report
+/// and not all of it.
+#[cfg(feature = "host")]
+const GUEST_CONSOLE_LOOKBACK: usize = 3;
+
 #[derive(Debug)]
 pub(crate) enum Frame {
     Open {
@@ -89,17 +98,19 @@ where
     let mut matched = 0usize;
     #[cfg(feature = "host")]
     let mut stray = Vec::new();
+    #[cfg(feature = "host")]
+    let mut console = GuestConsole::default();
     loop {
         let mut byte = [0_u8; 1];
         match std::future::poll_fn(|cx| Pin::new(&mut *io).poll_read(cx, &mut byte)).await {
             Ok(0) if matched == 0 => {
                 #[cfg(feature = "host")]
-                flush_stray_bytes(&mut stray)?;
+                flush_stray_bytes(&mut stray, &mut console)?;
                 return Ok(false);
             }
             Ok(0) => {
                 #[cfg(feature = "host")]
-                flush_stray_bytes(&mut stray)?;
+                flush_stray_bytes(&mut stray, &mut console)?;
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "truncated frame header",
@@ -113,7 +124,7 @@ where
             matched += 1;
             if matched == FRAME_MAGIC.len() {
                 #[cfg(feature = "host")]
-                flush_stray_bytes(&mut stray)?;
+                flush_stray_bytes(&mut stray, &mut console)?;
                 return Ok(true);
             }
         } else {
@@ -123,47 +134,81 @@ where
                     stray.extend_from_slice(&FRAME_MAGIC[..matched]);
                 }
                 stray.push(byte[0]);
-                flush_stray_bytes_on_newline(&mut stray)?;
+                flush_stray_bytes_on_newline(&mut stray, &mut console)?;
             }
             matched = usize::from(byte[0] == FRAME_MAGIC[0]);
         }
     }
 }
 
+/// The tail of the guest console this frame scan has seen.
+///
+/// The scanner is the only host-side reader of the console bytes that
+/// share the link with the frames, so the context of a fatal line
+/// exists here and nowhere else.
 #[cfg(feature = "host")]
-fn flush_stray_bytes_on_newline(stray: &mut Vec<u8>) -> io::Result<()> {
+#[derive(Default)]
+struct GuestConsole {
+    recent: std::collections::VecDeque<String>,
+}
+
+#[cfg(feature = "host")]
+impl GuestConsole {
+    /// The panic report ending at `line`, or `None` while the guest is
+    /// still alive. Remembers the line either way.
+    fn read(&mut self, line: &str) -> Option<String> {
+        let report = line.contains(GUEST_PANIC_MARKER).then(|| {
+            self.recent
+                .iter()
+                .map(String::as_str)
+                .chain(core::iter::once(line))
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join(" / ")
+        });
+        if self.recent.len() == GUEST_CONSOLE_LOOKBACK {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(line.to_owned());
+        report
+    }
+}
+
+/// One console line with the escape sequences the guest colours its log
+/// with removed, which is the form a panic report is quoted in.
+///
+/// Dropping the escape character alone would leave the rest of each
+/// sequence — `[1;31m` — in the middle of a report that ends up in a
+/// JSON error field, so the whole sequence goes.
+#[cfg(feature = "host")]
+fn printable_console_line(line: &[u8]) -> String {
+    let stripped = strip_ansi_escapes::strip(line);
+    String::from_utf8_lossy(&stripped)
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect::<String>()
+        .trim()
+        .to_owned()
+}
+
+#[cfg(feature = "host")]
+fn flush_stray_bytes_on_newline(stray: &mut Vec<u8>, console: &mut GuestConsole) -> io::Result<()> {
     if stray
         .last()
         .is_some_and(|byte| matches!(*byte, b'\n' | b'\r'))
     {
-        flush_stray_bytes(stray)?;
+        flush_stray_bytes(stray, console)?;
     }
     Ok(())
 }
 
-/// The panic report a console line carries, with the escape sequences
-/// the guest colours its log with removed.
 #[cfg(feature = "host")]
-fn guest_panic_report(line: &[u8]) -> Option<String> {
-    let text = String::from_utf8_lossy(line);
-    let start = text.find(GUEST_PANIC_MARKER)?;
-    Some(
-        text[start..]
-            .chars()
-            .filter(|character| !character.is_control())
-            .collect::<String>()
-            .trim()
-            .to_owned(),
-    )
-}
-
-#[cfg(feature = "host")]
-fn flush_stray_bytes(stray: &mut Vec<u8>) -> io::Result<()> {
+fn flush_stray_bytes(stray: &mut Vec<u8>, console: &mut GuestConsole) -> io::Result<()> {
     if stray.is_empty() {
         return Ok(());
     }
 
-    let report = guest_panic_report(stray);
+    let report = console.read(&printable_console_line(stray));
 
     let mut stderr = std::io::stderr().lock();
     stderr.write_all(b"helios-inspector: remote serial: ")?;
@@ -398,30 +443,63 @@ mod tests {
     use super::*;
     use crate::error::TransportError;
 
-    /// The line the aarch64 bench lane's guest died on, colour codes and
-    /// all, as the frame scanner sees it.
-    const PANIC_LINE: &[u8] = b"\x1b[1;31mERROR\x1b[0m [helios_kernel] Kernel panic: executor \
-task arena exhausted: 300 live tasks (kernel/src/exec/executor.rs:133:21) \n";
+    /// The four console lines the aarch64 bench lane's guest died on,
+    /// colour codes and all, as the frame scanner sees them. The panic
+    /// message itself contains a newline, so the kernel's own log
+    /// statement is the fourth of them and carries only its first half.
+    const PANIC_LINES: [&[u8]; 4] = [
+        b"panicked at kernel/src/wasmtime_adapter/component_host/service/mod.rs:484:13:\n",
+        b"failed to exec embedded system component:\n",
+        b"debugger component trapped: instance terminated: OutOfMemory\n",
+        b"\x1b[1;31mERROR\x1b[0m [helios_kernel] Kernel panic: failed to exec embedded system component:\n",
+    ];
+
+    fn console_report(lines: &[&[u8]]) -> Option<String> {
+        let mut console = GuestConsole::default();
+        let mut report = None;
+        for line in lines {
+            report = console.read(&printable_console_line(line)).or(report);
+        }
+        report
+    }
 
     #[test]
-    fn a_console_panic_line_is_read_as_a_panic_report() {
-        let report = guest_panic_report(PANIC_LINE).expect("the line carries a panic report");
+    fn a_panic_report_carries_the_lines_that_led_to_it() {
+        let report = console_report(&PANIC_LINES).expect("the console carries a panic report");
         assert_eq!(
             report,
-            "Kernel panic: executor task arena exhausted: 300 live tasks \
-(kernel/src/exec/executor.rs:133:21)"
+            "panicked at kernel/src/wasmtime_adapter/component_host/service/mod.rs:484:13: / \
+failed to exec embedded system component: / \
+debugger component trapped: instance terminated: OutOfMemory / \
+ERROR [helios_kernel] Kernel panic: failed to exec embedded system component:"
+        );
+    }
+
+    #[test]
+    fn the_look_back_does_not_reach_past_its_bound() {
+        let mut lines = vec![b"INFO [helios_kernel] Kernel is ready\n".as_slice()];
+        lines.extend_from_slice(&PANIC_LINES);
+        let report = console_report(&lines).expect("the console carries a panic report");
+        assert!(
+            !report.contains("Kernel is ready"),
+            "only the {GUEST_CONSOLE_LOOKBACK} lines before the panic are context: {report}"
         );
     }
 
     #[test]
     fn an_ordinary_console_line_is_not_a_panic_report() {
-        assert!(guest_panic_report(b"INFO [helios_kernel] Kernel is ready\n").is_none());
+        assert!(console_report(&[b"INFO [helios_kernel] Kernel is ready\n"]).is_none());
     }
 
     #[test]
     fn a_flushed_panic_line_ends_the_session() {
-        let mut stray = PANIC_LINE.to_vec();
-        let error = flush_stray_bytes(&mut stray).expect_err("a panic must end the read");
+        let mut console = GuestConsole::default();
+        let mut error = None;
+        for line in PANIC_LINES {
+            let mut stray = line.to_vec();
+            error = flush_stray_bytes(&mut stray, &mut console).err().or(error);
+        }
+        let error = error.expect("a panic must end the read");
         let transport = error
             .get_ref()
             .and_then(|inner| inner.downcast_ref::<TransportError>())
@@ -429,15 +507,16 @@ task arena exhausted: 300 live tasks (kernel/src/exec/executor.rs:133:21) \n";
         assert!(
             transport
                 .guest_panic()
-                .is_some_and(|report| report.contains("task arena exhausted")),
-            "the fault names the guest's panic: {transport}"
+                .is_some_and(|report| report.contains("instance terminated: OutOfMemory")),
+            "the fault names what the guest died of: {transport}"
         );
     }
 
     #[test]
     fn a_flushed_console_line_leaves_the_session_alone() {
+        let mut console = GuestConsole::default();
         let mut stray = b"INFO [helios_kernel] Kernel is ready\n".to_vec();
-        flush_stray_bytes(&mut stray).expect("an ordinary line is not a fault");
+        flush_stray_bytes(&mut stray, &mut console).expect("an ordinary line is not a fault");
         assert!(stray.is_empty());
     }
 }

@@ -305,9 +305,17 @@ pub(crate) async fn run_inner(
                 // ones behind it never got to measure, so the report
                 // carries a failed cell for each instead of silently
                 // dropping them, then let the caller see the panic.
-                let report = format!("{error:#}");
+                //
+                // The cells carry the panic report rather than the error
+                // chain: every layer the panic crossed repeats it, and a
+                // table cell wants the kernel's sentence once.
+                let report = format!(
+                    "guest kernel panicked during {}: {}",
+                    workload.name,
+                    guest_panic(&error).unwrap_or_default()
+                );
                 eprintln!(
-                    "helios-inspector: workload {} killed the guest; recording the rest as failed: {report}",
+                    "helios-inspector: workload {} killed the guest; recording the rest as failed: {error:#}",
                     workload.name
                 );
                 for pending in core::iter::once(workload).chain(remaining) {

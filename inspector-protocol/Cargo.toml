@@ -5,7 +5,7 @@ edition.workspace = true
 
 [features]
 default = ["host"]
-host = ["dep:bytes", "dep:futures-core", "dep:tokio", "dep:tokio-util"]
+host = ["dep:bytes", "dep:futures-core", "dep:strip-ansi-escapes", "dep:tokio", "dep:tokio-util"]
 guest = ["dep:helios-api"]
 
 [dependencies]
@@ -20,6 +20,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 tokio = { version = "1.48.0", features = ["io-util", "sync"], optional = true }
 tokio-util = { version = "0.7.16", features = ["compat"], optional = true }
 wit-bindgen = { workspace = true, features = ["macros", "async"] }
+strip-ansi-escapes = { version = "0.2.1", optional = true }
 
 [dev-dependencies]
 anyhow = "1.0.100"
