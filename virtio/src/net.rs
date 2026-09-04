@@ -117,6 +117,15 @@ const NET_FEATURE_MRG_RXBUF: u64 = 1 << 15;
 /// Byte offset of the `status` field in the virtio-net configuration
 /// space (mac[6], status[2], max_virtqueue_pairs[2], mtu[2]).
 const NET_CONFIG_STATUS_OFFSET: usize = 6;
+/// `max_virtqueue_pairs`, after mac[6] and status[2]. It exists only
+/// once VIRTIO_NET_F_MQ is negotiated, and on a device that offers
+/// nothing past MQ it is also the last field: the configuration
+/// structure ends at byte 10, so the field is read with the 16-bit
+/// access the spec requires rather than as part of a dword.
+const NET_CONFIG_MAX_VIRTQUEUE_PAIRS_OFFSET: usize = 8;
+/// `mtu`, after `max_virtqueue_pairs`; present once VIRTIO_NET_F_MTU is
+/// negotiated.
+const NET_CONFIG_MTU_OFFSET: usize = 10;
 /// `duplex`, after mac[6], status[2], max_virtqueue_pairs[2], mtu[2]
 /// and speed[4]. The RSS limits share its aligned dword.
 const NET_CONFIG_DUPLEX_OFFSET: usize = 16;
@@ -781,13 +790,27 @@ impl RxBufferSlot {
     }
 }
 
+/// A virtio feature word, printed the way the specification numbers
+/// its bits.
+struct FeatureWord(u64);
+
+impl core::fmt::Debug for FeatureWord {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(formatter, "{:#018x}", self.0)
+    }
+}
+
 impl<T: VirtioTransport> VirtioNetDevice<T> {
     pub fn new(transport: T) -> IoResult<Self> {
         if transport.device_type() != DeviceType::Network {
             return Err(IoError::Unsupported);
         }
 
+        // The device's own offer, kept so bring-up can report what was
+        // on the table next to what the driver took.
+        let offered_features = core::cell::Cell::new(0_u64);
         let features = negotiate_with(&transport, |offered| {
+            offered_features.set(offered);
             // Only ask for MQ together with CTRL_VQ — without the
             // control queue there is no way to enable additional pairs
             // beyond the default single pair.
@@ -930,28 +953,73 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             .checked_add(max_frame_len)
             .ok_or(IoError::DeviceFault)?;
 
-        let pair_count = if features.device(NET_FEATURE_MQ) {
-            let device_max = read_max_virtqueue_pairs(&transport);
-            device_max.clamp(1, NET_MAX_QUEUE_PAIRS)
+        // The most pairs worth bringing up. `max_virtqueue_pairs` is a
+        // ceiling the device advertises, not a promise that every pair
+        // below it is present and usable: a device whose host packet
+        // path offers fewer queues than the configuration space
+        // advertises reports queue size zero for the pairs it does not
+        // have, and the spec has the driver use the ones it finds and
+        // tell the device the number over the control queue.
+        let advertised_pairs = if features.device(NET_FEATURE_MQ) {
+            read_max_virtqueue_pairs(&transport).clamp(1, NET_MAX_QUEUE_PAIRS)
         } else {
             1
         };
-        if pair_count == 0 {
-            return Err(IoError::Unsupported);
-        }
 
-        let mut queue_pairs: Vec<NetQueuePair<T>> = Vec::with_capacity(usize::from(pair_count));
-        for pair_idx in 0..pair_count {
+        // One record, before the first queue is programmed, holding
+        // everything a bring-up failure is diagnosed from: what the
+        // device offered, what the driver took, the queue layout the
+        // class configuration implies, the count the transport itself
+        // reports, and the size the device gives at every index that
+        // layout covers. A device whose `num_queues` disagrees with
+        // `2 * max_virtqueue_pairs + 1` is about to be programmed for
+        // queues it does not have, and nothing else in the boot log
+        // would say so.
+        let probed_queues = usize::from(advertised_pairs) * 2 + 1;
+        let mut queue_sizes = [0_u16; NET_MAX_QUEUE_PAIRS as usize * 2 + 1];
+        for (index, size) in queue_sizes[..probed_queues].iter_mut().enumerate() {
+            *size = transport.queue_max_size(index as u16);
+        }
+        tracing::info!(
+            offered = ?FeatureWord(offered_features.get()),
+            accepted = ?FeatureWord(features.bits()),
+            max_virtqueue_pairs = advertised_pairs,
+            presented_queues = ?transport.presented_queue_count(),
+            queue_sizes = ?&queue_sizes[..probed_queues],
+            "virtio-net bring-up"
+        );
+
+        let mut queue_pairs: Vec<NetQueuePair<T>> =
+            Vec::with_capacity(usize::from(advertised_pairs));
+        for pair_idx in 0..advertised_pairs {
             let rx_queue_index = rx_queue_index(pair_idx);
             let tx_queue_index = tx_queue_index(pair_idx);
             let rx_queue_size = transport.queue_max_size(rx_queue_index).min(NET_QUEUE_SIZE);
             let tx_queue_size = transport.queue_max_size(tx_queue_index).min(NET_QUEUE_SIZE);
-            if rx_queue_size == 0
-                || tx_queue_size == 0
-                || !rx_queue_size.is_power_of_two()
-                || !tx_queue_size.is_power_of_two()
-            {
-                return Err(IoError::Unsupported);
+            if rx_queue_size == 0 || tx_queue_size == 0 {
+                // Multiqueue is optional in both directions. Refusing the
+                // whole device here would leave a working single-pair NIC
+                // unusable because its ceiling was optimistic.
+                if pair_idx == 0 {
+                    return Err(IoError::InvalidDeviceConfig(
+                        "virtio-net function presents no receive or transmit queue",
+                    ));
+                }
+                tracing::warn!(
+                    advertised_pairs,
+                    usable_pairs = pair_idx,
+                    "virtio-net advertised more queue pairs than it presents; \
+                     bringing up the pairs that exist"
+                );
+                break;
+            }
+            if !rx_queue_size.is_power_of_two() || !tx_queue_size.is_power_of_two() {
+                // A ring length that is not a power of two has no valid
+                // wrap, so this is the device model being wrong rather
+                // than a capability the driver can do without.
+                return Err(IoError::InvalidDeviceConfig(
+                    "virtio-net queue size is not a power of two",
+                ));
             }
 
             let mut rx_queue = VirtQueue::new(
@@ -1062,24 +1130,36 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             };
             let ctrl_index = control_queue_index(device_max);
             let ctrl_size = transport.queue_max_size(ctrl_index).min(NET_QUEUE_SIZE);
-            if ctrl_size != 0 && ctrl_size.is_power_of_two() {
-                let queue = VirtQueue::new(
-                    &transport,
-                    ctrl_index,
-                    ctrl_size,
-                    CONTROL_CHAIN_LIMIT,
-                    features,
-                )?;
-                let cmd_buffer = vec![0u8; CTRL_CMD_MAX_BYTES].into_boxed_slice();
-                let ack_buffer = vec![0u8; 1].into_boxed_slice();
-                Some(SpinMutex::new(NetControlState {
-                    queue,
-                    cmd_buffer,
-                    ack_buffer,
-                }))
-            } else {
-                None
+            // The driver has already told the device it accepted
+            // `CTRL_VQ`, so a control queue that cannot be brought up is
+            // a device that disagrees with its own feature bits. Leaving
+            // the slot empty here used to defer the failure to the first
+            // command, where it surfaced as a bare "operation is not
+            // supported" with nothing naming the queue (issue #91).
+            if ctrl_size == 0 {
+                return Err(IoError::InvalidDeviceConfig(
+                    "virtio-net offered the control queue but presents no queue at its index",
+                ));
             }
+            if !ctrl_size.is_power_of_two() {
+                return Err(IoError::InvalidDeviceConfig(
+                    "virtio-net control queue size is not a power of two",
+                ));
+            }
+            let queue = VirtQueue::new(
+                &transport,
+                ctrl_index,
+                ctrl_size,
+                CONTROL_CHAIN_LIMIT,
+                features,
+            )?;
+            let cmd_buffer = vec![0u8; CTRL_CMD_MAX_BYTES].into_boxed_slice();
+            let ack_buffer = vec![0u8; 1].into_boxed_slice();
+            Some(SpinMutex::new(NetControlState {
+                queue,
+                cmd_buffer,
+                ack_buffer,
+            }))
         } else {
             None
         };
@@ -2148,10 +2228,7 @@ impl DescriptorBitSet {
 }
 
 fn read_max_virtqueue_pairs<T: VirtioTransport>(transport: &T) -> u16 {
-    // virtio-net config layout (when F_MQ negotiated): mac (6B),
-    // status (2B), max_virtqueue_pairs (2B at offset 8).
-    let config = transport.read_config_u32(8).to_le_bytes();
-    u16::from_le_bytes([config[0], config[1]])
+    transport.read_config_u16(NET_CONFIG_MAX_VIRTQUEUE_PAIRS_OFFSET)
 }
 
 /// `rss_max_key_size`, `rss_max_indirection_table_length` and
@@ -2198,8 +2275,12 @@ impl RssLimits {
 }
 
 fn read_mac_address<T: VirtioTransport>(transport: &T) -> [u8; 6] {
+    // The address ends at byte 6, so its last two bytes are read as a
+    // half word: a device that offers MAC and nothing past it sizes its
+    // configuration structure to six bytes and answers the dword at 4
+    // with all-ones.
     let low = transport.read_config_u32(0).to_le_bytes();
-    let high = transport.read_config_u32(4).to_le_bytes();
+    let high = transport.read_config_u16(4).to_le_bytes();
     [low[0], low[1], low[2], low[3], high[0], high[1]]
 }
 
@@ -2210,13 +2291,7 @@ fn read_link_up<T: VirtioTransport>(transport: &T, features: NegotiatedFeatures)
     if !features.device(NET_FEATURE_STATUS) {
         return true;
     }
-    // The status field straddles bytes 6..8, the upper half of the
-    // aligned dword at offset 4.
-    let config = transport
-        .read_config_u32(NET_CONFIG_STATUS_OFFSET & !0x3)
-        .to_le_bytes();
-    let status = u16::from_le_bytes([config[2], config[3]]);
-    status & NET_STATUS_LINK_UP != 0
+    transport.read_config_u16(NET_CONFIG_STATUS_OFFSET) & NET_STATUS_LINK_UP != 0
 }
 
 fn read_mtu<T: VirtioTransport>(transport: &T, features: NegotiatedFeatures) -> usize {
@@ -2224,8 +2299,7 @@ fn read_mtu<T: VirtioTransport>(transport: &T, features: NegotiatedFeatures) -> 
         return DEFAULT_IP_MTU;
     }
 
-    let config = transport.read_config_u32(8).to_le_bytes();
-    let mtu = u16::from_le_bytes([config[2], config[3]]) as usize;
+    let mtu = usize::from(transport.read_config_u16(NET_CONFIG_MTU_OFFSET));
     if mtu == 0 {
         return DEFAULT_IP_MTU;
     }
@@ -2341,16 +2415,18 @@ mod tests {
 
     use super::{
         DescriptorBitSet, ETH_HEADER_LEN, MAX_LARGE_RECEIVE_FRAME_BYTES,
-        MAX_SEGMENTED_TRANSMIT_FRAME_BYTES, NET_CONFIG_STATUS_OFFSET, NET_FEATURE_CSUM,
+        MAX_SEGMENTED_TRANSMIT_FRAME_BYTES, NET_CONFIG_MAX_VIRTQUEUE_PAIRS_OFFSET,
+        NET_CONFIG_MTU_OFFSET, NET_CONFIG_STATUS_OFFSET, NET_FEATURE_CSUM, NET_FEATURE_CTRL_VQ,
         NET_FEATURE_GUEST_CSUM, NET_FEATURE_GUEST_ECN, NET_FEATURE_GUEST_TSO4,
         NET_FEATURE_GUEST_TSO6, NET_FEATURE_GUEST_UFO, NET_FEATURE_HOST_ECN, NET_FEATURE_HOST_TSO4,
-        NET_FEATURE_HOST_TSO6, NET_FEATURE_MRG_RXBUF, NET_FEATURE_STATUS, NET_STATUS_LINK_UP,
-        RX_PAGE_BYTES, RxFrame, TxChecksumMeta, TxGsoMeta, VIRTIO_NET_HDR_F_DATA_VALID,
-        VIRTIO_NET_HDR_F_NEEDS_CSUM, VIRTIO_NET_HDR_GSO_TCPV4, VirtioNetDevice, VirtioNetHeader,
-        write_tx_payload,
+        NET_FEATURE_HOST_TSO6, NET_FEATURE_MQ, NET_FEATURE_MRG_RXBUF, NET_FEATURE_STATUS,
+        NET_STATUS_LINK_UP, RX_PAGE_BYTES, RxFrame, TxChecksumMeta, TxGsoMeta,
+        VIRTIO_NET_HDR_F_DATA_VALID, VIRTIO_NET_HDR_F_NEEDS_CSUM, VIRTIO_NET_HDR_GSO_TCPV4,
+        VirtioNetDevice, VirtioNetHeader, read_max_virtqueue_pairs, write_tx_payload,
     };
     use crate::testing::{FakeTransport, FakeTransportConfig};
     use crate::transport::{DeviceType, VirtioFeatures};
+    use helios_hal::io::IoError;
     use helios_netstack::LinkState;
 
     /// One receive completion the fake device hands the driver: the
@@ -2388,6 +2464,7 @@ mod tests {
                 offered_features: VirtioFeatures::VERSION_1.bits() | offered_features,
                 queue_size: 8,
                 supports_queue_reset: false,
+                absent_queues: &[],
             });
             configure(&transport);
             Self {
@@ -3326,6 +3403,32 @@ mod tests {
     }
 
     #[test]
+    fn max_virtqueue_pairs_is_read_with_a_half_word_access() {
+        use super::VirtioTransport as _;
+
+        // A device that offers nothing past MQ ends its configuration
+        // structure at byte 10, and answers a dword read at 8, which runs
+        // two bytes past that end, with all-ones. The field is 16 bits
+        // wide and has to be read as such.
+        let transport = FakeTransport::new(FakeTransportConfig {
+            device_type: DeviceType::Network,
+            offered_features: VirtioFeatures::VERSION_1.bits()
+                | NET_FEATURE_MQ
+                | NET_FEATURE_CTRL_VQ,
+            queue_size: 8,
+            supports_queue_reset: false,
+            absent_queues: &[],
+        });
+        transport.set_config_u16(NET_CONFIG_MAX_VIRTQUEUE_PAIRS_OFFSET, 4);
+        transport.bound_config_len(NET_CONFIG_MTU_OFFSET);
+        assert_eq!(
+            transport.read_config_u32(NET_CONFIG_MAX_VIRTQUEUE_PAIRS_OFFSET),
+            u32::MAX
+        );
+        assert_eq!(read_max_virtqueue_pairs(&transport), 4);
+    }
+
+    #[test]
     fn coalescing_budget_encodes_the_control_queue_payloads() {
         let budget = super::CoalescingBudget {
             max_packets: 8,
@@ -3340,6 +3443,66 @@ mod tests {
         assert_eq!(
             budget.encode_for_queue(super::tx_queue_index(2)),
             [5, 0, 0, 0, 8, 0, 0, 0, 50, 0, 0, 0]
+        );
+    }
+
+    /// A device presenting `queue_size`-deep queues at every index
+    /// except the ones named, advertising `advertised_pairs` in its
+    /// configuration space.
+    fn multiqueue_transport(
+        offered_features: u64,
+        advertised_pairs: u16,
+        absent_queues: &'static [u16],
+    ) -> FakeTransport {
+        let transport = FakeTransport::new(FakeTransportConfig {
+            device_type: DeviceType::Network,
+            offered_features: VirtioFeatures::VERSION_1.bits() | offered_features,
+            queue_size: 8,
+            supports_queue_reset: false,
+            absent_queues,
+        });
+        transport.set_config_u16(NET_CONFIG_MAX_VIRTQUEUE_PAIRS_OFFSET, advertised_pairs);
+        transport
+    }
+
+    /// `max_virtqueue_pairs` is a ceiling the device advertises, not a
+    /// promise. A driver that treats a missing pair as fatal turns a
+    /// working single-pair NIC into a boot failure, which is what the
+    /// x86 bench lane hit under a multi-queue tap (issue #91).
+    #[test]
+    fn a_device_advertising_more_pairs_than_it_presents_comes_up_on_the_pairs_it_has() {
+        let transport = multiqueue_transport(
+            NET_FEATURE_MQ | NET_FEATURE_CTRL_VQ,
+            4,
+            // Pair 1's receive queue is missing, so only pair 0 is
+            // usable. The control queue still sits at 2 * 4.
+            &[2],
+        );
+
+        let device = VirtioNetDevice::new(transport)
+            .expect("a device with one usable pair is a device the driver can drive");
+
+        assert_eq!(device.queue_pair_count(), 1);
+    }
+
+    /// The driver accepts `CTRL_VQ` before it can see whether the queue
+    /// is there. Discovering it is not has to name the device's own
+    /// disagreement, not surface later as a bare "operation is not
+    /// supported" from the first command sent (issue #91).
+    #[test]
+    fn a_control_queue_the_device_does_not_present_is_named_at_bring_up() {
+        // The driver only accepts `CTRL_VQ` when it has something to
+        // say over it, so this is the multiqueue shape with the control
+        // queue — at 2 * 4 — missing.
+        let transport = multiqueue_transport(NET_FEATURE_MQ | NET_FEATURE_CTRL_VQ, 4, &[8]);
+
+        let Err(error) = VirtioNetDevice::new(transport) else {
+            panic!("a device that offers a queue it does not have is misconfigured");
+        };
+
+        assert!(
+            matches!(error, IoError::InvalidDeviceConfig(detail) if detail.contains("control queue")),
+            "the failure must name the control queue, got {error}"
         );
     }
 }

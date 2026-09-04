@@ -63,7 +63,6 @@ const PAGE_PRESENT: u64 = 1 << 0;
 const PAGE_HUGE: u64 = 1 << 7;
 const PAGE_NO_EXECUTE: u64 = 1 << 63;
 pub(crate) const KERNEL_STACK_BYTES: usize = 4 * 1024 * 1024;
-const WATCHDOG_SELF_TEST_ENABLED: bool = option_env!("HELIOS_WATCHDOG_SELF_TEST").is_some();
 pub(crate) static WASMTIME_NATIVE_TRAP_HANDLER: AtomicUsize = AtomicUsize::new(0);
 static CRITICAL_SECTION_STATE: helios_hal::critical_section::CriticalSectionState =
     helios_hal::critical_section::CriticalSectionState::new();
@@ -189,8 +188,7 @@ fn x86_kernel_main() -> ! {
     );
     smp::activate_runtime(boot.bootstrap_runtime());
     exceptions::install_for_current_processor();
-    let mirror_to_uart = WATCHDOG_SELF_TEST_ENABLED;
-    let console = serial_console(debug_state.clone(), mirror_to_uart);
+    let console = serial_console(debug_state.clone());
     let cpu = X86Cpu::new(boot.platform());
     vmm::install_user_address_space(physical_memory_offset, cpu.processor_count());
     let pci = pci::PciRoot::new(physical_memory_offset);
@@ -744,25 +742,26 @@ mod tests {
     }
 }
 
+/// The kernel console: every record is retained for the debugger and
+/// mirrored to the debug UART, as it is on aarch64.
+///
+/// Mirroring is not a debugging aid to switch on when something breaks.
+/// Anything the kernel reports before the inspector's RPC transport
+/// exists — device discovery, feature negotiation, the reason a device
+/// refused to come up — reaches the outside world through this UART or
+/// through nowhere at all, and a bring-up failure is exactly the case
+/// where the transport never arrives. x86 used to mirror only under the
+/// watchdog self-test, which is why a panic in PCI bring-up left a boot
+/// log holding the panic line and nothing that explained it.
 fn serial_console(
     debug_state: debug_state::RuntimeState,
-    mirror_to_uart: bool,
 ) -> helios_kernel::RecordingConsole<
     debug_state::RuntimeState,
     impl FnMut() -> u64,
     impl FnMut(&[u8]),
 > {
     serial_uart_init();
-    let write_fn: Option<fn(&[u8])> = if mirror_to_uart {
-        Some(|bytes: &[u8]| {
-            for &byte in bytes {
-                serial_write_byte(byte);
-            }
-        })
-    } else {
-        None
-    };
-    helios_kernel::RecordingConsole::new(debug_state, read_tsc, write_fn)
+    helios_kernel::RecordingConsole::new(debug_state, read_tsc, Some(write_debug_serial_bytes))
 }
 
 #[derive(Clone)]
@@ -983,7 +982,7 @@ extern "C" fn secondary_start_rust(
     exceptions::install_for_current_processor();
 
     let debug_state = boot.platform().debug_state();
-    let console = serial_console(debug_state.clone(), WATCHDOG_SELF_TEST_ENABLED);
+    let console = serial_console(debug_state.clone());
     let cpu = X86Cpu::new(boot.platform());
     let kernel = helios_kernel::init_with_watchdog(Platform::with_watchdog(
         console,
@@ -1238,12 +1237,7 @@ impl ByteSerial for DebugSerial {
 
     fn write_bytes(&self, bytes: &[u8]) {
         for &byte in bytes {
-            while !serial_tx_ready() {
-                core::hint::spin_loop();
-            }
-            unsafe {
-                PortWriteOnly::new(COM1_DATA).write(byte);
-            }
+            serial_write_byte(byte);
         }
     }
 }

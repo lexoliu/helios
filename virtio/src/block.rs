@@ -365,7 +365,7 @@ impl<T: VirtioTransport, C: QueueAffinity> VirtioBlockDevice<T, C> {
         {
             (
                 transport.read_config_u8(CFG_PHYSICAL_BLOCK_EXP),
-                u32::from(read_config_u16(&transport, CFG_MIN_IO_SIZE)),
+                u32::from(transport.read_config_u16(CFG_MIN_IO_SIZE)),
                 transport.read_config_u32(CFG_OPT_IO_SIZE),
             )
         } else {
@@ -803,7 +803,7 @@ fn queue_count<T: VirtioTransport, C: QueueAffinity>(
     if !features.device(BLK_F_MQ) {
         return 1;
     }
-    let device_queues = usize::from(read_config_u16(transport, CFG_NUM_QUEUES));
+    let device_queues = usize::from(transport.read_config_u16(CFG_NUM_QUEUES));
     device_queues.clamp(1, cpu.processor_count().max(1))
 }
 
@@ -829,13 +829,6 @@ fn deallocate_limits<T: VirtioTransport>(
             .unwrap_or(usize::MAX)
             .min(DEALLOCATE_SEGMENTS),
     ))
-}
-
-fn read_config_u16<T: VirtioTransport>(transport: &T, offset: usize) -> u16 {
-    u16::from_le_bytes([
-        transport.read_config_u8(offset),
-        transport.read_config_u8(offset + 1),
-    ])
 }
 
 impl<D: BlockDevice> VirtioBlockSwapBackend<D> {
@@ -1259,6 +1252,7 @@ mod tests {
             offered_features: VirtioFeatures::VERSION_1.bits() | features,
             queue_size: 8,
             supports_queue_reset: false,
+            absent_queues: &[],
         });
         transport.set_config_u32(CFG_CAPACITY_LOW, TEST_CAPACITY_SECTORS);
         setup(&transport);
@@ -1703,6 +1697,7 @@ mod tests {
             offered_features: VirtioFeatures::VERSION_1.bits() | BLK_F_MQ,
             queue_size: 8,
             supports_queue_reset: false,
+            absent_queues: &[],
         });
         transport.set_config_u32(CFG_CAPACITY_LOW, TEST_CAPACITY_SECTORS);
         transport.set_config_u16(CFG_NUM_QUEUES, 8);
@@ -1732,6 +1727,7 @@ mod tests {
             offered_features: VirtioFeatures::VERSION_1.bits() | BLK_F_DISCARD,
             queue_size: 8,
             supports_queue_reset: false,
+            absent_queues: &[],
         });
         transport.set_config_u32(CFG_CAPACITY_LOW, TEST_CAPACITY_SECTORS);
 

@@ -525,6 +525,7 @@ jobs:
       HELIOS_NET_IFNAME: helios0
       HELIOS_NET_BRIDGE: helios-br0
       NET_BOOT_LOG: ${{ github.workspace }}/helios-bench-boot.log
+      BENCH_RUNTIME_DIR: ${{ github.workspace }}/bench-runtime
     strategy:
       fail-fast: false
       matrix:
@@ -646,6 +647,7 @@ jobs:
           HELIOS_BOOT_SYNC_TIMEOUT_SECS: ${{ matrix.boot-timeout }}
           HELIOS_WORKLOAD_BENCH_VM_MEMORY: ${{ matrix.vm-memory }}
           HELIOS_WORKLOAD_BENCH_NET_BACKEND: ${{ matrix.net-backend }}
+          HELIOS_WORKLOAD_BENCH_RUNTIME_DIR: ${{ env.BENCH_RUNTIME_DIR }}
         run: |
           # Without this the step reports tee's status, not the
           # command's, and a runner script that fails is invisible.
@@ -683,9 +685,23 @@ jobs:
             fi
             printf '\n\n```\n'
             grep -h -e 'virtio-net online' -e 'virtio features negotiated' \
-              "${NET_BOOT_LOG}" | sort -u || printf 'no virtio-net bring-up line was logged\n'
+              "${NET_BOOT_LOG}" ${BENCH_RUNTIME_DIR}/*.log 2>/dev/null | sort -u \
+              || printf 'no virtio-net bring-up line was logged\n'
             printf '```\n'
           } >> "$GITHUB_STEP_SUMMARY"
+      # A bring-up failure leaves the inspector's one-line error and
+      # nothing else in the step log; the guest console and QEMU's own
+      # stderr live in the runtime directory, so collect it exactly as
+      # the smoke lanes do.
+      - name: Upload the inspector runtime directory
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ matrix.name }}-runtime
+          path: |
+            bench-runtime/**/*.log
+            helios-bench-boot.log
+          if-no-files-found: warn
       - name: Remove the tap network backend
         if: always() && matrix.net-backend == 'tap'
         working-directory: helios

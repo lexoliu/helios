@@ -173,7 +173,7 @@ impl<T: VirtioTransport> Drop for Virtio9pDevice<T> {
 }
 
 fn read_mount_tag<T: VirtioTransport>(transport: &T) -> IoResult<String> {
-    let tag_len = u16::from_le_bytes([transport.read_config_u8(0), transport.read_config_u8(1)]);
+    let tag_len = transport.read_config_u16(0);
     if tag_len == 0 {
         return Err(IoError::InvalidDeviceConfig(
             "virtio-9p mount tag length was zero",
@@ -208,6 +208,7 @@ mod tests {
             offered_features: VirtioFeatures::VERSION_1.bits() | P9_FEATURE_MOUNT_TAG,
             queue_size,
             supports_queue_reset: true,
+            absent_queues: &[],
         });
         let mut config = [0_u8; 32];
         let tag_len = u16::try_from(MOUNT_TAG.len()).expect("mount tag length fits in u16");

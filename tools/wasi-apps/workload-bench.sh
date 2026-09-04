@@ -34,6 +34,15 @@ if [[ -n "${HELIOS_WORKLOAD_BENCH_VM_MEMORY:-}" ]]; then
     command+=(--memory "${HELIOS_WORKLOAD_BENCH_VM_MEMORY}")
 fi
 
+# A benchmark that never boots leaves nothing behind to say why. Keeping
+# the runtime directory puts the guest console, QEMU's own stderr and the
+# inspector's log on disk, which is the only place a CI lane can collect
+# a bring-up failure from.
+if [[ -n "${HELIOS_WORKLOAD_BENCH_RUNTIME_DIR:-}" ]]; then
+    mkdir -p "${HELIOS_WORKLOAD_BENCH_RUNTIME_DIR}"
+    command+=(--runtime-dir "${HELIOS_WORKLOAD_BENCH_RUNTIME_DIR}" --keep-runtime-dir)
+fi
+
 # Host packet path for the guest's virtio-net device. Only a multi-queue
 # backend can exercise the driver's multiqueue and offload paths; see
 # docs/networking.md.

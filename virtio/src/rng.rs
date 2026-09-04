@@ -129,6 +129,7 @@ mod tests {
             offered_features: VirtioFeatures::VERSION_1.bits(),
             queue_size: 8,
             supports_queue_reset: false,
+            absent_queues: &[],
         }))
         .expect("entropy device should initialize")
     }

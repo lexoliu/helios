@@ -169,6 +169,18 @@ pub trait VirtioTransport: Send + Sync + 'static {
     fn device_features(&self) -> u64;
     fn set_driver_features(&self, features: u64);
     fn queue_max_size(&self, index: u16) -> u16;
+
+    /// How many virtqueues the device states it presents, where the
+    /// transport has a register that says so.
+    ///
+    /// This is the device's own count, independent of any class-specific
+    /// configuration field a driver derives a queue layout from. When
+    /// the two disagree the driver is about to program queues that are
+    /// not there, and this is the only value that can tell it so. The
+    /// MMIO register layout defines no such field.
+    fn presented_queue_count(&self) -> Option<u16> {
+        None
+    }
     fn set_queue(
         &self,
         index: u16,
@@ -200,6 +212,16 @@ pub trait VirtioTransport: Send + Sync + 'static {
 
     /// Acknowledges the pending interrupt and reports what it was for.
     fn ack_interrupt(&self) -> InterruptStatus;
+
+    /// Reads one 16-bit device configuration field with a 16-bit access.
+    ///
+    /// Required rather than derived from the dword read: the device
+    /// bounds configuration accesses by the length of the structure
+    /// it exposes for the negotiated features, and a dword that
+    /// straddles that end reads as all-ones on both the PCI and the
+    /// MMIO transport. virtio-net's `max_virtqueue_pairs` sits exactly
+    /// there whenever MQ is the last feature the device offers.
+    fn read_config_u16(&self, offset: usize) -> u16;
 
     fn read_config_u32(&self, offset: usize) -> u32;
 
@@ -339,6 +361,10 @@ impl<B: DeviceBus> VirtioTransport for VirtioMmioTransport<B> {
             self.bus.write_u32(REG_INTERRUPT_ACK, status);
         }
         InterruptStatus::from_isr(status)
+    }
+
+    fn read_config_u16(&self, offset: usize) -> u16 {
+        self.bus.read_u16(CONFIG_SPACE_OFFSET + offset)
     }
 
     fn read_config_u32(&self, offset: usize) -> u32 {
