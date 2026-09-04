@@ -169,6 +169,11 @@ jobs:
         with:
           workspaces: helios
           key: bench-suite-${{ matrix.lane }}
+      - name: Install inferno flamegraph renderer
+        # The harness collects a folded kernel profile for every class and
+        # refuses to finish without the renderer that turns it into an SVG,
+        # the same way the ci.yml bench lanes provision it.
+        run: cargo install inferno --locked
       - name: Build inspector
         working-directory: helios
         run: cargo build --release -p helios-inspector
