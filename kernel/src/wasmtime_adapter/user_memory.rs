@@ -201,6 +201,7 @@ unsafe impl<C: Cpu + Clone> LinearMemory for UserLinearMemory<C> {
             return Err(wasmtime::Error::from(ProgramOutOfMemory {
                 requested_bytes: new_size,
                 available_bytes: 0,
+                pool_bytes: 0,
                 reserved_bytes: self.byte_capacity,
             }));
         }

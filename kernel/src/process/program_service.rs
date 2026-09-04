@@ -29,11 +29,19 @@ pub enum ProgramExecErrorKind {
 
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 #[error(
-    "program memory request of {requested_bytes} bytes exceeds its memory budget: available={available_bytes} reserved={reserved_bytes}"
+    "program memory request of {requested_bytes} bytes exceeds its memory budget: available={available_bytes} of {pool_bytes} reserved={reserved_bytes}"
 )]
 pub struct ProgramOutOfMemory {
     pub requested_bytes: usize,
     pub available_bytes: usize,
+    /// Everything the pool the request was made against holds, free or
+    /// not.
+    ///
+    /// Without it `available` cannot be read: a refusal with little
+    /// available is a pool that is genuinely full, while a refusal with
+    /// most of a large pool available is a pool that cannot produce one
+    /// run that big, which is a different problem with a different fix.
+    pub pool_bytes: usize,
     pub reserved_bytes: usize,
 }
 

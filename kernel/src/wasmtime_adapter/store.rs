@@ -39,6 +39,7 @@ where
             return Err(ProgramOutOfMemory {
                 requested_bytes: desired,
                 available_bytes: 0,
+                pool_bytes: 0,
                 reserved_bytes: 0,
             }
             .into());
@@ -96,6 +97,7 @@ where
                 ProgramOutOfMemory {
                     requested_bytes: desired,
                     available_bytes: user_available,
+                    pool_bytes: user_heap.total_bytes,
                     reserved_bytes: 0,
                 }
                 .into(),
@@ -111,6 +113,7 @@ where
                 ProgramOutOfMemory {
                     requested_bytes: desired,
                     available_bytes: available,
+                    pool_bytes: heap.total_bytes,
                     reserved_bytes: reserve,
                 }
                 .into(),

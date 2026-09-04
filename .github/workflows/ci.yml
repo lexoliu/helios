@@ -388,6 +388,135 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
+  smoke-x86-64:
+    name: smoke-x86-64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
+      HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
+      # The accelerator is picked by capability, so this lane runs under
+      # KVM where the runner exposes it and TCG where it does not. The
+      # budget is sized for the slower of the two.
+      HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: helios
+      - uses: ./helios/.github/actions/checkout-wasmtime
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libudev-dev just cmake ninja-build \
+            qemu-system-x86 ovmf
+          qemu-system-x86_64 --version
+          # The inspector picks the accelerator by capability; this only
+          # fixes the permissions on the node when the runner has one.
+          if [ -e /dev/kvm ]; then
+            sudo chmod 666 /dev/kvm
+            ls -la /dev/kvm
+          fi
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-tools
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.13.0
+      - name: Stage Limine bootloader share
+        run: |
+          git clone --depth 1 --branch v11.x-binary \
+            https://github.com/limine-bootloader/limine "$GITHUB_WORKSPACE/limine"
+          make -C "$GITHUB_WORKSPACE/limine"
+      - name: Restore WASI tooling artifacts
+        id: artifact-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            helios/artifacts/wasi-tools
+            helios/artifacts/python3-root
+            helios/artifacts/wasix
+          key: wasi-artifacts-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('helios/tools/wasi-apps/**', 'helios/Cargo.lock') }}
+      - name: Stage WASI tooling artifacts
+        if: steps.artifact-cache.outputs.cache-hit != 'true'
+        working-directory: helios
+        run: tools/wasi-apps/build.sh
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: helios
+          key: smoke-x86-64
+      - name: Build inspector
+        working-directory: helios
+        run: cargo build --release -p helios-inspector
+      - name: Boot x86-64 guest
+        shell: bash
+        working-directory: helios
+        run: |
+          # Nothing covered x86-64 booting a guest, so a regression in
+          # its PCI bring-up or its memory split reached `dev` twice
+          # before anyone ran it by hand: issue #74. This step is the
+          # thing that would have caught both.
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/boot"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger --no-compiler-plugin \
+            shell -c 'echo ok' 2>&1 > boot-smoke.out | tee "$runtime/inspector.log"
+          cat boot-smoke.out
+          grep -Fqx ok boot-smoke.out
+      - name: Run the coreutils applets through dash
+        shell: bash
+        working-directory: helios
+        run: |
+          # coreutils is one multicall WASIX module published under
+          # several bootfs names, so every applet is launched by bare
+          # name and dash resolves it through PATH.
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/coreutils"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger \
+            --boot-program ls --boot-program mkdir --boot-program cat \
+            --no-compiler-plugin \
+            shell --trace-log "$runtime/guest-tracing.log" \
+            -c 'mkdir /d; echo coreutils:ok > /d/f; cat /d/f; ls /' \
+            2>&1 > coreutils-smoke.out | tee "$runtime/inspector.log"
+          cat coreutils-smoke.out
+          grep -Fqx coreutils:ok coreutils-smoke.out
+          grep -Fqx bin coreutils-smoke.out
+      - name: Compile a guest with the in-kernel compiler plugin
+        shell: bash
+        working-directory: helios
+        run: |
+          # The step that #74 actually died in. Without a lazy-commit
+          # address space the plugin's shared memory is allocated at its
+          # declared maximum in one piece, so this is also the largest
+          # single allocation the user pool is ever asked for — and the
+          # only step that proves the pool can still answer it.
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/compiler"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            shell --trace-log "$runtime/guest-tracing.log" -c 'echo compiler:ok' \
+            2>&1 > compiler-smoke.out | tee "$runtime/inspector.log"
+          cat compiler-smoke.out
+          grep -Fqx compiler:ok compiler-smoke.out
+      # There is no curl step here, unlike smoke-riscv64: a fetch over
+      # virtio-net never completes on x86-64 (#86), and a lane covers
+      # what passes. The step joins this job when that is fixed.
+      - name: Upload the inspector runtime directories
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-x86-64-runtime
+          # The guest console and QEMU's own stdout, stderr and -d logs.
+          # A failing smoke needs its evidence to leave the job as a file
+          # rather than as console output.
+          path: |
+            smoke-runtime/*/*.log
+          if-no-files-found: warn
+          retention-days: 7
+
   bench:
     name: bench-${{ matrix.name }}
     runs-on: ${{ matrix.runner }}

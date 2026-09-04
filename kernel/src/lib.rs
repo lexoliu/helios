@@ -453,9 +453,17 @@ impl KernelRunStats {
     }
 }
 
+/// What the kernel heap keeps for itself, as a fraction of the memory
+/// it is sizing against, and the floor under that fraction.
+///
+/// Two things use this: the growth path, which refuses to let user
+/// memory eat into the kernel's reserve, and the bootstrap split below,
+/// which decides how much of each memory region the kernel heap keeps
+/// before the user pool takes the rest. One number for both is the
+/// point — the reserve the kernel defends at run time is the reserve it
+/// was given at boot.
 const USER_MEMORY_KERNEL_RESERVE_FRACTION: usize = 4;
 const USER_MEMORY_MIN_KERNEL_RESERVE_BYTES: usize = 32 * 1024 * 1024;
-const USER_HEAP_REGION_FRACTION: usize = 2;
 const USER_HEAP_MIN_REGION_BYTES: usize = 2 * 1024 * 1024;
 
 pub struct Kernel<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone = NoWatchdog> {
@@ -838,22 +846,51 @@ where
     user_pool.unwrap_or_else(|| panic!("bootstrap did not provide memory for user pool"))
 }
 
+/// Splits one bootstrap memory region into the kernel heap's part and
+/// the user pool's part, and reports where the user's part begins.
+///
+/// The kernel keeps its reserve and the user pool takes the rest. The
+/// kernel is close to zero-allocation by contract — bounded pools, no
+/// per-guest growth — and a kernel OOM is fatal rather than
+/// recoverable, so what it needs is headroom over a small working set,
+/// not a share proportional to the machine.
+///
+/// Halving every region got that wrong in a way that showed. On a 2 GiB
+/// x86-64 machine the two halves came to 726 MiB of kernel heap and
+/// 730 MiB of user pool, and at the point where the first guest program
+/// is compiled the kernel was holding 39 MiB of its 726 — while the
+/// user pool could not produce the single 512 MiB run a shared wasm
+/// memory needs on a backend with no lazy-commit address space, because
+/// it did not have one. The spawn failed with 95% of the kernel's half
+/// untouched.
 fn split_bootstrap_memory_region(start: usize, end: usize) -> (usize, Option<usize>) {
     let len = end.saturating_sub(start);
-    if len < USER_HEAP_MIN_REGION_BYTES * USER_HEAP_REGION_FRACTION {
+    let kernel_len = user_memory_kernel_reserve_bytes(len);
+    let Some(user_len) = len.checked_sub(kernel_len) else {
+        return (end, None);
+    };
+    if user_len < USER_HEAP_MIN_REGION_BYTES {
         return (end, None);
     }
 
-    let user_len = len / USER_HEAP_REGION_FRACTION;
-    let user_start = align_down(end.saturating_sub(user_len), USER_HEAP_MIN_REGION_BYTES);
+    // Rounded up, away from the reserve: the kernel's share is a floor
+    // it keeps, so the alignment comes out of the user pool's side.
+    let user_start = align_up(start.saturating_add(kernel_len), USER_HEAP_MIN_REGION_BYTES);
     if user_start <= start || end.saturating_sub(user_start) < USER_HEAP_MIN_REGION_BYTES {
         return (end, None);
     }
     (user_start, Some(user_start))
 }
 
-const fn align_down(value: usize, align: usize) -> usize {
-    value & !(align - 1)
+/// `value` rounded up to a multiple of `align`, which must be a power
+/// of two. Saturates rather than wrapping, so a caller that checks the
+/// result against a region end rejects the overflow instead of
+/// wrapping into it.
+const fn align_up(value: usize, align: usize) -> usize {
+    match value.checked_add(align - 1) {
+        Some(sum) => sum & !(align - 1),
+        None => usize::MAX,
+    }
 }
 
 pub fn prime_bootstrap_allocator<Regions>(
@@ -1006,6 +1043,72 @@ mod tests {
     use super::*;
 
     const TEST_HEAP_BYTES: usize = 16 * 1024;
+
+    /// The compiler plugin's shared memory on a backend with no
+    /// lazy-commit address space: half a gigabyte, allocated at its
+    /// declared maximum in one piece because a shared memory can never
+    /// move.
+    const PLUGIN_SHARED_MEMORY_BYTES: usize = 512 * 1024 * 1024;
+
+    #[test]
+    fn the_kernel_keeps_its_reserve_and_the_user_pool_takes_the_rest() {
+        // What the two halves of a 2 GiB x86-64 machine came to once
+        // firmware had taken its share.
+        let start = 0x0010_0000;
+        let end = start + 1456 * 1024 * 1024;
+        let (kernel_end, user_start) = split_bootstrap_memory_region(start, end);
+        let user_start = user_start.expect("a gigabyte and a half is worth splitting");
+        assert_eq!(kernel_end, user_start, "the split is one point");
+
+        let kernel_len = kernel_end - start;
+        let user_len = end - user_start;
+        assert!(
+            kernel_len >= USER_MEMORY_MIN_KERNEL_RESERVE_BYTES,
+            "the kernel heap fell below its own floor at {kernel_len} bytes"
+        );
+        assert!(
+            user_len > PLUGIN_SHARED_MEMORY_BYTES,
+            "a user pool of {user_len} bytes cannot hold one              {PLUGIN_SHARED_MEMORY_BYTES}-byte allocation and anything else"
+        );
+    }
+
+    #[test]
+    fn a_region_that_cannot_spare_the_reserve_stays_with_the_kernel() {
+        let start = 0x4000_0000;
+        for len in [0_usize, 4096, USER_MEMORY_MIN_KERNEL_RESERVE_BYTES] {
+            let end = start + len;
+            assert_eq!(
+                split_bootstrap_memory_region(start, end),
+                (end, None),
+                "a {len}-byte region has nothing left after the kernel reserve"
+            );
+        }
+    }
+
+    #[test]
+    fn the_user_share_never_reaches_past_the_region_it_came_from() {
+        for offset in [0_usize, 4096, 2 * 1024 * 1024, 37 * 1024 * 1024] {
+            for len in [
+                8 * 1024 * 1024,
+                100 * 1024 * 1024,
+                1024 * 1024 * 1024,
+                3 * 1024 * 1024 * 1024,
+            ] {
+                let start = 0x4000_0000 + offset;
+                let end = start + len;
+                let (kernel_end, user_start) = split_bootstrap_memory_region(start, end);
+                assert!(kernel_end >= start && kernel_end <= end);
+                if let Some(user_start) = user_start {
+                    assert_eq!(user_start, kernel_end);
+                    assert!(user_start > start && user_start < end);
+                    assert!(
+                        user_start - start >= USER_MEMORY_MIN_KERNEL_RESERVE_BYTES,
+                        "the kernel heap kept less than its floor"
+                    );
+                }
+            }
+        }
+    }
 
     #[repr(align(4096))]
     struct AlignedHeap([u8; TEST_HEAP_BYTES]);

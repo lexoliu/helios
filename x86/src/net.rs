@@ -92,6 +92,15 @@ where
     // configuration changes. This is the point of the whole steering
     // path: a flow the device puts on pair `i` raises an interrupt on
     // the processor that already owns the socket.
+    //
+    // How many of those the machine actually gets is the device's
+    // decision, not ours. QEMU sizes a virtio-net function's MSI-X
+    // table from the queue pairs it was configured with — a
+    // single-queue device offers four entries — so a host with more
+    // processors than the device has table entries steers as far as the
+    // table goes and no further. Sizing this from the processor count
+    // alone is what made a default `virtio-net-pci` panic the kernel
+    // during bring-up.
     let PciFunction {
         root: pci,
         address,
@@ -102,7 +111,14 @@ where
         destination_apic_id,
     } = delivery;
     let queue_vectors = crate::exceptions::NETWORK_QUEUE_INTERRUPT_VECTORS;
-    let steered = cpu.processor_count().min(queue_vectors.len());
+    let table_entries = pci.msix_table_size(address).unwrap_or_else(|| {
+        panic!("virtio-net function {address} was discovered without an MSI-X capability")
+    });
+    let steerable = usize::from(table_entries).saturating_sub(1);
+    let steered = cpu
+        .processor_count()
+        .min(queue_vectors.len())
+        .min(steerable);
     let mut messages = [MsixMessage {
         vector,
         destination_apic_id,
@@ -114,11 +130,18 @@ where
         };
     }
     let msix = pci.bind_msix_vectors(address, &messages[..=steered]);
-    let binding = helios_virtio::MsixBinding::per_queue(
-        msix,
-        msix + 1,
-        u16::try_from(steered).unwrap_or_else(|_| panic!("{steered} queue vectors exceed u16")),
-    );
+    // A table with nothing left over after the configuration entry
+    // cannot steer at all: every structure of the function shares the
+    // one message, which is what `shared` describes.
+    let binding = if steered == 0 {
+        helios_virtio::MsixBinding::shared(msix)
+    } else {
+        helios_virtio::MsixBinding::per_queue(
+            msix,
+            msix + 1,
+            u16::try_from(steered).unwrap_or_else(|_| panic!("{steered} queue vectors exceed u16")),
+        )
+    };
     let device = helios_virtio::net_from_pci(&pci.access(), address, pci, dma, Some(binding))
         .unwrap_or_else(|error| {
             panic!("failed to initialize the virtio-net function at {address}: {error}")
