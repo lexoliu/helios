@@ -89,9 +89,10 @@ pub use host_fs::{
     HostFsTransport, UnsupportedHostFileSystem, guest_host_share_path,
 };
 pub use instance::{
-    InstanceExecutionTransition, InstanceId, InstanceProfileTotal, InstanceRegistry,
-    InstanceSnapshot, KillReason, OomPolicy, OomVictim, RegisteredInstance,
-    allow_instance_resource_growth, record_instance_transition,
+    CondemnedMemory, InstanceExecutionTransition, InstanceId, InstanceProfileTotal,
+    InstanceRegistry, InstanceSnapshot, KillReason, OOM_RECLAIM_GRACE, OomKillDecision,
+    OomKillOutcome, OomPolicy, OomVictim, RegisteredInstance, allow_instance_resource_growth,
+    record_instance_transition,
 };
 pub use io::{
     BlockInstallError, BlockSelfCheckError, BlockService, BlockStats, ByteReadWait, ByteReader,

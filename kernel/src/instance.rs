@@ -5,6 +5,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::time::Duration;
 
 use slab::Slab;
 use spin::Mutex;
@@ -89,6 +90,77 @@ const fn decode_kill_flag(value: u8) -> Option<KillReason> {
     }
 }
 
+/// How long the OOM killer waits for a condemned instance's memory
+/// before it will condemn another one to serve the same shortfall.
+///
+/// Condemning an instance does not free anything by itself: the kill
+/// flag is observed at the victim's next call-hook boundary, and the
+/// memory returns when its store is torn down and its registry entry
+/// drops. [`InstanceRegistry::request_kill`] bumps the runtime engine
+/// epoch, so a victim executing wasm reaches that boundary at its next
+/// epoch check, and the scheduler tick that drives those runs every
+/// 100ms (`SCHEDULER_INTERRUPT_INTERVAL`). Five ticks leaves room for
+/// the trap to unwind and the store to drop.
+///
+/// A victim parked in a host future that the epoch cannot reach — a
+/// socket read with no peer, a host-fs request whose reply never comes
+/// — may never reach a call hook at all, so the wait has to be bounded.
+/// When the window expires the condemnation goes stale: it stops
+/// counting as coverage, so the next request condemns a fresh victim,
+/// while the stale condemnation stays on the books and stays out of
+/// victim selection until the instance is actually torn down.
+pub const OOM_RECLAIM_GRACE: Duration = Duration::from_millis(500);
+
+/// User memory the OOM killer has condemned and not yet seen returned.
+///
+/// Reclaim is recorded by the victim's registry entry disappearing when
+/// its last handle drops, so this ledger is derived from the live
+/// instances rather than kept as a counter that could drift away from
+/// them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CondemnedMemory {
+    /// Condemned within [`OOM_RECLAIM_GRACE`]: memory the killer still
+    /// expects back, and the amount that covers a pending grow request.
+    pub pending_bytes: u64,
+    /// Condemned longer ago than [`OOM_RECLAIM_GRACE`]. Still condemned
+    /// and still not a candidate for a second condemnation, but no
+    /// longer counted as coverage: the instance may never reach a call
+    /// hook, and a shortfall cannot wait on it forever.
+    pub stale_bytes: u64,
+}
+
+impl CondemnedMemory {
+    /// Whether the memory already condemned and still expected back
+    /// covers a request for `requested_bytes`.
+    pub const fn covers(&self, requested_bytes: u64) -> bool {
+        self.pending_bytes >= requested_bytes
+    }
+}
+
+/// What [`InstanceRegistry::condemn_for_oom`] did with a grow request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OomKillOutcome {
+    /// This request condemned `victim`; its memory is expected back
+    /// within [`OOM_RECLAIM_GRACE`].
+    Condemned(OomVictim),
+    /// Memory already condemned covers the request. The requester takes
+    /// the typed grow failure and retries once the reclaim lands, rather
+    /// than condemning another live instance for memory that is already
+    /// on its way back.
+    AwaitingReclaim,
+    /// Nothing eligible is left to condemn: the requester takes the grow
+    /// failure with no victim.
+    NoVictim,
+}
+
+/// The outcome of a grow request together with the ledger it was
+/// decided against, as it stands after the decision.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OomKillDecision {
+    pub outcome: OomKillOutcome,
+    pub condemned: CondemnedMemory,
+}
+
 /// Snapshot of an OOM victim selected by [`InstanceRegistry::pick_oom_victim`].
 ///
 /// `score` is the ranking metric (`memory_bytes / restart cost`) — the
@@ -164,6 +236,16 @@ struct InstanceEntry {
     /// transition. When set, the next host-call boundary returns
     /// `Killed { reason }` instead of resuming the guest.
     kill_flag: AtomicU8,
+    /// Monotonic nanoseconds at which the kill flag was set, and the
+    /// memory attributed to the instance at that moment. Together they
+    /// are this instance's entry in the condemned-memory ledger: what
+    /// the killer expects back, and when it started expecting it.
+    ///
+    /// Both are written and read under the registry's `entries` lock,
+    /// alongside the flag flip itself, so no reader can see a
+    /// condemnation whose bytes have not been recorded yet.
+    condemned_at: AtomicU64,
+    condemned_bytes: AtomicU64,
     handle_count: AtomicUsize,
 }
 
@@ -218,6 +300,8 @@ impl InstanceRegistry {
             last_active_at: AtomicU64::new(started_at),
             policy,
             kill_flag: AtomicU8::new(KILL_FLAG_NONE),
+            condemned_at: AtomicU64::new(0),
+            condemned_bytes: AtomicU64::new(0),
             handle_count: AtomicUsize::new(1),
         });
         let entry_ptr = NonNull::from(entry.as_ref());
@@ -234,71 +318,125 @@ impl InstanceRegistry {
     /// chosen first, and system components never. Returns `None` when
     /// no candidate instance has memory attributed to it.
     ///
-    /// The caller must follow up with [`RegisteredInstance::request_kill`]
-    /// or use the registry-level helper that does both.
+    /// Instances that are already condemned are not candidates: their
+    /// memory is on the condemned ledger ([`Self::condemned_memory`])
+    /// rather than available to condemn again.
+    ///
+    /// This is victim selection on its own. The OOM killer's entry point
+    /// is [`Self::condemn_for_oom`], which weighs the ledger against the
+    /// request before it selects anything.
     pub fn pick_oom_victim(&self) -> Option<OomVictim> {
-        let entries = self.inner.entries.lock();
-        let mut best: Option<OomVictim> = None;
-        for (_, entry) in entries.iter() {
-            let memory_bytes = entry.memory_bytes.load(Ordering::Acquire);
-            if memory_bytes == 0 {
-                continue;
-            }
-            if entry.kill_flag.load(Ordering::Acquire) != KILL_FLAG_NONE {
-                // Already condemned; do not re-pick.
-                continue;
-            }
-            // Kernel infrastructure is not a candidate at any score.
-            let Some(cost) = entry.policy.restart_cost() else {
-                continue;
-            };
-            let score = memory_bytes / u64::from(cost.max(1));
-            match &best {
-                Some(current) if current.score >= score => {}
-                _ => {
-                    best = Some(OomVictim {
-                        id: entry.id,
-                        name: entry.name.clone(),
-                        memory_bytes,
-                        policy: entry.policy,
-                        score,
-                    });
-                }
-            }
-        }
-        best
+        best_victim(&self.inner.entries.lock())
     }
 
-    /// Mark `id` for termination. The next host-call boundary in that
-    /// instance returns the recorded `KillReason` instead of resuming
-    /// the guest. Returns true if the kill flag was actually flipped
-    /// (i.e. the instance existed and was not already condemned).
+    /// User memory condemned and not yet reclaimed, as of `now_nanos`.
+    ///
+    /// Reclaim is the victim's registry entry dropping with its last
+    /// handle, so an instance stops contributing here exactly when its
+    /// memory is back.
+    pub fn condemned_memory(&self, now_nanos: u64) -> CondemnedMemory {
+        condemned_ledger(&self.inner.entries.lock(), now_nanos)
+    }
+
+    /// The OOM killer's decision for one refused grow of
+    /// `requested_bytes` by `requester`.
+    ///
+    /// Condemning a victim only sets its kill flag; the memory returns
+    /// when that instance reaches its next call-hook boundary and is
+    /// torn down. Until it does, those bytes are already spoken for, so
+    /// a second refused grow that they would satisfy must not condemn a
+    /// second live instance — otherwise one 1MiB shortfall walks the
+    /// whole workload, condemning an instance per attempt while the
+    /// first reclaim is still in flight.
+    ///
+    /// So: while the memory condemned within [`OOM_RECLAIM_GRACE`]
+    /// covers the request, the answer is [`OomKillOutcome::AwaitingReclaim`]
+    /// and the requester takes its typed grow failure and retries.
+    /// Once that window expires on a victim that never reached a call
+    /// hook, its bytes stop counting as coverage and the next request
+    /// condemns a fresh victim; the stale condemnation stays on the
+    /// ledger as [`CondemnedMemory::stale_bytes`], and stays out of
+    /// victim selection, until the instance is torn down.
+    ///
+    /// The requester is never its own victim: when it is the
+    /// highest-scoring candidate the answer is
+    /// [`OomKillOutcome::NoVictim`] and it takes the failure itself,
+    /// rather than a smaller instance dying to feed it.
+    ///
+    /// Selection and condemnation happen under one lock, so two
+    /// processors refusing a grow at the same moment cannot both
+    /// condemn against the same empty ledger.
+    pub fn condemn_for_oom(
+        &self,
+        requester: InstanceId,
+        requested_bytes: u64,
+        now_nanos: u64,
+    ) -> OomKillDecision {
+        let entries = self.inner.entries.lock();
+        let mut condemned = condemned_ledger(&entries, now_nanos);
+        if condemned.covers(requested_bytes) {
+            return OomKillDecision {
+                outcome: OomKillOutcome::AwaitingReclaim,
+                condemned,
+            };
+        }
+        // Avoid suiciding: when the highest-scoring victim is the
+        // requester itself, the killer hands the grow failure back to it
+        // rather than marking it for termination — and does not fall
+        // through to a smaller instance, which would condemn a modest
+        // program to feed the one already holding the most memory.
+        // Other instances become the pick on later attempts as they
+        // accumulate memory.
+        let victim = best_victim(&entries).filter(|victim| victim.id != requester);
+        let Some(victim) = victim else {
+            return OomKillDecision {
+                outcome: OomKillOutcome::NoVictim,
+                condemned,
+            };
+        };
+        let condemned_bytes =
+            condemn_entry(&entries, victim.id, KillReason::OutOfMemory, now_nanos)
+                .expect("victim selected under the registry lock must still be condemnable");
+        condemned.pending_bytes = condemned.pending_bytes.saturating_add(condemned_bytes);
+        drop(entries);
+        self.notify_kill();
+        OomKillDecision {
+            outcome: OomKillOutcome::Condemned(victim),
+            condemned,
+        }
+    }
+
+    /// Mark `id` for termination as of `now_nanos`. The next host-call
+    /// boundary in that instance returns the recorded `KillReason`
+    /// instead of resuming the guest. Returns true if the kill flag was
+    /// actually flipped (i.e. the instance existed and was not already
+    /// condemned).
+    ///
+    /// A successful flip puts the instance's memory on the condemned
+    /// ledger, timestamped with `now_nanos`: whatever the reason for the
+    /// kill, those bytes are on their way back and the OOM killer must
+    /// not condemn a second instance for memory it is already getting.
     ///
     /// On a successful flip, the runtime engine epoch is bumped so
     /// any guest currently running without host calls hits its
     /// next `epoch_deadline_async_yield` boundary quickly and exposes
     /// the kill flag to `call_hook`. Without this kick a CPU-bound
     /// victim could run until its next host call, which on adversarial
-    /// workloads is "indefinitely".
-    pub fn request_kill(&self, id: InstanceId, reason: KillReason) -> bool {
+    /// workloads is "indefinitely". It is also what bounds the ledger's
+    /// wait: see [`OOM_RECLAIM_GRACE`].
+    pub fn request_kill(&self, id: InstanceId, reason: KillReason, now_nanos: u64) -> bool {
         let entries = self.inner.entries.lock();
-        let Some(entry) = entries
-            .iter()
-            .find_map(|(_, entry)| if entry.id == id { Some(entry) } else { None })
-        else {
-            return false;
-        };
-        let encoded = encode_kill_reason(reason);
-        let flipped = entry
-            .kill_flag
-            .compare_exchange(KILL_FLAG_NONE, encoded, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok();
+        let flipped = condemn_entry(&entries, id, reason, now_nanos).is_some();
         drop(entries);
         if flipped {
-            let notify = *self.inner.kill_notifier.lock();
-            notify();
+            self.notify_kill();
         }
         flipped
+    }
+
+    fn notify_kill(&self) {
+        let notify = *self.inner.kill_notifier.lock();
+        notify();
     }
 
     /// Instances that have not run on any processor for at least
@@ -399,6 +537,91 @@ impl Default for InstanceRegistry {
 
 fn noop_kill_notifier() {}
 
+/// Highest-scoring OOM candidate in `entries`.
+///
+/// Called with the registry's `entries` lock held.
+fn best_victim(entries: &Slab<Box<InstanceEntry>>) -> Option<OomVictim> {
+    let mut best: Option<OomVictim> = None;
+    for (_, entry) in entries.iter() {
+        let memory_bytes = entry.memory_bytes.load(Ordering::Acquire);
+        if memory_bytes == 0 {
+            continue;
+        }
+        if entry.kill_flag.load(Ordering::Acquire) != KILL_FLAG_NONE {
+            // Already condemned: its memory is on the ledger, not on the menu.
+            continue;
+        }
+        // Kernel infrastructure is not a candidate at any score.
+        let Some(cost) = entry.policy.restart_cost() else {
+            continue;
+        };
+        let score = memory_bytes / u64::from(cost.max(1));
+        match &best {
+            Some(current) if current.score >= score => {}
+            _ => {
+                best = Some(OomVictim {
+                    id: entry.id,
+                    name: entry.name.clone(),
+                    memory_bytes,
+                    policy: entry.policy,
+                    score,
+                });
+            }
+        }
+    }
+    best
+}
+
+/// Sum the memory of every condemned instance in `entries`, split at the
+/// [`OOM_RECLAIM_GRACE`] deadline.
+///
+/// Called with the registry's `entries` lock held.
+fn condemned_ledger(entries: &Slab<Box<InstanceEntry>>, now_nanos: u64) -> CondemnedMemory {
+    let grace_nanos = OOM_RECLAIM_GRACE.as_nanos() as u64;
+    let mut ledger = CondemnedMemory::default();
+    for (_, entry) in entries.iter() {
+        if entry.kill_flag.load(Ordering::Acquire) == KILL_FLAG_NONE {
+            continue;
+        }
+        let bytes = entry.condemned_bytes.load(Ordering::Acquire);
+        let waited = now_nanos.saturating_sub(entry.condemned_at.load(Ordering::Acquire));
+        if waited < grace_nanos {
+            ledger.pending_bytes = ledger.pending_bytes.saturating_add(bytes);
+        } else {
+            ledger.stale_bytes = ledger.stale_bytes.saturating_add(bytes);
+        }
+    }
+    ledger
+}
+
+/// Flip `id`'s kill flag and record its ledger entry, returning the
+/// bytes now condemned, or `None` when the instance is gone or was
+/// already condemned.
+///
+/// Called with the registry's `entries` lock held, which is what keeps
+/// the flag and its ledger entry from being observed out of step.
+fn condemn_entry(
+    entries: &Slab<Box<InstanceEntry>>,
+    id: InstanceId,
+    reason: KillReason,
+    now_nanos: u64,
+) -> Option<u64> {
+    let entry = entries
+        .iter()
+        .find_map(|(_, entry)| (entry.id == id).then_some(entry))?;
+    let encoded = encode_kill_reason(reason);
+    entry
+        .kill_flag
+        .compare_exchange(KILL_FLAG_NONE, encoded, Ordering::AcqRel, Ordering::Acquire)
+        .ok()?;
+    let condemned_bytes = entry.memory_bytes.load(Ordering::Acquire);
+    entry.condemned_at.store(now_nanos, Ordering::Release);
+    entry
+        .condemned_bytes
+        .store(condemned_bytes, Ordering::Release);
+    Some(condemned_bytes)
+}
+
 pub fn record_instance_transition(
     instance: &RegisteredInstance,
     transition: InstanceExecutionTransition,
@@ -457,19 +680,6 @@ impl RegisteredInstance {
     /// the next host-call boundary instead of resuming the guest.
     pub fn pending_kill(&self) -> Option<KillReason> {
         decode_kill_flag(self.entry().kill_flag.load(Ordering::Acquire))
-    }
-
-    /// Mark this instance for termination. The next call_hook
-    /// transition observes the flag and the executor returns the
-    /// recorded reason rather than resuming the guest.
-    pub fn request_kill(&self, reason: KillReason) {
-        let encoded = encode_kill_reason(reason);
-        let _ = self.entry().kill_flag.compare_exchange(
-            KILL_FLAG_NONE,
-            encoded,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
     }
 
     pub fn transition(

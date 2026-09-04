@@ -18,8 +18,9 @@ use wasmtime_wasi_io::streams::{InputStream, OutputStream, StreamError, StreamRe
 
 use crate::io::{ByteReader, ByteWriter};
 use crate::{
-    ComponentRuntimeState, ComponentStoreData, KillReason, ProgramOutOfMemory,
-    allow_instance_resource_growth, heap_stats, user_heap_stats, user_memory_kernel_reserve_bytes,
+    ComponentRuntimeState, ComponentStoreData, OomKillOutcome, ProgramOutOfMemory,
+    allow_instance_resource_growth, heap_stats, monotonic_nanos, user_heap_stats,
+    user_memory_kernel_reserve_bytes,
 };
 
 impl<CpuImpl, RuntimeStateImpl, FileSystem> ResourceLimiter
@@ -123,10 +124,17 @@ where
         None
     }
 
-    /// Pick the highest-scoring OOM victim that is not the requesting
-    /// instance and flag it for kill. Logged at warn level so post-mortem
-    /// analysis can trace which instance was sacrificed for which grow
-    /// request.
+    /// Ask the OOM killer to cover `requested_bytes` of user memory.
+    ///
+    /// The killer answers against its condemned-memory ledger, so a
+    /// shortfall that an in-flight kill already covers condemns nothing
+    /// further: `memory_growing` is a synchronous Wasmtime callback and
+    /// cannot wait for the reclaim, so the requester takes its typed
+    /// `ProgramOutOfMemory` failure either way and retries when the
+    /// guest next asks for the memory. Logged at warn level so
+    /// post-mortem analysis can trace which instance was sacrificed for
+    /// which grow request, and which requests were absorbed by a kill
+    /// that had already happened.
     fn request_oom_kill_for_growth(&self, requested_bytes: usize) {
         // VIRTIO_BALLOON_F_DEFLATE_ON_OOM: memory the host is holding is
         // reclaimed before memory a program is using. The balloon task
@@ -135,41 +143,45 @@ where
         if let Some(balloon) = self.runtime_state.memory_balloon() {
             balloon.request_deflate();
         }
-        let registry = &self.instance_registry;
         let requester = self.instance().id();
-        let mut victim = registry.pick_oom_victim();
-        // Avoid suiciding: if the highest-scoring victim is the requester
-        // itself, the OOM killer hands a grow failure back to that
-        // instance instead of marking the killer to terminate. Other
-        // instances may still be picked on subsequent grow attempts as
-        // they accumulate memory.
-        if let Some(candidate) = &victim
-            && candidate.id == requester
-        {
-            victim = None;
-        }
-        let Some(victim) = victim else {
-            tracing::warn!(
+        let decision = self.instance_registry.condemn_for_oom(
+            requester,
+            requested_bytes as u64,
+            monotonic_nanos(&self.cpu),
+        );
+        let condemned = decision.condemned;
+        match decision.outcome {
+            OomKillOutcome::Condemned(victim) => tracing::warn!(
                 target: "helios_kernel::oom",
                 requester = ?requester,
                 requested_bytes,
+                victim_id = ?victim.id,
+                victim_name = %victim.name,
+                victim_memory_bytes = victim.memory_bytes,
+                victim_policy = ?victim.policy,
+                score = victim.score,
+                condemned_pending_bytes = condemned.pending_bytes,
+                condemned_stale_bytes = condemned.stale_bytes,
+                "OOM killer condemned victim to free user memory"
+            ),
+            OomKillOutcome::AwaitingReclaim => tracing::debug!(
+                target: "helios_kernel::oom",
+                requester = ?requester,
+                requested_bytes,
+                condemned_pending_bytes = condemned.pending_bytes,
+                condemned_stale_bytes = condemned.stale_bytes,
+                "memory already condemned covers this grow — requester retries instead of \
+                 condemning another instance"
+            ),
+            OomKillOutcome::NoVictim => tracing::warn!(
+                target: "helios_kernel::oom",
+                requester = ?requester,
+                requested_bytes,
+                condemned_pending_bytes = condemned.pending_bytes,
+                condemned_stale_bytes = condemned.stale_bytes,
                 "OOM killer found no eligible victim — requester takes the grow failure"
-            );
-            return;
-        };
-        let killed = registry.request_kill(victim.id, KillReason::OutOfMemory);
-        tracing::warn!(
-            target: "helios_kernel::oom",
-            requester = ?requester,
-            requested_bytes,
-            victim_id = ?victim.id,
-            victim_name = %victim.name,
-            victim_memory_bytes = victim.memory_bytes,
-            victim_policy = ?victim.policy,
-            score = victim.score,
-            killed,
-            "OOM killer condemned victim to free user memory"
-        );
+            ),
+        }
     }
 }
 
