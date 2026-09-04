@@ -102,9 +102,16 @@ Per cell (workload × side), `iterations` executions (11 by default):
   missing one: every harness runs with `--keep-going`, records the
   failure and its reason, and goes on to the next workload, so a report
   accounts for every cell of the matrix. A failed cell takes part in no
-  comparison and the reason is printed under the class table. A run
-  that dies outright (the guest never boots, the harness is killed) still
-  fails the lane.
+  comparison and the reason is printed under the class table.
+- A workload that takes the guest down with it costs its own class and no
+  other. The Helios side boots one guest per workload class, so a kernel
+  panic ends that class: the inspector's frame reader recognises the
+  kernel's panic line on the console it shares with the RPC frames and
+  fails the call in flight instead of waiting for a reply that a dead
+  kernel will never send, the workloads that class never reached are
+  written out as failed cells naming the panic, and the next class starts
+  a fresh guest. The lane still fails — a report with a panic in it is
+  not publishable — but it fails with every cell it could still measure.
 - Machine noise is measured, not assumed: the `control_workload`
   (`quickjs-loop`) runs before and after the suite on every side, and the
   **noise floor** is the larger of the control's median drift and its CV.
@@ -135,6 +142,27 @@ only render from reports committed under `docs/benchmarks/runs/<id>/`
 own run id differs, and the `tooling` job of the workflow re-renders the
 committed sections and fails when the text no longer matches the report.
 
+## Cells that are known to fail
+
+A red cell in a published table is either a bug of ours with an issue
+number or a limit of the runner, and the table says which. As of this
+page's last render:
+
+- `instance-startup-100`, `instance-startup-500` — a user-mode spawn
+  storm exhausts the kernel's per-processor executor task arena and
+  panics the kernel (#94). The instance-density claim of #28 cannot be
+  measured on any lane until a spawn the kernel cannot serve is refused
+  instead of fatal.
+- Every Helios cell of the `x86-64-kvm` lane — the x86 kernel refuses the
+  multi-queue `vhost` tap device and never finishes boot (#91). The lane
+  runs, provisions its network backend and uploads its report; the report
+  has no Helios side.
+- `tcp-throughput` on a slirp backend on macOS — the guest's receive path
+  times out at around 300 KB (#93). Shared macOS runners can hold neither
+  the `com.apple.vm.networking` entitlement nor a `socket_vmnet` daemon,
+  so an advisory `aarch64-hvf` run has no other network backend to use;
+  the dedicated Apple Silicon machine does.
+
 ## Dedicated runners
 
 Publishable numbers come from two self-hosted machines, one per lane,
@@ -158,6 +186,23 @@ in **advisory** mode: the report carries `publishable: false`, the README
 says so, and nothing blocks. The repository variable
 `HELIOS_BENCH_DEDICATED=true` turns on the dedicated-runner runs for
 pushes to `dev`; tags always use the dedicated labels.
+
+The two deviations that matter most on shared runners, both recorded by
+`host-check` and in the report's deviation list:
+
+- **No accelerator on the Arm lane.** GitHub's macOS runners are
+  themselves virtual machines and expose no nested virtualization, so
+  `aarch64-hvf` runs under TCG there. An interpreted guest is a different
+  machine from the one the lane pins: it changes what is fast relative to
+  what, not just how long a run takes, which is exactly why an advisory
+  report is not publishable. The Fedora side of that lane is interpreted
+  too, so the three sides stay comparable with each other and with
+  nothing else.
+- **No multi-queue network on the Arm lane.** See the slirp entry above.
+
+The `x86-64-kvm` lane's shared runner does expose `/dev/kvm` and a
+writable `/dev/vhost-net`, so its accelerator and network backend match
+the lane; what it cannot promise is an idle machine or a fixed governor.
 
 ## Reproducing a published number
 

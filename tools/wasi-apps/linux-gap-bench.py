@@ -99,6 +99,15 @@ def terminate_process_group(pid: int) -> None:
         return
 
 
+class HeliosRunFailed(RuntimeError):
+    """One `workload-bench.sh` invocation did not finish its workloads.
+
+    A guest that dies costs the invocation it was serving and nothing
+    else: the suite boots one VM per workload class, so the caller
+    records the class it lost and keeps the classes it can still measure.
+    """
+
+
 def run_isolated(
     command: list[str],
     env: dict[str, str] | None = None,
@@ -114,13 +123,13 @@ def run_isolated(
         returncode = process.wait(timeout=timeout_seconds)
     except subprocess.TimeoutExpired as error:
         terminate_process_group(process.pid)
-        raise SystemExit(
+        raise HeliosRunFailed(
             f"command timed out after {timeout_seconds}s: {shlex.join(command)}"
         ) from error
     finally:
         terminate_process_group(process.pid)
     if returncode != 0:
-        raise subprocess.CalledProcessError(returncode, command)
+        raise HeliosRunFailed(f"{shlex.join(command)} exited with status {returncode}")
 
 
 def output(command: list[str]) -> str:
@@ -355,7 +364,8 @@ def run_helios(
     def run_control(moment: str) -> None:
         # The control workload measures the machine, not Helios: the same
         # program before and after the suite bounds how much the host
-        # drifted while the numbers in between were taken.
+        # drifted while the numbers in between were taken. It is the run's
+        # own precondition, so losing it fails the run.
         if control_workload is None:
             return
         run_helios_once(
@@ -373,49 +383,141 @@ def run_helios(
             keep_going,
         )
 
-    run_control("before")
+    try:
+        run_control("before")
+    except HeliosRunFailed as error:
+        raise SystemExit(f"the control workload could not be measured: {error}") from error
 
     if len(workloads_by_class) > 1:
         class_logs = []
+        lost_classes = []
         for workload_class, workload_names in workloads_by_class.items():
             class_log = out_dir / f"helios-{workload_class}.jsonl"
-            run_helios_once(
-                manifest,
-                class_log,
-                iterations,
-                [workload_class],
-                workload_names,
-                arch,
-                host_http_url,
-                host_tcp_host,
-                host_tcp_port,
-                host_tcp_echo_port,
-                timeout_seconds,
-                keep_going,
-            )
+            try:
+                run_helios_once(
+                    manifest,
+                    class_log,
+                    iterations,
+                    [workload_class],
+                    workload_names,
+                    arch,
+                    host_http_url,
+                    host_tcp_host,
+                    host_tcp_port,
+                    host_tcp_echo_port,
+                    timeout_seconds,
+                    keep_going,
+                )
+            except HeliosRunFailed as error:
+                if not keep_going:
+                    raise
+                # One class runs in one guest, so a guest this class killed
+                # costs this class and no other. Whatever it managed to
+                # write stays; the workloads it never reached become failed
+                # cells naming the reason, and the next class gets a fresh
+                # guest.
+                print(
+                    f"helios class {workload_class!r} did not finish; recording its "
+                    f"unmeasured workloads as failed and continuing: {error}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                record_unmeasured(class_log, workloads, workload_names, str(error))
+                lost_classes.append(workload_class)
             class_logs.append(class_log)
         with log.open("w", encoding="utf-8") as output_handle:
             for class_log in class_logs:
-                output_handle.write(class_log.read_text(encoding="utf-8"))
-        run_control("after")
+                if class_log.exists():
+                    output_handle.write(class_log.read_text(encoding="utf-8"))
+        try:
+            run_control("after")
+        except HeliosRunFailed as error:
+            raise SystemExit(f"the control workload could not be measured: {error}") from error
+        if lost_classes:
+            print(
+                "helios workload classes recorded as failed: " + ", ".join(lost_classes),
+                file=sys.stderr,
+                flush=True,
+            )
         return log
 
-    run_helios_once(
-        manifest,
-        log,
-        iterations,
-        list(workloads_by_class),
-        [workload["name"] for workload in workloads],
-        arch,
-        host_http_url,
-        host_tcp_host,
-        host_tcp_port,
-        host_tcp_echo_port,
-        timeout_seconds,
-        keep_going,
-    )
-    run_control("after")
+    try:
+        run_helios_once(
+            manifest,
+            log,
+            iterations,
+            list(workloads_by_class),
+            [workload["name"] for workload in workloads],
+            arch,
+            host_http_url,
+            host_tcp_host,
+            host_tcp_port,
+            host_tcp_echo_port,
+            timeout_seconds,
+            keep_going,
+        )
+    except HeliosRunFailed as error:
+        if not keep_going:
+            raise
+        print(
+            f"helios run did not finish; recording its unmeasured workloads as failed: {error}",
+            file=sys.stderr,
+            flush=True,
+        )
+        record_unmeasured(
+            log,
+            workloads,
+            [workload["name"] for workload in workloads],
+            str(error),
+        )
+    try:
+        run_control("after")
+    except HeliosRunFailed as error:
+        raise SystemExit(f"the control workload could not be measured: {error}") from error
     return log
+
+
+def record_unmeasured(
+    log: Path,
+    workloads: list[dict],
+    selected: list[str],
+    error: str,
+) -> None:
+    """Appends a failure record for every selected workload the log misses.
+
+    A workload with no record at all disappears from the report, which is
+    the one outcome a published table must never have: a cell is either a
+    number or a stated failure.
+    """
+    measured = set()
+    if log.exists():
+        with log.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                record = json.loads(line)
+                if record["type"] in ("summary", "failure"):
+                    measured.add(record["workload"])
+    by_name = {workload["name"]: workload for workload in workloads}
+    with log.open("a", encoding="utf-8") as handle:
+        for name in selected:
+            if name in measured:
+                continue
+            workload = by_name[name]
+            handle.write(
+                json.dumps(
+                    {
+                        "type": "failure",
+                        "workload": name,
+                        "class": workload["class"],
+                        "headline": bool(workload.get("headline", False)),
+                        "runner": workload["runner"],
+                        "error": error,
+                    }
+                )
+                + "\n"
+            )
 
 
 def run_helios_once(
@@ -1791,4 +1893,9 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except HeliosRunFailed as error:
+        # A run that gave up says so in one line; the traceback of a
+        # subprocess exit code told the reader nothing.
+        raise SystemExit(str(error)) from error
