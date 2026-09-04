@@ -166,8 +166,14 @@ pub(super) async fn acquire_or_wait_for_recycle(
 /// re-pooling, and doing it here would land it on the child's exit path
 /// (which `proc_join` waits on). The scrub overlaps with other guests
 /// on other processors and yields between chunks.
-pub(super) fn spawn_scrubbed_recycle<CpuImpl>(
-    spawner: &crate::Spawner<CpuImpl>,
+///
+/// The scrub is not optional: an unscrubbed memory cannot go back to
+/// the pool, and dropping the reservation would leak it. So when the
+/// executor has no task left for this instance the exiting instance
+/// scrubs on its own task before it finishes — the same work on a
+/// different task, not a shortcut around it.
+pub(super) async fn spawn_scrubbed_recycle<CpuImpl>(
+    spawner: &crate::InstanceSpawner<CpuImpl>,
     pool: Arc<Mutex<SharedMemoryPool>>,
     spec: SharedMemorySpec,
     memory: SharedMemory,
@@ -177,10 +183,23 @@ pub(super) fn spawn_scrubbed_recycle<CpuImpl>(
     if !pool.lock().reserve_for_recycle(spec, &memory) {
         return;
     }
-    spawner.spawn_detached(async move {
+    let spawned = spawner.try_spawn_detached({
+        let pool = pool.clone();
+        let memory = memory.clone();
+        async move {
+            scrub_shared_memory(&memory).await;
+            pool.lock().finish_recycle(spec, memory);
+        }
+    });
+    if let Err(error) = spawned {
+        tracing::warn!(
+            target: "helios_kernel::program",
+            %error,
+            "scrubbing an exited guest's shared memory on its own task: the executor's instance share is full"
+        );
         scrub_shared_memory(&memory).await;
         pool.lock().finish_recycle(spec, memory);
-    });
+    }
 }
 
 /// Bytes zeroed between cooperative yields while scrubbing. Sized so a

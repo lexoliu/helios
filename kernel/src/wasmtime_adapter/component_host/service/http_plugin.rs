@@ -137,10 +137,10 @@ where
     let started_at = exec_context
         .runtime_state
         .uptime_nanos(exec_context.cpu.now().ticks());
-    let instance = exec_context.instance_registry.register_with_cost(
+    let instance = exec_context.instance_registry.register_with_policy(
         HTTP_PLUGIN_INSTANCE_NAME,
         started_at,
-        crate::PLUGIN_RESTART_COST,
+        crate::OomPolicy::KernelPlugin,
     );
 
     let payload = trusted_bootfs_payload(artifact)?;
@@ -153,7 +153,12 @@ where
             ResourceTable::new(),
             exec_context.cpu.clone(),
             exec_context.timer.clone(),
-            exec_context.spawner.clone(),
+            // A kernel plugin is kernel infrastructure: its tasks come
+            // out of the arena's kernel reserve, so user-mode load
+            // cannot starve the plugins the kernel depends on.
+            exec_context
+                .spawner
+                .instance_spawner(crate::TaskFunding::Kernel),
             exec_context.runtime_state.clone(),
             exec_context.instance_registry.clone(),
             instance,

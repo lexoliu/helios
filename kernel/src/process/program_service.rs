@@ -173,6 +173,8 @@ pub enum ProgramExecErrorDetail {
     GuestMemoryAccessOutOfBounds,
     #[error("guest memory value has an invalid type")]
     GuestMemoryTypeMismatch,
+    #[error("the executor has no task capacity left for another instance")]
+    ExecutorTaskCapacityExhausted,
     #[error("internal invariant was violated")]
     InternalInvariant,
 }
@@ -227,6 +229,9 @@ impl ProgramExecErrorDetail {
             Self::GuestMemoryAccessOverflow => "guest memory access overflowed",
             Self::GuestMemoryAccessOutOfBounds => "guest memory access is out of bounds",
             Self::GuestMemoryTypeMismatch => "guest memory value has an invalid type",
+            Self::ExecutorTaskCapacityExhausted => {
+                "the executor has no task capacity left for another instance"
+            }
             Self::InternalInvariant => "internal invariant was violated",
         }
     }

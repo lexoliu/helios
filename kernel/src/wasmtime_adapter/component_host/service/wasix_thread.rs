@@ -111,11 +111,21 @@ where
         wasix_abi,
     );
     store_data.set_thread_id(tid);
-    caller.data_mut().insert_thread(tid, signal_state, exit_rx);
-    spawner.spawn_detached(async move {
+    // Spawn before the thread is recorded: a thread the executor has no
+    // capacity for must not be left in the table for `thread_join` to
+    // wait on forever.
+    if let Err(error) = spawner.try_spawn_detached(async move {
         let code = run_wasix_thread(engine, compiled, imported_memory, store_data, tid, args).await;
         let _ = exit_tx.send(code);
-    });
+    }) {
+        tracing::warn!(
+            target: "helios_kernel::program",
+            %error,
+            "refused a wasix thread: the executor's instance share is full"
+        );
+        return p1::errno::NOMEM;
+    }
+    caller.data_mut().insert_thread(tid, signal_state, exit_rx);
     p1::errno::SUCCESS
 }
 

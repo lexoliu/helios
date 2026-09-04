@@ -7,7 +7,7 @@ where
 {
     pub(super) cpu: CpuImpl,
     pub(super) timer: crate::Timer<CpuImpl>,
-    pub(super) spawner: crate::Spawner<CpuImpl>,
+    pub(super) spawner: crate::InstanceSpawner<CpuImpl>,
     pub(super) runtime_state: HostRuntimeState<CpuImpl, HostFs>,
     pub(super) instance: crate::RegisteredInstance,
     pub(super) parent_instance_id: Option<crate::InstanceId>,
@@ -49,7 +49,7 @@ where
     pub(super) fn new(
         cpu: CpuImpl,
         timer: crate::Timer<CpuImpl>,
-        spawner: crate::Spawner<CpuImpl>,
+        spawner: crate::InstanceSpawner<CpuImpl>,
         runtime_state: HostRuntimeState<CpuImpl, HostFs>,
         instance: crate::RegisteredInstance,
         parent_instance_id: Option<crate::InstanceId>,
@@ -280,7 +280,9 @@ where
         ProgramExecContext {
             cpu: self.cpu.clone(),
             timer: self.timer.clone(),
-            spawner: self.spawner.clone(),
+            // A child instance is funded from its own share; what the
+            // launch path takes from the parent is the processor.
+            spawner: self.spawner.launch_spawner().clone(),
             runtime_state: self.runtime_state.clone(),
             instance_registry: self.runtime_state.instance_registry(),
             parent_instance_id: Some(self.instance.id()),

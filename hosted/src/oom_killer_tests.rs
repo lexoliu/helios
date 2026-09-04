@@ -11,10 +11,7 @@
 #![cfg(test)]
 
 use helios_hal::vmm::{NoSwap, SwapBackend};
-use helios_kernel::{
-    DEFAULT_RESTART_COST, InstanceRegistry, KillReason, PLUGIN_RESTART_COST,
-    SYSTEM_COMPONENT_RESTART_COST,
-};
+use helios_kernel::{InstanceRegistry, KillReason, OomPolicy};
 
 #[test]
 fn pick_skips_instances_with_zero_memory() {
@@ -38,10 +35,10 @@ fn pick_chooses_largest_consumer_when_costs_match() {
 #[test]
 fn pick_prefers_low_restart_cost_per_byte() {
     let registry = InstanceRegistry::new();
-    let user = registry.register_with_cost("user-program", 0, DEFAULT_RESTART_COST);
-    let plugin = registry.register_with_cost("compiler-plugin", 0, PLUGIN_RESTART_COST);
+    let user = registry.register_with_policy("user-program", 0, OomPolicy::UserProgram);
+    let plugin = registry.register_with_policy("compiler-plugin", 0, OomPolicy::KernelPlugin);
     // User holds half as much memory but has one-hundredth the
-    // restart cost, so its `memory / restart_cost` score should win.
+    // restart cost, so its `memory / restart cost` score should win.
     user.set_memory_bytes(256 * 1024 * 1024);
     plugin.set_memory_bytes(512 * 1024 * 1024);
 
@@ -49,27 +46,35 @@ fn pick_prefers_low_restart_cost_per_byte() {
     assert_eq!(victim.id, user.id());
 }
 
+/// Issue #94's second signature: a spawn storm walked the user pool
+/// empty, every user instance was already condemned, and the OOM killer
+/// picked the embedded debugger — which is fatal. A system component is
+/// not a candidate at any score.
 #[test]
-fn system_components_are_picked_only_as_last_resort() {
+fn system_components_are_never_oom_victims() {
     let registry = InstanceRegistry::new();
-    let system = registry.register_with_cost("debugger", 0, SYSTEM_COMPONENT_RESTART_COST);
+    let system = registry.register_with_policy("debugger", 0, OomPolicy::SystemComponent);
     system.set_memory_bytes(1024 * 1024 * 1024);
 
-    // No other candidate: the system component is the only one with
-    // memory attributed, so it has to be picked despite the high cost.
-    let solo = registry.pick_oom_victim().expect("solo system victim");
-    assert_eq!(solo.id, system.id());
+    assert!(
+        registry.pick_oom_victim().is_none(),
+        "a system component holding every byte is still not a victim"
+    );
 
-    // Add a much smaller user-cost instance with a sliver of memory:
-    // even 1 MiB of user-cost memory beats 1 GiB of system-cost.
-    let user = registry.register_with_cost("user", 0, DEFAULT_RESTART_COST);
+    // A user program with a sliver of memory is, and stays, the pick.
+    let user = registry.register_with_policy("user", 0, OomPolicy::UserProgram);
     user.set_memory_bytes(1024 * 1024);
 
     let victim = registry.pick_oom_victim().expect("a victim is available");
-    assert_eq!(
-        victim.id,
-        user.id(),
-        "OOM killer must prefer the cheap-to-restart user program over the system component"
+    assert_eq!(victim.id, user.id());
+
+    // Once that user program is condemned there is no one left to
+    // condemn: the requester takes the grow failure instead.
+    assert!(registry.request_kill(victim.id, KillReason::OutOfMemory));
+    assert!(
+        registry.pick_oom_victim().is_none(),
+        "with every user instance condemned the killer must run out of victims, \
+         not fall through to the kernel's own components"
     );
 }
 

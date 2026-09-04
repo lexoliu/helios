@@ -31,7 +31,48 @@ const TASK_ARENA_ALIGN: usize = 64;
 const TASK_ARENA_CLASS_COUNT: usize = 13;
 /// Empty-list sentinel for the per-class free heads.
 const TASK_ARENA_FREE_NULL: u32 = u32::MAX;
+/// Arena bytes only kernel-funded tasks may occupy.
+///
+/// Sized as one block of the largest class the arena serves, so the
+/// kernel can always place a task of any size it spawns even when
+/// instance-funded work has taken every byte it is allowed to take.
+/// Without a reserve, user-mode load decides whether the kernel can
+/// spawn, which is what made a spawn storm fatal.
+const TASK_ARENA_KERNEL_RESERVE_BYTES: usize = TaskArena::class_bytes(TASK_ARENA_CLASS_COUNT - 1);
+/// Arena bytes instance-funded tasks may occupy.
+const TASK_ARENA_INSTANCE_BYTES: usize = TASK_ARENA_BYTES - TASK_ARENA_KERNEL_RESERVE_BYTES;
 static EXECUTOR_GROUP: Once<NoWeakArc<ExecutorGroup>> = Once::new();
+
+/// Which share of a processor's task arena a spawn draws from.
+///
+/// The distinction is ownership, not size: kernel-funded work is work
+/// the kernel decided to do — its own tasks and the components it
+/// provisions itself (system components, kernel plugins) — and running
+/// out of arena for it is a kernel resource failure, which is fatal.
+/// Instance-funded work is work a user-mode program asked for, and
+/// running out of arena for it is a typed refusal handed back to that
+/// program.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskFunding {
+    Kernel,
+    Instance,
+}
+
+/// A task the executor refused to place because the instance share of
+/// the arena is full.
+///
+/// Carries what a refusal has to say for itself: how much of the share
+/// the spawn asked for and how many instance-funded tasks are already
+/// live on this processor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "executor task arena instance share is full: {requested_bytes} bytes requested, {live_instance_tasks} instance tasks live in {share_bytes} bytes"
+)]
+pub struct TaskCapacityError {
+    pub requested_bytes: usize,
+    pub live_instance_tasks: usize,
+    pub share_bytes: usize,
+}
 
 struct ExecutorGroup {
     local_queues: Box<[ReadyQueue]>,
@@ -55,11 +96,29 @@ struct TaskArena {
     bytes: TaskArenaBytes,
     offset: AtomicUsize,
     active: AtomicUsize,
+    instance_active: AtomicUsize,
     /// One Treiber-stack head per block class: low 32 bits the block
     /// offset (`TASK_ARENA_FREE_NULL` = empty), high 32 bits a CAS tag
     /// bumped on every successful push/pop to defeat ABA.
-    free_heads: [AtomicU64; TASK_ARENA_CLASS_COUNT],
+    ///
+    /// Blocks are kept on the list of the region they came from, so a
+    /// block the kernel took out of its reserve and freed again cannot
+    /// be handed to an instance-funded task: the reserve stays a
+    /// reserve across task churn, not just until the first kernel task
+    /// exits.
+    free_heads: [[AtomicU64; TASK_ARENA_CLASS_COUNT]; BLOCK_REGION_COUNT],
 }
+
+/// Which side of the instance/kernel split a block sits on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlockRegion {
+    /// Below the instance ceiling: either funding may hold it.
+    Instance = 0,
+    /// Reaches into the kernel reserve: kernel-funded tasks only.
+    KernelReserve = 1,
+}
+
+const BLOCK_REGION_COUNT: usize = 2;
 
 #[repr(align(64))]
 struct TaskArenaBytes {
@@ -69,6 +128,7 @@ struct TaskArenaBytes {
 struct ArenaFuture<Fut> {
     ptr: NonNull<Fut>,
     class: usize,
+    funding: TaskFunding,
     arena: NoWeakArc<TaskArena>,
 }
 
@@ -86,9 +146,13 @@ impl TaskArena {
         unsafe {
             (&raw mut (*ptr).offset).write(AtomicUsize::new(0));
             (&raw mut (*ptr).active).write(AtomicUsize::new(0));
+            (&raw mut (*ptr).instance_active).write(AtomicUsize::new(0));
             let heads = &raw mut (*ptr).free_heads;
-            for class in 0..TASK_ARENA_CLASS_COUNT {
-                (&raw mut (*heads)[class]).write(AtomicU64::new(u64::from(TASK_ARENA_FREE_NULL)));
+            for region in 0..BLOCK_REGION_COUNT {
+                for class in 0..TASK_ARENA_CLASS_COUNT {
+                    (&raw mut (*heads)[region][class])
+                        .write(AtomicU64::new(u64::from(TASK_ARENA_FREE_NULL)));
+                }
             }
             UniqueArc::assume_init(arena).shareable()
         }
@@ -111,7 +175,33 @@ impl TaskArena {
         class
     }
 
-    fn allocate<Fut>(arena: &NoWeakArc<Self>, future: Fut) -> ArenaFuture<Fut> {
+    /// Places a kernel-funded task. Exhaustion here is a kernel
+    /// resource failure and stays fatal.
+    fn allocate_kernel<Fut>(arena: &NoWeakArc<Self>, future: Fut) -> ArenaFuture<Fut> {
+        Self::allocate(arena, future, TaskFunding::Kernel).unwrap_or_else(|_| {
+            panic!(
+                "executor task arena exhausted: {} live tasks",
+                arena.active.load(Ordering::Acquire)
+            )
+        })
+    }
+
+    /// Places an instance-funded task, or refuses it when the instance
+    /// share of the arena is full. The future is dropped on refusal;
+    /// the caller reports the refusal to the instance that asked for
+    /// the task.
+    fn allocate_instance<Fut>(
+        arena: &NoWeakArc<Self>,
+        future: Fut,
+    ) -> Result<ArenaFuture<Fut>, TaskCapacityError> {
+        Self::allocate(arena, future, TaskFunding::Instance)
+    }
+
+    fn allocate<Fut>(
+        arena: &NoWeakArc<Self>,
+        future: Fut,
+        funding: TaskFunding,
+    ) -> Result<ArenaFuture<Fut>, TaskCapacityError> {
         let size = size_of::<Fut>();
         let align = align_of::<Fut>().max(1);
         assert!(
@@ -119,38 +209,73 @@ impl TaskArena {
             "future alignment exceeds executor task arena alignment"
         );
         let class = Self::block_class(size);
+        let Some(start) = arena.take_block(class, funding) else {
+            return Err(TaskCapacityError {
+                requested_bytes: Self::class_bytes(class),
+                live_instance_tasks: arena.instance_active.load(Ordering::Acquire),
+                share_bytes: TASK_ARENA_INSTANCE_BYTES,
+            });
+        };
         arena.active.fetch_add(1, Ordering::AcqRel);
-        let start = arena.pop_free(class).unwrap_or_else(|| {
-            arena
-                .offset
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |offset| {
-                    offset
-                        .checked_add(Self::class_bytes(class))
-                        .filter(|end| *end <= TASK_ARENA_BYTES)
-                })
-                .unwrap_or_else(|_| {
-                    arena.active.fetch_sub(1, Ordering::AcqRel);
-                    panic!(
-                        "executor task arena exhausted: {} live tasks",
-                        arena.active.load(Ordering::Acquire)
-                    )
-                })
-        });
+        if funding == TaskFunding::Instance {
+            arena.instance_active.fetch_add(1, Ordering::AcqRel);
+        }
         let ptr = unsafe { arena.bytes.ptr().add(start).cast::<Fut>() };
         unsafe {
             ptr.write(future);
         }
-        ArenaFuture {
+        Ok(ArenaFuture {
             ptr: NonNull::new(ptr).expect("task arena pointer was null"),
             class,
+            funding,
             arena: arena.clone(),
+        })
+    }
+
+    /// Finds a block of `class` this funding may hold: a freed block
+    /// first, then fresh bytes from the bump pointer up to the ceiling
+    /// the funding is allowed to reach.
+    fn take_block(&self, class: usize, funding: TaskFunding) -> Option<usize> {
+        let reused = match funding {
+            // Reserve blocks first, so a kernel task that can be served
+            // out of the reserve leaves the instance share alone.
+            TaskFunding::Kernel => self
+                .pop_free(BlockRegion::KernelReserve, class)
+                .or_else(|| self.pop_free(BlockRegion::Instance, class)),
+            TaskFunding::Instance => self.pop_free(BlockRegion::Instance, class),
+        };
+        if let Some(start) = reused {
+            return Some(start);
+        }
+        let ceiling = match funding {
+            TaskFunding::Kernel => TASK_ARENA_BYTES,
+            TaskFunding::Instance => TASK_ARENA_INSTANCE_BYTES,
+        };
+        self.offset
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |offset| {
+                offset
+                    .checked_add(Self::class_bytes(class))
+                    .filter(|end| *end <= ceiling)
+            })
+            .ok()
+    }
+
+    /// The region a block belongs to for the rest of its life. A block
+    /// that reaches into the reserve is a reserve block even when it
+    /// starts below the ceiling, so instance-funded tasks can never
+    /// reuse arena bytes the kernel reserved for itself.
+    const fn region_of(start: usize, class: usize) -> BlockRegion {
+        if start + Self::class_bytes(class) > TASK_ARENA_INSTANCE_BYTES {
+            BlockRegion::KernelReserve
+        } else {
+            BlockRegion::Instance
         }
     }
 
     /// Pops a reusable block offset for `class`, or `None` when the
     /// class free list is empty.
-    fn pop_free(&self, class: usize) -> Option<usize> {
-        let head = &self.free_heads[class];
+    fn pop_free(&self, region: BlockRegion, class: usize) -> Option<usize> {
+        let head = &self.free_heads[region as usize][class];
         loop {
             let current = head.load(Ordering::Acquire);
             let offset = (current & u64::from(u32::MAX)) as u32;
@@ -175,9 +300,9 @@ impl TaskArena {
         }
     }
 
-    /// Returns a dropped block to its class free list.
+    /// Returns a dropped block to the free list of its region and class.
     fn push_free(&self, offset: usize, class: usize) {
-        let head = &self.free_heads[class];
+        let head = &self.free_heads[Self::region_of(offset, class) as usize][class];
         let offset = u32::try_from(offset).expect("task arena offsets fit in 32 bits");
         loop {
             let current = head.load(Ordering::Acquire);
@@ -200,8 +325,12 @@ impl TaskArena {
         }
     }
 
-    fn release(&self, block_offset: usize, class: usize) {
+    fn release(&self, block_offset: usize, class: usize, funding: TaskFunding) {
         self.push_free(block_offset, class);
+        if funding == TaskFunding::Instance {
+            let previous = self.instance_active.fetch_sub(1, Ordering::AcqRel);
+            assert!(previous != 0, "task arena instance task count underflowed");
+        }
         let previous = self.active.fetch_sub(1, Ordering::AcqRel);
         assert!(previous != 0, "task arena active count underflowed");
     }
@@ -230,7 +359,7 @@ impl<Fut> Drop for ArenaFuture<Fut> {
             ptr::drop_in_place(self.ptr.as_ptr());
         }
         let offset = self.ptr.as_ptr() as usize - self.arena.bytes.ptr() as usize;
-        self.arena.release(offset, self.class);
+        self.arena.release(offset, self.class, self.funding);
     }
 }
 
@@ -434,12 +563,23 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
         self.progress_notify.clone()
     }
 
-    fn spawn_with_progress<Fut>(&self, future: Fut) -> JoinHandle<Fut::Output>
+    /// Places `future` in this processor's task arena under `funding`.
+    fn allocate<Fut>(
+        &self,
+        future: Fut,
+        funding: TaskFunding,
+    ) -> Result<ArenaFuture<Fut>, TaskCapacityError> {
+        match funding {
+            TaskFunding::Kernel => Ok(TaskArena::allocate_kernel(&self.task_arena, future)),
+            TaskFunding::Instance => TaskArena::allocate_instance(&self.task_arena, future),
+        }
+    }
+
+    fn spawn_with_progress<Fut>(&self, future: ArenaFuture<Fut>) -> JoinHandle<Fut::Output>
     where
         Fut: Future + Send + 'static,
         Fut::Output: Send + 'static,
     {
-        let future = TaskArena::allocate(&self.task_arena, future);
         let scheduler = self.global_scheduler();
         let schedule = move |runnable| scheduler.schedule(runnable);
         let (runnable, task) = Builder::new().spawn(move |_| future, schedule);
@@ -449,14 +589,13 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
 
     fn spawn_local_with_progress<Fut>(
         &self,
-        future: Fut,
+        future: ArenaFuture<Fut>,
         progress_mode: ProgressMode,
     ) -> LocalJoinHandle<Fut::Output>
     where
         Fut: Future + 'static,
         Fut::Output: 'static,
     {
-        let future = TaskArena::allocate(&self.task_arena, future);
         if progress_mode == ProgressMode::Silent {
             let scheduler = self.local_silent_scheduler();
             let schedule = move |runnable| scheduler.schedule(runnable);
@@ -522,11 +661,22 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
         }
     }
 
+    /// A view of this spawner that funds every task it places from the
+    /// arena's instance share and hands back a typed refusal instead of
+    /// panicking when that share is full.
+    pub fn instance_spawner(&self, funding: TaskFunding) -> InstanceSpawner<CpuImpl> {
+        InstanceSpawner {
+            inner: self.clone(),
+            funding,
+        }
+    }
+
     pub fn spawn<Fut>(&self, future: Fut) -> JoinHandle<Fut::Output>
     where
         Fut: Future + Send + 'static,
         Fut::Output: Send + 'static,
     {
+        let future = TaskArena::allocate_kernel(&self.task_arena, future);
         self.spawn_with_progress(future)
     }
 
@@ -543,6 +693,7 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
         Fut: Future + 'static,
         Fut::Output: 'static,
     {
+        let future = TaskArena::allocate_kernel(&self.task_arena, future);
         self.spawn_local_with_progress(future, ProgressMode::Counted)
     }
 
@@ -559,8 +710,85 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
         Fut: Future + 'static,
         Fut::Output: 'static,
     {
+        let future = TaskArena::allocate_kernel(&self.task_arena, future);
         self.spawn_local_with_progress(future, ProgressMode::Silent)
             .detach();
+    }
+}
+
+/// The spawner a wasm instance's store holds.
+///
+/// Every task it places is attributed to the instance that asked for
+/// it, so a program that wants more tasks than the machine can serve is
+/// refused instead of walking the arena empty under the kernel. The
+/// type is the contract: an instance context cannot reach an
+/// infallible spawn, because it never holds a [`Spawner`].
+#[derive(Clone)]
+pub struct InstanceSpawner<CpuImpl: Cpu + Clone> {
+    inner: Spawner<CpuImpl>,
+    funding: TaskFunding,
+}
+
+impl<CpuImpl: Cpu + Clone> InstanceSpawner<CpuImpl> {
+    pub fn funding(&self) -> TaskFunding {
+        self.funding
+    }
+
+    pub(crate) fn progress_counter(&self) -> ProgressCounter {
+        self.inner.progress_counter()
+    }
+
+    /// The processor-local spawner a *new* instance's funding is drawn
+    /// from.
+    ///
+    /// The launch path needs it to build the child instance's own
+    /// [`InstanceSpawner`] on the arena that will hold the child's
+    /// tasks. It is not a way back to an infallible spawn for the
+    /// instance that holds this one: nothing outside the launch path
+    /// takes it.
+    pub(crate) fn launch_spawner(&self) -> &Spawner<CpuImpl> {
+        &self.inner
+    }
+
+    pub fn try_spawn<Fut>(&self, future: Fut) -> Result<JoinHandle<Fut::Output>, TaskCapacityError>
+    where
+        Fut: Future + Send + 'static,
+        Fut::Output: Send + 'static,
+    {
+        let future = self.inner.allocate(future, self.funding)?;
+        Ok(self.inner.spawn_with_progress(future))
+    }
+
+    pub fn try_spawn_detached<Fut>(&self, future: Fut) -> Result<(), TaskCapacityError>
+    where
+        Fut: Future + Send + 'static,
+        Fut::Output: Send + 'static,
+    {
+        self.try_spawn(future)?.detach();
+        Ok(())
+    }
+
+    pub fn try_spawn_local<Fut>(
+        &self,
+        future: Fut,
+    ) -> Result<LocalJoinHandle<Fut::Output>, TaskCapacityError>
+    where
+        Fut: Future + 'static,
+        Fut::Output: 'static,
+    {
+        let future = self.inner.allocate(future, self.funding)?;
+        Ok(self
+            .inner
+            .spawn_local_with_progress(future, ProgressMode::Counted))
+    }
+
+    pub fn try_spawn_local_detached<Fut>(&self, future: Fut) -> Result<(), TaskCapacityError>
+    where
+        Fut: Future + 'static,
+        Fut::Output: 'static,
+    {
+        self.try_spawn_local(future)?.detach();
+        Ok(())
     }
 }
 
@@ -755,9 +983,12 @@ impl<T> Future for LocalJoinHandle<T> {
 mod tests {
     use core::mem::size_of;
 
+    use alloc::vec::Vec;
+
     use super::{
         Executor, GlobalScheduler, LocalScheduler, LocalSilentScheduler, READY_QUEUE_CAPACITY,
-        Spawner, TASK_ARENA_CLASS_COUNT, TaskArena, ready_queue, should_wake_global_processor,
+        Spawner, TASK_ARENA_CLASS_COUNT, TASK_ARENA_INSTANCE_BYTES,
+        TASK_ARENA_KERNEL_RESERVE_BYTES, TaskArena, ready_queue, should_wake_global_processor,
         should_wake_owner_processor,
     };
     use helios_hal::cpu::{Cpu, HardwarePerfCounters, Instant, ProcessorId};
@@ -866,17 +1097,84 @@ mod tests {
         let arena = TaskArena::new_shared();
         // An eternal task pins the arena non-empty for the whole test,
         // matching the boot-time pump/transport tasks in a real kernel.
-        let pinned = TaskArena::allocate(&arena, [0_u8; 256]);
+        let pinned = TaskArena::allocate_kernel(&arena, [0_u8; 256]);
         // Churn two orders of magnitude more bytes than the arena holds;
         // the old reset-when-empty bump pointer exhausted after 1 MiB of
         // cumulative spawns and panicked on the next allocation.
         for _ in 0..200_000 {
-            drop(TaskArena::allocate(&arena, [0_u8; 512]));
+            drop(TaskArena::allocate_kernel(&arena, [0_u8; 512]));
         }
         // Distinct live allocations still coexist with the reused blocks.
-        let overlapped: [_; 8] = core::array::from_fn(|_| TaskArena::allocate(&arena, [0_u8; 512]));
+        let overlapped: [_; 8] =
+            core::array::from_fn(|_| TaskArena::allocate_kernel(&arena, [0_u8; 512]));
         drop(overlapped);
         drop(pinned);
+    }
+
+    /// The spawn storm from issue #94: a user program holding instance
+    /// after instance until the arena is gone. Before the instance
+    /// share existed this panicked the kernel; now the storm is refused
+    /// and the kernel's own tasks still have somewhere to go.
+    #[test]
+    fn instance_task_storm_is_refused_and_leaves_the_kernel_reserve_intact() {
+        let arena = TaskArena::new_shared();
+        let block = TaskArena::class_bytes(TaskArena::block_class(size_of::<[u8; 4096]>()));
+
+        let mut live = Vec::new();
+        loop {
+            match TaskArena::allocate_instance(&arena, [0_u8; 4096]) {
+                Ok(task) => live.push(task),
+                Err(error) => {
+                    assert_eq!(error.requested_bytes, block);
+                    assert_eq!(error.share_bytes, TASK_ARENA_INSTANCE_BYTES);
+                    assert_eq!(error.live_instance_tasks, live.len());
+                    break;
+                }
+            }
+        }
+
+        // The storm stops at the share, not at the arena.
+        assert_eq!(live.len(), TASK_ARENA_INSTANCE_BYTES / block);
+        // And the kernel can still place a task of the largest class it
+        // spawns — the property whose absence made a user-mode spawn
+        // able to kill the machine.
+        let kernel_task =
+            TaskArena::allocate_kernel(&arena, [0_u8; TASK_ARENA_KERNEL_RESERVE_BYTES]);
+        drop(kernel_task);
+        drop(live);
+    }
+
+    #[test]
+    fn instance_tasks_reclaim_the_share_when_their_instances_exit() {
+        let arena = TaskArena::new_shared();
+        let mut live = Vec::new();
+        while let Ok(task) = TaskArena::allocate_instance(&arena, [0_u8; 4096]) {
+            live.push(task);
+        }
+
+        // One instance exiting is one refusal reversed: capacity is a
+        // live-task property, not a cumulative-spawn property.
+        live.pop();
+        let replacement = TaskArena::allocate_instance(&arena, [0_u8; 4096]);
+
+        assert!(replacement.is_ok());
+        assert!(TaskArena::allocate_instance(&arena, [0_u8; 4096]).is_err());
+    }
+
+    /// Kernel-funded churn must not hand the reserve to instances: a
+    /// block the kernel took out of the reserve and released stays on
+    /// the reserve free list.
+    #[test]
+    fn released_kernel_reserve_blocks_never_reach_instance_tasks() {
+        let arena = TaskArena::new_shared();
+        let mut live = Vec::new();
+        while let Ok(task) = TaskArena::allocate_instance(&arena, [0_u8; 4096]) {
+            live.push(task);
+        }
+        // Bump into the reserve, then give the block back.
+        drop(TaskArena::allocate_kernel(&arena, [0_u8; 4096]));
+
+        assert!(TaskArena::allocate_instance(&arena, [0_u8; 4096]).is_err());
     }
 
     #[test]

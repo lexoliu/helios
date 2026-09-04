@@ -1018,11 +1018,18 @@ where
         let preview1_core_linker = self.inner.preview1_core_linker.clone();
         let shared_memory_pool = self.inner.shared_memory_pool.clone();
         let core_module_instance_pre_cache = self.inner.core_module_instance_pre_cache.clone();
-        let spawner = exec_context.spawner.clone();
+        // Everything this instance runs — its own task and every WASI
+        // future its store spawns later — is funded from the arena's
+        // instance share. A spawn storm therefore walks that share
+        // empty and is refused right here, instead of taking the
+        // executor capacity the kernel needs for its own tasks.
+        let spawner = exec_context
+            .spawner
+            .instance_spawner(crate::TaskFunding::Instance);
         let run_spawner = spawner.clone();
         let progress = spawner.progress_counter();
 
-        spawner.spawn_local_detached(async move {
+        let launched = spawner.try_spawn_local_detached(async move {
             let result = run_program_executable(
                 exec_context,
                 request.argv,
@@ -1046,6 +1053,18 @@ where
             .await;
             let _ = exit_tx.send(result);
         });
+        if let Err(error) = launched {
+            tracing::warn!(
+                target: "helios_kernel::program",
+                instance = ?instance_id,
+                %error,
+                "refused a program launch: the executor's instance task share is full"
+            );
+            return Err(ProgramExecError {
+                kind: ProgramExecErrorKind::OutOfMemory,
+                detail: ProgramExecErrorDetail::ExecutorTaskCapacityExhausted,
+            });
+        }
 
         let ChildStdio {
             stdin,
@@ -1478,10 +1497,10 @@ where
         let started_at = exec_context
             .runtime_state
             .uptime_nanos(exec_context.cpu.now().ticks());
-        let compiler_instance = exec_context.instance_registry.register_with_cost(
+        let compiler_instance = exec_context.instance_registry.register_with_policy(
             "compiler-plugin",
             started_at,
-            crate::PLUGIN_RESTART_COST,
+            crate::OomPolicy::KernelPlugin,
         );
         let store_data = CompilerCoreStore {
             cpu: exec_context.cpu.clone(),
@@ -1682,10 +1701,10 @@ where
         let scratch_started_at = exec_context
             .runtime_state
             .uptime_nanos(exec_context.cpu.now().ticks());
-        let scratch_instance = exec_context.instance_registry.register_with_cost(
+        let scratch_instance = exec_context.instance_registry.register_with_policy(
             "compiler-plugin-init",
             scratch_started_at,
-            crate::PLUGIN_RESTART_COST,
+            crate::OomPolicy::KernelPlugin,
         );
         let scratch_store_data = CompilerCoreStore {
             cpu: exec_context.cpu.clone(),
@@ -1727,7 +1746,10 @@ where
         Self {
             cpu: store.cpu.clone(),
             timer: store.timer(),
-            spawner: store.spawner().clone(),
+            // The launch path funds a child instance from a fresh
+            // instance share; what it needs from the parent is the
+            // processor its tasks will live on.
+            spawner: store.spawner().launch_spawner().clone(),
             runtime_state: store.runtime_state.clone(),
             instance_registry: store.instance_registry.clone(),
             parent_instance_id: Some(store.instance().id()),

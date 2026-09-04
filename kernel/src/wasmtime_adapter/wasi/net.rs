@@ -112,7 +112,7 @@ where
 {
     pub(super) socket: TcpSocket,
     pub(super) get_store_data: for<'a> fn(&'a mut T) -> &'a mut StoreData<CpuImpl, HostFs>,
-    pub(super) spawner: crate::Spawner<CpuImpl>,
+    pub(super) spawner: crate::InstanceSpawner<CpuImpl>,
     pub(super) waiter: crate::NotifyWaiter,
 }
 
@@ -129,6 +129,9 @@ pub(super) enum P3TcpListenStreamOperation {
     Accept,
     LocalAddress,
     InvalidState,
+    /// The executor had no task left for this instance to run the
+    /// accept on.
+    TaskCapacity,
 }
 
 #[derive(Clone, Debug, Error)]
@@ -629,7 +632,7 @@ where
     pub(super) fn new(
         socket: TcpSocket,
         get_store_data: for<'a> fn(&'a mut T) -> &'a mut StoreData<CpuImpl, HostFs>,
-        spawner: crate::Spawner<CpuImpl>,
+        spawner: crate::InstanceSpawner<CpuImpl>,
     ) -> Self {
         let waiter = socket.ready.waiter();
         Self {
@@ -764,13 +767,28 @@ where
             }
 
             if let Some((service, inner, ready, listener)) = start_accept {
-                this.spawner.spawn_detached(async move {
-                    let result = service.tcp_accept(listener, u64::MAX).await;
-                    let mut state = inner.lock();
-                    state.accept_in_progress = false;
-                    state.accept_result = Some(result);
-                    ready.notify_all();
+                let spawned = this.spawner.try_spawn_detached({
+                    let inner = inner.clone();
+                    async move {
+                        let result = service.tcp_accept(listener, u64::MAX).await;
+                        let mut state = inner.lock();
+                        state.accept_in_progress = false;
+                        state.accept_result = Some(result);
+                        ready.notify_all();
+                    }
                 });
+                if let Err(error) = spawned {
+                    inner.lock().accept_in_progress = false;
+                    tracing::warn!(
+                        target: "helios_kernel::program",
+                        %error,
+                        "refused a tcp accept task: the executor's instance share is full"
+                    );
+                    return Poll::Ready(Err(wasmtime::Error::new(P3TcpListenStreamError {
+                        operation: P3TcpListenStreamOperation::TaskCapacity,
+                        source: None,
+                    })));
+                }
                 wait_for_socket = true;
             }
 
@@ -1633,9 +1651,13 @@ where
     fn drop(&mut self, resource: Resource<TcpSocket>) -> Result<()> {
         let socket = self.table.delete(resource)?;
         if let Some((service, stream)) = socket.take_connected_stream() {
-            self.spawner().spawn_detached(async move {
+            // Closing is the instance's own work, so it is funded from
+            // the instance's share like everything else it asked for.
+            // A refusal traps this instance rather than leaving the
+            // kernel to carry a task it has no room for.
+            self.spawner().try_spawn_detached(async move {
                 service.tcp_close(stream).await;
-            });
+            })?;
         }
         Ok(())
     }
@@ -1895,20 +1917,32 @@ where
                 socket.ready.clone(),
             )
         };
-        spawner.spawn_detached(async move {
-            let result = service
-                .tcp_listen(
-                    local_address.address.network_address(),
-                    local_address.port,
-                    listen_backlog,
-                    hop_limit,
-                )
-                .await;
-            let mut state = inner.lock();
-            state.listen_in_progress = false;
-            state.listen_result = Some(result);
-            ready.notify_all();
+        let spawned = spawner.try_spawn_detached({
+            let inner = inner.clone();
+            async move {
+                let result = service
+                    .tcp_listen(
+                        local_address.address.network_address(),
+                        local_address.port,
+                        listen_backlog,
+                        hop_limit,
+                    )
+                    .await;
+                let mut state = inner.lock();
+                state.listen_in_progress = false;
+                state.listen_result = Some(result);
+                ready.notify_all();
+            }
         });
+        if let Err(error) = spawned {
+            inner.lock().listen_in_progress = false;
+            tracing::warn!(
+                target: "helios_kernel::program",
+                %error,
+                "refused a tcp listen task: the executor's instance share is full"
+            );
+            return Ok(Err(socket_types::ErrorCode::OutOfMemory));
+        }
         Ok(Ok(stream))
     }
 

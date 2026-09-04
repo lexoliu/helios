@@ -142,13 +142,14 @@ pub(super) struct ComponentPhase<'a> {
 }
 
 fn spawn_component_phase_heartbeat<CpuImpl>(
-    spawner: &crate::Spawner<CpuImpl>,
+    spawner: &crate::InstanceSpawner<CpuImpl>,
     cpu: &CpuImpl,
     timer: &crate::Timer<CpuImpl>,
     progress: &helios_hal::watchdog::ProgressCounter,
     write_serial: fn(&[u8]),
     phase: ComponentPhase<'_>,
-) where
+) -> Result<(), crate::TaskCapacityError>
+where
     CpuImpl: Cpu + Clone,
 {
     let ComponentPhase {
@@ -156,7 +157,7 @@ fn spawn_component_phase_heartbeat<CpuImpl>(
         started_at,
         done,
     } = phase;
-    spawner.spawn_detached({
+    spawner.try_spawn_detached({
         let done = done.clone();
         let cpu = cpu.clone();
         let timer = timer.clone();
@@ -184,7 +185,7 @@ fn spawn_component_phase_heartbeat<CpuImpl>(
                 }
             }
         }
-    });
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -1452,10 +1453,10 @@ where
     emit_stage_marker(write_serial, "instantiate:begin");
     tracing::info!(component = component_name, "instantiating system component");
     let instance_registry = debug_state.instance_registry();
-    let instance = instance_registry.register_with_cost(
+    let instance = instance_registry.register_with_policy(
         component_name,
         debug_state.uptime_nanos(cpu.now().ticks()),
-        crate::SYSTEM_COMPONENT_RESTART_COST,
+        crate::OomPolicy::SystemComponent,
     );
 
     let component_world = match world {
@@ -1464,7 +1465,10 @@ where
     };
     let instantiate_cpu = cpu.clone();
     let instantiate_timer = timer.clone();
-    let instantiate_spawner = spawner.clone();
+    // A system component is kernel infrastructure, so its tasks are
+    // funded from the arena's kernel reserve: user-mode load fills the
+    // instance share and stops there.
+    let instantiate_spawner = spawner.instance_spawner(crate::TaskFunding::Kernel);
 
     let context = ComponentExecContext::new(
         cpu,
@@ -1497,7 +1501,8 @@ where
             started_at: instantiate_started_at,
             done: &instantiate_done,
         },
-    );
+    )
+    .map_err(DebuggerError::TaskCapacity)?;
     let executor = executor.await;
     instantiate_done.store(true, Ordering::Release);
     let executor = executor.map_err(DebuggerError::InstantiateComponent)?;
@@ -4244,4 +4249,6 @@ enum DebuggerError {
     RunComponent(wasmtime::Error),
     #[error("debugger component returned a non-zero result")]
     GuestFailed,
+    #[error("the executor has no task capacity left for the debugger component: {0}")]
+    TaskCapacity(crate::TaskCapacityError),
 }

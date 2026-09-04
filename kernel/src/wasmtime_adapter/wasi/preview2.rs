@@ -2952,7 +2952,7 @@ where
     let read_socket = socket.clone();
     let read_cpu = store.cpu.clone();
     let read_runtime_state = store.runtime_state.clone();
-    store.spawner().spawn_detached(async move {
+    store.spawner().try_spawn_detached(async move {
         loop {
             let read_started = p2_kernel_profile_start(&read_runtime_state, &read_cpu);
             match read_socket.read(super::FILE_READ_CHUNK_BYTES as u32).await {
@@ -3021,10 +3021,10 @@ where
                 }
             }
         }
-    });
+    })?;
     let write_cpu = store.cpu.clone();
     let write_runtime_state = store.runtime_state.clone();
-    store.spawner().spawn_detached(async move {
+    store.spawner().try_spawn_detached(async move {
         while let Some(bytes) = network_reader.read().await {
             let started = write_cpu.now().ticks();
             if let Err(error) = socket.write_all_bytes(bytes).await {
@@ -3048,7 +3048,7 @@ where
                 started,
             );
         }
-    });
+    })?;
     p2_record_kernel_profile(&store.runtime_state, &store.cpu, "tcp-stream-pair", started);
     Ok((input, output))
 }
@@ -3131,30 +3131,47 @@ where
         };
         let profile_cpu = self.cpu.clone();
         let profile_runtime_state = self.runtime_state.clone();
-        self.spawner().spawn_detached(async move {
-            let started = profile_cpu.now().ticks();
-            let result = service
-                .tcp_connect_address(
-                    remote_address.address.network_address(),
-                    remote_address.port,
-                    local_port,
-                    hop_limit,
-                    u64::MAX,
-                )
-                .await;
-            p2_record_kernel_profile(&profile_runtime_state, &profile_cpu, "tcp-connect", started);
-            let mut state = inner.lock();
-            state.connect_in_progress = false;
-            state.connect_result = Some(match result {
-                Ok(stream) => {
-                    state.stream = Some(stream);
-                    state.remote_address = Some(remote_address);
-                    Ok(())
-                }
-                Err(error) => Err(error),
-            });
-            ready.notify_all();
+        let spawned = self.spawner().try_spawn_detached({
+            let inner = inner.clone();
+            async move {
+                let started = profile_cpu.now().ticks();
+                let result = service
+                    .tcp_connect_address(
+                        remote_address.address.network_address(),
+                        remote_address.port,
+                        local_port,
+                        hop_limit,
+                        u64::MAX,
+                    )
+                    .await;
+                p2_record_kernel_profile(
+                    &profile_runtime_state,
+                    &profile_cpu,
+                    "tcp-connect",
+                    started,
+                );
+                let mut state = inner.lock();
+                state.connect_in_progress = false;
+                state.connect_result = Some(match result {
+                    Ok(stream) => {
+                        state.stream = Some(stream);
+                        state.remote_address = Some(remote_address);
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
+                });
+                ready.notify_all();
+            }
         });
+        if let Err(error) = spawned {
+            inner.lock().connect_in_progress = false;
+            tracing::warn!(
+                target: "helios_kernel::program",
+                %error,
+                "refused a tcp connect task: the executor's instance share is full"
+            );
+            return Ok(Err(p2tcp::ErrorCode::OutOfMemory));
+        }
         Ok(Ok(()))
     }
 
@@ -3244,20 +3261,32 @@ where
                 state.hop_limit,
             )
         };
-        self.spawner().spawn_detached(async move {
-            let result = service
-                .tcp_listen(
-                    local_address.address.network_address(),
-                    local_address.port,
-                    listen_backlog,
-                    hop_limit,
-                )
-                .await;
-            let mut state = inner.lock();
-            state.listen_in_progress = false;
-            state.listen_result = Some(result);
-            ready.notify_all();
+        let spawned = self.spawner().try_spawn_detached({
+            let inner = inner.clone();
+            async move {
+                let result = service
+                    .tcp_listen(
+                        local_address.address.network_address(),
+                        local_address.port,
+                        listen_backlog,
+                        hop_limit,
+                    )
+                    .await;
+                let mut state = inner.lock();
+                state.listen_in_progress = false;
+                state.listen_result = Some(result);
+                ready.notify_all();
+            }
         });
+        if let Err(error) = spawned {
+            inner.lock().listen_in_progress = false;
+            tracing::warn!(
+                target: "helios_kernel::program",
+                %error,
+                "refused a tcp listen task: the executor's instance share is full"
+            );
+            return Ok(Err(p2tcp::ErrorCode::OutOfMemory));
+        }
         Ok(Ok(()))
     }
 
@@ -3353,13 +3382,25 @@ where
             let service = state.service.clone();
             let inner = socket.inner.clone();
             let ready = socket.ready.clone();
-            self.spawner().spawn_detached(async move {
-                let result = service.tcp_accept(listener, u64::MAX).await;
-                let mut state = inner.lock();
-                state.accept_in_progress = false;
-                state.accept_result = Some(result);
-                ready.notify_all();
+            let spawned = self.spawner().try_spawn_detached({
+                let inner = inner.clone();
+                async move {
+                    let result = service.tcp_accept(listener, u64::MAX).await;
+                    let mut state = inner.lock();
+                    state.accept_in_progress = false;
+                    state.accept_result = Some(result);
+                    ready.notify_all();
+                }
             });
+            if let Err(error) = spawned {
+                inner.lock().accept_in_progress = false;
+                tracing::warn!(
+                    target: "helios_kernel::program",
+                    %error,
+                    "refused a tcp accept task: the executor's instance share is full"
+                );
+                return Ok(Err(p2tcp::ErrorCode::OutOfMemory));
+            }
         }
         Ok(Err(p2tcp::ErrorCode::WouldBlock))
     }
@@ -3564,9 +3605,16 @@ where
                     Ok(value) => value,
                     Err(error) => return Ok(Err(map_p2_tcp_socket_error(error))),
                 };
-                self.spawner().spawn_detached(async move {
+                if let Err(error) = self.spawner().try_spawn_detached(async move {
                     let _ = service.tcp_shutdown_send(stream).await;
-                });
+                }) {
+                    tracing::warn!(
+                        target: "helios_kernel::program",
+                        %error,
+                        "refused a tcp shutdown task: the executor's instance share is full"
+                    );
+                    return Ok(Err(p2tcp::ErrorCode::OutOfMemory));
+                }
                 Ok(Ok(()))
             }
             p2tcp::ShutdownType::Both => {
@@ -3578,9 +3626,16 @@ where
                     Ok(value) => value,
                     Err(error) => return Ok(Err(map_p2_tcp_socket_error(error))),
                 };
-                self.spawner().spawn_detached(async move {
+                if let Err(error) = self.spawner().try_spawn_detached(async move {
                     let _ = service.tcp_shutdown_send(stream).await;
-                });
+                }) {
+                    tracing::warn!(
+                        target: "helios_kernel::program",
+                        %error,
+                        "refused a tcp shutdown task: the executor's instance share is full"
+                    );
+                    return Ok(Err(p2tcp::ErrorCode::OutOfMemory));
+                }
                 Ok(Ok(()))
             }
         }
@@ -3589,9 +3644,12 @@ where
     fn drop(&mut self, resource: Resource<TcpSocket>) -> Result<()> {
         let socket = self.table.delete(resource)?;
         if let Some((service, stream)) = socket.take_connected_stream() {
-            self.spawner().spawn_detached(async move {
+            // Closing is the instance's own work and is funded from its
+            // share; a refusal traps this instance instead of making the
+            // kernel carry a task it has no room for.
+            self.spawner().try_spawn_detached(async move {
                 service.tcp_close(stream).await;
-            });
+            })?;
         }
         Ok(())
     }
@@ -3640,9 +3698,16 @@ where
         };
         let stream = P2ResolveAddressStream::pending();
         let task_stream = stream.clone();
-        self.spawner().spawn_detached(async move {
+        if let Err(error) = self.spawner().try_spawn_detached(async move {
             task_stream.complete(service.dns_resolve(&name, u64::MAX).await);
-        });
+        }) {
+            tracing::warn!(
+                target: "helios_kernel::program",
+                %error,
+                "refused a dns resolve task: the executor's instance share is full"
+            );
+            return Ok(Err(p2lookup::ErrorCode::TemporaryResolverFailure));
+        }
         let resource = self.table.push(stream)?;
         Ok(Ok(resource))
     }

@@ -12,20 +12,44 @@ use triomphe::Arc;
 
 const INACTIVE_RESUME_AT: u64 = u64::MAX;
 
-/// Default OOM-killer cost score for plain user-mode programs.
-pub const DEFAULT_RESTART_COST: u32 = 1;
-/// Cost score for kernel plugins (e.g. compiler). Higher than user
-/// programs because restarting is expensive (plugin runtime cache
-/// rebuild, in-flight compile request loss), but finite so the OOM
-/// killer can still pick them when they are the dominant memory
-/// consumer.
-pub const PLUGIN_RESTART_COST: u32 = 100;
-/// Cost score for embedded system components (debugger). Highest of
-/// all, so the OOM killer only picks them when there is no other
-/// viable victim — an absolute last resort that nonetheless does
-/// terminate when memory pressure forces it, since system components
-/// are restartable.
-pub const SYSTEM_COMPONENT_RESTART_COST: u32 = 1_000_000;
+/// What the OOM killer is allowed to do with an instance.
+///
+/// The kernel's own components are not on the menu. A cost score, however
+/// high, only postpones the moment a user program's demand for memory
+/// condemns the debugger or the compiler — and losing one of those is
+/// fatal, so the ranking is between user-mode instances and the kernel's
+/// infrastructure is outside it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OomPolicy {
+    /// An ordinary user-mode program: the OOM killer's first choice,
+    /// ranked by the memory it holds.
+    UserProgram,
+    /// A kernel plugin (compiler, http client). Restartable, but
+    /// restarting costs a runtime cache rebuild and every in-flight
+    /// request, so it is picked only when it dominates memory.
+    KernelPlugin,
+    /// A component the kernel provisions and depends on. Never a
+    /// victim: user memory pressure must not be able to take down the
+    /// kernel's own services.
+    SystemComponent,
+}
+
+impl OomPolicy {
+    /// The weight a victim's memory is divided by when ranking, or
+    /// `None` when the instance is not a candidate at all.
+    pub const fn restart_cost(self) -> Option<u32> {
+        match self {
+            Self::UserProgram => Some(1),
+            Self::KernelPlugin => Some(100),
+            Self::SystemComponent => None,
+        }
+    }
+
+    /// Whether the OOM killer may condemn an instance under this policy.
+    pub const fn is_victim_candidate(self) -> bool {
+        self.restart_cost().is_some()
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct InstanceId(u64);
@@ -67,7 +91,7 @@ const fn decode_kill_flag(value: u8) -> Option<KillReason> {
 
 /// Snapshot of an OOM victim selected by [`InstanceRegistry::pick_oom_victim`].
 ///
-/// `score` is the ranking metric (`memory_bytes / restart_cost`) — the
+/// `score` is the ranking metric (`memory_bytes / restart cost`) — the
 /// higher the score, the more attractive the victim. Callers do not
 /// need to interpret it; it is exposed so the kernel can log victim
 /// selection decisions.
@@ -76,7 +100,7 @@ pub struct OomVictim {
     pub id: InstanceId,
     pub name: String,
     pub memory_bytes: u64,
-    pub restart_cost: u32,
+    pub policy: OomPolicy,
     pub score: u64,
 }
 
@@ -134,9 +158,8 @@ struct InstanceEntry {
     /// swap policy reads both to decide whether an instance has been
     /// idle long enough to evict.
     last_active_at: AtomicU64,
-    /// Cost weight for OOM victim selection. Higher = harder to kill.
-    /// See `DEFAULT_RESTART_COST` and friends.
-    restart_cost: u32,
+    /// What the OOM killer may do with this instance.
+    policy: OomPolicy,
     /// Set by the OOM killer / supervisor; checked on each call_hook
     /// transition. When set, the next host-call boundary returns
     /// `Killed { reason }` instead of resuming the guest.
@@ -172,18 +195,16 @@ impl InstanceRegistry {
     }
 
     pub fn register(&self, name: impl Into<String>, started_at: u64) -> RegisteredInstance {
-        self.register_with_cost(name, started_at, DEFAULT_RESTART_COST)
+        self.register_with_policy(name, started_at, OomPolicy::UserProgram)
     }
 
-    /// Register with an explicit OOM-killer restart cost. Callers that
-    /// run system components or kernel plugins use the higher
-    /// constants (`PLUGIN_RESTART_COST`, `SYSTEM_COMPONENT_RESTART_COST`)
-    /// so the OOM killer prefers cheaper victims.
-    pub fn register_with_cost(
+    /// Register under an explicit OOM policy. Kernel plugins and system
+    /// components say so here; everything else is a user program.
+    pub fn register_with_policy(
         &self,
         name: impl Into<String>,
         started_at: u64,
-        restart_cost: u32,
+        policy: OomPolicy,
     ) -> RegisteredInstance {
         let id = InstanceId(self.inner.next_id.fetch_add(1, Ordering::AcqRel));
         let entry = Box::new(InstanceEntry {
@@ -195,7 +216,7 @@ impl InstanceRegistry {
             active_depth: AtomicU32::new(0),
             last_resume_at: AtomicU64::new(INACTIVE_RESUME_AT),
             last_active_at: AtomicU64::new(started_at),
-            restart_cost,
+            policy,
             kill_flag: AtomicU8::new(KILL_FLAG_NONE),
             handle_count: AtomicUsize::new(1),
         });
@@ -208,10 +229,10 @@ impl InstanceRegistry {
         }
     }
 
-    /// Pick a victim instance using the standard `memory / restart_cost`
+    /// Pick a victim instance using the standard `memory / restart cost`
     /// heuristic: large memory consumers with low restart cost are
-    /// chosen first, system components last. Returns `None` when no
-    /// instance has any memory attributed to it.
+    /// chosen first, and system components never. Returns `None` when
+    /// no candidate instance has memory attributed to it.
     ///
     /// The caller must follow up with [`RegisteredInstance::request_kill`]
     /// or use the registry-level helper that does both.
@@ -227,8 +248,11 @@ impl InstanceRegistry {
                 // Already condemned; do not re-pick.
                 continue;
             }
-            let cost = entry.restart_cost.max(1) as u64;
-            let score = memory_bytes / cost;
+            // Kernel infrastructure is not a candidate at any score.
+            let Some(cost) = entry.policy.restart_cost() else {
+                continue;
+            };
+            let score = memory_bytes / u64::from(cost.max(1));
             match &best {
                 Some(current) if current.score >= score => {}
                 _ => {
@@ -236,7 +260,7 @@ impl InstanceRegistry {
                         id: entry.id,
                         name: entry.name.clone(),
                         memory_bytes,
-                        restart_cost: entry.restart_cost,
+                        policy: entry.policy,
                         score,
                     });
                 }
@@ -414,8 +438,8 @@ impl RegisteredInstance {
         self.entry().started_at
     }
 
-    pub fn restart_cost(&self) -> u32 {
-        self.entry().restart_cost
+    pub fn oom_policy(&self) -> OomPolicy {
+        self.entry().policy
     }
 
     pub fn memory_bytes(&self) -> u64 {

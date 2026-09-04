@@ -224,6 +224,14 @@ where
             ComponentWorld::System => ComponentBindingSet::System,
             ComponentWorld::Program => ComponentBindingSet::Program,
         };
+        // A system component is kernel infrastructure — the kernel
+        // provisions it, depends on it, and cannot carry on without it
+        // — so its tasks are funded from the arena's kernel reserve
+        // rather than from the share user-mode instances compete for.
+        let funding = match world {
+            ComponentWorld::System => crate::TaskFunding::Kernel,
+            ComponentWorld::Program => crate::TaskFunding::Instance,
+        };
 
         let linker = component_linker(&engine.engine, binding_set, &compiled.component)?;
 
@@ -241,7 +249,7 @@ where
                 wasmtime::component::ResourceTable::new(),
                 context.cpu,
                 context.timer,
-                context.spawner,
+                context.spawner.instance_spawner(funding),
                 context.runtime_state,
                 context.instance_registry,
                 context.instance,
