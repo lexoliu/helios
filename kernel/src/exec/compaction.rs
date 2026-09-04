@@ -20,7 +20,7 @@
 //! The `CompactionPolicy` trait selects ranges to relocate. The
 //! default `LargestUserRange` policy targets the largest committed
 //! sub-range owned by the highest-memory non-system instance,
-//! mirroring the OOM killer's "memory / restart_cost" weighting.
+//! mirroring the OOM killer's "memory / restart cost" weighting.
 //! Real workloads can swap in alternative policies without touching
 //! the dispatch loop.
 

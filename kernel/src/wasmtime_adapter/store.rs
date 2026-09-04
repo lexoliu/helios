@@ -165,7 +165,7 @@ where
             victim_id = ?victim.id,
             victim_name = %victim.name,
             victim_memory_bytes = victim.memory_bytes,
-            victim_restart_cost = victim.restart_cost,
+            victim_policy = ?victim.policy,
             score = victim.score,
             killed,
             "OOM killer condemned victim to free user memory"

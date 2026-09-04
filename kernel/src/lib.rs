@@ -67,16 +67,16 @@ pub use embedded::{
 pub use exec::{
     CompactionBudget, CompactionPolicy, CompactionReport, CompactionTarget, Compactor,
     DEFAULT_PERF_METRIC_CAPACITY, DEFAULT_PROFILE_STACK_CAPACITY, DEFAULT_TRACE_HISTORY_CAPACITY,
-    Executor, ExecutorRunStats, FoldedProfileSample, JoinHandle, KernelClock, LocalJoinHandle,
-    Mutex, MutexGuard, Notified, Notify, NotifyWaiter, OwnedRawMutexLease, OwnedRawRwLockReadLease,
-    OwnedRawRwLockWriteLease, PerfMetricFilter, PerfMetricHistory, PerfMetricSample, PerfSample,
-    PressureLevel, ProfileFilter, ProfileHistory, ProfileScope, ProgressChanged, ProgressMark,
-    ProgressSignal, RawMutex, RawMutexLease, RawRwLock, RawRwLockReadLease, RawRwLockWriteLease,
-    RwLock, RwLockReadGuard, RwLockWriteGuard, Sleep, Spawner, StatsSample, Timer, TraceEvent,
-    TraceField, TraceFilter, TraceHistory, TraceLevel, TraceValue, YieldNow, duration_to_ticks,
-    elapsed_millis, matches_perf_metric_filter, matches_profile_filter, matches_trace_filter,
-    monotonic_nanos, nanos_to_ticks_ceil_saturating, parse_console_text, wall_clock_offset_nanos,
-    yield_now,
+    Executor, ExecutorRunStats, FoldedProfileSample, InstanceSpawner, JoinHandle, KernelClock,
+    LocalJoinHandle, Mutex, MutexGuard, Notified, Notify, NotifyWaiter, OwnedRawMutexLease,
+    OwnedRawRwLockReadLease, OwnedRawRwLockWriteLease, PerfMetricFilter, PerfMetricHistory,
+    PerfMetricSample, PerfSample, PressureLevel, ProfileFilter, ProfileHistory, ProfileScope,
+    ProgressChanged, ProgressMark, ProgressSignal, RawMutex, RawMutexLease, RawRwLock,
+    RawRwLockReadLease, RawRwLockWriteLease, RwLock, RwLockReadGuard, RwLockWriteGuard, Sleep,
+    Spawner, StatsSample, TaskCapacityError, TaskFunding, Timer, TraceEvent, TraceField,
+    TraceFilter, TraceHistory, TraceLevel, TraceValue, YieldNow, duration_to_ticks, elapsed_millis,
+    matches_perf_metric_filter, matches_profile_filter, matches_trace_filter, monotonic_nanos,
+    nanos_to_ticks_ceil_saturating, parse_console_text, wall_clock_offset_nanos, yield_now,
 };
 pub use helios_hal::Platform;
 pub use helios_netstack::{
@@ -89,10 +89,9 @@ pub use host_fs::{
     HostFsTransport, UnsupportedHostFileSystem, guest_host_share_path,
 };
 pub use instance::{
-    DEFAULT_RESTART_COST, InstanceExecutionTransition, InstanceId, InstanceProfileTotal,
-    InstanceRegistry, InstanceSnapshot, KillReason, OomVictim, PLUGIN_RESTART_COST,
-    RegisteredInstance, SYSTEM_COMPONENT_RESTART_COST, allow_instance_resource_growth,
-    record_instance_transition,
+    InstanceExecutionTransition, InstanceId, InstanceProfileTotal, InstanceRegistry,
+    InstanceSnapshot, KillReason, OomPolicy, OomVictim, RegisteredInstance,
+    allow_instance_resource_growth, record_instance_transition,
 };
 pub use io::{
     BlockInstallError, BlockSelfCheckError, BlockService, BlockStats, ByteReadWait, ByteReader,

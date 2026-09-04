@@ -250,7 +250,7 @@ where
     pub table: ResourceTableImpl,
     pub cpu: CpuImpl,
     timer: Timer<CpuImpl>,
-    spawner: crate::Spawner<CpuImpl>,
+    spawner: crate::InstanceSpawner<CpuImpl>,
     pub runtime_state: RuntimeStateImpl,
     pub instance_registry: InstanceRegistry,
     entropy: EntropyPool,
@@ -310,7 +310,7 @@ where
         table: ResourceTableImpl,
         cpu: CpuImpl,
         timer: Timer<CpuImpl>,
-        spawner: crate::Spawner<CpuImpl>,
+        spawner: crate::InstanceSpawner<CpuImpl>,
         runtime_state: RuntimeStateImpl,
         instance_registry: InstanceRegistry,
         instance: RegisteredInstance,
@@ -420,7 +420,7 @@ where
         self.timer.sleep_for(duration)
     }
 
-    pub fn spawner(&self) -> &crate::Spawner<CpuImpl> {
+    pub fn spawner(&self) -> &crate::InstanceSpawner<CpuImpl> {
         &self.spawner
     }
 

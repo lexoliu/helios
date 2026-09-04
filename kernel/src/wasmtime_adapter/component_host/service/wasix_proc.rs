@@ -1574,7 +1574,7 @@ where
     let signal_state = caller.data().signal_state.clone();
     let generation = signal_state.next_interval_generation();
     let timer = caller.data().timer();
-    caller.data().spawner.spawn_detached(async move {
+    if let Err(error) = caller.data().spawner.try_spawn_detached(async move {
         loop {
             timer.sleep_for(Duration::from_nanos(interval)).await;
             if !signal_state.interval_generation_is_current(generation) {
@@ -1585,7 +1585,14 @@ where
                 break;
             }
         }
-    });
+    }) {
+        tracing::warn!(
+            target: "helios_kernel::program",
+            %error,
+            "refused a signal interval timer: the executor's instance share is full"
+        );
+        return p1::errno::NOMEM;
+    }
     p1::errno::SUCCESS
 }
 

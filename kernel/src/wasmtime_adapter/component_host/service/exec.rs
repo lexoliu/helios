@@ -185,7 +185,7 @@ pub(super) async fn run_program_executable<CpuImpl, HostFs>(
     descriptors: Option<Preview1DescriptorTable>,
     signal_state: WasixSignalState,
     signal_dispositions: Vec<WasixSignalDisposition>,
-    spawner: crate::Spawner<CpuImpl>,
+    spawner: crate::InstanceSpawner<CpuImpl>,
     progress: helios_hal::watchdog::ProgressCounter,
     executable: ProgramExecutable<CpuImpl, HostFs>,
     engine: &crate::wasmtime_adapter::WasmtimeEngine,
@@ -277,7 +277,7 @@ pub(super) async fn run_program_core_module<CpuImpl, HostFs>(
     descriptors: Option<Preview1DescriptorTable>,
     signal_state: WasixSignalState,
     signal_dispositions: Vec<WasixSignalDisposition>,
-    spawner: crate::Spawner<CpuImpl>,
+    spawner: crate::InstanceSpawner<CpuImpl>,
     progress: helios_hal::watchdog::ProgressCounter,
     compiled: Arc<WasmtimeCompiledCoreModule>,
     engine: &crate::wasmtime_adapter::WasmtimeEngine,
@@ -307,7 +307,7 @@ where
         output_mode: output_mode.clone(),
         core_linker: preview1_core_linker.clone(),
     });
-    let recycle_spawner = exec_context.spawner.clone();
+    let recycle_spawner = spawner.clone();
     let shared_memory_prepare_profile =
         start_program_kernel_profile(&profile_runtime_state, &profile_cpu);
     let imported_memory_spec = imported_shared_memory_spec_with_user_budget(&compiled.module)?;
@@ -331,7 +331,7 @@ where
             Preview1ProgramStore::<CpuImpl, HostFs>::new(
                 exec_context.cpu,
                 exec_context.timer,
-                exec_context.spawner.clone(),
+                spawner.clone(),
                 exec_context.runtime_state,
                 launched_instance,
                 exec_context.parent_instance_id,
@@ -483,7 +483,8 @@ where
                 started_at: run_started_at,
                 done: &run_done,
             },
-        );
+        )
+        .map_err(map_task_capacity_error)?;
         super::emit_program_stage_marker(exec_context.write_serial, "program:run-core-begin");
         let run_phase_started = profile_cpu.now().ticks();
         let result = loop {
@@ -538,7 +539,7 @@ where
     record_program_kernel_profile_sample(store_teardown_profile, "core-store-teardown");
 
     if recycle_allowed && let (Some(spec), Some(memory)) = (imported_memory_spec, recycle_memory) {
-        spawn_scrubbed_recycle(&recycle_spawner, shared_memory_pool.clone(), spec, memory);
+        spawn_scrubbed_recycle(&recycle_spawner, shared_memory_pool.clone(), spec, memory).await;
     }
     match completion {
         CoreModuleRunCompletion::Exit(result) => result,
@@ -578,7 +579,7 @@ pub(super) async fn run_program_core_module_with_restore<CpuImpl, HostFs>(
     authority: ProcessAuthority,
     filesystem: Option<DebugFileSystemSnapshot>,
     signal_state: WasixSignalState,
-    spawner: crate::Spawner<CpuImpl>,
+    spawner: crate::InstanceSpawner<CpuImpl>,
     progress: helios_hal::watchdog::ProgressCounter,
     compiled: Arc<WasmtimeCompiledCoreModule>,
     restore: Box<CoreModuleRestore>,
@@ -621,7 +622,7 @@ where
             Preview1ProgramStore::<CpuImpl, HostFs>::new(
                 exec_context.cpu,
                 exec_context.timer,
-                exec_context.spawner.clone(),
+                spawner.clone(),
                 exec_context.runtime_state,
                 launched_instance,
                 exec_context.parent_instance_id,
@@ -708,7 +709,8 @@ where
                 started_at: run_started_at,
                 done: &run_done,
             },
-        );
+        )
+        .map_err(map_task_capacity_error)?;
         super::emit_program_stage_marker(exec_context.write_serial, "program:run-core-begin");
         let run_phase_started = profile_cpu.now().ticks();
         let result = loop {
@@ -768,7 +770,8 @@ where
             shared_memory_pool.clone(),
             memory_spec,
             recycle_memory,
-        );
+        )
+        .await;
     }
     match completion {
         CoreModuleRunCompletion::Exit(result) => result,
@@ -808,7 +811,7 @@ pub(super) async fn run_program_component<CpuImpl, HostFs>(
     authority: ProcessAuthority,
     filesystem: Option<DebugFileSystemSnapshot>,
     _signal_state: WasixSignalState,
-    spawner: crate::Spawner<CpuImpl>,
+    spawner: crate::InstanceSpawner<CpuImpl>,
     progress: helios_hal::watchdog::ProgressCounter,
     instance_pre: Arc<ComponentInstancePre<StoreData<CpuImpl, HostFs>>>,
     engine: &crate::wasmtime_adapter::WasmtimeEngine,
@@ -850,7 +853,7 @@ where
             wasmtime::component::ResourceTable::new(),
             exec_context.cpu,
             exec_context.timer,
-            exec_context.spawner.clone(),
+            spawner.clone(),
             exec_context.runtime_state.clone(),
             exec_context.instance_registry,
             launched_instance,
@@ -927,7 +930,8 @@ where
             started_at: run_started_at,
             done: &run_done,
         },
-    );
+    )
+    .map_err(map_task_capacity_error)?;
     super::emit_program_stage_marker(exec_context.write_serial, "program:run-begin");
     let run_phase_started = profile_cpu.now().ticks();
     let result = executor.run().await;
@@ -1716,6 +1720,22 @@ fn caused_by_out_of_memory(error: &wasmtime::Error) -> bool {
     error
         .chain()
         .any(|cause| cause.is::<crate::ProgramOutOfMemory>())
+}
+
+/// A task the executor refused to place for this instance.
+///
+/// The instance asked for more executor capacity than the machine has
+/// left for user-mode work; it takes the failure, the kernel does not.
+pub(super) fn map_task_capacity_error(error: crate::TaskCapacityError) -> ProgramExecError {
+    tracing::warn!(
+        target: "helios_kernel::program",
+        %error,
+        "refused an instance task: the executor's instance share is full"
+    );
+    ProgramExecError {
+        kind: ProgramExecErrorKind::OutOfMemory,
+        detail: ProgramExecErrorDetail::ExecutorTaskCapacityExhausted,
+    }
 }
 
 pub(super) fn map_program_runtime_error(error: wasmtime::Error) -> ProgramExecError {
