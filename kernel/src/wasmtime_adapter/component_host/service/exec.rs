@@ -368,7 +368,10 @@ where
                 "program:instantiate-core-begin",
             );
             let instantiate_started = profile_cpu.now().ticks();
-            let instance = linker.instantiate_async(&mut store, &compiled.module).await;
+            let instance = {
+                let _owner = own_committed_memory(&profile_cpu, instance_id);
+                linker.instantiate_async(&mut store, &compiled.module).await
+            };
             record_named_program_kernel_profile(
                 &profile_runtime_state,
                 &profile_cpu,
@@ -436,7 +439,10 @@ where
                 "program:instantiate-core-begin",
             );
             let instantiate_started = profile_cpu.now().ticks();
-            let instance = instance_pre.instantiate_async(&mut store).await;
+            let instance = {
+                let _owner = own_committed_memory(&profile_cpu, instance_id);
+                instance_pre.instantiate_async(&mut store).await
+            };
             record_named_program_kernel_profile(
                 &profile_runtime_state,
                 &profile_cpu,
@@ -656,7 +662,10 @@ where
             "program:instantiate-core-begin",
         );
         let instantiate_started = profile_cpu.now().ticks();
-        let instance = linker.instantiate_async(&mut store, &compiled.module).await;
+        let instance = {
+            let _owner = own_committed_memory(&profile_cpu, instance_id);
+            linker.instantiate_async(&mut store, &compiled.module).await
+        };
         record_named_program_kernel_profile(
             &profile_runtime_state,
             &profile_cpu,
@@ -813,6 +822,8 @@ where
 {
     use crate::ComponentExecutor;
 
+    let instance_id = launched_instance.id();
+
     let argv = argv.into_vec();
     let run_started_at = monotonic_nanos(&exec_context.cpu);
     let run_cpu = exec_context.cpu.clone();
@@ -864,7 +875,10 @@ where
     let instantiate_instance_started = profile_runtime_state
         .profiling_enabled()
         .then(|| profile_cpu.now().ticks());
-    let instance = instance_pre.instantiate_async(&mut store).await;
+    let instance = {
+        let _owner = own_committed_memory(&profile_cpu, instance_id);
+        instance_pre.instantiate_async(&mut store).await
+    };
     if let Some(instantiate_instance_started) = instantiate_instance_started {
         record_program_kernel_profile(
             &profile_runtime_state,
@@ -1757,4 +1771,27 @@ pub(super) fn trusted_signed_payload(bytes: &Bytes) -> Result<Bytes, ProgramExec
     let trusted = cwasm::verify_signed_artifact(UntrustedCwasm::new(bytes))
         .map_err(map_artifact_trust_error)?;
     Ok(bytes.slice(..trusted.payload().len()))
+}
+
+/// Charges the linear memory an instantiation commits to the instance
+/// being instantiated.
+///
+/// Instantiation is where an instance's memory actually appears — the
+/// pooling allocator makes its slot accessible here, long before any
+/// guest code runs and therefore before any call hook can name an
+/// owner. The scope is held across the `.await` on purpose: this task
+/// is pinned to its processor, and instantiation is the only thing it
+/// is doing. Work that another task interleaves on the same processor
+/// in that window is charged here too, which costs the swap policy some
+/// precision in choosing a victim and costs correctness nothing — the
+/// pages, their flags and their tokens are the address space's, not the
+/// owner tag's.
+fn own_committed_memory<CpuImpl: Cpu>(
+    cpu: &CpuImpl,
+    instance: crate::InstanceId,
+) -> crate::UserMemoryOwnerScope<'static> {
+    crate::enter_user_memory_owner(
+        cpu.current_processor(),
+        crate::MemoryOwner::new(instance.raw()),
+    )
 }

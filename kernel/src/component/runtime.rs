@@ -12,6 +12,8 @@ use crate::{
     nanos_to_ticks_ceil_saturating, record_instance_transition,
 };
 use helios_hal::cpu::{Cpu, Instant};
+
+use crate::memory::{MemoryOwner, set_user_memory_owner};
 use thiserror::Error;
 
 /// Error returned through the runtime call hook when a kill was
@@ -543,9 +545,21 @@ where
         bytes
     }
 
+    /// Names the instance whose guest code is about to run on this
+    /// processor, so pages the runtime commits while it runs — a
+    /// `memory.grow`, most of all — are charged to it.
+    ///
+    /// This names the processor's current work, not a scope: the call
+    /// hooks fire on entering and leaving guest code, and nothing there
+    /// can own a guard. Between a resume and its matching pause this
+    /// processor is executing that instance's wasm, so anything it
+    /// commits is that instance's. Nested resumes keep the name in place
+    /// until the outermost pause, which is why only the transition that
+    /// actually stopped the instance clears it.
     pub fn record_transition(&mut self, transition: InstanceExecutionTransition) {
         let now_nanos = self.now_nanos();
         let elapsed = record_instance_transition(self.instance(), transition, now_nanos);
+        name_user_memory_owner(&self.cpu, self.instance(), transition, elapsed.is_some());
         if let Some(elapsed) = elapsed
             && self.runtime_state.profiling_enabled()
         {
@@ -628,3 +642,19 @@ pub async fn wait_until_runtime_deadline<CpuImpl, RuntimeStateImpl>(
 }
 
 // Runtime-adapter trait impls live in the concrete adapter module.
+
+/// Charges pages committed on this processor to `instance` while its
+/// guest code runs, and to nobody once it stops.
+fn name_user_memory_owner<CpuImpl: Cpu>(
+    cpu: &CpuImpl,
+    instance: &crate::RegisteredInstance,
+    transition: InstanceExecutionTransition,
+    stopped: bool,
+) {
+    let owner = match transition {
+        InstanceExecutionTransition::Resume => MemoryOwner::new(instance.id().raw()),
+        InstanceExecutionTransition::Pause if stopped => MemoryOwner::NONE,
+        InstanceExecutionTransition::Pause => return,
+    };
+    set_user_memory_owner(cpu.current_processor(), owner);
+}

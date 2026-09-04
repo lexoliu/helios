@@ -92,6 +92,25 @@ interface stats {
     reported-bytes: u64,
   }
 
+  /// Guest pages the kernel has moved out of memory, and what it cost
+  /// to bring them back.
+  record swap {
+    /// What the pages are written to.
+    backend: string,
+    /// Bytes that store can hold.
+    capacity-bytes: u64,
+    /// Bytes of it currently holding pages.
+    used-bytes: u64,
+    /// Pages written out since boot.
+    pages-out: u64,
+    /// Pages read back in since boot.
+    pages-in: u64,
+    /// Guest faults resolved by reading a page back.
+    faults-served: u64,
+    /// Mean time a faulting guest waited, over every fault served.
+    mean-fault-latency: mono-nanos,
+  }
+
   /// How the in-kernel 9p client's caches have served the host share
   /// since boot. The share is not exclusive, so every table is bounded
   /// in entries and in time; these counters say how much of that budget
@@ -158,6 +177,10 @@ interface stats {
     iommu: option<iommu>,
     /// Absent on a machine that gave the kernel no memory balloon.
     balloon: option<memory-balloon>,
+    /// Absent on a machine with no swap: one whose address space cannot
+    /// fault a swapped-out page back in, or that has no disk to write
+    /// pages to.
+    swap: option<swap>,
     /// Absent on a machine with no host share, or one whose host
     /// filesystem is reached without a 9p session in front of it.
     host-share: option<host-share-cache>,

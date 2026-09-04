@@ -62,6 +62,9 @@ struct RuntimeStateInner<ProgramService, NetworkService, HostFsService> {
     /// The memory balloon the host resizes this guest through. Empty on
     /// a machine that gave the kernel none.
     balloon: Once<BalloonHandle>,
+    /// Swap, once a backend with a lazy-commit address space and a disk
+    /// to write to has brought it up. Empty everywhere else.
+    swap: Once<crate::SwapHandle>,
     /// The machine's link to its host, once a backend brought a vsock
     /// device up. Empty on a machine with no vsock device, where the
     /// runtime adapter answers `unavailable` rather than trapping.
@@ -365,6 +368,7 @@ where
                 block_service: Once::new(),
                 iommu_report: Once::new(),
                 balloon: Once::new(),
+                swap: Once::new(),
                 vsock_service: Once::new(),
                 futex_table: Mutex::new(FutexTable::new()),
                 bootfs: Mutex::new(embedded_init().map(|init| init.bootfs())),
@@ -823,6 +827,16 @@ where
         assert!(installed, "memory balloon was installed more than once");
     }
 
+    /// Publishes swap, once a backend has brought it up.
+    pub fn install_swap(&self, swap: crate::SwapHandle) {
+        let mut installed = false;
+        self.inner.swap.call_once(|| {
+            installed = true;
+            swap
+        });
+        assert!(installed, "swap was installed more than once");
+    }
+
     /// Publishes the machine's vsock link.
     ///
     /// Called from the backend that brought the device up, before any
@@ -893,6 +907,7 @@ where
                 .get()
                 .map(|report| report.snapshot()),
             balloon: self.inner.balloon.get().map(BalloonHandle::stats),
+            swap: self.inner.swap.get().map(crate::SwapHandle::stats),
             host_share: self
                 .host_fs_service()
                 .and_then(|service| service.cache_stats()),

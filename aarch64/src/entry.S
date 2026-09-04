@@ -53,24 +53,159 @@ __helios_aarch64_exception_vectors:
     .balign 128
     b __helios_aarch64_sync_exception
 
+// Synchronous exception entry. Like the IRQ entry this runs on the
+// per-processor stack in SP_EL0, leaving the interrupted SP_EL1 intact,
+// and it saves the complete interrupted context: x0-x30, ELR, SPSR, the
+// interrupted SP, and the whole FP/SIMD file. Wasm traps still end in a
+// panic inside the handler, but a fault on a swapped-out page is
+// redirected: the handler rewrites the frame to enter the kernel's swap
+// trampoline on the faulting stack, and the epilogue below erets into
+// it. Nothing here can assume it never returns.
 __helios_aarch64_sync_exception:
-    mrs x4, tpidr_el1
-    cbz x4, 2f
-    add sp, x4, #{exception_stack_bytes}
-    b 3f
-2:
-    adrp x4, __helios_aarch64_boot_exception_stack_top
-    add x4, x4, :lo12:__helios_aarch64_boot_exception_stack_top
-    mov sp, x4
-3:
+    msr spsel, #0
+    sub sp, sp, #{sync_frame_bytes}
+    stp x0, x1, [sp, #0x00]
+    stp x2, x3, [sp, #0x10]
+    stp x4, x5, [sp, #0x20]
+    stp x6, x7, [sp, #0x30]
+    stp x8, x9, [sp, #0x40]
+    stp x10, x11, [sp, #0x50]
+    stp x12, x13, [sp, #0x60]
+    stp x14, x15, [sp, #0x70]
+    stp x16, x17, [sp, #0x80]
+    stp x18, x19, [sp, #0x90]
+    stp x20, x21, [sp, #0xa0]
+    stp x22, x23, [sp, #0xb0]
+    stp x24, x25, [sp, #0xc0]
+    stp x26, x27, [sp, #0xd0]
+    stp x28, x29, [sp, #0xe0]
+    mrs x0, elr_el1
+    mrs x1, spsr_el1
+    stp x30, x0, [sp, #0xf0]
+    str x1, [sp, #0x100]
+    msr spsel, #1
+    mov x0, sp
+    msr spsel, #0
+    str x0, [sp, #0x108]
+    stp q0, q1, [sp, #0x120]
+    stp q2, q3, [sp, #0x140]
+    stp q4, q5, [sp, #0x160]
+    stp q6, q7, [sp, #0x180]
+    stp q8, q9, [sp, #0x1a0]
+    stp q10, q11, [sp, #0x1c0]
+    stp q12, q13, [sp, #0x1e0]
+    stp q14, q15, [sp, #0x200]
+    stp q16, q17, [sp, #0x220]
+    stp q18, q19, [sp, #0x240]
+    stp q20, q21, [sp, #0x260]
+    stp q22, q23, [sp, #0x280]
+    stp q24, q25, [sp, #0x2a0]
+    stp q26, q27, [sp, #0x2c0]
+    stp q28, q29, [sp, #0x2e0]
+    stp q30, q31, [sp, #0x300]
+    mrs x0, fpsr
+    mrs x1, fpcr
+    stp x0, x1, [sp, #0x110]
     mrs x0, esr_el1
-    mrs x1, elr_el1
-    mov x2, x29
-    mrs x3, far_el1
+    mrs x1, far_el1
+    mov x2, sp
     bl aarch64_handle_sync_exception
-1:
-    wfi
-    b 1b
+    ldp x0, x1, [sp, #0x110]
+    msr fpsr, x0
+    msr fpcr, x1
+    ldp q0, q1, [sp, #0x120]
+    ldp q2, q3, [sp, #0x140]
+    ldp q4, q5, [sp, #0x160]
+    ldp q6, q7, [sp, #0x180]
+    ldp q8, q9, [sp, #0x1a0]
+    ldp q10, q11, [sp, #0x1c0]
+    ldp q12, q13, [sp, #0x1e0]
+    ldp q14, q15, [sp, #0x200]
+    ldp q16, q17, [sp, #0x220]
+    ldp q18, q19, [sp, #0x240]
+    ldp q20, q21, [sp, #0x260]
+    ldp q22, q23, [sp, #0x280]
+    ldp q24, q25, [sp, #0x2a0]
+    ldp q26, q27, [sp, #0x2c0]
+    ldp q28, q29, [sp, #0x2e0]
+    ldp q30, q31, [sp, #0x300]
+    ldr x0, [sp, #0x108]
+    msr spsel, #1
+    mov sp, x0
+    msr spsel, #0
+    ldr x1, [sp, #0x100]
+    ldp x30, x0, [sp, #0xf0]
+    msr elr_el1, x0
+    msr spsr_el1, x1
+    ldp x28, x29, [sp, #0xe0]
+    ldp x26, x27, [sp, #0xd0]
+    ldp x24, x25, [sp, #0xc0]
+    ldp x22, x23, [sp, #0xb0]
+    ldp x20, x21, [sp, #0xa0]
+    ldp x18, x19, [sp, #0x90]
+    ldp x16, x17, [sp, #0x80]
+    ldp x14, x15, [sp, #0x70]
+    ldp x12, x13, [sp, #0x60]
+    ldp x10, x11, [sp, #0x50]
+    ldp x8, x9, [sp, #0x40]
+    ldp x6, x7, [sp, #0x30]
+    ldp x4, x5, [sp, #0x20]
+    ldp x2, x3, [sp, #0x10]
+    ldp x0, x1, [sp, #0x00]
+    add sp, sp, #{sync_frame_bytes}
+    msr spsel, #1
+    eret
+
+// Returns to a context saved by the entry above, from kernel code
+// running on the stack that context was interrupted on. The frame sits
+// exactly one frame below the interrupted SP, so restoring it is the
+// same epilogue as above with SP already selected.
+.global __helios_aarch64_swap_fault_resume
+.type __helios_aarch64_swap_fault_resume, %function
+__helios_aarch64_swap_fault_resume:
+    msr daifset, #0x2
+    mov sp, x0
+    ldp x0, x1, [sp, #0x110]
+    msr fpsr, x0
+    msr fpcr, x1
+    ldp q0, q1, [sp, #0x120]
+    ldp q2, q3, [sp, #0x140]
+    ldp q4, q5, [sp, #0x160]
+    ldp q6, q7, [sp, #0x180]
+    ldp q8, q9, [sp, #0x1a0]
+    ldp q10, q11, [sp, #0x1c0]
+    ldp q12, q13, [sp, #0x1e0]
+    ldp q14, q15, [sp, #0x200]
+    ldp q16, q17, [sp, #0x220]
+    ldp q18, q19, [sp, #0x240]
+    ldp q20, q21, [sp, #0x260]
+    ldp q22, q23, [sp, #0x280]
+    ldp q24, q25, [sp, #0x2a0]
+    ldp q26, q27, [sp, #0x2c0]
+    ldp q28, q29, [sp, #0x2e0]
+    ldp q30, q31, [sp, #0x300]
+    ldr x1, [sp, #0x100]
+    ldp x30, x0, [sp, #0xf0]
+    msr elr_el1, x0
+    msr spsr_el1, x1
+    ldp x28, x29, [sp, #0xe0]
+    ldp x26, x27, [sp, #0xd0]
+    ldp x24, x25, [sp, #0xc0]
+    ldp x22, x23, [sp, #0xb0]
+    ldp x20, x21, [sp, #0xa0]
+    ldp x18, x19, [sp, #0x90]
+    ldp x16, x17, [sp, #0x80]
+    ldp x14, x15, [sp, #0x70]
+    ldp x12, x13, [sp, #0x60]
+    ldp x10, x11, [sp, #0x50]
+    ldp x8, x9, [sp, #0x40]
+    ldp x6, x7, [sp, #0x30]
+    ldp x4, x5, [sp, #0x20]
+    ldp x2, x3, [sp, #0x10]
+    ldp x0, x1, [sp, #0x00]
+    add sp, sp, #{sync_frame_bytes}
+    eret
+.size __helios_aarch64_swap_fault_resume, . - __helios_aarch64_swap_fault_resume
 
 // IRQ entry. The interrupted context keeps SP_EL1 untouched: selecting
 // SP_EL0 switches to the per-processor exception stack that

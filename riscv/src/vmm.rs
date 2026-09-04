@@ -56,7 +56,7 @@ use helios_kernel::runtime_memory::{
     default_memory_image_new, default_page_size,
 };
 use helios_kernel::{
-    ReservationLookup, ReservationTracker, VaCursor, allocate_user_frame_zeroed_on,
+    MemoryOwner, ReservationLookup, ReservationTracker, VaCursor, allocate_user_frame_zeroed_on,
     deallocate_user_frame_on, validate_range,
 };
 use spin::{Mutex, Once};
@@ -484,8 +484,12 @@ impl AddressSpace for RiscvUserAddressSpace {
     }
 
     fn release(&self, virt: VirtRange) -> Result<(), AddressSpaceError> {
-        let committed = self.state.lock().release(virt)?;
-        for region in &committed {
+        let released = self.state.lock().release(virt)?;
+        // This backend commits eagerly and has no swap, so a released
+        // reservation never holds a swap token; the assertion keeps that
+        // true if swap ever reaches this architecture (#59).
+        debug_assert!(released.swapped.is_empty());
+        for region in &released.committed {
             for offset in (0..region.range.byte_len).step_by(PAGE_SIZE) {
                 if let Ok(entry) = self.unmap_4k(region.range.start.raw() + offset) {
                     let phys = ((entry >> PTE_PPN_SHIFT) << PAGE_SHIFT) as usize;
@@ -520,13 +524,15 @@ impl AddressSpace for RiscvUserAddressSpace {
             }
         }
 
-        self.state.lock().record_commit(virt, flags)?;
+        self.state
+            .lock()
+            .record_commit(virt, flags, MemoryOwner::NONE)?;
         Ok(())
     }
 
     fn decommit(&self, virt: VirtRange) -> Result<(), AddressSpaceError> {
         validate_range(virt)?;
-        self.state.lock().record_decommit(virt)?;
+        let _ = self.state.lock().record_decommit(virt)?;
         for offset in (0..virt.byte_len).step_by(PAGE_SIZE) {
             let entry = self.unmap_4k(virt.start.raw() + offset)?;
             let phys = ((entry >> PTE_PPN_SHIFT) << PAGE_SHIFT) as usize;

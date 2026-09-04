@@ -3871,6 +3871,25 @@ macro_rules! convert_balloon_stats {
     };
 }
 
+/// Maps the kernel's swap snapshot onto one binding set's `swap`
+/// record, for the same reason [`convert_block_stats`] exists.
+macro_rules! convert_swap_stats {
+    ($bindings:path, $swap:expr) => {
+        $swap.map(|swap: crate::SwapStats| {
+            use $bindings as stats_bindings;
+            stats_bindings::Swap {
+                backend: alloc::string::String::from(swap.backend),
+                capacity_bytes: swap.capacity_bytes,
+                used_bytes: swap.used_bytes,
+                pages_out: swap.pages_out,
+                pages_in: swap.pages_in,
+                faults_served: swap.faults_served,
+                mean_fault_latency: swap.mean_fault_latency_nanos,
+            }
+        })
+    };
+}
+
 fn convert_sample(sample: StatsSample) -> debugger_bindings::helios::system::stats::Sample {
     let heap = heap_stats();
     let total_bytes =
@@ -3896,6 +3915,7 @@ fn convert_sample(sample: StatsSample) -> debugger_bindings::helios::system::sta
         block: convert_block_stats!(debugger_bindings::helios::system::stats, sample.block),
         iommu: convert_iommu_stats!(debugger_bindings::helios::system::stats, sample.iommu),
         balloon: convert_balloon_stats!(debugger_bindings::helios::system::stats, sample.balloon),
+        swap: convert_swap_stats!(debugger_bindings::helios::system::stats, sample.swap),
         host_share: convert_host_share_stats!(
             debugger_bindings::helios::system::stats,
             sample.host_share
@@ -3929,6 +3949,7 @@ fn convert_program_sample(sample: StatsSample) -> program_bindings::helios::syst
         block: convert_block_stats!(program_bindings::helios::system::stats, sample.block),
         iommu: convert_iommu_stats!(program_bindings::helios::system::stats, sample.iommu),
         balloon: convert_balloon_stats!(program_bindings::helios::system::stats, sample.balloon),
+        swap: convert_swap_stats!(program_bindings::helios::system::stats, sample.swap),
         host_share: convert_host_share_stats!(
             program_bindings::helios::system::stats,
             sample.host_share

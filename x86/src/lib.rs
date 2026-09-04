@@ -443,6 +443,11 @@ fn install_pci_devices<WatchdogImpl>(
         debug_state.install_memory_balloon(handle);
         routes.set_balloon(exceptions::BALLOON_INTERRUPT_VECTOR, handler);
     }
+    // x86 commits linear memory eagerly out of the user pool: there is
+    // no reservation to leave a not-present entry in, and Cranelift
+    // emits explicit bounds checks rather than relying on guard pages,
+    // so a swapped-out page could never fault back in. Tracked as #59.
+    helios_kernel::disable_swap(helios_kernel::SwapDisabled::NoLazyCommitAddressSpace);
     if block_functions.is_empty() {
         tracing::warn!("virtio block device was not discovered on the PCI bus");
     }

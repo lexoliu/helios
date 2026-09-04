@@ -1106,9 +1106,11 @@ impl<D: BlockDevice + 'static> SwapBackend for VirtioBlockSwapBackend<D> {
     ///
     /// The caller's slice goes to the device as it is: only the tail that
     /// does not fill a whole block is copied, into a single zero-padded
-    /// block. The extent is committed with a cache flush before the token
-    /// is handed back, because a swap-out the device has acknowledged but
-    /// not persisted is a page the kernel can no longer reconstruct.
+    /// block. No flush follows. Swap is scratch storage whose only
+    /// reader is the kernel that wrote it: once the device has taken
+    /// the write it will hand the same bytes back, and nothing in swap
+    /// has to outlive the kernel. A flush per page would buy durability
+    /// nobody wants at the price of a host fsync on every page evicted.
     async fn swap_out(&self, bytes: &[u8]) -> Result<Self::Token, Self::Error> {
         let token = self.allocate_token(bytes.len()).await?;
         if let Err(error) = self.write_extent(token, bytes).await {
@@ -1155,6 +1157,10 @@ impl<D: BlockDevice + 'static> SwapBackend for VirtioBlockSwapBackend<D> {
         self.release_token(token).await;
         Ok(())
     }
+
+    async fn release(&self, token: Self::Token) {
+        self.release_token(token).await;
+    }
 }
 
 impl<D: BlockDevice> VirtioBlockSwapBackend<D> {
@@ -1181,7 +1187,6 @@ impl<D: BlockDevice> VirtioBlockSwapBackend<D> {
                 .write_block(token.start_block + head_bytes / block_size, &tail)
                 .await?;
         }
-        self.device.flush().await?;
         Ok(())
     }
 }
@@ -1906,8 +1911,8 @@ mod tests {
         let token = block_on(backend.swap_out(&page)).expect("swap-out should succeed");
         assert_eq!(
             backend.device.flushes(),
-            1,
-            "a swap-out the device has not persisted is a page the kernel cannot rebuild"
+            0,
+            "swap is scratch storage; a flush per evicted page buys durability nobody reads"
         );
 
         let mut restored = vec![0_u8; page.len()];

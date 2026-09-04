@@ -14,18 +14,53 @@
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use helios_hal::vmm::{AddressSpaceError, PageFlags, VirtAddr, VirtRange};
+use helios_hal::pmm::PhysFrame;
+use helios_hal::vmm::{AddressSpaceError, PageFlags, SwapToken, VirtAddr, VirtRange};
 
-/// A committed sub-range of a reservation and the flags it was granted.
+use super::owner::MemoryOwner;
+
+/// A committed sub-range of a reservation, the flags it was granted,
+/// and the instance it was committed for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CommittedRegion {
     pub range: VirtRange,
     pub flags: PageFlags,
+    pub owner: MemoryOwner,
+}
+
+/// One page whose contents live in a swap backend instead of memory.
+///
+/// The page-table entry carries the same token on architectures that
+/// have spare bits in a not-present descriptor; this record is what
+/// teardown and enumeration walk, because a page table cannot be
+/// searched by owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SwapEntry {
+    pub addr: VirtAddr,
+    pub token: SwapToken,
+    /// Flags the page had before it was swapped out, so restoring it
+    /// puts it back exactly as the runtime left it.
+    pub flags: PageFlags,
+    pub owner: MemoryOwner,
+}
+
+/// What a released reservation was still holding.
+///
+/// Committed regions have frames to hand back; swapped pages have swap
+/// extents the backend is still holding, and the caller must release
+/// every one of those tokens or the swap device leaks one dead instance
+/// at a time.
+#[derive(Debug, Default)]
+pub struct ReleasedReservation {
+    pub committed: Vec<CommittedRegion>,
+    pub swapped: Vec<SwapEntry>,
 }
 
 struct Reservation {
     range: VirtRange,
     committed: Vec<CommittedRegion>,
+    /// Pages inside this reservation that are swapped out, ascending.
+    swapped: Vec<SwapEntry>,
 }
 
 /// Result of looking up a single address in the tracker.
@@ -65,18 +100,24 @@ impl ReservationTracker {
         self.reservations.push(Reservation {
             range,
             committed: Vec::new(),
+            swapped: Vec::new(),
         });
     }
 
-    /// Removes the reservation exactly matching `range` and returns its
-    /// committed regions so the caller can unmap them.
-    pub fn release(&mut self, range: VirtRange) -> Result<Vec<CommittedRegion>, AddressSpaceError> {
+    /// Removes the reservation exactly matching `range` and returns
+    /// everything it still held: committed regions to unmap, and
+    /// swapped pages whose tokens the caller must release.
+    pub fn release(&mut self, range: VirtRange) -> Result<ReleasedReservation, AddressSpaceError> {
         let index = self
             .reservations
             .iter()
             .position(|reservation| reservation.range == range)
             .ok_or(AddressSpaceError::NotReserved)?;
-        Ok(self.reservations.swap_remove(index).committed)
+        let reservation = self.reservations.swap_remove(index);
+        Ok(ReleasedReservation {
+            committed: reservation.committed,
+            swapped: reservation.swapped,
+        })
     }
 
     /// Validates that `virt` lies inside a reservation and does not
@@ -93,16 +134,27 @@ impl ReservationTracker {
         Ok(())
     }
 
-    /// Records a committed region after the backend mapped it.
+    /// Records a committed region after the backend mapped it,
+    /// attributing it to whoever the processor was committing for.
+    ///
+    /// Committing over a swapped-out page discards that page's swap
+    /// entry — the runtime has decided the old contents are gone — and
+    /// the orphaned token is returned so the caller can release its
+    /// backing store.
     pub fn record_commit(
         &mut self,
         virt: VirtRange,
         flags: PageFlags,
-    ) -> Result<(), AddressSpaceError> {
-        self.find_mut(virt)?
-            .committed
-            .push(CommittedRegion { range: virt, flags });
-        Ok(())
+        owner: MemoryOwner,
+    ) -> Result<Vec<SwapEntry>, AddressSpaceError> {
+        let reservation = self.find_mut(virt)?;
+        let orphaned = take_swapped_range(&mut reservation.swapped, virt);
+        reservation.committed.push(CommittedRegion {
+            range: virt,
+            flags,
+            owner,
+        });
+        Ok(orphaned)
     }
 
     /// Validates that `virt` lies inside a reservation and is fully
@@ -115,11 +167,17 @@ impl ReservationTracker {
         Ok(())
     }
 
-    /// Removes `virt` from the committed set after validating coverage.
-    pub fn record_decommit(&mut self, virt: VirtRange) -> Result<(), AddressSpaceError> {
+    /// Removes `virt` from the committed set after validating coverage,
+    /// returning any swapped pages inside it whose tokens the caller
+    /// must release.
+    pub fn record_decommit(
+        &mut self,
+        virt: VirtRange,
+    ) -> Result<Vec<SwapEntry>, AddressSpaceError> {
         self.ensure_committed(virt)?;
-        remove_committed_range(&mut self.find_mut(virt)?.committed, virt);
-        Ok(())
+        let reservation = self.find_mut(virt)?;
+        remove_committed_range(&mut reservation.committed, virt);
+        Ok(take_swapped_range(&mut reservation.swapped, virt))
     }
 
     /// Replaces the committed flags for `virt` after the backend changed
@@ -131,10 +189,25 @@ impl ReservationTracker {
         flags: PageFlags,
     ) -> Result<(), AddressSpaceError> {
         let reservation = self.find_mut(virt)?;
-        remove_committed_range(&mut reservation.committed, virt);
-        reservation
+        let owner = reservation
             .committed
-            .push(CommittedRegion { range: virt, flags });
+            .iter()
+            .find(|region| ranges_overlap(region.range, virt))
+            .map(|region| region.owner)
+            .unwrap_or(MemoryOwner::NONE);
+        remove_committed_range(&mut reservation.committed, virt);
+        reservation.committed.push(CommittedRegion {
+            range: virt,
+            flags,
+            owner,
+        });
+        // A protection change applies to the swapped pages too: they go
+        // back with the flags the runtime last asked for.
+        for entry in &mut reservation.swapped {
+            if virt.contains(entry.addr) {
+                entry.flags = flags;
+            }
+        }
         Ok(())
     }
 
@@ -177,9 +250,20 @@ impl ReservationTracker {
                 range_intersection(region.range, virt).map(|range| CommittedRegion {
                     range,
                     flags: region.flags,
+                    owner: region.owner,
                 })
             })
             .collect())
+    }
+
+    /// Removes and returns the swapped pages inside `virt`, for callers
+    /// that are about to drop the range's contents. The tokens are the
+    /// caller's to release.
+    pub fn take_swap_entries_in(&mut self, virt: VirtRange) -> Vec<SwapEntry> {
+        match self.find_mut(virt) {
+            Ok(reservation) => take_swapped_range(&mut reservation.swapped, virt),
+            Err(_) => Vec::new(),
+        }
     }
 
     /// Removes and returns the committed sub-ranges intersecting `virt`,
@@ -266,6 +350,130 @@ impl ReservationTracker {
     /// Returns a released reservation range to the reuse pool.
     pub fn push_free_range(&mut self, range: VirtRange) {
         self.free_list.push(range);
+    }
+
+    /// Moves the committed page at `addr` into the swapped set.
+    ///
+    /// The page must be committed; its flags are captured so
+    /// [`Self::take_swap_entry`] can put it back unchanged.
+    pub fn record_swap_out(
+        &mut self,
+        addr: VirtAddr,
+        token: SwapToken,
+    ) -> Result<PageFlags, AddressSpaceError> {
+        let page = VirtRange::new(addr, PhysFrame::SIZE);
+        let reservation = self.find_mut(page)?;
+        let region = reservation
+            .committed
+            .iter()
+            .find(|region| region.range.contains(addr))
+            .copied()
+            .ok_or(AddressSpaceError::NotCommitted)?;
+        remove_committed_range(&mut reservation.committed, page);
+        let entry = SwapEntry {
+            addr,
+            token,
+            flags: region.flags,
+            owner: region.owner,
+        };
+        let position = reservation
+            .swapped
+            .partition_point(|existing| existing.addr < addr);
+        reservation.swapped.insert(position, entry);
+        Ok(region.flags)
+    }
+
+    /// Moves the page at `addr` back out of the swapped set and into the
+    /// committed set, returning the entry it had.
+    pub fn take_swap_entry(&mut self, addr: VirtAddr) -> Result<SwapEntry, AddressSpaceError> {
+        let page = VirtRange::new(addr, PhysFrame::SIZE);
+        let reservation = self.find_mut(page)?;
+        let position = reservation
+            .swapped
+            .iter()
+            .position(|entry| entry.addr == addr)
+            .ok_or(AddressSpaceError::NotSwapped)?;
+        let entry = reservation.swapped.remove(position);
+        reservation.committed.push(CommittedRegion {
+            range: page,
+            flags: entry.flags,
+            owner: entry.owner,
+        });
+        Ok(entry)
+    }
+
+    /// The swap entry for `addr`, without disturbing it.
+    pub fn swap_entry(&self, addr: VirtAddr) -> Option<SwapEntry> {
+        let page = VirtRange::new(addr, PhysFrame::SIZE);
+        self.find(page)
+            .ok()?
+            .swapped
+            .iter()
+            .find(|entry| entry.addr == addr)
+            .copied()
+    }
+
+    /// Bytes committed for `owner` across every reservation.
+    pub fn owned_resident_bytes(&self, owner: MemoryOwner) -> u64 {
+        self.reservations
+            .iter()
+            .flat_map(|reservation| reservation.committed.iter())
+            .filter(|region| region.owner == owner)
+            .map(|region| region.range.byte_len as u64)
+            .sum()
+    }
+
+    /// Pages `owner` has swapped out across every reservation.
+    pub fn owned_swapped_pages(&self, owner: MemoryOwner) -> usize {
+        self.reservations
+            .iter()
+            .flat_map(|reservation| reservation.swapped.iter())
+            .filter(|entry| entry.owner == owner)
+            .count()
+    }
+
+    /// Pages swapped out across every reservation and owner.
+    pub fn swapped_pages(&self) -> usize {
+        self.reservations
+            .iter()
+            .map(|reservation| reservation.swapped.len())
+            .sum()
+    }
+
+    /// Visits `owner`'s committed regions, largest first, until `visit`
+    /// returns `false`. Largest first because a swap-out pass wants the
+    /// fewest scans for the most reclaimed pages.
+    pub fn owned_committed_regions<Visit>(&self, owner: MemoryOwner, mut visit: Visit)
+    where
+        Visit: FnMut(CommittedRegion) -> bool,
+    {
+        let mut regions: Vec<CommittedRegion> = self
+            .reservations
+            .iter()
+            .flat_map(|reservation| reservation.committed.iter())
+            .filter(|region| region.owner == owner)
+            .copied()
+            .collect();
+        regions.sort_by_key(|region| core::cmp::Reverse(region.range.byte_len));
+        for region in regions {
+            if !visit(region) {
+                return;
+            }
+        }
+    }
+
+    /// Every owner that currently has committed pages.
+    pub fn owners(&self) -> Vec<MemoryOwner> {
+        let mut owners: Vec<MemoryOwner> = self
+            .reservations
+            .iter()
+            .flat_map(|reservation| reservation.committed.iter())
+            .map(|region| region.owner)
+            .filter(|owner| !owner.is_none())
+            .collect();
+        owners.sort_unstable();
+        owners.dedup();
+        owners
     }
 
     fn find(&self, virt: VirtRange) -> Result<&Reservation, AddressSpaceError> {
@@ -356,6 +564,20 @@ fn committed_regions_cover(regions: &[CommittedRegion], range: VirtRange) -> boo
     true
 }
 
+/// Removes and returns every swap entry inside `range`.
+fn take_swapped_range(entries: &mut Vec<SwapEntry>, range: VirtRange) -> Vec<SwapEntry> {
+    let mut taken = Vec::new();
+    entries.retain(|entry| {
+        if range.contains(entry.addr) {
+            taken.push(*entry);
+            false
+        } else {
+            true
+        }
+    });
+    taken
+}
+
 fn remove_committed_range(regions: &mut Vec<CommittedRegion>, range: VirtRange) {
     let mut index = 0;
     while index < regions.len() {
@@ -373,12 +595,14 @@ fn remove_committed_range(regions: &mut Vec<CommittedRegion>, range: VirtRange) 
                     range.start.raw() - region.range.start.raw(),
                 ),
                 flags: region.flags,
+                owner: region.owner,
             });
         }
         if range.end().raw() < region.range.end().raw() {
             regions.push(CommittedRegion {
                 range: VirtRange::new(range.end(), region.range.end().raw() - range.end().raw()),
                 flags: region.flags,
+                owner: region.owner,
             });
         }
     }
@@ -404,7 +628,7 @@ mod tests {
     fn commit_precheck_rejects_overlap_and_foreign_ranges() {
         let mut tracker = tracker_with_reservation(0x1_0000, 4);
         tracker
-            .record_commit(range(0x1_0000, 2), PageFlags::READ)
+            .record_commit(range(0x1_0000, 2), PageFlags::READ, MemoryOwner::NONE)
             .unwrap();
         assert_eq!(
             tracker.precheck_commit(range(0x1_1000, 2)),
@@ -421,7 +645,11 @@ mod tests {
     fn decommit_requires_full_coverage_and_splits_regions() {
         let mut tracker = tracker_with_reservation(0x1_0000, 4);
         tracker
-            .record_commit(range(0x1_0000, 4), PageFlags::READ | PageFlags::WRITE)
+            .record_commit(
+                range(0x1_0000, 4),
+                PageFlags::READ | PageFlags::WRITE,
+                MemoryOwner::NONE,
+            )
             .unwrap();
         tracker.record_decommit(range(0x1_1000, 1)).unwrap();
         assert_eq!(
@@ -446,7 +674,11 @@ mod tests {
     fn protect_replaces_flags_in_place() {
         let mut tracker = tracker_with_reservation(0x1_0000, 2);
         tracker
-            .record_commit(range(0x1_0000, 2), PageFlags::READ | PageFlags::WRITE)
+            .record_commit(
+                range(0x1_0000, 2),
+                PageFlags::READ | PageFlags::WRITE,
+                MemoryOwner::NONE,
+            )
             .unwrap();
         tracker.ensure_committed(range(0x1_0000, 1)).unwrap();
         tracker
@@ -468,15 +700,16 @@ mod tests {
     fn release_returns_committed_regions_and_frees_range() {
         let mut tracker = tracker_with_reservation(0x1_0000, 4);
         tracker
-            .record_commit(range(0x1_0000, 1), PageFlags::READ)
+            .record_commit(range(0x1_0000, 1), PageFlags::READ, MemoryOwner::NONE)
             .unwrap();
         assert_eq!(
-            tracker.release(range(0x1_0000, 2)),
-            Err(AddressSpaceError::NotReserved),
+            tracker.release(range(0x1_0000, 2)).err(),
+            Some(AddressSpaceError::NotReserved),
             "release must match the exact reserved range"
         );
-        let committed = tracker.release(range(0x1_0000, 4)).unwrap();
-        assert_eq!(committed.len(), 1);
+        let released = tracker.release(range(0x1_0000, 4)).unwrap();
+        assert_eq!(released.committed.len(), 1);
+        assert!(released.swapped.is_empty());
         tracker.push_free_range(range(0x1_0000, 4));
         assert_eq!(tracker.reuse_free_range(2 * PAGE), Some(range(0x1_0000, 2)));
         assert_eq!(tracker.reuse_free_range(2 * PAGE), Some(range(0x1_2000, 2)));
@@ -487,7 +720,7 @@ mod tests {
     fn accessibility_plan_splits_protect_and_commit() {
         let mut tracker = tracker_with_reservation(0x1_0000, 4);
         tracker
-            .record_commit(range(0x1_1000, 1), PageFlags::READ)
+            .record_commit(range(0x1_1000, 1), PageFlags::READ, MemoryOwner::NONE)
             .unwrap();
         let plan = tracker.accessibility_plan(range(0x1_0000, 4)).unwrap();
         assert_eq!(plan.protect, [range(0x1_1000, 1)]);
@@ -498,7 +731,7 @@ mod tests {
     fn take_committed_intersections_clips_and_removes() {
         let mut tracker = tracker_with_reservation(0x1_0000, 4);
         tracker
-            .record_commit(range(0x1_0000, 2), PageFlags::READ)
+            .record_commit(range(0x1_0000, 2), PageFlags::READ, MemoryOwner::NONE)
             .unwrap();
         let taken = tracker
             .take_committed_intersections(range(0x1_1000, 3))

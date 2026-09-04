@@ -21,6 +21,7 @@ pub mod custom_vm;
 pub(crate) mod cwasm;
 pub mod engine;
 pub mod store;
+pub mod swap_fault;
 #[cfg(all(
     target_os = "none",
     any(
