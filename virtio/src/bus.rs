@@ -8,11 +8,17 @@ use helios_hal::iommu::DmaTranslation;
 pub trait DeviceBus: Send + Sync + 'static {
     type DmaPool: DmaPool;
 
-    fn read_u8(&self, offset: usize) -> u8 {
-        let word_offset = offset & !0x3;
-        let byte_index = offset & 0x3;
-        self.read_u32(word_offset).to_le_bytes()[byte_index]
-    }
+    /// Reads one byte.
+    ///
+    /// Narrow reads are their own operation rather than a slice of the
+    /// enclosing dword: a device register window ends where the device
+    /// says it ends, and a 32-bit access that reaches past that end is
+    /// refused by the bus and reads as all-ones rather than as the
+    /// field it contains. A field is read at its own width.
+    fn read_u8(&self, offset: usize) -> u8;
+
+    /// Reads one 16-bit field, at its own width, for the same reason.
+    fn read_u16(&self, offset: usize) -> u16;
 
     fn read_u32(&self, offset: usize) -> u32;
     fn write_u32(&self, offset: usize, value: u32);
@@ -126,6 +132,19 @@ impl<P> MmioBus<P> {
         assert!(offset < self.size, "MMIO byte access out of range");
 
         unsafe { self.base.as_ptr().add(offset) }
+    }
+
+    fn checked_halfword_ptr(&self, offset: usize) -> *mut u16 {
+        let end = offset
+            .checked_add(core::mem::size_of::<u16>())
+            .unwrap_or_else(|| panic!("MMIO offset overflow"));
+        assert!(end <= self.size, "MMIO halfword access out of range");
+        assert!(
+            offset.is_multiple_of(core::mem::align_of::<u16>()),
+            "MMIO halfword access misaligned"
+        );
+
+        unsafe { self.base.as_ptr().add(offset).cast::<u16>() }
     }
 }
 
@@ -307,6 +326,10 @@ impl<P: DmaPool> DeviceBus for MmioBus<P> {
 
     fn read_u8(&self, offset: usize) -> u8 {
         unsafe { self.checked_byte_ptr(offset).read_volatile() }
+    }
+
+    fn read_u16(&self, offset: usize) -> u16 {
+        unsafe { self.checked_halfword_ptr(offset).read_volatile() }
     }
 
     fn read_u32(&self, offset: usize) -> u32 {

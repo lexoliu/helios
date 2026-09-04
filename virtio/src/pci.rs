@@ -238,6 +238,10 @@ impl<P: DmaPool> DeviceBus for VirtioPciBus<P> {
         self.config().read_u8(offset)
     }
 
+    fn read_u16(&self, offset: usize) -> u16 {
+        self.config().read_u16(offset)
+    }
+
     fn read_u32(&self, offset: usize) -> u32 {
         self.config().read_u32(offset)
     }
@@ -587,6 +591,10 @@ impl<P: DmaPool> VirtioTransport for VirtioPciTransport<P> {
 
     fn write_config_u32(&self, offset: usize, value: u32) {
         self.bus.write_u32(offset, value);
+    }
+
+    fn read_config_u16(&self, offset: usize) -> u16 {
+        self.bus.read_u16(offset)
     }
 
     fn read_config_u8(&self, offset: usize) -> u8 {

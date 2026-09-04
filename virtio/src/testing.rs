@@ -63,6 +63,16 @@ impl MmioRegisterBus {
 impl DeviceBus for MmioRegisterBus {
     type DmaPool = IdentityDmaPool;
 
+    fn read_u8(&self, offset: usize) -> u8 {
+        self.read_u32(offset & !0x3).to_le_bytes()[offset & 0x3]
+    }
+
+    fn read_u16(&self, offset: usize) -> u16 {
+        let word = self.read_u32(offset & !0x3).to_le_bytes();
+        let byte = offset & 0x3;
+        u16::from_le_bytes([word[byte], word[byte + 1]])
+    }
+
     fn read_u32(&self, offset: usize) -> u32 {
         if offset == REG_DEVICE_FEATURES {
             let half = self.register(REG_DEVICE_FEATURES_SEL);
@@ -96,21 +106,61 @@ pub(crate) struct HeapBus<P = IdentityDmaPool> {
     /// Wide enough for the largest device configuration a driver in this
     /// crate reads (virtio-blk's runs to offset 0x40).
     config: UnsafeCell<[u32; 32]>,
+    /// How long the device says its configuration is. An access that
+    /// ends past this reads as all-ones, which is what a real bus does
+    /// with a read it refuses — and what makes a driver that reads a
+    /// two-byte field with a four-byte access see 0xffff instead of the
+    /// field.
+    config_bytes: usize,
     dma: P,
 }
 
 impl<P> HeapBus<P> {
-    fn new(dma: P) -> Self {
+    fn new(dma: P, config_bytes: usize) -> Self {
         Self {
             config: UnsafeCell::new([0; 32]),
+            config_bytes,
             dma,
         }
+    }
+
+    fn refuses(&self, offset: usize, width: usize) -> bool {
+        offset + width > self.config_bytes
+    }
+}
+
+impl<P> HeapBus<P> {
+    fn word(&self, offset: usize) -> u32 {
+        unsafe { (*self.config.get())[offset / 4] }
     }
 }
 
 impl<P: DmaPool> DeviceBus for HeapBus<P> {
+    fn read_u8(&self, offset: usize) -> u8 {
+        if self.refuses(offset, 1) {
+            return u8::MAX;
+        }
+        self.word(offset & !0x3).to_le_bytes()[offset & 0x3]
+    }
+
+    fn read_u16(&self, offset: usize) -> u16 {
+        assert!(
+            offset.is_multiple_of(2),
+            "a 16-bit device configuration field is aligned to its own width"
+        );
+        if self.refuses(offset, 2) {
+            return u16::MAX;
+        }
+        let word = self.word(offset & !0x3).to_le_bytes();
+        let byte = offset & 0x3;
+        u16::from_le_bytes([word[byte], word[byte + 1]])
+    }
+
     fn read_u32(&self, offset: usize) -> u32 {
-        unsafe { (*self.config.get())[offset / 4] }
+        if self.refuses(offset, 4) {
+            return u32::MAX;
+        }
+        self.word(offset)
     }
 
     fn write_u32(&self, offset: usize, value: u32) {
@@ -380,6 +430,14 @@ impl<P: DmaPool> VirtioTransport for FakeTransport<P> {
 
     fn read_config_u32(&self, offset: usize) -> u32 {
         self.bus.read_u32(offset)
+    }
+
+    fn read_config_u16(&self, offset: usize) -> u16 {
+        self.bus.read_u16(offset)
+    }
+
+    fn read_config_u8(&self, offset: usize) -> u8 {
+        self.bus.read_u8(offset)
     }
 
     fn write_config_u32(&self, offset: usize, value: u32) {

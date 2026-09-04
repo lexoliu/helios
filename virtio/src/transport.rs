@@ -223,11 +223,18 @@ pub trait VirtioTransport: Send + Sync + 'static {
     /// transport alongside the read.
     fn write_config_u32(&self, offset: usize, value: u32);
 
-    fn read_config_u8(&self, offset: usize) -> u8 {
-        let word_offset = offset & !0x3;
-        let byte_index = offset & 0x3;
-        self.read_config_u32(word_offset).to_le_bytes()[byte_index]
-    }
+    /// Reads one 16-bit device configuration field.
+    ///
+    /// Device configuration is exactly as long as the device's feature
+    /// set makes it, and it does not have to end on a dword boundary:
+    /// virtio-net offering multiqueue without an MTU, a link speed or
+    /// RSS publishes a ten-byte window whose last field is a `le16`. A
+    /// 32-bit read of that field reaches two bytes past the end, which
+    /// the bus refuses and reads as all-ones. Fields are read at the
+    /// width the specification gives them.
+    fn read_config_u16(&self, offset: usize) -> u16;
+
+    fn read_config_u8(&self, offset: usize) -> u8;
 }
 
 pub struct VirtioMmioTransport<B: DeviceBus> {
@@ -359,6 +366,10 @@ impl<B: DeviceBus> VirtioTransport for VirtioMmioTransport<B> {
 
     fn write_config_u32(&self, offset: usize, value: u32) {
         self.bus.write_u32(CONFIG_SPACE_OFFSET + offset, value);
+    }
+
+    fn read_config_u16(&self, offset: usize) -> u16 {
+        self.bus.read_u16(CONFIG_SPACE_OFFSET + offset)
     }
 
     fn read_config_u8(&self, offset: usize) -> u8 {
