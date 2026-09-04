@@ -64,6 +64,19 @@ const TCP_RECEIVE_BACKPRESSURE_BYTES: usize =
 const TCP_SMALL_PAYLOAD_ACK_BYTES: usize = TCP_RECEIVE_SEGMENT_BYTES / 2;
 const TCP_DELAYED_ACK_SEGMENTS: u8 = 2;
 const TCP_WINDOW_UPDATE_BYTES: u16 = (TCP_RECEIVE_SEGMENT_BYTES * 4) as u16;
+/// Acknowledgements a socket may owe at once.
+///
+/// The stack is driven in batches: a whole burst of received frames is
+/// demultiplexed before the transmit side runs, so the count of ACKs a
+/// socket owes has to survive the batch. RFC 5681 3.2 requires an
+/// immediate duplicate ACK for every out-of-order segment, and the peer
+/// needs three of them before it will fast-retransmit; a single pending
+/// flag collapses the whole burst into one ACK and leaves the peer with
+/// nothing to do but wait out its retransmission timeout. One cumulative
+/// ACK plus four duplicates clears that threshold with a spare, and stays
+/// far below the outbound frame slab so a lossy burst cannot starve data
+/// transmission.
+const TCP_MAX_QUEUED_ACKS: u8 = 5;
 pub(crate) const TCP_LOCAL_WINDOW_SCALE: u8 = 4;
 const TCP_MAX_WINDOW_SCALE: u8 = 14;
 pub(crate) const TCP_RECEIVE_BACKPRESSURE_SEGMENTS: usize = MAX_TCP_RECEIVE_SEGMENTS - 4;
@@ -654,7 +667,10 @@ where
     syn_queued: bool,
     syn_ack_queued: bool,
     fin_queued: bool,
-    ack_pending: bool,
+    /// Acknowledgements this socket owes its peer. Counted rather than
+    /// flagged so a batch of out-of-order segments produces the
+    /// duplicate ACKs that drive the peer's fast retransmit.
+    pending_acks: u8,
     duplicate_ack_count: u8,
     fast_retransmit_pending: bool,
     pending_pmtu_retransmit_sequence: Option<u32>,
@@ -702,7 +718,7 @@ where
             syn_queued: false,
             syn_ack_queued: false,
             fin_queued: false,
-            ack_pending: false,
+            pending_acks: 0,
             duplicate_ack_count: 0,
             fast_retransmit_pending: false,
             pending_pmtu_retransmit_sequence: None,
@@ -867,8 +883,17 @@ where
             .on_packet_sent(1, self.bytes_in_flight, now_nanos);
     }
 
+    /// Acknowledgements this socket still owes its peer.
+    ///
+    /// Everything past the first is a duplicate ACK: the receive
+    /// sequence has not moved, so the peer reads the repetition as the
+    /// loss signal it needs.
+    pub const fn pending_ack_count(&self) -> u8 {
+        self.pending_acks
+    }
+
     pub fn pending_ack(&self) -> Option<TcpHeader> {
-        if !self.ack_pending {
+        if self.pending_acks == 0 {
             return None;
         }
         let local = self.local?;
@@ -883,8 +908,11 @@ where
         })
     }
 
+    /// Consumes one owed acknowledgement. A frame carries exactly one,
+    /// so a socket owing duplicates stays pending until each has been
+    /// put on the wire.
     pub fn mark_ack_queued(&mut self) {
-        self.ack_pending = false;
+        self.pending_acks = self.pending_acks.saturating_sub(1);
         self.delayed_ack_deadline_nanos = None;
     }
 
@@ -1095,7 +1123,7 @@ where
             window_size: self.advertised_window,
         };
         let options = self.timestamped_options(now_nanos);
-        self.ack_pending = false;
+        self.pending_acks = self.pending_acks.saturating_sub(1);
         if persist_probe {
             self.mark_persist_probe_queued(
                 TcpPersistProbe {
@@ -1291,7 +1319,7 @@ where
             }
             self.schedule_next_pacing_send(sequence_len, now_nanos);
         }
-        self.ack_pending = false;
+        self.pending_acks = self.pending_acks.saturating_sub(1);
         self.delayed_ack_deadline_nanos = None;
         Some(TcpTransmitSegment {
             local,
@@ -1561,7 +1589,7 @@ where
                     false,
                 );
                 self.state = TcpState::Established;
-                self.ack_pending = true;
+                self.pending_acks = self.pending_acks.max(1);
                 TcpSegmentOutcome {
                     recovery: action,
                     readable: false,
@@ -1630,7 +1658,9 @@ where
                 }
                 if !self.receive_sequence_acceptable(packet.sequence, receive_sequence_len(packet))
                 {
-                    self.request_ack();
+                    // RFC 9293 3.10.7.4: every unacceptable segment is
+                    // answered with an acknowledgement of its own.
+                    self.request_duplicate_ack();
                     return TcpSegmentOutcome::default();
                 }
                 if packet.flags.contains(TcpFlags::SYN) {
@@ -1670,7 +1700,10 @@ where
                         Ok(payload_readable) => readable |= payload_readable,
                         Err(()) => {
                             self.refresh_advertised_window();
-                            self.request_ack();
+                            // The segment was dropped for want of queue
+                            // space, so it is a hole to the peer just
+                            // like a lost one.
+                            self.request_duplicate_ack();
                             return TcpSegmentOutcome {
                                 recovery: action,
                                 readable: false,
@@ -1726,7 +1759,7 @@ where
         self.syn_queued = false;
         self.syn_ack_queued = false;
         self.fin_queued = false;
-        self.ack_pending = false;
+        self.pending_acks = 0;
         self.duplicate_ack_count = 0;
         self.fast_retransmit_pending = false;
         self.pending_pmtu_retransmit_sequence = None;
@@ -2155,7 +2188,10 @@ where
         let payload_len = u32::try_from(payload.len()).unwrap_or(u32::MAX);
         let payload_end = sequence.wrapping_add(payload_len);
         if sequence_leq(payload_end, self.receive_next) {
-            self.request_ack();
+            // Data the peer already had acknowledged. It resent it
+            // because it believes something was lost, so answer every
+            // copy rather than one per batch.
+            self.request_duplicate_ack();
             return Ok(false);
         }
 
@@ -2171,7 +2207,7 @@ where
 
         self.insert_out_of_order_payload(sequence, payload)?;
         self.refresh_advertised_window();
-        self.request_ack();
+        self.request_duplicate_ack();
         Ok(false)
     }
 
@@ -2446,7 +2482,22 @@ where
     }
 
     fn request_ack(&mut self) {
-        self.ack_pending = true;
+        self.pending_acks = self.pending_acks.max(1);
+        self.delayed_ack_deadline_nanos = None;
+        self.unacked_receive_segments = 0;
+        self.pending_window_update_bytes = 0;
+    }
+
+    /// Queues one more acknowledgement on top of whatever is already
+    /// owed, for a segment that could not advance the receive sequence.
+    ///
+    /// The peer counts these: three repetitions of the same
+    /// acknowledgement are what tell it to retransmit the hole without
+    /// waiting for its timer, and a receiver with no SACK to offer —
+    /// which is every peer that did not negotiate it — has no other way
+    /// to say so.
+    fn request_duplicate_ack(&mut self) {
+        self.pending_acks = self.pending_acks.saturating_add(1).min(TCP_MAX_QUEUED_ACKS);
         self.delayed_ack_deadline_nanos = None;
         self.unacked_receive_segments = 0;
         self.pending_window_update_bytes = 0;
@@ -2560,7 +2611,7 @@ pub(crate) fn sequence_leq(lhs: u32, rhs: u32) -> bool {
     lhs == rhs || (rhs.wrapping_sub(lhs) as i32) >= 0
 }
 
-fn sequence_lt(lhs: u32, rhs: u32) -> bool {
+pub(crate) fn sequence_lt(lhs: u32, rhs: u32) -> bool {
     lhs != rhs && sequence_leq(lhs, rhs)
 }
 
@@ -5446,5 +5497,95 @@ mod tests {
             Some(drain_bytes)
         );
         assert!(socket.pending_ack().is_some());
+    }
+
+    /// A hole in the stream owes the peer one duplicate ACK per
+    /// out-of-order segment, not one per batch.
+    ///
+    /// The stack is driven once per received burst, so an ACK the socket
+    /// only records as a flag collapses the whole burst into a single
+    /// acknowledgement. A peer without SACK — every peer that did not
+    /// negotiate it, QEMU's slirp among them — then never counts the
+    /// three duplicates that trigger a fast retransmit and recovers the
+    /// hole on its retransmission timer instead, which cost 1.4–1.9 s
+    /// per loss on the aarch64 bench lane.
+    #[test]
+    fn out_of_order_segments_owe_one_duplicate_ack_each() {
+        let mut socket = established_socket();
+        let payload = [0u8; 100];
+
+        // In-order data first, so the peer already holds the cumulative
+        // acknowledgement every later duplicate repeats.
+        let _ = deliver_segment(
+            &mut socket,
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 101,
+                acknowledgement: 8,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+                options: TcpOptions::empty(),
+                payload: &payload,
+            },
+            1,
+        );
+        while socket.pending_ack().is_some() {
+            socket.mark_ack_queued();
+        }
+        assert_eq!(socket.pending_ack_count(), 0);
+
+        // The segment at 201 is the hole; everything after it arrives.
+        for index in 0..4u32 {
+            let _ = deliver_segment(
+                &mut socket,
+                TcpPacket {
+                    source_port: 80,
+                    destination_port: 49152,
+                    sequence: 301 + index * 100,
+                    acknowledgement: 8,
+                    flags: TcpFlags::ACK,
+                    window_size: u16::MAX,
+                    options: TcpOptions::empty(),
+                    payload: &payload,
+                },
+                2 + u64::from(index),
+            );
+        }
+
+        assert_eq!(socket.pending_ack_count(), 4);
+        let mut acknowledgements = 0;
+        while let Some(header) = socket.pending_ack() {
+            assert_eq!(header.acknowledgement, 201);
+            socket.mark_ack_queued();
+            acknowledgements += 1;
+        }
+        assert_eq!(acknowledgements, 4);
+    }
+
+    /// The queue of owed acknowledgements is bounded: a peer that keeps
+    /// pushing segments into a hole cannot make the socket owe an
+    /// unbounded burst of frames.
+    #[test]
+    fn owed_duplicate_acks_are_capped() {
+        let mut socket = established_socket();
+        let payload = [0u8; 100];
+        for index in 0..(u32::from(TCP_MAX_QUEUED_ACKS) + 8) {
+            let _ = deliver_segment(
+                &mut socket,
+                TcpPacket {
+                    source_port: 80,
+                    destination_port: 49152,
+                    sequence: 301 + index * 100,
+                    acknowledgement: 8,
+                    flags: TcpFlags::ACK,
+                    window_size: u16::MAX,
+                    options: TcpOptions::empty(),
+                    payload: &payload,
+                },
+                1 + u64::from(index),
+            );
+        }
+        assert_eq!(socket.pending_ack_count(), TCP_MAX_QUEUED_ACKS);
     }
 }
