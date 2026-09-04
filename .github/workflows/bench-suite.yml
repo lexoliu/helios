@@ -198,6 +198,7 @@ jobs:
           HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
           HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
           HELIOS_BOOT_SYNC_TIMEOUT_SECS: ${{ matrix.boot-timeout }}
+          HELIOS_WORKLOAD_BENCH_RUNTIME_DIR: ${{ github.workspace }}/bench-runtime
         run: |
           args=(run --lane "${{ matrix.lane }}" --out-dir "$GITHUB_WORKSPACE/bench-out/${{ matrix.lane }}"
                 --runner-label "${{ runner.name }}")
@@ -211,6 +212,17 @@ jobs:
             args+=(--net-ifname "${HELIOS_NET_IFNAME}" --net-bridge "${HELIOS_NET_BRIDGE}" --net-queues "$(nproc)")
           fi
           uv run helios-bench "${args[@]}"
+      # A bring-up failure leaves the inspector's one-line error and
+      # nothing else in the step log; the guest console and QEMU's own
+      # stderr live in the runtime directory, so collect it exactly as
+      # the ci.yml bench lanes do.
+      - name: Upload the inspector runtime directory
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-runtime-${{ matrix.lane }}
+          path: bench-runtime/**/*.log
+          if-no-files-found: warn
       - name: Remove the tap network backend
         if: always() && matrix.net-backend == 'tap'
         working-directory: helios
