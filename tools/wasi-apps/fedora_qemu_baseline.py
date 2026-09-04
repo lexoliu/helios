@@ -267,11 +267,14 @@ def copy_path_to_guest(
         "-o",
         "LogLevel=ERROR",
     ]
-    target = f"{SSH_USER}@127.0.0.1:{remote_path}"
     if source.is_dir():
+        # scp -r names the remote directory after the source, so it has to
+        # be handed the exact destination path: copying
+        # artifacts/bench-native/aarch64 into the parent would land the
+        # binaries in `aarch64`, not in the `native` the guest runner
+        # looks for.
         ssh(repo_root, key, port, f"rm -rf {shlex.quote(remote_path)}", timeout=30)
-        target = f"{SSH_USER}@127.0.0.1:{Path(remote_path).parent}/"
-    run([*scp_base, str(source), target], repo_root)
+    run([*scp_base, str(source), f"{SSH_USER}@127.0.0.1:{remote_path}"], repo_root)
 
 
 def resolve_quickjs_source_archive(
