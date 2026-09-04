@@ -63,6 +63,9 @@ wasmparser = { version = "0.245.0", default-features = false, features = ["compo
 
 [dev-dependencies]
 critical-section = { version = "1.2.0", features = ["std"] }
+# The console-gate tests drive the real `KernelConsoleSubscriber` through
+# `tracing::subscriber::with_default`, which is a std-only dispatcher.
+tracing = { workspace = true, features = ["std"] }
 divan = { version = "0.1.21", default-features = false }
 futures-lite = "2.6.1"
 helios-kernel-macro.workspace = true

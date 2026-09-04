@@ -59,6 +59,23 @@ impl<Console: Write + Send + 'static> Subscriber for KernelConsoleSubscriber<Con
     fn exit(&self, _span: &tracing::span::Id) {}
 }
 
+impl<Console> KernelConsoleSubscriber<Console> {
+    /// Builds a subscriber that owns `console`.
+    ///
+    /// The queue and the buffer pool are sized here rather than at every
+    /// construction site so the kernel logger and the console-gate tests
+    /// exercise one shape.
+    pub(crate) fn new(console: Console) -> Self {
+        Self {
+            console: UnsafeCell::new(console),
+            queue: ConcurrentQueue::bounded(LOG_QUEUE_CAPACITY),
+            buffers: Pool::bounded(LOG_BUFFER_POOL_SLOTS, new_log_buffer, reset_log_buffer),
+            flushing: AtomicBool::new(false),
+            next_span_id: AtomicU64::new(1),
+        }
+    }
+}
+
 impl<Console: Write> KernelConsoleSubscriber<Console> {
     fn try_flush(&self) {
         if self
@@ -141,14 +158,8 @@ impl tracing::field::Visit for ConsoleVisitor<'_> {
 }
 
 pub fn init_logger(console: impl Write + Send + 'static) {
-    tracing::subscriber::set_global_default(KernelConsoleSubscriber {
-        console: UnsafeCell::new(console),
-        queue: ConcurrentQueue::bounded(LOG_QUEUE_CAPACITY),
-        buffers: Pool::bounded(LOG_BUFFER_POOL_SLOTS, new_log_buffer, reset_log_buffer),
-        flushing: AtomicBool::new(false),
-        next_span_id: AtomicU64::new(1),
-    })
-    .expect("Failed to set global logger");
+    tracing::subscriber::set_global_default(KernelConsoleSubscriber::new(console))
+        .expect("Failed to set global logger");
 }
 
 fn format_event(event: &tracing::Event<'_>, buffers: &Pool<String>) -> ReusableObject<String> {
@@ -194,15 +205,10 @@ unsafe impl<Console: Send> Sync for KernelConsoleSubscriber<Console> {}
 #[cfg(test)]
 mod tests {
     use alloc::string::String;
-    use core::cell::UnsafeCell;
-    use core::sync::atomic::{AtomicBool, AtomicU64};
-
-    use concurrent_queue::ConcurrentQueue;
-    use objectpool::Pool;
 
     use super::{
-        KernelConsoleSubscriber, LOG_BUFFER_INITIAL_CAPACITY, LOG_BUFFER_POOL_SLOTS,
-        LOG_BUFFER_RETAINED_CAPACITY, LOG_QUEUE_CAPACITY, new_log_buffer, reset_log_buffer,
+        KernelConsoleSubscriber, LOG_BUFFER_INITIAL_CAPACITY, LOG_BUFFER_RETAINED_CAPACITY,
+        LOG_QUEUE_CAPACITY, reset_log_buffer,
     };
 
     #[test]
@@ -218,13 +224,7 @@ mod tests {
 
     #[test]
     fn log_queue_is_bounded_to_kernel_capacity() {
-        let logger = KernelConsoleSubscriber {
-            console: UnsafeCell::new(String::new()),
-            queue: ConcurrentQueue::bounded(LOG_QUEUE_CAPACITY),
-            buffers: Pool::bounded(LOG_BUFFER_POOL_SLOTS, new_log_buffer, reset_log_buffer),
-            flushing: AtomicBool::new(false),
-            next_span_id: AtomicU64::new(1),
-        };
+        let logger = KernelConsoleSubscriber::new(String::new());
 
         assert_eq!(logger.queue.capacity(), Some(LOG_QUEUE_CAPACITY));
     }
