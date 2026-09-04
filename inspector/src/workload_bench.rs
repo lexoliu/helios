@@ -295,9 +295,34 @@ pub(crate) async fn run_inner(
     })?;
 
     let mut failed = Vec::new();
-    for workload in workloads {
+    let mut remaining = workloads.into_iter();
+    while let Some(workload) = remaining.next() {
         let elapsed_ms = match measure_workload(client, &workload, command).await {
             Ok(elapsed_ms) => elapsed_ms,
+            Err(error) if guest_panic(&error).is_some() => {
+                // The guest kernel is gone: every further workload would
+                // measure a corpse. Record what this one and each of the
+                // ones behind it never got to measure, so the report
+                // carries a failed cell for each instead of silently
+                // dropping them, then let the caller see the panic.
+                let report = format!("{error:#}");
+                eprintln!(
+                    "helios-inspector: workload {} killed the guest; recording the rest as failed: {report}",
+                    workload.name
+                );
+                for pending in core::iter::once(workload).chain(remaining) {
+                    write_record(&JsonlRecord::Failure {
+                        workload: &pending.name,
+                        class: pending.class,
+                        headline: pending.headline,
+                        runner: pending.runner,
+                        error: report.clone(),
+                    })?;
+                    failed.push(pending.name);
+                }
+                report_failed(&failed);
+                return Err(error);
+            }
             Err(error) if command.keep_going => {
                 eprintln!(
                     "helios-inspector: workload {} failed; recorded and continuing: {error:#}",
@@ -329,14 +354,32 @@ pub(crate) async fn run_inner(
             validation: ValidationSummary { ok: true },
         })?;
     }
-    if !failed.is_empty() {
-        eprintln!(
-            "helios-inspector: {} workload(s) recorded as failed: {}",
-            failed.len(),
-            failed.join(", ")
-        );
-    }
+    report_failed(&failed);
     Ok(())
+}
+
+fn report_failed(failed: &[String]) {
+    if failed.is_empty() {
+        return;
+    }
+    eprintln!(
+        "helios-inspector: {} workload(s) recorded as failed: {}",
+        failed.len(),
+        failed.join(", ")
+    );
+}
+
+/// The guest's panic report when this error is a dead guest.
+///
+/// A panicked kernel answers no further RPC, so the transport reports it
+/// as a typed fault rather than letting the read block until the outer
+/// deadline; the bench driver has to tell that apart from a workload
+/// that merely failed.
+fn guest_panic(error: &anyhow::Error) -> Option<&str> {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<helios_inspector_protocol::RpcError>())
+        .find_map(helios_inspector_protocol::RpcError::guest_panic)
 }
 
 /// Times every iteration of one workload, writing its iteration records.

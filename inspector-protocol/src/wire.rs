@@ -9,6 +9,15 @@ use std::io::Write as _;
 pub(crate) const FRAME_MAGIC: [u8; 8] = [0xff, 0x00, b'H', b'R', b'P', b'C', 0xaa, 0x55];
 const MAX_FRAME_SIZE: usize = 1 << 20;
 
+/// The line the kernel's panic path always writes to the console,
+/// carrying the message and the source location on one line.
+///
+/// The frame scanner is the only host-side reader of the guest console
+/// bytes that share the link with the frames, so it is the only place
+/// that can turn a dead guest into an error instead of a wait.
+#[cfg(feature = "host")]
+const GUEST_PANIC_MARKER: &str = "Kernel panic:";
+
 #[derive(Debug)]
 pub(crate) enum Frame {
     Open {
@@ -132,11 +141,29 @@ fn flush_stray_bytes_on_newline(stray: &mut Vec<u8>) -> io::Result<()> {
     Ok(())
 }
 
+/// The panic report a console line carries, with the escape sequences
+/// the guest colours its log with removed.
+#[cfg(feature = "host")]
+fn guest_panic_report(line: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(line);
+    let start = text.find(GUEST_PANIC_MARKER)?;
+    Some(
+        text[start..]
+            .chars()
+            .filter(|character| !character.is_control())
+            .collect::<String>()
+            .trim()
+            .to_owned(),
+    )
+}
+
 #[cfg(feature = "host")]
 fn flush_stray_bytes(stray: &mut Vec<u8>) -> io::Result<()> {
     if stray.is_empty() {
         return Ok(());
     }
+
+    let report = guest_panic_report(stray);
 
     let mut stderr = std::io::stderr().lock();
     stderr.write_all(b"helios-inspector: remote serial: ")?;
@@ -160,7 +187,15 @@ fn flush_stray_bytes(stray: &mut Vec<u8>) -> io::Result<()> {
     stderr.write_all(b"\n")?;
     stderr.flush()?;
     stray.clear();
-    Ok(())
+    drop(stderr);
+
+    // The line is echoed before it is judged: a panic report is the last
+    // thing the guest ever says, and it has to reach the log even though
+    // it also ends the session.
+    match report {
+        Some(report) => Err(crate::error::TransportError::GuestPanicked { report }.into()),
+        None => Ok(()),
+    }
 }
 
 #[cfg(feature = "host")]
@@ -356,4 +391,53 @@ fn decode_u32_vec(payload: &mut &[u8]) -> io::Result<Vec<u32>> {
         values.push(decode_u32(payload)?);
     }
     Ok(values)
+}
+
+#[cfg(all(test, feature = "host"))]
+mod tests {
+    use super::*;
+    use crate::error::TransportError;
+
+    /// The line the aarch64 bench lane's guest died on, colour codes and
+    /// all, as the frame scanner sees it.
+    const PANIC_LINE: &[u8] = b"\x1b[1;31mERROR\x1b[0m [helios_kernel] Kernel panic: executor \
+task arena exhausted: 300 live tasks (kernel/src/exec/executor.rs:133:21) \n";
+
+    #[test]
+    fn a_console_panic_line_is_read_as_a_panic_report() {
+        let report = guest_panic_report(PANIC_LINE).expect("the line carries a panic report");
+        assert_eq!(
+            report,
+            "Kernel panic: executor task arena exhausted: 300 live tasks \
+(kernel/src/exec/executor.rs:133:21)"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_console_line_is_not_a_panic_report() {
+        assert!(guest_panic_report(b"INFO [helios_kernel] Kernel is ready\n").is_none());
+    }
+
+    #[test]
+    fn a_flushed_panic_line_ends_the_session() {
+        let mut stray = PANIC_LINE.to_vec();
+        let error = flush_stray_bytes(&mut stray).expect_err("a panic must end the read");
+        let transport = error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<TransportError>())
+            .expect("the error carries the typed transport fault");
+        assert!(
+            transport
+                .guest_panic()
+                .is_some_and(|report| report.contains("task arena exhausted")),
+            "the fault names the guest's panic: {transport}"
+        );
+    }
+
+    #[test]
+    fn a_flushed_console_line_leaves_the_session_alone() {
+        let mut stray = b"INFO [helios_kernel] Kernel is ready\n".to_vec();
+        flush_stray_bytes(&mut stray).expect("an ordinary line is not a fault");
+        assert!(stray.is_empty());
+    }
 }

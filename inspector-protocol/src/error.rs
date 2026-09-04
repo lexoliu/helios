@@ -35,12 +35,43 @@ pub enum TransportError {
         #[source]
         source: io::Error,
     },
+
+    /// The guest's kernel printed a panic report on the console the
+    /// frame scanner reads.
+    ///
+    /// A panicked guest answers no further frame, so without this the
+    /// call in flight blocks until the caller's outer deadline: the
+    /// benchmark lane that found it spent 2.5 h of a shared runner
+    /// waiting on a kernel that had been dead for two seconds.
+    #[error("guest kernel panicked: {report}")]
+    GuestPanicked { report: String },
 }
 
 #[cfg(feature = "host")]
 impl TransportError {
     pub(crate) fn io(operation: &'static str, source: io::Error) -> Self {
         Self::Io { operation, source }
+    }
+
+    /// The guest's panic report when this fault is a dead guest rather
+    /// than a transport of its own.
+    ///
+    /// The walk is explicit because `io::Error` does not expose a
+    /// custom payload through [`std::error::Error::source`], so an
+    /// error chain alone cannot find a panic that crossed the framing
+    /// layer.
+    pub fn guest_panic(&self) -> Option<&str> {
+        match self {
+            Self::GuestPanicked { report } => Some(report),
+            Self::Io { source, .. } => source
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<Self>())
+                .and_then(Self::guest_panic),
+            Self::Closed
+            | Self::Rejected(_)
+            | Self::UnexpectedReply
+            | Self::HandoffClosed { .. } => None,
+        }
     }
 }
 
@@ -83,6 +114,21 @@ pub enum RpcError {
         #[source]
         source: postcard::Error,
     },
+}
+
+impl RpcError {
+    /// The guest's panic report when this call failed because the guest
+    /// kernel died rather than because the call itself was refused.
+    ///
+    /// A caller that drives many calls in a row — the workload bench —
+    /// uses it to stop instead of asking a dead guest the next question.
+    pub fn guest_panic(&self) -> Option<&str> {
+        match self {
+            #[cfg(feature = "host")]
+            Self::Invoke { source, .. } => source.guest_panic(),
+            Self::Encode { .. } | Self::Decode { .. } => None,
+        }
+    }
 }
 
 /// Server-side dispatch error used by the in-debugger guest implementation.
