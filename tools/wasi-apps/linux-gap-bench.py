@@ -16,6 +16,7 @@ import time
 import tomllib
 from pathlib import Path
 
+import linux_workload_runner as runner
 from fedora_qemu_baseline import (
     DEFAULT_DISK_SIZE,
     DEFAULT_MEMORY,
@@ -31,7 +32,12 @@ from fedora_qemu_baseline import (
 
 # Helios inspector arch name -> Fedora guest arch name.
 LINUX_GUEST_ARCHES = {"aarch64": "aarch64", "x86-64": "x86_64"}
+from tcp_echo_server import start_tcp_echo_server
 from tcp_throughput_server import DEFAULT_PAYLOAD_BYTES, start_tcp_throughput_server
+
+# Workload classes in the order the report lists them; each names the design
+# claim its workloads isolate (see docs/benchmarks.md).
+WORKLOAD_CLASSES = ["startup", "hostcall", "ipc", "sched", "net", "fs", "compute"]
 
 HTTP_PAYLOAD_FILE = "payload.txt"
 HTTP_LARGE_PAYLOAD_FILE = "payload-64m.bin"
@@ -53,6 +59,11 @@ HOST_SERVER_BIND_ADDRESS = "0.0.0.0"
 DEFAULT_MAX_HOST_LOAD_PER_CPU = 0.75
 TOP_CPU_PROCESS_LIMIT = 8
 DEFAULT_HELIOS_TIMEOUT_SECONDS = 600
+# The whole Helios side of a lane, control runs included. A hosted CI job
+# is capped at six hours whatever its `timeout-minutes` says, and the
+# Linux side of the same lane needs provisioning plus its own budget, so
+# the Helios side is bounded well inside that rather than at it.
+DEFAULT_HELIOS_SIDE_TIMEOUT_SECONDS = 10800
 STALE_PROCESS_COMMAND_LIMIT = 240
 
 
@@ -93,6 +104,29 @@ def terminate_process_group(pid: int) -> None:
         return
 
 
+class HeliosRunFailed(RuntimeError):
+    """One `workload-bench.sh` invocation did not finish its workloads.
+
+    A guest that dies costs the invocation it was serving and nothing
+    else: the suite boots one VM per workload class, so the caller
+    records the class it lost and keeps the classes it can still measure.
+    """
+
+
+def class_budget(remaining_seconds: float, classes_left: int, per_class_cap: int) -> int:
+    """How long the next workload class may hold the Helios side.
+
+    The side's budget is shared out as the classes run rather than split
+    up front, so a class that finishes early hands the rest back and a
+    class that wedges cannot take more than its share of what is left.
+    The per-class cap still applies: it is what a healthy class is
+    allowed, and the share is only ever smaller.
+    """
+    if classes_left <= 0:
+        return 0
+    return max(0, min(per_class_cap, int(remaining_seconds // classes_left)))
+
+
 def run_isolated(
     command: list[str],
     env: dict[str, str] | None = None,
@@ -108,13 +142,13 @@ def run_isolated(
         returncode = process.wait(timeout=timeout_seconds)
     except subprocess.TimeoutExpired as error:
         terminate_process_group(process.pid)
-        raise SystemExit(
+        raise HeliosRunFailed(
             f"command timed out after {timeout_seconds}s: {shlex.join(command)}"
         ) from error
     finally:
         terminate_process_group(process.pid)
     if returncode != 0:
-        raise subprocess.CalledProcessError(returncode, command)
+        raise HeliosRunFailed(f"{shlex.join(command)} exited with status {returncode}")
 
 
 def output(command: list[str]) -> str:
@@ -130,16 +164,24 @@ def output(command: list[str]) -> str:
 
 
 def load_manifest(path: Path) -> dict:
-    with path.open("r", encoding="utf-8") as handle:
-        manifest = json.load(handle)
-    if manifest.get("schema_version") != 1:
-        raise SystemExit(f"unsupported workload manifest schema_version {manifest.get('schema_version')}")
-    return manifest
+    return runner.load_manifest(path)
 
 
-def selected_workloads(manifest: dict, classes: list[str], names: list[str]) -> list[dict]:
+def selected_workloads(
+    manifest: dict,
+    classes: list[str],
+    names: list[str],
+    skipped: list[str] | None = None,
+) -> list[dict]:
+    skipped = skipped or []
+    known = {workload["name"] for workload in manifest["workloads"]}
+    for name in skipped:
+        if name not in known:
+            raise SystemExit(f"unknown skipped workload {name}")
     selected = []
     for workload in manifest["workloads"]:
+        if workload["name"] in skipped:
+            continue
         if names and workload["name"] not in names:
             continue
         if classes and workload["class"] not in classes:
@@ -148,6 +190,11 @@ def selected_workloads(manifest: dict, classes: list[str], names: list[str]) -> 
     if not selected:
         raise SystemExit("workload selection matched no manifest entries")
     for name in names:
+        # A name asked for and skipped in the same breath is skipped: the
+        # caller names every workload it wants and then subtracts the ones
+        # this side cannot compare, and the subtraction has to win.
+        if name in skipped:
+            continue
         if not any(workload["name"] == name for workload in selected):
             raise SystemExit(f"unknown or filtered workload {name}")
     return selected
@@ -337,51 +384,206 @@ def run_helios(
     iterations: int,
     workloads: list[dict],
     arch: str,
+    accel: str | None,
     host_http_url: str | None,
     host_tcp_host: str | None,
     host_tcp_port: int | None,
+    host_tcp_echo_port: int | None,
     timeout_seconds: int,
+    side_timeout_seconds: int,
+    control_workload: dict | None,
+    keep_going: bool,
 ) -> Path:
     log = out_dir / "helios.jsonl"
     workloads_by_class: dict[str, list[str]] = {}
     for workload in workloads:
         workloads_by_class.setdefault(workload["class"], []).append(workload["name"])
 
+    # The whole Helios side runs inside one budget, the way the Linux
+    # side does. A guest that stops answering is bounded by the
+    # inspector's own deadlines, but a boot that never reaches the
+    # debugger is not, so without this a wedged class holds the runner
+    # until the CI job's own cap: run 33952047436 spent ninety-five of
+    # its final minutes there.
+    deadline = time.monotonic() + side_timeout_seconds
+
+    def remaining() -> float:
+        return deadline - time.monotonic()
+
+    def run_control(moment: str) -> None:
+        # The control workload measures the machine, not Helios: the same
+        # program before and after the suite bounds how much the host
+        # drifted while the numbers in between were taken. It is the run's
+        # own precondition, so losing it fails the run.
+        if control_workload is None:
+            return
+        run_helios_once(
+            manifest,
+            out_dir / f"helios-control-{moment}.jsonl",
+            iterations,
+            [],
+            [control_workload["name"]],
+            arch,
+            accel,
+            host_http_url,
+            host_tcp_host,
+            host_tcp_port,
+            host_tcp_echo_port,
+            class_budget(remaining(), 1, timeout_seconds),
+            keep_going,
+        )
+
+    try:
+        run_control("before")
+    except HeliosRunFailed as error:
+        raise SystemExit(f"the control workload could not be measured: {error}") from error
+
+    # The after-control is the run's own precondition, so it keeps its
+    # own run's worth of the budget rather than competing with the
+    # classes for what is left.
+    control_reserve = timeout_seconds if control_workload is not None else 0
+
     if len(workloads_by_class) > 1:
         class_logs = []
+        lost_classes = []
+        classes_left = len(workloads_by_class)
         for workload_class, workload_names in workloads_by_class.items():
             class_log = out_dir / f"helios-{workload_class}.jsonl"
-            run_helios_once(
-                manifest,
-                class_log,
-                iterations,
-                [workload_class],
-                workload_names,
-                arch,
-                host_http_url,
-                host_tcp_host,
-                host_tcp_port,
-                timeout_seconds,
+            budget = class_budget(
+                remaining() - control_reserve, classes_left, timeout_seconds
             )
+            classes_left -= 1
+            try:
+                if budget <= 0:
+                    raise HeliosRunFailed(
+                        "the Helios side's budget was spent before this class could run"
+                    )
+                run_helios_once(
+                    manifest,
+                    class_log,
+                    iterations,
+                    [workload_class],
+                    workload_names,
+                    arch,
+                    accel,
+                    host_http_url,
+                    host_tcp_host,
+                    host_tcp_port,
+                    host_tcp_echo_port,
+                    budget,
+                    keep_going,
+                )
+            except HeliosRunFailed as error:
+                if not keep_going:
+                    raise
+                # One class runs in one guest, so a guest this class killed
+                # costs this class and no other. Whatever it managed to
+                # write stays; the workloads it never reached become failed
+                # cells naming the reason, and the next class gets a fresh
+                # guest.
+                print(
+                    f"helios class {workload_class!r} did not finish; recording its "
+                    f"unmeasured workloads as failed and continuing: {error}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                record_unmeasured(class_log, workloads, workload_names, str(error))
+                lost_classes.append(workload_class)
             class_logs.append(class_log)
         with log.open("w", encoding="utf-8") as output_handle:
             for class_log in class_logs:
-                output_handle.write(class_log.read_text(encoding="utf-8"))
+                if class_log.exists():
+                    output_handle.write(class_log.read_text(encoding="utf-8"))
+        try:
+            run_control("after")
+        except HeliosRunFailed as error:
+            raise SystemExit(f"the control workload could not be measured: {error}") from error
+        if lost_classes:
+            print(
+                "helios workload classes recorded as failed: " + ", ".join(lost_classes),
+                file=sys.stderr,
+                flush=True,
+            )
         return log
 
-    run_helios_once(
-        manifest,
-        log,
-        iterations,
-        list(workloads_by_class),
-        [workload["name"] for workload in workloads],
-        arch,
-        host_http_url,
-        host_tcp_host,
-        host_tcp_port,
-        timeout_seconds,
-    )
+    try:
+        run_helios_once(
+            manifest,
+            log,
+            iterations,
+            list(workloads_by_class),
+            [workload["name"] for workload in workloads],
+            arch,
+            accel,
+            host_http_url,
+            host_tcp_host,
+            host_tcp_port,
+            host_tcp_echo_port,
+            class_budget(remaining() - control_reserve, 1, timeout_seconds),
+            keep_going,
+        )
+    except HeliosRunFailed as error:
+        if not keep_going:
+            raise
+        print(
+            f"helios run did not finish; recording its unmeasured workloads as failed: {error}",
+            file=sys.stderr,
+            flush=True,
+        )
+        record_unmeasured(
+            log,
+            workloads,
+            [workload["name"] for workload in workloads],
+            str(error),
+        )
+    try:
+        run_control("after")
+    except HeliosRunFailed as error:
+        raise SystemExit(f"the control workload could not be measured: {error}") from error
     return log
+
+
+def record_unmeasured(
+    log: Path,
+    workloads: list[dict],
+    selected: list[str],
+    error: str,
+) -> None:
+    """Appends a failure record for every selected workload the log misses.
+
+    A workload with no record at all disappears from the report, which is
+    the one outcome a published table must never have: a cell is either a
+    number or a stated failure.
+    """
+    measured = set()
+    if log.exists():
+        with log.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                record = json.loads(line)
+                if record["type"] in ("summary", "failure"):
+                    measured.add(record["workload"])
+    by_name = {workload["name"]: workload for workload in workloads}
+    with log.open("a", encoding="utf-8") as handle:
+        for name in selected:
+            if name in measured:
+                continue
+            workload = by_name[name]
+            handle.write(
+                json.dumps(
+                    {
+                        "type": "failure",
+                        "workload": name,
+                        "class": workload["class"],
+                        "headline": bool(workload.get("headline", False)),
+                        "runner": workload["runner"],
+                        "error": error,
+                    }
+                )
+                + "\n"
+            )
 
 
 def run_helios_once(
@@ -391,13 +593,21 @@ def run_helios_once(
     classes: list[str],
     names: list[str],
     arch: str,
+    accel: str | None,
     host_http_url: str | None,
     host_tcp_host: str | None,
     host_tcp_port: int | None,
+    host_tcp_echo_port: int | None,
     timeout_seconds: int,
+    keep_going: bool,
 ) -> None:
     env = os.environ.copy()
     env["HELIOS_WORKLOAD_BENCH_ARCH"] = arch
+    if accel:
+        # The inspector requires the profile's native accelerator when
+        # nobody names one, so the lane's choice is passed down rather
+        # than rediscovered per boot.
+        env["HELIOS_WORKLOAD_BENCH_ACCEL"] = accel
     env["HELIOS_WORKLOAD_BENCH_ITERATIONS"] = str(iterations)
     env["HELIOS_WORKLOAD_BENCH_MANIFEST"] = str(manifest)
     env["HELIOS_WORKLOAD_BENCH_LOG"] = str(log)
@@ -420,6 +630,10 @@ def run_helios_once(
         env["HELIOS_WORKLOAD_BENCH_HOST_TCP_HOST"] = host_tcp_host
     if host_tcp_port is not None:
         env["HELIOS_WORKLOAD_BENCH_HOST_TCP_PORT"] = str(host_tcp_port)
+    if host_tcp_echo_port is not None:
+        env["HELIOS_WORKLOAD_BENCH_HOST_TCP_ECHO_PORT"] = str(host_tcp_echo_port)
+    if keep_going:
+        env["HELIOS_WORKLOAD_BENCH_KEEP_GOING"] = "1"
     run_isolated(["tools/wasi-apps/workload-bench.sh"], env=env, timeout_seconds=timeout_seconds)
 
 
@@ -440,11 +654,15 @@ def run_linux(
     host_http_url: str | None,
     host_tcp_host: str | None,
     linux_tcp_port: int | None,
+    linux_tcp_echo_port: int | None,
     quickjs_source_archive: Path | None,
     wasmtime_linux_bin: Path | None,
     wasmtime_linux_archive: Path | None,
     guest_arch: str,
     accel: str | None,
+    native_bin_dir: Path | None,
+    control_workload: dict | None,
+    keep_going: bool,
 ) -> tuple[Path | None, Path | None, dict]:
     return run_fedora_qemu_linux(
         repo_root(),
@@ -463,11 +681,15 @@ def run_linux(
         host_http_url,
         host_tcp_host,
         linux_tcp_port,
+        linux_tcp_echo_port,
         quickjs_source_archive,
         wasmtime_linux_bin,
         wasmtime_linux_archive,
         guest_arch=guest_arch,
         accel=accel,
+        native_bin_dir=native_bin_dir,
+        control_workload=control_workload,
+        keep_going=keep_going,
     )
 
 
@@ -528,12 +750,30 @@ def parse_jsonl(path: Path | None) -> tuple[dict, dict[str, dict]]:
     return run_record, summaries
 
 
-def parse_hyperfine(path: Path | None) -> dict[str, dict]:
+def parse_linux_jsonl(path: Path | None) -> dict[str, dict]:
+    """Per-workload summaries of one Linux side, keyed by workload name.
+
+    ``median`` is kept in seconds because that is the unit every comparison
+    below derives its milliseconds from.
+    """
     if path is None or not path.exists():
         return {}
+    summaries: dict[str, dict] = {}
+    metrics: dict[str, list[dict]] = {}
     with path.open("r", encoding="utf-8") as handle:
-        data = json.load(handle)
-    return {entry["command"]: entry for entry in data.get("results", [])}
+        for line in handle:
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            if record["type"] == "iteration":
+                metrics.setdefault(record["workload"], []).append(record["metrics"])
+            if record["type"] == "summary":
+                summaries[record["workload"]] = {
+                    "median": record["median_elapsed_ms"] / 1000.0,
+                    "elapsed_ms": record["elapsed_ms"],
+                    "metrics": metrics.get(record["workload"], []),
+                }
+    return summaries
 
 
 def helios_perf_metric_paths(helios_jsonl: Path | None) -> list[Path]:
@@ -865,7 +1105,8 @@ def write_summary_json(
             ),
             "release": (linux_provenance or {}).get("wasmtime_linux_release"),
             "workloads": [
-                workload["name"] for workload in workloads if workload.get("wasmtime_profile")
+                workload["name"]
+                for workload in runner.workloads_with_counterpart(workloads, "linux_wasmtime")
             ],
         },
         "vm": run_record.get("vm"),
@@ -1149,8 +1390,8 @@ def write_report(
     wasmtime_profiles: list[Path],
 ) -> None:
     run_record, helios = parse_jsonl(helios_jsonl)
-    linux = parse_hyperfine(linux_json)
-    wasmtime_linux = parse_hyperfine(wasmtime_linux_json)
+    linux = parse_linux_jsonl(linux_json)
+    wasmtime_linux = parse_linux_jsonl(wasmtime_linux_json)
     rows = comparison_rows(workloads, helios, linux, wasmtime_linux)
     perf_metric_paths = helios_perf_metric_paths(helios_jsonl)
     helios_kernel_flamegraphs = render_helios_kernel_flamegraphs(helios_jsonl)
@@ -1184,8 +1425,8 @@ def write_report(
         "![Helios vs Fedora native and Wasmtime median timings](helios-vs-linux.svg)",
         "",
         f"- Helios JSONL: `{helios_jsonl or 'not-run'}`",
-        f"- Linux Hyperfine JSON: `{linux_json or 'not-run'}`",
-        f"- Wasmtime-on-Linux Hyperfine JSON: `{wasmtime_linux_json or 'not-run'}`",
+        f"- Linux native JSONL: `{linux_json or 'not-run'}`",
+        f"- Wasmtime-on-Linux JSONL: `{wasmtime_linux_json or 'not-run'}`",
         f"- Machine-readable summary: `{summary_json}`",
         f"- Helios git SHA: `{run_record.get('git_sha', git_sha())}`",
         f"- Linux baseline: `{(linux_provenance or {}).get('kind', 'not-run')}`",
@@ -1207,7 +1448,7 @@ def write_report(
     for workload in workloads:
         helios_summary = helios.get(workload["name"])
         wasmtime_summary = wasmtime_linux.get(workload["name"])
-        if not workload.get("wasmtime_profile"):
+        if runner.counterpart(workload, "linux_wasmtime") is None:
             wasmtime_floor_missing.append(workload["name"])
             continue
         helios_ms = helios_summary.get("median_elapsed_ms") if helios_summary else None
@@ -1368,7 +1609,8 @@ def write_report(
             )
         lines.append("")
 
-    for workload_class, title in [("cpu-bound", "CPU-Bound"), ("io-bound", "IO-Bound")]:
+    for workload_class in WORKLOAD_CLASSES:
+        title = workload_class.capitalize()
         class_workloads = [workload for workload in workloads if workload["class"] == workload_class]
         if not class_workloads:
             continue
@@ -1413,8 +1655,8 @@ def write_report(
             "## Raw Iterations",
             "",
             f"- Helios raw iteration timings are in `{helios_jsonl or 'not-run'}`.",
-            f"- Linux raw hyperfine timings are in `{linux_json or 'not-run'}`.",
-            f"- Wasmtime-on-Linux raw hyperfine timings are in `{wasmtime_linux_json or 'not-run'}`.",
+            f"- Linux native raw iteration timings are in `{linux_json or 'not-run'}`.",
+            f"- Wasmtime-on-Linux raw iteration timings are in `{wasmtime_linux_json or 'not-run'}`.",
         ]
     )
     for perf_path in perf_metric_paths:
@@ -1452,13 +1694,31 @@ def write_report(
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
+    """This driver's command line.
+
+    Built apart from `main` so the argv `helios-bench` emits can be parsed
+    by the very parser that will receive it: the two are edited together
+    and otherwise only meet forty minutes into a lane.
+    """
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", type=Path, default=repo_root() / "tools/wasi-apps/workloads.json")
     parser.add_argument("--iterations", type=int, default=5)
-    parser.add_argument("--class", dest="classes", action="append", choices=["cpu-bound", "io-bound"], default=[])
+    parser.add_argument("--class", dest="classes", action="append", choices=WORKLOAD_CLASSES, default=[])
     parser.add_argument("--workload", dest="workloads", action="append", default=[])
+    parser.add_argument(
+        "--skip-workload",
+        dest="skip_workloads",
+        action="append",
+        default=[],
+        help="leave a workload out of the run entirely, by name",
+    )
     parser.add_argument("--arch", default="aarch64")
+    parser.add_argument(
+        "--helios-accel",
+        default=None,
+        help="accelerator the Helios guest boots on; the inspector requires one to be named",
+    )
     parser.add_argument("--helios-host-http-host", default="10.0.2.2")
     parser.add_argument("--helios-host-tcp-host", default="10.0.2.2")
     parser.add_argument("--fedora-image-url", default=None)
@@ -1477,6 +1737,12 @@ def main() -> None:
         ),
     )
     parser.add_argument("--linux-vm-dir", type=Path, default=None)
+    parser.add_argument(
+        "--native-bin-dir",
+        type=Path,
+        default=None,
+        help="Static Linux binaries from tools/bench/native/build.sh; defaults to artifacts/bench-native/<guest-arch>.",
+    )
     parser.add_argument("--linux-vm-qemu-bin", default=None)
     parser.add_argument(
         "--linux-vm-accel",
@@ -1504,6 +1770,16 @@ def main() -> None:
         help="Pre-staged Linux Wasmtime tar archive for the guest architecture, copied into the Fedora guest for the Wasmtime-on-Linux timing baseline.",
     )
     parser.add_argument("--out-dir", type=Path)
+    parser.add_argument(
+        "--control",
+        action="store_true",
+        help="Run the manifest's control_workload before and after the suite on every side to measure machine noise.",
+    )
+    parser.add_argument(
+        "--keep-going",
+        action="store_true",
+        help="record a workload that fails and continue with the next one, on every side",
+    )
     parser.add_argument("--skip-helios", action="store_true")
     parser.add_argument("--skip-linux", action="store_true")
     parser.add_argument("--wasmtime-profile-workload", action="append", default=[])
@@ -1525,12 +1801,28 @@ def main() -> None:
         default=DEFAULT_HELIOS_TIMEOUT_SECONDS,
         help="Maximum wall-clock seconds for each isolated Helios VM workload command.",
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "--helios-side-timeout-seconds",
+        type=int,
+        default=DEFAULT_HELIOS_SIDE_TIMEOUT_SECONDS,
+        help=(
+            "Maximum wall-clock seconds for the whole Helios side, control runs "
+            "included. The classes share what is left of it as they run, so a "
+            "guest that wedges costs its own class rather than the runner."
+        ),
+    )
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
 
     if args.iterations <= 0:
         raise SystemExit("--iterations must be a positive integer")
     if args.max_host_load_per_cpu <= 0:
         raise SystemExit("--max-host-load-per-cpu must be positive")
+    if args.helios_side_timeout_seconds <= 0:
+        raise SystemExit("--helios-side-timeout-seconds must be a positive integer")
     if args.helios_timeout_seconds <= 0:
         raise SystemExit("--helios-timeout-seconds must be positive")
     if args.linux_vm_smp <= 0:
@@ -1570,13 +1862,18 @@ def main() -> None:
             args.linux_vm_qemu_bin = QEMU_BINS[linux_guest_arch]
         if args.linux_vm_dir is None:
             args.linux_vm_dir = default_asset_dir(linux_guest_arch)
+        if args.native_bin_dir is None:
+            args.native_bin_dir = repo_root() / "artifacts/bench-native" / linux_guest_arch
 
     if not args.skip_helios:
         enforce_no_stale_helios_benchmark_processes()
     host_load = host_load_snapshot()
     enforce_host_load(host_load, args.max_host_load_per_cpu, args.allow_busy_host)
     manifest = load_manifest(args.manifest)
-    workloads = selected_workloads(manifest, args.classes, args.workloads)
+    workloads = selected_workloads(manifest, args.classes, args.workloads, args.skip_workloads)
+    control_workload = None
+    if args.control:
+        control_workload = runner.selected_workload(manifest, manifest["control_workload"])
     out_dir = args.out_dir or repo_root() / "target/perf-baselines" / f"linux-gap-{git_short_sha()}-{int(time.time())}"
     if not out_dir.is_absolute():
         out_dir = repo_root() / out_dir
@@ -1589,12 +1886,15 @@ def main() -> None:
     profile_workloads = selected_workloads(manifest, [], args.wasmtime_profile_workload) if args.wasmtime_profile_workload else []
     needs_http = any(workload.get("requires_host_http", False) for workload in workloads + profile_workloads)
     needs_tcp = any(workload.get("requires_host_tcp", False) for workload in workloads)
+    needs_tcp_echo = any(workload.get("requires_host_tcp_echo", False) for workload in workloads)
     server = None
     tcp_server = None
+    tcp_echo_server = None
     host_http_url = None
     local_http_url = None
     host_tcp_host = None
     host_tcp_port = None
+    host_tcp_echo_port = None
     if needs_http:
         server, port = start_host_http(http_root)
         host_http_url = f"http://{args.helios_host_http_host}:{port}/{HTTP_PAYLOAD_FILE}"
@@ -1605,7 +1905,12 @@ def main() -> None:
         )
         host_tcp_host = args.helios_host_tcp_host
         host_tcp_port = port
+    if needs_tcp_echo and (not args.skip_helios or not args.skip_linux):
+        tcp_echo_server, port = start_tcp_echo_server("127.0.0.1", 0)
+        host_tcp_host = args.helios_host_tcp_host
+        host_tcp_echo_port = port
     linux_tcp_port = host_tcp_port if needs_tcp and not args.skip_linux else None
+    linux_tcp_echo_port = host_tcp_echo_port if needs_tcp_echo and not args.skip_linux else None
 
     try:
         helios_jsonl = None
@@ -1620,10 +1925,15 @@ def main() -> None:
                 args.iterations,
                 workloads,
                 args.arch,
+                args.helios_accel,
                 host_http_url,
                 host_tcp_host,
                 host_tcp_port,
+                host_tcp_echo_port,
                 args.helios_timeout_seconds,
+                args.helios_side_timeout_seconds,
+                control_workload,
+                args.keep_going,
             )
         if not args.skip_linux:
             linux_json, wasmtime_linux_json, linux_provenance = run_linux(
@@ -1643,11 +1953,15 @@ def main() -> None:
                 host_http_url,
                 host_tcp_host,
                 linux_tcp_port,
+                linux_tcp_echo_port,
                 args.quickjs_source_archive,
                 args.wasmtime_linux_bin,
                 args.wasmtime_linux_archive,
                 linux_guest_arch,
                 args.linux_vm_accel,
+                args.native_bin_dir,
+                control_workload,
+                args.keep_going,
             )
         if args.wasmtime_profile_workload:
             wasmtime_profiles = run_wasmtime_profiles(
@@ -1681,7 +1995,15 @@ def main() -> None:
         if tcp_server:
             tcp_server.shutdown()
             tcp_server.server_close()
+        if tcp_echo_server:
+            tcp_echo_server.shutdown()
+            tcp_echo_server.server_close()
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except HeliosRunFailed as error:
+        # A run that gave up says so in one line; the traceback of a
+        # subprocess exit code told the reader nothing.
+        raise SystemExit(str(error)) from error

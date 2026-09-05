@@ -1,0 +1,39 @@
+{% import "macros.md.j2" as m with context %}
+# {{ report.run.lane }} — {{ "advisory" if report.run.advisory else "dedicated" }} run{% if report.run.id %} [{{ report.run.id }}]({{ report.run.url }}){% endif %}
+
+Helios `{{ report.run.helios_git_sha[:12] }}` on {{ report.hardware.cpu }} ({{ report.hardware.logical_cpus }} logical CPUs, {{ report.hardware.accelerator }}, QEMU {{ report.hardware.qemu_version or "unknown" }}).
+Warm series: {{ report.thresholds.iterations - report.thresholds.warmup_discard }} iterations after {{ report.thresholds.warmup_discard }} discarded; median with the {{ (report.thresholds.confidence * 100) | round | int }}% bootstrap interval of the median ({{ report.thresholds.bootstrap_resamples }} resamples). Times in milliseconds.
+{% if report.control %}
+Noise floor from `{{ report.control.workload }}` before and after the suite: {{ report.control.noise_floor | percent }}.
+{% endif %}
+{% if not report.run.publishable %}
+
+> Not publishable: {% if report.run.advisory %}advisory run on a shared runner{% endif %}{% for deviation in report.run.deviations %}; {{ deviation }}{% endfor %}.
+{% endif %}
+
+{% for workload_class, workloads in report.by_class().items() %}
+## {{ CLASS_LABELS[workload_class] }}
+
+{{ m.header() }}
+{% for workload in workloads %}
+{{ m.row(workload) }}
+{% endfor %}
+
+{% for workload in workloads %}
+{% for side, reason in workload.failures.items() %}
+- `{{ workload.name }}` failed on {{ SIDE_LABELS[side] }}: {{ reason }}
+
+{% endfor %}
+{% set helios = workload.cells.get(Side.HELIOS) %}
+{% if helios and helios.metrics %}
+`{{ workload.name }}` secondary metrics (warm medians):
+{% for side in [Side.HELIOS, Side.LINUX_WASMTIME, Side.LINUX_NATIVE] %}
+{% set cell = workload.cells.get(side) %}
+{% if cell and cell.metrics %}
+- {{ SIDE_LABELS[side] }}: {% for name, stats in cell.metrics.items() %}`{{ name }}`={{ stats.median | round(3) }}{{ ", " if not loop.last }}{% endfor %}
+
+{% endif %}
+{% endfor %}
+{% endif %}
+{% endfor %}
+{% endfor %}

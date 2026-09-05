@@ -22,7 +22,9 @@ use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 
 use crate::stats_tui::format_bytes;
-use crate::workload_bench::{VmProvenance, WorkloadBenchCommand};
+use crate::workload_bench::{
+    DEFAULT_WORKLOAD_TIMEOUT_SECONDS, VmProvenance, WorkloadBenchCommand, guest_step_under_deadline,
+};
 use crate::{SessionCommand, connect_client, run_connected};
 
 mod network;
@@ -1470,16 +1472,26 @@ fn run_workload_bench(
             || command.kernel_profile_output.is_some()
             || command.user_profile_output.is_some()
             || command.perf_metrics_output.is_some();
+        let seconds = command.workload_timeout_seconds;
         let before_profile = if collect_profile {
-            system_profiling::clear(&client)
-                .await
-                .context("failed to clear remote profile samples")?;
-            system_profiling::set_enabled(&client, true)
-                .await
-                .context("failed to enable remote profiling")?;
-            system_profiling::folded(&client, &profile_filter, 0)
-                .await
-                .context("failed to read initial remote profile samples")?
+            guest_step_under_deadline("the profile reset", seconds, async {
+                system_profiling::clear(&client)
+                    .await
+                    .context("failed to clear remote profile samples")
+            })
+            .await?;
+            guest_step_under_deadline("the profiler hand-off", seconds, async {
+                system_profiling::set_enabled(&client, true)
+                    .await
+                    .context("failed to enable remote profiling")
+            })
+            .await?;
+            guest_step_under_deadline("the initial profile read", seconds, async {
+                system_profiling::folded(&client, &profile_filter, 0)
+                    .await
+                    .context("failed to read initial remote profile samples")
+            })
+            .await?
         } else {
             Vec::new()
         };
@@ -1487,20 +1499,30 @@ fn run_workload_bench(
         if let Err(error) =
             crate::workload_bench::run_inner(&mut client, &command, &provenance).await
         {
-            print_recent_guest_errors(&mut client).await;
+            print_recent_guest_errors(&mut client, seconds).await;
             return Err(error);
         }
 
         if collect_profile {
-            system_profiling::set_enabled(&client, false)
-                .await
-                .context("failed to disable remote profiling")?;
-            let after_profile = system_profiling::folded(&client, &profile_filter, 0)
-                .await
-                .context("failed to read final remote profile samples")?;
-            let metrics = system_profiling::metrics(&client, &metric_filter, 0)
-                .await
-                .context("failed to read final remote perf metrics")?;
+            guest_step_under_deadline("the profiler stop", seconds, async {
+                system_profiling::set_enabled(&client, false)
+                    .await
+                    .context("failed to disable remote profiling")
+            })
+            .await?;
+            let after_profile =
+                guest_step_under_deadline("the final profile read", seconds, async {
+                    system_profiling::folded(&client, &profile_filter, 0)
+                        .await
+                        .context("failed to read final remote profile samples")
+                })
+                .await?;
+            let metrics = guest_step_under_deadline("the perf metric read", seconds, async {
+                system_profiling::metrics(&client, &metric_filter, 0)
+                    .await
+                    .context("failed to read final remote perf metrics")
+            })
+            .await?;
             write_requested_profile_outputs(&command, &before_profile, &after_profile, &metrics)?;
         }
         Ok(())
@@ -1510,11 +1532,20 @@ fn run_workload_bench(
 /// Fetches and prints the guest's recent tracing events (info level and
 /// up, so boot markers frame the failure) so a failed remote operation
 /// is diagnosable from the CLI without a second tracing session.
-async fn print_recent_guest_errors(client: &mut crate::serial::RpcClient) {
+///
+/// It runs under the same deadline as the run's other guest steps: the
+/// call that brings us here is often a guest that stopped answering, and
+/// a diagnostic that hangs replaces the failure it was fetched to
+/// explain.
+async fn print_recent_guest_errors(client: &mut crate::serial::RpcClient, seconds: u32) {
     let mut config = crate::system::TracingConfig::new();
     config.limit = 100;
     config.min_level = Some(helios_inspector_protocol::system::tracing::Level::Info);
-    match crate::system::fetch_tracing(client, &config).await {
+    let fetched = guest_step_under_deadline("the tracing fetch", seconds, async {
+        crate::system::fetch_tracing(client, &config).await
+    })
+    .await;
+    match fetched {
         Ok(events) if events.is_empty() => {}
         Ok(events) => {
             eprintln!("recent guest tracing events:");
@@ -1594,7 +1625,7 @@ fn run_aot_bench(mut client: crate::serial::RpcClient, command: AotBenchCommand)
                     // Surface the guest-side error events before bailing:
                     // the RPC error kind alone (e.g. `Internal`) does not
                     // say which runtime operation actually failed.
-                    print_recent_guest_errors(&mut client).await;
+                    print_recent_guest_errors(&mut client, DEFAULT_WORKLOAD_TIMEOUT_SECONDS).await;
                     return Err(anyhow::anyhow!(
                         "remote AOT iteration {iteration} failed: {:?}: {}",
                         error.kind,

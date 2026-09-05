@@ -1,0 +1,14 @@
+[package]
+name = "helios-hello-wasi"
+version = "0.1.0"
+edition = "2024"
+description = "Smallest possible child program: prints one line, optionally holds until stdin closes."
+
+[dependencies]
+thiserror = "2.0.17"
+
+[[bin]]
+name = "helios_hello_wasi"
+path = "src/main.rs"
+
+[workspace]

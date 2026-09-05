@@ -433,16 +433,8 @@ fn install_pci_devices<WatchdogImpl>(
         tracing::warn!("virtio vsock device was not discovered on the PCI bus");
     }
     if let Some(address) = balloon_function {
-        let (handler, handle) = balloon::install(
-            kernel,
-            pci,
-            address,
-            physical_memory_offset,
-            exceptions::BALLOON_INTERRUPT_VECTOR,
-            destination_apic_id,
-        );
+        let handle = balloon::install(kernel, pci, address, physical_memory_offset);
         debug_state.install_memory_balloon(handle);
-        routes.set_balloon(exceptions::BALLOON_INTERRUPT_VECTOR, handler);
     }
     // The x86 address space reserves and commits lazily, so a page could
     // be taken away here — but the backend has not wired the other half:

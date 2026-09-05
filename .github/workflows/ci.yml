@@ -714,7 +714,15 @@ jobs:
             accel: kvm
             # KVM boots in seconds; a marker hang should fail fast.
             boot-timeout: "300"
-            workloads: ""
+            # The instance-density cells cannot be measured on any guest
+            # today: the user-memory pool does not grow with the guest, so
+            # the spawn is refused with a typed out-of-memory error (#130).
+            # They stay out of this lane's gating set rather than teaching
+            # the lane to tolerate a failed cell — the benchmark suite is
+            # where a failure becomes a recorded cell with its reason.
+            workloads: >-
+              --skip-workload instance-startup-100
+              --skip-workload instance-startup-500
             # Linux runners allow sudo, so the network workloads run over
             # a multi-queue tap with vhost-net: the only host packet path
             # on which the guest's virtio-net multiqueue, checksum and
@@ -830,11 +838,16 @@ jobs:
           # The inspector echoes the guest's boot lines on stderr; the
           # log is kept so the next step can record which virtio-net
           # features this lane actually negotiated.
+          #
+          # The side budget is what bounds the lane: the per-class cap is
+          # what one healthy class may take, and this is what all of them
+          # together may take, inside the job's own 75 minutes.
           python3 tools/wasi-apps/linux-gap-bench.py \
             --arch ${{ matrix.helios-arch }} \
             --skip-linux \
             --allow-busy-host \
             --helios-timeout-seconds 9000 \
+            --helios-side-timeout-seconds 3000 \
             --helios-host-http-host ${{ matrix.net-host }} \
             --helios-host-tcp-host ${{ matrix.net-host }} \
             --out-dir target/perf-baselines/ci-${{ matrix.name }} \
@@ -851,8 +864,11 @@ jobs:
               printf 'comparable with the multi-queue tap lanes.'
             fi
             printf '\n\n```\n'
-            grep -h -e 'virtio-net online' -e 'virtio features negotiated' \
-              "${NET_BOOT_LOG}" ${BENCH_RUNTIME_DIR}/*.log 2>/dev/null | sort -u \
+            # One runtime subdirectory per workload class, so the logs
+            # are a level down from the directory the lane names.
+            find "${BENCH_RUNTIME_DIR}" -name '*.log' -print0 2>/dev/null \
+              | xargs -0 grep -h -e 'virtio-net online' -e 'virtio features negotiated' \
+                  "${NET_BOOT_LOG}" 2>/dev/null | sort -u \
               || printf 'no virtio-net bring-up line was logged\n'
             printf '```\n'
           } >> "$GITHUB_STEP_SUMMARY"

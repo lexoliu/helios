@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -10,6 +11,11 @@ use helios_inspector_protocol::system::programs as system_programs;
 use serde::{Deserialize, Serialize};
 
 const HOST_HTTP_LARGE_PAYLOAD_FILE: &str = "payload-64m.bin";
+const WORKLOAD_MANIFEST_SCHEMA_VERSION: u16 = 2;
+/// Prefix of the stdout lines a workload uses to report a secondary
+/// measurement, `bench.<name>=<number>`; the Linux runner parses the same
+/// lines so every side of the comparison carries the same metric names.
+const METRIC_LINE_PREFIX: &str = "bench.";
 
 /// How long one workload iteration may take before the run gives up on
 /// it.
@@ -23,7 +29,7 @@ const HOST_HTTP_LARGE_PAYLOAD_FILE: &str = "payload-64m.bin";
 /// workload moves 64 MiB, so three minutes is orders of magnitude of
 /// headroom over anything healthy and still turns a hang into a named
 /// failure inside one step.
-const DEFAULT_WORKLOAD_TIMEOUT_SECONDS: u32 = 180;
+pub(crate) const DEFAULT_WORKLOAD_TIMEOUT_SECONDS: u32 = 180;
 
 /// A workload that never came back.
 ///
@@ -43,6 +49,11 @@ pub(crate) enum WorkloadBenchError {
         iteration: u16,
         seconds: u32,
     },
+    #[error(
+        "the guest did not answer {step} within {seconds}s; the run's workloads are \
+         already recorded, so the guest is torn down rather than waited on"
+    )]
+    GuestStepTimedOut { step: &'static str, seconds: u32 },
 }
 
 #[derive(Debug, Clone, ClapArgs)]
@@ -75,6 +86,17 @@ pub(crate) struct WorkloadBenchCommand {
     #[arg(long)]
     host_tcp_port: Option<u16>,
 
+    /// Host TCP echo port visible from inside the VM for round-trip latency workloads.
+    #[arg(long)]
+    host_tcp_echo_port: Option<u16>,
+
+    /// Record a workload that fails as a `failure` record and go on to the
+    /// next one, instead of ending the run at the first failure. The
+    /// benchmark suite runs this way so every cell of its report is
+    /// accounted for; the exit status stays zero and the JSONL is the record.
+    #[arg(long)]
+    pub(crate) keep_going: bool,
+
     /// Write folded kernel/user profile samples collected during the workload run.
     #[arg(long)]
     pub(crate) profile_output: Option<PathBuf>,
@@ -96,11 +118,18 @@ pub(crate) struct WorkloadBenchCommand {
     pub(crate) workload_timeout_seconds: u32,
 }
 
+/// The design claim a workload isolates; `docs/benchmarks.md` describes
+/// each class and the Linux counterpart it is compared against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum WorkloadClass {
-    CpuBound,
-    IoBound,
+    Startup,
+    Hostcall,
+    Ipc,
+    Sched,
+    Net,
+    Fs,
+    Compute,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,6 +150,9 @@ struct WorkloadManifest {
 struct Workload {
     name: String,
     class: WorkloadClass,
+    /// Whether the regression gate and the README table carry this workload.
+    #[serde(default)]
+    headline: bool,
     runner: WorkloadRunner,
     #[serde(rename = "description")]
     _description: String,
@@ -140,6 +172,8 @@ struct Workload {
     requires_host_http: bool,
     #[serde(default)]
     requires_host_tcp: bool,
+    #[serde(default)]
+    requires_host_tcp_echo: bool,
     #[serde(default)]
     wasm_path: Option<PathBuf>,
     #[serde(default)]
@@ -174,9 +208,12 @@ enum JsonlRecord<'a> {
     Iteration {
         workload: &'a str,
         class: WorkloadClass,
+        headline: bool,
         runner: WorkloadRunner,
         iteration: u16,
         elapsed_ms: u128,
+        /// Secondary measurements the workload printed as `bench.<name>=<number>`.
+        metrics: BTreeMap<String, f64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         throughput_bytes: Option<u64>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -185,9 +222,20 @@ enum JsonlRecord<'a> {
         stderr: StreamValidation<'a>,
         validation: ValidationSummary,
     },
+    /// A workload that did not produce a summary: how far it got is in
+    /// the iteration records before this one, and `error` says why it
+    /// stopped. Written only under `--keep-going`.
+    Failure {
+        workload: &'a str,
+        class: WorkloadClass,
+        headline: bool,
+        runner: WorkloadRunner,
+        error: String,
+    },
     Summary {
         workload: &'a str,
         class: WorkloadClass,
+        headline: bool,
         runner: WorkloadRunner,
         median_elapsed_ms: u128,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -251,66 +299,65 @@ pub(crate) async fn run_inner(
         selected_workloads,
     })?;
 
-    for workload in workloads {
-        let mut elapsed_ms = Vec::new();
-        for iteration in 1..=command.iterations {
-            let output = match workload.runner {
-                WorkloadRunner::Shell => {
-                    under_deadline(
-                        &workload,
-                        iteration,
-                        command,
-                        run_shell_workload(client, &workload, command),
-                    )
-                    .await?
+    let mut failed = Vec::new();
+    let mut remaining = workloads.into_iter();
+    while let Some(workload) = remaining.next() {
+        let elapsed_ms = match measure_workload(client, &workload, command).await {
+            Ok(elapsed_ms) => elapsed_ms,
+            Err(error) if guest_panic(&error).is_some() => {
+                // The guest kernel is gone: every further workload would
+                // measure a corpse. Record what this one and each of the
+                // ones behind it never got to measure, so the report
+                // carries a failed cell for each instead of silently
+                // dropping them, then let the caller see the panic.
+                //
+                // The cells carry the panic report rather than the error
+                // chain: every layer the panic crossed repeats it, and a
+                // table cell wants the kernel's sentence once.
+                let report = format!(
+                    "guest kernel panicked during {}: {}",
+                    workload.name,
+                    guest_panic(&error).unwrap_or_default()
+                );
+                eprintln!(
+                    "helios-inspector: workload {} killed the guest; recording the rest as failed: {error:#}",
+                    workload.name
+                );
+                for pending in core::iter::once(workload).chain(remaining) {
+                    write_record(&JsonlRecord::Failure {
+                        workload: &pending.name,
+                        class: pending.class,
+                        headline: pending.headline,
+                        runner: pending.runner,
+                        error: report.clone(),
+                    })?;
+                    failed.push(pending.name);
                 }
-                WorkloadRunner::Program => {
-                    under_deadline(
-                        &workload,
-                        iteration,
-                        command,
-                        run_program_workload(client, &workload, command),
-                    )
-                    .await?
-                }
-                WorkloadRunner::HeliosAot => {
-                    under_deadline(
-                        &workload,
-                        iteration,
-                        command,
-                        run_aot_workload(client, &workload, iteration),
-                    )
-                    .await?
-                }
-            };
-            let validation = validate_output(&workload, &output.stdout, &output.stderr)
-                .with_context(|| {
-                    format!(
-                        "workload {} iteration {} failed validation",
-                        workload.name, iteration
-                    )
+                report_failed(&failed);
+                return Err(error);
+            }
+            Err(error) if command.keep_going => {
+                eprintln!(
+                    "helios-inspector: workload {} failed; recorded and continuing: {error:#}",
+                    workload.name
+                );
+                write_record(&JsonlRecord::Failure {
+                    workload: &workload.name,
+                    class: workload.class,
+                    headline: workload.headline,
+                    runner: workload.runner,
+                    error: format!("{error:#}"),
                 })?;
-            elapsed_ms.push(output.elapsed_ms);
-            write_record(&JsonlRecord::Iteration {
-                workload: &workload.name,
-                class: workload.class,
-                runner: workload.runner,
-                iteration,
-                elapsed_ms: output.elapsed_ms,
-                throughput_bytes: workload.throughput_bytes,
-                throughput_mib_per_second: throughput_mib_per_second(
-                    workload.throughput_bytes,
-                    output.elapsed_ms,
-                ),
-                stdout: stream_validation(&workload, &output.stdout, false),
-                stderr: stream_validation(&workload, &output.stderr, workload.stderr_empty),
-                validation,
-            })?;
-        }
+                failed.push(workload.name.clone());
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         let median = median(&elapsed_ms)?;
         write_record(&JsonlRecord::Summary {
             workload: &workload.name,
             class: workload.class,
+            headline: workload.headline,
             runner: workload.runner,
             median_elapsed_ms: median,
             throughput_bytes: workload.throughput_bytes,
@@ -320,7 +367,98 @@ pub(crate) async fn run_inner(
             validation: ValidationSummary { ok: true },
         })?;
     }
+    report_failed(&failed);
     Ok(())
+}
+
+fn report_failed(failed: &[String]) {
+    if failed.is_empty() {
+        return;
+    }
+    eprintln!(
+        "helios-inspector: {} workload(s) recorded as failed: {}",
+        failed.len(),
+        failed.join(", ")
+    );
+}
+
+/// The guest's panic report when this error is a dead guest.
+///
+/// A panicked kernel answers no further RPC, so the transport reports it
+/// as a typed fault rather than letting the read block until the outer
+/// deadline; the bench driver has to tell that apart from a workload
+/// that merely failed.
+fn guest_panic(error: &anyhow::Error) -> Option<&str> {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<helios_inspector_protocol::RpcError>())
+        .find_map(helios_inspector_protocol::RpcError::guest_panic)
+}
+
+/// Times every iteration of one workload, writing its iteration records.
+async fn measure_workload(
+    client: &mut crate::serial::RpcClient,
+    workload: &Workload,
+    command: &WorkloadBenchCommand,
+) -> Result<Vec<u128>> {
+    let mut elapsed_ms = Vec::new();
+    for iteration in 1..=command.iterations {
+        let output = match workload.runner {
+            WorkloadRunner::Shell => {
+                under_deadline(
+                    workload,
+                    iteration,
+                    command,
+                    run_shell_workload(client, workload, command),
+                )
+                .await?
+            }
+            WorkloadRunner::Program => {
+                under_deadline(
+                    workload,
+                    iteration,
+                    command,
+                    run_program_workload(client, workload, command),
+                )
+                .await?
+            }
+            WorkloadRunner::HeliosAot => {
+                under_deadline(
+                    workload,
+                    iteration,
+                    command,
+                    run_aot_workload(client, workload, iteration),
+                )
+                .await?
+            }
+        };
+        let validation =
+            validate_output(workload, &output.stdout, &output.stderr).with_context(|| {
+                format!(
+                    "workload {} iteration {} failed validation",
+                    workload.name, iteration
+                )
+            })?;
+        elapsed_ms.push(output.elapsed_ms);
+        write_record(&JsonlRecord::Iteration {
+            workload: &workload.name,
+            class: workload.class,
+            headline: workload.headline,
+            runner: workload.runner,
+            iteration,
+            elapsed_ms: output.elapsed_ms,
+            metrics: parse_metrics(&output.stdout)?,
+            throughput_bytes: workload.throughput_bytes,
+            throughput_mib_per_second: throughput_mib_per_second(
+                workload.throughput_bytes,
+                output.elapsed_ms,
+            ),
+            stdout: stream_validation(workload, &output.stdout, false),
+            stderr: stream_validation(workload, &output.stderr, workload.stderr_empty),
+            validation,
+        })?;
+    }
+    Ok(elapsed_ms)
 }
 
 #[derive(Debug)]
@@ -356,6 +494,27 @@ async fn under_deadline(
             seconds,
         }
         .into());
+    };
+    result
+}
+
+/// Runs one guest step of the run that is not a workload — the profile
+/// hand-off, the tracing fetch, the teardown — under the same deadline a
+/// workload iteration gets.
+///
+/// Every one of those is an RPC to the same guest, and a guest that has
+/// stopped answering stops answering all of them. Without a bound here
+/// the run's last words are the last workload's, and the process sits on
+/// a dead VM until something outside it notices: run 33952047436 spent
+/// ninety-five minutes that way, holding QEMU open behind it.
+pub(crate) async fn guest_step_under_deadline<T>(
+    step: &'static str,
+    seconds: u32,
+    run: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    let Some(result) = crate::runtime::timeout(Duration::from_secs(u64::from(seconds)), run).await
+    else {
+        return Err(WorkloadBenchError::GuestStepTimedOut { step, seconds }.into());
     };
     result
 }
@@ -519,10 +678,11 @@ fn load_manifest(path: &Path) -> Result<WorkloadManifest> {
         .with_context(|| format!("failed to read workload manifest {}", path.display()))?;
     let manifest: WorkloadManifest = serde_json::from_slice(&bytes)
         .with_context(|| format!("failed to decode workload manifest {}", path.display()))?;
-    if manifest.schema_version != 1 {
+    if manifest.schema_version != WORKLOAD_MANIFEST_SCHEMA_VERSION {
         bail!(
-            "unsupported workload manifest schema_version {}",
-            manifest.schema_version
+            "unsupported workload manifest schema_version {}, expected {}",
+            manifest.schema_version,
+            WORKLOAD_MANIFEST_SCHEMA_VERSION
         );
     }
     Ok(manifest)
@@ -627,7 +787,48 @@ fn render_helios_template(
         })?;
         rendered = rendered.replace("{host_tcp_port}", &port.to_string());
     }
+    if workload.requires_host_tcp_echo
+        && (command.host_tcp_host.is_none() || command.host_tcp_echo_port.is_none())
+    {
+        bail!(
+            "workload {} requires --host-tcp-host and --host-tcp-echo-port for VM-visible host TCP echo",
+            workload.name
+        );
+    }
+    if rendered.contains("{host_tcp_echo_port}") {
+        let port = command.host_tcp_echo_port.ok_or_else(|| {
+            anyhow::anyhow!(
+                "workload {} requires --host-tcp-echo-port for VM-visible host TCP echo",
+                workload.name
+            )
+        })?;
+        rendered = rendered.replace("{host_tcp_echo_port}", &port.to_string());
+    }
     Ok(rendered)
+}
+
+/// Collects the `bench.<name>=<number>` lines a workload printed.
+///
+/// A malformed metric line is a workload bug, not noise to skip: the
+/// report would silently lose the measurement the workload exists for.
+fn parse_metrics(stdout: &[u8]) -> Result<BTreeMap<String, f64>> {
+    let mut metrics = BTreeMap::new();
+    for line in String::from_utf8_lossy(stdout).lines() {
+        let Some(assignment) = line.strip_prefix(METRIC_LINE_PREFIX) else {
+            continue;
+        };
+        let (name, value) = assignment
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("metric line {line:?} has no `=`"))?;
+        let value = value
+            .trim()
+            .parse::<f64>()
+            .with_context(|| format!("metric line {line:?} has a non-numeric value"))?;
+        if metrics.insert(name.trim().to_owned(), value).is_some() {
+            bail!("metric {name:?} was reported twice");
+        }
+    }
+    Ok(metrics)
 }
 
 fn large_host_http_url(host_http_url: &str) -> Result<String> {
@@ -782,6 +983,8 @@ mod tests {
             host_http_url: None,
             host_tcp_host: None,
             host_tcp_port: None,
+            host_tcp_echo_port: None,
+            keep_going: false,
             profile_output: None,
             kernel_profile_output: None,
             user_profile_output: None,
@@ -830,7 +1033,7 @@ mod tests {
     }
 
     #[test]
-    fn io_class_filter_excludes_cpu_workloads() {
+    fn net_class_filter_excludes_compute_workloads() {
         let command = WorkloadBenchCommand {
             manifest: Path::new(env!("CARGO_MANIFEST_DIR"))
                 .parent()
@@ -838,10 +1041,12 @@ mod tests {
                 .join("tools/wasi-apps/workloads.json"),
             iterations: 5,
             workloads: Vec::new(),
-            classes: vec![WorkloadClass::IoBound],
+            classes: vec![WorkloadClass::Net],
             host_http_url: None,
             host_tcp_host: None,
             host_tcp_port: None,
+            host_tcp_echo_port: None,
+            keep_going: false,
             profile_output: None,
             kernel_profile_output: None,
             user_profile_output: None,
@@ -852,8 +1057,64 @@ mod tests {
         assert!(
             workloads
                 .iter()
-                .all(|workload| workload.class == WorkloadClass::IoBound)
+                .all(|workload| workload.class == WorkloadClass::Net)
         );
+    }
+
+    #[test]
+    fn headline_workloads_cover_every_design_claim() {
+        let command = WorkloadBenchCommand {
+            manifest: Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .expect("inspector crate must live under repo root")
+                .join("tools/wasi-apps/workloads.json"),
+            iterations: 5,
+            workloads: Vec::new(),
+            classes: Vec::new(),
+            host_http_url: None,
+            host_tcp_host: None,
+            host_tcp_port: None,
+            host_tcp_echo_port: None,
+            keep_going: false,
+            profile_output: None,
+            kernel_profile_output: None,
+            user_profile_output: None,
+            perf_metrics_output: None,
+            workload_timeout_seconds: DEFAULT_WORKLOAD_TIMEOUT_SECONDS,
+        };
+        let workloads = select_workloads(&command).expect("manifest must parse");
+        for class in [
+            WorkloadClass::Startup,
+            WorkloadClass::Hostcall,
+            WorkloadClass::Ipc,
+            WorkloadClass::Sched,
+            WorkloadClass::Net,
+            WorkloadClass::Fs,
+            WorkloadClass::Compute,
+        ] {
+            assert!(
+                workloads
+                    .iter()
+                    .any(|workload| workload.class == class && workload.headline),
+                "class {class:?} has no headline workload"
+            );
+        }
+        let latency = workloads
+            .iter()
+            .find(|workload| workload.name == "tcp-latency")
+            .expect("manifest must contain the TCP latency workload");
+        assert!(latency.requires_host_tcp_echo);
+    }
+
+    #[test]
+    fn metric_lines_are_collected_and_validated() {
+        let metrics =
+            parse_metrics(b"pipe-pingpong:20000\nbench.rtt_p50_us=12.5\nbench.rtt_p99_us=40\n")
+                .expect("well-formed metrics parse");
+        assert_eq!(metrics.get("rtt_p50_us"), Some(&12.5));
+        assert_eq!(metrics.get("rtt_p99_us"), Some(&40.0));
+        assert!(parse_metrics(b"bench.broken\n").is_err());
+        assert!(parse_metrics(b"bench.x=1\nbench.x=2\n").is_err());
     }
 
     #[test]
@@ -875,6 +1136,8 @@ mod tests {
             host_http_url: None,
             host_tcp_host: None,
             host_tcp_port: None,
+            host_tcp_echo_port: None,
+            keep_going: false,
             profile_output: None,
             kernel_profile_output: None,
             user_profile_output: None,
@@ -886,7 +1149,8 @@ mod tests {
     fn timeout_test_workload(name: &str) -> Workload {
         Workload {
             name: name.to_owned(),
-            class: WorkloadClass::IoBound,
+            class: WorkloadClass::Net,
+            headline: false,
             runner: WorkloadRunner::Program,
             _description: String::new(),
             command: None,
@@ -897,6 +1161,7 @@ mod tests {
             stderr_empty: false,
             requires_host_http: false,
             requires_host_tcp: false,
+            requires_host_tcp_echo: false,
             wasm_path: None,
             remote_path: None,
             destination_path: None,
@@ -956,5 +1221,36 @@ mod tests {
         .expect("a workload that answers in time must not be failed");
 
         assert_eq!(output.elapsed_ms, 24);
+    }
+
+    /// The steps around the workloads are bounded too.
+    ///
+    /// The profile hand-off, the tracing fetch and the teardown all talk
+    /// to the same guest as a workload does, and a guest that stops
+    /// answering stops answering those as well. Run 33952047436 hung
+    /// there for ninety-five minutes after its last workload was
+    /// recorded, holding QEMU open behind it.
+    #[test]
+    fn a_guest_step_that_never_answers_is_failed_by_name() {
+        let error = crate::runtime::block_on(guest_step_under_deadline(
+            "the final profile read",
+            1,
+            std::future::pending::<Result<()>>(),
+        ))
+        .expect_err("a guest step that never answers must fail rather than hang");
+
+        let timed_out = error
+            .downcast_ref::<WorkloadBenchError>()
+            .expect("the failure must be the typed deadline error");
+        assert!(
+            matches!(
+                timed_out,
+                WorkloadBenchError::GuestStepTimedOut {
+                    step: "the final profile read",
+                    seconds: 1,
+                }
+            ),
+            "the failure must name the step and the deadline, got {timed_out}"
+        );
     }
 }

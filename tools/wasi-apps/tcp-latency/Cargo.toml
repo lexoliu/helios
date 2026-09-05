@@ -1,0 +1,15 @@
+[package]
+name = "helios-tcp-latency-wasi"
+version = "0.1.0"
+edition = "2024"
+description = "Round-trip latency of small messages against a TCP echo server through standard WASI sockets."
+
+[dependencies]
+helios-bench-metrics = { path = "../bench-metrics" }
+thiserror = "2.0.17"
+
+[[bin]]
+name = "helios_tcp_latency_wasi"
+path = "src/main.rs"
+
+[workspace]

@@ -1,0 +1,338 @@
+name: bench-suite
+
+# The publishable three-way comparison: Helios, Linux + Wasmtime and native
+# Linux on the same machine, accelerator and virtio devices, one lane per
+# architecture (docs/benchmarks.md).
+#
+# Two modes select the runner and the report's status:
+#   - dedicated: the self-hosted `helios-bench-*` machines; the report is
+#     publishable and the gate blocks on headline regressions. Taken by
+#     pushes to dev and by tags once the repository variable
+#     HELIOS_BENCH_DEDICATED is `true`, or by dispatching with
+#     advisory=false.
+#   - advisory: GitHub's shared runners; the report is marked
+#     non-publishable, the gate only comments. Taken by dispatch (the
+#     default) and by pull requests carrying the `bench` label.
+
+on:
+  workflow_dispatch:
+    inputs:
+      advisory:
+        description: Run on the shared runners and mark the report non-publishable
+        type: boolean
+        default: true
+      lanes:
+        description: Lanes to run
+        type: choice
+        options: [all, x86-64-kvm]
+        default: all
+      iterations:
+        description: Iterations per cell (empty = manifest default)
+        type: string
+        default: ""
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  push:
+    branches: [dev]
+    tags: ["v*"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  HELIOS_NET_IFNAME: helios0
+  HELIOS_NET_BRIDGE: helios-br0
+
+jobs:
+  tooling:
+    name: tooling
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      # Advisory unless this is a dedicated-runner event; `runs-on` below
+      # reads it through the needs context, the only one it can read.
+      advisory: ${{ steps.mode.outputs.advisory }}
+      # The suite's matrix, from tools/bench/manifest.toml: the lanes have
+      # one definition.
+      matrix: ${{ steps.lanes.outputs.matrix }}
+    steps:
+      - id: mode
+        run: |
+          if [ "${{ github.event_name }}" = workflow_dispatch ]; then
+            echo "advisory=${{ inputs.advisory }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = pull_request ]; then
+            echo "advisory=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "advisory=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Lint and test tools/bench
+        working-directory: tools/bench
+        run: |
+          uv sync --quiet
+          uv run ruff check .
+          uv run ruff format --check .
+          uv run pytest -q
+      - id: lanes
+        working-directory: tools/bench
+        run: |
+          select="${{ github.event_name == 'workflow_dispatch' && inputs.lanes || 'all' }}"
+          echo "matrix=$(uv run helios-bench lanes --select "$select" --format github-matrix)" >> "$GITHUB_OUTPUT"
+      - name: Verify the committed README and docs sections match their run's report
+        working-directory: tools/bench
+        run: uv run helios-bench render check
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.13.0
+      - name: Build the native counterparts
+        run: tools/bench/native/build.sh x86_64
+
+  suite:
+    name: suite-${{ matrix.lane }}
+    needs: tooling
+    # Heavy: only on dispatch, labelled PRs, tags, and dev pushes once the
+    # dedicated machines exist.
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'bench'))
+      || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/'))
+      || (github.event_name == 'push' && vars.HELIOS_BENCH_DEDICATED == 'true')
+    runs-on: ${{ needs.tooling.outputs.advisory == 'true' && matrix.shared-runner || matrix.dedicated-runner }}
+    env:
+      BENCH_ADVISORY: ${{ needs.tooling.outputs.advisory }}
+    timeout-minutes: 420
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.tooling.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: helios
+      - uses: ./helios/.github/actions/checkout-wasmtime
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libudev-dev just cmake ninja-build \
+            qemu-system-x86 ovmf qemu-utils genisoimage \
+            iproute2 nftables dnsmasq-base
+          if [ -e /dev/kvm ]; then
+            sudo chmod 666 /dev/kvm
+          fi
+      - uses: astral-sh/setup-uv@v6
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-tools
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.13.0
+      - name: Stage Limine bootloader share
+        run: |
+          git clone --depth 1 --branch v11.x-binary \
+            https://github.com/limine-bootloader/limine "$GITHUB_WORKSPACE/limine"
+          make -C "$GITHUB_WORKSPACE/limine"
+      - name: Restore WASI tooling artifacts
+        id: artifact-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            helios/artifacts/wasi-tools
+            helios/artifacts/python3-root
+            helios/artifacts/wasix
+          key: wasi-artifacts-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('helios/tools/wasi-apps/**', 'helios/Cargo.lock') }}
+      - name: Stage WASI tooling artifacts
+        if: steps.artifact-cache.outputs.cache-hit != 'true'
+        working-directory: helios
+        run: tools/wasi-apps/build.sh
+      - name: Restore pinned Fedora VM assets
+        uses: actions/cache@v4
+        with:
+          path: |
+            helios/target/perf-baselines/linux-vm/fedora-${{ matrix.guest-arch }}/*.qcow2
+            helios/target/perf-baselines/linux-vm/fedora-${{ matrix.guest-arch }}/sources
+            helios/target/perf-baselines/linux-vm/fedora-${{ matrix.guest-arch }}/tools
+          key: fedora-vm-assets-${{ matrix.guest-arch }}-${{ hashFiles('helios/tools/wasi-apps/fedora_qemu_baseline.py') }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: helios
+          key: bench-suite-${{ matrix.lane }}
+      - name: Install inferno flamegraph renderer
+        # The harness collects a folded kernel profile for every class and
+        # refuses to finish without the renderer that turns it into an SVG,
+        # the same way the ci.yml bench lanes provision it.
+        run: cargo install inferno --locked
+      - name: Build inspector
+        working-directory: helios
+        run: cargo build --release -p helios-inspector
+      - name: Install the bench tooling
+        working-directory: helios/tools/bench
+        run: uv sync --quiet
+      - name: Report host deviations from the lane
+        working-directory: helios/tools/bench
+        run: uv run helios-bench host-check --lane ${{ matrix.lane }} || true
+      - name: Provision the multi-queue tap network backend
+        if: matrix.net-backend == 'tap'
+        working-directory: helios
+        run: |
+          ./target/release/helios-inspector vm net-setup \
+            --net-backend tap \
+            --net-ifname "${HELIOS_NET_IFNAME}" \
+            --net-bridge "${HELIOS_NET_BRIDGE}" \
+            --net-dhcp
+      - name: Run the suite
+        working-directory: helios/tools/bench
+        env:
+          HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
+          HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: ${{ matrix.boot-timeout }}
+          HELIOS_WORKLOAD_BENCH_RUNTIME_DIR: ${{ github.workspace }}/bench-runtime
+        run: |
+          args=(run --lane "${{ matrix.lane }}" --out-dir "$GITHUB_WORKSPACE/bench-out/${{ matrix.lane }}"
+                --runner-label "${{ runner.name }}")
+          # The density cells' Helios half cannot be measured while the
+          # user-memory pool does not grow with the guest (#130), so a
+          # Linux number for them would have nothing to compare against —
+          # and the Linux side shares one budget out between the workloads
+          # it runs, so an uncomparable one takes its share from the rest.
+          # The Helios side still runs them: their failure is a recorded
+          # cell in the report, citing #130.
+          args+=(--skip-linux-workload instance-startup-100
+                 --skip-linux-workload instance-startup-500)
+          if [ "${BENCH_ADVISORY}" = true ]; then
+            args+=(--advisory --allow-busy-host)
+          fi
+          if [ -n "${{ inputs.iterations }}" ]; then
+            args+=(--iterations "${{ inputs.iterations }}")
+          fi
+          if [ "${{ matrix.net-backend }}" = tap ]; then
+            args+=(--net-ifname "${HELIOS_NET_IFNAME}" --net-bridge "${HELIOS_NET_BRIDGE}" --net-queues "$(nproc)")
+          fi
+          uv run helios-bench "${args[@]}"
+      # A bring-up failure leaves the inspector's one-line error and
+      # nothing else in the step log; the guest console and QEMU's own
+      # stderr live in the runtime directory, so collect it exactly as
+      # the ci.yml bench lanes do.
+      - name: Upload the inspector runtime directory
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-runtime-${{ matrix.lane }}
+          path: bench-runtime/**/*.log
+          if-no-files-found: warn
+      - name: Remove the tap network backend
+        if: always() && matrix.net-backend == 'tap'
+        working-directory: helios
+        run: |
+          ./target/release/helios-inspector vm net-teardown \
+            --net-backend tap \
+            --net-ifname "${HELIOS_NET_IFNAME}" \
+            --net-bridge "${HELIOS_NET_BRIDGE}"
+      - name: Publish the tables to the step summary
+        if: always()
+        run: |
+          tables="$GITHUB_WORKSPACE/bench-out/${{ matrix.lane }}/tables.md"
+          if [ -f "$tables" ]; then cat "$tables" >> "$GITHUB_STEP_SUMMARY"; fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-report-${{ matrix.lane }}
+          path: |
+            bench-out/${{ matrix.lane }}/report.json
+            bench-out/${{ matrix.lane }}/tables.md
+            bench-out/${{ matrix.lane }}/*.svg
+            bench-out/${{ matrix.lane }}/helios/*.jsonl
+            bench-out/${{ matrix.lane }}/helios/*.md
+            bench-out/${{ matrix.lane }}/linux/*.jsonl
+            bench-out/${{ matrix.lane }}/linux/*.md
+            bench-out/${{ matrix.lane }}/linux/summary.json
+          if-no-files-found: warn
+          retention-days: 90
+
+  gate:
+    name: gate-${{ matrix.lane }}
+    needs: [tooling, suite]
+    if: always() && needs.suite.result != 'skipped'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: write
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.tooling.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/download-artifact@v4
+        with:
+          name: bench-report-${{ matrix.lane }}
+          path: candidate
+      - name: Fetch the latest dev baseline for this lane
+        id: baseline
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The baseline is the newest successful bench-suite run on dev that
+          # published a report for this lane. Advisory candidates compare
+          # against it informationally; the gate only enforces when both
+          # reports came from dedicated runners.
+          for run_id in $(gh run list --workflow bench-suite.yml --branch dev --status success \
+                            --json databaseId --jq '.[].databaseId' --limit 20); do
+            if gh run download "$run_id" --name "bench-report-${{ matrix.lane }}" --dir baseline 2>/dev/null; then
+              echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+          echo "no dev baseline with a bench-report-${{ matrix.lane }} artifact yet"
+      - name: Compare
+        if: steps.baseline.outputs.run_id != ''
+        working-directory: tools/bench
+        run: |
+          uv sync --quiet
+          uv run helios-bench gate \
+            --baseline "$GITHUB_WORKSPACE/baseline/report.json" \
+            --candidate "$GITHUB_WORKSPACE/candidate/report.json" \
+            --out "$GITHUB_WORKSPACE/gate.md" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Comment on the pull request
+        if: github.event_name == 'pull_request' && always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ ! -f "$GITHUB_WORKSPACE/gate.md" ]; then
+            printf "### Benchmark gate, lane %s\n\nNo dev baseline exists for this lane yet; the candidate tables are in the run artifacts.\n" \
+              "${{ matrix.lane }}" > "$GITHUB_WORKSPACE/gate.md"
+          fi
+          gh pr comment "${{ github.event.pull_request.number }}" --body-file "$GITHUB_WORKSPACE/gate.md"
+
+  release-assets:
+    name: release-assets
+    needs: suite
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bench-report-*
+          path: reports
+      - name: Attach the reports to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # A paper cites the tag; the reports it cites are the release assets.
+          for lane_dir in reports/bench-report-*; do
+            lane="${lane_dir#reports/bench-report-}"
+            tar -C "$lane_dir" -czf "bench-report-${lane}.tar.gz" .
+            gh release upload "${GITHUB_REF_NAME}" "bench-report-${lane}.tar.gz" --clobber --repo "${GITHUB_REPOSITORY}"
+          done

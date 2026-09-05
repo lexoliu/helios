@@ -42,13 +42,25 @@ if [[ -n "${HELIOS_WORKLOAD_BENCH_ACCEL:-}" ]]; then
     command+=(--accel "${HELIOS_WORKLOAD_BENCH_ACCEL}")
 fi
 
+if [[ -n "${HELIOS_WORKLOAD_BENCH_VM_SMP:-}" ]]; then
+    command+=(--smp "${HELIOS_WORKLOAD_BENCH_VM_SMP}")
+fi
+
 # A benchmark that never boots leaves nothing behind to say why. Keeping
 # the runtime directory puts the guest console, QEMU's own stderr and the
 # inspector's log on disk, which is the only place a CI lane can collect
 # a bring-up failure from.
+#
+# One subdirectory per invocation, named after this invocation's log: a
+# benchmark run boots one guest per workload class through this script,
+# and they cannot share a directory. The boot image and the debug socket
+# live at fixed names inside it, so the next guest's QEMU fails to take
+# the write lock on `kernel.uefi.img` while the previous one still holds
+# it, and two guests would otherwise bind one `debug.sock`.
 if [[ -n "${HELIOS_WORKLOAD_BENCH_RUNTIME_DIR:-}" ]]; then
-    mkdir -p "${HELIOS_WORKLOAD_BENCH_RUNTIME_DIR}"
-    command+=(--runtime-dir "${HELIOS_WORKLOAD_BENCH_RUNTIME_DIR}" --keep-runtime-dir)
+    runtime_dir="${HELIOS_WORKLOAD_BENCH_RUNTIME_DIR}/$(basename "${log%.jsonl}")"
+    mkdir -p "${runtime_dir}"
+    command+=(--runtime-dir "${runtime_dir}" --keep-runtime-dir)
     # A network workload that fails leaves an exit status and nothing
     # about the wire. The capture sits between the virtio-net device and
     # the host backend, so it records what the guest driver actually
@@ -56,7 +68,7 @@ if [[ -n "${HELIOS_WORKLOAD_BENCH_RUNTIME_DIR:-}" ]]; then
     # is already one per boot, and a shared path would let the second
     # workload class overwrite the first's capture.
     if [[ -n "${HELIOS_WORKLOAD_BENCH_NET_PCAP:-}" ]]; then
-        command+=(--net-pcap "${HELIOS_WORKLOAD_BENCH_RUNTIME_DIR}/net.pcap")
+        command+=(--net-pcap "${runtime_dir}/net.pcap")
     fi
 fi
 
@@ -119,6 +131,13 @@ fi
 # own default applies unless a slower surface asks for more.
 if [[ -n "${HELIOS_WORKLOAD_BENCH_WORKLOAD_TIMEOUT_SECONDS:-}" ]]; then
     command+=(--workload-timeout-seconds "${HELIOS_WORKLOAD_BENCH_WORKLOAD_TIMEOUT_SECONDS}")
+fi
+
+if [[ -n "${HELIOS_WORKLOAD_BENCH_HOST_TCP_ECHO_PORT:-}" ]]; then
+    command+=(--host-tcp-echo-port "${HELIOS_WORKLOAD_BENCH_HOST_TCP_ECHO_PORT}")
+fi
+if [[ "${HELIOS_WORKLOAD_BENCH_KEEP_GOING:-0}" == "1" ]]; then
+    command+=(--keep-going)
 fi
 
 if [[ -n "${HELIOS_WORKLOAD_BENCH_PROFILE_OUTPUT:-}" ]]; then

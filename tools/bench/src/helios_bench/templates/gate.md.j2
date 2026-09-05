@@ -1,0 +1,22 @@
+### Benchmark gate — lane `{{ result.lane }}`
+
+Baseline run `{{ result.baseline_run or "local" }}`, candidate run `{{ result.candidate_run or "local" }}`, noise floor {{ result.noise_floor | percent }}.
+{% if result.enforced %}
+Both reports are from dedicated runners: headline regressions block.
+{% else %}
+Advisory comparison (at least one report is not publishable): nothing blocks, the table is informational.
+{% endif %}
+
+| Workload | Baseline | Candidate | Shift | CIs disjoint | Beyond noise | Verdict |
+| --- | ---: | ---: | ---: | :---: | :---: | --- |
+{% for row in result.rows %}
+| `{{ row.workload }}`{% if row.headline %} (headline){% endif %} | {{ row.baseline_median | ms }} | {{ row.candidate_median | ms }} | {{ row.shift | percent }} | {{ "yes" if row.ci_disjoint else "no" }} | {{ "yes" if row.beyond_noise else "no" }} | {% if row.regression %}**regression**{% elif row.improvement %}improvement{% else %}unchanged{% endif %} |
+{% endfor %}
+
+{% if result.blocking %}
+**Blocking**: {{ result.headline_regressions | map(attribute="workload") | join(", ") }} regressed significantly.
+{% elif result.regressions %}
+Significant regressions outside the headline set or on an advisory report: {{ result.regressions | map(attribute="workload") | join(", ") }}.
+{% else %}
+No significant regression.
+{% endif %}

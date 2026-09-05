@@ -66,7 +66,8 @@ clippy-host:
         --exclude helios-aarch64 --exclude helios-riscv --exclude helios-x86 \
         --exclude helios-date --exclude helios-debugger --exclude helios-http-client \
         --exclude helios-init --exclude helios-oob-load --exclude helios-perf \
-        --exclude helios-ping \
+        --exclude helios-ping --exclude helios-procbench \
+        --exclude helios-sched-tasks \
         -- -D warnings
 
 # Clippy each guest program on its own, denying warnings.
@@ -77,7 +78,8 @@ clippy-programs:
     # `helios-api` worlds, and a single invocation covering several of
     # them would unify those features and fail to build.
     for package in helios-date helios-debugger helios-http-client \
-        helios-init helios-oob-load helios-perf helios-ping; do
+        helios-init helios-oob-load helios-perf helios-ping helios-procbench \
+        helios-sched-tasks; do
         cargo clippy -p "${package}" --all-targets -- -D warnings
     done
 
@@ -165,3 +167,13 @@ test-embedded-debugger:
         --cargo cargo
     HELIOS_KERNEL_PREBUILD_MANIFEST="${out_dir}/kernel-prebuild.json" \
         cargo test -p helios-hosted init_program::tests::embedded_debugger_ -- --nocapture
+
+# Unit tests and lint of the benchmark-suite tooling (tools/bench); no benchmark runs.
+check-bench-tools:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd "{{repo_root}}/tools/bench"
+    uv sync --quiet
+    uv run ruff check .
+    uv run ruff format --check .
+    uv run pytest -q

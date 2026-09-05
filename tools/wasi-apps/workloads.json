@@ -1,34 +1,42 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
+  "control_workload": "quickjs-loop",
   "workloads": [
     {
       "name": "quickjs-loop",
-      "class": "cpu-bound",
+      "class": "compute",
+      "headline": true,
       "runner": "program",
-      "description": "Arithmetic loop in QuickJS.",
+      "description": "Arithmetic loop in QuickJS; compute parity against Linux+Wasmtime.",
       "program": "{quickjs}",
       "args": [
         "-e",
         "let s = 0; for (let i = 0; i < 250000; i++) s = (s + ((i * 17) % 97)) | 0; console.log(\"quickjs-loop:\" + s);"
       ],
-      "wasmtime_profile": {
-        "wasm_path": "artifacts/wasix/quickjs/qjs.wasm",
-        "args": [
-          "-e",
-          "let s = 0; for (let i = 0; i < 250000; i++) s = (s + ((i * 17) % 97)) | 0; console.log(\"quickjs-loop:\" + s);"
-        ]
-      },
       "boot_programs": [
         "quickjs"
       ],
       "stdout_contains": [
         "quickjs-loop:"
       ],
-      "stderr_empty": true
+      "stderr_empty": true,
+      "counterparts": {
+        "linux_native": {
+          "inherit": true
+        },
+        "linux_wasmtime": {
+          "wasm_path": "artifacts/wasix/quickjs/qjs.wasm",
+          "args": [
+            "-e",
+            "let s = 0; for (let i = 0; i < 250000; i++) s = (s + ((i * 17) % 97)) | 0; console.log(\"quickjs-loop:\" + s);"
+          ]
+        }
+      }
     },
     {
       "name": "cpython-json",
-      "class": "cpu-bound",
+      "class": "compute",
+      "headline": true,
       "runner": "program",
       "description": "Parse and serialize JSON repeatedly in CPython.",
       "program": "{python3}",
@@ -36,30 +44,36 @@
         "-c",
         "import json; data=[{\"i\":i,\"s\":str(i)} for i in range(800)]; total=sum(len(json.loads(json.dumps(data,separators=(\",\",\":\")))) for _ in range(40)); print(f\"cpython-json:{total}\")"
       ],
-      "wasmtime_profile": {
-        "wasm_path": "artifacts/python3-root/python3.wasm",
-        "guest_paths": [
-          "artifacts/python3-root"
-        ],
-        "wasmtime_flags": [
-          "--dir",
-          "{repo_root}/artifacts/python3-root::/"
-        ],
-        "args": [
-          "-c",
-          "import json; data=[{\"i\":i,\"s\":str(i)} for i in range(800)]; total=sum(len(json.loads(json.dumps(data,separators=(\",\",\":\")))) for _ in range(40)); print(f\"cpython-json:{total}\")"
-        ]
-      },
       "boot_programs": [
         "python3"
       ],
       "stdout_contains": [
         "cpython-json:32000"
-      ]
+      ],
+      "counterparts": {
+        "linux_native": {
+          "inherit": true
+        },
+        "linux_wasmtime": {
+          "wasm_path": "artifacts/python3-root/python3.wasm",
+          "guest_paths": [
+            "artifacts/python3-root"
+          ],
+          "wasmtime_flags": [
+            "--dir",
+            "{repo_root}/artifacts/python3-root::/"
+          ],
+          "args": [
+            "-c",
+            "import json; data=[{\"i\":i,\"s\":str(i)} for i in range(800)]; total=sum(len(json.loads(json.dumps(data,separators=(\",\",\":\")))) for _ in range(40)); print(f\"cpython-json:{total}\")"
+          ]
+        }
+      }
     },
     {
       "name": "cpython-regex",
-      "class": "cpu-bound",
+      "class": "compute",
+      "headline": false,
       "runner": "program",
       "description": "Regex and text processing loop in CPython.",
       "program": "{python3}",
@@ -67,58 +81,252 @@
         "-c",
         "import re; text=(\"alpha123 beta456 gamma789 delta000\\n\"*2000); total=sum(len(re.findall(r\"[a-z]+\\d+\", text)) for _ in range(80)); print(f\"cpython-regex:{total}\")"
       ],
-      "wasmtime_profile": {
-        "wasm_path": "artifacts/python3-root/python3.wasm",
-        "guest_paths": [
-          "artifacts/python3-root"
-        ],
-        "wasmtime_flags": [
-          "--dir",
-          "{repo_root}/artifacts/python3-root::/"
-        ],
-        "args": [
-          "-c",
-          "import re; text=(\"alpha123 beta456 gamma789 delta000\\n\"*2000); total=sum(len(re.findall(r\"[a-z]+\\d+\", text)) for _ in range(80)); print(f\"cpython-regex:{total}\")"
-        ]
-      },
       "boot_programs": [
         "python3"
       ],
       "stdout_contains": [
         "cpython-regex:640000"
-      ]
+      ],
+      "counterparts": {
+        "linux_native": {
+          "inherit": true
+        },
+        "linux_wasmtime": {
+          "wasm_path": "artifacts/python3-root/python3.wasm",
+          "guest_paths": [
+            "artifacts/python3-root"
+          ],
+          "wasmtime_flags": [
+            "--dir",
+            "{repo_root}/artifacts/python3-root::/"
+          ],
+          "args": [
+            "-c",
+            "import re; text=(\"alpha123 beta456 gamma789 delta000\\n\"*2000); total=sum(len(re.findall(r\"[a-z]+\\d+\", text)) for _ in range(80)); print(f\"cpython-regex:{total}\")"
+          ]
+        }
+      }
     },
     {
       "name": "aot-curl",
-      "class": "cpu-bound",
+      "class": "compute",
+      "headline": false,
       "runner": "helios-aot",
-      "description": "Compiler-plugin AOT timing for the curl wasm artifact.",
+      "description": "Compiler-plugin AOT timing for the curl wasm artifact against `wasmtime compile` of the same input.",
       "wasm_path": "artifacts/wasi-tools/curl.wasm",
       "remote_path": "/aot-bench-curl-input.wasm",
-      "destination_path": "/aot-bench-curl-output.cwasm"
+      "destination_path": "/aot-bench-curl-output.cwasm",
+      "counterparts": {
+        "linux_native": null,
+        "linux_wasmtime": {
+          "program": "{wasmtime}",
+          "args": [
+            "compile",
+            "-o",
+            "{workdir}/aot-curl-output.cwasm",
+            "{guest:artifacts/wasi-tools/curl.wasm}"
+          ]
+        }
+      }
     },
     {
       "name": "wasm-simd-lanes",
-      "class": "cpu-bound",
+      "class": "compute",
+      "headline": false,
       "runner": "program",
       "description": "Execute a deterministic wasm SIMD lane computation.",
       "program": "{simd_lanes}",
       "boot_programs": [
         "simd-lanes"
       ],
-      "wasmtime_profile": {
-        "wasm_path": "artifacts/wasix/simd-lanes/simd-lanes.wasm"
-      },
       "stdout_contains": [
         "simd-lanes:17"
       ],
-      "stderr_empty": true
+      "stderr_empty": true,
+      "counterparts": {
+        "linux_native": {
+          "inherit": true
+        },
+        "linux_wasmtime": {
+          "wasm_path": "artifacts/wasix/simd-lanes/simd-lanes.wasm"
+        }
+      }
+    },
+    {
+      "name": "instance-startup-1",
+      "class": "startup",
+      "headline": false,
+      "runner": "program",
+      "description": "Time to first output of one freshly spawned instance, and its memory footprint.",
+      "program": "/bin/procbench",
+      "args": [
+        "startup",
+        "1",
+        "/bin/hello",
+        "hold"
+      ],
+      "boot_programs": [
+        "procbench",
+        "hello"
+      ],
+      "stdout_contains": [
+        "instance-startup:1"
+      ],
+      "stderr_empty": true,
+      "counterparts": {
+        "linux_native": {
+          "program": "{native_bin}/procbench",
+          "args": [
+            "startup",
+            "1",
+            "{native_bin}/hello",
+            "hold"
+          ]
+        },
+        "linux_wasmtime": {
+          "program": "{native_bin}/procbench",
+          "args": [
+            "startup",
+            "1",
+            "{wasmtime_run}",
+            "{cwasm:artifacts/wasi-tools/hello.wasm}",
+            "hold"
+          ]
+        }
+      }
+    },
+    {
+      "name": "instance-startup-100",
+      "class": "startup",
+      "headline": true,
+      "runner": "program",
+      "description": "Time to first output across 100 concurrently spawned instances, and memory per instance.",
+      "program": "/bin/procbench",
+      "args": [
+        "startup",
+        "100",
+        "/bin/hello",
+        "hold"
+      ],
+      "boot_programs": [
+        "procbench",
+        "hello"
+      ],
+      "stdout_contains": [
+        "instance-startup:100"
+      ],
+      "stderr_empty": true,
+      "counterparts": {
+        "linux_native": {
+          "program": "{native_bin}/procbench",
+          "args": [
+            "startup",
+            "100",
+            "{native_bin}/hello",
+            "hold"
+          ]
+        },
+        "linux_wasmtime": {
+          "program": "{native_bin}/procbench",
+          "args": [
+            "startup",
+            "100",
+            "{wasmtime_run}",
+            "{cwasm:artifacts/wasi-tools/hello.wasm}",
+            "hold"
+          ]
+        }
+      }
+    },
+    {
+      "name": "instance-startup-500",
+      "class": "startup",
+      "headline": false,
+      "runner": "program",
+      "description": "Time to first output across 500 concurrently spawned instances, and memory per instance.",
+      "program": "/bin/procbench",
+      "args": [
+        "startup",
+        "500",
+        "/bin/hello",
+        "hold"
+      ],
+      "boot_programs": [
+        "procbench",
+        "hello"
+      ],
+      "stdout_contains": [
+        "instance-startup:500"
+      ],
+      "stderr_empty": true,
+      "counterparts": {
+        "linux_native": {
+          "program": "{native_bin}/procbench",
+          "args": [
+            "startup",
+            "500",
+            "{native_bin}/hello",
+            "hold"
+          ]
+        },
+        "linux_wasmtime": {
+          "program": "{native_bin}/procbench",
+          "args": [
+            "startup",
+            "500",
+            "{wasmtime_run}",
+            "{cwasm:artifacts/wasi-tools/hello.wasm}",
+            "hold"
+          ]
+        }
+      }
+    },
+    {
+      "name": "spawn-wait",
+      "class": "startup",
+      "headline": true,
+      "runner": "program",
+      "description": "Sequential spawn plus wait of a trivial child, 200 times.",
+      "program": "/bin/procbench",
+      "args": [
+        "spawn-wait",
+        "200",
+        "/bin/hello"
+      ],
+      "boot_programs": [
+        "procbench",
+        "hello"
+      ],
+      "stdout_contains": [
+        "spawn-wait:200"
+      ],
+      "stderr_empty": true,
+      "counterparts": {
+        "linux_native": {
+          "program": "{native_bin}/procbench",
+          "args": [
+            "spawn-wait",
+            "200",
+            "{native_bin}/hello"
+          ]
+        },
+        "linux_wasmtime": {
+          "program": "{native_bin}/procbench",
+          "args": [
+            "spawn-wait",
+            "200",
+            "{wasmtime_run}",
+            "{cwasm:artifacts/wasi-tools/hello.wasm}"
+          ]
+        }
+      }
     },
     {
       "name": "process-startup",
-      "class": "io-bound",
+      "class": "startup",
+      "headline": false,
       "runner": "shell",
-      "description": "Repeated shell command startup.",
+      "description": "Repeated shell command startup through dash.",
       "command": "i=0; while [ $i -lt 20 ]; do {dash} -c true; i=$((i+1)); done; echo process-startup:ok",
       "boot_programs": [
         "dash"
@@ -126,11 +334,134 @@
       "stdout_contains": [
         "process-startup:ok"
       ],
-      "stderr_empty": true
+      "stderr_empty": true,
+      "counterparts": {
+        "linux_native": {
+          "inherit": true
+        },
+        "linux_wasmtime": null
+      }
+    },
+    {
+      "name": "hostcall-loop",
+      "class": "hostcall",
+      "headline": true,
+      "runner": "program",
+      "description": "Two million calls of wasi:clocks/monotonic-clock.now against clock_gettime on Linux.",
+      "program": "/bin/hostcall-loop",
+      "args": [
+        "2000000"
+      ],
+      "boot_programs": [
+        "hostcall-loop"
+      ],
+      "stdout_contains": [
+        "hostcall-loop:2000000"
+      ],
+      "stderr_empty": true,
+      "counterparts": {
+        "linux_native": {
+          "program": "{native_bin}/hostcall-loop",
+          "args": [
+            "2000000"
+          ]
+        },
+        "linux_wasmtime": {
+          "wasm_path": "artifacts/wasi-tools/hostcall-loop.wasm",
+          "args": [
+            "2000000"
+          ]
+        }
+      }
+    },
+    {
+      "name": "pipe-pingpong",
+      "class": "ipc",
+      "headline": true,
+      "runner": "program",
+      "description": "20000 round trips of 64 bytes through a child's stdin and stdout.",
+      "program": "/bin/procbench",
+      "args": [
+        "pingpong",
+        "20000",
+        "64",
+        "/bin/pipe-echo"
+      ],
+      "boot_programs": [
+        "procbench",
+        "pipe-echo"
+      ],
+      "stdout_contains": [
+        "pipe-pingpong:20000"
+      ],
+      "stderr_empty": true,
+      "counterparts": {
+        "linux_native": {
+          "program": "{native_bin}/procbench",
+          "args": [
+            "pingpong",
+            "20000",
+            "64",
+            "{native_bin}/pipe-echo"
+          ]
+        },
+        "linux_wasmtime": {
+          "program": "{native_bin}/procbench",
+          "args": [
+            "pingpong",
+            "20000",
+            "64",
+            "{wasmtime_run}",
+            "{cwasm:artifacts/wasi-tools/pipe-echo.wasm}"
+          ]
+        }
+      }
+    },
+    {
+      "name": "pipe-stream",
+      "class": "ipc",
+      "headline": false,
+      "runner": "program",
+      "description": "Stream 64 MiB through a child's stdin and back out of its stdout.",
+      "program": "/bin/procbench",
+      "args": [
+        "stream",
+        "67108864",
+        "/bin/pipe-echo"
+      ],
+      "boot_programs": [
+        "procbench",
+        "pipe-echo"
+      ],
+      "stdout_contains": [
+        "pipe-stream:67108864"
+      ],
+      "stderr_empty": true,
+      "throughput_bytes": 67108864,
+      "counterparts": {
+        "linux_native": {
+          "program": "{native_bin}/procbench",
+          "args": [
+            "stream",
+            "67108864",
+            "{native_bin}/pipe-echo"
+          ]
+        },
+        "linux_wasmtime": {
+          "program": "{native_bin}/procbench",
+          "args": [
+            "stream",
+            "67108864",
+            "{wasmtime_run}",
+            "{cwasm:artifacts/wasi-tools/pipe-echo.wasm}"
+          ]
+        }
+      }
     },
     {
       "name": "stdio-pipe",
-      "class": "io-bound",
+      "class": "ipc",
+      "headline": false,
       "runner": "shell",
       "description": "Generate bytes, pipe through cat, write and read the result.",
       "command": "out={workdir}/pipe-$HELIOS_PROCESS_ID.out; copy={workdir}/pipe-$HELIOS_PROCESS_ID.copy; {head} --bytes=131072 /bin/bash | {cat} > $out; {cat} $out > $copy; {cat} $copy >/dev/null; echo stdio-pipe:ok",
@@ -142,11 +473,47 @@
       "stdout_contains": [
         "stdio-pipe:ok"
       ],
-      "stderr_empty": true
+      "stderr_empty": true,
+      "counterparts": {
+        "linux_native": {
+          "inherit": true
+        },
+        "linux_wasmtime": null
+      }
+    },
+    {
+      "name": "sched-tasks",
+      "class": "sched",
+      "headline": true,
+      "runner": "program",
+      "description": "64 cooperative tasks each yielding 2000 times, against 64 Linux threads calling sched_yield.",
+      "program": "/bin/sched-tasks",
+      "args": [
+        "64",
+        "2000"
+      ],
+      "boot_programs": [
+        "sched-tasks"
+      ],
+      "stdout_contains": [
+        "sched-tasks:128000"
+      ],
+      "stderr_empty": true,
+      "counterparts": {
+        "linux_native": {
+          "program": "{native_bin}/sched-tasks",
+          "args": [
+            "64",
+            "2000"
+          ]
+        },
+        "linux_wasmtime": null
+      }
     },
     {
       "name": "fs-smallfiles",
-      "class": "io-bound",
+      "class": "fs",
+      "headline": true,
       "runner": "shell",
       "description": "Create, read, and copy many small files.",
       "command": "dir={workdir}/bench-smallfiles-$HELIOS_PROCESS_ID; {mkdir} $dir; i=0; while [ $i -lt 64 ]; do echo data-$i > $dir/f$i; {cat} $dir/f$i > $dir/c$i; i=$((i+1)); done; echo fs-smallfiles:ok",
@@ -157,11 +524,18 @@
       "stdout_contains": [
         "fs-smallfiles:ok"
       ],
-      "stderr_empty": true
+      "stderr_empty": true,
+      "counterparts": {
+        "linux_native": {
+          "inherit": true
+        },
+        "linux_wasmtime": null
+      }
     },
     {
       "name": "fs-readstream",
-      "class": "io-bound",
+      "class": "fs",
+      "headline": false,
       "runner": "shell",
       "description": "Sequential read of a larger generated file.",
       "command": "file={workdir}/bench-readstream-$HELIOS_PROCESS_ID.in; copy={workdir}/bench-readstream-$HELIOS_PROCESS_ID.out; {head} --bytes=1048576 /bin/bash > $file; {cat} $file > $copy; {cat} $copy >/dev/null; echo fs-readstream:ok",
@@ -173,11 +547,18 @@
       "stdout_contains": [
         "fs-readstream:ok"
       ],
-      "stderr_empty": true
+      "stderr_empty": true,
+      "counterparts": {
+        "linux_native": {
+          "inherit": true
+        },
+        "linux_wasmtime": null
+      }
     },
     {
       "name": "curl-local-http",
-      "class": "io-bound",
+      "class": "net",
+      "headline": false,
       "runner": "program",
       "description": "Fetch from a deterministic local HTTP server.",
       "program": "{curl}",
@@ -192,11 +573,18 @@
         "helios-linux-gap:ok"
       ],
       "stderr_empty": true,
-      "requires_host_http": true
+      "requires_host_http": true,
+      "counterparts": {
+        "linux_native": {
+          "inherit": true
+        },
+        "linux_wasmtime": null
+      }
     },
     {
       "name": "tcp-throughput",
-      "class": "io-bound",
+      "class": "net",
+      "headline": true,
       "runner": "program",
       "description": "Read and discard a deterministic 64 MiB stream from a raw local TCP server.",
       "program": "{tcp_throughput}",
@@ -213,11 +601,61 @@
       ],
       "stderr_empty": true,
       "requires_host_tcp": true,
-      "throughput_bytes": 67108864
+      "throughput_bytes": 67108864,
+      "counterparts": {
+        "linux_native": {
+          "inherit": true
+        },
+        "linux_wasmtime": null
+      }
+    },
+    {
+      "name": "tcp-latency",
+      "class": "net",
+      "headline": true,
+      "runner": "program",
+      "description": "5000 sixteen-byte round trips against a host TCP echo server.",
+      "program": "/bin/tcp-latency",
+      "args": [
+        "{host_tcp_host}",
+        "{host_tcp_echo_port}",
+        "5000"
+      ],
+      "boot_programs": [
+        "tcp-latency"
+      ],
+      "stdout_contains": [
+        "tcp-latency:5000"
+      ],
+      "stderr_empty": true,
+      "requires_host_tcp_echo": true,
+      "counterparts": {
+        "linux_native": {
+          "program": "{native_bin}/tcp-latency",
+          "args": [
+            "{host_tcp_host}",
+            "{host_tcp_echo_port}",
+            "5000"
+          ]
+        },
+        "linux_wasmtime": {
+          "wasm_path": "artifacts/wasi-tools/tcp-latency.wasm",
+          "wasmtime_flags": [
+            "-S",
+            "inherit-network=y"
+          ],
+          "args": [
+            "{host_tcp_host}",
+            "{host_tcp_echo_port}",
+            "5000"
+          ]
+        }
+      }
     },
     {
       "name": "tcp-upload",
-      "class": "io-bound",
+      "class": "net",
+      "headline": false,
       "runner": "program",
       "description": "Stream 64 MiB from the guest to a host TCP sink.",
       "program": "{tcp_throughput}",
@@ -235,11 +673,18 @@
       "stdout_contains": [
         "tcp-upload:67108864"
       ],
-      "stderr_empty": true
+      "stderr_empty": true,
+      "counterparts": {
+        "linux_native": {
+          "inherit": true
+        },
+        "linux_wasmtime": null
+      }
     },
     {
       "name": "wasix-tcp-throughput",
-      "class": "io-bound",
+      "class": "net",
+      "headline": false,
       "runner": "program",
       "description": "Read and discard a deterministic 64 MiB stream through preview1/WASIX socket syscalls.",
       "program": "{wasix_tcp_throughput}",
@@ -256,11 +701,18 @@
       ],
       "stderr_empty": true,
       "requires_host_tcp": true,
-      "throughput_bytes": 67108864
+      "throughput_bytes": 67108864,
+      "counterparts": {
+        "linux_native": {
+          "inherit": true
+        },
+        "linux_wasmtime": null
+      }
     },
     {
       "name": "wasi-tcp-throughput",
-      "class": "io-bound",
+      "class": "net",
+      "headline": false,
       "runner": "program",
       "description": "Read and discard a deterministic 64 MiB stream through standard WASI sockets.",
       "program": "{wasi_tcp_throughput}",
@@ -272,28 +724,34 @@
       "boot_programs": [
         "wasi-tcp-throughput"
       ],
-      "wasmtime_profile": {
-        "wasm_path": "artifacts/wasi-tools/wasi-tcp-throughput.wasm",
-        "wasmtime_flags": [
-          "-S",
-          "inherit-network=y"
-        ],
-        "args": [
-          "{host_tcp_host}",
-          "{host_tcp_port}",
-          "67108864"
-        ]
-      },
       "stdout_contains": [
         "wasi-tcp-throughput:67108864"
       ],
       "stderr_empty": true,
       "requires_host_tcp": true,
-      "throughput_bytes": 67108864
+      "throughput_bytes": 67108864,
+      "counterparts": {
+        "linux_native": {
+          "inherit": true
+        },
+        "linux_wasmtime": {
+          "wasm_path": "artifacts/wasi-tools/wasi-tcp-throughput.wasm",
+          "wasmtime_flags": [
+            "-S",
+            "inherit-network=y"
+          ],
+          "args": [
+            "{host_tcp_host}",
+            "{host_tcp_port}",
+            "67108864"
+          ]
+        }
+      }
     },
     {
       "name": "curl-http-throughput",
-      "class": "io-bound",
+      "class": "net",
+      "headline": false,
       "runner": "program",
       "description": "Fetch and discard a deterministic 64 MiB local HTTP payload.",
       "program": "{curl}",
@@ -313,7 +771,13 @@
       ],
       "stderr_empty": true,
       "requires_host_http": true,
-      "throughput_bytes": 67108864
+      "throughput_bytes": 67108864,
+      "counterparts": {
+        "linux_native": {
+          "inherit": true
+        },
+        "linux_wasmtime": null
+      }
     }
   ]
 }

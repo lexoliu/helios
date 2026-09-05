@@ -55,7 +55,7 @@ def repo_root() -> Path:
 def load_manifest(path: Path) -> dict:
     with path.open("r", encoding="utf-8") as handle:
         manifest = json.load(handle)
-    if manifest.get("schema_version") != 1:
+    if manifest.get("schema_version") != 2:
         raise SystemExit(f"unsupported workload manifest schema_version {manifest.get('schema_version')}")
     return manifest
 
@@ -109,9 +109,11 @@ def render_arg(value: str, host_http_url: str | None, workload_name: str) -> str
 
 
 def profile_spec(workload: dict, host_http_url: str | None) -> tuple[Path, list[str], list[str]]:
-    spec = workload.get("wasmtime_profile")
-    if not spec:
-        raise SystemExit(f"workload {workload['name']} has no wasmtime_profile entry")
+    spec = workload.get("counterparts", {}).get("linux_wasmtime")
+    if not spec or "wasm_path" not in spec:
+        raise SystemExit(
+            f"workload {workload['name']} has no counterparts.linux_wasmtime entry with a wasm_path"
+        )
     wasm_path = repo_root() / spec["wasm_path"]
     if not wasm_path.exists():
         raise SystemExit(f"wasmtime profile wasm artifact does not exist: {wasm_path}")

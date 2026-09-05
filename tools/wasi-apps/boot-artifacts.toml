@@ -114,6 +114,38 @@ bootfs_path = "bin/wasix-tcp-throughput"
 source = "artifacts/wasi-tools/wasix-tcp-throughput.wasm"
 
 [[artifact]]
+command = "hello"
+package = "helios-hello-wasi"
+version = "0.1.0"
+source_url = "tools/wasi-apps/hello"
+bootfs_path = "bin/hello"
+source = "artifacts/wasi-tools/hello.wasm"
+
+[[artifact]]
+command = "pipe-echo"
+package = "helios-pipe-echo-wasi"
+version = "0.1.0"
+source_url = "tools/wasi-apps/pipe-echo"
+bootfs_path = "bin/pipe-echo"
+source = "artifacts/wasi-tools/pipe-echo.wasm"
+
+[[artifact]]
+command = "hostcall-loop"
+package = "helios-hostcall-loop-wasi"
+version = "0.1.0"
+source_url = "tools/wasi-apps/hostcall-loop"
+bootfs_path = "bin/hostcall-loop"
+source = "artifacts/wasi-tools/hostcall-loop.wasm"
+
+[[artifact]]
+command = "tcp-latency"
+package = "helios-tcp-latency-wasi"
+version = "0.1.0"
+source_url = "tools/wasi-apps/tcp-latency"
+bootfs_path = "bin/tcp-latency"
+source = "artifacts/wasi-tools/tcp-latency.wasm"
+
+[[artifact]]
 command = "wasix-thread-futex"
 package = "helios-wasix-conformance"
 version = "0.1.0"

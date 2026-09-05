@@ -31,6 +31,19 @@ pub trait ExternalInterruptHandler {
     fn handle_interrupt(&self);
 }
 
+/// A route slot a backend can never fill.
+///
+/// A backend whose device has no interrupt source to route — a PCI
+/// function without an MSI-X capability on a backend that routes
+/// MSI-X only — names this as the slot's handler type. The slot is
+/// then provably empty: nothing can be registered in it and dispatch
+/// never reaches it, without a handler whose body cannot run.
+impl ExternalInterruptHandler for core::convert::Infallible {
+    fn handle_interrupt(&self) {
+        match *self {}
+    }
+}
+
 /// Maps claimed interrupt sources to the device handlers a backend
 /// registered at boot.
 pub struct ExternalInterruptRoutes<Source, Network, HostFs, Entropy, Balloon, Vsock, Block> {
