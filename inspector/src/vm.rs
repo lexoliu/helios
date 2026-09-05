@@ -14,6 +14,7 @@ use helios_hal::fs::HOST_SHARE_MOUNT_TAG;
 use helios_inspector_protocol::debugger::filesystem as debugger_fs;
 use helios_inspector_protocol::system::profiling as system_profiling;
 use helios_inspector_protocol::system::programs as system_programs;
+use helios_workspace_root::WorkspaceRoot;
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
@@ -817,10 +818,10 @@ fn resolve(command: VmCommand) -> Result<ResolvedVmCommand> {
         .qemu_bin
         .or(file.qemu_bin)
         .unwrap_or_else(|| PathBuf::from(profile.qemu_bin));
-    let kernel = command
-        .kernel
-        .or(file.kernel)
-        .unwrap_or_else(|| default_kernel_path(arch, build_profile_dir(release, kernel_debug)));
+    let kernel = match command.kernel.or(file.kernel) {
+        Some(kernel) => kernel,
+        None => default_kernel_path(arch, build_profile_dir(release, kernel_debug))?,
+    };
     let smp = command.smp.or(file.smp).unwrap_or(profile.default_smp);
     let memory = command
         .memory
@@ -1097,17 +1098,17 @@ fn ensure_qemu_command(command: &ResolvedVmCommand) -> Result<()> {
 }
 
 fn build_vm(command: &ResolvedVmCommand) -> Result<()> {
-    let repo_root = repo_root();
+    let repo_root = repo_root()?;
     run_step(
         "building helios-cli",
-        cargo_build_command(repo_root, command.release, false)
+        cargo_build_command(&repo_root, command.release, false)
             .arg("-p")
             .arg("helios-cli"),
     )?;
     let prebuild_manifest = run_kernel_prebuild(command)?;
     run_step(
         &format!("building {} kernel", arch_label(command.profile.arch)),
-        cargo_build_command(repo_root, command.release, command.kernel_debug)
+        cargo_build_command(&repo_root, command.release, command.kernel_debug)
             .env("HELIOS_KERNEL_PREBUILD_MANIFEST", &prebuild_manifest)
             .arg("--target")
             .arg(command.profile.cargo_target)
@@ -1116,7 +1117,7 @@ fn build_vm(command: &ResolvedVmCommand) -> Result<()> {
     )?;
     run_step(
         "building inspector",
-        cargo_build_command(repo_root, command.release, false)
+        cargo_build_command(&repo_root, command.release, false)
             .arg("-p")
             .arg("helios-inspector"),
     )?;
@@ -1136,14 +1137,15 @@ fn cargo_build_command(repo_root: &Path, release: bool, kernel_debug: bool) -> C
 
 fn run_kernel_prebuild(command: &ResolvedVmCommand) -> Result<PathBuf> {
     let cli = discover_helios_cli()?;
-    let out_dir = repo_root()
+    let repo_root = repo_root()?;
+    let out_dir = repo_root
         .join("target")
         .join("kernel-prebuild")
         .join(command.profile.cargo_target)
         .join(build_profile_dir(command.release, command.kernel_debug));
     let mut prebuild = Command::new(&cli);
     prebuild
-        .current_dir(repo_root())
+        .current_dir(&repo_root)
         .arg("kernel-prebuild")
         .arg("--out-dir")
         .arg(&out_dir)
@@ -2122,7 +2124,7 @@ fn default_persistent_runtime_dir() -> Result<PathBuf> {
         .duration_since(UNIX_EPOCH)
         .context("system time is earlier than UNIX_EPOCH")?
         .as_millis();
-    Ok(repo_root()
+    Ok(repo_root()?
         .join("target")
         .join("inspector-vm")
         .join(format!("run-{}-{timestamp}", std::process::id())))
@@ -2260,10 +2262,14 @@ fn spinner(label: &str) -> ProgressBar {
     bar
 }
 
-fn repo_root() -> &'static Path {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("inspector crate must live under repo root")
+/// The checkout this inspector run operates on.
+///
+/// Resolved from the current directory (or `HELIOS_WORKSPACE_ROOT`) every
+/// time, never from the manifest directory the binary was compiled in: an
+/// inspector reused from another worktree would otherwise build and boot that
+/// worktree's kernel.
+fn repo_root() -> Result<PathBuf> {
+    Ok(WorkspaceRoot::resolve(None)?.path().to_path_buf())
 }
 
 fn build_profile_dir(release: bool, kernel_debug: bool) -> &'static str {
@@ -2276,13 +2282,13 @@ fn build_profile_dir(release: bool, kernel_debug: bool) -> &'static str {
     }
 }
 
-fn default_kernel_path(arch: VmArch, profile_dir: &str) -> PathBuf {
+fn default_kernel_path(arch: VmArch, profile_dir: &str) -> Result<PathBuf> {
     let profile = arch.profile();
-    repo_root()
+    Ok(repo_root()?
         .join("target")
         .join(profile.cargo_target)
         .join(profile_dir)
-        .join(profile.kernel_artifact_name)
+        .join(profile.kernel_artifact_name))
 }
 
 /// Creates the scratch disk image this VM's guest kernel will own.
@@ -3022,6 +3028,7 @@ mod tests {
         assert_eq!(
             resolved.kernel,
             repo_root()
+                .expect("workspace root must resolve")
                 .join("target")
                 .join(X86_64_VM_PROFILE.cargo_target)
                 .join("debug")
@@ -3148,6 +3155,7 @@ mod tests {
         assert_eq!(
             resolved.kernel,
             repo_root()
+                .expect("workspace root must resolve")
                 .join("target")
                 .join(X86_64_VM_PROFILE.cargo_target)
                 .join("kernel-debug")
@@ -3176,13 +3184,13 @@ mod tests {
         let command = watchdog_test_command(arch);
         run_step(
             "building helios-cli",
-            cargo_build_command(repo_root(), command.release, false)
+            cargo_build_command(&repo_root()?, command.release, false)
                 .arg("-p")
                 .arg("helios-cli"),
         )?;
         let prebuild_manifest = run_kernel_prebuild(&command)?;
         let status = std::process::Command::new("cargo")
-            .current_dir(repo_root())
+            .current_dir(repo_root()?)
             .arg("build")
             .arg("--target")
             .arg(arch.profile().cargo_target)
@@ -3210,7 +3218,8 @@ mod tests {
             release: false,
             kernel_debug: false,
             qemu_bin: PathBuf::from(profile.qemu_bin),
-            kernel: default_kernel_path(arch, build_profile_dir(false, false)),
+            kernel: default_kernel_path(arch, build_profile_dir(false, false))
+                .expect("workspace root must resolve"),
             socket: None,
             serial_stdio: false,
             serial_pty: false,
@@ -3383,7 +3392,8 @@ mod tests {
             release: true,
             kernel_debug: false,
             qemu_bin: PathBuf::from(profile.qemu_bin),
-            kernel: default_kernel_path(arch, build_profile_dir(true, false)),
+            kernel: default_kernel_path(arch, build_profile_dir(true, false))
+                .expect("workspace root must resolve"),
             socket: None,
             serial_stdio: false,
             serial_pty: false,
@@ -3398,7 +3408,7 @@ mod tests {
                 .iter()
                 .map(|value| (*value).to_owned())
                 .collect(),
-            shared_dir: Some(repo_root().to_path_buf()),
+            shared_dir: Some(repo_root().expect("workspace root must resolve")),
             data_disk_bytes: DEFAULT_DATA_DISK_BYTES,
             gdb: None,
             gdb_wait: false,

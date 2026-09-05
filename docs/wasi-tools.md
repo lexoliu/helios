@@ -105,6 +105,15 @@ tools/wasi-apps/build.sh
 `cwasm` payloads before adding them to bootfs. A missing artifact is a hard
 error; there is no repo-local fallback.
 
+Workspace-relative paths in that manifest — program manifests, the bootfs
+root, boot artifact sources — resolve against the checkout the CLI is *run*
+in: the nearest directory at or above the current one whose `Cargo.toml`
+declares `[workspace]`. Running outside a checkout is a hard error naming the
+directory that was searched; pass `--workspace-root <path>` or set
+`HELIOS_WORKSPACE_ROOT` to name the checkout explicitly. `helios-inspector`
+resolves its own repository paths the same way, so a binary built in one
+worktree and reused from another operates on the tree it is run in.
+
 ## Run In Helios (AArch64 HVF VM)
 
 The fastest local VM path on Apple Silicon is AArch64 with HVF. Inspector

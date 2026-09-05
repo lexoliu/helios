@@ -11,6 +11,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use fatfs::{FatType, FileSystem, FormatVolumeOptions, FsOptions};
 use helios_artifact::{cwasm_target_supports_wasm_simd, sign_payload_with_key};
 use helios_compiler_support::{AotCompileHint, precompile_artifact};
+use helios_workspace_root::WorkspaceRoot;
 use mbrman::{BOOT_ACTIVE, CHS, MBR, MBRPartitionEntry};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
@@ -42,6 +43,14 @@ struct LimineConfigTemplate {
 #[derive(Parser)]
 #[command(name = "helios-cli")]
 struct Cli {
+    /// Directory holding the Cargo workspace manifest that repository-relative
+    /// paths resolve against.
+    ///
+    /// Defaults to the nearest workspace root at or above the current
+    /// directory, so the tool operates on the checkout it is run in rather
+    /// than the one it was built in.
+    #[arg(long, global = true, value_name = "PATH")]
+    workspace_root: Option<PathBuf>,
     #[command(subcommand)]
     command: Commands,
 }
@@ -182,6 +191,20 @@ struct ExternalBootArtifact {
     support_bootfs_prefix: Option<String>,
 }
 
+/// The inputs every bootfs asset build shares.
+///
+/// They travel together because each asset is compiled by the same cargo, for
+/// the same profile and target, signed by the same root key, and resolved
+/// against the same checkout.
+struct BootBuild<'a> {
+    cargo: &'a Path,
+    profile: &'a str,
+    out_dir: &'a Path,
+    target: &'a str,
+    root_signing_key: &'a SigningKey,
+    workspace_root: &'a WorkspaceRoot,
+}
+
 #[derive(Clone, Debug)]
 struct ProgramManifest {
     command: String,
@@ -194,7 +217,9 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Aot(command) => run_aot(command),
         Commands::CompilerPlugin(command) => run_compiler_plugin(command),
-        Commands::KernelPrebuild(command) => run_kernel_prebuild(command),
+        Commands::KernelPrebuild(command) => {
+            run_kernel_prebuild(command, cli.workspace_root.as_deref())
+        }
         Commands::LimineUefiImage(command) => run_limine_uefi_image(command),
     }
 }
@@ -233,7 +258,11 @@ fn run_compiler_plugin(command: CompilerPluginCommand) -> Result<()> {
     Ok(())
 }
 
-fn run_kernel_prebuild(command: KernelPrebuildCommand) -> Result<()> {
+fn run_kernel_prebuild(
+    command: KernelPrebuildCommand,
+    explicit_workspace_root: Option<&Path>,
+) -> Result<()> {
+    let workspace_root = WorkspaceRoot::resolve(explicit_workspace_root)?;
     fs::create_dir_all(&command.out_dir)
         .with_context(|| format!("failed to create {}", command.out_dir.display()))?;
 
@@ -241,15 +270,16 @@ fn run_kernel_prebuild(command: KernelPrebuildCommand) -> Result<()> {
     let root_public_path = command.out_dir.join(ROOT_PUBLIC_FILE);
     let root_signing_key = ensure_root_keypair(&root_secret_path, &root_public_path)?;
 
-    let init_manifest = workspace_path(&command.init_manifest);
-    let bootfs_root = workspace_path(&command.bootfs_root);
+    let init_manifest = workspace_root.join(&command.init_manifest);
+    let bootfs_root = workspace_root.join(&command.bootfs_root);
 
     let selected_programs = selected_boot_programs(command.boot_programs)?;
-    let boot_artifacts_manifest = workspace_path(&command.boot_artifacts_manifest);
+    let boot_artifacts_manifest = workspace_root.join(&command.boot_artifacts_manifest);
     validate_external_boot_artifact_sources(
         &boot_artifacts_manifest,
         &command.target,
         &selected_programs,
+        &workspace_root,
     )?;
 
     let init_component = build_component_program(
@@ -273,22 +303,20 @@ fn run_kernel_prebuild(command: KernelPrebuildCommand) -> Result<()> {
     fs::write(&init_cwasm, init_signed)
         .with_context(|| format!("failed to write {}", init_cwasm.display()))?;
 
+    let build = BootBuild {
+        cargo: &command.cargo,
+        profile: &command.profile,
+        out_dir: &command.out_dir,
+        target: &command.target,
+        root_signing_key: &root_signing_key,
+        workspace_root: &workspace_root,
+    };
     let mut bootfs_assets = Vec::new();
     if !command.no_compiler_plugin {
-        bootfs_assets.push(build_compiler_plugin_asset(
-            &command.cargo,
-            &command.profile,
-            &command.out_dir,
-            &command.target,
-            &root_signing_key,
-        )?);
+        bootfs_assets.push(build_compiler_plugin_asset(&build)?);
     }
     bootfs_assets.extend(build_boot_program_assets(
-        &command.cargo,
-        &command.profile,
-        &command.out_dir,
-        &command.target,
-        &root_signing_key,
+        &build,
         &selected_programs,
         &boot_artifacts_manifest,
     )?);
@@ -618,28 +646,24 @@ impl Seek for FileSlice<'_> {
     }
 }
 
-fn build_compiler_plugin_asset(
-    cargo: &Path,
-    profile: &str,
-    out_dir: &Path,
-    target: &str,
-    root_signing_key: &SigningKey,
-) -> Result<BootAsset> {
+fn build_compiler_plugin_asset(build: &BootBuild<'_>) -> Result<BootAsset> {
     let wasm_path = build_wasm_program(
-        cargo,
-        profile,
-        out_dir,
-        &workspace_path(Path::new("compiler-plugin/Cargo.toml")),
+        build.cargo,
+        build.profile,
+        build.out_dir,
+        &build
+            .workspace_root
+            .join(Path::new("compiler-plugin/Cargo.toml")),
         "compiler-plugin-target",
         "wasm32-wasip1-threads",
         "helios_compiler_plugin.wasm",
     )?;
     let wasm =
         fs::read(&wasm_path).with_context(|| format!("failed to read {}", wasm_path.display()))?;
-    let payload = precompile_artifact(&wasm, target, Hint::Performance.into())?.bytes;
-    let signed = sign_payload_with_key(&payload, root_signing_key)
+    let payload = precompile_artifact(&wasm, build.target, Hint::Performance.into())?.bytes;
+    let signed = sign_payload_with_key(&payload, build.root_signing_key)
         .context("failed to sign compiler plugin AOT payload")?;
-    let output_path = out_dir.join("compiler_plugin.cwasm");
+    let output_path = build.out_dir.join("compiler_plugin.cwasm");
     fs::write(&output_path, signed)
         .with_context(|| format!("failed to write {}", output_path.display()))?;
 
@@ -679,15 +703,11 @@ fn selected_boot_programs(boot_programs: Vec<String>) -> Result<Option<BTreeSet<
 }
 
 fn build_boot_program_assets(
-    cargo: &Path,
-    profile: &str,
-    out_dir: &Path,
-    target: &str,
-    root_signing_key: &SigningKey,
+    build: &BootBuild<'_>,
     selected_programs: &Option<BTreeSet<String>>,
     boot_artifacts_manifest: &Path,
 ) -> Result<Vec<BootAsset>> {
-    let programs_root = workspace_path(Path::new("programs"));
+    let programs_root = build.workspace_root.join(Path::new("programs"));
     let mut available_programs = BTreeSet::new();
     let mut manifests = Vec::new();
     let mut external_artifacts = read_external_boot_artifacts(boot_artifacts_manifest)?;
@@ -725,9 +745,9 @@ fn build_boot_program_assets(
             artifact.command
         );
     }
-    reject_selected_target_mismatches(&external_artifacts, target, selected_programs)?;
+    reject_selected_target_mismatches(&external_artifacts, build.target, selected_programs)?;
     external_artifacts.retain(|artifact| {
-        artifact.supports_target(target)
+        artifact.supports_target(build.target)
             && selected_programs
                 .as_ref()
                 .is_none_or(|selected| selected.contains(&artifact.command))
@@ -750,17 +770,10 @@ fn build_boot_program_assets(
     external_artifacts.sort_by(|left, right| left.command.cmp(&right.command));
     let mut assets = manifests
         .into_iter()
-        .map(|manifest| {
-            build_boot_program_asset(cargo, profile, out_dir, target, root_signing_key, manifest)
-        })
+        .map(|manifest| build_boot_program_asset(build, manifest))
         .collect::<Result<Vec<_>>>()?;
     for artifact in external_artifacts {
-        assets.extend(build_external_boot_artifact_assets(
-            out_dir,
-            target,
-            root_signing_key,
-            artifact,
-        )?);
+        assets.extend(build_external_boot_artifact_assets(build, artifact)?);
     }
     Ok(assets)
 }
@@ -849,6 +862,7 @@ fn validate_external_boot_artifact_sources(
     path: &Path,
     target: &str,
     selected_programs: &Option<BTreeSet<String>>,
+    workspace_root: &WorkspaceRoot,
 ) -> Result<()> {
     for artifact in read_external_boot_artifacts(path)? {
         if !artifact.supports_target(target) {
@@ -861,7 +875,7 @@ fn validate_external_boot_artifact_sources(
             continue;
         }
         if let Some(support_root) = &artifact.support_root {
-            let support_root = workspace_path(support_root);
+            let support_root = workspace_root.join(support_root);
             ensure!(
                 support_root.is_dir(),
                 "boot artifact support root {} is missing",
@@ -914,37 +928,23 @@ impl ExternalBootArtifact {
     }
 }
 
-fn workspace_path(path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        return path.to_path_buf();
-    }
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap_or_else(|| panic!("cli manifest directory must have a workspace parent"))
-        .join(path)
-}
-
-fn build_boot_program_asset(
-    cargo: &Path,
-    profile: &str,
-    out_dir: &Path,
-    target: &str,
-    root_signing_key: &SigningKey,
-    manifest: ProgramManifest,
-) -> Result<BootAsset> {
+fn build_boot_program_asset(build: &BootBuild<'_>, manifest: ProgramManifest) -> Result<BootAsset> {
     let wasm_path = build_component_program(
-        cargo,
-        profile,
-        out_dir,
+        build.cargo,
+        build.profile,
+        build.out_dir,
         &manifest.manifest_path,
         &format!("bootfs-{}-target", manifest.command),
         &manifest.artifact_name,
     )?;
     let component_bytes = encode_component(&wasm_path)?;
-    let payload = precompile_artifact(&component_bytes, target, Hint::Performance.into())?.bytes;
-    let signed = sign_payload_with_key(&payload, root_signing_key)
+    let payload =
+        precompile_artifact(&component_bytes, build.target, Hint::Performance.into())?.bytes;
+    let signed = sign_payload_with_key(&payload, build.root_signing_key)
         .context("failed to sign bootfs AOT payload")?;
-    let output_path = out_dir.join(format!("{}_bootfs_component.cwasm", manifest.command));
+    let output_path = build
+        .out_dir
+        .join(format!("{}_bootfs_component.cwasm", manifest.command));
     fs::write(&output_path, signed)
         .with_context(|| format!("failed to write {}", output_path.display()))?;
 
@@ -957,21 +957,21 @@ fn build_boot_program_asset(
 }
 
 fn build_external_boot_artifact_assets(
-    out_dir: &Path,
-    target: &str,
-    root_signing_key: &SigningKey,
+    build: &BootBuild<'_>,
     artifact: ExternalBootArtifact,
 ) -> Result<Vec<BootAsset>> {
-    let source = workspace_path(&artifact.source);
+    let source = build.workspace_root.join(&artifact.source);
     let wasm = fs::read(&source).with_context(|| format!("failed to read {}", source.display()))?;
-    let payload = precompile_artifact(&wasm, target, Hint::Performance.into())?.bytes;
-    let signed = sign_payload_with_key(&payload, root_signing_key).with_context(|| {
+    let payload = precompile_artifact(&wasm, build.target, Hint::Performance.into())?.bytes;
+    let signed = sign_payload_with_key(&payload, build.root_signing_key).with_context(|| {
         format!(
             "failed to sign external bootfs AOT payload for {}",
             artifact.command
         )
     })?;
-    let output_path = out_dir.join(format!("{}_bootfs_component.cwasm", artifact.command));
+    let output_path = build
+        .out_dir
+        .join(format!("{}_bootfs_component.cwasm", artifact.command));
     fs::write(&output_path, signed)
         .with_context(|| format!("failed to write {}", output_path.display()))?;
 
@@ -985,7 +985,7 @@ fn build_external_boot_artifact_assets(
         (&artifact.support_root, &artifact.support_bootfs_prefix)
     {
         assets.extend(build_external_support_assets(
-            &workspace_path(support_root),
+            &build.workspace_root.join(support_root),
             prefix,
         )?);
     }
