@@ -1231,15 +1231,6 @@ where
         self.record_network_profile_events(phase, start, 0);
     }
 
-    fn record_network_profile_between(
-        &self,
-        phase: &'static str,
-        start: Option<NetworkPerfStart>,
-        end: Option<NetworkPerfStart>,
-    ) {
-        self.record_network_profile_events_bytes_between(phase, start, end, 0, 0);
-    }
-
     fn record_network_profile_events(
         &self,
         phase: &'static str,

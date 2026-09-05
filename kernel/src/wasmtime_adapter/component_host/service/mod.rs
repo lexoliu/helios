@@ -1654,20 +1654,16 @@ where
             return Ok(plugin.clone());
         }
 
-        match WasmtimePrecompiledKind::detect(compiler_payload) {
-            Some(WasmtimePrecompiledKind::CoreModule) => {}
-            Some(WasmtimePrecompiledKind::Component) => {
-                return Err(ProgramExecError {
-                    kind: ProgramExecErrorKind::InvalidBinary,
-                    detail: ProgramExecErrorDetail::CompilerPluginInvalid,
-                });
-            }
-            None => {
-                return Err(ProgramExecError {
-                    kind: ProgramExecErrorKind::InvalidBinary,
-                    detail: ProgramExecErrorDetail::CompilerPluginInvalid,
-                });
-            }
+        // The compiler plugin is a precompiled core module; a component
+        // or anything else is not the artifact this builds a runtime for.
+        if !matches!(
+            WasmtimePrecompiledKind::detect(compiler_payload),
+            Some(WasmtimePrecompiledKind::CoreModule)
+        ) {
+            return Err(ProgramExecError {
+                kind: ProgramExecErrorKind::InvalidBinary,
+                detail: ProgramExecErrorDetail::CompilerPluginInvalid,
+            });
         }
 
         let worker_threads = compiler_plugin_worker_threads(&exec_context.cpu);

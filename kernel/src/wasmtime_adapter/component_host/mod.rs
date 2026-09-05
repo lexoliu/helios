@@ -48,6 +48,10 @@ use crate::{
     HeapStats, PerfMetricFilter, PerfSample, ProfileFilter, ProfileScope, StatsSample, TraceEvent,
     TraceField, TraceFilter, TraceLevel, TraceValue,
 };
+// The two generated worlds spell every shared type identically, so each keeps
+// its own short alias rather than importing the names themselves.
+use debugger_bindings::helios::system as debugger_wit;
+use program_bindings::helios::system as program_wit;
 
 const SYNC_INSTANCE: &str = "helios:system/sync@0.1.0";
 const STATS_INSTANCE: &str = "helios:system/stats@0.1.0";
@@ -900,16 +904,15 @@ mod authority_tests {
     use alloc::vec::Vec;
 
     use super::{
-        build_program_child_authority, dns_network_rights, program_bindings,
-        require_exec_authority, require_spawn_authority, tcp_connect_network_rights,
-        udp_bind_network_rights,
+        build_program_child_authority, dns_network_rights, program_wit, require_exec_authority,
+        require_spawn_authority, tcp_connect_network_rights, udp_bind_network_rights,
     };
     use crate::{
         ClockAuthorityRights, DirectoryAuthorityRights, DirectoryPreopen, LinkAuthorityRights,
         NetworkAuthorityRights, ProcessAuthority, ProcessAuthorityRights, TerminalAuthorityRights,
     };
 
-    use program_bindings::helios::system::programs::{
+    use program_wit::programs::{
         CapabilityGrant, ClockGrant, ClockRight, DirectoryGrant, FilesystemRight, LinkGrant,
         LinkRight, NetworkGrant, NetworkRight, ProcessGrant, ProcessRight, TerminalGrant,
         TerminalRight,
@@ -1810,10 +1813,10 @@ where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    debugger_bindings::helios::system::serial::add_to_linker::<
-        _,
-        HasSelf<StoreData<CpuImpl, HostFs>>,
-    >(linker, |state| state)?;
+    debugger_wit::serial::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
+        linker,
+        |state| state,
+    )?;
     Ok(())
 }
 
@@ -1999,10 +2002,10 @@ where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    debugger_bindings::helios::system::programs::add_to_linker::<
-        _,
-        HasSelf<StoreData<CpuImpl, HostFs>>,
-    >(linker, |state| state)?;
+    debugger_wit::programs::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
+        linker,
+        |state| state,
+    )?;
     Ok(())
 }
 
@@ -2013,10 +2016,10 @@ where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    program_bindings::helios::system::programs::add_to_linker::<
-        _,
-        HasSelf<StoreData<CpuImpl, HostFs>>,
-    >(linker, |state| state)?;
+    program_wit::programs::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
+        linker,
+        |state| state,
+    )?;
     Ok(())
 }
 
@@ -2098,25 +2101,19 @@ where
                     )
                 })?;
                 if !has_authority {
-                    return Ok::<_, wasmtime::Error>((Err(
-                        debugger_bindings::helios::system::net::PingError {
-                            kind:
-                                debugger_bindings::helios::system::net::PingErrorKind::Unavailable,
-                            detail: "network authority is missing DNS rights".to_owned(),
-                        },
-                    ),));
+                    return Ok::<_, wasmtime::Error>((Err(debugger_wit::net::PingError {
+                        kind: debugger_wit::net::PingErrorKind::Unavailable,
+                        detail: "network authority is missing DNS rights".to_owned(),
+                    }),));
                 }
                 let service = accessor.with(|mut access| {
                     Ok::<_, wasmtime::Error>(access.get().runtime_state.network_service())
                 })?;
                 let Some(service) = service else {
-                    return Ok::<_, wasmtime::Error>((Err(
-                        debugger_bindings::helios::system::net::PingError {
-                            kind:
-                                debugger_bindings::helios::system::net::PingErrorKind::Unavailable,
-                            detail: "network service is unavailable on this machine".to_owned(),
-                        },
-                    ),));
+                    return Ok::<_, wasmtime::Error>((Err(debugger_wit::net::PingError {
+                        kind: debugger_wit::net::PingErrorKind::Unavailable,
+                        detail: "network service is unavailable on this machine".to_owned(),
+                    }),));
                 };
                 let response = service
                     .ping(&host, timeout)
@@ -2292,9 +2289,7 @@ where
                     ))
                 })?;
                 socket.0.tcp_close(socket.1).await;
-                Ok::<_, wasmtime::Error>((
-                    Ok::<(), debugger_bindings::helios::system::net::TcpError>(()),
-                ))
+                Ok::<_, wasmtime::Error>((Ok::<(), debugger_wit::net::TcpError>(()),))
             })
         },
     )?;
@@ -2360,9 +2355,7 @@ where
                     ))
                 })?;
                 socket.0.udp_close(socket.1).await;
-                Ok::<_, wasmtime::Error>((
-                    Ok::<(), debugger_bindings::helios::system::net::UdpError>(()),
-                ))
+                Ok::<_, wasmtime::Error>((Ok::<(), debugger_wit::net::UdpError>(()),))
             })
         },
     )?;
@@ -2431,23 +2424,19 @@ where
                     )
                 })?;
                 if !has_authority {
-                    return Ok::<_, wasmtime::Error>((Err(
-                        program_bindings::helios::system::net::PingError {
-                            kind: program_bindings::helios::system::net::PingErrorKind::Unavailable,
-                            detail: "network authority is missing DNS rights".to_owned(),
-                        },
-                    ),));
+                    return Ok::<_, wasmtime::Error>((Err(program_wit::net::PingError {
+                        kind: program_wit::net::PingErrorKind::Unavailable,
+                        detail: "network authority is missing DNS rights".to_owned(),
+                    }),));
                 }
                 let service = accessor.with(|mut access| {
                     Ok::<_, wasmtime::Error>(access.get().runtime_state.network_service())
                 })?;
                 let Some(service) = service else {
-                    return Ok::<_, wasmtime::Error>((Err(
-                        program_bindings::helios::system::net::PingError {
-                            kind: program_bindings::helios::system::net::PingErrorKind::Unavailable,
-                            detail: "network service is unavailable on this machine".to_owned(),
-                        },
-                    ),));
+                    return Ok::<_, wasmtime::Error>((Err(program_wit::net::PingError {
+                        kind: program_wit::net::PingErrorKind::Unavailable,
+                        detail: "network service is unavailable on this machine".to_owned(),
+                    }),));
                 };
                 let response = service
                     .ping(&host, timeout)
@@ -2641,9 +2630,7 @@ where
                     ))
                 })?;
                 socket.0.tcp_close(socket.1).await;
-                Ok::<_, wasmtime::Error>((
-                    Ok::<(), program_bindings::helios::system::net::TcpError>(()),
-                ))
+                Ok::<_, wasmtime::Error>((Ok::<(), program_wit::net::TcpError>(()),))
             })
         },
     )?;
@@ -2709,9 +2696,7 @@ where
                     ))
                 })?;
                 socket.0.udp_close(socket.1).await;
-                Ok::<_, wasmtime::Error>((
-                    Ok::<(), program_bindings::helios::system::net::UdpError>(()),
-                ))
+                Ok::<_, wasmtime::Error>((Ok::<(), program_wit::net::UdpError>(()),))
             })
         },
     )?;
@@ -2728,7 +2713,7 @@ where
     let mut instance = linker.instance(TRACING_INSTANCE)?;
     instance.func_wrap(
         "recent",
-        |caller, (filter, limit): (debugger_bindings::helios::system::tracing::Filter, u32)| {
+        |caller, (filter, limit): (debugger_wit::tracing::Filter, u32)| {
             let filter = convert_filter(filter);
             let events = caller
                 .data()
@@ -2742,7 +2727,7 @@ where
     )?;
     instance.func_wrap(
         "subscribe",
-        |mut caller, (filter,): (debugger_bindings::helios::system::tracing::Filter,)| {
+        |mut caller, (filter,): (debugger_wit::tracing::Filter,)| {
             let reader = StreamReader::new(
                 &mut caller,
                 TracingStreamProducer::new(convert_filter(filter)),
@@ -2771,7 +2756,7 @@ where
     })?;
     instance.func_wrap(
         "folded",
-        |caller, (filter, limit): (debugger_bindings::helios::system::profiling::Filter, u32)| {
+        |caller, (filter, limit): (debugger_wit::profiling::Filter, u32)| {
             let filter = convert_profile_filter(filter);
             let samples = caller
                 .data()
@@ -2785,11 +2770,7 @@ where
     )?;
     instance.func_wrap(
         "metrics",
-        |caller,
-         (filter, limit): (
-            debugger_bindings::helios::system::profiling::MetricFilter,
-            u32,
-        )| {
+        |caller, (filter, limit): (debugger_wit::profiling::MetricFilter, u32)| {
             let filter = convert_perf_metric_filter(filter);
             let samples = caller
                 .data()
@@ -2832,7 +2813,7 @@ where
     let mut instance = linker.instance(TRACING_INSTANCE)?;
     instance.func_wrap(
         "recent",
-        |caller, (filter, limit): (program_bindings::helios::system::tracing::Filter, u32)| {
+        |caller, (filter, limit): (program_wit::tracing::Filter, u32)| {
             let filter = convert_program_filter(filter);
             let events = caller
                 .data()
@@ -2846,7 +2827,7 @@ where
     )?;
     instance.func_wrap(
         "subscribe",
-        |mut caller, (filter,): (program_bindings::helios::system::tracing::Filter,)| {
+        |mut caller, (filter,): (program_wit::tracing::Filter,)| {
             let reader = StreamReader::new(
                 &mut caller,
                 ProgramTracingStreamProducer::new(convert_program_filter(filter)),
@@ -2857,53 +2838,39 @@ where
     Ok(())
 }
 
-fn convert_launch_error(
-    error: crate::ProgramExecError,
-) -> debugger_bindings::helios::system::programs::ExecError {
-    debugger_bindings::helios::system::programs::ExecError {
+fn convert_launch_error(error: crate::ProgramExecError) -> debugger_wit::programs::ExecError {
+    debugger_wit::programs::ExecError {
         kind: match error.kind {
             ProgramExecErrorKind::InvalidBinary => {
-                debugger_bindings::helios::system::programs::ExecErrorKind::InvalidBinary
+                debugger_wit::programs::ExecErrorKind::InvalidBinary
             }
             ProgramExecErrorKind::MissingEntry => {
-                debugger_bindings::helios::system::programs::ExecErrorKind::MissingEntry
+                debugger_wit::programs::ExecErrorKind::MissingEntry
             }
             ProgramExecErrorKind::UnsupportedImport => {
-                debugger_bindings::helios::system::programs::ExecErrorKind::UnsupportedImport
+                debugger_wit::programs::ExecErrorKind::UnsupportedImport
             }
             ProgramExecErrorKind::InvalidSignature => {
-                debugger_bindings::helios::system::programs::ExecErrorKind::InvalidSignature
+                debugger_wit::programs::ExecErrorKind::InvalidSignature
             }
-            ProgramExecErrorKind::InvalidPath => {
-                debugger_bindings::helios::system::programs::ExecErrorKind::InvalidPath
-            }
+            ProgramExecErrorKind::InvalidPath => debugger_wit::programs::ExecErrorKind::InvalidPath,
             ProgramExecErrorKind::PermissionDenied => {
-                debugger_bindings::helios::system::programs::ExecErrorKind::PermissionDenied
+                debugger_wit::programs::ExecErrorKind::PermissionDenied
             }
-            ProgramExecErrorKind::InvalidHint => {
-                debugger_bindings::helios::system::programs::ExecErrorKind::InvalidHint
-            }
-            ProgramExecErrorKind::OutOfMemory => {
-                debugger_bindings::helios::system::programs::ExecErrorKind::OutOfMemory
-            }
-            ProgramExecErrorKind::Unavailable => {
-                debugger_bindings::helios::system::programs::ExecErrorKind::Unavailable
-            }
-            ProgramExecErrorKind::Internal => {
-                debugger_bindings::helios::system::programs::ExecErrorKind::Internal
-            }
+            ProgramExecErrorKind::InvalidHint => debugger_wit::programs::ExecErrorKind::InvalidHint,
+            ProgramExecErrorKind::OutOfMemory => debugger_wit::programs::ExecErrorKind::OutOfMemory,
+            ProgramExecErrorKind::Unavailable => debugger_wit::programs::ExecErrorKind::Unavailable,
+            ProgramExecErrorKind::Internal => debugger_wit::programs::ExecErrorKind::Internal,
         },
         detail: error.detail.as_str().to_owned(),
     }
 }
 
-fn convert_launch_result(
-    result: crate::ExecResult,
-) -> debugger_bindings::helios::system::programs::ExecResult {
-    debugger_bindings::helios::system::programs::ExecResult {
+fn convert_launch_result(result: crate::ExecResult) -> debugger_wit::programs::ExecResult {
+    debugger_wit::programs::ExecResult {
         instance_id: result.instance_id.raw(),
         exit_code: result.exit_code,
-        output: debugger_bindings::helios::system::programs::ExecOutput {
+        output: debugger_wit::programs::ExecOutput {
             stdout: result.output.stdout,
             stderr: result.output.stderr,
         },
@@ -2912,338 +2879,246 @@ fn convert_launch_result(
 
 fn convert_program_launch_error(
     error: crate::ProgramExecError,
-) -> program_bindings::helios::system::programs::ExecError {
-    program_bindings::helios::system::programs::ExecError {
+) -> program_wit::programs::ExecError {
+    program_wit::programs::ExecError {
         kind: match error.kind {
             ProgramExecErrorKind::InvalidBinary => {
-                program_bindings::helios::system::programs::ExecErrorKind::InvalidBinary
+                program_wit::programs::ExecErrorKind::InvalidBinary
             }
             ProgramExecErrorKind::MissingEntry => {
-                program_bindings::helios::system::programs::ExecErrorKind::MissingEntry
+                program_wit::programs::ExecErrorKind::MissingEntry
             }
             ProgramExecErrorKind::UnsupportedImport => {
-                program_bindings::helios::system::programs::ExecErrorKind::UnsupportedImport
+                program_wit::programs::ExecErrorKind::UnsupportedImport
             }
             ProgramExecErrorKind::InvalidSignature => {
-                program_bindings::helios::system::programs::ExecErrorKind::InvalidSignature
+                program_wit::programs::ExecErrorKind::InvalidSignature
             }
-            ProgramExecErrorKind::InvalidPath => {
-                program_bindings::helios::system::programs::ExecErrorKind::InvalidPath
-            }
+            ProgramExecErrorKind::InvalidPath => program_wit::programs::ExecErrorKind::InvalidPath,
             ProgramExecErrorKind::PermissionDenied => {
-                program_bindings::helios::system::programs::ExecErrorKind::PermissionDenied
+                program_wit::programs::ExecErrorKind::PermissionDenied
             }
-            ProgramExecErrorKind::InvalidHint => {
-                program_bindings::helios::system::programs::ExecErrorKind::InvalidHint
-            }
-            ProgramExecErrorKind::OutOfMemory => {
-                program_bindings::helios::system::programs::ExecErrorKind::OutOfMemory
-            }
-            ProgramExecErrorKind::Unavailable => {
-                program_bindings::helios::system::programs::ExecErrorKind::Unavailable
-            }
-            ProgramExecErrorKind::Internal => {
-                program_bindings::helios::system::programs::ExecErrorKind::Internal
-            }
+            ProgramExecErrorKind::InvalidHint => program_wit::programs::ExecErrorKind::InvalidHint,
+            ProgramExecErrorKind::OutOfMemory => program_wit::programs::ExecErrorKind::OutOfMemory,
+            ProgramExecErrorKind::Unavailable => program_wit::programs::ExecErrorKind::Unavailable,
+            ProgramExecErrorKind::Internal => program_wit::programs::ExecErrorKind::Internal,
         },
         detail: error.detail.as_str().to_owned(),
     }
 }
 
-fn convert_program_launch_result(
-    result: crate::ExecResult,
-) -> program_bindings::helios::system::programs::ExecResult {
-    program_bindings::helios::system::programs::ExecResult {
+fn convert_program_launch_result(result: crate::ExecResult) -> program_wit::programs::ExecResult {
+    program_wit::programs::ExecResult {
         instance_id: result.instance_id.raw(),
         exit_code: result.exit_code,
-        output: program_bindings::helios::system::programs::ExecOutput {
+        output: program_wit::programs::ExecOutput {
             stdout: result.output.stdout,
             stderr: result.output.stderr,
         },
     }
 }
 
-fn convert_ip_address(
-    address: crate::NetworkIpAddress,
-) -> debugger_bindings::helios::system::net::IpAddress {
+fn convert_ip_address(address: crate::NetworkIpAddress) -> debugger_wit::net::IpAddress {
     match address {
         crate::NetworkIpAddress::Ipv4(address) => {
             let octets = address.octets();
-            debugger_bindings::helios::system::net::IpAddress::Ipv4((
-                octets[0], octets[1], octets[2], octets[3],
-            ))
+            debugger_wit::net::IpAddress::Ipv4((octets[0], octets[1], octets[2], octets[3]))
         }
         crate::NetworkIpAddress::Ipv6(address) => {
-            debugger_bindings::helios::system::net::IpAddress::Ipv6(ipv6_address_groups(address))
+            debugger_wit::net::IpAddress::Ipv6(ipv6_address_groups(address))
         }
     }
 }
 
-fn convert_program_ip_address(
-    address: crate::NetworkIpAddress,
-) -> program_bindings::helios::system::net::IpAddress {
+fn convert_program_ip_address(address: crate::NetworkIpAddress) -> program_wit::net::IpAddress {
     match address {
         crate::NetworkIpAddress::Ipv4(address) => {
             let octets = address.octets();
-            program_bindings::helios::system::net::IpAddress::Ipv4((
-                octets[0], octets[1], octets[2], octets[3],
-            ))
+            program_wit::net::IpAddress::Ipv4((octets[0], octets[1], octets[2], octets[3]))
         }
         crate::NetworkIpAddress::Ipv6(address) => {
-            program_bindings::helios::system::net::IpAddress::Ipv6(ipv6_address_groups(address))
+            program_wit::net::IpAddress::Ipv6(ipv6_address_groups(address))
         }
     }
 }
 
-fn convert_ping_reply(
-    reply: crate::PingReply,
-) -> debugger_bindings::helios::system::net::PingReply {
-    debugger_bindings::helios::system::net::PingReply {
+fn convert_ping_reply(reply: crate::PingReply) -> debugger_wit::net::PingReply {
+    debugger_wit::net::PingReply {
         address: convert_ip_address(reply.address),
         round_trip: reply.round_trip_nanos,
         payload_bytes: reply.payload_bytes,
     }
 }
 
-fn convert_program_ping_reply(
-    reply: crate::PingReply,
-) -> program_bindings::helios::system::net::PingReply {
-    program_bindings::helios::system::net::PingReply {
+fn convert_program_ping_reply(reply: crate::PingReply) -> program_wit::net::PingReply {
+    program_wit::net::PingReply {
         address: convert_program_ip_address(reply.address),
         round_trip: reply.round_trip_nanos,
         payload_bytes: reply.payload_bytes,
     }
 }
 
-fn convert_ping_error(
-    error: crate::PingError,
-) -> debugger_bindings::helios::system::net::PingError {
-    debugger_bindings::helios::system::net::PingError {
+fn convert_ping_error(error: crate::PingError) -> debugger_wit::net::PingError {
+    debugger_wit::net::PingError {
         kind: match error.kind {
             crate::PingErrorKind::UnresolvedHost => {
-                debugger_bindings::helios::system::net::PingErrorKind::UnresolvedHost
+                debugger_wit::net::PingErrorKind::UnresolvedHost
             }
-            crate::PingErrorKind::Timeout => {
-                debugger_bindings::helios::system::net::PingErrorKind::Timeout
-            }
-            crate::PingErrorKind::Unavailable => {
-                debugger_bindings::helios::system::net::PingErrorKind::Unavailable
-            }
-            crate::PingErrorKind::Internal => {
-                debugger_bindings::helios::system::net::PingErrorKind::Internal
-            }
+            crate::PingErrorKind::Timeout => debugger_wit::net::PingErrorKind::Timeout,
+            crate::PingErrorKind::Unavailable => debugger_wit::net::PingErrorKind::Unavailable,
+            crate::PingErrorKind::Internal => debugger_wit::net::PingErrorKind::Internal,
         },
         detail: error.detail.as_str().to_owned(),
     }
 }
 
-fn convert_program_ping_error(
-    error: crate::PingError,
-) -> program_bindings::helios::system::net::PingError {
-    program_bindings::helios::system::net::PingError {
+fn convert_program_ping_error(error: crate::PingError) -> program_wit::net::PingError {
+    program_wit::net::PingError {
         kind: match error.kind {
-            crate::PingErrorKind::UnresolvedHost => {
-                program_bindings::helios::system::net::PingErrorKind::UnresolvedHost
-            }
-            crate::PingErrorKind::Timeout => {
-                program_bindings::helios::system::net::PingErrorKind::Timeout
-            }
-            crate::PingErrorKind::Unavailable => {
-                program_bindings::helios::system::net::PingErrorKind::Unavailable
-            }
-            crate::PingErrorKind::Internal => {
-                program_bindings::helios::system::net::PingErrorKind::Internal
-            }
+            crate::PingErrorKind::UnresolvedHost => program_wit::net::PingErrorKind::UnresolvedHost,
+            crate::PingErrorKind::Timeout => program_wit::net::PingErrorKind::Timeout,
+            crate::PingErrorKind::Unavailable => program_wit::net::PingErrorKind::Unavailable,
+            crate::PingErrorKind::Internal => program_wit::net::PingErrorKind::Internal,
         },
         detail: error.detail.as_str().to_owned(),
     }
 }
 
-fn unavailable_tcp_error() -> debugger_bindings::helios::system::net::TcpError {
-    debugger_bindings::helios::system::net::TcpError {
-        kind: debugger_bindings::helios::system::net::TcpErrorKind::Unavailable,
+fn unavailable_tcp_error() -> debugger_wit::net::TcpError {
+    debugger_wit::net::TcpError {
+        kind: debugger_wit::net::TcpErrorKind::Unavailable,
         detail: "network service is unavailable on this machine".to_owned(),
     }
 }
 
-fn unavailable_tcp_authority_error() -> debugger_bindings::helios::system::net::TcpError {
-    debugger_bindings::helios::system::net::TcpError {
-        kind: debugger_bindings::helios::system::net::TcpErrorKind::Unavailable,
+fn unavailable_tcp_authority_error() -> debugger_wit::net::TcpError {
+    debugger_wit::net::TcpError {
+        kind: debugger_wit::net::TcpErrorKind::Unavailable,
         detail: "network authority is missing TCP or DNS rights".to_owned(),
     }
 }
 
-fn unavailable_program_tcp_error() -> program_bindings::helios::system::net::TcpError {
-    program_bindings::helios::system::net::TcpError {
-        kind: program_bindings::helios::system::net::TcpErrorKind::Unavailable,
+fn unavailable_program_tcp_error() -> program_wit::net::TcpError {
+    program_wit::net::TcpError {
+        kind: program_wit::net::TcpErrorKind::Unavailable,
         detail: "network service is unavailable on this machine".to_owned(),
     }
 }
 
-fn unavailable_program_tcp_authority_error() -> program_bindings::helios::system::net::TcpError {
-    program_bindings::helios::system::net::TcpError {
-        kind: program_bindings::helios::system::net::TcpErrorKind::Unavailable,
+fn unavailable_program_tcp_authority_error() -> program_wit::net::TcpError {
+    program_wit::net::TcpError {
+        kind: program_wit::net::TcpErrorKind::Unavailable,
         detail: "network authority is missing TCP or DNS rights".to_owned(),
     }
 }
 
-fn unavailable_udp_error() -> debugger_bindings::helios::system::net::UdpError {
-    debugger_bindings::helios::system::net::UdpError {
-        kind: debugger_bindings::helios::system::net::UdpErrorKind::Unavailable,
+fn unavailable_udp_error() -> debugger_wit::net::UdpError {
+    debugger_wit::net::UdpError {
+        kind: debugger_wit::net::UdpErrorKind::Unavailable,
         detail: "network service is unavailable on this machine".to_owned(),
     }
 }
 
-fn unavailable_udp_authority_error() -> debugger_bindings::helios::system::net::UdpError {
-    debugger_bindings::helios::system::net::UdpError {
-        kind: debugger_bindings::helios::system::net::UdpErrorKind::Unavailable,
+fn unavailable_udp_authority_error() -> debugger_wit::net::UdpError {
+    debugger_wit::net::UdpError {
+        kind: debugger_wit::net::UdpErrorKind::Unavailable,
         detail: "network authority is missing UDP or privileged-bind rights".to_owned(),
     }
 }
 
-fn unavailable_program_udp_error() -> program_bindings::helios::system::net::UdpError {
-    program_bindings::helios::system::net::UdpError {
-        kind: program_bindings::helios::system::net::UdpErrorKind::Unavailable,
+fn unavailable_program_udp_error() -> program_wit::net::UdpError {
+    program_wit::net::UdpError {
+        kind: program_wit::net::UdpErrorKind::Unavailable,
         detail: "network service is unavailable on this machine".to_owned(),
     }
 }
 
-fn unavailable_program_udp_authority_error() -> program_bindings::helios::system::net::UdpError {
-    program_bindings::helios::system::net::UdpError {
-        kind: program_bindings::helios::system::net::UdpErrorKind::Unavailable,
+fn unavailable_program_udp_authority_error() -> program_wit::net::UdpError {
+    program_wit::net::UdpError {
+        kind: program_wit::net::UdpErrorKind::Unavailable,
         detail: "network authority is missing UDP or privileged-bind rights".to_owned(),
     }
 }
 
-fn convert_tcp_error(error: crate::TcpError) -> debugger_bindings::helios::system::net::TcpError {
-    debugger_bindings::helios::system::net::TcpError {
+fn convert_tcp_error(error: crate::TcpError) -> debugger_wit::net::TcpError {
+    debugger_wit::net::TcpError {
         kind: match error.kind {
-            crate::TcpErrorKind::UnresolvedHost => {
-                debugger_bindings::helios::system::net::TcpErrorKind::UnresolvedHost
-            }
-            crate::TcpErrorKind::Timeout => {
-                debugger_bindings::helios::system::net::TcpErrorKind::Timeout
-            }
+            crate::TcpErrorKind::UnresolvedHost => debugger_wit::net::TcpErrorKind::UnresolvedHost,
+            crate::TcpErrorKind::Timeout => debugger_wit::net::TcpErrorKind::Timeout,
             crate::TcpErrorKind::ConnectionReset => {
-                debugger_bindings::helios::system::net::TcpErrorKind::ConnectionReset
+                debugger_wit::net::TcpErrorKind::ConnectionReset
             }
             crate::TcpErrorKind::ConnectionAborted => {
-                debugger_bindings::helios::system::net::TcpErrorKind::ConnectionAborted
+                debugger_wit::net::TcpErrorKind::ConnectionAborted
             }
-            crate::TcpErrorKind::PermissionDenied => {
-                debugger_bindings::helios::system::net::TcpErrorKind::Unavailable
-            }
-            crate::TcpErrorKind::Unavailable => {
-                debugger_bindings::helios::system::net::TcpErrorKind::Unavailable
-            }
-            crate::TcpErrorKind::Internal => {
-                debugger_bindings::helios::system::net::TcpErrorKind::Internal
-            }
+            crate::TcpErrorKind::PermissionDenied => debugger_wit::net::TcpErrorKind::Unavailable,
+            crate::TcpErrorKind::Unavailable => debugger_wit::net::TcpErrorKind::Unavailable,
+            crate::TcpErrorKind::Internal => debugger_wit::net::TcpErrorKind::Internal,
         },
         detail: error.detail.as_str().to_owned(),
     }
 }
 
-fn convert_program_tcp_error(
-    error: crate::TcpError,
-) -> program_bindings::helios::system::net::TcpError {
-    program_bindings::helios::system::net::TcpError {
+fn convert_program_tcp_error(error: crate::TcpError) -> program_wit::net::TcpError {
+    program_wit::net::TcpError {
         kind: match error.kind {
-            crate::TcpErrorKind::UnresolvedHost => {
-                program_bindings::helios::system::net::TcpErrorKind::UnresolvedHost
-            }
-            crate::TcpErrorKind::Timeout => {
-                program_bindings::helios::system::net::TcpErrorKind::Timeout
-            }
-            crate::TcpErrorKind::ConnectionReset => {
-                program_bindings::helios::system::net::TcpErrorKind::ConnectionReset
-            }
+            crate::TcpErrorKind::UnresolvedHost => program_wit::net::TcpErrorKind::UnresolvedHost,
+            crate::TcpErrorKind::Timeout => program_wit::net::TcpErrorKind::Timeout,
+            crate::TcpErrorKind::ConnectionReset => program_wit::net::TcpErrorKind::ConnectionReset,
             crate::TcpErrorKind::ConnectionAborted => {
-                program_bindings::helios::system::net::TcpErrorKind::ConnectionAborted
+                program_wit::net::TcpErrorKind::ConnectionAborted
             }
-            crate::TcpErrorKind::PermissionDenied => {
-                program_bindings::helios::system::net::TcpErrorKind::Unavailable
-            }
-            crate::TcpErrorKind::Unavailable => {
-                program_bindings::helios::system::net::TcpErrorKind::Unavailable
-            }
-            crate::TcpErrorKind::Internal => {
-                program_bindings::helios::system::net::TcpErrorKind::Internal
-            }
+            crate::TcpErrorKind::PermissionDenied => program_wit::net::TcpErrorKind::Unavailable,
+            crate::TcpErrorKind::Unavailable => program_wit::net::TcpErrorKind::Unavailable,
+            crate::TcpErrorKind::Internal => program_wit::net::TcpErrorKind::Internal,
         },
         detail: error.detail.as_str().to_owned(),
     }
 }
 
-fn convert_udp_datagram(
-    datagram: crate::UdpDatagram,
-) -> debugger_bindings::helios::system::net::UdpDatagram {
-    debugger_bindings::helios::system::net::UdpDatagram {
+fn convert_udp_datagram(datagram: crate::UdpDatagram) -> debugger_wit::net::UdpDatagram {
+    debugger_wit::net::UdpDatagram {
         address: convert_ip_address(datagram.address),
         port: datagram.port,
         bytes: lower_bytes_to_vec(datagram.bytes),
     }
 }
 
-fn convert_program_udp_datagram(
-    datagram: crate::UdpDatagram,
-) -> program_bindings::helios::system::net::UdpDatagram {
-    program_bindings::helios::system::net::UdpDatagram {
+fn convert_program_udp_datagram(datagram: crate::UdpDatagram) -> program_wit::net::UdpDatagram {
+    program_wit::net::UdpDatagram {
         address: convert_program_ip_address(datagram.address),
         port: datagram.port,
         bytes: lower_bytes_to_vec(datagram.bytes),
     }
 }
 
-fn convert_udp_error(error: crate::UdpError) -> debugger_bindings::helios::system::net::UdpError {
-    debugger_bindings::helios::system::net::UdpError {
+fn convert_udp_error(error: crate::UdpError) -> debugger_wit::net::UdpError {
+    debugger_wit::net::UdpError {
         kind: match error.kind {
-            crate::UdpErrorKind::UnresolvedHost => {
-                debugger_bindings::helios::system::net::UdpErrorKind::UnresolvedHost
-            }
-            crate::UdpErrorKind::Unsupported => {
-                debugger_bindings::helios::system::net::UdpErrorKind::Unavailable
-            }
-            crate::UdpErrorKind::Timeout => {
-                debugger_bindings::helios::system::net::UdpErrorKind::Timeout
-            }
+            crate::UdpErrorKind::UnresolvedHost => debugger_wit::net::UdpErrorKind::UnresolvedHost,
+            crate::UdpErrorKind::Unsupported => debugger_wit::net::UdpErrorKind::Unavailable,
+            crate::UdpErrorKind::Timeout => debugger_wit::net::UdpErrorKind::Timeout,
             crate::UdpErrorKind::PermissionDenied => {
-                debugger_bindings::helios::system::net::UdpErrorKind::PermissionDenied
+                debugger_wit::net::UdpErrorKind::PermissionDenied
             }
-            crate::UdpErrorKind::Unavailable => {
-                debugger_bindings::helios::system::net::UdpErrorKind::Unavailable
-            }
-            crate::UdpErrorKind::Internal => {
-                debugger_bindings::helios::system::net::UdpErrorKind::Internal
-            }
+            crate::UdpErrorKind::Unavailable => debugger_wit::net::UdpErrorKind::Unavailable,
+            crate::UdpErrorKind::Internal => debugger_wit::net::UdpErrorKind::Internal,
         },
         detail: error.detail.as_str().to_owned(),
     }
 }
 
-fn convert_program_udp_error(
-    error: crate::UdpError,
-) -> program_bindings::helios::system::net::UdpError {
-    program_bindings::helios::system::net::UdpError {
+fn convert_program_udp_error(error: crate::UdpError) -> program_wit::net::UdpError {
+    program_wit::net::UdpError {
         kind: match error.kind {
-            crate::UdpErrorKind::UnresolvedHost => {
-                program_bindings::helios::system::net::UdpErrorKind::UnresolvedHost
-            }
-            crate::UdpErrorKind::Unsupported => {
-                program_bindings::helios::system::net::UdpErrorKind::Unavailable
-            }
-            crate::UdpErrorKind::Timeout => {
-                program_bindings::helios::system::net::UdpErrorKind::Timeout
-            }
+            crate::UdpErrorKind::UnresolvedHost => program_wit::net::UdpErrorKind::UnresolvedHost,
+            crate::UdpErrorKind::Unsupported => program_wit::net::UdpErrorKind::Unavailable,
+            crate::UdpErrorKind::Timeout => program_wit::net::UdpErrorKind::Timeout,
             crate::UdpErrorKind::PermissionDenied => {
-                program_bindings::helios::system::net::UdpErrorKind::PermissionDenied
+                program_wit::net::UdpErrorKind::PermissionDenied
             }
-            crate::UdpErrorKind::Unavailable => {
-                program_bindings::helios::system::net::UdpErrorKind::Unavailable
-            }
-            crate::UdpErrorKind::Internal => {
-                program_bindings::helios::system::net::UdpErrorKind::Internal
-            }
+            crate::UdpErrorKind::Unavailable => program_wit::net::UdpErrorKind::Unavailable,
+            crate::UdpErrorKind::Internal => program_wit::net::UdpErrorKind::Internal,
         },
         detail: error.detail.as_str().to_owned(),
     }
@@ -3269,14 +3144,14 @@ where
     Ok(())
 }
 
-impl<CpuImpl, HostFs> debugger_bindings::helios::system::serial::Host for StoreData<CpuImpl, HostFs>
+impl<CpuImpl, HostFs> debugger_wit::serial::Host for StoreData<CpuImpl, HostFs>
 where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
 }
 
-impl<CpuImpl, HostFs, U> debugger_bindings::helios::system::serial::HostWithStore<U>
+impl<CpuImpl, HostFs, U> debugger_wit::serial::HostWithStore<U>
     for HasSelf<StoreData<CpuImpl, HostFs>>
 where
     CpuImpl: Cpu + Clone,
@@ -3294,15 +3169,14 @@ where
     }
 }
 
-impl<CpuImpl, HostFs> debugger_bindings::helios::system::serial::HostSerialPort
-    for StoreData<CpuImpl, HostFs>
+impl<CpuImpl, HostFs> debugger_wit::serial::HostSerialPort for StoreData<CpuImpl, HostFs>
 where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
 }
 
-impl<CpuImpl, HostFs, U> debugger_bindings::helios::system::serial::HostSerialPortWithStore<U>
+impl<CpuImpl, HostFs, U> debugger_wit::serial::HostSerialPortWithStore<U>
     for HasSelf<StoreData<CpuImpl, HostFs>>
 where
     CpuImpl: Cpu + Clone,
@@ -3311,13 +3185,13 @@ where
     async fn rights(
         accessor: &Accessor<U, Self>,
         resource: Resource<SbiSerialPort>,
-    ) -> wasmtime::Result<debugger_bindings::helios::system::serial::SerialRights> {
+    ) -> wasmtime::Result<debugger_wit::serial::SerialRights> {
         accessor.with(|mut access| {
             let _ = access.get().table.get(&resource)?;
             Ok::<_, wasmtime::Error>(
-                debugger_bindings::helios::system::serial::SerialRights::READ
-                    | debugger_bindings::helios::system::serial::SerialRights::WRITE
-                    | debugger_bindings::helios::system::serial::SerialRights::FLUSH,
+                debugger_wit::serial::SerialRights::READ
+                    | debugger_wit::serial::SerialRights::WRITE
+                    | debugger_wit::serial::SerialRights::FLUSH,
             )
         })
     }
@@ -3378,22 +3252,21 @@ where
     }
 }
 
-impl<CpuImpl, HostFs> debugger_bindings::helios::system::sync::Host for StoreData<CpuImpl, HostFs>
+impl<CpuImpl, HostFs> debugger_wit::sync::Host for StoreData<CpuImpl, HostFs>
 where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
 }
 
-impl<CpuImpl, HostFs> debugger_bindings::helios::system::sync::HostRawMutex
-    for StoreData<CpuImpl, HostFs>
+impl<CpuImpl, HostFs> debugger_wit::sync::HostRawMutex for StoreData<CpuImpl, HostFs>
 where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
 }
 
-impl<CpuImpl, HostFs, U> debugger_bindings::helios::system::sync::HostRawMutexWithStore<U>
+impl<CpuImpl, HostFs, U> debugger_wit::sync::HostRawMutexWithStore<U>
     for HasSelf<StoreData<CpuImpl, HostFs>>
 where
     CpuImpl: Cpu + Clone,
@@ -3438,15 +3311,14 @@ where
     }
 }
 
-impl<CpuImpl, HostFs> debugger_bindings::helios::system::sync::HostRawMutexGuard
-    for StoreData<CpuImpl, HostFs>
+impl<CpuImpl, HostFs> debugger_wit::sync::HostRawMutexGuard for StoreData<CpuImpl, HostFs>
 where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
 }
 
-impl<CpuImpl, HostFs, U> debugger_bindings::helios::system::sync::HostRawMutexGuardWithStore<U>
+impl<CpuImpl, HostFs, U> debugger_wit::sync::HostRawMutexGuardWithStore<U>
     for HasSelf<StoreData<CpuImpl, HostFs>>
 where
     CpuImpl: Cpu + Clone,
@@ -3463,15 +3335,14 @@ where
     }
 }
 
-impl<CpuImpl, HostFs> debugger_bindings::helios::system::sync::HostRawRwLock
-    for StoreData<CpuImpl, HostFs>
+impl<CpuImpl, HostFs> debugger_wit::sync::HostRawRwLock for StoreData<CpuImpl, HostFs>
 where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
 }
 
-impl<CpuImpl, HostFs, U> debugger_bindings::helios::system::sync::HostRawRwLockWithStore<U>
+impl<CpuImpl, HostFs, U> debugger_wit::sync::HostRawRwLockWithStore<U>
     for HasSelf<StoreData<CpuImpl, HostFs>>
 where
     CpuImpl: Cpu + Clone,
@@ -3529,15 +3400,14 @@ where
     }
 }
 
-impl<CpuImpl, HostFs> debugger_bindings::helios::system::sync::HostRawRwLockReadGuard
-    for StoreData<CpuImpl, HostFs>
+impl<CpuImpl, HostFs> debugger_wit::sync::HostRawRwLockReadGuard for StoreData<CpuImpl, HostFs>
 where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
 }
 
-impl<CpuImpl, HostFs, U> debugger_bindings::helios::system::sync::HostRawRwLockReadGuardWithStore<U>
+impl<CpuImpl, HostFs, U> debugger_wit::sync::HostRawRwLockReadGuardWithStore<U>
     for HasSelf<StoreData<CpuImpl, HostFs>>
 where
     CpuImpl: Cpu + Clone,
@@ -3554,16 +3424,14 @@ where
     }
 }
 
-impl<CpuImpl, HostFs> debugger_bindings::helios::system::sync::HostRawRwLockWriteGuard
-    for StoreData<CpuImpl, HostFs>
+impl<CpuImpl, HostFs> debugger_wit::sync::HostRawRwLockWriteGuard for StoreData<CpuImpl, HostFs>
 where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
 }
 
-impl<CpuImpl, HostFs, U>
-    debugger_bindings::helios::system::sync::HostRawRwLockWriteGuardWithStore<U>
+impl<CpuImpl, HostFs, U> debugger_wit::sync::HostRawRwLockWriteGuardWithStore<U>
     for HasSelf<StoreData<CpuImpl, HostFs>>
 where
     CpuImpl: Cpu + Clone,
@@ -3600,7 +3468,7 @@ where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    type Item = debugger_bindings::helios::system::stats::Sample;
+    type Item = debugger_wit::stats::Sample;
     type Buffer = Option<Self::Item>;
 
     fn poll_produce<'a>(
@@ -3649,7 +3517,7 @@ where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    type Item = program_bindings::helios::system::stats::Sample;
+    type Item = program_wit::stats::Sample;
     type Buffer = Option<Self::Item>;
 
     fn poll_produce<'a>(
@@ -3694,7 +3562,7 @@ where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    type Item = debugger_bindings::helios::system::tracing::Event;
+    type Item = debugger_wit::tracing::Event;
     type Buffer = Option<Self::Item>;
 
     fn poll_produce<'a>(
@@ -3739,7 +3607,7 @@ where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    type Item = program_bindings::helios::system::tracing::Event;
+    type Item = program_wit::tracing::Event;
     type Buffer = Option<Self::Item>;
 
     fn poll_produce<'a>(
@@ -3770,7 +3638,7 @@ where
 
 fn snapshot_sample<CpuImpl, HostFs>(
     store: &StoreData<CpuImpl, HostFs>,
-) -> debugger_bindings::helios::system::stats::Sample
+) -> debugger_wit::stats::Sample
 where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
@@ -3780,7 +3648,7 @@ where
 
 fn snapshot_program_sample<CpuImpl, HostFs>(
     store: &StoreData<CpuImpl, HostFs>,
-) -> program_bindings::helios::system::stats::Sample
+) -> program_wit::stats::Sample
 where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
@@ -3923,78 +3791,70 @@ macro_rules! convert_swap_stats {
     };
 }
 
-fn convert_sample(sample: StatsSample) -> debugger_bindings::helios::system::stats::Sample {
+fn convert_sample(sample: StatsSample) -> debugger_wit::stats::Sample {
     let heap = heap_stats();
     let total_bytes =
         u64::try_from(heap.total_bytes).expect("kernel heap total bytes do not fit into u64");
     let available_bytes = u64::try_from(heap.available_bytes())
         .expect("kernel heap available bytes do not fit into u64");
-    debugger_bindings::helios::system::stats::Sample {
+    debugger_wit::stats::Sample {
         timestamp: sample.timestamp,
         uptime: sample.uptime,
         wall_clock: sample.wall_clock,
-        processors: debugger_bindings::helios::system::stats::Processors {
+        processors: debugger_wit::stats::Processors {
             configured: sample.configured_processors,
             online: sample.online_processors,
             utilization: (0..sample.configured_processors)
-                .map(|id| debugger_bindings::helios::system::stats::Processor { id, busy: 0 })
+                .map(|id| debugger_wit::stats::Processor { id, busy: 0 })
                 .collect(),
         },
-        memory: debugger_bindings::helios::system::stats::Memory {
+        memory: debugger_wit::stats::Memory {
             total_bytes,
             available_bytes,
             pressure: convert_memory_pressure(total_bytes, available_bytes),
         },
-        block: convert_block_stats!(debugger_bindings::helios::system::stats, sample.block),
-        iommu: convert_iommu_stats!(debugger_bindings::helios::system::stats, sample.iommu),
-        balloon: convert_balloon_stats!(debugger_bindings::helios::system::stats, sample.balloon),
-        swap: convert_swap_stats!(debugger_bindings::helios::system::stats, sample.swap),
-        host_share: convert_host_share_stats!(
-            debugger_bindings::helios::system::stats,
-            sample.host_share
-        ),
-        network: convert_network_stats!(debugger_bindings::helios::system::stats, sample.network),
+        block: convert_block_stats!(debugger_wit::stats, sample.block),
+        iommu: convert_iommu_stats!(debugger_wit::stats, sample.iommu),
+        balloon: convert_balloon_stats!(debugger_wit::stats, sample.balloon),
+        swap: convert_swap_stats!(debugger_wit::stats, sample.swap),
+        host_share: convert_host_share_stats!(debugger_wit::stats, sample.host_share),
+        network: convert_network_stats!(debugger_wit::stats, sample.network),
     }
 }
 
-fn convert_program_sample(sample: StatsSample) -> program_bindings::helios::system::stats::Sample {
+fn convert_program_sample(sample: StatsSample) -> program_wit::stats::Sample {
     let heap = heap_stats();
     let total_bytes =
         u64::try_from(heap.total_bytes).expect("kernel heap total bytes do not fit into u64");
     let available_bytes = u64::try_from(heap.available_bytes())
         .expect("kernel heap available bytes do not fit into u64");
-    program_bindings::helios::system::stats::Sample {
+    program_wit::stats::Sample {
         timestamp: sample.timestamp,
         uptime: sample.uptime,
         wall_clock: sample.wall_clock,
-        processors: program_bindings::helios::system::stats::Processors {
+        processors: program_wit::stats::Processors {
             configured: sample.configured_processors,
             online: sample.online_processors,
             utilization: (0..sample.configured_processors)
-                .map(|id| program_bindings::helios::system::stats::Processor { id, busy: 0 })
+                .map(|id| program_wit::stats::Processor { id, busy: 0 })
                 .collect(),
         },
-        memory: program_bindings::helios::system::stats::Memory {
+        memory: program_wit::stats::Memory {
             total_bytes,
             available_bytes,
             pressure: convert_program_memory_pressure(total_bytes, available_bytes),
         },
-        block: convert_block_stats!(program_bindings::helios::system::stats, sample.block),
-        iommu: convert_iommu_stats!(program_bindings::helios::system::stats, sample.iommu),
-        balloon: convert_balloon_stats!(program_bindings::helios::system::stats, sample.balloon),
-        swap: convert_swap_stats!(program_bindings::helios::system::stats, sample.swap),
-        host_share: convert_host_share_stats!(
-            program_bindings::helios::system::stats,
-            sample.host_share
-        ),
-        network: convert_network_stats!(program_bindings::helios::system::stats, sample.network),
+        block: convert_block_stats!(program_wit::stats, sample.block),
+        iommu: convert_iommu_stats!(program_wit::stats, sample.iommu),
+        balloon: convert_balloon_stats!(program_wit::stats, sample.balloon),
+        swap: convert_swap_stats!(program_wit::stats, sample.swap),
+        host_share: convert_host_share_stats!(program_wit::stats, sample.host_share),
+        network: convert_network_stats!(program_wit::stats, sample.network),
     }
 }
 
-fn convert_instance(
-    instance: crate::InstanceSnapshot,
-) -> debugger_bindings::helios::system::instances::Instance {
-    debugger_bindings::helios::system::instances::Instance {
+fn convert_instance(instance: crate::InstanceSnapshot) -> debugger_wit::instances::Instance {
+    debugger_wit::instances::Instance {
         id: instance.id.raw(),
         name: instance.name,
         started_at: instance.started_at,
@@ -4007,60 +3867,56 @@ fn convert_instance(
 fn convert_memory_pressure(
     total_bytes: u64,
     available_bytes: u64,
-) -> debugger_bindings::helios::system::stats::MemoryPressure {
+) -> debugger_wit::stats::MemoryPressure {
     if total_bytes == 0 {
-        return debugger_bindings::helios::system::stats::MemoryPressure::Nominal;
+        return debugger_wit::stats::MemoryPressure::Nominal;
     }
 
     let used_permille =
         ((total_bytes.saturating_sub(available_bytes.min(total_bytes))) * 1_000) / total_bytes;
 
     match used_permille {
-        0..=699 => debugger_bindings::helios::system::stats::MemoryPressure::Nominal,
-        700..=849 => debugger_bindings::helios::system::stats::MemoryPressure::Elevated,
-        850..=949 => debugger_bindings::helios::system::stats::MemoryPressure::High,
-        _ => debugger_bindings::helios::system::stats::MemoryPressure::Critical,
+        0..=699 => debugger_wit::stats::MemoryPressure::Nominal,
+        700..=849 => debugger_wit::stats::MemoryPressure::Elevated,
+        850..=949 => debugger_wit::stats::MemoryPressure::High,
+        _ => debugger_wit::stats::MemoryPressure::Critical,
     }
 }
 
 fn convert_program_memory_pressure(
     total_bytes: u64,
     available_bytes: u64,
-) -> program_bindings::helios::system::stats::MemoryPressure {
+) -> program_wit::stats::MemoryPressure {
     if total_bytes == 0 {
-        return program_bindings::helios::system::stats::MemoryPressure::Nominal;
+        return program_wit::stats::MemoryPressure::Nominal;
     }
 
     let used_permille =
         ((total_bytes.saturating_sub(available_bytes.min(total_bytes))) * 1_000) / total_bytes;
 
     match used_permille {
-        0..=699 => program_bindings::helios::system::stats::MemoryPressure::Nominal,
-        700..=849 => program_bindings::helios::system::stats::MemoryPressure::Elevated,
-        850..=949 => program_bindings::helios::system::stats::MemoryPressure::High,
-        _ => program_bindings::helios::system::stats::MemoryPressure::Critical,
+        0..=699 => program_wit::stats::MemoryPressure::Nominal,
+        700..=849 => program_wit::stats::MemoryPressure::Elevated,
+        850..=949 => program_wit::stats::MemoryPressure::High,
+        _ => program_wit::stats::MemoryPressure::Critical,
     }
 }
 
-fn convert_filter(filter: debugger_bindings::helios::system::tracing::Filter) -> TraceFilter {
+fn convert_filter(filter: debugger_wit::tracing::Filter) -> TraceFilter {
     TraceFilter {
         min_level: filter.min_level.map(convert_level_to_local),
         target_prefixes: filter.target_prefixes,
     }
 }
 
-fn convert_program_filter(
-    filter: program_bindings::helios::system::tracing::Filter,
-) -> TraceFilter {
+fn convert_program_filter(filter: program_wit::tracing::Filter) -> TraceFilter {
     TraceFilter {
         min_level: filter.min_level.map(convert_program_level_to_local),
         target_prefixes: filter.target_prefixes,
     }
 }
 
-fn convert_profile_filter(
-    filter: debugger_bindings::helios::system::profiling::Filter,
-) -> ProfileFilter {
+fn convert_profile_filter(filter: debugger_wit::profiling::Filter) -> ProfileFilter {
     ProfileFilter {
         scope: filter.scope.map(convert_profile_scope_to_local),
         stack_prefixes: filter.stack_prefixes,
@@ -4069,17 +3925,15 @@ fn convert_profile_filter(
 
 fn convert_profile_sample(
     sample: crate::FoldedProfileSample,
-) -> debugger_bindings::helios::system::profiling::FoldedSample {
-    debugger_bindings::helios::system::profiling::FoldedSample {
+) -> debugger_wit::profiling::FoldedSample {
+    debugger_wit::profiling::FoldedSample {
         scope: convert_profile_scope_from_local(sample.scope),
         stack: sample.stack,
         weight: sample.weight,
     }
 }
 
-fn convert_perf_metric_filter(
-    filter: debugger_bindings::helios::system::profiling::MetricFilter,
-) -> PerfMetricFilter {
+fn convert_perf_metric_filter(filter: debugger_wit::profiling::MetricFilter) -> PerfMetricFilter {
     PerfMetricFilter {
         name_prefixes: filter.name_prefixes,
     }
@@ -4087,8 +3941,8 @@ fn convert_perf_metric_filter(
 
 fn convert_perf_metric_sample(
     sample: crate::PerfMetricSample,
-) -> debugger_bindings::helios::system::profiling::MetricSample {
-    debugger_bindings::helios::system::profiling::MetricSample {
+) -> debugger_wit::profiling::MetricSample {
+    debugger_wit::profiling::MetricSample {
         scope: convert_profile_scope_from_local(sample.scope),
         name: sample.name,
         count: sample.count,
@@ -4103,8 +3957,8 @@ fn convert_perf_metric_sample(
     }
 }
 
-fn convert_event(event: TraceEvent) -> debugger_bindings::helios::system::tracing::Event {
-    debugger_bindings::helios::system::tracing::Event {
+fn convert_event(event: TraceEvent) -> debugger_wit::tracing::Event {
+    debugger_wit::tracing::Event {
         timestamp: event.timestamp,
         level: convert_level_from_local(event.level),
         target: event.target,
@@ -4112,8 +3966,8 @@ fn convert_event(event: TraceEvent) -> debugger_bindings::helios::system::tracin
     }
 }
 
-fn convert_program_event(event: TraceEvent) -> program_bindings::helios::system::tracing::Event {
-    program_bindings::helios::system::tracing::Event {
+fn convert_program_event(event: TraceEvent) -> program_wit::tracing::Event {
+    program_wit::tracing::Event {
         timestamp: event.timestamp,
         level: convert_program_level_from_local(event.level),
         target: event.target,
@@ -4125,119 +3979,93 @@ fn convert_program_event(event: TraceEvent) -> program_bindings::helios::system:
     }
 }
 
-fn convert_field(field: TraceField) -> debugger_bindings::helios::system::tracing::Field {
-    debugger_bindings::helios::system::tracing::Field {
+fn convert_field(field: TraceField) -> debugger_wit::tracing::Field {
+    debugger_wit::tracing::Field {
         key: field.key,
         value: convert_value(field.value),
     }
 }
 
-fn convert_program_field(field: TraceField) -> program_bindings::helios::system::tracing::Field {
-    program_bindings::helios::system::tracing::Field {
+fn convert_program_field(field: TraceField) -> program_wit::tracing::Field {
+    program_wit::tracing::Field {
         key: field.key,
         value: convert_program_value(field.value),
     }
 }
 
-fn convert_value(value: TraceValue) -> debugger_bindings::helios::system::tracing::Value {
+fn convert_value(value: TraceValue) -> debugger_wit::tracing::Value {
     match value {
-        TraceValue::Boolean(value) => {
-            debugger_bindings::helios::system::tracing::Value::Boolean(value)
-        }
-        TraceValue::Signed64(value) => {
-            debugger_bindings::helios::system::tracing::Value::Signed64(value)
-        }
-        TraceValue::Unsigned64(value) => {
-            debugger_bindings::helios::system::tracing::Value::Unsigned64(value)
-        }
-        TraceValue::Float64(value) => {
-            debugger_bindings::helios::system::tracing::Value::Float64(value)
-        }
-        TraceValue::Text(value) => debugger_bindings::helios::system::tracing::Value::Text(value),
-        TraceValue::Blob(value) => debugger_bindings::helios::system::tracing::Value::Blob(value),
+        TraceValue::Boolean(value) => debugger_wit::tracing::Value::Boolean(value),
+        TraceValue::Signed64(value) => debugger_wit::tracing::Value::Signed64(value),
+        TraceValue::Unsigned64(value) => debugger_wit::tracing::Value::Unsigned64(value),
+        TraceValue::Float64(value) => debugger_wit::tracing::Value::Float64(value),
+        TraceValue::Text(value) => debugger_wit::tracing::Value::Text(value),
+        TraceValue::Blob(value) => debugger_wit::tracing::Value::Blob(value),
     }
 }
 
-fn convert_program_value(value: TraceValue) -> program_bindings::helios::system::tracing::Value {
+fn convert_program_value(value: TraceValue) -> program_wit::tracing::Value {
     match value {
-        TraceValue::Boolean(value) => {
-            program_bindings::helios::system::tracing::Value::Boolean(value)
-        }
-        TraceValue::Signed64(value) => {
-            program_bindings::helios::system::tracing::Value::Signed64(value)
-        }
-        TraceValue::Unsigned64(value) => {
-            program_bindings::helios::system::tracing::Value::Unsigned64(value)
-        }
-        TraceValue::Float64(value) => {
-            program_bindings::helios::system::tracing::Value::Float64(value)
-        }
-        TraceValue::Text(value) => program_bindings::helios::system::tracing::Value::Text(value),
-        TraceValue::Blob(value) => program_bindings::helios::system::tracing::Value::Blob(value),
+        TraceValue::Boolean(value) => program_wit::tracing::Value::Boolean(value),
+        TraceValue::Signed64(value) => program_wit::tracing::Value::Signed64(value),
+        TraceValue::Unsigned64(value) => program_wit::tracing::Value::Unsigned64(value),
+        TraceValue::Float64(value) => program_wit::tracing::Value::Float64(value),
+        TraceValue::Text(value) => program_wit::tracing::Value::Text(value),
+        TraceValue::Blob(value) => program_wit::tracing::Value::Blob(value),
     }
 }
 
-fn convert_profile_scope_from_local(
-    scope: ProfileScope,
-) -> debugger_bindings::helios::system::profiling::Scope {
+fn convert_profile_scope_from_local(scope: ProfileScope) -> debugger_wit::profiling::Scope {
     match scope {
-        ProfileScope::Kernel => debugger_bindings::helios::system::profiling::Scope::Kernel,
-        ProfileScope::User => debugger_bindings::helios::system::profiling::Scope::User,
+        ProfileScope::Kernel => debugger_wit::profiling::Scope::Kernel,
+        ProfileScope::User => debugger_wit::profiling::Scope::User,
     }
 }
 
-fn convert_profile_scope_to_local(
-    scope: debugger_bindings::helios::system::profiling::Scope,
-) -> ProfileScope {
+fn convert_profile_scope_to_local(scope: debugger_wit::profiling::Scope) -> ProfileScope {
     match scope {
-        debugger_bindings::helios::system::profiling::Scope::Kernel => ProfileScope::Kernel,
-        debugger_bindings::helios::system::profiling::Scope::User => ProfileScope::User,
+        debugger_wit::profiling::Scope::Kernel => ProfileScope::Kernel,
+        debugger_wit::profiling::Scope::User => ProfileScope::User,
     }
 }
 
-fn convert_level_from_local(
-    level: TraceLevel,
-) -> debugger_bindings::helios::system::tracing::Level {
+fn convert_level_from_local(level: TraceLevel) -> debugger_wit::tracing::Level {
     match level {
-        TraceLevel::Error => debugger_bindings::helios::system::tracing::Level::Error,
-        TraceLevel::Warn => debugger_bindings::helios::system::tracing::Level::Warn,
-        TraceLevel::Info => debugger_bindings::helios::system::tracing::Level::Info,
-        TraceLevel::Debug => debugger_bindings::helios::system::tracing::Level::Debug,
-        TraceLevel::Trace => debugger_bindings::helios::system::tracing::Level::Trace,
+        TraceLevel::Error => debugger_wit::tracing::Level::Error,
+        TraceLevel::Warn => debugger_wit::tracing::Level::Warn,
+        TraceLevel::Info => debugger_wit::tracing::Level::Info,
+        TraceLevel::Debug => debugger_wit::tracing::Level::Debug,
+        TraceLevel::Trace => debugger_wit::tracing::Level::Trace,
     }
 }
 
-fn convert_level_to_local(level: debugger_bindings::helios::system::tracing::Level) -> TraceLevel {
+fn convert_level_to_local(level: debugger_wit::tracing::Level) -> TraceLevel {
     match level {
-        debugger_bindings::helios::system::tracing::Level::Error => TraceLevel::Error,
-        debugger_bindings::helios::system::tracing::Level::Warn => TraceLevel::Warn,
-        debugger_bindings::helios::system::tracing::Level::Info => TraceLevel::Info,
-        debugger_bindings::helios::system::tracing::Level::Debug => TraceLevel::Debug,
-        debugger_bindings::helios::system::tracing::Level::Trace => TraceLevel::Trace,
+        debugger_wit::tracing::Level::Error => TraceLevel::Error,
+        debugger_wit::tracing::Level::Warn => TraceLevel::Warn,
+        debugger_wit::tracing::Level::Info => TraceLevel::Info,
+        debugger_wit::tracing::Level::Debug => TraceLevel::Debug,
+        debugger_wit::tracing::Level::Trace => TraceLevel::Trace,
     }
 }
 
-fn convert_program_level_from_local(
-    level: TraceLevel,
-) -> program_bindings::helios::system::tracing::Level {
+fn convert_program_level_from_local(level: TraceLevel) -> program_wit::tracing::Level {
     match level {
-        TraceLevel::Error => program_bindings::helios::system::tracing::Level::Error,
-        TraceLevel::Warn => program_bindings::helios::system::tracing::Level::Warn,
-        TraceLevel::Info => program_bindings::helios::system::tracing::Level::Info,
-        TraceLevel::Debug => program_bindings::helios::system::tracing::Level::Debug,
-        TraceLevel::Trace => program_bindings::helios::system::tracing::Level::Trace,
+        TraceLevel::Error => program_wit::tracing::Level::Error,
+        TraceLevel::Warn => program_wit::tracing::Level::Warn,
+        TraceLevel::Info => program_wit::tracing::Level::Info,
+        TraceLevel::Debug => program_wit::tracing::Level::Debug,
+        TraceLevel::Trace => program_wit::tracing::Level::Trace,
     }
 }
 
-fn convert_program_level_to_local(
-    level: program_bindings::helios::system::tracing::Level,
-) -> TraceLevel {
+fn convert_program_level_to_local(level: program_wit::tracing::Level) -> TraceLevel {
     match level {
-        program_bindings::helios::system::tracing::Level::Error => TraceLevel::Error,
-        program_bindings::helios::system::tracing::Level::Warn => TraceLevel::Warn,
-        program_bindings::helios::system::tracing::Level::Info => TraceLevel::Info,
-        program_bindings::helios::system::tracing::Level::Debug => TraceLevel::Debug,
-        program_bindings::helios::system::tracing::Level::Trace => TraceLevel::Trace,
+        program_wit::tracing::Level::Error => TraceLevel::Error,
+        program_wit::tracing::Level::Warn => TraceLevel::Warn,
+        program_wit::tracing::Level::Info => TraceLevel::Info,
+        program_wit::tracing::Level::Debug => TraceLevel::Debug,
+        program_wit::tracing::Level::Trace => TraceLevel::Trace,
     }
 }
 

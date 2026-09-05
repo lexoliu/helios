@@ -267,7 +267,12 @@ impl HttpFields {
             Self::check_value(value)?;
         }
 
-        let removed = self.entry_bytes_for(&name);
+        let removed: usize = self
+            .entries
+            .iter()
+            .filter(|(entry, _)| entry == &name)
+            .map(|(entry, value)| entry.as_str().len() + value.len())
+            .sum();
         let added: usize = values
             .iter()
             .map(|value| name.as_str().len() + value.len())
@@ -354,14 +359,6 @@ impl HttpFields {
             return Err(HttpHeaderError::InvalidSyntax);
         }
         Ok(())
-    }
-
-    fn entry_bytes_for(&self, name: &HttpFieldName) -> usize {
-        self.entries
-            .iter()
-            .filter(|(entry, _)| entry == name)
-            .map(|(entry, value)| entry.as_str().len() + value.len())
-            .sum()
     }
 
     fn check_section_size(&self, removed: usize, added: usize) -> Result<(), HttpHeaderError> {

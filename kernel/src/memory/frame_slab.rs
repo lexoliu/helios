@@ -203,7 +203,8 @@ impl FrameSlabCache {
 
     fn shard_capacity_frames(&self, total_frames: usize) -> usize {
         let shard_count = self.shards.get().map_or(1, |shards| shards.len() + 1);
-        slab_capacity_frames(total_frames)
+        total_frames
+            .div_ceil(SLAB_RETAIN_DIVISOR)
             .div_ceil(shard_count)
             .max(1)
     }
@@ -221,10 +222,6 @@ impl FrameSlabCache {
             )
         })
     }
-}
-
-fn slab_capacity_frames(total_frames: usize) -> usize {
-    total_frames.div_ceil(SLAB_RETAIN_DIVISOR)
 }
 
 #[cfg(test)]

@@ -254,6 +254,7 @@ pub(crate) struct DebugFileSystem<State, HostFsService> {
     pub(super) _host_fs: PhantomData<HostFsService>,
 }
 
+#[derive(Clone, Copy)]
 pub(super) enum FileWriteMode {
     At(usize),
     Append,
@@ -563,10 +564,7 @@ where
         let Some(host) = self.host.clone() else {
             return;
         };
-        let mode = match &self.mode {
-            FileWriteMode::At(offset) => FileWriteMode::At(*offset),
-            FileWriteMode::Append => FileWriteMode::Append,
-        };
+        let mode = self.mode;
         self.pending = Some(Box::pin(async move {
             let written = bytes.len();
             match mode {
