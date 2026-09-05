@@ -281,10 +281,11 @@ where
 }
 
 fn configured_timeout_seconds() -> NonZeroU16 {
-    let raw = WATCHDOG_TIMEOUT_SECONDS_ENV.unwrap_or("30");
-    let seconds = raw
-        .parse::<u16>()
-        .unwrap_or_else(|error| panic!("invalid HELIOS_WATCHDOG_TIMEOUT_SECS={raw:?}: {error}"));
-    NonZeroU16::new(seconds)
-        .unwrap_or_else(|| panic!("HELIOS_WATCHDOG_TIMEOUT_SECS must be non-zero"))
+    let seconds = match WATCHDOG_TIMEOUT_SECONDS_ENV {
+        Some(raw) => raw.parse::<u16>().unwrap_or_else(|error| {
+            panic!("invalid HELIOS_WATCHDOG_TIMEOUT_SECS={raw:?}: {error}")
+        }),
+        None => DEFAULT_WATCHDOG_TIMEOUT_SECONDS,
+    };
+    NonZeroU16::new(seconds).expect("HELIOS_WATCHDOG_TIMEOUT_SECS must be non-zero")
 }

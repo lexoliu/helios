@@ -56,8 +56,7 @@ pub enum Framing {
 /// Read one final response head, skipping any interim `1xx` responses.
 pub async fn read_head(socket: &mut Socket) -> Result<Head, ErrorCode> {
     loop {
-        let parsed = parse_head(socket.buffered())?;
-        let Some((length, status, headers)) = parsed else {
+        let Some((length, status, headers)) = parse_head(socket.buffered())? else {
             if socket.buffered().len() > MAX_HEAD_BYTES {
                 return Err(ErrorCode::HttpResponseHeaderSectionSize(Some(
                     MAX_HEAD_BYTES as u32,
@@ -116,8 +115,7 @@ pub fn framing(method: &Method, head: &Head) -> Result<Framing, ErrorCode> {
         return Ok(Framing::Empty);
     }
 
-    let codings = transfer_codings(&head.headers)?;
-    if let Some(codings) = codings {
+    if let Some(codings) = transfer_codings(&head.headers)? {
         let Some((last, rest)) = codings.split_last() else {
             return Err(ErrorCode::HttpProtocolError);
         };
@@ -321,12 +319,13 @@ async fn write_chunk(writer: &mut StreamWriter<u8>, chunk: Vec<u8>) -> bool {
 /// Read one CRLF-terminated line, without its terminator.
 async fn read_line(socket: &mut Socket, limit: usize) -> Result<Vec<u8>, ErrorCode> {
     loop {
-        if let Some(position) = find_crlf(socket.buffered()) {
-            let line = socket.buffered()[..position].to_vec();
+        let buffered = socket.buffered();
+        if let Some(position) = buffered.windows(2).position(|window| window == b"\r\n") {
+            let line = buffered[..position].to_vec();
             socket.consume(position + 2);
             return Ok(line);
         }
-        if socket.buffered().len() > limit {
+        if buffered.len() > limit {
             return Err(ErrorCode::HttpProtocolError);
         }
         if !socket.fill().await? {
@@ -335,17 +334,10 @@ async fn read_line(socket: &mut Socket, limit: usize) -> Result<Vec<u8>, ErrorCo
     }
 }
 
-fn find_crlf(bytes: &[u8]) -> Option<usize> {
-    bytes.windows(2).position(|window| window == b"\r\n")
-}
-
 fn parse_chunk_size(line: &[u8]) -> Result<u64, ErrorCode> {
     let line = core::str::from_utf8(line).map_err(|_| ErrorCode::HttpProtocolError)?;
-    let size = line
-        .split(';')
-        .next()
-        .ok_or(ErrorCode::HttpProtocolError)?
-        .trim();
+    // A chunk size may be followed by chunk extensions this client ignores.
+    let size = line.split_once(';').map_or(line, |(size, _)| size).trim();
     u64::from_str_radix(size, 16).map_err(|_| ErrorCode::HttpProtocolError)
 }
 

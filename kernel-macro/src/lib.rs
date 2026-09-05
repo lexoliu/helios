@@ -7,7 +7,7 @@ use proc_macro::TokenStream;
 use proc_macro2::Literal;
 use quote::quote;
 use syn::parse::{Parse, ParseStream};
-use syn::{LitStr, Result, parse_macro_input};
+use syn::{LitStr, parse_macro_input};
 use walkdir::WalkDir;
 
 struct WasmMacroInput {
@@ -15,7 +15,7 @@ struct WasmMacroInput {
 }
 
 impl Parse for WasmMacroInput {
-    fn parse(input: ParseStream<'_>) -> Result<Self> {
+    fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
         let wasm_path = input.parse()?;
         Ok(Self { wasm_path })
     }
@@ -26,7 +26,7 @@ struct BootFsMacroInput {
 }
 
 impl Parse for BootFsMacroInput {
-    fn parse(input: ParseStream<'_>) -> Result<Self> {
+    fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
         Ok(Self {
             root: input.parse()?,
         })
@@ -46,7 +46,7 @@ pub fn bootfs(input: TokenStream) -> TokenStream {
     expand_bootfs(input).unwrap_or_else(|error| panic!("failed to embed bootfs directory: {error}"))
 }
 
-fn expand_embed_wasm(input: WasmMacroInput) -> std::result::Result<TokenStream, String> {
+fn expand_embed_wasm(input: WasmMacroInput) -> Result<TokenStream, String> {
     let wasm_path = resolve_input_path(&input.wasm_path)?;
     let wasm_path = fs::canonicalize(&wasm_path)
         .map_err(|error| format!("failed to resolve {}: {error}", wasm_path.display()))?;
@@ -67,7 +67,7 @@ fn expand_embed_wasm(input: WasmMacroInput) -> std::result::Result<TokenStream, 
     .into())
 }
 
-fn expand_bootfs(input: BootFsMacroInput) -> std::result::Result<TokenStream, String> {
+fn expand_bootfs(input: BootFsMacroInput) -> Result<TokenStream, String> {
     let root = resolve_input_path(&input.root)?;
     let root = fs::canonicalize(&root)
         .map_err(|error| format!("failed to resolve {}: {error}", root.display()))?;
@@ -135,13 +135,13 @@ fn expand_bootfs(input: BootFsMacroInput) -> std::result::Result<TokenStream, St
     .into())
 }
 
-fn resolve_input_path(path: &LitStr) -> std::result::Result<PathBuf, String> {
+fn resolve_input_path(path: &LitStr) -> Result<PathBuf, String> {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR")
         .map_err(|error| format!("CARGO_MANIFEST_DIR is missing: {error}"))?;
     Ok(PathBuf::from(manifest_dir).join(path.value()))
 }
 
-fn file_modified_nanos(path: &std::path::Path) -> std::result::Result<u64, String> {
+fn file_modified_nanos(path: &std::path::Path) -> Result<u64, String> {
     let modified = fs::metadata(path)
         .map_err(|error| format!("failed to read metadata for {}: {error}", path.display()))?
         .modified()
@@ -164,7 +164,7 @@ fn file_modified_nanos(path: &std::path::Path) -> std::result::Result<u64, Strin
         .ok_or_else(|| format!("modification time for {} overflowed u64", path.display()))
 }
 
-fn is_empty_directory(path: &std::path::Path) -> std::result::Result<bool, String> {
+fn is_empty_directory(path: &std::path::Path) -> Result<bool, String> {
     let mut entries = fs::read_dir(path)
         .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
     Ok(entries.next().is_none())
