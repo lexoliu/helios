@@ -607,18 +607,18 @@ struct NetTxState<T: VirtioTransport> {
 }
 
 impl<T: VirtioTransport> NetQueuePair<T> {
-    /// Whether either ring of this pair has a completion nobody has
-    /// taken yet.
-    ///
-    /// A pair another processor currently holds is reported as idle:
-    /// that processor is draining it, so it needs no wake, and an
-    /// interrupt handler must not wait for a lock in any case.
     /// Counts one interrupt for this pair and releases its waiters.
     fn raise_interrupt(&self) {
         self.interrupt_count.fetch_add(1, Ordering::Relaxed);
         self.interrupts.notify_all();
     }
 
+    /// Whether either ring of this pair has a completion nobody has
+    /// taken yet.
+    ///
+    /// A pair another processor currently holds is reported as idle:
+    /// that processor is draining it, so it needs no wake, and an
+    /// interrupt handler must not wait for a lock in any case.
     fn has_pending_completions(&self) -> bool {
         let receive = self
             .rx_state
@@ -1694,20 +1694,10 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         let Some(mut state) = self.queue_pairs[pair_idx].rx_state.try_lock() else {
             return Ok(None);
         };
-        let received = self.drain_rx_pair_locked(pair_idx, &mut state, frames)?;
-        Ok(Some(received))
-    }
-
-    fn drain_rx_pair_locked(
-        &self,
-        pair_idx: usize,
-        state: &mut NetRxState<T>,
-        frames: &mut [Option<RxFrame>],
-    ) -> IoResult<usize> {
-        self.drain_returned_rx_buffers(pair_idx, state)?;
+        self.drain_returned_rx_buffers(pair_idx, &mut state)?;
         let mut received = 0usize;
         while received < frames.len() {
-            let Some(frame) = self.receive_next_frame(pair_idx, state)? else {
+            let Some(frame) = self.receive_next_frame(pair_idx, &mut state)? else {
                 break;
             };
             let slot = &mut frames[received];
@@ -1715,7 +1705,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             *slot = Some(frame);
             received += 1;
         }
-        Ok(received)
+        Ok(Some(received))
     }
 
     /// Takes the next completed frame off a receive ring, assembling a
@@ -1762,8 +1752,14 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             return Err(IoError::DeviceFault);
         }
         if buffers == 1 {
+            // The frame stays in the receive slot it landed in: the
+            // handle keeps that slot out of the free list until the
+            // last reader drops the frame.
             return Ok(Some(RxFrame::with_offload(
-                self.rx_bytes_from_slot(pair_idx, slot_index, self.header_len..used_len),
+                Bytes::from_owner(RxFrameOwner {
+                    slot: slot.clone(),
+                    range: self.header_len..used_len,
+                }),
                 offload,
             )));
         }
@@ -1952,7 +1948,11 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         let Some(mut state) = self.queue_pairs[pair_idx].tx_state.try_lock() else {
             return Ok(None);
         };
-        Self::drain_tx_completions_when_full(&mut state, frames.len());
+        // Only when the ring has run dry: a sweep of the used ring costs
+        // more than the descriptors it reclaims while any are still free.
+        if state.tx_queue.available_descriptors() == 0 {
+            Self::drain_tx_completions(&mut state, frames.len().max(1));
+        }
         let NetTxState {
             tx_queue,
             tx_buffers,
@@ -1988,9 +1988,9 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
                 !tx_in_flight.get(token_index),
                 "virtio net TX descriptor {token} is still in flight"
             );
-            let slot = slot_buffer_mut(tx_buffers, *tx_buffer_len, token_index, "TX");
+            let slot = tx_slot_buffer(tx_buffers, *tx_buffer_len, token_index);
             let prefix_len = write_tx_payload(slot, self.header_len, frame.bytes, checksum, gso)?;
-            let prefix = slot_buffer(tx_buffers, *tx_buffer_len, token_index, prefix_len, "TX");
+            let prefix: &[u8] = &slot[..prefix_len];
             let submitted_token = match payload {
                 Some(payload) => {
                     tx_queue.submit_read_only_chain_deferred(&self.transport, &[prefix, payload])?
@@ -2041,13 +2041,6 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
 
     pub async fn wait_for_interrupt(&self) {
         self.interrupts.notified().await;
-    }
-
-    fn rx_bytes_from_slot(&self, pair_idx: usize, slot_index: u16, range: Range<usize>) -> Bytes {
-        Bytes::from_owner(RxFrameOwner {
-            slot: self.queue_pairs[pair_idx].rx_slots[usize::from(slot_index)].clone(),
-            range,
-        })
     }
 
     fn drain_returned_rx_buffers(
@@ -2146,13 +2139,6 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             completed += 1;
         }
         completed
-    }
-
-    fn drain_tx_completions_when_full(state: &mut NetTxState<T>, budget: usize) -> usize {
-        if state.tx_queue.available_descriptors() != 0 {
-            return 0;
-        }
-        Self::drain_tx_completions(state, budget.max(1))
     }
 }
 
@@ -2288,43 +2274,18 @@ fn read_mtu<T: VirtioTransport>(transport: &T, features: NegotiatedFeatures) -> 
     mtu
 }
 
-fn slot_buffer_mut<'a>(
-    buffers: &'a mut [u8],
-    buffer_len: usize,
-    token_index: usize,
-    queue: &str,
-) -> &'a mut [u8] {
-    let start = token_index.checked_mul(buffer_len).unwrap_or_else(|| {
-        panic!("virtio net {queue} token {token_index} buffer offset overflowed")
-    });
+/// The transmit slot a descriptor identifier owns, out of the slab that
+/// holds one fixed-width slot per identifier.
+fn tx_slot_buffer(buffers: &mut [u8], buffer_len: usize, token_index: usize) -> &mut [u8] {
+    let start = token_index
+        .checked_mul(buffer_len)
+        .unwrap_or_else(|| panic!("virtio net TX token {token_index} buffer offset overflowed"));
     let end = start
         .checked_add(buffer_len)
-        .unwrap_or_else(|| panic!("virtio net {queue} token {token_index} buffer end overflowed"));
-    buffers.get_mut(start..end).unwrap_or_else(|| {
-        panic!("virtio net {queue} token {token_index} is outside the buffer slab")
-    })
-}
-
-fn slot_buffer<'a>(
-    buffers: &'a [u8],
-    buffer_len: usize,
-    token_index: usize,
-    payload_len: usize,
-    queue: &str,
-) -> &'a [u8] {
-    assert!(
-        payload_len <= buffer_len,
-        "virtio net payload length exceeds slot capacity"
-    );
-    let start = token_index.checked_mul(buffer_len).unwrap_or_else(|| {
-        panic!("virtio net {queue} token {token_index} buffer offset overflowed")
-    });
-    let end = start
-        .checked_add(payload_len)
-        .unwrap_or_else(|| panic!("virtio net {queue} token {token_index} payload end overflowed"));
-    buffers.get(start..end).unwrap_or_else(|| {
-        panic!("virtio net {queue} token {token_index} is outside the buffer slab")
-    })
+        .unwrap_or_else(|| panic!("virtio net TX token {token_index} buffer end overflowed"));
+    buffers
+        .get_mut(start..end)
+        .unwrap_or_else(|| panic!("virtio net TX token {token_index} is outside the buffer slab"))
 }
 
 /// Writes the virtio-net header for one transmit frame followed by the

@@ -120,11 +120,6 @@ const fn stat_tag(tag: MemoryStatTag) -> u16 {
     }
 }
 
-fn encode_stat(stat: MemoryStat, bytes: &mut [u8; STAT_BYTES]) {
-    bytes[..2].copy_from_slice(&stat_tag(stat.tag).to_le_bytes());
-    bytes[2..].copy_from_slice(&stat.value.to_le_bytes());
-}
-
 /// One virtqueue of a balloon device, with the completion table its
 /// waiters are routed through and the notification they park on.
 ///
@@ -454,12 +449,9 @@ impl<T: VirtioTransport> VirtioBalloonDevice<T> {
             return Err(IoError::OutOfBounds);
         }
         let mut encoded = [0_u8; STATS_PER_REPLY * STAT_BYTES];
-        for (index, stat) in stats.iter().enumerate() {
-            let start = index * STAT_BYTES;
-            let entry: &mut [u8; STAT_BYTES] = (&mut encoded[start..start + STAT_BYTES])
-                .try_into()
-                .unwrap_or_else(|_| panic!("balloon statistics entry has a fixed width"));
-            encode_stat(*stat, entry);
+        for (entry, stat) in encoded.chunks_exact_mut(STAT_BYTES).zip(stats) {
+            entry[..2].copy_from_slice(&stat_tag(stat.tag).to_le_bytes());
+            entry[2..].copy_from_slice(&stat.value.to_le_bytes());
         }
         let payload = &encoded[..stats.len() * STAT_BYTES];
         if payload.is_empty() {
