@@ -51,6 +51,11 @@ const DEFAULT_DATA_DISK_BYTES: u64 = 256 * 1024 * 1024;
 /// on the bus carries it, so the boot image is never mistaken for it.
 const DATA_DISK_SERIAL: &str = "helios-data";
 const DEFAULT_GDB_ENDPOINT: &str = "tcp::1234";
+/// The QEMU chardev the guest's debug serial line is bound to.
+const DEBUG_SERIAL_CHARDEV: &str = "helios-debug-serial";
+/// The runtime-directory file holding a raw copy of the debug serial
+/// line, host side. `--debug-serial-log` puts it elsewhere.
+const DEBUG_SERIAL_LOG_NAME: &str = "debug-serial.log";
 /// The QEMU IOThread the memory balloon's free-page hint queue runs on.
 const BALLOON_IOTHREAD_ID: &str = "balloon-io";
 /// How long the guest's reported balloon size has to hold still before a
@@ -454,6 +459,8 @@ pub(crate) struct VmConfigFile {
     #[serde(default)]
     pub(crate) qemu_log: Option<PathBuf>,
     #[serde(default)]
+    pub(crate) debug_serial_log: Option<PathBuf>,
+    #[serde(default)]
     pub(crate) qemu_trace: Vec<String>,
     #[serde(default)]
     pub(crate) qemu_trace_log: Option<PathBuf>,
@@ -565,6 +572,12 @@ pub(crate) struct VmCommand {
     /// File receiving QEMU stdout/stderr.
     #[arg(long)]
     qemu_log: Option<PathBuf>,
+
+    /// File receiving a raw copy of every byte on the debug serial
+    /// line, host side, before the inspector frames it. Defaults to
+    /// `debug-serial.log` in the runtime directory.
+    #[arg(long)]
+    debug_serial_log: Option<PathBuf>,
 
     /// QEMU `-d` trace flags. Repeat the flag or pass comma-separated groups.
     #[arg(long, value_delimiter = ',')]
@@ -731,6 +744,7 @@ struct ResolvedVmCommand {
     monitor: Option<String>,
     qmp: Option<String>,
     qemu_log: Option<PathBuf>,
+    debug_serial_log: Option<PathBuf>,
     qemu_trace: Vec<String>,
     qemu_trace_log: Option<PathBuf>,
     qemu_arg: Vec<String>,
@@ -876,6 +890,7 @@ fn resolve(command: VmCommand) -> Result<ResolvedVmCommand> {
     }
     let qmp = command.qmp.or(file.qmp);
     let qemu_log = command.qemu_log.or(file.qemu_log);
+    let debug_serial_log = command.debug_serial_log.or(file.debug_serial_log);
     let mut qemu_trace = file.qemu_trace;
     qemu_trace.extend(command.qemu_trace);
     let qemu_trace_log = command.qemu_trace_log.or(file.qemu_trace_log);
@@ -964,6 +979,7 @@ fn resolve(command: VmCommand) -> Result<ResolvedVmCommand> {
         monitor,
         qmp,
         qemu_log,
+        debug_serial_log,
         qemu_trace,
         qemu_trace_log,
         qemu_arg,
@@ -1175,8 +1191,8 @@ fn connect_and_run(command: &ResolvedVmCommand, runtime: &mut VmRuntime) -> Resu
             let baud = command.baud;
             crate::runtime::block_on(async move {
                 let io = crate::serial::open(socket, baud).await?;
-                let (mut read, _write) = io.into_split();
-                crate::ready::wait_for_boot(&mut read).await?;
+                let (read, _write) = io.into_split();
+                let read = crate::ready::wait_for_boot(read).await?;
                 // The console echo starts before the RPC connection, not
                 // after it: nothing else reads the serial socket once the
                 // RPC has moved off it, and a socket QEMU cannot write
@@ -1892,8 +1908,27 @@ impl VmRuntime {
         } else if let Some(serial_pty) = &serial_pty {
             qemu.arg("-serial").arg(&serial_pty.slave_path);
         } else if command.profile.console == VmConsoleProfile::SerialUnixSocket {
+            // The debug serial is a named chardev rather than the
+            // `-serial unix:` shorthand so the host side can keep a raw
+            // copy of the line: `logfile=` records every byte the
+            // chardev accepts, before anything on the host frames it.
+            // That is what tells a byte QEMU's 16550 model discarded
+            // into a socket it could not write apart from one the
+            // inspector's reader lost, and both are otherwise invisible
+            // — the guest sees a successful transmit either way.
+            let debug_serial_log = command
+                .debug_serial_log
+                .clone()
+                .unwrap_or_else(|| runtime_dir.path().join(DEBUG_SERIAL_LOG_NAME));
+            prepare_log_path(&debug_serial_log)?;
+            qemu.arg("-chardev").arg(format!(
+                "socket,id={DEBUG_SERIAL_CHARDEV},path={},server=on,wait=on,\
+                 logfile={},logappend=off",
+                qemu_option_value(&socket_path)?,
+                qemu_option_value(&debug_serial_log)?,
+            ));
             qemu.arg("-serial")
-                .arg(format!("unix:{},server=on,wait=on", socket_path.display()));
+                .arg(format!("chardev:{DEBUG_SERIAL_CHARDEV}"));
         }
         if let Some(gdb) = &command.gdb {
             qemu.arg("-gdb").arg(gdb);
@@ -2173,6 +2208,18 @@ fn prepare_log_path(log_path: &Path) -> Result<()> {
             .with_context(|| format!("failed to create log directory {}", parent.display()))?;
     }
     Ok(())
+}
+
+/// Renders a path as one QEMU option value.
+///
+/// QEMU splits an option list on commas and reads a doubled comma as a
+/// literal one, so a path that carries a comma has to be doubled or the
+/// rest of it is parsed as another option.
+fn qemu_option_value(path: &Path) -> Result<String> {
+    let text = path
+        .to_str()
+        .with_context(|| format!("QEMU option paths must be valid UTF-8: {}", path.display()))?;
+    Ok(text.replace(',', ",,"))
 }
 
 fn wait_for_socket(socket_path: &Path, qemu_log: &Path, child: &mut Child) -> Result<()> {
@@ -2900,6 +2947,7 @@ mod tests {
             monitor: None,
             qmp: None,
             qemu_log: None,
+            debug_serial_log: None,
             qemu_trace: Vec::new(),
             qemu_trace_log: None,
             qemu_arg: Vec::new(),
@@ -2948,6 +2996,7 @@ mod tests {
             monitor: None,
             qmp: None,
             qemu_log: None,
+            debug_serial_log: None,
             qemu_trace: Vec::new(),
             qemu_trace_log: None,
             qemu_arg: Vec::new(),
@@ -3074,6 +3123,7 @@ mod tests {
             monitor: None,
             qmp: None,
             qemu_log: None,
+            debug_serial_log: None,
             qemu_trace: Vec::new(),
             qemu_trace_log: None,
             qemu_arg: Vec::new(),
@@ -3181,6 +3231,7 @@ mod tests {
             monitor: None,
             qmp: None,
             qemu_log: None,
+            debug_serial_log: None,
             qemu_trace: Vec::new(),
             qemu_trace_log: None,
             qemu_arg: Vec::new(),
@@ -3353,6 +3404,7 @@ mod tests {
             monitor: None,
             qmp: None,
             qemu_log: None,
+            debug_serial_log: None,
             qemu_trace: Vec::new(),
             qemu_trace_log: None,
             qemu_arg: Vec::new(),

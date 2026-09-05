@@ -391,6 +391,13 @@ def run_helios_once(
     env["HELIOS_WORKLOAD_BENCH_LOG"] = str(log)
     env["HELIOS_WORKLOAD_BENCH_KERNEL_PROFILE_OUTPUT"] = str(log.with_suffix(".kernel.folded"))
     env["HELIOS_WORKLOAD_BENCH_PERF_METRICS_OUTPUT"] = str(log.with_suffix(".perf.json"))
+    runtime_dir = env.get("HELIOS_WORKLOAD_BENCH_RUNTIME_DIR")
+    if runtime_dir:
+        # One runtime directory per boot. Each workload class is its own
+        # VM, and a shared directory means the second one's QEMU log,
+        # guest console and raw debug-serial capture overwrite the
+        # first's — so a failure in the earlier boot leaves no evidence.
+        env["HELIOS_WORKLOAD_BENCH_RUNTIME_DIR"] = str(Path(runtime_dir) / log.stem)
     if classes:
         env["HELIOS_WORKLOAD_BENCH_CLASSES"] = ",".join(classes)
     if names:

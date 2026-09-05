@@ -561,6 +561,18 @@ jobs:
           grep -Fqx oob-load:before-fault oob-load-smoke.out
           grep -Fqx guest-alive oob-load-smoke.out
           ! grep -Fq 'Kernel panic' oob-load-smoke.out
+      # The host keeps its own copy of the debug serial, written by the
+      # QEMU chardev before the inspector frames a byte of it. A stage
+      # marker broken in that copy was lost inside QEMU's transmit
+      # path; one broken only in the framed output above was lost by
+      # the reader (#102). x86-64 is the lane where either happens,
+      # because its console mirror streams the whole boot log through
+      # COM1 exactly while the application processors come online.
+      - name: Check the raw debug serial captures
+        if: always()
+        shell: bash
+        working-directory: helios
+        run: python3 tools/debug-serial-report.py "$GITHUB_WORKSPACE/smoke-runtime"
       # There is no curl step here, unlike smoke-riscv64: a fetch over
       # virtio-net never completes on x86-64 (#86), and a lane covers
       # what passes. The step joins this job when that is fixed.
@@ -746,6 +758,13 @@ jobs:
               || printf 'no virtio-net bring-up line was logged\n'
             printf '```\n'
           } >> "$GITHUB_STEP_SUMMARY"
+      # The same raw-capture check the smoke lanes run: the benchmark
+      # boots the guest twice per workload class, so this lane is where
+      # a rare byte loss on the debug serial shows up first (#102).
+      - name: Check the raw debug serial captures
+        if: always()
+        working-directory: helios
+        run: python3 tools/debug-serial-report.py "${BENCH_RUNTIME_DIR}"
       # A bring-up failure leaves the inspector's one-line error and
       # nothing else in the step log; the guest console and QEMU's own
       # stderr live in the runtime directory, so collect it exactly as
