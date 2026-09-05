@@ -29,7 +29,7 @@ const METRIC_LINE_PREFIX: &str = "bench.";
 /// workload moves 64 MiB, so three minutes is orders of magnitude of
 /// headroom over anything healthy and still turns a hang into a named
 /// failure inside one step.
-const DEFAULT_WORKLOAD_TIMEOUT_SECONDS: u32 = 180;
+pub(crate) const DEFAULT_WORKLOAD_TIMEOUT_SECONDS: u32 = 180;
 
 /// A workload that never came back.
 ///
@@ -49,6 +49,11 @@ pub(crate) enum WorkloadBenchError {
         iteration: u16,
         seconds: u32,
     },
+    #[error(
+        "the guest did not answer {step} within {seconds}s; the run's workloads are \
+         already recorded, so the guest is torn down rather than waited on"
+    )]
+    GuestStepTimedOut { step: &'static str, seconds: u32 },
 }
 
 #[derive(Debug, Clone, ClapArgs)]
@@ -489,6 +494,27 @@ async fn under_deadline(
             seconds,
         }
         .into());
+    };
+    result
+}
+
+/// Runs one guest step of the run that is not a workload — the profile
+/// hand-off, the tracing fetch, the teardown — under the same deadline a
+/// workload iteration gets.
+///
+/// Every one of those is an RPC to the same guest, and a guest that has
+/// stopped answering stops answering all of them. Without a bound here
+/// the run's last words are the last workload's, and the process sits on
+/// a dead VM until something outside it notices: run 33952047436 spent
+/// ninety-five minutes that way, holding QEMU open behind it.
+pub(crate) async fn guest_step_under_deadline<T>(
+    step: &'static str,
+    seconds: u32,
+    run: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    let Some(result) = crate::runtime::timeout(Duration::from_secs(u64::from(seconds)), run).await
+    else {
+        return Err(WorkloadBenchError::GuestStepTimedOut { step, seconds }.into());
     };
     result
 }
@@ -1196,5 +1222,36 @@ mod tests {
         .expect("a workload that answers in time must not be failed");
 
         assert_eq!(output.elapsed_ms, 24);
+    }
+
+    /// The steps around the workloads are bounded too.
+    ///
+    /// The profile hand-off, the tracing fetch and the teardown all talk
+    /// to the same guest as a workload does, and a guest that stops
+    /// answering stops answering those as well. Run 33952047436 hung
+    /// there for ninety-five minutes after its last workload was
+    /// recorded, holding QEMU open behind it.
+    #[test]
+    fn a_guest_step_that_never_answers_is_failed_by_name() {
+        let error = crate::runtime::block_on(guest_step_under_deadline(
+            "the final profile read",
+            1,
+            std::future::pending::<Result<()>>(),
+        ))
+        .expect_err("a guest step that never answers must fail rather than hang");
+
+        let timed_out = error
+            .downcast_ref::<WorkloadBenchError>()
+            .expect("the failure must be the typed deadline error");
+        assert!(
+            matches!(
+                timed_out,
+                WorkloadBenchError::GuestStepTimedOut {
+                    step: "the final profile read",
+                    seconds: 1,
+                }
+            ),
+            "the failure must name the step and the deadline, got {timed_out}"
+        );
     }
 }

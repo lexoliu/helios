@@ -158,6 +158,28 @@ grow with the guest (#130). The refusal is correct; the density claim of
 #28 stays unmeasured until the pool's relationship to guest memory is
 settled.
 
+### Nothing in the run is unbounded
+
+A guest that stops answering is the failure mode this suite meets most
+often, and it is bounded three times over, because each bound catches
+what the one below it cannot see.
+
+- **Per iteration.** Every workload iteration runs under
+  `--workload-timeout-seconds`; the iteration that elapses is a failed
+  cell naming the workload and the iteration.
+- **Per guest step.** The steps around the workloads — the profiler
+  hand-off, the profile and metric reads, the tracing fetch — talk to the
+  same guest, so they run under the same deadline. Without that, a run
+  whose workloads were all recorded still sat on a dead VM: run
+  33952047436 hung there for ninety-five minutes with QEMU alive behind
+  it, until CI cancelled the job.
+- **Per side.** `--helios-side-timeout-seconds` bounds the whole Helios
+  side, control runs included, and the classes share what is left of it
+  as they run. A boot that never reaches the debugger answers no
+  deadline at all, so this is what keeps a wedged class costing one
+  class rather than the lane. The Linux side has had the same bound as
+  `--side-timeout-seconds` since it lost a side to one hung workload.
+
 The bugs the first runs of this suite found are fixed: the x86 kernel
 refusing a multi-queue `vhost` tap (#91), a user-mode spawn storm
 panicking the kernel through the task arena (#94), the OOM killer

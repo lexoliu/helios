@@ -64,6 +64,11 @@ class RunOptions:
     runner_label: str | None = None
     allow_busy_host: bool = False
     helios_timeout_seconds: int = 9000
+    # The whole Helios side of the lane, control runs included. The
+    # per-class cap above is what a healthy class may take; this is what
+    # all of them together may take, so a class whose guest stops
+    # answering cannot spend the job.
+    helios_side_timeout_seconds: int = 10800
     # Workloads to leave out of the Linux side. A cell whose Helios half
     # cannot be measured has nothing to compare a Linux number against,
     # and the Linux side's budget is shared out between the workloads it
@@ -157,6 +162,8 @@ def plan(options: RunOptions, manifest: Manifest, workloads: list[dict]) -> list
                     "--skip-linux",
                     "--helios-timeout-seconds",
                     str(options.helios_timeout_seconds),
+                    "--helios-side-timeout-seconds",
+                    str(options.helios_side_timeout_seconds),
                     "--out-dir",
                     str(options.out_dir / HELIOS_OUT),
                 ],

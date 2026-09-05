@@ -838,11 +838,16 @@ jobs:
           # The inspector echoes the guest's boot lines on stderr; the
           # log is kept so the next step can record which virtio-net
           # features this lane actually negotiated.
+          #
+          # The side budget is what bounds the lane: the per-class cap is
+          # what one healthy class may take, and this is what all of them
+          # together may take, inside the job's own 75 minutes.
           python3 tools/wasi-apps/linux-gap-bench.py \
             --arch ${{ matrix.helios-arch }} \
             --skip-linux \
             --allow-busy-host \
             --helios-timeout-seconds 9000 \
+            --helios-side-timeout-seconds 3000 \
             --helios-host-http-host ${{ matrix.net-host }} \
             --helios-host-tcp-host ${{ matrix.net-host }} \
             --out-dir target/perf-baselines/ci-${{ matrix.name }} \

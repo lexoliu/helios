@@ -59,6 +59,11 @@ HOST_SERVER_BIND_ADDRESS = "0.0.0.0"
 DEFAULT_MAX_HOST_LOAD_PER_CPU = 0.75
 TOP_CPU_PROCESS_LIMIT = 8
 DEFAULT_HELIOS_TIMEOUT_SECONDS = 600
+# The whole Helios side of a lane, control runs included. A hosted CI job
+# is capped at six hours whatever its `timeout-minutes` says, and the
+# Linux side of the same lane needs provisioning plus its own budget, so
+# the Helios side is bounded well inside that rather than at it.
+DEFAULT_HELIOS_SIDE_TIMEOUT_SECONDS = 10800
 STALE_PROCESS_COMMAND_LIMIT = 240
 
 
@@ -106,6 +111,20 @@ class HeliosRunFailed(RuntimeError):
     else: the suite boots one VM per workload class, so the caller
     records the class it lost and keeps the classes it can still measure.
     """
+
+
+def class_budget(remaining_seconds: float, classes_left: int, per_class_cap: int) -> int:
+    """How long the next workload class may hold the Helios side.
+
+    The side's budget is shared out as the classes run rather than split
+    up front, so a class that finishes early hands the rest back and a
+    class that wedges cannot take more than its share of what is left.
+    The per-class cap still applies: it is what a healthy class is
+    allowed, and the share is only ever smaller.
+    """
+    if classes_left <= 0:
+        return 0
+    return max(0, min(per_class_cap, int(remaining_seconds // classes_left)))
 
 
 def run_isolated(
@@ -371,6 +390,7 @@ def run_helios(
     host_tcp_port: int | None,
     host_tcp_echo_port: int | None,
     timeout_seconds: int,
+    side_timeout_seconds: int,
     control_workload: dict | None,
     keep_going: bool,
 ) -> Path:
@@ -378,6 +398,17 @@ def run_helios(
     workloads_by_class: dict[str, list[str]] = {}
     for workload in workloads:
         workloads_by_class.setdefault(workload["class"], []).append(workload["name"])
+
+    # The whole Helios side runs inside one budget, the way the Linux
+    # side does. A guest that stops answering is bounded by the
+    # inspector's own deadlines, but a boot that never reaches the
+    # debugger is not, so without this a wedged class holds the runner
+    # until the CI job's own cap: run 33952047436 spent ninety-five of
+    # its final minutes there.
+    deadline = time.monotonic() + side_timeout_seconds
+
+    def remaining() -> float:
+        return deadline - time.monotonic()
 
     def run_control(moment: str) -> None:
         # The control workload measures the machine, not Helios: the same
@@ -398,7 +429,7 @@ def run_helios(
             host_tcp_host,
             host_tcp_port,
             host_tcp_echo_port,
-            timeout_seconds,
+            class_budget(remaining(), 1, timeout_seconds),
             keep_going,
         )
 
@@ -407,12 +438,26 @@ def run_helios(
     except HeliosRunFailed as error:
         raise SystemExit(f"the control workload could not be measured: {error}") from error
 
+    # The after-control is the run's own precondition, so it keeps its
+    # own run's worth of the budget rather than competing with the
+    # classes for what is left.
+    control_reserve = timeout_seconds if control_workload is not None else 0
+
     if len(workloads_by_class) > 1:
         class_logs = []
         lost_classes = []
+        classes_left = len(workloads_by_class)
         for workload_class, workload_names in workloads_by_class.items():
             class_log = out_dir / f"helios-{workload_class}.jsonl"
+            budget = class_budget(
+                remaining() - control_reserve, classes_left, timeout_seconds
+            )
+            classes_left -= 1
             try:
+                if budget <= 0:
+                    raise HeliosRunFailed(
+                        "the Helios side's budget was spent before this class could run"
+                    )
                 run_helios_once(
                     manifest,
                     class_log,
@@ -425,7 +470,7 @@ def run_helios(
                     host_tcp_host,
                     host_tcp_port,
                     host_tcp_echo_port,
-                    timeout_seconds,
+                    budget,
                     keep_going,
                 )
             except HeliosRunFailed as error:
@@ -474,7 +519,7 @@ def run_helios(
             host_tcp_host,
             host_tcp_port,
             host_tcp_echo_port,
-            timeout_seconds,
+            class_budget(remaining() - control_reserve, 1, timeout_seconds),
             keep_going,
         )
     except HeliosRunFailed as error:
@@ -1756,6 +1801,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_HELIOS_TIMEOUT_SECONDS,
         help="Maximum wall-clock seconds for each isolated Helios VM workload command.",
     )
+    parser.add_argument(
+        "--helios-side-timeout-seconds",
+        type=int,
+        default=DEFAULT_HELIOS_SIDE_TIMEOUT_SECONDS,
+        help=(
+            "Maximum wall-clock seconds for the whole Helios side, control runs "
+            "included. The classes share what is left of it as they run, so a "
+            "guest that wedges costs its own class rather than the runner."
+        ),
+    )
     return parser
 
 
@@ -1766,6 +1821,8 @@ def main() -> None:
         raise SystemExit("--iterations must be a positive integer")
     if args.max_host_load_per_cpu <= 0:
         raise SystemExit("--max-host-load-per-cpu must be positive")
+    if args.helios_side_timeout_seconds <= 0:
+        raise SystemExit("--helios-side-timeout-seconds must be a positive integer")
     if args.helios_timeout_seconds <= 0:
         raise SystemExit("--helios-timeout-seconds must be positive")
     if args.linux_vm_smp <= 0:
@@ -1874,6 +1931,7 @@ def main() -> None:
                 host_tcp_port,
                 host_tcp_echo_port,
                 args.helios_timeout_seconds,
+                args.helios_side_timeout_seconds,
                 control_workload,
                 args.keep_going,
             )
