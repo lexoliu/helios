@@ -108,19 +108,22 @@ pub use kernel_exception::{
     KernelException, KernelExceptionCause, KernelExceptionDispatch, KernelNativeTrapHandler,
 };
 pub use memory::{
-    AccessibilityPlan, BalloonHandle, BalloonStats, CommittedRegion, ENTROPY_RESEED_INTERVAL,
-    EntropyPool, EntropySources, FREE_PAGE_REPORT_INTERVAL, HardwareEntropySource, IDLE_SWAP_AFTER,
-    KernelPhysFrameAllocator, MemoryOwner, NoCryptographicEntropy, NoEntropyDevice,
-    ROOT_ENTROPY_MATERIAL_BYTES, ReleasedReservation, ReservationLookup, ReservationTracker,
-    RootEntropy, RootEntropyHandle, SWAP_BATCH_BYTES, SWAP_TICK, SwapDisabled, SwapEntry,
-    SwapFaultError, SwapHandle, SwapStats, SwapVmHooks, UserHeapStats, UserMemoryOwnerScope,
-    UserMemoryOwners, VaCursor, allocate_user_frame_uninit_on, allocate_user_frame_zeroed,
+    AccessibilityPlan, BalloonHandle, BalloonStats, BootMemoryPlan, BootRegionSplitter,
+    CommittedRegion, ENTROPY_RESEED_INTERVAL, EntropyPool, EntropySources,
+    FREE_PAGE_REPORT_INTERVAL, HardwareEntropySource, IDLE_SWAP_AFTER, KERNEL_HEAP_BOOTSTRAP_BYTES,
+    KERNEL_HEAP_GROWTH_CHUNK_BYTES, KERNEL_HEAP_MAX_BOOT_FRACTION, KERNEL_HEAP_MIN_RESERVE_BYTES,
+    KERNEL_HEAP_RESERVE_FRACTION, KernelPhysFrameAllocator, MemoryOwner, NoCryptographicEntropy,
+    NoEntropyDevice, ROOT_ENTROPY_MATERIAL_BYTES, RegionShares, ReleasedReservation,
+    ReservationLookup, ReservationTracker, RootEntropy, RootEntropyHandle, SWAP_BATCH_BYTES,
+    SWAP_TICK, SwapDisabled, SwapEntry, SwapFaultError, SwapHandle, SwapStats, SwapVmHooks,
+    USER_POOL_MIN_REGION_BYTES, UserHeapStats, UserMemoryOwnerScope, UserMemoryOwners,
+    UserMemoryPool, VaCursor, allocate_user_frame_uninit_on, allocate_user_frame_zeroed,
     allocate_user_frame_zeroed_on, configure_user_memory_owner_processors,
     current_user_memory_owner, deallocate_user_frame, deallocate_user_frame_on, disable_swap,
     enter_user_memory_owner, install_entropy_device, install_memory_balloon, install_swap,
-    install_swap_hooks, installed_swap_handle, installed_swap_hooks, largest_servable_user_bytes,
-    seed_root_entropy, set_user_memory_owner, swapped_token, user_heap_stats,
-    user_mapping_kernel_heap_bytes, validate_range,
+    install_swap_hooks, installed_swap_handle, installed_swap_hooks, kernel_reserve_for,
+    largest_servable_user_bytes, seed_root_entropy, set_user_memory_owner, swapped_token,
+    user_heap_stats, user_mapping_kernel_heap_bytes, validate_range,
 };
 pub use network::{
     HTTP_FORBIDDEN_FIELD_NAMES, HTTP_MAX_FIELD_SECTION_BYTES, HTTP_MAX_FIELD_VALUE_BYTES, HttpBody,
@@ -181,6 +184,7 @@ use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering}
 use core::task::{Context, Poll, Waker};
 use core::time::Duration;
 
+use arrayvec::ArrayVec;
 use buddy_system_allocator::LockedHeap;
 use helios_hal::cpu::{Cpu, Instant, ProcessorId};
 use helios_hal::memory::MemoryRegion;
@@ -228,6 +232,17 @@ impl HeapStats {
 struct KernelAllocator<const ORDER: usize> {
     heap: LockedHeap<ORDER>,
     stats: KernelAllocationStats,
+    /// Every usable byte the boot memory map described, and the free
+    /// kernel heap a user grow may not dip into. Both are fixed by
+    /// [`memory::BootMemoryPlan`] at boot and never move afterwards:
+    /// the heap's own size is demand-driven, so a reserve defined
+    /// against it would be a floor that moved with the thing it is
+    /// supposed to hold down.
+    machine_usable_bytes: AtomicUsize,
+    kernel_reserve_bytes: AtomicUsize,
+    /// Allocations still to serve before another reserve top-up is
+    /// attempted; see [`Self::alloc_growing`].
+    top_up_backoff: AtomicUsize,
 }
 
 impl<const ORDER: usize> KernelAllocator<ORDER> {
@@ -235,6 +250,9 @@ impl<const ORDER: usize> KernelAllocator<ORDER> {
         Self {
             heap: LockedHeap::empty(),
             stats: KernelAllocationStats::new(),
+            machine_usable_bytes: AtomicUsize::new(0),
+            kernel_reserve_bytes: AtomicUsize::new(0),
+            top_up_backoff: AtomicUsize::new(0),
         }
     }
 
@@ -242,6 +260,108 @@ impl<const ORDER: usize> KernelAllocator<ORDER> {
         unsafe {
             self.heap.lock().add_to_heap(start, end);
         }
+    }
+
+    /// Records what the boot memory map came to and what the kernel
+    /// keeps out of it.
+    fn install_plan(&self, plan: memory::BootMemoryPlan) {
+        self.machine_usable_bytes
+            .store(plan.usable_bytes, Ordering::Release);
+        self.kernel_reserve_bytes
+            .store(plan.kernel_reserve_bytes, Ordering::Release);
+    }
+
+    fn reserve_bytes(&self) -> usize {
+        self.kernel_reserve_bytes.load(Ordering::Acquire)
+    }
+
+    fn machine_bytes(&self) -> usize {
+        self.machine_usable_bytes.load(Ordering::Acquire)
+    }
+
+    /// One allocation attempt, plus the free space the heap was left
+    /// with.
+    ///
+    /// The two are read under the same lock the allocation took, so the
+    /// growth decision below is made against the state the allocation
+    /// actually produced rather than a racing re-read.
+    fn try_alloc(&self, layout: Layout) -> (*mut u8, usize) {
+        let mut heap = self.heap.lock();
+        let ptr = heap
+            .alloc(layout)
+            .map_or(ptr::null_mut(), core::ptr::NonNull::as_ptr);
+        let free = heap
+            .stats_total_bytes()
+            .saturating_sub(heap.stats_alloc_actual());
+        (ptr, free)
+    }
+
+    /// Serves `layout`, taking more memory out of the user pool when
+    /// the heap cannot serve it or would be left under its reserve.
+    ///
+    /// The kernel heap owns only its boot share until this runs: see
+    /// [`memory::policy`] for why the machine's memory starts in the
+    /// user pool and comes here on demand, and why it never goes back.
+    ///
+    /// Two things ask for memory here, and they are not the same
+    /// request. A failed allocation must be retried after a lend or the
+    /// kernel dies, so it is never throttled. Topping the heap back up
+    /// to its reserve is housekeeping, and it backs off when the pool
+    /// has nothing to give: a lend costs a buddy allocation and a
+    /// frame-slab drain, and retrying it on every kernel allocation
+    /// would turn memory pressure into a throughput cliff exactly when
+    /// throughput matters.
+    ///
+    /// Growth is attempted at most once per allocation. A pool that
+    /// cannot serve one chunk cannot serve two, and a null return from
+    /// here reaches `alloc_error_handler`, which panics — a kernel
+    /// out-of-memory is fatal by contract, not something to spin on.
+    fn alloc_growing(&self, layout: Layout) -> *mut u8 {
+        let (ptr, free) = self.try_alloc(layout);
+        if !ptr.is_null() && free >= self.reserve_bytes() {
+            return ptr;
+        }
+        if !ptr.is_null() && !self.top_up_is_due() {
+            return ptr;
+        }
+
+        let wanted = layout
+            .size()
+            .max(layout.align())
+            .next_power_of_two()
+            .max(memory::KERNEL_HEAP_GROWTH_CHUNK_BYTES);
+        match memory::lend_user_memory_to_kernel_heap(wanted) {
+            Some((start, end)) => {
+                unsafe {
+                    self.add_to_heap(start, end);
+                }
+                self.top_up_backoff.store(0, Ordering::Relaxed);
+            }
+            None => self
+                .top_up_backoff
+                .store(KERNEL_HEAP_TOP_UP_BACKOFF, Ordering::Relaxed),
+        }
+
+        if ptr.is_null() {
+            self.try_alloc(layout).0
+        } else {
+            ptr
+        }
+    }
+
+    /// Whether a reserve top-up should be attempted, counting down the
+    /// backoff a failed one left behind.
+    ///
+    /// Relaxed and racy on purpose: this decides how often to retry
+    /// housekeeping, and two processors landing on the same count costs
+    /// one extra attempt.
+    fn top_up_is_due(&self) -> bool {
+        let remaining = self.top_up_backoff.load(Ordering::Relaxed);
+        if remaining == 0 {
+            return true;
+        }
+        self.top_up_backoff.store(remaining - 1, Ordering::Relaxed);
+        false
     }
 
     fn stats(&self) -> HeapStats {
@@ -284,7 +404,7 @@ impl<const ORDER: usize> KernelAllocator<ORDER> {
 
 unsafe impl<const ORDER: usize> GlobalAlloc for KernelAllocator<ORDER> {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let ptr = unsafe { GlobalAlloc::alloc(&self.heap, layout) };
+        let ptr = self.alloc_growing(layout);
         if !ptr.is_null() {
             self.stats.record_alloc(layout.size());
         }
@@ -292,8 +412,11 @@ unsafe impl<const ORDER: usize> GlobalAlloc for KernelAllocator<ORDER> {
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        let ptr = unsafe { GlobalAlloc::alloc_zeroed(&self.heap, layout) };
+        let ptr = self.alloc_growing(layout);
         if !ptr.is_null() {
+            unsafe {
+                ptr::write_bytes(ptr, 0, layout.size());
+            }
             self.stats.record_alloc(layout.size());
         }
         ptr
@@ -308,7 +431,7 @@ unsafe impl<const ORDER: usize> GlobalAlloc for KernelAllocator<ORDER> {
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         let new_layout = unsafe { Layout::from_size_align_unchecked(new_size, layout.align()) };
-        let new_ptr = unsafe { GlobalAlloc::alloc(&self.heap, new_layout) };
+        let new_ptr = self.alloc_growing(new_layout);
         if new_ptr.is_null() {
             return ptr::null_mut();
         }
@@ -453,18 +576,21 @@ impl KernelRunStats {
     }
 }
 
-/// What the kernel heap keeps for itself, as a fraction of the memory
-/// it is sizing against, and the floor under that fraction.
+/// The most usable regions a boot memory map may describe.
 ///
-/// Two things use this: the growth path, which refuses to let user
-/// memory eat into the kernel's reserve, and the bootstrap split below,
-/// which decides how much of each memory region the kernel heap keeps
-/// before the user pool takes the rest. One number for both is the
-/// point — the reserve the kernel defends at run time is the reserve it
-/// was given at boot.
-const USER_MEMORY_KERNEL_RESERVE_FRACTION: usize = 4;
-const USER_MEMORY_MIN_KERNEL_RESERVE_BYTES: usize = 32 * 1024 * 1024;
-const USER_HEAP_MIN_REGION_BYTES: usize = 2 * 1024 * 1024;
+/// The map is walked twice — once to total it, once to divide it — and
+/// the kernel cannot allocate a copy of it before the heap it is about
+/// to build exists, so the copy lives on the stack. Limine publishes
+/// around a dozen usable segments on the machines helios targets and
+/// the riscv device tree fewer, so this is two kilobytes of boot stack
+/// against a map an order of magnitude larger than any we have seen; a
+/// map that still overruns it is a machine the kernel has not been told
+/// about, and it says so rather than silently dropping the memory.
+const MAX_BOOT_MEMORY_REGIONS: usize = 128;
+
+/// Kernel allocations to serve before retrying a reserve top-up the
+/// user pool has already refused once.
+const KERNEL_HEAP_TOP_UP_BACKOFF: usize = 1024;
 
 pub struct Kernel<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone = NoWatchdog> {
     cpu: CpuImpl,
@@ -818,6 +944,15 @@ where
     kernel
 }
 
+/// Divides the boot memory map between the kernel heap and the user
+/// pool, and installs both.
+///
+/// The map is walked twice, because the policy is stated against the
+/// machine and not against whichever region happens to come first: the
+/// first pass totals the usable bytes, [`memory::BootMemoryPlan`] turns
+/// that into the kernel's boot share and its reserve, and the second
+/// pass hands the regions out. See [`memory::policy`] for the policy
+/// itself and the evidence behind it.
 fn init_allocator<Regions>(
     memory_regions: Regions,
     processor_count: usize,
@@ -825,15 +960,42 @@ fn init_allocator<Regions>(
 where
     Regions: IntoIterator<Item = MemoryRegion>,
 {
-    let mut user_pool = None;
+    let mut regions: ArrayVec<(usize, usize), MAX_BOOT_MEMORY_REGIONS> = ArrayVec::new();
     for mut region in memory_regions {
         let region = unsafe { region.as_mut() };
         let start = region.as_mut_ptr() as usize;
-        let end = start + region.len();
-        let (kernel_end, user_start) = split_bootstrap_memory_region(start, end);
-        unsafe {
-            ALLOCATOR.add_to_heap(start, kernel_end);
+        regions
+            .try_push((start, start + region.len()))
+            .unwrap_or_else(|_| {
+                panic!(
+                    "boot memory map described more than {MAX_BOOT_MEMORY_REGIONS} usable regions"
+                )
+            });
+    }
+
+    let usable_bytes = regions
+        .iter()
+        .map(|(start, end)| end.saturating_sub(*start))
+        .sum();
+    let plan = memory::BootMemoryPlan::for_usable_bytes(usable_bytes);
+    ALLOCATOR.install_plan(plan);
+    let mut splitter = plan.splitter();
+
+    let mut user_pool = None;
+    for (start, end) in regions {
+        let shares = splitter.split(start, end);
+        if let Some(kernel) = shares.kernel {
+            unsafe {
+                ALLOCATOR.add_to_heap(kernel.start, kernel.end);
+            }
         }
+        // The pool is installed as soon as the kernel heap can allocate
+        // it, and before the first user region is added: every later
+        // region, and every byte the kernel heap later borrows back,
+        // goes through it.
+        let Some(user) = shares.user else {
+            continue;
+        };
         let pool = *user_pool.get_or_insert_with(|| {
             let pool = memory::install_user_memory_pool(memory::allocate_user_memory_pool());
             pool.configure_processors(processor_count);
@@ -843,58 +1005,16 @@ where
             memory::configure_user_memory_owner_processors(processor_count);
             pool
         });
-        if let Some(user_start) = user_start {
-            pool.add_region(user_start, end);
-        }
+        pool.add_region(user.start, user.end);
     }
+
+    assert_eq!(
+        splitter.kernel_owed_bytes(),
+        0,
+        "the boot memory map is smaller than the kernel heap's boot share of {} bytes",
+        plan.kernel_boot_bytes
+    );
     user_pool.unwrap_or_else(|| panic!("bootstrap did not provide memory for user pool"))
-}
-
-/// Splits one bootstrap memory region into the kernel heap's part and
-/// the user pool's part, and reports where the user's part begins.
-///
-/// The kernel keeps its reserve and the user pool takes the rest. The
-/// kernel is close to zero-allocation by contract — bounded pools, no
-/// per-guest growth — and a kernel OOM is fatal rather than
-/// recoverable, so what it needs is headroom over a small working set,
-/// not a share proportional to the machine.
-///
-/// Halving every region got that wrong in a way that showed. On a 2 GiB
-/// x86-64 machine the two halves came to 726 MiB of kernel heap and
-/// 730 MiB of user pool, and at the point where the first guest program
-/// is compiled the kernel was holding 39 MiB of its 726 — while the
-/// user pool could not produce the single 512 MiB run a shared wasm
-/// memory needs on a backend with no lazy-commit address space, because
-/// it did not have one. The spawn failed with 95% of the kernel's half
-/// untouched.
-fn split_bootstrap_memory_region(start: usize, end: usize) -> (usize, Option<usize>) {
-    let len = end.saturating_sub(start);
-    let kernel_len = user_memory_kernel_reserve_bytes(len);
-    let Some(user_len) = len.checked_sub(kernel_len) else {
-        return (end, None);
-    };
-    if user_len < USER_HEAP_MIN_REGION_BYTES {
-        return (end, None);
-    }
-
-    // Rounded up, away from the reserve: the kernel's share is a floor
-    // it keeps, so the alignment comes out of the user pool's side.
-    let user_start = align_up(start.saturating_add(kernel_len), USER_HEAP_MIN_REGION_BYTES);
-    if user_start <= start || end.saturating_sub(user_start) < USER_HEAP_MIN_REGION_BYTES {
-        return (end, None);
-    }
-    (user_start, Some(user_start))
-}
-
-/// `value` rounded up to a multiple of `align`, which must be a power
-/// of two. Saturates rather than wrapping, so a caller that checks the
-/// result against a region end rejects the overflow instead of
-/// wrapping into it.
-const fn align_up(value: usize, align: usize) -> usize {
-    match value.checked_add(align - 1) {
-        Some(sum) => sum & !(align - 1),
-        None => usize::MAX,
-    }
 }
 
 pub fn prime_bootstrap_allocator<Regions>(
@@ -952,10 +1072,23 @@ fn finish_bootstrap<Console, CpuImpl>(
         topology.startup_policy
     );
     let user_heap = memory::user_heap_stats();
+    let machine = machine_memory();
     tracing::info!(
         "User memory pool total_bytes={} available_bytes={}",
         user_heap.total_bytes,
         user_heap.available_bytes()
+    );
+    // The pool line above is the pool's own view. This one is the
+    // policy: what the machine has, what the kernel heap started with
+    // and what it will never give back, and what it takes at a time
+    // when it needs more. `memory::policy` states why.
+    tracing::info!(
+        "Memory policy usable_bytes={} kernel_heap_bytes={} kernel_reserve_bytes={} \
+         kernel_growth_chunk_bytes={}",
+        machine.usable_bytes,
+        heap_stats().total_bytes,
+        kernel_heap_reserve_bytes(),
+        memory::KERNEL_HEAP_GROWTH_CHUNK_BYTES
     );
     tracing::info!(
         "Platform dma_model={dma_model:?} debug_serial={} network={} block_devices={} \
@@ -1023,10 +1156,39 @@ fn usize_to_u64(value: usize, label: &'static str) -> u64 {
     u64::try_from(value).unwrap_or_else(|_| panic!("{label} does not fit into u64"))
 }
 
-pub fn user_memory_kernel_reserve_bytes(total_heap_bytes: usize) -> usize {
-    (total_heap_bytes / USER_MEMORY_KERNEL_RESERVE_FRACTION)
-        .max(USER_MEMORY_MIN_KERNEL_RESERVE_BYTES)
-        .min(total_heap_bytes)
+/// Free kernel heap a user-memory grow may not dip into.
+///
+/// Derived from the boot memory map once and fixed for the life of the
+/// kernel — see [`BootMemoryPlan`]. The kernel heap's own total
+/// grows on demand, so a reserve expressed as a share of it would rise
+/// every time the kernel took more memory, which is the opposite of
+/// what a floor is for.
+pub fn kernel_heap_reserve_bytes() -> usize {
+    ALLOCATOR.reserve_bytes()
+}
+
+/// The machine's memory, across both domains.
+///
+/// The kernel heap and the user pool draw on the same physical memory
+/// now, so the honest answer to "how much memory is there" is one
+/// number for both: everything the boot memory map described, and
+/// everything neither domain has spent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MachineMemory {
+    /// Every usable byte the boot memory map described.
+    pub usable_bytes: usize,
+    /// Bytes neither the kernel heap nor the user pool has handed out.
+    pub free_bytes: usize,
+}
+
+pub fn machine_memory() -> MachineMemory {
+    let heap = heap_stats();
+    MachineMemory {
+        usable_bytes: ALLOCATOR.machine_bytes(),
+        free_bytes: heap
+            .available_bytes()
+            .saturating_add(memory::user_pool_available_bytes()),
+    }
 }
 
 /// The kernel heap's free space measured against the reserve it keeps
@@ -1051,10 +1213,23 @@ pub struct KernelHeapHeadroom {
 }
 
 impl KernelHeapHeadroom {
-    pub fn of(heap: HeapStats) -> Self {
+    /// The kernel heap's headroom right now.
+    ///
+    /// `available_bytes` counts the user pool's free memory as well as
+    /// the kernel heap's own, because the kernel heap takes what it
+    /// needs out of the pool: what bounds a user grow's kernel-side
+    /// cost is the machine, not the share the kernel happens to be
+    /// holding at the moment it is asked.
+    pub fn current() -> Self {
+        Self::of(heap_stats(), memory::user_pool_available_bytes())
+    }
+
+    pub fn of(heap: HeapStats, user_pool_available_bytes: usize) -> Self {
         Self {
-            available_bytes: heap.available_bytes(),
-            reserve_bytes: user_memory_kernel_reserve_bytes(heap.total_bytes),
+            available_bytes: heap
+                .available_bytes()
+                .saturating_add(user_pool_available_bytes),
+            reserve_bytes: kernel_heap_reserve_bytes(),
         }
     }
 
@@ -1103,72 +1278,6 @@ mod tests {
     use super::*;
 
     const TEST_HEAP_BYTES: usize = 16 * 1024;
-
-    /// The compiler plugin's shared memory on a backend with no
-    /// lazy-commit address space: half a gigabyte, allocated at its
-    /// declared maximum in one piece because a shared memory can never
-    /// move.
-    const PLUGIN_SHARED_MEMORY_BYTES: usize = 512 * 1024 * 1024;
-
-    #[test]
-    fn the_kernel_keeps_its_reserve_and_the_user_pool_takes_the_rest() {
-        // What the two halves of a 2 GiB x86-64 machine came to once
-        // firmware had taken its share.
-        let start = 0x0010_0000;
-        let end = start + 1456 * 1024 * 1024;
-        let (kernel_end, user_start) = split_bootstrap_memory_region(start, end);
-        let user_start = user_start.expect("a gigabyte and a half is worth splitting");
-        assert_eq!(kernel_end, user_start, "the split is one point");
-
-        let kernel_len = kernel_end - start;
-        let user_len = end - user_start;
-        assert!(
-            kernel_len >= USER_MEMORY_MIN_KERNEL_RESERVE_BYTES,
-            "the kernel heap fell below its own floor at {kernel_len} bytes"
-        );
-        assert!(
-            user_len > PLUGIN_SHARED_MEMORY_BYTES,
-            "a user pool of {user_len} bytes cannot hold one              {PLUGIN_SHARED_MEMORY_BYTES}-byte allocation and anything else"
-        );
-    }
-
-    #[test]
-    fn a_region_that_cannot_spare_the_reserve_stays_with_the_kernel() {
-        let start = 0x4000_0000;
-        for len in [0_usize, 4096, USER_MEMORY_MIN_KERNEL_RESERVE_BYTES] {
-            let end = start + len;
-            assert_eq!(
-                split_bootstrap_memory_region(start, end),
-                (end, None),
-                "a {len}-byte region has nothing left after the kernel reserve"
-            );
-        }
-    }
-
-    #[test]
-    fn the_user_share_never_reaches_past_the_region_it_came_from() {
-        for offset in [0_usize, 4096, 2 * 1024 * 1024, 37 * 1024 * 1024] {
-            for len in [
-                8 * 1024 * 1024,
-                100 * 1024 * 1024,
-                1024 * 1024 * 1024,
-                3 * 1024 * 1024 * 1024,
-            ] {
-                let start = 0x4000_0000 + offset;
-                let end = start + len;
-                let (kernel_end, user_start) = split_bootstrap_memory_region(start, end);
-                assert!(kernel_end >= start && kernel_end <= end);
-                if let Some(user_start) = user_start {
-                    assert_eq!(user_start, kernel_end);
-                    assert!(user_start > start && user_start < end);
-                    assert!(
-                        user_start - start >= USER_MEMORY_MIN_KERNEL_RESERVE_BYTES,
-                        "the kernel heap kept less than its floor"
-                    );
-                }
-            }
-        }
-    }
 
     #[repr(align(4096))]
     struct AlignedHeap([u8; TEST_HEAP_BYTES]);
