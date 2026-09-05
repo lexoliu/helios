@@ -451,7 +451,13 @@ def precompile(manifest_path: Path, names: list[str], wasmtime_bin: str, root: P
         print(f"precompiled {source} -> {target}")
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
+    """The guest runner's command line.
+
+    Built apart from `main` so the host driver's side of the contract can
+    be parsed by the very parser that will receive it: the two files are
+    edited together and only meet inside a guest.
+    """
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--manifest", type=Path, default=repo_root() / "tools/wasi-apps/workloads.json")
     parser.add_argument("--repo-root", type=Path, default=repo_root())
@@ -472,7 +478,7 @@ def main() -> None:
         action="store_true",
         help="record a workload that fails as a failure record and continue with the next one",
     )
-    run.add_argument(
+    run_parser.add_argument(
         "--side-timeout-seconds",
         type=float,
         default=None,
@@ -485,7 +491,11 @@ def main() -> None:
     paths_parser = subcommands.add_parser("guest-paths")
     paths_parser.add_argument("--workload", dest="workloads", action="append", default=[])
 
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
     root = args.repo_root.resolve()
     if args.command == "run":
         if args.iterations <= 0:

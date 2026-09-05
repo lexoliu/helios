@@ -1,11 +1,12 @@
 """The guest-side runner's manifest interpretation, exercised on the host."""
 
+import shlex
 from pathlib import Path
 
 import pytest
 
 from helios_bench import REPO_ROOT
-from helios_bench.wasi_apps import workload_runner
+from helios_bench.wasi_apps import fedora_baseline, workload_runner
 from helios_bench.workloads import load_workloads
 
 GUEST_ROOT = Path("/home/bench/helios")
@@ -75,3 +76,37 @@ def test_metric_lines_are_parsed_strictly() -> None:
         runner.parse_metrics("bench.broken\n", "w")
     with pytest.raises(SystemExit):
         runner.parse_metrics("bench.a=1\nbench.a=2\n", "w")
+
+
+def test_the_guest_runner_parses_the_command_the_host_driver_builds() -> None:
+    """The two halves of the Linux side only meet inside a guest.
+
+    `runner_command` writes the argv and `linux_workload_runner` reads it,
+    from two files that are edited together and whose disagreement shows
+    up an hour into a CI run as a traceback on the far side of an ssh.
+    """
+    baseline = fedora_baseline()
+    runner = workload_runner()
+    workloads = [{"name": "quickjs-loop"}, {"name": "hostcall-loop"}]
+    command = baseline.runner_command(
+        11,
+        workloads,
+        "http://10.77.0.1:80/payload.txt",
+        "10.77.0.1",
+        5000,
+        5001,
+        "linux-native.jsonl",
+        "linux_native",
+        None,
+        True,
+        5400,
+    )
+    argv = shlex.split(command)
+    assert argv[0] == "python3"
+    args = runner.build_parser().parse_args(argv[2:])
+    assert args.command == "run"
+    assert args.side == "linux_native"
+    assert args.iterations == 11
+    assert args.keep_going is True
+    assert args.side_timeout_seconds == 5400
+    assert args.workloads == ["quickjs-loop", "hostcall-loop"]
