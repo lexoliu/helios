@@ -779,6 +779,17 @@ enum VmSessionCommand {
     /// Only an instrumented kernel (`--profile-generate`) carries one; any
     /// other says so rather than handing back an empty profile.
     Profile(ProfileCommand),
+    /// Print the guest kernel artifact this checkout would boot, and
+    /// stop there.
+    ///
+    /// The path is resolved exactly as a boot resolves it — the
+    /// workspace root, then the architecture and the profile — so a
+    /// caller that has to identify the guest an image would boot does
+    /// not have to rebuild the mapping from architecture to Cargo target
+    /// and artifact name for itself. A paired benchmark run uses it to
+    /// refuse two checkouts whose guest images turn out to be the same
+    /// build, which the comparison between them could say nothing about.
+    KernelPath,
     /// Provision the privileged host state a network backend needs.
     NetSetup(NetSetupCommand),
     /// Remove the host state `net-setup` provisioned.
@@ -918,6 +929,15 @@ pub(crate) fn run(mut command: VmCommand) -> Result<()> {
             let file = load_config_file(command.config.as_deref())?;
             return build_vm(&resolve_build(&command, &file, None)?);
         }
+        // Answers from the build spec and boots nothing, so like `build`
+        // it needs neither an accelerator nor a guest.
+        Some(VmSessionCommand::KernelPath) => {
+            let file = load_config_file(command.config.as_deref())?;
+            let build = resolve_build(&command, &file, None)?;
+            let kernel = resolve_kernel_path(command.kernel, file.kernel, &build)?;
+            println!("{}", kernel.display());
+            return Ok(());
+        }
         session => command.command = session,
     }
     let command = resolve(command)?;
@@ -1000,6 +1020,20 @@ fn resolve_build(
     })
 }
 
+/// The kernel image a session boots: an explicit path from the command
+/// line or the config file, else the workspace artifact of the resolved
+/// build.
+fn resolve_kernel_path(
+    explicit: Option<PathBuf>,
+    configured: Option<PathBuf>,
+    build: &KernelBuildSpec,
+) -> Result<PathBuf> {
+    match explicit.or(configured) {
+        Some(kernel) => Ok(kernel),
+        None => default_kernel_path(build.profile.arch, build.kind.directory()),
+    }
+}
+
 fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand> {
     let file = load_config_file(command.config.as_deref())?;
     let session_command: Option<ResolvedVmSessionCommand> = command.command.take().map(Into::into);
@@ -1011,10 +1045,7 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand> {
         .qemu_bin
         .or(file.qemu_bin)
         .unwrap_or_else(|| PathBuf::from(profile.qemu_bin));
-    let kernel = match command.kernel.or(file.kernel) {
-        Some(kernel) => kernel,
-        None => default_kernel_path(arch, build.kind.directory())?,
-    };
+    let kernel = resolve_kernel_path(command.kernel, file.kernel, &build)?;
     let smp = command.smp.or(file.smp).unwrap_or(profile.default_smp);
     let memory = command
         .memory
@@ -3118,9 +3149,12 @@ impl From<VmSessionCommand> for ResolvedVmSessionCommand {
             VmSessionCommand::Balloon(command) => Self::Balloon(command),
             VmSessionCommand::Profile(command) => Self::Profile(command),
             VmSessionCommand::Build
+            | VmSessionCommand::KernelPath
             | VmSessionCommand::NetSetup(_)
             | VmSessionCommand::NetTeardown(_) => {
-                unreachable!("the build and the network helpers never reach a guest session")
+                unreachable!(
+                    "the build, the artifact query and the network helpers never reach a guest session"
+                )
             }
         }
     }
