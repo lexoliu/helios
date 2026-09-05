@@ -957,23 +957,33 @@ where
         let mut received = 0usize;
         let mut received_bytes = 0usize;
         let receive_started = self.profile_start();
-        // `stack_rx_budget` is fixed at Stack construction so we read
-        // it from the cached service-level value (no shard lock).
-        // Backpressure remains a per-shard query because it tracks
-        // live receive-window state.
-        let stack_rx_budget = self.inner.state.with(|state| {
-            if state.stack.receive_backpressured() {
-                0
-            } else {
-                self.inner.stack_rx_budget
-            }
-        });
+        // How many frames one poll may hand the stack is fixed at
+        // `Stack` construction, so it is read from the cached
+        // service-level value rather than from a shard.
+        //
+        // Nothing else bounds the drain. Receive backpressure used to:
+        // the poll asked one shard — the default one, whichever shard
+        // the flows had actually landed on — whether its receive window
+        // was open, and took every queue pair off the device when it
+        // was not. That made one socket's full receive queue the whole
+        // interface's problem. The guest stopped taking frames of any
+        // kind, answered no ARP, and the host's neighbour entry for a
+        // running guest went stale mid-transfer (#143).
+        //
+        // A receive window is per-socket flow control and it is already
+        // enforced where it belongs: a conforming peer stops sending
+        // before the queue fills, and a segment that arrives anyway is
+        // outside the advertised window and is dropped by the stack. So
+        // the drain runs to its budget, each frame is offered to the
+        // shard its flow belongs to, and a shard that will not take one
+        // loses that frame and nothing else.
+        let stack_rx_budget = self.inner.stack_rx_budget;
         loop {
             let remaining_rx_budget = budget
                 .rx_frames
                 .min(stack_rx_budget)
                 .saturating_sub(received);
-            if stack_rx_budget == 0 || remaining_rx_budget == 0 {
+            if remaining_rx_budget == 0 {
                 break;
             }
 
@@ -1001,7 +1011,6 @@ where
                 break;
             }
 
-            let mut receive_backpressured = false;
             let received_at = StackInstant::from_nanos(self.now_nanos());
             // Demux each frame to the shard owning its destination
             // port. The previous single-shard path locked
@@ -1017,29 +1026,27 @@ where
             // same shard should release its waiters once.
             let mut arrivals = ShardArrivals::new();
             for frame in frames[..received_batch].iter().flatten() {
-                if receive_backpressured {
-                    break;
-                }
                 let frame_len = frame.len();
                 match self
                     .inner
                     .state
                     .dispatch_rx_frame(frame, received_at, &self.inner.control)
                 {
-                    RxFrameDispatch::Delivered {
-                        shard_idx,
-                        backpressured,
-                    } => {
+                    RxFrameDispatch::Delivered { shard_idx } => {
                         arrivals.record(shard_idx);
                         self.inner.state.record_received(shard_idx, 1);
                         received += 1;
                         received_bytes = received_bytes.saturating_add(frame_len);
-                        if backpressured {
-                            receive_backpressured = true;
-                        }
                     }
-                    RxFrameDispatch::Backpressured => {
-                        receive_backpressured = true;
+                    // The frame is already off the ring and cannot be
+                    // put back, so it is lost — which is what a closed
+                    // receive window means and what the peer's
+                    // retransmission is for. The rest of the batch
+                    // belongs to other shards and is delivered
+                    // regardless: one saturated flow does not get to
+                    // drop another flow's segments, nor an ARP request.
+                    RxFrameDispatch::Backpressured { shard_idx } => {
+                        self.inner.state.record_receive_refused(shard_idx, 1);
                     }
                     RxFrameDispatch::Malformed => {
                         received += 1;
@@ -1063,10 +1070,6 @@ where
                 for frame in &mut frames[..received_batch] {
                     drop(frame.take());
                 }
-            }
-
-            if receive_backpressured {
-                break;
             }
         }
         self.record_network_profile_events_bytes(

@@ -36,8 +36,8 @@ use helios_netstack::{
     NetworkInterface as NetworkDevice, OutboundBatchStatus, Route, RouteTable, RxChecksumOffload,
     RxFrame, SegmentationOffload, Stack, StackConfig, StackError, StackEvent, StackInstant,
     TcpCloseKind, TcpConnectState, TcpConnectTerminalError, TcpEndpoint, TcpListenBacklog,
-    TcpPacket, TcpReadIntoState, TcpReadState, UdpEgress, UdpEndpoint, UdpPacket, UdpPayload,
-    UdpSocketBinding, UdpSocketError, flow_hash,
+    TcpPacket, TcpReadIntoState, TcpReadState, TcpStackCounters, UdpEgress, UdpEndpoint, UdpPacket,
+    UdpPayload, UdpSocketBinding, UdpSocketError, flow_hash,
 };
 use spin::{Mutex as SpinMutex, RwLock as SpinRwLock};
 
@@ -215,6 +215,28 @@ pub struct NetworkQueueStats {
     /// Interrupts the device raised for this pair's own message. Zero on
     /// a transport that cannot tell its queues apart.
     pub interrupts: u64,
+    /// Frames the demux threw away because this shard's stack had no
+    /// room for them. Already off the ring when they were refused, so
+    /// they are lost and the peer has to retransmit.
+    pub rx_refused_frames: u64,
+    /// Acknowledgements this shard has put on the wire, duplicates
+    /// included.
+    pub tcp_acks_sent: u64,
+    /// Those of them that advertised more receive room than the peer
+    /// had last been told about. A receiver whose window shut and whose
+    /// update count then stopped moving is a stalled transfer.
+    pub tcp_window_updates_sent: u64,
+    /// Segments this shard retransmitted, by timer or fast retransmit.
+    pub tcp_retransmits_sent: u64,
+    /// Connections this shard holds.
+    pub tcp_sockets: u32,
+    /// How many of them are refusing segments for want of receive room.
+    /// Nonzero with `tcp_sockets` at zero is a leaked window: the shard
+    /// will refuse frames with no socket left that could relieve it.
+    pub tcp_receive_backpressured_sockets: u32,
+    /// The receive window those connections advertise between them, in
+    /// bytes. Zero with connections open is a shut receiver.
+    pub tcp_receive_window_bytes: u64,
 }
 
 /// Per-shard network counters, one entry per processor.
@@ -667,21 +689,36 @@ where
         }
     }
 
-    /// Per-shard frame and interrupt counters.
+    /// Per-shard frame, interrupt and TCP counters.
     ///
-    /// Read without locking a shard: the counters are relaxed atomics
-    /// outside the shard mutex, so a statistics sweep never contends
-    /// with the receive path it is measuring.
+    /// The frame and interrupt counts are relaxed atomics outside the
+    /// shard mutex, so reading them never contends with the receive path
+    /// they measure. The TCP counters live inside the shard's stack and
+    /// cost one uncontended lock each; a statistics sweep is rare and
+    /// the alternative — mirroring six numbers out to atomics on every
+    /// segment — would put the cost on the hot path instead.
+    ///
+    /// What these are for: a shard that stops moving frames while its
+    /// window is shut and its window-update count is frozen is the
+    /// stalled receiver of #143, and the shape is visible in one sample.
     pub fn stats(&self) -> NetworkStats {
         NetworkStats {
             queues: (0..self.inner.state.shard_count())
                 .map(|idx| {
                     let (rx_frames, tx_frames) = self.inner.state.frame_counts(idx);
+                    let tcp = self.inner.state.tcp_counters(idx);
                     NetworkQueueStats {
                         id: idx as u32,
                         rx_frames,
                         tx_frames,
                         interrupts: self.inner.device.queue_interrupts(idx),
+                        rx_refused_frames: self.inner.state.refused_frame_count(idx),
+                        tcp_acks_sent: tcp.acks_sent,
+                        tcp_window_updates_sent: tcp.window_updates_sent,
+                        tcp_retransmits_sent: tcp.retransmits_sent,
+                        tcp_sockets: tcp.sockets,
+                        tcp_receive_backpressured_sockets: tcp.receive_backpressured_sockets,
+                        tcp_receive_window_bytes: tcp.receive_window_bytes,
                     }
                 })
                 .collect(),
@@ -1327,13 +1364,16 @@ fn usize_to_u64(value: usize, label: &'static str) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    /// The peer's hardware address in the frames these tests build.
+    const PEER_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 2];
+
     use helios_netstack::{
-        ETHERNET_FRAME_BYTES, EthernetFrame, EthernetProtocol, IcmpEchoKey, Icmpv4Packet,
-        Icmpv6Packet, IpAddress, IpCidr, IpProtocol, Ipv4Address, Ipv4Cidr, Ipv4Packet,
-        Ipv6Address, Ipv6Cidr, Ipv6Packet, MAX_OUTBOUND_FRAMES, NeighborEntry, NeighborState,
-        Route, StackConfig, StackInstant, TCP_RECEIVE_WINDOW_BYTES, TcpEndpoint, TcpFlags,
-        TcpHeader, TcpListenBacklog, TcpPacket, TransportChecksum, UdpEndpoint, UdpPacket,
-        UdpPayload, UdpSocketBinding, internet_checksum,
+        ArpOperation, ArpPacket, ETHERNET_FRAME_BYTES, EthernetFrame, EthernetProtocol,
+        IcmpEchoKey, Icmpv4Packet, Icmpv6Packet, IpAddress, IpCidr, IpProtocol, Ipv4Address,
+        Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6Cidr, Ipv6Packet, MAX_OUTBOUND_FRAMES,
+        NeighborEntry, NeighborState, Route, StackConfig, StackInstant, TCP_RECEIVE_WINDOW_BYTES,
+        TcpEndpoint, TcpFlags, TcpHeader, TcpListenBacklog, TcpPacket, TransportChecksum,
+        UdpEndpoint, UdpPacket, UdpPayload, UdpSocketBinding, internet_checksum,
     };
 
     use alloc::vec::Vec;
@@ -1348,9 +1388,9 @@ mod tests {
     use super::{
         AddressAttemptError, DhcpClientState, HandleSlab, NETWORK_BUSY_POLL_ROUNDS,
         NETWORK_TX_BATCH_FRAMES, NetworkIpAddress, NetworkPollBudget, NetworkPollProgress,
-        NetworkPollState, NetworkPumpAction, NetworkPumpCadence, NetworkShard, ReplicaHandle,
-        TcpListenerId, TcpReadProgress, UdpSocketId, icmp_echo_payload, limit_udp_datagram_bytes,
-        map_ipv4_address, parse_ipv6, receive_pair_order,
+        NetworkPollSource, NetworkPollState, NetworkPumpAction, NetworkPumpCadence, NetworkShard,
+        ReplicaHandle, TcpListenerId, TcpReadProgress, UdpSocketId, icmp_echo_payload,
+        limit_udp_datagram_bytes, map_ipv4_address, parse_ipv6, receive_pair_order,
     };
 
     fn ipv6_tcp_frame(
@@ -2400,12 +2440,8 @@ mod tests {
             StackInstant::from_nanos(1),
             &control,
         ) {
-            super::RxFrameDispatch::Delivered {
-                shard_idx,
-                backpressured,
-            } => {
+            super::RxFrameDispatch::Delivered { shard_idx } => {
                 assert_eq!(shard_idx, owner, "the reply belongs to the socket's shard");
-                assert!(!backpressured);
                 arrivals.record(shard_idx);
             }
             _ => panic!("the owning shard should have taken the reply"),
@@ -3422,6 +3458,179 @@ mod tests {
     /// it — so a sweep that stopped at the local pair stranded the
     /// reply on a multi-queue backend until some task happened to poll
     /// from the owning processor, which no backend guarantees.
+    /// An ARP request from `peer` for `local`, as the host sends when
+    /// its neighbour entry for the guest needs refreshing.
+    fn arp_request_frame(
+        peer: Ipv4Address,
+        local: Ipv4Address,
+    ) -> ([u8; ETHERNET_FRAME_BYTES], usize) {
+        let mut frame = [0; ETHERNET_FRAME_BYTES];
+        let offset =
+            EthernetFrame::encode_header(&mut frame, [0xff; 6], PEER_MAC, EthernetProtocol::Arp)
+                .expect("test Ethernet header should fit");
+        let len = ArpPacket {
+            operation: ArpOperation::Request,
+            sender_hardware: PEER_MAC,
+            sender_protocol: peer,
+            target_hardware: [0; 6],
+            target_protocol: local,
+        }
+        .encode(&mut frame[offset..])
+        .expect("test ARP request should fit");
+        (frame, offset + len)
+    }
+
+    /// #143. A TCP socket whose receive queue has filled closes its own
+    /// receive window, and that is all it may close.
+    ///
+    /// The device drain used to ask one shard — the default one, not
+    /// necessarily the one the flow had landed on — whether its window
+    /// was open, and take *every* queue pair off the device when it was
+    /// not. A single unread socket therefore stopped the guest taking
+    /// frames of any kind: no ARP reply, no ICMP, no DHCP, and nothing
+    /// for any other flow. On the x86 KVM lane that showed up as a
+    /// running guest whose neighbour entry on the host went stale
+    /// mid-transfer, `sendall` failing `EHOSTUNREACH`, and a download
+    /// that never resumed.
+    ///
+    /// So the assertion is the one the host cares about: the window is
+    /// shut, the read that would reopen it has not happened, and the
+    /// guest still answers ARP.
+    #[test]
+    fn a_closed_receive_window_does_not_stop_the_guest_answering_arp() {
+        /// The largest payload an IPv4 TCP segment carries in an
+        /// Ethernet frame, which is what a bulk sender fills.
+        const SEGMENT_BYTES: usize = ETHERNET_FRAME_BYTES
+            - EthernetFrame::HEADER_LEN
+            - Ipv4Packet::MIN_HEADER_LEN
+            - TcpPacket::MIN_HEADER_LEN;
+
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let service = test_network_service();
+        let device = service.inner.device.clone();
+        let state = &service.inner.state;
+        let owner = super::DEFAULT_SHARD_IDX;
+
+        let stream = {
+            let mut shard = state.shard_at(owner).lock();
+            shard.stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+            // Published, not merely installed: every poll pushes the
+            // control plane's configuration back into the shards, so an
+            // address only one shard knows about does not survive one.
+            service.inner.control.publish_from_shard(&shard);
+            let socket = shard
+                .stack
+                .open_tcp_connect(
+                    TcpEndpoint {
+                        address: IpAddress::Ipv4(local),
+                        port: 49_152,
+                    },
+                    TcpEndpoint {
+                        address: IpAddress::Ipv4(peer),
+                        port: 80,
+                    },
+                    7,
+                )
+                .expect("the test connection should allocate a socket");
+            shard.insert_tcp_stream(socket)
+        };
+        assert_eq!(
+            state.shard_idx_for_handle(stream),
+            owner,
+            "the stream belongs to the shard that minted it"
+        );
+
+        let (syn_ack, syn_ack_len) = ipv4_tcp_frame(
+            peer,
+            local,
+            TcpHeader {
+                source_port: 80,
+                destination_port: 49_152,
+                sequence: 100,
+                acknowledgement: 8,
+                flags: TcpFlags::SYN.union(TcpFlags::ACK),
+                window_size: u16::MAX,
+            },
+            &[],
+        );
+        state
+            .shard_at(owner)
+            .lock()
+            .stack
+            .receive_frame(&syn_ack[..syn_ack_len], StackInstant::from_nanos(1))
+            .expect("the SYN-ACK should establish the connection");
+
+        // Fill the receive queue and leave it full. Nothing reads it
+        // back out, so from here the socket's window stays shut.
+        let payload = [0u8; SEGMENT_BYTES];
+        let mut sequence = 101u32;
+        let mut segments = 0usize;
+        while !state.shard_at(owner).lock().stack.receive_backpressured() {
+            assert!(
+                segments < TCP_RECEIVE_WINDOW_BYTES.div_ceil(SEGMENT_BYTES),
+                "the receive window should close within its own capacity"
+            );
+            let (segment, segment_len) = ipv4_tcp_frame(
+                peer,
+                local,
+                TcpHeader {
+                    source_port: 80,
+                    destination_port: 49_152,
+                    sequence,
+                    acknowledgement: 8,
+                    flags: TcpFlags::ACK,
+                    window_size: u16::MAX,
+                },
+                &payload,
+            );
+            state
+                .shard_at(owner)
+                .lock()
+                .stack
+                .receive_frame(
+                    &segment[..segment_len],
+                    StackInstant::from_nanos(2 + segments as u64),
+                )
+                .expect("a segment inside the window should be accepted");
+            sequence = sequence.wrapping_add(SEGMENT_BYTES as u32);
+            segments += 1;
+        }
+        while state.shard_at(owner).lock().stack.take_outbound().is_some() {}
+
+        // The host asks who has the guest's address.
+        let (arp, arp_len) = arp_request_frame(peer, local);
+        device.deliver_on(0, &arp[..arp_len]);
+
+        let (progress, _) = block_on(service.poll_network_receive_once(NetworkPollSource::Pump))
+            .expect("the poll should drive the device");
+
+        assert_eq!(
+            progress.received_frames, 1,
+            "the ARP request must come off the device however shut a TCP \
+             socket's window is"
+        );
+        // The reply is somewhere in the outbound queue: the same poll
+        // also drove the TCP timers, which owe this connection an
+        // acknowledgement of their own.
+        let mut arp_reply = None;
+        let mut shard = state.shard_at(owner).lock();
+        while let Some(frame) = shard.stack.take_outbound() {
+            let Some(ethernet) = EthernetFrame::parse(frame.as_ref()) else {
+                continue;
+            };
+            if ethernet.protocol != EthernetProtocol::Arp {
+                continue;
+            }
+            arp_reply = ArpPacket::parse(ethernet.payload);
+            break;
+        }
+        let arp_reply = arp_reply.expect("the guest must have an ARP reply to send");
+        assert_eq!(arp_reply.operation, ArpOperation::Reply);
+        assert_eq!(arp_reply.sender_protocol, local);
+        assert_eq!(arp_reply.target_protocol, peer);
+    }
+
     #[test]
     fn a_receive_sweep_covers_every_queue_pair_starting_with_the_local_one() {
         for pair_count in 1..=8usize {

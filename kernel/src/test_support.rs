@@ -324,6 +324,10 @@ pub(crate) struct RecordingNetworkInterface {
 struct RecordingInterfaceState {
     /// Events each queue pair has reported.
     queues: alloc::vec::Vec<AtomicU64>,
+    /// Frames each queue pair is holding for the next drain, in arrival
+    /// order. A test that wants to prove the kernel takes a frame off
+    /// the device has to put one there first.
+    pending: alloc::vec::Vec<spin::Mutex<alloc::collections::VecDeque<helios_netstack::RxFrame>>>,
     /// Events reported that belong to no queue pair.
     device: AtomicU64,
     /// Wakes whatever is parked on either counter.
@@ -336,10 +340,24 @@ impl RecordingNetworkInterface {
         Self {
             inner: Arc::new(RecordingInterfaceState {
                 queues: (0..queue_pairs).map(|_| AtomicU64::new(0)).collect(),
+                pending: (0..queue_pairs)
+                    .map(|_| spin::Mutex::new(alloc::collections::VecDeque::new()))
+                    .collect(),
                 device: AtomicU64::new(0),
                 progress: crate::ProgressSignal::new(),
             }),
         }
+    }
+
+    /// Puts a frame in one queue pair's receive ring, where the next
+    /// drain will find it, and raises the event its arrival raises.
+    pub(crate) fn deliver_on(&self, queue_idx: usize, frame: &[u8]) {
+        self.inner.pending[queue_idx]
+            .lock()
+            .push_back(helios_netstack::RxFrame::new(
+                bytes::Bytes::copy_from_slice(frame),
+            ));
+        self.complete_on(queue_idx);
     }
 
     /// Raises the event one queue pair's completions raise, as the
@@ -403,13 +421,22 @@ impl helios_netstack::NetworkInterface for RecordingNetworkInterface {
 
     fn try_receive_frames_immediate_on<'a, 'slots>(
         &'a self,
-        _: usize,
-        _: &'slots mut [Option<helios_netstack::RxFrame>],
+        queue_idx: usize,
+        slots: &'slots mut [Option<helios_netstack::RxFrame>],
     ) -> helios_hal::io::IoResult<Option<usize>>
     where
         'a: 'slots,
     {
-        Ok(Some(0))
+        let mut pending = self.inner.pending[queue_idx].lock();
+        let mut taken = 0;
+        for slot in slots.iter_mut() {
+            let Some(frame) = pending.pop_front() else {
+                break;
+            };
+            *slot = Some(frame);
+            taken += 1;
+        }
+        Ok(Some(taken))
     }
 
     fn repost_rx_frame<'a>(

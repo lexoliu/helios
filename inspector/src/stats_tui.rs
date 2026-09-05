@@ -630,17 +630,57 @@ fn draw_network_panel(frame: &mut ratatui::Frame<'_>, area: Rect, sample: &stats
             if interrupts == 0 {
                 lines.push(block_line("irqs", "one shared line".to_owned()));
             }
-            lines.extend(network.queues.iter().map(|queue| {
-                Line::from(vec![
-                    Span::styled(
-                        format!("cpu{:<6}", queue.id),
-                        Style::default().fg(Color::Cyan),
-                    ),
-                    Span::raw(format!(
-                        "{} rx  {} tx  {} irq",
-                        queue.rx_frames, queue.tx_frames, queue.interrupts
-                    )),
-                ])
+            // A shard holding connections that advertise no window is a
+            // receiver that has stopped taking data, and one holding a
+            // backpressured socket count with no sockets left to relieve
+            // it will never take data again (#143). Both are worth a
+            // line of their own rather than a column to squint at.
+            let stalled: Vec<String> = network
+                .queues
+                .iter()
+                .filter(|queue| {
+                    (queue.tcp_sockets != 0 && queue.tcp_receive_window_bytes == 0)
+                        || (queue.tcp_sockets == 0 && queue.tcp_receive_backpressured_sockets != 0)
+                })
+                .map(|queue| format!("cpu{}", queue.id))
+                .collect();
+            if !stalled.is_empty() {
+                lines.push(block_line(
+                    "shut",
+                    format!("{} advertising no receive window", stalled.join(" ")),
+                ));
+            }
+            lines.extend(network.queues.iter().flat_map(|queue| {
+                [
+                    Line::from(vec![
+                        Span::styled(
+                            format!("cpu{:<6}", queue.id),
+                            Style::default().fg(Color::Cyan),
+                        ),
+                        Span::raw(format!(
+                            "{} rx  {} tx  {} irq  {} refused",
+                            queue.rx_frames,
+                            queue.tx_frames,
+                            queue.interrupts,
+                            queue.rx_refused_frames
+                        )),
+                    ]),
+                    Line::from(vec![
+                        Span::raw("       "),
+                        Span::styled(
+                            format!(
+                                "{} sock  {} shut  {}B win  {} ack  {} winupd  {} rexmit",
+                                queue.tcp_sockets,
+                                queue.tcp_receive_backpressured_sockets,
+                                queue.tcp_receive_window_bytes,
+                                queue.tcp_acks_sent,
+                                queue.tcp_window_updates_sent,
+                                queue.tcp_retransmits_sent
+                            ),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                    ]),
+                ]
             }));
             lines
         }

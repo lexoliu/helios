@@ -160,6 +160,20 @@ pub struct TcpSegmentOutcome {
     pub reset: Option<TcpReset>,
 }
 
+/// What one acknowledgement put on the wire was for.
+///
+/// A pure ACK is indistinguishable from a window update on the wire, so
+/// the socket says which it meant. A receiver that stops making progress
+/// while its window stays shut is a different fault from one whose window
+/// reopened and whose update never left the guest, and only this
+/// separates them (#143).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TcpAckQueued {
+    /// The acknowledgement carries a receive window larger than the one
+    /// the peer was last told about.
+    pub reopened_window: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TcpReset {
     pub local: TcpEndpoint,
@@ -687,6 +701,12 @@ where
     time_wait_deadline_nanos: Option<u64>,
     unacked_receive_segments: u8,
     pending_window_update_bytes: u32,
+    /// Whether the acknowledgement this socket owes exists to
+    /// reopen its receive window rather than to acknowledge data.
+    /// Read once, when the ACK is actually put on the wire, so the
+    /// count reflects window updates *sent* and not window updates
+    /// merely wanted.
+    pending_ack_reopens_window: bool,
     /// IPv4 TTL / IPv6 hop limit stamped on every frame this socket emits.
     hop_limit: u8,
 }
@@ -822,6 +842,7 @@ where
             time_wait_deadline_nanos: None,
             unacked_receive_segments: 0,
             pending_window_update_bytes: 0,
+            pending_ack_reopens_window: false,
             hop_limit: crate::DEFAULT_HOP_LIMIT,
         }
     }
@@ -1045,9 +1066,22 @@ where
     /// Consumes one owed acknowledgement. A frame carries exactly one,
     /// so a socket owing duplicates stays pending until each has been
     /// put on the wire.
-    pub fn mark_ack_queued(&mut self) {
+    /// Consumes one owed acknowledgement and reports whether that
+    /// frame is the window update the peer is waiting on. Only the
+    /// first frame of a duplicate-ACK run can be: the duplicates behind
+    /// it repeat the same window.
+    pub fn mark_ack_queued(&mut self) -> TcpAckQueued {
         self.pending_acks = self.pending_acks.saturating_sub(1);
         self.delayed_ack_deadline_nanos = None;
+        TcpAckQueued {
+            reopened_window: core::mem::take(&mut self.pending_ack_reopens_window),
+        }
+    }
+
+    /// The receive window this socket is currently advertising, in
+    /// bytes rather than in the header's scaled units.
+    pub fn advertised_receive_window_bytes(&self) -> u32 {
+        self.local_receive_window_bytes()
     }
 
     pub fn pending_ack_options(&self, now_nanos: u64) -> TcpHeaderOptions {
@@ -1672,7 +1706,9 @@ where
         let drained_segments = self.drain_contiguous_out_of_order();
         self.consume_pending_receive_fin(now_nanos);
         self.refresh_advertised_window();
-        if drained_segments != 0 || self.should_advertise_window_update(previous_window) {
+        let reopens_window = self.should_advertise_window_update(previous_window);
+        if drained_segments != 0 || reopens_window {
+            self.pending_ack_reopens_window |= reopens_window;
             self.request_ack();
         }
     }
@@ -1911,6 +1947,7 @@ where
         self.time_wait_deadline_nanos = None;
         self.unacked_receive_segments = 0;
         self.pending_window_update_bytes = 0;
+        self.pending_ack_reopens_window = false;
     }
 
     fn discard_acked_segments(&mut self, acknowledgement: u32) {
