@@ -801,10 +801,13 @@ jobs:
           HELIOS_WORKLOAD_BENCH_NET_BACKEND: ${{ matrix.net-backend }}
           HELIOS_WORKLOAD_BENCH_RUNTIME_DIR: ${{ env.BENCH_RUNTIME_DIR }}
           HELIOS_WORKLOAD_BENCH_ACCEL: ${{ matrix.accel }}
-          # The network workloads are the only ones whose failure leaves
-          # nothing behind to read, so every boot writes a capture of
-          # both directions into its own runtime directory.
-          HELIOS_WORKLOAD_BENCH_NET_PCAP: "1"
+          # No capture here. The network workloads are the only ones
+          # whose failure leaves nothing behind to read, but QEMU's
+          # netfilters attach to a single-queue netdev only, and this
+          # lane's whole point is a multi-queue tap — so a capture and
+          # this lane are mutually exclusive.
+          # `HELIOS_WORKLOAD_BENCH_NET_PCAP=1` takes one on any
+          # single-queue run; see docs/networking.md.
         run: |
           # Without this the step reports tee's status, not the
           # command's, and a runner script that fails is invisible.

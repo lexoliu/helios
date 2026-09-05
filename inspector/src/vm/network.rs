@@ -547,6 +547,14 @@ pub(crate) enum VmNetworkError {
 
     #[error("--net-pcap path {path} is not valid UTF-8, which QEMU object properties require")]
     PcapPathNotUtf8 { path: PathBuf },
+
+    #[error(
+        "--net-pcap cannot capture a netdev serving {queue_pairs} queue pairs: QEMU's netfilters \
+         attach to a single-queue netdev only, and one that serves more rejects the filter with \
+         `multiqueue is not supported`. Capture with --net-queues 1, or take the multi-queue \
+         measurement without a capture"
+    )]
+    PcapOnMultiQueueNetdev { queue_pairs: u16 },
 }
 
 /// Failures of the privileged `net-setup` / `net-teardown` helpers.
@@ -882,6 +890,13 @@ impl VmNetwork {
             .pcap
             .as_deref()
             .map(|path| {
+                // QEMU attaches a netfilter to one queue only, and a
+                // netdev with more rejects it outright, so a capture
+                // asked for beside multiqueue has to be named here
+                // rather than left to kill QEMU during bring-up.
+                if queue_pairs > 1 {
+                    return Err(VmNetworkError::PcapOnMultiQueueNetdev { queue_pairs });
+                }
                 let path = path
                     .to_str()
                     .ok_or_else(|| VmNetworkError::PcapPathNotUtf8 {
@@ -1648,6 +1663,37 @@ mod tests {
         assert_eq!(
             rendered.packet_dump(),
             Some("filter-dump,id=netdump0,netdev=net0,file=/tmp/helios.pcap,maxlen=65550")
+        );
+    }
+
+    /// QEMU's netfilters attach to a single-queue netdev only: asked to
+    /// dump a multi-queue one it answers `multiqueue is not supported`
+    /// and exits before the guest boots, which is a bring-up failure
+    /// with nothing in it naming the capture. The combination is
+    /// refused here instead, the way every other combination a backend
+    /// cannot satisfy is.
+    #[test]
+    fn a_capture_is_refused_on_a_multi_queue_netdev() {
+        let mut network = request(VmNetworkBackend::Tap);
+        network.ifname = Some("helios0".to_owned());
+        network.queues = Some(4);
+        network.pcap = Some(PathBuf::from("/tmp/helios.pcap"));
+
+        let error = network
+            .render(
+                VmNetworkProfile::VirtioPci,
+                split_ring(),
+                4,
+                HostPlatform::LINUX,
+            )
+            .expect_err("a capture cannot be attached to a multi-queue netdev");
+
+        assert!(
+            matches!(
+                error,
+                VmNetworkError::PcapOnMultiQueueNetdev { queue_pairs: 4 }
+            ),
+            "the failure must name the queue pairs that make the capture impossible, got {error}"
         );
     }
 
