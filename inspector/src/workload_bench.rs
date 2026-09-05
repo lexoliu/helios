@@ -544,9 +544,10 @@ async fn run_shell_workload(
     if output.exit_code != 0 {
         write_guest_output(workload, &output.output.stdout, &output.output.stderr)?;
         bail!(
-            "workload {} exited with code {}",
+            "workload {} exited with code {}{}",
             workload.name,
-            output.exit_code
+            output.exit_code,
+            quoted_stderr(&output.output.stderr)
         );
     }
     Ok(WorkloadOutput {
@@ -581,9 +582,10 @@ async fn run_program_workload(
     if output.exit_code != 0 {
         write_guest_output(workload, &output.output.stdout, &output.output.stderr)?;
         bail!(
-            "workload {} exited with code {}",
+            "workload {} exited with code {}{}",
             workload.name,
-            output.exit_code
+            output.exit_code,
+            quoted_stderr(&output.output.stderr)
         );
     }
     Ok(WorkloadOutput {
@@ -916,6 +918,34 @@ fn write_record(record: &JsonlRecord<'_>) -> Result<()> {
     Ok(())
 }
 
+/// The tail of a failing workload's stderr, folded onto one line for the
+/// failure record.
+///
+/// The whole of both streams goes to the run log, but a lane keeps the
+/// JSONL, and a cell whose `error` says nothing beyond "exited with code
+/// 1" cost run 33959252438 a diagnosis it could have carried itself
+/// (#150). An empty stream is said to be empty rather than left out.
+fn quoted_stderr(stderr: &[u8]) -> String {
+    /// Enough for a usage line, a `perror` line or a Rust `Error:` line;
+    /// the run log holds the rest.
+    const KEEP_CHARS: usize = 400;
+    let text = String::from_utf8_lossy(stderr);
+    let folded = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if folded.is_empty() {
+        return "; its stderr was empty".to_owned();
+    }
+    let count = folded.chars().count();
+    if count <= KEEP_CHARS {
+        return format!("; stderr: {folded}");
+    }
+    let start = folded
+        .char_indices()
+        .nth(count - KEEP_CHARS)
+        .map(|(index, _)| index)
+        .expect("the tail starts inside the folded stderr");
+    format!("; stderr (last {KEEP_CHARS} chars): …{}", &folded[start..])
+}
+
 /// Prints a failing workload's own output, named and labelled.
 ///
 /// A workload that exits non-zero used to surface as nothing but its
@@ -969,6 +999,24 @@ fn git_sha() -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A failed cell keeps only its `error` string, so the message has to
+    /// carry the guest's own complaint (#150).
+    #[test]
+    fn a_failed_cell_quotes_the_workload_stderr() {
+        assert_eq!(quoted_stderr(b""), "; its stderr was empty");
+        assert_eq!(
+            quoted_stderr(b"Error: tcp connect failed for 10.77.0.1:5001\n"),
+            "; stderr: Error: tcp connect failed for 10.77.0.1:5001"
+        );
+        let long = "x".repeat(500);
+        let quoted = quoted_stderr(long.as_bytes());
+        assert!(
+            quoted.starts_with("; stderr (last 400 chars): \u{2026}"),
+            "the tail must say it is a tail, got {quoted}"
+        );
+        assert!(quoted.ends_with(&"x".repeat(400)));
+    }
 
     #[test]
     fn manifest_contains_expected_workload_classes() {

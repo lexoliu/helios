@@ -159,7 +159,7 @@ below are rendered from, and why:
 | `instance-startup-100`, `instance-startup-500` | Helios | The user-memory pool does not grow with the guest, so the hundredth spawn is refused with a typed `SpawnErrorKind::OutOfMemory` (#130). Their Linux halves are skipped by name: a cell whose Helios half cannot be measured has nothing to compare against. |
 | `tcp-throughput`, `wasi-tcp-throughput`, `wasix-tcp-throughput` | Helios | The guest receive path stops answering and the workload's own deadline fails it (#143). |
 | `curl-http-throughput` | Helios | Never reached: the `net` class spent its share of the Helios side's budget on the three cells above and was killed at 589 s, so this one is recorded as unmeasured rather than left out. |
-| `tcp-latency` | all three | Exits non-zero on Helios, on Linux + Wasmtime and on native Linux alike, so the fault is in the workload or the host echo server rather than in the guest (#150). |
+| `tcp-latency` | all three | The driver bound the host echo server to 127.0.0.1 while every side reaches the host at the lane's `net_host` (10.77.0.1 on this lane), so no side could connect and all three exited non-zero (#150, fixed since). |
 
 The refusal behind #130 is correct; the density claim of #28 stays
 unmeasured until the pool's relationship to guest memory is settled.
