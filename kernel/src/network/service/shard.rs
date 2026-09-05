@@ -15,6 +15,13 @@
 //! [`NetworkShardSet::notify_arrivals`] additionally wakes the owning
 //! processor when it is not the one that drained, so a parked executor
 //! runs the released waiter instead of sleeping to its own deadline.
+//!
+//! A frame arrival is not the only producer of that signal. A read that
+//! relieves a shard's receive backpressure
+//! ([`NetworkShardSet::with_handle_receive_drain`]) raises it too,
+//! because until the application makes room the shard refuses every
+//! frame and the packet pump has nothing else to wake it.
+//!
 //! Nothing in this module spins, and no shard lock is ever held across
 //! an await point.
 
@@ -421,13 +428,14 @@ pub(super) struct NetworkShardSet {
     pub(super) listener_slots: ReplicaSlots<MAX_TCP_LISTENER_HANDLES>,
     /// Slots for bound datagram sockets, for the same reason.
     pub(super) udp_slots: ReplicaSlots<MAX_UDP_SOCKET_HANDLES>,
-    /// Raised whenever any shard takes a frame.
+    /// Raised whenever any shard makes receive-side progress.
     ///
-    /// A replicated socket has no single shard to watch, so this is what
-    /// its operations park on. Raising it costs one atomic increment per
-    /// receive batch, and the waiters it releases are the accept and
-    /// datagram-receive calls of server sockets.
-    pub(super) replica_arrival: ProgressSignal,
+    /// Two kinds of waiter have no single shard to watch. A replicated
+    /// socket's accept and datagram-receive calls do not know which
+    /// shard their next connection or datagram will hash to, and the
+    /// packet pump serves every shard at once. Raising it costs one
+    /// atomic increment per receive batch.
+    pub(super) any_arrival: ProgressSignal,
 }
 
 impl ShardArrivals {
@@ -490,7 +498,7 @@ impl NetworkShardSet {
             // Slot zero is the DHCP client, which every shard reserves
             // so a replicated bind cannot land on top of it.
             udp_slots: ReplicaSlots::new(INTERNAL_UDP_RESERVED_SLOTS),
-            replica_arrival: ProgressSignal::new(),
+            any_arrival: ProgressSignal::new(),
         }
     }
 
@@ -669,13 +677,14 @@ impl NetworkShardSet {
         }
     }
 
-    /// Samples the set-wide arrival signal, for an operation on a
-    /// socket that lives on every shard.
+    /// Samples the set-wide arrival signal, for a waiter that belongs
+    /// to no single shard: an operation on a socket that lives on every
+    /// shard, or the packet pump, which serves them all.
     #[inline]
-    pub(super) fn replica_wait(&self) -> ShardWait {
+    pub(super) fn any_shard_wait(&self) -> ShardWait {
         ShardWait {
             target: WaitTarget::AnyShard,
-            mark: self.replica_arrival.mark(),
+            mark: self.any_arrival.mark(),
         }
     }
 
@@ -684,7 +693,7 @@ impl NetworkShardSet {
     pub(super) fn arrival_for(&self, target: WaitTarget) -> &ProgressSignal {
         match target {
             WaitTarget::Shard(idx) => self.arrival(idx),
-            WaitTarget::AnyShard => &self.replica_arrival,
+            WaitTarget::AnyShard => &self.any_arrival,
         }
     }
 
@@ -711,18 +720,67 @@ impl NetworkShardSet {
         if arrivals.is_empty() {
             return;
         }
-        let current = cpu.current_processor();
         for shard_idx in arrivals.iter() {
-            self.arrival(shard_idx).signal();
-            let owner = self.owner_processor(shard_idx);
-            if owner != current {
-                cpu.wake_processor(owner);
-            }
+            self.raise_shard_progress(shard_idx, cpu);
         }
         // A replicated socket's operations watch the whole set, because
         // the shard their next connection or datagram lands on is not
-        // known until its flow is hashed.
-        self.replica_arrival.signal();
+        // known until its flow is hashed, and so does the packet pump,
+        // which produces for every shard.
+        self.any_arrival.signal();
+    }
+
+    /// Raises one shard's arrival signal and pulls the owning processor
+    /// out of its idle park when this is not that processor.
+    fn raise_shard_progress<CpuImpl: Cpu>(&self, shard_idx: usize, cpu: &CpuImpl) {
+        self.arrival(shard_idx).signal();
+        let owner = self.owner_processor(shard_idx);
+        if owner != cpu.current_processor() {
+            cpu.wake_processor(owner);
+        }
+    }
+
+    /// Runs `f` against the shard owning `handle`, and signals that
+    /// shard when the call relieved its receive backpressure.
+    ///
+    /// A frame arrival is not the only thing that unblocks a shard. A
+    /// stack whose receive queue is full refuses every frame offered to
+    /// it, so the packet pump receives nothing, transmits nothing and
+    /// parks — and the only event that can make the stack take a frame
+    /// again is the application read that makes room. That read happens
+    /// on the socket's own task, under this lock, and produces no frame
+    /// of its own, so it has to raise the signal itself: without it the
+    /// pump sleeps to the next protocol deadline, which for a pure
+    /// receiver is the DHCP retransmit interval a second away, while
+    /// the peer sits window-blocked (#107).
+    ///
+    /// The signal is raised after the lock is released, so a woken
+    /// waiter never contends with the drain that woke it.
+    pub(super) fn with_handle_receive_drain<H, R, CpuImpl>(
+        &self,
+        handle: H,
+        cpu: &CpuImpl,
+        f: impl FnOnce(&mut NetworkShard) -> R,
+    ) -> R
+    where
+        H: Into<ShardHandle>,
+        CpuImpl: Cpu,
+    {
+        let shard_idx = self.shard_idx_for_handle(handle);
+        let (result, relieved) = {
+            let mut shard = self.shard_at(shard_idx).lock();
+            let backpressured = shard.stack.receive_backpressured();
+            let result = f(&mut shard);
+            (
+                result,
+                backpressured && !shard.stack.receive_backpressured(),
+            )
+        };
+        if relieved {
+            self.raise_shard_progress(shard_idx, cpu);
+            self.any_arrival.signal();
+        }
+        result
     }
 
     /// Places one received frame in the shard that owns its local port.

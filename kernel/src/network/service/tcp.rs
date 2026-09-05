@@ -461,7 +461,7 @@ where
             // and then visits the rest, and the wait watches the whole
             // set because the next SYN's shard is not known until its
             // flow is hashed.
-            let wait = self.inner.state.replica_wait();
+            let wait = self.inner.state.any_shard_wait();
             let start = self.accepting_shard_idx();
             self.drive_tcp().await?;
             let accepted = self
@@ -614,10 +614,12 @@ where
     ) -> Result<TcpReadProgress, TcpError> {
         let started = self.profile_start();
         let now = StackInstant::from_nanos(self.now_nanos());
-        let read = self
-            .inner
-            .state
-            .with_handle(stream, |state| state.poll_tcp_read(stream, max_bytes, now))?;
+        let read =
+            self.inner
+                .state
+                .with_handle_receive_drain(stream, &self.inner.cpu, |state| {
+                    state.poll_tcp_read(stream, max_bytes, now)
+                })?;
         self.record_tcp_read_progress(profile_prefix, started, &read);
         Ok(read)
     }
@@ -630,9 +632,12 @@ where
     ) -> Result<TcpReadIntoProgress, TcpError> {
         let started = self.profile_start();
         let now = StackInstant::from_nanos(self.now_nanos());
-        let read = self.inner.state.with_handle(stream, |state| {
-            state.poll_tcp_read_into(stream, buffer, now)
-        })?;
+        let read =
+            self.inner
+                .state
+                .with_handle_receive_drain(stream, &self.inner.cpu, |state| {
+                    state.poll_tcp_read_into(stream, buffer, now)
+                })?;
         self.record_tcp_read_into_progress(profile_prefix, started, &read);
         Ok(read)
     }
@@ -1026,9 +1031,11 @@ where
         let tcp_finished = self.profile_start();
         if let Some(probe) = tcp_read_probe {
             tcp_read_started = self.profile_start();
-            tcp_read = Some(self.inner.state.with_handle(probe.stream, |state| {
-                state.poll_tcp_read(probe.stream, probe.max_bytes, now)
-            }));
+            tcp_read = Some(self.inner.state.with_handle_receive_drain(
+                probe.stream,
+                &self.inner.cpu,
+                |state| state.poll_tcp_read(probe.stream, probe.max_bytes, now),
+            ));
             tcp_read_finished = self.profile_start();
         }
         self.record_network_profile_between(source.tcp_drive_phase(), tcp_started, tcp_finished);

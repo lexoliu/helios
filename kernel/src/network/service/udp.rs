@@ -310,7 +310,7 @@ where
             // so the walk starts at this processor's own and the wait
             // watches the whole set. Nothing here owes a retransmission,
             // so the only other bound is the caller's deadline.
-            let wait = self.inner.state.replica_wait();
+            let wait = self.inner.state.any_shard_wait();
             let start = self.receiving_shard_idx();
             self.drive_udp().await?;
             let received = self.inner.state.find_in_replicas(start, |state| {
