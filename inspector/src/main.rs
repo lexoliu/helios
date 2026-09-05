@@ -125,18 +125,19 @@ pub(crate) struct TracingCommand {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    match args.command {
-        Some(Command::Vm(command)) => vm::run(*command),
-        command => run_serial(args.serial, into_session_command(command)),
-    }
-}
-
-fn run_serial(serial: SerialOptions, command: Option<SessionCommand>) -> Result<()> {
-    let device = serial.device.as_deref().ok_or_else(|| {
+    let session = match args.command {
+        Some(Command::Vm(command)) => return vm::run(*command),
+        Some(Command::Shell(command)) => Some(SessionCommand::Shell(command)),
+        Some(Command::Tracing(command)) => Some(SessionCommand::Tracing(command)),
+        Some(Command::Stats) => Some(SessionCommand::Stats),
+        Some(Command::Repl) => Some(SessionCommand::Repl),
+        None => None,
+    };
+    let device = args.serial.device.as_deref().ok_or_else(|| {
         anyhow::anyhow!("--device is required unless using `helios-inspector vm`")
     })?;
-    let client = connect_client(device, serial.baud, serial.boot_sync)?;
-    run_connected(client, command)
+    let client = connect_client(device, args.serial.baud, args.serial.boot_sync)?;
+    run_connected(client, session)
 }
 
 pub(crate) fn connect_client(
@@ -226,19 +227,6 @@ async fn write_trace_log(
         })?;
     }
     Ok(())
-}
-
-fn into_session_command(command: Option<Command>) -> Option<SessionCommand> {
-    match command {
-        Some(Command::Shell(command)) => Some(SessionCommand::Shell(command)),
-        Some(Command::Tracing(command)) => Some(SessionCommand::Tracing(command)),
-        Some(Command::Stats) => Some(SessionCommand::Stats),
-        Some(Command::Repl) => Some(SessionCommand::Repl),
-        Some(Command::Vm(_)) => {
-            unreachable!("vm command must be handled before connecting transport")
-        }
-        None => None,
-    }
 }
 
 fn run_interruptible(command: impl std::future::Future<Output = Result<()>>) -> Result<()> {

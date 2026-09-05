@@ -39,7 +39,12 @@ pub async fn run(client: &mut RpcClient) -> Result<()> {
         .await
         {
             Some(UiEvent::Key(key)) => {
-                if app.handle_key(key) {
+                let quit = matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
+                    || matches!(
+                        key.code,
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL)
+                    );
+                if quit {
                     break;
                 }
             }
@@ -89,14 +94,6 @@ impl App {
             last_updated: None,
             status: "live stats view; press q to return to the shell".to_owned(),
         }
-    }
-
-    fn handle_key(&mut self, key: KeyEvent) -> bool {
-        matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
-            || matches!(
-                key.code,
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL)
-            )
     }
 
     fn should_refresh(&self) -> bool {
@@ -165,12 +162,15 @@ fn draw_summary(frame: &mut ratatui::Frame<'_>, area: Rect, sample: &stats::Samp
         Some(&format_wall_clock(sample.wall_clock)),
         Color::Cyan,
     );
+    let cores = &sample.processors;
+    let cores_detail =
+        (cores.online != cores.configured).then(|| format!("{} online", cores.online));
     render_card(
         frame,
         cards[1],
         "Cores",
-        &core_count_value(sample),
-        core_count_detail(sample).as_deref(),
+        &cores.configured.to_string(),
+        cores_detail.as_deref(),
         Color::Green,
     );
     render_card(
@@ -185,7 +185,7 @@ fn draw_summary(frame: &mut ratatui::Frame<'_>, area: Rect, sample: &stats::Samp
         frame,
         cards[3],
         "Memory",
-        &memory.card_value(),
+        &memory.available_label(),
         Some(&memory.card_detail()),
         memory.accent(sample.memory.pressure),
     );
@@ -731,13 +731,6 @@ impl MemoryView {
         }
     }
 
-    fn card_value(&self) -> String {
-        match self.available_bytes() {
-            Some(available_bytes) => format!("{} free", format_bytes(available_bytes)),
-            None => "unreported".to_owned(),
-        }
-    }
-
     fn card_detail(&self) -> String {
         match self.total_bytes {
             Some(total_bytes) => format!("{} total", format_bytes(total_bytes)),
@@ -863,15 +856,6 @@ fn busiest_core_text(sample: &stats::Sample) -> String {
         .max_by_key(|processor| processor.busy)
         .map(|processor| format!("cpu{}", processor.id))
         .unwrap_or_else(|| "n/a".to_owned())
-}
-
-fn core_count_value(sample: &stats::Sample) -> String {
-    sample.processors.configured.to_string()
-}
-
-fn core_count_detail(sample: &stats::Sample) -> Option<String> {
-    (sample.processors.online != sample.processors.configured)
-        .then(|| format!("{} online", sample.processors.online))
 }
 
 fn cpu_color(busy: u16) -> Color {
