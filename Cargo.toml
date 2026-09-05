@@ -7,13 +7,7 @@ resolver = "2"
 [workspace.package]
 edition = "2024"
 
-# AGENTS.md §3 requires async trait methods to spell out the returned future
-# and its bounds (`fn op(&self) -> impl Future<Output = ...> + Send + '_`)
-# instead of using `async fn` in a trait definition. `manual_async_fn` asks for
-# exactly the opposite, so it is the one clippy lint this repository turns off.
-[workspace.lints.clippy]
-manual_async_fn = "allow"
-
+[workspace.lints]
 
 [package]
 name = "helios"
