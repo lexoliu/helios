@@ -366,8 +366,9 @@ just test-units
 
 `just lint` is `tools/fmt.sh --check` plus `cargo clippy … -D warnings` over
 the host crates, each guest program, and the three bare-metal targets.
-`just test-units` runs the `hal`, `virtio`, `netstack`, `kernel` and
-`workspace-root` unit tests and the `hal_layering` test that enforces §1.
+`just test-units` runs the `hal`, `virtio`, `netstack`, `kernel`,
+`inspector-protocol` and `workspace-root` unit tests and the
+`hal_layering` test that enforces §1.
 
 CI (`.github/workflows/ci.yml`) runs the same recipes, one lane each, so a
 red lane names the surface that broke:
