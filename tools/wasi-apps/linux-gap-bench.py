@@ -38,6 +38,18 @@ HTTP_LARGE_PAYLOAD_FILE = "payload-64m.bin"
 HTTP_PAYLOAD = b"helios-linux-gap:ok\n"
 HTTP_LARGE_PAYLOAD_BYTES = DEFAULT_PAYLOAD_BYTES
 HTTP_LARGE_PAYLOAD_CHUNK = bytes(range(251))
+# Where the host-side HTTP and TCP servers listen.
+#
+# Which host address the guest dials is a property of the packet path
+# its virtio-net device sits on, not of this script. Slirp translates
+# the guest's 10.0.2.2 into the host's loopback, so a loopback-bound
+# server answers. A tap puts the guest on a real bridge, where the
+# address it dials is the bridge's own; a loopback-bound server is not
+# listening there, the host kernel answers the SYN with a RST, and the
+# workload reports `ErrorCode::ConnectionRefused`. Listening on every
+# address is the one bind that serves both paths. The ports are
+# ephemeral and the servers live only for the run.
+HOST_SERVER_BIND_ADDRESS = "0.0.0.0"
 DEFAULT_MAX_HOST_LOAD_PER_CPU = 0.75
 TOP_CPU_PROCESS_LIMIT = 8
 DEFAULT_HELIOS_TIMEOUT_SECONDS = 600
@@ -302,7 +314,7 @@ def format_load(value: float | None) -> str:
 
 def start_host_http(root: Path) -> tuple[socketserver.TCPServer, int]:
     handler = lambda *args, **kwargs: QuietHttpHandler(*args, directory=str(root), **kwargs)
-    server = socketserver.TCPServer(("127.0.0.1", 0), handler)
+    server = socketserver.TCPServer((HOST_SERVER_BIND_ADDRESS, 0), handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return server, int(server.server_address[1])
@@ -1588,7 +1600,9 @@ def main() -> None:
         host_http_url = f"http://{args.helios_host_http_host}:{port}/{HTTP_PAYLOAD_FILE}"
         local_http_url = f"http://127.0.0.1:{port}/{HTTP_PAYLOAD_FILE}"
     if needs_tcp and (not args.skip_helios or not args.skip_linux):
-        tcp_server, port = start_tcp_throughput_server("127.0.0.1", 0, HTTP_LARGE_PAYLOAD_BYTES)
+        tcp_server, port = start_tcp_throughput_server(
+            HOST_SERVER_BIND_ADDRESS, 0, HTTP_LARGE_PAYLOAD_BYTES
+        )
         host_tcp_host = args.helios_host_tcp_host
         host_tcp_port = port
     linux_tcp_port = host_tcp_port if needs_tcp and not args.skip_linux else None
