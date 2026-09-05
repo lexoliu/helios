@@ -152,9 +152,6 @@ SECTIONS
     KEEP(*(.trap.continue)); /* for _continue_trap routine (vectored mode only) */
     KEEP(*(.trap.rust));     /* for _start_trap_rust Rust function */
     KEEP(*(.trap .trap.*));  /* Other .trap symbols at the end */
-    /* trapframe's assembly entry uses a single `j trap_handler`, so its
-       `.text` must stay within ±1 MiB of the Rust trap wrapper. */
-    *libtrapframe-*.rlib:(.text)
 
     *(.text.abort);
     *(.text .text.*);
