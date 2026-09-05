@@ -686,6 +686,45 @@ where
     hop_limit: u8,
 }
 
+/// Why a [`TcpSocket`] moved from one [`TcpState`] to another.
+///
+/// Every transition records one of these, so a packet capture can be
+/// matched against the route the state machine actually took instead of
+/// the route its output shape suggests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TcpStateChangeReason {
+    /// A listening socket was opened.
+    Listen,
+    /// An active open queued its SYN.
+    Connect,
+    /// A listener's child socket was created for an inbound SYN.
+    Accept,
+    /// The `TIME-WAIT` 2MSL timer elapsed.
+    TimeWaitExpired,
+    /// A segment exceeded [`TCP_MAX_RETRANSMISSIONS`] retransmissions.
+    RetransmissionLimit,
+    /// `SYN-SENT` received an acceptable RST.
+    SynSentReset,
+    /// `SYN-SENT` received an acceptable SYN-ACK.
+    SynSentEstablished,
+    /// `SYN-RECEIVED` received an in-window RST.
+    SynReceivedReset,
+    /// `SYN-RECEIVED` received the ACK completing the handshake.
+    SynReceivedEstablished,
+    /// A synchronised state received an in-window RST.
+    PeerReset,
+    /// A synchronised state received an in-window SYN.
+    PeerSyn,
+    /// The peer's FIN was consumed in sequence.
+    PeerFin,
+    /// The application closed its send side.
+    LocalClose,
+    /// The peer acknowledged our FIN.
+    FinAcknowledged,
+    /// The socket was aborted locally.
+    Abort,
+}
+
 impl<C> TcpSocket<C>
 where
     C: CongestionControl,
@@ -747,7 +786,7 @@ where
     pub fn listen(local: TcpEndpoint, congestion: C) -> Self {
         let mut socket = Self::closed(congestion);
         socket.local = Some(local);
-        socket.state = TcpState::Listen;
+        socket.set_state(TcpState::Listen, TcpStateChangeReason::Listen);
         socket
     }
 
@@ -760,7 +799,7 @@ where
         let mut socket = Self::closed(congestion);
         socket.local = Some(local);
         socket.remote = Some(remote);
-        socket.state = TcpState::SynSent;
+        socket.set_state(TcpState::SynSent, TcpStateChangeReason::Connect);
         socket.send_next = initial_sequence.wrapping_add(1);
         socket.send_unacknowledged = initial_sequence;
         socket
@@ -776,7 +815,7 @@ where
         let mut socket = Self::closed(congestion);
         socket.local = Some(local);
         socket.remote = Some(remote);
-        socket.state = TcpState::SynReceived;
+        socket.set_state(TcpState::SynReceived, TcpStateChangeReason::Accept);
         socket.receive_next = receive_next;
         socket.send_next = initial_sequence.wrapping_add(1);
         socket.send_unacknowledged = initial_sequence;
@@ -785,6 +824,32 @@ where
 
     pub const fn state(&self) -> TcpState {
         self.state
+    }
+
+    /// The single place [`TcpSocket::state`] changes.
+    ///
+    /// Routing every transition through here keeps the debug-level
+    /// record complete: a socket that leaves the stack's endpoint index
+    /// has, by construction, logged the reason it reached
+    /// [`TcpState::Closed`].
+    fn set_state(&mut self, next: TcpState, reason: TcpStateChangeReason) {
+        let previous = self.state;
+        if previous == next {
+            return;
+        }
+        self.state = next;
+        tracing::debug!(
+            ?previous,
+            ?next,
+            ?reason,
+            local = ?self.local,
+            remote = ?self.remote,
+            send_unacknowledged = self.send_unacknowledged,
+            send_next = self.send_next,
+            receive_next = self.receive_next,
+            bytes_in_flight = self.bytes_in_flight,
+            "TCP state change"
+        );
     }
 
     pub const fn local_endpoint(&self) -> Option<TcpEndpoint> {
@@ -1176,7 +1241,7 @@ where
                 .time_wait_deadline_nanos
                 .is_some_and(|deadline| now_nanos >= deadline)
         {
-            self.state = TcpState::Closed;
+            self.set_state(TcpState::Closed, TcpStateChangeReason::TimeWaitExpired);
             self.time_wait_deadline_nanos = None;
         }
     }
@@ -1417,7 +1482,7 @@ where
         in_flight.sent_at_nanos = now_nanos;
         in_flight.retransmissions = in_flight.retransmissions.saturating_add(1);
         if in_flight.retransmissions > TCP_MAX_RETRANSMISSIONS {
-            self.state = TcpState::Closed;
+            self.set_state(TcpState::Closed, TcpStateChangeReason::RetransmissionLimit);
             self.bytes_in_flight = 0;
             if let Some(in_flight) = self.in_flight.as_mut() {
                 in_flight.clear();
@@ -1556,7 +1621,7 @@ where
                 {
                     return TcpSegmentOutcome::default();
                 }
-                self.state = TcpState::Closed;
+                self.set_state(TcpState::Closed, TcpStateChangeReason::SynSentReset);
                 TcpSegmentOutcome {
                     recovery: Some(
                         self.congestion.on_congestion_event(
@@ -1588,7 +1653,10 @@ where
                     packet.options.timestamp(),
                     false,
                 );
-                self.state = TcpState::Established;
+                self.set_state(
+                    TcpState::Established,
+                    TcpStateChangeReason::SynSentEstablished,
+                );
                 self.pending_acks = self.pending_acks.max(1);
                 TcpSegmentOutcome {
                     recovery: action,
@@ -1599,7 +1667,7 @@ where
             }
             TcpState::SynReceived if packet.flags.contains(TcpFlags::RST) => {
                 if self.receive_sequence_acceptable(packet.sequence, receive_sequence_len(packet)) {
-                    self.state = TcpState::Closed;
+                    self.set_state(TcpState::Closed, TcpStateChangeReason::SynReceivedReset);
                 }
                 TcpSegmentOutcome::default()
             }
@@ -1619,7 +1687,10 @@ where
                     packet.options.timestamp(),
                     false,
                 );
-                self.state = TcpState::Established;
+                self.set_state(
+                    TcpState::Established,
+                    TcpStateChangeReason::SynReceivedEstablished,
+                );
                 TcpSegmentOutcome {
                     recovery: action,
                     readable: false,
@@ -1637,7 +1708,7 @@ where
                     if self
                         .receive_sequence_acceptable(packet.sequence, receive_sequence_len(packet))
                     {
-                        self.state = TcpState::Closed;
+                        self.set_state(TcpState::Closed, TcpStateChangeReason::PeerReset);
                         return TcpSegmentOutcome {
                             recovery: Some(self.congestion.on_congestion_event(
                                 CongestionEvent::RetransmissionTimeout { now_nanos },
@@ -1664,7 +1735,7 @@ where
                     return TcpSegmentOutcome::default();
                 }
                 if packet.flags.contains(TcpFlags::SYN) {
-                    self.state = TcpState::Closed;
+                    self.set_state(TcpState::Closed, TcpStateChangeReason::PeerSyn);
                     return TcpSegmentOutcome {
                         recovery: Some(self.congestion.on_congestion_event(
                             CongestionEvent::RetransmissionTimeout { now_nanos },
@@ -1739,15 +1810,16 @@ where
     }
 
     pub fn close_send(&mut self) {
-        self.state = match self.state {
+        let next = match self.state {
             TcpState::Established => TcpState::FinWait1,
             TcpState::CloseWait => TcpState::LastAck,
             state => state,
         };
+        self.set_state(next, TcpStateChangeReason::LocalClose);
     }
 
     pub fn abort(&mut self) {
-        self.state = TcpState::Closed;
+        self.set_state(TcpState::Closed, TcpStateChangeReason::Abort);
         self.bytes_in_flight = 0;
         self.receive_queue = None;
         self.receive_queued_bytes = 0;
@@ -1948,9 +2020,13 @@ where
             .saturating_add(u64::from(acked.saturating_add(probe_acked)));
         if self.fin_queued && sequence_leq(self.send_next, acknowledgement) {
             match self.state {
-                TcpState::FinWait1 => self.state = TcpState::FinWait2,
+                TcpState::FinWait1 => {
+                    self.set_state(TcpState::FinWait2, TcpStateChangeReason::FinAcknowledged);
+                }
                 TcpState::Closing => self.enter_time_wait(now_nanos),
-                TcpState::LastAck => self.state = TcpState::Closed,
+                TcpState::LastAck => {
+                    self.set_state(TcpState::Closed, TcpStateChangeReason::FinAcknowledged);
+                }
                 _ => {}
             }
         }
@@ -2308,8 +2384,12 @@ where
         self.receive_fin_sequence = None;
         self.receive_next = self.receive_next.wrapping_add(1);
         match self.state {
-            TcpState::Established => self.state = TcpState::CloseWait,
-            TcpState::FinWait1 => self.state = TcpState::Closing,
+            TcpState::Established => {
+                self.set_state(TcpState::CloseWait, TcpStateChangeReason::PeerFin);
+            }
+            TcpState::FinWait1 => {
+                self.set_state(TcpState::Closing, TcpStateChangeReason::PeerFin);
+            }
             TcpState::FinWait2 => self.enter_time_wait(now_nanos),
             _ => {}
         }
@@ -2555,7 +2635,7 @@ where
     }
 
     fn enter_time_wait(&mut self, now_nanos: u64) {
-        self.state = TcpState::TimeWait;
+        self.set_state(TcpState::TimeWait, TcpStateChangeReason::PeerFin);
         self.time_wait_deadline_nanos = Some(now_nanos.saturating_add(TCP_TIME_WAIT_NANOS));
     }
 

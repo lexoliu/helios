@@ -64,7 +64,7 @@ pub use stack::{
 pub use tcp::{TCP_RECEIVE_WINDOW_BYTES, TCP_TRANSMIT_BUFFER_BYTES};
 pub use tcp::{
     TcpEndpoint, TcpReset, TcpSegmentBudget, TcpSegmentOutcome, TcpSocket, TcpState,
-    TcpTransmitSegment,
+    TcpStateChangeReason, TcpTransmitSegment,
 };
 pub use types::{
     EthernetAddress, IpAddress, IpCidr, Ipv4Address, Ipv4Cidr, Ipv6Address, Ipv6Cidr, Ipv6Scope,

@@ -213,6 +213,15 @@ __helios_aarch64_swap_fault_resume:
 // a small runtime stack cannot overflow it, and returning is a plain
 // `msr spsel, #1`. PSTATE.I stays set for the whole handler, so the
 // frame below is never re-entered.
+//
+// Like the synchronous entry it saves the whole FP/SIMD file. An
+// interrupt lands on arbitrary kernel code, and kernel code uses NEON:
+// the checksum in `helios-netstack` accumulates in `q` registers across
+// several instructions, and the compiler emits vector moves for plain
+// data copies. `aarch64_handle_irq` is ordinary Rust that clobbers
+// those registers, so a handler that restored only the general-purpose
+// file would hand the interrupted code a corrupted vector accumulator
+// and a silently wrong result.
 __helios_aarch64_irq:
     msr spsel, #0
     sub sp, sp, #{irq_frame_bytes}
@@ -235,7 +244,45 @@ __helios_aarch64_irq:
     mrs x1, spsr_el1
     stp x30, x0, [sp, #0xf0]
     str x1, [sp, #0x100]
+    mrs x0, fpsr
+    mrs x1, fpcr
+    stp x0, x1, [sp, #0x108]
+    stp q0, q1, [sp, #0x120]
+    stp q2, q3, [sp, #0x140]
+    stp q4, q5, [sp, #0x160]
+    stp q6, q7, [sp, #0x180]
+    stp q8, q9, [sp, #0x1a0]
+    stp q10, q11, [sp, #0x1c0]
+    stp q12, q13, [sp, #0x1e0]
+    stp q14, q15, [sp, #0x200]
+    stp q16, q17, [sp, #0x220]
+    stp q18, q19, [sp, #0x240]
+    stp q20, q21, [sp, #0x260]
+    stp q22, q23, [sp, #0x280]
+    stp q24, q25, [sp, #0x2a0]
+    stp q26, q27, [sp, #0x2c0]
+    stp q28, q29, [sp, #0x2e0]
+    stp q30, q31, [sp, #0x300]
     bl aarch64_handle_irq
+    ldp x0, x1, [sp, #0x108]
+    msr fpsr, x0
+    msr fpcr, x1
+    ldp q0, q1, [sp, #0x120]
+    ldp q2, q3, [sp, #0x140]
+    ldp q4, q5, [sp, #0x160]
+    ldp q6, q7, [sp, #0x180]
+    ldp q8, q9, [sp, #0x1a0]
+    ldp q10, q11, [sp, #0x1c0]
+    ldp q12, q13, [sp, #0x1e0]
+    ldp q14, q15, [sp, #0x200]
+    ldp q16, q17, [sp, #0x220]
+    ldp q18, q19, [sp, #0x240]
+    ldp q20, q21, [sp, #0x260]
+    ldp q22, q23, [sp, #0x280]
+    ldp q24, q25, [sp, #0x2a0]
+    ldp q26, q27, [sp, #0x2c0]
+    ldp q28, q29, [sp, #0x2e0]
+    ldp q30, q31, [sp, #0x300]
     ldr x1, [sp, #0x100]
     ldp x30, x0, [sp, #0xf0]
     msr elr_el1, x0

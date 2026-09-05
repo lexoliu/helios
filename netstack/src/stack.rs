@@ -4892,6 +4892,22 @@ where
             return Ok(false);
         }
         if let Some(reset) = self.tcp_reset_response(source, destination, packet) {
+            // A segment whose four-tuple has no socket here. For an
+            // established connection that is always a defect — either
+            // the socket left the endpoint index, or the frame reached
+            // a stack that never owned the flow — and the RST tears
+            // down a healthy connection. `sockets` separates the two:
+            // a stack holding none of them was not the flow's owner.
+            tracing::debug!(
+                ?local_endpoint,
+                ?remote_endpoint,
+                flags = ?packet.flags,
+                sequence = packet.sequence,
+                acknowledgement = packet.acknowledgement,
+                payload_len = packet.payload.len(),
+                sockets = self.tcp.active_len(),
+                "TCP segment for an unknown four-tuple, answering with RST"
+            );
             self.queue_tcp(
                 reset.local,
                 reset.remote,

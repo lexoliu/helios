@@ -44,9 +44,8 @@ use spin::Once;
 const KERNEL_STACK_BYTES: usize = 4 * 1024 * 1024;
 const EXCEPTION_STACK_BYTES: usize = 64 * 1024;
 /// Bytes the IRQ entry reserves on the per-processor exception stack for
-/// `x0`-`x30`, `elr_el1` and `spsr_el1`, rounded up to the 16-byte stack
-/// alignment the architecture requires.
-const IRQ_FRAME_BYTES: usize = 272;
+/// `x0`-`x30`, `elr_el1`, `spsr_el1`, `fpsr`, `fpcr` and `q0`-`q31`.
+const IRQ_FRAME_BYTES: usize = 0x320;
 /// Bytes the synchronous-exception entry reserves for the complete
 /// interrupted context: `x0`-`x30`, `elr_el1`, `spsr_el1`, the
 /// interrupted `SP_EL1`, `q0`-`q31`, `fpsr` and `fpcr`. The whole
@@ -115,7 +114,36 @@ struct SyncTrapFrame {
     v: [u128; 32],
 }
 
+/// The interrupted context an IRQ saved.
+///
+/// The same context a synchronous exception saves, minus the
+/// interrupted `SP_EL1`: the IRQ entry never leaves `SP_EL1`, so there
+/// is nothing to record. The FP/SIMD file is saved for the same reason
+/// it is there — an interrupt lands on kernel code that keeps live
+/// state in `q` registers, and the handler is ordinary Rust that
+/// clobbers them.
+///
+/// Layout is pinned by `entry.S`; the assertions below keep the two from
+/// drifting apart.
+#[repr(C, align(16))]
+struct IrqTrapFrame {
+    /// `x0`-`x30`.
+    x: [u64; 31],
+    elr: u64,
+    spsr: u64,
+    fpsr: u64,
+    fpcr: u64,
+    /// `q0`-`q31`.
+    v: [u128; 32],
+}
+
 const _: () = {
+    assert!(core::mem::size_of::<IrqTrapFrame>() == IRQ_FRAME_BYTES);
+    assert!(core::mem::offset_of!(IrqTrapFrame, elr) == 0xf8);
+    assert!(core::mem::offset_of!(IrqTrapFrame, spsr) == 0x100);
+    assert!(core::mem::offset_of!(IrqTrapFrame, fpsr) == 0x108);
+    assert!(core::mem::offset_of!(IrqTrapFrame, fpcr) == 0x110);
+    assert!(core::mem::offset_of!(IrqTrapFrame, v) == 0x120);
     assert!(core::mem::size_of::<SyncTrapFrame>() == SYNC_FRAME_BYTES);
     assert!(core::mem::offset_of!(SyncTrapFrame, elr) == 0xf8);
     assert!(core::mem::offset_of!(SyncTrapFrame, spsr) == 0x100);

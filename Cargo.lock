@@ -1856,6 +1856,7 @@ dependencies = [
  "heapless",
  "helios-hal",
  "thiserror 2.0.18",
+ "tracing",
  "wide",
 ]
 
