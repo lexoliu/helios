@@ -1705,7 +1705,7 @@ where
             TcpState::SynSent if packet.flags.contains(TcpFlags::SYN.union(TcpFlags::ACK)) => {
                 if !self.syn_sent_ack_acceptable(packet.acknowledgement) {
                     return TcpSegmentOutcome {
-                        reset: self.syn_sent_unacceptable_ack_reset(packet.acknowledgement),
+                        reset: self.unacceptable_ack_reset(packet.acknowledgement),
                         ..TcpSegmentOutcome::default()
                     };
                 }
@@ -2000,10 +2000,6 @@ where
     fn syn_sent_ack_acceptable(&self, acknowledgement: u32) -> bool {
         sequence_lt(self.send_unacknowledged, acknowledgement)
             && sequence_leq(acknowledgement, self.send_next)
-    }
-
-    fn syn_sent_unacceptable_ack_reset(&self, acknowledgement: u32) -> Option<TcpReset> {
-        self.unacceptable_ack_reset(acknowledgement)
     }
 
     fn unacceptable_ack_reset(&self, acknowledgement: u32) -> Option<TcpReset> {

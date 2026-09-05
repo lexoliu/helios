@@ -984,7 +984,11 @@ impl PathMtuTable {
                 .iter()
                 .enumerate()
                 .min_by_key(|(index, entry)| {
-                    (entry.updated_at, key_distance(entry.key, key), *index)
+                    (
+                        entry.updated_at,
+                        entry.key.hash().abs_diff(key.hash()),
+                        *index,
+                    )
                 })
                 .map(|(index, _)| index)
                 .expect("full PMTU table must contain at least one entry");
@@ -1081,11 +1085,11 @@ impl Ipv4ReassemblyEntry {
         let end = offset
             .checked_add(payload_bytes.len())
             .unwrap_or_else(|| panic!("validated IPv4 fragment offset overflowed"));
-        let duplicate = self
+        if self
             .fragments
             .iter()
-            .find(|fragment| fragment.range_matches(offset, payload_bytes.as_ref()));
-        if let Some(_duplicate) = duplicate {
+            .any(|fragment| fragment.range_matches(offset, payload_bytes.as_ref()))
+        {
             if offset == 0
                 && self.has_header()
                 && self.header_bytes() != &packet_bytes[..packet.header_len]
@@ -1247,9 +1251,8 @@ impl Ipv4ReassemblyCache {
             self.remove_key(key);
             return Ipv4ReassemblyResult::InvalidFragment;
         }
-        let index = match self.entry_index_or_insert(key, now) {
-            Some(index) => index,
-            None => return Ipv4ReassemblyResult::CacheFull,
+        let Some(index) = self.entry_index_or_insert(key, now) else {
+            return Ipv4ReassemblyResult::CacheFull;
         };
         let header_added =
             if packet.fragment_offset_blocks == 0 && !self.entries[index].has_header() {
@@ -1362,7 +1365,7 @@ impl Ipv4ReassemblyCache {
             .min_by_key(|(index, entry)| {
                 (
                     entry.updated_at,
-                    reassembly_key_distance(entry.key, key),
+                    entry.key.hash().abs_diff(key.hash()),
                     *index,
                 )
             })
@@ -1539,7 +1542,12 @@ where
         let Some(socket) = self.get(index) else {
             panic!("TCP socket slab cannot index an unoccupied slot");
         };
-        let (endpoint_key, listener_key) = tcp_socket_index_keys(socket);
+        // A closed socket keeps neither key: nothing may look it up.
+        let (endpoint_key, listener_key) = if socket.state() == crate::TcpState::Closed {
+            (None, None)
+        } else {
+            tcp_socket_endpoint_keys(socket)
+        };
         if let Some(key) = endpoint_key {
             self.endpoint_index.insert(key, index);
         }
@@ -1839,10 +1847,6 @@ impl UdpSocketSlab {
 
     fn get_mut(&mut self, index: usize) -> Option<&mut UdpSocketState> {
         self.sockets.get_mut(index).and_then(Option::as_mut)
-    }
-
-    fn binding_free(&self, binding: UdpSocketBinding) -> bool {
-        !self.binding_overlaps(binding)
     }
 
     fn socket_for_packet(
@@ -2979,7 +2983,7 @@ where
     }
 
     pub fn udp_binding_free(&self, binding: UdpSocketBinding) -> bool {
-        self.udp.binding_free(binding)
+        !self.udp.binding_overlaps(binding)
     }
 
     pub fn take_udp(&mut self, socket: UdpSocketId) -> Result<Option<UdpReceive>, StackError> {
@@ -5858,16 +5862,6 @@ fn tcp_listener_addresses_overlap(left: TcpEndpoint, right: TcpEndpoint) -> bool
     }
 }
 
-fn tcp_socket_index_keys<C>(socket: &TcpSocket<C>) -> (Option<TcpEndpointKey>, Option<TcpEndpoint>)
-where
-    C: CongestionControl,
-{
-    if socket.state() == crate::TcpState::Closed {
-        return (None, None);
-    }
-    tcp_socket_endpoint_keys(socket)
-}
-
 fn tcp_socket_endpoint_keys<C>(
     socket: &TcpSocket<C>,
 ) -> (Option<TcpEndpointKey>, Option<TcpEndpoint>)
@@ -6228,14 +6222,6 @@ fn mix_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
 
 fn mix_u16(hash: u64, value: u16) -> u64 {
     mix_bytes(hash, &value.to_be_bytes())
-}
-
-fn key_distance(left: PathMtuKey, right: PathMtuKey) -> usize {
-    left.hash().abs_diff(right.hash())
-}
-
-fn reassembly_key_distance(left: Ipv4ReassemblyKey, right: Ipv4ReassemblyKey) -> usize {
-    left.hash().abs_diff(right.hash())
 }
 
 fn next_lower_pmtu_plateau(from: usize) -> Option<usize> {

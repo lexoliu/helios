@@ -175,10 +175,6 @@ impl Cubic {
         }
     }
 
-    fn reset_epoch(&mut self) {
-        self.epoch_start_nanos = None;
-    }
-
     fn update_cubic_window(&mut self, now_nanos: u64, acked_bytes: u32) {
         let epoch_start = *self.epoch_start_nanos.get_or_insert(now_nanos);
         if self.origin_point_cwnd == 0 {
@@ -257,7 +253,7 @@ impl CongestionControl for Cubic {
             self.mss * 2,
         );
         self.origin_point_cwnd = 0;
-        self.reset_epoch();
+        self.epoch_start_nanos = None;
         self.reno_floor.on_congestion_event(event);
         RecoveryAction {
             cwnd: self.congestion_window(),
