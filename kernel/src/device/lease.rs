@@ -98,8 +98,17 @@ impl DeviceWindow {
 
     /// The address a `bytes`-long span at `offset` within the window
     /// occupies.
+    ///
+    /// `offset` counts from the start of the window, not from the start
+    /// of the owner's linear memory: the window's own offset is what
+    /// turns one into the other, and forgetting it would map the device
+    /// over the owner's data.
     fn range_at(&self, offset: u64, bytes: u64) -> VirtRange {
-        let start = self.base.raw() as u64 + offset;
+        assert!(
+            offset + bytes <= self.bytes,
+            "a span of {bytes} bytes at {offset} runs past the device window"
+        );
+        let start = self.base.raw() as u64 + self.offset + offset;
         VirtRange::new(
             VirtAddr::new(usize::try_from(start).expect("a window sits inside the address space")),
             usize::try_from(bytes).expect("a window span fits the address space"),
@@ -232,8 +241,10 @@ impl GrantLease {
         if let Some(mapped) = self.regions[index] {
             return Ok(mapped);
         }
-        let bytes = (region.frame_count() as u64) * (PhysFrame::SIZE as u64);
-        let offset = self.carve(bytes, PhysFrame::SIZE as u64)?;
+        let granule = self.granule();
+        let bytes =
+            ((region.frame_count() as u64) * (PhysFrame::SIZE as u64)).next_multiple_of(granule);
+        let offset = self.carve(bytes, granule)?;
         let virt = self.window.range_at(offset, bytes);
         (device_vm_hooks().map_device)(virt, region)?;
         let mapped = MappedRegion {
@@ -262,12 +273,12 @@ impl GrantLease {
             return Err(GrantError::BudgetExhausted);
         }
         let budget = self.device.grant.dma();
-        let frame = PhysFrame::SIZE as u64;
-        let bytes = bytes.next_multiple_of(frame);
+        let granule = self.granule();
+        let bytes = bytes.next_multiple_of(granule);
         if self.pinned_bytes + bytes > budget.byte_budget {
             return Err(GrantError::BudgetExhausted);
         }
-        let offset = self.carve(bytes, align.max(frame))?;
+        let offset = self.carve(bytes, align.max(granule))?;
         let virt = self.window.range_at(offset, bytes);
         let first = (device_vm_hooks().commit_contiguous)(
             virt,
@@ -332,6 +343,17 @@ impl GrantLease {
     /// whoever the next owner is.
     pub fn reclaim(self) {
         drop(self);
+    }
+
+    /// The smallest unit the address space can change a mapping at,
+    /// which is what every region and buffer is aligned and sized to.
+    fn granule(&self) -> u64 {
+        let granule = (device_vm_hooks().mapping_granule)();
+        assert!(
+            granule >= PhysFrame::SIZE as u64 && granule.is_power_of_two(),
+            "an address space maps at a power-of-two granule of at least one frame, not {granule}"
+        );
+        granule
     }
 
     /// Carve `bytes` at `align` out of the window.

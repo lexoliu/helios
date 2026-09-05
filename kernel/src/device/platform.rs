@@ -35,6 +35,14 @@ pub struct DeviceVmHooks {
     pub commit_contiguous: fn(VirtRange, PageFlags, u64) -> Result<PhysFrame, AddressSpaceError>,
     /// Release backing [`Self::commit_contiguous`] installed.
     pub decommit: fn(VirtRange) -> Result<(), AddressSpaceError>,
+    /// The smallest unit at which this address space can change a
+    /// mapping, in bytes.
+    ///
+    /// Never smaller than a [`PhysFrame`], and larger on a machine whose
+    /// pages are: a device window carved at a finer granularity than
+    /// this would put two regions in one page, and changing either would
+    /// change both.
+    pub mapping_granule: fn() -> u64,
 }
 
 /// The interrupt controller's masking surface.
@@ -204,11 +212,16 @@ pub(crate) mod test_hooks {
         RECORDING.with(|recording| recording.borrow_mut().unmasked.push(source));
     }
 
+    fn mapping_granule() -> u64 {
+        PhysFrame::SIZE as u64
+    }
+
     static VM: DeviceVmHooks = DeviceVmHooks {
         map_device,
         unmap_device,
         commit_contiguous,
         decommit,
+        mapping_granule,
     };
 
     static INTERRUPTS: DeviceInterruptHooks = DeviceInterruptHooks { mask, unmask };

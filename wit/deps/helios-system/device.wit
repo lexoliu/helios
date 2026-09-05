@@ -1,0 +1,175 @@
+package helios:system@0.1.0;
+
+/// One device the kernel has handed to this instance, whole.
+///
+/// Helios drives virtio itself. Hardware outside that ecosystem is
+/// driven from here instead: the kernel discovers the device, bundles
+/// its physical ranges, its interrupts and what it may reach when it
+/// masters the bus into a grant, and hands that grant to exactly one
+/// instance. A driver that gets a register wrong faults in its own
+/// instance and is restarted; it does not take the kernel with it.
+///
+/// Registers are not reached through this interface. `map-region`
+/// places the device's own frames inside this instance's linear memory
+/// and hands back the offset they landed at, so a register access is an
+/// ordinary load or store. A call per register would cost more than the
+/// access it wraps and is deliberately not offered.
+///
+/// What the sandbox buys is memory isolation and a cheap restart. It
+/// does not confine the *bus*: unless the platform put the device behind
+/// a translation unit, a driver that programs a bad descriptor reaches
+/// all of memory. `confined` says which of the two this grant is.
+interface device {
+  /// Why a request was refused.
+  enum error {
+    /// No device with this name was discovered.
+    not-found,
+    /// Another instance already holds the device.
+    already-claimed,
+    /// The grant has no region or interrupt with this index.
+    no-such-index,
+    /// The window this instance's device mappings live in has no room
+    /// left.
+    window-exhausted,
+    /// The request exceeds the pinned-memory budget the kernel set for
+    /// this device.
+    budget-exhausted,
+    /// The alignment asked for is not a power of two.
+    bad-alignment,
+    /// The kernel could allocate the buffer but the device cannot
+    /// address it.
+    unreachable,
+    /// The address space refused the mapping.
+    mapping-failed,
+  }
+
+  /// How the hardware requires a region to be accessed.
+  enum memory-kind {
+    /// A register file. Accesses reach the device in program order,
+    /// exactly as wide as the instruction issued them, and are neither
+    /// cached, merged nor speculated.
+    %device,
+    /// Memory the device exposes and the processor may treat as RAM: a
+    /// framebuffer, an option ROM, a prefetchable aperture.
+    normal,
+  }
+
+  /// One of the device's physical ranges, as the platform described it.
+  record region {
+    /// Where the range starts in physical memory. A driver needs this
+    /// only to program an address the device itself will issue;
+    /// reaching the range is what `map-region` is for.
+    physical-address: u64,
+    /// How many bytes the range covers.
+    bytes: u64,
+    /// Whether the range is a register file or ordinary memory.
+    kind: memory-kind,
+    /// Whether the driver may write it.
+    writable: bool,
+    /// Whether reading past what was asked for is harmless.
+    prefetchable: bool,
+  }
+
+  /// Where a region ended up in this instance's linear memory.
+  record placement {
+    /// Byte offset of the mapping.
+    offset: u64,
+    /// How many bytes of linear memory the mapping covers, which is the
+    /// region rounded up to whole pages.
+    length: u64,
+  }
+
+  /// One delivery of one of the device's interrupts.
+  record interrupt-event {
+    /// Which of the grant's interrupts fired, as an index into the list
+    /// `interrupt-count` bounds. The platform's own numbering never
+    /// reaches the driver.
+    index: u32,
+    /// How many deliveries of this interrupt the kernel has forwarded,
+    /// this one included. A gap between two events is coalescing the
+    /// driver can measure: the device re-asserted before the driver
+    /// acknowledged the previous delivery.
+    sequence: u64,
+  }
+
+  /// A pinned, physically contiguous buffer the device reads and writes
+  /// directly.
+  ///
+  /// The pages come from this instance's own memory pool and count
+  /// against its accounting, so a driver that pins more than the machine
+  /// can spare is killed like any other instance that asked for too
+  /// much. A buffer lives as long as the grant does: a driver builds its
+  /// rings once, during its own bring-up.
+  resource dma-buffer {
+    /// Byte offset of the buffer in this instance's linear memory.
+    offset: func() -> u64;
+    /// How long the buffer is, rounded up to whole pages.
+    length: func() -> u64;
+    /// The address the device has to issue to reach the buffer. A
+    /// physical address on a machine with no translation unit in the
+    /// path, and an I/O virtual address on one that confines the device.
+    physical-address: func() -> u64;
+  }
+
+  /// One instance's exclusive hold on one device.
+  ///
+  /// Dropping the grant — or dying while holding it — masks every
+  /// source, unmaps every region and releases every buffer before the
+  /// device is offered to anyone else.
+  resource grant {
+    /// The platform's own path to the device.
+    name: func() -> string;
+
+    /// Every physical range the device answers on.
+    regions: func() -> list<region>;
+
+    /// Map the `index`-th region into this instance's linear memory, or
+    /// report where it already is.
+    ///
+    /// Asking twice is answered rather than refused: a driver that lost
+    /// track of an offset has not corrupted anything.
+    map-region: func(index: u32) -> result<placement, error>;
+
+    /// How many interrupts the device raises.
+    interrupt-count: func() -> u32;
+
+    /// Every delivery of every one of the device's interrupts.
+    ///
+    /// The kernel holds a source off at the controller the moment it
+    /// fires, so a level-triggered device cannot spin the machine while
+    /// this driver waits to be scheduled. The driver services the
+    /// device, calls `ack`, and calls `unmask` when it is ready to be
+    /// interrupted again.
+    interrupts: func() -> stream<interrupt-event>;
+
+    /// Acknowledge the delivery of `index`: the driver has read
+    /// whatever the device had to say, and a further assertion is a new
+    /// event. This does not unmask.
+    ack: func(index: u32) -> result<_, error>;
+
+    /// Hold `index` off at the controller.
+    mask: func(index: u32) -> result<_, error>;
+
+    /// Let the controller deliver `index` again.
+    unmask: func(index: u32) -> result<_, error>;
+
+    /// Pin a physically contiguous buffer the device can reach.
+    dma-alloc: func(bytes: u64, align: u64) -> result<dma-buffer, error>;
+
+    /// Whether the platform put this device behind a translation unit.
+    /// When it did not, the device reaches all of memory and a bad
+    /// descriptor is not confined by anything.
+    confined: func() -> bool;
+  }
+
+  /// Take exclusive ownership of the device `name` names.
+  ///
+  /// The second caller for a device that already has an owner is
+  /// refused rather than queued: a driver waiting for hardware another
+  /// driver holds is a provisioning mistake, not a shortage.
+  claim: func(name: string) -> result<grant, error>;
+
+  /// Every device discovery is willing to hand to a driver, whether or
+  /// not one holds it.
+  available: func() -> list<string>;
+}

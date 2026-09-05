@@ -2,6 +2,9 @@ mod compaction_tests;
 mod config;
 mod console;
 mod cpu;
+mod device;
+#[cfg(test)]
+mod device_tests;
 mod host_fs;
 #[cfg(test)]
 mod init_program;
@@ -15,6 +18,10 @@ mod swap;
 mod swap_tests;
 mod vmm;
 
+pub use device::{
+    HOSTED_DEVICE_INTERRUPT, HOSTED_DEVICE_NAME, device_address_space, device_registers,
+    hosted_device_grants, interrupt_controller_counts,
+};
 pub use swap::{FileSwapBackend, FileSwapError, FileSwapToken};
 pub use vmm::HostedAddressSpace;
 
