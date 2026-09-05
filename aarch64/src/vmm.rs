@@ -1127,7 +1127,7 @@ extern "C" fn aarch64_mmap_remap(addr: *mut u8, size: usize, prot_flags: u32) ->
     let size = round_up_to_page(size);
     let address_space = user_as();
     let range = VirtRange::new(VirtAddr::new(addr as usize), size);
-    match decommit_committed_pages(address_space, range) {
+    match address_space.decommit_committed_subranges(range) {
         Ok(()) => {}
         Err(error) => {
             tracing::error!(
@@ -1176,7 +1176,7 @@ extern "C" fn aarch64_mprotect(ptr: *mut u8, size: usize, prot_flags: u32) -> c_
     let address_space = user_as();
     let range = VirtRange::new(VirtAddr::new(ptr as usize), size);
     if prot_flags == 0 {
-        return match decommit_committed_pages(address_space, range) {
+        return match address_space.decommit_committed_subranges(range) {
             Ok(()) => 0,
             Err(error) => {
                 tracing::error!(
@@ -1191,7 +1191,7 @@ extern "C" fn aarch64_mprotect(ptr: *mut u8, size: usize, prot_flags: u32) -> c_
         };
     }
     let flags = prot_to_flags(prot_flags);
-    match ensure_accessible(address_space, range, flags) {
+    match address_space.ensure_accessible_subranges(range, flags) {
         Ok(()) => 0,
         Err(error) => {
             tracing::error!(
@@ -1205,21 +1205,6 @@ extern "C" fn aarch64_mprotect(ptr: *mut u8, size: usize, prot_flags: u32) -> c_
             EINVAL
         }
     }
-}
-
-fn decommit_committed_pages(
-    address_space: &Aarch64UserAddressSpace,
-    range: VirtRange,
-) -> Result<(), AddressSpaceError> {
-    address_space.decommit_committed_subranges(range)
-}
-
-fn ensure_accessible(
-    address_space: &Aarch64UserAddressSpace,
-    range: VirtRange,
-    flags: PageFlags,
-) -> Result<(), AddressSpaceError> {
-    address_space.ensure_accessible_subranges(range, flags)
 }
 
 /// Runtime custom-virtual-memory hook table for the aarch64
