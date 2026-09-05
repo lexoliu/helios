@@ -157,9 +157,7 @@ def test_the_build_is_not_charged_to_any_class(driver, tmp_path, monkeypatch) ->
     monkeypatch.setenv("HELIOS_TEST_BUILD_SECONDS", "4")
     measurable = [entry for entry in WORKLOADS if entry["class"] != WEDGED]
 
-    log, elapsed = run_side(
-        driver, tmp_path / "out", per_class=60, side=4, workloads=measurable
-    )
+    log, elapsed = run_side(driver, tmp_path / "out", per_class=60, side=4, workloads=measurable)
 
     assert (tmp_path / "builds").read_text(encoding="utf-8").strip() == "built", (
         "the side must build once, before its budget starts"
