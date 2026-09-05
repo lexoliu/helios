@@ -3655,15 +3655,10 @@ where
     }
 
     fn drop(&mut self, resource: Resource<TcpSocket>) -> Result<()> {
-        let socket = self.table.delete(resource)?;
-        if let Some((service, stream)) = socket.take_connected_stream() {
-            // Closing is the instance's own work and is funded from its
-            // share; a refusal traps this instance instead of making the
-            // kernel carry a task it has no room for.
-            self.spawner().try_spawn_detached(async move {
-                service.tcp_close(stream).await;
-            })?;
-        }
+        // Deleting the handle is the whole of it: the stream is owned by
+        // `TcpSocketState`, which retires it when the last clone of this
+        // socket goes away.
+        self.table.delete(resource)?;
         Ok(())
     }
 }

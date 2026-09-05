@@ -71,6 +71,25 @@ pub(super) struct TcpSocketState {
     pub(super) send_buffer_size: u64,
 }
 
+/// The kernel stream a `wasi:sockets` socket owns dies with the socket.
+///
+/// `wasi:sockets` hands the guest a resource, and the guest is free to
+/// exit while still holding it: a component's resource destructors run
+/// when the *guest* drops a handle, and never when the store around it
+/// is torn down. Retiring the stream from a task spawned by the
+/// destructor loses it in exactly that case, and lost it in #184 — a
+/// connection stayed in its shard, holding its receive queue and its
+/// slab slot, after the program that opened it had exited. Ownership
+/// lives here instead: whatever ends this state's life ends the
+/// stream's, with nothing to schedule and nothing to await.
+impl Drop for TcpSocketState {
+    fn drop(&mut self) {
+        if let Some(stream) = self.stream.take() {
+            self.service.tcp_close(stream);
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct UdpSocket {
     pub(super) inner: Arc<Mutex<UdpSocketState>>,
@@ -597,14 +616,6 @@ impl TcpSocket {
         let state = self.inner.lock();
         let stream = state.stream.ok_or(socket_types::ErrorCode::InvalidState)?;
         Ok((state.service.clone(), stream))
-    }
-
-    pub(super) fn take_connected_stream(&self) -> Option<(ComponentHostNetworkService, u64)> {
-        let mut state = self.inner.lock();
-        state
-            .stream
-            .take()
-            .map(|stream| (state.service.clone(), stream))
     }
 
     pub(super) fn shutdown_receive(&self) -> core::result::Result<(), socket_types::ErrorCode> {
@@ -1654,16 +1665,10 @@ where
     }
 
     fn drop(&mut self, resource: Resource<TcpSocket>) -> Result<()> {
-        let socket = self.table.delete(resource)?;
-        if let Some((service, stream)) = socket.take_connected_stream() {
-            // Closing is the instance's own work, so it is funded from
-            // the instance's share like everything else it asked for.
-            // A refusal traps this instance rather than leaving the
-            // kernel to carry a task it has no room for.
-            self.spawner().try_spawn_detached(async move {
-                service.tcp_close(stream).await;
-            })?;
-        }
+        // Deleting the handle is the whole of it: the stream is owned by
+        // `TcpSocketState`, which retires it when the last clone of this
+        // socket goes away.
+        self.table.delete(resource)?;
         Ok(())
     }
 }

@@ -672,7 +672,7 @@ impl ComponentNetworkService for BenchNetworkService {
         Ok(())
     }
 
-    async fn tcp_close(&self, _stream: Self::TcpStream) {}
+    fn tcp_close(&self, _stream: Self::TcpStream) {}
 
     async fn udp_bind(&self, local_port: u16) -> Result<UdpBinding<Self::UdpSocket>, UdpError> {
         Ok(UdpBinding {

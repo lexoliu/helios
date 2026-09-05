@@ -457,6 +457,37 @@ impl WasixSocketFamily {
     }
 }
 
+/// A netstack TCP stream a preview1 descriptor owns.
+///
+/// The stream is retired when the last descriptor holding it goes away.
+/// That is the whole lifetime rule, and it covers every way a preview1
+/// socket can end: `fd_close` drops the table entry, `sock_shutdown`
+/// replaces it, an `exec` inherits a duplicate of it, and a program
+/// that simply exits takes its descriptor table with it. Retiring the
+/// stream from `fd_close` alone left the stream behind in that last
+/// case, which is how eleven connections outlived the programs that
+/// opened them in #184.
+pub(super) struct WasixOwnedTcpStream {
+    service: ComponentHostNetworkService,
+    stream: u64,
+}
+
+impl WasixOwnedTcpStream {
+    pub(super) fn new(service: ComponentHostNetworkService, stream: u64) -> Arc<Self> {
+        Arc::new(Self { service, stream })
+    }
+
+    pub(super) const fn id(&self) -> u64 {
+        self.stream
+    }
+}
+
+impl Drop for WasixOwnedTcpStream {
+    fn drop(&mut self) {
+        self.service.tcp_close(self.stream);
+    }
+}
+
 #[derive(Clone)]
 pub(super) enum WasixTcpSocket {
     Unconnected {
@@ -476,7 +507,7 @@ pub(super) enum WasixTcpSocket {
     },
     Connected {
         family: WasixSocketFamily,
-        stream: u64,
+        stream: Arc<WasixOwnedTcpStream>,
         peer_address: crate::NetworkIpAddress,
         peer_port: u16,
         options: WasixSocketOptions,
@@ -1445,7 +1476,7 @@ pub(super) fn p1_probe_descriptor(
                 WasixTcpSocket::Connected { stream, .. },
             ))),
             P1_EVENTTYPE_FD_READ | P1_EVENTTYPE_FD_WRITE,
-        ) => Ok(P1Probe::Network(P1NetworkProbe::TcpStream(*stream))),
+        ) => Ok(P1Probe::Network(P1NetworkProbe::TcpStream(stream.id()))),
         (
             Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
                 WasixTcpSocket::Listening { listener, .. },

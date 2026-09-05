@@ -2644,7 +2644,7 @@ mod tests {
         let tcp =
             Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(WasixTcpSocket::Connected {
                 family: WasixSocketFamily::Ipv4,
-                stream: 1,
+                stream: WasixOwnedTcpStream::new(crate::test_support::test_network_service(), 1),
                 peer_address: crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([
                     127, 0, 0, 1,
                 ])),
