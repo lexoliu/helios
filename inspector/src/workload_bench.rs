@@ -207,6 +207,15 @@ enum JsonlRecord<'a> {
     Run {
         schema_version: u16,
         git_sha: String,
+        /// The host CPU model this run was taken on.
+        ///
+        /// A shared CI runner does not pin the model, and two runs of one
+        /// lane on two models are two machines rather than one machine
+        /// twice: run 33990628290 reported every workload 20-40% faster
+        /// than run 33987950977 because it landed on a faster host. A
+        /// comparison across runs can only refuse that when each run
+        /// record names the host it ran on (#173).
+        host_cpu: String,
         vm: &'a VmProvenance,
         manifest: String,
         iterations: u16,
@@ -300,6 +309,7 @@ pub(crate) async fn run_inner(
     write_record(&JsonlRecord::Run {
         schema_version: 1,
         git_sha: git_sha().unwrap_or_else(|_| "unknown".to_owned()),
+        host_cpu: host_cpu()?,
         vm: provenance,
         manifest: manifest_path.display().to_string(),
         iterations: command.iterations,
@@ -1070,6 +1080,54 @@ fn write_guest_stream(sink: &mut impl std::io::Write, name: &str, bytes: &[u8]) 
         writeln!(sink)?;
     }
     Ok(())
+}
+
+/// The host CPU model, for the run record.
+///
+/// There is no fallback: a run record that named the architecture instead
+/// of the model would let a cross-run comparison believe two machines
+/// were one. Where the model cannot be read the run fails and says so.
+fn host_cpu() -> Result<String> {
+    #[cfg(target_os = "linux")]
+    {
+        const CPUINFO: &str = "/proc/cpuinfo";
+        let cpuinfo = fs::read_to_string(CPUINFO)
+            .with_context(|| format!("failed to read {CPUINFO} for the host CPU model"))?;
+        cpuinfo
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(key, _)| key.trim() == "model name")
+            .map(|(_, value)| value.trim().to_owned())
+            .filter(|model| !model.is_empty())
+            .with_context(|| format!("{CPUINFO} names no non-empty `model name`"))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        const KEY: &str = "machdep.cpu.brand_string";
+        let output = std::process::Command::new("sysctl")
+            .arg("-n")
+            .arg(KEY)
+            .output()
+            .with_context(|| format!("failed to spawn sysctl -n {KEY}"))?;
+        if !output.status.success() {
+            bail!("sysctl -n {KEY} exited with status {}", output.status);
+        }
+        let model = String::from_utf8(output.stdout)
+            .with_context(|| format!("sysctl -n {KEY} output was not UTF-8"))?
+            .trim()
+            .to_owned();
+        if model.is_empty() {
+            bail!("sysctl -n {KEY} printed nothing");
+        }
+        Ok(model)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        bail!(
+            "no host CPU model source on this platform: the run record needs /proc/cpuinfo \
+             (Linux) or sysctl machdep.cpu.brand_string (macOS)"
+        )
+    }
 }
 
 fn git_sha() -> Result<String> {
