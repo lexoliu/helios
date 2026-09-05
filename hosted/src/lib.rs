@@ -27,14 +27,10 @@ use config::HostedConfig;
 use runtime::HostedRuntime;
 
 pub fn main() {
-    install_panic_hook();
-    HostedRuntime::new(HostedConfig::from_env()).run();
-}
-
-fn install_panic_hook() {
     std::panic::set_hook(Box::new(|info| {
         helios_kernel::panic_log_message(PanicPayload(info.payload()), info.location());
     }));
+    HostedRuntime::new(HostedConfig::from_env()).run();
 }
 
 struct PanicPayload<'a>(&'a (dyn Any + Send));

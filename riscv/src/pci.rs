@@ -44,12 +44,11 @@ impl PciHostController {
             .and_then(|mut reg| reg.next())
             .map(|region| region.starting_address as usize)
             .unwrap_or_else(|| panic!("PCI ECAM host node is missing a CPU-addressable reg"));
-        let domain = parse_optional_u32_property(node.property("linux,pci-domain"))
-            .map(|domain| {
-                u16::try_from(domain)
-                    .unwrap_or_else(|_| panic!("PCI domain {domain} does not fit in u16"))
-            })
-            .unwrap_or(0);
+        let domain = node.property("linux,pci-domain").map_or(0, |property| {
+            let domain = read_be_u32(property.value);
+            u16::try_from(domain)
+                .unwrap_or_else(|_| panic!("PCI domain {domain} does not fit in u16"))
+        });
         let bus_range = parse_bus_range(node);
         let parent_address_cells = infer_parent_address_cells(node);
         let memory_windows = parse_memory_windows(node, parent_address_cells);
@@ -437,10 +436,6 @@ fn parse_memory_windows(
         "PCI host did not expose any memory-mapped ranges"
     );
     windows
-}
-
-fn parse_optional_u32_property(property: Option<fdt::node::NodeProperty<'_>>) -> Option<u32> {
-    property.map(|property| read_be_u32(property.value))
 }
 
 fn parse_cells_as_u64(bytes: &[u8]) -> u64 {

@@ -1084,7 +1084,10 @@ fn fatal_panic(info: &core::panic::PanicInfo<'_>) -> ! {
         let _ = writeln!(console, "{}", info.message());
     });
 
-    shutdown_machine()
+    // SBI shutdown is a request, not a guarantee: a firmware that refuses it
+    // returns here, and the hart must not run on past a fatal panic.
+    sbi_rt::system_reset(sbi_rt::Shutdown, sbi_rt::NoReason);
+    halt_forever()
 }
 
 fn mask_interrupts() {
@@ -1095,11 +1098,6 @@ fn mask_interrupts() {
         riscv::register::sie::clear_sext();
     }
     compiler_fence(Ordering::SeqCst);
-}
-
-fn shutdown_machine() -> ! {
-    sbi_rt::system_reset(sbi_rt::Shutdown, sbi_rt::NoReason);
-    halt_forever()
 }
 
 fn halt_forever() -> ! {

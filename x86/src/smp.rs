@@ -31,6 +31,7 @@ use x86_64::PhysAddr;
 use x86_64::VirtAddr;
 use x86_64::instructions::tlb;
 use x86_64::registers::control::Cr3;
+use x86_64::structures::paging::page_table::PageTableEntry;
 use x86_64::structures::paging::{
     FrameAllocator, Mapper, OffsetPageTable, Page, PageSize, PageTable, PageTableFlags, PhysFrame,
     Size2MiB, Size4KiB,
@@ -1172,7 +1173,7 @@ fn ensure_direct_mapped_leaf_entry(
     physical_memory_offset: usize,
     page: Page<Size4KiB>,
     frame_allocator: &mut DirectMappedFrameAllocator,
-) -> &mut x86_64::structures::paging::page_table::PageTableEntry {
+) -> &mut PageTableEntry {
     let p4 = current_level_4_table(physical_memory_offset);
     let p3 = next_table_mut(
         physical_memory_offset,
@@ -1209,7 +1210,7 @@ fn current_level_4_table(physical_memory_offset: usize) -> &'static mut PageTabl
 
 fn next_table_mut<'a>(
     physical_memory_offset: usize,
-    entry: &'a mut x86_64::structures::paging::page_table::PageTableEntry,
+    entry: &'a mut PageTableEntry,
     context: &str,
 ) -> &'a mut PageTable {
     assert!(!entry.is_unused(), "{context} was unexpectedly unmapped");
@@ -1227,7 +1228,7 @@ fn next_table_mut<'a>(
 
 fn next_or_split_p3_table<'a>(
     physical_memory_offset: usize,
-    entry: &'a mut x86_64::structures::paging::page_table::PageTableEntry,
+    entry: &'a mut PageTableEntry,
     frame_allocator: &mut DirectMappedFrameAllocator,
 ) -> &'a mut PageTable {
     if entry.flags().contains(PageTableFlags::HUGE_PAGE) {
@@ -1242,7 +1243,7 @@ fn next_or_split_p3_table<'a>(
 
 fn next_or_split_p2_table<'a>(
     physical_memory_offset: usize,
-    entry: &'a mut x86_64::structures::paging::page_table::PageTableEntry,
+    entry: &'a mut PageTableEntry,
     frame_allocator: &mut DirectMappedFrameAllocator,
 ) -> &'a mut PageTable {
     if entry.flags().contains(PageTableFlags::HUGE_PAGE) {
@@ -1257,7 +1258,7 @@ fn next_or_split_p2_table<'a>(
 
 fn split_p3_huge_page<'a>(
     physical_memory_offset: usize,
-    entry: &'a mut x86_64::structures::paging::page_table::PageTableEntry,
+    entry: &'a mut PageTableEntry,
     frame_allocator: &mut DirectMappedFrameAllocator,
 ) -> &'a mut PageTable {
     let original_flags = entry.flags();
@@ -1278,7 +1279,7 @@ fn split_p3_huge_page<'a>(
 
 fn split_p2_huge_page<'a>(
     physical_memory_offset: usize,
-    entry: &'a mut x86_64::structures::paging::page_table::PageTableEntry,
+    entry: &'a mut PageTableEntry,
     frame_allocator: &mut DirectMappedFrameAllocator,
 ) -> &'a mut PageTable {
     let original_flags = entry.flags();
