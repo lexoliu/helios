@@ -1,30 +1,42 @@
-"""The baseline image of a paired run: a second Helios checkout, built and
-timed beside the candidate in the same job.
+"""The baseline image of a paired run: a second Helios checkout whose
+guest is built and timed beside the candidate's, in the same job.
 
 A shared runner does not pin the CPU model, so two runs of one lane are
 two machines as often as they are one machine twice: run 33990628290
 reported every workload 20-40% faster than the `dev` run it was compared
 against, including workloads its change could not touch (#173). The
 answer is not a quieter runner but a second column taken on the same
-runner, in the same job, minutes apart from the first.
+machine.
 
-What the two images share, and therefore cannot explain a difference
-between them:
+The baseline checkout supplies a **guest**, never a harness. One harness
+times both images — this checkout's `tools/wasi-apps/workload-bench.sh`,
+its `helios-inspector` and its `helios-cli` — and an image is selected by
+`HELIOS_WORKSPACE_ROOT`, the checkout the inspector resolves the guest
+against. Two harnesses would compare the harnesses as much as the
+kernels, and the older one need not even work: run 33995029872 failed
+because the baseline checkout's inspector predated a fix to the host
+side.
+
+Shared, and therefore unable to explain a difference between the columns:
 
 - the host, its CPU model, its load and its thermal state;
 - the QEMU release, the accelerator, the vCPU count and the memory;
 - the network backend and the host HTTP, TCP and echo servers on it;
+- the harness: the benchmark script, the inspector binary that boots
+  both guests, and the `helios-cli` that signs their prebuilt `cwasm`
+  and builds their boot images;
 - the workload manifest, read from the candidate checkout for both;
 - everything under `artifacts/` that `tools/wasi-apps/build.sh` stages
   (the CPython root, the WASI tools, the WASIX programs), linked into the
   baseline worktree entry by entry rather than copied;
 - the vendored Wasmtime checkout, linked as the worktree's sibling so
-  that both kernels compile against one revision and the difference
-  between the columns is Helios's own.
+  that both kernels compile against one revision.
 
-What differs, and is therefore what the comparison measures: the kernel
-image, the bootfs it carries (the compiler plugin included), and the
-inspector that boots them — each built from its own checkout.
+Per side, and therefore what the comparison measures: the kernel image,
+the bootfs it carries (the compiler plugin included) and the guest
+programs its prebuild signs — each built from its own checkout, and each
+digested before the first boot so that two checkouts which turn out to
+be one build are refused rather than timed twice.
 """
 
 from __future__ import annotations

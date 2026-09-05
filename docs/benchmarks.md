@@ -287,18 +287,42 @@ within a few percent. The pull request's run had landed on a faster
 machine, and nothing in the comparison could see that (#173).
 
 The paired mode answers it by taking the second column on the same
-machine:
+machine, with the same harness:
 
 ```bash
 uv run helios-bench run --lane x86-64-kvm --out-dir … --baseline-ref
 ```
 
 Given a ref, `--baseline-ref` resolves it; given none, it means the merge
-base with `dev`, the commit the branch is a change to. The suite then
-checks that commit out as a git worktree under
-`target/perf-baselines/worktrees/<sha>/helios`, builds its guest image
-and its inspector there through the same `tools/wasi-apps/workload-bench.sh`
-that builds the candidate's, and times both.
+base with `dev`, the commit the branch is a change to. The suite checks
+that commit out as a git worktree under
+`target/perf-baselines/worktrees/<sha>/helios` and times its guest
+against the candidate's.
+
+The baseline checkout supplies a **guest**, never a harness. One harness
+times both images: the candidate's `tools/wasi-apps/workload-bench.sh`,
+its `helios-inspector` and its `helios-cli`. An image is selected with
+`HELIOS_WORKSPACE_ROOT`, the checkout the inspector resolves the guest
+against — the kernel artifact, the prebuild manifest, the bootfs sources
+and the program manifests — so the same inspector that boots a guest is
+the one that built it. (`vm build` also compiles the baseline checkout's
+own host tools; nothing built there runs, and the run pins
+`HELIOS_INSPECTOR_BIN` and `HELIOS_CLI_BIN` to the candidate's binaries
+so that it cannot.)
+
+| | Shared by both columns | Per side |
+| --- | --- | --- |
+| Host | CPU, load, thermal state, QEMU release, accelerator, vCPUs, memory, network backend and its host servers | — |
+| Harness | `workload-bench.sh`, `helios-inspector`, `helios-cli`, the workload manifest, the run's iteration count and budgets | — |
+| Guest inputs | everything `tools/wasi-apps/build.sh` stages under `artifacts/`, linked into the baseline worktree entry by entry; the vendored Wasmtime checkout, linked as the worktree's sibling | — |
+| Guest | — | the kernel image, the bootfs it carries, the compiler plugin, the guest programs the prebuild signs |
+
+Two checkouts that turn out to be one build are refused before the first
+boot: the suite asks the inspector for each image's guest artifact
+(`helios-inspector vm --arch … kernel-path`, so the mapping from
+architecture and profile to Cargo target and artifact name has one
+definition), digests both, and fails the run when they match. There is
+nothing for a comparison between one build and itself to say.
 
 Two guest images cannot share a guest, so the boot is the smallest unit
 the pairing has. A paired run therefore boots **one guest per workload
@@ -327,6 +351,14 @@ its run record carries both commits (`helios_git_sha` for the candidate,
 `baseline_git_sha` for the baseline). A run that was asked to pair and
 could not build or measure its baseline is a failed run, not a report
 with one column missing.
+
+A boot's unix sockets do not live in its runtime directory. That path is
+the caller's, and the paired layout nests it per image and per workload,
+which took it past `sockaddr_un::sun_path` and made QEMU refuse the
+monitor socket with both guest images already built. The inspector puts
+`debug.sock`, `monitor.sock` and `qmp.sock` in a short directory of its
+own under `$XDG_RUNTIME_DIR` and links it as `<runtime>/sockets`; see
+`docs/debug-serial.md`.
 
 `bench-suite.yml` runs a pull request in paired mode against
 `github.event.pull_request.base.sha`, and `workflow_dispatch` takes a

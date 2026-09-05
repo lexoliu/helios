@@ -41,7 +41,7 @@ def run_side(
     started = time.monotonic()
     log = driver.run_helios(
         Path("tools/wasi-apps/workloads.json"),
-        [driver.HeliosImage(name="helios", root=driver.repo_root(), out_dir=out_dir)],
+        [driver.HeliosImage(name="helios", workspace_root=driver.repo_root(), out_dir=out_dir)],
         1,
         WORKLOADS if workloads is None else workloads,
         "x86-64",

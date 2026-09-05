@@ -23,12 +23,19 @@ set -eu
 if [ -n "${HELIOS_WORKLOAD_BENCH_BUILD_ONLY:-}" ]; then
     sleep "$HELIOS_TEST_BUILD_SECONDS"
     echo built >> "$HELIOS_TEST_BUILD_LOG"
+    # The guest artifact this image would boot, standing in for the
+    # kernel: its content is the workspace root, so two images are two
+    # builds unless a test says otherwise.
+    printf '%s\n' "${HELIOS_TEST_KERNEL_CONTENT:-$HELIOS_WORKSPACE_ROOT}" \
+        > "$HELIOS_WORKSPACE_ROOT/kernel"
     exit 0
 fi
 log="$HELIOS_WORKLOAD_BENCH_LOG"
 mkdir -p "$(dirname "$log")"
 if [ -n "${HELIOS_TEST_ORDER:-}" ]; then
-    printf '%s %s\n' "$(basename "$PWD")" "$HELIOS_WORKLOAD_BENCH_WORKLOADS" >> "$HELIOS_TEST_ORDER"
+    # The harness that ran, the guest it was pointed at, and what it ran.
+    printf '%s %s %s\n' "$(basename "$PWD")" "$(basename "$HELIOS_WORKSPACE_ROOT")" \
+        "$HELIOS_WORKLOAD_BENCH_WORKLOADS" >> "$HELIOS_TEST_ORDER"
 fi
 if [ "$HELIOS_WORKLOAD_BENCH_CLASSES" = "@WEDGED@" ]; then
     sleep 600 &

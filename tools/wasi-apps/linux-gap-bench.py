@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import hashlib
 import html
 import http.server
 import json
@@ -399,7 +400,7 @@ def write_http_payloads(root: Path) -> None:
 
 @dataclass(frozen=True)
 class HeliosImage:
-    """One Helios guest image and inspector, and where its records land.
+    """One guest image the Helios side times, and where its records land.
 
     An ordinary run times one image: the checkout this driver lives in.
     A paired run times two, the candidate and a baseline built from
@@ -407,22 +408,20 @@ class HeliosImage:
     be seen on a shared runner where two runs of one lane may not even
     land on the same CPU model (#173).
 
-    What the two images share is everything outside the kernel: the host,
-    the QEMU release, the accelerator, the network backend and the host
-    servers on it, the workload manifest, and the WASI artifacts under
-    `artifacts/`, which are the same files linked into the baseline
-    worktree. What differs is the kernel image, the bootfs it carries
-    (the compiler plugin included) and the inspector that boots them,
-    each built from this image's own `root`.
+    An image is a *guest*, not a harness. Both images are booted by this
+    checkout's `workload-bench.sh` and this checkout's `helios-inspector`
+    and `helios-cli`; what an image contributes is the workspace root
+    those tools resolve the guest against, through `HELIOS_WORKSPACE_ROOT`
+    — the kernel image, the bootfs it carries, the compiler plugin, and
+    the guest programs the prebuild signs. Timing two guests with two
+    harnesses would compare the harnesses as much as the kernels, and the
+    older one need not even work: run 33995029872 died because the
+    baseline checkout's inspector predated a fix to the host side.
     """
 
     name: str
-    root: Path
+    workspace_root: Path
     out_dir: Path
-
-    @property
-    def script(self) -> Path:
-        return self.root / "tools" / "wasi-apps" / "workload-bench.sh"
 
     def log(self, key: str | None = None) -> Path:
         return self.out_dir / ("helios.jsonl" if key is None else f"helios-{key}.jsonl")
@@ -452,6 +451,18 @@ class HeliosUnit:
     names: list[str]
 
 
+class IdenticalHeliosImages(RuntimeError):
+    """A paired run whose two images are the same build.
+
+    The comparison exists to attribute a difference between the columns
+    to the difference between the commits. Two identical guest images
+    have nothing to attribute, so the run says so rather than reporting
+    the noise between one build and itself — which is also what a paired
+    run would silently become if both checkouts ever shared a target
+    directory or a workspace root.
+    """
+
+
 def helios_units(workloads: list[dict], paired: bool) -> list[HeliosUnit]:
     if paired:
         return [
@@ -464,12 +475,102 @@ def helios_units(workloads: list[dict], paired: bool) -> list[HeliosUnit]:
     return [HeliosUnit(key=name, classes=[name], names=names) for name, names in by_class.items()]
 
 
-# Environment variables that would make two images share one build.
-# `workload-bench.sh` resolves both against its own checkout, so a value
-# set for the whole process points the baseline at the candidate's
-# inspector or its target directory, and the paired run would time one
-# image twice without saying so.
-PER_IMAGE_ENVIRONMENT = ("HELIOS_INSPECTOR_BIN", "CARGO_TARGET_DIR")
+def workload_bench_script() -> Path:
+    """The one harness, this checkout's, whatever image it is timing."""
+    return repo_root() / "tools" / "wasi-apps" / "workload-bench.sh"
+
+
+def inspector_bin() -> Path:
+    return Path(
+        os.environ.get(
+            "HELIOS_INSPECTOR_BIN", str(repo_root() / "target" / "release" / "helios-inspector")
+        )
+    )
+
+
+def helios_cli_bin() -> Path:
+    return Path(
+        os.environ.get("HELIOS_CLI_BIN", str(repo_root() / "target" / "release" / "helios-cli"))
+    )
+
+
+def harness_environment(image: HeliosImage, paired: bool) -> dict[str, str]:
+    """What points one harness at one image's guest.
+
+    `HELIOS_WORKSPACE_ROOT` is the checkout the inspector resolves the
+    guest against: the kernel artifact, the prebuild manifest, the bootfs
+    sources and the program manifests. The two binary pins are the other
+    half of the same statement, and they are set only when there are two
+    checkouts to confuse: with one, this checkout's layout already
+    answers, and a lane that builds under another profile keeps doing so.
+    """
+    env = {"HELIOS_WORKSPACE_ROOT": str(image.workspace_root)}
+    if paired:
+        env["HELIOS_INSPECTOR_BIN"] = str(inspector_bin())
+        env["HELIOS_CLI_BIN"] = str(helios_cli_bin())
+    return env
+
+
+def guest_artifact(image: HeliosImage, arch: str, accel: str | None = None) -> Path:
+    """The guest kernel this image would boot.
+
+    Asked of the inspector rather than rebuilt here: the mapping from
+    architecture and profile to Cargo target and artifact name is the
+    inspector's, and a second copy of it in this file would be a second
+    thing to keep true.
+    """
+    inspector = inspector_bin()
+    env = os.environ.copy()
+    env["HELIOS_WORKSPACE_ROOT"] = str(image.workspace_root)
+    argv = [str(inspector), "vm", "--arch", arch, "--release"]
+    if accel:
+        # The lane's accelerator, for the same reason every boot names
+        # it: a resolved command needs one, and rediscovering it here
+        # could refuse on a host the boots are perfectly happy on.
+        argv.extend(["--accel", accel])
+    argv.append("kernel-path")
+    completed = subprocess.run(
+        argv,
+        cwd=repo_root(),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise HeliosRunFailed(
+            f"{inspector} vm kernel-path for image {image.name!r} exited with status "
+            f"{completed.returncode}: {completed.stderr.strip()}"
+        )
+    return Path(completed.stdout.strip())
+
+
+def guest_artifact_digest(
+    image: HeliosImage, arch: str, accel: str | None = None
+) -> tuple[Path, str]:
+    path = guest_artifact(image, arch, accel)
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return path, digest.hexdigest()
+
+
+def refuse_identical_images(
+    images: list[HeliosImage], arch: str, accel: str | None = None
+) -> None:
+    """Refuses a paired run that would time one build twice."""
+    seen: dict[str, tuple[str, Path]] = {}
+    for image in images:
+        path, digest = guest_artifact_digest(image, arch, accel)
+        if digest in seen:
+            other_name, other_path = seen[digest]
+            raise IdenticalHeliosImages(
+                f"images {other_name!r} and {image.name!r} are the same guest build "
+                f"(sha256 {digest}): {other_path} and {path}. A paired run compares two "
+                "guest images; there is no difference here to attribute to a commit."
+            )
+        seen[digest] = (image.name, path)
 
 
 def run_helios(
@@ -491,14 +592,6 @@ def run_helios(
     keep_going: bool,
 ) -> Path:
     paired = len(images) > 1
-    if paired:
-        shared = [name for name in PER_IMAGE_ENVIRONMENT if os.environ.get(name)]
-        if shared:
-            raise SystemExit(
-                "a paired run builds one image per checkout, so it cannot inherit "
-                + ", ".join(shared)
-                + ": both images would resolve to the same build"
-            )
     units = helios_units(workloads, paired)
 
     # Every image is built once, before the budget starts and outside
@@ -510,7 +603,13 @@ def run_helios(
     # thing the pairing exists to produce.
     if not skip_build:
         for image in images:
-            build_helios(image, arch, accel, build_timeout_seconds)
+            build_helios(image, arch, accel, build_timeout_seconds, paired)
+
+    if paired:
+        # Before the first boot, not after the run: two images that turn
+        # out to be one build make every number below a measurement of
+        # the machine, and the report would not say so.
+        refuse_identical_images(images, arch, accel)
 
     # The whole Helios side runs inside one budget, the way the Linux
     # side does. A guest that stops answering is bounded by the
@@ -547,6 +646,7 @@ def run_helios(
                 host_tcp_echo_port,
                 class_budget(remaining(), len(images), timeout_seconds),
                 keep_going,
+                paired,
             )
 
     try:
@@ -592,6 +692,7 @@ def run_helios(
                     host_tcp_echo_port,
                     budget,
                     keep_going,
+                    paired,
                 )
             except HeliosRunFailed as error:
                 if not keep_going:
@@ -674,20 +775,26 @@ def record_unmeasured(
 
 
 def build_helios(
-    image: HeliosImage, arch: str, accel: str | None, timeout_seconds: int
+    image: HeliosImage, arch: str, accel: str | None, timeout_seconds: int, paired: bool
 ) -> None:
-    """Builds the guest image and the inspector this image's boots reuse."""
+    """Builds the guest artifacts this image's boots reuse.
+
+    Run through this checkout's harness with the image's workspace root,
+    so the compile that produces a baseline guest is driven by the same
+    inspector that will boot it.
+    """
     env = os.environ.copy()
     env["HELIOS_WORKLOAD_BENCH_ARCH"] = arch
     if accel:
         env["HELIOS_WORKLOAD_BENCH_ACCEL"] = accel
     env["HELIOS_WORKLOAD_BENCH_BUILD_ONLY"] = "1"
     env.pop("HELIOS_WORKLOAD_BENCH_NO_BUILD", None)
+    env.update(harness_environment(image, paired))
     run_isolated(
-        [str(image.script)],
+        [str(workload_bench_script())],
         env=env,
         timeout_seconds=timeout_seconds,
-        cwd=image.root,
+        cwd=repo_root(),
     )
 
 
@@ -706,6 +813,7 @@ def run_helios_once(
     host_tcp_echo_port: int | None,
     timeout_seconds: int,
     keep_going: bool,
+    paired: bool,
 ) -> None:
     env = os.environ.copy()
     env["HELIOS_WORKLOAD_BENCH_ARCH"] = arch
@@ -748,11 +856,12 @@ def run_helios_once(
     # Everything this boot needs was built before the budget started.
     env["HELIOS_WORKLOAD_BENCH_NO_BUILD"] = "1"
     env.pop("HELIOS_WORKLOAD_BENCH_BUILD_ONLY", None)
+    env.update(harness_environment(image, paired))
     run_isolated(
-        [str(image.script)],
+        [str(workload_bench_script())],
         env=env,
         timeout_seconds=timeout_seconds,
-        cwd=image.root,
+        cwd=repo_root(),
     )
 
 
@@ -1925,10 +2034,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help=(
-            "Checkout of a second Helios commit to time against this one, on this "
-            "host and in this job. Its guest image and inspector are built there "
-            "and every workload is booted for both images back to back, so the "
-            "comparison between them carries no change of machine."
+            "Checkout of a second Helios commit whose guest image is timed against "
+            "this one, on this host and in this job. It supplies the guest and "
+            "nothing else: this checkout's harness, inspector and helios-cli boot "
+            "both images, back to back for every workload, so the comparison "
+            "carries no change of machine and no change of host tooling."
         ),
     )
     parser.add_argument(
@@ -2091,7 +2201,9 @@ def main() -> None:
         linux_provenance = None
         wasmtime_profiles = []
         if not args.skip_helios:
-            images = [HeliosImage(name="helios", root=repo_root(), out_dir=out_dir)]
+            images = [
+                HeliosImage(name="helios", workspace_root=repo_root(), out_dir=out_dir)
+            ]
             if args.helios_baseline_root is not None:
                 baseline_out_dir = args.helios_baseline_out_dir or out_dir.parent / "helios-baseline"
                 if not baseline_out_dir.is_absolute():
@@ -2101,7 +2213,7 @@ def main() -> None:
                 images.append(
                     HeliosImage(
                         name="helios-baseline",
-                        root=args.helios_baseline_root,
+                        workspace_root=args.helios_baseline_root,
                         out_dir=baseline_out_dir,
                     )
                 )
@@ -2191,7 +2303,7 @@ def main() -> None:
 if __name__ == "__main__":
     try:
         main()
-    except HeliosRunFailed as error:
+    except (HeliosRunFailed, IdenticalHeliosImages) as error:
         # A run that gave up says so in one line; the traceback of a
         # subprocess exit code told the reader nothing.
         raise SystemExit(str(error)) from error
