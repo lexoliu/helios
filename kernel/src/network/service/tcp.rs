@@ -1099,7 +1099,13 @@ where
             ));
             tcp_read_finished = self.profile_start();
         }
-        self.record_network_profile_between(source.tcp_drive_phase(), tcp_started, tcp_finished);
+        self.record_network_profile_events_bytes_between(
+            source.tcp_drive_phase(),
+            tcp_started,
+            tcp_finished,
+            0,
+            0,
+        );
         if let (Some(probe), Some(Ok(read))) = (tcp_read_probe, tcp_read.as_ref()) {
             self.record_tcp_read_progress_between(
                 probe.profile_prefix,
