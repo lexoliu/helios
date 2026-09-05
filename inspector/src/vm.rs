@@ -906,18 +906,12 @@ fn resolve(command: VmCommand) -> Result<ResolvedVmCommand> {
     let session_command = command.command.map(Into::into);
     let mut boot_programs = file.boot_programs;
     boot_programs.extend(command.boot_programs);
-    if matches!(
-        &session_command,
-        Some(ResolvedVmSessionCommand::WorkloadBench(_))
-    ) {
-        let Some(ResolvedVmSessionCommand::WorkloadBench(command)) = &session_command else {
-            unreachable!("workload-bench session command was already matched")
-        };
-        let required = crate::workload_bench::required_boot_programs(command)?;
-        extend_unique_boot_programs(
-            &mut boot_programs,
-            &required.iter().map(String::as_str).collect::<Vec<_>>(),
-        );
+    if let Some(ResolvedVmSessionCommand::WorkloadBench(bench)) = &session_command {
+        for program in crate::workload_bench::required_boot_programs(bench)? {
+            if !boot_programs.contains(&program) {
+                boot_programs.push(program);
+            }
+        }
     }
     let no_compiler_plugin = command.no_compiler_plugin || file.no_compiler_plugin.unwrap_or(false);
     let runtime_dir = command.runtime_dir.or(file.runtime_dir);
@@ -1004,14 +998,6 @@ fn resolve(command: VmCommand) -> Result<ResolvedVmCommand> {
         needs_qmp: matches!(session_command, Some(ResolvedVmSessionCommand::Balloon(_))),
         command: session_command,
     })
-}
-
-fn extend_unique_boot_programs(programs: &mut Vec<String>, required: &[&str]) {
-    for program in required {
-        if !programs.iter().any(|existing| existing == program) {
-            programs.push((*program).to_owned());
-        }
-    }
 }
 
 fn load_config_file(path: Option<&Path>) -> Result<VmConfigFile> {

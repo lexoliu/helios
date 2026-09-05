@@ -365,7 +365,14 @@ async fn run_shell_workload(
     workload: &Workload,
     command: &WorkloadBenchCommand,
 ) -> Result<WorkloadOutput> {
-    let script = render_helios_script(workload, command)?;
+    let script = render_helios_template(
+        workload
+            .command
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("workload {} is missing command", workload.name))?,
+        workload,
+        command,
+    )?;
     let started = Instant::now();
     let output = crate::programs::exec(
         client,
@@ -543,14 +550,6 @@ fn validate_workload_shape(workload: &Workload) -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn render_helios_script(workload: &Workload, command: &WorkloadBenchCommand) -> Result<String> {
-    let script = workload
-        .command
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("workload {} is missing command", workload.name))?;
-    render_helios_template(script, workload, command)
 }
 
 fn render_helios_template(

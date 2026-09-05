@@ -825,19 +825,7 @@ fn dispatch_payload<R, W>(
     path: Vec<usize>,
     payload: Bytes,
 ) {
-    let target = {
-        let mut active = active
-            .lock()
-            .unwrap_or_else(|_| panic!("active invocation table mutex poisoned"));
-        match active.get(&invocation).and_then(Weak::upgrade) {
-            Some(target) => Some(target),
-            None => {
-                active.remove(&invocation);
-                None
-            }
-        }
-    };
-    if let Some(target) = target {
+    if let Some(target) = resolve_invocation(active, invocation) {
         target.push_payload(path, payload);
     }
 }
@@ -847,8 +835,7 @@ fn dispatch_close<R, W>(
     invocation: u32,
     path: Vec<usize>,
 ) {
-    let target = resolve_invocation(active, invocation);
-    if let Some(target) = target {
+    if let Some(target) = resolve_invocation(active, invocation) {
         target.mark_closed(path);
     }
 }

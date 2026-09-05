@@ -102,7 +102,7 @@ pub fn run(mut client: RpcClient) -> Result<()> {
                         let output = result?;
                         terminal.write_output(&output.output)?;
                     }
-                    runtime::CommandRun::Interrupted => terminal.print_line("interrupted")?,
+                    runtime::CommandRun::Interrupted => terminal.print("interrupted\n")?,
                 }
             }
         }
@@ -159,13 +159,6 @@ impl InteractiveTerminal {
 
     fn print(&mut self, text: &str) -> Result<()> {
         write_stdout(text.as_bytes())
-    }
-
-    fn print_line(&mut self, line: &str) -> Result<()> {
-        let mut output = String::with_capacity(line.len() + 1);
-        output.push_str(line);
-        output.push('\n');
-        self.print(&output)
     }
 
     fn write_output(&mut self, output: &ExecOutput) -> Result<()> {
