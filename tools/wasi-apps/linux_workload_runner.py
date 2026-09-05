@@ -306,6 +306,27 @@ def validate_output(workload: dict, stdout: bytes, stderr: bytes) -> None:
         raise WorkloadFailed(f"workload {workload['name']} wrote stderr")
 
 
+# Enough for a usage line, a `perror` line or a Rust `Error:` line; the
+# run log holds the rest of both streams.
+STDERR_QUOTE_CHARS = 400
+
+
+def quoted_stderr(stderr: bytes) -> str:
+    """The tail of a failing workload's stderr, folded onto one line.
+
+    Both streams already go to the run log, but a lane keeps the JSONL,
+    and a cell whose `error` says nothing beyond "exited with code 1"
+    cost run 33959252438 a diagnosis it could have carried itself (#150).
+    An empty stream is said to be empty rather than left out.
+    """
+    folded = " ".join(stderr.decode("utf-8", errors="replace").split())
+    if not folded:
+        return "; its stderr was empty"
+    if len(folded) <= STDERR_QUOTE_CHARS:
+        return f"; stderr: {folded}"
+    return f"; stderr (last {STDERR_QUOTE_CHARS} chars): …{folded[-STDERR_QUOTE_CHARS:]}"
+
+
 def run_once(
     workload: dict,
     argv: list[str],
@@ -337,7 +358,10 @@ def run_once(
     if completed.returncode != 0:
         sys.stdout.buffer.write(completed.stdout)
         sys.stderr.buffer.write(completed.stderr)
-        raise WorkloadFailed(f"workload {workload['name']} exited with code {completed.returncode}")
+        raise WorkloadFailed(
+            f"workload {workload['name']} exited with code {completed.returncode}"
+            f"{quoted_stderr(completed.stderr)}"
+        )
     validate_output(workload, completed.stdout, completed.stderr)
     metrics = parse_metrics(completed.stdout.decode("utf-8", errors="replace"), workload["name"])
     return elapsed_ms, metrics

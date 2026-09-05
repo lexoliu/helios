@@ -32,7 +32,7 @@ from fedora_qemu_baseline import (
 
 # Helios inspector arch name -> Fedora guest arch name.
 LINUX_GUEST_ARCHES = {"aarch64": "aarch64", "x86-64": "x86_64"}
-from tcp_echo_server import start_tcp_echo_server
+from tcp_echo_server import TcpEchoServer, start_tcp_echo_server
 from tcp_throughput_server import DEFAULT_PAYLOAD_BYTES, start_tcp_throughput_server
 
 # Workload classes in the order the report lists them; each names the design
@@ -365,6 +365,19 @@ def start_host_http(root: Path) -> tuple[socketserver.TCPServer, int]:
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return server, int(server.server_address[1])
+
+
+def start_host_tcp_echo() -> tuple[TcpEchoServer, int]:
+    """Starts the round-trip echo server the `tcp-latency` workloads talk to.
+
+    Every guest reaches the host at the lane's `net_host` — 10.77.0.1 on
+    the tap lane, 10.0.2.2 on a user-net one — never at the host's own
+    loopback, so this binds every interface exactly as the HTTP and
+    throughput servers do. Bound to 127.0.0.1 it was unreachable from all
+    three sides at once, which is how the workload came back as `failed`
+    in every column of run 33959252438 (#150).
+    """
+    return start_tcp_echo_server(HOST_SERVER_BIND_ADDRESS, 0)
 
 
 def write_http_payloads(root: Path) -> None:
@@ -1906,7 +1919,7 @@ def main() -> None:
         host_tcp_host = args.helios_host_tcp_host
         host_tcp_port = port
     if needs_tcp_echo and (not args.skip_helios or not args.skip_linux):
-        tcp_echo_server, port = start_tcp_echo_server("127.0.0.1", 0)
+        tcp_echo_server, port = start_host_tcp_echo()
         host_tcp_host = args.helios_host_tcp_host
         host_tcp_echo_port = port
     linux_tcp_port = host_tcp_port if needs_tcp and not args.skip_linux else None
