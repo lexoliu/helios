@@ -34,10 +34,10 @@ WORKLOADS = [
 ]
 
 
-def boot_order(order_log: Path) -> list[tuple[str, str]]:
-    """(checkout, workloads) of every boot the driver made, in order."""
+def boot_order(order_log: Path) -> list[tuple[str, str, str]]:
+    """(harness, guest workspace, workloads) of every boot, in order."""
     return [
-        (line.split(" ", 1)[0], line.split(" ", 1)[1])
+        tuple(line.split(" ", 2))
         for line in order_log.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
@@ -49,6 +49,13 @@ def driver(tmp_path, monkeypatch):
     fake_checkout(tmp_path / "candidate")
     fake_checkout(tmp_path / "baseline")
     monkeypatch.setattr(module, "repo_root", lambda: tmp_path / "candidate")
+    # The real one asks this checkout's inspector where the guest kernel
+    # is; the stand-in writes one where the query would find it.
+    monkeypatch.setattr(
+        module,
+        "guest_artifact",
+        lambda image, arch, accel=None: image.workspace_root / "kernel",
+    )
     monkeypatch.setenv("HELIOS_TEST_WEDGE_PID_FILE", str(tmp_path / "wedge.pid"))
     monkeypatch.setenv("HELIOS_TEST_BUILD_LOG", str(tmp_path / "builds"))
     monkeypatch.setenv("HELIOS_TEST_BUILD_SECONDS", "0")
@@ -80,13 +87,17 @@ def run_side(driver, tmp_path, images: list) -> Path:
 
 def images_of(driver, tmp_path, paired: bool) -> list:
     images = [
-        driver.HeliosImage(name="helios", root=tmp_path / "candidate", out_dir=tmp_path / "out" / "helios")
+        driver.HeliosImage(
+            name="helios",
+            workspace_root=tmp_path / "candidate",
+            out_dir=tmp_path / "out" / "helios",
+        )
     ]
     if paired:
         images.append(
             driver.HeliosImage(
                 name="helios-baseline",
-                root=tmp_path / "baseline",
+                workspace_root=tmp_path / "baseline",
                 out_dir=tmp_path / "out" / "helios-baseline",
             )
         )
@@ -108,7 +119,7 @@ def test_a_paired_side_boots_the_two_images_back_to_back(driver, tmp_path) -> No
     images = images_of(driver, tmp_path, paired=True)
     order = boot_order(run_side(driver, tmp_path, images))
 
-    assert [names for _, names in order] == [
+    assert [names for _, _, names in order] == [
         "quickjs-loop",
         "quickjs-loop",
         "cpython-json",
@@ -116,7 +127,7 @@ def test_a_paired_side_boots_the_two_images_back_to_back(driver, tmp_path) -> No
         "hostcall-loop",
         "hostcall-loop",
     ], "one boot per workload per image, and the pair is never split"
-    assert [checkout for checkout, _ in order] == [
+    assert [guest for _, guest, _ in order] == [
         "candidate",
         "baseline",
         "baseline",
@@ -139,17 +150,44 @@ def test_an_unpaired_side_still_boots_one_guest_per_class(driver, tmp_path) -> N
     order = boot_order(run_side(driver, tmp_path, images))
 
     assert order == [
-        ("candidate", "quickjs-loop,cpython-json"),
-        ("candidate", "hostcall-loop"),
+        ("candidate", "candidate", "quickjs-loop,cpython-json"),
+        ("candidate", "candidate", "hostcall-loop"),
     ]
 
 
-def test_the_two_images_are_never_built_into_one_target_directory(driver, tmp_path, monkeypatch) -> None:
-    """`workload-bench.sh` resolves both against its own checkout, so a
-    value set for the whole process would silently time one image twice."""
-    monkeypatch.setenv("CARGO_TARGET_DIR", str(tmp_path / "shared-target"))
-    with pytest.raises(SystemExit, match="CARGO_TARGET_DIR"):
+def test_one_harness_boots_both_images(driver, tmp_path) -> None:
+    """The baseline supplies a guest, never a harness.
+
+    Run 33995029872 died the other way round: the baseline checkout's own
+    `workload-bench.sh` and its own inspector drove its half, and that
+    inspector predated a fix to the host side, so the paired run failed
+    on the older harness rather than on anything about the guest.
+    """
+    order = boot_order(run_side(driver, tmp_path, images_of(driver, tmp_path, paired=True)))
+
+    assert {harness for harness, _, _ in order} == {"candidate"}, "every boot runs this checkout's harness"
+    assert {guest for _, guest, _ in order} == {"candidate", "baseline"}
+
+
+def test_two_images_that_are_one_build_are_refused(driver, tmp_path, monkeypatch) -> None:
+    """A shared target directory or workspace root would otherwise time
+    one build twice and report the noise between it and itself."""
+    monkeypatch.setenv("HELIOS_TEST_KERNEL_CONTENT", "one build, twice")
+    with pytest.raises(driver.IdenticalHeliosImages, match="same guest build"):
         run_side(driver, tmp_path, images_of(driver, tmp_path, paired=True))
+
+
+def test_the_refusal_reads_the_artifacts_not_the_paths(driver, tmp_path) -> None:
+    """Two checkouts are not the point; two builds are."""
+    images = images_of(driver, tmp_path, paired=True)
+    for image in images:
+        (image.workspace_root / "kernel").write_text(image.name, encoding="utf-8")
+
+    driver.refuse_identical_images(images, "x86-64")
+
+    (images[1].workspace_root / "kernel").write_text(images[0].name, encoding="utf-8")
+    with pytest.raises(driver.IdenticalHeliosImages, match="sha256"):
+        driver.refuse_identical_images(images, "x86-64")
 
 
 def test_the_driver_parses_the_baseline_flags_the_plan_emits(tmp_path) -> None:
