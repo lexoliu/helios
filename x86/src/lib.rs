@@ -38,7 +38,9 @@ use helios_hal::entropy::{EntropyQuality, EntropyUnavailable};
 use helios_hal::memory::MemoryRegion;
 use helios_hal::serial::ByteSerial;
 use helios_hal::watchdog::Watchdog;
-use helios_hal::{DeviceInventory, DmaModel, Platform, ProcessorStartupPolicy, ProcessorTopology};
+use helios_hal::{
+    DeviceInventory, DmaModel, Platform, ProcessorStartupPolicy, ProcessorTopology, align_up,
+};
 use x86_64::instructions::port::{Port, PortReadOnly, PortWriteOnly};
 use x86_64::registers::control::{Cr0Flags, Cr4Flags};
 
@@ -511,7 +513,7 @@ fn processor_count(rsdp_address: usize, physical_memory_offset: usize) -> usize 
 }
 
 fn boot_reserved_ranges(handoff: &boot::LimineBootHandoff) -> BootReservedRanges {
-    let executable_bytes = align_up_usize(
+    let executable_bytes = align_up(
         usize::try_from(handoff.kernel.size).unwrap_or_else(|_| {
             panic!(
                 "Limine executable file size does not fit usize: {}",
@@ -555,7 +557,7 @@ fn reserve_wakeup_page(
         .flat_map(|region| usable_region_segments(region, reserved_ranges))
         .flatten()
         .find_map(|segment| {
-            let start = align_up_usize(segment.start, smp::WAKEUP_PAGE_BYTES);
+            let start = align_up(segment.start, smp::WAKEUP_PAGE_BYTES);
             let end = segment.end.min(smp::SIPI_MAX_PHYSICAL_ADDRESS);
             (start
                 .checked_add(smp::WAKEUP_PAGE_BYTES)
@@ -608,17 +610,6 @@ fn dma_capable_ranges(
             helios_hal::iommu::PhysicalRange::new(start as u64, region.len() as u64)
         })
         .collect()
-}
-
-fn align_up_usize(value: usize, align: usize) -> usize {
-    assert!(
-        align.is_power_of_two(),
-        "alignment must be a power of two, got {align}"
-    );
-    value
-        .checked_add(align - 1)
-        .map(|value| value & !(align - 1))
-        .unwrap_or_else(|| panic!("alignment overflow for value={value:#x}, align={align:#x}"))
 }
 
 /// The kernel console: every record is retained for the debugger and

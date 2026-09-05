@@ -23,7 +23,9 @@ use helios_hal::critical_section::ProcessorIdentity;
 use helios_hal::entropy::{EntropyQuality, EntropyUnavailable};
 use helios_hal::memory::MemoryRegion;
 use helios_hal::serial::ByteSerial;
-use helios_hal::{DeviceInventory, DmaModel, Platform, ProcessorStartupPolicy, ProcessorTopology};
+use helios_hal::{
+    DeviceInventory, DmaModel, Platform, ProcessorStartupPolicy, ProcessorTopology, align_up,
+};
 use helios_kernel::{
     KernelException, KernelExceptionCause, KernelNativeTrapHandler, Timer, WasmtimeTlsSlots,
 };
@@ -1968,7 +1970,7 @@ fn convert_firmware_kind(firmware: u64) -> FirmwareKind {
 }
 
 fn boot_reserved_ranges(handoff: &LimineBootHandoff) -> BootReservedRanges {
-    let executable_bytes = align_up_usize(
+    let executable_bytes = align_up(
         usize::try_from(handoff.kernel.size)
             .unwrap_or_else(|_| panic!("Limine executable file size does not fit usize")),
         PAGE_BYTES,
@@ -2006,17 +2008,6 @@ fn boot_memory_regions(
                 })
             })
     })
-}
-
-fn align_up_usize(value: usize, align: usize) -> usize {
-    assert!(
-        align.is_power_of_two(),
-        "alignment must be a power of two, got {align}"
-    );
-    value
-        .checked_add(align - 1)
-        .map(|value| value & !(align - 1))
-        .unwrap_or_else(|| panic!("alignment overflow for value={value:#x}, align={align:#x}"))
 }
 
 struct PanicSerialWriter;

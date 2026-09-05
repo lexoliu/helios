@@ -25,15 +25,26 @@ pub mod vmm_test_harness;
 pub mod vsock;
 pub mod watchdog;
 
-/// Aligns `value` up to the next multiple of `align`.
+/// `value` rounded up to the next multiple of `align`, which must be a
+/// power of two.
 ///
-/// Panics if the alignment would overflow.
+/// Panics when the rounding overflows: a wrapped address is a smaller
+/// address, and a caller that checks the result against the end of a
+/// region would accept it.
 pub const fn align_up(value: usize, align: usize) -> usize {
+    assert!(align.is_power_of_two(), "alignment must be a power of two");
     let mask = align - 1;
     match value.checked_add(mask) {
         Some(next) => next & !mask,
         None => panic!("alignment overflow"),
     }
+}
+
+/// `value` rounded down to a multiple of `align`, which must be a power
+/// of two.
+pub const fn align_down(value: usize, align: usize) -> usize {
+    assert!(align.is_power_of_two(), "alignment must be a power of two");
+    value & !(align - 1)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -254,6 +265,26 @@ where
 mod tests {
     use super::*;
     use core::fmt;
+
+    #[test]
+    fn alignment_rounds_both_ways_and_leaves_aligned_values_alone() {
+        assert_eq!(align_up(0x1001, 0x1000), 0x2000);
+        assert_eq!(align_up(0x2000, 0x1000), 0x2000);
+        assert_eq!(align_down(0x1fff, 0x1000), 0x1000);
+        assert_eq!(align_down(0x1000, 0x1000), 0x1000);
+    }
+
+    #[test]
+    #[should_panic(expected = "alignment overflow")]
+    fn rounding_up_past_the_address_space_panics_instead_of_wrapping() {
+        let _ = align_up(usize::MAX, 0x1000);
+    }
+
+    #[test]
+    #[should_panic(expected = "alignment must be a power of two")]
+    fn a_non_power_of_two_alignment_is_rejected() {
+        let _ = align_up(0x1000, 0x600);
+    }
 
     struct TestConsole;
 

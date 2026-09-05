@@ -32,6 +32,7 @@ use helios_hal::vmm::{
     AddressSpace, AddressSpaceError, PageAge, PageFlags, SwapToken, Translation, VirtAddr,
     VirtRange,
 };
+use helios_hal::{align_down, align_up};
 use helios_kernel::{
     CommittedRegion, MemoryOwner, ReservationLookup, ReservationTracker, SwapEntry,
     current_user_memory_owner, validate_range,
@@ -401,14 +402,6 @@ fn host_page_size() -> usize {
     let value = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     assert!(value > 0, "sysconf(_SC_PAGESIZE) failed");
     value as usize
-}
-
-fn align_down(value: usize, align: usize) -> usize {
-    value & !(align - 1)
-}
-
-fn align_up(value: usize, align: usize) -> usize {
-    (value + align - 1) & !(align - 1)
 }
 
 /// `range.start` must be host-page aligned; the kernel rounds the length
