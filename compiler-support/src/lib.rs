@@ -1,5 +1,6 @@
 use helios_artifact::{
-    CWASM_MEMORY_GUARD_SIZE, CWASM_MEMORY_RESERVATION, cwasm_target_supports_wasm_simd,
+    CWASM_MEMORY_GUARD_SIZE, CWASM_MEMORY_RESERVATION, cwasm_target_cranelift_flags,
+    cwasm_target_supports_wasm_simd,
 };
 use std::env;
 use std::num::NonZeroUsize;
@@ -111,13 +112,8 @@ fn compiler_worker_count() -> usize {
     env::var("RAYON_NUM_THREADS")
         .ok()
         .and_then(|value| value.parse::<NonZeroUsize>().ok())
-        .map(NonZeroUsize::get)
-        .or_else(|| {
-            std::thread::available_parallelism()
-                .ok()
-                .map(NonZeroUsize::get)
-        })
-        .unwrap_or(1)
+        .or_else(|| std::thread::available_parallelism().ok())
+        .map_or(1, NonZeroUsize::get)
 }
 
 fn build_engine_config(target: &str, hint: AotCompileHint, worker_count: usize) -> Result<Config> {
@@ -128,7 +124,11 @@ fn build_engine_config(target: &str, hint: AotCompileHint, worker_count: usize) 
             target: target.to_owned(),
             source,
         })?;
-    configure_target_isa_flags(&mut config, target);
+    for flag in cwasm_target_cranelift_flags(target) {
+        unsafe {
+            config.cranelift_flag_enable(flag);
+        }
+    }
     match hint {
         AotCompileHint::Fast => {
             config.strategy(Strategy::Winch);
@@ -179,12 +179,4 @@ fn build_engine_config(target: &str, hint: AotCompileHint, worker_count: usize) 
     config.memory_reservation(CWASM_MEMORY_RESERVATION);
     config.memory_guard_size(CWASM_MEMORY_GUARD_SIZE);
     Ok(config)
-}
-
-fn configure_target_isa_flags(config: &mut Config, target: &str) {
-    for flag in helios_artifact::cwasm_target_cranelift_flags(target) {
-        unsafe {
-            config.cranelift_flag_enable(flag);
-        }
-    }
 }
