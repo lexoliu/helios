@@ -128,7 +128,9 @@ that guest components use internally:
 
 See `docs/wasi-tools.md` for the reproducible workflow that stages the
 standard WASIX `/bin/dash` boot artifact, boots CPython with its upstream
-stdlib, and runs upstream WASI tools such as Python and curl.
+stdlib, and runs upstream WASI tools such as Python and curl, and
+`docs/debug-serial.md` for the guest's debug serial line, the raw
+host-side capture every session keeps of it, and how to read one.
 
 ## Kernel Plugins
 
