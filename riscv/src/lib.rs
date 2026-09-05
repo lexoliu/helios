@@ -287,7 +287,6 @@ struct HartRuntime {
     timer: Timer<RiscvCpu>,
     wasmtime_tls: WasmtimeTlsSlots,
     native_trap_handler: Cell<Option<KernelNativeTrapHandler>>,
-    debug_transport: Option<DebugTransport>,
     external_interrupts: Option<net::ExternalInterrupts>,
     program_service: Option<debug_state::ProgramService>,
 }
@@ -314,24 +313,25 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     fatal_panic(info)
 }
 
-fn sbi_console(
+/// The kernel console: every record is retained for the debugger and,
+/// when the debug UART is carrying the kernel log, mirrored to it
+/// through the port's own console.
+///
+/// The mirror is the port's [`helios_kernel::DebugSerialWriter`] and
+/// nothing else. It used to be a byte loop over `sbi_rt::console_write_byte`,
+/// which reaches the very same 16550 the debugger's `[KDBG …]` markers
+/// go to — but beside the console that owns it rather than through it,
+/// so a marker emitted while a tracing record was mid-write came out
+/// spliced into it (#164).
+fn kernel_console(
     debug_state: debug_state::RuntimeState,
     mirror_to_uart: bool,
-) -> helios_kernel::RecordingConsole<
-    debug_state::RuntimeState,
-    impl FnMut() -> u64,
-    impl FnMut(&[u8]),
-> {
-    let write_fn: Option<fn(&[u8])> = if mirror_to_uart {
-        Some(|bytes: &[u8]| {
-            for &byte in bytes {
-                let _ = sbi_rt::console_write_byte(byte);
-            }
-        })
-    } else {
-        None
-    };
-    helios_kernel::RecordingConsole::new(debug_state, riscv::register::time::read64, write_fn)
+) -> helios_kernel::RecordingConsole<debug_state::RuntimeState, impl FnMut() -> u64> {
+    helios_kernel::RecordingConsole::new(
+        debug_state,
+        riscv::register::time::read64,
+        mirror_to_uart.then_some(DEBUG_SERIAL_WRITER),
+    )
 }
 
 #[derive(Clone)]
@@ -595,17 +595,18 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
     }
 
     let debug_state = shared_debug_state(timebase_frequency, hart_count);
-    let debug_transport = DebugTransport::discover(&fdt);
+    let has_debug_transport = publish_debug_transport(DebugTransport::discover(&fdt));
     let watchdog = shared_watchdog(&fdt);
     let has_vsock = vsock::has_vsock_device(&fdt);
     // The boot UART carries kernel tracing unless the embedded system
     // component needs the line to itself for its RPC framing. It needs
     // the line only when the machine has no vsock device: with one, the
     // component serves its RPC there and the UART stays a console, which
-    // is the whole reason the vsock transport exists.
-    let console = sbi_console(
+    // is the whole reason the vsock transport exists. A machine whose
+    // device tree describes no console has no line to carry it at all.
+    let console = kernel_console(
         debug_state.clone(),
-        !helios_kernel::has_embedded_system_component() || has_vsock,
+        has_debug_transport && (!helios_kernel::has_embedded_system_component() || has_vsock),
     );
     let cpu = RiscvCpu::new(
         current_hart,
@@ -615,7 +616,7 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
         fdt_addr,
     );
     let mut devices = DeviceInventory::new();
-    if debug_transport.is_some() {
+    if has_debug_transport {
         devices = devices.with_debug_serial();
     }
     if net::has_network_device(&fdt) {
@@ -731,7 +732,6 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
         timer: kernel.timer(),
         wasmtime_tls: WasmtimeTlsSlots::new(),
         native_trap_handler: Cell::new(None),
-        debug_transport,
         external_interrupts,
         program_service: None,
     };
@@ -909,19 +909,43 @@ pub(crate) fn current_hart_id() -> ProcessorId {
     current_hart_runtime().hart_id
 }
 
-fn current_debug_transport() -> &'static DebugTransport {
-    let runtime = current_hart_runtime();
-    runtime
-        .debug_transport
-        .as_ref()
-        .expect("debug transport is missing from the current hart runtime")
+/// The machine's debug UART, published by the first hart to discover it.
+///
+/// The port is a machine-wide device: every hart resolves the same
+/// `/chosen` node to the same register block, so it is described once
+/// here rather than copied into each hart's runtime.
+static DEBUG_TRANSPORT: Once<DebugTransport> = Once::new();
+
+/// The console that owns the right to write to that port.
+///
+/// Every byte the kernel or a guest puts on the boot UART is ordered by
+/// this one transmit role: the kernel log, the debugger's stage markers
+/// and the inspector's RPC frames alike.
+static DEBUG_CONSOLE: helios_kernel::DebugConsole = helios_kernel::DebugConsole::new();
+
+/// Publishes the discovered UART, and reports whether this machine has
+/// one at all.
+///
+/// Every hart calls this with the description it read from the same
+/// device tree, so the value is installed once and read afterwards.
+fn publish_debug_transport(discovered: Option<DebugTransport>) -> bool {
+    if let Some(transport) = discovered {
+        DEBUG_TRANSPORT.call_once(|| transport);
+    }
+    DEBUG_TRANSPORT.get().is_some()
 }
 
 impl DebugSerialAccess for DebugTransport {
     type Port = Self;
 
     fn port() -> Self {
-        *current_debug_transport()
+        *DEBUG_TRANSPORT
+            .get()
+            .expect("the debug UART was reached before the device tree described it")
+    }
+
+    fn console() -> &'static helios_kernel::DebugConsole {
+        &DEBUG_CONSOLE
     }
 }
 

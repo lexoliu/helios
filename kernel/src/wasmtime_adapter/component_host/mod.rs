@@ -4118,11 +4118,17 @@ mod tests {
         fn write_bytes(&self, _bytes: &[u8]) {}
     }
 
+    static DISCARD_CONSOLE: crate::DebugConsole = crate::DebugConsole::new();
+
     impl crate::DebugSerialAccess for DiscardPort {
         type Port = Self;
 
         fn port() -> Self {
             Self
+        }
+
+        fn console() -> &'static crate::DebugConsole {
+            &DISCARD_CONSOLE
         }
     }
 

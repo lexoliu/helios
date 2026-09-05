@@ -622,16 +622,8 @@ fn dma_capable_ranges(
 /// processor's siblings are already using.
 fn serial_console(
     debug_state: debug_state::RuntimeState,
-) -> helios_kernel::RecordingConsole<
-    debug_state::RuntimeState,
-    impl FnMut() -> u64,
-    impl FnMut(&[u8]),
-> {
-    helios_kernel::RecordingConsole::new(
-        debug_state,
-        read_tsc,
-        Some(|bytes: &[u8]| DEBUG_SERIAL_WRITER.emit(bytes)),
-    )
+) -> helios_kernel::RecordingConsole<debug_state::RuntimeState, impl FnMut() -> u64> {
+    helios_kernel::RecordingConsole::new(debug_state, read_tsc, Some(DEBUG_SERIAL_WRITER))
 }
 
 #[derive(Clone)]
@@ -1060,6 +1052,9 @@ fn serial_tx_ready() -> bool {
     }
 }
 
+/// The console that owns the right to write to COM1.
+static DEBUG_CONSOLE: helios_kernel::DebugConsole = helios_kernel::DebugConsole::new();
+
 impl DebugSerialAccess for DebugSerial {
     type Port = Self;
 
@@ -1067,6 +1062,10 @@ impl DebugSerialAccess for DebugSerial {
         // COM1 is configured once, by `serial_uart_init` on the
         // bootstrap processor, before anything can write to it.
         Self
+    }
+
+    fn console() -> &'static helios_kernel::DebugConsole {
+        &DEBUG_CONSOLE
     }
 }
 
