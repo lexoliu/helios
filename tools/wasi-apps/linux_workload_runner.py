@@ -298,10 +298,33 @@ class WorkloadFailed(Exception):
     """One workload could not be measured; the message says why."""
 
 
-def run_once(workload: dict, argv: list[str], env: dict[str, str]) -> tuple[float, dict[str, float]]:
-    """Runs one iteration and returns the child's wall time in milliseconds."""
+def run_once(
+    workload: dict,
+    argv: list[str],
+    env: dict[str, str],
+    timeout_seconds: float | None,
+) -> tuple[float, dict[str, float]]:
+    """Runs one iteration and returns the child's wall time in milliseconds.
+
+    A workload that hangs is bounded by `timeout_seconds`: without it one
+    stuck child holds the whole side until the caller's ssh gives up, and
+    every cell behind it is lost along with the ones already measured.
+    """
     started = time.perf_counter_ns()
-    completed = subprocess.run(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    try:
+        completed = subprocess.run(
+            argv,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise WorkloadFailed(
+            f"workload {workload['name']} exceeded its share of this side's budget "
+            f"({timeout_seconds:.0f}s)"
+        ) from error
     elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000
     if completed.returncode != 0:
         sys.stdout.buffer.write(completed.stdout)
@@ -327,6 +350,7 @@ def run_workloads(
     context: RenderContext,
     output: Path,
     keep_going: bool,
+    side_timeout_seconds: float | None,
 ) -> None:
     manifest = load_manifest(manifest_path)
     env = os.environ.copy()
@@ -346,14 +370,19 @@ def run_workloads(
             )
             + "\n"
         )
+        # Every workload gets an equal share of the budget the caller gave
+        # this side, so no single cell can spend the whole of it.
+        share = side_timeout_seconds / len(names) if side_timeout_seconds else None
         for name in names:
             workload = selected_workload(manifest, name)
             argv = counterpart_command(workload, side, context)
             elapsed: list[float] = []
             failure: str | None = None
+            deadline = time.monotonic() + share if share else None
             for iteration in range(1, iterations + 1):
                 try:
-                    elapsed_ms, metrics = run_once(workload, argv, env)
+                    remaining = max(1.0, deadline - time.monotonic()) if deadline else None
+                    elapsed_ms, metrics = run_once(workload, argv, env, remaining)
                 except WorkloadFailed as error:
                     if not keep_going:
                         raise SystemExit(str(error)) from error
@@ -443,6 +472,12 @@ def main() -> None:
         action="store_true",
         help="record a workload that fails as a failure record and continue with the next one",
     )
+    run.add_argument(
+        "--side-timeout-seconds",
+        type=float,
+        default=None,
+        help="the caller's whole budget for this side; each workload gets an equal share of it",
+    )
 
     precompile_parser = subcommands.add_parser("precompile")
     precompile_parser.add_argument("--workload", dest="workloads", action="append", default=[])
@@ -462,7 +497,14 @@ def main() -> None:
             workdir=Path(tempfile.mkdtemp(prefix="helios-bench-")),
         )
         run_workloads(
-            args.manifest, args.workloads, args.side, args.iterations, context, args.out, args.keep_going
+            args.manifest,
+            args.workloads,
+            args.side,
+            args.iterations,
+            context,
+            args.out,
+            args.keep_going,
+            args.side_timeout_seconds,
         )
     elif args.command == "precompile":
         precompile(args.manifest, args.workloads, args.wasmtime_bin, root)

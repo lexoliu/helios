@@ -1188,6 +1188,7 @@ def runner_command(
     side: str,
     wasmtime_bin: str | None = None,
     keep_going: bool = False,
+    side_timeout_seconds: int | None = None,
 ) -> str:
     command = [
         "python3",
@@ -1214,6 +1215,11 @@ def runner_command(
         command.extend(["--workload", workload["name"]])
     if keep_going:
         command.append("--keep-going")
+    if side_timeout_seconds is not None:
+        # The guest runner bounds each workload by its share of the same
+        # budget this side's ssh call is given, so a hung workload becomes
+        # one failed cell instead of the loss of every cell on the side.
+        command.extend(["--side-timeout-seconds", str(side_timeout_seconds)])
     if host_http_url:
         command.extend(["--host-http-url", host_http_url])
     if host_tcp_host and host_tcp_port is not None:
@@ -1427,6 +1433,7 @@ def run_fedora_qemu_linux(
                     side,
                     bin_path,
                     keep_going,
+                    setup_timeout_seconds,
                 ),
                 timeout=setup_timeout_seconds,
             )
