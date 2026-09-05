@@ -1134,6 +1134,7 @@ mod tests {
             kernel_profile_output: None,
             user_profile_output: None,
             perf_metrics_output: None,
+            llvm_raw_profile_output: None,
             workload_timeout_seconds: DEFAULT_WORKLOAD_TIMEOUT_SECONDS,
         };
         let workloads = select_workloads(&command).expect("manifest must parse");
@@ -1196,6 +1197,7 @@ mod tests {
             kernel_profile_output: None,
             user_profile_output: None,
             perf_metrics_output: None,
+            llvm_raw_profile_output: None,
             workload_timeout_seconds: DEFAULT_WORKLOAD_TIMEOUT_SECONDS,
         };
         let workloads = select_workloads(&command).expect("manifest must parse");
@@ -1225,6 +1227,7 @@ mod tests {
             kernel_profile_output: None,
             user_profile_output: None,
             perf_metrics_output: None,
+            llvm_raw_profile_output: None,
             workload_timeout_seconds: DEFAULT_WORKLOAD_TIMEOUT_SECONDS,
         };
         let workloads = select_workloads(&command).expect("manifest must parse");
@@ -1287,6 +1290,7 @@ mod tests {
             kernel_profile_output: None,
             user_profile_output: None,
             perf_metrics_output: None,
+            llvm_raw_profile_output: None,
             workload_timeout_seconds,
         }
     }
