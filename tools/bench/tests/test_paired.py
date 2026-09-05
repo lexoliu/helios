@@ -212,6 +212,98 @@ def test_the_driver_parses_the_baseline_flags_the_plan_emits(tmp_path) -> None:
     assert parsed.helios_side_timeout_seconds == options.helios_side_timeout_seconds
 
 
+# A per-unit cap far above any share, so that the share is what binds.
+PER_UNIT_CAP = 9000
+
+
+def granted_budgets(
+    driver, tmp_path, monkeypatch, control: dict | None, side: int, build_seconds: int
+) -> list[int]:
+    """What each boot of a paired side was allowed, in order.
+
+    Recorded at the seam rather than inferred from the clock: the budget
+    is the one number the accounting produces, and the run 33997256902
+    lost was lost by producing zero for every boot of it.
+    """
+    granted: list[int] = []
+
+    def record(*args, **kwargs) -> None:
+        granted.append(kwargs["timeout_seconds"])
+
+    monkeypatch.setattr(driver, "run_helios_once", record)
+    monkeypatch.setenv("HELIOS_TEST_BUILD_SECONDS", str(build_seconds))
+    driver.run_helios(
+        Path("tools/wasi-apps/workloads.json"),
+        images_of(driver, tmp_path, paired=True),
+        1,
+        WORKLOADS,
+        "x86-64",
+        "kvm",
+        None,
+        None,
+        None,
+        None,
+        timeout_seconds=PER_UNIT_CAP,
+        side_timeout_seconds=side,
+        build_timeout_seconds=120,
+        skip_build=False,
+        control_workload=control,
+        keep_going=True,
+    )
+    return granted
+
+
+def test_the_paired_budget_charges_nothing_before_the_first_unit(driver, tmp_path, monkeypatch) -> None:
+    """#154 hoisted the build out of the budget; the paired plan must not
+    put anything back in front of it.
+
+    Run 33997256902 refused all forty-eight of its boots as over budget
+    twenty-six minutes into a three-hour side budget, without booting
+    once. Both builds happen before the budget starts, the same way the
+    single build does, and nothing else comes off the front of it: the
+    two builds below take a fifth of the side between them, and the first
+    unit still sees the whole of it.
+    """
+    side = 60
+    granted = granted_budgets(driver, tmp_path, monkeypatch, None, side=side, build_seconds=7)
+
+    boots = driver.side_boots(len(WORKLOADS), 2, None)
+    assert boots == len(granted) == 6
+    expected = driver.class_budget(side, boots, PER_UNIT_CAP)
+    # Only the clock ticking through the assertion itself separates the
+    # two; the fourteen seconds of build would separate them by more.
+    assert expected - granted[0] <= 1, (
+        f"the first unit saw {granted[0]}s of a {side}s side budget, not {expected}s: "
+        "the build, or a reserve, is being charged to it"
+    )
+    assert all(budget > 0 for budget in granted)
+
+
+def test_the_control_boots_take_a_share_and_not_a_cap(driver, tmp_path, monkeypatch) -> None:
+    """Counted, not reserved.
+
+    The control runs before and after are the run's own precondition, so
+    they must not be starved — but reserving the per-unit cap for them
+    starves everything else instead: two caps are more than a whole side.
+    Counting them among the boots gives them a share, and the same
+    arithmetic that bounds a unit protects them.
+    """
+    side = 600
+    control = workload("quickjs-loop", "compute")
+    granted = granted_budgets(driver, tmp_path, monkeypatch, control, side=side, build_seconds=0)
+
+    boots = driver.side_boots(len(WORKLOADS), 2, control)
+    assert boots == len(granted) == 10, "three workloads and a control, before and after, per image"
+    expected = driver.class_budget(side, boots, PER_UNIT_CAP)
+    assert expected - granted[0] <= 1
+    assert all(budget > 0 for budget in granted), (
+        "every boot gets a share, the two after-control boots included"
+    )
+    # Each boot hands back what it did not use, so the share only ever
+    # widens: nothing is set aside that a later boot cannot reach.
+    assert granted == sorted(granted)
+
+
 def test_a_baseline_side_survives_the_schema_round_trip(paired_regression_report, tmp_path) -> None:
     path = tmp_path / "report.json"
     save_report(paired_regression_report, path)

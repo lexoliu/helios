@@ -210,10 +210,20 @@ what the one below it cannot see.
   33952047436 hung there for ninety-five minutes with QEMU alive behind
   it, until CI cancelled the job.
 - **Per side.** `--helios-side-timeout-seconds` bounds the whole Helios
-  side, control runs included, and the classes share what is left of it
-  as they run. A boot that never reaches the debugger answers no
-  deadline at all, so this is what keeps a wedged class costing one
-  class rather than the lane. The Linux side has had the same bound as
+  side, and every boot inside it shares it out as the run goes: one boot
+  per class (or, paired, one per workload per image), plus the control
+  workload before and after for each image. Nothing is reserved off the
+  front — the builds happen before the budget starts, and the control
+  boots are counted among the boots rather than set aside at the
+  per-boot cap, which is what made run 33997256902 refuse all
+  forty-eight of its boots as over budget without booting once. Each
+  boot may take at most its share of what is left, so a boot that
+  finishes early widens the share of every boot behind it and the ones
+  at the end are protected by the same arithmetic as the ones at the
+  start. A boot that never reaches the debugger answers no deadline at
+  all, so this is what keeps a wedged boot costing one boot rather than
+  the lane, and a side that measured nothing fails the run naming why
+  its first boot was refused. The Linux side has had the same bound as
   `--side-timeout-seconds` since it lost a side to one hung workload.
 
 The bugs the first runs of this suite found are fixed: the x86 kernel

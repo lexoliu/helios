@@ -83,12 +83,19 @@ def test_a_class_that_never_answers_is_killed_and_the_side_continues(driver, tmp
 
 
 def test_a_spent_budget_boots_no_further_guest(driver, tmp_path) -> None:
-    # The side's budget is a cap, not a target: with none of it left, a
-    # class is a stated failure rather than another boot.
-    log, elapsed = run_side(driver, tmp_path / "out", per_class=120, side=1)
+    """The side's budget is a cap, not a target: with none of it left, a
+    class is a stated failure rather than another boot.
 
-    assert elapsed < 30
-    written = records(log)
+    A side that measured nothing at all is the run's own failure, and the
+    reason its first boot was refused is what says so. Reported any later
+    it reads as a missing run record in a file the report assembly went
+    looking for, which is how run 33997256902 ended.
+    """
+    out_dir = tmp_path / "out"
+    with pytest.raises(driver.HeliosRunFailed, match="budget was spent"):
+        run_side(driver, out_dir, per_class=120, side=1)
+
+    written = records(out_dir / "helios.jsonl")
     assert {record["type"] for record in written.values()} == {"failure"}
     assert all("budget was spent" in record["error"] for record in written.values())
     assert not (tmp_path / "wedge.pid").exists(), "no guest may be booted on a spent budget"

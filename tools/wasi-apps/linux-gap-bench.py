@@ -133,6 +133,23 @@ def class_budget(remaining_seconds: float, classes_left: int, per_class_cap: int
     return max(0, min(per_class_cap, int(remaining_seconds // classes_left)))
 
 
+def side_boots(units: int, images: int, control_workload: dict | None) -> int:
+    """Every boot the Helios side's budget has to cover.
+
+    One per image per unit, plus the control workload before and after
+    for each image. The control boots are counted rather than reserved:
+    reserving them at the per-unit cap instead put two caps, 18 000
+    seconds of them, in front of a three-hour side budget, and run
+    33997256902 refused all forty-eight of its boots as over budget
+    twenty-six minutes in without booting once. Counted, each boot takes
+    at most its share of what is left, so the boots at the end of the run
+    are protected by the same arithmetic that bounds the ones before
+    them, and a boot that finishes early hands the rest back.
+    """
+    controls = 2 * images if control_workload is not None else 0
+    return units * images + controls
+
+
 def run_isolated(
     command: list[str],
     env: dict[str, str] | None = None,
@@ -622,6 +639,18 @@ def run_helios(
     def remaining() -> float:
         return deadline - time.monotonic()
 
+    # Every boot of the side, the control runs included, shares one
+    # budget as it goes: nothing is reserved up front, so the first boot
+    # sees the whole of it and each later one sees what its predecessors
+    # handed back.
+    boots_left = side_boots(len(units), len(images), control_workload)
+
+    def next_budget() -> int:
+        nonlocal boots_left
+        budget = class_budget(remaining(), boots_left, timeout_seconds)
+        boots_left -= 1
+        return budget
+
     def run_control(moment: str) -> None:
         # The control workload measures the machine, not Helios: the same
         # program before and after the suite bounds how much the host
@@ -644,9 +673,9 @@ def run_helios(
                 host_tcp_host,
                 host_tcp_port,
                 host_tcp_echo_port,
-                class_budget(remaining(), len(images), timeout_seconds),
-                keep_going,
-                paired,
+                timeout_seconds=next_budget(),
+                keep_going=keep_going,
+                paired=paired,
             )
 
     try:
@@ -654,14 +683,10 @@ def run_helios(
     except HeliosRunFailed as error:
         raise SystemExit(f"the control workload could not be measured: {error}") from error
 
-    # The after-control is the run's own precondition, so it keeps its
-    # own boot's worth of the budget per image rather than competing with
-    # the units for what is left.
-    control_reserve = timeout_seconds * len(images) if control_workload is not None else 0
-
     unit_logs: dict[str, list[Path]] = {image.name: [] for image in images}
+    measured = dict.fromkeys((image.name for image in images), 0)
+    first_refusal: dict[str, str] = {}
     lost = []
-    boots_left = len(units) * len(images)
     for index, unit in enumerate(units):
         # Which image boots first alternates from unit to unit, so that
         # neither of them systematically holds the earlier slot of the
@@ -670,8 +695,7 @@ def run_helios(
         ordered = images if index % 2 == 0 else list(reversed(images))
         for image in ordered:
             log = image.log(unit.key)
-            budget = class_budget(remaining() - control_reserve, boots_left, timeout_seconds)
-            boots_left -= 1
+            budget = next_budget()
             try:
                 if budget <= 0:
                     raise HeliosRunFailed(
@@ -690,10 +714,11 @@ def run_helios(
                     host_tcp_host,
                     host_tcp_port,
                     host_tcp_echo_port,
-                    budget,
-                    keep_going,
-                    paired,
+                    timeout_seconds=budget,
+                    keep_going=keep_going,
+                    paired=paired,
                 )
+                measured[image.name] += 1
             except HeliosRunFailed as error:
                 if not keep_going:
                     raise
@@ -710,6 +735,7 @@ def run_helios(
                 )
                 record_unmeasured(log, workloads, unit.names, str(error))
                 lost.append(f"{image.name}/{unit.key}")
+                first_refusal.setdefault(image.name, str(error))
             unit_logs[image.name].append(log)
 
     for image in images:
@@ -717,6 +743,18 @@ def run_helios(
             for path in unit_logs[image.name]:
                 if path.exists():
                     output_handle.write(path.read_text(encoding="utf-8"))
+
+    for image in images:
+        # An image that never booted has no run record, and the report
+        # assembly meets that as a missing line in a file rather than as
+        # what it is. The reason the first boot was refused is the reason
+        # the run failed, so it is the one that gets reported.
+        if measured[image.name] == 0:
+            raise HeliosRunFailed(
+                f"the {image.name!r} image measured nothing: not one of its "
+                f"{len(units)} boots produced a record. The first was refused because "
+                f"{first_refusal.get(image.name, 'no boot was attempted')}"
+            )
 
     try:
         run_control("after")
