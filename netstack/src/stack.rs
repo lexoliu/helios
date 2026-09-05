@@ -2133,11 +2133,18 @@ struct TcpResetResponse {
 }
 
 impl TcpAckReplaceKey {
+    /// Whether a queued acknowledgement is made redundant by a newer one.
+    ///
+    /// Only a *strictly* newer acknowledgement supersedes: two frames
+    /// carrying the same acknowledgement are duplicate ACKs, and their
+    /// count is the loss signal the peer counts to three before it
+    /// fast-retransmits. Folding them into one slot is what leaves a
+    /// hole to be recovered by the peer's retransmission timer instead.
     fn can_replace(self, replacement: Self) -> bool {
         self.local == replacement.local
             && self.remote == replacement.remote
             && self.sequence == replacement.sequence
-            && crate::tcp::sequence_leq(self.acknowledgement, replacement.acknowledgement)
+            && crate::tcp::sequence_lt(self.acknowledgement, replacement.acknowledgement)
     }
 }
 
@@ -3153,8 +3160,17 @@ where
             ArrayVec::<(usize, TcpEndpoint, TcpEndpoint, TcpHeader, TcpHeaderOptions), 16>::new();
         let mut pending_syn_ack =
             ArrayVec::<(usize, TcpEndpoint, TcpEndpoint, TcpHeader, TcpHeaderOptions), 16>::new();
-        let mut pending_ack =
-            ArrayVec::<(usize, TcpEndpoint, TcpEndpoint, TcpHeader, TcpHeaderOptions), 16>::new();
+        let mut pending_ack = ArrayVec::<
+            (
+                usize,
+                TcpEndpoint,
+                TcpEndpoint,
+                TcpHeader,
+                TcpHeaderOptions,
+                u8,
+            ),
+            16,
+        >::new();
         let mut pending_retransmit = ArrayVec::<(usize, TcpTransmitSegment), 16>::new();
         let mut pending_data = ArrayVec::<(usize, TcpTransmitSegment), 16>::new();
         for active_slot in 0..self.tcp.active_len() {
@@ -3236,6 +3252,7 @@ where
                                 remote,
                                 header,
                                 socket.pending_ack_options(now.nanos()),
+                                socket.pending_ack_count(),
                             ))
                             .unwrap_or_else(|_| panic!("TCP ACK transmit burst overflowed"));
                     }
@@ -3294,20 +3311,36 @@ where
                 self.schedule_tcp_timer(index);
             }
         }
-        for (index, local, remote, header, options) in pending_ack {
+        for (index, local, remote, header, options, acks) in pending_ack {
             let hop_limit = self.tcp_socket_hop_limit(index);
-            if self.queue_tcp(
-                local,
-                remote,
-                TcpEgress {
-                    header,
-                    options,
-                    payload: TcpTxPayload::Flat(&[]),
-                    hop_limit,
-                },
-                index as u16,
-                now,
-            )? {
+            // Every owed acknowledgement gets its own frame. All but the
+            // first repeat the same acknowledgement number, which is
+            // exactly the duplicate-ACK signal the peer counts before it
+            // retransmits a hole ahead of its own timer.
+            for ack in 0..acks {
+                let queued = match self.queue_tcp(
+                    local,
+                    remote,
+                    TcpEgress {
+                        header,
+                        options,
+                        payload: TcpTxPayload::Flat(&[]),
+                        hop_limit,
+                    },
+                    index as u16,
+                    now,
+                ) {
+                    Ok(queued) => queued,
+                    // The first acknowledgement is what the peer is
+                    // owed; the duplicates behind it are a loss hint,
+                    // and must not take the last outbound slot from the
+                    // retransmission they are asking for.
+                    Err(StackError::OutputQueueFull) if ack != 0 => break,
+                    Err(error) => return Err(error),
+                };
+                if !queued {
+                    break;
+                }
                 let socket = self
                     .tcp
                     .get_mut(index)
@@ -6904,6 +6937,83 @@ mod tests {
         assert_eq!(ack.sequence, replacement.sequence);
         assert_eq!(ack.flags, TcpFlags::ACK);
         assert!(ack.payload.is_empty());
+    }
+
+    /// A burst of out-of-order segments leaves three duplicate ACKs on
+    /// the wire, so the peer fast-retransmits the hole.
+    ///
+    /// Two things used to collapse the burst into one frame: the socket
+    /// recorded a single pending-ACK flag, and the outbound queue folded
+    /// a queued ACK into any later one carrying the same acknowledgement.
+    /// A peer without SACK then saw at most one duplicate, never reached
+    /// the three-duplicate threshold, and waited out its retransmission
+    /// timer instead — the 1.4–1.9 s stalls behind the aarch64 bench
+    /// lane's `tcp-throughput` read timeout.
+    #[test]
+    fn an_out_of_order_burst_leaves_duplicate_acks_on_the_wire() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let (mut stack, _socket) =
+            established_tcp_stack(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let payload = [0u8; 100];
+
+        let deliver = |stack: &mut Stack, sequence: u32, now: u64| {
+            let (segment, len) = tcp_segment_with_payload(
+                peer,
+                local,
+                TcpHeader {
+                    source_port: 80,
+                    destination_port: 49152,
+                    sequence,
+                    acknowledgement: 8,
+                    flags: TcpFlags::ACK,
+                    window_size: u16::MAX,
+                },
+                &payload,
+            );
+            stack
+                .receive_tcp(
+                    IpAddress::Ipv4(peer),
+                    IpAddress::Ipv4(local),
+                    &Bytes::copy_from_slice(&segment[..len]),
+                    RxFrameOffload::none(),
+                    StackInstant::from_nanos(now),
+                )
+                .expect("test TCP segment should be accepted");
+        };
+
+        // In-order data, acknowledged on its own drive: this is the
+        // cumulative acknowledgement the duplicates repeat.
+        deliver(&mut stack, 101, 2);
+        stack
+            .drive_tcp(StackInstant::from_nanos(2))
+            .expect("cumulative ACK should be queued");
+        while stack.take_outbound().is_some() {}
+
+        // One received burst: the segment at 201 is lost and everything
+        // behind it arrives before the stack is driven again, exactly as
+        // the packet pump drains a receive batch.
+        for index in 0..4u32 {
+            deliver(&mut stack, 301 + index * 100, 3 + u64::from(index));
+        }
+        stack
+            .drive_tcp(StackInstant::from_nanos(7))
+            .expect("duplicate ACKs should be queued");
+
+        let mut duplicates = 0;
+        while let Some(frame) = stack.take_outbound() {
+            let ethernet =
+                EthernetFrame::parse(frame.as_slice()).expect("Ethernet frame should parse");
+            let ipv4 = Ipv4Packet::parse(ethernet.payload).expect("IPv4 packet should parse");
+            let ack = TcpPacket::parse(ipv4.payload).expect("TCP packet should parse");
+            assert_eq!(ack.acknowledgement, 201);
+            assert!(ack.payload.is_empty());
+            duplicates += 1;
+        }
+        assert!(
+            duplicates >= 3,
+            "an out-of-order burst must leave at least three duplicate ACKs, got {duplicates}"
+        );
     }
 
     #[test]

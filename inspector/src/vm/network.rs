@@ -41,6 +41,14 @@ use super::qemu::QemuOptions;
 /// QEMU netdev identifier shared by the backend and the device.
 const NET_ID: &str = "net0";
 
+/// QEMU object identifier of the optional packet-capture filter.
+const NET_DUMP_ID: &str = "netdump0";
+
+/// Bytes of each captured frame written to the pcap. A coalesced
+/// receive frame can reach 64 KiB, and a capture that truncated it
+/// would hide exactly the segmentation the driver negotiated.
+const PCAP_SNAP_LEN: u32 = 65_550;
+
 /// File descriptor `socket_vmnet_client` hands the QEMU it execs.
 const SOCKET_VMNET_FD: u8 = 3;
 
@@ -536,6 +544,9 @@ pub(crate) enum VmNetworkError {
 
     #[error("QEMU binary `{name}` was not found")]
     QemuBinaryMissing { name: String },
+
+    #[error("--net-pcap path {path} is not valid UTF-8, which QEMU object properties require")]
+    PcapPathNotUtf8 { path: PathBuf },
 }
 
 /// Failures of the privileged `net-setup` / `net-teardown` helpers.
@@ -628,6 +639,14 @@ pub(crate) struct VmNetworkArgs {
     /// virtio-net device property, `key=value`. Repeat for several.
     #[arg(long = "net-device-prop", value_name = "KEY=VALUE")]
     pub(crate) device_props: Vec<VirtioNetProperty>,
+
+    /// Write every frame crossing the guest's virtio-net device to a
+    /// pcap file, through QEMU's `filter-dump`. Both directions, on
+    /// every backend: the capture sits between the device and the
+    /// backend, so it records what the guest driver actually sent and
+    /// received rather than what the host end saw.
+    #[arg(long = "net-pcap", value_name = "PATH")]
+    pub(crate) pcap: Option<PathBuf>,
 }
 
 /// Backend selection as it can be pinned in the inspector VM config file.
@@ -647,6 +666,8 @@ pub(crate) struct VmNetworkFile {
     pub(crate) socket_vmnet_client: Option<PathBuf>,
     #[serde(default)]
     pub(crate) device_props: Vec<VirtioNetProperty>,
+    #[serde(default)]
+    pub(crate) pcap: Option<PathBuf>,
 }
 
 /// A resolved backend request: command line over config file, with the
@@ -660,6 +681,7 @@ pub(crate) struct VmNetwork {
     socket_vmnet_path: Option<PathBuf>,
     socket_vmnet_client: Option<PathBuf>,
     device_props: Vec<VirtioNetProperty>,
+    pcap: Option<PathBuf>,
 }
 
 impl VmNetwork {
@@ -678,6 +700,7 @@ impl VmNetwork {
             socket_vmnet_path: args.socket_vmnet_path.or(file.socket_vmnet_path),
             socket_vmnet_client: args.socket_vmnet_client.or(file.socket_vmnet_client),
             device_props,
+            pcap: args.pcap.or(file.pcap),
         }
     }
 
@@ -852,10 +875,32 @@ impl VmNetwork {
             VmNetworkProfile::VirtioPci => ring.apply_pci(&mut device),
         }
 
+        // The dump filter sits on the netdev, so it records both
+        // directions of the same wire the driver drives, whatever the
+        // backend behind it is.
+        let packet_dump = self
+            .pcap
+            .as_deref()
+            .map(|path| {
+                let path = path
+                    .to_str()
+                    .ok_or_else(|| VmNetworkError::PcapPathNotUtf8 {
+                        path: path.to_path_buf(),
+                    })?;
+                let mut object = QemuOptions::new("filter-dump");
+                object.set("id", NET_DUMP_ID);
+                object.set("netdev", NET_ID);
+                object.set("file", path);
+                object.set("maxlen", PCAP_SNAP_LEN);
+                Ok(object.to_string())
+            })
+            .transpose()?;
+
         Ok(QemuNetArgs {
             launcher,
             netdev: netdev.to_string(),
             device: device.to_string(),
+            packet_dump,
             backend: self.backend,
             queue_pairs,
         })
@@ -967,6 +1012,7 @@ pub(crate) struct QemuNetArgs {
     launcher: Option<QemuLauncher>,
     netdev: String,
     device: String,
+    packet_dump: Option<String>,
     backend: VmNetworkBackend,
     queue_pairs: u16,
 }
@@ -989,6 +1035,9 @@ impl QemuNetArgs {
     /// Appends the `-netdev`/`-device` pair to a QEMU command line.
     pub(crate) fn apply(&self, qemu: &mut Command) {
         qemu.arg("-netdev").arg(&self.netdev);
+        if let Some(packet_dump) = &self.packet_dump {
+            qemu.arg("-object").arg(packet_dump);
+        }
         qemu.arg("-device").arg(&self.device);
     }
 
@@ -1009,6 +1058,11 @@ impl QemuNetArgs {
     #[cfg(test)]
     fn launcher(&self) -> Option<&QemuLauncher> {
         self.launcher.as_ref()
+    }
+
+    #[cfg(test)]
+    fn packet_dump(&self) -> Option<&str> {
+        self.packet_dump.as_deref()
     }
 }
 
@@ -1553,6 +1607,7 @@ mod tests {
             socket_vmnet_path: None,
             socket_vmnet_client: None,
             device_props: Vec::new(),
+            pcap: None,
         }
     }
 
@@ -1574,6 +1629,39 @@ mod tests {
         assert_eq!(rendered.device(), "virtio-net-pci,netdev=net0");
         assert_eq!(rendered.queue_pairs(), 1);
         assert!(rendered.launcher().is_none());
+    }
+
+    /// The packet capture attaches to the netdev, so it records both
+    /// directions of the wire the guest driver drives, on any backend.
+    #[test]
+    fn a_packet_capture_attaches_a_dump_filter_to_the_netdev() {
+        let mut network = request(VmNetworkBackend::User);
+        network.pcap = Some(PathBuf::from("/tmp/helios.pcap"));
+        let rendered = network
+            .render(
+                VmNetworkProfile::VirtioPci,
+                split_ring(),
+                1,
+                HostPlatform::MACOS,
+            )
+            .expect("a capture renders on every backend");
+        assert_eq!(
+            rendered.packet_dump(),
+            Some("filter-dump,id=netdump0,netdev=net0,file=/tmp/helios.pcap,maxlen=65550")
+        );
+    }
+
+    #[test]
+    fn without_a_capture_path_no_dump_filter_is_rendered() {
+        let rendered = request(VmNetworkBackend::User)
+            .render(
+                VmNetworkProfile::VirtioPci,
+                split_ring(),
+                1,
+                HostPlatform::MACOS,
+            )
+            .expect("the user backend renders on every host");
+        assert_eq!(rendered.packet_dump(), None);
     }
 
     #[test]
@@ -2015,6 +2103,7 @@ mod tests {
             socket_vmnet_path: None,
             socket_vmnet_client: None,
             device_props: Vec::new(),
+            pcap: None,
         };
         let file = VmNetworkFile {
             backend: Some(VmNetworkBackend::User),
@@ -2047,6 +2136,7 @@ mod tests {
                 socket_vmnet_path: None,
                 socket_vmnet_client: None,
                 device_props: Vec::new(),
+                pcap: None,
             },
             bridge_address: "10.77.0.1/24".parse().expect("a valid CIDR"),
             uplink: Some("eth0".to_owned()),

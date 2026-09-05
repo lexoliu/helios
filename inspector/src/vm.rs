@@ -2674,6 +2674,7 @@ mod tests {
             socket_vmnet_path: None,
             socket_vmnet_client: None,
             device_props: Vec::new(),
+            pcap: None,
         }
     }
 
