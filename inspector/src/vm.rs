@@ -684,6 +684,17 @@ enum VmSessionCommand {
     /// no `--boot-program` the bootfs carries every program, which is
     /// the superset every workload class boots from.
     Build,
+    /// Print the guest kernel artifact this checkout would boot, and
+    /// stop there.
+    ///
+    /// The path is resolved exactly as a boot resolves it — the
+    /// workspace root, then the architecture and the profile — so a
+    /// caller that has to identify the guest an image would boot does
+    /// not have to rebuild the mapping from architecture to Cargo target
+    /// and artifact name for itself. A paired benchmark run uses it to
+    /// refuse two checkouts whose guest images turn out to be the same
+    /// build, which the comparison between them could say nothing about.
+    KernelPath,
     /// Provision the privileged host state a network backend needs.
     NetSetup(NetSetupCommand),
     /// Remove the host state `net-setup` provisioned.
@@ -816,6 +827,13 @@ pub(crate) fn run(mut command: VmCommand) -> Result<()> {
         // `build` produces artifacts and boots nothing, so it neither
         // preflights the QEMU host state nor spawns a guest.
         Some(VmSessionCommand::Build) => return build_vm(&resolve(command)?),
+        // Answers from the resolved command and boots nothing, so it is
+        // dispatched beside `build` rather than after the host checks a
+        // guest would need.
+        Some(VmSessionCommand::KernelPath) => {
+            println!("{}", resolve(command)?.kernel.display());
+            return Ok(());
+        }
         session => command.command = session,
     }
     let command = resolve(command)?;
@@ -2903,9 +2921,12 @@ impl From<VmSessionCommand> for ResolvedVmSessionCommand {
             VmSessionCommand::WorkloadBench(command) => Self::WorkloadBench(command),
             VmSessionCommand::Balloon(command) => Self::Balloon(command),
             VmSessionCommand::Build
+            | VmSessionCommand::KernelPath
             | VmSessionCommand::NetSetup(_)
             | VmSessionCommand::NetTeardown(_) => {
-                unreachable!("the build and the network helpers never reach a guest session")
+                unreachable!(
+                    "the build, the artifact query and the network helpers never reach a guest session"
+                )
             }
         }
     }
