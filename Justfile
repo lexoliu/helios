@@ -133,7 +133,7 @@ clippy-target target package:
 # Usage: just build-instrumented aarch64
 build-instrumented arch:
     cargo run -p helios-inspector --quiet -- \
-        vm --arch {{arch}} --profile-generate --accel tcg build
+        vm --arch {{arch}} --profile-generate build
 
 # Equivalent of AGENTS §7 required checks. Run before declaring a change complete.
 check-all:
