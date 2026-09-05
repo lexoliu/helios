@@ -67,6 +67,9 @@ def native_client(tmp_path: Path) -> Path:
             "-Wall",
             "-Wextra",
             "-Werror",
+            # The same definition tools/bench/native/build.sh passes: under
+            # -std=c11 glibc hides clock_gettime and CLOCK_MONOTONIC.
+            "-D_GNU_SOURCE",
             "-I",
             str(NATIVE_SOURCE.parent),
             "-o",
