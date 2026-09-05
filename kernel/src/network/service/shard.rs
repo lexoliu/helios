@@ -17,10 +17,16 @@
 //! runs the released waiter instead of sleeping to its own deadline.
 //!
 //! A frame arrival is not the only producer of that signal. A read that
-//! relieves a shard's receive backpressure
-//! ([`NetworkShardSet::with_handle_receive_drain`]) raises it too,
-//! because until the application makes room the shard refuses every
-//! frame and the packet pump has nothing else to wake it.
+//! relieves a socket's receive backpressure
+//! ([`NetworkShardSet::with_handle_receive_drain`]) raises it too: a
+//! socket with no room refuses the segments offered to it, the peer is
+//! window-blocked, nothing arrives, and the application read that makes
+//! room produces no frame of its own for the pump to notice.
+//!
+//! What a full socket does *not* do is stop the interface. The receive
+//! window is that socket's flow control and reaches no further: every
+//! other flow, and every ARP, ICMP and DHCP frame, keeps being taken off
+//! the device while it is shut (#143).
 //!
 //! Nothing in this module spins, and no shard lock is ever held across
 //! an await point.
@@ -216,6 +222,13 @@ pub(super) struct PaddedShard {
     /// few frames stale is still the right answer.
     pub(super) rx_frames: AtomicU64,
     pub(super) tx_frames: AtomicU64,
+    /// Frames the demux had to throw away because this shard's stack
+    /// refused them: the segment was already off the ring and there is
+    /// nowhere to put it back. A nonzero count on one shard while the
+    /// others move frames is the signature of a receiver that is not
+    /// keeping up; a nonzero count that keeps climbing while the shard
+    /// has no live socket is the signature of a leaked window.
+    pub(super) rx_refused_frames: AtomicU64,
     /// Raised every time a frame is placed in this shard's stack.
     ///
     /// Deliberately outside the `SpinMutex`: the processor that drained
@@ -238,15 +251,13 @@ pub(super) struct ShardArrivals {
 
 /// What the RX demux did with one received frame.
 pub(super) enum RxFrameDispatch {
-    /// The owning shard took the frame. `backpressured` reports that its
-    /// receive window closed as it did.
-    Delivered {
-        shard_idx: usize,
-        backpressured: bool,
-    },
-    /// The owning shard refused the frame; the caller must stop draining
-    /// and let the stack catch up.
-    Backpressured,
+    /// The owning shard took the frame.
+    Delivered { shard_idx: usize },
+    /// The owning shard refused the frame because the socket it was for
+    /// has no room. The frame is lost — it is already off the ring — and
+    /// the shard is named so the loss is counted against the shard that
+    /// caused it rather than against the device.
+    Backpressured { shard_idx: usize },
     /// Nothing parsed the frame. It is consumed, but no shard changed.
     Malformed,
 }
@@ -513,6 +524,7 @@ impl NetworkShardSet {
                 inner: SpinMutex::new(factory(index)),
                 rx_frames: AtomicU64::new(0),
                 tx_frames: AtomicU64::new(0),
+                rx_refused_frames: AtomicU64::new(0),
                 arrival: ProgressSignal::new(),
             });
         }
@@ -661,12 +673,36 @@ impl NetworkShardSet {
             .fetch_add(frames as u64, AtomicOrdering::Relaxed);
     }
 
+    /// Records frames this shard would not take because a socket of
+    /// its own had no room. They are lost, and the count is the size of
+    /// that loss.
+    #[inline]
+    pub(super) fn record_receive_refused(&self, idx: usize, frames: usize) {
+        self.shards[idx]
+            .rx_refused_frames
+            .fetch_add(frames as u64, AtomicOrdering::Relaxed);
+    }
+
     /// Frames this shard has moved in each direction since boot.
     pub(super) fn frame_counts(&self, idx: usize) -> (u64, u64) {
         (
             self.shards[idx].rx_frames.load(AtomicOrdering::Relaxed),
             self.shards[idx].tx_frames.load(AtomicOrdering::Relaxed),
         )
+    }
+
+    /// What this shard's TCP layer has sent, and what it is currently
+    /// advertising. Behind the shard lock, so this is a statistics-path
+    /// call rather than a hot-path one.
+    pub(super) fn tcp_counters(&self, idx: usize) -> TcpStackCounters {
+        self.shards[idx].inner.lock().stack.tcp_counters()
+    }
+
+    /// Frames this shard refused for want of receive room since boot.
+    pub(super) fn refused_frame_count(&self, idx: usize) -> u64 {
+        self.shards[idx]
+            .rx_refused_frames
+            .load(AtomicOrdering::Relaxed)
     }
 
     /// The shard's cross-processor arrival signal. Raised by whichever
@@ -755,15 +791,16 @@ impl NetworkShardSet {
     /// shard when the call relieved its receive backpressure.
     ///
     /// A frame arrival is not the only thing that unblocks a shard. A
-    /// stack whose receive queue is full refuses every frame offered to
-    /// it, so the packet pump receives nothing, transmits nothing and
-    /// parks — and the only event that can make the stack take a frame
-    /// again is the application read that makes room. That read happens
-    /// on the socket's own task, under this lock, and produces no frame
-    /// of its own, so it has to raise the signal itself: without it the
-    /// pump sleeps to the next protocol deadline, which for a pure
-    /// receiver is the DHCP retransmit interval a second away, while
-    /// the peer sits window-blocked (#107).
+    /// socket whose receive queue is full advertises a shut window, the
+    /// peer stops sending, and the pump then receives nothing,
+    /// transmits nothing and parks — and the only event that can start
+    /// the flow again is the application read that makes room. That
+    /// read happens on the socket's own task, under this lock, and
+    /// produces no frame of its own, so it has to raise the signal
+    /// itself: without it the pump sleeps to the next protocol
+    /// deadline, which for a pure receiver is the DHCP retransmit
+    /// interval a second away, while the peer sits window-blocked
+    /// (#107).
     ///
     /// The signal is raised after the lock is released, so a woken
     /// waiter never contends with the drain that woke it.
@@ -811,11 +848,8 @@ impl NetworkShardSet {
         let shard_idx = shard_idx_for_frame(frame, self.shard_count());
         let mut shard = self.shards[shard_idx].inner.lock();
         let dispatch = match shard.stack.receive_rx_frame(frame.clone(), received_at) {
-            Ok(backpressured) => RxFrameDispatch::Delivered {
-                shard_idx,
-                backpressured,
-            },
-            Err(StackError::ReceiveBackpressure) => RxFrameDispatch::Backpressured,
+            Ok(_) => RxFrameDispatch::Delivered { shard_idx },
+            Err(StackError::ReceiveBackpressure) => RxFrameDispatch::Backpressured { shard_idx },
             Err(error) => {
                 tracing::debug!(?error, "dropped malformed network frame");
                 RxFrameDispatch::Malformed
