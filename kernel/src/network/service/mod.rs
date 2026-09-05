@@ -2468,6 +2468,157 @@ mod tests {
         );
     }
 
+    /// #158's other candidate, closed by construction: an echo reply
+    /// drained on a processor that does not own the stream must release
+    /// the reader parked on the stream's own shard.
+    ///
+    /// A request/response exchange parks on every single reply, so a
+    /// hand-off that only worked when the drain happened to run on the
+    /// owning processor would have shown up as a `tcp-latency` that
+    /// advanced one delayed-ACK deadline at a time. It does not: the
+    /// demux routes the reply to the shard the flow was placed on and
+    /// the drain releases that shard's waiter, whichever processor ran
+    /// it. Asserted with no timer in the test, so only the notification
+    /// can end the park.
+    #[test]
+    fn an_echo_reply_drained_on_a_foreign_processor_wakes_the_tcp_reader() {
+        const REPLY: [u8; 16] = [7; 16];
+
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        // The fixture drains as processor 0 and the stream lives on
+        // shard 1, so every hand-off below is cross-processor.
+        let owner = 1;
+        let cpu = RecordingSmpCpu::new(0, 2);
+        let control = super::NetworkControlPlane::new();
+        let state = super::NetworkShardSet::new(2, |index| {
+            NetworkShard::new(test_stack_config(), 1 + index as u32, index, 2)
+        });
+        // The port the connection is opened on is the one whose replies
+        // hash back to the owning shard, exactly as
+        // `allocate_tcp_local_port_for` picks it.
+        let local_port = (49_152..u16::MAX)
+            .find(|local_port| {
+                super::shard_idx_for_flow(
+                    IpAddress::Ipv4(local),
+                    *local_port,
+                    IpAddress::Ipv4(peer),
+                    80,
+                    state.shard_count(),
+                ) == owner
+            })
+            .expect("some ephemeral port hashes to the foreign shard");
+
+        let stream = {
+            let mut shard = state.shard_at(owner).lock();
+            shard.stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+            let socket = shard
+                .stack
+                .open_tcp_connect(
+                    TcpEndpoint {
+                        address: IpAddress::Ipv4(local),
+                        port: local_port,
+                    },
+                    TcpEndpoint {
+                        address: IpAddress::Ipv4(peer),
+                        port: 80,
+                    },
+                    7,
+                )
+                .expect("the test connection should allocate a socket");
+            shard.insert_tcp_stream(socket)
+        };
+        assert_eq!(state.shard_idx_for_handle(stream), owner);
+
+        let deliver = |header: TcpHeader, payload: &[u8], nanos: u64| {
+            let (frame, len) = ipv4_tcp_frame(peer, local, header, payload);
+            let mut arrivals = super::ShardArrivals::new();
+            match state.dispatch_rx_frame(
+                &unhashed(&frame[..len]),
+                StackInstant::from_nanos(nanos),
+                &control,
+            ) {
+                super::RxFrameDispatch::Delivered { shard_idx } => {
+                    assert_eq!(
+                        shard_idx, owner,
+                        "the segment belongs to the stream's shard"
+                    );
+                    arrivals.record(shard_idx);
+                }
+                _ => panic!("the owning shard should have taken the segment"),
+            }
+            state.notify_arrivals(&arrivals, &cpu);
+        };
+
+        deliver(
+            TcpHeader {
+                source_port: 80,
+                destination_port: local_port,
+                sequence: 100,
+                acknowledgement: 8,
+                flags: TcpFlags::SYN.union(TcpFlags::ACK),
+                window_size: u16::MAX,
+            },
+            &[],
+            1,
+        );
+
+        // The reader's park, taken the way `execute_tcp_read_into`
+        // takes it: mark the shard first, then find nothing to read.
+        let wait = state.shard_wait(owner);
+        assert!(
+            matches!(
+                state
+                    .shard_at(owner)
+                    .lock()
+                    .poll_tcp_read(stream, REPLY.len(), StackInstant::from_nanos(2))
+                    .expect("an established stream should poll"),
+                TcpReadProgress::Pending
+            ),
+            "the reply is still on the wire"
+        );
+        let mut parked = core::pin::pin!(state.arrival(owner).changed(wait.mark));
+        assert!(
+            block_on(poll_once(parked.as_mut())).is_none(),
+            "the reader must park until the reply is placed in its shard"
+        );
+
+        let woken_before_reply = cpu.woken().len();
+        deliver(
+            TcpHeader {
+                source_port: 80,
+                destination_port: local_port,
+                sequence: 101,
+                acknowledgement: 8,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+            },
+            &REPLY,
+            3,
+        );
+
+        assert!(
+            block_on(poll_once(parked)).is_some(),
+            "the foreign drain must release the reader, not its deadline"
+        );
+        assert_eq!(
+            cpu.woken()[woken_before_reply..],
+            [helios_hal::cpu::ProcessorId::new(1)],
+            "the owning processor must be pulled out of its idle park"
+        );
+        assert!(
+            matches!(
+                state
+                    .shard_at(owner)
+                    .lock()
+                    .poll_tcp_read(stream, REPLY.len(), StackInstant::from_nanos(4))
+                    .expect("an established stream should poll"),
+                TcpReadProgress::Data(ref bytes) if bytes.as_ref() == REPLY,
+            ),
+            "and the reply must be what the reader then reads"
+        );
+    }
+
     /// The regression #107 describes: a socket that is only receiving
     /// closes its receive window, and from that moment the pump's poll
     /// takes no frame, sends nothing and reports itself idle.

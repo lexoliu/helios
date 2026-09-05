@@ -1754,7 +1754,18 @@ where
                 let action = self.acknowledge_sent(
                     packet.acknowledgement,
                     now_nanos,
-                    false,
+                    // Application-limited, exactly as the passive-open
+                    // sibling below declares its own handshake. A SYN
+                    // carries no payload and nothing can be queued
+                    // behind it while the socket is still connecting,
+                    // so this acknowledgement covers one byte over one
+                    // round trip: it measures the application, not the
+                    // path. Declared bandwidth-limited it seeded the
+                    // congestion controller's model with "one byte per
+                    // round trip", and no later acknowledgement of a
+                    // request/response flow can revise that, because
+                    // those are application-limited too (#158).
+                    true,
                     packet.options.timestamp(),
                     false,
                 );
@@ -2227,9 +2238,20 @@ where
                     .max(last.saturating_sub(first))
             })
             .unwrap_or(0);
-        let timestamp_rtt_nanos = timestamp.and_then(|timestamp| {
-            (timestamp.echo_reply != 0).then(|| timestamp_echo_rtt_nanos(now_nanos, timestamp))
-        });
+        // The timestamp option's clock ticks in milliseconds, so an echo
+        // that comes back inside the same tick resolves to zero. Zero is
+        // not a round-trip time, it is "shorter than this clock can
+        // say", and it must not replace the send-time measurement, which
+        // has nanosecond resolution: a path fast enough to answer inside
+        // a millisecond would otherwise report no round trip at all and
+        // leave every consumer of the sample — the retransmission timer
+        // and the congestion controller's minimum-RTT estimate — with
+        // nothing to work from.
+        let timestamp_rtt_nanos = timestamp
+            .and_then(|timestamp| {
+                (timestamp.echo_reply != 0).then(|| timestamp_echo_rtt_nanos(now_nanos, timestamp))
+            })
+            .filter(|rtt_nanos| *rtt_nanos != 0);
         let rtt_nanos = timestamp_rtt_nanos.unwrap_or(rtt_nanos);
         let interval_nanos = if interval_nanos == 0 {
             timestamp_rtt_nanos.unwrap_or(0)
@@ -4634,6 +4656,150 @@ mod tests {
             .expect("local transmit buffer should drain through normal send path");
         assert_eq!(segment.payload.len(), TCP_RECEIVE_SEGMENT_BYTES);
         assert_eq!(socket.queue_send(b"x"), 1);
+    }
+
+    /// #158: a request/response exchange must be paced by the path, not
+    /// by its own handshake.
+    ///
+    /// The SYN-ACK acknowledges one byte — the sequence number the SYN
+    /// consumed — after one round trip. Taken as a delivery-rate sample
+    /// that reads as one byte per round trip, three to four orders of
+    /// magnitude below any real path, and because every later
+    /// acknowledgement of a ping-pong flow *is* application-limited,
+    /// nothing can ever revise it. `bench-x86-64-linux` measured the
+    /// consequence: with a 6.5 ms handshake the pacing rate came out at
+    /// 441 B/s, each sixteen-byte request waited 36.3 ms for its pacing
+    /// deadline, and `tcp-latency`'s five thousand round trips needed
+    /// 181 s against a 180 s deadline.
+    #[test]
+    fn a_request_response_flow_is_not_paced_by_its_handshake() {
+        const HANDSHAKE_RTT_NANOS: u64 = 6_500_000;
+        const REQUEST: [u8; 16] = [7; 16];
+
+        let mut socket = TcpSocket::connect(endpoint(49152), peer(80), 7, BbrV3::new(1460));
+        socket.mark_syn_queued(0);
+        let _ = deliver_segment(
+            &mut socket,
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 100,
+                acknowledgement: 8,
+                flags: TcpFlags::SYN.union(TcpFlags::ACK),
+                window_size: u16::MAX,
+                options: TcpOptions::empty(),
+                payload: &[],
+            },
+            HANDSHAKE_RTT_NANOS,
+        );
+        socket.mark_ack_queued();
+
+        // A window's worth of data one round trip apart, which is what a
+        // connection that has delivered nothing may assume — not the one
+        // byte its handshake happened to acknowledge.
+        let rate = socket
+            .congestion()
+            .pacing_rate()
+            .expect("the handshake round trip is enough to pace the first window");
+        assert_eq!(
+            rate.bytes_per_second(),
+            1460 * 10 * 1_000_000_000 / HANDSHAKE_RTT_NANOS * 2885 / 1000,
+            "the initial rate is the initial window over the handshake round trip, \
+             with the startup gain"
+        );
+
+        // The exchange itself: request, reply, request. The second
+        // request is the one the pacing deadline used to hold.
+        let request_at = HANDSHAKE_RTT_NANOS;
+        assert_eq!(socket.queue_send(&REQUEST), REQUEST.len());
+        let first = socket
+            .take_transmit_segment(request_at, TcpSegmentBudget::wire_segments(usize::MAX))
+            .expect("the first request should transmit");
+        assert_eq!(first.payload.as_ref(), &REQUEST);
+
+        let reply_at = request_at + HANDSHAKE_RTT_NANOS;
+        let _ = deliver_segment(
+            &mut socket,
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 101,
+                acknowledgement: 8 + REQUEST.len() as u32,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+                options: TcpOptions::empty(),
+                payload: &REQUEST,
+            },
+            reply_at,
+        );
+
+        assert_eq!(socket.queue_send(&REQUEST), REQUEST.len());
+        let second = socket
+            .take_transmit_segment(reply_at, TcpSegmentBudget::wire_segments(usize::MAX))
+            .expect("the next request must not wait on a pacing deadline of its own");
+        assert_eq!(second.payload.as_ref(), &REQUEST);
+    }
+
+    /// The other half: a flow that does fill its window is still paced
+    /// by what the path delivered, so the fix above does not turn the
+    /// pacing rate into a constant.
+    #[test]
+    fn a_bulk_flow_is_paced_by_the_delivery_rate_it_measured() {
+        const HANDSHAKE_RTT_NANOS: u64 = 6_500_000;
+
+        let mut socket = TcpSocket::connect(endpoint(49152), peer(80), 7, BbrV3::new(1460));
+        socket.mark_syn_queued(0);
+        let _ = deliver_segment(
+            &mut socket,
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 100,
+                acknowledgement: 8,
+                flags: TcpFlags::SYN.union(TcpFlags::ACK),
+                window_size: u16::MAX,
+                options: TcpOptions::empty(),
+                payload: &[],
+            },
+            HANDSHAKE_RTT_NANOS,
+        );
+        socket.mark_ack_queued();
+
+        let payload = [9u8; TCP_RECEIVE_SEGMENT_BYTES * 4];
+        assert_eq!(socket.queue_send(&payload), payload.len());
+        let sent_at = HANDSHAKE_RTT_NANOS;
+        let segment = socket
+            .take_transmit_segment(sent_at, TcpSegmentBudget::wire_segments(usize::MAX))
+            .expect("the first window should transmit");
+        let acked = segment.sequence_len;
+
+        // The application still has data queued when the acknowledgement
+        // lands, so this sample measures the path.
+        let delivery_rtt_nanos = 200_000;
+        let _ = deliver_segment(
+            &mut socket,
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 101,
+                acknowledgement: 8 + acked,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+                options: TcpOptions::empty(),
+                payload: &[],
+            },
+            sent_at + delivery_rtt_nanos,
+        );
+
+        let rate = socket
+            .congestion()
+            .pacing_rate()
+            .expect("a delivered window paces the flow");
+        assert_eq!(
+            rate.bytes_per_second(),
+            u64::from(acked) * 1_000_000_000 / delivery_rtt_nanos * 2885 / 1000,
+            "a bandwidth-limited sample must replace the initial estimate"
+        );
     }
 
     #[test]
