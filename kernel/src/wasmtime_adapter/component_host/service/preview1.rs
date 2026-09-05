@@ -29,6 +29,14 @@ where
     pub(super) tty_state: WasixTtyState,
     pub(super) signal_callback: Option<String>,
     pub(super) signal_state: WasixSignalState,
+    /// The `proc_raise_interval` timer this store asked for, if any.
+    ///
+    /// A repeating interval sleeps between raises, so nothing but its
+    /// owner can end it. The store is that owner: dropping this handle
+    /// cancels the task and returns its block to the executor's
+    /// instance share, so the timer cannot outlive the instance that
+    /// asked for it (#132).
+    pub(super) signal_interval: Option<crate::JoinHandle<()>>,
     pub(super) signal_dispositions: Vec<WasixSignalDisposition>,
     pub(super) descriptors: Preview1DescriptorTable,
     pub(super) asyncify: WasixAsyncifyState,
@@ -106,6 +114,7 @@ where
             tty_state,
             signal_callback: None,
             signal_state,
+            signal_interval: None,
             signal_dispositions,
             descriptors,
             asyncify: WasixAsyncifyState::new(),

@@ -1564,6 +1564,9 @@ where
     };
     if interval == 0 {
         caller.data().signal_state.cancel_interval();
+        // Dropping the handle cancels the timer task, so the instance
+        // share gets its block back now rather than one interval later.
+        caller.data_mut().signal_interval = None;
         return p1::errno::SUCCESS;
     }
     let interval = match u64::try_from(interval) {
@@ -1574,7 +1577,8 @@ where
     let signal_state = caller.data().signal_state.clone();
     let generation = signal_state.next_interval_generation();
     let timer = caller.data().timer();
-    if let Err(error) = caller.data().spawner.try_spawn_detached(async move {
+    let spawner = caller.data().spawner.clone();
+    let timer_task = spawner.try_spawn(async move {
         loop {
             timer.sleep_for(Duration::from_nanos(interval)).await;
             if !signal_state.interval_generation_is_current(generation) {
@@ -1585,13 +1589,23 @@ where
                 break;
             }
         }
-    }) {
-        tracing::warn!(
-            target: "helios_kernel::program",
-            %error,
-            "refused a signal interval timer: the executor's instance share is full"
-        );
-        return p1::errno::NOMEM;
+    });
+    match timer_task {
+        // The store owns the timer for the rest of its life: a repeating
+        // interval sleeps between raises, so a detached one would hold
+        // its block in the executor's instance share long after the
+        // instance that asked for it had exited (#132). Assigning also
+        // cancels whatever interval this store had before, which is the
+        // generation bump above expressed as ownership.
+        Ok(task) => caller.data_mut().signal_interval = Some(task),
+        Err(error) => {
+            tracing::warn!(
+                target: "helios_kernel::program",
+                %error,
+                "refused a signal interval timer: the executor's instance share is full"
+            );
+            return p1::errno::NOMEM;
+        }
     }
     p1::errno::SUCCESS
 }

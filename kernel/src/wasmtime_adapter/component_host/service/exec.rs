@@ -471,8 +471,7 @@ where
             })?;
         record_program_kernel_profile_sample(resolve_start_profile, "resolve-core-start");
 
-        let run_done = Arc::new(core::sync::atomic::AtomicBool::new(false));
-        super::spawn_component_phase_heartbeat(
+        let run_heartbeat = super::spawn_component_phase_heartbeat(
             &spawner,
             &run_cpu,
             &run_timer,
@@ -481,7 +480,6 @@ where
             super::ComponentPhase {
                 name: "program:run-core",
                 started_at: run_started_at,
-                done: &run_done,
             },
         )
         .map_err(map_task_capacity_error)?;
@@ -507,7 +505,7 @@ where
             "run-core",
             run_phase_started,
         );
-        run_done.store(true, core::sync::atomic::Ordering::Release);
+        drop(run_heartbeat);
         super::emit_program_stage_marker(exec_context.write_serial, "program:run-core-end");
 
         let completion_profile = start_program_kernel_profile(&profile_runtime_state, &profile_cpu);
@@ -697,8 +695,7 @@ where
             })?;
         record_program_kernel_profile_sample(resolve_start_profile, "resolve-core-start-rewind");
 
-        let run_done = Arc::new(core::sync::atomic::AtomicBool::new(false));
-        super::spawn_component_phase_heartbeat(
+        let run_heartbeat = super::spawn_component_phase_heartbeat(
             &spawner,
             &run_cpu,
             &run_timer,
@@ -707,7 +704,6 @@ where
             super::ComponentPhase {
                 name: "program:run-core",
                 started_at: run_started_at,
-                done: &run_done,
             },
         )
         .map_err(map_task_capacity_error)?;
@@ -733,7 +729,7 @@ where
             "run-core-rewind",
             run_phase_started,
         );
-        run_done.store(true, core::sync::atomic::Ordering::Release);
+        drop(run_heartbeat);
         super::emit_program_stage_marker(exec_context.write_serial, "program:run-core-end");
 
         let completion_profile = start_program_kernel_profile(&profile_runtime_state, &profile_cpu);
@@ -918,8 +914,7 @@ where
     let executor = executor.map_err(map_program_runtime_error)?;
     super::emit_program_stage_marker(exec_context.write_serial, "program:instantiate-ok");
 
-    let run_done = Arc::new(core::sync::atomic::AtomicBool::new(false));
-    super::spawn_component_phase_heartbeat(
+    let run_heartbeat = super::spawn_component_phase_heartbeat(
         &spawner,
         &run_cpu,
         &run_timer,
@@ -928,7 +923,6 @@ where
         super::ComponentPhase {
             name: "program:run",
             started_at: run_started_at,
-            done: &run_done,
         },
     )
     .map_err(map_task_capacity_error)?;
@@ -941,7 +935,7 @@ where
         "run-component",
         run_phase_started,
     );
-    run_done.store(true, core::sync::atomic::Ordering::Release);
+    drop(run_heartbeat);
     let result = result.map_err(map_program_runtime_error)?;
     super::emit_program_stage_marker(exec_context.write_serial, "program:run-end");
 
