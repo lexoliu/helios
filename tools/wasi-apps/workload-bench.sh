@@ -113,6 +113,14 @@ if [[ -n "${HELIOS_WORKLOAD_BENCH_HOST_TCP_PORT:-}" ]]; then
     command+=(--host-tcp-port "${HELIOS_WORKLOAD_BENCH_HOST_TCP_PORT}")
 fi
 
+# A workload runs inside the guest and is reported by an RPC that never
+# answers if the guest stops making progress, so the runner fails an
+# iteration that overruns rather than holding the lane. The inspector's
+# own default applies unless a slower surface asks for more.
+if [[ -n "${HELIOS_WORKLOAD_BENCH_WORKLOAD_TIMEOUT_SECONDS:-}" ]]; then
+    command+=(--workload-timeout-seconds "${HELIOS_WORKLOAD_BENCH_WORKLOAD_TIMEOUT_SECONDS}")
+fi
+
 if [[ -n "${HELIOS_WORKLOAD_BENCH_PROFILE_OUTPUT:-}" ]]; then
     command+=(--profile-output "${HELIOS_WORKLOAD_BENCH_PROFILE_OUTPUT}")
 fi

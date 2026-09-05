@@ -687,7 +687,14 @@ jobs:
   bench:
     name: bench-${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 180
+    # The lane builds the inspector and the guest, then boots once per
+    # workload class; a healthy run is around half an hour. The runner's
+    # own per-iteration deadline is what catches a hung workload, so
+    # this only has to catch a hang the runner cannot see — a build or a
+    # boot that never finishes — and it is set close enough to a real
+    # run that it does so in the same hour rather than three hours
+    # later.
+    timeout-minutes: 75
     env:
       HELIOS_NET_IFNAME: helios0
       HELIOS_NET_BRIDGE: helios-br0
