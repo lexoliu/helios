@@ -23,8 +23,8 @@ use crate::{
     ComponentOutputStreamKind, ComponentStoreData, DeadlinePollable, EmbeddedComponent, ExecResult,
     ProgramExecError, ProgramExecErrorDetail, ProgramExecErrorKind, RawMutex,
     RawMutexGuardResource, RawMutexResource, RawRwLock, RawRwLockReadGuardResource,
-    RawRwLockResource, RawRwLockWriteGuardResource, SerialPortResource, elapsed_millis, heap_stats,
-    largest_servable_user_bytes, monotonic_nanos, user_heap_stats,
+    RawRwLockResource, RawRwLockWriteGuardResource, SerialPortResource, elapsed_millis,
+    largest_servable_user_bytes, machine_memory, monotonic_nanos, user_heap_stats,
 };
 use helios_hal::cpu::Cpu;
 use spin::Mutex;
@@ -57,7 +57,15 @@ const NET_INSTANCE: &str = "helios:system/net@0.1.0";
 const TRACING_INSTANCE: &str = "helios:system/tracing@0.1.0";
 const PROFILING_INSTANCE: &str = "helios:system/profiling@0.1.0";
 const INSTANCES_INSTANCE: &str = "helios:system/instances@0.1.0";
-const COMPONENT_CACHE_FRACTION: usize = 8;
+/// The share of the machine's free memory the compiled-component cache
+/// may hold.
+///
+/// It used to be an eighth of the kernel heap's free space, back when
+/// the kernel heap was a fixed quarter of the machine — a thirty-second
+/// of the machine, arrived at through a share of a share. The kernel
+/// heap's size is demand-driven now (see `memory::policy`), so the same
+/// budget has to be expressed against the thing that does not move.
+const COMPONENT_CACHE_FRACTION: usize = 32;
 const COMPONENT_PHASE_HEARTBEAT_INTERVAL_NANOS: u64 = 5_000_000_000;
 
 fn lower_bytes_to_vec(bytes: Bytes) -> Vec<u8> {
@@ -3781,12 +3789,19 @@ macro_rules! convert_swap_stats {
     };
 }
 
+/// The machine's memory, not the kernel heap's.
+///
+/// The two domains draw on the same physical memory — the kernel heap
+/// takes what it needs out of the user pool — so a consumer asking how
+/// much memory there is wants one number for both. Reporting the kernel
+/// heap alone made `procbench`'s `memory_per_instance_bytes` measure a
+/// share whose size is itself demand-driven, which is not a footprint.
 fn convert_sample(sample: StatsSample) -> debugger_wit::stats::Sample {
-    let heap = heap_stats();
+    let machine = machine_memory();
     let total_bytes =
-        u64::try_from(heap.total_bytes).expect("kernel heap total bytes do not fit into u64");
-    let available_bytes = u64::try_from(heap.available_bytes())
-        .expect("kernel heap available bytes do not fit into u64");
+        u64::try_from(machine.usable_bytes).expect("machine memory does not fit into u64");
+    let available_bytes =
+        u64::try_from(machine.free_bytes).expect("free machine memory does not fit into u64");
     debugger_wit::stats::Sample {
         timestamp: sample.timestamp,
         uptime: sample.uptime,
@@ -3812,12 +3827,14 @@ fn convert_sample(sample: StatsSample) -> debugger_wit::stats::Sample {
     }
 }
 
+/// See [`convert_sample`]: the same machine-wide reading, for the
+/// unprivileged program world.
 fn convert_program_sample(sample: StatsSample) -> program_wit::stats::Sample {
-    let heap = heap_stats();
+    let machine = machine_memory();
     let total_bytes =
-        u64::try_from(heap.total_bytes).expect("kernel heap total bytes do not fit into u64");
-    let available_bytes = u64::try_from(heap.available_bytes())
-        .expect("kernel heap available bytes do not fit into u64");
+        u64::try_from(machine.usable_bytes).expect("machine memory does not fit into u64");
+    let available_bytes =
+        u64::try_from(machine.free_bytes).expect("free machine memory does not fit into u64");
     program_wit::stats::Sample {
         timestamp: sample.timestamp,
         uptime: sample.uptime,

@@ -1459,7 +1459,7 @@ fn report_balloon(
         Err(error) => format!("qemu-backed=unavailable ({error})"),
     };
     println!(
-        "{} {label}: {guest} {host} user-memory-available={}",
+        "{} {label}: {guest} {host} machine-memory-available={}",
         style("balloon").green(),
         format_bytes(sample.memory.available_bytes)
     );

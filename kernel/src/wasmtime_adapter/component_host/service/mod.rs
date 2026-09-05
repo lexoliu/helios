@@ -385,8 +385,7 @@ where
         return service;
     }
 
-    let available_bytes = heap_stats().available_bytes();
-    let cache_budget = available_bytes / COMPONENT_CACHE_FRACTION;
+    let cache_budget = machine_memory().free_bytes / COMPONENT_CACHE_FRACTION;
     let shared_memory_pool_budget =
         user_heap_stats().available_bytes() / SHARED_MEMORY_POOL_FRACTION;
     let runtime = crate::wasmtime_adapter::WasmtimeComponentRuntime::new(cpu.clone());

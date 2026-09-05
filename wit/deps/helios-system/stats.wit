@@ -31,8 +31,17 @@ interface stats {
     utilization: list<processor>,
   }
 
+  /// The machine's memory, across both of the kernel's allocation
+  /// domains.
+  ///
+  /// The kernel heap and the user pool draw on the same physical
+  /// memory — the pool is seeded with everything the boot memory map
+  /// described and the kernel heap takes what it needs out of it — so
+  /// one number covers both. See `docs/memory.md`.
   record memory {
+    /// Every usable byte the boot memory map described.
     total-bytes: u64,
+    /// Bytes neither domain has handed out.
     available-bytes: u64,
     pressure: memory-pressure,
   }
