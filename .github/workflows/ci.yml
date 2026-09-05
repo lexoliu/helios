@@ -143,6 +143,7 @@ jobs:
           runtime="$GITHUB_WORKSPACE/smoke-runtime/boot"
           mkdir -p "$runtime"
           ./target/release/helios-inspector vm --arch riscv64 --release --memory 2G \
+            --accel tcg \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program debugger --no-compiler-plugin \
             shell -c 'echo ok' 2>&1 > boot-smoke.out | tee "$runtime/inspector.log"
@@ -163,6 +164,7 @@ jobs:
           runtime="$GITHUB_WORKSPACE/smoke-runtime/wall-clock"
           mkdir -p "$runtime"
           ./target/release/helios-inspector vm --arch riscv64 --release --memory 2G \
+            --accel tcg \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program debugger --boot-program date \
             --no-compiler-plugin \
@@ -188,6 +190,7 @@ jobs:
           runtime="$GITHUB_WORKSPACE/smoke-runtime/coreutils"
           mkdir -p "$runtime"
           ./target/release/helios-inspector vm --arch riscv64 --release --memory 2G \
+            --accel tcg \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program debugger \
             --boot-program ls --boot-program mkdir --boot-program cat \
@@ -212,6 +215,7 @@ jobs:
           runtime="$GITHUB_WORKSPACE/smoke-runtime/cpython"
           mkdir -p "$runtime"
           ./target/release/helios-inspector vm --arch riscv64 --release --memory 2G \
+            --accel tcg \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program debugger --boot-program python3 \
             --no-compiler-plugin \
@@ -239,6 +243,7 @@ jobs:
           runtime="$GITHUB_WORKSPACE/smoke-runtime/oob-load"
           mkdir -p "$runtime"
           ./target/release/helios-inspector vm --arch riscv64 --release --memory 2G \
+            --accel tcg \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program debugger --boot-program oob-load \
             --no-compiler-plugin \
@@ -267,6 +272,7 @@ jobs:
           ls -l /dev/vhost-vsock
           id
           ./target/release/helios-inspector vm --arch riscv64 --release --memory 2G \
+            --accel tcg \
             --rpc-transport vsock \
             --boot-program dash --boot-program debugger --no-compiler-plugin \
             shell -c 'echo ok' > vsock-smoke.out
@@ -289,6 +295,7 @@ jobs:
           runtime="$GITHUB_WORKSPACE/smoke-runtime/curl"
           mkdir -p "$runtime"
           ./target/release/helios-inspector vm --arch riscv64 --release --memory 2G \
+            --accel tcg \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program debugger \
             --boot-program curl --boot-program http-client --no-compiler-plugin \
@@ -312,10 +319,11 @@ jobs:
 
   # A native Arm Linux runner under multi-threaded TCG. This lane is a
   # functional check, not a performance surface: `ubuntu-24.04-arm`
-  # exposes no `/dev/kvm`, so the inspector's capability probe selects
-  # TCG and `-cpu max`. It would pick KVM up on its own if GitHub ever
-  # publishes an accelerated Arm runner; the first step records which
-  # one this run actually had.
+  # publishes no `/dev/kvm` at all — `-accel kvm` there fails with
+  # "Could not access KVM kernel module" (probe run 33944339758) — so
+  # both boots below ask for `--accel tcg` on purpose. The inspector
+  # requires a profile's native accelerator when nobody names one, so a
+  # lane that means to measure the emulator has to say so (#118).
   #
   # The QEMU 8.2 that Ubuntu 24.04 ships asserts in its emulated GICv3
   # CPU interface under multi-threaded TCG
@@ -436,6 +444,7 @@ jobs:
           runtime="$GITHUB_WORKSPACE/smoke-runtime/device-tree"
           mkdir -p "$runtime"
           ./target/release/helios-inspector vm --arch aarch64 --release --memory 2G \
+            --accel tcg \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program debugger --no-compiler-plugin \
             shell -c 'echo ok' 2>&1 > boot-dt.out | tee "$runtime/inspector.log"
@@ -461,6 +470,7 @@ jobs:
           runtime="$GITHUB_WORKSPACE/smoke-runtime/acpi"
           mkdir -p "$runtime"
           ./target/release/helios-inspector vm --arch aarch64 --release --memory 2G --acpi \
+            --accel tcg \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program debugger --no-compiler-plugin \
             shell -c 'echo ok' 2>&1 > boot-acpi.out | tee "$runtime/inspector.log"
@@ -484,9 +494,10 @@ jobs:
     env:
       HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
       HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
-      # The accelerator is picked by capability, so this lane runs under
-      # KVM where the runner exposes it and TCG where it does not. The
-      # budget is sized for the slower of the two.
+      # Every boot below names `--accel kvm`. The inspector no longer
+      # falls through to the emulator on its own, and this runner does
+      # publish /dev/kvm (probe run 33944339758), so a run that lost it
+      # should say so rather than quietly take twenty times as long.
       HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
     steps:
       - uses: actions/checkout@v4
@@ -548,6 +559,7 @@ jobs:
           runtime="$GITHUB_WORKSPACE/smoke-runtime/boot"
           mkdir -p "$runtime"
           ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+            --accel kvm \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program debugger --no-compiler-plugin \
             shell -c 'echo ok' 2>&1 > boot-smoke.out | tee "$runtime/inspector.log"
@@ -563,6 +575,7 @@ jobs:
           runtime="$GITHUB_WORKSPACE/smoke-runtime/coreutils"
           mkdir -p "$runtime"
           ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+            --accel kvm \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program debugger \
             --boot-program ls --boot-program mkdir --boot-program cat \
@@ -585,6 +598,7 @@ jobs:
           runtime="$GITHUB_WORKSPACE/smoke-runtime/compiler"
           mkdir -p "$runtime"
           ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+            --accel kvm \
             --runtime-dir "$runtime" --keep-runtime-dir \
             shell --trace-log "$runtime/guest-tracing.log" -c 'echo compiler:ok' \
             2>&1 > compiler-smoke.out | tee "$runtime/inspector.log"
@@ -608,6 +622,7 @@ jobs:
           runtime="$GITHUB_WORKSPACE/smoke-runtime/oob-load"
           mkdir -p "$runtime"
           ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+            --accel kvm \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program debugger --boot-program oob-load \
             --no-compiler-plugin \
@@ -636,6 +651,7 @@ jobs:
           runtime="$GITHUB_WORKSPACE/smoke-runtime/curl"
           mkdir -p "$runtime"
           ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+            --accel kvm \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program debugger \
             --boot-program curl --boot-program http-client --no-compiler-plugin \
@@ -685,6 +701,10 @@ jobs:
             runner: ubuntu-24.04
             helios-arch: x86-64
             vm-memory: 2G
+            # Named rather than probed: a benchmark that quietly measured
+            # the emulator would be worse than no benchmark (#118), and
+            # this runner does publish /dev/kvm (probe run 33944339758).
+            accel: kvm
             # KVM boots in seconds; a marker hang should fail fast.
             boot-timeout: "300"
             workloads: ""
@@ -694,18 +714,15 @@ jobs:
             # TSO paths exist at all. See docs/networking.md.
             net-backend: tap
             net-host: 10.77.0.1
-          # There is deliberately no aarch64 lane, on Linux or anywhere
-          # else. GitHub's Arm runners expose neither /dev/kvm nor a
-          # readable /dev/vhost-net, so an aarch64 guest there runs
-          # under TCG behind a userspace tap — no accelerator and no
-          # multi-queue offload — which is not evidence for anything
-          # AGENTS.md §3.5 asks a benchmark to show. The macOS lane that
-          # used to sit here measured no better: its run record showed
-          # `"accel":["tcg"]`, because GitHub's macOS runners report
-          # kern.hv_support=0 and the inspector's probe falls through to
-          # TCG (#118). aarch64 numbers are taken on a real arm64
-          # machine or a self-hosted runner, and the multi-queue network
-          # baseline comes from the x86-64 KVM lane above.
+          # This is the only benchmark lane there is. Nearly everything
+          # a helios benchmark measures lives in the cross-platform
+          # kernel, so performance is single-architecture by decision,
+          # and x86-64 KVM is the one GitHub-hosted surface that can
+          # measure it: the Arm runners publish no /dev/kvm at all
+          # (`-accel kvm` there fails with "Could not access KVM kernel
+          # module", probe run 33944339758) and the macOS lane that used
+          # to stand in for them ran `"accel":["tcg"]` behind an HVF
+          # label (#118). aarch64 lanes in CI are functional smokes.
     steps:
       - uses: actions/checkout@v4
         with:
@@ -783,6 +800,7 @@ jobs:
           HELIOS_WORKLOAD_BENCH_VM_MEMORY: ${{ matrix.vm-memory }}
           HELIOS_WORKLOAD_BENCH_NET_BACKEND: ${{ matrix.net-backend }}
           HELIOS_WORKLOAD_BENCH_RUNTIME_DIR: ${{ env.BENCH_RUNTIME_DIR }}
+          HELIOS_WORKLOAD_BENCH_ACCEL: ${{ matrix.accel }}
         run: |
           # Without this the step reports tee's status, not the
           # command's, and a runner script that fails is invisible.
@@ -880,96 +898,4 @@ jobs:
         with:
           name: perf-baselines-${{ matrix.name }}
           path: helios/target/perf-baselines/ci-${{ matrix.name }}/**
-          if-no-files-found: warn
-
-  bench-linux-baseline:
-    name: bench-linux-baseline-aarch64
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 120
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          path: helios
-      - uses: ./helios/.github/actions/checkout-wasmtime
-      - name: Install host dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libudev-dev just cmake ninja-build \
-            qemu-system-arm qemu-efi-aarch64 qemu-utils genisoimage
-          # ubuntu-24.04-arm exposes no /dev/kvm; the baseline selects TCG by
-          # capability and provisions the guest with emulation-sized timeouts.
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: wasm-tools
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: 0.13.0
-      - name: Restore WASI tooling artifacts
-        id: artifact-cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            helios/artifacts/wasi-tools
-            helios/artifacts/python3-root
-            helios/artifacts/wasix
-          key: wasi-artifacts-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('helios/tools/wasi-apps/**', 'helios/Cargo.lock') }}
-      - name: Stage WASI tooling artifacts
-        if: steps.artifact-cache.outputs.cache-hit != 'true'
-        working-directory: helios
-        run: tools/wasi-apps/build.sh
-      - name: Restore pinned Fedora VM assets
-        uses: actions/cache@v4
-        with:
-          path: |
-            helios/target/perf-baselines/linux-vm/fedora-aarch64/Fedora-Cloud-Base-Generic-44-1.7.aarch64.qcow2
-            helios/target/perf-baselines/linux-vm/fedora-aarch64/sources
-            helios/target/perf-baselines/linux-vm/fedora-aarch64/tools
-          key: fedora-vm-assets-aarch64-44-1.7-wasmtime-48.0.0
-      - name: Run Linux baseline workloads
-        working-directory: helios
-        run: |
-          python3 tools/wasi-apps/linux-gap-bench.py \
-            --skip-helios \
-            --iterations 3 \
-            --allow-busy-host \
-            --linux-vm-memory 4G \
-            --linux-vm-smp 4 \
-            --linux-vm-setup-timeout-seconds 5400 \
-            --out-dir target/perf-baselines/ci-linux-baseline-aarch64
-      - name: Summarize results
-        if: always()
-        working-directory: helios
-        run: |
-          python3 - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
-          import json
-          from pathlib import Path
-
-          summary = Path("target/perf-baselines/ci-linux-baseline-aarch64/summary.json")
-          if not summary.is_file():
-              print("### Linux baseline (aarch64) produced no summary.json\n")
-              raise SystemExit(0)
-          payload = json.loads(summary.read_text())
-          print(f"### Linux baseline: {payload['linux_baseline']['kind']}\n")
-          print(f"- Wasmtime floor: `{payload['wasmtime_linux_baseline'].get('release')}`")
-          print(f"- Guest CPU: `{payload['linux_baseline'].get('qemu_cpu')}` "
-                f"on `{payload['linux_baseline'].get('qemu_machine')}`")
-          print(f"- Guest RAM: `{payload['linux_baseline'].get('qemu_ram')}`\n")
-          print("| workload | class | Linux native (ms) | Wasmtime-on-Linux (ms) |")
-          print("| --- | --- | ---: | ---: |")
-          for row in payload["workloads"]:
-              native = row["linux_median_ms"]
-              floor = row["wasmtime_linux_median_ms"]
-              print(f"| {row['name']} | {row['class']} "
-                    f"| {'n/a' if native is None else f'{native:.2f}'} "
-                    f"| {'n/a' if floor is None else f'{floor:.2f}'} |")
-          EOF
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: perf-baselines-linux-baseline-aarch64
-          path: |
-            helios/target/perf-baselines/ci-linux-baseline-aarch64/**
-            helios/target/perf-baselines/linux-vm/fedora-aarch64/serial.boot-attempt-*.log
-            helios/target/perf-baselines/linux-vm/fedora-aarch64/host-memory.boot-attempt-*.json
           if-no-files-found: warn

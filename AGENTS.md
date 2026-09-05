@@ -222,13 +222,29 @@ performance, then compare after. Baseline logs and reports live in
 `target/perf-baselines/` and are not committed; cite the median
 `elapsed_ms` and any regression directly in the PR description.
 
+**The performance surface is x86-64 Linux under KVM.** Nearly everything
+a helios benchmark measures lives in the cross-platform kernel, so
+performance is single-architecture by decision, and `bench-x86-64-linux`
+is the only benchmark lane CI has. Arm GitHub runners publish no
+`/dev/kvm` (probe run 33944339758), so there is no accelerated aarch64
+lane to have.
+
 The canonical workload is the in-kernel compiler plugin compiling a fixed
-wasm input under arm64+HVF (fastest supported surface, no TCG noise). HVF
-is a local arm64 machine or a self-hosted runner; no GitHub-hosted runner
-provides it, so this baseline is never taken from CI:
+wasm input. `aot-bench` on a local arm64 machine under HVF stays a valid
+optional measurement of the same workload on a second architecture, but
+it is no longer required and never comes from CI:
 
 ```bash
-./target/release/helios-inspector vm --arch aarch64 --release \
+./target/release/helios-inspector vm --arch x86-64 --release --accel kvm \
+    aot-bench artifacts/wasi-tools/curl.wasm --iterations 5 \
+    | tee target/perf-baselines/x86-64-kvm-curl-<short-sha>.log
+```
+
+The same workload on an arm64 machine under HVF, when a second
+architecture is worth a look:
+
+```bash
+./target/release/helios-inspector vm --arch aarch64 --release --accel hvf \
     aot-bench artifacts/wasi-tools/curl.wasm --iterations 5 \
     | tee target/perf-baselines/aarch64-hvf-curl-<short-sha>.log
 ```
@@ -248,11 +264,11 @@ virtio-net driver negotiates:
 ```bash
 helios-inspector vm net-setup \
     --net-backend tap --net-ifname helios0 --net-bridge helios-br0 --net-dhcp
-./target/release/helios-inspector vm --arch aarch64 --release \
+./target/release/helios-inspector vm --arch x86-64 --release --accel kvm \
     --net-backend tap --net-ifname helios0 --net-bridge helios-br0 \
     --net-queues "$(nproc)" \
     workload-bench --workload tcp-throughput --iterations 5 \
-    | tee target/perf-baselines/aarch64-tap-tcp-<short-sha>.jsonl
+    | tee target/perf-baselines/x86-64-tap-tcp-<short-sha>.jsonl
 ```
 
 Cite the negotiated feature set alongside the median: the `virtio-net
@@ -260,21 +276,16 @@ online` boot line records the queue-pair count and the checksum/TSO bits
 the run actually had. `docs/networking.md` covers the backends, the
 privileged setup, and what each one can exercise.
 
-Locally that baseline is an arm64 host with a tap backend. **In CI the
-multi-queue network baseline is the x86-64 KVM lane**, and it is the
-only lane that can produce one: GitHub's Arm Linux runners expose
-neither `/dev/kvm` nor a readable `/dev/vhost-net`, so a guest there
-would run under TCG behind a userspace tap, with no accelerator and no
-offload to measure. That is why there is no aarch64 benchmark lane at
-all. **No GitHub-hosted runner produces an aarch64 baseline**, CPU-side
-or network: the macOS lane that once claimed to be the arm64 HVF
-surface ran under TCG, because those runners report
-`kern.hv_support=0` and the inspector's capability probe falls through
-(#118). helios CI is Linux-only, and the one aarch64 lane it keeps —
-`smoke-aarch64` on `ubuntu-24.04-arm` — is a TCG functional check, not
-a performance surface. Take every arm64 number, CPU-side and network,
-on a real arm64 machine or a self-hosted runner, and do not read a
-cross-architecture comparison out of CI.
+**In CI the multi-queue network baseline is the x86-64 KVM lane**, the
+same single lane the compiler workload comes from. Locally the same
+baseline is any host with a tap backend.
+
+Every helios CI lane runs on a Linux runner, and the aarch64 and riscv64
+lanes CI keeps — `smoke-aarch64` and `smoke-riscv64` — are TCG functional
+checks, never performance surfaces. Neither the inspector nor a lane may
+reach TCG by falling back: the accelerator is named, and a host that
+cannot provide the one it was asked for fails saying which check refused
+(#118).
 
 ## 3.6 Architectural ambition
 

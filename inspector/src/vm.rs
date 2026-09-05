@@ -1,4 +1,6 @@
 use std::fs;
+use std::fs::File;
+use std::io;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
@@ -545,6 +547,10 @@ pub(crate) struct VmCommand {
     cpu: Option<String>,
 
     /// QEMU accelerator option. Repeat to pass multiple `-accel` entries.
+    ///
+    /// Left unset, the profile's native accelerator is required and the
+    /// run fails naming the check that refused it; emulation is never a
+    /// fallback, so pass `--accel tcg` to ask for it on purpose.
     #[arg(long)]
     accel: Vec<String>,
 
@@ -837,7 +843,7 @@ fn resolve(command: VmCommand) -> Result<ResolvedVmCommand> {
         file.baud.unwrap_or(DEFAULT_BAUD)
     };
     let mut accel = if file.accel.is_empty() && command.accel.is_empty() {
-        default_accel(profile)
+        default_accel(profile)?
     } else {
         file.accel
     };
@@ -1027,41 +1033,124 @@ fn default_config_path() -> Option<PathBuf> {
         .map(|dirs| dirs.config_dir().join("vm.json"))
 }
 
-/// Picks the profile's accelerator by host capability when the user gave
-/// none: the profile's native accelerator (HVF/KVM) only when this host
-/// can actually provide it, otherwise TCG. Profiles with no default
-/// accelerator keep QEMU's own default.
-fn default_accel(profile: &VmProfile) -> Vec<String> {
-    let native_host = match profile.arch {
-        VmArch::Aarch64 => std::env::consts::ARCH == "aarch64",
-        VmArch::X86_64 => std::env::consts::ARCH == "x86_64",
-        VmArch::Riscv64 => false,
-    };
+/// Why one of a profile's native accelerators cannot run on this host.
+///
+/// Each variant names the exact thing that was inspected, because the
+/// whole point of refusing to fall back is that the caller learns which
+/// check failed instead of silently getting an emulator.
+#[derive(Debug, thiserror::Error)]
+enum AcceleratorUnavailable {
+    #[error("`{accelerator}` needs a {required} host and this one is {host}")]
+    HostArchitecture {
+        accelerator: &'static str,
+        required: &'static str,
+        host: &'static str,
+    },
+    #[error("`hvf` needs a macOS host and this one runs {host_os}")]
+    HvfHostOs { host_os: &'static str },
+    #[error("`hvf` needs `kern.hv_support=1`; this host reports {reported}")]
+    HvfUnsupported { reported: String },
+    #[error("`hvf` needs `kern.hv_support`, which `sysctl` could not read: {source}")]
+    HvfProbeFailed {
+        #[source]
+        source: io::Error,
+    },
+    #[error("`kvm` needs /dev/kvm and this host has no such node")]
+    KvmNodeMissing,
+    #[error("`kvm` needs read/write access to /dev/kvm: {source}")]
+    KvmNodeUnusable {
+        #[source]
+        source: io::Error,
+    },
+}
+
+/// No accelerator the profile calls native is available on this host.
+///
+/// Emulation is a deliberate choice, never a fallback: a lane that
+/// quietly dropped to TCG reported HVF numbers that were TCG numbers for
+/// weeks (#118), so the inspector refuses to pick the emulator for the
+/// caller and says exactly what it inspected.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "no accelerator the {arch} profile can use is available on this host:\n{}\n\
+     pass `--accel tcg` to run under emulation on purpose",
+    .checks.iter().map(|check| format!("  - {check}")).collect::<Vec<_>>().join("\n")
+)]
+struct NoNativeAccelerator {
+    arch: &'static str,
+    checks: Vec<AcceleratorUnavailable>,
+}
+
+/// Picks the profile's accelerator when the caller named none: the first
+/// native accelerator this host can actually provide, and an error
+/// naming every failed check when it can provide none. Profiles with no
+/// native accelerator keep QEMU's own default.
+fn default_accel(profile: &VmProfile) -> Result<Vec<String>, NoNativeAccelerator> {
+    if profile.default_accel.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut checks = Vec::new();
     for accel in profile.default_accel {
-        let available = match *accel {
-            // The OS check alone is not enough: virtualized macOS hosts
-            // without nested virtualization (e.g. CI runners) ship the
-            // Hypervisor framework but report kern.hv_support=0, and QEMU
-            // aborts with HV_UNSUPPORTED if HVF is requested anyway.
-            "hvf" => {
-                native_host
-                    && std::env::consts::OS == "macos"
-                    && std::process::Command::new("sysctl")
-                        .args(["-n", "kern.hv_support"])
-                        .output()
-                        .is_ok_and(|output| String::from_utf8_lossy(&output.stdout).trim() == "1")
-            }
-            "kvm" => native_host && Path::new("/dev/kvm").exists(),
-            _ => true,
-        };
-        if available {
-            return vec![(*accel).to_owned()];
+        match probe_accel(profile.arch, *accel) {
+            Ok(()) => return Ok(vec![(*accel).to_owned()]),
+            Err(check) => checks.push(check),
         }
     }
-    if profile.default_accel.is_empty() {
-        Vec::new()
-    } else {
-        vec!["tcg".to_owned()]
+    Err(NoNativeAccelerator {
+        arch: arch_label(profile.arch),
+        checks,
+    })
+}
+
+/// Inspects the host state one named accelerator needs.
+fn probe_accel(arch: VmArch, accel: &'static str) -> Result<(), AcceleratorUnavailable> {
+    let required = match arch {
+        VmArch::Aarch64 => "aarch64",
+        VmArch::X86_64 => "x86_64",
+        // No host this runs on executes riscv64 natively, so no riscv64
+        // profile names a native accelerator in the first place.
+        VmArch::Riscv64 => "riscv64",
+    };
+    if std::env::consts::ARCH != required {
+        return Err(AcceleratorUnavailable::HostArchitecture {
+            accelerator: accel,
+            required,
+            host: std::env::consts::ARCH,
+        });
+    }
+    match accel {
+        // The OS check alone is not enough: virtualized macOS hosts
+        // without nested virtualization (e.g. CI runners) ship the
+        // Hypervisor framework but report kern.hv_support=0, and QEMU
+        // aborts with HV_UNSUPPORTED if HVF is requested anyway.
+        "hvf" => {
+            if std::env::consts::OS != "macos" {
+                return Err(AcceleratorUnavailable::HvfHostOs {
+                    host_os: std::env::consts::OS,
+                });
+            }
+            let output = std::process::Command::new("sysctl")
+                .args(["-n", "kern.hv_support"])
+                .output()
+                .map_err(|source| AcceleratorUnavailable::HvfProbeFailed { source })?;
+            let reported = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            if reported == "1" {
+                Ok(())
+            } else {
+                Err(AcceleratorUnavailable::HvfUnsupported { reported })
+            }
+        }
+        // Existence is not enough either: the node is root:kvm 0660 on a
+        // stock udev, and a caller outside that group learns so here
+        // rather than from QEMU aborting after the kernel build.
+        "kvm" => match File::options().read(true).write(true).open("/dev/kvm") {
+            Ok(_) => Ok(()),
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                Err(AcceleratorUnavailable::KvmNodeMissing)
+            }
+            Err(source) => Err(AcceleratorUnavailable::KvmNodeUnusable { source }),
+        },
+        _ => Ok(()),
     }
 }
 
@@ -2871,6 +2960,64 @@ mod tests {
         assert!(!AARCH64_VIRT_HVF_PROFILE.machine.contains("raspi"));
     }
 
+    /// Emulation is a choice, never a fallback. When the caller names no
+    /// accelerator and the host provides none of the profile's, the
+    /// error has to name every check that refused and how to ask for the
+    /// emulator on purpose — a lane that silently dropped to TCG
+    /// reported HVF numbers that were TCG numbers for weeks (#118).
+    #[test]
+    fn no_native_accelerator_names_every_failed_check() {
+        let error = NoNativeAccelerator {
+            arch: "aarch64",
+            checks: vec![
+                AcceleratorUnavailable::HvfHostOs { host_os: "linux" },
+                AcceleratorUnavailable::KvmNodeMissing,
+            ],
+        }
+        .to_string();
+        assert!(error.contains("aarch64 profile"), "{error}");
+        assert!(
+            error.contains("needs a macOS host and this one runs linux"),
+            "{error}"
+        );
+        assert!(
+            error.contains("needs /dev/kvm and this host has no such node"),
+            "{error}"
+        );
+        assert!(error.contains("pass `--accel tcg`"), "{error}");
+    }
+
+    /// A profile that names no native accelerator leaves the choice to
+    /// QEMU instead of failing: nothing runs riscv64 natively here, so
+    /// that profile never asked for an accelerator in the first place.
+    #[test]
+    fn a_profile_without_a_native_accelerator_resolves_to_nothing() {
+        assert_eq!(
+            default_accel(&RISCV64_VM_PROFILE).expect("riscv64 names no native accelerator"),
+            Vec::<String>::new()
+        );
+    }
+
+    /// The host-architecture check runs ahead of any device probe, so an
+    /// accelerator asked for on the wrong host says so rather than
+    /// blaming a node that could never have helped.
+    #[test]
+    fn a_foreign_host_architecture_is_named_before_any_device_probe() {
+        let error = probe_accel(VmArch::Riscv64, "kvm")
+            .expect_err("no host these tests run on executes riscv64 natively");
+        assert!(
+            matches!(
+                error,
+                AcceleratorUnavailable::HostArchitecture {
+                    accelerator: "kvm",
+                    required: "riscv64",
+                    ..
+                }
+            ),
+            "unexpected check: {error}"
+        );
+    }
+
     #[test]
     fn riscv64_profile_matches_qemu_first_baseline() {
         assert_eq!(RISCV64_VM_PROFILE.arch, VmArch::Riscv64);
@@ -2946,7 +3093,9 @@ mod tests {
             bios: None,
             baud: DEFAULT_BAUD,
             cpu: None,
-            accel: Vec::new(),
+            // Every caller states its accelerator; these resolve on any
+            // host, so they ask for the emulator on purpose.
+            accel: vec!["tcg".to_owned()],
             shared_dir: None,
             data_disk_size: None,
             gdb: None,
@@ -2995,7 +3144,9 @@ mod tests {
             bios: None,
             baud: DEFAULT_BAUD,
             cpu: None,
-            accel: Vec::new(),
+            // Every caller states its accelerator; these resolve on any
+            // host, so they ask for the emulator on purpose.
+            accel: vec!["tcg".to_owned()],
             shared_dir: None,
             data_disk_size: None,
             gdb: None,
@@ -3123,7 +3274,9 @@ mod tests {
             bios: None,
             baud: DEFAULT_BAUD,
             cpu: None,
-            accel: Vec::new(),
+            // Every caller states its accelerator; these resolve on any
+            // host, so they ask for the emulator on purpose.
+            accel: vec!["tcg".to_owned()],
             shared_dir: None,
             data_disk_size: None,
             gdb: None,
