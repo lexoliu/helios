@@ -36,12 +36,7 @@ class Lane(BaseModel):
     guest_arch: str
     accelerator: str
     runner_label: str
-    # The hosted GitHub runner the same lane runs on in advisory mode, or
-    # `None` when no hosted runner can stand in for the lane's machine.
-    # An Arm lane has none: GitHub's hosted runners are Linux only here,
-    # and a Linux Arm runner has no accelerator, so an advisory number
-    # from one would describe an interpreter, not the lane.
-    shared_runner: str | None = None
+    shared_runner: str
     qemu_version: str
     boot_timeout_seconds: int = Field(ge=1)
     vcpus: int = Field(ge=1)
@@ -55,15 +50,15 @@ class Lane(BaseModel):
     def qemu_binary(self) -> str:
         return f"qemu-system-{self.guest_arch}"
 
-    def runs_on(self, advisory: bool) -> str | None:
-        """The runner this lane uses in the given mode, if it has one."""
+    def runs_on(self, advisory: bool) -> str:
+        """The runner this lane runs on in the given mode."""
         return self.shared_runner if advisory else self.runner_label
 
     def github_matrix_entry(self) -> dict[str, str]:
         """One `include` entry of the bench-suite workflow matrix."""
         return {
             "lane": self.name,
-            "shared-runner": self.shared_runner or "",
+            "shared-runner": self.shared_runner,
             "dedicated-runner": self.runner_label,
             "helios-arch": self.helios_arch,
             "guest-arch": self.guest_arch,

@@ -14,7 +14,7 @@ from helios_bench.workloads import load_workloads
 
 def test_manifest_lanes_are_complete() -> None:
     manifest = load_manifest()
-    assert {lane.name for lane in manifest.lanes} == {"x86-64-kvm", "aarch64-hvf"}
+    assert {lane.name for lane in manifest.lanes} == {"x86-64-kvm"}
     for lane in manifest.lanes:
         assert isinstance(lane, Lane)
         assert lane.runner_label.startswith("helios-bench-")
@@ -60,23 +60,17 @@ def test_native_counterparts_exist_for_every_native_bin_reference() -> None:
                     assert Path(value).name in sources, value
 
 
-def test_the_arm_lane_has_no_hosted_stand_in() -> None:
-    """CI here is Linux-only, and no hosted runner describes the Arm lane.
+def test_the_suite_measures_one_lane() -> None:
+    """One architecture, on purpose.
 
-    A hosted Linux Arm runner has neither `/dev/kvm` nor a readable
-    `/dev/vhost-net`, so a guest on one is interpreted behind a userspace
-    tap: a different machine, not a noisier one.
+    Nearly everything this suite measures lives in the cross-platform
+    kernel, and no hosted GitHub Arm runner exposes `/dev/kvm`, so a
+    second lane would repeat the first through an interpreter. An Arm
+    number comes from a dedicated machine, by hand.
     """
     manifest = load_manifest()
-    arm = manifest.lane("aarch64-hvf")
-    assert arm.shared_runner is None
-    assert arm.runs_on(advisory=True) is None
-    assert arm.runs_on(advisory=False) == "helios-bench-arm-hvf"
-
-
-def test_an_advisory_run_keeps_only_the_lanes_a_hosted_runner_can_stand_in_for() -> None:
-    manifest = load_manifest()
-    advisory = [lane.name for lane in manifest.lanes if lane.shared_runner is not None]
-    assert advisory == ["x86-64-kvm"]
-    for lane in manifest.lanes:
-        assert lane.runs_on(advisory=False) == lane.runner_label
+    assert [lane.name for lane in manifest.lanes] == ["x86-64-kvm"]
+    lane = manifest.lane("x86-64-kvm")
+    assert lane.accelerator == "kvm"
+    assert lane.runs_on(advisory=True) == "ubuntu-24.04"
+    assert lane.runs_on(advisory=False) == "helios-bench-x86-kvm"

@@ -22,8 +22,8 @@ Three sides, on one machine, in one workflow run:
 | Linux + Wasmtime | the same wasm, precompiled by `wasmtime compile` from the same Wasmtime release Helios vendors, run by `wasmtime run --allow-precompiled` inside a Fedora guest | `tools/wasi-apps/fedora_qemu_baseline.py` |
 | Native Linux | a C or distribution-native equivalent inside the same Fedora guest | same guest, `tools/bench/native/*.c` |
 
-Every side gets the same QEMU release, accelerator (KVM on Linux hosts,
-HVF on Apple Silicon), vCPU count, memory, virtio block/net/rng devices,
+Every side gets the same QEMU release, accelerator (KVM), vCPU count,
+memory, virtio block/net/rng devices,
 and network backend. The pins are in `tools/bench/manifest.toml`; the
 runner refuses to start on a host that deviates from its lane unless the
 run is explicitly advisory, in which case the deviations are written into
@@ -80,9 +80,10 @@ Known limits recorded by the suite itself:
 - `fs-*` runs on the embedded filesystem root, not on a block device;
   a virtio-blk-backed filesystem (issue #15) is what makes the file I/O
   class comparable to ext4.
-- The aarch64 shared runner is a slirp lane (single queue, no offload);
-  its network numbers are comparable neither with the tap lane nor with
-  the dedicated machine's vmnet-bridged backend.
+- The network class needs a multi-queue `tap` with vhost-net to mean
+  anything: slirp is single-queue with no offload, so a run taken on one
+  measures neither the driver's multiqueue path nor its checksum and TSO
+  paths (docs/networking.md).
 
 ## Statistics
 
@@ -159,53 +160,55 @@ around 300 KB (#93), and two guests sharing one runtime directory (#98).
 A cell that fails now is news, and belongs in a new issue quoted from the
 report.
 
-## Where each architecture's numbers come from
+## One lane, and why
 
-**x86-64 numbers** come from the `x86-64-kvm` lane: the dedicated Linux
-machine for publishable ones, and a hosted `ubuntu-24.04` runner in
-advisory mode, which has the same accelerator (`/dev/kvm`) and the same
-network backend (a multi-queue tap over a readable `/dev/vhost-net`) as
-the lane pins. What a hosted runner cannot promise is an idle machine or
-a fixed governor, which is exactly the difference between an advisory
-number and a publishable one.
+The suite measures **x86-64 Linux under KVM** and nothing else.
 
-**aarch64 numbers** come only from the dedicated Apple Silicon machine,
-or from a developer's own arm64 machine run by hand. There is no hosted
-aarch64 lane and there will not be one: this repository's CI runs on
-Linux GitHub runners only, and a hosted Linux Arm runner exposes neither
-`/dev/kvm` nor a readable `/dev/vhost-net`, so a guest on one would be
-interpreted behind a userspace tap. That is a different machine, not a
-noisier one — it changes what is fast relative to what, which is the one
-thing a benchmark exists to measure. An advisory run therefore emits the
-`x86-64-kvm` lane alone, and the Arm half of any table stays empty until
-the dedicated machine exists.
+Nearly everything it measures — the executor, the component host, the
+host-call path, the in-kernel network stack, the block and pipe paths —
+lives in the architecture-neutral `kernel/` crate, so a second
+architecture repeats the same code through a different backend rather
+than covering new ground. What is genuinely per-architecture (trap entry,
+IRQ delivery, MMIO, SMP bring-up) is covered by the smoke lanes, which
+boot every backend on every change.
+
+There is also no hosted runner that could carry a second lane. GitHub's
+Arm runners expose no `/dev/kvm` (probe run 33944339758) and no readable
+`/dev/vhost-net`, so an Arm lane there would be an interpreter measuring
+an interpreter behind a userspace tap: a different machine, not a noisier
+one, which changes what is fast relative to what — the one thing a
+benchmark exists to measure.
+
+An aarch64 number therefore comes from a dedicated Apple Silicon machine
+or a developer's own arm64 box, taken by hand with the same harness
+(`helios-bench run --lane …` against a lane added to `manifest.toml` for
+that machine), never from hosted CI. AGENTS.md §3.5's arm64 baseline is
+that kind of measurement.
 
 ## Dedicated runners
 
-Publishable numbers come from two self-hosted machines, one per lane,
-registered with these labels:
+Publishable numbers come from a self-hosted machine registered with this
+label:
 
 | Lane | Label | Host | Accelerator | Advisory stand-in |
 | --- | --- | --- | --- | --- |
 | `x86-64-kvm` | `helios-bench-x86-kvm` | x86-64 Linux, `/dev/kvm` | KVM | `ubuntu-24.04` |
-| `aarch64-hvf` | `helios-bench-arm-hvf` | Apple Silicon macOS | HVF | none |
 
 Requirements the manifest's host check cannot verify and the machine's
-owner must guarantee: the CPU frequency governor is fixed (`performance`
-on Linux; on macOS the machine is on mains power and not in low-power
-mode), turbo behaviour is the same for every run, nothing else is
+owner must guarantee: the CPU frequency governor is fixed
+(`performance`), turbo behaviour is the same for every run, nothing else is
 scheduled on the machine while the workflow runs, the same QEMU release
 is installed as the lane pins, and the network backend is the lane's
-(`tap` with vhost-net on Linux, `vmnet-bridged` on macOS — the only
-macOS packet path with more than one queue and any offload).
+(a `tap` device driven by vhost-net, the only host packet path with more
+than one queue and any offload — see docs/networking.md).
 
-Until these machines exist, the lanes that have a hosted stand-in run
-there in **advisory** mode: the report carries `publishable: false`, the
-README says so, and nothing blocks. A lane with no stand-in — the Arm one
-— is left out of an advisory run entirely rather than run on a machine it
-does not describe. The repository variable `HELIOS_BENCH_DEDICATED=true`
-turns on the dedicated-runner runs for pushes to `dev`; tags always use
-the dedicated labels.
+Until that machine exists, the lane runs on its hosted stand-in in
+**advisory** mode: the report carries `publishable: false`, the README
+says so, and nothing blocks. The stand-in has the lane's accelerator and
+its network backend; what it cannot promise is an idle machine or a fixed
+governor. The repository variable `HELIOS_BENCH_DEDICATED=true` turns on
+the dedicated-runner runs for pushes to `dev`; tags always use the
+dedicated label.
 
 Every difference between the host a run is taken on and the lane it
 claims is recorded by `host-check` and listed in the report's
@@ -217,9 +220,9 @@ claims is recorded by `host-check` and listed in the report's
 ```bash
 git checkout <tag>
 cd tools/bench && uv sync
-uv run helios-bench host-check --lane aarch64-hvf     # must print no deviation
-uv run helios-bench run --lane aarch64-hvf --out-dir ../../target/bench/aarch64-hvf
-uv run helios-bench render tables --report ../../target/bench/aarch64-hvf/report.json
+uv run helios-bench host-check --lane x86-64-kvm     # must print no deviation
+uv run helios-bench run --lane x86-64-kvm --out-dir ../../target/bench/x86-64-kvm
+uv run helios-bench render tables --report ../../target/bench/x86-64-kvm/report.json
 ```
 
 `run --dry-run` prints the exact harness commands and the host

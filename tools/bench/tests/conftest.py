@@ -108,7 +108,7 @@ def make_report(
         id=run_id,
         url=f"https://github.com/lexoliu/helios/actions/runs/{run_id}",
         attempt=1,
-        lane="aarch64-hvf",
+        lane="x86-64-kvm",
         runner_label="helios-bench-arm-hvf" if publishable else "macos-15",
         advisory=not publishable,
         publishable=publishable,

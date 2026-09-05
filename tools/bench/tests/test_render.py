@@ -55,8 +55,8 @@ def test_marked_section_replacement_round_trip() -> None:
 
 def test_docs_gate_and_pins_render(baseline_report: Report, regressed_report: Report) -> None:
     docs = render_docs_results([baseline_report], "1001")
-    assert "### Lane `aarch64-hvf`" in docs
-    assert "benchmarks/runs/1001/aarch64-hvf-hostcall.svg" in docs
+    assert "### Lane `x86-64-kvm`" in docs
+    assert "benchmarks/runs/1001/x86-64-kvm-hostcall.svg" in docs
     gate = render_gate(evaluate(baseline_report, regressed_report))
     assert "**regression**" in gate and "**Blocking**" in gate
     pins = render_pins(baseline_report)
@@ -67,9 +67,9 @@ def test_plots_write_one_svg_per_class_and_the_headline(tmp_path: Path, baseline
     written = plot_report(baseline_report, tmp_path)
     names = sorted(path.name for path in written)
     assert names == [
-        "aarch64-hvf-compute.svg",
-        "aarch64-hvf-fs.svg",
-        "aarch64-hvf-headline.svg",
-        "aarch64-hvf-hostcall.svg",
+        "x86-64-kvm-compute.svg",
+        "x86-64-kvm-fs.svg",
+        "x86-64-kvm-headline.svg",
+        "x86-64-kvm-hostcall.svg",
     ]
     assert all(path.read_text(encoding="utf-8").lstrip().startswith("<?xml") for path in written)

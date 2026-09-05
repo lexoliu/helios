@@ -39,7 +39,8 @@ def test_rejected_cells_are_skipped(baseline_report: Report, regressed_report: R
 
 
 def test_lane_mismatch_is_refused(baseline_report: Report) -> None:
+    """Two lanes are two machines, whatever the manifest ships today."""
     other = baseline_report.model_copy(deep=True)
-    other.run.lane = "x86-64-kvm"
+    other.run.lane = "aarch64-hvf"
     with pytest.raises(SystemExit):
         evaluate(baseline_report, other)

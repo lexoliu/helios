@@ -21,6 +21,12 @@ confidence = 0.95
 # from its raw iterations.
 bootstrap_seed = 20260903
 
+# One lane. Nearly everything this suite measures lives in the
+# cross-platform kernel, so a second architecture buys repetition rather
+# than coverage, and no hosted GitHub Arm runner can host one anyway:
+# they expose no /dev/kvm (probe run 33944339758), which would make an
+# Arm lane an interpreter measuring an interpreter. An Arm number comes
+# from a dedicated machine or a developer's own arm64 box, by hand.
 [[lane]]
 name = "x86-64-kvm"
 helios_arch = "x86-64"
@@ -43,29 +49,3 @@ linux_vm_memory = "4G"
 net_backend = "tap"
 net_host = "10.77.0.1"
 devices = ["virtio-blk-pci", "virtio-net-pci", "virtio-rng-pci"]
-
-[[lane]]
-name = "aarch64-hvf"
-helios_arch = "aarch64"
-guest_arch = "aarch64"
-accelerator = "hvf"
-runner_label = "helios-bench-arm-hvf"
-# No hosted runner. helios CI runs on Linux GitHub runners only, and a
-# hosted Linux Arm runner offers neither KVM nor a readable
-# /dev/vhost-net, so a guest there would be interpreted behind a
-# userspace tap — a different machine, not a noisier one. This lane runs
-# on the dedicated Apple Silicon machine or not at all
-# (docs/benchmarks.md, "Dedicated runners").
-# Homebrew qemu on the dedicated Apple Silicon machine.
-qemu_version = "10.2.2"
-boot_timeout_seconds = 3600
-vcpus = 4
-memory = "2G"
-linux_vm_memory = "4G"
-# The dedicated Apple Silicon machine bridges the guest onto a host
-# interface through vmnet, which is the only macOS packet path with more
-# than one queue and any offload; slirp, the backend a hosted runner
-# would have been left with, has neither (docs/networking.md).
-net_backend = "vmnet-bridged"
-net_host = "10.0.2.2"
-devices = ["virtio-blk-device", "virtio-net-device", "virtio-rng-device"]

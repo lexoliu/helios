@@ -67,10 +67,6 @@ def command_run(args: argparse.Namespace) -> int:
 def command_lanes(args: argparse.Namespace) -> int:
     manifest = load_manifest()
     lanes = manifest.lanes if args.select == "all" else [manifest.lane(args.select)]
-    if args.advisory:
-        # A lane with no hosted runner has no advisory form: it would be a
-        # different machine, not a noisier one.
-        lanes = [lane for lane in lanes if lane.shared_runner is not None]
     if args.format == "github-matrix":
         print(json.dumps([lane.github_matrix_entry() for lane in lanes]))
     else:
@@ -194,11 +190,6 @@ def build_parser() -> argparse.ArgumentParser:
     lanes = subcommands.add_parser("lanes", help="list the lanes of the manifest")
     lanes.add_argument("--select", default="all", help="a lane name, or all")
     lanes.add_argument("--format", choices=["names", "github-matrix"], default="names")
-    lanes.add_argument(
-        "--advisory",
-        action="store_true",
-        help="list only the lanes that have a hosted runner to run on",
-    )
     lanes.set_defaults(func=command_lanes)
 
     host_check = subcommands.add_parser("host-check", help="list how this host deviates from a lane")
