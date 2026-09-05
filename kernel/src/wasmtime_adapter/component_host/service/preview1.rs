@@ -20,7 +20,7 @@ where
     pub(super) output_mode: OutputMode,
     pub(super) read_serial: crate::SerialReader,
     pub(super) serial_read_buffer: Vec<u8>,
-    pub(super) write_serial: fn(&[u8]),
+    pub(super) write_serial: crate::DebugSerialWriter,
     pub(super) imported_memory: Option<SharedMemory>,
     pub(super) current_core_module: Option<Arc<WasmtimeCompiledCoreModule>>,
     pub(super) wasix_abi: bool,
@@ -66,7 +66,7 @@ where
         authority: ProcessAuthority,
         output_mode: OutputMode,
         read_serial: crate::SerialReader,
-        write_serial: fn(&[u8]),
+        write_serial: crate::DebugSerialWriter,
         imported_memory: Option<SharedMemory>,
         filesystem: Option<DebugFileSystemSnapshot>,
         descriptors: Option<Preview1DescriptorTable>,
@@ -387,27 +387,30 @@ where
         }
     }
 
-    /// Deliver stdout/stderr bytes to a sink that cannot block, or hand
+    /// Deliver stdout/stderr bytes to a kernel-served sink, or hand
     /// back the bounded child channel the caller has to push through.
     ///
     /// The split exists because the store is not `Sync`: holding `&self`
     /// across an `.await` would make every host-call future non-`Send`.
     /// Callers take the returned writer — a cheap handle clone — and then
-    /// await or `try_write` it outside this borrow.
+    /// await or `try_write` it outside this borrow, and for a local sink
+    /// they offer whatever it could not take again after a yield.
     pub(super) fn route_output(
         &self,
         stream: crate::ComponentOutputStreamKind,
         bytes: &[u8],
-    ) -> Option<crate::ByteWriter> {
+    ) -> RoutedOutput {
         if bytes.is_empty() {
-            return None;
+            return RoutedOutput::Local(0);
         }
         match self.output_mode.sink(stream) {
-            crate::ComponentOutputSink::Local(local) => {
-                local.write(&self.cpu, &self.runtime_state, self.write_serial, bytes);
-                None
-            }
-            crate::ComponentOutputSink::Child(writer) => Some(writer.clone()),
+            crate::ComponentOutputSink::Local(local) => RoutedOutput::Local(local.write(
+                &self.cpu,
+                &self.runtime_state,
+                self.write_serial,
+                bytes,
+            )),
+            crate::ComponentOutputSink::Child(writer) => RoutedOutput::Child(writer.clone()),
         }
     }
 
@@ -4675,8 +4678,33 @@ where
     HostFs: crate::HostFileSystem,
 {
     let written = u32::try_from(bytes.len()).map_err(|_| p1::errno::OVERFLOW)?;
-    let Some(writer) = caller.data().route_output(stream, bytes) else {
-        return Ok(written);
+    let mut placed = 0;
+    let writer = loop {
+        match caller.data().route_output(stream, &bytes[placed..]) {
+            RoutedOutput::Child(writer) => break writer,
+            RoutedOutput::Local(taken) => {
+                placed += taken;
+                if placed == bytes.len() {
+                    return Ok(written);
+                }
+                // The debug UART is owned by another processor right
+                // now. A non-blocking descriptor reports what it did
+                // place; a blocking one yields and offers the rest.
+                if taken == 0 {
+                    if nonblocking {
+                        // POSIX: a non-blocking write that placed
+                        // nothing reports `EAGAIN` and keeps its bytes;
+                        // one that placed some reports what it placed.
+                        return if placed == 0 {
+                            Err(p1::errno::AGAIN)
+                        } else {
+                            u32::try_from(placed).map_err(|_| p1::errno::OVERFLOW)
+                        };
+                    }
+                    crate::yield_now().await;
+                }
+            }
+        }
     };
     if nonblocking {
         match writer.try_write(Bytes::copy_from_slice(bytes)) {
@@ -4687,6 +4715,17 @@ where
         let _: Result<(), crate::ClosedPeer> = writer.write(Bytes::copy_from_slice(bytes)).await;
     }
     Ok(written)
+}
+
+/// Where one chunk of guest stdio went.
+///
+/// A kernel-served sink reports how many bytes it took, because the
+/// debug UART it may be is owned by one processor at a time (#103) and
+/// takes a guest stream a line at a time. A child pipe hands back its
+/// writer for the caller to push through outside the store borrow.
+pub(super) enum RoutedOutput {
+    Local(usize),
+    Child(crate::ByteWriter),
 }
 
 pub(super) async fn p1_write_descriptor<CpuImpl, HostFs>(

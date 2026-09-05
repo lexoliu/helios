@@ -5,7 +5,7 @@ use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::fmt::{self, Write};
+use core::fmt::Write;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use core::time::Duration;
@@ -23,12 +23,10 @@ use crate::{
     ComponentOutputStreamKind, ComponentStoreData, DeadlinePollable, EmbeddedComponent, ExecResult,
     ProgramExecError, ProgramExecErrorDetail, ProgramExecErrorKind, RawMutex,
     RawMutexGuardResource, RawMutexResource, RawRwLock, RawRwLockReadGuardResource,
-    RawRwLockResource, RawRwLockWriteGuardResource, SerialPortResource, elapsed_millis,
-    emit_serial_stage_marker, heap_stats, largest_servable_user_bytes, monotonic_nanos,
-    user_heap_stats,
+    RawRwLockResource, RawRwLockWriteGuardResource, SerialPortResource, elapsed_millis, heap_stats,
+    largest_servable_user_bytes, monotonic_nanos, user_heap_stats,
 };
 use helios_hal::cpu::Cpu;
-use helios_hal::serial::ByteSerial;
 use spin::Mutex;
 use thiserror::Error;
 use wasmtime::component::{
@@ -73,28 +71,6 @@ mod network;
 pub mod service;
 mod topology;
 mod vsock;
-
-struct SerialFmtWriter {
-    write_serial: fn(&[u8]),
-}
-
-impl Write for SerialFmtWriter {
-    fn write_str(&mut self, text: &str) -> fmt::Result {
-        (self.write_serial)(text.as_bytes());
-        Ok(())
-    }
-}
-
-fn write_serial_fmt(write_serial: fn(&[u8]), arguments: fmt::Arguments<'_>) {
-    let mut writer = SerialFmtWriter { write_serial };
-    // `write_fmt` hands the sink one fragment per format piece, so the gate
-    // spans the whole message rather than each fragment.
-    crate::io::emit_console_line(|| {
-        writer
-            .write_fmt(arguments)
-            .expect("serial formatting should not fail");
-    });
-}
 
 pub use network::{
     ComponentHostNetworkService, ComponentHostTcpListenerToken, ComponentHostTcpStreamToken,
@@ -171,7 +147,7 @@ fn spawn_component_phase_heartbeat<CpuImpl>(
     cpu: &CpuImpl,
     timer: &crate::Timer<CpuImpl>,
     progress: &helios_hal::watchdog::ProgressCounter,
-    write_serial: fn(&[u8]),
+    write_serial: crate::DebugSerialWriter,
     phase: ComponentPhase,
 ) -> Result<ComponentPhaseHeartbeat, crate::TaskCapacityError>
 where
@@ -194,10 +170,9 @@ where
                 progress.record_progress();
                 if cfg!(debug_assertions) {
                     let elapsed_ms = elapsed_millis(started_at, now);
-                    write_serial_fmt(
-                        write_serial,
-                        format_args!("\n[KDBG {phase}-progress elapsed_ms={elapsed_ms}]\n"),
-                    );
+                    write_serial.emit_fmt(format_args!(
+                        "\n[KDBG {phase}-progress elapsed_ms={elapsed_ms}]\n"
+                    ));
                 }
             }
         }
@@ -1409,7 +1384,7 @@ where
     pub(super) spawner: crate::Spawner<CpuImpl>,
     pub(super) debug_state: HostRuntimeState<CpuImpl, HostFs>,
     pub(super) read_serial: crate::SerialReader,
-    pub(super) write_serial: fn(&[u8]),
+    pub(super) write_serial: crate::DebugSerialWriter,
 }
 
 async fn run_system_component<CpuImpl, HostFs>(
@@ -1438,7 +1413,7 @@ where
     let component_name = component.name();
     let runtime = crate::wasmtime_adapter::WasmtimeComponentRuntime::new(cpu.clone());
 
-    emit_stage_marker(write_serial, "engine:new");
+    write_serial.emit_stage_marker("engine:new");
     tracing::info!(
         component = component_name,
         "creating system component engine"
@@ -1450,7 +1425,7 @@ where
             HostFs,
         >>::create_engine(&runtime)
         .map_err(DebuggerError::CreateEngine)?;
-    emit_stage_marker(write_serial, "engine:ok");
+    write_serial.emit_stage_marker("engine:ok");
 
     tracing::info!(
         component = component_name,
@@ -1464,9 +1439,9 @@ where
         }
         .map_err(DebuggerError::LoadComponent)?,
     };
-    emit_stage_marker(write_serial, "component:ok");
+    write_serial.emit_stage_marker("component:ok");
 
-    emit_stage_marker(write_serial, "instantiate:begin");
+    write_serial.emit_stage_marker("instantiate:begin");
     tracing::info!(component = component_name, "instantiating system component");
     let instance_registry = debug_state.instance_registry();
     let instance = instance_registry.register_with_policy(
@@ -1520,14 +1495,14 @@ where
     let executor = executor.await;
     drop(instantiate_heartbeat);
     let executor = executor.map_err(DebuggerError::InstantiateComponent)?;
-    emit_stage_marker(write_serial, "instantiate:ok");
+    write_serial.emit_stage_marker("instantiate:ok");
 
     tracing::info!(component = component_name, "entering wasi:cli/run");
-    emit_stage_marker(write_serial, "run:begin");
+    write_serial.emit_stage_marker("run:begin");
 
     let result = executor.run().await.map_err(DebuggerError::RunComponent)?;
 
-    emit_stage_marker(write_serial, "run:ok");
+    write_serial.emit_stage_marker("run:ok");
     tracing::info!(component = component_name, "wasi:cli/run returned");
 
     match result.status {
@@ -3232,11 +3207,19 @@ where
         resource: Resource<SbiSerialPort>,
         bytes: Vec<u8>,
     ) -> wasmtime::Result<()> {
-        accessor.with(|mut access| {
+        let writer = accessor.with(|mut access| {
             let _ = access.get().table.get(&resource)?;
-            access.get().write_serial(&bytes);
-            Ok::<_, wasmtime::Error>(())
+            Ok::<_, wasmtime::Error>(access.get().serial_writer())
         })?;
+        // One call is one segment. The debugger's transport puts a
+        // whole RPC frame on the wire with a single write, and the
+        // console keeps a segment indivisible, which is what stops a
+        // kernel console record from landing inside a frame (#103).
+        // Another processor may own the port, so this yields to the
+        // executor rather than waiting on it.
+        while !writer.try_write(&bytes) {
+            crate::yield_now().await;
+        }
         Ok(())
     }
 
@@ -4069,25 +4052,14 @@ fn convert_program_level_to_local(level: program_wit::tracing::Level) -> TraceLe
     }
 }
 
-fn emit_stage_marker(write_serial: fn(&[u8]), stage: &str) {
-    emit_serial_stage_marker(&MarkerSerial(write_serial), stage);
-}
-
-fn emit_program_stage_marker(write_serial: fn(&[u8]), stage: &str) {
+/// A stage marker a release kernel does not print.
+///
+/// The per-program markers are the noisiest of them and exist for
+/// bring-up, so they stay behind the debug build the way they always
+/// have.
+fn emit_program_stage_marker(write_serial: crate::DebugSerialWriter, stage: &str) {
     if cfg!(debug_assertions) {
-        emit_stage_marker(write_serial, stage);
-    }
-}
-
-struct MarkerSerial(fn(&[u8]));
-
-impl ByteSerial for MarkerSerial {
-    fn try_read_byte(&self) -> Option<u8> {
-        None
-    }
-
-    fn write_bytes(&self, bytes: &[u8]) {
-        (self.0)(bytes);
+        write_serial.emit_stage_marker(stage);
     }
 }
 
@@ -4127,8 +4099,27 @@ mod tests {
     const PHASES_PAST_THE_SHARE: usize = 768 * 1024 / 64 + 1;
 
     /// The heartbeat only writes in debug builds, and where it writes is
-    /// not what these tests are about.
-    fn discard_serial(_: &[u8]) {}
+    /// not what these tests are about, so the port it reaches drops
+    /// every byte.
+    struct DiscardPort;
+
+    impl helios_hal::serial::ByteSerial for DiscardPort {
+        fn try_read_byte(&self) -> Option<u8> {
+            None
+        }
+
+        fn write_bytes(&self, _bytes: &[u8]) {}
+    }
+
+    impl crate::DebugSerialAccess for DiscardPort {
+        type Port = Self;
+
+        fn port() -> Self {
+            Self
+        }
+    }
+
+    const DISCARD_SERIAL: crate::DebugSerialWriter = crate::DebugSerialWriter::of::<DiscardPort>();
 
     struct PhaseFixture {
         executor: Executor,
@@ -4160,7 +4151,7 @@ mod tests {
                 &self.cpu,
                 &self.timer,
                 &self.progress,
-                discard_serial,
+                DISCARD_SERIAL,
                 ComponentPhase {
                     name: "test:phase",
                     started_at: 0,

@@ -49,7 +49,7 @@ where
     pub process_authority: ProcessAuthority,
     pub output_mode: ComponentOutputMode,
     pub serial_reader: crate::SerialReader,
-    pub serial_writer: fn(&[u8]),
+    pub serial_writer: crate::DebugSerialWriter,
     _host_fs: core::marker::PhantomData<HostFs>,
 }
 
@@ -74,7 +74,7 @@ where
         process_authority: ProcessAuthority,
         output_mode: ComponentOutputMode,
         serial_reader: crate::SerialReader,
-        serial_writer: fn(&[u8]),
+        serial_writer: crate::DebugSerialWriter,
     ) -> Self {
         Self {
             cpu,

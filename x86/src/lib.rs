@@ -285,7 +285,7 @@ fn x86_kernel_main() -> ! {
         &cpu,
         &debug_state,
         read_debug_serial,
-        write_debug_serial_bytes,
+        DEBUG_SERIAL_WRITER,
     );
     smp::current_runtime().install_program_service(
         program_service.unwrap_or_else(|| panic!("x86 bootstrap did not install program service")),
@@ -627,7 +627,11 @@ fn serial_console(
     impl FnMut() -> u64,
     impl FnMut(&[u8]),
 > {
-    helios_kernel::RecordingConsole::new(debug_state, read_tsc, Some(write_debug_serial_bytes))
+    helios_kernel::RecordingConsole::new(
+        debug_state,
+        read_tsc,
+        Some(|bytes: &[u8]| DEBUG_SERIAL_WRITER.emit(bytes)),
+    )
 }
 
 #[derive(Clone)]
@@ -813,7 +817,7 @@ where
         kernel,
         debug_state,
         read_debug_serial,
-        write_debug_serial_bytes,
+        DEBUG_SERIAL_WRITER,
     );
 }
 
@@ -1070,9 +1074,12 @@ fn read_debug_serial(buffer: &mut alloc::vec::Vec<u8>, max_bytes: u32) {
     helios_kernel::read_debug_serial::<DebugSerial>(buffer, max_bytes);
 }
 
-pub(crate) fn write_debug_serial_bytes(bytes: &[u8]) {
-    helios_kernel::write_debug_serial_bytes::<DebugSerial>(bytes);
-}
+/// The kernel's writer for this machine's debug UART.
+///
+/// Every byte the kernel or a guest puts on the port goes through the
+/// console this names; the backend supplies only the accessor.
+const DEBUG_SERIAL_WRITER: helios_kernel::DebugSerialWriter =
+    helios_kernel::DebugSerialWriter::of::<DebugSerial>();
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {

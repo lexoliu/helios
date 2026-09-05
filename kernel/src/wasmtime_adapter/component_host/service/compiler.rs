@@ -36,7 +36,7 @@ where
     pub(super) instance: Arc<crate::RegisteredInstance>,
     pub(super) shared: Arc<CompilerCoreShared<CompilerCoreStore<CpuImpl, HostFs>>>,
     pub(super) preview1_descriptors: CompilerPreview1Descriptors,
-    pub(super) write_serial: fn(&[u8]),
+    pub(super) write_serial: crate::DebugSerialWriter,
     pub(super) _marker: core::marker::PhantomData<fn() -> HostFs>,
 }
 
@@ -337,7 +337,11 @@ where
         let Ok(bytes) = read_shared_memory(memory, ptr, len) else {
             return p1::errno::FAULT;
         };
-        (caller.data().write_serial)(&bytes);
+        // The compiler plugin is bootfs-provisioned and trusted (§3.3),
+        // and this host function is synchronous, so its diagnostics go
+        // to the console the way a kernel record does: handed to the
+        // port's owner rather than waiting for the port.
+        caller.data().write_serial.emit(&bytes);
         written = written.saturating_add(len);
     }
     write_u32(memory, nwritten, written)

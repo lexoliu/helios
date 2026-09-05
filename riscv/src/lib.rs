@@ -741,7 +741,7 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
         &cpu,
         &debug_state,
         read_debug_serial,
-        write_debug_serial_bytes,
+        DEBUG_SERIAL_WRITER,
     );
     hart_runtime.program_service = program_service;
     unsafe {
@@ -759,7 +759,7 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
         kernel,
         debug_state,
         read_debug_serial,
-        write_debug_serial_bytes,
+        DEBUG_SERIAL_WRITER,
     );
 }
 
@@ -929,9 +929,12 @@ fn read_debug_serial(buffer: &mut alloc::vec::Vec<u8>, max_bytes: u32) {
     helios_kernel::read_debug_serial::<DebugTransport>(buffer, max_bytes);
 }
 
-pub(crate) fn write_debug_serial_bytes(bytes: &[u8]) {
-    helios_kernel::write_debug_serial_bytes::<DebugTransport>(bytes);
-}
+/// The kernel's writer for this machine's debug UART.
+///
+/// Every byte the kernel or a guest puts on the port goes through the
+/// console this names; the backend supplies only the accessor.
+const DEBUG_SERIAL_WRITER: helios_kernel::DebugSerialWriter =
+    helios_kernel::DebugSerialWriter::of::<DebugTransport>();
 
 #[unsafe(no_mangle)]
 extern "C" fn wasmtime_tls_get(slot: usize) -> *mut u8 {

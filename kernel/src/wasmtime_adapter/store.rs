@@ -374,8 +374,8 @@ impl OutputStream for ChannelOutputStream {
 pub enum StdioOutputStream {
     /// Bytes flow to a parent-facing byte channel.
     Child(ChannelOutputStream),
-    /// Bytes flow to the serial debug port.
-    Serial(fn(&[u8])),
+    /// Bytes flow to the machine's debug UART.
+    Serial(SerialOutputStream),
     /// Bytes are recorded as observer trace events (no-op here because
     /// serial debug does not model trace output for P2 programs).
     Trace,
@@ -388,7 +388,11 @@ impl Pollable for StdioOutputStream {
             // The child channel is bounded, so readiness is real work:
             // complete a parked batch and wait for room.
             StdioOutputStream::Child(inner) => inner.ready().await,
-            StdioOutputStream::Serial(_) | StdioOutputStream::Trace => {}
+            // The debug UART is bounded too: its owner may be another
+            // processor writing a segment of its own, so readiness is
+            // the wait for the port's turn.
+            StdioOutputStream::Serial(inner) => Pollable::ready(inner).await,
+            StdioOutputStream::Trace => {}
         }
     }
 }
@@ -398,10 +402,7 @@ impl OutputStream for StdioOutputStream {
     fn write(&mut self, bytes: Bytes) -> StreamResult<()> {
         match self {
             StdioOutputStream::Child(inner) => inner.write(bytes),
-            StdioOutputStream::Serial(writer) => {
-                writer(bytes.as_ref());
-                Ok(())
-            }
+            StdioOutputStream::Serial(inner) => OutputStream::write(inner, bytes),
             StdioOutputStream::Trace => Ok(()),
         }
     }
@@ -413,8 +414,90 @@ impl OutputStream for StdioOutputStream {
     fn check_write(&mut self) -> StreamResult<usize> {
         match self {
             StdioOutputStream::Child(inner) => inner.check_write(),
-            StdioOutputStream::Serial(_) | StdioOutputStream::Trace => Ok(64 * 1024),
+            StdioOutputStream::Serial(inner) => OutputStream::check_write(inner),
+            StdioOutputStream::Trace => Ok(P2_SERIAL_WRITE_PERMIT_BYTES),
         }
+    }
+}
+
+/// Bytes a P2 stdio stream may hand the debug UART in one write.
+const P2_SERIAL_WRITE_PERMIT_BYTES: usize = 64 * 1024;
+
+/// WASI P2 stdout/stderr over the machine's debug UART.
+///
+/// The console takes a guest byte stream a line at a time, and only
+/// while no other processor owns the port (#103), so this parks what it
+/// could not place and offers it again from `ready`, withholding the
+/// next permit until it is gone. That is the flow control the
+/// child-channel stream applies, over a device instead of a channel.
+pub struct SerialOutputStream {
+    writer: crate::DebugSerialWriter,
+    pending: Option<Bytes>,
+}
+
+impl SerialOutputStream {
+    #[must_use]
+    pub fn new(writer: crate::DebugSerialWriter) -> Self {
+        Self {
+            writer,
+            pending: None,
+        }
+    }
+
+    /// Places as much of what is parked as the console will take now,
+    /// and reports whether anything is still parked.
+    fn push(&mut self) -> bool {
+        let Some(mut bytes) = self.pending.take() else {
+            return false;
+        };
+        while !bytes.is_empty() {
+            let taken = self.writer.write_stream(bytes.as_ref());
+            if taken == 0 {
+                self.pending = Some(bytes);
+                return true;
+            }
+            bytes = bytes.slice(taken..);
+        }
+        false
+    }
+}
+
+#[wasmtime_wasi_io::async_trait]
+impl Pollable for SerialOutputStream {
+    async fn ready(&mut self) {
+        // The port has no readiness signal to register on: the wait is
+        // for another processor to finish the segment it owns, so the
+        // task yields between attempts rather than parking.
+        while self.push() {
+            crate::yield_now().await;
+        }
+    }
+}
+
+#[wasmtime_wasi_io::async_trait]
+impl OutputStream for SerialOutputStream {
+    fn write(&mut self, bytes: Bytes) -> StreamResult<()> {
+        if self.pending.is_some() {
+            return Err(StreamError::trap(
+                "serial output stream write exceeded its check-write permit",
+            ));
+        }
+        self.pending = Some(bytes);
+        let _parked = self.push();
+        Ok(())
+    }
+
+    fn flush(&mut self) -> StreamResult<()> {
+        // What is parked is drained by `ready`, which `check_write`
+        // pends on, so there is nothing to push here.
+        Ok(())
+    }
+
+    fn check_write(&mut self) -> StreamResult<usize> {
+        if self.push() {
+            return Ok(0);
+        }
+        Ok(P2_SERIAL_WRITE_PERMIT_BYTES)
     }
 }
 

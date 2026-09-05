@@ -23,7 +23,7 @@ pub use child::{
     byte_channel,
 };
 pub use console::{RecordingConsole, emit_console_line};
-pub use debug_serial::{DebugSerialAccess, read_debug_serial, write_debug_serial_bytes};
+pub use debug_serial::{DebugConsole, DebugSerialAccess, DebugSerialWriter, read_debug_serial};
 pub use interrupts::{
     ExternalInterruptHandler, ExternalInterruptRoutes, MAX_BLOCK_DEVICES, MAX_NETWORK_INTERRUPTS,
     wake_queue_owners,
@@ -33,7 +33,4 @@ pub use panic_console::{PanicSerial, emit_panic_report};
 pub use poll_registry::{
     PollKey, PollRegistration, PollRegistry, PollRegistryError, PollSourceKind,
 };
-pub use serial::{
-    SerialReader, emit_serial_error_marker, emit_serial_stage_marker, read_serial, try_read_serial,
-    write_serial,
-};
+pub use serial::{SerialReader, read_serial, try_read_serial};

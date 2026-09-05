@@ -48,13 +48,53 @@ python3 tools/debug-serial-report.py <runtime-dir-or-capture> ...
 
 It prints each capture's stage markers in order and exits non-zero when
 one of them is broken. The kernel writes a marker as `\n[KDBG <stage>]\n`
-under the console gate (`kernel/src/io/serial.rs`), so in a whole
-capture every marker sits on a line of its own. A marker sharing its
-line with another, or one that never closes before the newline, is
-bytes the guest wrote and the host never received.
+as one segment through the line's single owner
+(`kernel/src/io/debug_serial.rs`), so in a whole capture every marker
+sits on a line of its own. A marker sharing its line with another, or
+one that never closes before the newline, is bytes the guest wrote and
+the host never received.
 
 Passing a directory walks it, which is how a lane checks every VM it
 booted in one step. `smoke-x86-64` and both `bench` lanes run it.
+
+## One owner
+
+Three producers share the line and two of them are byte streams a host
+reader has to tell apart, so the kernel gives the port exactly one
+owner: `DebugConsole` in `kernel/src/io/debug_serial.rs`. A backend
+supplies only how the port is reached (`DebugSerialAccess`); nothing
+else writes to it.
+
+The unit the owner keeps indivisible is a **segment**:
+
+- one complete kernel console record — a tracing event, a `[KDBG …]`
+  marker, a kernel diagnostic;
+- one complete guest write, which for the debugger is exactly one RPC
+  frame, because its transport puts a frame on the wire with a single
+  `serial.write`;
+- one line-sized piece of a guest byte stream (stdout, stderr), cut at
+  a newline so a console record lands between the guest's lines and
+  never inside one.
+
+Two segments never interleave, which is what lets the host read the
+line by scanning for the RPC frame magic and treating everything else
+as console text. Before that owner existed, a console record emitted on
+one processor could land between a frame's magic and the end of its
+payload, and the reader — already committed to the length it read —
+took whatever was there (#103).
+
+Waiting for the port is never a stall the machine pays for. A kernel
+record that finds the port owned hands its bytes to that owner over a
+lock-free queue and returns, which is what makes an interrupt handler
+safe on the very processor that is transmitting. Guest bytes never
+queue: their host functions yield to the executor and offer the same
+bytes again, so a guest writing faster than the UART drains is
+throttled by the device rather than by kernel memory.
+
+The panic report is the one deliberate exception. A panicking processor
+cannot wait for a port another processor may never release, so it
+writes straight at the register, allocation-free and lock-free, and
+accepts that it may cut into whatever was on the wire.
 
 ## Keeping the line drained
 

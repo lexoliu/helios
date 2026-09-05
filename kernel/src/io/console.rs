@@ -19,6 +19,14 @@ use crate::ComponentRuntimeState;
 /// complete message and must not await: the section is held for exactly as
 /// long as the message takes to reach the device.
 ///
+/// What reaches the device is a separate question, and its answer is
+/// [`DebugConsole`](super::DebugConsole): the port has one owner, and a
+/// record handed to it is written whole whoever else is writing. This
+/// gate is what establishes the *record* — where one begins and ends
+/// across the fragments `core::fmt` hands a sink, and that the
+/// debugger's copy of the console is cut at the same boundaries as the
+/// bytes on the wire.
+///
 /// The unit of a message is one *record* — one tracing event, one stage
 /// marker, one panic report — not one fragment of it. A record carries its
 /// own bound: it is as long as the formatter makes it and no longer, so
