@@ -1109,6 +1109,11 @@ impl EventFd {
 
     pub(super) async fn read(&self) -> u64 {
         loop {
+            // Armed before the counter is read: a write broadcasts to
+            // every reader and every `poll_readable` waiter at once and
+            // banks nothing, so a wait created after the write would
+            // park until the next one.
+            let written = self.notify.notified();
             {
                 let mut state = self.state.lock();
                 if state.value != 0 {
@@ -1119,7 +1124,7 @@ impl EventFd {
                     return core::mem::take(&mut state.value);
                 }
             }
-            self.notify.notified().await;
+            written.await;
         }
     }
 }

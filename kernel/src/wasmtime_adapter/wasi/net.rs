@@ -210,10 +210,15 @@ impl P2ResolveAddressStream {
 
     pub(crate) async fn wait_ready(&self) {
         loop {
+            // Armed before the result is read: completion broadcasts to
+            // every waiter and banks nothing, so a wait created after
+            // the resolver finished would park for a second completion
+            // that never comes.
+            let completed = self.ready.notified();
             if self.is_ready() {
                 return;
             }
-            self.ready.notified().await;
+            completed.await;
         }
     }
 

@@ -721,11 +721,16 @@ where
 
     pub async fn wait_for_program_service(&self) -> ProgramService {
         loop {
+            // Armed before the slot is read: installation broadcasts to
+            // every task waiting for the service and banks nothing, so a
+            // wait created after an install it just missed would park
+            // for a second install that never comes.
+            let installed = self.inner.program_service_ready.notified();
             if let Some(service) = self.program_service() {
                 return service;
             }
 
-            self.inner.program_service_ready.notified().await;
+            installed.await;
         }
     }
 

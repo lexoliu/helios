@@ -521,9 +521,16 @@ where
     };
     let key = caller.data().futex_key(futex);
     let registration = caller.data().runtime_state.prepare_futex_wait(key);
+    // The wait is armed before the guest word is compared. `futex_wake`
+    // stores a permit this wait can still claim, but `futex_wake_all`
+    // broadcasts to the waits that already exist and banks nothing, so a
+    // wake-all landing between the comparison and the park is only
+    // observed by a wait that was armed first.
+    let wake = registration.notify().notified();
     let current = match p1_try_read_u32(caller, memory, futex) {
         Ok(value) => value,
         Err(_) => {
+            drop(wake);
             caller
                 .data()
                 .runtime_state
@@ -532,6 +539,7 @@ where
         }
     };
     if current != expected {
+        drop(wake);
         caller
             .data()
             .runtime_state
@@ -539,11 +547,12 @@ where
         return p1::errno::INVAL;
     }
 
-    let notify = registration.notify();
     let woken = match timeout {
-        Some(0) => false,
+        Some(0) => {
+            drop(wake);
+            false
+        }
         Some(timeout_nanos) => {
-            let wake = notify.notified();
             let sleep = caller.data().sleep_for(Duration::from_nanos(timeout_nanos));
             futures::pin_mut!(wake);
             futures::pin_mut!(sleep);
@@ -553,7 +562,7 @@ where
             )
         }
         None => {
-            notify.notified().await;
+            wake.await;
             true
         }
     };

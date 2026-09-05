@@ -20,10 +20,63 @@ use event_listener::{Event, EventListener};
 
 /// Interrupt-safe notification primitive for bridging kernel events into async tasks.
 ///
-/// Notifications are remembered as permits, so an interrupt that arrives before
-/// a task starts awaiting is still observed later.
+/// # Contract
+///
+/// A notification is either a *permit* handed to exactly one waiter or a
+/// *broadcast* delivered to the waits that already exist. The two never
+/// mix:
+///
+/// - [`Notify::notify_one`] and [`Notify::notify_count`] store permits.
+///   A permit outlives the call, so an interrupt that lands before any
+///   task awaits is still observed by the next [`Notify::notified`], and
+///   each stored permit is consumed exactly once.
+/// - [`Notify::notify_one_coalesced`] stores at most one permit. It is
+///   the level-triggered form for a single consumer that re-reads shared
+///   state after every wake, where a burst of events is one wake.
+/// - [`Notify::notify_all`] is a broadcast and stores nothing. It
+///   releases every wait that exists when it is called; a wait created
+///   afterwards parks, exactly like tokio's `Notify::notify_waiters`.
+///
+/// Banking permits for waits that have not happened yet is what
+/// [`Notify::notify_all`] must never do: the permits are never drained,
+/// so every later `notified().await` completes without an event, and a
+/// consumer shaped as `loop { work(); signal.notified().await; }` stops
+/// returning `Pending` — on a cooperative executor that is a processor
+/// removed from the scheduler, not a busy task.
+///
+/// # Arm before you test
+///
+/// Because a broadcast is not banked, a caller waiting on state that a
+/// broadcast publishes must create its wait *before* it inspects that
+/// state:
+///
+/// ```ignore
+/// loop {
+///     let wait = signal.notified(); // arm
+///     if published() {              // test
+///         break;
+///     }
+///     wait.await;                   // park
+/// }
+/// ```
+///
+/// [`Notify::notified`] and [`Notify::waiter`] sample the broadcast
+/// generation when they are *created*, not when they are first polled,
+/// so a broadcast raised between the test and the park still completes
+/// the wait. A retry loop or a timed re-probe is not a substitute.
+///
+/// # SMP contract
+///
+/// Every notify entry point is lock-free, allocation-free and safe to
+/// call from interrupt context on any processor: a producer on one CPU
+/// releases a consumer parked on another with a single atomic update
+/// plus the event wake. Waiting never spins.
 pub struct Notify {
     permits: AtomicUsize,
+    /// Bumped once per [`Notify::notify_all`]. A wait completes when the
+    /// generation moves past the value it was armed at, which is how one
+    /// broadcast releases every waiter without handing out permits.
+    generation: AtomicU64,
     event: Event,
 }
 
@@ -31,11 +84,17 @@ pub struct Notify {
 #[must_use = "futures do nothing unless awaited"]
 pub struct Notified<'a> {
     notify: &'a Notify,
-    listener: Option<EventListener>,
+    waiter: NotifyWaiter,
 }
 
 /// Reusable state for polling a [`Notify`] without allocating a Future.
+///
+/// Created by [`Notify::waiter`], which arms it against the current
+/// broadcast generation. It re-arms itself every time a wait completes,
+/// so a caller that keeps one across a `poll_fn` loop stays covered by
+/// the arm-before-test discipline without rebuilding it.
 pub struct NotifyWaiter {
+    observed: u64,
     listener: Option<EventListener>,
 }
 
@@ -157,30 +216,51 @@ impl Notify {
     pub const fn new() -> Self {
         Self {
             permits: AtomicUsize::new(0),
+            generation: AtomicU64::new(0),
             event: Event::new(),
         }
     }
 
-    /// Returns a future that resolves after consuming one pending notification.
+    /// Returns a future that resolves on the next notification.
+    ///
+    /// The wait is armed here: it consumes a permit stored by
+    /// [`Self::notify_one`] or completes on a [`Self::notify_all`] raised
+    /// from this point on. Creating the future before testing the state
+    /// it waits for is what makes a broadcast impossible to lose.
     pub fn notified(&self) -> Notified<'_> {
         Notified {
             notify: self,
+            waiter: self.waiter(),
+        }
+    }
+
+    /// Arms a reusable wait, as [`Self::notified`] does for a future.
+    pub fn waiter(&self) -> NotifyWaiter {
+        NotifyWaiter {
+            observed: self.generation.load(Ordering::Acquire),
             listener: None,
         }
     }
 
-    pub const fn waiter(&self) -> NotifyWaiter {
-        NotifyWaiter { listener: None }
-    }
-
     pub fn poll_notified(&self, cx: &mut Context<'_>, waiter: &mut NotifyWaiter) -> Poll<()> {
         loop {
+            let generation = self.generation.load(Ordering::Acquire);
+            if generation != waiter.observed {
+                // A broadcast landed after this wait was armed. It is not
+                // a permit, so nothing is claimed here.
+                waiter.rearm(generation);
+                return Poll::Ready(());
+            }
+
             if self.try_claim_permit() {
-                waiter.listener = None;
+                waiter.rearm(generation);
                 return Poll::Ready(());
             }
 
             if waiter.listener.is_none() {
+                // Registering before the generation and the permit are
+                // read again on the next turn of the loop is what closes
+                // the window between deciding to park and a notification.
                 waiter.listener = Some(self.event.listen());
                 continue;
             }
@@ -201,7 +281,10 @@ impl Notify {
         }
     }
 
-    /// Signals a single waiter.
+    /// Stores one permit, claimed by exactly one wait.
+    ///
+    /// The permit outlives the call: a wait that arrives later claims it
+    /// and completes, and no second wait can claim the same permit.
     ///
     /// This operation is non-blocking and suitable for interrupt context.
     pub fn notify_one(&self) {
@@ -222,7 +305,12 @@ impl Notify {
         }
     }
 
-    /// Signals up to `count` waiters with one permit update.
+    /// Stores `count` permits with one permit update.
+    ///
+    /// Each permit is claimed by exactly one wait, so this is the form a
+    /// caller uses when it knows how many waiters it owes a wake — a
+    /// futex waking `n` of its waiters, say. Pass a count, never a bound
+    /// standing in for "everyone": that is [`Self::notify_all`].
     ///
     /// This operation is non-blocking and suitable for interrupt context.
     pub fn notify_count(&self, count: usize) {
@@ -233,11 +321,17 @@ impl Notify {
         self.event.notify(count);
     }
 
-    /// Signals every current waiter.
+    /// Releases every wait that exists right now, storing no permit.
+    ///
+    /// A wait armed before this call completes; a wait armed after it
+    /// parks until the next notification. Callers whose waiters test
+    /// shared state must arm before they test — see the type's
+    /// arm-before-test note — because there is no banked permit to
+    /// cover the gap.
     ///
     /// This operation is non-blocking and suitable for interrupt context.
     pub fn notify_all(&self) {
-        self.add_permits(usize::MAX / 2);
+        self.generation.fetch_add(1, Ordering::AcqRel);
         self.event.notify(usize::MAX);
     }
 
@@ -285,16 +379,25 @@ impl Default for Notify {
     }
 }
 
+impl NotifyWaiter {
+    /// Re-arms the wait at `generation`, dropping its registration.
+    ///
+    /// Sampling here rather than at the next poll keeps the waiter armed
+    /// across the caller's own work: a broadcast raised while the caller
+    /// acts on this wake is observed by the next wait instead of being
+    /// dropped on the floor.
+    fn rearm(&mut self, generation: u64) {
+        self.observed = generation;
+        self.listener = None;
+    }
+}
+
 impl Future for Notified<'_> {
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut waiter = NotifyWaiter {
-            listener: self.listener.take(),
-        };
-        let result = self.notify.poll_notified(cx, &mut waiter);
-        self.listener = waiter.listener;
-        result
+        let notify = self.notify;
+        notify.poll_notified(cx, &mut self.waiter)
     }
 }
 
@@ -619,11 +722,21 @@ mod tests {
     use alloc::sync::Arc;
     use alloc::vec;
     use alloc::vec::Vec;
-    use core::sync::atomic::{AtomicBool, Ordering};
+    use core::future::Future;
+    use core::pin::{Pin, pin};
+    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use core::task::{Context, Poll, Waker};
 
     use futures_lite::future::{block_on, poll_once, yield_now, zip};
 
     use super::{Mutex, Notify, ProgressSignal, RawMutex, RwLock};
+
+    /// Polls `future` once, reporting whether it finished.
+    fn poll_pinned(future: Pin<&mut impl Future<Output = ()>>) -> bool {
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+        matches!(future.poll(&mut context), Poll::Ready(()))
+    }
 
     /// One signal releases every parked waiter, which is the whole
     /// reason a shard arrival cannot be a permit-based `Notify`: a
@@ -697,6 +810,121 @@ mod tests {
             notify.notified().await;
             notify.notified().await;
         });
+    }
+
+    /// A broadcast is delivered to every wait that exists, not to one
+    /// of them: the waiters on a socket's readiness, an eventfd, or a
+    /// futex key are all parked on the same signal at once.
+    #[test]
+    fn notify_all_releases_every_registered_waiter() {
+        let notify = Notify::new();
+        let mut first = pin!(notify.notified());
+        let mut second = pin!(notify.notified());
+        assert!(!poll_pinned(first.as_mut()));
+        assert!(!poll_pinned(second.as_mut()));
+
+        notify.notify_all();
+
+        assert!(poll_pinned(first.as_mut()));
+        assert!(poll_pinned(second.as_mut()));
+    }
+
+    /// The defect this primitive was fixed for: a broadcast that banked
+    /// permits left every later wait instantly ready, so a
+    /// `loop { work(); notified().await }` consumer stopped returning
+    /// `Pending` and its processor stopped polling anything else.
+    #[test]
+    fn a_wait_that_follows_notify_all_still_parks() {
+        let notify = Notify::new();
+        notify.notify_all();
+
+        let mut waiter = pin!(notify.notified());
+        assert!(!poll_pinned(waiter.as_mut()));
+        assert_eq!(notify.permits.load(Ordering::Acquire), 0);
+
+        // And the same holds for every wait after that one.
+        notify.notify_all();
+        assert!(poll_pinned(waiter.as_mut()));
+        assert!(!poll_pinned(pin!(notify.notified())));
+    }
+
+    /// Arming before testing the published state is the discipline a
+    /// broadcast asks of its callers: the wait is created, the state is
+    /// read, and a broadcast in between still completes the wait.
+    #[test]
+    fn a_notify_all_between_arming_and_parking_is_not_lost() {
+        let notify = Notify::new();
+        let mut waiter = pin!(notify.notified());
+        notify.notify_all();
+
+        assert!(poll_pinned(waiter.as_mut()));
+    }
+
+    /// A permit belongs to one wait. A broadcast must not consume it and
+    /// a second wait must not claim it twice.
+    #[test]
+    fn a_stored_permit_is_consumed_exactly_once() {
+        let notify = Notify::new();
+        notify.notify_one();
+
+        assert!(poll_pinned(pin!(notify.notified())));
+        assert_eq!(notify.permits.load(Ordering::Acquire), 0);
+        assert!(!poll_pinned(pin!(notify.notified())));
+
+        // A broadcast releases the armed wait without spending the
+        // permit that a later wait is owed.
+        notify.notify_one();
+        let mut armed = pin!(notify.notified());
+        notify.notify_all();
+        assert!(poll_pinned(armed.as_mut()));
+        assert_eq!(notify.permits.load(Ordering::Acquire), 1);
+        assert!(poll_pinned(pin!(notify.notified())));
+        assert_eq!(notify.permits.load(Ordering::Acquire), 0);
+    }
+
+    /// One broadcast has to release waiters parked on other processors,
+    /// which is the case a single-threaded poll test cannot cover: each
+    /// waiter here is parked by its own executor on its own thread.
+    #[test]
+    fn notify_all_releases_waiters_on_other_processors() {
+        const WAITERS: usize = 4;
+
+        let notify = Arc::new(Notify::new());
+        let armed = Arc::new(AtomicUsize::new(0));
+        let woken = Arc::new(AtomicUsize::new(0));
+
+        let threads: Vec<_> = (0..WAITERS)
+            .map(|_| {
+                let notify = notify.clone();
+                let armed = armed.clone();
+                let woken = woken.clone();
+                std::thread::spawn(move || {
+                    block_on(async {
+                        // Arm, then publish that this waiter is armed:
+                        // the broadcast below is raised only once, so a
+                        // waiter that armed late would never be woken.
+                        let wait = notify.notified();
+                        armed.fetch_add(1, Ordering::AcqRel);
+                        wait.await;
+                    });
+                    woken.fetch_add(1, Ordering::AcqRel);
+                })
+            })
+            .collect();
+
+        while armed.load(Ordering::Acquire) != WAITERS {
+            std::thread::yield_now();
+        }
+        notify.notify_all();
+
+        for thread in threads {
+            thread
+                .join()
+                .unwrap_or_else(|_| panic!("notify waiter thread panicked unexpectedly"));
+        }
+
+        assert_eq!(woken.load(Ordering::Acquire), WAITERS);
+        assert_eq!(notify.permits.load(Ordering::Acquire), 0);
     }
 
     #[test]
