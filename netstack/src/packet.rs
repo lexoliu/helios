@@ -420,8 +420,13 @@ impl<'a> UdpPacket<'a> {
         write_u16(output, 6, 0)?;
         output[Self::HEADER_LEN..len].copy_from_slice(payload);
         let field = match checksum {
+            // RFC 768: a computed checksum of zero is transmitted as all
+            // ones, so that zero keeps meaning "no checksum".
             TransportChecksum::Software => {
-                udp_transmitted_checksum(udp_checksum(source, destination, &output[..len]))
+                match udp_checksum(source, destination, &output[..len]) {
+                    0 => u16::MAX,
+                    checksum => checksum,
+                }
             }
             TransportChecksum::DeviceOffload => {
                 udp_pseudo_header_checksum(source, destination, len)
@@ -430,10 +435,6 @@ impl<'a> UdpPacket<'a> {
         write_u16(output, 6, field)?;
         Some(len)
     }
-}
-
-fn udp_transmitted_checksum(checksum: u16) -> u16 {
-    if checksum == 0 { u16::MAX } else { checksum }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
