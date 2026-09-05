@@ -26,7 +26,7 @@ WEDGED = "net"
 FAKE_BENCH = """#!/bin/sh
 set -eu
 if [ -n "${HELIOS_WORKLOAD_BENCH_BUILD_ONLY:-}" ]; then
-    sleep 2
+    sleep "$HELIOS_TEST_BUILD_SECONDS"
     echo built >> "$HELIOS_TEST_BUILD_LOG"
     exit 0
 fi
@@ -67,6 +67,7 @@ def driver(tmp_path, monkeypatch):
     monkeypatch.setattr(module, "repo_root", lambda: tmp_path)
     monkeypatch.setenv("HELIOS_TEST_WEDGE_PID_FILE", str(tmp_path / "wedge.pid"))
     monkeypatch.setenv("HELIOS_TEST_BUILD_LOG", str(tmp_path / "builds"))
+    monkeypatch.setenv("HELIOS_TEST_BUILD_SECONDS", "0")
     return module
 
 
@@ -78,14 +79,20 @@ def records(log: Path) -> dict[str, dict]:
     }
 
 
-def run_side(driver, out_dir: Path, per_class: int, side: int) -> tuple[Path, float]:
+def run_side(
+    driver,
+    out_dir: Path,
+    per_class: int,
+    side: int,
+    workloads: list[dict] | None = None,
+) -> tuple[Path, float]:
     out_dir.mkdir()
     started = time.monotonic()
     log = driver.run_helios(
         Path("tools/wasi-apps/workloads.json"),
         out_dir,
         1,
-        WORKLOADS,
+        WORKLOADS if workloads is None else workloads,
         "x86-64",
         "kvm",
         None,
@@ -136,28 +143,30 @@ def test_a_spent_budget_boots_no_further_guest(driver, tmp_path) -> None:
     assert not (tmp_path / "wedge.pid").exists(), "no guest may be booted on a spent budget"
 
 
-def test_the_build_is_not_charged_to_any_class(driver, tmp_path) -> None:
+def test_the_build_is_not_charged_to_any_class(driver, tmp_path, monkeypatch) -> None:
     """#153: a cold cargo cache is not a workload.
 
-    The stand-in spends two seconds building, more than any one class's
-    share of the budget below. Charging that to the first class is what
-    killed `bench-x86-64-linux` on a cold runner — it died with the
-    budget spent before a guest had booted — so what is asserted here is
-    that every class that can be measured still was, and that the one
-    that failed failed on its own deadline rather than on the budget.
+    The stand-in spends the whole side's budget building. Charged to the
+    classes, that leaves the first one nothing — which is how
+    `bench-x86-64-linux` died on a cold runner, with the budget spent
+    before a guest had booted. Hoisted out of the budget, both classes
+    below are measured. No class here wedges: what is under test is the
+    build, and a deadline of its own would only make the assertion
+    depend on how fast the runner is.
     """
-    log, elapsed = run_side(driver, tmp_path / "out", per_class=2, side=4)
+    monkeypatch.setenv("HELIOS_TEST_BUILD_SECONDS", "4")
+    measurable = [entry for entry in WORKLOADS if entry["class"] != WEDGED]
+
+    log, elapsed = run_side(
+        driver, tmp_path / "out", per_class=60, side=4, workloads=measurable
+    )
 
     assert (tmp_path / "builds").read_text(encoding="utf-8").strip() == "built", (
         "the side must build once, before its budget starts"
     )
-    assert elapsed > 2, "the build is the one thing that runs before the budget"
-
-    written = records(log)
-    assert written["quickjs-loop"]["type"] == "summary"
-    assert written["hostcall-loop"]["type"] == "summary"
-    assert "timed out" in written["wasi-tcp-throughput"]["error"], (
-        "the wedged class must fail on its own deadline, not on a budget the build spent"
+    assert elapsed > 4, "the build is the one thing that runs before the budget"
+    assert all(record["type"] == "summary" for record in records(log).values()), (
+        "no class may lose its share of the budget to the build"
     )
 
 
