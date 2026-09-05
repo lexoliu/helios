@@ -507,10 +507,31 @@ where
             // A blocked write is unblocked by the peer's window opening,
             // which arrives as an ACK on this stream's shard.
             let wait = self.shard_wait_for_handle(stream);
-            self.drive_tcp().await?;
             let written = self.inner.state.with_handle(stream, |state| {
                 state.try_write_tcp_bytes(stream, &mut bytes)
             })?;
+            // Queuing bytes on a socket puts nothing on the wire and
+            // raises no signal: the stack has to be driven for them to
+            // become a segment, and no arrival, completion or timer
+            // says that a socket now has data to send. So the writer
+            // publishes what it queued, on its own task, before it
+            // returns or parks — the transmit-side counterpart of the
+            // receive drain that raises a shard's arrival in #107.
+            //
+            // Left to the packet pump instead, the segment waits for
+            // the pump's next wake, and an idle pump parks for
+            // `DHCP_RETRANSMIT_NANOS`. A request/response exchange then
+            // pays a second per round trip, which is #158: 5000 echo
+            // round trips could not finish inside the benchmark's 180 s
+            // iteration deadline.
+            //
+            // This is the same one poll per iteration the loop always
+            // ran, moved behind the write rather than in front of it. A
+            // write that found no room still drives, which is what
+            // reclaims the peer's ACKs, and the wait it parks on was
+            // sampled before this poll, so a drain that made room here
+            // releases the park at once instead of being slept through.
+            self.drive_tcp().await?;
             if written != 0 {
                 continue;
             }
