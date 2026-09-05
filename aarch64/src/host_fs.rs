@@ -63,20 +63,18 @@ impl HostFsTransport for HostFsTransportService {
         self.device.pipeline_depth()
     }
 
-    fn request<'a>(
+    async fn request<'a>(
         &'a self,
         bytes: &'a [u8],
         response: &'a mut BytesMut,
         response_len: usize,
-    ) -> impl core::future::Future<Output = Result<(), IoError>> + Send + 'a {
-        async move {
-            response.clear();
-            response.resize(response_len, 0);
-            let used = self.device.request(bytes, response).await?;
-            let used = usize::try_from(used).map_err(|_| IoError::DeviceFault)?;
-            response.truncate(used);
-            Ok(())
-        }
+    ) -> Result<(), IoError> {
+        response.clear();
+        response.resize(response_len, 0);
+        let used = self.device.request(bytes, response).await?;
+        let used = usize::try_from(used).map_err(|_| IoError::DeviceFault)?;
+        response.truncate(used);
+        Ok(())
     }
 }
 

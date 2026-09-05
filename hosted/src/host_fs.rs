@@ -53,32 +53,28 @@ fn map_io_error(error: io::Error) -> HostFsError {
     HostFsError::Transport(io_error)
 }
 
-fn blocking_path<T>(
+async fn blocking_path<T>(
     path: Result<PathBuf, HostFsError>,
     operation: impl FnOnce(PathBuf) -> Result<T, HostFsError> + Send + 'static,
-) -> impl core::future::Future<Output = Result<T, HostFsError>> + Send
+) -> Result<T, HostFsError>
 where
     T: Send + 'static,
 {
-    async move {
-        let path = path?;
-        blocking::unblock(move || operation(path)).await
-    }
+    let path = path?;
+    blocking::unblock(move || operation(path)).await
 }
 
-fn blocking_two_paths<T>(
+async fn blocking_two_paths<T>(
     source: Result<PathBuf, HostFsError>,
     destination: Result<PathBuf, HostFsError>,
     operation: impl FnOnce(PathBuf, PathBuf) -> Result<T, HostFsError> + Send + 'static,
-) -> impl core::future::Future<Output = Result<T, HostFsError>> + Send
+) -> Result<T, HostFsError>
 where
     T: Send + 'static,
 {
-    async move {
-        let source = source?;
-        let destination = destination?;
-        blocking::unblock(move || operation(source, destination)).await
-    }
+    let source = source?;
+    let destination = destination?;
+    blocking::unblock(move || operation(source, destination)).await
 }
 
 impl HostFileSystem for HostedFileSystem {
