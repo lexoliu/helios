@@ -55,7 +55,7 @@ where
             .tcp_connect_from(host, port, local_port, hop_limit, timeout_nanos)
     }
 
-    pub fn tcp_listen(
+    pub async fn tcp_listen(
         &self,
         _: TcpCap,
         privileged_bind: Option<PrivilegedBindCap>,
@@ -63,18 +63,16 @@ where
         local_port: u16,
         backlog: u16,
         hop_limit: u8,
-    ) -> impl Future<Output = Result<TcpListener<Service::TcpListener>, TcpError>> + Send + '_ {
-        async move {
-            if local_port < 1024 && privileged_bind.is_none() {
-                return Err(TcpError {
-                    kind: TcpErrorKind::PermissionDenied,
-                    detail: NetworkErrorDetail::PrivilegedBindDenied,
-                });
-            }
-            self.service
-                .tcp_listen(local_address, local_port, backlog, hop_limit)
-                .await
+    ) -> Result<TcpListener<Service::TcpListener>, TcpError> {
+        if local_port < 1024 && privileged_bind.is_none() {
+            return Err(TcpError {
+                kind: TcpErrorKind::PermissionDenied,
+                detail: NetworkErrorDetail::PrivilegedBindDenied,
+            });
         }
+        self.service
+            .tcp_listen(local_address, local_port, backlog, hop_limit)
+            .await
     }
 
     pub fn tcp_accept(
@@ -133,21 +131,19 @@ where
         self.service.tcp_close(stream)
     }
 
-    pub fn udp_bind(
+    pub async fn udp_bind(
         &self,
         _: UdpCap,
         privileged_bind: Option<PrivilegedBindCap>,
         local_port: u16,
-    ) -> impl Future<Output = Result<UdpBinding<Service::UdpSocket>, UdpError>> + '_ {
-        async move {
-            if local_port < 1024 && privileged_bind.is_none() {
-                return Err(UdpError {
-                    kind: UdpErrorKind::PermissionDenied,
-                    detail: NetworkErrorDetail::PrivilegedBindDenied,
-                });
-            }
-            self.service.udp_bind(local_port).await
+    ) -> Result<UdpBinding<Service::UdpSocket>, UdpError> {
+        if local_port < 1024 && privileged_bind.is_none() {
+            return Err(UdpError {
+                kind: UdpErrorKind::PermissionDenied,
+                detail: NetworkErrorDetail::PrivilegedBindDenied,
+            });
         }
+        self.service.udp_bind(local_port).await
     }
 
     pub fn udp_send<'a>(

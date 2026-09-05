@@ -1276,138 +1276,96 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFileSystem
         Some(self.cache_stats())
     }
 
-    fn stat_path<'a>(
-        &'a self,
-        path: &'a str,
-    ) -> impl Future<Output = Result<HostMetadata, HostFsError>> + Send + 'a {
-        async move { self.stat_path_impl(path).await }
+    async fn stat_path<'a>(&'a self, path: &'a str) -> Result<HostMetadata, HostFsError> {
+        self.stat_path_impl(path).await
     }
 
-    fn read_dir<'a>(
-        &'a self,
-        path: &'a str,
-    ) -> impl Future<Output = Result<Vec<HostDirEntry>, HostFsError>> + Send + 'a {
-        async move { self.read_dir_impl(path).await }
+    async fn read_dir<'a>(&'a self, path: &'a str) -> Result<Vec<HostDirEntry>, HostFsError> {
+        self.read_dir_impl(path).await
     }
 
-    fn read_file<'a>(
-        &'a self,
-        path: &'a str,
-    ) -> impl Future<Output = Result<Vec<u8>, HostFsError>> + Send + 'a {
-        async move { self.read_file_impl(path).await }
+    async fn read_file<'a>(&'a self, path: &'a str) -> Result<Vec<u8>, HostFsError> {
+        self.read_file_impl(path).await
     }
 
-    fn read_file_range<'a>(
+    async fn read_file_range<'a>(
         &'a self,
         path: &'a str,
         offset: u64,
         max_bytes: u32,
-    ) -> impl Future<Output = Result<Vec<u8>, HostFsError>> + Send + 'a {
-        async move { self.read_file_range_impl(path, offset, max_bytes).await }
+    ) -> Result<Vec<u8>, HostFsError> {
+        self.read_file_range_impl(path, offset, max_bytes).await
     }
 
-    fn write_file<'a>(
+    async fn write_file<'a>(
         &'a self,
         path: &'a str,
         offset: u64,
         bytes: &'a [u8],
-    ) -> impl Future<Output = Result<(), HostFsError>> + Send + 'a {
-        async move { self.write_file_impl(path, offset, bytes).await }
+    ) -> Result<(), HostFsError> {
+        self.write_file_impl(path, offset, bytes).await
     }
 
-    fn append_file<'a>(
-        &'a self,
-        path: &'a str,
-        bytes: &'a [u8],
-    ) -> impl Future<Output = Result<u64, HostFsError>> + Send + 'a {
-        async move { self.append_file_impl(path, bytes).await }
+    async fn append_file<'a>(&'a self, path: &'a str, bytes: &'a [u8]) -> Result<u64, HostFsError> {
+        self.append_file_impl(path, bytes).await
     }
 
-    fn sync_file<'a>(
-        &'a self,
-        path: &'a str,
-    ) -> impl Future<Output = Result<(), HostFsError>> + Send + 'a {
-        async move { self.sync_file_impl(path).await }
+    async fn sync_file<'a>(&'a self, path: &'a str) -> Result<(), HostFsError> {
+        self.sync_file_impl(path).await
     }
 
-    fn truncate_file<'a>(
-        &'a self,
-        path: &'a str,
-    ) -> impl Future<Output = Result<(), HostFsError>> + Send + 'a {
-        async move { self.truncate_file_impl(path).await }
+    async fn truncate_file<'a>(&'a self, path: &'a str) -> Result<(), HostFsError> {
+        self.truncate_file_impl(path).await
     }
 
-    fn set_file_size<'a>(
-        &'a self,
-        path: &'a str,
-        size: u64,
-    ) -> impl Future<Output = Result<(), HostFsError>> + Send + 'a {
-        async move { self.set_file_size_impl(path, size).await }
+    async fn set_file_size<'a>(&'a self, path: &'a str, size: u64) -> Result<(), HostFsError> {
+        self.set_file_size_impl(path, size).await
     }
 
-    fn set_times<'a>(
+    async fn set_times<'a>(
         &'a self,
         path: &'a str,
         access_nanos: Option<u64>,
         modified_nanos: Option<u64>,
-    ) -> impl Future<Output = Result<(), HostFsError>> + Send + 'a {
-        async move {
-            self.set_times_impl(path, access_nanos, modified_nanos)
-                .await
-        }
+    ) -> Result<(), HostFsError> {
+        self.set_times_impl(path, access_nanos, modified_nanos)
+            .await
     }
 
-    fn create_file<'a>(
-        &'a self,
-        path: &'a str,
-    ) -> impl Future<Output = Result<(), HostFsError>> + Send + 'a {
-        async move { self.create_file_impl(path).await }
+    async fn create_file<'a>(&'a self, path: &'a str) -> Result<(), HostFsError> {
+        self.create_file_impl(path).await
     }
 
-    fn create_directory<'a>(
-        &'a self,
-        path: &'a str,
-    ) -> impl Future<Output = Result<(), HostFsError>> + Send + 'a {
-        async move { self.create_directory_impl(path).await }
+    async fn create_directory<'a>(&'a self, path: &'a str) -> Result<(), HostFsError> {
+        self.create_directory_impl(path).await
     }
 
-    fn remove<'a>(
-        &'a self,
-        path: &'a str,
-        directory: bool,
-    ) -> impl Future<Output = Result<(), HostFsError>> + Send + 'a {
-        async move { self.remove_impl(path, directory).await }
+    async fn remove<'a>(&'a self, path: &'a str, directory: bool) -> Result<(), HostFsError> {
+        self.remove_impl(path, directory).await
     }
 
-    fn rename<'a>(
+    async fn rename<'a>(
         &'a self,
         source: &'a str,
         destination: &'a str,
-    ) -> impl Future<Output = Result<(), HostFsError>> + Send + 'a {
-        async move { self.rename_impl(source, destination).await }
+    ) -> Result<(), HostFsError> {
+        self.rename_impl(source, destination).await
     }
 
-    fn hard_link<'a>(
+    async fn hard_link<'a>(
         &'a self,
         source: &'a str,
         destination: &'a str,
-    ) -> impl Future<Output = Result<(), HostFsError>> + Send + 'a {
-        async move { self.hard_link_impl(source, destination).await }
+    ) -> Result<(), HostFsError> {
+        self.hard_link_impl(source, destination).await
     }
 
-    fn symlink<'a>(
-        &'a self,
-        target: &'a str,
-        link_path: &'a str,
-    ) -> impl Future<Output = Result<(), HostFsError>> + Send + 'a {
-        async move { self.symlink_impl(target, link_path).await }
+    async fn symlink<'a>(&'a self, target: &'a str, link_path: &'a str) -> Result<(), HostFsError> {
+        self.symlink_impl(target, link_path).await
     }
 
-    fn read_link<'a>(
-        &'a self,
-        path: &'a str,
-    ) -> impl Future<Output = Result<String, HostFsError>> + Send + 'a {
-        async move { self.read_link_impl(path).await }
+    async fn read_link<'a>(&'a self, path: &'a str) -> Result<String, HostFsError> {
+        self.read_link_impl(path).await
     }
 }
 
