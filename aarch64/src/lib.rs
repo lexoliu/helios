@@ -5,7 +5,6 @@ extern crate alloc;
 
 use core::arch::{asm, global_asm};
 use core::cell::UnsafeCell;
-use core::fmt::{self, Write};
 use core::num::NonZeroUsize;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
@@ -1847,10 +1846,20 @@ fn write_debug_serial_bytes(bytes: &[u8]) {
     helios_kernel::write_debug_serial_bytes::<LockedDebugSerial>(bytes);
 }
 
-fn try_write_panic_serial_bytes(bytes: &[u8]) {
-    let base = DEBUG_SERIAL_BASE.load(Ordering::Acquire);
-    if base != 0 {
-        DebugSerial { base }.write_bytes(bytes);
+/// The port a panicking processor writes its report to.
+///
+/// The console UART without the writer lock: a processor that panicked
+/// while holding that lock would spin on itself forever, and a report
+/// cut in half still says more than a hang. A panic before firmware
+/// discovery has no port at all and the bytes go nowhere.
+struct PanicConsolePort;
+
+impl helios_kernel::PanicSerial for PanicConsolePort {
+    fn write_bytes(bytes: &[u8]) {
+        let base = DEBUG_SERIAL_BASE.load(Ordering::Acquire);
+        if base != 0 {
+            DebugSerial { base }.write_bytes(bytes);
+        }
     }
 }
 
@@ -2038,23 +2047,10 @@ fn boot_memory_regions(
     })
 }
 
-struct PanicSerialWriter;
-
-impl Write for PanicSerialWriter {
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        try_write_panic_serial_bytes(s.as_bytes());
-        Ok(())
-    }
-}
-
 #[cfg(target_os = "none")]
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    // One indivisible message, like every other console producer: the panic
-    // report shares this UART with kernel tracing and the debugger markers.
-    helios_kernel::emit_console_line(|| {
-        let _ = writeln!(PanicSerialWriter, "{info}");
-    });
+    helios_kernel::emit_panic_report::<PanicConsolePort>(info);
     helios_kernel::panic_log(info);
     loop {
         unsafe {

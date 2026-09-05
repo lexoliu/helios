@@ -10,6 +10,7 @@ mod console;
 mod debug_serial;
 mod interrupts;
 mod iommu;
+mod panic_console;
 mod poll_registry;
 mod serial;
 
@@ -28,6 +29,7 @@ pub use interrupts::{
     wake_queue_owners,
 };
 pub use iommu::{IommuDomains, IommuEndpointStats, IommuReport, IommuStats, MAX_IOMMU_ENDPOINTS};
+pub use panic_console::{PanicSerial, emit_panic_report};
 pub use poll_registry::{
     PollKey, PollRegistration, PollRegistry, PollRegistryError, PollSourceKind,
 };

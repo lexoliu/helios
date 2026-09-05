@@ -28,7 +28,6 @@ use alloc::sync::Arc;
 use core::arch::asm;
 use core::arch::global_asm;
 use core::arch::x86_64::{__cpuid, __cpuid_count, _rdrand64_step, _rdtsc};
-use core::fmt::{self, Write};
 use core::ops::Range;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use helios_hal::boot::{BootMemoryMap, BootReservedRanges, usable_region_segments};
@@ -1043,12 +1042,18 @@ fn serial_write_byte(byte: u8) {
     }
 }
 
-struct PanicSerialWriter;
+/// The port a panicking processor writes its report to.
+///
+/// COM1, the same port everything else on this machine writes to, and
+/// reached the same way: `x86_kernel_main` configures it before
+/// anything can panic, and reconfiguring it here would clear the
+/// transmit FIFO — discarding the tail of the very log that explains
+/// the panic.
+struct PanicConsolePort;
 
-impl Write for PanicSerialWriter {
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        write_debug_serial_bytes(s.as_bytes());
-        Ok(())
+impl helios_kernel::PanicSerial for PanicConsolePort {
+    fn write_bytes(bytes: &[u8]) {
+        DebugSerial.write_bytes(bytes);
     }
 }
 
@@ -1079,16 +1084,7 @@ pub(crate) fn write_debug_serial_bytes(bytes: &[u8]) {
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    // One indivisible message, like every other console producer: the panic
-    // report shares this UART with kernel tracing and the debugger markers.
-    //
-    // The port is not reconfigured first. `x86_kernel_main` configures it
-    // before anything can panic, and reconfiguring it would clear the
-    // transmit FIFO — discarding the tail of the very log that explains
-    // the panic.
-    helios_kernel::emit_console_line(|| {
-        let _ = writeln!(PanicSerialWriter, "{info}");
-    });
+    helios_kernel::emit_panic_report::<PanicConsolePort>(info);
     helios_kernel::panic_log(info);
     loop {
         core::hint::spin_loop();
