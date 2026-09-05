@@ -96,12 +96,25 @@ const MSI_NO_VECTOR: u16 = 0xffff;
 pub struct MsixBinding {
     /// Table entry the configuration-change notification uses.
     config: u16,
-    /// Table entry queue zero uses; queue `i` uses `queues + i`.
+    /// Table entry the first group of queues uses; group `i` uses
+    /// `queues + i`.
     queues: u16,
-    /// Queues covered by an entry of their own. A queue past this shares
-    /// the last one, which keeps a device with more queues than the
-    /// backend has vectors working rather than leaving its tail silent.
+    /// Queue groups covered by an entry of their own. A group past this
+    /// shares the last one, which keeps a device with more queues than
+    /// the backend has vectors working rather than leaving its tail
+    /// silent.
     queue_entries: u16,
+    /// Consecutive virtqueues that share one entry.
+    ///
+    /// A device whose queues are independent puts one queue in each
+    /// group. virtio-net does not: a receive queue and a transmit queue
+    /// form a pair drained by one processor, they sit at `2 * pair` and
+    /// `2 * pair + 1`, and both halves have to raise the message that
+    /// processor takes. Grouping them is what makes a per-queue binding
+    /// mean "per queue pair" for that device — mapping each virtqueue to
+    /// an entry of its own instead puts a pair's transmit completions on
+    /// a different processor's vector than its receive completions.
+    queues_per_entry: u16,
 }
 
 impl MsixBinding {
@@ -111,27 +124,54 @@ impl MsixBinding {
             config: entry,
             queues: entry,
             queue_entries: 1,
+            queues_per_entry: 1,
         }
     }
 
     /// Queue `i` raises the message at `queues + i`, and a
     /// configuration change raises `config`.
     pub const fn per_queue(config: u16, queues: u16, queue_entries: u16) -> Self {
+        Self::per_queue_group(config, queues, queue_entries, 1)
+    }
+
+    /// Queue pair `p` — virtqueues `2 * p` and `2 * p + 1` — raises the
+    /// message at `queues + p`, and a configuration change raises
+    /// `config`.
+    ///
+    /// This is the virtio-net layout: the receive and transmit halves of
+    /// a pair are drained by one processor, so they share that
+    /// processor's message.
+    pub const fn per_queue_pair(config: u16, queues: u16, queue_entries: u16) -> Self {
+        Self::per_queue_group(config, queues, queue_entries, 2)
+    }
+
+    const fn per_queue_group(
+        config: u16,
+        queues: u16,
+        queue_entries: u16,
+        queues_per_entry: u16,
+    ) -> Self {
         assert!(
             queue_entries != 0,
             "a per-queue MSI-X binding needs at least one queue entry"
+        );
+        assert!(
+            queues_per_entry != 0,
+            "a per-queue MSI-X binding needs at least one queue per entry"
         );
         Self {
             config,
             queues,
             queue_entries,
+            queues_per_entry,
         }
     }
 
     /// The table entry a queue's notifications are delivered through.
     const fn vector_for_queue(self, index: u16) -> u16 {
-        if index < self.queue_entries {
-            self.queues + index
+        let group = index / self.queues_per_entry;
+        if group < self.queue_entries {
+            self.queues + group
         } else {
             self.queues + self.queue_entries - 1
         }
@@ -926,6 +966,37 @@ mod tests {
         for queue in 4..16 {
             assert_eq!(binding.vector_for_queue(queue), 4);
         }
+    }
+
+    /// virtio-net keeps a pair's two queues at `2 * pair` and
+    /// `2 * pair + 1`, and one processor drains both. Splitting them
+    /// across two entries is what sent a single-queue function's
+    /// transmit completions to a vector no processor had a handler for.
+    #[test]
+    fn both_halves_of_a_queue_pair_raise_the_pair_entry() {
+        // Entry zero is the configuration change; the pairs follow it.
+        let binding = MsixBinding::per_queue_pair(0, 1, 4);
+        for pair in 0..4 {
+            assert_eq!(binding.vector_for_queue(2 * pair), 1 + pair);
+            assert_eq!(binding.vector_for_queue(2 * pair + 1), 1 + pair);
+        }
+    }
+
+    /// The control queue sits past every pair, at `2 * max_pairs`, so a
+    /// function whose table has room for more pairs than the device
+    /// carries still points it at an entry — which is why the backend
+    /// has to route every entry it programs, not only the ones its
+    /// queue pairs use.
+    #[test]
+    fn the_control_queue_lands_on_an_entry_of_its_own_group() {
+        let binding = MsixBinding::per_queue_pair(0, 1, 3);
+        assert_eq!(binding.vector_for_queue(2), 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "at least one queue per entry")]
+    fn a_grouped_binding_needs_a_queue_per_entry() {
+        let _ = MsixBinding::per_queue_group(0, 1, 4, 0);
     }
 
     #[test]

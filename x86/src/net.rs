@@ -101,6 +101,14 @@ where
     // table goes and no further. Sizing this from the processor count
     // alone is what made a default `virtio-net-pci` panic the kernel
     // during bring-up.
+    //
+    // The table says how many entries there are, not how the device
+    // spends them: it points each of its virtqueues at one, and the
+    // control queue sits past every pair. So the entries are handed out
+    // per queue pair rather than per virtqueue, and every entry
+    // programmed below gets a route — an entry the device can select
+    // but the routing table does not know is a kernel panic the first
+    // time that queue completes.
     let PciFunction {
         root: pci,
         address,
@@ -136,7 +144,7 @@ where
     let binding = if steered == 0 {
         helios_virtio::MsixBinding::shared(msix)
     } else {
-        helios_virtio::MsixBinding::per_queue(
+        helios_virtio::MsixBinding::per_queue_pair(
             msix,
             msix + 1,
             u16::try_from(steered).unwrap_or_else(|_| panic!("{steered} queue vectors exceed u16")),
@@ -163,15 +171,19 @@ where
     ));
     tracing::info!(
         queue_pairs,
-        steered_queue_vectors = steered,
+        msix_queue_entries = steered,
+        steered_queue_pairs = steered.min(queue_pairs),
         config_vector = vector,
         "virtio network online transport=pci function={address}"
     );
     NetworkInterrupts {
-        // A pair past the vectors this backend hands out shares the last
-        // one, so its route is the one already installed for that
-        // vector; only the pairs with a vector of their own get a route.
-        queues: (0..steered.min(queue_pairs))
+        // Every entry programmed above, not only the ones this device's
+        // queue pairs claim: the device decides which entry each of its
+        // virtqueues raises, and its control queue's group sits past the
+        // pairs. A message on an entry with no route is fatal, and one
+        // that names a pair the device does not have is normalised back
+        // onto a real pair by the driver.
+        queues: (0..steered)
             .map(|pair_idx| {
                 (
                     queue_vectors[pair_idx],
