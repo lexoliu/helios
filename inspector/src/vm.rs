@@ -1091,7 +1091,7 @@ fn default_accel(profile: &VmProfile) -> Result<Vec<String>, NoNativeAccelerator
     }
     let mut checks = Vec::new();
     for accel in profile.default_accel {
-        match probe_accel(profile.arch, *accel) {
+        match probe_accel(profile.arch, accel) {
             Ok(()) => return Ok(vec![(*accel).to_owned()]),
             Err(check) => checks.push(check),
         }
