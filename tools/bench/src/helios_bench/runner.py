@@ -19,6 +19,8 @@ from pathlib import Path
 
 from helios_bench import REPO_ROOT, WASI_APPS_ROOT
 from helios_bench.assemble import assemble_report, build_control
+from helios_bench.baseline import Baseline
+from helios_bench.baseline import prepare as prepare_baseline
 from helios_bench.manifest import (
     Lane,
     Manifest,
@@ -42,8 +44,18 @@ NATIVE_ARTIFACTS = REPO_ROOT / "artifacts" / "bench-native"
 BOOT_ARTIFACTS = WASI_APPS_ROOT / "boot-artifacts.toml"
 CARGO_TARGETS = {"aarch64": "aarch64-unknown-none", "x86-64": "x86_64-unknown-none"}
 HELIOS_OUT = "helios"
+HELIOS_BASELINE_OUT = "helios-baseline"
 LINUX_OUT = "linux"
 LINUX_SIDES = {Side.LINUX_NATIVE, Side.LINUX_WASMTIME}
+# Which subdirectory of the run's output each side's raw JSONL lands in.
+# The two Helios images write the same file names, so the directory is
+# what tells their records apart.
+SIDE_OUT = {
+    Side.HELIOS: HELIOS_OUT,
+    Side.HELIOS_BASELINE: HELIOS_BASELINE_OUT,
+    Side.LINUX_NATIVE: LINUX_OUT,
+    Side.LINUX_WASMTIME: LINUX_OUT,
+}
 
 
 @dataclass(frozen=True)
@@ -76,6 +88,13 @@ class RunOptions:
     skip_linux_workloads: tuple[str, ...] = ()
     linux_setup_timeout_seconds: int = 5400
     network: NetworkOptions = NetworkOptions()
+    # The second Helios image this run is timed against, or None for an
+    # ordinary run. Its presence adds the `helios_baseline` side and makes
+    # the Helios half boot both images for every workload. The side
+    # timeout above still bounds that half as a whole: a paired run
+    # shares it out over twice as many boots, and each of those boots
+    # carries one workload rather than a whole class.
+    baseline: Baseline | None = None
 
 
 @dataclass(frozen=True)
@@ -166,6 +185,7 @@ def plan(options: RunOptions, manifest: Manifest, workloads: list[dict]) -> list
                     str(options.helios_side_timeout_seconds),
                     "--out-dir",
                     str(options.out_dir / HELIOS_OUT),
+                    *baseline_arguments(options),
                 ],
                 env=env,
                 cwd=REPO_ROOT,
@@ -203,6 +223,18 @@ def plan(options: RunOptions, manifest: Manifest, workloads: list[dict]) -> list
             )
         )
     return commands
+
+
+def baseline_arguments(options: RunOptions) -> list[str]:
+    """What the driver needs to time the second image beside the first."""
+    if options.baseline is None:
+        return []
+    return [
+        "--helios-baseline-root",
+        str(options.baseline.worktree),
+        "--helios-baseline-out-dir",
+        str(options.out_dir / HELIOS_BASELINE_OUT),
+    ]
 
 
 def execute(command: PlannedCommand) -> None:
@@ -297,7 +329,7 @@ def thresholds_from(manifest: Manifest, iterations: int | None) -> Thresholds:
 def read_sides(options: RunOptions, thresholds: Thresholds) -> dict[Side, RawSide]:
     sides = {}
     for side in options.sides:
-        out_dir = options.out_dir / (HELIOS_OUT if side is Side.HELIOS else LINUX_OUT)
+        out_dir = options.out_dir / SIDE_OUT[side]
         raw = read_optional_side(out_dir, side, thresholds.warmup_discard)
         if raw is None:
             raise SystemExit(f"the {side} side produced no JSONL under {out_dir}")
@@ -308,7 +340,7 @@ def read_sides(options: RunOptions, thresholds: Thresholds) -> dict[Side, RawSid
 def read_controls(options: RunOptions, thresholds: Thresholds) -> dict[Side, tuple[RawSide, RawSide]]:
     controls = {}
     for side in options.sides:
-        out_dir = options.out_dir / (HELIOS_OUT if side is Side.HELIOS else LINUX_OUT)
+        out_dir = options.out_dir / SIDE_OUT[side]
         before = read_control(out_dir, side, "before", thresholds.warmup_discard)
         after = read_control(out_dir, side, "after", thresholds.warmup_discard)
         if before is not None and after is not None:
@@ -324,6 +356,12 @@ def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) ->
             "this host deviates from lane "
             f"{lane.name}; refusing to produce a publishable report:\n  - " + "\n  - ".join(deviations)
         )
+    if options.baseline is not None and not {Side.HELIOS, Side.HELIOS_BASELINE} <= options.sides:
+        raise SystemExit(
+            "a paired run times both Helios images: --sides has to name helios and helios_baseline"
+        )
+    if options.baseline is None and Side.HELIOS_BASELINE in options.sides:
+        raise SystemExit("the helios_baseline side needs --baseline-ref to say what it is built from")
     workload_manifest = load_workloads()
     workloads = select_workloads(workload_manifest, options.workload_names)
     commands = plan(options, manifest, workloads)
@@ -333,6 +371,12 @@ def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) ->
         for command in commands:
             print(f"# {command.description}\n{command.shell()}")
         return None
+
+    if options.baseline is not None:
+        # Before the clock starts: the worktree, the links it shares with
+        # the candidate, and the build the driver then does are all fixed
+        # costs of the pairing, not of any workload.
+        prepare_baseline(options.baseline)
 
     started = datetime.now(UTC).isoformat(timespec="seconds")
     options.out_dir.mkdir(parents=True, exist_ok=True)
@@ -358,6 +402,8 @@ def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) ->
         started_at=started,
         finished_at=finished,
         helios_git_sha=git_sha(),
+        baseline_git_sha=options.baseline.sha if options.baseline else None,
+        baseline_ref=options.baseline.ref if options.baseline else None,
     )
     return assemble_report(
         workloads=workloads,

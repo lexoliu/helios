@@ -2,6 +2,7 @@ use std::fs;
 use std::fs::File;
 use std::io;
 use std::os::unix::fs::FileTypeExt;
+use std::os::unix::fs::symlink;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -61,6 +62,19 @@ const DEBUG_SERIAL_CHARDEV: &str = "helios-debug-serial";
 /// The runtime-directory file holding a raw copy of the debug serial
 /// line, host side. `--debug-serial-log` puts it elsewhere.
 const DEBUG_SERIAL_LOG_NAME: &str = "debug-serial.log";
+/// Longest unix socket path the inspector will hand to QEMU.
+///
+/// `sockaddr_un::sun_path` holds 108 bytes on Linux and 104 on macOS,
+/// the terminator included, so 103 is what fits on either host the
+/// inspector runs on. QEMU refuses a longer path rather than truncating
+/// it, and it refuses it after the guest image is built.
+const UNIX_SOCKET_PATH_MAX: usize = 103;
+/// The runtime directory's link to the socket directory the sockets of
+/// that VM actually live in.
+const SOCKET_DIR_LINK_NAME: &str = "sockets";
+const DEBUG_SOCKET_NAME: &str = "debug.sock";
+const MONITOR_SOCKET_NAME: &str = "monitor.sock";
+const QMP_SOCKET_NAME: &str = "qmp.sock";
 /// The QEMU IOThread the memory balloon's free-page hint queue runs on.
 const BALLOON_IOTHREAD_ID: &str = "balloon-io";
 /// How long the guest's reported balloon size has to hold still before a
@@ -670,6 +684,17 @@ enum VmSessionCommand {
     /// no `--boot-program` the bootfs carries every program, which is
     /// the superset every workload class boots from.
     Build,
+    /// Print the guest kernel artifact this checkout would boot, and
+    /// stop there.
+    ///
+    /// The path is resolved exactly as a boot resolves it — the
+    /// workspace root, then the architecture and the profile — so a
+    /// caller that has to identify the guest an image would boot does
+    /// not have to rebuild the mapping from architecture to Cargo target
+    /// and artifact name for itself. A paired benchmark run uses it to
+    /// refuse two checkouts whose guest images turn out to be the same
+    /// build, which the comparison between them could say nothing about.
+    KernelPath,
     /// Provision the privileged host state a network backend needs.
     NetSetup(NetSetupCommand),
     /// Remove the host state `net-setup` provisioned.
@@ -802,6 +827,13 @@ pub(crate) fn run(mut command: VmCommand) -> Result<()> {
         // `build` produces artifacts and boots nothing, so it neither
         // preflights the QEMU host state nor spawns a guest.
         Some(VmSessionCommand::Build) => return build_vm(&resolve(command)?),
+        // Answers from the resolved command and boots nothing, so it is
+        // dispatched beside `build` rather than after the host checks a
+        // guest would need.
+        Some(VmSessionCommand::KernelPath) => {
+            println!("{}", resolve(command)?.kernel.display());
+            return Ok(());
+        }
         session => command.command = session,
     }
     let command = resolve(command)?;
@@ -1918,6 +1950,9 @@ struct VmRuntime {
     /// The QMP socket the inspector created, when it owns one.
     qmp_socket: Option<PathBuf>,
     runtime_dir: VmRuntimeDir,
+    /// Held for the life of the VM: dropping it takes the sockets with
+    /// it, and QEMU is still bound to them until it exits.
+    _socket_dir: VmSocketDir,
     qemu_log: PathBuf,
     child: Child,
 }
@@ -1969,15 +2004,126 @@ impl VmRuntimeDir {
             Self::Persistent(path) => path,
         }
     }
+
+    fn is_persistent(&self) -> bool {
+        matches!(self, Self::Persistent(_))
+    }
+}
+
+/// A unix socket path the kernel will not accept.
+///
+/// The inspector owns the paths it hands QEMU, so it is the inspector
+/// that refuses one that cannot fit, naming the path and the limit.
+/// QEMU's own refusal comes after the guest image is built and reads as
+/// a QEMU argument error rather than as what it is: run 33993027470 lost
+/// a whole benchmark lane to `-monitor unix:…/monitor.sock` at 116
+/// bytes.
+#[derive(Debug, thiserror::Error)]
+#[error("unix socket path {} is {length} bytes, and at most {limit} fit", .path.display())]
+struct SocketPathTooLong {
+    path: PathBuf,
+    length: usize,
+    limit: usize,
+}
+
+fn check_socket_path(path: &Path) -> Result<()> {
+    let length = path.as_os_str().len();
+    if length > UNIX_SOCKET_PATH_MAX {
+        return Err(SocketPathTooLong {
+            path: path.to_path_buf(),
+            length,
+            limit: UNIX_SOCKET_PATH_MAX,
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// Where the sockets of one VM live.
+///
+/// Not in the runtime directory. That path belongs to the caller, names
+/// the run for a human, and nests as deeply as the caller likes: a
+/// benchmark that boots one guest per workload per image pushed it past
+/// `sun_path` and QEMU refused the monitor socket with every guest image
+/// already built (#173). The sockets go in a short directory of the
+/// inspector's own, and the runtime directory carries a `sockets` link
+/// to it so that a monitor, a QMP client or a raw serial reader still
+/// finds them from the directory a lane retained.
+enum VmSocketDir {
+    Temporary(TempDir),
+    Persistent(PathBuf),
+}
+
+impl VmSocketDir {
+    /// `$XDG_RUNTIME_DIR` when the session has one, and the system
+    /// temporary directory otherwise. Both are short by construction,
+    /// and the first is already the place a session's sockets belong.
+    fn base() -> PathBuf {
+        match std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from) {
+            Some(path) if path.is_dir() => path,
+            _ => std::env::temp_dir(),
+        }
+    }
+
+    fn create(runtime_dir: &VmRuntimeDir) -> Result<Self> {
+        let base = Self::base();
+        let dir = tempfile::Builder::new()
+            .prefix("helios-")
+            .tempdir_in(&base)
+            .with_context(|| {
+                format!(
+                    "failed to create the VM socket directory in {}",
+                    base.display()
+                )
+            })?;
+        // The longest name any of the sockets takes, checked once: the
+        // three of them are created at different points of the spawn and
+        // the run must fail before the first, not between them.
+        check_socket_path(&dir.path().join(MONITOR_SOCKET_NAME))?;
+        let link = runtime_dir.path().join(SOCKET_DIR_LINK_NAME);
+        if fs::symlink_metadata(&link).is_ok() {
+            fs::remove_file(&link).with_context(|| {
+                format!("failed to replace the stale socket link {}", link.display())
+            })?;
+        }
+        symlink(dir.path(), &link).with_context(|| {
+            format!(
+                "failed to record the socket directory {} as {}",
+                dir.path().display(),
+                link.display()
+            )
+        })?;
+        if runtime_dir.is_persistent() {
+            // A retained runtime directory is retained to be read later,
+            // and a link into a directory that removed itself reads as
+            // nothing at all.
+            return Ok(Self::Persistent(dir.keep()));
+        }
+        Ok(Self::Temporary(dir))
+    }
+
+    fn path(&self) -> &Path {
+        match self {
+            Self::Temporary(tempdir) => tempdir.path(),
+            Self::Persistent(path) => path,
+        }
+    }
 }
 
 impl VmRuntime {
     fn spawn(command: &ResolvedVmCommand) -> Result<Self> {
         let runtime_dir = VmRuntimeDir::create(command)?;
-        let socket_path = command
-            .socket
-            .clone()
-            .unwrap_or_else(|| runtime_dir.path().join("debug.sock"));
+        let socket_dir = VmSocketDir::create(&runtime_dir)?;
+        let socket_path = match &command.socket {
+            // A path the caller named is the caller's; it is still
+            // checked, because the kernel will refuse it either way and
+            // the inspector can say so before QEMU is started.
+            Some(path) => {
+                check_socket_path(path)?;
+                path.clone()
+            }
+            None => socket_dir.path().join(DEBUG_SOCKET_NAME),
+        };
         let qemu_log = command
             .qemu_log
             .clone()
@@ -2008,12 +2154,12 @@ impl VmRuntime {
             None => Command::new(&command.qemu_bin),
         };
         qemu.arg("-display").arg("none");
-        if let Some(monitor) = monitor_endpoint(command, runtime_dir.path()) {
+        if let Some(monitor) = monitor_endpoint(command, socket_dir.path())? {
             qemu.arg("-monitor").arg(monitor);
         } else {
             qemu.arg("-monitor").arg("none");
         }
-        if let Some(qmp) = qmp_endpoint(command, runtime_dir.path()) {
+        if let Some(qmp) = qmp_endpoint(command, socket_dir.path())? {
             qemu.arg("-qmp").arg(qmp);
         }
         qemu.arg("-machine").arg(machine(command));
@@ -2172,9 +2318,10 @@ impl VmRuntime {
         Ok(Self {
             transport: Some(transport),
             _serial_pty_slave: serial_pty_slave,
-            qmp_socket: qmp_socket_path(command, runtime_dir.path()),
+            qmp_socket: qmp_socket_path(command, socket_dir.path())?,
             qemu_log,
             runtime_dir,
+            _socket_dir: socket_dir,
             child,
         })
     }
@@ -2247,19 +2394,24 @@ fn default_persistent_runtime_dir() -> Result<PathBuf> {
         .join(format!("run-{}-{timestamp}", std::process::id())))
 }
 
-fn monitor_endpoint(command: &ResolvedVmCommand, runtime_dir: &Path) -> Option<String> {
-    command.monitor.clone().or_else(|| {
-        command
-            .keep_runtime_dir
-            .then(|| unix_endpoint(runtime_dir, "monitor.sock"))
-    })
+fn monitor_endpoint(command: &ResolvedVmCommand, socket_dir: &Path) -> Result<Option<String>> {
+    match &command.monitor {
+        Some(monitor) => Ok(Some(monitor.clone())),
+        None if command.keep_runtime_dir => {
+            Ok(Some(unix_endpoint(socket_dir, MONITOR_SOCKET_NAME)?))
+        }
+        None => Ok(None),
+    }
 }
 
-fn qmp_endpoint(command: &ResolvedVmCommand, runtime_dir: &Path) -> Option<String> {
-    command.qmp.clone().or_else(|| {
-        (command.keep_runtime_dir || command.needs_qmp)
-            .then(|| unix_endpoint(runtime_dir, "qmp.sock"))
-    })
+fn qmp_endpoint(command: &ResolvedVmCommand, socket_dir: &Path) -> Result<Option<String>> {
+    match &command.qmp {
+        Some(qmp) => Ok(Some(qmp.clone())),
+        None if command.keep_runtime_dir || command.needs_qmp => {
+            Ok(Some(unix_endpoint(socket_dir, QMP_SOCKET_NAME)?))
+        }
+        None => Ok(None),
+    }
 }
 
 /// The QMP socket the inspector can talk to, when there is one it owns
@@ -2269,18 +2421,21 @@ fn qmp_endpoint(command: &ResolvedVmCommand, runtime_dir: &Path) -> Option<Strin
 /// name a TCP port or a socket QEMU connects out to, so only the
 /// `unix:<path>` form the inspector understands is offered back to the
 /// commands that drive QMP themselves.
-fn qmp_socket_path(command: &ResolvedVmCommand, runtime_dir: &Path) -> Option<PathBuf> {
-    let endpoint = qmp_endpoint(command, runtime_dir)?;
-    let path = endpoint.strip_prefix("unix:")?;
+fn qmp_socket_path(command: &ResolvedVmCommand, socket_dir: &Path) -> Result<Option<PathBuf>> {
+    let Some(endpoint) = qmp_endpoint(command, socket_dir)? else {
+        return Ok(None);
+    };
+    let Some(path) = endpoint.strip_prefix("unix:") else {
+        return Ok(None);
+    };
     let path = path.split(',').next().unwrap_or(path);
-    Some(PathBuf::from(path))
+    Ok(Some(PathBuf::from(path)))
 }
 
-fn unix_endpoint(runtime_dir: &Path, name: &str) -> String {
-    format!(
-        "unix:{},server=on,wait=off",
-        runtime_dir.join(name).display()
-    )
+fn unix_endpoint(socket_dir: &Path, name: &str) -> Result<String> {
+    let path = socket_dir.join(name);
+    check_socket_path(&path)?;
+    Ok(format!("unix:{},server=on,wait=off", path.display()))
 }
 
 impl Drop for VmRuntime {
@@ -2766,9 +2921,12 @@ impl From<VmSessionCommand> for ResolvedVmSessionCommand {
             VmSessionCommand::WorkloadBench(command) => Self::WorkloadBench(command),
             VmSessionCommand::Balloon(command) => Self::Balloon(command),
             VmSessionCommand::Build
+            | VmSessionCommand::KernelPath
             | VmSessionCommand::NetSetup(_)
             | VmSessionCommand::NetTeardown(_) => {
-                unreachable!("the build and the network helpers never reach a guest session")
+                unreachable!(
+                    "the build, the artifact query and the network helpers never reach a guest session"
+                )
             }
         }
     }
@@ -2906,14 +3064,67 @@ mod tests {
     fn a_balloon_session_gets_a_qmp_socket_of_its_own() {
         let mut command = watchdog_test_command(VmArch::Aarch64);
         command.needs_qmp = true;
-        let runtime_dir = Path::new("/tmp/helios-vm");
+        let socket_dir = Path::new("/tmp/helios-vm");
         assert_eq!(
-            qmp_socket_path(&command, runtime_dir),
+            qmp_socket_path(&command, socket_dir).unwrap(),
             Some(PathBuf::from("/tmp/helios-vm/qmp.sock"))
         );
 
         command.needs_qmp = false;
-        assert_eq!(qmp_socket_path(&command, runtime_dir), None);
+        assert_eq!(qmp_socket_path(&command, socket_dir).unwrap(), None);
+    }
+
+    /// The path QEMU is handed is the inspector's to refuse.
+    ///
+    /// A caller's runtime directory nests as deeply as the caller likes,
+    /// and the benchmark suite's paired mode nests it per image and per
+    /// workload. QEMU refuses a `sun_path` over the limit after the
+    /// guest image is built, so the run has to fail before that, naming
+    /// the path and the limit (#173).
+    #[test]
+    fn a_socket_path_over_the_unix_limit_is_refused_by_name() {
+        let short = Path::new("/run/user/1000/helios-ab12cd/monitor.sock");
+        check_socket_path(short).expect("a short path is handed to QEMU");
+
+        let long = PathBuf::from("/home/runner/work/helios/helios")
+            .join("a".repeat(UNIX_SOCKET_PATH_MAX))
+            .join(MONITOR_SOCKET_NAME);
+        let error = check_socket_path(&long).expect_err("a path over the limit is refused");
+        let message = error.to_string();
+        assert!(message.contains(&long.display().to_string()), "{message}");
+        assert!(
+            message.contains(&UNIX_SOCKET_PATH_MAX.to_string()),
+            "{message}"
+        );
+    }
+
+    /// The sockets never sit under the caller's runtime directory, so a
+    /// deep one cannot push them over the limit.
+    #[test]
+    fn the_socket_directory_is_short_whatever_the_runtime_directory_is() {
+        let deep = std::env::temp_dir()
+            .join("helios-socket-dir-test")
+            .join("bench-runtime/helios-baseline/helios-control-before/helios-control-before");
+        fs::create_dir_all(&deep).expect("the deep runtime directory is created");
+        let runtime_dir = VmRuntimeDir::Persistent(deep.clone());
+        let socket_dir =
+            VmSocketDir::create(&runtime_dir).expect("the socket directory is created");
+
+        check_socket_path(&socket_dir.path().join(MONITOR_SOCKET_NAME))
+            .expect("the socket path fits");
+        let link = deep.join(SOCKET_DIR_LINK_NAME);
+        assert_eq!(
+            fs::read_link(&link).expect("the runtime directory records the socket directory"),
+            socket_dir.path(),
+        );
+        fs::remove_dir_all(socket_dir.path()).expect("the socket directory is removed");
+        fs::remove_dir_all(
+            deep.parent()
+                .and_then(Path::parent)
+                .and_then(Path::parent)
+                .unwrap(),
+        )
+        .expect("the runtime directory is removed");
     }
 
     #[test]

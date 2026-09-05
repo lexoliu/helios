@@ -9,7 +9,9 @@ from pathlib import Path
 
 from helios_bench import REPO_ROOT
 from helios_bench.artifacts import RUNS_DIR, committed_reports, fetch_reports, run_dir
-from helios_bench.gate import evaluate
+from helios_bench.baseline import MERGE_BASE
+from helios_bench.baseline import resolve as resolve_baseline
+from helios_bench.gate import gate_report
 from helios_bench.manifest import host_deviations, load_manifest
 from helios_bench.plots import plot_report
 from helios_bench.render import (
@@ -40,11 +42,16 @@ def parse_sides(raw: str) -> frozenset[Side]:
 def command_run(args: argparse.Namespace) -> int:
     manifest = load_manifest()
     lane = manifest.lane(args.lane)
+    ref = MERGE_BASE if args.baseline_merge_base else args.baseline_ref
+    baseline = resolve_baseline(ref) if ref else None
+    sides = parse_sides(args.sides)
+    if baseline is not None:
+        sides |= {Side.HELIOS_BASELINE}
     options = RunOptions(
         lane=lane,
         out_dir=args.out_dir.resolve(),
         advisory=args.advisory,
-        sides=parse_sides(args.sides),
+        sides=sides,
         workload_names=args.workloads,
         iterations=args.iterations,
         runner_label=args.runner_label,
@@ -54,6 +61,7 @@ def command_run(args: argparse.Namespace) -> int:
         skip_linux_workloads=tuple(args.skip_linux_workloads),
         linux_setup_timeout_seconds=args.linux_setup_timeout_seconds,
         network=NetworkOptions(ifname=args.net_ifname, bridge=args.net_bridge, queues=args.net_queues),
+        baseline=baseline,
     )
     report = run_suite(options, manifest, dry_run=args.dry_run)
     if report is None:
@@ -158,12 +166,19 @@ def command_fetch(args: argparse.Namespace) -> int:
 
 
 def command_gate(args: argparse.Namespace) -> int:
-    result = evaluate(load_report(args.baseline), load_report(args.candidate))
-    text = render_gate(result)
+    candidate = load_report(args.candidate)
+    baseline = load_report(args.baseline) if args.baseline else None
+    report = gate_report(candidate, baseline)
+    if not report.results:
+        raise SystemExit(
+            f"{args.candidate}: the run was not paired and no --baseline was given, "
+            "so there is nothing to compare it against"
+        )
+    text = render_gate(report, candidate.run.lane)
     if args.out:
         write_text(args.out, text)
     sys.stdout.write(text)
-    return 1 if result.blocking else 0
+    return 1 if report.blocking else 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -192,6 +207,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="leave a workload out of the Linux side, by name",
     )
     run.add_argument("--linux-setup-timeout-seconds", type=int, default=5400)
+    run.add_argument(
+        "--baseline-ref",
+        nargs="?",
+        const=MERGE_BASE,
+        default=None,
+        help=(
+            "time a second Helios image, built from this ref in a worktree under "
+            "target/perf-baselines/worktrees/, against this one on this host in this "
+            f"job; without a value, {MERGE_BASE} with the upstream default branch"
+        ),
+    )
+    run.add_argument(
+        "--baseline-merge-base",
+        action="store_true",
+        help="pair against the merge base with the upstream default branch",
+    )
     run.add_argument("--net-ifname")
     run.add_argument("--net-bridge")
     run.add_argument("--net-queues", type=int)
@@ -247,7 +278,14 @@ def build_parser() -> argparse.ArgumentParser:
     fetch.set_defaults(func=command_fetch)
 
     gate = subcommands.add_parser("gate", help="compare a candidate report against a baseline")
-    gate.add_argument("--baseline", type=Path, required=True)
+    gate.add_argument(
+        "--baseline",
+        type=Path,
+        help=(
+            "a report from another run of the same lane, for the cross-run table. "
+            "The paired table needs no baseline: it is in the candidate report."
+        ),
+    )
     gate.add_argument("--candidate", type=Path, required=True)
     gate.add_argument("--out", type=Path)
     gate.set_defaults(func=command_gate)
