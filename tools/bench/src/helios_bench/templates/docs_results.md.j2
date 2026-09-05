@@ -26,9 +26,10 @@ Advisory: this report is from `{{ report.run.runner_label }}`, not a dedicated r
 
 ![{{ CLASS_LABELS[workload_class] }} on {{ report.run.lane }}](benchmarks/runs/{{ run_id }}/{{ report.run.lane }}-{{ workload_class }}.svg)
 
-{{ m.header() }}
+{% set sides = report.table_sides() %}
+{{ m.header(sides) }}
 {% for workload in workloads %}
-{{ m.row(workload) }}
+{{ m.row(workload, sides) }}
 {% endfor %}
 
 {% endfor %}

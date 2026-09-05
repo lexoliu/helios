@@ -18,15 +18,25 @@ REPORT_SCHEMA_VERSION = 1
 
 class Side(StrEnum):
     HELIOS = "helios"
+    #: A second Helios image, built from another commit and timed against
+    #: `HELIOS` on the same host in the same job. Present only in a paired
+    #: run; see `helios_bench.baseline`.
+    HELIOS_BASELINE = "helios_baseline"
     LINUX_WASMTIME = "linux_wasmtime"
     LINUX_NATIVE = "linux_native"
 
 
 SIDE_LABELS = {
     Side.HELIOS: "Helios",
+    Side.HELIOS_BASELINE: "Helios (baseline)",
     Side.LINUX_WASMTIME: "Linux + Wasmtime",
     Side.LINUX_NATIVE: "Native Linux",
 }
+
+#: The order a table and a plot put the sides in. The baseline column is
+#: printed only by a run that produced one, so an unpaired report renders
+#: exactly as it did before the paired mode existed.
+TABLE_SIDE_ORDER = [Side.HELIOS, Side.HELIOS_BASELINE, Side.LINUX_WASMTIME, Side.LINUX_NATIVE]
 
 
 class WorkloadClass(StrEnum):
@@ -61,7 +71,18 @@ class RunInfo(BaseModel):
     deviations: list[str]
     started_at: str
     finished_at: str
-    helios_git_sha: str
+    helios_git_sha: str = Field(description="the candidate: the commit the `helios` side was built from")
+    baseline_git_sha: str | None = Field(
+        default=None,
+        description="the commit the `helios_baseline` side was built from, when the run was paired",
+    )
+    baseline_ref: str | None = Field(
+        default=None, description="what the run was asked to pair against, before it was resolved"
+    )
+
+    @property
+    def paired(self) -> bool:
+        return self.baseline_git_sha is not None
 
 
 class Hardware(BaseModel):
@@ -186,6 +207,14 @@ class Report(BaseModel):
             if workload.name == name:
                 return workload
         return None
+
+    def measured_sides(self) -> set[Side]:
+        return {side for workload in self.workloads for side in workload.cells}
+
+    def table_sides(self) -> list[Side]:
+        """The columns a table and a plot print, in report order."""
+        measured = self.measured_sides()
+        return [side for side in TABLE_SIDE_ORDER if side is not Side.HELIOS_BASELINE or side in measured]
 
     def headline_workloads(self) -> list[WorkloadResult]:
         return [workload for workload in self.workloads if workload.headline]
