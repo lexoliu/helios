@@ -409,6 +409,30 @@ pub(super) struct ShardWait {
     pub(super) mark: ProgressMark,
 }
 
+/// Everything a network operation samples before it inspects the state
+/// it means to park on.
+///
+/// Two things can end such a park and both are races rather than polls:
+/// a frame another processor placed in the shard, which raises the
+/// shard's arrival signal, and the interface's own event, which is what
+/// a frame nobody has drained yet raises. A wait that carries only the
+/// first arms the second *after* the caller has already looked, and an
+/// interrupt in that window is lost — permanently, once a full receive
+/// ring stops the device raising any more.
+///
+/// So the two marks are taken together, in the one call that also
+/// decides which shard and which queue pair the operation belongs to,
+/// and [`NetworkService::wait_for_shard_progress`] takes nothing else.
+#[derive(Clone, Copy)]
+pub(super) struct NetworkWait {
+    pub(super) shard: ShardWait,
+    /// The queue pair this wait watches, fixed when the marks were
+    /// taken rather than at the park: a task that migrates between the
+    /// two would otherwise park on a pair whose mark it never sampled.
+    pub(super) queue_idx: usize,
+    pub(super) device: InterfaceEventMark,
+}
+
 /// Which arrival signal an operation parks on.
 ///
 /// A socket that lives on one shard waits for that shard. A replicated
@@ -695,19 +719,6 @@ impl NetworkShardSet {
             WaitTarget::Shard(idx) => self.arrival(idx),
             WaitTarget::AnyShard => &self.any_arrival,
         }
-    }
-
-    /// Samples the arrival signal of the shard owning `handle`.
-    #[inline]
-    pub(super) fn shard_wait_for_handle<H: Into<ShardHandle>>(&self, handle: H) -> ShardWait {
-        self.shard_wait(self.shard_idx_for_handle(handle))
-    }
-
-    /// Samples the arrival signal of the shard that unqualified
-    /// operations run on.
-    #[inline]
-    pub(super) fn default_shard_wait(&self) -> ShardWait {
-        self.shard_wait(self.default_shard_idx())
     }
 
     /// Releases every operation parked on a shard that just took a

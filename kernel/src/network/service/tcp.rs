@@ -378,7 +378,7 @@ where
         loop {
             // Sampled before the handshake state is inspected, so a SYN-ACK
             // another processor drains in between resolves the wait.
-            let wait = self.inner.state.shard_wait_for_handle(stream);
+            let wait = self.shard_wait_for_handle(stream);
             self.drive_tcp().await?;
             let now_nanos = self.now_nanos();
             let poll_connect = self.inner.state.with_handle(stream, |state| {
@@ -476,7 +476,7 @@ where
             // and then visits the rest, and the wait watches the whole
             // set because the next SYN's shard is not known until its
             // flow is hashed.
-            let wait = self.inner.state.any_shard_wait();
+            let wait = self.any_shard_wait();
             let start = self.accepting_shard_idx();
             self.drive_tcp().await?;
             let accepted = self
@@ -506,7 +506,7 @@ where
         while !bytes.is_empty() {
             // A blocked write is unblocked by the peer's window opening,
             // which arrives as an ACK on this stream's shard.
-            let wait = self.inner.state.shard_wait_for_handle(stream);
+            let wait = self.shard_wait_for_handle(stream);
             self.drive_tcp().await?;
             let written = self.inner.state.with_handle(stream, |state| {
                 state.try_write_tcp_bytes(stream, &mut bytes)
@@ -534,7 +534,7 @@ where
         let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
         let max_bytes = max_bytes as usize;
         loop {
-            let wait = self.inner.state.shard_wait_for_handle(stream);
+            let wait = self.shard_wait_for_handle(stream);
             match self.poll_tcp_read_once(stream, max_bytes, TcpReadPhasePrefix::Initial)? {
                 TcpReadProgress::Data(bytes) => return Ok(Some(bytes)),
                 TcpReadProgress::Eof => return Ok(None),
@@ -578,7 +578,7 @@ where
         let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
         let max_bytes = buffer.capacity();
         loop {
-            let wait = self.inner.state.shard_wait_for_handle(stream);
+            let wait = self.shard_wait_for_handle(stream);
             match self.poll_tcp_read_into_once(
                 stream,
                 &mut buffer,
@@ -1137,7 +1137,7 @@ where
     /// is driven by nothing but the clock.
     pub(super) async fn wait_for_tcp_progress(
         &self,
-        wait: ShardWait,
+        wait: NetworkWait,
         operation_deadline_nanos: u64,
     ) {
         let now_nanos = self.now_nanos();

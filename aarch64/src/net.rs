@@ -3,8 +3,8 @@ use arm_gic::{IntId, Trigger};
 use helios_hal::io::IoError;
 use helios_hal::watchdog::Watchdog;
 use helios_kernel::{
-    ExternalInterruptHandler, InterfaceCapabilities, Kernel, LinkState, NetworkDevice,
-    NetworkService, PacketBuffer,
+    ExternalInterruptHandler, InterfaceCapabilities, InterfaceEventMark, Kernel, LinkState,
+    NetworkDevice, PacketBuffer,
 };
 use triomphe::Arc;
 
@@ -54,19 +54,7 @@ where
         tracing::warn!("virtio network device was not discovered on the platform bus");
         return None;
     };
-    let service = NetworkService::new(
-        *cpu,
-        debug_state.clone(),
-        kernel.timer(),
-        network.device.clone(),
-    );
-    let packet_pump = service.clone();
-    debug_state.install_network_service(helios_kernel::ComponentHostNetworkService::from_service(
-        service,
-    ));
-    kernel.spawn_detached(async move {
-        packet_pump.run_packet_pump().await;
-    });
+    kernel.install_network_interface(debug_state, network.device.clone());
     tracing::info!("virtio network online interrupt={:?}", network.interrupt);
     Some(network)
 }
@@ -157,12 +145,20 @@ impl NetworkDevice for VirtioNetworkDevice {
             .reclaim_transmit_completions_immediate_on_pair(queue_idx, budget)
     }
 
-    async fn wait_for_event(&self) {
-        self.inner.wait_for_interrupt().await;
+    fn event_mark(&self, queue_idx: usize) -> InterfaceEventMark {
+        self.inner.interrupt_mark(queue_idx)
     }
 
-    async fn wait_for_event_on(&self, queue_idx: usize) {
-        self.inner.wait_for_interrupt_on(queue_idx).await;
+    fn wait_for_event_since(
+        &self,
+        queue_idx: usize,
+        mark: InterfaceEventMark,
+    ) -> impl core::future::Future<Output = ()> + Send + '_ {
+        // Not an `async fn`: the driver arms both listeners against
+        // `mark` when this is called, and an `async fn` body would defer
+        // that to the first poll, which is exactly the window the mark
+        // exists to close.
+        self.inner.wait_for_interrupt_since(queue_idx, mark)
     }
 
     fn queue_interrupts(&self, queue_idx: usize) -> u64 {
