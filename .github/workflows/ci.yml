@@ -714,7 +714,15 @@ jobs:
             accel: kvm
             # KVM boots in seconds; a marker hang should fail fast.
             boot-timeout: "300"
-            workloads: ""
+            # The instance-density cells cannot be measured on any guest
+            # today: the user-memory pool does not grow with the guest, so
+            # the spawn is refused with a typed out-of-memory error (#130).
+            # They stay out of this lane's gating set rather than teaching
+            # the lane to tolerate a failed cell — the benchmark suite is
+            # where a failure becomes a recorded cell with its reason.
+            workloads: >-
+              --skip-workload instance-startup-100
+              --skip-workload instance-startup-500
             # Linux runners allow sudo, so the network workloads run over
             # a multi-queue tap with vhost-net: the only host packet path
             # on which the guest's virtio-net multiqueue, checksum and
