@@ -516,3 +516,46 @@ pub(crate) fn translate_call_hook(hook: CallHook) -> crate::InstanceExecutionTra
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use wasmtime_wasi_io::bytes::Bytes;
+    use wasmtime_wasi_io::streams::{OutputStream, StreamError};
+
+    use super::ChannelOutputStream;
+    use crate::io::{TryRead, byte_channel};
+
+    /// #183: a parent that lets go of a child's stdout breaks the
+    /// child's pipe even though every byte it wrote was delivered
+    /// first.
+    ///
+    /// `wasi:io/streams.blocking-write-and-flush` asks for the next
+    /// write permit after the flush, so a child whose bytes have
+    /// already reached the parent still learns that the pipe is gone,
+    /// on the very write it had completed. That is what a write to a
+    /// pipe nobody reads is, and the kernel reports it rather than
+    /// swallowing it, so a parent that means to hold a child alive
+    /// holds the child's stdout with it.
+    #[test]
+    fn a_delivered_write_still_breaks_once_the_parent_drops_the_reader() {
+        let (writer, reader) = byte_channel();
+        let mut stdout = ChannelOutputStream::new(writer);
+
+        assert!(matches!(stdout.check_write(), Ok(permit) if permit != 0));
+        stdout
+            .write(Bytes::from_static(b"hello\n"))
+            .expect("the parent still holds the pipe");
+        assert!(
+            matches!(reader.try_read(), TryRead::Ready(bytes) if bytes.as_ref() == b"hello\n"),
+            "the parent did not receive the bytes it then stopped reading"
+        );
+
+        drop(reader);
+
+        assert!(matches!(stdout.check_write(), Err(StreamError::Closed)));
+        assert!(matches!(
+            stdout.write(Bytes::from_static(b"more\n")),
+            Err(StreamError::Closed)
+        ));
+    }
+}
