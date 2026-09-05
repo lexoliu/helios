@@ -93,7 +93,6 @@ pub(crate) fn count_virtio_mmio_devices(fdt: &Fdt<'_>, expected: DeviceType) -> 
 
 use core::arch::{asm, global_asm};
 use core::cell::Cell;
-use core::fmt::Write;
 use core::mem;
 use core::num::NonZeroUsize;
 use core::ops::Range;
@@ -107,8 +106,8 @@ use helios_hal::memory::MemoryRegion;
 use helios_hal::serial::ByteSerial;
 use helios_hal::{DeviceInventory, DmaModel, ProcessorStartupPolicy, ProcessorTopology};
 use helios_kernel::{
-    KernelException, KernelExceptionCause, KernelExceptionDispatch, KernelNativeTrapHandler, Timer,
-    WasmtimeTlsSlots,
+    DebugSerialAccess, KernelException, KernelExceptionCause, KernelExceptionDispatch,
+    KernelNativeTrapHandler, Timer, WasmtimeTlsSlots,
 };
 use riscv::interrupt::Trap;
 use riscv::interrupt::supervisor::{Exception, Interrupt};
@@ -918,12 +917,20 @@ fn current_debug_transport() -> &'static DebugTransport {
         .expect("debug transport is missing from the current hart runtime")
 }
 
+impl DebugSerialAccess for DebugTransport {
+    type Port = Self;
+
+    fn port() -> Self {
+        *current_debug_transport()
+    }
+}
+
 fn read_debug_serial(buffer: &mut alloc::vec::Vec<u8>, max_bytes: u32) {
-    helios_kernel::try_read_serial(current_debug_transport(), buffer, max_bytes);
+    helios_kernel::read_debug_serial::<DebugTransport>(buffer, max_bytes);
 }
 
 pub(crate) fn write_debug_serial_bytes(bytes: &[u8]) {
-    current_debug_transport().write_bytes(bytes);
+    helios_kernel::write_debug_serial_bytes::<DebugTransport>(bytes);
 }
 
 #[unsafe(no_mangle)]
@@ -1048,41 +1055,28 @@ fn handle_user_exception(exception: Exception, stval: usize, tf: &TrapFrame) -> 
     )
 }
 
+/// The port a panicking hart writes its report to.
+///
+/// SBI, not the debugger's transport: firmware answers whatever state
+/// the kernel left the machine in, and a byte it refuses is a byte
+/// nothing can be done about here.
+struct PanicConsolePort;
+
+impl helios_kernel::PanicSerial for PanicConsolePort {
+    fn write_bytes(bytes: &[u8]) {
+        for &byte in bytes {
+            if sbi_rt::console_write_byte(byte).is_err() {
+                return;
+            }
+        }
+    }
+}
+
 fn fatal_panic(info: &core::panic::PanicInfo<'_>) -> ! {
     mask_interrupts();
 
-    struct PanicConsole;
-
-    impl Write for PanicConsole {
-        fn write_str(&mut self, s: &str) -> core::fmt::Result {
-            for byte in s.bytes() {
-                let ret = sbi_rt::console_write_byte(byte);
-                if ret.is_err() {
-                    return Err(core::fmt::Error);
-                }
-            }
-            Ok(())
-        }
-    }
-
-    // The panic report shares the UART with kernel tracing and the debugger's
-    // stage markers, so it goes out as one indivisible message like every
-    // other console producer. Nothing follows it: the hart shuts down next.
-    helios_kernel::emit_console_line(|| {
-        let mut console = PanicConsole;
-        let _ = console.write_str("Kernel panic");
-        if let Some(location) = info.location() {
-            let _ = write!(
-                console,
-                " at {}:{}:{}",
-                location.file(),
-                location.line(),
-                location.column()
-            );
-        }
-        let _ = console.write_str("\n");
-        let _ = writeln!(console, "{}", info.message());
-    });
+    // Nothing follows the report: the hart shuts down next.
+    helios_kernel::emit_panic_report::<PanicConsolePort>(info);
 
     // SBI shutdown is a request, not a guarantee: a firmware that refuses it
     // returns here, and the hart must not run on past a fatal panic.

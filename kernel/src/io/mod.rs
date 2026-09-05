@@ -7,8 +7,10 @@
 mod block;
 mod child;
 mod console;
+mod debug_serial;
 mod interrupts;
 mod iommu;
+mod panic_console;
 mod poll_registry;
 mod serial;
 
@@ -21,11 +23,13 @@ pub use child::{
     byte_channel,
 };
 pub use console::{RecordingConsole, emit_console_line};
+pub use debug_serial::{DebugSerialAccess, read_debug_serial, write_debug_serial_bytes};
 pub use interrupts::{
     ExternalInterruptHandler, ExternalInterruptRoutes, MAX_BLOCK_DEVICES, MAX_NETWORK_INTERRUPTS,
     wake_queue_owners,
 };
 pub use iommu::{IommuDomains, IommuEndpointStats, IommuReport, IommuStats, MAX_IOMMU_ENDPOINTS};
+pub use panic_console::{PanicSerial, emit_panic_report};
 pub use poll_registry::{
     PollKey, PollRegistration, PollRegistry, PollRegistryError, PollSourceKind,
 };

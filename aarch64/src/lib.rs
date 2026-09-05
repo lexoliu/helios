@@ -5,9 +5,7 @@ extern crate alloc;
 
 use core::arch::{asm, global_asm};
 use core::cell::UnsafeCell;
-use core::fmt::{self, Write};
 use core::num::NonZeroUsize;
-use core::ops::Range;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
@@ -16,16 +14,20 @@ use alloc::vec::Vec;
 use arm_gic::IntId;
 use helios_hal::boot::{
     BootFirmwareTables, BootHandoff, BootKernelImage, BootMemoryKind, BootMemoryMap,
-    BootMemoryRegion, BootModule, BootModules, FirmwareKind,
+    BootMemoryRegion, BootModule, BootModules, BootReservedRanges, FirmwareKind,
+    usable_region_segments,
 };
 use helios_hal::cpu::{Cpu, HardwarePerfCounters, Instant, ProcessorId};
 use helios_hal::critical_section::ProcessorIdentity;
 use helios_hal::entropy::{EntropyQuality, EntropyUnavailable};
 use helios_hal::memory::MemoryRegion;
 use helios_hal::serial::ByteSerial;
-use helios_hal::{DeviceInventory, DmaModel, Platform, ProcessorStartupPolicy, ProcessorTopology};
+use helios_hal::{
+    DeviceInventory, DmaModel, Platform, ProcessorStartupPolicy, ProcessorTopology, align_up,
+};
 use helios_kernel::{
-    KernelException, KernelExceptionCause, KernelNativeTrapHandler, Timer, WasmtimeTlsSlots,
+    DebugSerialAccess, KernelException, KernelExceptionCause, KernelNativeTrapHandler, Timer,
+    WasmtimeTlsSlots,
 };
 use limine::BaseRevision;
 use limine::file::File;
@@ -54,7 +56,6 @@ const IRQ_FRAME_BYTES: usize = 0x320;
 const SYNC_FRAME_BYTES: usize = 0x320;
 const PAGE_BYTES: usize = 4096;
 const MMIO_BLOCK_BYTES: usize = 2 * 1024 * 1024;
-const MAX_USABLE_REGION_SEGMENTS: usize = 6;
 const PAGE_TABLE_ENTRIES: usize = 512;
 const PAGE_TABLE_INDEX_MASK: usize = PAGE_TABLE_ENTRIES - 1;
 const PAGE_TABLE_DESCRIPTOR: u64 = 0b11;
@@ -1803,25 +1804,62 @@ fn active_debug_serial() -> DebugSerial {
     DebugSerial { base }
 }
 
+/// The console UART with the writer lock around it.
+///
+/// A PL011 takes one byte per register write, so two processors pushing
+/// bytes at the port interleave them inside a line; the lock is what
+/// makes one write indivisible. Reads are not serialised, because one
+/// task drains the port.
+#[derive(Clone, Copy)]
+struct LockedDebugSerial(DebugSerial);
+
+impl ByteSerial for LockedDebugSerial {
+    fn try_read_byte(&self) -> Option<u8> {
+        self.0.try_read_byte()
+    }
+
+    fn write_bytes(&self, bytes: &[u8]) {
+        while DEBUG_SERIAL_WRITER_HELD
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        self.0.write_bytes(bytes);
+        DEBUG_SERIAL_WRITER_HELD.store(false, Ordering::Release);
+    }
+}
+
+impl DebugSerialAccess for LockedDebugSerial {
+    type Port = Self;
+
+    fn port() -> Self {
+        Self(active_debug_serial())
+    }
+}
+
 fn read_debug_serial(buffer: &mut alloc::vec::Vec<u8>, max_bytes: u32) {
-    helios_kernel::try_read_serial(&active_debug_serial(), buffer, max_bytes);
+    helios_kernel::read_debug_serial::<LockedDebugSerial>(buffer, max_bytes);
 }
 
 fn write_debug_serial_bytes(bytes: &[u8]) {
-    while DEBUG_SERIAL_WRITER_HELD
-        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-        .is_err()
-    {
-        core::hint::spin_loop();
-    }
-    active_debug_serial().write_bytes(bytes);
-    DEBUG_SERIAL_WRITER_HELD.store(false, Ordering::Release);
+    helios_kernel::write_debug_serial_bytes::<LockedDebugSerial>(bytes);
 }
 
-fn try_write_panic_serial_bytes(bytes: &[u8]) {
-    let base = DEBUG_SERIAL_BASE.load(Ordering::Acquire);
-    if base != 0 {
-        DebugSerial { base }.write_bytes(bytes);
+/// The port a panicking processor writes its report to.
+///
+/// The console UART without the writer lock: a processor that panicked
+/// while holding that lock would spin on itself forever, and a report
+/// cut in half still says more than a hang. A panic before firmware
+/// discovery has no port at all and the bytes go nowhere.
+struct PanicConsolePort;
+
+impl helios_kernel::PanicSerial for PanicConsolePort {
+    fn write_bytes(bytes: &[u8]) {
+        let base = DEBUG_SERIAL_BASE.load(Ordering::Acquire);
+        if base != 0 {
+            DebugSerial { base }.write_bytes(bytes);
+        }
     }
 }
 
@@ -1968,19 +2006,8 @@ fn convert_firmware_kind(firmware: u64) -> FirmwareKind {
     }
 }
 
-#[derive(Clone, Debug)]
-struct BootReservedRanges {
-    ranges: [Option<Range<usize>>; 2],
-}
-
-impl BootReservedRanges {
-    fn iter(&self) -> impl Iterator<Item = &Range<usize>> {
-        self.ranges.iter().flatten()
-    }
-}
-
 fn boot_reserved_ranges(handoff: &LimineBootHandoff) -> BootReservedRanges {
-    let executable_bytes = align_up_usize(
+    let executable_bytes = align_up(
         usize::try_from(handoff.kernel.size)
             .unwrap_or_else(|_| panic!("Limine executable file size does not fit usize")),
         PAGE_BYTES,
@@ -1994,12 +2021,10 @@ fn boot_reserved_ranges(handoff: &LimineBootHandoff) -> BootReservedRanges {
     let file_end = file_start
         .checked_add(executable_bytes)
         .unwrap_or_else(|| panic!("Limine executable file range overflow"));
-    BootReservedRanges {
-        ranges: [
-            Some(loaded_executable_start..loaded_executable_end),
-            Some(file_start..file_end),
-        ],
-    }
+    let mut reserved = BootReservedRanges::new();
+    reserved.reserve(loaded_executable_start..loaded_executable_end);
+    reserved.reserve(file_start..file_end);
+    reserved
 }
 
 fn boot_memory_regions(
@@ -2022,77 +2047,10 @@ fn boot_memory_regions(
     })
 }
 
-fn usable_region_segments(
-    region: BootMemoryRegion,
-    reserved_ranges: &BootReservedRanges,
-) -> [Option<Range<usize>>; MAX_USABLE_REGION_SEGMENTS] {
-    if !region.usable() || region.end <= region.start {
-        return [const { None }; MAX_USABLE_REGION_SEGMENTS];
-    }
-    let mut segments = [const { None }; MAX_USABLE_REGION_SEGMENTS];
-    segments[0] = Some(region.start as usize..region.end as usize);
-    for reserved in reserved_ranges.iter() {
-        segments = subtract_reserved_range(segments, reserved);
-    }
-    segments
-}
-
-fn subtract_reserved_range(
-    segments: [Option<Range<usize>>; MAX_USABLE_REGION_SEGMENTS],
-    reserved: &Range<usize>,
-) -> [Option<Range<usize>>; MAX_USABLE_REGION_SEGMENTS] {
-    let mut out = [const { None }; MAX_USABLE_REGION_SEGMENTS];
-    let mut next = 0;
-    for segment in segments.into_iter().flatten() {
-        for piece in split_segment(segment, reserved).into_iter().flatten() {
-            assert!(
-                next < out.len(),
-                "AArch64 boot memory segmentation exceeded fixed capacity"
-            );
-            out[next] = Some(piece);
-            next += 1;
-        }
-    }
-    out
-}
-
-fn split_segment(segment: Range<usize>, reserved: &Range<usize>) -> [Option<Range<usize>>; 2] {
-    if reserved.end <= segment.start || reserved.start >= segment.end {
-        return [Some(segment), None];
-    }
-    let left = (reserved.start > segment.start).then_some(segment.start..reserved.start);
-    let right = (reserved.end < segment.end).then_some(reserved.end..segment.end);
-    [left, right]
-}
-
-fn align_up_usize(value: usize, align: usize) -> usize {
-    assert!(
-        align.is_power_of_two(),
-        "alignment must be a power of two, got {align}"
-    );
-    value
-        .checked_add(align - 1)
-        .map(|value| value & !(align - 1))
-        .unwrap_or_else(|| panic!("alignment overflow for value={value:#x}, align={align:#x}"))
-}
-
-struct PanicSerialWriter;
-
-impl Write for PanicSerialWriter {
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        try_write_panic_serial_bytes(s.as_bytes());
-        Ok(())
-    }
-}
-
 #[cfg(target_os = "none")]
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    // One indivisible message, like every other console producer: the panic
-    // report shares this UART with kernel tracing and the debugger markers.
-    helios_kernel::emit_console_line(|| {
-        let _ = writeln!(PanicSerialWriter, "{info}");
-    });
+    helios_kernel::emit_panic_report::<PanicConsolePort>(info);
     helios_kernel::panic_log(info);
     loop {
         unsafe {

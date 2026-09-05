@@ -1380,12 +1380,7 @@ fn allocate_aligned_zeroed(size: usize, align: usize) -> usize {
         .as_ptr() as usize
 }
 
-use helios_hal::align_up;
-
-fn align_down(value: usize, align: usize) -> usize {
-    assert!(align.is_power_of_two(), "alignment must be a power of two");
-    value & !(align - 1)
-}
+use helios_hal::{align_down, align_up};
 
 fn wakeup_image() -> &'static [u8] {
     unsafe {

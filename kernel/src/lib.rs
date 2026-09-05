@@ -96,13 +96,14 @@ pub use instance::{
 };
 pub use io::{
     BlockInstallError, BlockSelfCheckError, BlockService, BlockStats, ByteReadWait, ByteReader,
-    ByteWriteWait, ByteWriter, ClosedPeer, ExternalInterruptHandler, ExternalInterruptRoutes,
-    IommuDomains, IommuEndpointStats, IommuReport, IommuStats, MAX_BLOCK_DEVICES,
-    MAX_IOMMU_ENDPOINTS, MAX_NETWORK_INTERRUPTS, PollKey, PollRegistration, PollRegistry,
-    PollRegistryError, PollSourceKind, RecordingConsole, SCRATCH_DISK_SERIAL, SerialReader,
-    TryRead, TryWrite, byte_channel, emit_console_line, emit_serial_error_marker,
-    emit_serial_stage_marker, install_block_devices, read_serial, try_read_serial,
-    wake_queue_owners, write_serial,
+    ByteWriteWait, ByteWriter, ClosedPeer, DebugSerialAccess, ExternalInterruptHandler,
+    ExternalInterruptRoutes, IommuDomains, IommuEndpointStats, IommuReport, IommuStats,
+    MAX_BLOCK_DEVICES, MAX_IOMMU_ENDPOINTS, MAX_NETWORK_INTERRUPTS, PanicSerial, PollKey,
+    PollRegistration, PollRegistry, PollRegistryError, PollSourceKind, RecordingConsole,
+    SCRATCH_DISK_SERIAL, SerialReader, TryRead, TryWrite, byte_channel, emit_console_line,
+    emit_panic_report, emit_serial_error_marker, emit_serial_stage_marker, install_block_devices,
+    read_debug_serial, read_serial, try_read_serial, wake_queue_owners, write_debug_serial_bytes,
+    write_serial,
 };
 pub use kernel_exception::{
     KernelException, KernelExceptionCause, KernelExceptionDispatch, KernelNativeTrapHandler,
