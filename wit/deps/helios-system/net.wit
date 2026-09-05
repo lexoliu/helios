@@ -33,6 +33,10 @@ interface net {
   enum tcp-error-kind {
     unresolved-host,
     timeout,
+    /// The peer reset the connection.
+    connection-reset,
+    /// The connection was aborted before the stream ended.
+    connection-aborted,
     unavailable,
     internal,
   }
@@ -65,6 +69,9 @@ interface net {
     /// Reads up to `max-bytes` octets from the peer.
     ///
     /// `none` indicates an orderly EOF after the peer closed its transmit side.
+    /// A connection that ended any other way fails immediately with
+    /// `connection-reset` or `connection-aborted` rather than waiting out
+    /// `timeout`.
     read: async func(max-bytes: u32, timeout: mono-nanos) -> result<option<list<u8>>, tcp-error>;
 
     /// Writes the complete `bytes` buffer before returning.

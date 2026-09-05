@@ -182,6 +182,8 @@ fn map_ping_error(error: raw::PingError) -> io::Error {
 fn map_tcp_error(error: raw::TcpError) -> io::Error {
     let kind = match error.kind {
         TcpErrorKind::Timeout => io::ErrorKind::TimedOut,
+        TcpErrorKind::ConnectionReset => io::ErrorKind::ConnectionReset,
+        TcpErrorKind::ConnectionAborted => io::ErrorKind::ConnectionAborted,
         TcpErrorKind::UnresolvedHost => io::ErrorKind::NotFound,
         TcpErrorKind::Unavailable => io::ErrorKind::ConnectionAborted,
         TcpErrorKind::Internal => io::ErrorKind::Other,

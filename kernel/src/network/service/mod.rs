@@ -34,9 +34,10 @@ use helios_netstack::{
     Icmpv6Packet, IpAddress, IpCidr, IpProtocol, Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv6Address,
     Ipv6Cidr, Ipv6Packet, MAX_OUTBOUND_FRAMES, NeighborEntry, NetworkInterface as NetworkDevice,
     OutboundBatchStatus, Route, RouteTable, RxChecksumOffload, RxFrame, SegmentationOffload, Stack,
-    StackConfig, StackError, StackEvent, StackInstant, TcpConnectState, TcpConnectTerminalError,
-    TcpEndpoint, TcpListenBacklog, TcpPacket, TcpReadIntoState, TcpReadState, UdpEgress,
-    UdpEndpoint, UdpPacket, UdpPayload, UdpSocketBinding, UdpSocketError, flow_hash,
+    StackConfig, StackError, StackEvent, StackInstant, TcpCloseKind, TcpConnectState,
+    TcpConnectTerminalError, TcpEndpoint, TcpListenBacklog, TcpPacket, TcpReadIntoState,
+    TcpReadState, UdpEgress, UdpEndpoint, UdpPacket, UdpPayload, UdpSocketBinding, UdpSocketError,
+    flow_hash,
 };
 use spin::{Mutex as SpinMutex, RwLock as SpinRwLock};
 
@@ -1776,6 +1777,83 @@ mod tests {
             AddressAttemptError::is_address_specific(&error),
             "a refused candidate must fall through to the next resolved address"
         );
+    }
+
+    /// Issue #116: a connection the peer resets has to fail the read
+    /// that is waiting on it, not sit in the read loop until the
+    /// deadline turns a reset into a reported timeout.
+    #[test]
+    fn read_on_a_reset_connection_fails_with_connection_reset() {
+        let local = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        let remote = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+        let mut state = test_network_shard();
+        state.stack.add_ipv6_address(Ipv6Cidr::new(local, 64));
+        state.stack.learn_neighbor(NeighborEntry {
+            ip: IpAddress::Ipv6(remote),
+            mac: [0x02, 0, 0, 0, 0, 2],
+            state: NeighborState::Reachable,
+            updated_at: StackInstant::from_nanos(0),
+        });
+        let stream = state
+            .start_tcp_connect(
+                IpAddress::Ipv6(local),
+                IpAddress::Ipv6(remote),
+                443,
+                49_152,
+                helios_netstack::DEFAULT_HOP_LIMIT,
+            )
+            .expect("IPv6 TCP connect should allocate a socket");
+        state
+            .stack
+            .drive_tcp(StackInstant::from_nanos(1))
+            .expect("IPv6 TCP SYN should be queued");
+        let frame = state
+            .stack
+            .take_outbound()
+            .expect("IPv6 SYN frame should be queued");
+        let ethernet = EthernetFrame::parse(frame.as_slice()).expect("Ethernet frame should parse");
+        let ipv6 = Ipv6Packet::parse(ethernet.payload).expect("IPv6 packet should parse");
+        let syn = TcpPacket::parse(ipv6.payload).expect("TCP packet should parse");
+
+        let (syn_ack, syn_ack_len) = ipv6_tcp_frame(
+            remote,
+            local,
+            TcpHeader {
+                source_port: 443,
+                destination_port: syn.source_port,
+                sequence: 100,
+                acknowledgement: syn.sequence.wrapping_add(1),
+                flags: TcpFlags::SYN.union(TcpFlags::ACK),
+                window_size: u16::MAX,
+            },
+        );
+        state
+            .stack
+            .receive_frame(&syn_ack[..syn_ack_len], StackInstant::from_nanos(2))
+            .expect("IPv6 SYN-ACK should establish the stream");
+
+        let (reset, reset_len) = ipv6_tcp_frame(
+            remote,
+            local,
+            TcpHeader {
+                source_port: 443,
+                destination_port: syn.source_port,
+                sequence: 101,
+                acknowledgement: syn.sequence.wrapping_add(1),
+                flags: TcpFlags::RST.union(TcpFlags::ACK),
+                window_size: 0,
+            },
+        );
+        state
+            .stack
+            .receive_frame(&reset[..reset_len], StackInstant::from_nanos(3))
+            .expect("an in-window RST should be accepted");
+
+        let Err(error) = state.poll_tcp_read(stream, 8, StackInstant::from_nanos(4)) else {
+            panic!("a read on a reset connection must not report progress");
+        };
+        assert_eq!(error.kind, crate::TcpErrorKind::ConnectionReset);
+        assert_eq!(error.detail, crate::NetworkErrorDetail::TcpConnectionReset);
     }
 
     /// Builds the ICMPv4 echo reply a host would send back for

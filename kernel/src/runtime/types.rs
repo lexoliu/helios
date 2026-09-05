@@ -248,6 +248,10 @@ pub enum TcpErrorKind {
     UnresolvedHost,
     #[error("operation timed out")]
     Timeout,
+    #[error("connection reset by peer")]
+    ConnectionReset,
+    #[error("connection aborted")]
+    ConnectionAborted,
     #[error("permission denied")]
     PermissionDenied,
     #[error("TCP service is unavailable")]
@@ -401,6 +405,12 @@ pub enum NetworkErrorDetail {
     TcpNoLongerWritable,
     #[error("TCP read timed out")]
     TcpReadTimeout,
+    #[error("TCP connection was reset by the peer")]
+    TcpConnectionReset,
+    #[error("TCP connection was aborted")]
+    TcpConnectionAborted,
+    #[error("TCP peer stopped acknowledging")]
+    TcpPeerUnresponsive,
     #[error("TCP receive failed")]
     TcpReceiveFailed,
     #[error("TCP stream closed unexpectedly")]
@@ -483,6 +493,9 @@ impl NetworkErrorDetail {
             Self::TcpWriteQueueFailed => "TCP write could not be queued",
             Self::TcpNoLongerWritable => "TCP stream is no longer writable",
             Self::TcpReadTimeout => "TCP read timed out",
+            Self::TcpConnectionReset => "TCP connection was reset by the peer",
+            Self::TcpConnectionAborted => "TCP connection was aborted",
+            Self::TcpPeerUnresponsive => "TCP peer stopped acknowledging",
             Self::TcpReceiveFailed => "TCP receive failed",
             Self::TcpClosedUnexpectedly => "TCP stream closed unexpectedly",
             Self::TcpNoEphemeralPorts => "no ephemeral TCP ports are available",

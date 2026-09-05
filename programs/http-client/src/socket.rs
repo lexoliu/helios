@@ -89,7 +89,9 @@ impl Socket {
 pub fn read_error(error: &std::io::Error) -> ErrorCode {
     match error.kind() {
         std::io::ErrorKind::TimedOut => ErrorCode::HttpResponseTimeout,
-        std::io::ErrorKind::ConnectionAborted => ErrorCode::ConnectionTerminated,
+        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted => {
+            ErrorCode::ConnectionTerminated
+        }
         _ => ErrorCode::InternalError(Some(error.to_string())),
     }
 }
@@ -98,7 +100,9 @@ pub fn read_error(error: &std::io::Error) -> ErrorCode {
 pub fn write_error(error: &std::io::Error) -> ErrorCode {
     match error.kind() {
         std::io::ErrorKind::TimedOut => ErrorCode::ConnectionWriteTimeout,
-        std::io::ErrorKind::ConnectionAborted => ErrorCode::ConnectionTerminated,
+        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted => {
+            ErrorCode::ConnectionTerminated
+        }
         _ => ErrorCode::InternalError(Some(error.to_string())),
     }
 }
@@ -111,7 +115,9 @@ pub fn connect_error(error: &std::io::Error) -> ErrorCode {
             rcode: None,
             info_code: None,
         }),
-        std::io::ErrorKind::ConnectionAborted => ErrorCode::ConnectionRefused,
+        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted => {
+            ErrorCode::ConnectionRefused
+        }
         _ => ErrorCode::InternalError(Some(error.to_string())),
     }
 }

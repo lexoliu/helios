@@ -3108,6 +3108,12 @@ fn convert_tcp_error(error: crate::TcpError) -> debugger_bindings::helios::syste
             crate::TcpErrorKind::Timeout => {
                 debugger_bindings::helios::system::net::TcpErrorKind::Timeout
             }
+            crate::TcpErrorKind::ConnectionReset => {
+                debugger_bindings::helios::system::net::TcpErrorKind::ConnectionReset
+            }
+            crate::TcpErrorKind::ConnectionAborted => {
+                debugger_bindings::helios::system::net::TcpErrorKind::ConnectionAborted
+            }
             crate::TcpErrorKind::PermissionDenied => {
                 debugger_bindings::helios::system::net::TcpErrorKind::Unavailable
             }
@@ -3132,6 +3138,12 @@ fn convert_program_tcp_error(
             }
             crate::TcpErrorKind::Timeout => {
                 program_bindings::helios::system::net::TcpErrorKind::Timeout
+            }
+            crate::TcpErrorKind::ConnectionReset => {
+                program_bindings::helios::system::net::TcpErrorKind::ConnectionReset
+            }
+            crate::TcpErrorKind::ConnectionAborted => {
+                program_bindings::helios::system::net::TcpErrorKind::ConnectionAborted
             }
             crate::TcpErrorKind::PermissionDenied => {
                 program_bindings::helios::system::net::TcpErrorKind::Unavailable

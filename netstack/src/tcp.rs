@@ -641,6 +641,11 @@ where
     local: Option<TcpEndpoint>,
     remote: Option<TcpEndpoint>,
     state: TcpState,
+    /// Set by every transition into [`TcpState::Closed`], from the reason
+    /// the transition carried, and cleared by every transition out of it.
+    /// A reader holding a closed connection asks this whether the stream
+    /// ended or the connection did.
+    close_kind: Option<TcpCloseKind>,
     congestion: C,
     send_next: u32,
     send_unacknowledged: u32,
@@ -725,6 +730,53 @@ pub enum TcpStateChangeReason {
     Abort,
 }
 
+/// How a connection that reached [`TcpState::Closed`] ended, from the
+/// point of view of an application still holding it.
+///
+/// [`TcpStateChangeReason`] records the route the state machine took;
+/// this is the part of that route a reader has to act on, and it is the
+/// only distinction the stack's callers need to tell an exhausted stream
+/// from a broken connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TcpCloseKind {
+    /// The connection ended in order: the peer's FIN arrived in sequence
+    /// behind everything it sent, so the reader has the whole stream.
+    Graceful,
+    /// The connection was reset — an in-window RST, or the in-window SYN
+    /// that RFC 9293 3.10.7.4 answers with one.
+    Reset,
+    /// The local side aborted the connection.
+    Aborted,
+    /// The peer stopped acknowledging and the retransmission limit ran
+    /// out with data still unacknowledged.
+    Unresponsive,
+}
+
+impl TcpStateChangeReason {
+    /// How a socket that entered [`TcpState::Closed`] through this
+    /// transition reads to the application holding it.
+    ///
+    /// `None` for the reasons that only open or advance a connection;
+    /// those never name a transition into `Closed`.
+    pub const fn close_kind(self) -> Option<TcpCloseKind> {
+        match self {
+            Self::TimeWaitExpired | Self::PeerFin | Self::LocalClose | Self::FinAcknowledged => {
+                Some(TcpCloseKind::Graceful)
+            }
+            Self::SynSentReset | Self::SynReceivedReset | Self::PeerReset | Self::PeerSyn => {
+                Some(TcpCloseKind::Reset)
+            }
+            Self::Abort => Some(TcpCloseKind::Aborted),
+            Self::RetransmissionLimit => Some(TcpCloseKind::Unresponsive),
+            Self::Listen
+            | Self::Connect
+            | Self::Accept
+            | Self::SynSentEstablished
+            | Self::SynReceivedEstablished => None,
+        }
+    }
+}
+
 impl<C> TcpSocket<C>
 where
     C: CongestionControl,
@@ -734,6 +786,7 @@ where
             local: None,
             remote: None,
             state: TcpState::Closed,
+            close_kind: None,
             congestion,
             send_next: 0,
             send_unacknowledged: 0,
@@ -826,6 +879,15 @@ where
         self.state
     }
 
+    /// How this connection ended, once it reached [`TcpState::Closed`]
+    /// through a transition.
+    ///
+    /// `None` while the connection is live, and for a socket that has
+    /// never left the `Closed` it was constructed in.
+    pub const fn close_kind(&self) -> Option<TcpCloseKind> {
+        self.close_kind
+    }
+
     /// The single place [`TcpSocket::state`] changes.
     ///
     /// Routing every transition through here keeps the debug-level
@@ -838,6 +900,13 @@ where
             return;
         }
         self.state = next;
+        self.close_kind = if next == TcpState::Closed {
+            Some(reason.close_kind().unwrap_or_else(|| {
+                panic!("TCP transition into Closed carried the non-terminal reason {reason:?}")
+            }))
+        } else {
+            None
+        };
         tracing::debug!(
             ?previous,
             ?next,

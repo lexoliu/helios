@@ -2158,6 +2158,8 @@ pub(super) fn map_p3_tcp_error(error: crate::TcpError) -> socket_types::ErrorCod
             socket_types::ErrorCode::RemoteUnreachable
         }
         crate::TcpErrorKind::Timeout => socket_types::ErrorCode::Timeout,
+        crate::TcpErrorKind::ConnectionReset => socket_types::ErrorCode::ConnectionReset,
+        crate::TcpErrorKind::ConnectionAborted => socket_types::ErrorCode::ConnectionAborted,
         crate::TcpErrorKind::PermissionDenied => socket_types::ErrorCode::AccessDenied,
         crate::TcpErrorKind::Internal => socket_types::ErrorCode::Other(None),
     }
