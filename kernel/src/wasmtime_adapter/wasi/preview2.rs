@@ -31,7 +31,9 @@ use super::{
 use crate::wasmtime_adapter::component_host::{
     HostRuntimeState, RuntimeDeadlinePollable, StoreData,
 };
-use crate::wasmtime_adapter::store::{ChannelInputStream, ChannelOutputStream, StdioOutputStream};
+use crate::wasmtime_adapter::store::{
+    ChannelInputStream, ChannelOutputStream, SerialOutputStream, StdioOutputStream,
+};
 use crate::wasmtime_adapter::wasi::map_host_fs_error;
 use crate::{
     ComponentNetworkService, ComponentOutputMode, ComponentOutputRoute, ComponentOutputStreamKind,
@@ -1030,13 +1032,17 @@ where
                 ComponentOutputRoute::Child(writer) => {
                     StdioOutputStream::Child(ChannelOutputStream::new(writer.clone()))
                 }
-                ComponentOutputRoute::Serial => StdioOutputStream::Serial(store.serial_writer_fn()),
+                ComponentOutputRoute::Serial => {
+                    StdioOutputStream::Serial(SerialOutputStream::new(store.serial_writer()))
+                }
                 ComponentOutputRoute::Trace | ComponentOutputRoute::Discard => {
                     StdioOutputStream::Trace
                 }
             }
         }
-        ComponentOutputMode::Serial => StdioOutputStream::Serial(store.serial_writer_fn()),
+        ComponentOutputMode::Serial => {
+            StdioOutputStream::Serial(SerialOutputStream::new(store.serial_writer()))
+        }
         ComponentOutputMode::Trace => StdioOutputStream::Trace,
     }
 }

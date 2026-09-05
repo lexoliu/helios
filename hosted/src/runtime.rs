@@ -54,13 +54,40 @@ fn read_debug_serial(buffer: &mut Vec<u8>, max_bytes: u32) {
     }
 }
 
-fn write_debug_serial(bytes: &[u8]) {
-    let mut guard = SERIAL_OUTPUT.lock().unwrap();
-    if let Some(stdout) = guard.as_mut() {
-        let _ = stdout.write_all(bytes);
-        let _ = stdout.flush();
+/// Hosted's write side is the process's own stdout, and it reaches it
+/// through the same kernel console every other backend does: the
+/// backend supplies the port, the console owns the right to write to
+/// it.
+#[derive(Clone, Copy)]
+struct HostedDebugPort;
+
+impl helios_hal::serial::ByteSerial for HostedDebugPort {
+    /// Reads go through [`read_debug_serial`], for the reason given
+    /// there, so nothing ever asks this port for a byte.
+    fn try_read_byte(&self) -> Option<u8> {
+        None
+    }
+
+    fn write_bytes(&self, bytes: &[u8]) {
+        let mut guard = SERIAL_OUTPUT.lock().unwrap();
+        if let Some(stdout) = guard.as_mut() {
+            let _ = stdout.write_all(bytes);
+            let _ = stdout.flush();
+        }
     }
 }
+
+impl helios_kernel::DebugSerialAccess for HostedDebugPort {
+    type Port = Self;
+
+    fn port() -> Self {
+        Self
+    }
+}
+
+/// The kernel's writer for this machine's debug serial line.
+const DEBUG_SERIAL_WRITER: helios_kernel::DebugSerialWriter =
+    helios_kernel::DebugSerialWriter::of::<HostedDebugPort>();
 
 pub struct HostedRuntime {
     machine: Arc<HostedMachine>,
@@ -295,7 +322,7 @@ fn spawn_processor_thread(
                     &cpu,
                     &debug_state,
                     read_debug_serial,
-                    write_debug_serial,
+                    DEBUG_SERIAL_WRITER,
                 );
 
                 // Start non-bootstrap processors for component host topology.
@@ -312,7 +339,7 @@ fn spawn_processor_thread(
                 kernel,
                 debug_state,
                 read_debug_serial,
-                write_debug_serial,
+                DEBUG_SERIAL_WRITER,
             );
         })
         .unwrap_or_else(|err| panic!("failed to spawn processor {}: {err}", processor.id()))

@@ -198,7 +198,7 @@ where
     instance_registry: crate::InstanceRegistry,
     parent_instance_id: Option<crate::InstanceId>,
     read_serial: crate::SerialReader,
-    write_serial: fn(&[u8]),
+    write_serial: crate::DebugSerialWriter,
 }
 
 impl<CpuImpl, HostFs> ProgramExecContext<CpuImpl, HostFs>
@@ -333,7 +333,7 @@ pub fn install_program_service<CpuImpl, HostFs, WatchdogImpl>(
     cpu: &CpuImpl,
     debug_state: &HostRuntimeState<CpuImpl, HostFs>,
     read_serial: crate::SerialReader,
-    write_serial: fn(&[u8]),
+    write_serial: crate::DebugSerialWriter,
 ) -> UserProgramService<CpuImpl, HostFs>
 where
     CpuImpl: Cpu + Clone,
@@ -348,7 +348,7 @@ pub fn install_component_host_program_service<CpuImpl, HostFs, WatchdogImpl>(
     cpu: &CpuImpl,
     debug_state: &HostRuntimeState<CpuImpl, HostFs>,
     read_serial: crate::SerialReader,
-    write_serial: fn(&[u8]),
+    write_serial: crate::DebugSerialWriter,
 ) -> Option<UserProgramService<CpuImpl, HostFs>>
 where
     CpuImpl: Cpu + Clone,
@@ -374,7 +374,7 @@ fn install_program_service_inner<CpuImpl, HostFs, WatchdogImpl>(
     cpu: &CpuImpl,
     debug_state: &HostRuntimeState<CpuImpl, HostFs>,
     read_serial: crate::SerialReader,
-    write_serial: fn(&[u8]),
+    write_serial: crate::DebugSerialWriter,
 ) -> UserProgramService<CpuImpl, HostFs>
 where
     CpuImpl: Cpu + Clone,
@@ -442,7 +442,7 @@ pub fn run_embedded_component_forever<CpuImpl, HostFs, WatchdogImpl>(
     kernel: &crate::Kernel<CpuImpl, WatchdogImpl>,
     debug_state: HostRuntimeState<CpuImpl, HostFs>,
     read_serial: crate::SerialReader,
-    write_serial: fn(&[u8]),
+    write_serial: crate::DebugSerialWriter,
 ) -> !
 where
     CpuImpl: Cpu + Clone,
@@ -450,13 +450,13 @@ where
     WatchdogImpl: Watchdog + Clone,
 {
     let component_name = component.name();
-    super::emit_stage_marker(write_serial, "boot");
-    super::emit_stage_marker(write_serial, "component-host:trace-begin");
+    write_serial.emit_stage_marker("boot");
+    write_serial.emit_stage_marker("component-host:trace-begin");
     tracing::info!(
         component = component_name,
         "launching embedded system component"
     );
-    super::emit_stage_marker(write_serial, "component-host:run-local-begin");
+    write_serial.emit_stage_marker("component-host:run-local-begin");
     let stack = system_component_profile_stack(component_name);
     kernel
         .run_local_future(ProfiledSystemComponentFuture::new(
@@ -477,13 +477,11 @@ where
             stack,
         ))
         .unwrap_or_else(|error| {
-            super::write_serial_fmt(
-                write_serial,
-                format_args!("\n[KDBG error failed-system-component {error:#}]\n"),
-            );
+            write_serial
+                .emit_error_marker("error failed-system-component", format_args!("{error:#}"));
             panic!("failed to exec embedded system component:\n{error:#}");
         });
-    super::emit_stage_marker(write_serial, "done");
+    write_serial.emit_stage_marker("done");
     tracing::info!(
         component = component_name,
         "embedded system component exited cleanly"
@@ -565,7 +563,7 @@ pub fn run_component_host_processor_forever<CpuImpl, HostFs, WatchdogImpl>(
     kernel: crate::Kernel<CpuImpl, WatchdogImpl>,
     debug_state: HostRuntimeState<CpuImpl, HostFs>,
     read_serial: crate::SerialReader,
-    write_serial: fn(&[u8]),
+    write_serial: crate::DebugSerialWriter,
 ) -> !
 where
     CpuImpl: Cpu + Clone,
@@ -1183,7 +1181,7 @@ where
         exec_context: &ProgramExecContext<CpuImpl, HostFs>,
         source: &ProgramSource,
         hint: Option<AotCompileHint>,
-        write_serial: fn(&[u8]),
+        write_serial: crate::DebugSerialWriter,
     ) -> Result<ProgramExecutable<CpuImpl, HostFs>, ProgramExecError> {
         let started_at = monotonic_nanos(&self.inner.clock_cpu);
         let payload = match source {
@@ -1222,7 +1220,7 @@ where
     fn load_precompiled_executable(
         &self,
         payload: Bytes,
-        write_serial: fn(&[u8]),
+        write_serial: crate::DebugSerialWriter,
         started_at: u64,
     ) -> Result<ProgramExecutable<CpuImpl, HostFs>, ProgramExecError> {
         match WasmtimePrecompiledKind::detect(&payload) {
@@ -1242,7 +1240,7 @@ where
     fn load_precompiled_component(
         &self,
         payload: Bytes,
-        write_serial: fn(&[u8]),
+        write_serial: crate::DebugSerialWriter,
         started_at: u64,
     ) -> Result<Arc<ComponentInstancePre<StoreData<CpuImpl, HostFs>>>, ProgramExecError> {
         let component = if let Some(component) = self.inner.component_cache.lock().get(&payload) {
@@ -1327,7 +1325,7 @@ where
     fn load_precompiled_core_module(
         &self,
         payload: Bytes,
-        write_serial: fn(&[u8]),
+        write_serial: crate::DebugSerialWriter,
         started_at: u64,
     ) -> Result<Arc<WasmtimeCompiledCoreModule>, ProgramExecError> {
         if let Some(module) = self.inner.core_module_cache.lock().get(&payload) {
@@ -1617,7 +1615,7 @@ where
             });
         }
         if !diagnostic.is_empty() {
-            (store.data().write_serial)(&diagnostic);
+            store.data().write_serial.emit(&diagnostic);
         }
         read_shared_memory(
             store.data().memory(),
@@ -1750,7 +1748,7 @@ where
             instance_registry: store.instance_registry.clone(),
             parent_instance_id: Some(store.instance().id()),
             read_serial: store.serial_reader_fn(),
-            write_serial: store.serial_writer_fn(),
+            write_serial: store.serial_writer(),
         }
     }
 }

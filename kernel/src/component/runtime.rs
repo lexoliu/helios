@@ -94,16 +94,22 @@ impl ComponentOutputRoute {
 /// Borrowed resolution of where one stdio stream's bytes go.
 ///
 /// The split is exactly the flow-control boundary: a [`LocalOutputSink`]
-/// accepts bytes unconditionally and never blocks, while `Child` is a
-/// bounded byte channel that applies backpressure — callers must either
-/// await [`ByteWriter::write`] or drive [`ByteWriter::poll_write`] from a
-/// poll context.
+/// never parks the caller, while `Child` is a bounded byte channel that
+/// applies backpressure — callers must either await
+/// [`ByteWriter::write`] or drive [`ByteWriter::poll_write`] from a poll
+/// context.
+///
+/// Neither half takes bytes unconditionally. A local serial sink is the
+/// machine's one debug UART, whose owner may be another processor
+/// mid-segment (#103), so it reports how much of the chunk it took and
+/// the caller yields for the rest.
 pub enum ComponentOutputSink<'a> {
     Local(LocalOutputSink),
     Child(&'a ByteWriter),
 }
 
-/// Output destinations that can always take one more chunk.
+/// Output destinations the kernel serves itself, without a channel
+/// between the guest and the bytes' destination.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LocalOutputSink {
     Serial,
@@ -112,25 +118,35 @@ pub enum LocalOutputSink {
 }
 
 impl LocalOutputSink {
+    /// Takes what it can of `bytes` and reports how many it took.
+    ///
+    /// Zero means the debug UART is owned by another processor right
+    /// now: the caller yields and offers the same bytes again. A short
+    /// count means the console cut the stream at a line boundary, which
+    /// is the granularity at which a kernel console record may reach
+    /// the wire between the guest's own lines.
+    #[must_use]
     pub(crate) fn write<CpuImpl, RuntimeStateImpl>(
         self,
         cpu: &CpuImpl,
         runtime_state: &RuntimeStateImpl,
-        serial_writer: fn(&[u8]),
+        serial_writer: crate::DebugSerialWriter,
         bytes: &[u8],
-    ) where
+    ) -> usize
+    where
         CpuImpl: Cpu + Clone,
         RuntimeStateImpl: ComponentRuntimeState,
     {
         match self {
-            Self::Serial => serial_writer(bytes),
+            Self::Serial => serial_writer.write_stream(bytes),
             Self::Trace => {
                 let text = core::str::from_utf8(bytes).unwrap_or_else(|error| {
                     panic!("guest attempted to write non-utf8 stdout/stderr bytes: {error}")
                 });
                 runtime_state.record_console_text(cpu.now().ticks(), text);
+                bytes.len()
             }
-            Self::Discard => {}
+            Self::Discard => bytes.len(),
         }
     }
 }
@@ -291,7 +307,7 @@ where
     clock: KernelClock<CpuImpl, RuntimeStateImpl>,
     execution_context: ComponentExecutionContext<FileSystem>,
     serial_reader: crate::SerialReader,
-    serial_writer: fn(&[u8]),
+    serial_writer: crate::DebugSerialWriter,
     /// Set by the runtime exit interface before the guest
     /// traps; the executor reads it to distinguish a clean requested
     /// exit (turn into an exit code) from an actual runtime error.
@@ -356,7 +372,7 @@ where
         process_authority: ProcessAuthority,
         output_mode: ComponentOutputMode,
         serial_reader: crate::SerialReader,
-        serial_writer: fn(&[u8]),
+        serial_writer: crate::DebugSerialWriter,
     ) -> Self {
         let entropy = EntropyPool::derive(runtime_state.root_entropy(), instance.id().raw());
         let clock = KernelClock::new(cpu.clone(), runtime_state.clone());
@@ -432,7 +448,8 @@ where
         self.serial_reader
     }
 
-    pub(crate) fn serial_writer_fn(&self) -> fn(&[u8]) {
+    /// The kernel's writer for the machine's debug UART.
+    pub(crate) fn serial_writer(&self) -> crate::DebugSerialWriter {
         self.serial_writer
     }
 
@@ -506,9 +523,19 @@ where
         }
         match self.execution_context.output_mode.sink(stream) {
             ComponentOutputSink::Local(local) => {
-                let bytes = pending.take().expect("the chunk was present a line ago");
-                local.write(&self.cpu, &self.runtime_state, self.serial_writer, &bytes);
-                core::task::Poll::Ready(())
+                let chunk = pending.take().expect("the chunk was present a line ago");
+                let taken = local.write(&self.cpu, &self.runtime_state, self.serial_writer, &chunk);
+                if taken == chunk.len() {
+                    return core::task::Poll::Ready(());
+                }
+                // The debug UART's owner is another processor. Keep what
+                // is left and come back for it: there is no readiness
+                // signal to register on a port that is written to, so
+                // the wake is this task's own, which is what
+                // `yield_now` does from a poll context.
+                *pending = Some(chunk.slice(taken..));
+                cx.waker().wake_by_ref();
+                core::task::Poll::Pending
             }
             ComponentOutputSink::Child(writer) => {
                 let wait = wait.get_or_insert_with(|| writer.wait_state());
@@ -566,10 +593,6 @@ where
                 stdin_rx.read().await.map(|bytes| bytes.to_vec())
             }
         }
-    }
-
-    pub fn write_serial(&self, bytes: &[u8]) {
-        (self.serial_writer)(bytes);
     }
 
     /// Raw read of the serial debug port, regardless of this component's

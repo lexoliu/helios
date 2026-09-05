@@ -211,7 +211,6 @@ static RSDP_REQUEST: RsdpRequest = RsdpRequest::new();
 #[used]
 static STACK_SIZE_REQUEST: StackSizeRequest = StackSizeRequest::new(KERNEL_STACK_BYTES as u64);
 static DEBUG_SERIAL_BASE: AtomicUsize = AtomicUsize::new(0);
-static DEBUG_SERIAL_WRITER_HELD: AtomicBool = AtomicBool::new(false);
 static CRITICAL_SECTION_STATE: helios_hal::critical_section::CriticalSectionState =
     helios_hal::critical_section::CriticalSectionState::new();
 
@@ -557,7 +556,7 @@ extern "C" fn aarch64_kernel_main() -> ! {
     let console = helios_kernel::RecordingConsole::new(
         debug_state.clone(),
         read_counter,
-        Some(write_debug_serial_bytes),
+        Some(|bytes: &[u8]| DEBUG_SERIAL_WRITER.emit(bytes)),
     );
     let mut devices = DeviceInventory::new().with_debug_serial();
     if host_fs::has_9p_device(&platform) {
@@ -728,7 +727,7 @@ extern "C" fn aarch64_kernel_main() -> ! {
         &cpu,
         &debug_state,
         read_debug_serial,
-        write_debug_serial_bytes,
+        DEBUG_SERIAL_WRITER,
     ) {
         runtime.install_program_service(program_service);
     }
@@ -749,7 +748,7 @@ extern "C" fn aarch64_kernel_main() -> ! {
         kernel,
         debug_state,
         read_debug_serial,
-        write_debug_serial_bytes,
+        DEBUG_SERIAL_WRITER,
     );
 }
 
@@ -1071,7 +1070,7 @@ unsafe extern "C" fn aarch64_secondary_main(mp_info: &MpInfo) -> ! {
     let console = helios_kernel::RecordingConsole::new(
         debug_state.clone(),
         read_counter,
-        Some(write_debug_serial_bytes),
+        Some(|bytes: &[u8]| DEBUG_SERIAL_WRITER.emit(bytes)),
     );
     let kernel = helios_kernel::init(
         Platform::new(console, core::iter::empty::<MemoryRegion>(), cpu)
@@ -1086,7 +1085,7 @@ unsafe extern "C" fn aarch64_secondary_main(mp_info: &MpInfo) -> ! {
         &cpu,
         &debug_state,
         read_debug_serial,
-        write_debug_serial_bytes,
+        DEBUG_SERIAL_WRITER,
     ) {
         runtime.install_program_service(program_service);
     }
@@ -1099,7 +1098,7 @@ unsafe extern "C" fn aarch64_secondary_main(mp_info: &MpInfo) -> ! {
         kernel,
         debug_state,
         read_debug_serial,
-        write_debug_serial_bytes,
+        DEBUG_SERIAL_WRITER,
     );
 }
 
@@ -1804,47 +1803,24 @@ fn active_debug_serial() -> DebugSerial {
     DebugSerial { base }
 }
 
-/// The console UART with the writer lock around it.
-///
-/// A PL011 takes one byte per register write, so two processors pushing
-/// bytes at the port interleave them inside a line; the lock is what
-/// makes one write indivisible. Reads are not serialised, because one
-/// task drains the port.
-#[derive(Clone, Copy)]
-struct LockedDebugSerial(DebugSerial);
-
-impl ByteSerial for LockedDebugSerial {
-    fn try_read_byte(&self) -> Option<u8> {
-        self.0.try_read_byte()
-    }
-
-    fn write_bytes(&self, bytes: &[u8]) {
-        while DEBUG_SERIAL_WRITER_HELD
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            core::hint::spin_loop();
-        }
-        self.0.write_bytes(bytes);
-        DEBUG_SERIAL_WRITER_HELD.store(false, Ordering::Release);
-    }
-}
-
-impl DebugSerialAccess for LockedDebugSerial {
+impl DebugSerialAccess for DebugSerial {
     type Port = Self;
 
     fn port() -> Self {
-        Self(active_debug_serial())
+        active_debug_serial()
     }
 }
 
 fn read_debug_serial(buffer: &mut alloc::vec::Vec<u8>, max_bytes: u32) {
-    helios_kernel::read_debug_serial::<LockedDebugSerial>(buffer, max_bytes);
+    helios_kernel::read_debug_serial::<DebugSerial>(buffer, max_bytes);
 }
 
-fn write_debug_serial_bytes(bytes: &[u8]) {
-    helios_kernel::write_debug_serial_bytes::<LockedDebugSerial>(bytes);
-}
+/// The kernel's writer for this machine's debug UART.
+///
+/// Every byte the kernel or a guest puts on the port goes through the
+/// console this names; the backend supplies only the accessor.
+const DEBUG_SERIAL_WRITER: helios_kernel::DebugSerialWriter =
+    helios_kernel::DebugSerialWriter::of::<DebugSerial>();
 
 /// The port a panicking processor writes its report to.
 ///

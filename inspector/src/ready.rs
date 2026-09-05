@@ -324,27 +324,34 @@ async fn drain_boot_preamble(lines: &mut SerialLines<RpcReader>) -> Result<()> {
     Ok(())
 }
 
+/// How a `[KDBG …]` stage marker opens.
+const MARKER_PREFIX: &str = "[KDBG ";
+
+/// The stage a marker line names, or `None` when the line carries none.
+///
+/// A marker owns its line. The kernel writes it as `\n[KDBG <stage>]\n`
+/// in one segment through the single owner of the debug UART, so the
+/// leading newline closes whatever preceded it and nothing else reaches
+/// the wire before the trailing one (#103). This therefore reads the
+/// whole line as one marker instead of hunting for the prefix inside a
+/// line that should not have held anything else; a line that carries
+/// the prefix and is not a marker is that guarantee breaking, and says
+/// so rather than recovering a marker out of it.
 fn parse_stage_marker(line: &[u8]) -> Result<Option<&str>> {
     let text =
         std::str::from_utf8(line).context("debug serial preamble contained non-utf8 bytes")?;
-    let Some(start) = text.find("[KDBG ") else {
+    if !text.contains(MARKER_PREFIX) {
         return Ok(None);
+    }
+    let Some(stage) = text
+        .strip_prefix(MARKER_PREFIX)
+        .and_then(|stage| stage.strip_suffix(']'))
+    else {
+        anyhow::bail!("a debugger stage marker shared its serial line with other output: {text:?}");
     };
-    let text = &text[start..];
-    let Some(end) = text.find(']') else {
-        anyhow::bail!("malformed debugger stage marker {text:?}");
-    };
-    let marker = &text[..=end];
-    let rest = &text[end + 1..];
-    if rest.contains("[KDBG ") {
+    if stage.contains(']') {
         anyhow::bail!("multiple debugger stage markers appeared on one serial line: {text:?}");
     }
-    let Some(stage) = marker.strip_prefix("[KDBG ") else {
-        unreachable!("stage marker search returned a non-marker prefix");
-    };
-    let Some(stage) = stage.strip_suffix(']') else {
-        anyhow::bail!("malformed debugger stage marker {marker:?}");
-    };
     Ok(Some(stage))
 }
 
@@ -555,6 +562,37 @@ mod tests {
                     "chunks {chunks:?} stalling every {stall_every} lost a marker"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn a_marker_owns_its_line() {
+        assert_eq!(
+            parse_stage_marker(b"[KDBG run:begin]").expect("a whole marker parses"),
+            Some("run:begin")
+        );
+        assert_eq!(
+            parse_stage_marker(b" INFO helios_kernel: processor 1 online")
+                .expect("an ordinary console line is not a marker"),
+            None
+        );
+    }
+
+    /// A marker that shares its line is the single-owner guarantee
+    /// breaking, so it is reported rather than recovered from.
+    #[test]
+    fn a_marker_that_shares_its_line_is_a_fault() {
+        for line in [
+            b"INFO helios_kernel: online[KDBG boot]".as_slice(),
+            b"[KDBG boot][KDBG engine:new]".as_slice(),
+            b"[KDBG boot".as_slice(),
+        ] {
+            let error = parse_stage_marker(line)
+                .expect_err("a marker that does not own its line is a fault");
+            assert!(
+                error.to_string().contains("serial line"),
+                "the fault names the line it read: {error}"
+            );
         }
     }
 

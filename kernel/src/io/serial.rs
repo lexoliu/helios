@@ -4,8 +4,6 @@ use alloc::vec::Vec;
 
 use helios_hal::serial::ByteSerial;
 
-use super::console::emit_console_line;
-
 pub type SerialReader = fn(&mut Vec<u8>, u32);
 
 /// Try a non-blocking read into caller-owned storage. Returns whatever bytes
@@ -43,34 +41,6 @@ pub fn read_serial(io: &impl ByteSerial, buffer: &mut Vec<u8>, max_bytes: u32) {
         };
         buffer.push(byte);
     }
-}
-
-pub fn write_serial(io: &impl ByteSerial, bytes: &[u8]) {
-    emit_console_line(|| io.write_bytes(bytes));
-}
-
-pub fn emit_serial_stage_marker(io: &impl ByteSerial, stage: &str) {
-    emit_console_line(|| {
-        io.write_bytes(b"\n[KDBG ");
-        io.write_bytes(stage.as_bytes());
-        io.write_bytes(b"]\n");
-    });
-}
-
-pub fn emit_serial_error_marker(io: &impl ByteSerial, label: &str, message: &str) {
-    emit_console_line(|| {
-        io.write_bytes(b"\n[KDBG ");
-        io.write_bytes(label.as_bytes());
-        io.write_bytes(b": ");
-        for byte in message.bytes() {
-            match byte {
-                b'\n' | b'\r' => io.write_bytes(b" "),
-                b']' => io.write_bytes(b")"),
-                other => io.write_bytes(&[other]),
-            }
-        }
-        io.write_bytes(b"]\n");
-    });
 }
 
 #[cfg(test)]
