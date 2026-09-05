@@ -13,15 +13,27 @@
 
 use helios_hal::vmm::{NoSwap, SwapBackend};
 use helios_kernel::{
-    ActivityChange, InstanceActivity, InstanceExecutionTransition, InstanceRegistry, KillReason,
-    OOM_RECLAIM_GRACE, OomKillOutcome, OomPolicy,
+    ActivityChange, InstanceActivity, InstanceExecutionTransition, InstanceRegistry,
+    KernelHeapHeadroom, KillReason, MemoryPool, OOM_RECLAIM_GRACE, OomKillOutcome, OomPolicy,
+    store_kernel_heap_bytes, user_mapping_kernel_heap_bytes,
 };
+
+/// A store value's own size, standing in for the wasmtime store the
+/// kernel really allocates. The exact number does not matter to these
+/// tests — only that every store carries the charge the kernel gives
+/// it, through the same function the runtime adapter calls.
+const TEST_STORE_BYTES: usize = 4096;
+
+/// What one store costs the kernel heap.
+fn test_store_charge() -> u64 {
+    store_kernel_heap_bytes(TEST_STORE_BYTES)
+}
 
 #[test]
 fn pick_skips_instances_with_zero_memory() {
     let registry = InstanceRegistry::new();
     let _idle = registry.register("idle", 0);
-    assert!(registry.pick_oom_victim().is_none());
+    assert!(registry.pick_oom_victim(MemoryPool::User).is_none());
 }
 
 #[test]
@@ -32,7 +44,9 @@ fn pick_chooses_largest_consumer_when_costs_match() {
     small.set_memory_bytes(64 * 1024 * 1024);
     large.set_memory_bytes(512 * 1024 * 1024);
 
-    let victim = registry.pick_oom_victim().expect("a victim is available");
+    let victim = registry
+        .pick_oom_victim(MemoryPool::User)
+        .expect("a victim is available");
     assert_eq!(victim.id, large.id());
 }
 
@@ -46,7 +60,9 @@ fn pick_prefers_low_restart_cost_per_byte() {
     user.set_memory_bytes(256 * 1024 * 1024);
     plugin.set_memory_bytes(512 * 1024 * 1024);
 
-    let victim = registry.pick_oom_victim().expect("a victim is available");
+    let victim = registry
+        .pick_oom_victim(MemoryPool::User)
+        .expect("a victim is available");
     assert_eq!(victim.id, user.id());
 }
 
@@ -61,7 +77,7 @@ fn system_components_are_never_oom_victims() {
     system.set_memory_bytes(1024 * 1024 * 1024);
 
     assert!(
-        registry.pick_oom_victim().is_none(),
+        registry.pick_oom_victim(MemoryPool::User).is_none(),
         "a system component holding every byte is still not a victim"
     );
 
@@ -69,14 +85,16 @@ fn system_components_are_never_oom_victims() {
     let user = registry.register_with_policy("user", 0, OomPolicy::UserProgram);
     user.set_memory_bytes(1024 * 1024);
 
-    let victim = registry.pick_oom_victim().expect("a victim is available");
+    let victim = registry
+        .pick_oom_victim(MemoryPool::User)
+        .expect("a victim is available");
     assert_eq!(victim.id, user.id());
 
     // Once that user program is condemned there is no one left to
     // condemn: the requester takes the grow failure instead.
     assert!(registry.request_kill(victim.id, KillReason::OutOfMemory, 0));
     assert!(
-        registry.pick_oom_victim().is_none(),
+        registry.pick_oom_victim(MemoryPool::User).is_none(),
         "with every user instance condemned the killer must run out of victims, \
          not fall through to the kernel's own components"
     );
@@ -115,12 +133,16 @@ fn condemned_instances_are_excluded_from_subsequent_picks() {
     big.set_memory_bytes(512 * 1024 * 1024);
     small.set_memory_bytes(64 * 1024 * 1024);
 
-    let first = registry.pick_oom_victim().expect("first victim");
+    let first = registry
+        .pick_oom_victim(MemoryPool::User)
+        .expect("first victim");
     assert_eq!(first.id, big.id());
     assert!(registry.request_kill(first.id, KillReason::OutOfMemory, 0));
 
     // big is now condemned; the next pick must move on to small.
-    let second = registry.pick_oom_victim().expect("second victim");
+    let second = registry
+        .pick_oom_victim(MemoryPool::User)
+        .expect("second victim");
     assert_eq!(second.id, small.id());
 }
 
@@ -164,7 +186,7 @@ fn one_shortfall_condemns_only_the_victims_that_cover_it() {
     let mut awaiting = 0_usize;
     for _ in 0..INSTANCES {
         match registry
-            .condemn_for_oom(requester.id(), REQUESTED_BYTES, 0)
+            .condemn_for_oom(requester.id(), MemoryPool::User, REQUESTED_BYTES, 0)
             .outcome
         {
             OomKillOutcome::Condemned(_) => condemned += 1,
@@ -180,7 +202,7 @@ fn one_shortfall_condemns_only_the_victims_that_cover_it() {
     );
     assert_eq!(awaiting, INSTANCES - needed);
 
-    let ledger = registry.condemned_memory(0);
+    let ledger = registry.condemned_memory(MemoryPool::User, 0);
     assert_eq!(ledger.pending_bytes, REQUESTED_BYTES);
     assert_eq!(ledger.stale_bytes, 0);
     assert_eq!(
@@ -204,16 +226,19 @@ fn reclaimed_memory_leaves_the_ledger() {
     let survivor = registry.register("survivor", 0);
     survivor.set_memory_bytes(4 * 1024 * 1024);
 
-    let decision = registry.condemn_for_oom(requester.id(), 1024 * 1024, 0);
+    let decision = registry.condemn_for_oom(requester.id(), MemoryPool::User, 1024 * 1024, 0);
     assert!(matches!(decision.outcome, OomKillOutcome::Condemned(_)));
     assert_eq!(decision.condemned.pending_bytes, 8 * 1024 * 1024);
 
     // Teardown: the victim's last handle drops and its memory is back.
     drop(victim);
-    assert_eq!(registry.condemned_memory(0).pending_bytes, 0);
+    assert_eq!(
+        registry.condemned_memory(MemoryPool::User, 0).pending_bytes,
+        0
+    );
 
     // A shortfall after the reclaim is a fresh decision again.
-    let decision = registry.condemn_for_oom(requester.id(), 1024 * 1024, 0);
+    let decision = registry.condemn_for_oom(requester.id(), MemoryPool::User, 1024 * 1024, 0);
     assert!(matches!(
         decision.outcome,
         OomKillOutcome::Condemned(victim) if victim.id == survivor.id()
@@ -237,21 +262,23 @@ fn a_condemnation_stops_covering_when_its_grace_expires() {
     let next = registry.register("next", 0);
     next.set_memory_bytes(4 * 1024 * 1024);
 
-    let decision = registry.condemn_for_oom(requester.id(), REQUESTED_BYTES, 0);
+    let decision = registry.condemn_for_oom(requester.id(), MemoryPool::User, REQUESTED_BYTES, 0);
     assert!(matches!(
         decision.outcome,
         OomKillOutcome::Condemned(victim) if victim.id == stuck.id()
     ));
 
     // Inside the window the condemned bytes still cover the request.
-    let decision = registry.condemn_for_oom(requester.id(), REQUESTED_BYTES, grace - 1);
+    let decision =
+        registry.condemn_for_oom(requester.id(), MemoryPool::User, REQUESTED_BYTES, grace - 1);
     assert_eq!(decision.outcome, OomKillOutcome::AwaitingReclaim);
     assert_eq!(decision.condemned.pending_bytes, 8 * 1024 * 1024);
     assert_eq!(decision.condemned.stale_bytes, 0);
 
     // The window expires and the victim is still holding its memory:
     // the next victim is condemned rather than waiting forever.
-    let decision = registry.condemn_for_oom(requester.id(), REQUESTED_BYTES, grace);
+    let decision =
+        registry.condemn_for_oom(requester.id(), MemoryPool::User, REQUESTED_BYTES, grace);
     assert!(matches!(
         decision.outcome,
         OomKillOutcome::Condemned(victim) if victim.id == next.id()
@@ -266,7 +293,7 @@ fn a_condemnation_stops_covering_when_its_grace_expires() {
     // Stale is not forgotten: the instance stays condemned and is never
     // picked a second time.
     assert_eq!(stuck.pending_kill(), Some(KillReason::OutOfMemory));
-    assert!(registry.pick_oom_victim().is_none());
+    assert!(registry.pick_oom_victim(MemoryPool::User).is_none());
 }
 
 /// The requester is not condemned to serve its own grow, and no smaller
@@ -280,7 +307,7 @@ fn the_requester_is_never_its_own_victim() {
     let small = registry.register("small", 0);
     small.set_memory_bytes(1024 * 1024);
 
-    let decision = registry.condemn_for_oom(requester.id(), 1024 * 1024, 0);
+    let decision = registry.condemn_for_oom(requester.id(), MemoryPool::User, 1024 * 1024, 0);
     assert_eq!(decision.outcome, OomKillOutcome::NoVictim);
     assert_eq!(requester.pending_kill(), None);
     assert_eq!(small.pending_kill(), None);
@@ -320,19 +347,19 @@ fn a_condemned_spawner_survives_the_hooks_that_unwind_its_kill_trap() {
         .collect();
 
     // The spawner is inside guest code: `CallingWasm`.
-    let mut activity = InstanceActivity::new(spawner.clone());
+    let mut activity = InstanceActivity::new(spawner.clone(), test_store_charge());
     let step = activity.record(InstanceExecutionTransition::Resume, 10);
     assert_eq!(step.change, ActivityChange::Entered);
     assert_eq!(step.killed, None);
 
     // Two children's grows are refused. The first condemns the spawner,
     // the second is covered by the ledger and condemns nothing further.
-    let first = registry.condemn_for_oom(children[0].id(), REQUESTED_BYTES, 20);
+    let first = registry.condemn_for_oom(children[0].id(), MemoryPool::User, REQUESTED_BYTES, 20);
     assert!(
         matches!(first.outcome, OomKillOutcome::Condemned(victim) if victim.id == spawner.id()),
         "the spawner is the highest-scoring victim"
     );
-    let second = registry.condemn_for_oom(children[1].id(), REQUESTED_BYTES, 21);
+    let second = registry.condemn_for_oom(children[1].id(), MemoryPool::User, REQUESTED_BYTES, 21);
     assert_eq!(second.outcome, OomKillOutcome::AwaitingReclaim);
 
     // The spawner reaches a host call. The hook records the pause and
@@ -355,7 +382,12 @@ fn a_condemned_spawner_survives_the_hooks_that_unwind_its_kill_trap() {
 
     // The victim is still a live registry entry on its way out, and the
     // kernel is still running.
-    assert_eq!(registry.condemned_memory(31).pending_bytes, SPAWNER_BYTES);
+    assert_eq!(
+        registry
+            .condemned_memory(MemoryPool::User, 31)
+            .pending_bytes,
+        SPAWNER_BYTES
+    );
 }
 
 /// The mirror image of the same defect. When the condemnation is first
@@ -376,7 +408,7 @@ fn a_condemnation_seen_on_a_resume_hook_still_closes_the_activation() {
 
     // The victim was in a host call when it was condemned, and the hook
     // that sees the flag is the one returning to wasm.
-    let mut activity = InstanceActivity::new(victim.clone());
+    let mut activity = InstanceActivity::new(victim.clone(), test_store_charge());
     let step = activity.record(InstanceExecutionTransition::Resume, 10);
     assert_eq!(step.killed, Some(KillReason::OutOfMemory));
     assert_eq!(
@@ -408,7 +440,7 @@ fn dropping_the_owner_releases_its_activation() {
     let registry = InstanceRegistry::new();
     let instance = registry.register("cancelled", 0);
 
-    let mut activity = InstanceActivity::new(instance.clone());
+    let mut activity = InstanceActivity::new(instance.clone(), test_store_charge());
     activity.record(InstanceExecutionTransition::Resume, 100);
     drop(activity);
 
@@ -420,6 +452,174 @@ fn dropping_the_owner_releases_its_activation() {
         .expect("the instance is still registered")
         .cpu_busy;
     assert_eq!(busy, 0);
+}
+
+/// Issue #120, first defect. The kernel-heap branch of the grow
+/// admission path subtracted the whole growth from the kernel heap's
+/// availability — after the user-pool branch above it had already
+/// established that the growth comes out of the user pool. What a grow
+/// costs the *kernel* heap is the page tables and reservation records
+/// that address the new pages, around a five-hundredth of it, so grows
+/// the kernel heap could fund hundreds of times over were refused.
+#[test]
+fn a_grow_is_charged_its_page_tables_not_its_pages() {
+    const GROWTH: usize = 256 * 1024 * 1024;
+    const RESERVE: usize = 128 * 1024 * 1024;
+    const SPARE: usize = 4 * 1024 * 1024;
+
+    let cost = user_mapping_kernel_heap_bytes(GROWTH);
+    assert!(
+        cost < SPARE,
+        "a {GROWTH}-byte grow must cost the kernel heap less than {SPARE} bytes, not {cost}"
+    );
+
+    // The kernel heap has 4 MiB above its reserve: far less than the
+    // growth, and far more than the page tables the growth needs. The
+    // old check refused this; the pages are not the kernel heap's to
+    // fund.
+    let headroom = KernelHeapHeadroom {
+        available_bytes: RESERVE + SPARE,
+        reserve_bytes: RESERVE,
+    };
+    assert_eq!(headroom.growth_shortfall_bytes(GROWTH), None);
+
+    // The reserve is still a reserve. With nothing free above it, the
+    // grow is refused — and the shortfall it asks the OOM killer to
+    // reclaim is the kernel-side cost, not the growth.
+    let exhausted = KernelHeapHeadroom {
+        available_bytes: RESERVE,
+        reserve_bytes: RESERVE,
+    };
+    assert_eq!(exhausted.growth_shortfall_bytes(GROWTH), Some(cost));
+
+    // The #114 shape: free was already under the reserve, so the
+    // refusal never depended on the size of the grow. It still does
+    // not, and the kernel heap is still defended.
+    let breached = KernelHeapHeadroom {
+        available_bytes: RESERVE - SPARE,
+        reserve_bytes: RESERVE,
+    };
+    assert_eq!(
+        breached.growth_shortfall_bytes(GROWTH),
+        Some(cost + SPARE),
+        "a heap under its reserve owes the page tables plus the breach"
+    );
+
+    // A grow of nothing costs nothing, even with the reserve breached.
+    assert_eq!(breached.growth_shortfall_bytes(0), None);
+}
+
+/// Issue #120, second defect. `pick_oom_victim` ranked by wasm linear
+/// memory whatever ran out, so a kernel-heap shortfall condemned the
+/// biggest holder of the pool that was *not* full. The two rankings
+/// genuinely disagree: one instance can hold the largest linear memory
+/// in the system while another, with a small memory and a store per
+/// guest thread, holds the most kernel heap.
+#[test]
+fn a_kernel_heap_shortfall_condemns_the_largest_kernel_footprint() {
+    const GUEST_THREADS: usize = 64;
+
+    let registry = InstanceRegistry::new();
+
+    // One large linear memory on a single store.
+    let hog = registry.register("/bin/big-memory", 0);
+    hog.set_memory_bytes(512 * 1024 * 1024);
+    let _hog_store = InstanceActivity::new(hog.clone(), test_store_charge());
+
+    // A small memory, but a store per `wasi:thread-spawn` thread — and
+    // a store is kernel heap: the store value itself plus the page
+    // tables for the fiber stack it runs on.
+    let threaded = registry.register("/bin/many-threads", 0);
+    threaded.set_memory_bytes(4 * 1024 * 1024);
+    let _threaded_stores: Vec<_> = (0..GUEST_THREADS)
+        .map(|_| InstanceActivity::new(threaded.clone(), test_store_charge()))
+        .collect();
+
+    assert!(hog.memory_bytes() > threaded.memory_bytes());
+    assert!(threaded.kernel_heap_bytes() > hog.kernel_heap_bytes());
+
+    let user_victim = registry
+        .pick_oom_victim(MemoryPool::User)
+        .expect("a user-pool victim is available");
+    assert_eq!(
+        user_victim.id,
+        hog.id(),
+        "a user-pool shortfall still ranks by linear memory"
+    );
+
+    let kernel_victim = registry
+        .pick_oom_victim(MemoryPool::Kernel)
+        .expect("a kernel-heap victim is available");
+    assert_eq!(
+        kernel_victim.id,
+        threaded.id(),
+        "a kernel-heap shortfall must rank by kernel-heap footprint"
+    );
+    assert_eq!(kernel_victim.pool, MemoryPool::Kernel);
+    assert_eq!(kernel_victim.score, threaded.kernel_heap_bytes());
+}
+
+/// A store's kernel heap leaves the instance's footprint when the store
+/// does. Attribution travels with ownership because the kernel
+/// allocator cannot be asked who an allocation was for.
+#[test]
+fn a_dropped_store_returns_its_kernel_heap_to_the_instance() {
+    let registry = InstanceRegistry::new();
+    let instance = registry.register("/bin/threaded", 0);
+    let base = instance.kernel_heap_bytes();
+
+    let first = InstanceActivity::new(instance.clone(), test_store_charge());
+    let second = InstanceActivity::new(instance.clone(), test_store_charge());
+    assert_eq!(instance.kernel_heap_bytes(), base + 2 * test_store_charge());
+
+    drop(second);
+    assert_eq!(instance.kernel_heap_bytes(), base + test_store_charge());
+    drop(first);
+    assert_eq!(instance.kernel_heap_bytes(), base);
+}
+
+/// #105's ledger has to count the pool the shortfall is in. A
+/// condemnation records what the victim held in both pools, so a
+/// kernel-heap shortfall is answered against kernel-heap bytes and a
+/// second shortfall those bytes cover condemns nothing further.
+#[test]
+fn the_ledger_counts_the_pool_the_shortfall_is_in() {
+    const MEMORY_BYTES: u64 = 64 * 1024 * 1024;
+
+    let registry = InstanceRegistry::new();
+    let requester = registry.register("requester", 0);
+    let victim = registry.register("/bin/procbench", 0);
+    victim.set_memory_bytes(MEMORY_BYTES);
+    let _victim_store = InstanceActivity::new(victim.clone(), test_store_charge());
+    let kernel_bytes = victim.kernel_heap_bytes();
+    assert!(
+        kernel_bytes < MEMORY_BYTES,
+        "the two pools are different numbers"
+    );
+
+    let decision =
+        registry.condemn_for_oom(requester.id(), MemoryPool::Kernel, kernel_bytes / 2, 0);
+    assert!(
+        matches!(decision.outcome, OomKillOutcome::Condemned(ref chosen) if chosen.id == victim.id())
+    );
+    assert_eq!(decision.condemned.pending_bytes, kernel_bytes);
+
+    assert_eq!(
+        registry
+            .condemned_memory(MemoryPool::Kernel, 0)
+            .pending_bytes,
+        kernel_bytes
+    );
+    assert_eq!(
+        registry.condemned_memory(MemoryPool::User, 0).pending_bytes,
+        MEMORY_BYTES,
+        "the same condemnation is on both ledgers, at each pool's own size"
+    );
+
+    // The kernel-heap bytes already condemned cover a second shortfall
+    // of the same size, so no second live instance is condemned.
+    let second = registry.condemn_for_oom(requester.id(), MemoryPool::Kernel, kernel_bytes / 2, 0);
+    assert_eq!(second.outcome, OomKillOutcome::AwaitingReclaim);
 }
 
 #[test]

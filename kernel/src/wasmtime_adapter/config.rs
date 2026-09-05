@@ -1,6 +1,6 @@
 use wasmtime::Config;
 
-pub const COMPONENT_ASYNC_STACK_SIZE: usize = 8 * 1024 * 1024;
+pub use crate::component::COMPONENT_ASYNC_STACK_SIZE;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AotCompileHint {
@@ -54,10 +54,10 @@ pub fn build_component_engine_config(target: &str) -> Config {
     config.wasm_reference_types(true);
     config.wasm_function_references(true);
     config.epoch_interruption(true);
-    // CPython's class construction recurses deeply; the default
-    // 512 KB stack is not enough. Give component instances an 8 MB
-    // stack (both for the guest wasm call stack and for the host
-    // Rust async frames that drive it).
+    // The stack size is kernel policy, not a runtime knob: see
+    // `COMPONENT_ASYNC_STACK_SIZE` for why it is what it is and who
+    // pays for it. Both the guest wasm call stack and the host Rust
+    // async frames driving it run on it.
     config.max_wasm_stack(COMPONENT_ASYNC_STACK_SIZE);
     config.async_stack_size(COMPONENT_ASYNC_STACK_SIZE);
     config

@@ -13,8 +13,42 @@ use crate::{
 };
 use helios_hal::cpu::{Cpu, Instant};
 
-use crate::memory::{MemoryOwner, set_user_memory_owner};
+use crate::memory::{MemoryOwner, set_user_memory_owner, user_mapping_kernel_heap_bytes};
 use thiserror::Error;
+
+/// The stack a component instance runs on: both the guest wasm call
+/// stack and the host Rust async frames driving it.
+///
+/// CPython's class construction recurses deeply and does not fit
+/// Wasmtime's 512 KiB default. This is kernel policy rather than a
+/// runtime knob — the kernel is what pays for the stack, in user pages
+/// for the stack itself and in kernel heap for the page tables that
+/// address it — so the runtime adapter's engine configuration reads it
+/// from here.
+pub const COMPONENT_ASYNC_STACK_SIZE: usize = 8 * 1024 * 1024;
+
+/// The kernel heap one wasm store costs the kernel.
+///
+/// Two terms, and both are per *store* rather than per instance, which
+/// is what makes an instance's kernel-heap footprint track the stores
+/// it holds — a guest thread gets its own store over the same instance
+/// — instead of only the linear memory it grew:
+///
+/// - `store_bytes`, the store value itself. Every service the guest can
+///   reach hangs off it: the resource and descriptor tables, preopened
+///   directories, signal state, stdio plumbing, the entropy pool. The
+///   kernel owns the whole thing on its own heap.
+/// - The page tables and reservation records for the fiber stack the
+///   store runs on. The stack's pages come from the user pool, but the
+///   kernel heap pays to address them, and the pooling allocator keeps
+///   the whole [`COMPONENT_ASYNC_STACK_SIZE`] resident
+///   (`async_stack_keep_resident`), so the whole span is mapped for as
+///   long as the store lives.
+pub fn store_kernel_heap_bytes(store_bytes: usize) -> u64 {
+    let bytes =
+        store_bytes.saturating_add(user_mapping_kernel_heap_bytes(COMPONENT_ASYNC_STACK_SIZE));
+    u64::try_from(bytes).unwrap_or(u64::MAX)
+}
 
 /// Error returned through the runtime call hook when a kill was
 /// requested for the running instance — by the OOM killer or by a
@@ -279,6 +313,7 @@ impl<FileSystem> ComponentExecutionContext<FileSystem> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         instance: RegisteredInstance,
+        store_kernel_heap_bytes: u64,
         debug_port: Option<()>,
         filesystem: FileSystem,
         arguments: Vec<String>,
@@ -287,7 +322,7 @@ impl<FileSystem> ComponentExecutionContext<FileSystem> {
         output_mode: ComponentOutputMode,
     ) -> Self {
         Self {
-            activity: InstanceActivity::new(instance),
+            activity: InstanceActivity::new(instance, store_kernel_heap_bytes),
             debug_port,
             filesystem,
             arguments,
@@ -336,6 +371,7 @@ where
             clock,
             execution_context: ComponentExecutionContext::new(
                 instance,
+                store_kernel_heap_bytes(size_of::<Self>()),
                 debug_port,
                 filesystem,
                 arguments,

@@ -45,10 +45,10 @@ pub use bootfs::{
 };
 pub(crate) use component::ComponentCache;
 pub use component::{
-    CompiledComponent, ComponentExecContext, ComponentExecutor, ComponentExitStatus,
-    ComponentFsNodeKind, ComponentFsPathError, ComponentFsResourceError, ComponentOutputMode,
-    ComponentOutputRoute, ComponentOutputSink, ComponentOutputStreamKind, ComponentRawMutex,
-    ComponentRawMutexGuard, ComponentRawRwLock, ComponentRawRwLockReadGuard,
+    COMPONENT_ASYNC_STACK_SIZE, CompiledComponent, ComponentExecContext, ComponentExecutor,
+    ComponentExitStatus, ComponentFsNodeKind, ComponentFsPathError, ComponentFsResourceError,
+    ComponentOutputMode, ComponentOutputRoute, ComponentOutputSink, ComponentOutputStreamKind,
+    ComponentRawMutex, ComponentRawMutexGuard, ComponentRawRwLock, ComponentRawRwLockReadGuard,
     ComponentRawRwLockWriteGuard, ComponentResourceTableError, ComponentRunResult,
     ComponentRuntimeEngine, ComponentRuntimeFactory, ComponentRuntimeState, ComponentSerialPort,
     ComponentStoreData, ComponentTcpBackend, ComponentTcpStream, ComponentUdpBackend,
@@ -58,7 +58,7 @@ pub use component::{
     RawRwLockWriteGuardResource, SerialPortResource, TcpStreamResource, UdpSocketResource,
     directory_prefix, map_resource_table_error, parent_path, path_is_within_directory,
     provider_channel, resolve_absolute_path, resolve_child_path, resolve_guest_path,
-    strip_directory_prefix, wait_until_runtime_deadline,
+    store_kernel_heap_bytes, strip_directory_prefix, wait_until_runtime_deadline,
 };
 pub use embedded::{
     EmbeddedComponent, EmbeddedInit, embedded_boot_component, embedded_init,
@@ -90,9 +90,9 @@ pub use host_fs::{
 };
 pub use instance::{
     ActivityChange, ActivityStep, CondemnedMemory, InstanceActivity, InstanceExecutionTransition,
-    InstanceId, InstanceProfileTotal, InstanceRegistry, InstanceSnapshot, KillReason,
-    OOM_RECLAIM_GRACE, OomKillDecision, OomKillOutcome, OomPolicy, OomVictim, RegisteredInstance,
-    allow_instance_resource_growth,
+    InstanceId, InstanceProfileTotal, InstanceRegistry, InstanceSnapshot, KernelHeapCharge,
+    KillReason, MemoryPool, OOM_RECLAIM_GRACE, OomKillDecision, OomKillOutcome, OomPolicy,
+    OomVictim, RegisteredInstance, allow_instance_resource_growth,
 };
 pub use io::{
     BlockInstallError, BlockSelfCheckError, BlockService, BlockStats, ByteReadWait, ByteReader,
@@ -119,7 +119,8 @@ pub use memory::{
     current_user_memory_owner, deallocate_user_frame, deallocate_user_frame_on, disable_swap,
     enter_user_memory_owner, install_entropy_device, install_memory_balloon, install_swap,
     install_swap_hooks, installed_swap_handle, installed_swap_hooks, largest_servable_user_bytes,
-    seed_root_entropy, set_user_memory_owner, swapped_token, user_heap_stats, validate_range,
+    seed_root_entropy, set_user_memory_owner, swapped_token, user_heap_stats,
+    user_mapping_kernel_heap_bytes, validate_range,
 };
 pub use network::{
     HTTP_FORBIDDEN_FIELD_NAMES, HTTP_MAX_FIELD_SECTION_BYTES, HTTP_MAX_FIELD_VALUE_BYTES, HttpBody,
@@ -1026,6 +1027,62 @@ pub fn user_memory_kernel_reserve_bytes(total_heap_bytes: usize) -> usize {
     (total_heap_bytes / USER_MEMORY_KERNEL_RESERVE_FRACTION)
         .max(USER_MEMORY_MIN_KERNEL_RESERVE_BYTES)
         .min(total_heap_bytes)
+}
+
+/// The kernel heap's free space measured against the reserve it keeps
+/// for itself, and what a user-memory grow may take out of it.
+///
+/// Kernel and user memory are separate ownership domains (AGENTS §3).
+/// A wasm grow is served from the user pool; what it costs the *kernel*
+/// heap is the page tables and reservation records that address the new
+/// pages — [`user_mapping_kernel_heap_bytes`] — not the pages
+/// themselves. Charging the growth itself here refused grows the kernel
+/// heap was never asked to fund, and refused them by an amount two
+/// orders of magnitude larger than the real cost.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KernelHeapHeadroom {
+    /// Kernel heap not currently allocated.
+    pub available_bytes: usize,
+    /// Kernel heap held back for the kernel's own working set. A user
+    /// grow may not dip into it: a kernel OOM is fatal, so the reserve
+    /// is what keeps user-mode demand from being able to end the
+    /// kernel.
+    pub reserve_bytes: usize,
+}
+
+impl KernelHeapHeadroom {
+    pub fn of(heap: HeapStats) -> Self {
+        Self {
+            available_bytes: heap.available_bytes(),
+            reserve_bytes: user_memory_kernel_reserve_bytes(heap.total_bytes),
+        }
+    }
+
+    /// The kernel heap a user-memory grow of `growth_bytes` cannot find
+    /// above the reserve, or `None` when its kernel-side cost fits.
+    ///
+    /// The shortfall — not the growth, and not the cost alone — is what
+    /// the OOM killer is asked to reclaim: it is the number of
+    /// kernel-heap bytes that have to come back before the same grow
+    /// can be admitted, which on a heap already under its reserve
+    /// includes the breach as well as the cost.
+    ///
+    /// A grow of nothing needs nothing, even from a heap under its
+    /// reserve: this answers a grow request, not a health check.
+    pub const fn growth_shortfall_bytes(self, growth_bytes: usize) -> Option<usize> {
+        let cost = user_mapping_kernel_heap_bytes(growth_bytes);
+        if cost == 0 {
+            return None;
+        }
+        match self
+            .reserve_bytes
+            .saturating_add(cost)
+            .checked_sub(self.available_bytes)
+        {
+            None | Some(0) => None,
+            Some(shortfall) => Some(shortfall),
+        }
+    }
 }
 
 #[cfg(target_os = "none")]
