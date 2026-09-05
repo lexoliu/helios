@@ -156,7 +156,7 @@ below are rendered from, and why:
 
 | Cell | Sides | Why |
 | --- | --- | --- |
-| `instance-startup-100`, `instance-startup-500` | Helios | The kernel heap was a fixed quarter of the guest and an instance costs it ~8.1 MiB, so the 46th spawn was refused with a typed `SpawnErrorKind::OutOfMemory` while the user pool was untouched (#130, fixed since; see `docs/memory.md`). The ceiling is now the executor's fixed 768 KiB instance task share at about ninety instances (#159). Their Linux halves are skipped by name: a cell whose Helios half cannot be measured has nothing to compare against. |
+| `instance-startup-100`, `instance-startup-500` | Helios | The kernel heap was a fixed quarter of the guest and an instance costs it ~8.1 MiB, so the 46th spawn was refused with a typed `SpawnErrorKind::OutOfMemory` while the user pool was untouched (#130, fixed since; see `docs/memory.md`). The next ceiling was the executor's fixed 768 KiB instance task share at about ninety instances (#159, #142, fixed since: the arena is a share of the machine and its bytes are fungible across block classes). `instance-startup-100` gates the lane again; `instance-startup-500` does not, because 500 instances want about 6.1 GiB of guest and the lane's has 2 GiB. Their Linux halves are skipped by name: a cell whose Helios half cannot be measured has nothing to compare against. |
 | `tcp-throughput`, `wasi-tcp-throughput`, `wasix-tcp-throughput` | Helios | The guest receive path stops answering and the workload's own deadline fails it (#143). |
 | `curl-http-throughput` | Helios | Never reached: the `net` class spent its share of the Helios side's budget on the three cells above and was killed at 589 s, so this one is recorded as unmeasured rather than left out. |
 | `tcp-latency` | all three | The driver bound the host echo server to 127.0.0.1 while every side reaches the host at the lane's `net_host` (10.77.0.1 on this lane), so no side could connect and all three exited non-zero (#150, fixed since). |
@@ -166,9 +166,13 @@ wrong about which pool had run out. `docs/memory.md` states the
 relationship between guest memory and the two domains that replaced it:
 all usable memory is user pool and the kernel heap draws on it, so the
 instance ceiling is a property of the guest's memory. With that fixed the
-density workload reaches instance 104 and is refused by the executor's
-fixed 768 KiB instance task share instead (#159), so both density cells
-stay out of the gating set against that limit rather than a memory one.
+density workload reached instance 104 and was refused by the executor's
+fixed 768 KiB instance task share instead (#159). That arena is sized
+from the boot memory plan now — 7.25 MiB per processor on this lane's
+2 GiB guest — and buddy-split, so freed bytes serve any block class
+(#142). `instance-startup-100` is back in the gating set;
+`instance-startup-500` stays out against the guest's memory rather than
+against the executor.
 
 The per-processor task arena that #132 records — where the density cells'
 refused spawns cost every later spawn in the same guest — did not recur

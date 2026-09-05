@@ -714,19 +714,23 @@ jobs:
             accel: kvm
             # KVM boots in seconds; a marker hang should fail fast.
             boot-timeout: "300"
-            # The instance-density cells are no longer bounded by
-            # memory — the boot memory policy leaves all usable memory
-            # in the user pool and lets the kernel heap draw on it
-            # (#130, docs/memory.md), and the hundredth spawn now
-            # reaches instance 104 before it is refused. What refuses it
-            # is the executor's fixed 768 KiB instance task share
-            # (#159), a constant the guest's memory does not move. They
-            # stay out of this lane's gating set until that is settled,
-            # rather than teaching the lane to tolerate a failed cell —
-            # the benchmark suite is where a failure becomes a recorded
-            # cell with its reason.
+            # `instance-startup-100` gates this lane again. Neither
+            # thing that used to refuse it does now: the boot memory
+            # policy leaves all usable memory in the user pool and lets
+            # the kernel heap draw on it (#130), and the executor's task
+            # arena is a share of the machine rather than a fixed 1 MiB
+            # array (#159, #142), which on this 2 GiB guest is 7.25 MiB
+            # per processor against the ~8.5 KiB a live instance costs
+            # one. See docs/memory.md.
+            #
+            # `instance-startup-500` stays out, and for the machine
+            # rather than the executor: 500 instances want about 6.1 GiB
+            # of guest before the kernel's own baseline and this one has
+            # 2 GiB, so the cell would fail on memory whatever the arena
+            # holds. Measuring it needs a bigger guest, not a different
+            # kernel, and a failed cell is not something this lane is
+            # taught to tolerate.
             workloads: >-
-              --skip-workload instance-startup-100
               --skip-workload instance-startup-500
             # Linux runners allow sudo, so the network workloads run over
             # a multi-queue tap with vhost-net: the only host packet path

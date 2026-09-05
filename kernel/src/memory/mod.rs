@@ -38,7 +38,8 @@ pub use pmm::KernelPhysFrameAllocator;
 pub use policy::{
     BootMemoryPlan, BootRegionSplitter, KERNEL_HEAP_BOOTSTRAP_BYTES,
     KERNEL_HEAP_GROWTH_CHUNK_BYTES, KERNEL_HEAP_MAX_BOOT_FRACTION, KERNEL_HEAP_MIN_RESERVE_BYTES,
-    KERNEL_HEAP_RESERVE_FRACTION, RegionShares, USER_POOL_MIN_REGION_BYTES, kernel_reserve_for,
+    KERNEL_HEAP_RESERVE_FRACTION, RegionShares, TASK_ARENA_FRACTION, TASK_ARENA_MIN_BYTES,
+    USER_POOL_MIN_REGION_BYTES, kernel_reserve_for, task_arena_bytes_for,
 };
 pub use reservations::{
     AccessibilityPlan, CommittedRegion, ReleasedReservation, ReservationLookup, ReservationTracker,

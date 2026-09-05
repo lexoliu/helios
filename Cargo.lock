@@ -1809,6 +1809,7 @@ dependencies = [
  "bytes",
  "concurrent-queue",
  "critical-section",
+ "crossbeam-utils",
  "divan",
  "event-listener",
  "futures",

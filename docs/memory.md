@@ -26,6 +26,21 @@ pool at run time:
 | kernel boot share | `min(kernel reserve + 16 MiB, usable / 2)` | what the kernel heap starts with, taken off the front of the map once |
 | user pool | `usable - kernel boot share` | seeded with everything else |
 | kernel growth chunk | 64 MiB | what the kernel heap takes out of the pool when it needs more |
+| task arena, per processor | `max(1 MiB, usable / 256)` | one processor's executor task arena, taken from the kernel heap when the executor is built |
+
+The task arena is the executor's, not the heap's: it holds the futures
+of live tasks, and a live instance costs its processor's arena about
+8.5 KiB — an 8 KiB launch task and a 256-byte phase heartbeat — against
+the ~12.5 MiB it costs the machine. A 256th of the machine per processor
+is therefore about six times the arena the machine's memory can fund
+instances for, so what a processor can hold is the guest's memory and
+not a constant (#159). The executor rounds the share down to a whole
+number of its largest block class (256 KiB) and keeps one of those
+blocks as the kernel reserve, so the kernel can place a task of any size
+it spawns however full the instance share is. Bytes inside an arena are
+fungible: blocks are buddy-split and buddy-merged over 64-byte granules,
+so a freed 8 KiB block serves 256-byte spawns and free buddies coalesce
+(#142).
 
 The kernel reserve is derived from the boot memory map once and never
 moves afterwards. It cannot be a share of the kernel heap, because the
@@ -93,18 +108,23 @@ hosted test `memory_policy_tests` places instances against a real
 `UserMemoryPool` until it refuses one, and records 140 on the 2 GiB
 guest's memory map and 422 on three times it.
 
-Memory is no longer what stops the density workload. On run
+Memory is no longer what stops the density workload, and neither is the
+executor. On run
 [33969418797](https://github.com/lexoliu/helios/actions/runs/33969418797)
 `instance-startup-100` reached instance 104 with no `ProgramOutOfMemory`
 and no OOM-killer line anywhere in the boot, and was refused by the
 executor's fixed 768 KiB instance task share instead (#159) — a constant
-the guest's memory does not move. Both density cells stay out of the
-`bench-x86-64-linux` gating set until that is settled.
+the guest's memory did not move. The arena is a share of the machine
+now, so on the same 2 GiB guest (1,977,962,496 usable) it is 7.25 MiB
+per processor once it is rounded to whole 256 KiB blocks, of which 7 MiB
+is the instance share: 896 launch tasks, against the ~140 instances the
+guest's memory can fund. `instance-startup-100` is back in
+the `bench-x86-64-linux` gating set.
 
-`instance-startup-500` is above the 2 GiB memory ceiling in any case:
-500 instances want about 6.1 GiB of machine before the kernel's own
-baseline, so it needs a bigger guest to be measured rather than a
-different pool.
+`instance-startup-500` stays out of it, and for the machine rather than
+the arena: 500 instances want about 6.1 GiB of machine before the
+kernel's own baseline, and the lane's guest has 2 GiB. It needs a bigger
+guest to be measured, not a bigger arena.
 
 ## Related
 

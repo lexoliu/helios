@@ -96,6 +96,47 @@ pub const KERNEL_HEAP_MIN_RESERVE_BYTES: usize = 32 * 1024 * 1024;
 /// buddy as a single aligned block rather than scattering it.
 pub const KERNEL_HEAP_GROWTH_CHUNK_BYTES: usize = 64 * 1024 * 1024;
 
+/// The share of the machine one processor's executor task arena takes.
+///
+/// The arena holds the futures of live tasks, and what bounds the
+/// number of those is instance density. A live instance costs its
+/// processor's arena about 8.5 KiB — an 8 KiB launch task and a
+/// 256-byte phase heartbeat — and costs the machine about 12.5 MiB of
+/// kernel structures and linear memory (`docs/memory.md`). A 256th of
+/// the machine is therefore roughly six times the arena the machine's
+/// own memory can fund instances for, which leaves room for programs
+/// much cheaper in memory than `hello` without the arena becoming the
+/// thing that refuses them, and costs 0.4% of the machine per
+/// processor.
+///
+/// #159 is what a constant costs here when it does not move: a fixed
+/// 1 MiB arena, 768 KiB of it the instance share, capped a 2 GiB guest
+/// at about ninety instances per processor while the memory for
+/// hundreds more sat free.
+pub const TASK_ARENA_FRACTION: usize = 256;
+
+/// The floor under [`TASK_ARENA_FRACTION`], for machines too small for
+/// a 256th of them to be a working arena.
+///
+/// It is the size the arena had when it was a compile-time array, so a
+/// machine below the floor keeps exactly the arena it used to have.
+pub const TASK_ARENA_MIN_BYTES: usize = 1024 * 1024;
+
+/// One processor's task arena on a machine of `usable_bytes`.
+///
+/// Public and pure so a test can state the relationship between guest
+/// memory and task capacity without booting anything. The executor
+/// rounds the answer down to a whole number of its largest block
+/// class; see `kernel/src/exec/executor.rs`.
+pub const fn task_arena_bytes_for(usable_bytes: usize) -> usize {
+    let share = usable_bytes / TASK_ARENA_FRACTION;
+    if share < TASK_ARENA_MIN_BYTES {
+        TASK_ARENA_MIN_BYTES
+    } else {
+        share
+    }
+}
+
 /// The smallest leftover worth handing to the user pool.
 ///
 /// Also the alignment the user share starts on: the kernel's boot share
@@ -312,6 +353,29 @@ mod tests {
         let small = BootMemoryPlan::for_usable_bytes(TWO_GIB_USABLE);
         let large = BootMemoryPlan::for_usable_bytes(SIX_GIB_USABLE);
         assert_eq!(large.kernel_reserve_bytes, 3 * small.kernel_reserve_bytes);
+    }
+
+    #[test]
+    fn the_task_arena_scales_with_the_machine() {
+        let small = task_arena_bytes_for(TWO_GIB_USABLE);
+        let large = task_arena_bytes_for(SIX_GIB_USABLE);
+
+        assert_eq!(large, 3 * small, "the arena did not track the machine");
+        // The 2 GiB guest of #159 is where the fixed arena refused the
+        // hundredth instance. Its share has to hold the density the
+        // machine's own memory can fund, which `docs/memory.md` puts at
+        // about 140 instances, at about 8.5 KiB of arena each.
+        assert!(
+            small >= 140 * 9 * 1024,
+            "a 2 GiB guest's arena is {small} bytes, under the density its memory funds"
+        );
+        // And a machine too small for a share still gets the arena it
+        // had before the share existed.
+        assert_eq!(task_arena_bytes_for(0), TASK_ARENA_MIN_BYTES);
+        assert_eq!(
+            task_arena_bytes_for(TASK_ARENA_MIN_BYTES * TASK_ARENA_FRACTION),
+            TASK_ARENA_MIN_BYTES
+        );
     }
 
     #[test]
