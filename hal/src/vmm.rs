@@ -340,15 +340,15 @@ pub trait AddressSpace: Send + Sync + 'static {
     /// `virt.frame_count()` consecutive ones, so the caller can hand the
     /// device one address and a length.
     ///
-    /// `below` bounds the allocation: no frame of the run sits at or
-    /// above it. A device that drives fewer than 64 address bits passes
-    /// its limit here rather than discovering the truncation as
-    /// corruption.
+    /// `limit` bounds the allocation: no byte of the run sits above it.
+    /// A device that drives fewer than 64 address bits passes its
+    /// highest reachable address here rather than discovering the
+    /// truncation as corruption.
     fn commit_contiguous(
         &self,
         _virt: VirtRange,
         _flags: PageFlags,
-        _below: u64,
+        _limit: u64,
     ) -> Result<PhysFrame, AddressSpaceError> {
         Err(AddressSpaceError::DeviceMappingUnsupported)
     }
