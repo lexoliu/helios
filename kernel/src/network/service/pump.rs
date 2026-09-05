@@ -196,7 +196,7 @@ where
             // it samples the mark *before* the poll that decides
             // whether to park, so progress made in between is not
             // slept through.
-            let wait = self.inner.state.any_shard_wait();
+            let wait = self.any_shard_wait();
             match self.poll_network_once(NetworkPollSource::Pump).await {
                 Ok((progress, budget)) => match cadence.complete(progress, budget) {
                     NetworkPumpAction::Continue => {}

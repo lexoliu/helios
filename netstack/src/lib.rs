@@ -515,6 +515,31 @@ impl Default for PacketBuffer {
     }
 }
 
+/// An interface's event counters, sampled by a waiter before it
+/// inspects the state it means to park on.
+///
+/// An interface event — an RX arrival, a transmit completion, a link
+/// change — is a broadcast fact, and a waiter that arms itself *after*
+/// testing its own state sleeps through every event raised in between.
+/// That window is fatal rather than slow: a device with
+/// `VIRTIO_RING_F_EVENT_IDX` raises nothing further once its receive
+/// ring has filled, so the one lost event is the last one there will be.
+///
+/// Two counters, because an interface reports two kinds of progress.
+/// `queue` counts what one queue pair completed, which is the only
+/// progress an operation pinned to that pair can use; `device` counts
+/// what the interface reported that belongs to no pair — a
+/// configuration change, a control-queue completion, or any event a
+/// transport with one interrupt line cannot attribute to a pair. A
+/// waiter observes an increment of either.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct InterfaceEventMark {
+    /// Events the sampled queue pair had reported.
+    pub queue: u64,
+    /// Events the interface had reported that belong to no queue pair.
+    pub device: u64,
+}
+
 /// Multi-core aware network interface contract used by packet stacks.
 pub trait NetworkInterface: Clone + Send + Sync + 'static {
     /// Returns the hardware MAC address programmed for this interface.
@@ -625,8 +650,32 @@ pub trait NetworkInterface: Clone + Send + Sync + 'static {
         Ok(None)
     }
 
-    /// Waits for interface progress, such as RX arrival or TX completion.
-    fn wait_for_event(&self) -> impl Future<Output = ()> + Send + '_;
+    /// Samples this interface's event counters for one queue pair.
+    ///
+    /// Callers take the mark *before* they inspect whatever they intend
+    /// to wait for, and hand it back to [`Self::wait_for_event_since`];
+    /// there is no way to park on an interface event without one,
+    /// because a waiter that armed itself afterwards would sleep
+    /// through the event it was waiting for. This is the interface-side
+    /// half of the same arm-before-test discipline the kernel's shard
+    /// arrival signal uses.
+    fn event_mark(&self, queue_idx: usize) -> InterfaceEventMark;
+
+    /// Waits until the interface reports an event past `mark`, on
+    /// `queue_idx` or on the interface as a whole.
+    ///
+    /// An operation belongs to one shard, which drains one queue pair,
+    /// so a completion on another pair is not progress it can use.
+    /// `mark` must come from [`Self::event_mark`] on the same queue,
+    /// taken before the caller inspected its own state: an event
+    /// already past it resolves the wait immediately rather than
+    /// parking for a second event that a full receive ring guarantees
+    /// will never come.
+    fn wait_for_event_since(
+        &self,
+        queue_idx: usize,
+        mark: InterfaceEventMark,
+    ) -> impl Future<Output = ()> + Send + '_;
 
     /// Interrupts this queue pair's own message has raised since boot.
     ///
@@ -638,18 +687,6 @@ pub trait NetworkInterface: Clone + Send + Sync + 'static {
     fn queue_interrupts(&self, queue_idx: usize) -> u64 {
         let _ = queue_idx;
         0
-    }
-
-    /// Waits for progress on one queue pair, or for anything the device
-    /// reports that belongs to no pair.
-    ///
-    /// An operation belongs to one shard, which drains one queue pair,
-    /// so a completion on another pair is not progress it can use.
-    /// Defaults to the whole-device wait for interfaces that cannot
-    /// tell their queues apart.
-    fn wait_for_event_on(&self, queue_idx: usize) -> impl Future<Output = ()> + Send + '_ {
-        let _ = queue_idx;
-        self.wait_for_event()
     }
 }
 

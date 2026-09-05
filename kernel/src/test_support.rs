@@ -259,3 +259,215 @@ impl Cpu for RecordingSmpCpu {
         self.base.reboot()
     }
 }
+
+/// Runtime state that answers the few questions a service asks during
+/// construction and records nothing.
+///
+/// Uptime is the raw tick count, which is what every other kernel test
+/// fixture does: the tests that use this assert on ordering between
+/// events, never on wall time.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct TestRuntimeState;
+
+impl crate::component::ComponentRuntimeState for TestRuntimeState {
+    fn uptime_nanos(&self, current_ticks: u64) -> u64 {
+        current_ticks
+    }
+
+    fn wall_clock_offset_nanos(&self) -> i128 {
+        0
+    }
+
+    fn record_console_text(&self, _: u64, _: &str) {}
+
+    fn root_entropy(&self) -> &crate::RootEntropy {
+        panic!("the network test runtime state has no root entropy")
+    }
+
+    fn memory_balloon(&self) -> Option<crate::memory::BalloonHandle> {
+        None
+    }
+
+    fn profiling_enabled(&self) -> bool {
+        false
+    }
+
+    fn record_profile_stack_nanos(&self, _: crate::ProfileScope, _: alloc::string::String, _: u64) {
+    }
+
+    fn record_profile_stack_parts_nanos(&self, _: crate::ProfileScope, _: &str, _: &str, _: u64) {}
+
+    fn record_perf_metric_parts(
+        &self,
+        _: crate::ProfileScope,
+        _: &str,
+        _: &str,
+        _: crate::PerfSample,
+    ) {
+    }
+}
+
+/// A network interface that moves no frames and does nothing but report
+/// events, the way a driver's interrupt handler does.
+///
+/// Counters, not permits: an interface event is a broadcast fact, and
+/// what the tests care about is whether a waiter that sampled the
+/// counters *before* looking at its own state observes an event raised
+/// in between. [`Self::complete_on`] stands in for the interrupt
+/// handler; [`helios_netstack::NetworkInterface::event_mark`] is what a
+/// waiter takes beforehand.
+#[derive(Clone)]
+pub(crate) struct RecordingNetworkInterface {
+    inner: Arc<RecordingInterfaceState>,
+}
+
+struct RecordingInterfaceState {
+    /// Events each queue pair has reported.
+    queues: alloc::vec::Vec<AtomicU64>,
+    /// Events reported that belong to no queue pair.
+    device: AtomicU64,
+    /// Wakes whatever is parked on either counter.
+    progress: crate::ProgressSignal,
+}
+
+impl RecordingNetworkInterface {
+    pub(crate) fn new(queue_pairs: usize) -> Self {
+        assert!(queue_pairs != 0, "an interface has at least one queue pair");
+        Self {
+            inner: Arc::new(RecordingInterfaceState {
+                queues: (0..queue_pairs).map(|_| AtomicU64::new(0)).collect(),
+                device: AtomicU64::new(0),
+                progress: crate::ProgressSignal::new(),
+            }),
+        }
+    }
+
+    /// Raises the event one queue pair's completions raise, as the
+    /// driver's interrupt handler would.
+    pub(crate) fn complete_on(&self, queue_idx: usize) {
+        self.inner.queues[queue_idx].fetch_add(1, Ordering::AcqRel);
+        self.inner.progress.signal();
+    }
+}
+
+impl RecordingInterfaceState {
+    fn mark(&self, queue_idx: usize) -> helios_netstack::InterfaceEventMark {
+        helios_netstack::InterfaceEventMark {
+            queue: self.queues[queue_idx].load(Ordering::Acquire),
+            device: self.device.load(Ordering::Acquire),
+        }
+    }
+}
+
+impl helios_netstack::NetworkInterface for RecordingNetworkInterface {
+    fn mac_address(&self) -> [u8; 6] {
+        [0x02, 0, 0, 0, 0, 1]
+    }
+
+    fn max_frame_len(&self) -> usize {
+        helios_netstack::ETHERNET_FRAME_BYTES
+    }
+
+    fn queue_pair_count(&self) -> usize {
+        self.inner.queues.len()
+    }
+
+    fn capabilities(&self) -> helios_netstack::InterfaceCapabilities {
+        helios_netstack::InterfaceCapabilities {
+            max_frame_len: helios_netstack::ETHERNET_FRAME_BYTES,
+            events: helios_netstack::EventDeliveryCapabilities {
+                polling: true,
+                interrupts: true,
+                rx_poll_budget: helios_netstack::DEFAULT_POLL_BUDGET,
+                tx_completion_budget: helios_netstack::DEFAULT_POLL_BUDGET,
+                ..helios_netstack::EventDeliveryCapabilities::default()
+            },
+            ..helios_netstack::InterfaceCapabilities::default()
+        }
+    }
+
+    fn try_receive<'a>(
+        &'a self,
+        _: &'a mut helios_netstack::PacketBuffer,
+    ) -> impl core::future::Future<Output = helios_hal::io::IoResult<bool>> + Send + 'a {
+        core::future::ready(Ok(false))
+    }
+
+    fn try_receive_frame(
+        &self,
+    ) -> impl core::future::Future<
+        Output = helios_hal::io::IoResult<Option<helios_netstack::RxFrame>>,
+    > + Send {
+        core::future::ready(Ok(None))
+    }
+
+    fn try_receive_frames_immediate_on<'a, 'slots>(
+        &'a self,
+        _: usize,
+        _: &'slots mut [Option<helios_netstack::RxFrame>],
+    ) -> helios_hal::io::IoResult<Option<usize>>
+    where
+        'a: 'slots,
+    {
+        Ok(Some(0))
+    }
+
+    fn repost_rx_frame<'a>(
+        &'a self,
+        _: helios_netstack::RxFrame,
+    ) -> impl core::future::Future<Output = helios_hal::io::IoResult<()>> + Send + 'a {
+        core::future::ready(Ok(()))
+    }
+
+    fn repost_rx_frames_immediate<'a, 'slots>(
+        &'a self,
+        _: &'slots mut [Option<helios_netstack::RxFrame>],
+    ) -> helios_hal::io::IoResult<Option<()>>
+    where
+        'a: 'slots,
+    {
+        Ok(Some(()))
+    }
+
+    fn try_transmit_scatter_immediate_on(
+        &self,
+        _: usize,
+        _: &[helios_netstack::TxFrameRef<'_>],
+    ) -> helios_hal::io::IoResult<Option<usize>> {
+        Ok(Some(0))
+    }
+
+    fn reclaim_transmit_completions_immediate_on(
+        &self,
+        _: usize,
+        _: usize,
+    ) -> helios_hal::io::IoResult<Option<usize>> {
+        Ok(Some(0))
+    }
+
+    fn event_mark(&self, queue_idx: usize) -> helios_netstack::InterfaceEventMark {
+        self.inner.mark(queue_idx)
+    }
+
+    fn wait_for_event_since(
+        &self,
+        queue_idx: usize,
+        mark: helios_netstack::InterfaceEventMark,
+    ) -> impl core::future::Future<Output = ()> + Send + '_ {
+        // Armed here, not at the first poll, exactly as a driver must:
+        // the wake this races is raised by an interrupt handler that
+        // does not wait to be observed.
+        let progress = self.inner.progress.mark();
+        async move {
+            let changed = self.inner.progress.changed(progress);
+            let mut changed = core::pin::pin!(changed);
+            core::future::poll_fn(|cx| {
+                if self.inner.mark(queue_idx) != mark {
+                    return core::task::Poll::Ready(());
+                }
+                core::future::Future::poll(changed.as_mut(), cx)
+            })
+            .await;
+        }
+    }
+}

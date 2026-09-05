@@ -31,13 +31,13 @@ use helios_netstack::{
     DEFAULT_HOP_LIMIT, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DNS_PORT, DhcpClientMessage,
     DhcpDnsServers, DhcpMessageType, DhcpPacket, DnsQuestionWriter, DnsRecordType, DnsResponse,
     EthernetFrame, EthernetProtocol, FlowTuple, IcmpEchoKey, IcmpEchoReply, Icmpv4Packet,
-    Icmpv6Packet, IpAddress, IpCidr, IpProtocol, Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv6Address,
-    Ipv6Cidr, Ipv6Packet, MAX_OUTBOUND_FRAMES, NeighborEntry, NetworkInterface as NetworkDevice,
-    OutboundBatchStatus, Route, RouteTable, RxChecksumOffload, RxFrame, SegmentationOffload, Stack,
-    StackConfig, StackError, StackEvent, StackInstant, TcpCloseKind, TcpConnectState,
-    TcpConnectTerminalError, TcpEndpoint, TcpListenBacklog, TcpPacket, TcpReadIntoState,
-    TcpReadState, UdpEgress, UdpEndpoint, UdpPacket, UdpPayload, UdpSocketBinding, UdpSocketError,
-    flow_hash,
+    Icmpv6Packet, InterfaceEventMark, IpAddress, IpCidr, IpProtocol, Ipv4Address, Ipv4Cidr,
+    Ipv4Packet, Ipv6Address, Ipv6Cidr, Ipv6Packet, MAX_OUTBOUND_FRAMES, NeighborEntry,
+    NetworkInterface as NetworkDevice, OutboundBatchStatus, Route, RouteTable, RxChecksumOffload,
+    RxFrame, SegmentationOffload, Stack, StackConfig, StackError, StackEvent, StackInstant,
+    TcpCloseKind, TcpConnectState, TcpConnectTerminalError, TcpEndpoint, TcpListenBacklog,
+    TcpPacket, TcpReadIntoState, TcpReadState, UdpEgress, UdpEndpoint, UdpPacket, UdpPayload,
+    UdpSocketBinding, UdpSocketError, flow_hash,
 };
 use spin::{Mutex as SpinMutex, RwLock as SpinRwLock};
 
@@ -749,7 +749,7 @@ where
             // default shard; the mark is taken before the reply is
             // looked for so a reply another processor drains in between
             // does not sleep this task to its deadline.
-            let wait = self.inner.state.default_shard_wait();
+            let wait = self.default_shard_wait();
             self.drive_ping().await?;
             let now_nanos = self.now_nanos();
             match sent_at_nanos {
@@ -904,10 +904,7 @@ where
             // is where the DHCP exchange and the Router Advertisements
             // that answer it demux back to: neither has a flow the hash
             // can name.
-            let wait = self
-                .inner
-                .state
-                .shard_wait(self.inner.state.default_shard_idx());
+            let wait = self.default_shard_wait();
             let ipv4_configured = self
                 .drive_ipv4_configuration()
                 .await
@@ -1054,6 +1051,62 @@ where
         }
     }
 
+    /// Samples everything an operation on `idx` must have marked before
+    /// it inspects that shard.
+    ///
+    /// Callers take this first and inspect afterwards. Both marks in
+    /// the returned wait are older than whatever the caller then looks
+    /// at, so progress made in between resolves the park instead of
+    /// being slept through — the shard's arrival for a frame another
+    /// processor placed, and the interface's event counters for a frame
+    /// still sitting in the ring.
+    fn shard_wait(&self, idx: usize) -> NetworkWait {
+        self.network_wait(idx, self.inner.state.shard_wait(idx))
+    }
+
+    /// The same for a waiter that belongs to no single shard: a
+    /// replicated socket, whose next connection or datagram lands on
+    /// whichever shard its flow hashes to, and the packet pump, which
+    /// produces for every shard at once.
+    ///
+    /// Such a waiter still watches one queue pair — the one this
+    /// processor drains — because the cross-shard hand-off is the
+    /// arrival signal's job, not the device's.
+    fn any_shard_wait(&self) -> NetworkWait {
+        let queue_idx = self
+            .inner
+            .state
+            .shard_idx_for_processor(self.inner.cpu.current_processor());
+        self.network_wait(queue_idx, self.inner.state.any_shard_wait())
+    }
+
+    /// Samples the wait for the shard that owns `handle`.
+    fn shard_wait_for_handle<H: Into<ShardHandle>>(&self, handle: H) -> NetworkWait {
+        self.shard_wait(self.inner.state.shard_idx_for_handle(handle))
+    }
+
+    /// Samples the wait for the shard that unqualified operations run
+    /// on — DHCP, Router Advertisements and ICMP echo replies, none of
+    /// which carry a flow the hash can name.
+    fn default_shard_wait(&self) -> NetworkWait {
+        self.shard_wait(self.inner.state.default_shard_idx())
+    }
+
+    /// Pairs a sampled shard arrival with the interface's event
+    /// counters for the queue pair the wait will watch.
+    ///
+    /// The interface mark is taken here, in the same call, rather than
+    /// at the park: an interrupt raised between the caller's last drain
+    /// and its park would otherwise arm nothing, and a device whose
+    /// receive ring has since filled raises no second one.
+    fn network_wait(&self, queue_idx: usize, shard: ShardWait) -> NetworkWait {
+        NetworkWait {
+            shard,
+            queue_idx,
+            device: self.inner.device.event_mark(queue_idx),
+        }
+    }
+
     /// The wait every caller that parks on a shard takes.
     ///
     /// An operation belongs to exactly one shard, and the progress that
@@ -1064,27 +1117,30 @@ where
     ///   placed a frame in this shard, or by the read that relieved its
     ///   receive backpressure — the cross-task hand-off, and the only
     ///   one that covers work done on a foreign CPU;
-    /// * the device event, which covers transmit completions, link
-    ///   changes and anything else the device reports;
+    /// * the interface event, which covers frames still in the ring,
+    ///   transmit completions, link changes and anything else the
+    ///   device reports;
     /// * `duration`, the caller's own bound — its deadline, the
     ///   interval at which it owes a retransmission, or for the packet
     ///   pump the soonest protocol timer any shard owes.
     ///
     /// `wait` must have been sampled before the caller inspected its
-    /// shard; [`NetworkShardSet::shard_wait`] and its siblings are the
-    /// only way to build one, and an arrival that lands between that
-    /// inspection and this park resolves immediately rather than
-    /// sleeping through the wake. A waiter that belongs to no single
-    /// shard samples the set-wide signal instead: a replicated socket,
-    /// because the shard its next connection or datagram lands on is
-    /// not known until the flow is hashed, and the packet pump, because
-    /// it produces for every shard at once.
-    async fn wait_for_shard_progress(&self, wait: ShardWait, duration: Duration) {
+    /// shard; [`Self::shard_wait`] and its siblings are the only way to
+    /// build one, and progress that lands between that inspection and
+    /// this park resolves immediately rather than sleeping through the
+    /// wake. That is why the interface mark travels inside the wait
+    /// instead of being taken here: a device event armed at the park is
+    /// armed after the caller has already looked.
+    async fn wait_for_shard_progress(&self, wait: NetworkWait, duration: Duration) {
         if duration.is_zero() {
             return;
         }
 
-        let arrival = self.inner.state.arrival_for(wait.target).changed(wait.mark);
+        let arrival = self
+            .inner
+            .state
+            .arrival_for(wait.shard.target)
+            .changed(wait.shard.mark);
         let mut arrival = core::pin::pin!(arrival);
 
         if !self.inner.device.capabilities().events.interrupts {
@@ -1114,7 +1170,7 @@ where
         let event = self
             .inner
             .device
-            .wait_for_event_on(self.event_queue_idx(wait));
+            .wait_for_event_since(wait.queue_idx, wait.device);
         let mut event = core::pin::pin!(event);
         if core::future::poll_fn(|cx| {
             Poll::Ready(arrival.as_mut().poll(cx).is_ready() || event.as_mut().poll(cx).is_ready())
@@ -1140,23 +1196,6 @@ where
             Poll::Pending
         })
         .await;
-    }
-
-    /// The queue pair a wait should watch.
-    ///
-    /// A shard drains the pair with its own index, so an operation on
-    /// one shard watches that pair. A replicated socket has no single
-    /// shard, so it watches the pair this processor drains — the
-    /// cross-shard hand-off is the arrival signal's job, not the
-    /// device's.
-    fn event_queue_idx(&self, wait: ShardWait) -> usize {
-        match wait.target {
-            WaitTarget::Shard(idx) => idx,
-            WaitTarget::AnyShard => self
-                .inner
-                .state
-                .shard_idx_for_processor(self.inner.cpu.current_processor()),
-        }
     }
 
     /// The wait for a caller whose only bound is its own deadline.
@@ -1311,7 +1350,9 @@ mod tests {
     use futures_lite::future::{block_on, poll_once};
     use helios_netstack::RxFrame;
 
-    use crate::test_support::RecordingSmpCpu;
+    use crate::test_support::{
+        RecordingNetworkInterface, RecordingSmpCpu, TestCpu, TestRuntimeState,
+    };
 
     use super::{
         AddressAttemptError, DhcpClientState, HandleSlab, NETWORK_BUSY_POLL_ROUNDS,
@@ -2568,6 +2609,80 @@ mod tests {
         assert!(
             block_on(poll_once(parked.as_mut())).is_none(),
             "a read that was never blocking the pump must not wake it"
+        );
+    }
+
+    /// A service over an interface that reports events and moves no
+    /// frames, which is all the wait needs.
+    fn test_network_service()
+    -> super::NetworkService<TestCpu, TestRuntimeState, RecordingNetworkInterface> {
+        let cpu = TestCpu::without_entropy();
+        let device = RecordingNetworkInterface::new(1);
+        super::NetworkService::new(
+            cpu,
+            TestRuntimeState,
+            crate::Timer::new(cpu),
+            device.clone(),
+        )
+    }
+
+    /// #131: the interface event a park races has to be marked before
+    /// the caller inspects its own state, not when the park is built.
+    ///
+    /// The window is between the last time the caller drained the
+    /// device and the moment it parks, and an interrupt that lands
+    /// inside it is the last one there will be: the frames it announced
+    /// are still in the receive ring, and a device with
+    /// `VIRTIO_RING_F_EVENT_IDX` whose ring has filled raises nothing
+    /// further. Nobody polls the interface after that — no ACKs, no ARP
+    /// replies — which is what the x86 tap lane saw as the host's
+    /// neighbour entry for a live guest going `FAILED` mid-transfer.
+    ///
+    /// So the assertion is that the park is over before it begins: the
+    /// wait is sampled the way every receive samples it, the device
+    /// raises its interrupt afterwards, and the park must not park.
+    #[test]
+    fn an_interface_event_raised_after_the_wait_was_sampled_ends_the_park() {
+        let service = test_network_service();
+        let device = service.inner.device.clone();
+
+        // Sampled first, exactly as `execute_tcp_read_into` samples it
+        // before polling the stack and driving the device.
+        let wait = service.shard_wait(0);
+
+        // The device completes a receive batch on the pair this wait
+        // watches and raises its interrupt — after the caller's last
+        // look, before its park.
+        device.complete_on(0);
+
+        // An hour, so nothing but the event can end this: a blocking
+        // `sock_recv` passes `u64::MAX` and has no bound at all.
+        let mut parked = core::pin::pin!(
+            service.wait_for_shard_progress(wait, core::time::Duration::from_secs(3600))
+        );
+        assert!(
+            block_on(poll_once(parked.as_mut())).is_some(),
+            "an interface event raised between the sample and the park must end it"
+        );
+    }
+
+    /// The other half of the same contract: a wait sampled after the
+    /// device went quiet still parks. A mark that resolved every wait
+    /// would turn the receive path into a spin.
+    #[test]
+    fn a_wait_sampled_after_the_last_event_still_parks() {
+        let service = test_network_service();
+        let device = service.inner.device.clone();
+
+        device.complete_on(0);
+        let wait = service.shard_wait(0);
+
+        let mut parked = core::pin::pin!(
+            service.wait_for_shard_progress(wait, core::time::Duration::from_secs(3600))
+        );
+        assert!(
+            block_on(poll_once(parked.as_mut())).is_none(),
+            "a wait taken after the event has nothing to observe yet"
         );
     }
 

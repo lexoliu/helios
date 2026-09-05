@@ -1,6 +1,6 @@
 use core::future::Future;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 use core::task::{Context, Poll};
 
 use event_listener::{Event, EventListener};
@@ -20,23 +20,35 @@ use event_listener::{Event, EventListener};
 /// that lands between creating the future and first polling it is still
 /// observed rather than lost.
 pub struct Notify {
-    generation: AtomicUsize,
+    generation: AtomicU64,
     event: Event,
 }
 
 pub struct Notified<'a> {
     notify: &'a Notify,
     /// Where the counter stood when this wait began.
-    observed: usize,
+    observed: u64,
     listener: Option<EventListener>,
 }
 
 impl Notify {
     pub const fn new() -> Self {
         Self {
-            generation: AtomicUsize::new(0),
+            generation: AtomicU64::new(0),
             event: Event::new(),
         }
+    }
+
+    /// The counter as it stands now.
+    ///
+    /// For a caller that cannot build the wait yet: one that has to
+    /// decide *what* it is waiting for first, or that hands the sample
+    /// across an abstraction boundary and only parks on the far side.
+    /// It passes the sample back to [`Self::notified_since`], and gets
+    /// the same guarantee [`Self::notified`] gives — the counter was
+    /// read before the caller tested its own state.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
     }
 
     /// Waits for the device's next notification.
@@ -45,9 +57,19 @@ impl Notify {
     /// may create the future before re-testing what it is waiting for
     /// and still observe a notification that arrives in between.
     pub fn notified(&self) -> Notified<'_> {
+        self.notified_since(self.generation())
+    }
+
+    /// Waits for a notification past `observed`.
+    ///
+    /// Ready at once when the counter has already moved, which is the
+    /// whole point: the sample is taken before the caller tests its own
+    /// state, so a notification raised in between ends the wait instead
+    /// of being slept through.
+    pub fn notified_since(&self, observed: u64) -> Notified<'_> {
         Notified {
             notify: self,
-            observed: self.generation.load(Ordering::Acquire),
+            observed,
             listener: None,
         }
     }
@@ -132,6 +154,18 @@ mod tests {
         let notify = Notify::new();
         let mut waiter = pin!(notify.notified());
         notify.notify_all();
+        assert!(poll_once(waiter.as_mut()));
+    }
+
+    #[test]
+    fn a_mark_taken_before_a_notification_observes_it() {
+        // The sample a caller takes before it tests its own state, and
+        // the wait it builds from that sample afterwards. The device
+        // moved in between; the wait must be over before it starts.
+        let notify = Notify::new();
+        let mark = notify.generation();
+        notify.notify_all();
+        let mut waiter = pin!(notify.notified_since(mark));
         assert!(poll_once(waiter.as_mut()));
     }
 

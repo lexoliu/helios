@@ -25,6 +25,7 @@ use alloc::vec::Vec;
 use async_lock::Mutex as AsyncMutex;
 use bytes::Bytes;
 use core::cell::UnsafeCell;
+use core::future::Future;
 use core::mem::size_of;
 use core::ops::Range;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -32,8 +33,9 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use helios_hal::io::{IoError, IoResult};
 use helios_netstack::{
     ChecksumOffload, DEFAULT_POLL_BUDGET, EventDeliveryCapabilities, FlowHash,
-    InterfaceCapabilities, LinkState, QueueTopology, RSS_INDIRECTION_ENTRIES, RSS_KEY_BYTES,
-    RxChecksumReport, RxFrameOffload, STANDARD_RSS_KEY, SegmentationOffload, rss_indirection_entry,
+    InterfaceCapabilities, InterfaceEventMark, LinkState, QueueTopology, RSS_INDIRECTION_ENTRIES,
+    RSS_KEY_BYTES, RxChecksumReport, RxFrameOffload, STANDARD_RSS_KEY, SegmentationOffload,
+    rss_indirection_entry,
 };
 use spin::Mutex as SpinMutex;
 
@@ -2015,32 +2017,59 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         Ok(Some(submitted))
     }
 
-    /// Waits for progress on one queue pair, or for anything the device
-    /// reports that belongs to no pair.
+    /// Samples the counters a queue pair's waiter races against: the
+    /// pair's own interrupts and the device-wide ones that belong to no
+    /// pair.
+    ///
+    /// Taken before the caller inspects whatever it means to wait for.
+    /// The sample is what makes the wait safe to build afterwards, and
+    /// the reason it is a separate call is that the decision of *what*
+    /// to wait for happens above this driver.
+    pub fn interrupt_mark(&self, pair_idx: usize) -> InterfaceEventMark {
+        let pair_idx = self.normalize_pair_idx(pair_idx);
+        InterfaceEventMark {
+            queue: self.queue_pairs[pair_idx].interrupts.generation(),
+            device: self.interrupts.generation(),
+        }
+    }
+
+    /// Waits for progress on one queue pair past `mark`, or for
+    /// anything the device reports that belongs to no pair.
     ///
     /// An operation belongs to one shard, which drains one pair, so this
     /// is what its wait parks on: a completion on another pair is not
     /// progress it can use, and waking for it would cost the same as
     /// waking the task that did make progress.
-    pub async fn wait_for_interrupt_on(&self, pair_idx: usize) {
+    ///
+    /// The two listeners are armed here, against `mark`, and not inside
+    /// the future this returns: an interrupt raised between the
+    /// caller's last drain and its park is then already past the mark,
+    /// and the wait is over before it begins. Arming at first poll
+    /// instead loses that interrupt, and with `VIRTIO_RING_F_EVENT_IDX`
+    /// negotiated a device whose receive ring has filled raises no
+    /// second one.
+    pub fn wait_for_interrupt_since(
+        &self,
+        pair_idx: usize,
+        mark: InterfaceEventMark,
+    ) -> impl Future<Output = ()> + Send + '_ {
         let pair_idx = self.normalize_pair_idx(pair_idx);
-        let pair = self.queue_pairs[pair_idx].interrupts.notified();
-        let mut pair = core::pin::pin!(pair);
-        let device = self.interrupts.notified();
-        let mut device = core::pin::pin!(device);
-        core::future::poll_fn(|cx| {
-            use core::future::Future;
-            use core::task::Poll;
-            if pair.as_mut().poll(cx).is_ready() || device.as_mut().poll(cx).is_ready() {
-                return Poll::Ready(());
-            }
-            Poll::Pending
-        })
-        .await;
-    }
-
-    pub async fn wait_for_interrupt(&self) {
-        self.interrupts.notified().await;
+        let pair = self.queue_pairs[pair_idx]
+            .interrupts
+            .notified_since(mark.queue);
+        let device = self.interrupts.notified_since(mark.device);
+        async move {
+            let mut pair = core::pin::pin!(pair);
+            let mut device = core::pin::pin!(device);
+            core::future::poll_fn(|cx| {
+                use core::task::Poll;
+                if pair.as_mut().poll(cx).is_ready() || device.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(());
+                }
+                Poll::Pending
+            })
+            .await;
+        }
     }
 
     fn rx_bytes_from_slot(&self, pair_idx: usize, slot_index: u16, range: Range<usize>) -> Bytes {

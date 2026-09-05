@@ -87,7 +87,7 @@ where
             // between resolves the wait instead of being slept through —
             // the exact case that made `--smp 4` DNS lookups time out
             // while the per-operation wait was a device-event wait.
-            let wait = self.inner.state.shard_wait(socket.shard_idx);
+            let wait = self.shard_wait(socket.shard_idx);
             self.drive_dns().await?;
             let now = StackInstant::from_nanos(self.now_nanos());
             let mut shard = self.inner.state.shard_at(socket.shard_idx).lock();
@@ -263,10 +263,7 @@ where
         loop {
             // The lease is negotiated on the default shard, which is
             // where the offer demuxes back to.
-            let wait = self
-                .inner
-                .state
-                .shard_wait(self.inner.state.default_shard_idx());
+            let wait = self.default_shard_wait();
             self.drive_network(NetworkPollSource::Configuration)
                 .await
                 .map_err(|_| NetworkControlError::BackendFault)?;
