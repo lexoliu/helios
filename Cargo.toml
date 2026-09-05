@@ -103,5 +103,13 @@ debug = 2
 [profile.release]
 panic = "abort"
 
+# The instrumented kernel of docs/pgo.md: an optimised build that also
+# carries LLVM's counters. The instrumentation itself comes from rustflags,
+# which are not a profile setting; `helios-inspector vm --profile-generate`
+# adds them and this profile keeps the artifacts in a directory of their own,
+# so an instrumented image and a plain one never overwrite each other.
+[profile.profile-generate]
+inherits = "release"
+
 [lints]
 workspace = true

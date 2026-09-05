@@ -16,3 +16,5 @@ pub const PROFILING_SET_ENABLED: &str = "set-enabled";
 pub const PROFILING_CLEAR: &str = "clear";
 pub const PROFILING_FOLDED: &str = "folded";
 pub const PROFILING_METRICS: &str = "metrics";
+pub const PROFILING_RAW_PROFILE_SIZE: &str = "raw-profile-size";
+pub const PROFILING_RAW_PROFILE_READ: &str = "raw-profile-read";

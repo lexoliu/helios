@@ -2,9 +2,9 @@
 
 Issue #28 asks whether the benchmark suite can feed profile-guided
 optimisation of (a) the bare-metal kernel and (b) the AOT compiler
-plugin. This page records what was checked, on which toolchain, and the
-verdict for each path. Nothing here was implemented: neither path is
-straightforward, and the blockers below are filed as issues.
+plugin. This page records what was checked, on which toolchain, and where
+each path stands. Path (a) is implemented and is described below as it
+works today; path (b) is not, and its blocker is filed as an issue.
 
 Toolchain examined: `rustc 1.98.0-nightly (3daae5e42 2026-06-14)`,
 LLVM 22.1.6 (`rust-toolchain.toml`), vendored Wasmtime
@@ -40,44 +40,132 @@ Evidence on this toolchain:
   can be instrumented without compiler-rt if Helios provides its own
   runtime.
 
-### What an in-kernel runtime would be
+### The in-kernel runtime
 
-1. Build the kernel with `-C profile-generate -Z no-profiler-runtime`
-   (per-target `rustflags` in `.cargo/config.toml`), defining
-   `__llvm_profile_runtime` in `kernel/` so the linker is satisfied. The
-   instrumentation itself is target-independent: counters are plain
-   loads/stores into `__llvm_prf_cnts`.
-2. Keep the sections: `link.x` currently lists no `__llvm_prf_*` input
-   sections, so they would be placed by default rules and could be
-   dropped by `--gc-sections`. The linker script needs `KEEP` for
-   `__llvm_prf_cnts`, `__llvm_prf_data`, `__llvm_prf_names`,
-   `__llvm_prf_vnds` (and `__llvm_prf_bits` for the newer coverage bits)
-   with `__start_`/`__stop_` symbols for each.
-3. Write a `.profraw`: a header (magic, version, counter/data/name section
-   sizes and deltas), followed by the raw section bytes, in the format
-   LLVM 22's `llvm-profdata` reads. The format carries a version field
-   and changes between LLVM releases; the writer must assert the version
-   it implements against `rustc -vV`'s LLVM.
-4. Get it out of the guest. Two transports exist today: the debugger's
-   `helios:system/profiling` interface, which streams folded samples to the
-   inspector over the serial or vsock RPC (`docs/inspector-vsock.md`), and
-   the host share. A `profiling.llvm-raw-profile` call returning the bytes
-   fits the existing RPC and needs no filesystem; the inspector writes the
-   file and runs `llvm-profdata merge`.
-5. Size: one 8-byte counter per instrumented region. The kernel links
-   Wasmtime, Cranelift and the netstack, so the counter section is in the
-   low tens of megabytes for a `--release` kernel; it must live in
-   kernel-owned memory that is reserved at link time, not allocated at
-   runtime, and it doubles as a fixed cost on every instrumented boot.
-6. Compile-time counter updates in the kernel's hot paths (the executor,
-   the virtio queues, the netstack's per-packet path) are not free and
-   change scheduling; the suite would run the instrumented kernel only to
-   collect profiles, never to report numbers.
+`-C profile-generate` on the kernel is a build profile, a runtime in
+`kernel/`, a linker-script fragment per target, an export and a CI job.
+Every piece is below, and none of them exists in a plain kernel: the
+runtime and the writer are compiled only under `--cfg
+helios_profile_generate`, the linker fragments are passed only by the
+instrumented build, and a plain kernel answers the export with
+`not-instrumented` rather than an empty profile a merge would take for a
+workload that ran nothing.
 
-Verdict: feasible, not straightforward. It is a kernel feature (a
-runtime, a linker-script change, a WIT call, an inspector command and a
-CI job), not a benchmark-tooling change, and every piece is pinned to the
-LLVM raw-profile version.
+#### Building one
+
+```bash
+just build-instrumented x86-64      # aarch64, riscv64, x86-64
+helios-inspector vm --arch x86-64 --profile-generate --accel kvm shell
+```
+
+`just build-instrumented` is the inspector's own `vm --profile-generate
+build`, so the flags have one definition (`inspector/src/vm.rs`,
+`profile_generate_rustflags`) and a check and a boot cannot disagree
+about what an instrumented kernel is. The build differs from `--release`
+by the `profile-generate` cargo profile — release, in a target directory
+of its own — and by four rustflags:
+
+| Flag | Why |
+| --- | --- |
+| `-C profile-generate` | emits the counters and the `__llvm_prf_*` sections |
+| `-Z no-profiler-runtime` | keeps rustc from injecting compiler-rt's runtime, which assumes a libc |
+| `-C llvm-args=-disable-vp=true` | turns value profiling off, see below |
+| `--cfg helios_profile_generate` | compiles the kernel's own runtime, in the same flags that emit the instrumentation |
+
+They arrive as one `cargo --config` override rather than through
+`RUSTFLAGS`, because cargo *joins* a `--config` array with the one
+`.cargo/config.toml` sets for the same target while the environment
+variable would *replace* it, costing the target its link arguments and
+its ISA features.
+
+Value profiling is off deliberately. It calls
+`__llvm_profile_instrument_target` on every indirect call, allocates a
+node per new call target, and makes the profile's length depend on what
+has executed — which the size-then-window export below could not
+describe without freezing the guest. The profile is therefore a
+counter profile: `llvm-profdata` reads it, `-C profile-use` consumes it,
+and the one optimisation it cannot drive is indirect-call promotion.
+
+#### The runtime, in `kernel/src/profiling`
+
+`__llvm_profile_runtime` is defined there — a definition is all any
+instrumented object wants of it — and so is the `.profraw` writer. The
+module allocates nothing: the counters live in the sections the linker
+reserved, and the writer serialises the image a window at a time out of
+them.
+
+The format is pinned to the toolchain, not guessed at. Every object
+rustc instruments carries `__llvm_profile_raw_version`, the version word
+LLVM's own runtime would have written; the writer refuses to produce a
+byte unless it equals the version it implements — 10, with the
+IR-instrumentation variant bit, on the pinned nightly's LLVM 22.1.6.
+A toolchain bump that changes the raw format therefore fails loudly at
+the export instead of writing a file `llvm-profdata` misreads.
+
+#### Keeping the sections
+
+`aarch64/profile-generate.ld` and `riscv/profile-generate.x` place
+`__llvm_prf_data`, `__llvm_prf_names`, `__llvm_prf_vnds`,
+`__llvm_prf_bits` and `__llvm_prf_cnts` with `KEEP` and define a
+`__start_`/`__stop_` pair for each. Both targets bring their own linker
+script, so the sections have to be placed: on riscv64 an orphan would
+land outside `__sdata .. __edata`, the window `_start` copies from the
+image, and the per-function records — which carry link-time relative
+pointers, not zeroes — would never reach RAM. The fragments are added
+with an extra `-T` by the instrumented build alone, so a plain image is
+byte-for-byte what the base script produces.
+
+`x86_64-unknown-none` has no fragment and needs none: it links with
+LLD's own layout, which places the sections as ordinary orphans, keeps
+them under `--gc-sections` because their `__start_`/`__stop_` symbols are
+referenced (LLD's default `-z nostart-stop-gc`), and synthesises those
+symbols itself.
+
+#### Getting it out of the guest
+
+`helios:system/profiling` gained two calls, `raw-profile-size` and
+`raw-profile-read`, and the guest debugger forwards both over the
+existing inspector RPC. The length is fixed by the link rather than by
+what has executed, so a reader asks once and then walks the image while
+the kernel keeps counting — the same property that lets compiler-rt dump
+a profile from a running process. Each read is capped
+(`helios_kernel::MAX_PROFILE_READ`), which bounds the one transient
+buffer the export lowers into the guest.
+
+On the host:
+
+```bash
+# collect and stop
+helios-inspector vm --arch x86-64 --profile-generate --accel kvm \
+    profile target/pgo/boot.profraw
+
+# collect after a workload
+helios-inspector vm --arch x86-64 --profile-generate --accel kvm \
+    aot-bench artifacts/wasi-tools/curl.wasm --iterations 2 \
+    --llvm-raw-profile-output target/pgo/aot-bench.profraw
+```
+
+Both write the raw profile and run `llvm-profdata merge` beside it. The
+tool is looked up before the guest is asked for a byte, and a host
+without it is told exactly what is missing: `rustup component add
+llvm-tools` puts `llvm-profdata` in
+`$(rustc --print target-libdir)/../bin`, and its LLVM is the one that
+matches the instrumentation.
+
+#### Collecting in CI
+
+`bench-suite.yml` has a `profile-generate` job: it builds the
+instrumented x86-64 kernel, runs the compiler workload and the suite's
+non-network classes on it under KVM, merges every `.profraw` and uploads
+one `helios-kernel.profdata`. It reports no numbers and it is not a
+benchmark surface — counter updates in the executor, the virtio queues
+and the netstack's per-packet path change scheduling, so anything timed
+on an instrumented kernel would be measuring the counters. The network
+class is not in the profile yet: it needs the privileged tap backend the
+suite lane provisions.
+
+Consuming the profile with `-C profile-use` is the next step and is not
+wired up: the collected artifact is what makes it possible to try.
 
 ### Sample-based alternative already within reach
 
@@ -123,6 +211,7 @@ Cranelift's output is limited to block layout. Not implemented.
 
 - #70: in-kernel `-C profile-generate` runtime with `-Z no-profiler-runtime`,
   the linker-script sections, the raw-profile writer and the export call.
+  Implemented; described above.
 - #71: branch-hint feedback for the compiler plugin: instrumenting the
   suite's wasm inputs, writing `metadata.code.branch_hint`, and re-hinting
   in `build.sh`.

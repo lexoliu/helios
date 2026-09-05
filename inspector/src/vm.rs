@@ -30,6 +30,7 @@ use crate::{SessionCommand, connect_client, run_connected};
 mod network;
 mod qemu;
 mod qmp;
+mod raw_profile;
 
 use network::{
     HostPlatform, NetSetupCommand, NetTeardownCommand, QemuNetArgs, VmNetwork, VmNetworkArgs,
@@ -37,6 +38,7 @@ use network::{
 };
 use qemu::QemuOptions;
 use qmp::QmpClient;
+use raw_profile::ProfileCommand;
 
 const DEFAULT_BAUD: u32 = 115_200;
 const DEFAULT_AARCH64_QEMU_BIN: &str = "qemu-system-aarch64";
@@ -183,6 +185,69 @@ pub(crate) enum VmRpcTransport {
     Vsock,
 }
 
+/// Which build of the kernel image a session boots.
+///
+/// The four are exclusive by construction rather than by a rule spread over
+/// booleans: each names one cargo profile, one `target/<triple>/` directory,
+/// and whether the image carries LLVM instrumentation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum KernelBuildProfile {
+    /// Cargo's `dev` profile, the default.
+    #[default]
+    Debug,
+    /// `kernel-debug`: debuginfo and unstripped symbols for GDB and LLDB.
+    KernelDebug,
+    /// `release`.
+    Release,
+    /// `profile-generate`: release plus `-C profile-generate`, the image a
+    /// PGO collection boots (docs/pgo.md).
+    ProfileGenerate,
+}
+
+impl KernelBuildProfile {
+    /// The `target/<triple>/` subdirectory the artifacts land in.
+    fn directory(self) -> &'static str {
+        match self {
+            Self::Debug => "debug",
+            Self::KernelDebug => "kernel-debug",
+            Self::Release => "release",
+            Self::ProfileGenerate => "profile-generate",
+        }
+    }
+
+    /// Whether the guest image this profile builds is an optimised one.
+    fn optimised(self) -> bool {
+        matches!(self, Self::Release | Self::ProfileGenerate)
+    }
+
+    /// Whether the image carries LLVM instrumentation.
+    fn instrumented(self) -> bool {
+        matches!(self, Self::ProfileGenerate)
+    }
+
+    /// The profile the guest programs of the bootfs are built with.
+    ///
+    /// `helios-cli kernel-prebuild` knows two: an optimised one and a
+    /// debug one. Nothing instruments the guest programs — the profile
+    /// being collected is the kernel's — so an instrumented kernel boots
+    /// the same optimised user space a release kernel does.
+    fn guest_programs(self) -> &'static str {
+        if self.optimised() { "release" } else { "debug" }
+    }
+
+    /// The profile the host tools built alongside the guest use. They are
+    /// never instrumented — nothing profiles the inspector — and they are
+    /// found next to the running binary, so they stay in the two
+    /// directories a host build ever uses.
+    fn host(self) -> Self {
+        if self.optimised() {
+            Self::Release
+        } else {
+            Self::Debug
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct VmProfile {
     arch: VmArch,
@@ -213,6 +278,17 @@ struct VmProfile {
     /// How this profile would attach a vsock device, when a session asks
     /// for the vsock RPC transport.
     vsock: VmVsockProfile,
+    /// Linker script fragment that places this target's LLVM
+    /// instrumentation sections, for `--profile-generate` builds.
+    ///
+    /// `x86_64-unknown-none` has none: it links with LLD's own layout,
+    /// which places the `__llvm_prf_*` sections as ordinary orphans, keeps
+    /// them under `--gc-sections` because their `__start_`/`__stop_`
+    /// symbols are referenced, and synthesises those symbols itself. The
+    /// two targets that bring their own linker script have to say where
+    /// the sections go, or the counters land outside the image the boot
+    /// code loads (docs/pgo.md).
+    profile_generate_linker_script: Option<&'static str>,
 }
 
 /// The `virt` machine as the aarch64 kernel boots it by default: EDK2
@@ -253,6 +329,7 @@ const AARCH64_VIRT_HVF_PROFILE: VmProfile = VmProfile {
     iommu: None,
     balloon: VmBalloonProfile::VirtioBalloonMmio,
     vsock: VmVsockProfile::VhostVsockMmio,
+    profile_generate_linker_script: Some("aarch64/profile-generate.ld"),
 };
 
 #[cfg(test)]
@@ -282,6 +359,7 @@ const AARCH64_VIRT_TCG_PROFILE: VmProfile = VmProfile {
     iommu: None,
     balloon: VmBalloonProfile::VirtioBalloonMmio,
     vsock: VmVsockProfile::VhostVsockMmio,
+    profile_generate_linker_script: Some("aarch64/profile-generate.ld"),
 };
 
 const RISCV64_VM_PROFILE: VmProfile = VmProfile {
@@ -310,6 +388,7 @@ const RISCV64_VM_PROFILE: VmProfile = VmProfile {
     iommu: None,
     balloon: VmBalloonProfile::VirtioBalloonMmio,
     vsock: VmVsockProfile::VhostVsockMmio,
+    profile_generate_linker_script: Some("riscv/profile-generate.x"),
 };
 
 const X86_64_VM_PROFILE: VmProfile = VmProfile {
@@ -335,6 +414,7 @@ const X86_64_VM_PROFILE: VmProfile = VmProfile {
     iommu: Some(VmIommuProfile::VirtioIommuPci),
     balloon: VmBalloonProfile::VirtioBalloonPci,
     vsock: VmVsockProfile::VhostVsockPci,
+    profile_generate_linker_script: None,
 };
 
 /// Virtqueue ring layout the inspector asks every virtio device for.
@@ -434,6 +514,8 @@ pub(crate) struct VmConfigFile {
     #[serde(default)]
     pub(crate) release: Option<bool>,
     #[serde(default)]
+    pub(crate) profile_generate: Option<bool>,
+    #[serde(default)]
     pub(crate) kernel_debug: Option<bool>,
     #[serde(default)]
     pub(crate) qemu_bin: Option<PathBuf>,
@@ -504,6 +586,14 @@ pub(crate) struct VmCommand {
 
     #[arg(long, default_value_t = false)]
     release: bool,
+
+    /// Build an instrumented kernel: release plus `-C profile-generate`,
+    /// whose profile the `profile` action collects (docs/pgo.md).
+    ///
+    /// An instrumented kernel counts every branch it takes, so it is a
+    /// collection artifact and never a measurement one.
+    #[arg(long, default_value_t = false, conflicts_with_all = ["release", "debug", "kernel_debug"])]
+    profile_generate: bool,
 
     /// Build the kernel with debuginfo and unstripped symbols for GDB/LLDB.
     #[arg(long, default_value_t = false, conflicts_with = "release")]
@@ -670,6 +760,11 @@ enum VmSessionCommand {
     /// no `--boot-program` the bootfs carries every program, which is
     /// the superset every workload class boots from.
     Build,
+    /// Write the guest kernel's LLVM raw profile and merge it.
+    ///
+    /// Only an instrumented kernel (`--profile-generate`) carries one; any
+    /// other says so rather than handing back an empty profile.
+    Profile(ProfileCommand),
     /// Provision the privileged host state a network backend needs.
     NetSetup(NetSetupCommand),
     /// Remove the host state `net-setup` provisioned.
@@ -735,13 +830,18 @@ struct AotBenchCommand {
     /// Write structured kernel/user perf metrics collected during the AOT run.
     #[arg(long)]
     perf_metrics_output: Option<PathBuf>,
+
+    /// Write the guest kernel's LLVM raw profile after the run, and the
+    /// `llvm-profdata merge` of it beside the file. Only an instrumented
+    /// kernel (`--profile-generate`) carries one (docs/pgo.md).
+    #[arg(long)]
+    llvm_raw_profile_output: Option<PathBuf>,
 }
 
 #[derive(Debug)]
 struct ResolvedVmCommand {
     profile: &'static VmProfile,
-    release: bool,
-    kernel_debug: bool,
+    build: KernelBuildProfile,
     qemu_bin: PathBuf,
     kernel: PathBuf,
     socket: Option<PathBuf>,
@@ -789,6 +889,7 @@ enum ResolvedVmSessionCommand {
     AotBench(AotBenchCommand),
     WorkloadBench(WorkloadBenchCommand),
     Balloon(BalloonCommand),
+    Profile(ProfileCommand),
 }
 
 pub(crate) fn run(mut command: VmCommand) -> Result<()> {
@@ -829,17 +930,32 @@ fn resolve(command: VmCommand) -> Result<ResolvedVmCommand> {
     let profile = arch.profile();
     let debug = command.debug || file.debug.unwrap_or(false);
     let release = command.release || file.release.unwrap_or(false);
+    let profile_generate = command.profile_generate || file.profile_generate.unwrap_or(false);
     let kernel_debug = debug || command.kernel_debug || file.kernel_debug.unwrap_or(false);
     if release && kernel_debug {
         bail!("--release and --kernel-debug cannot be used together");
     }
+    if profile_generate && (release || kernel_debug) {
+        bail!(
+            "--profile-generate builds its own optimised kernel and cannot be combined with --release, --debug or --kernel-debug"
+        );
+    }
+    let build = if profile_generate {
+        KernelBuildProfile::ProfileGenerate
+    } else if release {
+        KernelBuildProfile::Release
+    } else if kernel_debug {
+        KernelBuildProfile::KernelDebug
+    } else {
+        KernelBuildProfile::Debug
+    };
     let qemu_bin = command
         .qemu_bin
         .or(file.qemu_bin)
         .unwrap_or_else(|| PathBuf::from(profile.qemu_bin));
     let kernel = match command.kernel.or(file.kernel) {
         Some(kernel) => kernel,
-        None => default_kernel_path(arch, build_profile_dir(release, kernel_debug))?,
+        None => default_kernel_path(arch, build.directory())?,
     };
     let smp = command.smp.or(file.smp).unwrap_or(profile.default_smp);
     let memory = command
@@ -972,8 +1088,7 @@ fn resolve(command: VmCommand) -> Result<ResolvedVmCommand> {
 
     Ok(ResolvedVmCommand {
         profile,
-        release,
-        kernel_debug,
+        build,
         qemu_bin,
         kernel,
         socket: command.socket,
@@ -1189,14 +1304,14 @@ fn build_vm(command: &ResolvedVmCommand) -> Result<()> {
     let repo_root = repo_root()?;
     run_step(
         "building helios-cli",
-        cargo_build_command(&repo_root, command.release, false)
+        cargo_build_command(&repo_root, command.build.host())
             .arg("-p")
             .arg("helios-cli"),
     )?;
     let prebuild_manifest = run_kernel_prebuild(command)?;
     run_step(
         &format!("building {} kernel", arch_label(command.profile.arch)),
-        cargo_build_command(&repo_root, command.release, command.kernel_debug)
+        kernel_build_command(&repo_root, command)
             .env("HELIOS_KERNEL_PREBUILD_MANIFEST", &prebuild_manifest)
             .arg("--target")
             .arg(command.profile.cargo_target)
@@ -1205,22 +1320,80 @@ fn build_vm(command: &ResolvedVmCommand) -> Result<()> {
     )?;
     run_step(
         "building inspector",
-        cargo_build_command(&repo_root, command.release, false)
+        cargo_build_command(&repo_root, command.build.host())
             .arg("-p")
             .arg("helios-inspector"),
     )?;
     Ok(())
 }
 
-fn cargo_build_command(repo_root: &Path, release: bool, kernel_debug: bool) -> Command {
+fn cargo_build_command(repo_root: &Path, build: KernelBuildProfile) -> Command {
     let mut command = Command::new("cargo");
     command.current_dir(repo_root).arg("build");
-    if release {
-        command.arg("--release");
-    } else if kernel_debug {
-        command.arg("--profile").arg("kernel-debug");
+    match build {
+        KernelBuildProfile::Debug => {}
+        KernelBuildProfile::KernelDebug => {
+            command.arg("--profile").arg("kernel-debug");
+        }
+        KernelBuildProfile::Release => {
+            command.arg("--release");
+        }
+        KernelBuildProfile::ProfileGenerate => {
+            command.arg("--profile").arg("profile-generate");
+        }
     }
     command
+}
+
+/// The cargo invocation that builds the guest image itself.
+///
+/// An instrumented build differs from every other one by its rustflags, and
+/// they arrive as a `--config` override rather than through `RUSTFLAGS`:
+/// cargo joins a `--config` array with the one `.cargo/config.toml` sets for
+/// the same target, where the environment variable would replace it and cost
+/// the target its link arguments and ISA features.
+fn kernel_build_command(repo_root: &Path, command: &ResolvedVmCommand) -> Command {
+    let mut cargo = cargo_build_command(repo_root, command.build);
+    if command.build.instrumented() {
+        cargo
+            .arg("--config")
+            .arg(profile_generate_rustflags(command.profile));
+    }
+    cargo
+}
+
+/// The `--config` override that turns a kernel build into an instrumented
+/// one, for the target this profile boots.
+fn profile_generate_rustflags(profile: &VmProfile) -> String {
+    let mut flags = vec![
+        // rustc would satisfy `__llvm_profile_runtime` by injecting
+        // compiler-rt's profile runtime, which assumes a libc; the kernel
+        // defines the symbol and writes the profile itself
+        // (`kernel/src/profiling`).
+        "-C".to_owned(),
+        "profile-generate".to_owned(),
+        "-Z".to_owned(),
+        "no-profiler-runtime".to_owned(),
+        // Value profiling calls the runtime on every indirect call and
+        // grows the profile as new call targets appear, which the kernel's
+        // window-at-a-time export cannot describe (docs/pgo.md).
+        "-C".to_owned(),
+        "llvm-args=-disable-vp=true".to_owned(),
+        // Gates the kernel's profile runtime on the same flags that emit the
+        // instrumentation, so the two can never be built apart.
+        "--cfg".to_owned(),
+        "helios_profile_generate".to_owned(),
+    ];
+    if let Some(script) = profile.profile_generate_linker_script {
+        flags.push("-C".to_owned());
+        flags.push(format!("link-arg=-T{script}"));
+    }
+    // The array is serialised rather than spelled out, so a flag that needs
+    // quoting cannot silently produce a config cargo misreads.
+    let flags = toml::Value::try_from(flags)
+        .expect("a list of strings is a TOML array")
+        .to_string();
+    format!("target.\"{}\".rustflags={flags}", profile.cargo_target)
 }
 
 fn run_kernel_prebuild(command: &ResolvedVmCommand) -> Result<PathBuf> {
@@ -1230,7 +1403,7 @@ fn run_kernel_prebuild(command: &ResolvedVmCommand) -> Result<PathBuf> {
         .join("target")
         .join("kernel-prebuild")
         .join(command.profile.cargo_target)
-        .join(build_profile_dir(command.release, command.kernel_debug));
+        .join(command.build.directory());
     let mut prebuild = Command::new(&cli);
     prebuild
         .current_dir(&repo_root)
@@ -1240,7 +1413,7 @@ fn run_kernel_prebuild(command: &ResolvedVmCommand) -> Result<PathBuf> {
         .arg("--target")
         .arg(command.profile.cargo_target)
         .arg("--profile")
-        .arg(build_profile_dir(command.release, command.kernel_debug))
+        .arg(command.build.guest_programs())
         .arg("--cargo")
         .arg("cargo");
     for program in &command.boot_programs {
@@ -1308,7 +1481,7 @@ fn connect_and_run(command: &ResolvedVmCommand, runtime: &mut VmRuntime) -> Resu
             workload_command,
             VmProvenance {
                 arch: arch_label(command.profile.arch),
-                release: command.release,
+                release: command.build.optimised(),
                 smp: command.smp,
                 memory: command.memory.clone(),
                 cpu: command.cpu.clone(),
@@ -1320,6 +1493,9 @@ fn connect_and_run(command: &ResolvedVmCommand, runtime: &mut VmRuntime) -> Resu
                 "the balloon command needs a QMP socket; pass --qmp unix:<path>,server=on,wait=off",
             )?;
             run_balloon(client, balloon, &socket)
+        }
+        Some(ResolvedVmSessionCommand::Profile(profile)) => {
+            crate::run_interruptible(async move { raw_profile::run(&client, &profile).await })
         }
         Some(ResolvedVmSessionCommand::Session(command)) => run_connected(client, Some(command)),
         None => run_connected(client, None),
@@ -1536,6 +1712,9 @@ fn run_workload_bench(
             .await?;
             write_requested_profile_outputs(&command, &before_profile, &after_profile, &metrics)?;
         }
+        if let Some(output) = command.llvm_raw_profile_output() {
+            raw_profile::collect_beside(&client, output).await?;
+        }
         Ok(())
     })
 }
@@ -1665,6 +1844,9 @@ fn run_aot_bench(mut client: crate::serial::RpcClient, command: AotBenchCommand)
                 .context("failed to read final remote perf metrics")?;
             write_requested_profile_outputs(&command, &before_profile, &after_profile, &metrics)?;
         }
+        if let Some(output) = command.llvm_raw_profile_output() {
+            raw_profile::collect_beside(&client, output).await?;
+        }
         Ok(())
     })
 }
@@ -1674,9 +1856,16 @@ trait ProfileOutputRequest {
     fn kernel_profile_output(&self) -> Option<&Path>;
     fn user_profile_output(&self) -> Option<&Path>;
     fn perf_metrics_output(&self) -> Option<&Path>;
+    /// Where the guest kernel's own LLVM raw profile is written, when the
+    /// run is collecting one.
+    fn llvm_raw_profile_output(&self) -> Option<&Path>;
 }
 
 impl ProfileOutputRequest for AotBenchCommand {
+    fn llvm_raw_profile_output(&self) -> Option<&Path> {
+        self.llvm_raw_profile_output.as_deref()
+    }
+
     fn profile_output(&self) -> Option<&Path> {
         self.profile_output.as_deref()
     }
@@ -1695,6 +1884,10 @@ impl ProfileOutputRequest for AotBenchCommand {
 }
 
 impl ProfileOutputRequest for WorkloadBenchCommand {
+    fn llvm_raw_profile_output(&self) -> Option<&Path> {
+        self.llvm_raw_profile_output.as_deref()
+    }
+
     fn profile_output(&self) -> Option<&Path> {
         self.profile_output.as_deref()
     }
@@ -2389,16 +2582,6 @@ fn repo_root() -> Result<PathBuf> {
     Ok(WorkspaceRoot::resolve(None)?.path().to_path_buf())
 }
 
-fn build_profile_dir(release: bool, kernel_debug: bool) -> &'static str {
-    if release {
-        "release"
-    } else if kernel_debug {
-        "kernel-debug"
-    } else {
-        "debug"
-    }
-}
-
 fn default_kernel_path(arch: VmArch, profile_dir: &str) -> Result<PathBuf> {
     let profile = arch.profile();
     Ok(repo_root()?
@@ -2765,6 +2948,7 @@ impl From<VmSessionCommand> for ResolvedVmSessionCommand {
             VmSessionCommand::AotBench(command) => Self::AotBench(command),
             VmSessionCommand::WorkloadBench(command) => Self::WorkloadBench(command),
             VmSessionCommand::Balloon(command) => Self::Balloon(command),
+            VmSessionCommand::Profile(command) => Self::Profile(command),
             VmSessionCommand::Build
             | VmSessionCommand::NetSetup(_)
             | VmSessionCommand::NetTeardown(_) => {
@@ -3109,8 +3293,7 @@ mod tests {
             vsock_cid: None,
             arch: VmArch::X86_64,
             debug: false,
-            release: false,
-            kernel_debug: false,
+            build: KernelBuildProfile::Debug,
             config: None,
             qemu_bin: None,
             kernel: None,
@@ -3160,8 +3343,7 @@ mod tests {
             vsock_cid: None,
             arch: VmArch::X86_64,
             debug: false,
-            release: false,
-            kernel_debug: false,
+            build: KernelBuildProfile::Debug,
             config: Some(missing_config),
             qemu_bin: None,
             kernel: None,
@@ -3202,7 +3384,7 @@ mod tests {
 
         let resolved = resolve(command).expect("VM command resolution must succeed");
         assert_eq!(resolved.profile, &X86_64_VM_PROFILE);
-        assert!(!resolved.release);
+        assert_eq!(resolved.build, KernelBuildProfile::Debug);
         assert_eq!(resolved.smp, DEFAULT_X86_SMP);
         assert_eq!(resolved.memory, DEFAULT_X86_MEMORY);
         assert_eq!(resolved.bios, None);
@@ -3290,8 +3472,7 @@ mod tests {
             vsock_cid: None,
             arch: VmArch::X86_64,
             debug: true,
-            release: false,
-            kernel_debug: false,
+            build: KernelBuildProfile::Debug,
             config: Some(tempdir.path().join("missing-vm.json")),
             qemu_bin: None,
             kernel: None,
@@ -3331,7 +3512,7 @@ mod tests {
         };
 
         let resolved = resolve(command).expect("VM debug command resolution must succeed");
-        assert!(resolved.kernel_debug);
+        assert_eq!(resolved.build, KernelBuildProfile::KernelDebug);
         assert_eq!(resolved.gdb.as_deref(), Some(DEFAULT_GDB_ENDPOINT));
         assert!(resolved.gdb_wait);
         assert!(resolved.keep_runtime_dir);
@@ -3367,7 +3548,7 @@ mod tests {
         let command = watchdog_test_command(arch);
         run_step(
             "building helios-cli",
-            cargo_build_command(&repo_root()?, command.release, false)
+            cargo_build_command(&repo_root()?, command.build.host())
                 .arg("-p")
                 .arg("helios-cli"),
         )?;
@@ -3398,10 +3579,9 @@ mod tests {
         let profile = arch.profile();
         ResolvedVmCommand {
             profile,
-            release: false,
-            kernel_debug: false,
+            build: KernelBuildProfile::Debug,
             qemu_bin: PathBuf::from(profile.qemu_bin),
-            kernel: default_kernel_path(arch, build_profile_dir(false, false))
+            kernel: default_kernel_path(arch, KernelBuildProfile::Debug.directory())
                 .expect("workspace root must resolve"),
             socket: None,
             serial_stdio: false,
@@ -3572,10 +3752,9 @@ mod tests {
         let profile = arch.profile();
         ResolvedVmCommand {
             profile,
-            release: true,
-            kernel_debug: false,
+            build: KernelBuildProfile::Release,
             qemu_bin: PathBuf::from(profile.qemu_bin),
-            kernel: default_kernel_path(arch, build_profile_dir(true, false))
+            kernel: default_kernel_path(arch, KernelBuildProfile::Release.directory())
                 .expect("workspace root must resolve"),
             socket: None,
             serial_stdio: false,

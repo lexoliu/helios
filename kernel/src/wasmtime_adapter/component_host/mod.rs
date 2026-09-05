@@ -43,8 +43,8 @@ use crate::wasmtime_adapter::cwasm::{self, ArtifactTrustError, UntrustedCwasm};
 use crate::wasmtime_adapter::wasi::ChannelStreamProducer;
 use crate::wasmtime_adapter::wasi::bindings::filesystem::types::ErrorCode as FsErrorCode;
 use crate::{
-    HeapStats, PerfMetricFilter, PerfSample, ProfileFilter, ProfileScope, StatsSample, TraceEvent,
-    TraceField, TraceFilter, TraceLevel, TraceValue,
+    HeapStats, LlvmProfile, PerfMetricFilter, PerfSample, ProfileFilter, ProfileScope, StatsSample,
+    TraceEvent, TraceField, TraceFilter, TraceLevel, TraceValue,
 };
 // The two generated worlds spell every shared type identically, so each keeps
 // its own short alias rather than importing the names themselves.
@@ -2765,7 +2765,70 @@ where
             Ok((samples,))
         },
     )?;
+    instance.func_wrap("raw-profile-size", |_caller, (): ()| {
+        Ok((crate::KernelLlvmProfile
+            .size()
+            .map_err(convert_raw_profile_error),))
+    })?;
+    instance.func_wrap(
+        "raw-profile-read",
+        |_caller, (offset, length): (u64, u32)| {
+            Ok((read_raw_profile(offset, length).map_err(convert_raw_profile_error),))
+        },
+    )?;
     Ok(())
+}
+
+/// Copies one window of the kernel's own LLVM raw profile out of the image.
+///
+/// The returned buffer is the one transient allocation this export makes —
+/// the component ABI lowers a `list<u8>` from owned bytes — and the window
+/// is capped by the interface rather than by what the caller asks for, so a
+/// profile in the tens of megabytes leaves the kernel a bounded piece at a
+/// time.
+fn read_raw_profile(offset: u64, length: u32) -> Result<Vec<u8>, crate::LlvmProfileError> {
+    if length > crate::MAX_PROFILE_READ {
+        return Err(crate::LlvmProfileError::ReadTooLarge {
+            requested: u64::from(length),
+            limit: crate::MAX_PROFILE_READ,
+        });
+    }
+    let profile = crate::KernelLlvmProfile;
+    let remaining = profile.size()?.saturating_sub(offset);
+    let mut bytes = alloc::vec![0u8; remaining.min(u64::from(length)) as usize];
+    let written = profile.read(offset, &mut bytes)?;
+    bytes.truncate(written);
+    Ok(bytes)
+}
+
+fn convert_raw_profile_error(
+    error: crate::LlvmProfileError,
+) -> debugger_wit::profiling::RawProfileError {
+    use crate::LlvmProfileError as Local;
+    use debugger_wit::profiling::RawProfileError as Wit;
+
+    match error {
+        Local::NotInstrumented => Wit::NotInstrumented,
+        Local::UnsupportedVersion { found, .. } => Wit::UnsupportedVersion(found),
+        Local::MalformedSection { section, .. } => {
+            Wit::MalformedSection(convert_profile_section(section))
+        }
+        Local::OutOfRange { len, .. } => Wit::OutOfRange(len),
+        Local::ReadTooLarge { limit, .. } => Wit::ReadTooLarge(limit),
+    }
+}
+
+fn convert_profile_section(
+    section: crate::ProfileSection,
+) -> debugger_wit::profiling::ProfileSection {
+    use crate::ProfileSection as Local;
+    use debugger_wit::profiling::ProfileSection as Wit;
+
+    match section {
+        Local::Counters => Wit::Counters,
+        Local::Data => Wit::Data,
+        Local::Names => Wit::Names,
+    }
 }
 
 fn add_stats_to_program_linker<CpuImpl, HostFs>(

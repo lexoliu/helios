@@ -120,6 +120,12 @@ pub(crate) struct WorkloadBenchCommand {
     #[arg(long)]
     pub(crate) perf_metrics_output: Option<PathBuf>,
 
+    /// Write the guest kernel's LLVM raw profile after the run, and the
+    /// `llvm-profdata merge` of it beside the file. Only an instrumented
+    /// kernel (`vm --profile-generate`) carries one (docs/pgo.md).
+    #[arg(long)]
+    pub(crate) llvm_raw_profile_output: Option<PathBuf>,
+
     /// Seconds one workload iteration may take before the run fails it.
     #[arg(long, default_value_t = DEFAULT_WORKLOAD_TIMEOUT_SECONDS)]
     pub(crate) workload_timeout_seconds: u32,
