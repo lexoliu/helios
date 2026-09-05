@@ -191,16 +191,24 @@ where
     pub async fn run_packet_pump(&self) -> ! {
         let mut cadence = NetworkPumpCadence::new();
         loop {
+            // The pump produces for every shard, so its park is the
+            // set-wide arrival signal — and, like every other waiter,
+            // it samples the mark *before* the poll that decides
+            // whether to park, so progress made in between is not
+            // slept through.
+            let wait = self.inner.state.any_shard_wait();
             match self.poll_network_once(NetworkPollSource::Pump).await {
                 Ok((progress, budget)) => match cadence.complete(progress, budget) {
                     NetworkPumpAction::Continue => {}
                     NetworkPumpAction::Yield => crate::yield_now().await,
-                    NetworkPumpAction::Wait => self.wait_for_progress(self.pump_wait()).await,
+                    NetworkPumpAction::Wait => {
+                        self.wait_for_shard_progress(wait, self.pump_wait()).await;
+                    }
                 },
                 Err(error) => {
                     cadence.reset();
                     tracing::debug!(?error, "network packet pump failed to drive device");
-                    self.wait_for_progress(self.pump_wait()).await;
+                    self.wait_for_shard_progress(wait, self.pump_wait()).await;
                 }
             }
         }

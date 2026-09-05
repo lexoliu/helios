@@ -1009,15 +1009,21 @@ where
         tracing::info!("network link up: reconfiguring the interface");
     }
 
-    /// The wait the packet pump takes when a poll round found nothing.
+    /// The timer bound the packet pump takes when a poll round found
+    /// nothing.
     ///
     /// The pump has no caller deadline, but it does own the stack's
     /// timer duties — DHCP retransmission, TCP retransmit and
-    /// delayed-ACK deadlines — so an interrupt-driven device still needs
-    /// the wait bounded by the soonest of them. Left purely
-    /// event-driven, a lost DHCP reply would never be retransmitted,
-    /// because the wake that would drive the retransmit is the reply
-    /// that never came.
+    /// delayed-ACK deadlines — so the park has to be bounded by the
+    /// soonest of them. Left purely event-driven, a lost DHCP reply
+    /// would never be retransmitted, because the wake that would drive
+    /// the retransmit is the reply that never came.
+    ///
+    /// This is a bound on *timer* duties only, and never the mechanism
+    /// by which the pump learns about work: everything a shard can
+    /// hand it — a frame another processor drained, a read that
+    /// relieved receive backpressure — raises the arrival signal the
+    /// park races this bound against.
     fn pump_wait(&self) -> Duration {
         let now = self.now_nanos();
         let next_stack_deadline = self
@@ -1047,65 +1053,31 @@ where
         }
     }
 
-    /// The wait the packet pump takes: it is the producer for every
-    /// shard, so it parks on the device — on the pair this processor
-    /// drains, which is the only one its next poll will look at.
-    async fn wait_for_progress(&self, duration: Duration) {
-        if duration.is_zero() {
-            return;
-        }
-
-        if !self.inner.device.capabilities().events.interrupts {
-            self.inner.timer.sleep_for(duration).await;
-            return;
-        }
-
-        let event = self.inner.device.wait_for_event_on(
-            self.inner
-                .state
-                .shard_idx_for_processor(self.inner.cpu.current_processor()),
-        );
-        let mut event = core::pin::pin!(event);
-        if core::future::poll_fn(|cx| Poll::Ready(event.as_mut().poll(cx).is_ready())).await {
-            return;
-        }
-
-        let timer = self.inner.timer.sleep_for(duration);
-        let mut timer = core::pin::pin!(timer);
-
-        core::future::poll_fn(|cx| {
-            if event.as_mut().poll(cx).is_ready() {
-                return Poll::Ready(());
-            }
-            if timer.as_mut().poll(cx).is_ready() {
-                return Poll::Ready(());
-            }
-            Poll::Pending
-        })
-        .await;
-    }
-
-    /// The wait every per-operation caller takes.
+    /// The wait every caller that parks on a shard takes.
     ///
-    /// An operation belongs to exactly one shard, and the frame that
-    /// ends its wait can be drained by any processor. Three things can
+    /// An operation belongs to exactly one shard, and the progress that
+    /// ends its wait can be made by any processor. Three things can
     /// end it, and all three are races rather than polls:
     ///
     /// * the shard's arrival signal, raised by whichever processor
-    ///   placed a frame in this shard — the cross-processor hand-off,
-    ///   and the only one that covers a reply drained on a foreign CPU;
+    ///   placed a frame in this shard, or by the read that relieved its
+    ///   receive backpressure — the cross-task hand-off, and the only
+    ///   one that covers work done on a foreign CPU;
     /// * the device event, which covers transmit completions, link
     ///   changes and anything else the device reports;
-    /// * `duration`, the caller's own bound — its deadline, or the
-    ///   interval at which it owes a retransmission.
+    /// * `duration`, the caller's own bound — its deadline, the
+    ///   interval at which it owes a retransmission, or for the packet
+    ///   pump the soonest protocol timer any shard owes.
     ///
     /// `wait` must have been sampled before the caller inspected its
     /// shard; [`NetworkShardSet::shard_wait`] and its siblings are the
     /// only way to build one, and an arrival that lands between that
     /// inspection and this park resolves immediately rather than
-    /// sleeping through the wake. A replicated socket samples the
-    /// set-wide signal instead, because the shard its next connection
-    /// or datagram lands on is not known until the flow is hashed.
+    /// sleeping through the wake. A waiter that belongs to no single
+    /// shard samples the set-wide signal instead: a replicated socket,
+    /// because the shard its next connection or datagram lands on is
+    /// not known until the flow is hashed, and the packet pump, because
+    /// it produces for every shard at once.
     async fn wait_for_shard_progress(&self, wait: ShardWait, duration: Duration) {
         if duration.is_zero() {
             return;
@@ -1328,8 +1300,9 @@ mod tests {
         ETHERNET_FRAME_BYTES, EthernetFrame, EthernetProtocol, IcmpEchoKey, Icmpv4Packet,
         Icmpv6Packet, IpAddress, IpCidr, IpProtocol, Ipv4Address, Ipv4Cidr, Ipv4Packet,
         Ipv6Address, Ipv6Cidr, Ipv6Packet, MAX_OUTBOUND_FRAMES, NeighborEntry, NeighborState,
-        Route, StackConfig, StackInstant, TcpFlags, TcpHeader, TcpListenBacklog, TcpPacket,
-        TransportChecksum, UdpEndpoint, UdpPacket, UdpPayload, UdpSocketBinding, internet_checksum,
+        Route, StackConfig, StackInstant, TCP_RECEIVE_WINDOW_BYTES, TcpEndpoint, TcpFlags,
+        TcpHeader, TcpListenBacklog, TcpPacket, TransportChecksum, UdpEndpoint, UdpPacket,
+        UdpPayload, UdpSocketBinding, internet_checksum,
     };
 
     use alloc::vec::Vec;
@@ -1343,8 +1316,8 @@ mod tests {
         AddressAttemptError, DhcpClientState, HandleSlab, NETWORK_BUSY_POLL_ROUNDS,
         NETWORK_TX_BATCH_FRAMES, NetworkIpAddress, NetworkPollBudget, NetworkPollProgress,
         NetworkPollState, NetworkPumpAction, NetworkPumpCadence, NetworkShard, ReplicaHandle,
-        TcpListenerId, UdpSocketId, icmp_echo_payload, limit_udp_datagram_bytes, map_ipv4_address,
-        parse_ipv6,
+        TcpListenerId, TcpReadProgress, UdpSocketId, icmp_echo_payload, limit_udp_datagram_bytes,
+        map_ipv4_address, parse_ipv6,
     };
 
     fn ipv6_tcp_frame(
@@ -1457,6 +1430,7 @@ mod tests {
         source: Ipv4Address,
         destination: Ipv4Address,
         header: TcpHeader,
+        payload: &[u8],
     ) -> ([u8; ETHERNET_FRAME_BYTES], usize) {
         let mut frame = [0; ETHERNET_FRAME_BYTES];
         let mut offset = EthernetFrame::encode_header(
@@ -1472,7 +1446,7 @@ mod tests {
             IpAddress::Ipv4(source),
             IpAddress::Ipv4(destination),
             header,
-            &[],
+            payload,
             TransportChecksum::Software,
         )
         .expect("test TCP segment should fit");
@@ -2348,6 +2322,177 @@ mod tests {
         );
     }
 
+    /// The regression #107 describes: a socket that is only receiving
+    /// closes its receive window, and from that moment the pump's poll
+    /// takes no frame, sends nothing and reports itself idle.
+    ///
+    /// The application read that makes room is then the only event in
+    /// the system that can let the stack take a frame again, and it
+    /// produces no frame of its own. Until it raised the shard's
+    /// arrival signal the pump had nothing to wake it and slept to the
+    /// soonest protocol deadline instead — and a pure receiver owes
+    /// none, so that deadline was the DHCP retransmit interval a second
+    /// away. Captures showed exactly that: 1000–1072 ms gaps in which
+    /// the guest stopped acknowledging, with the peer window-blocked
+    /// and no loss either side.
+    ///
+    /// The assertions are that the park ends *by notification*: the
+    /// pump's wait is sampled the way `run_packet_pump` samples it, it
+    /// is pending while the receive queue is full, and it is ready
+    /// after the drain — with no timer in the test at all.
+    #[test]
+    fn draining_a_backpressured_socket_wakes_the_packet_pump() {
+        /// The largest payload an IPv4 TCP segment carries in an
+        /// Ethernet frame, which is what a bulk sender fills.
+        const SEGMENT_BYTES: usize = ETHERNET_FRAME_BYTES
+            - EthernetFrame::HEADER_LEN
+            - Ipv4Packet::MIN_HEADER_LEN
+            - TcpPacket::MIN_HEADER_LEN;
+
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        // The receiving socket lives on shard 1 and this fixture is
+        // processor 0, so the drain is the cross-processor hand-off the
+        // pump depends on rather than a local one.
+        let owner = 1;
+        let cpu = RecordingSmpCpu::new(0, 2);
+        let state = super::NetworkShardSet::new(2, |index| {
+            NetworkShard::new(test_stack_config(), 1 + index as u32, index, 2)
+        });
+
+        let stream = {
+            let mut shard = state.shard_at(owner).lock();
+            shard.stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+            let socket = shard
+                .stack
+                .open_tcp_connect(
+                    TcpEndpoint {
+                        address: IpAddress::Ipv4(local),
+                        port: 49_152,
+                    },
+                    TcpEndpoint {
+                        address: IpAddress::Ipv4(peer),
+                        port: 80,
+                    },
+                    7,
+                )
+                .expect("the test connection should allocate a socket");
+            shard.insert_tcp_stream(socket)
+        };
+        assert_eq!(
+            state.shard_idx_for_handle(stream),
+            owner,
+            "the stream belongs to the shard that minted it"
+        );
+
+        let (syn_ack, syn_ack_len) = ipv4_tcp_frame(
+            peer,
+            local,
+            TcpHeader {
+                source_port: 80,
+                destination_port: 49_152,
+                sequence: 100,
+                acknowledgement: 8,
+                flags: TcpFlags::SYN.union(TcpFlags::ACK),
+                window_size: u16::MAX,
+            },
+            &[],
+        );
+        state
+            .shard_at(owner)
+            .lock()
+            .stack
+            .receive_frame(&syn_ack[..syn_ack_len], StackInstant::from_nanos(1))
+            .expect("the SYN-ACK should establish the connection");
+
+        // Fill the receive queue until the stack refuses more. From
+        // here the pump's poll receives nothing whatever the device has
+        // waiting, which is what makes its progress idle.
+        let payload = [0u8; SEGMENT_BYTES];
+        let mut sequence = 101u32;
+        let mut segments = 0usize;
+        loop {
+            if state.shard_at(owner).lock().stack.receive_backpressured() {
+                break;
+            }
+            assert!(
+                segments < TCP_RECEIVE_WINDOW_BYTES.div_ceil(SEGMENT_BYTES),
+                "the receive window should close within its own capacity"
+            );
+            let (segment, segment_len) = ipv4_tcp_frame(
+                peer,
+                local,
+                TcpHeader {
+                    source_port: 80,
+                    destination_port: 49_152,
+                    sequence,
+                    acknowledgement: 8,
+                    flags: TcpFlags::ACK,
+                    window_size: u16::MAX,
+                },
+                &payload,
+            );
+            state
+                .shard_at(owner)
+                .lock()
+                .stack
+                .receive_frame(
+                    &segment[..segment_len],
+                    StackInstant::from_nanos(2 + segments as u64),
+                )
+                .expect("a segment inside the window should be accepted");
+            sequence = sequence.wrapping_add(SEGMENT_BYTES as u32);
+            segments += 1;
+        }
+
+        // The pump's park, taken the way `run_packet_pump` takes it:
+        // the mark first, then the poll that finds nothing.
+        let wait = state.any_shard_wait();
+        let mut parked = core::pin::pin!(state.arrival_for(wait.target).changed(wait.mark));
+        assert!(
+            block_on(poll_once(parked.as_mut())).is_none(),
+            "the pump must park while the receive queue is full"
+        );
+
+        // The application reads. Nothing else can make room, so this is
+        // the whole event the pump is waiting for.
+        let read = state
+            .with_handle_receive_drain(stream, &cpu, |shard| {
+                shard.poll_tcp_read(stream, SEGMENT_BYTES, StackInstant::from_nanos(1_000))
+            })
+            .expect("the queued data should read");
+        assert!(matches!(read, TcpReadProgress::Data(_)));
+        assert!(
+            !state.shard_at(owner).lock().stack.receive_backpressured(),
+            "the read must have relieved the backpressure"
+        );
+
+        assert!(
+            block_on(poll_once(parked)).is_some(),
+            "the drain must release the pump's park, not the DHCP retransmit timer"
+        );
+        assert_eq!(
+            cpu.woken(),
+            alloc::vec![helios_hal::cpu::ProcessorId::new(1)],
+            "the shard's owning processor must be pulled out of its idle park"
+        );
+
+        // A read that relieves nothing raises nothing: the signal is a
+        // hand-off, not a heartbeat.
+        let wait = state.any_shard_wait();
+        let mut parked = core::pin::pin!(state.arrival_for(wait.target).changed(wait.mark));
+        let read = state
+            .with_handle_receive_drain(stream, &cpu, |shard| {
+                shard.poll_tcp_read(stream, SEGMENT_BYTES, StackInstant::from_nanos(1_001))
+            })
+            .expect("the rest of the queued data should read");
+        assert!(matches!(read, TcpReadProgress::Data(_)));
+        assert!(
+            block_on(poll_once(parked.as_mut())).is_none(),
+            "a read that was never blocking the pump must not wake it"
+        );
+    }
+
     /// The receive rule and the placement rule have to agree, or a
     /// socket is opened on a shard its own frames never reach.
     #[test]
@@ -2569,6 +2714,7 @@ mod tests {
                 flags: TcpFlags::SYN,
                 window_size: u16::MAX,
             },
+            &[],
         );
         let syn_ack_sequence = {
             let mut shard = state.shard_at(2).lock();
@@ -2602,6 +2748,7 @@ mod tests {
                 flags: TcpFlags::ACK,
                 window_size: u16::MAX,
             },
+            &[],
         );
         state
             .shard_at(2)
