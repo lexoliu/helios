@@ -223,7 +223,9 @@ performance, then compare after. Baseline logs and reports live in
 `elapsed_ms` and any regression directly in the PR description.
 
 The canonical workload is the in-kernel compiler plugin compiling a fixed
-wasm input under arm64+HVF (fastest supported surface, no TCG noise):
+wasm input under arm64+HVF (fastest supported surface, no TCG noise). HVF
+is a local arm64 machine or a self-hosted runner; no GitHub-hosted runner
+provides it, so this baseline is never taken from CI:
 
 ```bash
 ./target/release/helios-inspector vm --arch aarch64 --release \
@@ -263,12 +265,16 @@ multi-queue network baseline is the x86-64 KVM lane**, and it is the
 only lane that can produce one: GitHub's Arm Linux runners expose
 neither `/dev/kvm` nor a readable `/dev/vhost-net`, so a guest there
 would run under TCG behind a userspace tap, with no accelerator and no
-offload to measure. That is why there is no aarch64 Linux benchmark
-lane. The aarch64 numbers come from the macOS HVF lane, whose network
-backend is slirp and whose network numbers are therefore not a
-baseline for anything the driver negotiates. Until an Arm runner with
-KVM exists, do not read a cross-architecture network comparison out of
-CI; take the arm64 tap baseline on a real machine instead.
+offload to measure. That is why there is no aarch64 benchmark lane at
+all. **No GitHub-hosted runner produces an aarch64 baseline**, CPU-side
+or network: the macOS lane that once claimed to be the arm64 HVF
+surface ran under TCG, because those runners report
+`kern.hv_support=0` and the inspector's capability probe falls through
+(#118). helios CI is Linux-only, and the one aarch64 lane it keeps —
+`smoke-aarch64` on `ubuntu-24.04-arm` — is a TCG functional check, not
+a performance surface. Take every arm64 number, CPU-side and network,
+on a real arm64 machine or a self-hosted runner, and do not read a
+cross-architecture comparison out of CI.
 
 ## 3.6 Architectural ambition
 
@@ -341,7 +347,11 @@ paths, components).
   ACPI tables instead of a device tree. The aarch64 kernel takes its whole
   platform description from the firmware and QEMU publishes one description or
   the other, never both, so both modes have to keep booting; the
-  `smoke-aarch64` CI job runs each of them.
+  `smoke-aarch64` CI job runs each of them on `ubuntu-24.04-arm` under
+  TCG, against a pinned upstream QEMU the lane builds and caches because
+  the one Ubuntu 24.04 ships asserts in its emulated GICv3 CPU interface
+  under multi-threaded TCG (#85). Every helios CI lane runs on a Linux
+  runner; a `runs-on: macos-*` job does not belong in this repository.
 - `helios-inspector vm --kernel-debug --gdb <endpoint>` is the supported QEMU
   gdbstub path for symbol-level kernel debugging. Use `--gdb-wait` when the
   debugger must attach before kernel entry. Use endpoints such as `tcp::1234`

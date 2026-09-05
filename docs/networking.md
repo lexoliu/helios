@@ -317,15 +317,23 @@ every run and the negotiated feature set is printed into the job log.
 **That lane is the multi-queue network baseline**, and until an Arm
 runner with KVM exists it is the only one CI has.
 
-The macOS lane keeps `user`: GitHub's macOS runners give no way to hold
-the vmnet entitlement or install the `socket_vmnet` daemon, so that lane
-is labelled single-queue, no-offload in its summary and its numbers are
-not comparable with the x86-64 lane's network workloads. It is there for
-the aarch64 CPU-side numbers, which HVF can produce honestly.
+It is also the only `bench` lane. Every helios CI job runs on a Linux
+runner, and no GitHub-hosted runner can produce an aarch64 baseline of
+any kind. The Arm Linux runners expose neither `/dev/kvm` nor a
+readable `/dev/vhost-net`, so a guest there runs under TCG behind a
+userspace tap: no accelerator, and none of the multiqueue or offload
+paths the tap backend exists to exercise. The macOS lane that used to
+stand in for them was no better — its run record showed
+`"accel":["tcg"]`, because GitHub's macOS runners report
+`kern.hv_support=0` and the inspector's capability probe falls through
+to TCG (#118). A lane in either shape measures the emulator, so the
+arm64 baseline, CPU-side and multi-queue network alike, is taken on a
+real arm64 machine or a self-hosted runner (see AGENTS.md §3.5) rather
+than read out of CI.
 
-There is deliberately no aarch64 Linux lane. GitHub's Arm runners expose
-neither `/dev/kvm` nor a readable `/dev/vhost-net`, so a guest there runs
-under TCG behind a userspace tap: no accelerator, and none of the
-multiqueue or offload paths the tap backend exists to exercise. A lane
-in that shape measures the emulator, so an arm64 multi-queue baseline is
-taken on a real machine (see AGENTS.md §3.5) rather than read out of CI.
+The one aarch64 lane CI does run, `smoke-aarch64`, is a functional
+check on `ubuntu-24.04-arm` under TCG and not a performance surface. It
+boots the guest from a device tree and from ACPI against a pinned
+upstream QEMU that the lane builds and caches, because the QEMU Ubuntu
+24.04 ships asserts in its emulated GICv3 CPU interface under
+multi-threaded TCG (#85).
