@@ -148,9 +148,21 @@ def load_manifest(path: Path) -> dict:
     return runner.load_manifest(path)
 
 
-def selected_workloads(manifest: dict, classes: list[str], names: list[str]) -> list[dict]:
+def selected_workloads(
+    manifest: dict,
+    classes: list[str],
+    names: list[str],
+    skipped: list[str] | None = None,
+) -> list[dict]:
+    skipped = skipped or []
+    known = {workload["name"] for workload in manifest["workloads"]}
+    for name in skipped:
+        if name not in known:
+            raise SystemExit(f"unknown skipped workload {name}")
     selected = []
     for workload in manifest["workloads"]:
+        if workload["name"] in skipped:
+            continue
         if names and workload["name"] not in names:
             continue
         if classes and workload["class"] not in classes:
@@ -348,6 +360,7 @@ def run_helios(
     iterations: int,
     workloads: list[dict],
     arch: str,
+    accel: str | None,
     host_http_url: str | None,
     host_tcp_host: str | None,
     host_tcp_port: int | None,
@@ -375,6 +388,7 @@ def run_helios(
             [],
             [control_workload["name"]],
             arch,
+            accel,
             host_http_url,
             host_tcp_host,
             host_tcp_port,
@@ -401,6 +415,7 @@ def run_helios(
                     [workload_class],
                     workload_names,
                     arch,
+                    accel,
                     host_http_url,
                     host_tcp_host,
                     host_tcp_port,
@@ -449,6 +464,7 @@ def run_helios(
             list(workloads_by_class),
             [workload["name"] for workload in workloads],
             arch,
+            accel,
             host_http_url,
             host_tcp_host,
             host_tcp_port,
@@ -527,6 +543,7 @@ def run_helios_once(
     classes: list[str],
     names: list[str],
     arch: str,
+    accel: str | None,
     host_http_url: str | None,
     host_tcp_host: str | None,
     host_tcp_port: int | None,
@@ -536,6 +553,11 @@ def run_helios_once(
 ) -> None:
     env = os.environ.copy()
     env["HELIOS_WORKLOAD_BENCH_ARCH"] = arch
+    if accel:
+        # The inspector requires the profile's native accelerator when
+        # nobody names one, so the lane's choice is passed down rather
+        # than rediscovered per boot.
+        env["HELIOS_WORKLOAD_BENCH_ACCEL"] = accel
     env["HELIOS_WORKLOAD_BENCH_ITERATIONS"] = str(iterations)
     env["HELIOS_WORKLOAD_BENCH_MANIFEST"] = str(manifest)
     env["HELIOS_WORKLOAD_BENCH_LOG"] = str(log)
@@ -1628,7 +1650,19 @@ def main() -> None:
     parser.add_argument("--iterations", type=int, default=5)
     parser.add_argument("--class", dest="classes", action="append", choices=WORKLOAD_CLASSES, default=[])
     parser.add_argument("--workload", dest="workloads", action="append", default=[])
+    parser.add_argument(
+        "--skip-workload",
+        dest="skip_workloads",
+        action="append",
+        default=[],
+        help="leave a workload out of the run entirely, by name",
+    )
     parser.add_argument("--arch", default="aarch64")
+    parser.add_argument(
+        "--helios-accel",
+        default=None,
+        help="accelerator the Helios guest boots on; the inspector requires one to be named",
+    )
     parser.add_argument("--helios-host-http-host", default="10.0.2.2")
     parser.add_argument("--helios-host-tcp-host", default="10.0.2.2")
     parser.add_argument("--fedora-image-url", default=None)
@@ -1764,7 +1798,7 @@ def main() -> None:
     host_load = host_load_snapshot()
     enforce_host_load(host_load, args.max_host_load_per_cpu, args.allow_busy_host)
     manifest = load_manifest(args.manifest)
-    workloads = selected_workloads(manifest, args.classes, args.workloads)
+    workloads = selected_workloads(manifest, args.classes, args.workloads, args.skip_workloads)
     control_workload = None
     if args.control:
         control_workload = runner.selected_workload(manifest, manifest["control_workload"])
@@ -1819,6 +1853,7 @@ def main() -> None:
                 args.iterations,
                 workloads,
                 args.arch,
+                args.helios_accel,
                 host_http_url,
                 host_tcp_host,
                 host_tcp_port,

@@ -1,6 +1,8 @@
 """The guest-side runner's manifest interpretation, exercised on the host."""
 
+import os
 import shlex
+import sys
 from pathlib import Path
 
 import pytest
@@ -110,3 +112,27 @@ def test_the_guest_runner_parses_the_command_the_host_driver_builds() -> None:
     assert args.keep_going is True
     assert args.side_timeout_seconds == 5400
     assert args.workloads == ["quickjs-loop", "hostcall-loop"]
+
+
+def test_a_hung_workload_becomes_a_failed_cell_instead_of_holding_the_side() -> None:
+    """The timeout path, exercised rather than merely declared.
+
+    A child that never exits used to hold the whole Linux side until the
+    caller's ssh gave up, losing every cell the side had already measured.
+    """
+    runner = workload_runner()
+    workload = {"name": "hangs-forever", "stdout_contains": [], "stderr_empty": True}
+    argv = [sys.executable, "-c", "import time; time.sleep(30)"]
+    with pytest.raises(runner.WorkloadFailed) as failure:
+        runner.run_once(workload, argv, dict(os.environ), 0.2)
+    assert "hangs-forever" in str(failure.value)
+    assert "budget" in str(failure.value)
+
+
+def test_a_workload_that_finishes_inside_its_share_is_timed_normally() -> None:
+    runner = workload_runner()
+    workload = {"name": "prints-a-metric", "stdout_contains": ["ok"], "stderr_empty": True}
+    argv = [sys.executable, "-c", "print('ok'); print('bench.rate=2.5')"]
+    elapsed_ms, metrics = runner.run_once(workload, argv, dict(os.environ), 30.0)
+    assert elapsed_ms > 0
+    assert metrics == {"rate": 2.5}

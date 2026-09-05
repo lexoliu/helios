@@ -144,6 +144,11 @@ def plan(options: RunOptions, manifest: Manifest, workloads: list[dict]) -> list
                     *common,
                     "--arch",
                     lane.helios_arch,
+                    # The lane pins the accelerator and the inspector
+                    # requires one to be named, so the manifest says it
+                    # rather than each boot rediscovering it.
+                    "--helios-accel",
+                    lane.accelerator,
                     "--skip-linux",
                     "--helios-timeout-seconds",
                     str(options.helios_timeout_seconds),
