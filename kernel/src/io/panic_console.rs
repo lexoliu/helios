@@ -1,15 +1,13 @@
 //! The panic console.
 //!
 //! The last thing a machine says is its panic report, and every backend
-//! said it the same way: wrap a byte writer in a `fmt::Write`, then push
-//! the report through it inside the console gate. What differs is only
-//! which port a panicking machine can still reach.
+//! says it the same way: wrap a byte writer in a `fmt::Write` and push
+//! the report through it. What differs is only which port a panicking
+//! machine can still reach.
 
 use core::fmt::{self, Write};
 use core::marker::PhantomData;
 use core::panic::PanicInfo;
-
-use super::console::emit_console_line;
 
 /// The byte sink a panic report reaches on this machine.
 ///
@@ -42,10 +40,12 @@ impl<Serial: PanicSerial> Write for PanicConsole<Serial> {
 
 /// Writes one panic report to the machine's panic console.
 ///
-/// The report is one record, emitted under the console gate like every
-/// other, because it shares the UART with kernel tracing and with the
-/// debugger's stage markers and would otherwise be cut apart by a line
-/// another processor was already writing.
+/// It is the one record on this machine that does not go through
+/// [`DebugConsole`](super::DebugConsole), for the reason that module
+/// gives: a panicking processor cannot wait for a port another
+/// processor may never release, and it cannot wait for a gate either.
+/// The report goes straight at the register and accepts that it may cut
+/// into whatever was on the wire.
 ///
 /// The record names itself twice over, and both names are load-bearing:
 /// `Kernel panic` is what a smoke run greps for to prove the kernel did
@@ -61,10 +61,8 @@ pub fn emit_panic_report<Serial: PanicSerial>(info: &PanicInfo<'_>) {
 /// A `PanicInfo` cannot be built outside a real panic, so this is where
 /// the record's shape is testable.
 fn emit_report<Serial: PanicSerial>(report: impl fmt::Display) {
-    emit_console_line(|| {
-        let mut console = PanicConsole::<Serial>(PhantomData);
-        let _ = writeln!(console, "Kernel panic: {report}");
-    });
+    let mut console = PanicConsole::<Serial>(PhantomData);
+    let _ = writeln!(console, "Kernel panic: {report}");
 }
 
 #[cfg(test)]

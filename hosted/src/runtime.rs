@@ -77,11 +77,18 @@ impl helios_hal::serial::ByteSerial for HostedDebugPort {
     }
 }
 
+/// The console that owns the right to write to the process's stdout.
+static DEBUG_CONSOLE: helios_kernel::DebugConsole = helios_kernel::DebugConsole::new();
+
 impl helios_kernel::DebugSerialAccess for HostedDebugPort {
     type Port = Self;
 
     fn port() -> Self {
         Self
+    }
+
+    fn console() -> &'static helios_kernel::DebugConsole {
+        &DEBUG_CONSOLE
     }
 }
 

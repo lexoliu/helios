@@ -556,7 +556,7 @@ extern "C" fn aarch64_kernel_main() -> ! {
     let console = helios_kernel::RecordingConsole::new(
         debug_state.clone(),
         read_counter,
-        Some(|bytes: &[u8]| DEBUG_SERIAL_WRITER.emit(bytes)),
+        Some(DEBUG_SERIAL_WRITER),
     );
     let mut devices = DeviceInventory::new().with_debug_serial();
     if host_fs::has_9p_device(&platform) {
@@ -1070,7 +1070,7 @@ unsafe extern "C" fn aarch64_secondary_main(mp_info: &MpInfo) -> ! {
     let console = helios_kernel::RecordingConsole::new(
         debug_state.clone(),
         read_counter,
-        Some(|bytes: &[u8]| DEBUG_SERIAL_WRITER.emit(bytes)),
+        Some(DEBUG_SERIAL_WRITER),
     );
     let kernel = helios_kernel::init(
         Platform::new(console, core::iter::empty::<MemoryRegion>(), cpu)
@@ -1803,11 +1803,18 @@ fn active_debug_serial() -> DebugSerial {
     DebugSerial { base }
 }
 
+/// The console that owns the right to write to the machine's debug UART.
+static DEBUG_CONSOLE: helios_kernel::DebugConsole = helios_kernel::DebugConsole::new();
+
 impl DebugSerialAccess for DebugSerial {
     type Port = Self;
 
     fn port() -> Self {
         active_debug_serial()
+    }
+
+    fn console() -> &'static helios_kernel::DebugConsole {
+        &DEBUG_CONSOLE
     }
 }
 

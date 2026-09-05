@@ -20,7 +20,10 @@
 //!
 //! - **One owner.** [`DebugConsole`] is the only thing that calls
 //!   [`ByteSerial::write_bytes`] on the debug port. A backend supplies
-//!   the accessor and no longer has a byte writer of its own. The one
+//!   the accessor and no longer has a byte writer of its own, and the
+//!   kernel console mirrors through [`DebugSerialWriter`] rather than
+//!   through a sink of the backend's choosing, so there is no second
+//!   writer to fall out of step with this one (#164). The one
 //!   deliberate exception is [`PanicSerial`](super::PanicSerial): a
 //!   panicking processor cannot wait for a port another processor may
 //!   never release, so the panic report is written straight at the
@@ -122,6 +125,15 @@ pub trait DebugSerialAccess {
 
     /// The machine's debug UART.
     fn port() -> Self::Port;
+
+    /// The console that owns the right to write to [`Self::port`].
+    ///
+    /// The transmit role and the hand-off queue behind it are state of
+    /// one port, so they live beside that port in the backend that owns
+    /// it rather than in a kernel-wide value. A kernel-wide one would
+    /// make two ports share a role and a queue, and a record handed
+    /// over for one of them could then be written to the other.
+    fn console() -> &'static DebugConsole;
 }
 
 /// Drains what the debug UART has, up to `max_bytes`, into caller-owned
@@ -135,23 +147,17 @@ pub fn read_debug_serial<Access: DebugSerialAccess>(buffer: &mut Vec<u8>, max_by
     try_read_serial(&Access::port(), buffer, max_bytes);
 }
 
-/// The machine's one debug UART has one console.
-///
-/// The port is a machine-wide device reached through a receiver-less
-/// accessor, so its owner is a machine-wide value too. It holds one
-/// atomic flag and, once a processor has ever lost the race for the
-/// port, the hand-off queue behind it.
-static CONSOLE: DebugConsole = DebugConsole::new();
-
 /// The kernel's writer for the machine's debug UART, monomorphised for
 /// one backend.
 ///
-/// This is what the component host, the guest-facing services and the
-/// backends pass around instead of a raw byte writer, so there is no
-/// way to reach the port that does not go through the console.
+/// This is what the component host, the guest-facing services, the
+/// kernel console and the backends pass around instead of a raw byte
+/// writer, so there is no way to reach the port that does not go
+/// through the console.
 #[derive(Clone, Copy)]
 pub struct DebugSerialWriter {
     emit: fn(&[u8]),
+    emit_arguments: fn(fmt::Arguments<'_>),
     try_write: fn(&[u8]) -> bool,
 }
 
@@ -162,6 +168,7 @@ impl DebugSerialWriter {
     pub const fn of<Access: DebugSerialAccess>() -> Self {
         Self {
             emit: emit_segment::<Access>,
+            emit_arguments: emit_arguments_segment::<Access>,
             try_write: try_write_segment::<Access>,
         }
     }
@@ -180,13 +187,7 @@ impl DebugSerialWriter {
     /// record is built in a pooled buffer first and reaches the port as
     /// a single segment.
     pub fn emit_fmt(&self, arguments: fmt::Arguments<'_>) {
-        CONSOLE.with_segment_buffer(|buffer| {
-            let mut record = SegmentWriter { buffer };
-            record
-                .write_fmt(arguments)
-                .expect("a segment buffer never fails to take a formatted record");
-            (self.emit)(buffer);
-        });
+        (self.emit_arguments)(arguments);
     }
 
     /// Writes one whole guest segment, reporting `false` when another
@@ -269,11 +270,22 @@ impl Write for MarkerEscape<'_, '_> {
 }
 
 fn emit_segment<Access: DebugSerialAccess>(record: &[u8]) {
-    CONSOLE.emit(&Access::port(), record);
+    Access::console().emit(&Access::port(), record);
+}
+
+fn emit_arguments_segment<Access: DebugSerialAccess>(arguments: fmt::Arguments<'_>) {
+    let console = Access::console();
+    console.with_segment_buffer(|buffer| {
+        let mut record = SegmentWriter { buffer };
+        record
+            .write_fmt(arguments)
+            .expect("a segment buffer never fails to take a formatted record");
+        console.emit(&Access::port(), buffer);
+    });
 }
 
 fn try_write_segment<Access: DebugSerialAccess>(segment: &[u8]) -> bool {
-    CONSOLE.try_write(&Access::port(), segment)
+    Access::console().try_write(&Access::port(), segment)
 }
 
 /// The piece of a guest byte stream the console takes as one segment.

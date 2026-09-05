@@ -1,107 +1,125 @@
-use core::fmt::{self, Write};
+extern crate alloc;
 
+use alloc::string::String;
+use core::fmt::{self, Write};
+use core::mem;
+
+use super::debug_serial::DebugSerialWriter;
 use crate::ComponentRuntimeState;
 
-/// Emits one console message with the console gate held, so the bytes reach
-/// the shared byte stream indivisibly.
-///
-/// Every kernel console producer lands on the same device: the tracing
-/// mirror, the embedded debugger's `[KDBG …]` stage markers, and panic
-/// output all reach one UART on every backend. None of them writes in a
-/// single store — a UART sink pushes byte by byte, and `write_fmt` hands the
-/// sink one fragment per format piece — so two producers running on two
-/// processors split each other's lines. That is how a stage marker reached
-/// the inspector as `"[KDBG eng152 "`, with a balloon trace line wedged
-/// through the middle of it.
-///
-/// The gate is the critical section, which is what makes this work across
-/// processors as well as across the interrupts of one. `emit` must write a
-/// complete message and must not await: the section is held for exactly as
-/// long as the message takes to reach the device.
-///
-/// What reaches the device is a separate question, and its answer is
-/// [`DebugConsole`](super::DebugConsole): the port has one owner, and a
-/// record handed to it is written whole whoever else is writing. This
-/// gate is what establishes the *record* — where one begins and ends
-/// across the fragments `core::fmt` hands a sink, and that the
-/// debugger's copy of the console is cut at the same boundaries as the
-/// bytes on the wire.
-///
-/// The unit of a message is one *record* — one tracing event, one stage
-/// marker, one panic report — not one fragment of it. A record carries its
-/// own bound: it is as long as the formatter makes it and no longer, so
-/// holding the gate across a whole record holds it for a bounded time
-/// while holding it per fragment holds it for no useful invariant at all.
-/// The section nests, so a producer that already owns the gate may call
-/// through another gated writer without deadlocking.
-pub fn emit_console_line<Emitted>(emit: impl FnOnce() -> Emitted) -> Emitted {
-    critical_section::with(|_| emit())
-}
+/// Capacity a console's record buffer starts with, and the capacity
+/// above which it is released rather than kept, so one long record does
+/// not pin an oversized buffer for the rest of the boot.
+const RECORD_BUFFER_INITIAL_CAPACITY: usize = 256;
+const RECORD_BUFFER_RETAINED_CAPACITY: usize = 4096;
 
-/// Generic recording console that traces output into kernel runtime state
-/// and optionally mirrors bytes to a hardware serial sink.
+/// The kernel console: it keeps every record for the debugger and puts
+/// the same record on the machine's debug UART.
 ///
-/// Backends instantiate this with their architecture-specific tick source
-/// and byte writer. This eliminates the duplicated console wrapper pattern
-/// across riscv and x86.
-pub struct RecordingConsole<State, TickFn, WriteFn> {
+/// Backends instantiate this with their own tick source, and with the
+/// [`DebugSerialWriter`] of the port they brought up — or with `None`
+/// when the machine's debug line is carrying something else and the
+/// console is a debugger-only record.
+///
+/// # Why the mirror is a `DebugSerialWriter` and not a byte sink
+///
+/// The kernel console is not the only producer on that UART: the
+/// embedded debugger's `[KDBG …]` stage markers and the inspector's RPC
+/// frames go out on the same wire. [`DebugConsole`](super::DebugConsole)
+/// exists so that all of them are ordered by one transmit role, and a
+/// record handed to it reaches the port whole whoever else is writing.
+///
+/// A console that took an arbitrary `FnMut(&[u8])` let a backend put a
+/// second writer on that wire beside the console rather than through
+/// it, and riscv did: it mirrored kernel tracing to the SBI console
+/// byte by byte while the markers went to the same 16550 through the
+/// [`DebugConsole`]. Two writers, two disciplines, one device — so a
+/// marker emitted while the balloon's periodic report was mid-write came
+/// out spliced into it as `"emory balloo[KDBG boot]"` (#164). Naming
+/// the writer in the type is what stops that from being expressible.
+///
+/// # The record is the segment
+///
+/// The unit the console promises to deliver indivisibly is one *record*
+/// — one tracing event, one formatted diagnostic — not one fragment of
+/// it. `core::fmt` hands a sink one fragment per format piece, so a
+/// record built by `write!` is gathered here before it is emitted, and
+/// reaches the [`DebugConsole`] as a single segment. That is the whole
+/// of the discipline: there is no second gate around it to fall out of
+/// step, and nothing holds a critical section across a UART transmit.
+pub struct RecordingConsole<State, TickFn> {
     state: State,
     tick_fn: TickFn,
-    write_fn: Option<WriteFn>,
+    writer: Option<DebugSerialWriter>,
+    record: String,
 }
 
-impl<State, TickFn, WriteFn> RecordingConsole<State, TickFn, WriteFn>
+impl<State, TickFn> RecordingConsole<State, TickFn>
 where
     State: ComponentRuntimeState,
     TickFn: FnMut() -> u64,
-    WriteFn: FnMut(&[u8]),
 {
-    /// Create a console that records to runtime state and optionally mirrors
-    /// to a byte sink.
-    pub fn new(state: State, tick_fn: TickFn, write_fn: Option<WriteFn>) -> Self {
+    /// Creates a console that records to runtime state and, when the
+    /// machine's debug line carries the kernel log, mirrors each record
+    /// to it through the port's own console.
+    pub fn new(state: State, tick_fn: TickFn, writer: Option<DebugSerialWriter>) -> Self {
         Self {
             state,
             tick_fn,
-            write_fn,
+            writer,
+            record: String::with_capacity(RECORD_BUFFER_INITIAL_CAPACITY),
         }
     }
 
-    /// Records one piece of console text and mirrors it to the sink.
+    /// Records one whole console record and mirrors it.
     ///
-    /// Callers hold the console gate around a whole record; this is the
-    /// body that runs inside it, so the debugger's copy of the console
-    /// and the bytes on the wire are cut at the same boundaries.
-    fn emit(&mut self, text: &str) {
+    /// The debugger's copy of the console and the bytes on the wire are
+    /// therefore cut at the same boundaries.
+    fn emit(&mut self, record: &str) {
         let ticks = (self.tick_fn)();
-        self.state.record_console_text(ticks, text);
-        if let Some(write_fn) = &mut self.write_fn {
-            write_fn(text.as_bytes());
+        self.state.record_console_text(ticks, record);
+        if let Some(writer) = self.writer {
+            writer.emit(record.as_bytes());
         }
     }
 }
 
-impl<State, TickFn, WriteFn> Write for RecordingConsole<State, TickFn, WriteFn>
+impl<State, TickFn> Write for RecordingConsole<State, TickFn>
 where
     State: ComponentRuntimeState,
     TickFn: FnMut() -> u64,
-    WriteFn: FnMut(&[u8]),
 {
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        emit_console_line(|| self.emit(s));
+    /// Takes one whole record.
+    ///
+    /// This is the path the kernel's tracing subscriber uses: it builds
+    /// an event's line in a buffer of its own and hands it over in one
+    /// call.
+    fn write_str(&mut self, record: &str) -> fmt::Result {
+        self.emit(record);
         Ok(())
     }
 
-    /// Holds the gate across the whole formatted record.
+    /// Gathers a formatted record before emitting it.
     ///
-    /// `core::fmt` hands a sink one fragment per format piece, so the
-    /// default `write_fmt` would take and release the gate several times
-    /// per record — once per level, target, message and field — and
-    /// another processor's stage marker would slot into any of those
-    /// gaps. The record is the message this console promises to deliver
-    /// indivisibly, so the record is what the gate spans; `write_str`
-    /// nests inside it.
+    /// The default `write_fmt` would hand `write_str` one fragment per
+    /// format piece — one for the level, the target, the message, each
+    /// field — and each of those would be a segment of its own on the
+    /// wire, with another processor's stage marker free to land between
+    /// two of them. The record is what this console delivers whole, so
+    /// the record is what reaches the port.
     fn write_fmt(&mut self, arguments: fmt::Arguments<'_>) -> fmt::Result {
-        emit_console_line(|| fmt::write(self, arguments))
+        let mut record = mem::take(&mut self.record);
+        let formatted = fmt::write(&mut record, arguments);
+        if formatted.is_ok() {
+            self.emit(&record);
+        }
+        if record.capacity() > RECORD_BUFFER_RETAINED_CAPACITY {
+            record = String::with_capacity(RECORD_BUFFER_INITIAL_CAPACITY);
+        } else {
+            record.clear();
+        }
+        self.record = record;
+        formatted
     }
 }
 
@@ -113,27 +131,30 @@ mod tests {
     use alloc::string::{String, ToString};
     use alloc::vec::Vec;
     use core::fmt::Write as _;
-    use core::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread;
 
     use helios_hal::serial::ByteSerial;
     use tracing::Dispatch;
 
-    use super::{RecordingConsole, emit_console_line};
+    use super::RecordingConsole;
     use crate::ComponentRuntimeState;
+    use crate::io::debug_serial::{DebugConsole, DebugSerialAccess, DebugSerialWriter};
     use crate::log::KernelConsoleSubscriber;
 
+    /// The stage the debugger's marker producer announces. It is a real
+    /// one: `run:begin` is what the inspector's readiness reader waits
+    /// for before it opens the RPC session.
+    const KDBG_STAGE: &str = "run:begin";
+    /// The marker that stage puts on the wire, as its own line.
     const KDBG_MARKER: &str = "[KDBG run:begin]";
-    const TRACE_LINE: &str = "INFO [helios_kernel::memory::balloon] reporting started";
-    const LINES_PER_PRODUCER: usize = 200;
     /// Records each tracing producer emits in the contended phase.
     ///
-    /// The sink writes one byte per `yield_now`, so a record of ~60 bytes
-    /// is ~60 chances for another processor to cut into it; a few dozen
-    /// records per producer is already thousands of interleaving points,
-    /// and staying well under `LOG_QUEUE_CAPACITY` keeps the test about
-    /// the console gate rather than about queue back-pressure.
+    /// The sink writes one byte per `yield_now`, so a record of ~60
+    /// bytes is ~60 chances for another processor to cut into it; a few
+    /// dozen records per producer is already thousands of interleaving
+    /// points, and staying well under `LOG_QUEUE_CAPACITY` keeps the
+    /// test about the console rather than about queue back-pressure.
     const RECORDS_PER_PRODUCER: usize = 24;
     /// Records each producer formats through `write_fmt`.
     ///
@@ -141,85 +162,46 @@ mod tests {
     /// how long the test should run rather than by queue capacity.
     const FORMATTED_RECORDS_PER_PRODUCER: usize = 256;
 
-    /// A sink shaped like the UART the backends actually write to: one byte at
-    /// a time, with a yield between bytes so an ungated producer is split.
-    #[derive(Default)]
-    struct RecordingSink {
+    /// A sink shaped like the UART the backends actually write to: one
+    /// byte at a time, with a yield between bytes, so a producer that
+    /// does not hold the transmit role is split by whoever does.
+    struct Wire {
         bytes: Mutex<Vec<u8>>,
     }
 
-    impl RecordingSink {
-        fn reset(&self) {
-            self.bytes
-                .lock()
-                .expect("the recording sink was poisoned")
-                .clear();
-        }
-
-        fn lines(&self) -> Vec<String> {
-            let bytes = self.bytes.lock().expect("the recording sink was poisoned");
-            String::from_utf8(bytes.clone())
-                .expect("the sink recorded valid utf-8")
-                .lines()
-                .map(ToString::to_string)
-                .collect()
-        }
-    }
-
-    impl ByteSerial for RecordingSink {
-        fn try_read_byte(&self) -> Option<u8> {
-            None
-        }
-
-        fn write_bytes(&self, bytes: &[u8]) {
+    impl Wire {
+        fn write(&self, bytes: &[u8]) {
             for &byte in bytes {
                 self.bytes
                     .lock()
-                    .expect("the recording sink was poisoned")
+                    .expect("the recorded wire was poisoned")
                     .push(byte);
                 thread::yield_now();
             }
         }
-    }
 
-    fn produce(sink: &RecordingSink, line: &str) {
-        for _ in 0..LINES_PER_PRODUCER {
-            emit_console_line(|| {
-                sink.write_bytes(line.as_bytes());
-                sink.write_bytes(b"\n");
-            });
+        fn reset(&self) {
+            self.bytes
+                .lock()
+                .expect("the recorded wire was poisoned")
+                .clear();
         }
-    }
 
-    /// Regression for #76: a stage marker reached the inspector as
-    /// `"[KDBG eng152 "` because the tracing mirror and the debugger wrote to
-    /// one UART without a shared gate, and each of them writes byte by byte.
-    #[test]
-    fn two_producers_never_split_each_others_lines() {
-        let sink = Arc::new(RecordingSink::default());
-        let debugger = {
-            let sink = sink.clone();
-            thread::spawn(move || produce(&sink, KDBG_MARKER))
-        };
-        let tracing = {
-            let sink = sink.clone();
-            thread::spawn(move || produce(&sink, TRACE_LINE))
-        };
-        debugger.join().expect("the debugger producer panicked");
-        tracing.join().expect("the tracing producer panicked");
-
-        let lines = sink.lines();
-        assert_eq!(lines.len(), LINES_PER_PRODUCER * 2);
-        for line in &lines {
-            assert!(
-                line == KDBG_MARKER || line == TRACE_LINE,
-                "a producer's line was split by the other: {line:?}"
-            );
+        /// The non-empty lines the wire carried.
+        ///
+        /// A stage marker opens with a newline so that it owns its line
+        /// whatever preceded it, which leaves a blank line behind when
+        /// the record before it ended in one; the blank lines are not
+        /// what these tests are about.
+        fn lines(&self) -> Vec<String> {
+            let bytes = self.bytes.lock().expect("the recorded wire was poisoned");
+            String::from_utf8(bytes.clone())
+                .expect("the wire carried valid utf-8")
+                .lines()
+                .filter(|line| !line.is_empty())
+                .map(ToString::to_string)
+                .collect()
         }
-        assert_eq!(
-            lines.iter().filter(|line| *line == KDBG_MARKER).count(),
-            LINES_PER_PRODUCER
-        );
     }
 
     /// Runtime state shaped like a backend's: it keeps the console text
@@ -231,18 +213,12 @@ mod tests {
     }
 
     impl RecordingRuntimeState {
-        fn reset(&self) {
-            self.text
-                .lock()
-                .expect("the recorded console text was poisoned")
-                .clear();
-        }
-
         fn lines(&self) -> Vec<String> {
             self.text
                 .lock()
                 .expect("the recorded console text was poisoned")
                 .lines()
+                .filter(|line| !line.is_empty())
                 .map(ToString::to_string)
                 .collect()
         }
@@ -265,7 +241,7 @@ mod tests {
         }
 
         fn root_entropy(&self) -> &crate::RootEntropy {
-            panic!("the console gate test state has no root entropy")
+            panic!("the console test state has no root entropy")
         }
 
         fn memory_balloon(&self) -> Option<crate::memory::BalloonHandle> {
@@ -297,37 +273,55 @@ mod tests {
         }
     }
 
-    /// The kernel logger, wired to a recording console over the
-    /// byte-at-a-time sink, exactly as a backend wires it.
-    fn kernel_logger(state: RecordingRuntimeState, sink: Arc<RecordingSink>) -> Dispatch {
-        let console = RecordingConsole::new(
-            state,
-            || 0,
-            Some(move |bytes: &[u8]| sink.write_bytes(bytes)),
-        );
-        Dispatch::new(Arc::new(KernelConsoleSubscriber::new(console)))
-    }
-
-    /// A record built by `write!` is one message too.
+    /// Regression for #164: a `[KDBG …]` stage marker and a console
+    /// record share one UART and must not splice into each other.
     ///
-    /// `core::fmt` splits a format string into one fragment per piece —
-    /// here five of them — so this is the path where a per-fragment gate
-    /// shows up as a marker cut in half. The debugger keeps emitting
-    /// stage markers for as long as the producers keep formatting, which
-    /// is the traffic that finds the gaps.
+    /// Both producers take the real path a backend wires: the console
+    /// mirrors through the port's [`DebugSerialWriter`], and the
+    /// debugger emits its marker through the same writer. `write_fmt`
+    /// is the console side that finds the gap, because `core::fmt`
+    /// hands a sink one fragment per format piece and a marker that
+    /// reached the port between two of them cut the record in half —
+    /// which is what the inspector refused as
+    /// `"emory balloo[KDBG boot]"`.
     #[test]
-    fn a_formatted_record_never_reaches_the_console_in_pieces() {
-        let sink = Arc::new(RecordingSink::default());
+    fn a_stage_marker_never_splits_a_formatted_record() {
+        struct Port;
+        static WIRE: Wire = Wire {
+            bytes: Mutex::new(Vec::new()),
+        };
+        static CONSOLE: DebugConsole = DebugConsole::new();
+
+        impl ByteSerial for Port {
+            fn try_read_byte(&self) -> Option<u8> {
+                None
+            }
+
+            fn write_bytes(&self, bytes: &[u8]) {
+                WIRE.write(bytes);
+            }
+        }
+
+        impl DebugSerialAccess for Port {
+            type Port = Self;
+
+            fn port() -> Self {
+                Self
+            }
+
+            fn console() -> &'static DebugConsole {
+                &CONSOLE
+            }
+        }
+
+        const WRITER: DebugSerialWriter = DebugSerialWriter::of::<Port>();
+
         let state = RecordingRuntimeState::default();
         let console = Arc::new(Mutex::new(RecordingConsole::new(
             state.clone(),
             || 0,
-            Some({
-                let sink = sink.clone();
-                move |bytes: &[u8]| sink.write_bytes(bytes)
-            }),
+            Some(WRITER),
         )));
-        let formatting = Arc::new(AtomicBool::new(true));
 
         let producers: Vec<_> = ["alpha", "beta"]
             .into_iter()
@@ -345,26 +339,17 @@ mod tests {
                 })
             })
             .collect();
-        let debugger = {
-            let sink = sink.clone();
-            let formatting = formatting.clone();
-            thread::spawn(move || {
-                let mut markers = 0_usize;
-                while formatting.load(Ordering::Acquire) {
-                    emit_console_line(|| {
-                        sink.write_bytes(KDBG_MARKER.as_bytes());
-                        sink.write_bytes(b"\n");
-                    });
-                    markers += 1;
-                }
-                markers
-            })
-        };
+        let debugger = thread::spawn(move || {
+            for _ in 0..FORMATTED_RECORDS_PER_PRODUCER {
+                WRITER.emit_stage_marker(KDBG_STAGE);
+                thread::yield_now();
+            }
+        });
         for producer in producers {
             producer.join().expect("a formatting producer panicked");
         }
-        formatting.store(false, Ordering::Release);
-        let markers = debugger.join().expect("the debugger producer panicked");
+        debugger.join().expect("the debugger producer panicked");
+        let markers = FORMATTED_RECORDS_PER_PRODUCER;
 
         let expected: Vec<String> = ["alpha", "beta"]
             .into_iter()
@@ -373,51 +358,85 @@ mod tests {
                     .map(move |index| format!("INFO [{producer}] formatted record index={index}"))
             })
             .collect();
-        let lines = sink.lines();
-        assert_eq!(lines.len(), expected.len() + markers);
+        let lines = WIRE.lines();
         for line in &lines {
             assert!(
                 line == KDBG_MARKER || expected.contains(line),
-                "a formatted record reached the console in pieces: {line:?}"
+                "a stage marker and a formatted record spliced into each other: {line:?}"
             );
         }
         assert_eq!(
             lines.iter().filter(|line| *line == KDBG_MARKER).count(),
-            markers
+            markers,
+            "a stage marker was lost or split"
         );
+        assert_eq!(lines.len(), expected.len() + markers);
     }
 
     /// Regression for #102: a tracing record must reach the shared byte
-    /// stream indivisibly, however many format pieces it is built from.
+    /// stream indivisibly, however many format pieces it is built from,
+    /// and however many processors are writing.
     ///
-    /// `Write::write_str` is a fragment-granularity interface — nothing
-    /// in `core::fmt` promises a caller hands a sink one whole message —
-    /// so the record boundary has to be established before the console,
-    /// and the console gate then covers the record rather than a piece of
-    /// it. Two processors emitting records while a third emits `[KDBG …]`
-    /// stage markers is the traffic that produced a marker cut in half on
-    /// the x86 bench lane.
+    /// The producers are the real ones: the kernel's tracing subscriber
+    /// over a recording console that mirrors through the port's writer,
+    /// and the debugger emitting stage markers through that same
+    /// writer.
     #[test]
     fn a_tracing_record_never_reaches_the_console_in_pieces() {
-        let sink = Arc::new(RecordingSink::default());
-        let state = RecordingRuntimeState::default();
-        let logger = kernel_logger(state.clone(), sink.clone());
+        struct Port;
+        static WIRE: Wire = Wire {
+            bytes: Mutex::new(Vec::new()),
+        };
+        static CONSOLE: DebugConsole = DebugConsole::new();
 
-        // One uncontended record per producer, to learn the exact bytes a
-        // whole record is made of rather than asserting against a
+        impl ByteSerial for Port {
+            fn try_read_byte(&self) -> Option<u8> {
+                None
+            }
+
+            fn write_bytes(&self, bytes: &[u8]) {
+                WIRE.write(bytes);
+            }
+        }
+
+        impl DebugSerialAccess for Port {
+            type Port = Self;
+
+            fn port() -> Self {
+                Self
+            }
+
+            fn console() -> &'static DebugConsole {
+                &CONSOLE
+            }
+        }
+
+        const WRITER: DebugSerialWriter = DebugSerialWriter::of::<Port>();
+
+        let state = RecordingRuntimeState::default();
+        let logger = Dispatch::new(Arc::new(KernelConsoleSubscriber::new(
+            RecordingConsole::new(state.clone(), || 0, Some(WRITER)),
+        )));
+
+        // One uncontended record per producer, to learn the exact bytes
+        // a whole record is made of rather than asserting against a
         // hand-written copy of the formatter's output.
         tracing::dispatcher::with_default(&logger, || {
-            tracing::info!(producer = "alpha", "console gate record");
-            tracing::info!(producer = "beta", "console gate record");
+            tracing::info!(producer = "alpha", "console record");
+            tracing::info!(producer = "beta", "console record");
         });
-        let expected = sink.lines();
+        let expected = WIRE.lines();
         assert_eq!(
             expected.len(),
             2,
             "an uncontended record is exactly one line: {expected:?}"
         );
-        sink.reset();
-        state.reset();
+        WIRE.reset();
+        state
+            .text
+            .lock()
+            .expect("the recorded console text was poisoned")
+            .clear();
 
         let producers: Vec<_> = ["alpha", "beta"]
             .into_iter()
@@ -426,30 +445,24 @@ mod tests {
                 thread::spawn(move || {
                     tracing::dispatcher::with_default(&logger, || {
                         for _ in 0..RECORDS_PER_PRODUCER {
-                            tracing::info!(producer, "console gate record");
+                            tracing::info!(producer, "console record");
                             thread::yield_now();
                         }
                     });
                 })
             })
             .collect();
-        let debugger = {
-            let sink = sink.clone();
-            thread::spawn(move || {
-                for _ in 0..RECORDS_PER_PRODUCER {
-                    emit_console_line(|| {
-                        sink.write_bytes(KDBG_MARKER.as_bytes());
-                        sink.write_bytes(b"\n");
-                    });
-                }
-            })
-        };
+        let debugger = thread::spawn(move || {
+            for _ in 0..RECORDS_PER_PRODUCER {
+                WRITER.emit_stage_marker(KDBG_STAGE);
+            }
+        });
         for producer in producers {
             producer.join().expect("a tracing producer panicked");
         }
         debugger.join().expect("the debugger producer panicked");
 
-        let lines = sink.lines();
+        let lines = WIRE.lines();
         assert_eq!(lines.len(), RECORDS_PER_PRODUCER * 3);
         for line in &lines {
             assert!(

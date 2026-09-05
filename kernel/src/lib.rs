@@ -101,8 +101,8 @@ pub use io::{
     IommuReport, IommuStats, MAX_BLOCK_DEVICES, MAX_IOMMU_ENDPOINTS, MAX_NETWORK_INTERRUPTS,
     PanicSerial, PollKey, PollRegistration, PollRegistry, PollRegistryError, PollSourceKind,
     RecordingConsole, SCRATCH_DISK_SERIAL, SerialReader, TryRead, TryWrite, byte_channel,
-    emit_console_line, emit_panic_report, install_block_devices, read_debug_serial, read_serial,
-    try_read_serial, wake_queue_owners,
+    emit_panic_report, install_block_devices, read_debug_serial, read_serial, try_read_serial,
+    wake_queue_owners,
 };
 pub use kernel_exception::{
     KernelException, KernelExceptionCause, KernelExceptionDispatch, KernelNativeTrapHandler,
