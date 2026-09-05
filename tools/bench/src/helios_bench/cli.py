@@ -50,6 +50,7 @@ def command_run(args: argparse.Namespace) -> int:
         runner_label=args.runner_label,
         allow_busy_host=args.allow_busy_host,
         helios_timeout_seconds=args.helios_timeout_seconds,
+        skip_linux_workloads=tuple(args.skip_linux_workloads),
         linux_setup_timeout_seconds=args.linux_setup_timeout_seconds,
         network=NetworkOptions(ifname=args.net_ifname, bridge=args.net_bridge, queues=args.net_queues),
     )
@@ -181,6 +182,13 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--runner-label")
     run.add_argument("--allow-busy-host", action="store_true")
     run.add_argument("--helios-timeout-seconds", type=int, default=9000)
+    run.add_argument(
+        "--skip-linux-workload",
+        dest="skip_linux_workloads",
+        action="append",
+        default=[],
+        help="leave a workload out of the Linux side, by name",
+    )
     run.add_argument("--linux-setup-timeout-seconds", type=int, default=5400)
     run.add_argument("--net-ifname")
     run.add_argument("--net-bridge")

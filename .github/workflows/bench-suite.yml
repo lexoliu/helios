@@ -196,6 +196,15 @@ jobs:
         run: |
           args=(run --lane "${{ matrix.lane }}" --out-dir "$GITHUB_WORKSPACE/bench-out/${{ matrix.lane }}"
                 --runner-label "${{ runner.name }}")
+          # The density cells' Helios half cannot be measured while the
+          # user-memory pool does not grow with the guest (#130), so a
+          # Linux number for them would have nothing to compare against —
+          # and the Linux side shares one budget out between the workloads
+          # it runs, so an uncomparable one takes its share from the rest.
+          # The Helios side still runs them: their failure is a recorded
+          # cell in the report, citing #130.
+          args+=(--skip-linux-workload instance-startup-100
+                 --skip-linux-workload instance-startup-500)
           if [ "${BENCH_ADVISORY}" = true ]; then
             args+=(--advisory --allow-busy-host)
           fi

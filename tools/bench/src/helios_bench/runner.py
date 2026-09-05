@@ -64,6 +64,11 @@ class RunOptions:
     runner_label: str | None = None
     allow_busy_host: bool = False
     helios_timeout_seconds: int = 9000
+    # Workloads to leave out of the Linux side. A cell whose Helios half
+    # cannot be measured has nothing to compare a Linux number against,
+    # and the Linux side's budget is shared out between the workloads it
+    # runs, so an uncomparable one takes its share from the rest.
+    skip_linux_workloads: tuple[str, ...] = ()
     linux_setup_timeout_seconds: int = 5400
     network: NetworkOptions = NetworkOptions()
 
@@ -176,6 +181,11 @@ def plan(options: RunOptions, manifest: Manifest, workloads: list[dict]) -> list
                     str(lane.vcpus),
                     "--linux-vm-setup-timeout-seconds",
                     str(options.linux_setup_timeout_seconds),
+                    *[
+                        argument
+                        for name in options.skip_linux_workloads
+                        for argument in ("--skip-workload", name)
+                    ],
                     "--native-bin-dir",
                     str(NATIVE_ARTIFACTS / lane.guest_arch),
                     "--out-dir",

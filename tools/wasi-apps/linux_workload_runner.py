@@ -279,23 +279,31 @@ def parse_metrics(stdout: str, workload_name: str) -> dict[str, float]:
     return metrics
 
 
+class WorkloadFailed(Exception):
+    """One workload could not be measured; the message says why."""
+
+
 def validate_output(workload: dict, stdout: bytes, stderr: bytes) -> None:
+    """Raises `WorkloadFailed` when the child did not produce what it must.
+
+    A cell that fails validation is one failed cell, exactly like a cell
+    whose child exits non-zero or outlives its budget. Raising `SystemExit`
+    here took the whole side down instead — past `--keep-going`, past the
+    cells already measured, and past the log that carried them, since the
+    runner never got to copy it back.
+    """
     stdout_text = stdout.decode("utf-8", errors="replace")
     for expected in workload.get("stdout_contains", []):
         if expected not in stdout_text:
             sys.stdout.buffer.write(stdout)
             sys.stderr.buffer.write(stderr)
-            raise SystemExit(
+            raise WorkloadFailed(
                 f"workload {workload['name']} stdout did not contain expected text {expected!r}"
             )
     if workload.get("stderr_empty", False) and stderr:
         sys.stdout.buffer.write(stdout)
         sys.stderr.buffer.write(stderr)
-        raise SystemExit(f"workload {workload['name']} wrote stderr")
-
-
-class WorkloadFailed(Exception):
-    """One workload could not be measured; the message says why."""
+        raise WorkloadFailed(f"workload {workload['name']} wrote stderr")
 
 
 def run_once(
@@ -354,7 +362,6 @@ def run_workloads(
 ) -> None:
     manifest = load_manifest(manifest_path)
     env = os.environ.copy()
-    env["HELIOS_PROCESS_ID"] = str(os.getpid())
     with output.open("w", encoding="utf-8") as handle:
         handle.write(
             json.dumps(
@@ -380,6 +387,13 @@ def run_workloads(
             failure: str | None = None
             deadline = time.monotonic() + share if share else None
             for iteration in range(1, iterations + 1):
+                # On Helios every iteration is a freshly spawned process, so
+                # a workload naming its scratch after the process gets a new
+                # name each time. Here one process runs them all, and
+                # `fs-smallfiles` found it: the second `mkdir` of the same
+                # directory wrote "File exists" to stderr and failed a cell
+                # that had nothing wrong with it.
+                env["HELIOS_PROCESS_ID"] = f"{os.getpid()}-{iteration}"
                 try:
                     remaining = max(1.0, deadline - time.monotonic()) if deadline else None
                     elapsed_ms, metrics = run_once(workload, argv, env, remaining)
