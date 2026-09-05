@@ -151,6 +151,13 @@ number or a limit of the runner, and the table says which. The report's
 the table is generated from what the run actually saw rather than from
 this page.
 
+One cell is failing for a reason that is not a bug in the harness:
+`instance-startup-100` and `instance-startup-500` are refused with a
+typed `SpawnErrorKind::OutOfMemory` because the user-memory pool does not
+grow with the guest (#130). The refusal is correct; the density claim of
+#28 stays unmeasured until the pool's relationship to guest memory is
+settled.
+
 The bugs the first runs of this suite found are fixed: the x86 kernel
 refusing a multi-queue `vhost` tap (#91), a user-mode spawn storm
 panicking the kernel through the task arena (#94), the OOM killer
