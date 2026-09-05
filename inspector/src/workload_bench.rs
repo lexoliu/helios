@@ -1055,6 +1055,7 @@ mod tests {
             kernel_profile_output: None,
             user_profile_output: None,
             perf_metrics_output: None,
+            workload_timeout_seconds: DEFAULT_WORKLOAD_TIMEOUT_SECONDS,
         };
         let workloads = select_workloads(&command).expect("manifest must parse");
         for class in [
@@ -1110,6 +1111,8 @@ mod tests {
             host_http_url: None,
             host_tcp_host: None,
             host_tcp_port: None,
+            host_tcp_echo_port: None,
+            keep_going: false,
             profile_output: None,
             kernel_profile_output: None,
             user_profile_output: None,
@@ -1121,7 +1124,8 @@ mod tests {
     fn timeout_test_workload(name: &str) -> Workload {
         Workload {
             name: name.to_owned(),
-            class: WorkloadClass::IoBound,
+            class: WorkloadClass::Net,
+            headline: false,
             runner: WorkloadRunner::Program,
             _description: String::new(),
             command: None,
@@ -1132,6 +1136,7 @@ mod tests {
             stderr_empty: false,
             requires_host_http: false,
             requires_host_tcp: false,
+            requires_host_tcp_echo: false,
             wasm_path: None,
             remote_path: None,
             destination_path: None,
