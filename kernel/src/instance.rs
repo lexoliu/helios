@@ -765,8 +765,8 @@ pub struct ActivityStep {
 ///
 /// [`RegisteredInstance`] is a handle: cloneable, shared, readable by
 /// anyone. Activity is not. The registry entry counts how many stores
-/// are inside an instance's guest code — a `wasi:thread-spawn` thread
-/// gets its own store over the same instance — but the resume/pause
+/// are inside an instance's guest code — a guest thread gets its own
+/// store over the same instance — but the resume/pause
 /// pairing behind each of those counts belongs to exactly one owner.
 /// `InstanceActivity` is that owner: it is not `Clone`, it holds at
 /// most one activation on the entry, and it is the only thing that
