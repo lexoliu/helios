@@ -149,90 +149,6 @@ impl HeapPerfSnapshot {
             stats.size_class_reallocation_bytes,
         );
     }
-
-    fn allocation_count_delta(&self, stats: HeapStats) -> u64 {
-        swap_delta(&self.allocation_count, stats.allocation_count)
-    }
-
-    fn deallocation_count_delta(&self, stats: HeapStats) -> u64 {
-        swap_delta(&self.deallocation_count, stats.deallocation_count)
-    }
-
-    fn reallocation_count_delta(&self, stats: HeapStats) -> u64 {
-        swap_delta(&self.reallocation_count, stats.reallocation_count)
-    }
-
-    fn allocation_bytes_delta(&self, stats: HeapStats) -> u64 {
-        swap_delta(&self.total_allocation_bytes, stats.total_allocation_bytes)
-    }
-
-    fn deallocation_bytes_delta(&self, stats: HeapStats) -> u64 {
-        swap_delta(
-            &self.total_deallocation_bytes,
-            stats.total_deallocation_bytes,
-        )
-    }
-
-    fn reallocation_bytes_delta(&self, stats: HeapStats) -> u64 {
-        swap_delta(
-            &self.total_reallocation_bytes,
-            stats.total_reallocation_bytes,
-        )
-    }
-
-    fn allocation_size_class_count_delta(&self, stats: HeapStats) -> [u64; HEAP_SIZE_CLASS_COUNT] {
-        heap_size_class_delta(
-            &self.size_class_allocation_count,
-            stats.size_class_allocation_count,
-        )
-    }
-
-    fn deallocation_size_class_count_delta(
-        &self,
-        stats: HeapStats,
-    ) -> [u64; HEAP_SIZE_CLASS_COUNT] {
-        heap_size_class_delta(
-            &self.size_class_deallocation_count,
-            stats.size_class_deallocation_count,
-        )
-    }
-
-    fn reallocation_size_class_count_delta(
-        &self,
-        stats: HeapStats,
-    ) -> [u64; HEAP_SIZE_CLASS_COUNT] {
-        heap_size_class_delta(
-            &self.size_class_reallocation_count,
-            stats.size_class_reallocation_count,
-        )
-    }
-
-    fn allocation_size_class_bytes_delta(&self, stats: HeapStats) -> [u64; HEAP_SIZE_CLASS_COUNT] {
-        heap_size_class_delta(
-            &self.size_class_allocation_bytes,
-            stats.size_class_allocation_bytes,
-        )
-    }
-
-    fn deallocation_size_class_bytes_delta(
-        &self,
-        stats: HeapStats,
-    ) -> [u64; HEAP_SIZE_CLASS_COUNT] {
-        heap_size_class_delta(
-            &self.size_class_deallocation_bytes,
-            stats.size_class_deallocation_bytes,
-        )
-    }
-
-    fn reallocation_size_class_bytes_delta(
-        &self,
-        stats: HeapStats,
-    ) -> [u64; HEAP_SIZE_CLASS_COUNT] {
-        heap_size_class_delta(
-            &self.size_class_reallocation_bytes,
-            stats.size_class_reallocation_bytes,
-        )
-    }
 }
 
 fn swap_delta(value: &AtomicU64, current: u64) -> u64 {
@@ -548,73 +464,73 @@ where
             return;
         }
 
-        let allocations = self.inner.heap_perf_snapshot.allocation_count_delta(stats);
-        let allocation_bytes = self.inner.heap_perf_snapshot.allocation_bytes_delta(stats);
+        let metrics = &self.inner.perf_metrics;
+        let snapshot = &self.inner.heap_perf_snapshot;
+
         record_heap_delta_metric(
-            &self.inner.perf_metrics,
+            metrics,
             "alloc",
-            allocations,
-            allocation_bytes,
+            swap_delta(&snapshot.allocation_count, stats.allocation_count),
+            swap_delta(
+                &snapshot.total_allocation_bytes,
+                stats.total_allocation_bytes,
+            ),
         );
         record_heap_size_class_delta_metrics(
-            &self.inner.perf_metrics,
+            metrics,
             HeapMetricKind::Alloc,
-            self.inner
-                .heap_perf_snapshot
-                .allocation_size_class_count_delta(stats),
-            self.inner
-                .heap_perf_snapshot
-                .allocation_size_class_bytes_delta(stats),
+            heap_size_class_delta(
+                &snapshot.size_class_allocation_count,
+                stats.size_class_allocation_count,
+            ),
+            heap_size_class_delta(
+                &snapshot.size_class_allocation_bytes,
+                stats.size_class_allocation_bytes,
+            ),
         );
 
-        let deallocations = self
-            .inner
-            .heap_perf_snapshot
-            .deallocation_count_delta(stats);
-        let deallocation_bytes = self
-            .inner
-            .heap_perf_snapshot
-            .deallocation_bytes_delta(stats);
         record_heap_delta_metric(
-            &self.inner.perf_metrics,
+            metrics,
             "dealloc",
-            deallocations,
-            deallocation_bytes,
+            swap_delta(&snapshot.deallocation_count, stats.deallocation_count),
+            swap_delta(
+                &snapshot.total_deallocation_bytes,
+                stats.total_deallocation_bytes,
+            ),
         );
         record_heap_size_class_delta_metrics(
-            &self.inner.perf_metrics,
+            metrics,
             HeapMetricKind::Dealloc,
-            self.inner
-                .heap_perf_snapshot
-                .deallocation_size_class_count_delta(stats),
-            self.inner
-                .heap_perf_snapshot
-                .deallocation_size_class_bytes_delta(stats),
+            heap_size_class_delta(
+                &snapshot.size_class_deallocation_count,
+                stats.size_class_deallocation_count,
+            ),
+            heap_size_class_delta(
+                &snapshot.size_class_deallocation_bytes,
+                stats.size_class_deallocation_bytes,
+            ),
         );
 
-        let reallocations = self
-            .inner
-            .heap_perf_snapshot
-            .reallocation_count_delta(stats);
-        let reallocation_bytes = self
-            .inner
-            .heap_perf_snapshot
-            .reallocation_bytes_delta(stats);
         record_heap_delta_metric(
-            &self.inner.perf_metrics,
+            metrics,
             "realloc",
-            reallocations,
-            reallocation_bytes,
+            swap_delta(&snapshot.reallocation_count, stats.reallocation_count),
+            swap_delta(
+                &snapshot.total_reallocation_bytes,
+                stats.total_reallocation_bytes,
+            ),
         );
         record_heap_size_class_delta_metrics(
-            &self.inner.perf_metrics,
+            metrics,
             HeapMetricKind::Realloc,
-            self.inner
-                .heap_perf_snapshot
-                .reallocation_size_class_count_delta(stats),
-            self.inner
-                .heap_perf_snapshot
-                .reallocation_size_class_bytes_delta(stats),
+            heap_size_class_delta(
+                &snapshot.size_class_reallocation_count,
+                stats.size_class_reallocation_count,
+            ),
+            heap_size_class_delta(
+                &snapshot.size_class_reallocation_bytes,
+                stats.size_class_reallocation_bytes,
+            ),
         );
     }
 

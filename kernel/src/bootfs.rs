@@ -217,10 +217,16 @@ impl BootDirectoryHandleExt for DirectoryHandle<BootDirectory> {
         } else {
             with_trailing_slash(&directory.path)
         };
-        let mut entries = Vec::new();
+        let mut entries: Vec<BootDirectoryEntry> = Vec::new();
 
         for child in directory_child_entries(&directory.image, &prefix) {
-            push_boot_directory_entry(&mut entries, child.name, child.is_directory);
+            if entries.iter().any(|entry| entry.name == child.name) {
+                continue;
+            }
+            entries.push(BootDirectoryEntry {
+                name: child.name.to_owned(),
+                is_directory: child.is_directory,
+            });
         }
 
         entries
@@ -302,21 +308,6 @@ fn directory_child_entries<'a>(
     directories.chain(files)
 }
 
-fn push_boot_directory_entry(
-    entries: &mut Vec<BootDirectoryEntry>,
-    name: &str,
-    is_directory: bool,
-) {
-    if entries.iter().any(|entry| entry.name == name) {
-        return;
-    }
-
-    entries.push(BootDirectoryEntry {
-        name: name.to_owned(),
-        is_directory,
-    });
-}
-
 impl FileSystem for EmbeddedBootFs {
     type Directory = BootDirectory;
     type File = BootFile;
@@ -378,7 +369,7 @@ impl Directory for BootDirectory {
                 let next_path = directory_child_path(&directory.path, child.name);
                 if directory_entry_exists(&entries, &next_path) {
                     continue;
-                };
+                }
 
                 if child.is_directory {
                     entries.push(DirectoryEntry::Directory(BootDirectory {

@@ -267,14 +267,18 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
                 return;
             }
 
-            match self.shared.next_sleep_deadline.compare_exchange_weak(
-                published,
-                deadline,
-                AtomicOrdering::AcqRel,
-                AtomicOrdering::Acquire,
-            ) {
-                Ok(_) => break,
-                Err(_) => continue,
+            if self
+                .shared
+                .next_sleep_deadline
+                .compare_exchange_weak(
+                    published,
+                    deadline,
+                    AtomicOrdering::AcqRel,
+                    AtomicOrdering::Acquire,
+                )
+                .is_ok()
+            {
+                break;
             }
         }
 
