@@ -19,6 +19,8 @@ pub use compaction::{
     CompactionBudget, CompactionPolicy, CompactionReport, CompactionTarget, Compactor,
     PressureLevel,
 };
+#[cfg(test)]
+pub(crate) use executor::executor_test_guard;
 pub use executor::{
     Executor, ExecutorRunStats, InstanceSpawner, JoinHandle, LocalJoinHandle, READY_BATCH_TASKS,
     Spawner, TaskCapacityError, TaskFunding,

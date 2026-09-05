@@ -7,7 +7,6 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt::{self, Write};
 use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll};
 use core::time::Duration;
 
@@ -133,12 +132,34 @@ pub type RuntimeDeadlinePollable<CpuImpl, HostFs> =
 
 /// A long-running bring-up phase the heartbeat reports on.
 ///
-/// The name, its start, and the flag that ends it are one description
-/// of the same phase, so they travel together.
-pub(super) struct ComponentPhase<'a> {
+/// The name and its start are one description of the same phase, so
+/// they travel together. When the phase ends is not part of the
+/// description: that is the guard's job, see [`ComponentPhaseHeartbeat`].
+pub(super) struct ComponentPhase {
     pub(super) name: &'static str,
     pub(super) started_at: u64,
-    pub(super) done: &'a Arc<AtomicBool>,
+}
+
+/// Owns the heartbeat task for exactly as long as its phase lasts.
+///
+/// The heartbeat is instance-funded, so it holds a block of the
+/// executor's per-processor instance share (#101) while it runs.
+/// Dropping this guard cancels the task, and cancelling drops the
+/// future, which returns that block. The release is therefore tied to
+/// a value going out of scope — it happens on every way a phase can
+/// end, including an early `?`, an instance condemned mid-run, and a
+/// run future dropped on its fiber.
+///
+/// The shape this replaces was a detached task polling an
+/// `Arc<AtomicBool>` that the run path had to remember to set after
+/// its own sleep interval had elapsed. It returned the block one
+/// heartbeat interval late on the paths that did set the flag and
+/// never on the paths that returned before reaching it, so a burst of
+/// short-lived instances left the instance share full of heartbeats
+/// for instances that were already gone (#132).
+#[must_use = "the phase heartbeat runs until its guard is dropped"]
+pub(super) struct ComponentPhaseHeartbeat {
+    _task: crate::JoinHandle<()>,
 }
 
 fn spawn_component_phase_heartbeat<CpuImpl>(
@@ -147,32 +168,23 @@ fn spawn_component_phase_heartbeat<CpuImpl>(
     timer: &crate::Timer<CpuImpl>,
     progress: &helios_hal::watchdog::ProgressCounter,
     write_serial: fn(&[u8]),
-    phase: ComponentPhase<'_>,
-) -> Result<(), crate::TaskCapacityError>
+    phase: ComponentPhase,
+) -> Result<ComponentPhaseHeartbeat, crate::TaskCapacityError>
 where
     CpuImpl: Cpu + Clone,
 {
     let ComponentPhase {
         name: phase,
         started_at,
-        done,
     } = phase;
-    spawner.try_spawn_detached({
-        let done = done.clone();
+    let task = spawner.try_spawn({
         let cpu = cpu.clone();
         let timer = timer.clone();
         let progress = progress.clone();
         async move {
             let interval = Duration::from_nanos(COMPONENT_PHASE_HEARTBEAT_INTERVAL_NANOS);
             loop {
-                if done.load(Ordering::Acquire) {
-                    return;
-                }
-
                 timer.sleep_for(interval).await;
-                if done.load(Ordering::Acquire) {
-                    return;
-                }
 
                 let now = monotonic_nanos(&cpu);
                 progress.record_progress();
@@ -185,7 +197,8 @@ where
                 }
             }
         }
-    })
+    })?;
+    Ok(ComponentPhaseHeartbeat { _task: task })
 }
 
 #[derive(Clone, Copy)]
@@ -1488,9 +1501,8 @@ where
     );
 
     let executor = runtime.instantiate(&engine, &compiled, component_world, context);
-    let instantiate_done = Arc::new(AtomicBool::new(false));
     let instantiate_started_at = monotonic_nanos(&instantiate_cpu);
-    spawn_component_phase_heartbeat(
+    let instantiate_heartbeat = spawn_component_phase_heartbeat(
         &instantiate_spawner,
         &instantiate_cpu,
         &instantiate_timer,
@@ -1499,12 +1511,11 @@ where
         ComponentPhase {
             name: "instantiate",
             started_at: instantiate_started_at,
-            done: &instantiate_done,
         },
     )
     .map_err(DebuggerError::TaskCapacity)?;
     let executor = executor.await;
-    instantiate_done.store(true, Ordering::Release);
+    drop(instantiate_heartbeat);
     let executor = executor.map_err(DebuggerError::InstantiateComponent)?;
     emit_stage_marker(write_serial, "instantiate:ok");
 
@@ -4268,4 +4279,139 @@ enum DebuggerError {
     GuestFailed,
     #[error("the executor has no task capacity left for the debugger component: {0}")]
     TaskCapacity(crate::TaskCapacityError),
+}
+
+#[cfg(test)]
+mod tests {
+    use helios_hal::cpu::ProcessorId;
+    use helios_hal::watchdog::ProgressCounter;
+
+    use super::{ComponentPhase, ComponentPhaseHeartbeat, spawn_component_phase_heartbeat};
+    use crate::test_support::TestCpu;
+    use crate::{Executor, InstanceSpawner, TaskCapacityError, TaskFunding, Timer};
+
+    /// One block per 64-byte granule is the most blocks the 768 KiB
+    /// instance share of a processor's task arena can ever hold, so a
+    /// run this long outlives the share whatever size class the
+    /// heartbeat future lands in. Nothing in the loop tells a heartbeat
+    /// its phase is over; the only thing that ends one is its guard
+    /// going out of scope.
+    const PHASES_PAST_THE_SHARE: usize = 768 * 1024 / 64 + 1;
+
+    /// The heartbeat only writes in debug builds, and where it writes is
+    /// not what these tests are about.
+    fn discard_serial(_: &[u8]) {}
+
+    struct PhaseFixture {
+        executor: Executor,
+        spawner: InstanceSpawner<TestCpu>,
+        timer: Timer<TestCpu>,
+        progress: ProgressCounter,
+        cpu: TestCpu,
+    }
+
+    impl PhaseFixture {
+        fn new() -> Self {
+            let cpu = TestCpu::without_entropy();
+            let executor = Executor::new(ProgressCounter::new(), 1, ProcessorId::new(0));
+            let spawner = executor
+                .spawner(cpu)
+                .instance_spawner(TaskFunding::Instance);
+            Self {
+                executor,
+                spawner,
+                timer: Timer::new(cpu),
+                progress: ProgressCounter::new(),
+                cpu,
+            }
+        }
+
+        fn start_phase(&self) -> Result<ComponentPhaseHeartbeat, TaskCapacityError> {
+            spawn_component_phase_heartbeat(
+                &self.spawner,
+                &self.cpu,
+                &self.timer,
+                &self.progress,
+                discard_serial,
+                ComponentPhase {
+                    name: "test:phase",
+                    started_at: 0,
+                },
+            )
+        }
+
+        /// Runs the executor until it stalls. The fixture's clock never
+        /// advances, so a heartbeat polled here parks on its sleep
+        /// exactly as it does while a real instance runs, and a
+        /// heartbeat whose guard has been dropped is cancelled here —
+        /// which is where its arena block goes back.
+        fn drain(&self) {
+            self.executor.run_until_stalled_with_stats();
+        }
+
+        /// Moves the timer's inbox into its wheel, which is where a
+        /// sleep that was dropped before it fired is discarded. The
+        /// kernel event loop does this every tick; a test that runs
+        /// more phases than the timer inbox holds has to do it too.
+        fn settle_timer(&self) {
+            self.timer.fire_expired();
+        }
+
+        /// One phase, started and ended, with its heartbeat parked on
+        /// its sleep in between — the shape every instance's run phase
+        /// has.
+        fn run_phase(&self) -> Result<(), TaskCapacityError> {
+            let heartbeat = self.start_phase()?;
+            self.drain();
+            drop(heartbeat);
+            self.drain();
+            self.settle_timer();
+            Ok(())
+        }
+    }
+
+    /// Issue #132: after two workloads had spawned instances, every
+    /// later spawn on that processor was refused because the arena
+    /// still held a task per instance that had already exited. Those
+    /// tasks were phase heartbeats: detached, instance-funded, and
+    /// ended only by an `AtomicBool` they re-read after a five-second
+    /// sleep. Ending a phase must return its heartbeat's block now.
+    #[test]
+    fn a_phase_that_ends_returns_its_heartbeat_block_to_the_instance_share() {
+        let _serialized = crate::exec::executor_test_guard();
+        let fixture = PhaseFixture::new();
+
+        for phase in 0..PHASES_PAST_THE_SHARE {
+            fixture
+                .run_phase()
+                .unwrap_or_else(|error| panic!("phase {phase} was refused: {error}"));
+        }
+    }
+
+    /// The exit a condemned instance takes: the run returns an error
+    /// and nothing on the way out signals the heartbeat. The guard is
+    /// the signal, so the share comes back on this path too — the path
+    /// the old `run_done.store(true)` was skipped on entirely, which
+    /// left the block held for the rest of the kernel's life.
+    #[test]
+    fn a_phase_that_ends_in_an_error_returns_its_heartbeat_block() {
+        let _serialized = crate::exec::executor_test_guard();
+        let fixture = PhaseFixture::new();
+
+        fn run_condemned_phase(fixture: &PhaseFixture) -> Result<(), &'static str> {
+            let _heartbeat = fixture.start_phase().map_err(|_| "refused")?;
+            fixture.drain();
+            Err("instance condemned mid-run")
+        }
+
+        for phase in 0..PHASES_PAST_THE_SHARE {
+            assert_eq!(
+                run_condemned_phase(&fixture),
+                Err("instance condemned mid-run"),
+                "phase {phase} did not reach its error exit",
+            );
+            fixture.drain();
+            fixture.settle_timer();
+        }
+    }
 }

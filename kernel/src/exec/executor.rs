@@ -864,6 +864,21 @@ impl<CpuImpl: Cpu + Clone> LocalSilentScheduler<CpuImpl> {
     }
 }
 
+/// Serializes the tests that drive an [`Executor`].
+///
+/// [`EXECUTOR_GROUP`] is a process-wide singleton, so every `Executor`
+/// a test binary builds shares one set of ready queues and one task
+/// arena per processor. Two tests running their own executors at the
+/// same time would run each other's tasks and charge each other's
+/// arena, so they take this in turn instead.
+#[cfg(test)]
+pub(crate) fn executor_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static EXECUTOR_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    EXECUTOR_TESTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn executor_group(configured_processors: usize) -> NoWeakArc<ExecutorGroup> {
     EXECUTOR_GROUP
         .call_once(|| {
@@ -1078,6 +1093,7 @@ mod tests {
 
     #[test]
     fn global_batch_does_not_probe_empty_local_queue_per_task() {
+        let _serialized = super::executor_test_guard();
         let executor = Executor::new(ProgressCounter::new(), 1, ProcessorId::new(0));
         let spawner = executor.spawner(TestCpu);
         for _ in 0..8 {
@@ -1159,6 +1175,36 @@ mod tests {
 
         assert!(replacement.is_ok());
         assert!(TaskArena::allocate_instance(&arena, [0_u8; 4096]).is_err());
+    }
+
+    /// A refusal is not a charge. The arena drops the future it could
+    /// not place and records nothing, so the share still holds exactly
+    /// what was live before the refusal and admits exactly one more
+    /// task once one of them ends (#132).
+    #[test]
+    fn a_refused_instance_task_charges_nothing_to_the_share() {
+        let arena = TaskArena::new_shared();
+        let mut live = Vec::new();
+        while let Ok(task) = TaskArena::allocate_instance(&arena, [0_u8; 4096]) {
+            live.push(task);
+        }
+
+        let Err(refusal) = TaskArena::allocate_instance(&arena, [0_u8; 4096]) else {
+            panic!("the share is full");
+        };
+        assert_eq!(refusal.live_instance_tasks, live.len());
+        // Asking again after a refusal reports the same population: the
+        // refused allocation took nothing it has to give back.
+        let Err(repeated) = TaskArena::allocate_instance(&arena, [0_u8; 4096]) else {
+            panic!("the share is full");
+        };
+        assert_eq!(repeated.live_instance_tasks, live.len());
+
+        live.pop();
+        let replacement =
+            TaskArena::allocate_instance(&arena, [0_u8; 4096]).expect("one ended, one fits");
+        drop(replacement);
+        drop(live);
     }
 
     /// Kernel-funded churn must not hand the reserve to instances: a
