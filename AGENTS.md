@@ -1,238 +1,228 @@
-# Agent Contract
+# Helios contributor contract
 
-This file describes the architectural rules that any contributor — human or
-AI agent — must respect when changing this repository. These rules encode
-decisions that have already been made; they are not up for renegotiation on a
-per-task basis.
+This file is the repository's contract for every contributor, human or agent.
+It records decisions that have already been made; a task does not reopen them.
+`CLAUDE.md` is a symlink to this file. A personal or global agent configuration
+may add rules for its own user, but where the two disagree this file wins,
+because it is the only one every contributor can see.
 
-## 0. Precedence over global agent rules
+This file is edited only by a maintainer or by the agent orchestrating a task,
+never by a delegated agent. An agent that finds a rule missing or wrong reports
+the gap in its result and leaves the wording to the orchestrator.
 
-These project rules override any conflicting rule from a global agent
-configuration (for example `~/.claude/CLAUDE.md`). In particular: §3.2
-requires `--release` artifacts as the only valid evidence for any performance
-test, benchmark, or runtime acceptance measurement. Global "do not use
-`--release`" guidance does not apply to this repository's performance work.
+## 1. The tree and its layering
 
-The Wasmtime path dependency at `../wasmtime/...` is intentional. It is
-expected to track the upstream commit that the kernel target builds against;
-treat it as a vendored sibling checkout rather than a transient experiment.
-When updating the dependency, update its commit hash in `docs/wasmtime.md`
-and verify that every required check in §7 still passes against the new
-commit.
+Dependencies flow one way, from the bottom of this list to the top. A crate
+never depends on anything above it.
 
-## 1. Layering
+| Layer | Crates | Contents |
+| --- | --- | --- |
+| Hardware contracts | `hal/` | Traits, capability types and value types only. `#![no_std]`. |
+| Device and protocol libraries | `netstack/`, `virtio/`, `i6300esb/` | `#![no_std]` protocol engines and drivers. `virtio/` builds on `netstack/`; all three depend on `hal/` and none on the kernel. |
+| Shared ABIs | `compiler-abi/`, `artifact/` | `#![no_std]` wire formats shared by the kernel and host tools: the compiler plugin's request and response headers, `cwasm` target flags, the signature trailer. |
+| Kernel | `kernel/`, `kernel-macro/` | Every piece of hardware-independent runtime logic: executor, timer, memory and OOM, instance registry, component host, Wasmtime adapter, network service, host-fs client, every WIT service. `#![no_std]`, generic over `Cpu`. `kernel-macro/` embeds wasm and the bootfs at build time. |
+| Backends | `aarch64/`, `riscv/`, `x86/`, `hosted/` | Boot, trap, IRQ, timer, MMIO, UART, virtio transport and SMP wiring, and nothing else. `hosted/` runs the same kernel on the host OS under the same restriction. |
+| Kernel image | the root crate `helios` (`src/`) | The binary that links whichever backend the target selects, and runs `hosted` on the host. |
+| User space | `api/`, `api-macro/`, `programs/*` | The userland SDK and the wasm programs, kernel plugins included: `init`, `debugger`, `http-client`, `date`, `ping`, `perf`, `oob-load`. `compiler-plugin/` is the in-kernel compiler, a kernel plugin built by the host tools. |
+| Host tools | `inspector/`, `inspector-protocol/`, `cli/`, `compiler-support/`, `workspace-root/` | `std` crates that boot, build and observe a guest. `inspector-protocol/` is the WIT RPC contract between the inspector and the guest debugger. |
 
-Helios is organised as a strict, one-way dependency stack:
+The rules that follow from the table:
 
-```
-hal  <-  kernel  <-  {riscv, x86, hosted}  <-  inspector / programs
-```
+- `hal/` names hardware properties, never a consumer. Wasmtime, Cranelift, the
+  kernel's WIT interfaces and the inspector protocol are all upward-layer
+  concepts; a `hal/` trait method named after its caller belongs in `kernel/`.
+  A capability says what the hardware can do ("lazy-commit virtual memory")
+  and the kernel turns that into a runtime knob (Wasmtime's pooling
+  allocator).
+- A backend contains adapter code only. WIT worlds, RPC handlers, Wasmtime
+  orchestration, debugger logic and anything two backends would both need
+  live in `kernel/`, or in `hal/` when it is a contract. Duplicating logic
+  across backends is a defect to fix in the same change that notices it.
+- `hosted/` exists for development and test coverage. It is never evidence
+  for a performance decision, an optimization profile, or the validity of a
+  kernel optimization on real targets; those are grounded in the bare-metal
+  backends and explicit target capabilities.
+- A new crate marks a real boundary used by more than one owner or an
+  externally meaningful contract. Local implementation detail is a module in
+  the owning layer.
+- Directory names carry no `helios` prefix (`cli/`, not `helios-cli/`); package
+  names may (`helios-cli`) where the workspace convention wants them.
 
-- **`hal/`** contains architecture-neutral hardware contracts only: traits,
-  capability types, and value types. It must not contain concrete drivers or
-  runtime logic. `hal/` must also not name any specific runtime or higher-
-  layer consumer in its API surface — Wasmtime, Cranelift, the kernel's
-  WIT interfaces, the inspector protocol, etc. are all upward-layer concepts
-  that leak abstractions if they appear in `hal/`. Capabilities express the
-  underlying *hardware* property (e.g. "supports lazy-commit virtual
-  memory") and the kernel translates that into runtime knobs (e.g.
-  enabling Wasmtime's pooling instance allocator). A trait method named
-  after its caller is a code smell that warrants renaming or relocating to
-  `kernel/`.
-- **`kernel/`** contains all hardware-independent runtime logic: the executor,
-  timer, component host, observer, capability resources, host-fs client, and
-  every WIT service implementation. It is `#![no_std]` and generic over `Cpu`.
-- **`riscv/`** and **`x86/`** are concrete hardware adaptation layers. They
-  are allowed to contain boot, trap, IRQ, timer, MMIO, UART, virtio, and SMP
-  wiring — nothing else. They must not contain WIT worlds, RPC protocol
-  handlers, Wasmtime orchestration, or debugger business logic.
-- **`hosted/`** is a first-class backend that runs the same kernel on top of
-  the host OS. It has the same restrictions as `riscv/` and `x86/`: adapter
-  code only, no business logic.
-- **`hosted/`** exists for development and test coverage only. Do not use it
-  as a performance baseline, optimization profile, or evidence that a kernel
-  optimization is valid for real targets. Performance-sensitive runtime
-  decisions must be grounded in `riscv/`, `x86/`, or explicit target
-  capabilities.
+### Wasmtime
 
-If a piece of logic could reasonably be shared between two backends, it
-belongs in `kernel/` (or `hal/` for contracts), not duplicated in the backend
-crates.
+The kernel builds against the sibling checkout at `../wasmtime/crates/wasmtime`
+through a workspace path dependency. That checkout is a vendored fork, not a
+transient experiment: `docs/wasmtime.md` records the branch and the revision
+it must be at, and CI checks out the same snapshot. Moving the dependency
+means updating `docs/wasmtime.md` and passing every check in §7 against the
+new revision in the same change. Changing the fork itself is a maintainer
+decision, taken before the change is written.
 
 ## 2. Construction over conditional compilation
 
-- The kernel must not select runtimes, probe features, or switch behaviour
-  based on `#[cfg(target_arch)]`. Capabilities are injected through the backend
-  `Cpu` implementation, including executable-code publication and ISA feature
+- The kernel never selects a runtime, probes a feature, or switches behaviour
+  on `#[cfg(target_arch)]`. Capabilities arrive through the backend's `Cpu`
+  implementation, including executable-code publication and ISA feature
   probing.
-- Runtime consumers in `kernel/` depend on traits (for example
-  `ComponentRuntimeFactory`, `HostFileSystem`), not on concrete Wasmtime types.
-  Concrete runtimes are adapters that satisfy those traits.
-- Global mutable state is not allowed. State is passed explicitly through
-  `Kernel<CpuImpl>`, `RuntimeState<…>`, and similar owned structures.
-- Define Rust service traits before WIT bindings. Model each system capability
-  as a Rust trait first, then expose it through a WASI/WIT interface.
+- Kernel code depends on traits (`ComponentRuntimeFactory`, `HostFileSystem`,
+  and their kin), never on concrete Wasmtime types. A runtime is an adapter
+  that satisfies those traits.
+- There is no global mutable state. State is owned and passed explicitly
+  through `Kernel<CpuImpl>`, `RuntimeState<…>` and similar structures.
+- A system capability is a Rust trait first and a WASI/WIT interface second.
+  Define the trait, then expose it.
 
 ## 3. Code quality
 
-- No workaround, fallback, stub, or "simpler approach" code. If a design does
-  not fit, fix the abstraction rather than bypassing it.
-- No duplicated code across backends. Move shared logic into `kernel/` or
-  `hal/` immediately.
-- Do not create a new crate just to organize local implementation detail. A
-  crate must represent a real shared boundary used by multiple owners or an
-  externally meaningful contract. Otherwise place the code in the owning layer
-  as a module, usually `kernel/` for hardware-independent runtime logic or
-  `hal/` for cross-backend contracts.
-- Do not leave legacy code for backwards compatibility. When a feature is
-  removed, remove every related path in the same change.
-- Do not make unilateral architecture changes while debugging. If a failure
-  appears to involve a core subsystem, diagnose that subsystem directly instead
-  of replacing it with a different architecture.
-- Do not mask runtime, allocator, or scheduler bugs by inflating memory sizes,
-  widening budgets, disabling limits, lowering optimization, or adding
-  component-specific allocation tricks. If a program, component, or kernel
-  plugin unexpectedly exhausts memory, diagnose the real ownership boundary,
-  allocator initialization, grow path, and lifecycle semantics. Fix the shared
-  abstraction instead of making the failing artifact unusually large.
-- Virtio is the current core I/O path. Do not replace virtio-backed boot,
-  block, network, host-share, or debug transport paths with IDE, emulated
-  legacy devices, ad-hoc host files, or other fallback I/O unless the user
-  explicitly approves that architectural change in the current task.
-- Prefer third-party crates over hand-rolled implementations when the crate
-  is well maintained and no-std friendly.
-- Prefer generic types, `impl Trait`, and the type system over enum-based
-  type erasure or `dyn Trait` when the set of implementations is known at
-  compile time.
-- Async trait definitions must spell out the returned future and bounds
-  explicitly, for example
-  `fn op(&self) -> impl Future<Output = Result<T, E>> + Send + '_`; do not use
-  `async fn` in trait definitions. Trait implementations may use direct
-  `async fn` implementations when the compiler accepts them.
-- Avoid heap allocation in kernel-facing code. Use stack storage, static
-  capacity, caller-owned buffers, arenas, or explicit ownership passed through
-  typed APIs whenever the size/lifetime is known. Allocating containers such as
-  `Vec`, `String`, `Box`, `Arc`, and map types require a concrete reason tied
-  to variable-sized guest data, kernel plugin payloads, or runtime ownership.
-- Kernel memory and user memory are separate ownership domains. The kernel
-  itself should be as close to zero-allocation as practical and allocate only
-  from kernel-owned pools when allocation is unavoidable. User-mode wasm
-  instances, including kernel plugins, use separate user-memory allocation and
-  resource accounting; user OOM is handled by killing/dropping the affected
-  wasm instance and reclaiming its user-memory pool, not by growing kernel
-  budgets or adding per-plugin memory policy. Kernel OOM is fatal and must
-  panic rather than attempting recovery.
-- Avoid dynamic dispatch in kernel-facing code. Do not introduce `dyn Trait`,
-  `Box<dyn ...>`, `Arc<dyn ...>`, or type-erased callback surfaces when a
-  generic type, associated type, or concrete adapter can express the boundary.
-- Prefer `use` imports for repeated module, enum, and type paths. Do not keep
-  spelling long fully-qualified paths inline when a local import makes the
-  code clearer.
-- `anyhow` is not allowed in this repository. Use typed error enums with
-  `thiserror`; callers may translate those errors at external CLI or test
-  boundaries, but repository crates must preserve structured error provenance.
-- Diagnostics policy:
-  - `tracing` is the only diagnostic crate in this repository. Never use the
-    `log` crate, no matter the scope. If a third-party dependency emits `log`
-    records (for example `cranelift_codegen`), bridge them with
-    `tracing-log::LogTracer` rather than installing a `log::Log` impl.
-  - In kernel-side, `hal/`, library, and protocol crates, never use
-    `println!`/`eprintln!`/`dbg!`; route diagnostics through `tracing`.
-  - In user-mode wasm programs (anything under `programs/`, plus kernel
-    plugins per §3.1), `println!` and `print!` are the natural way to write
-    to stdio and are explicitly allowed; do not bend them through
-    `helios_api::io::stdout()` for the sake of the rule.
-- Never use `#[path = "…"]` to pull source files across crate boundaries.
+### 3.1 Design
 
-## 3.1 Kernel plugins
+- No workaround, fallback, stub, or "simpler approach" code. When a design
+  does not fit, fix the abstraction. When the only alternatives are a degraded
+  variant or no change, make no change and record the blocker for a
+  maintainer decision.
+- An unexpected case fails fast with a message that names what was checked.
+  Silently substituting a default (an emulator for an accelerator, a smaller
+  budget, a skipped step) hides the defect and moves the failure somewhere
+  harder to diagnose.
+- No legacy or compatibility paths. Removing a feature removes every path
+  that served it, in the same change.
+- No architecture change while debugging. A failure that appears to involve a
+  core subsystem is diagnosed in that subsystem, not routed around it.
+- Memory bugs are never masked. Do not inflate memory sizes, widen budgets,
+  disable limits, lower optimization, or add component-specific allocation
+  tricks. When a program, component, or kernel plugin exhausts memory,
+  diagnose the ownership boundary, allocator initialization, grow path and
+  lifecycle, and fix the shared abstraction.
+- Kernel memory and user memory are separate ownership domains. The kernel is
+  as close to zero-allocation as practical and, when it must allocate, uses
+  kernel-owned pools; kernel OOM is fatal and panics. User-mode wasm
+  instances, kernel plugins included, use user-memory allocation and
+  accounting; user OOM kills the instance and reclaims its pool, and never
+  grows a kernel budget or adds per-plugin policy.
+- Heap allocation in kernel-facing code needs a concrete reason tied to
+  variable-sized guest data, plugin payloads, or runtime ownership. Stack
+  storage, static capacity, caller-owned buffers, arenas and typed ownership
+  come first.
+- No dynamic dispatch in kernel-facing code. Generics, associated types and
+  concrete adapters express a boundary whose implementations are known at
+  compile time; `dyn Trait`, `Box<dyn …>`, `Arc<dyn …>` and type-erased
+  callbacks do not appear.
+- Virtio is the I/O path: boot, block, network, host share and debug
+  transport. Replacing any of them with IDE, an emulated legacy device, an
+  ad-hoc host file, or other fallback I/O is an architectural change that
+  needs explicit approval in the task that proposes it.
+- A well-maintained, `no_std`-friendly third-party crate beats a hand-rolled
+  implementation.
 
-- `Kernel plugin` is the authoritative term for an ordinary user-mode wasm
-  program running inside Wasmtime with the normal runtime isolation model.
-- Kernel plugins are not a separate execution class. The distinction is in
-  provisioning and lifecycle management, not in a different runtime boundary.
+### 3.2 Rust style
+
+- `async fn` is the syntax for an async function in an impl block or at module
+  level. A trait *declaration* spells its future out, with bounds, because
+  that is where the contract lives:
+  `fn op(&self) -> impl Future<Output = Result<T, E>> + Send + '_;`
+  An implementation of that trait writes `async fn op(&self) -> Result<T, E>`;
+  the declaration's bounds are checked against it. `fn … -> impl Future` in an
+  implementation is correct only when the body returns another future
+  untouched (a forwarder) rather than wrapping it in an `async` block.
+  `clippy::manual_async_fn` enforces the impl-block half of this rule and
+  is never allowed off.
+- Errors are typed enums with `thiserror`; `anyhow` does not appear in this
+  repository. A CLI or test boundary may translate an error into text, but
+  every crate preserves structured provenance.
+- Diagnostics go through `tracing`, the only diagnostic crate in the tree.
+  The `log` crate is never used; a dependency that emits `log` records
+  (`cranelift_codegen`, for one) is bridged with `tracing_log::LogTracer`.
+  Kernel, `hal/`, library and protocol crates never call `println!`,
+  `eprintln!` or `dbg!`. User-mode wasm programs under `programs/`, kernel
+  plugins included, write to stdio with `println!` and `print!` as the
+  natural thing; do not route them through the SDK for the rule's sake.
+- Structured text is never built by string concatenation. A multi-line
+  literal lives in a file pulled in with `include_str!`; templated output uses
+  a compile-time typed template or a serde serializer for JSON, YAML and TOML,
+  so a renamed field fails the build instead of emitting a broken document.
+- Repeated module, enum and type paths get a `use`; long fully-qualified paths
+  are not spelled inline.
+- `#[path = "…"]` never pulls a source file across a crate boundary.
+- Invariants live in types, not in runtime checks; structs, traits and
+  generics express variation rather than enums or erasure.
+
+### 3.3 Kernel plugins
+
+- "Kernel plugin" is the term for an ordinary user-mode wasm program that
+  runs inside Wasmtime under the normal isolation model. Plugins differ from
+  other programs in provisioning and lifecycle, not in runtime boundary.
 - Non-core kernel functionality may depend on kernel plugins.
-- The compiler is a kernel plugin: it is bootfs-provisioned, loaded during
-  kernel startup, and trusted by the kernel for signed `cwasm` output.
+- The compiler is a kernel plugin: bootfs-provisioned, loaded at kernel
+  startup, trusted for signed `cwasm` output.
 - The HTTP client is a kernel plugin (`programs/http-client`): the kernel
-  implements only `wasi:http/types` and forwards `wasi:http/client.send`
-  through a typed provider slot to the plugin's exported
-  `wasi:http/handler`; HTTP/1.1 framing, DNS, and (later) TLS run in user
-  memory. The same provider-slot routing is the path for any future
-  interface served by a plugin.
-- Kernel plugins and ordinary user-mode programs share the same user-memory
-  and allocation contracts. Do not add plugin-private allocator policy, custom
-  memory floors, or oversized linker memory settings to work around OOM. A
-  kernel plugin may fail with a typed OOM result and be discarded/restarted by
-  its owner; that lifecycle belongs in the shared runtime contract.
+  implements `wasi:http/types` only and forwards `wasi:http/client.send`
+  through a typed provider slot to the plugin's `wasi:http/handler`; HTTP/1.1
+  framing, DNS and, later, TLS run in user memory. The provider slot is the
+  route for any future interface a plugin serves.
+- Plugins share the user-memory and allocation contract of every program.
+  There is no plugin-private allocator policy, memory floor, or oversized
+  linker memory. A plugin may fail with a typed OOM result and be discarded
+  or restarted by its owner through the shared runtime contract.
 
-## 3.2 Wasmtime runtime performance
+### 3.4 Wasmtime runtime performance
 
-- The kernel must provide an internal exception/signal mechanism usable by
-  Wasmtime runtime code. Do not treat `Config::signals_based_traps(false)` as
-  a final solution; disabling signals-based traps removes important Wasmtime
-  performance paths such as guard-page bounds-check elimination and Winch
-  compatibility.
-- Wasmtime performance features such as typed function references, SIMD,
-  relaxed SIMD, and target ISA feature probing must remain correctly enabled
-  when the real target supports them.
-- Full x86 AVX/FMA/AVX512 enablement is an explicit TODO until the x86 kernel
-  provides OSXSAVE, XCR0 configuration, and XSAVE/XRSTOR state preservation.
-- `hosted/` must not be used as evidence for Wasmtime runtime performance
-  decisions. Runtime optimization choices must be based on real kernel targets
-  and explicit target capabilities.
-- Any performance test, benchmark, or acceptance measurement must run with
-  optimized `--release` artifacts. Debug builds are acceptable for functional
-  checks and diagnosis only; do not use them as performance evidence.
-- Every Wasmtime perf opt-in the kernel can support must stay enabled:
+- The kernel provides the exception and signal mechanism Wasmtime's runtime
+  needs. `Config::signals_based_traps(false)` is never a final answer: it
+  removes guard-page bounds-check elimination and Winch compatibility.
+- Typed function references, SIMD, relaxed SIMD and target ISA feature
+  probing stay correctly enabled wherever the real target supports them.
+- Every Wasmtime performance opt-in the kernel can support stays enabled:
   pooling instance allocation, signals-based traps, epoch interruption,
-  SIMD/threads/component-model, `async_stack_zeroing(false)`. Once the user
-  VM is real, `memory_reservation` and `memory_guard_size` must eliminate
-  wasm32 bounds checks, with `memory_init_cow(true)` and
-  `memory_may_move(false)`. Disabling any of these requires a same-PR
-  justification of the alternative semantic path.
+  SIMD, threads, the component model, `async_stack_zeroing(false)`. With a
+  real user VM, `memory_reservation` and `memory_guard_size` eliminate wasm32
+  bounds checks, with `memory_init_cow(true)` and `memory_may_move(false)`.
+  Disabling any of them needs a same-PR justification of the alternative
+  semantic path.
+- Full x86 AVX, FMA and AVX-512 enablement waits on the x86 kernel providing
+  OSXSAVE, XCR0 configuration and XSAVE/XRSTOR state preservation, and is
+  tracked as such.
+- Performance decisions rest on bare-metal targets and explicit capabilities,
+  never on `hosted/`.
+- A performance test, benchmark, or acceptance measurement runs `--release`
+  artifacts. Debug builds serve functional checks and diagnosis only.
 
-## 3.3 Naming
-
-- Directory names must not use the `helios` prefix. Use concise names such as
-  `cli/` rather than `helios-cli/`.
-- Package and crate names may still use the `helios-` prefix when that matches
-  workspace naming conventions.
-
-## 3.4 Modern hardware and SMP-first
+### 3.5 Modern hardware, SMP first
 
 Helios targets modern multi-core hardware. SMP correctness is a day-one
 property of every kernel and `hal/` subsystem, never a follow-up.
 
-- New abstractions state their concurrency contract before their API: which
-  ops are lock-free, which take an async mutex, which fan out to remote
-  processors. "Add SMP later" is not an acceptable design note.
-- Any address-space mutation invalidates the local TLB and dispatches an IPI
-  shootdown to every other processor that has run in that space. Skipping
-  the IPI is a regression.
-- Hot paths use per-CPU storage indexed by `Cpu::current_processor()`, and
-  cross-processor queues prefer atomics or lock-free channels over `Mutex`.
-- Hardware features that already exist on the target (XSAVE/AVX, MWAIT,
-  cache-coherent I/O, gicv3) must be brought up properly rather than
-  avoided because they need SMP-aware setup.
+- A new abstraction states its concurrency contract before its API: which
+  operations are lock-free, which take an async mutex, which fan out to other
+  processors. "Add SMP later" is not a design note.
+- Every address-space mutation invalidates the local TLB and sends an IPI
+  shootdown to every other processor that has run in that space.
+- Hot paths use per-CPU storage indexed by `Cpu::current_processor()`;
+  cross-processor queues prefer atomics and lock-free channels to a mutex.
+- Hardware the target already has (XSAVE and AVX, MWAIT, cache-coherent I/O,
+  GICv3) is brought up properly rather than avoided because its setup is
+  SMP-aware.
 
-## 3.5 Performance baselines
+### 3.6 Performance baselines
+
+Performance is measured on one architecture: x86-64 Linux under KVM. Nearly
+everything a Helios benchmark exercises lives in the cross-platform kernel,
+so a second architecture would measure the emulator or the host, not the
+kernel. `bench-x86-64-linux` is CI's only benchmark lane; the aarch64 and
+riscv64 lanes are functional checks under TCG and never a performance
+surface. GitHub's Arm runners expose no KVM, and macOS runners are not used
+(§7).
 
 Capture a baseline before any change that affects kernel-side runtime
-performance, then compare after. Baseline logs and reports live in
-`target/perf-baselines/` and are not committed; cite the median
-`elapsed_ms` and any regression directly in the PR description.
+performance, compare after, and cite the medians and any regression in the
+PR. Baseline logs live under `target/perf-baselines/` and are not committed.
+A developer laptop is not a benchmark host: take numbers from the CI lane or
+a dedicated machine.
 
-**The performance surface is x86-64 Linux under KVM.** Nearly everything
-a helios benchmark measures lives in the cross-platform kernel, so
-performance is single-architecture by decision, and `bench-x86-64-linux`
-is the only benchmark lane CI has. Arm GitHub runners publish no
-`/dev/kvm` (probe run 33944339758), so there is no accelerated aarch64
-lane to have.
-
-The canonical workload is the in-kernel compiler plugin compiling a fixed
-wasm input. `aot-bench` on a local arm64 machine under HVF stays a valid
-optional measurement of the same workload on a second architecture, but
-it is no longer required and never comes from CI:
+The canonical compute workload is the in-kernel compiler plugin compiling a
+fixed wasm input. The regression target is the median `elapsed_ms` over
+iterations 2..N; iteration 1 pays the cold cache build and is excluded.
+`--compiler-timing` adds a Cranelift pass breakdown for diagnosis, not for
+the baseline.
 
 ```bash
 ./target/release/helios-inspector vm --arch x86-64 --release --accel kvm \
@@ -240,26 +230,13 @@ it is no longer required and never comes from CI:
     | tee target/perf-baselines/x86-64-kvm-curl-<short-sha>.log
 ```
 
-The same workload on an arm64 machine under HVF, when a second
-architecture is worth a look:
-
-```bash
-./target/release/helios-inspector vm --arch aarch64 --release --accel hvf \
-    aot-bench artifacts/wasi-tools/curl.wasm --iterations 5 \
-    | tee target/perf-baselines/aarch64-hvf-curl-<short-sha>.log
-```
-
-The regression target is the median `elapsed_ms` across iterations
-2..N — iteration 1 is the cold cache-build cost and excluded from
-steady-state comparisons. `--compiler-timing` adds a cranelift pass
-breakdown to the log; use it for diagnosis when a regression appears,
-not for the canonical baseline.
-
-Network-path changes take a second baseline, because the compiler
-workload never touches the NIC. The canonical network workload is
-`tcp-throughput` on a multi-queue backend — `user` (slirp) is a
-single-queue, no-offload path and is not valid evidence for anything the
-virtio-net driver negotiates:
+A network-path change takes a second baseline, because the compiler workload
+never touches the NIC. The canonical network workload is `tcp-throughput` on
+a multi-queue tap backend; slirp (`user`) is single-queue with no offload and
+is not evidence for anything the virtio-net driver negotiates. Cite the
+`virtio-net online` boot line beside the median: it records the queue-pair
+count and the checksum and TSO bits the run actually had. `docs/networking.md`
+covers the backends and the privileged setup.
 
 ```bash
 helios-inspector vm net-setup \
@@ -271,140 +248,111 @@ helios-inspector vm net-setup \
     | tee target/perf-baselines/x86-64-tap-tcp-<short-sha>.jsonl
 ```
 
-Cite the negotiated feature set alongside the median: the `virtio-net
-online` boot line records the queue-pair count and the checksum/TSO bits
-the run actually had. `docs/networking.md` covers the backends, the
-privileged setup, and what each one can exercise.
+The same `aot-bench` on an arm64 machine under HVF (`--arch aarch64 --accel
+hvf`) is a valid optional look at a second architecture. It is never required
+and never comes from CI.
 
-**In CI the multi-queue network baseline is the x86-64 KVM lane**, the
-same single lane the compiler workload comes from. Locally the same
-baseline is any host with a tap backend.
+### 3.7 Architectural ambition
 
-Every helios CI lane runs on a Linux runner, and the aarch64 and riscv64
-lanes CI keeps — `smoke-aarch64` and `smoke-riscv64` — are TCG functional
-checks, never performance surfaces. Neither the inspector nor a lane may
-reach TCG by falling back: the accelerator is named, and a host that
-cannot provide the one it was asked for fails saying which check refused
-(#118).
-
-## 3.6 Architectural ambition
-
-- Performance, scalability, and architectural cleanliness work must
-  not be cut short because the change is large. If an improvement
-  better tracks modern high-performance practice and yields a more
-  elegant abstraction without violating an existing contract, take
-  the full path — including cross-crate interface reshapes,
-  ownership reorganization across subsystems, and ABI changes across
-  backends.
-- Do not estimate effort. Phrases like "X hours", "X days", "quick
-  win", "low-effort", or any time-cost framing are not valid
-  decision inputs. The only decision criteria are: (a) does the
-  change resolve a root problem; (b) does the resulting code track
-  modern practice and read more cleanly; (c) does it introduce any
-  new contract violation. All three pass → land it.
-- Do not propose a degraded variant in order to "ship something
-  first". If the only options are a degraded variant or no change,
-  do not change — record the decision as a real blocker for
-  explicit user discussion, and do not freelance an alternative.
-- Large changes should be discussed proactively (via AskUserQuestion
-  or normal conversation) to align on intent and direction. Such
-  discussions are for alignment, not for requesting permission to
-  land a degraded variant.
+- Performance, scalability and cleanliness work is not cut short because the
+  change is large. When an improvement tracks modern high-performance
+  practice and yields a cleaner abstraction without breaking a contract here,
+  take the full path: cross-crate interface reshapes, ownership moves across
+  subsystems, ABI changes across backends.
+- Effort is not a decision input. "Hours", "days", "quick win" and any other
+  time-cost framing do not appear in a proposal. The criteria are whether the
+  change resolves a root problem, whether the result tracks modern practice
+  and reads more cleanly, and whether it introduces a contract violation.
+- Large changes are discussed before they are built, to align on direction.
+  That discussion is for alignment, never for permission to land a degraded
+  variant.
 
 ## 4. Async-first execution
 
-The kernel runs a cooperative async executor; anything that pins it blocks
-every other task, including the 9p host-fs transport, WASI futures, and
-timers. The rules below apply to every crate that is either `#![no_std]` or
-driven by the cooperative executor (hal, kernel, riscv, x86, hosted runtime
-paths, components).
+The kernel runs a cooperative async executor. Anything that pins it blocks
+every other task: the 9p host-fs transport, WASI futures, timers, the network
+service. These rules bind every `#![no_std]` crate and every crate the
+executor drives (`hal/`, `kernel/`, the backends' runtime paths, components).
 
-- **Do not call `block_on` in production code.** The only legitimate uses
-  are (a) tests, (b) bootstrap entry points that run *before* the kernel
-  executor starts (e.g. `run_system_component`), and (c) the `block_on`
-  definition itself. If you feel you need `block_on` elsewhere, make the
-  caller async instead.
-- **Never make an async operation look synchronous.** If an operation
-  reaches a trait that implements it with `.await`, the public entry point
-  must also be `async` (or return an `impl Future`). Do not hide an async
-  call behind a sync shim by `block_on`-ing internally.
-- **Never busy-wait on external state inside an async context.**
-  `core::hint::spin_loop()` is only acceptable for sub-microsecond hardware
-  synchronisation (UART TX FIFO drain, virtio descriptor completion,
-  critical-section contention). For anything that waits on software state
-  (I/O readiness, channel message, transport response), use `Notify`,
-  oneshot channels, or `yield_now().await`.
-- **Non-blocking adapters for blocking APIs.** Serial readers, channel
-  receivers, and similar interfaces expose a non-blocking "try" variant
-  (`try_read_serial`, `try_recv`, etc.) so async callers can yield between
-  polls. Blocking variants exist only for bootstrap paths.
-- **No `Arc<Mutex<T>>` hidden behind async APIs.** Prefer channels, kernel
-  `Notify`, or single-owner `RefCell` within a task. When a lock is
-  unavoidable, use the kernel's async `Mutex`/`RwLock` from
-  `kernel/src/sync.rs` and release the guard before `.await` points.
-- **Yielding, not spinning, is the currency.** Any loop that polls for
-  progress must `yield_now().await` on the non-ready path, giving the
-  executor a chance to drive the task that produces the progress.
+- `block_on` does not appear in production code. Its only uses are tests,
+  bootstrap entry points that run before the executor starts, and its own
+  definition. A caller that seems to need it becomes async instead.
+- An async operation never looks synchronous. When an operation reaches a
+  trait that implements it with `.await`, the public entry point is `async`
+  or returns a future; no sync shim hides a `block_on`.
+- Nothing busy-waits on software state inside an async context.
+  `core::hint::spin_loop()` is for sub-microsecond hardware synchronisation
+  only: a UART FIFO drain, a virtio descriptor completion, critical-section
+  contention. Readiness, channel messages and transport replies are awaited
+  through `Notify`, oneshot channels, or `yield_now().await`.
+- A signal is armed before the condition is tested, never after, so that a
+  wake-up between the test and the park cannot be lost. `Notify::notify_all`
+  is a broadcast to waits that already exist; `notify_one` and
+  `notify_count` store permits. The two never mix.
+- Blocking interfaces (serial readers, channel receivers) expose a
+  non-blocking `try_*` variant for async callers. Blocking variants exist for
+  bootstrap paths only.
+- No `Arc<Mutex<T>>` behind an async API. Channels, the kernel `Notify`, and
+  single-owner `RefCell` within a task come first; when a lock is unavoidable
+  it is the kernel's async `Mutex` or `RwLock` from `kernel/src/exec/sync.rs`,
+  and the guard is released before an `.await`.
+- A loop that polls for progress yields on the non-ready path so the executor
+  can drive the task that produces the progress.
 
 ## 5. Inspector surface
 
-- Inspector commands are exactly `shell`, `stats`, `tracing`, `repl`, and
-  `vm`. Do not re-introduce `qemu-shell` or any legacy `dash` CLI entry.
-- `repl` treats `stats` and `tracing` as local shortcuts and forwards all
-  other input to the guest shell.
-- `vm` boots the selected architecture under QEMU, waits for the guest
-  debugger component to come up, then drops into a `repl` session.
-- `helios-inspector vm --arch aarch64 --acpi` boots the `virt` machine with
-  ACPI tables instead of a device tree. The aarch64 kernel takes its whole
-  platform description from the firmware and QEMU publishes one description or
-  the other, never both, so both modes have to keep booting; the
-  `smoke-aarch64` CI job runs each of them on `ubuntu-24.04-arm` under
-  TCG, against a pinned upstream QEMU the lane builds and caches because
-  the one Ubuntu 24.04 ships asserts in its emulated GICv3 CPU interface
-  under multi-threaded TCG (#85). Every helios CI lane runs on a Linux
-  runner; a `runs-on: macos-*` job does not belong in this repository.
-- `helios-inspector vm --kernel-debug --gdb <endpoint>` is the supported QEMU
-  gdbstub path for symbol-level kernel debugging. Use `--gdb-wait` when the
-  debugger must attach before kernel entry. Use endpoints such as `tcp::1234`
-  with GDB (`target remote :1234`) or LLDB (`gdb-remote 1234`). Keep this path
-  working for both `riscv64` and `x86-64`.
-- `helios-inspector vm --debug` is the shortcut for local kernel debugging:
-  it enables the kernel debug profile, opens the default gdbstub, waits for
-  the debugger before kernel entry, keeps the runtime directory, and exposes
-  monitor/QMP sockets. Prefer this over hand-written QEMU invocations.
-- Inspector VM must expose practical diagnosis knobs for future work:
-  retained runtime directories, QEMU stdout/stderr logs, QEMU `-d` trace logs,
-  HMP monitor sockets, QMP sockets, CPU/accelerator overrides, and explicit
-  raw QEMU argument passthrough. Add missing shortcuts to inspector instead of
-  making developers repeat long manual QEMU commands.
-- When a QEMU VM appears stuck or silent, use the inspector/QEMU debug path
-  flexibly: inspect the QEMU process, gdbstub, kernel symbols, serial socket,
-  and QEMU logs before drawing conclusions. Do not replace real target
-  debugging with `hosted/` evidence.
-- Boot and kernel debugging must be evidence-first: reproduce the failure,
-  capture serial/QEMU logs plus GDB/LLDB/QMP state when needed, and only then
-  change boot, device topology, trap, or runtime code.
-- Inspector ↔ guest communication must go through WIT RPC defined in
-  `helios-inspector-protocol`, not through ad-hoc side channels.
+- The inspector's commands are `shell`, `tracing`, `stats`, `repl` and `vm`.
+  `repl` treats `stats` and `tracing` as local shortcuts and forwards
+  everything else to the guest shell. `vm` boots the selected architecture
+  under QEMU, waits for the guest debugger component, and then runs one of
+  the session commands or a bench action: `aot-bench`, `workload-bench`,
+  `net-setup`, `net-teardown`. No `qemu-shell` or `dash` entry returns.
+- The accelerator is always named. With no `--accel`, the inspector requires
+  the profile's native accelerator and fails saying which check refused it
+  (`/dev/kvm` missing or unreadable, `kern.hv_support` not set, host
+  architecture mismatch). Emulation is asked for with `--accel tcg`, never
+  reached by falling back.
+- `vm --arch aarch64 --acpi` boots the `virt` machine from ACPI tables
+  instead of a device tree. The aarch64 kernel takes its whole platform
+  description from firmware and QEMU publishes one description or the other,
+  so both modes keep booting and CI runs both.
+- `vm --kernel-debug --gdb <endpoint>` is the QEMU gdbstub path for
+  symbol-level kernel debugging, with `--gdb-wait` to attach before kernel
+  entry; `tcp::1234` works with GDB (`target remote :1234`) and LLDB
+  (`gdb-remote 1234`). It stays working for `riscv64` and `x86-64`.
+- `vm --debug` is the local kernel-debugging shortcut: debug profile, default
+  gdbstub, wait for the debugger, retained runtime directory, monitor and QMP
+  sockets. Prefer it to hand-written QEMU invocations.
+- The inspector exposes the diagnosis knobs a developer would otherwise
+  script by hand: retained runtime directories, QEMU stdout and stderr, QEMU
+  `-d` traces, HMP and QMP sockets, CPU and accelerator overrides, raw QEMU
+  argument passthrough. A missing knob is added to the inspector rather than
+  repeated as a manual command.
+- Boot and kernel debugging is evidence first: reproduce, capture serial and
+  QEMU logs and GDB, LLDB or QMP state, and only then change boot, device
+  topology, trap, or runtime code. A stuck or silent VM is inspected through
+  the process, the gdbstub, the symbols, the serial socket and the QEMU logs
+  before any conclusion; `hosted/` evidence does not stand in for it.
+- Inspector and guest communicate through the WIT RPC defined in
+  `helios-inspector-protocol`, never through a side channel.
 
 ## 6. WASI tooling
 
-- `tools/wasi-apps/build.sh` is the single entry point that stages WASI
-  shared-fs tooling. It downloads the official CPython WASI build and
-  places it under `artifacts/python3-root/` (python3.wasm + stdlib),
-  and builds our Rust `curl-wasi` under `artifacts/wasi-tools/`.
-- Do not reintroduce a hand-rolled Python interpreter (the old
-  `tools/wasi-apps/python` stub). helios tests against real CPython or
-  nothing.
-- `docs/wasi-tools.md` documents the reproducible workflow. If runtime
-  behaviour changes, update docs and paths atomically in the same change.
+- `tools/wasi-apps/build.sh` is the single entry point that stages the WASI
+  shared-fs tooling: it downloads the official CPython WASI build into
+  `artifacts/python3-root/` (`python3.wasm` plus the standard library) and
+  builds the Rust `curl-wasi` into `artifacts/wasi-tools/`.
+- Helios tests against real CPython or nothing. A hand-rolled interpreter
+  stub does not return.
+- `docs/wasi-tools.md` describes the reproducible workflow; a change to
+  runtime behaviour updates the docs and the paths in the same change.
 
-## 7. Required checks before finishing a task
+## 7. Checks and CI
 
-Generate the matching `helios-cli kernel-prebuild` manifest first and pass it
-through `HELIOS_KERNEL_PREBUILD_MANIFEST` for the target being checked.
-
-Run these locally before declaring a change complete:
+Before a change is complete, run the recipes for every surface it can
+affect. `just check-target` and `just test-units` generate the
+`helios-cli kernel-prebuild` manifest and pass it through
+`HELIOS_KERNEL_PREBUILD_MANIFEST` themselves.
 
 ```bash
 just check-host
@@ -416,18 +364,77 @@ just lint
 just test-units
 ```
 
-`just lint` is `tools/fmt.sh --check` plus `cargo clippy … -D warnings`
-over the host crates, each guest program, and all three bare-metal targets;
-`just test-units` runs the `hal`, `virtio`, `netstack` and `kernel` unit tests
-and the `hal_layering` layering test. CI runs the same recipes, split across
-one lane each, so a red lane names the surface that broke.
+`just lint` is `tools/fmt.sh --check` plus `cargo clippy … -D warnings` over
+the host crates, each guest program, and the three bare-metal targets.
+`just test-units` runs the `hal`, `virtio`, `netstack`, `kernel` and
+`workspace-root` unit tests and the `hal_layering` test that enforces §1.
 
-Clippy is gated at `-D warnings`, and the only lint the workspace turns off is
-`clippy::manual_async_fn`, which contradicts §3's explicit-future trait style;
-it is allowed once in the root `Cargo.toml` and inherited by every crate
-through `[lints] workspace = true`. Suppressing any other lint needs an
-`#[expect(…, reason = "…")]` on the item that says why the lint is wrong
-there.
+CI (`.github/workflows/ci.yml`) runs the same recipes, one lane each, so a
+red lane names the surface that broke:
 
-Contract compliance is enforced by module ownership and by these checks, not
-by guard scripts.
+| Lane | Runner | What it proves |
+| --- | --- | --- |
+| `check-host`, `check-aarch64`, `check-riscv`, `check-x86` | `ubuntu-24.04` | Every surface compiles. |
+| `lint-fmt`, `lint-host`, `lint-aarch64`, `lint-riscv`, `lint-x86` | `ubuntu-24.04` | Formatting and clippy at `-D warnings`. |
+| `test-units`, `test-embedded-debugger` | `ubuntu-24.04` | Unit tests and the embedded debugger. |
+| `smoke-x86-64` | `ubuntu-24.04`, `--accel kvm` | Boot, shell, CPython, the in-kernel compiler, a trapped OOB load, curl over virtio-net, the raw serial captures. |
+| `smoke-riscv64` | `ubuntu-24.04`, `--accel tcg` | Boot, shell, CPython, a trapped OOB load, the inspector RPC over vsock, curl over virtio-net. |
+| `smoke-aarch64` | `ubuntu-24.04-arm`, `--accel tcg` | Boot from the device tree and from ACPI, against a pinned upstream QEMU the lane builds and caches, because Ubuntu 24.04's QEMU asserts in its emulated GICv3 under multi-threaded TCG. |
+| `bench-x86-64-linux` | `ubuntu-24.04`, `--accel kvm`, multi-queue tap | The workload benchmarks of §3.6, with the negotiated virtio-net features reported. |
+
+Every lane runs on a Linux runner. macOS runners are not used: their queue
+dominates the run and nothing Helios ships targets macOS. Every boot in CI
+names its accelerator explicitly, per §5.
+
+The lint gate is `-D warnings` with no lint allowed workspace-wide; the
+`[workspace.lints]` table exists so each crate can inherit it and is empty.
+Suppressing a lint needs `#[expect(…, reason = "…")]` on the item, with a
+reason that says why the lint is wrong there. `clippy::manual_async_fn` is
+the gate for §3.2's `async fn` rule.
+
+`dep-check.yml` runs on a schedule and on demand. `release.yml` runs
+`release-plz` on every push to `main`: it owns version numbers, the
+changelog and tags, so commits follow the conventional format (`feat:`,
+`fix:`, `feat!:`, `BREAKING CHANGE:`) and nobody edits a version or a
+changelog by hand.
+
+## 8. Branches, pull requests, evidence
+
+- Nobody pushes to `dev` or `main`. Work lives on a topic branch and lands
+  through a pull request against `dev`. `main` is the release trigger, and
+  merging into it is a maintainer decision.
+- A problem becomes an issue before it becomes a branch; one issue, one
+  branch, one PR, with `Fixes #N` on its own line in the body. A PR that
+  advances an issue without closing it says `Part of #N`.
+- Commits on `dev` are signed; the branch ruleset rejects unsigned ones.
+  Commit messages and PR bodies carry no attribution trailers, generated-by
+  footers, or session identifiers.
+- A PR merges when every check it can affect is green. A red lane that is
+  already red on `dev` and untouched by the PR gets its own issue, is named
+  in the PR body, and does not block. Evidence in the PR body is concrete:
+  the run id, the lane, the median, the negotiated feature line, the log
+  line that proved the diagnosis.
+- A change to the Wasmtime fork, to a CI runner or lane, to this file, or to
+  anything that publishes is discussed with a maintainer before it is made.
+
+## 9. Working in parallel
+
+Several agents and developers work on this tree at once. The rules that keep
+them from colliding:
+
+- One checkout per task. A delegated agent works in its own git worktree
+  branched from `origin/dev`, with a cloned `target/` for a warm cache, and
+  never edits, cleans, or builds inside another worktree or another project.
+- A delegated agent runs the per-crate checks for the crates it touched
+  (`cargo check -p`, `cargo clippy -p … -D warnings`, the crate's tests, the
+  relevant `just check-target`, file-scoped rustfmt). The workspace-wide
+  lint and test suite is CI's job; running it locally as well pays the same
+  compile twice.
+- Benchmarks never run on a developer machine. The CI bench lane produces
+  comparable artifacts; a laptop under other load does not.
+- Waiting on CI is one bounded foreground command (`timeout 590 gh pr checks
+  <N> --watch --interval 30`), not a polling loop. A wait that exceeds ten
+  minutes is a defect signal: shorten the loop rather than wait longer.
+- Every ordinary PR is one issue, one branch, one delivery. An agent that
+  finds a second problem while fixing the first files a new issue and cites
+  it, rather than widening the PR.
