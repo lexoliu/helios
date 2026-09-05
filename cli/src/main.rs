@@ -144,6 +144,18 @@ enum LimineEfiArch {
     Aarch64,
 }
 
+impl LimineEfiArch {
+    /// Removable-media boot path the UEFI firmware looks for on this
+    /// architecture, which is both what Limine installs and what the
+    /// share directory is recognised by.
+    fn efi_bootloader_name(self) -> &'static str {
+        match self {
+            Self::X86_64 => "BOOTX64.EFI",
+            Self::Aarch64 => "BOOTAA64.EFI",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PrebuildManifest {
     target: String,
@@ -367,10 +379,7 @@ impl LimineToolchain {
             .ok_or_else(|| {
                 anyhow!("failed to locate Limine shared files; set HELIOS_LIMINE_SHARE")
             })?;
-        let efi_bootloader_name = match efi_arch {
-            LimineEfiArch::X86_64 => "BOOTX64.EFI",
-            LimineEfiArch::Aarch64 => "BOOTAA64.EFI",
-        };
+        let efi_bootloader_name = efi_arch.efi_bootloader_name();
         let efi_bootloader = share_dir.join(efi_bootloader_name);
         ensure!(
             efi_bootloader.is_file(),
@@ -555,10 +564,7 @@ fn find_executable_in_path(name: &str) -> Option<PathBuf> {
 fn infer_limine_share_dir(executable: &Path, efi_arch: LimineEfiArch) -> Option<PathBuf> {
     let bin_dir = executable.parent()?;
     let prefix_dir = bin_dir.parent()?;
-    let efi_bootloader_name = match efi_arch {
-        LimineEfiArch::X86_64 => "BOOTX64.EFI",
-        LimineEfiArch::Aarch64 => "BOOTAA64.EFI",
-    };
+    let efi_bootloader_name = efi_arch.efi_bootloader_name();
     [
         prefix_dir.join("share").join("limine"),
         prefix_dir.join("share"),
@@ -1186,19 +1192,17 @@ fn encode_component(path: &Path) -> Result<Vec<u8>> {
 }
 
 fn ensure_root_keypair(root_secret_path: &Path, root_public_path: &Path) -> Result<SigningKey> {
-    if root_secret_path.is_file() {
-        let signing_key = read_signing_key(root_secret_path)?;
-        fs::write(
-            root_public_path,
-            VerifyingKey::from(&signing_key).to_bytes(),
-        )
-        .with_context(|| format!("failed to write {}", root_public_path.display()))?;
-        return Ok(signing_key);
-    }
-
-    let signing_key = SigningKey::generate(&mut OsRng);
-    fs::write(root_secret_path, signing_key.to_bytes())
-        .with_context(|| format!("failed to write {}", root_secret_path.display()))?;
+    let signing_key = if root_secret_path.is_file() {
+        read_signing_key(root_secret_path)?
+    } else {
+        let signing_key = SigningKey::generate(&mut OsRng);
+        fs::write(root_secret_path, signing_key.to_bytes())
+            .with_context(|| format!("failed to write {}", root_secret_path.display()))?;
+        signing_key
+    };
+    // The public key is rewritten either way: it is the copy the kernel
+    // verifies against, and a secret that outlived its public half would
+    // otherwise sign artifacts nothing can check.
     fs::write(
         root_public_path,
         VerifyingKey::from(&signing_key).to_bytes(),
