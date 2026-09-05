@@ -50,9 +50,17 @@ fi
 # the runtime directory puts the guest console, QEMU's own stderr and the
 # inspector's log on disk, which is the only place a CI lane can collect
 # a bring-up failure from.
+#
+# One subdirectory per invocation, named after this invocation's log: a
+# benchmark run boots one guest per workload class through this script,
+# and they cannot share a directory. The boot image and the debug socket
+# live at fixed names inside it, so the next guest's QEMU fails to take
+# the write lock on `kernel.uefi.img` while the previous one still holds
+# it, and two guests would otherwise bind one `debug.sock`.
 if [[ -n "${HELIOS_WORKLOAD_BENCH_RUNTIME_DIR:-}" ]]; then
-    mkdir -p "${HELIOS_WORKLOAD_BENCH_RUNTIME_DIR}"
-    command+=(--runtime-dir "${HELIOS_WORKLOAD_BENCH_RUNTIME_DIR}" --keep-runtime-dir)
+    runtime_dir="${HELIOS_WORKLOAD_BENCH_RUNTIME_DIR}/$(basename "${log%.jsonl}")"
+    mkdir -p "${runtime_dir}"
+    command+=(--runtime-dir "${runtime_dir}" --keep-runtime-dir)
     # A network workload that fails leaves an exit status and nothing
     # about the wire. The capture sits between the virtio-net device and
     # the host backend, so it records what the guest driver actually
@@ -60,7 +68,7 @@ if [[ -n "${HELIOS_WORKLOAD_BENCH_RUNTIME_DIR:-}" ]]; then
     # is already one per boot, and a shared path would let the second
     # workload class overwrite the first's capture.
     if [[ -n "${HELIOS_WORKLOAD_BENCH_NET_PCAP:-}" ]]; then
-        command+=(--net-pcap "${HELIOS_WORKLOAD_BENCH_RUNTIME_DIR}/net.pcap")
+        command+=(--net-pcap "${runtime_dir}/net.pcap")
     fi
 fi
 

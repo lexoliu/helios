@@ -851,8 +851,11 @@ jobs:
               printf 'comparable with the multi-queue tap lanes.'
             fi
             printf '\n\n```\n'
-            grep -h -e 'virtio-net online' -e 'virtio features negotiated' \
-              "${NET_BOOT_LOG}" ${BENCH_RUNTIME_DIR}/*.log 2>/dev/null | sort -u \
+            # One runtime subdirectory per workload class, so the logs
+            # are a level down from the directory the lane names.
+            find "${BENCH_RUNTIME_DIR}" -name '*.log' -print0 2>/dev/null \
+              | xargs -0 grep -h -e 'virtio-net online' -e 'virtio features negotiated' \
+                  "${NET_BOOT_LOG}" 2>/dev/null | sort -u \
               || printf 'no virtio-net bring-up line was logged\n'
             printf '```\n'
           } >> "$GITHUB_STEP_SUMMARY"
