@@ -9,7 +9,7 @@ where
     pub(super) timer: crate::Timer<CpuImpl>,
     pub(super) spawner: crate::InstanceSpawner<CpuImpl>,
     pub(super) runtime_state: HostRuntimeState<CpuImpl, HostFs>,
-    pub(super) instance: crate::RegisteredInstance,
+    activity: crate::InstanceActivity,
     pub(super) parent_instance_id: Option<crate::InstanceId>,
     pub(super) filesystem: DebugFileSystem<HostRuntimeState<CpuImpl, HostFs>, HostFs>,
     pub(super) clock: crate::KernelClock<CpuImpl, HostRuntimeState<CpuImpl, HostFs>>,
@@ -83,7 +83,7 @@ where
             timer,
             spawner,
             runtime_state,
-            instance,
+            activity: crate::InstanceActivity::new(instance),
             parent_instance_id,
             filesystem,
             clock,
@@ -133,7 +133,7 @@ where
 
     pub(super) fn futex_key(&self, address: u32) -> crate::FutexKey {
         crate::FutexKey::new(
-            crate::ProcessMemoryIdentity::new(self.instance.id().raw()),
+            crate::ProcessMemoryIdentity::new(self.instance().id().raw()),
             crate::GuestAddress::new(u64::from(address)),
         )
     }
@@ -285,44 +285,94 @@ where
             spawner: self.spawner.launch_spawner().clone(),
             runtime_state: self.runtime_state.clone(),
             instance_registry: self.runtime_state.instance_registry(),
-            parent_instance_id: Some(self.instance.id()),
+            parent_instance_id: Some(self.instance().id()),
             read_serial: self.read_serial,
             write_serial: self.write_serial,
+        }
+    }
+
+    pub(super) fn instance(&self) -> &crate::RegisteredInstance {
+        self.activity.instance()
+    }
+
+    /// The whole call-hook body for this store.
+    ///
+    /// Every exit that traps goes through [`crate::InstanceActivity`]'s
+    /// terminal state first. Wasmtime pairs its hooks around the call
+    /// it is making, so returning an error from a hook cancels the call
+    /// whose matching hook would have closed the transition just
+    /// recorded — while the `ReturningFromWasm` that unwinds the trap
+    /// still arrives. Ending the activation before the trap is raised
+    /// is what leaves that trailing transition nothing to close (#114).
+    pub(super) fn record_call_hook(
+        &mut self,
+        transition: crate::InstanceExecutionTransition,
+    ) -> wasmtime::Result<()> {
+        let killed = self.record_transition(transition);
+        if let Some(signal) = self.signal_state.take_pending() {
+            self.end_activation();
+            self.request_exit(128u32.saturating_add(signal));
+            return Err(wasmtime::Error::new(Preview1Exit));
+        }
+        match killed {
+            Some(reason) => Err(wasmtime::Error::from(crate::InstanceKilled { reason })),
+            None => Ok(()),
         }
     }
 
     /// Same naming as the component path: while this processor is
     /// running the program's guest code, pages it commits are the
     /// program's. See `component::runtime`'s `record_transition`.
-    pub(super) fn record_transition(&self, transition: crate::InstanceExecutionTransition) {
+    ///
+    /// Returns the kill reason when the instance has been condemned,
+    /// with the activation already ended.
+    fn record_transition(
+        &mut self,
+        transition: crate::InstanceExecutionTransition,
+    ) -> Option<crate::KillReason> {
         let now_nanos = self.now_nanos();
-        let elapsed = crate::record_instance_transition(&self.instance, transition, now_nanos);
-        let owner = match transition {
-            crate::InstanceExecutionTransition::Resume => {
-                Some(crate::MemoryOwner::new(self.instance.id().raw()))
+        let step = self.activity.record(transition, now_nanos);
+        self.apply_activity_change(step.change);
+        step.killed
+    }
+
+    /// End this store's activation because a trap the guest never
+    /// returns from is about to be raised.
+    fn end_activation(&mut self) {
+        let now_nanos = self.now_nanos();
+        let change = self.activity.end(now_nanos);
+        self.apply_activity_change(change);
+    }
+
+    /// End the activation and report the condemnation when the instance
+    /// has one, for the epoch callback that traps a CPU-bound guest.
+    pub(super) fn end_on_pending_kill(&mut self) -> Option<crate::KillReason> {
+        let reason = self.activity.pending_kill()?;
+        self.end_activation();
+        Some(reason)
+    }
+
+    fn apply_activity_change(&self, change: crate::ActivityChange) {
+        let owner = match change {
+            crate::ActivityChange::Entered => {
+                crate::MemoryOwner::new(self.activity.instance().id().raw())
             }
-            crate::InstanceExecutionTransition::Pause if elapsed.is_some() => {
-                Some(crate::MemoryOwner::NONE)
-            }
-            crate::InstanceExecutionTransition::Pause => None,
+            crate::ActivityChange::Left { .. } => crate::MemoryOwner::NONE,
+            crate::ActivityChange::Unchanged => return,
         };
-        if let Some(owner) = owner {
-            crate::set_user_memory_owner(self.cpu.current_processor(), owner);
-        }
-        if let Some(elapsed) = elapsed
+        crate::set_user_memory_owner(self.cpu.current_processor(), owner);
+        if let crate::ActivityChange::Left {
+            instance_elapsed: Some(elapsed),
+        } = change
             && self.runtime_state.profiling_enabled()
         {
             self.runtime_state.record_profile_stack_parts_nanos(
                 crate::ProfileScope::User,
                 "user;",
-                self.instance.name(),
+                self.activity.instance().name(),
                 elapsed,
             );
         }
-    }
-
-    pub(super) fn check_pending_kill(&self) -> Option<crate::KillReason> {
-        self.instance.pending_kill()
     }
 
     /// Deliver stdout/stderr bytes to a sink that cannot block, or hand
@@ -1005,24 +1055,14 @@ pub(super) fn configure_preview1_program_store<CpuImpl, HostFs>(
     store.call_hook(
         |mut caller: StoreContextMut<'_, Preview1ProgramStore<CpuImpl, HostFs>>, hook| {
             let transition = crate::wasmtime_adapter::store::translate_call_hook(hook);
-            caller.data().record_transition(transition);
-            if let Some(signal) = caller.data().signal_state.take_pending() {
-                caller
-                    .data_mut()
-                    .request_exit(128u32.saturating_add(signal));
-                return Err(wasmtime::Error::new(Preview1Exit));
-            }
-            if let Some(reason) = caller.data().check_pending_kill() {
-                return Err(wasmtime::Error::from(crate::InstanceKilled { reason }));
-            }
-            Ok(())
+            caller.data_mut().record_call_hook(transition)
         },
     );
     store.set_epoch_deadline(1);
     // Epoch ticks double as the kill observation point for CPU-bound
     // guests (see `store_with_state`): check the flag, otherwise yield.
-    store.epoch_deadline_callback(|caller| {
-        if let Some(reason) = caller.data().check_pending_kill() {
+    store.epoch_deadline_callback(|mut caller| {
+        if let Some(reason) = caller.data_mut().end_on_pending_kill() {
             return Err(wasmtime::Error::from(crate::InstanceKilled { reason }));
         }
         Ok(wasmtime::UpdateDeadline::Yield(1))

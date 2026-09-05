@@ -1560,12 +1560,17 @@ where
     store.limiter(|state| state);
     store.call_hook(
         |mut caller: StoreContextMut<'_, StoreData<CpuImpl, HostFs>>, hook| {
+            // The kill reason comes back from `record_transition`
+            // itself, with the activation already ended: a hook that
+            // recorded a transition and then returned an error would
+            // cancel the call whose matching hook closes it, and the
+            // `ReturningFromWasm` that unwinds the trap would then
+            // arrive against an activation nobody holds (#114).
             let transition = crate::wasmtime_adapter::store::translate_call_hook(hook);
-            caller.data_mut().record_transition(transition);
-            if let Some(reason) = caller.data().check_pending_kill() {
-                return Err(wasmtime::Error::from(crate::InstanceKilled { reason }));
+            match caller.data_mut().record_transition(transition) {
+                Some(reason) => Err(wasmtime::Error::from(crate::InstanceKilled { reason })),
+                None => Ok(()),
             }
-            Ok(())
         },
     );
     store.set_epoch_deadline(1);
@@ -1574,8 +1579,8 @@ where
     // wasm stretches (e.g. an AOT compile), and cancelling the future
     // instead would surface a bare interrupt trap that loses the kill
     // reason (OOM vs supervisor restart).
-    store.epoch_deadline_callback(|caller| {
-        if let Some(reason) = caller.data().check_pending_kill() {
+    store.epoch_deadline_callback(|mut caller| {
+        if let Some(reason) = caller.data_mut().end_on_pending_kill() {
             return Err(wasmtime::Error::from(crate::InstanceKilled { reason }));
         }
         Ok(wasmtime::UpdateDeadline::Yield(1))
