@@ -151,12 +151,23 @@ number or a limit of the runner, and the table says which. The report's
 the table is generated from what the run actually saw rather than from
 this page.
 
-One cell is failing for a reason that is not a bug in the harness:
-`instance-startup-100` and `instance-startup-500` are refused with a
-typed `SpawnErrorKind::OutOfMemory` because the user-memory pool does not
-grow with the guest (#130). The refusal is correct; the density claim of
-#28 stays unmeasured until the pool's relationship to guest memory is
-settled.
+These are the cells that failed in run 33959252438, the run the results
+below are rendered from, and why:
+
+| Cell | Sides | Why |
+| --- | --- | --- |
+| `instance-startup-100`, `instance-startup-500` | Helios | The user-memory pool does not grow with the guest, so the hundredth spawn is refused with a typed `SpawnErrorKind::OutOfMemory` (#130). Their Linux halves are skipped by name: a cell whose Helios half cannot be measured has nothing to compare against. |
+| `tcp-throughput`, `wasi-tcp-throughput`, `wasix-tcp-throughput` | Helios | The guest receive path stops answering and the workload's own deadline fails it (#143). |
+| `curl-http-throughput` | Helios | Never reached: the `net` class spent its share of the Helios side's budget on the three cells above and was killed at 589 s, so this one is recorded as unmeasured rather than left out. |
+| `tcp-latency` | all three | Exits non-zero on Helios, on Linux + Wasmtime and on native Linux alike, so the fault is in the workload or the host echo server rather than in the guest (#150). |
+
+The refusal behind #130 is correct; the density claim of #28 stays
+unmeasured until the pool's relationship to guest memory is settled.
+
+The per-processor task arena that #132 records — where the density cells'
+refused spawns cost every later spawn in the same guest — did not recur
+in this run: `spawn-wait` and `process-startup` were both measured after
+them.
 
 ### Nothing in the run is unbounded
 
@@ -273,6 +284,94 @@ left of it Helios is slower, and bars inside the noise floor mean nothing.
 
 ## Results
 
-<!-- helios-bench:begin run=pending -->
-No advisory run has been rendered into this page yet.
+<!-- helios-bench:begin run=33959252438 -->
+Rendered from CI run [33959252438](https://github.com/lexoliu/helios/actions/runs/33959252438) by `helios-bench render docs --run 33959252438`; the reports it was rendered from are committed under `docs/benchmarks/runs/33959252438/`.
+
+### Lane `x86-64-kvm`
+
+Advisory: this report is from `GitHub Actions 1000006547`, not a dedicated runner. Its numbers show the shape of the comparison, not a publishable result.
+
+| Pin | Value |
+| --- | --- |
+| Helios | `5b9c36c5cf28e2bc51ae3514d23d1b31f2f236c6` |
+| Vendored Wasmtime | `6bbaceda21b3de992508f1c26e45f66bfd175e68` |
+| Wasmtime on Linux | `wasmtime-v48.0.0-x86_64-linux` |
+| Fedora image | `28680fe5b371a5a8…` |
+| QEMU | pinned `8.2.2`, ran `8.2.2` |
+| Guest | 4 vCPUs, 6G (Helios) / 4G (Linux), `tap` network, virtio-blk-pci, virtio-net-pci, virtio-rng-pci |
+| Host | AMD EPYC 7763 64-Core Processor, 4 logical CPUs, kvm |
+| Noise floor | +15.1% from `quickjs-loop` before and after the suite |
+
+#### Instance start-up
+
+![Instance start-up on x86-64-kvm](benchmarks/runs/33959252438/x86-64-kvm-startup.svg)
+
+| Workload | Helios | Linux + Wasmtime | Native Linux | vs Wasmtime | vs native |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `instance-startup-1` | 16.0 [15.0, 19.0] (rejected) | 6.74 [6.45, 6.83] | 0.76 [0.71, 0.91] | n/a | n/a |
+| `instance-startup-100` (headline) | **failed** | n/a | n/a | n/a | n/a |
+| `instance-startup-500` | **failed** | n/a | n/a | n/a | n/a |
+| `spawn-wait` (headline) | 460 [458, 460] | 1,200 [1,189, 1,207] | 51.6 [50.8, 52.4] | 2.61x | 0.11x |
+| `process-startup` | 374 [334, 414] | n/a | 29.6 [29.4, 29.7] | n/a | 0.08x |
+
+#### Host call vs syscall
+
+![Host call vs syscall on x86-64-kvm](benchmarks/runs/33959252438/x86-64-kvm-hostcall.svg)
+
+| Workload | Helios | Linux + Wasmtime | Native Linux | vs Wasmtime | vs native |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `hostcall-loop` (headline) | 925 [918, 934] | 482 [481, 483] | 68.3 [68.2, 68.7] | 0.52x | 0.07x |
+
+#### IPC
+
+![IPC on x86-64-kvm](benchmarks/runs/33959252438/x86-64-kvm-ipc.svg)
+
+| Workload | Helios | Linux + Wasmtime | Native Linux | vs Wasmtime | vs native |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `pipe-pingpong` (headline) | 432 [429, 434] | 1,185 [1,153, 1,246] | 555 [551, 562] | 2.75x | 1.29x |
+| `pipe-stream` | 76.0 [74.0, 76.5] | 130 [128, 132] | 39.5 [37.9, 41.6] | 1.71x | 0.52x |
+| `stdio-pipe` | 28.0 [23.0, 28.0] | n/a | 6.76 [6.62, 7.13] | n/a | 0.24x |
+
+#### Scheduling
+
+![Scheduling on x86-64-kvm](benchmarks/runs/33959252438/x86-64-kvm-sched.svg)
+
+| Workload | Helios | Linux + Wasmtime | Native Linux | vs Wasmtime | vs native |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `sched-tasks` (headline) | 346 [342, 347] | n/a | 132 [131, 134] | n/a | 0.38x |
+
+#### Network
+
+![Network on x86-64-kvm](benchmarks/runs/33959252438/x86-64-kvm-net.svg)
+
+| Workload | Helios | Linux + Wasmtime | Native Linux | vs Wasmtime | vs native |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `curl-local-http` | 14.5 [12.0, 16.0] | n/a | 7.86 [7.76, 8.07] | n/a | 0.54x |
+| `tcp-throughput` (headline) | **failed** | n/a | 495 [489, 507] | n/a | n/a |
+| `tcp-latency` (headline) | **failed** | **failed** | **failed** | n/a | n/a |
+| `tcp-upload` | 1,015 [944, 1,072] | n/a | 573 [547, 696] (rejected) | n/a | n/a |
+| `wasix-tcp-throughput` | **failed** | n/a | 496 [490, 503] | n/a | n/a |
+| `wasi-tcp-throughput` | **failed** | 499 [492, 504] | 493 [492, 505] | n/a | n/a |
+| `curl-http-throughput` | **failed** | n/a | 200 [194, 205] | n/a | n/a |
+
+#### File I/O
+
+![File I/O on x86-64-kvm](benchmarks/runs/33959252438/x86-64-kvm-fs.svg)
+
+| Workload | Helios | Linux + Wasmtime | Native Linux | vs Wasmtime | vs native |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `fs-smallfiles` (headline) | 108 [104, 112] | n/a | 101 [100.0, 101] | n/a | 0.93x (within noise) |
+| `fs-readstream` | 26.0 [23.5, 29.0] | n/a | 7.73 [7.69, 7.89] | n/a | 0.30x |
+
+#### Compute parity
+
+![Compute parity on x86-64-kvm](benchmarks/runs/33959252438/x86-64-kvm-compute.svg)
+
+| Workload | Helios | Linux + Wasmtime | Native Linux | vs Wasmtime | vs native |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `quickjs-loop` (headline) **parity bug** | 43.0 [41.0, 45.0] | 26.8 [26.6, 27.1] | 31.1 [31.0, 31.2] | 0.62x | 0.72x |
+| `cpython-json` (headline) **parity bug** | 312 [306, 314] | 95.3 [93.7, 95.8] | 40.8 [40.6, 41.1] | 0.30x | 0.13x |
+| `cpython-regex` **parity bug** | 456 [456, 462] | 214 [212, 216] | 117 [116, 118] | 0.47x | 0.26x |
+| `aot-curl` **parity bug** | 370 [348, 371] | 111 [111, 114] | n/a | 0.30x | n/a |
+| `wasm-simd-lanes` **parity bug** | 11.0 [8.50, 11.0] | 5.77 [5.49, 5.91] | 1.00 [0.97, 1.10] | 0.52x | 0.09x |
 <!-- helios-bench:end -->

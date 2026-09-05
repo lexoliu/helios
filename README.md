@@ -139,8 +139,23 @@ machine, accelerator and virtio devices, with the same wasm precompiled by
 the same Wasmtime revision. The suite, its pins and its statistics are
 described in [docs/benchmarks.md](docs/benchmarks.md).
 
-<!-- helios-bench:begin run=pending -->
-No advisory run has been rendered into this section yet.
+<!-- helios-bench:begin run=33959252438 -->
+Numbers below are from CI run [33959252438](https://github.com/lexoliu/helios/actions/runs/33959252438) on GitHub's shared runners in advisory mode: they show the shape of the comparison, not a publishable result, until the dedicated runners described in [docs/benchmarks.md](docs/benchmarks.md) exist.
+Each cell is the median warm wall time in milliseconds with its 95% bootstrap interval; the "vs" columns divide the other side's median by Helios's, so above 1x Helios is faster. Same QEMU, accelerator, vCPUs, memory and virtio devices on every side; Linux + Wasmtime runs the same wasm precompiled by the same Wasmtime revision Helios vendors. Methodology, pins and the full tables: [docs/benchmarks.md](docs/benchmarks.md).
+
+**x86-64-kvm** — AMD EPYC 7763 64-Core Processor, kvm, noise floor +15.1%
+| Workload | Helios | Linux + Wasmtime | Native Linux | vs Wasmtime | vs native |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `quickjs-loop` (headline) **parity bug** | 43.0 [41.0, 45.0] | 26.8 [26.6, 27.1] | 31.1 [31.0, 31.2] | 0.62x | 0.72x |
+| `cpython-json` (headline) **parity bug** | 312 [306, 314] | 95.3 [93.7, 95.8] | 40.8 [40.6, 41.1] | 0.30x | 0.13x |
+| `instance-startup-100` (headline) | **failed** | n/a | n/a | n/a | n/a |
+| `spawn-wait` (headline) | 460 [458, 460] | 1,200 [1,189, 1,207] | 51.6 [50.8, 52.4] | 2.61x | 0.11x |
+| `hostcall-loop` (headline) | 925 [918, 934] | 482 [481, 483] | 68.3 [68.2, 68.7] | 0.52x | 0.07x |
+| `pipe-pingpong` (headline) | 432 [429, 434] | 1,185 [1,153, 1,246] | 555 [551, 562] | 2.75x | 1.29x |
+| `sched-tasks` (headline) | 346 [342, 347] | n/a | 132 [131, 134] | n/a | 0.38x |
+| `fs-smallfiles` (headline) | 108 [104, 112] | n/a | 101 [100.0, 101] | n/a | 0.93x (within noise) |
+| `tcp-throughput` (headline) | **failed** | n/a | 495 [489, 507] | n/a | n/a |
+| `tcp-latency` (headline) | **failed** | **failed** | **failed** | n/a | n/a |
 <!-- helios-bench:end -->
 
 ## Kernel Plugins
