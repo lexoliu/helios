@@ -34,6 +34,14 @@ if [[ -n "${HELIOS_WORKLOAD_BENCH_VM_MEMORY:-}" ]]; then
     command+=(--memory "${HELIOS_WORKLOAD_BENCH_VM_MEMORY}")
 fi
 
+# The inspector requires the profile's native accelerator when nobody
+# names one, so a host that means to measure the emulator has to say so.
+# Naming it here also puts the accelerator in the run record every
+# summary is read back from.
+if [[ -n "${HELIOS_WORKLOAD_BENCH_ACCEL:-}" ]]; then
+    command+=(--accel "${HELIOS_WORKLOAD_BENCH_ACCEL}")
+fi
+
 # A benchmark that never boots leaves nothing behind to say why. Keeping
 # the runtime directory puts the guest console, QEMU's own stderr and the
 # inspector's log on disk, which is the only place a CI lane can collect

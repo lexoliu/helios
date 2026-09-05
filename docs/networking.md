@@ -314,18 +314,29 @@ The `bench` job's x86-64 Linux lane provisions a tap through `net-setup`
 and runs with `--net-backend tap --net-queues $(nproc)` (the tap netdev
 always carries `vhost=on`), so multiqueue and offload are exercised on
 every run and the negotiated feature set is printed into the job log.
-**That lane is the multi-queue network baseline**, and until an Arm
-runner with KVM exists it is the only one CI has.
+**That lane is the multi-queue network baseline**, and it is the only
+`bench` lane there is: nearly everything a helios benchmark measures
+lives in the cross-platform kernel, so performance is
+single-architecture by decision (AGENTS.md §3.5). It names `--accel kvm`
+rather than probing for it, because a benchmark that quietly measured
+the emulator would be worse than no benchmark.
 
-The macOS lane keeps `user`: GitHub's macOS runners give no way to hold
-the vmnet entitlement or install the `socket_vmnet` daemon, so that lane
-is labelled single-queue, no-offload in its summary and its numbers are
-not comparable with the x86-64 lane's network workloads. It is there for
-the aarch64 CPU-side numbers, which HVF can produce honestly.
+Every helios CI job runs on a Linux runner, and no GitHub-hosted runner
+could produce an aarch64 baseline anyway. The Arm Linux runners publish
+no `/dev/kvm` at all — `-accel kvm` there fails with "Could not access
+KVM kernel module" — and no readable `/dev/vhost-net`, so a guest there
+runs under TCG behind a userspace tap: no accelerator, and none of the
+multiqueue or offload paths the tap backend exists to exercise. The
+macOS lane that used to stand in for them was no better; its run record
+showed `"accel":["tcg"]`, because those runners report
+`kern.hv_support=0` and the inspector's probe fell through to the
+emulator (#118). Both lanes are gone, and the inspector no longer falls
+back at all: a host that cannot provide the accelerator it was asked
+for fails naming the check that refused.
 
-There is deliberately no aarch64 Linux lane. GitHub's Arm runners expose
-neither `/dev/kvm` nor a readable `/dev/vhost-net`, so a guest there runs
-under TCG behind a userspace tap: no accelerator, and none of the
-multiqueue or offload paths the tap backend exists to exercise. A lane
-in that shape measures the emulator, so an arm64 multi-queue baseline is
-taken on a real machine (see AGENTS.md §3.5) rather than read out of CI.
+The aarch64 lane CI does run, `smoke-aarch64`, is a functional check on
+`ubuntu-24.04-arm` under `--accel tcg` and not a performance surface. It
+boots the guest from a device tree and from ACPI against a pinned
+upstream QEMU that the lane builds and caches, because the QEMU Ubuntu
+24.04 ships asserts in its emulated GICv3 CPU interface under
+multi-threaded TCG (#85).
