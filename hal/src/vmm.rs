@@ -43,6 +43,7 @@ use core::num::NonZeroU32;
 
 use thiserror::Error;
 
+use crate::device::DeviceRegion;
 use crate::pmm::PhysFrame;
 
 /// Virtual address. No alignment guarantees; ranges check
@@ -149,6 +150,10 @@ pub enum AddressSpaceError {
     NotSwapped,
     #[error("page buffer is not exactly one frame")]
     BadPageBuffer,
+    #[error("this address space cannot map device memory")]
+    DeviceMappingUnsupported,
+    #[error("the range is a device mapping, not ordinary memory")]
+    DeviceMapped,
 }
 
 /// Identity of one swapped-out page's backing store.
@@ -286,6 +291,67 @@ pub trait AddressSpace: Send + Sync + 'static {
 
     /// Change permissions on already-committed pages. No frame churn.
     fn protect(&self, virt: VirtRange, flags: PageFlags) -> Result<(), AddressSpaceError>;
+
+    /// Map `region`'s physical bytes at `virt`, which must be a
+    /// sub-range of an existing reservation exactly as long as the
+    /// region.
+    ///
+    /// No frame comes from this address space's pool: the bytes belong
+    /// to a device and were never anyone's to allocate. The leaf entries
+    /// carry the region's own attributes — a
+    /// [`MemoryKind::Device`](crate::device::MemoryKind::Device) range
+    /// is mapped so that accesses reach the device unmerged,
+    /// unspeculated and in program order, and a region that is not
+    /// writable is mapped read-only whatever `flags` ask for.
+    ///
+    /// Per the SMP contract the call invalidates the local TLB and
+    /// shoots down every other processor that has run in this space
+    /// before it returns, so no processor can reach the range through a
+    /// stale translation.
+    ///
+    /// A backend that cannot express device memory in its page tables
+    /// reports [`AddressSpaceError::DeviceMappingUnsupported`] rather
+    /// than mapping the range as ordinary memory, because a register
+    /// file behind a cacheable mapping is a silent corruption rather
+    /// than a slower one.
+    fn map_device(&self, _virt: VirtRange, _region: DeviceRegion) -> Result<(), AddressSpaceError> {
+        Err(AddressSpaceError::DeviceMappingUnsupported)
+    }
+
+    /// Remove a mapping [`Self::map_device`] installed, leaving the
+    /// range reserved and faulting.
+    ///
+    /// Nothing is returned to the frame pool — the frames were never
+    /// taken from it — and the shootdown happens before the call
+    /// returns, so the owner has provably lost its last path to the
+    /// device's registers by the time the kernel reports the device
+    /// free.
+    fn unmap_device(&self, _virt: VirtRange) -> Result<(), AddressSpaceError> {
+        Err(AddressSpaceError::DeviceMappingUnsupported)
+    }
+
+    /// Materialise physically contiguous backing for `virt` and report
+    /// where it landed.
+    ///
+    /// [`Self::commit`] is free to satisfy a range out of whatever
+    /// frames the pool has; a buffer a device reads by physical address
+    /// is not, because the device walks it linearly and knows nothing
+    /// about page tables. The returned frame is the first of
+    /// `virt.frame_count()` consecutive ones, so the caller can hand the
+    /// device one address and a length.
+    ///
+    /// `below` bounds the allocation: no frame of the run sits at or
+    /// above it. A device that drives fewer than 64 address bits passes
+    /// its limit here rather than discovering the truncation as
+    /// corruption.
+    fn commit_contiguous(
+        &self,
+        _virt: VirtRange,
+        _flags: PageFlags,
+        _below: u64,
+    ) -> Result<PhysFrame, AddressSpaceError> {
+        Err(AddressSpaceError::DeviceMappingUnsupported)
+    }
 
     /// Look up the current state of `addr`. Lock-free.
     fn translate(&self, addr: VirtAddr) -> Translation;
