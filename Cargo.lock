@@ -1945,6 +1945,7 @@ dependencies = [
  "bitflags 2.13.1",
  "bytes",
  "critical-section",
+ "crossbeam-utils",
  "divan",
  "event-listener",
  "fdt",

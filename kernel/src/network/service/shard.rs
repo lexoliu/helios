@@ -10,7 +10,7 @@
 //!
 //! Placement is therefore routinely cross-processor: the shard lock is
 //! taken by the draining CPU, not the owning one. That hand-off is
-//! completed by [`PaddedShard::arrival`] — the draining CPU raises the
+//! completed by [`ShardCell::arrival`] — the draining CPU raises the
 //! owning shard's progress signal after it releases the lock, and
 //! [`NetworkShardSet::notify_arrivals`] additionally wakes the owning
 //! processor when it is not the one that drained, so a parked executor
@@ -32,6 +32,7 @@
 //! an await point.
 
 use super::*;
+use crossbeam_utils::CachePadded;
 
 /// The shard a received frame belongs to.
 ///
@@ -202,15 +203,16 @@ pub(super) struct NetworkShard {
     pub(super) next_icmp_echo_identifier: u16,
 }
 
-/// A set of `NetworkShard` instances laid out per-CPU.
+/// One shard's stack and the per-shard words beside it.
 ///
-/// Cache-line padding around each shard avoids false sharing once
-/// multiple shards live in the box: without it, two adjacent
-/// `SpinMutex` fields would share a cache line and ping-pong on
-/// every cross-CPU lock operation. We pay the padding cost in the
-/// single-shard build to keep the layout invariant.
-#[repr(align(64))]
-pub(super) struct PaddedShard {
+/// The set holds these behind [`CachePadded`], so two adjacent
+/// shards' lock words never share a cache line, nor the 128-byte pair
+/// that x86-64's adjacent-line prefetcher and aarch64 cores move as
+/// one; without that, every cross-CPU lock operation on one shard
+/// would ping-pong the line its neighbour's lock lives on. The
+/// single-shard build pays the padding too, to keep the layout
+/// invariant.
+pub(super) struct ShardCell {
     pub(super) inner: SpinMutex<NetworkShard>,
     /// Frames this shard's stack has taken off the device, and frames
     /// it has handed back to it.
@@ -457,7 +459,7 @@ pub(super) enum WaitTarget {
 }
 
 pub(super) struct NetworkShardSet {
-    pub(super) shards: Box<[PaddedShard]>,
+    pub(super) shards: Box<[CachePadded<ShardCell>]>,
     /// Slots for listeners, which exist on every shard because an
     /// inbound connection's hash is not known when the port is opened.
     pub(super) listener_slots: ReplicaSlots<MAX_TCP_LISTENER_HANDLES>,
@@ -518,15 +520,15 @@ impl NetworkShardSet {
         F: FnMut(usize) -> NetworkShard,
     {
         assert!(shard_count != 0, "network shard count must be non-zero");
-        let mut shards: Vec<PaddedShard> = Vec::with_capacity(shard_count);
+        let mut shards: Vec<CachePadded<ShardCell>> = Vec::with_capacity(shard_count);
         for index in 0..shard_count {
-            shards.push(PaddedShard {
+            shards.push(CachePadded::new(ShardCell {
                 inner: SpinMutex::new(factory(index)),
                 rx_frames: AtomicU64::new(0),
                 tx_frames: AtomicU64::new(0),
                 rx_refused_frames: AtomicU64::new(0),
                 arrival: ProgressSignal::new(),
-            });
+            }));
         }
         Self {
             shards: shards.into_boxed_slice(),
