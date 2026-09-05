@@ -29,17 +29,15 @@ impl HostedFileSystem {
         let mut resolved = self.root.clone();
         for component in Path::new(path).components() {
             match component {
-                Component::Prefix(_) | Component::ParentDir => return Err(invalid_host_path()),
+                Component::Prefix(_) | Component::ParentDir => {
+                    return Err(HostFsError::Transport(IoError::PermissionDenied));
+                }
                 Component::RootDir | Component::CurDir => {}
                 Component::Normal(segment) => resolved.push(segment),
             }
         }
         Ok(resolved)
     }
-}
-
-fn invalid_host_path() -> HostFsError {
-    HostFsError::Transport(IoError::PermissionDenied)
 }
 
 fn map_io_error(error: io::Error) -> HostFsError {
@@ -157,7 +155,7 @@ impl HostFileSystem for HostedFileSystem {
         &self,
         path: &str,
     ) -> impl core::future::Future<Output = Result<(), HostFsError>> + Send + '_ {
-        blocking_path(self.resolve(path), |path| truncate_impl(&path))
+        blocking_path(self.resolve(path), |path| set_file_size_impl(&path, 0))
     }
 
     fn set_file_size(
@@ -338,10 +336,6 @@ fn sync_file_impl(path: &Path) -> Result<(), HostFsError> {
         .map_err(map_io_error)?
         .sync_all()
         .map_err(map_io_error)
-}
-
-fn truncate_impl(path: &Path) -> Result<(), HostFsError> {
-    set_file_size_impl(path, 0)
 }
 
 fn set_file_size_impl(path: &Path, size: u64) -> Result<(), HostFsError> {

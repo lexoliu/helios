@@ -20,8 +20,8 @@ pub struct HostedConfig {
 
 impl HostedConfig {
     pub fn from_env() -> Self {
-        let processor_count =
-            parse_env_usize("HELIOS_HOSTED_PROCESSORS").unwrap_or_else(default_processor_count);
+        let processor_count = parse_env_usize("HELIOS_HOSTED_PROCESSORS")
+            .unwrap_or_else(|| thread::available_parallelism().map_or(1, usize::from));
         assert!(
             processor_count != 0,
             "HELIOS_HOSTED_PROCESSORS must be greater than zero"
@@ -66,12 +66,6 @@ impl HostedConfig {
     pub fn init_wasi_root(&self) -> Option<&Path> {
         self.init_wasi_root.as_deref()
     }
-}
-
-fn default_processor_count() -> usize {
-    thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(1)
 }
 
 fn parse_env_usize(name: &str) -> Option<usize> {
