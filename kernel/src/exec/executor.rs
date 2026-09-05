@@ -81,13 +81,26 @@ pub struct TaskCapacityError {
     pub share_bytes: usize,
 }
 
+// A padded counter is one cache line by itself on every target, so a
+// wake on one processor's counter can never invalidate another's.
+const _: () = assert!(align_of::<CachePadded<AtomicUsize>>() >= 64);
+
+/// The queues and counters every processor's executor shares.
+///
+/// Cache-line contract: a processor's ready counter is written by
+/// whichever processor wakes a task it owns and polled by the owner
+/// on every run-loop pass, so each one sits on its own line rather
+/// than eight to a line. The two global counters are written by every
+/// processor and are padded away from the `Box` pointers beside them,
+/// which every processor reads on every schedule; without that, each
+/// global push would invalidate the line every scheduler dereferences.
 struct ExecutorGroup {
     local_queues: Box<[ReadyQueue]>,
-    local_ready_counts: Box<[AtomicUsize]>,
+    local_ready_counts: Box<[CachePadded<AtomicUsize>]>,
     task_arenas: Box<[NoWeakArc<TaskArena>]>,
     global_queue: ReadyQueue,
-    global_ready_count: AtomicUsize,
-    global_wake_cursor: AtomicUsize,
+    global_ready_count: CachePadded<AtomicUsize>,
+    global_wake_cursor: CachePadded<AtomicUsize>,
 }
 
 /// Per-processor buddy arena for task futures.
@@ -1198,7 +1211,7 @@ fn executor_group(configured_processors: usize) -> NoWeakArc<ExecutorGroup> {
             let mut task_arenas = Vec::with_capacity(configured_processors);
             for _ in 0..configured_processors {
                 local_queues.push(ready_queue());
-                local_ready_counts.push(AtomicUsize::new(0));
+                local_ready_counts.push(CachePadded::new(AtomicUsize::new(0)));
                 task_arenas.push(TaskArena::new_shared(arena_bytes));
             }
             NoWeakArc::new(ExecutorGroup {
@@ -1206,8 +1219,8 @@ fn executor_group(configured_processors: usize) -> NoWeakArc<ExecutorGroup> {
                 local_ready_counts: local_ready_counts.into_boxed_slice(),
                 task_arenas: task_arenas.into_boxed_slice(),
                 global_queue: ready_queue(),
-                global_ready_count: AtomicUsize::new(0),
-                global_wake_cursor: AtomicUsize::new(0),
+                global_ready_count: CachePadded::new(AtomicUsize::new(0)),
+                global_wake_cursor: CachePadded::new(AtomicUsize::new(0)),
             })
         })
         .clone()

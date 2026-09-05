@@ -29,6 +29,7 @@ use core::future::Future;
 use core::mem::size_of;
 use core::ops::Range;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use crossbeam_utils::CachePadded;
 
 use helios_hal::io::{IoError, IoResult};
 use helios_netstack::{
@@ -677,7 +678,7 @@ pub struct VirtioNetDevice<T: VirtioTransport> {
     /// devices (and devices that did not negotiate MQ) carry a
     /// single pair so the rest of the implementation does not need
     /// a `Option` branch on every code path.
-    queue_pairs: Box<[NetQueuePair<T>]>,
+    queue_pairs: Box<[CachePadded<NetQueuePair<T>>]>,
     /// Control queue used to issue runtime commands such as
     /// `VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET`. `None` when the device
     /// did not negotiate `VIRTIO_NET_F_CTRL_VQ` (unconditionally
@@ -991,7 +992,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             "virtio-net bring-up"
         );
 
-        let mut queue_pairs: Vec<NetQueuePair<T>> =
+        let mut queue_pairs: Vec<CachePadded<NetQueuePair<T>>> =
             Vec::with_capacity(usize::from(advertised_pairs));
         for pair_idx in 0..advertised_pairs {
             let rx_queue_index = rx_queue_index(pair_idx);
@@ -1098,7 +1099,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             let tx_in_flight = DescriptorBitSet::new(tx_buffer_count);
             let tx_payloads = vec![None; tx_buffer_count].into_boxed_slice();
 
-            queue_pairs.push(NetQueuePair {
+            queue_pairs.push(CachePadded::new(NetQueuePair {
                 interrupt_count: AtomicU64::new(0),
                 interrupts: Notify::new(),
                 rx_state: AsyncMutex::new(NetRxState {
@@ -1118,7 +1119,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
                     tx_in_flight,
                     tx_payloads,
                 }),
-            });
+            }));
         }
 
         // Optional control queue. Allocated AFTER all RX/TX queues
