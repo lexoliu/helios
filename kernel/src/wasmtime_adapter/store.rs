@@ -18,9 +18,9 @@ use wasmtime_wasi_io::streams::{InputStream, OutputStream, StreamError, StreamRe
 
 use crate::io::{ByteReader, ByteWriter};
 use crate::{
-    ComponentRuntimeState, ComponentStoreData, OomKillOutcome, ProgramOutOfMemory,
-    allow_instance_resource_growth, heap_stats, monotonic_nanos, user_heap_stats,
-    user_memory_kernel_reserve_bytes,
+    ComponentRuntimeState, ComponentStoreData, KernelHeapHeadroom, MemoryPool, OomKillOutcome,
+    ProgramOutOfMemory, allow_instance_resource_growth, heap_stats, monotonic_nanos,
+    user_heap_stats,
 };
 
 impl<CpuImpl, RuntimeStateImpl, FileSystem> ResourceLimiter
@@ -82,18 +82,29 @@ where
 {
     /// Decide whether `growth` extra bytes of user memory can be granted.
     ///
+    /// Two pools have to answer, and they are asked for different
+    /// amounts. The user pool is asked for the growth itself: that is
+    /// where the guest's pages come from. The kernel heap is asked only
+    /// for what the growth costs *it* — the page tables and reservation
+    /// records that address the new pages
+    /// ([`crate::user_mapping_kernel_heap_bytes`]), around a
+    /// five-hundredth of the growth. Charging the growth itself against
+    /// the kernel heap, as this did, refused grows the kernel heap was
+    /// never asked to fund.
+    ///
     /// On insufficient user heap or kernel reserve breach, the OOM
-    /// killer is asked to mark the largest non-self victim for
-    /// termination (so the next host-call boundary on that instance
-    /// traps with [`crate::InstanceKilled`] and frees its memory). The
-    /// growing request itself still returns `ProgramOutOfMemory` —
-    /// reclamation happens asynchronously and the requester retries on
-    /// the next allocation attempt or surfaces the error to its caller.
+    /// killer is asked to mark the largest non-self victim *of the pool
+    /// that ran out* for termination (so the next host-call boundary on
+    /// that instance traps with [`crate::InstanceKilled`] and frees its
+    /// memory). The growing request itself still returns
+    /// `ProgramOutOfMemory` — reclamation happens asynchronously and the
+    /// requester retries on the next allocation attempt or surfaces the
+    /// error to its caller.
     fn try_satisfy_or_kill(&self, desired: usize, growth: usize) -> Option<wasmtime::Error> {
         let user_heap = user_heap_stats();
         let user_available = user_heap.available_bytes();
         if user_available < growth {
-            self.request_oom_kill_for_growth(growth);
+            self.request_oom_kill_for_growth(MemoryPool::User, growth);
             return Some(
                 ProgramOutOfMemory {
                     requested_bytes: desired,
@@ -106,16 +117,19 @@ where
         }
 
         let heap = heap_stats();
-        let reserve = user_memory_kernel_reserve_bytes(heap.total_bytes);
-        let available = heap.available_bytes();
-        if available.saturating_sub(growth) < reserve {
-            self.request_oom_kill_for_growth(growth);
+        let headroom = KernelHeapHeadroom::of(heap);
+        if let Some(shortfall) = headroom.growth_shortfall_bytes(growth) {
+            self.request_oom_kill_for_growth(MemoryPool::Kernel, shortfall);
+            // Every number in this refusal describes the kernel heap,
+            // including the request: reporting the guest's `desired`
+            // here alongside kernel-heap availability is what made a
+            // refusal on this branch read as a user-pool refusal.
             return Some(
                 ProgramOutOfMemory {
-                    requested_bytes: desired,
-                    available_bytes: available,
+                    requested_bytes: shortfall,
+                    available_bytes: headroom.available_bytes,
                     pool_bytes: heap.total_bytes,
-                    reserved_bytes: reserve,
+                    reserved_bytes: headroom.reserve_bytes,
                 }
                 .into(),
             );
@@ -124,7 +138,7 @@ where
         None
     }
 
-    /// Ask the OOM killer to cover `requested_bytes` of user memory.
+    /// Ask the OOM killer to cover `requested_bytes` of `pool`.
     ///
     /// The killer answers against its condemned-memory ledger, so a
     /// shortfall that an in-flight kill already covers condemns nothing
@@ -135,7 +149,7 @@ where
     /// post-mortem analysis can trace which instance was sacrificed for
     /// which grow request, and which requests were absorbed by a kill
     /// that had already happened.
-    fn request_oom_kill_for_growth(&self, requested_bytes: usize) {
+    fn request_oom_kill_for_growth(&self, pool: MemoryPool, requested_bytes: usize) {
         // VIRTIO_BALLOON_F_DEFLATE_ON_OOM: memory the host is holding is
         // reclaimed before memory a program is using. The balloon task
         // does the deflating, so this only asks; the requester still
@@ -146,6 +160,7 @@ where
         let requester = self.instance().id();
         let decision = self.instance_registry.condemn_for_oom(
             requester,
+            pool,
             requested_bytes as u64,
             monotonic_nanos(&self.cpu),
         );
@@ -154,19 +169,22 @@ where
             OomKillOutcome::Condemned(victim) => tracing::warn!(
                 target: "helios_kernel::oom",
                 requester = ?requester,
+                pool = ?pool,
                 requested_bytes,
                 victim_id = ?victim.id,
                 victim_name = %victim.name,
                 victim_memory_bytes = victim.memory_bytes,
+                victim_kernel_bytes = victim.kernel_bytes,
                 victim_policy = ?victim.policy,
                 score = victim.score,
                 condemned_pending_bytes = condemned.pending_bytes,
                 condemned_stale_bytes = condemned.stale_bytes,
-                "OOM killer condemned victim to free user memory"
+                "OOM killer condemned victim to free memory"
             ),
             OomKillOutcome::AwaitingReclaim => tracing::debug!(
                 target: "helios_kernel::oom",
                 requester = ?requester,
+                pool = ?pool,
                 requested_bytes,
                 condemned_pending_bytes = condemned.pending_bytes,
                 condemned_stale_bytes = condemned.stale_bytes,
@@ -176,6 +194,7 @@ where
             OomKillOutcome::NoVictim => tracing::warn!(
                 target: "helios_kernel::oom",
                 requester = ?requester,
+                pool = ?pool,
                 requested_bytes,
                 condemned_pending_bytes = condemned.pending_bytes,
                 condemned_stale_bytes = condemned.stale_bytes,

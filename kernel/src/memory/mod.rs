@@ -5,11 +5,14 @@
 //! linear memories. `frame_slab` is the per-processor frame cache
 //! that backs both. `entropy` owns the boot-seeded root DRBG and the
 //! per-instance pools derived from it. `reservations` is the AddressSpace
-//! reservation/committed-region bookkeeping shared by every backend.
+//! reservation/committed-region bookkeeping shared by every backend, and
+//! `mapping_cost` says what mapping user address space costs the kernel
+//! heap that describes it.
 
 mod balloon;
 mod entropy;
 mod frame_slab;
+mod mapping_cost;
 mod owner;
 mod pmm;
 mod reported;
@@ -23,6 +26,7 @@ pub use entropy::{
     NoCryptographicEntropy, NoEntropyDevice, ROOT_ENTROPY_MATERIAL_BYTES, RootEntropy,
     RootEntropyHandle, install_entropy_device, seed_root_entropy,
 };
+pub use mapping_cost::user_mapping_kernel_heap_bytes;
 pub use owner::{
     MemoryOwner, UserMemoryOwnerScope, UserMemoryOwners, configure_user_memory_owner_processors,
     current_user_memory_owner, enter_user_memory_owner, set_user_memory_owner,

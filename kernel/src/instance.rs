@@ -12,6 +12,8 @@ use slab::Slab;
 use spin::Mutex;
 use triomphe::Arc;
 
+use crate::user_mapping_kernel_heap_bytes;
+
 const INACTIVE_RESUME_AT: u64 = u64::MAX;
 
 /// What the OOM killer is allowed to do with an instance.
@@ -51,6 +53,26 @@ impl OomPolicy {
     pub const fn is_victim_candidate(self) -> bool {
         self.restart_cost().is_some()
     }
+}
+
+/// One of the kernel's two memory ownership domains.
+///
+/// They are separate pools with separate accounting (AGENTS §3): a wasm
+/// instance's pages come from the user pool, while the page tables,
+/// reservation records and store state that describe them come from the
+/// kernel heap. Killing an instance returns bytes to both, but *how
+/// many* it returns to each is a different number, and an instance that
+/// dominates one pool need not dominate the other — a program holding
+/// one large linear memory is the biggest user-pool consumer in the
+/// system while a program holding forty guest threads over a small
+/// memory is the biggest kernel-heap consumer. So the ranking has to be
+/// told which pool ran out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryPool {
+    /// The user-memory pool wasm linear memories are served from.
+    User,
+    /// The kernel heap.
+    Kernel,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -112,12 +134,15 @@ const fn decode_kill_flag(value: u8) -> Option<KillReason> {
 /// victim selection until the instance is actually torn down.
 pub const OOM_RECLAIM_GRACE: Duration = Duration::from_millis(500);
 
-/// User memory the OOM killer has condemned and not yet seen returned.
+/// Memory the OOM killer has condemned and not yet seen returned,
+/// counted in one [`MemoryPool`].
 ///
 /// Reclaim is recorded by the victim's registry entry disappearing when
 /// its last handle drops, so this ledger is derived from the live
 /// instances rather than kept as a counter that could drift away from
-/// them.
+/// them. A condemnation records what the victim held in *both* pools,
+/// so a shortfall on either one is answered against the bytes that
+/// shortfall is actually waiting for.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CondemnedMemory {
     /// Condemned within [`OOM_RECLAIM_GRACE`]: memory the killer still
@@ -164,15 +189,22 @@ pub struct OomKillDecision {
 
 /// Snapshot of an OOM victim selected by [`InstanceRegistry::pick_oom_victim`].
 ///
-/// `score` is the ranking metric (`memory_bytes / restart cost`) — the
-/// higher the score, the more attractive the victim. Callers do not
-/// need to interpret it; it is exposed so the kernel can log victim
-/// selection decisions.
+/// `score` is the ranking metric (the bytes this victim holds in `pool`
+/// divided by its restart cost) — the higher the score, the more
+/// attractive the victim. Callers do not need to interpret it; it is
+/// exposed so the kernel can log victim selection decisions. Both pools
+/// travel with the victim so a log line says what the kill actually
+/// returns, not only the pool it was ranked on.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OomVictim {
     pub id: InstanceId,
     pub name: String,
+    /// The pool that ran out, and therefore the one `score` ranks.
+    pub pool: MemoryPool,
+    /// User-pool bytes: the instance's wasm linear memory.
     pub memory_bytes: u64,
+    /// Kernel-heap bytes attributed to the instance.
+    pub kernel_bytes: u64,
     pub policy: OomPolicy,
     pub score: u64,
 }
@@ -222,6 +254,12 @@ struct InstanceEntry {
     name: String,
     started_at: u64,
     memory_bytes: AtomicU64,
+    /// Kernel heap charged to this instance by its owners: one charge
+    /// per store it holds, released when that store drops. The
+    /// page-table and reservation-record cost of its user memory is
+    /// derived from `memory_bytes` instead of charged, so the two can
+    /// never drift apart — see [`InstanceEntry::kernel_heap_bytes`].
+    kernel_bytes: AtomicU64,
     active_nanos: AtomicU64,
     active_depth: AtomicU32,
     last_resume_at: AtomicU64,
@@ -237,16 +275,19 @@ struct InstanceEntry {
     /// transition. When set, the next host-call boundary returns
     /// `Killed { reason }` instead of resuming the guest.
     kill_flag: AtomicU8,
-    /// Monotonic nanoseconds at which the kill flag was set, and the
-    /// memory attributed to the instance at that moment. Together they
-    /// are this instance's entry in the condemned-memory ledger: what
-    /// the killer expects back, and when it started expecting it.
+    /// Monotonic nanoseconds at which the kill flag was set, and what
+    /// the instance held in each pool at that moment. Together they are
+    /// this instance's entry in the condemned-memory ledger: what the
+    /// killer expects back, and when it started expecting it. Both
+    /// pools are recorded because either one can be the pool a later
+    /// shortfall is waiting on.
     ///
-    /// Both are written and read under the registry's `entries` lock,
-    /// alongside the flag flip itself, so no reader can see a
+    /// All three are written and read under the registry's `entries`
+    /// lock, alongside the flag flip itself, so no reader can see a
     /// condemnation whose bytes have not been recorded yet.
     condemned_at: AtomicU64,
-    condemned_bytes: AtomicU64,
+    condemned_user_bytes: AtomicU64,
+    condemned_kernel_bytes: AtomicU64,
     handle_count: AtomicUsize,
 }
 
@@ -295,6 +336,7 @@ impl InstanceRegistry {
             name: name.into(),
             started_at,
             memory_bytes: AtomicU64::new(0),
+            kernel_bytes: AtomicU64::new(0),
             active_nanos: AtomicU64::new(0),
             active_depth: AtomicU32::new(0),
             last_resume_at: AtomicU64::new(INACTIVE_RESUME_AT),
@@ -302,7 +344,8 @@ impl InstanceRegistry {
             policy,
             kill_flag: AtomicU8::new(KILL_FLAG_NONE),
             condemned_at: AtomicU64::new(0),
-            condemned_bytes: AtomicU64::new(0),
+            condemned_user_bytes: AtomicU64::new(0),
+            condemned_kernel_bytes: AtomicU64::new(0),
             handle_count: AtomicUsize::new(1),
         });
         let entry_ptr = NonNull::from(entry.as_ref());
@@ -315,9 +358,17 @@ impl InstanceRegistry {
     }
 
     /// Pick a victim instance using the standard `memory / restart cost`
-    /// heuristic: large memory consumers with low restart cost are
-    /// chosen first, and system components never. Returns `None` when
-    /// no candidate instance has memory attributed to it.
+    /// heuristic against the pool that ran out: large consumers *of
+    /// that pool* with low restart cost are chosen first, and system
+    /// components never. Returns `None` when no candidate instance
+    /// holds anything in `pool`.
+    ///
+    /// `pool` is what makes the ranking measure the shortfall it is
+    /// answering. Ranking a kernel-heap shortfall by wasm linear-memory
+    /// size picks the instance holding the most of the pool that is not
+    /// full; killing it does return kernel-side state, but only
+    /// incidentally, and the instance that would have returned the most
+    /// keeps running.
     ///
     /// Instances that are already condemned are not candidates: their
     /// memory is on the condemned ledger ([`Self::condemned_memory`])
@@ -326,21 +377,23 @@ impl InstanceRegistry {
     /// This is victim selection on its own. The OOM killer's entry point
     /// is [`Self::condemn_for_oom`], which weighs the ledger against the
     /// request before it selects anything.
-    pub fn pick_oom_victim(&self) -> Option<OomVictim> {
-        best_victim(&self.inner.entries.lock())
+    pub fn pick_oom_victim(&self, pool: MemoryPool) -> Option<OomVictim> {
+        best_victim(&self.inner.entries.lock(), pool)
     }
 
-    /// User memory condemned and not yet reclaimed, as of `now_nanos`.
+    /// Memory condemned out of `pool` and not yet reclaimed, as of
+    /// `now_nanos`.
     ///
     /// Reclaim is the victim's registry entry dropping with its last
     /// handle, so an instance stops contributing here exactly when its
     /// memory is back.
-    pub fn condemned_memory(&self, now_nanos: u64) -> CondemnedMemory {
-        condemned_ledger(&self.inner.entries.lock(), now_nanos)
+    pub fn condemned_memory(&self, pool: MemoryPool, now_nanos: u64) -> CondemnedMemory {
+        condemned_ledger(&self.inner.entries.lock(), pool, now_nanos)
     }
 
-    /// The OOM killer's decision for one refused grow of
-    /// `requested_bytes` by `requester`.
+    /// The OOM killer's decision for one refused grow by `requester`,
+    /// where `requested_bytes` is what has to come back to `pool`
+    /// before the same request can be admitted.
     ///
     /// Condemning a victim only sets its kill flag; the memory returns
     /// when that instance reaches its next call-hook boundary and is
@@ -370,11 +423,12 @@ impl InstanceRegistry {
     pub fn condemn_for_oom(
         &self,
         requester: InstanceId,
+        pool: MemoryPool,
         requested_bytes: u64,
         now_nanos: u64,
     ) -> OomKillDecision {
         let entries = self.inner.entries.lock();
-        let mut condemned = condemned_ledger(&entries, now_nanos);
+        let mut condemned = condemned_ledger(&entries, pool, now_nanos);
         if condemned.covers(requested_bytes) {
             return OomKillDecision {
                 outcome: OomKillOutcome::AwaitingReclaim,
@@ -388,7 +442,7 @@ impl InstanceRegistry {
         // program to feed the one already holding the most memory.
         // Other instances become the pick on later attempts as they
         // accumulate memory.
-        let victim = best_victim(&entries).filter(|victim| victim.id != requester);
+        let victim = best_victim(&entries, pool).filter(|victim| victim.id != requester);
         let Some(victim) = victim else {
             return OomKillDecision {
                 outcome: OomKillOutcome::NoVictim,
@@ -398,7 +452,9 @@ impl InstanceRegistry {
         let condemned_bytes =
             condemn_entry(&entries, victim.id, KillReason::OutOfMemory, now_nanos)
                 .expect("victim selected under the registry lock must still be condemnable");
-        condemned.pending_bytes = condemned.pending_bytes.saturating_add(condemned_bytes);
+        condemned.pending_bytes = condemned
+            .pending_bytes
+            .saturating_add(condemned_bytes.of(pool));
         drop(entries);
         self.notify_kill();
         OomKillDecision {
@@ -538,14 +594,20 @@ impl Default for InstanceRegistry {
 
 fn noop_kill_notifier() {}
 
-/// Highest-scoring OOM candidate in `entries`.
+/// Highest-scoring OOM candidate in `entries` for the pool that ran
+/// out.
 ///
 /// Called with the registry's `entries` lock held.
-fn best_victim(entries: &Slab<Box<InstanceEntry>>) -> Option<OomVictim> {
+fn best_victim(entries: &Slab<Box<InstanceEntry>>, pool: MemoryPool) -> Option<OomVictim> {
     let mut best: Option<OomVictim> = None;
     for (_, entry) in entries.iter() {
         let memory_bytes = entry.memory_bytes.load(Ordering::Acquire);
-        if memory_bytes == 0 {
+        let kernel_bytes = entry.kernel_heap_bytes();
+        let pool_bytes = match pool {
+            MemoryPool::User => memory_bytes,
+            MemoryPool::Kernel => kernel_bytes,
+        };
+        if pool_bytes == 0 {
             continue;
         }
         if entry.kill_flag.load(Ordering::Acquire) != KILL_FLAG_NONE {
@@ -556,14 +618,16 @@ fn best_victim(entries: &Slab<Box<InstanceEntry>>) -> Option<OomVictim> {
         let Some(cost) = entry.policy.restart_cost() else {
             continue;
         };
-        let score = memory_bytes / u64::from(cost.max(1));
+        let score = pool_bytes / u64::from(cost.max(1));
         match &best {
             Some(current) if current.score >= score => {}
             _ => {
                 best = Some(OomVictim {
                     id: entry.id,
                     name: entry.name.clone(),
+                    pool,
                     memory_bytes,
+                    kernel_bytes,
                     policy: entry.policy,
                     score,
                 });
@@ -573,18 +637,25 @@ fn best_victim(entries: &Slab<Box<InstanceEntry>>) -> Option<OomVictim> {
     best
 }
 
-/// Sum the memory of every condemned instance in `entries`, split at the
-/// [`OOM_RECLAIM_GRACE`] deadline.
+/// Sum the `pool` memory of every condemned instance in `entries`,
+/// split at the [`OOM_RECLAIM_GRACE`] deadline.
 ///
 /// Called with the registry's `entries` lock held.
-fn condemned_ledger(entries: &Slab<Box<InstanceEntry>>, now_nanos: u64) -> CondemnedMemory {
+fn condemned_ledger(
+    entries: &Slab<Box<InstanceEntry>>,
+    pool: MemoryPool,
+    now_nanos: u64,
+) -> CondemnedMemory {
     let grace_nanos = OOM_RECLAIM_GRACE.as_nanos() as u64;
     let mut ledger = CondemnedMemory::default();
     for (_, entry) in entries.iter() {
         if entry.kill_flag.load(Ordering::Acquire) == KILL_FLAG_NONE {
             continue;
         }
-        let bytes = entry.condemned_bytes.load(Ordering::Acquire);
+        let bytes = match pool {
+            MemoryPool::User => entry.condemned_user_bytes.load(Ordering::Acquire),
+            MemoryPool::Kernel => entry.condemned_kernel_bytes.load(Ordering::Acquire),
+        };
         let waited = now_nanos.saturating_sub(entry.condemned_at.load(Ordering::Acquire));
         if waited < grace_nanos {
             ledger.pending_bytes = ledger.pending_bytes.saturating_add(bytes);
@@ -595,9 +666,25 @@ fn condemned_ledger(entries: &Slab<Box<InstanceEntry>>, now_nanos: u64) -> Conde
     ledger
 }
 
+/// What one condemnation put on the ledger, in both pools.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CondemnedBytes {
+    user: u64,
+    kernel: u64,
+}
+
+impl CondemnedBytes {
+    const fn of(self, pool: MemoryPool) -> u64 {
+        match pool {
+            MemoryPool::User => self.user,
+            MemoryPool::Kernel => self.kernel,
+        }
+    }
+}
+
 /// Flip `id`'s kill flag and record its ledger entry, returning the
-/// bytes now condemned, or `None` when the instance is gone or was
-/// already condemned.
+/// bytes now condemned in each pool, or `None` when the instance is
+/// gone or was already condemned.
 ///
 /// Called with the registry's `entries` lock held, which is what keeps
 /// the flag and its ledger entry from being observed out of step.
@@ -606,7 +693,7 @@ fn condemn_entry(
     id: InstanceId,
     reason: KillReason,
     now_nanos: u64,
-) -> Option<u64> {
+) -> Option<CondemnedBytes> {
     let entry = entries
         .iter()
         .find_map(|(_, entry)| (entry.id == id).then_some(entry))?;
@@ -615,12 +702,18 @@ fn condemn_entry(
         .kill_flag
         .compare_exchange(KILL_FLAG_NONE, encoded, Ordering::AcqRel, Ordering::Acquire)
         .ok()?;
-    let condemned_bytes = entry.memory_bytes.load(Ordering::Acquire);
+    let condemned = CondemnedBytes {
+        user: entry.memory_bytes.load(Ordering::Acquire),
+        kernel: entry.kernel_heap_bytes(),
+    };
     entry.condemned_at.store(now_nanos, Ordering::Release);
     entry
-        .condemned_bytes
-        .store(condemned_bytes, Ordering::Release);
-    Some(condemned_bytes)
+        .condemned_user_bytes
+        .store(condemned.user, Ordering::Release);
+    entry
+        .condemned_kernel_bytes
+        .store(condemned.kernel, Ordering::Release);
+    Some(condemned)
 }
 
 pub fn allow_instance_resource_growth(
@@ -668,11 +761,61 @@ impl RegisteredInstance {
             .store(memory_bytes, Ordering::Release);
     }
 
+    /// Kernel heap attributed to this instance: every live
+    /// [`KernelHeapCharge`] against it, plus the page tables and
+    /// reservation records its user memory needs.
+    pub fn kernel_heap_bytes(&self) -> u64 {
+        self.entry().kernel_heap_bytes()
+    }
+
+    /// Charge `bytes` of kernel heap to this instance for as long as
+    /// the returned charge is alive.
+    pub fn charge_kernel_heap(&self, bytes: u64) -> KernelHeapCharge {
+        self.entry().kernel_bytes.fetch_add(bytes, Ordering::AcqRel);
+        KernelHeapCharge {
+            instance: self.clone(),
+            bytes,
+        }
+    }
+
     /// Returns `Some(reason)` when the instance has been condemned by
     /// the OOM killer or a supervisor and the runtime should trap on
     /// the next host-call boundary instead of resuming the guest.
     pub fn pending_kill(&self) -> Option<KillReason> {
         decode_kill_flag(self.entry().kill_flag.load(Ordering::Acquire))
+    }
+}
+
+/// Kernel heap charged to an instance for as long as the structure that
+/// allocated it is alive.
+///
+/// The kernel allocator cannot be asked who an allocation was for, so
+/// attribution travels with ownership instead: whoever allocates kernel
+/// heap on an instance's behalf holds one of these, and the bytes leave
+/// that instance's footprint exactly when the owner drops — which is
+/// also when the allocation itself goes back. One charge per store is
+/// what makes an instance's kernel-heap footprint track the stores it
+/// holds rather than the linear memory it grew.
+pub struct KernelHeapCharge {
+    instance: RegisteredInstance,
+    bytes: u64,
+}
+
+impl KernelHeapCharge {
+    /// The bytes this charge holds against its instance.
+    pub const fn bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
+impl Drop for KernelHeapCharge {
+    fn drop(&mut self) {
+        let bytes = self.bytes;
+        let _ = self.instance.entry().kernel_bytes.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |charged| Some(charged.saturating_sub(bytes)),
+        );
     }
 }
 
@@ -784,6 +927,12 @@ pub struct ActivityStep {
 /// zero.
 pub struct InstanceActivity {
     instance: RegisteredInstance,
+    /// The kernel heap this store costs, charged to the instance for
+    /// exactly as long as the store exists. The activity owner is the
+    /// one thing there is precisely one of per store (that is what
+    /// makes it the owner), so it is where the per-store charge
+    /// belongs.
+    _store_charge: KernelHeapCharge,
     state: ActivityState,
     /// The last timestamp this owner was given, so a store dropped
     /// while its guest is suspended — a cancelled task, a future
@@ -805,10 +954,14 @@ enum ActivityState {
 }
 
 impl InstanceActivity {
-    pub fn new(instance: RegisteredInstance) -> Self {
+    /// Open a store's activity accounting over `instance`, charging it
+    /// `store_kernel_heap_bytes` of kernel heap until this owner drops.
+    pub fn new(instance: RegisteredInstance, store_kernel_heap_bytes: u64) -> Self {
         let last_nanos = instance.started_at();
+        let store_charge = instance.charge_kernel_heap(store_kernel_heap_bytes);
         Self {
             instance,
+            _store_charge: store_charge,
             state: ActivityState::Idle,
             last_nanos,
         }
@@ -924,6 +1077,26 @@ impl Drop for InstanceActivity {
 }
 
 impl InstanceEntry {
+    /// Kernel heap attributed to this instance.
+    ///
+    /// Two terms, because the kernel knows about its own allocations in
+    /// two different ways. What its owners charged it explicitly — one
+    /// [`KernelHeapCharge`] per store it holds — is accumulated in
+    /// `kernel_bytes`. What its *user* memory costs the kernel heap is
+    /// derived from `memory_bytes` through the same model the grow
+    /// admission path uses, rather than charged separately: the two
+    /// then cannot drift apart, and an instance is never admitted
+    /// against one number and ranked on another.
+    fn kernel_heap_bytes(&self) -> u64 {
+        let memory_bytes = self.memory_bytes.load(Ordering::Acquire);
+        let mapped_bytes = usize::try_from(memory_bytes).unwrap_or(usize::MAX);
+        let mapping_bytes =
+            u64::try_from(user_mapping_kernel_heap_bytes(mapped_bytes)).unwrap_or(u64::MAX);
+        self.kernel_bytes
+            .load(Ordering::Acquire)
+            .saturating_add(mapping_bytes)
+    }
+
     fn total_active_nanos(&self, now_nanos: u64) -> u64 {
         let total = self.active_nanos.load(Ordering::Acquire);
         if self.active_depth.load(Ordering::Acquire) == 0 {
@@ -1004,7 +1177,7 @@ mod tests {
         assert_eq!(first[0].cpu_busy, 0);
         assert_eq!(first[0].memory_bytes, 4096);
 
-        let mut activity = InstanceActivity::new(instance.clone());
+        let mut activity = InstanceActivity::new(instance.clone(), 0);
         activity.record(InstanceExecutionTransition::Resume, 220);
         let second = registry.snapshot(260);
         assert_eq!(second[0].cpu_busy, 666);

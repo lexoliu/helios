@@ -83,7 +83,10 @@ where
             timer,
             spawner,
             runtime_state,
-            activity: crate::InstanceActivity::new(instance),
+            activity: crate::InstanceActivity::new(
+                instance,
+                crate::store_kernel_heap_bytes(size_of::<Self>()),
+            ),
             parent_instance_id,
             filesystem,
             clock,
