@@ -309,8 +309,7 @@ impl<T: VirtioTransport> VirtioIommuDevice<T> {
         let mut drained = 0;
         queue.drain_used(|token, _len| {
             let slot = slot_for_token[usize::from(token)];
-            let start = usize::from(slot) * FAULT_BYTES;
-            let fault = decode_fault(&buffers[start..start + FAULT_BYTES]);
+            let fault = decode_fault(fault_slot(buffers, slot));
             tracing::error!(
                 reason = fault.reason,
                 flags = fault.flags,
