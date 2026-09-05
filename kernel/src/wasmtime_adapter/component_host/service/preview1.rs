@@ -5014,6 +5014,8 @@ pub(super) fn p1_errno_from_tcp_error(error: crate::TcpError) -> i32 {
     match error.kind {
         crate::TcpErrorKind::UnresolvedHost => p1::errno::HOSTUNREACH,
         crate::TcpErrorKind::Timeout => p1::errno::TIMEDOUT,
+        crate::TcpErrorKind::ConnectionReset => p1::errno::CONNRESET,
+        crate::TcpErrorKind::ConnectionAborted => p1::errno::CONNABORTED,
         crate::TcpErrorKind::PermissionDenied => p1::errno::NOTCAPABLE,
         crate::TcpErrorKind::Unavailable => p1::errno::NETDOWN,
         crate::TcpErrorKind::Internal => p1::errno::IO,

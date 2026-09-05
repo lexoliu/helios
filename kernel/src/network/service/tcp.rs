@@ -17,6 +17,38 @@ pub(super) enum TcpReadProgress {
     Eof,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(super) enum TcpReadIntoProgress {
+    Pending,
+    Data(usize),
+    Eof,
+}
+
+/// The kernel-side reading of a netstack close kind.
+///
+/// A gracefully closed connection is end-of-stream and has no error;
+/// every other way a connection ends is one the reader has to be told
+/// about immediately, instead of waiting out a deadline that will only
+/// ever report a timeout that did not happen.
+fn tcp_close_error(close: TcpCloseKind) -> Option<TcpError> {
+    let (kind, detail) = match close {
+        TcpCloseKind::Graceful => return None,
+        TcpCloseKind::Reset => (
+            TcpErrorKind::ConnectionReset,
+            NetworkErrorDetail::TcpConnectionReset,
+        ),
+        TcpCloseKind::Aborted => (
+            TcpErrorKind::ConnectionAborted,
+            NetworkErrorDetail::TcpConnectionAborted,
+        ),
+        TcpCloseKind::Unresponsive => (
+            TcpErrorKind::Timeout,
+            NetworkErrorDetail::TcpPeerUnresponsive,
+        ),
+    };
+    Some(TcpError { kind, detail })
+}
+
 impl<CpuImpl, Runtime, DeviceImpl> NetworkService<CpuImpl, Runtime, DeviceImpl>
 where
     CpuImpl: Cpu + Clone,
@@ -170,7 +202,10 @@ where
             })?;
             let (readable, hangup) = match read {
                 TcpReadState::Data(_) => (true, false),
-                TcpReadState::Eof => (true, true),
+                // A reset reads as ready-and-hung-up just as a clean
+                // close does: the read that follows completes at once,
+                // with the connection error instead of end-of-stream.
+                TcpReadState::Closed(_) => (true, true),
                 TcpReadState::Pending => (false, false),
             };
             // Writability follows the send side, which outlives the read
@@ -534,9 +569,9 @@ where
                 &mut buffer,
                 TcpReadPhasePrefix::IntoInitial,
             )? {
-                TcpReadIntoState::Data(bytes) => return Ok(Some(bytes)),
-                TcpReadIntoState::Eof => return Ok(None),
-                TcpReadIntoState::Pending => {}
+                TcpReadIntoProgress::Data(bytes) => return Ok(Some(bytes)),
+                TcpReadIntoProgress::Eof => return Ok(None),
+                TcpReadIntoProgress::Pending => {}
             }
 
             let drive_started = self.profile_start();
@@ -547,17 +582,17 @@ where
                 &mut buffer,
                 TcpReadPhasePrefix::IntoAfterDrive,
             )? {
-                TcpReadIntoState::Data(bytes) => return Ok(Some(bytes)),
-                TcpReadIntoState::Eof => return Ok(None),
-                TcpReadIntoState::Pending => {}
+                TcpReadIntoProgress::Data(bytes) => return Ok(Some(bytes)),
+                TcpReadIntoProgress::Eof => return Ok(None),
+                TcpReadIntoProgress::Pending => {}
             }
             match self
                 .poll_tcp_read_into_without_interrupt_sleep(stream, &mut buffer, deadline_nanos)
                 .await?
             {
-                TcpReadIntoState::Data(bytes) => return Ok(Some(bytes)),
-                TcpReadIntoState::Eof => return Ok(None),
-                TcpReadIntoState::Pending => {}
+                TcpReadIntoProgress::Data(bytes) => return Ok(Some(bytes)),
+                TcpReadIntoProgress::Eof => return Ok(None),
+                TcpReadIntoProgress::Pending => {}
             }
             if self.now_nanos() >= deadline_nanos {
                 return Err(TcpError {
@@ -592,7 +627,7 @@ where
         stream: TcpStreamId,
         buffer: &mut RegisteredTcpReadBuffer<'_>,
         profile_prefix: TcpReadPhasePrefix,
-    ) -> Result<TcpReadIntoState, TcpError> {
+    ) -> Result<TcpReadIntoProgress, TcpError> {
         let started = self.profile_start();
         let now = StackInstant::from_nanos(self.now_nanos());
         let read = self.inner.state.with_handle(stream, |state| {
@@ -661,15 +696,15 @@ where
         stream: TcpStreamId,
         buffer: &mut RegisteredTcpReadBuffer<'_>,
         deadline_nanos: u64,
-    ) -> Result<TcpReadIntoState, TcpError> {
+    ) -> Result<TcpReadIntoProgress, TcpError> {
         let capabilities = self.inner.device.capabilities().events;
         if !capabilities.polling || capabilities.interrupts {
-            return Ok(TcpReadIntoState::Pending);
+            return Ok(TcpReadIntoProgress::Pending);
         }
 
         for _ in 0..NETWORK_POLLING_TCP_READ_ROUNDS {
             if self.now_nanos() >= deadline_nanos {
-                return Ok(TcpReadIntoState::Pending);
+                return Ok(TcpReadIntoProgress::Pending);
             }
             let yield_started = self.profile_start();
             crate::yield_now().await;
@@ -684,14 +719,16 @@ where
                 })?;
             self.record_network_profile("tcp-read-into-polling-drive-network", drive_started);
             match self.poll_tcp_read_into_once(stream, buffer, TcpReadPhasePrefix::IntoPolling)? {
-                ready @ (TcpReadIntoState::Data(_) | TcpReadIntoState::Eof) => return Ok(ready),
-                TcpReadIntoState::Pending => {}
+                ready @ (TcpReadIntoProgress::Data(_) | TcpReadIntoProgress::Eof) => {
+                    return Ok(ready);
+                }
+                TcpReadIntoProgress::Pending => {}
             }
             if outcome.0.is_idle() {
                 break;
             }
         }
-        Ok(TcpReadIntoState::Pending)
+        Ok(TcpReadIntoProgress::Pending)
     }
 
     pub(super) async fn wait_for_ipv4_tcp(&self, deadline_nanos: u64) -> Result<(), TcpError> {
@@ -1093,18 +1130,20 @@ where
         &self,
         prefix: TcpReadPhasePrefix,
         start: Option<NetworkPerfStart>,
-        read: &TcpReadIntoState,
+        read: &TcpReadIntoProgress,
     ) {
         let (phase, bytes) = match read {
-            TcpReadIntoState::Pending => (
+            TcpReadIntoProgress::Pending => (
                 tcp_read_profile_phase(prefix, TcpReadPhaseOutcome::Pending),
                 0,
             ),
-            TcpReadIntoState::Data(bytes) => (
+            TcpReadIntoProgress::Data(bytes) => (
                 tcp_read_profile_phase(prefix, TcpReadPhaseOutcome::Ready),
                 *bytes,
             ),
-            TcpReadIntoState::Eof => (tcp_read_profile_phase(prefix, TcpReadPhaseOutcome::Eof), 0),
+            TcpReadIntoProgress::Eof => {
+                (tcp_read_profile_phase(prefix, TcpReadPhaseOutcome::Eof), 0)
+            }
         };
         self.record_network_profile_events_bytes(phase, start, 1, bytes);
     }
@@ -1319,7 +1358,10 @@ impl NetworkShard {
             })? {
             TcpReadState::Pending => Ok(TcpReadProgress::Pending),
             TcpReadState::Data(bytes) => Ok(TcpReadProgress::Data(bytes)),
-            TcpReadState::Eof => Ok(TcpReadProgress::Eof),
+            TcpReadState::Closed(close) => match tcp_close_error(close) {
+                Some(error) => Err(error),
+                None => Ok(TcpReadProgress::Eof),
+            },
         }
     }
 
@@ -1328,14 +1370,22 @@ impl NetworkShard {
         stream: TcpStreamId,
         buffer: &mut RegisteredTcpReadBuffer<'_>,
         now: StackInstant,
-    ) -> Result<TcpReadIntoState, TcpError> {
+    ) -> Result<TcpReadIntoProgress, TcpError> {
         let socket = self.tcp_socket(stream)?;
-        self.stack
+        match self
+            .stack
             .tcp_read_into(socket, buffer, now)
             .map_err(|_| TcpError {
                 kind: TcpErrorKind::Unavailable,
                 detail: NetworkErrorDetail::TcpReceiveFailed,
-            })
+            })? {
+            TcpReadIntoState::Pending => Ok(TcpReadIntoProgress::Pending),
+            TcpReadIntoState::Data(bytes) => Ok(TcpReadIntoProgress::Data(bytes)),
+            TcpReadIntoState::Closed(close) => match tcp_close_error(close) {
+                Some(error) => Err(error),
+                None => Ok(TcpReadIntoProgress::Eof),
+            },
+        }
     }
 
     pub(super) fn remove_tcp_stream(&mut self, stream: TcpStreamId) {

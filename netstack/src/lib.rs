@@ -63,7 +63,7 @@ pub use stack::{
 };
 pub use tcp::{TCP_RECEIVE_WINDOW_BYTES, TCP_TRANSMIT_BUFFER_BYTES};
 pub use tcp::{
-    TcpEndpoint, TcpReset, TcpSegmentBudget, TcpSegmentOutcome, TcpSocket, TcpState,
+    TcpCloseKind, TcpEndpoint, TcpReset, TcpSegmentBudget, TcpSegmentOutcome, TcpSocket, TcpState,
     TcpStateChangeReason, TcpTransmitSegment,
 };
 pub use types::{

@@ -16,11 +16,11 @@ use crate::{
     Icmpv4Packet, Icmpv6DestinationUnreachableCode, Icmpv6Packet, IpAddress, IpCidr, Ipv4Address,
     Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6Cidr, Ipv6DnsServers, Ipv6Packet,
     Ipv6RouterConfiguration, Ipv6Scope, NeighborDiscovery, PacketBuffer, RxChecksumReport, RxFrame,
-    RxFrameOffload, SegmentationOffload, StackError, TcpEndpoint, TcpFlags, TcpHeader,
-    TcpHeaderOptions, TcpPacket, TcpReceiveBuffer, TcpSegmentBudget, TcpSocket, TcpTransmitSegment,
-    TransportChecksum, TxChecksum, TxFrameRef, TxSegmentation, UdpPacket, icmpv6_checksum_valid,
-    interpret_router_advertisement, ipv4_checksum, partial_transport_checksum_completes,
-    tcp_checksum_valid, udp_checksum_valid,
+    RxFrameOffload, SegmentationOffload, StackError, TcpCloseKind, TcpEndpoint, TcpFlags,
+    TcpHeader, TcpHeaderOptions, TcpPacket, TcpReceiveBuffer, TcpSegmentBudget, TcpSocket,
+    TcpTransmitSegment, TransportChecksum, TxChecksum, TxFrameRef, TxSegmentation, UdpPacket,
+    icmpv6_checksum_valid, interpret_router_advertisement, ipv4_checksum,
+    partial_transport_checksum_completes, tcp_checksum_valid, udp_checksum_valid,
 };
 
 pub const MAX_ROUTES: usize = 32;
@@ -718,18 +718,25 @@ pub enum TcpConnectState {
     Closed(TcpConnectTerminalError),
 }
 
+/// What a read found on a TCP socket.
+///
+/// A connection that can no longer deliver data reports why in the same
+/// step: `Closed(TcpCloseKind::Graceful)` is end-of-stream, and every
+/// other [`TcpCloseKind`] is a connection error the caller has to
+/// surface rather than wait out.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TcpReadState {
     Pending,
     Data(Bytes),
-    Eof,
+    Closed(TcpCloseKind),
 }
 
+/// The [`TcpReadState`] of a read that filled a caller-owned buffer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TcpReadIntoState {
     Pending,
     Data(usize),
-    Eof,
+    Closed(TcpCloseKind),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3175,7 +3182,7 @@ where
         let mut pending_data = ArrayVec::<(usize, TcpTransmitSegment), 16>::new();
         for active_slot in 0..self.tcp.active_len() {
             let index = self.tcp.active_index(active_slot);
-            let (deadline, closed) = {
+            let (deadline, newly_closed) = {
                 let segment_budget = {
                     let Some(socket) = self.tcp.get(index) else {
                         panic!("TCP active socket index referenced a missing socket");
@@ -3188,8 +3195,14 @@ where
                 let Some(socket) = self.tcp.get_mut(index) else {
                     panic!("TCP active socket index referenced a missing socket");
                 };
+                let previous_state = socket.state();
                 socket.expire_timers(now.nanos());
                 let closed = socket.state() == crate::TcpState::Closed;
+                // Retirement is a transition, not a condition: a closed
+                // socket stays in the active set until its owner drops
+                // it, and repeating the retirement every drive would
+                // repeat its close event too.
+                let newly_closed = closed && previous_state != crate::TcpState::Closed;
                 if !closed
                     && let (Some(local), Some(remote)) =
                         (socket.local_endpoint(), socket.remote_endpoint())
@@ -3257,12 +3270,20 @@ where
                             .unwrap_or_else(|_| panic!("TCP ACK transmit burst overflowed"));
                     }
                 }
-                (socket.next_deadline_nanos(), closed)
+                (socket.next_deadline_nanos(), newly_closed)
             };
-            if closed && self.tcp.terminal_error(index).is_none() {
-                self.tcp.remove_indices(index);
-                self.release_tcp_listener_child(index);
-                self.remove_tcp_accepts_for(socket_id(index));
+            if newly_closed {
+                if self.tcp.terminal_error(index).is_none() {
+                    self.tcp.remove_indices(index);
+                    self.release_tcp_listener_child(index);
+                    self.remove_tcp_accepts_for(socket_id(index));
+                }
+                Self::push_event_into(
+                    &mut self.events,
+                    StackEvent::TcpClosed {
+                        socket: socket_id(index),
+                    },
+                );
             }
             self.schedule_tcp_timer_deadline(index, deadline);
         }
@@ -3463,8 +3484,10 @@ where
         let socket = self.tcp_socket_mut(socket)?;
         let state = match socket.receive(max_bytes, now.nanos()) {
             Some(bytes) => TcpReadState::Data(bytes),
-            None if socket.state() == crate::TcpState::CloseWait => TcpReadState::Eof,
-            None => TcpReadState::Pending,
+            None => match tcp_read_termination(socket) {
+                Some(kind) => TcpReadState::Closed(kind),
+                None => TcpReadState::Pending,
+            },
         };
         self.schedule_tcp_timer(index);
         self.update_tcp_receive_backpressure(index);
@@ -3484,8 +3507,10 @@ where
         let socket = self.tcp_socket_mut(socket)?;
         let state = match socket.receive_into(sink, now.nanos()) {
             Some(bytes) => TcpReadIntoState::Data(bytes),
-            None if socket.state() == crate::TcpState::CloseWait => TcpReadIntoState::Eof,
-            None => TcpReadIntoState::Pending,
+            None => match tcp_read_termination(socket) {
+                Some(kind) => TcpReadIntoState::Closed(kind),
+                None => TcpReadIntoState::Pending,
+            },
         };
         self.schedule_tcp_timer(index);
         self.update_tcp_receive_backpressure(index);
@@ -4832,6 +4857,18 @@ where
                     },
                 );
             }
+            // A segment that ended the connection — a peer RST above all
+            // — leaves a blocked reader with nothing else to wait for,
+            // so the closure is the wakeup.
+            if previous_state != crate::TcpState::Closed && current_state == crate::TcpState::Closed
+            {
+                Self::push_event_into(
+                    &mut self.events,
+                    StackEvent::TcpClosed {
+                        socket: socket_id(index),
+                    },
+                );
+            }
             if outcome.receive_backpressure {
                 return Err(StackError::ReceiveBackpressure);
             }
@@ -6071,6 +6108,35 @@ fn bytes_subrange(parent: &[u8], subset: &[u8]) -> core::ops::Range<usize> {
     );
     let start = subset_start - parent_start;
     start..start + subset.len()
+}
+
+/// Why a drained TCP socket will never produce another byte, or `None`
+/// while it still can.
+///
+/// The receive queue being empty is not by itself a terminal condition:
+/// what settles it is whether the peer's FIN has been consumed (every
+/// state past `CLOSE-WAIT` on the receive side has consumed it) and, for
+/// a socket already in `CLOSED`, the reason the state machine recorded
+/// when it got there.
+fn tcp_read_termination<C>(socket: &TcpSocket<C>) -> Option<TcpCloseKind>
+where
+    C: CongestionControl,
+{
+    match socket.state() {
+        crate::TcpState::CloseWait
+        | crate::TcpState::Closing
+        | crate::TcpState::LastAck
+        | crate::TcpState::TimeWait => Some(TcpCloseKind::Graceful),
+        crate::TcpState::Closed => Some(socket.close_kind().unwrap_or_else(|| {
+            panic!("TCP socket reached Closed without recording why it closed")
+        })),
+        crate::TcpState::Listen
+        | crate::TcpState::SynSent
+        | crate::TcpState::SynReceived
+        | crate::TcpState::Established
+        | crate::TcpState::FinWait1
+        | crate::TcpState::FinWait2 => None,
+    }
 }
 
 fn socket_id(index: usize) -> SocketId {
@@ -9915,8 +9981,171 @@ mod tests {
         assert_eq!(stack.take_event(), Some(StackEvent::TcpReadable { socket }));
         assert_eq!(
             stack.tcp_read(socket, 1, StackInstant::from_nanos(3)),
-            Ok(TcpReadState::Eof)
+            Ok(TcpReadState::Closed(TcpCloseKind::Graceful))
         );
+    }
+
+    #[test]
+    fn tcp_read_reports_reset_after_peer_rst_mid_stream() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let (mut stack, socket) = open_established_tcp_stack(local, peer);
+        let (payload, payload_len) = tcp_segment_with_payload(
+            peer,
+            local,
+            TcpHeader {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 101,
+                acknowledgement: 8,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+            },
+            b"ok",
+        );
+        stack
+            .receive_tcp(
+                IpAddress::Ipv4(peer),
+                IpAddress::Ipv4(local),
+                &Bytes::copy_from_slice(&payload[..payload_len]),
+                RxFrameOffload::none(),
+                StackInstant::from_nanos(2),
+            )
+            .expect("payload should be accepted");
+        let (reset, reset_len) = tcp_segment(
+            peer,
+            local,
+            TcpHeader {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 103,
+                acknowledgement: 8,
+                flags: TcpFlags::RST.union(TcpFlags::ACK),
+                window_size: u16::MAX,
+            },
+        );
+        stack
+            .receive_tcp(
+                IpAddress::Ipv4(peer),
+                IpAddress::Ipv4(local),
+                &Bytes::copy_from_slice(&reset[..reset_len]),
+                RxFrameOffload::none(),
+                StackInstant::from_nanos(3),
+            )
+            .expect("in-window RST should be accepted");
+
+        assert_eq!(stack.take_event(), Some(StackEvent::TcpReadable { socket }));
+        // The reset is a wakeup of its own: a reader parked on this
+        // socket has nothing else left to wait for.
+        assert_eq!(stack.take_event(), Some(StackEvent::TcpClosed { socket }));
+        // Bytes the peer delivered before resetting are still the
+        // reader's; the reset is what follows them.
+        assert_eq!(
+            stack.tcp_read(socket, 8, StackInstant::from_nanos(4)),
+            Ok(TcpReadState::Data(Bytes::from_static(b"ok")))
+        );
+        assert_eq!(
+            stack.tcp_read(socket, 8, StackInstant::from_nanos(5)),
+            Ok(TcpReadState::Closed(TcpCloseKind::Reset))
+        );
+    }
+
+    #[test]
+    fn tcp_read_reports_eof_after_local_close_follows_peer_fin() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let (mut stack, socket) = open_established_tcp_stack(local, peer);
+        let (fin, fin_len) = tcp_segment(
+            peer,
+            local,
+            TcpHeader {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 101,
+                acknowledgement: 8,
+                flags: TcpFlags::ACK.union(TcpFlags::FIN),
+                window_size: u16::MAX,
+            },
+        );
+        stack
+            .receive_tcp(
+                IpAddress::Ipv4(peer),
+                IpAddress::Ipv4(local),
+                &Bytes::copy_from_slice(&fin[..fin_len]),
+                RxFrameOffload::none(),
+                StackInstant::from_nanos(2),
+            )
+            .expect("FIN should be accepted");
+        stack
+            .tcp_shutdown_send(socket)
+            .expect("local close should follow the peer's FIN");
+
+        // LAST-ACK has consumed the peer's FIN just as CLOSE-WAIT did,
+        // so the stream is still over rather than pending.
+        assert_eq!(
+            stack.tcp_read(socket, 8, StackInstant::from_nanos(3)),
+            Ok(TcpReadState::Closed(TcpCloseKind::Graceful))
+        );
+    }
+
+    #[test]
+    fn tcp_time_wait_expiry_queues_closed_event() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let (mut stack, socket) = open_established_tcp_stack(local, peer);
+        stack
+            .tcp_shutdown_send(socket)
+            .expect("active close should start");
+        stack
+            .drive_tcp(StackInstant::from_nanos(2))
+            .expect("FIN should be queued");
+        let _ = stack.take_outbound().expect("FIN frame should be queued");
+        let (fin_ack, fin_ack_len) = tcp_segment(
+            peer,
+            local,
+            TcpHeader {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 101,
+                acknowledgement: 9,
+                flags: TcpFlags::ACK.union(TcpFlags::FIN),
+                window_size: u16::MAX,
+            },
+        );
+        stack
+            .receive_tcp(
+                IpAddress::Ipv4(peer),
+                IpAddress::Ipv4(local),
+                &Bytes::copy_from_slice(&fin_ack[..fin_ack_len]),
+                RxFrameOffload::none(),
+                StackInstant::from_nanos(3),
+            )
+            .expect("peer FIN should enter TIME_WAIT");
+        while stack.take_event().is_some() {}
+        assert_eq!(
+            stack.tcp_read(socket, 8, StackInstant::from_nanos(4)),
+            Ok(TcpReadState::Closed(TcpCloseKind::Graceful))
+        );
+
+        stack
+            .drive_tcp(StackInstant::from_nanos(
+                3 + crate::tcp::TCP_TIME_WAIT_NANOS,
+            ))
+            .expect("TIME_WAIT timer should expire");
+
+        assert_eq!(stack.take_event(), Some(StackEvent::TcpClosed { socket }));
+        assert_eq!(
+            stack.tcp_read(socket, 8, StackInstant::from_nanos(5)),
+            Ok(TcpReadState::Closed(TcpCloseKind::Graceful))
+        );
+        // The retirement happens once, on the transition; a second
+        // drive over the same closed socket has nothing to report.
+        stack
+            .drive_tcp(StackInstant::from_nanos(
+                4 + crate::tcp::TCP_TIME_WAIT_NANOS,
+            ))
+            .expect("closed socket should stay closed");
+        assert_eq!(stack.take_event(), None);
     }
 
     #[test]
@@ -10543,7 +10772,7 @@ mod tests {
             stack
                 .tcp_read(socket, 8, StackInstant::from_nanos(4))
                 .unwrap(),
-            TcpReadState::Eof
+            TcpReadState::Closed(TcpCloseKind::Graceful)
         );
     }
 
@@ -10648,7 +10877,7 @@ mod tests {
             stack
                 .tcp_read(socket, 8, StackInstant::from_nanos(6))
                 .unwrap(),
-            TcpReadState::Eof
+            TcpReadState::Closed(TcpCloseKind::Graceful)
         );
     }
 

@@ -81,6 +81,10 @@ pub(crate) mod errno {
     pub(crate) const AFNOSUPPORT: i32 = 5;
     pub(crate) const AGAIN: i32 = 6;
     pub(crate) const BADF: i32 = 8;
+    /// `__WASI_ERRNO_CONNABORTED`.
+    pub(crate) const CONNABORTED: i32 = 13;
+    /// `__WASI_ERRNO_CONNRESET`.
+    pub(crate) const CONNRESET: i32 = 15;
     pub(crate) const EXIST: i32 = 20;
     pub(crate) const FAULT: i32 = 21;
     pub(crate) const INVAL: i32 = 28;
