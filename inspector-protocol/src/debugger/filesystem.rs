@@ -498,12 +498,8 @@ mod guest {
     }
 
     fn normalized_components(path: &str) -> Result<Vec<String>, DispatchError> {
-        normalize_segments(path)
-    }
-
-    fn normalize_segments(input: &str) -> Result<Vec<String>, DispatchError> {
         let mut segments = Vec::new();
-        for component in Path::new(input).components() {
+        for component in Path::new(path).components() {
             match component {
                 std::path::Component::RootDir | std::path::Component::CurDir => {}
                 std::path::Component::Normal(segment) => segments.push(
@@ -511,19 +507,19 @@ mod guest {
                         .to_str()
                         .ok_or_else(|| {
                             DispatchError::protocol(format!(
-                                "path {input:?} contains a non-utf8 segment"
+                                "path {path:?} contains a non-utf8 segment"
                             ))
                         })?
                         .to_owned(),
                 ),
                 std::path::Component::ParentDir => {
                     return Err(DispatchError::protocol(format!(
-                        "path {input:?} contains unsupported parent traversal"
+                        "path {path:?} contains unsupported parent traversal"
                     )));
                 }
                 std::path::Component::Prefix(_) => {
                     return Err(DispatchError::protocol(format!(
-                        "path {input:?} uses an unsupported path prefix"
+                        "path {path:?} uses an unsupported path prefix"
                     )));
                 }
             }
