@@ -316,13 +316,17 @@ impl BbrV3 {
     const PROBE_RTT_DURATION_NANOS: u64 = 200_000_000;
     const FULL_BW_THRESHOLD_NUMERATOR: u64 = 125;
     const FULL_BW_THRESHOLD_DENOMINATOR: u64 = 100;
+    /// The window a connection may have in flight before it has
+    /// delivered anything, in segments. Also the window the initial
+    /// pacing rate is derived from.
+    const INITIAL_WINDOW_SEGMENTS: u32 = 10;
 
     pub const fn new(mss: u32) -> Self {
         assert!(mss != 0, "MSS must be non-zero");
         Self {
             mode: BbrMode::Startup,
             mss,
-            cwnd: mss * 10,
+            cwnd: mss * Self::INITIAL_WINDOW_SEGMENTS,
             pacing_rate: None,
             max_bandwidth_bytes_per_second: 0,
             min_rtt_nanos: u64::MAX,
@@ -445,12 +449,35 @@ impl BbrV3 {
     }
 
     fn rate_with_gain(&self, gain_num: u64, gain_den: u64) -> Option<PacingRate> {
-        if self.max_bandwidth_bytes_per_second == 0 {
+        let base = self.base_rate_bytes_per_second()?;
+        Some(PacingRate::from_bytes_per_second(
+            (base.saturating_mul(gain_num) / gain_den).max(1),
+        ))
+    }
+
+    /// The rate the mode's gain is applied to.
+    ///
+    /// The delivery rate once the connection has measured one, and
+    /// until then the initial window over the shortest round trip seen
+    /// — the rate a window's worth of data leaves at when it is sent
+    /// one round trip apart, which is what a connection that has
+    /// delivered nothing is entitled to assume.
+    ///
+    /// A flow that never delivers more than the application gives it
+    /// stays on this estimate for its whole life, and that is the
+    /// point: its acknowledgements are application-limited, they
+    /// measure the application rather than the path, and pacing a
+    /// request/response exchange by them means pacing it by how little
+    /// it asked to send.
+    fn base_rate_bytes_per_second(&self) -> Option<u64> {
+        if self.max_bandwidth_bytes_per_second != 0 {
+            return Some(self.max_bandwidth_bytes_per_second);
+        }
+        if self.min_rtt_nanos == 0 || self.min_rtt_nanos == u64::MAX {
             return None;
         }
-        Some(PacingRate::from_bytes_per_second(
-            (self.max_bandwidth_bytes_per_second * gain_num / gain_den).max(1),
-        ))
+        let window = u64::from(self.mss) * u64::from(Self::INITIAL_WINDOW_SEGMENTS);
+        Some((window.saturating_mul(1_000_000_000) / self.min_rtt_nanos).max(1))
     }
 }
 
