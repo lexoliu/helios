@@ -23,6 +23,7 @@ use std::time::Instant;
 
 use helios_api::channel;
 use helios_api::programs::{self, Child, ExecRequest, SpawnRequest};
+use helios_api::wit_bindgen::{FutureReader, StreamReader};
 use helios_api::{stats, task};
 use helios_bench_metrics::{LatencySamples, mib_per_second, report_metric};
 use thiserror::Error;
@@ -56,8 +57,12 @@ enum ProcbenchError {
         kind: programs::ExecErrorKind,
         detail: String,
     },
-    #[error("child {path} exited with code {code}")]
-    ChildFailed { path: String, code: u32 },
+    #[error("child {path} exited with code {code}; its stderr said: {stderr}")]
+    ChildFailed {
+        path: String,
+        code: u32,
+        stderr: String,
+    },
     #[error("child {path} closed its stdout before producing output")]
     NoOutput { path: String },
     #[error("child returned a corrupted message in round {round}")]
@@ -153,6 +158,21 @@ fn parse_number(raw: Option<String>) -> Result<u64, ProcbenchError> {
     Ok(value)
 }
 
+/// A child of a `startup` batch, held with the stdout endpoint it was
+/// measured through.
+///
+/// The reader is part of the child, not a probe that ends with the
+/// measurement: dropping it closes the child's stdout, and the next
+/// write the child makes fails with a broken pipe, which kills a
+/// `hello hold` that is only waiting for its stdin to close (#183).
+/// `tools/bench/native/procbench.c` holds the matching descriptor open
+/// for the same reason, and closes it only when it dismantles the batch.
+struct HeldChild {
+    child: Child,
+    _stdout: StreamReader<u8>,
+    _stdout_done: FutureReader<Result<(), ()>>,
+}
+
 async fn startup(count: u64, child: ChildSpec) -> Result<(), ProcbenchError> {
     let memory_before = stats::snapshot().memory.available_bytes;
     let (tx, rx) = channel::bounded(usize::try_from(count).expect("count fits usize"));
@@ -187,11 +207,13 @@ async fn startup(count: u64, child: ChildSpec) -> Result<(), ProcbenchError> {
     // has had its stdin closed yet.
     let memory_after = stats::snapshot().memory.available_bytes;
 
-    for handle in children {
+    for held in children {
         // Closing stdin releases a `hello hold` child; the batch is
-        // dismantled only after its footprint was sampled.
-        handle.write_stdin(Vec::new()).await?;
-        wait_child(handle, &child.path).await?;
+        // dismantled only after its footprint was sampled. The stdout
+        // endpoint the child was measured through goes with it, so no
+        // child outlives its own pipe.
+        held.child.write_stdin(Vec::new()).await?;
+        wait_child(held.child, &child.path).await?;
     }
 
     println!("instance-startup:{count}");
@@ -209,10 +231,10 @@ async fn startup(count: u64, child: ChildSpec) -> Result<(), ProcbenchError> {
 
 async fn spawn_until_first_output(
     child: &ChildSpec,
-) -> Result<(Child, std::time::Duration), ProcbenchError> {
+) -> Result<(HeldChild, std::time::Duration), ProcbenchError> {
     let started = Instant::now();
     let handle = child.spawn().await?;
-    let (mut stdout, _completion) = handle.stdout();
+    let (mut stdout, stdout_done) = handle.stdout();
     let (result, chunk) = stdout.read(Vec::with_capacity(READ_CHUNK_BYTES)).await;
     let elapsed = started.elapsed();
     if chunk.is_empty() && helios_api::stream_closed(result) {
@@ -220,19 +242,39 @@ async fn spawn_until_first_output(
             path: child.path.clone(),
         });
     }
-    Ok((handle, elapsed))
+    Ok((
+        HeldChild {
+            child: handle,
+            _stdout: stdout,
+            _stdout_done: stdout_done,
+        },
+        elapsed,
+    ))
 }
 
 async fn wait_child(child: Child, path: &str) -> Result<(), ProcbenchError> {
+    // The reader is taken before the wait so a failing child's own
+    // account of the failure survives; a child that exits cleanly costs
+    // one closed stream and nothing else.
+    let (mut stderr, _completion) = child.stderr();
     let status = child.wait().await.map_err(|error| ProcbenchError::Spawn {
         path: path.to_owned(),
         kind: error.kind,
         detail: error.detail,
     })?;
     if status.code != 0 {
+        let mut captured = Vec::new();
+        loop {
+            let (result, chunk) = stderr.read(Vec::with_capacity(READ_CHUNK_BYTES)).await;
+            captured.extend_from_slice(&chunk);
+            if chunk.is_empty() && helios_api::stream_closed(result) {
+                break;
+            }
+        }
         return Err(ProcbenchError::ChildFailed {
             path: path.to_owned(),
             code: status.code,
+            stderr: String::from_utf8_lossy(&captured).trim().to_owned(),
         });
     }
     Ok(())
@@ -263,6 +305,9 @@ async fn spawn_wait(count: u64, child: ChildSpec) -> Result<(), ProcbenchError> 
             return Err(ProcbenchError::ChildFailed {
                 path: child.path.clone(),
                 code: result.exit_code,
+                stderr: String::from_utf8_lossy(&result.output.stderr)
+                    .trim()
+                    .to_owned(),
             });
         }
     }
