@@ -30,6 +30,10 @@ struct TrustedSigningKeyTemplate<'a> {
 }
 
 fn main() {
+    // Set by the `profile-generate` build's rustflags, alongside
+    // `-C profile-generate`, so the profile runtime and the instrumentation
+    // it serves can never be compiled apart (docs/pgo.md).
+    println!("cargo:rustc-check-cfg=cfg(helios_profile_generate)");
     println!("cargo:rustc-check-cfg=cfg(helios_watchdog_self_test)");
     println!("cargo:rerun-if-env-changed=HELIOS_BUILD_TARGET");
     println!("cargo:rerun-if-env-changed=HELIOS_KERNEL_PREBUILD_MANIFEST");

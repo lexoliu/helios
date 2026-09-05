@@ -18,6 +18,7 @@ mod log;
 mod memory;
 mod network;
 mod process;
+mod profiling;
 mod runtime;
 #[cfg(test)]
 mod test_support;
@@ -148,6 +149,9 @@ pub use process::{
     RuntimeMessage, SetWallClockCap, SignalAuthority, SpawnAuthority, SymlinkCreateCap,
     SymlinkReadCap, TcpCap, TerminalAuthorityRights, TerminalInputCap, TerminalOutputCap, ThreadId,
     ThreadRecord, ThreadState, ThreadTable, ThreadTableError, TtyControlCap, UdpCap,
+};
+pub use profiling::{
+    KernelLlvmProfile, LlvmProfile, LlvmProfileError, MAX_PROFILE_READ, ProfileSection,
 };
 pub use runtime::{
     AuthorityDomain, ComponentHostFilesystemState, ComponentNetworkService, ComponentNetworkState,

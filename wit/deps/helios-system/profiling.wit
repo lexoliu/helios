@@ -37,8 +37,43 @@ interface profiling {
     total-instructions-retired: u64,
   }
 
+  /// A section of the kernel image's LLVM instrumentation.
+  enum profile-section {
+    counters,
+    data,
+    names,
+  }
+
+  /// Why the kernel could not produce an LLVM raw profile.
+  variant raw-profile-error {
+    /// The running kernel carries no instrumentation: it was not built
+    /// with the `profile-generate` profile.
+    not-instrumented,
+    /// The image's `__llvm_profile_raw_version`, which is not the raw
+    /// profile version the kernel's writer implements.
+    unsupported-version(u64),
+    /// A section whose length is not a whole number of its records.
+    malformed-section(profile-section),
+    /// The length of the profile, which the requested offset is past.
+    out-of-range(u64),
+    /// The largest window one read serves, which the request exceeded.
+    read-too-large(u32),
+  }
+
   set-enabled: func(enabled: bool);
   clear: func();
   folded: func(filter: filter, limit: u32) -> list<folded-sample>;
   metrics: func(filter: metric-filter, limit: u32) -> list<metric-sample>;
+
+  /// Length in bytes of the kernel's LLVM raw profile (`.profraw`).
+  ///
+  /// The length is fixed by the link rather than by what has executed, so
+  /// a reader may ask once and then walk the image while the kernel keeps
+  /// counting.
+  raw-profile-size: func() -> result<u64, raw-profile-error>;
+
+  /// The window of the raw profile starting at `offset`, at most `length`
+  /// bytes. A window that reaches the end of the image is short, and an
+  /// offset at the end returns nothing.
+  raw-profile-read: func(offset: u64, length: u32) -> result<list<u8>, raw-profile-error>;
 }

@@ -10,8 +10,9 @@ use crate::system::server::{self, Dispatcher};
 use super::bindings::helios::system::{instances, profiling, programs, stats, tracing};
 use super::methods::{
     INSTANCES_INSTANCE, INSTANCES_SNAPSHOT, PROFILING_CLEAR, PROFILING_FOLDED, PROFILING_INSTANCE,
-    PROFILING_METRICS, PROFILING_SET_ENABLED, PROGRAMS_AOT, PROGRAMS_EXEC, PROGRAMS_INSTANCE,
-    STATS_INSTANCE, STATS_SNAPSHOT, TRACING_INSTANCE, TRACING_RECENT,
+    PROFILING_METRICS, PROFILING_RAW_PROFILE_READ, PROFILING_RAW_PROFILE_SIZE,
+    PROFILING_SET_ENABLED, PROGRAMS_AOT, PROGRAMS_EXEC, PROGRAMS_INSTANCE, STATS_INSTANCE,
+    STATS_SNAPSHOT, TRACING_INSTANCE, TRACING_RECENT,
 };
 use crate::debugger::{filesystem, programs as debugger_programs};
 
@@ -56,6 +57,8 @@ fn supports_request(instance: &str, func: &str) -> bool {
             | (PROFILING_INSTANCE, PROFILING_CLEAR)
             | (PROFILING_INSTANCE, PROFILING_FOLDED)
             | (PROFILING_INSTANCE, PROFILING_METRICS)
+            | (PROFILING_INSTANCE, PROFILING_RAW_PROFILE_SIZE)
+            | (PROFILING_INSTANCE, PROFILING_RAW_PROFILE_READ)
     ) || filesystem::supports(instance, func)
         || debugger_programs::supports(instance, func)
 }
@@ -219,6 +222,31 @@ async fn dispatch(instance: &str, func: &str, payload: &[u8]) -> Result<Vec<u8>,
                 .collect::<Vec<_>>();
             postcard::to_allocvec(&samples).map_err(|source| DispatchError::Encode {
                 operation: "profiling.metrics",
+                source,
+            })
+        }
+        (PROFILING_INSTANCE, PROFILING_RAW_PROFILE_SIZE) => {
+            if !payload.is_empty() {
+                return Err(DispatchError::UnexpectedPayload {
+                    operation: "profiling.raw-profile-size",
+                });
+            }
+            let size = host_profiling::raw_profile_size().map_err(convert_raw_profile_error);
+            postcard::to_allocvec(&size).map_err(|source| DispatchError::Encode {
+                operation: "profiling.raw-profile-size",
+                source,
+            })
+        }
+        (PROFILING_INSTANCE, PROFILING_RAW_PROFILE_READ) => {
+            let (offset, length): (u64, u32) =
+                postcard::from_bytes(payload).map_err(|source| DispatchError::Decode {
+                    operation: "profiling.raw-profile-read",
+                    source,
+                })?;
+            let window =
+                host_profiling::raw_profile_read(offset, length).map_err(convert_raw_profile_error);
+            postcard::to_allocvec(&window).map_err(|source| DispatchError::Encode {
+                operation: "profiling.raw-profile-read",
                 source,
             })
         }
@@ -529,6 +557,30 @@ fn convert_filter(filter: tracing::Filter) -> host_tracing::Filter {
     host_tracing::Filter {
         min_level: filter.min_level.map(convert_level_to_local),
         target_prefixes: filter.target_prefixes,
+    }
+}
+
+fn convert_raw_profile_error(error: host_profiling::RawProfileError) -> profiling::RawProfileError {
+    use host_profiling::RawProfileError as Host;
+    use profiling::RawProfileError as Wire;
+
+    match error {
+        Host::NotInstrumented => Wire::NotInstrumented,
+        Host::UnsupportedVersion(version) => Wire::UnsupportedVersion(version),
+        Host::MalformedSection(section) => Wire::MalformedSection(convert_profile_section(section)),
+        Host::OutOfRange(len) => Wire::OutOfRange(len),
+        Host::ReadTooLarge(limit) => Wire::ReadTooLarge(limit),
+    }
+}
+
+fn convert_profile_section(section: host_profiling::ProfileSection) -> profiling::ProfileSection {
+    use host_profiling::ProfileSection as Host;
+    use profiling::ProfileSection as Wire;
+
+    match section {
+        Host::Counters => Wire::Counters,
+        Host::Data => Wire::Data,
+        Host::Names => Wire::Names,
     }
 }
 

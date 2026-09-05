@@ -255,6 +255,113 @@ jobs:
           if-no-files-found: warn
           retention-days: 90
 
+  # The profile-guided-optimisation feed of docs/pgo.md. It boots an
+  # instrumented kernel — one that counts every branch it takes — runs the
+  # suite's workloads on it, and uploads the merged profile. It reports no
+  # numbers and its lane is not a benchmark surface: instrumentation changes
+  # scheduling, so anything timed here would measure the counters.
+  profile-generate:
+    name: profile-generate
+    # Same events as the suite: a full instrumented build plus a workload
+    # pass is too heavy for every push.
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'bench'))
+      || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/'))
+      || (github.event_name == 'push' && vars.HELIOS_BENCH_DEDICATED == 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: helios
+      - uses: ./helios/.github/actions/checkout-wasmtime
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libudev-dev just cmake ninja-build \
+            qemu-system-x86 ovmf qemu-utils genisoimage
+          if [ -e /dev/kvm ]; then
+            sudo chmod 666 /dev/kvm
+          fi
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-tools
+      - name: Stage Limine bootloader share
+        run: |
+          git clone --depth 1 --branch v11.x-binary \
+            https://github.com/limine-bootloader/limine "$GITHUB_WORKSPACE/limine"
+          make -C "$GITHUB_WORKSPACE/limine"
+      - name: Restore WASI tooling artifacts
+        id: artifact-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            helios/artifacts/wasi-tools
+            helios/artifacts/python3-root
+            helios/artifacts/wasix
+          key: wasi-artifacts-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('helios/tools/wasi-apps/**', 'helios/Cargo.lock') }}
+      - name: Stage WASI tooling artifacts
+        if: steps.artifact-cache.outputs.cache-hit != 'true'
+        working-directory: helios
+        run: tools/wasi-apps/build.sh
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: helios
+          key: profile-generate
+      - name: Put llvm-profdata on PATH
+        # The inspector merges the raw profile before it writes anything and
+        # names this tool if it cannot find it; the toolchain's own copy is
+        # the one whose LLVM matches the instrumentation.
+        working-directory: helios
+        run: |
+          rustup component add llvm-tools
+          echo "$(rustc --print target-libdir)/../bin" >> "$GITHUB_PATH"
+      - name: Build the instrumented kernel
+        working-directory: helios
+        run: just build-instrumented x86-64
+      - name: Collect the compiler profile
+        working-directory: helios
+        env:
+          HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
+          HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/profiles"
+          ./target/release/helios-inspector vm --arch x86-64 --profile-generate \
+            --accel kvm --memory 4G \
+            aot-bench artifacts/wasi-tools/curl.wasm --iterations 2 \
+            --llvm-raw-profile-output "$GITHUB_WORKSPACE/profiles/aot-bench.profraw"
+      - name: Collect the workload profile
+        working-directory: helios
+        env:
+          HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
+          HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
+        run: |
+          # Every class the suite runs that needs no privileged host
+          # networking. The network path is profiled once a lane provisions
+          # the tap backend for a collection run.
+          ./target/release/helios-inspector vm --arch x86-64 --profile-generate \
+            --accel kvm --memory 4G \
+            workload-bench --iterations 1 \
+            --class compute --class startup --class hostcall \
+            --class ipc --class sched --class fs \
+            --llvm-raw-profile-output "$GITHUB_WORKSPACE/profiles/workloads.profraw"
+      - name: Merge the profiles
+        run: |
+          llvm-profdata merge \
+            --output "$GITHUB_WORKSPACE/profiles/helios-kernel.profdata" \
+            "$GITHUB_WORKSPACE"/profiles/*.profraw
+          llvm-profdata show --all-functions \
+            "$GITHUB_WORKSPACE/profiles/helios-kernel.profdata" \
+            | tail -20 >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: helios-kernel-profdata
+          path: profiles/helios-kernel.profdata
+          if-no-files-found: error
+          retention-days: 90
+
   gate:
     name: gate-${{ matrix.lane }}
     needs: [tooling, suite]

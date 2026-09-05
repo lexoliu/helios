@@ -123,6 +123,18 @@ clippy-target target package:
     HELIOS_KERNEL_PREBUILD_MANIFEST="${manifest}" cargo clippy \
         -p "{{package}}" --target "{{target}}" -- -D warnings
 
+# Build the instrumented kernel image of docs/pgo.md for `arch` (aarch64,
+# riscv64, x86-64) and stop there.
+#
+# The instrumented rustflags have exactly one definition, in the inspector,
+# so what this builds and what a `--profile-generate` boot builds cannot
+# drift. `vm` always wants an accelerator named; this recipe boots nothing,
+# so the one named here means only "not a boot".
+# Usage: just build-instrumented aarch64
+build-instrumented arch:
+    cargo run -p helios-inspector --quiet -- \
+        vm --arch {{arch}} --profile-generate --accel tcg build
+
 # Equivalent of AGENTS §7 required checks. Run before declaring a change complete.
 check-all:
     just check-host

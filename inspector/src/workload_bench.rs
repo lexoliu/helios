@@ -120,6 +120,12 @@ pub(crate) struct WorkloadBenchCommand {
     #[arg(long)]
     pub(crate) perf_metrics_output: Option<PathBuf>,
 
+    /// Write the guest kernel's LLVM raw profile after the run, and the
+    /// `llvm-profdata merge` of it beside the file. Only an instrumented
+    /// kernel (`vm --profile-generate`) carries one (docs/pgo.md).
+    #[arg(long)]
+    pub(crate) llvm_raw_profile_output: Option<PathBuf>,
+
     /// Seconds one workload iteration may take before the run fails it.
     #[arg(long, default_value_t = DEFAULT_WORKLOAD_TIMEOUT_SECONDS)]
     pub(crate) workload_timeout_seconds: u32,
@@ -1128,6 +1134,7 @@ mod tests {
             kernel_profile_output: None,
             user_profile_output: None,
             perf_metrics_output: None,
+            llvm_raw_profile_output: None,
             workload_timeout_seconds: DEFAULT_WORKLOAD_TIMEOUT_SECONDS,
         };
         let workloads = select_workloads(&command).expect("manifest must parse");
@@ -1190,6 +1197,7 @@ mod tests {
             kernel_profile_output: None,
             user_profile_output: None,
             perf_metrics_output: None,
+            llvm_raw_profile_output: None,
             workload_timeout_seconds: DEFAULT_WORKLOAD_TIMEOUT_SECONDS,
         };
         let workloads = select_workloads(&command).expect("manifest must parse");
@@ -1219,6 +1227,7 @@ mod tests {
             kernel_profile_output: None,
             user_profile_output: None,
             perf_metrics_output: None,
+            llvm_raw_profile_output: None,
             workload_timeout_seconds: DEFAULT_WORKLOAD_TIMEOUT_SECONDS,
         };
         let workloads = select_workloads(&command).expect("manifest must parse");
@@ -1281,6 +1290,7 @@ mod tests {
             kernel_profile_output: None,
             user_profile_output: None,
             perf_metrics_output: None,
+            llvm_raw_profile_output: None,
             workload_timeout_seconds,
         }
     }
