@@ -141,6 +141,15 @@ transfer stalls: whether the guest stopped acknowledging, whether the peer
 stopped sending, and which of the two was waiting on a timer are all
 questions the capture answers and the guest log does not.
 
+The bench lanes turn it on for themselves. `workload-bench.sh` adds
+`--net-pcap` whenever `HELIOS_WORKLOAD_BENCH_NET_PCAP` is set and a
+runtime directory was asked for, and writes `net.pcap` into that
+directory — one per boot, because each workload class is its own VM and
+a shared path would let the second class overwrite the first's capture.
+CI sets both, and the runtime directory is uploaded when the lane fails,
+so a network workload that fails there is diagnosable from the artifact
+without reproducing the lane.
+
 ## The `user` backend
 
 The default. QEMU's built-in slirp stack needs no privileges and no host

@@ -282,7 +282,7 @@ async fn run_shell_workload(
     .with_context(|| format!("failed to run workload {}", workload.name))?;
     let elapsed_ms = started.elapsed().as_millis();
     if output.exit_code != 0 {
-        write_guest_output(&output.output.stdout, &output.output.stderr)?;
+        write_guest_output(workload, &output.output.stdout, &output.output.stderr)?;
         bail!(
             "workload {} exited with code {}",
             workload.name,
@@ -319,7 +319,7 @@ async fn run_program_workload(
         .with_context(|| format!("failed to run workload {}", workload.name))?;
     let elapsed_ms = started.elapsed().as_millis();
     if output.exit_code != 0 {
-        write_guest_output(&output.output.stdout, &output.output.stderr)?;
+        write_guest_output(workload, &output.output.stdout, &output.output.stderr)?;
         bail!(
             "workload {} exited with code {}",
             workload.name,
@@ -548,7 +548,7 @@ fn validate_output(workload: &Workload, stdout: &[u8], stderr: &[u8]) -> Result<
     let stdout_text = String::from_utf8_lossy(stdout);
     for expected in &workload.stdout_contains {
         if !stdout_text.contains(expected) {
-            write_guest_output(stdout, stderr)?;
+            write_guest_output(workload, stdout, stderr)?;
             bail!(
                 "workload {} stdout did not contain expected text {:?}",
                 workload.name,
@@ -557,7 +557,7 @@ fn validate_output(workload: &Workload, stdout: &[u8], stderr: &[u8]) -> Result<
         }
     }
     if workload.stderr_empty && !stderr.is_empty() {
-        write_guest_output(stdout, stderr)?;
+        write_guest_output(workload, stdout, stderr)?;
         bail!("workload {} wrote stderr", workload.name);
     }
     Ok(ValidationSummary { ok: true })
@@ -622,10 +622,38 @@ fn write_record(record: &JsonlRecord<'_>) -> Result<()> {
     Ok(())
 }
 
-fn write_guest_output(stdout: &[u8], stderr: &[u8]) -> Result<()> {
+/// Prints a failing workload's own output, named and labelled.
+///
+/// A workload that exits non-zero used to surface as nothing but its
+/// exit status, and the bytes it wrote went out unattributed — the
+/// guest's stdout into the JSONL record stream a lane parses, its
+/// stderr beside it with nothing saying which workload wrote it or
+/// which stream it came from. Both streams go to stderr here, which is
+/// where a lane log collects them, and each one is named so the log
+/// says what the workload saw rather than only that it failed.
+fn write_guest_output(workload: &Workload, stdout: &[u8], stderr: &[u8]) -> Result<()> {
     use std::io::Write as _;
-    std::io::stdout().write_all(stdout)?;
-    std::io::stderr().write_all(stderr)?;
+    let mut sink = std::io::stderr().lock();
+    writeln!(sink, "--- workload {} output ---", workload.name)?;
+    write_guest_stream(&mut sink, "stdout", stdout)?;
+    write_guest_stream(&mut sink, "stderr", stderr)?;
+    writeln!(sink, "--- end of workload {} output ---", workload.name)?;
+    Ok(())
+}
+
+/// One named stream of a failing workload's output. An empty stream is
+/// said to be empty rather than left out: "the guest printed nothing"
+/// and "the runner did not capture this" are different failures.
+fn write_guest_stream(sink: &mut impl std::io::Write, name: &str, bytes: &[u8]) -> Result<()> {
+    if bytes.is_empty() {
+        writeln!(sink, "{name}: <empty>")?;
+        return Ok(());
+    }
+    writeln!(sink, "{name} ({} bytes):", bytes.len())?;
+    sink.write_all(bytes)?;
+    if !bytes.ends_with(b"\n") {
+        writeln!(sink)?;
+    }
     Ok(())
 }
 
