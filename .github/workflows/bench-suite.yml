@@ -83,7 +83,11 @@ jobs:
         working-directory: tools/bench
         run: |
           select="${{ github.event_name == 'workflow_dispatch' && inputs.lanes || 'all' }}"
-          echo "matrix=$(uv run helios-bench lanes --select "$select" --format github-matrix)" >> "$GITHUB_OUTPUT"
+          advisory=""
+          if [ "${{ steps.mode.outputs.advisory }}" = true ]; then advisory=--advisory; fi
+          # An advisory run lists only the lanes a hosted runner can
+          # stand in for; the Arm lane has none and waits for its machine.
+          echo "matrix=$(uv run helios-bench lanes --select "$select" $advisory --format github-matrix)" >> "$GITHUB_OUTPUT"
       - name: Verify the committed README and docs sections match their run's report
         working-directory: tools/bench
         run: uv run helios-bench render check
@@ -129,6 +133,8 @@ jobs:
           if [ -e /dev/kvm ]; then
             sudo chmod 666 /dev/kvm
           fi
+      # The dedicated Apple Silicon machine keeps its own tools; hosted
+      # runners here are Linux only.
       - name: Install host dependencies (macOS)
         if: runner.os == 'macOS'
         run: brew install qemu just cmake ninja cdrtools
@@ -254,7 +260,7 @@ jobs:
 
   gate:
     name: gate-${{ matrix.lane }}
-    needs: suite
+    needs: [tooling, suite]
     if: always() && needs.suite.result != 'skipped'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -265,7 +271,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        lane: [x86-64-kvm, aarch64-hvf]
+        include: ${{ fromJSON(needs.tooling.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6

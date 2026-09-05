@@ -145,33 +145,50 @@ committed sections and fails when the text no longer matches the report.
 ## Cells that are known to fail
 
 A red cell in a published table is either a bug of ours with an issue
-number or a limit of the runner, and the table says which. As of this
-page's last render:
+number or a limit of the runner, and the table says which. The report's
+`failures` map carries the harness's own reason for every one of them, so
+the table is generated from what the run actually saw rather than from
+this page.
 
-- `instance-startup-100`, `instance-startup-500` — a user-mode spawn
-  storm exhausts the kernel's per-processor executor task arena and
-  panics the kernel (#94). The instance-density claim of #28 cannot be
-  measured on any lane until a spawn the kernel cannot serve is refused
-  instead of fatal.
-- Every Helios cell of the `x86-64-kvm` lane — the x86 kernel refuses the
-  multi-queue `vhost` tap device and never finishes boot (#91). The lane
-  runs, provisions its network backend and uploads its report; the report
-  has no Helios side.
-- `tcp-throughput` on a slirp backend on macOS — the guest's receive path
-  times out at around 300 KB (#93). Shared macOS runners can hold neither
-  the `com.apple.vm.networking` entitlement nor a `socket_vmnet` daemon,
-  so an advisory `aarch64-hvf` run has no other network backend to use;
-  the dedicated Apple Silicon machine does.
+The bugs the first runs of this suite found are fixed: the x86 kernel
+refusing a multi-queue `vhost` tap (#91), a user-mode spawn storm
+panicking the kernel through the task arena (#94), the OOM killer
+condemning a fresh victim per grow attempt (#100) and then panicking on
+an already-inactive instance (#114), the guest receive path stalling
+around 300 KB (#93), and two guests sharing one runtime directory (#98).
+A cell that fails now is news, and belongs in a new issue quoted from the
+report.
+
+## Where each architecture's numbers come from
+
+**x86-64 numbers** come from the `x86-64-kvm` lane: the dedicated Linux
+machine for publishable ones, and a hosted `ubuntu-24.04` runner in
+advisory mode, which has the same accelerator (`/dev/kvm`) and the same
+network backend (a multi-queue tap over a readable `/dev/vhost-net`) as
+the lane pins. What a hosted runner cannot promise is an idle machine or
+a fixed governor, which is exactly the difference between an advisory
+number and a publishable one.
+
+**aarch64 numbers** come only from the dedicated Apple Silicon machine,
+or from a developer's own arm64 machine run by hand. There is no hosted
+aarch64 lane and there will not be one: this repository's CI runs on
+Linux GitHub runners only, and a hosted Linux Arm runner exposes neither
+`/dev/kvm` nor a readable `/dev/vhost-net`, so a guest on one would be
+interpreted behind a userspace tap. That is a different machine, not a
+noisier one — it changes what is fast relative to what, which is the one
+thing a benchmark exists to measure. An advisory run therefore emits the
+`x86-64-kvm` lane alone, and the Arm half of any table stays empty until
+the dedicated machine exists.
 
 ## Dedicated runners
 
 Publishable numbers come from two self-hosted machines, one per lane,
 registered with these labels:
 
-| Lane | Label | Host | Accelerator |
-| --- | --- | --- | --- |
-| `x86-64-kvm` | `helios-bench-x86-kvm` | x86-64 Linux, `/dev/kvm` | KVM |
-| `aarch64-hvf` | `helios-bench-arm-hvf` | Apple Silicon macOS | HVF |
+| Lane | Label | Host | Accelerator | Advisory stand-in |
+| --- | --- | --- | --- | --- |
+| `x86-64-kvm` | `helios-bench-x86-kvm` | x86-64 Linux, `/dev/kvm` | KVM | `ubuntu-24.04` |
+| `aarch64-hvf` | `helios-bench-arm-hvf` | Apple Silicon macOS | HVF | none |
 
 Requirements the manifest's host check cannot verify and the machine's
 owner must guarantee: the CPU frequency governor is fixed (`performance`
@@ -179,30 +196,21 @@ on Linux; on macOS the machine is on mains power and not in low-power
 mode), turbo behaviour is the same for every run, nothing else is
 scheduled on the machine while the workflow runs, the same QEMU release
 is installed as the lane pins, and the network backend is the lane's
-(`tap` with vhost-net on Linux, vmnet-bridged on macOS).
+(`tap` with vhost-net on Linux, `vmnet-bridged` on macOS — the only
+macOS packet path with more than one queue and any offload).
 
-Until these machines exist, the same jobs run on GitHub's shared runners
-in **advisory** mode: the report carries `publishable: false`, the README
-says so, and nothing blocks. The repository variable
-`HELIOS_BENCH_DEDICATED=true` turns on the dedicated-runner runs for
-pushes to `dev`; tags always use the dedicated labels.
+Until these machines exist, the lanes that have a hosted stand-in run
+there in **advisory** mode: the report carries `publishable: false`, the
+README says so, and nothing blocks. A lane with no stand-in — the Arm one
+— is left out of an advisory run entirely rather than run on a machine it
+does not describe. The repository variable `HELIOS_BENCH_DEDICATED=true`
+turns on the dedicated-runner runs for pushes to `dev`; tags always use
+the dedicated labels.
 
-The two deviations that matter most on shared runners, both recorded by
-`host-check` and in the report's deviation list:
-
-- **No accelerator on the Arm lane.** GitHub's macOS runners are
-  themselves virtual machines and expose no nested virtualization, so
-  `aarch64-hvf` runs under TCG there. An interpreted guest is a different
-  machine from the one the lane pins: it changes what is fast relative to
-  what, not just how long a run takes, which is exactly why an advisory
-  report is not publishable. The Fedora side of that lane is interpreted
-  too, so the three sides stay comparable with each other and with
-  nothing else.
-- **No multi-queue network on the Arm lane.** See the slirp entry above.
-
-The `x86-64-kvm` lane's shared runner does expose `/dev/kvm` and a
-writable `/dev/vhost-net`, so its accelerator and network backend match
-the lane; what it cannot promise is an idle machine or a fixed governor.
+Every difference between the host a run is taken on and the lane it
+claims is recorded by `host-check` and listed in the report's
+`deviations`, and any deviation at all makes the report
+`publishable: false`.
 
 ## Reproducing a published number
 

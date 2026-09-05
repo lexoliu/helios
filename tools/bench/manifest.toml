@@ -50,16 +50,22 @@ helios_arch = "aarch64"
 guest_arch = "aarch64"
 accelerator = "hvf"
 runner_label = "helios-bench-arm-hvf"
-shared_runner = "macos-15"
+# No hosted runner. helios CI runs on Linux GitHub runners only, and a
+# hosted Linux Arm runner offers neither KVM nor a readable
+# /dev/vhost-net, so a guest there would be interpreted behind a
+# userspace tap — a different machine, not a noisier one. This lane runs
+# on the dedicated Apple Silicon machine or not at all
+# (docs/benchmarks.md, "Dedicated runners").
 # Homebrew qemu on the dedicated Apple Silicon machine.
 qemu_version = "10.2.2"
 boot_timeout_seconds = 3600
 vcpus = 4
 memory = "2G"
 linux_vm_memory = "4G"
-# GitHub's macOS runners can hold neither the com.apple.vm.networking
-# entitlement nor a socket_vmnet daemon, so the shared lane is slirp
-# (single queue, no offload); the dedicated machine runs vmnet-bridged.
-net_backend = "user"
+# The dedicated Apple Silicon machine bridges the guest onto a host
+# interface through vmnet, which is the only macOS packet path with more
+# than one queue and any offload; slirp, the backend a hosted runner
+# would have been left with, has neither (docs/networking.md).
+net_backend = "vmnet-bridged"
 net_host = "10.0.2.2"
 devices = ["virtio-blk-device", "virtio-net-device", "virtio-rng-device"]

@@ -58,3 +58,25 @@ def test_native_counterparts_exist_for_every_native_bin_reference() -> None:
             for value in [spec["program"], *spec.get("args", [])]:
                 if value.startswith("{native_bin}/"):
                     assert Path(value).name in sources, value
+
+
+def test_the_arm_lane_has_no_hosted_stand_in() -> None:
+    """CI here is Linux-only, and no hosted runner describes the Arm lane.
+
+    A hosted Linux Arm runner has neither `/dev/kvm` nor a readable
+    `/dev/vhost-net`, so a guest on one is interpreted behind a userspace
+    tap: a different machine, not a noisier one.
+    """
+    manifest = load_manifest()
+    arm = manifest.lane("aarch64-hvf")
+    assert arm.shared_runner is None
+    assert arm.runs_on(advisory=True) is None
+    assert arm.runs_on(advisory=False) == "helios-bench-arm-hvf"
+
+
+def test_an_advisory_run_keeps_only_the_lanes_a_hosted_runner_can_stand_in_for() -> None:
+    manifest = load_manifest()
+    advisory = [lane.name for lane in manifest.lanes if lane.shared_runner is not None]
+    assert advisory == ["x86-64-kvm"]
+    for lane in manifest.lanes:
+        assert lane.runs_on(advisory=False) == lane.runner_label
