@@ -1783,6 +1783,7 @@ dependencies = [
  "futures-core",
  "futures-io",
  "futures-lite",
+ "futures-util",
  "helios-api",
  "postcard",
  "serde",

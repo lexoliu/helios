@@ -97,6 +97,7 @@ test-units:
     export HELIOS_KERNEL_PREBUILD_MANIFEST="${out_dir}/kernel-prebuild.json"
     cargo test -p helios-hal -p helios-virtio -p helios-netstack -p helios-kernel --lib
     cargo test -p helios-workspace-root --lib
+    cargo test -p helios-inspector-protocol --lib
     cargo test -p helios-kernel --test hal_layering
 
 # Generate the kernel-prebuild manifest for `target` and run `cargo clippy`
