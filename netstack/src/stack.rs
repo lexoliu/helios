@@ -2113,6 +2113,45 @@ where
     tcp_timer_deadlines: [Option<u64>; MAX_TCP_SOCKETS],
     tcp_receive_backpressured: [bool; MAX_TCP_SOCKETS],
     tcp_receive_backpressured_count: usize,
+    tcp_transmit_counters: TcpTransmitCounters,
+}
+
+/// What this stack has put on the wire on behalf of its TCP sockets.
+///
+/// Cumulative and never reset, so a sample taken during a stall is read
+/// against an earlier one rather than against zero. Kept on the stack
+/// rather than on the socket because a socket that closes takes its own
+/// history with it, and the question these answer — did this receiver
+/// stop acknowledging, and did it reopen the window it closed — outlives
+/// any one connection.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TcpTransmitCounters {
+    acks_sent: u64,
+    window_updates_sent: u64,
+    retransmits_sent: u64,
+}
+
+/// A snapshot of what a stack's TCP layer is doing, for the statistics
+/// path to report per shard.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TcpStackCounters {
+    /// Acknowledgements this stack has put on the wire, duplicates
+    /// included.
+    pub acks_sent: u64,
+    /// Those of them that advertised a larger receive window than the
+    /// peer had last been told about.
+    pub window_updates_sent: u64,
+    /// Segments retransmitted, by timer or by fast retransmit.
+    pub retransmits_sent: u64,
+    /// Connections this stack currently holds.
+    pub sockets: u32,
+    /// How many of them have a full receive queue and are refusing
+    /// segments. A count that stays nonzero while `sockets` is zero is a
+    /// leaked window, and the stack will refuse frames for ever.
+    pub receive_backpressured_sockets: u32,
+    /// The receive window those connections advertise between them, in
+    /// bytes. Zero with a nonzero `sockets` is a shut receiver.
+    pub receive_window_bytes: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -2370,6 +2409,30 @@ where
             tcp_timer_deadlines: [None; MAX_TCP_SOCKETS],
             tcp_receive_backpressured: [false; MAX_TCP_SOCKETS],
             tcp_receive_backpressured_count: 0,
+            tcp_transmit_counters: TcpTransmitCounters::default(),
+        }
+    }
+
+    /// What this stack's TCP layer has sent and what it is advertising.
+    pub fn tcp_counters(&self) -> TcpStackCounters {
+        let mut sockets = 0u32;
+        let mut receive_window_bytes = 0u64;
+        for active_slot in 0..self.tcp.active_len() {
+            let index = self.tcp.active_index(active_slot);
+            let Some(socket) = self.tcp.get(index) else {
+                continue;
+            };
+            sockets += 1;
+            receive_window_bytes = receive_window_bytes
+                .saturating_add(u64::from(socket.advertised_receive_window_bytes()));
+        }
+        TcpStackCounters {
+            acks_sent: self.tcp_transmit_counters.acks_sent,
+            window_updates_sent: self.tcp_transmit_counters.window_updates_sent,
+            retransmits_sent: self.tcp_transmit_counters.retransmits_sent,
+            sockets,
+            receive_backpressured_sockets: self.tcp_receive_backpressured_count as u32,
+            receive_window_bytes,
         }
     }
 
@@ -3278,9 +3341,7 @@ where
             };
             if newly_closed {
                 if self.tcp.terminal_error(index).is_none() {
-                    self.tcp.remove_indices(index);
-                    self.release_tcp_listener_child(index);
-                    self.remove_tcp_accepts_for(socket_id(index));
+                    self.retire_closed_tcp_socket(index);
                 }
                 Self::push_event_into(
                     &mut self.events,
@@ -3370,7 +3431,11 @@ where
                     .tcp
                     .get_mut(index)
                     .expect("TCP socket disappeared while queuing ACK");
-                socket.mark_ack_queued();
+                let queued_ack = socket.mark_ack_queued();
+                self.tcp_transmit_counters.acks_sent += 1;
+                if queued_ack.reopened_window {
+                    self.tcp_transmit_counters.window_updates_sent += 1;
+                }
                 self.schedule_tcp_timer(index);
             }
         }
@@ -3395,6 +3460,7 @@ where
                     .get_mut(index)
                     .expect("TCP socket disappeared while queuing retransmission");
                 socket.mark_retransmission_queued(sequence, now.nanos());
+                self.tcp_transmit_counters.retransmits_sent += 1;
                 self.schedule_tcp_timer(index);
             }
         }
@@ -5388,11 +5454,32 @@ where
             .expect("TCP socket disappeared while refreshing indices")
             .state();
         if state == crate::TcpState::Closed {
-            self.tcp.remove_indices(index);
-            self.clear_tcp_receive_backpressure(index);
-            self.release_tcp_listener_child(index);
-            self.remove_tcp_accepts_for(socket_id(index));
+            self.retire_closed_tcp_socket(index);
         }
+    }
+
+    /// Takes a socket that has reached `Closed` out of every index the
+    /// stack keeps about a *live* connection, while leaving the socket
+    /// itself in the slab for the owner to read out and drop.
+    ///
+    /// De-indexing is what makes this irreversible: once the endpoint
+    /// key is gone no segment can reach the socket again, so whatever
+    /// its receive queue still holds is all it will ever hold. The
+    /// receive-backpressure flag has to be surrendered in the same
+    /// step. It is a promise that the *stack* will take frames again
+    /// once this socket is drained, and a de-indexed socket can no
+    /// longer make that promise good: the flag would stay raised until
+    /// the owner closed the handle, and until then the shard reports
+    /// itself unable to receive (#143).
+    ///
+    /// Both paths that close a socket — the state refresh after a
+    /// segment and the timer drive — go through here so the two cannot
+    /// drift apart again.
+    fn retire_closed_tcp_socket(&mut self, index: usize) {
+        self.tcp.remove_indices(index);
+        self.clear_tcp_receive_backpressure(index);
+        self.release_tcp_listener_child(index);
+        self.remove_tcp_accepts_for(socket_id(index));
     }
 
     fn release_tcp_listener_child(&mut self, index: usize) {
@@ -11323,6 +11410,230 @@ mod tests {
             Ok(TcpReadState::Data(_))
         ));
         assert!(!stack.receive_backpressured());
+    }
+
+    /// #143. A connection that reaches `Closed` on the *timer* path —
+    /// a TIME-WAIT expiry here — is de-indexed and can never receive
+    /// another segment, so whatever its receive queue still holds is
+    /// all it will ever hold. Until the retirement surrendered the
+    /// receive-backpressure flag with the endpoint index, the stack
+    /// went on reporting itself unable to take a frame with no socket
+    /// left that could ever relieve it: the guest stopped answering
+    /// ARP and disappeared off the wire for the rest of the run.
+    #[test]
+    fn a_connection_that_closes_on_the_timer_path_surrenders_its_receive_window() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let (mut stack, socket) = open_established_tcp_stack(local, peer);
+
+        // Fill the receive queue and leave it full: this is a receiver
+        // that closed its window and has not read a byte back out.
+        let payload = [0u8; crate::tcp::TCP_RECEIVE_SEGMENT_BYTES];
+        let mut sequence = 101u32;
+        for index in 0..crate::tcp::TCP_RECEIVE_BACKPRESSURE_SEGMENTS {
+            let (segment, segment_len) = tcp_segment_with_payload(
+                peer,
+                local,
+                TcpHeader {
+                    source_port: 80,
+                    destination_port: 49152,
+                    sequence,
+                    acknowledgement: 8,
+                    flags: TcpFlags::ACK,
+                    window_size: u16::MAX,
+                },
+                &payload,
+            );
+            stack
+                .receive_tcp(
+                    IpAddress::Ipv4(peer),
+                    IpAddress::Ipv4(local),
+                    &Bytes::copy_from_slice(&segment[..segment_len]),
+                    RxFrameOffload::none(),
+                    StackInstant::from_nanos(index as u64 + 2),
+                )
+                .expect("a segment inside the window should be accepted");
+            sequence = sequence.wrapping_add(crate::tcp::TCP_RECEIVE_SEGMENT_BYTES as u32);
+        }
+        assert!(
+            stack.receive_backpressured(),
+            "the unread queue should have closed the receive window"
+        );
+
+        // The connection now ends without the application reading:
+        // active close, the peer's FIN-ACK, TIME-WAIT.
+        stack
+            .tcp_shutdown_send(socket)
+            .expect("active close should start");
+        stack
+            .drive_tcp(StackInstant::from_nanos(1_000))
+            .expect("FIN should be queued");
+        let (fin_ack, fin_ack_len) = tcp_segment(
+            peer,
+            local,
+            TcpHeader {
+                source_port: 80,
+                destination_port: 49152,
+                sequence,
+                acknowledgement: 9,
+                flags: TcpFlags::ACK.union(TcpFlags::FIN),
+                window_size: u16::MAX,
+            },
+        );
+        stack
+            .receive_tcp(
+                IpAddress::Ipv4(peer),
+                IpAddress::Ipv4(local),
+                &Bytes::copy_from_slice(&fin_ack[..fin_ack_len]),
+                RxFrameOffload::none(),
+                StackInstant::from_nanos(1_001),
+            )
+            .expect("the peer FIN should enter TIME-WAIT");
+        assert!(
+            stack.receive_backpressured(),
+            "the queue is still full while the socket is in TIME-WAIT"
+        );
+
+        // The TIME-WAIT timer, and nothing else, closes the socket.
+        stack
+            .drive_tcp(StackInstant::from_nanos(
+                1_001 + crate::tcp::TCP_TIME_WAIT_NANOS,
+            ))
+            .expect("the TIME-WAIT timer should expire");
+
+        assert!(
+            !stack.receive_backpressured(),
+            "a de-indexed socket cannot be relieved, so it must not go on \
+             refusing frames on the whole stack's behalf"
+        );
+        assert_eq!(
+            stack.tcp_counters().receive_backpressured_sockets,
+            0,
+            "the backpressure bookkeeping must agree with the predicate"
+        );
+    }
+
+    /// A bulk receiver with a reader that lags behind the wire: the
+    /// window closes, and every read has to be able to reopen it and
+    /// say so on the wire. Drives a whole 64 MiB transfer through the
+    /// stack a segment at a time, reading one segment back for every
+    /// two that arrive, and asserts that the window never latches shut
+    /// and that the reopening is advertised rather than merely felt.
+    #[test]
+    fn a_slow_reader_keeps_getting_its_receive_window_reopened() {
+        /// The transfer the `tcp-throughput` workload runs.
+        const TRANSFER_BYTES: usize = 64 * 1024 * 1024;
+        const SEGMENT_BYTES: usize = crate::tcp::TCP_RECEIVE_SEGMENT_BYTES;
+
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let (mut stack, socket) = open_established_tcp_stack(local, peer);
+
+        let payload = [0u8; SEGMENT_BYTES];
+        let mut sequence = 101u32;
+        let mut now = 2u64;
+        let mut delivered = 0usize;
+        let mut read_back = 0usize;
+        let mut refusals = 0usize;
+        let mut window_closures = 0usize;
+        while read_back < TRANSFER_BYTES {
+            // A well-behaved sender: it fills exactly the window the
+            // receiver last advertised and then waits to be told there
+            // is more room. That wait is the whole point — a window
+            // update that is never sent is a transfer that never
+            // finishes.
+            while delivered < TRANSFER_BYTES
+                && stack.tcp_counters().receive_window_bytes >= SEGMENT_BYTES as u64
+            {
+                let (segment, segment_len) = tcp_segment_with_payload(
+                    peer,
+                    local,
+                    TcpHeader {
+                        source_port: 80,
+                        destination_port: 49152,
+                        sequence,
+                        acknowledgement: 8,
+                        flags: TcpFlags::ACK,
+                        window_size: u16::MAX,
+                    },
+                    &payload,
+                );
+                now += 1;
+                match stack.receive_tcp(
+                    IpAddress::Ipv4(peer),
+                    IpAddress::Ipv4(local),
+                    &Bytes::copy_from_slice(&segment[..segment_len]),
+                    RxFrameOffload::none(),
+                    StackInstant::from_nanos(now),
+                ) {
+                    Ok(_) => {
+                        sequence = sequence.wrapping_add(SEGMENT_BYTES as u32);
+                        delivered += SEGMENT_BYTES;
+                    }
+                    // The receive queue filled before the advertised
+                    // window ran out. The segment is lost exactly as it
+                    // would be on the wire and the sender does not move
+                    // past it.
+                    Err(StackError::ReceiveBackpressure) => {
+                        refusals += 1;
+                        break;
+                    }
+                    Err(error) => panic!("unexpected receive error: {error:?}"),
+                }
+            }
+            if stack.tcp_counters().receive_window_bytes < SEGMENT_BYTES as u64 {
+                window_closures += 1;
+            }
+
+            // The application takes one segment per turn, so it is
+            // always behind the wire and the window is always under
+            // pressure.
+            now += 1;
+            match stack.tcp_read(socket, SEGMENT_BYTES, StackInstant::from_nanos(now)) {
+                Ok(TcpReadState::Data(bytes)) => read_back += bytes.len(),
+                Ok(TcpReadState::Pending) => {}
+                other => panic!("unexpected read outcome: {other:?}"),
+            }
+            now += 1;
+            stack
+                .drive_tcp(StackInstant::from_nanos(now))
+                .expect("the stack should drive its TCP timers");
+            while stack.take_outbound().is_some() {}
+            while stack.take_event().is_some() {}
+        }
+
+        assert_eq!(
+            read_back, delivered,
+            "every byte the wire delivered must reach the reader"
+        );
+        assert!(
+            read_back >= TRANSFER_BYTES,
+            "the whole transfer must arrive, and {read_back} of {TRANSFER_BYTES} did"
+        );
+        assert!(
+            window_closures != 0,
+            "a reader this far behind must have closed the window at least once"
+        );
+        assert!(
+            !stack.receive_backpressured(),
+            "the window must be open again once the reader has caught up"
+        );
+
+        let counters = stack.tcp_counters();
+        assert!(
+            counters.window_updates_sent != 0,
+            "a window that closed and reopened owes the peer an update: it shut \
+             {window_closures} times and refused {refusals} segments, and not one \
+             update was advertised"
+        );
+        assert!(
+            counters.acks_sent >= counters.window_updates_sent,
+            "every window update is carried by an acknowledgement"
+        );
+        assert!(
+            counters.receive_window_bytes != 0,
+            "the drained receiver must be advertising room again"
+        );
     }
 
     #[test]

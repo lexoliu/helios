@@ -58,13 +58,13 @@ pub use stack::{
     MAX_OUTBOUND_FRAMES, MAX_UDP_RX, MAX_UDP_SOCKETS, NeighborEntry, NeighborState,
     OutboundBatchStatus, Route, RouteTable, RxChecksumOffload, SocketId, Stack, StackConfig,
     StackEvent, StackInstant, TcpAccept, TcpConnectState, TcpConnectTerminalError,
-    TcpListenBacklog, TcpReadIntoState, TcpReadState, UdpEgress, UdpEndpoint, UdpPayload,
-    UdpReceive, UdpSocketBinding, UdpSocketError, UdpSocketId,
+    TcpListenBacklog, TcpReadIntoState, TcpReadState, TcpStackCounters, UdpEgress, UdpEndpoint,
+    UdpPayload, UdpReceive, UdpSocketBinding, UdpSocketError, UdpSocketId,
 };
 pub use tcp::{TCP_RECEIVE_WINDOW_BYTES, TCP_TRANSMIT_BUFFER_BYTES};
 pub use tcp::{
-    TcpCloseKind, TcpEndpoint, TcpReset, TcpSegmentBudget, TcpSegmentOutcome, TcpSocket, TcpState,
-    TcpStateChangeReason, TcpTransmitSegment,
+    TcpAckQueued, TcpCloseKind, TcpEndpoint, TcpReset, TcpSegmentBudget, TcpSegmentOutcome,
+    TcpSocket, TcpState, TcpStateChangeReason, TcpTransmitSegment,
 };
 pub use types::{
     EthernetAddress, IpAddress, IpCidr, Ipv4Address, Ipv4Cidr, Ipv6Address, Ipv6Cidr, Ipv6Scope,
