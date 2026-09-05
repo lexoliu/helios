@@ -148,6 +148,28 @@ interface stats {
     /// a transport that cannot tell its queues apart, where every
     /// completion arrives on one line.
     interrupts: u64,
+    /// Frames the demux threw away because this shard's stack had no
+    /// room for them. They were already off the ring when they were
+    /// refused, so they are lost and the peer has to retransmit.
+    rx-refused-frames: u64,
+    /// Acknowledgements this shard has put on the wire, duplicates
+    /// included.
+    tcp-acks-sent: u64,
+    /// Those of them that advertised more receive room than the peer had
+    /// last been told about. A receiver whose window shut and whose
+    /// update count then stopped moving is a stalled transfer.
+    tcp-window-updates-sent: u64,
+    /// Segments this shard retransmitted, by timer or fast retransmit.
+    tcp-retransmits-sent: u64,
+    /// Connections this shard holds.
+    tcp-sockets: u32,
+    /// How many of them are refusing segments for want of receive room.
+    /// Nonzero while `tcp-sockets` is zero is a leaked window: the shard
+    /// refuses frames with no socket left that could relieve it.
+    tcp-receive-backpressured-sockets: u32,
+    /// The receive window those connections advertise between them, in
+    /// bytes. Zero with connections open is a shut receiver.
+    tcp-receive-window-bytes: u64,
   }
 
   /// How the interface's work is spread across processors.

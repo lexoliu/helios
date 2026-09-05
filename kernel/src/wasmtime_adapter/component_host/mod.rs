@@ -3723,6 +3723,13 @@ macro_rules! convert_network_stats {
                         rx_frames: queue.rx_frames,
                         tx_frames: queue.tx_frames,
                         interrupts: queue.interrupts,
+                        rx_refused_frames: queue.rx_refused_frames,
+                        tcp_acks_sent: queue.tcp_acks_sent,
+                        tcp_window_updates_sent: queue.tcp_window_updates_sent,
+                        tcp_retransmits_sent: queue.tcp_retransmits_sent,
+                        tcp_sockets: queue.tcp_sockets,
+                        tcp_receive_backpressured_sockets: queue.tcp_receive_backpressured_sockets,
+                        tcp_receive_window_bytes: queue.tcp_receive_window_bytes,
                     })
                     .collect(),
             }
