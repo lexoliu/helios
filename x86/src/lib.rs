@@ -41,6 +41,7 @@ use helios_hal::watchdog::Watchdog;
 use helios_hal::{
     DeviceInventory, DmaModel, Platform, ProcessorStartupPolicy, ProcessorTopology, align_up,
 };
+use helios_kernel::DebugSerialAccess;
 use x86_64::instructions::port::{Port, PortReadOnly, PortWriteOnly};
 use x86_64::registers::control::{Cr0Flags, Cr4Flags};
 
@@ -1058,12 +1059,22 @@ fn serial_tx_ready() -> bool {
     }
 }
 
+impl DebugSerialAccess for DebugSerial {
+    type Port = Self;
+
+    fn port() -> Self {
+        // COM1 is configured once, by `serial_uart_init` on the
+        // bootstrap processor, before anything can write to it.
+        Self
+    }
+}
+
 fn read_debug_serial(buffer: &mut alloc::vec::Vec<u8>, max_bytes: u32) {
-    helios_kernel::try_read_serial(&DebugSerial, buffer, max_bytes);
+    helios_kernel::read_debug_serial::<DebugSerial>(buffer, max_bytes);
 }
 
 pub(crate) fn write_debug_serial_bytes(bytes: &[u8]) {
-    DebugSerial.write_bytes(bytes);
+    helios_kernel::write_debug_serial_bytes::<DebugSerial>(bytes);
 }
 
 #[panic_handler]

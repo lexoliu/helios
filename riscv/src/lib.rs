@@ -107,8 +107,8 @@ use helios_hal::memory::MemoryRegion;
 use helios_hal::serial::ByteSerial;
 use helios_hal::{DeviceInventory, DmaModel, ProcessorStartupPolicy, ProcessorTopology};
 use helios_kernel::{
-    KernelException, KernelExceptionCause, KernelExceptionDispatch, KernelNativeTrapHandler, Timer,
-    WasmtimeTlsSlots,
+    DebugSerialAccess, KernelException, KernelExceptionCause, KernelExceptionDispatch,
+    KernelNativeTrapHandler, Timer, WasmtimeTlsSlots,
 };
 use riscv::interrupt::Trap;
 use riscv::interrupt::supervisor::{Exception, Interrupt};
@@ -918,12 +918,20 @@ fn current_debug_transport() -> &'static DebugTransport {
         .expect("debug transport is missing from the current hart runtime")
 }
 
+impl DebugSerialAccess for DebugTransport {
+    type Port = Self;
+
+    fn port() -> Self {
+        *current_debug_transport()
+    }
+}
+
 fn read_debug_serial(buffer: &mut alloc::vec::Vec<u8>, max_bytes: u32) {
-    helios_kernel::try_read_serial(current_debug_transport(), buffer, max_bytes);
+    helios_kernel::read_debug_serial::<DebugTransport>(buffer, max_bytes);
 }
 
 pub(crate) fn write_debug_serial_bytes(bytes: &[u8]) {
-    current_debug_transport().write_bytes(bytes);
+    helios_kernel::write_debug_serial_bytes::<DebugTransport>(bytes);
 }
 
 #[unsafe(no_mangle)]

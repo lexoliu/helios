@@ -27,7 +27,8 @@ use helios_hal::{
     DeviceInventory, DmaModel, Platform, ProcessorStartupPolicy, ProcessorTopology, align_up,
 };
 use helios_kernel::{
-    KernelException, KernelExceptionCause, KernelNativeTrapHandler, Timer, WasmtimeTlsSlots,
+    DebugSerialAccess, KernelException, KernelExceptionCause, KernelNativeTrapHandler, Timer,
+    WasmtimeTlsSlots,
 };
 use limine::BaseRevision;
 use limine::file::File;
@@ -1804,19 +1805,46 @@ fn active_debug_serial() -> DebugSerial {
     DebugSerial { base }
 }
 
+/// The console UART with the writer lock around it.
+///
+/// A PL011 takes one byte per register write, so two processors pushing
+/// bytes at the port interleave them inside a line; the lock is what
+/// makes one write indivisible. Reads are not serialised, because one
+/// task drains the port.
+#[derive(Clone, Copy)]
+struct LockedDebugSerial(DebugSerial);
+
+impl ByteSerial for LockedDebugSerial {
+    fn try_read_byte(&self) -> Option<u8> {
+        self.0.try_read_byte()
+    }
+
+    fn write_bytes(&self, bytes: &[u8]) {
+        while DEBUG_SERIAL_WRITER_HELD
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        self.0.write_bytes(bytes);
+        DEBUG_SERIAL_WRITER_HELD.store(false, Ordering::Release);
+    }
+}
+
+impl DebugSerialAccess for LockedDebugSerial {
+    type Port = Self;
+
+    fn port() -> Self {
+        Self(active_debug_serial())
+    }
+}
+
 fn read_debug_serial(buffer: &mut alloc::vec::Vec<u8>, max_bytes: u32) {
-    helios_kernel::try_read_serial(&active_debug_serial(), buffer, max_bytes);
+    helios_kernel::read_debug_serial::<LockedDebugSerial>(buffer, max_bytes);
 }
 
 fn write_debug_serial_bytes(bytes: &[u8]) {
-    while DEBUG_SERIAL_WRITER_HELD
-        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-        .is_err()
-    {
-        core::hint::spin_loop();
-    }
-    active_debug_serial().write_bytes(bytes);
-    DEBUG_SERIAL_WRITER_HELD.store(false, Ordering::Release);
+    helios_kernel::write_debug_serial_bytes::<LockedDebugSerial>(bytes);
 }
 
 fn try_write_panic_serial_bytes(bytes: &[u8]) {

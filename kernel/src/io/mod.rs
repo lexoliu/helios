@@ -7,6 +7,7 @@
 mod block;
 mod child;
 mod console;
+mod debug_serial;
 mod interrupts;
 mod iommu;
 mod poll_registry;
@@ -21,6 +22,7 @@ pub use child::{
     byte_channel,
 };
 pub use console::{RecordingConsole, emit_console_line};
+pub use debug_serial::{DebugSerialAccess, read_debug_serial, write_debug_serial_bytes};
 pub use interrupts::{
     ExternalInterruptHandler, ExternalInterruptRoutes, MAX_BLOCK_DEVICES, MAX_NETWORK_INTERRUPTS,
     wake_queue_owners,

@@ -32,6 +32,17 @@ fn init_serial() {
     let _ = SERIAL_OUTPUT.lock().unwrap().insert(std::io::stdout());
 }
 
+/// Hosted's debug transport is the process's own stdin, which is why it
+/// does not go through `helios_kernel::DebugSerialAccess` like the
+/// bare-metal backends.
+///
+/// That contract is built on `ByteSerial::try_read_byte`: a port that
+/// answers immediately, so the kernel takes what is there and yields.
+/// A host stream has no such answer — `read` either returns bytes or
+/// parks the thread until some arrive. Draining it a byte at a time
+/// through the shared path would block until `max_bytes` had arrived
+/// rather than until the debugger's next frame had, so the read stays
+/// here, one blocking call for whatever the stream hands over.
 fn read_debug_serial(buffer: &mut Vec<u8>, max_bytes: u32) {
     buffer.clear();
     let mut guard = SERIAL_INPUT.lock().unwrap();
