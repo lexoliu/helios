@@ -4114,13 +4114,15 @@ mod tests {
     use crate::test_support::TestCpu;
     use crate::{Executor, InstanceSpawner, TaskCapacityError, TaskFunding, Timer};
 
-    /// One block per 64-byte granule is the most blocks the 768 KiB
-    /// instance share of a processor's task arena can ever hold, so a
-    /// run this long outlives the share whatever size class the
-    /// heartbeat future lands in. Nothing in the loop tells a heartbeat
-    /// its phase is over; the only thing that ends one is its guard
-    /// going out of scope.
-    const PHASES_PAST_THE_SHARE: usize = 768 * 1024 / 64 + 1;
+    /// One block per 64-byte granule is the most blocks an instance
+    /// share can ever hold, so a run this long outlives the share
+    /// whatever size class the heartbeat future lands in. The share is
+    /// the arena's floor here — a host test installs no boot memory
+    /// plan, so every arena is `TASK_ARENA_MIN_BYTES`, of which the
+    /// share is all but the kernel reserve. Nothing in the loop tells a
+    /// heartbeat its phase is over; the only thing that ends one is its
+    /// guard going out of scope.
+    const PHASES_PAST_THE_SHARE: usize = crate::TASK_ARENA_MIN_BYTES / 64 + 1;
 
     /// The heartbeat only writes in debug builds, and where it writes is
     /// not what these tests are about, so the port it reaches drops

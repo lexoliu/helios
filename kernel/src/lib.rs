@@ -116,14 +116,15 @@ pub use memory::{
     NoEntropyDevice, ROOT_ENTROPY_MATERIAL_BYTES, RegionShares, ReleasedReservation,
     ReservationLookup, ReservationTracker, RootEntropy, RootEntropyHandle, SWAP_BATCH_BYTES,
     SWAP_TICK, SwapDisabled, SwapEntry, SwapFaultError, SwapHandle, SwapStats, SwapVmHooks,
-    USER_POOL_MIN_REGION_BYTES, UserHeapStats, UserMemoryOwnerScope, UserMemoryOwners,
-    UserMemoryPool, VaCursor, allocate_user_frame_uninit_on, allocate_user_frame_zeroed,
-    allocate_user_frame_zeroed_on, configure_user_memory_owner_processors,
-    current_user_memory_owner, deallocate_user_frame, deallocate_user_frame_on, disable_swap,
-    enter_user_memory_owner, install_entropy_device, install_memory_balloon, install_swap,
-    install_swap_hooks, installed_swap_handle, installed_swap_hooks, kernel_reserve_for,
-    largest_servable_user_bytes, seed_root_entropy, set_user_memory_owner, swapped_token,
-    user_heap_stats, user_mapping_kernel_heap_bytes, validate_range,
+    TASK_ARENA_FRACTION, TASK_ARENA_MIN_BYTES, USER_POOL_MIN_REGION_BYTES, UserHeapStats,
+    UserMemoryOwnerScope, UserMemoryOwners, UserMemoryPool, VaCursor,
+    allocate_user_frame_uninit_on, allocate_user_frame_zeroed, allocate_user_frame_zeroed_on,
+    configure_user_memory_owner_processors, current_user_memory_owner, deallocate_user_frame,
+    deallocate_user_frame_on, disable_swap, enter_user_memory_owner, install_entropy_device,
+    install_memory_balloon, install_swap, install_swap_hooks, installed_swap_handle,
+    installed_swap_hooks, kernel_reserve_for, largest_servable_user_bytes, seed_root_entropy,
+    set_user_memory_owner, swapped_token, task_arena_bytes_for, user_heap_stats,
+    user_mapping_kernel_heap_bytes, validate_range,
 };
 pub use network::{
     HTTP_FORBIDDEN_FIELD_NAMES, HTTP_MAX_FIELD_SECTION_BYTES, HTTP_MAX_FIELD_VALUE_BYTES, HttpBody,
@@ -1084,11 +1085,12 @@ fn finish_bootstrap<Console, CpuImpl>(
     // when it needs more. `memory::policy` states why.
     tracing::info!(
         "Memory policy usable_bytes={} kernel_heap_bytes={} kernel_reserve_bytes={} \
-         kernel_growth_chunk_bytes={}",
+         kernel_growth_chunk_bytes={} task_arena_bytes={}",
         machine.usable_bytes,
         heap_stats().total_bytes,
         kernel_heap_reserve_bytes(),
-        memory::KERNEL_HEAP_GROWTH_CHUNK_BYTES
+        memory::KERNEL_HEAP_GROWTH_CHUNK_BYTES,
+        exec::task_arena_bytes(machine.usable_bytes)
     );
     tracing::info!(
         "Platform dma_model={dma_model:?} debug_serial={} network={} block_devices={} \
@@ -1181,10 +1183,20 @@ pub struct MachineMemory {
     pub free_bytes: usize,
 }
 
+/// Every usable byte the boot memory map described, as the installed
+/// [`BootMemoryPlan`] recorded it.
+///
+/// The kernel sizes what has to move with the machine against this: the
+/// user pool, the kernel heap's reserve, and every processor's executor
+/// task arena.
+pub(crate) fn machine_usable_bytes() -> usize {
+    ALLOCATOR.machine_bytes()
+}
+
 pub fn machine_memory() -> MachineMemory {
     let heap = heap_stats();
     MachineMemory {
-        usable_bytes: ALLOCATOR.machine_bytes(),
+        usable_bytes: machine_usable_bytes(),
         free_bytes: heap
             .available_bytes()
             .saturating_add(memory::user_pool_available_bytes()),

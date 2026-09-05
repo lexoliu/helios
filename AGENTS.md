@@ -198,6 +198,16 @@ property of every kernel and `hal/` subsystem, never a follow-up.
   shootdown to every other processor that has run in that space.
 - Hot paths use per-CPU storage indexed by `Cpu::current_processor()`;
   cross-processor queues prefer atomics and lock-free channels to a mutex.
+  The processor index is only reachable where a `Cpu` is held: an executor,
+  a scheduler, a service that was constructed with one. A task future, a
+  drop path, or a global allocator holds none and never carries one (on
+  every backend a `Cpu` is a refcounted handle, and cloning it per task is
+  a cost on the spawn path), so a per-processor structure states which of
+  its operations run on the owner and which arrive from any processor, and
+  gives the latter a lock-free path that needs no processor index.
+- Words written by different processors live on different cache lines
+  (`crossbeam_utils::CachePadded`, sized per target), and a structure's
+  docs say which processor writes each padded block.
 - Hardware the target already has (XSAVE and AVX, MWAIT, cache-coherent I/O,
   GICv3) is brought up properly rather than avoided because its setup is
   SMP-aware.
@@ -439,3 +449,7 @@ them from colliding:
 - Every ordinary PR is one issue, one branch, one delivery. An agent that
   finds a second problem while fixing the first files a new issue and cites
   it, rather than widening the PR.
+- Scratch files are shared between the agents of one session. A file an
+  agent writes outside its worktree carries its branch or PR number in its
+  name, and a PR body or issue body is written from a file named that way,
+  never from a generic `pr.md`.

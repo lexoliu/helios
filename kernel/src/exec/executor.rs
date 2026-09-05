@@ -2,35 +2,42 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
+use core::alloc::Layout;
 use core::cell::UnsafeCell;
 use core::future::Future;
 use core::marker::PhantomData;
-use core::mem::{MaybeUninit, align_of, size_of};
+use core::mem::{align_of, size_of};
 use core::pin::Pin;
 use core::ptr::{self, NonNull};
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicUsize, Ordering};
 use core::task::{Context, Poll};
 
 use async_task::{Builder, Runnable, Task};
 use concurrent_queue::{ConcurrentQueue, PopError, PushError};
+use crossbeam_utils::CachePadded;
 use helios_hal::cpu::{Cpu, ProcessorId};
 use helios_hal::watchdog::ProgressCounter;
 use spin::Once;
-use triomphe::{Arc as NoWeakArc, UniqueArc};
+use triomphe::Arc as NoWeakArc;
 
 use crate::exec::sync::Notify;
+use crate::memory::task_arena_bytes_for;
 
 type ReadyQueue = ConcurrentQueue<Runnable>;
 pub type JoinHandle<T> = Task<T>;
 pub const READY_BATCH_TASKS: usize = 1024;
 const READY_QUEUE_CAPACITY: usize = READY_BATCH_TASKS * 4;
-const TASK_ARENA_BYTES: usize = 1024 * 1024;
 const TASK_ARENA_ALIGN: usize = 64;
 /// Power-of-two block classes from the alignment granule (64 B) up to
 /// the largest future the arena places (256 KiB).
 const TASK_ARENA_CLASS_COUNT: usize = 13;
-/// Empty-list sentinel for the per-class free heads.
-const TASK_ARENA_FREE_NULL: u32 = u32::MAX;
+/// The largest block the arena serves, and the unit its two sub-arenas
+/// are measured in.
+///
+/// Buddy merging never leaves the top block a piece was split out of,
+/// so a sub-arena that is a whole number of top blocks is a boundary no
+/// block can straddle and no merge can cross.
+const TASK_ARENA_TOP_BYTES: usize = TASK_ARENA_ALIGN << (TASK_ARENA_CLASS_COUNT - 1);
 /// Arena bytes only kernel-funded tasks may occupy.
 ///
 /// Sized as one block of the largest class the arena serves, so the
@@ -38,9 +45,9 @@ const TASK_ARENA_FREE_NULL: u32 = u32::MAX;
 /// instance-funded work has taken every byte it is allowed to take.
 /// Without a reserve, user-mode load decides whether the kernel can
 /// spawn, which is what made a spawn storm fatal.
-const TASK_ARENA_KERNEL_RESERVE_BYTES: usize = TaskArena::class_bytes(TASK_ARENA_CLASS_COUNT - 1);
-/// Arena bytes instance-funded tasks may occupy.
-const TASK_ARENA_INSTANCE_BYTES: usize = TASK_ARENA_BYTES - TASK_ARENA_KERNEL_RESERVE_BYTES;
+const TASK_ARENA_KERNEL_RESERVE_BYTES: usize = TASK_ARENA_TOP_BYTES;
+/// Empty-list and end-of-chain sentinel for block offsets.
+const TASK_ARENA_BLOCK_NULL: usize = usize::MAX;
 static EXECUTOR_GROUP: Once<NoWeakArc<ExecutorGroup>> = Once::new();
 
 /// Which share of a processor's task arena a spawn draws from.
@@ -83,46 +90,150 @@ struct ExecutorGroup {
     global_wake_cursor: AtomicUsize,
 }
 
-/// Per-processor bump arena with per-class block reuse.
+/// Per-processor buddy arena for task futures.
 ///
-/// Long-lived tasks (network pump, transport runners) pin allocations
-/// for the kernel's whole lifetime, so a reset-when-empty bump pointer
-/// would leak every completed task's bytes forever and exhaust under
-/// spawn churn. Freed blocks instead return to an ABA-tagged Treiber
-/// stack per power-of-two class and are reused before the bump pointer
-/// grows; steady-state usage is bounded by the peak number of live
-/// tasks per class, not by cumulative spawns.
+/// # Concurrency contract
+///
+/// The arena belongs to one processor. A spawn is served by the arena
+/// of the processor it is running on — [`Cpu::current_processor`] picks
+/// it, because a [`Spawner`] travels with the task that holds it — so
+/// every allocation, split, merge and free-list mutation happens on the
+/// owning processor. The metadata is single-owner and plain: no lock,
+/// no atomic and no critical section stands on the spawn path. Nothing
+/// re-enters an allocation from underneath one, either: an interrupt
+/// handler notifies and queues, and a device handler holds no spawner.
+///
+/// A task does not end where it started. A global task spawned on one
+/// processor is finished and dropped on whichever processor ran it
+/// last, so a free cannot touch the metadata; it publishes the block on
+/// a lock-free MPSC stack instead, and the owner drains that stack and
+/// merges everything on it at the start of its next allocation. Local
+/// and remote frees take the same path because the drop site cannot
+/// name the processor it runs on — a future would have to carry a
+/// `Cpu`, which is a clone and a drop of a refcounted backend handle on
+/// every spawn — so "local" here means only that the push happened to
+/// be uncontended.
+///
+/// The push is a CAS on the head with the link written into the freed
+/// block itself; the drain is one swap of the whole chain. Neither
+/// needs an ABA tag: a stack whose consumer never pops a single node
+/// has no pop for ABA to race with.
+///
+/// The two halves sit on different cache lines, because different
+/// processors write them: the buddy trees are the owner's, and the free
+/// stack and the live counts belong to whichever processor a task ends
+/// on. Without that padding every task ending anywhere in the machine
+/// would invalidate the line its owner allocates out of, which is the
+/// whole spawn hot path.
+///
+/// # Fungible bytes
+///
+/// Blocks are buddy-split and buddy-merged over the arena's 64-byte
+/// granules, so freed bytes are fungible across size classes: a
+/// returned 8 KiB block serves thirty-two 256-byte spawns, and two free
+/// buddies merge back into the block they came from. That is #142.
+/// Before it, each power-of-two class had its own free list and a bump
+/// pointer that never rewound, so a class whose list was empty could
+/// not be served while the rest of the arena sat free.
+///
+/// # The two sub-arenas
+///
+/// The kernel reserve is a sub-arena with its own buddy tree, so a
+/// block that came from the reserve — and every piece it is split into
+/// — stays a reserve block for the life of the kernel, and an instance
+/// share that is full can never take from it. Instance-funded spawns
+/// are served from the share and refused with a
+/// [`TaskCapacityError`] when it is full. Kernel-funded spawns take the
+/// share first and fall back to the reserve, so kernel work does not
+/// pin reserve bytes while the share can serve it.
 struct TaskArena {
-    bytes: TaskArenaBytes,
-    offset: AtomicUsize,
+    /// Fixed when the arena is built and never written again.
+    bytes: ArenaBytes,
+    /// Where the kernel reserve starts, which is also how many bytes
+    /// instance-funded tasks may hold. Fixed at construction.
+    share_bytes: usize,
+    /// Written by the owning processor and by nothing else: the buddy
+    /// trees and their free lists. On a cache line of its own, so a
+    /// task ending on another processor cannot invalidate the line the
+    /// owner allocates out of.
+    regions: CachePadded<UnsafeCell<[BuddyRegion; BLOCK_REGION_COUNT]>>,
+    /// Written by whichever processor a task placed here ends on, which
+    /// is any of them. On a cache line of its own for the same reason,
+    /// and its three cells share that line because a release writes all
+    /// three and so does an allocation.
+    shared: CachePadded<SharedCells>,
+}
+
+/// The arena cells any processor writes.
+struct SharedCells {
+    /// Head of the MPSC stack of freed blocks the owner has not merged
+    /// yet, or [`TASK_ARENA_BLOCK_NULL`]. Pushed by the processor the
+    /// task ended on, drained by the owner.
+    remote_free: AtomicUsize,
     active: AtomicUsize,
     instance_active: AtomicUsize,
-    /// One Treiber-stack head per block class: low 32 bits the block
-    /// offset (`TASK_ARENA_FREE_NULL` = empty), high 32 bits a CAS tag
-    /// bumped on every successful push/pop to defeat ABA.
-    ///
-    /// Blocks are kept on the list of the region they came from, so a
-    /// block the kernel took out of its reserve and freed again cannot
-    /// be handed to an instance-funded task: the reserve stays a
-    /// reserve across task churn, not just until the first kernel task
-    /// exits.
-    free_heads: [[AtomicU64; TASK_ARENA_CLASS_COUNT]; BLOCK_REGION_COUNT],
 }
 
 /// Which side of the instance/kernel split a block sits on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BlockRegion {
-    /// Below the instance ceiling: either funding may hold it.
+    /// Below the kernel reserve: either funding may hold it.
     Instance = 0,
-    /// Reaches into the kernel reserve: kernel-funded tasks only.
+    /// The kernel reserve: kernel-funded tasks only.
     KernelReserve = 1,
 }
 
 const BLOCK_REGION_COUNT: usize = 2;
 
-#[repr(align(64))]
-struct TaskArenaBytes {
-    bytes: UnsafeCell<[MaybeUninit<u8>; TASK_ARENA_BYTES]>,
+/// The arena's backing bytes, carved from the kernel heap at boot.
+///
+/// There is no compile-time array behind an arena any more: how many
+/// tasks a processor can hold is a property of the machine's memory,
+/// and [`helios_kernel::task_arena_bytes_for`](crate::task_arena_bytes_for)
+/// states it.
+struct ArenaBytes {
+    ptr: NonNull<u8>,
+    len: usize,
+}
+
+/// The header a block carries while it sits on one of its region's free
+/// lists, written into the block's own bytes.
+///
+/// The lists are doubly linked because a merge removes a buddy from the
+/// middle of one.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct FreeNode {
+    next: usize,
+    prev: usize,
+}
+
+/// The header a freed block carries while it waits on the arena's MPSC
+/// stack for the owner to drain it.
+///
+/// The class travels with the block because the owner has no other
+/// record of how big it was; the arena keeps no side table of live
+/// blocks.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct RemoteFreeNode {
+    next: usize,
+    class: usize,
+}
+
+/// One buddy tree over a contiguous, top-block-aligned span of the
+/// arena.
+struct BuddyRegion {
+    base: NonNull<u8>,
+    start: usize,
+    len: usize,
+    /// Head of each class's free list, or [`TASK_ARENA_BLOCK_NULL`].
+    free_heads: [usize; TASK_ARENA_CLASS_COUNT],
+    /// One bit per block per class, set while that block is free and on
+    /// its class's list. Whether a buddy is free is the one question a
+    /// merge asks that the lists cannot answer in constant time.
+    free_bits: Box<[u64]>,
+    class_bit_base: [usize; TASK_ARENA_CLASS_COUNT],
 }
 
 struct ArenaFuture<Fut> {
@@ -132,30 +243,234 @@ struct ArenaFuture<Fut> {
     arena: NoWeakArc<TaskArena>,
 }
 
-unsafe impl Sync for TaskArenaBytes {}
+// SAFETY: every mutation of the owner-only metadata happens on the
+// owning processor, and everything reachable from another processor —
+// the remote-free stack and the two counters — is atomic.
 unsafe impl Sync for TaskArena {}
+unsafe impl Send for TaskArena {}
 unsafe impl<Fut: Send> Send for ArenaFuture<Fut> {}
 
-impl TaskArena {
-    /// Constructs the arena directly inside its shared allocation. The
-    /// megabyte-sized `bytes` store is `MaybeUninit` and must never be
-    /// materialized on the stack; only the atomics need initialization.
-    fn new_shared() -> NoWeakArc<Self> {
-        let mut arena = UniqueArc::<Self>::new_uninit();
-        let ptr = arena.as_mut_ptr().cast::<Self>();
+impl ArenaBytes {
+    fn new(len: usize) -> Self {
+        let layout = Self::layout(len);
+        // SAFETY: `layout` has a non-zero size: the caller has already
+        // asserted the arena spans at least two top blocks.
+        let ptr = unsafe { alloc::alloc::alloc(layout) };
+        let ptr = NonNull::new(ptr).unwrap_or_else(|| alloc::alloc::handle_alloc_error(layout));
+        Self { ptr, len }
+    }
+
+    fn layout(len: usize) -> Layout {
+        Layout::from_size_align(len, TASK_ARENA_ALIGN)
+            .unwrap_or_else(|error| panic!("a task arena of {len} bytes has no layout: {error}"))
+    }
+
+    fn ptr(&self) -> *mut u8 {
+        self.ptr.as_ptr()
+    }
+}
+
+impl Drop for ArenaBytes {
+    fn drop(&mut self) {
+        // SAFETY: the pointer came from `alloc` under the same layout,
+        // and every task that held a block is gone: the arena is only
+        // dropped when the last `ArenaFuture` referencing it has been.
         unsafe {
-            (&raw mut (*ptr).offset).write(AtomicUsize::new(0));
-            (&raw mut (*ptr).active).write(AtomicUsize::new(0));
-            (&raw mut (*ptr).instance_active).write(AtomicUsize::new(0));
-            let heads = &raw mut (*ptr).free_heads;
-            for region in 0..BLOCK_REGION_COUNT {
-                for class in 0..TASK_ARENA_CLASS_COUNT {
-                    (&raw mut (*heads)[region][class])
-                        .write(AtomicU64::new(u64::from(TASK_ARENA_FREE_NULL)));
-                }
-            }
-            UniqueArc::assume_init(arena).shareable()
+            alloc::alloc::dealloc(self.ptr.as_ptr(), Self::layout(self.len));
         }
+    }
+}
+
+impl BuddyRegion {
+    /// A tree over `start..start + len`, every top block of it free.
+    fn new(base: NonNull<u8>, start: usize, len: usize) -> Self {
+        assert!(
+            len != 0 && len.is_multiple_of(TASK_ARENA_TOP_BYTES),
+            "a task arena region of {len} bytes is not a whole number of {TASK_ARENA_TOP_BYTES}-byte top blocks"
+        );
+        let mut class_bit_base = [0; TASK_ARENA_CLASS_COUNT];
+        let mut bits = 0;
+        for (class, base_bit) in class_bit_base.iter_mut().enumerate() {
+            *base_bit = bits;
+            bits += len / TaskArena::class_bytes(class);
+        }
+        let free_bits = alloc::vec![0_u64; bits.div_ceil(u64::BITS as usize)];
+        let mut region = Self {
+            base,
+            start,
+            len,
+            free_heads: [TASK_ARENA_BLOCK_NULL; TASK_ARENA_CLASS_COUNT],
+            free_bits: free_bits.into_boxed_slice(),
+            class_bit_base,
+        };
+        for offset in (start..start + len).step_by(TASK_ARENA_TOP_BYTES) {
+            region.push_free(offset, TASK_ARENA_CLASS_COUNT - 1);
+        }
+        region
+    }
+
+    /// A block of `class`, split out of the smallest free block that
+    /// can hold one, or `None` when this region has none.
+    fn allocate(&mut self, class: usize) -> Option<usize> {
+        let source = (class..TASK_ARENA_CLASS_COUNT)
+            .find(|candidate| self.free_heads[*candidate] != TASK_ARENA_BLOCK_NULL)?;
+        let offset = self.pop_free(source);
+        for split in (class..source).rev() {
+            self.push_free(offset + TaskArena::class_bytes(split), split);
+        }
+        Some(offset)
+    }
+
+    /// Returns a block, merging it with its buddy for as long as the
+    /// buddy is free. Merging stops at the top class, so a merged block
+    /// never leaves the top block it was split out of.
+    fn free(&mut self, offset: usize, class: usize) {
+        assert!(
+            class < TASK_ARENA_CLASS_COUNT,
+            "task arena block class {class} does not exist"
+        );
+        assert!(
+            offset >= self.start
+                && offset + TaskArena::class_bytes(class) <= self.start + self.len
+                && (offset - self.start).is_multiple_of(TaskArena::class_bytes(class)),
+            "task arena block at {offset} is not a class-{class} block of this region"
+        );
+        let mut offset = offset;
+        let mut class = class;
+        while class + 1 < TASK_ARENA_CLASS_COUNT {
+            let buddy = self.buddy_of(offset, class);
+            if !self.is_free(buddy, class) {
+                break;
+            }
+            self.remove_free(buddy, class);
+            offset = offset.min(buddy);
+            class += 1;
+        }
+        self.push_free(offset, class);
+    }
+
+    /// The block `offset` merges with at `class`: its sibling under the
+    /// same parent, which is always inside the same top block.
+    const fn buddy_of(&self, offset: usize, class: usize) -> usize {
+        let size = TaskArena::class_bytes(class);
+        self.start + (((offset - self.start) / size) ^ 1) * size
+    }
+
+    fn bit_index(&self, offset: usize, class: usize) -> usize {
+        self.class_bit_base[class] + (offset - self.start) / TaskArena::class_bytes(class)
+    }
+
+    fn is_free(&self, offset: usize, class: usize) -> bool {
+        let bit = self.bit_index(offset, class);
+        self.free_bits[bit / u64::BITS as usize] & (1 << (bit % u64::BITS as usize)) != 0
+    }
+
+    fn set_free(&mut self, offset: usize, class: usize, free: bool) {
+        let bit = self.bit_index(offset, class);
+        let mask = 1 << (bit % u64::BITS as usize);
+        let word = &mut self.free_bits[bit / u64::BITS as usize];
+        if free {
+            *word |= mask;
+        } else {
+            *word &= !mask;
+        }
+    }
+
+    /// The list header inside a free block. Every class is at least one
+    /// 64-byte granule, so the header always fits, and every block is
+    /// granule-aligned, so it is aligned.
+    fn node(&self, offset: usize) -> *mut FreeNode {
+        // SAFETY: `offset` is inside the arena, which is one allocation.
+        unsafe { self.base.as_ptr().add(offset).cast::<FreeNode>() }
+    }
+
+    fn push_free(&mut self, offset: usize, class: usize) {
+        let head = self.free_heads[class];
+        // SAFETY: the block is free, so its bytes are the region's to
+        // write, and the owner is the only writer.
+        unsafe {
+            self.node(offset).write(FreeNode {
+                next: head,
+                prev: TASK_ARENA_BLOCK_NULL,
+            });
+            if head != TASK_ARENA_BLOCK_NULL {
+                (*self.node(head)).prev = offset;
+            }
+        }
+        self.free_heads[class] = offset;
+        self.set_free(offset, class, true);
+    }
+
+    fn pop_free(&mut self, class: usize) -> usize {
+        let offset = self.free_heads[class];
+        assert!(
+            offset != TASK_ARENA_BLOCK_NULL,
+            "task arena class {class} was popped while empty"
+        );
+        self.remove_free(offset, class);
+        offset
+    }
+
+    fn remove_free(&mut self, offset: usize, class: usize) {
+        // SAFETY: the block is on this class's list, so its header is
+        // the one this region wrote.
+        let node = unsafe { self.node(offset).read() };
+        if node.prev == TASK_ARENA_BLOCK_NULL {
+            self.free_heads[class] = node.next;
+        } else {
+            // SAFETY: as above, for the block before this one.
+            unsafe {
+                (*self.node(node.prev)).next = node.next;
+            }
+        }
+        if node.next != TASK_ARENA_BLOCK_NULL {
+            // SAFETY: as above, for the block after this one.
+            unsafe {
+                (*self.node(node.next)).prev = node.prev;
+            }
+        }
+        self.set_free(offset, class, false);
+    }
+}
+
+/// One processor's task arena on a machine of `usable_bytes`.
+///
+/// The boot memory plan states the share
+/// ([`task_arena_bytes_for`](crate::memory::task_arena_bytes_for)); the
+/// executor rounds it down to whole top blocks, because a sub-arena
+/// boundary has to be one no block can straddle.
+pub(crate) fn task_arena_bytes(usable_bytes: usize) -> usize {
+    task_arena_bytes_for(usable_bytes) / TASK_ARENA_TOP_BYTES * TASK_ARENA_TOP_BYTES
+}
+
+impl TaskArena {
+    /// An arena of `arena_bytes`, rounded down to whole top blocks, in
+    /// its shared allocation.
+    ///
+    /// The size comes from the boot memory plan, so a processor's task
+    /// capacity moves with the machine's memory (#159).
+    fn new_shared(arena_bytes: usize) -> NoWeakArc<Self> {
+        let total_bytes = arena_bytes / TASK_ARENA_TOP_BYTES * TASK_ARENA_TOP_BYTES;
+        assert!(
+            total_bytes >= TASK_ARENA_KERNEL_RESERVE_BYTES + TASK_ARENA_TOP_BYTES,
+            "a task arena of {arena_bytes} bytes cannot hold the kernel reserve and a share"
+        );
+        let share_bytes = total_bytes - TASK_ARENA_KERNEL_RESERVE_BYTES;
+        let bytes = ArenaBytes::new(total_bytes);
+        let base = bytes.ptr;
+        NoWeakArc::new(Self {
+            regions: CachePadded::new(UnsafeCell::new([
+                BuddyRegion::new(base, 0, share_bytes),
+                BuddyRegion::new(base, share_bytes, TASK_ARENA_KERNEL_RESERVE_BYTES),
+            ])),
+            bytes,
+            share_bytes,
+            shared: CachePadded::new(SharedCells {
+                remote_free: AtomicUsize::new(TASK_ARENA_BLOCK_NULL),
+                active: AtomicUsize::new(0),
+                instance_active: AtomicUsize::new(0),
+            }),
+        })
     }
 
     /// Bytes a block of `class` occupies: `64 << class`.
@@ -181,7 +496,7 @@ impl TaskArena {
         Self::allocate(arena, future, TaskFunding::Kernel).unwrap_or_else(|_| {
             panic!(
                 "executor task arena exhausted: {} live tasks",
-                arena.active.load(Ordering::Acquire)
+                arena.shared.active.load(Ordering::Acquire)
             )
         })
     }
@@ -212,14 +527,17 @@ impl TaskArena {
         let Some(start) = arena.take_block(class, funding) else {
             return Err(TaskCapacityError {
                 requested_bytes: Self::class_bytes(class),
-                live_instance_tasks: arena.instance_active.load(Ordering::Acquire),
-                share_bytes: TASK_ARENA_INSTANCE_BYTES,
+                live_instance_tasks: arena.shared.instance_active.load(Ordering::Acquire),
+                share_bytes: arena.share_bytes,
             });
         };
-        arena.active.fetch_add(1, Ordering::AcqRel);
+        arena.shared.active.fetch_add(1, Ordering::AcqRel);
         if funding == TaskFunding::Instance {
-            arena.instance_active.fetch_add(1, Ordering::AcqRel);
+            arena.shared.instance_active.fetch_add(1, Ordering::AcqRel);
         }
+        // SAFETY: the block is this task's until it is released, and it
+        // is `class_bytes(class)` bytes of granule-aligned storage,
+        // which fits `Fut` by construction.
         let ptr = unsafe { arena.bytes.ptr().add(start).cast::<Fut>() };
         unsafe {
             ptr.write(future);
@@ -232,113 +550,82 @@ impl TaskArena {
         })
     }
 
-    /// Finds a block of `class` this funding may hold: a freed block
-    /// first, then fresh bytes from the bump pointer up to the ceiling
-    /// the funding is allowed to reach.
+    /// Finds a block of `class` this funding may hold, after merging
+    /// back everything freed since the last allocation.
+    ///
+    /// Kernel-funded work takes the share first and the reserve only
+    /// when the share cannot serve it, so the reserve stays whole for
+    /// the spawn that has nowhere else to go.
     fn take_block(&self, class: usize, funding: TaskFunding) -> Option<usize> {
-        let reused = match funding {
-            // Reserve blocks first, so a kernel task that can be served
-            // out of the reserve leaves the instance share alone.
-            TaskFunding::Kernel => self
-                .pop_free(BlockRegion::KernelReserve, class)
-                .or_else(|| self.pop_free(BlockRegion::Instance, class)),
-            TaskFunding::Instance => self.pop_free(BlockRegion::Instance, class),
-        };
-        if let Some(start) = reused {
-            return Some(start);
+        // SAFETY: allocation runs on the processor this arena belongs
+        // to, and that processor is the only writer of the metadata.
+        let regions = unsafe { &mut *self.regions.get() };
+        self.drain_remote_frees(regions);
+        let share = &mut regions[BlockRegion::Instance as usize];
+        match funding {
+            TaskFunding::Instance => share.allocate(class),
+            TaskFunding::Kernel => share
+                .allocate(class)
+                .or_else(|| regions[BlockRegion::KernelReserve as usize].allocate(class)),
         }
-        let ceiling = match funding {
-            TaskFunding::Kernel => TASK_ARENA_BYTES,
-            TaskFunding::Instance => TASK_ARENA_INSTANCE_BYTES,
-        };
-        self.offset
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |offset| {
-                offset
-                    .checked_add(Self::class_bytes(class))
-                    .filter(|end| *end <= ceiling)
-            })
-            .ok()
     }
 
-    /// The region a block belongs to for the rest of its life. A block
-    /// that reaches into the reserve is a reserve block even when it
-    /// starts below the ceiling, so instance-funded tasks can never
-    /// reuse arena bytes the kernel reserved for itself.
-    const fn region_of(start: usize, class: usize) -> BlockRegion {
-        if start + Self::class_bytes(class) > TASK_ARENA_INSTANCE_BYTES {
-            BlockRegion::KernelReserve
-        } else {
+    /// Merges every block freed since the last allocation back into the
+    /// region it came from.
+    fn drain_remote_frees(&self, regions: &mut [BuddyRegion; BLOCK_REGION_COUNT]) {
+        let mut cursor = self
+            .shared
+            .remote_free
+            .swap(TASK_ARENA_BLOCK_NULL, Ordering::Acquire);
+        while cursor != TASK_ARENA_BLOCK_NULL {
+            // SAFETY: the block is free and carries the header its
+            // release wrote; the `Acquire` swap published those writes.
+            let node = unsafe { self.bytes.ptr().add(cursor).cast::<RemoteFreeNode>().read() };
+            regions[self.region_of(cursor) as usize].free(cursor, node.class);
+            cursor = node.next;
+        }
+    }
+
+    /// The region a block belongs to, which its address decides. The
+    /// two regions are whole numbers of top blocks and merging never
+    /// crosses a top block, so no block ever straddles the boundary.
+    const fn region_of(&self, offset: usize) -> BlockRegion {
+        if offset < self.share_bytes {
             BlockRegion::Instance
+        } else {
+            BlockRegion::KernelReserve
         }
     }
 
-    /// Pops a reusable block offset for `class`, or `None` when the
-    /// class free list is empty.
-    fn pop_free(&self, region: BlockRegion, class: usize) -> Option<usize> {
-        let head = &self.free_heads[region as usize][class];
-        loop {
-            let current = head.load(Ordering::Acquire);
-            let offset = (current & u64::from(u32::MAX)) as u32;
-            if offset == TASK_ARENA_FREE_NULL {
-                return None;
-            }
-            let next = unsafe {
-                self.bytes
-                    .ptr()
-                    .add(offset as usize)
-                    .cast::<u32>()
-                    .read_volatile()
-            };
-            let tag = (current >> 32).wrapping_add(1);
-            let replacement = (tag << 32) | u64::from(next);
-            if head
-                .compare_exchange(current, replacement, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                return Some(offset as usize);
-            }
-        }
-    }
-
-    /// Returns a dropped block to the free list of its region and class.
-    fn push_free(&self, offset: usize, class: usize) {
-        let head = &self.free_heads[Self::region_of(offset, class) as usize][class];
-        let offset = u32::try_from(offset).expect("task arena offsets fit in 32 bits");
-        loop {
-            let current = head.load(Ordering::Acquire);
-            let next = (current & u64::from(u32::MAX)) as u32;
-            unsafe {
-                self.bytes
-                    .ptr()
-                    .add(offset as usize)
-                    .cast::<u32>()
-                    .write_volatile(next);
-            }
-            let tag = (current >> 32).wrapping_add(1);
-            let replacement = (tag << 32) | u64::from(offset);
-            if head
-                .compare_exchange(current, replacement, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                return;
-            }
-        }
-    }
-
+    /// Publishes a dropped block on the arena's free stack, from
+    /// whichever processor the task ended on.
     fn release(&self, block_offset: usize, class: usize, funding: TaskFunding) {
-        self.push_free(block_offset, class);
+        // SAFETY: the future has been dropped, so the block's bytes are
+        // the arena's again and this is their only writer until the CAS
+        // below publishes them.
+        let node = unsafe { self.bytes.ptr().add(block_offset).cast::<RemoteFreeNode>() };
+        let mut head = self.shared.remote_free.load(Ordering::Relaxed);
+        loop {
+            // SAFETY: as above.
+            unsafe {
+                node.write(RemoteFreeNode { next: head, class });
+            }
+            match self.shared.remote_free.compare_exchange_weak(
+                head,
+                block_offset,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(current) => head = current,
+            }
+        }
         if funding == TaskFunding::Instance {
-            let previous = self.instance_active.fetch_sub(1, Ordering::AcqRel);
+            let previous = self.shared.instance_active.fetch_sub(1, Ordering::AcqRel);
             assert!(previous != 0, "task arena instance task count underflowed");
         }
-        let previous = self.active.fetch_sub(1, Ordering::AcqRel);
+        let previous = self.shared.active.fetch_sub(1, Ordering::AcqRel);
         assert!(previous != 0, "task arena active count underflowed");
-    }
-}
-
-impl TaskArenaBytes {
-    fn ptr(&self) -> *mut u8 {
-        self.bytes.get().cast::<u8>()
     }
 }
 
@@ -386,7 +673,6 @@ pub struct Spawner<CpuImpl: Cpu + Clone> {
     owner_processor: ProcessorId,
     local_queue_index: usize,
     processor_count: usize,
-    task_arena: NoWeakArc<TaskArena>,
     progress: ProgressCounter,
     progress_notify: NoWeakArc<Notify>,
 }
@@ -396,7 +682,6 @@ pub struct Executor {
     owner_processor: ProcessorId,
     local_queue_index: usize,
     processor_count: usize,
-    task_arena: NoWeakArc<TaskArena>,
     progress: ProgressCounter,
     progress_notify: NoWeakArc<Notify>,
 }
@@ -480,13 +765,11 @@ impl Executor {
                 )
             });
         let processor_count = group.local_queues.len();
-        let task_arena = group.task_arenas[local_queue_index].clone();
         Self {
             group,
             owner_processor,
             local_queue_index,
             processor_count,
-            task_arena,
             progress,
             progress_notify: NoWeakArc::new(Notify::new()),
         }
@@ -499,7 +782,6 @@ impl Executor {
             owner_processor: self.owner_processor,
             local_queue_index: self.local_queue_index,
             processor_count: self.processor_count,
-            task_arena: self.task_arena.clone(),
             progress: self.progress.clone(),
             progress_notify: self.progress_notify.clone(),
         }
@@ -563,15 +845,36 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
         self.progress_notify.clone()
     }
 
+    /// The task arena of the processor this spawn is running on.
+    ///
+    /// A `Spawner` travels with the task that holds it, so the arena a
+    /// spawn draws on is chosen here rather than bound when the spawner
+    /// was made: the arena's metadata is owner-only, and the owner is
+    /// the processor doing the allocating.
+    fn task_arena(&self) -> &NoWeakArc<TaskArena> {
+        let processor = self.cpu.current_processor();
+        self.group
+            .task_arenas
+            .get(processor.id() as usize)
+            .unwrap_or_else(|| {
+                panic!(
+                    "processor {} has no task arena among the {} the executor configured",
+                    processor.id(),
+                    self.group.task_arenas.len()
+                )
+            })
+    }
+
     /// Places `future` in this processor's task arena under `funding`.
     fn allocate<Fut>(
         &self,
         future: Fut,
         funding: TaskFunding,
     ) -> Result<ArenaFuture<Fut>, TaskCapacityError> {
+        let arena = self.task_arena();
         match funding {
-            TaskFunding::Kernel => Ok(TaskArena::allocate_kernel(&self.task_arena, future)),
-            TaskFunding::Instance => TaskArena::allocate_instance(&self.task_arena, future),
+            TaskFunding::Kernel => Ok(TaskArena::allocate_kernel(arena, future)),
+            TaskFunding::Instance => TaskArena::allocate_instance(arena, future),
         }
     }
 
@@ -676,7 +979,7 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
         Fut: Future + Send + 'static,
         Fut::Output: Send + 'static,
     {
-        let future = TaskArena::allocate_kernel(&self.task_arena, future);
+        let future = TaskArena::allocate_kernel(self.task_arena(), future);
         self.spawn_with_progress(future)
     }
 
@@ -693,7 +996,7 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
         Fut: Future + 'static,
         Fut::Output: 'static,
     {
-        let future = TaskArena::allocate_kernel(&self.task_arena, future);
+        let future = TaskArena::allocate_kernel(self.task_arena(), future);
         self.spawn_local_with_progress(future, ProgressMode::Counted)
     }
 
@@ -710,7 +1013,7 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
         Fut: Future + 'static,
         Fut::Output: 'static,
     {
-        let future = TaskArena::allocate_kernel(&self.task_arena, future);
+        let future = TaskArena::allocate_kernel(self.task_arena(), future);
         self.spawn_local_with_progress(future, ProgressMode::Silent)
             .detach();
     }
@@ -886,13 +1189,17 @@ fn executor_group(configured_processors: usize) -> NoWeakArc<ExecutorGroup> {
                 configured_processors != 0,
                 "executor processor count must be non-zero"
             );
+            // Every processor's arena is the same share of the same
+            // machine; what it holds is the machine's memory divided by
+            // what a live instance costs an arena, not a constant.
+            let arena_bytes = task_arena_bytes(crate::machine_usable_bytes());
             let mut local_queues = Vec::with_capacity(configured_processors);
             let mut local_ready_counts = Vec::with_capacity(configured_processors);
             let mut task_arenas = Vec::with_capacity(configured_processors);
             for _ in 0..configured_processors {
                 local_queues.push(ready_queue());
                 local_ready_counts.push(AtomicUsize::new(0));
-                task_arenas.push(TaskArena::new_shared());
+                task_arenas.push(TaskArena::new_shared(arena_bytes));
             }
             NoWeakArc::new(ExecutorGroup {
                 local_queues: local_queues.into_boxed_slice(),
@@ -1002,9 +1309,9 @@ mod tests {
 
     use super::{
         Executor, GlobalScheduler, LocalScheduler, LocalSilentScheduler, READY_QUEUE_CAPACITY,
-        Spawner, TASK_ARENA_CLASS_COUNT, TASK_ARENA_INSTANCE_BYTES,
-        TASK_ARENA_KERNEL_RESERVE_BYTES, TaskArena, ready_queue, should_wake_global_processor,
-        should_wake_owner_processor,
+        Spawner, TASK_ARENA_CLASS_COUNT, TASK_ARENA_KERNEL_RESERVE_BYTES, TASK_ARENA_TOP_BYTES,
+        TaskArena, ready_queue, should_wake_global_processor, should_wake_owner_processor,
+        task_arena_bytes,
     };
     use helios_hal::cpu::{Cpu, HardwarePerfCounters, Instant, ProcessorId};
     use helios_hal::watchdog::ProgressCounter;
@@ -1108,14 +1415,20 @@ mod tests {
         assert_eq!(stats.local_empty_pop_count(), 1);
     }
 
+    /// The arena a host test gets, which is the floor: nothing installed
+    /// a boot memory plan, so `machine_usable_bytes()` is zero and every
+    /// arena is [`TASK_ARENA_MIN_BYTES`].
+    const TEST_ARENA_BYTES: usize = crate::memory::TASK_ARENA_MIN_BYTES;
+    const TEST_SHARE_BYTES: usize = TEST_ARENA_BYTES - TASK_ARENA_KERNEL_RESERVE_BYTES;
+
     #[test]
     fn task_arena_reuses_blocks_released_around_pinned_tasks() {
-        let arena = TaskArena::new_shared();
+        let arena = TaskArena::new_shared(TEST_ARENA_BYTES);
         // An eternal task pins the arena non-empty for the whole test,
         // matching the boot-time pump/transport tasks in a real kernel.
         let pinned = TaskArena::allocate_kernel(&arena, [0_u8; 256]);
         // Churn two orders of magnitude more bytes than the arena holds;
-        // the old reset-when-empty bump pointer exhausted after 1 MiB of
+        // a bump pointer that never rewound exhausted after 1 MiB of
         // cumulative spawns and panicked on the next allocation.
         for _ in 0..200_000 {
             drop(TaskArena::allocate_kernel(&arena, [0_u8; 512]));
@@ -1127,13 +1440,80 @@ mod tests {
         drop(pinned);
     }
 
+    /// Issue #142: the share is bytes, not a set of per-class budgets.
+    /// A share filled with one class and then emptied serves any other
+    /// class, because a freed block is split for a smaller request and
+    /// merged with its buddy for a larger one. On a bump arena with
+    /// per-class free lists this refused every one of the small tasks
+    /// with ~96% of the share free.
+    #[test]
+    fn freed_bytes_of_one_class_serve_a_different_class() {
+        let arena = TaskArena::new_shared(TEST_ARENA_BYTES);
+        let large_bytes = TaskArena::class_bytes(TaskArena::block_class(size_of::<[u8; 8192]>()));
+        let small_bytes = TaskArena::class_bytes(TaskArena::block_class(size_of::<[u8; 256]>()));
+
+        let mut large = Vec::new();
+        while let Ok(task) = TaskArena::allocate_instance(&arena, [0_u8; 8192]) {
+            large.push(task);
+        }
+        assert_eq!(large.len(), TEST_SHARE_BYTES / large_bytes);
+        drop(large);
+
+        // Every byte the large tasks held is available to the small
+        // class, and to the large class again afterwards.
+        let mut small = Vec::new();
+        while let Ok(task) = TaskArena::allocate_instance(&arena, [0_u8; 256]) {
+            small.push(task);
+        }
+        assert_eq!(small.len(), TEST_SHARE_BYTES / small_bytes);
+        drop(small);
+
+        let mut large_again = Vec::new();
+        while let Ok(task) = TaskArena::allocate_instance(&arena, [0_u8; 8192]) {
+            large_again.push(task);
+        }
+        assert_eq!(
+            large_again.len(),
+            TEST_SHARE_BYTES / large_bytes,
+            "freed small blocks did not merge back into large ones"
+        );
+    }
+
+    /// A task does not end where it started: a global task can finish
+    /// on any processor. Its block is published on the arena's free
+    /// stack from there and merged by the owner at its next allocation,
+    /// so the bytes come back with no lock between the two processors.
+    #[test]
+    fn a_block_freed_off_the_owning_processor_comes_back_at_the_next_allocation() {
+        let arena = TaskArena::new_shared(TEST_ARENA_BYTES);
+        let mut live = Vec::new();
+        while let Ok(task) = TaskArena::allocate_instance(&arena, [0_u8; 4096]) {
+            live.push(task);
+        }
+        let released = live.pop().expect("the share held at least one task");
+        let released_ptr = released.ptr.as_ptr().cast::<u8>();
+
+        // The freeing processor is not the owner, and never touches the
+        // owner's block metadata.
+        let elsewhere = std::thread::spawn(move || drop(released));
+        elsewhere.join().expect("the freeing thread panicked");
+
+        let replacement = TaskArena::allocate_instance(&arena, [0_u8; 4096])
+            .expect("the block freed elsewhere is the owner's again");
+        assert_eq!(
+            replacement.ptr.as_ptr().cast::<u8>(),
+            released_ptr,
+            "the owner served the next spawn from somewhere other than the freed block"
+        );
+    }
+
     /// The spawn storm from issue #94: a user program holding instance
-    /// after instance until the arena is gone. Before the instance
+    /// after instance until the share is gone. Before the instance
     /// share existed this panicked the kernel; now the storm is refused
     /// and the kernel's own tasks still have somewhere to go.
     #[test]
     fn instance_task_storm_is_refused_and_leaves_the_kernel_reserve_intact() {
-        let arena = TaskArena::new_shared();
+        let arena = TaskArena::new_shared(TEST_ARENA_BYTES);
         let block = TaskArena::class_bytes(TaskArena::block_class(size_of::<[u8; 4096]>()));
 
         let mut live = Vec::new();
@@ -1142,7 +1522,7 @@ mod tests {
                 Ok(task) => live.push(task),
                 Err(error) => {
                     assert_eq!(error.requested_bytes, block);
-                    assert_eq!(error.share_bytes, TASK_ARENA_INSTANCE_BYTES);
+                    assert_eq!(error.share_bytes, TEST_SHARE_BYTES);
                     assert_eq!(error.live_instance_tasks, live.len());
                     break;
                 }
@@ -1150,7 +1530,7 @@ mod tests {
         }
 
         // The storm stops at the share, not at the arena.
-        assert_eq!(live.len(), TASK_ARENA_INSTANCE_BYTES / block);
+        assert_eq!(live.len(), TEST_SHARE_BYTES / block);
         // And the kernel can still place a task of the largest class it
         // spawns — the property whose absence made a user-mode spawn
         // able to kill the machine.
@@ -1160,9 +1540,53 @@ mod tests {
         drop(live);
     }
 
+    /// However the share is fragmented, and however many instance
+    /// spawns are refused, the reserve is untouched: it is a sub-arena
+    /// of its own, so nothing splits a reserve block for an instance
+    /// and no merge carries share bytes into it.
+    #[test]
+    fn the_reserve_is_never_consumed_by_instance_allocations() {
+        let arena = TaskArena::new_shared(TEST_ARENA_BYTES);
+        let mut small = Vec::new();
+        let mut large = Vec::new();
+        // Interleave two classes, then drop every other small task, so
+        // the share ends up holed rather than uniformly full.
+        loop {
+            let Ok(large_task) = TaskArena::allocate_instance(&arena, [0_u8; 4096]) else {
+                break;
+            };
+            large.push(large_task);
+            let Ok(small_task) = TaskArena::allocate_instance(&arena, [0_u8; 128]) else {
+                break;
+            };
+            small.push(small_task);
+        }
+        small.retain({
+            let mut index = 0;
+            move |_| {
+                index += 1;
+                index % 2 == 0
+            }
+        });
+        // Keep asking until the share refuses, in every class.
+        for _ in 0..64 {
+            drop(TaskArena::allocate_instance(&arena, [0_u8; 64]));
+            drop(TaskArena::allocate_instance(&arena, [0_u8; 8192]));
+        }
+        assert!(TaskArena::allocate_instance(&arena, [0_u8; 8192]).is_err());
+
+        // The reserve is whole: it still serves a block of the largest
+        // class the arena has.
+        let kernel_task =
+            TaskArena::allocate_kernel(&arena, [0_u8; TASK_ARENA_KERNEL_RESERVE_BYTES]);
+        drop(kernel_task);
+        drop(small);
+        drop(large);
+    }
+
     #[test]
     fn instance_tasks_reclaim_the_share_when_their_instances_exit() {
-        let arena = TaskArena::new_shared();
+        let arena = TaskArena::new_shared(TEST_ARENA_BYTES);
         let mut live = Vec::new();
         while let Ok(task) = TaskArena::allocate_instance(&arena, [0_u8; 4096]) {
             live.push(task);
@@ -1183,7 +1607,7 @@ mod tests {
     /// task once one of them ends (#132).
     #[test]
     fn a_refused_instance_task_charges_nothing_to_the_share() {
-        let arena = TaskArena::new_shared();
+        let arena = TaskArena::new_shared(TEST_ARENA_BYTES);
         let mut live = Vec::new();
         while let Ok(task) = TaskArena::allocate_instance(&arena, [0_u8; 4096]) {
             live.push(task);
@@ -1208,19 +1632,53 @@ mod tests {
     }
 
     /// Kernel-funded churn must not hand the reserve to instances: a
-    /// block the kernel took out of the reserve and released stays on
-    /// the reserve free list.
+    /// block the kernel took out of the reserve and released stays in
+    /// the reserve's own buddy tree.
     #[test]
     fn released_kernel_reserve_blocks_never_reach_instance_tasks() {
-        let arena = TaskArena::new_shared();
+        let arena = TaskArena::new_shared(TEST_ARENA_BYTES);
         let mut live = Vec::new();
         while let Ok(task) = TaskArena::allocate_instance(&arena, [0_u8; 4096]) {
             live.push(task);
         }
-        // Bump into the reserve, then give the block back.
+        // Reach into the reserve, then give the block back.
         drop(TaskArena::allocate_kernel(&arena, [0_u8; 4096]));
 
         assert!(TaskArena::allocate_instance(&arena, [0_u8; 4096]).is_err());
+    }
+
+    /// #159: what a processor can hold is the machine's, not a
+    /// constant's. A guest with more memory gets a proportionally
+    /// larger share and places proportionally more instance tasks.
+    #[test]
+    fn the_share_scales_with_the_boot_memory_plan() {
+        /// What a QEMU `-m 2G` x86-64 guest's memory map came to (run
+        /// 33943692491), and the same machine with four times it.
+        const TWO_GIB_USABLE: usize = 1_977_962_496;
+        let small = TaskArena::new_shared(task_arena_bytes(TWO_GIB_USABLE));
+        let large = TaskArena::new_shared(task_arena_bytes(4 * TWO_GIB_USABLE));
+
+        let place_until_refused = |arena: &_| {
+            let mut live = Vec::new();
+            while let Ok(task) = TaskArena::allocate_instance(arena, [0_u8; 8192]) {
+                live.push(task);
+            }
+            live.len()
+        };
+        let small_tasks = place_until_refused(&small);
+        let large_tasks = place_until_refused(&large);
+
+        // The hundredth instance of #159 was refused at about ninety
+        // launch tasks in a 768 KiB share. The same guest's share now
+        // holds the launch tasks of hundreds of instances.
+        assert!(
+            small_tasks >= 500,
+            "a 2 GiB guest's share held only {small_tasks} launch tasks"
+        );
+        assert!(
+            large_tasks >= 3 * small_tasks,
+            "four times the machine held {large_tasks} against {small_tasks}"
+        );
     }
 
     #[test]
@@ -1233,5 +1691,6 @@ mod tests {
             TaskArena::class_bytes(TASK_ARENA_CLASS_COUNT - 1),
             256 * 1024
         );
+        assert_eq!(TASK_ARENA_TOP_BYTES, 256 * 1024);
     }
 }
