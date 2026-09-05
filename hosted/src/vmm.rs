@@ -27,6 +27,7 @@
 use std::ptr;
 use std::sync::Mutex;
 
+use helios_hal::device::DeviceRegion;
 use helios_hal::pmm::PhysFrame;
 use helios_hal::vmm::{
     AddressSpace, AddressSpaceError, PageAge, PageFlags, SwapToken, Translation, VirtAddr,
@@ -135,6 +136,26 @@ impl HostedAddressSpace {
         }
         Ok(())
     }
+}
+
+/// The page protection a device region has to be mapped with.
+///
+/// Normal memory and a register file get the same host protection: the
+/// host kernel has no uncached mapping to offer a user process, and the
+/// distinction only bites on real hardware. `hosted` exists to exercise
+/// the kernel's bookkeeping, and it says so rather than pretending the
+/// mapping is uncached.
+fn device_region_flags(region: DeviceRegion) -> PageFlags {
+    let mut flags = PageFlags::READ;
+    if region.attributes.writable {
+        flags |= PageFlags::WRITE;
+    }
+    flags
+}
+
+/// The smallest unit this address space can change a mapping at.
+pub fn host_mapping_granule() -> u64 {
+    host_page_size() as u64
 }
 
 impl Default for HostedAddressSpace {
@@ -260,6 +281,94 @@ impl AddressSpace for HostedAddressSpace {
             }
         }
         self.apply_host_protection(&reservations, hull, false)
+    }
+
+    /// On this backend a "physical" address is a host virtual address,
+    /// so a device region is a second view of memory the host already
+    /// owns. The device's own pages are file-backed and shared, which is
+    /// what lets them appear at a second address; mapping is therefore
+    /// `MAP_FIXED` over the reservation rather than a page-table walk.
+    ///
+    /// There is no other processor to shoot down: the hosted kernel runs
+    /// on one, and the host's own `mmap` has published the change to
+    /// every thread by the time it returns.
+    fn map_device(&self, virt: VirtRange, region: DeviceRegion) -> Result<(), AddressSpaceError> {
+        validate_range(virt)?;
+        if !virt.start.raw().is_multiple_of(self.host_page)
+            || !virt.byte_len.is_multiple_of(self.host_page)
+        {
+            return Err(AddressSpaceError::Misaligned);
+        }
+        let backing = crate::device::backing_for(&region).ok_or(
+            // A region no hosted device published cannot be mapped:
+            // there is no host memory behind the address, and mapping
+            // anonymous pages there would hand the owner a device that
+            // silently is not one.
+            AddressSpaceError::DeviceMappingUnsupported,
+        )?;
+        let mut reservations = self.reservations.lock().unwrap();
+        reservations.precheck_commit(virt)?;
+        let flags = device_region_flags(region);
+        let owner = current_user_memory_owner(self.processor);
+        self.orphan(reservations.record_commit(virt, flags, owner)?);
+        let mapped = unsafe {
+            libc::mmap(
+                virt.start.raw() as *mut _,
+                virt.byte_len,
+                page_flags_to_prot(flags),
+                libc::MAP_FIXED | libc::MAP_SHARED,
+                backing.descriptor,
+                backing.offset,
+            )
+        };
+        if mapped == libc::MAP_FAILED {
+            let _ = reservations.record_decommit(virt)?;
+            return Err(AddressSpaceError::DeviceMappingUnsupported);
+        }
+        Ok(())
+    }
+
+    fn unmap_device(&self, virt: VirtRange) -> Result<(), AddressSpaceError> {
+        validate_range(virt)?;
+        let mut reservations = self.reservations.lock().unwrap();
+        reservations.ensure_committed(virt)?;
+        let swapped = reservations.record_decommit(virt)?;
+        self.orphan(swapped);
+        // Anonymous `PROT_NONE` restores what a reservation is: address
+        // space nothing is behind. Dropping the shared mapping here is
+        // what makes the device provably unreachable.
+        let restored = unsafe {
+            libc::mmap(
+                virt.start.raw() as *mut _,
+                virt.byte_len,
+                libc::PROT_NONE,
+                libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if restored == libc::MAP_FAILED {
+            return Err(AddressSpaceError::DeviceMappingUnsupported);
+        }
+        Ok(())
+    }
+
+    /// Physical contiguity is free here: a "physical" address is the
+    /// host virtual address, so a range that is contiguous in this
+    /// address space is contiguous to the device by construction.
+    fn commit_contiguous(
+        &self,
+        virt: VirtRange,
+        flags: PageFlags,
+        limit: u64,
+    ) -> Result<PhysFrame, AddressSpaceError> {
+        validate_range(virt)?;
+        let last = (virt.start.raw() + virt.byte_len - 1) as u64;
+        if last > limit {
+            return Err(AddressSpaceError::OutOfFrames);
+        }
+        self.commit(virt, flags)?;
+        Ok(PhysFrame::from_phys_addr(virt.start.raw()))
     }
 
     fn translate(&self, addr: VirtAddr) -> Translation {
