@@ -117,18 +117,21 @@ where
         }
 
         let heap = heap_stats();
-        let headroom = KernelHeapHeadroom::of(heap);
+        let headroom = KernelHeapHeadroom::of(heap, user_available);
         if let Some(shortfall) = headroom.growth_shortfall_bytes(growth) {
             self.request_oom_kill_for_growth(MemoryPool::Kernel, shortfall);
-            // Every number in this refusal describes the kernel heap,
-            // including the request: reporting the guest's `desired`
-            // here alongside kernel-heap availability is what made a
-            // refusal on this branch read as a user-pool refusal.
+            // Every number in this refusal describes the kernel side
+            // of the grow, including the request: reporting the guest's
+            // `desired` here alongside kernel-heap availability is what
+            // made a refusal on this branch read as a user-pool
+            // refusal. Availability spans both domains because the
+            // kernel heap funds itself out of the user pool, so this
+            // branch fires only when the machine itself is out.
             return Some(
                 ProgramOutOfMemory {
                     requested_bytes: shortfall,
                     available_bytes: headroom.available_bytes,
-                    pool_bytes: heap.total_bytes,
+                    pool_bytes: heap.total_bytes.saturating_add(user_heap.total_bytes),
                     reserved_bytes: headroom.reserve_bytes,
                 }
                 .into(),

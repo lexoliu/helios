@@ -714,12 +714,17 @@ jobs:
             accel: kvm
             # KVM boots in seconds; a marker hang should fail fast.
             boot-timeout: "300"
-            # The instance-density cells cannot be measured on any guest
-            # today: the user-memory pool does not grow with the guest, so
-            # the spawn is refused with a typed out-of-memory error (#130).
-            # They stay out of this lane's gating set rather than teaching
-            # the lane to tolerate a failed cell — the benchmark suite is
-            # where a failure becomes a recorded cell with its reason.
+            # The instance-density cells are no longer bounded by
+            # memory — the boot memory policy leaves all usable memory
+            # in the user pool and lets the kernel heap draw on it
+            # (#130, docs/memory.md), and the hundredth spawn now
+            # reaches instance 104 before it is refused. What refuses it
+            # is the executor's fixed 768 KiB instance task share
+            # (#159), a constant the guest's memory does not move. They
+            # stay out of this lane's gating set until that is settled,
+            # rather than teaching the lane to tolerate a failed cell —
+            # the benchmark suite is where a failure becomes a recorded
+            # cell with its reason.
             workloads: >-
               --skip-workload instance-startup-100
               --skip-workload instance-startup-500

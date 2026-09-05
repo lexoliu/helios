@@ -53,6 +53,34 @@ impl UserMemoryPool {
         self.frame_slab.configure_processors(processor_count);
     }
 
+    /// Hands `bytes` of the pool to the kernel heap, for good.
+    ///
+    /// This is the run-time half of the boot memory policy: the pool is
+    /// seeded with everything the machine has and the kernel heap takes
+    /// what it turns out to need out of it, rather than both guessing
+    /// their share at boot. See [`super::policy`] for why the transfer
+    /// is one-way.
+    ///
+    /// `bytes` must be a power of two, and the block comes back aligned
+    /// to its own size, so the pool loses one buddy rather than a
+    /// straddling pair.
+    ///
+    /// Called from inside the global allocator, so it must not itself
+    /// allocate on the kernel heap — which is why it goes through
+    /// [`Self::allocate_raw`], skipping both the free-page reporting
+    /// check and the frame slab.
+    pub(crate) fn lend_to_kernel_heap(&self, bytes: usize) -> Option<(usize, usize)> {
+        debug_assert!(bytes.is_power_of_two(), "a lend is one buddy block");
+        let layout = Layout::from_size_align(bytes, bytes).ok()?;
+        let (ptr, size) = self.allocate_raw(layout, None).ok()?;
+        // The pool never sees this memory again, so it must stop
+        // counting towards the frame-slab capacity the pool sizes from
+        // its own total.
+        self.total_bytes.fetch_sub(size, Ordering::Release);
+        let start = ptr.as_ptr() as usize;
+        Some((start, start + size))
+    }
+
     pub fn stats(&self) -> UserHeapStats {
         let allocator = self.heap.lock();
         let cached = self.frame_slab.cached_bytes();
@@ -403,6 +431,21 @@ fn user_memory_pool() -> &'static UserMemoryPool {
 
 pub fn user_heap_stats() -> UserHeapStats {
     user_memory_pool().stats()
+}
+
+/// User memory the pool can still hand out, or nothing at all before
+/// the pool exists.
+///
+/// Unlike [`user_heap_stats`] this does not panic on a pool that has
+/// not been installed: both callers run on the kernel heap's growth
+/// path, which is reached during boot before the pool is there.
+pub(crate) fn user_pool_available_bytes() -> usize {
+    installed_user_memory_pool().map_or(0, |pool| pool.stats().available_bytes())
+}
+
+/// See [`UserMemoryPool::lend_to_kernel_heap`].
+pub(crate) fn lend_user_memory_to_kernel_heap(bytes: usize) -> Option<(usize, usize)> {
+    installed_user_memory_pool()?.lend_to_kernel_heap(bytes)
 }
 
 /// See [`UserMemoryPool::largest_servable_bytes`].
