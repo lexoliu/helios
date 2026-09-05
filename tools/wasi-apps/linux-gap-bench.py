@@ -64,6 +64,10 @@ DEFAULT_HELIOS_TIMEOUT_SECONDS = 600
 # Linux side of the same lane needs provisioning plus its own budget, so
 # the Helios side is bounded well inside that rather than at it.
 DEFAULT_HELIOS_SIDE_TIMEOUT_SECONDS = 10800
+# The one build the side does before its budget starts. A cold cache on a
+# hosted runner compiles the whole workspace twice over — host tools and
+# a bare-metal target — and none of it belongs to a workload.
+DEFAULT_HELIOS_BUILD_TIMEOUT_SECONDS = 3600
 STALE_PROCESS_COMMAND_LIMIT = 240
 
 
@@ -404,6 +408,8 @@ def run_helios(
     host_tcp_echo_port: int | None,
     timeout_seconds: int,
     side_timeout_seconds: int,
+    build_timeout_seconds: int,
+    skip_build: bool,
     control_workload: dict | None,
     keep_going: bool,
 ) -> Path:
@@ -411,6 +417,14 @@ def run_helios(
     workloads_by_class: dict[str, list[str]] = {}
     for workload in workloads:
         workloads_by_class.setdefault(workload["class"], []).append(workload["name"])
+
+    # The guest image and the inspector are built once, before the
+    # budget starts and outside every class's share of it. A cold cargo
+    # cache is minutes of compiling that has nothing to do with any
+    # workload, and charging it to the first class made the lane's
+    # outcome depend on the runner's cache state: #153.
+    if not skip_build:
+        build_helios(arch, accel, build_timeout_seconds)
 
     # The whole Helios side runs inside one budget, the way the Linux
     # side does. A guest that stops answering is bounded by the
@@ -599,6 +613,21 @@ def record_unmeasured(
             )
 
 
+def build_helios(arch: str, accel: str | None, timeout_seconds: int) -> None:
+    """Builds the guest image and the inspector the classes then reuse."""
+    env = os.environ.copy()
+    env["HELIOS_WORKLOAD_BENCH_ARCH"] = arch
+    if accel:
+        env["HELIOS_WORKLOAD_BENCH_ACCEL"] = accel
+    env["HELIOS_WORKLOAD_BENCH_BUILD_ONLY"] = "1"
+    env.pop("HELIOS_WORKLOAD_BENCH_NO_BUILD", None)
+    run_isolated(
+        ["tools/wasi-apps/workload-bench.sh"],
+        env=env,
+        timeout_seconds=timeout_seconds,
+    )
+
+
 def run_helios_once(
     manifest: Path,
     log: Path,
@@ -647,6 +676,9 @@ def run_helios_once(
         env["HELIOS_WORKLOAD_BENCH_HOST_TCP_ECHO_PORT"] = str(host_tcp_echo_port)
     if keep_going:
         env["HELIOS_WORKLOAD_BENCH_KEEP_GOING"] = "1"
+    # Everything this boot needs was built before the budget started.
+    env["HELIOS_WORKLOAD_BENCH_NO_BUILD"] = "1"
+    env.pop("HELIOS_WORKLOAD_BENCH_BUILD_ONLY", None)
     run_isolated(["tools/wasi-apps/workload-bench.sh"], env=env, timeout_seconds=timeout_seconds)
 
 
@@ -1815,6 +1847,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum wall-clock seconds for each isolated Helios VM workload command.",
     )
     parser.add_argument(
+        "--helios-skip-build",
+        action="store_true",
+        help=(
+            "The caller has already built the guest image and the inspector into "
+            "the same target directory, so this run boots them rather than "
+            "building again. A CI lane uses it to make the compile its own step."
+        ),
+    )
+    parser.add_argument(
+        "--helios-build-timeout-seconds",
+        type=int,
+        default=DEFAULT_HELIOS_BUILD_TIMEOUT_SECONDS,
+        help=(
+            "Maximum wall-clock seconds for the one build the Helios side does "
+            "before its budget starts. A cold cargo cache compiles the kernel, "
+            "the bootfs programs and the inspector; none of that is a workload."
+        ),
+    )
+    parser.add_argument(
         "--helios-side-timeout-seconds",
         type=int,
         default=DEFAULT_HELIOS_SIDE_TIMEOUT_SECONDS,
@@ -1834,6 +1885,8 @@ def main() -> None:
         raise SystemExit("--iterations must be a positive integer")
     if args.max_host_load_per_cpu <= 0:
         raise SystemExit("--max-host-load-per-cpu must be positive")
+    if args.helios_build_timeout_seconds <= 0:
+        raise SystemExit("--helios-build-timeout-seconds must be a positive integer")
     if args.helios_side_timeout_seconds <= 0:
         raise SystemExit("--helios-side-timeout-seconds must be a positive integer")
     if args.helios_timeout_seconds <= 0:
@@ -1945,6 +1998,8 @@ def main() -> None:
                 host_tcp_echo_port,
                 args.helios_timeout_seconds,
                 args.helios_side_timeout_seconds,
+                args.helios_build_timeout_seconds,
+                args.helios_skip_build,
                 control_workload,
                 args.keep_going,
             )
