@@ -31,6 +31,13 @@ const METRIC_LINE_PREFIX: &str = "bench.";
 /// failure inside one step.
 pub(crate) const DEFAULT_WORKLOAD_TIMEOUT_SECONDS: u32 = 180;
 
+/// How long the post-failure network-counter read may take.
+///
+/// Short because it runs after a failure that may itself be a guest that
+/// stopped answering: the counters are worth a few seconds of a lane's
+/// time and not a minute of it.
+const NETWORK_COUNTER_DEADLINE_SECONDS: u32 = 10;
+
 /// A workload that never came back.
 ///
 /// Typed rather than a bare message because the deadline is the one
@@ -403,7 +410,7 @@ async fn measure_workload(
 ) -> Result<Vec<u128>> {
     let mut elapsed_ms = Vec::new();
     for iteration in 1..=command.iterations {
-        let output = match workload.runner {
+        let attempt = match workload.runner {
             WorkloadRunner::Shell => {
                 under_deadline(
                     workload,
@@ -411,7 +418,7 @@ async fn measure_workload(
                     command,
                     run_shell_workload(client, workload, command),
                 )
-                .await?
+                .await
             }
             WorkloadRunner::Program => {
                 under_deadline(
@@ -420,7 +427,7 @@ async fn measure_workload(
                     command,
                     run_program_workload(client, workload, command),
                 )
-                .await?
+                .await
             }
             WorkloadRunner::HeliosAot => {
                 under_deadline(
@@ -429,16 +436,29 @@ async fn measure_workload(
                     command,
                     run_aot_workload(client, workload, iteration),
                 )
-                .await?
+                .await
             }
         };
-        let validation =
-            validate_output(workload, &output.stdout, &output.stderr).with_context(|| {
+        let output = match attempt {
+            Ok(output) => output,
+            Err(error) => {
+                write_guest_network_counters(client, workload, iteration).await;
+                return Err(error);
+            }
+        };
+        let validation = match validate_output(workload, &output.stdout, &output.stderr)
+            .with_context(|| {
                 format!(
                     "workload {} iteration {} failed validation",
                     workload.name, iteration
                 )
-            })?;
+            }) {
+            Ok(validation) => validation,
+            Err(error) => {
+                write_guest_network_counters(client, workload, iteration).await;
+                return Err(error);
+            }
+        };
         elapsed_ms.push(output.elapsed_ms);
         write_record(&JsonlRecord::Iteration {
             workload: &workload.name,
@@ -933,6 +953,77 @@ fn write_guest_output(workload: &Workload, stdout: &[u8], stderr: &[u8]) -> Resu
     write_guest_stream(&mut sink, "stderr", stderr)?;
     writeln!(sink, "--- end of workload {} output ---", workload.name)?;
     Ok(())
+}
+
+/// Prints the guest's per-shard network counters after a failed
+/// workload iteration.
+///
+/// The lane keeps no guest tracing during a transfer and the guest logs
+/// nothing at INFO mid-stream, so a stalled network workload used to
+/// leave the log with the failure and nothing about the stack that
+/// produced it: whether the receiver's window had shut, whether the
+/// window update that should have reopened it was ever sent, whether
+/// frames were being refused and on which shard (#143). One sample of
+/// these answers all of that, and it is the last thing worth asking a
+/// guest that has just failed.
+///
+/// Best effort by design. The iteration may have failed *because* the
+/// guest stopped answering, and this must not turn a named failure into
+/// a hang, so it is bounded like every other guest step and a guest that
+/// says nothing is reported as saying nothing.
+async fn write_guest_network_counters(
+    client: &mut crate::serial::RpcClient,
+    workload: &Workload,
+    iteration: u16,
+) {
+    use std::io::Write as _;
+    let sample = guest_step_under_deadline(
+        "network counters",
+        NETWORK_COUNTER_DEADLINE_SECONDS,
+        crate::system::fetch_stats(client),
+    )
+    .await;
+    let mut sink = std::io::stderr().lock();
+    let _ = writeln!(
+        sink,
+        "--- workload {} iteration {iteration} network counters ---",
+        workload.name
+    );
+    match sample {
+        Ok(sample) => match sample.network {
+            Some(network) if !network.queues.is_empty() => {
+                for queue in network.queues {
+                    let _ = writeln!(
+                        sink,
+                        "shard {} rx={} tx={} irq={} refused={} sockets={} shut-sockets={} \
+                         window-bytes={} acks={} window-updates={} retransmits={}",
+                        queue.id,
+                        queue.rx_frames,
+                        queue.tx_frames,
+                        queue.interrupts,
+                        queue.rx_refused_frames,
+                        queue.tcp_sockets,
+                        queue.tcp_receive_backpressured_sockets,
+                        queue.tcp_receive_window_bytes,
+                        queue.tcp_acks_sent,
+                        queue.tcp_window_updates_sent,
+                        queue.tcp_retransmits_sent,
+                    );
+                }
+            }
+            Some(_) | None => {
+                let _ = writeln!(sink, "the guest reports no network device");
+            }
+        },
+        Err(error) => {
+            let _ = writeln!(sink, "the guest did not answer: {error}");
+        }
+    }
+    let _ = writeln!(
+        sink,
+        "--- end of workload {} iteration {iteration} network counters ---",
+        workload.name
+    );
 }
 
 /// One named stream of a failing workload's output. An empty stream is
