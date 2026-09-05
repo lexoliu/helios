@@ -16,7 +16,24 @@ if [[ ! "${iterations}" =~ ^[0-9]+$ ]] || (( iterations == 0 )); then
     exit 1
 fi
 
-"${cargo_bin}" build --release -p helios-inspector
+# Two modes exist so that whatever times the boots does not also time a
+# cold cargo cache: `BUILD_ONLY` produces the guest image and the
+# inspector and stops, and `NO_BUILD` runs the workloads against what a
+# previous `BUILD_ONLY` left in the same target directory.
+build_only="${HELIOS_WORKLOAD_BENCH_BUILD_ONLY:-}"
+no_build="${HELIOS_WORKLOAD_BENCH_NO_BUILD:-}"
+if [[ -n "${build_only}" && -n "${no_build}" ]]; then
+    printf 'HELIOS_WORKLOAD_BENCH_BUILD_ONLY and _NO_BUILD contradict each other\n' >&2
+    exit 1
+fi
+
+if [[ -z "${no_build}" ]]; then
+    "${cargo_bin}" build --release -p helios-inspector
+elif [[ ! -x "${inspector}" ]]; then
+    printf '%s does not exist; run this script with HELIOS_WORKLOAD_BENCH_BUILD_ONLY=1 first\n' \
+        "${inspector}" >&2
+    exit 1
+fi
 
 mkdir -p target/perf-baselines
 short_sha="$(git rev-parse --short HEAD)"
@@ -29,6 +46,15 @@ command=(
     "${arch}"
     --release
 )
+
+# The build depends on the architecture and the profile and on nothing
+# else, so it is issued before the boot's own flags are gathered: a
+# machine description this host cannot satisfy must not stop the compile
+# that a later boot on a prepared host will reuse.
+if [[ -n "${build_only}" ]]; then
+    printf 'building the Helios guest and the inspector\n' >&2
+    exec "${command[@]}" build
+fi
 
 if [[ -n "${HELIOS_WORKLOAD_BENCH_VM_MEMORY:-}" ]]; then
     command+=(--memory "${HELIOS_WORKLOAD_BENCH_VM_MEMORY}")
@@ -89,6 +115,10 @@ fi
 
 if [[ -n "${HELIOS_WORKLOAD_BENCH_NET_BRIDGE:-}" ]]; then
     command+=(--net-bridge "${HELIOS_WORKLOAD_BENCH_NET_BRIDGE}")
+fi
+
+if [[ -n "${no_build}" ]]; then
+    command+=(--no-build)
 fi
 
 command+=(

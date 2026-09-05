@@ -662,6 +662,14 @@ enum VmSessionCommand {
     WorkloadBench(WorkloadBenchCommand),
     /// Move the guest's memory balloon and watch the guest follow.
     Balloon(BalloonCommand),
+    /// Build the guest image and the inspector, and stop there.
+    ///
+    /// The boots that follow reuse what this leaves in the target
+    /// directory, so whatever is timing them — a per-class budget, a
+    /// job step — measures guests rather than a cold cargo cache. With
+    /// no `--boot-program` the bootfs carries every program, which is
+    /// the superset every workload class boots from.
+    Build,
     /// Provision the privileged host state a network backend needs.
     NetSetup(NetSetupCommand),
     /// Remove the host state `net-setup` provisioned.
@@ -791,6 +799,9 @@ pub(crate) fn run(mut command: VmCommand) -> Result<()> {
         Some(VmSessionCommand::NetTeardown(teardown)) => {
             return Ok(network::run_teardown(teardown)?);
         }
+        // `build` produces artifacts and boots nothing, so it neither
+        // preflights the QEMU host state nor spawns a guest.
+        Some(VmSessionCommand::Build) => return build_vm(&resolve(command)?),
         session => command.command = session,
     }
     let command = resolve(command)?;
@@ -2754,8 +2765,10 @@ impl From<VmSessionCommand> for ResolvedVmSessionCommand {
             VmSessionCommand::AotBench(command) => Self::AotBench(command),
             VmSessionCommand::WorkloadBench(command) => Self::WorkloadBench(command),
             VmSessionCommand::Balloon(command) => Self::Balloon(command),
-            VmSessionCommand::NetSetup(_) | VmSessionCommand::NetTeardown(_) => {
-                unreachable!("the privileged network helpers never reach a guest session")
+            VmSessionCommand::Build
+            | VmSessionCommand::NetSetup(_)
+            | VmSessionCommand::NetTeardown(_) => {
+                unreachable!("the build and the network helpers never reach a guest session")
             }
         }
     }

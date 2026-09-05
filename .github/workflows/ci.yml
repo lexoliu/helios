@@ -786,9 +786,17 @@ jobs:
           key: bench-${{ matrix.name }}
       - name: Install inferno flamegraph renderer
         run: cargo install inferno --locked
-      - name: Build inspector
+      # The guest image, its bootfs and the inspector are built here so
+      # the benchmark step below times guests rather than a cold cargo
+      # cache. Every class the driver then runs boots what this leaves in
+      # the target directory (#153), and the compile's cost is this
+      # step's own line in the job summary.
+      - name: Build the Helios guest and inspector
         working-directory: helios
-        run: cargo build --release -p helios-inspector
+        env:
+          HELIOS_WORKLOAD_BENCH_ARCH: ${{ matrix.helios-arch }}
+          HELIOS_WORKLOAD_BENCH_BUILD_ONLY: "1"
+        run: tools/wasi-apps/workload-bench.sh
       - name: Provision the multi-queue tap network backend
         if: matrix.net-backend == 'tap'
         working-directory: helios
@@ -848,6 +856,7 @@ jobs:
             --allow-busy-host \
             --helios-timeout-seconds 9000 \
             --helios-side-timeout-seconds 3000 \
+            --helios-skip-build \
             --helios-host-http-host ${{ matrix.net-host }} \
             --helios-host-tcp-host ${{ matrix.net-host }} \
             --out-dir target/perf-baselines/ci-${{ matrix.name }} \

@@ -25,6 +25,11 @@ WEDGED = "net"
 # group is torn down rather than just the script.
 FAKE_BENCH = """#!/bin/sh
 set -eu
+if [ -n "${HELIOS_WORKLOAD_BENCH_BUILD_ONLY:-}" ]; then
+    sleep 2
+    echo built >> "$HELIOS_TEST_BUILD_LOG"
+    exit 0
+fi
 log="$HELIOS_WORKLOAD_BENCH_LOG"
 mkdir -p "$(dirname "$log")"
 if [ "$HELIOS_WORKLOAD_BENCH_CLASSES" = "@WEDGED@" ]; then
@@ -61,6 +66,7 @@ def driver(tmp_path, monkeypatch):
     script.chmod(0o755)
     monkeypatch.setattr(module, "repo_root", lambda: tmp_path)
     monkeypatch.setenv("HELIOS_TEST_WEDGE_PID_FILE", str(tmp_path / "wedge.pid"))
+    monkeypatch.setenv("HELIOS_TEST_BUILD_LOG", str(tmp_path / "builds"))
     return module
 
 
@@ -88,6 +94,8 @@ def run_side(driver, out_dir: Path, per_class: int, side: int) -> tuple[Path, fl
         None,
         timeout_seconds=per_class,
         side_timeout_seconds=side,
+        build_timeout_seconds=60,
+        skip_build=False,
         control_workload=None,
         keep_going=True,
     )
@@ -126,6 +134,31 @@ def test_a_spent_budget_boots_no_further_guest(driver, tmp_path) -> None:
     assert {record["type"] for record in written.values()} == {"failure"}
     assert all("budget was spent" in record["error"] for record in written.values())
     assert not (tmp_path / "wedge.pid").exists(), "no guest may be booted on a spent budget"
+
+
+def test_the_build_is_not_charged_to_any_class(driver, tmp_path) -> None:
+    """#153: a cold cargo cache is not a workload.
+
+    The stand-in spends two seconds building, more than any one class's
+    share of the budget below. Charging that to the first class is what
+    killed `bench-x86-64-linux` on a cold runner — it died with the
+    budget spent before a guest had booted — so what is asserted here is
+    that every class that can be measured still was, and that the one
+    that failed failed on its own deadline rather than on the budget.
+    """
+    log, elapsed = run_side(driver, tmp_path / "out", per_class=2, side=4)
+
+    assert (tmp_path / "builds").read_text(encoding="utf-8").strip() == "built", (
+        "the side must build once, before its budget starts"
+    )
+    assert elapsed > 2, "the build is the one thing that runs before the budget"
+
+    written = records(log)
+    assert written["quickjs-loop"]["type"] == "summary"
+    assert written["hostcall-loop"]["type"] == "summary"
+    assert "timed out" in written["wasi-tcp-throughput"]["error"], (
+        "the wedged class must fail on its own deadline, not on a budget the build spent"
+    )
 
 
 def test_the_budget_is_shared_out_as_the_classes_run(driver) -> None:
