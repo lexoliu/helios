@@ -2619,6 +2619,125 @@ mod tests {
         );
     }
 
+    /// The regression #158 describes: a completed socket write leaves
+    /// its bytes queued on the socket, and nothing in the system says
+    /// that a socket has data to send.
+    ///
+    /// The bytes only become a segment when the stack is driven, and
+    /// the events that drive it are a frame arriving, a transmit
+    /// completing and a protocol timer expiring. A write is none of
+    /// them: it raises no arrival, completes no descriptor and arms no
+    /// timer, so a writer that queued its bytes and returned left the
+    /// segment for the packet pump — which, having nothing to do, was
+    /// parked for `DHCP_RETRANSMIT_NANOS`.
+    ///
+    /// A request/response exchange therefore paid a second per round
+    /// trip: `tcp-latency`'s 5000 sixteen-byte round trips could not
+    /// finish inside the benchmark's 180 s iteration deadline, and the
+    /// counters read at that deadline showed a socket that had made
+    /// about two hundred round trips with an open window, no
+    /// retransmissions and no refused frames.
+    ///
+    /// So the assertion is that the write itself puts the segment on
+    /// the wire: after `tcp_write_all_bytes` returns, the payload is in
+    /// the shard's outbound queue, with no poll, no timer and no pump
+    /// in the test at all.
+    #[test]
+    fn a_completed_tcp_write_leaves_its_payload_on_the_wire() {
+        /// The `tcp-latency` request: sixteen bytes, which every
+        /// congestion window and send queue has room for.
+        const REQUEST: &[u8] = b"0123456789abcdef";
+
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let service = test_network_service();
+        let state = &service.inner.state;
+        let owner = super::DEFAULT_SHARD_IDX;
+
+        let stream = {
+            let mut shard = state.shard_at(owner).lock();
+            shard.stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+            shard.stack.learn_neighbor(NeighborEntry {
+                ip: IpAddress::Ipv4(peer),
+                mac: PEER_MAC,
+                state: NeighborState::Reachable,
+                updated_at: StackInstant::from_nanos(0),
+            });
+            service.inner.control.publish_from_shard(&shard);
+            let socket = shard
+                .stack
+                .open_tcp_connect(
+                    TcpEndpoint {
+                        address: IpAddress::Ipv4(local),
+                        port: 49_152,
+                    },
+                    TcpEndpoint {
+                        address: IpAddress::Ipv4(peer),
+                        port: 7,
+                    },
+                    7,
+                )
+                .expect("the test connection should allocate a socket");
+            shard.insert_tcp_stream(socket)
+        };
+
+        let (syn_ack, syn_ack_len) = ipv4_tcp_frame(
+            peer,
+            local,
+            TcpHeader {
+                source_port: 7,
+                destination_port: 49_152,
+                sequence: 100,
+                acknowledgement: 8,
+                flags: TcpFlags::SYN.union(TcpFlags::ACK),
+                window_size: u16::MAX,
+            },
+            &[],
+        );
+        state
+            .shard_at(owner)
+            .lock()
+            .stack
+            .receive_frame(&syn_ack[..syn_ack_len], StackInstant::from_nanos(1))
+            .expect("the SYN-ACK should establish the connection");
+
+        // Everything the handshake owed is already queued; the frame
+        // this test is about is the one the write produces.
+        while state.shard_at(owner).lock().stack.take_outbound().is_some() {}
+
+        block_on(service.tcp_write_all_bytes(stream, Bytes::from_static(REQUEST), u64::MAX))
+            .expect("a sixteen-byte write into an open window should complete");
+
+        let mut request_segment = None;
+        let mut shard = state.shard_at(owner).lock();
+        while let Some(frame) = shard.stack.take_outbound() {
+            let Some(ethernet) = EthernetFrame::parse(frame.as_ref()) else {
+                continue;
+            };
+            let Some(ipv4) = Ipv4Packet::parse(ethernet.payload) else {
+                continue;
+            };
+            if ipv4.protocol != IpProtocol::Tcp {
+                continue;
+            }
+            let Some(segment) = TcpPacket::parse(ipv4.payload) else {
+                continue;
+            };
+            if segment.payload.is_empty() {
+                continue;
+            }
+            request_segment = Some(segment.payload.to_vec());
+            break;
+        }
+
+        assert_eq!(
+            request_segment.as_deref(),
+            Some(REQUEST),
+            "the write must publish its own segment rather than leave it \
+             for the packet pump's next wake"
+        );
+    }
+
     /// The regression #107 describes: a socket that is only receiving
     /// closes its receive window, and from that moment the pump's poll
     /// takes no frame, sends nothing and reports itself idle.
