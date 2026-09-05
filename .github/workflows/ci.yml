@@ -561,6 +561,30 @@ jobs:
           grep -Fqx oob-load:before-fault oob-load-smoke.out
           grep -Fqx guest-alive oob-load-smoke.out
           ! grep -Fq 'Kernel panic' oob-load-smoke.out
+      - name: Fetch over virtio-net with curl
+        shell: bash
+        working-directory: helios
+        run: |
+          # Without this the step reports tee's status, not the
+          # command's, and a runner script that fails is invisible.
+          set -o pipefail
+          # The counterpart of smoke-riscv64's curl step, and what #86
+          # died in twice over: nothing here drove the NIC, because the
+          # balloon service had wedged the bootstrap processor's
+          # executor, and once it did drive the NIC the transmit queue's
+          # MSI-X message landed on a vector the routing table did not
+          # know. Both are x86-only, and neither is visible from any
+          # step that does not move a packet.
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/curl"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger \
+            --boot-program curl --boot-program http-client --no-compiler-plugin \
+            shell -c 'curl http://detectportal.firefox.com/success.txt' \
+            2>&1 > curl-smoke.out | tee "$runtime/inspector.log"
+          cat curl-smoke.out
+          grep -Fqx success curl-smoke.out
       # The host keeps its own copy of the debug serial, written by the
       # QEMU chardev before the inspector frames a byte of it. A stage
       # marker broken in that copy was lost inside QEMU's transmit
@@ -573,9 +597,6 @@ jobs:
         shell: bash
         working-directory: helios
         run: python3 tools/debug-serial-report.py "$GITHUB_WORKSPACE/smoke-runtime"
-      # There is no curl step here, unlike smoke-riscv64: a fetch over
-      # virtio-net never completes on x86-64 (#86), and a lane covers
-      # what passes. The step joins this job when that is fixed.
       - name: Upload the inspector runtime directories
         if: failure()
         uses: actions/upload-artifact@v4
