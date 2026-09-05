@@ -1627,6 +1627,7 @@ dependencies = [
  "fatfs",
  "helios-artifact",
  "helios-compiler-support",
+ "helios-workspace-root",
  "hex",
  "mbrman",
  "rand",
@@ -1750,6 +1751,7 @@ dependencies = [
  "futures-util",
  "helios-hal",
  "helios-inspector-protocol",
+ "helios-workspace-root",
  "indicatif",
  "ipnet",
  "libc",
@@ -1926,6 +1928,15 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "zerocopy",
+]
+
+[[package]]
+name = "helios-workspace-root"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "thiserror 2.0.18",
+ "toml",
 ]
 
 [[package]]

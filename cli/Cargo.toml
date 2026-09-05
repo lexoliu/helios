@@ -11,6 +11,7 @@ ed25519-dalek = { version = "2.2.0", default-features = false, features = ["allo
 fatfs = "0.3.6"
 helios-artifact.workspace = true
 helios-compiler-support.workspace = true
+helios-workspace-root.workspace = true
 hex = "0.4.3"
 mbrman = "0.5.4"
 rand = "0.8.5"

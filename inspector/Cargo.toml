@@ -25,6 +25,7 @@ futures-lite = "2.6.1"
 futures-util = { version = "0.3.31", default-features = false, features = ["io"] }
 helios-inspector-protocol.workspace = true
 helios-hal.workspace = true
+helios-workspace-root.workspace = true
 nu-ansi-term = "0.50.3"
 ratatui = "0.30.0"
 rustyline = "14.0.0"

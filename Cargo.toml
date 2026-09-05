@@ -1,6 +1,6 @@
 [workspace]
 members = [
-    "aarch64", "api", "api-macro", "artifact", "cli", "compiler-abi", "compiler-plugin", "compiler-support", "hal", "i6300esb", "hosted", "kernel", "kernel-macro", "netstack", "programs/date", "programs/debugger", "programs/http-client", "programs/init", "programs/oob-load", "programs/perf", "programs/ping", "riscv", "x86", "inspector", "inspector-protocol", "virtio",
+    "aarch64", "api", "api-macro", "artifact", "cli", "compiler-abi", "compiler-plugin", "compiler-support", "hal", "i6300esb", "hosted", "kernel", "kernel-macro", "netstack", "programs/date", "programs/debugger", "programs/http-client", "programs/init", "programs/oob-load", "programs/perf", "programs/ping", "riscv", "x86", "inspector", "inspector-protocol", "virtio", "workspace-root",
 ]
 resolver = "2"
 
@@ -34,6 +34,7 @@ helios-riscv = { path = "riscv" }
 helios-kernel = { path = "kernel", default-features = false }
 helios-netstack = { path = "netstack" }
 helios-virtio = { path = "virtio" }
+helios-workspace-root = { path = "workspace-root" }
 helios-x86 = { path = "x86" }
 i6300esb = { path = "i6300esb" }
 helios = { path = "." }
