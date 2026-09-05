@@ -12,10 +12,22 @@ off it.
 The line is bound as a named chardev, and the chardev keeps a log:
 
 ```
--chardev socket,id=helios-debug-serial,path=<runtime>/debug.sock,\
+-chardev socket,id=helios-debug-serial,path=<sockets>/debug.sock,\
          server=on,wait=on,logfile=<runtime>/debug-serial.log,logappend=off
 -serial chardev:helios-debug-serial
 ```
+
+`<sockets>` is not the runtime directory. A unix socket path is bounded
+by `sockaddr_un::sun_path` — 108 bytes on Linux, 104 on macOS — and the
+runtime directory is the caller's, named for a human and nested as
+deeply as the caller likes; the benchmark suite's paired mode nests it
+per image and per workload, which is how run 33993027470 lost a lane to
+a monitor socket QEMU refused at 116 bytes. So the inspector puts
+`debug.sock`, `monitor.sock` and `qmp.sock` in a short directory of its
+own under `$XDG_RUNTIME_DIR` (or the system temporary directory) and
+links it as `<runtime>/sockets`, which is where a retained runtime
+directory says to look. A path that cannot fit even there is refused
+before QEMU starts, naming the path and the limit.
 
 `debug-serial.log` is a byte-for-byte copy of the line, written by QEMU
 as it accepts each byte, before anything on the host frames it.
