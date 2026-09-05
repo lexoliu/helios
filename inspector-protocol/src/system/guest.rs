@@ -1,5 +1,3 @@
-use std::io;
-
 use futures_io::{AsyncRead, AsyncWrite};
 use helios_api::{
     instances as host_instances, profiling as host_profiling, programs as host_programs,
@@ -7,7 +5,7 @@ use helios_api::{
 };
 
 use crate::error::DispatchError;
-use crate::wire::{Frame, read_frame, write_frame};
+use crate::system::server::{self, Dispatcher};
 
 use super::bindings::helios::system::{instances, profiling, programs, stats, tracing};
 use super::methods::{
@@ -17,99 +15,33 @@ use super::methods::{
 };
 use crate::debugger::{filesystem, programs as debugger_programs};
 
-const RESPONSE_CHUNK_BYTES: usize = 64 * 1024;
+/// The embedded debugger's dispatcher: every method it exposes,
+/// answered out of the guest's own system interfaces.
+struct SystemDispatcher;
 
-pub async fn serve<R, W>(mut read: R, mut write: W) -> Result<(), DispatchError>
+impl Dispatcher for SystemDispatcher {
+    fn supports(&self, instance: &str, func: &str) -> bool {
+        supports_request(instance, func)
+    }
+
+    async fn dispatch(
+        &self,
+        instance: &str,
+        func: &str,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, DispatchError> {
+        dispatch(instance, func, payload).await
+    }
+}
+
+/// Serves inspector RPC for the embedded debugger until the transport
+/// closes.
+pub async fn serve<R, W>(read: R, write: W) -> Result<(), DispatchError>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    loop {
-        let Some(Frame::Open {
-            invocation,
-            instance,
-            func,
-        }) = read_frame(&mut read)
-            .await
-            .map_err(|source| DispatchError::Io {
-                operation: "read debugger request frame",
-                source,
-            })?
-        else {
-            return Ok(());
-        };
-
-        if !supports_request(&instance, &func) {
-            write_frame(
-                &mut write,
-                &Frame::Reject {
-                    invocation,
-                    message: format!(
-                        "remote invocation {instance}.{func} is not exposed by the embedded debugger"
-                    ),
-                },
-            )
-            .await
-            .map_err(|source| DispatchError::Io {
-                operation: "reject unsupported debugger request",
-                source,
-            })?;
-            continue;
-        }
-
-        write_frame(&mut write, &Frame::Accept { invocation })
-            .await
-            .map_err(|source| DispatchError::Io {
-                operation: "accept debugger request stream",
-                source,
-            })?;
-        let payload = read_root_payload(&mut read, invocation).await?;
-        let response = match dispatch(&instance, &func, &payload).await {
-            Ok(response) => response,
-            Err(error) => {
-                write_frame(
-                    &mut write,
-                    &Frame::Reject {
-                        invocation,
-                        message: format!("{error}"),
-                    },
-                )
-                .await
-                .map_err(|source| DispatchError::Io {
-                    operation: "report debugger request failure",
-                    source,
-                })?;
-                continue;
-            }
-        };
-        for chunk in response.chunks(RESPONSE_CHUNK_BYTES) {
-            write_frame(
-                &mut write,
-                &Frame::Data {
-                    invocation,
-                    path: Vec::new(),
-                    payload: chunk.to_vec(),
-                },
-            )
-            .await
-            .map_err(|source| DispatchError::Io {
-                operation: "write debugger response payload",
-                source,
-            })?;
-        }
-        write_frame(
-            &mut write,
-            &Frame::Close {
-                invocation,
-                path: Vec::new(),
-            },
-        )
-        .await
-        .map_err(|source| DispatchError::Io {
-            operation: "close debugger response stream",
-            source,
-        })?;
-    }
+    server::serve(read, write, SystemDispatcher).await
 }
 
 fn supports_request(instance: &str, func: &str) -> bool {
@@ -443,67 +375,6 @@ fn convert_launch_error_kind(kind: host_programs::ExecErrorKind) -> programs::Ex
         host_programs::ExecErrorKind::OutOfMemory => programs::ExecErrorKind::OutOfMemory,
         host_programs::ExecErrorKind::Unavailable => programs::ExecErrorKind::Unavailable,
         host_programs::ExecErrorKind::Internal => programs::ExecErrorKind::Internal,
-    }
-}
-
-async fn read_root_payload<R>(read: &mut R, invocation: u32) -> Result<Vec<u8>, DispatchError>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut payload = Vec::new();
-    loop {
-        match read_frame(read).await.map_err(|source| DispatchError::Io {
-            operation: "read request payload frame",
-            source,
-        })? {
-            Some(Frame::Data {
-                invocation: frame_invocation,
-                path,
-                payload: chunk,
-            }) => {
-                if frame_invocation != invocation {
-                    return Err(DispatchError::protocol(format!(
-                        "received payload for invocation {frame_invocation} while reading {invocation}"
-                    )));
-                }
-                if !path.is_empty() {
-                    return Err(DispatchError::protocol(
-                        "nested request stream paths are unsupported in the guest debugger",
-                    ));
-                }
-                payload.extend_from_slice(&chunk);
-            }
-            Some(Frame::Close {
-                invocation: frame_invocation,
-                path,
-            }) => {
-                if frame_invocation != invocation {
-                    return Err(DispatchError::protocol(format!(
-                        "received close for invocation {frame_invocation} while reading {invocation}"
-                    )));
-                }
-                if !path.is_empty() {
-                    return Err(DispatchError::protocol(
-                        "nested request stream paths are unsupported in the guest debugger",
-                    ));
-                }
-                return Ok(payload);
-            }
-            Some(Frame::Reject { .. } | Frame::Accept { .. } | Frame::Open { .. }) => {
-                return Err(DispatchError::protocol(
-                    "unexpected control frame while reading debugger request payload",
-                ));
-            }
-            None => {
-                return Err(DispatchError::Io {
-                    operation: "read debugger request payload",
-                    source: io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "transport closed while reading debugger request payload",
-                    ),
-                });
-            }
-        }
     }
 }
 

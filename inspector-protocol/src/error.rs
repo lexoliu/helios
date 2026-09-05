@@ -132,7 +132,9 @@ impl RpcError {
 }
 
 /// Server-side dispatch error used by the in-debugger guest implementation.
-#[cfg(feature = "guest")]
+///
+/// Not gated on the `guest` feature: the RPC server loop that raises it
+/// is generic over its dispatcher, and the host build tests that loop.
 #[derive(Debug, Error)]
 pub enum DispatchError {
     #[error("failed to encode {operation} response: {source}")]
@@ -166,7 +168,6 @@ pub enum DispatchError {
     },
 }
 
-#[cfg(feature = "guest")]
 impl DispatchError {
     pub fn protocol(message: impl Into<String>) -> Self {
         Self::Protocol {
