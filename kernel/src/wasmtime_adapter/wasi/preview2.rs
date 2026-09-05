@@ -878,6 +878,11 @@ impl Pollable for TcpSocket {
     /// readiness has to cover every in-flight operation, not just connect.
     async fn ready(&mut self) {
         loop {
+            // Armed before the socket state is read: a background
+            // connect/listen/accept broadcasts its result to every
+            // pollable and banks nothing, so a wait created after the
+            // task finished would park until the next operation.
+            let settled = self.ready.notified();
             {
                 let state = self.inner.lock();
                 let in_flight = state.connect_in_progress
@@ -887,7 +892,7 @@ impl Pollable for TcpSocket {
                     return;
                 }
             }
-            self.ready.notified().await;
+            settled.await;
         }
     }
 }

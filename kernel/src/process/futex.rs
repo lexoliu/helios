@@ -122,6 +122,10 @@ impl FutexTable {
         }
     }
 
+    /// Wakes at most `count` of the key's waiters.
+    ///
+    /// The permits are stored, so a waiter that has registered through
+    /// [`Self::prepare_wait`] but has not parked yet still claims one.
     pub fn wake(&self, key: FutexKey, count: usize) -> usize {
         let Some(entry) = self.entries.get(&key) else {
             return 0;
@@ -131,6 +135,13 @@ impl FutexTable {
         wake_count
     }
 
+    /// Wakes every waiter parked on the key.
+    ///
+    /// This is a broadcast and stores no permit: a waiter that arrives
+    /// after it has to park, exactly as a futex requires. Waiters arm
+    /// their wait before they compare the guest word, which is what
+    /// keeps a wake between the comparison and the park from being
+    /// lost.
     pub fn wake_all(&self, key: FutexKey) -> usize {
         let Some(entry) = self.entries.get(&key) else {
             return 0;
@@ -142,7 +153,7 @@ impl FutexTable {
 
 #[cfg(test)]
 mod tests {
-    use futures_lite::future::block_on;
+    use futures_lite::future::{block_on, poll_once};
 
     use super::{
         FUTEX_TABLE_INITIAL_CAPACITY, FutexKey, FutexTable, GuestAddress, ProcessMemoryIdentity,
@@ -194,12 +205,33 @@ mod tests {
         let mut table = FutexTable::new();
         let first = table.prepare_wait(key(1, 0x1000));
         let second = table.prepare_wait(key(1, 0x1000));
+        // Both waits are armed before the wake, as the guest-facing wait
+        // path arms before it compares the futex word.
+        let first_wait = first.notify().notified();
+        let second_wait = second.notify().notified();
 
         assert_eq!(table.wake_all(key(1, 0x1000)), 2);
 
-        block_on(first.notify().notified());
-        block_on(second.notify().notified());
+        block_on(first_wait);
+        block_on(second_wait);
         table.complete_wait(first);
         table.complete_wait(second);
+    }
+
+    /// A wake-all is a broadcast, not a permit bank: a waiter that
+    /// arrives after it has to park, or every futex wait that follows a
+    /// wake on the same key returns without ever blocking.
+    #[test]
+    fn a_wait_that_follows_wake_all_still_parks() {
+        let mut table = FutexTable::new();
+        let registration = table.prepare_wait(key(1, 0x1000));
+
+        assert_eq!(table.wake_all(key(1, 0x1000)), 1);
+
+        assert!(
+            block_on(poll_once(registration.notify().notified())).is_none(),
+            "a futex wait armed after the wake has nothing to consume"
+        );
+        table.complete_wait(registration);
     }
 }

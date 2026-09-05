@@ -274,9 +274,16 @@ impl SwapFaultReply {
         }
     }
 
+    /// Publishes the outcome and releases the faulting fiber.
+    ///
+    /// A reply has exactly one consumer — the fiber parked in
+    /// [`SwapHandle::fault_in`] — so this is a level-triggered
+    /// single-consumer wake, not a broadcast: the permit is stored
+    /// whether or not that fiber has parked yet, and the settled
+    /// outcome is what the fiber re-reads when it wakes.
     fn settle(&self, outcome: u8) {
         self.outcome.store(outcome, Ordering::Release);
-        self.ready.notify_all();
+        self.ready.notify_one_coalesced();
     }
 
     fn read(&self) -> Option<Result<(), SwapFaultError>> {

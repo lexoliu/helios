@@ -118,6 +118,11 @@ impl<M> ProviderSender<M> {
     pub async fn send(&self, message: M) -> Result<(), ProviderError> {
         let mut message = message;
         loop {
+            // Armed before the push: the receiver's close broadcast is
+            // not banked, so a receiver dropped between a full push and
+            // the park would otherwise leave this sender asleep with no
+            // further `room` notification ever coming.
+            let room = self.channel.room.notified();
             match self.channel.queue.push(message) {
                 Ok(()) => {
                     self.channel.ready.notify_one();
@@ -125,7 +130,7 @@ impl<M> ProviderSender<M> {
                 }
                 Err(PushError::Full(returned)) => {
                     message = returned;
-                    self.channel.room.notified().await;
+                    room.await;
                 }
                 Err(PushError::Closed(_)) => return Err(ProviderError::Closed),
             }

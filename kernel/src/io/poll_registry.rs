@@ -1,5 +1,7 @@
 extern crate alloc;
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use hashbrown::HashMap;
 use thiserror::Error;
 use triomphe::Arc;
@@ -42,10 +44,23 @@ impl PollKey {
     }
 }
 
+/// Readiness of one registered source, shared by the registry and every
+/// clone of its registration.
+///
+/// The flag is the level and the notification is the edge:
+/// [`PollRegistry::mark_ready`] publishes the flag and then broadcasts.
+/// A broadcast banks nothing, so a waiter arms on it *before* it reads
+/// the flag; a `mark_ready` landing between the two completes the wait
+/// it just missed instead of being lost.
+struct PollState {
+    ready: AtomicBool,
+    notify: Notify,
+}
+
 #[derive(Clone)]
 pub struct PollRegistration {
     key: PollKey,
-    notify: Arc<Notify>,
+    state: Arc<PollState>,
 }
 
 impl PollRegistration {
@@ -53,8 +68,16 @@ impl PollRegistration {
         self.key
     }
 
+    /// Resolves once the source is ready, and immediately when it
+    /// already is.
     pub async fn ready(&self) {
-        self.notify.notified().await;
+        loop {
+            let notified = self.state.notify.notified();
+            if self.state.ready.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
     }
 }
 
@@ -67,8 +90,7 @@ pub enum PollRegistryError {
 }
 
 struct PollEntry {
-    ready: bool,
-    notify: Arc<Notify>,
+    state: Arc<PollState>,
 }
 
 #[derive(Default)]
@@ -90,31 +112,36 @@ impl PollRegistry {
                 id: key.id(),
             });
         }
-        let notify = Arc::new(Notify::new());
+        let state = Arc::new(PollState {
+            ready: AtomicBool::new(false),
+            notify: Notify::new(),
+        });
         self.entries.insert(
             key,
             PollEntry {
-                ready: false,
-                notify: notify.clone(),
+                state: state.clone(),
             },
         );
-        Ok(PollRegistration { key, notify })
+        Ok(PollRegistration { key, state })
     }
 
     pub fn mark_ready(&mut self, key: PollKey) -> Result<(), PollRegistryError> {
         let entry = self.entry_mut(key)?;
-        entry.ready = true;
-        entry.notify.notify_all();
+        entry.state.ready.store(true, Ordering::Release);
+        entry.state.notify.notify_all();
         Ok(())
     }
 
     pub fn clear_ready(&mut self, key: PollKey) -> Result<(), PollRegistryError> {
-        self.entry_mut(key)?.ready = false;
+        self.entry_mut(key)?
+            .state
+            .ready
+            .store(false, Ordering::Release);
         Ok(())
     }
 
     pub fn is_ready(&self, key: PollKey) -> Result<bool, PollRegistryError> {
-        Ok(self.entry(key)?.ready)
+        Ok(self.entry(key)?.state.ready.load(Ordering::Acquire))
     }
 
     pub fn remove(&mut self, key: PollKey) -> Result<(), PollRegistryError> {
@@ -187,5 +214,30 @@ mod tests {
             registry.mark_ready(key).unwrap();
             registration.ready().await;
         });
+    }
+
+    /// Readiness is a level, not a permit: a registration that is not
+    /// ready parks, and one that is ready resolves however many times it
+    /// is asked.
+    #[test]
+    fn registration_wait_parks_until_the_source_is_ready() {
+        let mut registry = PollRegistry::new();
+        let key = PollKey::new(PollSourceKind::SOCKET, 3);
+        let registration = registry.register(key).unwrap();
+
+        assert!(
+            futures_lite::future::block_on(futures_lite::future::poll_once(registration.ready()))
+                .is_none()
+        );
+
+        registry.mark_ready(key).unwrap();
+        futures_lite::future::block_on(registration.ready());
+        futures_lite::future::block_on(registration.clone().ready());
+
+        registry.clear_ready(key).unwrap();
+        assert!(
+            futures_lite::future::block_on(futures_lite::future::poll_once(registration.ready()))
+                .is_none()
+        );
     }
 }
