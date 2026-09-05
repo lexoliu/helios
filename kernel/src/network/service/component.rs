@@ -310,82 +310,70 @@ where
         NetworkService::hardware_address(self)
     }
 
-    fn ipv4_cidr(&self) -> impl core::future::Future<Output = Option<crate::Ipv4Cidr>> + Send + '_ {
-        async move { NetworkService::ipv4_cidr(self).await }
+    async fn ipv4_cidr(&self) -> Option<crate::Ipv4Cidr> {
+        NetworkService::ipv4_cidr(self).await
     }
 
-    fn ping<'a>(
+    async fn ping<'a>(&'a self, host: &'a str, timeout_nanos: u64) -> Result<PingReply, PingError> {
+        NetworkService::ping(self, host, timeout_nanos).await
+    }
+
+    async fn dns_resolve<'a>(
         &'a self,
         host: &'a str,
         timeout_nanos: u64,
-    ) -> impl core::future::Future<Output = Result<PingReply, PingError>> + Send + 'a {
-        async move { NetworkService::ping(self, host, timeout_nanos).await }
+    ) -> Result<Vec<NetworkIpAddress>, DnsError> {
+        NetworkService::dns_resolve(self, host, timeout_nanos).await
     }
 
-    fn dns_resolve<'a>(
-        &'a self,
-        host: &'a str,
-        timeout_nanos: u64,
-    ) -> impl core::future::Future<Output = Result<Vec<NetworkIpAddress>, DnsError>> + Send + 'a
-    {
-        async move { NetworkService::dns_resolve(self, host, timeout_nanos).await }
-    }
-
-    fn tcp_connect<'a>(
+    async fn tcp_connect<'a>(
         &'a self,
         host: &'a str,
         port: u16,
         timeout_nanos: u64,
-    ) -> impl core::future::Future<Output = Result<Self::TcpStream, TcpError>> + Send + 'a {
-        async move { NetworkService::tcp_connect(self, host, port, timeout_nanos).await }
+    ) -> Result<Self::TcpStream, TcpError> {
+        NetworkService::tcp_connect(self, host, port, timeout_nanos).await
     }
 
-    fn tcp_connect_from<'a>(
+    async fn tcp_connect_from<'a>(
         &'a self,
         host: &'a str,
         port: u16,
         local_port: u16,
         hop_limit: u8,
         timeout_nanos: u64,
-    ) -> impl core::future::Future<Output = Result<Self::TcpStream, TcpError>> + Send + 'a {
-        async move {
-            NetworkService::tcp_connect_from(self, host, port, local_port, hop_limit, timeout_nanos)
-                .await
-        }
+    ) -> Result<Self::TcpStream, TcpError> {
+        NetworkService::tcp_connect_from(self, host, port, local_port, hop_limit, timeout_nanos)
+            .await
     }
 
-    fn tcp_connect_address(
+    async fn tcp_connect_address(
         &self,
         remote_address: NetworkIpAddress,
         port: u16,
         local_port: u16,
         hop_limit: u8,
         timeout_nanos: u64,
-    ) -> impl core::future::Future<Output = Result<Self::TcpStream, TcpError>> + Send + '_ {
-        async move {
-            NetworkService::tcp_connect_address(
-                self,
-                remote_address,
-                port,
-                local_port,
-                hop_limit,
-                timeout_nanos,
-            )
-            .await
-        }
+    ) -> Result<Self::TcpStream, TcpError> {
+        NetworkService::tcp_connect_address(
+            self,
+            remote_address,
+            port,
+            local_port,
+            hop_limit,
+            timeout_nanos,
+        )
+        .await
     }
 
-    fn tcp_listen(
+    async fn tcp_listen(
         &self,
         local_address: NetworkIpAddress,
         local_port: u16,
         backlog: u16,
         hop_limit: u8,
-    ) -> impl core::future::Future<Output = Result<TcpListener<Self::TcpListener>, TcpError>> + Send + '_
-    {
-        async move {
-            NetworkService::tcp_listen(self, local_address, local_port, backlog, hop_limit).await
-        }
+    ) -> Result<TcpListener<Self::TcpListener>, TcpError> {
+        NetworkService::tcp_listen(self, local_address, local_port, backlog, hop_limit).await
     }
 
     fn tcp_set_hop_limit(&self, stream: Self::TcpStream, hop_limit: u8) -> Result<(), TcpError> {
@@ -400,92 +388,75 @@ where
         NetworkService::tcp_listener_set_hop_limit(self, listener, hop_limit)
     }
 
-    fn tcp_accept(
+    async fn tcp_accept(
         &self,
         listener: Self::TcpListener,
         timeout_nanos: u64,
-    ) -> impl core::future::Future<Output = Result<TcpAccepted<Self::TcpStream>, TcpError>> + Send + '_
-    {
-        async move { NetworkService::tcp_accept(self, listener, timeout_nanos).await }
+    ) -> Result<TcpAccepted<Self::TcpStream>, TcpError> {
+        NetworkService::tcp_accept(self, listener, timeout_nanos).await
     }
 
-    fn tcp_readiness(
-        &self,
-        stream: Self::TcpStream,
-    ) -> impl core::future::Future<Output = Result<SocketReadiness, TcpError>> + Send + '_ {
-        async move { NetworkService::tcp_readiness(self, stream).await }
+    async fn tcp_readiness(&self, stream: Self::TcpStream) -> Result<SocketReadiness, TcpError> {
+        NetworkService::tcp_readiness(self, stream).await
     }
 
-    fn tcp_listener_readiness(
+    async fn tcp_listener_readiness(
         &self,
         listener: Self::TcpListener,
-    ) -> impl core::future::Future<Output = Result<SocketReadiness, TcpError>> + Send + '_ {
-        async move { NetworkService::tcp_listener_readiness(self, listener).await }
+    ) -> Result<SocketReadiness, TcpError> {
+        NetworkService::tcp_listener_readiness(self, listener).await
     }
 
-    fn udp_readiness(
-        &self,
-        socket: Self::UdpSocket,
-    ) -> impl core::future::Future<Output = Result<SocketReadiness, UdpError>> + Send + '_ {
-        async move { NetworkService::udp_readiness(self, socket).await }
+    async fn udp_readiness(&self, socket: Self::UdpSocket) -> Result<SocketReadiness, UdpError> {
+        NetworkService::udp_readiness(self, socket).await
     }
 
-    fn tcp_write_all<'a>(
+    async fn tcp_write_all<'a>(
         &'a self,
         stream: Self::TcpStream,
         bytes: &'a [u8],
         timeout_nanos: u64,
-    ) -> impl core::future::Future<Output = Result<(), TcpError>> + Send + 'a {
-        async move { NetworkService::tcp_write_all(self, stream, bytes, timeout_nanos).await }
+    ) -> Result<(), TcpError> {
+        NetworkService::tcp_write_all(self, stream, bytes, timeout_nanos).await
     }
 
-    fn tcp_write_all_bytes<'a>(
-        &'a self,
+    async fn tcp_write_all_bytes(
+        &self,
         stream: Self::TcpStream,
         bytes: Bytes,
         timeout_nanos: u64,
-    ) -> impl core::future::Future<Output = Result<(), TcpError>> + Send + 'a {
-        async move { NetworkService::tcp_write_all_bytes(self, stream, bytes, timeout_nanos).await }
+    ) -> Result<(), TcpError> {
+        NetworkService::tcp_write_all_bytes(self, stream, bytes, timeout_nanos).await
     }
 
-    fn tcp_read<'a>(
-        &'a self,
+    async fn tcp_read(
+        &self,
         stream: Self::TcpStream,
         max_bytes: u32,
         timeout_nanos: u64,
-    ) -> impl core::future::Future<Output = Result<Option<Bytes>, TcpError>> + Send + 'a {
-        async move { NetworkService::tcp_read(self, stream, max_bytes, timeout_nanos).await }
+    ) -> Result<Option<Bytes>, TcpError> {
+        NetworkService::tcp_read(self, stream, max_bytes, timeout_nanos).await
     }
 
-    fn tcp_read_into<'a>(
+    async fn tcp_read_into<'a>(
         &'a self,
         stream: Self::TcpStream,
         buffer: RegisteredTcpReadBuffer<'a>,
         timeout_nanos: u64,
-    ) -> impl core::future::Future<Output = Result<Option<usize>, TcpError>> + Send + 'a {
-        async move { NetworkService::tcp_read_into(self, stream, buffer, timeout_nanos).await }
+    ) -> Result<Option<usize>, TcpError> {
+        NetworkService::tcp_read_into(self, stream, buffer, timeout_nanos).await
     }
 
-    fn tcp_shutdown_send(
-        &self,
-        stream: Self::TcpStream,
-    ) -> impl core::future::Future<Output = Result<(), TcpError>> + Send + '_ {
-        async move { NetworkService::tcp_shutdown_send(self, stream).await }
+    async fn tcp_shutdown_send(&self, stream: Self::TcpStream) -> Result<(), TcpError> {
+        NetworkService::tcp_shutdown_send(self, stream).await
     }
 
-    fn tcp_close(
-        &self,
-        stream: Self::TcpStream,
-    ) -> impl core::future::Future<Output = ()> + Send + '_ {
-        async move { NetworkService::tcp_close(self, stream).await }
+    async fn tcp_close(&self, stream: Self::TcpStream) {
+        NetworkService::tcp_close(self, stream).await
     }
 
-    fn udp_bind(
-        &self,
-        local_port: u16,
-    ) -> impl core::future::Future<Output = Result<UdpBinding<Self::UdpSocket>, UdpError>> + Send + '_
-    {
-        async move { NetworkService::udp_bind(self, local_port).await }
+    async fn udp_bind(&self, local_port: u16) -> Result<UdpBinding<Self::UdpSocket>, UdpError> {
+        NetworkService::udp_bind(self, local_port).await
     }
 
     fn udp_connect(
@@ -505,68 +476,56 @@ where
         NetworkService::udp_set_hop_limit(self, socket, hop_limit)
     }
 
-    fn udp_send<'a>(
+    async fn udp_send<'a>(
         &'a self,
         socket: Self::UdpSocket,
         host: &'a str,
         port: u16,
         bytes: &'a [u8],
         timeout_nanos: u64,
-    ) -> impl core::future::Future<Output = Result<u64, UdpError>> + Send + 'a {
-        async move { NetworkService::udp_send(self, socket, host, port, bytes, timeout_nanos).await }
+    ) -> Result<u64, UdpError> {
+        NetworkService::udp_send(self, socket, host, port, bytes, timeout_nanos).await
     }
 
-    fn udp_send_address<'a>(
+    async fn udp_send_address<'a>(
         &'a self,
         socket: Self::UdpSocket,
         remote_address: NetworkIpAddress,
         port: u16,
         bytes: &'a [u8],
         timeout_nanos: u64,
-    ) -> impl core::future::Future<Output = Result<u64, UdpError>> + Send + 'a {
-        async move {
-            NetworkService::udp_send_address(
-                self,
-                socket,
-                remote_address,
-                port,
-                bytes,
-                timeout_nanos,
-            )
+    ) -> Result<u64, UdpError> {
+        NetworkService::udp_send_address(self, socket, remote_address, port, bytes, timeout_nanos)
             .await
-        }
     }
 
-    fn udp_receive<'a>(
-        &'a self,
+    async fn udp_receive(
+        &self,
         socket: Self::UdpSocket,
         max_bytes: u32,
         timeout_nanos: u64,
-    ) -> impl core::future::Future<Output = Result<Option<UdpDatagram>, UdpError>> + Send + 'a {
-        async move { NetworkService::udp_receive(self, socket, max_bytes, timeout_nanos).await }
+    ) -> Result<Option<UdpDatagram>, UdpError> {
+        NetworkService::udp_receive(self, socket, max_bytes, timeout_nanos).await
     }
 
-    fn udp_join_multicast_v4(
+    async fn udp_join_multicast_v4(
         &self,
         group: KernelIpv4Address,
         interface: KernelIpv4Address,
-    ) -> impl core::future::Future<Output = Result<(), UdpError>> + Send + '_ {
-        async move { NetworkService::udp_join_multicast_v4(self, group, interface).await }
+    ) -> Result<(), UdpError> {
+        NetworkService::udp_join_multicast_v4(self, group, interface).await
     }
 
-    fn udp_leave_multicast_v4(
+    async fn udp_leave_multicast_v4(
         &self,
         group: KernelIpv4Address,
         interface: KernelIpv4Address,
-    ) -> impl core::future::Future<Output = Result<(), UdpError>> + Send + '_ {
-        async move { NetworkService::udp_leave_multicast_v4(self, group, interface).await }
+    ) -> Result<(), UdpError> {
+        NetworkService::udp_leave_multicast_v4(self, group, interface).await
     }
 
-    fn udp_close(
-        &self,
-        socket: Self::UdpSocket,
-    ) -> impl core::future::Future<Output = ()> + Send + '_ {
-        async move { NetworkService::udp_close(self, socket).await }
+    async fn udp_close(&self, socket: Self::UdpSocket) {
+        NetworkService::udp_close(self, socket).await
     }
 }
 

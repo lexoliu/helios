@@ -130,23 +130,19 @@ where
 {
     type Error = wasmtime::Error;
 
-    fn run(
-        mut self,
-    ) -> impl core::future::Future<Output = Result<ComponentRunResult, Self::Error>> + Send {
-        async move {
-            let run = self.run_func;
-            let raw = self
-                .store
-                .run_concurrent(async move |accessor| run.call_concurrent(accessor, ()).await)
-                .await;
-            let (status, exit_code) = interpret_run_result(raw, self.store.data_mut())?;
-            let instance_id = self.store.data().instance().id();
-            Ok(ComponentRunResult {
-                status,
-                exit_code,
-                instance_id,
-            })
-        }
+    async fn run(mut self) -> Result<ComponentRunResult, Self::Error> {
+        let run = self.run_func;
+        let raw = self
+            .store
+            .run_concurrent(async move |accessor| run.call_concurrent(accessor, ()).await)
+            .await;
+        let (status, exit_code) = interpret_run_result(raw, self.store.data_mut())?;
+        let instance_id = self.store.data().instance().id();
+        Ok(ComponentRunResult {
+            status,
+            exit_code,
+            instance_id,
+        })
     }
 }
 
