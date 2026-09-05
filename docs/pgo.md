@@ -86,6 +86,21 @@ describe without freezing the guest. The profile is therefore a
 counter profile: `llvm-profdata` reads it, `-C profile-use` consumes it,
 and the one optimisation it cannot drive is indirect-call promotion.
 
+#### What it costs
+
+Measured on the pinned toolchain, booting each instrumented kernel to the
+debugger and collecting straight away:
+
+| Target | Instrumented functions | Counters | Raw profile |
+| --- | --- | --- | --- |
+| `aarch64-unknown-none` | 49,874 | 267,889 | 6,147,776 B |
+| `x86_64-unknown-none` | 43,065 | 246,687 | 5,580,768 B |
+| `riscv64gc-unknown-none-elf` | 41,675 | 246,376 | 5,403,776 B |
+
+The counters are a fixed cost on every instrumented boot — a little over
+two megabytes of link-time memory — and the profile is small enough to walk
+out over the RPC in a few seconds.
+
 #### The runtime, in `kernel/src/profiling`
 
 `__llvm_profile_runtime` is defined there — a definition is all any
