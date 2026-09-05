@@ -171,6 +171,11 @@ def selected_workloads(
     if not selected:
         raise SystemExit("workload selection matched no manifest entries")
     for name in names:
+        # A name asked for and skipped in the same breath is skipped: the
+        # caller names every workload it wants and then subtracts the ones
+        # this side cannot compare, and the subtraction has to win.
+        if name in skipped:
+            continue
         if not any(workload["name"] == name for workload in selected):
             raise SystemExit(f"unknown or filtered workload {name}")
     return selected
@@ -1644,7 +1649,13 @@ def write_report(
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
+    """This driver's command line.
+
+    Built apart from `main` so the argv `helios-bench` emits can be parsed
+    by the very parser that will receive it: the two are edited together
+    and otherwise only meet forty minutes into a lane.
+    """
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", type=Path, default=repo_root() / "tools/wasi-apps/workloads.json")
     parser.add_argument("--iterations", type=int, default=5)
@@ -1745,7 +1756,11 @@ def main() -> None:
         default=DEFAULT_HELIOS_TIMEOUT_SECONDS,
         help="Maximum wall-clock seconds for each isolated Helios VM workload command.",
     )
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
 
     if args.iterations <= 0:
         raise SystemExit("--iterations must be a positive integer")
