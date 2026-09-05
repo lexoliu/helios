@@ -34,6 +34,7 @@ i6300esb = { path = "i6300esb" }
 helios = { path = "." }
 tracing = { version = "0.1.44",  default-features = false }
 wit-bindgen = { version = "0.53.0", default-features = false }
+tempfile = "3.23.0"
 
 
 [target.'cfg(not(target_os = "none"))'.dependencies]

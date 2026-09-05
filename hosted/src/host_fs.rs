@@ -390,44 +390,21 @@ fn read_link_impl(path: &Path) -> Result<String, HostFsError> {
 mod tests {
     use core::future::Future;
 
-    use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use tempfile::TempDir;
 
     use helios_kernel::HostFileSystem;
 
     use super::HostedFileSystem;
 
-    struct TestRoot {
-        path: PathBuf,
+    fn test_root() -> TempDir {
+        tempfile::Builder::new()
+            .prefix("helios-hosted-fs-")
+            .tempdir()
+            .expect("test root must be created")
     }
 
-    impl TestRoot {
-        fn new() -> Self {
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system clock must be after the Unix epoch")
-                .as_nanos();
-            let path = std::env::temp_dir()
-                .join(format!("helios-hosted-fs-{}-{nanos}", std::process::id()));
-            std::fs::create_dir(&path).expect("test root must be created");
-            Self { path }
-        }
-
-        fn filesystem(&self) -> HostedFileSystem {
-            HostedFileSystem::new(self.path.clone())
-        }
-    }
-
-    impl Drop for TestRoot {
-        fn drop(&mut self) {
-            if let Err(error) = std::fs::remove_dir_all(&self.path) {
-                tracing::warn!(
-                    path = %self.path.display(),
-                    ?error,
-                    "failed to remove hosted filesystem test root"
-                );
-            }
-        }
+    fn filesystem(root: &TempDir) -> HostedFileSystem {
+        HostedFileSystem::new(root.path().to_path_buf())
     }
 
     fn run_hosted_fs_test(test: impl Future<Output = ()> + Send + 'static) {
@@ -440,10 +417,10 @@ mod tests {
     #[test]
     fn hosted_filesystem_supports_links() {
         run_hosted_fs_test(async {
-            let root = TestRoot::new();
-            std::fs::write(root.path.join("source"), b"payload")
+            let root = test_root();
+            std::fs::write(root.path().join("source"), b"payload")
                 .expect("source file must be written");
-            let filesystem = root.filesystem();
+            let filesystem = filesystem(&root);
 
             filesystem
                 .hard_link("source", "hard")
@@ -473,10 +450,10 @@ mod tests {
         run_hosted_fs_test(async {
             use std::os::unix::fs::MetadataExt;
 
-            let root = TestRoot::new();
-            std::fs::write(root.path.join("source"), b"payload")
+            let root = test_root();
+            std::fs::write(root.path().join("source"), b"payload")
                 .expect("source file must be written");
-            let filesystem = root.filesystem();
+            let filesystem = filesystem(&root);
 
             filesystem
                 .set_times("source", Some(1_500_000_002), Some(2_000_000_003))
@@ -484,7 +461,7 @@ mod tests {
                 .expect("times must be set");
 
             let metadata =
-                std::fs::metadata(root.path.join("source")).expect("metadata must be read");
+                std::fs::metadata(root.path().join("source")).expect("metadata must be read");
             assert_eq!(metadata.atime(), 1);
             assert_eq!(metadata.atime_nsec(), 500_000_002);
             assert_eq!(metadata.mtime(), 2);
@@ -498,9 +475,9 @@ mod tests {
     #[test]
     fn hosted_filesystem_appends_at_the_current_end_of_file() {
         run_hosted_fs_test(async {
-            let root = TestRoot::new();
-            std::fs::write(root.path.join("log"), b"first").expect("seed file must be written");
-            let filesystem = root.filesystem();
+            let root = test_root();
+            std::fs::write(root.path().join("log"), b"first").expect("seed file must be written");
+            let filesystem = filesystem(&root);
 
             let offset = filesystem
                 .append_file("log", b"-second")
@@ -513,7 +490,7 @@ mod tests {
                 .await
                 .expect("second append must succeed");
 
-            let contents = std::fs::read(root.path.join("log")).expect("file must be readable");
+            let contents = std::fs::read(root.path().join("log")).expect("file must be readable");
             assert_eq!(contents, b"first-second-third");
         });
     }
@@ -524,9 +501,9 @@ mod tests {
     #[test]
     fn hosted_filesystem_syncs_files_and_reports_missing_ones() {
         run_hosted_fs_test(async {
-            let root = TestRoot::new();
-            std::fs::write(root.path.join("data"), b"payload").expect("file must be written");
-            let filesystem = root.filesystem();
+            let root = test_root();
+            std::fs::write(root.path().join("data"), b"payload").expect("file must be written");
+            let filesystem = filesystem(&root);
 
             filesystem
                 .sync_file("data")
@@ -549,11 +526,11 @@ mod tests {
     #[test]
     fn hosted_filesystem_stat_carries_identity_links_and_timestamps() {
         run_hosted_fs_test(async {
-            let root = TestRoot::new();
-            std::fs::write(root.path.join("source"), b"payload").expect("file must be written");
-            std::fs::hard_link(root.path.join("source"), root.path.join("alias"))
+            let root = test_root();
+            std::fs::write(root.path().join("source"), b"payload").expect("file must be written");
+            std::fs::hard_link(root.path().join("source"), root.path().join("alias"))
                 .expect("hard link must be created");
-            let filesystem = root.filesystem();
+            let filesystem = filesystem(&root);
             filesystem
                 .set_times("source", Some(1_500_000_002), Some(2_000_000_003))
                 .await
@@ -583,8 +560,8 @@ mod tests {
     #[test]
     fn hosted_filesystem_rejects_parent_components() {
         run_hosted_fs_test(async {
-            let root = TestRoot::new();
-            let filesystem = root.filesystem();
+            let root = test_root();
+            let filesystem = filesystem(&root);
 
             let error = filesystem
                 .read_file("../outside")
