@@ -114,7 +114,10 @@ use riscv::interrupt::Trap;
 use riscv::interrupt::supervisor::{Exception, Interrupt};
 use riscv_rt::entry;
 use spin::Once;
-use trapframe::TrapFrame;
+
+mod trap;
+
+pub use trap::{GeneralRegs, TrapFrame};
 
 global_asm!(include_str!("mp_hook.S"));
 global_asm!(include_str!("secondary_entry.S"));
@@ -293,7 +296,8 @@ struct HartRuntime {
 impl HartRuntime {
     /// Publishes this runtime as the hart's identity.
     ///
-    /// `trapframe` owns `sscratch`, so hart-local runtime state lives in `tp`.
+    /// Hart-local runtime state lives in `tp`, which the trap entry saves
+    /// and restores with the rest of the integer file.
     /// This keeps trap entry correct while still giving the kernel a cheap
     /// per-hart lookup path. The hart already carried a bootstrapping identity
     /// in `tp`; this replaces it, and both forms are distinguishable, so the
@@ -498,9 +502,9 @@ extern "C" fn secondary_start_rust(hart_id: usize, fdt_addr: usize) -> ! {
     run_hart(hart_id, fdt_addr)
 }
 
+/// The Rust half of the supervisor trap entry in `trap.S`.
 #[unsafe(no_mangle)]
-#[unsafe(link_section = ".trap.rust")]
-extern "C" fn trap_handler(tf: &mut TrapFrame) {
+extern "C" fn __helios_riscv_trap_dispatch(tf: &mut TrapFrame) {
     trap_dispatch(tf);
 }
 
@@ -944,12 +948,16 @@ extern "C" fn wasmtime_init_traps(handler: KernelNativeTrapHandler) -> i32 {
 
 unsafe fn configure_interrupts() {
     unsafe {
-        trapframe::init();
+        trap::install_trap_vector();
         riscv::register::sie::set_ssoft();
         riscv::register::sie::set_stimer();
         riscv::register::sie::set_sext();
         riscv::register::sstatus::set_sie();
     }
+    // The entry is live from here, so this is the first moment the hart can
+    // prove it round-trips the floating-point file. §3.4: every hart proves
+    // it for itself, because `FS` and the trap vector are per-hart state.
+    trap::verify_trap_preserves_fp_state();
 }
 
 fn handle_exception(exception: Exception, tf: &TrapFrame) -> ! {
