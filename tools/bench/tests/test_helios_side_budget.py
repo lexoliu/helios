@@ -72,11 +72,9 @@ def records(log: Path) -> dict[str, dict]:
     }
 
 
-def test_a_class_that_never_answers_is_killed_and_the_side_continues(driver, tmp_path) -> None:
-    out_dir = tmp_path / "out"
+def run_side(driver, out_dir: Path, per_class: int, side: int) -> tuple[Path, float]:
     out_dir.mkdir()
     started = time.monotonic()
-
     log = driver.run_helios(
         Path("tools/wasi-apps/workloads.json"),
         out_dir,
@@ -88,14 +86,21 @@ def test_a_class_that_never_answers_is_killed_and_the_side_continues(driver, tmp
         None,
         None,
         None,
-        timeout_seconds=60,
-        side_timeout_seconds=6,
+        timeout_seconds=per_class,
+        side_timeout_seconds=side,
         control_workload=None,
         keep_going=True,
     )
-    elapsed = time.monotonic() - started
+    return log, time.monotonic() - started
 
-    assert elapsed < 6, "the side must not outlive its own budget"
+
+def test_a_class_that_never_answers_is_killed_and_the_side_continues(driver, tmp_path) -> None:
+    # A per-class cap well inside the side's budget: what is under test
+    # is that the class is killed on its own deadline and the side keeps
+    # going, not how the budget is shared.
+    log, elapsed = run_side(driver, tmp_path / "out", per_class=2, side=120)
+
+    assert elapsed < 60, "a killed class must not be waited on"
 
     written = records(log)
     assert written["quickjs-loop"]["type"] == "summary"
@@ -109,6 +114,18 @@ def test_a_class_that_never_answers_is_killed_and_the_side_continues(driver, tmp
     wedge_pid = int((tmp_path / "wedge.pid").read_text(encoding="utf-8").strip())
     with pytest.raises(ProcessLookupError):
         os.kill(wedge_pid, 0)
+
+
+def test_a_spent_budget_boots_no_further_guest(driver, tmp_path) -> None:
+    # The side's budget is a cap, not a target: with none of it left, a
+    # class is a stated failure rather than another boot.
+    log, elapsed = run_side(driver, tmp_path / "out", per_class=120, side=1)
+
+    assert elapsed < 30
+    written = records(log)
+    assert {record["type"] for record in written.values()} == {"failure"}
+    assert all("budget was spent" in record["error"] for record in written.values())
+    assert not (tmp_path / "wedge.pid").exists(), "no guest may be booted on a spent budget"
 
 
 def test_the_budget_is_shared_out_as_the_classes_run(driver) -> None:
