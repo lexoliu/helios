@@ -197,16 +197,6 @@ impl NetworkDevice for VirtioNetworkDevice {
         self.inner.try_receive_frame().await
     }
 
-    fn try_receive_frames_immediate<'a, 'slots>(
-        &'a self,
-        frames: &'slots mut [Option<helios_virtio::RxFrame>],
-    ) -> Result<Option<usize>, IoError>
-    where
-        'a: 'slots,
-    {
-        self.inner.try_receive_frames_immediate(frames)
-    }
-
     async fn repost_rx_frame(&self, frame: helios_virtio::RxFrame) -> Result<(), IoError> {
         self.inner.repost_rx_frame(frame).await
     }

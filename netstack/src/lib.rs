@@ -550,22 +550,13 @@ pub trait NetworkInterface: Clone + Send + Sync + 'static {
     /// Attempts to receive one frame as an owning device buffer.
     fn try_receive_frame(&self) -> impl Future<Output = IoResult<Option<RxFrame>>> + Send;
 
-    /// Attempts to receive owning device buffers without waiting for any async lock or event.
-    fn try_receive_frames_immediate<'a, 'slots>(
-        &'a self,
-        frames: &'slots mut [Option<RxFrame>],
-    ) -> IoResult<Option<usize>>
-    where
-        'a: 'slots,
-    {
-        let _ = frames;
-        Ok(None)
-    }
-
-    /// Variant of `try_receive_frames_immediate` that drains a specific
-    /// RX queue pair so per-processor pollers do not contend on the
-    /// other pairs. Defaults to the all-pairs path for single-queue
-    /// devices.
+    /// Attempts to receive owning device buffers from one RX queue pair
+    /// without waiting for any async lock or event.
+    ///
+    /// One pair, not all of them: the caller sweeps the pairs itself so
+    /// it can start at the one its own processor owns and skip a pair
+    /// somebody else is already draining. `Ok(None)` means this pair
+    /// could not be entered without waiting.
     fn try_receive_frames_immediate_on<'a, 'slots>(
         &'a self,
         queue_idx: usize,
@@ -574,8 +565,8 @@ pub trait NetworkInterface: Clone + Send + Sync + 'static {
     where
         'a: 'slots,
     {
-        let _ = queue_idx;
-        self.try_receive_frames_immediate(frames)
+        let _ = (queue_idx, frames);
+        Ok(None)
     }
 
     /// Releases an owning device RX frame back to the interface.

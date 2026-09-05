@@ -1677,32 +1677,14 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         self.receive_next_frame(PAIR, &mut state)
     }
 
-    pub fn try_receive_frames_immediate(
-        &self,
-        frames: &mut [Option<RxFrame>],
-    ) -> IoResult<Option<usize>> {
-        let mut received = 0usize;
-        let mut any_locked = false;
-        for pair_idx in 0..self.queue_pairs.len() {
-            if received >= frames.len() {
-                break;
-            }
-            let Some(mut state) = self.queue_pairs[pair_idx].rx_state.try_lock() else {
-                continue;
-            };
-            any_locked = true;
-            received += self.drain_rx_pair_locked(pair_idx, &mut state, &mut frames[received..])?;
-        }
-        if !any_locked {
-            return Ok(None);
-        }
-        Ok(Some(received))
-    }
-
-    /// Variant of `try_receive_frames_immediate` that drains a single
-    /// RX queue pair, so per-processor pollers do not contend on the
-    /// other pairs' locks. The index is normalized like the TX pair
-    /// entry points.
+    /// Drains one RX queue pair without waiting for its lock, and
+    /// reports `None` when another processor holds it.
+    ///
+    /// One pair per call: the caller owns the sweep across pairs,
+    /// because only it knows which pair its processor should look at
+    /// first. The index is normalized like the TX pair entry points, so
+    /// a caller indexing by processor still lands on a real pair when
+    /// the device has fewer pairs than the machine has processors.
     pub fn try_receive_frames_immediate_on_pair(
         &self,
         pair_idx: usize,
@@ -2548,7 +2530,7 @@ mod tests {
             let mut frames = [const { None }; 1];
             let received = self
                 .device
-                .try_receive_frames_immediate(&mut frames)?
+                .try_receive_frames_immediate_on_pair(0, &mut frames)?
                 .expect("the receive ring is uncontended in tests");
             assert!(received <= 1);
             Ok(frames[0].take())

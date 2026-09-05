@@ -1318,7 +1318,7 @@ mod tests {
         NETWORK_TX_BATCH_FRAMES, NetworkIpAddress, NetworkPollBudget, NetworkPollProgress,
         NetworkPollState, NetworkPumpAction, NetworkPumpCadence, NetworkShard, ReplicaHandle,
         TcpListenerId, TcpReadProgress, UdpSocketId, icmp_echo_payload, limit_udp_datagram_bytes,
-        map_ipv4_address, parse_ipv6,
+        map_ipv4_address, parse_ipv6, receive_pair_order,
     };
 
     fn ipv6_tcp_frame(
@@ -3308,5 +3308,26 @@ mod tests {
             assert_eq!(cadence.complete(busy, budget), NetworkPumpAction::Continue);
         }
         assert_eq!(cadence.complete(busy, budget), NetworkPumpAction::Yield);
+    }
+
+    /// A poll drains every receive queue pair, not only the one its own
+    /// processor owns. The host decides which pair a frame arrives on —
+    /// a DHCP offer hashes differently from the discover that provoked
+    /// it — so a sweep that stopped at the local pair stranded the
+    /// reply on a multi-queue backend until some task happened to poll
+    /// from the owning processor, which no backend guarantees.
+    #[test]
+    fn a_receive_sweep_covers_every_queue_pair_starting_with_the_local_one() {
+        for pair_count in 1..=8usize {
+            for local_pair in 0..pair_count {
+                let visited: Vec<usize> = receive_pair_order(local_pair, pair_count).collect();
+
+                assert_eq!(visited.len(), pair_count);
+                assert_eq!(visited[0], local_pair);
+                let mut sorted = visited.clone();
+                sorted.sort_unstable();
+                assert_eq!(sorted, (0..pair_count).collect::<Vec<_>>());
+            }
+        }
     }
 }
