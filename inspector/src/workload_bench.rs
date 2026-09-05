@@ -1,6 +1,7 @@
 use std::fs;
+use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail};
 use clap::{Args as ClapArgs, ValueEnum};
@@ -9,6 +10,40 @@ use helios_inspector_protocol::system::programs as system_programs;
 use serde::{Deserialize, Serialize};
 
 const HOST_HTTP_LARGE_PAYLOAD_FILE: &str = "payload-64m.bin";
+
+/// How long one workload iteration may take before the run gives up on
+/// it.
+///
+/// Nothing else bounds it. A workload runs inside the guest and is
+/// reported by an RPC that simply never answers if the guest stops
+/// making progress, so a hung transfer used to hold the lane until the
+/// job's own timeout hours later — and a lane that hangs says less
+/// about the failure than a lane that fails, while costing far more.
+/// The measured medians on a KVM lane are milliseconds and the largest
+/// workload moves 64 MiB, so three minutes is orders of magnitude of
+/// headroom over anything healthy and still turns a hang into a named
+/// failure inside one step.
+const DEFAULT_WORKLOAD_TIMEOUT_SECONDS: u32 = 180;
+
+/// A workload that never came back.
+///
+/// Typed rather than a bare message because the deadline is the one
+/// failure the runner reports about a workload it has no output for:
+/// the RPC never answered, so there is nothing to validate and nothing
+/// to print, and what the lane needs to read is which workload, which
+/// iteration, and how long it was given.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum WorkloadBenchError {
+    #[error(
+        "workload {workload} iteration {iteration} did not finish within {seconds}s; \
+         the guest never answered, so neither of its streams was captured"
+    )]
+    WorkloadTimedOut {
+        workload: String,
+        iteration: u16,
+        seconds: u32,
+    },
+}
 
 #[derive(Debug, Clone, ClapArgs)]
 pub(crate) struct WorkloadBenchCommand {
@@ -55,6 +90,10 @@ pub(crate) struct WorkloadBenchCommand {
     /// Write structured kernel/user perf metrics collected during the workload run.
     #[arg(long)]
     pub(crate) perf_metrics_output: Option<PathBuf>,
+
+    /// Seconds one workload iteration may take before the run fails it.
+    #[arg(long, default_value_t = DEFAULT_WORKLOAD_TIMEOUT_SECONDS)]
+    pub(crate) workload_timeout_seconds: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
@@ -216,9 +255,33 @@ pub(crate) async fn run_inner(
         let mut elapsed_ms = Vec::new();
         for iteration in 1..=command.iterations {
             let output = match workload.runner {
-                WorkloadRunner::Shell => run_shell_workload(client, &workload, command).await?,
-                WorkloadRunner::Program => run_program_workload(client, &workload, command).await?,
-                WorkloadRunner::HeliosAot => run_aot_workload(client, &workload, iteration).await?,
+                WorkloadRunner::Shell => {
+                    under_deadline(
+                        &workload,
+                        iteration,
+                        command,
+                        run_shell_workload(client, &workload, command),
+                    )
+                    .await?
+                }
+                WorkloadRunner::Program => {
+                    under_deadline(
+                        &workload,
+                        iteration,
+                        command,
+                        run_program_workload(client, &workload, command),
+                    )
+                    .await?
+                }
+                WorkloadRunner::HeliosAot => {
+                    under_deadline(
+                        &workload,
+                        iteration,
+                        command,
+                        run_aot_workload(client, &workload, iteration),
+                    )
+                    .await?
+                }
             };
             let validation = validate_output(&workload, &output.stdout, &output.stderr)
                 .with_context(|| {
@@ -260,10 +323,41 @@ pub(crate) async fn run_inner(
     Ok(())
 }
 
+#[derive(Debug)]
 struct WorkloadOutput {
     elapsed_ms: u128,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
+}
+
+/// Runs one workload iteration under the run's per-iteration deadline.
+///
+/// The deadline is per iteration rather than per workload because that
+/// is the unit the guest actually executes: five iterations of a
+/// healthy workload should not buy the sixth a longer hang, and naming
+/// the iteration is what says whether a workload failed cold or only
+/// after it had already succeeded four times.
+///
+/// When it elapses the iteration's future is dropped, which abandons
+/// the outstanding RPC, and the error propagates out of the run — the
+/// caller tears the guest down with it, so nothing is left executing.
+async fn under_deadline(
+    workload: &Workload,
+    iteration: u16,
+    command: &WorkloadBenchCommand,
+    run: impl Future<Output = Result<WorkloadOutput>>,
+) -> Result<WorkloadOutput> {
+    let seconds = command.workload_timeout_seconds;
+    let Some(result) = crate::runtime::timeout(Duration::from_secs(u64::from(seconds)), run).await
+    else {
+        return Err(WorkloadBenchError::WorkloadTimedOut {
+            workload: workload.name.clone(),
+            iteration,
+            seconds,
+        }
+        .into());
+    };
+    result
 }
 
 async fn run_shell_workload(
@@ -282,7 +376,7 @@ async fn run_shell_workload(
     .with_context(|| format!("failed to run workload {}", workload.name))?;
     let elapsed_ms = started.elapsed().as_millis();
     if output.exit_code != 0 {
-        write_guest_output(&output.output.stdout, &output.output.stderr)?;
+        write_guest_output(workload, &output.output.stdout, &output.output.stderr)?;
         bail!(
             "workload {} exited with code {}",
             workload.name,
@@ -319,7 +413,7 @@ async fn run_program_workload(
         .with_context(|| format!("failed to run workload {}", workload.name))?;
     let elapsed_ms = started.elapsed().as_millis();
     if output.exit_code != 0 {
-        write_guest_output(&output.output.stdout, &output.output.stderr)?;
+        write_guest_output(workload, &output.output.stdout, &output.output.stderr)?;
         bail!(
             "workload {} exited with code {}",
             workload.name,
@@ -548,7 +642,7 @@ fn validate_output(workload: &Workload, stdout: &[u8], stderr: &[u8]) -> Result<
     let stdout_text = String::from_utf8_lossy(stdout);
     for expected in &workload.stdout_contains {
         if !stdout_text.contains(expected) {
-            write_guest_output(stdout, stderr)?;
+            write_guest_output(workload, stdout, stderr)?;
             bail!(
                 "workload {} stdout did not contain expected text {:?}",
                 workload.name,
@@ -557,7 +651,7 @@ fn validate_output(workload: &Workload, stdout: &[u8], stderr: &[u8]) -> Result<
         }
     }
     if workload.stderr_empty && !stderr.is_empty() {
-        write_guest_output(stdout, stderr)?;
+        write_guest_output(workload, stdout, stderr)?;
         bail!("workload {} wrote stderr", workload.name);
     }
     Ok(ValidationSummary { ok: true })
@@ -622,10 +716,38 @@ fn write_record(record: &JsonlRecord<'_>) -> Result<()> {
     Ok(())
 }
 
-fn write_guest_output(stdout: &[u8], stderr: &[u8]) -> Result<()> {
+/// Prints a failing workload's own output, named and labelled.
+///
+/// A workload that exits non-zero used to surface as nothing but its
+/// exit status, and the bytes it wrote went out unattributed — the
+/// guest's stdout into the JSONL record stream a lane parses, its
+/// stderr beside it with nothing saying which workload wrote it or
+/// which stream it came from. Both streams go to stderr here, which is
+/// where a lane log collects them, and each one is named so the log
+/// says what the workload saw rather than only that it failed.
+fn write_guest_output(workload: &Workload, stdout: &[u8], stderr: &[u8]) -> Result<()> {
     use std::io::Write as _;
-    std::io::stdout().write_all(stdout)?;
-    std::io::stderr().write_all(stderr)?;
+    let mut sink = std::io::stderr().lock();
+    writeln!(sink, "--- workload {} output ---", workload.name)?;
+    write_guest_stream(&mut sink, "stdout", stdout)?;
+    write_guest_stream(&mut sink, "stderr", stderr)?;
+    writeln!(sink, "--- end of workload {} output ---", workload.name)?;
+    Ok(())
+}
+
+/// One named stream of a failing workload's output. An empty stream is
+/// said to be empty rather than left out: "the guest printed nothing"
+/// and "the runner did not capture this" are different failures.
+fn write_guest_stream(sink: &mut impl std::io::Write, name: &str, bytes: &[u8]) -> Result<()> {
+    if bytes.is_empty() {
+        writeln!(sink, "{name}: <empty>")?;
+        return Ok(());
+    }
+    writeln!(sink, "{name} ({} bytes):", bytes.len())?;
+    sink.write_all(bytes)?;
+    if !bytes.ends_with(b"\n") {
+        writeln!(sink)?;
+    }
     Ok(())
 }
 
@@ -665,6 +787,7 @@ mod tests {
             kernel_profile_output: None,
             user_profile_output: None,
             perf_metrics_output: None,
+            workload_timeout_seconds: DEFAULT_WORKLOAD_TIMEOUT_SECONDS,
         };
         let workloads = select_workloads(&command).expect("manifest must parse");
         assert!(
@@ -724,6 +847,7 @@ mod tests {
             kernel_profile_output: None,
             user_profile_output: None,
             perf_metrics_output: None,
+            workload_timeout_seconds: DEFAULT_WORKLOAD_TIMEOUT_SECONDS,
         };
         let workloads = select_workloads(&command).expect("manifest must parse");
         assert!(
@@ -741,5 +865,97 @@ mod tests {
         );
         assert_eq!(throughput_mib_per_second(None, 64), None);
         assert_eq!(throughput_mib_per_second(Some(64 * 1024 * 1024), 0), None);
+    }
+
+    fn timeout_test_command(workload_timeout_seconds: u32) -> WorkloadBenchCommand {
+        WorkloadBenchCommand {
+            manifest: PathBuf::from("tools/wasi-apps/workloads.json"),
+            iterations: 5,
+            workloads: Vec::new(),
+            classes: Vec::new(),
+            host_http_url: None,
+            host_tcp_host: None,
+            host_tcp_port: None,
+            profile_output: None,
+            kernel_profile_output: None,
+            user_profile_output: None,
+            perf_metrics_output: None,
+            workload_timeout_seconds,
+        }
+    }
+
+    fn timeout_test_workload(name: &str) -> Workload {
+        Workload {
+            name: name.to_owned(),
+            class: WorkloadClass::IoBound,
+            runner: WorkloadRunner::Program,
+            _description: String::new(),
+            command: None,
+            program: None,
+            args: Vec::new(),
+            boot_programs: Vec::new(),
+            stdout_contains: Vec::new(),
+            stderr_empty: false,
+            requires_host_http: false,
+            requires_host_tcp: false,
+            wasm_path: None,
+            remote_path: None,
+            destination_path: None,
+            throughput_bytes: None,
+        }
+    }
+
+    /// A workload that never answers is failed by name, not waited on.
+    /// The RPC that reports a workload simply never returns when the
+    /// guest stops making progress, so without this the lane held its
+    /// runner until the job's own timeout hours later.
+    #[test]
+    fn a_workload_that_never_answers_is_failed_by_name_and_iteration() {
+        let command = timeout_test_command(1);
+        let workload = timeout_test_workload("tcp-throughput");
+
+        let error = crate::runtime::block_on(under_deadline(
+            &workload,
+            3,
+            &command,
+            std::future::pending(),
+        ))
+        .expect_err("a workload that never answers must fail rather than hang");
+
+        let timed_out = error
+            .downcast_ref::<WorkloadBenchError>()
+            .expect("the failure must be the typed deadline error");
+        assert!(
+            matches!(
+                timed_out,
+                WorkloadBenchError::WorkloadTimedOut {
+                    workload,
+                    iteration: 3,
+                    seconds: 1,
+                } if workload == "tcp-throughput"
+            ),
+            "the failure must name the workload, the iteration and the deadline, got {timed_out}"
+        );
+    }
+
+    /// A workload that answers inside the deadline is untouched by it.
+    #[test]
+    fn a_workload_that_answers_in_time_keeps_its_measurement() {
+        let command = timeout_test_command(DEFAULT_WORKLOAD_TIMEOUT_SECONDS);
+        let workload = timeout_test_workload("process-startup");
+
+        let output = crate::runtime::block_on(under_deadline(
+            &workload,
+            1,
+            &command,
+            std::future::ready(Ok(WorkloadOutput {
+                elapsed_ms: 24,
+                stdout: b"process-startup:ok\n".to_vec(),
+                stderr: Vec::new(),
+            })),
+        ))
+        .expect("a workload that answers in time must not be failed");
+
+        assert_eq!(output.elapsed_ms, 24);
     }
 }

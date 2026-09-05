@@ -1,5 +1,20 @@
 use super::*;
 
+/// The receive queue pairs a poll visits, in the order it visits them:
+/// the pair belonging to the polling processor first, then every other
+/// pair once, wrapping.
+///
+/// Ownership of a pair is a locality preference, not a claim: a frame
+/// the host steered onto another processor's pair still has to be
+/// drained by whoever is polling, so the sweep covers all of them.
+pub(super) fn receive_pair_order(
+    local_pair: usize,
+    pair_count: usize,
+) -> impl Iterator<Item = usize> {
+    assert!(pair_count != 0, "an interface has at least one queue pair");
+    (0..pair_count).map(move |offset| (local_pair + offset) % pair_count)
+}
+
 pub(super) struct TcpListenerState {
     pub(super) stack_socket: helios_netstack::SocketId,
     pub(super) local_port: u16,
@@ -867,6 +882,55 @@ where
         Ok(reclaimed)
     }
 
+    /// Drains received frames from every queue pair, which is what puts
+    /// a reply into the shard that is waiting for it.
+    ///
+    /// Every pair has to be visited, for the receive-side reason the
+    /// reclaim above visits every pair on the transmit side: the device
+    /// delivers a frame on whichever pair *it* steered the flow to, and
+    /// that choice is the host's rather than this processor's. A reply
+    /// to a broadcast exchange — a DHCP offer, an ARP reply — is hashed
+    /// independently of the request that provoked it, so on a
+    /// multi-queue backend it routinely arrives on a pair belonging to
+    /// a processor that is not polling. Nothing else then drains it: a
+    /// packet pump is a backend's own choice to install, and a backend
+    /// without one drives the interface entirely from the operation
+    /// waiting on it, on that operation's processor.
+    ///
+    /// The local pair is visited first, so a processor drains its own
+    /// ring before it looks at anyone else's, and a pair another
+    /// processor already holds is skipped by the device's `try_lock` —
+    /// that processor is draining it and this poll has nothing to add.
+    /// `Ok(None)` means every pair was held, which is the same "come
+    /// back later" a single-pair drain reports.
+    fn receive_frames_immediate(
+        &self,
+        frames: &mut [Option<RxFrame>],
+    ) -> Result<Option<usize>, IoError> {
+        let pair_count = self.inner.device.queue_pair_count().max(1);
+        let local_pair = usize::from(self.inner.cpu.current_processor().id()) % pair_count;
+        let mut received = 0usize;
+        let mut drained_a_pair = false;
+        for pair_idx in receive_pair_order(local_pair, pair_count) {
+            if received >= frames.len() {
+                break;
+            }
+            let Some(batch) = self
+                .inner
+                .device
+                .try_receive_frames_immediate_on(pair_idx, &mut frames[received..])?
+            else {
+                continue;
+            };
+            drained_a_pair = true;
+            received += batch;
+        }
+        if !drained_a_pair {
+            return Ok(None);
+        }
+        Ok(Some(received))
+    }
+
     pub(super) async fn poll_network_once_with_tcp_read(
         &self,
         source: NetworkPollSource,
@@ -916,11 +980,8 @@ where
             let receive_limit = remaining_rx_budget.min(NETWORK_RX_BATCH_FRAMES);
             let mut frames: [Option<RxFrame>; NETWORK_RX_BATCH_FRAMES] =
                 core::array::from_fn(|_| None);
-            let poll_pair = usize::from(self.inner.cpu.current_processor().id());
             let received_batch = match self
-                .inner
-                .device
-                .try_receive_frames_immediate_on(poll_pair, &mut frames[..receive_limit])?
+                .receive_frames_immediate(&mut frames[..receive_limit])?
             {
                 Some(received_batch) => received_batch,
                 None => {

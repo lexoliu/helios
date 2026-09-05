@@ -49,6 +49,15 @@ fi
 if [[ -n "${HELIOS_WORKLOAD_BENCH_RUNTIME_DIR:-}" ]]; then
     mkdir -p "${HELIOS_WORKLOAD_BENCH_RUNTIME_DIR}"
     command+=(--runtime-dir "${HELIOS_WORKLOAD_BENCH_RUNTIME_DIR}" --keep-runtime-dir)
+    # A network workload that fails leaves an exit status and nothing
+    # about the wire. The capture sits between the virtio-net device and
+    # the host backend, so it records what the guest driver actually
+    # sent and received; it lives in the runtime directory because that
+    # is already one per boot, and a shared path would let the second
+    # workload class overwrite the first's capture.
+    if [[ -n "${HELIOS_WORKLOAD_BENCH_NET_PCAP:-}" ]]; then
+        command+=(--net-pcap "${HELIOS_WORKLOAD_BENCH_RUNTIME_DIR}/net.pcap")
+    fi
 fi
 
 # Host packet path for the guest's virtio-net device. Only a multi-queue
@@ -102,6 +111,14 @@ fi
 
 if [[ -n "${HELIOS_WORKLOAD_BENCH_HOST_TCP_PORT:-}" ]]; then
     command+=(--host-tcp-port "${HELIOS_WORKLOAD_BENCH_HOST_TCP_PORT}")
+fi
+
+# A workload runs inside the guest and is reported by an RPC that never
+# answers if the guest stops making progress, so the runner fails an
+# iteration that overruns rather than holding the lane. The inspector's
+# own default applies unless a slower surface asks for more.
+if [[ -n "${HELIOS_WORKLOAD_BENCH_WORKLOAD_TIMEOUT_SECONDS:-}" ]]; then
+    command+=(--workload-timeout-seconds "${HELIOS_WORKLOAD_BENCH_WORKLOAD_TIMEOUT_SECONDS}")
 fi
 
 if [[ -n "${HELIOS_WORKLOAD_BENCH_PROFILE_OUTPUT:-}" ]]; then

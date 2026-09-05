@@ -141,6 +141,22 @@ transfer stalls: whether the guest stopped acknowledging, whether the peer
 stopped sending, and which of the two was waiting on a timer are all
 questions the capture answers and the guest log does not.
 
+A capture needs a single-queue netdev. QEMU attaches a netfilter to one
+queue, and a netdev serving more rejects the filter with `multiqueue is
+not supported` before the guest boots, so the inspector refuses
+`--net-pcap` beside more than one queue pair rather than letting QEMU
+die of it. On `tap`, capture with `--net-queues 1` and take the
+multi-queue measurement separately; that is also why the CI bench lane,
+whose entire point is a multi-queue tap, takes no capture.
+
+`workload-bench.sh` adds `--net-pcap` whenever
+`HELIOS_WORKLOAD_BENCH_NET_PCAP` is set and a runtime directory was
+asked for, and writes `net.pcap` into that directory — one per boot,
+because each workload class is its own VM and a shared path would let
+the second class overwrite the first's capture. The runtime directory
+is uploaded when a bench lane fails, so a capture taken on a
+single-queue run reaches the artifact with the rest of the evidence.
+
 ## The `user` backend
 
 The default. QEMU's built-in slirp stack needs no privileges and no host
