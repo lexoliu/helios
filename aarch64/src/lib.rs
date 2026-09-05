@@ -7,7 +7,6 @@ use core::arch::{asm, global_asm};
 use core::cell::UnsafeCell;
 use core::fmt::{self, Write};
 use core::num::NonZeroUsize;
-use core::ops::Range;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
@@ -16,7 +15,8 @@ use alloc::vec::Vec;
 use arm_gic::IntId;
 use helios_hal::boot::{
     BootFirmwareTables, BootHandoff, BootKernelImage, BootMemoryKind, BootMemoryMap,
-    BootMemoryRegion, BootModule, BootModules, FirmwareKind,
+    BootMemoryRegion, BootModule, BootModules, BootReservedRanges, FirmwareKind,
+    usable_region_segments,
 };
 use helios_hal::cpu::{Cpu, HardwarePerfCounters, Instant, ProcessorId};
 use helios_hal::critical_section::ProcessorIdentity;
@@ -54,7 +54,6 @@ const IRQ_FRAME_BYTES: usize = 0x320;
 const SYNC_FRAME_BYTES: usize = 0x320;
 const PAGE_BYTES: usize = 4096;
 const MMIO_BLOCK_BYTES: usize = 2 * 1024 * 1024;
-const MAX_USABLE_REGION_SEGMENTS: usize = 6;
 const PAGE_TABLE_ENTRIES: usize = 512;
 const PAGE_TABLE_INDEX_MASK: usize = PAGE_TABLE_ENTRIES - 1;
 const PAGE_TABLE_DESCRIPTOR: u64 = 0b11;
@@ -1968,17 +1967,6 @@ fn convert_firmware_kind(firmware: u64) -> FirmwareKind {
     }
 }
 
-#[derive(Clone, Debug)]
-struct BootReservedRanges {
-    ranges: [Option<Range<usize>>; 2],
-}
-
-impl BootReservedRanges {
-    fn iter(&self) -> impl Iterator<Item = &Range<usize>> {
-        self.ranges.iter().flatten()
-    }
-}
-
 fn boot_reserved_ranges(handoff: &LimineBootHandoff) -> BootReservedRanges {
     let executable_bytes = align_up_usize(
         usize::try_from(handoff.kernel.size)
@@ -1994,12 +1982,10 @@ fn boot_reserved_ranges(handoff: &LimineBootHandoff) -> BootReservedRanges {
     let file_end = file_start
         .checked_add(executable_bytes)
         .unwrap_or_else(|| panic!("Limine executable file range overflow"));
-    BootReservedRanges {
-        ranges: [
-            Some(loaded_executable_start..loaded_executable_end),
-            Some(file_start..file_end),
-        ],
-    }
+    let mut reserved = BootReservedRanges::new();
+    reserved.reserve(loaded_executable_start..loaded_executable_end);
+    reserved.reserve(file_start..file_end);
+    reserved
 }
 
 fn boot_memory_regions(
@@ -2020,49 +2006,6 @@ fn boot_memory_regions(
                 })
             })
     })
-}
-
-fn usable_region_segments(
-    region: BootMemoryRegion,
-    reserved_ranges: &BootReservedRanges,
-) -> [Option<Range<usize>>; MAX_USABLE_REGION_SEGMENTS] {
-    if !region.usable() || region.end <= region.start {
-        return [const { None }; MAX_USABLE_REGION_SEGMENTS];
-    }
-    let mut segments = [const { None }; MAX_USABLE_REGION_SEGMENTS];
-    segments[0] = Some(region.start as usize..region.end as usize);
-    for reserved in reserved_ranges.iter() {
-        segments = subtract_reserved_range(segments, reserved);
-    }
-    segments
-}
-
-fn subtract_reserved_range(
-    segments: [Option<Range<usize>>; MAX_USABLE_REGION_SEGMENTS],
-    reserved: &Range<usize>,
-) -> [Option<Range<usize>>; MAX_USABLE_REGION_SEGMENTS] {
-    let mut out = [const { None }; MAX_USABLE_REGION_SEGMENTS];
-    let mut next = 0;
-    for segment in segments.into_iter().flatten() {
-        for piece in split_segment(segment, reserved).into_iter().flatten() {
-            assert!(
-                next < out.len(),
-                "AArch64 boot memory segmentation exceeded fixed capacity"
-            );
-            out[next] = Some(piece);
-            next += 1;
-        }
-    }
-    out
-}
-
-fn split_segment(segment: Range<usize>, reserved: &Range<usize>) -> [Option<Range<usize>>; 2] {
-    if reserved.end <= segment.start || reserved.start >= segment.end {
-        return [Some(segment), None];
-    }
-    let left = (reserved.start > segment.start).then_some(segment.start..reserved.start);
-    let right = (reserved.end < segment.end).then_some(reserved.end..segment.end);
-    [left, right]
 }
 
 fn align_up_usize(value: usize, align: usize) -> usize {

@@ -31,7 +31,7 @@ use core::arch::x86_64::{__cpuid, __cpuid_count, _rdrand64_step, _rdtsc};
 use core::fmt::{self, Write};
 use core::ops::Range;
 use core::sync::atomic::{AtomicUsize, Ordering};
-use helios_hal::boot::BootMemoryMap;
+use helios_hal::boot::{BootMemoryMap, BootReservedRanges, usable_region_segments};
 use helios_hal::cpu::{Cpu, Instant, ProcessorId};
 use helios_hal::critical_section::ProcessorIdentity;
 use helios_hal::entropy::{EntropyQuality, EntropyUnavailable};
@@ -57,7 +57,6 @@ const PIT_SPEAKER_GATE: u16 = 0x61;
 const PIT_BASE_HZ: u64 = 1_193_182;
 const PIT_CALIBRATION_HZ: u64 = 100;
 const PAGE_BYTES: usize = 4096;
-const MAX_USABLE_REGION_SEGMENTS: usize = 6;
 pub(crate) const KERNEL_STACK_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) static WASMTIME_NATIVE_TRAP_HANDLER: AtomicUsize = AtomicUsize::new(0);
 static CRITICAL_SECTION_STATE: helios_hal::critical_section::CriticalSectionState =
@@ -511,17 +510,6 @@ fn processor_count(rsdp_address: usize, physical_memory_offset: usize) -> usize 
     count
 }
 
-#[derive(Clone, Debug)]
-struct BootReservedRanges {
-    ranges: [Option<Range<usize>>; 3],
-}
-
-impl BootReservedRanges {
-    fn iter(&self) -> impl Iterator<Item = &Range<usize>> {
-        self.ranges.iter().flatten()
-    }
-}
-
 fn boot_reserved_ranges(handoff: &boot::LimineBootHandoff) -> BootReservedRanges {
     let executable_bytes = align_up_usize(
         usize::try_from(handoff.kernel.size).unwrap_or_else(|_| {
@@ -551,13 +539,10 @@ fn boot_reserved_ranges(handoff: &boot::LimineBootHandoff) -> BootReservedRanges
         panic!("Limine executable file range overflow: start={file_start:#x}, len={executable_bytes:#x}")
     });
 
-    BootReservedRanges {
-        ranges: [
-            Some(loaded_executable_start..loaded_executable_end),
-            Some(file_start..file_end),
-            None,
-        ],
-    }
+    let mut reserved = BootReservedRanges::new();
+    reserved.reserve(loaded_executable_start..loaded_executable_end);
+    reserved.reserve(file_start..file_end);
+    reserved
 }
 
 fn reserve_wakeup_page(
@@ -587,7 +572,9 @@ fn boot_memory_regions(
     excluded: Option<Range<usize>>,
 ) -> impl IntoIterator<Item = MemoryRegion> {
     let mut reserved_ranges = reserved_ranges.clone();
-    reserved_ranges.ranges[2] = excluded;
+    if let Some(excluded) = excluded {
+        reserved_ranges.reserve(excluded);
+    }
     handoff.memory_map.regions().flat_map(move |region| {
         usable_region_segments(region, &reserved_ranges)
             .into_iter()
@@ -623,58 +610,6 @@ fn dma_capable_ranges(
         .collect()
 }
 
-fn usable_region_segments(
-    region: helios_hal::boot::BootMemoryRegion,
-    reserved_ranges: &BootReservedRanges,
-) -> [Option<Range<usize>>; MAX_USABLE_REGION_SEGMENTS] {
-    if !region.usable() || region.end <= region.start {
-        return [const { None }; MAX_USABLE_REGION_SEGMENTS];
-    }
-
-    let mut segments = [const { None }; MAX_USABLE_REGION_SEGMENTS];
-    segments[0] = Some(region.start as usize..region.end as usize);
-    for reserved in reserved_ranges.iter() {
-        segments = subtract_reserved_range(segments, reserved);
-    }
-    segments
-}
-
-fn subtract_reserved_range(
-    segments: [Option<Range<usize>>; MAX_USABLE_REGION_SEGMENTS],
-    reserved: &Range<usize>,
-) -> [Option<Range<usize>>; MAX_USABLE_REGION_SEGMENTS] {
-    let mut result = [const { None }; MAX_USABLE_REGION_SEGMENTS];
-    let mut next = 0;
-    for segment in segments.into_iter().flatten() {
-        if reserved.end <= segment.start || reserved.start >= segment.end {
-            assert!(
-                next < MAX_USABLE_REGION_SEGMENTS,
-                "too many x86 usable memory segments after reserving bootloader ranges"
-            );
-            result[next] = Some(segment);
-            next += 1;
-            continue;
-        }
-        if reserved.start > segment.start {
-            assert!(
-                next < MAX_USABLE_REGION_SEGMENTS,
-                "too many x86 usable memory segments after reserving bootloader ranges"
-            );
-            result[next] = Some(segment.start..reserved.start);
-            next += 1;
-        }
-        if reserved.end < segment.end {
-            assert!(
-                next < MAX_USABLE_REGION_SEGMENTS,
-                "too many x86 usable memory segments after reserving bootloader ranges"
-            );
-            result[next] = Some(reserved.end..segment.end);
-            next += 1;
-        }
-    }
-    result
-}
-
 fn align_up_usize(value: usize, align: usize) -> usize {
     assert!(
         align.is_power_of_two(),
@@ -684,65 +619,6 @@ fn align_up_usize(value: usize, align: usize) -> usize {
         .checked_add(align - 1)
         .map(|value| value & !(align - 1))
         .unwrap_or_else(|| panic!("alignment overflow for value={value:#x}, align={align:#x}"))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{BootReservedRanges, usable_region_segments};
-    use core::ops::Range;
-    use helios_hal::boot::{BootMemoryKind, BootMemoryRegion};
-
-    #[test]
-    fn usable_region_without_overlap_stays_single_segment() {
-        assert_eq!(
-            collect_segments(region(0x1000..0x4000), Some(&(0x5000..0x6000))),
-            alloc::vec![0x1000..0x4000]
-        );
-    }
-
-    #[test]
-    fn excluded_wakeup_page_splits_region_without_heap_growth_path() {
-        assert_eq!(
-            collect_segments(region(0x1000..0x5000), Some(&(0x2000..0x3000))),
-            alloc::vec![0x1000..0x2000, 0x3000..0x5000]
-        );
-    }
-
-    #[test]
-    fn non_usable_region_yields_no_segments() {
-        assert!(
-            collect_segments(
-                BootMemoryRegion {
-                    start: 0x1000,
-                    end: 0x4000,
-                    kind: BootMemoryKind::Reserved,
-                },
-                None,
-            )
-            .is_empty()
-        );
-    }
-
-    fn collect_segments(
-        region: BootMemoryRegion,
-        excluded: Option<&Range<usize>>,
-    ) -> alloc::vec::Vec<Range<usize>> {
-        let reserved = BootReservedRanges {
-            ranges: [excluded.cloned(), None, None],
-        };
-        usable_region_segments(region, &reserved)
-            .into_iter()
-            .flatten()
-            .collect()
-    }
-
-    fn region(range: Range<usize>) -> BootMemoryRegion {
-        BootMemoryRegion {
-            start: range.start as u64,
-            end: range.end as u64,
-            kind: BootMemoryKind::Usable,
-        }
-    }
 }
 
 /// The kernel console: every record is retained for the debugger and

@@ -1689,6 +1689,7 @@ dependencies = [
 name = "helios-hal"
 version = "0.1.0"
 dependencies = [
+ "arrayvec",
  "bitflags 2.13.1",
  "fdt",
  "thiserror 2.0.18",
