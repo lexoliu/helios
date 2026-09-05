@@ -156,10 +156,9 @@ fn parse_scope(scope: String) -> Result<Scope, PerfError> {
 }
 
 fn parse_limit(limit: String) -> Result<u32, PerfError> {
-    let limit = limit
+    limit
         .parse::<u32>()
-        .map_err(|_| PerfError::InvalidLimit(limit))?;
-    Ok(limit)
+        .map_err(|_| PerfError::InvalidLimit(limit))
 }
 
 fn next_value(

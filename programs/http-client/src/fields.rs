@@ -107,11 +107,7 @@ pub fn is_hop_by_hop(name: &str, connection_options: &[String]) -> bool {
 /// `wasi:http` owns the size limits, so a section that is too large is
 /// reported with the code for the section it came from rather than truncated.
 pub fn build_fields(entries: &[(String, Vec<u8>)], section: Section) -> Result<Fields, ErrorCode> {
-    Fields::from_list(entries).map_err(|error| field_error(error, section))
-}
-
-fn field_error(error: HeaderError, section: Section) -> ErrorCode {
-    match (error, section) {
+    Fields::from_list(entries).map_err(|error| match (error, section) {
         (HeaderError::SizeExceeded, Section::Headers) => {
             ErrorCode::HttpResponseHeaderSectionSize(None)
         }
@@ -122,5 +118,5 @@ fn field_error(error: HeaderError, section: Section) -> ErrorCode {
         (HeaderError::InvalidSyntax | HeaderError::Forbidden | HeaderError::Immutable, _) => {
             ErrorCode::HttpProtocolError
         }
-    }
+    })
 }

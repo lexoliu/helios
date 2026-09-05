@@ -124,11 +124,7 @@ async fn handle(request: types::Request) -> Result<types::Response, ErrorCode> {
     let sent = request::send(&socket, &head, framing, contents, contents_trailers).await;
     // Whatever happened to the request body, the caller that produced it is
     // waiting on this verdict.
-    let verdict = match &sent {
-        Ok(()) => Ok(()),
-        Err(code) => Err(code.clone()),
-    };
-    let _ = body_result.write(verdict).await;
+    let _ = body_result.write(sent.clone()).await;
     sent?;
 
     socket.set_timeout(timeouts.first_byte);
