@@ -7,9 +7,9 @@ use bytes::Bytes;
 
 use crate::io::{ByteReader, ByteWriter, TryRead};
 use crate::{
-    EntropyPool, InstanceExecutionTransition, InstanceRegistry, KernelClock, KillReason,
-    ProcessAuthority, RegisteredInstance, SetWallClockCap, Sleep, Timer,
-    nanos_to_ticks_ceil_saturating, record_instance_transition,
+    ActivityChange, EntropyPool, InstanceActivity, InstanceExecutionTransition, InstanceRegistry,
+    KernelClock, KillReason, ProcessAuthority, RegisteredInstance, SetWallClockCap, Sleep, Timer,
+    nanos_to_ticks_ceil_saturating,
 };
 use helios_hal::cpu::{Cpu, Instant};
 
@@ -233,7 +233,7 @@ pub trait ComponentRuntimeState: Clone + Send + 'static {
 }
 
 pub(crate) struct ComponentExecutionContext<FileSystem> {
-    instance: RegisteredInstance,
+    activity: InstanceActivity,
     debug_port: Option<()>,
     filesystem: FileSystem,
     arguments: Vec<String>,
@@ -287,7 +287,7 @@ impl<FileSystem> ComponentExecutionContext<FileSystem> {
         output_mode: ComponentOutputMode,
     ) -> Self {
         Self {
-            instance,
+            activity: InstanceActivity::new(instance),
             debug_port,
             filesystem,
             arguments,
@@ -361,7 +361,7 @@ where
     }
 
     pub(crate) fn instance(&self) -> &RegisteredInstance {
-        &self.execution_context.instance
+        self.execution_context.activity.instance()
     }
 
     pub(crate) fn debug_port(&self) -> Option<()> {
@@ -545,22 +545,51 @@ where
         bytes
     }
 
-    /// Names the instance whose guest code is about to run on this
-    /// processor, so pages the runtime commits while it runs — a
-    /// `memory.grow`, most of all — are charged to it.
+    /// Report the transition wasmtime's call hook delivered, and name
+    /// the instance whose guest code this processor is running so pages
+    /// the runtime commits while it runs — a `memory.grow`, most of all
+    /// — are charged to it.
     ///
-    /// This names the processor's current work, not a scope: the call
-    /// hooks fire on entering and leaving guest code, and nothing there
-    /// can own a guard. Between a resume and its matching pause this
-    /// processor is executing that instance's wasm, so anything it
-    /// commits is that instance's. Nested resumes keep the name in place
-    /// until the outermost pause, which is why only the transition that
-    /// actually stopped the instance clears it.
-    pub fn record_transition(&mut self, transition: InstanceExecutionTransition) {
+    /// A call hook cannot hold a scope guard across the stretch of
+    /// guest code it opens; the guard is the store's own
+    /// [`InstanceActivity`], which owns the pairing between the
+    /// transitions and hands back what changed.
+    ///
+    /// Returns the kill reason when the OOM killer or a supervisor has
+    /// condemned this instance — and in that case the activation has
+    /// already been ended, so the caller's only remaining job is to
+    /// raise the `InstanceKilled` trap. The two cannot be separated:
+    /// see [`InstanceActivity::record`].
+    pub fn record_transition(
+        &mut self,
+        transition: InstanceExecutionTransition,
+    ) -> Option<KillReason> {
         let now_nanos = self.now_nanos();
-        let elapsed = record_instance_transition(self.instance(), transition, now_nanos);
-        name_user_memory_owner(&self.cpu, self.instance(), transition, elapsed.is_some());
-        if let Some(elapsed) = elapsed
+        let step = self
+            .execution_context
+            .activity
+            .record(transition, now_nanos);
+        self.apply_activity_change(step.change);
+        step.killed
+    }
+
+    /// End this store's activation and report the condemnation when the
+    /// instance has one. The epoch callback uses this: a CPU-bound
+    /// guest never reaches a call hook, and the trap raised there
+    /// unwinds through the same hooks a call-hook kill does.
+    pub fn end_on_pending_kill(&mut self) -> Option<KillReason> {
+        let reason = self.execution_context.activity.pending_kill()?;
+        let now_nanos = self.now_nanos();
+        let change = self.execution_context.activity.end(now_nanos);
+        self.apply_activity_change(change);
+        Some(reason)
+    }
+
+    fn apply_activity_change(&self, change: ActivityChange) {
+        name_user_memory_owner(&self.cpu, self.instance(), change);
+        if let ActivityChange::Left {
+            instance_elapsed: Some(elapsed),
+        } = change
             && self.runtime_state.profiling_enabled()
         {
             self.runtime_state.record_profile_stack_parts_nanos(
@@ -570,14 +599,6 @@ where
                 elapsed,
             );
         }
-    }
-
-    /// Returns the recorded kill reason if the OOM killer or a
-    /// supervisor flagged this instance for termination since the last
-    /// host-call boundary. The component executor calls this from
-    /// `call_hook` and surfaces the value as an `InstanceKilled` trap.
-    pub fn check_pending_kill(&self) -> Option<KillReason> {
-        self.instance().pending_kill()
     }
 }
 
@@ -644,17 +665,16 @@ pub async fn wait_until_runtime_deadline<CpuImpl, RuntimeStateImpl>(
 // Runtime-adapter trait impls live in the concrete adapter module.
 
 /// Charges pages committed on this processor to `instance` while its
-/// guest code runs, and to nobody once it stops.
+/// guest code runs, and to nobody once this store leaves it.
 fn name_user_memory_owner<CpuImpl: Cpu>(
     cpu: &CpuImpl,
     instance: &crate::RegisteredInstance,
-    transition: InstanceExecutionTransition,
-    stopped: bool,
+    change: ActivityChange,
 ) {
-    let owner = match transition {
-        InstanceExecutionTransition::Resume => MemoryOwner::new(instance.id().raw()),
-        InstanceExecutionTransition::Pause if stopped => MemoryOwner::NONE,
-        InstanceExecutionTransition::Pause => return,
+    let owner = match change {
+        ActivityChange::Entered => MemoryOwner::new(instance.id().raw()),
+        ActivityChange::Left { .. } => MemoryOwner::NONE,
+        ActivityChange::Unchanged => return,
     };
     set_user_memory_owner(cpu.current_processor(), owner);
 }

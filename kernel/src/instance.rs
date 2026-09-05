@@ -3,6 +3,7 @@ extern crate alloc;
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::num::NonZeroU32;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use core::time::Duration;
@@ -622,14 +623,6 @@ fn condemn_entry(
     Some(condemned_bytes)
 }
 
-pub fn record_instance_transition(
-    instance: &RegisteredInstance,
-    transition: InstanceExecutionTransition,
-    now_nanos: u64,
-) -> Option<u64> {
-    instance.transition(transition, now_nanos)
-}
-
 pub fn allow_instance_resource_growth(
     instance: &RegisteredInstance,
     desired: usize,
@@ -681,20 +674,6 @@ impl RegisteredInstance {
     pub fn pending_kill(&self) -> Option<KillReason> {
         decode_kill_flag(self.entry().kill_flag.load(Ordering::Acquire))
     }
-
-    pub fn transition(
-        &self,
-        transition: InstanceExecutionTransition,
-        now_nanos: u64,
-    ) -> Option<u64> {
-        match transition {
-            InstanceExecutionTransition::Resume => {
-                self.entry().resume(now_nanos);
-                None
-            }
-            InstanceExecutionTransition::Pause => self.entry().pause(now_nanos),
-        }
-    }
 }
 
 impl Clone for RegisteredInstance {
@@ -742,6 +721,208 @@ impl Drop for RegisteredInstance {
     }
 }
 
+/// What one recorded transition did to the processor the reporting
+/// store is running on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActivityChange {
+    /// The store entered the instance's guest code: what this processor
+    /// commits from here on belongs to that instance.
+    Entered,
+    /// The store left the instance's guest code. `instance_elapsed` is
+    /// `Some` when no activation is left anywhere, carrying the
+    /// nanoseconds the instance held a processor.
+    Left { instance_elapsed: Option<u64> },
+    /// Nothing changed hands: a nested transition, or one reported
+    /// after the activation had already ended.
+    Unchanged,
+}
+
+impl ActivityChange {
+    /// Fold the change made by ending an activation into the change the
+    /// transition itself made. Releasing the activation always wins:
+    /// once it is gone the processor is not the instance's any more.
+    fn then(self, ending: Self) -> Self {
+        match ending {
+            Self::Left { .. } => ending,
+            Self::Entered | Self::Unchanged => self,
+        }
+    }
+}
+
+/// The result of reporting one call-hook transition to an
+/// [`InstanceActivity`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ActivityStep {
+    /// What the transition did to this processor's ownership.
+    pub change: ActivityChange,
+    /// Set when the instance has been condemned. The activation is
+    /// already ended when this is `Some`, so the caller's only
+    /// remaining job is to raise the trap.
+    pub killed: Option<KillReason>,
+}
+
+/// One store's activity accounting for the instance it runs.
+///
+/// [`RegisteredInstance`] is a handle: cloneable, shared, readable by
+/// anyone. Activity is not. The registry entry counts how many stores
+/// are inside an instance's guest code — a `wasi:thread-spawn` thread
+/// gets its own store over the same instance — but the resume/pause
+/// pairing behind each of those counts belongs to exactly one owner.
+/// `InstanceActivity` is that owner: it is not `Clone`, it holds at
+/// most one activation on the entry, and it is the only thing that
+/// opens or closes one.
+///
+/// The kill path is part of the same ownership. Wasmtime pairs its call
+/// hooks around the call it is making, so a hook that records a
+/// transition and *then* returns an error cancels the call whose
+/// matching hook would have closed that transition — while the
+/// `ReturningFromWasm` that unwinds the resulting trap still arrives.
+/// [`Self::record`] therefore looks for the condemnation itself and
+/// ends the activation in the same step. That ended state is
+/// terminal, so the transitions wasmtime reports while the trap unwinds
+/// find no activation to close rather than a counter to drive below
+/// zero.
+pub struct InstanceActivity {
+    instance: RegisteredInstance,
+    state: ActivityState,
+    /// The last timestamp this owner was given, so a store dropped
+    /// while its guest is suspended — a cancelled task, a future
+    /// dropped on its fiber — still closes its activation instead of
+    /// leaving the instance on a processor forever.
+    last_nanos: u64,
+}
+
+enum ActivityState {
+    /// Not inside guest code; no activation held.
+    Idle,
+    /// Inside guest code, `depth` call-hook levels deep, holding one
+    /// activation on the registry entry.
+    Running(NonZeroU32),
+    /// A call hook raised a trap the guest never returns from — an OOM
+    /// or supervisor kill, or a signal exit. Any activation was
+    /// released then, and this state is terminal.
+    Ended,
+}
+
+impl InstanceActivity {
+    pub fn new(instance: RegisteredInstance) -> Self {
+        let last_nanos = instance.started_at();
+        Self {
+            instance,
+            state: ActivityState::Idle,
+            last_nanos,
+        }
+    }
+
+    pub fn instance(&self) -> &RegisteredInstance {
+        &self.instance
+    }
+
+    /// The condemnation recorded for this instance, if any.
+    pub fn pending_kill(&self) -> Option<KillReason> {
+        self.instance.pending_kill()
+    }
+
+    /// Report the transition a call hook just delivered.
+    ///
+    /// The condemnation check lives here rather than in the caller
+    /// because the two cannot be separated safely: a hook that records
+    /// a transition and then refuses to let the guest continue has told
+    /// the registry about an activation whose closing hook will never
+    /// fire. Ending the activation in the same step is what makes the
+    /// trailing unwind transitions harmless.
+    pub fn record(
+        &mut self,
+        transition: InstanceExecutionTransition,
+        now_nanos: u64,
+    ) -> ActivityStep {
+        self.last_nanos = now_nanos;
+        let change = match transition {
+            InstanceExecutionTransition::Resume => self.enter(now_nanos),
+            InstanceExecutionTransition::Pause => self.leave(now_nanos),
+        };
+        match self.instance.pending_kill() {
+            Some(reason) => {
+                let ending = self.end(now_nanos);
+                ActivityStep {
+                    change: change.then(ending),
+                    killed: Some(reason),
+                }
+            }
+            None => ActivityStep {
+                change,
+                killed: None,
+            },
+        }
+    }
+
+    /// End this store's activation because a trap the guest never
+    /// returns from is being raised. Terminal and idempotent.
+    pub fn end(&mut self, now_nanos: u64) -> ActivityChange {
+        self.last_nanos = now_nanos;
+        let change = match self.state {
+            ActivityState::Running(_) => ActivityChange::Left {
+                instance_elapsed: self.instance.entry().close_activation(now_nanos),
+            },
+            ActivityState::Idle | ActivityState::Ended => ActivityChange::Unchanged,
+        };
+        self.state = ActivityState::Ended;
+        change
+    }
+
+    fn enter(&mut self, now_nanos: u64) -> ActivityChange {
+        match self.state {
+            ActivityState::Idle => {
+                self.instance.entry().open_activation(now_nanos);
+                self.state = ActivityState::Running(NonZeroU32::MIN);
+                ActivityChange::Entered
+            }
+            ActivityState::Running(depth) => {
+                self.state = ActivityState::Running(depth.saturating_add(1));
+                ActivityChange::Unchanged
+            }
+            ActivityState::Ended => ActivityChange::Unchanged,
+        }
+    }
+
+    fn leave(&mut self, now_nanos: u64) -> ActivityChange {
+        match self.state {
+            ActivityState::Running(depth) => match NonZeroU32::new(depth.get() - 1) {
+                Some(remaining) => {
+                    self.state = ActivityState::Running(remaining);
+                    ActivityChange::Unchanged
+                }
+                None => {
+                    self.state = ActivityState::Idle;
+                    ActivityChange::Left {
+                        instance_elapsed: self.instance.entry().close_activation(now_nanos),
+                    }
+                }
+            },
+            // A store whose pauses outnumber its resumes while its
+            // activation is still live is a kernel bookkeeping bug: the
+            // owner that would have opened the activation is this one.
+            // Kernel-owned invariant, so it stays fatal.
+            ActivityState::Idle => panic!(
+                "instance {} paused while already inactive",
+                self.instance.name()
+            ),
+            ActivityState::Ended => ActivityChange::Unchanged,
+        }
+    }
+}
+
+impl Drop for InstanceActivity {
+    fn drop(&mut self) {
+        // A store dropped mid-guest — a cancelled task, a future
+        // dropped while its fiber is suspended — never reports the
+        // pause wasmtime would have. Close the activation at the last
+        // timestamp this owner saw, so the instance does not read as
+        // permanently on a processor.
+        let _ = self.end(self.last_nanos);
+    }
+}
+
 impl InstanceEntry {
     fn total_active_nanos(&self, now_nanos: u64) -> u64 {
         let total = self.active_nanos.load(Ordering::Acquire);
@@ -757,18 +938,26 @@ impl InstanceEntry {
         total.saturating_add(now_nanos.saturating_sub(resumed_at))
     }
 
-    fn resume(&self, now_nanos: u64) {
-        let previous_depth = self.active_depth.fetch_add(1, Ordering::AcqRel);
-        if previous_depth == 0 {
+    /// Open one activation on this instance. Called only by the
+    /// [`InstanceActivity`] that opened it, which is the single owner
+    /// of the pairing behind this count.
+    fn open_activation(&self, now_nanos: u64) {
+        if self.active_depth.fetch_add(1, Ordering::AcqRel) == 0 {
             self.last_resume_at.store(now_nanos, Ordering::Release);
         }
     }
 
-    fn pause(&self, now_nanos: u64) -> Option<u64> {
+    /// Close one activation, returning how long the instance held a
+    /// processor when this was the last one.
+    fn close_activation(&self, now_nanos: u64) -> Option<u64> {
         let previous_depth = self.active_depth.fetch_sub(1, Ordering::AcqRel);
+        // Every close is made by the owner that made the matching open,
+        // so a count that has already reached zero here is the
+        // registry's own bookkeeping going wrong, not a user-load
+        // condition. Kernel-owned invariant: panic.
         assert!(
             previous_depth != 0,
-            "instance {} paused while already inactive",
+            "instance {} closed an activation it never opened",
             self.name
         );
 
@@ -792,7 +981,7 @@ impl InstanceEntry {
 
 #[cfg(test)]
 mod tests {
-    use super::{InstanceExecutionTransition, InstanceRegistry};
+    use super::{InstanceActivity, InstanceExecutionTransition, InstanceRegistry};
 
     #[test]
     fn assigns_stable_ids() {
@@ -815,11 +1004,12 @@ mod tests {
         assert_eq!(first[0].cpu_busy, 0);
         assert_eq!(first[0].memory_bytes, 4096);
 
-        instance.transition(InstanceExecutionTransition::Resume, 220);
+        let mut activity = InstanceActivity::new(instance.clone());
+        activity.record(InstanceExecutionTransition::Resume, 220);
         let second = registry.snapshot(260);
         assert_eq!(second[0].cpu_busy, 666);
 
-        instance.transition(InstanceExecutionTransition::Pause, 280);
+        activity.record(InstanceExecutionTransition::Pause, 280);
         let third = registry.snapshot(320);
         assert_eq!(third[0].cpu_busy, 333);
     }

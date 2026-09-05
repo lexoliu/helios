@@ -1403,7 +1403,7 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    let pid = match u32::try_from(caller.data().instance.id().raw()) {
+    let pid = match u32::try_from(caller.data().instance().id().raw()) {
         Ok(pid) => pid,
         Err(_) => return p1::errno::OVERFLOW,
     };
@@ -1422,7 +1422,7 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    let current = match u32::try_from(caller.data().instance.id().raw()) {
+    let current = match u32::try_from(caller.data().instance().id().raw()) {
         Ok(pid) => pid,
         Err(_) => return p1::errno::OVERFLOW,
     };
@@ -1452,7 +1452,7 @@ where
     if status != p1::errno::SUCCESS {
         return Ok(status);
     }
-    let current = match u32::try_from(caller.data().instance.id().raw()) {
+    let current = match u32::try_from(caller.data().instance().id().raw()) {
         Ok(pid) => pid,
         Err(_) => return Ok(p1::errno::OVERFLOW),
     };
@@ -1720,7 +1720,7 @@ where
             .unwrap_or_default(),
         None => caller.data().environment.clone(),
     };
-    let process_id = caller.data().instance.id().raw().to_string();
+    let process_id = caller.data().instance().id().raw().to_string();
     environment.retain(|(name, _)| name.as_str() != HELIOS_PROCESS_ID_ENV);
     environment.push((HELIOS_PROCESS_ID_ENV.into(), process_id));
     let service = caller

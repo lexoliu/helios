@@ -75,7 +75,7 @@ where
     let timer = caller.data().timer();
     let spawner = caller.data().spawner.clone();
     let runtime_state = caller.data().runtime_state.clone();
-    let instance = caller.data().instance.clone();
+    let instance = caller.data().instance().clone();
     let parent_instance_id = caller.data().parent_instance_id;
     let arguments = caller.data().arguments.clone();
     let environment = caller.data().environment.clone();
