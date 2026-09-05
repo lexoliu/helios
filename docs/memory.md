@@ -93,11 +93,18 @@ hosted test `memory_policy_tests` places instances against a real
 `UserMemoryPool` until it refuses one, and records 140 on the 2 GiB
 guest's memory map and 422 on three times it.
 
-`instance-startup-500` is above the 2 GiB ceiling and stays out of the
-`bench-x86-64-linux` lane's gating set: 500 instances want about 6.1 GiB
-of machine before the kernel's own baseline, so it needs a guest of 8 GiB
-to be measured rather than a different pool. `instance-startup-100` fits
-and is measured.
+Memory is no longer what stops the density workload. On run
+[33969418797](https://github.com/lexoliu/helios/actions/runs/33969418797)
+`instance-startup-100` reached instance 104 with no `ProgramOutOfMemory`
+and no OOM-killer line anywhere in the boot, and was refused by the
+executor's fixed 768 KiB instance task share instead (#159) — a constant
+the guest's memory does not move. Both density cells stay out of the
+`bench-x86-64-linux` gating set until that is settled.
+
+`instance-startup-500` is above the 2 GiB memory ceiling in any case:
+500 instances want about 6.1 GiB of machine before the kernel's own
+baseline, so it needs a bigger guest to be measured rather than a
+different pool.
 
 ## Related
 
