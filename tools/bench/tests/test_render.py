@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from helios_bench.gate import evaluate
+from helios_bench.gate import GateReport, evaluate
 from helios_bench.plots import plot_report
 from helios_bench.render import (
     marked_section,
@@ -57,7 +57,10 @@ def test_docs_gate_and_pins_render(baseline_report: Report, regressed_report: Re
     docs = render_docs_results([baseline_report], "1001")
     assert "### Lane `x86-64-kvm`" in docs
     assert "benchmarks/runs/1001/x86-64-kvm-hostcall.svg" in docs
-    gate = render_gate(evaluate(baseline_report, regressed_report))
+    gate = render_gate(
+        GateReport(paired=None, cross_run=evaluate(baseline_report, regressed_report)),
+        baseline_report.run.lane,
+    )
     assert "**regression**" in gate and "**Blocking**" in gate
     pins = render_pins(baseline_report)
     assert "b83d18c8558b6d32fb0c0727d1c6a32639842c49" in pins

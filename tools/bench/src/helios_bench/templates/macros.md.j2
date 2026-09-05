@@ -11,10 +11,10 @@
 {% endfor %}
 {{ found.text }}
 {%- endmacro %}
-{% macro row(workload) -%}
-| `{{ workload.name }}`{% if workload.headline %} (headline){% endif %}{% if workload.parity_bug %} **parity bug**{% endif %} | {{ cell(workload, Side.HELIOS) }} | {{ cell(workload, Side.LINUX_WASMTIME) }} | {{ cell(workload, Side.LINUX_NATIVE) }} | {{ speedup(workload, Side.LINUX_WASMTIME) }} | {{ speedup(workload, Side.LINUX_NATIVE) }} |
+{% macro row(workload, sides) -%}
+| `{{ workload.name }}`{% if workload.headline %} (headline){% endif %}{% if workload.parity_bug %} **parity bug**{% endif %}{% for side in sides %} | {{ cell(workload, side) }}{% endfor %} | {{ speedup(workload, Side.LINUX_WASMTIME) }} | {{ speedup(workload, Side.LINUX_NATIVE) }} |
 {%- endmacro %}
-{% macro header() -%}
-| Workload | Helios | Linux + Wasmtime | Native Linux | vs Wasmtime | vs native |
-| --- | ---: | ---: | ---: | ---: | ---: |
+{% macro header(sides) -%}
+| Workload{% for side in sides %} | {{ SIDE_LABELS[side] }}{% endfor %} | vs Wasmtime | vs native |
+| ---{% for side in sides %} | ---:{% endfor %} | ---: | ---: |
 {%- endmacro %}

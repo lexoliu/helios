@@ -22,6 +22,13 @@ Three sides, on one machine, in one workflow run:
 | Linux + Wasmtime | the same wasm, precompiled by `wasmtime compile` from the same Wasmtime release Helios vendors, run by `wasmtime run --allow-precompiled` inside a Fedora guest | `tools/wasi-apps/fedora_qemu_baseline.py` |
 | Native Linux | a C or distribution-native equivalent inside the same Fedora guest | same guest, `tools/bench/native/*.c` |
 
+A fourth side appears when the run is **paired**: `Helios (baseline)`, a
+second Helios image built from another commit and timed against the first
+on the same host, in the same job. It is not a fourth runtime — it is the
+same kernel at another revision, and it exists so that a few-percent
+change can be told apart from a change of runner. See "The paired mode"
+below.
+
 Every side gets the same QEMU release, accelerator (KVM), vCPU count,
 memory, virtio block/net/rng devices,
 and network backend. The pins are in `tools/bench/manifest.toml`; the
@@ -119,12 +126,20 @@ Per cell (workload × side), `iterations` executions (11 by default):
 - A comparison between Helios and a Linux side is **significant** when
   the two warm bootstrap intervals do not overlap and the ratio of medians
   moves by more than the noise floor; otherwise it prints "within noise".
-- The regression gate compares a candidate report against the newest
-  `dev` report of the same lane and calls a headline workload regressed
-  when its Helios warm intervals are disjoint and the median moved by more
-  than the larger of the two runs' noise floors. It blocks only when both
-  reports are publishable, i.e. from dedicated runners; on advisory reports
-  it comments the table on the pull request.
+- The regression gate makes the same call twice, against two baselines,
+  and the difference between them is which one can be trusted to block.
+  A headline workload is regressed when the two warm bootstrap intervals
+  are disjoint and the median moved by more than the noise floor.
+  - **Paired**, against the `Helios (baseline)` side of the candidate's
+    own report: one host, one job, the two images booted back to back for
+    every workload. Nothing about the machine differs between the
+    columns, so this half blocks on a headline regression whether or not
+    the report is publishable.
+  - **Cross-run**, against the newest `dev` report of the same lane:
+    another job, another runner. This half blocks only when both reports
+    are publishable *and* their run records name the same host CPU;
+    otherwise it comments the table and enforces nothing.
+  The gate comment on a pull request prints the paired table first.
 
 ## Reports and where the numbers come from
 
@@ -261,6 +276,65 @@ claims is recorded by `host-check` and listed in the report's
 `deviations`, and any deviation at all makes the report
 `publishable: false`.
 
+## The paired mode
+
+A shared runner does not pin the CPU model. Run 33990628290 reported
+every workload 20-40% faster than the `dev` run it was compared against
+(33987950977), including `quickjs-loop`, `cpython-json` and
+`wasm-simd-lanes`, which the change under test — cache-line padding of
+three kernel structures — cannot touch. Two consecutive `dev` runs agree
+within a few percent. The pull request's run had landed on a faster
+machine, and nothing in the comparison could see that (#173).
+
+The paired mode answers it by taking the second column on the same
+machine:
+
+```bash
+uv run helios-bench run --lane x86-64-kvm --out-dir … --baseline-ref
+```
+
+Given a ref, `--baseline-ref` resolves it; given none, it means the merge
+base with `dev`, the commit the branch is a change to. The suite then
+checks that commit out as a git worktree under
+`target/perf-baselines/worktrees/<sha>/helios`, builds its guest image
+and its inspector there through the same `tools/wasi-apps/workload-bench.sh`
+that builds the candidate's, and times both.
+
+Two guest images cannot share a guest, so the boot is the smallest unit
+the pairing has. A paired run therefore boots **one guest per workload
+per image** rather than one per class, and the two boots of a workload
+are adjacent: baseline, candidate, next workload, and which of the two
+goes first alternates so that neither systematically holds the earlier
+slot. Within a boot the iterations are what they always were — iteration
+1 cold, the rest the warm series — because a guest per iteration would
+make every iteration a cold one and leave nothing for the CV bound, the
+bootstrap interval or the cross-run comparison to stand on.
+
+What the two images share, and therefore cannot explain a difference
+between them: the host and its CPU model, load and thermal state; the
+QEMU release, the accelerator, the vCPUs and the memory; the network
+backend and the host HTTP, TCP and echo servers on it; the workload
+manifest, read from the candidate checkout for both; everything under
+`artifacts/` that `tools/wasi-apps/build.sh` stages, linked into the
+baseline worktree entry by entry rather than copied; and the vendored
+Wasmtime checkout, linked as the worktree's sibling so both kernels
+compile against one revision. What differs is the kernel image, the
+bootfs it carries (the compiler plugin included) and the inspector that
+boots them.
+
+The report carries the second column as the `helios_baseline` side, and
+its run record carries both commits (`helios_git_sha` for the candidate,
+`baseline_git_sha` for the baseline). A run that was asked to pair and
+could not build or measure its baseline is a failed run, not a report
+with one column missing.
+
+`bench-suite.yml` runs a pull request in paired mode against
+`github.event.pull_request.base.sha`, and `workflow_dispatch` takes a
+`baseline_ref` input. The `bench-x86-64-linux` lane of `ci.yml` is
+unchanged except that the inspector now writes the host CPU model into
+the `run` record it emits, so a comparison between two of its runs can
+tell one machine from two.
+
 ## Reproducing a published number
 
 ```bash
@@ -272,7 +346,8 @@ uv run helios-bench render tables --report ../../target/bench/x86-64-kvm/report.
 ```
 
 `run --dry-run` prints the exact harness commands and the host
-deviations without running anything. `--sides helios` or
+deviations without running anything, the baseline worktree included: it
+resolves the ref but creates nothing. `--sides helios` or
 `--sides linux_native,linux_wasmtime` runs one side; `--workload` repeats
 to select workloads. The runner drives `tools/wasi-apps/linux-gap-bench.py`
 for both sides; every intermediate file (per-class JSONL, the guest's

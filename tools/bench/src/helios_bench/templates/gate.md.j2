@@ -1,10 +1,14 @@
-### Benchmark gate — lane `{{ result.lane }}`
+{% macro table(result) %}
 
-Baseline run `{{ result.baseline_run or "local" }}`, candidate run `{{ result.candidate_run or "local" }}`, noise floor {{ result.noise_floor | percent }}.
-{% if result.enforced %}
-Both reports are from dedicated runners: headline regressions block.
+#### {{ GATE_TITLES[result.kind] }}
+
+Baseline {{ result.baseline_label }}, candidate {{ result.candidate_label }}, noise floor {{ result.noise_floor | percent }}.
+{% if result.kind == GateKind.PAIRED %}
+Both columns were measured in this job on {{ result.candidate_host }}, the two images booted back to back for every workload: headline regressions block whether or not the report is publishable.
+{% elif result.enforced %}
+Both reports are from dedicated runners on {{ result.candidate_host }}: headline regressions block.
 {% else %}
-Advisory comparison (at least one report is not publishable): nothing blocks, the table is informational.
+Informational only, and nothing here blocks: {% if result.baseline_host != result.candidate_host %}the two runs did not land on the same host ({{ result.baseline_host }} against {{ result.candidate_host }}){% else %}at least one of the two reports is not publishable{% endif %}.
 {% endif %}
 
 | Workload | Baseline | Candidate | Shift | CIs disjoint | Beyond noise | Verdict |
@@ -16,7 +20,23 @@ Advisory comparison (at least one report is not publishable): nothing blocks, th
 {% if result.blocking %}
 **Blocking**: {{ result.headline_regressions | map(attribute="workload") | join(", ") }} regressed significantly.
 {% elif result.regressions %}
-Significant regressions outside the headline set or on an advisory report: {{ result.regressions | map(attribute="workload") | join(", ") }}.
+Significant regressions outside the headline set, or on a comparison that does not block: {{ result.regressions | map(attribute="workload") | join(", ") }}.
+{% elif result.improvements %}
+No significant regression. Significant improvement: {{ result.improvements | map(attribute="workload") | join(", ") }}.
 {% else %}
-No significant regression.
+No significant regression, and nothing moved beyond the noise floor.
+{% endif %}
+{% endmacro %}
+### Benchmark gate — lane `{{ lane }}`
+{% if report.paired %}
+{{ table(report.paired) }}
+{% else %}
+
+This run was not paired: there is no second image to compare against on this host, so only the cross-run table below is available.
+{% endif %}
+{% if report.cross_run %}
+{{ table(report.cross_run) }}
+{% else %}
+
+No `dev` report exists for this lane yet, so there is no cross-run table.
 {% endif %}
