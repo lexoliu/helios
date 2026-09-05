@@ -143,6 +143,14 @@ struct BalloonShared {
     /// Set by the runtime's out-of-memory path.
     deflate_requested: AtomicBool,
     /// Wakes the task that owns the inflated runs.
+    ///
+    /// One consumer, level-triggered: every raise means "the target or
+    /// the pressure state moved, look again", so a single pending wake
+    /// covers however many raises landed while the service was busy.
+    /// Signalling it with `notify_all` would be a bug rather than an
+    /// over-approximation — that call banks permits for waits that have
+    /// not happened yet, so the service's next park would return
+    /// immediately and its loop would stop yielding to the executor.
     work: Notify,
 }
 
@@ -177,7 +185,7 @@ impl BalloonHandle {
     /// a synchronous allocation failure, not a task that can wait.
     pub fn request_deflate(&self) {
         self.shared.deflate_requested.store(true, Ordering::Release);
-        self.shared.work.notify_all();
+        self.shared.work.notify_one_coalesced();
     }
 }
 
@@ -210,7 +218,7 @@ where
     kernel.spawn_local_detached(async move {
         loop {
             forwarder.config_changed().await;
-            forwarded.shared.work.notify_all();
+            forwarded.shared.work.notify_one_coalesced();
         }
     });
 
@@ -928,6 +936,57 @@ mod tests {
                     value: free - floor
                 },
             ]
+        );
+    }
+
+    /// Polls `future` once, reporting whether it finished.
+    fn poll_once(future: core::pin::Pin<&mut impl core::future::Future<Output = ()>>) -> bool {
+        let waker = core::task::Waker::noop();
+        let mut context = core::task::Context::from_waker(waker);
+        matches!(future.poll(&mut context), core::task::Poll::Ready(()))
+    }
+
+    /// The work signal is the only thing that makes the balloon service
+    /// yield: it runs one adjustment pass, parks on the next raise, and
+    /// the executor gets the processor back in between.
+    ///
+    /// A signal that banks permits for waits that have not happened yet
+    /// turns that park into a no-op, and the service's `loop` then never
+    /// reaches an await — one `poll` that never returns, on a task
+    /// pinned to the processor that brought the device up. Everything
+    /// else on that processor's local queue stops being polled, which is
+    /// how a guest ends up alive with a kernel plugin that never gets
+    /// its first request.
+    #[test]
+    fn a_work_raise_releases_one_wait_and_the_next_one_parks() {
+        let handle = BalloonHandle::new();
+
+        handle.request_deflate();
+        assert!(
+            poll_once(core::pin::pin!(handle.shared.work.notified())),
+            "the raise has to release the wait the service is parked on"
+        );
+        assert!(
+            !poll_once(core::pin::pin!(handle.shared.work.notified())),
+            "the service's next wait has to park, or its loop stops yielding"
+        );
+    }
+
+    /// Raises that land while the service is mid-pass describe the same
+    /// thing — look at the target again — so they coalesce into the one
+    /// wake that pass owes, rather than queueing a pass each.
+    #[test]
+    fn repeated_work_raises_coalesce_into_one_wake() {
+        let handle = BalloonHandle::new();
+
+        handle.request_deflate();
+        handle.request_deflate();
+        handle.request_deflate();
+
+        assert!(poll_once(core::pin::pin!(handle.shared.work.notified())));
+        assert!(
+            !poll_once(core::pin::pin!(handle.shared.work.notified())),
+            "three raises of the same level-triggered signal owe one wake"
         );
     }
 

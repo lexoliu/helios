@@ -227,6 +227,13 @@ struct SwapShared {
     /// Faults waiting for a page. Bounded, because an unbounded queue
     /// here would mean an unbounded number of blocked fibers.
     faults: ConcurrentQueue<SwapFaultRequest>,
+    /// Wakes the swap service. One consumer, level-triggered: a raise
+    /// means "there is a fault queued or the free-memory picture moved",
+    /// and the service re-reads both when it wakes, so one pending wake
+    /// stands for however many raises landed while it was working.
+    /// `notify_all` is the wrong primitive here — it banks permits for
+    /// waits that have not happened yet, so the service's next park
+    /// would return immediately and its loop would never yield.
     work: Notify,
     counters: SwapCounters,
     backend: &'static str,
@@ -342,7 +349,7 @@ impl SwapHandle {
             // faulting instruction would fault forever.
             return Err(SwapFaultError::Backend);
         }
-        self.shared.work.notify_all();
+        self.shared.work.notify_one_coalesced();
         loop {
             if let Some(outcome) = reply.read() {
                 return outcome;
@@ -378,7 +385,7 @@ impl SwapHandle {
     /// Wakes the policy, for callers that have just changed how much
     /// memory is free.
     pub fn poke(&self) {
-        self.shared.work.notify_all();
+        self.shared.work.notify_one_coalesced();
     }
 }
 
@@ -944,6 +951,33 @@ fn current_pressure() -> PressureLevel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Polls `future` once, reporting whether it finished.
+    fn poll_once(future: core::pin::Pin<&mut impl core::future::Future<Output = ()>>) -> bool {
+        let waker = core::task::Waker::noop();
+        let mut context = core::task::Context::from_waker(waker);
+        matches!(future.poll(&mut context), core::task::Poll::Ready(()))
+    }
+
+    /// The swap service parks on its work signal between passes, which
+    /// is the only point at which the processor it runs on gets to poll
+    /// anything else. A signal that banks permits for waits that have
+    /// not happened yet would make that park return immediately and turn
+    /// the service loop into a spin inside a single `poll`.
+    #[test]
+    fn a_poke_releases_one_wait_and_the_next_one_parks() {
+        let handle = SwapHandle::new("test", 0);
+
+        handle.poke();
+        assert!(
+            poll_once(core::pin::pin!(handle.shared.work.notified())),
+            "the poke has to release the wait the service is parked on"
+        );
+        assert!(
+            !poll_once(core::pin::pin!(handle.shared.work.notified())),
+            "the service's next wait has to park, or its loop stops yielding"
+        );
+    }
 
     fn insert<Token: Copy>(map: &mut SwapMap<Token>, token: Token) -> SwapToken {
         let handle = map.reserve().expect("index");
