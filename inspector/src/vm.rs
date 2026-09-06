@@ -841,7 +841,7 @@ struct AotBenchCommand {
 #[derive(Debug)]
 struct ResolvedVmCommand {
     profile: &'static VmProfile,
-    build: KernelBuildProfile,
+    build: KernelBuildSpec,
     qemu_bin: PathBuf,
     kernel: PathBuf,
     socket: Option<PathBuf>,
@@ -865,8 +865,6 @@ struct ResolvedVmCommand {
     qemu_trace: Vec<String>,
     qemu_trace_log: Option<PathBuf>,
     qemu_arg: Vec<String>,
-    boot_programs: Vec<String>,
-    no_compiler_plugin: bool,
     runtime_dir: Option<PathBuf>,
     keep_runtime_dir: bool,
     acpi: bool,
@@ -902,13 +900,16 @@ pub(crate) fn run(mut command: VmCommand) -> Result<()> {
         }
         // `build` produces artifacts and boots nothing, so it neither
         // preflights the QEMU host state nor spawns a guest.
-        Some(VmSessionCommand::Build) => return build_vm(&resolve(command)?),
+        Some(VmSessionCommand::Build) => {
+            let file = load_config_file(command.config.as_deref())?;
+            return build_vm(&resolve_build(&command, &file, None)?);
+        }
         session => command.command = session,
     }
     let command = resolve(command)?;
     ensure_qemu_command(&command)?;
     if !command.no_build {
-        build_vm(&command)?;
+        build_vm(&command.build)?;
     }
     let mut runtime = VmRuntime::spawn(&command)?;
     let result = connect_and_run(&command, &mut runtime);
@@ -924,14 +925,32 @@ pub(crate) fn run(mut command: VmCommand) -> Result<()> {
     })
 }
 
-fn resolve(command: VmCommand) -> Result<ResolvedVmCommand> {
-    let file = load_config_file(command.config.as_deref())?;
+/// Everything a guest build needs, and nothing a boot needs: the build
+/// never starts QEMU, so it resolves no accelerator, CPU model, or host
+/// state (#179).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct KernelBuildSpec {
+    profile: &'static VmProfile,
+    kind: KernelBuildProfile,
+    boot_programs: Vec<String>,
+    no_compiler_plugin: bool,
+}
+
+fn debug_shortcut(command: &VmCommand, file: &VmConfigFile) -> bool {
+    command.debug || file.debug.unwrap_or(false)
+}
+
+fn resolve_build(
+    command: &VmCommand,
+    file: &VmConfigFile,
+    session_command: Option<&ResolvedVmSessionCommand>,
+) -> Result<KernelBuildSpec> {
     let arch = file.arch.unwrap_or(command.arch);
     let profile = arch.profile();
-    let debug = command.debug || file.debug.unwrap_or(false);
     let release = command.release || file.release.unwrap_or(false);
     let profile_generate = command.profile_generate || file.profile_generate.unwrap_or(false);
-    let kernel_debug = debug || command.kernel_debug || file.kernel_debug.unwrap_or(false);
+    let kernel_debug =
+        debug_shortcut(command, file) || command.kernel_debug || file.kernel_debug.unwrap_or(false);
     if release && kernel_debug {
         bail!("--release and --kernel-debug cannot be used together");
     }
@@ -940,7 +959,7 @@ fn resolve(command: VmCommand) -> Result<ResolvedVmCommand> {
             "--profile-generate builds its own optimised kernel and cannot be combined with --release, --debug or --kernel-debug"
         );
     }
-    let build = if profile_generate {
+    let kind = if profile_generate {
         KernelBuildProfile::ProfileGenerate
     } else if release {
         KernelBuildProfile::Release
@@ -949,13 +968,38 @@ fn resolve(command: VmCommand) -> Result<ResolvedVmCommand> {
     } else {
         KernelBuildProfile::Debug
     };
+    let mut boot_programs = file.boot_programs.clone();
+    boot_programs.extend(command.boot_programs.iter().cloned());
+    if let Some(ResolvedVmSessionCommand::WorkloadBench(bench)) = session_command {
+        for program in crate::workload_bench::required_boot_programs(bench)? {
+            if !boot_programs.contains(&program) {
+                boot_programs.push(program);
+            }
+        }
+    }
+    let no_compiler_plugin = command.no_compiler_plugin || file.no_compiler_plugin.unwrap_or(false);
+    Ok(KernelBuildSpec {
+        profile,
+        kind,
+        boot_programs,
+        no_compiler_plugin,
+    })
+}
+
+fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand> {
+    let file = load_config_file(command.config.as_deref())?;
+    let session_command: Option<ResolvedVmSessionCommand> = command.command.take().map(Into::into);
+    let build = resolve_build(&command, &file, session_command.as_ref())?;
+    let profile = build.profile;
+    let arch = profile.arch;
+    let debug = debug_shortcut(&command, &file);
     let qemu_bin = command
         .qemu_bin
         .or(file.qemu_bin)
         .unwrap_or_else(|| PathBuf::from(profile.qemu_bin));
     let kernel = match command.kernel.or(file.kernel) {
         Some(kernel) => kernel,
-        None => default_kernel_path(arch, build.directory())?,
+        None => default_kernel_path(arch, build.kind.directory())?,
     };
     let smp = command.smp.or(file.smp).unwrap_or(profile.default_smp);
     let memory = command
@@ -1032,17 +1076,6 @@ fn resolve(command: VmCommand) -> Result<ResolvedVmCommand> {
     let qemu_trace_log = command.qemu_trace_log.or(file.qemu_trace_log);
     let mut qemu_arg = file.qemu_arg;
     qemu_arg.extend(command.qemu_arg);
-    let session_command = command.command.map(Into::into);
-    let mut boot_programs = file.boot_programs;
-    boot_programs.extend(command.boot_programs);
-    if let Some(ResolvedVmSessionCommand::WorkloadBench(bench)) = &session_command {
-        for program in crate::workload_bench::required_boot_programs(bench)? {
-            if !boot_programs.contains(&program) {
-                boot_programs.push(program);
-            }
-        }
-    }
-    let no_compiler_plugin = command.no_compiler_plugin || file.no_compiler_plugin.unwrap_or(false);
     let runtime_dir = command.runtime_dir.or(file.runtime_dir);
     let keep_runtime_dir =
         debug || command.keep_runtime_dir || file.keep_runtime_dir.unwrap_or(false);
@@ -1112,8 +1145,6 @@ fn resolve(command: VmCommand) -> Result<ResolvedVmCommand> {
         qemu_trace,
         qemu_trace_log,
         qemu_arg,
-        boot_programs,
-        no_compiler_plugin,
         runtime_dir,
         keep_runtime_dir,
         acpi,
@@ -1300,11 +1331,11 @@ fn ensure_qemu_command(command: &ResolvedVmCommand) -> Result<()> {
     Ok(())
 }
 
-fn build_vm(command: &ResolvedVmCommand) -> Result<()> {
+fn build_vm(command: &KernelBuildSpec) -> Result<()> {
     let repo_root = repo_root()?;
     run_step(
         "building helios-cli",
-        cargo_build_command(&repo_root, command.build.host())
+        cargo_build_command(&repo_root, command.kind.host())
             .arg("-p")
             .arg("helios-cli"),
     )?;
@@ -1320,7 +1351,7 @@ fn build_vm(command: &ResolvedVmCommand) -> Result<()> {
     )?;
     run_step(
         "building inspector",
-        cargo_build_command(&repo_root, command.build.host())
+        cargo_build_command(&repo_root, command.kind.host())
             .arg("-p")
             .arg("helios-inspector"),
     )?;
@@ -1352,9 +1383,9 @@ fn cargo_build_command(repo_root: &Path, build: KernelBuildProfile) -> Command {
 /// cargo joins a `--config` array with the one `.cargo/config.toml` sets for
 /// the same target, where the environment variable would replace it and cost
 /// the target its link arguments and ISA features.
-fn kernel_build_command(repo_root: &Path, command: &ResolvedVmCommand) -> Command {
-    let mut cargo = cargo_build_command(repo_root, command.build);
-    if command.build.instrumented() {
+fn kernel_build_command(repo_root: &Path, command: &KernelBuildSpec) -> Command {
+    let mut cargo = cargo_build_command(repo_root, command.kind);
+    if command.kind.instrumented() {
         cargo
             .arg("--config")
             .arg(profile_generate_rustflags(command.profile));
@@ -1396,14 +1427,14 @@ fn profile_generate_rustflags(profile: &VmProfile) -> String {
     format!("target.\"{}\".rustflags={flags}", profile.cargo_target)
 }
 
-fn run_kernel_prebuild(command: &ResolvedVmCommand) -> Result<PathBuf> {
+fn run_kernel_prebuild(command: &KernelBuildSpec) -> Result<PathBuf> {
     let cli = discover_helios_cli()?;
     let repo_root = repo_root()?;
     let out_dir = repo_root
         .join("target")
         .join("kernel-prebuild")
         .join(command.profile.cargo_target)
-        .join(command.build.directory());
+        .join(command.kind.directory());
     let mut prebuild = Command::new(&cli);
     prebuild
         .current_dir(&repo_root)
@@ -1413,7 +1444,7 @@ fn run_kernel_prebuild(command: &ResolvedVmCommand) -> Result<PathBuf> {
         .arg("--target")
         .arg(command.profile.cargo_target)
         .arg("--profile")
-        .arg(command.build.guest_programs())
+        .arg(command.kind.guest_programs())
         .arg("--cargo")
         .arg("cargo");
     for program in &command.boot_programs {
@@ -1481,7 +1512,7 @@ fn connect_and_run(command: &ResolvedVmCommand, runtime: &mut VmRuntime) -> Resu
             workload_command,
             VmProvenance {
                 arch: arch_label(command.profile.arch),
-                release: command.build.optimised(),
+                release: command.build.kind.optimised(),
                 smp: command.smp,
                 memory: command.memory.clone(),
                 cpu: command.cpu.clone(),
@@ -3287,6 +3318,26 @@ mod tests {
 
     /// A `vm` invocation with nothing but its defaults, for tests that
     /// only care about one option.
+    #[test]
+    fn a_build_resolves_without_an_accelerator() {
+        // A build boots nothing, so it must resolve on a host that has no
+        // accelerator for the target (#179). Pick whichever architecture
+        // this host cannot accelerate; a host that accelerates all three
+        // has nothing to prove here.
+        let Some(arch) = [VmArch::X86_64, VmArch::Aarch64, VmArch::Riscv64]
+            .into_iter()
+            .find(|arch| default_accel(arch.profile()).is_err())
+        else {
+            return;
+        };
+        let mut command = minimal_command();
+        command.arch = arch;
+        let spec = resolve_build(&command, &VmConfigFile::default(), None)
+            .expect("a build needs no accelerator");
+        assert_eq!(spec.profile.arch, arch);
+        assert_eq!(spec.kind, KernelBuildProfile::Debug);
+    }
+
     fn minimal_command() -> VmCommand {
         VmCommand {
             rpc_transport: None,
@@ -3388,7 +3439,7 @@ mod tests {
 
         let resolved = resolve(command).expect("VM command resolution must succeed");
         assert_eq!(resolved.profile, &X86_64_VM_PROFILE);
-        assert_eq!(resolved.build, KernelBuildProfile::Debug);
+        assert_eq!(resolved.build.kind, KernelBuildProfile::Debug);
         assert_eq!(resolved.smp, DEFAULT_X86_SMP);
         assert_eq!(resolved.memory, DEFAULT_X86_MEMORY);
         assert_eq!(resolved.bios, None);
@@ -3518,7 +3569,7 @@ mod tests {
         };
 
         let resolved = resolve(command).expect("VM debug command resolution must succeed");
-        assert_eq!(resolved.build, KernelBuildProfile::KernelDebug);
+        assert_eq!(resolved.build.kind, KernelBuildProfile::KernelDebug);
         assert_eq!(resolved.gdb.as_deref(), Some(DEFAULT_GDB_ENDPOINT));
         assert!(resolved.gdb_wait);
         assert!(resolved.keep_runtime_dir);
@@ -3554,11 +3605,11 @@ mod tests {
         let command = watchdog_test_command(arch);
         run_step(
             "building helios-cli",
-            cargo_build_command(&repo_root()?, command.build.host())
+            cargo_build_command(&repo_root()?, command.build.kind.host())
                 .arg("-p")
                 .arg("helios-cli"),
         )?;
-        let prebuild_manifest = run_kernel_prebuild(&command)?;
+        let prebuild_manifest = run_kernel_prebuild(&command.build)?;
         let status = std::process::Command::new("cargo")
             .current_dir(repo_root()?)
             .arg("build")
@@ -3585,7 +3636,12 @@ mod tests {
         let profile = arch.profile();
         ResolvedVmCommand {
             profile,
-            build: KernelBuildProfile::Debug,
+            build: KernelBuildSpec {
+                profile,
+                kind: KernelBuildProfile::Debug,
+                boot_programs: vec!["debugger".to_owned()],
+                no_compiler_plugin: true,
+            },
             qemu_bin: PathBuf::from(profile.qemu_bin),
             kernel: default_kernel_path(arch, KernelBuildProfile::Debug.directory())
                 .expect("workspace root must resolve"),
@@ -3614,8 +3670,6 @@ mod tests {
             qemu_trace: Vec::new(),
             qemu_trace_log: None,
             qemu_arg: Vec::new(),
-            boot_programs: vec!["debugger".to_owned()],
-            no_compiler_plugin: true,
             runtime_dir: None,
             keep_runtime_dir: false,
             acpi: false,
@@ -3643,7 +3697,7 @@ mod tests {
     #[ignore = "requires qemu, a release riscv guest build, and staged host artifacts"]
     fn exec_path_runs_host_curl_in_riscv_release_vm() -> Result<()> {
         let command = direct_exec_command(VmArch::Riscv64);
-        build_vm(&command)?;
+        build_vm(&command.build)?;
         let mut runtime = VmRuntime::spawn(&command)?;
         let socket = runtime
             .socket_path()
@@ -3681,7 +3735,7 @@ mod tests {
     #[ignore = "requires qemu, a release riscv guest build, and staged host artifacts"]
     fn exec_path_runs_host_cpython_in_riscv_release_vm() -> Result<()> {
         let command = direct_exec_command(VmArch::Riscv64);
-        build_vm(&command)?;
+        build_vm(&command.build)?;
         let mut runtime = VmRuntime::spawn(&command)?;
         let socket = runtime
             .socket_path()
@@ -3715,7 +3769,7 @@ mod tests {
     #[ignore = "requires qemu, a release riscv guest build, and staged host artifacts"]
     fn shell_runs_host_cpython_in_riscv_release_vm() -> Result<()> {
         let command = direct_exec_command(VmArch::Riscv64);
-        build_vm(&command)?;
+        build_vm(&command.build)?;
         let mut runtime = VmRuntime::spawn(&command)?;
         let socket = runtime
             .socket_path()
@@ -3758,7 +3812,12 @@ mod tests {
         let profile = arch.profile();
         ResolvedVmCommand {
             profile,
-            build: KernelBuildProfile::Release,
+            build: KernelBuildSpec {
+                profile,
+                kind: KernelBuildProfile::Release,
+                boot_programs: Vec::new(),
+                no_compiler_plugin: false,
+            },
             qemu_bin: PathBuf::from(profile.qemu_bin),
             kernel: default_kernel_path(arch, KernelBuildProfile::Release.directory())
                 .expect("workspace root must resolve"),
@@ -3787,8 +3846,6 @@ mod tests {
             qemu_trace: Vec::new(),
             qemu_trace_log: None,
             qemu_arg: Vec::new(),
-            boot_programs: Vec::new(),
-            no_compiler_plugin: false,
             runtime_dir: None,
             keep_runtime_dir: false,
             acpi: false,
