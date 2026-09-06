@@ -39,7 +39,7 @@ jobs:
           # splits them so a lint failure names the surface it came from
           # and each lane keeps its own build cache.
           - name: lint-fmt
-            command: just fmt-check
+            command: just fmt-check && just deny-check
           - name: lint-host
             command: just clippy-host && just clippy-programs
           - name: lint-aarch64
@@ -62,7 +62,7 @@ jobs:
             libudev-dev just cmake ninja-build
       - uses: taiki-e/install-action@v2
         with:
-          tool: wasm-tools
+          tool: wasm-tools,cargo-deny
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.13.0

@@ -137,8 +137,8 @@ maintainer's decision and the fork's revision moves once, per §1.
   `clippy::manual_async_fn` enforces the impl-block half of this rule and
   is never allowed off.
 - Errors are typed enums with `thiserror`; `anyhow` does not appear in this
-  repository, and `workspace-root/tests/no_anyhow.rs` refuses any manifest
-  that lists it. A CLI or test boundary may translate an error into text,
+  repository, and `cargo deny --workspace check bans` (`deny.toml`) refuses
+  any crate that depends on it. A CLI or test boundary may translate an error into text,
   but every crate preserves structured provenance. When an upstream API
   answers in `anyhow::Result` (`wit-component`, for one), the caller's typed
   variant carries the rendered chain (`format!("{error:#}")`) in a named
@@ -392,14 +392,14 @@ just lint
 just test-units
 ```
 
-`just lint` is `tools/fmt.sh --check` plus `cargo clippy … -D warnings` over
-the host crates, each guest program, and the three bare-metal targets.
+`just lint` is `tools/fmt.sh --check`, `cargo deny --workspace check bans`
+against `deny.toml`, and `cargo clippy … -D warnings` over the host crates, each
+guest program, and the three bare-metal targets.
 `just test-units` runs the `hal`, `virtio`, `netstack`, `kernel`,
-`inspector-protocol` and `workspace-root` unit tests, the `hal_layering`
-test (`kernel/tests/`) that enforces §1, and the `no_anyhow` test
-(`workspace-root/tests/`) that enforces §3.2. The recipe names each
-integration test with `--test <name>`, so a new enforcement test is added to
-the recipe in the same change or it never runs.
+`inspector-protocol` and `workspace-root` unit tests and the `hal_layering`
+test (`kernel/tests/`) that enforces §1. The recipe names each integration
+test with `--test <name>`, so a new enforcement test is added to the recipe
+in the same change or it never runs.
 
 CI (`.github/workflows/ci.yml`) runs the same recipes, one lane each, so a
 red lane names the surface that broke:
@@ -407,7 +407,7 @@ red lane names the surface that broke:
 | Lane | Runner | What it proves |
 | --- | --- | --- |
 | `check-host`, `check-aarch64`, `check-riscv`, `check-x86` | `ubuntu-24.04` | Every surface compiles. |
-| `lint-fmt`, `lint-host`, `lint-aarch64`, `lint-riscv`, `lint-x86` | `ubuntu-24.04` | Formatting and clippy at `-D warnings`. |
+| `lint-fmt`, `lint-host`, `lint-aarch64`, `lint-riscv`, `lint-x86` | `ubuntu-24.04` | Formatting, the `deny.toml` bans, and clippy at `-D warnings`. |
 | `test-units`, `test-embedded-debugger` | `ubuntu-24.04` | Unit tests and the embedded debugger. |
 | `smoke-x86-64` | `ubuntu-24.04`, `--accel kvm` | Boot, shell, CPython, the in-kernel compiler, a trapped OOB load, curl over virtio-net, the raw serial captures. |
 | `smoke-riscv64` | `ubuntu-24.04`, `--accel tcg` | Boot, shell, CPython, a trapped OOB load, the inspector RPC over vsock, curl over virtio-net. |
