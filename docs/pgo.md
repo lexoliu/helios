@@ -172,7 +172,11 @@ matches the instrumentation.
 `bench-suite.yml` has a `profile-generate` job: it builds the
 instrumented x86-64 kernel, runs the compiler workload and the suite's
 non-network classes on it under KVM, merges every `.profraw` and uploads
-one `helios-kernel.profdata`. It reports no numbers and it is not a
+one `helios-kernel.profdata`. It boots the lane's own machine, read from
+`tools/bench/manifest.toml`: the collection runs the lane's workloads, and
+a guest smaller than the one the suite times cannot run them — `4G`
+against the lane's `6G` took the x86-64 kernel's memory pool down on
+`process-startup` (run 34011609558, job 101428527454). It reports no numbers and it is not a
 benchmark surface — counter updates in the executor, the virtio queues
 and the netstack's per-packet path change scheduling, so anything timed
 on an instrumented kernel would be measuring the counters. The network

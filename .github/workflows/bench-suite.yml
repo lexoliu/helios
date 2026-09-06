@@ -250,6 +250,9 @@ jobs:
       || (github.event_name == 'push' && vars.HELIOS_BENCH_DEDICATED == 'true')
     runs-on: ubuntu-24.04
     timeout-minutes: 240
+    env:
+      # The lane whose workloads and machine the profile describes.
+      BENCH_LANE: x86-64-kvm
     steps:
       - uses: actions/checkout@v4
         with:
@@ -258,6 +261,17 @@ jobs:
       - uses: ./helios/.github/actions/bench-host
         with:
           rust-cache-key: profile-generate
+          bench-tooling: "true"
+      - name: Read the lane
+        id: lane
+        working-directory: helios/tools/bench
+        run: |
+          # The collection boots the lane's own workloads, so it boots the
+          # lane's machine: a guest smaller than the one the suite times
+          # cannot run them, and a number written here would be a second
+          # definition of the one in tools/bench/manifest.toml.
+          entry="$(uv run helios-bench lanes --select "${BENCH_LANE}" --format github-matrix | jq -c '.[0]')"
+          printf 'memory=%s\n' "$(printf '%s' "$entry" | jq -r '.memory')" >> "$GITHUB_OUTPUT"
       - name: Put llvm-profdata on PATH
         # The inspector merges the raw profile before it writes anything and
         # names this tool if it cannot find it; the toolchain's own copy is
@@ -277,7 +291,7 @@ jobs:
         run: |
           mkdir -p "$GITHUB_WORKSPACE/profiles"
           ./target/release/helios-inspector vm --arch x86-64 --profile-generate \
-            --accel kvm --memory 4G \
+            --accel kvm --memory "${{ steps.lane.outputs.memory }}" \
             aot-bench artifacts/wasi-tools/curl.wasm --iterations 2 \
             --llvm-raw-profile-output "$GITHUB_WORKSPACE/profiles/aot-bench.profraw"
       - name: Collect the workload profile
@@ -290,7 +304,7 @@ jobs:
           # networking. The network path is profiled once a lane provisions
           # the tap backend for a collection run.
           ./target/release/helios-inspector vm --arch x86-64 --profile-generate \
-            --accel kvm --memory 4G \
+            --accel kvm --memory "${{ steps.lane.outputs.memory }}" \
             workload-bench --iterations 1 \
             --class compute --class startup --class hostcall \
             --class ipc --class sched --class fs \
