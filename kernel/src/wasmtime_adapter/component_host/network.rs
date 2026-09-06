@@ -175,7 +175,7 @@ trait DynComponentHostNetworkService: Send + Sync + 'static {
         stream: u64,
     ) -> Pin<Box<dyn Future<Output = Result<(), TcpError>> + Send + 'a>>;
 
-    fn tcp_close<'a>(&'a self, stream: u64) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+    fn tcp_close(&self, stream: u64);
 
     fn udp_bind<'a>(
         &'a self,
@@ -487,8 +487,8 @@ impl ComponentNetworkService for ComponentHostNetworkService {
         self.inner.tcp_shutdown_send(stream)
     }
 
-    fn tcp_close(&self, stream: Self::TcpStream) -> impl Future<Output = ()> + Send + '_ {
-        self.inner.tcp_close(stream)
+    fn tcp_close(&self, stream: Self::TcpStream) {
+        self.inner.tcp_close(stream);
     }
 
     fn udp_bind(
@@ -903,11 +903,9 @@ where
         ))
     }
 
-    fn tcp_close<'a>(&'a self, stream: u64) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
-        Box::pin(
-            self.service
-                .tcp_close(<Service::TcpStream as ComponentHostTcpStreamToken>::from_raw(stream)),
-        )
+    fn tcp_close(&self, stream: u64) {
+        self.service
+            .tcp_close(<Service::TcpStream as ComponentHostTcpStreamToken>::from_raw(stream));
     }
 
     fn udp_bind<'a>(

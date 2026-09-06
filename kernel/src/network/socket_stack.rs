@@ -123,12 +123,8 @@ where
         self.service.tcp_shutdown_send(stream)
     }
 
-    pub fn tcp_close(
-        &self,
-        _: TcpCap,
-        stream: Service::TcpStream,
-    ) -> impl Future<Output = ()> + Send + '_ {
-        self.service.tcp_close(stream)
+    pub fn tcp_close(&self, _: TcpCap, stream: Service::TcpStream) {
+        self.service.tcp_close(stream);
     }
 
     pub async fn udp_bind(
@@ -400,9 +396,7 @@ mod tests {
             core::future::ready(Ok(()))
         }
 
-        fn tcp_close(&self, _: Self::TcpStream) -> impl Future<Output = ()> + Send + '_ {
-            core::future::ready(())
-        }
+        fn tcp_close(&self, _: Self::TcpStream) {}
 
         fn udp_bind(
             &self,

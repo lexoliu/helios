@@ -536,3 +536,493 @@ impl helios_netstack::NetworkInterface for RecordingNetworkInterface {
         }
     }
 }
+
+/// The network service the kernel's own tests drive.
+///
+/// An in-memory double that models an always-ready loopback peer. It
+/// lives here rather than inside one test module because several of
+/// them need the same double, and one of them needs a real
+/// [`crate::ComponentHostNetworkService`] built on top of it.
+#[cfg(feature = "wasmtime-runtime")]
+mod network {
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    use bytes::Bytes;
+
+    use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+    use triomphe::Arc;
+
+    use crate::{ComponentNetworkService, SocketReadiness};
+
+    /// The streams a [`TestNetworkService`] has been asked to retire.
+    #[derive(Default)]
+    pub(crate) struct TestClosedStreams {
+        count: AtomicUsize,
+        last: AtomicU64,
+    }
+
+    impl TestClosedStreams {
+        fn record(&self, stream: u64) {
+            self.last.store(stream, Ordering::Release);
+            self.count.fetch_add(1, Ordering::AcqRel);
+        }
+
+        pub(crate) fn count(&self) -> usize {
+            self.count.load(Ordering::Acquire)
+        }
+
+        pub(crate) fn last(&self) -> u64 {
+            self.last.load(Ordering::Acquire)
+        }
+    }
+
+    #[derive(Clone, Default)]
+    pub(crate) struct TestNetworkService {
+        closed: Arc<TestClosedStreams>,
+    }
+
+    impl TestNetworkService {
+        pub(crate) fn new() -> Self {
+            Self::default()
+        }
+
+        /// The retirement log this service writes to, which is what a
+        /// socket-lifetime test asserts against.
+        pub(crate) fn closed(&self) -> Arc<TestClosedStreams> {
+            self.closed.clone()
+        }
+    }
+
+    impl ComponentNetworkService for TestNetworkService {
+        type TcpStream = u64;
+        type TcpListener = u64;
+        type UdpSocket = u64;
+
+        // The in-memory doubles model an always-ready loopback peer.
+        fn tcp_readiness(
+            &self,
+            _: Self::TcpStream,
+        ) -> impl Future<Output = Result<SocketReadiness, crate::TcpError>> + Send + '_ {
+            core::future::ready(Ok(SocketReadiness {
+                readable: true,
+                writable: true,
+                hangup: false,
+            }))
+        }
+
+        fn tcp_listener_readiness(
+            &self,
+            _: Self::TcpListener,
+        ) -> impl Future<Output = Result<SocketReadiness, crate::TcpError>> + Send + '_ {
+            core::future::ready(Ok(SocketReadiness {
+                readable: true,
+                writable: false,
+                hangup: false,
+            }))
+        }
+
+        fn udp_readiness(
+            &self,
+            _: Self::UdpSocket,
+        ) -> impl Future<Output = Result<SocketReadiness, crate::UdpError>> + Send + '_ {
+            core::future::ready(Ok(SocketReadiness {
+                readable: true,
+                writable: true,
+                hangup: false,
+            }))
+        }
+
+        fn hardware_address(&self) -> [u8; 6] {
+            [2, 0, 0, 0, 0, 1]
+        }
+
+        fn ipv4_cidr(
+            &self,
+        ) -> impl core::future::Future<Output = Option<crate::Ipv4Cidr>> + Send + '_ {
+            core::future::ready(Some(crate::Ipv4Cidr::new(
+                crate::Ipv4Address::new([127, 0, 0, 1]),
+                8,
+            )))
+        }
+
+        fn ping(
+            &self,
+            _: &str,
+            _: u64,
+        ) -> impl core::future::Future<Output = Result<crate::PingReply, crate::PingError>> + Send + '_
+        {
+            core::future::ready(Ok(crate::PingReply {
+                address: crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([127, 0, 0, 1])),
+                round_trip_nanos: 1,
+                payload_bytes: 1,
+            }))
+        }
+
+        fn dns_resolve(
+            &self,
+            _: &str,
+            _: u64,
+        ) -> impl core::future::Future<
+            Output = Result<Vec<crate::NetworkIpAddress>, crate::DnsError>,
+        > + Send
+        + '_ {
+            core::future::ready(Ok(vec![crate::NetworkIpAddress::Ipv4(
+                crate::Ipv4Address::new([127, 0, 0, 1]),
+            )]))
+        }
+
+        fn tcp_connect(
+            &self,
+            _: &str,
+            _: u16,
+            _: u64,
+        ) -> impl core::future::Future<Output = Result<Self::TcpStream, crate::TcpError>> + Send + '_
+        {
+            core::future::ready(Ok(7))
+        }
+
+        fn tcp_connect_from(
+            &self,
+            _: &str,
+            _: u16,
+            local_port: u16,
+            _: u8,
+            _: u64,
+        ) -> impl core::future::Future<Output = Result<Self::TcpStream, crate::TcpError>> + Send + '_
+        {
+            core::future::ready(Ok(u64::from(local_port)))
+        }
+
+        fn tcp_connect_address(
+            &self,
+            _: crate::NetworkIpAddress,
+            _: u16,
+            local_port: u16,
+            _: u8,
+            _: u64,
+        ) -> impl core::future::Future<Output = Result<Self::TcpStream, crate::TcpError>> + Send + '_
+        {
+            core::future::ready(Ok(if local_port == 0 {
+                7
+            } else {
+                u64::from(local_port)
+            }))
+        }
+
+        fn tcp_listen(
+            &self,
+            _: crate::NetworkIpAddress,
+            local_port: u16,
+            _: u16,
+            _: u8,
+        ) -> impl core::future::Future<
+            Output = Result<crate::TcpListener<Self::TcpListener>, crate::TcpError>,
+        > + Send
+        + '_ {
+            core::future::ready(Ok(crate::TcpListener {
+                listener: 8,
+                local_port,
+            }))
+        }
+
+        fn tcp_set_hop_limit(&self, _: Self::TcpStream, _: u8) -> Result<(), crate::TcpError> {
+            Ok(())
+        }
+
+        fn tcp_listener_set_hop_limit(
+            &self,
+            _: Self::TcpListener,
+            _: u8,
+        ) -> Result<(), crate::TcpError> {
+            Ok(())
+        }
+
+        fn tcp_accept(
+            &self,
+            listener: Self::TcpListener,
+            _: u64,
+        ) -> impl core::future::Future<
+            Output = Result<crate::TcpAccepted<Self::TcpStream>, crate::TcpError>,
+        > + Send
+        + '_ {
+            core::future::ready(Ok(crate::TcpAccepted {
+                stream: listener + 1,
+                address: crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([127, 0, 0, 1])),
+                port: 4040,
+            }))
+        }
+
+        fn tcp_write_all(
+            &self,
+            _: Self::TcpStream,
+            _: &[u8],
+            _: u64,
+        ) -> impl core::future::Future<Output = Result<(), crate::TcpError>> + Send + '_ {
+            core::future::ready(Ok(()))
+        }
+
+        fn tcp_read(
+            &self,
+            _: Self::TcpStream,
+            _: u32,
+            _: u64,
+        ) -> impl core::future::Future<Output = Result<Option<Bytes>, crate::TcpError>> + Send + '_
+        {
+            core::future::ready(Ok(Some(Bytes::from_static(&[4, 2]))))
+        }
+
+        fn tcp_shutdown_send(
+            &self,
+            _: Self::TcpStream,
+        ) -> impl core::future::Future<Output = Result<(), crate::TcpError>> + Send + '_ {
+            core::future::ready(Ok(()))
+        }
+
+        fn tcp_close(&self, stream: Self::TcpStream) {
+            self.closed.record(stream);
+        }
+
+        fn udp_bind(
+            &self,
+            local_port: u16,
+        ) -> impl core::future::Future<
+            Output = Result<crate::UdpBinding<Self::UdpSocket>, crate::UdpError>,
+        > + Send
+        + '_ {
+            core::future::ready(Ok(crate::UdpBinding {
+                socket: 9,
+                local_port,
+            }))
+        }
+
+        fn udp_connect(
+            &self,
+            _: Self::UdpSocket,
+            _: crate::NetworkIpAddress,
+            _: u16,
+        ) -> Result<(), crate::UdpError> {
+            Ok(())
+        }
+
+        fn udp_disconnect(&self, _: Self::UdpSocket) -> Result<(), crate::UdpError> {
+            Ok(())
+        }
+
+        fn udp_set_hop_limit(&self, _: Self::UdpSocket, _: u8) -> Result<(), crate::UdpError> {
+            Ok(())
+        }
+
+        fn udp_send(
+            &self,
+            _: Self::UdpSocket,
+            _: &str,
+            _: u16,
+            bytes: &[u8],
+            _: u64,
+        ) -> impl core::future::Future<Output = Result<u64, crate::UdpError>> + Send + '_ {
+            let _ = bytes;
+            async { panic!("a UDP send must take the typed address path") }
+        }
+
+        fn udp_send_address(
+            &self,
+            _: Self::UdpSocket,
+            _: crate::NetworkIpAddress,
+            _: u16,
+            bytes: &[u8],
+            _: u64,
+        ) -> impl core::future::Future<Output = Result<u64, crate::UdpError>> + Send + '_ {
+            core::future::ready(Ok(bytes.len() as u64))
+        }
+
+        fn udp_receive(
+            &self,
+            _: Self::UdpSocket,
+            _: u32,
+            _: u64,
+        ) -> impl core::future::Future<
+            Output = Result<Option<crate::UdpDatagram>, crate::UdpError>,
+        > + Send
+        + '_ {
+            core::future::ready(Ok(None))
+        }
+
+        fn udp_join_multicast_v4(
+            &self,
+            _: crate::Ipv4Address,
+            _: crate::Ipv4Address,
+        ) -> impl core::future::Future<Output = Result<(), crate::UdpError>> + Send + '_ {
+            core::future::ready(Ok(()))
+        }
+
+        fn udp_leave_multicast_v4(
+            &self,
+            _: crate::Ipv4Address,
+            _: crate::Ipv4Address,
+        ) -> impl core::future::Future<Output = Result<(), crate::UdpError>> + Send + '_ {
+            core::future::ready(Ok(()))
+        }
+
+        fn udp_close(
+            &self,
+            _: Self::UdpSocket,
+        ) -> impl core::future::Future<Output = ()> + Send + '_ {
+            core::future::ready(())
+        }
+    }
+
+    impl crate::NetworkAdminBackend for TestNetworkService {
+        fn network_stats(&self) -> crate::NetworkStats {
+            crate::NetworkStats::default()
+        }
+
+        fn bridge_port(
+            &self,
+            _: crate::NetworkPortId,
+            _: crate::NetworkBridgeRequest,
+        ) -> impl core::future::Future<Output = Result<(), crate::NetworkControlError>> + Send
+        {
+            core::future::ready(Err(crate::NetworkControlError::BridgeUnavailable))
+        }
+
+        fn unbridge_port(
+            &self,
+            _: crate::NetworkPortId,
+        ) -> impl core::future::Future<Output = Result<(), crate::NetworkControlError>> + Send
+        {
+            core::future::ready(Err(crate::NetworkControlError::BridgeUnavailable))
+        }
+
+        fn acquire_dhcp(
+            &self,
+            _: crate::NetworkPortId,
+        ) -> impl core::future::Future<Output = Result<crate::Ipv4Cidr, crate::NetworkControlError>> + Send
+        {
+            core::future::ready(Ok(crate::Ipv4Cidr::new(
+                crate::Ipv4Address::new([127, 0, 0, 1]),
+                8,
+            )))
+        }
+
+        fn add_address(
+            &self,
+            _: crate::NetworkPortId,
+            _: crate::Ipv4Cidr,
+        ) -> impl core::future::Future<Output = Result<(), crate::NetworkControlError>> + Send
+        {
+            core::future::ready(Ok(()))
+        }
+
+        fn remove_address(
+            &self,
+            _: crate::NetworkPortId,
+            _: crate::Ipv4Cidr,
+        ) -> impl core::future::Future<Output = Result<(), crate::NetworkControlError>> + Send
+        {
+            core::future::ready(Ok(()))
+        }
+
+        fn clear_addresses(
+            &self,
+            _: crate::NetworkPortId,
+        ) -> impl core::future::Future<Output = Result<(), crate::NetworkControlError>> + Send
+        {
+            core::future::ready(Ok(()))
+        }
+
+        fn list_addresses(
+            &self,
+            _: crate::NetworkPortId,
+        ) -> impl core::future::Future<
+            Output = Result<Vec<crate::Ipv4Cidr>, crate::NetworkControlError>,
+        > + Send {
+            core::future::ready(Ok(vec![crate::Ipv4Cidr::new(
+                crate::Ipv4Address::new([127, 0, 0, 1]),
+                8,
+            )]))
+        }
+
+        fn mac_address(
+            &self,
+            _: crate::NetworkPortId,
+        ) -> impl core::future::Future<
+            Output = Result<crate::MacAddress, crate::NetworkControlError>,
+        > + Send {
+            core::future::ready(Ok(crate::MacAddress::new([2, 0, 0, 0, 0, 1])))
+        }
+
+        fn set_gateway(
+            &self,
+            _: crate::NetworkPortId,
+            _: crate::Ipv4Address,
+        ) -> impl core::future::Future<Output = Result<(), crate::NetworkControlError>> + Send
+        {
+            core::future::ready(Ok(()))
+        }
+
+        fn add_route(
+            &self,
+            _: crate::NetworkPortId,
+            _: crate::Ipv4Route,
+        ) -> impl core::future::Future<Output = Result<(), crate::NetworkControlError>> + Send
+        {
+            core::future::ready(Ok(()))
+        }
+
+        fn remove_route(
+            &self,
+            _: crate::NetworkPortId,
+            _: crate::Ipv4Route,
+        ) -> impl core::future::Future<Output = Result<(), crate::NetworkControlError>> + Send
+        {
+            core::future::ready(Ok(()))
+        }
+
+        fn clear_routes(
+            &self,
+            _: crate::NetworkPortId,
+        ) -> impl core::future::Future<Output = Result<(), crate::NetworkControlError>> + Send
+        {
+            core::future::ready(Ok(()))
+        }
+
+        fn list_routes(
+            &self,
+            _: crate::NetworkPortId,
+        ) -> impl core::future::Future<
+            Output = Result<Vec<crate::Ipv4Route>, crate::NetworkControlError>,
+        > + Send {
+            core::future::ready(Ok(vec![crate::Ipv4Route::new(
+                crate::Ipv4Cidr::new(crate::Ipv4Address::new([0, 0, 0, 0]), 0),
+                crate::Ipv4Address::new([127, 0, 0, 1]),
+            )]))
+        }
+    }
+}
+
+#[cfg(feature = "wasmtime-runtime")]
+pub(crate) use network::{TestClosedStreams, TestNetworkService};
+
+/// A [`crate::ComponentHostNetworkService`] over a fresh
+/// [`TestNetworkService`], for a test that does not inspect what the
+/// service was asked to retire.
+#[cfg(feature = "wasmtime-runtime")]
+pub(crate) fn test_network_service() -> crate::ComponentHostNetworkService {
+    crate::ComponentHostNetworkService::from_service(TestNetworkService::new())
+}
+
+/// The same, paired with the log of the streams it retires.
+#[cfg(feature = "wasmtime-runtime")]
+pub(crate) fn recording_network_service() -> (
+    crate::ComponentHostNetworkService,
+    triomphe::Arc<TestClosedStreams>,
+) {
+    let service = TestNetworkService::new();
+    let closed = service.closed();
+    (
+        crate::ComponentHostNetworkService::from_service(service),
+        closed,
+    )
+}

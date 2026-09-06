@@ -720,6 +720,34 @@ impl ByteWriter {
         self.channel.reader_closed.load(Ordering::Acquire)
     }
 
+    /// Resolves once the reader half is gone.
+    ///
+    /// A producer that parks on something other than this channel has
+    /// no other way to learn that the consumer went away: it is not
+    /// waiting on the queue, so the close that wakes writability wakes
+    /// nothing it holds. The preview2 TCP bridge is one — it parks on a
+    /// socket read with no deadline — and a bridge that never learns
+    /// its channel is gone never ends, keeping the socket it reads from
+    /// alive for the rest of the boot (#184).
+    ///
+    /// The wait is armed before the flag is tested, so a close between
+    /// the two resolves it rather than being slept through.
+    pub async fn reader_closed(&self) {
+        let mut wait = self.wait_state();
+        core::future::poll_fn(|cx| {
+            loop {
+                if self.is_reader_closed() {
+                    return Poll::Ready(());
+                }
+                match self.channel.writable.poll_notified(cx, &mut wait.wait) {
+                    Poll::Ready(()) => continue,
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+        })
+        .await;
+    }
+
     pub fn close(&self) {
         self.channel.writer_closed.store(true, Ordering::Release);
         self.channel.readable.notify_one();
@@ -1001,6 +1029,47 @@ mod tests {
             .expect("queued bytes should be delivered before EOF");
         assert_eq!(received.as_ref(), b"before-close");
         assert!(futures_lite::future::block_on(reader.read()).is_none());
+    }
+
+    /// Polls `future` once with a no-op waker, reporting whether it
+    /// finished.
+    fn poll_pinned(future: core::pin::Pin<&mut impl core::future::Future<Output = ()>>) -> bool {
+        let waker = core::task::Waker::noop();
+        let mut context = core::task::Context::from_waker(waker);
+        core::future::Future::poll(future, &mut context).is_ready()
+    }
+
+    /// A producer parked on something other than the queue still has
+    /// to learn that the consumer went away. Without this the preview2
+    /// TCP bridge, which parks on a deadline-free socket read, outlived
+    /// the instance whose channel it was feeding and kept that
+    /// instance's connection open for the rest of the boot (#184).
+    #[test]
+    fn a_writer_learns_that_its_reader_is_gone_while_parked_elsewhere() {
+        let (writer, reader) = byte_channel();
+
+        let mut closed = core::pin::pin!(writer.reader_closed());
+        assert!(
+            !poll_pinned(closed.as_mut()),
+            "a live reader leaves the wait parked"
+        );
+
+        drop(reader);
+
+        assert!(
+            poll_pinned(closed.as_mut()),
+            "dropping the reader must release a producer parked on the close"
+        );
+    }
+
+    /// The same, for a close that lands before the wait is built: the
+    /// flag is the state, the signal is only the wake-up.
+    #[test]
+    fn a_writer_that_asks_after_its_reader_is_gone_does_not_park() {
+        let (writer, reader) = byte_channel();
+        drop(reader);
+
+        futures_lite::future::block_on(writer.reader_closed());
     }
 
     #[test]

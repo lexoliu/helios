@@ -283,7 +283,15 @@ where
         self.drive_tcp().await
     }
 
-    pub async fn tcp_close(&self, stream: TcpStreamId) {
+    /// Retires `stream`, freeing its slab slot and its stack socket.
+    ///
+    /// Synchronous on purpose: retirement is a shard-lock update with
+    /// nothing to await, and the owner that has to run it is a `Drop`.
+    /// A future here would mean the only way to end a stream's life is
+    /// to spawn a task, and a task spawned from a dying instance is a
+    /// task that may never run — which is how a connection outlived the
+    /// program that opened it (#184).
+    pub fn tcp_close(&self, stream: TcpStreamId) {
         self.inner.state.with_handle(stream, |state| {
             state.remove_tcp_stream(stream);
         });

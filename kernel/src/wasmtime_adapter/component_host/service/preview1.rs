@@ -4239,7 +4239,7 @@ where
     let descriptor =
         Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(WasixTcpSocket::Connected {
             family,
-            stream: accepted.stream,
+            stream: WasixOwnedTcpStream::new(service.clone(), accepted.stream),
             peer_address: accepted.address,
             peer_port: accepted.port,
             options: WasixSocketOptions::default(),
@@ -4275,7 +4275,7 @@ where
     match caller.data().descriptors.get(fd) {
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
             WasixTcpSocket::Connected { stream, .. },
-        ))) => Ok(*stream),
+        ))) => Ok(stream.id()),
         Some(Preview1Descriptor::Socket(_)) => Err(p1::errno::INVAL),
         Some(_) => Err(p1::errno::NOTSOCK),
         None => Err(p1::errno::BADF),
@@ -4391,7 +4391,7 @@ where
     let stream = match caller.data().descriptors.get(fd) {
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
             WasixTcpSocket::Connected { stream, .. },
-        ))) => *stream,
+        ))) => stream.id(),
         Some(Preview1Descriptor::Socket(_)) => return p1::errno::INVAL,
         Some(_) => return p1::errno::NOTSOCK,
         None => return p1::errno::BADF,
@@ -4500,7 +4500,7 @@ where
     let Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(WasixTcpSocket::Connected {
         stream,
         ..
-    }))) = descriptor
+    }))) = &descriptor
     else {
         return p1_connected_tcp_stream(caller, fd)
             .err()
@@ -4527,7 +4527,7 @@ where
         Err(_) => return p1::errno::OVERFLOW,
     };
     if let Err(error) = service
-        .tcp_write_all_bytes(stream, Bytes::from(bytes), timeout)
+        .tcp_write_all_bytes(stream.id(), Bytes::from(bytes), timeout)
         .await
     {
         return p1_errno_from_tcp_error_for_fdflags(error, fdflags);
@@ -4550,21 +4550,22 @@ where
     let descriptor = caller.data().descriptors.get(fd).cloned();
     match descriptor {
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
-            WasixTcpSocket::Connected { stream, .. },
+            WasixTcpSocket::Connected { .. },
         ))) => {
             let status = caller.data().require_tcp_authority();
             if status != p1::errno::SUCCESS {
                 return status;
             }
-            let Some(service) = caller.data().runtime_state.network_service() else {
+            if caller.data().runtime_state.network_service().is_none() {
                 return p1::errno::NETDOWN;
-            };
-            service.tcp_close(stream).await;
+            }
             let Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(slot))) =
                 caller.data_mut().descriptors.get_mut(fd)
             else {
                 return p1::errno::BADF;
             };
+            // Replacing the slot drops this descriptor's handle, and the
+            // stream is retired once the last one is gone.
             let options = *slot.options();
             *slot = WasixTcpSocket::Unconnected {
                 family: slot.family(),
@@ -5155,10 +5156,80 @@ mod tests {
         }
     }
 
+    fn connected_socket_entry(
+        service: crate::ComponentHostNetworkService,
+        stream: u64,
+    ) -> Preview1DescriptorEntry {
+        Preview1DescriptorEntry {
+            descriptor: Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
+                WasixTcpSocket::Connected {
+                    family: WasixSocketFamily::Ipv4,
+                    stream: WasixOwnedTcpStream::new(service, stream),
+                    peer_address: crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([
+                        127, 0, 0, 1,
+                    ])),
+                    peer_port: 80,
+                    options: WasixSocketOptions::default(),
+                },
+            )),
+            close_on_exec: false,
+            fdflags: 0,
+        }
+    }
+
+    /// A program that exits with a socket open retires it.
+    ///
+    /// `fd_close` used to be the only thing that touched a preview1
+    /// socket's netstack stream, and it only dropped the descriptor —
+    /// so a program that exited, whether or not it had closed the fd,
+    /// left the connection in its shard. In #184 eleven of them were
+    /// still there, one per iteration of the workload that had opened
+    /// them, each advertising a full receive window with nobody left to
+    /// read it.
+    #[test]
+    fn a_preview1_socket_descriptor_retires_its_stream_when_its_table_goes_away() {
+        let (service, closed) = crate::test_support::recording_network_service();
+        let table =
+            Preview1DescriptorTable::from_entries(vec![Some(connected_socket_entry(service, 11))]);
+
+        assert_eq!(closed.count(), 0, "a live descriptor holds its stream open");
+        drop(table);
+        assert_eq!(
+            closed.count(),
+            1,
+            "the descriptor table takes its sockets with it"
+        );
+        assert_eq!(closed.last(), 11);
+    }
+
+    /// A stream two descriptors share is retired when the second one
+    /// goes, not the first. `exec` hands the child a copy of the table,
+    /// so closing on the first drop would take the connection out from
+    /// under the process that inherited it — and the slab slot it frees
+    /// is handed straight to the next connection.
+    #[test]
+    fn a_preview1_socket_stream_outlives_every_descriptor_but_the_last() {
+        let (service, closed) = crate::test_support::recording_network_service();
+        let mut table =
+            Preview1DescriptorTable::from_entries(vec![Some(connected_socket_entry(service, 11))]);
+        let inherited = table.clone_for_exec();
+
+        assert_eq!(table.close(0), p1::errno::SUCCESS);
+        assert_eq!(
+            closed.count(),
+            0,
+            "the inherited descriptor still holds the stream"
+        );
+        drop(table);
+        assert_eq!(closed.count(), 0);
+        drop(inherited);
+        assert_eq!(closed.count(), 1, "the last descriptor retires the stream");
+    }
+
     fn connected_socket() -> Preview1Descriptor {
         Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(WasixTcpSocket::Connected {
             family: WasixSocketFamily::Ipv4,
-            stream: 9,
+            stream: WasixOwnedTcpStream::new(crate::test_support::test_network_service(), 9),
             peer_address: crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([127, 0, 0, 1])),
             peer_port: 80,
             options: WasixSocketOptions::default(),

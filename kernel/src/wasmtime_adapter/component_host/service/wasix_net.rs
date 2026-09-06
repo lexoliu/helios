@@ -1491,7 +1491,7 @@ fn wasix_socket_backend_handle(
 ) -> Option<WasixSocketBackendHandle> {
     match descriptor {
         WasixSocketDescriptor::Tcp(WasixTcpSocket::Connected { stream, .. }) => {
-            Some(WasixSocketBackendHandle::TcpStream(*stream))
+            Some(WasixSocketBackendHandle::TcpStream(stream.id()))
         }
         WasixSocketDescriptor::Tcp(WasixTcpSocket::Listening { listener, .. }) => {
             Some(WasixSocketBackendHandle::TcpListener(*listener))
@@ -1823,7 +1823,7 @@ where
     let descriptor =
         Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(WasixTcpSocket::Connected {
             family,
-            stream: accepted.stream,
+            stream: WasixOwnedTcpStream::new(service.clone(), accepted.stream),
             peer_address,
             peer_port: accepted.port,
             options: WasixSocketOptions::default(),
@@ -1944,7 +1944,7 @@ where
     let options = *slot.options();
     *slot = WasixTcpSocket::Connected {
         family,
-        stream,
+        stream: WasixOwnedTcpStream::new(service.clone(), stream),
         peer_address: address,
         peer_port: port,
         options,
@@ -2099,7 +2099,7 @@ where
             };
             let buffer = crate::RegisteredTcpReadBuffer::new(memory.base, &ranges);
             let bytes = match service
-                .tcp_read_into_registered(stream, buffer, timeout)
+                .tcp_read_into_registered(stream.id(), buffer, timeout)
                 .await
             {
                 Ok(Some(bytes)) => bytes,
@@ -2267,7 +2267,7 @@ where
                 Err(_) => return p1::errno::OVERFLOW,
             };
             if let Err(error) = service
-                .tcp_write_all_bytes(stream, Bytes::from(bytes), timeout)
+                .tcp_write_all_bytes(stream.id(), Bytes::from(bytes), timeout)
                 .await
             {
                 return p1_errno_from_tcp_error_for_fdflags(error, fdflags);
@@ -2393,7 +2393,10 @@ where
                 Err(errno) => return errno,
             };
             let timeout = wasix_effective_socket_timeout(options.send_timeout, fdflags);
-            if let Err(error) = service.tcp_write_all_bytes(stream, bytes, timeout).await {
+            if let Err(error) = service
+                .tcp_write_all_bytes(stream.id(), bytes, timeout)
+                .await
+            {
                 return p1_errno_from_tcp_error_for_fdflags(error, fdflags);
             }
             p1_write_u64(caller, memory, ret_size, written)

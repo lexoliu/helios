@@ -2035,17 +2035,13 @@ where
         ResourceType::host::<SbiTcpStream>(),
         |accessor, rep| {
             Box::pin(async move {
-                let stream = accessor.with(|mut access| {
+                // Deleting the handle is the whole of it: the backend
+                // owns the kernel stream and retires it when dropped.
+                accessor.with(|mut access| {
                     let resource = Resource::<SbiTcpStream>::new_own(rep);
-                    let stream = access.get().table.delete(resource)?;
-                    Ok::<_, wasmtime::Error>(stream)
+                    access.get().table.delete(resource)?;
+                    Ok::<_, wasmtime::Error>(())
                 })?;
-                stream
-                    .resource
-                    .backend
-                    .service
-                    .tcp_close(stream.resource.backend.stream)
-                    .await;
                 Ok::<_, wasmtime::Error>(())
             })
         },
@@ -2136,21 +2132,19 @@ where
                 };
                 let connected = service.tcp_connect(&host, port, timeout).await;
                 record_component_host_kernel_profile(profile, "system-net-tcp-connect");
-                let response = match connected {
-                    Ok(stream) => {
-                        let resource = accessor.with(|mut access| {
-                            access
-                                .get()
-                                .table
-                                .push(SbiTcpStream::new(NetworkTcpBackend {
-                                    service: service.clone(),
-                                    stream,
-                                }))
-                        })?;
-                        Ok(resource)
-                    }
-                    Err(error) => Err(convert_tcp_error(error)),
-                };
+                let response =
+                    match connected {
+                        Ok(stream) => {
+                            let resource =
+                                accessor.with(|mut access| {
+                                    access.get().table.push(SbiTcpStream::new(
+                                        NetworkTcpBackend::new(service.clone(), stream),
+                                    ))
+                                })?;
+                            Ok(resource)
+                        }
+                        Err(error) => Err(convert_tcp_error(error)),
+                    };
                 Ok::<_, wasmtime::Error>((response,))
             })
         },
@@ -2208,12 +2202,15 @@ where
                     Ok::<_, wasmtime::Error>((
                         (
                             socket.resource.backend.service.clone(),
-                            socket.resource.backend.stream,
+                            socket.resource.backend.stream(),
                         ),
                         component_host_profile(access.get()),
                     ))
                 })?;
-                let response = socket.0.tcp_read(socket.1, max_bytes, timeout).await;
+                let Some(stream) = socket.1 else {
+                    return Ok::<_, wasmtime::Error>((Err(closed_tcp_error()),));
+                };
+                let response = socket.0.tcp_read(stream, max_bytes, timeout).await;
                 let bytes = response
                     .as_ref()
                     .ok()
@@ -2242,15 +2239,18 @@ where
                     Ok::<_, wasmtime::Error>((
                         (
                             socket.resource.backend.service.clone(),
-                            socket.resource.backend.stream,
+                            socket.resource.backend.stream(),
                         ),
                         component_host_profile(access.get()),
                     ))
                 })?;
+                let Some(stream) = socket.1 else {
+                    return Ok::<_, wasmtime::Error>((Err(closed_tcp_error()),));
+                };
                 let written = bytes.len() as u64;
                 let response = socket
                     .0
-                    .tcp_write_all_bytes(socket.1, Bytes::from(bytes), timeout)
+                    .tcp_write_all_bytes(stream, Bytes::from(bytes), timeout)
                     .await
                     .map(|()| written)
                     .map_err(convert_tcp_error);
@@ -2264,14 +2264,11 @@ where
         |accessor: &Accessor<StoreData<CpuImpl, HostFs>>,
          (resource,): (Resource<SbiTcpStream>,)| {
             Box::pin(async move {
-                let socket = accessor.with(|mut access| {
-                    let socket = access.get().table.get(&resource)?;
-                    Ok::<_, wasmtime::Error>((
-                        socket.resource.backend.service.clone(),
-                        socket.resource.backend.stream,
-                    ))
+                accessor.with(|mut access| {
+                    let socket = access.get().table.get_mut(&resource)?;
+                    socket.resource.backend.close();
+                    Ok::<_, wasmtime::Error>(())
                 })?;
-                socket.0.tcp_close(socket.1).await;
                 Ok::<_, wasmtime::Error>((Ok::<(), debugger_wit::net::TcpError>(()),))
             })
         },
@@ -2358,17 +2355,13 @@ where
         ResourceType::host::<SbiTcpStream>(),
         |accessor, rep| {
             Box::pin(async move {
-                let stream = accessor.with(|mut access| {
+                // Deleting the handle is the whole of it: the backend
+                // owns the kernel stream and retires it when dropped.
+                accessor.with(|mut access| {
                     let resource = Resource::<SbiTcpStream>::new_own(rep);
-                    let stream = access.get().table.delete(resource)?;
-                    Ok::<_, wasmtime::Error>(stream)
+                    access.get().table.delete(resource)?;
+                    Ok::<_, wasmtime::Error>(())
                 })?;
-                stream
-                    .resource
-                    .backend
-                    .service
-                    .tcp_close(stream.resource.backend.stream)
-                    .await;
                 Ok::<_, wasmtime::Error>(())
             })
         },
@@ -2461,21 +2454,19 @@ where
                 };
                 let connected = service.tcp_connect(&host, port, timeout).await;
                 record_component_host_kernel_profile(profile, "program-net-tcp-connect");
-                let response = match connected {
-                    Ok(stream) => {
-                        let resource = accessor.with(|mut access| {
-                            access
-                                .get()
-                                .table
-                                .push(SbiTcpStream::new(NetworkTcpBackend {
-                                    service: service.clone(),
-                                    stream,
-                                }))
-                        })?;
-                        Ok(resource)
-                    }
-                    Err(error) => Err(convert_program_tcp_error(error)),
-                };
+                let response =
+                    match connected {
+                        Ok(stream) => {
+                            let resource =
+                                accessor.with(|mut access| {
+                                    access.get().table.push(SbiTcpStream::new(
+                                        NetworkTcpBackend::new(service.clone(), stream),
+                                    ))
+                                })?;
+                            Ok(resource)
+                        }
+                        Err(error) => Err(convert_program_tcp_error(error)),
+                    };
                 Ok::<_, wasmtime::Error>((response,))
             })
         },
@@ -2535,13 +2526,16 @@ where
                     Ok::<_, wasmtime::Error>((
                         (
                             socket.resource.backend.service.clone(),
-                            socket.resource.backend.stream,
+                            socket.resource.backend.stream(),
                         ),
                         component_host_profile(access.get()),
                     ))
                 })?;
                 let service_profile = profile.as_ref().map(ComponentHostProfile::restarted);
-                let response = socket.0.tcp_read(socket.1, max_bytes, timeout).await;
+                let Some(stream) = socket.1 else {
+                    return Ok::<_, wasmtime::Error>((Err(closed_program_tcp_error()),));
+                };
+                let response = socket.0.tcp_read(stream, max_bytes, timeout).await;
                 let bytes = response
                     .as_ref()
                     .ok()
@@ -2583,15 +2577,18 @@ where
                     Ok::<_, wasmtime::Error>((
                         (
                             socket.resource.backend.service.clone(),
-                            socket.resource.backend.stream,
+                            socket.resource.backend.stream(),
                         ),
                         component_host_profile(access.get()),
                     ))
                 })?;
+                let Some(stream) = socket.1 else {
+                    return Ok::<_, wasmtime::Error>((Err(closed_program_tcp_error()),));
+                };
                 let written = bytes.len() as u64;
                 let response = socket
                     .0
-                    .tcp_write_all_bytes(socket.1, Bytes::from(bytes), timeout)
+                    .tcp_write_all_bytes(stream, Bytes::from(bytes), timeout)
                     .await
                     .map(|()| written)
                     .map_err(convert_program_tcp_error);
@@ -2605,14 +2602,11 @@ where
         |accessor: &Accessor<StoreData<CpuImpl, HostFs>>,
          (resource,): (Resource<SbiTcpStream>,)| {
             Box::pin(async move {
-                let socket = accessor.with(|mut access| {
-                    let socket = access.get().table.get(&resource)?;
-                    Ok::<_, wasmtime::Error>((
-                        socket.resource.backend.service.clone(),
-                        socket.resource.backend.stream,
-                    ))
+                accessor.with(|mut access| {
+                    let socket = access.get().table.get_mut(&resource)?;
+                    socket.resource.backend.close();
+                    Ok::<_, wasmtime::Error>(())
                 })?;
-                socket.0.tcp_close(socket.1).await;
                 Ok::<_, wasmtime::Error>((Ok::<(), program_wit::net::TcpError>(()),))
             })
         },
@@ -3027,6 +3021,22 @@ fn convert_program_ping_error(error: crate::PingError) -> program_wit::net::Ping
             crate::PingErrorKind::Internal => program_wit::net::PingErrorKind::Internal,
         },
         detail: error.detail.as_str().to_owned(),
+    }
+}
+
+/// The error a `tcp-stream` method answers once the guest has closed
+/// the stream but still holds its handle.
+fn closed_tcp_error() -> debugger_wit::net::TcpError {
+    debugger_wit::net::TcpError {
+        kind: debugger_wit::net::TcpErrorKind::Unavailable,
+        detail: "TCP stream is closed".to_owned(),
+    }
+}
+
+fn closed_program_tcp_error() -> program_wit::net::TcpError {
+    program_wit::net::TcpError {
+        kind: program_wit::net::TcpErrorKind::Unavailable,
+        detail: "TCP stream is closed".to_owned(),
     }
 }
 

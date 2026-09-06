@@ -3,6 +3,8 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::future::Future as _;
+use core::task::Poll;
 
 use helios_hal::cpu::Cpu;
 use helios_netstack::Ipv6Address;
@@ -2942,6 +2944,29 @@ fn p2_usize_to_u64(value: usize, label: &'static str) -> u64 {
     u64::try_from(value).unwrap_or_else(|_| panic!("{label} does not fit into u64"))
 }
 
+/// One bridge read, raced against the guest half of the channel going
+/// away. `None` means the channel is gone and the bridge is done.
+async fn p2_tcp_bridge_read(
+    socket: &TcpSocket,
+    writer: &crate::ByteWriter,
+    max_bytes: u32,
+) -> Option<core::result::Result<Option<Bytes>, super::socket_types::ErrorCode>> {
+    let read = socket.read(max_bytes);
+    let closed = writer.reader_closed();
+    let mut read = core::pin::pin!(read);
+    let mut closed = core::pin::pin!(closed);
+    core::future::poll_fn(|cx| {
+        if let Poll::Ready(read) = read.as_mut().poll(cx) {
+            return Poll::Ready(Some(read));
+        }
+        if closed.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(None);
+        }
+        Poll::Pending
+    })
+    .await
+}
+
 fn p2_tcp_stream_pair<CpuImpl, HostFs>(
     store: &mut StoreData<CpuImpl, HostFs>,
     socket_resource: &Resource<TcpSocket>,
@@ -2968,7 +2993,26 @@ where
     store.spawner().try_spawn_detached(async move {
         loop {
             let read_started = p2_kernel_profile_start(&read_runtime_state, &read_cpu);
-            match read_socket.read(super::FILE_READ_CHUNK_BYTES as u32).await {
+            // The bridge holds a clone of the socket, so it is the
+            // bridge that decides when the socket's kernel stream can
+            // be retired. A backend read carries no deadline, so left
+            // alone this parks for ever — and when the instance goes
+            // away, taking the guest half of the channel with it, the
+            // bridge stayed parked and the connection stayed in its
+            // shard (#184). Racing the read against the channel's own
+            // close ends the bridge with the store it belongs to; a
+            // cancelled read leaves its bytes in the socket, which is
+            // about to be retired anyway.
+            let Some(read) = p2_tcp_bridge_read(
+                &read_socket,
+                &network_writer,
+                super::FILE_READ_CHUNK_BYTES as u32,
+            )
+            .await
+            else {
+                break;
+            };
+            match read {
                 Ok(Some(bytes)) => {
                     let byte_len = p2_usize_to_u64(bytes.len(), "preview2 tcp bridge byte count");
                     p2_record_kernel_profile_events_bytes(
@@ -3655,15 +3699,10 @@ where
     }
 
     fn drop(&mut self, resource: Resource<TcpSocket>) -> Result<()> {
-        let socket = self.table.delete(resource)?;
-        if let Some((service, stream)) = socket.take_connected_stream() {
-            // Closing is the instance's own work and is funded from its
-            // share; a refusal traps this instance instead of making the
-            // kernel carry a task it has no room for.
-            self.spawner().try_spawn_detached(async move {
-                service.tcp_close(stream).await;
-            })?;
-        }
+        // Deleting the handle is the whole of it: the stream is owned by
+        // `TcpSocketState`, which retires it when the last clone of this
+        // socket goes away.
+        self.table.delete(resource)?;
         Ok(())
     }
 }

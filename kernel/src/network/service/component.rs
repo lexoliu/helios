@@ -451,8 +451,8 @@ where
         NetworkService::tcp_shutdown_send(self, stream).await
     }
 
-    async fn tcp_close(&self, stream: Self::TcpStream) {
-        NetworkService::tcp_close(self, stream).await
+    fn tcp_close(&self, stream: Self::TcpStream) {
+        NetworkService::tcp_close(self, stream);
     }
 
     async fn udp_bind(&self, local_port: u16) -> Result<UdpBinding<Self::UdpSocket>, UdpError> {

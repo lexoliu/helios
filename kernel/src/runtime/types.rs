@@ -721,7 +721,9 @@ pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
         stream: Self::TcpStream,
     ) -> impl Future<Output = Result<(), TcpError>> + Send + '_;
 
-    fn tcp_close(&self, stream: Self::TcpStream) -> impl Future<Output = ()> + Send + '_;
+    /// Retires a stream. Synchronous because the owner that ends a
+    /// stream's life is a `Drop`, which cannot await.
+    fn tcp_close(&self, stream: Self::TcpStream);
 
     fn udp_bind(
         &self,
