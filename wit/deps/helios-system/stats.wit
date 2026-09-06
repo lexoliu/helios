@@ -179,6 +179,24 @@ interface stats {
     /// The receive window those connections advertise between them, in
     /// bytes. Zero with connections open is a shut receiver.
     tcp-receive-window-bytes: u64,
+    /// In-order payload bytes currently queued across live connections,
+    /// waiting to be read.
+    receive-queued-bytes: u64,
+    /// Out-of-order payload bytes currently buffered across live
+    /// connections, waiting on a hole to close.
+    out-of-order-queued-bytes: u64,
+    /// Segments this shard received whose payload sat wholly at or
+    /// below receive_next.
+    peer-retransmits-received: u64,
+    /// Duplicate acknowledgements this shard requested because an
+    /// out-of-order segment arrived.
+    duplicate-acks-requested: u64,
+    /// Times frame reception stalled because this queue pair's receive
+    /// reassembly pool had no free buffers.
+    rx-pool-stalls: u64,
+    /// Free reassembly buffers currently available in this queue pair's
+    /// receive pool. Zero if no pool is configured.
+    rx-pool-free: u32,
   }
 
   /// How the interface's work is spread across processors.

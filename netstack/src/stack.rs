@@ -17,9 +17,9 @@ use crate::{
     Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6Cidr, Ipv6DnsServers, Ipv6Packet,
     Ipv6RouterConfiguration, Ipv6Scope, NeighborDiscovery, PacketBuffer, RxChecksumReport, RxFrame,
     RxFrameOffload, SegmentationOffload, StackError, TcpCloseKind, TcpEndpoint, TcpFlags,
-    TcpHeader, TcpHeaderOptions, TcpPacket, TcpReceiveBuffer, TcpSegmentBudget, TcpSocket,
-    TcpTransmitSegment, TransportChecksum, TxChecksum, TxFrameRef, TxSegmentation, UdpPacket,
-    icmpv6_checksum_valid, interpret_router_advertisement, ipv4_checksum,
+    TcpHeader, TcpHeaderOptions, TcpPacket, TcpReceiveBuffer, TcpReceiveCounters, TcpSegmentBudget,
+    TcpSocket, TcpTransmitSegment, TransportChecksum, TxChecksum, TxFrameRef, TxSegmentation,
+    UdpPacket, icmpv6_checksum_valid, interpret_router_advertisement, ipv4_checksum,
     partial_transport_checksum_completes, tcp_checksum_valid, udp_checksum_valid,
 };
 
@@ -2125,6 +2125,7 @@ where
     tcp_receive_backpressured: [bool; MAX_TCP_SOCKETS],
     tcp_receive_backpressured_count: usize,
     tcp_transmit_counters: TcpTransmitCounters,
+    tcp_receive_counters: TcpReceiveCounters,
 }
 
 /// What this stack has put on the wire on behalf of its TCP sockets.
@@ -2163,6 +2164,18 @@ pub struct TcpStackCounters {
     /// The receive window those connections advertise between them, in
     /// bytes. Zero with a nonzero `sockets` is a shut receiver.
     pub receive_window_bytes: u64,
+    /// In-order data waiting in receive queues that user space has not
+    /// read yet, in bytes, summed across connections on this shard.
+    pub receive_queued_bytes: u64,
+    /// Data held in out-of-order reassembly queues across connections on
+    /// this shard, in bytes.
+    pub out_of_order_queued_bytes: u64,
+    /// Segments received whose whole payload lies at or below
+    /// `receive_next`, indicating the peer resent data it had already
+    /// sent.
+    pub peer_retransmits_received: u64,
+    /// Duplicate acknowledgements requested by connections on this shard.
+    pub duplicate_acks_requested: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -2421,6 +2434,7 @@ where
             tcp_receive_backpressured: [false; MAX_TCP_SOCKETS],
             tcp_receive_backpressured_count: 0,
             tcp_transmit_counters: TcpTransmitCounters::default(),
+            tcp_receive_counters: TcpReceiveCounters::default(),
         }
     }
 
@@ -2428,6 +2442,8 @@ where
     pub fn tcp_counters(&self) -> TcpStackCounters {
         let mut sockets = 0u32;
         let mut receive_window_bytes = 0u64;
+        let mut receive_queued_bytes = 0u64;
+        let mut out_of_order_queued_bytes = 0u64;
         for active_slot in 0..self.tcp.active_len() {
             let index = self.tcp.active_index(active_slot);
             let Some(socket) = self.tcp.get(index) else {
@@ -2436,6 +2452,10 @@ where
             sockets += 1;
             receive_window_bytes = receive_window_bytes
                 .saturating_add(u64::from(socket.advertised_receive_window_bytes()));
+            receive_queued_bytes =
+                receive_queued_bytes.saturating_add(socket.receive_queued_bytes() as u64);
+            out_of_order_queued_bytes =
+                out_of_order_queued_bytes.saturating_add(socket.out_of_order_queued_bytes() as u64);
         }
         TcpStackCounters {
             acks_sent: self.tcp_transmit_counters.acks_sent,
@@ -2444,6 +2464,10 @@ where
             sockets,
             receive_backpressured_sockets: self.tcp_receive_backpressured_count as u32,
             receive_window_bytes,
+            receive_queued_bytes,
+            out_of_order_queued_bytes,
+            peer_retransmits_received: self.tcp_receive_counters.peer_retransmits_received,
+            duplicate_acks_requested: self.tcp_receive_counters.duplicate_acks_requested,
         }
     }
 
@@ -4899,7 +4923,10 @@ where
                     .get_mut(index)
                     .expect("TCP endpoint index referenced a missing socket");
                 let previous_state = socket.state();
+                let before = socket.receive_counters();
                 let outcome = socket.on_segment(packet, payload_bytes, now.nanos());
+                self.tcp_receive_counters
+                    .fold(before, socket.receive_counters());
                 (
                     previous_state,
                     socket.state(),
@@ -11677,6 +11704,92 @@ mod tests {
             counters.receive_window_bytes != 0,
             "the drained receiver must be advertising room again"
         );
+    }
+
+    #[test]
+    fn peer_retransmit_increments_counters() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let (mut stack, _socket) = open_established_tcp_stack(local, peer);
+
+        let payload = b"hello";
+        let (segment, segment_len) = tcp_segment_with_payload(
+            peer,
+            local,
+            TcpHeader {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 101,
+                acknowledgement: 8,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+            },
+            payload,
+        );
+
+        // Deliver an in-window segment.
+        stack
+            .receive_tcp(
+                IpAddress::Ipv4(peer),
+                IpAddress::Ipv4(local),
+                &Bytes::copy_from_slice(&segment[..segment_len]),
+                RxFrameOffload::none(),
+                StackInstant::from_nanos(2),
+            )
+            .expect("in-window segment should be accepted");
+
+        assert_eq!(stack.tcp_counters().peer_retransmits_received, 0);
+
+        // Deliver the same segment again.
+        stack
+            .receive_tcp(
+                IpAddress::Ipv4(peer),
+                IpAddress::Ipv4(local),
+                &Bytes::copy_from_slice(&segment[..segment_len]),
+                RxFrameOffload::none(),
+                StackInstant::from_nanos(3),
+            )
+            .expect("duplicate segment should be accepted");
+
+        let counters = stack.tcp_counters();
+        assert_eq!(counters.peer_retransmits_received, 1);
+        assert!(counters.duplicate_acks_requested >= 1);
+    }
+
+    #[test]
+    fn out_of_order_segment_queues_bytes() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let (mut stack, _socket) = open_established_tcp_stack(local, peer);
+
+        let payload = b"out-of-order payload";
+        let (segment, segment_len) = tcp_segment_with_payload(
+            peer,
+            local,
+            TcpHeader {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 200,
+                acknowledgement: 8,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+            },
+            payload,
+        );
+
+        stack
+            .receive_tcp(
+                IpAddress::Ipv4(peer),
+                IpAddress::Ipv4(local),
+                &Bytes::copy_from_slice(&segment[..segment_len]),
+                RxFrameOffload::none(),
+                StackInstant::from_nanos(2),
+            )
+            .expect("out-of-order segment should be accepted");
+
+        let counters = stack.tcp_counters();
+        assert_eq!(counters.out_of_order_queued_bytes, payload.len() as u64);
+        assert_eq!(counters.receive_queued_bytes, 0);
     }
 
     #[test]

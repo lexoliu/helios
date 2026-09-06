@@ -480,6 +480,12 @@ fn convert_network(network: host_stats::Network) -> stats::Network {
                 tcp_sockets: queue.tcp_sockets,
                 tcp_receive_backpressured_sockets: queue.tcp_receive_backpressured_sockets,
                 tcp_receive_window_bytes: queue.tcp_receive_window_bytes,
+                receive_queued_bytes: queue.receive_queued_bytes,
+                out_of_order_queued_bytes: queue.out_of_order_queued_bytes,
+                peer_retransmits_received: queue.peer_retransmits_received,
+                duplicate_acks_requested: queue.duplicate_acks_requested,
+                rx_pool_stalls: queue.rx_pool_stalls,
+                rx_pool_free: queue.rx_pool_free,
             })
             .collect(),
     }

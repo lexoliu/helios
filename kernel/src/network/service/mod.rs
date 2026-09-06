@@ -237,6 +237,24 @@ pub struct NetworkQueueStats {
     /// The receive window those connections advertise between them, in
     /// bytes. Zero with connections open is a shut receiver.
     pub tcp_receive_window_bytes: u64,
+    /// In-order payload bytes currently queued across live connections,
+    /// waiting to be read.
+    pub receive_queued_bytes: u64,
+    /// Out-of-order payload bytes currently buffered across live
+    /// connections, waiting on a hole to close.
+    pub out_of_order_queued_bytes: u64,
+    /// Segments this shard received whose payload sat wholly at or
+    /// below receive_next.
+    pub peer_retransmits_received: u64,
+    /// Duplicate acknowledgements this shard requested because an
+    /// out-of-order segment arrived.
+    pub duplicate_acks_requested: u64,
+    /// Times frame reception stalled because this queue pair's receive
+    /// reassembly pool had no free buffers.
+    pub rx_pool_stalls: u64,
+    /// Free reassembly buffers currently available in this queue pair's
+    /// receive pool. Zero if no pool is configured.
+    pub rx_pool_free: u32,
 }
 
 /// Per-shard network counters, one entry per processor.
@@ -719,6 +737,12 @@ where
                         tcp_sockets: tcp.sockets,
                         tcp_receive_backpressured_sockets: tcp.receive_backpressured_sockets,
                         tcp_receive_window_bytes: tcp.receive_window_bytes,
+                        receive_queued_bytes: tcp.receive_queued_bytes,
+                        out_of_order_queued_bytes: tcp.out_of_order_queued_bytes,
+                        peer_retransmits_received: tcp.peer_retransmits_received,
+                        duplicate_acks_requested: tcp.duplicate_acks_requested,
+                        rx_pool_stalls: self.inner.device.rx_pool_stalls(idx),
+                        rx_pool_free: self.inner.device.rx_pool_free(idx),
                     }
                 })
                 .collect(),
