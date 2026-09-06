@@ -538,7 +538,9 @@ def test_a_pgo_run_reports_without_a_linux_side(tmp_path) -> None:
     # Everything `helios-bench run` writes beside the report has to
     # survive a run with no Linux column, because the job never has one.
     assert "quickjs-loop" in render_tables(report)
-    assert plot_report(report, tmp_path)
+    plots = plot_report(report, tmp_path)
+    assert plots
+    assert all(not path.name.endswith("-headline.svg") for path in plots)
     save_report(report, tmp_path / "report.json")
     result = evaluate_paired(load_report(tmp_path / "report.json"))
     assert result is not None
