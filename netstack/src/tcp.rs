@@ -761,6 +761,11 @@ where
     send_unacknowledged: u32,
     receive_next: u32,
     advertised_window: u16,
+    /// The right edge of the receive window as the peer was last told
+    /// it: `receive_next` plus the window that went out with it, in
+    /// bytes. RFC 9293 3.8.6.2.1 forbids moving it left, and
+    /// `refresh_advertised_window` is where that rule is kept.
+    receive_window_right_edge: u32,
     peer_max_segment_size: usize,
     /// Scale applied to our advertised window. Zero until the handshake
     /// proves the peer sent a window-scale option; RFC 7323 only permits
@@ -916,6 +921,7 @@ where
             send_unacknowledged: 0,
             receive_next: 0,
             advertised_window: receive_window_size(0, 0),
+            receive_window_right_edge: 0,
             peer_max_segment_size: TCP_RECEIVE_SEGMENT_BYTES,
             local_window_scale: 0,
             peer_window_scale: 0,
@@ -997,7 +1003,7 @@ where
         socket.local = Some(local);
         socket.remote = Some(remote);
         socket.set_state(TcpState::SynReceived, TcpStateChangeReason::Accept);
-        socket.receive_next = receive_next;
+        socket.set_receive_base(receive_next);
         socket.send_next = initial_sequence.wrapping_add(1);
         socket.send_unacknowledged = initial_sequence;
         socket
@@ -1923,7 +1929,7 @@ where
                     remote.port = packet.source_port;
                     remote
                 });
-                self.receive_next = packet.sequence.wrapping_add(1);
+                self.set_receive_base(packet.sequence.wrapping_add(1));
                 let action = self.acknowledge_sent(
                     packet.acknowledgement,
                     now_nanos,
@@ -2442,9 +2448,49 @@ where
         }
     }
 
+    /// Anchors the receive window on the sequence number the peer's SYN
+    /// established. Called once per connection, before any data: from
+    /// here on the window's right edge only ever moves right.
+    fn set_receive_base(&mut self, receive_next: u32) {
+        self.receive_next = receive_next;
+        self.receive_window_right_edge = receive_next;
+        self.refresh_advertised_window();
+    }
+
+    /// Recomputes the advertised window from the free receive space,
+    /// without ever moving the window's right edge left.
+    ///
+    /// Free space alone is not a window. Out-of-order data buffered
+    /// behind a hole consumes space without advancing `receive_next`, so
+    /// a free-space window retracts the edge the peer was already told
+    /// about, and `receive_sequence_acceptable` then refuses segments
+    /// the peer sent legally - including, once the retraction reaches
+    /// `receive_next`, the retransmission that would fill the hole,
+    /// which a reader holding an empty in-order queue can never unblock
+    /// by draining. RFC 9293 3.8.6.2.1 forbids the retraction, and the
+    /// receiver is free to drop what it has no room for and let the peer
+    /// resend it (#166).
     fn refresh_advertised_window(&mut self) {
-        self.advertised_window =
-            receive_window_size(self.receive_buffered_bytes(), self.local_window_scale);
+        let free = receive_window_size(self.receive_buffered_bytes(), self.local_window_scale);
+        // What is still open at the edge the peer was last told about,
+        // in the scaled units the header carries: comparing there and
+        // not in bytes keeps this rule from firing on the truncation
+        // `receive_window_size` already does. In-order data advances
+        // `receive_next` by exactly what it buffers, so the two agree
+        // and the window is the free space; out-of-order data does not,
+        // and the edge holds.
+        self.advertised_window = if sequence_lt(self.receive_next, self.receive_window_right_edge) {
+            let open = self
+                .receive_window_right_edge
+                .wrapping_sub(self.receive_next)
+                >> self.local_window_scale;
+            free.max(u16::try_from(open).unwrap_or(u16::MAX))
+        } else {
+            free
+        };
+        self.receive_window_right_edge = self
+            .receive_next
+            .wrapping_add(u32::from(self.advertised_window) << self.local_window_scale);
     }
 
     fn receive_buffered_bytes(&self) -> usize {
@@ -5897,6 +5943,92 @@ mod tests {
 
         assert!(!outcome.receive_backpressure);
         assert_eq!(socket.peer_receive_window(), 4);
+    }
+
+    /// A hole must not cost the peer the window it was already given.
+    ///
+    /// Out-of-order data buffered behind a hole consumes receive space
+    /// without advancing `receive_next`, so a window computed from free
+    /// space alone retracts the right edge the peer was told about.
+    /// `receive_sequence_acceptable` then refuses segments the peer sent
+    /// legally, each refusal costing it another retransmission timeout,
+    /// and a reader whose in-order queue is empty has nothing to drain
+    /// that would reopen the window (#166). RFC 9293 3.8.6.2.1 forbids
+    /// the retraction: the receiver drops what it has no room for and
+    /// lets the peer resend it.
+    #[test]
+    fn out_of_order_data_never_retracts_the_advertised_receive_window() {
+        // The segment size a GRO peer delivers over virtio-net, which is
+        // what makes the retraction big enough to bite within one window.
+        const GRO_BYTES: usize = 64 * 1024;
+
+        let mut socket = established_scaled_socket();
+        let hole = socket.receive_next;
+        let right_edge = hole.wrapping_add(socket.advertised_receive_window_bytes());
+        let payload = [7u8; GRO_BYTES];
+
+        let mut sequence = hole.wrapping_add(GRO_BYTES as u32);
+        let mut buffered = 0usize;
+        let mut now_nanos = TCP_INITIAL_RTO_NANOS;
+        while sequence_leq(sequence.wrapping_add(GRO_BYTES as u32), right_edge) {
+            now_nanos += 1;
+            let _ = deliver_segment(
+                &mut socket,
+                TcpPacket {
+                    source_port: 80,
+                    destination_port: 49152,
+                    sequence,
+                    acknowledgement: 8,
+                    flags: TcpFlags::ACK,
+                    window_size: u16::MAX,
+                    options: TcpOptions::empty(),
+                    payload: &payload,
+                },
+                now_nanos,
+            );
+            buffered += GRO_BYTES;
+            let diagnostics = socket.receive_diagnostics();
+            assert_eq!(
+                diagnostics.out_of_order_queued_bytes, buffered,
+                "a segment inside the advertised window was refused at {sequence}"
+            );
+            assert!(
+                sequence_leq(
+                    right_edge,
+                    socket
+                        .receive_next
+                        .wrapping_add(socket.advertised_receive_window_bytes()),
+                ),
+                "the receive window's right edge retracted at {sequence}"
+            );
+            sequence = sequence.wrapping_add(GRO_BYTES as u32);
+        }
+        assert!(buffered != 0, "the window must hold more than one segment");
+        assert_eq!(socket.receive_next, hole);
+
+        // The retransmission that fills the hole releases every byte
+        // behind it to the reader.
+        let _ = deliver_segment(
+            &mut socket,
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: hole,
+                acknowledgement: 8,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+                options: TcpOptions::empty(),
+                payload: &payload,
+            },
+            now_nanos + 1,
+        );
+        let diagnostics = socket.receive_diagnostics();
+        assert_eq!(diagnostics.out_of_order_queued_bytes, 0);
+        assert_eq!(diagnostics.receive_queued_bytes, buffered + GRO_BYTES);
+        assert_eq!(
+            diagnostics.receive_next, sequence,
+            "every buffered byte behind the hole became readable"
+        );
     }
 
     #[test]
