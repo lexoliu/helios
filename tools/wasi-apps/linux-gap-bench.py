@@ -6,9 +6,9 @@ import http.server
 import json
 import os
 import platform
+import shlex
 import shutil
 import signal
-import shlex
 import socketserver
 import subprocess
 import sys
@@ -28,8 +28,10 @@ from fedora_qemu_baseline import (
     QEMU_BINS,
     default_asset_dir,
     host_arch,
-    wasm_uses_simd as fedora_wasm_uses_simd,
     run_fedora_qemu_linux,
+)
+from fedora_qemu_baseline import (
+    wasm_uses_simd as fedora_wasm_uses_simd,
 )
 
 # Helios inspector arch name -> Fedora guest arch name.
@@ -165,12 +167,12 @@ def run_isolated(
     try:
         returncode = process.wait(timeout=timeout_seconds)
     except subprocess.TimeoutExpired as error:
-        terminate_process_group(process.pid)
         raise HeliosRunFailed(
             f"command timed out after {timeout_seconds}s: {shlex.join(command)}"
         ) from error
     finally:
         terminate_process_group(process.pid)
+        process.wait(timeout=timeout_seconds)
     if returncode != 0:
         raise HeliosRunFailed(f"{shlex.join(command)} exited with status {returncode}")
 
@@ -179,8 +181,7 @@ def output(command: list[str]) -> str:
     completed = subprocess.run(
         command,
         cwd=repo_root(),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        capture_output=True,
         text=True,
         check=True,
     )
@@ -260,8 +261,7 @@ def top_cpu_processes(limit: int = TOP_CPU_PROCESS_LIMIT) -> list[dict]:
     completed = subprocess.run(
         ["ps", "-axo", "pid=,pcpu=,command="],
         cwd=repo_root(),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        capture_output=True,
         text=True,
         check=False,
     )
@@ -289,8 +289,7 @@ def process_table() -> list[dict]:
     completed = subprocess.run(
         ["ps", "-axo", "pid=,ppid=,command="],
         cwd=repo_root(),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        capture_output=True,
         text=True,
         check=False,
     )
@@ -1447,7 +1446,7 @@ def write_summary_json(
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
-def throughput_mib_s(byte_count: int | None, elapsed_ms: float | int | None) -> float | None:
+def throughput_mib_s(byte_count: int | None, elapsed_ms: float | None) -> float | None:
     if byte_count is None or elapsed_ms is None or elapsed_ms == 0:
         return None
     return (byte_count / (1024.0 * 1024.0)) / (elapsed_ms / 1000.0)

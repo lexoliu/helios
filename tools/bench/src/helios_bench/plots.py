@@ -109,7 +109,7 @@ def plot_report(report: Report, out_dir: Path) -> list[Path]:
         path = out_dir / f"{report.run.lane}-{workload_class}.svg"
         plot_class(report, workload_class, path)
         written.append(path)
-    if report.headline_workloads():
+    if any(workload.comparisons for workload in report.headline_workloads()):
         path = out_dir / f"{report.run.lane}-headline.svg"
         plot_headline(report, path)
         written.append(path)
