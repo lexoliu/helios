@@ -3,6 +3,16 @@ name: Release
 on:
   push:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: >-
+          Attach the kernel profile and the profile-guided kernel to this
+          existing release tag. The bootstrap: a release published before
+          the job below existed carries no profile, and this is how it
+          gets one.
+        type: string
+        required: true
 
 permissions:
   contents: write
@@ -11,13 +21,127 @@ permissions:
 jobs:
   release-plz:
     name: Release
+    # A dispatch names a tag that already exists; it attaches assets to
+    # that release and never cuts one.
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
+    outputs:
+      # What release-plz released, as it reports it: a JSON array of
+      # `{package_name, prs, tag, version}` and a flag saying whether that
+      # array is empty. The job below reads the kernel package's own tag
+      # out of it rather than guessing at a tag from the ref.
+      releases: ${{ steps.release-plz.outputs.releases }}
+      releases-created: ${{ steps.release-plz.outputs.releases_created }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
-      - uses: MarcoIeni/release-plz-action@v0.5
+      - id: release-plz
+        uses: MarcoIeni/release-plz-action@v0.5
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  # Which release the kernel profile belongs to, decided before hours of
+  # collection are spent on it. release-plz bumps the packages that
+  # changed, so a release run that touched a library alone cut no kernel
+  # release and there is nothing to attach a kernel profile to: this job
+  # then names no tag and the one below does not run.
+  kernel-release-tag:
+    name: kernel-release-tag
+    needs: release-plz
+    if: >-
+      always()
+      && (github.event_name == 'workflow_dispatch'
+          || needs.release-plz.outputs.releases-created == 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASES: ${{ needs.release-plz.outputs.releases }}
+          DISPATCH_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_EVENT_NAME}" = workflow_dispatch ]; then
+            tag="${DISPATCH_TAG}"
+          else
+            # `helios` is the kernel image's own package (AGENTS.md §1), so
+            # its tag is the release that a kernel, and the profile that
+            # kernel was built with, belong to. A release of a library
+            # crate alone is not one.
+            tag="$(printf '%s' "${RELEASES}" | jq -r '.[] | select(.package_name == "helios") | .tag')"
+            if [ -z "${tag}" ]; then
+              packages="$(printf '%s' "${RELEASES}" | jq -r '[.[].package_name] | join(", ")')"
+              printf 'release-plz released %s and no version of the helios package, so no kernel profile is collected.\n' \
+                "${packages:-nothing}" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+          fi
+          # The assets go onto a release, so that release is here before
+          # the collection starts rather than hours after it.
+          if ! gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" --json tagName > /dev/null; then
+            echo "no GitHub release is tagged ${tag} in ${GITHUB_REPOSITORY}" >&2
+            exit 1
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+  # The profile the released kernel was built with, shipped beside it
+  # (#226). Every x86-64 release build reads the latest release's
+  # `helios-kernel.profdata`, and the profile is refreshed here, at
+  # release time, by the collection `bench-suite.yml` runs — the same
+  # composite action, so what a release ships and what CI measures cannot
+  # drift.
+  #
+  # It runs on the bench lane's machine class with KVM and names the
+  # accelerator (AGENTS.md §5): the collection boots the lane's workloads,
+  # and a profile collected under the emulator would describe the
+  # emulator's scheduling.
+  kernel-profile:
+    name: kernel-profile
+    needs: kernel-release-tag
+    if: needs.kernel-release-tag.outputs.tag != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      RELEASE_TAG: ${{ needs.kernel-release-tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: helios
+          # The released tree, not the branch that has moved on since: a
+          # profile carries the function hashes of the kernel it was
+          # collected on, so one collected from another commit arrives
+          # stale (docs/pgo.md).
+          ref: ${{ needs.kernel-release-tag.outputs.tag }}
+      - uses: ./helios/.github/actions/checkout-wasmtime
+      - uses: ./helios/.github/actions/bench-host
+        with:
+          rust-cache-key: release-kernel-profile
+          bench-tooling: "true"
+      - uses: ./helios/.github/actions/collect-kernel-profile
+        with:
+          limine-dir: ${{ github.workspace }}/limine
+          output: ${{ github.workspace }}/profiles/helios-kernel.profdata
+      - name: Build the released kernel against the profile
+        working-directory: helios
+        run: just kernel-pgo-use x86-64 "$GITHUB_WORKSPACE/profiles/helios-kernel.profdata"
+      - name: Attach the profile and the profile-guided kernel to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # `gh release upload` names an asset after the file it uploads,
+          # so the stable names are made here: `helios-cli profile-fetch`
+          # and every x86-64 release build ask for them by name.
+          mkdir -p assets
+          cp profiles/helios-kernel.profdata assets/helios-kernel.profdata
+          cp helios/target/x86_64-unknown-none/profile-use/helios assets/helios-kernel-x86-64
+          gh release upload "${RELEASE_TAG}" \
+            assets/helios-kernel.profdata \
+            assets/helios-kernel-x86-64 \
+            --clobber --repo "${GITHUB_REPOSITORY}"
