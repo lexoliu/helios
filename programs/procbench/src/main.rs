@@ -6,7 +6,8 @@
 //!
 //! - `startup <n> <child> [args..]` spawns `n` instances at once and measures
 //!   each one's time to first output, then samples the memory the batch
-//!   occupies while every child is still alive.
+//!   occupies while every child is still alive, and finally times the
+//!   sequential destruction of the batch on its own.
 //! - `spawn-wait <n> <child> [args..]` spawns and waits for one child at a
 //!   time, `n` times.
 //! - `pingpong <rounds> <bytes> <child> [args..]` sends `rounds` messages of
@@ -207,6 +208,15 @@ async fn startup(count: u64, child: ChildSpec) -> Result<(), ProcbenchError> {
     // has had its stdin closed yet.
     let memory_after = stats::snapshot().memory.available_bytes;
 
+    // The batch is dismantled from this one task, so the hundred instances
+    // are destroyed one after another on whichever processor this task runs
+    // on, and everything each of them allocated is freed from there. That is
+    // a different shape of load from the spawn above, which ran on every
+    // processor at once, and it is timed separately for that reason: a change
+    // to the kernel allocator can leave `batch_ms` untouched and still be
+    // paid for here, which is how the regression of #169 stayed invisible to
+    // three passes that compared `batch_ms` alone.
+    let teardown_started = Instant::now();
     for held in children {
         // Closing stdin releases a `hello hold` child; the batch is
         // dismantled only after its footprint was sampled. The stdout
@@ -215,12 +225,17 @@ async fn startup(count: u64, child: ChildSpec) -> Result<(), ProcbenchError> {
         held.child.write_stdin(Vec::new()).await?;
         wait_child(held.child, &child.path).await?;
     }
+    let teardown_elapsed = teardown_started.elapsed();
 
     println!("instance-startup:{count}");
     samples.report("first_output");
     report_metric(
         "batch_ms",
         format!("{:.3}", batch_elapsed.as_secs_f64() * 1_000.0),
+    );
+    report_metric(
+        "teardown_ms",
+        format!("{:.3}", teardown_elapsed.as_secs_f64() * 1_000.0),
     );
     report_metric(
         "memory_per_instance_bytes",
