@@ -1615,7 +1615,7 @@ where
     device::add_device_to_linker(linker)?;
     add_instances_to_linker(linker)?;
     add_tracing_to_linker(linker)?;
-    add_profiling_to_linker(linker)?;
+    debugger_profiling::add_to_linker(linker)?;
     Ok(())
 }
 
@@ -1811,6 +1811,7 @@ where
     add_stats_to_program_linker(linker)?;
     device::add_device_to_linker(linker)?;
     add_tracing_to_program_linker(linker)?;
+    program_profiling::add_to_linker(linker)?;
     Ok(())
 }
 
@@ -2743,64 +2744,174 @@ where
     Ok(())
 }
 
-fn add_profiling_to_linker<CpuImpl, Net, HostFs>(
-    linker: &mut Linker<StoreData<CpuImpl, Net, HostFs>>,
-) -> wasmtime::Result<()>
-where
-    CpuImpl: Cpu + Clone,
-    Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
-{
-    let mut instance = linker.instance(PROFILING_INSTANCE)?;
-    instance.func_wrap("set-enabled", |caller, (enabled,): (bool,)| {
-        caller.data().runtime_state.set_profiling_enabled(enabled);
-        Ok(())
-    })?;
-    instance.func_wrap("clear", |caller, (): ()| {
-        caller.data().runtime_state.clear_profile();
-        Ok(())
-    })?;
-    instance.func_wrap(
-        "folded",
-        |caller, (filter, limit): (debugger_wit::profiling::Filter, u32)| {
-            let filter = convert_profile_filter(filter);
-            let samples = caller
-                .data()
-                .runtime_state
-                .folded_profile(caller.data().cpu.now().ticks(), &filter, limit)
-                .into_iter()
-                .map(convert_profile_sample)
-                .collect::<Vec<_>>();
-            Ok((samples,))
-        },
-    )?;
-    instance.func_wrap(
-        "metrics",
-        |caller, (filter, limit): (debugger_wit::profiling::MetricFilter, u32)| {
-            let filter = convert_perf_metric_filter(filter);
-            let samples = caller
-                .data()
-                .runtime_state
-                .perf_metrics(&filter, limit)
-                .into_iter()
-                .map(convert_perf_metric_sample)
-                .collect::<Vec<_>>();
-            Ok((samples,))
-        },
-    )?;
-    instance.func_wrap("raw-profile-size", |_caller, (): ()| {
-        Ok((crate::KernelLlvmProfile
-            .size()
-            .map_err(convert_raw_profile_error),))
-    })?;
-    instance.func_wrap(
-        "raw-profile-read",
-        |_caller, (offset, length): (u64, u32)| {
-            Ok((read_raw_profile(offset, length).map_err(convert_raw_profile_error),))
-        },
-    )?;
-    Ok(())
+/// Registers `helios:system/profiling` for one binding set.
+///
+/// The System and Program worlds see the same kernel-side profile state
+/// through generated WIT types that differ only in the module they were
+/// generated into, so the host functions and every conversion between the
+/// kernel's own filter and sample types and the generated ones are written
+/// once here and instantiated per binding set.
+///
+/// The whole interface is registered for both worlds. A world that imports
+/// an interface and is handed only part of it fails to instantiate on the
+/// first call to a missing function, which is the defect this macro exists
+/// to remove rather than to relocate.
+macro_rules! impl_profiling_bindings {
+    ($module:ident, $wit:ident) => {
+        mod $module {
+            use super::*;
+
+            pub(super) fn add_to_linker<CpuImpl, Net, HostFs>(
+                linker: &mut Linker<StoreData<CpuImpl, Net, HostFs>>,
+            ) -> wasmtime::Result<()>
+            where
+                CpuImpl: Cpu + Clone,
+                Net: ComponentHostNetwork,
+                HostFs: crate::HostFileSystem,
+            {
+                let mut instance = linker.instance(PROFILING_INSTANCE)?;
+                instance.func_wrap("set-enabled", |caller, (enabled,): (bool,)| {
+                    caller.data().runtime_state.set_profiling_enabled(enabled);
+                    Ok(())
+                })?;
+                instance.func_wrap("clear", |caller, (): ()| {
+                    caller.data().runtime_state.clear_profile();
+                    Ok(())
+                })?;
+                instance.func_wrap(
+                    "folded",
+                    |caller, (filter, limit): ($wit::profiling::Filter, u32)| {
+                        let filter = convert_profile_filter(filter);
+                        let samples = caller
+                            .data()
+                            .runtime_state
+                            .folded_profile(caller.data().cpu.now().ticks(), &filter, limit)
+                            .into_iter()
+                            .map(convert_profile_sample)
+                            .collect::<Vec<_>>();
+                        Ok((samples,))
+                    },
+                )?;
+                instance.func_wrap(
+                    "metrics",
+                    |caller, (filter, limit): ($wit::profiling::MetricFilter, u32)| {
+                        let filter = convert_perf_metric_filter(filter);
+                        let samples = caller
+                            .data()
+                            .runtime_state
+                            .perf_metrics(&filter, limit)
+                            .into_iter()
+                            .map(convert_perf_metric_sample)
+                            .collect::<Vec<_>>();
+                        Ok((samples,))
+                    },
+                )?;
+                instance.func_wrap("raw-profile-size", |_caller, (): ()| {
+                    Ok((crate::KernelLlvmProfile
+                        .size()
+                        .map_err(convert_raw_profile_error),))
+                })?;
+                instance.func_wrap(
+                    "raw-profile-read",
+                    |_caller, (offset, length): (u64, u32)| {
+                        Ok((read_raw_profile(offset, length).map_err(convert_raw_profile_error),))
+                    },
+                )?;
+                Ok(())
+            }
+
+            fn convert_profile_filter(filter: $wit::profiling::Filter) -> ProfileFilter {
+                ProfileFilter {
+                    scope: filter.scope.map(convert_profile_scope_to_local),
+                    stack_prefixes: filter.stack_prefixes,
+                }
+            }
+
+            fn convert_profile_sample(
+                sample: crate::FoldedProfileSample,
+            ) -> $wit::profiling::FoldedSample {
+                $wit::profiling::FoldedSample {
+                    scope: convert_profile_scope_from_local(sample.scope),
+                    stack: sample.stack,
+                    weight: sample.weight,
+                }
+            }
+
+            fn convert_perf_metric_filter(
+                filter: $wit::profiling::MetricFilter,
+            ) -> PerfMetricFilter {
+                PerfMetricFilter {
+                    name_prefixes: filter.name_prefixes,
+                }
+            }
+
+            fn convert_perf_metric_sample(
+                sample: crate::PerfMetricSample,
+            ) -> $wit::profiling::MetricSample {
+                $wit::profiling::MetricSample {
+                    scope: convert_profile_scope_from_local(sample.scope),
+                    name: sample.name,
+                    count: sample.count,
+                    total_events: sample.total_events,
+                    total_nanos: sample.total_nanos,
+                    min_nanos: sample.min_nanos,
+                    max_nanos: sample.max_nanos,
+                    total_bytes: sample.total_bytes,
+                    total_reference_cycles: sample.total_reference_cycles,
+                    total_cpu_cycles: sample.total_cpu_cycles,
+                    total_instructions_retired: sample.total_instructions_retired,
+                }
+            }
+
+            fn convert_profile_scope_from_local(scope: ProfileScope) -> $wit::profiling::Scope {
+                match scope {
+                    ProfileScope::Kernel => $wit::profiling::Scope::Kernel,
+                    ProfileScope::User => $wit::profiling::Scope::User,
+                }
+            }
+
+            fn convert_profile_scope_to_local(scope: $wit::profiling::Scope) -> ProfileScope {
+                match scope {
+                    $wit::profiling::Scope::Kernel => ProfileScope::Kernel,
+                    $wit::profiling::Scope::User => ProfileScope::User,
+                }
+            }
+
+            fn convert_raw_profile_error(
+                error: crate::LlvmProfileError,
+            ) -> $wit::profiling::RawProfileError {
+                use crate::LlvmProfileError as Local;
+                use $wit::profiling::RawProfileError as Wit;
+
+                match error {
+                    Local::NotInstrumented => Wit::NotInstrumented,
+                    Local::UnsupportedVersion { found, .. } => Wit::UnsupportedVersion(found),
+                    Local::MalformedSection { section, .. } => {
+                        Wit::MalformedSection(convert_profile_section(section))
+                    }
+                    Local::OutOfRange { len, .. } => Wit::OutOfRange(len),
+                    Local::ReadTooLarge { limit, .. } => Wit::ReadTooLarge(limit),
+                }
+            }
+
+            fn convert_profile_section(
+                section: crate::ProfileSection,
+            ) -> $wit::profiling::ProfileSection {
+                use crate::ProfileSection as Local;
+                use $wit::profiling::ProfileSection as Wit;
+
+                match section {
+                    Local::Counters => Wit::Counters,
+                    Local::Data => Wit::Data,
+                    Local::Names => Wit::Names,
+                }
+            }
+        }
+    };
 }
+
+impl_profiling_bindings!(debugger_profiling, debugger_wit);
+impl_profiling_bindings!(program_profiling, program_wit);
 
 /// Copies one window of the kernel's own LLVM raw profile out of the image.
 ///
@@ -2822,36 +2933,6 @@ fn read_raw_profile(offset: u64, length: u32) -> Result<Vec<u8>, crate::LlvmProf
     let written = profile.read(offset, &mut bytes)?;
     bytes.truncate(written);
     Ok(bytes)
-}
-
-fn convert_raw_profile_error(
-    error: crate::LlvmProfileError,
-) -> debugger_wit::profiling::RawProfileError {
-    use crate::LlvmProfileError as Local;
-    use debugger_wit::profiling::RawProfileError as Wit;
-
-    match error {
-        Local::NotInstrumented => Wit::NotInstrumented,
-        Local::UnsupportedVersion { found, .. } => Wit::UnsupportedVersion(found),
-        Local::MalformedSection { section, .. } => {
-            Wit::MalformedSection(convert_profile_section(section))
-        }
-        Local::OutOfRange { len, .. } => Wit::OutOfRange(len),
-        Local::ReadTooLarge { limit, .. } => Wit::ReadTooLarge(limit),
-    }
-}
-
-fn convert_profile_section(
-    section: crate::ProfileSection,
-) -> debugger_wit::profiling::ProfileSection {
-    use crate::ProfileSection as Local;
-    use debugger_wit::profiling::ProfileSection as Wit;
-
-    match section {
-        Local::Counters => Wit::Counters,
-        Local::Data => Wit::Data,
-        Local::Names => Wit::Names,
-    }
 }
 
 fn add_stats_to_program_linker<CpuImpl, Net, HostFs>(
@@ -4104,47 +4185,6 @@ fn convert_program_filter(filter: program_wit::tracing::Filter) -> TraceFilter {
     }
 }
 
-fn convert_profile_filter(filter: debugger_wit::profiling::Filter) -> ProfileFilter {
-    ProfileFilter {
-        scope: filter.scope.map(convert_profile_scope_to_local),
-        stack_prefixes: filter.stack_prefixes,
-    }
-}
-
-fn convert_profile_sample(
-    sample: crate::FoldedProfileSample,
-) -> debugger_wit::profiling::FoldedSample {
-    debugger_wit::profiling::FoldedSample {
-        scope: convert_profile_scope_from_local(sample.scope),
-        stack: sample.stack,
-        weight: sample.weight,
-    }
-}
-
-fn convert_perf_metric_filter(filter: debugger_wit::profiling::MetricFilter) -> PerfMetricFilter {
-    PerfMetricFilter {
-        name_prefixes: filter.name_prefixes,
-    }
-}
-
-fn convert_perf_metric_sample(
-    sample: crate::PerfMetricSample,
-) -> debugger_wit::profiling::MetricSample {
-    debugger_wit::profiling::MetricSample {
-        scope: convert_profile_scope_from_local(sample.scope),
-        name: sample.name,
-        count: sample.count,
-        total_events: sample.total_events,
-        total_nanos: sample.total_nanos,
-        min_nanos: sample.min_nanos,
-        max_nanos: sample.max_nanos,
-        total_bytes: sample.total_bytes,
-        total_reference_cycles: sample.total_reference_cycles,
-        total_cpu_cycles: sample.total_cpu_cycles,
-        total_instructions_retired: sample.total_instructions_retired,
-    }
-}
-
 fn convert_event(event: TraceEvent) -> debugger_wit::tracing::Event {
     debugger_wit::tracing::Event {
         timestamp: event.timestamp,
@@ -4200,20 +4240,6 @@ fn convert_program_value(value: TraceValue) -> program_wit::tracing::Value {
         TraceValue::Float64(value) => program_wit::tracing::Value::Float64(value),
         TraceValue::Text(value) => program_wit::tracing::Value::Text(value),
         TraceValue::Blob(value) => program_wit::tracing::Value::Blob(value),
-    }
-}
-
-fn convert_profile_scope_from_local(scope: ProfileScope) -> debugger_wit::profiling::Scope {
-    match scope {
-        ProfileScope::Kernel => debugger_wit::profiling::Scope::Kernel,
-        ProfileScope::User => debugger_wit::profiling::Scope::User,
-    }
-}
-
-fn convert_profile_scope_to_local(scope: debugger_wit::profiling::Scope) -> ProfileScope {
-    match scope {
-        debugger_wit::profiling::Scope::Kernel => ProfileScope::Kernel,
-        debugger_wit::profiling::Scope::User => ProfileScope::User,
     }
 }
 
