@@ -196,7 +196,7 @@ use alloc::task::Wake;
 use core::alloc::{GlobalAlloc, Layout};
 use core::future::Future;
 use core::ptr;
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use core::task::{Context, Poll, Waker};
 use core::time::Duration;
 
@@ -236,6 +236,39 @@ pub struct HeapStats {
     /// This field says how much of that is a cache rather than a live
     /// kernel object.
     pub magazine_cached_bytes: usize,
+    /// Magazine takes that found a block, and takes that did not.
+    ///
+    /// The hit rate is what says whether a workload's allocation
+    /// pattern is one the front can serve: a churn that frees what it
+    /// allocates restocks its own magazines, while a burst that only
+    /// grows misses on every batch and pays the shared heap for each
+    /// one. Both are stepped by the owning processor inside the mask
+    /// the take already holds.
+    pub magazine_hit_count: u64,
+    pub magazine_miss_count: u64,
+    /// Refills asked for, and blocks they actually came back with.
+    ///
+    /// The two differ when the heap is near its reserve and a refill
+    /// stops short, so `blocks / count` below the batch size says the
+    /// front is paying a second heap acquisition for less than a batch.
+    pub magazine_refill_count: u64,
+    pub magazine_refill_block_count: u64,
+    /// Drains a full magazine performed, and blocks they returned. A
+    /// drain count that tracks the refill count is a magazine
+    /// thrashing against the heap rather than absorbing churn.
+    pub magazine_drain_count: u64,
+    pub magazine_drain_block_count: u64,
+    /// Times the kernel heap took another chunk out of the user pool,
+    /// and the bytes it took. Growth is the expensive path and the one
+    /// that costs the user pool its memory, so a change that grows the
+    /// heap more often is spending user memory to serve the kernel.
+    pub heap_growth_count: u64,
+    pub heap_growth_bytes: u64,
+    /// Allocations the buddy heap could not serve out of the memory it
+    /// already had, and which therefore reached the growth path. This
+    /// is the fragmentation signal: blocks a magazine holds cannot
+    /// merge, so a front that caches too deeply shows up here.
+    pub heap_allocation_failure_count: u64,
     pub requested_live_bytes: usize,
     pub allocation_count: u64,
     pub deallocation_count: u64,
@@ -266,6 +299,15 @@ impl HeapStats {
             total_bytes: 0,
             allocated_bytes: 0,
             magazine_cached_bytes: 0,
+            magazine_hit_count: 0,
+            magazine_miss_count: 0,
+            magazine_refill_count: 0,
+            magazine_refill_block_count: 0,
+            magazine_drain_count: 0,
+            magazine_drain_block_count: 0,
+            heap_growth_count: 0,
+            heap_growth_bytes: 0,
+            heap_allocation_failure_count: 0,
             requested_live_bytes: 0,
             allocation_count: 0,
             deallocation_count: 0,
@@ -280,6 +322,49 @@ impl HeapStats {
             size_class_deallocation_bytes: [0; HEAP_SIZE_CLASS_COUNT],
             size_class_reallocation_bytes: [0; HEAP_SIZE_CLASS_COUNT],
         }
+    }
+}
+
+/// What the kernel heap's growth path did.
+///
+/// Not per-processor: growth is the slow path, taken once per chunk of
+/// [`memory::KERNEL_HEAP_GROWTH_CHUNK_BYTES`] and once per allocation
+/// the buddy heap refused, so a shared atomic here is a cost no served
+/// allocation pays. It is the counter that says whether a change to the
+/// front is spending user-pool memory to serve the kernel.
+struct HeapGrowthCounters {
+    growth_count: AtomicU64,
+    growth_bytes: AtomicU64,
+    allocation_failure_count: AtomicU64,
+}
+
+impl HeapGrowthCounters {
+    const fn new() -> Self {
+        Self {
+            growth_count: AtomicU64::new(0),
+            growth_bytes: AtomicU64::new(0),
+            allocation_failure_count: AtomicU64::new(0),
+        }
+    }
+
+    fn record_growth(&self, bytes: usize) {
+        self.growth_count.fetch_add(1, Ordering::Relaxed);
+        self.growth_bytes.fetch_add(
+            usize_to_u64(bytes, "kernel heap growth chunk"),
+            Ordering::Relaxed,
+        );
+    }
+
+    fn record_allocation_failure(&self) {
+        self.allocation_failure_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn accumulate_into(&self, total: &mut HeapStats) {
+        total.heap_growth_count += self.growth_count.load(Ordering::Relaxed);
+        total.heap_growth_bytes += self.growth_bytes.load(Ordering::Relaxed);
+        total.heap_allocation_failure_count +=
+            self.allocation_failure_count.load(Ordering::Relaxed);
     }
 }
 
@@ -306,6 +391,16 @@ struct KernelAllocator<const ORDER: usize> {
     /// every allocation and written only when profiling is switched, so
     /// it is a shared line that is never written on the hot path.
     size_class_metrics_enabled: AtomicBool,
+    /// What the growth path did: chunks taken out of the user pool,
+    /// the bytes they came to, and the allocations that reached it
+    /// because the heap could not serve them out of what it had.
+    ///
+    /// A real `fetch_add` on a shared line, and that is the right cost
+    /// here: this is stepped once per chunk of
+    /// [`memory::KERNEL_HEAP_GROWTH_CHUNK_BYTES`] and once per
+    /// allocation the buddy heap refused, never on the path an
+    /// allocation that the heap or a magazine can serve takes.
+    growth: HeapGrowthCounters,
     /// Every usable byte the boot memory map described, and the free
     /// kernel heap a user grow may not dip into. Both are fixed by
     /// [`memory::BootMemoryPlan`] at boot and never move afterwards:
@@ -326,6 +421,7 @@ impl<const ORDER: usize> KernelAllocator<ORDER> {
             magazines: memory::HeapMagazines::new(),
             unslotted_stats: memory::HeapCounters::new(),
             size_class_metrics_enabled: AtomicBool::new(false),
+            growth: HeapGrowthCounters::new(),
             machine_usable_bytes: AtomicUsize::new(0),
             kernel_reserve_bytes: AtomicUsize::new(0),
             top_up_backoff: AtomicUsize::new(0),
@@ -366,26 +462,35 @@ impl<const ORDER: usize> KernelAllocator<ORDER> {
         let Some(class) = memory::MagazineClass::of(layout) else {
             return self.alloc_growing(layout);
         };
-        if let Some(front) = front
-            && let Some(block) = front.take(class)
-        {
+        let Some(front) = front else {
+            return self.alloc_growing(class.layout());
+        };
+        if let Some(block) = front.take(class) {
             return block.as_ptr();
         }
 
-        // A miss goes to the shared heap for the caller's own block and
-        // then, in one more acquisition, for a batch behind it, so the
-        // next `MAGAZINE_BATCH` allocations of this class do not come
-        // back here. The block is asked for under the class's own
-        // layout, not the caller's: that is what lets any processor
-        // later serve it out of its magazine, and it is the same block
-        // the heap would have chosen for the caller's layout anyway.
-        let ptr = self.alloc_growing(class.layout());
-        if !ptr.is_null()
-            && let Some(front) = front
-        {
-            self.refill(front, class);
+        // A miss takes one batch out of the shared heap under a single
+        // acquisition: the first block is the caller's and the rest
+        // stock the magazine, so the allocations behind this one do not
+        // come back here. Asking for the caller's block on its own and
+        // the batch behind it second, as this did, paid the heap lock
+        // twice for one miss.
+        //
+        // The blocks are asked for under the class's own layout, not
+        // the caller's: that is what lets any processor later serve one
+        // out of its magazine, and it is the same block the heap would
+        // have chosen for the caller's layout anyway.
+        let mut blocks = self.alloc_batch_growing(class.layout(), memory::MAGAZINE_BATCH);
+        let Some(block) = blocks.pop() else {
+            return ptr::null_mut();
+        };
+        // SAFETY: every remaining block came from the heap under the
+        // class layout and nothing else references it.
+        unsafe { front.stock(class, &mut blocks) };
+        if !blocks.is_empty() {
+            self.free_batch(class, &mut blocks);
         }
-        ptr
+        block.as_ptr()
     }
 
     /// Returns `ptr` to this processor's magazine when the class is one
@@ -423,51 +528,24 @@ impl<const ORDER: usize> KernelAllocator<ORDER> {
         }
     }
 
-    /// Stocks one class of `front`'s magazine out of the shared heap.
-    ///
-    /// One acquisition for up to a batch. The heap is never grown from
-    /// here — growth belongs to [`Self::alloc_growing`], which the
-    /// caller's own block has already been through — and the refill
-    /// stops before it would take the heap below its reserve, so a
-    /// cache never eats the memory the kernel keeps for itself.
-    fn refill(&self, front: &memory::ProcessorFront, class: memory::MagazineClass) {
-        let layout = class.layout();
-        let reserve = self.reserve_bytes();
-        let mut blocks: ArrayVec<ptr::NonNull<u8>, { memory::MAGAZINE_BATCH }> = ArrayVec::new();
-        self.heap.with(|heap| {
-            while !blocks.is_full() {
-                let free = heap
-                    .stats_total_bytes()
-                    .saturating_sub(heap.stats_alloc_actual());
-                if free < reserve.saturating_add(layout.size()) {
-                    break;
-                }
-                let Ok(block) = heap.alloc(layout) else {
-                    break;
-                };
-                blocks.push(block);
-            }
-        });
-        if blocks.is_empty() {
-            return;
-        }
-
-        // SAFETY: every block came from `heap.alloc` under the class
-        // layout and nothing else references it.
-        unsafe { front.stock(class, &mut blocks) };
-        if !blocks.is_empty() {
-            self.free_batch(class, &mut blocks);
-        }
-    }
-
     /// Returns a magazine's overflow to the shared heap under one
-    /// acquisition.
+    /// acquisition, in address order.
+    ///
+    /// The order is the point. `buddy_system_allocator::Heap::dealloc`
+    /// pushes the block onto its class's free list and then walks that
+    /// list looking for the block's buddy, so two halves of a buddy
+    /// pair freed back to back meet at the head of the list and merge
+    /// out of it, while the same two freed with fourteen other blocks
+    /// between them each stay on the list and lengthen the walk every
+    /// later free of that class pays. Ascending order puts every pair
+    /// the batch holds next to each other.
     fn free_batch(
         &self,
         class: memory::MagazineClass,
         batch: &mut ArrayVec<ptr::NonNull<u8>, { memory::MAGAZINE_BATCH }>,
     ) {
         let layout = class.layout();
+        order_batch_for_merge(batch);
         self.heap.with(|heap| {
             for block in batch.drain(..) {
                 // SAFETY: every block in the batch was served by this
@@ -505,26 +583,60 @@ impl<const ORDER: usize> KernelAllocator<ORDER> {
         self.machine_usable_bytes.load(Ordering::Acquire)
     }
 
-    /// One allocation attempt, plus the free space the heap was left
-    /// with.
+    /// One batch attempt, plus the free space the heap was left with.
     ///
-    /// The two are read under the same lock the allocation took, so the
-    /// growth decision below is made against the state the allocation
-    /// actually produced rather than a racing re-read.
-    fn try_alloc(&self, layout: Layout) -> (*mut u8, usize) {
+    /// The first block is unconditional: it is the caller's, and a
+    /// kernel allocation that fails is fatal, so it is never turned
+    /// down over the reserve. Every block behind it is a magazine's
+    /// refill and stops before it would take the heap below the
+    /// reserve the kernel keeps for itself, so a cache never eats that
+    /// memory.
+    ///
+    /// The blocks and the free space are read under the same lock the
+    /// allocation took, so the growth decision below is made against
+    /// the state the allocation actually produced rather than a racing
+    /// re-read.
+    fn take_batch(
+        &self,
+        layout: Layout,
+        want: usize,
+        reserve: usize,
+    ) -> (
+        ArrayVec<ptr::NonNull<u8>, { memory::MAGAZINE_BATCH }>,
+        usize,
+    ) {
         self.heap.with(|heap| {
-            let ptr = heap
-                .alloc(layout)
-                .map_or(ptr::null_mut(), core::ptr::NonNull::as_ptr);
+            let mut blocks: ArrayVec<ptr::NonNull<u8>, { memory::MAGAZINE_BATCH }> =
+                ArrayVec::new();
+            while blocks.len() < want && !blocks.is_full() {
+                if !blocks.is_empty() {
+                    let free = heap
+                        .stats_total_bytes()
+                        .saturating_sub(heap.stats_alloc_actual());
+                    if free < reserve.saturating_add(layout.size()) {
+                        break;
+                    }
+                }
+                let Ok(block) = heap.alloc(layout) else {
+                    break;
+                };
+                blocks.push(block);
+            }
             let free = heap
                 .stats_total_bytes()
                 .saturating_sub(heap.stats_alloc_actual());
-            (ptr, free)
+            (blocks, free)
         })
     }
 
-    /// Serves `layout`, taking more memory out of the user pool when
-    /// the heap cannot serve it or would be left under its reserve.
+    /// Serves up to `want` blocks of `layout`, taking more memory out
+    /// of the user pool when the heap cannot serve the first one or
+    /// would be left under its reserve.
+    ///
+    /// This is the one growth decision in the allocator: an ordinary
+    /// allocation asks for one block through [`Self::alloc_growing`]
+    /// and a magazine miss asks for a batch, and both reach the pool
+    /// the same way, under one acquisition each.
     ///
     /// The kernel heap owns only its boot share until this runs: see
     /// [`memory::policy`] for why the machine's memory starts in the
@@ -540,16 +652,25 @@ impl<const ORDER: usize> KernelAllocator<ORDER> {
     /// throughput matters.
     ///
     /// Growth is attempted at most once per allocation. A pool that
-    /// cannot serve one chunk cannot serve two, and a null return from
-    /// here reaches `alloc_error_handler`, which panics — a kernel
-    /// out-of-memory is fatal by contract, not something to spin on.
-    fn alloc_growing(&self, layout: Layout) -> *mut u8 {
-        let (ptr, free) = self.try_alloc(layout);
-        if !ptr.is_null() && free >= self.reserve_bytes() {
-            return ptr;
+    /// cannot serve one chunk cannot serve two, and an empty return
+    /// from here reaches `alloc_error_handler`, which panics — a
+    /// kernel out-of-memory is fatal by contract, not something to spin
+    /// on.
+    fn alloc_batch_growing(
+        &self,
+        layout: Layout,
+        want: usize,
+    ) -> ArrayVec<ptr::NonNull<u8>, { memory::MAGAZINE_BATCH }> {
+        let reserve = self.reserve_bytes();
+        let (blocks, free) = self.take_batch(layout, want, reserve);
+        if !blocks.is_empty() && free >= reserve {
+            return blocks;
         }
-        if !ptr.is_null() && !self.top_up_is_due() {
-            return ptr;
+        if blocks.is_empty() {
+            self.growth.record_allocation_failure();
+        }
+        if !blocks.is_empty() && !self.top_up_is_due() {
+            return blocks;
         }
 
         let wanted = layout
@@ -559,6 +680,7 @@ impl<const ORDER: usize> KernelAllocator<ORDER> {
             .max(memory::KERNEL_HEAP_GROWTH_CHUNK_BYTES);
         match memory::lend_user_memory_to_kernel_heap(wanted) {
             Some((start, end)) => {
+                self.growth.record_growth(end.saturating_sub(start));
                 unsafe {
                     self.add_to_heap(start, end);
                 }
@@ -569,11 +691,18 @@ impl<const ORDER: usize> KernelAllocator<ORDER> {
                 .store(KERNEL_HEAP_TOP_UP_BACKOFF, Ordering::Relaxed),
         }
 
-        if ptr.is_null() {
-            self.try_alloc(layout).0
+        if blocks.is_empty() {
+            self.take_batch(layout, want, reserve).0
         } else {
-            ptr
+            blocks
         }
+    }
+
+    /// Serves one block of `layout`; see [`Self::alloc_batch_growing`].
+    fn alloc_growing(&self, layout: Layout) -> *mut u8 {
+        self.alloc_batch_growing(layout, 1)
+            .pop()
+            .map_or(ptr::null_mut(), ptr::NonNull::as_ptr)
     }
 
     /// Whether a reserve top-up should be attempted, counting down the
@@ -605,6 +734,7 @@ impl<const ORDER: usize> KernelAllocator<ORDER> {
         stats.total_bytes = total_bytes;
         stats.allocated_bytes = allocated_bytes;
         stats.magazine_cached_bytes = self.magazines.cached_bytes();
+        self.growth.accumulate_into(&mut stats);
         self.unslotted_stats.accumulate_into(&mut stats);
         self.magazines.accumulate_counters(&mut stats);
         stats
@@ -718,6 +848,15 @@ unsafe impl<const ORDER: usize> GlobalAlloc for KernelAllocator<ORDER> {
         self.record_realloc(front, layout.size(), new_size);
         new_ptr
     }
+}
+
+/// Orders a batch the way the shared heap wants to receive it.
+///
+/// See [`KernelAllocator::free_batch`] for why ascending: it is what
+/// puts the two halves of a buddy pair next to each other, so the
+/// second one meets the first at the head of the class's free list.
+fn order_batch_for_merge(batch: &mut ArrayVec<ptr::NonNull<u8>, { memory::MAGAZINE_BATCH }>) {
+    batch.sort_unstable_by_key(|block| block.as_ptr() as usize);
 }
 
 fn heap_size_class(size: usize) -> usize {
@@ -1594,6 +1733,67 @@ mod tests {
             stats.magazine_cached_bytes <= stats.allocated_bytes,
             "cached bytes are a share of what the heap has handed out"
         );
+    }
+
+    /// A drain hands the shared heap its blocks in ascending address
+    /// order, so the two halves of a buddy pair arrive back to back
+    /// and merge instead of each one lengthening the class's free
+    /// list. See [`KernelAllocator::free_batch`].
+    #[test]
+    fn a_drain_is_ordered_so_a_buddy_pair_arrives_together() {
+        // Two buddy pairs of 64-byte blocks, handed over interleaved
+        // the way a magazine's list order leaves them.
+        let base = 0x1_0000_usize;
+        let addresses = [base + 64, base + 192, base, base + 128];
+        let mut batch: ArrayVec<ptr::NonNull<u8>, { memory::MAGAZINE_BATCH }> = addresses
+            .iter()
+            .map(|address| ptr::NonNull::new(*address as *mut u8).expect("a non-null test block"))
+            .collect();
+
+        order_batch_for_merge(&mut batch);
+
+        let ordered: ArrayVec<usize, { memory::MAGAZINE_BATCH }> =
+            batch.iter().map(|block| block.as_ptr() as usize).collect();
+        assert_eq!(
+            ordered.as_slice(),
+            [base, base + 64, base + 128, base + 192],
+            "a drain reaches the heap in ascending order"
+        );
+    }
+
+    /// A miss takes the caller's block and the magazine's stock out of
+    /// the shared heap under one acquisition, so the front is left
+    /// holding a batch less the block the caller kept.
+    #[test]
+    fn a_miss_takes_one_batch_for_the_caller_and_the_magazine() {
+        let allocator = KernelAllocator::<HEAP_ORDER>::empty();
+        let mut heap = Box::new(AlignedHeap([0; TEST_HEAP_BYTES]));
+        let start = heap.0.as_mut_ptr() as usize;
+        unsafe {
+            allocator.add_to_heap(start, start + TEST_HEAP_BYTES);
+        }
+        allocator.configure_processors(1);
+
+        let layout = Layout::from_size_align(64, 8).expect("valid allocation layout");
+        test_support::as_processor(ProcessorId::new(0), || {
+            let ptr = unsafe { GlobalAlloc::alloc(&allocator, layout) };
+            assert!(!ptr.is_null());
+
+            let stats = allocator.stats();
+            assert_eq!(stats.magazine_miss_count, 1, "the first take missed");
+            assert_eq!(stats.magazine_refill_count, 1, "and refilled once");
+            assert_eq!(
+                stats.magazine_refill_block_count,
+                (memory::MAGAZINE_BATCH - 1) as u64,
+                "the batch less the block the caller kept"
+            );
+            assert_eq!(
+                stats.magazine_cached_bytes,
+                (memory::MAGAZINE_BATCH - 1) * 64
+            );
+
+            unsafe { GlobalAlloc::dealloc(&allocator, ptr, layout) };
+        });
     }
 
     /// An allocation past the largest cached class goes straight to the

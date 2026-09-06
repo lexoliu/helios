@@ -132,21 +132,25 @@ const MAX_CACHED_BYTES: usize = 1 << MAX_CACHED_ORDER;
 /// the caller returns them under one acquisition.
 pub(crate) const MAGAZINE_BATCH: usize = 16;
 
-/// The bytes one class may hold on one processor.
+/// How many blocks one class may hold on one processor.
 ///
-/// A magazine is a cache, not a pool: memory parked here is memory the
-/// buddy heap cannot merge or hand to a larger allocation, so the depth
-/// is bounded in bytes rather than in blocks and the small classes —
-/// the ones that repeat — get the deeper magazines.
-const CLASS_CAPACITY_BYTES: usize = 8 * 1024;
-
-/// The shallowest a magazine may be: two batches, so a refill followed
-/// by a drain of the same size cannot thrash against the heap.
-const MIN_CLASS_CAPACITY: usize = 2 * MAGAZINE_BATCH;
-
-/// The deepest a magazine may be, so the smallest classes do not turn a
-/// byte budget into an unbounded block count.
-const MAX_CLASS_CAPACITY: usize = 128;
+/// Two batches, the same for every class: enough that a drain leaves a
+/// batch behind to serve from, and no more, because what a parked
+/// block costs is not its bytes.
+///
+/// `buddy_system_allocator::Heap::dealloc` finds a block's buddy by
+/// walking that class's free list from the head, so a block a magazine
+/// holds is a block whose buddy arrives at the heap, finds nothing to
+/// merge with, and stays on the list — and every later free of the
+/// class walks past it. A magazine's depth is therefore the length of
+/// a scan the shared heap pays on every free of that class, and it is
+/// what the earlier byte budget failed to bound: it allowed 128 blocks
+/// of the hot classes on each processor, and the mass free that ends
+/// `instance-startup-100` — a hundred instances alive at once, then
+/// all destroyed — walked hundreds of unmergeable blocks per free
+/// (#169). The whole regression was there: the spawn half of that
+/// workload, which the magazines serve out of cache, never moved.
+const CLASS_CAPACITY: usize = 2 * MAGAZINE_BATCH;
 
 /// The link a cached block carries while it sits on a magazine, written
 /// into the block's own bytes.
@@ -211,19 +215,6 @@ impl MagazineClass {
     #[inline]
     const fn index(self) -> usize {
         (self.0 - MIN_CACHED_ORDER) as usize
-    }
-
-    /// How many blocks one processor keeps of this class.
-    #[inline]
-    const fn capacity(self) -> usize {
-        let by_bytes = CLASS_CAPACITY_BYTES / self.block_bytes();
-        if by_bytes < MIN_CLASS_CAPACITY {
-            MIN_CLASS_CAPACITY
-        } else if by_bytes > MAX_CLASS_CAPACITY {
-            MAX_CLASS_CAPACITY
-        } else {
-            by_bytes
-        }
     }
 
     const fn from_index(index: usize) -> Self {
@@ -430,6 +421,45 @@ fn size_to_step(size: usize) -> isize {
         .unwrap_or_else(|_| panic!("kernel allocation size {size} does not fit an isize"))
 }
 
+/// What one processor's magazines did.
+///
+/// Owner-stepped, and stepped only from inside a masked region that is
+/// already there for the magazine operation being counted, so no
+/// allocation pays a mask or an atomic for these. They are what says
+/// whether the front is serving a workload or fighting it: a hit rate,
+/// how much of a batch a refill actually came back with, and whether
+/// drains track refills.
+struct MagazineCounters {
+    hit_count: AtomicU64,
+    miss_count: AtomicU64,
+    refill_count: AtomicU64,
+    refill_block_count: AtomicU64,
+    drain_count: AtomicU64,
+    drain_block_count: AtomicU64,
+}
+
+impl MagazineCounters {
+    const fn new() -> Self {
+        Self {
+            hit_count: AtomicU64::new(0),
+            miss_count: AtomicU64::new(0),
+            refill_count: AtomicU64::new(0),
+            refill_block_count: AtomicU64::new(0),
+            drain_count: AtomicU64::new(0),
+            drain_block_count: AtomicU64::new(0),
+        }
+    }
+
+    fn accumulate_into(&self, total: &mut HeapStats) {
+        total.magazine_hit_count += self.hit_count.load(Ordering::Relaxed);
+        total.magazine_miss_count += self.miss_count.load(Ordering::Relaxed);
+        total.magazine_refill_count += self.refill_count.load(Ordering::Relaxed);
+        total.magazine_refill_block_count += self.refill_block_count.load(Ordering::Relaxed);
+        total.magazine_drain_count += self.drain_count.load(Ordering::Relaxed);
+        total.magazine_drain_block_count += self.drain_block_count.load(Ordering::Relaxed);
+    }
+}
+
 /// One processor's magazines and counters.
 ///
 /// See the module documentation for which half is reached how. Every
@@ -446,6 +476,9 @@ pub(crate) struct ProcessorFront {
     depths: [AtomicUsize; MAGAZINE_CLASS_COUNT],
     /// Owner writes, any processor reads.
     counters: HeapCounters,
+    /// Owner writes, any processor reads: what this processor's
+    /// magazines did.
+    magazine_counters: MagazineCounters,
 }
 
 // SAFETY: `heads` is only ever reached from the owning processor with
@@ -460,6 +493,7 @@ impl ProcessorFront {
             heads: UnsafeCell::new([core::ptr::null_mut(); MAGAZINE_CLASS_COUNT]),
             depths: [const { AtomicUsize::new(0) }; MAGAZINE_CLASS_COUNT],
             counters: HeapCounters::new(),
+            magazine_counters: MagazineCounters::new(),
         }
     }
 
@@ -480,12 +514,17 @@ impl ProcessorFront {
             // masked for the whole of the access, so no other reference
             // into the cell exists.
             let heads = unsafe { &mut *self.heads.get() };
-            let head = NonNull::new(heads[class.index()])?;
+            let counters = &self.magazine_counters;
+            let Some(head) = NonNull::new(heads[class.index()]) else {
+                OwnedStep::add_u64(&counters.miss_count, 1);
+                return None;
+            };
             // SAFETY: every block on this list was given its link by
             // `give` or `stock`, and nothing has touched it since: the
             // list is owner-only.
             heads[class.index()] = unsafe { head.as_ref().next };
             self.set_depth(class, self.depth(class) - 1);
+            OwnedStep::add_u64(&counters.hit_count, 1);
             Some(head.cast())
         })
     }
@@ -513,7 +552,7 @@ impl ProcessorFront {
             let heads = unsafe { &mut *self.heads.get() };
             let mut depth = self.depth(class);
             let mut overflow = None;
-            if depth >= class.capacity() {
+            if depth >= CLASS_CAPACITY {
                 let mut batch = ArrayVec::new();
                 while !batch.is_full()
                     && let Some(head) = NonNull::new(heads[class.index()])
@@ -524,6 +563,12 @@ impl ProcessorFront {
                     depth -= 1;
                     batch.push(head.cast());
                 }
+                let counters = &self.magazine_counters;
+                OwnedStep::add_u64(&counters.drain_count, 1);
+                OwnedStep::add_u64(
+                    &counters.drain_block_count,
+                    usize_to_u64(batch.len(), "magazine drain block count"),
+                );
                 overflow = Some(batch);
             }
             // SAFETY: the caller promises the block is unaliased and at
@@ -549,9 +594,14 @@ impl ProcessorFront {
         with_local_interrupts_masked(|| {
             // SAFETY: owning processor, interrupts masked.
             let heads = unsafe { &mut *self.heads.get() };
-            let capacity = class.capacity();
+            let counters = &self.magazine_counters;
+            OwnedStep::add_u64(&counters.refill_count, 1);
+            OwnedStep::add_u64(
+                &counters.refill_block_count,
+                usize_to_u64(blocks.len(), "magazine refill block count"),
+            );
             let mut depth = self.depth(class);
-            while depth < capacity
+            while depth < CLASS_CAPACITY
                 && let Some(block) = blocks.pop()
             {
                 // SAFETY: as `give`, for every block the caller handed
@@ -681,6 +731,7 @@ impl HeapMagazines {
         if let Some(fronts) = self.processors.get() {
             for front in fronts.iter() {
                 front.counters.accumulate_into(total);
+                front.magazine_counters.accumulate_into(total);
             }
         }
     }
@@ -697,8 +748,8 @@ mod tests {
     use helios_hal::cpu::ProcessorId;
 
     use super::{
-        HeapMagazines, MAGAZINE_BATCH, MAGAZINE_CLASS_COUNT, MAX_CACHED_BYTES, MIN_BLOCK_BYTES,
-        MagazineClass, OwnedStep, ProcessorFront, SharedStep,
+        CLASS_CAPACITY, HeapMagazines, MAGAZINE_BATCH, MAGAZINE_CLASS_COUNT, MAX_CACHED_BYTES,
+        MIN_BLOCK_BYTES, MagazineClass, OwnedStep, ProcessorFront, SharedStep,
     };
     use crate::HeapStats;
 
@@ -808,7 +859,7 @@ mod tests {
         magazines.configure_processors(1);
         let front = magazines.front(OWNER).expect("a configured front");
         let class = MagazineClass::from_index(MAGAZINE_CLASS_COUNT - 1);
-        let capacity = class.capacity();
+        let capacity = CLASS_CAPACITY;
         let mut blocks = Vec::new();
         let mut returned = Vec::new();
 

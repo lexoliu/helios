@@ -97,6 +97,18 @@ struct HeapPerfSnapshot {
     size_class_allocation_bytes: [AtomicU64; HEAP_SIZE_CLASS_COUNT],
     size_class_deallocation_bytes: [AtomicU64; HEAP_SIZE_CLASS_COUNT],
     size_class_reallocation_bytes: [AtomicU64; HEAP_SIZE_CLASS_COUNT],
+    /// The per-processor front's own tally (`memory::magazine`) and the
+    /// heap growth path's, so a run says how the front behaved rather
+    /// than only how much it allocated.
+    magazine_hit_count: AtomicU64,
+    magazine_miss_count: AtomicU64,
+    magazine_refill_count: AtomicU64,
+    magazine_refill_block_count: AtomicU64,
+    magazine_drain_count: AtomicU64,
+    magazine_drain_block_count: AtomicU64,
+    heap_growth_count: AtomicU64,
+    heap_growth_bytes: AtomicU64,
+    heap_allocation_failure_count: AtomicU64,
 }
 
 impl HeapPerfSnapshot {
@@ -114,6 +126,15 @@ impl HeapPerfSnapshot {
             size_class_allocation_bytes: [const { AtomicU64::new(0) }; HEAP_SIZE_CLASS_COUNT],
             size_class_deallocation_bytes: [const { AtomicU64::new(0) }; HEAP_SIZE_CLASS_COUNT],
             size_class_reallocation_bytes: [const { AtomicU64::new(0) }; HEAP_SIZE_CLASS_COUNT],
+            magazine_hit_count: AtomicU64::new(0),
+            magazine_miss_count: AtomicU64::new(0),
+            magazine_refill_count: AtomicU64::new(0),
+            magazine_refill_block_count: AtomicU64::new(0),
+            magazine_drain_count: AtomicU64::new(0),
+            magazine_drain_block_count: AtomicU64::new(0),
+            heap_growth_count: AtomicU64::new(0),
+            heap_growth_bytes: AtomicU64::new(0),
+            heap_allocation_failure_count: AtomicU64::new(0),
         }
     }
 
@@ -154,6 +175,24 @@ impl HeapPerfSnapshot {
             &self.size_class_reallocation_bytes,
             stats.size_class_reallocation_bytes,
         );
+        self.magazine_hit_count
+            .store(stats.magazine_hit_count, Ordering::Release);
+        self.magazine_miss_count
+            .store(stats.magazine_miss_count, Ordering::Release);
+        self.magazine_refill_count
+            .store(stats.magazine_refill_count, Ordering::Release);
+        self.magazine_refill_block_count
+            .store(stats.magazine_refill_block_count, Ordering::Release);
+        self.magazine_drain_count
+            .store(stats.magazine_drain_count, Ordering::Release);
+        self.magazine_drain_block_count
+            .store(stats.magazine_drain_block_count, Ordering::Release);
+        self.heap_growth_count
+            .store(stats.heap_growth_count, Ordering::Release);
+        self.heap_growth_bytes
+            .store(stats.heap_growth_bytes, Ordering::Release);
+        self.heap_allocation_failure_count
+            .store(stats.heap_allocation_failure_count, Ordering::Release);
     }
 }
 
@@ -559,6 +598,68 @@ where
                 &snapshot.size_class_reallocation_bytes,
                 stats.size_class_reallocation_bytes,
             ),
+        );
+
+        // What the per-processor front and the growth path did over the
+        // same window: the hit rate, how much of a batch a refill came
+        // back with, whether drains track refills, and what the heap
+        // had to take out of the user pool to keep serving.
+        record_heap_delta_metric(
+            metrics,
+            "magazine-hit",
+            swap_delta(&snapshot.magazine_hit_count, stats.magazine_hit_count),
+            0,
+        );
+        record_heap_delta_metric(
+            metrics,
+            "magazine-miss",
+            swap_delta(&snapshot.magazine_miss_count, stats.magazine_miss_count),
+            0,
+        );
+        record_heap_delta_metric(
+            metrics,
+            "magazine-refill",
+            swap_delta(&snapshot.magazine_refill_count, stats.magazine_refill_count),
+            0,
+        );
+        record_heap_delta_metric(
+            metrics,
+            "magazine-refill-block",
+            swap_delta(
+                &snapshot.magazine_refill_block_count,
+                stats.magazine_refill_block_count,
+            ),
+            0,
+        );
+        record_heap_delta_metric(
+            metrics,
+            "magazine-drain",
+            swap_delta(&snapshot.magazine_drain_count, stats.magazine_drain_count),
+            0,
+        );
+        record_heap_delta_metric(
+            metrics,
+            "magazine-drain-block",
+            swap_delta(
+                &snapshot.magazine_drain_block_count,
+                stats.magazine_drain_block_count,
+            ),
+            0,
+        );
+        record_heap_delta_metric(
+            metrics,
+            "growth",
+            swap_delta(&snapshot.heap_growth_count, stats.heap_growth_count),
+            swap_delta(&snapshot.heap_growth_bytes, stats.heap_growth_bytes),
+        );
+        record_heap_delta_metric(
+            metrics,
+            "allocation-failure",
+            swap_delta(
+                &snapshot.heap_allocation_failure_count,
+                stats.heap_allocation_failure_count,
+            ),
+            0,
         );
     }
 
