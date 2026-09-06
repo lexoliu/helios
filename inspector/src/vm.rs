@@ -31,6 +31,7 @@ use crate::{
 };
 
 mod network;
+mod profdata;
 mod qemu;
 mod qmp;
 mod raw_profile;
@@ -39,6 +40,7 @@ use network::{
     HostPlatform, NetSetupCommand, NetTeardownCommand, QemuNetArgs, VmNetwork, VmNetworkArgs,
     VmNetworkError, VmNetworkFile, VmNetworkProfile, VmNetworkSetupError,
 };
+use profdata::ProfileUseError;
 use qemu::QemuOptions;
 use qmp::{QmpClient, QmpError, SizeError};
 use raw_profile::{ProfileCommand, RawProfileCollectError};
@@ -85,6 +87,13 @@ pub(crate) enum VmConfigError {
          --release, --debug or --kernel-debug"
     )]
     ProfileGenerateWithOtherProfile,
+    #[error(
+        "--profile-use builds an optimised kernel from a collected profile and cannot be \
+         combined with --profile-generate, --debug or --kernel-debug"
+    )]
+    ProfileUseWithOtherProfile,
+    #[error("{0}")]
+    ProfileUse(#[from] ProfileUseError),
     #[error("{0}")]
     WorkloadSelection(#[from] WorkloadSelectionError),
     #[error("failed to read inspector VM config {path}: {source}")]
@@ -607,7 +616,7 @@ pub(crate) enum VmRpcTransport {
 
 /// Which build of the kernel image a session boots.
 ///
-/// The four are exclusive by construction rather than by a rule spread over
+/// The five are exclusive by construction rather than by a rule spread over
 /// booleans: each names one cargo profile, one `target/<triple>/` directory,
 /// and whether the image carries LLVM instrumentation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -622,6 +631,12 @@ enum KernelBuildProfile {
     /// `profile-generate`: release plus `-C profile-generate`, the image a
     /// PGO collection boots (docs/pgo.md).
     ProfileGenerate,
+    /// `profile-use`: release plus `-C profile-use`, the image a
+    /// collected profile optimises (docs/pgo.md). The profile itself is
+    /// named by [`KernelBuildSpec::profile_use`]: a build kind says what
+    /// kind of build it is, and two PGO kernels from two profiles are the
+    /// same kind of build.
+    ProfileUse,
 }
 
 impl KernelBuildProfile {
@@ -632,12 +647,16 @@ impl KernelBuildProfile {
             Self::KernelDebug => "kernel-debug",
             Self::Release => "release",
             Self::ProfileGenerate => "profile-generate",
+            Self::ProfileUse => "profile-use",
         }
     }
 
     /// Whether the guest image this profile builds is an optimised one.
     fn optimised(self) -> bool {
-        matches!(self, Self::Release | Self::ProfileGenerate)
+        matches!(
+            self,
+            Self::Release | Self::ProfileGenerate | Self::ProfileUse
+        )
     }
 
     /// Whether the image carries LLVM instrumentation.
@@ -936,6 +955,8 @@ pub(crate) struct VmConfigFile {
     #[serde(default)]
     pub(crate) profile_generate: Option<bool>,
     #[serde(default)]
+    pub(crate) profile_use: Option<PathBuf>,
+    #[serde(default)]
     pub(crate) kernel_debug: Option<bool>,
     #[serde(default)]
     pub(crate) qemu_bin: Option<PathBuf>,
@@ -1014,6 +1035,17 @@ pub(crate) struct VmCommand {
     /// collection artifact and never a measurement one.
     #[arg(long, default_value_t = false, conflicts_with_all = ["release", "debug", "kernel_debug"])]
     profile_generate: bool,
+
+    /// Build an optimised kernel from a collected profile: release plus
+    /// `-C profile-use=<file>`, where the file is the merged
+    /// `.profdata` a `--profile-generate` collection produced
+    /// (docs/pgo.md).
+    ///
+    /// The profile is named, never discovered: a PGO kernel is only as
+    /// good as the profile it was built from, so which profile that was
+    /// is part of the command that built it.
+    #[arg(long, value_name = "FILE", conflicts_with_all = ["debug", "kernel_debug", "profile_generate"])]
+    profile_use: Option<PathBuf>,
 
     /// Build the kernel with debuginfo and unstripped symbols for GDB/LLDB.
     #[arg(long, default_value_t = false, conflicts_with = "release")]
@@ -1374,6 +1406,11 @@ pub(crate) fn run(mut command: VmCommand) -> Result<(), VmError> {
 struct KernelBuildSpec {
     profile: &'static VmProfile,
     kind: KernelBuildProfile,
+    /// The merged profile a [`KernelBuildProfile::ProfileUse`] build
+    /// reads, absolute so that the `--config` override cargo receives
+    /// does not depend on the directory the build is issued from.
+    /// `None` for every other kind.
+    profile_use: Option<PathBuf>,
     boot_programs: Vec<String>,
     no_compiler_plugin: bool,
 }
@@ -1399,7 +1436,25 @@ fn resolve_build(
     if profile_generate && (release || kernel_debug) {
         return Err(VmConfigError::ProfileGenerateWithOtherProfile);
     }
-    let kind = if profile_generate {
+    let profile_use = command
+        .profile_use
+        .clone()
+        .or_else(|| file.profile_use.clone());
+    if profile_use.is_some() && (profile_generate || kernel_debug) {
+        return Err(VmConfigError::ProfileUseWithOtherProfile);
+    }
+    // Before the build kind exists, so that a profile from another
+    // toolchain costs a sixteen-byte read rather than a kernel compile
+    // that ends in an LLVM error naming no file.
+    let profile_use = profile_use
+        .map(|path| {
+            profdata::validate(&path)?;
+            absolute_profile(&path)
+        })
+        .transpose()?;
+    let kind = if profile_use.is_some() {
+        KernelBuildProfile::ProfileUse
+    } else if profile_generate {
         KernelBuildProfile::ProfileGenerate
     } else if release {
         KernelBuildProfile::Release
@@ -1421,8 +1476,23 @@ fn resolve_build(
     Ok(KernelBuildSpec {
         profile,
         kind,
+        profile_use,
         boot_programs,
         no_compiler_plugin,
+    })
+}
+
+/// The profile path as cargo will read it.
+///
+/// `-C profile-use` is resolved by rustc against its own working
+/// directory, which is the workspace root rather than the one the
+/// inspector was invoked from, so a relative path typed on the command
+/// line has to be made absolute here or it names a different file in the
+/// build than it did in the shell.
+fn absolute_profile(path: &Path) -> Result<PathBuf, ProfileUseError> {
+    path.canonicalize().map_err(|source| ProfileUseError::Read {
+        path: path.display().to_string(),
+        source,
     })
 }
 
@@ -1822,6 +1892,9 @@ fn cargo_build_command(repo_root: &Path, build: KernelBuildProfile) -> Command {
         KernelBuildProfile::ProfileGenerate => {
             command.arg("--profile").arg("profile-generate");
         }
+        KernelBuildProfile::ProfileUse => {
+            command.arg("--profile").arg("profile-use");
+        }
     }
     command
 }
@@ -1839,6 +1912,11 @@ fn kernel_build_command(repo_root: &Path, command: &KernelBuildSpec) -> Command 
         cargo
             .arg("--config")
             .arg(profile_generate_rustflags(command.profile));
+    }
+    if let Some(profile) = &command.profile_use {
+        cargo
+            .arg("--config")
+            .arg(profile_use_rustflags(command.profile, profile));
     }
     cargo
 }
@@ -1877,8 +1955,48 @@ fn profile_generate_rustflags(profile: &VmProfile) -> String {
     format!("target.\"{}\".rustflags={flags}", profile.cargo_target)
 }
 
+/// The `--config` override that builds this target's kernel against a
+/// collected profile.
+///
+/// It arrives the same way the instrumented build's flags do, and for the
+/// same reason: cargo joins a `--config` array with the one
+/// `.cargo/config.toml` sets for the target, where `RUSTFLAGS` would
+/// replace it and cost the target its link arguments and its ISA
+/// features.
+fn profile_use_rustflags(profile: &VmProfile, used: &Path) -> String {
+    let flags = vec![
+        "-C".to_owned(),
+        format!("profile-use={}", used.display()),
+        // A profile is a snapshot of one set of workloads on one revision,
+        // so a kernel always has functions it says nothing about: a
+        // function added since the collection, or one no collected
+        // workload ever called. LLVM is silent about those by default,
+        // which makes a profile that covers almost nothing look exactly
+        // like one that covers everything. This asks it to name them, and
+        // they stay warnings: a stale profile costs optimisation, never
+        // the build.
+        "-C".to_owned(),
+        "llvm-args=-pgo-warn-missing-function".to_owned(),
+        // The instrumented build collects with value profiling off
+        // (`profile_generate_rustflags`), so every function in the
+        // profile carries zero value sites while a default use build
+        // expects as many as its indirect calls. LLVM reports each of
+        // those as "inconsistent number of value sites ... possibly due
+        // to the use of a stale profile" — a wrong diagnosis of a
+        // correct profile, three hundred times over on the x86-64
+        // kernel. The two halves state the same thing about value
+        // profiling or they disagree about what the profile contains.
+        "-C".to_owned(),
+        "llvm-args=-disable-vp=true".to_owned(),
+    ];
+    let flags = toml::Value::try_from(flags)
+        .expect("a list of strings is a TOML array")
+        .to_string();
+    format!("target.\"{}\".rustflags={flags}", profile.cargo_target)
+}
+
 fn run_kernel_prebuild(command: &KernelBuildSpec) -> Result<PathBuf, VmBuildError> {
-    let cli = discover_helios_cli()?;
+    let cli = discover_helios_cli(command.kind)?;
     let repo_root = repo_root()?;
     let out_dir = repo_root
         .join("target")
@@ -2611,7 +2729,7 @@ fn prepare_limine_uefi_image(
         "building {} Limine UEFI disk image",
         arch_label(command.profile.arch)
     ));
-    let cli = discover_helios_cli()?;
+    let cli = discover_helios_cli(command.build.kind)?;
     let status = Command::new(&cli)
         .arg("limine-uefi-image")
         .arg("--kernel")
@@ -2649,7 +2767,24 @@ fn limine_efi_arch_argument(arch: VmArch) -> &'static str {
     }
 }
 
-fn discover_helios_cli() -> Result<PathBuf, ToolDiscoveryError> {
+/// The `helios-cli` a build of `kind` drives.
+///
+/// `HELIOS_CLI_BIN` first: a paired benchmark run pins one harness for two
+/// guest checkouts and says so there.
+///
+/// Then the binary [`build_vm`] builds for this kind. An optimised kernel
+/// build compiles `helios-cli` `--release`, and the inspector asking for
+/// one need not be a release binary itself — `just build-instrumented` and
+/// `just kernel-pgo-use` run it through `cargo run`, out of
+/// `target/debug/`. Looking beside the running executable therefore finds
+/// nothing on a clean checkout, which is why `profile-generate` had never
+/// produced an artifact (#217). The kind names the profile, so the lookup
+/// asks for that one rather than for whatever shares a directory with the
+/// inspector.
+///
+/// The directory beside the inspector, and then `PATH`, still answer for
+/// an inspector run from somewhere other than a workspace.
+fn discover_helios_cli(kind: KernelBuildProfile) -> Result<PathBuf, ToolDiscoveryError> {
     if let Some(path) = std::env::var_os("HELIOS_CLI_BIN").map(PathBuf::from) {
         if path.is_file() {
             return Ok(path);
@@ -2657,6 +2792,12 @@ fn discover_helios_cli() -> Result<PathBuf, ToolDiscoveryError> {
         return Err(ToolDiscoveryError::CliBinNotAFile {
             path: path.display().to_string(),
         });
+    }
+    if let Ok(root) = repo_root() {
+        let candidate = workspace_helios_cli(&root, kind);
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
     }
     let current_exe =
         std::env::current_exe().map_err(|source| ToolDiscoveryError::CurrentExe { source })?;
@@ -2669,6 +2810,17 @@ fn discover_helios_cli() -> Result<PathBuf, ToolDiscoveryError> {
         return Ok(candidate);
     }
     Err(ToolDiscoveryError::CliMissing)
+}
+
+/// Where [`build_vm`] leaves the `helios-cli` a build of `kind` needs.
+///
+/// One expression, so the build and the lookup cannot disagree about the
+/// profile: `cargo_build_command` compiles it under `kind.host()`, and
+/// this names the directory that profile writes into.
+fn workspace_helios_cli(root: &Path, kind: KernelBuildProfile) -> PathBuf {
+    root.join("target")
+        .join(kind.host().directory())
+        .join("helios-cli")
 }
 
 fn arch_label(arch: VmArch) -> &'static str {
@@ -4201,6 +4353,139 @@ mod tests {
         assert_eq!(spec.kind, KernelBuildProfile::Debug);
     }
 
+    /// A merged profile of the pinned toolchain's format, as
+    /// `llvm-profdata merge` writes one: the magic, the version word, and
+    /// nothing the header check reads past.
+    fn pinned_profile(directory: &Path) -> PathBuf {
+        let path = directory.join("helios-kernel.profdata");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0x8169_666f_7270_6cffu64.to_le_bytes());
+        bytes.extend_from_slice(&(13u64 | 1 << 56).to_le_bytes());
+        fs::write(&path, bytes).expect("writing the profile header");
+        path
+    }
+
+    #[test]
+    fn a_profile_use_build_is_release_reading_that_profile() {
+        let directory = tempfile::tempdir().expect("a temporary directory for the profile");
+        let profile = pinned_profile(directory.path());
+        let mut command = minimal_command();
+        command.profile_use = Some(profile.clone());
+        let spec = resolve_build(&command, &VmConfigFile::default(), None)
+            .expect("a profile of the pinned format builds");
+        assert_eq!(spec.kind, KernelBuildProfile::ProfileUse);
+        assert_eq!(spec.kind.directory(), "profile-use");
+        assert!(spec.kind.optimised(), "PGO is an optimised build");
+        assert!(
+            !spec.kind.instrumented(),
+            "it consumes counters, it does not emit them"
+        );
+        assert_eq!(
+            spec.profile_use.as_deref(),
+            Some(
+                profile
+                    .canonicalize()
+                    .expect("the profile exists")
+                    .as_path()
+            ),
+        );
+    }
+
+    #[test]
+    fn the_profile_use_flags_name_the_profile_and_keep_a_gap_a_warning() {
+        let directory = tempfile::tempdir().expect("a temporary directory for the profile");
+        let profile = pinned_profile(directory.path());
+        let flags = profile_use_rustflags(&X86_64_VM_PROFILE, &profile);
+        assert!(
+            flags.starts_with("target.\"x86_64-unknown-none\".rustflags="),
+            "{flags}"
+        );
+        assert!(
+            flags.contains(&format!("\"profile-use={}\"", profile.display())),
+            "{flags}"
+        );
+        assert!(flags.contains("-pgo-warn-missing-function"), "{flags}");
+        assert!(
+            flags.contains("-disable-vp=true"),
+            "the collection turns value profiling off and the use side has to agree: {flags}"
+        );
+    }
+
+    #[test]
+    fn a_profile_from_another_toolchain_is_refused_before_the_build() {
+        let directory = tempfile::tempdir().expect("a temporary directory for the profile");
+        let path = directory.path().join("stale.profdata");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0x8169_666f_7270_6cffu64.to_le_bytes());
+        bytes.extend_from_slice(&(9u64 | 1 << 56).to_le_bytes());
+        fs::write(&path, bytes).expect("writing the stale profile header");
+        let mut command = minimal_command();
+        command.profile_use = Some(path);
+        let error = resolve_build(&command, &VmConfigFile::default(), None)
+            .expect_err("a profile this toolchain cannot read never reaches cargo");
+        assert!(matches!(error, VmConfigError::ProfileUse(_)), "{error}");
+        assert!(error.to_string().contains("version 9"), "{error}");
+        assert!(error.to_string().contains("version 13"), "{error}");
+    }
+
+    #[test]
+    fn profile_use_and_profile_generate_are_the_two_halves_and_never_one_build() {
+        let directory = tempfile::tempdir().expect("a temporary directory for the profile");
+        let mut command = minimal_command();
+        command.profile_use = Some(pinned_profile(directory.path()));
+        command.profile_generate = true;
+        let error = resolve_build(&command, &VmConfigFile::default(), None)
+            .expect_err("one build cannot both collect a profile and read one");
+        assert!(
+            matches!(error, VmConfigError::ProfileUseWithOtherProfile),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_config_file_profile_use_is_refused_beside_kernel_debug() {
+        let mut command = minimal_command();
+        command.kernel_debug = true;
+        let directory = tempfile::tempdir().expect("a temporary directory for the profile");
+        let file = VmConfigFile {
+            profile_use: Some(pinned_profile(directory.path())),
+            ..VmConfigFile::default()
+        };
+        let error = resolve_build(&command, &file, None)
+            .expect_err("the config file's profile is refused the way the flag's is");
+        assert!(
+            matches!(error, VmConfigError::ProfileUseWithOtherProfile),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn the_cli_a_build_needs_is_the_one_that_build_compiles() {
+        // An optimised kernel build compiles helios-cli --release, and the
+        // inspector driving it can be the debug binary `cargo run`
+        // produces, so the lookup asks for the profile rather than for
+        // whatever shares a directory with it (#217).
+        let root = Path::new("/workspace");
+        for kind in [
+            KernelBuildProfile::Release,
+            KernelBuildProfile::ProfileGenerate,
+            KernelBuildProfile::ProfileUse,
+        ] {
+            assert_eq!(
+                workspace_helios_cli(root, kind),
+                Path::new("/workspace/target/release/helios-cli"),
+                "{kind:?}"
+            );
+        }
+        for kind in [KernelBuildProfile::Debug, KernelBuildProfile::KernelDebug] {
+            assert_eq!(
+                workspace_helios_cli(root, kind),
+                Path::new("/workspace/target/debug/helios-cli"),
+                "{kind:?}"
+            );
+        }
+    }
+
     fn minimal_command() -> VmCommand {
         VmCommand {
             rpc_transport: None,
@@ -4209,6 +4494,7 @@ mod tests {
             debug: false,
             release: false,
             profile_generate: false,
+            profile_use: None,
             kernel_debug: false,
             config: None,
             qemu_bin: None,
@@ -4261,6 +4547,7 @@ mod tests {
             debug: false,
             release: false,
             profile_generate: false,
+            profile_use: None,
             kernel_debug: false,
             config: Some(missing_config),
             qemu_bin: None,
@@ -4392,6 +4679,7 @@ mod tests {
             debug: true,
             release: false,
             profile_generate: false,
+            profile_use: None,
             kernel_debug: false,
             config: Some(tempdir.path().join("missing-vm.json")),
             qemu_bin: None,
@@ -4506,6 +4794,7 @@ mod tests {
             build: KernelBuildSpec {
                 profile,
                 kind: KernelBuildProfile::Debug,
+                profile_use: None,
                 boot_programs: vec!["debugger".to_owned()],
                 no_compiler_plugin: true,
             },
@@ -4708,6 +4997,7 @@ mod tests {
             build: KernelBuildSpec {
                 profile,
                 kind: KernelBuildProfile::Release,
+                profile_use: None,
                 boot_programs: Vec::new(),
                 no_compiler_plugin: false,
             },

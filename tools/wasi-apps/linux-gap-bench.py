@@ -420,10 +420,17 @@ class HeliosImage:
     """One guest image the Helios side times, and where its records land.
 
     An ordinary run times one image: the checkout this driver lives in.
-    A paired run times two, the candidate and a baseline built from
-    another commit in its own worktree, so that a few-percent effect can
-    be seen on a shared runner where two runs of one lane may not even
-    land on the same CPU model (#173).
+    A paired run times two, so that a few-percent effect can be seen on a
+    shared runner where two runs of one lane may not even land on the same
+    CPU model (#173). Two things can differ between them, and a paired run
+    varies exactly one:
+
+    - the **commit**, `workspace_root`: a baseline built from another
+      commit in its own worktree, which is what a pull request is timed
+      against;
+    - the **build**, `profile_use`: the same commit compiled against a
+      collected profile, which is what says whether profile-guided
+      optimisation of the kernel pays (docs/pgo.md, #211).
 
     An image is a *guest*, not a harness. Both images are booted by this
     checkout's `workload-bench.sh` and this checkout's `helios-inspector`
@@ -439,6 +446,11 @@ class HeliosImage:
     name: str
     workspace_root: Path
     out_dir: Path
+    # The merged `.profdata` this image's kernel is compiled against, or
+    # None for the ordinary release build. The inspector puts a
+    # `--profile-use` kernel in a target directory of its own, so the two
+    # images of a PGO pairing share a checkout without sharing artifacts.
+    profile_use: Path | None = None
 
     def log(self, key: str | None = None) -> Path:
         return self.out_dir / ("helios.jsonl" if key is None else f"helios-{key}.jsonl")
@@ -472,11 +484,13 @@ class IdenticalHeliosImages(RuntimeError):
     """A paired run whose two images are the same build.
 
     The comparison exists to attribute a difference between the columns
-    to the difference between the commits. Two identical guest images
-    have nothing to attribute, so the run says so rather than reporting
-    the noise between one build and itself — which is also what a paired
-    run would silently become if both checkouts ever shared a target
-    directory or a workspace root.
+    to the one thing that varies between them: the commit, or the profile
+    the kernel was compiled against. Two identical guest images have
+    nothing to attribute, so the run says so rather than reporting the
+    noise between one build and itself — which is also what a paired run
+    would silently become if both checkouts ever shared a target
+    directory or a workspace root, or if a `--profile-use` build landed
+    in the plain release directory.
     """
 
 
@@ -525,6 +539,10 @@ def harness_environment(image: HeliosImage, paired: bool) -> dict[str, str]:
     if paired:
         env["HELIOS_INSPECTOR_BIN"] = str(inspector_bin())
         env["HELIOS_CLI_BIN"] = str(helios_cli_bin())
+    # Set for the image that has one and cleared for the image that does
+    # not: the caller's environment is inherited, and a leaked profile
+    # would silently make a PGO pairing two PGO kernels.
+    env["HELIOS_WORKLOAD_BENCH_PROFILE_USE"] = str(image.profile_use) if image.profile_use else ""
     return env
 
 
@@ -540,6 +558,10 @@ def guest_artifact(image: HeliosImage, arch: str, accel: str | None = None) -> P
     env = os.environ.copy()
     env["HELIOS_WORKSPACE_ROOT"] = str(image.workspace_root)
     argv = [str(inspector), "vm", "--arch", arch, "--release"]
+    if image.profile_use is not None:
+        # The PGO kernel of a pairing is a different artifact in a
+        # different directory, and this is what identifies it.
+        argv.extend(["--profile-use", str(image.profile_use)])
     if accel:
         # The lane's accelerator, for the same reason every boot names
         # it: a resolved command needs one, and rediscovering it here
@@ -585,7 +607,7 @@ def refuse_identical_images(
             raise IdenticalHeliosImages(
                 f"images {other_name!r} and {image.name!r} are the same guest build "
                 f"(sha256 {digest}): {other_path} and {path}. A paired run compares two "
-                "guest images; there is no difference here to attribute to a commit."
+                "guest images; there is no difference here to attribute to a commit or a build."
             )
         seen[digest] = (image.name, path)
 
@@ -2080,6 +2102,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--helios-profile-use",
+        type=Path,
+        default=None,
+        help=(
+            "Merged .profdata the timed Helios image is compiled against, which "
+            "pairs the profile-guided kernel of docs/pgo.md against the plain "
+            "release kernel of this same checkout. The baseline image is that "
+            "plain build unless --helios-baseline-root names another commit."
+        ),
+    )
+    parser.add_argument(
         "--helios-baseline-out-dir",
         type=Path,
         default=None,
@@ -2134,8 +2167,20 @@ def main() -> None:
         raise SystemExit("--helios-side-timeout-seconds must be a positive integer")
     if args.helios_timeout_seconds <= 0:
         raise SystemExit("--helios-timeout-seconds must be positive")
-    if args.helios_baseline_out_dir is not None and args.helios_baseline_root is None:
-        raise SystemExit("--helios-baseline-out-dir needs --helios-baseline-root")
+    if args.helios_profile_use is not None:
+        if args.skip_helios:
+            raise SystemExit("--helios-profile-use has nothing to build under --skip-helios")
+        args.helios_profile_use = args.helios_profile_use.resolve()
+        if not args.helios_profile_use.is_file():
+            raise SystemExit(f"{args.helios_profile_use} is not a file")
+    if (
+        args.helios_baseline_out_dir is not None
+        and args.helios_baseline_root is None
+        and args.helios_profile_use is None
+    ):
+        raise SystemExit(
+            "--helios-baseline-out-dir needs --helios-baseline-root or --helios-profile-use"
+        )
     if args.helios_baseline_root is not None:
         if args.skip_helios:
             raise SystemExit("--helios-baseline-root has nothing to pair with under --skip-helios")
@@ -2240,9 +2285,19 @@ def main() -> None:
         wasmtime_profiles = []
         if not args.skip_helios:
             images = [
-                HeliosImage(name="helios", workspace_root=repo_root(), out_dir=out_dir)
+                HeliosImage(
+                    name="helios",
+                    workspace_root=repo_root(),
+                    out_dir=out_dir,
+                    profile_use=args.helios_profile_use,
+                )
             ]
-            if args.helios_baseline_root is not None:
+            # A pairing varies one thing: the commit the baseline is built
+            # from, or the profile the candidate is built against. The
+            # baseline is always the plain release build of whichever
+            # checkout it names, which is what the candidate is measured
+            # against in either case.
+            if args.helios_baseline_root is not None or args.helios_profile_use is not None:
                 baseline_out_dir = args.helios_baseline_out_dir or out_dir.parent / "helios-baseline"
                 if not baseline_out_dir.is_absolute():
                     baseline_out_dir = repo_root() / baseline_out_dir
@@ -2251,7 +2306,7 @@ def main() -> None:
                 images.append(
                     HeliosImage(
                         name="helios-baseline",
-                        workspace_root=args.helios_baseline_root,
+                        workspace_root=args.helios_baseline_root or repo_root(),
                         out_dir=baseline_out_dir,
                     )
                 )
