@@ -29,7 +29,7 @@ use core::arch::asm;
 use core::arch::global_asm;
 use core::arch::x86_64::{__cpuid, __cpuid_count, _rdrand64_step, _rdtsc};
 use core::ops::Range;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicUsize, Ordering, compiler_fence};
 use helios_hal::boot::{BootMemoryMap, BootReservedRanges, usable_region_segments};
 use helios_hal::cpu::{Cpu, Instant, ProcessorId};
 use helios_hal::critical_section::ProcessorIdentity;
@@ -683,15 +683,36 @@ impl Cpu for X86Cpu {
     }
 
     fn park_current(&self) {
-        // HLT halts the CPU until any unmasked interrupt fires. The
-        // local APIC timer always ticks at our scheduler frequency,
-        // and a remote core can drag this one out of HLT immediately
-        // by sending the wake IPI through `wake_processor`. Inside a
-        // critical section IRQs are masked and HLT would deadlock,
-        // but `park_current` is only called from the kernel run loop
-        // which never holds a critical section across the call.
+        // HLT halts the processor until an unmasked interrupt fires.
+        // Masking IRQs around the flag test and the halt is what makes
+        // the pair race-free: the run loop parks after finding its
+        // queue empty, and a wake published in the gap between those
+        // two either lands in `wake_pending`, which the masked test
+        // below observes, or arrives as an interrupt that is already
+        // pending when the halt begins. Without the latch that wake was
+        // acknowledged and discarded, and the processor slept on work
+        // it already had until the next local APIC tick.
+        //
+        // `sti` has a one-instruction shadow, so `sti; hlt` is atomic:
+        // an IPI arriving between the two cannot be taken before the
+        // halt. The same pairing on AArch64 is `wfi` under a masked
+        // DAIF (`aarch64/src/lib.rs`).
+        assert!(
+            x86_64::instructions::interrupts::are_enabled(),
+            "x86 park_current was entered with interrupts masked, where HLT never returns"
+        );
+        x86_64::instructions::interrupts::disable();
+        // `cli` is `asm!(..., options(nomem))`, which is not a
+        // synchronisation point, so the flag read must be pinned below
+        // it explicitly. `CriticalSectionState::acquire` fences the same
+        // way after masking, for the same reason.
+        compiler_fence(Ordering::SeqCst);
+        if smp::current_runtime().take_wake_pending() {
+            x86_64::instructions::interrupts::enable();
+            return;
+        }
         unsafe {
-            core::arch::asm!("hlt", options(nomem, nostack, preserves_flags));
+            core::arch::asm!("sti; hlt", options(nomem, nostack));
         }
     }
 
@@ -701,7 +722,10 @@ impl Cpu for X86Cpu {
     }
 
     fn wake_processor(&self, processor: ProcessorId) {
-        if let Some(apic_id) = self.state.apic_id_of(processor) {
+        // Publish before signalling: `park_current` masks interrupts
+        // around its own test, so a target on its way into HLT either
+        // sees this store or takes the pending IPI.
+        if let Some(apic_id) = self.state.publish_wake(processor) {
             smp::send_wake_ipi(apic_id);
         }
     }

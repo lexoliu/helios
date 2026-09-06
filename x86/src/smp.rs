@@ -76,6 +76,26 @@ pub(crate) struct ProcessorRuntime {
     device_interrupts: Once<&'static DeviceInterruptRoutes>,
     local_timer_ready: AtomicBool,
     started: AtomicBool,
+    /// Set by [`X86PlatformState::publish_wake`] on the *target*
+    /// processor before the wake IPI goes out, and cleared by
+    /// `park_current` under masked interrupts. It closes the window
+    /// between the run loop finding its queue empty and the `hlt` that
+    /// parks: a wake published in that window is observed instead of
+    /// slept through. AArch64 carries the same latch for the same
+    /// reason (`aarch64/src/lib.rs`).
+    wake_pending: AtomicBool,
+}
+
+impl ProcessorRuntime {
+    /// Takes the pending wake, if there is one.
+    ///
+    /// Called by `park_current` with interrupts masked, so a wake
+    /// published after this returns `false` arrives as a pending
+    /// interrupt that the halt completes on rather than a store this
+    /// processor has already stopped looking at.
+    pub(crate) fn take_wake_pending(&self) -> bool {
+        self.wake_pending.swap(false, Ordering::AcqRel)
+    }
 }
 
 pub(crate) struct BootContext {
@@ -152,6 +172,7 @@ pub(crate) fn build_boot_context(
             device_interrupts: Once::new(),
             local_timer_ready: AtomicBool::new(false),
             started: AtomicBool::new(false),
+            wake_pending: AtomicBool::new(false),
         },
         stack_top: 0,
     });
@@ -178,6 +199,7 @@ pub(crate) fn build_boot_context(
                 device_interrupts: Once::new(),
                 local_timer_ready: AtomicBool::new(false),
                 started: AtomicBool::new(false),
+                wake_pending: AtomicBool::new(false),
             },
             stack_top: stack + KERNEL_STACK_BYTES,
         });
@@ -381,6 +403,19 @@ impl X86PlatformState {
             .map(|slot| slot.apic_id)
     }
 
+    /// Publishes a wake for `processor` and answers with the local-APIC
+    /// id to signal, or `None` when no such processor is configured.
+    ///
+    /// The store lands before the caller sends the IPI. A target on its
+    /// way into `park_current` either observes the flag in the masked
+    /// test there, or takes an interrupt that is already pending when
+    /// its halt begins; either way the wake is not lost.
+    pub(crate) fn publish_wake(&self, processor: ProcessorId) -> Option<u32> {
+        let slot = self.processors.get(processor.id() as usize)?;
+        slot.runtime.wake_pending.store(true, Ordering::Release);
+        Some(slot.apic_id)
+    }
+
     pub(crate) fn current_processor(&self) -> ProcessorId {
         ProcessorId::new(current_runtime().logical_id)
     }
@@ -497,9 +532,9 @@ pub(crate) fn handle_device_interrupt(vector: u8) {
 }
 
 pub(crate) fn handle_wake_interrupt() {
-    // Wake IPI carries no payload; receiving it is sufficient to
-    // bring the processor out of HLT and back into the kernel
-    // run loop. Just ack and return.
+    // The wake carries no payload: returning from HLT is the whole
+    // message, and `park_current` owns the flag the sender published in
+    // `X86PlatformState::publish_wake`. Just ack and return.
     local_apic_eoi();
 }
 
