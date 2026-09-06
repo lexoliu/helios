@@ -1977,6 +1977,17 @@ fn profile_use_rustflags(profile: &VmProfile, used: &Path) -> String {
         // the build.
         "-C".to_owned(),
         "llvm-args=-pgo-warn-missing-function".to_owned(),
+        // The instrumented build collects with value profiling off
+        // (`profile_generate_rustflags`), so every function in the
+        // profile carries zero value sites while a default use build
+        // expects as many as its indirect calls. LLVM reports each of
+        // those as "inconsistent number of value sites ... possibly due
+        // to the use of a stale profile" — a wrong diagnosis of a
+        // correct profile, three hundred times over on the x86-64
+        // kernel. The two halves state the same thing about value
+        // profiling or they disagree about what the profile contains.
+        "-C".to_owned(),
+        "llvm-args=-disable-vp=true".to_owned(),
     ];
     let flags = toml::Value::try_from(flags)
         .expect("a list of strings is a TOML array")
@@ -4360,6 +4371,10 @@ mod tests {
             "{flags}"
         );
         assert!(flags.contains("-pgo-warn-missing-function"), "{flags}");
+        assert!(
+            flags.contains("-disable-vp=true"),
+            "the collection turns value profiling off and the use side has to agree: {flags}"
+        );
     }
 
     #[test]

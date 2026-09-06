@@ -191,12 +191,22 @@ other.
 | --- | --- |
 | `-C profile-use=<file>` | reads the merged profile; the path is an argument, never discovered |
 | `-C llvm-args=-pgo-warn-missing-function` | names every function the profile says nothing about, as a warning |
+| `-C llvm-args=-disable-vp=true` | the collection turns value profiling off, so the use side has to agree |
 
 ```bash
 just kernel-pgo-use x86-64 target/pgo/helios-kernel.profdata
 helios-inspector vm --arch x86-64 \
     --profile-use target/pgo/helios-kernel.profdata --accel kvm shell
 ```
+
+The last flag is the collection's own, restated. The instrumented build
+turns value profiling off (above), so every record carries zero value
+sites; a default use build expects as many as the function has indirect
+calls, and reports each mismatch as "inconsistent number of value sites
+… possibly due to the use of a stale profile" — a wrong diagnosis of a
+correct profile, three hundred times over on the x86-64 kernel. The two
+halves state the same thing about value profiling, or they disagree about
+what the profile contains.
 
 `just kernel-pgo-use` is the inspector's own `vm --profile-use build`,
 the way `just build-instrumented` is `vm --profile-generate build`, so
