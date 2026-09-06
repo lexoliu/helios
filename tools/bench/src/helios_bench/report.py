@@ -100,6 +100,19 @@ class RunInfo(BaseModel):
         default_factory=list,
         description="headline workloads timed again on both images after the first pair of boots regressed",
     )
+    kernel_profile: str | None = Field(
+        default=None,
+        description=(
+            "the kernel profile the `helios` kernel was built against: `release <tag>` for the "
+            "profile that release published, or the file the run named (docs/pgo.md)"
+        ),
+    )
+    baseline_kernel_profile: str | None = Field(
+        default=None,
+        description=(
+            "the kernel profile the `helios_baseline` kernel was built against, when the run was paired"
+        ),
+    )
 
     @property
     def paired(self) -> bool:

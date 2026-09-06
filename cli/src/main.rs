@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use askama::Template;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -10,6 +10,10 @@ use ed25519_dalek::{SecretKey, SigningKey, VerifyingKey};
 use fatfs::{FatType, FileSystem, FormatVolumeOptions, FsOptions};
 use helios_artifact::{TrailerError, cwasm_target_supports_wasm_simd, sign_payload_with_key};
 use helios_compiler_support::{AotCompileHint, CompileError, precompile_artifact};
+use helios_profdata::{
+    FetchedProfile, KERNEL_PROFILE_ASSET, KernelProfileStore, KernelProfileStoreError,
+    ProfileUseError, RELEASE_REPOSITORY,
+};
 use helios_workspace_root::{WorkspaceRoot, WorkspaceRootError};
 use mbrman::{BOOT_ACTIVE, CHS, MBR, MBRPartitionEntry};
 use rand::{TryRng, rngs::SysRng};
@@ -34,6 +38,8 @@ enum CliError {
     KernelPrebuild(#[from] PrebuildError),
     #[error("{0}")]
     LimineUefiImage(#[from] LimineError),
+    #[error("{0}")]
+    ProfileFetch(#[from] ProfileFetchError),
 }
 
 /// Why an ahead-of-time compile did not produce a signed artifact.
@@ -476,6 +482,84 @@ const ROOT_PUBLIC_FILE: &str = "helios-root-public.key";
 const PREBUILD_MANIFEST_FILE: &str = "kernel-prebuild.json";
 const DEFAULT_INIT_ARGV0: &str = "/init.wasm";
 const DEFAULT_BOOT_ARTIFACTS_MANIFEST: &str = "tools/wasi-apps/boot-artifacts.toml";
+/// Why the kernel profile a release published did not reach the store.
+///
+/// A fetch either leaves a profile this toolchain can build against in
+/// the store or fails saying which step did not answer: a release build
+/// reads the store and nothing downstream can tell an empty store from a
+/// half-written one.
+#[derive(Debug, thiserror::Error)]
+enum ProfileFetchError {
+    #[error("{0}")]
+    WorkspaceRoot(#[from] WorkspaceRootError),
+    #[error(
+        "{variable} holds characters a GitHub token does not: a token is [A-Za-z0-9_-], and \
+         this one would be passed to curl as a header"
+    )]
+    Token { variable: &'static str },
+    #[error("failed to run curl for {url}: {source}; the fetch downloads over HTTPS with curl")]
+    Curl {
+        url: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to hand curl its configuration for {url}: {source}")]
+    CurlConfig {
+        url: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("curl did not answer {url}: it exited {status} and said {stderr}")]
+    CurlExited {
+        url: String,
+        status: String,
+        stderr: String,
+    },
+    #[error(
+        "{url} answered 404. Every release carries {KERNEL_PROFILE_ASSET} from release.yml's \
+         kernel-profile job (docs/pgo.md); a release cut before that job existed gets its \
+         assets by dispatching that workflow with its tag"
+    )]
+    NoRelease { url: String },
+    #[error("{url} answered HTTP {status}: {body}")]
+    HttpStatus {
+        url: String,
+        status: String,
+        body: String,
+    },
+    #[error("curl wrote no HTTP status for {url}; it answered {len} bytes")]
+    NoHttpStatus { url: String, len: usize },
+    #[error("{url} did not answer with a GitHub release: {source}")]
+    DecodeRelease {
+        url: String,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error(
+        "release {tag} of {repository} carries no {KERNEL_PROFILE_ASSET} asset; release.yml's \
+         kernel-profile job attaches one to every release that carries a kernel \
+         (docs/pgo.md), and an older release gets it by dispatching that workflow with \
+         this tag"
+    )]
+    NoProfileAsset { repository: String, tag: String },
+    #[error("failed to create {path}: {source}")]
+    CreateDirectory {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to write {path}: {source}")]
+    Write {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("{0}")]
+    Profile(#[from] ProfileUseError),
+    #[error("{0}")]
+    Store(#[from] KernelProfileStoreError),
+}
+
 const COMPILER_PLUGIN_BOOTFS_PATH: &str = "bin/compiler.cwasm";
 const COMPILER_PLUGIN_ROOT_KEY_ENV: &str = "HELIOS_COMPILER_ROOT_KEY_HEX";
 const COMPILER_PLUGIN_SHARED_MEMORY_MAX_BYTES: usize = 512 * 1024 * 1024;
@@ -512,6 +596,7 @@ enum Commands {
     CompilerPlugin(CompilerPluginCommand),
     KernelPrebuild(KernelPrebuildCommand),
     LimineUefiImage(LimineUefiImageCommand),
+    ProfileFetch(ProfileFetchCommand),
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -587,6 +672,20 @@ struct LimineUefiImageCommand {
     baud: u32,
     #[arg(long, value_enum)]
     efi_arch: LimineEfiArch,
+}
+
+/// Download the kernel profile a release published, so that a `--release`
+/// x86-64 kernel is built the way the release's own kernel was
+/// (`docs/pgo.md`).
+#[derive(Parser)]
+struct ProfileFetchCommand {
+    /// Release to take the profile from. The latest release by default,
+    /// which is the one every release build between releases spends.
+    #[arg(long, value_name = "TAG")]
+    tag: Option<String>,
+    /// `owner/name` of the repository whose releases carry the profile.
+    #[arg(long, value_name = "REPOSITORY", default_value = RELEASE_REPOSITORY)]
+    repository: String,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -684,6 +783,9 @@ fn main() -> Result<(), CliError> {
             Ok(run_kernel_prebuild(command, cli.workspace_root.as_deref())?)
         }
         Commands::LimineUefiImage(command) => Ok(run_limine_uefi_image(command)?),
+        Commands::ProfileFetch(command) => {
+            Ok(run_profile_fetch(command, cli.workspace_root.as_deref())?)
+        }
     }
 }
 
@@ -1876,4 +1978,197 @@ mod tests {
             support_bootfs_prefix: None,
         }
     }
+}
+
+/// GitHub's REST API, where a release's tag and its assets are read from.
+const GITHUB_API: &str = "https://api.github.com";
+
+/// Environment variables a GitHub token is read from, in order: the first
+/// is what a GitHub Actions runner sets, the second what `gh auth` sets.
+///
+/// The API answers a public repository without one, at sixty requests an
+/// hour per address, which a busy shared runner can be a long way into.
+const GITHUB_TOKEN_VARIABLES: [&str; 2] = ["GITHUB_TOKEN", "GH_TOKEN"];
+
+/// Digits of the HTTP status curl is asked to write after the body.
+const HTTP_STATUS_DIGITS: usize = 3;
+
+/// Bytes of an unexpected answer an error carries: enough to read
+/// GitHub's own `{"message": ...}`, not enough to bury the message.
+const ERROR_BODY_BYTES: usize = 512;
+
+/// The parts of a GitHub release this fetch reads.
+#[derive(Debug, Deserialize)]
+struct GithubRelease {
+    tag_name: String,
+    #[serde(default)]
+    assets: Vec<GithubReleaseAsset>,
+}
+
+/// One asset of a release.
+#[derive(Debug, Deserialize)]
+struct GithubReleaseAsset {
+    name: String,
+    browser_download_url: String,
+}
+
+/// Downloads the kernel profile a release published into the store.
+///
+/// The store is what `helios-inspector vm --release` reads to build an
+/// x86-64 kernel the way the release's own kernel was built
+/// (`docs/pgo.md`), so this is the one entry point that puts a profile
+/// there: everything else names a profile it was given.
+fn run_profile_fetch(
+    command: ProfileFetchCommand,
+    explicit_workspace_root: Option<&Path>,
+) -> Result<(), ProfileFetchError> {
+    let workspace_root = WorkspaceRoot::resolve(explicit_workspace_root)?;
+    let store = KernelProfileStore::new(workspace_root.path());
+    let repository = &command.repository;
+    let url = match &command.tag {
+        Some(tag) => format!("{GITHUB_API}/repos/{repository}/releases/tags/{tag}"),
+        None => format!("{GITHUB_API}/repos/{repository}/releases/latest"),
+    };
+    let document = github_get(&url, true)?;
+    let release: GithubRelease =
+        serde_json::from_slice(&document).map_err(|source| ProfileFetchError::DecodeRelease {
+            url: url.clone(),
+            source,
+        })?;
+    let asset = release
+        .assets
+        .iter()
+        .find(|asset| asset.name == KERNEL_PROFILE_ASSET)
+        .ok_or_else(|| ProfileFetchError::NoProfileAsset {
+            repository: repository.clone(),
+            tag: release.tag_name.clone(),
+        })?;
+    let path = store.profile_path(&release.tag_name)?;
+    let directory = path.parent().expect("a profile path names its release");
+    fs::create_dir_all(directory).map_err(|source| ProfileFetchError::CreateDirectory {
+        path: directory.display().to_string(),
+        source,
+    })?;
+    // The download carries no token: GitHub redirects an asset to its own
+    // object store, and an Authorization header follows the redirect
+    // there.
+    let profile = github_get(&asset.browser_download_url, false)?;
+    fs::write(&path, profile).map_err(|source| ProfileFetchError::Write {
+        path: path.display().to_string(),
+        source,
+    })?;
+    // The header check before the record: a record names a profile a
+    // build can read, or there is no record.
+    helios_profdata::validate(&path)?;
+    store.publish(&FetchedProfile {
+        repository: repository.clone(),
+        tag: release.tag_name.clone(),
+    })?;
+    println!("{} {} {}", release.tag_name, repository, path.display());
+    Ok(())
+}
+
+/// One HTTPS GET through curl, returning the body.
+///
+/// curl is the HTTP client this repository already downloads its pinned
+/// artifacts with (`tools/wasi-apps/build.sh`). The status is asked for
+/// explicitly rather than through `--fail`, because a 404 on a release is
+/// the answer that has something to say and `--fail` throws the body away.
+fn github_get(url: &str, authenticated: bool) -> Result<Vec<u8>, ProfileFetchError> {
+    let config = if authenticated {
+        github_token_header()?
+    } else {
+        String::new()
+    };
+    let mut child = Command::new("curl")
+        .args([
+            "--silent",
+            "--show-error",
+            "--location",
+            "--proto",
+            "=https",
+            "--tlsv1.2",
+            "--write-out",
+            "%{http_code}",
+            "--config",
+            "-",
+        ])
+        .arg(url)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|source| ProfileFetchError::Curl {
+            url: url.to_owned(),
+            source,
+        })?;
+    child
+        .stdin
+        .take()
+        .expect("curl was spawned with a piped stdin")
+        .write_all(config.as_bytes())
+        .map_err(|source| ProfileFetchError::CurlConfig {
+            url: url.to_owned(),
+            source,
+        })?;
+    let output = child
+        .wait_with_output()
+        .map_err(|source| ProfileFetchError::Curl {
+            url: url.to_owned(),
+            source,
+        })?;
+    if !output.status.success() {
+        return Err(ProfileFetchError::CurlExited {
+            url: url.to_owned(),
+            status: output.status.to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        });
+    }
+    let mut body = output.stdout;
+    if body.len() < HTTP_STATUS_DIGITS {
+        return Err(ProfileFetchError::NoHttpStatus {
+            url: url.to_owned(),
+            len: body.len(),
+        });
+    }
+    let status = String::from_utf8_lossy(&body[body.len() - HTTP_STATUS_DIGITS..]).into_owned();
+    body.truncate(body.len() - HTTP_STATUS_DIGITS);
+    match status.as_str() {
+        "200" => Ok(body),
+        "404" => Err(ProfileFetchError::NoRelease {
+            url: url.to_owned(),
+        }),
+        _ => Err(ProfileFetchError::HttpStatus {
+            url: url.to_owned(),
+            status,
+            body: String::from_utf8_lossy(&body[..body.len().min(ERROR_BODY_BYTES)])
+                .trim()
+                .to_owned(),
+        }),
+    }
+}
+
+/// The curl configuration carrying the GitHub token, or nothing.
+///
+/// The token reaches curl on its standard input rather than in an
+/// argument, because arguments are readable to every process on the
+/// machine. A value that is not a token is refused rather than quoted
+/// into a configuration line.
+fn github_token_header() -> Result<String, ProfileFetchError> {
+    for variable in GITHUB_TOKEN_VARIABLES {
+        let Ok(token) = std::env::var(variable) else {
+            continue;
+        };
+        if token.is_empty() {
+            continue;
+        }
+        if !token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+        {
+            return Err(ProfileFetchError::Token { variable });
+        }
+        return Ok(format!("header = \"Authorization: Bearer {token}\"\n"));
+    }
+    Ok(String::new())
 }

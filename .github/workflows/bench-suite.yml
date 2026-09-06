@@ -163,6 +163,16 @@ jobs:
           flamegraphs: "true"
           inspector: "true"
           bench-tooling: "true"
+      # Every x86-64 release build is built against the kernel profile
+      # the latest release published (docs/pgo.md, #226); the inspector
+      # refuses to build one without it rather than producing a plain
+      # kernel wearing a PGO label, so the fetch comes before the build.
+      - name: Fetch the release kernel profile
+        if: matrix.helios-arch == 'x86-64'
+        working-directory: helios
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: cargo run --release -p helios-cli -- profile-fetch
       - name: Report host deviations from the lane
         working-directory: helios/tools/bench
         run: uv run helios-bench host-check --lane ${{ matrix.lane }} || true
@@ -374,10 +384,21 @@ jobs:
             printf '%s=%s\n' "$field" "$(printf '%s' "$entry" | jq -r --arg f "$field" '.[$f]')" \
               >> "$GITHUB_OUTPUT"
           done
+      # The candidate's profile: the one this run collected. It lands in
+      # the checkout so the paired table can name it as a path.
       - uses: actions/download-artifact@v4
         with:
           name: helios-kernel-profdata
-          path: profile
+          path: helios/target/pgo-candidate
+      # Every x86-64 release build is built against the kernel profile
+      # the latest release published (docs/pgo.md, #226); the inspector
+      # refuses to build one without it rather than producing a plain
+      # kernel wearing a PGO label, so the fetch comes before the build.
+      - name: Fetch the release kernel profile
+        working-directory: helios
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: cargo run --release -p helios-cli -- profile-fetch
       - name: Provision the multi-queue tap network backend
         if: steps.lane.outputs.net-backend == 'tap'
         working-directory: helios
@@ -401,7 +422,7 @@ jobs:
           args=(run --lane "${BENCH_LANE}" --out-dir "$GITHUB_WORKSPACE/bench-out/pgo"
                 --runner-label "${{ runner.name }}"
                 --sides "helios,helios_baseline"
-                --profile-use "$GITHUB_WORKSPACE/profile/helios-kernel.profdata"
+                --profile-use "$GITHUB_WORKSPACE/helios/target/pgo-candidate/helios-kernel.profdata"
                 --advisory --allow-busy-host)
           if [ -n "${{ inputs.iterations }}" ]; then
             args+=(--iterations "${{ inputs.iterations }}")

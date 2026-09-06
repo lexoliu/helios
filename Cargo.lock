@@ -1693,6 +1693,7 @@ dependencies = [
  "fatfs",
  "helios-artifact",
  "helios-compiler-support",
+ "helios-profdata",
  "helios-workspace-root",
  "hex",
  "mbrman",
@@ -1819,6 +1820,7 @@ dependencies = [
  "futures-util",
  "helios-hal",
  "helios-inspector-protocol",
+ "helios-profdata",
  "helios-workspace-root",
  "indicatif",
  "ipnet",
@@ -1964,6 +1966,16 @@ version = "0.1.0"
 dependencies = [
  "helios-api",
  "helios-bench-metrics",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "helios-profdata"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
  "thiserror 2.0.20",
 ]
 

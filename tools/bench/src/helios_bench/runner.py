@@ -9,6 +9,7 @@ every pin, and turns the raw JSONL into a report.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import platform
 import shlex
@@ -55,6 +56,15 @@ LINUX_SIDES = {Side.LINUX_NATIVE, Side.LINUX_WASMTIME}
 # pairing varies the candidate.
 RELEASE_BUILD = "release"
 PROFILE_USE_BUILD = "profile-use"
+# Architectures whose `--release` kernel is built against the profile the
+# latest release published (docs/pgo.md, #226). On those there is no plain
+# release kernel: the inspector compiles one with `-C profile-use` and its
+# artifacts land in the `profile-use` directory, so the run record and the
+# bootfs pins below have to say so.
+RELEASE_PROFILE_ARCHS = frozenset({"x86-64"})
+# Where `helios-cli profile-fetch` records the release whose profile this
+# checkout builds against.
+KERNEL_PROFILE_RECORD = REPO_ROOT / "target" / "profiles" / "fetched.json"
 # Which subdirectory of the run's output each side's raw JSONL lands in.
 # The two Helios images write the same file names, so the directory is
 # what tells their records apart.
@@ -111,9 +121,34 @@ class RunOptions:
     profile_use: Path | None = None
 
     @property
+    def paired(self) -> bool:
+        """Whether this run times a second Helios image beside the first."""
+        return self.baseline is not None or self.profile_use is not None
+
+    @property
+    def reads_release_profile(self) -> bool:
+        """Whether a plain release build of this lane reads a profile."""
+        return self.lane.helios_arch in RELEASE_PROFILE_ARCHS
+
+    @property
     def kernel_build(self) -> str:
         """The cargo profile the candidate kernel is built with."""
-        return PROFILE_USE_BUILD if self.profile_use else RELEASE_BUILD
+        if self.profile_use or self.reads_release_profile:
+            return PROFILE_USE_BUILD
+        return RELEASE_BUILD
+
+    @property
+    def baseline_kernel_build(self) -> str | None:
+        """The cargo profile the second image is built with, if there is one.
+
+        The baseline image is built the way a plain `--release` build of
+        this lane is, which on an architecture whose releases carry a
+        profile is itself a `profile-use` build: what separates the two
+        columns of a PGO pairing is then the profile, not the build kind.
+        """
+        if not self.paired:
+            return None
+        return PROFILE_USE_BUILD if self.reads_release_profile else RELEASE_BUILD
 
 
 @dataclass(frozen=True)
@@ -256,6 +291,44 @@ def plan(options: RunOptions, manifest: Manifest, workloads: list[dict]) -> list
             )
         )
     return commands
+
+
+def release_kernel_profile_tag() -> str:
+    """The release whose kernel profile this checkout builds against.
+
+    `helios-cli profile-fetch` writes the record and the inspector
+    refuses a release build without it, so a run that has already booted
+    a guest has one; a missing record is a run that never built what it
+    says it built.
+    """
+    if not KERNEL_PROFILE_RECORD.is_file():
+        raise SystemExit(
+            f"{KERNEL_PROFILE_RECORD} is not there, so this lane's release kernel was not built "
+            "against a release profile: run `helios-cli profile-fetch` (docs/pgo.md)"
+        )
+    return json.loads(KERNEL_PROFILE_RECORD.read_text())["tag"]
+
+
+def profile_label(path: Path) -> str:
+    """A profile named short enough for a table cell."""
+    try:
+        return str(path.relative_to(REPO_ROOT))
+    except ValueError:
+        return str(path)
+
+
+def kernel_profiles(options: RunOptions) -> tuple[str | None, str | None]:
+    """Which profile each column's kernel was built against.
+
+    The candidate reads the profile the run named, and otherwise the
+    release's on a lane whose release builds read one. The baseline image
+    is built plain, so it reads the release's or none — which is exactly
+    what a PGO pairing measures once every release publishes a profile:
+    the release's counts against a freshly collected set (#226).
+    """
+    release = f"release {release_kernel_profile_tag()}" if options.reads_release_profile else None
+    candidate = profile_label(options.profile_use) if options.profile_use else release
+    return candidate, release if options.paired else None
 
 
 def baseline_arguments(options: RunOptions, out_root: Path) -> list[str]:
@@ -540,7 +613,7 @@ def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) ->
             "this host deviates from lane "
             f"{lane.name}; refusing to produce a publishable report:\n  - " + "\n  - ".join(deviations)
         )
-    paired = options.baseline is not None or options.profile_use is not None
+    paired = options.paired
     if paired and not {Side.HELIOS, Side.HELIOS_BASELINE} <= options.sides:
         raise SystemExit(
             "a paired run times both Helios images: --sides has to name helios and helios_baseline"
@@ -577,6 +650,8 @@ def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) ->
     )
     run_id, run_url, attempt = github_run()
 
+    candidate_profile, baseline_profile = kernel_profiles(options)
+
     def build(reconfirmed: list[str]) -> Report:
         finished = datetime.now(UTC).isoformat(timespec="seconds")
         run = RunInfo(
@@ -598,7 +673,9 @@ def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) ->
             baseline_git_sha=options.baseline.sha if options.baseline else (git_sha() if paired else None),
             baseline_ref=options.baseline.ref if options.baseline else None,
             kernel_build=options.kernel_build,
-            baseline_kernel_build=RELEASE_BUILD if paired else None,
+            baseline_kernel_build=options.baseline_kernel_build,
+            kernel_profile=candidate_profile,
+            baseline_kernel_profile=baseline_profile,
             retaken=retaken,
             reconfirmed=reconfirmed,
         )

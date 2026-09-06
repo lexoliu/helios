@@ -1,13 +1,21 @@
-//! The merged profile a `--profile-use` kernel build reads.
+//! The kernel profile a `-C profile-use` build reads, and the store the
+//! fetched one lives in.
+//!
+//! Two host tools hold one end of this each. `helios-cli profile-fetch`
+//! downloads the `helios-kernel.profdata` a release published and writes
+//! it into the store; `helios-inspector vm --release` reads the store to
+//! build the x86-64 kernel against it (`docs/pgo.md`, #226). What a
+//! profile has to be, and where a fetched one lives, is therefore one
+//! definition rather than a convention two crates keep separately.
 //!
 //! `-C profile-use` takes the *indexed* profile `llvm-profdata merge`
 //! writes, not the `.profraw` the guest kernel exports
-//! (`kernel/src/profiling`, `docs/pgo.md`). The two containers are
-//! distinguished by their first eight bytes and the second word of an
-//! indexed file is its format version, so a profile from another
-//! toolchain is recognisable before rustc is started — and is refused
-//! here rather than deep inside a twenty-minute kernel build whose
-//! failure names an LLVM bitcode error.
+//! (`kernel/src/profiling`). The two containers are distinguished by
+//! their first eight bytes and the second word of an indexed file is its
+//! format version, so a profile from another toolchain is recognisable
+//! before rustc is started — and is refused here rather than deep inside
+//! a twenty-minute kernel build whose failure names an LLVM bitcode
+//! error.
 //!
 //! The check mirrors the guest writer's: it holds one pinned version
 //! word, says which toolchain that word was read from, and fails loudly
@@ -16,6 +24,31 @@
 use std::fs::File;
 use std::io::Read as _;
 use std::path::Path;
+
+mod store;
+
+pub use store::{FetchedProfile, KernelProfileStore, KernelProfileStoreError};
+
+/// Name of the release asset every release carries the kernel's profile
+/// under (#226), and of the file the store keeps it in.
+///
+/// `release.yml`'s `kernel-profile` job uploads it; nothing else names
+/// it, so a rename is one edit.
+pub const KERNEL_PROFILE_ASSET: &str = "helios-kernel.profdata";
+
+/// The command that puts a release's profile in the store, spelled the
+/// way a user would type it.
+///
+/// Every refusal that comes of an empty store names it, so the fix is in
+/// the error rather than in the documentation.
+pub const FETCH_COMMAND: &str = "helios-cli profile-fetch";
+
+/// The repository whose releases carry the kernel profile.
+///
+/// This is where Helios publishes, the way `checkout-wasmtime` pins where
+/// the vendored Wasmtime comes from. `helios-cli profile-fetch --repo`
+/// overrides it for a fork.
+pub const RELEASE_REPOSITORY: &str = "lexoliu/helios";
 
 /// `IndexedInstrProf::Magic`, the first eight bytes of a merged profile
 /// read as a little-endian word: the ASCII `\xfflprofi\x81`.
@@ -56,51 +89,82 @@ const HEADER_BYTES: usize = 16;
 /// Why a file named by `--profile-use` is not a profile this toolchain
 /// can build against.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum ProfileUseError {
+pub enum ProfileUseError {
+    /// The file could not be opened or read.
     #[error("failed to read the profile {path}: {source}")]
     Read {
+        /// The profile that could not be read.
         path: String,
+        /// The underlying filesystem error.
         #[source]
         source: std::io::Error,
     },
+    /// The file is shorter than the header the check reads.
     #[error(
         "the profile {path} is {len} bytes; an indexed profile starts with a \
          {HEADER_BYTES}-byte magic and version"
     )]
-    TooShort { path: String, len: usize },
+    TooShort {
+        /// The profile that is too short.
+        path: String,
+        /// How many bytes it holds.
+        len: usize,
+    },
+    /// The file is the raw profile the guest exports, not the merged one.
     #[error(
         "{path} is a raw profile (.profraw), and -C profile-use reads the merged one; \
          `llvm-profdata merge --output <file>.profdata {path}` produces it"
     )]
-    NotMerged { path: String },
+    NotMerged {
+        /// The raw profile that reached a `--profile-use` build.
+        path: String,
+    },
+    /// The file is not an LLVM profile at all.
     #[error(
         "{path} is not an LLVM profile: it starts with {magic:#018x}, and an indexed \
          profile starts with {INDEXED_MAGIC:#018x}"
     )]
-    NotAProfile { path: String, magic: u64 },
+    NotAProfile {
+        /// The file that is not a profile.
+        path: String,
+        /// The magic word it does start with.
+        magic: u64,
+    },
+    /// The profile's format version is not the one this toolchain reads.
     #[error(
         "{path} is an indexed profile of version {found}, and this toolchain reads \
          version {expected} (docs/pgo.md); collect the profile again on the toolchain \
          rust-toolchain.toml pins"
     )]
     VersionMismatch {
+        /// The profile whose version does not match.
         path: String,
+        /// The version the file carries.
         found: u64,
+        /// The version this toolchain reads.
         expected: u64,
     },
+    /// The profile did not come from IR-level instrumentation.
     #[error(
         "{path} carries version word {version:#018x}, which does not set the \
          IR-instrumentation variant bit {VARIANT_MASK_IR_PROF:#018x}; the kernel is \
          instrumented with -C profile-generate, whose profiles are IR profiles"
     )]
-    NotIrInstrumented { path: String, version: u64 },
+    NotIrInstrumented {
+        /// The profile that is not an IR profile.
+        path: String,
+        /// The version word it carries.
+        version: u64,
+    },
 }
 
 /// Refuses a profile this toolchain's `-C profile-use` cannot read.
 ///
 /// Called before the build command is assembled, so that a stale artifact
-/// costs a header read rather than a kernel compile.
-pub(super) fn validate(path: &Path) -> Result<(), ProfileUseError> {
+/// costs a header read rather than a kernel compile, and again by
+/// `helios-cli profile-fetch` before a downloaded asset enters the store,
+/// so that a bad asset is refused where it arrives.
+pub fn validate(path: &Path) -> Result<(), ProfileUseError> {
     let name = path.display().to_string();
     let on_read = |source| ProfileUseError::Read {
         path: name.clone(),
@@ -166,6 +230,15 @@ fn check_header(path: &str, header: &[u8; HEADER_BYTES]) -> Result<(), ProfileUs
 mod tests {
     use super::*;
 
+    /// The sixteen bytes a merged profile of the pinned toolchain starts
+    /// with, for a test that needs a file rather than a header.
+    pub(crate) fn pinned_header() -> [u8; HEADER_BYTES] {
+        header(
+            INDEXED_MAGIC,
+            INDEXED_PROFILE_VERSION | VARIANT_MASK_IR_PROF,
+        )
+    }
+
     fn header(magic: u64, version: u64) -> [u8; HEADER_BYTES] {
         let mut bytes = [0u8; HEADER_BYTES];
         bytes[..8].copy_from_slice(&magic.to_le_bytes());
@@ -175,14 +248,8 @@ mod tests {
 
     #[test]
     fn the_pinned_toolchains_profile_is_accepted() {
-        check_header(
-            "pinned.profdata",
-            &header(
-                INDEXED_MAGIC,
-                INDEXED_PROFILE_VERSION | VARIANT_MASK_IR_PROF,
-            ),
-        )
-        .expect("the version the pinned toolchain writes is the one this build reads");
+        check_header("pinned.profdata", &pinned_header())
+            .expect("the version the pinned toolchain writes is the one this build reads");
     }
 
     #[test]
