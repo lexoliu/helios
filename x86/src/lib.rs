@@ -137,6 +137,10 @@ extern "C" fn _start() -> ! {
 }
 
 fn x86_kernel_main() -> ! {
+    // Before anything else: every line below may read this processor's
+    // identity at `fs:0`, and the bootstrap processor has no runtime to point
+    // `IA32_FS_BASE` at until the heap and the ACPI tables exist.
+    smp::install_bootstrap_anchor();
     // The one place COM1 is configured; see `serial_uart_init`.
     serial_uart_init();
     assert!(
