@@ -1621,6 +1621,21 @@ name = "helios-bench-metrics"
 version = "0.1.0"
 
 [[package]]
+name = "helios-branch-hints"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "wasm-encoder 0.245.1",
+ "wasmparser 0.245.1",
+ "wasmtime",
+ "wat",
+]
+
+[[package]]
 name = "helios-cli"
 version = "0.1.0"
 dependencies = [
