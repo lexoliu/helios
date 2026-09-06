@@ -502,8 +502,8 @@ impl helios_netstack::NetworkInterface for RecordingNetworkInterface {
 /// The network service the kernel's own tests drive.
 ///
 /// An in-memory double that models an always-ready loopback peer. It
-/// lives here rather than inside one test module because the WASI
-/// adapter's tests and the preview1 descriptor tests both need a real
+/// lives here rather than inside one test module because several of
+/// them need the same double, and one of them needs a real
 /// [`crate::ComponentHostNetworkService`] built on top of it.
 #[cfg(feature = "wasmtime-runtime")]
 mod network {
@@ -785,7 +785,7 @@ mod network {
             _: u64,
         ) -> impl core::future::Future<Output = Result<u64, crate::UdpError>> + Send + '_ {
             let _ = bytes;
-            async { panic!("WASI UDP send must use typed address path") }
+            async { panic!("a UDP send must take the typed address path") }
         }
 
         fn udp_send_address(
