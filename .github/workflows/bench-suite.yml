@@ -69,18 +69,28 @@ jobs:
       # Advisory unless this is a dedicated-runner event; `runs-on` below
       # reads it through the needs context, the only one it can read.
       advisory: ${{ steps.mode.outputs.advisory }}
+      paired_acceptance: ${{ steps.mode.outputs.paired_acceptance }}
       # The suite's matrix, from tools/bench/manifest.toml: the lanes have
       # one definition.
       matrix: ${{ steps.lanes.outputs.matrix }}
     steps:
       - id: mode
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REQUESTED_ADVISORY: ${{ inputs.advisory }}
+          BASELINE_REF: ${{ inputs.baseline_ref }}
         run: |
-          if [ "${{ github.event_name }}" = workflow_dispatch ]; then
-            echo "advisory=${{ inputs.advisory }}" >> "$GITHUB_OUTPUT"
-          elif [ "${{ github.event_name }}" = pull_request ]; then
+          if [ "$EVENT_NAME" = workflow_dispatch ]; then
+            echo "advisory=$REQUESTED_ADVISORY" >> "$GITHUB_OUTPUT"
+          elif [ "$EVENT_NAME" = pull_request ]; then
             echo "advisory=true" >> "$GITHUB_OUTPUT"
           else
             echo "advisory=false" >> "$GITHUB_OUTPUT"
+          fi
+          if [ "$EVENT_NAME" = workflow_dispatch ] && [ "$REQUESTED_ADVISORY" = true ] && [ -n "$BASELINE_REF" ]; then
+            echo "paired_acceptance=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "paired_acceptance=false" >> "$GITHUB_OUTPUT"
           fi
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
@@ -118,6 +128,7 @@ jobs:
     runs-on: ${{ needs.tooling.outputs.advisory == 'true' && matrix.shared-runner || matrix.dedicated-runner }}
     env:
       BENCH_ADVISORY: ${{ needs.tooling.outputs.advisory }}
+      BENCH_PAIRED_ACCEPTANCE: ${{ needs.tooling.outputs.paired_acceptance }}
     timeout-minutes: 420
     strategy:
       fail-fast: false
@@ -189,6 +200,9 @@ jobs:
           if [ -n "${BENCH_BASELINE_REF}" ]; then
             args+=(--baseline-ref "${BENCH_BASELINE_REF}")
           fi
+          if [ "${BENCH_PAIRED_ACCEPTANCE}" = true ]; then
+            args+=(--sides "helios,helios_baseline")
+          fi
           if [ "${{ matrix.net-backend }}" = tap ]; then
             args+=(--net-ifname "${HELIOS_NET_IFNAME}" --net-bridge "${HELIOS_NET_BRIDGE}" --net-queues "$(nproc)")
           fi
@@ -241,13 +255,15 @@ jobs:
   # scheduling, so anything timed here would measure the counters.
   profile-generate:
     name: profile-generate
-    # Same events as the suite: a full instrumented build plus a workload
-    # pass is too heavy for every push.
+    needs: tooling
+    # Full suite events retain profiling; advisory revision acceptance
+    # measures its two images without an independent PGO experiment.
     if: >-
-      github.event_name == 'workflow_dispatch'
+      needs.tooling.outputs.paired_acceptance != 'true'
+      && (github.event_name == 'workflow_dispatch'
       || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'bench'))
       || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/'))
-      || (github.event_name == 'push' && vars.HELIOS_BENCH_DEDICATED == 'true')
+      || (github.event_name == 'push' && vars.HELIOS_BENCH_DEDICATED == 'true'))
     runs-on: ubuntu-24.04
     timeout-minutes: 240
     env:
@@ -289,11 +305,7 @@ jobs:
     needs: profile-generate
     # Same events as the job that produces the profile: without one there
     # is nothing to build against.
-    if: >-
-      github.event_name == 'workflow_dispatch'
-      || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'bench'))
-      || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/'))
-      || (github.event_name == 'push' && vars.HELIOS_BENCH_DEDICATED == 'true')
+    if: needs.profile-generate.result == 'success'
     runs-on: ubuntu-24.04
     timeout-minutes: 420
     permissions:
