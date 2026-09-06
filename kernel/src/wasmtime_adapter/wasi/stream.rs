@@ -1,11 +1,13 @@
 use super::*;
+use crate::ComponentHostNetwork;
 
-pub(super) struct SerialStreamConsumer<T, CpuImpl, HostFs>
+pub(super) struct SerialStreamConsumer<T, CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    pub(super) getter: fn(&mut T) -> &mut StoreData<CpuImpl, HostFs>,
+    pub(super) getter: fn(&mut T) -> &mut StoreData<CpuImpl, Net, HostFs>,
     pub(super) stream: OutputStreamKind,
     pub(super) result: Option<oneshot::Sender<core::result::Result<(), cli_types::ErrorCode>>>,
     /// Batch that the sink could not take yet. Held here — never dropped
@@ -14,20 +16,22 @@ where
     pub(super) write_wait: Option<crate::ByteWriteWait>,
 }
 
-impl<T, CpuImpl, HostFs> Unpin for SerialStreamConsumer<T, CpuImpl, HostFs>
+impl<T, CpuImpl, Net, HostFs> Unpin for SerialStreamConsumer<T, CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
 }
 
-impl<T, CpuImpl, HostFs> SerialStreamConsumer<T, CpuImpl, HostFs>
+impl<T, CpuImpl, Net, HostFs> SerialStreamConsumer<T, CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     pub(super) fn new(
-        getter: fn(&mut T) -> &mut StoreData<CpuImpl, HostFs>,
+        getter: fn(&mut T) -> &mut StoreData<CpuImpl, Net, HostFs>,
         result: oneshot::Sender<core::result::Result<(), cli_types::ErrorCode>>,
         stream: OutputStreamKind,
     ) -> Self {
@@ -47,9 +51,10 @@ where
     }
 }
 
-impl<T, CpuImpl, HostFs> Drop for SerialStreamConsumer<T, CpuImpl, HostFs>
+impl<T, CpuImpl, Net, HostFs> Drop for SerialStreamConsumer<T, CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     fn drop(&mut self) {
@@ -57,9 +62,11 @@ where
     }
 }
 
-impl<T: 'static, CpuImpl, HostFs> StreamConsumer<T> for SerialStreamConsumer<T, CpuImpl, HostFs>
+impl<T: 'static, CpuImpl, Net, HostFs> StreamConsumer<T>
+    for SerialStreamConsumer<T, CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     type Item = u8;

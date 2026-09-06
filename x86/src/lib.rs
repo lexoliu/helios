@@ -18,10 +18,19 @@ mod vsock;
 mod watchdog;
 
 mod debug_state {
-    pub(crate) type RuntimeState =
-        helios_kernel::HostRuntimeState<crate::X86Cpu, crate::host_fs::HostFileSystemService>;
-    pub(crate) type ProgramService =
-        helios_kernel::UserProgramService<crate::X86Cpu, crate::host_fs::HostFileSystemService>;
+    /// The network service this machine's virtio-net function backs.
+    pub(crate) type NetworkService =
+        helios_kernel::NetworkService<crate::X86Cpu, crate::net::VirtioNetworkDevice>;
+    pub(crate) type RuntimeState = helios_kernel::HostRuntimeState<
+        crate::X86Cpu,
+        NetworkService,
+        crate::host_fs::HostFileSystemService,
+    >;
+    pub(crate) type ProgramService = helios_kernel::UserProgramService<
+        crate::X86Cpu,
+        NetworkService,
+        crate::host_fs::HostFileSystemService,
+    >;
 }
 
 use alloc::sync::Arc;

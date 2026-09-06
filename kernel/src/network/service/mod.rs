@@ -44,12 +44,12 @@ use spin::{Mutex as SpinMutex, RwLock as SpinRwLock};
 
 use crate::SocketReadiness;
 use crate::{
-    ComponentNetworkService, ComponentRuntimeState, DnsError, DnsErrorKind,
-    Ipv4Address as KernelIpv4Address, Ipv4Cidr as KernelIpv4Cidr, Ipv4Route as KernelIpv4Route,
-    MacAddress, NetworkAdminBackend, NetworkBridgeRequest, NetworkControlError, NetworkErrorDetail,
-    NetworkIpAddress, NetworkPortId, PingError, PingErrorKind, PingReply, ProgressMark,
-    ProgressSignal, RegisteredTcpReadBuffer, TcpAccepted, TcpError, TcpErrorKind, TcpListener,
-    Timer, UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
+    ComponentNetworkService, DnsError, DnsErrorKind, Ipv4Address as KernelIpv4Address,
+    Ipv4Cidr as KernelIpv4Cidr, Ipv4Route as KernelIpv4Route, MacAddress, NetworkAdminBackend,
+    NetworkBridgeRequest, NetworkControlError, NetworkErrorDetail, NetworkIpAddress, NetworkPortId,
+    PingError, PingErrorKind, PingReply, ProfileSink, ProgressMark, ProgressSignal,
+    RegisteredTcpReadBuffer, TcpAccepted, TcpError, TcpErrorKind, TcpListener, Timer, UdpBinding,
+    UdpDatagram, UdpError, UdpErrorKind, UptimeClock,
 };
 use triomphe::Arc;
 
@@ -118,23 +118,24 @@ const NETWORK_POLLING_TCP_READ_ROUNDS: usize = NETWORK_BUSY_POLL_ROUNDS * 2;
 const NETWORK_TCP_READ_BURST_ROUNDS: usize = NETWORK_BUSY_POLL_ROUNDS;
 
 #[derive(Clone)]
-pub struct NetworkService<CpuImpl, Runtime, Device>
+pub struct NetworkService<CpuImpl, Device>
 where
     CpuImpl: Cpu + Clone,
-    Runtime: ComponentRuntimeState + Sync,
     Device: NetworkDevice,
 {
-    inner: Arc<NetworkServiceInner<CpuImpl, Runtime, Device>>,
+    inner: Arc<NetworkServiceInner<CpuImpl, Device>>,
 }
 
-struct NetworkServiceInner<CpuImpl, Runtime, Device>
+struct NetworkServiceInner<CpuImpl, Device>
 where
     CpuImpl: Cpu + Clone,
-    Runtime: ComponentRuntimeState + Sync,
     Device: NetworkDevice,
 {
     cpu: CpuImpl,
-    runtime_state: Runtime,
+    profiles: ProfileSink,
+    /// The kernel's uptime clock, the origin every protocol deadline
+    /// and every profile sample here is measured from.
+    clock: UptimeClock,
     timer: Timer<CpuImpl>,
     device: Device,
     state: NetworkShardSet,
@@ -286,18 +287,13 @@ impl From<TcpStreamId> for ShardHandle {
     }
 }
 
-#[cfg(feature = "wasmtime-runtime")]
-impl crate::ComponentHostTcpStreamToken for TcpStreamId {
+impl crate::NetworkHandle for TcpStreamId {
     fn into_raw(self) -> u64 {
         u64::from(self.0.get())
     }
 
     fn from_raw(raw: u64) -> Self {
-        let raw = u32::try_from(raw)
-            .unwrap_or_else(|_| panic!("tcp stream handle {raw} does not fit in u32"));
-        let raw =
-            NonZeroU32::new(raw).unwrap_or_else(|| panic!("tcp stream handle must be non-zero"));
-        Self(raw)
+        Self(non_zero_u32_handle("tcp stream", raw))
     }
 }
 
@@ -310,24 +306,19 @@ impl From<TcpListenerId> for u64 {
     }
 }
 
-impl From<TcpListenerId> for ReplicaHandle {
-    fn from(id: TcpListenerId) -> Self {
-        ReplicaHandle::from_raw(id.0)
-    }
-}
-
-#[cfg(feature = "wasmtime-runtime")]
-impl crate::ComponentHostTcpListenerToken for TcpListenerId {
+impl crate::NetworkHandle for TcpListenerId {
     fn into_raw(self) -> u64 {
         u64::from(self.0.get())
     }
 
     fn from_raw(raw: u64) -> Self {
-        let raw = u32::try_from(raw)
-            .unwrap_or_else(|_| panic!("tcp listener handle {raw} does not fit in u32"));
-        let raw =
-            NonZeroU32::new(raw).unwrap_or_else(|| panic!("tcp listener handle must be non-zero"));
-        Self(raw)
+        Self(non_zero_u32_handle("tcp listener", raw))
+    }
+}
+
+impl From<TcpListenerId> for ReplicaHandle {
+    fn from(id: TcpListenerId) -> Self {
+        ReplicaHandle::from_raw(id.0)
     }
 }
 
@@ -340,24 +331,30 @@ impl From<UdpSocketId> for u64 {
     }
 }
 
-impl From<UdpSocketId> for ReplicaHandle {
-    fn from(id: UdpSocketId) -> Self {
-        ReplicaHandle::from_raw(id.0)
-    }
-}
-
-#[cfg(feature = "wasmtime-runtime")]
-impl crate::ComponentHostUdpSocketToken for UdpSocketId {
+impl crate::NetworkHandle for UdpSocketId {
     fn into_raw(self) -> u64 {
         u64::from(self.0.get())
     }
 
     fn from_raw(raw: u64) -> Self {
-        let raw = u32::try_from(raw)
-            .unwrap_or_else(|_| panic!("udp socket handle {raw} does not fit in u32"));
-        let raw =
-            NonZeroU32::new(raw).unwrap_or_else(|| panic!("udp socket handle must be non-zero"));
-        Self(raw)
+        Self(non_zero_u32_handle("udp socket", raw))
+    }
+}
+
+/// The slab index behind a numeric handle name.
+///
+/// Every id these types carry was minted by this service and travels
+/// only inside the kernel, so a value that is not one is a kernel bug
+/// and stops here rather than becoming a handle to some other socket.
+fn non_zero_u32_handle(kind: &str, raw: u64) -> NonZeroU32 {
+    let raw =
+        u32::try_from(raw).unwrap_or_else(|_| panic!("{kind} handle {raw} does not fit in u32"));
+    NonZeroU32::new(raw).unwrap_or_else(|| panic!("{kind} handle must be non-zero"))
+}
+
+impl From<UdpSocketId> for ReplicaHandle {
+    fn from(id: UdpSocketId) -> Self {
+        ReplicaHandle::from_raw(id.0)
     }
 }
 
@@ -641,15 +638,15 @@ const fn next_transaction_id(current: u32) -> u32 {
     if next == 0 { 1 } else { next }
 }
 
-impl<CpuImpl, Runtime, DeviceImpl> NetworkService<CpuImpl, Runtime, DeviceImpl>
+impl<CpuImpl, DeviceImpl> NetworkService<CpuImpl, DeviceImpl>
 where
     CpuImpl: Cpu + Clone,
-    Runtime: ComponentRuntimeState + Sync,
     DeviceImpl: NetworkDevice,
 {
     pub fn new(
         cpu: CpuImpl,
-        runtime_state: Runtime,
+        profiles: ProfileSink,
+        clock: UptimeClock,
         timer: Timer<CpuImpl>,
         device: DeviceImpl,
     ) -> Self {
@@ -703,7 +700,8 @@ where
         Self {
             inner: Arc::new(NetworkServiceInner {
                 cpu,
-                runtime_state,
+                profiles,
+                clock,
                 timer,
                 state,
                 control: NetworkControlPlane::new(),
@@ -1281,20 +1279,26 @@ where
         self.deadline_wait(deadline_nanos).min(interval)
     }
 
+    /// Wakes the packet pump so a segment a synchronous retirement
+    /// queued leaves on the next executor turn rather than the next
+    /// protocol timer (#232).
+    ///
+    /// The pump parks on the whole shard set, and the executor wakes
+    /// the processor its task lands on, so raising the signal is the
+    /// whole of it.
+    pub fn wake_packet_pump(&self) {
+        self.inner.state.wake_any_shard();
+    }
+
     fn now_nanos(&self) -> u64 {
-        self.inner
-            .runtime_state
-            .uptime_nanos(self.inner.cpu.now().ticks())
+        self.inner.clock.now_nanos(&self.inner.cpu)
     }
 
     fn profile_start(&self) -> Option<NetworkPerfStart> {
-        self.inner
-            .runtime_state
-            .profiling_enabled()
-            .then(|| NetworkPerfStart {
-                nanos: self.now_nanos(),
-                counters: self.inner.cpu.hardware_perf_counters(),
-            })
+        self.inner.profiles.enabled().then(|| NetworkPerfStart {
+            nanos: self.now_nanos(),
+            counters: self.inner.cpu.hardware_perf_counters(),
+        })
     }
 
     fn record_network_profile(&self, phase: &'static str, start: Option<NetworkPerfStart>) {
@@ -1341,13 +1345,13 @@ where
         };
         let counters = end.counters.delta_since(start.counters);
         let elapsed_nanos = end.nanos.saturating_sub(start.nanos);
-        self.inner.runtime_state.record_profile_stack_parts_nanos(
+        self.inner.profiles.record_profile_stack_parts_nanos(
             crate::ProfileScope::Kernel,
             "kernel;network;",
             phase,
             elapsed_nanos,
         );
-        self.inner.runtime_state.record_perf_metric_parts(
+        self.inner.profiles.record_perf_metric_parts(
             crate::ProfileScope::Kernel,
             "kernel;network;",
             phase,
@@ -1423,7 +1427,6 @@ pub(crate) mod fixture {
     pub(crate) struct EstablishedTcpFixture {
         service: NetworkService<
             crate::test_support::TestCpu,
-            crate::test_support::TestRuntimeState,
             crate::test_support::RecordingNetworkInterface,
         >,
         stream: TcpStreamId,
@@ -1449,7 +1452,8 @@ pub(crate) mod fixture {
             let cpu = crate::test_support::TestCpu::without_entropy();
             let service = NetworkService::new(
                 cpu,
-                crate::test_support::TestRuntimeState,
+                crate::test_support::test_profile_sink(),
+                crate::test_support::test_uptime_clock(),
                 Timer::new(cpu),
                 crate::test_support::RecordingNetworkInterface::new(1),
             );
@@ -1510,13 +1514,18 @@ pub(crate) mod fixture {
         }
 
         /// The service a component-host owner holds.
-        pub(crate) fn service(&self) -> crate::ComponentHostNetworkService {
-            crate::ComponentHostNetworkService::from_service(self.service.clone())
+        pub(crate) fn service(
+            &self,
+        ) -> NetworkService<
+            crate::test_support::TestCpu,
+            crate::test_support::RecordingNetworkInterface,
+        > {
+            self.service.clone()
         }
 
         /// The stream handle a component-host owner holds.
-        pub(crate) fn stream(&self) -> u64 {
-            u64::from(self.stream)
+        pub(crate) fn stream(&self) -> TcpStreamId {
+            self.stream
         }
 
         /// Hands the peer's segment to the stack.
@@ -1616,9 +1625,7 @@ mod tests {
     use futures_lite::future::{block_on, poll_once};
     use helios_netstack::RxFrame;
 
-    use crate::test_support::{
-        RecordingNetworkInterface, RecordingSmpCpu, TestCpu, TestRuntimeState,
-    };
+    use crate::test_support::{RecordingNetworkInterface, RecordingSmpCpu, TestCpu};
 
     use super::{
         AddressAttemptError, DhcpClientState, HandleSlab, NETWORK_BUSY_POLL_ROUNDS,
@@ -3201,16 +3208,21 @@ mod tests {
 
     /// A service over an interface that reports events and moves no
     /// frames, which is all the wait needs.
-    fn test_network_service()
-    -> super::NetworkService<TestCpu, TestRuntimeState, RecordingNetworkInterface> {
+    fn test_network_service() -> super::NetworkService<TestCpu, RecordingNetworkInterface> {
         test_network_service_on(RecordingNetworkInterface::new(1))
     }
 
     fn test_network_service_on(
         device: RecordingNetworkInterface,
-    ) -> super::NetworkService<TestCpu, TestRuntimeState, RecordingNetworkInterface> {
+    ) -> super::NetworkService<TestCpu, RecordingNetworkInterface> {
         let cpu = TestCpu::without_entropy();
-        super::NetworkService::new(cpu, TestRuntimeState, crate::Timer::new(cpu), device)
+        super::NetworkService::new(
+            cpu,
+            crate::test_support::test_profile_sink(),
+            crate::test_support::test_uptime_clock(),
+            crate::Timer::new(cpu),
+            device,
+        )
     }
 
     /// #131: the interface event a park races has to be marked before

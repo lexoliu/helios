@@ -9,7 +9,7 @@ use crate::{
     DEFAULT_PERF_METRIC_CAPACITY, DEFAULT_PROFILE_STACK_CAPACITY, DEFAULT_TRACE_HISTORY_CAPACITY,
     EmbeddedBootFs, FoldedProfileSample, FutexKey, FutexTable, FutexWaitRegistration,
     HEAP_SIZE_CLASS_COUNT, HeapStats, InstanceRegistry, Notify, PerfMetricFilter,
-    PerfMetricHistory, PerfMetricSample, PerfSample, ProfileFilter, ProfileHistory, ProfileScope,
+    PerfMetricHistory, PerfMetricSample, PerfSample, ProfileFilter, ProfileScope, ProfileSink,
     StatsSample, TraceEvent, TraceFilter, TraceHistory, embedded_init,
 };
 use crate::{RootEntropy, RootEntropyHandle};
@@ -77,9 +77,10 @@ struct RuntimeStateInner<ProgramService, NetworkService, HostFsService> {
     futex_table: Mutex<FutexTable>,
     bootfs: Mutex<Option<EmbeddedBootFs>>,
     tracing: Mutex<TraceHistory>,
-    profiling_enabled: AtomicBool,
-    profiling: Mutex<ProfileHistory>,
-    perf_metrics: Mutex<PerfMetricHistory>,
+    /// The profile and perf histories, held as a handle rather than as
+    /// fields so a subsystem this state owns can record into them
+    /// without naming the state's own type (see [`ProfileSink`]).
+    profiles: ProfileSink,
     heap_perf_snapshot: HeapPerfSnapshot,
 }
 
@@ -295,9 +296,10 @@ where
                 futex_table: Mutex::new(FutexTable::new()),
                 bootfs: Mutex::new(embedded_init().map(|init| init.bootfs())),
                 tracing: Mutex::new(TraceHistory::new(DEFAULT_TRACE_HISTORY_CAPACITY)),
-                profiling_enabled: AtomicBool::new(false),
-                profiling: Mutex::new(ProfileHistory::new(DEFAULT_PROFILE_STACK_CAPACITY)),
-                perf_metrics: Mutex::new(PerfMetricHistory::new(DEFAULT_PERF_METRIC_CAPACITY)),
+                profiles: ProfileSink::new(
+                    DEFAULT_PROFILE_STACK_CAPACITY,
+                    DEFAULT_PERF_METRIC_CAPACITY,
+                ),
                 heap_perf_snapshot: HeapPerfSnapshot::new(),
             }),
         }
@@ -324,21 +326,26 @@ where
         if enabled {
             self.inner.heap_perf_snapshot.reset(crate::heap_stats());
         }
-        self.inner
-            .profiling_enabled
-            .store(enabled, Ordering::Release);
+        self.inner.profiles.set_enabled(enabled);
+    }
+
+    /// The profile and perf histories this state records into.
+    ///
+    /// Handed to the subsystems the state itself owns — the network
+    /// service above all — so they can record without holding the state
+    /// that holds them.
+    pub fn profiles(&self) -> ProfileSink {
+        self.inner.profiles.clone()
     }
 
     pub fn profiling_enabled(&self) -> bool {
-        self.inner.profiling_enabled.load(Ordering::Acquire)
+        self.inner.profiles.enabled()
     }
 
     pub fn clear_profile(&self) {
-        self.inner.profiling.lock().clear();
-        self.inner.perf_metrics.lock().clear();
-        crate::set_kernel_heap_size_class_metrics_enabled(
-            self.inner.profiling_enabled.load(Ordering::Acquire),
-        );
+        self.inner.profiles.profiling().lock().clear();
+        self.inner.profiles.perf_metrics().lock().clear();
+        crate::set_kernel_heap_size_class_metrics_enabled(self.inner.profiles.enabled());
         self.inner.heap_perf_snapshot.reset(crate::heap_stats());
     }
 
@@ -348,19 +355,27 @@ where
         stack: alloc::string::String,
         weight_ticks: u64,
     ) {
-        if !self.inner.profiling_enabled.load(Ordering::Acquire) {
+        if !self.inner.profiles.enabled() {
             return;
         }
         let weight = self.ticks_to_nanos(weight_ticks);
-        self.inner.profiling.lock().record(scope, stack, weight);
+        self.inner
+            .profiles
+            .profiling()
+            .lock()
+            .record(scope, stack, weight);
     }
 
     pub fn record_profile_stack_str(&self, scope: ProfileScope, stack: &str, weight_ticks: u64) {
-        if !self.inner.profiling_enabled.load(Ordering::Acquire) {
+        if !self.inner.profiles.enabled() {
             return;
         }
         let weight = self.ticks_to_nanos(weight_ticks);
-        self.inner.profiling.lock().record_str(scope, stack, weight);
+        self.inner
+            .profiles
+            .profiling()
+            .lock()
+            .record_str(scope, stack, weight);
     }
 
     pub fn record_profile_stack_parts(
@@ -370,12 +385,13 @@ where
         suffix: &str,
         weight_ticks: u64,
     ) {
-        if !self.inner.profiling_enabled.load(Ordering::Acquire) {
+        if !self.inner.profiles.enabled() {
             return;
         }
         let weight = self.ticks_to_nanos(weight_ticks);
         self.inner
-            .profiling
+            .profiles
+            .profiling()
             .lock()
             .record_parts(scope, prefix, suffix, weight);
     }
@@ -386,11 +402,12 @@ where
         stack: alloc::string::String,
         weight_nanos: u64,
     ) {
-        if !self.inner.profiling_enabled.load(Ordering::Acquire) {
+        if !self.inner.profiles.enabled() {
             return;
         }
         self.inner
-            .profiling
+            .profiles
+            .profiling()
             .lock()
             .record(scope, stack, weight_nanos);
     }
@@ -401,11 +418,12 @@ where
         stack: &str,
         weight_nanos: u64,
     ) {
-        if !self.inner.profiling_enabled.load(Ordering::Acquire) {
+        if !self.inner.profiles.enabled() {
             return;
         }
         self.inner
-            .profiling
+            .profiles
+            .profiling()
             .lock()
             .record_str(scope, stack, weight_nanos);
     }
@@ -417,11 +435,12 @@ where
         suffix: &str,
         weight_nanos: u64,
     ) {
-        if !self.inner.profiling_enabled.load(Ordering::Acquire) {
+        if !self.inner.profiles.enabled() {
             return;
         }
         self.inner
-            .profiling
+            .profiles
+            .profiling()
             .lock()
             .record_parts(scope, prefix, suffix, weight_nanos);
     }
@@ -434,7 +453,8 @@ where
     ) -> alloc::vec::Vec<FoldedProfileSample> {
         let _ = current_ticks;
         self.inner
-            .profiling
+            .profiles
+            .profiling()
             .lock()
             .folded(filter, core::iter::empty(), limit)
     }
@@ -446,31 +466,33 @@ where
         suffix: &str,
         sample: PerfSample,
     ) {
-        if !self.inner.profiling_enabled.load(Ordering::Acquire) {
+        if !self.inner.profiles.enabled() {
             return;
         }
         self.inner
-            .perf_metrics
+            .profiles
+            .perf_metrics()
             .lock()
             .record_parts(scope, prefix, suffix, sample);
     }
 
     pub fn record_perf_metric_str(&self, scope: ProfileScope, name: &str, sample: PerfSample) {
-        if !self.inner.profiling_enabled.load(Ordering::Acquire) {
+        if !self.inner.profiles.enabled() {
             return;
         }
         self.inner
-            .perf_metrics
+            .profiles
+            .perf_metrics()
             .lock()
             .record_str(scope, name, sample);
     }
 
     pub fn record_kernel_heap_metrics(&self, stats: HeapStats) {
-        if !self.inner.profiling_enabled.load(Ordering::Acquire) {
+        if !self.inner.profiles.enabled() {
             return;
         }
 
-        let metrics = &self.inner.perf_metrics;
+        let metrics = self.inner.profiles.perf_metrics();
         let snapshot = &self.inner.heap_perf_snapshot;
 
         record_heap_delta_metric(
@@ -542,13 +564,14 @@ where
 
     #[track_caller]
     pub fn record_perf_metric_at_caller(&self, scope: ProfileScope, sample: PerfSample) {
-        if !self.inner.profiling_enabled.load(Ordering::Acquire) {
+        if !self.inner.profiles.enabled() {
             return;
         }
         let caller = Location::caller();
         let name = format!("kernel;callsite;{}:{}", caller.file(), caller.line());
         self.inner
-            .perf_metrics
+            .profiles
+            .perf_metrics()
             .lock()
             .record_str(scope, &name, sample);
     }
@@ -558,7 +581,11 @@ where
         filter: &PerfMetricFilter,
         limit: u32,
     ) -> alloc::vec::Vec<PerfMetricSample> {
-        self.inner.perf_metrics.lock().recent(filter, limit)
+        self.inner
+            .profiles
+            .perf_metrics()
+            .lock()
+            .recent(filter, limit)
     }
 
     pub fn ticks_to_nanos(&self, ticks: u64) -> u64 {
@@ -566,7 +593,18 @@ where
     }
 
     pub fn uptime_nanos(&self, current_ticks: u64) -> u64 {
-        self.ticks_to_nanos(current_ticks.saturating_sub(self.inner.boot_ticks))
+        self.uptime_clock().nanos_at(current_ticks)
+    }
+
+    /// The kernel's uptime clock, for a subsystem that reads uptime
+    /// without holding the runtime state.
+    ///
+    /// The network service is one: it timestamps every protocol
+    /// deadline and every profile sample, and it no longer carries the
+    /// runtime state that used to answer for it. Handing it this keeps
+    /// one origin for both.
+    pub fn uptime_clock(&self) -> crate::UptimeClock {
+        crate::UptimeClock::new(self.inner.boot_ticks, self.inner.timebase_frequency)
     }
 
     /// Places the monotonic clock on the wall, from the platform's
@@ -859,9 +897,19 @@ impl<ProgramService, NetworkService, HostFsService> ComponentRuntimeState
     for RuntimeState<ProgramService, NetworkService, HostFsService>
 where
     ProgramService: Clone + Send + 'static,
-    NetworkService: Clone + Send + Sync + 'static,
+    NetworkService: crate::ComponentNetworkService,
     HostFsService: Clone + Send + 'static,
 {
+    fn retire_network_handles(&self, retired: &crate::SocketRetirementQueue) {
+        if retired.is_empty() {
+            return;
+        }
+        let service = self.network_service().expect(
+            "a socket resource retired a network handle on a machine with no network service",
+        );
+        crate::retire_queued_handles(retired, &service);
+    }
+
     fn uptime_nanos(&self, current_ticks: u64) -> u64 {
         RuntimeState::uptime_nanos(self, current_ticks)
     }

@@ -1,3 +1,4 @@
+use crate::ComponentHostNetwork;
 mod argv;
 pub(crate) use argv::ProgramArgv;
 mod shared_memory;
@@ -134,12 +135,13 @@ fn kernel_processor_profile_stack(processor: u16) -> String {
 }
 
 #[derive(Clone)]
-pub struct UserProgramService<CpuImpl, HostFs>
+pub struct UserProgramService<CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    inner: Arc<UserProgramServiceInner<CpuImpl, HostFs>>,
+    inner: Arc<UserProgramServiceInner<CpuImpl, Net, HostFs>>,
 }
 
 /// The program a launch runs and the credentials it runs under.
@@ -147,18 +149,18 @@ where
 /// Distinct from [`ProgramExecContext`], which is the host the program
 /// runs *in*, and from [`ChildStdio`], which is how the caller talks to
 /// it once it is running.
-pub(super) struct ProgramLaunch {
+pub(super) struct ProgramLaunch<Net: ComponentHostNetwork> {
     argv: ProgramArgv,
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
     filesystem: Option<DebugFileSystemSnapshot>,
     /// Inherited preview1 descriptors. Only core modules have a
     /// descriptor table; a component ignores one.
-    descriptors: Option<Preview1DescriptorTable>,
+    descriptors: Option<Preview1DescriptorTable<Net>>,
     signal_dispositions: Vec<WasixSignalDisposition>,
 }
 
-impl ProgramLaunch {
+impl<Net: ComponentHostNetwork> ProgramLaunch<Net> {
     /// A launch that inherits nothing: no descriptors, no signal
     /// dispositions.
     pub(super) fn new(
@@ -186,24 +188,26 @@ pub(super) struct ChildStdio {
 }
 
 #[derive(Clone)]
-pub(crate) struct ProgramExecContext<CpuImpl, HostFs>
+pub(crate) struct ProgramExecContext<CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     cpu: CpuImpl,
     timer: crate::Timer<CpuImpl>,
     spawner: crate::Spawner<CpuImpl>,
-    runtime_state: HostRuntimeState<CpuImpl, HostFs>,
+    runtime_state: HostRuntimeState<CpuImpl, Net, HostFs>,
     instance_registry: crate::InstanceRegistry,
     parent_instance_id: Option<crate::InstanceId>,
     read_serial: crate::SerialReader,
     write_serial: crate::DebugSerialWriter,
 }
 
-impl<CpuImpl, HostFs> ProgramExecContext<CpuImpl, HostFs>
+impl<CpuImpl, Net, HostFs> ProgramExecContext<CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     pub(crate) fn spawner(&self) -> crate::Spawner<CpuImpl> {
@@ -211,30 +215,31 @@ where
     }
 }
 
-struct UserProgramServiceInner<CpuImpl, HostFs>
+struct UserProgramServiceInner<CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     runtime: crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl>,
     engine: crate::wasmtime_adapter::WasmtimeEngine,
-    preview1_core_linker: CoreLinker<Preview1ProgramStore<CpuImpl, HostFs>>,
+    preview1_core_linker: CoreLinker<Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     shared_memory_pool: Arc<Mutex<SharedMemoryPool>>,
     component_cache: Mutex<ComponentCache<WasmtimeCompiledComponent>>,
     component_instance_pre_cache:
-        Mutex<ComponentCache<ComponentInstancePre<StoreData<CpuImpl, HostFs>>>>,
+        Mutex<ComponentCache<ComponentInstancePre<StoreData<CpuImpl, Net, HostFs>>>>,
     core_module_cache: Mutex<ComponentCache<WasmtimeCompiledCoreModule>>,
     // Release AArch64/HVF quickjs-loop evidence: caching the Preview1 core
     // InstancePre moved the median from 53 ms to 50-51 ms. Cache only modules
     // whose imports are independent of per-process shared-memory binding.
-    core_module_instance_pre_cache: CoreModuleInstancePreCache<CpuImpl, HostFs>,
+    core_module_instance_pre_cache: CoreModuleInstancePreCache<CpuImpl, Net, HostFs>,
     compiler_artifact: Option<Bytes>,
     /// Lazily-built compiler kernel-plugin runtime. The plugin's
     /// `wasmtime::Module`, `InstancePre`, and 512 MiB `SharedMemory` are
     /// allocated on first compile and reused for every subsequent call,
     /// turning the plugin into a long-lived kernel resident — no more
     /// per-call buddy-heap churn that previously OOM'd after one compile.
-    compiler_plugin: Mutex<Option<Arc<CompilerPluginRuntime<CpuImpl, HostFs>>>>,
+    compiler_plugin: Mutex<Option<Arc<CompilerPluginRuntime<CpuImpl, Net, HostFs>>>>,
     /// Serialises compile calls. The cached `SharedMemory` is the
     /// plugin's only scratch surface; concurrent calls would race on
     /// the bump allocator and corrupt each other's request/response
@@ -246,12 +251,12 @@ where
     _marker: core::marker::PhantomData<fn() -> HostFs>,
 }
 
-struct ProgramSpawnRequest {
+struct ProgramSpawnRequest<Net: ComponentHostNetwork> {
     argv: ProgramArgv,
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
     filesystem: Option<DebugFileSystemSnapshot>,
-    descriptors: Option<Preview1DescriptorTable>,
+    descriptors: Option<Preview1DescriptorTable<Net>>,
     signal_state: WasixSignalState,
     signal_dispositions: Vec<WasixSignalDisposition>,
 }
@@ -328,30 +333,32 @@ pub struct ChildExit {
     filesystem: Option<DebugFileSystemSnapshot>,
 }
 
-pub fn install_program_service<CpuImpl, HostFs, WatchdogImpl>(
+pub fn install_program_service<CpuImpl, Net, HostFs, WatchdogImpl>(
     kernel: &crate::Kernel<CpuImpl, WatchdogImpl>,
     cpu: &CpuImpl,
-    debug_state: &HostRuntimeState<CpuImpl, HostFs>,
+    debug_state: &HostRuntimeState<CpuImpl, Net, HostFs>,
     read_serial: crate::SerialReader,
     write_serial: crate::DebugSerialWriter,
-) -> UserProgramService<CpuImpl, HostFs>
+) -> UserProgramService<CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
     WatchdogImpl: Watchdog + Clone,
 {
     install_program_service_inner(kernel, cpu, debug_state, read_serial, write_serial)
 }
 
-pub fn install_component_host_program_service<CpuImpl, HostFs, WatchdogImpl>(
+pub fn install_component_host_program_service<CpuImpl, Net, HostFs, WatchdogImpl>(
     kernel: &crate::Kernel<CpuImpl, WatchdogImpl>,
     cpu: &CpuImpl,
-    debug_state: &HostRuntimeState<CpuImpl, HostFs>,
+    debug_state: &HostRuntimeState<CpuImpl, Net, HostFs>,
     read_serial: crate::SerialReader,
     write_serial: crate::DebugSerialWriter,
-) -> Option<UserProgramService<CpuImpl, HostFs>>
+) -> Option<UserProgramService<CpuImpl, Net, HostFs>>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
     WatchdogImpl: Watchdog + Clone,
 {
@@ -369,15 +376,16 @@ where
     ))
 }
 
-fn install_program_service_inner<CpuImpl, HostFs, WatchdogImpl>(
+fn install_program_service_inner<CpuImpl, Net, HostFs, WatchdogImpl>(
     kernel: &crate::Kernel<CpuImpl, WatchdogImpl>,
     cpu: &CpuImpl,
-    debug_state: &HostRuntimeState<CpuImpl, HostFs>,
+    debug_state: &HostRuntimeState<CpuImpl, Net, HostFs>,
     read_serial: crate::SerialReader,
     write_serial: crate::DebugSerialWriter,
-) -> UserProgramService<CpuImpl, HostFs>
+) -> UserProgramService<CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
     WatchdogImpl: Watchdog + Clone,
 {
@@ -389,7 +397,7 @@ where
     let shared_memory_pool_budget =
         user_heap_stats().available_bytes() / SHARED_MEMORY_POOL_FRACTION;
     let runtime = crate::wasmtime_adapter::WasmtimeComponentRuntime::new(cpu.clone());
-    let engine = <crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl> as crate::ComponentRuntimeFactory<CpuImpl, HostRuntimeState<CpuImpl, HostFs>, HostFs>>::create_engine(&runtime)
+    let engine = <crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl> as crate::ComponentRuntimeFactory<CpuImpl, HostRuntimeState<CpuImpl, Net, HostFs>, HostFs>>::create_engine(&runtime)
         .unwrap_or_else(|error| panic!("failed to create launched-program engine: {error:#}"));
     let preview1_core_linker = preview1_program_linker(engine.raw())
         .unwrap_or_else(|error| panic!("failed to create preview1 program linker: {error:#}"));
@@ -434,17 +442,18 @@ where
     service
 }
 
-pub fn run_embedded_component_forever<CpuImpl, HostFs, WatchdogImpl>(
+pub fn run_embedded_component_forever<CpuImpl, Net, HostFs, WatchdogImpl>(
     component: EmbeddedComponent,
     world: ComponentBindingSet,
     cpu: CpuImpl,
     kernel: &crate::Kernel<CpuImpl, WatchdogImpl>,
-    debug_state: HostRuntimeState<CpuImpl, HostFs>,
+    debug_state: HostRuntimeState<CpuImpl, Net, HostFs>,
     read_serial: crate::SerialReader,
     write_serial: crate::DebugSerialWriter,
 ) -> !
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
     WatchdogImpl: Watchdog + Clone,
 {
@@ -488,26 +497,28 @@ where
     cpu.shutdown()
 }
 
-struct ProfiledSystemComponentFuture<CpuImpl, HostFs, Fut>
+struct ProfiledSystemComponentFuture<CpuImpl, Net, HostFs, Fut>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     inner: Fut,
     cpu: CpuImpl,
-    debug_state: HostRuntimeState<CpuImpl, HostFs>,
+    debug_state: HostRuntimeState<CpuImpl, Net, HostFs>,
     stack: String,
 }
 
-impl<CpuImpl, HostFs, Fut> ProfiledSystemComponentFuture<CpuImpl, HostFs, Fut>
+impl<CpuImpl, Net, HostFs, Fut> ProfiledSystemComponentFuture<CpuImpl, Net, HostFs, Fut>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     fn new(
         inner: Fut,
         cpu: CpuImpl,
-        debug_state: HostRuntimeState<CpuImpl, HostFs>,
+        debug_state: HostRuntimeState<CpuImpl, Net, HostFs>,
         stack: String,
     ) -> Self {
         Self {
@@ -519,9 +530,10 @@ where
     }
 }
 
-impl<CpuImpl, HostFs, Fut> Future for ProfiledSystemComponentFuture<CpuImpl, HostFs, Fut>
+impl<CpuImpl, Net, HostFs, Fut> Future for ProfiledSystemComponentFuture<CpuImpl, Net, HostFs, Fut>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
     Fut: Future,
 {
@@ -544,28 +556,30 @@ where
     }
 }
 
-pub fn run_program_workers_forever<CpuImpl, HostFs, WatchdogImpl>(
+pub fn run_program_workers_forever<CpuImpl, Net, HostFs, WatchdogImpl>(
     _cpu: CpuImpl,
     kernel: crate::Kernel<CpuImpl, WatchdogImpl>,
-    _debug_state: HostRuntimeState<CpuImpl, HostFs>,
+    _debug_state: HostRuntimeState<CpuImpl, Net, HostFs>,
 ) -> !
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
     WatchdogImpl: Watchdog + Clone,
 {
     kernel.run()
 }
 
-pub fn run_component_host_processor_forever<CpuImpl, HostFs, WatchdogImpl>(
+pub fn run_component_host_processor_forever<CpuImpl, Net, HostFs, WatchdogImpl>(
     cpu: CpuImpl,
     kernel: crate::Kernel<CpuImpl, WatchdogImpl>,
-    debug_state: HostRuntimeState<CpuImpl, HostFs>,
+    debug_state: HostRuntimeState<CpuImpl, Net, HostFs>,
     read_serial: crate::SerialReader,
     write_serial: crate::DebugSerialWriter,
 ) -> !
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
     WatchdogImpl: Watchdog + Clone,
 {
@@ -604,13 +618,14 @@ where
     }
 }
 
-fn run_kernel_processor_forever<CpuImpl, HostFs, WatchdogImpl>(
+fn run_kernel_processor_forever<CpuImpl, Net, HostFs, WatchdogImpl>(
     cpu: CpuImpl,
     kernel: crate::Kernel<CpuImpl, WatchdogImpl>,
-    debug_state: HostRuntimeState<CpuImpl, HostFs>,
+    debug_state: HostRuntimeState<CpuImpl, Net, HostFs>,
 ) -> !
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
     WatchdogImpl: Watchdog + Clone,
 {
@@ -638,15 +653,16 @@ where
     }
 }
 
-fn record_executor_metrics<CpuImpl, HostFs>(
+fn record_executor_metrics<CpuImpl, Net, HostFs>(
     cpu: &CpuImpl,
-    debug_state: &HostRuntimeState<CpuImpl, HostFs>,
+    debug_state: &HostRuntimeState<CpuImpl, Net, HostFs>,
     stack: &str,
     started: u64,
     counters: helios_hal::cpu::HardwarePerfCounters,
     stats: crate::KernelRunStats,
 ) where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     let progress = stats.progress_count();
@@ -692,12 +708,13 @@ fn record_executor_metrics<CpuImpl, HostFs>(
     debug_state.record_kernel_heap_metrics(crate::heap_stats());
 }
 
-fn record_executor_event_metric<CpuImpl, HostFs>(
-    runtime_state: &HostRuntimeState<CpuImpl, HostFs>,
+fn record_executor_event_metric<CpuImpl, Net, HostFs>(
+    runtime_state: &HostRuntimeState<CpuImpl, Net, HostFs>,
     name: &'static str,
     events: usize,
 ) where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     if events == 0 {
@@ -720,13 +737,14 @@ fn usize_to_u64(value: usize, label: &'static str) -> u64 {
     u64::try_from(value).unwrap_or_else(|_| panic!("{label} does not fit into u64"))
 }
 
-fn record_program_kernel_profile<CpuImpl, HostFs>(
-    runtime_state: &HostRuntimeState<CpuImpl, HostFs>,
+fn record_program_kernel_profile<CpuImpl, Net, HostFs>(
+    runtime_state: &HostRuntimeState<CpuImpl, Net, HostFs>,
     cpu: &CpuImpl,
     phase: &'static str,
     started_ticks: u64,
 ) where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     if runtime_state.profiling_enabled() {
@@ -739,14 +757,15 @@ fn record_program_kernel_profile<CpuImpl, HostFs>(
     }
 }
 
-fn record_named_program_kernel_profile<CpuImpl, HostFs>(
-    runtime_state: &HostRuntimeState<CpuImpl, HostFs>,
+fn record_named_program_kernel_profile<CpuImpl, Net, HostFs>(
+    runtime_state: &HostRuntimeState<CpuImpl, Net, HostFs>,
     cpu: &CpuImpl,
     phase: &'static str,
     name: &str,
     started_ticks: u64,
 ) where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     if runtime_state.profiling_enabled() {
@@ -763,24 +782,26 @@ fn record_named_program_kernel_profile<CpuImpl, HostFs>(
     }
 }
 
-struct ProgramKernelProfile<CpuImpl, HostFs>
+struct ProgramKernelProfile<CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    runtime_state: HostRuntimeState<CpuImpl, HostFs>,
+    runtime_state: HostRuntimeState<CpuImpl, Net, HostFs>,
     cpu: CpuImpl,
     started_ticks: u64,
     counters: helios_hal::cpu::HardwarePerfCounters,
     started_heap: crate::HeapStats,
 }
 
-fn start_program_kernel_profile<CpuImpl, HostFs>(
-    runtime_state: &HostRuntimeState<CpuImpl, HostFs>,
+fn start_program_kernel_profile<CpuImpl, Net, HostFs>(
+    runtime_state: &HostRuntimeState<CpuImpl, Net, HostFs>,
     cpu: &CpuImpl,
-) -> Option<ProgramKernelProfile<CpuImpl, HostFs>>
+) -> Option<ProgramKernelProfile<CpuImpl, Net, HostFs>>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     runtime_state
@@ -794,11 +815,12 @@ where
         })
 }
 
-fn record_program_kernel_profile_sample<CpuImpl, HostFs>(
-    profile: Option<ProgramKernelProfile<CpuImpl, HostFs>>,
+fn record_program_kernel_profile_sample<CpuImpl, Net, HostFs>(
+    profile: Option<ProgramKernelProfile<CpuImpl, Net, HostFs>>,
     phase: &'static str,
 ) where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     if let Some(profile) = profile {
@@ -861,14 +883,15 @@ fn record_program_kernel_profile_sample<CpuImpl, HostFs>(
     }
 }
 
-fn record_program_heap_delta<CpuImpl, HostFs>(
-    runtime_state: &HostRuntimeState<CpuImpl, HostFs>,
+fn record_program_heap_delta<CpuImpl, Net, HostFs>(
+    runtime_state: &HostRuntimeState<CpuImpl, Net, HostFs>,
     phase: &'static str,
     kind: &'static str,
     events: u64,
     bytes: u64,
 ) where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     if events == 0 && bytes == 0 {
@@ -893,9 +916,10 @@ fn record_program_heap_delta<CpuImpl, HostFs>(
     );
 }
 
-impl<CpuImpl, HostFs> UserProgramService<CpuImpl, HostFs>
+impl<CpuImpl, Net, HostFs> UserProgramService<CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     pub fn increment_epoch(&self) {
@@ -907,10 +931,10 @@ where
     /// future resolving with its exit status.
     pub(super) async fn spawn(
         &self,
-        exec_context: ProgramExecContext<CpuImpl, HostFs>,
+        exec_context: ProgramExecContext<CpuImpl, Net, HostFs>,
         source: ProgramSource,
         hint: Option<AotCompileHint>,
-        launch: ProgramLaunch,
+        launch: ProgramLaunch<Net>,
     ) -> Result<ChildHandle, ProgramExecError> {
         super::emit_program_stage_marker(exec_context.write_serial, "program:spawn-begin");
         let executable = self
@@ -926,10 +950,10 @@ where
     /// rather than at every call site.
     async fn spawn_with_output_mode(
         &self,
-        exec_context: ProgramExecContext<CpuImpl, HostFs>,
+        exec_context: ProgramExecContext<CpuImpl, Net, HostFs>,
         source: ProgramSource,
         hint: Option<AotCompileHint>,
-        mut launch: ProgramLaunch,
+        mut launch: ProgramLaunch<Net>,
         output_mode: OutputMode,
         stdio: ChildStdio,
     ) -> Result<ChildHandle, ProgramExecError> {
@@ -945,9 +969,9 @@ where
 
     fn spawn_loaded(
         &self,
-        exec_context: ProgramExecContext<CpuImpl, HostFs>,
-        executable: ProgramExecutable<CpuImpl, HostFs>,
-        launch: ProgramLaunch,
+        exec_context: ProgramExecContext<CpuImpl, Net, HostFs>,
+        executable: ProgramExecutable<CpuImpl, Net, HostFs>,
+        launch: ProgramLaunch<Net>,
     ) -> Result<ChildHandle, ProgramExecError> {
         let (stdin_writer, stdin_reader) = crate::byte_channel();
         let (stdout_writer, stdout_reader) = crate::byte_channel();
@@ -971,9 +995,9 @@ where
 
     fn spawn_loaded_with_output_mode(
         &self,
-        exec_context: ProgramExecContext<CpuImpl, HostFs>,
-        executable: ProgramExecutable<CpuImpl, HostFs>,
-        launch: ProgramLaunch,
+        exec_context: ProgramExecContext<CpuImpl, Net, HostFs>,
+        executable: ProgramExecutable<CpuImpl, Net, HostFs>,
+        launch: ProgramLaunch<Net>,
         output_mode: OutputMode,
         stdio: ChildStdio,
     ) -> Result<ChildHandle, ProgramExecError> {
@@ -1084,11 +1108,11 @@ where
     /// along with the exit code.
     pub(super) async fn exec_buffered(
         &self,
-        exec_context: ProgramExecContext<CpuImpl, HostFs>,
+        exec_context: ProgramExecContext<CpuImpl, Net, HostFs>,
         source: ProgramSource,
         hint: Option<AotCompileHint>,
         stdin: Vec<u8>,
-        launch: ProgramLaunch,
+        launch: ProgramLaunch<Net>,
     ) -> Result<ExecResult, ProgramExecError> {
         self.exec_buffered_with_snapshot(exec_context, source, hint, stdin, launch)
             .await
@@ -1097,11 +1121,11 @@ where
 
     async fn exec_buffered_with_snapshot(
         &self,
-        exec_context: ProgramExecContext<CpuImpl, HostFs>,
+        exec_context: ProgramExecContext<CpuImpl, Net, HostFs>,
         source: ProgramSource,
         hint: Option<AotCompileHint>,
         stdin: Vec<u8>,
-        launch: ProgramLaunch,
+        launch: ProgramLaunch<Net>,
     ) -> Result<(ExecResult, Option<DebugFileSystemSnapshot>), ProgramExecError> {
         let executable = self
             .load_executable(&exec_context, &source, hint, exec_context.write_serial)
@@ -1112,10 +1136,10 @@ where
 
     async fn exec_loaded_buffered(
         &self,
-        exec_context: ProgramExecContext<CpuImpl, HostFs>,
-        executable: ProgramExecutable<CpuImpl, HostFs>,
+        exec_context: ProgramExecContext<CpuImpl, Net, HostFs>,
+        executable: ProgramExecutable<CpuImpl, Net, HostFs>,
         stdin: Vec<u8>,
-        launch: ProgramLaunch,
+        launch: ProgramLaunch<Net>,
     ) -> Result<(ExecResult, Option<DebugFileSystemSnapshot>), ProgramExecError> {
         let mut child = self.spawn_loaded(exec_context, executable, launch)?;
 
@@ -1166,7 +1190,7 @@ where
 
     pub(crate) async fn aot(
         &self,
-        exec_context: &ProgramExecContext<CpuImpl, HostFs>,
+        exec_context: &ProgramExecContext<CpuImpl, Net, HostFs>,
         wasm: &Bytes,
         hint: AotCompileHint,
         profile: bool,
@@ -1177,11 +1201,11 @@ where
 
     async fn load_executable(
         &self,
-        exec_context: &ProgramExecContext<CpuImpl, HostFs>,
+        exec_context: &ProgramExecContext<CpuImpl, Net, HostFs>,
         source: &ProgramSource,
         hint: Option<AotCompileHint>,
         write_serial: crate::DebugSerialWriter,
-    ) -> Result<ProgramExecutable<CpuImpl, HostFs>, ProgramExecError> {
+    ) -> Result<ProgramExecutable<CpuImpl, Net, HostFs>, ProgramExecError> {
         let started_at = monotonic_nanos(&self.inner.clock_cpu);
         let payload = match source {
             ProgramSource::SignedArtifact(bytes) => {
@@ -1221,7 +1245,7 @@ where
         payload: Bytes,
         write_serial: crate::DebugSerialWriter,
         started_at: u64,
-    ) -> Result<ProgramExecutable<CpuImpl, HostFs>, ProgramExecError> {
+    ) -> Result<ProgramExecutable<CpuImpl, Net, HostFs>, ProgramExecError> {
         match WasmtimePrecompiledKind::detect(&payload) {
             Some(WasmtimePrecompiledKind::Component) => self
                 .load_precompiled_component(payload, write_serial, started_at)
@@ -1241,7 +1265,7 @@ where
         payload: Bytes,
         write_serial: crate::DebugSerialWriter,
         started_at: u64,
-    ) -> Result<Arc<ComponentInstancePre<StoreData<CpuImpl, HostFs>>>, ProgramExecError> {
+    ) -> Result<PreparedComponent<CpuImpl, Net, HostFs>, ProgramExecError> {
         let component = if let Some(component) = self.inner.component_cache.lock().get(&payload) {
             super::emit_program_stage_marker(write_serial, "program:deserialize-cache-hit");
             let now = monotonic_nanos(&self.inner.clock_cpu);
@@ -1388,7 +1412,7 @@ where
 
     async fn compile_raw_component_to_signed_artifact(
         &self,
-        exec_context: &ProgramExecContext<CpuImpl, HostFs>,
+        exec_context: &ProgramExecContext<CpuImpl, Net, HostFs>,
         wasm: &Bytes,
         hint: AotCompileHint,
         profile: bool,
@@ -1407,7 +1431,7 @@ where
 
     async fn invoke_compiler_core_module(
         &self,
-        exec_context: &ProgramExecContext<CpuImpl, HostFs>,
+        exec_context: &ProgramExecContext<CpuImpl, Net, HostFs>,
         compiler_payload: Bytes,
         wasm: &Bytes,
         hint: AotCompileHint,
@@ -1483,7 +1507,7 @@ where
 
     fn invoke_compiler_inner(
         &self,
-        exec_context: &ProgramExecContext<CpuImpl, HostFs>,
+        exec_context: &ProgramExecContext<CpuImpl, Net, HostFs>,
         compiler_payload: &Bytes,
         wasm: &Bytes,
         hint: AotCompileHint,
@@ -1625,7 +1649,7 @@ where
 
     fn read_compiler_plugin_artifact(
         &self,
-        exec_context: &ProgramExecContext<CpuImpl, HostFs>,
+        exec_context: &ProgramExecContext<CpuImpl, Net, HostFs>,
     ) -> Result<Bytes, ProgramExecError> {
         self.inner
             .compiler_artifact
@@ -1643,9 +1667,9 @@ where
     /// drops to a fresh `wasmtime::Store` and `instance_pre.instantiate`.
     fn ensure_compiler_plugin(
         &self,
-        exec_context: &ProgramExecContext<CpuImpl, HostFs>,
+        exec_context: &ProgramExecContext<CpuImpl, Net, HostFs>,
         compiler_payload: &Bytes,
-    ) -> Result<Arc<CompilerPluginRuntime<CpuImpl, HostFs>>, ProgramExecError> {
+    ) -> Result<Arc<CompilerPluginRuntime<CpuImpl, Net, HostFs>>, ProgramExecError> {
         let mut slot = self.inner.compiler_plugin.lock();
         if let Some(plugin) = slot.as_ref() {
             return Ok(plugin.clone());
@@ -1683,7 +1707,8 @@ where
             next_thread_id: AtomicI32::new(0),
             thread_tasks: Mutex::new(Vec::new()),
         });
-        let mut linker: CoreLinker<CompilerCoreStore<CpuImpl, HostFs>> = CoreLinker::new(engine);
+        let mut linker: CoreLinker<CompilerCoreStore<CpuImpl, Net, HostFs>> =
+            CoreLinker::new(engine);
         add_compiler_core_imports(&mut linker, shared_memory.clone())?;
 
         // `linker.define` requires an `AsContext<Data = T>`; build a
@@ -1730,12 +1755,13 @@ where
     }
 }
 
-impl<CpuImpl, HostFs> ProgramExecContext<CpuImpl, HostFs>
+impl<CpuImpl, Net, HostFs> ProgramExecContext<CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    pub(crate) fn from_store(store: &StoreData<CpuImpl, HostFs>) -> Self {
+    pub(crate) fn from_store(store: &StoreData<CpuImpl, Net, HostFs>) -> Self {
         Self {
             cpu: store.cpu.clone(),
             timer: store.timer(),
@@ -1954,6 +1980,15 @@ const P1_RIGHT_PATH_MUTATE_MASK: u64 = P1_RIGHT_PATH_CREATE_DIRECTORY
 mod tests {
     use super::*;
 
+    /// The descriptor flavour the table tests use. None of them opens a
+    /// socket, so the service type only has to exist; the recording one
+    /// is what the rest of the kernel's tests already carry.
+    type TestNet = crate::test_support::TestNetworkService;
+    type TestDescriptor = Preview1Descriptor<TestNet>;
+    type TestDescriptorTable = Preview1DescriptorTable<TestNet>;
+    type TestSpawnFdSnapshot = WasixSpawnFdSnapshot<TestNet>;
+    type TestSocketDescriptor = WasixSocketDescriptor<TestNet>;
+
     #[test]
     fn preview1_program_linked_imports_match_manifest() {
         assert_eq!(PREVIEW1_PROGRAM_LINKED_IMPORTS, p1::PREVIEW1_FUNCTIONS);
@@ -2074,7 +2109,7 @@ mod tests {
 
     #[test]
     fn null_device_rights_and_stat_match_character_device_semantics() {
-        let rights = p1_descriptor_rights(&Preview1Descriptor::NullDevice);
+        let rights = p1_descriptor_rights(&TestDescriptor::NullDevice);
         assert_ne!(rights & P1_RIGHT_FD_READ, 0);
         assert_ne!(rights & P1_RIGHT_FD_WRITE, 0);
         assert_ne!(rights & P1_RIGHT_POLL_FD_READWRITE, 0);
@@ -2083,14 +2118,14 @@ mod tests {
             fs_types::DescriptorType::CharacterDevice
         ));
         assert!(matches!(
-            p1_probe_descriptor(Some(&Preview1Descriptor::NullDevice), P1_EVENTTYPE_FD_WRITE),
+            p1_probe_descriptor(Some(&TestDescriptor::NullDevice), P1_EVENTTYPE_FD_WRITE),
             Ok(P1Probe::Local(P1Readiness::Ready { bytes })) if bytes == usize::MAX as u64
         ));
     }
 
     #[test]
     fn fd_renumber_replaces_stdio_descriptor() {
-        let file = Preview1Descriptor::File {
+        let file: TestDescriptor = Preview1Descriptor::File {
             descriptor: FsDescriptor {
                 path: "/redirected".into(),
                 kind: FsNodeKind::File,
@@ -2100,7 +2135,7 @@ mod tests {
             offset: 0,
             fdflags: 0,
         };
-        let mut table = Preview1DescriptorTable::from_entries(vec![
+        let mut table: TestDescriptorTable = Preview1DescriptorTable::from_entries(vec![
             Some(Preview1DescriptorEntry::new(
                 Preview1Descriptor::Stdin {
                     carry: Bytes::new(),
@@ -2131,7 +2166,7 @@ mod tests {
 
     #[test]
     fn fd_close_can_close_stdio_slots() {
-        let mut table = Preview1DescriptorTable::from_entries(vec![
+        let mut table: TestDescriptorTable = Preview1DescriptorTable::from_entries(vec![
             Some(Preview1DescriptorEntry::new(
                 Preview1Descriptor::Stdin {
                     carry: Bytes::new(),
@@ -2155,7 +2190,7 @@ mod tests {
 
     #[test]
     fn descriptor_insert_reuses_lowest_closed_slot() {
-        let mut table = Preview1DescriptorTable::from_entries(vec![
+        let mut table: TestDescriptorTable = Preview1DescriptorTable::from_entries(vec![
             Some(Preview1DescriptorEntry::new(
                 Preview1Descriptor::Stdin {
                     carry: Bytes::new(),
@@ -2179,7 +2214,7 @@ mod tests {
 
     #[test]
     fn fd_dup2_replaces_exact_target_descriptor() {
-        let file = Preview1Descriptor::File {
+        let file: TestDescriptor = Preview1Descriptor::File {
             descriptor: FsDescriptor {
                 path: "/redirected".into(),
                 kind: FsNodeKind::File,
@@ -2189,7 +2224,7 @@ mod tests {
             offset: 0,
             fdflags: 0,
         };
-        let mut table = Preview1DescriptorTable::from_entries(vec![
+        let mut table: TestDescriptorTable = Preview1DescriptorTable::from_entries(vec![
             Some(Preview1DescriptorEntry::new(
                 Preview1Descriptor::Stdin {
                     carry: Bytes::new(),
@@ -2219,7 +2254,7 @@ mod tests {
 
     #[test]
     fn descriptor_table_preserves_fdflags_across_dup_and_exec_snapshot() {
-        let file = Preview1Descriptor::File {
+        let file: TestDescriptor = Preview1Descriptor::File {
             descriptor: FsDescriptor {
                 path: "/nonblock".into(),
                 kind: FsNodeKind::File,
@@ -2229,7 +2264,7 @@ mod tests {
             offset: 0,
             fdflags: P1_FDFLAG_NONBLOCK,
         };
-        let mut table = Preview1DescriptorTable::from_entries(vec![Some(
+        let mut table: TestDescriptorTable = Preview1DescriptorTable::from_entries(vec![Some(
             Preview1DescriptorEntry::new(file, false),
         )]);
 
@@ -2260,7 +2295,7 @@ mod tests {
             options: WasixSocketOptions::default(),
             socket_type: WASIX_SOCK_TYPE_STREAM,
         });
-        let mut table = Preview1DescriptorTable::from_entries(vec![Some(
+        let mut table: TestDescriptorTable = Preview1DescriptorTable::from_entries(vec![Some(
             Preview1DescriptorEntry::new(socket, false),
         )]);
 
@@ -2435,7 +2470,7 @@ mod tests {
             offset: 0,
             fdflags: 0,
         };
-        let table = Preview1DescriptorTable::from_entries(vec![
+        let table: TestDescriptorTable = Preview1DescriptorTable::from_entries(vec![
             Some(Preview1DescriptorEntry::new(
                 Preview1Descriptor::Stdin {
                     carry: Bytes::new(),
@@ -2459,7 +2494,7 @@ mod tests {
 
     #[test]
     fn spawn_fd_snapshot_maps_directory_source_to_guest_path() {
-        let snapshot = WasixSpawnFdSnapshot {
+        let snapshot: TestSpawnFdSnapshot = WasixSpawnFdSnapshot {
             descriptors: Preview1DescriptorTable::from_entries(vec![Some(
                 Preview1DescriptorEntry::new(
                     Preview1Descriptor::Preopen {
@@ -2490,7 +2525,7 @@ mod tests {
 
     #[test]
     fn spawn_fd_fchdir_updates_child_authority_cwd() {
-        let preopen = Preview1Descriptor::Preopen {
+        let preopen: TestDescriptor = Preview1Descriptor::Preopen {
             guest_name: "/workspace".into(),
             descriptor: FsDescriptor {
                 path: "/mnt/workspace".into(),
@@ -2508,7 +2543,7 @@ mod tests {
             )
             .expect("test preopen must be valid"),
         );
-        let mut snapshot = WasixSpawnFdSnapshot {
+        let mut snapshot: TestSpawnFdSnapshot = WasixSpawnFdSnapshot {
             descriptors: Preview1DescriptorTable::from_entries(vec![Some(
                 Preview1DescriptorEntry::new(preopen, false),
             )]),
@@ -2529,7 +2564,7 @@ mod tests {
 
     #[test]
     fn spawn_fd_open_base_uses_child_cwd_for_relative_paths() {
-        let snapshot = WasixSpawnFdSnapshot {
+        let snapshot: TestSpawnFdSnapshot = WasixSpawnFdSnapshot {
             descriptors: Preview1DescriptorTable::from_entries(vec![Some(
                 Preview1DescriptorEntry::new(
                     Preview1Descriptor::Preopen {
@@ -2565,7 +2600,7 @@ mod tests {
 
     #[test]
     fn spawn_fd_open_base_resolves_absolute_guest_path_through_preopen() {
-        let snapshot = WasixSpawnFdSnapshot {
+        let snapshot: TestSpawnFdSnapshot = WasixSpawnFdSnapshot {
             descriptors: Preview1DescriptorTable::from_entries(vec![Some(
                 Preview1DescriptorEntry::new(
                     Preview1Descriptor::Preopen {
@@ -2658,20 +2693,20 @@ mod tests {
                 local_port: 5353,
                 options: WasixSocketOptions::default(),
             }));
-        let udp_unbound =
+        let udp_unbound: TestDescriptor =
             Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Unbound {
                 family: WasixSocketFamily::Ipv4,
                 options: WasixSocketOptions::default(),
             }));
         let (left_writer, right_reader) = crate::byte_channel();
-        let pair = Preview1Descriptor::Socket(WasixSocketDescriptor::Pair {
+        let pair: TestDescriptor = Preview1Descriptor::Socket(WasixSocketDescriptor::Pair {
             reader: right_reader,
             writer: left_writer,
             carry: Bytes::new(),
             options: WasixSocketOptions::default(),
             socket_type: WASIX_SOCK_TYPE_STREAM,
         });
-        let nonsocket = Preview1Descriptor::Stdout;
+        let nonsocket: TestDescriptor = Preview1Descriptor::Stdout;
 
         assert_eq!(
             wasix_sock_recv_authority(Some(&tcp)),
@@ -2733,23 +2768,33 @@ mod tests {
             wasix_sock_listen_authority(Some(&nonsocket)),
             Err(p1::errno::NOTSOCK)
         );
-        assert_eq!(wasix_sock_recv_authority(None), Err(p1::errno::BADF));
-        assert_eq!(wasix_sock_send_authority(None), Err(p1::errno::BADF));
-        assert_eq!(wasix_sock_listen_authority(None), Err(p1::errno::BADF));
+        assert_eq!(
+            wasix_sock_recv_authority::<TestNet>(None),
+            Err(p1::errno::BADF)
+        );
+        assert_eq!(
+            wasix_sock_send_authority::<TestNet>(None),
+            Err(p1::errno::BADF)
+        );
+        assert_eq!(
+            wasix_sock_listen_authority::<TestNet>(None),
+            Err(p1::errno::BADF)
+        );
     }
 
     #[test]
     fn wasix_multicast_preflight_accepts_udp_sockets_only() {
-        let udp = Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Unbound {
-            family: WasixSocketFamily::Ipv4,
-            options: WasixSocketOptions::default(),
-        }));
-        let tcp =
+        let udp: TestDescriptor =
+            Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Unbound {
+                family: WasixSocketFamily::Ipv4,
+                options: WasixSocketOptions::default(),
+            }));
+        let tcp: TestDescriptor =
             Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(WasixTcpSocket::Unconnected {
                 family: WasixSocketFamily::Ipv4,
                 options: WasixSocketOptions::default(),
             }));
-        let file = Preview1Descriptor::Stdout;
+        let file: TestDescriptor = Preview1Descriptor::Stdout;
 
         assert_eq!(
             wasix_udp_socket_descriptor_status(Some(&udp)),
@@ -2763,7 +2808,10 @@ mod tests {
             wasix_udp_socket_descriptor_status(Some(&file)),
             p1::errno::NOTSOCK
         );
-        assert_eq!(wasix_udp_socket_descriptor_status(None), p1::errno::BADF);
+        assert_eq!(
+            wasix_udp_socket_descriptor_status::<TestNet>(None),
+            p1::errno::BADF
+        );
     }
 
     #[test]
@@ -2937,7 +2985,7 @@ mod tests {
     }
 
     /// Ready mask for a descriptor whose readiness needs no network service.
-    fn local_epoll_mask(descriptor: Option<&Preview1Descriptor>, interest: u32) -> u32 {
+    fn local_epoll_mask(descriptor: Option<&TestDescriptor>, interest: u32) -> u32 {
         if descriptor.is_none() {
             return WASIX_EPOLL_TYPE_EPOLLERR | WASIX_EPOLL_TYPE_EPOLLHUP;
         }
@@ -2991,7 +3039,7 @@ mod tests {
         );
 
         let (pair_writer, pair_reader) = crate::byte_channel();
-        let pair = Preview1Descriptor::Socket(WasixSocketDescriptor::Pair {
+        let pair: TestDescriptor = Preview1Descriptor::Socket(WasixSocketDescriptor::Pair {
             reader: pair_reader,
             writer: pair_writer.clone(),
             carry: Bytes::new(),
@@ -3071,10 +3119,11 @@ mod tests {
 
     #[test]
     fn wasix_socket_size_options_are_descriptor_local_state() {
-        let mut descriptor = WasixSocketDescriptor::Tcp(WasixTcpSocket::Unconnected {
-            family: WasixSocketFamily::Ipv4,
-            options: WasixSocketOptions::default(),
-        });
+        let mut descriptor: TestSocketDescriptor =
+            WasixSocketDescriptor::Tcp(WasixTcpSocket::Unconnected {
+                family: WasixSocketFamily::Ipv4,
+                options: WasixSocketOptions::default(),
+            });
 
         assert_eq!(
             descriptor.options().receive_buffer_size,
@@ -3139,10 +3188,11 @@ mod tests {
 
     #[test]
     fn wasix_socket_flag_options_are_descriptor_local_state() {
-        let mut descriptor = WasixSocketDescriptor::Udp(WasixUdpSocket::Unbound {
-            family: WasixSocketFamily::Ipv4,
-            options: WasixSocketOptions::default(),
-        });
+        let mut descriptor: TestSocketDescriptor =
+            WasixSocketDescriptor::Udp(WasixUdpSocket::Unbound {
+                family: WasixSocketFamily::Ipv4,
+                options: WasixSocketOptions::default(),
+            });
 
         assert_eq!(
             descriptor
@@ -3193,10 +3243,11 @@ mod tests {
     /// connections are being probed or coalesced when they are not.
     #[test]
     fn wasix_socket_rejects_flags_the_netstack_cannot_honour() {
-        let mut descriptor = WasixSocketDescriptor::Tcp(WasixTcpSocket::Unconnected {
-            family: WasixSocketFamily::Ipv4,
-            options: WasixSocketOptions::default(),
-        });
+        let mut descriptor: TestSocketDescriptor =
+            WasixSocketDescriptor::Tcp(WasixTcpSocket::Unconnected {
+                family: WasixSocketFamily::Ipv4,
+                options: WasixSocketOptions::default(),
+            });
 
         assert_eq!(
             descriptor
@@ -3241,10 +3292,11 @@ mod tests {
     /// a TTL outside the IP header's range is rejected instead of truncated.
     #[test]
     fn wasix_socket_size_options_clamp_to_netstack_capacity() {
-        let mut descriptor = WasixSocketDescriptor::Tcp(WasixTcpSocket::Unconnected {
-            family: WasixSocketFamily::Ipv4,
-            options: WasixSocketOptions::default(),
-        });
+        let mut descriptor: TestSocketDescriptor =
+            WasixSocketDescriptor::Tcp(WasixTcpSocket::Unconnected {
+                family: WasixSocketFamily::Ipv4,
+                options: WasixSocketOptions::default(),
+            });
 
         assert_eq!(
             descriptor
@@ -3304,10 +3356,11 @@ mod tests {
 
     #[test]
     fn wasix_socket_time_options_are_descriptor_local_state() {
-        let mut descriptor = WasixSocketDescriptor::Tcp(WasixTcpSocket::Unconnected {
-            family: WasixSocketFamily::Ipv4,
-            options: WasixSocketOptions::default(),
-        });
+        let mut descriptor: TestSocketDescriptor =
+            WasixSocketDescriptor::Tcp(WasixTcpSocket::Unconnected {
+                family: WasixSocketFamily::Ipv4,
+                options: WasixSocketOptions::default(),
+            });
 
         assert_eq!(
             descriptor.options().time(WASIX_SOCK_OPTION_RECV_TIMEOUT),

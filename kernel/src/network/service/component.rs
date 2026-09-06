@@ -18,10 +18,9 @@ pub(super) enum DhcpClientState {
     Bound,
 }
 
-impl<CpuImpl, Runtime, DeviceImpl> NetworkService<CpuImpl, Runtime, DeviceImpl>
+impl<CpuImpl, DeviceImpl> NetworkService<CpuImpl, DeviceImpl>
 where
     CpuImpl: Cpu + Clone,
-    Runtime: ComponentRuntimeState + Sync,
     DeviceImpl: NetworkDevice,
 {
     pub async fn dns_resolve(
@@ -295,11 +294,9 @@ where
     }
 }
 
-impl<CpuImpl, Runtime, DeviceImpl> ComponentNetworkService
-    for NetworkService<CpuImpl, Runtime, DeviceImpl>
+impl<CpuImpl, DeviceImpl> ComponentNetworkService for NetworkService<CpuImpl, DeviceImpl>
 where
     CpuImpl: Cpu + Clone,
-    Runtime: ComponentRuntimeState + Sync,
     DeviceImpl: NetworkDevice,
 {
     type TcpStream = TcpStreamId;
@@ -531,13 +528,15 @@ where
     fn udp_close(&self, socket: Self::UdpSocket) {
         NetworkService::udp_close(self, socket);
     }
+
+    fn wake_packet_pump(&self) {
+        NetworkService::wake_packet_pump(self);
+    }
 }
 
-impl<CpuImpl, Runtime, DeviceImpl> NetworkAdminBackend
-    for NetworkService<CpuImpl, Runtime, DeviceImpl>
+impl<CpuImpl, DeviceImpl> NetworkAdminBackend for NetworkService<CpuImpl, DeviceImpl>
 where
     CpuImpl: Cpu + Clone,
-    Runtime: ComponentRuntimeState + Sync,
     DeviceImpl: NetworkDevice,
 {
     fn network_stats(&self) -> crate::NetworkStats {

@@ -573,10 +573,56 @@ pub struct SocketReadiness {
     pub hangup: bool,
 }
 
+/// What the component host needs of the machine's network service.
+///
+/// The host is generic over this the way it is generic over
+/// [`helios_hal::cpu::Cpu`]: the backend names the one service its
+/// machine has, and every socket call from a component compiles to a
+/// direct call on it. The trait carries nothing of its own — it names
+/// the pair of contracts together so a generic item that only passes
+/// the service along spells one bound instead of two.
+pub trait ComponentHostNetwork: ComponentNetworkService + crate::NetworkAdminBackend {}
+
+impl<Service> ComponentHostNetwork for Service where
+    Service: ComponentNetworkService + crate::NetworkAdminBackend
+{
+}
+
+/// A network handle's stable numeric name.
+///
+/// A handle is normally carried as the service's own type, which keeps
+/// a stream, a listener and a datagram socket from being confused for
+/// one another. One owner cannot: a component's socket resource types
+/// are handed to the bindings generator by path, and a path carries no
+/// type parameter, so those types stay concrete however generic the
+/// host around them is. They name what they own by id, and the generic
+/// store turns the id back into a handle at every call and at every
+/// retirement.
+///
+/// `from_raw` is the exact inverse of `into_raw` for every id the
+/// service minted. An id from anywhere else is a kernel bug, not a
+/// guest input — the numbers never leave the kernel — so an
+/// implementation panics rather than inventing a handle.
+pub trait NetworkHandle: Copy + Send + Sync + 'static {
+    fn into_raw(self) -> u64;
+
+    fn from_raw(raw: u64) -> Self;
+}
+
+impl NetworkHandle for u64 {
+    fn into_raw(self) -> u64 {
+        self
+    }
+
+    fn from_raw(raw: u64) -> Self {
+        raw
+    }
+}
+
 pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
-    type TcpStream: Copy + Send + 'static;
-    type TcpListener: Copy + Send + 'static;
-    type UdpSocket: Copy + Send + 'static;
+    type TcpStream: NetworkHandle;
+    type TcpListener: NetworkHandle;
+    type UdpSocket: NetworkHandle;
 
     /// Probe a connected stream without consuming buffered bytes.
     fn tcp_readiness(
@@ -788,6 +834,21 @@ pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
     /// Retires a datagram socket. Synchronous because the owner that
     /// ends a socket's life is a `Drop`, which cannot await.
     fn udp_close(&self, socket: Self::UdpSocket);
+
+    /// Wakes the packet pump so a segment a synchronous retirement
+    /// queued leaves on the next executor turn.
+    ///
+    /// Retiring a connection queues its FIN or RST on the stack's
+    /// outbound queue and puts nothing on the wire: the pump is what
+    /// publishes it, and an idle pump parks until the next protocol
+    /// deadline, a second away on a quiet guest (#232). A write already
+    /// publishes what it queued before it returns; a retirement cannot,
+    /// because it happens in a `Drop` with nothing to await, so the
+    /// owner that drains the retirements calls this once afterwards.
+    ///
+    /// Callable from any processor: the wake is a signal raise, never a
+    /// poll.
+    fn wake_packet_pump(&self);
 }
 
 pub trait ComponentNetworkState<Service>: Clone + Send + 'static

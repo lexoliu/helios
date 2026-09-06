@@ -1,26 +1,27 @@
 use super::*;
 
-pub(super) fn add_wasix_epoll_imports<CpuImpl, HostFs>(
-    linker: &mut CoreLinker<Preview1ProgramStore<CpuImpl, HostFs>>,
+pub(super) fn add_wasix_epoll_imports<CpuImpl, Net, HostFs>(
+    linker: &mut CoreLinker<Preview1ProgramStore<CpuImpl, Net, HostFs>>,
 ) -> Result<(), ProgramExecError>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     linker
         .func_wrap(
             WASIX_MODULE,
             "epoll_create",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>, ret_fd: i32| -> i32 {
-                wasix_epoll_create(&mut caller, ret_fd as u32)
-            },
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+             ret_fd: i32|
+             -> i32 { wasix_epoll_create(&mut caller, ret_fd as u32) },
         )
         .map_err(map_program_runtime_error)?;
     linker
         .func_wrap(
             WASIX_MODULE,
             "epoll_ctl",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
              epfd: i32,
              op: i32,
              fd: i32,
@@ -32,7 +33,7 @@ where
         .func_wrap_async(
             WASIX_MODULE,
             "epoll_wait",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
              (epfd, events, maxevents, timeout, ret_nevents): (i32, i32, i32, i64, i32)| {
                 Box::new(async move {
                     wasix_epoll_wait(
@@ -51,12 +52,13 @@ where
     Ok(())
 }
 
-pub(super) fn wasix_epoll_create<CpuImpl, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+pub(super) fn wasix_epoll_create<CpuImpl, Net, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     ret_fd: u32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     let Some(memory) = p1_memory(caller) else {
@@ -74,8 +76,8 @@ where
     p1_write_u32(caller, memory, ret_fd, fd)
 }
 
-pub(super) fn wasix_epoll_ctl<CpuImpl, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+pub(super) fn wasix_epoll_ctl<CpuImpl, Net, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     epfd: i32,
     op: i32,
     fd: i32,
@@ -83,6 +85,7 @@ pub(super) fn wasix_epoll_ctl<CpuImpl, HostFs>(
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     match caller.data().descriptors.get(epfd) {
@@ -130,8 +133,8 @@ where
     }
 }
 
-pub(super) async fn wasix_epoll_wait<CpuImpl, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+pub(super) async fn wasix_epoll_wait<CpuImpl, Net, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     epfd: i32,
     events: u32,
     maxevents: i32,
@@ -140,6 +143,7 @@ pub(super) async fn wasix_epoll_wait<CpuImpl, HostFs>(
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     if maxevents <= 0 {
@@ -230,12 +234,13 @@ pub(super) fn poll_epoll_wait_targets(
 /// with an infinite timeout it parked forever, and with a timeout it always
 /// timed out. `p1_add_wait_target` covers every descriptor kind, flagging the
 /// poll-driven ones for re-probing.
-pub(super) fn wasix_epoll_wait_set<CpuImpl, HostFs>(
-    caller: &Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+pub(super) fn wasix_epoll_wait_set<CpuImpl, Net, HostFs>(
+    caller: &Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     epfd: i32,
 ) -> Result<P1WaitSet, i32>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     let interests = match caller.data().descriptors.get(epfd) {
@@ -324,13 +329,14 @@ pub(super) fn wasix_write_epoll_event<T>(
         ))
 }
 
-pub(super) async fn wasix_collect_epoll_events<CpuImpl, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+pub(super) async fn wasix_collect_epoll_events<CpuImpl, Net, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     epfd: i32,
     maxevents: u32,
 ) -> Vec<EpollInterest>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     let interests = match caller.data().descriptors.get(epfd) {
@@ -371,13 +377,14 @@ where
 /// readable, so they never raised `EPOLLIN`. The tri-state readiness makes
 /// "ready with nothing buffered" (end-of-stream, a drained regular file)
 /// distinguishable from "would block".
-pub(super) async fn wasix_epoll_ready_mask<CpuImpl, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+pub(super) async fn wasix_epoll_ready_mask<CpuImpl, Net, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     fd: i32,
     interest: u32,
 ) -> u32
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     if caller.data().descriptors.get(fd).is_none() {
