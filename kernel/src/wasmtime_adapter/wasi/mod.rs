@@ -1972,6 +1972,80 @@ mod tests {
         assert_eq!(closed.last(), 42);
     }
 
+    /// The socket a completed accept parks, as `PendingAccept`'s task
+    /// builds it.
+    fn accepted_connection(service: ComponentHostNetworkService, stream: u64) -> TcpSocket {
+        TcpSocket::from_accepted(
+            service,
+            WasiTcpSocketFamily::Ipv4,
+            tcp4([127, 0, 0, 1], 8080),
+            crate::TcpAccepted {
+                stream,
+                address: crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([127, 0, 0, 1])),
+                port: 4040,
+            },
+        )
+    }
+
+    /// A connection that was accepted but never adopted is retired too.
+    ///
+    /// The accept completes on a detached task and parks its answer in
+    /// `accept_result`; the accept path turns it into a guest resource
+    /// the next time the guest asks. While that answer was a bare
+    /// stream id, a socket dropped in the window between the two left a
+    /// connected stream in its shard with nothing pointing at it, which
+    /// is #184's leak through a narrower door (#225). The parked value
+    /// is the accepted socket itself, so it dies with the listening one.
+    #[test]
+    fn a_wasi_tcp_socket_retires_a_connection_it_never_adopted() {
+        let (service, closed) = crate::test_support::recording_network_service();
+        let socket = TcpSocket::new(service.clone(), WasiTcpSocketFamily::Ipv4);
+        socket.inner.lock().accept_result = Some(Ok(accepted_connection(service, 43)));
+
+        drop(socket);
+        assert_eq!(
+            closed.count(),
+            1,
+            "a connection still sitting in the accept result is retired"
+        );
+        assert_eq!(closed.last(), 43);
+    }
+
+    /// A connection accepted after the socket died is retired too.
+    ///
+    /// The detached accept task holds the listening socket's state,
+    /// because that is where it parks its answer, so the state outlives
+    /// the guest resource whenever the two race. What the task parks
+    /// owns its stream, and the state's own drop — the moment the task
+    /// lets go of it — retires the connection nobody will ever adopt.
+    #[test]
+    fn a_wasi_tcp_socket_retires_a_connection_accepted_after_it_died() {
+        let (service, closed) = crate::test_support::recording_network_service();
+        let socket = TcpSocket::new(service.clone(), WasiTcpSocketFamily::Ipv4);
+        let task_state = socket.inner.clone();
+        socket.inner.lock().accept_in_progress = true;
+
+        drop(socket);
+        assert_eq!(
+            closed.count(),
+            0,
+            "the accept task still holds the listening socket's state"
+        );
+
+        {
+            let mut state = task_state.lock();
+            state.accept_in_progress = false;
+            state.accept_result = Some(Ok(accepted_connection(service, 43)));
+        }
+        drop(task_state);
+        assert_eq!(
+            closed.count(),
+            1,
+            "the state the accept task released retires the connection it accepted"
+        );
+        assert_eq!(closed.last(), 43);
+    }
+
     /// A `wasi:sockets` datagram socket's kernel socket dies with the
     /// socket.
     ///

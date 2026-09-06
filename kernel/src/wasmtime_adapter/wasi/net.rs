@@ -60,8 +60,10 @@ pub(super) struct TcpSocketState {
         Option<core::result::Result<crate::TcpListener<u64>, crate::TcpError>>,
     pub(super) listen_backlog: u16,
     pub(super) accept_in_progress: bool,
-    pub(super) accept_result:
-        Option<core::result::Result<crate::TcpAccepted<u64>, crate::TcpError>>,
+    /// The connection a completed accept produced, already a socket of
+    /// its own, waiting for the accept path to turn it into a guest
+    /// resource.
+    pub(super) accept_result: Option<core::result::Result<TcpSocket, crate::TcpError>>,
     pub(super) keep_alive_enabled: bool,
     pub(super) keep_alive_idle_time: u64,
     pub(super) keep_alive_interval: u64,
@@ -91,6 +93,13 @@ pub(super) struct TcpSocketState {
 /// polled again. Both are the same listener's two possible resting
 /// places, never two listeners, so retiring whichever is present
 /// retires it exactly once.
+///
+/// A connection this socket accepted needs no line of its own here. It
+/// is parked in `accept_result` as a [`TcpSocket`], so dropping the
+/// field runs this same destructor on it. While the parked value was a
+/// bare stream id nothing owned the connection between the accept task
+/// storing it and the accept path adopting it, and a socket that died
+/// in that window left it in its shard for the rest of the boot (#225).
 impl Drop for TcpSocketState {
     fn drop(&mut self) {
         if let Some(stream) = self.stream.take() {
@@ -105,6 +114,103 @@ impl Drop for TcpSocketState {
         if let Some(listener) = listener {
             self.service.tcp_listener_close(listener);
         }
+    }
+}
+
+/// One accept in flight on a listening socket.
+///
+/// Both `wasi:sockets` generations run the accept on a detached task
+/// and park its answer for the next call to adopt, so what the network
+/// service hands back has to belong to somebody the moment it exists.
+/// The task builds the [`TcpSocket`] itself and parks that: the parked
+/// value owns its stream, in whichever order the socket resource dies
+/// and the accept completes (#225).
+///
+/// Everything the accepted socket needs is captured here while the
+/// caller still holds the state lock, so the task reads nothing back
+/// out of the listening socket and the spawn happens with the lock
+/// released.
+pub(super) struct PendingAccept {
+    service: ComponentHostNetworkService,
+    inner: Arc<Mutex<TcpSocketState>>,
+    ready: Arc<crate::Notify>,
+    listener: u64,
+    family: WasiTcpSocketFamily,
+    local_address: WasiTcpSocketAddress,
+}
+
+impl PendingAccept {
+    /// Mark an accept in progress on a listening socket the caller has
+    /// locked.
+    ///
+    /// `None` when the socket has no local address: `listener` and
+    /// `local_address` are set together, and the accepted socket
+    /// inherits the listening one's address, so a socket without one
+    /// cannot describe the connection it is about to take. The caller
+    /// reports that broken invariant in its own vocabulary.
+    pub(super) fn start(
+        socket: &TcpSocket,
+        state: &mut TcpSocketState,
+        listener: u64,
+    ) -> Option<Self> {
+        let local_address = state.local_address?;
+        state.accept_in_progress = true;
+        Some(Self {
+            service: state.service.clone(),
+            inner: socket.inner.clone(),
+            ready: socket.ready.clone(),
+            listener,
+            family: state.family,
+            local_address,
+        })
+    }
+
+    /// Run the accept on a detached task, parking the socket it
+    /// produces.
+    ///
+    /// The caller must have released the socket's state lock: this
+    /// takes it again to clear `accept_in_progress` when the executor
+    /// refuses the task.
+    pub(super) fn spawn<CpuImpl>(
+        self,
+        spawner: &crate::InstanceSpawner<CpuImpl>,
+    ) -> core::result::Result<(), crate::TaskCapacityError>
+    where
+        CpuImpl: Cpu + Clone,
+    {
+        let Self {
+            service,
+            inner,
+            ready,
+            listener,
+            family,
+            local_address,
+        } = self;
+        let spawned = spawner.try_spawn_detached({
+            let inner = inner.clone();
+            async move {
+                let accepted = service
+                    .tcp_accept(listener, u64::MAX)
+                    .await
+                    .map(|accepted| {
+                        TcpSocket::from_accepted(service.clone(), family, local_address, accepted)
+                    });
+                let mut state = inner.lock();
+                state.accept_in_progress = false;
+                state.accept_result = Some(accepted);
+                ready.notify_all();
+            }
+        });
+        if let Err(error) = spawned {
+            inner.lock().accept_in_progress = false;
+            tracing::warn!(
+                target: "helios_kernel::program",
+                %error,
+                "refused a tcp accept task: the executor's instance share is full"
+            );
+            return Err(error);
+        }
+        Ok(())
     }
 }
 
@@ -343,6 +449,39 @@ impl TcpSocket {
             })),
             ready: Arc::new(crate::Notify::new()),
         }
+    }
+
+    /// The socket one completed accept produced.
+    ///
+    /// The connection belongs to the returned value from here: its
+    /// `TcpSocketState` retires the stream whether the socket becomes a
+    /// guest resource or is dropped while still parked in
+    /// `accept_result`.
+    pub(super) fn from_accepted(
+        service: ComponentHostNetworkService,
+        family: WasiTcpSocketFamily,
+        local_address: WasiTcpSocketAddress,
+        accepted: crate::TcpAccepted<u64>,
+    ) -> Self {
+        let remote_address = match accepted.address {
+            crate::NetworkIpAddress::Ipv4(address) => WasiTcpIpAddress::Ipv4(address),
+            crate::NetworkIpAddress::Ipv6(address) => WasiTcpIpAddress::Ipv6(address),
+        };
+        assert_eq!(
+            remote_address.family(),
+            family,
+            "tcp accept returned a peer address for the wrong socket family"
+        );
+        Self::accepted(
+            service,
+            family,
+            accepted.stream,
+            local_address,
+            WasiTcpSocketAddress {
+                address: remote_address,
+                port: accepted.port,
+            },
+        )
     }
 
     pub(super) fn family(&self) -> WasiTcpSocketFamily {
@@ -733,39 +872,7 @@ where
                     wait_for_socket = true;
                 } else if let Some(result) = state.accept_result.take() {
                     match result {
-                        Ok(accepted) => {
-                            let Some(local_address) = state.local_address else {
-                                return Poll::Ready(Err(wasmtime::Error::new(
-                                    P3TcpListenStreamError {
-                                        operation: P3TcpListenStreamOperation::LocalAddress,
-                                        source: None,
-                                    },
-                                )));
-                            };
-                            let remote_address = match accepted.address {
-                                crate::NetworkIpAddress::Ipv4(address) => {
-                                    WasiTcpIpAddress::Ipv4(address)
-                                }
-                                crate::NetworkIpAddress::Ipv6(address) => {
-                                    WasiTcpIpAddress::Ipv6(address)
-                                }
-                            };
-                            assert_eq!(
-                                remote_address.family(),
-                                state.family,
-                                "tcp accept returned a peer address for the wrong socket family"
-                            );
-                            accepted_socket = Some(TcpSocket::accepted(
-                                state.service.clone(),
-                                state.family,
-                                accepted.stream,
-                                local_address,
-                                WasiTcpSocketAddress {
-                                    address: remote_address,
-                                    port: accepted.port,
-                                },
-                            ));
-                        }
+                        Ok(socket) => accepted_socket = Some(socket),
                         Err(error) => {
                             return Poll::Ready(Err(wasmtime::Error::new(
                                 P3TcpListenStreamError {
@@ -778,13 +885,14 @@ where
                 } else if state.accept_in_progress {
                     wait_for_socket = true;
                 } else if let Some(listener) = state.listener {
-                    state.accept_in_progress = true;
-                    start_accept = Some((
-                        state.service.clone(),
-                        this.socket.inner.clone(),
-                        this.socket.ready.clone(),
-                        listener,
-                    ));
+                    let Some(pending) = PendingAccept::start(&this.socket, &mut state, listener)
+                    else {
+                        return Poll::Ready(Err(wasmtime::Error::new(P3TcpListenStreamError {
+                            operation: P3TcpListenStreamOperation::LocalAddress,
+                            source: None,
+                        })));
+                    };
+                    start_accept = Some(pending);
                 } else {
                     return Poll::Ready(Err(wasmtime::Error::new(P3TcpListenStreamError {
                         operation: P3TcpListenStreamOperation::InvalidState,
@@ -800,24 +908,8 @@ where
                 return Poll::Ready(Ok(StreamResult::Completed));
             }
 
-            if let Some((service, inner, ready, listener)) = start_accept {
-                let spawned = this.spawner.try_spawn_detached({
-                    let inner = inner.clone();
-                    async move {
-                        let result = service.tcp_accept(listener, u64::MAX).await;
-                        let mut state = inner.lock();
-                        state.accept_in_progress = false;
-                        state.accept_result = Some(result);
-                        ready.notify_all();
-                    }
-                });
-                if let Err(error) = spawned {
-                    inner.lock().accept_in_progress = false;
-                    tracing::warn!(
-                        target: "helios_kernel::program",
-                        %error,
-                        "refused a tcp accept task: the executor's instance share is full"
-                    );
+            if let Some(pending) = start_accept {
+                if pending.spawn(&this.spawner).is_err() {
                     return Poll::Ready(Err(wasmtime::Error::new(P3TcpListenStreamError {
                         operation: P3TcpListenStreamOperation::TaskCapacity,
                         source: None,
