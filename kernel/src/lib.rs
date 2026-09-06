@@ -200,11 +200,13 @@ use core::task::{Context, Poll, Waker};
 use core::time::Duration;
 
 use arrayvec::ArrayVec;
-use buddy_system_allocator::LockedHeap;
+use buddy_system_allocator::Heap;
 use helios_hal::cpu::{Cpu, Instant, ProcessorId};
 use helios_hal::memory::MemoryRegion;
 use helios_hal::watchdog::{NoWatchdog, ProgressCounter, Watchdog};
 use helios_hal::{DeviceInventory, DmaModel, ProcessorStartupPolicy, ProcessorTopology};
+
+use crate::memory::IrqSafeMutex;
 
 const HEAP_ORDER: usize = 32;
 pub const HEAP_SIZE_CLASS_COUNT: usize = 12;
@@ -245,7 +247,12 @@ impl HeapStats {
 }
 
 struct KernelAllocator<const ORDER: usize> {
-    heap: LockedHeap<ORDER>,
+    /// The kernel heap, behind the mask every allocator in this kernel
+    /// takes: an interrupt handler allocates and frees, so a plain spin
+    /// lock here deadlocks the processor that was interrupted holding
+    /// it, and then every other processor behind it (#206). See
+    /// [`memory::IrqSafeMutex`] for the contract.
+    heap: IrqSafeMutex<Heap<ORDER>>,
     stats: KernelAllocationStats,
     /// Every usable byte the boot memory map described, and the free
     /// kernel heap a user grow may not dip into. Both are fixed by
@@ -263,7 +270,7 @@ struct KernelAllocator<const ORDER: usize> {
 impl<const ORDER: usize> KernelAllocator<ORDER> {
     const fn empty() -> Self {
         Self {
-            heap: LockedHeap::empty(),
+            heap: IrqSafeMutex::new(Heap::new()),
             stats: KernelAllocationStats::new(),
             machine_usable_bytes: AtomicUsize::new(0),
             kernel_reserve_bytes: AtomicUsize::new(0),
@@ -272,9 +279,20 @@ impl<const ORDER: usize> KernelAllocator<ORDER> {
     }
 
     unsafe fn add_to_heap(&self, start: usize, end: usize) {
-        unsafe {
-            self.heap.lock().add_to_heap(start, end);
-        }
+        self.heap.with(|heap| unsafe {
+            heap.add_to_heap(start, end);
+        });
+    }
+
+    /// Returns one allocation to the heap.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be an allocation this heap served under `layout`,
+    /// which is what every [`GlobalAlloc`] caller already promises.
+    unsafe fn free(&self, ptr: *mut u8, layout: Layout) {
+        let ptr = ptr::NonNull::new(ptr).expect("the global allocator was handed a null pointer");
+        self.heap.with(|heap| unsafe { heap.dealloc(ptr, layout) });
     }
 
     /// Records what the boot memory map came to and what the kernel
@@ -301,14 +319,15 @@ impl<const ORDER: usize> KernelAllocator<ORDER> {
     /// growth decision below is made against the state the allocation
     /// actually produced rather than a racing re-read.
     fn try_alloc(&self, layout: Layout) -> (*mut u8, usize) {
-        let mut heap = self.heap.lock();
-        let ptr = heap
-            .alloc(layout)
-            .map_or(ptr::null_mut(), core::ptr::NonNull::as_ptr);
-        let free = heap
-            .stats_total_bytes()
-            .saturating_sub(heap.stats_alloc_actual());
-        (ptr, free)
+        self.heap.with(|heap| {
+            let ptr = heap
+                .alloc(layout)
+                .map_or(ptr::null_mut(), core::ptr::NonNull::as_ptr);
+            let free = heap
+                .stats_total_bytes()
+                .saturating_sub(heap.stats_alloc_actual());
+            (ptr, free)
+        })
     }
 
     /// Serves `layout`, taking more memory out of the user pool when
@@ -380,10 +399,12 @@ impl<const ORDER: usize> KernelAllocator<ORDER> {
     }
 
     fn stats(&self) -> HeapStats {
-        let allocator = self.heap.lock();
+        let (total_bytes, allocated_bytes) = self
+            .heap
+            .with(|heap| (heap.stats_total_bytes(), heap.stats_alloc_actual()));
         HeapStats {
-            total_bytes: allocator.stats_total_bytes(),
-            allocated_bytes: allocator.stats_alloc_actual(),
+            total_bytes,
+            allocated_bytes,
             requested_live_bytes: self.stats.requested_live_bytes.load(Ordering::Relaxed),
             allocation_count: self.stats.allocation_count.load(Ordering::Relaxed),
             deallocation_count: self.stats.deallocation_count.load(Ordering::Relaxed),
@@ -438,9 +459,7 @@ unsafe impl<const ORDER: usize> GlobalAlloc for KernelAllocator<ORDER> {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe {
-            GlobalAlloc::dealloc(&self.heap, ptr, layout);
-        }
+        unsafe { self.free(ptr, layout) };
         self.stats.record_dealloc(layout.size());
     }
 
@@ -453,7 +472,7 @@ unsafe impl<const ORDER: usize> GlobalAlloc for KernelAllocator<ORDER> {
 
         unsafe {
             ptr::copy_nonoverlapping(ptr, new_ptr, layout.size().min(new_size));
-            GlobalAlloc::dealloc(&self.heap, ptr, layout);
+            self.free(ptr, layout);
         }
         self.stats.record_realloc(layout.size(), new_size);
         new_ptr
@@ -1336,6 +1355,54 @@ mod tests {
         assert_eq!(stats.total_allocation_bytes, 64);
         assert_eq!(stats.total_reallocation_bytes, 128);
         assert_eq!(stats.total_deallocation_bytes, 128);
+        assert_eq!(stats.requested_live_bytes, 0);
+    }
+
+    /// The allocator has to serve a caller that is already inside a
+    /// machine-wide critical section.
+    ///
+    /// The path is real: a virtio interrupt ends in
+    /// [`Notify::notify_all`], which is `event_listener::Event::notify`;
+    /// the kernel builds `event-listener` with its `critical-section`
+    /// feature, so the notify takes a critical section and allocates its
+    /// shared state inside one the first time it runs. If the kernel
+    /// heap ever took a lock that could not nest inside the section its
+    /// own caller holds, that first notify would hang the processor.
+    ///
+    /// The heap's own mask is processor-local and takes no owner word,
+    /// so this nests trivially now. It did not always: the first version
+    /// of the #206 fix took `critical_section::with` itself here, and
+    /// depended on that section being re-entrant for the same
+    /// processor. The test is kept because the caller's section is real
+    /// whatever the heap does underneath.
+    #[test]
+    fn the_kernel_allocator_serves_a_caller_already_inside_a_critical_section() {
+        let allocator = KernelAllocator::<HEAP_ORDER>::empty();
+        let mut heap = Box::new(AlignedHeap([0; TEST_HEAP_BYTES]));
+        let start = heap.0.as_mut_ptr() as usize;
+        unsafe {
+            allocator.add_to_heap(start, start + TEST_HEAP_BYTES);
+        }
+
+        let layout = Layout::from_size_align(64, 8).expect("valid allocation layout");
+        critical_section::with(|_| {
+            let ptr = unsafe { GlobalAlloc::alloc(&allocator, layout) };
+            assert!(
+                !ptr.is_null(),
+                "the kernel heap refused an allocation issued from inside a critical section"
+            );
+            let grown = unsafe { GlobalAlloc::realloc(&allocator, ptr, layout, 128) };
+            assert!(!grown.is_null());
+            let grown_layout = Layout::from_size_align(128, 8).expect("valid grown layout");
+            unsafe {
+                GlobalAlloc::dealloc(&allocator, grown, grown_layout);
+            }
+        });
+
+        let stats = allocator.stats();
+        assert_eq!(stats.allocation_count, 1);
+        assert_eq!(stats.reallocation_count, 1);
+        assert_eq!(stats.deallocation_count, 1);
         assert_eq!(stats.requested_live_bytes, 0);
     }
 }

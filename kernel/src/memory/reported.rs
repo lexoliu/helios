@@ -12,10 +12,13 @@
 //! have to split its records, and a bounded range-set would have to drop
 //! one, which is exactly the case where the guarantee matters.
 //!
-//! Concurrency contract: the bitmap sits behind a spin mutex taken for
-//! the length of a word walk and never held across an await. It is grown
-//! only from [`ReportedFrames::cover`], which runs during
-//! single-processor bring-up.
+//! Concurrency contract: the bitmap sits behind an
+//! [`IrqSafeMutex`] taken for the length of a word walk and never held
+//! across an await. The lock masks interrupts while it is held because
+//! it is reached from the frame allocators, which an interrupt handler
+//! also reaches (#206). It is grown only from
+//! [`ReportedFrames::cover`], which runs during single-processor
+//! bring-up.
 
 extern crate alloc;
 
@@ -24,8 +27,8 @@ use core::future::Future;
 use alloc::vec;
 use alloc::vec::Vec;
 
+use crate::memory::irq_safe::IrqSafeMutex;
 use helios_hal::pmm::{PhysFrame, PhysFrameRange};
-use spin::Mutex;
 
 /// Runs a single [`visit_free_runs`] pass holds at once.
 ///
@@ -41,13 +44,13 @@ const BITS_PER_WORD: usize = u64::BITS as usize;
 
 /// The frames a pool has shown to a free-page consumer.
 pub(crate) struct ReportedFrames {
-    bits: Mutex<FrameBitmap>,
+    bits: IrqSafeMutex<FrameBitmap>,
 }
 
 impl ReportedFrames {
     pub(crate) const fn new() -> Self {
         Self {
-            bits: Mutex::new(FrameBitmap::empty()),
+            bits: IrqSafeMutex::new(FrameBitmap::empty()),
         }
     }
 
@@ -61,15 +64,16 @@ impl ReportedFrames {
         }
         let first = start / PhysFrame::SIZE;
         let last = end.div_ceil(PhysFrame::SIZE);
-        self.bits.lock().cover(first, last);
+        self.bits.with(|bits| bits.cover(first, last));
     }
 
     /// Records that `range` has been shown to a consumer.
     pub(crate) fn mark(&self, range: PhysFrameRange) {
-        let mut bits = self.bits.lock();
-        for frame in 0..range.frame_count {
-            bits.set(range.start.index() + frame);
-        }
+        self.bits.with(|bits| {
+            for frame in 0..range.frame_count {
+                bits.set(range.start.index() + frame);
+            }
+        });
     }
 
     /// Clears `range` and reports whether any of it had been shown to a
@@ -91,24 +95,25 @@ impl ReportedFrames {
         if len == 0 {
             return false;
         }
-        let mut bits = self.bits.lock();
         let covered = start.div_ceil(PhysFrame::SIZE)..(start + len) / PhysFrame::SIZE;
-        let mut found = false;
-        for frame in start / PhysFrame::SIZE..(start + len).div_ceil(PhysFrame::SIZE) {
-            if !bits.get(frame) {
-                continue;
+        self.bits.with(|bits| {
+            let mut found = false;
+            for frame in start / PhysFrame::SIZE..(start + len).div_ceil(PhysFrame::SIZE) {
+                if !bits.get(frame) {
+                    continue;
+                }
+                found = true;
+                if covered.contains(&frame) {
+                    bits.clear(frame);
+                }
             }
-            found = true;
-            if covered.contains(&frame) {
-                bits.clear(frame);
-            }
-        }
-        found
+            found
+        })
     }
 
     /// How many frames are currently marked.
     pub(crate) fn count(&self) -> usize {
-        self.bits.lock().count()
+        self.bits.with(|bits| bits.count())
     }
 }
 

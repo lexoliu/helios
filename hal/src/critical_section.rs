@@ -217,6 +217,145 @@ const fn decode_is_outermost(token: usize) -> bool {
     token & OUTERMOST_BIT != 0
 }
 
+/// A mask that stops interrupts on the calling processor only.
+///
+/// This is the other half of [`CriticalSectionState`], and the one a
+/// lock usually wants. A `critical_section` here is machine-wide: it
+/// masks local interrupts *and* takes the single `owner` word above, so
+/// every holder on every processor serialises against every other. That
+/// is right for state one processor at a time may touch — a GIC
+/// register, a PCI configuration cycle — and wrong for a lock that
+/// already has its own spin word, where the machine-wide word is pure
+/// contention.
+///
+/// A lock reachable from an interrupt handler needs only the local
+/// half: the handler that would re-enter the lock runs on the processor
+/// that holds it, so masking that processor is what breaks the
+/// deadlock. Cross-processor exclusion stays the lock's own job. This
+/// trait provides exactly that half and nothing else — it is
+/// `spin_lock_irqsave`, not a critical section.
+///
+/// Nesting is correct by construction and needs no depth counter: an
+/// inner [`LocalInterruptMask::mask`] finds interrupts already masked
+/// and answers `false`, so its [`LocalInterruptMask::restore`] leaves
+/// them masked and only the outermost restore re-enables them.
+pub trait LocalInterruptMask {
+    /// Masks interrupts on the calling processor and reports whether
+    /// they were enabled before.
+    ///
+    /// The answer is the token [`LocalInterruptMask::restore`] takes; it
+    /// is not transferable to another processor.
+    fn mask() -> bool;
+
+    /// Restores what [`LocalInterruptMask::mask`] found.
+    ///
+    /// # Safety
+    ///
+    /// `was_enabled` must be the value returned by the matching `mask`
+    /// on this processor, and no code between the two may have changed
+    /// the interrupt state itself.
+    unsafe fn restore(was_enabled: bool);
+}
+
+/// Every backend's [`InterruptOps`] is a local interrupt mask already.
+///
+/// The fences match [`CriticalSectionState::acquire`] and
+/// [`CriticalSectionState::release`]: a backend's disable and enable are
+/// `asm!` with `options(nomem)`, which is not a synchronisation point,
+/// so the guarded accesses have to be pinned inside the masked window
+/// explicitly.
+impl<I: InterruptOps> LocalInterruptMask for I {
+    #[inline]
+    fn mask() -> bool {
+        let was_enabled = I::interrupts_enabled();
+        I::disable_interrupts();
+        compiler_fence(Ordering::SeqCst);
+        was_enabled
+    }
+
+    #[inline]
+    unsafe fn restore(was_enabled: bool) {
+        compiler_fence(Ordering::SeqCst);
+        if was_enabled {
+            // SAFETY: the caller promises this undoes its own `mask`.
+            unsafe { I::enable_interrupts() };
+        }
+    }
+}
+
+unsafe extern "Rust" {
+    safe fn _helios_local_interrupt_mask() -> bool;
+    fn _helios_local_interrupt_restore(was_enabled: bool);
+}
+
+/// Runs `act` with interrupts masked on the calling processor.
+///
+/// The mask is the one a backend installed with
+/// [`set_local_interrupt_mask_impl`], reached by linkage because the
+/// callers that need it — a global allocator, a physical-frame pool —
+/// are statics that hold no `Cpu` and can be entered from any
+/// processor.
+///
+/// This gives **no** exclusion against another processor. It stops the
+/// interrupt handler on *this* processor from re-entering whatever the
+/// caller is about to touch; the caller's own lock is what keeps other
+/// processors out. Using this without such a lock is a data race.
+///
+/// The restore runs even if `act` panics, so an unwinding host test
+/// cannot leave a processor masked.
+#[inline]
+pub fn with_local_interrupts_masked<R>(act: impl FnOnce() -> R) -> R {
+    struct Restore {
+        was_enabled: bool,
+    }
+
+    impl Drop for Restore {
+        #[inline(always)]
+        fn drop(&mut self) {
+            // SAFETY: `was_enabled` came from the `mask` this guard was
+            // built from, and nothing between the two touches the
+            // interrupt state.
+            unsafe { _helios_local_interrupt_restore(self.was_enabled) };
+        }
+    }
+
+    let _restore = Restore {
+        was_enabled: _helios_local_interrupt_mask(),
+    };
+    act()
+}
+
+/// Installs `$t` as the processor-local interrupt mask for the final
+/// binary.
+///
+/// A backend writes this once, beside its `critical_section::set_impl!`,
+/// naming its [`InterruptOps`] type — the blanket impl above turns that
+/// into a [`LocalInterruptMask`]. A platform with no interrupts of its
+/// own names a type whose mask is a no-op.
+///
+/// Exactly one crate in a binary may invoke this, exactly as with
+/// `critical_section::set_impl!`: it defines the symbols
+/// [`with_local_interrupts_masked`] links against, and a second
+/// definition is a duplicate-symbol error at link time.
+#[macro_export]
+macro_rules! set_local_interrupt_mask_impl {
+    ($t: ty) => {
+        #[unsafe(no_mangle)]
+        fn _helios_local_interrupt_mask() -> bool {
+            <$t as $crate::critical_section::LocalInterruptMask>::mask()
+        }
+
+        #[unsafe(no_mangle)]
+        unsafe fn _helios_local_interrupt_restore(was_enabled: bool) {
+            // SAFETY: forwarded from `with_local_interrupts_masked`,
+            // which pairs every restore with its own mask.
+            unsafe { <$t as $crate::critical_section::LocalInterruptMask>::restore(was_enabled) }
+        }
+    };
+}
+
+pub use crate::set_local_interrupt_mask_impl;
+
 #[cfg(test)]
 mod tests {
     use super::{CriticalSectionState, InterruptOps, ProcessorIdentity, decode_is_outermost};

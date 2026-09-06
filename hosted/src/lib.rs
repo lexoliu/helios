@@ -28,6 +28,35 @@ pub use vmm::HostedAddressSpace;
 #[global_allocator]
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+/// The processor-local interrupt mask for a hosted kernel.
+///
+/// A host process has no interrupt handler of its own: nothing preempts
+/// a thread here and then allocates on the kernel heap, which is the
+/// interleaving the mask exists to break on a real backend. So there is
+/// nothing to mask, and the spin lock inside each
+/// `IrqSafeMutex` is the whole of the exclusion — which is the same
+/// exclusion it provides between processors on bare metal.
+///
+/// This is a platform fact, not a stub: `mask` reports that interrupts
+/// were not enabled because on this platform they never are, and
+/// `restore` therefore has nothing to undo.
+struct HostedInterruptMask;
+
+impl helios_hal::critical_section::LocalInterruptMask for HostedInterruptMask {
+    fn mask() -> bool {
+        false
+    }
+
+    unsafe fn restore(was_enabled: bool) {
+        debug_assert!(
+            !was_enabled,
+            "the hosted mask never reports interrupts as enabled"
+        );
+    }
+}
+
+helios_hal::critical_section::set_local_interrupt_mask_impl!(HostedInterruptMask);
+
 use std::any::Any;
 use std::fmt;
 
