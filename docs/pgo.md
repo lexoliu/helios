@@ -176,7 +176,12 @@ one `helios-kernel.profdata`. It boots the lane's own machine, read from
 `tools/bench/manifest.toml`: the collection runs the lane's workloads, and
 a guest smaller than the one the suite times cannot run them — `4G`
 against the lane's `6G` took the x86-64 kernel's memory pool down on
-`process-startup` (run 34011609558, job 101428527454). It reports no numbers and it is not a
+`process-startup` (run 34011609558, job 101428527454). It runs
+`--keep-going` for the same reason the suite does: `instance-startup-500`
+wants more guest than the lane has, and a workload this machine cannot run
+is a recorded failure rather than the end of the pass — the profile is the
+counts of everything that did run, and stopping there would collect
+nothing for the classes behind it. It reports no numbers and it is not a
 benchmark surface — counter updates in the executor, the virtio queues
 and the netstack's per-packet path change scheduling, so anything timed
 on an instrumented kernel would be measuring the counters. The network
