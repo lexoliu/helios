@@ -45,7 +45,7 @@ def command_run(args: argparse.Namespace) -> int:
     ref = MERGE_BASE if args.baseline_merge_base else args.baseline_ref
     baseline = resolve_baseline(ref) if ref else None
     sides = parse_sides(args.sides)
-    if baseline is not None:
+    if baseline is not None or args.profile_use is not None:
         sides |= {Side.HELIOS_BASELINE}
     options = RunOptions(
         lane=lane,
@@ -62,6 +62,7 @@ def command_run(args: argparse.Namespace) -> int:
         linux_setup_timeout_seconds=args.linux_setup_timeout_seconds,
         network=NetworkOptions(ifname=args.net_ifname, bridge=args.net_bridge, queues=args.net_queues),
         baseline=baseline,
+        profile_use=args.profile_use.resolve() if args.profile_use else None,
     )
     report = run_suite(options, manifest, dry_run=args.dry_run)
     if report is None:
@@ -216,6 +217,17 @@ def build_parser() -> argparse.ArgumentParser:
             "time a second Helios image, built from this ref in a worktree under "
             "target/perf-baselines/worktrees/, against this one on this host in this "
             f"job; without a value, {MERGE_BASE} with the upstream default branch"
+        ),
+    )
+    run.add_argument(
+        "--profile-use",
+        type=Path,
+        default=None,
+        help=(
+            "build the timed Helios kernel against this merged .profdata and pair it "
+            "against the plain release kernel of this same commit, on this host in this "
+            "job (docs/pgo.md); the profile is what bench-suite.yml's profile-generate "
+            "job uploads"
         ),
     )
     run.add_argument(

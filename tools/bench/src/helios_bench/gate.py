@@ -172,6 +172,24 @@ def evaluate(baseline: Report, candidate: Report) -> GateResult:
     )
 
 
+def image_label(sha: str | None, ref: str | None, build: str | None, other_build: str | None) -> str:
+    """How one column of a paired table names its image.
+
+    The commit always, then whatever distinguishes this image from the
+    other one: the ref it was asked for, and the cargo profile its kernel
+    was built with when the two differ — a PGO pairing varies the build
+    and not the commit, so without that the two columns would carry the
+    same label.
+    """
+    qualifiers = []
+    if ref:
+        qualifiers.append(ref)
+    if build and other_build and build != other_build:
+        qualifiers.append(build)
+    label = f"`{short(sha)}`"
+    return f"{label} ({', '.join(qualifiers)})" if qualifiers else label
+
+
 def evaluate_paired(candidate: Report) -> GateResult | None:
     """The candidate against the baseline image of its own run.
 
@@ -208,9 +226,18 @@ def evaluate_paired(candidate: Report) -> GateResult | None:
         lane=candidate.run.lane,
         baseline_run=candidate.run.id,
         candidate_run=candidate.run.id,
-        baseline_label=f"`{short(candidate.run.baseline_git_sha)}`"
-        + (f" ({candidate.run.baseline_ref})" if candidate.run.baseline_ref else ""),
-        candidate_label=f"`{short(candidate.run.helios_git_sha)}`",
+        baseline_label=image_label(
+            candidate.run.baseline_git_sha,
+            candidate.run.baseline_ref,
+            candidate.run.baseline_kernel_build,
+            candidate.run.kernel_build,
+        ),
+        candidate_label=image_label(
+            candidate.run.helios_git_sha,
+            None,
+            candidate.run.kernel_build,
+            candidate.run.baseline_kernel_build,
+        ),
         baseline_host=candidate.hardware.cpu,
         candidate_host=candidate.hardware.cpu,
         noise_floor=floor,

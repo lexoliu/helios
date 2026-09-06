@@ -19,7 +19,8 @@ from bench_stub import fake_checkout, records, workload
 from helios_bench.baseline import Baseline
 from helios_bench.gate import GateKind, evaluate, evaluate_paired, gate_report
 from helios_bench.manifest import load_manifest
-from helios_bench.render import render_gate
+from helios_bench.plots import plot_report
+from helios_bench.render import render_gate, render_tables
 from helios_bench.report import Report, Side, load_report, save_report
 from helios_bench.runner import GAP_BENCH, RunOptions, plan
 from helios_bench.wasi_apps import gap_bench
@@ -394,3 +395,152 @@ def test_the_gate_puts_the_paired_table_before_the_cross_run_one(
     # The cross-run comparison is unchanged: two advisory reports, so it
     # states what it saw and enforces nothing.
     assert not evaluate(baseline_report, paired_regression_report).enforced
+
+
+def test_a_profile_use_run_pairs_two_builds_of_one_checkout(tmp_path) -> None:
+    """The other axis of a pairing: one commit, two builds (#211).
+
+    A PGO candidate has no second checkout to name, so the plan asks the
+    driver for the profile instead and the driver pairs it against the
+    plain release build of the checkout it lives in. The baseline output
+    directory travels either way: the two images write the same file
+    names.
+    """
+    profile = tmp_path / "helios-kernel.profdata"
+    profile.write_bytes(b"\x00" * 16)
+    options = RunOptions(
+        lane=load_manifest().lane("x86-64-kvm"),
+        out_dir=tmp_path / "out",
+        advisory=True,
+        sides=frozenset({Side.HELIOS, Side.HELIOS_BASELINE}),
+        profile_use=profile,
+    )
+    assert options.kernel_build == "profile-use"
+    invocations = [
+        command.argv
+        for command in plan(options, load_manifest(), WORKLOADS)
+        if command.argv[1:2] == [str(GAP_BENCH)]
+    ]
+    assert len(invocations) == 1, "the Helios side alone; no Linux side was asked for"
+    args = gap_bench().build_parser().parse_args(invocations[0][2:])
+    assert args.helios_profile_use == profile
+    assert args.helios_baseline_root is None, "the baseline is this checkout, built plain"
+    assert args.helios_baseline_out_dir == options.out_dir / "helios-baseline"
+
+
+def test_a_pgo_pairing_names_the_build_in_both_columns(paired_regression_report) -> None:
+    """Two columns of one commit are told apart by their build.
+
+    The paired table labels each column with its commit, which is the
+    only thing that varies when the baseline is another ref. A PGO
+    pairing varies the build instead, so both columns would otherwise
+    carry the same label and the table would say nothing about which one
+    read the profile.
+    """
+    sha = paired_regression_report.run.helios_git_sha
+    run = paired_regression_report.run.model_copy(
+        update={
+            "baseline_git_sha": sha,
+            "baseline_ref": None,
+            "kernel_build": "profile-use",
+            "baseline_kernel_build": "release",
+        }
+    )
+    result = evaluate_paired(paired_regression_report.model_copy(update={"run": run}))
+
+    assert result is not None and result.kind is GateKind.PAIRED
+    assert "release" in result.baseline_label
+    assert "profile-use" in result.candidate_label
+    assert result.baseline_label != result.candidate_label
+    rendered = render_gate(
+        gate_report(paired_regression_report.model_copy(update={"run": run}), None), run.lane
+    )
+    assert "profile-use" in rendered
+
+
+def test_a_pgo_run_reports_without_a_linux_side(tmp_path) -> None:
+    """`suite-pgo` times Helios against Helios and nothing else.
+
+    The three-way comparison answers a different question and would
+    double a job that already boots every workload twice, so the PGO job
+    runs `--sides helios,helios_baseline`. A report with neither Linux
+    column still has to assemble, render and gate.
+    """
+    from conftest import THRESHOLDS, iterations, raw_side
+    from conftest import WORKLOADS as SYNTHETIC
+
+    from helios_bench.assemble import assemble_report, build_control
+    from helios_bench.report import Hardware, Pins, RunInfo
+
+    sha = "0123456789abcdef0123456789abcdef01234567"
+    centers = {"hostcall-loop": 100.0, "quickjs-loop": 90.0, "fs-smallfiles": 40.0}
+    sides = {
+        Side.HELIOS: raw_side({name: iterations(value, 1.0, 5) for name, value in centers.items()}),
+        Side.HELIOS_BASELINE: raw_side(
+            {name: iterations(value * 1.1, 1.0, 6) for name, value in centers.items()}
+        ),
+    }
+    control_sides = {
+        side: (
+            raw_side({"quickjs-loop": iterations(100.0, 1.0, 7)}),
+            raw_side({"quickjs-loop": iterations(101.0, 1.0, 8)}),
+        )
+        for side in sides
+    }
+    report = assemble_report(
+        SYNTHETIC,
+        sides,
+        build_control("quickjs-loop", control_sides, THRESHOLDS),
+        RunInfo(
+            id="4004",
+            url=None,
+            attempt=1,
+            lane="x86-64-kvm",
+            runner_label="ubuntu-24.04",
+            advisory=True,
+            publishable=False,
+            deviations=[],
+            started_at="2026-09-05T00:00:00+00:00",
+            finished_at="2026-09-05T02:00:00+00:00",
+            helios_git_sha=sha,
+            baseline_git_sha=sha,
+            baseline_ref=None,
+            kernel_build="profile-use",
+            baseline_kernel_build="release",
+        ),
+        Hardware(
+            host_os="Linux 6.11",
+            host_arch="x86_64",
+            cpu="AMD EPYC 7763",
+            logical_cpus=4,
+            memory_bytes=16 << 30,
+            accelerator="kvm",
+            qemu_version="8.2.2",
+        ),
+        Pins(
+            wasmtime_revision="39819b1f81f3912dddfdcb25de6d5924aef15783",
+            wasmtime_linux_release="wasmtime-v48.0.0-x86_64-linux",
+            fedora_image_url="https://download.fedoraproject.org/example.qcow2",
+            fedora_image_sha256="ef" * 32,
+            qemu_version="8.2.2",
+            vcpus=4,
+            memory="6G",
+            linux_vm_memory="4G",
+            net_backend="tap",
+            devices=["virtio-net-pci"],
+            wasm_artifacts={},
+            bootfs_cwasm={},
+        ),
+        THRESHOLDS,
+    )
+
+    assert set(report.measured_sides()) == {Side.HELIOS, Side.HELIOS_BASELINE}
+    # Everything `helios-bench run` writes beside the report has to
+    # survive a run with no Linux column, because the job never has one.
+    assert "quickjs-loop" in render_tables(report)
+    assert plot_report(report, tmp_path)
+    save_report(report, tmp_path / "report.json")
+    result = evaluate_paired(load_report(tmp_path / "report.json"))
+    assert result is not None
+    assert result.rows, "the PGO candidate is compared against the plain image"
+    assert "profile-use" in render_gate(gate_report(report, None), report.run.lane)
