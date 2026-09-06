@@ -238,7 +238,8 @@ unoptimised PGO build would measure neither.
 #### Refusing a profile the toolchain cannot read
 
 The build checks the profile's header before cargo starts
-(`inspector/src/vm/profdata.rs`), the way the guest writer checks
+(`helios-profdata`, the crate the inspector and `helios-cli` share),
+the way the guest writer checks
 `__llvm_profile_raw_version` before it writes a byte. Sixteen bytes
 answer three questions:
 
