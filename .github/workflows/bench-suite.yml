@@ -132,64 +132,14 @@ jobs:
           # rather than the single commit a default checkout fetches.
           fetch-depth: 0
       - uses: ./helios/.github/actions/checkout-wasmtime
-      - name: Install host dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libudev-dev just cmake ninja-build \
-            qemu-system-x86 ovmf qemu-utils genisoimage \
-            iproute2 nftables dnsmasq-base
-          if [ -e /dev/kvm ]; then
-            sudo chmod 666 /dev/kvm
-          fi
-      - uses: astral-sh/setup-uv@v6
-      - uses: taiki-e/install-action@v2
+      - uses: ./helios/.github/actions/bench-host
         with:
-          tool: wasm-tools
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: 0.13.0
-      - name: Stage Limine bootloader share
-        run: |
-          git clone --depth 1 --branch v11.x-binary \
-            https://github.com/limine-bootloader/limine "$GITHUB_WORKSPACE/limine"
-          make -C "$GITHUB_WORKSPACE/limine"
-      - name: Restore WASI tooling artifacts
-        id: artifact-cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            helios/artifacts/wasi-tools
-            helios/artifacts/python3-root
-            helios/artifacts/wasix
-          key: wasi-artifacts-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('helios/tools/wasi-apps/**', 'helios/Cargo.lock') }}
-      - name: Stage WASI tooling artifacts
-        if: steps.artifact-cache.outputs.cache-hit != 'true'
-        working-directory: helios
-        run: tools/wasi-apps/build.sh
-      - name: Restore pinned Fedora VM assets
-        uses: actions/cache@v4
-        with:
-          path: |
-            helios/target/perf-baselines/linux-vm/fedora-${{ matrix.guest-arch }}/*.qcow2
-            helios/target/perf-baselines/linux-vm/fedora-${{ matrix.guest-arch }}/sources
-            helios/target/perf-baselines/linux-vm/fedora-${{ matrix.guest-arch }}/tools
-          key: fedora-vm-assets-${{ matrix.guest-arch }}-${{ hashFiles('helios/tools/wasi-apps/fedora_qemu_baseline.py') }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: helios
-          key: bench-suite-${{ matrix.lane }}
-      - name: Install inferno flamegraph renderer
-        # The harness collects a folded kernel profile for every class and
-        # refuses to finish without the renderer that turns it into an SVG,
-        # the same way the ci.yml bench lanes provision it.
-        run: cargo install inferno --locked
-      - name: Build inspector
-        working-directory: helios
-        run: cargo build --release -p helios-inspector
-      - name: Install the bench tooling
-        working-directory: helios/tools/bench
-        run: uv sync --quiet
+          rust-cache-key: bench-suite-${{ matrix.lane }}
+          network-tools: ${{ matrix.net-backend == 'tap' }}
+          guest-arch: ${{ matrix.guest-arch }}
+          flamegraphs: "true"
+          inspector: "true"
+          bench-tooling: "true"
       - name: Report host deviations from the lane
         working-directory: helios/tools/bench
         run: uv run helios-bench host-check --lane ${{ matrix.lane }} || true
@@ -305,43 +255,9 @@ jobs:
         with:
           path: helios
       - uses: ./helios/.github/actions/checkout-wasmtime
-      - name: Install host dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libudev-dev just cmake ninja-build \
-            qemu-system-x86 ovmf qemu-utils genisoimage
-          if [ -e /dev/kvm ]; then
-            sudo chmod 666 /dev/kvm
-          fi
-      - uses: taiki-e/install-action@v2
+      - uses: ./helios/.github/actions/bench-host
         with:
-          tool: wasm-tools
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: 0.13.0
-      - name: Stage Limine bootloader share
-        run: |
-          git clone --depth 1 --branch v11.x-binary \
-            https://github.com/limine-bootloader/limine "$GITHUB_WORKSPACE/limine"
-          make -C "$GITHUB_WORKSPACE/limine"
-      - name: Restore WASI tooling artifacts
-        id: artifact-cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            helios/artifacts/wasi-tools
-            helios/artifacts/python3-root
-            helios/artifacts/wasix
-          key: wasi-artifacts-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('helios/tools/wasi-apps/**', 'helios/Cargo.lock') }}
-      - name: Stage WASI tooling artifacts
-        if: steps.artifact-cache.outputs.cache-hit != 'true'
-        working-directory: helios
-        run: tools/wasi-apps/build.sh
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: helios
-          key: profile-generate
+          rust-cache-key: profile-generate
       - name: Put llvm-profdata on PATH
         # The inspector merges the raw profile before it writes anything and
         # names this tool if it cannot find it; the toolchain's own copy is
@@ -392,6 +308,144 @@ jobs:
           name: helios-kernel-profdata
           path: profiles/helios-kernel.profdata
           if-no-files-found: error
+          retention-days: 90
+
+  # The other half of docs/pgo.md: the profile the job above collected,
+  # spent. One commit is built twice — the plain release kernel and the
+  # same kernel compiled against the profile — and the paired suite of
+  # #173 boots both back to back for every workload on this host, so what
+  # separates the two columns is profile-guided optimisation and nothing
+  # else (#211).
+  suite-pgo:
+    name: suite-pgo
+    needs: profile-generate
+    # Same events as the job that produces the profile: without one there
+    # is nothing to build against.
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'bench'))
+      || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/'))
+      || (github.event_name == 'push' && vars.HELIOS_BENCH_DEDICATED == 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 420
+    permissions:
+      contents: read
+      pull-requests: write
+    env:
+      # The profile is collected from an x86-64 kernel, so this is the
+      # lane that can spend it; a profile carries function hashes of the
+      # target it was collected on and no other lane could read it.
+      BENCH_LANE: x86-64-kvm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: helios
+      - uses: ./helios/.github/actions/checkout-wasmtime
+      - uses: ./helios/.github/actions/bench-host
+        with:
+          rust-cache-key: suite-pgo
+          network-tools: "true"
+          flamegraphs: "true"
+          inspector: "true"
+          bench-tooling: "true"
+      - name: Read the lane
+        id: lane
+        working-directory: helios/tools/bench
+        run: |
+          # The lane's pins have one definition, tools/bench/manifest.toml,
+          # and this job is not a matrix job, so it reads the entry the
+          # matrix would have carried rather than repeating its values.
+          entry="$(uv run helios-bench lanes --select "${BENCH_LANE}" --format github-matrix | jq -c '.[0]')"
+          for field in boot-timeout net-backend; do
+            printf '%s=%s\n' "$field" "$(printf '%s' "$entry" | jq -r --arg f "$field" '.[$f]')" \
+              >> "$GITHUB_OUTPUT"
+          done
+      - uses: actions/download-artifact@v4
+        with:
+          name: helios-kernel-profdata
+          path: profile
+      - name: Provision the multi-queue tap network backend
+        if: steps.lane.outputs.net-backend == 'tap'
+        working-directory: helios
+        run: |
+          ./target/release/helios-inspector vm net-setup \
+            --net-backend tap \
+            --net-ifname "${HELIOS_NET_IFNAME}" \
+            --net-bridge "${HELIOS_NET_BRIDGE}" \
+            --net-dhcp
+      - name: Time the profile-guided kernel against the plain one
+        working-directory: helios/tools/bench
+        env:
+          HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
+          HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: ${{ steps.lane.outputs.boot-timeout }}
+          HELIOS_WORKLOAD_BENCH_RUNTIME_DIR: ${{ github.workspace }}/bench-runtime
+        run: |
+          # Helios against Helios: the Linux sides answer a different
+          # question (docs/benchmarks.md) and would double a job that
+          # already boots every workload twice.
+          args=(run --lane "${BENCH_LANE}" --out-dir "$GITHUB_WORKSPACE/bench-out/pgo"
+                --runner-label "${{ runner.name }}"
+                --sides "helios,helios_baseline"
+                --profile-use "$GITHUB_WORKSPACE/profile/helios-kernel.profdata"
+                --advisory --allow-busy-host)
+          if [ -n "${{ inputs.iterations }}" ]; then
+            args+=(--iterations "${{ inputs.iterations }}")
+          fi
+          if [ "${{ steps.lane.outputs.net-backend }}" = tap ]; then
+            args+=(--net-ifname "${HELIOS_NET_IFNAME}" --net-bridge "${HELIOS_NET_BRIDGE}" --net-queues "$(nproc)")
+          fi
+          uv run helios-bench "${args[@]}"
+      - name: Upload the inspector runtime directory
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-runtime-pgo
+          path: bench-runtime/**/*.log
+          if-no-files-found: warn
+      - name: Remove the tap network backend
+        if: always() && steps.lane.outputs.net-backend == 'tap'
+        working-directory: helios
+        run: |
+          ./target/release/helios-inspector vm net-teardown \
+            --net-backend tap \
+            --net-ifname "${HELIOS_NET_IFNAME}" \
+            --net-bridge "${HELIOS_NET_BRIDGE}"
+      - name: Compare the two images
+        if: always() && hashFiles('bench-out/pgo/report.json') != ''
+        working-directory: helios/tools/bench
+        run: |
+          # The paired table is in the report: both columns were measured
+          # here. What that table means, and why its verdict does not gate
+          # this job, is prose and lives in a file rather than in a
+          # printf: tools/bench/pgo-gate-note.md.
+          exit_status=0
+          uv run helios-bench gate \
+            --candidate "$GITHUB_WORKSPACE/bench-out/pgo/report.json" \
+            > "$GITHUB_WORKSPACE/pgo-table.md" || exit_status=$?
+          {
+            cat "$GITHUB_WORKSPACE/helios/tools/bench/pgo-gate-note.md"
+            cat "$GITHUB_WORKSPACE/pgo-table.md"
+            printf '\nhelios-bench gate exited %s.\n' "$exit_status"
+          } > "$GITHUB_WORKSPACE/pgo-comment.md"
+          cat "$GITHUB_WORKSPACE/pgo-comment.md" >> "$GITHUB_STEP_SUMMARY"
+      - name: Comment on the pull request
+        if: always() && github.event_name == 'pull_request' && hashFiles('pgo-comment.md') != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh pr comment "${{ github.event.pull_request.number }}" --body-file "$GITHUB_WORKSPACE/pgo-comment.md"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-report-pgo
+          path: |
+            bench-out/pgo/report.json
+            bench-out/pgo/tables.md
+            bench-out/pgo/*.svg
+            bench-out/pgo/helios/*.jsonl
+            bench-out/pgo/helios-baseline/*.jsonl
+            pgo-comment.md
+          if-no-files-found: warn
           retention-days: 90
 
   gate:
