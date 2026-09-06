@@ -262,12 +262,14 @@ to describe a counter array belonging to a user-mode wasm instance, so a
 branch profile would need a second export and a second instrumented build.
 
 `helios-branch-hints record` sums one or more captured runs against the
-site map into `tools/wasi-apps/branch-profiles/<artifact>.json`. The
-profiles are committed, because CI rebuilds the artifacts from
-`build.sh` on a cache miss and `artifacts/` is not in the repository.
-Sites executed fewer than `MIN_OBSERVATIONS` times are dropped when the
-profile is written: they can never produce a hint, and keeping them makes
-the committed file an order of magnitude larger for no decision.
+site map into a profile under `tools/wasi-apps/branch-profiles/`. A
+profile has to be committed for a rebuilt artifact to keep its hints — CI
+rebuilds the artifacts from `build.sh` on a cache miss and `artifacts/` is
+not in the repository — and **none is committed today**, for the reason
+under "What it is worth" below. Sites executed fewer than
+`MIN_OBSERVATIONS` times are dropped when a profile is written: they can
+never produce a hint, and keeping them makes the file an order of
+magnitude larger for no decision.
 
 **Hint.** `helios-branch-hints hint` writes the section into the original,
 uninstrumented module, immediately before the code section, and
@@ -293,17 +295,51 @@ wrong compilation.
 
 The hints change block layout and nothing else, so the measurement is the
 compute-parity workloads on the `x86-64-kvm` bench lane (§3.6), hinted
-artifacts against unhinted ones. `quickjs-loop`, `cpython-json` and
-`cpython-regex` carry hints; `wasm-simd-lanes` (a module with no branch in
-it at all) and `aot-curl` (which times the compiler, not the compiled
-code) carry none, and are what says how much of any difference was the
-runner rather than the layout.
+artifacts against unhinted ones. Two `bench-suite` dispatches on the same
+host CPU model, both advisory on the shared runner: unhinted
+[34005864567](https://github.com/lexoliu/helios/actions/runs/34005864567)
+against hinted
+[34005865823](https://github.com/lexoliu/helios/actions/runs/34005865823),
+AMD EPYC 7763, 4 vCPUs, KVM.
 
-A branch profile is a property of the program and its input, not of the
-host: the counts recorded from a `quickjs-loop` run on aarch64 under HVF
-and from the same input under Wasmtime on the host agree site for site.
-The lane the *effect* is measured on is still x86-64 KVM, because that is
-the only benchmark surface this repository has.
+The hinted side carried the profiles the loop recorded on Helios:
+`qjs.wasm`, 22,313 branch sites, 54 above the observation floor, 36
+hinted; `python3.wasm`, 126,615 sites, 2,404 above the floor, 1,777
+hinted, from `cpython-json` and `cpython-regex` summed. Helios warm
+medians in ms, with the bootstrap 95% interval of the median:
+
+| Workload | branch hints | unhinted ms | hinted ms | ratio | verdict |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `quickjs-loop` | 36 | 45 [42, 48] | 40 [39, 41] | 0.889x | within noise |
+| `cpython-json` | 1,777 | 325 [322, 331] | 312 [309, 317] | 0.958x | within noise |
+| `cpython-regex` | 1,777 | 467 [466, 472] | 450 [446, 456] | 0.965x | within noise |
+| `aot-curl` | 0 | 458 [436, 464] | 436 [431, 456] | 0.954x | within noise |
+| `wasm-simd-lanes` | 0 | 13 [10, 13] | 13 [12.5, 13.5] | 1.000x | within noise |
+
+`cpython-json` and `cpython-regex` run the same hinted module and so share
+its hint count.
+
+Noise floor 14.1%, from the control workload before and after the suite.
+
+The two CPython rows have disjoint intervals and moved 3.5% and 4.2%. So
+did `aot-curl`, by 4.6% — and `aot-curl` carries no hints at all, because
+it times the compiler rather than the compiled code. A change that moved
+the hinted workloads and the unhinted control by the same few percent
+moved the machine, not the layout: on this lane the effect of the hints is
+smaller than what separates two runs of the same code.
+
+So the tooling is what lands. The artifacts ship **unhinted**: no profile
+is committed, `build.sh` finds none, and every artifact is byte for byte
+what it was. Re-recording one is a single command, and what would make the
+question answerable is a lane that can resolve a few percent — the
+dedicated runner of docs/benchmarks.md — rather than a different producer.
+
+The paired mode `--baseline-ref` added in #178 is not the instrument for
+this: it shares `artifacts/` and the `helios-cli` that compiles them
+between the two columns and varies only the kernel image, so both columns
+would carry the same hinted wasm. Pairing an artifact-level change needs
+the baseline checkout to stage its own artifacts, which it deliberately
+does not.
 
 ## Issues filed
 
@@ -312,4 +348,6 @@ the only benchmark surface this repository has.
   Implemented; described above.
 - #71: branch-hint feedback for the compiler plugin: instrumenting the
   suite's wasm inputs, writing `metadata.code.branch_hint`, and re-hinting
-  in `build.sh`.
+  in `build.sh`. The producer is implemented and described above; the
+  artifacts ship unhinted, because the effect is below what the lane can
+  resolve.
