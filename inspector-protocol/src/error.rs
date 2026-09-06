@@ -1,12 +1,13 @@
 //! Typed error types for the inspector protocol.
 //!
-//! The protocol crate is a library; AGENTS §3 forbids `anyhow` here. Errors
-//! are encoded as structured enums so callers (inspector, CLI, debugger guest)
-//! can dispatch on a stable contract instead of opaque strings.
+//! `anyhow` appears nowhere in this repository (AGENTS §3.2). Errors are
+//! structured enums so every caller — the inspector, the CLI, the debugger
+//! guest — dispatches on a stable contract instead of parsing a string, and
+//! so a failure keeps the provenance of the layer that produced it.
 //!
-//! Test-only wRPC compatibility shims still adapt to upstream
-//! `anyhow::Result`, but the production transport API never exposes that
-//! boundary.
+//! The transport's own tests drive [`crate::transport`] through the same
+//! typed API a production caller uses, so there is no second error contract
+//! reachable from this crate.
 
 #[cfg(feature = "host")]
 use std::io;
