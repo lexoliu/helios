@@ -524,8 +524,8 @@ where
         NetworkService::udp_leave_multicast_v4(self, group, interface).await
     }
 
-    async fn udp_close(&self, socket: Self::UdpSocket) {
-        NetworkService::udp_close(self, socket).await
+    fn udp_close(&self, socket: Self::UdpSocket) {
+        NetworkService::udp_close(self, socket);
     }
 }
 

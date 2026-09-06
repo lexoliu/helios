@@ -1919,6 +1919,75 @@ mod tests {
         assert_eq!(closed.count(), 1, "the last holder retires the stream");
     }
 
+    /// A `wasi:sockets` datagram socket's kernel socket dies with the
+    /// socket.
+    ///
+    /// Nothing retired it before: the resource destructor deleted the
+    /// table entry and `UdpSocketState` had no `Drop`, so every program
+    /// that bound a `udp-socket` left a replica on every shard and a
+    /// slot in `udp_slots` behind it (#190).
+    #[test]
+    fn a_wasi_udp_socket_retires_its_socket_when_its_resource_is_dropped() {
+        let (service, closed) = crate::test_support::recording_udp_network_service();
+        let socket = UdpSocket::new(service, WasiUdpSocketFamily::Ipv4);
+        block_on(socket.bind(udp4([0, 0, 0, 0], 5353))).expect("the test service always binds");
+
+        assert_eq!(
+            closed.count(),
+            0,
+            "a live socket must not have retired its binding"
+        );
+        drop(socket);
+        assert_eq!(
+            closed.count(),
+            1,
+            "dropping the socket must retire the binding it owns"
+        );
+        assert_eq!(closed.last(), 9, "the retired socket is the one bound");
+    }
+
+    /// A bind the guest started and never finished is retired too. The
+    /// kernel socket is allocated by `start-bind`, and a program is
+    /// free to exit before `finish-bind` promotes it.
+    #[test]
+    fn a_wasi_udp_socket_retires_a_bind_that_never_finished() {
+        let (service, closed) = crate::test_support::recording_udp_network_service();
+        let socket = UdpSocket::new(service, WasiUdpSocketFamily::Ipv4);
+        block_on(socket.start_bind_p2(udp4([0, 0, 0, 0], 5353)))
+            .expect("the test service always binds");
+
+        assert_eq!(closed.count(), 0);
+        drop(socket);
+        assert_eq!(
+            closed.count(),
+            1,
+            "a pending bind holds a kernel socket and must retire it"
+        );
+        assert_eq!(closed.last(), 9);
+    }
+
+    /// A socket handed to the p2 datagram streams outlives the resource
+    /// table, and the binding is retired only once the last holder is
+    /// gone. Retiring on the first drop would unbind a socket the
+    /// incoming stream is still reading, and the slab slot it frees is
+    /// handed straight to the next bind.
+    #[test]
+    fn a_wasi_udp_socket_retires_its_socket_only_once_every_holder_is_gone() {
+        let (service, closed) = crate::test_support::recording_udp_network_service();
+        let socket = UdpSocket::new(service, WasiUdpSocketFamily::Ipv4);
+        block_on(socket.bind(udp4([0, 0, 0, 0], 5353))).expect("the test service always binds");
+        let borrowed = socket.clone();
+
+        drop(socket);
+        assert_eq!(
+            closed.count(),
+            0,
+            "a binding still held by another clone must stay open"
+        );
+        drop(borrowed);
+        assert_eq!(closed.count(), 1, "the last holder retires the binding");
+    }
+
     #[test]
     fn p3_tcp_socket_hop_limit_is_descriptor_local_state() {
         let service = ComponentHostNetworkService::from_service(TestNetworkService::new());

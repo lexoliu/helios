@@ -514,6 +514,36 @@ pub(super) enum WasixTcpSocket {
     },
 }
 
+/// A netstack datagram socket a preview1 descriptor owns.
+///
+/// The same rule as [`WasixOwnedTcpStream`], for the same reason: the
+/// socket is retired when the last descriptor holding it goes away,
+/// which covers `fd_close`, the `sock_shutdown` that unbinds it, the
+/// duplicate an `exec` inherits, and the table a program takes with it
+/// when it exits. Nothing on any of those paths touched the netstack
+/// socket before, so a datagram socket stayed installed on every shard
+/// with its slot in `udp_slots` held (#190).
+pub(super) struct WasixOwnedUdpSocket {
+    service: ComponentHostNetworkService,
+    socket: u64,
+}
+
+impl WasixOwnedUdpSocket {
+    pub(super) fn new(service: ComponentHostNetworkService, socket: u64) -> Arc<Self> {
+        Arc::new(Self { service, socket })
+    }
+
+    pub(super) const fn id(&self) -> u64 {
+        self.socket
+    }
+}
+
+impl Drop for WasixOwnedUdpSocket {
+    fn drop(&mut self) {
+        self.service.udp_close(self.socket);
+    }
+}
+
 #[derive(Clone)]
 pub(super) enum WasixUdpSocket {
     Unbound {
@@ -522,7 +552,7 @@ pub(super) enum WasixUdpSocket {
     },
     Bound {
         family: WasixSocketFamily,
-        socket: u64,
+        socket: Arc<WasixOwnedUdpSocket>,
         local_port: u16,
         options: WasixSocketOptions,
     },
@@ -1489,7 +1519,7 @@ pub(super) fn p1_probe_descriptor(
                 ..
             }))),
             P1_EVENTTYPE_FD_READ | P1_EVENTTYPE_FD_WRITE,
-        ) => Ok(P1Probe::Network(P1NetworkProbe::UdpSocket(*socket))),
+        ) => Ok(P1Probe::Network(P1NetworkProbe::UdpSocket(socket.id()))),
         // A socket with no endpoint yet can never make progress; it is not
         // an error to poll it, it simply never becomes ready.
         (

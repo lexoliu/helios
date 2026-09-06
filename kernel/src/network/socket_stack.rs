@@ -199,12 +199,8 @@ where
         self.service.udp_leave_multicast_v4(group, interface)
     }
 
-    pub fn udp_close(
-        &self,
-        _: UdpCap,
-        socket: Service::UdpSocket,
-    ) -> impl Future<Output = ()> + Send + '_ {
-        self.service.udp_close(socket)
+    pub fn udp_close(&self, _: UdpCap, socket: Service::UdpSocket) {
+        self.service.udp_close(socket);
     }
 }
 
@@ -473,9 +469,7 @@ mod tests {
             core::future::ready(Ok(()))
         }
 
-        fn udp_close(&self, _: Self::UdpSocket) -> impl Future<Output = ()> + Send + '_ {
-            core::future::ready(())
-        }
+        fn udp_close(&self, _: Self::UdpSocket) {}
     }
 
     #[test]

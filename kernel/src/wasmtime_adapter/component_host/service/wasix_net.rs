@@ -1497,7 +1497,7 @@ fn wasix_socket_backend_handle(
             Some(WasixSocketBackendHandle::TcpListener(*listener))
         }
         WasixSocketDescriptor::Udp(WasixUdpSocket::Bound { socket, .. }) => {
-            Some(WasixSocketBackendHandle::UdpSocket(*socket))
+            Some(WasixSocketBackendHandle::UdpSocket(socket.id()))
         }
         WasixSocketDescriptor::Tcp(
             WasixTcpSocket::Unconnected { .. } | WasixTcpSocket::Bound { .. },
@@ -1682,7 +1682,7 @@ where
             }
             *slot = WasixUdpSocket::Bound {
                 family,
-                socket: binding.socket,
+                socket: WasixOwnedUdpSocket::new(service.clone(), binding.socket),
                 local_port: binding.local_port,
                 options,
             };
@@ -2037,7 +2037,7 @@ where
                 Err(errno) => return errno,
             };
             let timeout = wasix_effective_socket_timeout(options.receive_timeout, fdflags);
-            let datagram = match service.udp_receive(socket, capacity, timeout).await {
+            let datagram = match service.udp_receive(socket.id(), capacity, timeout).await {
                 Ok(Some(datagram)) => datagram,
                 Ok(None) => return p1::errno::AGAIN,
                 Err(error) => return p1_errno_from_udp_error_for_fdflags(error, fdflags),
@@ -2192,7 +2192,7 @@ where
             let (socket, send_timeout) = match socket {
                 WasixUdpSocket::Bound {
                     socket, options, ..
-                } => (socket, options.send_timeout),
+                } => (socket.id(), options.send_timeout),
                 WasixUdpSocket::Unbound { options, family } => {
                     let Some(service) = caller.data().runtime_state.network_service() else {
                         return p1::errno::NETDOWN;
@@ -2213,7 +2213,7 @@ where
                     };
                     *slot = WasixUdpSocket::Bound {
                         family,
-                        socket: binding.socket,
+                        socket: WasixOwnedUdpSocket::new(service.clone(), binding.socket),
                         local_port: binding.local_port,
                         options,
                     };
@@ -2225,7 +2225,7 @@ where
                     else {
                         return p1::errno::BADF;
                     };
-                    (*socket, options.send_timeout)
+                    (socket.id(), options.send_timeout)
                 }
             };
             let Some(service) = caller.data().runtime_state.network_service() else {

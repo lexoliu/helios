@@ -728,7 +728,7 @@ impl ComponentNetworkService for BenchNetworkService {
         Ok(())
     }
 
-    async fn udp_close(&self, _socket: Self::UdpSocket) {}
+    fn udp_close(&self, _socket: Self::UdpSocket) {}
 }
 
 impl Cpu for BenchCpu {

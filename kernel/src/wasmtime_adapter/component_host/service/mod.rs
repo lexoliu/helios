@@ -2654,7 +2654,7 @@ mod tests {
         let udp_bound =
             Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Bound {
                 family: WasixSocketFamily::Ipv4,
-                socket: 2,
+                socket: WasixOwnedUdpSocket::new(crate::test_support::test_network_service(), 2),
                 local_port: 5353,
                 options: WasixSocketOptions::default(),
             }));

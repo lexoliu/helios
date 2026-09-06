@@ -556,7 +556,11 @@ mod network {
 
     use crate::{ComponentNetworkService, SocketReadiness};
 
-    /// The streams a [`TestNetworkService`] has been asked to retire.
+    /// The handles a [`TestNetworkService`] has been asked to retire.
+    ///
+    /// TCP streams and UDP sockets get one of these each, because a
+    /// socket-lifetime test asserts on a count and the two protocols
+    /// number their handles independently.
     #[derive(Default)]
     pub(crate) struct TestClosedStreams {
         count: AtomicUsize,
@@ -581,6 +585,7 @@ mod network {
     #[derive(Clone, Default)]
     pub(crate) struct TestNetworkService {
         closed: Arc<TestClosedStreams>,
+        closed_udp: Arc<TestClosedStreams>,
     }
 
     impl TestNetworkService {
@@ -588,10 +593,16 @@ mod network {
             Self::default()
         }
 
-        /// The retirement log this service writes to, which is what a
-        /// socket-lifetime test asserts against.
+        /// The TCP retirement log this service writes to, which is
+        /// what a stream-lifetime test asserts against.
         pub(crate) fn closed(&self) -> Arc<TestClosedStreams> {
             self.closed.clone()
+        }
+
+        /// The UDP retirement log, kept apart from the TCP one so a
+        /// datagram-socket test counts only its own protocol.
+        pub(crate) fn closed_udp_sockets(&self) -> Arc<TestClosedStreams> {
+            self.closed_udp.clone()
         }
     }
 
@@ -865,11 +876,8 @@ mod network {
             core::future::ready(Ok(()))
         }
 
-        fn udp_close(
-            &self,
-            _: Self::UdpSocket,
-        ) -> impl core::future::Future<Output = ()> + Send + '_ {
-            core::future::ready(())
+        fn udp_close(&self, socket: Self::UdpSocket) {
+            self.closed_udp.record(socket);
         }
     }
 
@@ -1021,6 +1029,21 @@ pub(crate) fn recording_network_service() -> (
 ) {
     let service = TestNetworkService::new();
     let closed = service.closed();
+    (
+        crate::ComponentHostNetworkService::from_service(service),
+        closed,
+    )
+}
+
+/// The same again, paired with the log of the datagram sockets it
+/// retires.
+#[cfg(feature = "wasmtime-runtime")]
+pub(crate) fn recording_udp_network_service() -> (
+    crate::ComponentHostNetworkService,
+    triomphe::Arc<TestClosedStreams>,
+) {
+    let service = TestNetworkService::new();
+    let closed = service.closed_udp_sockets();
     (
         crate::ComponentHostNetworkService::from_service(service),
         closed,

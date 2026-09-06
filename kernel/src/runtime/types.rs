@@ -779,7 +779,9 @@ pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
         interface: Ipv4Address,
     ) -> impl Future<Output = Result<(), UdpError>> + Send + '_;
 
-    fn udp_close(&self, socket: Self::UdpSocket) -> impl Future<Output = ()> + Send + '_;
+    /// Retires a datagram socket. Synchronous because the owner that
+    /// ends a socket's life is a `Drop`, which cannot await.
+    fn udp_close(&self, socket: Self::UdpSocket);
 }
 
 pub trait ComponentNetworkState<Service>: Clone + Send + 'static
