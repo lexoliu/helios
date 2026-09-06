@@ -199,10 +199,21 @@ struct TcpPersistProbe {
     fin: bool,
 }
 
+/// One segment held aside until the hole in front of it is filled.
+///
+/// The payload is a `BytesMut` the socket owns outright, never the
+/// `Bytes` the caller passed in. Every payload reaching [`TcpSocket::on_segment`]
+/// is a slice of the frame the network driver handed up, so keeping it
+/// keeps one of the driver's receive buffers; a driver whose buffers are
+/// all parked in reassembly queues stops taking frames off its ring, and
+/// the retransmission that would fill the hole is the frame it stops
+/// taking. The contiguous path already copies out of the frame for the
+/// same reason (see `push_receive_segment_owned`), and the owning type
+/// here is what makes that rule hold for the out-of-order path too.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TcpOutOfOrderSegment {
     sequence: u32,
-    payload: Bytes,
+    payload: BytesMut,
 }
 
 // Hot TCP sockets should pay for the state they actually touch, not for every
@@ -2476,7 +2487,7 @@ where
                 segment.sequence = self.receive_next;
             }
             let len = segment.payload.len();
-            self.push_receive_payload(segment.payload)
+            self.push_receive_payload(segment.payload.freeze())
                 .unwrap_or_else(|_| panic!("TCP receive queue reported full after capacity check"));
             self.receive_next = self
                 .receive_next
@@ -2573,8 +2584,15 @@ where
         if payload.is_empty() {
             return Ok(());
         }
-        // payload is already an owning Bytes — slice or copied into
-        // by the caller. No further copy at the segment boundary.
+        // Take the bytes out of the frame they arrived in, exactly as
+        // `push_receive_segment_owned` does on the contiguous path:
+        // `try_into_mut` keeps a buffer this socket already owns, and a
+        // slice of a driver frame — which is what every fragment here is
+        // — is copied instead of parking the driver's receive buffer for
+        // as long as the hole lasts.
+        let payload = payload
+            .try_into_mut()
+            .unwrap_or_else(|shared| BytesMut::from(shared.as_ref()));
         let segment = TcpOutOfOrderSegment { sequence, payload };
         let len = segment.payload.len();
         self.out_of_order_mut().push(segment).map_err(|_| ())?;
@@ -5542,6 +5560,69 @@ mod tests {
             .pending_ack()
             .expect("out-of-order payload must request a duplicate ACK");
         assert_eq!(ack.acknowledgement, receive_next_before);
+    }
+
+    /// Out-of-order data must not keep the buffer the device filled.
+    ///
+    /// Every payload reaching `on_segment` is a slice of the frame the
+    /// driver handed up, so holding it holds one of the driver's
+    /// receive buffers. The in-order path already knows that and copies
+    /// (`push_receive_segment_owned`); the out-of-order queue stored the
+    /// caller's `Bytes` unchanged, so a hole in the sequence space
+    /// parked one device buffer per queued segment for as long as the
+    /// hole lasted.
+    #[test]
+    fn out_of_order_receive_payload_does_not_retain_the_device_buffer() {
+        struct TrackedBuffer {
+            bytes: [u8; 3],
+            released: alloc::sync::Arc<core::sync::atomic::AtomicBool>,
+        }
+
+        impl AsRef<[u8]> for TrackedBuffer {
+            fn as_ref(&self) -> &[u8] {
+                &self.bytes
+            }
+        }
+
+        impl Drop for TrackedBuffer {
+            fn drop(&mut self) {
+                self.released
+                    .store(true, core::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let released = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+        let mut socket = established_socket();
+        socket.mark_ack_queued();
+        let receive_next_before = socket.receive_next;
+        let payload = Bytes::from_owner(TrackedBuffer {
+            bytes: *b"def",
+            released: released.clone(),
+        });
+
+        let _ = socket.on_segment(
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: receive_next_before + 3,
+                acknowledgement: 8,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+                options: TcpOptions::empty(),
+                payload: b"def",
+            },
+            payload,
+            TCP_INITIAL_RTO_NANOS + 1,
+        );
+
+        assert_eq!(
+            socket.out_of_order_queued_bytes, 3,
+            "the segment itself must still be queued out of order"
+        );
+        assert!(
+            released.load(core::sync::atomic::Ordering::SeqCst),
+            "queuing a segment out of order must not hold the device buffer it arrived in"
+        );
     }
 
     #[test]
