@@ -332,10 +332,29 @@ struct RecordingInterfaceState {
     device: AtomicU64,
     /// Wakes whatever is parked on either counter.
     progress: crate::ProgressSignal,
+    /// Whether the transmit ring takes frames. A recording interface
+    /// refuses them by default so a test can read what the stack queued;
+    /// one built with [`RecordingNetworkInterface::accepting_transmissions`]
+    /// takes every frame and counts it instead.
+    accept_transmissions: bool,
+    /// Every frame the transmit ring took, headers and payload joined,
+    /// in the order it took them.
+    transmitted: spin::Mutex<alloc::vec::Vec<alloc::vec::Vec<u8>>>,
 }
 
 impl RecordingNetworkInterface {
     pub(crate) fn new(queue_pairs: usize) -> Self {
+        Self::with_transmit_policy(queue_pairs, false)
+    }
+
+    /// An interface whose transmit ring accepts every frame offered, so a
+    /// test can assert that a frame reached the device rather than that
+    /// it sat in the stack's outbound queue.
+    pub(crate) fn accepting_transmissions(queue_pairs: usize) -> Self {
+        Self::with_transmit_policy(queue_pairs, true)
+    }
+
+    fn with_transmit_policy(queue_pairs: usize, accept_transmissions: bool) -> Self {
         assert!(queue_pairs != 0, "an interface has at least one queue pair");
         Self {
             inner: Arc::new(RecordingInterfaceState {
@@ -345,8 +364,16 @@ impl RecordingNetworkInterface {
                     .collect(),
                 device: AtomicU64::new(0),
                 progress: crate::ProgressSignal::new(),
+                accept_transmissions,
+                transmitted: spin::Mutex::new(alloc::vec::Vec::new()),
             }),
         }
+    }
+
+    /// The frames the transmit ring has taken since the interface was
+    /// built, each with its scatter payload appended to its headers.
+    pub(crate) fn transmitted_frames(&self) -> alloc::vec::Vec<alloc::vec::Vec<u8>> {
+        self.inner.transmitted.lock().clone()
     }
 
     /// Puts a frame in one queue pair's receive ring, where the next
@@ -459,9 +486,20 @@ impl helios_netstack::NetworkInterface for RecordingNetworkInterface {
     fn try_transmit_scatter_immediate_on(
         &self,
         _: usize,
-        _: &[helios_netstack::TxFrameRef<'_>],
+        frames: &[helios_netstack::TxFrameRef<'_>],
     ) -> helios_hal::io::IoResult<Option<usize>> {
-        Ok(Some(0))
+        if !self.inner.accept_transmissions {
+            return Ok(Some(0));
+        }
+        let mut transmitted = self.inner.transmitted.lock();
+        for frame in frames {
+            let mut bytes = frame.bytes.to_vec();
+            if let Some(payload) = frame.payload {
+                bytes.extend_from_slice(payload);
+            }
+            transmitted.push(bytes);
+        }
+        Ok(Some(frames.len()))
     }
 
     fn reclaim_transmit_completions_immediate_on(

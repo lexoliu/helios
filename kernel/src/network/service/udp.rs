@@ -294,6 +294,12 @@ where
             .shard_at(self.receiving_shard_idx())
             .lock()
             .try_send_udp(socket, destination, port, bytes, now)?;
+        // Queuing the datagram puts it in the shard's outbound queue and
+        // raises no signal, so the sender publishes it to the device on
+        // its own task rather than leaving it for the packet pump, whose
+        // idle park would hold it for a second (#181, the UDP twin of
+        // #158's TCP write).
+        self.drive_udp().await?;
         Ok(u64::try_from(written).unwrap_or_else(|_| panic!("udp write length exceeds u64")))
     }
 

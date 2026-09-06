@@ -2643,6 +2643,61 @@ mod tests {
     /// the shard's outbound queue, with no poll, no timer and no pump
     /// in the test at all.
     #[test]
+    fn a_udp_send_puts_its_datagram_on_the_device() {
+        // A datagram that only reaches the shard's outbound queue waits
+        // for the packet pump, and an idle pump parks for a second; the
+        // sender has to publish it to the device itself (#181).
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let device = RecordingNetworkInterface::accepting_transmissions(1);
+        let service = test_network_service_on(device.clone());
+        let state = &service.inner.state;
+        let owner = super::DEFAULT_SHARD_IDX;
+
+        let socket = {
+            let mut shard = state.shard_at(owner).lock();
+            shard.stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+            shard.stack.learn_neighbor(NeighborEntry {
+                ip: IpAddress::Ipv4(peer),
+                mac: PEER_MAC,
+                state: NeighborState::Reachable,
+                updated_at: StackInstant::from_nanos(0),
+            });
+            service.inner.control.publish_from_shard(&shard);
+            bind_udp(&mut shard, FIRST_TEST_UDP_SLOT, 4040)
+        };
+
+        let sent = block_on(service.udp_send_address(
+            socket,
+            NetworkIpAddress::Ipv4(map_ipv4_address(peer)),
+            53,
+            b"hello",
+            u64::MAX,
+        ))
+        .expect("a five-byte datagram to a reachable neighbour should send");
+
+        assert_eq!(sent, 5);
+        let datagram = device.transmitted_frames().into_iter().find_map(|frame| {
+            let ethernet = EthernetFrame::parse(&frame)?;
+            let ipv4 = Ipv4Packet::parse(ethernet.payload)?;
+            if ipv4.protocol != IpProtocol::Udp {
+                return None;
+            }
+            let udp = UdpPacket::parse(ipv4.payload)?;
+            (udp.destination_port == 53).then(|| udp.payload.to_vec())
+        });
+        assert_eq!(
+            datagram.as_deref(),
+            Some(&b"hello"[..]),
+            "the datagram stayed in the outbound queue instead of reaching the device"
+        );
+        assert!(
+            state.shard_at(owner).lock().stack.take_outbound().is_none(),
+            "nothing should be left queued once the send returned"
+        );
+    }
+
+    #[test]
     fn a_completed_tcp_write_leaves_its_payload_on_the_wire() {
         /// The `tcp-latency` request: sixteen bytes, which every
         /// congestion window and send queue has room for.
@@ -2913,14 +2968,14 @@ mod tests {
     /// frames, which is all the wait needs.
     fn test_network_service()
     -> super::NetworkService<TestCpu, TestRuntimeState, RecordingNetworkInterface> {
+        test_network_service_on(RecordingNetworkInterface::new(1))
+    }
+
+    fn test_network_service_on(
+        device: RecordingNetworkInterface,
+    ) -> super::NetworkService<TestCpu, TestRuntimeState, RecordingNetworkInterface> {
         let cpu = TestCpu::without_entropy();
-        let device = RecordingNetworkInterface::new(1);
-        super::NetworkService::new(
-            cpu,
-            TestRuntimeState,
-            crate::Timer::new(cpu),
-            device.clone(),
-        )
+        super::NetworkService::new(cpu, TestRuntimeState, crate::Timer::new(cpu), device)
     }
 
     /// #131: the interface event a park races has to be marked before
