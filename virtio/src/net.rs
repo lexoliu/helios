@@ -773,7 +773,7 @@ struct NetControlState<T: VirtioTransport> {
     ack_buffer: Box<[u8]>,
 }
 
-pub use helios_netstack::RxFrame;
+pub use helios_netstack::{RxDrain, RxFrame};
 
 // SAFETY: each `NetQueuePair`'s RX/TX state is independently
 // synchronised by its own async / spin lock; `control` follows the
@@ -1734,27 +1734,36 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
     /// first. The index is normalized like the TX pair entry points, so
     /// a caller indexing by processor still lands on a real pair when
     /// the device has fewer pairs than the machine has processors.
+    ///
+    /// A chain this driver refuses ends the drain, but it does not
+    /// discard it: the frames already taken off the ring travel back in
+    /// the [`RxDrain`] beside the error, because they are the caller's
+    /// from the moment they leave the used ring and nothing can put
+    /// them back.
     pub fn try_receive_frames_immediate_on_pair(
         &self,
         pair_idx: usize,
         frames: &mut [Option<RxFrame>],
-    ) -> IoResult<Option<usize>> {
+    ) -> Option<RxDrain> {
         let pair_idx = self.normalize_pair_idx(pair_idx);
-        let Some(mut state) = self.queue_pairs[pair_idx].rx_state.try_lock() else {
-            return Ok(None);
-        };
-        self.drain_returned_rx_buffers(pair_idx, &mut state)?;
+        let mut state = self.queue_pairs[pair_idx].rx_state.try_lock()?;
+        if let Err(error) = self.drain_returned_rx_buffers(pair_idx, &mut state) {
+            return Some(RxDrain::refused(0, error));
+        }
         let mut received = 0usize;
         while received < frames.len() {
-            let Some(frame) = self.receive_next_frame(pair_idx, &mut state)? else {
-                break;
-            };
-            let slot = &mut frames[received];
-            assert!(slot.is_none(), "virtio net RX batch slot was not empty");
-            *slot = Some(frame);
-            received += 1;
+            match self.receive_next_frame(pair_idx, &mut state) {
+                Ok(Some(frame)) => {
+                    let slot = &mut frames[received];
+                    assert!(slot.is_none(), "virtio net RX batch slot was not empty");
+                    *slot = Some(frame);
+                    received += 1;
+                }
+                Ok(None) => break,
+                Err(error) => return Some(RxDrain::refused(received, error)),
+            }
         }
-        Ok(Some(received))
+        Some(RxDrain::completed(received))
     }
 
     /// Takes the next completed frame off a receive ring, assembling a
@@ -1787,13 +1796,12 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         }
         let slot = &self.queue_pairs[pair_idx].rx_slots[usize::from(slot_index)];
         let header = RxHeader::parse(&slot.buffer()[..self.header_len], self.header_len);
-        let offload = match self.rx_offload(header) {
-            Ok(offload) => offload,
-            Err(error) => {
-                self.repost_rx_buffer(pair_idx, state, slot_index)?;
-                return Err(error);
-            }
-        };
+        // How many used entries this frame owns is settled before
+        // anything else the header says, because it is what lets a
+        // refusal below give the whole chain back rather than the head
+        // alone. A `num_buffers` of zero names no chain at all, so that
+        // one reposts the head by itself, like a head whose length made
+        // the header unreadable.
         let buffers = if self.mergeable_rx_buffers {
             usize::from(header.num_buffers)
         } else {
@@ -1803,6 +1811,13 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             self.repost_rx_buffer(pair_idx, state, slot_index)?;
             return Err(IoError::DeviceFault);
         }
+        let offload = match self.rx_offload(header) {
+            Ok(offload) => offload,
+            Err(error) => {
+                self.refuse_rx_chain(pair_idx, state, slot_index, buffers - 1)?;
+                return Err(error);
+            }
+        };
         if buffers == 1 {
             // The frame stays in the receive slot it landed in: the
             // handle keeps that slot out of the free list until the
@@ -1864,7 +1879,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         assembly[..assembled].copy_from_slice(&head_slot.buffer()[self.header_len..head.used_len]);
         self.repost_rx_buffer_deferred(pair_idx, state, head.slot)?;
         let mut expected_position = head.position;
-        for _ in 1..buffers {
+        for index in 1..buffers {
             expected_position += 1;
             let Some((token, used_len)) = state.rx_queue.pop_used_with_len() else {
                 state.rx_queue.publish();
@@ -1879,7 +1894,10 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
                     .checked_add(used_len)
                     .is_some_and(|end| end <= self.max_receive_frame_len);
             if position != expected_position || !fits {
-                self.repost_rx_buffer(pair_idx, state, slot_index)?;
+                // The chain is refused whole: this buffer goes back
+                // together with the `buffers - 1 - index` tails still
+                // sitting behind it in the used ring.
+                self.refuse_rx_chain(pair_idx, state, slot_index, buffers - 1 - index)?;
                 return Err(IoError::DeviceFault);
             }
             // Only the head buffer of a mergeable chain carries the
@@ -1891,6 +1909,48 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         state.rx_queue.publish();
         state.rx_queue.notify(&self.transport);
         Ok(assembled)
+    }
+
+    /// Gives a refused mergeable chain back to the device whole: the
+    /// buffer the refusal stopped on, and the `tails` used entries the
+    /// device published behind it.
+    ///
+    /// A chain is consumed whole or refused whole. Only the head buffer
+    /// of a chain carries a virtio-net header, and `num_buffers` in it
+    /// is the only thing that says how many used entries the frame
+    /// owns. A refusal that reposts its own buffer alone therefore
+    /// leaves the rest of the chain in the used ring, and the next
+    /// drain pops one of those tails and treats it as a head:
+    /// `RxHeader::parse` reads frame payload as a header, so
+    /// `num_buffers`, `flags` and `gso_type` all come out of arbitrary
+    /// bytes and the drain either faults again or stitches a chain
+    /// together out of unrelated frames. One refused chain of N buffers
+    /// becomes N-1 further refusals. Draining the tails here is what
+    /// leaves the next drain looking at a real head.
+    ///
+    /// The tails go back unread: the frame is already lost, and the
+    /// only thing left to get right is the ring. A tail the device has
+    /// not published yet ends the walk — the device still owns that
+    /// buffer, so there is nothing to hand back and nothing this drain
+    /// can do about it.
+    fn refuse_rx_chain(
+        &self,
+        pair_idx: usize,
+        state: &mut NetRxState<T>,
+        refused_slot: u16,
+        tails: usize,
+    ) -> IoResult<()> {
+        self.repost_rx_buffer_deferred(pair_idx, state, refused_slot)?;
+        for _ in 0..tails {
+            let Some((token, _)) = state.rx_queue.pop_used_with_len() else {
+                break;
+            };
+            let (slot_index, _) = Self::complete_rx_slot(state, token);
+            self.repost_rx_buffer_deferred(pair_idx, state, slot_index)?;
+        }
+        state.rx_queue.publish();
+        state.rx_queue.notify(&self.transport);
+        Ok(())
     }
 
     /// Translates the device's per-frame receive header into the
@@ -2592,11 +2652,19 @@ mod tests {
 
         fn receive(&self) -> Result<Option<RxFrame>, helios_hal::io::IoError> {
             let mut frames = [const { None }; 1];
-            let received = self
+            let drain = self
                 .device
-                .try_receive_frames_immediate_on_pair(0, &mut frames)?
+                .try_receive_frames_immediate_on_pair(0, &mut frames)
                 .expect("the receive ring is uncontended in tests");
-            assert!(received <= 1);
+            assert!(drain.received <= 1);
+            if let Some(error) = drain.refusal {
+                assert_eq!(
+                    drain.received, 0,
+                    "a one-frame drain stops on its first frame, so a refusal \
+                     it reports carries none"
+                );
+                return Err(error);
+            }
             Ok(frames[0].take())
         }
     }
@@ -3019,6 +3087,97 @@ mod tests {
             .expect("a well-formed chain is accepted")
             .expect("the chain the exhausted drain left in the ring is delivered next");
         assert_eq!(frame.bytes.len(), head.len() + tail.len());
+    }
+
+    /// A chain refused on its head's offload metadata takes its tail
+    /// buffers with it, so the next drain starts at a real head.
+    ///
+    /// The head is where `num_buffers` lives, so a refusal that reposts
+    /// it alone leaves the tails in the used ring for the next drain to
+    /// parse as heads — frame payload read as a virtio-net header,
+    /// which is either another fault or a chain assembled out of
+    /// unrelated buffers.
+    #[test]
+    fn a_chain_refused_for_its_offload_gives_its_tail_back() {
+        let harness = NetHarness::new(RECEIVE_OFFLOAD_FEATURES);
+        let refused_head = vec![0x71_u8; 4000];
+        let refused_tail = vec![0x72_u8; 1000];
+
+        // virtio 1.2 §5.1.6.1: a frame is either partially checksummed
+        // or validated, never both. The driver refuses this one on the
+        // header alone, before a byte of it is copied — and by then it
+        // knows the chain is two buffers long.
+        harness.complete_chain(
+            0,
+            RxDeviceHeader {
+                flags: VIRTIO_NET_HDR_F_NEEDS_CSUM | VIRTIO_NET_HDR_F_DATA_VALID,
+                ..RxDeviceHeader::default()
+            },
+            &[&refused_head, &refused_tail],
+        );
+        expect_device_fault(harness.receive());
+
+        let head = vec![0x73_u8; 4000];
+        let tail = vec![0x74_u8; 1000];
+        harness.complete_chain(2, RxDeviceHeader::default(), &[&head, &tail]);
+        let frame = harness
+            .receive()
+            .expect("the refused chain left a real head at the front of the used ring")
+            .expect("the well-formed chain behind a refused one is delivered by the next drain");
+        assert_eq!(frame.bytes.len(), head.len() + tail.len());
+        assert_eq!(&frame.bytes[..head.len()], &head[..]);
+        assert_eq!(&frame.bytes[head.len()..], &tail[..]);
+    }
+
+    /// The same for a chain refused midway, on a tail the device posted
+    /// out of order: the tails behind the offending buffer go back with
+    /// it.
+    #[test]
+    fn a_chain_refused_on_a_misplaced_tail_gives_the_rest_back() {
+        let harness = NetHarness::new(RECEIVE_OFFLOAD_FEATURES);
+        assert!(
+            harness.device.queue_pairs[0].rx_slots.len() >= 6,
+            "the test needs a three-buffer chain with a gap in it, then a pair more"
+        );
+        let refused_head = vec![0x81_u8; 4000];
+        let refused_tail = vec![0x82_u8; 1000];
+
+        // A head claiming three buffers, followed by two tails the
+        // device completed out of the buffers *after* the one the head
+        // named: the first tail's available-ring position is two past
+        // the head's rather than one, which is a chain this driver
+        // cannot reconstruct.
+        harness.complete_rx(
+            0,
+            DeviceRxBuffer {
+                header: Some(RxDeviceHeader {
+                    num_buffers: 3,
+                    ..RxDeviceHeader::default()
+                }),
+                payload: &refused_head,
+            },
+        );
+        for token in [2, 3] {
+            harness.complete_rx(
+                token,
+                DeviceRxBuffer {
+                    header: None,
+                    payload: &refused_tail,
+                },
+            );
+        }
+        expect_device_fault(harness.receive());
+
+        let head = vec![0x83_u8; 4000];
+        let tail = vec![0x84_u8; 1000];
+        harness.complete_chain(4, RxDeviceHeader::default(), &[&head, &tail]);
+        let frame = harness
+            .receive()
+            .expect("the refused chain left a real head at the front of the used ring")
+            .expect("the well-formed chain behind a refused one is delivered by the next drain");
+        assert_eq!(frame.bytes.len(), head.len() + tail.len());
+        assert_eq!(&frame.bytes[..head.len()], &head[..]);
+        assert_eq!(&frame.bytes[head.len()..], &tail[..]);
     }
 
     /// The per-frame checksum report is what the stack decides trust

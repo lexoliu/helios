@@ -930,12 +930,18 @@ where
     /// ring before it looks at anyone else's, and a pair another
     /// processor already holds is skipped by the device's `try_lock` —
     /// that processor is draining it and this poll has nothing to add.
-    /// `Ok(None)` means every pair was held, which is the same "come
-    /// back later" a single-pair drain reports.
-    fn receive_frames_immediate(
-        &self,
-        frames: &mut [Option<RxFrame>],
-    ) -> Result<Option<usize>, IoError> {
+    /// `None` means every pair was held, which is the same "come back
+    /// later" a single-pair drain reports.
+    ///
+    /// A pair that refuses ends the sweep, and the refusal travels back
+    /// beside the frames the sweep had already collected rather than in
+    /// place of them. Those frames are off the ring and no used entry
+    /// can be put back, so dropping them to report the error costs up
+    /// to a whole batch of good frames per malformed chain and makes
+    /// the peer retransmit data the guest did receive. The refusal is
+    /// counted against the pair that produced it here, because this is
+    /// the last place that knows which pair that was.
+    fn receive_frames_immediate(&self, frames: &mut [Option<RxFrame>]) -> Option<RxDrain> {
         let pair_count = self.inner.device.queue_pair_count().max(1);
         let local_pair = usize::from(self.inner.cpu.current_processor().id()) % pair_count;
         let mut received = 0usize;
@@ -944,20 +950,24 @@ where
             if received >= frames.len() {
                 break;
             }
-            let Some(batch) = self
+            let Some(drain) = self
                 .inner
                 .device
-                .try_receive_frames_immediate_on(pair_idx, &mut frames[received..])?
+                .try_receive_frames_immediate_on(pair_idx, &mut frames[received..])
             else {
                 continue;
             };
             drained_a_pair = true;
-            received += batch;
+            received += drain.received;
+            if let Some(refusal) = drain.refusal {
+                self.inner.state.record_receive_device_refusal(pair_idx);
+                return Some(RxDrain::refused(received, refusal));
+            }
         }
         if !drained_a_pair {
-            return Ok(None);
+            return None;
         }
-        Ok(Some(received))
+        Some(RxDrain::completed(received))
     }
 
     pub(super) async fn poll_network_once_with_tcp_read(
@@ -1019,10 +1029,11 @@ where
             let receive_limit = remaining_rx_budget.min(NETWORK_RX_BATCH_FRAMES);
             let mut frames: [Option<RxFrame>; NETWORK_RX_BATCH_FRAMES] =
                 core::array::from_fn(|_| None);
-            let received_batch = match self
-                .receive_frames_immediate(&mut frames[..receive_limit])?
-            {
-                Some(received_batch) => received_batch,
+            let RxDrain {
+                received: received_batch,
+                refusal,
+            } = match self.receive_frames_immediate(&mut frames[..receive_limit]) {
+                Some(drain) => drain,
                 None => {
                     let mut received_batch = 0usize;
                     for frame in &mut frames[..receive_limit] {
@@ -1033,10 +1044,14 @@ where
                         *frame = Some(received_frame);
                         received_batch += 1;
                     }
-                    received_batch
+                    RxDrain::completed(received_batch)
                 }
             };
-            if received_batch == 0 {
+            // A refused drain still falls through the demux below, so
+            // the frames it did take reach their shards and their
+            // receive slots go back to the device before the error is
+            // reported at the bottom of the iteration.
+            if received_batch == 0 && refusal.is_none() {
                 break;
             }
 
@@ -1099,6 +1114,14 @@ where
                 for frame in &mut frames[..received_batch] {
                     drop(frame.take());
                 }
+            }
+
+            // The drain that produced this batch was refused. Its
+            // frames have reached their shards and their receive slots
+            // are back with the device, so the error is what is left to
+            // report.
+            if let Some(refusal) = refusal {
+                return Err(refusal);
             }
         }
         self.record_network_profile_events_bytes(

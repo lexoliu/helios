@@ -329,13 +329,24 @@ pub(crate) struct RecordingNetworkInterface {
     inner: Arc<RecordingInterfaceState>,
 }
 
+/// What one queue pair hands the next drain, in the order the device
+/// produced it.
+enum PendingReceive {
+    /// A frame the drain takes off the ring.
+    Frame(helios_netstack::RxFrame),
+    /// A completion the driver refuses. The drain stops there and
+    /// reports the error beside the frames it has already taken, which
+    /// is what a virtio-net chain this driver cannot reconstruct does.
+    Refusal(helios_hal::io::IoError),
+}
+
 struct RecordingInterfaceState {
     /// Events each queue pair has reported.
     queues: alloc::vec::Vec<AtomicU64>,
-    /// Frames each queue pair is holding for the next drain, in arrival
+    /// What each queue pair is holding for the next drain, in arrival
     /// order. A test that wants to prove the kernel takes a frame off
     /// the device has to put one there first.
-    pending: alloc::vec::Vec<spin::Mutex<alloc::collections::VecDeque<helios_netstack::RxFrame>>>,
+    pending: alloc::vec::Vec<spin::Mutex<alloc::collections::VecDeque<PendingReceive>>>,
     /// Events reported that belong to no queue pair.
     device: AtomicU64,
     /// Wakes whatever is parked on either counter.
@@ -389,9 +400,20 @@ impl RecordingNetworkInterface {
     pub(crate) fn deliver_on(&self, queue_idx: usize, frame: &[u8]) {
         self.inner.pending[queue_idx]
             .lock()
-            .push_back(helios_netstack::RxFrame::new(
+            .push_back(PendingReceive::Frame(helios_netstack::RxFrame::new(
                 bytes::Bytes::copy_from_slice(frame),
-            ));
+            )));
+        self.complete_on(queue_idx);
+    }
+
+    /// Puts a completion the driver refuses behind whatever one queue
+    /// pair is already holding, so a test can drain a batch of good
+    /// frames into a refusal the way a malformed mergeable chain
+    /// arrives behind good ones.
+    pub(crate) fn refuse_on(&self, queue_idx: usize, error: helios_hal::io::IoError) {
+        self.inner.pending[queue_idx]
+            .lock()
+            .push_back(PendingReceive::Refusal(error));
         self.complete_on(queue_idx);
     }
 
@@ -458,20 +480,25 @@ impl helios_netstack::NetworkInterface for RecordingNetworkInterface {
         &'a self,
         queue_idx: usize,
         slots: &'slots mut [Option<helios_netstack::RxFrame>],
-    ) -> helios_hal::io::IoResult<Option<usize>>
+    ) -> Option<helios_netstack::RxDrain>
     where
         'a: 'slots,
     {
         let mut pending = self.inner.pending[queue_idx].lock();
-        let mut taken = 0;
+        let mut received = 0;
         for slot in slots.iter_mut() {
-            let Some(frame) = pending.pop_front() else {
-                break;
-            };
-            *slot = Some(frame);
-            taken += 1;
+            match pending.pop_front() {
+                Some(PendingReceive::Frame(frame)) => {
+                    *slot = Some(frame);
+                    received += 1;
+                }
+                Some(PendingReceive::Refusal(error)) => {
+                    return Some(helios_netstack::RxDrain::refused(received, error));
+                }
+                None => break,
+            }
         }
-        Ok(Some(taken))
+        Some(helios_netstack::RxDrain::completed(received))
     }
 
     fn repost_rx_frame<'a>(

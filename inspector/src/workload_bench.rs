@@ -1370,14 +1370,16 @@ async fn write_guest_network_counters(
                 for queue in network.queues {
                     let _ = writeln!(
                         sink,
-                        "shard {} rx={} tx={} irq={} refused={} sockets={} shut-sockets={} \
-                         window-bytes={} queued={} ooo={} peer-rexmit={} dup-acks={} \
-                         pool-stalls={} pool-free={} acks={} window-updates={} retransmits={}",
+                        "shard {} rx={} tx={} irq={} refused={} device-refused={} \
+                         sockets={} shut-sockets={} window-bytes={} queued={} ooo={} \
+                         peer-rexmit={} dup-acks={} pool-stalls={} pool-free={} acks={} \
+                         window-updates={} retransmits={}",
                         queue.id,
                         queue.rx_frames,
                         queue.tx_frames,
                         queue.interrupts,
                         queue.rx_refused_frames,
+                        queue.rx_device_refusals,
                         queue.tcp_sockets,
                         queue.tcp_receive_backpressured_sockets,
                         queue.tcp_receive_window_bytes,

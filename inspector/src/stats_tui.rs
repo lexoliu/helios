@@ -733,11 +733,12 @@ fn draw_network_panel(frame: &mut ratatui::Frame<'_>, area: Rect, sample: &stats
                             Style::default().fg(Color::Cyan),
                         ),
                         Span::raw(format!(
-                            "{} rx  {} tx  {} irq  {} refused",
+                            "{} rx  {} tx  {} irq  {} refused  {} dev-refused",
                             queue.rx_frames,
                             queue.tx_frames,
                             queue.interrupts,
-                            queue.rx_refused_frames
+                            queue.rx_refused_frames,
+                            queue.rx_device_refusals
                         )),
                     ]),
                     Line::from(vec![
