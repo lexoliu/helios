@@ -222,6 +222,15 @@ property of every kernel and `hal/` subsystem, never a follow-up.
 - Words written by different processors live on different cache lines
   (`crossbeam_utils::CachePadded`, sized per target), and a structure's
   docs say which processor writes each padded block.
+- A lock that an interrupt handler can reach (an allocator, a frame pool,
+  anything `Notify::notify_all` or a waker can touch) masks the local
+  processor's interrupts for as long as it is held, through
+  `IrqSafeMutex` in `kernel/src/memory/` and the
+  `hal::critical_section::LocalInterruptMask` it rests on. Cross-processor
+  exclusion stays the lock's own spin word; a machine-wide
+  `critical_section` around a lock that already has one is contention, not
+  safety, and is reserved for state only one processor may touch at a
+  time (an interrupt controller register, a PCI configuration cycle).
 - Hardware the target already has (XSAVE and AVX, MWAIT, cache-coherent I/O,
   GICv3) is brought up properly rather than avoided because its setup is
   SMP-aware.
@@ -236,11 +245,18 @@ riscv64 lanes are functional checks under TCG and never a performance
 surface. GitHub's Arm runners expose no KVM, and macOS runners are not used
 (§7).
 
-Capture a baseline before any change that affects kernel-side runtime
-performance, compare after, and cite the medians and any regression in the
-PR. Baseline logs live under `target/perf-baselines/` and are not committed.
-A developer laptop is not a benchmark host: take numbers from the CI lane or
-a dedicated machine.
+Capture a baseline before any change that touches a kernel hot path,
+correctness fixes included, compare after, and cite the medians and any
+regression in the PR. Baseline logs live under `target/perf-baselines/` and
+are not committed. A developer laptop is not a benchmark host: take numbers
+from the CI lane or a dedicated machine.
+
+Two runs of the lane are not a comparison: the runner's CPU model changes
+from run to run. The paired mode of `bench-suite.yml` (`baseline_ref`, or
+`--profile-use` for a build-kind pair) boots both images in one job on one
+host, reports the noise floor, and carries the compute control, and it is
+the instrument for any before/after claim. A PR cites the paired run and
+job ids and the control row beside its medians.
 
 The canonical compute workload is the in-kernel compiler plugin compiling a
 fixed wasm input. The regression target is the median `elapsed_ms` over
@@ -259,8 +275,10 @@ never touches the NIC. The canonical network workload is `tcp-throughput` on
 a multi-queue tap backend; slirp (`user`) is single-queue with no offload and
 is not evidence for anything the virtio-net driver negotiates. Cite the
 `virtio-net online` boot line beside the median: it records the queue-pair
-count and the checksum and TSO bits the run actually had. `docs/networking.md`
-covers the backends and the privileged setup.
+count and the checksum and TSO bits the run actually had. The lane boots one
+guest per workload class and prints the line for each; the one to cite is
+the boot that ran the workload being measured. `docs/networking.md` covers
+the backends and the privileged setup.
 
 ```bash
 helios-inspector vm net-setup \
@@ -450,8 +468,9 @@ changelog by hand.
   Commit messages and PR bodies carry no attribution trailers, generated-by
   footers, or session identifiers.
 - A PR merges when every check it can affect is green. A red lane that is
-  already red on `dev` and untouched by the PR gets its own issue, is named
-  in the PR body, and does not block. Evidence in the PR body is concrete:
+  already red on `dev` and untouched by the PR is named in the PR body with
+  the issue that tracks it (filed by the PR if none exists yet) and does not
+  block. Evidence in the PR body is concrete:
   the run id, the lane, the median, the negotiated feature line, the log
   line that proved the diagnosis.
 - A change to the Wasmtime fork, to a CI runner or lane, to this file, or to
@@ -481,7 +500,11 @@ them from colliding:
   minutes is a defect signal: shorten the loop rather than wait longer.
 - Every ordinary PR is one issue, one branch, one delivery. An agent that
   finds a second problem while fixing the first files a new issue and cites
-  it, rather than widening the PR.
+  it, rather than widening the PR. The exception is a defect the PR cannot
+  be proven without (a broken job the PR's evidence has to run through, a
+  tool the PR's check needs): that fix rides in the PR, under its own issue
+  and its own commit, and the PR body names it as a repair rather than a
+  widening.
 - Scratch files are shared between the agents of one session. A file an
   agent writes outside its worktree carries its branch or PR number in its
   name, and a PR body or issue body is written from a file named that way,
