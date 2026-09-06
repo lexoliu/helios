@@ -203,6 +203,14 @@ mod tests {
             None
         }
 
+        /// A test runtime publishes no devices; the registry is empty
+        /// and every claim through it reports the device is not there.
+        fn device_grants(&self) -> &crate::device::DeviceGrantRegistry {
+            static EMPTY: crate::device::DeviceGrantRegistry =
+                crate::device::DeviceGrantRegistry::new();
+            &EMPTY
+        }
+
         fn profiling_enabled(&self) -> bool {
             false
         }

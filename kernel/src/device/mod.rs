@@ -44,8 +44,10 @@
 //! [`platform`], and no driver logic at all.
 
 mod grant;
+mod handle;
 mod interrupt;
 mod lease;
+mod owner;
 mod platform;
 mod registry;
 
@@ -53,11 +55,13 @@ pub use grant::{
     DeviceGrant, DeviceName, DmaBudget, GrantError, GrantInterrupt, MAX_DEVICE_NAME,
     MAX_GRANT_INTERRUPTS, MAX_GRANT_REGIONS,
 };
+pub use handle::{DmaBufferHandle, GrantHandle};
 pub use interrupt::{InterruptEvent, InterruptRelay, InterruptStats};
 pub use lease::{
     DEVICE_WINDOW_BYTES, DeviceWindow, DmaBuffer, GrantLease, GrantStats, MAX_DMA_BUFFERS,
     MappedRegion, PublishedDevice,
 };
+pub use owner::{DeviceOwnership, LinearMemory};
 pub use platform::{
     DeviceInterruptHooks, DeviceVmHooks, install_device_interrupt_hooks, install_device_vm_hooks,
 };
@@ -330,6 +334,102 @@ mod tests {
             lease.stats().interrupts.masked,
             1,
             "the delivery held the source off until the driver unmasks again"
+        );
+    }
+
+    /// An instance's window sits at the top of the reservation the
+    /// kernel gives every linear memory, so the memory it displaces is
+    /// memory a 32-bit instance could never address.
+    #[test]
+    fn the_window_sits_above_everything_the_instance_can_address() {
+        let mut ownership = super::DeviceOwnership::new();
+        assert!(
+            ownership.window().is_none(),
+            "an instance whose memory the runtime has not resolved has nowhere to put a device"
+        );
+
+        ownership.set_memory(super::LinearMemory {
+            base: VirtAddr::new(WINDOW_BASE),
+            reservation_bytes: RESERVATION_BYTES,
+        });
+
+        let window = ownership.window().expect("a resolved memory has a window");
+        assert_eq!(
+            window.offset(),
+            RESERVATION_BYTES - super::DEVICE_WINDOW_BYTES
+        );
+        assert_eq!(window.bytes(), super::DEVICE_WINDOW_BYTES);
+        assert!(
+            ownership.growth_limit().is_none(),
+            "an instance holding no device pays nothing for the path existing"
+        );
+    }
+
+    /// The cap exists so a `memory.grow` cannot land on a register
+    /// file, and it exists only while there is a register file to land
+    /// on.
+    #[test]
+    fn holding_a_device_caps_the_instance_s_growth_at_the_window() {
+        let registry = registry(&["test:alpha"]);
+        let mut ownership = super::DeviceOwnership::new();
+        ownership.set_memory(super::LinearMemory {
+            base: VirtAddr::new(WINDOW_BASE),
+            reservation_bytes: RESERVATION_BYTES,
+        });
+
+        ownership
+            .claim(&registry, "test:alpha")
+            .expect("the device is free");
+
+        assert_eq!(
+            ownership.growth_limit(),
+            Some(RESERVATION_BYTES - super::DEVICE_WINDOW_BYTES)
+        );
+        assert!(ownership.holds_device());
+
+        ownership.release();
+        assert!(ownership.growth_limit().is_none());
+        assert!(
+            registry.claim("test:alpha", window()).is_ok(),
+            "releasing gives the device back"
+        );
+    }
+
+    /// An instance that has already grown over the window cannot be
+    /// given a device: the mapping would land on memory it is using.
+    #[test]
+    fn an_instance_that_grew_over_the_window_cannot_be_given_a_device() {
+        let registry = registry(&["test:alpha"]);
+        let mut ownership = super::DeviceOwnership::new();
+        ownership.set_memory(super::LinearMemory {
+            base: VirtAddr::new(WINDOW_BASE),
+            reservation_bytes: RESERVATION_BYTES,
+        });
+        ownership.note_growth(RESERVATION_BYTES - super::DEVICE_WINDOW_BYTES + 1);
+
+        assert_eq!(
+            ownership.claim(&registry, "test:alpha"),
+            Err(GrantError::WindowExhausted)
+        );
+    }
+
+    /// A driver drives one device. A second claim would make reclaim
+    /// ambiguous, so it is refused rather than replacing the first.
+    #[test]
+    fn an_instance_holds_one_device_at_a_time() {
+        let registry = registry(&["test:alpha", "test:beta"]);
+        let mut ownership = super::DeviceOwnership::new();
+        ownership.set_memory(super::LinearMemory {
+            base: VirtAddr::new(WINDOW_BASE),
+            reservation_bytes: RESERVATION_BYTES,
+        });
+        ownership
+            .claim(&registry, "test:alpha")
+            .expect("the first device is free");
+
+        assert_eq!(
+            ownership.claim(&registry, "test:beta"),
+            Err(GrantError::AlreadyClaimed)
         );
     }
 

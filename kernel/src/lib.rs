@@ -63,11 +63,11 @@ pub use component::{
 };
 pub use device::{
     DEVICE_WINDOW_BYTES, DeviceGrant, DeviceGrantRegistry, DeviceInterruptHooks,
-    DeviceInterruptRoute, DeviceName, DeviceVmHooks, DeviceWindow, DmaBudget, DmaBuffer,
-    GrantError, GrantInterrupt, GrantLease, GrantStats, InterruptEvent, InterruptRelay,
-    InterruptStats, MAX_DEVICE_NAME, MAX_DMA_BUFFERS, MAX_GRANT_INTERRUPTS, MAX_GRANT_REGIONS,
-    MAX_GRANTS, MappedRegion, PublishedDevice, install_device_interrupt_hooks,
-    install_device_vm_hooks,
+    DeviceInterruptRoute, DeviceName, DeviceOwnership, DeviceVmHooks, DeviceWindow, DmaBudget,
+    DmaBuffer, DmaBufferHandle, GrantError, GrantHandle, GrantInterrupt, GrantLease, GrantStats,
+    InterruptEvent, InterruptRelay, InterruptStats, LinearMemory, MAX_DEVICE_NAME, MAX_DMA_BUFFERS,
+    MAX_GRANT_INTERRUPTS, MAX_GRANT_REGIONS, MAX_GRANTS, MappedRegion, PublishedDevice,
+    install_device_interrupt_hooks, install_device_vm_hooks,
 };
 pub use embedded::{
     EmbeddedComponent, EmbeddedInit, embedded_boot_component, embedded_init,

@@ -31,7 +31,7 @@ pub const MAX_DEVICE_NAME: usize = 64;
 /// Names are compared, never parsed: the kernel matches the name a
 /// driver asks for against the name discovery published and does not
 /// interpret either.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DeviceName(ArrayString<MAX_DEVICE_NAME>);
 
 impl DeviceName {

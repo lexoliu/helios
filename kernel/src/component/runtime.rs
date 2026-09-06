@@ -256,6 +256,13 @@ pub trait ComponentRuntimeState: Clone + Send + 'static {
     /// memory back before it condemns an instance.
     fn memory_balloon(&self) -> Option<crate::memory::BalloonHandle>;
 
+    /// The devices discovery is willing to hand to a user-mode driver.
+    ///
+    /// Empty on a machine whose backend found nothing outside the
+    /// hardware it drives itself, which is every machine until a
+    /// backend publishes a grant.
+    fn device_grants(&self) -> &crate::device::DeviceGrantRegistry;
+
     fn profiling_enabled(&self) -> bool;
 
     fn record_profile_stack_nanos(
@@ -308,6 +315,10 @@ where
     execution_context: ComponentExecutionContext<FileSystem>,
     serial_reader: crate::SerialReader,
     serial_writer: crate::DebugSerialWriter,
+    /// Where this instance's linear memory sits and the device it
+    /// holds, if any. Empty on every instance that never asks for one,
+    /// which is every instance that is not a driver.
+    pub device: crate::device::DeviceOwnership,
     /// Set by the runtime exit interface before the guest
     /// traps; the executor reads it to distinguish a clean requested
     /// exit (turn into an exit code) from an actual runtime error.
@@ -397,6 +408,7 @@ where
             ),
             serial_reader,
             serial_writer,
+            device: crate::device::DeviceOwnership::new(),
             requested_exit: None,
         }
     }

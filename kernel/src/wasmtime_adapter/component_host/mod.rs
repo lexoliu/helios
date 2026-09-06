@@ -75,6 +75,8 @@ fn lower_bytes_to_vec(bytes: Bytes) -> Vec<u8> {
     Vec::from(bytes)
 }
 
+mod device;
+pub(crate) use device::record_linear_memory;
 mod network;
 pub mod service;
 mod topology;
@@ -1596,6 +1598,7 @@ where
     add_net_to_linker(linker)?;
     vsock::add_vsock_to_linker::<vsock::DebuggerVsock, _, _>(linker)?;
     add_stats_to_linker(linker)?;
+    device::add_device_to_linker(linker)?;
     add_instances_to_linker(linker)?;
     add_tracing_to_linker(linker)?;
     add_profiling_to_linker(linker)?;
@@ -1785,6 +1788,7 @@ where
     add_net_to_program_linker(linker)?;
     vsock::add_vsock_to_linker::<vsock::ProgramVsock, _, _>(linker)?;
     add_stats_to_program_linker(linker)?;
+    device::add_device_to_linker(linker)?;
     add_tracing_to_program_linker(linker)?;
     Ok(())
 }

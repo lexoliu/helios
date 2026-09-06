@@ -881,6 +881,10 @@ where
         self.inner.balloon.get().cloned()
     }
 
+    fn device_grants(&self) -> &DeviceGrantRegistry {
+        RuntimeState::device_grants(self)
+    }
+
     fn profiling_enabled(&self) -> bool {
         RuntimeState::profiling_enabled(self)
     }

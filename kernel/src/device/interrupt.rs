@@ -31,13 +31,14 @@
 //! inspection and the park is not lost.
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::task::{Context, Poll};
 
 use arrayvec::ArrayVec;
 use concurrent_queue::ConcurrentQueue;
 
 use super::grant::{GrantError, GrantInterrupt, MAX_GRANT_INTERRUPTS};
 use super::platform::device_interrupt_hooks;
-use crate::Notify;
+use crate::{Notify, NotifyWaiter};
 
 /// One delivery of one of a granted device's interrupts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -175,6 +176,35 @@ impl InterruptRelay {
     /// The next delivery if one is already queued, without parking.
     pub fn try_next_event(&self) -> Option<InterruptEvent> {
         self.pending.pop().ok()
+    }
+
+    /// A wake-up registration armed against this relay's current state.
+    ///
+    /// A caller that polls rather than awaits — a stream that has to
+    /// hand each delivery to its reader — keeps one of these across
+    /// polls, which is what keeps it covered by the arm-before-test
+    /// discipline without rebuilding the registration each time.
+    pub fn waiter(&self) -> NotifyWaiter {
+        self.ready.waiter()
+    }
+
+    /// The next delivery, or `Pending` with `cx` registered to be woken
+    /// by the next one.
+    ///
+    /// Safe from any processor. The wake-up permit is banked, so a
+    /// delivery that lands between the queue being found empty and the
+    /// registration completing is not lost.
+    pub fn poll_event(
+        &self,
+        cx: &mut Context<'_>,
+        waiter: &mut NotifyWaiter,
+    ) -> Poll<InterruptEvent> {
+        loop {
+            if let Ok(event) = self.pending.pop() {
+                return Poll::Ready(event);
+            }
+            core::task::ready!(self.ready.poll_notified(cx, waiter));
+        }
     }
 
     /// Acknowledge the delivery of `index`: the owner has read whatever
