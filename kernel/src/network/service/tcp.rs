@@ -64,10 +64,9 @@ fn tcp_close_error(close: TcpCloseKind) -> Option<TcpError> {
     Some(TcpError { kind, detail })
 }
 
-impl<CpuImpl, Runtime, DeviceImpl> NetworkService<CpuImpl, Runtime, DeviceImpl>
+impl<CpuImpl, DeviceImpl> NetworkService<CpuImpl, DeviceImpl>
 where
     CpuImpl: Cpu + Clone,
-    Runtime: ComponentRuntimeState + Sync,
     DeviceImpl: NetworkDevice,
 {
     pub async fn tcp_connect(

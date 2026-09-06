@@ -6,8 +6,12 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use arrayvec::ArrayString;
 use helios_hal::cpu::HardwarePerfCounterDelta;
+use spin::Mutex;
+use triomphe::Arc;
 
 pub const DEFAULT_TRACE_HISTORY_CAPACITY: usize = 512;
 pub const DEFAULT_PROFILE_STACK_CAPACITY: usize = 1024;
@@ -130,6 +134,94 @@ pub struct TraceHistory {
     next_seq: u64,
     capacity: usize,
     events: VecDeque<(u64, TraceEvent)>,
+}
+
+/// The profile and perf histories a subsystem records into.
+///
+/// It is the whole of what a subsystem needs in order to be profiled,
+/// held apart from [`crate::RuntimeState`] so that a subsystem the
+/// runtime state itself owns can record into it. The network service is
+/// exactly that: the runtime state holds the service, and the service
+/// records its own phases, so a service that reached the histories
+/// through the runtime state would be a type that contains itself.
+///
+/// Every operation is callable from any processor: the enable flag is
+/// an atomic and each history is behind its own lock, taken for the
+/// length of one record.
+#[derive(Clone)]
+pub struct ProfileSink {
+    inner: Arc<ProfileSinkInner>,
+}
+
+struct ProfileSinkInner {
+    enabled: AtomicBool,
+    profiling: Mutex<ProfileHistory>,
+    perf_metrics: Mutex<PerfMetricHistory>,
+}
+
+impl ProfileSink {
+    pub fn new(profile_capacity: usize, perf_metric_capacity: usize) -> Self {
+        Self {
+            inner: Arc::new(ProfileSinkInner {
+                enabled: AtomicBool::new(false),
+                profiling: Mutex::new(ProfileHistory::new(profile_capacity)),
+                perf_metrics: Mutex::new(PerfMetricHistory::new(perf_metric_capacity)),
+            }),
+        }
+    }
+
+    /// Whether anything is recording. Every record path tests this
+    /// first, so a kernel that is not profiling pays one relaxed load.
+    pub fn enabled(&self) -> bool {
+        self.inner.enabled.load(Ordering::Acquire)
+    }
+
+    pub fn set_enabled(&self, enabled: bool) {
+        self.inner.enabled.store(enabled, Ordering::Release);
+    }
+
+    pub fn profiling(&self) -> &Mutex<ProfileHistory> {
+        &self.inner.profiling
+    }
+
+    pub fn perf_metrics(&self) -> &Mutex<PerfMetricHistory> {
+        &self.inner.perf_metrics
+    }
+
+    /// Records one folded stack, named by a prefix and a suffix so the
+    /// caller needs no allocation to name a phase.
+    pub fn record_profile_stack_parts_nanos(
+        &self,
+        scope: ProfileScope,
+        prefix: &str,
+        suffix: &str,
+        weight_nanos: u64,
+    ) {
+        if !self.enabled() {
+            return;
+        }
+        self.inner
+            .profiling
+            .lock()
+            .record_parts(scope, prefix, suffix, weight_nanos);
+    }
+
+    /// Records one perf sample under the same split name.
+    pub fn record_perf_metric_parts(
+        &self,
+        scope: ProfileScope,
+        prefix: &str,
+        suffix: &str,
+        sample: PerfSample,
+    ) {
+        if !self.enabled() {
+            return;
+        }
+        self.inner
+            .perf_metrics
+            .lock()
+            .record_parts(scope, prefix, suffix, sample);
+    }
 }
 
 #[derive(Debug)]

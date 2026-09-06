@@ -6,13 +6,16 @@
 //! lists kernel-side resource handles surfaced to wasm, `provider` holds
 //! the hand-off slots for interfaces served by kernel plugins, `runtime`
 //! and `runtime_backend` host the component lifecycle and per-call state,
-//! and `types` declares the component resource type aliases.
+//! and `types` declares the component resource type aliases, and
+//! `retire` carries the network handles of a socket resource that died
+//! without the service that minted them.
 
 mod cache;
 mod fs;
 mod fs_path;
 mod provider;
 mod resources;
+mod retire;
 mod runtime;
 mod runtime_backend;
 mod types;
@@ -34,6 +37,10 @@ pub use resources::{
     ComponentRawMutex, ComponentRawMutexGuard, ComponentRawRwLock, ComponentRawRwLockReadGuard,
     ComponentRawRwLockWriteGuard, ComponentSerialPort, ComponentTcpBackend, ComponentTcpStream,
     ComponentUdpBackend, ComponentUdpSocket,
+};
+pub use retire::{
+    RetiredNetworkHandle, SocketRetirementQueue, SocketRetirementSender, StoreSocketRetirement,
+    retire_queued_handles,
 };
 pub use runtime::{
     COMPONENT_ASYNC_STACK_SIZE, ComponentOutputMode, ComponentOutputRoute, ComponentOutputSink,

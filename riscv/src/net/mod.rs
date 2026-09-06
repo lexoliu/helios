@@ -22,7 +22,7 @@ type RiscvVirtioNetTransport = helios_virtio::VirtioMmioTransport<helios_virtio:
 type RiscvVirtioNetDevice = helios_virtio::VirtioNetDevice<RiscvVirtioNetTransport>;
 
 #[derive(Clone)]
-struct VirtioNetworkDevice {
+pub(crate) struct VirtioNetworkDevice {
     inner: Arc<RiscvVirtioNetDevice>,
     /// Held so the interrupt handler can steer by IPI.
     ///

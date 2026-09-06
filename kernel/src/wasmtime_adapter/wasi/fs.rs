@@ -1,20 +1,23 @@
 use super::*;
+use crate::ComponentHostNetwork;
 
-pub(super) struct ComponentFsProfile<CpuImpl, HostFs>
+pub(super) struct ComponentFsProfile<CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    pub(super) runtime_state: HostRuntimeState<CpuImpl, HostFs>,
+    pub(super) runtime_state: HostRuntimeState<CpuImpl, Net, HostFs>,
     pub(super) cpu: CpuImpl,
     pub(super) started_ticks: u64,
 }
 
-pub(super) fn component_fs_profile<CpuImpl, HostFs>(
-    store: &StoreData<CpuImpl, HostFs>,
-) -> Option<ComponentFsProfile<CpuImpl, HostFs>>
+pub(super) fn component_fs_profile<CpuImpl, Net, HostFs>(
+    store: &StoreData<CpuImpl, Net, HostFs>,
+) -> Option<ComponentFsProfile<CpuImpl, Net, HostFs>>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     store
@@ -27,11 +30,12 @@ where
         })
 }
 
-pub(super) fn record_component_fs_profile<CpuImpl, HostFs>(
-    profile: Option<ComponentFsProfile<CpuImpl, HostFs>>,
+pub(super) fn record_component_fs_profile<CpuImpl, Net, HostFs>(
+    profile: Option<ComponentFsProfile<CpuImpl, Net, HostFs>>,
     operation: &'static str,
 ) where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     if let Some(profile) = profile {
@@ -284,12 +288,13 @@ where
 {
     /// Binds a descriptor to the host share when its path lives under the
     /// host mount, otherwise reports that the embedded filesystem owns it.
-    pub(crate) fn for_descriptor<CpuImpl>(
-        store: &StoreData<CpuImpl, HostFs>,
+    pub(crate) fn for_descriptor<CpuImpl, Net>(
+        store: &StoreData<CpuImpl, Net, HostFs>,
         descriptor: &FsDescriptor,
     ) -> core::result::Result<Option<Self>, fs_types::ErrorCode>
     where
         CpuImpl: Cpu + Clone,
+        Net: ComponentHostNetwork,
     {
         let Some(path) = crate::guest_host_share_path(&descriptor.path) else {
             return Ok(None);
@@ -306,12 +311,13 @@ type PendingHostTransfer<T> = Pin<
     Box<dyn core::future::Future<Output = core::result::Result<T, fs_types::ErrorCode>> + Send>,
 >;
 
-pub(super) struct FileWriteConsumer<T, CpuImpl, HostFs>
+pub(super) struct FileWriteConsumer<T, CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    pub(super) getter: fn(&mut T) -> &mut StoreData<CpuImpl, HostFs>,
+    pub(super) getter: fn(&mut T) -> &mut StoreData<CpuImpl, Net, HostFs>,
     pub(super) descriptor: FsDescriptor,
     pub(super) mode: FileWriteMode,
     pub(super) host: Option<HostFileStreamTarget<HostFs>>,
@@ -319,12 +325,13 @@ where
     pub(super) result: Option<oneshot::Sender<core::result::Result<(), fs_types::ErrorCode>>>,
 }
 
-pub(super) struct FileReadStreamProducer<T, CpuImpl, HostFs>
+pub(super) struct FileReadStreamProducer<T, CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    pub(super) getter: fn(&mut T) -> &mut StoreData<CpuImpl, HostFs>,
+    pub(super) getter: fn(&mut T) -> &mut StoreData<CpuImpl, Net, HostFs>,
     pub(super) descriptor: FsDescriptor,
     pub(super) offset: u64,
     pub(super) chunk_bytes: usize,
@@ -336,27 +343,30 @@ where
 // The in-flight 9p transfer is already heap-pinned, and nothing else in
 // either stream is address-sensitive, so both drive their pending future
 // directly from `Pin<&mut Self>`.
-impl<T, CpuImpl, HostFs> Unpin for FileReadStreamProducer<T, CpuImpl, HostFs>
+impl<T, CpuImpl, Net, HostFs> Unpin for FileReadStreamProducer<T, CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
 }
 
-impl<T, CpuImpl, HostFs> Unpin for FileWriteConsumer<T, CpuImpl, HostFs>
+impl<T, CpuImpl, Net, HostFs> Unpin for FileWriteConsumer<T, CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
 }
 
-impl<T, CpuImpl, HostFs> FileReadStreamProducer<T, CpuImpl, HostFs>
+impl<T, CpuImpl, Net, HostFs> FileReadStreamProducer<T, CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     pub(super) fn new(
-        getter: fn(&mut T) -> &mut StoreData<CpuImpl, HostFs>,
+        getter: fn(&mut T) -> &mut StoreData<CpuImpl, Net, HostFs>,
         descriptor: FsDescriptor,
         offset: u64,
         chunk_bytes: usize,
@@ -400,9 +410,10 @@ where
     }
 }
 
-impl<T, CpuImpl, HostFs> Drop for FileReadStreamProducer<T, CpuImpl, HostFs>
+impl<T, CpuImpl, Net, HostFs> Drop for FileReadStreamProducer<T, CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     fn drop(&mut self) {
@@ -410,9 +421,11 @@ where
     }
 }
 
-impl<T: 'static, CpuImpl, HostFs> StreamProducer<T> for FileReadStreamProducer<T, CpuImpl, HostFs>
+impl<T: 'static, CpuImpl, Net, HostFs> StreamProducer<T>
+    for FileReadStreamProducer<T, CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     type Item = u8;
@@ -511,13 +524,14 @@ where
     }
 }
 
-impl<T, CpuImpl, HostFs> FileWriteConsumer<T, CpuImpl, HostFs>
+impl<T, CpuImpl, Net, HostFs> FileWriteConsumer<T, CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     pub(super) fn new_at(
-        getter: fn(&mut T) -> &mut StoreData<CpuImpl, HostFs>,
+        getter: fn(&mut T) -> &mut StoreData<CpuImpl, Net, HostFs>,
         descriptor: FsDescriptor,
         offset: usize,
         host: Option<HostFileStreamTarget<HostFs>>,
@@ -534,7 +548,7 @@ where
     }
 
     pub(super) fn new_append(
-        getter: fn(&mut T) -> &mut StoreData<CpuImpl, HostFs>,
+        getter: fn(&mut T) -> &mut StoreData<CpuImpl, Net, HostFs>,
         descriptor: FsDescriptor,
         host: Option<HostFileStreamTarget<HostFs>>,
         result: oneshot::Sender<core::result::Result<(), fs_types::ErrorCode>>,
@@ -587,9 +601,10 @@ where
     }
 }
 
-impl<T, CpuImpl, HostFs> Drop for FileWriteConsumer<T, CpuImpl, HostFs>
+impl<T, CpuImpl, Net, HostFs> Drop for FileWriteConsumer<T, CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     fn drop(&mut self) {
@@ -597,9 +612,11 @@ where
     }
 }
 
-impl<T: 'static, CpuImpl, HostFs> StreamConsumer<T> for FileWriteConsumer<T, CpuImpl, HostFs>
+impl<T: 'static, CpuImpl, Net, HostFs> StreamConsumer<T>
+    for FileWriteConsumer<T, CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     type Item = u8;
@@ -2000,9 +2017,10 @@ pub(crate) fn effective_open_descriptor_flags(
     Ok(effective)
 }
 
-impl<CpuImpl, HostFs> wasi::filesystem::preopens::Host for StoreData<CpuImpl, HostFs>
+impl<CpuImpl, Net, HostFs> wasi::filesystem::preopens::Host for StoreData<CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     fn get_directories(&mut self) -> Result<Vec<(Resource<FsDescriptor>, String)>> {
@@ -2018,18 +2036,21 @@ where
     }
 }
 
-impl<CpuImpl, HostFs> wasi::filesystem::types::Host for StoreData<CpuImpl, HostFs>
+impl<CpuImpl, Net, HostFs> wasi::filesystem::types::Host for StoreData<CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     fn convert_error_code(&mut self, error: FsError) -> Result<fs_types::ErrorCode> {
         error.downcast()
     }
 }
-impl<CpuImpl, HostFs> wasi::filesystem::types::HostDescriptor for StoreData<CpuImpl, HostFs>
+impl<CpuImpl, Net, HostFs> wasi::filesystem::types::HostDescriptor
+    for StoreData<CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     fn drop(&mut self, descriptor: Resource<FsDescriptor>) -> Result<()> {
@@ -2038,10 +2059,11 @@ where
     }
 }
 
-impl<CpuImpl, HostFs, U> wasi::filesystem::types::HostDescriptorWithStore<U>
-    for HasSelf<StoreData<CpuImpl, HostFs>>
+impl<CpuImpl, Net, HostFs, U> wasi::filesystem::types::HostDescriptorWithStore<U>
+    for HasSelf<StoreData<CpuImpl, Net, HostFs>>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     fn read_via_stream(
@@ -3145,12 +3167,13 @@ where
 /// node in memory with no write-back stage, so there is nothing a sync could
 /// flush there — that no-op is the correct answer, not a missing feature, and
 /// is spelled out here rather than left implicit.
-async fn sync_descriptor<U, CpuImpl, HostFs>(
-    accessor: &Accessor<U, HasSelf<StoreData<CpuImpl, HostFs>>>,
+async fn sync_descriptor<U, CpuImpl, Net, HostFs>(
+    accessor: &Accessor<U, HasSelf<StoreData<CpuImpl, Net, HostFs>>>,
     descriptor: Resource<FsDescriptor>,
 ) -> Result<(), FsError>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     let path = accessor.with(|mut access| {
@@ -3174,12 +3197,13 @@ where
     Ok(())
 }
 
-pub(super) fn get_fs_descriptor<CpuImpl, HostFs>(
-    store: &mut StoreData<CpuImpl, HostFs>,
+pub(super) fn get_fs_descriptor<CpuImpl, Net, HostFs>(
+    store: &mut StoreData<CpuImpl, Net, HostFs>,
     resource: &Resource<FsDescriptor>,
 ) -> core::result::Result<FsDescriptor, fs_types::ErrorCode>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     store

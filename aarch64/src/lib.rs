@@ -168,10 +168,19 @@ mod rtc;
 mod vsock;
 
 mod debug_state {
-    pub(crate) type RuntimeState =
-        helios_kernel::HostRuntimeState<crate::Aarch64Cpu, crate::host_fs::HostFileSystemService>;
-    pub(crate) type ProgramService =
-        helios_kernel::UserProgramService<crate::Aarch64Cpu, crate::host_fs::HostFileSystemService>;
+    /// The network service this machine's virtio-net device backs.
+    pub(crate) type NetworkService =
+        helios_kernel::NetworkService<crate::Aarch64Cpu, crate::net::VirtioNetworkDevice>;
+    pub(crate) type RuntimeState = helios_kernel::HostRuntimeState<
+        crate::Aarch64Cpu,
+        NetworkService,
+        crate::host_fs::HostFileSystemService,
+    >;
+    pub(crate) type ProgramService = helios_kernel::UserProgramService<
+        crate::Aarch64Cpu,
+        NetworkService,
+        crate::host_fs::HostFileSystemService,
+    >;
 }
 
 /// Interrupt routes the bootstrap processor installs for the virtio

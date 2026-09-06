@@ -1823,6 +1823,7 @@ dependencies = [
  "lru",
  "nu-ansi-term",
  "objectpool",
+ "pin-project-lite",
  "rand_chacha",
  "rand_core",
  "serde",

@@ -57,10 +57,12 @@ pub use component::{
     ComponentUdpSocket, ComponentWorld, DeadlinePollable, InstanceKilled, LocalOutputSink,
     ProviderAlreadyInstalled, ProviderError, ProviderReceiver, ProviderSender, ProviderSlot,
     RawMutexGuardResource, RawMutexResource, RawRwLockReadGuardResource, RawRwLockResource,
-    RawRwLockWriteGuardResource, SerialPortResource, TcpStreamResource, UdpSocketResource,
+    RawRwLockWriteGuardResource, RetiredNetworkHandle, SerialPortResource, SocketRetirementQueue,
+    SocketRetirementSender, StoreSocketRetirement, TcpStreamResource, UdpSocketResource,
     directory_prefix, map_resource_table_error, parent_path, path_is_within_directory,
     provider_channel, resolve_absolute_path, resolve_child_path, resolve_guest_path,
-    store_kernel_heap_bytes, strip_directory_prefix, wait_until_runtime_deadline,
+    retire_queued_handles, store_kernel_heap_bytes, strip_directory_prefix,
+    wait_until_runtime_deadline,
 };
 pub use device::{
     DEFAULT_DMA_BUDGET_BYTES, DEVICE_WINDOW_BYTES, DeviceGrant, DeviceGrantRegistry,
@@ -82,12 +84,13 @@ pub use exec::{
     LocalJoinHandle, Mutex, MutexGuard, Notified, Notify, NotifyWaiter, OwnedRawMutexLease,
     OwnedRawRwLockReadLease, OwnedRawRwLockWriteLease, PerfMetricFilter, PerfMetricHistory,
     PerfMetricSample, PerfSample, PressureLevel, ProfileFilter, ProfileHistory, ProfileScope,
-    ProgressChanged, ProgressMark, ProgressSignal, RawMutex, RawMutexLease, RawRwLock,
+    ProfileSink, ProgressChanged, ProgressMark, ProgressSignal, RawMutex, RawMutexLease, RawRwLock,
     RawRwLockReadLease, RawRwLockWriteLease, RwLock, RwLockReadGuard, RwLockWriteGuard, Sleep,
     Spawner, StatsSample, TaskCapacityError, TaskFunding, Timer, TraceEvent, TraceField,
-    TraceFilter, TraceHistory, TraceLevel, TraceValue, YieldNow, duration_to_ticks, elapsed_millis,
-    matches_perf_metric_filter, matches_profile_filter, matches_trace_filter, monotonic_nanos,
-    nanos_to_ticks_ceil_saturating, parse_console_text, wall_clock_offset_nanos, yield_now,
+    TraceFilter, TraceHistory, TraceLevel, TraceValue, UptimeClock, YieldNow, duration_to_ticks,
+    elapsed_millis, matches_perf_metric_filter, matches_profile_filter, matches_trace_filter,
+    monotonic_nanos, nanos_to_ticks_ceil_saturating, parse_console_text, wall_clock_offset_nanos,
+    yield_now,
 };
 pub use helios_hal::Platform;
 pub use helios_netstack::{
@@ -164,12 +167,12 @@ pub use profiling::{
     KernelLlvmProfile, LlvmProfile, LlvmProfileError, MAX_PROFILE_READ, ProfileSection,
 };
 pub use runtime::{
-    AuthorityDomain, ComponentHostFilesystemState, ComponentNetworkService, ComponentNetworkState,
-    DnsError, DnsErrorKind, ExecOutput, ExecResult, HostDirEntry, HostFileSystem, HostFsError,
-    HostFsErrorKind, HostMetadata, Ipv4Address, NetworkErrorDetail, NetworkIpAddress,
-    ObjectIdentity, PingError, PingErrorKind, PingReply, RegisteredTcpReadBuffer, RuntimeState,
-    SocketReadiness, TcpAccepted, TcpError, TcpErrorKind, TcpListener, UdpBinding, UdpDatagram,
-    UdpError, UdpErrorKind,
+    AuthorityDomain, ComponentHostFilesystemState, ComponentHostNetwork, ComponentNetworkService,
+    ComponentNetworkState, DnsError, DnsErrorKind, ExecOutput, ExecResult, HostDirEntry,
+    HostFileSystem, HostFsError, HostFsErrorKind, HostMetadata, Ipv4Address, NetworkErrorDetail,
+    NetworkHandle, NetworkIpAddress, ObjectIdentity, PingError, PingErrorKind, PingReply,
+    RegisteredTcpReadBuffer, RuntimeState, SocketReadiness, TcpAccepted, TcpError, TcpErrorKind,
+    TcpListener, UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
 };
 pub use vsock::{
     ComponentHostVsockService, MAX_VSOCK_BACKLOG, MAX_VSOCK_CONNECTIONS, MAX_VSOCK_LISTENERS,
@@ -178,10 +181,8 @@ pub use vsock::{
 };
 #[cfg(feature = "wasmtime-runtime")]
 pub use wasmtime_adapter::component_host::{
-    ChildExit, ChildHandle, ComponentBindingSet, ComponentHostNetworkService,
-    ComponentHostProcessorRole, ComponentHostTcpListenerToken, ComponentHostTcpStreamToken,
-    ComponentHostUdpSocketToken, HostRuntimeState, UserProgramService,
-    component_host_processor_role, component_host_processors_to_start,
+    ChildExit, ChildHandle, ComponentBindingSet, ComponentHostProcessorRole, HostRuntimeState,
+    UserProgramService, component_host_processor_role, component_host_processors_to_start,
     component_host_system_processor, component_host_worker_count,
     install_component_host_program_service, install_program_service,
     run_component_host_processor_forever, run_embedded_component_forever,

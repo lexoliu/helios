@@ -24,6 +24,7 @@
 //! queue, so an interrupt taken between the inspection and the park is
 //! not lost.
 
+use crate::ComponentHostNetwork;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::pin::Pin;
@@ -51,14 +52,15 @@ use super::StoreData;
 /// the sense that the registry is: a claim by an instance the kernel
 /// never gave a device to is refused, so an ordinary program importing
 /// it learns there is no device for it and nothing else.
-pub(super) fn add_device_to_linker<CpuImpl, HostFs>(
-    linker: &mut Linker<StoreData<CpuImpl, HostFs>>,
+pub(super) fn add_device_to_linker<CpuImpl, Net, HostFs>(
+    linker: &mut Linker<StoreData<CpuImpl, Net, HostFs>>,
 ) -> wasmtime::Result<()>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    device_wit::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(linker, |state| state)
+    device_wit::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, HostFs>>>(linker, |state| state)
 }
 
 /// Record where an instance's linear memory landed.
@@ -72,11 +74,12 @@ where
 /// An instance whose component has no linear memory records nothing.
 /// It could not see a register even if it were given one, and its claim
 /// is refused when it makes one rather than here, where nobody asked.
-pub(crate) fn record_linear_memory<CpuImpl, HostFs>(
-    mut store: impl wasmtime::AsContextMut<Data = StoreData<CpuImpl, HostFs>>,
+pub(crate) fn record_linear_memory<CpuImpl, Net, HostFs>(
+    mut store: impl wasmtime::AsContextMut<Data = StoreData<CpuImpl, Net, HostFs>>,
     instance: &wasmtime::component::Instance,
 ) where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     let Some(memory) = instance.get_default_memory(store.as_context_mut()) else {
@@ -155,9 +158,10 @@ fn to_wit_region(region: &DeviceRegion) -> device_wit::Region {
     }
 }
 
-impl<CpuImpl, HostFs> device_wit::Host for StoreData<CpuImpl, HostFs>
+impl<CpuImpl, Net, HostFs> device_wit::Host for StoreData<CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     fn claim(
@@ -200,9 +204,10 @@ where
     }
 }
 
-impl<CpuImpl, HostFs> device_wit::HostGrant for StoreData<CpuImpl, HostFs>
+impl<CpuImpl, Net, HostFs> device_wit::HostGrant for StoreData<CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     fn name(&mut self, handle: Resource<GrantHandle>) -> wasmtime::Result<String> {
@@ -307,9 +312,10 @@ where
     }
 }
 
-impl<CpuImpl, HostFs> device_wit::HostDmaBuffer for StoreData<CpuImpl, HostFs>
+impl<CpuImpl, Net, HostFs> device_wit::HostDmaBuffer for StoreData<CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     fn offset(&mut self, handle: Resource<DmaBufferHandle>) -> wasmtime::Result<u64> {
@@ -334,9 +340,10 @@ where
     }
 }
 
-impl<CpuImpl, HostFs> StoreData<CpuImpl, HostFs>
+impl<CpuImpl, Net, HostFs> StoreData<CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     /// Run `act` against the relay of the device `handle` names.
@@ -364,30 +371,33 @@ where
 /// relay through it. That is what keeps the lease single-owned and lets
 /// a reclaim end the stream rather than race it — once the lease is
 /// gone the stream reports the device is gone too.
-struct InterruptStreamProducer<T, CpuImpl, HostFs>
+struct InterruptStreamProducer<T, CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    getter: fn(&mut T) -> &mut StoreData<CpuImpl, HostFs>,
+    getter: fn(&mut T) -> &mut StoreData<CpuImpl, Net, HostFs>,
     device: DeviceName,
     waiter: Option<NotifyWaiter>,
 }
 
-impl<T, CpuImpl, HostFs> Unpin for InterruptStreamProducer<T, CpuImpl, HostFs>
+impl<T, CpuImpl, Net, HostFs> Unpin for InterruptStreamProducer<T, CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
 }
 
-impl<T, CpuImpl, HostFs> InterruptStreamProducer<T, CpuImpl, HostFs>
+impl<T, CpuImpl, Net, HostFs> InterruptStreamProducer<T, CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     const fn new(
-        getter: fn(&mut T) -> &mut StoreData<CpuImpl, HostFs>,
+        getter: fn(&mut T) -> &mut StoreData<CpuImpl, Net, HostFs>,
         device: DeviceName,
     ) -> Self {
         Self {
@@ -398,10 +408,11 @@ where
     }
 }
 
-impl<T, CpuImpl, HostFs> StreamProducer<T> for InterruptStreamProducer<T, CpuImpl, HostFs>
+impl<T, CpuImpl, Net, HostFs> StreamProducer<T> for InterruptStreamProducer<T, CpuImpl, Net, HostFs>
 where
     T: 'static,
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     type Item = device_wit::InterruptEvent;
@@ -446,10 +457,12 @@ where
     }
 }
 
-impl<CpuImpl, HostFs, U> device_wit::HostGrantWithStore<U> for HasSelf<StoreData<CpuImpl, HostFs>>
+impl<CpuImpl, Net, HostFs, U> device_wit::HostGrantWithStore<U>
+    for HasSelf<StoreData<CpuImpl, Net, HostFs>>
 where
     U: 'static,
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     fn interrupts(

@@ -279,6 +279,15 @@ mod tests {
             _: crate::PerfSample,
         ) {
         }
+
+        /// The console fixture has no network service, and nothing it
+        /// drives opens a socket.
+        fn retire_network_handles(&self, retired: &crate::SocketRetirementQueue) {
+            assert!(
+                retired.is_empty(),
+                "the console test state was handed a socket to retire"
+            );
+        }
     }
 
     /// Regression for #164: a `[KDBG …]` stage marker and a console

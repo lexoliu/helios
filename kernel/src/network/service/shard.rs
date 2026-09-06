@@ -781,6 +781,19 @@ impl NetworkShardSet {
         }
     }
 
+    /// Releases everything parked on the whole shard set, the packet
+    /// pump included.
+    ///
+    /// The counterpart of [`Self::with_handle_receive_drain`] for an
+    /// event that belongs to no one shard: a synchronous retirement
+    /// queues a FIN and produces no frame, so nothing else raises a
+    /// signal and the pump would sleep to the next protocol deadline
+    /// with the segment still in the queue (#232). Callable from any
+    /// processor, and it takes no shard lock.
+    pub(super) fn wake_any_shard(&self) {
+        self.any_arrival.signal();
+    }
+
     /// The signal a sampled wait belongs to.
     #[inline]
     pub(super) fn arrival_for(&self, target: WaitTarget) -> &ProgressSignal {

@@ -5,6 +5,7 @@
 //! the runtime through the traits defined in
 //! [`crate::component::runtime_backend`].
 
+use crate::ComponentHostNetwork;
 pub(crate) mod artifact_profile;
 pub mod bindings;
 pub(crate) mod component_host;
@@ -114,18 +115,20 @@ impl ComponentRuntimeEngine for WasmtimeEngine {
 }
 
 /// A running Wasmtime component instance.
-pub struct WasmtimeExecutor<CpuImpl, HostFs>
+pub struct WasmtimeExecutor<CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: HostFileSystem,
 {
-    store: wasmtime::Store<StoreData<CpuImpl, HostFs>>,
+    store: wasmtime::Store<StoreData<CpuImpl, Net, HostFs>>,
     run_func: wasmtime::component::TypedFunc<(), (core::result::Result<(), ()>,)>,
 }
 
-impl<CpuImpl, HostFs> ComponentExecutor for WasmtimeExecutor<CpuImpl, HostFs>
+impl<CpuImpl, Net, HostFs> ComponentExecutor for WasmtimeExecutor<CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: HostFileSystem,
 {
     type Error = wasmtime::Error;
@@ -152,12 +155,13 @@ where
 /// Runtime traps that correspond to `wasi:cli/exit` requests are treated as
 /// a clean exit with the code the guest supplied; other traps still bubble
 /// up as `wasmtime::Error`.
-fn interpret_run_result<CpuImpl, HostFs>(
+fn interpret_run_result<CpuImpl, Net, HostFs>(
     raw: wasmtime::Result<wasmtime::Result<(Result<(), ()>,)>>,
-    store_data: &mut StoreData<CpuImpl, HostFs>,
+    store_data: &mut StoreData<CpuImpl, Net, HostFs>,
 ) -> wasmtime::Result<(ComponentExitStatus, u32)>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: HostFileSystem,
 {
     match raw {
@@ -192,15 +196,17 @@ impl<P: Cpu + Clone> WasmtimeComponentRuntime<P> {
     }
 }
 
-impl<CpuImpl, HostFs, P> ComponentRuntimeFactory<CpuImpl, HostRuntimeState<CpuImpl, HostFs>, HostFs>
+impl<CpuImpl, Net, HostFs, P>
+    ComponentRuntimeFactory<CpuImpl, HostRuntimeState<CpuImpl, Net, HostFs>, HostFs>
     for WasmtimeComponentRuntime<P>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: HostFileSystem,
     P: Cpu + Clone,
 {
     type Engine = WasmtimeEngine;
-    type Executor = WasmtimeExecutor<CpuImpl, HostFs>;
+    type Executor = WasmtimeExecutor<CpuImpl, Net, HostFs>;
     type CreateEngineError = wasmtime::Error;
     type InstantiateError = wasmtime::Error;
 
@@ -214,7 +220,7 @@ where
         engine: &Self::Engine,
         compiled: &WasmtimeCompiledComponent,
         world: ComponentWorld,
-        context: ComponentExecContext<CpuImpl, HostRuntimeState<CpuImpl, HostFs>, HostFs>,
+        context: ComponentExecContext<CpuImpl, HostRuntimeState<CpuImpl, Net, HostFs>, HostFs>,
     ) -> Result<Self::Executor, Self::InstantiateError> {
         let binding_set = match world {
             ComponentWorld::System => ComponentBindingSet::System,
@@ -241,7 +247,7 @@ where
 
         let mut store = store_with_state(
             &engine.engine,
-            StoreData::<CpuImpl, HostFs>::new(
+            StoreData::<CpuImpl, Net, HostFs>::new(
                 wasmtime::component::ResourceTable::new(),
                 context.cpu,
                 context.timer,

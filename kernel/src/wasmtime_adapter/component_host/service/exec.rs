@@ -1,25 +1,31 @@
 use super::*;
 
-pub(super) enum ProgramExecutable<CpuImpl, HostFs>
+/// A component that is compiled, linked and ready to instantiate, shared by
+/// every launch of the same executable.
+pub(super) type PreparedComponent<CpuImpl, Net, HostFs> =
+    Arc<ComponentInstancePre<StoreData<CpuImpl, Net, HostFs>>>;
+
+pub(super) enum ProgramExecutable<CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    Component(Arc<ComponentInstancePre<StoreData<CpuImpl, HostFs>>>),
+    Component(PreparedComponent<CpuImpl, Net, HostFs>),
     CoreModule(Arc<WasmtimeCompiledCoreModule>),
     ForkedCoreModule {
         compiled: Arc<WasmtimeCompiledCoreModule>,
         /// Boxed because a fork's restore state dwarfs the two
         /// refcounted handles the other variants carry, and the
         /// executable itself is moved through every launch path.
-        restore: Box<CoreModuleRestore>,
+        restore: Box<CoreModuleRestore<Net>>,
     },
 }
 
-pub(super) struct CoreModuleRestore {
+pub(super) struct CoreModuleRestore<Net: ComponentHostNetwork> {
     pub(super) memory: SharedMemory,
     pub(super) memory_spec: SharedMemorySpec,
-    pub(super) descriptors: Preview1DescriptorTable,
+    pub(super) descriptors: Preview1DescriptorTable<Net>,
     pub(super) signal_dispositions: Vec<WasixSignalDisposition>,
     pub(super) rewind: WasixRewind,
 }
@@ -41,49 +47,52 @@ pub(super) struct WasixRewind {
 }
 
 /// Pre-instantiated core modules shared across launches.
-pub(super) type CoreModuleInstancePreCache<CpuImpl, HostFs> =
-    Arc<Mutex<ComponentCache<InstancePre<Preview1ProgramStore<CpuImpl, HostFs>>>>>;
+pub(super) type CoreModuleInstancePreCache<CpuImpl, Net, HostFs> =
+    Arc<Mutex<ComponentCache<InstancePre<Preview1ProgramStore<CpuImpl, Net, HostFs>>>>>;
 
-pub(super) struct WasixExecReplacement<CpuImpl, HostFs>
+pub(super) struct WasixExecReplacement<CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     pub(super) argv: ProgramArgv,
     pub(super) env: Vec<(String, String)>,
-    pub(super) executable: ProgramExecutable<CpuImpl, HostFs>,
+    pub(super) executable: ProgramExecutable<CpuImpl, Net, HostFs>,
     pub(super) authority: ProcessAuthority,
     pub(super) filesystem: Option<DebugFileSystemSnapshot>,
-    pub(super) descriptors: Option<Preview1DescriptorTable>,
+    pub(super) descriptors: Option<Preview1DescriptorTable<Net>>,
     pub(super) signal_state: WasixSignalState,
     pub(super) signal_dispositions: Vec<WasixSignalDisposition>,
 }
 
-pub(super) struct CoreModuleReplacementState<CpuImpl, HostFs>
+pub(super) struct CoreModuleReplacementState<CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    pub(super) exec_context: ProgramExecContext<CpuImpl, HostFs>,
+    pub(super) exec_context: ProgramExecContext<CpuImpl, Net, HostFs>,
     pub(super) instance: crate::RegisteredInstance,
     pub(super) output_mode: OutputMode,
-    pub(super) core_linker: CoreLinker<Preview1ProgramStore<CpuImpl, HostFs>>,
+    pub(super) core_linker: CoreLinker<Preview1ProgramStore<CpuImpl, Net, HostFs>>,
 }
 
-pub(super) enum CoreModuleRunCompletion<CpuImpl, HostFs>
+pub(super) enum CoreModuleRunCompletion<CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     Exit(Result<ChildExit, ProgramExecError>),
     /// Boxed: an exec replacement carries the whole next program,
     /// and the common completion is a plain exit code.
-    Exec(Box<WasixExecReplacement<CpuImpl, HostFs>>),
+    Exec(Box<WasixExecReplacement<CpuImpl, Net, HostFs>>),
 }
 
-pub(super) struct WasixAsyncifyState {
+pub(super) struct WasixAsyncifyState<Net: ComponentHostNetwork> {
     pub(super) snapshots: Vec<WasixStackSnapshot>,
-    pub(super) process_snapshots: Vec<WasixProcessSnapshot>,
+    pub(super) process_snapshots: Vec<WasixProcessSnapshot<Net>>,
     pub(super) phase: WasixAsyncifyPhase,
     pub(super) rewind_value: Option<u64>,
     pub(super) process_snapshot_rewinding: bool,
@@ -131,10 +140,10 @@ pub(super) struct WasixStackSnapshot {
 }
 
 #[derive(Clone)]
-pub(super) struct WasixProcessSnapshot {
+pub(super) struct WasixProcessSnapshot<Net: ComponentHostNetwork> {
     pub(super) memory: Vec<u8>,
     pub(super) memory_pages: u32,
-    pub(super) descriptors: Preview1DescriptorTable,
+    pub(super) descriptors: Preview1DescriptorTable<Net>,
     pub(super) filesystem: DebugFileSystemSnapshot,
     pub(super) authority: ProcessAuthority,
     pub(super) cwd: Option<Preview1Cwd>,
@@ -148,22 +157,23 @@ pub(super) struct WasixProcessSnapshot {
     pub(super) rewind_stack: Vec<u8>,
 }
 
-pub(super) fn read_bootfs_artifact<CpuImpl, HostFs>(
-    runtime_state: &HostRuntimeState<CpuImpl, HostFs>,
+pub(super) fn read_bootfs_artifact<CpuImpl, Net, HostFs>(
+    runtime_state: &HostRuntimeState<CpuImpl, Net, HostFs>,
     path: &str,
 ) -> Option<Bytes>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     let filesystem = crate::wasmtime_adapter::wasi::DebugFileSystem::<
-        HostRuntimeState<CpuImpl, HostFs>,
+        HostRuntimeState<CpuImpl, Net, HostFs>,
         HostFs,
     >::new(runtime_state.clone());
     filesystem.read_program_file_bytes(path).ok()
 }
 
-impl WasixAsyncifyState {
+impl<Net: ComponentHostNetwork> WasixAsyncifyState<Net> {
     pub(super) const fn new() -> Self {
         Self {
             snapshots: Vec::new(),
@@ -176,28 +186,29 @@ impl WasixAsyncifyState {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn run_program_executable<CpuImpl, HostFs>(
-    exec_context: ProgramExecContext<CpuImpl, HostFs>,
+pub(super) async fn run_program_executable<CpuImpl, Net, HostFs>(
+    exec_context: ProgramExecContext<CpuImpl, Net, HostFs>,
     argv: ProgramArgv,
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
     filesystem: Option<DebugFileSystemSnapshot>,
-    descriptors: Option<Preview1DescriptorTable>,
+    descriptors: Option<Preview1DescriptorTable<Net>>,
     signal_state: WasixSignalState,
     signal_dispositions: Vec<WasixSignalDisposition>,
     spawner: crate::InstanceSpawner<CpuImpl>,
     progress: helios_hal::watchdog::ProgressCounter,
-    executable: ProgramExecutable<CpuImpl, HostFs>,
+    executable: ProgramExecutable<CpuImpl, Net, HostFs>,
     engine: &crate::wasmtime_adapter::WasmtimeEngine,
     runtime: &crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl>,
-    preview1_core_linker: CoreLinker<Preview1ProgramStore<CpuImpl, HostFs>>,
+    preview1_core_linker: CoreLinker<Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     shared_memory_pool: Arc<Mutex<SharedMemoryPool>>,
-    core_module_instance_pre_cache: CoreModuleInstancePreCache<CpuImpl, HostFs>,
+    core_module_instance_pre_cache: CoreModuleInstancePreCache<CpuImpl, Net, HostFs>,
     launched_instance: crate::RegisteredInstance,
     output_mode: OutputMode,
 ) -> Result<ChildExit, ProgramExecError>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     match executable {
@@ -268,13 +279,13 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn run_program_core_module<CpuImpl, HostFs>(
-    exec_context: ProgramExecContext<CpuImpl, HostFs>,
+pub(super) async fn run_program_core_module<CpuImpl, Net, HostFs>(
+    exec_context: ProgramExecContext<CpuImpl, Net, HostFs>,
     argv: ProgramArgv,
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
     filesystem: Option<DebugFileSystemSnapshot>,
-    descriptors: Option<Preview1DescriptorTable>,
+    descriptors: Option<Preview1DescriptorTable<Net>>,
     signal_state: WasixSignalState,
     signal_dispositions: Vec<WasixSignalDisposition>,
     spawner: crate::InstanceSpawner<CpuImpl>,
@@ -282,14 +293,15 @@ pub(super) async fn run_program_core_module<CpuImpl, HostFs>(
     compiled: Arc<WasmtimeCompiledCoreModule>,
     engine: &crate::wasmtime_adapter::WasmtimeEngine,
     runtime: &crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl>,
-    preview1_core_linker: CoreLinker<Preview1ProgramStore<CpuImpl, HostFs>>,
+    preview1_core_linker: CoreLinker<Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     shared_memory_pool: Arc<Mutex<SharedMemoryPool>>,
-    core_module_instance_pre_cache: CoreModuleInstancePreCache<CpuImpl, HostFs>,
+    core_module_instance_pre_cache: CoreModuleInstancePreCache<CpuImpl, Net, HostFs>,
     launched_instance: crate::RegisteredInstance,
     output_mode: OutputMode,
 ) -> Result<ChildExit, ProgramExecError>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     let profile_name = argv.program_name().to_owned();
@@ -322,13 +334,13 @@ where
         "core-shared-memory-prepare",
     );
     let recycle_memory = imported_memory.clone();
-    let store_teardown_profile: Option<ProgramKernelProfile<CpuImpl, HostFs>>;
+    let store_teardown_profile: Option<ProgramKernelProfile<CpuImpl, Net, HostFs>>;
     let (completion, recycle_allowed) = {
         let store_prepare_profile =
             start_program_kernel_profile(&profile_runtime_state, &profile_cpu);
         let mut store = wasmtime::Store::new(
             engine.raw(),
-            Preview1ProgramStore::<CpuImpl, HostFs>::new(
+            Preview1ProgramStore::<CpuImpl, Net, HostFs>::new(
                 exec_context.cpu,
                 exec_context.timer,
                 spawner.clone(),
@@ -570,8 +582,8 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn run_program_core_module_with_restore<CpuImpl, HostFs>(
-    exec_context: ProgramExecContext<CpuImpl, HostFs>,
+pub(super) async fn run_program_core_module_with_restore<CpuImpl, Net, HostFs>(
+    exec_context: ProgramExecContext<CpuImpl, Net, HostFs>,
     argv: ProgramArgv,
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
@@ -580,17 +592,18 @@ pub(super) async fn run_program_core_module_with_restore<CpuImpl, HostFs>(
     spawner: crate::InstanceSpawner<CpuImpl>,
     progress: helios_hal::watchdog::ProgressCounter,
     compiled: Arc<WasmtimeCompiledCoreModule>,
-    restore: Box<CoreModuleRestore>,
+    restore: Box<CoreModuleRestore<Net>>,
     engine: &crate::wasmtime_adapter::WasmtimeEngine,
     runtime: &crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl>,
-    preview1_core_linker: CoreLinker<Preview1ProgramStore<CpuImpl, HostFs>>,
+    preview1_core_linker: CoreLinker<Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     shared_memory_pool: Arc<Mutex<SharedMemoryPool>>,
-    core_module_instance_pre_cache: CoreModuleInstancePreCache<CpuImpl, HostFs>,
+    core_module_instance_pre_cache: CoreModuleInstancePreCache<CpuImpl, Net, HostFs>,
     launched_instance: crate::RegisteredInstance,
     output_mode: OutputMode,
 ) -> Result<ChildExit, ProgramExecError>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     let profile_name = argv.program_name().to_owned();
@@ -611,13 +624,13 @@ where
     let imported_memory = Some(restore.memory.clone());
     let recycle_memory = restore.memory.clone();
     let memory_spec = restore.memory_spec;
-    let store_teardown_profile: Option<ProgramKernelProfile<CpuImpl, HostFs>>;
+    let store_teardown_profile: Option<ProgramKernelProfile<CpuImpl, Net, HostFs>>;
     let (completion, recycle_allowed) = {
         let store_prepare_profile =
             start_program_kernel_profile(&profile_runtime_state, &profile_cpu);
         let mut store = wasmtime::Store::new(
             engine.raw(),
-            Preview1ProgramStore::<CpuImpl, HostFs>::new(
+            Preview1ProgramStore::<CpuImpl, Net, HostFs>::new(
                 exec_context.cpu,
                 exec_context.timer,
                 spawner.clone(),
@@ -800,8 +813,8 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn run_program_component<CpuImpl, HostFs>(
-    exec_context: ProgramExecContext<CpuImpl, HostFs>,
+pub(super) async fn run_program_component<CpuImpl, Net, HostFs>(
+    exec_context: ProgramExecContext<CpuImpl, Net, HostFs>,
     argv: ProgramArgv,
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
@@ -809,7 +822,7 @@ pub(super) async fn run_program_component<CpuImpl, HostFs>(
     _signal_state: WasixSignalState,
     spawner: crate::InstanceSpawner<CpuImpl>,
     progress: helios_hal::watchdog::ProgressCounter,
-    instance_pre: Arc<ComponentInstancePre<StoreData<CpuImpl, HostFs>>>,
+    instance_pre: PreparedComponent<CpuImpl, Net, HostFs>,
     engine: &crate::wasmtime_adapter::WasmtimeEngine,
     _runtime: &crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl>,
     launched_instance: crate::RegisteredInstance,
@@ -817,6 +830,7 @@ pub(super) async fn run_program_component<CpuImpl, HostFs>(
 ) -> Result<ChildExit, ProgramExecError>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     use crate::ComponentExecutor;
@@ -845,7 +859,7 @@ where
     };
     let mut store = crate::wasmtime_adapter::store_with_state(
         engine.raw(),
-        StoreData::<CpuImpl, HostFs>::new(
+        StoreData::<CpuImpl, Net, HostFs>::new(
             wasmtime::component::ResourceTable::new(),
             exec_context.cpu,
             exec_context.timer,
@@ -952,12 +966,13 @@ where
     })
 }
 
-pub(super) async fn handle_wasix_asyncify_completion<CpuImpl, HostFs>(
-    store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, HostFs>>,
+pub(super) async fn handle_wasix_asyncify_completion<CpuImpl, Net, HostFs>(
+    store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     instance: &wasmtime::Instance,
 ) -> Result<bool, ProgramExecError>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     let phase = core::mem::replace(
@@ -1215,13 +1230,14 @@ where
     }
 }
 
-pub(super) async fn wasix_begin_rewind<CpuImpl, HostFs>(
-    store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, HostFs>>,
+pub(super) async fn wasix_begin_rewind<CpuImpl, Net, HostFs>(
+    store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     instance: &wasmtime::Instance,
     rewind: WasixRewind,
 ) -> Result<(), ProgramExecError>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     let WasixRewind {
@@ -1295,16 +1311,17 @@ where
     Ok(())
 }
 
-pub(super) fn wasix_capture_process_snapshot<CpuImpl, HostFs>(
-    store: &wasmtime::Store<Preview1ProgramStore<CpuImpl, HostFs>>,
+pub(super) fn wasix_capture_process_snapshot<CpuImpl, Net, HostFs>(
+    store: &wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     stack_lower: u32,
     stack_upper: u32,
     stack_pointer: u32,
     memory_stack: Vec<u8>,
     rewind_stack: Vec<u8>,
-) -> Result<WasixProcessSnapshot, ProgramExecError>
+) -> Result<WasixProcessSnapshot<Net>, ProgramExecError>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     let snapshot_started = store
@@ -1357,7 +1374,10 @@ where
     })
 }
 
-pub(super) fn trace_wasix_process_snapshot(snapshot: &WasixProcessSnapshot, snapshot_count: usize) {
+pub(super) fn trace_wasix_process_snapshot<Net: ComponentHostNetwork>(
+    snapshot: &WasixProcessSnapshot<Net>,
+    snapshot_count: usize,
+) {
     let cwd = snapshot
         .cwd
         .as_ref()
@@ -1383,8 +1403,8 @@ pub(super) fn trace_wasix_process_snapshot(snapshot: &WasixProcessSnapshot, snap
     );
 }
 
-pub(super) async fn spawn_wasix_fork_child<CpuImpl, HostFs>(
-    store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, HostFs>>,
+pub(super) async fn spawn_wasix_fork_child<CpuImpl, Net, HostFs>(
+    store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     stack_lower: u32,
     stack_upper: u32,
     stack_pointer: u32,
@@ -1393,6 +1413,7 @@ pub(super) async fn spawn_wasix_fork_child<CpuImpl, HostFs>(
 ) -> Result<u32, ProgramExecError>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     let memory = store
@@ -1539,11 +1560,12 @@ where
     Ok(pid)
 }
 
-pub(super) fn wasix_next_stack_hash<CpuImpl, HostFs>(
-    store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, HostFs>>,
+pub(super) fn wasix_next_stack_hash<CpuImpl, Net, HostFs>(
+    store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, HostFs>>,
 ) -> u128
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     let lower = store.data_mut().entropy.insecure_u64();
@@ -1560,13 +1582,14 @@ pub(super) fn wasix_stack_snapshot_bytes(user: u32, hash: u128) -> [u8; WASIX_ST
     bytes
 }
 
-pub(super) async fn wasix_call_instance_func0<CpuImpl, HostFs>(
-    store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, HostFs>>,
+pub(super) async fn wasix_call_instance_func0<CpuImpl, Net, HostFs>(
+    store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     instance: &wasmtime::Instance,
     name: &str,
 ) -> Result<(), ProgramExecError>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     let function = instance
@@ -1581,14 +1604,15 @@ where
         .map_err(map_program_runtime_error)
 }
 
-pub(super) async fn wasix_call_instance_func1<CpuImpl, HostFs>(
-    store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, HostFs>>,
+pub(super) async fn wasix_call_instance_func1<CpuImpl, Net, HostFs>(
+    store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     instance: &wasmtime::Instance,
     name: &str,
     value: u32,
 ) -> Result<(), ProgramExecError>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     let function = instance
@@ -1603,13 +1627,14 @@ where
         .map_err(map_program_runtime_error)
 }
 
-pub(super) fn wasix_global_u32_from_instance<CpuImpl, HostFs>(
-    store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, HostFs>>,
+pub(super) fn wasix_global_u32_from_instance<CpuImpl, Net, HostFs>(
+    store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     instance: &wasmtime::Instance,
     name: &str,
 ) -> Result<u32, ProgramExecError>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     let global = instance
@@ -1627,14 +1652,15 @@ where
     }
 }
 
-pub(super) fn wasix_set_global_u32_from_instance<CpuImpl, HostFs>(
-    store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, HostFs>>,
+pub(super) fn wasix_set_global_u32_from_instance<CpuImpl, Net, HostFs>(
+    store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     instance: &wasmtime::Instance,
     name: &str,
     value: u32,
 ) -> Result<(), ProgramExecError>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     let global = instance

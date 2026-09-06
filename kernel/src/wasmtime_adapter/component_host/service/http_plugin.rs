@@ -50,11 +50,12 @@ const HTTP_PLUGIN_INSTANCE_NAME: &str = "http-client-plugin";
 /// is installed. Reading the artifact here (rather than on first use) is what
 /// lets an image without the plugin answer `configuration-error` immediately
 /// instead of discovering the absence mid-request.
-pub(super) fn install_http_client_plugin<CpuImpl, HostFs>(
-    service: &UserProgramService<CpuImpl, HostFs>,
-    exec_context: ProgramExecContext<CpuImpl, HostFs>,
+pub(super) fn install_http_client_plugin<CpuImpl, Net, HostFs>(
+    service: &UserProgramService<CpuImpl, Net, HostFs>,
+    exec_context: ProgramExecContext<CpuImpl, Net, HostFs>,
 ) where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     let Some(artifact) = read_bootfs_artifact(&exec_context.runtime_state, HTTP_CLIENT_PLUGIN_PATH)
@@ -85,13 +86,14 @@ pub(super) fn install_http_client_plugin<CpuImpl, HostFs>(
 
 /// Own the plugin for the lifetime of the kernel, rebuilding it when its
 /// runtime stops being trustworthy.
-async fn run_http_plugin_supervisor<CpuImpl, HostFs>(
-    service: UserProgramService<CpuImpl, HostFs>,
-    exec_context: ProgramExecContext<CpuImpl, HostFs>,
+async fn run_http_plugin_supervisor<CpuImpl, Net, HostFs>(
+    service: UserProgramService<CpuImpl, Net, HostFs>,
+    exec_context: ProgramExecContext<CpuImpl, Net, HostFs>,
     artifact: Bytes,
     receiver: ProviderReceiver<HttpExchange>,
 ) where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     loop {
@@ -123,15 +125,16 @@ async fn run_http_plugin_supervisor<CpuImpl, HostFs>(
 }
 
 /// Build one plugin instance and serve exchanges with it until it dies.
-async fn run_http_plugin_once<CpuImpl, HostFs>(
-    service: &UserProgramService<CpuImpl, HostFs>,
-    exec_context: &ProgramExecContext<CpuImpl, HostFs>,
+async fn run_http_plugin_once<CpuImpl, Net, HostFs>(
+    service: &UserProgramService<CpuImpl, Net, HostFs>,
+    exec_context: &ProgramExecContext<CpuImpl, Net, HostFs>,
     artifact: &Bytes,
     first: HttpExchange,
     receiver: &ProviderReceiver<HttpExchange>,
 ) -> Result<(), ProgramExecError>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     let started_at = exec_context
@@ -149,7 +152,7 @@ where
 
     let mut store = crate::wasmtime_adapter::store_with_state(
         service.inner.engine.raw(),
-        StoreData::<CpuImpl, HostFs>::new(
+        StoreData::<CpuImpl, Net, HostFs>::new(
             ResourceTable::new(),
             exec_context.cpu.clone(),
             exec_context.timer.clone(),
@@ -199,13 +202,14 @@ where
 }
 
 /// Hand one exchange to a background task so several can be in flight.
-fn dispatch_exchange<CpuImpl, HostFs>(
-    accessor: &Accessor<StoreData<CpuImpl, HostFs>>,
+fn dispatch_exchange<CpuImpl, Net, HostFs>(
+    accessor: &Accessor<StoreData<CpuImpl, Net, HostFs>>,
     guest: &exports::wasi::http::handler::Guest,
     exchange: HttpExchange,
 ) -> wasmtime::Result<()>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     accessor.spawn(HandleExchange {
@@ -216,20 +220,30 @@ where
     Ok(())
 }
 
+/// The store's type parameters, carried by a task that names them without
+/// holding a value of any of them.
+type StoreTypeMarker<CpuImpl, Net, HostFs> =
+    core::marker::PhantomData<fn() -> (CpuImpl, Net, HostFs)>;
+
 /// One `wasi:http/handler.handle` call, start to finish.
-struct HandleExchange<CpuImpl, HostFs> {
+struct HandleExchange<CpuImpl, Net, HostFs> {
     guest: exports::wasi::http::handler::Guest,
     exchange: HttpExchange,
-    _marker: core::marker::PhantomData<fn() -> (CpuImpl, HostFs)>,
+    _marker: StoreTypeMarker<CpuImpl, Net, HostFs>,
 }
 
-impl<CpuImpl, HostFs> AccessorTask<StoreData<CpuImpl, HostFs>, HasSelf<StoreData<CpuImpl, HostFs>>>
-    for HandleExchange<CpuImpl, HostFs>
+impl<CpuImpl, Net, HostFs>
+    AccessorTask<StoreData<CpuImpl, Net, HostFs>, HasSelf<StoreData<CpuImpl, Net, HostFs>>>
+    for HandleExchange<CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    async fn run(self, accessor: &Accessor<StoreData<CpuImpl, HostFs>>) -> wasmtime::Result<()> {
+    async fn run(
+        self,
+        accessor: &Accessor<StoreData<CpuImpl, Net, HostFs>>,
+    ) -> wasmtime::Result<()> {
         let Self {
             guest, exchange, ..
         } = self;

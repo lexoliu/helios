@@ -6,10 +6,9 @@ pub(super) struct UdpSocketState {
     pub(super) binding: UdpSocketBinding,
 }
 
-impl<CpuImpl, Runtime, DeviceImpl> NetworkService<CpuImpl, Runtime, DeviceImpl>
+impl<CpuImpl, DeviceImpl> NetworkService<CpuImpl, DeviceImpl>
 where
     CpuImpl: Cpu + Clone,
-    Runtime: ComponentRuntimeState + Sync,
     DeviceImpl: NetworkDevice,
 {
     pub async fn udp_bind(&self, local_port: u16) -> Result<UdpBinding<UdpSocketId>, UdpError> {

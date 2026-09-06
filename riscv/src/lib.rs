@@ -14,10 +14,19 @@ mod vsock;
 mod watchdog;
 
 mod debug_state {
-    pub(crate) type RuntimeState =
-        helios_kernel::HostRuntimeState<crate::RiscvCpu, crate::host_fs::HostFileSystemService>;
-    pub(crate) type ProgramService =
-        helios_kernel::UserProgramService<crate::RiscvCpu, crate::host_fs::HostFileSystemService>;
+    /// The network service this machine's virtio-net device backs.
+    pub(crate) type NetworkService =
+        helios_kernel::NetworkService<crate::RiscvCpu, crate::net::VirtioNetworkDevice>;
+    pub(crate) type RuntimeState = helios_kernel::HostRuntimeState<
+        crate::RiscvCpu,
+        NetworkService,
+        crate::host_fs::HostFileSystemService,
+    >;
+    pub(crate) type ProgramService = helios_kernel::UserProgramService<
+        crate::RiscvCpu,
+        NetworkService,
+        crate::host_fs::HostFileSystemService,
+    >;
 }
 
 use ns16550a::Uart;

@@ -287,15 +287,48 @@ impl Cpu for RecordingSmpCpu {
     }
 }
 
-/// Runtime state that answers the few questions a service asks during
-/// construction and records nothing.
+/// A detached [`crate::ProfileSink`] for a subsystem under test.
+///
+/// Nothing reads it back; the histories exist so the subsystem's own
+/// record calls run the same path they run on a live kernel.
+pub(crate) fn test_profile_sink() -> crate::ProfileSink {
+    crate::ProfileSink::new(
+        crate::DEFAULT_PROFILE_STACK_CAPACITY,
+        crate::DEFAULT_PERF_METRIC_CAPACITY,
+    )
+}
+
+/// The uptime clock a test service reads, at a 1 GHz timebase whose
+/// origin is the boot tick, so a tick is a nanosecond and a test can
+/// state deadlines in either.
+pub(crate) fn test_uptime_clock() -> crate::UptimeClock {
+    crate::UptimeClock::new(0, 1_000_000_000)
+}
+
+/// Runtime state that answers the few questions a store asks and
+/// records nothing.
 ///
 /// Uptime is the raw tick count, which is what every other kernel test
 /// fixture does: the tests that use this assert on ordering between
-/// events, never on wall time.
-#[derive(Clone, Copy, Default)]
-pub(crate) struct TestRuntimeState;
+/// events, never on wall time. The network service is the one a
+/// store's socket retirements are closed through, so a test that
+/// drives a store's teardown can watch what it closed.
+#[cfg(feature = "wasmtime-runtime")]
+#[derive(Clone, Default)]
+pub(crate) struct TestRuntimeState {
+    network: Option<TestNetworkService>,
+}
 
+#[cfg(feature = "wasmtime-runtime")]
+impl TestRuntimeState {
+    pub(crate) fn with_network(network: TestNetworkService) -> Self {
+        Self {
+            network: Some(network),
+        }
+    }
+}
+
+#[cfg(feature = "wasmtime-runtime")]
 impl crate::component::ComponentRuntimeState for TestRuntimeState {
     fn uptime_nanos(&self, current_ticks: u64) -> u64 {
         current_ticks
@@ -339,6 +372,18 @@ impl crate::component::ComponentRuntimeState for TestRuntimeState {
         _: &str,
         _: crate::PerfSample,
     ) {
+    }
+
+    fn retire_network_handles(&self, retired: &crate::SocketRetirementQueue) {
+        match self.network.as_ref() {
+            Some(service) => {
+                crate::retire_queued_handles(retired, service);
+            }
+            None => assert!(
+                retired.is_empty(),
+                "a network-less test runtime state was handed a socket to retire"
+            ),
+        }
     }
 }
 
@@ -603,8 +648,8 @@ impl helios_netstack::NetworkInterface for RecordingNetworkInterface {
 ///
 /// An in-memory double that models an always-ready loopback peer. It
 /// lives here rather than inside one test module because several of
-/// them need the same double, and one of them needs a real
-/// [`crate::ComponentHostNetworkService`] built on top of it.
+/// them need the same double, and the component host's own tests
+/// substitute it for the machine's network service.
 #[cfg(feature = "wasmtime-runtime")]
 mod network {
     use alloc::vec;
@@ -649,6 +694,7 @@ mod network {
         closed: Arc<TestClosedStreams>,
         closed_udp: Arc<TestClosedStreams>,
         closed_listeners: Arc<TestClosedStreams>,
+        pump_wakes: Arc<AtomicUsize>,
     }
 
     impl TestNetworkService {
@@ -673,6 +719,13 @@ mod network {
         /// separate handles with separate lifetimes.
         pub(crate) fn closed_listeners(&self) -> Arc<TestClosedStreams> {
             self.closed_listeners.clone()
+        }
+
+        /// How many times a retirement drain has kicked the packet
+        /// pump, which is what proves a queued FIN leaves on the next
+        /// executor turn rather than the next protocol timer (#232).
+        pub(crate) fn packet_pump_wakes(&self) -> usize {
+            self.pump_wakes.load(Ordering::Acquire)
         }
     }
 
@@ -953,6 +1006,10 @@ mod network {
         fn udp_close(&self, socket: Self::UdpSocket) {
             self.closed_udp.record(socket);
         }
+
+        fn wake_packet_pump(&self) {
+            self.pump_wakes.fetch_add(1, Ordering::AcqRel);
+        }
     }
 
     impl crate::NetworkAdminBackend for TestNetworkService {
@@ -1087,53 +1144,78 @@ mod network {
 #[cfg(feature = "wasmtime-runtime")]
 pub(crate) use network::{TestClosedStreams, TestNetworkService};
 
-/// A [`crate::ComponentHostNetworkService`] over a fresh
-/// [`TestNetworkService`], for a test that does not inspect what the
-/// service was asked to retire.
+/// A fresh [`TestNetworkService`], for a test that does not inspect
+/// what the service was asked to retire.
 #[cfg(feature = "wasmtime-runtime")]
-pub(crate) fn test_network_service() -> crate::ComponentHostNetworkService {
-    crate::ComponentHostNetworkService::from_service(TestNetworkService::new())
+pub(crate) fn test_network_service() -> TestNetworkService {
+    TestNetworkService::new()
 }
 
 /// The same, paired with the log of the streams it retires.
 #[cfg(feature = "wasmtime-runtime")]
-pub(crate) fn recording_network_service() -> (
-    crate::ComponentHostNetworkService,
-    triomphe::Arc<TestClosedStreams>,
-) {
+pub(crate) fn recording_network_service() -> (TestNetworkService, triomphe::Arc<TestClosedStreams>)
+{
     let service = TestNetworkService::new();
     let closed = service.closed();
-    (
-        crate::ComponentHostNetworkService::from_service(service),
-        closed,
-    )
+    (service, closed)
+}
+
+/// A store's end of the socket retirement queue, for a test with no
+/// store around it.
+///
+/// A component's socket resource holds no service: it queues what it
+/// owns when it dies, and the store closes it on its next turn. A
+/// lifetime test therefore asserts on both halves — the drop queued the
+/// id, and the drain closed it through this service — and drains
+/// through [`crate::retire_queued_handles`], the same function the live
+/// kernel's runtime state calls.
+#[cfg(feature = "wasmtime-runtime")]
+pub(crate) struct TestSocketRetirement {
+    queue: crate::SocketRetirementQueue,
+    service: TestNetworkService,
+}
+
+#[cfg(feature = "wasmtime-runtime")]
+impl TestSocketRetirement {
+    pub(crate) fn new(service: TestNetworkService) -> Self {
+        Self {
+            queue: crate::SocketRetirementQueue::new(),
+            service,
+        }
+    }
+
+    /// The sender a socket resource this fixture stands behind holds.
+    pub(crate) fn sender(&self) -> crate::SocketRetirementSender {
+        self.queue.sender()
+    }
+
+    /// Whether a dying socket has queued anything the store has yet to
+    /// close.
+    pub(crate) fn queued(&self) -> bool {
+        !self.queue.is_empty()
+    }
+
+    /// Closes everything queued, answering how many handles it closed.
+    pub(crate) fn drain(&self) -> usize {
+        crate::retire_queued_handles(&self.queue, &self.service)
+    }
 }
 
 /// The same again, paired with the log of the listeners it retires.
 #[cfg(feature = "wasmtime-runtime")]
-pub(crate) fn recording_listener_network_service() -> (
-    crate::ComponentHostNetworkService,
-    triomphe::Arc<TestClosedStreams>,
-) {
+pub(crate) fn recording_listener_network_service()
+-> (TestNetworkService, triomphe::Arc<TestClosedStreams>) {
     let service = TestNetworkService::new();
     let closed = service.closed_listeners();
-    (
-        crate::ComponentHostNetworkService::from_service(service),
-        closed,
-    )
+    (service, closed)
 }
 
 /// The same again, paired with the log of the datagram sockets it
 /// retires.
 #[cfg(feature = "wasmtime-runtime")]
-pub(crate) fn recording_udp_network_service() -> (
-    crate::ComponentHostNetworkService,
-    triomphe::Arc<TestClosedStreams>,
-) {
+pub(crate) fn recording_udp_network_service()
+-> (TestNetworkService, triomphe::Arc<TestClosedStreams>) {
     let service = TestNetworkService::new();
     let closed = service.closed_udp_sockets();
-    (
-        crate::ComponentHostNetworkService::from_service(service),
-        closed,
-    )
+    (service, closed)
 }
