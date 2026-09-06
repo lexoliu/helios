@@ -8,7 +8,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context as _, Result, bail};
 use askama::Template;
 use clap::{Args as ClapArgs, Subcommand, ValueEnum};
 use console::style;
@@ -17,16 +16,19 @@ use helios_hal::fs::HOST_SHARE_MOUNT_TAG;
 use helios_inspector_protocol::debugger::filesystem as debugger_fs;
 use helios_inspector_protocol::system::profiling as system_profiling;
 use helios_inspector_protocol::system::programs as system_programs;
-use helios_workspace_root::WorkspaceRoot;
+use helios_workspace_root::{WorkspaceRoot, WorkspaceRootError};
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 
 use crate::stats_tui::format_bytes;
 use crate::workload_bench::{
-    DEFAULT_WORKLOAD_TIMEOUT_SECONDS, VmProvenance, WorkloadBenchCommand, guest_step_under_deadline,
+    DEFAULT_WORKLOAD_TIMEOUT_SECONDS, VmProvenance, WorkloadBenchCommand, WorkloadBenchError,
+    WorkloadSelectionError, guest_step_under_deadline,
 };
-use crate::{SessionCommand, connect_client, run_connected};
+use crate::{
+    ConnectError, InterruptError, SessionCommand, SessionError, connect_client, run_connected,
+};
 
 mod network;
 mod qemu;
@@ -35,11 +37,415 @@ mod raw_profile;
 
 use network::{
     HostPlatform, NetSetupCommand, NetTeardownCommand, QemuNetArgs, VmNetwork, VmNetworkArgs,
-    VmNetworkFile, VmNetworkProfile,
+    VmNetworkError, VmNetworkFile, VmNetworkProfile, VmNetworkSetupError,
 };
 use qemu::QemuOptions;
-use qmp::QmpClient;
-use raw_profile::ProfileCommand;
+use qmp::{QmpClient, QmpError, SizeError};
+use raw_profile::{ProfileCommand, RawProfileCollectError};
+
+/// Why a `vm` session did not run.
+///
+/// The four stages are separate variants because a failure in each is
+/// answered somewhere else: the flags and the config file, the guest
+/// build, the machine QEMU was asked to construct, and the session that
+/// ran on it once it was up.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum VmError {
+    #[error("{0}")]
+    NetworkSetup(#[from] VmNetworkSetupError),
+    #[error("{0}")]
+    Config(#[from] VmConfigError),
+    #[error("{0}")]
+    Build(#[from] VmBuildError),
+    #[error("{0}")]
+    Runtime(#[from] VmRuntimeError),
+    /// A session that failed, with the runtime directory it left behind
+    /// and QEMU's own account of the machine.
+    ///
+    /// QEMU's log is the only record of a machine it refused to build or
+    /// a device backend that never started, and the runtime directory is
+    /// about to go away, so both travel with the failure.
+    #[error("VM runtime directory: {runtime_dir}\n{report}: {source}")]
+    Session {
+        runtime_dir: String,
+        report: String,
+        #[source]
+        source: VmSessionError,
+    },
+}
+
+/// Why the flags, the config file and this host do not describe a VM
+/// that can be booted.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum VmConfigError {
+    #[error("--release and --kernel-debug cannot be used together")]
+    ReleaseWithKernelDebug,
+    #[error(
+        "--profile-generate builds its own optimised kernel and cannot be combined with \
+         --release, --debug or --kernel-debug"
+    )]
+    ProfileGenerateWithOtherProfile,
+    #[error("{0}")]
+    WorkloadSelection(#[from] WorkloadSelectionError),
+    #[error("failed to read inspector VM config {path}: {source}")]
+    ReadConfig {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to decode inspector VM config {path}: {source}")]
+    DecodeConfig {
+        path: String,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("{0}")]
+    NoNativeAccelerator(#[from] NoNativeAccelerator),
+    #[error("--data-disk-size must be greater than zero")]
+    ZeroDataDiskSize,
+    #[error("--gdb-wait requires --gdb or --debug")]
+    GdbWaitWithoutGdb,
+    #[error("{0}")]
+    VsockUnsupported(#[from] crate::vsock::VsockUnsupported),
+    #[error(
+        "--rpc-transport vsock keeps the guest console on the serial line, \
+         which --serial-stdio and --serial-pty take over"
+    )]
+    VsockWithSerialConsole,
+    #[error("--vsock-cid must be 3 or greater; 0, 1 and 2 are reserved")]
+    ReservedVsockCid,
+    #[error("--serial-stdio cannot share stdio with --monitor stdio")]
+    SerialStdioWithMonitorStdio,
+    #[error(
+        "--acpi is not available on {arch}: its machine publishes one firmware description \
+         and the kernel already takes that one"
+    )]
+    AcpiUnavailable { arch: &'static str },
+    #[error(
+        "--iommu is not available on {arch}: its virtio devices are memory-mapped, and \
+         virtio-iommu can only confine PCI endpoints"
+    )]
+    IommuUnavailable { arch: &'static str },
+    #[error("{0}")]
+    Network(#[from] VmNetworkError),
+    #[error("shared directory does not exist: {path}")]
+    SharedDirMissing { path: String },
+    #[error("aarch64-virt-hvf requires an aarch64 host; pass --accel tcg explicitly for TCG")]
+    HvfNeedsAarch64Host,
+    #[error("{0}")]
+    WorkspaceRoot(#[from] WorkspaceRootError),
+}
+
+/// Why the guest image or the host tools a boot needs could not be
+/// built.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum VmBuildError {
+    #[error("{0}")]
+    Step(#[from] BuildStepError),
+    #[error("{0}")]
+    Tool(#[from] ToolDiscoveryError),
+    #[error("{0}")]
+    WorkspaceRoot(#[from] WorkspaceRootError),
+}
+
+/// One build or provisioning step run as a child process.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum BuildStepError {
+    #[error("failed to spawn {label}: {source}")]
+    Spawn {
+        label: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("{label} exited with status {status}")]
+    Exited {
+        label: String,
+        status: std::process::ExitStatus,
+    },
+}
+
+/// Why a host tool the inspector drives could not be found.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ToolDiscoveryError {
+    #[error("HELIOS_CLI_BIN does not point to a file: {path}")]
+    CliBinNotAFile { path: String },
+    #[error("failed to locate current executable: {source}")]
+    CurrentExe {
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to find helios-cli; run `cargo build -p helios-cli` or set HELIOS_CLI_BIN")]
+    CliMissing,
+}
+
+/// Why the machine itself could not be constructed or started.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum VmRuntimeError {
+    #[error("failed to create VM runtime directory {path}: {source}")]
+    CreateRuntimeDir {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to create temporary QEMU runtime directory: {source}")]
+    CreateTempRuntimeDir {
+        #[source]
+        source: io::Error,
+    },
+    #[error("system time is earlier than UNIX_EPOCH: {source}")]
+    SystemTimeBeforeEpoch {
+        #[source]
+        source: std::time::SystemTimeError,
+    },
+    #[error("{0}")]
+    WorkspaceRoot(#[from] WorkspaceRootError),
+    #[error("{0}")]
+    Serial(#[from] crate::serial::SerialError),
+    #[error("{0}")]
+    Tool(#[from] ToolDiscoveryError),
+    #[error("{0}")]
+    Step(#[from] BuildStepError),
+    #[error("failed to create socket directory {path}: {source}")]
+    CreateSocketDir {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to inspect existing socket path {path}: {source}")]
+    InspectSocketPath {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("refusing to overwrite existing non-socket path {path}")]
+    SocketPathNotASocket { path: String },
+    #[error("failed to remove stale socket {path}: {source}")]
+    RemoveStaleSocket {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to create log directory {path}: {source}")]
+    CreateLogDir {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to canonicalize kernel {path}: {source}")]
+    CanonicalizeKernel {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to create scratch disk image {path}: {source}")]
+    CreateDataDisk {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to size scratch disk image {path}: {source}")]
+    SizeDataDisk {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("QEMU option paths must be valid UTF-8: {path}")]
+    OptionPathNotUtf8 { path: String },
+    #[error("{env_var} does not point to a file: {path}")]
+    Edk2EnvNotAFile { env_var: &'static str, path: String },
+    #[error("failed to find QEMU EDK2 {arch} firmware; set {env_var}")]
+    Edk2CodeMissing {
+        arch: &'static str,
+        env_var: &'static str,
+    },
+    #[error("failed to find QEMU EDK2 {arch} variable store next to {code}")]
+    Edk2VarsMissing { arch: &'static str, code: String },
+    #[error("failed to prepare EDK2 variable store {vars} from {template}: {source}")]
+    Edk2VarsCopy {
+        vars: String,
+        template: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to {step} {path}: {source}")]
+    QemuLog {
+        /// `create` or `open … for append`, spelled as the message reads
+        /// it.
+        step: &'static str,
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to start QEMU executable {path}: {source}")]
+    SpawnQemu {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("QEMU {pipe} pipe was not available for serial stdio")]
+    ChildPipeMissing { pipe: &'static str },
+    #[error("failed to poll QEMU process state: {source}")]
+    PollQemu {
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to read QEMU log {path}: {source}")]
+    ReadQemuLog {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("QEMU exited before opening the debug serial socket {socket}\n{log}")]
+    QemuExitedBeforeSocket { socket: String, log: String },
+    #[error("timed out waiting for QEMU to create debug serial socket {socket}")]
+    SocketTimedOut { socket: String },
+    #[error("VM transport was already taken")]
+    TransportAlreadyTaken,
+    #[error("{0}")]
+    SocketPathTooLong(#[from] SocketPathTooLong),
+    #[error("failed to create the VM socket directory in {path}: {source}")]
+    CreateSocketDirectory {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to replace the stale socket link {path}: {source}")]
+    ReplaceSocketLink {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to record the socket directory {target} as {link}: {source}")]
+    RecordSocketLink {
+        target: String,
+        link: String,
+        #[source]
+        source: io::Error,
+    },
+}
+
+/// Why the session that ran on the booted machine failed.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum VmSessionError {
+    #[error("{0}")]
+    Runtime(#[from] VmRuntimeError),
+    #[error("socket path must be valid UTF-8: {path}")]
+    SocketPathNotUtf8 { path: String },
+    #[error("failed to connect inspector RPC client{over}: {source}")]
+    Connect {
+        /// The transport the connection was attempted over, empty for the
+        /// serial socket the plain `--socket` path uses.
+        over: &'static str,
+        #[source]
+        source: ConnectError,
+    },
+    #[error("failed to connect inspector RPC client over vsock: {source}")]
+    ConnectVsock {
+        #[source]
+        source: crate::vsock::VsockConnectError,
+    },
+    #[error("the balloon command needs a QMP socket; pass --qmp unix:<path>,server=on,wait=off")]
+    BalloonNeedsQmp,
+    #[error("{0}")]
+    Qmp(#[from] QmpError),
+    #[error("{0}")]
+    Size(#[from] SizeError),
+    #[error("failed to set the balloon target to {target}: {source}")]
+    SetBalloonTarget {
+        target: String,
+        #[source]
+        source: QmpError,
+    },
+    #[error("{0}")]
+    WorkloadBench(#[from] WorkloadBenchError),
+    #[error("{0}")]
+    AotBench(#[from] AotBenchError),
+    #[error("{0}")]
+    RawProfile(#[from] RawProfileCollectError),
+    #[error("{0}")]
+    ProfileOutput(#[from] ProfileOutputError),
+    #[error("{0}")]
+    Session(#[from] SessionError),
+    #[error("{0}")]
+    Interrupt(#[from] InterruptError),
+    #[error("{0}")]
+    Profiling(#[from] ProfilingStepError),
+}
+
+/// One profiling RPC around a bench run, named by the step it was for.
+///
+/// Every one of them fails the same way — the guest refused or never
+/// answered — so the step is what tells them apart in the message.
+#[derive(Debug, thiserror::Error)]
+#[error("failed to {step}: {source}")]
+pub(crate) struct ProfilingStepError {
+    /// The profiling step, spelled the way the message reads it.
+    step: &'static str,
+    #[source]
+    source: helios_inspector_protocol::RpcError,
+}
+
+/// Why an `aot-bench` run did not produce its measurements.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum AotBenchError {
+    #[error("failed to read {path}: {source}")]
+    ReadWasm {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("aot-bench --iterations must be non-zero")]
+    ZeroIterations,
+    #[error("failed to upload {path}: {source}")]
+    Upload {
+        path: String,
+        #[source]
+        source: helios_inspector_protocol::RpcError,
+    },
+    #[error("failed to AOT compile uploaded wasm iteration {iteration}: {source}")]
+    Compile {
+        iteration: u16,
+        #[source]
+        source: helios_inspector_protocol::RpcError,
+    },
+    #[error("remote AOT iteration {iteration} failed: {kind:?}: {detail}")]
+    Refused {
+        iteration: u16,
+        kind: system_programs::ExecErrorKind,
+        detail: String,
+    },
+    #[error("failed to report an aot-bench iteration: {source}")]
+    Report {
+        #[source]
+        source: io::Error,
+    },
+    #[error("{0}")]
+    ProfileOutput(#[from] ProfileOutputError),
+    #[error("{0}")]
+    RawProfile(#[from] RawProfileCollectError),
+}
+
+/// Why a profile or metric file a run asked for was not written.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ProfileOutputError {
+    #[error("failed to write {path}: {source}")]
+    Write {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to encode the perf metrics for {path}: {source}")]
+    Encode {
+        path: String,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("failed to report the written profile outputs: {source}")]
+    Report {
+        #[source]
+        source: io::Error,
+    },
+}
 
 const DEFAULT_BAUD: u32 = 115_200;
 const DEFAULT_AARCH64_QEMU_BIN: &str = "qemu-system-aarch64";
@@ -915,7 +1321,7 @@ enum ResolvedVmSessionCommand {
     Profile(ProfileCommand),
 }
 
-pub(crate) fn run(mut command: VmCommand) -> Result<()> {
+pub(crate) fn run(mut command: VmCommand) -> Result<(), VmError> {
     // The privileged network helpers provision the host, they do not boot
     // a guest, so they are dispatched before any build or QEMU work.
     match command.command.take() {
@@ -927,14 +1333,15 @@ pub(crate) fn run(mut command: VmCommand) -> Result<()> {
         // preflights the QEMU host state nor spawns a guest.
         Some(VmSessionCommand::Build) => {
             let file = load_config_file(command.config.as_deref())?;
-            return build_vm(&resolve_build(&command, &file, None)?);
+            return Ok(build_vm(&resolve_build(&command, &file, None)?)?);
         }
         // Answers from the build spec and boots nothing, so like `build`
         // it needs neither an accelerator nor a guest.
         Some(VmSessionCommand::KernelPath) => {
             let file = load_config_file(command.config.as_deref())?;
             let build = resolve_build(&command, &file, None)?;
-            let kernel = resolve_kernel_path(command.kernel, file.kernel, &build)?;
+            let kernel = resolve_kernel_path(command.kernel, file.kernel, &build)
+                .map_err(VmConfigError::from)?;
             println!("{}", kernel.display());
             return Ok(());
         }
@@ -947,15 +1354,16 @@ pub(crate) fn run(mut command: VmCommand) -> Result<()> {
     }
     let mut runtime = VmRuntime::spawn(&command)?;
     let result = connect_and_run(&command, &mut runtime);
-    let runtime_dir = runtime.runtime_dir_path().to_path_buf();
+    let runtime_dir = runtime.runtime_dir_path().display().to_string();
     // QEMU's own log is the only account of a machine it refused to
     // build or a device backend that never started, and the runtime
     // directory is about to go away, so a failed session reads it here.
     let report = result.is_err().then(|| runtime.qemu_report());
     runtime.shutdown();
-    result.with_context(|| match &report {
-        Some(report) => format!("VM runtime directory: {}\n{report}", runtime_dir.display()),
-        None => format!("VM runtime directory: {}", runtime_dir.display()),
+    result.map_err(|source| VmError::Session {
+        runtime_dir,
+        report: report.unwrap_or_default(),
+        source,
     })
 }
 
@@ -978,7 +1386,7 @@ fn resolve_build(
     command: &VmCommand,
     file: &VmConfigFile,
     session_command: Option<&ResolvedVmSessionCommand>,
-) -> Result<KernelBuildSpec> {
+) -> Result<KernelBuildSpec, VmConfigError> {
     let arch = file.arch.unwrap_or(command.arch);
     let profile = arch.profile();
     let release = command.release || file.release.unwrap_or(false);
@@ -986,12 +1394,10 @@ fn resolve_build(
     let kernel_debug =
         debug_shortcut(command, file) || command.kernel_debug || file.kernel_debug.unwrap_or(false);
     if release && kernel_debug {
-        bail!("--release and --kernel-debug cannot be used together");
+        return Err(VmConfigError::ReleaseWithKernelDebug);
     }
     if profile_generate && (release || kernel_debug) {
-        bail!(
-            "--profile-generate builds its own optimised kernel and cannot be combined with --release, --debug or --kernel-debug"
-        );
+        return Err(VmConfigError::ProfileGenerateWithOtherProfile);
     }
     let kind = if profile_generate {
         KernelBuildProfile::ProfileGenerate
@@ -1027,14 +1433,14 @@ fn resolve_kernel_path(
     explicit: Option<PathBuf>,
     configured: Option<PathBuf>,
     build: &KernelBuildSpec,
-) -> Result<PathBuf> {
+) -> Result<PathBuf, WorkspaceRootError> {
     match explicit.or(configured) {
         Some(kernel) => Ok(kernel),
         None => default_kernel_path(build.profile.arch, build.kind.directory()),
     }
 }
 
-fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand> {
+fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
     let file = load_config_file(command.config.as_deref())?;
     let session_command: Option<ResolvedVmSessionCommand> = command.command.take().map(Into::into);
     let build = resolve_build(&command, &file, session_command.as_ref())?;
@@ -1076,7 +1482,7 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand> {
         .or(file.data_disk_size)
         .unwrap_or(DEFAULT_DATA_DISK_BYTES);
     if data_disk_bytes == 0 {
-        bail!("--data-disk-size must be greater than zero");
+        return Err(VmConfigError::ZeroDataDiskSize);
     }
     let gdb = command
         .gdb
@@ -1084,7 +1490,7 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand> {
         .or_else(|| debug.then(|| DEFAULT_GDB_ENDPOINT.to_owned()));
     let gdb_wait = debug || command.gdb_wait || file.gdb_wait.unwrap_or(false);
     if gdb_wait && gdb.is_none() {
-        bail!("--gdb-wait requires --gdb or --debug");
+        return Err(VmConfigError::GdbWaitWithoutGdb);
     }
     let rpc_transport = command
         .rpc_transport
@@ -1100,18 +1506,15 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand> {
         // QEMU with a message about a device model that does not exist.
         crate::vsock::preflight()?;
         if command.serial_stdio || command.serial_pty {
-            bail!(
-                "--rpc-transport vsock keeps the guest console on the serial line, \
-                 which --serial-stdio and --serial-pty take over"
-            );
+            return Err(VmConfigError::VsockWithSerialConsole);
         }
         if vsock_cid < 3 {
-            bail!("--vsock-cid must be 3 or greater; 0, 1 and 2 are reserved");
+            return Err(VmConfigError::ReservedVsockCid);
         }
     }
     let monitor = command.monitor.or(file.monitor);
     if command.serial_stdio && matches!(monitor.as_deref(), Some("stdio")) {
-        bail!("--serial-stdio cannot share stdio with --monitor stdio");
+        return Err(VmConfigError::SerialStdioWithMonitorStdio);
     }
     let qmp = command.qmp.or(file.qmp);
     let qemu_log = command.qemu_log.or(file.qemu_log);
@@ -1126,19 +1529,15 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand> {
         debug || command.keep_runtime_dir || file.keep_runtime_dir.unwrap_or(false);
     let acpi = command.acpi || file.acpi.unwrap_or(false);
     if acpi && profile.acpi_machine.is_none() {
-        bail!(
-            "--acpi is not available on {}: its machine publishes one firmware description and \
-             the kernel already takes that one",
-            arch_label(arch)
-        );
+        return Err(VmConfigError::AcpiUnavailable {
+            arch: arch_label(arch),
+        });
     }
     let iommu = command.iommu || file.iommu.unwrap_or(false);
     if iommu && profile.iommu.is_none() {
-        bail!(
-            "--iommu is not available on {}: its virtio devices are memory-mapped, and \
-             virtio-iommu can only confine PCI endpoints",
-            arch_label(arch)
-        );
+        return Err(VmConfigError::IommuUnavailable {
+            arch: arch_label(arch),
+        });
     }
     let virtio_devices = VirtioDeviceProfile {
         ring: if command.virtio_packed || file.virtio_packed.unwrap_or(false) {
@@ -1204,7 +1603,7 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand> {
     })
 }
 
-fn load_config_file(path: Option<&Path>) -> Result<VmConfigFile> {
+fn load_config_file(path: Option<&Path>) -> Result<VmConfigFile, VmConfigError> {
     let path = path.map(Path::to_path_buf).or_else(default_config_path);
     let Some(path) = path else {
         return Ok(VmConfigFile::default());
@@ -1212,10 +1611,14 @@ fn load_config_file(path: Option<&Path>) -> Result<VmConfigFile> {
     if !path.is_file() {
         return Ok(VmConfigFile::default());
     }
-    let bytes = fs::read(&path)
-        .with_context(|| format!("failed to read inspector VM config {}", path.display()))?;
-    serde_json::from_slice(&bytes)
-        .with_context(|| format!("failed to decode inspector VM config {}", path.display()))
+    let bytes = fs::read(&path).map_err(|source| VmConfigError::ReadConfig {
+        path: path.display().to_string(),
+        source,
+    })?;
+    serde_json::from_slice(&bytes).map_err(|source| VmConfigError::DecodeConfig {
+        path: path.display().to_string(),
+        source,
+    })
 }
 
 fn default_config_path() -> Option<PathBuf> {
@@ -1229,7 +1632,7 @@ fn default_config_path() -> Option<PathBuf> {
 /// whole point of refusing to fall back is that the caller learns which
 /// check failed instead of silently getting an emulator.
 #[derive(Debug, thiserror::Error)]
-enum AcceleratorUnavailable {
+pub(crate) enum AcceleratorUnavailable {
     #[error("`{accelerator}` needs a {required} host and this one is {host}")]
     HostArchitecture {
         accelerator: &'static str,
@@ -1266,7 +1669,7 @@ enum AcceleratorUnavailable {
      pass `--accel tcg` to run under emulation on purpose",
     .checks.iter().map(|check| format!("  - {check}")).collect::<Vec<_>>().join("\n")
 )]
-struct NoNativeAccelerator {
+pub(crate) struct NoNativeAccelerator {
     arch: &'static str,
     checks: Vec<AcceleratorUnavailable>,
 }
@@ -1354,17 +1757,19 @@ fn default_cpu(profile: &VmProfile, accel: &[String]) -> Option<&'static str> {
     }
 }
 
-fn ensure_qemu_command(command: &ResolvedVmCommand) -> Result<()> {
+fn ensure_qemu_command(command: &ResolvedVmCommand) -> Result<(), VmConfigError> {
     if let Some(shared_dir) = &command.shared_dir
         && !shared_dir.is_dir()
     {
-        bail!("shared directory does not exist: {}", shared_dir.display());
+        return Err(VmConfigError::SharedDirMissing {
+            path: shared_dir.display().to_string(),
+        });
     }
     if command.profile.arch == VmArch::Aarch64
         && command.accel.iter().any(|accel| accel == "hvf")
         && std::env::consts::ARCH != "aarch64"
     {
-        bail!("aarch64-virt-hvf requires an aarch64 host; pass --accel tcg explicitly for TCG");
+        return Err(VmConfigError::HvfNeedsAarch64Host);
     }
     // Host state the selected backend depends on is checked before the
     // kernel build, so a missing tap costs seconds rather than a rebuild.
@@ -1376,7 +1781,7 @@ fn ensure_qemu_command(command: &ResolvedVmCommand) -> Result<()> {
     Ok(())
 }
 
-fn build_vm(command: &KernelBuildSpec) -> Result<()> {
+fn build_vm(command: &KernelBuildSpec) -> Result<(), VmBuildError> {
     let repo_root = repo_root()?;
     run_step(
         "building helios-cli",
@@ -1472,7 +1877,7 @@ fn profile_generate_rustflags(profile: &VmProfile) -> String {
     format!("target.\"{}\".rustflags={flags}", profile.cargo_target)
 }
 
-fn run_kernel_prebuild(command: &KernelBuildSpec) -> Result<PathBuf> {
+fn run_kernel_prebuild(command: &KernelBuildSpec) -> Result<PathBuf, VmBuildError> {
     let cli = discover_helios_cli()?;
     let repo_root = repo_root()?;
     let out_dir = repo_root
@@ -1502,36 +1907,48 @@ fn run_kernel_prebuild(command: &KernelBuildSpec) -> Result<PathBuf> {
     Ok(out_dir.join("kernel-prebuild.json"))
 }
 
-fn connect_and_run(command: &ResolvedVmCommand, runtime: &mut VmRuntime) -> Result<()> {
+fn connect_and_run(
+    command: &ResolvedVmCommand,
+    runtime: &mut VmRuntime,
+) -> Result<(), VmSessionError> {
     let qmp_socket = runtime.qmp_socket.clone();
     let client = match runtime.take_transport()? {
         VmTransport::SerialSocket(socket_path) => {
-            let socket = socket_path.to_str().ok_or_else(|| {
-                anyhow::anyhow!("socket path must be valid UTF-8: {}", socket_path.display())
-            })?;
+            let socket = socket_path
+                .to_str()
+                .ok_or_else(|| VmSessionError::SocketPathNotUtf8 {
+                    path: socket_path.display().to_string(),
+                })?;
             connect_client(socket, command.baud, true)
-                .context("failed to connect inspector RPC client")?
+                .map_err(|source| VmSessionError::Connect { over: "", source })?
         }
         VmTransport::SerialIo(io) => crate::runtime::block_on(async move {
             crate::ready::connect_after_boot(io)
                 .await
-                .context("failed to connect inspector RPC client over QEMU stdio serial")
+                .map_err(|error| VmSessionError::Connect {
+                    over: " over QEMU stdio serial",
+                    source: ConnectError::from(error),
+                })
         })?,
         VmTransport::VsockAfterSerial {
             serial_socket,
             guest_cid,
         } => {
-            let socket = serial_socket.to_str().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "socket path must be valid UTF-8: {}",
-                    serial_socket.display()
-                )
-            })?;
+            let socket =
+                serial_socket
+                    .to_str()
+                    .ok_or_else(|| VmSessionError::SocketPathNotUtf8 {
+                        path: serial_socket.display().to_string(),
+                    })?;
             let baud = command.baud;
             crate::runtime::block_on(async move {
-                let io = crate::serial::open(socket, baud).await?;
+                let io = crate::serial::open(socket, baud)
+                    .await
+                    .map_err(ConnectError::from)?;
                 let (read, _write) = io.into_split();
-                let read = crate::ready::wait_for_boot(read).await?;
+                let read = crate::ready::wait_for_boot(read)
+                    .await
+                    .map_err(ConnectError::from)?;
                 // The console echo starts before the RPC connection, not
                 // after it: nothing else reads the serial socket once the
                 // RPC has moved off it, and a socket QEMU cannot write
@@ -1544,10 +1961,18 @@ fn connect_and_run(command: &ResolvedVmCommand, runtime: &mut VmRuntime) -> Resu
                         .await?;
                 let mut client =
                     helios_inspector_protocol::transport::Client::new(vsock_read, vsock_write);
-                crate::ready::wait_until_ready(&mut client).await?;
-                Ok::<_, anyhow::Error>(client)
+                crate::ready::wait_until_ready(&mut client)
+                    .await
+                    .map_err(ConnectError::from)?;
+                Ok::<_, VsockSessionError>(client)
             })
-            .context("failed to connect inspector RPC client over vsock")?
+            .map_err(|error| match error {
+                VsockSessionError::Vsock { source } => VmSessionError::ConnectVsock { source },
+                VsockSessionError::Connect { source } => VmSessionError::Connect {
+                    over: " over vsock",
+                    source,
+                },
+            })?
         }
     };
     match command.command.clone() {
@@ -1565,17 +1990,34 @@ fn connect_and_run(command: &ResolvedVmCommand, runtime: &mut VmRuntime) -> Resu
             },
         ),
         Some(ResolvedVmSessionCommand::Balloon(balloon)) => {
-            let socket = qmp_socket.context(
-                "the balloon command needs a QMP socket; pass --qmp unix:<path>,server=on,wait=off",
-            )?;
+            let socket = qmp_socket.ok_or(VmSessionError::BalloonNeedsQmp)?;
             run_balloon(client, balloon, &socket)
         }
         Some(ResolvedVmSessionCommand::Profile(profile)) => {
-            crate::run_interruptible(async move { raw_profile::run(&client, &profile).await })
+            crate::run_interruptible(async move { Ok(raw_profile::run(&client, &profile).await?) })
         }
-        Some(ResolvedVmSessionCommand::Session(command)) => run_connected(client, Some(command)),
-        None => run_connected(client, None),
+        Some(ResolvedVmSessionCommand::Session(command)) => {
+            Ok(run_connected(client, Some(command))?)
+        }
+        None => Ok(run_connected(client, None)?),
     }
+}
+
+/// The two ways the vsock hand-off can fail, kept apart so the message
+/// says whether the guest never came up on the serial line or the vsock
+/// connection itself was refused.
+#[derive(Debug, thiserror::Error)]
+enum VsockSessionError {
+    #[error("{source}")]
+    Vsock {
+        #[from]
+        source: crate::vsock::VsockConnectError,
+    },
+    #[error("{source}")]
+    Connect {
+        #[from]
+        source: ConnectError,
+    },
 }
 
 /// Moves the guest's balloon through the targets the caller named,
@@ -1590,20 +2032,23 @@ fn run_balloon(
     mut client: crate::serial::RpcClient,
     command: BalloonCommand,
     qmp_socket: &Path,
-) -> Result<()> {
+) -> Result<(), VmSessionError> {
     let mut qmp = QmpClient::connect(qmp_socket)?;
-    report_balloon(&mut qmp, &mut client, "initial")?;
+    report_balloon(&mut qmp, &mut client, "initial");
 
     for target in &command.targets {
         let bytes = qmp::parse_size(target)?;
         println!("{} balloon target {target}", style("set").cyan());
         qmp.set_balloon(bytes)
-            .with_context(|| format!("failed to set the balloon target to {target}"))?;
-        settle_balloon(&mut client, bytes, command.settle_seconds)?;
-        report_balloon(&mut qmp, &mut client, target)?;
+            .map_err(|source| VmSessionError::SetBalloonTarget {
+                target: target.clone(),
+                source,
+            })?;
+        settle_balloon(&mut client, bytes, command.settle_seconds);
+        report_balloon(&mut qmp, &mut client, target);
         if command.hold_seconds != 0 {
             std::thread::sleep(Duration::from_secs(command.hold_seconds));
-            report_balloon(&mut qmp, &mut client, &format!("{target} after hold"))?;
+            report_balloon(&mut qmp, &mut client, &format!("{target} after hold"));
         }
     }
     Ok(())
@@ -1621,7 +2066,7 @@ fn run_balloon(
 /// inflate past its own pressure floor and reports the truth, so the
 /// wait ends when the guest stops moving and the caller sees where it
 /// stopped.
-fn settle_balloon(client: &mut crate::serial::RpcClient, target: u64, seconds: u64) -> Result<()> {
+fn settle_balloon(client: &mut crate::serial::RpcClient, target: u64, seconds: u64) {
     let started = std::time::Instant::now();
     let deadline = started + Duration::from_secs(seconds);
     let mut previous = None;
@@ -1637,7 +2082,7 @@ fn settle_balloon(client: &mut crate::serial::RpcClient, target: u64, seconds: u
                     "{} guest stopped answering before the {seconds}s wait ran out",
                     style("settled").yellow()
                 );
-                return Ok(());
+                return;
             }
             std::thread::sleep(Duration::from_secs(1));
             continue;
@@ -1649,7 +2094,7 @@ fn settle_balloon(client: &mut crate::serial::RpcClient, target: u64, seconds: u
                 style("settled").green(),
                 started.elapsed().as_secs_f64()
             );
-            return Ok(());
+            return;
         }
         if actual != previous {
             previous = actual;
@@ -1661,14 +2106,14 @@ fn settle_balloon(client: &mut crate::serial::RpcClient, target: u64, seconds: u
                 actual.map_or_else(|| "no balloon".to_owned(), format_bytes),
                 started.elapsed().as_secs_f64()
             );
-            return Ok(());
+            return;
         }
         if std::time::Instant::now() >= deadline {
             println!(
                 "{} guest was still moving when the {seconds}s wait ran out",
                 style("settled").yellow()
             );
-            return Ok(());
+            return;
         }
         std::thread::sleep(Duration::from_secs(1));
     }
@@ -1682,17 +2127,13 @@ fn guest_stats(
     crate::runtime::block_on(crate::system::fetch_stats(client)).ok()
 }
 
-fn report_balloon(
-    qmp: &mut QmpClient,
-    client: &mut crate::serial::RpcClient,
-    label: &str,
-) -> Result<()> {
+fn report_balloon(qmp: &mut QmpClient, client: &mut crate::serial::RpcClient, label: &str) {
     let Some(sample) = guest_stats(client) else {
         println!(
             "{} {label}: the guest did not answer",
             style("balloon").yellow()
         );
-        return Ok(());
+        return;
     };
     let guest = match &sample.balloon {
         Some(balloon) => format!(
@@ -1715,14 +2156,13 @@ fn report_balloon(
         style("balloon").green(),
         format_bytes(sample.memory.available_bytes)
     );
-    Ok(())
 }
 
 fn run_workload_bench(
     mut client: crate::serial::RpcClient,
     command: WorkloadBenchCommand,
     provenance: VmProvenance,
-) -> Result<()> {
+) -> Result<(), VmSessionError> {
     crate::run_interruptible(async move {
         let profile_filter = system_profiling::Filter {
             scope: None,
@@ -1738,21 +2178,33 @@ fn run_workload_bench(
         let seconds = command.workload_timeout_seconds;
         let before_profile = if collect_profile {
             guest_step_under_deadline("the profile reset", seconds, async {
-                system_profiling::clear(&client)
-                    .await
-                    .context("failed to clear remote profile samples")
+                Ok::<_, VmSessionError>(
+                    profiling_step(
+                        "clear remote profile samples",
+                        system_profiling::clear(&client),
+                    )
+                    .await?,
+                )
             })
             .await?;
             guest_step_under_deadline("the profiler hand-off", seconds, async {
-                system_profiling::set_enabled(&client, true)
-                    .await
-                    .context("failed to enable remote profiling")
+                Ok::<_, VmSessionError>(
+                    profiling_step(
+                        "enable remote profiling",
+                        system_profiling::set_enabled(&client, true),
+                    )
+                    .await?,
+                )
             })
             .await?;
             guest_step_under_deadline("the initial profile read", seconds, async {
-                system_profiling::folded(&client, &profile_filter, 0)
-                    .await
-                    .context("failed to read initial remote profile samples")
+                Ok::<_, VmSessionError>(
+                    profiling_step(
+                        "read initial remote profile samples",
+                        system_profiling::folded(&client, &profile_filter, 0),
+                    )
+                    .await?,
+                )
             })
             .await?
         } else {
@@ -1763,27 +2215,39 @@ fn run_workload_bench(
             crate::workload_bench::run_inner(&mut client, &command, &provenance).await
         {
             print_recent_guest_errors(&mut client, seconds).await;
-            return Err(error);
+            return Err(error.into());
         }
 
         if collect_profile {
             guest_step_under_deadline("the profiler stop", seconds, async {
-                system_profiling::set_enabled(&client, false)
-                    .await
-                    .context("failed to disable remote profiling")
+                Ok::<_, VmSessionError>(
+                    profiling_step(
+                        "disable remote profiling",
+                        system_profiling::set_enabled(&client, false),
+                    )
+                    .await?,
+                )
             })
             .await?;
             let after_profile =
                 guest_step_under_deadline("the final profile read", seconds, async {
-                    system_profiling::folded(&client, &profile_filter, 0)
-                        .await
-                        .context("failed to read final remote profile samples")
+                    Ok::<_, VmSessionError>(
+                        profiling_step(
+                            "read final remote profile samples",
+                            system_profiling::folded(&client, &profile_filter, 0),
+                        )
+                        .await?,
+                    )
                 })
                 .await?;
             let metrics = guest_step_under_deadline("the perf metric read", seconds, async {
-                system_profiling::metrics(&client, &metric_filter, 0)
-                    .await
-                    .context("failed to read final remote perf metrics")
+                Ok::<_, VmSessionError>(
+                    profiling_step(
+                        "read final remote perf metrics",
+                        system_profiling::metrics(&client, &metric_filter, 0),
+                    )
+                    .await?,
+                )
             })
             .await?;
             write_requested_profile_outputs(&command, &before_profile, &after_profile, &metrics)?;
@@ -1793,6 +2257,19 @@ fn run_workload_bench(
         }
         Ok(())
     })
+}
+
+/// Runs one profiling RPC, naming the step it was for.
+///
+/// Every profiling call around a bench run fails the same way — the
+/// guest refused or never answered — so the step it was for is what
+/// tells them apart in the message.
+async fn profiling_step<T>(
+    step: &'static str,
+    call: impl std::future::Future<Output = Result<T, helios_inspector_protocol::RpcError>>,
+) -> Result<T, ProfilingStepError> {
+    call.await
+        .map_err(|source| ProfilingStepError { step, source })
 }
 
 /// Fetches and prints the guest's recent tracing events (info level and
@@ -1808,7 +2285,7 @@ async fn print_recent_guest_errors(client: &mut crate::serial::RpcClient, second
     config.limit = 100;
     config.min_level = Some(helios_inspector_protocol::system::tracing::Level::Info);
     let fetched = guest_step_under_deadline("the tracing fetch", seconds, async {
-        crate::system::fetch_tracing(client, &config).await
+        Ok::<_, WorkloadBenchError>(crate::system::fetch_tracing(client, &config).await?)
     })
     .await;
     match fetched {
@@ -1821,20 +2298,28 @@ async fn print_recent_guest_errors(client: &mut crate::serial::RpcClient, second
                 }
             }
         }
-        Err(error) => eprintln!("failed to fetch guest tracing events: {error:#}"),
+        Err(error) => eprintln!("failed to fetch guest tracing events: {error}"),
     }
 }
 
-fn run_aot_bench(mut client: crate::serial::RpcClient, command: AotBenchCommand) -> Result<()> {
+fn run_aot_bench(
+    mut client: crate::serial::RpcClient,
+    command: AotBenchCommand,
+) -> Result<(), VmSessionError> {
     crate::run_interruptible(async move {
-        let wasm = fs::read(&command.wasm)
-            .with_context(|| format!("failed to read {}", command.wasm.display()))?;
+        let wasm = fs::read(&command.wasm).map_err(|source| AotBenchError::ReadWasm {
+            path: command.wasm.display().to_string(),
+            source,
+        })?;
         if command.iterations == 0 {
-            bail!("aot-bench --iterations must be non-zero");
+            return Err(AotBenchError::ZeroIterations.into());
         }
         debugger_fs::write(&client, &command.remote_path, &wasm, false)
             .await
-            .with_context(|| format!("failed to upload {}", command.wasm.display()))?;
+            .map_err(|source| AotBenchError::Upload {
+                path: command.wasm.display().to_string(),
+                source,
+            })?;
         let profile_filter = system_profiling::Filter {
             scope: None,
             stack_prefixes: Vec::new(),
@@ -1847,15 +2332,21 @@ fn run_aot_bench(mut client: crate::serial::RpcClient, command: AotBenchCommand)
             || command.user_profile_output.is_some()
             || command.perf_metrics_output.is_some();
         let before_profile = if collect_profile {
-            system_profiling::clear(&client)
-                .await
-                .context("failed to clear remote profile samples")?;
-            system_profiling::set_enabled(&client, true)
-                .await
-                .context("failed to enable remote profiling")?;
-            system_profiling::folded(&client, &profile_filter, 0)
-                .await
-                .context("failed to read initial remote profile samples")?
+            profiling_step(
+                "clear remote profile samples",
+                system_profiling::clear(&client),
+            )
+            .await?;
+            profiling_step(
+                "enable remote profiling",
+                system_profiling::set_enabled(&client, true),
+            )
+            .await?;
+            profiling_step(
+                "read initial remote profile samples",
+                system_profiling::folded(&client, &profile_filter, 0),
+            )
+            .await?
         } else {
             Vec::new()
         };
@@ -1868,7 +2359,8 @@ fn run_aot_bench(mut client: crate::serial::RpcClient, command: AotBenchCommand)
                 "uploaded {} bytes to {}",
                 wasm.len(),
                 command.remote_path
-            )?;
+            )
+            .map_err(|source| AotBenchError::Report { source })?;
         }
         for iteration in 1..=command.iterations {
             let started = std::time::Instant::now();
@@ -1882,21 +2374,20 @@ fn run_aot_bench(mut client: crate::serial::RpcClient, command: AotBenchCommand)
                 },
             )
             .await
-            .with_context(|| {
-                format!("failed to AOT compile uploaded wasm iteration {iteration}")
-            })?;
+            .map_err(|source| AotBenchError::Compile { iteration, source })?;
             let result = match outcome {
                 Ok(result) => result,
                 Err(error) => {
-                    // Surface the guest-side error events before bailing:
+                    // Surface the guest-side error events before failing:
                     // the RPC error kind alone (e.g. `Internal`) does not
                     // say which runtime operation actually failed.
                     print_recent_guest_errors(&mut client, DEFAULT_WORKLOAD_TIMEOUT_SECONDS).await;
-                    return Err(anyhow::anyhow!(
-                        "remote AOT iteration {iteration} failed: {:?}: {}",
-                        error.kind,
-                        error.detail
-                    ));
+                    return Err(AotBenchError::Refused {
+                        iteration,
+                        kind: error.kind,
+                        detail: error.detail,
+                    }
+                    .into());
                 }
             };
             let elapsed = started.elapsed();
@@ -1906,18 +2397,25 @@ fn run_aot_bench(mut client: crate::serial::RpcClient, command: AotBenchCommand)
                 "iteration={iteration} elapsed_ms={} destination_path={}",
                 elapsed.as_millis(),
                 result.destination_path
-            )?;
+            )
+            .map_err(|source| AotBenchError::Report { source })?;
         }
         if collect_profile {
-            system_profiling::set_enabled(&client, false)
-                .await
-                .context("failed to disable remote profiling")?;
-            let after_profile = system_profiling::folded(&client, &profile_filter, 0)
-                .await
-                .context("failed to read final remote profile samples")?;
-            let metrics = system_profiling::metrics(&client, &metric_filter, 0)
-                .await
-                .context("failed to read final remote perf metrics")?;
+            profiling_step(
+                "disable remote profiling",
+                system_profiling::set_enabled(&client, false),
+            )
+            .await?;
+            let after_profile = profiling_step(
+                "read final remote profile samples",
+                system_profiling::folded(&client, &profile_filter, 0),
+            )
+            .await?;
+            let metrics = profiling_step(
+                "read final remote perf metrics",
+                system_profiling::metrics(&client, &metric_filter, 0),
+            )
+            .await?;
             write_requested_profile_outputs(&command, &before_profile, &after_profile, &metrics)?;
         }
         if let Some(output) = command.llvm_raw_profile_output() {
@@ -1986,42 +2484,35 @@ fn write_requested_profile_outputs(
     before_profile: &[system_profiling::FoldedSample],
     after_profile: &[system_profiling::FoldedSample],
     metrics: &[system_profiling::MetricSample],
-) -> Result<()> {
+) -> Result<(), ProfileOutputError> {
     use std::io::Write as _;
 
-    if let Some(output) = command.profile_output() {
-        write_profile_output(output, before_profile, after_profile, None)
-            .with_context(|| format!("failed to write {}", output.display()))?;
-        let mut stderr = std::io::stderr().lock();
-        writeln!(stderr, "profile_output={}", output.display())?;
-    }
-    if let Some(output) = command.kernel_profile_output() {
-        write_profile_output(
-            output,
-            before_profile,
-            after_profile,
+    for (output, scope, label) in [
+        (command.profile_output(), None, "profile_output"),
+        (
+            command.kernel_profile_output(),
             Some(system_profiling::Scope::Kernel),
-        )
-        .with_context(|| format!("failed to write {}", output.display()))?;
-        let mut stderr = std::io::stderr().lock();
-        writeln!(stderr, "kernel_profile_output={}", output.display())?;
-    }
-    if let Some(output) = command.user_profile_output() {
-        write_profile_output(
-            output,
-            before_profile,
-            after_profile,
+            "kernel_profile_output",
+        ),
+        (
+            command.user_profile_output(),
             Some(system_profiling::Scope::User),
-        )
-        .with_context(|| format!("failed to write {}", output.display()))?;
+            "user_profile_output",
+        ),
+    ] {
+        let Some(output) = output else {
+            continue;
+        };
+        write_profile_output(output, before_profile, after_profile, scope)?;
         let mut stderr = std::io::stderr().lock();
-        writeln!(stderr, "user_profile_output={}", output.display())?;
+        writeln!(stderr, "{label}={}", output.display())
+            .map_err(|source| ProfileOutputError::Report { source })?;
     }
     if let Some(output) = command.perf_metrics_output() {
-        write_perf_metrics_output(output, metrics)
-            .with_context(|| format!("failed to write {}", output.display()))?;
+        write_perf_metrics_output(output, metrics)?;
         let mut stderr = std::io::stderr().lock();
-        writeln!(stderr, "perf_metrics_output={}", output.display())?;
+        writeln!(stderr, "perf_metrics_output={}", output.display())
+            .map_err(|source| ProfileOutputError::Report { source })?;
     }
     Ok(())
 }
@@ -2031,18 +2522,28 @@ fn write_profile_output(
     before: &[system_profiling::FoldedSample],
     after: &[system_profiling::FoldedSample],
     scope: Option<system_profiling::Scope>,
-) -> Result<()> {
-    fs::write(output, diff_folded_profile(before, after, scope))?;
-    Ok(())
+) -> Result<(), ProfileOutputError> {
+    fs::write(output, diff_folded_profile(before, after, scope)).map_err(|source| {
+        ProfileOutputError::Write {
+            path: output.display().to_string(),
+            source,
+        }
+    })
 }
 
 fn write_perf_metrics_output(
     output: &Path,
     metrics: &[system_profiling::MetricSample],
-) -> Result<()> {
-    let bytes = serde_json::to_vec_pretty(metrics)?;
-    fs::write(output, bytes)?;
-    Ok(())
+) -> Result<(), ProfileOutputError> {
+    let bytes =
+        serde_json::to_vec_pretty(metrics).map_err(|source| ProfileOutputError::Encode {
+            path: output.display().to_string(),
+            source,
+        })?;
+    fs::write(output, bytes).map_err(|source| ProfileOutputError::Write {
+        path: output.display().to_string(),
+        source,
+    })
 }
 
 #[derive(Template)]
@@ -2086,7 +2587,7 @@ fn diff_folded_profile(
 fn prepare_boot_artifact(
     command: &ResolvedVmCommand,
     runtime_dir: Option<&Path>,
-) -> Result<PathBuf> {
+) -> Result<PathBuf, VmRuntimeError> {
     match command.profile.boot_artifact {
         VmBootArtifactKind::KernelBinary => Ok(command.kernel.clone()),
         VmBootArtifactKind::LimineUefiDiskImage => prepare_limine_uefi_image(command, runtime_dir),
@@ -2096,9 +2597,12 @@ fn prepare_boot_artifact(
 fn prepare_limine_uefi_image(
     command: &ResolvedVmCommand,
     runtime_dir: Option<&Path>,
-) -> Result<PathBuf> {
-    let kernel = fs::canonicalize(&command.kernel)
-        .with_context(|| format!("failed to canonicalize kernel {}", command.kernel.display()))?;
+) -> Result<PathBuf, VmRuntimeError> {
+    let kernel =
+        fs::canonicalize(&command.kernel).map_err(|source| VmRuntimeError::CanonicalizeKernel {
+            path: command.kernel.display().to_string(),
+            source,
+        })?;
     let image = match runtime_dir {
         Some(dir) => dir.join("kernel.uefi.img"),
         None => kernel.with_extension("uefi.img"),
@@ -2119,10 +2623,17 @@ fn prepare_limine_uefi_image(
         .arg("--efi-arch")
         .arg(limine_efi_arch_argument(command.profile.arch))
         .status()
-        .with_context(|| format!("failed to spawn {}", cli.display()))?;
+        .map_err(|source| BuildStepError::Spawn {
+            label: format!("{}", cli.display()),
+            source,
+        })?;
     if !status.success() {
         spinner.finish_and_clear();
-        bail!("helios-cli limine-uefi-image exited with status {status}");
+        return Err(BuildStepError::Exited {
+            label: "helios-cli limine-uefi-image".to_owned(),
+            status,
+        }
+        .into());
     }
     spinner.finish_with_message(format!("{} {}", style("built").green(), image.display()));
     Ok(image)
@@ -2138,17 +2649,17 @@ fn limine_efi_arch_argument(arch: VmArch) -> &'static str {
     }
 }
 
-fn discover_helios_cli() -> Result<PathBuf> {
+fn discover_helios_cli() -> Result<PathBuf, ToolDiscoveryError> {
     if let Some(path) = std::env::var_os("HELIOS_CLI_BIN").map(PathBuf::from) {
         if path.is_file() {
             return Ok(path);
         }
-        bail!(
-            "HELIOS_CLI_BIN does not point to a file: {}",
-            path.display()
-        );
+        return Err(ToolDiscoveryError::CliBinNotAFile {
+            path: path.display().to_string(),
+        });
     }
-    let current_exe = std::env::current_exe().context("failed to locate current executable")?;
+    let current_exe =
+        std::env::current_exe().map_err(|source| ToolDiscoveryError::CurrentExe { source })?;
     if let Some(candidate) = current_exe.parent().map(|dir| dir.join("helios-cli"))
         && candidate.is_file()
     {
@@ -2157,7 +2668,7 @@ fn discover_helios_cli() -> Result<PathBuf> {
     if let Some(candidate) = find_executable_in_path("helios-cli") {
         return Ok(candidate);
     }
-    bail!("failed to find helios-cli; run `cargo build -p helios-cli` or set HELIOS_CLI_BIN")
+    Err(ToolDiscoveryError::CliMissing)
 }
 
 fn arch_label(arch: VmArch) -> &'static str {
@@ -2168,17 +2679,21 @@ fn arch_label(arch: VmArch) -> &'static str {
     }
 }
 
-fn run_step(label: &str, command: &mut Command) -> Result<()> {
+fn run_step(label: &str, command: &mut Command) -> Result<(), BuildStepError> {
     let spinner = spinner(label);
-    let status = command
-        .status()
-        .with_context(|| format!("failed to spawn {label}"))?;
+    let status = command.status().map_err(|source| BuildStepError::Spawn {
+        label: label.to_owned(),
+        source,
+    })?;
     if status.success() {
         spinner.finish_with_message(format!("{} {}", style("built").green(), label));
         return Ok(());
     }
     spinner.finish_and_clear();
-    bail!("{label} exited with status {status}")
+    Err(BuildStepError::Exited {
+        label: label.to_owned(),
+        status,
+    })
 }
 
 struct VmRuntime {
@@ -2214,25 +2729,27 @@ enum VmRuntimeDir {
 }
 
 impl VmRuntimeDir {
-    fn create(command: &ResolvedVmCommand) -> Result<Self> {
+    fn create(command: &ResolvedVmCommand) -> Result<Self, VmRuntimeError> {
+        let create = |path: &Path| {
+            fs::create_dir_all(path).map_err(|source| VmRuntimeError::CreateRuntimeDir {
+                path: path.display().to_string(),
+                source,
+            })
+        };
         if let Some(path) = &command.runtime_dir {
-            fs::create_dir_all(path).with_context(|| {
-                format!("failed to create VM runtime directory {}", path.display())
-            })?;
+            create(path)?;
             return Ok(Self::Persistent(path.clone()));
         }
         if command.keep_runtime_dir {
             let path = default_persistent_runtime_dir()?;
-            fs::create_dir_all(&path).with_context(|| {
-                format!("failed to create VM runtime directory {}", path.display())
-            })?;
+            create(&path)?;
             return Ok(Self::Persistent(path));
         }
         tempfile::Builder::new()
             .prefix("helios-inspector-vm.")
             .tempdir()
             .map(Self::Temporary)
-            .context("failed to create temporary QEMU runtime directory")
+            .map_err(|source| VmRuntimeError::CreateTempRuntimeDir { source })
     }
 
     fn path(&self) -> &Path {
@@ -2257,21 +2774,20 @@ impl VmRuntimeDir {
 /// bytes.
 #[derive(Debug, thiserror::Error)]
 #[error("unix socket path {} is {length} bytes, and at most {limit} fit", .path.display())]
-struct SocketPathTooLong {
+pub(crate) struct SocketPathTooLong {
     path: PathBuf,
     length: usize,
     limit: usize,
 }
 
-fn check_socket_path(path: &Path) -> Result<()> {
+fn check_socket_path(path: &Path) -> Result<(), SocketPathTooLong> {
     let length = path.as_os_str().len();
     if length > UNIX_SOCKET_PATH_MAX {
         return Err(SocketPathTooLong {
             path: path.to_path_buf(),
             length,
             limit: UNIX_SOCKET_PATH_MAX,
-        }
-        .into());
+        });
     }
     Ok(())
 }
@@ -2302,16 +2818,14 @@ impl VmSocketDir {
         }
     }
 
-    fn create(runtime_dir: &VmRuntimeDir) -> Result<Self> {
+    fn create(runtime_dir: &VmRuntimeDir) -> Result<Self, VmRuntimeError> {
         let base = Self::base();
         let dir = tempfile::Builder::new()
             .prefix("helios-")
             .tempdir_in(&base)
-            .with_context(|| {
-                format!(
-                    "failed to create the VM socket directory in {}",
-                    base.display()
-                )
+            .map_err(|source| VmRuntimeError::CreateSocketDirectory {
+                path: base.display().to_string(),
+                source,
             })?;
         // The longest name any of the sockets takes, checked once: the
         // three of them are created at different points of the spawn and
@@ -2319,16 +2833,15 @@ impl VmSocketDir {
         check_socket_path(&dir.path().join(MONITOR_SOCKET_NAME))?;
         let link = runtime_dir.path().join(SOCKET_DIR_LINK_NAME);
         if fs::symlink_metadata(&link).is_ok() {
-            fs::remove_file(&link).with_context(|| {
-                format!("failed to replace the stale socket link {}", link.display())
+            fs::remove_file(&link).map_err(|source| VmRuntimeError::ReplaceSocketLink {
+                path: link.display().to_string(),
+                source,
             })?;
         }
-        symlink(dir.path(), &link).with_context(|| {
-            format!(
-                "failed to record the socket directory {} as {}",
-                dir.path().display(),
-                link.display()
-            )
+        symlink(dir.path(), &link).map_err(|source| VmRuntimeError::RecordSocketLink {
+            target: dir.path().display().to_string(),
+            link: link.display().to_string(),
+            source,
         })?;
         if runtime_dir.is_persistent() {
             // A retained runtime directory is retained to be read later,
@@ -2348,7 +2861,7 @@ impl VmSocketDir {
 }
 
 impl VmRuntime {
-    fn spawn(command: &ResolvedVmCommand) -> Result<Self> {
+    fn spawn(command: &ResolvedVmCommand) -> Result<Self, VmRuntimeError> {
         let runtime_dir = VmRuntimeDir::create(command)?;
         let socket_dir = VmSocketDir::create(&runtime_dir)?;
         let socket_path = match &command.socket {
@@ -2457,8 +2970,12 @@ impl VmRuntime {
             qemu.stdout(Stdio::piped());
         } else {
             qemu.stdin(Stdio::null());
-            qemu.stdout(Stdio::from(fs::File::create(&qemu_log).with_context(
-                || format!("failed to create {}", qemu_log.display()),
+            qemu.stdout(Stdio::from(fs::File::create(&qemu_log).map_err(
+                |source| VmRuntimeError::QemuLog {
+                    step: "create",
+                    path: qemu_log.display().to_string(),
+                    source,
+                },
             )?));
         }
         qemu.stderr(Stdio::from(
@@ -2466,7 +2983,11 @@ impl VmRuntime {
                 .append(true)
                 .create(true)
                 .open(&qemu_log)
-                .with_context(|| format!("failed to open {} for append", qemu_log.display()))?,
+                .map_err(|source| VmRuntimeError::QemuLog {
+                    step: "open",
+                    path: format!("{} for append", qemu_log.display()),
+                    source,
+                })?,
         ));
         if matches!(command.profile.arch, VmArch::Aarch64 | VmArch::Riscv64) {
             qemu.arg("-global").arg("virtio-mmio.force-legacy=false");
@@ -2516,22 +3037,20 @@ impl VmRuntime {
             );
         }
 
-        let mut child = qemu.spawn().with_context(|| {
-            format!(
-                "failed to start QEMU executable {}",
-                command.qemu_bin.display()
-            )
+        let mut child = qemu.spawn().map_err(|source| VmRuntimeError::SpawnQemu {
+            path: command.qemu_bin.display().to_string(),
+            source,
         })?;
         let mut serial_pty_slave = None;
         let transport = if command.serial_stdio {
             let stdout = child
                 .stdout
                 .take()
-                .context("QEMU stdout pipe was not available for serial stdio")?;
+                .ok_or(VmRuntimeError::ChildPipeMissing { pipe: "stdout" })?;
             let stdin = child
                 .stdin
                 .take()
-                .context("QEMU stdin pipe was not available for serial stdio")?;
+                .ok_or(VmRuntimeError::ChildPipeMissing { pipe: "stdin" })?;
             VmTransport::SerialIo(crate::serial::open_child_stdio(stdout, stdin)?)
         } else if let Some(serial_pty) = serial_pty {
             serial_pty_slave = Some(serial_pty.slave);
@@ -2578,10 +3097,10 @@ impl VmRuntime {
         }
     }
 
-    fn take_transport(&mut self) -> Result<VmTransport> {
+    fn take_transport(&mut self) -> Result<VmTransport, VmRuntimeError> {
         self.transport
             .take()
-            .context("VM transport was already taken")
+            .ok_or(VmRuntimeError::TransportAlreadyTaken)
     }
 
     fn runtime_dir_path(&self) -> &Path {
@@ -2620,10 +3139,10 @@ impl VmRuntime {
     }
 }
 
-fn default_persistent_runtime_dir() -> Result<PathBuf> {
+fn default_persistent_runtime_dir() -> Result<PathBuf, VmRuntimeError> {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .context("system time is earlier than UNIX_EPOCH")?
+        .map_err(|source| VmRuntimeError::SystemTimeBeforeEpoch { source })?
         .as_millis();
     Ok(repo_root()?
         .join("target")
@@ -2631,7 +3150,10 @@ fn default_persistent_runtime_dir() -> Result<PathBuf> {
         .join(format!("run-{}-{timestamp}", std::process::id())))
 }
 
-fn monitor_endpoint(command: &ResolvedVmCommand, socket_dir: &Path) -> Result<Option<String>> {
+fn monitor_endpoint(
+    command: &ResolvedVmCommand,
+    socket_dir: &Path,
+) -> Result<Option<String>, SocketPathTooLong> {
     match &command.monitor {
         Some(monitor) => Ok(Some(monitor.clone())),
         None if command.keep_runtime_dir => {
@@ -2641,7 +3163,10 @@ fn monitor_endpoint(command: &ResolvedVmCommand, socket_dir: &Path) -> Result<Op
     }
 }
 
-fn qmp_endpoint(command: &ResolvedVmCommand, socket_dir: &Path) -> Result<Option<String>> {
+fn qmp_endpoint(
+    command: &ResolvedVmCommand,
+    socket_dir: &Path,
+) -> Result<Option<String>, SocketPathTooLong> {
     match &command.qmp {
         Some(qmp) => Ok(Some(qmp.clone())),
         None if command.keep_runtime_dir || command.needs_qmp => {
@@ -2658,7 +3183,10 @@ fn qmp_endpoint(command: &ResolvedVmCommand, socket_dir: &Path) -> Result<Option
 /// name a TCP port or a socket QEMU connects out to, so only the
 /// `unix:<path>` form the inspector understands is offered back to the
 /// commands that drive QMP themselves.
-fn qmp_socket_path(command: &ResolvedVmCommand, socket_dir: &Path) -> Result<Option<PathBuf>> {
+fn qmp_socket_path(
+    command: &ResolvedVmCommand,
+    socket_dir: &Path,
+) -> Result<Option<PathBuf>, SocketPathTooLong> {
     let Some(endpoint) = qmp_endpoint(command, socket_dir)? else {
         return Ok(None);
     };
@@ -2669,7 +3197,7 @@ fn qmp_socket_path(command: &ResolvedVmCommand, socket_dir: &Path) -> Result<Opt
     Ok(Some(PathBuf::from(path)))
 }
 
-fn unix_endpoint(socket_dir: &Path, name: &str) -> Result<String> {
+fn unix_endpoint(socket_dir: &Path, name: &str) -> Result<String, SocketPathTooLong> {
     let path = socket_dir.join(name);
     check_socket_path(&path)?;
     Ok(format!("unix:{},server=on,wait=off", path.display()))
@@ -2681,42 +3209,46 @@ impl Drop for VmRuntime {
     }
 }
 
-fn prepare_socket_path(socket_path: &Path) -> Result<()> {
+fn prepare_socket_path(socket_path: &Path) -> Result<(), VmRuntimeError> {
     if let Some(parent) = socket_path
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
     {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create socket directory {}", parent.display()))?;
+        fs::create_dir_all(parent).map_err(|source| VmRuntimeError::CreateSocketDir {
+            path: parent.display().to_string(),
+            source,
+        })?;
     }
     if !socket_path.exists() {
         return Ok(());
     }
 
-    let metadata = fs::symlink_metadata(socket_path).with_context(|| {
-        format!(
-            "failed to inspect existing socket path {}",
-            socket_path.display()
-        )
-    })?;
+    let metadata =
+        fs::symlink_metadata(socket_path).map_err(|source| VmRuntimeError::InspectSocketPath {
+            path: socket_path.display().to_string(),
+            source,
+        })?;
     if !metadata.file_type().is_socket() {
-        bail!(
-            "refusing to overwrite existing non-socket path {}",
-            socket_path.display()
-        );
+        return Err(VmRuntimeError::SocketPathNotASocket {
+            path: socket_path.display().to_string(),
+        });
     }
-    fs::remove_file(socket_path)
-        .with_context(|| format!("failed to remove stale socket {}", socket_path.display()))?;
+    fs::remove_file(socket_path).map_err(|source| VmRuntimeError::RemoveStaleSocket {
+        path: socket_path.display().to_string(),
+        source,
+    })?;
     Ok(())
 }
 
-fn prepare_log_path(log_path: &Path) -> Result<()> {
+fn prepare_log_path(log_path: &Path) -> Result<(), VmRuntimeError> {
     if let Some(parent) = log_path
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
     {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create log directory {}", parent.display()))?;
+        fs::create_dir_all(parent).map_err(|source| VmRuntimeError::CreateLogDir {
+            path: parent.display().to_string(),
+            source,
+        })?;
     }
     Ok(())
 }
@@ -2726,14 +3258,20 @@ fn prepare_log_path(log_path: &Path) -> Result<()> {
 /// QEMU splits an option list on commas and reads a doubled comma as a
 /// literal one, so a path that carries a comma has to be doubled or the
 /// rest of it is parsed as another option.
-fn qemu_option_value(path: &Path) -> Result<String> {
+fn qemu_option_value(path: &Path) -> Result<String, VmRuntimeError> {
     let text = path
         .to_str()
-        .with_context(|| format!("QEMU option paths must be valid UTF-8: {}", path.display()))?;
+        .ok_or_else(|| VmRuntimeError::OptionPathNotUtf8 {
+            path: path.display().to_string(),
+        })?;
     Ok(text.replace(',', ",,"))
 }
 
-fn wait_for_socket(socket_path: &Path, qemu_log: &Path, child: &mut Child) -> Result<()> {
+fn wait_for_socket(
+    socket_path: &Path,
+    qemu_log: &Path,
+    child: &mut Child,
+) -> Result<(), VmRuntimeError> {
     let started = std::time::Instant::now();
     while started.elapsed() < DEFAULT_SOCKET_WAIT {
         if socket_path.exists() {
@@ -2741,23 +3279,24 @@ fn wait_for_socket(socket_path: &Path, qemu_log: &Path, child: &mut Child) -> Re
         }
         if child
             .try_wait()
-            .context("failed to poll QEMU process state")?
+            .map_err(|source| VmRuntimeError::PollQemu { source })?
             .is_some()
         {
-            let log = fs::read_to_string(qemu_log)
-                .with_context(|| format!("failed to read QEMU log {}", qemu_log.display()))?;
-            bail!(
-                "QEMU exited before opening the debug serial socket {}\n{}",
-                socket_path.display(),
-                log
-            );
+            let log =
+                fs::read_to_string(qemu_log).map_err(|source| VmRuntimeError::ReadQemuLog {
+                    path: qemu_log.display().to_string(),
+                    source,
+                })?;
+            return Err(VmRuntimeError::QemuExitedBeforeSocket {
+                socket: socket_path.display().to_string(),
+                log,
+            });
         }
         std::thread::sleep(SOCKET_POLL_INTERVAL);
     }
-    bail!(
-        "timed out waiting for QEMU to create debug serial socket {}",
-        socket_path.display()
-    )
+    Err(VmRuntimeError::SocketTimedOut {
+        socket: socket_path.display().to_string(),
+    })
 }
 
 fn spinner(label: &str) -> ProgressBar {
@@ -2777,11 +3316,11 @@ fn spinner(label: &str) -> ProgressBar {
 /// time, never from the manifest directory the binary was compiled in: an
 /// inspector reused from another worktree would otherwise build and boot that
 /// worktree's kernel.
-fn repo_root() -> Result<PathBuf> {
+fn repo_root() -> Result<PathBuf, WorkspaceRootError> {
     Ok(WorkspaceRoot::resolve(None)?.path().to_path_buf())
 }
 
-fn default_kernel_path(arch: VmArch, profile_dir: &str) -> Result<PathBuf> {
+fn default_kernel_path(arch: VmArch, profile_dir: &str) -> Result<PathBuf, WorkspaceRootError> {
     let profile = arch.profile();
     Ok(repo_root()?
         .join("target")
@@ -2794,12 +3333,20 @@ fn default_kernel_path(arch: VmArch, profile_dir: &str) -> Result<PathBuf> {
 ///
 /// It lives in the runtime directory, so every VM gets a disk of its own
 /// and a retained runtime directory keeps whatever the guest wrote.
-fn prepare_data_disk(command: &ResolvedVmCommand, runtime_dir: &Path) -> Result<PathBuf> {
+fn prepare_data_disk(
+    command: &ResolvedVmCommand,
+    runtime_dir: &Path,
+) -> Result<PathBuf, VmRuntimeError> {
     let image = runtime_dir.join("data.img");
-    let file = fs::File::create(&image)
-        .with_context(|| format!("failed to create scratch disk image {}", image.display()))?;
+    let file = fs::File::create(&image).map_err(|source| VmRuntimeError::CreateDataDisk {
+        path: image.display().to_string(),
+        source,
+    })?;
     file.set_len(command.data_disk_bytes)
-        .with_context(|| format!("failed to size scratch disk image {}", image.display()))?;
+        .map_err(|source| VmRuntimeError::SizeDataDisk {
+            path: image.display().to_string(),
+            source,
+        })?;
     Ok(image)
 }
 
@@ -2807,7 +3354,7 @@ fn configure_firmware(
     qemu: &mut Command,
     command: &ResolvedVmCommand,
     runtime_dir: &Path,
-) -> Result<()> {
+) -> Result<(), VmRuntimeError> {
     if let Some(bios) = &command.bios {
         qemu.arg("-bios").arg(bios);
         return Ok(());
@@ -2816,12 +3363,10 @@ fn configure_firmware(
         let code = discover_qemu_edk2_code(command.profile.arch, &command.qemu_bin)?;
         let vars_template = discover_qemu_edk2_vars(command.profile.arch, &code)?;
         let vars = runtime_dir.join(format!("edk2-{}-vars.fd", arch_label(command.profile.arch)));
-        fs::copy(&vars_template, &vars).with_context(|| {
-            format!(
-                "failed to prepare EDK2 variable store {} from {}",
-                vars.display(),
-                vars_template.display()
-            )
+        fs::copy(&vars_template, &vars).map_err(|source| VmRuntimeError::Edk2VarsCopy {
+            vars: vars.display().to_string(),
+            template: vars_template.display().to_string(),
+            source,
         })?;
         qemu.arg("-drive").arg(format!(
             "if=pflash,format=raw,readonly=on,file={}",
@@ -2833,7 +3378,7 @@ fn configure_firmware(
     Ok(())
 }
 
-fn discover_qemu_edk2_code(arch: VmArch, qemu_bin: &Path) -> Result<PathBuf> {
+fn discover_qemu_edk2_code(arch: VmArch, qemu_bin: &Path) -> Result<PathBuf, VmRuntimeError> {
     let env_var = match arch {
         VmArch::Aarch64 => "HELIOS_EDK2_AARCH64_CODE",
         VmArch::X86_64 => "HELIOS_EDK2_X86_64_CODE",
@@ -2843,7 +3388,10 @@ fn discover_qemu_edk2_code(arch: VmArch, qemu_bin: &Path) -> Result<PathBuf> {
         if path.is_file() {
             return Ok(path);
         }
-        bail!("{env_var} does not point to a file: {}", path.display());
+        return Err(VmRuntimeError::Edk2EnvNotAFile {
+            env_var,
+            path: path.display().to_string(),
+        });
     }
     let qemu_bin = if qemu_bin.components().count() == 1 {
         find_executable_in_path(qemu_bin.to_str().unwrap_or("")).unwrap_or_else(|| qemu_bin.into())
@@ -2871,11 +3419,9 @@ fn discover_qemu_edk2_code(arch: VmArch, qemu_bin: &Path) -> Result<PathBuf> {
     candidates
         .into_iter()
         .find(|path| path.is_file())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "failed to find QEMU EDK2 {} firmware; set {env_var}",
-                arch_label(arch)
-            )
+        .ok_or(VmRuntimeError::Edk2CodeMissing {
+            arch: arch_label(arch),
+            env_var,
         })
 }
 
@@ -2894,17 +3440,16 @@ fn find_executable_in_path(name: &str) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-fn discover_qemu_edk2_vars(arch: VmArch, code: &Path) -> Result<PathBuf> {
+fn discover_qemu_edk2_vars(arch: VmArch, code: &Path) -> Result<PathBuf, VmRuntimeError> {
     for vars in edk2_vars_filenames(arch).map(|name| code.with_file_name(name)) {
         if vars.is_file() {
             return Ok(vars);
         }
     }
-    bail!(
-        "failed to find QEMU EDK2 {} variable store next to {}",
-        arch_label(arch),
-        code.display()
-    )
+    Err(VmRuntimeError::Edk2VarsMissing {
+        arch: arch_label(arch),
+        code: code.display().to_string(),
+    })
 }
 
 fn edk2_vars_filenames(arch: VmArch) -> impl Iterator<Item = &'static str> {
@@ -3166,10 +3711,104 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::time::{Duration, Instant};
 
-    use anyhow::{Result, bail};
     use helios_inspector_protocol::debugger::programs as debugger_programs;
+    use helios_inspector_protocol::system::programs::ExecError;
 
     use super::*;
+
+    /// Why one of the `#[ignore]`d guest integration tests failed.
+    ///
+    /// The tests drive the whole stack — build, boot, connect, run — so
+    /// the failure keeps the typed error of whichever layer stopped,
+    /// and adds only what a test can say that production code cannot:
+    /// which arch, which program, and how long it waited.
+    #[derive(Debug, thiserror::Error)]
+    enum GuestTestFailure {
+        #[error("{arch} watchdog self-test failed: {source}")]
+        Watchdog {
+            arch: &'static str,
+            #[source]
+            source: Box<Self>,
+        },
+        #[error("{0}")]
+        Build(#[from] VmBuildError),
+        #[error("{0}")]
+        Runtime(#[from] VmRuntimeError),
+        #[error("{0}")]
+        Step(#[from] BuildStepError),
+        #[error("{0}")]
+        WorkspaceRoot(#[from] WorkspaceRootError),
+        #[error("failed to spawn cargo for watchdog self-test kernel build: {source}")]
+        SpawnCargo {
+            #[source]
+            source: io::Error,
+        },
+        #[error("watchdog self-test kernel build exited with status {status}")]
+        CargoExited { status: std::process::ExitStatus },
+        #[error("socket path must be valid UTF-8")]
+        SocketPathNotUtf8,
+        #[error("failed to connect {purpose} RPC client: {source}")]
+        Connect {
+            purpose: &'static str,
+            #[source]
+            source: ConnectError,
+        },
+        #[error("timed out waiting for {what}")]
+        TimedOut { what: &'static str },
+        #[error("{what} failed: {source}")]
+        Rpc {
+            what: &'static str,
+            #[source]
+            source: helios_inspector_protocol::RpcError,
+        },
+        #[error("{what} failed: {kind:?}: {detail}")]
+        Refused {
+            what: &'static str,
+            kind: system_programs::ExecErrorKind,
+            detail: String,
+        },
+        #[error("{0}")]
+        Program(#[from] crate::programs::ProgramError),
+        #[error("failed to configure serial socket read timeout: {source}")]
+        SerialReadTimeout {
+            #[source]
+            source: io::Error,
+        },
+        #[error("failed to connect to QEMU debug serial socket {path}: {source}")]
+        SerialConnect {
+            path: String,
+            #[source]
+            source: io::Error,
+        },
+        #[error("failed while reading QEMU debug serial socket: {source}")]
+        SerialRead {
+            #[source]
+            source: io::Error,
+        },
+        #[error(
+            "timed out waiting for {expected} debugger run markers; observed {seen}; \
+             reconnects: {reconnects}; recent stages: {stages}; recent lines: {lines}"
+        )]
+        MarkersTimedOut {
+            expected: usize,
+            seen: usize,
+            reconnects: usize,
+            stages: String,
+            lines: String,
+        },
+    }
+
+    impl GuestTestFailure {
+        /// The guest's typed refusal of an `exec-path`, named by what was
+        /// being run.
+        fn refused(what: &'static str, error: ExecError) -> Self {
+            Self::Refused {
+                what,
+                kind: error.kind,
+                detail: error.detail,
+            }
+        }
+    }
 
     const WATCHDOG_SELF_TEST_DELAY_MS: &str = "5000";
 
@@ -3810,13 +4449,17 @@ mod tests {
 
     #[test]
     #[ignore = "requires qemu and cross-compiled kernels"]
-    fn watchdog_self_test_resets_x86_and_riscv() -> Result<()> {
-        assert_watchdog_reset(VmArch::X86_64).context("x86 watchdog self-test failed")?;
-        assert_watchdog_reset(VmArch::Riscv64).context("riscv watchdog self-test failed")?;
+    fn watchdog_self_test_resets_x86_and_riscv() -> Result<(), GuestTestFailure> {
+        for arch in [VmArch::X86_64, VmArch::Riscv64] {
+            assert_watchdog_reset(arch).map_err(|source| GuestTestFailure::Watchdog {
+                arch: arch_label(arch),
+                source: Box::new(source),
+            })?;
+        }
         Ok(())
     }
 
-    fn assert_watchdog_reset(arch: VmArch) -> Result<()> {
+    fn assert_watchdog_reset(arch: VmArch) -> Result<(), GuestTestFailure> {
         build_watchdog_test_kernel(arch)?;
         let command = watchdog_test_command(arch);
         let mut runtime = VmRuntime::spawn(&command)?;
@@ -3825,7 +4468,7 @@ mod tests {
         Ok(())
     }
 
-    fn build_watchdog_test_kernel(arch: VmArch) -> Result<()> {
+    fn build_watchdog_test_kernel(arch: VmArch) -> Result<(), GuestTestFailure> {
         let command = watchdog_test_command(arch);
         run_step(
             "building helios-cli",
@@ -3849,11 +4492,11 @@ mod tests {
                 WATCHDOG_SELF_TEST_DELAY_MS,
             )
             .status()
-            .context("failed to spawn cargo for watchdog self-test kernel build")?;
+            .map_err(|source| GuestTestFailure::SpawnCargo { source })?;
         if status.success() {
             return Ok(());
         }
-        bail!("watchdog self-test kernel build exited with status {status}");
+        Err(GuestTestFailure::CargoExited { status })
     }
 
     fn watchdog_test_command(arch: VmArch) -> ResolvedVmCommand {
@@ -3919,16 +4562,20 @@ mod tests {
 
     #[test]
     #[ignore = "requires qemu, a release riscv guest build, and staged host artifacts"]
-    fn exec_path_runs_host_curl_in_riscv_release_vm() -> Result<()> {
+    fn exec_path_runs_host_curl_in_riscv_release_vm() -> Result<(), GuestTestFailure> {
         let command = direct_exec_command(VmArch::Riscv64);
         build_vm(&command.build)?;
         let mut runtime = VmRuntime::spawn(&command)?;
         let socket = runtime
             .socket_path()
             .to_str()
-            .ok_or_else(|| anyhow::anyhow!("socket path must be valid UTF-8"))?;
-        let client = connect_client(socket, DEFAULT_BAUD, true)
-            .context("failed to connect direct-exec RPC client")?;
+            .ok_or(GuestTestFailure::SocketPathNotUtf8)?;
+        let client = connect_client(socket, DEFAULT_BAUD, true).map_err(|source| {
+            GuestTestFailure::Connect {
+                purpose: "direct-exec",
+                source,
+            }
+        })?;
 
         let curl = crate::runtime::block_on(async {
             crate::runtime::timeout(
@@ -3941,8 +4588,14 @@ mod tests {
             )
             .await
         })
-        .ok_or_else(|| anyhow::anyhow!("timed out waiting for direct curl exec-path result"))??
-        .map_err(|error| anyhow::anyhow!("direct curl exec-path failed: {error:?}"))?;
+        .ok_or(GuestTestFailure::TimedOut {
+            what: "direct curl exec-path result",
+        })?
+        .map_err(|source| GuestTestFailure::Rpc {
+            what: "direct curl exec-path",
+            source,
+        })?
+        .map_err(|error| GuestTestFailure::refused("direct curl exec-path", error))?;
         assert_eq!(curl.exit_code, 0, "curl exited non-zero: {curl:?}");
         let curl_stdout = String::from_utf8_lossy(&curl.output.stdout).to_ascii_lowercase();
         assert!(
@@ -3957,16 +4610,20 @@ mod tests {
 
     #[test]
     #[ignore = "requires qemu, a release riscv guest build, and staged host artifacts"]
-    fn exec_path_runs_host_cpython_in_riscv_release_vm() -> Result<()> {
+    fn exec_path_runs_host_cpython_in_riscv_release_vm() -> Result<(), GuestTestFailure> {
         let command = direct_exec_command(VmArch::Riscv64);
         build_vm(&command.build)?;
         let mut runtime = VmRuntime::spawn(&command)?;
         let socket = runtime
             .socket_path()
             .to_str()
-            .ok_or_else(|| anyhow::anyhow!("socket path must be valid UTF-8"))?;
-        let client = connect_client(socket, DEFAULT_BAUD, true)
-            .context("failed to connect direct-exec RPC client")?;
+            .ok_or(GuestTestFailure::SocketPathNotUtf8)?;
+        let client = connect_client(socket, DEFAULT_BAUD, true).map_err(|source| {
+            GuestTestFailure::Connect {
+                purpose: "direct-exec",
+                source,
+            }
+        })?;
 
         let python = crate::runtime::block_on(async {
             crate::runtime::timeout(
@@ -3979,8 +4636,14 @@ mod tests {
             )
             .await
         })
-        .ok_or_else(|| anyhow::anyhow!("timed out waiting for direct CPython exec-path result"))??
-        .map_err(|error| anyhow::anyhow!("direct CPython exec-path failed: {error:?}"))?;
+        .ok_or(GuestTestFailure::TimedOut {
+            what: "direct CPython exec-path result",
+        })?
+        .map_err(|source| GuestTestFailure::Rpc {
+            what: "direct CPython exec-path",
+            source,
+        })?
+        .map_err(|error| GuestTestFailure::refused("direct CPython exec-path", error))?;
         assert_eq!(python.exit_code, 0, "CPython exited non-zero: {python:?}");
         let python_stdout = String::from_utf8_lossy(&python.output.stdout);
         assert_eq!(python_stdout.trim(), "42", "unexpected CPython stdout");
@@ -3991,16 +4654,20 @@ mod tests {
 
     #[test]
     #[ignore = "requires qemu, a release riscv guest build, and staged host artifacts"]
-    fn shell_runs_host_cpython_in_riscv_release_vm() -> Result<()> {
+    fn shell_runs_host_cpython_in_riscv_release_vm() -> Result<(), GuestTestFailure> {
         let command = direct_exec_command(VmArch::Riscv64);
         build_vm(&command.build)?;
         let mut runtime = VmRuntime::spawn(&command)?;
         let socket = runtime
             .socket_path()
             .to_str()
-            .ok_or_else(|| anyhow::anyhow!("socket path must be valid UTF-8"))?;
-        let mut client = connect_client(socket, DEFAULT_BAUD, true)
-            .context("failed to connect shell RPC client")?;
+            .ok_or(GuestTestFailure::SocketPathNotUtf8)?;
+        let mut client = connect_client(socket, DEFAULT_BAUD, true).map_err(|source| {
+            GuestTestFailure::Connect {
+                purpose: "shell",
+                source,
+            }
+        })?;
 
         let python = crate::runtime::block_on(async {
             crate::runtime::timeout(
@@ -4016,7 +4683,9 @@ mod tests {
             )
             .await
         })
-        .ok_or_else(|| anyhow::anyhow!("timed out waiting for shell CPython result"))??;
+        .ok_or(GuestTestFailure::TimedOut {
+            what: "shell CPython result",
+        })??;
         assert_eq!(
             python.exit_code, 0,
             "shell CPython exited non-zero: {python:?}"
@@ -4093,14 +4762,14 @@ mod tests {
         }
     }
 
-    fn connect_serial_socket(socket_path: &Path) -> Result<UnixStream> {
+    fn connect_serial_socket(socket_path: &Path) -> Result<UnixStream, GuestTestFailure> {
         let started = Instant::now();
         loop {
             match UnixStream::connect(socket_path) {
                 Ok(stream) => {
                     stream
                         .set_read_timeout(Some(SERIAL_READ_TIMEOUT))
-                        .context("failed to configure serial socket read timeout")?;
+                        .map_err(|source| GuestTestFailure::SerialReadTimeout { source })?;
                     return Ok(stream);
                 }
                 Err(error)
@@ -4108,12 +4777,10 @@ mod tests {
                         error.kind(),
                         ErrorKind::ConnectionRefused | ErrorKind::NotFound
                     ) && started.elapsed() < SERIAL_CONNECT_TIMEOUT => {}
-                Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!(
-                            "failed to connect to QEMU debug serial socket {}",
-                            socket_path.display()
-                        )
+                Err(source) => {
+                    return Err(GuestTestFailure::SerialConnect {
+                        path: socket_path.display().to_string(),
+                        source,
                     });
                 }
             }
@@ -4125,7 +4792,7 @@ mod tests {
         socket_path: &Path,
         marker: &[u8],
         expected: usize,
-    ) -> Result<()> {
+    ) -> Result<(), GuestTestFailure> {
         let deadline = Instant::now() + WATCHDOG_STAGE_TIMEOUT;
         let mut serial = connect_serial_socket(socket_path)?;
         let mut line = Vec::new();
@@ -4173,16 +4840,18 @@ mod tests {
                 }
                 Err(error)
                     if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
-                Err(error) => {
-                    return Err(error).context("failed while reading QEMU debug serial socket");
+                Err(source) => {
+                    return Err(GuestTestFailure::SerialRead { source });
                 }
             }
         }
 
-        bail!(
-            "timed out waiting for {expected} debugger run markers; observed {seen}; reconnects: {reconnects}; recent stages: {}; recent lines: {}",
-            observed_stages.join(" | "),
-            recent_lines.join(" | ")
-        )
+        Err(GuestTestFailure::MarkersTimedOut {
+            expected,
+            seen,
+            reconnects,
+            stages: observed_stages.join(" | "),
+            lines: recent_lines.join(" | "),
+        })
     }
 }

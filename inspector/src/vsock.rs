@@ -8,9 +8,7 @@
 //! that cannot provide it fails with [`VsockUnsupported`] instead of
 //! quietly running on the serial line.
 
-use anyhow::Result;
-
-use crate::serial::{RpcReader, RpcWriter};
+use crate::serial::{RpcReader, RpcWriter, TransportHalf};
 
 /// How long the host retries the connection after the guest debugger
 /// announced it entered `wasi:cli/run`.
@@ -58,6 +56,72 @@ pub(crate) enum VsockUnsupported {
 /// preflight checks, on every host.
 const VHOST_VSOCK_DEVICE_NAME: &str = "/dev/vhost-vsock";
 
+/// Why the inspector could not open its RPC transport over vsock.
+///
+/// A host that cannot carry vsock at all is a separate variant from a
+/// host that can and did not: the first is answered by choosing the
+/// serial transport, the second by looking at the guest.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum VsockConnectError {
+    #[error("{0}")]
+    Unsupported(#[from] VsockUnsupported),
+    #[error("failed to connect to guest vsock cid {cid} port {port}: {source}")]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        expect(
+            dead_code,
+            reason = "only the Linux connect path opens an AF_VSOCK socket; every other host \
+                      refuses with Unsupported before it gets here"
+        )
+    )]
+    Connect {
+        cid: u32,
+        port: u32,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to configure the guest vsock stream nonblocking: {source}")]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        expect(
+            dead_code,
+            reason = "only the Linux connect path opens an AF_VSOCK socket; every other host \
+                      refuses with Unsupported before it gets here"
+        )
+    )]
+    Configure {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to clone the guest vsock stream reader: {source}")]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        expect(
+            dead_code,
+            reason = "only the Linux connect path opens an AF_VSOCK socket; every other host \
+                      refuses with Unsupported before it gets here"
+        )
+    )]
+    Clone {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to register the guest vsock stream {half}: {source}")]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        expect(
+            dead_code,
+            reason = "only the Linux connect path opens an AF_VSOCK socket; every other host \
+                      refuses with Unsupported before it gets here"
+        )
+    )]
+    Register {
+        half: TransportHalf,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
 /// Checks that this host can give a guest a vsock device at all.
 ///
 /// Called before QEMU is built so an unusable request fails with an
@@ -91,8 +155,10 @@ pub(crate) fn preflight() -> Result<(), VsockUnsupported> {
 
 /// Opens the RPC transport to `port` on the guest at `cid`.
 #[cfg(target_os = "linux")]
-pub(crate) async fn connect(cid: u32, port: u32) -> Result<(RpcReader, RpcWriter)> {
-    use anyhow::Context as _;
+pub(crate) async fn connect(
+    cid: u32,
+    port: u32,
+) -> Result<(RpcReader, RpcWriter), VsockConnectError> {
     use std::io;
     use std::time::Instant;
 
@@ -113,33 +179,35 @@ pub(crate) async fn connect(cid: u32, port: u32) -> Result<(RpcReader, RpcWriter
             {
                 async_io::Timer::after(CONNECT_POLL).await;
             }
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("failed to connect to guest vsock cid {cid} port {port}")
-                });
+            Err(source) => {
+                return Err(VsockConnectError::Connect { cid, port, source });
             }
         }
     };
     stream
         .set_nonblocking(true)
-        .context("failed to configure the guest vsock stream nonblocking")?;
+        .map_err(|source| VsockConnectError::Configure { source })?;
     let read = stream
         .try_clone()
-        .context("failed to clone the guest vsock stream reader")?;
+        .map_err(|source| VsockConnectError::Clone { source })?;
+    let register = |half| move |source| VsockConnectError::Register { half, source };
     Ok((
         Box::new(
             async_io::Async::new(AsyncVsockStream::new(read))
-                .context("failed to register the guest vsock stream reader")?,
+                .map_err(register(TransportHalf::Reader))?,
         ) as RpcReader,
         Box::new(
             async_io::Async::new(AsyncVsockStream::new(stream))
-                .context("failed to register the guest vsock stream writer")?,
+                .map_err(register(TransportHalf::Writer))?,
         ) as RpcWriter,
     ))
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) async fn connect(cid: u32, port: u32) -> Result<(RpcReader, RpcWriter)> {
+pub(crate) async fn connect(
+    cid: u32,
+    port: u32,
+) -> Result<(RpcReader, RpcWriter), VsockConnectError> {
     let _ = (cid, port);
     Err(VsockUnsupported::HostOperatingSystem.into())
 }

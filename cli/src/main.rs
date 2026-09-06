@@ -4,14 +4,13 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{Context, Result, anyhow, bail, ensure};
 use askama::Template;
 use clap::{Parser, Subcommand, ValueEnum};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use fatfs::{FatType, FileSystem, FormatVolumeOptions, FsOptions};
-use helios_artifact::{cwasm_target_supports_wasm_simd, sign_payload_with_key};
-use helios_compiler_support::{AotCompileHint, precompile_artifact};
-use helios_workspace_root::WorkspaceRoot;
+use helios_artifact::{TrailerError, cwasm_target_supports_wasm_simd, sign_payload_with_key};
+use helios_compiler_support::{AotCompileHint, CompileError, precompile_artifact};
+use helios_workspace_root::{WorkspaceRoot, WorkspaceRootError};
 use mbrman::{BOOT_ACTIVE, CHS, MBR, MBRPartitionEntry};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
@@ -19,6 +18,453 @@ use toml::Value;
 use walkdir::WalkDir;
 use wasmparser::Parser as WasmParser;
 use wit_component::ComponentEncoder;
+
+/// Why a `helios-cli` invocation did not do what it was asked.
+///
+/// One variant per subcommand: each owns the typed error of the work it
+/// drives, so a failure names the command that produced it before it
+/// names the step.
+#[derive(Debug, thiserror::Error)]
+enum CliError {
+    #[error("{0}")]
+    Aot(#[from] AotError),
+    #[error("{0}")]
+    CompilerPlugin(#[from] CompilerPluginError),
+    #[error("{0}")]
+    KernelPrebuild(#[from] PrebuildError),
+    #[error("{0}")]
+    LimineUefiImage(#[from] LimineError),
+}
+
+/// Why an ahead-of-time compile did not produce a signed artifact.
+#[derive(Debug, thiserror::Error)]
+enum AotError {
+    #[error("{0}")]
+    Key(#[from] KeyError),
+    #[error("failed to read {path}: {source}")]
+    ReadInput {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("{0}")]
+    Compile(#[from] CompileError),
+    #[error("failed to sign AOT payload: {source}")]
+    Sign {
+        #[source]
+        source: TrailerError,
+    },
+    #[error("failed to write {path}: {source}")]
+    WriteOutput {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+}
+
+/// Why the in-kernel compiler plugin could not be compiled and signed.
+#[derive(Debug, thiserror::Error)]
+enum CompilerPluginError {
+    #[error("{COMPILER_PLUGIN_ROOT_KEY_ENV} is required: {source}")]
+    MissingRootKey {
+        #[source]
+        source: std::env::VarError,
+    },
+    #[error("failed to decode compiler plugin root key: {source}")]
+    DecodeRootKey {
+        #[source]
+        source: hex::FromHexError,
+    },
+    #[error("root key must be 32 bytes, got {len}")]
+    RootKeyLength { len: usize },
+    #[error("failed to read wasm from stdin: {source}")]
+    ReadStdin {
+        #[source]
+        source: io::Error,
+    },
+    #[error("{0}")]
+    Compile(#[from] CompileError),
+    #[error("failed to sign compiler plugin output: {source}")]
+    Sign {
+        #[source]
+        source: TrailerError,
+    },
+    #[error("failed to write signed cwasm to stdout: {source}")]
+    WriteStdout {
+        #[source]
+        source: io::Error,
+    },
+}
+
+/// Why the root signing keypair could not be read or written.
+#[derive(Debug, thiserror::Error)]
+enum KeyError {
+    #[error("failed to read {path}: {source}")]
+    Read {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("{path} does not contain a 32-byte Ed25519 secret key: {source}")]
+    NotThirtyTwoBytes {
+        path: String,
+        #[source]
+        source: std::array::TryFromSliceError,
+    },
+    #[error("failed to write {path}: {source}")]
+    Write {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+}
+
+/// Why the kernel-prebuild manifest and the bootfs it describes could
+/// not be produced.
+#[derive(Debug, thiserror::Error)]
+enum PrebuildError {
+    #[error("{0}")]
+    WorkspaceRoot(#[from] WorkspaceRootError),
+    #[error("{0}")]
+    Key(#[from] KeyError),
+    #[error("{0}")]
+    BootPrograms(#[from] BootProgramError),
+    #[error("{0}")]
+    BootArtifacts(#[from] BootArtifactsError),
+    #[error("{0}")]
+    WasmBuild(#[from] WasmBuildError),
+    #[error("{0}")]
+    Bootfs(#[from] BootfsError),
+    #[error("{0}")]
+    Compile(#[from] CompileError),
+    #[error("failed to create {path}: {source}")]
+    CreateOutDir {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to sign init AOT payload: {source}")]
+    SignInit {
+        #[source]
+        source: TrailerError,
+    },
+    #[error("failed to write {path}: {source}")]
+    Write {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to resolve {path}: {source}")]
+    Resolve {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to encode the kernel-prebuild manifest: {source}")]
+    EncodeManifest {
+        #[source]
+        source: serde_json::Error,
+    },
+}
+
+/// Why one wasm program could not be built into an artifact.
+#[derive(Debug, thiserror::Error)]
+enum WasmBuildError {
+    #[error("crate manifest {path} is missing")]
+    ManifestMissing { path: String },
+    #[error("failed to invoke cargo for {path}: {source}")]
+    SpawnCargo {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("wasm build for {path} target {target} failed with status {status}")]
+    BuildFailed {
+        path: String,
+        target: String,
+        status: std::process::ExitStatus,
+    },
+    #[error("failed to resolve generated artifact {artifact}: {source}")]
+    ResolveArtifact {
+        artifact: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to read {path}: {source}")]
+    Read {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    /// wit-component reports through `anyhow`, which keeps no type to
+    /// carry here, so its own report travels as the text it renders —
+    /// the whole chain, not just its outermost line.
+    #[error("failed to load core module {path}: {report}")]
+    LoadCoreModule { path: String, report: String },
+    #[error("failed to encode component {path}: {report}")]
+    EncodeComponent { path: String, report: String },
+}
+
+/// Why the set of boot programs could not be resolved from the
+/// workspace and the selection the caller made.
+#[derive(Debug, thiserror::Error)]
+enum BootProgramError {
+    #[error("--boot-program must name at least one boot program")]
+    EmptyFlagSelection,
+    #[error("HELIOS_BOOT_PROGRAMS must name at least one boot program")]
+    EmptyEnvSelection,
+    #[error("HELIOS_BOOT_PROGRAMS referenced unknown program(s): {missing}")]
+    UnknownPrograms { missing: String },
+    #[error("failed to read {path}: {source}")]
+    ReadProgramsRoot {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to read programs directory entry: {source}")]
+    ReadProgramsEntry {
+        #[source]
+        source: io::Error,
+    },
+    #[error("program directory {path} has no valid UTF-8 name")]
+    ProgramNameNotUtf8 { path: String },
+    #[error("default program crate manifest {path} is missing")]
+    ManifestMissing { path: String },
+    #[error("failed to read {path}: {source}")]
+    ReadManifest {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to parse {path}: {source}")]
+    ParseManifest {
+        path: String,
+        #[source]
+        source: toml::de::Error,
+    },
+    #[error("{path} is missing package.name or lib.name")]
+    ManifestHasNoName { path: String },
+}
+
+/// Why the external boot-artifacts manifest does not describe artifacts
+/// this build can use.
+#[derive(Debug, thiserror::Error)]
+enum BootArtifactsError {
+    #[error("boot artifacts manifest {path} is missing")]
+    ManifestMissing { path: String },
+    #[error("failed to read boot artifacts manifest {path}: {source}")]
+    ReadManifest {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to parse boot artifacts manifest {path}: {source}")]
+    ParseManifest {
+        path: String,
+        #[source]
+        source: toml::de::Error,
+    },
+    #[error("boot artifact in {path} has an empty command")]
+    EmptyCommand { path: String },
+    #[error("boot artifact {command} in {path} has an empty {field}")]
+    EmptyField {
+        command: String,
+        path: String,
+        /// The manifest key that was empty, spelled the way the message
+        /// reads it.
+        field: &'static str,
+    },
+    #[error("boot artifact {command} must install under bin/")]
+    BootfsPathNotUnderBin { command: String },
+    #[error("boot artifact {command} source must be workspace-relative")]
+    SourceNotRelative { command: String },
+    #[error("boot artifact {command} support root must be workspace-relative")]
+    SupportRootNotRelative { command: String },
+    #[error(
+        "boot artifact {command} support_root and support_bootfs_prefix must be specified together"
+    )]
+    SupportPairMismatch { command: String },
+    #[error("boot artifact {command} support bootfs prefix must be relative")]
+    SupportPrefixNotRelative { command: String },
+    #[error("boot artifact {command} declares an empty target")]
+    EmptyTarget { command: String },
+    #[error("boot artifact support root {path} is missing")]
+    SupportRootMissing { path: String },
+    #[error("boot program command {command} is declared more than once")]
+    DuplicateCommand { command: String },
+    #[error("boot program(s) are not available for target {target}: {mismatches}")]
+    TargetMismatch { target: String, mismatches: String },
+}
+
+/// Why one bootfs asset could not be produced.
+#[derive(Debug, thiserror::Error)]
+enum BootfsError {
+    #[error("{0}")]
+    WasmBuild(#[from] WasmBuildError),
+    #[error("{0}")]
+    Compile(#[from] CompileError),
+    #[error("{0}")]
+    BootArtifacts(#[from] BootArtifactsError),
+    #[error("{0}")]
+    BootPrograms(#[from] BootProgramError),
+    #[error("failed to read {path}: {source}")]
+    Read {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to sign {payload} AOT payload: {source}")]
+    Sign {
+        /// Which payload was being signed, spelled the way the message
+        /// reads it.
+        payload: String,
+        #[source]
+        source: TrailerError,
+    },
+    #[error("failed to write {path}: {source}")]
+    Write {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to resolve {path}: {source}")]
+    Resolve {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to walk support root {path}: {source}")]
+    WalkSupportRoot {
+        path: String,
+        #[source]
+        source: walkdir::Error,
+    },
+    #[error("failed to strip support root {root} from {source_path}: {source}")]
+    StripSupportRoot {
+        root: String,
+        source_path: String,
+        #[source]
+        source: std::path::StripPrefixError,
+    },
+    #[error("{path} is not valid UTF-8")]
+    PathNotUtf8 { path: String },
+    #[error("failed to read directory {path}: {source}")]
+    ReadDir {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+}
+
+/// Why the Limine UEFI disk image could not be built.
+#[derive(Debug, thiserror::Error)]
+enum LimineError {
+    #[error("failed to canonicalize kernel {path}: {source}")]
+    CanonicalizeKernel {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to find Limine; install `limine` or set HELIOS_LIMINE_BIN")]
+    ToolchainMissing,
+    #[error("failed to locate Limine shared files; set HELIOS_LIMINE_SHARE")]
+    ShareDirMissing,
+    #[error("Limine EFI bootloader is missing: {path}")]
+    BootloaderMissing { path: String },
+    #[error("failed to inspect {path}: {source}")]
+    Inspect {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to create image directory {path}: {source}")]
+    CreateImageDir {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to create Limine image {path}: {source}")]
+    CreateImage {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to size Limine image {path}: {source}")]
+    SizeImage {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to create Limine image MBR: {source}")]
+    CreateMbr {
+        #[source]
+        source: mbrman::Error,
+    },
+    #[error("Limine UEFI image is too large for an MBR partition table: {source}")]
+    ImageTooLarge {
+        #[source]
+        source: std::num::TryFromIntError,
+    },
+    #[error("Limine UEFI image is too small for the FAT partition")]
+    ImageTooSmall,
+    #[error("failed to write Limine image MBR: {source}")]
+    WriteMbr {
+        #[source]
+        source: mbrman::Error,
+    },
+    #[error("Limine partition offset exceeds image size")]
+    PartitionOffsetTooLarge,
+    #[error("failed to format Limine FAT32 partition: {source}")]
+    FormatPartition {
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to {step}: {source}")]
+    Partition {
+        /// The partition operation that failed, spelled the way the
+        /// message reads it.
+        step: &'static str,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to create {path}: {source}")]
+    CreateFatEntry {
+        /// The path inside the image, which is fixed by the layout.
+        path: &'static str,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to write {path}: {source}")]
+    WriteFatEntry {
+        path: &'static str,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to render Limine configuration: {source}")]
+    RenderConfig {
+        #[source]
+        source: askama::Error,
+    },
+    #[error("failed to open source file {path}: {source}")]
+    OpenSource {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to create FAT file {name}: {source}")]
+    CreateFatFile {
+        name: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to copy {path} into FAT file {name}: {source}")]
+    CopyIntoFat {
+        path: String,
+        name: String,
+        #[source]
+        source: io::Error,
+    },
+}
 
 const ROOT_SECRET_FILE: &str = "helios-root-secret.key";
 const ROOT_PUBLIC_FILE: &str = "helios-root-public.key";
@@ -224,59 +670,65 @@ struct ProgramManifest {
     artifact_name: String,
 }
 
-fn main() -> Result<()> {
+fn main() -> Result<(), CliError> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Aot(command) => run_aot(command),
-        Commands::CompilerPlugin(command) => run_compiler_plugin(command),
+        Commands::Aot(command) => Ok(run_aot(command)?),
+        Commands::CompilerPlugin(command) => Ok(run_compiler_plugin(command)?),
         Commands::KernelPrebuild(command) => {
-            run_kernel_prebuild(command, cli.workspace_root.as_deref())
+            Ok(run_kernel_prebuild(command, cli.workspace_root.as_deref())?)
         }
-        Commands::LimineUefiImage(command) => run_limine_uefi_image(command),
+        Commands::LimineUefiImage(command) => Ok(run_limine_uefi_image(command)?),
     }
 }
 
-fn run_aot(command: AotCommand) -> Result<()> {
+fn run_aot(command: AotCommand) -> Result<(), AotError> {
     let root_signing_key = read_signing_key(&command.root_key)?;
-    let wasm = fs::read(&command.input)
-        .with_context(|| format!("failed to read {}", command.input.display()))?;
+    let wasm = fs::read(&command.input).map_err(|source| AotError::ReadInput {
+        path: command.input.display().to_string(),
+        source,
+    })?;
     let payload = precompile_artifact(&wasm, &command.target, command.hint.into())?.bytes;
-    let signed =
-        sign_payload_with_key(&payload, &root_signing_key).context("failed to sign AOT payload")?;
-    fs::write(&command.output, signed)
-        .with_context(|| format!("failed to write {}", command.output.display()))?;
+    let signed = sign_payload_with_key(&payload, &root_signing_key)
+        .map_err(|source| AotError::Sign { source })?;
+    fs::write(&command.output, signed).map_err(|source| AotError::WriteOutput {
+        path: command.output.display().to_string(),
+        source,
+    })?;
     Ok(())
 }
 
-fn run_compiler_plugin(command: CompilerPluginCommand) -> Result<()> {
+fn run_compiler_plugin(command: CompilerPluginCommand) -> Result<(), CompilerPluginError> {
     let root_key_hex = std::env::var(COMPILER_PLUGIN_ROOT_KEY_ENV)
-        .with_context(|| format!("{COMPILER_PLUGIN_ROOT_KEY_ENV} is required"))?;
+        .map_err(|source| CompilerPluginError::MissingRootKey { source })?;
     let root_key_bytes: [u8; 32] = hex::decode(root_key_hex.trim())
-        .context("failed to decode compiler plugin root key")?
+        .map_err(|source| CompilerPluginError::DecodeRootKey { source })?
         .try_into()
-        .map_err(|bytes: Vec<u8>| anyhow!("root key must be 32 bytes, got {}", bytes.len()))?;
+        .map_err(|bytes: Vec<u8>| CompilerPluginError::RootKeyLength { len: bytes.len() })?;
     let root_signing_key = SigningKey::from_bytes(&root_key_bytes);
 
     let mut wasm = Vec::new();
     io::stdin()
         .read_to_end(&mut wasm)
-        .context("failed to read wasm from stdin")?;
+        .map_err(|source| CompilerPluginError::ReadStdin { source })?;
     let payload = precompile_artifact(&wasm, &command.target, command.hint.into())?.bytes;
     let signed = sign_payload_with_key(&payload, &root_signing_key)
-        .context("failed to sign compiler plugin output")?;
+        .map_err(|source| CompilerPluginError::Sign { source })?;
     io::stdout()
         .write_all(&signed)
-        .context("failed to write signed cwasm to stdout")?;
+        .map_err(|source| CompilerPluginError::WriteStdout { source })?;
     Ok(())
 }
 
 fn run_kernel_prebuild(
     command: KernelPrebuildCommand,
     explicit_workspace_root: Option<&Path>,
-) -> Result<()> {
+) -> Result<(), PrebuildError> {
     let workspace_root = WorkspaceRoot::resolve(explicit_workspace_root)?;
-    fs::create_dir_all(&command.out_dir)
-        .with_context(|| format!("failed to create {}", command.out_dir.display()))?;
+    fs::create_dir_all(&command.out_dir).map_err(|source| PrebuildError::CreateOutDir {
+        path: command.out_dir.display().to_string(),
+        source,
+    })?;
 
     let root_secret_path = command.out_dir.join(ROOT_SECRET_FILE);
     let root_public_path = command.out_dir.join(ROOT_PUBLIC_FILE);
@@ -311,9 +763,11 @@ fn run_kernel_prebuild(
     )?
     .bytes;
     let init_signed = sign_payload_with_key(&init_payload, &root_signing_key)
-        .context("failed to sign init AOT payload")?;
-    fs::write(&init_cwasm, init_signed)
-        .with_context(|| format!("failed to write {}", init_cwasm.display()))?;
+        .map_err(|source| PrebuildError::SignInit { source })?;
+    fs::write(&init_cwasm, init_signed).map_err(|source| PrebuildError::Write {
+        path: init_cwasm.display().to_string(),
+        source,
+    })?;
 
     let build = BootBuild {
         cargo: &command.cargo,
@@ -333,28 +787,37 @@ fn run_kernel_prebuild(
         &boot_artifacts_manifest,
     )?);
 
+    let resolve = |path: &Path| {
+        fs::canonicalize(path).map_err(|source| PrebuildError::Resolve {
+            path: path.display().to_string(),
+            source,
+        })
+    };
     let manifest = PrebuildManifest {
         target: command.target,
-        init_component: fs::canonicalize(&init_cwasm)
-            .with_context(|| format!("failed to resolve {}", init_cwasm.display()))?,
+        init_component: resolve(&init_cwasm)?,
         init_argv0: command.init_argv0,
-        bootfs_root: fs::canonicalize(&bootfs_root)
-            .with_context(|| format!("failed to resolve {}", bootfs_root.display()))?,
-        root_public_key: fs::canonicalize(&root_public_path)
-            .with_context(|| format!("failed to resolve {}", root_public_path.display()))?,
-        root_secret_key: fs::canonicalize(&root_secret_path)
-            .with_context(|| format!("failed to resolve {}", root_secret_path.display()))?,
+        bootfs_root: resolve(&bootfs_root)?,
+        root_public_key: resolve(&root_public_path)?,
+        root_secret_key: resolve(&root_secret_path)?,
         bootfs_assets,
     };
     let manifest_path = command.out_dir.join(PREBUILD_MANIFEST_FILE);
-    fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)
-        .with_context(|| format!("failed to write {}", manifest_path.display()))?;
+    let encoded = serde_json::to_vec_pretty(&manifest)
+        .map_err(|source| PrebuildError::EncodeManifest { source })?;
+    fs::write(&manifest_path, encoded).map_err(|source| PrebuildError::Write {
+        path: manifest_path.display().to_string(),
+        source,
+    })?;
     Ok(())
 }
 
-fn run_limine_uefi_image(command: LimineUefiImageCommand) -> Result<()> {
-    let kernel = fs::canonicalize(&command.kernel)
-        .with_context(|| format!("failed to canonicalize kernel {}", command.kernel.display()))?;
+fn run_limine_uefi_image(command: LimineUefiImageCommand) -> Result<(), LimineError> {
+    let kernel =
+        fs::canonicalize(&command.kernel).map_err(|source| LimineError::CanonicalizeKernel {
+            path: command.kernel.display().to_string(),
+            source,
+        })?;
     let limine = LimineToolchain::discover(command.efi_arch)?;
     build_limine_uefi_image(&limine, &kernel, &command.output, command.baud)
 }
@@ -365,27 +828,23 @@ struct LimineToolchain {
 }
 
 impl LimineToolchain {
-    fn discover(efi_arch: LimineEfiArch) -> Result<Self> {
+    fn discover(efi_arch: LimineEfiArch) -> Result<Self, LimineError> {
         let executable = std::env::var_os("HELIOS_LIMINE_BIN")
             .map(PathBuf::from)
             .or_else(|| find_executable_in_path("limine"))
-            .ok_or_else(|| {
-                anyhow!("failed to find Limine; install `limine` or set HELIOS_LIMINE_BIN")
-            })?;
+            .ok_or(LimineError::ToolchainMissing)?;
         let share_dir = std::env::var_os("HELIOS_LIMINE_SHARE")
             .map(PathBuf::from)
-            .or_else(|| limine_datadir(&executable).ok())
+            .or_else(|| limine_datadir(&executable))
             .or_else(|| infer_limine_share_dir(&executable, efi_arch))
-            .ok_or_else(|| {
-                anyhow!("failed to locate Limine shared files; set HELIOS_LIMINE_SHARE")
-            })?;
+            .ok_or(LimineError::ShareDirMissing)?;
         let efi_bootloader_name = efi_arch.efi_bootloader_name();
         let efi_bootloader = share_dir.join(efi_bootloader_name);
-        ensure!(
-            efi_bootloader.is_file(),
-            "Limine EFI bootloader is missing: {}",
-            efi_bootloader.display()
-        );
+        if !efi_bootloader.is_file() {
+            return Err(LimineError::BootloaderMissing {
+                path: efi_bootloader.display().to_string(),
+            });
+        }
         Ok(Self {
             efi_bootloader,
             efi_bootloader_name,
@@ -393,24 +852,21 @@ impl LimineToolchain {
     }
 }
 
-fn limine_datadir(executable: &Path) -> Result<PathBuf> {
+/// Asks the Limine executable where its shared files live.
+///
+/// Every failure means the same thing to the caller — this executable
+/// cannot say — and [`LimineToolchain::discover`] goes on to the next
+/// way of finding the directory, so the reason is not carried further.
+fn limine_datadir(executable: &Path) -> Option<PathBuf> {
     let output = Command::new(executable)
         .arg("--print-datadir")
         .output()
-        .with_context(|| {
-            format!(
-                "failed to query Limine data directory via {}",
-                executable.display()
-            )
-        })?;
-    ensure!(
-        output.status.success(),
-        "{} --print-datadir exited with status {}",
-        executable.display(),
-        output.status
-    );
-    let path = String::from_utf8(output.stdout).context("Limine data directory was not UTF-8")?;
-    Ok(PathBuf::from(path.trim()))
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = String::from_utf8(output.stdout).ok()?;
+    Some(PathBuf::from(path.trim()))
 }
 
 fn build_limine_uefi_image(
@@ -418,11 +874,13 @@ fn build_limine_uefi_image(
     kernel: &Path,
     image: &Path,
     baud: u32,
-) -> Result<()> {
+) -> Result<(), LimineError> {
     let image_bytes = limine_image_bytes(kernel, &limine.efi_bootloader)?;
     if let Some(parent) = image.parent().filter(|path| !path.as_os_str().is_empty()) {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create image directory {}", parent.display()))?;
+        fs::create_dir_all(parent).map_err(|source| LimineError::CreateImageDir {
+            path: parent.display().to_string(),
+            source,
+        })?;
     }
     let mut image_file = fs::OpenOptions::new()
         .create(true)
@@ -430,32 +888,41 @@ fn build_limine_uefi_image(
         .read(true)
         .write(true)
         .open(image)
-        .with_context(|| format!("failed to create Limine image {}", image.display()))?;
+        .map_err(|source| LimineError::CreateImage {
+            path: image.display().to_string(),
+            source,
+        })?;
     image_file
         .set_len(image_bytes)
-        .with_context(|| format!("failed to size Limine image {}", image.display()))?;
+        .map_err(|source| LimineError::SizeImage {
+            path: image.display().to_string(),
+            source,
+        })?;
     write_limine_mbr(&mut image_file, image_bytes)?;
     write_limine_fat_volume(&mut image_file, image_bytes, kernel, limine, baud)
 }
 
-fn limine_image_bytes(kernel: &Path, efi_bootloader: &Path) -> Result<u64> {
-    let payload_bytes = fs::metadata(kernel)
-        .with_context(|| format!("failed to inspect kernel {}", kernel.display()))?
-        .len()
-        + fs::metadata(efi_bootloader)
-            .with_context(|| format!("failed to inspect {}", efi_bootloader.display()))?
-            .len();
+fn limine_image_bytes(kernel: &Path, efi_bootloader: &Path) -> Result<u64, LimineError> {
+    let inspect = |path: &Path| {
+        fs::metadata(path)
+            .map(|metadata| metadata.len())
+            .map_err(|source| LimineError::Inspect {
+                path: path.display().to_string(),
+                source,
+            })
+    };
+    let payload_bytes = inspect(kernel)? + inspect(efi_bootloader)?;
     Ok(LIMINE_IMAGE_BYTES.max(payload_bytes + 128 * 1024 * 1024))
 }
 
-fn write_limine_mbr(image: &mut fs::File, image_bytes: u64) -> Result<()> {
+fn write_limine_mbr(image: &mut fs::File, image_bytes: u64) -> Result<(), LimineError> {
     let mut mbr = MBR::new_from(image, LIMINE_SECTOR_BYTES as u32, LIMINE_DISK_SIGNATURE)
-        .context("failed to create Limine image MBR")?;
+        .map_err(|source| LimineError::CreateMbr { source })?;
     let total_sectors = u32::try_from(image_bytes / LIMINE_SECTOR_BYTES)
-        .context("Limine UEFI image is too large for an MBR partition table")?;
+        .map_err(|source| LimineError::ImageTooLarge { source })?;
     let partition_sectors = total_sectors
         .checked_sub(LIMINE_PARTITION_START_LBA)
-        .ok_or_else(|| anyhow!("Limine UEFI image is too small for the FAT partition"))?;
+        .ok_or(LimineError::ImageTooSmall)?;
     mbr[1] = MBRPartitionEntry {
         boot: BOOT_ACTIVE,
         first_chs: CHS::empty(),
@@ -465,7 +932,7 @@ fn write_limine_mbr(image: &mut fs::File, image_bytes: u64) -> Result<()> {
         sectors: partition_sectors,
     };
     mbr.write_into(image)
-        .context("failed to write Limine image MBR")
+        .map_err(|source| LimineError::WriteMbr { source })
 }
 
 fn write_limine_fat_volume(
@@ -474,11 +941,11 @@ fn write_limine_fat_volume(
     kernel: &Path,
     limine: &LimineToolchain,
     baud: u32,
-) -> Result<()> {
+) -> Result<(), LimineError> {
     let partition_offset = u64::from(LIMINE_PARTITION_START_LBA) * LIMINE_SECTOR_BYTES;
     let partition_len = image_bytes
         .checked_sub(partition_offset)
-        .ok_or_else(|| anyhow!("Limine partition offset exceeds image size"))?;
+        .ok_or(LimineError::PartitionOffsetTooLarge)?;
     let mut partition = FileSlice::new(image, partition_offset, partition_len);
     fatfs::format_volume(
         &mut partition,
@@ -486,22 +953,33 @@ fn write_limine_fat_volume(
             .fat_type(FatType::Fat32)
             .volume_label(*b"HELIOS     "),
     )
-    .context("failed to format Limine FAT32 partition")?;
+    .map_err(|source| LimineError::FormatPartition { source })?;
     write_fat32_hidden_sectors(&mut partition, LIMINE_PARTITION_START_LBA)?;
     partition
         .seek(SeekFrom::Start(0))
-        .context("failed to rewind Limine FAT32 partition")?;
-    let fs = FileSystem::new(partition, FsOptions::new())
-        .context("failed to open Limine FAT32 partition")?;
+        .map_err(|source| LimineError::Partition {
+            step: "rewind Limine FAT32 partition",
+            source,
+        })?;
+    let fs =
+        FileSystem::new(partition, FsOptions::new()).map_err(|source| LimineError::Partition {
+            step: "open Limine FAT32 partition",
+            source,
+        })?;
     let root = fs.root_dir();
-    let boot = root.create_dir("boot").context("failed to create /boot")?;
-    let efi = root.create_dir("EFI").context("failed to create /EFI")?;
-    let efi_boot = efi
-        .create_dir("BOOT")
-        .context("failed to create /EFI/BOOT")?;
-    let limine_dir = boot
-        .create_dir("limine")
-        .context("failed to create /boot/limine")?;
+    fn create_dir<'a, IO: fatfs::ReadWriteSeek>(
+        parent: &fatfs::Dir<'a, IO>,
+        name: &str,
+        path: &'static str,
+    ) -> Result<fatfs::Dir<'a, IO>, LimineError> {
+        parent
+            .create_dir(name)
+            .map_err(|source| LimineError::CreateFatEntry { path, source })
+    }
+    let boot = create_dir(&root, "boot", "/boot")?;
+    let efi = create_dir(&root, "EFI", "/EFI")?;
+    let efi_boot = create_dir(&efi, "BOOT", "/EFI/BOOT")?;
+    let limine_dir = create_dir(&boot, "limine", "/boot/limine")?;
     write_file_to_fat(
         &efi_boot,
         limine.efi_bootloader_name,
@@ -509,48 +987,67 @@ fn write_limine_fat_volume(
     )?;
     let config = LimineConfigTemplate { baud }
         .render()
-        .context("failed to render Limine configuration")?;
-    let mut limine_conf = limine_dir
-        .create_file("limine.conf")
-        .context("failed to create /boot/limine/limine.conf")?;
-    limine_conf
-        .write_all(config.as_bytes())
-        .context("failed to write /boot/limine/limine.conf")?;
-    let mut efi_limine_conf = efi_boot
-        .create_file("limine.conf")
-        .context("failed to create /EFI/BOOT/limine.conf")?;
-    efi_limine_conf
-        .write_all(config.as_bytes())
-        .context("failed to write /EFI/BOOT/limine.conf")?;
+        .map_err(|source| LimineError::RenderConfig { source })?;
+    for (directory, path) in [
+        (&limine_dir, "/boot/limine/limine.conf"),
+        (&efi_boot, "/EFI/BOOT/limine.conf"),
+    ] {
+        let mut file = directory
+            .create_file("limine.conf")
+            .map_err(|source| LimineError::CreateFatEntry { path, source })?;
+        file.write_all(config.as_bytes())
+            .map_err(|source| LimineError::WriteFatEntry { path, source })?;
+    }
     write_file_to_fat(&boot, "helios", kernel)?;
     Ok(())
 }
 
-fn write_fat32_hidden_sectors(partition: &mut FileSlice<'_>, hidden_sectors: u32) -> Result<()> {
+fn write_fat32_hidden_sectors(
+    partition: &mut FileSlice<'_>,
+    hidden_sectors: u32,
+) -> Result<(), LimineError> {
     const BPB_HIDDEN_SECTORS_OFFSET: u64 = 0x1c;
     const FAT32_BACKUP_BOOT_SECTOR: u64 = 6 * LIMINE_SECTOR_BYTES;
     for boot_sector in [0, FAT32_BACKUP_BOOT_SECTOR] {
         partition
             .seek(SeekFrom::Start(boot_sector + BPB_HIDDEN_SECTORS_OFFSET))
-            .context("failed to seek to FAT32 hidden-sectors field")?;
+            .map_err(|source| LimineError::Partition {
+                step: "seek to FAT32 hidden-sectors field",
+                source,
+            })?;
         partition
             .write_all(&hidden_sectors.to_le_bytes())
-            .context("failed to write FAT32 hidden-sectors field")?;
+            .map_err(|source| LimineError::Partition {
+                step: "write FAT32 hidden-sectors field",
+                source,
+            })?;
     }
     Ok(())
 }
 
-fn write_file_to_fat<IO>(root: &fatfs::Dir<'_, IO>, name: &str, source: &Path) -> Result<()>
+fn write_file_to_fat<IO>(
+    root: &fatfs::Dir<'_, IO>,
+    name: &str,
+    source: &Path,
+) -> Result<(), LimineError>
 where
     IO: fatfs::ReadWriteSeek,
 {
-    let mut input = fs::File::open(source)
-        .with_context(|| format!("failed to open source file {}", source.display()))?;
+    let mut input = fs::File::open(source).map_err(|error| LimineError::OpenSource {
+        path: source.display().to_string(),
+        source: error,
+    })?;
     let mut output = root
         .create_file(name)
-        .with_context(|| format!("failed to create FAT file {name}"))?;
-    std::io::copy(&mut input, &mut output)
-        .with_context(|| format!("failed to copy {} into FAT file {name}", source.display()))?;
+        .map_err(|error| LimineError::CreateFatFile {
+            name: name.to_owned(),
+            source: io::Error::other(error),
+        })?;
+    std::io::copy(&mut input, &mut output).map_err(|error| LimineError::CopyIntoFat {
+        path: source.display().to_string(),
+        name: name.to_owned(),
+        source: error,
+    })?;
     Ok(())
 }
 
@@ -652,7 +1149,7 @@ impl Seek for FileSlice<'_> {
     }
 }
 
-fn build_compiler_plugin_asset(build: &BootBuild<'_>) -> Result<BootAsset> {
+fn build_compiler_plugin_asset(build: &BootBuild<'_>) -> Result<BootAsset, BootfsError> {
     let wasm_path = build_wasm_program(
         build.cargo,
         build.profile,
@@ -664,30 +1161,51 @@ fn build_compiler_plugin_asset(build: &BootBuild<'_>) -> Result<BootAsset> {
         "wasm32-wasip1-threads",
         "helios_compiler_plugin.wasm",
     )?;
-    let wasm =
-        fs::read(&wasm_path).with_context(|| format!("failed to read {}", wasm_path.display()))?;
+    let wasm = fs::read(&wasm_path).map_err(|source| BootfsError::Read {
+        path: wasm_path.display().to_string(),
+        source,
+    })?;
     let payload = precompile_artifact(&wasm, build.target, Hint::Performance.into())?.bytes;
-    let signed = sign_payload_with_key(&payload, build.root_signing_key)
-        .context("failed to sign compiler plugin AOT payload")?;
+    let signed = sign_payload_with_key(&payload, build.root_signing_key).map_err(|source| {
+        BootfsError::Sign {
+            payload: "compiler plugin".to_owned(),
+            source,
+        }
+    })?;
     let output_path = build.out_dir.join("compiler_plugin.cwasm");
-    fs::write(&output_path, signed)
-        .with_context(|| format!("failed to write {}", output_path.display()))?;
+    write_bootfs_artifact(&output_path, signed)?;
 
     Ok(BootAsset {
         path: COMPILER_PLUGIN_BOOTFS_PATH.to_owned(),
-        source: fs::canonicalize(&output_path)
-            .with_context(|| format!("failed to resolve {}", output_path.display()))?,
+        source: resolve_bootfs_source(&output_path)?,
         kind: BootAssetKind::File,
     })
 }
 
-fn selected_boot_programs(boot_programs: Vec<String>) -> Result<Option<BTreeSet<String>>> {
+/// Writes one signed bootfs artifact to `path`.
+fn write_bootfs_artifact(path: &Path, bytes: Vec<u8>) -> Result<(), BootfsError> {
+    fs::write(path, bytes).map_err(|source| BootfsError::Write {
+        path: path.display().to_string(),
+        source,
+    })
+}
+
+/// The absolute path the manifest records for one bootfs asset.
+fn resolve_bootfs_source(path: &Path) -> Result<PathBuf, BootfsError> {
+    fs::canonicalize(path).map_err(|source| BootfsError::Resolve {
+        path: path.display().to_string(),
+        source,
+    })
+}
+
+fn selected_boot_programs(
+    boot_programs: Vec<String>,
+) -> Result<Option<BTreeSet<String>>, BootProgramError> {
     if !boot_programs.is_empty() {
         let selected = boot_programs.into_iter().collect::<BTreeSet<_>>();
-        ensure!(
-            !selected.is_empty(),
-            "--boot-program must name at least one boot program"
-        );
+        if selected.is_empty() {
+            return Err(BootProgramError::EmptyFlagSelection);
+        }
         return Ok(Some(selected));
     }
 
@@ -701,10 +1219,9 @@ fn selected_boot_programs(boot_programs: Vec<String>) -> Result<Option<BTreeSet<
         .filter(|entry| !entry.is_empty())
         .map(str::to_owned)
         .collect::<BTreeSet<_>>();
-    ensure!(
-        !selected.is_empty(),
-        "HELIOS_BOOT_PROGRAMS must name at least one boot program"
-    );
+    if selected.is_empty() {
+        return Err(BootProgramError::EmptyEnvSelection);
+    }
     Ok(Some(selected))
 }
 
@@ -712,25 +1229,28 @@ fn build_boot_program_assets(
     build: &BootBuild<'_>,
     selected_programs: &Option<BTreeSet<String>>,
     boot_artifacts_manifest: &Path,
-) -> Result<Vec<BootAsset>> {
+) -> Result<Vec<BootAsset>, BootfsError> {
     let programs_root = build.workspace_root.join(Path::new("programs"));
     let mut available_programs = BTreeSet::new();
     let mut manifests = Vec::new();
     let mut external_artifacts = read_external_boot_artifacts(boot_artifacts_manifest)?;
 
-    for entry in fs::read_dir(&programs_root)
-        .with_context(|| format!("failed to read {}", programs_root.display()))?
+    for entry in
+        fs::read_dir(&programs_root).map_err(|source| BootProgramError::ReadProgramsRoot {
+            path: programs_root.display().to_string(),
+            source,
+        })?
     {
-        let entry = entry.with_context(|| "failed to read programs directory entry")?;
+        let entry = entry.map_err(|source| BootProgramError::ReadProgramsEntry { source })?;
         let path = entry.path();
         if !path.is_dir() {
             continue;
         }
         let Some(command) = path.file_name().and_then(|name| name.to_str()) else {
-            bail!(
-                "program directory {} has no valid UTF-8 name",
-                path.display()
-            );
+            return Err(BootProgramError::ProgramNameNotUtf8 {
+                path: path.display().to_string(),
+            }
+            .into());
         };
         if command == "init" {
             continue;
@@ -745,11 +1265,12 @@ fn build_boot_program_assets(
         manifests.push(read_program_manifest(command, &path.join("Cargo.toml"))?);
     }
     for artifact in &external_artifacts {
-        ensure!(
-            available_programs.insert(artifact.command.clone()),
-            "boot program command {} is declared more than once",
-            artifact.command
-        );
+        if !available_programs.insert(artifact.command.clone()) {
+            return Err(BootArtifactsError::DuplicateCommand {
+                command: artifact.command.clone(),
+            }
+            .into());
+        }
     }
     reject_selected_target_mismatches(&external_artifacts, build.target, selected_programs)?;
     external_artifacts.retain(|artifact| {
@@ -765,11 +1286,12 @@ fn build_boot_program_assets(
             .filter(|command| !available_programs.contains(*command))
             .cloned()
             .collect::<Vec<_>>();
-        ensure!(
-            missing_programs.is_empty(),
-            "HELIOS_BOOT_PROGRAMS referenced unknown program(s): {}",
-            missing_programs.join(", ")
-        );
+        if !missing_programs.is_empty() {
+            return Err(BootProgramError::UnknownPrograms {
+                missing: missing_programs.join(", "),
+            }
+            .into());
+        }
     }
 
     manifests.sort_by(|left, right| left.command.cmp(&right.command));
@@ -777,88 +1299,85 @@ fn build_boot_program_assets(
     let mut assets = manifests
         .into_iter()
         .map(|manifest| build_boot_program_asset(build, manifest))
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<Result<Vec<_>, BootfsError>>()?;
     for artifact in external_artifacts {
         assets.extend(build_external_boot_artifact_assets(build, artifact)?);
     }
     Ok(assets)
 }
 
-fn read_external_boot_artifacts(path: &Path) -> Result<Vec<ExternalBootArtifact>> {
-    ensure!(
-        path.is_file(),
-        "boot artifacts manifest {} is missing",
-        path.display()
-    );
-    let manifest = fs::read_to_string(path)
-        .with_context(|| format!("failed to read boot artifacts manifest {}", path.display()))?;
-    let manifest = toml::from_str::<BootArtifactsManifest>(&manifest)
-        .with_context(|| format!("failed to parse boot artifacts manifest {}", path.display()))?;
+fn read_external_boot_artifacts(
+    path: &Path,
+) -> Result<Vec<ExternalBootArtifact>, BootArtifactsError> {
+    if !path.is_file() {
+        return Err(BootArtifactsError::ManifestMissing {
+            path: path.display().to_string(),
+        });
+    }
+    let manifest = fs::read_to_string(path).map_err(|source| BootArtifactsError::ReadManifest {
+        path: path.display().to_string(),
+        source,
+    })?;
+    let manifest = toml::from_str::<BootArtifactsManifest>(&manifest).map_err(|source| {
+        BootArtifactsError::ParseManifest {
+            path: path.display().to_string(),
+            source,
+        }
+    })?;
     for artifact in &manifest.artifact {
-        ensure!(
-            !artifact.command.is_empty(),
-            "boot artifact in {} has an empty command",
-            path.display()
-        );
-        ensure!(
-            !artifact.package.is_empty(),
-            "boot artifact {} in {} has an empty package",
-            artifact.command,
-            path.display()
-        );
-        ensure!(
-            !artifact.version.is_empty(),
-            "boot artifact {} in {} has an empty version",
-            artifact.command,
-            path.display()
-        );
-        ensure!(
-            !artifact.source_url.is_empty(),
-            "boot artifact {} in {} has an empty source URL",
-            artifact.command,
-            path.display()
-        );
-        ensure!(
-            !artifact.bootfs_path.is_empty(),
-            "boot artifact {} in {} has an empty bootfs path",
-            artifact.command,
-            path.display()
-        );
-        ensure!(
-            artifact.bootfs_path.starts_with("bin/"),
-            "boot artifact {} must install under bin/",
-            artifact.command
-        );
-        ensure!(
-            artifact.source.is_relative(),
-            "boot artifact {} source must be workspace-relative",
-            artifact.command
-        );
-        if let Some(support_root) = &artifact.support_root {
-            ensure!(
-                support_root.is_relative(),
-                "boot artifact {} support root must be workspace-relative",
-                artifact.command
-            );
+        if artifact.command.is_empty() {
+            return Err(BootArtifactsError::EmptyCommand {
+                path: path.display().to_string(),
+            });
         }
-        ensure!(
-            artifact.support_root.is_some() == artifact.support_bootfs_prefix.is_some(),
-            "boot artifact {} support_root and support_bootfs_prefix must be specified together",
-            artifact.command
-        );
-        if let Some(prefix) = &artifact.support_bootfs_prefix {
-            ensure!(
-                !prefix.is_empty() && !prefix.starts_with('/'),
-                "boot artifact {} support bootfs prefix must be relative",
-                artifact.command
-            );
+        let empty = |field| BootArtifactsError::EmptyField {
+            command: artifact.command.clone(),
+            path: path.display().to_string(),
+            field,
+        };
+        for (value, field) in [
+            (&artifact.package, "package"),
+            (&artifact.version, "version"),
+            (&artifact.source_url, "source URL"),
+            (&artifact.bootfs_path, "bootfs path"),
+        ] {
+            if value.is_empty() {
+                return Err(empty(field));
+            }
         }
-        for target in &artifact.targets {
-            ensure!(
-                !target.is_empty(),
-                "boot artifact {} declares an empty target",
-                artifact.command
-            );
+        if !artifact.bootfs_path.starts_with("bin/") {
+            return Err(BootArtifactsError::BootfsPathNotUnderBin {
+                command: artifact.command.clone(),
+            });
+        }
+        if !artifact.source.is_relative() {
+            return Err(BootArtifactsError::SourceNotRelative {
+                command: artifact.command.clone(),
+            });
+        }
+        if let Some(support_root) = &artifact.support_root
+            && !support_root.is_relative()
+        {
+            return Err(BootArtifactsError::SupportRootNotRelative {
+                command: artifact.command.clone(),
+            });
+        }
+        if artifact.support_root.is_some() != artifact.support_bootfs_prefix.is_some() {
+            return Err(BootArtifactsError::SupportPairMismatch {
+                command: artifact.command.clone(),
+            });
+        }
+        if let Some(prefix) = &artifact.support_bootfs_prefix
+            && (prefix.is_empty() || prefix.starts_with('/'))
+        {
+            return Err(BootArtifactsError::SupportPrefixNotRelative {
+                command: artifact.command.clone(),
+            });
+        }
+        if artifact.targets.iter().any(String::is_empty) {
+            return Err(BootArtifactsError::EmptyTarget {
+                command: artifact.command.clone(),
+            });
         }
     }
     Ok(manifest.artifact)
@@ -869,7 +1388,7 @@ fn validate_external_boot_artifact_sources(
     target: &str,
     selected_programs: &Option<BTreeSet<String>>,
     workspace_root: &WorkspaceRoot,
-) -> Result<()> {
+) -> Result<(), BootArtifactsError> {
     for artifact in read_external_boot_artifacts(path)? {
         if !artifact.supports_target(target) {
             continue;
@@ -882,11 +1401,11 @@ fn validate_external_boot_artifact_sources(
         }
         if let Some(support_root) = &artifact.support_root {
             let support_root = workspace_root.join(support_root);
-            ensure!(
-                support_root.is_dir(),
-                "boot artifact support root {} is missing",
-                support_root.display()
-            );
+            if !support_root.is_dir() {
+                return Err(BootArtifactsError::SupportRootMissing {
+                    path: support_root.display().to_string(),
+                });
+            }
         }
     }
     Ok(())
@@ -896,7 +1415,7 @@ fn reject_selected_target_mismatches(
     artifacts: &[ExternalBootArtifact],
     target: &str,
     selected_programs: &Option<BTreeSet<String>>,
-) -> Result<()> {
+) -> Result<(), BootArtifactsError> {
     let Some(selected_programs) = selected_programs else {
         return Ok(());
     };
@@ -906,11 +1425,12 @@ fn reject_selected_target_mismatches(
         .filter(|artifact| !artifact.supports_target(target))
         .map(|artifact| format!("{} {}", artifact.command, artifact.target_constraints()))
         .collect::<Vec<_>>();
-    ensure!(
-        mismatches.is_empty(),
-        "boot program(s) are not available for target {target}: {}",
-        mismatches.join("; ")
-    );
+    if !mismatches.is_empty() {
+        return Err(BootArtifactsError::TargetMismatch {
+            target: target.to_owned(),
+            mismatches: mismatches.join("; "),
+        });
+    }
     Ok(())
 }
 
@@ -934,7 +1454,10 @@ impl ExternalBootArtifact {
     }
 }
 
-fn build_boot_program_asset(build: &BootBuild<'_>, manifest: ProgramManifest) -> Result<BootAsset> {
+fn build_boot_program_asset(
+    build: &BootBuild<'_>,
+    manifest: ProgramManifest,
+) -> Result<BootAsset, BootfsError> {
     let wasm_path = build_component_program(
         build.cargo,
         build.profile,
@@ -946,18 +1469,20 @@ fn build_boot_program_asset(build: &BootBuild<'_>, manifest: ProgramManifest) ->
     let component_bytes = encode_component(&wasm_path)?;
     let payload =
         precompile_artifact(&component_bytes, build.target, Hint::Performance.into())?.bytes;
-    let signed = sign_payload_with_key(&payload, build.root_signing_key)
-        .context("failed to sign bootfs AOT payload")?;
+    let signed = sign_payload_with_key(&payload, build.root_signing_key).map_err(|source| {
+        BootfsError::Sign {
+            payload: "bootfs".to_owned(),
+            source,
+        }
+    })?;
     let output_path = build
         .out_dir
         .join(format!("{}_bootfs_component.cwasm", manifest.command));
-    fs::write(&output_path, signed)
-        .with_context(|| format!("failed to write {}", output_path.display()))?;
+    write_bootfs_artifact(&output_path, signed)?;
 
     Ok(BootAsset {
         path: format!("bin/{}", manifest.command),
-        source: fs::canonicalize(&output_path)
-            .with_context(|| format!("failed to resolve {}", output_path.display()))?,
+        source: resolve_bootfs_source(&output_path)?,
         kind: BootAssetKind::File,
     })
 }
@@ -965,26 +1490,27 @@ fn build_boot_program_asset(build: &BootBuild<'_>, manifest: ProgramManifest) ->
 fn build_external_boot_artifact_assets(
     build: &BootBuild<'_>,
     artifact: ExternalBootArtifact,
-) -> Result<Vec<BootAsset>> {
+) -> Result<Vec<BootAsset>, BootfsError> {
     let source = build.workspace_root.join(&artifact.source);
-    let wasm = fs::read(&source).with_context(|| format!("failed to read {}", source.display()))?;
+    let wasm = fs::read(&source).map_err(|error| BootfsError::Read {
+        path: source.display().to_string(),
+        source: error,
+    })?;
     let payload = precompile_artifact(&wasm, build.target, Hint::Performance.into())?.bytes;
-    let signed = sign_payload_with_key(&payload, build.root_signing_key).with_context(|| {
-        format!(
-            "failed to sign external bootfs AOT payload for {}",
-            artifact.command
-        )
+    let signed = sign_payload_with_key(&payload, build.root_signing_key).map_err(|source| {
+        BootfsError::Sign {
+            payload: format!("external bootfs {}", artifact.command),
+            source,
+        }
     })?;
     let output_path = build
         .out_dir
         .join(format!("{}_bootfs_component.cwasm", artifact.command));
-    fs::write(&output_path, signed)
-        .with_context(|| format!("failed to write {}", output_path.display()))?;
+    write_bootfs_artifact(&output_path, signed)?;
 
     let mut assets = vec![BootAsset {
         path: artifact.bootfs_path,
-        source: fs::canonicalize(&output_path)
-            .with_context(|| format!("failed to resolve {}", output_path.display()))?,
+        source: resolve_bootfs_source(&output_path)?,
         kind: BootAssetKind::File,
     }];
     if let (Some(support_root), Some(prefix)) =
@@ -998,31 +1524,37 @@ fn build_external_boot_artifact_assets(
     Ok(assets)
 }
 
-fn build_external_support_assets(root: &Path, bootfs_prefix: &str) -> Result<Vec<BootAsset>> {
-    ensure!(
-        root.is_dir(),
-        "boot artifact support root {} is missing",
-        root.display()
-    );
+fn build_external_support_assets(
+    root: &Path,
+    bootfs_prefix: &str,
+) -> Result<Vec<BootAsset>, BootfsError> {
+    if !root.is_dir() {
+        return Err(BootArtifactsError::SupportRootMissing {
+            path: root.display().to_string(),
+        }
+        .into());
+    }
     let mut assets = Vec::new();
     for entry in WalkDir::new(root).sort_by_file_name() {
-        let entry =
-            entry.with_context(|| format!("failed to walk support root {}", root.display()))?;
+        let entry = entry.map_err(|source| BootfsError::WalkSupportRoot {
+            path: root.display().to_string(),
+            source,
+        })?;
         if entry.path() == root {
             continue;
         }
         let source = entry.into_path();
         let relative = source
             .strip_prefix(root)
-            .with_context(|| {
-                format!(
-                    "failed to strip support root {} from {}",
-                    root.display(),
-                    source.display()
-                )
+            .map_err(|error| BootfsError::StripSupportRoot {
+                root: root.display().to_string(),
+                source_path: source.display().to_string(),
+                source: error,
             })?
             .to_str()
-            .with_context(|| format!("{} is not valid UTF-8", source.display()))?
+            .ok_or_else(|| BootfsError::PathNotUtf8 {
+                path: source.display().to_string(),
+            })?
             .replace('\\', "/");
         let kind = if source.is_dir() {
             if !is_empty_directory(&source)? {
@@ -1036,32 +1568,43 @@ fn build_external_support_assets(root: &Path, bootfs_prefix: &str) -> Result<Vec
         };
         assets.push(BootAsset {
             path: format!("{}/{}", bootfs_prefix.trim_end_matches('/'), relative),
-            source: fs::canonicalize(&source)
-                .with_context(|| format!("failed to resolve {}", source.display()))?,
+            source: resolve_bootfs_source(&source)?,
             kind,
         });
     }
     Ok(assets)
 }
 
-fn is_empty_directory(path: &Path) -> Result<bool> {
+fn is_empty_directory(path: &Path) -> Result<bool, BootfsError> {
     Ok(fs::read_dir(path)
-        .with_context(|| format!("failed to read directory {}", path.display()))?
+        .map_err(|source| BootfsError::ReadDir {
+            path: path.display().to_string(),
+            source,
+        })?
         .next()
         .is_none())
 }
 
-fn read_program_manifest(command: &str, manifest_path: &Path) -> Result<ProgramManifest> {
-    ensure!(
-        manifest_path.is_file(),
-        "default program crate manifest {} is missing",
-        manifest_path.display()
-    );
-    let manifest = fs::read_to_string(manifest_path)
-        .with_context(|| format!("failed to read {}", manifest_path.display()))?;
+fn read_program_manifest(
+    command: &str,
+    manifest_path: &Path,
+) -> Result<ProgramManifest, BootProgramError> {
+    if !manifest_path.is_file() {
+        return Err(BootProgramError::ManifestMissing {
+            path: manifest_path.display().to_string(),
+        });
+    }
+    let manifest =
+        fs::read_to_string(manifest_path).map_err(|source| BootProgramError::ReadManifest {
+            path: manifest_path.display().to_string(),
+            source,
+        })?;
     let manifest = manifest
         .parse::<Value>()
-        .with_context(|| format!("failed to parse {}", manifest_path.display()))?;
+        .map_err(|source| BootProgramError::ParseManifest {
+            path: manifest_path.display().to_string(),
+            source,
+        })?;
     let artifact_stem = manifest
         .get("lib")
         .and_then(|lib| lib.get("name"))
@@ -1074,11 +1617,8 @@ fn read_program_manifest(command: &str, manifest_path: &Path) -> Result<ProgramM
                 .and_then(Value::as_str)
                 .map(|name| name.replace('-', "_"))
         })
-        .with_context(|| {
-            format!(
-                "{} is missing package.name or lib.name",
-                manifest_path.display()
-            )
+        .ok_or_else(|| BootProgramError::ManifestHasNoName {
+            path: manifest_path.display().to_string(),
         })?;
     Ok(ProgramManifest {
         command: command.to_owned(),
@@ -1094,7 +1634,7 @@ fn build_component_program(
     manifest_path: &Path,
     target_dir_name: &str,
     artifact_name: &str,
-) -> Result<PathBuf> {
+) -> Result<PathBuf, WasmBuildError> {
     build_wasm_program(
         cargo,
         profile,
@@ -1114,12 +1654,12 @@ fn build_wasm_program(
     target_dir_name: &str,
     target_triple: &str,
     artifact_name: &str,
-) -> Result<PathBuf> {
-    ensure!(
-        manifest_path.is_file(),
-        "crate manifest {} is missing",
-        manifest_path.display()
-    );
+) -> Result<PathBuf, WasmBuildError> {
+    if !manifest_path.is_file() {
+        return Err(WasmBuildError::ManifestMissing {
+            path: manifest_path.display().to_string(),
+        });
+    }
     let target_dir = out_dir.join(target_dir_name);
     let mut command = Command::new(cargo);
     command
@@ -1146,14 +1686,17 @@ fn build_wasm_program(
     command.env("RUSTFLAGS", wasm_rustflags(target_triple));
     let status = command
         .status()
-        .with_context(|| format!("failed to invoke cargo for {}", manifest_path.display()))?;
-    ensure!(
-        status.success(),
-        "wasm build for {} target {} failed with status {}",
-        manifest_path.display(),
-        target_triple,
-        status
-    );
+        .map_err(|source| WasmBuildError::SpawnCargo {
+            path: manifest_path.display().to_string(),
+            source,
+        })?;
+    if !status.success() {
+        return Err(WasmBuildError::BuildFailed {
+            path: manifest_path.display().to_string(),
+            target: target_triple.to_owned(),
+            status,
+        });
+    }
 
     let profile_dir = if profile == "release" {
         "release"
@@ -1166,7 +1709,10 @@ fn build_wasm_program(
             .join(profile_dir)
             .join(artifact_name),
     )
-    .with_context(|| format!("failed to resolve generated artifact {}", artifact_name))
+    .map_err(|source| WasmBuildError::ResolveArtifact {
+        artifact: artifact_name.to_owned(),
+        source,
+    })
 }
 
 fn wasm_rustflags(target_triple: &str) -> String {
@@ -1178,26 +1724,46 @@ fn wasm_rustflags(target_triple: &str) -> String {
     }
 }
 
-fn encode_component(path: &Path) -> Result<Vec<u8>> {
-    let wasm = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+/// Encodes one core module as a component, or passes a component through.
+///
+/// `wit-component` reports through `anyhow`, which leaves no error type
+/// to keep, so its report is captured as the whole chain it renders and
+/// carried in the variant that names the step — the alternative would be
+/// to lose everything the encoder said about why the module was refused.
+fn encode_component(path: &Path) -> Result<Vec<u8>, WasmBuildError> {
+    let wasm = fs::read(path).map_err(|source| WasmBuildError::Read {
+        path: path.display().to_string(),
+        source,
+    })?;
     if WasmParser::is_component(&wasm) {
         return Ok(wasm);
     }
     ComponentEncoder::default()
         .module(&wasm)
-        .with_context(|| format!("failed to load core module {}", path.display()))?
+        .map_err(|error| WasmBuildError::LoadCoreModule {
+            path: path.display().to_string(),
+            report: format!("{error:#}"),
+        })?
         .validate(true)
         .encode()
-        .with_context(|| format!("failed to encode component {}", path.display()))
+        .map_err(|error| WasmBuildError::EncodeComponent {
+            path: path.display().to_string(),
+            report: format!("{error:#}"),
+        })
 }
 
-fn ensure_root_keypair(root_secret_path: &Path, root_public_path: &Path) -> Result<SigningKey> {
+fn ensure_root_keypair(
+    root_secret_path: &Path,
+    root_public_path: &Path,
+) -> Result<SigningKey, KeyError> {
     let signing_key = if root_secret_path.is_file() {
         read_signing_key(root_secret_path)?
     } else {
         let signing_key = SigningKey::generate(&mut OsRng);
-        fs::write(root_secret_path, signing_key.to_bytes())
-            .with_context(|| format!("failed to write {}", root_secret_path.display()))?;
+        fs::write(root_secret_path, signing_key.to_bytes()).map_err(|source| KeyError::Write {
+            path: root_secret_path.display().to_string(),
+            source,
+        })?;
         signing_key
     };
     // The public key is rewritten either way: it is the copy the kernel
@@ -1207,18 +1773,26 @@ fn ensure_root_keypair(root_secret_path: &Path, root_public_path: &Path) -> Resu
         root_public_path,
         VerifyingKey::from(&signing_key).to_bytes(),
     )
-    .with_context(|| format!("failed to write {}", root_public_path.display()))?;
+    .map_err(|source| KeyError::Write {
+        path: root_public_path.display().to_string(),
+        source,
+    })?;
     Ok(signing_key)
 }
 
-fn read_signing_key(path: &Path) -> Result<SigningKey> {
-    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-    let secret_bytes: [u8; 32] = bytes.as_slice().try_into().with_context(|| {
-        format!(
-            "{} does not contain a 32-byte Ed25519 secret key",
-            path.display()
-        )
+fn read_signing_key(path: &Path) -> Result<SigningKey, KeyError> {
+    let bytes = fs::read(path).map_err(|source| KeyError::Read {
+        path: path.display().to_string(),
+        source,
     })?;
+    let secret_bytes: [u8; 32] =
+        bytes
+            .as_slice()
+            .try_into()
+            .map_err(|source| KeyError::NotThirtyTwoBytes {
+                path: path.display().to_string(),
+                source,
+            })?;
     Ok(SigningKey::from_bytes(&secret_bytes))
 }
 
@@ -1243,7 +1817,7 @@ mod tests {
                 .expect_err("target-specific artifact must reject unsupported selected target");
         assert!(
             error.to_string().contains("simd-lanes supports"),
-            "unexpected error: {error:#}"
+            "unexpected error: {error}"
         );
     }
 
@@ -1269,7 +1843,7 @@ mod tests {
                 .expect_err("simd-requiring artifact must reject riscv64 selection");
         assert!(
             error.to_string().contains("quickjs requires wasm SIMD"),
-            "unexpected error: {error:#}"
+            "unexpected error: {error}"
         );
     }
 

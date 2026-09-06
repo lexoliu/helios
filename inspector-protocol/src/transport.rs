@@ -12,16 +12,15 @@ use futures_io::{AsyncRead as FuturesAsyncRead, AsyncWrite as FuturesAsyncWrite}
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadBuf};
 use tokio::sync::futures::Notified;
 use tokio::sync::{Mutex, Notify, mpsc};
-#[cfg(test)]
-use wrpc_transport::{Index, Invoke, Serve};
 
 use crate::error::TransportError;
 use crate::wire::{Frame, read_frame, write_frame};
 
 /// Transport-level result with structured error provenance.
 ///
-/// Test-only wRPC trait impls adapt this typed contract to upstream
-/// `anyhow::Result`; production callers use this alias directly.
+/// Every caller of this transport — the inspector, the guest debugger and
+/// this crate's own tests — uses this alias, so a failure keeps the
+/// variant that names what the transport was doing.
 pub type Result<T> = core::result::Result<T, TransportError>;
 
 type IoFuture<T> = Pin<Box<dyn Future<Output = io::Result<T>> + Send + 'static>>;
@@ -309,57 +308,6 @@ where
     }
 }
 
-#[cfg(test)]
-impl<R, W> Invoke for Client<R, W>
-where
-    R: FuturesAsyncRead + Send + Unpin + 'static,
-    W: FuturesAsyncWrite + Send + Unpin + 'static,
-{
-    type Context = ();
-    type Outgoing = Outgoing<R, W>;
-    type Incoming = Incoming<R, W>;
-
-    async fn invoke<P>(
-        &self,
-        (): Self::Context,
-        instance: &str,
-        func: &str,
-        params: Bytes,
-        _paths: impl AsRef<[P]> + Send,
-    ) -> anyhow::Result<(Self::Outgoing, Self::Incoming)>
-    where
-        P: AsRef<[Option<usize>]> + Send + Sync,
-    {
-        self.open_invocation(instance, func, params)
-            .await
-            .map_err(Into::into)
-    }
-}
-
-#[cfg(test)]
-impl<R, W> Serve for Server<R, W>
-where
-    R: FuturesAsyncRead + Send + Unpin + 'static,
-    W: FuturesAsyncWrite + Send + Unpin + 'static,
-{
-    type Context = ();
-    type Outgoing = Outgoing<R, W>;
-    type Incoming = Incoming<R, W>;
-
-    async fn serve(
-        &self,
-        instance: &str,
-        func: &str,
-        _paths: impl Into<Arc<[Box<[Option<usize>]>]>> + Send,
-    ) -> anyhow::Result<
-        impl Stream<Item = anyhow::Result<(Self::Context, Self::Outgoing, Self::Incoming)>> + 'static,
-    > {
-        Ok(WrpcInvocationStream {
-            inner: Server::serve(self, instance, func)?,
-        })
-    }
-}
-
 impl<R, W> Invocation<R, W> {
     fn new_client(id: u32, inner: &Arc<ClientInner<R, W>>) -> Arc<Self> {
         let invocation = Arc::new(Self {
@@ -610,30 +558,6 @@ impl<R, W> Outgoing<R, W> {
     }
 }
 
-#[cfg(test)]
-impl<R, W> Index<Self> for Incoming<R, W> {
-    fn index(&self, path: &[usize]) -> anyhow::Result<Self> {
-        assert!(!path.is_empty(), "incoming indexed path must not be empty");
-        Ok(Self {
-            invocation: self.invocation.clone(),
-            path: join_path(&self.path, path),
-            state: StdMutex::new(IncomingState::default()),
-        })
-    }
-}
-
-#[cfg(test)]
-impl<R, W> Index<Self> for Outgoing<R, W> {
-    fn index(&self, path: &[usize]) -> anyhow::Result<Self> {
-        assert!(!path.is_empty(), "outgoing indexed path must not be empty");
-        Ok(Self {
-            invocation: self.invocation.clone(),
-            path: join_path(&self.path, path),
-            state: StdMutex::new(OutgoingState::default()),
-        })
-    }
-}
-
 impl<R, W> AsyncRead for Incoming<R, W>
 where
     R: FuturesAsyncRead + Send + Unpin + 'static,
@@ -855,27 +779,6 @@ where
                 Poll::Pending => return Poll::Pending,
             }
         }
-    }
-}
-
-#[cfg(test)]
-struct WrpcInvocationStream<R, W> {
-    inner: InvocationStream<R, W>,
-}
-
-#[cfg(test)]
-impl<R, W> Stream for WrpcInvocationStream<R, W>
-where
-    R: FuturesAsyncRead + Send + Unpin + 'static,
-    W: FuturesAsyncWrite + Send + Unpin + 'static,
-{
-    type Item = anyhow::Result<((), Outgoing<R, W>, Incoming<R, W>)>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-        Pin::new(&mut this.inner)
-            .poll_next(cx)
-            .map(|item| item.map(|result| result.map_err(Into::into)))
     }
 }
 
@@ -1233,15 +1136,6 @@ impl<R, W> FrameWriter<W> for ServerInner<R, W> {
     }
 }
 
-#[cfg(test)]
-fn join_path(prefix: &[usize], suffix: &[usize]) -> Arc<[usize]> {
-    if prefix.is_empty() {
-        Arc::from(suffix)
-    } else {
-        Arc::from([prefix, suffix].concat())
-    }
-}
-
 fn encode_path(path: &[usize]) -> io::Result<Vec<u32>> {
     path.iter()
         .map(|index| {
@@ -1271,7 +1165,6 @@ mod tests {
     use tokio::sync::Notify;
     use tokio::time::{Duration, timeout};
     use tokio_util::compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _};
-    use wrpc_transport::{InvokeExt as _, ServeExt as _};
 
     /// How long the second of two concurrently held invocations may go
     /// unanswered. Long enough that a loaded machine does not fail it,
@@ -1515,258 +1408,117 @@ mod tests {
             });
     }
 
-    #[test]
-    fn typed_unit_invocation_completes() {
+    /// Runs one call per entry of `responses`, answering each with the
+    /// bytes it names, and gives back what the client read.
+    ///
+    /// The payload shape is the point of every test that uses it. The
+    /// transport carries opaque bytes, so a response of one byte, of
+    /// several, and of bytes that are all zero each have to reach the
+    /// caller exactly as the server wrote them — a length the framing
+    /// got wrong, or a zero byte read as "nothing was sent", would be
+    /// invisible to a test that only checks that a call completed.
+    fn round_trip(func: &'static str, responses: &[&'static [u8]]) -> Vec<Vec<u8>> {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap_or_else(|error| panic!("failed to build test runtime: {error}"))
-            .block_on(async {
+            .block_on(async move {
                 let (host, peer) = tokio::io::duplex(4096);
                 let (host_read, host_write) = tokio::io::split(host);
                 let server = Server::new(host_read.compat(), host_write.compat_write());
                 let (peer_read, peer_write) = tokio::io::split(peer);
                 let client = Client::new(peer_read.compat(), peer_write.compat_write());
 
-                let invocations = server
-                    .serve_values::<(), (u32,)>("transport:test", "unit", [])
-                    .await
-                    .unwrap_or_else(|error| {
-                        panic!("failed to register typed server handler: {error}")
-                    });
-                let mut invocations = Box::pin(invocations);
+                let mut invocations =
+                    server
+                        .serve("transport:test", func)
+                        .unwrap_or_else(|error| {
+                            panic!("failed to register the {func} handler: {error}")
+                        });
+                let answers = responses.to_vec();
                 let server_task = tokio::spawn(async move {
-                    for expected in [7_u32, 11_u32] {
-                        let (_, (), _rx, tx) = invocations
-                            .as_mut()
+                    for response in answers {
+                        let (_, mut outgoing, mut incoming) = invocations
                             .next()
                             .await
-                            .unwrap_or_else(|| panic!("typed invocation stream ended early"))
+                            .unwrap_or_else(|| panic!("the {func} stream ended early"))
                             .unwrap_or_else(|error| {
-                                panic!("failed to accept typed invocation: {error}")
+                                panic!("failed to accept a {func} invocation: {error}")
                             });
-                        tx((expected,)).await.unwrap_or_else(|error| {
-                            panic!("failed to send typed response: {error}")
+                        let mut request = Vec::new();
+                        incoming
+                            .read_to_end(&mut request)
+                            .await
+                            .unwrap_or_else(|error| {
+                                panic!("failed to read the {func} request: {error}")
+                            });
+                        assert!(
+                            request.is_empty(),
+                            "unexpected {func} request payload: {request:?}"
+                        );
+                        outgoing.write_all(response).await.unwrap_or_else(|error| {
+                            panic!("failed to write the {func} response: {error}")
+                        });
+                        outgoing.shutdown().await.unwrap_or_else(|error| {
+                            panic!("failed to close the {func} response stream: {error}")
                         });
                     }
                 });
 
-                let paths: [Box<[Option<usize>]>; 0] = [];
-                let (value,) = client
-                    .invoke_values_blocking::<Box<[Option<usize>]>, (), (u32,)>(
-                        (),
-                        "transport:test",
-                        "unit",
-                        (),
-                        paths,
-                    )
-                    .await
-                    .unwrap_or_else(|error| panic!("typed invocation failed: {error}"));
-                assert_eq!(value, 7);
-
-                let paths: [Box<[Option<usize>]>; 0] = [];
-                let (value,) = client
-                    .invoke_values_blocking::<Box<[Option<usize>]>, (), (u32,)>(
-                        (),
-                        "transport:test",
-                        "unit",
-                        (),
-                        paths,
-                    )
-                    .await
-                    .unwrap_or_else(|error| panic!("second typed invocation failed: {error}"));
-                assert_eq!(value, 11);
-
+                let mut read = Vec::new();
+                for _ in responses {
+                    read.push(
+                        client
+                            .invoke_raw("transport:test", func, Vec::new())
+                            .await
+                            .unwrap_or_else(|error| {
+                                panic!("the {func} invocation failed: {error}")
+                            }),
+                    );
+                }
                 server_task
                     .await
-                    .unwrap_or_else(|error| panic!("typed server task panicked: {error}"));
-            });
+                    .unwrap_or_else(|error| panic!("the {func} server task panicked: {error}"));
+                read
+            })
     }
 
+    /// Two calls in a row each keep their own answer, down to a response
+    /// that is a single byte.
     #[test]
-    fn typed_optional_resource_result_completes() {
-        #[repr(transparent)]
-        struct TestResource(());
-
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap_or_else(|error| panic!("failed to build test runtime: {error}"))
-            .block_on(async {
-                let (host, peer) = tokio::io::duplex(4096);
-                let (host_read, host_write) = tokio::io::split(host);
-                let server = Server::new(host_read.compat(), host_write.compat_write());
-                let (peer_read, peer_write) = tokio::io::split(peer);
-                let client = Client::new(peer_read.compat(), peer_write.compat_write());
-
-                let invocations = server
-                    .serve_values::<(), (Option<wrpc_transport::ResourceOwn<TestResource>>,)>(
-                        "transport:test",
-                        "resource",
-                        [],
-                    )
-                    .await
-                    .unwrap_or_else(|error| {
-                        panic!("failed to register resource server handler: {error}")
-                    });
-                let mut invocations = Box::pin(invocations);
-                let server_task = tokio::spawn(async move {
-                    let (_, (), _rx, tx) = invocations
-                        .as_mut()
-                        .next()
-                        .await
-                        .unwrap_or_else(|| panic!("resource invocation stream ended early"))
-                        .unwrap_or_else(|error| {
-                            panic!("failed to accept resource invocation: {error}")
-                        });
-                    tx((None,)).await.unwrap_or_else(|error| {
-                        panic!("failed to send resource response: {error}")
-                    });
-                });
-
-                let paths: [Box<[Option<usize>]>; 0] = [];
-                let (value,) = client
-                    .invoke_values_blocking::<
-                        Box<[Option<usize>]>,
-                        (),
-                        (Option<wrpc_transport::ResourceOwn<TestResource>>,),
-                    >((), "transport:test", "resource", (), paths)
-                    .await
-                    .unwrap_or_else(|error| panic!("resource invocation failed: {error}"));
-                assert!(value.is_none(), "resource response must be none");
-
-                server_task
-                    .await
-                    .unwrap_or_else(|error| panic!("resource server task panicked: {error}"));
-            });
+    fn sequential_invocations_keep_their_own_short_answers() {
+        assert_eq!(
+            round_trip("unit", &[&[7], &[11]]),
+            vec![vec![7_u8], vec![11_u8]]
+        );
     }
 
+    /// A one-byte response is not an empty one. The byte a caller sends
+    /// to mean "no value" is still a byte the transport has to deliver,
+    /// and a framing that treated it as an empty payload would hand the
+    /// caller nothing to decode.
     #[test]
-    fn typed_some_resource_result_completes() {
-        #[repr(transparent)]
-        struct TestResource(());
-
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap_or_else(|error| panic!("failed to build test runtime: {error}"))
-            .block_on(async {
-                let (host, peer) = tokio::io::duplex(4096);
-                let (host_read, host_write) = tokio::io::split(host);
-                let server = Server::new(host_read.compat(), host_write.compat_write());
-                let (peer_read, peer_write) = tokio::io::split(peer);
-                let client = Client::new(peer_read.compat(), peer_write.compat_write());
-
-                let invocations = server
-                    .serve_values::<(), (Option<wrpc_transport::ResourceOwn<TestResource>>,)>(
-                        "transport:test",
-                        "resource-some",
-                        [],
-                    )
-                    .await
-                    .unwrap_or_else(|error| {
-                        panic!("failed to register resource-some server handler: {error}")
-                    });
-                let mut invocations = Box::pin(invocations);
-                let server_task = tokio::spawn(async move {
-                    let (_, (), _rx, tx) = invocations
-                        .as_mut()
-                        .next()
-                        .await
-                        .unwrap_or_else(|| panic!("resource-some invocation stream ended early"))
-                        .unwrap_or_else(|error| {
-                            panic!("failed to accept resource-some invocation: {error}")
-                        });
-                    let handle = wrpc_transport::ResourceOwn::from(Bytes::from_static(&[
-                        0x12, 0x34, 0x56, 0x78,
-                    ]));
-                    tx((Some(handle),)).await.unwrap_or_else(|error| {
-                        panic!("failed to send resource-some response: {error}")
-                    });
-                });
-
-                let paths: [Box<[Option<usize>]>; 0] = [];
-                let (value,) = client
-                    .invoke_values_blocking::<
-                        Box<[Option<usize>]>,
-                        (),
-                        (Option<wrpc_transport::ResourceOwn<TestResource>>,),
-                    >((), "transport:test", "resource-some", (), paths)
-                    .await
-                    .unwrap_or_else(|error| panic!("resource-some invocation failed: {error}"));
-                let bytes =
-                    value.unwrap_or_else(|| panic!("resource-some response must be present"));
-                assert_eq!(
-                    Bytes::from(bytes),
-                    Bytes::from_static(&[0x12, 0x34, 0x56, 0x78])
-                );
-
-                server_task
-                    .await
-                    .unwrap_or_else(|error| panic!("resource-some server task panicked: {error}"));
-            });
+    fn a_single_byte_response_is_not_read_as_an_empty_one() {
+        assert_eq!(round_trip("resource", &[&[0]]), vec![vec![0_u8]]);
     }
 
+    /// A response of several bytes arrives with all of them, in order.
     #[test]
-    fn typed_zero_handle_resource_result_completes() {
-        #[repr(transparent)]
-        struct TestResource(());
+    fn a_multi_byte_response_arrives_whole() {
+        assert_eq!(
+            round_trip("resource-some", &[&[1, 4, 0x12, 0x34, 0x56, 0x78]]),
+            vec![vec![1, 4, 0x12, 0x34, 0x56, 0x78]]
+        );
+    }
 
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap_or_else(|error| panic!("failed to build test runtime: {error}"))
-            .block_on(async {
-                let (host, peer) = tokio::io::duplex(4096);
-                let (host_read, host_write) = tokio::io::split(host);
-                let server = Server::new(host_read.compat(), host_write.compat_write());
-                let (peer_read, peer_write) = tokio::io::split(peer);
-                let client = Client::new(peer_read.compat(), peer_write.compat_write());
-
-                let invocations = server
-                    .serve_values::<(), (Option<wrpc_transport::ResourceOwn<TestResource>>,)>(
-                        "transport:test",
-                        "resource-zero",
-                        [],
-                    )
-                    .await
-                    .unwrap_or_else(|error| {
-                        panic!("failed to register resource-zero server handler: {error}")
-                    });
-                let mut invocations = Box::pin(invocations);
-                let server_task = tokio::spawn(async move {
-                    let (_, (), _rx, tx) = invocations
-                        .as_mut()
-                        .next()
-                        .await
-                        .unwrap_or_else(|| panic!("resource-zero invocation stream ended early"))
-                        .unwrap_or_else(|error| {
-                            panic!("failed to accept resource-zero invocation: {error}")
-                        });
-                    let handle =
-                        wrpc_transport::ResourceOwn::from(Bytes::from_static(&[0, 0, 0, 0]));
-                    tx((Some(handle),)).await.unwrap_or_else(|error| {
-                        panic!("failed to send resource-zero response: {error}")
-                    });
-                });
-
-                let paths: [Box<[Option<usize>]>; 0] = [];
-                let (value,) = client
-                    .invoke_values_blocking::<
-                        Box<[Option<usize>]>,
-                        (),
-                        (Option<wrpc_transport::ResourceOwn<TestResource>>,),
-                    >((), "transport:test", "resource-zero", (), paths)
-                    .await
-                    .unwrap_or_else(|error| panic!("resource-zero invocation failed: {error}"));
-                let bytes =
-                    value.unwrap_or_else(|| panic!("resource-zero response must be present"));
-                assert_eq!(Bytes::from(bytes), Bytes::from_static(&[0, 0, 0, 0]));
-
-                server_task
-                    .await
-                    .unwrap_or_else(|error| panic!("resource-zero server task panicked: {error}"));
-            });
+    /// A response whose payload bytes are all zero is still a response.
+    /// Nothing in the framing may read a zero byte as an absent one.
+    #[test]
+    fn an_all_zero_response_payload_arrives_whole() {
+        assert_eq!(
+            round_trip("resource-zero", &[&[1, 4, 0, 0, 0, 0]]),
+            vec![vec![1, 4, 0, 0, 0, 0]]
+        );
     }
 
     #[test]
