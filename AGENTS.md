@@ -361,6 +361,10 @@ does.
   topology, trap, or runtime code. A stuck or silent VM is inspected through
   the process, the gdbstub, the symbols, the serial socket and the QEMU logs
   before any conclusion; `hosted/` evidence does not stand in for it.
+- An issue's own diagnosis is a hypothesis, not a finding. The cause is
+  re-established from the run's artifacts (the console log, the counter
+  lines, the QEMU and gdbstub state) before any code changes, and a PR that
+  fixes a different mechanism than the issue named says so.
 - Inspector and guest communicate through the WIT RPC defined in
   `helios-inspector-protocol`, never through a side channel.
 
@@ -380,7 +384,11 @@ does.
 Before a change is complete, run the recipes for every surface it can
 affect. `just check-target` and `just test-units` generate the
 `helios-cli kernel-prebuild` manifest and pass it through
-`HELIOS_KERNEL_PREBUILD_MANIFEST` themselves.
+`HELIOS_KERNEL_PREBUILD_MANIFEST` themselves. The `check-target` set is the
+backends the diff can reach: a change in `hal/`, a library crate, a shared
+ABI or `kernel/` runs all three bare-metal targets; a change confined to
+one backend runs that backend's target; a change confined to the host tools
+or a user program runs none.
 
 ```bash
 just check-host
@@ -463,7 +471,9 @@ them from colliding:
   the integration tests are where a crate's enforcement tests live, the
   relevant `just check-target`, file-scoped rustfmt). The workspace-wide
   lint and test suite is CI's job; running it locally as well pays the same
-  compile twice.
+  compile twice. A check that can outrun the agent harness's default shell
+  time limit runs under an explicit `timeout`, or in the background with one
+  waiter, so that a cut-off log is never read as a result.
 - Benchmarks never run on a developer machine. The CI bench lane produces
   comparable artifacts; a laptop under other load does not.
 - Waiting on CI is one bounded foreground command (`timeout 590 gh pr checks
@@ -476,3 +486,9 @@ them from colliding:
   agent writes outside its worktree carries its branch or PR number in its
   name, and a PR body or issue body is written from a file named that way,
   never from a generic `pr.md`.
+- A worktree reaches `artifacts/python3-root`, `artifacts/wasi-tools` and
+  the `artifacts/wasix/*` entries through symlinks into the main checkout.
+  Those are read-only from the worktree: an agent that needs a different
+  artifact replaces the link with its own copy or directory and never runs
+  `tools/wasi-apps/build.sh` or any other staging step through the link,
+  because that rewrites another session's inputs while it is using them.
