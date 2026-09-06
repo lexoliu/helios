@@ -14,10 +14,10 @@ use helios_hal::cpu::Cpu;
 #[derive(Clone, Copy, Debug)]
 pub enum ComponentWorld {
     /// The system (debugger) world — includes programs, net, stats, tracing,
-    /// instances, serial, sync.
+    /// profiling, instances, serial, sync.
     System,
     /// The launched-program world — includes programs, net, stats, tracing,
-    /// serial, sync, but not instances.
+    /// profiling, serial, sync, but not instances.
     Program,
 }
 
