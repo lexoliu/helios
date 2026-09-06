@@ -68,37 +68,40 @@ Memory policy usable_bytes=… kernel_heap_bytes=… kernel_reserve_bytes=… ke
 
 ## What allocates each domain
 
-The kernel heap is a TLSF allocator, `rlsf`, behind the one lock an
-interrupt handler is allowed to take (`kernel/src/memory/irq_safe.rs`).
-TLSF answers both an allocation and a free in constant time: a request
-is a bitmap search over two levels of segregated free lists, and a free
-is a bitmap update and a few pointer writes, whatever the heap is
-holding. The kernel builds it with 32 first-level classes and 32
-second-level subdivisions of each, so the lists span one granule (32
-bytes) to 128 GiB — `rlsf` divides a pool region larger than the top
-class into several pools, and the kernel heap's boot share can be half
-of the machine — and a block a search settles on is at most 3.1% larger
-than the request it rounded up to.
+The kernel heap uses `talc`, with its default binning and manually
+claimed regions, behind `IrqSafeMutex`
+(`kernel/src/memory/irq_safe.rs`). Boundary tags identify neighboring
+blocks, and doubly linked free lists let a free unlink and coalesce
+those neighbors without walking a size class. Allocation uses segregated
+free lists and an availability bitmap. The allocator owns its size-class
+layout and block metadata; the kernel does not duplicate either.
 
 It was a buddy allocator until #246. That allocator found a freed
 block's buddy by walking the block's size class from the head of the
 free list, and walked the list whole whenever the buddy was absent,
 which is the ordinary case in a mass free. Tearing down a hundred
-instances is about forty thousand frees, and `instance-startup-100` paid
-68 ms of a 123 ms run in teardown alone. The walk is also why a
+instances involves tens of thousands of kernel frees. The walk is also why a
 per-processor allocation cache could not sit in front of that heap
 (#169): every block a cache held was a block whose buddy arrived, found
 nothing to merge with, and stayed on the list for every later search to
 walk past.
 
-TLSF keeps no running totals, so the kernel keeps the two the stats
-report — every byte the heap owns, and what live allocations hold of it
-— in the same structure as the heap and therefore under the same lock as
-the operation that moves them. What an allocation is charged is the
-block `rlsf` searches for: the payload, its used-block header, the
-padding an over-aligned payload needs, rounded up to a granule. It is
-computed from the `Layout` alone, which is what makes the charge and the
-refund the same number.
+Heap statistics use Talc's built-in counters under that same lock:
+`total_bytes` is claimed memory, and `allocated_bytes` is claimed memory
+minus actual free-block bytes. This includes permanent allocator
+metadata, block headers, and alignment overhead; requested payload bytes
+remain a separate counter. Reading statistics is constant time.
+Growth includes the request's alignment and allocator overhead before
+rounding to the user pool's power-of-two lend size. A payload that is
+itself a whole growth chunk still needs room for its allocation header;
+a chunk of exactly the payload size cannot serve it.
+
+The first candidate for #246 was `rlsf`. Review reproduced a difference
+between its search size and actual occupied size: two allocations held
+288 bytes while layout-derived accounting charged 320 bytes. Search
+padding is an upper bound, not occupied memory, and `rlsf 0.2.3` does not
+expose a constant-time occupied-block-size query. Talc's counters avoid
+both that approximation and dependency on private header layouts.
 
 The user pool (`kernel/src/memory/user.rs`) and the kernel frame
 allocator (`kernel/src/memory/pmm.rs`) are still buddy heaps, each with
