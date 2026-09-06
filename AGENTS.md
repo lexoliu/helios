@@ -484,6 +484,12 @@ them from colliding:
 - One checkout per task. A delegated agent works in its own git worktree
   branched from `origin/dev`, with a cloned `target/` for a warm cache, and
   never edits, cleans, or builds inside another worktree or another project.
+  Nothing outside the worktree is modified for any reason: not another
+  project's `target/`, not a tool's cache under the home directory, not a
+  sibling worktree. When the resource-headroom floor refuses a build, the
+  agent may delete rebuildable directories inside its own `target/` and
+  otherwise stops and reports the shortfall; reclaiming space anywhere else
+  is the orchestrator's or the maintainer's action.
 - A delegated agent runs the per-crate checks for the crates it touched
   (`cargo check -p`, `cargo clippy -p … --all-targets -D warnings`,
   `cargo test -p <crate>` with every target and never `--lib` alone, because
@@ -492,7 +498,10 @@ them from colliding:
   lint and test suite is CI's job; running it locally as well pays the same
   compile twice. A check that can outrun the agent harness's default shell
   time limit runs under an explicit `timeout`, or in the background with one
-  waiter, so that a cut-off log is never read as a result.
+  waiter, so that a cut-off log is never read as a result. A local check the
+  machine cannot run (a boot refused by the resource floor) may be replaced
+  by the CI lane that runs the same check on the same target, and the PR
+  body names the substitution and the lane's run id.
 - Benchmarks never run on a developer machine. The CI bench lane produces
   comparable artifacts; a laptop under other load does not.
 - Waiting on CI is one bounded foreground command (`timeout 590 gh pr checks
