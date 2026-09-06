@@ -192,6 +192,55 @@ impl TcpReceiveCounters {
     }
 }
 
+/// One half-open range of sequence space, `start..end`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TcpSequenceRange {
+    pub start: u32,
+    pub end: u32,
+}
+
+/// The acknowledgement a socket most recently put on the wire.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TcpAckSnapshot {
+    pub acknowledgement: u32,
+    /// The receive window that acknowledgement carried, in bytes rather
+    /// than in the header's scaled units.
+    pub window_bytes: u32,
+}
+
+/// The segment a socket most recently took off the wire, whether or not
+/// the receive path went on to accept it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TcpSegmentSnapshot {
+    pub sequence: u32,
+    pub payload_len: u32,
+}
+
+/// Everything the receive side of one socket holds at a single instant.
+///
+/// A read that times out reports this, so a stall names the state that
+/// produced it while the socket still exists: the per-shard counters are
+/// read after the workload has exited, by which time the socket is gone
+/// and its queues with it (#166).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TcpReceiveDiagnostics {
+    pub state: TcpState,
+    pub receive_next: u32,
+    /// Bytes queued in order, waiting for the reader.
+    pub receive_queued_bytes: usize,
+    /// Bytes held aside behind a hole in the sequence space.
+    pub out_of_order_queued_bytes: usize,
+    pub out_of_order_segments: usize,
+    /// The range immediately behind the hole and the one furthest from
+    /// it: with `receive_next` they say how wide the hole is and how far
+    /// past it the peer has already sent.
+    pub first_out_of_order: Option<TcpSequenceRange>,
+    pub last_out_of_order: Option<TcpSequenceRange>,
+    pub advertised_window_bytes: u32,
+    pub last_ack: Option<TcpAckSnapshot>,
+    pub last_segment: Option<TcpSegmentSnapshot>,
+}
+
 /// What one acknowledgement put on the wire was for.
 ///
 /// A pure ACK is indistinguishable from a window update on the wire, so
@@ -265,6 +314,10 @@ impl TcpOutOfOrderQueue {
 
     fn first(&self) -> Option<&TcpOutOfOrderSegment> {
         self.segments.first()
+    }
+
+    fn last(&self) -> Option<&TcpOutOfOrderSegment> {
+        self.len().checked_sub(1).map(|index| &self[index])
     }
 
     fn push(&mut self, segment: TcpOutOfOrderSegment) -> Result<(), TcpOutOfOrderSegment> {
@@ -723,6 +776,13 @@ where
     out_of_order: Option<TcpOutOfOrderQueue>,
     out_of_order_queued_bytes: usize,
     receive_counters: TcpReceiveCounters,
+    /// The last acknowledgement this socket handed to the transmit path,
+    /// and the last segment its peer handed to the receive path. Both
+    /// exist for [`TcpSocket::receive_diagnostics`]: a stalled reader has
+    /// to be able to say whether the socket had stopped hearing from the
+    /// peer or had stopped answering it.
+    last_ack_sent: Option<TcpAckSnapshot>,
+    last_segment_received: Option<TcpSegmentSnapshot>,
     transmit_queue: Option<TcpTransmitQueue>,
     in_flight: Option<TcpInFlightQueue>,
     bytes_in_flight: u32,
@@ -868,6 +928,8 @@ where
             out_of_order: None,
             out_of_order_queued_bytes: 0,
             receive_counters: TcpReceiveCounters::default(),
+            last_ack_sent: None,
+            last_segment_received: None,
             transmit_queue: None,
             in_flight: None,
             bytes_in_flight: 0,
@@ -1144,7 +1206,7 @@ where
     /// first frame of a duplicate-ACK run can be: the duplicates behind
     /// it repeat the same window.
     pub fn mark_ack_queued(&mut self) -> TcpAckQueued {
-        self.pending_acks = self.pending_acks.saturating_sub(1);
+        self.note_ack_emitted();
         self.delayed_ack_deadline_nanos = None;
         TcpAckQueued {
             reopened_window: core::mem::take(&mut self.pending_ack_reopens_window),
@@ -1233,6 +1295,27 @@ where
 
     pub const fn peer_timestamp(&self) -> Option<TcpTimestampOption> {
         self.peer_timestamp
+    }
+
+    /// The receive side of this socket, whole, at this instant.
+    pub fn receive_diagnostics(&self) -> TcpReceiveDiagnostics {
+        let out_of_order = self.out_of_order.as_ref();
+        TcpReceiveDiagnostics {
+            state: self.state,
+            receive_next: self.receive_next,
+            receive_queued_bytes: self.receive_queued_bytes,
+            out_of_order_queued_bytes: self.out_of_order_queued_bytes,
+            out_of_order_segments: out_of_order.map_or(0, TcpOutOfOrderQueue::len),
+            first_out_of_order: out_of_order
+                .and_then(TcpOutOfOrderQueue::first)
+                .map(out_of_order_range),
+            last_out_of_order: out_of_order
+                .and_then(TcpOutOfOrderQueue::last)
+                .map(out_of_order_range),
+            advertised_window_bytes: self.local_receive_window_bytes(),
+            last_ack: self.last_ack_sent,
+            last_segment: self.last_segment_received,
+        }
     }
 
     pub fn receive_backpressured(&self) -> bool {
@@ -1381,7 +1464,7 @@ where
             window_size: self.advertised_window,
         };
         let options = self.timestamped_options(now_nanos);
-        self.pending_acks = self.pending_acks.saturating_sub(1);
+        self.note_ack_emitted();
         if persist_probe {
             self.mark_persist_probe_queued(
                 TcpPersistProbe {
@@ -1577,7 +1660,7 @@ where
             }
             self.schedule_next_pacing_send(sequence_len, now_nanos);
         }
-        self.pending_acks = self.pending_acks.saturating_sub(1);
+        self.note_ack_emitted();
         self.delayed_ack_deadline_nanos = None;
         Some(TcpTransmitSegment {
             local,
@@ -1910,6 +1993,10 @@ where
             | TcpState::CloseWait
             | TcpState::Closing
             | TcpState::LastAck => {
+                self.last_segment_received = Some(TcpSegmentSnapshot {
+                    sequence: packet.sequence,
+                    payload_len: u32::try_from(packet.payload.len()).unwrap_or(u32::MAX),
+                });
                 if packet.flags.contains(TcpFlags::RST) {
                     if self
                         .receive_sequence_acceptable(packet.sequence, receive_sequence_len(packet))
@@ -2802,6 +2889,18 @@ where
         })
     }
 
+    /// Records one acknowledgement leaving the socket. Every outgoing
+    /// header carries `receive_next` and `advertised_window`, so the
+    /// snapshot is taken here rather than at each of the three places a
+    /// header is built.
+    fn note_ack_emitted(&mut self) {
+        self.pending_acks = self.pending_acks.saturating_sub(1);
+        self.last_ack_sent = Some(TcpAckSnapshot {
+            acknowledgement: self.receive_next,
+            window_bytes: self.local_receive_window_bytes(),
+        });
+    }
+
     fn request_ack(&mut self) {
         self.pending_acks = self.pending_acks.max(1);
         self.delayed_ack_deadline_nanos = None;
@@ -2899,6 +2998,13 @@ where
         self.pending_window_update_bytes =
             self.pending_window_update_bytes.saturating_add(delta_bytes);
         self.pending_window_update_bytes >= u32::from(TCP_WINDOW_UPDATE_BYTES)
+    }
+}
+
+fn out_of_order_range(segment: &TcpOutOfOrderSegment) -> TcpSequenceRange {
+    TcpSequenceRange {
+        start: segment.sequence,
+        end: segment_end_from_parts(segment.sequence, segment.payload.len()),
     }
 }
 
@@ -5791,6 +5897,61 @@ mod tests {
 
         assert!(!outcome.receive_backpressure);
         assert_eq!(socket.peer_receive_window(), 4);
+    }
+
+    #[test]
+    fn receive_diagnostics_report_the_hole_a_stalled_reader_waits_on() {
+        let mut socket = established_socket();
+        let hole = socket.receive_next;
+        let payload = [7u8; 4];
+
+        let _ = deliver_segment(
+            &mut socket,
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: hole + 8,
+                acknowledgement: 8,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+                options: TcpOptions::empty(),
+                payload: &payload,
+            },
+            TCP_INITIAL_RTO_NANOS + 1,
+        );
+        socket.mark_ack_queued();
+
+        let diagnostics = socket.receive_diagnostics();
+        assert_eq!(diagnostics.state, TcpState::Established);
+        assert_eq!(diagnostics.receive_next, hole);
+        assert_eq!(diagnostics.receive_queued_bytes, 0);
+        assert_eq!(diagnostics.out_of_order_queued_bytes, payload.len());
+        assert_eq!(diagnostics.out_of_order_segments, 1);
+        assert_eq!(
+            diagnostics.first_out_of_order,
+            Some(TcpSequenceRange {
+                start: hole + 8,
+                end: hole + 8 + payload.len() as u32,
+            })
+        );
+        assert_eq!(
+            diagnostics.first_out_of_order,
+            diagnostics.last_out_of_order
+        );
+        assert_eq!(
+            diagnostics.last_segment,
+            Some(TcpSegmentSnapshot {
+                sequence: hole + 8,
+                payload_len: payload.len() as u32,
+            })
+        );
+        assert_eq!(
+            diagnostics.last_ack,
+            Some(TcpAckSnapshot {
+                acknowledgement: hole,
+                window_bytes: socket.advertised_receive_window_bytes(),
+            })
+        );
     }
 
     #[test]
