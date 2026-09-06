@@ -1083,6 +1083,34 @@ where
             .on_packet_sent(1, self.bytes_in_flight, now_nanos);
     }
 
+    /// The reset this socket owes its peer when the local side tears
+    /// the connection down instead of closing it.
+    ///
+    /// A connection still queued in a listener's backlog has no other
+    /// way to end: the listener is going away, nobody will ever accept
+    /// the connection, and the peer completed a handshake it believes
+    /// in. RFC 9293 answers that with a reset rather than a FIN, so the
+    /// peer learns at once instead of retransmitting into a stack that
+    /// no longer owns the four-tuple.
+    ///
+    /// `None` for a socket with no peer — a listener, or one that never
+    /// left `Closed` — which has no four-tuple to reset.
+    pub fn pending_reset(&self) -> Option<TcpHeader> {
+        let local = self.local?;
+        let remote = self.remote?;
+        Some(TcpHeader {
+            source_port: local.port,
+            destination_port: remote.port,
+            sequence: self.send_next,
+            // The peer validates a reset against its own receive
+            // window, so it carries the acknowledgement this side would
+            // otherwise have sent.
+            acknowledgement: self.receive_next,
+            flags: TcpFlags::RST.union(TcpFlags::ACK),
+            window_size: 0,
+        })
+    }
+
     /// Acknowledgements this socket still owes its peer.
     ///
     /// Everything past the first is a duplicate ACK: the receive

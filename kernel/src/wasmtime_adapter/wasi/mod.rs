@@ -1919,6 +1919,59 @@ mod tests {
         assert_eq!(closed.count(), 1, "the last holder retires the stream");
     }
 
+    /// A `wasi:sockets` socket's kernel listener dies with the socket.
+    ///
+    /// Nothing retired it before: the resource destructor deleted the
+    /// table entry, `TcpSocketState`'s `Drop` retired only the stream
+    /// beside it, and the network service offered no
+    /// `tcp_listener_close` at all — so every listener a component
+    /// opened stayed installed on every shard with its local port bound
+    /// for the rest of the boot (#191).
+    #[test]
+    fn a_wasi_tcp_socket_retires_its_listener_when_its_resource_is_dropped() {
+        let (service, closed) = crate::test_support::recording_listener_network_service();
+        let socket = TcpSocket::new(service, WasiTcpSocketFamily::Ipv4);
+        socket.inner.lock().listener = Some(41);
+
+        assert_eq!(
+            closed.count(),
+            0,
+            "a live socket must not have retired its listener"
+        );
+        drop(socket);
+        assert_eq!(
+            closed.count(),
+            1,
+            "dropping the socket must retire the listener it owns"
+        );
+        assert_eq!(closed.last(), 41);
+    }
+
+    /// A listener that was opened but never adopted is retired too.
+    ///
+    /// `tcp_listen` completes on a detached task and parks its answer in
+    /// `listen_result`; the listen stream moves it into `listener` the
+    /// next time it is polled. A socket dropped in that window holds a
+    /// listener in the shards with nothing pointing at it, which is the
+    /// same leak by a narrower door.
+    #[test]
+    fn a_wasi_tcp_socket_retires_a_listener_it_never_adopted() {
+        let (service, closed) = crate::test_support::recording_listener_network_service();
+        let socket = TcpSocket::new(service, WasiTcpSocketFamily::Ipv4);
+        socket.inner.lock().listen_result = Some(Ok(crate::TcpListener {
+            listener: 42,
+            local_port: 8080,
+        }));
+
+        drop(socket);
+        assert_eq!(
+            closed.count(),
+            1,
+            "a listener still sitting in the listen result is retired"
+        );
+        assert_eq!(closed.last(), 42);
+    }
+
     /// A `wasi:sockets` datagram socket's kernel socket dies with the
     /// socket.
     ///

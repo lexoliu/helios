@@ -488,6 +488,37 @@ impl Drop for WasixOwnedTcpStream {
     }
 }
 
+/// A netstack TCP listener a preview1 descriptor owns.
+///
+/// The same rule as [`WasixOwnedTcpStream`], for the same reason: the
+/// listener is retired when the last descriptor holding it goes away,
+/// which covers `fd_close`, the duplicate an `exec` inherits, and the
+/// table a program takes with it when it exits. Nothing on any of those
+/// paths touched the listener before — the network service had no
+/// `tcp_listener_close` at all — so every listener a program opened
+/// stayed in its shard for the rest of the boot, holding the local port
+/// that `is_tcp_local_port_free` consults (#191).
+pub(super) struct WasixOwnedTcpListener {
+    service: ComponentHostNetworkService,
+    listener: u64,
+}
+
+impl WasixOwnedTcpListener {
+    pub(super) fn new(service: ComponentHostNetworkService, listener: u64) -> Arc<Self> {
+        Arc::new(Self { service, listener })
+    }
+
+    pub(super) const fn id(&self) -> u64 {
+        self.listener
+    }
+}
+
+impl Drop for WasixOwnedTcpListener {
+    fn drop(&mut self) {
+        self.service.tcp_listener_close(self.listener);
+    }
+}
+
 #[derive(Clone)]
 pub(super) enum WasixTcpSocket {
     Unconnected {
@@ -501,7 +532,7 @@ pub(super) enum WasixTcpSocket {
     },
     Listening {
         family: WasixSocketFamily,
-        listener: u64,
+        listener: Arc<WasixOwnedTcpListener>,
         local_port: u16,
         options: WasixSocketOptions,
     },
@@ -1512,7 +1543,7 @@ pub(super) fn p1_probe_descriptor(
                 WasixTcpSocket::Listening { listener, .. },
             ))),
             P1_EVENTTYPE_FD_READ | P1_EVENTTYPE_FD_WRITE,
-        ) => Ok(P1Probe::Network(P1NetworkProbe::TcpListener(*listener))),
+        ) => Ok(P1Probe::Network(P1NetworkProbe::TcpListener(listener.id()))),
         (
             Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Bound {
                 socket,

@@ -725,6 +725,12 @@ pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
     /// stream's life is a `Drop`, which cannot await.
     fn tcp_close(&self, stream: Self::TcpStream);
 
+    /// Retires a listener, releasing the local port it held. Connections
+    /// already accepted are streams of their own and live on; ones still
+    /// queued in the backlog are reset. Synchronous for the same reason
+    /// [`ComponentNetworkService::tcp_close`] is.
+    fn tcp_listener_close(&self, listener: Self::TcpListener);
+
     fn udp_bind(
         &self,
         local_port: u16,

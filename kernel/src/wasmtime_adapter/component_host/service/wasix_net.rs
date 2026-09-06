@@ -1494,7 +1494,7 @@ fn wasix_socket_backend_handle(
             Some(WasixSocketBackendHandle::TcpStream(stream.id()))
         }
         WasixSocketDescriptor::Tcp(WasixTcpSocket::Listening { listener, .. }) => {
-            Some(WasixSocketBackendHandle::TcpListener(*listener))
+            Some(WasixSocketBackendHandle::TcpListener(listener.id()))
         }
         WasixSocketDescriptor::Udp(WasixUdpSocket::Bound { socket, .. }) => {
             Some(WasixSocketBackendHandle::UdpSocket(socket.id()))
@@ -1767,7 +1767,7 @@ where
     let options = *slot.options();
     *slot = WasixTcpSocket::Listening {
         family,
-        listener: listener.listener,
+        listener: WasixOwnedTcpListener::new(service.clone(), listener.listener),
         local_port: listener.local_port,
         options,
     };
@@ -1800,7 +1800,7 @@ where
                 family,
                 ..
             },
-        ))) => (*listener, options.accept_timeout, *family),
+        ))) => (listener.id(), options.accept_timeout, *family),
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(_))) => {
             return p1::errno::INVAL;
         }

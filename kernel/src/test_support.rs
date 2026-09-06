@@ -621,6 +621,7 @@ mod network {
     pub(crate) struct TestNetworkService {
         closed: Arc<TestClosedStreams>,
         closed_udp: Arc<TestClosedStreams>,
+        closed_listeners: Arc<TestClosedStreams>,
     }
 
     impl TestNetworkService {
@@ -638,6 +639,13 @@ mod network {
         /// datagram-socket test counts only its own protocol.
         pub(crate) fn closed_udp_sockets(&self) -> Arc<TestClosedStreams> {
             self.closed_udp.clone()
+        }
+
+        /// The listener retirement log, kept apart from the stream one
+        /// because a listener and the connections it accepted are
+        /// separate handles with separate lifetimes.
+        pub(crate) fn closed_listeners(&self) -> Arc<TestClosedStreams> {
+            self.closed_listeners.clone()
         }
     }
 
@@ -828,6 +836,10 @@ mod network {
 
         fn tcp_close(&self, stream: Self::TcpStream) {
             self.closed.record(stream);
+        }
+
+        fn tcp_listener_close(&self, listener: Self::TcpListener) {
+            self.closed_listeners.record(listener);
         }
 
         fn udp_bind(
@@ -1064,6 +1076,20 @@ pub(crate) fn recording_network_service() -> (
 ) {
     let service = TestNetworkService::new();
     let closed = service.closed();
+    (
+        crate::ComponentHostNetworkService::from_service(service),
+        closed,
+    )
+}
+
+/// The same again, paired with the log of the listeners it retires.
+#[cfg(feature = "wasmtime-runtime")]
+pub(crate) fn recording_listener_network_service() -> (
+    crate::ComponentHostNetworkService,
+    triomphe::Arc<TestClosedStreams>,
+) {
+    let service = TestNetworkService::new();
+    let closed = service.closed_listeners();
     (
         crate::ComponentHostNetworkService::from_service(service),
         closed,

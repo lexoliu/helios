@@ -292,9 +292,39 @@ where
     /// task that may never run — which is how a connection outlived the
     /// program that opened it (#184).
     pub fn tcp_close(&self, stream: TcpStreamId) {
+        let now = StackInstant::from_nanos(self.now_nanos());
         self.inner.state.with_handle(stream, |state| {
-            state.remove_tcp_stream(stream);
+            state.remove_tcp_stream(stream, now);
         });
+    }
+
+    /// Retires `listener`, freeing its slab slot, its replica on every
+    /// shard, and the local port those replicas were holding.
+    ///
+    /// Synchronous for the same reason `tcp_close` and `udp_close` are:
+    /// retirement is a shard-lock update with nothing to await, and the
+    /// owner that has to run it is a `Drop`. A future here would mean
+    /// the only way to end a listener's life is to spawn a task, and a
+    /// task spawned from a dying instance is a task that may never run.
+    ///
+    /// Connections already accepted are streams of their own and live
+    /// on. A connection still queued in a replica's backlog is reset:
+    /// nobody will ever accept it, and its peer completed a handshake
+    /// with a port that is going away. Until this existed every
+    /// listener a program opened stayed in its shard for the rest of
+    /// the boot, holding the port that `is_tcp_local_port_free`
+    /// consults (#191).
+    pub fn tcp_listener_close(&self, listener: TcpListenerId) {
+        let slot = ReplicaHandle::from(listener).slot();
+        let now = StackInstant::from_nanos(self.now_nanos());
+        self.inner
+            .state
+            .for_each_replica("tcp listener close", |state| {
+                state.remove_tcp_listener(slot, now);
+                Ok::<(), core::convert::Infallible>(())
+            })
+            .unwrap_or_else(|infallible| match infallible {});
+        self.inner.state.listener_slots.release(slot);
     }
 
     pub(super) async fn execute_tcp_connect(
@@ -389,12 +419,13 @@ where
             let wait = self.shard_wait_for_handle(stream);
             self.drive_tcp().await?;
             let now_nanos = self.now_nanos();
+            let now = StackInstant::from_nanos(now_nanos);
             let poll_connect = self.inner.state.with_handle(stream, |state| {
                 match state.poll_tcp_connect(stream) {
                     Ok(TcpConnectProgress::Connected) => Ok(TcpConnectProgress::Connected),
                     Ok(TcpConnectProgress::Pending) => {
                         if now_nanos >= deadline_nanos {
-                            state.remove_tcp_stream(stream);
+                            state.remove_tcp_stream(stream, now);
                             Err(TcpError {
                                 kind: TcpErrorKind::Timeout,
                                 detail: NetworkErrorDetail::TcpConnectTimeout,
@@ -404,7 +435,7 @@ where
                         }
                     }
                     Err(error) => {
-                        state.remove_tcp_stream(stream);
+                        state.remove_tcp_stream(stream, now);
                         Err(error)
                     }
                 }
@@ -455,12 +486,13 @@ where
                 return Err(error);
             }
         };
+        let now = StackInstant::from_nanos(self.now_nanos());
         let install = self.inner.state.install_replica(
             slot,
             |shard, slot| {
                 shard.install_tcp_listener(slot, local_address, local_port, backlog, hop_limit)
             },
-            NetworkShard::remove_tcp_listener,
+            |shard, slot| shard.remove_tcp_listener(slot, now),
         );
         if let Err(error) = install {
             self.inner.state.listener_slots.release(slot);
@@ -1373,12 +1405,16 @@ impl NetworkShard {
         Ok(())
     }
 
-    /// Drops this shard's replica of a listener, used to unwind a
-    /// partial install.
-    pub(super) fn remove_tcp_listener(&mut self, slot: usize) {
+    /// Drops this shard's replica of a listener, used both to close one
+    /// and to unwind a partial install.
+    ///
+    /// The stack resets whatever this replica's backlog was still
+    /// holding, so `now` stamps those resets. Connections already
+    /// accepted are streams of their own and are untouched.
+    pub(super) fn remove_tcp_listener(&mut self, slot: usize, now: StackInstant) {
         if let Some(state) = self.tcp_listeners.remove(slot) {
             self.stack
-                .remove_tcp_socket(state.stack_socket)
+                .remove_tcp_socket(state.stack_socket, now)
                 .unwrap_or_else(|_| panic!("TCP listener referenced an unknown stack socket"));
         }
     }
@@ -1517,11 +1553,11 @@ impl NetworkShard {
         }
     }
 
-    pub(super) fn remove_tcp_stream(&mut self, stream: TcpStreamId) {
+    pub(super) fn remove_tcp_stream(&mut self, stream: TcpStreamId, now: StackInstant) {
         let slot = self.decode_handle_slot(stream.into());
         if let Some(socket) = self.tcp_streams.remove(slot) {
             self.stack
-                .remove_tcp_socket(socket)
+                .remove_tcp_socket(socket, now)
                 .unwrap_or_else(|_| panic!("TCP stream referenced an unknown stack socket"));
         }
     }
