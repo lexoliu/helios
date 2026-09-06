@@ -1996,7 +1996,7 @@ fn profile_use_rustflags(profile: &VmProfile, used: &Path) -> String {
 }
 
 fn run_kernel_prebuild(command: &KernelBuildSpec) -> Result<PathBuf, VmBuildError> {
-    let cli = discover_helios_cli()?;
+    let cli = discover_helios_cli(command.kind)?;
     let repo_root = repo_root()?;
     let out_dir = repo_root
         .join("target")
@@ -2729,7 +2729,7 @@ fn prepare_limine_uefi_image(
         "building {} Limine UEFI disk image",
         arch_label(command.profile.arch)
     ));
-    let cli = discover_helios_cli()?;
+    let cli = discover_helios_cli(command.build.kind)?;
     let status = Command::new(&cli)
         .arg("limine-uefi-image")
         .arg("--kernel")
@@ -2767,7 +2767,24 @@ fn limine_efi_arch_argument(arch: VmArch) -> &'static str {
     }
 }
 
-fn discover_helios_cli() -> Result<PathBuf, ToolDiscoveryError> {
+/// The `helios-cli` a build of `kind` drives.
+///
+/// `HELIOS_CLI_BIN` first: a paired benchmark run pins one harness for two
+/// guest checkouts and says so there.
+///
+/// Then the binary [`build_vm`] builds for this kind. An optimised kernel
+/// build compiles `helios-cli` `--release`, and the inspector asking for
+/// one need not be a release binary itself — `just build-instrumented` and
+/// `just kernel-pgo-use` run it through `cargo run`, out of
+/// `target/debug/`. Looking beside the running executable therefore finds
+/// nothing on a clean checkout, which is why `profile-generate` had never
+/// produced an artifact (#217). The kind names the profile, so the lookup
+/// asks for that one rather than for whatever shares a directory with the
+/// inspector.
+///
+/// The directory beside the inspector, and then `PATH`, still answer for
+/// an inspector run from somewhere other than a workspace.
+fn discover_helios_cli(kind: KernelBuildProfile) -> Result<PathBuf, ToolDiscoveryError> {
     if let Some(path) = std::env::var_os("HELIOS_CLI_BIN").map(PathBuf::from) {
         if path.is_file() {
             return Ok(path);
@@ -2775,6 +2792,12 @@ fn discover_helios_cli() -> Result<PathBuf, ToolDiscoveryError> {
         return Err(ToolDiscoveryError::CliBinNotAFile {
             path: path.display().to_string(),
         });
+    }
+    if let Ok(root) = repo_root() {
+        let candidate = workspace_helios_cli(&root, kind);
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
     }
     let current_exe =
         std::env::current_exe().map_err(|source| ToolDiscoveryError::CurrentExe { source })?;
@@ -2787,6 +2810,17 @@ fn discover_helios_cli() -> Result<PathBuf, ToolDiscoveryError> {
         return Ok(candidate);
     }
     Err(ToolDiscoveryError::CliMissing)
+}
+
+/// Where [`build_vm`] leaves the `helios-cli` a build of `kind` needs.
+///
+/// One expression, so the build and the lookup cannot disagree about the
+/// profile: `cargo_build_command` compiles it under `kind.host()`, and
+/// this names the directory that profile writes into.
+fn workspace_helios_cli(root: &Path, kind: KernelBuildProfile) -> PathBuf {
+    root.join("target")
+        .join(kind.host().directory())
+        .join("helios-cli")
 }
 
 fn arch_label(arch: VmArch) -> &'static str {
@@ -4423,6 +4457,33 @@ mod tests {
             matches!(error, VmConfigError::ProfileUseWithOtherProfile),
             "{error}"
         );
+    }
+
+    #[test]
+    fn the_cli_a_build_needs_is_the_one_that_build_compiles() {
+        // An optimised kernel build compiles helios-cli --release, and the
+        // inspector driving it can be the debug binary `cargo run`
+        // produces, so the lookup asks for the profile rather than for
+        // whatever shares a directory with it (#217).
+        let root = Path::new("/workspace");
+        for kind in [
+            KernelBuildProfile::Release,
+            KernelBuildProfile::ProfileGenerate,
+            KernelBuildProfile::ProfileUse,
+        ] {
+            assert_eq!(
+                workspace_helios_cli(root, kind),
+                Path::new("/workspace/target/release/helios-cli"),
+                "{kind:?}"
+            );
+        }
+        for kind in [KernelBuildProfile::Debug, KernelBuildProfile::KernelDebug] {
+            assert_eq!(
+                workspace_helios_cli(root, kind),
+                Path::new("/workspace/target/debug/helios-cli"),
+                "{kind:?}"
+            );
+        }
     }
 
     fn minimal_command() -> VmCommand {
