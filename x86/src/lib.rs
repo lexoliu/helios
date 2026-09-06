@@ -106,6 +106,18 @@ critical_section::set_impl!(X86CriticalSection);
 // and need only to keep this processor's interrupt handler out.
 helios_hal::critical_section::set_local_interrupt_mask_impl!(X86InterruptOps);
 
+/// The processor slot a caller holding no `Cpu` reads, out of the same
+/// `fs`-relative anchor `current_processor` uses.
+struct X86ProcessorSlot;
+
+impl helios_hal::cpu::CurrentProcessorSlot for X86ProcessorSlot {
+    fn current_slot() -> Option<ProcessorId> {
+        smp::current_processor_slot()
+    }
+}
+
+helios_hal::cpu::set_current_processor_slot_impl!(X86ProcessorSlot);
+
 unsafe impl critical_section::Impl for X86CriticalSection {
     unsafe fn acquire() -> usize {
         unsafe { CRITICAL_SECTION_STATE.acquire::<X86InterruptOps>() }

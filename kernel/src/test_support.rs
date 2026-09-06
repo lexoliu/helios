@@ -34,6 +34,56 @@ impl helios_hal::critical_section::LocalInterruptMask for TestInterruptMask {
 }
 
 helios_hal::critical_section::set_local_interrupt_mask_impl!(TestInterruptMask);
+
+std::thread_local! {
+    /// The slot this test thread is standing in for, if it asked to
+    /// stand in for one.
+    ///
+    /// A host test binary runs no bring-up, so nothing here is a
+    /// processor and the default is `None` — which is what a real
+    /// backend answers before a processor installs its runtime, and the
+    /// path most of these tests want. A test that needs the
+    /// per-processor path builds the structure it is testing, sizes it
+    /// itself, and borrows a slot for the duration with
+    /// [`as_processor`]. The cell is thread-local so two tests running
+    /// in parallel cannot claim the same slot and race on the
+    /// owner-only metadata behind it.
+    static TEST_PROCESSOR: std::cell::Cell<Option<ProcessorId>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+/// Runs `act` as though this thread were processor `slot`.
+///
+/// The slot is restored afterwards, including when `act` panics, so a
+/// failing test cannot leave the thread claiming a processor for every
+/// test that follows it on the same thread.
+pub(crate) fn as_processor<R>(slot: ProcessorId, act: impl FnOnce() -> R) -> R {
+    struct Restore(Option<ProcessorId>);
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_PROCESSOR.with(|current| current.set(self.0));
+        }
+    }
+
+    let _restore = Restore(TEST_PROCESSOR.with(|current| current.replace(Some(slot))));
+    act()
+}
+
+/// The processor slot for the kernel's own unit tests.
+///
+/// `current_processor_slot` is reached by linkage too, so a test binary
+/// has to install one; see [`TEST_PROCESSOR`] for what it answers.
+struct TestProcessorSlot;
+
+impl helios_hal::cpu::CurrentProcessorSlot for TestProcessorSlot {
+    fn current_slot() -> Option<ProcessorId> {
+        TEST_PROCESSOR.with(std::cell::Cell::get)
+    }
+}
+
+helios_hal::cpu::set_current_processor_slot_impl!(TestProcessorSlot);
 use helios_hal::entropy::{EntropyQuality, EntropyUnavailable};
 use triomphe::Arc;
 

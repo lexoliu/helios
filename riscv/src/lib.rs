@@ -286,6 +286,24 @@ critical_section::set_impl!(SupervisorCriticalSection);
 // and need only to keep this processor's interrupt handler out.
 helios_hal::critical_section::set_local_interrupt_mask_impl!(SupervisorInterruptOps);
 
+/// The processor slot a caller holding no `Cpu` reads, out of the same
+/// `tp` hart runtime `RiscvCpu::current_processor` uses.
+///
+/// A hart answers `None` between its first instruction and
+/// [`HartRuntime::install`], rather than zero: the caller
+/// ([`helios_hal::cpu::current_processor_slot`]) must be able to tell
+/// "hart zero" from "no hart yet", and on this backend the bootstrap
+/// hart is not always hart zero.
+struct RiscvProcessorSlot;
+
+impl helios_hal::cpu::CurrentProcessorSlot for RiscvProcessorSlot {
+    fn current_slot() -> Option<ProcessorId> {
+        installed_hart_runtime().map(|runtime| runtime.hart_id)
+    }
+}
+
+helios_hal::cpu::set_current_processor_slot_impl!(RiscvProcessorSlot);
+
 unsafe impl critical_section::Impl for SupervisorCriticalSection {
     unsafe fn acquire() -> usize {
         unsafe { CRITICAL_SECTION_STATE.acquire::<SupervisorInterruptOps>() }

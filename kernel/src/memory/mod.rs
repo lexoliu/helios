@@ -2,7 +2,9 @@
 //!
 //! `irq_safe` carries the lock every allocator here is built on: an
 //! interrupt handler allocates, so the lock that guards an allocator
-//! has to mask interrupts while it is held.
+//! has to mask interrupts while it is held. `magazine` is the
+//! per-processor front that keeps most kernel allocations from
+//! reaching that lock at all.
 //! `pmm` exposes the kernel's physical-frame allocator wrapper.
 //! `user` carries the per-program user-memory pool used by Wasmtime
 //! linear memories. `frame_slab` is the per-processor frame cache
@@ -18,6 +20,7 @@ mod balloon;
 mod entropy;
 mod frame_slab;
 mod irq_safe;
+mod magazine;
 mod mapping_cost;
 mod owner;
 mod pmm;
@@ -34,6 +37,10 @@ pub use entropy::{
     RootEntropyHandle, install_entropy_device, seed_root_entropy,
 };
 pub(crate) use irq_safe::IrqSafeMutex;
+pub(crate) use magazine::{
+    HeapCounters, HeapMagazines, MAGAZINE_BATCH, MagazineClass, OwnedStep, ProcessorFront,
+    SharedStep,
+};
 pub use mapping_cost::user_mapping_kernel_heap_bytes;
 pub use owner::{
     MemoryOwner, UserMemoryOwnerScope, UserMemoryOwners, configure_user_memory_owner_processors,

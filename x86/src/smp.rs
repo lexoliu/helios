@@ -417,6 +417,20 @@ pub(crate) fn current_processor() -> ProcessorId {
     ProcessorId::new(logical_id)
 }
 
+/// The slot this processor owns among the kernel's per-processor
+/// structures, or `None` while it is still on [`BOOTSTRAP_ANCHOR`].
+///
+/// Only the bootstrap processor ever runs on that anchor — an
+/// application processor's wakeup trampoline installs its real runtime
+/// in `IA32_FS_BASE` before the first compiler-generated instruction —
+/// and it answers `None` rather than zero because the caller
+/// ([`helios_hal::cpu::current_processor_slot`]) must be able to tell
+/// "processor zero" from "no processor yet".
+pub(crate) fn current_processor_slot() -> Option<ProcessorId> {
+    let logical_id = anchor_logical_id();
+    (logical_id != BOOTSTRAP_ANCHOR_LOGICAL_ID).then(|| ProcessorId::new(logical_id))
+}
+
 /// The identity this processor answers critical-section acquires with.
 ///
 /// A processor takes critical sections from its first instruction, well before

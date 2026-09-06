@@ -126,6 +126,59 @@ the arena: 500 instances want about 6.1 GiB of machine before the
 kernel's own baseline, and the lane's guest has 2 GiB. It needs a bigger
 guest to be measured, not a bigger arena.
 
+## The kernel heap's per-processor front
+
+The kernel heap is one buddy allocator behind one `IrqSafeMutex`
+(`kernel/src/lib.rs`), and that lock is the machine's hottest word: every
+processor's executor, network service and component host allocate on it
+at once, and the buddy allocator behind it walks a free list on every
+free looking for the block's buddy, at every class it merges up through.
+
+`kernel/src/memory/magazine.rs` puts a per-processor front in front of
+it. Each processor keeps a magazine of recently freed blocks per small
+size class and serves its own allocations out of it; the shared heap
+sees a batch of sixteen instead of sixteen separate allocations. The
+size classes are buddy orders from 8 bytes to 512 bytes, which is where
+the measured distribution ends: over `hostcall-loop`, `sched-tasks`,
+`spawn-wait`, `instance-startup-100` and `pipe-pingpong`, 99.85% of the
+7.6 million kernel allocations are 512 bytes or smaller and 72% of them
+land in the single 65–128 byte class.
+
+Two properties make it safe and cheap:
+
+- **Blocks are fungible.** A class-`k` block is `1 << k` bytes at
+  `1 << k` alignment, which is exactly what the buddy heap serves for
+  that class, and the front asks the heap for that layout rather than
+  the caller's. So a block one processor allocated is a block any
+  processor may later hand out of its own magazine, there is no owner to
+  return a block to, and the heap's own byte accounting stays symmetric
+  between the allocation and the free.
+- **The metadata is owner-only.** The list heads are plain pointers with
+  no lock and no atomic on them, reached only from the owning processor
+  with local interrupts masked — the same mask the heap lock already
+  takes, and for the same reason: the processor's own interrupt handler
+  allocates. What another processor reads (the depths, and the
+  allocation counters) is atomic, and the counters are stepped by their
+  owner with a relaxed load, an add and a relaxed store, so no kernel
+  allocation performs a contended atomic any more.
+
+The array is sized at bring-up, out of the same
+`prime_bootstrap_allocator` call that fills the heap, by the processor
+count the backend reports. Before that the heap serves every allocation
+directly; afterwards a processor naming a slot the array does not hold
+panics rather than borrowing another processor's magazine. A processor
+that has not installed its per-processor runtime yet names no slot at
+all — `helios_hal::cpu::current_processor_slot` answers `None`, which
+every backend implements out of the same processor-local register its
+`Cpu::current_processor` reads — and takes the direct path.
+
+`HeapStats::magazine_cached_bytes` reports what the magazines are
+holding. It is inside `allocated_bytes` as well, because from the buddy
+heap's point of view those blocks are out on loan; the field says how
+much of that is a cache rather than a live kernel object. A refill never
+takes the heap below its reserve, so the cache cannot eat the memory the
+kernel keeps for itself.
+
 ## Related
 
 - `docs/benchmarks.md` — the density workloads and what they report.

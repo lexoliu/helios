@@ -514,6 +514,18 @@ critical_section::set_impl!(Aarch64CriticalSection);
 // and need only to keep this processor's interrupt handler out.
 helios_hal::critical_section::set_local_interrupt_mask_impl!(Aarch64InterruptOps);
 
+/// The processor slot a caller holding no `Cpu` reads, out of the same
+/// `tpidr_el1` runtime pointer `Aarch64Cpu::current_processor` uses.
+struct Aarch64CurrentProcessorSlot;
+
+impl helios_hal::cpu::CurrentProcessorSlot for Aarch64CurrentProcessorSlot {
+    fn current_slot() -> Option<ProcessorId> {
+        current_processor_slot()
+    }
+}
+
+helios_hal::cpu::set_current_processor_slot_impl!(Aarch64CurrentProcessorSlot);
+
 unsafe impl critical_section::Impl for Aarch64CriticalSection {
     unsafe fn acquire() -> usize {
         unsafe { CRITICAL_SECTION_STATE.acquire::<Aarch64InterruptOps>() }
@@ -1421,6 +1433,24 @@ fn read_processor_runtime() -> usize {
         asm!("mrs {ptr}, tpidr_el1", ptr = out(reg) ptr, options(nomem, nostack, preserves_flags));
     }
     ptr
+}
+
+/// The slot this processor owns among the kernel's per-processor
+/// structures, or `None` while `tpidr_el1` is still null.
+///
+/// A processor runs from its reset vector to
+/// [`Aarch64PlatformState::activate_runtime`] with no runtime of its
+/// own, and answers `None` for that window rather than zero, because
+/// the caller ([`helios_hal::cpu::current_processor_slot`]) must be
+/// able to tell "processor zero" from "no processor yet".
+fn current_processor_slot() -> Option<ProcessorId> {
+    let ptr = read_processor_runtime() as *const ProcessorRuntime;
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: only `activate_runtime` writes `tpidr_el1`, and it writes
+    // the address of a `&'static ProcessorRuntime`.
+    Some(unsafe { &*ptr }.logical_id())
 }
 
 fn current_processor_runtime() -> &'static ProcessorRuntime {

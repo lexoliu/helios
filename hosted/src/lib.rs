@@ -58,6 +58,8 @@ impl helios_hal::critical_section::LocalInterruptMask for HostedInterruptMask {
 
 helios_hal::critical_section::set_local_interrupt_mask_impl!(HostedInterruptMask);
 
+helios_hal::cpu::set_current_processor_slot_impl!(cpu::HostedProcessorSlot);
+
 use std::any::Any;
 use std::fmt;
 

@@ -237,3 +237,69 @@ pub trait Cpu: Send + Sync + 'static {
     /// Reboots the machine and never returns.
     fn reboot(&self) -> !;
 }
+
+unsafe extern "Rust" {
+    safe fn _helios_current_processor_slot() -> Option<ProcessorId>;
+}
+
+/// The slot the calling processor owns among the kernel's per-processor
+/// structures, or `None` while that processor cannot yet name it.
+///
+/// [`Cpu::current_processor`] answers the same question, and every
+/// caller that holds a `Cpu` asks it there. This exists for the callers
+/// that hold none and can never be given one: the global allocator and
+/// the counters behind it are `static`s entered from any processor, and
+/// on every backend a `Cpu` is a refcounted handle whose clone and drop
+/// would land on the allocation path. The answer is reached by linkage,
+/// the way [`crate::critical_section::with_local_interrupts_masked`]
+/// reaches the backend's interrupt mask, and it costs what
+/// [`Cpu::current_processor`] costs: one load off the processor-local
+/// register (`fs` on x86-64, `tpidr_el1` on AArch64, `tp` on RISC-V).
+///
+/// # The `None` window
+///
+/// A processor answers `None` between its first instruction and the
+/// moment its per-processor runtime is installed, because until then
+/// the register holds a bootstrapping identity that names hardware
+/// rather than a slot. That window is bounded and boot-only — every
+/// application processor leaves it before its first compiler-generated
+/// instruction, and the bootstrap processor leaves it during
+/// bring-up — and a caller in it uses the shared structure instead of a
+/// per-processor one. It is never a licence to guess a slot: two
+/// processors that guessed the same one would write the same
+/// owner-only metadata.
+#[inline]
+pub fn current_processor_slot() -> Option<ProcessorId> {
+    _helios_current_processor_slot()
+}
+
+/// Answers [`current_processor_slot`] for one backend.
+pub trait CurrentProcessorSlot {
+    /// The slot of the calling processor, or `None` while it still
+    /// carries a bootstrapping identity.
+    ///
+    /// Two processors must never answer with the same slot: the value
+    /// selects owner-only metadata, and a shared answer is a data race
+    /// on it.
+    fn current_slot() -> Option<ProcessorId>;
+}
+
+/// Installs `$t` as the processor-slot source for the final binary.
+///
+/// A backend writes this once, beside its
+/// [`crate::set_local_interrupt_mask_impl`], naming its
+/// [`CurrentProcessorSlot`] implementation. Exactly one crate in a
+/// binary may invoke it: it defines the symbol
+/// [`current_processor_slot`] links against, and a second definition is
+/// a duplicate-symbol error at link time.
+#[macro_export]
+macro_rules! set_current_processor_slot_impl {
+    ($t: ty) => {
+        #[unsafe(no_mangle)]
+        fn _helios_current_processor_slot() -> Option<$crate::cpu::ProcessorId> {
+            <$t as $crate::cpu::CurrentProcessorSlot>::current_slot()
+        }
+    };
+}
+
+pub use crate::set_current_processor_slot_impl;

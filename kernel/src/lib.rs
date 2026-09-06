@@ -196,13 +196,14 @@ use alloc::task::Wake;
 use core::alloc::{GlobalAlloc, Layout};
 use core::future::Future;
 use core::ptr;
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use core::task::{Context, Poll, Waker};
 use core::time::Duration;
 
 use arrayvec::ArrayVec;
 use buddy_system_allocator::Heap;
 use helios_hal::cpu::{Cpu, Instant, ProcessorId};
+use helios_hal::critical_section::with_local_interrupts_masked;
 use helios_hal::memory::MemoryRegion;
 use helios_hal::watchdog::{NoWatchdog, ProgressCounter, Watchdog};
 use helios_hal::{DeviceInventory, DmaModel, ProcessorStartupPolicy, ProcessorTopology};
@@ -226,6 +227,15 @@ static BOOT_STATE: AtomicU8 = AtomicU8::new(BOOT_UNINITIALIZED);
 pub struct HeapStats {
     pub total_bytes: usize,
     pub allocated_bytes: usize,
+    /// Bytes the per-processor magazines hold out of the shared heap
+    /// (`memory::magazine`).
+    ///
+    /// They are inside `allocated_bytes` too, and correctly so: the
+    /// buddy heap has handed them out and cannot merge them or serve a
+    /// larger allocation from them until a magazine gives them back.
+    /// This field says how much of that is a cache rather than a live
+    /// kernel object.
+    pub magazine_cached_bytes: usize,
     pub requested_live_bytes: usize,
     pub allocation_count: u64,
     pub deallocation_count: u64,
@@ -245,6 +255,32 @@ impl HeapStats {
     pub fn available_bytes(self) -> usize {
         self.total_bytes.saturating_sub(self.allocated_bytes)
     }
+
+    /// The zero every processor's counters are summed into.
+    ///
+    /// The counters live one block per processor now
+    /// (`memory::magazine`), so a stats read is an accumulation rather
+    /// than a set of loads, and this is what it starts from.
+    pub(crate) const fn zeroed() -> Self {
+        Self {
+            total_bytes: 0,
+            allocated_bytes: 0,
+            magazine_cached_bytes: 0,
+            requested_live_bytes: 0,
+            allocation_count: 0,
+            deallocation_count: 0,
+            reallocation_count: 0,
+            total_allocation_bytes: 0,
+            total_deallocation_bytes: 0,
+            total_reallocation_bytes: 0,
+            size_class_allocation_count: [0; HEAP_SIZE_CLASS_COUNT],
+            size_class_deallocation_count: [0; HEAP_SIZE_CLASS_COUNT],
+            size_class_reallocation_count: [0; HEAP_SIZE_CLASS_COUNT],
+            size_class_allocation_bytes: [0; HEAP_SIZE_CLASS_COUNT],
+            size_class_deallocation_bytes: [0; HEAP_SIZE_CLASS_COUNT],
+            size_class_reallocation_bytes: [0; HEAP_SIZE_CLASS_COUNT],
+        }
+    }
 }
 
 struct KernelAllocator<const ORDER: usize> {
@@ -254,7 +290,22 @@ struct KernelAllocator<const ORDER: usize> {
     /// it, and then every other processor behind it (#206). See
     /// [`memory::IrqSafeMutex`] for the contract.
     heap: IrqSafeMutex<Heap<ORDER>>,
-    stats: KernelAllocationStats,
+    /// The per-processor front in front of that lock: a magazine of
+    /// cached blocks per small size class, and the allocation counters,
+    /// both owned by the processor they belong to. See
+    /// `memory::magazine` for the concurrency contract. Most kernel
+    /// allocations never reach the heap above.
+    magazines: memory::HeapMagazines,
+    /// The counters for allocations no processor could claim, because
+    /// the processor serving them still carried a bootstrapping
+    /// identity or the front had not been sized yet. Boot-only, and
+    /// stepped atomically because two bootstrapping processors may
+    /// reach it at once.
+    unslotted_stats: memory::HeapCounters,
+    /// Whether the size-class breakdown is being collected. Read on
+    /// every allocation and written only when profiling is switched, so
+    /// it is a shared line that is never written on the hot path.
+    size_class_metrics_enabled: AtomicBool,
     /// Every usable byte the boot memory map described, and the free
     /// kernel heap a user grow may not dip into. Both are fixed by
     /// [`memory::BootMemoryPlan`] at boot and never move afterwards:
@@ -272,7 +323,9 @@ impl<const ORDER: usize> KernelAllocator<ORDER> {
     const fn empty() -> Self {
         Self {
             heap: IrqSafeMutex::new(Heap::new()),
-            stats: KernelAllocationStats::new(),
+            magazines: memory::HeapMagazines::new(),
+            unslotted_stats: memory::HeapCounters::new(),
+            size_class_metrics_enabled: AtomicBool::new(false),
             machine_usable_bytes: AtomicUsize::new(0),
             kernel_reserve_bytes: AtomicUsize::new(0),
             top_up_backoff: AtomicUsize::new(0),
@@ -282,6 +335,145 @@ impl<const ORDER: usize> KernelAllocator<ORDER> {
     unsafe fn add_to_heap(&self, start: usize, end: usize) {
         self.heap.with(|heap| unsafe {
             heap.add_to_heap(start, end);
+        });
+    }
+
+    /// The front belonging to the processor this call is running on, or
+    /// `None` while that processor cannot name its slot.
+    ///
+    /// One load off the processor-local register — `fs` on x86-64,
+    /// `tpidr_el1` on AArch64, `tp` on RISC-V — reached by linkage
+    /// because a global allocator holds no [`Cpu`] and never can; see
+    /// [`helios_hal::cpu::current_processor_slot`].
+    #[inline]
+    fn front(&self) -> Option<&memory::ProcessorFront> {
+        let slot = helios_hal::cpu::current_processor_slot()?;
+        self.magazines.front(slot)
+    }
+
+    #[inline]
+    fn size_class_metrics(&self) -> bool {
+        self.size_class_metrics_enabled.load(Ordering::Relaxed)
+    }
+
+    /// Serves `layout`, out of this processor's magazine when the class
+    /// is one it caches and it has a block.
+    ///
+    /// This is the memory half only: the caller counts what it got, so
+    /// that a reallocation can count itself as one rather than as an
+    /// allocation and a free.
+    fn allocate_block(&self, front: Option<&memory::ProcessorFront>, layout: Layout) -> *mut u8 {
+        let Some(class) = memory::MagazineClass::of(layout) else {
+            return self.alloc_growing(layout);
+        };
+        if let Some(front) = front
+            && let Some(block) = front.take(class)
+        {
+            return block.as_ptr();
+        }
+
+        // A miss goes to the shared heap for the caller's own block and
+        // then, in one more acquisition, for a batch behind it, so the
+        // next `MAGAZINE_BATCH` allocations of this class do not come
+        // back here. The block is asked for under the class's own
+        // layout, not the caller's: that is what lets any processor
+        // later serve it out of its magazine, and it is the same block
+        // the heap would have chosen for the caller's layout anyway.
+        let ptr = self.alloc_growing(class.layout());
+        if !ptr.is_null()
+            && let Some(front) = front
+        {
+            self.refill(front, class);
+        }
+        ptr
+    }
+
+    /// Returns `ptr` to this processor's magazine when the class is one
+    /// it caches, and to the shared heap otherwise.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be an allocation this allocator served under
+    /// `layout`, which is what every [`GlobalAlloc`] caller already
+    /// promises.
+    unsafe fn release_block(
+        &self,
+        front: Option<&memory::ProcessorFront>,
+        ptr: *mut u8,
+        layout: Layout,
+    ) {
+        let Some(class) = memory::MagazineClass::of(layout) else {
+            unsafe { self.free(ptr, layout) };
+            return;
+        };
+        let block = ptr::NonNull::new(ptr).expect("the global allocator was handed a null pointer");
+        let Some(front) = front else {
+            // The class is cached but this processor has no front yet,
+            // so the block goes back under the class layout it was
+            // taken under; anything else would leave the heap's byte
+            // accounting asymmetric.
+            unsafe { self.free(ptr, class.layout()) };
+            return;
+        };
+        // SAFETY: the block was served under the class layout — every
+        // allocation of a cached class is, above — and the caller
+        // promises nothing else references it.
+        if let Some(mut batch) = unsafe { front.give(class, block) } {
+            self.free_batch(class, &mut batch);
+        }
+    }
+
+    /// Stocks one class of `front`'s magazine out of the shared heap.
+    ///
+    /// One acquisition for up to a batch. The heap is never grown from
+    /// here — growth belongs to [`Self::alloc_growing`], which the
+    /// caller's own block has already been through — and the refill
+    /// stops before it would take the heap below its reserve, so a
+    /// cache never eats the memory the kernel keeps for itself.
+    fn refill(&self, front: &memory::ProcessorFront, class: memory::MagazineClass) {
+        let layout = class.layout();
+        let reserve = self.reserve_bytes();
+        let mut blocks: ArrayVec<ptr::NonNull<u8>, { memory::MAGAZINE_BATCH }> = ArrayVec::new();
+        self.heap.with(|heap| {
+            while !blocks.is_full() {
+                let free = heap
+                    .stats_total_bytes()
+                    .saturating_sub(heap.stats_alloc_actual());
+                if free < reserve.saturating_add(layout.size()) {
+                    break;
+                }
+                let Ok(block) = heap.alloc(layout) else {
+                    break;
+                };
+                blocks.push(block);
+            }
+        });
+        if blocks.is_empty() {
+            return;
+        }
+
+        // SAFETY: every block came from `heap.alloc` under the class
+        // layout and nothing else references it.
+        unsafe { front.stock(class, &mut blocks) };
+        if !blocks.is_empty() {
+            self.free_batch(class, &mut blocks);
+        }
+    }
+
+    /// Returns a magazine's overflow to the shared heap under one
+    /// acquisition.
+    fn free_batch(
+        &self,
+        class: memory::MagazineClass,
+        batch: &mut ArrayVec<ptr::NonNull<u8>, { memory::MAGAZINE_BATCH }>,
+    ) {
+        let layout = class.layout();
+        self.heap.with(|heap| {
+            for block in batch.drain(..) {
+                // SAFETY: every block in the batch was served by this
+                // heap under `layout` and is no longer referenced.
+                unsafe { heap.dealloc(block, layout) };
+            }
         });
     }
 
@@ -399,179 +591,132 @@ impl<const ORDER: usize> KernelAllocator<ORDER> {
         false
     }
 
+    /// Sizes the per-processor front, once the heap it lives in has
+    /// memory and the backend has said how many processors there are.
+    fn configure_processors(&self, processor_count: usize) {
+        self.magazines.configure_processors(processor_count);
+    }
+
     fn stats(&self) -> HeapStats {
+        let mut stats = HeapStats::zeroed();
         let (total_bytes, allocated_bytes) = self
             .heap
             .with(|heap| (heap.stats_total_bytes(), heap.stats_alloc_actual()));
-        HeapStats {
-            total_bytes,
-            allocated_bytes,
-            requested_live_bytes: self.stats.requested_live_bytes.load(Ordering::Relaxed),
-            allocation_count: self.stats.allocation_count.load(Ordering::Relaxed),
-            deallocation_count: self.stats.deallocation_count.load(Ordering::Relaxed),
-            reallocation_count: self.stats.reallocation_count.load(Ordering::Relaxed),
-            total_allocation_bytes: self.stats.total_allocation_bytes.load(Ordering::Relaxed),
-            total_deallocation_bytes: self.stats.total_deallocation_bytes.load(Ordering::Relaxed),
-            total_reallocation_bytes: self.stats.total_reallocation_bytes.load(Ordering::Relaxed),
-            size_class_allocation_count: self
-                .stats
-                .size_class_counts(&self.stats.size_class_allocation_count),
-            size_class_deallocation_count: self
-                .stats
-                .size_class_counts(&self.stats.size_class_deallocation_count),
-            size_class_reallocation_count: self
-                .stats
-                .size_class_counts(&self.stats.size_class_reallocation_count),
-            size_class_allocation_bytes: self
-                .stats
-                .size_class_counts(&self.stats.size_class_allocation_bytes),
-            size_class_deallocation_bytes: self
-                .stats
-                .size_class_counts(&self.stats.size_class_deallocation_bytes),
-            size_class_reallocation_bytes: self
-                .stats
-                .size_class_counts(&self.stats.size_class_reallocation_bytes),
-        }
+        stats.total_bytes = total_bytes;
+        stats.allocated_bytes = allocated_bytes;
+        stats.magazine_cached_bytes = self.magazines.cached_bytes();
+        self.unslotted_stats.accumulate_into(&mut stats);
+        self.magazines.accumulate_counters(&mut stats);
+        stats
     }
 
     fn set_size_class_metrics_enabled(&self, enabled: bool) {
-        self.stats.set_size_class_metrics_enabled(enabled);
+        self.size_class_metrics_enabled
+            .store(enabled, Ordering::Release);
+    }
+
+    /// Counts one allocation on the processor that served it.
+    ///
+    /// A processor's own counters are plain words behind the local
+    /// interrupt mask; the block for a processor that cannot name a
+    /// slot is shared and steps atomically. `memory::magazine` states
+    /// why the two differ.
+    #[inline]
+    fn record_alloc(&self, front: Option<&memory::ProcessorFront>, size: usize) {
+        let metrics = self.size_class_metrics();
+        match front {
+            Some(front) => with_local_interrupts_masked(|| {
+                front
+                    .counters()
+                    .record_alloc::<memory::OwnedStep>(size, metrics);
+            }),
+            None => self
+                .unslotted_stats
+                .record_alloc::<memory::SharedStep>(size, metrics),
+        }
+    }
+
+    /// Counts one deallocation; see [`Self::record_alloc`].
+    #[inline]
+    fn record_dealloc(&self, front: Option<&memory::ProcessorFront>, size: usize) {
+        let metrics = self.size_class_metrics();
+        match front {
+            Some(front) => with_local_interrupts_masked(|| {
+                front
+                    .counters()
+                    .record_dealloc::<memory::OwnedStep>(size, metrics);
+            }),
+            None => self
+                .unslotted_stats
+                .record_dealloc::<memory::SharedStep>(size, metrics),
+        }
+    }
+
+    /// Counts one reallocation; see [`Self::record_alloc`].
+    #[inline]
+    fn record_realloc(
+        &self,
+        front: Option<&memory::ProcessorFront>,
+        old_size: usize,
+        new_size: usize,
+    ) {
+        let metrics = self.size_class_metrics();
+        match front {
+            Some(front) => with_local_interrupts_masked(|| {
+                front
+                    .counters()
+                    .record_realloc::<memory::OwnedStep>(old_size, new_size, metrics);
+            }),
+            None => {
+                self.unslotted_stats
+                    .record_realloc::<memory::SharedStep>(old_size, new_size, metrics);
+            }
+        }
     }
 }
 
 unsafe impl<const ORDER: usize> GlobalAlloc for KernelAllocator<ORDER> {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let ptr = self.alloc_growing(layout);
+        let front = self.front();
+        let ptr = self.allocate_block(front, layout);
         if !ptr.is_null() {
-            self.stats.record_alloc(layout.size());
+            self.record_alloc(front, layout.size());
         }
         ptr
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        let ptr = self.alloc_growing(layout);
+        let front = self.front();
+        let ptr = self.allocate_block(front, layout);
         if !ptr.is_null() {
             unsafe {
                 ptr::write_bytes(ptr, 0, layout.size());
             }
-            self.stats.record_alloc(layout.size());
+            self.record_alloc(front, layout.size());
         }
         ptr
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { self.free(ptr, layout) };
-        self.stats.record_dealloc(layout.size());
+        let front = self.front();
+        unsafe { self.release_block(front, ptr, layout) };
+        self.record_dealloc(front, layout.size());
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         let new_layout = unsafe { Layout::from_size_align_unchecked(new_size, layout.align()) };
-        let new_ptr = self.alloc_growing(new_layout);
+        let front = self.front();
+        let new_ptr = self.allocate_block(front, new_layout);
         if new_ptr.is_null() {
             return ptr::null_mut();
         }
 
         unsafe {
             ptr::copy_nonoverlapping(ptr, new_ptr, layout.size().min(new_size));
-            self.free(ptr, layout);
+            self.release_block(front, ptr, layout);
         }
-        self.stats.record_realloc(layout.size(), new_size);
+        self.record_realloc(front, layout.size(), new_size);
         new_ptr
-    }
-}
-
-struct KernelAllocationStats {
-    requested_live_bytes: AtomicUsize,
-    allocation_count: AtomicU64,
-    deallocation_count: AtomicU64,
-    reallocation_count: AtomicU64,
-    total_allocation_bytes: AtomicU64,
-    total_deallocation_bytes: AtomicU64,
-    total_reallocation_bytes: AtomicU64,
-    size_class_metrics_enabled: AtomicBool,
-    size_class_allocation_count: [AtomicU64; HEAP_SIZE_CLASS_COUNT],
-    size_class_deallocation_count: [AtomicU64; HEAP_SIZE_CLASS_COUNT],
-    size_class_reallocation_count: [AtomicU64; HEAP_SIZE_CLASS_COUNT],
-    size_class_allocation_bytes: [AtomicU64; HEAP_SIZE_CLASS_COUNT],
-    size_class_deallocation_bytes: [AtomicU64; HEAP_SIZE_CLASS_COUNT],
-    size_class_reallocation_bytes: [AtomicU64; HEAP_SIZE_CLASS_COUNT],
-}
-
-impl KernelAllocationStats {
-    const fn new() -> Self {
-        Self {
-            requested_live_bytes: AtomicUsize::new(0),
-            allocation_count: AtomicU64::new(0),
-            deallocation_count: AtomicU64::new(0),
-            reallocation_count: AtomicU64::new(0),
-            total_allocation_bytes: AtomicU64::new(0),
-            total_deallocation_bytes: AtomicU64::new(0),
-            total_reallocation_bytes: AtomicU64::new(0),
-            size_class_metrics_enabled: AtomicBool::new(false),
-            size_class_allocation_count: [const { AtomicU64::new(0) }; HEAP_SIZE_CLASS_COUNT],
-            size_class_deallocation_count: [const { AtomicU64::new(0) }; HEAP_SIZE_CLASS_COUNT],
-            size_class_reallocation_count: [const { AtomicU64::new(0) }; HEAP_SIZE_CLASS_COUNT],
-            size_class_allocation_bytes: [const { AtomicU64::new(0) }; HEAP_SIZE_CLASS_COUNT],
-            size_class_deallocation_bytes: [const { AtomicU64::new(0) }; HEAP_SIZE_CLASS_COUNT],
-            size_class_reallocation_bytes: [const { AtomicU64::new(0) }; HEAP_SIZE_CLASS_COUNT],
-        }
-    }
-
-    fn size_class_counts(
-        &self,
-        values: &[AtomicU64; HEAP_SIZE_CLASS_COUNT],
-    ) -> [u64; HEAP_SIZE_CLASS_COUNT] {
-        core::array::from_fn(|index| values[index].load(Ordering::Relaxed))
-    }
-
-    fn record_alloc(&self, size: usize) {
-        let size_u64 = usize_to_u64(size, "kernel allocation size");
-        self.allocation_count.fetch_add(1, Ordering::Relaxed);
-        self.requested_live_bytes.fetch_add(size, Ordering::Relaxed);
-        self.total_allocation_bytes
-            .fetch_add(size_u64, Ordering::Relaxed);
-        if self.size_class_metrics_enabled.load(Ordering::Relaxed) {
-            let class = heap_size_class(size);
-            self.size_class_allocation_count[class].fetch_add(1, Ordering::Relaxed);
-            self.size_class_allocation_bytes[class].fetch_add(size_u64, Ordering::Relaxed);
-        }
-    }
-
-    fn record_dealloc(&self, size: usize) {
-        let size_u64 = usize_to_u64(size, "kernel deallocation size");
-        self.deallocation_count.fetch_add(1, Ordering::Relaxed);
-        self.requested_live_bytes.fetch_sub(size, Ordering::Relaxed);
-        self.total_deallocation_bytes
-            .fetch_add(size_u64, Ordering::Relaxed);
-        if self.size_class_metrics_enabled.load(Ordering::Relaxed) {
-            let class = heap_size_class(size);
-            self.size_class_deallocation_count[class].fetch_add(1, Ordering::Relaxed);
-            self.size_class_deallocation_bytes[class].fetch_add(size_u64, Ordering::Relaxed);
-        }
-    }
-
-    fn record_realloc(&self, old_size: usize, new_size: usize) {
-        let new_size_u64 = usize_to_u64(new_size, "kernel reallocation size");
-        self.reallocation_count.fetch_add(1, Ordering::Relaxed);
-        if new_size >= old_size {
-            self.requested_live_bytes
-                .fetch_add(new_size - old_size, Ordering::Relaxed);
-        } else {
-            self.requested_live_bytes
-                .fetch_sub(old_size - new_size, Ordering::Relaxed);
-        }
-        self.total_reallocation_bytes
-            .fetch_add(new_size_u64, Ordering::Relaxed);
-        if self.size_class_metrics_enabled.load(Ordering::Relaxed) {
-            let class = heap_size_class(new_size);
-            self.size_class_reallocation_count[class].fetch_add(1, Ordering::Relaxed);
-            self.size_class_reallocation_bytes[class].fetch_add(new_size_u64, Ordering::Relaxed);
-        }
-    }
-
-    fn set_size_class_metrics_enabled(&self, enabled: bool) {
-        self.size_class_metrics_enabled
-            .store(enabled, Ordering::Release);
     }
 }
 
@@ -1034,6 +1179,12 @@ where
         let pool = *user_pool.get_or_insert_with(|| {
             let pool = memory::install_user_memory_pool(memory::allocate_user_memory_pool());
             pool.configure_processors(processor_count);
+            // The kernel heap's own per-processor front is sized here
+            // too, and for the same reason: this is the first point at
+            // which the heap can allocate the array and the processor
+            // count is known. Every allocation before it goes straight
+            // to the shared heap.
+            ALLOCATOR.configure_processors(processor_count);
             // The swap policy asks which instance a committed page
             // belongs to, and the answer is per-processor; size that
             // table with the pool it describes.
@@ -1404,6 +1555,130 @@ mod tests {
         assert_eq!(stats.allocation_count, 1);
         assert_eq!(stats.reallocation_count, 1);
         assert_eq!(stats.deallocation_count, 1);
+        assert_eq!(stats.requested_live_bytes, 0);
+    }
+
+    /// A processor with a front serves its small allocations out of it:
+    /// the block a free left in the magazine is the block the next
+    /// allocation of that class gets, and the shared heap never sees
+    /// either.
+    #[test]
+    fn a_cached_class_is_served_out_of_this_processors_magazine() {
+        let allocator = KernelAllocator::<HEAP_ORDER>::empty();
+        let mut heap = Box::new(AlignedHeap([0; TEST_HEAP_BYTES]));
+        let start = heap.0.as_mut_ptr() as usize;
+        unsafe {
+            allocator.add_to_heap(start, start + TEST_HEAP_BYTES);
+        }
+        allocator.configure_processors(1);
+
+        let layout = Layout::from_size_align(64, 8).expect("valid allocation layout");
+        test_support::as_processor(ProcessorId::new(0), || {
+            let first = unsafe { GlobalAlloc::alloc(&allocator, layout) };
+            assert!(!first.is_null());
+            // The miss behind it stocked a batch, so the heap is
+            // already holding blocks out for this processor.
+            assert!(allocator.stats().magazine_cached_bytes > 0);
+
+            unsafe { GlobalAlloc::dealloc(&allocator, first, layout) };
+            let second = unsafe { GlobalAlloc::alloc(&allocator, layout) };
+            assert_eq!(second, first, "the free left its block in the magazine");
+            unsafe { GlobalAlloc::dealloc(&allocator, second, layout) };
+        });
+
+        let stats = allocator.stats();
+        assert_eq!(stats.allocation_count, 2);
+        assert_eq!(stats.deallocation_count, 2);
+        assert_eq!(stats.requested_live_bytes, 0);
+        assert!(
+            stats.magazine_cached_bytes <= stats.allocated_bytes,
+            "cached bytes are a share of what the heap has handed out"
+        );
+    }
+
+    /// An allocation past the largest cached class goes straight to the
+    /// shared heap, and comes back to it.
+    #[test]
+    fn an_uncached_class_never_touches_a_magazine() {
+        let allocator = KernelAllocator::<HEAP_ORDER>::empty();
+        let mut heap = Box::new(AlignedHeap([0; TEST_HEAP_BYTES]));
+        let start = heap.0.as_mut_ptr() as usize;
+        unsafe {
+            allocator.add_to_heap(start, start + TEST_HEAP_BYTES);
+        }
+        allocator.configure_processors(1);
+
+        let layout = Layout::from_size_align(4096, 8).expect("valid allocation layout");
+        test_support::as_processor(ProcessorId::new(0), || {
+            let ptr = unsafe { GlobalAlloc::alloc(&allocator, layout) };
+            assert!(!ptr.is_null());
+            assert_eq!(allocator.stats().magazine_cached_bytes, 0);
+            unsafe { GlobalAlloc::dealloc(&allocator, ptr, layout) };
+            assert_eq!(allocator.stats().magazine_cached_bytes, 0);
+        });
+
+        assert_eq!(allocator.stats().requested_live_bytes, 0);
+    }
+
+    /// A processor that cannot name a slot allocates and frees through
+    /// the shared heap, and its counters still balance.
+    #[test]
+    fn an_unslotted_processor_still_allocates_and_counts() {
+        let allocator = KernelAllocator::<HEAP_ORDER>::empty();
+        let mut heap = Box::new(AlignedHeap([0; TEST_HEAP_BYTES]));
+        let start = heap.0.as_mut_ptr() as usize;
+        unsafe {
+            allocator.add_to_heap(start, start + TEST_HEAP_BYTES);
+        }
+        allocator.configure_processors(1);
+
+        let layout = Layout::from_size_align(64, 8).expect("valid allocation layout");
+        let ptr = unsafe { GlobalAlloc::alloc(&allocator, layout) };
+        assert!(!ptr.is_null());
+        assert_eq!(
+            allocator.stats().magazine_cached_bytes,
+            0,
+            "an allocation that named no slot cached nothing"
+        );
+        unsafe { GlobalAlloc::dealloc(&allocator, ptr, layout) };
+
+        let stats = allocator.stats();
+        assert_eq!(stats.allocation_count, 1);
+        assert_eq!(stats.deallocation_count, 1);
+        assert_eq!(stats.requested_live_bytes, 0);
+    }
+
+    /// A block allocated before the front existed is freed into a
+    /// magazine afterwards without unbalancing the heap's own byte
+    /// accounting, because every allocation of a cached class is served
+    /// under the class layout whether a magazine is there or not.
+    #[test]
+    fn a_block_from_before_bring_up_can_be_freed_into_a_magazine() {
+        let allocator = KernelAllocator::<HEAP_ORDER>::empty();
+        let mut heap = Box::new(AlignedHeap([0; TEST_HEAP_BYTES]));
+        let start = heap.0.as_mut_ptr() as usize;
+        unsafe {
+            allocator.add_to_heap(start, start + TEST_HEAP_BYTES);
+        }
+
+        let layout = Layout::from_size_align(48, 8).expect("valid allocation layout");
+        let ptr = unsafe { GlobalAlloc::alloc(&allocator, layout) };
+        assert!(!ptr.is_null());
+        let allocated_before = allocator.stats().allocated_bytes;
+
+        allocator.configure_processors(1);
+        test_support::as_processor(ProcessorId::new(0), || {
+            unsafe { GlobalAlloc::dealloc(&allocator, ptr, layout) };
+            let taken = unsafe { GlobalAlloc::alloc(&allocator, layout) };
+            assert_eq!(taken, ptr, "the magazine served the block back");
+            unsafe { GlobalAlloc::dealloc(&allocator, taken, layout) };
+        });
+
+        // The block is in the magazine, so the heap still counts it as
+        // handed out — and counts exactly the one block, not a rounded
+        // one that would drift the accounting.
+        let stats = allocator.stats();
+        assert_eq!(stats.magazine_cached_bytes, allocated_before);
         assert_eq!(stats.requested_live_bytes, 0);
     }
 }

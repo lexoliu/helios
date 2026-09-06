@@ -1,10 +1,46 @@
+use std::cell::Cell;
 use std::sync::Arc;
 use std::thread;
 
-use helios_hal::cpu::{Cpu, Instant, ProcessorId};
+use helios_hal::cpu::{Cpu, CurrentProcessorSlot, Instant, ProcessorId};
 use helios_hal::entropy::{EntropyQuality, EntropyUnavailable};
 
 use crate::runtime::HostedMachine;
+
+thread_local! {
+    /// Which logical processor this OS thread is running as.
+    ///
+    /// The hosted backend maps one thread to one processor for the
+    /// life of that thread, so this is written once, by the thread
+    /// itself, before it enters the kernel. Threads that are not
+    /// processors — the process's own main thread, the timer thread —
+    /// never write it and answer `None`, which is exactly what
+    /// [`helios_hal::cpu::current_processor_slot`] means by it.
+    static CURRENT_PROCESSOR: Cell<Option<ProcessorId>> = const { Cell::new(None) };
+}
+
+/// Records that this thread runs as `processor`.
+///
+/// Called once, at the top of a processor thread, before anything that
+/// might ask which processor it is.
+pub(crate) fn set_current_processor(processor: ProcessorId) {
+    CURRENT_PROCESSOR.with(|current| current.set(Some(processor)));
+}
+
+/// The processor slot a caller holding no `Cpu` reads.
+///
+/// On bare metal this is a processor-local register; here it is the
+/// thread-local above, for the same reason and with the same contract.
+pub(crate) struct HostedProcessorSlot;
+
+impl CurrentProcessorSlot for HostedProcessorSlot {
+    fn current_slot() -> Option<ProcessorId> {
+        // A thread whose locals have already been torn down is past
+        // any kernel work, so it names no processor rather than
+        // panicking inside an allocation.
+        CURRENT_PROCESSOR.try_with(Cell::get).ok().flatten()
+    }
+}
 
 /// Hosted CPU adapter that exposes one OS thread as one logical processor.
 ///

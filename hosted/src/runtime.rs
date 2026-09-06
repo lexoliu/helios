@@ -276,6 +276,7 @@ fn spawn_processor_thread(
     thread::Builder::new()
         .name(format!("helios-hosted-p{}", processor.id()))
         .spawn(move || {
+            crate::cpu::set_current_processor(processor);
             machine.register_thread(processor, thread::current());
             ready_tx
                 .send(processor)
