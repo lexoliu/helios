@@ -4,11 +4,14 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context as _, Result, bail};
 use clap::{Args as ClapArgs, ValueEnum};
+use helios_inspector_protocol::RpcError;
 use helios_inspector_protocol::debugger::filesystem as debugger_fs;
-use helios_inspector_protocol::system::programs as system_programs;
+use helios_inspector_protocol::system::programs::{self as system_programs, ExecErrorKind};
 use serde::{Deserialize, Serialize};
+
+use crate::programs::ProgramError;
+use crate::system::SystemError;
 
 const HOST_HTTP_LARGE_PAYLOAD_FILE: &str = "payload-64m.bin";
 const WORKLOAD_MANIFEST_SCHEMA_VERSION: u16 = 2;
@@ -61,6 +64,302 @@ pub(crate) enum WorkloadBenchError {
          already recorded, so the guest is torn down rather than waited on"
     )]
     GuestStepTimedOut { step: &'static str, seconds: u32 },
+    #[error("workload-bench --iterations must be non-zero")]
+    ZeroIterations,
+    #[error("{source}")]
+    Selection {
+        #[from]
+        source: WorkloadSelectionError,
+    },
+    #[error("{source}")]
+    Input {
+        #[from]
+        source: WorkloadInputError,
+    },
+    #[error("failed to run workload {workload}: {source}")]
+    RunWorkload {
+        workload: String,
+        #[source]
+        source: ProgramError,
+    },
+    #[error("workload {workload} exited with code {exit_code}{stderr}")]
+    WorkloadExited {
+        workload: String,
+        exit_code: u32,
+        /// The tail of the workload's own stderr, already folded onto one
+        /// line by [`quoted_stderr`].
+        stderr: String,
+    },
+    #[error("failed to read AOT workload wasm {path}: {source}")]
+    ReadAotWasm {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to upload {path}: {source}")]
+    UploadAotWasm {
+        path: String,
+        #[source]
+        source: RpcError,
+    },
+    #[error("failed to AOT compile workload {workload}: {source}")]
+    AotCompile {
+        workload: String,
+        #[source]
+        source: RpcError,
+    },
+    #[error("remote AOT workload {workload} failed: {kind:?}: {detail}")]
+    AotRefused {
+        workload: String,
+        kind: ExecErrorKind,
+        detail: String,
+    },
+    #[error("workload {workload} iteration {iteration} failed validation: {source}")]
+    Validation {
+        workload: String,
+        iteration: u16,
+        #[source]
+        source: WorkloadOutputError,
+    },
+    #[error("{source}")]
+    Output {
+        #[from]
+        source: WorkloadOutputError,
+    },
+    #[error("cannot compute median for empty sample set")]
+    EmptyMedianSample,
+    #[error("failed to write the workload bench record stream: {source}")]
+    WriteRecord {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to encode a workload bench record: {source}")]
+    EncodeRecord {
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("{source}")]
+    Guest {
+        #[from]
+        source: SystemError,
+    },
+    #[error("{source}")]
+    HostCpu {
+        #[from]
+        source: HostCpuError,
+    },
+}
+
+impl WorkloadBenchError {
+    /// The guest's panic report when this failure is a dead guest.
+    ///
+    /// A panicked kernel answers no further RPC, so the transport
+    /// reports it as a typed fault rather than letting the read block
+    /// until the outer deadline; the bench driver has to tell that apart
+    /// from a workload that merely failed. The walk is over this enum's
+    /// own variants, so a variant that gains an RPC source has to say
+    /// here whether it can carry a panic.
+    pub(crate) fn guest_panic(&self) -> Option<&str> {
+        match self {
+            Self::RunWorkload { source, .. } => source.guest_panic(),
+            Self::UploadAotWasm { source, .. } | Self::AotCompile { source, .. } => {
+                source.guest_panic()
+            }
+            Self::Guest { source } => source.guest_panic(),
+            Self::WorkloadTimedOut { .. }
+            | Self::GuestStepTimedOut { .. }
+            | Self::ZeroIterations
+            | Self::Selection { .. }
+            | Self::Input { .. }
+            | Self::WorkloadExited { .. }
+            | Self::ReadAotWasm { .. }
+            | Self::AotRefused { .. }
+            | Self::Validation { .. }
+            | Self::Output { .. }
+            | Self::EmptyMedianSample
+            | Self::WriteRecord { .. }
+            | Self::EncodeRecord { .. }
+            | Self::HostCpu { .. } => None,
+        }
+    }
+}
+
+/// Why the run has no usable set of workloads to measure.
+///
+/// Every variant is a manifest or a command line the run refuses before
+/// it boots anything: the manifest could not be read, its schema is not
+/// the one this inspector speaks, the selection matched nothing, or an
+/// entry does not carry what its runner needs.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum WorkloadSelectionError {
+    #[error("failed to read workload manifest {path}: {source}")]
+    ReadManifest {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to decode workload manifest {path}: {source}")]
+    DecodeManifest {
+        path: String,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("unsupported workload manifest schema_version {found}, expected {expected}")]
+    ManifestSchema { found: u16, expected: u16 },
+    #[error("workload selection matched no manifest entries")]
+    NoEntriesSelected,
+    #[error("unknown or filtered workload {requested}")]
+    UnknownWorkload { requested: String },
+    #[error("{runner} workload {workload} is missing {field}")]
+    MissingField {
+        /// The runner the manifest entry named, spelled as the message
+        /// reads it.
+        runner: &'static str,
+        workload: String,
+        /// The manifest key the entry has to carry for that runner.
+        field: &'static str,
+    },
+    #[error("workload {workload} is missing command")]
+    MissingCommand { workload: String },
+}
+
+/// Why a workload cannot be rendered for this run.
+///
+/// A workload's script names the host endpoints it needs, and the run
+/// carries them as flags. Each variant names the workload and the flag,
+/// because the fix is always to pass that flag to that run.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum WorkloadInputError {
+    #[error("workload {workload} requires {flags} for VM-visible {purpose}")]
+    MissingHostEndpoint {
+        workload: String,
+        /// The flag or flags the workload needs, spelled as the message
+        /// reads them.
+        flags: &'static str,
+        /// What those flags provide.
+        purpose: &'static str,
+    },
+    #[error("host HTTP URL has no path segment: {url}")]
+    HostHttpUrlHasNoPath { url: String },
+}
+
+/// Why a workload's own output is not the output the manifest describes.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum WorkloadOutputError {
+    #[error("workload {workload} stdout did not contain expected text {expected:?}")]
+    StdoutMissingText { workload: String, expected: String },
+    #[error("workload {workload} wrote stderr")]
+    WroteStderr { workload: String },
+    #[error("metric line {line:?} has no `=`")]
+    MetricLineHasNoAssignment { line: String },
+    #[error("metric line {line:?} has a non-numeric value: {source}")]
+    MetricValueNotNumeric {
+        line: String,
+        #[source]
+        source: core::num::ParseFloatError,
+    },
+    #[error("metric {name:?} was reported twice")]
+    DuplicateMetric { name: String },
+    #[error("failed to write the workload output report: {source}")]
+    Write {
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+/// Why the run could not name the host CPU it measured on.
+///
+/// The model has no fallback — an architecture in its place would let a
+/// cross-run comparison believe two machines were one — so every way of
+/// failing to read it names the source it was reading.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum HostCpuError {
+    #[cfg_attr(
+        not(target_os = "linux"),
+        expect(
+            dead_code,
+            reason = "only a Linux host reads the model out of /proc/cpuinfo"
+        )
+    )]
+    #[error("failed to read /proc/cpuinfo for the host CPU model: {source}")]
+    ReadCpuinfo {
+        #[source]
+        source: std::io::Error,
+    },
+    #[cfg_attr(
+        not(target_os = "linux"),
+        expect(
+            dead_code,
+            reason = "only a Linux host reads the model out of /proc/cpuinfo"
+        )
+    )]
+    #[error("/proc/cpuinfo names no non-empty `model name`")]
+    CpuinfoHasNoModelName,
+    #[cfg_attr(
+        not(target_os = "macos"),
+        expect(dead_code, reason = "only a macOS host reads the model out of sysctl")
+    )]
+    #[error("failed to spawn sysctl -n {SYSCTL_CPU_BRAND_KEY}: {source}")]
+    SpawnSysctl {
+        #[source]
+        source: std::io::Error,
+    },
+    #[cfg_attr(
+        not(target_os = "macos"),
+        expect(dead_code, reason = "only a macOS host reads the model out of sysctl")
+    )]
+    #[error("sysctl -n {SYSCTL_CPU_BRAND_KEY} exited with status {status}")]
+    SysctlExited { status: std::process::ExitStatus },
+    #[cfg_attr(
+        not(target_os = "macos"),
+        expect(dead_code, reason = "only a macOS host reads the model out of sysctl")
+    )]
+    #[error("sysctl -n {SYSCTL_CPU_BRAND_KEY} output was not UTF-8: {source}")]
+    SysctlNotUtf8 {
+        #[source]
+        source: std::string::FromUtf8Error,
+    },
+    #[cfg_attr(
+        not(target_os = "macos"),
+        expect(dead_code, reason = "only a macOS host reads the model out of sysctl")
+    )]
+    #[error("sysctl -n {SYSCTL_CPU_BRAND_KEY} printed nothing")]
+    SysctlPrintedNothing,
+    #[cfg_attr(
+        any(target_os = "linux", target_os = "macos"),
+        expect(
+            dead_code,
+            reason = "this host has one of the two sources the run record accepts"
+        )
+    )]
+    #[error(
+        "no host CPU model source on this platform: the run record needs /proc/cpuinfo \
+         (Linux) or sysctl {SYSCTL_CPU_BRAND_KEY} (macOS)"
+    )]
+    UnsupportedPlatform,
+}
+
+/// The sysctl key naming the CPU model on macOS.
+///
+/// Named separately so every message renders the same key the reader
+/// asks for, on every host.
+const SYSCTL_CPU_BRAND_KEY: &str = "machdep.cpu.brand_string";
+
+/// Why the run could not name the revision it measured.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum GitShaError {
+    #[error("failed to spawn git rev-parse HEAD: {source}")]
+    Spawn {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("git rev-parse HEAD exited with status {status}")]
+    Exited { status: std::process::ExitStatus },
+    #[error("git rev-parse HEAD output was not UTF-8: {source}")]
+    NotUtf8 {
+        #[source]
+        source: std::string::FromUtf8Error,
+    },
 }
 
 #[derive(Debug, Clone, ClapArgs)]
@@ -284,7 +583,9 @@ struct ValidationSummary {
     ok: bool,
 }
 
-pub(crate) fn required_boot_programs(command: &WorkloadBenchCommand) -> Result<Vec<String>> {
+pub(crate) fn required_boot_programs(
+    command: &WorkloadBenchCommand,
+) -> Result<Vec<String>, WorkloadSelectionError> {
     let workloads = select_workloads(command)?;
     let mut programs = vec!["dash".to_owned(), "debugger".to_owned()];
     for workload in workloads {
@@ -302,9 +603,9 @@ pub(crate) async fn run_inner(
     client: &mut crate::serial::RpcClient,
     command: &WorkloadBenchCommand,
     provenance: &VmProvenance,
-) -> Result<()> {
+) -> Result<(), WorkloadBenchError> {
     if command.iterations == 0 {
-        bail!("workload-bench --iterations must be non-zero");
+        return Err(WorkloadBenchError::ZeroIterations);
     }
     let manifest_path = command.manifest.clone();
     let workloads = select_workloads(command)?;
@@ -327,7 +628,7 @@ pub(crate) async fn run_inner(
     while let Some(workload) = remaining.next() {
         let elapsed_ms = match measure_workload(client, &workload, command).await {
             Ok(elapsed_ms) => elapsed_ms,
-            Err(error) if guest_panic(&error).is_some() => {
+            Err(error) if error.guest_panic().is_some() => {
                 // The guest kernel is gone: every further workload would
                 // measure a corpse. Record what this one and each of the
                 // ones behind it never got to measure, so the report
@@ -340,10 +641,10 @@ pub(crate) async fn run_inner(
                 let report = format!(
                     "guest kernel panicked during {}: {}",
                     workload.name,
-                    guest_panic(&error).unwrap_or_default()
+                    error.guest_panic().unwrap_or_default()
                 );
                 eprintln!(
-                    "helios-inspector: workload {} killed the guest; recording the rest as failed: {error:#}",
+                    "helios-inspector: workload {} killed the guest; recording the rest as failed: {error}",
                     workload.name
                 );
                 for pending in core::iter::once(workload).chain(remaining) {
@@ -361,7 +662,7 @@ pub(crate) async fn run_inner(
             }
             Err(error) if command.keep_going => {
                 eprintln!(
-                    "helios-inspector: workload {} failed; recorded and continuing: {error:#}",
+                    "helios-inspector: workload {} failed; recorded and continuing: {error}",
                     workload.name
                 );
                 write_record(&JsonlRecord::Failure {
@@ -369,7 +670,7 @@ pub(crate) async fn run_inner(
                     class: workload.class,
                     headline: workload.headline,
                     runner: workload.runner,
-                    error: format!("{error:#}"),
+                    error: error.to_string(),
                 })?;
                 failed.push(workload.name.clone());
                 continue;
@@ -405,25 +706,12 @@ fn report_failed(failed: &[String]) {
     );
 }
 
-/// The guest's panic report when this error is a dead guest.
-///
-/// A panicked kernel answers no further RPC, so the transport reports it
-/// as a typed fault rather than letting the read block until the outer
-/// deadline; the bench driver has to tell that apart from a workload
-/// that merely failed.
-fn guest_panic(error: &anyhow::Error) -> Option<&str> {
-    error
-        .chain()
-        .filter_map(|cause| cause.downcast_ref::<helios_inspector_protocol::RpcError>())
-        .find_map(helios_inspector_protocol::RpcError::guest_panic)
-}
-
 /// Times every iteration of one workload, writing its iteration records.
 async fn measure_workload(
     client: &mut crate::serial::RpcClient,
     workload: &Workload,
     command: &WorkloadBenchCommand,
-) -> Result<Vec<u128>> {
+) -> Result<Vec<u128>, WorkloadBenchError> {
     let mut elapsed_ms = Vec::new();
     for iteration in 1..=command.iterations {
         let attempt = match workload.runner {
@@ -462,17 +750,15 @@ async fn measure_workload(
                 return Err(error);
             }
         };
-        let validation = match validate_output(workload, &output.stdout, &output.stderr)
-            .with_context(|| {
-                format!(
-                    "workload {} iteration {} failed validation",
-                    workload.name, iteration
-                )
-            }) {
+        let validation = match validate_output(workload, &output.stdout, &output.stderr) {
             Ok(validation) => validation,
-            Err(error) => {
+            Err(source) => {
                 write_guest_network_counters(client, workload, iteration).await;
-                return Err(error);
+                return Err(WorkloadBenchError::Validation {
+                    workload: workload.name.clone(),
+                    iteration,
+                    source,
+                });
             }
         };
         elapsed_ms.push(output.elapsed_ms);
@@ -519,8 +805,8 @@ async fn under_deadline(
     workload: &Workload,
     iteration: u16,
     command: &WorkloadBenchCommand,
-    run: impl Future<Output = Result<WorkloadOutput>>,
-) -> Result<WorkloadOutput> {
+    run: impl Future<Output = Result<WorkloadOutput, WorkloadBenchError>>,
+) -> Result<WorkloadOutput, WorkloadBenchError> {
     let seconds = command.workload_timeout_seconds;
     let Some(result) = crate::runtime::timeout(Duration::from_secs(u64::from(seconds)), run).await
     else {
@@ -528,8 +814,7 @@ async fn under_deadline(
             workload: workload.name.clone(),
             iteration,
             seconds,
-        }
-        .into());
+        });
     };
     result
 }
@@ -543,11 +828,14 @@ async fn under_deadline(
 /// the run's last words are the last workload's, and the process sits on
 /// a dead VM until something outside it notices: run 33952047436 spent
 /// ninety-five minutes that way, holding QEMU open behind it.
-pub(crate) async fn guest_step_under_deadline<T>(
+pub(crate) async fn guest_step_under_deadline<T, E>(
     step: &'static str,
     seconds: u32,
-    run: impl Future<Output = Result<T>>,
-) -> Result<T> {
+    run: impl Future<Output = Result<T, E>>,
+) -> Result<T, E>
+where
+    E: From<WorkloadBenchError>,
+{
     let Some(result) = crate::runtime::timeout(Duration::from_secs(u64::from(seconds)), run).await
     else {
         return Err(WorkloadBenchError::GuestStepTimedOut { step, seconds }.into());
@@ -559,12 +847,14 @@ async fn run_shell_workload(
     client: &mut crate::serial::RpcClient,
     workload: &Workload,
     command: &WorkloadBenchCommand,
-) -> Result<WorkloadOutput> {
+) -> Result<WorkloadOutput, WorkloadBenchError> {
     let script = render_helios_template(
         workload
             .command
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("workload {} is missing command", workload.name))?,
+            .ok_or_else(|| WorkloadSelectionError::MissingCommand {
+                workload: workload.name.clone(),
+            })?,
         workload,
         command,
     )?;
@@ -575,16 +865,18 @@ async fn run_shell_workload(
         &["-c".to_owned(), script],
     )
     .await
-    .with_context(|| format!("failed to run workload {}", workload.name))?;
+    .map_err(|source| WorkloadBenchError::RunWorkload {
+        workload: workload.name.clone(),
+        source,
+    })?;
     let elapsed_ms = started.elapsed().as_millis();
     if output.exit_code != 0 {
         write_guest_output(workload, &output.output.stdout, &output.output.stderr)?;
-        bail!(
-            "workload {} exited with code {}{}",
-            workload.name,
-            output.exit_code,
-            quoted_stderr(&output.output.stderr)
-        );
+        return Err(WorkloadBenchError::WorkloadExited {
+            workload: workload.name.clone(),
+            exit_code: output.exit_code,
+            stderr: quoted_stderr(&output.output.stderr),
+        });
     }
     Ok(WorkloadOutput {
         elapsed_ms,
@@ -597,11 +889,16 @@ async fn run_program_workload(
     client: &mut crate::serial::RpcClient,
     workload: &Workload,
     command: &WorkloadBenchCommand,
-) -> Result<WorkloadOutput> {
+) -> Result<WorkloadOutput, WorkloadBenchError> {
     let program = render_helios_template(
-        workload.program.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("program workload {} is missing program", workload.name)
-        })?,
+        workload
+            .program
+            .as_ref()
+            .ok_or_else(|| WorkloadSelectionError::MissingField {
+                runner: "program",
+                workload: workload.name.clone(),
+                field: "program",
+            })?,
         workload,
         command,
     )?;
@@ -609,20 +906,22 @@ async fn run_program_workload(
         .args
         .iter()
         .map(|arg| render_helios_template(arg, workload, command))
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<Result<Vec<_>, WorkloadInputError>>()?;
     let started = Instant::now();
     let output = crate::programs::exec(client, &program, &args)
         .await
-        .with_context(|| format!("failed to run workload {}", workload.name))?;
+        .map_err(|source| WorkloadBenchError::RunWorkload {
+            workload: workload.name.clone(),
+            source,
+        })?;
     let elapsed_ms = started.elapsed().as_millis();
     if output.exit_code != 0 {
         write_guest_output(workload, &output.output.stdout, &output.output.stderr)?;
-        bail!(
-            "workload {} exited with code {}{}",
-            workload.name,
-            output.exit_code,
-            quoted_stderr(&output.output.stderr)
-        );
+        return Err(WorkloadBenchError::WorkloadExited {
+            workload: workload.name.clone(),
+            exit_code: output.exit_code,
+            stderr: quoted_stderr(&output.output.stderr),
+        });
     }
     Ok(WorkloadOutput {
         elapsed_ms,
@@ -635,24 +934,35 @@ async fn run_aot_workload(
     client: &crate::serial::RpcClient,
     workload: &Workload,
     iteration: u16,
-) -> Result<WorkloadOutput> {
+) -> Result<WorkloadOutput, WorkloadBenchError> {
+    let missing = |field| WorkloadSelectionError::MissingField {
+        runner: "AOT",
+        workload: workload.name.clone(),
+        field,
+    };
     let wasm_path = workload
         .wasm_path
         .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("AOT workload {} is missing wasm_path", workload.name))?;
+        .ok_or_else(|| missing("wasm_path"))?;
     let remote_path = workload
         .remote_path
         .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("AOT workload {} is missing remote_path", workload.name))?;
-    let destination_path = workload.destination_path.as_ref().ok_or_else(|| {
-        anyhow::anyhow!("AOT workload {} is missing destination_path", workload.name)
+        .ok_or_else(|| missing("remote_path"))?;
+    let destination_path = workload
+        .destination_path
+        .as_ref()
+        .ok_or_else(|| missing("destination_path"))?;
+    let wasm = fs::read(wasm_path).map_err(|source| WorkloadBenchError::ReadAotWasm {
+        path: wasm_path.display().to_string(),
+        source,
     })?;
-    let wasm = fs::read(wasm_path)
-        .with_context(|| format!("failed to read AOT workload wasm {}", wasm_path.display()))?;
     if iteration == 1 {
         debugger_fs::write(client, remote_path, &wasm, false)
             .await
-            .with_context(|| format!("failed to upload {}", wasm_path.display()))?;
+            .map_err(|source| WorkloadBenchError::UploadAotWasm {
+                path: wasm_path.display().to_string(),
+                source,
+            })?;
     }
 
     let started = Instant::now();
@@ -666,14 +976,14 @@ async fn run_aot_workload(
         },
     )
     .await
-    .with_context(|| format!("failed to AOT compile workload {}", workload.name))?;
-    outcome.map_err(|error| {
-        anyhow::anyhow!(
-            "remote AOT workload {} failed: {:?}: {}",
-            workload.name,
-            error.kind,
-            error.detail
-        )
+    .map_err(|source| WorkloadBenchError::AotCompile {
+        workload: workload.name.clone(),
+        source,
+    })?;
+    outcome.map_err(|error| WorkloadBenchError::AotRefused {
+        workload: workload.name.clone(),
+        kind: error.kind,
+        detail: error.detail,
     })?;
     Ok(WorkloadOutput {
         elapsed_ms: started.elapsed().as_millis(),
@@ -682,7 +992,9 @@ async fn run_aot_workload(
     })
 }
 
-fn select_workloads(command: &WorkloadBenchCommand) -> Result<Vec<Workload>> {
+fn select_workloads(
+    command: &WorkloadBenchCommand,
+) -> Result<Vec<Workload>, WorkloadSelectionError> {
     let manifest = load_manifest(&command.manifest)?;
     let mut selected = Vec::new();
     for workload in manifest.workloads {
@@ -699,43 +1011,55 @@ fn select_workloads(command: &WorkloadBenchCommand) -> Result<Vec<Workload>> {
     }
 
     if selected.is_empty() {
-        bail!("workload selection matched no manifest entries");
+        return Err(WorkloadSelectionError::NoEntriesSelected);
     }
     if !command.workloads.is_empty() {
         for requested in &command.workloads {
             if !selected.iter().any(|workload| &workload.name == requested) {
-                bail!("unknown or filtered workload {requested}");
+                return Err(WorkloadSelectionError::UnknownWorkload {
+                    requested: requested.clone(),
+                });
             }
         }
     }
     Ok(selected)
 }
 
-fn load_manifest(path: &Path) -> Result<WorkloadManifest> {
-    let bytes = fs::read(path)
-        .with_context(|| format!("failed to read workload manifest {}", path.display()))?;
-    let manifest: WorkloadManifest = serde_json::from_slice(&bytes)
-        .with_context(|| format!("failed to decode workload manifest {}", path.display()))?;
+fn load_manifest(path: &Path) -> Result<WorkloadManifest, WorkloadSelectionError> {
+    let bytes = fs::read(path).map_err(|source| WorkloadSelectionError::ReadManifest {
+        path: path.display().to_string(),
+        source,
+    })?;
+    let manifest: WorkloadManifest = serde_json::from_slice(&bytes).map_err(|source| {
+        WorkloadSelectionError::DecodeManifest {
+            path: path.display().to_string(),
+            source,
+        }
+    })?;
     if manifest.schema_version != WORKLOAD_MANIFEST_SCHEMA_VERSION {
-        bail!(
-            "unsupported workload manifest schema_version {}, expected {}",
-            manifest.schema_version,
-            WORKLOAD_MANIFEST_SCHEMA_VERSION
-        );
+        return Err(WorkloadSelectionError::ManifestSchema {
+            found: manifest.schema_version,
+            expected: WORKLOAD_MANIFEST_SCHEMA_VERSION,
+        });
     }
     Ok(manifest)
 }
 
-fn validate_workload_shape(workload: &Workload) -> Result<()> {
+fn validate_workload_shape(workload: &Workload) -> Result<(), WorkloadSelectionError> {
+    let missing = |runner, field| WorkloadSelectionError::MissingField {
+        runner,
+        workload: workload.name.clone(),
+        field,
+    };
     match workload.runner {
         WorkloadRunner::Shell => {
             if workload.command.is_none() {
-                bail!("shell workload {} is missing command", workload.name);
+                return Err(missing("shell", "command"));
             }
         }
         WorkloadRunner::Program => {
             if workload.program.is_none() {
-                bail!("program workload {} is missing program", workload.name);
+                return Err(missing("program", "program"));
             }
         }
         WorkloadRunner::HeliosAot => {
@@ -743,7 +1067,7 @@ fn validate_workload_shape(workload: &Workload) -> Result<()> {
                 || workload.remote_path.is_none()
                 || workload.destination_path.is_none()
             {
-                bail!("AOT workload {} is missing AOT paths", workload.name);
+                return Err(missing("AOT", "AOT paths"));
             }
         }
     }
@@ -754,7 +1078,12 @@ fn render_helios_template(
     template: &str,
     workload: &Workload,
     command: &WorkloadBenchCommand,
-) -> Result<String> {
+) -> Result<String, WorkloadInputError> {
+    let missing = |flags, purpose| WorkloadInputError::MissingHostEndpoint {
+        workload: workload.name.clone(),
+        flags,
+        purpose,
+    };
     let mut rendered = template.to_owned();
     for (placeholder, value) in [
         // Scratch files live at the embedded filesystem root inside the
@@ -776,70 +1105,52 @@ fn render_helios_template(
         rendered = rendered.replace(placeholder, value);
     }
     if workload.requires_host_http && command.host_http_url.is_none() {
-        bail!(
-            "workload {} requires --host-http-url for VM-visible host HTTP",
-            workload.name
-        );
+        return Err(missing("--host-http-url", "host HTTP"));
     }
     if rendered.contains("{host_http_url}") {
-        let url = command.host_http_url.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "workload {} requires --host-http-url for VM-visible host HTTP",
-                workload.name
-            )
-        })?;
+        let url = command
+            .host_http_url
+            .as_ref()
+            .ok_or_else(|| missing("--host-http-url", "host HTTP"))?;
         rendered = rendered.replace("{host_http_url}", url);
     }
     if rendered.contains("{host_http_large_url}") {
-        let url = command.host_http_url.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "workload {} requires --host-http-url for VM-visible host HTTP",
-                workload.name
-            )
-        })?;
+        let url = command
+            .host_http_url
+            .as_ref()
+            .ok_or_else(|| missing("--host-http-url", "host HTTP"))?;
         rendered = rendered.replace("{host_http_large_url}", &large_host_http_url(url)?);
     }
     if workload.requires_host_tcp
         && (command.host_tcp_host.is_none() || command.host_tcp_port.is_none())
     {
-        bail!(
-            "workload {} requires --host-tcp-host and --host-tcp-port for VM-visible host TCP",
-            workload.name
-        );
+        return Err(missing("--host-tcp-host and --host-tcp-port", "host TCP"));
     }
     if rendered.contains("{host_tcp_host}") {
-        let host = command.host_tcp_host.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "workload {} requires --host-tcp-host for VM-visible host TCP",
-                workload.name
-            )
-        })?;
+        let host = command
+            .host_tcp_host
+            .as_ref()
+            .ok_or_else(|| missing("--host-tcp-host", "host TCP"))?;
         rendered = rendered.replace("{host_tcp_host}", host);
     }
     if rendered.contains("{host_tcp_port}") {
-        let port = command.host_tcp_port.ok_or_else(|| {
-            anyhow::anyhow!(
-                "workload {} requires --host-tcp-port for VM-visible host TCP",
-                workload.name
-            )
-        })?;
+        let port = command
+            .host_tcp_port
+            .ok_or_else(|| missing("--host-tcp-port", "host TCP"))?;
         rendered = rendered.replace("{host_tcp_port}", &port.to_string());
     }
     if workload.requires_host_tcp_echo
         && (command.host_tcp_host.is_none() || command.host_tcp_echo_port.is_none())
     {
-        bail!(
-            "workload {} requires --host-tcp-host and --host-tcp-echo-port for VM-visible host TCP echo",
-            workload.name
-        );
+        return Err(missing(
+            "--host-tcp-host and --host-tcp-echo-port",
+            "host TCP echo",
+        ));
     }
     if rendered.contains("{host_tcp_echo_port}") {
-        let port = command.host_tcp_echo_port.ok_or_else(|| {
-            anyhow::anyhow!(
-                "workload {} requires --host-tcp-echo-port for VM-visible host TCP echo",
-                workload.name
-            )
-        })?;
+        let port = command
+            .host_tcp_echo_port
+            .ok_or_else(|| missing("--host-tcp-echo-port", "host TCP echo"))?;
         rendered = rendered.replace("{host_tcp_echo_port}", &port.to_string());
     }
     Ok(rendered)
@@ -849,48 +1160,62 @@ fn render_helios_template(
 ///
 /// A malformed metric line is a workload bug, not noise to skip: the
 /// report would silently lose the measurement the workload exists for.
-fn parse_metrics(stdout: &[u8]) -> Result<BTreeMap<String, f64>> {
+fn parse_metrics(stdout: &[u8]) -> Result<BTreeMap<String, f64>, WorkloadOutputError> {
     let mut metrics = BTreeMap::new();
     for line in String::from_utf8_lossy(stdout).lines() {
         let Some(assignment) = line.strip_prefix(METRIC_LINE_PREFIX) else {
             continue;
         };
-        let (name, value) = assignment
-            .split_once('=')
-            .ok_or_else(|| anyhow::anyhow!("metric line {line:?} has no `=`"))?;
-        let value = value
-            .trim()
-            .parse::<f64>()
-            .with_context(|| format!("metric line {line:?} has a non-numeric value"))?;
+        let (name, value) = assignment.split_once('=').ok_or_else(|| {
+            WorkloadOutputError::MetricLineHasNoAssignment {
+                line: line.to_owned(),
+            }
+        })?;
+        let value = value.trim().parse::<f64>().map_err(|source| {
+            WorkloadOutputError::MetricValueNotNumeric {
+                line: line.to_owned(),
+                source,
+            }
+        })?;
         if metrics.insert(name.trim().to_owned(), value).is_some() {
-            bail!("metric {name:?} was reported twice");
+            return Err(WorkloadOutputError::DuplicateMetric {
+                name: name.to_owned(),
+            });
         }
     }
     Ok(metrics)
 }
 
-fn large_host_http_url(host_http_url: &str) -> Result<String> {
-    let (prefix, _) = host_http_url
-        .rsplit_once('/')
-        .ok_or_else(|| anyhow::anyhow!("host HTTP URL has no path segment: {host_http_url}"))?;
+fn large_host_http_url(host_http_url: &str) -> Result<String, WorkloadInputError> {
+    let (prefix, _) =
+        host_http_url
+            .rsplit_once('/')
+            .ok_or_else(|| WorkloadInputError::HostHttpUrlHasNoPath {
+                url: host_http_url.to_owned(),
+            })?;
     Ok(format!("{prefix}/{HOST_HTTP_LARGE_PAYLOAD_FILE}"))
 }
 
-fn validate_output(workload: &Workload, stdout: &[u8], stderr: &[u8]) -> Result<ValidationSummary> {
+fn validate_output(
+    workload: &Workload,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> Result<ValidationSummary, WorkloadOutputError> {
     let stdout_text = String::from_utf8_lossy(stdout);
     for expected in &workload.stdout_contains {
         if !stdout_text.contains(expected) {
             write_guest_output(workload, stdout, stderr)?;
-            bail!(
-                "workload {} stdout did not contain expected text {:?}",
-                workload.name,
-                expected
-            );
+            return Err(WorkloadOutputError::StdoutMissingText {
+                workload: workload.name.clone(),
+                expected: expected.clone(),
+            });
         }
     }
     if workload.stderr_empty && !stderr.is_empty() {
         write_guest_output(workload, stdout, stderr)?;
-        bail!("workload {} wrote stderr", workload.name);
+        return Err(WorkloadOutputError::WroteStderr {
+            workload: workload.name.clone(),
+        });
     }
     Ok(ValidationSummary { ok: true })
 }
@@ -919,9 +1244,9 @@ fn stream_validation<'a>(
     }
 }
 
-fn median(values: &[u128]) -> Result<u128> {
+fn median(values: &[u128]) -> Result<u128, WorkloadBenchError> {
     if values.is_empty() {
-        bail!("cannot compute median for empty sample set");
+        return Err(WorkloadBenchError::EmptyMedianSample);
     }
     let mut sorted = values.to_vec();
     sorted.sort_unstable();
@@ -946,12 +1271,12 @@ fn extend_unique(programs: &mut Vec<String>, required: &[String]) {
     }
 }
 
-fn write_record(record: &JsonlRecord<'_>) -> Result<()> {
+fn write_record(record: &JsonlRecord<'_>) -> Result<(), WorkloadBenchError> {
     use std::io::Write as _;
     let mut stdout = std::io::stdout().lock();
-    serde_json::to_writer(&mut stdout, record)?;
-    writeln!(stdout)?;
-    Ok(())
+    serde_json::to_writer(&mut stdout, record)
+        .map_err(|source| WorkloadBenchError::EncodeRecord { source })?;
+    writeln!(stdout).map_err(|source| WorkloadBenchError::WriteRecord { source })
 }
 
 /// The tail of a failing workload's stderr, folded onto one line for the
@@ -991,14 +1316,18 @@ fn quoted_stderr(stderr: &[u8]) -> String {
 /// which stream it came from. Both streams go to stderr here, which is
 /// where a lane log collects them, and each one is named so the log
 /// says what the workload saw rather than only that it failed.
-fn write_guest_output(workload: &Workload, stdout: &[u8], stderr: &[u8]) -> Result<()> {
+fn write_guest_output(
+    workload: &Workload,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> Result<(), WorkloadOutputError> {
     use std::io::Write as _;
     let mut sink = std::io::stderr().lock();
-    writeln!(sink, "--- workload {} output ---", workload.name)?;
-    write_guest_stream(&mut sink, "stdout", stdout)?;
-    write_guest_stream(&mut sink, "stderr", stderr)?;
-    writeln!(sink, "--- end of workload {} output ---", workload.name)?;
-    Ok(())
+    writeln!(sink, "--- workload {} output ---", workload.name)
+        .and_then(|()| write_guest_stream(&mut sink, "stdout", stdout))
+        .and_then(|()| write_guest_stream(&mut sink, "stderr", stderr))
+        .and_then(|()| writeln!(sink, "--- end of workload {} output ---", workload.name))
+        .map_err(|source| WorkloadOutputError::Write { source })
 }
 
 /// Prints the guest's per-shard network counters after a failed
@@ -1026,7 +1355,7 @@ async fn write_guest_network_counters(
     let sample = guest_step_under_deadline(
         "network counters",
         NETWORK_COUNTER_DEADLINE_SECONDS,
-        crate::system::fetch_stats(client),
+        async { Ok::<_, WorkloadBenchError>(crate::system::fetch_stats(client).await?) },
     )
     .await;
     let mut sink = std::io::stderr().lock();
@@ -1075,7 +1404,11 @@ async fn write_guest_network_counters(
 /// One named stream of a failing workload's output. An empty stream is
 /// said to be empty rather than left out: "the guest printed nothing"
 /// and "the runner did not capture this" are different failures.
-fn write_guest_stream(sink: &mut impl std::io::Write, name: &str, bytes: &[u8]) -> Result<()> {
+fn write_guest_stream(
+    sink: &mut impl std::io::Write,
+    name: &str,
+    bytes: &[u8],
+) -> std::io::Result<()> {
     if bytes.is_empty() {
         writeln!(sink, "{name}: <empty>")?;
         return Ok(());
@@ -1093,60 +1426,60 @@ fn write_guest_stream(sink: &mut impl std::io::Write, name: &str, bytes: &[u8]) 
 /// There is no fallback: a run record that named the architecture instead
 /// of the model would let a cross-run comparison believe two machines
 /// were one. Where the model cannot be read the run fails and says so.
-fn host_cpu() -> Result<String> {
+fn host_cpu() -> Result<String, HostCpuError> {
     #[cfg(target_os = "linux")]
     {
         const CPUINFO: &str = "/proc/cpuinfo";
-        let cpuinfo = fs::read_to_string(CPUINFO)
-            .with_context(|| format!("failed to read {CPUINFO} for the host CPU model"))?;
+        let cpuinfo =
+            fs::read_to_string(CPUINFO).map_err(|source| HostCpuError::ReadCpuinfo { source })?;
         cpuinfo
             .lines()
             .filter_map(|line| line.split_once(':'))
             .find(|(key, _)| key.trim() == "model name")
             .map(|(_, value)| value.trim().to_owned())
             .filter(|model| !model.is_empty())
-            .with_context(|| format!("{CPUINFO} names no non-empty `model name`"))
+            .ok_or(HostCpuError::CpuinfoHasNoModelName)
     }
     #[cfg(target_os = "macos")]
     {
-        const KEY: &str = "machdep.cpu.brand_string";
         let output = std::process::Command::new("sysctl")
             .arg("-n")
-            .arg(KEY)
+            .arg(SYSCTL_CPU_BRAND_KEY)
             .output()
-            .with_context(|| format!("failed to spawn sysctl -n {KEY}"))?;
+            .map_err(|source| HostCpuError::SpawnSysctl { source })?;
         if !output.status.success() {
-            bail!("sysctl -n {KEY} exited with status {}", output.status);
+            return Err(HostCpuError::SysctlExited {
+                status: output.status,
+            });
         }
         let model = String::from_utf8(output.stdout)
-            .with_context(|| format!("sysctl -n {KEY} output was not UTF-8"))?
+            .map_err(|source| HostCpuError::SysctlNotUtf8 { source })?
             .trim()
             .to_owned();
         if model.is_empty() {
-            bail!("sysctl -n {KEY} printed nothing");
+            return Err(HostCpuError::SysctlPrintedNothing);
         }
         Ok(model)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        bail!(
-            "no host CPU model source on this platform: the run record needs /proc/cpuinfo \
-             (Linux) or sysctl machdep.cpu.brand_string (macOS)"
-        )
+        Err(HostCpuError::UnsupportedPlatform)
     }
 }
 
-fn git_sha() -> Result<String> {
+fn git_sha() -> Result<String, GitShaError> {
     let output = std::process::Command::new("git")
         .arg("rev-parse")
         .arg("HEAD")
         .output()
-        .context("failed to spawn git rev-parse HEAD")?;
+        .map_err(|source| GitShaError::Spawn { source })?;
     if !output.status.success() {
-        bail!("git rev-parse HEAD exited with status {}", output.status);
+        return Err(GitShaError::Exited {
+            status: output.status,
+        });
     }
     Ok(String::from_utf8(output.stdout)
-        .context("git rev-parse HEAD output was not UTF-8")?
+        .map_err(|source| GitShaError::NotUtf8 { source })?
         .trim()
         .to_owned())
 }
@@ -1385,7 +1718,7 @@ mod tests {
         let command = timeout_test_command(1);
         let workload = timeout_test_workload("tcp-throughput");
 
-        let error = crate::runtime::block_on(under_deadline(
+        let timed_out = crate::runtime::block_on(under_deadline(
             &workload,
             3,
             &command,
@@ -1393,12 +1726,9 @@ mod tests {
         ))
         .expect_err("a workload that never answers must fail rather than hang");
 
-        let timed_out = error
-            .downcast_ref::<WorkloadBenchError>()
-            .expect("the failure must be the typed deadline error");
         assert!(
             matches!(
-                timed_out,
+                &timed_out,
                 WorkloadBenchError::WorkloadTimedOut {
                     workload,
                     iteration: 3,
@@ -1439,19 +1769,16 @@ mod tests {
     /// recorded, holding QEMU open behind it.
     #[test]
     fn a_guest_step_that_never_answers_is_failed_by_name() {
-        let error = crate::runtime::block_on(guest_step_under_deadline(
+        let timed_out = crate::runtime::block_on(guest_step_under_deadline(
             "the final profile read",
             1,
-            std::future::pending::<Result<()>>(),
+            std::future::pending::<Result<(), WorkloadBenchError>>(),
         ))
         .expect_err("a guest step that never answers must fail rather than hang");
 
-        let timed_out = error
-            .downcast_ref::<WorkloadBenchError>()
-            .expect("the failure must be the typed deadline error");
         assert!(
             matches!(
-                timed_out,
+                &timed_out,
                 WorkloadBenchError::GuestStepTimedOut {
                     step: "the final profile read",
                     seconds: 1,

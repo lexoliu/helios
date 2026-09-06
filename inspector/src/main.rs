@@ -11,10 +11,102 @@ mod vm;
 mod vsock;
 mod workload_bench;
 
-use anyhow::{Context as _, Result, bail};
 use clap::{Args as ClapArgs, Parser, Subcommand};
 use std::io::Write as _;
 use std::path::PathBuf;
+
+use crate::ready::BootError;
+use crate::repl::{ReplError, ShellScriptError};
+use crate::serial::SerialError;
+use crate::system::SystemError;
+use crate::tui::TerminalError;
+
+/// Why an inspector run ended other than by doing what it was asked.
+///
+/// The three ways in are separate variants because they are answered in
+/// different places: the command line, the transport to a guest, and the
+/// session that ran once the transport was up.
+#[derive(Debug, thiserror::Error)]
+enum InspectorError {
+    #[error("--device is required unless using `helios-inspector vm`")]
+    MissingDevice,
+    #[error("{0}")]
+    Vm(#[from] vm::VmError),
+    #[error("{0}")]
+    Connect(#[from] ConnectError),
+    #[error("{0}")]
+    Session(#[from] SessionError),
+}
+
+/// Why the inspector could not reach the guest debugger.
+///
+/// A transport that never opened and a guest that never came up are
+/// different problems: the first is the host's device or socket, the
+/// second is the guest's own boot.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ConnectError {
+    #[error("{0}")]
+    Transport(#[from] SerialError),
+    #[error("{0}")]
+    Boot(#[from] BootError),
+}
+
+/// Why the session that ran over an open transport failed.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum SessionError {
+    #[error("failed to prime the guest tracing capture: {source}")]
+    PrimeCapture {
+        #[source]
+        source: SystemError,
+    },
+    #[error("failed to drain the guest tracing capture: {source}")]
+    DrainCapture {
+        #[source]
+        source: SystemError,
+    },
+    #[error("failed to create the guest trace log at {path}: {source}")]
+    CreateTraceLog {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to write the guest trace log at {path}: {source}")]
+    WriteTraceLog {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("{0}")]
+    Shell(#[from] ShellScriptError),
+    #[error("failed to write the remote shell output: {source}")]
+    WriteShellOutput {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("remote shell exited with code {exit_code}")]
+    RemoteShellExited { exit_code: u32 },
+    #[error("{0}")]
+    Tracing(#[from] SystemError),
+    #[error("{0}")]
+    Stats(#[from] TerminalError),
+    #[error("{0}")]
+    Repl(#[from] ReplError),
+    #[error("{0}")]
+    Interrupt(#[from] InterruptError),
+}
+
+/// The inspector could not arm the Ctrl+C handler a cancellable command
+/// runs under.
+///
+/// A command that cannot be interrupted is not run: the operator would
+/// have no way back out of it short of killing the process, which loses
+/// the terminal it left in raw mode.
+#[derive(Debug, thiserror::Error)]
+#[error("failed to listen for Ctrl+C during inspector command execution: {source}")]
+pub(crate) struct InterruptError {
+    #[source]
+    source: std::io::Error,
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -123,36 +215,38 @@ pub(crate) struct TracingCommand {
     target_prefix: Vec<String>,
 }
 
-fn main() -> Result<()> {
+fn main() -> Result<(), InspectorError> {
     let args = Args::parse();
     let session = match args.command {
-        Some(Command::Vm(command)) => return vm::run(*command),
+        Some(Command::Vm(command)) => return Ok(vm::run(*command)?),
         Some(Command::Shell(command)) => Some(SessionCommand::Shell(command)),
         Some(Command::Tracing(command)) => Some(SessionCommand::Tracing(command)),
         Some(Command::Stats) => Some(SessionCommand::Stats),
         Some(Command::Repl) => Some(SessionCommand::Repl),
         None => None,
     };
-    let device = args.serial.device.as_deref().ok_or_else(|| {
-        anyhow::anyhow!("--device is required unless using `helios-inspector vm`")
-    })?;
+    let device = args
+        .serial
+        .device
+        .as_deref()
+        .ok_or(InspectorError::MissingDevice)?;
     let client = connect_client(device, args.serial.baud, args.serial.boot_sync)?;
-    run_connected(client, session)
+    Ok(run_connected(client, session)?)
 }
 
 pub(crate) fn connect_client(
     device: &str,
     baud: u32,
     boot_sync: bool,
-) -> Result<serial::RpcClient> {
+) -> Result<serial::RpcClient, ConnectError> {
     runtime::block_on(async move {
         let io = serial::open(device, baud).await?;
         if boot_sync {
-            Ok::<_, anyhow::Error>(ready::connect_after_boot(io).await?)
+            Ok(ready::connect_after_boot(io).await?)
         } else {
             let mut client = io.into_client();
             ready::wait_until_ready(&mut client).await?;
-            Ok::<_, anyhow::Error>(client)
+            Ok(client)
         }
     })
 }
@@ -160,7 +254,7 @@ pub(crate) fn connect_client(
 pub(crate) fn run_connected(
     client: serial::RpcClient,
     command: Option<SessionCommand>,
-) -> Result<()> {
+) -> Result<(), SessionError> {
     match command.unwrap_or(SessionCommand::Repl) {
         SessionCommand::Shell(command) => run_interruptible(async move {
             let mut client = client;
@@ -175,7 +269,7 @@ pub(crate) fn run_connected(
                         )?,
                     )
                     .await
-                    .context("failed to prime the guest tracing capture")?,
+                    .map_err(|source| SessionError::PrimeCapture { source })?,
                 ),
                 None => None,
             };
@@ -184,24 +278,28 @@ pub(crate) fn run_connected(
                 write_trace_log(&mut client, capture, path).await?;
             }
             let output = result?;
-            std::io::stdout().write_all(&output.output.stdout)?;
-            std::io::stderr().write_all(&output.output.stderr)?;
+            std::io::stdout()
+                .write_all(&output.output.stdout)
+                .and_then(|()| std::io::stderr().write_all(&output.output.stderr))
+                .map_err(|source| SessionError::WriteShellOutput { source })?;
             if output.exit_code != 0 {
-                bail!("remote shell exited with code {}", output.exit_code);
+                return Err(SessionError::RemoteShellExited {
+                    exit_code: output.exit_code,
+                });
             }
             Ok(())
         }),
-        SessionCommand::Tracing(command) => runtime::block_on(system::run_tracing(
+        SessionCommand::Tracing(command) => Ok(runtime::block_on(system::run_tracing(
             client,
             command.limit,
             command.min_level.as_deref(),
             command.target_prefix,
-        )),
+        ))?),
         SessionCommand::Stats => run_interruptible(async move {
             let mut client = client;
-            stats_tui::run(&mut client).await
+            Ok(stats_tui::run(&mut client).await?)
         }),
-        SessionCommand::Repl => repl::run(client),
+        SessionCommand::Repl => Ok(repl::run(client)?),
     }
 }
 
@@ -214,24 +312,30 @@ async fn write_trace_log(
     client: &mut serial::RpcClient,
     capture: &mut system::TracingCapture,
     path: &PathBuf,
-) -> Result<()> {
+) -> Result<(), SessionError> {
     let lines = capture
         .drain(client)
         .await
-        .context("failed to drain the guest tracing capture")?;
-    let mut log = std::fs::File::create(path)
-        .with_context(|| format!("failed to create the guest trace log at {}", path.display()))?;
+        .map_err(|source| SessionError::DrainCapture { source })?;
+    let mut log = std::fs::File::create(path).map_err(|source| SessionError::CreateTraceLog {
+        path: path.display().to_string(),
+        source,
+    })?;
     for line in lines {
-        writeln!(log, "{line}").with_context(|| {
-            format!("failed to write the guest trace log at {}", path.display())
+        writeln!(log, "{line}").map_err(|source| SessionError::WriteTraceLog {
+            path: path.display().to_string(),
+            source,
         })?;
     }
     Ok(())
 }
 
-fn run_interruptible(command: impl std::future::Future<Output = Result<()>>) -> Result<()> {
+fn run_interruptible<E>(command: impl std::future::Future<Output = Result<(), E>>) -> Result<(), E>
+where
+    E: From<InterruptError>,
+{
     match runtime::block_on(runtime::interruptible(command))
-        .context("failed to listen for Ctrl+C during inspector command execution")?
+        .map_err(|source| InterruptError { source })?
     {
         runtime::CommandRun::Completed(result) => result,
         runtime::CommandRun::Interrupted => Ok(()),

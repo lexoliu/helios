@@ -1,6 +1,5 @@
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
 use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers};
 use futures_lite::future;
 use helios_inspector_protocol::system::instances;
@@ -16,19 +15,29 @@ use time::format_description::well_known::Rfc3339;
 
 use crate::serial::RpcClient;
 use crate::system;
-use crate::tui;
+use crate::tui::{self, TerminalError};
 
 const LIVE_STATS_PERIOD_MS: u64 = 1_000;
 
-pub async fn run(client: &mut RpcClient) -> Result<()> {
-    let mut session = tui::Session::open(false, "stats view")?;
+/// The view's name, which every terminal fault it raises is reported
+/// against.
+const STATS_VIEW: &str = "stats view";
+
+pub async fn run(client: &mut RpcClient) -> Result<(), TerminalError> {
+    let mut session = tui::Session::open(false, STATS_VIEW)?;
     let events = tui::spawn_events();
     let mut app = App::new(LIVE_STATS_PERIOD_MS);
 
     app.refresh(client).await;
 
     loop {
-        session.terminal().draw(|frame| draw(frame, &app))?;
+        session
+            .terminal()
+            .draw(|frame| draw(frame, &app))
+            .map_err(|source| TerminalError::Draw {
+                view: STATS_VIEW,
+                source,
+            })?;
         match future::or(
             async { events.recv().await.ok().and_then(UiEvent::from_crossterm) },
             async {

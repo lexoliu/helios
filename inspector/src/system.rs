@@ -5,15 +5,62 @@ use std::fmt::Write as _;
 use std::io::Write as _;
 use std::time::Duration;
 
-use anyhow::{Context as _, Result};
 use helios_inspector_protocol::system::{instances, stats, tracing};
 use nu_ansi_term::{Color, Style as AnsiStyle};
 
 use crate::TracingCommand;
-use crate::remote;
+use crate::remote::{self, RemoteError};
 use crate::serial::RpcClient;
 
 const LIVE_TRACING_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Why the inspector could not read or render what the guest reports.
+///
+/// The fetches and the rendering are separate variants because they fail
+/// for unrelated reasons: a fetch fails at the guest, and a render fails
+/// at this process's own formatter, which is a defect here rather than
+/// there.
+#[derive(Debug, thiserror::Error)]
+pub enum SystemError {
+    #[error("failed to fetch {what}: {source}")]
+    Fetch {
+        /// What was being read, spelled the way the message reads it.
+        what: &'static str,
+        #[source]
+        source: RemoteError,
+    },
+    #[error("unknown tracing level {level}")]
+    UnknownLevel { level: String },
+    #[error("failed to render a guest tracing event: {source}")]
+    Render {
+        #[from]
+        source: core::fmt::Error,
+    },
+    #[error("failed to listen for SIGINT: {source}")]
+    Signals {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to write the guest tracing stream: {source}")]
+    Write {
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+impl SystemError {
+    /// The guest's panic report when a fetch failed because the guest
+    /// kernel died.
+    pub fn guest_panic(&self) -> Option<&str> {
+        match self {
+            Self::Fetch { source, .. } => source.guest_panic(),
+            Self::UnknownLevel { .. }
+            | Self::Render { .. }
+            | Self::Signals { .. }
+            | Self::Write { .. } => None,
+        }
+    }
+}
 
 pub struct TracingConfig {
     pub limit: u32,
@@ -38,28 +85,39 @@ impl TracingConfig {
     }
 }
 
-pub async fn fetch_stats(client: &mut RpcClient) -> Result<stats::Sample> {
+pub async fn fetch_stats(client: &mut RpcClient) -> Result<stats::Sample, SystemError> {
     remote::call(stats::snapshot(client), "remote stats snapshot")
         .await
-        .context("failed to fetch remote stats snapshot")
+        .map_err(|source| SystemError::Fetch {
+            what: "remote stats snapshot",
+            source,
+        })
 }
 
-pub async fn fetch_instances(client: &mut RpcClient) -> Result<Vec<instances::Instance>> {
+pub async fn fetch_instances(
+    client: &mut RpcClient,
+) -> Result<Vec<instances::Instance>, SystemError> {
     remote::call(instances::snapshot(client), "remote instances snapshot")
         .await
-        .context("failed to fetch remote instances snapshot")
+        .map_err(|source| SystemError::Fetch {
+            what: "remote instances snapshot",
+            source,
+        })
 }
 
 pub async fn fetch_tracing(
     client: &mut RpcClient,
     config: &TracingConfig,
-) -> Result<Vec<tracing::Event>> {
+) -> Result<Vec<tracing::Event>, SystemError> {
     remote::call(
         tracing::recent(client, &config.filter(), config.limit),
         "remote tracing events",
     )
     .await
-    .context("failed to fetch remote tracing events")
+    .map_err(|source| SystemError::Fetch {
+        what: "remote tracing events",
+        source,
+    })
 }
 
 pub async fn run_tracing(
@@ -67,7 +125,7 @@ pub async fn run_tracing(
     limit: u32,
     min_level: Option<&str>,
     target_prefixes: Vec<String>,
-) -> Result<()> {
+) -> Result<(), SystemError> {
     let config = tracing_config(limit, min_level, target_prefixes)?;
     stream_tracing(&mut client, &config).await
 }
@@ -75,7 +133,7 @@ pub async fn run_tracing(
 pub async fn stream_tracing_command(
     client: &mut RpcClient,
     command: &TracingCommand,
-) -> Result<()> {
+) -> Result<(), SystemError> {
     let config = tracing_config(
         command.limit,
         command.min_level.as_deref(),
@@ -88,7 +146,7 @@ pub fn tracing_config(
     limit: u32,
     min_level: Option<&str>,
     target_prefixes: Vec<String>,
-) -> Result<TracingConfig> {
+) -> Result<TracingConfig, SystemError> {
     let mut config = TracingConfig::new();
     config.limit = limit;
     config.min_level = match min_level {
@@ -99,7 +157,7 @@ pub fn tracing_config(
     Ok(config)
 }
 
-pub fn parse_level(value: &str) -> Result<Option<tracing::Level>> {
+pub fn parse_level(value: &str) -> Result<Option<tracing::Level>, SystemError> {
     use tracing::Level;
 
     let level = match value {
@@ -109,15 +167,23 @@ pub fn parse_level(value: &str) -> Result<Option<tracing::Level>> {
         "info" => Level::Info,
         "debug" => Level::Debug,
         "trace" => Level::Trace,
-        _ => anyhow::bail!("unknown tracing level {value}"),
+        _ => {
+            return Err(SystemError::UnknownLevel {
+                level: value.to_owned(),
+            });
+        }
     };
     Ok(Some(level))
 }
 
-pub async fn stream_tracing(client: &mut RpcClient, config: &TracingConfig) -> Result<()> {
+pub async fn stream_tracing(
+    client: &mut RpcClient,
+    config: &TracingConfig,
+) -> Result<(), SystemError> {
     let mut stdout = std::io::stdout().lock();
     let mut emitted = EmittedEvents::new(config.limit);
-    let mut signals = Signals::new([Signal::Int]).context("failed to listen for SIGINT")?;
+    let mut signals =
+        Signals::new([Signal::Int]).map_err(|source| SystemError::Signals { source })?;
 
     loop {
         let events = fetch_tracing(client, config).await?;
@@ -125,17 +191,29 @@ pub async fn stream_tracing(client: &mut RpcClient, config: &TracingConfig) -> R
             let key = tracing_event_key(&event)?;
             let line = render_tracing_event(&event)?;
             if emitted.insert(key) {
-                stdout.write_all(line.as_bytes())?;
-                stdout.write_all(b"\n")?;
+                write_line(&mut stdout, line.as_bytes())?;
+                write_line(&mut stdout, b"\n")?;
             }
         }
-        stdout.flush()?;
-        if wait_for_tracing_tick_or_interrupt(&mut signals).await? {
-            stdout.write_all(b"interrupted\n")?;
-            stdout.flush()?;
+        stdout
+            .flush()
+            .map_err(|source| SystemError::Write { source })?;
+        if wait_for_tracing_tick_or_interrupt(&mut signals)
+            .await
+            .map_err(|source| SystemError::Signals { source })?
+        {
+            write_line(&mut stdout, b"interrupted\n")?;
+            stdout
+                .flush()
+                .map_err(|source| SystemError::Write { source })?;
             return Ok(());
         }
     }
+}
+
+fn write_line(sink: &mut impl std::io::Write, bytes: &[u8]) -> Result<(), SystemError> {
+    sink.write_all(bytes)
+        .map_err(|source| SystemError::Write { source })
 }
 
 async fn wait_for_tracing_tick_or_interrupt(signals: &mut Signals) -> std::io::Result<bool> {
@@ -177,14 +255,14 @@ impl TracingPalette {
     }
 }
 
-pub fn render_tracing_event(event: &tracing::Event) -> Result<String> {
+pub fn render_tracing_event(event: &tracing::Event) -> Result<String, SystemError> {
     render_tracing_event_with(event, TracingPalette::Terminal)
 }
 
 pub fn render_tracing_event_with(
     event: &tracing::Event,
     palette: TracingPalette,
-) -> Result<String> {
+) -> Result<String, SystemError> {
     let mut text = String::new();
     write!(
         &mut text,
@@ -242,7 +320,7 @@ pub struct TracingCapture {
 
 impl TracingCapture {
     /// Primes the capture with whatever the ring already holds.
-    pub async fn start(client: &mut RpcClient, config: TracingConfig) -> Result<Self> {
+    pub async fn start(client: &mut RpcClient, config: TracingConfig) -> Result<Self, SystemError> {
         let mut capture = Self {
             emitted: EmittedEvents::new(config.limit),
             config,
@@ -253,7 +331,7 @@ impl TracingCapture {
 
     /// Returns the events that reached the ring since the last call, rendered
     /// without escape sequences.
-    pub async fn drain(&mut self, client: &mut RpcClient) -> Result<Vec<String>> {
+    pub async fn drain(&mut self, client: &mut RpcClient) -> Result<Vec<String>, SystemError> {
         let events = self.take_new_events(client).await?;
         events
             .iter()
@@ -261,7 +339,10 @@ impl TracingCapture {
             .collect()
     }
 
-    async fn take_new_events(&mut self, client: &mut RpcClient) -> Result<Vec<tracing::Event>> {
+    async fn take_new_events(
+        &mut self,
+        client: &mut RpcClient,
+    ) -> Result<Vec<tracing::Event>, SystemError> {
         let mut fresh = Vec::new();
         for event in fetch_tracing(client, &self.config).await? {
             if self.emitted.insert(tracing_event_key(&event)?) {
@@ -272,7 +353,7 @@ impl TracingCapture {
     }
 }
 
-fn tracing_event_key(event: &tracing::Event) -> Result<String> {
+fn tracing_event_key(event: &tracing::Event) -> Result<String, SystemError> {
     let mut text = String::new();
     write!(
         &mut text,
@@ -312,7 +393,7 @@ fn level_style(level: tracing::Level) -> AnsiStyle {
     }
 }
 
-fn render_value(value: &tracing::Value) -> Result<String> {
+fn render_value(value: &tracing::Value) -> Result<String, SystemError> {
     use tracing::Value;
 
     let mut output = String::new();
