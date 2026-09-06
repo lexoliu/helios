@@ -619,6 +619,7 @@ where
                 TcpReadProgress::Pending => {}
             }
             if self.now_nanos() >= deadline_nanos {
+                self.report_tcp_read_timeout(stream, timeout_nanos);
                 return Err(TcpError {
                     kind: TcpErrorKind::Timeout,
                     detail: NetworkErrorDetail::TcpReadTimeout,
@@ -671,6 +672,7 @@ where
                 TcpReadIntoProgress::Pending => {}
             }
             if self.now_nanos() >= deadline_nanos {
+                self.report_tcp_read_timeout(stream, timeout_nanos);
                 return Err(TcpError {
                     kind: TcpErrorKind::Timeout,
                     detail: NetworkErrorDetail::TcpReadTimeout,
@@ -679,6 +681,43 @@ where
             let wait_started = self.profile_start();
             self.wait_for_tcp_progress(wait, deadline_nanos).await;
             self.record_network_profile("tcp-read-into-wait", wait_started);
+        }
+    }
+
+    /// Names the receive state a read gave up on.
+    ///
+    /// The per-shard counters are read after the workload exits, when
+    /// the socket has already been torn down and its queues are gone, so
+    /// a stall reported that way says nothing about the hole that caused
+    /// it. This runs while the socket is still alive, once per timeout,
+    /// on a path that has already waited out its whole deadline (#166).
+    fn report_tcp_read_timeout(&self, stream: TcpStreamId, timeout_nanos: u64) {
+        let diagnostics = self
+            .inner
+            .state
+            .with_handle(stream, |shard| shard.tcp_receive_diagnostics(stream));
+        match diagnostics {
+            Ok(diagnostics) => tracing::warn!(
+                stream = u64::from(stream),
+                timeout_nanos,
+                state = ?diagnostics.state,
+                receive_next = diagnostics.receive_next,
+                receive_queued_bytes = diagnostics.receive_queued_bytes,
+                out_of_order_queued_bytes = diagnostics.out_of_order_queued_bytes,
+                out_of_order_segments = diagnostics.out_of_order_segments,
+                first_out_of_order = ?diagnostics.first_out_of_order,
+                last_out_of_order = ?diagnostics.last_out_of_order,
+                advertised_window_bytes = diagnostics.advertised_window_bytes,
+                last_ack = ?diagnostics.last_ack,
+                last_segment = ?diagnostics.last_segment,
+                "TCP read timed out"
+            ),
+            Err(error) => tracing::warn!(
+                stream = u64::from(stream),
+                timeout_nanos,
+                ?error,
+                "TCP read timed out on a stream the shard no longer holds"
+            ),
         }
     }
 
@@ -1576,6 +1615,19 @@ impl NetworkShard {
             kind: TcpErrorKind::Unavailable,
             detail: NetworkErrorDetail::UnknownTcpStream,
         })
+    }
+
+    pub(super) fn tcp_receive_diagnostics(
+        &self,
+        stream: TcpStreamId,
+    ) -> Result<TcpReceiveDiagnostics, TcpError> {
+        let socket = self.tcp_socket(stream)?;
+        self.stack
+            .tcp_receive_diagnostics(socket)
+            .map_err(|_| TcpError {
+                kind: TcpErrorKind::Unavailable,
+                detail: NetworkErrorDetail::UnknownTcpStream,
+            })
     }
 
     pub(super) fn tcp_listener(

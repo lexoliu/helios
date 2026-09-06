@@ -17,10 +17,11 @@ use crate::{
     Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6Cidr, Ipv6DnsServers, Ipv6Packet,
     Ipv6RouterConfiguration, Ipv6Scope, NeighborDiscovery, PacketBuffer, RxChecksumReport, RxFrame,
     RxFrameOffload, SegmentationOffload, StackError, TcpCloseKind, TcpEndpoint, TcpFlags,
-    TcpHeader, TcpHeaderOptions, TcpPacket, TcpReceiveBuffer, TcpReceiveCounters, TcpSegmentBudget,
-    TcpSocket, TcpTransmitSegment, TransportChecksum, TxChecksum, TxFrameRef, TxSegmentation,
-    UdpPacket, icmpv6_checksum_valid, interpret_router_advertisement, ipv4_checksum,
-    partial_transport_checksum_completes, tcp_checksum_valid, udp_checksum_valid,
+    TcpHeader, TcpHeaderOptions, TcpPacket, TcpReceiveBuffer, TcpReceiveCounters,
+    TcpReceiveDiagnostics, TcpSegmentBudget, TcpSocket, TcpTransmitSegment, TransportChecksum,
+    TxChecksum, TxFrameRef, TxSegmentation, UdpPacket, icmpv6_checksum_valid,
+    interpret_router_advertisement, ipv4_checksum, partial_transport_checksum_completes,
+    tcp_checksum_valid, udp_checksum_valid,
 };
 
 pub const MAX_ROUTES: usize = 32;
@@ -3168,6 +3169,20 @@ where
             ),
             _ => TcpConnectState::Pending,
         })
+    }
+
+    /// The receive state of one socket, for a caller that has to report
+    /// why it made no progress.
+    ///
+    /// Read-only, and taken while the socket is still alive: the
+    /// per-shard counters are folded in after a socket closes and so
+    /// cannot describe the queues a stalled reader was waiting on
+    /// (#166).
+    pub fn tcp_receive_diagnostics(
+        &self,
+        socket: SocketId,
+    ) -> Result<TcpReceiveDiagnostics, StackError> {
+        Ok(self.tcp_socket(socket)?.receive_diagnostics())
     }
 
     /// Report whether `listener` has a completed connection waiting in the
