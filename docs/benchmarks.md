@@ -376,10 +376,18 @@ own under `$XDG_RUNTIME_DIR` and links it as `<runtime>/sockets`; see
 
 `bench-suite.yml` runs a pull request in paired mode against
 `github.event.pull_request.base.sha`, and `workflow_dispatch` takes a
-`baseline_ref` input. The `bench-x86-64-linux` lane of `ci.yml` is
-unchanged except that the inspector now writes the host CPU model into
-the `run` record it emits, so a comparison between two of its runs can
-tell one machine from two.
+`baseline_ref` input. An advisory dispatch with an explicit baseline is
+revision acceptance: it runs only `helios` and `helios_baseline`, with
+all workloads, warm iterations, before/after compute controls, and the
+same enforced paired gate. It does not run the unrelated Linux
+comparisons or independent profile-generation/PGO experiment. Unpaired
+dispatches, labelled PR runs, dedicated runs and publication events retain
+the full suite and profiling flow. Mode selection is computed once by the
+tooling job, so profile generation starts only after tooling succeeds.
+
+The `bench-x86-64-linux` lane of `ci.yml` is unchanged except that the
+inspector now writes the host CPU model into the `run` record it emits,
+so a comparison between two of its runs can tell one machine from two.
 
 ## Reproducing a published number
 
