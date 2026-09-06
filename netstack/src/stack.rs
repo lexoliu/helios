@@ -6,7 +6,7 @@ use core::fmt;
 use core::mem::MaybeUninit;
 
 use arrayvec::ArrayVec;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use heapless::Deque;
 use heapless::binary_heap::{BinaryHeap, Min};
 
@@ -563,11 +563,21 @@ impl Ipv4MulticastMembership {
     }
 }
 
+/// A received datagram's bytes, owned by the queue that holds them.
+///
+/// Small datagrams live in the inline block and cost no allocation at
+/// all; larger ones get a `BytesMut` this payload owns outright, never
+/// the `Bytes` of the frame it was parsed out of. Every payload the
+/// receive path builds is a slice of the frame the network driver handed
+/// up, so keeping that slice keeps one of the driver's receive buffers
+/// for as long as the datagram sits unread — up to [`MAX_UDP_RX`] of
+/// them, which is enough to starve the driver's reassembly pool and stop
+/// it taking frames off its ring.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UdpPayload {
     inline: [u8; UDP_INLINE_PAYLOAD_BYTES],
     inline_len: u16,
-    heap: Option<Bytes>,
+    heap: Option<BytesMut>,
 }
 
 impl UdpPayload {
@@ -578,12 +588,18 @@ impl UdpPayload {
         Self {
             inline: [0; UDP_INLINE_PAYLOAD_BYTES],
             inline_len: 0,
-            heap: Some(Bytes::copy_from_slice(bytes)),
+            heap: Some(BytesMut::from(bytes)),
         }
     }
 
-    /// Keeps small datagrams inline and retains large owning frame slices
-    /// without re-copying their payload bytes.
+    /// Keeps small datagrams inline and takes larger ones out of the
+    /// frame they arrived in.
+    ///
+    /// `try_into_mut` keeps a buffer the caller already owns outright and
+    /// copies anything shared. A frame from a network driver is built
+    /// with `Bytes::from_owner`, which never reports itself unique, so a
+    /// slice of one is always copied and the driver's buffer is released
+    /// as soon as the frame is dropped.
     pub fn from_bytes(bytes: Bytes) -> Self {
         if bytes.len() <= UDP_INLINE_PAYLOAD_BYTES {
             return Self::inline_from_slice(bytes.as_ref());
@@ -591,7 +607,11 @@ impl UdpPayload {
         Self {
             inline: [0; UDP_INLINE_PAYLOAD_BYTES],
             inline_len: 0,
-            heap: Some(bytes),
+            heap: Some(
+                bytes
+                    .try_into_mut()
+                    .unwrap_or_else(|shared| BytesMut::from(shared.as_ref())),
+            ),
         }
     }
 
@@ -616,30 +636,21 @@ impl UdpPayload {
 
     /// Converts the payload to reference-counted bytes for outer APIs.
     pub fn into_bytes(self) -> Bytes {
-        self.heap
-            .unwrap_or_else(|| Bytes::copy_from_slice(&self.inline[..usize::from(self.inline_len)]))
+        match self.heap {
+            Some(bytes) => bytes.freeze(),
+            None => Bytes::copy_from_slice(&self.inline[..usize::from(self.inline_len)]),
+        }
     }
 
     /// Converts at most `max_bytes` into reference-counted bytes.
     pub fn into_limited_bytes(self, max_bytes: usize) -> Bytes {
         let len = self.len().min(max_bytes);
         match self.heap {
-            Some(bytes) => bytes.slice(..len),
+            Some(mut bytes) => {
+                bytes.truncate(len);
+                bytes.freeze()
+            }
             None => Bytes::copy_from_slice(&self.inline[..len]),
-        }
-    }
-
-    #[cfg(test)]
-    fn frame_slice_offset_for_test(&self, frame: &Bytes) -> Option<usize> {
-        let payload = self.heap.as_ref()?;
-        let frame_start = frame.as_ptr() as usize;
-        let frame_end = frame_start + frame.len();
-        let payload_start = payload.as_ptr() as usize;
-        let payload_end = payload_start + payload.len();
-        if payload_start >= frame_start && payload_end <= frame_end {
-            Some(payload_start - frame_start)
-        } else {
-            None
         }
     }
 }
@@ -9229,9 +9240,36 @@ mod tests {
         assert_eq!(received.bytes.as_ref(), b"payload");
     }
 
+    /// A queued datagram must not keep the buffer the device filled.
+    ///
+    /// Every payload `receive_udp` builds is a slice of the frame the
+    /// driver handed up, so storing it stores one of the driver's
+    /// receive buffers until the datagram is read — up to `MAX_UDP_RX`
+    /// of them. Datagrams above `UDP_INLINE_PAYLOAD_BYTES` are the case
+    /// that used to keep the slice unchanged; the inline path always
+    /// copied.
     #[test]
-    fn ipv4_udp_large_payload_retains_owning_frame_slice() {
+    fn ipv4_udp_large_payload_does_not_retain_the_device_buffer() {
         const LARGE_PAYLOAD: [u8; 1024] = [0x5a; 1024];
+
+        struct TrackedFrame {
+            bytes: Vec<u8>,
+            released: alloc::sync::Arc<core::sync::atomic::AtomicBool>,
+        }
+
+        impl AsRef<[u8]> for TrackedFrame {
+            fn as_ref(&self) -> &[u8] {
+                &self.bytes
+            }
+        }
+
+        impl Drop for TrackedFrame {
+            fn drop(&mut self) {
+                self.released
+                    .store(true, core::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
@@ -9240,21 +9278,26 @@ mod tests {
             .open_udp(UdpSocketBinding::wildcard(4040))
             .expect("UDP socket should bind");
         let (frame, frame_len) = ipv4_udp_frame(peer, 53, local, 4040, &LARGE_PAYLOAD);
-        let frame = Bytes::copy_from_slice(&frame[..frame_len]);
+        let released = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+        let frame = Bytes::from_owner(TrackedFrame {
+            bytes: frame[..frame_len].to_vec(),
+            released: released.clone(),
+        });
 
         stack
             .receive_rx_frame(RxFrame::new(frame.clone()), StackInstant::from_nanos(1))
             .expect("large UDP frame should parse");
+        drop(frame);
 
+        assert!(
+            released.load(core::sync::atomic::Ordering::SeqCst),
+            "a queued datagram must not hold the device buffer it arrived in"
+        );
         let received = stack
             .take_udp(socket)
             .expect("UDP socket should exist")
-            .expect("large UDP datagram should be queued");
+            .expect("large UDP datagram should still be queued");
         assert_eq!(received.bytes.as_ref(), LARGE_PAYLOAD.as_slice());
-        assert_eq!(
-            received.bytes.frame_slice_offset_for_test(&frame),
-            Some(EthernetFrame::HEADER_LEN + Ipv4Packet::MIN_HEADER_LEN + UdpPacket::HEADER_LEN)
-        );
     }
 
     #[test]
