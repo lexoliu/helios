@@ -1624,7 +1624,6 @@ version = "0.1.0"
 name = "helios-cli"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "askama",
  "clap",
  "ed25519-dalek",
@@ -1638,6 +1637,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "thiserror 2.0.18",
  "toml",
  "walkdir",
  "wasmparser 0.245.1",
