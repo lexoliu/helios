@@ -23,9 +23,9 @@ use super::bindings::filesystem::types as p3fs;
 use super::bindings::filesystem::types::{ErrorCode as P3ErrorCode, OpenFlags as P3OpenFlags};
 use super::{
     DebugFileSystem, FsDescriptor, FsNodeKind, HostFileStreamTarget, P2IncomingDatagramStream,
-    P2Network, P2OutgoingDatagramStream, P2ResolveAddressStream, Preview2GuestExit, TcpSocket,
-    UdpSocket, WasiAdapterTrap, WasiImportSet, WasiTcpSocketAddress, WasiTcpSocketFamily,
-    WasiUdpSocketAddress, WasiUdpSocketError, WasiUdpSocketFamily,
+    P2Network, P2OutgoingDatagramStream, P2ResolveAddressStream, PendingAccept, Preview2GuestExit,
+    TcpSocket, UdpSocket, WasiAdapterTrap, WasiImportSet, WasiTcpSocketAddress,
+    WasiTcpSocketFamily, WasiUdpSocketAddress, WasiUdpSocketError, WasiUdpSocketFamily,
     descriptor_stat_from_host_metadata, has_wasi_network_rights, host_metadata_node_kind,
     metadata_hash_value, output_is_terminal, stdin_is_terminal, wasi_tcp_bind_rights,
     wasi_udp_bind_rights,
@@ -3386,42 +3386,13 @@ where
         >,
     > {
         let socket = self.table.get(&socket_resource)?.clone();
-        {
+        let pending = {
             let mut state = socket.inner.lock();
             if let Some(result) = state.accept_result.take() {
-                let accepted = match result {
-                    Ok(accepted) => accepted,
+                let accepted_socket = match result {
+                    Ok(accepted_socket) => accepted_socket,
                     Err(error) => return Ok(Err(map_p2_tcp_core_error(error))),
                 };
-                let Some(local_address) = state.local_address else {
-                    return Err(wasmtime::Error::new(crate::ProgramExecError {
-                        kind: crate::ProgramExecErrorKind::Internal,
-                        detail: crate::ProgramExecErrorDetail::InternalInvariant,
-                    }));
-                };
-                let remote_address = match accepted.address {
-                    crate::NetworkIpAddress::Ipv4(address) => {
-                        super::WasiTcpIpAddress::Ipv4(address)
-                    }
-                    crate::NetworkIpAddress::Ipv6(address) => {
-                        super::WasiTcpIpAddress::Ipv6(address)
-                    }
-                };
-                assert_eq!(
-                    remote_address.family(),
-                    state.family,
-                    "tcp accept returned a peer address for the wrong socket family"
-                );
-                let accepted_socket = TcpSocket::accepted(
-                    state.service.clone(),
-                    state.family,
-                    accepted.stream,
-                    local_address,
-                    WasiTcpSocketAddress {
-                        address: remote_address,
-                        port: accepted.port,
-                    },
-                );
                 drop(state);
                 let accepted_resource = self.table.push_child(accepted_socket, &socket_resource)?;
                 let accepted_socket = self.table.get(&accepted_resource)?.clone();
@@ -3435,29 +3406,16 @@ where
             let Some(listener) = state.listener else {
                 return Ok(Err(p2tcp::ErrorCode::InvalidState));
             };
-            state.accept_in_progress = true;
-            let service = state.service.clone();
-            let inner = socket.inner.clone();
-            let ready = socket.ready.clone();
-            let spawned = self.spawner().try_spawn_detached({
-                let inner = inner.clone();
-                async move {
-                    let result = service.tcp_accept(listener, u64::MAX).await;
-                    let mut state = inner.lock();
-                    state.accept_in_progress = false;
-                    state.accept_result = Some(result);
-                    ready.notify_all();
-                }
-            });
-            if let Err(error) = spawned {
-                inner.lock().accept_in_progress = false;
-                tracing::warn!(
-                    target: "helios_kernel::program",
-                    %error,
-                    "refused a tcp accept task: the executor's instance share is full"
-                );
-                return Ok(Err(p2tcp::ErrorCode::OutOfMemory));
-            }
+            let Some(pending) = PendingAccept::start(&socket, &mut state, listener) else {
+                return Err(wasmtime::Error::new(crate::ProgramExecError {
+                    kind: crate::ProgramExecErrorKind::Internal,
+                    detail: crate::ProgramExecErrorDetail::InternalInvariant,
+                }));
+            };
+            pending
+        };
+        if pending.spawn(self.spawner()).is_err() {
+            return Ok(Err(p2tcp::ErrorCode::OutOfMemory));
         }
         Ok(Err(p2tcp::ErrorCode::WouldBlock))
     }
