@@ -528,10 +528,6 @@ where
     fn udp_close(&self, socket: Self::UdpSocket) {
         NetworkService::udp_close(self, socket);
     }
-
-    fn wake_packet_pump(&self) {
-        NetworkService::wake_packet_pump(self);
-    }
 }
 
 impl<CpuImpl, DeviceImpl> NetworkAdminBackend for NetworkService<CpuImpl, DeviceImpl>

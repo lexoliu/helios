@@ -1903,12 +1903,6 @@ mod tests {
         assert_eq!(retirement.drain(), 1, "the drain retires the queued stream");
         assert_eq!(closed.count(), 1);
         assert_eq!(closed.last(), 7, "the retired stream is the one connected");
-        assert_eq!(
-            service.packet_pump_wakes(),
-            1,
-            "a drain that closed a connection kicks the pump so its FIN \
-             leaves on the next executor turn"
-        );
     }
 
     /// A socket that owns nothing queues nothing, so a store whose
@@ -1926,11 +1920,6 @@ mod tests {
         );
         assert_eq!(retirement.drain(), 0);
         assert_eq!(closed.count(), 0);
-        assert_eq!(
-            service.packet_pump_wakes(),
-            0,
-            "a drain that closed nothing must not wake the pump"
-        );
     }
 
     /// A socket handed to a stream producer outlives the resource

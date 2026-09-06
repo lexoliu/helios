@@ -1279,14 +1279,20 @@ where
         self.deadline_wait(deadline_nanos).min(interval)
     }
 
-    /// Wakes the packet pump so a segment a synchronous retirement
-    /// queued leaves on the next executor turn rather than the next
-    /// protocol timer (#232).
+    /// Wakes the packet pump so a segment a synchronous close queued
+    /// leaves on the next executor turn rather than the next protocol
+    /// timer (#232, #231).
     ///
     /// The pump parks on the whole shard set, and the executor wakes
     /// the processor its task lands on, so raising the signal is the
     /// whole of it.
-    pub fn wake_packet_pump(&self) {
+    ///
+    /// Private because the kick is not a duty an owner can be asked to
+    /// remember: every close that can queue a segment —
+    /// [`NetworkService::tcp_close`] and
+    /// [`NetworkService::tcp_listener_close`] — ends with it, so a
+    /// `Drop` that retires a handle has nothing left to do (#231).
+    fn wake_packet_pump(&self) {
         self.inner.state.wake_any_shard();
     }
 
@@ -1411,9 +1417,37 @@ fn usize_to_u64(value: usize, label: &'static str) -> u64 {
 pub(crate) mod fixture {
     use super::*;
 
+    use alloc::boxed::Box;
+    use core::pin::Pin;
+    use futures_lite::future::{block_on, poll_once};
     use helios_netstack::{
         ETHERNET_FRAME_BYTES, NeighborState, TcpFlags, TcpHeader, TransportChecksum,
     };
+
+    use crate::ProgressChanged;
+
+    /// The packet pump's park, sampled the way the pump takes one: the
+    /// arrival mark first, then the state it means to sleep through.
+    ///
+    /// This is what a close test reads instead of the wire. Whether a
+    /// FIN is on the outbound queue says nothing about when it leaves;
+    /// the pump publishes it, and a pump nobody woke sleeps out its
+    /// bound — the soonest protocol timer, `DHCP_RETRANSMIT_NANOS` away
+    /// on a guest with nothing else to send (#231).
+    pub(crate) struct PumpPark<'a> {
+        parked: Pin<Box<ProgressChanged<'a>>>,
+    }
+
+    impl PumpPark<'_> {
+        /// Whether the park has been released since it was sampled.
+        ///
+        /// Polls it exactly once, as the executor would; a park still
+        /// pending is left armed, so one sample answers both before and
+        /// after the event under test.
+        pub(crate) fn released(&mut self) -> bool {
+            block_on(poll_once(self.parked.as_mut())).is_some()
+        }
+    }
 
     /// One TCP segment the stack put on its outbound queue, reduced to
     /// what a close test asks about.
@@ -1526,6 +1560,22 @@ pub(crate) mod fixture {
         /// The stream handle a component-host owner holds.
         pub(crate) fn stream(&self) -> TcpStreamId {
             self.stream
+        }
+
+        /// Samples the park the packet pump would be sitting in, for a
+        /// test that asks when a close's segment leaves rather than
+        /// whether it was queued.
+        pub(crate) fn pump_park(&self) -> PumpPark<'_> {
+            let wait = self.service.inner.state.any_shard_wait();
+            PumpPark {
+                parked: Box::pin(
+                    self.service
+                        .inner
+                        .state
+                        .arrival_for(wait.target)
+                        .changed(wait.mark),
+                ),
+            }
         }
 
         /// Hands the peer's segment to the stack.

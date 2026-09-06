@@ -5388,6 +5388,43 @@ mod tests {
         );
     }
 
+    /// The FIN leaves on the next executor turn, not on the next
+    /// protocol timer.
+    ///
+    /// #224 put the segment on the outbound queue and #232 kicked the
+    /// packet pump from the retirement drain, but a preview1 descriptor
+    /// closes its stream straight from `WasixOwnedTcpStream::drop` and
+    /// never went through that drain. Its FIN therefore sat in the
+    /// queue until the pump's park expired, which on a guest with
+    /// nothing else to send is `DHCP_RETRANSMIT_NANOS` — a second of
+    /// silence the peer spends holding an established connection
+    /// (#231). This asks the park, not the wire: the previous test
+    /// already proves the FIN is queued, and what was wrong was when it
+    /// left.
+    #[test]
+    fn a_preview1_socket_descriptor_wakes_the_packet_pump_when_its_table_goes_away() {
+        use crate::network::EstablishedTcpFixture;
+
+        let fixture = EstablishedTcpFixture::new();
+        let table = Preview1DescriptorTable::from_entries(vec![Some(connected_socket_entry(
+            fixture.service(),
+            fixture.stream(),
+        ))]);
+
+        let mut park = fixture.pump_park();
+        assert!(
+            !park.released(),
+            "a live descriptor gives the pump nothing to publish"
+        );
+
+        drop(table);
+        assert!(
+            park.released(),
+            "the close that queued the FIN must release the pump's park \
+             rather than leave it to the next protocol timer"
+        );
+    }
+
     /// A stream two descriptors share is retired when the second one
     /// goes, not the first. `exec` hands the child a copy of the table,
     /// so closing on the first drop would take the connection out from

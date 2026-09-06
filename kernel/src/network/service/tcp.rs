@@ -290,11 +290,35 @@ where
     /// to spawn a task, and a task spawned from a dying instance is a
     /// task that may never run — which is how a connection outlived the
     /// program that opened it (#184).
+    ///
+    /// The close ends with a pump kick, and that is the whole of #231:
+    /// what a retirement leaves behind is a FIN sequence to run or a
+    /// reset on the outbound queue, and neither puts a frame anywhere a
+    /// shard's own arrival signal would see. Without the kick the
+    /// segment waits for the pump's next park to expire — up to
+    /// `DHCP_RETRANSMIT_NANOS` on a guest with nothing else to send —
+    /// so a peer learns of the close a second after the guest made it.
+    /// The kick belongs here rather than at the call sites: #232 put it
+    /// on the component host's retirement drain, and the owners that
+    /// reach this method directly — a socket resource backend's
+    /// `close`, a descriptor table's `Drop` — never got one. No present
+    /// or future owner has to remember it now.
+    ///
+    /// Unconditional, because the only close that queues nothing is one
+    /// on a connection that owed its peer nothing, and telling the two
+    /// apart costs more than the kick: `TcpCloseOutcome::Reclaimed`
+    /// covers both the bare reclamation and the reset, so gating on it
+    /// would drop exactly the wake a reset needs. A kick nothing is
+    /// waiting for is one atomic increment on the shard set's arrival
+    /// signal and a notify that finds no listener; a kick the parked
+    /// pump takes costs it one pass over the shards, which is noise
+    /// beside the teardown that just ran.
     pub fn tcp_close(&self, stream: TcpStreamId) {
         let now = StackInstant::from_nanos(self.now_nanos());
         self.inner.state.with_handle(stream, |state| {
             state.remove_tcp_stream(stream, now);
         });
+        self.wake_packet_pump();
     }
 
     /// Retires `listener`, freeing its slab slot, its replica on every
@@ -313,6 +337,10 @@ where
     /// listener a program opened stayed in its shard for the rest of
     /// the boot, holding the port that `is_tcp_local_port_free`
     /// consults (#191).
+    ///
+    /// Those resets are segments on the outbound queue and nothing
+    /// else raises a signal for them, so this kicks the pump for the
+    /// reason [`NetworkService::tcp_close`] does and on the same terms.
     pub fn tcp_listener_close(&self, listener: TcpListenerId) {
         let slot = ReplicaHandle::from(listener).slot();
         let now = StackInstant::from_nanos(self.now_nanos());
@@ -324,6 +352,7 @@ where
             })
             .unwrap_or_else(|infallible| match infallible {});
         self.inner.state.listener_slots.release(slot);
+        self.wake_packet_pump();
     }
 
     pub(super) async fn execute_tcp_connect(

@@ -476,8 +476,6 @@ mod tests {
         fn tcp_listener_close(&self, _: Self::TcpListener) {}
 
         fn udp_close(&self, _: Self::UdpSocket) {}
-
-        fn wake_packet_pump(&self) {}
     }
 
     #[test]

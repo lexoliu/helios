@@ -134,6 +134,12 @@ where
     /// from a dying instance is a task that may never run — which is
     /// how a datagram socket outlived the program that opened it
     /// (#190).
+    ///
+    /// Unlike the TCP closes this queues nothing, so it kicks nothing:
+    /// a datagram socket owes its peers no shutdown sequence, and
+    /// retiring its replicas drops receive queues rather than producing
+    /// a segment. There is no pump wake here because the pump would
+    /// have nothing to publish (#231).
     pub fn udp_close(&self, socket: UdpSocketId) {
         let slot = ReplicaHandle::from(socket).slot();
         self.inner

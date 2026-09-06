@@ -694,7 +694,6 @@ mod network {
         closed: Arc<TestClosedStreams>,
         closed_udp: Arc<TestClosedStreams>,
         closed_listeners: Arc<TestClosedStreams>,
-        pump_wakes: Arc<AtomicUsize>,
     }
 
     impl TestNetworkService {
@@ -719,13 +718,6 @@ mod network {
         /// separate handles with separate lifetimes.
         pub(crate) fn closed_listeners(&self) -> Arc<TestClosedStreams> {
             self.closed_listeners.clone()
-        }
-
-        /// How many times a retirement drain has kicked the packet
-        /// pump, which is what proves a queued FIN leaves on the next
-        /// executor turn rather than the next protocol timer (#232).
-        pub(crate) fn packet_pump_wakes(&self) -> usize {
-            self.pump_wakes.load(Ordering::Acquire)
         }
     }
 
@@ -1005,10 +997,6 @@ mod network {
 
         fn udp_close(&self, socket: Self::UdpSocket) {
             self.closed_udp.record(socket);
-        }
-
-        fn wake_packet_pump(&self) {
-            self.pump_wakes.fetch_add(1, Ordering::AcqRel);
         }
     }
 
