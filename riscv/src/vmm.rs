@@ -820,10 +820,11 @@ impl AddressSpace for RiscvUserAddressSpace {
         // grants naming overlapping physical space cannot both believe
         // they own it.
         let mut devices = self.devices.lock();
-        for mapping in devices.iter() {
-            if mapping.range.start.raw() == virt.start.raw() {
-                return Err(AddressSpaceError::DeviceMapped);
-            }
+        if devices
+            .iter()
+            .any(|mapping| ranges_overlap(mapping.range, virt))
+        {
+            return Err(AddressSpaceError::DeviceMapped);
         }
         for page in 0..pages {
             let virt_addr = virt.start.raw() + page * PAGE_SIZE;
@@ -1246,3 +1247,14 @@ const _: () = {
     let _: extern "C" fn(*const u8, usize, &mut *mut runtime_memory::RuntimeMemoryImage) -> c_int =
         default_memory_image_new;
 };
+
+/// Whether two ranges share any byte.
+///
+/// A device mapping is claimed by range rather than by start address:
+/// two windows that overlap without starting at the same place are
+/// still the same registers reached twice, and the second claim would
+/// silently take the first one's page-table entries.
+fn ranges_overlap(left: VirtRange, right: VirtRange) -> bool {
+    left.start.raw() < right.start.raw() + right.byte_len
+        && right.start.raw() < left.start.raw() + left.byte_len
+}

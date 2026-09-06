@@ -132,6 +132,8 @@ pub enum GrantError {
     NotFound,
     #[error("the device is already granted to another owner")]
     AlreadyClaimed,
+    #[error("a buffer of no bytes is not a buffer")]
+    EmptyRequest,
     #[error("the platform surface a granted device needs is not installed")]
     PlatformUnavailable,
     #[error("the grant has no region with this index")]

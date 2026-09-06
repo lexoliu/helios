@@ -106,6 +106,7 @@ fn to_wit_error(error: GrantError) -> device_wit::Error {
         GrantError::WindowExhausted => device_wit::Error::WindowExhausted,
         GrantError::BudgetExhausted => device_wit::Error::BudgetExhausted,
         GrantError::BadAlignment => device_wit::Error::BadAlignment,
+        GrantError::EmptyRequest => device_wit::Error::EmptyRequest,
         GrantError::Unreachable => device_wit::Error::Unreachable,
         // Everything left is a defect a driver cannot do anything
         // about: a grant that was built wrong, a registry that was
@@ -119,6 +120,25 @@ fn to_wit_error(error: GrantError) -> device_wit::Error {
         | GrantError::PlatformUnavailable
         | GrantError::RegionAlreadyMapped
         | GrantError::AddressSpace(_) => device_wit::Error::MappingFailed,
+    }
+}
+
+/// The trap a handle for a device this instance no longer holds earns.
+///
+/// These three questions have no honest answer once the lease is gone.
+/// Answering "no regions, no interrupts, not confined" would read to a
+/// driver as a device that exists and has nothing, when what happened
+/// is that its device was taken away and given to someone else; a
+/// driver acting on that answer is already wrong. The methods that
+/// *do* something with a stale handle — mapping, pinning, masking —
+/// return `not-found` because a driver can reasonably retry a claim;
+/// there is nothing to retry here.
+fn stale(device: &DeviceName) -> impl FnOnce(GrantError) -> wasmtime::Error + use<> {
+    let device = *device;
+    move |error| {
+        wasmtime::Error::msg(alloc::format!(
+            "this instance no longer holds the device {device}: {error}"
+        ))
     }
 }
 
@@ -194,11 +214,8 @@ where
         handle: Resource<GrantHandle>,
     ) -> wasmtime::Result<Vec<device_wit::Region>> {
         let device = *self.table.get(&handle)?.device();
-        Ok(self
-            .device
-            .lease_for_mut(&device)
-            .map(|lease| lease.grant().regions().iter().map(to_wit_region).collect())
-            .unwrap_or_default())
+        let lease = self.device.lease_for_mut(&device).map_err(stale(&device))?;
+        Ok(lease.grant().regions().iter().map(to_wit_region).collect())
     }
 
     fn map_region(
@@ -221,11 +238,8 @@ where
 
     fn interrupt_count(&mut self, handle: Resource<GrantHandle>) -> wasmtime::Result<u32> {
         let device = *self.table.get(&handle)?.device();
-        Ok(self
-            .device
-            .lease_for_mut(&device)
-            .map(|lease| lease.grant().interrupts().len() as u32)
-            .unwrap_or(0))
+        let lease = self.device.lease_for_mut(&device).map_err(stale(&device))?;
+        Ok(lease.grant().interrupts().len() as u32)
     }
 
     fn ack(
@@ -272,10 +286,8 @@ where
 
     fn confined(&mut self, handle: Resource<GrantHandle>) -> wasmtime::Result<bool> {
         let device = *self.table.get(&handle)?.device();
-        Ok(self
-            .device
-            .lease_for_mut(&device)
-            .is_ok_and(|lease| lease.grant().confinement().is_some()))
+        let lease = self.device.lease_for_mut(&device).map_err(stale(&device))?;
+        Ok(lease.grant().confinement().is_some())
     }
 
     fn drop(&mut self, handle: Resource<GrantHandle>) -> wasmtime::Result<()> {

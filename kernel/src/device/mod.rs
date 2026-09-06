@@ -278,6 +278,40 @@ mod tests {
         );
     }
 
+    /// Nothing was refused, so saying the budget was exhausted would
+    /// name the wrong fact and send a driver looking at a limit that
+    /// had nothing to do with it.
+    #[test]
+    fn a_buffer_of_no_bytes_is_refused_as_empty_rather_than_over_budget() {
+        let registry = registry(&["test:alpha"]);
+        let mut lease = registry
+            .claim("test:alpha", window())
+            .expect("the device is free");
+
+        assert_eq!(
+            lease.dma_alloc(0, 4096).err(),
+            Some(GrantError::EmptyRequest)
+        );
+    }
+
+    /// The size comes from the driver, and rounding it up to the
+    /// mapping granule is where a hostile one reaches for the wrap: an
+    /// unchecked `next_multiple_of` turns a request for most of the
+    /// address space into a handful of bytes in a release build, and
+    /// the driver then hands that to hardware as a ring.
+    #[test]
+    fn a_request_too_large_to_round_up_is_refused_rather_than_wrapped() {
+        let registry = registry(&["test:alpha"]);
+        let mut lease = registry
+            .claim("test:alpha", window())
+            .expect("the device is free");
+
+        assert_eq!(
+            lease.dma_alloc(u64::MAX, 4096).err(),
+            Some(GrantError::WindowExhausted)
+        );
+    }
+
     #[test]
     fn an_alignment_that_is_not_a_power_of_two_is_refused() {
         let registry = registry(&["test:alpha"]);

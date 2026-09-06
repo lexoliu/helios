@@ -10,10 +10,16 @@
 //! # Concurrency contract
 //!
 //! Both tables are installed once, on the bootstrap processor, before
-//! any secondary is started. [`mask`] runs in interrupt context and
-//! takes the GIC's spin lock; every other writer of that lock holds it
-//! during bring-up or during a driver's own `unmask`, neither of which
-//! runs with interrupts masked on a processor that could take the line.
+//! any secondary is started.
+//!
+//! [`mask`] runs in interrupt context and takes the GIC's distributor
+//! lock, and [`unmask`] takes the same lock from an ordinary task with
+//! interrupts enabled. Those two are the deadlock: without care, a
+//! granted-device interrupt arriving on the processor whose task holds
+//! the lock would spin on it forever. `Gic::with_registers` is what
+//! rules that out — every taker of the lock holds it inside a critical
+//! section, so no interrupt reaches the holding processor while it is
+//! held. See the concurrency contract in `gic.rs`.
 
 use alloc::vec::Vec;
 

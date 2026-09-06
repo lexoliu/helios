@@ -1,10 +1,19 @@
 //! GICv3 bring-up for the AArch64 backend.
 //!
 //! Concurrency contract: every distributor and redistributor write goes
-//! through [`Gic`]'s spin lock, and all of them happen during bring-up —
-//! the bootstrap processor configures the distributor and the device
-//! interrupts, each processor initialises its own CPU interface as it
-//! comes online. The interrupt path itself never takes the lock:
+//! through [`Gic`]'s spin lock, and every taker holds it with interrupts
+//! masked on the local processor — [`Gic::with_registers`] is the only
+//! way in, and it opens a critical section first.
+//!
+//! That is not belt and braces. Most writes happen during bring-up, but
+//! [`Gic::set_device_interrupt_enabled`] does not: a user-mode driver
+//! unmasks its own line from an ordinary task, with interrupts enabled,
+//! while a granted-device interrupt landing on that same processor
+//! masks the line from the interrupt handler. Without the critical
+//! section the handler would spin on a lock held by the task it
+//! interrupted, on its own processor, forever.
+//!
+//! The interrupt path's other half never takes the lock at all:
 //! acknowledging and ending an interrupt are `ICC_*_EL1` system-register
 //! accesses private to the running processor.
 
@@ -45,6 +54,15 @@ pub(crate) struct Gic {
 }
 
 impl Gic {
+    /// Runs `act` against the distributor and redistributors with the
+    /// lock held and interrupts masked on this processor.
+    ///
+    /// Every writer goes through here; see the module comment for why
+    /// the two have to be taken together.
+    fn with_registers<R>(&self, act: impl FnOnce(&mut GicV3<'static>) -> R) -> R {
+        critical_section::with(|_| act(&mut self.inner.lock()))
+    }
+
     /// Maps the controller, configures the distributor, and brings up
     /// the bootstrap processor's CPU interface.
     ///
@@ -97,35 +115,38 @@ impl Gic {
     /// Initialises the calling processor's CPU interface and enables the
     /// interrupts private to it.
     pub(crate) fn attach_current_processor(&self, mpidr: u64) {
-        let mut gic = self.inner.lock();
-        let index = redistributor_index(&mut gic, mpidr, self.processor_count);
-        gic.init_cpu(index);
-        GicCpuInterface::enable_group1(true);
-        GicCpuInterface::set_priority_mask(PRIORITY_MASK_ALL);
-        for intid in [VIRTUAL_TIMER_PPI, WAKE_SGI] {
-            gic.enable_interrupt(intid, Some(index), true)
-                .unwrap_or_else(|error| {
-                    panic!(
-                        "AArch64 GIC could not enable {intid:?} on redistributor {index}: {error}"
-                    )
-                });
-        }
+        let index = self.with_registers(|gic| {
+            let index = redistributor_index(gic, mpidr, self.processor_count);
+            gic.init_cpu(index);
+            GicCpuInterface::enable_group1(true);
+            GicCpuInterface::set_priority_mask(PRIORITY_MASK_ALL);
+            for intid in [VIRTUAL_TIMER_PPI, WAKE_SGI] {
+                gic.enable_interrupt(intid, Some(index), true)
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "AArch64 GIC could not enable {intid:?} on redistributor {index}: {error}"
+                        )
+                    });
+            }
+            index
+        });
         tracing::debug!("GICv3 cpu interface online mpidr={mpidr:#x} redistributor={index}");
     }
 
     /// Routes a device interrupt to the processor with `mpidr` and
     /// enables it with the trigger mode the device tree declared.
     pub(crate) fn enable_device_interrupt(&self, intid: IntId, trigger: Trigger, mpidr: u64) {
-        let mut gic = self.inner.lock();
-        gic.distributor()
-            .set_routing(intid, Some(mpidr & MPIDR_AFFINITY_MASK))
-            .unwrap_or_else(|error| panic!("AArch64 GIC could not route {intid:?}: {error}"));
-        gic.set_trigger(intid, None, trigger)
-            .unwrap_or_else(|error| {
-                panic!("AArch64 GIC could not set the trigger of {intid:?}: {error}")
-            });
-        gic.enable_interrupt(intid, None, true)
-            .unwrap_or_else(|error| panic!("AArch64 GIC could not enable {intid:?}: {error}"));
+        self.with_registers(|gic| {
+            gic.distributor()
+                .set_routing(intid, Some(mpidr & MPIDR_AFFINITY_MASK))
+                .unwrap_or_else(|error| panic!("AArch64 GIC could not route {intid:?}: {error}"));
+            gic.set_trigger(intid, None, trigger)
+                .unwrap_or_else(|error| {
+                    panic!("AArch64 GIC could not set the trigger of {intid:?}: {error}")
+                });
+            gic.enable_interrupt(intid, None, true)
+                .unwrap_or_else(|error| panic!("AArch64 GIC could not enable {intid:?}: {error}"));
+        });
         tracing::info!("GICv3 routed {intid:?} to mpidr={mpidr:#x} trigger={trigger:?}");
     }
 
@@ -138,12 +159,19 @@ impl Gic {
     /// serviced yet; the driver's `unmask` is what arms the line again.
     /// Routing and trigger mode are untouched, so an unmask restores
     /// exactly the configuration bring-up established.
+    ///
+    /// This is the one taker of the distributor lock that runs outside
+    /// bring-up, and it runs from both sides: a driver's `unmask` on a
+    /// task, and the kernel's `mask` in interrupt context. The critical
+    /// section inside [`Gic::with_registers`] is what keeps the second
+    /// from landing on a processor whose own task holds the lock.
     pub(crate) fn set_device_interrupt_enabled(&self, intid: IntId, enabled: bool) {
-        let mut gic = self.inner.lock();
-        gic.enable_interrupt(intid, None, enabled)
-            .unwrap_or_else(|error| {
-                panic!("AArch64 GIC could not set the enable of {intid:?}: {error}")
-            });
+        self.with_registers(|gic| {
+            gic.enable_interrupt(intid, None, enabled)
+                .unwrap_or_else(|error| {
+                    panic!("AArch64 GIC could not set the enable of {intid:?}: {error}")
+                });
+        });
     }
 }
 

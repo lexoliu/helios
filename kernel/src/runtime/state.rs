@@ -681,7 +681,6 @@ where
         &self.inner.http_client
     }
 
-    /// Publishes the root DRBG the backend seeded at boot.
     /// The devices discovery is willing to hand to user-mode drivers.
     ///
     /// The registry is the one place a device's ownership is decided, so
@@ -691,6 +690,7 @@ where
         &self.inner.device_grants
     }
 
+    /// Publishes the root DRBG the backend seeded at boot.
     pub fn install_root_entropy(&self, root: RootEntropyHandle) {
         let mut installed = false;
         self.inner.root_entropy.call_once(|| {

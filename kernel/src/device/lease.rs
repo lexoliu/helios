@@ -276,7 +276,7 @@ impl GrantLease {
     /// like any other instance that asked for too much.
     pub fn dma_alloc(&mut self, bytes: u64, align: u64) -> Result<DmaBuffer, GrantError> {
         if bytes == 0 {
-            return Err(GrantError::BudgetExhausted);
+            return Err(GrantError::EmptyRequest);
         }
         if align == 0 || !align.is_power_of_two() {
             return Err(GrantError::BadAlignment);
@@ -286,7 +286,13 @@ impl GrantLease {
         }
         let budget = self.device.grant.dma();
         let granule = self.granule();
-        let bytes = bytes.next_multiple_of(granule);
+        // `bytes` came from the driver, so the rounding is checked: an
+        // unchecked one wraps in a release build and would answer a
+        // request for most of the address space with a buffer of a few
+        // bytes, which the driver would then hand to the hardware.
+        let bytes = bytes
+            .checked_next_multiple_of(granule)
+            .ok_or(GrantError::WindowExhausted)?;
         if self.pinned_bytes + bytes > budget.byte_budget {
             return Err(GrantError::BudgetExhausted);
         }

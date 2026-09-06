@@ -10,9 +10,15 @@
 //! # Concurrency contract
 //!
 //! Both tables are installed once, on the bootstrap hart, before any
-//! secondary is started. [`mask`] runs in interrupt context and writes
-//! a PLIC enable bit, which is a single memory-mapped word rather than
-//! a lock.
+//! secondary is started.
+//!
+//! Masking is not a single store. A PLIC enable bit lives in a 32-bit
+//! word shared with thirty-one other sources, and the `plic` crate
+//! reads, modifies and writes that whole word — so two harts arming or
+//! holding off two *different* sources in the same word lose a bit
+//! between them. [`set_source_enabled`] is the only writer of those
+//! words in this backend, and it serialises them; see the lock's own
+//! comment for why the critical section is part of that.
 
 use alloc::vec::Vec;
 use core::num::NonZeroU32;
@@ -28,7 +34,7 @@ use helios_kernel::{
     DeviceInterruptRoute, DeviceName, DeviceVmHooks, DmaBudget, GrantError, GrantInterrupt,
 };
 use plic::Plic;
-use spin::Once;
+use spin::{Mutex, Once};
 
 use crate::net::{InterruptSourceId, PlicContext};
 
@@ -46,6 +52,38 @@ fn controller() -> (&'static Plic, PlicContext) {
     *CONTROLLER
         .get()
         .expect("a granted device's interrupt was masked before the controller was published")
+}
+
+/// Serialises the PLIC's enable words.
+///
+/// `plic::Plic::enable` and `disable` are a read-modify-write of the
+/// 32-bit word that carries a source's enable bit, and that word covers
+/// thirty-two sources. Two harts touching two different sources in the
+/// same word therefore race, and one of them loses its bit — a granted
+/// device that stops delivering, or worse, a kernel device that does.
+///
+/// The lock is taken with interrupts masked on the local hart because
+/// one of the writers is a granted device's [`mask`], which runs in
+/// interrupt context: a task holding this lock and then interrupted
+/// into `mask` on its own hart would spin on itself.
+static ENABLE_WORDS: Mutex<()> = Mutex::new(());
+
+/// Arm or hold off one PLIC source, without disturbing the thirty-one
+/// that share its enable word.
+pub(crate) fn set_source_enabled(
+    plic: &Plic,
+    context: PlicContext,
+    source: InterruptSourceId,
+    enabled: bool,
+) {
+    critical_section::with(|_| {
+        let _words = ENABLE_WORDS.lock();
+        if enabled {
+            plic.enable(source, context);
+        } else {
+            plic.disable(source, context);
+        }
+    });
 }
 
 fn source(raw: u32) -> InterruptSourceId {
@@ -90,12 +128,12 @@ static VM_HOOKS: DeviceVmHooks = DeviceVmHooks {
 
 fn mask(raw: u32) {
     let (plic, context) = controller();
-    plic.disable(source(raw), context);
+    set_source_enabled(plic, context, source(raw), false);
 }
 
 fn unmask(raw: u32) {
     let (plic, context) = controller();
-    plic.enable(source(raw), context);
+    set_source_enabled(plic, context, source(raw), true);
 }
 
 static INTERRUPT_HOOKS: DeviceInterruptHooks = DeviceInterruptHooks { mask, unmask };
@@ -181,7 +219,7 @@ pub(crate) fn publish_grants(
             continue;
         };
         plic.set_priority(device.source, 1);
-        plic.disable(device.source, context);
+        set_source_enabled(plic, context, device.source, false);
         routes.push((
             device.source,
             DeviceInterruptRoute::new(

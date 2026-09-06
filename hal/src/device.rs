@@ -185,11 +185,6 @@ impl DmaCapability {
     }
 }
 
-/// A device that masters the bus, and the reach it does it with.
-///
-/// Implemented by a backend's handle on a discovered device, so the
-/// kernel can ask a device what it is capable of without knowing which
-/// bus it was found on.
 /// What a physically contiguous allocation has to satisfy for the
 /// device that will read it.
 ///
@@ -219,6 +214,11 @@ impl DmaPlacement {
     }
 }
 
+/// A device that masters the bus, and the reach it does it with.
+///
+/// Implemented by a backend's handle on a discovered device, so the
+/// kernel can ask a device what it is capable of without knowing which
+/// bus it was found on.
 pub trait DmaCapable {
     fn dma_capability(&self) -> DmaCapability;
 }

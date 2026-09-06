@@ -129,7 +129,12 @@ impl ExternalInterrupts {
 
     fn enable_source(&self, source: InterruptSourceId) {
         self.plic.set_priority(source, 1);
-        self.plic.enable(source, self.context);
+        // Through the device path's guarded accessor, because that is
+        // the one place that owns the read-modify-write of a PLIC
+        // enable word — see its comment. A kernel device brought up
+        // while a granted one is being masked would otherwise lose a
+        // bit to it.
+        crate::device::set_source_enabled(self.plic, self.context, source, true);
         self.plic.set_threshold(self.context, 0);
     }
 

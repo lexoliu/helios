@@ -36,6 +36,10 @@ interface device {
     budget-exhausted,
     /// The alignment asked for is not a power of two.
     bad-alignment,
+    /// A buffer of no bytes was asked for. Distinct from the budget
+    /// being exhausted: nothing was refused, there was nothing to ask
+    /// for.
+    empty-request,
     /// The kernel could allocate the buffer but the device cannot
     /// address it.
     unreachable,
