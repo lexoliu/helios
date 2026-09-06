@@ -136,6 +136,20 @@ build-instrumented arch:
     cargo run -p helios-inspector --quiet -- \
         vm --arch {{arch}} --profile-generate build
 
+# Build the PGO kernel image of docs/pgo.md for `arch` (aarch64, riscv64,
+# x86-64) against `profile`, a merged `.profdata`, and stop there.
+#
+# The mirror of `build-instrumented`: the PGO rustflags have one
+# definition, in the inspector, so what this builds and what a
+# `--profile-use` boot builds cannot drift. The profile is an argument
+# because a PGO kernel is only as good as the profile behind it, and the
+# inspector refuses one this toolchain cannot read before cargo starts.
+# `bench-suite.yml` uploads one as `helios-kernel-profdata`.
+# Usage: just kernel-pgo-use x86-64 target/pgo/helios-kernel.profdata
+kernel-pgo-use arch profile:
+    cargo run -p helios-inspector --quiet -- \
+        vm --arch {{arch}} --profile-use {{profile}} build
+
 # Equivalent of AGENTS §7 required checks. Run before declaring a change complete.
 check-all:
     just check-host
