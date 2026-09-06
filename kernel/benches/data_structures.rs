@@ -732,8 +732,6 @@ impl ComponentNetworkService for BenchNetworkService {
     }
 
     fn udp_close(&self, _socket: Self::UdpSocket) {}
-
-    fn wake_packet_pump(&self) {}
 }
 
 impl Cpu for BenchCpu {

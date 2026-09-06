@@ -769,12 +769,20 @@ pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
 
     /// Retires a stream. Synchronous because the owner that ends a
     /// stream's life is a `Drop`, which cannot await.
+    ///
+    /// An implementation publishes what the retirement queued before it
+    /// returns, the way a completed write publishes its payload (#181).
+    /// A close leaves a FIN sequence to run or a reset on the outbound
+    /// queue and puts no frame on the wire by itself, so an owner that
+    /// had to ask for the transmission separately would be an owner
+    /// that could forget to (#231).
     fn tcp_close(&self, stream: Self::TcpStream);
 
     /// Retires a listener, releasing the local port it held. Connections
     /// already accepted are streams of their own and live on; ones still
     /// queued in the backlog are reset. Synchronous for the same reason
-    /// [`ComponentNetworkService::tcp_close`] is.
+    /// [`ComponentNetworkService::tcp_close`] is, and it publishes
+    /// those resets for the same reason.
     fn tcp_listener_close(&self, listener: Self::TcpListener);
 
     fn udp_bind(
@@ -833,22 +841,10 @@ pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
 
     /// Retires a datagram socket. Synchronous because the owner that
     /// ends a socket's life is a `Drop`, which cannot await.
+    ///
+    /// A datagram socket owes its peers no shutdown sequence, so unlike
+    /// the TCP closes this queues nothing and publishes nothing.
     fn udp_close(&self, socket: Self::UdpSocket);
-
-    /// Wakes the packet pump so a segment a synchronous retirement
-    /// queued leaves on the next executor turn.
-    ///
-    /// Retiring a connection queues its FIN or RST on the stack's
-    /// outbound queue and puts nothing on the wire: the pump is what
-    /// publishes it, and an idle pump parks until the next protocol
-    /// deadline, a second away on a quiet guest (#232). A write already
-    /// publishes what it queued before it returns; a retirement cannot,
-    /// because it happens in a `Drop` with nothing to await, so the
-    /// owner that drains the retirements calls this once afterwards.
-    ///
-    /// Callable from any processor: the wake is a signal raise, never a
-    /// poll.
-    fn wake_packet_pump(&self);
 }
 
 pub trait ComponentNetworkState<Service>: Clone + Send + 'static

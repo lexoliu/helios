@@ -126,22 +126,23 @@ impl SocketRetirementSender {
     }
 }
 
-/// Closes everything `retired` holds through `service`, and wakes the
-/// packet pump if anything closed.
+/// Closes everything `retired` holds through `service`.
 ///
-/// The one place a queued id becomes a close. The pump kick is what
-/// carries the FIN or RST those closes queued onto the wire on the next
-/// executor turn instead of the next protocol deadline, a second away
-/// on a quiet guest (#232); one kick covers the whole batch, because
-/// the segments are all in the same outbound queue by the time it is
-/// raised.
+/// The one place a queued id becomes a close. Carrying the FIN or RST
+/// a close queues onto the wire is the close's own job and not this
+/// batch's: #232 kicked the packet pump here, once per drain, which
+/// left every synchronous closer that reaches the service directly —
+/// [`crate::ComponentTcpBackend::close`], a preview1 descriptor's
+/// `Drop` — waiting on the pump's next park (#231). The kick now ends
+/// [`crate::ComponentNetworkService::tcp_close`] itself, so this drain
+/// closes and nothing more.
 ///
 /// Answers how many handles it closed.
 pub fn retire_queued_handles<Service>(retired: &SocketRetirementQueue, service: &Service) -> usize
 where
     Service: crate::ComponentNetworkService,
 {
-    let closed = retired.drain(|handle| match handle {
+    retired.drain(|handle| match handle {
         RetiredNetworkHandle::TcpStream(stream) => {
             service.tcp_close(crate::NetworkHandle::from_raw(stream));
         }
@@ -151,11 +152,7 @@ where
         RetiredNetworkHandle::UdpSocket(socket) => {
             service.udp_close(crate::NetworkHandle::from_raw(socket));
         }
-    });
-    if closed != 0 {
-        service.wake_packet_pump();
-    }
-    closed
+    })
 }
 
 /// The store's end of the retirement queue.
@@ -247,16 +244,10 @@ mod tests {
         assert_eq!(listeners.last(), 41);
         assert_eq!(sockets.count(), 1);
         assert_eq!(sockets.last(), 9);
-        assert_eq!(
-            service.packet_pump_wakes(),
-            1,
-            "one kick covers the whole batch of segments the closes queued"
-        );
     }
 
-    /// A store torn down with an empty queue closes nothing and leaves
-    /// the packet pump alone, which is every store that never opened a
-    /// socket.
+    /// A store torn down with an empty queue closes nothing, which is
+    /// every store that never opened a socket.
     #[test]
     fn a_store_teardown_with_nothing_queued_costs_nothing() {
         let service = TestNetworkService::new();
@@ -266,7 +257,6 @@ mod tests {
 
         drop(retirement);
         assert_eq!(streams.count(), 0);
-        assert_eq!(service.packet_pump_wakes(), 0);
     }
 
     /// Handles come back in push order, so a drain closes a socket's
