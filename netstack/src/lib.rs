@@ -63,8 +63,8 @@ pub use stack::{
 };
 pub use tcp::{TCP_RECEIVE_WINDOW_BYTES, TCP_TRANSMIT_BUFFER_BYTES};
 pub use tcp::{
-    TcpAckQueued, TcpCloseKind, TcpEndpoint, TcpReset, TcpSegmentBudget, TcpSegmentOutcome,
-    TcpSocket, TcpState, TcpStateChangeReason, TcpTransmitSegment,
+    TcpAckQueued, TcpCloseKind, TcpEndpoint, TcpReceiveCounters, TcpReset, TcpSegmentBudget,
+    TcpSegmentOutcome, TcpSocket, TcpState, TcpStateChangeReason, TcpTransmitSegment,
 };
 pub use types::{
     EthernetAddress, IpAddress, IpCidr, Ipv4Address, Ipv4Cidr, Ipv6Address, Ipv6Cidr, Ipv6Scope,
@@ -685,6 +685,24 @@ pub trait NetworkInterface: Clone + Send + Sync + 'static {
     /// across processors instead of piling on one. Zero for an interface
     /// that cannot tell its queues apart.
     fn queue_interrupts(&self, queue_idx: usize) -> u64 {
+        let _ = queue_idx;
+        0
+    }
+
+    /// Times receive on this queue pair had to pause because every
+    /// reassembly buffer was checked out. Nonzero means the reassembly
+    /// pool is too small for the number of concurrent multi-buffer frames
+    /// in flight. Zero for an interface that has no reassembly pool.
+    fn rx_pool_stalls(&self, queue_idx: usize) -> u64 {
+        let _ = queue_idx;
+        0
+    }
+
+    /// Free reassembly buffers currently available for this queue pair.
+    /// Zero while traffic is arriving indicates the driver cannot
+    /// assemble chained frames until delivered frames are released.
+    /// Zero for an interface that has no reassembly pool.
+    fn rx_pool_free(&self, queue_idx: usize) -> u32 {
         let _ = queue_idx;
         0
     }

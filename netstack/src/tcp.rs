@@ -160,6 +160,38 @@ pub struct TcpSegmentOutcome {
     pub reset: Option<TcpReset>,
 }
 
+/// What a socket's receive side has seen from its peer since it was
+/// opened. Running totals the stack folds into its own per-shard
+/// counters after every segment, so a socket that closes takes nothing
+/// with it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TcpReceiveCounters {
+    /// Segments whose whole payload lay at or below `receive_next`: the
+    /// peer resent data this side had already acknowledged.
+    pub peer_retransmits_received: u64,
+    /// Calls to `request_duplicate_ack`, one per segment that arrived
+    /// out of order or out of window.
+    pub duplicate_acks_requested: u64,
+}
+
+impl TcpReceiveCounters {
+    /// Adds what one socket saw between two snapshots to a running
+    /// total. The stack calls it after every segment, so the total
+    /// outlives the socket.
+    pub fn fold(&mut self, before: Self, after: Self) {
+        self.peer_retransmits_received = self.peer_retransmits_received.saturating_add(
+            after
+                .peer_retransmits_received
+                .wrapping_sub(before.peer_retransmits_received),
+        );
+        self.duplicate_acks_requested = self.duplicate_acks_requested.saturating_add(
+            after
+                .duplicate_acks_requested
+                .wrapping_sub(before.duplicate_acks_requested),
+        );
+    }
+}
+
 /// What one acknowledgement put on the wire was for.
 ///
 /// A pure ACK is indistinguishable from a window update on the wire, so
@@ -690,6 +722,7 @@ where
     receive_fin_sequence: Option<u32>,
     out_of_order: Option<TcpOutOfOrderQueue>,
     out_of_order_queued_bytes: usize,
+    receive_counters: TcpReceiveCounters,
     transmit_queue: Option<TcpTransmitQueue>,
     in_flight: Option<TcpInFlightQueue>,
     bytes_in_flight: u32,
@@ -834,6 +867,7 @@ where
             receive_fin_sequence: None,
             out_of_order: None,
             out_of_order_queued_bytes: 0,
+            receive_counters: TcpReceiveCounters::default(),
             transmit_queue: None,
             in_flight: None,
             bytes_in_flight: 0,
@@ -1093,6 +1127,23 @@ where
     /// bytes rather than in the header's scaled units.
     pub fn advertised_receive_window_bytes(&self) -> u32 {
         self.local_receive_window_bytes()
+    }
+
+    /// In-order data currently waiting in the receive queue that user
+    /// space has not read yet, in bytes.
+    pub fn receive_queued_bytes(&self) -> usize {
+        self.receive_queued_bytes
+    }
+
+    /// Data held in the out-of-order reassembly queue, in bytes.
+    pub fn out_of_order_queued_bytes(&self) -> usize {
+        self.out_of_order_queued_bytes
+    }
+
+    /// What the receive side has seen from the peer since the socket
+    /// was opened.
+    pub fn receive_counters(&self) -> TcpReceiveCounters {
+        self.receive_counters
     }
 
     pub fn pending_ack_options(&self, now_nanos: u64) -> TcpHeaderOptions {
@@ -1858,6 +1909,7 @@ where
                 {
                     // RFC 9293 3.10.7.4: every unacceptable segment is
                     // answered with an acknowledgement of its own.
+                    self.record_old_payload(packet.sequence, packet.payload.len());
                     self.request_duplicate_ack();
                     return TcpSegmentOutcome::default();
                 }
@@ -2390,6 +2442,24 @@ where
         Some(bytes)
     }
 
+    /// Counts a segment whose whole payload lies at or below
+    /// `receive_next` as a retransmission by the peer. Two paths see
+    /// one: the acceptability check refuses a segment that is entirely
+    /// old, and `receive_payload` catches the same shape when the
+    /// window check let it through by its end edge.
+    fn record_old_payload(&mut self, sequence: u32, payload_len: usize) {
+        let payload_len = u32::try_from(payload_len).unwrap_or(u32::MAX);
+        if payload_len == 0 {
+            return;
+        }
+        if sequence_leq(sequence.wrapping_add(payload_len), self.receive_next) {
+            self.receive_counters.peer_retransmits_received = self
+                .receive_counters
+                .peer_retransmits_received
+                .saturating_add(1);
+        }
+    }
+
     fn receive_payload(
         &mut self,
         sequence: u32,
@@ -2402,6 +2472,7 @@ where
             // Data the peer already had acknowledged. It resent it
             // because it believes something was lost, so answer every
             // copy rather than one per batch.
+            self.record_old_payload(sequence, payload.len());
             self.request_duplicate_ack();
             return Ok(false);
         }
@@ -2719,6 +2790,10 @@ where
     /// which is every peer that did not negotiate it — has no other way
     /// to say so.
     fn request_duplicate_ack(&mut self) {
+        self.receive_counters.duplicate_acks_requested = self
+            .receive_counters
+            .duplicate_acks_requested
+            .saturating_add(1);
         self.pending_acks = self.pending_acks.saturating_add(1).min(TCP_MAX_QUEUED_ACKS);
         self.delayed_ack_deadline_nanos = None;
         self.unacked_receive_segments = 0;

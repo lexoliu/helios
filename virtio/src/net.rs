@@ -583,6 +583,10 @@ impl RxReassemblyPool {
         !self.free.slots.lock().is_empty()
     }
 
+    fn free_count(&self) -> usize {
+        self.free.slots.lock().len()
+    }
+
     /// Checks a buffer out of the pool as the owner of the frame that
     /// will be assembled into it.
     ///
@@ -665,6 +669,9 @@ struct NetQueuePair<T: VirtioTransport> {
     /// processor that drains the pair, so the counts spread instead of
     /// piling on whichever processor owns a single vector.
     interrupt_count: AtomicU64,
+    /// Times receive on this queue pair had to pause because every
+    /// reassembly buffer was checked out.
+    rx_pool_stalls: AtomicU64,
     /// Progress on this pair alone.
     ///
     /// A per-CPU queue layout wants a per-queue wake: a waiter whose
@@ -1119,6 +1126,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
 
             queue_pairs.push(CachePadded::new(NetQueuePair {
                 interrupt_count: AtomicU64::new(0),
+                rx_pool_stalls: AtomicU64::new(0),
                 interrupts: Notify::new(),
                 rx_state: AsyncMutex::new(NetRxState {
                     rx_queue,
@@ -1556,6 +1564,26 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             .map_or(0, |pair| pair.interrupt_count.load(Ordering::Relaxed))
     }
 
+    /// Times receive on this queue pair had to pause because every
+    /// reassembly buffer was checked out. Nonzero means the reassembly
+    /// pool is too small for the number of concurrent multi-buffer frames
+    /// in flight.
+    pub fn rx_pool_stalls(&self, pair_idx: usize) -> u64 {
+        self.queue_pairs
+            .get(self.normalize_pair_idx(pair_idx))
+            .map_or(0, |pair| pair.rx_pool_stalls.load(Ordering::Relaxed))
+    }
+
+    /// Free reassembly buffers currently available on this queue pair.
+    /// Zero while traffic is arriving indicates the driver cannot
+    /// assemble chained frames until delivered frames are released.
+    pub fn rx_pool_free(&self, pair_idx: usize) -> u32 {
+        self.queue_pairs
+            .get(self.normalize_pair_idx(pair_idx))
+            .and_then(|pair| pair.rx_reassembly.as_ref())
+            .map_or(0, |pool| pool.free_count() as u32)
+    }
+
     /// Handles an interrupt raised by the configuration-change vector.
     pub fn handle_configuration_interrupt(&self) {
         self.transport.ack_interrupt();
@@ -1743,6 +1771,9 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
     ) -> IoResult<Option<RxFrame>> {
         let reassembly = self.queue_pairs[pair_idx].rx_reassembly.as_ref();
         if reassembly.is_some_and(|pool| !pool.has_free()) {
+            self.queue_pairs[pair_idx]
+                .rx_pool_stalls
+                .fetch_add(1, Ordering::Relaxed);
             return Ok(None);
         }
         let Some((token, used_len)) = state.rx_queue.pop_used_with_len() else {
@@ -2799,6 +2830,50 @@ mod tests {
             0,
             "every receive slot must be back in the device's hands"
         );
+    }
+
+    /// Exhausting the reassembly pool stalls receive until delivered
+    /// frames are dropped and release their buffers back to the pool.
+    #[test]
+    fn reassembly_pool_exhaustion_stalls_and_recovers() {
+        let harness = NetHarness::new(RECEIVE_OFFLOAD_FEATURES);
+        assert_eq!(harness.device.rx_pool_free(0), 2);
+        assert_eq!(harness.device.rx_pool_stalls(0), 0);
+
+        let head = vec![0x11_u8; 4000];
+        let tail = vec![0x22_u8; 1000];
+
+        let frame1 = harness
+            .deliver_chain(0, RxDeviceHeader::default(), &[&head, &tail])
+            .expect("a well-formed chain is accepted")
+            .expect("the driver should deliver the assembled frame");
+        assert_eq!(harness.device.rx_pool_free(0), 1);
+
+        let frame2 = harness
+            .deliver_chain(2, RxDeviceHeader::default(), &[&head, &tail])
+            .expect("a well-formed chain is accepted")
+            .expect("the driver should deliver the assembled frame");
+        assert_eq!(harness.device.rx_pool_free(0), 0);
+
+        harness.complete_rx(
+            4,
+            DeviceRxBuffer {
+                header: Some(RxDeviceHeader {
+                    num_buffers: 2,
+                    ..RxDeviceHeader::default()
+                }),
+                payload: &head,
+            },
+        );
+
+        let stalled = harness.receive().expect("stalled receive should not error");
+        assert!(stalled.is_none());
+        assert_eq!(harness.device.rx_pool_stalls(0), 1);
+        assert_eq!(harness.device.rx_pool_free(0), 0);
+
+        drop(frame1);
+        drop(frame2);
+        assert_eq!(harness.device.rx_pool_free(0), 2);
     }
 
     /// A device that completes a buffer which was not the next one made

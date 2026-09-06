@@ -164,6 +164,14 @@ impl NetworkDevice for VirtioNetworkDevice {
     fn queue_interrupts(&self, queue_idx: usize) -> u64 {
         self.inner.queue_interrupts(queue_idx)
     }
+
+    fn rx_pool_stalls(&self, queue_idx: usize) -> u64 {
+        self.inner.rx_pool_stalls(queue_idx)
+    }
+
+    fn rx_pool_free(&self, queue_idx: usize) -> u32 {
+        self.inner.rx_pool_free(queue_idx)
+    }
 }
 
 fn discover_network_device(
