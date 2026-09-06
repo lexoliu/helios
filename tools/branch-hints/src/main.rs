@@ -3,6 +3,7 @@
 //! fit together and where the profiles come from.
 
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
 use helios_branch_hints::{
@@ -78,11 +79,26 @@ struct HintArgs {
     output: PathBuf,
 }
 
-fn main() -> Result<(), Error> {
-    match Cli::parse().command {
+fn main() -> ExitCode {
+    let result = match Cli::parse().command {
         Command::Instrument(args) => run_instrument(&args),
         Command::Record(args) => run_record(&args),
         Command::Hint(args) => run_hint(&args),
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            // A build log gets the sentence, not the Debug form: the
+            // failure this most often reports is a stale profile, and the
+            // message says which module and what to do about it.
+            eprintln!("helios-branch-hints: {error}");
+            let mut source = std::error::Error::source(&error);
+            while let Some(cause) = source {
+                eprintln!("  caused by: {cause}");
+                source = cause.source();
+            }
+            ExitCode::FAILURE
+        }
     }
 }
 
