@@ -305,8 +305,14 @@ and never comes from CI.
   time-cost framing do not appear in a proposal. The criteria are whether the
   change resolves a root problem, whether the result tracks modern practice
   and reads more cleanly, and whether it introduces a contract violation.
-- Large changes are discussed before they are built, to align on direction.
-  That discussion is for alignment, never for permission to land a degraded
+- "Discuss before building" is a rule about public API: the surface a
+  library exposes to other people, where a reshape is a commitment. Inside
+  this tree it almost never applies. A large internal change, a core
+  subsystem replaced included, is recorded on its issue with the diagnosis
+  and the decision, then built and measured; that record is the whole of
+  the discussion, and a performance change in particular is gated by the
+  paired measurement of §3.6 and by nothing else. Where a discussion does
+  happen it is for alignment, never for permission to land a degraded
   variant.
 
 ## 4. Async-first execution
