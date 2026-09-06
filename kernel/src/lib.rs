@@ -203,7 +203,6 @@ use core::time::Duration;
 use arrayvec::ArrayVec;
 use buddy_system_allocator::Heap;
 use helios_hal::cpu::{Cpu, Instant, ProcessorId};
-use helios_hal::critical_section::with_local_interrupts_masked;
 use helios_hal::memory::MemoryRegion;
 use helios_hal::watchdog::{NoWatchdog, ProgressCounter, Watchdog};
 use helios_hal::{DeviceInventory, DmaModel, ProcessorStartupPolicy, ProcessorTopology};
@@ -383,9 +382,10 @@ struct KernelAllocator<const ORDER: usize> {
     magazines: memory::HeapMagazines,
     /// The counters for allocations no processor could claim, because
     /// the processor serving them still carried a bootstrapping
-    /// identity or the front had not been sized yet. Boot-only, and
-    /// stepped atomically because two bootstrapping processors may
-    /// reach it at once.
+    /// identity or the front had not been sized yet. Boot-only, and the
+    /// one block several processors may reach at once, which is the
+    /// case a per-processor block never has and the reason the atomic
+    /// step every block takes is the right one for both.
     unslotted_stats: memory::HeapCounters,
     /// Whether the size-class breakdown is being collected. Read on
     /// every allocation and written only when profiling is switched, so
@@ -745,41 +745,35 @@ impl<const ORDER: usize> KernelAllocator<ORDER> {
             .store(enabled, Ordering::Release);
     }
 
-    /// Counts one allocation on the processor that served it.
+    /// The counter block the calling processor steps: its own, or the
+    /// one block for a processor that cannot name a slot yet.
     ///
-    /// A processor's own counters are plain words behind the local
-    /// interrupt mask; the block for a processor that cannot name a
-    /// slot is shared and steps atomically. `memory::magazine` states
-    /// why the two differ.
+    /// Both step with a relaxed `fetch_add`, and `memory::magazine`
+    /// says why an owned block does too rather than taking the local
+    /// interrupt mask a plain step would need: the mask is two calls
+    /// through the backend's linkage plus an interrupt-state write, on
+    /// every kernel allocation, and it costs more than the uncontended
+    /// atomic it saves (#169).
+    #[inline]
+    fn counters<'front>(
+        &'front self,
+        front: Option<&'front memory::ProcessorFront>,
+    ) -> &'front memory::HeapCounters {
+        front.map_or(&self.unslotted_stats, memory::ProcessorFront::counters)
+    }
+
+    /// Counts one allocation on the processor that served it.
     #[inline]
     fn record_alloc(&self, front: Option<&memory::ProcessorFront>, size: usize) {
-        let metrics = self.size_class_metrics();
-        match front {
-            Some(front) => with_local_interrupts_masked(|| {
-                front
-                    .counters()
-                    .record_alloc::<memory::OwnedStep>(size, metrics);
-            }),
-            None => self
-                .unslotted_stats
-                .record_alloc::<memory::SharedStep>(size, metrics),
-        }
+        self.counters(front)
+            .record_alloc(size, self.size_class_metrics());
     }
 
     /// Counts one deallocation; see [`Self::record_alloc`].
     #[inline]
     fn record_dealloc(&self, front: Option<&memory::ProcessorFront>, size: usize) {
-        let metrics = self.size_class_metrics();
-        match front {
-            Some(front) => with_local_interrupts_masked(|| {
-                front
-                    .counters()
-                    .record_dealloc::<memory::OwnedStep>(size, metrics);
-            }),
-            None => self
-                .unslotted_stats
-                .record_dealloc::<memory::SharedStep>(size, metrics),
-        }
+        self.counters(front)
+            .record_dealloc(size, self.size_class_metrics());
     }
 
     /// Counts one reallocation; see [`Self::record_alloc`].
@@ -790,18 +784,8 @@ impl<const ORDER: usize> KernelAllocator<ORDER> {
         old_size: usize,
         new_size: usize,
     ) {
-        let metrics = self.size_class_metrics();
-        match front {
-            Some(front) => with_local_interrupts_masked(|| {
-                front
-                    .counters()
-                    .record_realloc::<memory::OwnedStep>(old_size, new_size, metrics);
-            }),
-            None => {
-                self.unslotted_stats
-                    .record_realloc::<memory::SharedStep>(old_size, new_size, metrics);
-            }
-        }
+        self.counters(front)
+            .record_realloc(old_size, new_size, self.size_class_metrics());
     }
 }
 

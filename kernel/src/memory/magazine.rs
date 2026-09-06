@@ -37,14 +37,20 @@
 //!   the whole of it. With interrupts masked the owner cannot be
 //!   preempted, so it cannot migrate mid-operation and no second
 //!   processor can arrive.
-//! - **Owner writes, anyone reads.** [`ProcessorFront::depths`] and
+//! - **Owner writes, anyone reads.** [`ProcessorFront::depths`],
+//!   [`ProcessorFront::magazine_counters`] and
 //!   [`ProcessorFront::counters`] are written by the owner and read by
 //!   whichever processor answers `heap_stats()`. They are atomics for
-//!   that reason alone: the owner steps them with a relaxed load, an
-//!   add and a relaxed store — a plain read-modify-write on every
-//!   target here and never a locked one, because a single writer needs
-//!   no atomicity against itself. [`CounterStep`] names that, and names
-//!   the locked step the one shared counter block takes instead.
+//!   that reason, and how the owner steps them depends on where the
+//!   step sits. The depths and the magazine counters are stepped from
+//!   inside the masked region the magazine operation already holds, so
+//!   they take [`step_owned`]: a relaxed load, an add and a relaxed
+//!   store, which no target lowers to a locked instruction, because a
+//!   single writer needs no atomicity against itself. The heap
+//!   counters are stepped on paths that have no masked region of their
+//!   own, and they take a relaxed `fetch_add` instead of opening one;
+//!   [`HeapCounters`] says why that is the cheaper of the two rather
+//!   than a concession.
 //!
 //! There is no cross-processor free path and no return queue, because
 //! there is nothing for one to carry: a free is served by the magazine
@@ -142,14 +148,18 @@ pub(crate) const MAGAZINE_BATCH: usize = 16;
 /// walking that class's free list from the head, so a block a magazine
 /// holds is a block whose buddy arrives at the heap, finds nothing to
 /// merge with, and stays on the list — and every later free of the
-/// class walks past it. A magazine's depth is therefore the length of
-/// a scan the shared heap pays on every free of that class, and it is
-/// what the earlier byte budget failed to bound: it allowed 128 blocks
-/// of the hot classes on each processor, and the mass free that ends
-/// `instance-startup-100` — a hundred instances alive at once, then
-/// all destroyed — walked hundreds of unmergeable blocks per free
-/// (#169). The whole regression was there: the spawn half of that
-/// workload, which the magazines serve out of cache, never moved.
+/// class walks past it. A magazine's depth is therefore the length of a
+/// scan the shared heap pays on every free of that class, which is what
+/// bounds it here and what the earlier byte budget did not: that one
+/// allowed 128 blocks of the hot classes on each processor.
+///
+/// It is a bound worth keeping and it was not the `instance-startup-100`
+/// regression of #169. With this depth the workload's counters say the
+/// shared heap is not where its time goes at all: the front serves 96.3%
+/// of its allocations, every refill comes back with a full batch, and no
+/// allocation ever reaches the growth path because the buddy heap could
+/// not serve it. [`HeapCounters`] records what the cost turned out to
+/// be.
 const CLASS_CAPACITY: usize = 2 * MAGAZINE_BATCH;
 
 /// The link a cached block carries while it sits on a magazine, written
@@ -222,59 +232,55 @@ impl MagazineClass {
     }
 }
 
-/// How a counter block is stepped.
+/// Steps a counter whose only writer is the processor that owns it,
+/// from inside a region that already holds the local interrupt mask.
 ///
-/// A per-processor block has one writer, which needs no atomicity
-/// against itself and takes the local interrupt mask against its own
-/// interrupt handler; it steps with a relaxed load, an add and a
-/// relaxed store, which no target lowers to a locked instruction. The
-/// one block no processor owns — the counters an allocation made before
-/// its processor could name a slot lands on — may have several writers
-/// at once and steps with a real atomic add. The two are the same
-/// counters and the same arithmetic, so the difference is a type rather
-/// than a second copy of [`HeapCounters`].
-pub(crate) trait CounterStep {
-    fn add_u64(cell: &AtomicU64, by: u64);
-    fn add_usize_signed(cell: &AtomicUsize, by: isize);
-}
-
-/// The single-writer step; see [`CounterStep`].
-pub(crate) struct OwnedStep;
-
-impl CounterStep for OwnedStep {
-    #[inline]
-    fn add_u64(cell: &AtomicU64, by: u64) {
-        cell.store(
-            cell.load(Ordering::Relaxed).wrapping_add(by),
-            Ordering::Relaxed,
-        );
-    }
-
-    #[inline]
-    fn add_usize_signed(cell: &AtomicUsize, by: isize) {
-        cell.store(
-            cell.load(Ordering::Relaxed).wrapping_add_signed(by),
-            Ordering::Relaxed,
-        );
-    }
-}
-
-/// The many-writer step; see [`CounterStep`].
-pub(crate) struct SharedStep;
-
-impl CounterStep for SharedStep {
-    #[inline]
-    fn add_u64(cell: &AtomicU64, by: u64) {
-        cell.fetch_add(by, Ordering::Relaxed);
-    }
-
-    #[inline]
-    fn add_usize_signed(cell: &AtomicUsize, by: isize) {
-        cell.fetch_add(by as usize, Ordering::Relaxed);
-    }
+/// A relaxed load, an add and a relaxed store: no target lowers that to
+/// a locked instruction, because a single writer needs no atomicity
+/// against itself, and the mask the caller already holds is what keeps
+/// this processor's own interrupt handler from interleaving with it.
+///
+/// Legal only there. Every caller is a [`ProcessorFront`] method that
+/// took [`with_local_interrupts_masked`] for the whole of the operation
+/// it is counting, so the step is free; opening a masked region *for*
+/// the step would not be, which is what [`HeapCounters`] records.
+#[inline]
+fn step_owned(cell: &AtomicU64, by: u64) {
+    cell.store(
+        cell.load(Ordering::Relaxed).wrapping_add(by),
+        Ordering::Relaxed,
+    );
 }
 
 /// One block of kernel-heap allocation counters.
+///
+/// One per processor, plus the one block that serves a processor which
+/// cannot name a slot yet. Every field is stepped with a relaxed
+/// `fetch_add`.
+///
+/// # Why an atomic rather than the plain step
+///
+/// A per-processor block has one writer, so a plain load-add-store
+/// would be correct against every other processor and only this
+/// processor's own interrupt handler could interleave with it. Keeping
+/// that handler out costs one
+/// [`with_local_interrupts_masked`] region, and unlike the magazine's
+/// own counters there is no region here to fold the step into: a
+/// counter is stepped on every kernel allocation, magazine hit or not,
+/// including the classes no magazine caches. Opening a region for it
+/// means two calls through the backend's linkage — `_helios_local_
+/// interrupt_mask` and its restore are `#[no_mangle]` symbols the
+/// backend defines, so they are never inlined into the allocator — plus
+/// the architecture's interrupt-state write, `cli`/`sti` on x86-64 and
+/// `msr daifset`/`daifclr` on AArch64.
+///
+/// That is more than the atomic it avoids. The line belongs to this
+/// processor alone, so the add hits L1 in exclusive state and never
+/// leaves it, which is the whole reason the counters were split per
+/// processor in the first place. Masking for them instead cost
+/// `instance-startup-100` 2.6 % (#169): the workload makes about
+/// 40,000 kernel allocations per batch, and the shared heap it no
+/// longer reaches was never contended enough to pay that back.
 ///
 /// `requested_live_bytes` is the one field whose per-processor value is
 /// not a total: an allocation served on one processor may be freed on
@@ -318,50 +324,62 @@ impl HeapCounters {
     }
 
     /// Records one allocation of `size` bytes.
-    pub(crate) fn record_alloc<Step: CounterStep>(&self, size: usize, size_class_metrics: bool) {
+    pub(crate) fn record_alloc(&self, size: usize, size_class_metrics: bool) {
         let size_u64 = usize_to_u64(size, "kernel allocation size");
-        Step::add_u64(&self.allocation_count, 1);
-        Step::add_usize_signed(&self.requested_live_bytes, size_to_step(size));
-        Step::add_u64(&self.total_allocation_bytes, size_u64);
+        self.allocation_count.fetch_add(1, Ordering::Relaxed);
+        self.step_live_bytes(size_to_step(size));
+        self.total_allocation_bytes
+            .fetch_add(size_u64, Ordering::Relaxed);
         if size_class_metrics {
             let class = heap_size_class(size);
-            Step::add_u64(&self.size_class_allocation_count[class], 1);
-            Step::add_u64(&self.size_class_allocation_bytes[class], size_u64);
+            self.size_class_allocation_count[class].fetch_add(1, Ordering::Relaxed);
+            self.size_class_allocation_bytes[class].fetch_add(size_u64, Ordering::Relaxed);
         }
     }
 
     /// Records one deallocation of `size` bytes.
-    pub(crate) fn record_dealloc<Step: CounterStep>(&self, size: usize, size_class_metrics: bool) {
+    pub(crate) fn record_dealloc(&self, size: usize, size_class_metrics: bool) {
         let size_u64 = usize_to_u64(size, "kernel deallocation size");
-        Step::add_u64(&self.deallocation_count, 1);
-        Step::add_usize_signed(&self.requested_live_bytes, -size_to_step(size));
-        Step::add_u64(&self.total_deallocation_bytes, size_u64);
+        self.deallocation_count.fetch_add(1, Ordering::Relaxed);
+        self.step_live_bytes(-size_to_step(size));
+        self.total_deallocation_bytes
+            .fetch_add(size_u64, Ordering::Relaxed);
         if size_class_metrics {
             let class = heap_size_class(size);
-            Step::add_u64(&self.size_class_deallocation_count[class], 1);
-            Step::add_u64(&self.size_class_deallocation_bytes[class], size_u64);
+            self.size_class_deallocation_count[class].fetch_add(1, Ordering::Relaxed);
+            self.size_class_deallocation_bytes[class].fetch_add(size_u64, Ordering::Relaxed);
         }
     }
 
     /// Records one reallocation from `old_size` to `new_size`.
-    pub(crate) fn record_realloc<Step: CounterStep>(
+    pub(crate) fn record_realloc(
         &self,
         old_size: usize,
         new_size: usize,
         size_class_metrics: bool,
     ) {
         let new_size_u64 = usize_to_u64(new_size, "kernel reallocation size");
-        Step::add_u64(&self.reallocation_count, 1);
-        Step::add_usize_signed(
-            &self.requested_live_bytes,
-            size_to_step(new_size) - size_to_step(old_size),
-        );
-        Step::add_u64(&self.total_reallocation_bytes, new_size_u64);
+        self.reallocation_count.fetch_add(1, Ordering::Relaxed);
+        self.step_live_bytes(size_to_step(new_size) - size_to_step(old_size));
+        self.total_reallocation_bytes
+            .fetch_add(new_size_u64, Ordering::Relaxed);
         if size_class_metrics {
             let class = heap_size_class(new_size);
-            Step::add_u64(&self.size_class_reallocation_count[class], 1);
-            Step::add_u64(&self.size_class_reallocation_bytes[class], new_size_u64);
+            self.size_class_reallocation_count[class].fetch_add(1, Ordering::Relaxed);
+            self.size_class_reallocation_bytes[class].fetch_add(new_size_u64, Ordering::Relaxed);
         }
+    }
+
+    /// Moves `requested_live_bytes` by a signed amount.
+    ///
+    /// A free on a processor that did not serve the allocation drives
+    /// this word below zero, and the sum over every block is what is
+    /// meaningful, so it wraps rather than saturating; `fetch_add` of
+    /// the two's-complement pattern is the wrapping add.
+    #[inline]
+    fn step_live_bytes(&self, by: isize) {
+        self.requested_live_bytes
+            .fetch_add(by as usize, Ordering::Relaxed);
     }
 
     /// Adds this block's counters into `total`.
@@ -516,7 +534,7 @@ impl ProcessorFront {
             let heads = unsafe { &mut *self.heads.get() };
             let counters = &self.magazine_counters;
             let Some(head) = NonNull::new(heads[class.index()]) else {
-                OwnedStep::add_u64(&counters.miss_count, 1);
+                step_owned(&counters.miss_count, 1);
                 return None;
             };
             // SAFETY: every block on this list was given its link by
@@ -524,7 +542,7 @@ impl ProcessorFront {
             // list is owner-only.
             heads[class.index()] = unsafe { head.as_ref().next };
             self.set_depth(class, self.depth(class) - 1);
-            OwnedStep::add_u64(&counters.hit_count, 1);
+            step_owned(&counters.hit_count, 1);
             Some(head.cast())
         })
     }
@@ -564,8 +582,8 @@ impl ProcessorFront {
                     batch.push(head.cast());
                 }
                 let counters = &self.magazine_counters;
-                OwnedStep::add_u64(&counters.drain_count, 1);
-                OwnedStep::add_u64(
+                step_owned(&counters.drain_count, 1);
+                step_owned(
                     &counters.drain_block_count,
                     usize_to_u64(batch.len(), "magazine drain block count"),
                 );
@@ -595,8 +613,8 @@ impl ProcessorFront {
             // SAFETY: owning processor, interrupts masked.
             let heads = unsafe { &mut *self.heads.get() };
             let counters = &self.magazine_counters;
-            OwnedStep::add_u64(&counters.refill_count, 1);
-            OwnedStep::add_u64(
+            step_owned(&counters.refill_count, 1);
+            step_owned(
                 &counters.refill_block_count,
                 usize_to_u64(blocks.len(), "magazine refill block count"),
             );
@@ -743,13 +761,14 @@ mod tests {
     use alloc::vec::Vec;
     use core::alloc::Layout;
     use core::ptr::NonNull;
+    use core::sync::atomic::{AtomicU64, Ordering};
 
     use arrayvec::ArrayVec;
     use helios_hal::cpu::ProcessorId;
 
     use super::{
         CLASS_CAPACITY, HeapMagazines, MAGAZINE_BATCH, MAGAZINE_CLASS_COUNT, MAX_CACHED_BYTES,
-        MIN_BLOCK_BYTES, MagazineClass, OwnedStep, ProcessorFront, SharedStep,
+        MIN_BLOCK_BYTES, MagazineClass, ProcessorFront,
     };
     use crate::HeapStats;
 
@@ -930,9 +949,9 @@ mod tests {
     fn counters_sum_across_processors() {
         let first = ProcessorFront::new();
         let second = ProcessorFront::new();
-        first.counters().record_alloc::<OwnedStep>(64, true);
-        second.counters().record_alloc::<OwnedStep>(64, true);
-        second.counters().record_dealloc::<OwnedStep>(64, true);
+        first.counters().record_alloc(64, true);
+        second.counters().record_alloc(64, true);
+        second.counters().record_dealloc(64, true);
 
         let mut total = HeapStats::zeroed();
         first.counters().accumulate_into(&mut total);
@@ -951,8 +970,8 @@ mod tests {
     fn a_free_on_another_processor_still_totals() {
         let allocator = ProcessorFront::new();
         let freer = ProcessorFront::new();
-        allocator.counters().record_alloc::<OwnedStep>(128, false);
-        freer.counters().record_dealloc::<OwnedStep>(128, false);
+        allocator.counters().record_alloc(128, false);
+        freer.counters().record_dealloc(128, false);
 
         let mut total = HeapStats::zeroed();
         allocator.counters().accumulate_into(&mut total);
@@ -960,24 +979,36 @@ mod tests {
         assert_eq!(total.requested_live_bytes, 0);
     }
 
-    /// The two counter steps are the same arithmetic; only their
-    /// atomicity differs.
+    /// A reallocation counts itself once, as the difference between the
+    /// two sizes, rather than as an allocation and a free.
     #[test]
-    fn both_counter_steps_agree() {
-        let owned = ProcessorFront::new();
-        let shared = ProcessorFront::new();
-        owned.counters().record_alloc::<OwnedStep>(200, true);
-        owned.counters().record_realloc::<OwnedStep>(200, 300, true);
-        shared.counters().record_alloc::<SharedStep>(200, true);
-        shared
-            .counters()
-            .record_realloc::<SharedStep>(200, 300, true);
+    fn a_reallocation_counts_the_difference() {
+        let front = ProcessorFront::new();
+        front.counters().record_alloc(200, true);
+        front.counters().record_realloc(200, 300, true);
 
-        let mut owned_total = HeapStats::zeroed();
-        owned.counters().accumulate_into(&mut owned_total);
-        let mut shared_total = HeapStats::zeroed();
-        shared.counters().accumulate_into(&mut shared_total);
-        assert_eq!(owned_total, shared_total);
-        assert_eq!(owned_total.requested_live_bytes, 300);
+        let mut total = HeapStats::zeroed();
+        front.counters().accumulate_into(&mut total);
+        assert_eq!(total.allocation_count, 1);
+        assert_eq!(total.reallocation_count, 1);
+        assert_eq!(total.deallocation_count, 0);
+        assert_eq!(total.requested_live_bytes, 300);
+    }
+
+    /// The plain step the masked paths take is the arithmetic a relaxed
+    /// `fetch_add` would have done, wrap included; only the atomicity
+    /// the callers no longer need is missing.
+    #[test]
+    fn the_owner_step_matches_an_atomic_add() {
+        for (start, by) in [(0u64, 1u64), (7, 9), (u64::MAX, 3), (u64::MAX - 1, 1)] {
+            let stepped = AtomicU64::new(start);
+            let added = AtomicU64::new(start);
+            super::step_owned(&stepped, by);
+            added.fetch_add(by, Ordering::Relaxed);
+            assert_eq!(
+                stepped.load(Ordering::Relaxed),
+                added.load(Ordering::Relaxed)
+            );
+        }
     }
 }

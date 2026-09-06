@@ -157,10 +157,25 @@ Two properties make it safe and cheap:
   no lock and no atomic on them, reached only from the owning processor
   with local interrupts masked — the same mask the heap lock already
   takes, and for the same reason: the processor's own interrupt handler
-  allocates. What another processor reads (the depths, and the
-  allocation counters) is atomic, and the counters are stepped by their
-  owner with a relaxed load, an add and a relaxed store, so no kernel
-  allocation performs a contended atomic any more.
+  allocates. What another processor reads (the depths, the magazine's
+  own hit and drain counts, and the allocation counters) is atomic. The
+  depths and the magazine counts are stepped inside the masked region
+  the magazine operation already holds, so they take a plain load, add
+  and store; the allocation counters are stepped on paths that hold no
+  such region and take a relaxed `fetch_add` instead of opening one.
+  Either way the line belongs to one processor, so no kernel allocation
+  performs a *contended* atomic any more — which is the property that
+  mattered, and the reason the counters are per processor at all.
+
+  Masking for the allocation counters was measured and reverted. A mask
+  is two calls through the backend's linkage (`_helios_local_interrupt_
+  mask` and its restore are `#[no_mangle]` symbols a backend defines, so
+  they never inline into the allocator) plus the architecture's
+  interrupt-state write, and a counter is stepped on *every* kernel
+  allocation, magazine hit or not. Paying that to avoid an uncontended
+  L1-exclusive atomic cost `instance-startup-100` 2.6% (#169), which the
+  shared heap the front no longer reaches did not pay back: on that
+  workload the heap lock was never contended enough.
 
 The array is sized at bring-up, out of the same
 `prime_bootstrap_allocator` call that fills the heap, by the processor

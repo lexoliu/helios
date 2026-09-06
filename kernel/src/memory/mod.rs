@@ -38,8 +38,7 @@ pub use entropy::{
 };
 pub(crate) use irq_safe::IrqSafeMutex;
 pub(crate) use magazine::{
-    HeapCounters, HeapMagazines, MAGAZINE_BATCH, MagazineClass, OwnedStep, ProcessorFront,
-    SharedStep,
+    HeapCounters, HeapMagazines, MAGAZINE_BATCH, MagazineClass, ProcessorFront,
 };
 pub use mapping_cost::user_mapping_kernel_heap_bytes;
 pub use owner::{
