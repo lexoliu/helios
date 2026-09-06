@@ -29,6 +29,12 @@ pub use service::{
 };
 pub use socket_stack::SocketStack;
 
+/// The established-connection fixture the retirement tests in
+/// `wasmtime_adapter` need. Its wiring is private to `network::service`
+/// and the owners it exercises are not.
+#[cfg(all(test, feature = "wasmtime-runtime"))]
+pub(crate) use service::fixture::EstablishedTcpFixture;
+
 /// Bringing a discovered interface online: the one place a backend
 /// hands the kernel a network device.
 ///

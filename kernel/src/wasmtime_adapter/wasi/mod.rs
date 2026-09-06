@@ -1919,6 +1919,46 @@ mod tests {
         assert_eq!(closed.count(), 1, "the last holder retires the stream");
     }
 
+    /// The retirement reaches the wire: the last holder of a
+    /// `wasi:sockets` socket puts its FIN on it.
+    ///
+    /// #184 moved the stream's ownership onto `TcpSocketState`, and the
+    /// tests above prove the drop retires it. What retirement meant
+    /// inside the stack was dropping the socket, clearing its timers
+    /// and freeing its slot with nothing sent, so a component that
+    /// exited holding a connection was invisible to its peer, which
+    /// kept an established connection until its own timeout (#224).
+    #[test]
+    fn a_wasi_tcp_socket_puts_its_fin_on_the_wire_when_its_resource_is_dropped() {
+        use crate::network::EstablishedTcpFixture;
+        use helios_netstack::TcpFlags;
+
+        let fixture = EstablishedTcpFixture::new();
+        let socket = TcpSocket::new(fixture.service(), WasiTcpSocketFamily::Ipv4);
+        socket.inner.lock().stream = Some(fixture.stream());
+
+        assert!(
+            fixture.drive().is_empty(),
+            "a live socket owes its peer nothing"
+        );
+
+        drop(socket);
+        let segments = fixture.drive();
+        let fin = segments
+            .iter()
+            .find(|segment| segment.flags.contains(TcpFlags::FIN))
+            .expect("the resource takes its connection down with a FIN");
+        assert_eq!(
+            fin.sequence,
+            EstablishedTcpFixture::LOCAL_SEQUENCE.wrapping_add(1),
+            "the FIN carries this side's send sequence"
+        );
+        assert!(
+            !fin.flags.contains(TcpFlags::RST),
+            "a connection with nothing unread is closed, not aborted"
+        );
+    }
+
     /// A `wasi:sockets` socket's kernel listener dies with the socket.
     ///
     /// Nothing retired it before: the resource destructor deleted the
