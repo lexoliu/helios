@@ -133,6 +133,20 @@ impl ExternalInterrupts {
         self.plic.set_threshold(self.context, 0);
     }
 
+    /// Route a source a user-mode driver owns.
+    ///
+    /// Unlike every other attach, the source is left disabled: the
+    /// grant's owner arms it with its own `unmask`, and until something
+    /// owns the device an interrupt would have nowhere to go.
+    pub(crate) fn attach_device(
+        &mut self,
+        source: InterruptSourceId,
+        route: helios_kernel::DeviceInterruptRoute,
+    ) {
+        self.plic.set_threshold(self.context, 0);
+        self.routes.add_device(source, route);
+    }
+
     pub(crate) fn handle(&self) {
         while let Some(source) = self.plic.claim(self.context) {
             let source = InterruptSourceId(source);
