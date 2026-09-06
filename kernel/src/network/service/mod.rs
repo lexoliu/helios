@@ -34,10 +34,10 @@ use helios_netstack::{
     Icmpv6Packet, InterfaceEventMark, IpAddress, IpCidr, IpProtocol, Ipv4Address, Ipv4Cidr,
     Ipv4Packet, Ipv6Address, Ipv6Cidr, Ipv6Packet, MAX_OUTBOUND_FRAMES, NeighborEntry,
     NetworkInterface as NetworkDevice, OutboundBatchStatus, Route, RouteTable, RxChecksumOffload,
-    RxFrame, SegmentationOffload, Stack, StackConfig, StackError, StackEvent, StackInstant,
-    TcpCloseKind, TcpConnectState, TcpConnectTerminalError, TcpEndpoint, TcpListenBacklog,
-    TcpPacket, TcpReadIntoState, TcpReadState, TcpStackCounters, UdpEgress, UdpEndpoint, UdpPacket,
-    UdpPayload, UdpSocketBinding, UdpSocketError, flow_hash,
+    RxDrain, RxFrame, SegmentationOffload, Stack, StackConfig, StackError, StackEvent,
+    StackInstant, TcpCloseKind, TcpConnectState, TcpConnectTerminalError, TcpEndpoint,
+    TcpListenBacklog, TcpPacket, TcpReadIntoState, TcpReadState, TcpStackCounters, UdpEgress,
+    UdpEndpoint, UdpPacket, UdpPayload, UdpSocketBinding, UdpSocketError, flow_hash,
 };
 use spin::{Mutex as SpinMutex, RwLock as SpinRwLock};
 
@@ -219,6 +219,13 @@ pub struct NetworkQueueStats {
     /// room for them. Already off the ring when they were refused, so
     /// they are lost and the peer has to retransmit.
     pub rx_refused_frames: u64,
+    /// Receive drains of this pair the driver refused: a mergeable
+    /// chain it cannot reconstruct, a header it cannot read, an offload
+    /// combination the device may not report. One count per refused
+    /// drain, not per frame. The frames the same drain had already
+    /// taken are delivered anyway, so this climbing beside a climbing
+    /// `rx_frames` is a device fault rate rather than a dead pair.
+    pub rx_device_refusals: u64,
     /// Acknowledgements this shard has put on the wire, duplicates
     /// included.
     pub tcp_acks_sent: u64,
@@ -731,6 +738,7 @@ where
                         tx_frames,
                         interrupts: self.inner.device.queue_interrupts(idx),
                         rx_refused_frames: self.inner.state.refused_frame_count(idx),
+                        rx_device_refusals: self.inner.state.device_refusal_count(idx),
                         tcp_acks_sent: tcp.acks_sent,
                         tcp_window_updates_sent: tcp.window_updates_sent,
                         tcp_retransmits_sent: tcp.retransmits_sent,
@@ -3978,6 +3986,46 @@ mod tests {
         assert_eq!(arp_reply.operation, ArpOperation::Reply);
         assert_eq!(arp_reply.sender_protocol, local);
         assert_eq!(arp_reply.target_protocol, peer);
+    }
+
+    /// #209. A drain the driver refuses partway still delivers the
+    /// frames it had already taken, and the refusal is counted.
+    ///
+    /// Those frames are off the ring by the time the refusal happens
+    /// and no used entry can be put back, so a poll that reported the
+    /// error on its own lost a whole batch of good frames for one
+    /// malformed chain. Nothing counted them either, so the statistics
+    /// said only that the shard had stopped moving frames — the same
+    /// shape as a receiver that is merely slow.
+    #[test]
+    fn a_refused_drain_delivers_the_frames_it_took_and_counts_the_refusal() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let service = test_network_service();
+        let device = service.inner.device.clone();
+
+        let (arp, arp_len) = arp_request_frame(peer, local);
+        device.deliver_on(0, &arp[..arp_len]);
+        device.deliver_on(0, &arp[..arp_len]);
+        // The malformed chain arrives behind them, inside the same
+        // batch the drain is filling.
+        device.refuse_on(0, helios_hal::io::IoError::DeviceFault);
+
+        let Err(error) = block_on(service.poll_network_receive_once(NetworkPollSource::Pump))
+        else {
+            panic!("the refusal is still reported to the caller");
+        };
+        assert_eq!(error, helios_hal::io::IoError::DeviceFault);
+
+        let queue = service.stats().queues[super::DEFAULT_SHARD_IDX];
+        assert_eq!(
+            queue.rx_frames, 2,
+            "the frames the refused drain had already taken must reach their shard"
+        );
+        assert_eq!(
+            queue.rx_device_refusals, 1,
+            "the refusal must be counted where the loss can be seen"
+        );
     }
 
     #[test]

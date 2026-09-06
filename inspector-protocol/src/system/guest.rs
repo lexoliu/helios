@@ -474,6 +474,7 @@ fn convert_network(network: host_stats::Network) -> stats::Network {
                 tx_frames: queue.tx_frames,
                 interrupts: queue.interrupts,
                 rx_refused_frames: queue.rx_refused_frames,
+                rx_device_refusals: queue.rx_device_refusals,
                 tcp_acks_sent: queue.tcp_acks_sent,
                 tcp_window_updates_sent: queue.tcp_window_updates_sent,
                 tcp_retransmits_sent: queue.tcp_retransmits_sent,

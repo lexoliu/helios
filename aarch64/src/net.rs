@@ -119,7 +119,7 @@ impl NetworkDevice for VirtioNetworkDevice {
         &'a self,
         queue_idx: usize,
         frames: &'slots mut [Option<helios_virtio::RxFrame>],
-    ) -> Result<Option<usize>, IoError>
+    ) -> Option<helios_virtio::RxDrain>
     where
         'a: 'slots,
     {

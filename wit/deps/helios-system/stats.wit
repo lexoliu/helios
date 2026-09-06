@@ -161,6 +161,13 @@ interface stats {
     /// room for them. They were already off the ring when they were
     /// refused, so they are lost and the peer has to retransmit.
     rx-refused-frames: u64,
+    /// Receive drains of this pair the driver refused: a mergeable chain
+    /// it cannot reconstruct, a header it cannot read, an offload
+    /// combination the device may not report. One count per refused
+    /// drain, not per frame. The frames the same drain had already taken
+    /// are delivered anyway, so this climbing beside a climbing
+    /// `rx-frames` is a device fault rate rather than a dead pair.
+    rx-device-refusals: u64,
     /// Acknowledgements this shard has put on the wire, duplicates
     /// included.
     tcp-acks-sent: u64,
