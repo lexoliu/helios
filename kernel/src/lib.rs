@@ -201,15 +201,55 @@ use core::task::{Context, Poll, Waker};
 use core::time::Duration;
 
 use arrayvec::ArrayVec;
-use buddy_system_allocator::Heap;
 use helios_hal::cpu::{Cpu, Instant, ProcessorId};
 use helios_hal::memory::MemoryRegion;
 use helios_hal::watchdog::{NoWatchdog, ProgressCounter, Watchdog};
 use helios_hal::{DeviceInventory, DmaModel, ProcessorStartupPolicy, ProcessorTopology};
+use rlsf::{GRANULARITY, Tlsf};
 
 use crate::memory::IrqSafeMutex;
 
-const HEAP_ORDER: usize = 32;
+/// First-level classes of the kernel heap's segregated free lists.
+///
+/// A TLSF first level spans one power of two starting at
+/// [`GRANULARITY`] — `size_of::<usize>() * 4`, so 32 bytes on every
+/// target Helios builds for — and 32 of them therefore reach 128 GiB.
+/// That upper end is the point. `rlsf` caps one pool region at
+/// `GRANULARITY << FLLEN` and divides anything larger into several
+/// pools, and the largest region this heap is ever handed is its boot
+/// share, up to half of the machine's usable memory
+/// ([`memory::policy`]); a ceiling below the machines Helios targets
+/// would turn a boot region into a division loop. At 32 the division
+/// never happens.
+///
+/// It is also exactly the width of [`KernelHeapBitmap`], which is what
+/// keeps the first-level search a single instruction on one word.
+const HEAP_FIRST_LEVELS: usize = 32;
+
+/// Second-level subdivisions of each first-level class.
+///
+/// Each first-level class is split into this many linearly spaced
+/// ranges, and a search settles on a block at most `1 / SLLEN` larger
+/// than the request it rounded up to: 3.1% here, against 6.3% at 16.
+/// The cost is the free-list table, `FLLEN * SLLEN` pointers — 8 KiB of
+/// `.bss` at these parameters — and one bitmap word per first level.
+const HEAP_SECOND_LEVELS: usize = 32;
+
+/// The bitmap word of both levels, wide enough for
+/// [`HEAP_FIRST_LEVELS`] and [`HEAP_SECOND_LEVELS`] bits.
+type KernelHeapBitmap = u32;
+
+/// The kernel heap's allocator: TLSF, constant time in both directions.
+///
+/// What this replaced was a buddy allocator whose free found a block's
+/// buddy by walking that size class's free list, and walked the list
+/// whole whenever the buddy was absent — the ordinary case in a mass
+/// free. Tearing down a hundred instances is about forty thousand
+/// frees, and the walk made the teardown quadratic in the blocks a
+/// class was holding (#246). A TLSF free is a bitmap update and a few
+/// pointer writes whatever the heap holds.
+type KernelHeap =
+    Tlsf<'static, KernelHeapBitmap, KernelHeapBitmap, HEAP_FIRST_LEVELS, HEAP_SECOND_LEVELS>;
 pub const HEAP_SIZE_CLASS_COUNT: usize = 12;
 const BOOT_UNINITIALIZED: u8 = 0;
 const BOOT_INITIALIZING: u8 = 1;
@@ -219,7 +259,7 @@ const WATCHDOG_CHECK_DIVISOR: u32 = 4;
 const WATCHDOG_SELF_TEST_DELAY_MILLIS_ENV: &str = env!("HELIOS_WATCHDOG_SELF_TEST_DELAY_MS");
 
 #[cfg_attr(target_os = "none", global_allocator)]
-static ALLOCATOR: KernelAllocator<HEAP_ORDER> = KernelAllocator::empty();
+static ALLOCATOR: KernelAllocator = KernelAllocator::empty();
 static BOOT_STATE: AtomicU8 = AtomicU8::new(BOOT_UNINITIALIZED);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -247,13 +287,124 @@ impl HeapStats {
     }
 }
 
-struct KernelAllocator<const ORDER: usize> {
+/// The heap bytes a `layout` allocation occupies, by the accounting
+/// [`Tlsf::allocate`] performs on its way to a free block.
+///
+/// `allocate` prefixes every payload with a used-block header, which
+/// `rlsf` documents as [`GRANULARITY`]`/ 2` bytes long; the address
+/// after that header is only aligned to `GRANULARITY / 2`, so a
+/// stricter alignment costs up to that much padding again. It then
+/// searches for a free block of the sum rounded up to a whole granule,
+/// and splits the block it finds down to exactly that — or leaves it
+/// whole when the remainder would be under one granule, which is the
+/// only way the real cost exceeds this, and by less than a granule.
+///
+/// The number comes from the layout alone on purpose. [`GlobalAlloc`]
+/// hands `dealloc` the layout the allocation was made with, so the
+/// charge and the refund are the same number and
+/// [`KernelHeapState::allocated_bytes`] cannot drift over a run.
+const fn heap_block_bytes(layout: Layout) -> usize {
+    let header = GRANULARITY / 2;
+    let overhead = layout.align().saturating_sub(header) + header;
+    let block = layout.size().saturating_add(overhead);
+    block.saturating_add(GRANULARITY - 1) & !(GRANULARITY - 1)
+}
+
+/// The kernel heap and the two words the kernel keeps about it.
+///
+/// A TLSF is a bitmap and a table of free lists and nothing else: it
+/// holds no running totals, and asking it for one would be the walk the
+/// whole allocator exists to avoid. So the kernel maintains them, in
+/// the same structure as the heap and therefore under the same lock as
+/// the operation that moves them — a stats read can never catch a total
+/// that belongs to a different allocation than the free space beside
+/// it.
+///
+/// Both words mean what they meant when this heap was a buddy
+/// allocator, so `heap_stats()` reports the same quantities:
+/// `total_bytes` is every byte the heap owns, and `allocated_bytes` is
+/// what live allocations are holding of it, blocks and their headers
+/// rather than the sizes their callers asked for.
+struct KernelHeapState {
+    tlsf: KernelHeap,
+    /// Every byte the heap took ownership of, as `rlsf` counted it: a
+    /// pool costs a sentinel block and the alignment slack at its
+    /// front, and `insert_free_block_ptr` answers with what it used.
+    total_bytes: usize,
+    /// The heap live allocations are holding, by
+    /// [`heap_block_bytes`].
+    allocated_bytes: usize,
+}
+
+impl KernelHeapState {
+    const fn new() -> Self {
+        Self {
+            tlsf: Tlsf::new(),
+            total_bytes: 0,
+            allocated_bytes: 0,
+        }
+    }
+
+    /// Heap not currently held by an allocation.
+    fn free_bytes(&self) -> usize {
+        self.total_bytes.saturating_sub(self.allocated_bytes)
+    }
+
+    /// Gives the heap `start..end`.
+    ///
+    /// # Safety
+    ///
+    /// The range must be memory nothing else owns, and it must outlive
+    /// the heap — which, this being the kernel's global allocator,
+    /// means for as long as the kernel runs.
+    unsafe fn insert(&mut self, start: usize, end: usize) {
+        let len = end
+            .checked_sub(start)
+            .expect("kernel heap region ends before it starts");
+        let start = ptr::NonNull::new(start as *mut u8)
+            .expect("kernel heap region starts at the null address");
+        let region = ptr::NonNull::slice_from_raw_parts(start, len);
+        // Safety: the caller gave us the region outright, and it
+        // outlives the kernel.
+        let used = unsafe { self.tlsf.insert_free_block_ptr(region) }.unwrap_or_else(|| {
+            panic!("kernel heap region of {len} bytes is too small to hold a TLSF pool")
+        });
+        self.total_bytes += used.get();
+    }
+
+    /// Serves `layout` out of the heap, or answers null.
+    fn allocate(&mut self, layout: Layout) -> *mut u8 {
+        match self.tlsf.allocate(layout) {
+            Some(ptr) => {
+                self.allocated_bytes += heap_block_bytes(layout);
+                ptr.as_ptr()
+            }
+            None => ptr::null_mut(),
+        }
+    }
+
+    /// Returns one allocation to the heap.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be an allocation this heap served under `layout`.
+    unsafe fn deallocate(&mut self, ptr: ptr::NonNull<u8>, layout: Layout) {
+        // Safety: the caller's promise is exactly `deallocate`'s, and
+        // `layout` carries the alignment the block was allocated with.
+        unsafe { self.tlsf.deallocate(ptr, layout.align()) };
+        self.allocated_bytes = self
+            .allocated_bytes
+            .saturating_sub(heap_block_bytes(layout));
+    }
+}
+
+struct KernelAllocator {
     /// The kernel heap, behind the mask every allocator in this kernel
     /// takes: an interrupt handler allocates and frees, so a plain spin
     /// lock here deadlocks the processor that was interrupted holding
     /// it, and then every other processor behind it (#206). See
     /// [`memory::IrqSafeMutex`] for the contract.
-    heap: IrqSafeMutex<Heap<ORDER>>,
+    heap: IrqSafeMutex<KernelHeapState>,
     stats: KernelAllocationStats,
     /// Every usable byte the boot memory map described, and the free
     /// kernel heap a user grow may not dip into. Both are fixed by
@@ -268,10 +419,10 @@ struct KernelAllocator<const ORDER: usize> {
     top_up_backoff: AtomicUsize,
 }
 
-impl<const ORDER: usize> KernelAllocator<ORDER> {
+impl KernelAllocator {
     const fn empty() -> Self {
         Self {
-            heap: IrqSafeMutex::new(Heap::new()),
+            heap: IrqSafeMutex::new(KernelHeapState::new()),
             stats: KernelAllocationStats::new(),
             machine_usable_bytes: AtomicUsize::new(0),
             kernel_reserve_bytes: AtomicUsize::new(0),
@@ -279,9 +430,15 @@ impl<const ORDER: usize> KernelAllocator<ORDER> {
         }
     }
 
+    /// Gives the heap `start..end`.
+    ///
+    /// # Safety
+    ///
+    /// The range must be memory nothing else owns and it must outlive
+    /// the kernel; see [`KernelHeapState::insert`].
     unsafe fn add_to_heap(&self, start: usize, end: usize) {
         self.heap.with(|heap| unsafe {
-            heap.add_to_heap(start, end);
+            heap.insert(start, end);
         });
     }
 
@@ -293,7 +450,8 @@ impl<const ORDER: usize> KernelAllocator<ORDER> {
     /// which is what every [`GlobalAlloc`] caller already promises.
     unsafe fn free(&self, ptr: *mut u8, layout: Layout) {
         let ptr = ptr::NonNull::new(ptr).expect("the global allocator was handed a null pointer");
-        self.heap.with(|heap| unsafe { heap.dealloc(ptr, layout) });
+        self.heap
+            .with(|heap| unsafe { heap.deallocate(ptr, layout) });
     }
 
     /// Records what the boot memory map came to and what the kernel
@@ -321,13 +479,8 @@ impl<const ORDER: usize> KernelAllocator<ORDER> {
     /// actually produced rather than a racing re-read.
     fn try_alloc(&self, layout: Layout) -> (*mut u8, usize) {
         self.heap.with(|heap| {
-            let ptr = heap
-                .alloc(layout)
-                .map_or(ptr::null_mut(), core::ptr::NonNull::as_ptr);
-            let free = heap
-                .stats_total_bytes()
-                .saturating_sub(heap.stats_alloc_actual());
-            (ptr, free)
+            let ptr = heap.allocate(layout);
+            (ptr, heap.free_bytes())
         })
     }
 
@@ -402,7 +555,7 @@ impl<const ORDER: usize> KernelAllocator<ORDER> {
     fn stats(&self) -> HeapStats {
         let (total_bytes, allocated_bytes) = self
             .heap
-            .with(|heap| (heap.stats_total_bytes(), heap.stats_alloc_actual()));
+            .with(|heap| (heap.total_bytes, heap.allocated_bytes));
         HeapStats {
             total_bytes,
             allocated_bytes,
@@ -439,7 +592,7 @@ impl<const ORDER: usize> KernelAllocator<ORDER> {
     }
 }
 
-unsafe impl<const ORDER: usize> GlobalAlloc for KernelAllocator<ORDER> {
+unsafe impl GlobalAlloc for KernelAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let ptr = self.alloc_growing(layout);
         if !ptr.is_null() {
@@ -1328,9 +1481,71 @@ mod tests {
     #[repr(align(4096))]
     struct AlignedHeap([u8; TEST_HEAP_BYTES]);
 
+    /// The heap's own two words come back to where they started once
+    /// every allocation is freed, whatever sizes and alignments went
+    /// through it.
+    ///
+    /// TLSF keeps no totals of its own, so these are the kernel's, and
+    /// an allocation that charged a different number than its free
+    /// refunds would leave the heap looking permanently fuller than it
+    /// is — which is the reserve the growth path in
+    /// [`KernelAllocator::alloc_growing`] measures itself against, so
+    /// the drift would end as a kernel that lends itself the user pool
+    /// a chunk at a time and never stops.
+    #[test]
+    fn the_kernel_heaps_free_space_returns_after_every_allocation_is_freed() {
+        let allocator = KernelAllocator::empty();
+        let mut heap = Box::new(AlignedHeap([0; TEST_HEAP_BYTES]));
+        let start = heap.0.as_mut_ptr() as usize;
+        unsafe {
+            allocator.add_to_heap(start, start + TEST_HEAP_BYTES);
+        }
+
+        let empty = allocator.stats();
+        assert_eq!(empty.allocated_bytes, 0);
+        assert!(empty.total_bytes > 0);
+
+        // Sizes and alignments that exercise both halves of the header
+        // accounting: alignments at and under the granule's half, where
+        // the padding is fixed, and above it, where it is not.
+        let layouts = [(1, 1), (17, 8), (64, 16), (100, 32), (7, 64), (512, 256)]
+            .map(|(size, align)| Layout::from_size_align(size, align).expect("valid test layout"));
+
+        let mut live = ArrayVec::<*mut u8, 6>::new();
+        for layout in layouts {
+            let ptr = unsafe { GlobalAlloc::alloc(&allocator, layout) };
+            assert!(!ptr.is_null(), "the test heap refused {layout:?}");
+            assert!(
+                (ptr as usize).is_multiple_of(layout.align()),
+                "the heap returned {ptr:?} for {layout:?}"
+            );
+            live.push(ptr);
+        }
+
+        let held = allocator.stats();
+        assert!(
+            held.allocated_bytes >= layouts.iter().map(Layout::size).sum::<usize>(),
+            "the heap charged {} bytes for allocations asking for {}",
+            held.allocated_bytes,
+            layouts.iter().map(Layout::size).sum::<usize>()
+        );
+        assert_eq!(held.total_bytes, empty.total_bytes);
+
+        for (ptr, layout) in live.into_iter().zip(layouts) {
+            unsafe {
+                GlobalAlloc::dealloc(&allocator, ptr, layout);
+            }
+        }
+
+        let drained = allocator.stats();
+        assert_eq!(drained.allocated_bytes, 0);
+        assert_eq!(drained.total_bytes, empty.total_bytes);
+        assert_eq!(drained.available_bytes(), empty.available_bytes());
+    }
+
     #[test]
     fn kernel_allocator_tracks_requested_allocation_pressure() {
-        let allocator = KernelAllocator::<HEAP_ORDER>::empty();
+        let allocator = KernelAllocator::empty();
         let mut heap = Box::new(AlignedHeap([0; TEST_HEAP_BYTES]));
         let start = heap.0.as_mut_ptr() as usize;
         unsafe {
@@ -1378,7 +1593,7 @@ mod tests {
     /// whatever the heap does underneath.
     #[test]
     fn the_kernel_allocator_serves_a_caller_already_inside_a_critical_section() {
-        let allocator = KernelAllocator::<HEAP_ORDER>::empty();
+        let allocator = KernelAllocator::empty();
         let mut heap = Box::new(AlignedHeap([0; TEST_HEAP_BYTES]));
         let start = heap.0.as_mut_ptr() as usize;
         unsafe {

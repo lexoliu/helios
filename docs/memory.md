@@ -66,6 +66,47 @@ The boot log states the policy as the kernel applied it:
 Memory policy usable_bytes=… kernel_heap_bytes=… kernel_reserve_bytes=… kernel_growth_chunk_bytes=…
 ```
 
+## What allocates each domain
+
+The kernel heap is a TLSF allocator, `rlsf`, behind the one lock an
+interrupt handler is allowed to take (`kernel/src/memory/irq_safe.rs`).
+TLSF answers both an allocation and a free in constant time: a request
+is a bitmap search over two levels of segregated free lists, and a free
+is a bitmap update and a few pointer writes, whatever the heap is
+holding. The kernel builds it with 32 first-level classes and 32
+second-level subdivisions of each, so the lists span one granule (32
+bytes) to 128 GiB — `rlsf` divides a pool region larger than the top
+class into several pools, and the kernel heap's boot share can be half
+of the machine — and a block a search settles on is at most 3.1% larger
+than the request it rounded up to.
+
+It was a buddy allocator until #246. That allocator found a freed
+block's buddy by walking the block's size class from the head of the
+free list, and walked the list whole whenever the buddy was absent,
+which is the ordinary case in a mass free. Tearing down a hundred
+instances is about forty thousand frees, and `instance-startup-100` paid
+68 ms of a 123 ms run in teardown alone. The walk is also why a
+per-processor allocation cache could not sit in front of that heap
+(#169): every block a cache held was a block whose buddy arrived, found
+nothing to merge with, and stayed on the list for every later search to
+walk past.
+
+TLSF keeps no running totals, so the kernel keeps the two the stats
+report — every byte the heap owns, and what live allocations hold of it
+— in the same structure as the heap and therefore under the same lock as
+the operation that moves them. What an allocation is charged is the
+block `rlsf` searches for: the payload, its used-block header, the
+padding an over-aligned payload needs, rounded up to a granule. It is
+computed from the `Layout` alone, which is what makes the charge and the
+refund the same number.
+
+The user pool (`kernel/src/memory/user.rs`) and the kernel frame
+allocator (`kernel/src/memory/pmm.rs`) are still buddy heaps, each with
+a lock-free per-processor frame slab in front that keeps single-frame
+churn off the lock. Their multi-frame returns go to the same `dealloc`,
+so they carry the same walk on the same workloads; #248 and #249 track
+reading that off the bench lane on top of the new kernel heap.
+
 ## Why the split is not a fraction
 
 It used to be. The kernel heap kept a quarter of every boot region and
