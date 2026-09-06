@@ -158,6 +158,7 @@ mod vmm;
 pub use vmm::Aarch64UserAddressSpace;
 mod balloon;
 mod block;
+mod device;
 mod entropy;
 mod gic;
 mod host_fs;
@@ -638,6 +639,9 @@ extern "C" fn aarch64_kernel_main() -> ! {
         &handoff,
     ));
     gic.attach_current_processor(platform_state.bootstrap_mpidr());
+    // The device path's platform surface comes up with the controller
+    // and before any grant is published, which the registry enforces.
+    device::install_hooks(gic);
 
     let mut routes = DeviceInterruptRoutes::new();
     if let Some(host_fs) = host_fs::install(
@@ -717,6 +721,17 @@ extern "C" fn aarch64_kernel_main() -> ! {
             platform_state.bootstrap_mpidr(),
         );
         routes.add_block(block.interrupt, block.device);
+    }
+
+    // Everything the kernel drives itself has claimed its interrupt by
+    // now, so what the firmware described and nobody took is exactly
+    // what a driver plugin may be handed.
+    for (intid, route) in device::publish_grants(
+        &platform,
+        debug_state.device_grants(),
+        platform_state.bootstrap_mpidr(),
+    ) {
+        routes.add_device(intid, route);
     }
 
     let runtime = current_processor_runtime();

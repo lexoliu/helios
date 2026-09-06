@@ -17,7 +17,7 @@
 //! interrupted code could already hold; the memory hooks are called from
 //! task context only.
 
-use helios_hal::device::DeviceRegion;
+use helios_hal::device::{DeviceRegion, DmaPlacement};
 use helios_hal::pmm::PhysFrame;
 use helios_hal::vmm::{AddressSpaceError, PageFlags, VirtRange};
 use spin::Once;
@@ -32,9 +32,14 @@ pub struct DeviceVmHooks {
     pub unmap_device: fn(VirtRange) -> Result<(), AddressSpaceError>,
     /// Commit physically contiguous backing no byte of which sits above
     /// `limit`, and report its first frame.
-    pub commit_contiguous: fn(VirtRange, PageFlags, u64) -> Result<PhysFrame, AddressSpaceError>,
+    pub commit_contiguous:
+        fn(VirtRange, PageFlags, DmaPlacement) -> Result<PhysFrame, AddressSpaceError>,
     /// Release backing [`Self::commit_contiguous`] installed.
-    pub decommit: fn(VirtRange) -> Result<(), AddressSpaceError>,
+    ///
+    /// `align` is what the matching commit asked for. A contiguous run
+    /// is one allocation, not a pile of frames, and an allocator that
+    /// was given a size and an alignment has to be given them back.
+    pub release_contiguous: fn(VirtRange, u64) -> Result<(), AddressSpaceError>,
     /// The smallest unit at which this address space can change a
     /// mapping, in bytes.
     ///
@@ -130,7 +135,7 @@ pub(crate) mod test_hooks {
     use super::{DeviceInterruptHooks, DeviceVmHooks};
     use alloc::vec::Vec;
     use core::cell::RefCell;
-    use helios_hal::device::DeviceRegion;
+    use helios_hal::device::{DeviceRegion, DmaPlacement};
     use helios_hal::pmm::PhysFrame;
     use helios_hal::vmm::{AddressSpaceError, PageFlags, VirtRange};
 
@@ -140,7 +145,7 @@ pub(crate) mod test_hooks {
         MapDevice(VirtRange),
         UnmapDevice(VirtRange),
         Commit(VirtRange),
-        Decommit(VirtRange),
+        Released(VirtRange),
     }
 
     #[derive(Default)]
@@ -184,7 +189,7 @@ pub(crate) mod test_hooks {
     fn commit_contiguous(
         virt: VirtRange,
         _flags: PageFlags,
-        limit: u64,
+        placement: DmaPlacement,
     ) -> Result<PhysFrame, AddressSpaceError> {
         let frame = RECORDING.with(|recording| {
             let mut recording = recording.borrow_mut();
@@ -192,15 +197,15 @@ pub(crate) mod test_hooks {
             recording.next_frame += virt.frame_count();
             PhysFrame::from_index(index)
         });
-        if (frame.phys_addr() + virt.byte_len - 1) as u64 > limit {
+        if !placement.accepts(frame.phys_addr() as u64, virt.byte_len as u64) {
             return Err(AddressSpaceError::OutOfFrames);
         }
         record(MappingChange::Commit(virt));
         Ok(frame)
     }
 
-    fn decommit(virt: VirtRange) -> Result<(), AddressSpaceError> {
-        record(MappingChange::Decommit(virt));
+    fn release_contiguous(virt: VirtRange, _align: u64) -> Result<(), AddressSpaceError> {
+        record(MappingChange::Released(virt));
         Ok(())
     }
 
@@ -220,7 +225,7 @@ pub(crate) mod test_hooks {
         map_device,
         unmap_device,
         commit_contiguous,
-        decommit,
+        release_contiguous,
         mapping_granule,
     };
 

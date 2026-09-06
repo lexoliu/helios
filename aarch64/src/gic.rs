@@ -128,6 +128,23 @@ impl Gic {
             .unwrap_or_else(|error| panic!("AArch64 GIC could not enable {intid:?}: {error}"));
         tracing::info!("GICv3 routed {intid:?} to mpidr={mpidr:#x} trigger={trigger:?}");
     }
+
+    /// Masks or unmasks an already-routed device interrupt.
+    ///
+    /// This is the distributor half of the device path's flow control.
+    /// The kernel masks a device's interrupt the moment it takes one,
+    /// so the driver, which runs in user memory and may be descheduled
+    /// for a long time, cannot be re-entered by a line it has not
+    /// serviced yet; the driver's `unmask` is what arms the line again.
+    /// Routing and trigger mode are untouched, so an unmask restores
+    /// exactly the configuration bring-up established.
+    pub(crate) fn set_device_interrupt_enabled(&self, intid: IntId, enabled: bool) {
+        let mut gic = self.inner.lock();
+        gic.enable_interrupt(intid, None, enabled)
+            .unwrap_or_else(|error| {
+                panic!("AArch64 GIC could not set the enable of {intid:?}: {error}")
+            });
+    }
 }
 
 /// Sends the wake SGI to the single processor with `mpidr`.

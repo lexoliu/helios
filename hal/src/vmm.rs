@@ -43,7 +43,7 @@ use core::num::NonZeroU32;
 
 use thiserror::Error;
 
-use crate::device::DeviceRegion;
+use crate::device::{DeviceRegion, DmaPlacement};
 use crate::pmm::PhysFrame;
 
 /// Virtual address. No alignment guarantees; ranges check
@@ -340,16 +340,28 @@ pub trait AddressSpace: Send + Sync + 'static {
     /// `virt.frame_count()` consecutive ones, so the caller can hand the
     /// device one address and a length.
     ///
-    /// `limit` bounds the allocation: no byte of the run sits above it.
-    /// A device that drives fewer than 64 address bits passes its
-    /// highest reachable address here rather than discovering the
+    /// `placement` bounds the allocation: the run starts on the
+    /// device's required alignment and no byte of it sits above the
+    /// device's highest reachable address. A device that drives fewer
+    /// than 64 address lines says so here rather than discovering the
     /// truncation as corruption.
     fn commit_contiguous(
         &self,
         _virt: VirtRange,
         _flags: PageFlags,
-        _limit: u64,
+        _placement: DmaPlacement,
     ) -> Result<PhysFrame, AddressSpaceError> {
+        Err(AddressSpaceError::DeviceMappingUnsupported)
+    }
+
+    /// Give back the run [`Self::commit_contiguous`] produced.
+    ///
+    /// `align` is the placement alignment the commit was made with. A
+    /// contiguous run is a single allocation rather than a pile of
+    /// frames, so an allocator that was handed a size and an alignment
+    /// has to be handed both of them back; releasing it as ordinary
+    /// frames would put it on the wrong free list.
+    fn release_contiguous(&self, _virt: VirtRange, _align: u64) -> Result<(), AddressSpaceError> {
         Err(AddressSpaceError::DeviceMappingUnsupported)
     }
 

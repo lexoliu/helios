@@ -12,8 +12,8 @@ use fdt::node::FdtNode;
 use helios_virtio::{InterruptTrigger, MmioInterrupt};
 
 use super::{
-    ConsoleDescription, GicDescription, MmioRegion, PlatformDescription, PlatformError,
-    PlatformSource, Slots, SpiInterrupt, VirtioMmioSlot,
+    ConsoleDescription, GicDescription, GrantableDevice, MAX_GRANTABLE_DEVICES, MmioRegion,
+    PlatformDescription, PlatformError, PlatformSource, Slots, SpiInterrupt, VirtioMmioSlot,
 };
 
 /// `compatible` string of the interrupt controller this backend drives.
@@ -22,6 +22,12 @@ const GIC_V3: &str = "arm,gic-v3";
 const PL011: &str = "arm,pl011";
 /// `compatible` string of the real-time clock.
 const PL031: &str = "arm,pl031";
+/// `compatible` string of a virtio transport slot, which the virtio
+/// walk already claims.
+const VIRTIO_MMIO: &str = "virtio,mmio";
+
+/// The mapping granule a grant's region has to respect.
+const FRAME: usize = helios_hal::pmm::PhysFrame::SIZE;
 
 /// Parses the blob Limine handed over.
 pub(super) fn parse(dtb: usize) -> Result<Fdt<'static>, PlatformError> {
@@ -71,7 +77,67 @@ pub(super) fn describe(
             .map(|node| first_region(&node, PL031))
             .transpose()?,
         virtio,
+        grantable: grantable(fdt),
         boot_entropy_seed: helios_hal::entropy::device_tree_seed(fdt),
+    })
+}
+
+/// Every node this backend has no driver for and can hand to one in
+/// user memory.
+///
+/// The filter is deliberately narrow, because a grant is a real
+/// capability over real hardware. A node qualifies when it has a
+/// register window, raises an interrupt this GIC can route, and is not
+/// something the kernel drives itself. Nodes that describe the machine
+/// rather than a device — the processors, the memory, `chosen`, the
+/// architected timer — have no `reg` and an `interrupts` property at
+/// most, so they never reach the region check.
+///
+/// A node whose window is not frame-aligned is skipped with a warning
+/// rather than refused: it is a device this backend cannot isolate,
+/// not a machine it cannot boot. Mapping it would put a neighbour's
+/// registers in the same page, which is the one thing a grant must
+/// never do.
+fn grantable(fdt: &Fdt<'static>) -> Slots<GrantableDevice, MAX_GRANTABLE_DEVICES> {
+    let mut devices = Slots::new();
+    for node in fdt.all_nodes() {
+        if drives_itself(&node) {
+            continue;
+        }
+        let (Ok(region), Some(interrupt)) =
+            (first_region(&node, node.name), node_interrupt(fdt, &node))
+        else {
+            continue;
+        };
+        if !region.base.is_multiple_of(FRAME) || !region.size.is_multiple_of(FRAME) {
+            tracing::warn!(
+                node = node.name,
+                base = region.base,
+                size = region.size,
+                "the device tree describes a device whose window is not frame-aligned; \
+                 it cannot be isolated and is not offered to a driver"
+            );
+            continue;
+        }
+        devices.push(
+            GrantableDevice {
+                name: node.name,
+                region,
+                interrupt,
+                coherent: node.property("dma-coherent").is_some(),
+            },
+            "grantable devices",
+        );
+    }
+    devices
+}
+
+/// Whether the kernel drives this node itself.
+fn drives_itself(node: &FdtNode<'_, '_>) -> bool {
+    node.compatible().is_some_and(|entries| {
+        entries
+            .all()
+            .any(|entry| matches!(entry, GIC_V3 | PL011 | PL031 | VIRTIO_MMIO))
     })
 }
 
@@ -158,6 +224,5 @@ fn first_region(node: &FdtNode<'_, '_>, what: &str) -> Result<MmioRegion, Platfo
 /// property has the same shape whatever device declares it, and the
 /// GIC's three-cell binding is the only one an AArch64 tree uses.
 fn node_interrupt<'b, 'a: 'b>(fdt: &'b Fdt<'a>, node: &FdtNode<'b, 'a>) -> Option<SpiInterrupt> {
-    let interrupt = helios_virtio::node_interrupt(fdt, node)?;
-    Some(spi(interrupt).expect("a console interrupt specifier declares a trigger mode"))
+    spi(helios_virtio::node_interrupt(fdt, node)?).ok()
 }

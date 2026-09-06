@@ -176,6 +176,14 @@ pub(super) fn describe(
         // path finds.
         rtc: None,
         virtio,
+        // The AML walk above looks for virtio transports specifically,
+        // by their hardware id. Naming every other device in the
+        // namespace, deciding which the kernel does not drive, and
+        // reading each one's interrupt out of its `_CRS` is a second
+        // enumeration, and this description says what it knows rather
+        // than guessing: an ACPI-described machine offers no grantable
+        // device yet.
+        grantable: Slots::new(),
         // ACPI has no counterpart to the device tree's
         // `/chosen/rng-seed`, so an ACPI-described machine starts from
         // the processor's own random source alone until the entropy

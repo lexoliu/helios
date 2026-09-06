@@ -62,12 +62,12 @@ pub use component::{
     store_kernel_heap_bytes, strip_directory_prefix, wait_until_runtime_deadline,
 };
 pub use device::{
-    DEVICE_WINDOW_BYTES, DeviceGrant, DeviceGrantRegistry, DeviceInterruptHooks,
-    DeviceInterruptRoute, DeviceName, DeviceOwnership, DeviceVmHooks, DeviceWindow, DmaBudget,
-    DmaBuffer, DmaBufferHandle, GrantError, GrantHandle, GrantInterrupt, GrantLease, GrantStats,
-    InterruptEvent, InterruptRelay, InterruptStats, LinearMemory, MAX_DEVICE_NAME, MAX_DMA_BUFFERS,
-    MAX_GRANT_INTERRUPTS, MAX_GRANT_REGIONS, MAX_GRANTS, MappedRegion, PublishedDevice,
-    install_device_interrupt_hooks, install_device_vm_hooks,
+    DEFAULT_DMA_BUDGET_BYTES, DEVICE_WINDOW_BYTES, DeviceGrant, DeviceGrantRegistry,
+    DeviceInterruptHooks, DeviceInterruptRoute, DeviceName, DeviceOwnership, DeviceVmHooks,
+    DeviceWindow, DmaBudget, DmaBuffer, DmaBufferHandle, GrantError, GrantHandle, GrantInterrupt,
+    GrantLease, GrantStats, InterruptEvent, InterruptRelay, InterruptStats, LinearMemory,
+    MAX_DEVICE_NAME, MAX_DMA_BUFFERS, MAX_GRANT_INTERRUPTS, MAX_GRANT_REGIONS, MAX_GRANTS,
+    MappedRegion, PublishedDevice, install_device_interrupt_hooks, install_device_vm_hooks,
 };
 pub use embedded::{
     EmbeddedComponent, EmbeddedInit, embedded_boot_component, embedded_init,
@@ -128,12 +128,12 @@ pub use memory::{
     TASK_ARENA_FRACTION, TASK_ARENA_MIN_BYTES, USER_POOL_MIN_REGION_BYTES, UserHeapStats,
     UserMemoryOwnerScope, UserMemoryOwners, UserMemoryPool, VaCursor,
     allocate_user_frame_uninit_on, allocate_user_frame_zeroed, allocate_user_frame_zeroed_on,
-    configure_user_memory_owner_processors, current_user_memory_owner, deallocate_user_frame,
-    deallocate_user_frame_on, disable_swap, enter_user_memory_owner, install_entropy_device,
-    install_memory_balloon, install_swap, install_swap_hooks, installed_swap_handle,
-    installed_swap_hooks, kernel_reserve_for, largest_servable_user_bytes, seed_root_entropy,
-    set_user_memory_owner, swapped_token, task_arena_bytes_for, user_heap_stats,
-    user_mapping_kernel_heap_bytes, validate_range,
+    allocate_user_run_zeroed_on, configure_user_memory_owner_processors, current_user_memory_owner,
+    deallocate_user_frame, deallocate_user_frame_on, deallocate_user_run_on, disable_swap,
+    enter_user_memory_owner, install_entropy_device, install_memory_balloon, install_swap,
+    install_swap_hooks, installed_swap_handle, installed_swap_hooks, kernel_reserve_for,
+    largest_servable_user_bytes, seed_root_entropy, set_user_memory_owner, swapped_token,
+    task_arena_bytes_for, user_heap_stats, user_mapping_kernel_heap_bytes, validate_range,
 };
 pub use network::{
     HTTP_FORBIDDEN_FIELD_NAMES, HTTP_MAX_FIELD_SECTION_BYTES, HTTP_MAX_FIELD_VALUE_BYTES, HttpBody,

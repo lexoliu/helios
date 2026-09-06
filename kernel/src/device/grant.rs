@@ -84,6 +84,20 @@ impl core::fmt::Display for GrantInterrupt {
     }
 }
 
+/// How much memory the kernel pins for one device when discovery has
+/// nothing more specific to say.
+///
+/// Discovery reads the device's *capability* from the firmware — how
+/// far it can address, whether it is coherent — but no firmware
+/// description says how much memory a driver deserves, because that is
+/// a question about this machine's other tenants rather than about the
+/// hardware. So it is a kernel policy, set here in one place, and a
+/// backend that does learn a device-specific figure passes that
+/// instead. Sixteen mebibytes is a descriptor ring and its buffers for
+/// the classes of device a plugin drives, and small enough that a
+/// driver cannot squeeze the rest of user space out of the pool.
+pub const DEFAULT_DMA_BUDGET_BYTES: u64 = 16 << 20;
+
 /// How much memory the kernel is willing to pin for one device, and
 /// what that device can reach with it.
 ///

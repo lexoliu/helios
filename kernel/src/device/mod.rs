@@ -52,8 +52,8 @@ mod platform;
 mod registry;
 
 pub use grant::{
-    DeviceGrant, DeviceName, DmaBudget, GrantError, GrantInterrupt, MAX_DEVICE_NAME,
-    MAX_GRANT_INTERRUPTS, MAX_GRANT_REGIONS,
+    DEFAULT_DMA_BUDGET_BYTES, DeviceGrant, DeviceName, DmaBudget, GrantError, GrantInterrupt,
+    MAX_DEVICE_NAME, MAX_GRANT_INTERRUPTS, MAX_GRANT_REGIONS,
 };
 pub use handle::{DmaBufferHandle, GrantHandle};
 pub use interrupt::{InterruptEvent, InterruptRelay, InterruptStats};
@@ -251,7 +251,7 @@ mod tests {
         );
         assert!(matches!(
             test_hooks::changes().last(),
-            Some(MappingChange::Decommit(_))
+            Some(MappingChange::Released(_))
         ));
     }
 

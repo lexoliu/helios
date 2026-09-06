@@ -27,7 +27,7 @@
 use std::ptr;
 use std::sync::Mutex;
 
-use helios_hal::device::DeviceRegion;
+use helios_hal::device::{DeviceRegion, DmaPlacement};
 use helios_hal::pmm::PhysFrame;
 use helios_hal::vmm::{
     AddressSpace, AddressSpaceError, PageAge, PageFlags, SwapToken, Translation, VirtAddr,
@@ -360,15 +360,20 @@ impl AddressSpace for HostedAddressSpace {
         &self,
         virt: VirtRange,
         flags: PageFlags,
-        limit: u64,
+        placement: DmaPlacement,
     ) -> Result<PhysFrame, AddressSpaceError> {
         validate_range(virt)?;
-        let last = (virt.start.raw() + virt.byte_len - 1) as u64;
-        if last > limit {
+        if !placement.accepts(virt.start.raw() as u64, virt.byte_len as u64) {
             return Err(AddressSpaceError::OutOfFrames);
         }
         self.commit(virt, flags)?;
         Ok(PhysFrame::from_phys_addr(virt.start.raw()))
+    }
+
+    /// Symmetric with the commit above: the host allocator placed the
+    /// pages, so the alignment it was given is not owed back to it.
+    fn release_contiguous(&self, virt: VirtRange, _align: u64) -> Result<(), AddressSpaceError> {
+        self.decommit(virt)
     }
 
     fn translate(&self, addr: VirtAddr) -> Translation {

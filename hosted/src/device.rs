@@ -25,7 +25,7 @@ use std::ffi::CString;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use helios_hal::device::{DeviceRegion, DeviceRegionAttributes, DmaCapability};
+use helios_hal::device::{DeviceRegion, DeviceRegionAttributes, DmaCapability, DmaPlacement};
 use helios_hal::iommu::{DmaTranslation, PhysicalRange};
 use helios_hal::pmm::PhysFrame;
 use helios_hal::vmm::{AddressSpace, AddressSpaceError, PageFlags, VirtRange};
@@ -216,14 +216,18 @@ fn unmap_device(virt: VirtRange) -> Result<(), AddressSpaceError> {
 fn commit_contiguous(
     virt: VirtRange,
     flags: PageFlags,
-    limit: u64,
+    placement: DmaPlacement,
 ) -> Result<PhysFrame, AddressSpaceError> {
     platform()
         .address_space
-        .commit_contiguous(virt, flags, limit)
+        .commit_contiguous(virt, flags, placement)
 }
 
-fn decommit(virt: VirtRange) -> Result<(), AddressSpaceError> {
+fn release_contiguous(virt: VirtRange, _align: u64) -> Result<(), AddressSpaceError> {
+    // The host owns page-level placement under this backend's `mmap`,
+    // so a contiguous run is released the same way any other committed
+    // range is: there is no allocator here that was handed a size and
+    // an alignment to give back.
     platform().address_space.decommit(virt)
 }
 
@@ -245,7 +249,7 @@ static VM_HOOKS: DeviceVmHooks = DeviceVmHooks {
     map_device,
     unmap_device,
     commit_contiguous,
-    decommit,
+    release_contiguous,
     mapping_granule,
 };
 

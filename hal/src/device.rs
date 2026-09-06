@@ -190,6 +190,35 @@ impl DmaCapability {
 /// Implemented by a backend's handle on a discovered device, so the
 /// kernel can ask a device what it is capable of without knowing which
 /// bus it was found on.
+/// What a physically contiguous allocation has to satisfy for the
+/// device that will read it.
+///
+/// Both halves come from the device, not from the software asking:
+/// alignment is what its descriptor format or its bus burst requires,
+/// and the limit is how far its address lines actually reach. Carrying
+/// them together keeps a commit from being made against one and
+/// checked against the other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DmaPlacement {
+    /// Alignment, in bytes, the physical run must have. A power of two.
+    pub align: u64,
+    /// Highest physical byte the device can address, inclusive.
+    pub limit: u64,
+}
+
+impl DmaPlacement {
+    /// Whether a run of `bytes` at `physical` satisfies this placement.
+    pub const fn accepts(&self, physical: u64, bytes: u64) -> bool {
+        if !physical.is_multiple_of(self.align) {
+            return false;
+        }
+        match physical.checked_add(bytes) {
+            None | Some(0) => false,
+            Some(end) => end - 1 <= self.limit,
+        }
+    }
+}
+
 pub trait DmaCapable {
     fn dma_capability(&self) -> DmaCapability;
 }

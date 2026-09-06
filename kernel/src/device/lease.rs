@@ -28,6 +28,7 @@
 //! processor that has run in the space before it returns.
 
 use arrayvec::ArrayVec;
+use helios_hal::device::DmaPlacement;
 use helios_hal::pmm::PhysFrame;
 use helios_hal::vmm::{PageFlags, VirtAddr, VirtRange};
 use triomphe::Arc;
@@ -139,6 +140,17 @@ pub struct DmaBuffer {
     pub device_address: u64,
 }
 
+/// One pinned buffer as the lease records it.
+///
+/// The alignment is the lease's business and not the driver's: a
+/// contiguous run is one allocation, and releasing it needs the size
+/// and alignment it was made with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PinnedBuffer {
+    buffer: DmaBuffer,
+    align: u64,
+}
+
 /// What one owner's hold on one device has cost, for the stats panel.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GrantStats {
@@ -196,7 +208,7 @@ pub struct GrantLease {
     /// driver builds its rings once and holds them for as long as it
     /// holds the device.
     cursor: u64,
-    buffers: ArrayVec<DmaBuffer, MAX_DMA_BUFFERS>,
+    buffers: ArrayVec<PinnedBuffer, MAX_DMA_BUFFERS>,
     pinned_bytes: u64,
 }
 
@@ -278,19 +290,23 @@ impl GrantLease {
         if self.pinned_bytes + bytes > budget.byte_budget {
             return Err(GrantError::BudgetExhausted);
         }
-        let offset = self.carve(bytes, align.max(granule))?;
+        let align = align.max(granule);
+        let offset = self.carve(bytes, align)?;
         let virt = self.window.range_at(offset, bytes);
         let first = (device_vm_hooks().commit_contiguous)(
             virt,
             PageFlags::READ | PageFlags::WRITE,
-            budget.capability.address_limit(),
+            DmaPlacement {
+                align,
+                limit: budget.capability.address_limit(),
+            },
         )?;
         let physical = first.phys_addr() as u64;
         if !budget.capability.can_reach(physical, bytes) {
             // The address space handed back a run the device cannot
             // address. Nothing is salvageable from a buffer at the wrong
             // end of memory, and leaving it committed would leak it.
-            (device_vm_hooks().decommit)(virt)?;
+            (device_vm_hooks().release_contiguous)(virt, align)?;
             return Err(GrantError::Unreachable);
         }
         let device_address = budget
@@ -303,14 +319,14 @@ impl GrantLease {
             bytes,
             device_address,
         };
-        self.buffers.push(buffer);
+        self.buffers.push(PinnedBuffer { buffer, align });
         self.pinned_bytes += bytes;
         Ok(buffer)
     }
 
     /// The buffers currently pinned for the device.
-    pub fn dma_buffers(&self) -> &[DmaBuffer] {
-        &self.buffers
+    pub fn dma_buffers(&self) -> impl Iterator<Item = DmaBuffer> + '_ {
+        self.buffers.iter().map(|pinned| pinned.buffer)
     }
 
     pub fn stats(&self) -> GrantStats {
@@ -386,10 +402,10 @@ impl Drop for GrantLease {
                 )
             });
         }
-        for buffer in &self.buffers {
-            let offset = buffer.offset - self.window.offset;
-            let virt = self.window.range_at(offset, buffer.bytes);
-            (device_vm_hooks().decommit)(virt).unwrap_or_else(|error| {
+        for pinned in &self.buffers {
+            let offset = pinned.buffer.offset - self.window.offset;
+            let virt = self.window.range_at(offset, pinned.buffer.bytes);
+            (device_vm_hooks().release_contiguous)(virt, pinned.align).unwrap_or_else(|error| {
                 panic!(
                     "device {} kept a pinned buffer the address space would not release: {error}",
                     self.device.grant.name()
