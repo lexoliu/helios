@@ -1001,6 +1001,32 @@ pub(super) struct UdpSocketState {
     pub(super) open_stream_handles: usize,
 }
 
+/// The kernel socket a `wasi:sockets` datagram socket owns dies with
+/// the socket.
+///
+/// The same rule as [`TcpSocketState`], for the same reason: a
+/// component's resource destructors run when the *guest* drops a
+/// handle and never when the store around it is torn down, so a
+/// program that exits holding a `udp-socket` retires nothing. A
+/// datagram socket is installed on every shard and holds a slot in
+/// `udp_slots`, so one left behind costs the whole set (#190).
+/// Ownership lives here instead: whatever ends this state's life ends
+/// the socket's, with nothing to schedule and nothing to await.
+///
+/// A `pending_bind` is retired too. `start-bind` allocates the kernel
+/// socket before `finish-bind` promotes it, and a guest is free to
+/// exit between the two.
+impl Drop for UdpSocketState {
+    fn drop(&mut self) {
+        for bound in [self.bound.take(), self.pending_bind.take()]
+            .into_iter()
+            .flatten()
+        {
+            self.service.udp_close(bound.socket);
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(super) enum WasiUdpSocketError {
     NotSupported,

@@ -4578,22 +4578,22 @@ where
         ))) => p1::errno::INVAL,
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(_))) => p1::errno::INVAL,
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Bound {
-            socket,
             ..
         }))) => {
             let status = caller.data().require_udp_authority();
             if status != p1::errno::SUCCESS {
                 return status;
             }
-            let Some(service) = caller.data().runtime_state.network_service() else {
+            if caller.data().runtime_state.network_service().is_none() {
                 return p1::errno::NETDOWN;
-            };
-            service.udp_close(socket).await;
+            }
             let Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(slot))) =
                 caller.data_mut().descriptors.get_mut(fd)
             else {
                 return p1::errno::BADF;
             };
+            // Replacing the slot drops this descriptor's handle, and the
+            // socket is retired once the last one is gone.
             let options = *slot.options();
             *slot = WasixUdpSocket::Unbound {
                 family: slot.family(),
@@ -5224,6 +5224,69 @@ mod tests {
         assert_eq!(closed.count(), 0);
         drop(inherited);
         assert_eq!(closed.count(), 1, "the last descriptor retires the stream");
+    }
+
+    fn bound_udp_socket_entry(
+        service: crate::ComponentHostNetworkService,
+        socket: u64,
+    ) -> Preview1DescriptorEntry {
+        Preview1DescriptorEntry {
+            descriptor: Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(
+                WasixUdpSocket::Bound {
+                    family: WasixSocketFamily::Ipv4,
+                    socket: WasixOwnedUdpSocket::new(service, socket),
+                    local_port: 5353,
+                    options: WasixSocketOptions::default(),
+                },
+            )),
+            close_on_exec: false,
+            fdflags: 0,
+        }
+    }
+
+    /// A program that exits with a datagram socket open retires it.
+    ///
+    /// Nothing on the preview1 path touched a bound UDP socket's
+    /// netstack handle: `fd_close` dropped the descriptor and left the
+    /// socket installed on every shard with its `udp_slots` entry held,
+    /// for the rest of the boot (#190).
+    #[test]
+    fn a_preview1_udp_descriptor_retires_its_socket_when_its_table_goes_away() {
+        let (service, closed) = crate::test_support::recording_udp_network_service();
+        let table =
+            Preview1DescriptorTable::from_entries(vec![Some(bound_udp_socket_entry(service, 21))]);
+
+        assert_eq!(closed.count(), 0, "a live descriptor holds its socket open");
+        drop(table);
+        assert_eq!(
+            closed.count(),
+            1,
+            "the descriptor table takes its sockets with it"
+        );
+        assert_eq!(closed.last(), 21);
+    }
+
+    /// A datagram socket two descriptors share is retired when the
+    /// second one goes, not the first. `exec` hands the child a copy of
+    /// the table, and the slab slot a retired handle frees is handed
+    /// straight to the next bind.
+    #[test]
+    fn a_preview1_udp_socket_outlives_every_descriptor_but_the_last() {
+        let (service, closed) = crate::test_support::recording_udp_network_service();
+        let mut table =
+            Preview1DescriptorTable::from_entries(vec![Some(bound_udp_socket_entry(service, 21))]);
+        let inherited = table.clone_for_exec();
+
+        assert_eq!(table.close(0), p1::errno::SUCCESS);
+        assert_eq!(
+            closed.count(),
+            0,
+            "the inherited descriptor still holds the socket"
+        );
+        drop(table);
+        assert_eq!(closed.count(), 0);
+        drop(inherited);
+        assert_eq!(closed.count(), 1, "the last descriptor retires the socket");
     }
 
     fn connected_socket() -> Preview1Descriptor {

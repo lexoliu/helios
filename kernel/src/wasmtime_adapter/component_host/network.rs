@@ -230,7 +230,7 @@ trait DynComponentHostNetworkService: Send + Sync + 'static {
         interface: Ipv4Address,
     ) -> Pin<Box<dyn Future<Output = Result<(), UdpError>> + Send + 'a>>;
 
-    fn udp_close<'a>(&'a self, socket: u64) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+    fn udp_close(&self, socket: u64);
 
     fn bridge_port<'a>(
         &'a self,
@@ -564,8 +564,8 @@ impl ComponentNetworkService for ComponentHostNetworkService {
         self.inner.udp_leave_multicast_v4(group, interface)
     }
 
-    fn udp_close(&self, socket: Self::UdpSocket) -> impl Future<Output = ()> + Send + '_ {
-        self.inner.udp_close(socket)
+    fn udp_close(&self, socket: Self::UdpSocket) {
+        self.inner.udp_close(socket);
     }
 }
 
@@ -1009,11 +1009,9 @@ where
         Box::pin(self.service.udp_leave_multicast_v4(group, interface))
     }
 
-    fn udp_close<'a>(&'a self, socket: u64) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
-        Box::pin(
-            self.service
-                .udp_close(<Service::UdpSocket as ComponentHostUdpSocketToken>::from_raw(socket)),
-        )
+    fn udp_close(&self, socket: u64) {
+        self.service
+            .udp_close(<Service::UdpSocket as ComponentHostUdpSocketToken>::from_raw(socket));
     }
 
     fn bridge_port<'a>(

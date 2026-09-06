@@ -125,7 +125,17 @@ where
         self.execute_udp_leave_multicast_v4(group, interface).await
     }
 
-    pub async fn udp_close(&self, socket: UdpSocketId) {
+    /// Retires `socket`, freeing its slab slot and its replica on
+    /// every shard.
+    ///
+    /// Synchronous on purpose, exactly as `tcp_close` is: retirement is
+    /// a shard-lock update with nothing to await, and the owner that
+    /// has to run it is a `Drop`. A future here would mean the only way
+    /// to end a socket's life is to spawn a task, and a task spawned
+    /// from a dying instance is a task that may never run — which is
+    /// how a datagram socket outlived the program that opened it
+    /// (#190).
+    pub fn udp_close(&self, socket: UdpSocketId) {
         let slot = ReplicaHandle::from(socket).slot();
         self.inner
             .state

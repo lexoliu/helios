@@ -2055,17 +2055,13 @@ where
         ResourceType::host::<SbiUdpSocket>(),
         |accessor, rep| {
             Box::pin(async move {
-                let socket = accessor.with(|mut access| {
+                // Deleting the handle is the whole of it: the backend
+                // owns the kernel socket and retires it when dropped.
+                accessor.with(|mut access| {
                     let resource = Resource::<SbiUdpSocket>::new_own(rep);
-                    let socket = access.get().table.delete(resource)?;
-                    Ok::<_, wasmtime::Error>(socket)
+                    access.get().table.delete(resource)?;
+                    Ok::<_, wasmtime::Error>(())
                 })?;
-                socket
-                    .resource
-                    .backend
-                    .service
-                    .udp_close(socket.resource.backend.socket)
-                    .await;
                 Ok::<_, wasmtime::Error>(())
             })
         },
@@ -2177,21 +2173,19 @@ where
                     return Ok::<_, wasmtime::Error>((Err(unavailable_udp_error()),));
                 };
                 let bound = service.udp_bind(local_port).await;
-                let response = match bound {
-                    Ok(binding) => {
-                        let resource = accessor.with(|mut access| {
-                            access
-                                .get()
-                                .table
-                                .push(SbiUdpSocket::new(NetworkUdpBackend {
-                                    service: service.clone(),
-                                    socket: binding.socket,
-                                }))
-                        })?;
-                        Ok(resource)
-                    }
-                    Err(error) => Err(convert_udp_error(error)),
-                };
+                let response =
+                    match bound {
+                        Ok(binding) => {
+                            let resource =
+                                accessor.with(|mut access| {
+                                    access.get().table.push(SbiUdpSocket::new(
+                                        NetworkUdpBackend::new(service.clone(), binding.socket),
+                                    ))
+                                })?;
+                            Ok(resource)
+                        }
+                        Err(error) => Err(convert_udp_error(error)),
+                    };
                 Ok::<_, wasmtime::Error>((response,))
             })
         },
@@ -2286,12 +2280,15 @@ where
                     let socket = access.get().table.get(&resource)?;
                     Ok::<_, wasmtime::Error>((
                         socket.resource.backend.service.clone(),
-                        socket.resource.backend.socket,
+                        socket.resource.backend.socket(),
                     ))
                 })?;
+                let Some(handle) = socket.1 else {
+                    return Ok::<_, wasmtime::Error>((Err(closed_udp_error()),));
+                };
                 let response = socket
                     .0
-                    .udp_receive(socket.1, max_bytes, timeout)
+                    .udp_receive(handle, max_bytes, timeout)
                     .await
                     .map(|datagram| datagram.map(convert_udp_datagram))
                     .map_err(convert_udp_error);
@@ -2314,12 +2311,15 @@ where
                     let socket = access.get().table.get(&resource)?;
                     Ok::<_, wasmtime::Error>((
                         socket.resource.backend.service.clone(),
-                        socket.resource.backend.socket,
+                        socket.resource.backend.socket(),
                     ))
                 })?;
+                let Some(handle) = socket.1 else {
+                    return Ok::<_, wasmtime::Error>((Err(closed_udp_error()),));
+                };
                 let response = socket
                     .0
-                    .udp_send(socket.1, &host, port, &bytes, timeout)
+                    .udp_send(handle, &host, port, &bytes, timeout)
                     .await
                     .map_err(convert_udp_error);
                 Ok::<_, wasmtime::Error>((response,))
@@ -2331,14 +2331,11 @@ where
         |accessor: &Accessor<StoreData<CpuImpl, HostFs>>,
          (resource,): (Resource<SbiUdpSocket>,)| {
             Box::pin(async move {
-                let socket = accessor.with(|mut access| {
-                    let socket = access.get().table.get(&resource)?;
-                    Ok::<_, wasmtime::Error>((
-                        socket.resource.backend.service.clone(),
-                        socket.resource.backend.socket,
-                    ))
+                accessor.with(|mut access| {
+                    let socket = access.get().table.get_mut(&resource)?;
+                    socket.resource.backend.close();
+                    Ok::<_, wasmtime::Error>(())
                 })?;
-                socket.0.udp_close(socket.1).await;
                 Ok::<_, wasmtime::Error>((Ok::<(), debugger_wit::net::UdpError>(()),))
             })
         },
@@ -2375,17 +2372,13 @@ where
         ResourceType::host::<SbiUdpSocket>(),
         |accessor, rep| {
             Box::pin(async move {
-                let socket = accessor.with(|mut access| {
+                // Deleting the handle is the whole of it: the backend
+                // owns the kernel socket and retires it when dropped.
+                accessor.with(|mut access| {
                     let resource = Resource::<SbiUdpSocket>::new_own(rep);
-                    let socket = access.get().table.delete(resource)?;
-                    Ok::<_, wasmtime::Error>(socket)
+                    access.get().table.delete(resource)?;
+                    Ok::<_, wasmtime::Error>(())
                 })?;
-                socket
-                    .resource
-                    .backend
-                    .service
-                    .udp_close(socket.resource.backend.socket)
-                    .await;
                 Ok::<_, wasmtime::Error>(())
             })
         },
@@ -2501,21 +2494,19 @@ where
                     return Ok::<_, wasmtime::Error>((Err(unavailable_program_udp_error()),));
                 };
                 let bound = service.udp_bind(local_port).await;
-                let response = match bound {
-                    Ok(binding) => {
-                        let resource = accessor.with(|mut access| {
-                            access
-                                .get()
-                                .table
-                                .push(SbiUdpSocket::new(NetworkUdpBackend {
-                                    service: service.clone(),
-                                    socket: binding.socket,
-                                }))
-                        })?;
-                        Ok(resource)
-                    }
-                    Err(error) => Err(convert_program_udp_error(error)),
-                };
+                let response =
+                    match bound {
+                        Ok(binding) => {
+                            let resource =
+                                accessor.with(|mut access| {
+                                    access.get().table.push(SbiUdpSocket::new(
+                                        NetworkUdpBackend::new(service.clone(), binding.socket),
+                                    ))
+                                })?;
+                            Ok(resource)
+                        }
+                        Err(error) => Err(convert_program_udp_error(error)),
+                    };
                 Ok::<_, wasmtime::Error>((response,))
             })
         },
@@ -2624,12 +2615,15 @@ where
                     let socket = access.get().table.get(&resource)?;
                     Ok::<_, wasmtime::Error>((
                         socket.resource.backend.service.clone(),
-                        socket.resource.backend.socket,
+                        socket.resource.backend.socket(),
                     ))
                 })?;
+                let Some(handle) = socket.1 else {
+                    return Ok::<_, wasmtime::Error>((Err(closed_program_udp_error()),));
+                };
                 let response = socket
                     .0
-                    .udp_receive(socket.1, max_bytes, timeout)
+                    .udp_receive(handle, max_bytes, timeout)
                     .await
                     .map(|datagram| datagram.map(convert_program_udp_datagram))
                     .map_err(convert_program_udp_error);
@@ -2652,12 +2646,15 @@ where
                     let socket = access.get().table.get(&resource)?;
                     Ok::<_, wasmtime::Error>((
                         socket.resource.backend.service.clone(),
-                        socket.resource.backend.socket,
+                        socket.resource.backend.socket(),
                     ))
                 })?;
+                let Some(handle) = socket.1 else {
+                    return Ok::<_, wasmtime::Error>((Err(closed_program_udp_error()),));
+                };
                 let response = socket
                     .0
-                    .udp_send(socket.1, &host, port, &bytes, timeout)
+                    .udp_send(handle, &host, port, &bytes, timeout)
                     .await
                     .map_err(convert_program_udp_error);
                 Ok::<_, wasmtime::Error>((response,))
@@ -2669,14 +2666,11 @@ where
         |accessor: &Accessor<StoreData<CpuImpl, HostFs>>,
          (resource,): (Resource<SbiUdpSocket>,)| {
             Box::pin(async move {
-                let socket = accessor.with(|mut access| {
-                    let socket = access.get().table.get(&resource)?;
-                    Ok::<_, wasmtime::Error>((
-                        socket.resource.backend.service.clone(),
-                        socket.resource.backend.socket,
-                    ))
+                accessor.with(|mut access| {
+                    let socket = access.get().table.get_mut(&resource)?;
+                    socket.resource.backend.close();
+                    Ok::<_, wasmtime::Error>(())
                 })?;
-                socket.0.udp_close(socket.1).await;
                 Ok::<_, wasmtime::Error>((Ok::<(), program_wit::net::UdpError>(()),))
             })
         },
@@ -3069,6 +3063,22 @@ fn unavailable_program_tcp_authority_error() -> program_wit::net::TcpError {
     program_wit::net::TcpError {
         kind: program_wit::net::TcpErrorKind::Unavailable,
         detail: "network authority is missing TCP or DNS rights".to_owned(),
+    }
+}
+
+/// The error a `udp-socket` method answers once the guest has closed
+/// the socket but still holds its handle.
+fn closed_udp_error() -> debugger_wit::net::UdpError {
+    debugger_wit::net::UdpError {
+        kind: debugger_wit::net::UdpErrorKind::Unavailable,
+        detail: "UDP socket is closed".to_owned(),
+    }
+}
+
+fn closed_program_udp_error() -> program_wit::net::UdpError {
+    program_wit::net::UdpError {
+        kind: program_wit::net::UdpErrorKind::Unavailable,
+        detail: "UDP socket is closed".to_owned(),
     }
 }
 
