@@ -465,10 +465,44 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Arm GIC interrupt kind 1")]
+    #[should_panic(expected = "declares a private peripheral interrupt")]
     fn private_peripheral_interrupts_are_rejected() {
         let blob = arm_gic_tree(1, 4);
         let fdt = Fdt::new(&blob).expect("gic tree parses");
         let _ = mmio_candidates(&fdt).next();
+    }
+
+    /// The same tree, through the form a walk over unchosen nodes uses.
+    ///
+    /// A private peripheral interrupt is a fact about that node rather
+    /// than a malformed tree, so a caller that has to decide gets an
+    /// answer where a caller that requires a routable line gets a
+    /// panic.
+    #[test]
+    fn a_private_peripheral_interrupt_is_reported_rather_than_refused() {
+        let blob = arm_gic_tree(1, 4);
+        let fdt = Fdt::new(&blob).expect("gic tree parses");
+        let node = fdt
+            .all_nodes()
+            .find(|node| node.name.starts_with("virtio_mmio"))
+            .expect("the tree carries the transport node");
+        assert!(matches!(
+            node_interrupt_kind(&fdt, &node),
+            Some(NodeInterrupt::Private)
+        ));
+    }
+
+    #[test]
+    fn a_shared_peripheral_interrupt_is_reported_with_its_trigger() {
+        let blob = arm_gic_tree(0, 4);
+        let fdt = Fdt::new(&blob).expect("gic tree parses");
+        let node = fdt
+            .all_nodes()
+            .find(|node| node.name.starts_with("virtio_mmio"))
+            .expect("the tree carries the transport node");
+        let Some(NodeInterrupt::Shared(interrupt)) = node_interrupt_kind(&fdt, &node) else {
+            panic!("a shared peripheral interrupt is reported as shared");
+        };
+        assert_eq!(interrupt.trigger, Some(InterruptTrigger::Level));
     }
 }

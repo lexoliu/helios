@@ -185,23 +185,26 @@ a device tree node path, `hosted:device0`. Names are compared, never
 parsed: the kernel matches the name a driver asks for against the name
 discovery published and interprets neither.
 
-## AArch64 discovery
+## Device-tree discovery
 
 A device-tree machine describes far more than the kernel drives. The
 aarch64 backend's walk takes every node that has a register window and
 raises an interrupt, and drops the ones the kernel drives itself — the
-GIC, the PL011 console, the PL031 clock, and every `virtio,mmio`
-transport. What is left is, by definition, hardware nobody in the
-kernel claims, which is exactly what a driver plugin exists for. On
-QEMU's `virt` board that is the PL061 GPIO controller.
+interrupt controller, the console UART, the real-time clock, and every
+`virtio,mmio` transport. What is left is, by definition, hardware
+nobody in the kernel claims, which is exactly what a driver plugin
+exists for. On QEMU's aarch64 `virt` board that is the PL061 GPIO
+controller; its riscv64 `virt` board describes nothing the kernel does
+not already drive, and publishes no grant.
 
 A node whose window is not frame-aligned is skipped with a warning
 rather than refused. It is a device this backend cannot isolate, not a
 machine it cannot boot: mapping it would put a neighbour's registers in
 the same page, and changing one mapping would change both.
 
-Each grant's interrupt is routed at the distributor with the trigger
-mode the tree declared, and then left masked. Nothing owns the device
+Each grant's interrupt is routed at the controller — at the GIC
+distributor with the trigger mode the tree declared, or at the PLIC
+with a priority — and then left masked. Nothing owns the device
 yet, so a line arriving before a claim would have nowhere to go; the
 first `unmask` from the driver that claims it is what arms the
 hardware.
@@ -265,7 +268,23 @@ for core modules only, so the vendored fork gained
 `wasmtime::component::Instance::get_default_memory`; `docs/wasmtime.md`
 records the revision.
 
-One thing is open, and it is recorded on #5: **x86-64 PCI enumeration
-and riscv64 device-tree discovery are not built.** Both backends still
-publish no grants, so `hosted/` and aarch64 are the grant sources
-today.
+### RISC-V has no memory type in its page tables
+
+Whether an access is cacheable and reorderable is a physical memory
+attribute of the address on RISC-V, fixed by the platform, rather than
+something a leaf PTE selects. (Svpbmt adds one; QEMU's `virt` does not
+offer it.) So on riscv64 a register window is an ordinary valid leaf
+pointing into the platform's I/O space, and a region's `kind` is
+already true of the address it names. On aarch64 the same region takes
+MAIR index 7, Device-nGnRnE, because there the page table is what
+decides.
+
+### What is open
+
+**x86-64 publishes no grants.** PCI is a different enumeration, not a
+port of the device-tree walk: sizing a memory BAR means writing all
+ones to it and reading back with the function's memory-space decode
+turned off, and masking a granted line means reaching that function's
+own MSI-X vector-control bit rather than a controller the kernel owns.
+Both deserve their own design and their own review rather than a
+tail-end of this one. It is recorded on #5.

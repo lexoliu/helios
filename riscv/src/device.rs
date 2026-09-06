@@ -241,11 +241,8 @@ fn discover(fdt: &Fdt<'static>) -> Vec<GrantableDevice> {
 }
 
 fn drives_itself(node: &FdtNode<'_, '_>) -> bool {
-    node.compatible().is_some_and(|entries| {
-        entries
-            .all()
-            .any(|entry| KERNEL_DRIVEN.contains(&entry))
-    })
+    node.compatible()
+        .is_some_and(|entries| entries.all().any(|entry| KERNEL_DRIVEN.contains(&entry)))
 }
 
 /// The register window a node declares, when it declares one this
