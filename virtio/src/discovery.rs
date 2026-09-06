@@ -108,28 +108,59 @@ pub fn node_interrupt<'b, 'a: 'b>(
     fdt: &'b Fdt<'a>,
     node: &FdtNode<'b, 'a>,
 ) -> Option<MmioInterrupt> {
+    match node_interrupt_kind(fdt, node)? {
+        NodeInterrupt::Shared(interrupt) => Some(interrupt),
+        NodeInterrupt::Private => panic!(
+            "device tree node {} declares a private peripheral interrupt, \
+             and only shared peripheral interrupts are routable",
+            node.name
+        ),
+    }
+}
+
+/// What kind of interrupt a node declares.
+///
+/// [`node_interrupt`] is for a caller that requires a routable line and
+/// should fail loudly without one — a virtio transport whose
+/// completions could otherwise only be polled. A caller walking nodes
+/// it did not choose has to be able to tell the two apart instead,
+/// because a private peripheral interrupt is a fact about that node
+/// rather than a malformed tree.
+pub enum NodeInterrupt {
+    /// A line the controller routes by affinity, so it can be given to
+    /// a driver.
+    Shared(MmioInterrupt),
+    /// A line that belongs to one processor. It is not routed, so it
+    /// cannot be granted.
+    Private,
+}
+
+/// Decodes the first entry of `node`'s `interrupts` property, reporting
+/// the kind rather than requiring one.
+pub fn node_interrupt_kind<'b, 'a: 'b>(
+    fdt: &'b Fdt<'a>,
+    node: &FdtNode<'b, 'a>,
+) -> Option<NodeInterrupt> {
     let interrupts = node.property("interrupts")?;
     let name = node.name;
     let cells = interrupt_cells(fdt, node, name);
     let mut values = interrupt_cell_values(interrupts.value, name);
     match cells {
-        NUMBER_ONLY_CELLS => Some(MmioInterrupt {
+        NUMBER_ONLY_CELLS => Some(NodeInterrupt::Shared(MmioInterrupt {
             number: next_interrupt_cell(&mut values, name),
             trigger: None,
-        }),
+        })),
         ARM_GIC_CELLS => {
             let kind = next_interrupt_cell(&mut values, name);
-            assert!(
-                kind == ARM_GIC_KIND_SPI,
-                "device tree node {name} declares Arm GIC interrupt kind {kind}, \
-                 only shared peripheral interrupts are routable"
-            );
+            if kind != ARM_GIC_KIND_SPI {
+                return Some(NodeInterrupt::Private);
+            }
             let number = next_interrupt_cell(&mut values, name);
             let flags = next_interrupt_cell(&mut values, name);
-            Some(MmioInterrupt {
+            Some(NodeInterrupt::Shared(MmioInterrupt {
                 number,
                 trigger: Some(trigger_from_flags(flags, name)),
-            })
+            }))
         }
         cells => panic!(
             "device tree node {name} has an interrupt parent with unsupported \

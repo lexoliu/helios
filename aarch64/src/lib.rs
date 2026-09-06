@@ -1691,22 +1691,32 @@ fn table_from_physical(physical_address: usize, physical_memory_offset: usize) -
 }
 
 fn fdt_cells_to_usize(bytes: &[u8], name: &str) -> usize {
-    assert!(
-        bytes.len() == 4 || bytes.len() == 8,
-        "{name} must contain one or two 32-bit cells, got {} bytes",
-        bytes.len()
-    );
+    fdt_cells(bytes).unwrap_or_else(|| {
+        panic!(
+            "{name} must contain one or two 32-bit cells, got {} bytes",
+            bytes.len()
+        )
+    })
+}
+
+/// The value one or two big-endian cells spell, or `None` when the
+/// property is not that shape.
+///
+/// [`fdt_cells_to_usize`] is for a caller reading a node it chose,
+/// where a different shape means a tree this backend cannot boot on. A
+/// walk over nodes nobody chose meets `reg` properties written against
+/// `#size-cells = <0>` — a processor, a PCI function — and those are
+/// simply not devices with a register window.
+fn fdt_cells(bytes: &[u8]) -> Option<usize> {
+    if bytes.len() != 4 && bytes.len() != 8 {
+        return None;
+    }
     let mut value = 0usize;
     for cell in bytes.chunks_exact(4) {
-        value = value
-            .checked_shl(32)
-            .unwrap_or_else(|| panic!("{name} cell shift overflow"))
-            | u32::from_be_bytes(
-                cell.try_into()
-                    .unwrap_or_else(|_| panic!("{name} cell had invalid width")),
-            ) as usize;
+        let cell = u32::from_be_bytes(cell.try_into().ok()?) as usize;
+        value = value.checked_shl(32)? | cell;
     }
-    value
+    Some(value)
 }
 
 fn mmio_virtual_base(physical_base: usize, physical_memory_offset: usize) -> usize {

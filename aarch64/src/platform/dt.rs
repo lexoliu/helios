@@ -104,9 +104,14 @@ fn grantable(fdt: &Fdt<'static>) -> Slots<GrantableDevice, MAX_GRANTABLE_DEVICES
         if drives_itself(&node) {
             continue;
         }
-        let (Ok(region), Some(interrupt)) =
-            (first_region(&node, node.name), node_interrupt(fdt, &node))
-        else {
+        // The region is checked first: most of what a tree describes is
+        // the machine rather than a device — the processors, the
+        // memory, `chosen`, the architected timer — and none of it has
+        // a register window.
+        let Some(region) = described_region(&node) else {
+            continue;
+        };
+        let Some(interrupt) = node_interrupt(fdt, &node) else {
             continue;
         };
         if !region.base.is_multiple_of(FRAME) || !region.size.is_multiple_of(FRAME) {
@@ -130,6 +135,18 @@ fn grantable(fdt: &Fdt<'static>) -> Slots<GrantableDevice, MAX_GRANTABLE_DEVICES
         );
     }
     devices
+}
+
+/// The register window a node declares, when it declares one this
+/// backend can read.
+///
+/// Unlike [`first_region`], a missing or oddly shaped `reg` is an
+/// answer rather than an error: this walks nodes nobody chose.
+fn described_region(node: &FdtNode<'_, '_>) -> Option<MmioRegion> {
+    let region = node.raw_reg().and_then(|mut regions| regions.next())?;
+    let base = crate::fdt_cells(region.address)?;
+    let size = crate::fdt_cells(region.size)?;
+    (size != 0).then_some(MmioRegion { base, size })
 }
 
 /// Whether the kernel drives this node itself.
@@ -224,5 +241,11 @@ fn first_region(node: &FdtNode<'_, '_>, what: &str) -> Result<MmioRegion, Platfo
 /// property has the same shape whatever device declares it, and the
 /// GIC's three-cell binding is the only one an AArch64 tree uses.
 fn node_interrupt<'b, 'a: 'b>(fdt: &'b Fdt<'a>, node: &FdtNode<'b, 'a>) -> Option<SpiInterrupt> {
-    spi(helios_virtio::node_interrupt(fdt, node)?).ok()
+    match helios_virtio::node_interrupt_kind(fdt, node)? {
+        helios_virtio::NodeInterrupt::Shared(interrupt) => spi(interrupt).ok(),
+        // A private peripheral interrupt belongs to one processor and
+        // is not routed by affinity, so it is not something this
+        // backend can hand to a driver.
+        helios_virtio::NodeInterrupt::Private => None,
+    }
 }
