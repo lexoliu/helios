@@ -134,7 +134,10 @@ Per cell (workload × side), `iterations` executions (11 by default):
     own report: one host, one job, the two images booted back to back for
     every workload. Nothing about the machine differs between the
     columns, so this half blocks on a headline regression whether or not
-    the report is publishable.
+    the report is publishable. Every headline also needs a valid cell
+    from both images: a missing, failed or variance-rejected cell blocks
+    as incomplete paired evidence, rather than disappearing from the
+    acceptance decision. Comparable rows remain in the report.
   - **Cross-run**, against the newest `dev` report of the same lane:
     another job, another runner. This half blocks only when both reports
     are publishable *and* their run records name the same host CPU;
