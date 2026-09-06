@@ -881,6 +881,37 @@ pub enum TcpCloseKind {
     Unresponsive,
 }
 
+/// What retiring a socket owes its peer, from RFC 9293 3.6.
+///
+/// The owner of a connection never decides this: it says only that it
+/// has let go, and the socket's own state and receive queue decide what
+/// goes on the wire. Keeping the decision here is what makes every way
+/// a connection can end — a guest's explicit close, a descriptor table
+/// dying with its program, a resource destructor — reach the same
+/// three answers.
+///
+/// The value is a snapshot of the socket it was read from and is
+/// consumed by the same `&mut Stack` that read it; it carries no
+/// ownership and outlives nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TcpCloseAction {
+    /// Nothing was ever synchronised under this four-tuple, or the
+    /// connection has already reached [`TcpState::Closed`]. RFC 9293
+    /// 3.10.4 deletes the transmission control block and returns, with
+    /// nothing on the wire.
+    Reclaim,
+    /// The connection is abandoned with data its owner will never read,
+    /// or from a half-open state that has no FIN to send. RFC 9293
+    /// 3.6.1 aborts with a reset rather than a FIN, because a FIN would
+    /// promise the peer a stream that was in fact truncated.
+    Reset,
+    /// The orderly close of RFC 9293 3.6: the FIN is already on the
+    /// wire, or [`TcpSocket::close_send`] is about to put it there, and
+    /// the socket runs `FIN-WAIT`/`CLOSING`/`TIME-WAIT` to its end
+    /// before its slot is reclaimed.
+    Finish,
+}
+
 impl TcpStateChangeReason {
     /// How a socket that entered [`TcpState::Closed`] through this
     /// transition reads to the application holding it.
@@ -2109,6 +2140,37 @@ where
         }
     }
 
+    /// What retiring this socket owes its peer.
+    ///
+    /// A socket that has already sent its FIN finishes the sequence it
+    /// started, whatever is left in its receive queue: the peer was
+    /// told the stream ended in order and a reset would retract that.
+    /// A socket that has not is abandoning undelivered data if its
+    /// receive queue is non-empty, and RFC 9293 3.6.1 makes that an
+    /// abort; with an empty queue it is the ordinary close, and the FIN
+    /// is what the peer is owed.
+    pub fn close_action(&self) -> TcpCloseAction {
+        match self.state {
+            TcpState::Closed | TcpState::Listen | TcpState::SynSent => TcpCloseAction::Reclaim,
+            TcpState::FinWait1
+            | TcpState::FinWait2
+            | TcpState::Closing
+            | TcpState::LastAck
+            | TcpState::TimeWait => TcpCloseAction::Finish,
+            // A handshake the peer believes in that never became a
+            // stream: there is no send sequence to close and nobody to
+            // hand the connection to.
+            TcpState::SynReceived => TcpCloseAction::Reset,
+            TcpState::Established | TcpState::CloseWait => {
+                if self.receive_buffered_bytes() == 0 {
+                    TcpCloseAction::Finish
+                } else {
+                    TcpCloseAction::Reset
+                }
+            }
+        }
+    }
+
     pub fn close_send(&mut self) {
         let next = match self.state {
             TcpState::Established => TcpState::FinWait1,
@@ -2493,7 +2555,10 @@ where
             .wrapping_add(u32::from(self.advertised_window) << self.local_window_scale);
     }
 
-    fn receive_buffered_bytes(&self) -> usize {
+    /// Everything the receive path is holding for this socket: the
+    /// in-order bytes a reader has not taken, and the out-of-order
+    /// bytes waiting on the gap in front of them.
+    pub fn receive_buffered_bytes(&self) -> usize {
         self.receive_queued_bytes
             .checked_add(self.out_of_order_queued_bytes)
             .expect("TCP receive buffered byte count overflowed")

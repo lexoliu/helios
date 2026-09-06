@@ -57,13 +57,13 @@ pub use stack::{
     Ipv4MulticastMembership, MAX_ICMP_ECHO_REPLIES, MAX_IPV4_MULTICAST_MEMBERSHIPS,
     MAX_OUTBOUND_FRAMES, MAX_UDP_RX, MAX_UDP_SOCKETS, NeighborEntry, NeighborState,
     OutboundBatchStatus, Route, RouteTable, RxChecksumOffload, SocketId, Stack, StackConfig,
-    StackEvent, StackInstant, TcpAccept, TcpConnectState, TcpConnectTerminalError,
+    StackEvent, StackInstant, TcpAccept, TcpCloseOutcome, TcpConnectState, TcpConnectTerminalError,
     TcpListenBacklog, TcpReadIntoState, TcpReadState, TcpStackCounters, UdpEgress, UdpEndpoint,
     UdpPayload, UdpReceive, UdpSocketBinding, UdpSocketError, UdpSocketId,
 };
 pub use tcp::{TCP_RECEIVE_WINDOW_BYTES, TCP_TRANSMIT_BUFFER_BYTES};
 pub use tcp::{
-    TcpAckQueued, TcpAckSnapshot, TcpCloseKind, TcpEndpoint, TcpReceiveCounters,
+    TcpAckQueued, TcpAckSnapshot, TcpCloseAction, TcpCloseKind, TcpEndpoint, TcpReceiveCounters,
     TcpReceiveDiagnostics, TcpReset, TcpSegmentBudget, TcpSegmentOutcome, TcpSegmentSnapshot,
     TcpSequenceRange, TcpSocket, TcpState, TcpStateChangeReason, TcpTransmitSegment,
 };

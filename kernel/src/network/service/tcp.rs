@@ -1592,12 +1592,26 @@ impl NetworkShard {
         }
     }
 
+    /// Retires `stream` and hands what is left of the connection to the
+    /// stack.
+    ///
+    /// The handle is invalid the moment its slot is released, whatever
+    /// the stack then does with the socket: a connection still owing
+    /// its peer a FIN outlives the handle, under the stack's ownership
+    /// and unreachable from here, and a later call on the handle is
+    /// `UnknownTcpStream` either way.
+    ///
+    /// Before #224 this dropped the socket outright, so a program that
+    /// exited with a connection open put nothing on the wire and its
+    /// peer kept an established connection until its own timeout.
     pub(super) fn remove_tcp_stream(&mut self, stream: TcpStreamId, now: StackInstant) {
         let slot = self.decode_handle_slot(stream.into());
         if let Some(socket) = self.tcp_streams.remove(slot) {
-            self.stack
-                .remove_tcp_socket(socket, now)
+            let outcome = self
+                .stack
+                .close_tcp_socket(socket, now)
                 .unwrap_or_else(|_| panic!("TCP stream referenced an unknown stack socket"));
+            tracing::debug!(stream = u64::from(stream), ?outcome, "TCP stream retired");
         }
     }
 

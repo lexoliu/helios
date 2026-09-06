@@ -1395,6 +1395,208 @@ fn usize_to_u64(value: usize, label: &'static str) -> u64 {
     u64::try_from(value).unwrap_or_else(|_| panic!("{label} does not fit into u64"))
 }
 
+/// A service whose stack already holds one established connection, for
+/// a test that owns that connection from outside this module.
+///
+/// The wiring lives here because all of it does: the shard lock, the
+/// local address, the neighbour entry, the stack socket and the stream
+/// slot are private to `network::service`, while the owners whose
+/// `Drop` retires a stream — a descriptor table, a guest socket
+/// resource — are in `wasmtime_adapter`.
+#[cfg(test)]
+pub(crate) mod fixture {
+    use super::*;
+
+    use helios_netstack::{
+        ETHERNET_FRAME_BYTES, NeighborState, TcpFlags, TcpHeader, TransportChecksum,
+    };
+
+    /// One TCP segment the stack put on its outbound queue, reduced to
+    /// what a close test asks about.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) struct FixtureSegment {
+        pub(crate) flags: TcpFlags,
+        pub(crate) sequence: u32,
+        pub(crate) acknowledgement: u32,
+    }
+
+    pub(crate) struct EstablishedTcpFixture {
+        service: NetworkService<
+            crate::test_support::TestCpu,
+            crate::test_support::TestRuntimeState,
+            crate::test_support::RecordingNetworkInterface,
+        >,
+        stream: TcpStreamId,
+    }
+
+    impl EstablishedTcpFixture {
+        const LOCAL: Ipv4Address = Ipv4Address::new([192, 0, 2, 10]);
+        const PEER: Ipv4Address = Ipv4Address::new([192, 0, 2, 20]);
+        const LOCAL_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 1];
+        const PEER_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 2];
+        const LOCAL_PORT: u16 = 49_152;
+        const PEER_PORT: u16 = 80;
+        /// This side's initial send sequence, so a test can predict the
+        /// sequence its FIN or its reset carries.
+        pub(crate) const LOCAL_SEQUENCE: u32 = 7;
+        /// The peer's, for the acknowledgement they carry back.
+        pub(crate) const PEER_SEQUENCE: u32 = 100;
+
+        /// A connection in `ESTABLISHED`, with the handshake's own
+        /// frames already drained so the next segment on the wire is
+        /// whatever the test produces.
+        pub(crate) fn new() -> Self {
+            let cpu = crate::test_support::TestCpu::without_entropy();
+            let service = NetworkService::new(
+                cpu,
+                crate::test_support::TestRuntimeState,
+                Timer::new(cpu),
+                crate::test_support::RecordingNetworkInterface::new(1),
+            );
+            let fixture = Self {
+                service,
+                stream: {
+                    // Placeholder: replaced below once the shard has
+                    // the socket. `TcpStreamId` is non-zero, so the
+                    // stream slot has to come from the shard itself.
+                    TcpStreamId(NonZeroU32::new(1).expect("one is non-zero"))
+                },
+            };
+            let stream = {
+                let mut shard = fixture
+                    .service
+                    .inner
+                    .state
+                    .shard_at(DEFAULT_SHARD_IDX)
+                    .lock();
+                shard.stack.add_ipv4_address(Ipv4Cidr::new(Self::LOCAL, 24));
+                shard.stack.learn_neighbor(NeighborEntry {
+                    ip: IpAddress::Ipv4(Self::PEER),
+                    mac: Self::PEER_MAC,
+                    state: NeighborState::Reachable,
+                    updated_at: StackInstant::from_nanos(0),
+                });
+                fixture.service.inner.control.publish_from_shard(&shard);
+                let socket = shard
+                    .stack
+                    .open_tcp_connect(
+                        TcpEndpoint {
+                            address: IpAddress::Ipv4(Self::LOCAL),
+                            port: Self::LOCAL_PORT,
+                        },
+                        TcpEndpoint {
+                            address: IpAddress::Ipv4(Self::PEER),
+                            port: Self::PEER_PORT,
+                        },
+                        Self::LOCAL_SEQUENCE,
+                    )
+                    .expect("the fixture connection should allocate a socket");
+                shard.insert_tcp_stream(socket)
+            };
+            let fixture = Self { stream, ..fixture };
+            fixture.deliver(
+                TcpHeader {
+                    source_port: Self::PEER_PORT,
+                    destination_port: Self::LOCAL_PORT,
+                    sequence: Self::PEER_SEQUENCE,
+                    acknowledgement: Self::LOCAL_SEQUENCE.wrapping_add(1),
+                    flags: TcpFlags::SYN.union(TcpFlags::ACK),
+                    window_size: u16::MAX,
+                },
+                &[],
+            );
+            let _ = fixture.drive();
+            fixture
+        }
+
+        /// The service a component-host owner holds.
+        pub(crate) fn service(&self) -> crate::ComponentHostNetworkService {
+            crate::ComponentHostNetworkService::from_service(self.service.clone())
+        }
+
+        /// The stream handle a component-host owner holds.
+        pub(crate) fn stream(&self) -> u64 {
+            u64::from(self.stream)
+        }
+
+        /// Hands the peer's segment to the stack.
+        pub(crate) fn deliver(&self, header: TcpHeader, payload: &[u8]) {
+            let mut frame = [0u8; ETHERNET_FRAME_BYTES];
+            let mut offset = EthernetFrame::encode_header(
+                &mut frame,
+                Self::LOCAL_MAC,
+                Self::PEER_MAC,
+                EthernetProtocol::Ipv4,
+            )
+            .expect("the fixture Ethernet header should fit");
+            let tcp_start = offset + Ipv4Packet::MIN_HEADER_LEN;
+            let tcp_len = TcpPacket::encode(
+                &mut frame[tcp_start..],
+                IpAddress::Ipv4(Self::PEER),
+                IpAddress::Ipv4(Self::LOCAL),
+                header,
+                payload,
+                TransportChecksum::Software,
+            )
+            .expect("the fixture TCP segment should fit");
+            offset += Ipv4Packet::encode_header(
+                &mut frame[offset..],
+                Self::PEER,
+                Self::LOCAL,
+                IpProtocol::Tcp,
+                tcp_len,
+                1,
+                64,
+            )
+            .expect("the fixture IPv4 header should fit");
+            self.service
+                .inner
+                .state
+                .shard_at(DEFAULT_SHARD_IDX)
+                .lock()
+                .stack
+                .receive_frame(
+                    &frame[..offset + tcp_len],
+                    StackInstant::from_nanos(self.service.now_nanos()),
+                )
+                .expect("the fixture segment should be accepted");
+        }
+
+        /// Drives the stack once and reports every TCP segment it
+        /// queued, which is what a close test reads instead of the
+        /// state the stack was left in.
+        pub(crate) fn drive(&self) -> Vec<FixtureSegment> {
+            let now = StackInstant::from_nanos(self.service.now_nanos());
+            let mut shard = self.service.inner.state.shard_at(DEFAULT_SHARD_IDX).lock();
+            shard
+                .stack
+                .drive_tcp(now)
+                .expect("the fixture stack should drive");
+            let mut segments = Vec::new();
+            while let Some(frame) = shard.stack.take_outbound() {
+                let Some(ethernet) = EthernetFrame::parse(frame.as_slice()) else {
+                    continue;
+                };
+                let Some(ipv4) = Ipv4Packet::parse(ethernet.payload) else {
+                    continue;
+                };
+                if ipv4.protocol != IpProtocol::Tcp {
+                    continue;
+                }
+                let Some(tcp) = TcpPacket::parse(ipv4.payload) else {
+                    continue;
+                };
+                segments.push(FixtureSegment {
+                    flags: tcp.flags,
+                    sequence: tcp.sequence,
+                    acknowledgement: tcp.acknowledgement,
+                });
+            }
+            segments
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// The peer's hardware address in the frames these tests build.

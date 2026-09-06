@@ -16,8 +16,8 @@ use crate::{
     Icmpv4Packet, Icmpv6DestinationUnreachableCode, Icmpv6Packet, IpAddress, IpCidr, Ipv4Address,
     Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6Cidr, Ipv6DnsServers, Ipv6Packet,
     Ipv6RouterConfiguration, Ipv6Scope, NeighborDiscovery, PacketBuffer, RxChecksumReport, RxFrame,
-    RxFrameOffload, SegmentationOffload, StackError, TcpCloseKind, TcpEndpoint, TcpFlags,
-    TcpHeader, TcpHeaderOptions, TcpPacket, TcpReceiveBuffer, TcpReceiveCounters,
+    RxFrameOffload, SegmentationOffload, StackError, TcpCloseAction, TcpCloseKind, TcpEndpoint,
+    TcpFlags, TcpHeader, TcpHeaderOptions, TcpPacket, TcpReceiveBuffer, TcpReceiveCounters,
     TcpReceiveDiagnostics, TcpSegmentBudget, TcpSocket, TcpTransmitSegment, TransportChecksum,
     TxChecksum, TxFrameRef, TxSegmentation, UdpPacket, icmpv6_checksum_valid,
     interpret_router_advertisement, ipv4_checksum, partial_transport_checksum_completes,
@@ -2119,6 +2119,9 @@ where
     tcp_accept: Deque<TcpQueuedAccept, MAX_TCP_ACCEPT>,
     tcp_listener_queues: TcpListenerQueues,
     tcp_listener_children: [Option<SocketId>; MAX_TCP_SOCKETS],
+    /// Connections the stack owns because their owner let go while they
+    /// were still finishing an orderly close.
+    tcp_orphans: TcpOrphans,
     tcp: TcpSocketSlab<C>,
     tcp_timers: BinaryHeap<TcpTimerEntry, Min, MAX_TCP_TIMER_ENTRIES>,
     tcp_timer_generations: [u32; MAX_TCP_SOCKETS],
@@ -2127,6 +2130,83 @@ where
     tcp_receive_backpressured_count: usize,
     tcp_transmit_counters: TcpTransmitCounters,
     tcp_receive_counters: TcpReceiveCounters,
+}
+
+/// The socket slots the stack is finishing on its own account.
+///
+/// A connection whose owner closed it while it still had a FIN sequence
+/// to run has no owner left to read its events, drain its receive queue
+/// or free its slot, so the stack keeps it and does all three itself.
+/// Membership ends exactly when the socket reaches [`TcpState::Closed`]
+/// and its slot, its endpoint and its timers go back to the slab.
+///
+/// Concurrency: this is `Stack` state, and a `Stack` belongs to one
+/// shard, mutated behind `&mut self` by whichever processor holds that
+/// shard. No operation here is reachable from another processor, so
+/// nothing is atomic and nothing is padded. The set is a list rather
+/// than a slot-wide bitmap because it is walked once per
+/// [`Stack::drive_tcp`] and is empty on almost every walk.
+#[derive(Clone, Debug)]
+struct TcpOrphans {
+    indices: ArrayVec<usize, MAX_TCP_SOCKETS>,
+}
+
+impl TcpOrphans {
+    const fn new() -> Self {
+        Self {
+            indices: ArrayVec::new_const(),
+        }
+    }
+
+    fn adopt(&mut self, index: usize) {
+        if self.contains(index) {
+            return;
+        }
+        self.indices
+            .try_push(index)
+            .unwrap_or_else(|_| panic!("TCP orphan set cannot exceed the socket slab"));
+    }
+
+    fn release(&mut self, index: usize) {
+        if let Some(position) = self.indices.iter().position(|orphan| *orphan == index) {
+            let _ = self.indices.swap_remove(position);
+        }
+    }
+
+    fn contains(&self, index: usize) -> bool {
+        self.indices.contains(&index)
+    }
+
+    fn len(&self) -> usize {
+        self.indices.len()
+    }
+
+    /// The slot at `position` in the walk order, which
+    /// [`TcpOrphans::release`] rearranges: a sweep that reclaims the
+    /// orphan at `position` re-reads the same position rather than
+    /// advancing past the one swapped into it.
+    fn at(&self, position: usize) -> usize {
+        *self
+            .indices
+            .get(position)
+            .unwrap_or_else(|| panic!("TCP orphan position {position} is outside the orphan set"))
+    }
+}
+
+/// What [`Stack::close_tcp_socket`] did with the socket it was handed.
+///
+/// The distinction matters to the caller only as bookkeeping: the
+/// socket id is invalid either way from the moment the call returns,
+/// because either the slot is already free or the stack owns what is
+/// left of the connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TcpCloseOutcome {
+    /// The connection is over and its slot, port and timers are free.
+    Reclaimed,
+    /// The connection is running out its FIN sequence under the stack's
+    /// ownership, and will be reclaimed when it reaches
+    /// [`TcpState::Closed`].
+    Finishing,
 }
 
 /// What this stack has put on the wire on behalf of its TCP sockets.
@@ -2428,6 +2508,7 @@ where
             tcp_accept: Deque::new(),
             tcp_listener_queues: TcpListenerQueues::new(),
             tcp_listener_children: [None; MAX_TCP_SOCKETS],
+            tcp_orphans: TcpOrphans::new(),
             tcp: TcpSocketSlab::new(),
             tcp_timers: BinaryHeap::new(),
             tcp_timer_generations: [0; MAX_TCP_SOCKETS],
@@ -3393,12 +3474,18 @@ where
                 if self.tcp.terminal_error(index).is_none() {
                     self.retire_closed_tcp_socket(index);
                 }
-                Self::push_event_into(
-                    &mut self.events,
-                    StackEvent::TcpClosed {
-                        socket: socket_id(index),
-                    },
-                );
+                // An orphan's former owner is gone and its slot is
+                // about to be handed to another connection, so an event
+                // naming it would be read by whoever holds that slot
+                // next. The sweep below is the whole of its retirement.
+                if !self.tcp_orphans.contains(index) {
+                    Self::push_event_into(
+                        &mut self.events,
+                        StackEvent::TcpClosed {
+                            socket: socket_id(index),
+                        },
+                    );
+                }
             }
             self.schedule_tcp_timer_deadline(index, deadline);
         }
@@ -3531,6 +3618,7 @@ where
             )?;
             self.schedule_tcp_timer(index);
         }
+        self.sweep_tcp_orphans(now);
         Ok(())
     }
 
@@ -3584,6 +3672,55 @@ where
         self.tcp_listener_children[index] = None;
         self.remove_tcp_accepts_for(socket);
         Ok(())
+    }
+
+    /// Retires a connection the way RFC 9293 3.6 says a close ends one,
+    /// rather than by dropping its socket.
+    ///
+    /// This is the entry point for every way a connection's owner can
+    /// let go — a guest's explicit close, a descriptor table dying with
+    /// its program, a resource destructor — and the owner supplies no
+    /// policy: [`TcpSocket::close_action`] reads the socket's state and
+    /// its receive queue and answers with the FIN, the reset, or the
+    /// bare reclamation the peer is owed.
+    ///
+    /// A connection that still has a FIN sequence to run is adopted by
+    /// the stack and finishes it with no owner, so the slot, the local
+    /// port and the timers are released when the state machine reaches
+    /// [`TcpState::Closed`] and not when the owner let go. The socket
+    /// id is invalid to its former owner from the moment this returns,
+    /// whichever outcome it reports.
+    ///
+    /// [`Stack::remove_tcp_socket`] remains the listener's retirement:
+    /// a listener has no send sequence to close, and what its backlog
+    /// is owed is the reset that path already sends.
+    pub fn close_tcp_socket(
+        &mut self,
+        socket: SocketId,
+        now: StackInstant,
+    ) -> Result<TcpCloseOutcome, StackError> {
+        let index = socket_index(socket);
+        match self.tcp_socket(socket)?.close_action() {
+            TcpCloseAction::Reclaim => {
+                self.remove_tcp_socket(socket, now)?;
+                Ok(TcpCloseOutcome::Reclaimed)
+            }
+            TcpCloseAction::Reset => {
+                self.reset_tcp_socket(socket_id(index), now);
+                self.remove_tcp_socket(socket, now)?;
+                Ok(TcpCloseOutcome::Reclaimed)
+            }
+            TcpCloseAction::Finish => {
+                self.tcp_socket_mut(socket)?.close_send();
+                self.tcp_orphans.adopt(index);
+                // Receive backpressure is a promise that the stack will
+                // take frames again once this socket is drained, and an
+                // orphan has nobody left to drain it (#143).
+                self.clear_tcp_receive_backpressure(index);
+                self.schedule_tcp_timer(index);
+                Ok(TcpCloseOutcome::Finishing)
+            }
+        }
     }
 
     pub fn tcp_send(&mut self, socket: SocketId, bytes: &[u8]) -> Result<usize, StackError> {
@@ -4994,7 +5131,13 @@ where
             // A segment that ended the connection — a peer RST above all
             // — leaves a blocked reader with nothing else to wait for,
             // so the closure is the wakeup.
-            if previous_state != crate::TcpState::Closed && current_state == crate::TcpState::Closed
+            //
+            // An orphan has no reader to wake and a slot another
+            // connection is about to take, so its retirement is the
+            // sweep in `drive_tcp` and nothing else.
+            if previous_state != crate::TcpState::Closed
+                && current_state == crate::TcpState::Closed
+                && !self.tcp_orphans.contains(index)
             {
                 Self::push_event_into(
                     &mut self.events,
@@ -5546,6 +5689,69 @@ where
         self.remove_tcp_accepts_for(socket_id(index));
     }
 
+    /// Reclaims every orphan the state machine has finished with, and
+    /// resets the ones whose peer kept sending after the close.
+    ///
+    /// Membership, not a transition, is what the sweep tests. An orphan
+    /// reaches [`TcpState::Closed`] two ways — a timer this drive
+    /// expired, the `TIME-WAIT` 2MSL above all, and a segment the
+    /// receive path handled between drives — and only the first is a
+    /// transition a drive can observe.
+    ///
+    /// Data that arrives after the close has no reader and never will,
+    /// which RFC 9293 3.6.1 answers with a reset. Without it an orphan
+    /// in `FIN-WAIT-2` would sit on its slot and its advertised window
+    /// against a peer that had no reason to send a FIN.
+    fn sweep_tcp_orphans(&mut self, now: StackInstant) {
+        let mut position = 0;
+        while position < self.tcp_orphans.len() {
+            let index = self.tcp_orphans.at(position);
+            let socket = self
+                .tcp
+                .get(index)
+                .unwrap_or_else(|| panic!("orphaned TCP socket {index} left the slab behind it"));
+            if socket.state() == crate::TcpState::Closed {
+                self.reclaim_tcp_orphan(index);
+                continue;
+            }
+            if socket.receive_buffered_bytes() != 0 {
+                self.reset_tcp_socket(socket_id(index), now);
+                self.tcp
+                    .get_mut(index)
+                    .unwrap_or_else(|| {
+                        panic!("orphaned TCP socket {index} left the slab behind it")
+                    })
+                    .abort();
+                self.reclaim_tcp_orphan(index);
+                continue;
+            }
+            position += 1;
+        }
+    }
+
+    /// Frees an orphan's slot, its endpoint keys, its local port and
+    /// its timers.
+    ///
+    /// The tail of [`Stack::remove_tcp_socket`], minus the parts only a
+    /// listener has: an orphan is always a connection, so it has no
+    /// backlog to reset and no listener queue of its own — only the
+    /// backlog slot it may still hold in the listener it arrived on.
+    fn reclaim_tcp_orphan(&mut self, index: usize) {
+        self.tcp_orphans.release(index);
+        let listener = self.tcp_listener_children[index].take();
+        let removed = self.tcp.remove(index);
+        assert!(
+            removed.is_some(),
+            "orphaned TCP socket {index} left the slab behind it"
+        );
+        self.clear_tcp_timer(index);
+        self.clear_tcp_receive_backpressure(index);
+        if let Some(listener) = listener {
+            self.tcp_listener_queues.release(listener);
+        }
+        self.remove_tcp_accepts_for(socket_id(index));
+    }
+
     fn release_tcp_listener_child(&mut self, index: usize) {
         if let Some(listener) = self.tcp_listener_children[index].take() {
             self.tcp_listener_queues.release(listener);
@@ -5811,27 +6017,30 @@ where
             }
         }
         for child in children {
-            self.reset_tcp_listener_child(child, now);
+            self.reset_tcp_socket(child, now);
             self.remove_tcp_child_without_backlog_release(child);
         }
     }
 
-    /// Queues the reset a backlog connection is owed before it is
-    /// dropped.
+    /// Queues the reset a connection is owed before it is dropped.
     ///
-    /// The peer finished a handshake and is waiting on a port that is
-    /// about to stop existing. Dropping the socket silently would leave
-    /// it retransmitting until its own timeout, and the segments would
-    /// then meet a stack that no longer owns the four-tuple. The reset
-    /// goes onto the same outbound queue a live socket's segments take,
-    /// so it leaves with the next drive.
+    /// Two paths reach it. A connection still in a listener's backlog
+    /// finished a handshake and is waiting on a port that is about to
+    /// stop existing. A connection whose owner closed it with data it
+    /// had never read is being aborted rather than closed, which RFC
+    /// 9293 3.6.1 answers with a reset because a FIN would tell the
+    /// peer a truncated stream had ended in order. Either way, dropping
+    /// the socket silently would leave the peer retransmitting until
+    /// its own timeout, into a stack that no longer owns the
+    /// four-tuple. The reset goes onto the same outbound queue a live
+    /// socket's segments take, so it leaves with the next drive.
     ///
     /// A reset that cannot be queued — no route, no neighbour, a full
     /// output queue — is reported and dropped rather than failing the
     /// close: the connection is going away either way, and a reset is
     /// an unreliable notification even when it is sent.
-    fn reset_tcp_listener_child(&mut self, child: SocketId, now: StackInstant) {
-        let index = socket_index(child);
+    fn reset_tcp_socket(&mut self, socket: SocketId, now: StackInstant) {
+        let index = socket_index(socket);
         let Some(socket) = self.tcp.get(index) else {
             return;
         };
@@ -5856,12 +6065,7 @@ where
             identification,
             now,
         ) {
-            tracing::debug!(
-                ?local,
-                ?remote,
-                ?error,
-                "TCP listener backlog reset could not be queued"
-            );
+            tracing::debug!(?local, ?remote, ?error, "TCP reset could not be queued");
         }
     }
 
@@ -10454,6 +10658,289 @@ mod tests {
             stack
                 .open_tcp_connect(local_endpoint, remote_endpoint, 99)
                 .is_ok()
+        );
+    }
+
+    /// The endpoints [`open_established_tcp_stack`] connects, so a
+    /// close test can ask whether the four-tuple is free again.
+    fn established_endpoints(local: Ipv4Address, peer: Ipv4Address) -> (TcpEndpoint, TcpEndpoint) {
+        (
+            TcpEndpoint {
+                address: IpAddress::Ipv4(local),
+                port: 49152,
+            },
+            TcpEndpoint {
+                address: IpAddress::Ipv4(peer),
+                port: 80,
+            },
+        )
+    }
+
+    /// The flags, sequence and acknowledgement of the next queued
+    /// frame, so a close test reads what went on the wire rather than
+    /// the state the stack was left in.
+    fn take_tcp_segment(stack: &mut Stack) -> Option<(TcpFlags, u32, u32)> {
+        let frame = stack.take_outbound()?;
+        let ethernet = EthernetFrame::parse(frame.as_slice()).expect("Ethernet frame should parse");
+        let ipv4 = Ipv4Packet::parse(ethernet.payload).expect("IPv4 packet should parse");
+        let tcp = TcpPacket::parse(ipv4.payload).expect("TCP packet should parse");
+        Some((tcp.flags, tcp.sequence, tcp.acknowledgement))
+    }
+
+    /// The peer's FIN, acknowledging everything this side has sent.
+    fn deliver_peer_fin(
+        stack: &mut Stack,
+        local: Ipv4Address,
+        peer: Ipv4Address,
+        acknowledgement: u32,
+        now: u64,
+    ) {
+        let (fin, fin_len) = tcp_segment(
+            peer,
+            local,
+            TcpHeader {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 101,
+                acknowledgement,
+                flags: TcpFlags::ACK.union(TcpFlags::FIN),
+                window_size: u16::MAX,
+            },
+        );
+        stack
+            .receive_tcp(
+                IpAddress::Ipv4(peer),
+                IpAddress::Ipv4(local),
+                &Bytes::copy_from_slice(&fin[..fin_len]),
+                RxFrameOffload::none(),
+                StackInstant::from_nanos(now),
+            )
+            .expect("the peer's FIN should be accepted");
+    }
+
+    /// A close that follows an explicit shutdown adds nothing to the
+    /// wire and finishes the sequence the shutdown started.
+    ///
+    /// On `dev` the close dropped the socket instead: the FIN had gone
+    /// out, but the peer's FIN then met a stack that no longer owned
+    /// the four-tuple, so it was answered with a bare reset from
+    /// `tcp_reset_response` and the connection never reached
+    /// `TIME-WAIT`.
+    #[test]
+    fn tcp_close_after_a_shutdown_finishes_the_sequence() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let (mut stack, socket) = open_established_tcp_stack(local, peer);
+
+        stack
+            .tcp_shutdown_send(socket)
+            .expect("the guest's shutdown should start the close");
+        stack
+            .drive_tcp(StackInstant::from_nanos(2))
+            .expect("the FIN should be queued");
+        let (flags, fin_sequence, _) =
+            take_tcp_segment(&mut stack).expect("the shutdown owes the peer a FIN");
+        assert!(flags.contains(TcpFlags::FIN));
+        while stack.take_outbound().is_some() {}
+
+        assert_eq!(
+            stack.close_tcp_socket(socket, StackInstant::from_nanos(3)),
+            Ok(TcpCloseOutcome::Finishing),
+            "a socket that has already sent its FIN finishes the sequence it started"
+        );
+        stack
+            .drive_tcp(StackInstant::from_nanos(3))
+            .expect("the close should queue nothing new");
+        assert_eq!(
+            take_tcp_segment(&mut stack),
+            None,
+            "the FIN is already on the wire; the close owes the peer nothing more"
+        );
+
+        deliver_peer_fin(&mut stack, local, peer, fin_sequence.wrapping_add(1), 4);
+        stack
+            .drive_tcp(StackInstant::from_nanos(4))
+            .expect("the peer's FIN should be acknowledged");
+        let (flags, _, acknowledgement) =
+            take_tcp_segment(&mut stack).expect("TIME-WAIT owes the peer's FIN an acknowledgement");
+        assert_eq!(flags, TcpFlags::ACK);
+        assert_eq!(acknowledgement, 102);
+        assert!(
+            stack
+                .tcp_read(socket, 8, StackInstant::from_nanos(5))
+                .is_ok(),
+            "the stack owns the socket until TIME-WAIT ends"
+        );
+
+        stack
+            .drive_tcp(StackInstant::from_nanos(
+                4 + crate::tcp::TCP_TIME_WAIT_NANOS,
+            ))
+            .expect("the 2MSL timer should expire");
+        assert_eq!(
+            stack.tcp_read(socket, 8, StackInstant::from_nanos(6)),
+            Err(StackError::UnknownSocket),
+            "the slot is released when the state machine reaches Closed"
+        );
+    }
+
+    /// A close with nothing left to read is the ordinary close of RFC
+    /// 9293 3.6, and the stack is what sends its FIN.
+    ///
+    /// On `dev` this assertion fails at the first `take_tcp_segment`:
+    /// the close queued no segment at all, which is #224.
+    #[test]
+    fn tcp_close_with_an_empty_receive_queue_sends_a_fin() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let (mut stack, socket) = open_established_tcp_stack(local, peer);
+
+        assert_eq!(
+            stack.close_tcp_socket(socket, StackInstant::from_nanos(2)),
+            Ok(TcpCloseOutcome::Finishing)
+        );
+        stack
+            .drive_tcp(StackInstant::from_nanos(2))
+            .expect("the close should queue a FIN");
+        let (flags, fin_sequence, _) =
+            take_tcp_segment(&mut stack).expect("a close with nothing unread owes its peer a FIN");
+        assert!(flags.contains(TcpFlags::FIN));
+        assert_eq!(fin_sequence, 8, "the FIN carries this side's send sequence");
+
+        deliver_peer_fin(&mut stack, local, peer, fin_sequence.wrapping_add(1), 3);
+        stack
+            .drive_tcp(StackInstant::from_nanos(
+                3 + crate::tcp::TCP_TIME_WAIT_NANOS,
+            ))
+            .expect("the 2MSL timer should expire");
+        assert_eq!(
+            stack.tcp_read(socket, 8, StackInstant::from_nanos(4)),
+            Err(StackError::UnknownSocket),
+            "the orphan reclaims itself once the sequence is over"
+        );
+    }
+
+    /// A close that abandons data nobody read is an abort, and RFC 9293
+    /// 3.6.1 aborts with a reset rather than a FIN.
+    ///
+    /// On `dev` the close put nothing on the wire, so the peer went on
+    /// believing in a connection whose reader had gone.
+    #[test]
+    fn tcp_close_with_unread_data_resets_and_reclaims_at_once() {
+        const UNREAD: &[u8] = b"unread";
+
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let (local_endpoint, remote_endpoint) = established_endpoints(local, peer);
+        let (mut stack, socket) = open_established_tcp_stack(local, peer);
+
+        let (data, data_len) = tcp_segment_with_payload(
+            peer,
+            local,
+            TcpHeader {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 101,
+                acknowledgement: 8,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+            },
+            UNREAD,
+        );
+        stack
+            .receive_tcp(
+                IpAddress::Ipv4(peer),
+                IpAddress::Ipv4(local),
+                &Bytes::copy_from_slice(&data[..data_len]),
+                RxFrameOffload::none(),
+                StackInstant::from_nanos(2),
+            )
+            .expect("the peer's data should be queued");
+        while stack.take_outbound().is_some() {}
+
+        assert_eq!(
+            stack.close_tcp_socket(socket, StackInstant::from_nanos(3)),
+            Ok(TcpCloseOutcome::Reclaimed),
+            "an aborted connection has no sequence left to run"
+        );
+        let (flags, sequence, acknowledgement) =
+            take_tcp_segment(&mut stack).expect("an abort owes its peer a reset");
+        assert_eq!(flags, TcpFlags::RST.union(TcpFlags::ACK));
+        assert_eq!(sequence, 8, "the reset carries this side's send sequence");
+        assert_eq!(
+            acknowledgement,
+            101 + UNREAD.len() as u32,
+            "and the acknowledgement this side would otherwise have sent"
+        );
+
+        assert_eq!(
+            stack.tcp_read(socket, 8, StackInstant::from_nanos(4)),
+            Err(StackError::UnknownSocket)
+        );
+        assert!(
+            stack
+                .open_tcp_connect(local_endpoint, remote_endpoint, 7)
+                .is_ok(),
+            "an abort frees the four-tuple immediately: there is no TIME-WAIT after a reset"
+        );
+    }
+
+    /// An orphan holds its four-tuple for the whole of `TIME-WAIT` and
+    /// hands back its slot, its port and its timers at the 2MSL
+    /// deadline, with nobody left to tell.
+    #[test]
+    fn tcp_orphan_is_reclaimed_when_time_wait_expires() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let (local_endpoint, remote_endpoint) = established_endpoints(local, peer);
+        let (mut stack, socket) = open_established_tcp_stack(local, peer);
+
+        assert_eq!(
+            stack.close_tcp_socket(socket, StackInstant::from_nanos(2)),
+            Ok(TcpCloseOutcome::Finishing)
+        );
+        stack
+            .drive_tcp(StackInstant::from_nanos(2))
+            .expect("the close should queue a FIN");
+        let (flags, fin_sequence, _) =
+            take_tcp_segment(&mut stack).expect("the close owes its peer a FIN");
+        assert!(flags.contains(TcpFlags::FIN));
+
+        let time_wait_started = 3;
+        deliver_peer_fin(
+            &mut stack,
+            local,
+            peer,
+            fin_sequence.wrapping_add(1),
+            time_wait_started,
+        );
+        assert_eq!(
+            stack.open_tcp_connect(local_endpoint, remote_endpoint, 99),
+            Err(StackError::AddressInUse),
+            "TIME-WAIT holds the four-tuple whether or not the connection still has an owner"
+        );
+        while stack.take_event().is_some() {}
+
+        stack
+            .drive_tcp(StackInstant::from_nanos(
+                time_wait_started + crate::tcp::TCP_TIME_WAIT_NANOS,
+            ))
+            .expect("the 2MSL timer should expire");
+        assert_eq!(
+            stack.tcp_read(socket, 8, StackInstant::from_nanos(5)),
+            Err(StackError::UnknownSocket),
+            "the orphan's slot goes back to the slab when it reaches Closed"
+        );
+        assert_eq!(
+            stack.take_event(),
+            None,
+            "an orphan has no owner to tell that it closed"
+        );
+        assert!(
+            stack
+                .open_tcp_connect(local_endpoint, remote_endpoint, 99)
+                .is_ok(),
+            "and its local port is free again"
         );
     }
 

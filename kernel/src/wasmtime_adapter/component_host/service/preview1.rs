@@ -5274,6 +5274,48 @@ mod tests {
         assert_eq!(closed.last(), 11);
     }
 
+    /// The retirement reaches the wire: the last descriptor holding a
+    /// connection puts its FIN on it.
+    ///
+    /// #184 gave the descriptor the duty of retiring its stream, and
+    /// the tests above prove it discharges it. What retirement meant
+    /// inside the stack was dropping the socket, clearing its timers
+    /// and freeing its slot with nothing sent, so a program that
+    /// exited with a connection open was invisible to its peer, which
+    /// kept an established connection until its own timeout (#224).
+    #[test]
+    fn a_preview1_socket_descriptor_puts_its_fin_on_the_wire_when_its_table_goes_away() {
+        use crate::network::EstablishedTcpFixture;
+        use helios_netstack::TcpFlags;
+
+        let fixture = EstablishedTcpFixture::new();
+        let table = Preview1DescriptorTable::from_entries(vec![Some(connected_socket_entry(
+            fixture.service(),
+            fixture.stream(),
+        ))]);
+
+        assert!(
+            fixture.drive().is_empty(),
+            "a live descriptor owes its peer nothing"
+        );
+
+        drop(table);
+        let segments = fixture.drive();
+        let fin = segments
+            .iter()
+            .find(|segment| segment.flags.contains(TcpFlags::FIN))
+            .expect("the descriptor table takes its connection down with a FIN");
+        assert_eq!(
+            fin.sequence,
+            EstablishedTcpFixture::LOCAL_SEQUENCE.wrapping_add(1),
+            "the FIN carries this side's send sequence"
+        );
+        assert!(
+            !fin.flags.contains(TcpFlags::RST),
+            "a connection with nothing unread is closed, not aborted"
+        );
+    }
+
     /// A stream two descriptors share is retired when the second one
     /// goes, not the first. `exec` hands the child a copy of the table,
     /// so closing on the first drop would take the connection out from
