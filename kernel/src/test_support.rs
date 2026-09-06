@@ -7,6 +7,33 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use helios_hal::cpu::{Cpu, Instant, ProcessorId};
+
+/// The processor-local interrupt mask for the kernel's own unit tests.
+///
+/// `with_local_interrupts_masked` reaches its implementation by
+/// linkage, so a binary that links this crate has to install one. A
+/// bare-metal backend installs its `InterruptOps`; a test binary runs
+/// as a host process, where nothing preempts a thread and then
+/// allocates, so there is nothing to mask and the spin lock inside each
+/// `IrqSafeMutex` is the whole exclusion. This is the same arrangement
+/// the `critical-section` dev-dependency's `std` feature provides for
+/// `critical_section::with` here.
+struct TestInterruptMask;
+
+impl helios_hal::critical_section::LocalInterruptMask for TestInterruptMask {
+    fn mask() -> bool {
+        false
+    }
+
+    unsafe fn restore(was_enabled: bool) {
+        debug_assert!(
+            !was_enabled,
+            "the host test mask never reports interrupts as enabled"
+        );
+    }
+}
+
+helios_hal::critical_section::set_local_interrupt_mask_impl!(TestInterruptMask);
 use helios_hal::entropy::{EntropyQuality, EntropyUnavailable};
 use triomphe::Arc;
 

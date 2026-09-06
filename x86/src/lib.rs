@@ -93,6 +93,10 @@ struct X86CriticalSection;
 
 critical_section::set_impl!(X86CriticalSection);
 
+// The processor-local half, for locks that carry their own spin word
+// and need only to keep this processor's interrupt handler out.
+helios_hal::critical_section::set_local_interrupt_mask_impl!(X86InterruptOps);
+
 unsafe impl critical_section::Impl for X86CriticalSection {
     unsafe fn acquire() -> usize {
         unsafe { CRITICAL_SECTION_STATE.acquire::<X86InterruptOps>() }

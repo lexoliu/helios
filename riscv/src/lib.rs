@@ -273,6 +273,10 @@ struct SupervisorCriticalSection;
 
 critical_section::set_impl!(SupervisorCriticalSection);
 
+// The processor-local half, for locks that carry their own spin word
+// and need only to keep this processor's interrupt handler out.
+helios_hal::critical_section::set_local_interrupt_mask_impl!(SupervisorInterruptOps);
+
 unsafe impl critical_section::Impl for SupervisorCriticalSection {
     unsafe fn acquire() -> usize {
         unsafe { CRITICAL_SECTION_STATE.acquire::<SupervisorInterruptOps>() }
