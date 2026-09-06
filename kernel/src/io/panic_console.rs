@@ -47,11 +47,11 @@ impl<Serial: PanicSerial> Write for PanicConsole<Serial> {
 /// The report goes straight at the register and accepts that it may cut
 /// into whatever was on the wire.
 ///
-/// The record names itself twice over, and both names are load-bearing:
-/// `Kernel panic` is what a smoke run greps for to prove the kernel did
-/// not panic, and the `panicked at …` that `PanicInfo` renders is what
-/// the inspector's readiness reader watches for to stop waiting on a
-/// guest that will never come up.
+/// The record names itself twice: `panicked at …` lets the readiness
+/// reader recognize a failed boot, and `Kernel panic:` terminates the
+/// host frame scanner's report. The terminal marker follows the body
+/// so the scanner's look-back includes the message, not just its
+/// location. Smoke checks recognize that same terminal marker.
 pub fn emit_panic_report<Serial: PanicSerial>(info: &PanicInfo<'_>) {
     emit_report::<Serial>(info);
 }
@@ -62,7 +62,8 @@ pub fn emit_panic_report<Serial: PanicSerial>(info: &PanicInfo<'_>) {
 /// the record's shape is testable.
 fn emit_report<Serial: PanicSerial>(report: impl fmt::Display) {
     let mut console = PanicConsole::<Serial>(PhantomData);
-    let _ = writeln!(console, "Kernel panic: {report}");
+    let _ = writeln!(console, "{report}");
+    let _ = writeln!(console, "Kernel panic:");
 }
 
 #[cfg(test)]
@@ -100,7 +101,7 @@ mod tests {
         let text = core::str::from_utf8(&captured).expect("the report is UTF-8");
         assert_eq!(
             text,
-            "Kernel panic: panicked at kernel/src/lib.rs:1:1:\nthe machine gave up\n"
+            "panicked at kernel/src/lib.rs:1:1:\nthe machine gave up\nKernel panic:\n"
         );
     }
 }
