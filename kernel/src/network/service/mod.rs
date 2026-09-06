@@ -3236,6 +3236,62 @@ mod tests {
         }
     }
 
+    /// A listener retired the way its owner retires it gives its port
+    /// back, and the next listen can take it.
+    ///
+    /// `tcp_listener_close` is what every host boundary's `Drop` calls,
+    /// and before #191 there was nothing for those drops to call: the
+    /// listener stayed in every shard for the rest of the boot with its
+    /// slab slot held and its port bound, and `is_tcp_local_port_free`
+    /// consults exactly that list, so a leaked listener also refused
+    /// the next bind.
+    #[test]
+    fn a_retired_listener_gives_its_port_back_to_the_next_listen() {
+        let service = test_network_service();
+        let local_address = NetworkIpAddress::Ipv4(crate::Ipv4Address::new([0, 0, 0, 0]));
+        let listener = block_on(service.tcp_listen(
+            local_address,
+            8080,
+            4,
+            helios_netstack::DEFAULT_HOP_LIMIT,
+        ))
+        .expect("the first listen should take port 8080");
+        assert_eq!(listener.local_port, 8080);
+        for shard_idx in 0..service.inner.state.shard_count() {
+            assert!(
+                !service
+                    .inner
+                    .state
+                    .shard_at(shard_idx)
+                    .lock()
+                    .is_tcp_local_port_free(8080),
+                "a live listener holds its port on every shard"
+            );
+        }
+
+        service.tcp_listener_close(listener.listener);
+
+        for shard_idx in 0..service.inner.state.shard_count() {
+            assert!(
+                service
+                    .inner
+                    .state
+                    .shard_at(shard_idx)
+                    .lock()
+                    .is_tcp_local_port_free(8080),
+                "a retired listener releases its port on every shard"
+            );
+        }
+        let second = block_on(service.tcp_listen(
+            local_address,
+            8080,
+            4,
+            helios_netstack::DEFAULT_HOP_LIMIT,
+        ))
+        .expect("the port the first listener held should bind again");
+        assert_eq!(second.local_port, 8080);
+    }
+
     /// A listener exists on every shard, and `accept` starts at the
     /// caller's own shard and then visits the rest, so a connection the
     /// receive path placed on a foreign shard is never stranded.
@@ -3266,7 +3322,7 @@ mod tests {
                         helios_netstack::DEFAULT_HOP_LIMIT,
                     )
                 },
-                NetworkShard::remove_tcp_listener,
+                |shard, slot| shard.remove_tcp_listener(slot, StackInstant::from_nanos(0)),
             )
             .expect("the listener should install on every shard");
 

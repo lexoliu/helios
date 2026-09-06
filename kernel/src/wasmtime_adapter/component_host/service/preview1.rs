@@ -4216,7 +4216,7 @@ where
             WasixTcpSocket::Listening {
                 listener, family, ..
             },
-        ))) => (*listener, *family),
+        ))) => (listener.id(), *family),
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(_))) => {
             return p1::errno::INVAL;
         }
@@ -5175,6 +5175,78 @@ mod tests {
             close_on_exec: false,
             fdflags: 0,
         }
+    }
+
+    fn listening_socket_entry(
+        service: crate::ComponentHostNetworkService,
+        listener: u64,
+    ) -> Preview1DescriptorEntry {
+        Preview1DescriptorEntry {
+            descriptor: Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
+                WasixTcpSocket::Listening {
+                    family: WasixSocketFamily::Ipv4,
+                    listener: WasixOwnedTcpListener::new(service, listener),
+                    local_port: 8080,
+                    options: WasixSocketOptions::default(),
+                },
+            )),
+            close_on_exec: false,
+            fdflags: 0,
+        }
+    }
+
+    /// A program that exits with a listener open retires it.
+    ///
+    /// Nothing on any preview1 path touched a listener before #191:
+    /// `fd_close` dropped the table entry and the network service had no
+    /// `tcp_listener_close` to call, so every listener a program opened
+    /// stayed installed on every shard for the rest of the boot, holding
+    /// the local port that `is_tcp_local_port_free` consults.
+    #[test]
+    fn a_preview1_listening_descriptor_retires_its_listener_when_its_table_goes_away() {
+        let (service, closed) = crate::test_support::recording_listener_network_service();
+        let table =
+            Preview1DescriptorTable::from_entries(vec![Some(listening_socket_entry(service, 21))]);
+
+        assert_eq!(
+            closed.count(),
+            0,
+            "a live descriptor holds its listener open"
+        );
+        drop(table);
+        assert_eq!(
+            closed.count(),
+            1,
+            "the descriptor table takes its listeners with it"
+        );
+        assert_eq!(closed.last(), 21);
+    }
+
+    /// A listener two descriptors share is retired when the second one
+    /// goes, not the first: `exec` hands the child a copy of the table,
+    /// and the slab slot a retirement frees is handed to the next
+    /// listen.
+    #[test]
+    fn a_preview1_listener_outlives_every_descriptor_but_the_last() {
+        let (service, closed) = crate::test_support::recording_listener_network_service();
+        let mut table =
+            Preview1DescriptorTable::from_entries(vec![Some(listening_socket_entry(service, 21))]);
+        let inherited = table.clone_for_exec();
+
+        assert_eq!(table.close(0), p1::errno::SUCCESS);
+        assert_eq!(
+            closed.count(),
+            0,
+            "the inherited descriptor still holds the listener"
+        );
+        drop(table);
+        assert_eq!(closed.count(), 0);
+        drop(inherited);
+        assert_eq!(
+            closed.count(),
+            1,
+            "the last descriptor retires the listener"
+        );
     }
 
     /// A program that exits with a socket open retires it.

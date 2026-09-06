@@ -127,6 +127,10 @@ where
         self.service.tcp_close(stream);
     }
 
+    pub fn tcp_listener_close(&self, _: TcpCap, listener: Service::TcpListener) {
+        self.service.tcp_listener_close(listener);
+    }
+
     pub async fn udp_bind(
         &self,
         _: UdpCap,
@@ -468,6 +472,8 @@ mod tests {
         ) -> impl Future<Output = Result<(), UdpError>> + Send + '_ {
             core::future::ready(Ok(()))
         }
+
+        fn tcp_listener_close(&self, _: Self::TcpListener) {}
 
         fn udp_close(&self, _: Self::UdpSocket) {}
     }

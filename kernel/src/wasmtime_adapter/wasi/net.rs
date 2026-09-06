@@ -71,7 +71,8 @@ pub(super) struct TcpSocketState {
     pub(super) send_buffer_size: u64,
 }
 
-/// The kernel stream a `wasi:sockets` socket owns dies with the socket.
+/// The kernel stream and listener a `wasi:sockets` socket owns die with
+/// the socket.
 ///
 /// `wasi:sockets` hands the guest a resource, and the guest is free to
 /// exit while still holding it: a component's resource destructors run
@@ -82,10 +83,27 @@ pub(super) struct TcpSocketState {
 /// slab slot, after the program that opened it had exited. Ownership
 /// lives here instead: whatever ends this state's life ends the
 /// stream's, with nothing to schedule and nothing to await.
+///
+/// The listener beside it had no retirement path at all until #191,
+/// because the network service offered none. It has two homes here: the
+/// adopted one in `listener`, and the freshly opened one still sitting
+/// in `listen_result` when the socket dies before the listen stream is
+/// polled again. Both are the same listener's two possible resting
+/// places, never two listeners, so retiring whichever is present
+/// retires it exactly once.
 impl Drop for TcpSocketState {
     fn drop(&mut self) {
         if let Some(stream) = self.stream.take() {
             self.service.tcp_close(stream);
+        }
+        let listener = self.listener.take().or_else(|| {
+            self.listen_result
+                .take()
+                .and_then(core::result::Result::ok)
+                .map(|listener| listener.listener)
+        });
+        if let Some(listener) = listener {
+            self.service.tcp_listener_close(listener);
         }
     }
 }

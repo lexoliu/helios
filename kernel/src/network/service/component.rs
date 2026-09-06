@@ -455,6 +455,10 @@ where
         NetworkService::tcp_close(self, stream);
     }
 
+    fn tcp_listener_close(&self, listener: Self::TcpListener) {
+        NetworkService::tcp_listener_close(self, listener);
+    }
+
     async fn udp_bind(&self, local_port: u16) -> Result<UdpBinding<Self::UdpSocket>, UdpError> {
         NetworkService::udp_bind(self, local_port).await
     }

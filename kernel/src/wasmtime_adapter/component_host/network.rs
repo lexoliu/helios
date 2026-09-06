@@ -177,6 +177,8 @@ trait DynComponentHostNetworkService: Send + Sync + 'static {
 
     fn tcp_close(&self, stream: u64);
 
+    fn tcp_listener_close(&self, listener: u64);
+
     fn udp_bind<'a>(
         &'a self,
         local_port: u16,
@@ -489,6 +491,10 @@ impl ComponentNetworkService for ComponentHostNetworkService {
 
     fn tcp_close(&self, stream: Self::TcpStream) {
         self.inner.tcp_close(stream);
+    }
+
+    fn tcp_listener_close(&self, listener: Self::TcpListener) {
+        self.inner.tcp_listener_close(listener);
     }
 
     fn udp_bind(
@@ -906,6 +912,12 @@ where
     fn tcp_close(&self, stream: u64) {
         self.service
             .tcp_close(<Service::TcpStream as ComponentHostTcpStreamToken>::from_raw(stream));
+    }
+
+    fn tcp_listener_close(&self, listener: u64) {
+        self.service.tcp_listener_close(
+            <Service::TcpListener as ComponentHostTcpListenerToken>::from_raw(listener),
+        );
     }
 
     fn udp_bind<'a>(
