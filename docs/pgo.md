@@ -169,10 +169,12 @@ matches the instrumentation.
 
 #### Collecting in CI
 
-`bench-suite.yml` has a `profile-generate` job: it builds the
+`bench-suite.yml` has a `profile-generate` job: it prepares a bench host
+and then runs `.github/actions/collect-kernel-profile`, which builds the
 instrumented x86-64 kernel, runs the compiler workload and the suite's
-non-network classes on it under KVM, merges every `.profraw` and uploads
-one `helios-kernel.profdata`. It boots the lane's own machine, read from
+non-network classes on it under KVM and merges every `.profraw` into one
+`helios-kernel.profdata`; the job uploads that. The collection is a
+composite action because the release job below runs the same one. It boots the lane's own machine, read from
 `tools/bench/manifest.toml`: the collection runs the lane's workloads, and
 a guest smaller than the one the suite times cannot run them — `4G`
 against the lane's `6G` took the x86-64 kernel's memory pool down on
@@ -307,9 +309,37 @@ optimisation of the kernel, not about the pull request that happened to
 run it, so a red headline row says PGO did not pay on this commit — which
 is the answer the job exists to produce.
 
-Shipping a PGO kernel from `release.yml` is the next step, and it is
-decided from these numbers rather than before them: it needs a
-profile-refresh cadence, which the paragraphs above are the argument for.
+#### Shipping it in a release
+
+A release carries the profile its kernel was built with (#226).
+`release.yml` reads the tag release-plz cut for the `helios` package out
+of the action's own `releases` output — the kernel image is that package,
+and a release run that bumped a library alone cut no kernel release and
+collects nothing — checks that tree out, runs the collection, builds the
+released kernel with `--profile-use` against what it collected, and
+attaches two assets to the release under stable names:
+
+| Asset | What it is |
+| --- | --- |
+| `helios-kernel.profdata` | the merged profile, collected on the released commit |
+| `helios-kernel-x86-64` | the released x86-64 kernel, built with `-C profile-use` on it |
+
+The collection is one sequence for both workflows:
+`.github/actions/collect-kernel-profile` is what the `profile-generate`
+job of `bench-suite.yml` runs and what the release job runs. A profile
+collected two ways would be two profiles wearing one name, and the kernel
+a release ships would not be the kernel `suite-pgo` measured.
+
+The release is also the refresh cadence, and it is the cadence the
+paragraphs above argue for: a profile goes stale in its counts long
+before it goes stale in its hashes, and silently, so the point to collect
+again is the one at which the kernel it describes has moved — a release.
+Between releases the profile is the one the last release published.
+
+A release published before this job existed carries no profile.
+Dispatching `release.yml` with its `tag` input names such a release and
+attaches the two assets to it; a tag with no release behind it is refused
+by name, before the collection rather than after it.
 
 ### Sample-based alternative already within reach
 

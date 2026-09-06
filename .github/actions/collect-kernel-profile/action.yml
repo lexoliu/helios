@@ -1,0 +1,113 @@
+name: Collect the kernel profile
+description: >-
+  The `-C profile-generate` collection of docs/pgo.md, start to finish: the
+  instrumented x86-64 kernel, the lane's workloads booted on it, and one
+  merged `helios-kernel.profdata` written where the caller asks for it.
+
+  Two workflows collect a profile and they collect the same one.
+  `bench-suite.yml`'s `profile-generate` job uploads it as an artifact for
+  `suite-pgo` to spend; `release.yml` attaches it to the release the
+  kernel beside it was built from (#226). The sequence lives here so a
+  change to what the profile covers reaches both, because a profile
+  collected two ways is two profiles.
+
+  The host preparation stays in the jobs. `bench-host` is a relative
+  `uses:` and one inside a composite action does not resolve the way one
+  in a job does, so a caller runs it first and this action assumes the
+  host it leaves behind: `just`, `uv`, the WASI artifacts, and a usable
+  `/dev/kvm`.
+inputs:
+  checkout-path:
+    description: Directory the Helios checkout is in, relative to the workspace.
+    required: false
+    default: helios
+  lane:
+    description: >-
+      Benchmark lane whose machine and workloads the profile describes,
+      read from `tools/bench/manifest.toml`. The collection boots the
+      lane's own guest: one smaller than the suite times cannot run the
+      workloads the profile is meant to cover.
+    required: false
+    default: x86-64-kvm
+  limine-dir:
+    description: >-
+      The Limine share `bench-host` staged, which the x86-64 boot builds
+      its UEFI disk image from.
+    required: true
+  output:
+    description: >-
+      Absolute path of the merged indexed profile to write. The raw
+      profiles are collected beside it in a directory of their own.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Read the lane
+      id: lane
+      shell: bash
+      working-directory: ${{ inputs.checkout-path }}/tools/bench
+      run: |
+        # The collection boots the lane's own workloads, so it boots the
+        # lane's machine: a guest smaller than the one the suite times
+        # cannot run them, and a number written here would be a second
+        # definition of the one in tools/bench/manifest.toml.
+        entry="$(uv run helios-bench lanes --select "${{ inputs.lane }}" --format github-matrix | jq -c '.[0]')"
+        printf 'memory=%s\n' "$(printf '%s' "$entry" | jq -r '.memory')" >> "$GITHUB_OUTPUT"
+    - name: Put llvm-profdata on PATH
+      # The inspector merges the raw profile before it writes anything and
+      # names this tool if it cannot find it; the toolchain's own copy is
+      # the one whose LLVM matches the instrumentation.
+      shell: bash
+      working-directory: ${{ inputs.checkout-path }}
+      run: |
+        rustup component add llvm-tools
+        echo "$(rustc --print target-libdir)/../bin" >> "$GITHUB_PATH"
+    - name: Build the instrumented kernel
+      shell: bash
+      working-directory: ${{ inputs.checkout-path }}
+      run: just build-instrumented x86-64
+    - name: Collect the compiler profile
+      shell: bash
+      working-directory: ${{ inputs.checkout-path }}
+      env:
+        HELIOS_LIMINE_SHARE: ${{ inputs.limine-dir }}
+        HELIOS_LIMINE_BIN: ${{ inputs.limine-dir }}/limine
+      run: |
+        mkdir -p "${RUNNER_TEMP}/kernel-profile-raw"
+        ./target/release/helios-inspector vm --arch x86-64 --profile-generate \
+          --accel kvm --memory "${{ steps.lane.outputs.memory }}" \
+          aot-bench artifacts/wasi-tools/curl.wasm --iterations 2 \
+          --llvm-raw-profile-output "${RUNNER_TEMP}/kernel-profile-raw/aot-bench.profraw"
+    - name: Collect the workload profile
+      shell: bash
+      working-directory: ${{ inputs.checkout-path }}
+      env:
+        HELIOS_LIMINE_SHARE: ${{ inputs.limine-dir }}
+        HELIOS_LIMINE_BIN: ${{ inputs.limine-dir }}/limine
+      run: |
+        # Every class the suite runs that needs no privileged host
+        # networking. The network path is profiled once a lane provisions
+        # the tap backend for a collection run.
+        # --keep-going for the same reason the suite passes it: a
+        # workload this machine cannot run is a recorded failure and not
+        # the end of the pass. instance-startup-500 wants more guest than
+        # the lane has and exhausts the pooling allocator's core-instance
+        # limit (run 34012834611, job 101431842184); the profile is the
+        # counts of everything that did run, and losing the classes after
+        # it would collect nothing for them.
+        ./target/release/helios-inspector vm --arch x86-64 --profile-generate \
+          --accel kvm --memory "${{ steps.lane.outputs.memory }}" \
+          workload-bench --iterations 1 --keep-going \
+          --class compute --class startup --class hostcall \
+          --class ipc --class sched --class fs \
+          --llvm-raw-profile-output "${RUNNER_TEMP}/kernel-profile-raw/workloads.profraw"
+    - name: Merge the profiles
+      shell: bash
+      run: |
+        mkdir -p "$(dirname "${{ inputs.output }}")"
+        llvm-profdata merge \
+          --output "${{ inputs.output }}" \
+          "${RUNNER_TEMP}/kernel-profile-raw/aot-bench.profraw" \
+          "${RUNNER_TEMP}/kernel-profile-raw/workloads.profraw"
+        llvm-profdata show --all-functions "${{ inputs.output }}" \
+          | tail -20 >> "$GITHUB_STEP_SUMMARY"
