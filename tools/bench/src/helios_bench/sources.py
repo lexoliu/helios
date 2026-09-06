@@ -17,13 +17,17 @@ from pathlib import Path
 from helios_bench.report import Iteration, Side
 
 HELIOS_JSONL = "helios.jsonl"
+# Both Helios images write the same file names; what tells them apart is
+# the directory the driver was told to write each into.
 SIDE_JSONL = {
     Side.HELIOS: "helios.jsonl",
+    Side.HELIOS_BASELINE: "helios.jsonl",
     Side.LINUX_NATIVE: "linux-native.jsonl",
     Side.LINUX_WASMTIME: "linux-wasmtime.jsonl",
 }
 SIDE_CONTROL_JSONL = {
     Side.HELIOS: "helios-control-{moment}.jsonl",
+    Side.HELIOS_BASELINE: "helios-control-{moment}.jsonl",
     Side.LINUX_NATIVE: "linux-native-control-{moment}.jsonl",
     Side.LINUX_WASMTIME: "linux-wasmtime-control-{moment}.jsonl",
 }

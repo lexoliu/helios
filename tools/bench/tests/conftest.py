@@ -72,6 +72,7 @@ def make_report(
     run_id: str = "1001",
     publishable: bool = True,
     seed: int = 1,
+    baseline_centers: dict[str, float] | None = None,
 ) -> Report:
     sides = {
         Side.HELIOS: raw_side(
@@ -94,16 +95,27 @@ def make_report(
             }
         ),
     }
-    control = build_control(
-        "quickjs-loop",
-        {
-            Side.HELIOS: (
-                raw_side({"quickjs-loop": iterations(100.0, 1.0, seed + 31)}),
-                raw_side({"quickjs-loop": iterations(101.0, 1.0, seed + 32)}),
-            )
-        },
-        THRESHOLDS,
-    )
+    control_sides = {
+        Side.HELIOS: (
+            raw_side({"quickjs-loop": iterations(100.0, 1.0, seed + 31)}),
+            raw_side({"quickjs-loop": iterations(101.0, 1.0, seed + 32)}),
+        )
+    }
+    if baseline_centers is not None:
+        # The same seeds as the candidate: the two images were timed on
+        # one host minutes apart, so a workload neither of them changed
+        # has to come back the same on both.
+        sides[Side.HELIOS_BASELINE] = raw_side(
+            {
+                name: iterations(center, center * 0.02, seed + sum(map(ord, name)) % 100, cold_extra=center)
+                for name, center in baseline_centers.items()
+            }
+        )
+        control_sides[Side.HELIOS_BASELINE] = (
+            raw_side({"quickjs-loop": iterations(100.0, 1.0, seed + 31)}),
+            raw_side({"quickjs-loop": iterations(101.0, 1.0, seed + 32)}),
+        )
+    control = build_control("quickjs-loop", control_sides, THRESHOLDS)
     run = RunInfo(
         id=run_id,
         url=f"https://github.com/lexoliu/helios/actions/runs/{run_id}",
@@ -116,6 +128,10 @@ def make_report(
         started_at="2026-09-03T00:00:00+00:00",
         finished_at="2026-09-03T01:00:00+00:00",
         helios_git_sha="0123456789abcdef0123456789abcdef01234567",
+        baseline_git_sha=(
+            "89abcdef0123456789abcdef0123456789abcdef" if baseline_centers is not None else None
+        ),
+        baseline_ref="merge-base" if baseline_centers is not None else None,
     )
     hardware = Hardware(
         host_os="Darwin 25.6.0",
@@ -153,6 +169,33 @@ def regressed_report() -> Report:
     return make_report(
         {"hostcall-loop": 30.0, "quickjs-loop": 100.5, "fs-smallfiles": 25.0}, run_id="1002", seed=5
     )
+
+
+def paired(candidate: float, baseline: float, run_id: str, seed: int) -> Report:
+    """A paired report: the same workloads, two Helios images, one host."""
+    return make_report(
+        {"hostcall-loop": candidate, "quickjs-loop": 100.5, "fs-smallfiles": 25.0},
+        run_id=run_id,
+        publishable=False,
+        seed=seed,
+        baseline_centers={"hostcall-loop": baseline, "quickjs-loop": 100.5, "fs-smallfiles": 25.0},
+    )
+
+
+@pytest.fixture
+def paired_improvement_report() -> Report:
+    return paired(candidate=20.0, baseline=30.0, run_id="2001", seed=3)
+
+
+@pytest.fixture
+def paired_regression_report() -> Report:
+    return paired(candidate=30.0, baseline=20.0, run_id="2002", seed=3)
+
+
+@pytest.fixture
+def paired_flat_report() -> Report:
+    """A candidate 0.4% away from its baseline: inside any run's floor."""
+    return paired(candidate=20.08, baseline=20.0, run_id="2003", seed=3)
 
 
 @pytest.fixture

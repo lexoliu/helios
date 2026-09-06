@@ -12,9 +12,9 @@ import matplotlib.pyplot as plt  # noqa: E402
 
 from helios_bench.report import CLASS_LABELS, SIDE_LABELS, Report, Side, WorkloadClass  # noqa: E402
 
-SIDE_ORDER = [Side.HELIOS, Side.LINUX_WASMTIME, Side.LINUX_NATIVE]
 SIDE_COLORS = {
     Side.HELIOS: "#d97706",
+    Side.HELIOS_BASELINE: "#b45309",
     Side.LINUX_WASMTIME: "#2563eb",
     Side.LINUX_NATIVE: "#6b7280",
 }
@@ -26,9 +26,10 @@ def plot_class(report: Report, workload_class: WorkloadClass, path: Path) -> Non
     workloads = [workload for workload in report.workloads if workload.workload_class == workload_class]
     if not workloads:
         raise ValueError(f"report has no {workload_class} workloads")
-    height = 0.8 / len(SIDE_ORDER)
+    sides = report.table_sides()
+    height = 0.8 / len(sides)
     figure, axis = plt.subplots(figsize=(9, 0.9 + 0.55 * len(workloads)))
-    for offset, side in enumerate(SIDE_ORDER):
+    for offset, side in enumerate(sides):
         positions = []
         medians = []
         lows = []
@@ -37,7 +38,7 @@ def plot_class(report: Report, workload_class: WorkloadClass, path: Path) -> Non
             cell = workload.cells.get(side)
             if cell is None:
                 continue
-            positions.append(row + (offset - 1) * height)
+            positions.append(row + (offset - (len(sides) - 1) / 2) * height)
             medians.append(cell.warm.median)
             lows.append(cell.warm.median - cell.warm.ci_low)
             highs.append(cell.warm.ci_high - cell.warm.median)

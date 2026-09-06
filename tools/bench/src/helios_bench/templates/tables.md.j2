@@ -14,9 +14,10 @@ Noise floor from `{{ report.control.workload }}` before and after the suite: {{ 
 {% for workload_class, workloads in report.by_class().items() %}
 ## {{ CLASS_LABELS[workload_class] }}
 
-{{ m.header() }}
+{% set sides = report.table_sides() %}
+{{ m.header(sides) }}
 {% for workload in workloads %}
-{{ m.row(workload) }}
+{{ m.row(workload, sides) }}
 {% endfor %}
 
 {% for workload in workloads %}
@@ -27,7 +28,7 @@ Noise floor from `{{ report.control.workload }}` before and after the suite: {{ 
 {% set helios = workload.cells.get(Side.HELIOS) %}
 {% if helios and helios.metrics %}
 `{{ workload.name }}` secondary metrics (warm medians):
-{% for side in [Side.HELIOS, Side.LINUX_WASMTIME, Side.LINUX_NATIVE] %}
+{% for side in sides %}
 {% set cell = workload.cells.get(side) %}
 {% if cell and cell.metrics %}
 - {{ SIDE_LABELS[side] }}: {% for name, stats in cell.metrics.items() %}`{{ name }}`={{ stats.median | round(3) }}{{ ", " if not loop.last }}{% endfor %}

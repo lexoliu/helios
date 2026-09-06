@@ -5,9 +5,10 @@ Each cell is the median warm wall time in milliseconds with its 95% bootstrap in
 {% for report in reports %}
 **{{ report.run.lane }}** — {{ report.hardware.cpu }}, {{ report.hardware.accelerator }}{% if report.control %}, noise floor {{ report.control.noise_floor | percent }}{% endif %}
 
-{{ m.header() }}
+{% set sides = report.table_sides() %}
+{{ m.header(sides) }}
 {% for workload in report.headline_workloads() %}
-{{ m.row(workload) }}
+{{ m.row(workload, sides) }}
 {% endfor %}
 
 {% endfor %}
