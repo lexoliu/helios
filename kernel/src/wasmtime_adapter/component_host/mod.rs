@@ -75,6 +75,8 @@ fn lower_bytes_to_vec(bytes: Bytes) -> Vec<u8> {
     Vec::from(bytes)
 }
 
+mod device;
+pub(crate) use device::record_linear_memory;
 mod network;
 pub mod service;
 mod topology;
@@ -1596,6 +1598,7 @@ where
     add_net_to_linker(linker)?;
     vsock::add_vsock_to_linker::<vsock::DebuggerVsock, _, _>(linker)?;
     add_stats_to_linker(linker)?;
+    device::add_device_to_linker(linker)?;
     add_instances_to_linker(linker)?;
     add_tracing_to_linker(linker)?;
     add_profiling_to_linker(linker)?;
@@ -1785,6 +1788,7 @@ where
     add_net_to_program_linker(linker)?;
     vsock::add_vsock_to_linker::<vsock::ProgramVsock, _, _>(linker)?;
     add_stats_to_program_linker(linker)?;
+    device::add_device_to_linker(linker)?;
     add_tracing_to_program_linker(linker)?;
     Ok(())
 }
@@ -3801,6 +3805,32 @@ macro_rules! convert_network_stats {
     };
 }
 
+/// Maps the kernel's granted-device inventory onto one binding set's
+/// `granted-device` list, for the same reason [`convert_block_stats`]
+/// exists.
+macro_rules! convert_device_stats {
+    ($bindings:path, $devices:expr) => {
+        $devices
+            .into_iter()
+            .map(|device: crate::GrantedDeviceSnapshot| {
+                use $bindings as stats_bindings;
+                stats_bindings::GrantedDevice {
+                    name: alloc::string::String::from(device.name.as_str()),
+                    region_bytes: device.region_bytes,
+                    regions: device.regions,
+                    interrupts: device.interrupt_count,
+                    dma_budget_bytes: device.dma_budget_bytes,
+                    confined: device.confined,
+                    claimed: device.claimed,
+                    interrupts_forwarded: device.interrupts_forwarded,
+                    interrupts_coalesced: device.interrupts_coalesced,
+                    masked_sources: device.masked_sources,
+                }
+            })
+            .collect()
+    };
+}
+
 macro_rules! convert_block_stats {
     ($bindings:path, $block:expr) => {
         $block.map(|block: crate::BlockStats| {
@@ -3897,6 +3927,7 @@ fn convert_sample(sample: StatsSample) -> debugger_wit::stats::Sample {
         swap: convert_swap_stats!(debugger_wit::stats, sample.swap),
         host_share: convert_host_share_stats!(debugger_wit::stats, sample.host_share),
         network: convert_network_stats!(debugger_wit::stats, sample.network),
+        devices: convert_device_stats!(debugger_wit::stats, sample.devices),
     }
 }
 
@@ -3930,6 +3961,7 @@ fn convert_program_sample(sample: StatsSample) -> program_wit::stats::Sample {
         swap: convert_swap_stats!(program_wit::stats, sample.swap),
         host_share: convert_host_share_stats!(program_wit::stats, sample.host_share),
         network: convert_network_stats!(program_wit::stats, sample.network),
+        devices: convert_device_stats!(program_wit::stats, sample.devices),
     }
 }
 

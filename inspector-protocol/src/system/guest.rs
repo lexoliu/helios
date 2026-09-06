@@ -432,6 +432,22 @@ fn convert_sample(sample: host_stats::Sample) -> stats::Sample {
         swap: sample.swap.map(convert_swap),
         host_share: sample.host_share.map(convert_host_share_cache),
         network: sample.network.map(convert_network),
+        devices: sample.devices.into_iter().map(convert_device).collect(),
+    }
+}
+
+fn convert_device(device: host_stats::GrantedDevice) -> stats::GrantedDevice {
+    stats::GrantedDevice {
+        name: device.name,
+        region_bytes: device.region_bytes,
+        regions: device.regions,
+        interrupts: device.interrupts,
+        dma_budget_bytes: device.dma_budget_bytes,
+        confined: device.confined,
+        claimed: device.claimed,
+        interrupts_forwarded: device.interrupts_forwarded,
+        interrupts_coalesced: device.interrupts_coalesced,
+        masked_sources: device.masked_sources,
     }
 }
 

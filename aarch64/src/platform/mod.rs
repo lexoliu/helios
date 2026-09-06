@@ -38,6 +38,14 @@ pub(crate) use acpi::AcpiError;
 /// truncated, because a dropped slot is a device that never comes up.
 const MAX_VIRTIO_MMIO_SLOTS: usize = 32;
 
+/// Devices the description can offer to a user-mode driver.
+///
+/// Bounded for the same reason as the virtio slots: the description is
+/// built before the kernel has a growable collection, and a machine
+/// with more grantable devices than this is one this backend cannot
+/// describe rather than one it describes partially.
+const MAX_GRANTABLE_DEVICES: usize = 8;
+
 /// Processors whose redistributor frame the description can name.
 ///
 /// A machine that describes more is refused rather than described
@@ -79,6 +87,27 @@ impl SpiInterrupt {
 pub(crate) struct VirtioMmioSlot {
     pub(crate) region: MmioRegion,
     pub(crate) interrupt: SpiInterrupt,
+}
+
+/// A device the kernel has no driver for, and can therefore hand to a
+/// user-mode one.
+///
+/// "No driver for" is the whole definition: the console, the interrupt
+/// controller, the real-time clock and every virtio transport are
+/// driven by this backend, so they are never offered. What is left on a
+/// device-tree machine is the hardware nobody in the kernel claims,
+/// which is exactly the hardware a driver plugin exists to drive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GrantableDevice {
+    /// The firmware's own name for the node, used as the grant's name so
+    /// a driver asks for the device the machine describes rather than
+    /// for a number this backend made up.
+    pub(crate) name: &'static str,
+    pub(crate) region: MmioRegion,
+    pub(crate) interrupt: SpiInterrupt,
+    /// Whether the device's own accesses are coherent with the
+    /// processor caches, as the firmware declares it.
+    pub(crate) coherent: bool,
 }
 
 /// The platform's console UART.
@@ -178,6 +207,8 @@ pub(crate) struct PlatformDescription {
     /// without one leaves the kernel's wall clock reading as uptime.
     pub(crate) rtc: Option<MmioRegion>,
     pub(crate) virtio: Slots<VirtioMmioSlot, MAX_VIRTIO_MMIO_SLOTS>,
+    /// Hardware no kernel driver claims, offered to driver plugins.
+    pub(crate) grantable: Slots<GrantableDevice, MAX_GRANTABLE_DEVICES>,
     /// The entropy the bootloader left behind, from the device tree's
     /// `/chosen/rng-seed`. ACPI has no equivalent property, so an
     /// ACPI-described machine starts from the processor's own random

@@ -46,17 +46,29 @@ where
             .into());
         }
 
+        // An instance holding a device may not grow over the window its
+        // registers are mapped into: the memory would land on top of a
+        // register file. Refusing is what `memory.grow` already reports
+        // as -1, so a driver sees a shortage rather than a trap.
+        if self
+            .device
+            .growth_limit()
+            .is_some_and(|limit| desired as u64 > limit)
+        {
+            return Ok(false);
+        }
+
         let growth = desired.saturating_sub(current);
 
         if let Some(error) = self.try_satisfy_or_kill(desired, growth) {
             return Err(error);
         }
 
-        Ok(allow_instance_resource_growth(
-            self.instance(),
-            desired,
-            maximum,
-        ))
+        let allowed = allow_instance_resource_growth(self.instance(), desired, maximum);
+        if allowed {
+            self.device.note_growth(desired as u64);
+        }
+        Ok(allowed)
     }
 
     fn memory_grow_failed(&mut self, error: wasmtime::Error) -> wasmtime::Result<()> {

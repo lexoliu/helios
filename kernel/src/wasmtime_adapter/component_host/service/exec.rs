@@ -886,6 +886,12 @@ where
             instantiate_instance_started,
         );
     }
+    let instance = instance.inspect(|instance| {
+        // The device path needs to know where this instance's linear
+        // memory landed before it can place a device window in it, and
+        // this is the first moment the runtime can say.
+        crate::wasmtime_adapter::component_host::record_linear_memory(&mut store, instance);
+    });
     let executor = instance.and_then(|instance| {
         let resolve_started = profile_runtime_state
             .profiling_enabled()

@@ -25,8 +25,8 @@ pub use child::{
 pub use console::RecordingConsole;
 pub use debug_serial::{DebugConsole, DebugSerialAccess, DebugSerialWriter, read_debug_serial};
 pub use interrupts::{
-    ExternalInterruptHandler, ExternalInterruptRoutes, MAX_BLOCK_DEVICES, MAX_NETWORK_INTERRUPTS,
-    wake_queue_owners,
+    ExternalInterruptHandler, ExternalInterruptRoutes, MAX_BLOCK_DEVICES, MAX_DEVICE_INTERRUPTS,
+    MAX_NETWORK_INTERRUPTS, wake_queue_owners,
 };
 pub use iommu::{IommuDomains, IommuEndpointStats, IommuReport, IommuStats, MAX_IOMMU_ENDPOINTS};
 pub use panic_console::{PanicSerial, emit_panic_report};

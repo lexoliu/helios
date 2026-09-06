@@ -11,6 +11,8 @@
 
 use helios_hal::cpu::{Cpu, ProcessorId};
 
+use crate::device::DeviceInterruptRoute;
+
 /// Block devices one platform may route interrupts for.
 ///
 /// A machine routinely carries more than one: the disk the kernel was
@@ -25,6 +27,16 @@ pub const MAX_BLOCK_DEVICES: usize = 4;
 /// configuration changes, which is what bounds this: the number of queue
 /// vectors the x86 backend hands out, and the configuration message.
 pub const MAX_NETWORK_INTERRUPTS: usize = 9;
+
+/// Interrupt sources one platform may route to user-mode drivers.
+///
+/// Granted devices are routed through the same table as the kernel's
+/// own, because the controller does not distinguish them: what a grant
+/// changes is what the handler does, not where the source arrives. The
+/// bound is the number of grants a machine publishes times the sources
+/// one device raises, capped where the routing table stops being a
+/// linear scan worth doing in interrupt context.
+pub const MAX_DEVICE_INTERRUPTS: usize = 16;
 
 /// A device that consumes external interrupts for one source.
 pub trait ExternalInterruptHandler {
@@ -53,6 +65,11 @@ pub struct ExternalInterruptRoutes<Source, Network, HostFs, Entropy, Balloon, Vs
     balloon: Option<(Source, Balloon)>,
     vsock: Option<(Source, Vsock)>,
     block: [Option<(Source, Block)>; MAX_BLOCK_DEVICES],
+    /// Sources a user-mode driver owns. Concrete rather than generic:
+    /// what a granted source reaches is the kernel's own relay, which
+    /// only holds the source off and wakes the owner, so no backend has
+    /// a handler type of its own to name here.
+    device: [Option<(Source, DeviceInterruptRoute)>; MAX_DEVICE_INTERRUPTS],
 }
 
 impl<Source, Network, HostFs, Entropy, Balloon, Vsock, Block>
@@ -74,6 +91,7 @@ where
             balloon: None,
             vsock: None,
             block: [const { None }; MAX_BLOCK_DEVICES],
+            device: [const { None }; MAX_DEVICE_INTERRUPTS],
         }
     }
 
@@ -143,6 +161,24 @@ where
         *slot = Some((source, handler));
     }
 
+    /// Registers one interrupt of a device granted to a user-mode
+    /// driver.
+    ///
+    /// The route is installed at boot against the published device, not
+    /// against whoever currently owns it, so it survives an owner's
+    /// death and its replacement's start-up without the controller
+    /// being touched.
+    pub fn add_device(&mut self, source: Source, route: DeviceInterruptRoute) {
+        let slot = self
+            .device
+            .iter_mut()
+            .find(|slot| slot.is_none())
+            .unwrap_or_else(|| {
+                panic!("more than {MAX_DEVICE_INTERRUPTS} granted-device interrupt routes were installed")
+            });
+        *slot = Some((source, route));
+    }
+
     /// Dispatches a claimed source to its handler. Returns false when no
     /// route matches so the backend can fail fast with controller
     /// context in the message.
@@ -158,7 +194,10 @@ where
         {
             return true;
         }
-        self.block.iter().any(|slot| dispatch(slot, source))
+        if self.block.iter().any(|slot| dispatch(slot, source)) {
+            return true;
+        }
+        self.device.iter().any(|slot| dispatch(slot, source))
     }
 }
 

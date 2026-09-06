@@ -229,7 +229,73 @@ fn draw_main_panels(
     draw_iommu_panel(frame, panels[3], sample);
     draw_host_share_panel(frame, panels[4], sample);
     draw_network_panel(frame, panels[5], sample);
-    draw_instances_panel(frame, sections[1], instances);
+
+    // A device the kernel handed to a user-mode driver belongs beside
+    // the instances, because that is what one of those instances is
+    // doing. Both halves answer the same question from opposite ends:
+    // who is running, and what does it hold.
+    let bottom = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(64), Constraint::Percentage(36)])
+        .split(sections[1]);
+    draw_instances_panel(frame, bottom[0], instances);
+    draw_devices_panel(frame, bottom[1], sample);
+}
+
+/// The hardware the kernel does not drive itself, and who holds it.
+fn draw_devices_panel(frame: &mut ratatui::Frame<'_>, area: Rect, sample: &stats::Sample) {
+    let rows = sample.devices.iter().map(|device| {
+        let owner = if device.claimed { "held" } else { "free" };
+        let style = if device.claimed {
+            Style::default().fg(Color::Green)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        Row::new(vec![
+            Cell::from(device.name.clone()),
+            Cell::from(owner).style(style),
+            Cell::from(format_bytes(device.region_bytes)),
+            Cell::from(format!("{}", device.interrupts)),
+            Cell::from(format!(
+                "{}/{}",
+                device.interrupts_forwarded, device.masked_sources
+            )),
+        ])
+    });
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Min(12),
+            Constraint::Length(5),
+            Constraint::Length(8),
+            Constraint::Length(4),
+            Constraint::Length(9),
+        ],
+    )
+    .header(
+        Row::new(vec!["device", "owner", "regs", "irq", "fwd/msk"])
+            .style(Style::default().fg(Color::Cyan)),
+    )
+    .block(
+        Block::default()
+            .title("Granted devices")
+            .borders(Borders::ALL),
+    );
+    if sample.devices.is_empty() {
+        let empty = Paragraph::new(Text::from(vec![Line::from(Span::styled(
+            "no grantable devices on this machine",
+            Style::default().fg(Color::DarkGray),
+        ))]))
+        .block(
+            Block::default()
+                .title("Granted devices")
+                .borders(Borders::ALL),
+        )
+        .wrap(Wrap { trim: true });
+        frame.render_widget(empty, area);
+        return;
+    }
+    frame.render_widget(table, area);
 }
 
 fn draw_empty(frame: &mut ratatui::Frame<'_>, top: Rect, body: Rect, app: &App) {

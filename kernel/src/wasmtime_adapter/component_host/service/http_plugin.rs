@@ -179,6 +179,7 @@ where
         .instantiate_async(&mut store)
         .await
         .map_err(map_program_runtime_error)?;
+    crate::wasmtime_adapter::component_host::record_linear_memory(&mut store, &wasm_instance);
     let handler = HttpHost::new(&mut store, &wasm_instance).map_err(map_program_runtime_error)?;
     let guest = handler.wasi_http_handler().clone();
 

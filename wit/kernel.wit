@@ -64,3 +64,27 @@ world remote-system {
   export helios:system/serial@0.1.0;
   export helios:system/instances@0.1.0;
 }
+
+/// World a kernel plugin that drives one device outside the virtio
+/// ecosystem implements.
+///
+/// It is an ordinary user-mode component with the ordinary isolation model;
+/// what makes it a driver is the grant the kernel hands it, and nothing else.
+/// The driver-class interface it exports back to the kernel — block, net,
+/// serial — is not here yet.
+world device-driver {
+  include wasi:cli/imports@0.3.0;
+  import helios:system/device@0.1.0;
+  import helios:system/sync@0.1.0;
+  import helios:system/tracing@0.1.0;
+}
+
+/// World the kernel generates its own `helios:system/device` bindings from.
+///
+/// Separate from `device-driver` for the same reason `http-host` is separate
+/// from `http-handler`: this keeps the kernel's bindgen down to the one
+/// interface it serves instead of regenerating every `wasi:cli` import the
+/// program bindings already provide.
+world device-host {
+  import helios:system/device@0.1.0;
+}

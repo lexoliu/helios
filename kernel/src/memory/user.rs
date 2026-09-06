@@ -485,6 +485,31 @@ pub fn allocate_user_frame_uninit_on(
         .map(|(ptr, _)| ptr)
 }
 
+/// Allocates one physically contiguous, zeroed run of user memory.
+///
+/// A device that reads or writes memory by itself sees physical
+/// addresses and no page table, so a DMA buffer has to be one run of
+/// physical memory rather than a list of frames. The buddy allocator
+/// already answers in contiguous blocks, so the run is exactly what a
+/// single allocation of `layout` returns; splitting it back into
+/// frames is what would be wrong here, and is why the matching release
+/// takes the same layout.
+pub fn allocate_user_run_zeroed_on(
+    processor: ProcessorId,
+    layout: Layout,
+) -> Result<NonNull<u8>, ProgramOutOfMemory> {
+    user_memory_pool().allocate_zeroed_on(processor, layout)
+}
+
+/// Gives back a run from [`allocate_user_run_zeroed_on`].
+///
+/// `layout` is the one the run was allocated with. The buddy allocator
+/// derives the block order from it, so a different layout returns the
+/// memory to the wrong free list.
+pub fn deallocate_user_run_on(processor: ProcessorId, ptr: NonNull<u8>, layout: Layout) {
+    user_memory_pool().deallocate_bytes_on(processor, ptr, layout);
+}
+
 pub fn deallocate_user_frame(ptr: NonNull<u8>) {
     let layout = Layout::from_size_align(PhysFrame::SIZE, PhysFrame::SIZE)
         .unwrap_or_else(|_| panic!("invalid user-frame layout"));

@@ -22,6 +22,7 @@ use crate::memory::BalloonHandle;
 use crate::BlockService;
 use crate::ComponentHostVsockService;
 use crate::component::{ComponentRuntimeState, ProviderSlot};
+use crate::device::DeviceGrantRegistry;
 use crate::network::HttpExchange;
 use crate::runtime::types::ComponentHostFilesystemState;
 
@@ -56,6 +57,10 @@ struct RuntimeStateInner<ProgramService, NetworkService, HostFsService> {
     /// The scratch disk the platform gave this kernel, once it has been
     /// identified and proved. Empty on a machine with no block device.
     block_service: Once<BlockService>,
+    /// The devices the machine is willing to hand to user-mode drivers,
+    /// as discovery published them. Empty on a machine whose backend
+    /// found nothing outside the hardware it drives itself.
+    device_grants: DeviceGrantRegistry,
     /// What the platform's IOMMU confines, once the backend has built
     /// the domains. Empty on a machine whose devices are not behind one.
     iommu_report: Once<alloc::sync::Arc<crate::IommuReport>>,
@@ -282,6 +287,7 @@ where
                 http_client: ProviderSlot::new(),
                 host_fs_service: Mutex::new(None),
                 block_service: Once::new(),
+                device_grants: DeviceGrantRegistry::new(),
                 iommu_report: Once::new(),
                 balloon: Once::new(),
                 swap: Once::new(),
@@ -675,6 +681,15 @@ where
         &self.inner.http_client
     }
 
+    /// The devices discovery is willing to hand to user-mode drivers.
+    ///
+    /// The registry is the one place a device's ownership is decided, so
+    /// a supervisor claims through it and the inspector lists through
+    /// it.
+    pub fn device_grants(&self) -> &DeviceGrantRegistry {
+        &self.inner.device_grants
+    }
+
     /// Publishes the root DRBG the backend seeded at boot.
     pub fn install_root_entropy(&self, root: RootEntropyHandle) {
         let mut installed = false;
@@ -835,6 +850,7 @@ where
             network: self
                 .network_service()
                 .map(|service| service.network_stats()),
+            devices: self.inner.device_grants.snapshot(),
         }
     }
 }
@@ -864,6 +880,10 @@ where
 
     fn memory_balloon(&self) -> Option<BalloonHandle> {
         self.inner.balloon.get().cloned()
+    }
+
+    fn device_grants(&self) -> &DeviceGrantRegistry {
+        RuntimeState::device_grants(self)
     }
 
     fn profiling_enabled(&self) -> bool {
