@@ -56,7 +56,12 @@ transient experiment: `docs/wasmtime.md` records the branch and the revision
 it must be at, and CI checks out the same snapshot. Moving the dependency
 means updating `docs/wasmtime.md` and passing every check in §7 against the
 new revision in the same change. Changing the fork itself is a maintainer
-decision, taken before the change is written.
+decision, taken before the change is written. A task that finds the fork
+missing a primitive it needs (an accessor on a `wasmtime` type, a runtime
+hook) reports the gap with the call site and the shape the primitive would
+take, and stops there: it neither routes around the gap inside the kernel
+nor adds the primitive on its own, because the orchestrating agent holds the
+maintainer's decision and the fork's revision moves once, per §1.
 
 ## 2. Construction over conditional compilation
 
@@ -99,6 +104,11 @@ decision, taken before the change is written.
   instances, kernel plugins included, use user-memory allocation and
   accounting; user OOM kills the instance and reclaims its pool, and never
   grows a kernel budget or adds per-plugin policy.
+- A buffer the device handed up belongs to the driver and is on loan for one
+  receive pass. Nothing the stack queues (an out-of-order TCP segment, an
+  unread datagram, a deferred reply) retains it: the queued value owns its
+  bytes. A driver's receive pool is a shared, unsignalled resource, and one
+  pinned buffer stalls the ring for every socket on that queue pair.
 - Heap allocation in kernel-facing code needs a concrete reason tied to
   variable-sized guest data, plugin payloads, or runtime ownership. Stack
   storage, static capacity, caller-owned buffers, arenas and typed ownership
@@ -127,8 +137,12 @@ decision, taken before the change is written.
   `clippy::manual_async_fn` enforces the impl-block half of this rule and
   is never allowed off.
 - Errors are typed enums with `thiserror`; `anyhow` does not appear in this
-  repository. A CLI or test boundary may translate an error into text, but
-  every crate preserves structured provenance.
+  repository, and `workspace-root/tests/no_anyhow.rs` refuses any manifest
+  that lists it. A CLI or test boundary may translate an error into text,
+  but every crate preserves structured provenance. When an upstream API
+  answers in `anyhow::Result` (`wit-component`, for one), the caller's typed
+  variant carries the rendered chain (`format!("{error:#}")`) in a named
+  `report: String` field; it never erases into `Box<dyn Error>`.
 - Diagnostics go through `tracing`, the only diagnostic crate in the tree.
   The `log` crate is never used; a dependency that emits `log` records
   (`cranelift_codegen`, for one) is bridged with `tracing_log::LogTracer`.
@@ -283,6 +297,10 @@ The kernel runs a cooperative async executor. Anything that pins it blocks
 every other task: the 9p host-fs transport, WASI futures, timers, the network
 service. These rules bind every `#![no_std]` crate and every crate the
 executor drives (`hal/`, `kernel/`, the backends' runtime paths, components).
+The signal and lock rules below bind the host side of the inspector
+transport as well (`inspector-protocol`'s client: one reader, many waiters),
+because a lost wake there hangs a bench lane exactly as one in the kernel
+does.
 
 - `block_on` does not appear in production code. Its only uses are tests,
   bootstrap entry points that run before the executor starts, and its own
@@ -377,8 +395,11 @@ just test-units
 `just lint` is `tools/fmt.sh --check` plus `cargo clippy … -D warnings` over
 the host crates, each guest program, and the three bare-metal targets.
 `just test-units` runs the `hal`, `virtio`, `netstack`, `kernel`,
-`inspector-protocol` and `workspace-root` unit tests and the
-`hal_layering` test that enforces §1.
+`inspector-protocol` and `workspace-root` unit tests, the `hal_layering`
+test (`kernel/tests/`) that enforces §1, and the `no_anyhow` test
+(`workspace-root/tests/`) that enforces §3.2. The recipe names each
+integration test with `--test <name>`, so a new enforcement test is added to
+the recipe in the same change or it never runs.
 
 CI (`.github/workflows/ci.yml`) runs the same recipes, one lane each, so a
 red lane names the surface that broke:
@@ -437,7 +458,9 @@ them from colliding:
   branched from `origin/dev`, with a cloned `target/` for a warm cache, and
   never edits, cleans, or builds inside another worktree or another project.
 - A delegated agent runs the per-crate checks for the crates it touched
-  (`cargo check -p`, `cargo clippy -p … -D warnings`, the crate's tests, the
+  (`cargo check -p`, `cargo clippy -p … --all-targets -D warnings`,
+  `cargo test -p <crate>` with every target and never `--lib` alone, because
+  the integration tests are where a crate's enforcement tests live, the
   relevant `just check-target`, file-scoped rustfmt). The workspace-wide
   lint and test suite is CI's job; running it locally as well pays the same
   compile twice.
