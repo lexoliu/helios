@@ -81,6 +81,9 @@ pub struct StatsSample {
     /// How the interface's work is spread across processors, absent on a
     /// machine that gave the kernel no network device.
     pub network: Option<crate::NetworkStats>,
+    /// The hardware the kernel does not drive itself and has offered to
+    /// user-mode drivers. Empty on a machine that described none.
+    pub devices: Vec<crate::GrantedDeviceSnapshot>,
 }
 
 #[derive(Clone, Debug)]

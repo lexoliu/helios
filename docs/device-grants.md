@@ -185,22 +185,87 @@ a device tree node path, `hosted:device0`. Names are compared, never
 parsed: the kernel matches the name a driver asks for against the name
 discovery published and interprets neither.
 
+## AArch64 discovery
+
+A device-tree machine describes far more than the kernel drives. The
+aarch64 backend's walk takes every node that has a register window and
+raises an interrupt, and drops the ones the kernel drives itself — the
+GIC, the PL011 console, the PL031 clock, and every `virtio,mmio`
+transport. What is left is, by definition, hardware nobody in the
+kernel claims, which is exactly what a driver plugin exists for. On
+QEMU's `virt` board that is the PL061 GPIO controller.
+
+A node whose window is not frame-aligned is skipped with a warning
+rather than refused. It is a device this backend cannot isolate, not a
+machine it cannot boot: mapping it would put a neighbour's registers in
+the same page, and changing one mapping would change both.
+
+Each grant's interrupt is routed at the distributor with the trigger
+mode the tree declared, and then left masked. Nothing owns the device
+yet, so a line arriving before a claim would have nowhere to go; the
+first `unmask` from the driver that claims it is what arms the
+hardware.
+
+The DMA capability comes from the firmware — a node that declares no
+`dma-ranges` masters the processor's own physical address space, and
+`dma-coherent` says whether its accesses snoop. The *budget* does not:
+no firmware description says how much memory a driver deserves, because
+that is a question about the machine's other tenants. It is kernel
+policy, `DEFAULT_DMA_BUDGET_BYTES`, set in one place.
+
+An ACPI-described machine publishes no grants yet. The AML walk looks
+for virtio transports by hardware id; naming every other device in the
+namespace and reading each one's `_CRS` is a second enumeration, and
+the description says what it knows rather than guessing.
+
+## Contiguous memory is one allocation
+
+A device that masters the bus sees physical addresses and no page
+table, so a DMA buffer has to be one physical run rather than a list of
+frames. The user pool's buddy allocator already answers in contiguous
+blocks, so the run is exactly what a single allocation returns — and
+that is why releasing one takes the alignment it was made with rather
+than being torn down frame by frame. A run given back as frames lands
+on the wrong free list.
+
+`DmaPlacement` carries the alignment and the device's address limit
+together, because both come from the device and neither means anything
+without the other: a commit made against one and checked against the
+other is how a buffer ends up somewhere the hardware silently
+truncates.
+
+The backend tracks device mappings beside its reservation tracker
+rather than inside it. The tracker exists to return frames to the user
+pool when a reservation is released, and neither kind of device mapping
+may go there: a register window was never taken from the pool, and a
+pinned run is owed its own layout. Keeping them separate is also what
+makes `release` total — a store torn down by an OOM kill still has its
+device mapped, and the address space is the last place that can
+guarantee the hardware is unreachable afterwards.
+
+## Seeing them
+
+A granted device is an ordinary part of the machine's inventory, not a
+hidden one, so `helios-inspector stats` lists them beside the
+instances: the name discovery published, whether an instance holds it,
+how much register space the grant covers, how many lines it raises, and
+the forwarded-to-masked counts. A device whose masked count stays equal
+to its line count is a driver that has stopped servicing its hardware.
+
 ## Status
 
 Phase 1 landed the `hal` capability types, `kernel/src/device/`, the
-`helios:system/device@0.1.0` contract, and the hosted machine's device
-and tests.
+`helios:system/device@0.1.0` contract and its host implementation, the
+hosted machine's device and tests, aarch64 device-tree discovery, and
+the inspector listing.
 
-Two things are open, and both are recorded on #5:
+Placing a mapping inside a component instance's linear memory needs the
+base address of that instance's core memory. The runtime exposed this
+for core modules only, so the vendored fork gained
+`wasmtime::component::Instance::get_default_memory`; `docs/wasmtime.md`
+records the revision.
 
-* **The kernel-side implementation of `helios:system/device` is not
-  wired.** Placing a mapping inside an instance's linear memory needs
-  the base address and length of that component instance's core memory.
-  The runtime exposes this for core modules (`Instance::get_memory`,
-  which the preview1 path uses) but not for components: a component's
-  `get_export` cannot return a memory, and a component host function
-  receives only a `StoreContextMut`. The interface is declared and
-  imported by no world until that primitive exists.
-* **Bare-metal discovery is not built.** `hosted/` is the only grant
-  source. PCI enumeration on x86-64 and device tree nodes on aarch64 and
-  riscv64 are the remaining half of phase 1's backend work.
+One thing is open, and it is recorded on #5: **x86-64 PCI enumeration
+and riscv64 device-tree discovery are not built.** Both backends still
+publish no grants, so `hosted/` and aarch64 are the grant sources
+today.

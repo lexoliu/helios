@@ -24,7 +24,9 @@ use arrayvec::ArrayVec;
 use spin::Once;
 use triomphe::Arc;
 
-use super::grant::{DeviceGrant, GrantError, GrantInterrupt};
+use alloc::vec::Vec;
+
+use super::grant::{DeviceGrant, DeviceName, GrantError, GrantInterrupt};
 use super::interrupt::InterruptRelay;
 use super::lease::{DeviceWindow, GrantLease, PublishedDevice};
 use super::platform::device_hooks_installed;
@@ -100,6 +102,33 @@ impl DeviceGrantRegistry {
             );
         }
         Ok(())
+    }
+
+    /// What the inspector shows for one granted device.
+    ///
+    /// A granted device is an ordinary part of the machine's inventory
+    /// rather than a hidden one, so this reads the same way the block
+    /// device and the network queues do: what the hardware is, who has
+    /// it, and how its interrupts have been flowing.
+    pub fn snapshot(&self) -> Vec<GrantedDeviceSnapshot> {
+        self.devices()
+            .iter()
+            .map(|device| {
+                let interrupts = device.relay().stats();
+                GrantedDeviceSnapshot {
+                    name: *device.grant.name(),
+                    region_bytes: device.grant.region_bytes(),
+                    regions: device.grant.regions().len() as u32,
+                    interrupt_count: device.grant.interrupts().len() as u32,
+                    dma_budget_bytes: device.grant.dma().byte_budget,
+                    confined: device.grant.confinement().is_some(),
+                    claimed: device.is_claimed(),
+                    interrupts_forwarded: interrupts.forwarded,
+                    interrupts_coalesced: interrupts.coalesced,
+                    masked_sources: interrupts.masked,
+                }
+            })
+            .collect()
     }
 
     /// Every device discovery published, whether or not it has an owner.
@@ -188,4 +217,29 @@ impl ExternalInterruptHandler for DeviceInterruptRoute {
             "a device interrupt route delivered a source its device does not raise"
         );
     }
+}
+
+/// One granted device, as the inspector lists it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GrantedDeviceSnapshot {
+    /// The name discovery published, which is the firmware's own.
+    pub name: DeviceName,
+    /// Register space the grant covers, across all its regions.
+    pub region_bytes: u64,
+    pub regions: u32,
+    pub interrupt_count: u32,
+    pub dma_budget_bytes: u64,
+    /// Whether an I/O translation unit confines the device's own reads
+    /// and writes.
+    pub confined: bool,
+    /// Whether an instance currently holds it.
+    pub claimed: bool,
+    /// Interrupts the kernel has handed to the owner.
+    pub interrupts_forwarded: u64,
+    /// Interrupts that arrived while one was already outstanding, and
+    /// were therefore folded into it.
+    pub interrupts_coalesced: u64,
+    /// Sources currently held off at the controller, waiting for the
+    /// owner to acknowledge.
+    pub masked_sources: u32,
 }

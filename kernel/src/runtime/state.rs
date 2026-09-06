@@ -850,6 +850,7 @@ where
             network: self
                 .network_service()
                 .map(|service| service.network_stats()),
+            devices: self.inner.device_grants.snapshot(),
         }
     }
 }

@@ -65,7 +65,7 @@ pub use owner::{DeviceOwnership, LinearMemory};
 pub use platform::{
     DeviceInterruptHooks, DeviceVmHooks, install_device_interrupt_hooks, install_device_vm_hooks,
 };
-pub use registry::{DeviceGrantRegistry, DeviceInterruptRoute, MAX_GRANTS};
+pub use registry::{DeviceGrantRegistry, DeviceInterruptRoute, GrantedDeviceSnapshot, MAX_GRANTS};
 
 #[cfg(test)]
 mod tests {

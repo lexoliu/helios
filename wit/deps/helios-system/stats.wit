@@ -192,6 +192,36 @@ interface stats {
     queues: list<network-queue>,
   }
 
+  /// One piece of hardware the kernel does not drive itself, offered
+  /// to a user-mode driver.
+  record granted-device {
+    /// The name the firmware gave the device, which is the name a
+    /// driver asks for.
+    name: string,
+    /// Register space the grant covers, across all its regions.
+    region-bytes: u64,
+    /// How many separate windows that is.
+    regions: u32,
+    /// Interrupt lines the device raises.
+    interrupts: u32,
+    /// Most bytes the kernel will pin for the device at once.
+    dma-budget-bytes: u64,
+    /// Whether an I/O translation unit confines the device's own reads
+    /// and writes.
+    confined: bool,
+    /// Whether an instance currently holds it.
+    claimed: bool,
+    /// Interrupts the kernel has handed to the owner.
+    interrupts-forwarded: u64,
+    /// Interrupts that arrived while one was still outstanding, and
+    /// were folded into it rather than queued.
+    interrupts-coalesced: u64,
+    /// Lines currently held off at the controller, waiting for the
+    /// owner to acknowledge. Persistently equal to `interrupts` is a
+    /// driver that has stopped servicing its device.
+    masked-sources: u32,
+  }
+
   record sample {
     timestamp: mono-nanos,
     uptime: mono-nanos,
@@ -217,6 +247,9 @@ interface stats {
     host-share: option<host-share-cache>,
     /// Absent on a machine that gave the kernel no network device.
     network: option<network>,
+    /// Hardware the kernel has no driver for and has offered to
+    /// user-mode ones. Empty on a machine that described none.
+    devices: list<granted-device>,
   }
 
   /// Returns the latest coherent system-wide observation snapshot.
