@@ -10,7 +10,7 @@ Toolchain examined: `rustc 1.98.0-nightly (3daae5e42 2026-06-14)`,
 LLVM 22.1.6 (`rust-toolchain.toml`), vendored Wasmtime
 `lexoliu/wasmtime@b83d18c8558b6d32fb0c0727d1c6a32639842c49`.
 
-## (a) `-C profile-generate` for the bare-metal kernel
+## (a) Profile-guided optimisation of the bare-metal kernel
 
 ### What rustc needs
 
@@ -40,7 +40,7 @@ Evidence on this toolchain:
   can be instrumented without compiler-rt if Helios provides its own
   runtime.
 
-### The in-kernel runtime
+### Collecting it: the in-kernel runtime
 
 `-C profile-generate` on the kernel is a build profile, a runtime in
 `kernel/`, a linker-script fragment per target, an export and a CI job.
@@ -179,8 +179,118 @@ on an instrumented kernel would be measuring the counters. The network
 class is not in the profile yet: it needs the privileged tap backend the
 suite lane provisions.
 
-Consuming the profile with `-C profile-use` is the next step and is not
-wired up: the collected artifact is what makes it possible to try.
+### Spending it: `-C profile-use`
+
+`vm --profile-use <file>` is the other half. It is the release build plus
+two rustflags, in a cargo profile and a target directory of its own, so a
+PGO image and a plain one can be built from one checkout without
+overwriting each other — which is what lets the two be timed against each
+other.
+
+| Flag | Why |
+| --- | --- |
+| `-C profile-use=<file>` | reads the merged profile; the path is an argument, never discovered |
+| `-C llvm-args=-pgo-warn-missing-function` | names every function the profile says nothing about, as a warning |
+
+```bash
+just kernel-pgo-use x86-64 target/pgo/helios-kernel.profdata
+helios-inspector vm --arch x86-64 \
+    --profile-use target/pgo/helios-kernel.profdata --accel kvm shell
+```
+
+`just kernel-pgo-use` is the inspector's own `vm --profile-use build`,
+the way `just build-instrumented` is `vm --profile-generate build`, so
+the flags have one definition (`inspector/src/vm.rs`,
+`profile_use_rustflags`).
+
+The profile is an explicit argument on purpose: a PGO kernel is only as
+good as the profile behind it, so which profile that was is part of the
+command that built it and part of the run record of anything timed on it.
+`--profile-use` composes with `--release` and with nothing else:
+`--profile-generate`, `--debug` and `--kernel-debug` are refused by name,
+because a build cannot both collect a profile and read one, and an
+unoptimised PGO build would measure neither.
+
+#### Refusing a profile the toolchain cannot read
+
+The build checks the profile's header before cargo starts
+(`inspector/src/vm/profdata.rs`), the way the guest writer checks
+`__llvm_profile_raw_version` before it writes a byte. Sixteen bytes
+answer three questions:
+
+- a `.profraw` reaching `--profile-use` means the `llvm-profdata merge`
+  step was skipped, and is refused naming that step rather than "not an
+  indexed profile";
+- an indexed profile whose version is not the one this toolchain writes
+  is refused naming both versions. On the pinned nightly that is 13
+  (`IndexedInstrProf::ProfVersion::CurrentVersion`, LLVM 22.1.6), the
+  index-side counterpart of the raw version 10 the guest writer emits;
+- a profile without the IR-instrumentation variant bit did not come from
+  `-C profile-generate` and is refused as such.
+
+Without the check a stale artifact fails twenty minutes into a kernel
+build, with an LLVM error that names no file.
+
+#### What a stale profile costs
+
+Nothing fails. LLVM matches a profile record to a function by its
+mangled name and by a hash of its control-flow graph, and reacts to a
+miss quietly:
+
+- **a function that is not in the profile at all** — added since the
+  collection, or never called by a collected workload — keeps its
+  static branch heuristics and its default inlining. It is the state
+  every un-instrumented build is in, so the cost is the optimisation not
+  gained rather than a pessimisation. `-pgo-warn-missing-function` is
+  what makes those visible, as warnings: they never fail the build.
+- **a function whose control flow changed** since the collection — an
+  added branch, a changed loop — has a record under its name whose hash
+  no longer matches. LLVM discards that record (`instr_prof_hash_mismatch`)
+  and the function falls back to the same static heuristics. The danger
+  is not the discard but its silence at scale: a profile stale enough
+  that most hashes miss produces a kernel that is a release build wearing
+  a PGO label.
+- **counts that are merely old** — the function and its shape are
+  unchanged but the workload mix has moved — are the case with no
+  diagnostic at all. A branch that was cold when the profile was taken is
+  laid out out-of-line and stays there. This is what makes the paired
+  measurement below the only real check: a profile that no longer
+  describes the kernel shows up as no improvement, not as an error.
+
+So the profile is refreshed by re-running the collection, never by
+patching; and the artifact carries the run that produced it.
+
+#### Measuring it in CI
+
+`bench-suite.yml` has a `suite-pgo` job after `profile-generate`, on the
+same events. It downloads that run's `helios-kernel-profdata`, builds the
+candidate kernel with `--profile-use` and the baseline kernel plain from
+the same commit, and runs the paired suite of #173 with the two on one
+host: `--sides helios,helios_baseline`, which is Helios against Helios,
+because the Linux sides answer a different question and would double a job
+that already boots every workload twice.
+
+The pairing machinery varies one thing between its two columns. Until now
+that was the commit — a baseline worktree of another ref (#173, #178) —
+and here it is the build: one commit, two kernels, and
+`tools/bench/pgo-gate-note.md` beside the gate table saying which column
+read the profile. The report is the paired table and the per-workload
+medians; read the headline compute workloads first (`aot-curl`,
+`cpython-json`, `quickjs-loop`), because they are what the profile covers.
+
+The `net` class is timed on both images and is **not in the profile**: the
+collection job runs the classes that need no privileged host networking,
+so the candidate's packet path carries no counts. Profiling it needs a
+collection run on a lane that provisions the tap backend.
+
+The job reports and does not gate. Its verdict is about profile-guided
+optimisation of the kernel, not about the pull request that happened to
+run it, so a red headline row says PGO did not pay on this commit — which
+is the answer the job exists to produce.
+
+Shipping a PGO kernel from `release.yml` is the next step, and it is
+decided from these numbers rather than before them: it needs a
+profile-refresh cadence, which the paragraphs above are the argument for.
 
 ### Sample-based alternative already within reach
 
@@ -230,3 +340,5 @@ Cranelift's output is limited to block layout. Not implemented.
 - #71: branch-hint feedback for the compiler plugin: instrumenting the
   suite's wasm inputs, writing `metadata.code.branch_hint`, and re-hinting
   in `build.sh`.
+- #211: `-C profile-use` for the kernel, the `profile-use` build kind and
+  the paired `suite-pgo` job. Implemented; described above.
