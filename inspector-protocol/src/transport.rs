@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::future::Future;
+use std::future::{Future, poll_fn};
 use std::io;
-use std::pin::Pin;
+use std::pin::{Pin, pin};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::task::{Context, Poll};
@@ -10,7 +10,8 @@ use bytes::Bytes;
 use futures_core::Stream;
 use futures_io::{AsyncRead as FuturesAsyncRead, AsyncWrite as FuturesAsyncWrite};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadBuf};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::futures::Notified;
+use tokio::sync::{Mutex, Notify, mpsc};
 #[cfg(test)]
 use wrpc_transport::{Index, Invoke, Serve};
 
@@ -40,11 +41,26 @@ enum InvocationOwner<R, W> {
     Server(Weak<ServerInner<R, W>>),
 }
 
+/// One call in flight, and the only place its answer is ever filed.
+///
+/// Everything a caller waits for — the open reply, inbound payloads,
+/// the close of a path, a failure — lives on this object, and every
+/// mutation of it signals `progress`. A waiter therefore watches the
+/// same object the reader writes to, so an answer cannot be filed
+/// somewhere the caller waiting for it is not looking.
 struct Invocation<R, W> {
     id: u32,
     owner: InvocationOwner<R, W>,
     inbound: StdMutex<InboundBuffers>,
     accepted: AtomicBool,
+    /// The reply to this invocation's `Open`. A server invocation is
+    /// created already accepted and never carries one.
+    reply: StdMutex<Option<Reply>>,
+    /// Broadcast to every waiter each time this invocation's state
+    /// changes. Signalled with `notify_waiters`, which stores no
+    /// permit, so a waiter arms before it tests and never wakes on a
+    /// change it has already seen.
+    progress: Notify,
 }
 
 #[derive(Clone)]
@@ -52,14 +68,21 @@ pub struct Client<R, W> {
     inner: Arc<ClientInner<R, W>>,
 }
 
+/// The client half of a connection: one reader, many waiters.
+///
+/// Whichever caller holds `read` is the reader, and it routes the frame
+/// it read into the invocation that frame names before it releases the
+/// lock. Every other caller parks on its own invocation's signal and
+/// races that signal against the same lock, so the reader role passes
+/// to a waiter as soon as the current reader steps away, and a waiter
+/// whose answer has already been filed leaves through its signal rather
+/// than taking the transport.
 struct ClientInner<R, W> {
     read: Arc<Mutex<R>>,
     write: Arc<Mutex<W>>,
-    dispatch: Arc<Mutex<()>>,
     closed: StdMutex<bool>,
     next_invocation: AtomicU32,
     active: StdMutex<HashMap<u32, Weak<Invocation<R, W>>>>,
-    replies: StdMutex<HashMap<u32, Reply>>,
 }
 
 #[derive(Clone)]
@@ -81,6 +104,7 @@ struct Registration<R, W> {
     tx: mpsc::Sender<InvocationAccept<R, W>>,
 }
 
+/// How the remote answered an `Open`.
 enum Reply {
     Accept,
     Reject(String),
@@ -127,11 +151,9 @@ where
             inner: Arc::new(ClientInner {
                 read: Arc::new(Mutex::new(read)),
                 write: Arc::new(Mutex::new(write)),
-                dispatch: Arc::new(Mutex::new(())),
                 closed: StdMutex::new(false),
                 next_invocation: AtomicU32::new(1),
                 active: StdMutex::new(HashMap::new()),
-                replies: StdMutex::new(HashMap::new()),
             }),
         }
     }
@@ -208,7 +230,12 @@ where
         }
 
         loop {
-            if let Some(reply) = take_reply(&self.inner.replies, id) {
+            // Armed before the reply is tested for, so a reply filed
+            // between the test and the park still wakes this caller.
+            let mut signal = pin!(invocation.progress.notified());
+            signal.as_mut().enable();
+
+            if let Some(reply) = invocation.take_reply() {
                 match reply {
                     Reply::Accept => break,
                     Reply::Reject(message) => return Err(TransportError::Rejected(message)),
@@ -217,7 +244,7 @@ where
             if is_closed(&self.inner.closed) {
                 return Err(TransportError::Closed);
             }
-            pump_client_once(self.inner.clone())
+            drive_client(&self.inner, signal)
                 .await
                 .map_err(|source| TransportError::io("read remote invocation reply", source))?;
         }
@@ -340,6 +367,8 @@ impl<R, W> Invocation<R, W> {
             owner: InvocationOwner::Client(Arc::downgrade(inner)),
             inbound: StdMutex::new(InboundBuffers::default()),
             accepted: AtomicBool::new(false),
+            reply: StdMutex::new(None),
+            progress: Notify::new(),
         });
         register_invocation(&inner.active, &invocation);
         invocation
@@ -351,25 +380,33 @@ impl<R, W> Invocation<R, W> {
             owner: InvocationOwner::Server(Arc::downgrade(inner)),
             inbound: StdMutex::new(InboundBuffers::default()),
             accepted: AtomicBool::new(true),
+            reply: StdMutex::new(None),
+            progress: Notify::new(),
         });
         register_invocation(&inner.active, &invocation);
         invocation
     }
 
     fn push_payload(&self, path: Vec<usize>, payload: Bytes) {
-        let mut inbound = self
-            .inbound
-            .lock()
-            .unwrap_or_else(|_| panic!("invocation inbound buffer mutex poisoned"));
-        inbound.chunks.entry(path).or_default().push_back(payload);
+        {
+            let mut inbound = self
+                .inbound
+                .lock()
+                .unwrap_or_else(|_| panic!("invocation inbound buffer mutex poisoned"));
+            inbound.chunks.entry(path).or_default().push_back(payload);
+        }
+        self.progress.notify_waiters();
     }
 
     fn mark_closed(&self, path: Vec<usize>) {
-        let mut inbound = self
-            .inbound
-            .lock()
-            .unwrap_or_else(|_| panic!("invocation inbound buffer mutex poisoned"));
-        inbound.closed.insert(path);
+        {
+            let mut inbound = self
+                .inbound
+                .lock()
+                .unwrap_or_else(|_| panic!("invocation inbound buffer mutex poisoned"));
+            inbound.closed.insert(path);
+        }
+        self.progress.notify_waiters();
     }
 
     fn pop_payload(&self, path: &[usize]) -> Option<Bytes> {
@@ -406,16 +443,51 @@ impl<R, W> Invocation<R, W> {
         self.accepted.store(true, Ordering::Release);
     }
 
+    /// Files the answer to this invocation's `Open` and wakes whoever
+    /// opened it.
+    fn deliver_reply(&self, reply: Reply) {
+        *self
+            .reply
+            .lock()
+            .unwrap_or_else(|_| panic!("invocation reply mutex poisoned")) = Some(reply);
+        self.progress.notify_waiters();
+    }
+
+    fn take_reply(&self) -> Option<Reply> {
+        self.reply
+            .lock()
+            .unwrap_or_else(|_| panic!("invocation reply mutex poisoned"))
+            .take()
+    }
+
     fn is_accepted(&self) -> bool {
         self.accepted.load(Ordering::Acquire)
     }
 
+    /// Fails this invocation, keeping the first failure reported: the
+    /// remote's own message says more than the connection teardown that
+    /// follows it.
     fn set_error(&self, message: String) {
-        let mut inbound = self
-            .inbound
-            .lock()
-            .unwrap_or_else(|_| panic!("invocation inbound buffer mutex poisoned"));
-        inbound.error = Some(message);
+        {
+            let mut inbound = self
+                .inbound
+                .lock()
+                .unwrap_or_else(|_| panic!("invocation inbound buffer mutex poisoned"));
+            if inbound.error.is_none() {
+                inbound.error = Some(message);
+            }
+        }
+        self.progress.notify_waiters();
+    }
+
+    /// `Some` once `path` has something for its reader, `None` while
+    /// the caller must keep waiting.
+    fn ready_state(&self, path: &[usize]) -> Option<io::Result<()>> {
+        if self.has_payload(path) || self.is_closed(path) {
+            return Some(Ok(()));
+        }
+        self.error_message()
+            .map(|message| Err(io::Error::other(message)))
     }
 
     fn error_message(&self) -> Option<String> {
@@ -457,21 +529,26 @@ where
 {
     async fn read_until_ready(self: Arc<Self>, path: Vec<usize>) -> io::Result<()> {
         loop {
-            if self.has_payload(&path) || self.is_closed(&path) {
-                return Ok(());
-            }
-            if let Some(message) = self.error_message() {
-                return Err(io::Error::other(message));
-            }
-
             match &self.owner {
                 InvocationOwner::Client(inner) => {
+                    // Armed before the state is tested, so a frame
+                    // routed between the test and the park still wakes
+                    // this waiter.
+                    let mut signal = pin!(self.progress.notified());
+                    signal.as_mut().enable();
+
+                    if let Some(state) = self.ready_state(&path) {
+                        return state;
+                    }
                     let inner = inner.upgrade().ok_or_else(|| {
                         io::Error::new(io::ErrorKind::BrokenPipe, "client transport disappeared")
                     })?;
-                    pump_client_once(inner).await?;
+                    drive_client(&inner, signal).await?;
                 }
                 InvocationOwner::Server(inner) => {
+                    if let Some(state) = self.ready_state(&path) {
+                        return state;
+                    }
                     let inner = inner.upgrade().ok_or_else(|| {
                         io::Error::new(io::ErrorKind::BrokenPipe, "server transport disappeared")
                     })?;
@@ -840,29 +917,6 @@ fn dispatch_close<R, W>(
     }
 }
 
-fn mark_invocation_accepted<R, W>(
-    active: &StdMutex<HashMap<u32, Weak<Invocation<R, W>>>>,
-    invocation: u32,
-) {
-    if let Some(target) = resolve_invocation(active, invocation) {
-        target.mark_accepted();
-    }
-}
-
-fn dispatch_reject<R, W>(
-    active: &StdMutex<HashMap<u32, Weak<Invocation<R, W>>>>,
-    invocation: u32,
-    message: String,
-) -> bool {
-    match resolve_invocation(active, invocation) {
-        Some(target) if target.is_accepted() => {
-            target.set_error(message);
-            true
-        }
-        Some(_) | None => false,
-    }
-}
-
 fn resolve_invocation<R, W>(
     active: &StdMutex<HashMap<u32, Weak<Invocation<R, W>>>>,
     invocation: u32,
@@ -879,13 +933,6 @@ fn resolve_invocation<R, W>(
     }
 }
 
-fn take_reply(replies: &StdMutex<HashMap<u32, Reply>>, invocation: u32) -> Option<Reply> {
-    replies
-        .lock()
-        .unwrap_or_else(|_| panic!("client reply table mutex poisoned"))
-        .remove(&invocation)
-}
-
 fn is_closed(closed: &StdMutex<bool>) -> bool {
     *closed
         .lock()
@@ -899,46 +946,81 @@ fn mark_closed(closed: &StdMutex<bool>) {
     *closed = true;
 }
 
-async fn pump_client_once<R, W>(client: Arc<ClientInner<R, W>>) -> io::Result<()>
+/// Waits for `signal`, or takes the reader role and routes one frame.
+///
+/// The two are raced with the signal polled first, and the reader
+/// routes its frame before it releases the read lock. A caller whose
+/// answer has already been filed therefore always finds the signal
+/// ready on the poll that would otherwise hand it the transport, so it
+/// cannot end up inside `read_frame` waiting for a frame the remote has
+/// already sent.
+async fn drive_client<R, W>(
+    client: &Arc<ClientInner<R, W>>,
+    mut signal: Pin<&mut Notified<'_>>,
+) -> io::Result<()>
 where
     R: FuturesAsyncRead + Send + Unpin + 'static,
     W: FuturesAsyncWrite + Send + Unpin + 'static,
 {
     if is_closed(&client.closed) {
-        return Ok(());
+        return Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "client transport is closed",
+        ));
     }
 
-    let _dispatch = client.dispatch.lock().await;
-    let frame = {
-        let mut io = client.read.lock().await;
-        match read_frame(&mut *io).await? {
-            Some(frame) => frame,
-            None => {
-                mark_closed(&client.closed);
-                return Ok(());
-            }
+    let mut acquire = pin!(client.read.lock());
+    let reader = poll_fn(|cx| {
+        if signal.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(None);
         }
+        acquire.as_mut().poll(cx).map(Some)
+    })
+    .await;
+    let Some(mut io) = reader else {
+        return Ok(());
     };
 
+    let frame = match read_frame(&mut *io).await {
+        Ok(Some(frame)) => frame,
+        Ok(None) => {
+            close_client(client, "client transport closed mid-invocation");
+            return Ok(());
+        }
+        Err(error) => {
+            close_client(client, &error.to_string());
+            return Err(error);
+        }
+    };
+    route_client_frame(client, frame).inspect_err(|error| {
+        close_client(client, &error.to_string());
+    })
+}
+
+/// Files one frame into the invocation it names.
+///
+/// A frame for an invocation whose caller has dropped it is discarded:
+/// the caller registers the invocation before it writes the `Open` and
+/// holds it for as long as it waits, so the only frames that resolve to
+/// nothing are answers nobody is waiting for.
+fn route_client_frame<R, W>(client: &Arc<ClientInner<R, W>>, frame: Frame) -> io::Result<()> {
     match frame {
         Frame::Accept { invocation } => {
-            mark_invocation_accepted(&client.active, invocation);
-            client
-                .replies
-                .lock()
-                .unwrap_or_else(|_| panic!("client reply table mutex poisoned"))
-                .insert(invocation, Reply::Accept);
+            if let Some(target) = resolve_invocation(&client.active, invocation) {
+                target.mark_accepted();
+                target.deliver_reply(Reply::Accept);
+            }
         }
         Frame::Reject {
             invocation,
             message,
         } => {
-            if !dispatch_reject(&client.active, invocation, message.clone()) {
-                client
-                    .replies
-                    .lock()
-                    .unwrap_or_else(|_| panic!("client reply table mutex poisoned"))
-                    .insert(invocation, Reply::Reject(message));
+            if let Some(target) = resolve_invocation(&client.active, invocation) {
+                if target.is_accepted() {
+                    target.set_error(message);
+                } else {
+                    target.deliver_reply(Reply::Reject(message));
+                }
             }
         }
         Frame::Data {
@@ -952,7 +1034,7 @@ where
             Bytes::from(payload),
         ),
         Frame::Close { invocation, path } => {
-            dispatch_close(&client.active, invocation, decode_path(&path)?)
+            dispatch_close(&client.active, invocation, decode_path(&path)?);
         }
         Frame::Open { .. } => {
             return Err(io::Error::new(
@@ -963,6 +1045,26 @@ where
     }
 
     Ok(())
+}
+
+/// Ends every call on a connection the reader can no longer read.
+///
+/// With several invocations in flight the failure belongs to all of
+/// them, not only to whichever one happened to hold the reader role:
+/// failing each one both reports the fault and wakes the waiter parked
+/// on its signal.
+fn close_client<R, W>(client: &Arc<ClientInner<R, W>>, reason: &str) {
+    mark_closed(&client.closed);
+    let waiting: Vec<Arc<Invocation<R, W>>> = client
+        .active
+        .lock()
+        .unwrap_or_else(|_| panic!("active invocation table mutex poisoned"))
+        .values()
+        .filter_map(Weak::upgrade)
+        .collect();
+    for invocation in waiting {
+        invocation.set_error(reason.to_owned());
+    }
 }
 
 async fn pump_server_once<R, W>(server: Arc<ServerInner<R, W>>) -> Result<()>
@@ -1163,11 +1265,19 @@ mod tests {
     use super::{Client, RAW_UPLOAD_CHUNK_BYTES, Server};
     use bytes::Bytes;
     use futures_lite::StreamExt as _;
+    use futures_lite::future::poll_once;
+    use futures_util::future::join;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::sync::Notify;
     use tokio::time::{Duration, timeout};
     use tokio_util::compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _};
     use wrpc_transport::{InvokeExt as _, ServeExt as _};
+
+    /// How long the second of two concurrently held invocations may go
+    /// unanswered. Long enough that a loaded machine does not fail it,
+    /// short enough that a client which serializes its waiters fails
+    /// the test instead of hanging the suite.
+    const CONCURRENT_DEADLINE: Duration = Duration::from_secs(5);
 
     #[test]
     fn sequential_empty_invocations_do_not_stall() {
@@ -1868,6 +1978,215 @@ mod tests {
                     .await
                     .unwrap_or_else(|error| panic!("blocked pump task panicked: {error}"))
                     .unwrap_or_else(|error| panic!("blocked pump failed: {error}"));
+            });
+    }
+
+    /// Two invocations held open at once must both complete.
+    ///
+    /// One caller reads the connection while the other waits, so the
+    /// reader routes the waiter's answer as it goes. A client whose
+    /// waiters take turns at the transport files that answer and then
+    /// parks the waiter in `read_frame` for a frame the guest has
+    /// already sent, and neither call ever finishes.
+    #[test]
+    fn concurrently_held_invocations_both_complete() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap_or_else(|error| panic!("failed to build test runtime: {error}"))
+            .block_on(async {
+                let (host, peer) = tokio::io::duplex(4096);
+                let (host_read, host_write) = tokio::io::split(host);
+                let server = Server::new(host_read.compat(), host_write.compat_write());
+                let (peer_read, peer_write) = tokio::io::split(peer);
+                let client = Client::new(peer_read.compat(), peer_write.compat_write());
+                let release = std::sync::Arc::new(Notify::new());
+
+                let mut slow_calls = server
+                    .serve("transport:test", "slow")
+                    .unwrap_or_else(|error| panic!("failed to register slow handler: {error}"));
+                let slow_release = release.clone();
+                let slow_task =
+                    tokio::spawn(async move {
+                        let (_, mut outgoing, mut incoming) = slow_calls
+                            .next()
+                            .await
+                            .unwrap_or_else(|| panic!("slow invocation stream ended early"))
+                            .unwrap_or_else(|error| {
+                                panic!("failed to accept slow invocation: {error}")
+                            });
+                        let mut request = Vec::new();
+                        incoming
+                            .read_to_end(&mut request)
+                            .await
+                            .unwrap_or_else(|error| panic!("failed to read slow request: {error}"));
+                        // The guest holds this call open while it answers
+                        // the other one, which is the whole point: the host
+                        // must be able to use the connection meanwhile.
+                        slow_release.notified().await;
+                        outgoing.write_all(b"slow").await.unwrap_or_else(|error| {
+                            panic!("failed to write slow response: {error}")
+                        });
+                        outgoing.shutdown().await.unwrap_or_else(|error| {
+                            panic!("failed to close slow response: {error}")
+                        });
+                    });
+
+                let mut probe_calls = server
+                    .serve("transport:test", "probe")
+                    .unwrap_or_else(|error| panic!("failed to register probe handler: {error}"));
+                let probe_task = tokio::spawn(async move {
+                    let (_, mut outgoing, mut incoming) = probe_calls
+                        .next()
+                        .await
+                        .unwrap_or_else(|| panic!("probe invocation stream ended early"))
+                        .unwrap_or_else(|error| {
+                            panic!("failed to accept probe invocation: {error}")
+                        });
+                    let mut request = Vec::new();
+                    incoming
+                        .read_to_end(&mut request)
+                        .await
+                        .unwrap_or_else(|error| panic!("failed to read probe request: {error}"));
+                    outgoing
+                        .write_all(b"pong")
+                        .await
+                        .unwrap_or_else(|error| panic!("failed to write probe response: {error}"));
+                    outgoing
+                        .shutdown()
+                        .await
+                        .unwrap_or_else(|error| panic!("failed to close probe response: {error}"));
+                });
+
+                let (mut slow_outgoing, mut slow_incoming) = client
+                    .open_invocation("transport:test", "slow", Bytes::new())
+                    .await
+                    .unwrap_or_else(|error| panic!("failed to open slow invocation: {error}"));
+                slow_outgoing.shutdown().await.unwrap_or_else(|error| {
+                    panic!("failed to close slow request channel: {error}")
+                });
+
+                let held = async {
+                    let mut response = Vec::new();
+                    slow_incoming
+                        .read_to_end(&mut response)
+                        .await
+                        .unwrap_or_else(|error| panic!("failed to read slow response: {error}"));
+                    assert_eq!(response, b"slow");
+                };
+                let concurrent = async {
+                    let answer = timeout(
+                        CONCURRENT_DEADLINE,
+                        client.invoke_raw("transport:test", "probe", Vec::new()),
+                    )
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!(
+                            "the second invocation went unanswered for {CONCURRENT_DEADLINE:?} \
+                             while the first was held open"
+                        )
+                    })
+                    .unwrap_or_else(|error| panic!("probe invocation failed: {error}"));
+                    assert_eq!(answer, b"pong");
+                    release.notify_one();
+                };
+                join(held, concurrent).await;
+
+                slow_task
+                    .await
+                    .unwrap_or_else(|error| panic!("slow server task panicked: {error}"));
+                probe_task
+                    .await
+                    .unwrap_or_else(|error| panic!("probe server task panicked: {error}"));
+            });
+    }
+
+    /// An answer filed before its caller waits for it must reach it.
+    ///
+    /// The whole of one invocation's answer — accept, payload and
+    /// close — is routed by the caller that holds the read half, the
+    /// payload and close while nobody is waiting on them at all. The
+    /// wire is empty by the time that caller reads its own response, so
+    /// it completes only if it is delivered what was filed for it
+    /// rather than sent back to the transport for a frame that will
+    /// never arrive.
+    #[test]
+    fn an_answer_filed_while_its_caller_parks_is_delivered() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap_or_else(|error| panic!("failed to build test runtime: {error}"))
+            .block_on(async {
+                let (guest, peer) = tokio::io::duplex(4096);
+                let (guest_read, guest_write) = tokio::io::split(guest);
+                let mut guest_read = guest_read.compat();
+                let mut guest_write = guest_write.compat_write();
+                let (peer_read, peer_write) = tokio::io::split(peer);
+                let client = Client::new(peer_read.compat(), peer_write.compat_write());
+
+                // The first caller takes the reader role and parks in
+                // the transport; the second is left a pure waiter.
+                let mut reader =
+                    Box::pin(client.open_invocation("transport:test", "reader", Bytes::new()));
+                assert!(
+                    poll_once(&mut reader).await.is_none(),
+                    "the first caller must park until the guest answers it"
+                );
+                let mut waiter =
+                    Box::pin(client.open_invocation("transport:test", "waiter", Bytes::new()));
+                assert!(
+                    poll_once(&mut waiter).await.is_none(),
+                    "the second caller must park until the guest answers it"
+                );
+
+                for expected in ["reader", "waiter"] {
+                    match super::read_frame(&mut guest_read)
+                        .await
+                        .unwrap_or_else(|error| {
+                            panic!("failed to read the {expected} open frame: {error}")
+                        }) {
+                        Some(super::Frame::Open { func, .. }) => assert_eq!(func, expected),
+                        other => panic!("unexpected {expected} open frame: {other:?}"),
+                    }
+                }
+
+                for frame in [
+                    super::Frame::Accept { invocation: 2 },
+                    super::Frame::Data {
+                        invocation: 2,
+                        path: Vec::new(),
+                        payload: b"answered".to_vec(),
+                    },
+                    super::Frame::Close {
+                        invocation: 2,
+                        path: Vec::new(),
+                    },
+                    super::Frame::Accept { invocation: 1 },
+                ] {
+                    super::write_frame(&mut guest_write, &frame)
+                        .await
+                        .unwrap_or_else(|error| panic!("failed to write {frame:?}: {error}"));
+                }
+
+                let (reading, parked) = timeout(CONCURRENT_DEADLINE, join(reader, waiter))
+                    .await
+                    .unwrap_or_else(|_| panic!("a caller never saw the accept filed for it"));
+                let (_reader_outgoing, _reader_incoming) = reading
+                    .unwrap_or_else(|error| panic!("the reading invocation failed: {error}"));
+                let (_waiter_outgoing, mut waiter_incoming) =
+                    parked.unwrap_or_else(|error| panic!("the parked invocation failed: {error}"));
+
+                // Nothing is left on the wire, so this response can
+                // only come from what was filed while nobody waited.
+                let mut response = Vec::new();
+                timeout(
+                    CONCURRENT_DEADLINE,
+                    waiter_incoming.read_to_end(&mut response),
+                )
+                .await
+                .unwrap_or_else(|_| panic!("the parked caller never saw the payload filed for it"))
+                .unwrap_or_else(|error| panic!("failed to read the parked response: {error}"));
+                assert_eq!(response, b"answered");
             });
     }
 }
