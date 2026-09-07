@@ -392,6 +392,15 @@ The `bench-x86-64-linux` lane of `ci.yml` is unchanged except that the
 inspector now writes the host CPU model into the `run` record it emits,
 so a comparison between two of its runs can tell one machine from two.
 
+For TCP reconnect diagnosis, a dispatch can explicitly set `tcp_probe=true`
+and supply `baseline_ref`. That mode captures two iterations of
+`tcp-throughput` on each image with `--net-queues 1`, as required by QEMU's
+packet filter. Packet captures and raw logs are retained in the runtime
+artifact; the diagnostic report is named `tcp-probe-<lane>`. It is always
+non-publishable and does not run the performance gate or PGO experiment.
+It is not acceptance evidence: normal multi-queue acceptance still runs
+the full workload set and its configured warm series.
+
 ## Reproducing a published number
 
 ```bash

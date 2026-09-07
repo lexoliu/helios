@@ -10,9 +10,14 @@ from helios_bench.manifest import REPO_ROOT
 
 
 @pytest.fixture
-def jobs():
-    workflow = REPO_ROOT / ".github/workflows/bench-suite.yml"
-    return yaml.safe_load(workflow.read_text())["jobs"]
+def workflow():
+    path = REPO_ROOT / ".github/workflows/bench-suite.yml"
+    return yaml.load(path.read_text(), Loader=yaml.BaseLoader)
+
+
+@pytest.fixture
+def jobs(workflow):
+    return workflow["jobs"]
 
 
 @pytest.mark.parametrize(
@@ -46,16 +51,14 @@ def test_workflow_mode(jobs, tmp_path, event, requested, baseline, advisory, pai
     }
 
 
-@pytest.mark.parametrize("paired", ["true", "false"])
-def test_suite_preserves_workloads_and_pairing(jobs, tmp_path: Path, paired):
-    suite = next(step for step in jobs["suite"]["steps"] if step.get("name") == "Run the suite")
+def run_arguments(script: str, tmp_path: Path, paired: str, baseline: str = "baseline") -> list[str]:
     expressions = {
         "matrix.lane": "x86-64-kvm",
         "runner.name": "test-runner",
         "inputs.iterations": "11",
         "matrix.net-backend": "user",
     }
-    script = re.sub(r"\$\{\{(.*?)\}\}", lambda match: expressions[match[1].strip()], suite["run"])
+    script = re.sub(r"\$\{\{(.*?)\}\}", lambda match: expressions[match[1].strip()], script)
     invocation = 'uv run helios-bench "${args[@]}"'
     assert script.count(invocation) == 1
     script = script.replace(invocation, 'printf "%s\\n" "${args[@]}"')
@@ -68,11 +71,18 @@ def test_suite_preserves_workloads_and_pairing(jobs, tmp_path: Path, paired):
         | {
             "GITHUB_WORKSPACE": str(tmp_path),
             "BENCH_ADVISORY": "true",
-            "BENCH_BASELINE_REF": "baseline",
+            "BENCH_BASELINE_REF": baseline,
             "BENCH_PAIRED_ACCEPTANCE": paired,
         },
     )
-    arguments = result.stdout.splitlines()
+    return result.stdout.splitlines()
+
+
+@pytest.mark.parametrize("paired", ["true", "false"])
+def test_suite_preserves_workloads_and_pairing(jobs, tmp_path: Path, paired):
+    suite = next(step for step in jobs["suite"]["steps"] if step.get("name") == "Run the suite")
+    assert suite["if"] == "${{ !inputs.tcp_probe }}"
+    arguments = run_arguments(suite["run"], tmp_path, paired)
     assert arguments[arguments.index("--baseline-ref") + 1] == "baseline"
     assert arguments[arguments.index("--iterations") + 1] == "11"
     assert "--workload" not in arguments
@@ -99,4 +109,33 @@ def test_keep_going_preserves_failed_workload_logs(jobs):
         if step.get("name") == "Upload the inspector runtime directory"
     )
     assert upload["if"] == "always()"
-    assert upload["with"]["path"] == "bench-runtime/**/*.log"
+    assert "bench-runtime/**/*.log" in upload["with"]["path"].splitlines()
+
+
+def test_tcp_probe_is_opt_in_and_not_acceptance(workflow, jobs, tmp_path):
+    assert workflow["on"]["workflow_dispatch"]["inputs"]["tcp_probe"]["default"] == "false"
+    probe = next(step for step in jobs["suite"]["steps"] if step.get("name") == "Run TCP reconnect probe")
+    assert probe["if"] == "inputs.tcp_probe"
+    assert probe["env"]["HELIOS_WORKLOAD_BENCH_NET_PCAP"] == "1"
+    assert "!inputs.tcp_probe" in jobs["gate"]["if"]
+    assert "!inputs.tcp_probe" in jobs["profile-generate"]["if"]
+    arguments = run_arguments(probe["run"], tmp_path, "true")
+    assert arguments[arguments.index("--workload") + 1] == "tcp-throughput"
+    assert arguments[arguments.index("--iterations") + 1] == "2"
+    assert arguments[arguments.index("--net-queues") + 1] == "1"
+    assert arguments[arguments.index("--baseline-ref") + 1] == "baseline"
+    assert arguments[arguments.index("--sides") + 1] == "helios,helios_baseline"
+    assert "--advisory" in arguments
+    upload = next(
+        step
+        for step in jobs["suite"]["steps"]
+        if step.get("name") == "Upload the inspector runtime directory"
+    )
+    assert "bench-runtime/**/*.pcap" in upload["with"]["path"].splitlines()
+
+
+def test_tcp_probe_requires_a_baseline(jobs, tmp_path):
+    probe = next(step for step in jobs["suite"]["steps"] if step.get("name") == "Run TCP reconnect probe")
+    with pytest.raises(subprocess.CalledProcessError) as error:
+        run_arguments(probe["run"], tmp_path, "true", baseline="")
+    assert "tcp_probe requires baseline_ref" in error.value.stdout
