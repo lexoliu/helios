@@ -162,6 +162,13 @@ fn build_engine_config(target: &str, hint: AotCompileHint, worker_count: usize) 
     config.gc_support(true);
     config.wasm_reference_types(true);
     config.wasm_function_references(true);
+    // The only profile channel Cranelift has. With this off the
+    // `metadata.code.branch_hint` section a module carries is skipped and
+    // the unlikely successor of a hinted branch is laid out inline like
+    // every other; with it on, `code_translator.rs` marks that successor
+    // cold and the block-order pass moves it out of line. A module without
+    // the section is unaffected, so it is on for every compile.
+    config.wasm_branch_hinting(true);
     config.concurrency_support(true);
     config.parallel_compilation(worker_count > 1);
     config.epoch_interruption(true);

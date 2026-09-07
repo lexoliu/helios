@@ -362,24 +362,143 @@ Checked in the vendored tree (`cranelift/codegen`, `cranelift/frontend`,
   profilers; it consumes nothing.
 - The only feedback channel that exists is the wasm **branch hinting**
   proposal: `crates/cranelift/src/translate/code_translator.rs` marks the
-  unlikely successor of a hinted `if` cold (`builder.set_cold_block`) and
-  the block-order pass moves cold blocks out of line
-  (`cranelift/codegen/src/machinst/blockorder.rs`).
+  unlikely successor of a hinted `if` or `br_if` cold
+  (`builder.set_cold_block`) and the block-order pass moves cold blocks out
+  of line (`cranelift/codegen/src/machinst/blockorder.rs`).
 
-So the feedback the compiler plugin can consume today is a
-`metadata.code.branch_hint` custom section in the input wasm. Producing
-it from the suite means instrumenting a wasm module for branch counts,
-running it on Helios under the suite, and writing the hints back into the
-module before the plugin compiles it. Neither the instrumentation nor the
-writer exists in this repository or in the vendored Wasmtime; Binaryen's
-branch-hint passes are the natural producer, and Binaryen is not a
-dependency of this repository. Any wasm shipped with hints must be
-re-hinted whenever it is rebuilt, which ties the compute-parity artifacts
-(CPython, QuickJS) to a hinting step in `tools/wasi-apps/build.sh`.
+So the feedback the compiler plugin can consume is a
+`metadata.code.branch_hint` custom section in the input wasm, and the
+producer is this repository's own: `tools/branch-hints`
+(`helios-branch-hints`), three subcommands that close the loop from a real
+run back into the artifact. Binaryen has branch-hint passes and would have
+been the other candidate; it is not a dependency of this repository, and
+the counting side — running the instrumented module *on Helios* and getting
+its counters back — is Helios-specific either way.
 
-Verdict: the channel is real and cheap to consume (Cranelift already
-does), but the producer is a new tool chain step and its effect on
-Cranelift's output is limited to block layout. Not implemented.
+`helios-compiler-support` turns the channel on with
+`Config::wasm_branch_hinting(true)`. Wasmtime defaults it off
+(`Tunables::branch_hinting`), so before that line every hint in every
+module was parsed by nothing. It is on for every compile, hinted module or
+not: a module without the section is unaffected, and the flag is not part
+of the `cwasm` compatibility check.
+
+### The loop
+
+```bash
+# 1. count what a real run does, on Helios, one boot per workload
+tools/wasi-apps/collect-branch-profiles.py --arch x86-64 --accel kvm
+
+# 2. rebuild; build.sh writes the recorded hints back in
+tools/wasi-apps/build.sh
+```
+
+**Instrument.** `helios-branch-hints instrument` rewrites a module so every
+`if` and `br_if` bumps one of a taken/not-taken pair of 64-bit counters,
+and writes a site map from counter index back to the *original* module's
+`(function, offset)` — the pair the proposal addresses a hint by, counted
+from the start of the function body, which is what
+`FuncEnvironment::take_branch_hint` subtracts. The rewrite splices bytes:
+no function is renumbered, and every section the tool has no opinion about
+survives byte for byte.
+
+Three decisions the rewrite makes, and why:
+
+| Decision | Why |
+| --- | --- |
+| The counters live in the module's own memory 0, in pages carved out by raising the memory's *minimum* size | A wasi host function reads iovecs from the default memory and nowhere else, so the dump has to write through memory 0; the kernel's pooling allocator gives an instance one memory; a global per site would put hundreds of kilobytes into the instance's vmctx and past `max_core_instance_size`. wasi-libc takes every heap byte from `memory.grow`, which starts above the minimum, so the reserved pages are never handed to the program. |
+| The probe is `local.set`, one call, `local.get`, and the counter address is computed with arithmetic rather than a branch | The probe must not itself change the branch behaviour being measured, and a branchless address keeps the instrumented module's own layout out of the counts. |
+| Both of a program's exits are covered: the `_start` export is repointed at a wrapper that dumps after it returns, and every `call` to the `proc_exit` import is rerouted through a wrapper that dumps first | wasi-libc's `_start` returns on success and calls `proc_exit` on failure, and a program that calls `exit()` from inside `main` never returns at all. Missing either exit loses the whole profile. |
+
+**Record.** The counters come back on the program's own stdout, framed by
+`!helios-branch-profile-1` and `!helios-branch-profile-end` markers so the
+surrounding console traffic is not mistaken for counts and a guest that
+died mid-dump is rejected rather than half-read. That channel already
+exists: `helios-inspector vm … shell -c` runs a command in the guest and
+brings its output back. The LLVM raw-profile export of (a) was the
+alternative and does not fit: it carries the *kernel's*
+`-C profile-generate` counters out of a kernel built for it, and has no way
+to describe a counter array belonging to a user-mode wasm instance, so a
+branch profile would need a second export and a second instrumented build.
+
+`helios-branch-hints record` sums one or more captured runs against the
+site map into a profile under `tools/wasi-apps/branch-profiles/`. A
+profile has to be committed for a rebuilt artifact to keep its hints — CI
+rebuilds the artifacts from `build.sh` on a cache miss and `artifacts/` is
+not in the repository — and **none is committed today**, for the reason
+under "What it is worth" below. Sites executed fewer than
+`MIN_OBSERVATIONS` times are dropped when a profile is written: they can
+never produce a hint, and keeping them makes the file an order of
+magnitude larger for no decision.
+
+**Hint.** `helios-branch-hints hint` writes the section into the original,
+uninstrumented module, immediately before the code section, and
+`tools/wasi-apps/build.sh` calls it for every staged artifact a profile
+exists for, naming the artifact and the profile in the build log. Two
+constants decide what gets a hint, both in `tools/branch-hints/src/lib.rs`
+with their reasoning:
+
+| Constant | Value | Why |
+| --- | --- | --- |
+| `MIN_OBSERVATIONS` | 1000 | A hint moves the unlikely successor out of line, so one taken from three executions can cost every later execution an extra jump for a bias that was never measured. A thousand executions puts the binomial 95% interval of an observed 90/10 split inside ±2 points. |
+| `HINT_RATIO` | 0.90 | Cranelift's whole response is layout. At 90% the cost is bounded by one extra jump on a tenth of the executions, against contiguous layout on the other nine tenths. Cranelift has no way to express "slightly", so a merely-probable hint is worse than none. |
+
+A profile is only applicable to the build it was recorded from, and two
+checks say so before a byte is written: the sha256 of the code section
+(the bytes a recorded offset indexes into, and nothing else, so a rebuild
+that only reorders custom sections still matches), and, per site, that the
+module really has an `if` or a `br_if` at that offset. Either failing
+fails the build, because a hint written from a stale offset is a silently
+wrong compilation.
+
+### What it is worth
+
+The hints change block layout and nothing else, so the measurement is the
+compute-parity workloads on the `x86-64-kvm` bench lane (§3.6), hinted
+artifacts against unhinted ones. Two `bench-suite` dispatches on the same
+host CPU model, both advisory on the shared runner: unhinted
+[34005864567](https://github.com/lexoliu/helios/actions/runs/34005864567)
+against hinted
+[34005865823](https://github.com/lexoliu/helios/actions/runs/34005865823),
+AMD EPYC 7763, 4 vCPUs, KVM.
+
+The hinted side carried the profiles the loop recorded on Helios:
+`qjs.wasm`, 22,313 branch sites, 54 above the observation floor, 36
+hinted; `python3.wasm`, 126,615 sites, 2,404 above the floor, 1,777
+hinted, from `cpython-json` and `cpython-regex` summed. Helios warm
+medians in ms, with the bootstrap 95% interval of the median:
+
+| Workload | branch hints | unhinted ms | hinted ms | ratio | verdict |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `quickjs-loop` | 36 | 45 [42, 48] | 40 [39, 41] | 0.889x | within noise |
+| `cpython-json` | 1,777 | 325 [322, 331] | 312 [309, 317] | 0.958x | within noise |
+| `cpython-regex` | 1,777 | 467 [466, 472] | 450 [446, 456] | 0.965x | within noise |
+| `aot-curl` | 0 | 458 [436, 464] | 436 [431, 456] | 0.954x | within noise |
+| `wasm-simd-lanes` | 0 | 13 [10, 13] | 13 [12.5, 13.5] | 1.000x | within noise |
+
+`cpython-json` and `cpython-regex` run the same hinted module and so share
+its hint count.
+
+Noise floor 14.1%, from the control workload before and after the suite.
+
+The two CPython rows have disjoint intervals and moved 3.5% and 4.2%. So
+did `aot-curl`, by 4.6% — and `aot-curl` carries no hints at all, because
+it times the compiler rather than the compiled code. A change that moved
+the hinted workloads and the unhinted control by the same few percent
+moved the machine, not the layout: on this lane the effect of the hints is
+smaller than what separates two runs of the same code.
+
+So the tooling is what lands. The artifacts ship **unhinted**: no profile
+is committed, `build.sh` finds none, and every artifact is byte for byte
+what it was. Re-recording one is a single command, and what would make the
+question answerable is a lane that can resolve a few percent — the
+dedicated runner of docs/benchmarks.md — rather than a different producer.
+
+The paired mode `--baseline-ref` added in #178 is not the instrument for
+this: it shares `artifacts/` and the `helios-cli` that compiles them
+between the two columns and varies only the kernel image, so both columns
+would carry the same hinted wasm. Pairing an artifact-level change needs
+the baseline checkout to stage its own artifacts, which it deliberately
+does not.
 
 ## Issues filed
 
@@ -388,6 +507,8 @@ Cranelift's output is limited to block layout. Not implemented.
   Implemented; described above.
 - #71: branch-hint feedback for the compiler plugin: instrumenting the
   suite's wasm inputs, writing `metadata.code.branch_hint`, and re-hinting
-  in `build.sh`.
+  in `build.sh`. The producer is implemented and described above; the
+  artifacts ship unhinted, because the effect is below what the lane can
+  resolve.
 - #211: `-C profile-use` for the kernel, the `profile-use` build kind and
   the paired `suite-pgo` job. Implemented; described above.

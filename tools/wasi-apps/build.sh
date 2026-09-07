@@ -10,6 +10,9 @@
 #   benchmark-suite workload programs from source.
 # - Stages standard Wasmer WASIX shell/coreutils artifacts and builds QuickJS
 #   with wasm SIMD enabled for the boot filesystem.
+# - Writes the recorded branch hints back into every artifact a profile
+#   exists for, so a rebuilt artifact keeps the hints the compiler plugin
+#   reads (docs/pgo.md section (b)).
 #
 # Network-gated: the CPython download needs internet; pass a pre-staged
 # zip via `CPYTHON_WASI_ZIP=<path>` to skip the curl step. Wasmer
@@ -52,8 +55,32 @@ coreutils_package="${COREUTILS_PACKAGE:-wasmer/coreutils}"
 coreutils_version="${COREUTILS_VERSION:-1.0.19}"
 coreutils_webc_url="${COREUTILS_WEBC_URL:-https://cdn.wasmer.io/webcimages/6b2fd4494bd198f60859987608a7633f807a05147e4d8398ec061639d047ce75.webc}"
 
+branch_profiles="${BRANCH_PROFILE_DIR:-$repo_root/tools/wasi-apps/branch-profiles}"
+
 staging="$(mktemp -d)"
 trap 'rm -rf "$staging"' EXIT
+
+# Writes the recorded branch hints into a staged artifact, when a profile
+# for it exists. A profile that does not match the module it names is a
+# hard failure: the offsets it carries index a code section that has
+# changed, and a hint written from one of them would be a silently wrong
+# compilation. Re-record with tools/wasi-apps/collect-branch-profiles.py.
+branch_hints_bin=""
+apply_branch_hints() {
+  local name="$1"
+  local module="$2"
+  local profile="$branch_profiles/$name.json"
+  if [[ ! -f "$profile" ]]; then
+    return 0
+  fi
+  if [[ -z "$branch_hints_bin" ]]; then
+    cargo build --release --manifest-path "$repo_root/Cargo.toml" -p helios-branch-hints
+    branch_hints_bin="$repo_root/target/release/helios-branch-hints"
+  fi
+  "$branch_hints_bin" hint --input "$module" --profile "$profile" --output "$module.hinted"
+  mv -f "$module.hinted" "$module"
+  wasm-tools validate "$module"
+}
 
 verify_wasm_uses_simd() {
   local path="$1"
@@ -177,6 +204,7 @@ wasm-tools component new \
   --adapt "$adapter_path" \
   -o "$python_component_raw"
 wasm-tools strip "$python_component_raw" -o "$python_root/python3.wasm"
+apply_branch_hints python3 "$python_root/python3.wasm"
 
 cp -r "$staging/cpython/lib" "$python_root/"
 
@@ -213,6 +241,7 @@ else
 fi
 wasm-tools validate "$quickjs_root/qjs.wasm"
 verify_wasm_uses_simd "$quickjs_root/qjs.wasm"
+apply_branch_hints quickjs "$quickjs_root/qjs.wasm"
 
 echo "QuickJS installed at: $quickjs_root/qjs.wasm"
 ls -lh "$quickjs_root/qjs.wasm"
@@ -267,6 +296,10 @@ build_wasi_tool() {
     "$repo_root/tools/wasi-apps/$crate/target/$target/release/$artifact.wasm" \
     "$out_dir/$name.wasm"
   wasm-tools strip "$out_dir/$name.wasm" -o "$out_dir/$name-stripped.wasm"
+  # After the strip, which drops every custom section the hints would
+  # otherwise ride in.
+  apply_branch_hints "$name" "$out_dir/$name.wasm"
+  apply_branch_hints "$name" "$out_dir/$name-stripped.wasm"
 }
 
 build_wasi_tool curl helios_curl_wasi wasm32-wasip2 curl
