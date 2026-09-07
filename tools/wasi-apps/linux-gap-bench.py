@@ -15,10 +15,13 @@ import sys
 import threading
 import time
 import tomllib
+from collections.abc import Iterator
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
 import linux_workload_runner as runner
+from owned_tcp_server import OwnedTCPServer
 from fedora_qemu_baseline import (
     DEFAULT_DISK_SIZE,
     DEFAULT_MEMORY,
@@ -384,7 +387,7 @@ def format_load(value: float | None) -> str:
 
 def start_host_http(root: Path) -> tuple[socketserver.TCPServer, int]:
     handler = lambda *args, **kwargs: QuietHttpHandler(*args, directory=str(root), **kwargs)
-    server = socketserver.TCPServer((HOST_SERVER_BIND_ADDRESS, 0), handler)
+    server = OwnedTCPServer((HOST_SERVER_BIND_ADDRESS, 0), handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return server, int(server.server_address[1])
@@ -412,6 +415,55 @@ def write_http_payloads(root: Path) -> None:
             chunk = HTTP_LARGE_PAYLOAD_CHUNK[: min(remaining, len(HTTP_LARGE_PAYLOAD_CHUNK))]
             handle.write(chunk)
             remaining -= len(chunk)
+
+
+@dataclass(frozen=True)
+class HostEndpoints:
+    http_url: str | None = None
+    local_http_url: str | None = None
+    tcp_host: str | None = None
+    tcp_port: int | None = None
+    tcp_echo_port: int | None = None
+
+
+@dataclass(frozen=True)
+class HostServices:
+    http_root: Path
+    http_host: str
+    tcp_host: str
+    http: bool = False
+    tcp: bool = False
+    tcp_echo: bool = False
+
+    @contextmanager
+    def serve(self) -> Iterator[HostEndpoints]:
+        with ExitStack() as cleanup:
+
+            def retain(started: tuple[socketserver.BaseServer, int]) -> int:
+                server, port = started
+                cleanup.callback(server.server_close)
+                cleanup.callback(server.shutdown)
+                return port
+
+            http_url = None
+            local_http_url = None
+            if self.http:
+                port = retain(start_host_http(self.http_root))
+                http_url = f"http://{self.http_host}:{port}/{HTTP_PAYLOAD_FILE}"
+                local_http_url = f"http://127.0.0.1:{port}/{HTTP_PAYLOAD_FILE}"
+            tcp_port = None
+            if self.tcp:
+                tcp_port = retain(
+                    start_tcp_throughput_server(HOST_SERVER_BIND_ADDRESS, 0, HTTP_LARGE_PAYLOAD_BYTES)
+                )
+            echo_port = retain(start_host_tcp_echo()) if self.tcp_echo else None
+            yield HostEndpoints(
+                http_url=http_url,
+                local_http_url=local_http_url,
+                tcp_host=self.tcp_host if self.tcp or self.tcp_echo else None,
+                tcp_port=tcp_port,
+                tcp_echo_port=echo_port,
+            )
 
 
 @dataclass(frozen=True)
@@ -618,16 +670,14 @@ def run_helios(
     workloads: list[dict],
     arch: str,
     accel: str | None,
-    host_http_url: str | None,
-    host_tcp_host: str | None,
-    host_tcp_port: int | None,
-    host_tcp_echo_port: int | None,
+    host_services: HostServices,
     timeout_seconds: int,
     side_timeout_seconds: int,
     build_timeout_seconds: int,
     skip_build: bool,
     control_workload: dict | None,
     keep_going: bool,
+    shared_endpoints: HostEndpoints | None = None,
 ) -> Path:
     paired = len(images) > 1
     units = helios_units(workloads, paired)
@@ -672,6 +722,27 @@ def run_helios(
         boots_left -= 1
         return budget
 
+    def run_boot(image: HeliosImage, log: Path, classes: list[str], names: list[str], budget: int) -> None:
+        scope = nullcontext(shared_endpoints) if shared_endpoints is not None else host_services.serve()
+        with scope as endpoints:
+            run_helios_once(
+                image,
+                manifest,
+                log,
+                iterations,
+                classes,
+                names,
+                arch,
+                accel,
+                endpoints.http_url,
+                endpoints.tcp_host,
+                endpoints.tcp_port,
+                endpoints.tcp_echo_port,
+                timeout_seconds=budget,
+                keep_going=keep_going,
+                paired=paired,
+            )
+
     def run_control(moment: str) -> None:
         # The control workload measures the machine, not Helios: the same
         # program before and after the suite bounds how much the host
@@ -681,23 +752,7 @@ def run_helios(
         if control_workload is None:
             return
         for image in images:
-            run_helios_once(
-                image,
-                manifest,
-                image.control_log(moment),
-                iterations,
-                [],
-                [control_workload["name"]],
-                arch,
-                accel,
-                host_http_url,
-                host_tcp_host,
-                host_tcp_port,
-                host_tcp_echo_port,
-                timeout_seconds=next_budget(),
-                keep_going=keep_going,
-                paired=paired,
-            )
+            run_boot(image, image.control_log(moment), [], [control_workload["name"]], next_budget())
 
     try:
         run_control("before")
@@ -722,23 +777,7 @@ def run_helios(
                     raise HeliosRunFailed(
                         "the Helios side's budget was spent before this boot could run"
                     )
-                run_helios_once(
-                    image,
-                    manifest,
-                    log,
-                    iterations,
-                    unit.classes,
-                    unit.names,
-                    arch,
-                    accel,
-                    host_http_url,
-                    host_tcp_host,
-                    host_tcp_port,
-                    host_tcp_echo_port,
-                    timeout_seconds=budget,
-                    keep_going=keep_going,
-                    paired=paired,
-                )
+                run_boot(image, log, unit.classes, unit.names, budget)
                 measured[image.name] += 1
             except HeliosRunFailed as error:
                 if not keep_going:
@@ -2067,6 +2106,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="record a workload that fails and continue with the next one, on every side",
     )
+    parser.add_argument(
+        "--reuse-host-listeners",
+        action="store_true",
+        help="reuse peer connection state across guest boots for reconnect diagnosis, not performance acceptance",
+    )
     parser.add_argument("--skip-helios", action="store_true")
     parser.add_argument("--skip-linux", action="store_true")
     parser.add_argument("--wasmtime-profile-workload", action="append", default=[])
@@ -2251,32 +2295,16 @@ def main() -> None:
     needs_http = any(workload.get("requires_host_http", False) for workload in workloads + profile_workloads)
     needs_tcp = any(workload.get("requires_host_tcp", False) for workload in workloads)
     needs_tcp_echo = any(workload.get("requires_host_tcp_echo", False) for workload in workloads)
-    server = None
-    tcp_server = None
-    tcp_echo_server = None
-    host_http_url = None
-    local_http_url = None
-    host_tcp_host = None
-    host_tcp_port = None
-    host_tcp_echo_port = None
-    if needs_http:
-        server, port = start_host_http(http_root)
-        host_http_url = f"http://{args.helios_host_http_host}:{port}/{HTTP_PAYLOAD_FILE}"
-        local_http_url = f"http://127.0.0.1:{port}/{HTTP_PAYLOAD_FILE}"
-    if needs_tcp and (not args.skip_helios or not args.skip_linux):
-        tcp_server, port = start_tcp_throughput_server(
-            HOST_SERVER_BIND_ADDRESS, 0, HTTP_LARGE_PAYLOAD_BYTES
-        )
-        host_tcp_host = args.helios_host_tcp_host
-        host_tcp_port = port
-    if needs_tcp_echo and (not args.skip_helios or not args.skip_linux):
-        tcp_echo_server, port = start_host_tcp_echo()
-        host_tcp_host = args.helios_host_tcp_host
-        host_tcp_echo_port = port
-    linux_tcp_port = host_tcp_port if needs_tcp and not args.skip_linux else None
-    linux_tcp_echo_port = host_tcp_echo_port if needs_tcp_echo and not args.skip_linux else None
+    services = HostServices(
+        http_root=http_root,
+        http_host=args.helios_host_http_host,
+        tcp_host=args.helios_host_tcp_host,
+        http=needs_http,
+        tcp=needs_tcp and (not args.skip_helios or not args.skip_linux),
+        tcp_echo=needs_tcp_echo and (not args.skip_helios or not args.skip_linux),
+    )
 
-    try:
+    with services.serve() as endpoints:
         helios_jsonl = None
         linux_json = None
         wasmtime_linux_json = None
@@ -2316,16 +2344,14 @@ def main() -> None:
                 workloads,
                 args.arch,
                 args.helios_accel,
-                host_http_url,
-                host_tcp_host,
-                host_tcp_port,
-                host_tcp_echo_port,
+                services,
                 args.helios_timeout_seconds,
                 args.helios_side_timeout_seconds,
                 args.helios_build_timeout_seconds,
                 args.helios_skip_build,
                 control_workload,
                 args.keep_going,
+                shared_endpoints=endpoints if args.reuse_host_listeners else None,
             )
         if not args.skip_linux:
             linux_json, wasmtime_linux_json, linux_provenance = run_linux(
@@ -2342,10 +2368,10 @@ def main() -> None:
                 args.linux_vm_smp,
                 args.linux_vm_disk_size,
                 args.linux_vm_setup_timeout_seconds,
-                host_http_url,
-                host_tcp_host,
-                linux_tcp_port,
-                linux_tcp_echo_port,
+                endpoints.http_url,
+                endpoints.tcp_host,
+                endpoints.tcp_port,
+                endpoints.tcp_echo_port,
                 args.quickjs_source_archive,
                 args.wasmtime_linux_bin,
                 args.wasmtime_linux_archive,
@@ -2361,7 +2387,7 @@ def main() -> None:
                 out_dir,
                 args.wasmtime_profile_workload,
                 args.wasmtime_profile_mode,
-                local_http_url,
+                endpoints.local_http_url,
                 args.wasmtime_bin,
                 args.wasmtime_no_flamegraph,
                 args.wasmtime_profile_guest_interval,
@@ -2380,16 +2406,6 @@ def main() -> None:
             wasmtime_profiles,
         )
         print(report)
-    finally:
-        if server:
-            server.shutdown()
-            server.server_close()
-        if tcp_server:
-            tcp_server.shutdown()
-            tcp_server.server_close()
-        if tcp_echo_server:
-            tcp_echo_server.shutdown()
-            tcp_echo_server.server_close()
 
 
 if __name__ == "__main__":

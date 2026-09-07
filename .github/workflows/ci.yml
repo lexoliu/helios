@@ -265,6 +265,7 @@ jobs:
           # module, and the inspector refuses rather than falling back,
           # so a runner without it fails this step loudly.
           sudo modprobe vhost_vsock
+          sudo udevadm settle
           # udev creates the node root:kvm mode 0660 and the runner
           # account is not in that group, so QEMU's vhost backend cannot
           # open it. Hand the node to this account before asking for it.
