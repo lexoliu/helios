@@ -103,12 +103,23 @@ padding is an upper bound, not occupied memory, and `rlsf 0.2.3` does not
 expose a constant-time occupied-block-size query. Talc's counters avoid
 both that approximation and dependency on private header layouts.
 
-The user pool (`kernel/src/memory/user.rs`) and the kernel frame
-allocator (`kernel/src/memory/pmm.rs`) are still buddy heaps, each with
-a lock-free per-processor frame slab in front that keeps single-frame
-churn off the lock. Their multi-frame returns go to the same `dealloc`,
-so they carry the same walk on the same workloads; #248 and #249 track
-reading that off the bench lane on top of the new kernel heap.
+The user pool (`kernel/src/memory/user.rs`) remains a buddy heap with a
+per-processor frame slab absorbing single-frame churn. The x86-64 user
+VM returns individual frames through `deallocate_user_frame_on`, not
+multi-frame runs. Returns beyond the shard quota reach the buddy heap;
+an allocation that the heap cannot serve also drains cached frames back
+to it before retrying. The multi-frame pinned-run callers are in the
+aarch64 and riscv backends. Issue #248 tracks the measured cost of the
+actual x86-64 path, not an assumed multi-frame teardown path. Frame-slab
+ownership during concurrent pop and drain is a separate correctness
+repair tracked by #251.
+
+`KernelPhysFrameAllocator` (`kernel/src/memory/pmm.rs`) also contains a
+buddy heap and frame slab, but has no production allocation call path in
+the current tree. Its constructors are used by tests; x86 page-table
+allocation uses `DirectMappedFrameAllocator` and the global allocator.
+Issue #249 was closed as not planned after this call-path check, rather
+than attributing benchmark costs to an unused allocator.
 
 ## Why the split is not a fraction
 
