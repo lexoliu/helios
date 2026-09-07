@@ -496,6 +496,7 @@ jobs:
           done
           echo "no dev baseline with a bench-report-${{ matrix.lane }} artifact yet"
       - name: Compare
+        shell: bash
         if: hashFiles('candidate/report.json') != ''
         working-directory: tools/bench
         run: |

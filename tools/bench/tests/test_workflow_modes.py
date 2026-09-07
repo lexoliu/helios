@@ -165,6 +165,30 @@ def test_tcp_probe_requires_a_baseline(jobs, tmp_path):
     assert "tcp_probe requires baseline_ref" in error.value.stdout
 
 
+@pytest.mark.parametrize("gate_status", [0, 1, 2])
+def test_gate_pipeline_preserves_the_producer_exit_status(jobs, tmp_path, gate_status):
+    compare = next(step for step in jobs["gate"]["steps"] if step.get("name") == "Compare")
+    script = compare["run"].replace("uv sync --quiet", ":")
+    script = script.replace("${{ steps.baseline.outputs.run_id }}", "")
+    producer = 'uv run helios-bench "${args[@]}"'
+    assert script.count(producer) == 1
+    script = script.replace(producer, f'(printf "gate verdict\\n"; exit {gate_status})')
+    shell = (
+        ["bash", "--noprofile", "--norc", "-eo", "pipefail"]
+        if compare.get("shell") == "bash"
+        else ["bash", "-e"]
+    )
+    summary = tmp_path / "summary"
+    result = subprocess.run(
+        [*shell, "-c", script],
+        capture_output=True,
+        text=True,
+        env=os.environ | {"GITHUB_WORKSPACE": str(tmp_path), "GITHUB_STEP_SUMMARY": str(summary)},
+    )
+    assert summary.read_text() == "gate verdict\n"
+    assert result.returncode == gate_status
+
+
 def test_vsock_setup_waits_for_device_rules_before_setting_permissions():
     workflow = yaml.load((REPO_ROOT / ".github/workflows/ci.yml").read_text(), Loader=yaml.BaseLoader)
     steps = workflow["jobs"]["smoke-riscv64"]["steps"]
