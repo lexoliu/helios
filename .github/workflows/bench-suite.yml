@@ -245,6 +245,8 @@ jobs:
           path: |
             bench-runtime/**/*.log
             bench-runtime/**/*.pcap
+            helios/target/*-unknown-none*/release/helios
+            helios/target/perf-baselines/worktrees/*/helios/target/*-unknown-none*/release/helios
           if-no-files-found: warn
       - name: Remove the tap network backend
         if: always() && matrix.net-backend == 'tap'
