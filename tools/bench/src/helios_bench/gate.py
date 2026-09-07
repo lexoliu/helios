@@ -59,6 +59,7 @@ class GateResult:
     candidate_host: str
     noise_floor: float
     rows: list[GateRow]
+    incomplete_headlines: list[str]
     blocking: bool
     enforced: bool
 
@@ -167,6 +168,7 @@ def evaluate(baseline: Report, candidate: Report) -> GateResult:
         candidate_host=candidate.hardware.cpu,
         noise_floor=floor,
         rows=rows,
+        incomplete_headlines=[],
         blocking=enforced and any(row.regression and row.headline for row in rows),
         enforced=enforced,
     )
@@ -214,10 +216,13 @@ def evaluate_paired(candidate: Report) -> GateResult | None:
         )
     floor = noise_floor(candidate)
     pairs = []
+    incomplete_headlines = []
     for workload in candidate.workloads:
         base_cell = workload.cells.get(Side.HELIOS_BASELINE)
         cand_cell = workload.cells.get(Side.HELIOS)
         if not comparable(base_cell, cand_cell):
+            if workload.headline:
+                incomplete_headlines.append(workload.name)
             continue
         pairs.append((workload, base_cell, cand_cell))
     rows = gate_rows(pairs, floor)
@@ -242,7 +247,8 @@ def evaluate_paired(candidate: Report) -> GateResult | None:
         candidate_host=candidate.hardware.cpu,
         noise_floor=floor,
         rows=rows,
-        blocking=any(row.regression and row.headline for row in rows),
+        incomplete_headlines=incomplete_headlines,
+        blocking=bool(incomplete_headlines) or any(row.regression and row.headline for row in rows),
         enforced=True,
     )
 
