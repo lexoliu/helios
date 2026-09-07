@@ -86,6 +86,7 @@ def test_suite_preserves_workloads_and_pairing(jobs, tmp_path: Path, paired):
     assert arguments[arguments.index("--baseline-ref") + 1] == "baseline"
     assert arguments[arguments.index("--iterations") + 1] == "11"
     assert "--workload" not in arguments
+    assert "--reuse-host-listeners" not in arguments
     if paired == "true":
         assert arguments[arguments.index("--sides") + 1] == "helios,helios_baseline"
     else:
@@ -145,6 +146,7 @@ def test_tcp_probe_is_opt_in_and_not_acceptance(workflow, jobs, tmp_path):
     assert arguments[arguments.index("--workload") + 1] == "tcp-throughput"
     assert arguments[arguments.index("--iterations") + 1] == "2"
     assert arguments[arguments.index("--net-queues") + 1] == "1"
+    assert "--reuse-host-listeners" in arguments
     assert arguments[arguments.index("--baseline-ref") + 1] == "baseline"
     assert arguments[arguments.index("--sides") + 1] == "helios,helios_baseline"
     assert "--advisory" in arguments

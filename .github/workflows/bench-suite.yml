@@ -192,7 +192,7 @@ jobs:
           args=(run --lane "${{ matrix.lane }}" --out-dir "$GITHUB_WORKSPACE/bench-out/${{ matrix.lane }}"
                 --runner-label "${{ runner.name }}" --advisory --allow-busy-host
                 --sides "helios,helios_baseline" --baseline-ref "$BENCH_BASELINE_REF"
-                --workload tcp-throughput --iterations 2 --net-queues 1)
+                --workload tcp-throughput --iterations 2 --net-queues 1 --reuse-host-listeners)
           if [ "${{ matrix.net-backend }}" = tap ]; then
             args+=(--net-ifname "$HELIOS_NET_IFNAME" --net-bridge "$HELIOS_NET_BRIDGE")
           fi

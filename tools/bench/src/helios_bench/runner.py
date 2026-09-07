@@ -68,6 +68,7 @@ class NetworkOptions:
     ifname: str | None = None
     bridge: str | None = None
     queues: int | None = None
+    reuse_host_listeners: bool = False
 
 
 @dataclass(frozen=True)
@@ -167,6 +168,8 @@ def plan(options: RunOptions, manifest: Manifest, workloads: list[dict]) -> list
     ]
     if options.allow_busy_host:
         common.append("--allow-busy-host")
+    if options.network.reuse_host_listeners:
+        common.append("--reuse-host-listeners")
     for workload in workloads:
         common.extend(["--workload", workload["name"]])
     if Side.HELIOS in options.sides:
@@ -376,6 +379,10 @@ def read_controls(options: RunOptions, thresholds: Thresholds) -> dict[Side, tup
 def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) -> Report | None:
     lane = options.lane
     deviations = host_deviations(lane)
+    if options.network.reuse_host_listeners:
+        deviations.append(
+            "shared host listeners requested for reconnect diagnosis; not performance acceptance"
+        )
     if deviations and not options.advisory:
         raise SystemExit(
             "this host deviates from lane "

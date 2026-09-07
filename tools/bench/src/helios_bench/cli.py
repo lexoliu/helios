@@ -60,7 +60,12 @@ def command_run(args: argparse.Namespace) -> int:
         helios_side_timeout_seconds=args.helios_side_timeout_seconds,
         skip_linux_workloads=tuple(args.skip_linux_workloads),
         linux_setup_timeout_seconds=args.linux_setup_timeout_seconds,
-        network=NetworkOptions(ifname=args.net_ifname, bridge=args.net_bridge, queues=args.net_queues),
+        network=NetworkOptions(
+            ifname=args.net_ifname,
+            bridge=args.net_bridge,
+            queues=args.net_queues,
+            reuse_host_listeners=args.reuse_host_listeners,
+        ),
         baseline=baseline,
         profile_use=args.profile_use.resolve() if args.profile_use else None,
     )
@@ -238,6 +243,11 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--net-ifname")
     run.add_argument("--net-bridge")
     run.add_argument("--net-queues", type=int)
+    run.add_argument(
+        "--reuse-host-listeners",
+        action="store_true",
+        help="preserve peer connection state across guest boots for diagnosis; not performance acceptance",
+    )
     run.set_defaults(func=command_run)
 
     lanes = subcommands.add_parser("lanes", help="list the lanes of the manifest")
