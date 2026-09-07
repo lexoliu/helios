@@ -46,10 +46,10 @@ impl UserMemoryPool {
             heap.initialize(regions);
             heap.total_bytes
         });
+        self.total_bytes.store(total, Ordering::Release);
         for &(start, end) in regions {
             self.reported.cover(start, end);
         }
-        self.total_bytes.store(total, Ordering::Release);
     }
 
     pub fn configure_processors(&self, processor_count: usize) {
