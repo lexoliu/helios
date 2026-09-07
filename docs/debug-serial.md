@@ -116,7 +116,13 @@ still recognizes the body's `panicked at` line and collects its trailer.
 The benchmark suite retains raw runtime logs even when `--keep-going`
 turns individual workload failures into report cells instead of a failed
 shell step. Those logs are the diagnostic record behind an incomplete
-paired gate.
+paired gate. The runtime artifact also retains each release kernel ELF:
+the candidate under `helios/target/<target>/release/helios` and a paired
+baseline under `helios/target/perf-baselines/worktrees/<sha>/helios/target/<target>/release/helios`.
+The CI workload lane includes its kernel ELF with failure diagnostics.
+Use the image matching the failed boot's revision when symbolizing an
+instruction pointer; an ELF rebuilt from another revision is not that
+run's symbol map.
 
 ## Keeping the line drained
 

@@ -135,6 +135,32 @@ def test_keep_going_preserves_failed_workload_logs(jobs):
     assert "bench-runtime/**/*.log" in upload["with"]["path"].splitlines()
 
 
+@pytest.mark.parametrize(
+    ("filename", "job", "condition"),
+    [("ci.yml", "bench", "failure()"), ("bench-suite.yml", "suite", "always()")],
+)
+def test_benchmark_diagnostics_keep_the_exact_release_kernels(filename, job, condition, tmp_path):
+    workflow = yaml.load((REPO_ROOT / ".github/workflows" / filename).read_text(), Loader=yaml.BaseLoader)
+    upload = next(
+        step
+        for step in workflow["jobs"][job]["steps"]
+        if step.get("name") == "Upload the inspector runtime directory"
+    )
+    assert upload["if"] == condition
+    paths = upload["with"]["path"].splitlines()
+    candidate = Path("helios/target/x86_64-unknown-none/release/helios")
+    baseline = Path(
+        "helios/target/perf-baselines/worktrees/baseline/helios/target/x86_64-unknown-none/release/helios"
+    )
+    kernels = [candidate, baseline] if job == "suite" else [candidate]
+    for kernel in kernels:
+        image = tmp_path / kernel
+        image.parent.mkdir(parents=True, exist_ok=True)
+        image.write_bytes(b"\x7fELF")
+    matched = {path.relative_to(tmp_path) for pattern in paths for path in tmp_path.glob(pattern)}
+    assert set(kernels) <= matched
+
+
 def test_tcp_probe_is_opt_in_and_not_acceptance(workflow, jobs, tmp_path):
     assert workflow["on"]["workflow_dispatch"]["inputs"]["tcp_probe"]["default"] == "false"
     probe = next(step for step in jobs["suite"]["steps"] if step.get("name") == "Run TCP reconnect probe")
