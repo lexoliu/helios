@@ -92,6 +92,28 @@ def test_suite_preserves_workloads_and_pairing(jobs, tmp_path: Path, paired):
         assert "--sides" not in arguments
 
 
+@pytest.mark.parametrize(("probe", "queues"), [("true", "1"), ("false", "8"), ("", "8")])
+def test_tap_setup_matches_the_probe_queue_mode(jobs, probe, queues):
+    setup = next(
+        step for step in jobs["suite"]["steps"] if step.get("name") == "Provision the tap network backend"
+    )
+    assert setup["env"]["TCP_PROBE"] == "${{ inputs.tcp_probe }}"
+    script = setup["run"].replace('"$(nproc)"', '"8"')
+    script = script.replace("./target/release/helios-inspector", 'printf "%s\\n"')
+    result = subprocess.run(
+        ["bash", "-eu", "-c", script],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=os.environ
+        | {"TCP_PROBE": probe, "HELIOS_NET_IFNAME": "helios0", "HELIOS_NET_BRIDGE": "helios-br0"},
+    )
+    arguments = result.stdout.splitlines()
+    assert arguments[:2] == ["vm", "net-setup"]
+    assert arguments[arguments.index("--net-queues") + 1] == queues
+    assert "--net-dhcp" in arguments
+
+
 def test_profile_jobs_follow_the_mode_output(jobs):
     assert jobs["tooling"]["outputs"]["paired_acceptance"] == "${{ steps.mode.outputs.paired_acceptance }}"
     assert jobs["suite"]["env"]["BENCH_PAIRED_ACCEPTANCE"] == "${{ needs.tooling.outputs.paired_acceptance }}"

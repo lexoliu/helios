@@ -166,12 +166,16 @@ jobs:
       - name: Report host deviations from the lane
         working-directory: helios/tools/bench
         run: uv run helios-bench host-check --lane ${{ matrix.lane }} || true
-      - name: Provision the multi-queue tap network backend
+      - name: Provision the tap network backend
         if: matrix.net-backend == 'tap'
         working-directory: helios
+        env:
+          TCP_PROBE: ${{ inputs.tcp_probe }}
         run: |
+          queues="$(nproc)"
+          if [ "$TCP_PROBE" = true ]; then queues=1; fi
           ./target/release/helios-inspector vm net-setup \
-            --net-backend tap \
+            --net-backend tap --net-queues "$queues" \
             --net-ifname "${HELIOS_NET_IFNAME}" \
             --net-bridge "${HELIOS_NET_BRIDGE}" \
             --net-dhcp
