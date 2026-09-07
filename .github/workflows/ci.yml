@@ -820,6 +820,17 @@ jobs:
           HELIOS_WORKLOAD_BENCH_ARCH: ${{ matrix.helios-arch }}
           HELIOS_WORKLOAD_BENCH_BUILD_ONLY: "1"
         run: tools/wasi-apps/workload-bench.sh
+      - uses: astral-sh/setup-uv@v6
+      - name: Export benchmark function symbols
+        working-directory: helios/tools/bench
+        run: uv run helios-bench symbols --root ../.. --out-dir "$GITHUB_WORKSPACE/kernel-symbols"
+      - name: Preserve benchmark function symbols before boot
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ matrix.name }}-kernel-symbols
+          path: kernel-symbols/**/*.symbols.json
+          if-no-files-found: error
+          retention-days: 7
       - name: Provision the multi-queue tap network backend
         if: matrix.net-backend == 'tap'
         working-directory: helios
@@ -924,6 +935,7 @@ jobs:
             bench-runtime/**/*.log
             bench-runtime/**/*.pcap
             helios-bench-boot.log
+            kernel-symbols/**/*.symbols.json
           if-no-files-found: warn
       - name: Remove the tap network backend
         if: always() && matrix.net-backend == 'tap'
