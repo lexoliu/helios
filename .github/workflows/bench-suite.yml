@@ -237,6 +237,10 @@ jobs:
       # Preserve their raw console and QEMU logs even when the suite
       # returns success, so the separate gate can name incomplete
       # evidence without losing the diagnostic record behind it.
+      - name: Export benchmark function symbols
+        if: always()
+        working-directory: helios/tools/bench
+        run: uv run helios-bench symbols --root ../.. --out-dir "$GITHUB_WORKSPACE/kernel-symbols"
       - name: Upload the inspector runtime directory
         if: always()
         uses: actions/upload-artifact@v4
@@ -245,8 +249,7 @@ jobs:
           path: |
             bench-runtime/**/*.log
             bench-runtime/**/*.pcap
-            helios/target/*-unknown-none*/release/helios
-            helios/target/perf-baselines/worktrees/*/helios/target/*-unknown-none*/release/helios
+            kernel-symbols/**/*.symbols.json
           if-no-files-found: warn
       - name: Remove the tap network backend
         if: always() && matrix.net-backend == 'tap'
