@@ -90,3 +90,13 @@ def test_profile_jobs_follow_the_mode_output(jobs):
     assert jobs["suite-pgo"]["needs"] == "profile-generate"
     assert jobs["suite-pgo"]["if"] == "needs.profile-generate.result == 'success'"
     assert jobs["gate"]["needs"] == ["tooling", "suite"]
+
+
+def test_keep_going_preserves_failed_workload_logs(jobs):
+    upload = next(
+        step
+        for step in jobs["suite"]["steps"]
+        if step.get("name") == "Upload the inspector runtime directory"
+    )
+    assert upload["if"] == "always()"
+    assert upload["with"]["path"] == "bench-runtime/**/*.log"
