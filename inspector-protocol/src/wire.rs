@@ -476,6 +476,21 @@ ERROR [helios_kernel] Kernel panic: failed to exec embedded system component:"
     }
 
     #[test]
+    fn a_terminal_panic_marker_retains_the_exception_message() {
+        let report = console_report(&[
+            b"panicked at x86/src/exceptions.rs:210:9:\n",
+            b"unhandled x86 kernel exception after Wasmtime dispatch: fault details\n",
+            b"Kernel panic:\n",
+        ])
+        .expect("the terminal marker carries the complete report");
+        assert_eq!(
+            report,
+            "panicked at x86/src/exceptions.rs:210:9: / \
+unhandled x86 kernel exception after Wasmtime dispatch: fault details / Kernel panic:"
+        );
+    }
+
+    #[test]
     fn the_look_back_does_not_reach_past_its_bound() {
         let mut lines = vec![b"INFO [helios_kernel] Kernel is ready\n".as_slice()];
         lines.extend_from_slice(&PANIC_LINES);
