@@ -207,12 +207,12 @@ jobs:
             args+=(--net-ifname "${HELIOS_NET_IFNAME}" --net-bridge "${HELIOS_NET_BRIDGE}" --net-queues "$(nproc)")
           fi
           uv run helios-bench "${args[@]}"
-      # A bring-up failure leaves the inspector's one-line error and
-      # nothing else in the step log; the guest console and QEMU's own
-      # stderr live in the runtime directory, so collect it exactly as
-      # the ci.yml bench lanes do.
+      # Keep-going records failed workloads without failing this step.
+      # Preserve their raw console and QEMU logs even when the suite
+      # returns success, so the separate gate can name incomplete
+      # evidence without losing the diagnostic record behind it.
       - name: Upload the inspector runtime directory
-        if: failure()
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: bench-runtime-${{ matrix.lane }}
