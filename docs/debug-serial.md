@@ -116,7 +116,22 @@ still recognizes the body's `panicked at` line and collects its trailer.
 The benchmark suite retains raw runtime logs even when `--keep-going`
 turns individual workload failures into report cells instead of a failed
 shell step. Those logs are the diagnostic record behind an incomplete
-paired gate.
+paired gate. Kernel images contain their build's signing material, so
+neither complete ELFs nor code/data dumps are diagnostic artifacts.
+`helios-bench symbols --root <checkout> --out-dir <directory>` exports only
+defined function names, addresses and sizes, the ELF type and load-segment
+layout, entry point, and the image's SHA-256. Object symbols, code bytes,
+data bytes, and debug sections are not exported. Missing images or
+function symbol tables fail the export rather than produce an empty map.
+
+The CI workload lane uploads these JSON snapshots immediately after
+building, before network setup or guest boot, as
+`bench-<lane>-kernel-symbols` with seven-day retention. The paired suite
+retains both images' snapshots with its runtime logs. Match the failed
+boot's image identity, subtract the load slide printed by Limine from the
+reported instruction pointer, and locate that ELF-relative address in
+the function ranges. A map rebuilt from another revision is not that
+run's symbol map.
 
 ## Keeping the line drained
 
