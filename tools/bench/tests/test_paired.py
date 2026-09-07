@@ -11,6 +11,8 @@ cannot.
 
 from __future__ import annotations
 
+import socket
+from contextlib import ExitStack, nullcontext
 from pathlib import Path
 
 import pytest
@@ -22,7 +24,7 @@ from helios_bench.manifest import load_manifest
 from helios_bench.plots import plot_report
 from helios_bench.render import render_gate, render_tables
 from helios_bench.report import Report, Side, load_report, save_report
-from helios_bench.runner import GAP_BENCH, RunOptions, plan
+from helios_bench.runner import GAP_BENCH, NetworkOptions, RunOptions, plan, run_suite
 from helios_bench.wasi_apps import gap_bench
 
 # Two classes, three workloads, and none of them the class that wedges:
@@ -64,7 +66,7 @@ def driver(tmp_path, monkeypatch):
     return module
 
 
-def run_side(driver, tmp_path, images: list) -> Path:
+def run_side(driver, tmp_path, images: list, services=None, shared_endpoints=None) -> Path:
     driver.run_helios(
         Path("tools/wasi-apps/workloads.json"),
         images,
@@ -72,10 +74,8 @@ def run_side(driver, tmp_path, images: list) -> Path:
         WORKLOADS,
         "x86-64",
         "kvm",
-        None,
-        None,
-        None,
-        None,
+        services or driver.HostServices(tmp_path, "10.77.0.1", "10.77.0.1"),
+        shared_endpoints=shared_endpoints,
         timeout_seconds=60,
         side_timeout_seconds=600,
         build_timeout_seconds=60,
@@ -105,6 +105,119 @@ def images_of(driver, tmp_path, paired: bool) -> list:
     for image in images:
         image.out_dir.mkdir(parents=True)
     return images
+
+
+@pytest.fixture
+def host_services(driver, tmp_path, monkeypatch):
+    events = []
+    ports = iter(range(30000, 30100))
+
+    class Server:
+        def __init__(self, port):
+            self.port = port
+
+        def shutdown(self):
+            events.append(("shutdown", self.port))
+
+        def server_close(self):
+            events.append(("close", self.port))
+
+    def start(*args):
+        port = next(ports)
+        events.append(("start", port))
+        return Server(port), port
+
+    monkeypatch.setattr(driver, "start_host_http", start)
+    monkeypatch.setattr(driver, "start_tcp_throughput_server", start)
+    monkeypatch.setattr(driver, "start_host_tcp_echo", start)
+    services = driver.HostServices(tmp_path, "10.77.0.1", "10.77.0.1", http=True, tcp=True, tcp_echo=True)
+    return services, events
+
+
+@pytest.mark.parametrize("reuse", [False, True])
+def test_guest_boots_isolate_listeners_unless_reuse_is_explicit(
+    driver, tmp_path, monkeypatch, host_services, reuse
+):
+    services, events = host_services
+    endpoints = []
+    run_once = driver.run_helios_once
+
+    def record(*args, **kwargs):
+        endpoints.append(args[8:12])
+        return run_once(*args, **kwargs)
+
+    monkeypatch.setattr(driver, "run_helios_once", record)
+    with services.serve() if reuse else nullcontext(None) as shared:
+        run_side(driver, tmp_path, images_of(driver, tmp_path, paired=True), services, shared)
+    assert len(endpoints) == 6
+    expected = 1 if reuse else 6
+    assert len({endpoint[0] for endpoint in endpoints}) == expected
+    assert len({endpoint[2] for endpoint in endpoints}) == expected
+    assert len({endpoint[3] for endpoint in endpoints}) == expected
+    assert all(endpoint[1] == "10.77.0.1" for endpoint in endpoints)
+    started = [port for event, port in events if event == "start"]
+    assert len(started) == expected * 3
+    for port in started:
+        assert [event for event, value in events if value == port] == ["start", "shutdown", "close"]
+
+
+def test_host_listeners_close_when_the_guest_scope_fails(host_services):
+    services, events = host_services
+    with pytest.raises(RuntimeError, match="guest failed"):
+        with services.serve():
+            raise RuntimeError("guest failed")
+    assert [event for event, _ in events].count("close") == 3
+
+
+def test_host_listeners_close_after_partial_startup(driver, monkeypatch, host_services):
+    services, events = host_services
+
+    def refuse(*args):
+        raise RuntimeError("bind failed")
+
+    monkeypatch.setattr(driver, "start_tcp_throughput_server", refuse)
+    with pytest.raises(RuntimeError, match="bind failed"):
+        with services.serve():
+            pytest.fail("startup should fail")
+    assert [event for event, _ in events] == ["start", "shutdown", "close"]
+
+
+def test_real_listener_scopes_serve_independent_endpoints(driver, tmp_path, monkeypatch):
+    monkeypatch.setattr(driver, "HOST_SERVER_BIND_ADDRESS", "127.0.0.1")
+    services = driver.HostServices(tmp_path, "127.0.0.1", "127.0.0.1", tcp_echo=True)
+    with services.serve() as first, services.serve() as second:
+        assert first.tcp_echo_port != second.tcp_echo_port
+        for endpoints in [first, second]:
+            with socket.create_connection((endpoints.tcp_host, endpoints.tcp_echo_port), timeout=2) as client:
+                client.sendall(b"x")
+                assert client.recv(1) == b"x"
+
+
+def test_guest_scope_closes_accepted_connections(driver, tmp_path, monkeypatch):
+    monkeypatch.setattr(driver, "HOST_SERVER_BIND_ADDRESS", "127.0.0.1")
+    services = driver.HostServices(tmp_path, "127.0.0.1", "127.0.0.1", tcp_echo=True)
+    with ExitStack() as clients:
+        with services.serve() as endpoints:
+            client = clients.enter_context(
+                socket.create_connection((endpoints.tcp_host, endpoints.tcp_echo_port), timeout=2)
+            )
+            client.sendall(b"x")
+            assert client.recv(1) == b"x"
+        assert client.recv(1) == b""
+
+
+def test_shared_listener_diagnosis_cannot_be_published(tmp_path, monkeypatch):
+    monkeypatch.setattr("helios_bench.runner.host_deviations", lambda lane: [])
+    manifest = load_manifest()
+    options = RunOptions(
+        lane=manifest.lane("x86-64-kvm"),
+        out_dir=tmp_path,
+        advisory=False,
+        sides=frozenset({Side.HELIOS}),
+        network=NetworkOptions(reuse_host_listeners=True),
+    )
+    with pytest.raises(SystemExit, match="shared host listeners requested"):
+        run_suite(options, manifest, dry_run=True)
 
 
 def test_a_paired_side_boots_the_two_images_back_to_back(driver, tmp_path) -> None:
@@ -191,7 +304,8 @@ def test_the_refusal_reads_the_artifacts_not_the_paths(driver, tmp_path) -> None
         driver.refuse_identical_images(images, "x86-64")
 
 
-def test_the_driver_parses_the_baseline_flags_the_plan_emits(tmp_path) -> None:
+@pytest.mark.parametrize("reuse", [False, True])
+def test_the_driver_parses_the_baseline_flags_the_plan_emits(tmp_path, reuse) -> None:
     """The plan's argv and the driver's parser are edited together."""
     options = RunOptions(
         lane=load_manifest().lane("x86-64-kvm"),
@@ -199,6 +313,7 @@ def test_the_driver_parses_the_baseline_flags_the_plan_emits(tmp_path) -> None:
         advisory=True,
         sides=frozenset({Side.HELIOS, Side.HELIOS_BASELINE}),
         baseline=Baseline(ref="merge-base", sha="a" * 40, worktree=tmp_path / "worktree"),
+        network=NetworkOptions(reuse_host_listeners=reuse),
     )
     commands = [
         command for command in plan(options, load_manifest(), []) if command.argv[1:2] == [str(GAP_BENCH)]
@@ -207,6 +322,7 @@ def test_the_driver_parses_the_baseline_flags_the_plan_emits(tmp_path) -> None:
     parsed = gap_bench().build_parser().parse_args(commands[0].argv[2:])
     assert parsed.helios_baseline_root == tmp_path / "worktree"
     assert parsed.helios_baseline_out_dir == tmp_path / "helios-baseline"
+    assert parsed.reuse_host_listeners == reuse
     # One budget for the Helios half however many images it times: a
     # paired boot carries one workload where an unpaired one carries a
     # whole class, and the driver shares the budget out as it goes.
@@ -240,10 +356,7 @@ def granted_budgets(
         WORKLOADS,
         "x86-64",
         "kvm",
-        None,
-        None,
-        None,
-        None,
+        driver.HostServices(tmp_path, "10.77.0.1", "10.77.0.1"),
         timeout_seconds=PER_UNIT_CAP,
         side_timeout_seconds=side,
         build_timeout_seconds=120,

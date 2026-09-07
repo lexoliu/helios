@@ -106,7 +106,17 @@ throttled by the device rather than by kernel memory.
 The panic report is the one deliberate exception. A panicking processor
 cannot wait for a port another processor may never release, so it
 writes straight at the register, allocation-free and lock-free, and
-accepts that it may cut into whatever was on the wire.
+accepts that it may cut into whatever was on the wire. It emits the
+`PanicInfo` body before a final `Kernel panic:` line. The host frame
+scanner ends the session at that marker and includes its bounded
+look-back, so putting the marker first would retain the location while
+losing the exception message on the following line. The readiness reader
+still recognizes the body's `panicked at` line and collects its trailer.
+
+The benchmark suite retains raw runtime logs even when `--keep-going`
+turns individual workload failures into report cells instead of a failed
+shell step. Those logs are the diagnostic record behind an incomplete
+paired gate.
 
 ## Keeping the line drained
 

@@ -1948,13 +1948,16 @@ where
                     reset: None,
                 }
             }
-            TcpState::SynSent if packet.flags.contains(TcpFlags::SYN.union(TcpFlags::ACK)) => {
-                if !self.syn_sent_ack_acceptable(packet.acknowledgement) {
-                    return TcpSegmentOutcome {
-                        reset: self.unacceptable_ack_reset(packet.acknowledgement),
-                        ..TcpSegmentOutcome::default()
-                    };
+            TcpState::SynSent
+                if packet.flags.contains(TcpFlags::ACK)
+                    && !self.syn_sent_ack_acceptable(packet.acknowledgement) =>
+            {
+                TcpSegmentOutcome {
+                    reset: self.unacceptable_ack_reset(packet.acknowledgement),
+                    ..TcpSegmentOutcome::default()
                 }
+            }
+            TcpState::SynSent if packet.flags.contains(TcpFlags::SYN.union(TcpFlags::ACK)) => {
                 self.record_peer_options(packet);
                 self.remote = self.remote.map(|mut remote| {
                     remote.port = packet.source_port;
@@ -3352,57 +3355,109 @@ mod tests {
     }
 
     #[test]
-    fn syn_sent_rejects_syn_ack_acknowledging_unsent_sequence() {
-        let mut socket = TcpSocket::connect(endpoint(49152), peer(80), 7, BbrV3::new(1460));
-        socket.mark_syn_queued(0);
-
-        let outcome = deliver_segment(
-            &mut socket,
-            TcpPacket {
-                source_port: 80,
-                destination_port: 49152,
-                sequence: 100,
-                acknowledgement: 9,
-                flags: TcpFlags::SYN.union(TcpFlags::ACK),
-                window_size: u16::MAX,
-                options: TcpOptions::empty(),
-                payload: &[],
-            },
-            TCP_INITIAL_RTO_NANOS,
-        );
-
-        assert_eq!(socket.state(), TcpState::SynSent);
-        assert_eq!(socket.receive_next, 0);
-        let reset = outcome
-            .reset
-            .expect("unacceptable SYN-SENT ACK must request a reset");
-        assert_eq!(reset.header.sequence, 9);
-        assert_eq!(reset.header.acknowledgement, 0);
-        assert_eq!(reset.header.flags, TcpFlags::RST);
+    fn syn_sent_resets_unacceptable_acks_with_or_without_syn() {
+        for flags in [
+            TcpFlags::ACK,
+            TcpFlags::SYN.union(TcpFlags::ACK),
+            TcpFlags::FIN.union(TcpFlags::ACK),
+        ] {
+            for acknowledgement in [7, 9] {
+                let mut socket = TcpSocket::connect(endpoint(49152), peer(80), 7, BbrV3::new(1460));
+                socket.mark_syn_queued(0);
+                let outcome = deliver_segment(
+                    &mut socket,
+                    TcpPacket {
+                        source_port: 80,
+                        destination_port: 49152,
+                        sequence: 100,
+                        acknowledgement,
+                        flags,
+                        window_size: u16::MAX,
+                        options: TcpOptions::empty(),
+                        payload: &[],
+                    },
+                    TCP_INITIAL_RTO_NANOS,
+                );
+                assert_eq!(socket.state(), TcpState::SynSent);
+                assert_eq!(socket.receive_next, 0);
+                assert_eq!(socket.send_unacknowledged, 7);
+                let reset = outcome.reset.unwrap_or_else(|| {
+                    panic!("unacceptable SYN-SENT ACK {acknowledgement} with {flags:?} must request a reset")
+                });
+                assert_eq!(reset.header.sequence, acknowledgement);
+                assert_eq!(reset.header.acknowledgement, 0);
+                assert_eq!(reset.header.flags, TcpFlags::RST);
+                assert!(
+                    socket
+                        .pending_retransmission(TCP_INITIAL_RTO_NANOS)
+                        .is_some()
+                );
+            }
+        }
     }
 
     #[test]
-    fn syn_sent_ignores_rst_without_ack() {
-        let mut socket = TcpSocket::connect(endpoint(49152), peer(80), 7, BbrV3::new(1460));
-        socket.mark_syn_queued(0);
+    fn syn_sent_ignores_rst_without_acceptable_ack() {
+        for (flags, acknowledgement) in [
+            (TcpFlags::RST, 0),
+            (TcpFlags::RST.union(TcpFlags::ACK), 7),
+            (TcpFlags::RST.union(TcpFlags::ACK), 9),
+            (TcpFlags::RST.union(TcpFlags::SYN).union(TcpFlags::ACK), 9),
+        ] {
+            let mut socket = TcpSocket::connect(endpoint(49152), peer(80), 7, BbrV3::new(1460));
+            socket.mark_syn_queued(0);
+            let outcome = deliver_segment(
+                &mut socket,
+                TcpPacket {
+                    source_port: 80,
+                    destination_port: 49152,
+                    sequence: 100,
+                    acknowledgement,
+                    flags,
+                    window_size: u16::MAX,
+                    options: TcpOptions::empty(),
+                    payload: &[],
+                },
+                TCP_INITIAL_RTO_NANOS,
+            );
+            assert_eq!(socket.state(), TcpState::SynSent);
+            assert_eq!(outcome, TcpSegmentOutcome::default());
+            assert!(
+                socket
+                    .pending_retransmission(TCP_INITIAL_RTO_NANOS)
+                    .is_some()
+            );
+        }
+    }
 
-        let outcome = deliver_segment(
-            &mut socket,
-            TcpPacket {
-                source_port: 80,
-                destination_port: 49152,
-                sequence: 100,
-                acknowledgement: 0,
-                flags: TcpFlags::RST,
-                window_size: u16::MAX,
-                options: TcpOptions::empty(),
-                payload: &[],
-            },
-            TCP_INITIAL_RTO_NANOS,
-        );
-
-        assert_eq!(socket.state(), TcpState::SynSent);
-        assert_eq!(outcome, TcpSegmentOutcome::default());
+    #[test]
+    fn syn_sent_acceptable_ack_without_syn_does_not_establish_or_reset() {
+        for flags in [TcpFlags::ACK, TcpFlags::FIN.union(TcpFlags::ACK)] {
+            let mut socket = TcpSocket::connect(endpoint(49152), peer(80), 7, BbrV3::new(1460));
+            socket.mark_syn_queued(0);
+            let outcome = deliver_segment(
+                &mut socket,
+                TcpPacket {
+                    source_port: 80,
+                    destination_port: 49152,
+                    sequence: 100,
+                    acknowledgement: 8,
+                    flags,
+                    window_size: u16::MAX,
+                    options: TcpOptions::empty(),
+                    payload: &[],
+                },
+                TCP_INITIAL_RTO_NANOS,
+            );
+            assert_eq!(socket.state(), TcpState::SynSent);
+            assert_eq!(outcome, TcpSegmentOutcome::default());
+            assert_eq!(socket.send_unacknowledged, 7);
+            assert!(
+                socket
+                    .pending_retransmission(TCP_INITIAL_RTO_NANOS)
+                    .is_some()
+            );
+        }
     }
 
     #[test]

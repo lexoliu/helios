@@ -18,7 +18,12 @@ Informational only, and nothing here blocks: {% if result.baseline_host != resul
 {% endfor %}
 
 {% if result.blocking %}
+{% if result.incomplete_headlines %}
+**Blocking: incomplete paired evidence** — {{ result.incomplete_headlines | join(", ") }} has no comparable baseline/candidate pair (missing, failed, or rejected cell).
+{% endif %}
+{% if result.headline_regressions %}
 **Blocking**: {{ result.headline_regressions | map(attribute="workload") | join(", ") }} regressed significantly.
+{% endif %}
 {% elif result.regressions %}
 Significant regressions outside the headline set, or on a comparison that does not block: {{ result.regressions | map(attribute="workload") | join(", ") }}.
 {% elif result.improvements %}

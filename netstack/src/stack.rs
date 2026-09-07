@@ -8009,6 +8009,85 @@ mod tests {
     }
 
     #[test]
+    fn tcp_connect_resets_stale_ack_then_retransmits_syn_and_establishes() {
+        let config = StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES);
+        let (mut stack, socket, local, peer) = open_pending_tcp_connect_stack(config);
+        stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        stack.learn_neighbor(NeighborEntry {
+            ip: IpAddress::Ipv4(peer),
+            mac: PEER_MAC,
+            state: NeighborState::Reachable,
+            updated_at: StackInstant::from_nanos(0),
+        });
+        stack
+            .drive_tcp(StackInstant::from_nanos(0))
+            .expect("initial SYN should be queued");
+        assert!(stack.take_outbound().is_some());
+
+        let stale = ipv4_tcp_frame(
+            peer,
+            local,
+            TcpHeader {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 100,
+                acknowledgement: 9,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+            },
+            &[],
+        );
+        stack
+            .receive_frame(&stale, StackInstant::from_nanos(1))
+            .expect("stale ACK should be handled");
+        assert_eq!(
+            stack.tcp_connect_state(socket),
+            Ok(TcpConnectState::Pending)
+        );
+        let frame = stack.take_outbound().expect("stale ACK must queue RST");
+        let ethernet = EthernetFrame::parse(frame.as_slice()).expect("Ethernet frame");
+        let ipv4 = Ipv4Packet::parse(ethernet.payload).expect("IPv4 packet");
+        let reset = TcpPacket::parse(ipv4.payload).expect("TCP reset");
+        assert_eq!(reset.sequence, 9);
+        assert_eq!(reset.acknowledgement, 0);
+        assert_eq!(reset.flags, TcpFlags::RST);
+        assert!(crate::tcp_checksum_valid(
+            IpAddress::Ipv4(local),
+            IpAddress::Ipv4(peer),
+            ipv4.payload,
+        ));
+
+        let retry_at = StackInstant::from_nanos(crate::tcp::TCP_INITIAL_RTO_NANOS);
+        stack.drive_tcp(retry_at).expect("SYN should retransmit");
+        let frame = stack.take_outbound().expect("retransmitted SYN");
+        let ethernet = EthernetFrame::parse(frame.as_slice()).expect("Ethernet frame");
+        let ipv4 = Ipv4Packet::parse(ethernet.payload).expect("IPv4 packet");
+        let syn = TcpPacket::parse(ipv4.payload).expect("TCP SYN");
+        assert_eq!(syn.sequence, 7);
+        assert_eq!(syn.flags, TcpFlags::SYN);
+        let syn_ack = ipv4_tcp_frame(
+            peer,
+            local,
+            TcpHeader {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 200,
+                acknowledgement: 8,
+                flags: TcpFlags::SYN.union(TcpFlags::ACK),
+                window_size: u16::MAX,
+            },
+            &[],
+        );
+        stack
+            .receive_frame(&syn_ack, retry_at)
+            .expect("fresh SYN-ACK should establish");
+        assert_eq!(
+            stack.tcp_connect_state(socket),
+            Ok(TcpConnectState::Connected)
+        );
+    }
+
+    #[test]
     fn ipv4_icmp_port_unreachable_closes_pending_tcp_connect() {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);

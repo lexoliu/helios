@@ -504,14 +504,14 @@ pub(crate) enum VmNetworkError {
     TunFlagsUnparsable { path: PathBuf, raw: String },
 
     #[error(
-        "tap interface `{ifname}` was created without IFF_MULTI_QUEUE (tun_flags {flags:#06x}), \
-         so it cannot back {queues} queue pairs; recreate it with \
-         `helios-inspector vm net-setup --net-backend tap --net-ifname {ifname}`"
+        "tap interface `{ifname}` has tun_flags {flags:#06x}, but this request requires \
+         IFF_MULTI_QUEUE={multi_queue}; use a separate tap provisioned with matching \
+         --net-queues (1 for single-queue, greater than 1 for multi-queue)"
     )]
-    TapNotMultiQueue {
+    TapQueueModeMismatch {
         ifname: String,
         flags: u32,
-        queues: u16,
+        multi_queue: bool,
     },
 
     #[error(
@@ -604,12 +604,6 @@ pub(crate) enum VmNetworkSetupError {
         #[source]
         source: serde_json::Error,
     },
-
-    #[error(
-        "tap interface `{ifname}` already exists without IFF_MULTI_QUEUE; \
-         run `helios-inspector vm net-teardown --net-ifname {ifname}` first"
-    )]
-    ExistingTapNotMultiQueue { ifname: String },
 
     #[error("failed to read the dnsmasq pid file {path}")]
     PidFileUnreadable {
@@ -844,7 +838,7 @@ impl VmNetwork {
                 // vhost-net moves the packet copy into host kernel
                 // threads; without it a multi-queue tap still funnels
                 // every queue through the QEMU main loop.
-                netdev.set("vhost", "on");
+                netdev.set("vhost", if self.pcap.is_some() { "off" } else { "on" });
                 if queue_pairs > 1 {
                     netdev.set("queues", queue_pairs);
                 }
@@ -978,17 +972,12 @@ impl VmNetwork {
         // device: it warns per queue and then trips an assertion in
         // `net_client_init1`, after the debug serial socket is expected
         // and before the guest prints a line. Refuse here with the fix.
-        if let VhostNet::Unusable(source) = VhostNet::probe() {
+        if self.pcap.is_none()
+            && let VhostNet::Unusable(source) = VhostNet::probe()
+        {
             return Err(VmNetworkError::VhostNetUnusable { source });
         }
-        let flags = read_tun_flags(ifname)?;
-        if queue_pairs > 1 && flags & IFF_MULTI_QUEUE == 0 {
-            return Err(VmNetworkError::TapNotMultiQueue {
-                ifname: ifname.to_owned(),
-                flags,
-                queues: queue_pairs,
-            });
-        }
+        check_tap_queue_mode(ifname, read_tun_flags(ifname)?, queue_pairs > 1)?;
         if let Some(bridge) = &self.bridge {
             match interface_master(ifname)? {
                 Some(actual) if actual == *bridge => {}
@@ -1448,12 +1437,32 @@ fn tap_names(network: &VmNetwork) -> Result<(String, String), VmNetworkSetupErro
     Ok((ifname, bridge))
 }
 
-/// Builds the privileged plan that provisions a multi-queue tap.
+fn setup_tap_multi_queue(queues: Option<u16>) -> Result<bool, VmNetworkError> {
+    match queues {
+        Some(0) => Err(VmNetworkError::ZeroQueues),
+        Some(1) => Ok(false),
+        _ => Ok(true),
+    }
+}
+
+fn check_tap_queue_mode(ifname: &str, flags: u32, multi_queue: bool) -> Result<(), VmNetworkError> {
+    if (flags & IFF_MULTI_QUEUE != 0) != multi_queue {
+        return Err(VmNetworkError::TapQueueModeMismatch {
+            ifname: ifname.to_owned(),
+            flags,
+            multi_queue,
+        });
+    }
+    Ok(())
+}
+
+/// Builds the privileged plan that provisions the requested tap queue mode.
 fn tap_setup_plan(
     command: &NetSetupCommand,
     ifname: &str,
     bridge: &str,
 ) -> Result<Vec<PrivilegedCommand>, VmNetworkSetupError> {
+    let multi_queue = setup_tap_multi_queue(command.network.queues)?;
     let (uid, gid) = invoking_credentials();
     let mut plan = Vec::new();
     // The queues are served by vhost-net threads, so the node has to be
@@ -1486,22 +1495,14 @@ fn tap_setup_plan(
         ],
     ));
     if !interface_exists(ifname) {
-        plan.push(PrivilegedCommand::new(
-            "ip",
-            [
-                "tuntap",
-                "add",
-                "dev",
-                ifname,
-                "mode",
-                "tap",
-                "multi_queue",
-                "user",
-                &uid.to_string(),
-                "group",
-                &gid.to_string(),
-            ],
-        ));
+        let uid = uid.to_string();
+        let gid = gid.to_string();
+        let mut args = vec!["tuntap", "add", "dev", ifname, "mode", "tap"];
+        if multi_queue {
+            args.push("multi_queue");
+        }
+        args.extend(["user", &uid, "group", &gid]);
+        plan.push(PrivilegedCommand::new("ip", args));
     }
     plan.push(PrivilegedCommand::new(
         "ip",
@@ -1632,8 +1633,9 @@ pub(crate) fn run_setup(command: NetSetupCommand) -> Result<(), VmNetworkSetupEr
     let network = VmNetwork::resolve(command.network.clone(), VmNetworkFile::default());
     require_tap_backend(&network)?;
     let (ifname, bridge) = tap_names(&network)?;
-    if interface_exists(&ifname) && read_tun_flags(&ifname)? & IFF_MULTI_QUEUE == 0 {
-        return Err(VmNetworkSetupError::ExistingTapNotMultiQueue { ifname });
+    let multi_queue = setup_tap_multi_queue(network.queues)?;
+    if interface_exists(&ifname) {
+        check_tap_queue_mode(&ifname, read_tun_flags(&ifname)?, multi_queue)?;
     }
     let elevate = !is_root();
     let plan = tap_setup_plan(&command, &ifname, &bridge)?;
@@ -1659,16 +1661,14 @@ pub(crate) fn run_setup(command: NetSetupCommand) -> Result<(), VmNetworkSetupEr
         }
     }
 
-    // The whole point of the tap backend is multi-queue; a tap that came
-    // up without IFF_MULTI_QUEUE would silently cap the guest at one
-    // queue pair, so the helper proves the flag rather than assuming it.
+    // QEMU's TUNSETIFF must match the tap's IFF_MULTI_QUEUE mode,
+    // including a single-queue capture. Prove the requested flag
+    // rather than assuming the setup commands established it.
     let flags = read_tun_flags(&ifname)?;
-    if flags & IFF_MULTI_QUEUE == 0 {
-        return Err(VmNetworkSetupError::ExistingTapNotMultiQueue { ifname });
-    }
+    check_tap_queue_mode(&ifname, flags, multi_queue)?;
     println!(
-        "{} tap {ifname} on bridge {bridge} is multi-queue (tun_flags {flags:#06x}) on \
-         vhost-net; guests reach the host at {}",
+        "{} tap {ifname} on bridge {bridge} has IFF_MULTI_QUEUE={multi_queue} \
+         (tun_flags {flags:#06x}); guests reach the host at {}",
         style("ready").green(),
         command.bridge_address.addr(),
     );
@@ -1853,6 +1853,39 @@ mod tests {
             "tap,id=net0,ifname=helios0,script=no,downscript=no,vhost=on"
         );
         assert_eq!(rendered.device(), "virtio-net-pci,netdev=net0");
+        network.pcap = Some(PathBuf::from("/tmp/helios.pcap"));
+        let capture = network
+            .render(
+                VmNetworkProfile::VirtioPci,
+                split_ring(),
+                4,
+                HostPlatform::LINUX,
+            )
+            .expect("a TAP capture uses the userspace datapath");
+        assert_eq!(
+            capture.netdev(),
+            "tap,id=net0,ifname=helios0,script=no,downscript=no,vhost=off"
+        );
+        assert_eq!(capture.queue_pairs(), 1);
+        assert_eq!(capture.device(), "virtio-net-pci,netdev=net0");
+        assert!(capture.packet_dump().is_some());
+    }
+
+    #[test]
+    fn tap_queue_mode_validation_rejects_both_mismatch_directions() {
+        for flags in [0x1002, 0x1002 | IFF_MULTI_QUEUE] {
+            for multi_queue in [false, true] {
+                let result = check_tap_queue_mode("helios0", flags, multi_queue);
+                if (flags & IFF_MULTI_QUEUE != 0) == multi_queue {
+                    assert!(result.is_ok());
+                } else {
+                    assert!(matches!(
+                        result,
+                        Err(VmNetworkError::TapQueueModeMismatch { .. })
+                    ));
+                }
+            }
+        }
     }
 
     #[test]
@@ -2252,8 +2285,8 @@ mod tests {
     }
 
     #[test]
-    fn the_setup_plan_creates_a_multi_queue_tap_on_a_bridge() {
-        let command = NetSetupCommand {
+    fn the_setup_plan_creates_a_tap_matching_the_requested_queue_mode() {
+        let mut command = NetSetupCommand {
             network: VmNetworkArgs {
                 backend: Some(VmNetworkBackend::Tap),
                 queues: None,
@@ -2297,6 +2330,21 @@ mod tests {
                 .iter()
                 .any(|step| step.contains("--dhcp-range=10.77.0.2,10.77.0.129,255.255.255.0,12h"))
         );
+        for queues in [1, 4] {
+            command.network.queues = Some(queues);
+            let plan = tap_setup_plan(&command, "helios0", "helios-br0").expect("valid queue mode");
+            let tap = plan
+                .iter()
+                .map(|step| step.display(true))
+                .find(|step| step.starts_with("sudo ip tuntap add "))
+                .expect("tap creation command");
+            assert_eq!(tap.contains("multi_queue"), queues > 1);
+        }
+        command.network.queues = Some(0);
+        assert!(matches!(
+            tap_setup_plan(&command, "helios0", "helios-br0"),
+            Err(VmNetworkSetupError::Network(VmNetworkError::ZeroQueues))
+        ));
     }
 
     #[test]
