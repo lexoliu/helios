@@ -179,8 +179,16 @@ helios_x86_interrupt_common:
 
     mov rdi, rsp
     mov r12, rsp
+    sub rsp, 512
     and rsp, -16
+    fxsave64 [rsp]
+    sub rsp, 16
+    mov dword ptr [rsp], 0x1f80
+    fninit
+    ldmxcsr [rsp]
     call helios_x86_interrupt_dispatch
+    add rsp, 16
+    fxrstor64 [rsp]
     mov rsp, r12
 
     pop r15

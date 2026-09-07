@@ -104,6 +104,7 @@ test-units:
     cargo test -p helios-workspace-root --lib
     cargo test -p helios-inspector-protocol --lib
     cargo test -p helios-kernel --test hal_layering
+    python3 "{{repo_root}}/x86/tests/interrupt_state.py"
 
 # Generate the kernel-prebuild manifest for `target` and run `cargo clippy`
 # against it, denying warnings.

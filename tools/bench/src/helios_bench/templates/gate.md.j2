@@ -29,7 +29,7 @@ Significant regressions outside the headline set, or on a comparison that does n
 {% elif result.improvements %}
 No significant regression. Significant improvement: {{ result.improvements | map(attribute="workload") | join(", ") }}.
 {% else %}
-No significant regression, and nothing moved beyond the noise floor.
+No significant regression or improvement: no row has both disjoint confidence intervals and a shift beyond the noise floor.
 {% endif %}
 {% endmacro %}
 ### Benchmark gate — lane `{{ lane }}`
