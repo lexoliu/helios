@@ -378,7 +378,12 @@ impl<Pool: PhysFrameAllocator, Device: MemoryBalloon + Clone> BalloonService<Poo
         self.floor_notice = None;
         let mut run_frames = INFLATE_RUN_FRAMES.min(wanted);
         while wanted > 0 && !self.runs.is_full() {
-            let Ok(range) = self.pool.allocate(run_frames.min(wanted), false) else {
+            let available = run_frames.min(wanted).min(self.inflation_budget());
+            if available == 0 {
+                break;
+            }
+            run_frames = 1 << available.ilog2();
+            let Ok(range) = self.pool.allocate(run_frames, false) else {
                 // A pool with nothing that contiguous left may still
                 // have smaller runs; halving is what turns a
                 // fragmentation failure into progress instead of a
@@ -801,6 +806,29 @@ mod tests {
             "`actual` reports what the guest could give, not what was asked"
         );
         assert_eq!(device.inner.actual.load(Ordering::Acquire) as usize, held);
+    }
+
+    #[test]
+    fn non_power_of_two_targets_and_budgets_use_exact_frame_occupancy() {
+        let pool = pool(4 * 1024 * 1024);
+        let outside = pool.allocate(1, false).expect("non-balloon frame");
+        let total = PhysFrameAllocator::stats(pool).total_frames;
+        let floor = total / PRESSURE_FLOOR_DIVISOR;
+        let before = free_frames(pool);
+        let device = FakeBalloon::new(false);
+        let (mut service, _) = service(pool, device.clone());
+        for target in [3, 17, total] {
+            device.set_target_pages(u32::try_from(target).expect("target fits"));
+            block_on(service.adjust());
+            let held = service.held_frames();
+            assert!(held <= target);
+            assert_eq!(before - free_frames(pool), held);
+            assert!(free_frames(pool) >= floor);
+        }
+        device.set_target_pages(0);
+        block_on(service.adjust());
+        assert_eq!(free_frames(pool), before);
+        PhysFrameAllocator::deallocate(pool, outside);
     }
 
     /// Lowering the target is how the host gives memory back, and the
