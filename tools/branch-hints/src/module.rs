@@ -131,7 +131,7 @@ impl<'a> CoreModule<'a> {
             if let Some((id, content)) = payload.as_section() {
                 module.sections.push(SectionSpan {
                     id,
-                    header_start: header_start(bytes, id, &content),
+                    header_start: wasm::header_start(bytes, id, &content),
                     content,
                     count: 0,
                 });
@@ -316,16 +316,6 @@ impl<'a> CoreModule<'a> {
         }
         format!("{:x}", hasher.finalize())
     }
-}
-
-fn header_start(bytes: &[u8], id: u8, content: &Range<usize>) -> usize {
-    let size = u32::try_from(content.len()).expect("a wasm section length fits in a u32");
-    let start = content.start - 1 - wasm::leb_u32(size).len();
-    assert_eq!(
-        bytes[start], id,
-        "section header for id {id} is not where its length says it is"
-    );
-    start
 }
 
 fn read_body(

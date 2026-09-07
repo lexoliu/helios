@@ -5,6 +5,8 @@
 //! opinion about survives byte for byte and the offsets a profile records
 //! stay meaningful.
 
+use std::ops::Range;
+
 use wasm_encoder::Encode;
 
 /// Encodes `value` as an unsigned LEB128 integer.
@@ -12,6 +14,20 @@ pub fn leb_u32(value: u32) -> Vec<u8> {
     let mut bytes = Vec::new();
     value.encode(&mut bytes);
     bytes
+}
+
+/// Locates the header byte of the section whose content is `content`: the
+/// id byte, followed by the LEB128 size, immediately precedes the content.
+/// The id found there has to be `id`, or the section was not where its
+/// length said it was.
+pub fn header_start(bytes: &[u8], id: u8, content: &Range<usize>) -> usize {
+    let size = u32::try_from(content.len()).expect("a wasm section length fits in a u32");
+    let start = content.start - 1 - leb_u32(size).len();
+    assert_eq!(
+        bytes[start], id,
+        "section header for id {id} is not where its length says it is"
+    );
+    start
 }
 
 /// Decodes the unsigned LEB128 integer at `bytes[position]`, returning it

@@ -69,12 +69,7 @@ pub fn locate(bytes: &[u8]) -> Result<Location, Error> {
         }
     };
 
-    let size = u32::try_from(body.len()).expect("a core module fits in a u32");
-    let header_start = body.start - 1 - wasm::leb_u32(size).len();
-    assert_eq!(
-        bytes[header_start], COMPONENT_CORE_MODULE_SECTION,
-        "core module section header is not where its length says it is"
-    );
+    let header_start = wasm::header_start(bytes, COMPONENT_CORE_MODULE_SECTION, &body);
     Ok(Location {
         core_module_index,
         section: header_start..body.end,
