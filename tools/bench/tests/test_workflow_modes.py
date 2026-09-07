@@ -161,3 +161,18 @@ def test_tcp_probe_requires_a_baseline(jobs, tmp_path):
     with pytest.raises(subprocess.CalledProcessError) as error:
         run_arguments(probe["run"], tmp_path, "true", baseline="")
     assert "tcp_probe requires baseline_ref" in error.value.stdout
+
+
+def test_vsock_setup_waits_for_device_rules_before_setting_permissions():
+    workflow = yaml.load((REPO_ROOT / ".github/workflows/ci.yml").read_text(), Loader=yaml.BaseLoader)
+    steps = workflow["jobs"]["smoke-riscv64"]["steps"]
+    script = next(
+        step["run"]
+        for step in steps
+        if step.get("name") == "Boot riscv64 guest with the inspector RPC on vsock"
+    )
+    assert script.index("sudo modprobe vhost_vsock") < script.index("sudo udevadm settle")
+    assert script.index("sudo udevadm settle") < script.index("sudo chmod 0666 /dev/vhost-vsock")
+    assert script.index("sudo chmod 0666 /dev/vhost-vsock") < script.index(
+        "./target/release/helios-inspector"
+    )
