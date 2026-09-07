@@ -3,15 +3,16 @@ import argparse
 import socketserver
 import threading
 
+from owned_tcp_server import OwnedThreadingTCPServer
+
 
 DEFAULT_CHUNK_BYTES = 1024 * 1024
 DEFAULT_PAYLOAD_BYTES = 64 * 1024 * 1024
 PAYLOAD_CHUNK = bytes(index & 0xFF for index in range(DEFAULT_CHUNK_BYTES))
 
 
-class TcpThroughputServer(socketserver.ThreadingTCPServer):
+class TcpThroughputServer(OwnedThreadingTCPServer):
     allow_reuse_address = True
-    daemon_threads = True
 
     def __init__(
         self,

@@ -12,13 +12,14 @@ import socket
 import socketserver
 import threading
 
+from owned_tcp_server import OwnedThreadingTCPServer
+
 
 RECEIVE_BYTES = 64 * 1024
 
 
-class TcpEchoServer(socketserver.ThreadingTCPServer):
+class TcpEchoServer(OwnedThreadingTCPServer):
     allow_reuse_address = True
-    daemon_threads = True
 
 
 class TcpEchoHandler(socketserver.BaseRequestHandler):

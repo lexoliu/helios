@@ -66,6 +66,61 @@ The boot log states the policy as the kernel applied it:
 Memory policy usable_bytes=… kernel_heap_bytes=… kernel_reserve_bytes=… kernel_growth_chunk_bytes=…
 ```
 
+## What allocates each domain
+
+The kernel heap uses `talc`, with its default binning and manually
+claimed regions, behind `IrqSafeMutex`
+(`kernel/src/memory/irq_safe.rs`). Boundary tags identify neighboring
+blocks, and doubly linked free lists let a free unlink and coalesce
+those neighbors without walking a size class. Allocation uses segregated
+free lists and an availability bitmap. The allocator owns its size-class
+layout and block metadata; the kernel does not duplicate either.
+
+It was a buddy allocator until #246. That allocator found a freed
+block's buddy by walking the block's size class from the head of the
+free list, and walked the list whole whenever the buddy was absent,
+which is the ordinary case in a mass free. Tearing down a hundred
+instances involves tens of thousands of kernel frees. The walk is also why a
+per-processor allocation cache could not sit in front of that heap
+(#169): every block a cache held was a block whose buddy arrived, found
+nothing to merge with, and stayed on the list for every later search to
+walk past.
+
+Heap statistics use Talc's built-in counters under that same lock:
+`total_bytes` is claimed memory, and `allocated_bytes` is claimed memory
+minus actual free-block bytes. This includes permanent allocator
+metadata, block headers, and alignment overhead; requested payload bytes
+remain a separate counter. Reading statistics is constant time.
+Growth includes the request's alignment and allocator overhead before
+rounding to the user pool's power-of-two lend size. A payload that is
+itself a whole growth chunk still needs room for its allocation header;
+a chunk of exactly the payload size cannot serve it.
+
+The first candidate for #246 was `rlsf`. Review reproduced a difference
+between its search size and actual occupied size: two allocations held
+288 bytes while layout-derived accounting charged 320 bytes. Search
+padding is an upper bound, not occupied memory, and `rlsf 0.2.3` does not
+expose a constant-time occupied-block-size query. Talc's counters avoid
+both that approximation and dependency on private header layouts.
+
+The user pool (`kernel/src/memory/user.rs`) remains a buddy heap with a
+per-processor frame slab absorbing single-frame churn. The x86-64 user
+VM returns individual frames through `deallocate_user_frame_on`, not
+multi-frame runs. Returns beyond the shard quota reach the buddy heap;
+an allocation that the heap cannot serve also drains cached frames back
+to it before retrying. The multi-frame pinned-run callers are in the
+aarch64 and riscv backends. Issue #248 tracks the measured cost of the
+actual x86-64 path, not an assumed multi-frame teardown path. Frame-slab
+ownership during concurrent pop and drain is a separate correctness
+repair tracked by #251.
+
+`KernelPhysFrameAllocator` (`kernel/src/memory/pmm.rs`) also contains a
+buddy heap and frame slab, but has no production allocation call path in
+the current tree. Its constructors are used by tests; x86 page-table
+allocation uses `DirectMappedFrameAllocator` and the global allocator.
+Issue #249 was closed as not planned after this call-path check, rather
+than attributing benchmark costs to an unused allocator.
+
 ## Why the split is not a fraction
 
 It used to be. The kernel heap kept a quarter of every boot region and
