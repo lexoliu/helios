@@ -1158,6 +1158,7 @@ where
     let mut splitter = plan.splitter();
 
     let mut user_pool = None;
+    let mut user_regions: ArrayVec<(usize, usize), MAX_BOOT_MEMORY_REGIONS> = ArrayVec::new();
     for (start, end) in regions {
         let shares = splitter.split(start, end);
         if let Some(kernel) = shares.kernel {
@@ -1172,7 +1173,7 @@ where
         let Some(user) = shares.user else {
             continue;
         };
-        let pool = *user_pool.get_or_insert_with(|| {
+        user_pool.get_or_insert_with(|| {
             let pool = memory::install_user_memory_pool(memory::allocate_user_memory_pool());
             pool.configure_processors(processor_count);
             // The swap policy asks which instance a committed page
@@ -1181,7 +1182,7 @@ where
             memory::configure_user_memory_owner_processors(processor_count);
             pool
         });
-        pool.add_region(user.start, user.end);
+        user_regions.push((user.start, user.end));
     }
 
     assert_eq!(
@@ -1190,7 +1191,10 @@ where
         "the boot memory map is smaller than the kernel heap's boot share of {} bytes",
         plan.kernel_boot_bytes
     );
-    user_pool.unwrap_or_else(|| panic!("bootstrap did not provide memory for user pool"))
+    let pool =
+        user_pool.unwrap_or_else(|| panic!("bootstrap did not provide memory for user pool"));
+    pool.initialize(&user_regions);
+    pool
 }
 
 pub fn prime_bootstrap_allocator<Regions>(
