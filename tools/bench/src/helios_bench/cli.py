@@ -25,6 +25,7 @@ from helios_bench.render import (
 )
 from helios_bench.report import Side, load_report, save_report
 from helios_bench.runner import NetworkOptions, RunOptions, run_suite
+from helios_bench.symbols import export_kernel_symbols
 
 README_PATH = REPO_ROOT / "README.md"
 DOCS_PATH = REPO_ROOT / "docs" / "benchmarks.md"
@@ -187,6 +188,12 @@ def command_gate(args: argparse.Namespace) -> int:
     return 1 if report.blocking else 0
 
 
+def command_symbols(args: argparse.Namespace) -> int:
+    for path in export_kernel_symbols(args.root, args.out_dir):
+        print(path)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="helios-bench", description=__doc__)
     subcommands = parser.add_subparsers(dest="command", required=True)
@@ -249,6 +256,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="preserve peer connection state across guest boots for diagnosis; not performance acceptance",
     )
     run.set_defaults(func=command_run)
+
+    symbols = subcommands.add_parser(
+        "symbols", help="export kernel function symbols without code or data contents"
+    )
+    symbols.add_argument("--root", type=Path, default=REPO_ROOT)
+    symbols.add_argument("--out-dir", type=Path, required=True)
+    symbols.set_defaults(func=command_symbols)
 
     lanes = subcommands.add_parser("lanes", help="list the lanes of the manifest")
     lanes.add_argument("--select", default="all", help="a lane name, or all")
