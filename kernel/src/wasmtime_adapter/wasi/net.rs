@@ -1,3 +1,7 @@
+use pin_project_lite::pin_project;
+
+use crate::{ComponentHostNetwork, NetworkHandle, RetiredNetworkHandle, SocketRetirementSender};
+
 use super::*;
 
 pub(crate) fn has_wasi_network_rights(
@@ -45,7 +49,14 @@ pub(super) struct P2ResolveAddressStreamState {
 }
 
 pub(super) struct TcpSocketState {
-    pub(super) service: ComponentHostNetworkService,
+    /// Where this socket's handles go when it dies.
+    ///
+    /// A socket cannot hold the network service: it is a
+    /// `wasi:sockets` resource type, so it reaches `bindgen!` through
+    /// `with:` as a plain path and cannot carry the service's type
+    /// parameter. It holds the ids and this sender instead, and the
+    /// generic store closes what it queues.
+    pub(super) retire: SocketRetirementSender,
     pub(super) family: WasiTcpSocketFamily,
     pub(super) stream: Option<u64>,
     pub(super) listener: Option<u64>,
@@ -60,8 +71,10 @@ pub(super) struct TcpSocketState {
         Option<core::result::Result<crate::TcpListener<u64>, crate::TcpError>>,
     pub(super) listen_backlog: u16,
     pub(super) accept_in_progress: bool,
-    pub(super) accept_result:
-        Option<core::result::Result<crate::TcpAccepted<u64>, crate::TcpError>>,
+    /// The connection a completed accept produced, already a socket of
+    /// its own, waiting for the accept path to turn it into a guest
+    /// resource.
+    pub(super) accept_result: Option<core::result::Result<TcpSocket, crate::TcpError>>,
     pub(super) keep_alive_enabled: bool,
     pub(super) keep_alive_idle_time: u64,
     pub(super) keep_alive_interval: u64,
@@ -71,7 +84,8 @@ pub(super) struct TcpSocketState {
     pub(super) send_buffer_size: u64,
 }
 
-/// The kernel stream a `wasi:sockets` socket owns dies with the socket.
+/// The kernel stream and listener a `wasi:sockets` socket owns die with
+/// the socket.
 ///
 /// `wasi:sockets` hands the guest a resource, and the guest is free to
 /// exit while still holding it: a component's resource destructors run
@@ -82,11 +96,149 @@ pub(super) struct TcpSocketState {
 /// slab slot, after the program that opened it had exited. Ownership
 /// lives here instead: whatever ends this state's life ends the
 /// stream's, with nothing to schedule and nothing to await.
+///
+/// The listener beside it had no retirement path at all until #191,
+/// because the network service offered none. It has two homes here: the
+/// adopted one in `listener`, and the freshly opened one still sitting
+/// in `listen_result` when the socket dies before the listen stream is
+/// polled again. Both are the same listener's two possible resting
+/// places, never two listeners, so retiring whichever is present
+/// retires it exactly once.
+///
+/// A connection this socket accepted needs no line of its own here. It
+/// is parked in `accept_result` as a [`TcpSocket`], so dropping the
+/// field runs this same destructor on it. While the parked value was a
+/// bare stream id nothing owned the connection between the accept task
+/// storing it and the accept path adopting it, and a socket that died
+/// in that window left it in its shard for the rest of the boot (#225).
+///
+/// What changed with the retirement queue is where the close happens,
+/// not who decides it. Ownership still ends here and nothing is
+/// scheduled and nothing awaited; the ids go to the store, which holds
+/// the service, and it closes them on its next turn — the entry to the
+/// next `wasi:sockets` host call at the latest, and its own teardown if
+/// there is no next call.
 impl Drop for TcpSocketState {
     fn drop(&mut self) {
         if let Some(stream) = self.stream.take() {
-            self.service.tcp_close(stream);
+            self.retire.push(RetiredNetworkHandle::TcpStream(stream));
         }
+        let listener = self.listener.take().or_else(|| {
+            self.listen_result
+                .take()
+                .and_then(core::result::Result::ok)
+                .map(|listener| listener.listener)
+        });
+        if let Some(listener) = listener {
+            self.retire
+                .push(RetiredNetworkHandle::TcpListener(listener));
+        }
+    }
+}
+
+/// One accept in flight on a listening socket.
+///
+/// Both `wasi:sockets` generations run the accept on a detached task
+/// and park its answer for the next call to adopt, so what the network
+/// service hands back has to belong to somebody the moment it exists.
+/// The task builds the [`TcpSocket`] itself and parks that: the parked
+/// value owns its stream, in whichever order the socket resource dies
+/// and the accept completes (#225).
+///
+/// Everything the accepted socket needs is captured here while the
+/// caller still holds the state lock, so the task reads nothing back
+/// out of the listening socket and the spawn happens with the lock
+/// released.
+///
+/// The service comes from the host method that starts the accept, not
+/// from the socket: a socket resource holds none. The task therefore
+/// carries a clone of the concrete service and calls it directly, with
+/// no erased handle anywhere on the path.
+pub(super) struct PendingAccept<Net: ComponentHostNetwork> {
+    service: Net,
+    retire: SocketRetirementSender,
+    inner: Arc<Mutex<TcpSocketState>>,
+    ready: Arc<crate::Notify>,
+    listener: u64,
+    family: WasiTcpSocketFamily,
+    local_address: WasiTcpSocketAddress,
+}
+
+impl<Net: ComponentHostNetwork> PendingAccept<Net> {
+    /// Mark an accept in progress on a listening socket the caller has
+    /// locked.
+    ///
+    /// `None` when the socket has no local address: `listener` and
+    /// `local_address` are set together, and the accepted socket
+    /// inherits the listening one's address, so a socket without one
+    /// cannot describe the connection it is about to take. The caller
+    /// reports that broken invariant in its own vocabulary.
+    pub(super) fn start(
+        socket: &TcpSocket,
+        state: &mut TcpSocketState,
+        service: Net,
+        listener: u64,
+    ) -> Option<Self> {
+        let local_address = state.local_address?;
+        state.accept_in_progress = true;
+        Some(Self {
+            service,
+            retire: state.retire.clone(),
+            inner: socket.inner.clone(),
+            ready: socket.ready.clone(),
+            listener,
+            family: state.family,
+            local_address,
+        })
+    }
+
+    /// Run the accept on a detached task, parking the socket it
+    /// produces.
+    ///
+    /// The caller must have released the socket's state lock: this
+    /// takes it again to clear `accept_in_progress` when the executor
+    /// refuses the task.
+    pub(super) fn spawn<CpuImpl>(
+        self,
+        spawner: &crate::InstanceSpawner<CpuImpl>,
+    ) -> core::result::Result<(), crate::TaskCapacityError>
+    where
+        CpuImpl: Cpu + Clone,
+    {
+        let Self {
+            service,
+            retire,
+            inner,
+            ready,
+            listener,
+            family,
+            local_address,
+        } = self;
+        let spawned = spawner.try_spawn_detached({
+            let inner = inner.clone();
+            async move {
+                let accepted = service
+                    .tcp_accept(NetworkHandle::from_raw(listener), u64::MAX)
+                    .await
+                    .map(|accepted| {
+                        TcpSocket::from_accepted(retire, family, local_address, accepted)
+                    });
+                let mut state = inner.lock();
+                state.accept_in_progress = false;
+                state.accept_result = Some(accepted);
+                ready.notify_all();
+            }
+        });
+        if let Err(error) = spawned {
+            inner.lock().accept_in_progress = false;
+            tracing::warn!(
+                target: "helios_kernel::program",
+                %error,
+                "refused a tcp accept task: the executor's instance share is full"
+            );
+            return Err(error);
+        }
+        Ok(())
     }
 }
 
@@ -106,38 +258,117 @@ pub struct P2OutgoingDatagramStream {
     pub(super) check_send_permit_count: u64,
 }
 
-pub(super) struct TcpReadStreamProducer {
-    pub(super) socket: TcpSocket,
-    pub(super) pending: Option<Pin<Box<dyn core::future::Future<Output = TcpReadResult> + Send>>>,
-    pub(super) completion:
-        Option<oneshot::Sender<core::result::Result<(), socket_types::ErrorCode>>>,
+/// One read on a socket, as a future the producer can own by value.
+///
+/// A free `async fn` rather than a method so its future has a type the
+/// producer can name through a `Fut` parameter: everything it needs is
+/// owned, so the future borrows nothing and outlives any one poll.
+async fn read_socket<Net: ComponentHostNetwork>(
+    socket: TcpSocket,
+    service: Net,
+    max_bytes: u32,
+) -> TcpReadResult {
+    socket.read(&service, max_bytes).await
 }
 
-impl Unpin for TcpReadStreamProducer {}
-
-pub(super) struct TcpWriteConsumer {
-    pub(super) socket: TcpSocket,
-    pub(super) pending: Option<Pin<Box<dyn core::future::Future<Output = TcpWriteResult> + Send>>>,
-    pub(super) completion:
-        Option<oneshot::Sender<core::result::Result<(), socket_types::ErrorCode>>>,
+/// One write on a socket, as a future the consumer can own by value.
+async fn write_socket<Net: ComponentHostNetwork>(
+    socket: TcpSocket,
+    service: Net,
+    bytes: Bytes,
+) -> TcpWriteResult {
+    socket.write_all_bytes(&service, bytes).await
 }
 
-impl Unpin for TcpWriteConsumer {}
+pin_project! {
+    /// The `wasi:sockets` `receive` stream, reading through the
+    /// machine's own network service.
+    ///
+    /// The in-flight read is held by value under a `Fut` parameter that
+    /// [`tcp_read_producer`] infers from [`read_socket`], and `start`
+    /// is the function pointer that mints the next one. A boxed
+    /// `dyn Future` here would erase the service the whole component
+    /// host is generic over for the sake of one field.
+    pub(super) struct TcpReadStreamProducer<Net, Fut>
+    where
+        Net: ComponentHostNetwork,
+    {
+        pub(super) socket: TcpSocket,
+        pub(super) service: Net,
+        pub(super) start: fn(TcpSocket, Net, u32) -> Fut,
+        #[pin]
+        pub(super) pending: Option<Fut>,
+        pub(super) completion:
+            Option<oneshot::Sender<core::result::Result<(), socket_types::ErrorCode>>>,
+    }
 
-pub(super) struct TcpListenStreamProducer<T, CpuImpl, HostFs>
+    impl<Net, Fut> PinnedDrop for TcpReadStreamProducer<Net, Fut>
+    where
+        Net: ComponentHostNetwork,
+    {
+        fn drop(this: Pin<&mut Self>) {
+            complete_socket_transfer(this.project().completion, Ok(()));
+        }
+    }
+}
+
+pin_project! {
+    /// The `wasi:sockets` `send` stream, writing through the machine's
+    /// own network service. The mirror of [`TcpReadStreamProducer`].
+    pub(super) struct TcpWriteConsumer<Net, Fut>
+    where
+        Net: ComponentHostNetwork,
+    {
+        pub(super) socket: TcpSocket,
+        pub(super) service: Net,
+        pub(super) start: fn(TcpSocket, Net, Bytes) -> Fut,
+        #[pin]
+        pub(super) pending: Option<Fut>,
+        pub(super) completion:
+            Option<oneshot::Sender<core::result::Result<(), socket_types::ErrorCode>>>,
+    }
+
+    impl<Net, Fut> PinnedDrop for TcpWriteConsumer<Net, Fut>
+    where
+        Net: ComponentHostNetwork,
+    {
+        fn drop(this: Pin<&mut Self>) {
+            complete_socket_transfer(this.project().completion, Ok(()));
+        }
+    }
+}
+
+/// Answers the `future<result>` a `send` or `receive` handed the guest,
+/// once. A dropped receiver means the guest stopped caring, which is
+/// not this side's problem.
+fn complete_socket_transfer(
+    completion: &mut Option<oneshot::Sender<core::result::Result<(), socket_types::ErrorCode>>>,
+    result: core::result::Result<(), socket_types::ErrorCode>,
+) {
+    if let Some(sender) = completion.take() {
+        let _ = sender.send(result);
+    }
+}
+
+pub(super) struct TcpListenStreamProducer<T, CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     pub(super) socket: TcpSocket,
-    pub(super) get_store_data: for<'a> fn(&'a mut T) -> &'a mut StoreData<CpuImpl, HostFs>,
+    /// The service every accept this stream starts runs on, taken from
+    /// the store when the listen began.
+    pub(super) service: Net,
+    pub(super) get_store_data: for<'a> fn(&'a mut T) -> &'a mut StoreData<CpuImpl, Net, HostFs>,
     pub(super) spawner: crate::InstanceSpawner<CpuImpl>,
     pub(super) waiter: crate::NotifyWaiter,
 }
 
-impl<T, CpuImpl, HostFs> Unpin for TcpListenStreamProducer<T, CpuImpl, HostFs>
+impl<T, CpuImpl, Net, HostFs> Unpin for TcpListenStreamProducer<T, CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
 }
@@ -261,10 +492,10 @@ impl P2ResolveAddressStream {
 }
 
 impl TcpSocket {
-    pub(super) fn new(service: ComponentHostNetworkService, family: WasiTcpSocketFamily) -> Self {
+    pub(super) fn new(retire: SocketRetirementSender, family: WasiTcpSocketFamily) -> Self {
         Self {
             inner: Arc::new(Mutex::new(TcpSocketState {
-                service,
+                retire,
                 family,
                 stream: None,
                 listener: None,
@@ -292,7 +523,7 @@ impl TcpSocket {
     }
 
     pub(super) fn accepted(
-        service: ComponentHostNetworkService,
+        retire: SocketRetirementSender,
         family: WasiTcpSocketFamily,
         stream: u64,
         local_address: WasiTcpSocketAddress,
@@ -300,7 +531,7 @@ impl TcpSocket {
     ) -> Self {
         Self {
             inner: Arc::new(Mutex::new(TcpSocketState {
-                service,
+                retire,
                 family,
                 stream: Some(stream),
                 listener: None,
@@ -325,6 +556,39 @@ impl TcpSocket {
             })),
             ready: Arc::new(crate::Notify::new()),
         }
+    }
+
+    /// The socket one completed accept produced.
+    ///
+    /// The connection belongs to the returned value from here: its
+    /// `TcpSocketState` retires the stream whether the socket becomes a
+    /// guest resource or is dropped while still parked in
+    /// `accept_result`.
+    pub(super) fn from_accepted<Stream: NetworkHandle>(
+        retire: SocketRetirementSender,
+        family: WasiTcpSocketFamily,
+        local_address: WasiTcpSocketAddress,
+        accepted: crate::TcpAccepted<Stream>,
+    ) -> Self {
+        let remote_address = match accepted.address {
+            crate::NetworkIpAddress::Ipv4(address) => WasiTcpIpAddress::Ipv4(address),
+            crate::NetworkIpAddress::Ipv6(address) => WasiTcpIpAddress::Ipv6(address),
+        };
+        assert_eq!(
+            remote_address.family(),
+            family,
+            "tcp accept returned a peer address for the wrong socket family"
+        );
+        Self::accepted(
+            retire,
+            family,
+            accepted.stream.into_raw(),
+            local_address,
+            WasiTcpSocketAddress {
+                address: remote_address,
+                port: accepted.port,
+            },
+        )
     }
 
     pub(super) fn family(&self) -> WasiTcpSocketFamily {
@@ -521,42 +785,43 @@ impl TcpSocket {
     /// the descriptor and handed to `connect`/`listen`, which apply it before
     /// the first packet leaves. Once a stream or listener exists the change
     /// takes effect on the live socket.
-    pub(super) fn set_hop_limit(
+    pub(super) fn set_hop_limit<Net: ComponentHostNetwork>(
         &self,
+        service: &Net,
         value: u8,
     ) -> core::result::Result<(), socket_types::ErrorCode> {
         if value == 0 {
             return Err(socket_types::ErrorCode::InvalidArgument);
         }
-        let (service, stream, listener) = {
+        let (stream, listener) = {
             let mut state = self.inner.lock();
             state.hop_limit = value;
-            (state.service.clone(), state.stream, state.listener)
+            (state.stream, state.listener)
         };
         if let Some(stream) = stream {
             service
-                .tcp_set_hop_limit(stream, value)
+                .tcp_set_hop_limit(NetworkHandle::from_raw(stream), value)
                 .map_err(map_p3_tcp_error)?;
         }
         if let Some(listener) = listener {
             service
-                .tcp_listener_set_hop_limit(listener, value)
+                .tcp_listener_set_hop_limit(NetworkHandle::from_raw(listener), value)
                 .map_err(map_p3_tcp_error)?;
         }
         Ok(())
     }
 
-    pub(super) async fn connect(
+    pub(super) async fn connect<Net: ComponentHostNetwork>(
         &self,
+        service: &Net,
         remote_address: WasiTcpSocketAddress,
     ) -> core::result::Result<(), socket_types::ErrorCode> {
-        let (service, local_port, hop_limit) = {
+        let (local_port, hop_limit) = {
             let state = self.inner.lock();
             if state.stream.is_some() {
                 return Err(socket_types::ErrorCode::InvalidState);
             }
             (
-                state.service.clone(),
                 state.local_address.map_or(0, |address| address.port),
                 state.hop_limit,
             )
@@ -572,15 +837,16 @@ impl TcpSocket {
             .await
             .map_err(map_p3_tcp_error)?;
         let mut state = self.inner.lock();
-        state.stream = Some(stream);
+        state.stream = Some(stream.into_raw());
         state.remote_address = Some(remote_address);
         state.receive_shutdown = false;
         state.send_shutdown = false;
         Ok(())
     }
 
-    pub(super) async fn write_all_bytes(
+    pub(super) async fn write_all_bytes<Net: ComponentHostNetwork>(
         &self,
+        service: &Net,
         bytes: Bytes,
     ) -> core::result::Result<(), socket_types::ErrorCode> {
         if bytes.is_empty() {
@@ -589,33 +855,33 @@ impl TcpSocket {
         if self.inner.lock().send_shutdown {
             return Err(socket_types::ErrorCode::InvalidState);
         }
-        let (service, stream) = self.connected_stream()?;
+        let stream = self.connected_stream()?;
         service
-            .tcp_write_all_bytes(stream, bytes, u64::MAX)
+            .tcp_write_all_bytes(NetworkHandle::from_raw(stream), bytes, u64::MAX)
             .await
             .map_err(map_p3_tcp_error)
     }
 
-    pub(super) async fn read(
+    pub(super) async fn read<Net: ComponentHostNetwork>(
         &self,
+        service: &Net,
         max_bytes: u32,
     ) -> core::result::Result<Option<Bytes>, socket_types::ErrorCode> {
         if self.inner.lock().receive_shutdown {
             return Ok(None);
         }
-        let (service, stream) = self.connected_stream()?;
+        let stream = self.connected_stream()?;
         service
-            .tcp_read(stream, max_bytes, u64::MAX)
+            .tcp_read(NetworkHandle::from_raw(stream), max_bytes, u64::MAX)
             .await
             .map_err(map_p3_tcp_error)
     }
 
-    pub(super) fn connected_stream(
-        &self,
-    ) -> core::result::Result<(ComponentHostNetworkService, u64), socket_types::ErrorCode> {
-        let state = self.inner.lock();
-        let stream = state.stream.ok_or(socket_types::ErrorCode::InvalidState)?;
-        Ok((state.service.clone(), stream))
+    pub(super) fn connected_stream(&self) -> core::result::Result<u64, socket_types::ErrorCode> {
+        self.inner
+            .lock()
+            .stream
+            .ok_or(socket_types::ErrorCode::InvalidState)
     }
 
     pub(super) fn shutdown_receive(&self) -> core::result::Result<(), socket_types::ErrorCode> {
@@ -627,32 +893,30 @@ impl TcpSocket {
         Ok(())
     }
 
-    pub(super) fn shutdown_send_state(
-        &self,
-    ) -> core::result::Result<(ComponentHostNetworkService, u64), socket_types::ErrorCode> {
+    pub(super) fn shutdown_send_state(&self) -> core::result::Result<u64, socket_types::ErrorCode> {
         let mut state = self.inner.lock();
         let stream = state.stream.ok_or(socket_types::ErrorCode::InvalidState)?;
-        if state.send_shutdown {
-            return Ok((state.service.clone(), stream));
-        }
         state.send_shutdown = true;
-        Ok((state.service.clone(), stream))
+        Ok(stream)
     }
 }
 
-impl<T, CpuImpl, HostFs> TcpListenStreamProducer<T, CpuImpl, HostFs>
+impl<T, CpuImpl, Net, HostFs> TcpListenStreamProducer<T, CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     pub(super) fn new(
         socket: TcpSocket,
-        get_store_data: for<'a> fn(&'a mut T) -> &'a mut StoreData<CpuImpl, HostFs>,
+        service: Net,
+        get_store_data: for<'a> fn(&'a mut T) -> &'a mut StoreData<CpuImpl, Net, HostFs>,
         spawner: crate::InstanceSpawner<CpuImpl>,
     ) -> Self {
         let waiter = socket.ready.waiter();
         Self {
             socket,
+            service,
             get_store_data,
             spawner,
             waiter,
@@ -660,10 +924,11 @@ where
     }
 }
 
-impl<T, CpuImpl, HostFs> StreamProducer<T> for TcpListenStreamProducer<T, CpuImpl, HostFs>
+impl<T, CpuImpl, Net, HostFs> StreamProducer<T> for TcpListenStreamProducer<T, CpuImpl, Net, HostFs>
 where
     T: 'static,
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     type Item = Resource<TcpSocket>;
@@ -715,39 +980,7 @@ where
                     wait_for_socket = true;
                 } else if let Some(result) = state.accept_result.take() {
                     match result {
-                        Ok(accepted) => {
-                            let Some(local_address) = state.local_address else {
-                                return Poll::Ready(Err(wasmtime::Error::new(
-                                    P3TcpListenStreamError {
-                                        operation: P3TcpListenStreamOperation::LocalAddress,
-                                        source: None,
-                                    },
-                                )));
-                            };
-                            let remote_address = match accepted.address {
-                                crate::NetworkIpAddress::Ipv4(address) => {
-                                    WasiTcpIpAddress::Ipv4(address)
-                                }
-                                crate::NetworkIpAddress::Ipv6(address) => {
-                                    WasiTcpIpAddress::Ipv6(address)
-                                }
-                            };
-                            assert_eq!(
-                                remote_address.family(),
-                                state.family,
-                                "tcp accept returned a peer address for the wrong socket family"
-                            );
-                            accepted_socket = Some(TcpSocket::accepted(
-                                state.service.clone(),
-                                state.family,
-                                accepted.stream,
-                                local_address,
-                                WasiTcpSocketAddress {
-                                    address: remote_address,
-                                    port: accepted.port,
-                                },
-                            ));
-                        }
+                        Ok(socket) => accepted_socket = Some(socket),
                         Err(error) => {
                             return Poll::Ready(Err(wasmtime::Error::new(
                                 P3TcpListenStreamError {
@@ -760,13 +993,18 @@ where
                 } else if state.accept_in_progress {
                     wait_for_socket = true;
                 } else if let Some(listener) = state.listener {
-                    state.accept_in_progress = true;
-                    start_accept = Some((
-                        state.service.clone(),
-                        this.socket.inner.clone(),
-                        this.socket.ready.clone(),
+                    let Some(pending) = PendingAccept::start(
+                        &this.socket,
+                        &mut state,
+                        this.service.clone(),
                         listener,
-                    ));
+                    ) else {
+                        return Poll::Ready(Err(wasmtime::Error::new(P3TcpListenStreamError {
+                            operation: P3TcpListenStreamOperation::LocalAddress,
+                            source: None,
+                        })));
+                    };
+                    start_accept = Some(pending);
                 } else {
                     return Poll::Ready(Err(wasmtime::Error::new(P3TcpListenStreamError {
                         operation: P3TcpListenStreamOperation::InvalidState,
@@ -782,24 +1020,8 @@ where
                 return Poll::Ready(Ok(StreamResult::Completed));
             }
 
-            if let Some((service, inner, ready, listener)) = start_accept {
-                let spawned = this.spawner.try_spawn_detached({
-                    let inner = inner.clone();
-                    async move {
-                        let result = service.tcp_accept(listener, u64::MAX).await;
-                        let mut state = inner.lock();
-                        state.accept_in_progress = false;
-                        state.accept_result = Some(result);
-                        ready.notify_all();
-                    }
-                });
-                if let Err(error) = spawned {
-                    inner.lock().accept_in_progress = false;
-                    tracing::warn!(
-                        target: "helios_kernel::program",
-                        %error,
-                        "refused a tcp accept task: the executor's instance share is full"
-                    );
+            if let Some(pending) = start_accept {
+                if pending.spawn(&this.spawner).is_err() {
                     return Poll::Ready(Err(wasmtime::Error::new(P3TcpListenStreamError {
                         operation: P3TcpListenStreamOperation::TaskCapacity,
                         source: None,
@@ -818,82 +1040,76 @@ where
     }
 }
 
-impl TcpReadStreamProducer {
-    pub(super) fn new(
-        socket: TcpSocket,
-        completion: oneshot::Sender<core::result::Result<(), socket_types::ErrorCode>>,
-    ) -> Self {
-        Self {
-            socket,
-            pending: None,
-            completion: Some(completion),
-        }
-    }
-
-    pub(super) fn complete(&mut self, result: core::result::Result<(), socket_types::ErrorCode>) {
-        if let Some(tx) = self.completion.take() {
-            let _ = tx.send(result);
-        }
+/// The `receive` stream for one socket, with the read future's type
+/// inferred here and carried by the producer.
+pub(super) fn tcp_read_producer<Net: ComponentHostNetwork>(
+    socket: TcpSocket,
+    service: Net,
+    completion: oneshot::Sender<core::result::Result<(), socket_types::ErrorCode>>,
+) -> TcpReadStreamProducer<Net, impl core::future::Future<Output = TcpReadResult> + Send> {
+    TcpReadStreamProducer {
+        socket,
+        service,
+        start: read_socket::<Net>,
+        pending: None,
+        completion: Some(completion),
     }
 }
 
-impl Drop for TcpReadStreamProducer {
-    fn drop(&mut self) {
-        self.complete(Ok(()));
-    }
-}
-
-impl<T: 'static> StreamProducer<T> for TcpReadStreamProducer {
+impl<T, Net, Fut> StreamProducer<T> for TcpReadStreamProducer<Net, Fut>
+where
+    T: 'static,
+    Net: ComponentHostNetwork,
+    Fut: core::future::Future<Output = TcpReadResult> + Send + 'static,
+{
     type Item = u8;
     type Buffer = BytesStreamBuffer;
 
     fn poll_produce(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         mut store: wasmtime::StoreContextMut<'_, T>,
         mut destination: Destination<'_, Self::Item, Self::Buffer>,
         finish: bool,
     ) -> Poll<Result<StreamResult>> {
+        let mut this = self.project();
         if finish {
-            self.complete(Ok(()));
+            complete_socket_transfer(this.completion, Ok(()));
             return Poll::Ready(Ok(StreamResult::Cancelled));
         }
 
         loop {
-            if self.pending.is_none() {
+            if this.pending.is_none() {
                 let capacity = destination.remaining(&mut store);
                 if capacity == Some(0) {
                     return Poll::Ready(Ok(StreamResult::Completed));
                 }
-                let socket = self.socket.clone();
                 let capacity = capacity.unwrap_or(FILE_READ_CHUNK_BYTES);
                 let max_bytes = u32::try_from(capacity).unwrap_or(u32::MAX);
-                self.pending = Some(Box::pin(async move { socket.read(max_bytes).await }));
+                let read = (*this.start)(this.socket.clone(), this.service.clone(), max_bytes);
+                this.pending.set(Some(read));
             }
 
-            let pending = self
-                .pending
-                .as_mut()
-                .expect("tcp read future must be present before polling");
-            match pending.as_mut().poll(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Ok(Some(bytes))) if bytes.is_empty() => {
-                    self.pending = None;
-                    continue;
-                }
-                Poll::Ready(Ok(Some(bytes))) => {
-                    self.pending = None;
+            let result = match this.pending.as_mut().as_pin_mut() {
+                Some(pending) => match pending.poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(result) => result,
+                },
+                None => unreachable!("tcp read future must be present before polling"),
+            };
+            this.pending.set(None);
+            match result {
+                Ok(Some(bytes)) if bytes.is_empty() => continue,
+                Ok(Some(bytes)) => {
                     destination.set_buffer(BytesStreamBuffer::new(bytes));
                     return Poll::Ready(Ok(StreamResult::Completed));
                 }
-                Poll::Ready(Ok(None)) => {
-                    self.pending = None;
-                    self.complete(Ok(()));
+                Ok(None) => {
+                    complete_socket_transfer(this.completion, Ok(()));
                     return Poll::Ready(Ok(StreamResult::Dropped));
                 }
-                Poll::Ready(Err(error)) => {
-                    self.pending = None;
-                    self.complete(Err(error));
+                Err(error) => {
+                    complete_socket_transfer(this.completion, Err(error));
                     return Poll::Ready(Ok(StreamResult::Dropped));
                 }
             }
@@ -901,69 +1117,67 @@ impl<T: 'static> StreamProducer<T> for TcpReadStreamProducer {
     }
 }
 
-impl TcpWriteConsumer {
-    pub(super) fn new(
-        socket: TcpSocket,
-        completion: oneshot::Sender<core::result::Result<(), socket_types::ErrorCode>>,
-    ) -> Self {
-        Self {
-            socket,
-            pending: None,
-            completion: Some(completion),
-        }
-    }
-
-    pub(super) fn complete(&mut self, result: core::result::Result<(), socket_types::ErrorCode>) {
-        if let Some(tx) = self.completion.take() {
-            let _ = tx.send(result);
-        }
+/// The `send` stream for one socket, with the write future's type
+/// inferred here and carried by the consumer.
+pub(super) fn tcp_write_consumer<Net: ComponentHostNetwork>(
+    socket: TcpSocket,
+    service: Net,
+    completion: oneshot::Sender<core::result::Result<(), socket_types::ErrorCode>>,
+) -> TcpWriteConsumer<Net, impl core::future::Future<Output = TcpWriteResult> + Send> {
+    TcpWriteConsumer {
+        socket,
+        service,
+        start: write_socket::<Net>,
+        pending: None,
+        completion: Some(completion),
     }
 }
 
-impl Drop for TcpWriteConsumer {
-    fn drop(&mut self) {
-        self.complete(Ok(()));
-    }
-}
-
-impl<T: 'static> StreamConsumer<T> for TcpWriteConsumer {
+impl<T, Net, Fut> StreamConsumer<T> for TcpWriteConsumer<Net, Fut>
+where
+    T: 'static,
+    Net: ComponentHostNetwork,
+    Fut: core::future::Future<Output = TcpWriteResult> + Send + 'static,
+{
     type Item = u8;
 
     fn poll_consume(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         mut store: wasmtime::StoreContextMut<'_, T>,
         mut source: Source<'_, Self::Item>,
         _: bool,
     ) -> Poll<Result<StreamResult>> {
+        let mut this = self.project();
         loop {
-            if self.pending.is_none() {
+            if this.pending.is_none() {
                 let available = source.remaining(&mut store);
                 if available == 0 {
-                    self.complete(Ok(()));
+                    complete_socket_transfer(this.completion, Ok(()));
                     return Poll::Ready(Ok(StreamResult::Completed));
                 }
                 let mut bytes = Vec::with_capacity(available);
                 source.read(&mut store, &mut bytes)?;
-                let socket = self.socket.clone();
-                self.pending = Some(Box::pin(async move {
-                    socket.write_all_bytes(Bytes::from(bytes)).await
-                }));
+                let write = (*this.start)(
+                    this.socket.clone(),
+                    this.service.clone(),
+                    Bytes::from(bytes),
+                );
+                this.pending.set(Some(write));
             }
 
-            let pending = self
-                .pending
-                .as_mut()
-                .expect("tcp write future must be present before polling");
-            match pending.as_mut().poll(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Ok(())) => {
-                    self.pending = None;
-                    continue;
-                }
-                Poll::Ready(Err(error)) => {
-                    self.pending = None;
-                    self.complete(Err(error));
+            let result = match this.pending.as_mut().as_pin_mut() {
+                Some(pending) => match pending.poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(result) => result,
+                },
+                None => unreachable!("tcp write future must be present before polling"),
+            };
+            this.pending.set(None);
+            match result {
+                Ok(()) => continue,
+                Err(error) => {
+                    complete_socket_transfer(this.completion, Err(error));
                     return Poll::Ready(Ok(StreamResult::Dropped));
                 }
             }
@@ -990,7 +1204,9 @@ pub(super) struct BoundUdpSocket {
 }
 
 pub(super) struct UdpSocketState {
-    pub(super) service: ComponentHostNetworkService,
+    /// Where this socket's kernel socket goes when it dies, for the
+    /// same reason [`TcpSocketState::retire`] exists.
+    pub(super) retire: SocketRetirementSender,
     pub(super) family: WasiUdpSocketFamily,
     pub(super) bound: Option<BoundUdpSocket>,
     pub(super) pending_bind: Option<BoundUdpSocket>,
@@ -999,6 +1215,33 @@ pub(super) struct UdpSocketState {
     pub(super) receive_buffer_size: u64,
     pub(super) send_buffer_size: u64,
     pub(super) open_stream_handles: usize,
+}
+
+/// The kernel socket a `wasi:sockets` datagram socket owns dies with
+/// the socket.
+///
+/// The same rule as [`TcpSocketState`], for the same reason: a
+/// component's resource destructors run when the *guest* drops a
+/// handle and never when the store around it is torn down, so a
+/// program that exits holding a `udp-socket` retires nothing. A
+/// datagram socket is installed on every shard and holds a slot in
+/// `udp_slots`, so one left behind costs the whole set (#190).
+/// Ownership lives here instead: whatever ends this state's life ends
+/// the socket's, with nothing to schedule and nothing to await.
+///
+/// A `pending_bind` is retired too. `start-bind` allocates the kernel
+/// socket before `finish-bind` promotes it, and a guest is free to
+/// exit between the two.
+impl Drop for UdpSocketState {
+    fn drop(&mut self) {
+        for bound in [self.bound.take(), self.pending_bind.take()]
+            .into_iter()
+            .flatten()
+        {
+            self.retire
+                .push(RetiredNetworkHandle::UdpSocket(bound.socket));
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1020,10 +1263,10 @@ pub(super) struct WasiUdpSocketDatagram {
 }
 
 impl UdpSocket {
-    pub(super) fn new(service: ComponentHostNetworkService, family: WasiUdpSocketFamily) -> Self {
+    pub(super) fn new(retire: SocketRetirementSender, family: WasiUdpSocketFamily) -> Self {
         Self {
             inner: Arc::new(Mutex::new(UdpSocketState {
-                service,
+                retire,
                 family,
                 bound: None,
                 pending_bind: None,
@@ -1077,21 +1320,22 @@ impl UdpSocket {
     ///
     /// An unbound socket has no stack socket yet, so the value is applied when
     /// the bind completes; a bound socket takes it immediately.
-    pub(super) fn set_unicast_hop_limit(
+    pub(super) fn set_unicast_hop_limit<Net: ComponentHostNetwork>(
         &self,
+        service: &Net,
         value: u8,
     ) -> core::result::Result<(), WasiUdpSocketError> {
         if value == 0 {
             return Err(WasiUdpSocketError::InvalidArgument);
         }
-        let (service, bound) = {
+        let bound = {
             let mut state = self.inner.lock();
             state.hop_limit = value;
-            (state.service.clone(), state.bound.or(state.pending_bind))
+            state.bound.or(state.pending_bind)
         };
         if let Some(bound) = bound {
             service
-                .udp_set_hop_limit(bound.socket, value)
+                .udp_set_hop_limit(NetworkHandle::from_raw(bound.socket), value)
                 .map_err(WasiUdpSocketError::Backend)?;
         }
         Ok(())
@@ -1127,20 +1371,22 @@ impl UdpSocket {
         Ok(())
     }
 
-    pub(super) async fn bind(
+    pub(super) async fn bind<Net: ComponentHostNetwork>(
         &self,
+        service: &Net,
         local_address: WasiUdpSocketAddress,
     ) -> core::result::Result<(), WasiUdpSocketError> {
         validate_udp_local_address(self.family(), local_address)?;
-        self.bind_backend(local_address.port, false).await
+        self.bind_backend(service, local_address.port, false).await
     }
 
-    pub(super) async fn start_bind_p2(
+    pub(super) async fn start_bind_p2<Net: ComponentHostNetwork>(
         &self,
+        service: &Net,
         local_address: WasiUdpSocketAddress,
     ) -> core::result::Result<(), WasiUdpSocketError> {
         validate_udp_local_address(self.family(), local_address)?;
-        self.bind_backend(local_address.port, true).await
+        self.bind_backend(service, local_address.port, true).await
     }
 
     pub(super) fn finish_bind_p2(&self) -> core::result::Result<(), WasiUdpSocketError> {
@@ -1156,15 +1402,19 @@ impl UdpSocket {
         Ok(())
     }
 
-    pub(super) async fn connect(
+    pub(super) async fn connect<Net: ComponentHostNetwork>(
         &self,
+        service: &Net,
         remote_address: WasiUdpSocketAddress,
     ) -> core::result::Result<(), WasiUdpSocketError> {
         validate_udp_remote_address(self.family(), remote_address)?;
-        let bound = self.ensure_bound(0).await?;
-        let service = self.inner.lock().service.clone();
+        let bound = self.ensure_bound(service, 0).await?;
         service
-            .udp_connect(bound.socket, remote_address.address, remote_address.port)
+            .udp_connect(
+                NetworkHandle::from_raw(bound.socket),
+                remote_address.address,
+                remote_address.port,
+            )
             .map_err(WasiUdpSocketError::Backend)?;
         let mut state = self.inner.lock();
         assert_eq!(
@@ -1176,22 +1426,25 @@ impl UdpSocket {
         Ok(())
     }
 
-    pub(super) fn disconnect(&self) -> core::result::Result<(), WasiUdpSocketError> {
+    pub(super) fn disconnect<Net: ComponentHostNetwork>(
+        &self,
+        service: &Net,
+    ) -> core::result::Result<(), WasiUdpSocketError> {
         let mut state = self.inner.lock();
         if state.remote_address.is_none() {
             return Err(WasiUdpSocketError::InvalidState);
         }
         let bound = state.bound.ok_or(WasiUdpSocketError::InvalidState)?;
-        let service = state.service.clone();
         service
-            .udp_disconnect(bound.socket)
+            .udp_disconnect(NetworkHandle::from_raw(bound.socket))
             .map_err(WasiUdpSocketError::Backend)?;
         state.remote_address = None;
         Ok(())
     }
 
-    pub(super) fn open_p2_streams(
+    pub(super) fn open_p2_streams<Net: ComponentHostNetwork>(
         &self,
+        service: &Net,
         remote_address: Option<WasiUdpSocketAddress>,
     ) -> core::result::Result<
         (P2IncomingDatagramStream, P2OutgoingDatagramStream),
@@ -1210,14 +1463,17 @@ impl UdpSocket {
             }
             state.bound.expect("UDP socket bound state checked above")
         };
-        let service = self.inner.lock().service.clone();
         if let Some(remote_address) = remote_address {
             service
-                .udp_connect(bound.socket, remote_address.address, remote_address.port)
+                .udp_connect(
+                    NetworkHandle::from_raw(bound.socket),
+                    remote_address.address,
+                    remote_address.port,
+                )
                 .map_err(WasiUdpSocketError::Backend)?;
         } else if self.inner.lock().remote_address.is_some() {
             service
-                .udp_disconnect(bound.socket)
+                .udp_disconnect(NetworkHandle::from_raw(bound.socket))
                 .map_err(WasiUdpSocketError::Backend)?;
         }
         let mut state = self.inner.lock();
@@ -1240,7 +1496,7 @@ impl UdpSocket {
         Ok((incoming, outgoing))
     }
 
-    pub(super) fn release_stream_handle(&self) {
+    pub(super) fn release_stream_handle<Net: ComponentHostNetwork>(&self, service: &Net) {
         let mut state = self.inner.lock();
         if state.open_stream_handles == 0 {
             return;
@@ -1249,16 +1505,16 @@ impl UdpSocket {
         if state.open_stream_handles == 0
             && let (Some(bound), Some(_)) = (state.bound, state.remote_address)
         {
-            let service = state.service.clone();
             service
-                .udp_disconnect(bound.socket)
+                .udp_disconnect(NetworkHandle::from_raw(bound.socket))
                 .unwrap_or_else(|error| panic!("failed to disconnect closed UDP streams: {error}"));
             state.remote_address = None;
         }
     }
 
-    pub(super) async fn send_datagram(
+    pub(super) async fn send_datagram<Net: ComponentHostNetwork>(
         &self,
+        service: &Net,
         bytes: &[u8],
         remote_address: Option<WasiUdpSocketAddress>,
         timeout_nanos: u64,
@@ -1270,11 +1526,10 @@ impl UdpSocket {
             let state = self.inner.lock();
             resolve_udp_send_target(&state, remote_address)?
         };
-        let bound = self.ensure_bound(0).await?;
-        let service = self.inner.lock().service.clone();
+        let bound = self.ensure_bound(service, 0).await?;
         let written = service
             .udp_send_address(
-                bound.socket,
+                NetworkHandle::from_raw(bound.socket),
                 target.address,
                 target.port,
                 bytes,
@@ -1289,8 +1544,9 @@ impl UdpSocket {
         Ok(())
     }
 
-    pub(super) async fn receive_datagram(
+    pub(super) async fn receive_datagram<Net: ComponentHostNetwork>(
         &self,
+        service: &Net,
         remote_address: Option<WasiUdpSocketAddress>,
         timeout_nanos: u64,
     ) -> core::result::Result<WasiUdpSocketDatagram, WasiUdpSocketError> {
@@ -1306,11 +1562,10 @@ impl UdpSocket {
             .lock()
             .bound
             .ok_or(WasiUdpSocketError::InvalidState)?;
-        let service = self.inner.lock().service.clone();
         loop {
             let datagram = service
                 .udp_receive(
-                    bound.socket,
+                    NetworkHandle::from_raw(bound.socket),
                     MAX_WASI_UDP_DATAGRAM_BYTES as u32,
                     timeout_nanos,
                 )
@@ -1340,17 +1595,18 @@ impl UdpSocket {
         }
     }
 
-    pub(super) async fn bind_backend(
+    pub(super) async fn bind_backend<Net: ComponentHostNetwork>(
         &self,
+        service: &Net,
         local_port: u16,
         pending_bind: bool,
     ) -> core::result::Result<(), WasiUdpSocketError> {
-        let (service, hop_limit) = {
+        let hop_limit = {
             let state = self.inner.lock();
             if state.pending_bind.is_some() || state.bound.is_some() {
                 return Err(WasiUdpSocketError::InvalidState);
             }
-            (state.service.clone(), state.hop_limit)
+            state.hop_limit
         };
         let binding = service
             .udp_bind(local_port)
@@ -1363,7 +1619,7 @@ impl UdpSocket {
             .udp_set_hop_limit(binding.socket, hop_limit)
             .map_err(WasiUdpSocketError::Backend)?;
         let bound = BoundUdpSocket {
-            socket: binding.socket,
+            socket: binding.socket.into_raw(),
             local_port: binding.local_port,
         };
         let mut state = self.inner.lock();
@@ -1379,8 +1635,9 @@ impl UdpSocket {
         Ok(())
     }
 
-    pub(super) async fn ensure_bound(
+    pub(super) async fn ensure_bound<Net: ComponentHostNetwork>(
         &self,
+        service: &Net,
         local_port: u16,
     ) -> core::result::Result<BoundUdpSocket, WasiUdpSocketError> {
         {
@@ -1392,7 +1649,7 @@ impl UdpSocket {
                 return Err(WasiUdpSocketError::InvalidState);
             }
         }
-        self.bind_backend(local_port, false).await?;
+        self.bind_backend(service, local_port, false).await?;
         self.inner
             .lock()
             .bound
@@ -1459,15 +1716,17 @@ pub(super) fn network_ip_address_is_unspecified(address: crate::NetworkIpAddress
     }
 }
 
-impl<CpuImpl, HostFs> wasi::sockets::types::Host for StoreData<CpuImpl, HostFs>
+impl<CpuImpl, Net, HostFs> wasi::sockets::types::Host for StoreData<CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
 }
-impl<CpuImpl, HostFs> wasi::sockets::types::HostTcpSocket for StoreData<CpuImpl, HostFs>
+impl<CpuImpl, Net, HostFs> wasi::sockets::types::HostTcpSocket for StoreData<CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     async fn bind(
@@ -1500,10 +1759,12 @@ where
             socket_types::IpAddressFamily::Ipv4 => WasiTcpSocketFamily::Ipv4,
             socket_types::IpAddressFamily::Ipv6 => WasiTcpSocketFamily::Ipv6,
         };
-        let Some(service) = self.runtime_state.network_service() else {
+        if self.runtime_state.network_service().is_none() {
             return Ok(Err(socket_types::ErrorCode::Other(None)));
-        };
-        let resource = self.table.push(TcpSocket::new(service, family))?;
+        }
+        let resource = self
+            .table
+            .push(TcpSocket::new(self.retirement.sender(), family))?;
         Ok(Ok(resource))
     }
 
@@ -1626,8 +1887,11 @@ where
         socket: Resource<TcpSocket>,
         value: u8,
     ) -> Result<core::result::Result<(), socket_types::ErrorCode>> {
+        let Some(service) = self.runtime_state.network_service() else {
+            return Ok(Err(socket_types::ErrorCode::Other(None)));
+        };
         let socket = self.table.get(&socket)?.clone();
-        Ok(socket.set_hop_limit(value))
+        Ok(socket.set_hop_limit(&service, value))
     }
 
     fn get_receive_buffer_size(
@@ -1665,17 +1929,22 @@ where
     }
 
     fn drop(&mut self, resource: Resource<TcpSocket>) -> Result<()> {
-        // Deleting the handle is the whole of it: the stream is owned by
-        // `TcpSocketState`, which retires it when the last clone of this
-        // socket goes away.
+        // Deleting the handle ends the socket's life: the stream is
+        // owned by `TcpSocketState`, which queues it when the last
+        // clone of this socket goes away. Draining right afterwards is
+        // what turns that into a close on this very call, so the FIN
+        // of a guest that closed its connection leaves now rather than
+        // on the guest's next socket call.
         self.table.delete(resource)?;
+        self.retire_sockets();
         Ok(())
     }
 }
 
-impl<CpuImpl, HostFs> wasi::sockets::types::HostUdpSocket for StoreData<CpuImpl, HostFs>
+impl<CpuImpl, Net, HostFs> wasi::sockets::types::HostUdpSocket for StoreData<CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     async fn bind(
@@ -1697,8 +1966,11 @@ where
         ) {
             return Ok(Err(socket_types::ErrorCode::AccessDenied));
         }
+        let Some(service) = self.runtime_state.network_service() else {
+            return Ok(Err(socket_types::ErrorCode::Other(None)));
+        };
         let result = socket
-            .bind(local_address)
+            .bind(&service, local_address)
             .await
             .map_err(map_p3_udp_socket_error);
         Ok(result)
@@ -1717,8 +1989,11 @@ where
             Ok(address) => address,
             Err(error) => return Ok(Err(map_p3_udp_socket_error(error))),
         };
+        let Some(service) = self.runtime_state.network_service() else {
+            return Ok(Err(socket_types::ErrorCode::Other(None)));
+        };
         let result = socket
-            .connect(remote_address)
+            .connect(&service, remote_address)
             .await
             .map_err(map_p3_udp_socket_error);
         Ok(result)
@@ -1735,10 +2010,12 @@ where
             Ok(family) => family,
             Err(error) => return Ok(Err(map_p3_udp_socket_error(error))),
         };
-        let Some(service) = self.runtime_state.network_service() else {
+        if self.runtime_state.network_service().is_none() {
             return Ok(Err(socket_types::ErrorCode::Other(None)));
-        };
-        let resource = self.table.push(UdpSocket::new(service, family))?;
+        }
+        let resource = self
+            .table
+            .push(UdpSocket::new(self.retirement.sender(), family))?;
         Ok(Ok(resource))
     }
 
@@ -1746,8 +2023,11 @@ where
         &mut self,
         socket: Resource<UdpSocket>,
     ) -> Result<core::result::Result<(), socket_types::ErrorCode>> {
+        let Some(service) = self.runtime_state.network_service() else {
+            return Ok(Err(socket_types::ErrorCode::Other(None)));
+        };
         let socket = self.table.get(&socket)?.clone();
-        Ok(socket.disconnect().map_err(map_p3_udp_socket_error))
+        Ok(socket.disconnect(&service).map_err(map_p3_udp_socket_error))
     }
 
     fn get_local_address(
@@ -1793,9 +2073,12 @@ where
         socket: Resource<UdpSocket>,
         value: u8,
     ) -> Result<core::result::Result<(), socket_types::ErrorCode>> {
+        let Some(service) = self.runtime_state.network_service() else {
+            return Ok(Err(socket_types::ErrorCode::Other(None)));
+        };
         let socket = self.table.get(&socket)?.clone();
         Ok(socket
-            .set_unicast_hop_limit(value)
+            .set_unicast_hop_limit(&service, value)
             .map_err(map_p3_udp_socket_error))
     }
 
@@ -1841,14 +2124,16 @@ where
 
     fn drop(&mut self, resource: Resource<UdpSocket>) -> Result<()> {
         self.table.delete(resource)?;
+        self.retire_sockets();
         Ok(())
     }
 }
 
-impl<CpuImpl, HostFs, U> wasi::sockets::types::HostTcpSocketWithStore<U>
-    for HasSelf<StoreData<CpuImpl, HostFs>>
+impl<CpuImpl, Net, HostFs, U> wasi::sockets::types::HostTcpSocketWithStore<U>
+    for HasSelf<StoreData<CpuImpl, Net, HostFs>>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     async fn connect(
@@ -1856,7 +2141,7 @@ where
         socket: Resource<TcpSocket>,
         remote_address: socket_types::IpSocketAddress,
     ) -> Result<core::result::Result<(), socket_types::ErrorCode>> {
-        let (has_tcp_authority, socket) = accessor.with(|mut access| {
+        let (has_tcp_authority, socket, service) = accessor.with(|mut access| {
             let store = access.get();
             Ok::<_, wasmtime::Error>((
                 has_wasi_network_rights(
@@ -1864,16 +2149,20 @@ where
                     crate::NetworkAuthorityRights::TCP,
                 ),
                 store.table.get(&socket)?.clone(),
+                store.runtime_state.network_service(),
             ))
         })?;
         if !has_tcp_authority {
             return Ok(Err(socket_types::ErrorCode::AccessDenied));
         }
+        let Some(service) = service else {
+            return Ok(Err(socket_types::ErrorCode::Other(None)));
+        };
         let remote_address = match parse_p3_tcp_socket_address(remote_address, socket.family()) {
             Ok(address) => address,
             Err(error) => return Ok(Err(error)),
         };
-        Ok(socket.connect(remote_address).await)
+        Ok(socket.connect(&service, remote_address).await)
     }
 
     fn listen(
@@ -1904,13 +2193,16 @@ where
         ) {
             return Ok(Err(socket_types::ErrorCode::AccessDenied));
         }
+        let Some(service) = access.get().runtime_state.network_service() else {
+            return Ok(Err(socket_types::ErrorCode::Other(None)));
+        };
         let spawner = access.get().spawner().clone();
         let getter = access.getter();
         let stream = StreamReader::new(
             &mut access,
-            TcpListenStreamProducer::new(socket.clone(), getter, spawner.clone()),
+            TcpListenStreamProducer::new(socket.clone(), service.clone(), getter, spawner.clone()),
         )?;
-        let (service, inner, ready) = {
+        let (inner, ready) = {
             let mut state = socket.inner.lock();
             if state.stream.is_some()
                 || state.listener.is_some()
@@ -1921,11 +2213,7 @@ where
                 return Ok(Err(socket_types::ErrorCode::InvalidState));
             }
             state.listen_in_progress = true;
-            (
-                state.service.clone(),
-                socket.inner.clone(),
-                socket.ready.clone(),
-            )
+            (socket.inner.clone(), socket.ready.clone())
         };
         let spawned = spawner.try_spawn_detached({
             let inner = inner.clone();
@@ -1937,7 +2225,11 @@ where
                         listen_backlog,
                         hop_limit,
                     )
-                    .await;
+                    .await
+                    .map(|listener| crate::TcpListener {
+                        listener: listener.listener.into_raw(),
+                        local_port: listener.local_port,
+                    });
                 let mut state = inner.lock();
                 state.listen_in_progress = false;
                 state.listen_result = Some(result);
@@ -1973,8 +2265,16 @@ where
             });
         }
         let socket = access.get().table.get(&socket)?.clone();
+        let Some(service) = access.get().runtime_state.network_service() else {
+            bytes.close(&mut access)?;
+            return FutureReader::new(&mut access, async {
+                Ok::<_, wasmtime::Error>(Err::<(), socket_types::ErrorCode>(
+                    socket_types::ErrorCode::Other(None),
+                ))
+            });
+        };
         let (tx, rx) = oneshot::channel();
-        bytes.pipe(&mut access, TcpWriteConsumer::new(socket, tx))?;
+        bytes.pipe(&mut access, tcp_write_consumer(socket, service, tx))?;
         FutureReader::new(&mut access, async move {
             match rx.await {
                 Ok(result) => Ok::<_, wasmtime::Error>(result),
@@ -2003,8 +2303,17 @@ where
             return Ok((stream, future));
         }
         let socket = access.get().table.get(&socket)?.clone();
+        let Some(service) = access.get().runtime_state.network_service() else {
+            let stream = StreamReader::new(&mut access, Vec::<u8>::new())?;
+            let future = FutureReader::new(&mut access, async {
+                Ok::<_, wasmtime::Error>(Err::<(), socket_types::ErrorCode>(
+                    socket_types::ErrorCode::Other(None),
+                ))
+            })?;
+            return Ok((stream, future));
+        };
         let (tx, rx) = oneshot::channel();
-        let stream = StreamReader::new(&mut access, TcpReadStreamProducer::new(socket, tx))?;
+        let stream = StreamReader::new(&mut access, tcp_read_producer(socket, service, tx))?;
         let future = FutureReader::new(&mut access, async move {
             match rx.await {
                 Ok(result) => Ok::<_, wasmtime::Error>(result),
@@ -2015,10 +2324,11 @@ where
     }
 }
 
-impl<CpuImpl, HostFs, U> wasi::sockets::types::HostUdpSocketWithStore<U>
-    for HasSelf<StoreData<CpuImpl, HostFs>>
+impl<CpuImpl, Net, HostFs, U> wasi::sockets::types::HostUdpSocketWithStore<U>
+    for HasSelf<StoreData<CpuImpl, Net, HostFs>>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     async fn send(
@@ -2036,7 +2346,16 @@ where
         if !has_udp_authority {
             return Ok(Err(socket_types::ErrorCode::AccessDenied));
         }
-        let socket = accessor.with(|mut access| access.get().table.get(&socket).cloned())?;
+        let (socket, service) = accessor.with(|mut access| {
+            let store = access.get();
+            Ok::<_, wasmtime::Error>((
+                store.table.get(&socket)?.clone(),
+                store.runtime_state.network_service(),
+            ))
+        })?;
+        let Some(service) = service else {
+            return Ok(Err(socket_types::ErrorCode::Other(None)));
+        };
         let remote_address = match remote_address {
             Some(address) => match parse_p3_udp_socket_address(address, socket.family()) {
                 Ok(address) => Some(address),
@@ -2045,7 +2364,7 @@ where
             None => None,
         };
         let result = socket
-            .send_datagram(&bytes, remote_address, u64::MAX)
+            .send_datagram(&service, &bytes, remote_address, u64::MAX)
             .await
             .map_err(map_p3_udp_socket_error);
         Ok(result)
@@ -2066,9 +2385,18 @@ where
         if !has_udp_authority {
             return Ok(Err(socket_types::ErrorCode::AccessDenied));
         }
-        let socket = accessor.with(|mut access| access.get().table.get(&socket).cloned())?;
+        let (socket, service) = accessor.with(|mut access| {
+            let store = access.get();
+            Ok::<_, wasmtime::Error>((
+                store.table.get(&socket)?.clone(),
+                store.runtime_state.network_service(),
+            ))
+        })?;
+        let Some(service) = service else {
+            return Ok(Err(socket_types::ErrorCode::Other(None)));
+        };
         let result = socket
-            .receive_datagram(None, u64::MAX)
+            .receive_datagram(&service, None, u64::MAX)
             .await
             .map(|datagram| {
                 (
@@ -2291,17 +2619,19 @@ pub(super) fn map_p3_udp_socket_error(error: WasiUdpSocketError) -> socket_types
     }
 }
 
-impl<CpuImpl, HostFs> wasi::sockets::ip_name_lookup::Host for StoreData<CpuImpl, HostFs>
+impl<CpuImpl, Net, HostFs> wasi::sockets::ip_name_lookup::Host for StoreData<CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
 }
 
-impl<CpuImpl, HostFs, U> wasi::sockets::ip_name_lookup::HostWithStore<U>
-    for HasSelf<StoreData<CpuImpl, HostFs>>
+impl<CpuImpl, Net, HostFs, U> wasi::sockets::ip_name_lookup::HostWithStore<U>
+    for HasSelf<StoreData<CpuImpl, Net, HostFs>>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     async fn resolve_addresses(

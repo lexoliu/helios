@@ -14,11 +14,14 @@ use crate::config::HostedConfig;
 use crate::console::HostedConsole;
 use crate::cpu::HostedCpu;
 use crate::host_fs::HostedFileSystem;
+use crate::net::HostedNetworkDevice;
 use crate::rtc::HostRtc;
 
 const NANOS_PER_SECOND: u64 = 1_000_000_000;
 
-type HostedRuntimeState = helios_kernel::HostRuntimeState<HostedCpu, HostedFileSystem>;
+type HostedNetworkService = helios_kernel::NetworkService<HostedCpu, HostedNetworkDevice>;
+type HostedRuntimeState =
+    helios_kernel::HostRuntimeState<HostedCpu, HostedNetworkService, HostedFileSystem>;
 
 /// Shared debug state across all hosted processor threads.
 static DEBUG_STATE: OnceLock<HostedRuntimeState> = OnceLock::new();

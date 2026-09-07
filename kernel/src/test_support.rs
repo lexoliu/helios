@@ -7,6 +7,33 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use helios_hal::cpu::{Cpu, Instant, ProcessorId};
+
+/// The processor-local interrupt mask for the kernel's own unit tests.
+///
+/// `with_local_interrupts_masked` reaches its implementation by
+/// linkage, so a binary that links this crate has to install one. A
+/// bare-metal backend installs its `InterruptOps`; a test binary runs
+/// as a host process, where nothing preempts a thread and then
+/// allocates, so there is nothing to mask and the spin lock inside each
+/// `IrqSafeMutex` is the whole exclusion. This is the same arrangement
+/// the `critical-section` dev-dependency's `std` feature provides for
+/// `critical_section::with` here.
+struct TestInterruptMask;
+
+impl helios_hal::critical_section::LocalInterruptMask for TestInterruptMask {
+    fn mask() -> bool {
+        false
+    }
+
+    unsafe fn restore(was_enabled: bool) {
+        debug_assert!(
+            !was_enabled,
+            "the host test mask never reports interrupts as enabled"
+        );
+    }
+}
+
+helios_hal::critical_section::set_local_interrupt_mask_impl!(TestInterruptMask);
 use helios_hal::entropy::{EntropyQuality, EntropyUnavailable};
 use triomphe::Arc;
 
@@ -260,15 +287,48 @@ impl Cpu for RecordingSmpCpu {
     }
 }
 
-/// Runtime state that answers the few questions a service asks during
-/// construction and records nothing.
+/// A detached [`crate::ProfileSink`] for a subsystem under test.
+///
+/// Nothing reads it back; the histories exist so the subsystem's own
+/// record calls run the same path they run on a live kernel.
+pub(crate) fn test_profile_sink() -> crate::ProfileSink {
+    crate::ProfileSink::new(
+        crate::DEFAULT_PROFILE_STACK_CAPACITY,
+        crate::DEFAULT_PERF_METRIC_CAPACITY,
+    )
+}
+
+/// The uptime clock a test service reads, at a 1 GHz timebase whose
+/// origin is the boot tick, so a tick is a nanosecond and a test can
+/// state deadlines in either.
+pub(crate) fn test_uptime_clock() -> crate::UptimeClock {
+    crate::UptimeClock::new(0, 1_000_000_000)
+}
+
+/// Runtime state that answers the few questions a store asks and
+/// records nothing.
 ///
 /// Uptime is the raw tick count, which is what every other kernel test
 /// fixture does: the tests that use this assert on ordering between
-/// events, never on wall time.
-#[derive(Clone, Copy, Default)]
-pub(crate) struct TestRuntimeState;
+/// events, never on wall time. The network service is the one a
+/// store's socket retirements are closed through, so a test that
+/// drives a store's teardown can watch what it closed.
+#[cfg(feature = "wasmtime-runtime")]
+#[derive(Clone, Default)]
+pub(crate) struct TestRuntimeState {
+    network: Option<TestNetworkService>,
+}
 
+#[cfg(feature = "wasmtime-runtime")]
+impl TestRuntimeState {
+    pub(crate) fn with_network(network: TestNetworkService) -> Self {
+        Self {
+            network: Some(network),
+        }
+    }
+}
+
+#[cfg(feature = "wasmtime-runtime")]
 impl crate::component::ComponentRuntimeState for TestRuntimeState {
     fn uptime_nanos(&self, current_ticks: u64) -> u64 {
         current_ticks
@@ -288,6 +348,14 @@ impl crate::component::ComponentRuntimeState for TestRuntimeState {
         None
     }
 
+    /// A test runtime publishes no devices; the registry is empty
+    /// and every claim through it reports the device is not there.
+    fn device_grants(&self) -> &crate::device::DeviceGrantRegistry {
+        static EMPTY: crate::device::DeviceGrantRegistry =
+            crate::device::DeviceGrantRegistry::new();
+        &EMPTY
+    }
+
     fn profiling_enabled(&self) -> bool {
         false
     }
@@ -305,6 +373,18 @@ impl crate::component::ComponentRuntimeState for TestRuntimeState {
         _: crate::PerfSample,
     ) {
     }
+
+    fn retire_network_handles(&self, retired: &crate::SocketRetirementQueue) {
+        match self.network.as_ref() {
+            Some(service) => {
+                crate::retire_queued_handles(retired, service);
+            }
+            None => assert!(
+                retired.is_empty(),
+                "a network-less test runtime state was handed a socket to retire"
+            ),
+        }
+    }
 }
 
 /// A network interface that moves no frames and does nothing but report
@@ -321,13 +401,24 @@ pub(crate) struct RecordingNetworkInterface {
     inner: Arc<RecordingInterfaceState>,
 }
 
+/// What one queue pair hands the next drain, in the order the device
+/// produced it.
+enum PendingReceive {
+    /// A frame the drain takes off the ring.
+    Frame(helios_netstack::RxFrame),
+    /// A completion the driver refuses. The drain stops there and
+    /// reports the error beside the frames it has already taken, which
+    /// is what a virtio-net chain this driver cannot reconstruct does.
+    Refusal(helios_hal::io::IoError),
+}
+
 struct RecordingInterfaceState {
     /// Events each queue pair has reported.
     queues: alloc::vec::Vec<AtomicU64>,
-    /// Frames each queue pair is holding for the next drain, in arrival
+    /// What each queue pair is holding for the next drain, in arrival
     /// order. A test that wants to prove the kernel takes a frame off
     /// the device has to put one there first.
-    pending: alloc::vec::Vec<spin::Mutex<alloc::collections::VecDeque<helios_netstack::RxFrame>>>,
+    pending: alloc::vec::Vec<spin::Mutex<alloc::collections::VecDeque<PendingReceive>>>,
     /// Events reported that belong to no queue pair.
     device: AtomicU64,
     /// Wakes whatever is parked on either counter.
@@ -381,9 +472,20 @@ impl RecordingNetworkInterface {
     pub(crate) fn deliver_on(&self, queue_idx: usize, frame: &[u8]) {
         self.inner.pending[queue_idx]
             .lock()
-            .push_back(helios_netstack::RxFrame::new(
+            .push_back(PendingReceive::Frame(helios_netstack::RxFrame::new(
                 bytes::Bytes::copy_from_slice(frame),
-            ));
+            )));
+        self.complete_on(queue_idx);
+    }
+
+    /// Puts a completion the driver refuses behind whatever one queue
+    /// pair is already holding, so a test can drain a batch of good
+    /// frames into a refusal the way a malformed mergeable chain
+    /// arrives behind good ones.
+    pub(crate) fn refuse_on(&self, queue_idx: usize, error: helios_hal::io::IoError) {
+        self.inner.pending[queue_idx]
+            .lock()
+            .push_back(PendingReceive::Refusal(error));
         self.complete_on(queue_idx);
     }
 
@@ -450,20 +552,25 @@ impl helios_netstack::NetworkInterface for RecordingNetworkInterface {
         &'a self,
         queue_idx: usize,
         slots: &'slots mut [Option<helios_netstack::RxFrame>],
-    ) -> helios_hal::io::IoResult<Option<usize>>
+    ) -> Option<helios_netstack::RxDrain>
     where
         'a: 'slots,
     {
         let mut pending = self.inner.pending[queue_idx].lock();
-        let mut taken = 0;
+        let mut received = 0;
         for slot in slots.iter_mut() {
-            let Some(frame) = pending.pop_front() else {
-                break;
-            };
-            *slot = Some(frame);
-            taken += 1;
+            match pending.pop_front() {
+                Some(PendingReceive::Frame(frame)) => {
+                    *slot = Some(frame);
+                    received += 1;
+                }
+                Some(PendingReceive::Refusal(error)) => {
+                    return Some(helios_netstack::RxDrain::refused(received, error));
+                }
+                None => break,
+            }
         }
-        Ok(Some(taken))
+        Some(helios_netstack::RxDrain::completed(received))
     }
 
     fn repost_rx_frame<'a>(
@@ -541,8 +648,8 @@ impl helios_netstack::NetworkInterface for RecordingNetworkInterface {
 ///
 /// An in-memory double that models an always-ready loopback peer. It
 /// lives here rather than inside one test module because several of
-/// them need the same double, and one of them needs a real
-/// [`crate::ComponentHostNetworkService`] built on top of it.
+/// them need the same double, and the component host's own tests
+/// substitute it for the machine's network service.
 #[cfg(feature = "wasmtime-runtime")]
 mod network {
     use alloc::vec;
@@ -556,7 +663,11 @@ mod network {
 
     use crate::{ComponentNetworkService, SocketReadiness};
 
-    /// The streams a [`TestNetworkService`] has been asked to retire.
+    /// The handles a [`TestNetworkService`] has been asked to retire.
+    ///
+    /// TCP streams and UDP sockets get one of these each, because a
+    /// socket-lifetime test asserts on a count and the two protocols
+    /// number their handles independently.
     #[derive(Default)]
     pub(crate) struct TestClosedStreams {
         count: AtomicUsize,
@@ -581,6 +692,8 @@ mod network {
     #[derive(Clone, Default)]
     pub(crate) struct TestNetworkService {
         closed: Arc<TestClosedStreams>,
+        closed_udp: Arc<TestClosedStreams>,
+        closed_listeners: Arc<TestClosedStreams>,
     }
 
     impl TestNetworkService {
@@ -588,10 +701,23 @@ mod network {
             Self::default()
         }
 
-        /// The retirement log this service writes to, which is what a
-        /// socket-lifetime test asserts against.
+        /// The TCP retirement log this service writes to, which is
+        /// what a stream-lifetime test asserts against.
         pub(crate) fn closed(&self) -> Arc<TestClosedStreams> {
             self.closed.clone()
+        }
+
+        /// The UDP retirement log, kept apart from the TCP one so a
+        /// datagram-socket test counts only its own protocol.
+        pub(crate) fn closed_udp_sockets(&self) -> Arc<TestClosedStreams> {
+            self.closed_udp.clone()
+        }
+
+        /// The listener retirement log, kept apart from the stream one
+        /// because a listener and the connections it accepted are
+        /// separate handles with separate lifetimes.
+        pub(crate) fn closed_listeners(&self) -> Arc<TestClosedStreams> {
+            self.closed_listeners.clone()
         }
     }
 
@@ -784,6 +910,10 @@ mod network {
             self.closed.record(stream);
         }
 
+        fn tcp_listener_close(&self, listener: Self::TcpListener) {
+            self.closed_listeners.record(listener);
+        }
+
         fn udp_bind(
             &self,
             local_port: u16,
@@ -865,11 +995,8 @@ mod network {
             core::future::ready(Ok(()))
         }
 
-        fn udp_close(
-            &self,
-            _: Self::UdpSocket,
-        ) -> impl core::future::Future<Output = ()> + Send + '_ {
-            core::future::ready(())
+        fn udp_close(&self, socket: Self::UdpSocket) {
+            self.closed_udp.record(socket);
         }
     }
 
@@ -1005,24 +1132,78 @@ mod network {
 #[cfg(feature = "wasmtime-runtime")]
 pub(crate) use network::{TestClosedStreams, TestNetworkService};
 
-/// A [`crate::ComponentHostNetworkService`] over a fresh
-/// [`TestNetworkService`], for a test that does not inspect what the
-/// service was asked to retire.
+/// A fresh [`TestNetworkService`], for a test that does not inspect
+/// what the service was asked to retire.
 #[cfg(feature = "wasmtime-runtime")]
-pub(crate) fn test_network_service() -> crate::ComponentHostNetworkService {
-    crate::ComponentHostNetworkService::from_service(TestNetworkService::new())
+pub(crate) fn test_network_service() -> TestNetworkService {
+    TestNetworkService::new()
 }
 
 /// The same, paired with the log of the streams it retires.
 #[cfg(feature = "wasmtime-runtime")]
-pub(crate) fn recording_network_service() -> (
-    crate::ComponentHostNetworkService,
-    triomphe::Arc<TestClosedStreams>,
-) {
+pub(crate) fn recording_network_service() -> (TestNetworkService, triomphe::Arc<TestClosedStreams>)
+{
     let service = TestNetworkService::new();
     let closed = service.closed();
-    (
-        crate::ComponentHostNetworkService::from_service(service),
-        closed,
-    )
+    (service, closed)
+}
+
+/// A store's end of the socket retirement queue, for a test with no
+/// store around it.
+///
+/// A component's socket resource holds no service: it queues what it
+/// owns when it dies, and the store closes it on its next turn. A
+/// lifetime test therefore asserts on both halves — the drop queued the
+/// id, and the drain closed it through this service — and drains
+/// through [`crate::retire_queued_handles`], the same function the live
+/// kernel's runtime state calls.
+#[cfg(feature = "wasmtime-runtime")]
+pub(crate) struct TestSocketRetirement {
+    queue: crate::SocketRetirementQueue,
+    service: TestNetworkService,
+}
+
+#[cfg(feature = "wasmtime-runtime")]
+impl TestSocketRetirement {
+    pub(crate) fn new(service: TestNetworkService) -> Self {
+        Self {
+            queue: crate::SocketRetirementQueue::new(),
+            service,
+        }
+    }
+
+    /// The sender a socket resource this fixture stands behind holds.
+    pub(crate) fn sender(&self) -> crate::SocketRetirementSender {
+        self.queue.sender()
+    }
+
+    /// Whether a dying socket has queued anything the store has yet to
+    /// close.
+    pub(crate) fn queued(&self) -> bool {
+        !self.queue.is_empty()
+    }
+
+    /// Closes everything queued, answering how many handles it closed.
+    pub(crate) fn drain(&self) -> usize {
+        crate::retire_queued_handles(&self.queue, &self.service)
+    }
+}
+
+/// The same again, paired with the log of the listeners it retires.
+#[cfg(feature = "wasmtime-runtime")]
+pub(crate) fn recording_listener_network_service()
+-> (TestNetworkService, triomphe::Arc<TestClosedStreams>) {
+    let service = TestNetworkService::new();
+    let closed = service.closed_listeners();
+    (service, closed)
+}
+
+/// The same again, paired with the log of the datagram sockets it
+/// retires.
+#[cfg(feature = "wasmtime-runtime")]
+pub(crate) fn recording_udp_network_service()
+-> (TestNetworkService, triomphe::Arc<TestClosedStreams>) {
+    let service = TestNetworkService::new();
+    let closed = service.closed_udp_sockets();
+    (service, closed)
 }

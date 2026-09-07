@@ -57,14 +57,15 @@ pub use stack::{
     Ipv4MulticastMembership, MAX_ICMP_ECHO_REPLIES, MAX_IPV4_MULTICAST_MEMBERSHIPS,
     MAX_OUTBOUND_FRAMES, MAX_UDP_RX, MAX_UDP_SOCKETS, NeighborEntry, NeighborState,
     OutboundBatchStatus, Route, RouteTable, RxChecksumOffload, SocketId, Stack, StackConfig,
-    StackEvent, StackInstant, TcpAccept, TcpConnectState, TcpConnectTerminalError,
+    StackEvent, StackInstant, TcpAccept, TcpCloseOutcome, TcpConnectState, TcpConnectTerminalError,
     TcpListenBacklog, TcpReadIntoState, TcpReadState, TcpStackCounters, UdpEgress, UdpEndpoint,
     UdpPayload, UdpReceive, UdpSocketBinding, UdpSocketError, UdpSocketId,
 };
 pub use tcp::{TCP_RECEIVE_WINDOW_BYTES, TCP_TRANSMIT_BUFFER_BYTES};
 pub use tcp::{
-    TcpAckQueued, TcpCloseKind, TcpEndpoint, TcpReset, TcpSegmentBudget, TcpSegmentOutcome,
-    TcpSocket, TcpState, TcpStateChangeReason, TcpTransmitSegment,
+    TcpAckQueued, TcpAckSnapshot, TcpCloseAction, TcpCloseKind, TcpEndpoint, TcpReceiveCounters,
+    TcpReceiveDiagnostics, TcpReset, TcpSegmentBudget, TcpSegmentOutcome, TcpSegmentSnapshot,
+    TcpSequenceRange, TcpSocket, TcpState, TcpStateChangeReason, TcpTransmitSegment,
 };
 pub use types::{
     EthernetAddress, IpAddress, IpCidr, Ipv4Address, Ipv4Cidr, Ipv6Address, Ipv6Cidr, Ipv6Scope,
@@ -231,6 +232,44 @@ impl RxFrame {
 impl AsRef<[u8]> for RxFrame {
     fn as_ref(&self) -> &[u8] {
         self.bytes.as_ref()
+    }
+}
+
+/// What one immediate receive drain came to: the frames it wrote into
+/// the caller's slice, and the refusal it stopped on.
+///
+/// Both halves travel together because a drain that stops partway has
+/// already taken its frames off the device, and a completed receive
+/// buffer cannot be put back. Reporting the error on its own therefore
+/// loses every frame the drain had already taken — one malformed frame
+/// costs the whole batch in front of it, and the peer retransmits data
+/// the guest did in fact receive. So the caller delivers `received`
+/// frames first and handles `refusal` afterwards.
+#[derive(Debug)]
+pub struct RxDrain {
+    /// Frames written into the front of the caller's slice. They belong
+    /// to the caller whether or not the drain went on to be refused.
+    pub received: usize,
+    /// The error the drain stopped on, if it stopped on one.
+    pub refusal: Option<helios_hal::io::IoError>,
+}
+
+impl RxDrain {
+    /// A drain that ran to the end of the caller's slice or to the end
+    /// of what the device had ready.
+    pub const fn completed(received: usize) -> Self {
+        Self {
+            received,
+            refusal: None,
+        }
+    }
+
+    /// A drain that took `received` frames and was then refused.
+    pub const fn refused(received: usize, refusal: helios_hal::io::IoError) -> Self {
+        Self {
+            received,
+            refusal: Some(refusal),
+        }
     }
 }
 
@@ -580,18 +619,22 @@ pub trait NetworkInterface: Clone + Send + Sync + 'static {
     ///
     /// One pair, not all of them: the caller sweeps the pairs itself so
     /// it can start at the one its own processor owns and skip a pair
-    /// somebody else is already draining. `Ok(None)` means this pair
-    /// could not be entered without waiting.
+    /// somebody else is already draining. `None` means this pair could
+    /// not be entered without waiting.
+    ///
+    /// A device error does not discard the drain. It arrives in the
+    /// [`RxDrain`] beside the frames the drain had already written, so
+    /// the caller delivers those before it reports the refusal.
     fn try_receive_frames_immediate_on<'a, 'slots>(
         &'a self,
         queue_idx: usize,
         frames: &'slots mut [Option<RxFrame>],
-    ) -> IoResult<Option<usize>>
+    ) -> Option<RxDrain>
     where
         'a: 'slots,
     {
         let _ = (queue_idx, frames);
-        Ok(None)
+        None
     }
 
     /// Releases an owning device RX frame back to the interface.
@@ -685,6 +728,24 @@ pub trait NetworkInterface: Clone + Send + Sync + 'static {
     /// across processors instead of piling on one. Zero for an interface
     /// that cannot tell its queues apart.
     fn queue_interrupts(&self, queue_idx: usize) -> u64 {
+        let _ = queue_idx;
+        0
+    }
+
+    /// Times receive on this queue pair had to pause because every
+    /// reassembly buffer was checked out. Nonzero means the reassembly
+    /// pool is too small for the number of concurrent multi-buffer frames
+    /// in flight. Zero for an interface that has no reassembly pool.
+    fn rx_pool_stalls(&self, queue_idx: usize) -> u64 {
+        let _ = queue_idx;
+        0
+    }
+
+    /// Free reassembly buffers currently available for this queue pair.
+    /// Zero while traffic is arriving indicates the driver cannot
+    /// assemble chained frames until delivered frames are released.
+    /// Zero for an interface that has no reassembly pool.
+    fn rx_pool_free(&self, queue_idx: usize) -> u32 {
         let _ = queue_idx;
         0
     }

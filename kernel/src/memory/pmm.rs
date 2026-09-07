@@ -1,6 +1,6 @@
 //! Kernel-side physical-frame allocator.
 //!
-//! A slab-fronted adapter over `buddy_system_allocator::LockedHeap<32>`
+//! A slab-fronted adapter over `buddy_system_allocator::Heap<32>`
 //! that exposes the [`hal::pmm::PhysFrameAllocator`] trait. Single-frame
 //! allocations use a fixed-size frame slab before falling back to the
 //! buddy heap; contiguous ranges still come from the buddy allocator.
@@ -10,7 +10,10 @@
 //! Single-frame reuse uses lock-free per-processor slab shards, while
 //! contiguous range allocation is serialized by the buddy heap. The slab is
 //! drained before retrying a failed contiguous allocation so cached frames do
-//! not harm large-range availability.
+//! not harm large-range availability. The buddy heap sits behind
+//! [`crate::memory::IrqSafeMutex`], because an interrupt handler on this
+//! processor allocates and a plain spin lock here would deadlock the
+//! processor that was interrupted holding it (#206).
 
 extern crate alloc;
 
@@ -19,12 +22,13 @@ use core::future::Future;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use buddy_system_allocator::LockedHeap;
+use buddy_system_allocator::Heap;
 use helios_hal::pmm::{
     FrameAllocError, FrameAllocStats, PhysFrame, PhysFrameAllocator, PhysFrameRange,
 };
 
 use crate::memory::frame_slab::FrameSlabCache;
+use crate::memory::irq_safe::IrqSafeMutex;
 use crate::memory::reported::{ReportedFrames, visit_free_runs};
 
 const HEAP_ORDER: usize = 32;
@@ -32,10 +36,10 @@ const HEAP_ORDER: usize = 32;
 /// Kernel physical-frame allocator. Constructed empty and grown by
 /// [`KernelPhysFrameAllocator::add_region`] during boot.
 pub struct KernelPhysFrameAllocator {
-    heap: LockedHeap<HEAP_ORDER>,
+    heap: IrqSafeMutex<Heap<HEAP_ORDER>>,
     slab: FrameSlabCache,
     /// Total bytes published into the buddy heap via `add_region`.
-    /// `LockedHeap` does not expose a `largest_free_run` helper, so
+    /// The buddy heap does not expose a `largest_free_run` helper, so
     /// `total_added_bytes - currently_allocated` is the closest cheap
     /// approximation we can give the OOM policy.
     added_bytes: AtomicUsize,
@@ -47,7 +51,7 @@ pub struct KernelPhysFrameAllocator {
 impl KernelPhysFrameAllocator {
     pub const fn new() -> Self {
         Self {
-            heap: LockedHeap::empty(),
+            heap: IrqSafeMutex::new(Heap::new()),
             slab: FrameSlabCache::new(),
             added_bytes: AtomicUsize::new(0),
             reported: ReportedFrames::new(),
@@ -69,9 +73,9 @@ impl KernelPhysFrameAllocator {
             end.is_multiple_of(PhysFrame::SIZE),
             "frame-allocator region end {end:#x} is not page-aligned"
         );
-        unsafe {
-            self.heap.lock().add_to_heap(start, end);
-        }
+        self.heap.with(|heap| unsafe {
+            heap.add_to_heap(start, end);
+        });
         self.reported.cover(start, end);
         self.added_bytes.fetch_add(end - start, Ordering::Release);
     }
@@ -102,24 +106,25 @@ impl KernelPhysFrameAllocator {
         let bytes = count * PhysFrame::SIZE;
         let layout = Layout::from_size_align(bytes, PhysFrame::SIZE)
             .unwrap_or_else(|_| panic!("frame-allocator layout overflow for {bytes} bytes"));
-        let mut allocator = self.heap.lock();
-        let ptr = allocator
-            .alloc(layout)
-            .or_else(|_| {
-                self.slab.drain(|ptr| unsafe {
-                    allocator.dealloc(ptr, single_frame_layout());
-                });
-                allocator.alloc(layout)
-            })
-            .map_err(|_| {
-                let total = allocator.stats_total_bytes();
-                let used = allocator.stats_alloc_actual();
-                let cached = self.slab.cached_bytes();
-                FrameAllocError::OutOfFrames {
-                    requested: count,
-                    available: total.saturating_sub(used).saturating_add(cached) / PhysFrame::SIZE,
-                }
-            })?;
+        let ptr = self.heap.with(|heap| {
+            heap.alloc(layout)
+                .or_else(|_| {
+                    self.slab.drain(|ptr| unsafe {
+                        heap.dealloc(ptr, single_frame_layout());
+                    });
+                    heap.alloc(layout)
+                })
+                .map_err(|_| {
+                    let total = heap.stats_total_bytes();
+                    let used = heap.stats_alloc_actual();
+                    let cached = self.slab.cached_bytes();
+                    FrameAllocError::OutOfFrames {
+                        requested: count,
+                        available: total.saturating_sub(used).saturating_add(cached)
+                            / PhysFrame::SIZE,
+                    }
+                })
+        })?;
         Ok(PhysFrameRange::from_phys_addr(ptr.as_ptr() as usize, bytes))
     }
 }
@@ -183,21 +188,24 @@ impl PhysFrameAllocator for KernelPhysFrameAllocator {
                 return;
             }
         }
-        unsafe {
-            self.heap.lock().dealloc(ptr, layout);
-        }
+        self.heap.with(|heap| unsafe {
+            heap.dealloc(ptr, layout);
+        });
     }
 
     fn stats(&self) -> FrameAllocStats {
-        let allocator = self.heap.lock();
-        let total = allocator.stats_total_bytes();
-        let cached = self.slab.cached_bytes();
-        let used = allocator.stats_alloc_actual().saturating_sub(cached);
+        let (total, used) = self.heap.with(|heap| {
+            let cached = self.slab.cached_bytes();
+            (
+                heap.stats_total_bytes(),
+                heap.stats_alloc_actual().saturating_sub(cached),
+            )
+        });
         let free_bytes = total.saturating_sub(used);
         FrameAllocStats {
             total_frames: total / PhysFrame::SIZE,
             allocated_frames: used / PhysFrame::SIZE,
-            // `LockedHeap` does not surface a true largest-free-run; we
+            // The buddy heap does not surface a true largest-free-run; we
             // report total free as the upper bound. Pressure-monitor
             // policy uses this as a coarse signal — a real per-order
             // walk can replace this once a hot consumer exists.

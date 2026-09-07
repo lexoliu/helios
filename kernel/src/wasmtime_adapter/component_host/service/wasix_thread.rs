@@ -1,11 +1,12 @@
 use super::*;
 
-pub(super) async fn wasix_thread_sleep<CpuImpl, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+pub(super) async fn wasix_thread_sleep<CpuImpl, Net, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     duration: i64,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     let Ok(duration) = u64::try_from(duration) else {
@@ -18,12 +19,13 @@ where
     p1::errno::SUCCESS
 }
 
-pub(super) fn wasix_thread_id<CpuImpl, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+pub(super) fn wasix_thread_id<CpuImpl, Net, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     ret_tid: u32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     let Some(memory) = p1_memory(caller) else {
@@ -32,13 +34,14 @@ where
     p1_write_u32(caller, memory, ret_tid, caller.data().thread_id)
 }
 
-pub(super) async fn wasix_thread_spawn_v2<CpuImpl, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+pub(super) async fn wasix_thread_spawn_v2<CpuImpl, Net, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     args: u32,
     ret_tid: u32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     let Some(memory) = p1_memory(caller) else {
@@ -129,16 +132,17 @@ where
     p1::errno::SUCCESS
 }
 
-pub(super) async fn run_wasix_thread<CpuImpl, HostFs>(
+pub(super) async fn run_wasix_thread<CpuImpl, Net, HostFs>(
     engine: wasmtime::Engine,
     compiled: Arc<WasmtimeCompiledCoreModule>,
     imported_memory: SharedMemory,
-    store_data: Preview1ProgramStore<CpuImpl, HostFs>,
+    store_data: Preview1ProgramStore<CpuImpl, Net, HostFs>,
     tid: u32,
     args: u32,
 ) -> u32
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     let mut store = wasmtime::Store::new(&engine, store_data);
@@ -195,12 +199,13 @@ where
     }
 }
 
-pub(super) async fn wasix_thread_join<CpuImpl, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+pub(super) async fn wasix_thread_join<CpuImpl, Net, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     tid: u32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     if tid == caller.data().thread_id {
@@ -233,12 +238,13 @@ where
     }
 }
 
-pub(super) fn wasix_thread_parallelism<CpuImpl, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+pub(super) fn wasix_thread_parallelism<CpuImpl, Net, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     ret_parallelism: u32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     let Some(memory) = p1_memory(caller) else {
@@ -251,13 +257,14 @@ where
     p1_write_u32(caller, memory, ret_parallelism, parallelism)
 }
 
-pub(super) fn wasix_thread_signal<CpuImpl, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+pub(super) fn wasix_thread_signal<CpuImpl, Net, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     tid: i32,
     signal: i32,
 ) -> wasmtime::Result<i32>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     if !(0..=31).contains(&signal) {
@@ -283,23 +290,25 @@ where
     Ok(p1::errno::SUCCESS)
 }
 
-pub(super) fn wasix_thread_exit<CpuImpl, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+pub(super) fn wasix_thread_exit<CpuImpl, Net, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     code: u32,
 ) -> wasmtime::Result<()>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     caller.data_mut().request_exit(code);
     Err(wasmtime::Error::new(Preview1Exit))
 }
 
-pub(super) fn wasix_stack_bounds_from_caller<CpuImpl, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+pub(super) fn wasix_stack_bounds_from_caller<CpuImpl, Net, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
 ) -> Result<(u32, u32, u32), ProgramExecError>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     let stack_lower = wasix_global_u32_from_caller(caller, "__data_end")?;
@@ -308,12 +317,13 @@ where
     Ok((stack_lower, stack_upper, stack_pointer))
 }
 
-pub(super) fn wasix_global_u32_from_caller<CpuImpl, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+pub(super) fn wasix_global_u32_from_caller<CpuImpl, Net, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     name: &str,
 ) -> Result<u32, ProgramExecError>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     let global = caller
@@ -332,12 +342,13 @@ where
     }
 }
 
-pub(super) async fn wasix_call_asyncify_start_unwind<CpuImpl, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+pub(super) async fn wasix_call_asyncify_start_unwind<CpuImpl, Net, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     data: u32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     let Some(function) = caller
@@ -355,11 +366,12 @@ where
         .map_or(p1::errno::NOTSUP, |_| p1::errno::SUCCESS)
 }
 
-pub(super) async fn wasix_call_asyncify_stop_rewind<CpuImpl, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+pub(super) async fn wasix_call_asyncify_stop_rewind<CpuImpl, Net, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     let Some(function) = caller
@@ -377,13 +389,14 @@ where
         .map_or(p1::errno::NOTSUP, |_| p1::errno::SUCCESS)
 }
 
-pub(super) async fn wasix_stack_checkpoint<CpuImpl, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+pub(super) async fn wasix_stack_checkpoint<CpuImpl, Net, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     snapshot: u32,
     ret_value: u32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     if let Some(value) = caller.data_mut().asyncify.rewind_value.take() {
@@ -436,13 +449,14 @@ where
     wasix_call_asyncify_start_unwind(caller, stack_lower).await
 }
 
-pub(super) async fn wasix_stack_restore<CpuImpl, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+pub(super) async fn wasix_stack_restore<CpuImpl, Net, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     snapshot: u32,
     value: u64,
 ) -> wasmtime::Result<()>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     let Some(memory) = p1_memory(caller) else {
@@ -501,8 +515,8 @@ where
     Ok(())
 }
 
-pub(super) async fn wasix_futex_wait<CpuImpl, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+pub(super) async fn wasix_futex_wait<CpuImpl, Net, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     futex: u32,
     expected: u32,
     timeout: u32,
@@ -510,6 +524,7 @@ pub(super) async fn wasix_futex_wait<CpuImpl, HostFs>(
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     let Some(memory) = p1_memory(caller) else {
@@ -573,13 +588,14 @@ where
     p1_write_wasix_bool(caller, memory, ret_woken, woken)
 }
 
-pub(super) fn wasix_futex_wake<CpuImpl, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+pub(super) fn wasix_futex_wake<CpuImpl, Net, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     futex: u32,
     ret_woken: u32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     let Some(memory) = p1_memory(caller) else {
@@ -593,13 +609,14 @@ where
     p1_write_wasix_bool(caller, memory, ret_woken, woken)
 }
 
-pub(super) fn wasix_futex_wake_all<CpuImpl, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+pub(super) fn wasix_futex_wake_all<CpuImpl, Net, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     futex: u32,
     ret_woken: u32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     let Some(memory) = p1_memory(caller) else {

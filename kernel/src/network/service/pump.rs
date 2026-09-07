@@ -182,10 +182,9 @@ pub(super) enum NetworkPumpAction {
     Wait,
 }
 
-impl<CpuImpl, Runtime, DeviceImpl> NetworkService<CpuImpl, Runtime, DeviceImpl>
+impl<CpuImpl, DeviceImpl> NetworkService<CpuImpl, DeviceImpl>
 where
     CpuImpl: Cpu + Clone,
-    Runtime: ComponentRuntimeState + Sync,
     DeviceImpl: NetworkDevice,
 {
     pub async fn run_packet_pump(&self) -> ! {

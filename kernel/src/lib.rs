@@ -8,6 +8,7 @@ extern crate std;
 
 mod bootfs;
 mod component;
+mod device;
 mod embedded;
 mod exec;
 mod host_fs;
@@ -56,10 +57,21 @@ pub use component::{
     ComponentUdpSocket, ComponentWorld, DeadlinePollable, InstanceKilled, LocalOutputSink,
     ProviderAlreadyInstalled, ProviderError, ProviderReceiver, ProviderSender, ProviderSlot,
     RawMutexGuardResource, RawMutexResource, RawRwLockReadGuardResource, RawRwLockResource,
-    RawRwLockWriteGuardResource, SerialPortResource, TcpStreamResource, UdpSocketResource,
+    RawRwLockWriteGuardResource, RetiredNetworkHandle, SerialPortResource, SocketRetirementQueue,
+    SocketRetirementSender, StoreSocketRetirement, TcpStreamResource, UdpSocketResource,
     directory_prefix, map_resource_table_error, parent_path, path_is_within_directory,
     provider_channel, resolve_absolute_path, resolve_child_path, resolve_guest_path,
-    store_kernel_heap_bytes, strip_directory_prefix, wait_until_runtime_deadline,
+    retire_queued_handles, store_kernel_heap_bytes, strip_directory_prefix,
+    wait_until_runtime_deadline,
+};
+pub use device::{
+    DEFAULT_DMA_BUDGET_BYTES, DEVICE_WINDOW_BYTES, DeviceGrant, DeviceGrantRegistry,
+    DeviceInterruptHooks, DeviceInterruptRoute, DeviceName, DeviceOwnership, DeviceVmHooks,
+    DeviceWindow, DmaBudget, DmaBuffer, DmaBufferHandle, GrantError, GrantHandle, GrantInterrupt,
+    GrantLease, GrantStats, GrantedDeviceSnapshot, InterruptEvent, InterruptRelay, InterruptStats,
+    LinearMemory, MAX_DEVICE_NAME, MAX_DMA_BUFFERS, MAX_GRANT_INTERRUPTS, MAX_GRANT_REGIONS,
+    MAX_GRANTS, MappedRegion, PublishedDevice, install_device_interrupt_hooks,
+    install_device_vm_hooks,
 };
 pub use embedded::{
     EmbeddedComponent, EmbeddedInit, embedded_boot_component, embedded_init,
@@ -72,18 +84,19 @@ pub use exec::{
     LocalJoinHandle, Mutex, MutexGuard, Notified, Notify, NotifyWaiter, OwnedRawMutexLease,
     OwnedRawRwLockReadLease, OwnedRawRwLockWriteLease, PerfMetricFilter, PerfMetricHistory,
     PerfMetricSample, PerfSample, PressureLevel, ProfileFilter, ProfileHistory, ProfileScope,
-    ProgressChanged, ProgressMark, ProgressSignal, RawMutex, RawMutexLease, RawRwLock,
+    ProfileSink, ProgressChanged, ProgressMark, ProgressSignal, RawMutex, RawMutexLease, RawRwLock,
     RawRwLockReadLease, RawRwLockWriteLease, RwLock, RwLockReadGuard, RwLockWriteGuard, Sleep,
     Spawner, StatsSample, TaskCapacityError, TaskFunding, Timer, TraceEvent, TraceField,
-    TraceFilter, TraceHistory, TraceLevel, TraceValue, YieldNow, duration_to_ticks, elapsed_millis,
-    matches_perf_metric_filter, matches_profile_filter, matches_trace_filter, monotonic_nanos,
-    nanos_to_ticks_ceil_saturating, parse_console_text, wall_clock_offset_nanos, yield_now,
+    TraceFilter, TraceHistory, TraceLevel, TraceValue, UptimeClock, YieldNow, duration_to_ticks,
+    elapsed_millis, matches_perf_metric_filter, matches_profile_filter, matches_trace_filter,
+    monotonic_nanos, nanos_to_ticks_ceil_saturating, parse_console_text, wall_clock_offset_nanos,
+    yield_now,
 };
 pub use helios_hal::Platform;
 pub use helios_netstack::{
     ChecksumOffload, DEFAULT_POLL_BUDGET, EventDeliveryCapabilities, InterfaceCapabilities,
-    InterfaceEventMark, LinkState, NetworkInterface as NetworkDevice, PacketBuffer, RxFrame,
-    RxFrameOffload, SegmentationOffload, TxFrameRef,
+    InterfaceEventMark, LinkState, NetworkInterface as NetworkDevice, PacketBuffer, RxDrain,
+    RxFrame, RxFrameOffload, SegmentationOffload, TxFrameRef,
 };
 pub use host_fs::{
     HOST_SHARE_GUEST_MOUNT_PATH, HOST_SHARE_MOUNT_TAG, HostFsCacheStats, HostFsClient,
@@ -99,11 +112,11 @@ pub use io::{
     BlockInstallError, BlockSelfCheckError, BlockService, BlockStats, ByteReadWait, ByteReader,
     ByteWriteWait, ByteWriter, ClosedPeer, DebugConsole, DebugSerialAccess, DebugSerialWriter,
     ExternalInterruptHandler, ExternalInterruptRoutes, IommuDomains, IommuEndpointStats,
-    IommuReport, IommuStats, MAX_BLOCK_DEVICES, MAX_IOMMU_ENDPOINTS, MAX_NETWORK_INTERRUPTS,
-    PanicSerial, PollKey, PollRegistration, PollRegistry, PollRegistryError, PollSourceKind,
-    RecordingConsole, SCRATCH_DISK_SERIAL, SerialReader, TryRead, TryWrite, byte_channel,
-    emit_panic_report, install_block_devices, read_debug_serial, read_serial, try_read_serial,
-    wake_queue_owners,
+    IommuReport, IommuStats, MAX_BLOCK_DEVICES, MAX_DEVICE_INTERRUPTS, MAX_IOMMU_ENDPOINTS,
+    MAX_NETWORK_INTERRUPTS, PanicSerial, PollKey, PollRegistration, PollRegistry,
+    PollRegistryError, PollSourceKind, RecordingConsole, SCRATCH_DISK_SERIAL, SerialReader,
+    TryRead, TryWrite, byte_channel, emit_panic_report, install_block_devices, read_debug_serial,
+    read_serial, try_read_serial, wake_queue_owners,
 };
 pub use kernel_exception::{
     KernelException, KernelExceptionCause, KernelExceptionDispatch, KernelNativeTrapHandler,
@@ -120,12 +133,12 @@ pub use memory::{
     TASK_ARENA_FRACTION, TASK_ARENA_MIN_BYTES, USER_POOL_MIN_REGION_BYTES, UserHeapStats,
     UserMemoryOwnerScope, UserMemoryOwners, UserMemoryPool, VaCursor,
     allocate_user_frame_uninit_on, allocate_user_frame_zeroed, allocate_user_frame_zeroed_on,
-    configure_user_memory_owner_processors, current_user_memory_owner, deallocate_user_frame,
-    deallocate_user_frame_on, disable_swap, enter_user_memory_owner, install_entropy_device,
-    install_memory_balloon, install_swap, install_swap_hooks, installed_swap_handle,
-    installed_swap_hooks, kernel_reserve_for, largest_servable_user_bytes, seed_root_entropy,
-    set_user_memory_owner, swapped_token, task_arena_bytes_for, user_heap_stats,
-    user_mapping_kernel_heap_bytes, validate_range,
+    allocate_user_run_zeroed_on, configure_user_memory_owner_processors, current_user_memory_owner,
+    deallocate_user_frame, deallocate_user_frame_on, deallocate_user_run_on, disable_swap,
+    enter_user_memory_owner, install_entropy_device, install_memory_balloon, install_swap,
+    install_swap_hooks, installed_swap_handle, installed_swap_hooks, kernel_reserve_for,
+    largest_servable_user_bytes, seed_root_entropy, set_user_memory_owner, swapped_token,
+    task_arena_bytes_for, user_heap_stats, user_mapping_kernel_heap_bytes, validate_range,
 };
 pub use network::{
     HTTP_FORBIDDEN_FIELD_NAMES, HTTP_MAX_FIELD_SECTION_BYTES, HTTP_MAX_FIELD_VALUE_BYTES, HttpBody,
@@ -154,12 +167,12 @@ pub use profiling::{
     KernelLlvmProfile, LlvmProfile, LlvmProfileError, MAX_PROFILE_READ, ProfileSection,
 };
 pub use runtime::{
-    AuthorityDomain, ComponentHostFilesystemState, ComponentNetworkService, ComponentNetworkState,
-    DnsError, DnsErrorKind, ExecOutput, ExecResult, HostDirEntry, HostFileSystem, HostFsError,
-    HostFsErrorKind, HostMetadata, Ipv4Address, NetworkErrorDetail, NetworkIpAddress,
-    ObjectIdentity, PingError, PingErrorKind, PingReply, RegisteredTcpReadBuffer, RuntimeState,
-    SocketReadiness, TcpAccepted, TcpError, TcpErrorKind, TcpListener, UdpBinding, UdpDatagram,
-    UdpError, UdpErrorKind,
+    AuthorityDomain, ComponentHostFilesystemState, ComponentHostNetwork, ComponentNetworkService,
+    ComponentNetworkState, DnsError, DnsErrorKind, ExecOutput, ExecResult, HostDirEntry,
+    HostFileSystem, HostFsError, HostFsErrorKind, HostMetadata, Ipv4Address, NetworkErrorDetail,
+    NetworkHandle, NetworkIpAddress, ObjectIdentity, PingError, PingErrorKind, PingReply,
+    RegisteredTcpReadBuffer, RuntimeState, SocketReadiness, TcpAccepted, TcpError, TcpErrorKind,
+    TcpListener, UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
 };
 pub use vsock::{
     ComponentHostVsockService, MAX_VSOCK_BACKLOG, MAX_VSOCK_CONNECTIONS, MAX_VSOCK_LISTENERS,
@@ -168,10 +181,8 @@ pub use vsock::{
 };
 #[cfg(feature = "wasmtime-runtime")]
 pub use wasmtime_adapter::component_host::{
-    ChildExit, ChildHandle, ComponentBindingSet, ComponentHostNetworkService,
-    ComponentHostProcessorRole, ComponentHostTcpListenerToken, ComponentHostTcpStreamToken,
-    ComponentHostUdpSocketToken, HostRuntimeState, UserProgramService,
-    component_host_processor_role, component_host_processors_to_start,
+    ChildExit, ChildHandle, ComponentBindingSet, ComponentHostProcessorRole, HostRuntimeState,
+    UserProgramService, component_host_processor_role, component_host_processors_to_start,
     component_host_system_processor, component_host_worker_count,
     install_component_host_program_service, install_program_service,
     run_component_host_processor_forever, run_embedded_component_forever,
@@ -190,11 +201,13 @@ use core::task::{Context, Poll, Waker};
 use core::time::Duration;
 
 use arrayvec::ArrayVec;
-use buddy_system_allocator::LockedHeap;
+use buddy_system_allocator::Heap;
 use helios_hal::cpu::{Cpu, Instant, ProcessorId};
 use helios_hal::memory::MemoryRegion;
 use helios_hal::watchdog::{NoWatchdog, ProgressCounter, Watchdog};
 use helios_hal::{DeviceInventory, DmaModel, ProcessorStartupPolicy, ProcessorTopology};
+
+use crate::memory::IrqSafeMutex;
 
 const HEAP_ORDER: usize = 32;
 pub const HEAP_SIZE_CLASS_COUNT: usize = 12;
@@ -235,7 +248,12 @@ impl HeapStats {
 }
 
 struct KernelAllocator<const ORDER: usize> {
-    heap: LockedHeap<ORDER>,
+    /// The kernel heap, behind the mask every allocator in this kernel
+    /// takes: an interrupt handler allocates and frees, so a plain spin
+    /// lock here deadlocks the processor that was interrupted holding
+    /// it, and then every other processor behind it (#206). See
+    /// [`memory::IrqSafeMutex`] for the contract.
+    heap: IrqSafeMutex<Heap<ORDER>>,
     stats: KernelAllocationStats,
     /// Every usable byte the boot memory map described, and the free
     /// kernel heap a user grow may not dip into. Both are fixed by
@@ -253,7 +271,7 @@ struct KernelAllocator<const ORDER: usize> {
 impl<const ORDER: usize> KernelAllocator<ORDER> {
     const fn empty() -> Self {
         Self {
-            heap: LockedHeap::empty(),
+            heap: IrqSafeMutex::new(Heap::new()),
             stats: KernelAllocationStats::new(),
             machine_usable_bytes: AtomicUsize::new(0),
             kernel_reserve_bytes: AtomicUsize::new(0),
@@ -262,9 +280,20 @@ impl<const ORDER: usize> KernelAllocator<ORDER> {
     }
 
     unsafe fn add_to_heap(&self, start: usize, end: usize) {
-        unsafe {
-            self.heap.lock().add_to_heap(start, end);
-        }
+        self.heap.with(|heap| unsafe {
+            heap.add_to_heap(start, end);
+        });
+    }
+
+    /// Returns one allocation to the heap.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be an allocation this heap served under `layout`,
+    /// which is what every [`GlobalAlloc`] caller already promises.
+    unsafe fn free(&self, ptr: *mut u8, layout: Layout) {
+        let ptr = ptr::NonNull::new(ptr).expect("the global allocator was handed a null pointer");
+        self.heap.with(|heap| unsafe { heap.dealloc(ptr, layout) });
     }
 
     /// Records what the boot memory map came to and what the kernel
@@ -291,14 +320,15 @@ impl<const ORDER: usize> KernelAllocator<ORDER> {
     /// growth decision below is made against the state the allocation
     /// actually produced rather than a racing re-read.
     fn try_alloc(&self, layout: Layout) -> (*mut u8, usize) {
-        let mut heap = self.heap.lock();
-        let ptr = heap
-            .alloc(layout)
-            .map_or(ptr::null_mut(), core::ptr::NonNull::as_ptr);
-        let free = heap
-            .stats_total_bytes()
-            .saturating_sub(heap.stats_alloc_actual());
-        (ptr, free)
+        self.heap.with(|heap| {
+            let ptr = heap
+                .alloc(layout)
+                .map_or(ptr::null_mut(), core::ptr::NonNull::as_ptr);
+            let free = heap
+                .stats_total_bytes()
+                .saturating_sub(heap.stats_alloc_actual());
+            (ptr, free)
+        })
     }
 
     /// Serves `layout`, taking more memory out of the user pool when
@@ -370,10 +400,12 @@ impl<const ORDER: usize> KernelAllocator<ORDER> {
     }
 
     fn stats(&self) -> HeapStats {
-        let allocator = self.heap.lock();
+        let (total_bytes, allocated_bytes) = self
+            .heap
+            .with(|heap| (heap.stats_total_bytes(), heap.stats_alloc_actual()));
         HeapStats {
-            total_bytes: allocator.stats_total_bytes(),
-            allocated_bytes: allocator.stats_alloc_actual(),
+            total_bytes,
+            allocated_bytes,
             requested_live_bytes: self.stats.requested_live_bytes.load(Ordering::Relaxed),
             allocation_count: self.stats.allocation_count.load(Ordering::Relaxed),
             deallocation_count: self.stats.deallocation_count.load(Ordering::Relaxed),
@@ -428,9 +460,7 @@ unsafe impl<const ORDER: usize> GlobalAlloc for KernelAllocator<ORDER> {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe {
-            GlobalAlloc::dealloc(&self.heap, ptr, layout);
-        }
+        unsafe { self.free(ptr, layout) };
         self.stats.record_dealloc(layout.size());
     }
 
@@ -443,7 +473,7 @@ unsafe impl<const ORDER: usize> GlobalAlloc for KernelAllocator<ORDER> {
 
         unsafe {
             ptr::copy_nonoverlapping(ptr, new_ptr, layout.size().min(new_size));
-            GlobalAlloc::dealloc(&self.heap, ptr, layout);
+            self.free(ptr, layout);
         }
         self.stats.record_realloc(layout.size(), new_size);
         new_ptr
@@ -1326,6 +1356,54 @@ mod tests {
         assert_eq!(stats.total_allocation_bytes, 64);
         assert_eq!(stats.total_reallocation_bytes, 128);
         assert_eq!(stats.total_deallocation_bytes, 128);
+        assert_eq!(stats.requested_live_bytes, 0);
+    }
+
+    /// The allocator has to serve a caller that is already inside a
+    /// machine-wide critical section.
+    ///
+    /// The path is real: a virtio interrupt ends in
+    /// [`Notify::notify_all`], which is `event_listener::Event::notify`;
+    /// the kernel builds `event-listener` with its `critical-section`
+    /// feature, so the notify takes a critical section and allocates its
+    /// shared state inside one the first time it runs. If the kernel
+    /// heap ever took a lock that could not nest inside the section its
+    /// own caller holds, that first notify would hang the processor.
+    ///
+    /// The heap's own mask is processor-local and takes no owner word,
+    /// so this nests trivially now. It did not always: the first version
+    /// of the #206 fix took `critical_section::with` itself here, and
+    /// depended on that section being re-entrant for the same
+    /// processor. The test is kept because the caller's section is real
+    /// whatever the heap does underneath.
+    #[test]
+    fn the_kernel_allocator_serves_a_caller_already_inside_a_critical_section() {
+        let allocator = KernelAllocator::<HEAP_ORDER>::empty();
+        let mut heap = Box::new(AlignedHeap([0; TEST_HEAP_BYTES]));
+        let start = heap.0.as_mut_ptr() as usize;
+        unsafe {
+            allocator.add_to_heap(start, start + TEST_HEAP_BYTES);
+        }
+
+        let layout = Layout::from_size_align(64, 8).expect("valid allocation layout");
+        critical_section::with(|_| {
+            let ptr = unsafe { GlobalAlloc::alloc(&allocator, layout) };
+            assert!(
+                !ptr.is_null(),
+                "the kernel heap refused an allocation issued from inside a critical section"
+            );
+            let grown = unsafe { GlobalAlloc::realloc(&allocator, ptr, layout, 128) };
+            assert!(!grown.is_null());
+            let grown_layout = Layout::from_size_align(128, 8).expect("valid grown layout");
+            unsafe {
+                GlobalAlloc::dealloc(&allocator, grown, grown_layout);
+            }
+        });
+
+        let stats = allocator.stats();
+        assert_eq!(stats.allocation_count, 1);
+        assert_eq!(stats.reallocation_count, 1);
+        assert_eq!(stats.deallocation_count, 1);
         assert_eq!(stats.requested_live_bytes, 0);
     }
 }

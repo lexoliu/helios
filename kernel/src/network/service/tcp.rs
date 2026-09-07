@@ -64,10 +64,9 @@ fn tcp_close_error(close: TcpCloseKind) -> Option<TcpError> {
     Some(TcpError { kind, detail })
 }
 
-impl<CpuImpl, Runtime, DeviceImpl> NetworkService<CpuImpl, Runtime, DeviceImpl>
+impl<CpuImpl, DeviceImpl> NetworkService<CpuImpl, DeviceImpl>
 where
     CpuImpl: Cpu + Clone,
-    Runtime: ComponentRuntimeState + Sync,
     DeviceImpl: NetworkDevice,
 {
     pub async fn tcp_connect(
@@ -291,10 +290,69 @@ where
     /// to spawn a task, and a task spawned from a dying instance is a
     /// task that may never run — which is how a connection outlived the
     /// program that opened it (#184).
+    ///
+    /// The close ends with a pump kick, and that is the whole of #231:
+    /// what a retirement leaves behind is a FIN sequence to run or a
+    /// reset on the outbound queue, and neither puts a frame anywhere a
+    /// shard's own arrival signal would see. Without the kick the
+    /// segment waits for the pump's next park to expire — up to
+    /// `DHCP_RETRANSMIT_NANOS` on a guest with nothing else to send —
+    /// so a peer learns of the close a second after the guest made it.
+    /// The kick belongs here rather than at the call sites: #232 put it
+    /// on the component host's retirement drain, and the owners that
+    /// reach this method directly — a socket resource backend's
+    /// `close`, a descriptor table's `Drop` — never got one. No present
+    /// or future owner has to remember it now.
+    ///
+    /// Unconditional, because the only close that queues nothing is one
+    /// on a connection that owed its peer nothing, and telling the two
+    /// apart costs more than the kick: `TcpCloseOutcome::Reclaimed`
+    /// covers both the bare reclamation and the reset, so gating on it
+    /// would drop exactly the wake a reset needs. A kick nothing is
+    /// waiting for is one atomic increment on the shard set's arrival
+    /// signal and a notify that finds no listener; a kick the parked
+    /// pump takes costs it one pass over the shards, which is noise
+    /// beside the teardown that just ran.
     pub fn tcp_close(&self, stream: TcpStreamId) {
+        let now = StackInstant::from_nanos(self.now_nanos());
         self.inner.state.with_handle(stream, |state| {
-            state.remove_tcp_stream(stream);
+            state.remove_tcp_stream(stream, now);
         });
+        self.wake_packet_pump();
+    }
+
+    /// Retires `listener`, freeing its slab slot, its replica on every
+    /// shard, and the local port those replicas were holding.
+    ///
+    /// Synchronous for the same reason `tcp_close` and `udp_close` are:
+    /// retirement is a shard-lock update with nothing to await, and the
+    /// owner that has to run it is a `Drop`. A future here would mean
+    /// the only way to end a listener's life is to spawn a task, and a
+    /// task spawned from a dying instance is a task that may never run.
+    ///
+    /// Connections already accepted are streams of their own and live
+    /// on. A connection still queued in a replica's backlog is reset:
+    /// nobody will ever accept it, and its peer completed a handshake
+    /// with a port that is going away. Until this existed every
+    /// listener a program opened stayed in its shard for the rest of
+    /// the boot, holding the port that `is_tcp_local_port_free`
+    /// consults (#191).
+    ///
+    /// Those resets are segments on the outbound queue and nothing
+    /// else raises a signal for them, so this kicks the pump for the
+    /// reason [`NetworkService::tcp_close`] does and on the same terms.
+    pub fn tcp_listener_close(&self, listener: TcpListenerId) {
+        let slot = ReplicaHandle::from(listener).slot();
+        let now = StackInstant::from_nanos(self.now_nanos());
+        self.inner
+            .state
+            .for_each_replica("tcp listener close", |state| {
+                state.remove_tcp_listener(slot, now);
+                Ok::<(), core::convert::Infallible>(())
+            })
+            .unwrap_or_else(|infallible| match infallible {});
+        self.inner.state.listener_slots.release(slot);
+        self.wake_packet_pump();
     }
 
     pub(super) async fn execute_tcp_connect(
@@ -389,12 +447,13 @@ where
             let wait = self.shard_wait_for_handle(stream);
             self.drive_tcp().await?;
             let now_nanos = self.now_nanos();
+            let now = StackInstant::from_nanos(now_nanos);
             let poll_connect = self.inner.state.with_handle(stream, |state| {
                 match state.poll_tcp_connect(stream) {
                     Ok(TcpConnectProgress::Connected) => Ok(TcpConnectProgress::Connected),
                     Ok(TcpConnectProgress::Pending) => {
                         if now_nanos >= deadline_nanos {
-                            state.remove_tcp_stream(stream);
+                            state.remove_tcp_stream(stream, now);
                             Err(TcpError {
                                 kind: TcpErrorKind::Timeout,
                                 detail: NetworkErrorDetail::TcpConnectTimeout,
@@ -404,7 +463,7 @@ where
                         }
                     }
                     Err(error) => {
-                        state.remove_tcp_stream(stream);
+                        state.remove_tcp_stream(stream, now);
                         Err(error)
                     }
                 }
@@ -455,12 +514,13 @@ where
                 return Err(error);
             }
         };
+        let now = StackInstant::from_nanos(self.now_nanos());
         let install = self.inner.state.install_replica(
             slot,
             |shard, slot| {
                 shard.install_tcp_listener(slot, local_address, local_port, backlog, hop_limit)
             },
-            NetworkShard::remove_tcp_listener,
+            |shard, slot| shard.remove_tcp_listener(slot, now),
         );
         if let Err(error) = install {
             self.inner.state.listener_slots.release(slot);
@@ -587,6 +647,7 @@ where
                 TcpReadProgress::Pending => {}
             }
             if self.now_nanos() >= deadline_nanos {
+                self.report_tcp_read_timeout(stream, timeout_nanos);
                 return Err(TcpError {
                     kind: TcpErrorKind::Timeout,
                     detail: NetworkErrorDetail::TcpReadTimeout,
@@ -639,6 +700,7 @@ where
                 TcpReadIntoProgress::Pending => {}
             }
             if self.now_nanos() >= deadline_nanos {
+                self.report_tcp_read_timeout(stream, timeout_nanos);
                 return Err(TcpError {
                     kind: TcpErrorKind::Timeout,
                     detail: NetworkErrorDetail::TcpReadTimeout,
@@ -647,6 +709,43 @@ where
             let wait_started = self.profile_start();
             self.wait_for_tcp_progress(wait, deadline_nanos).await;
             self.record_network_profile("tcp-read-into-wait", wait_started);
+        }
+    }
+
+    /// Names the receive state a read gave up on.
+    ///
+    /// The per-shard counters are read after the workload exits, when
+    /// the socket has already been torn down and its queues are gone, so
+    /// a stall reported that way says nothing about the hole that caused
+    /// it. This runs while the socket is still alive, once per timeout,
+    /// on a path that has already waited out its whole deadline (#166).
+    fn report_tcp_read_timeout(&self, stream: TcpStreamId, timeout_nanos: u64) {
+        let diagnostics = self
+            .inner
+            .state
+            .with_handle(stream, |shard| shard.tcp_receive_diagnostics(stream));
+        match diagnostics {
+            Ok(diagnostics) => tracing::warn!(
+                stream = u64::from(stream),
+                timeout_nanos,
+                state = ?diagnostics.state,
+                receive_next = diagnostics.receive_next,
+                receive_queued_bytes = diagnostics.receive_queued_bytes,
+                out_of_order_queued_bytes = diagnostics.out_of_order_queued_bytes,
+                out_of_order_segments = diagnostics.out_of_order_segments,
+                first_out_of_order = ?diagnostics.first_out_of_order,
+                last_out_of_order = ?diagnostics.last_out_of_order,
+                advertised_window_bytes = diagnostics.advertised_window_bytes,
+                last_ack = ?diagnostics.last_ack,
+                last_segment = ?diagnostics.last_segment,
+                "TCP read timed out"
+            ),
+            Err(error) => tracing::warn!(
+                stream = u64::from(stream),
+                timeout_nanos,
+                ?error,
+                "TCP read timed out on a stream the shard no longer holds"
+            ),
         }
     }
 
@@ -930,12 +1029,18 @@ where
     /// ring before it looks at anyone else's, and a pair another
     /// processor already holds is skipped by the device's `try_lock` —
     /// that processor is draining it and this poll has nothing to add.
-    /// `Ok(None)` means every pair was held, which is the same "come
-    /// back later" a single-pair drain reports.
-    fn receive_frames_immediate(
-        &self,
-        frames: &mut [Option<RxFrame>],
-    ) -> Result<Option<usize>, IoError> {
+    /// `None` means every pair was held, which is the same "come back
+    /// later" a single-pair drain reports.
+    ///
+    /// A pair that refuses ends the sweep, and the refusal travels back
+    /// beside the frames the sweep had already collected rather than in
+    /// place of them. Those frames are off the ring and no used entry
+    /// can be put back, so dropping them to report the error costs up
+    /// to a whole batch of good frames per malformed chain and makes
+    /// the peer retransmit data the guest did receive. The refusal is
+    /// counted against the pair that produced it here, because this is
+    /// the last place that knows which pair that was.
+    fn receive_frames_immediate(&self, frames: &mut [Option<RxFrame>]) -> Option<RxDrain> {
         let pair_count = self.inner.device.queue_pair_count().max(1);
         let local_pair = usize::from(self.inner.cpu.current_processor().id()) % pair_count;
         let mut received = 0usize;
@@ -944,20 +1049,24 @@ where
             if received >= frames.len() {
                 break;
             }
-            let Some(batch) = self
+            let Some(drain) = self
                 .inner
                 .device
-                .try_receive_frames_immediate_on(pair_idx, &mut frames[received..])?
+                .try_receive_frames_immediate_on(pair_idx, &mut frames[received..])
             else {
                 continue;
             };
             drained_a_pair = true;
-            received += batch;
+            received += drain.received;
+            if let Some(refusal) = drain.refusal {
+                self.inner.state.record_receive_device_refusal(pair_idx);
+                return Some(RxDrain::refused(received, refusal));
+            }
         }
         if !drained_a_pair {
-            return Ok(None);
+            return None;
         }
-        Ok(Some(received))
+        Some(RxDrain::completed(received))
     }
 
     pub(super) async fn poll_network_once_with_tcp_read(
@@ -1019,10 +1128,11 @@ where
             let receive_limit = remaining_rx_budget.min(NETWORK_RX_BATCH_FRAMES);
             let mut frames: [Option<RxFrame>; NETWORK_RX_BATCH_FRAMES] =
                 core::array::from_fn(|_| None);
-            let received_batch = match self
-                .receive_frames_immediate(&mut frames[..receive_limit])?
-            {
-                Some(received_batch) => received_batch,
+            let RxDrain {
+                received: received_batch,
+                refusal,
+            } = match self.receive_frames_immediate(&mut frames[..receive_limit]) {
+                Some(drain) => drain,
                 None => {
                     let mut received_batch = 0usize;
                     for frame in &mut frames[..receive_limit] {
@@ -1033,10 +1143,14 @@ where
                         *frame = Some(received_frame);
                         received_batch += 1;
                     }
-                    received_batch
+                    RxDrain::completed(received_batch)
                 }
             };
-            if received_batch == 0 {
+            // A refused drain still falls through the demux below, so
+            // the frames it did take reach their shards and their
+            // receive slots go back to the device before the error is
+            // reported at the bottom of the iteration.
+            if received_batch == 0 && refusal.is_none() {
                 break;
             }
 
@@ -1099,6 +1213,14 @@ where
                 for frame in &mut frames[..received_batch] {
                     drop(frame.take());
                 }
+            }
+
+            // The drain that produced this batch was refused. Its
+            // frames have reached their shards and their receive slots
+            // are back with the device, so the error is what is left to
+            // report.
+            if let Some(refusal) = refusal {
+                return Err(refusal);
             }
         }
         self.record_network_profile_events_bytes(
@@ -1350,12 +1472,16 @@ impl NetworkShard {
         Ok(())
     }
 
-    /// Drops this shard's replica of a listener, used to unwind a
-    /// partial install.
-    pub(super) fn remove_tcp_listener(&mut self, slot: usize) {
+    /// Drops this shard's replica of a listener, used both to close one
+    /// and to unwind a partial install.
+    ///
+    /// The stack resets whatever this replica's backlog was still
+    /// holding, so `now` stamps those resets. Connections already
+    /// accepted are streams of their own and are untouched.
+    pub(super) fn remove_tcp_listener(&mut self, slot: usize, now: StackInstant) {
         if let Some(state) = self.tcp_listeners.remove(slot) {
             self.stack
-                .remove_tcp_socket(state.stack_socket)
+                .remove_tcp_socket(state.stack_socket, now)
                 .unwrap_or_else(|_| panic!("TCP listener referenced an unknown stack socket"));
         }
     }
@@ -1494,12 +1620,26 @@ impl NetworkShard {
         }
     }
 
-    pub(super) fn remove_tcp_stream(&mut self, stream: TcpStreamId) {
+    /// Retires `stream` and hands what is left of the connection to the
+    /// stack.
+    ///
+    /// The handle is invalid the moment its slot is released, whatever
+    /// the stack then does with the socket: a connection still owing
+    /// its peer a FIN outlives the handle, under the stack's ownership
+    /// and unreachable from here, and a later call on the handle is
+    /// `UnknownTcpStream` either way.
+    ///
+    /// Before #224 this dropped the socket outright, so a program that
+    /// exited with a connection open put nothing on the wire and its
+    /// peer kept an established connection until its own timeout.
+    pub(super) fn remove_tcp_stream(&mut self, stream: TcpStreamId, now: StackInstant) {
         let slot = self.decode_handle_slot(stream.into());
         if let Some(socket) = self.tcp_streams.remove(slot) {
-            self.stack
-                .remove_tcp_socket(socket)
+            let outcome = self
+                .stack
+                .close_tcp_socket(socket, now)
                 .unwrap_or_else(|_| panic!("TCP stream referenced an unknown stack socket"));
+            tracing::debug!(stream = u64::from(stream), ?outcome, "TCP stream retired");
         }
     }
 
@@ -1517,6 +1657,19 @@ impl NetworkShard {
             kind: TcpErrorKind::Unavailable,
             detail: NetworkErrorDetail::UnknownTcpStream,
         })
+    }
+
+    pub(super) fn tcp_receive_diagnostics(
+        &self,
+        stream: TcpStreamId,
+    ) -> Result<TcpReceiveDiagnostics, TcpError> {
+        let socket = self.tcp_socket(stream)?;
+        self.stack
+            .tcp_receive_diagnostics(socket)
+            .map_err(|_| TcpError {
+                kind: TcpErrorKind::Unavailable,
+                detail: NetworkErrorDetail::UnknownTcpStream,
+            })
     }
 
     pub(super) fn tcp_listener(

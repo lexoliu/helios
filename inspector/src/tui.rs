@@ -2,7 +2,6 @@ use std::io;
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{Context as _, Result};
 use async_channel::Receiver;
 use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent};
 use crossterm::execute;
@@ -14,6 +13,57 @@ use ratatui::backend::CrosstermBackend;
 
 pub(crate) type ShellTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 
+/// Why a terminal view could not be opened or given back.
+///
+/// A restore that fails is as much a fault as an open that fails: it
+/// leaves the operator's terminal in raw mode on the alternate screen,
+/// so it is reported with the same detail rather than swallowed.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum TerminalError {
+    #[error("failed to enable raw mode for {view}: {source}")]
+    EnableRawMode {
+        view: &'static str,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to enter {view} screen: {source}")]
+    EnterScreen {
+        view: &'static str,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to create terminal for {view}: {source}")]
+    CreateTerminal {
+        view: &'static str,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to disable raw mode for {view}: {source}")]
+    DisableRawMode {
+        view: &'static str,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to leave {view} screen: {source}")]
+    LeaveScreen {
+        view: &'static str,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to restore cursor after {view}: {source}")]
+    RestoreCursor {
+        view: &'static str,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to draw the {view}: {source}")]
+    Draw {
+        view: &'static str,
+        #[source]
+        source: io::Error,
+    },
+}
+
 pub(crate) struct Session {
     terminal: ShellTerminal,
     mouse_capture: bool,
@@ -21,18 +71,27 @@ pub(crate) struct Session {
 }
 
 impl Session {
-    pub(crate) fn open(mouse_capture: bool, context: &'static str) -> Result<Self> {
-        enable_raw_mode().with_context(|| format!("failed to enable raw mode for {context}"))?;
+    pub(crate) fn open(mouse_capture: bool, context: &'static str) -> Result<Self, TerminalError> {
+        enable_raw_mode().map_err(|source| TerminalError::EnableRawMode {
+            view: context,
+            source,
+        })?;
         let mut stdout = io::stdout();
-        if mouse_capture {
+        let entered = if mouse_capture {
             execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
-                .with_context(|| format!("failed to enter {context} screen"))?;
         } else {
             execute!(stdout, EnterAlternateScreen)
-                .with_context(|| format!("failed to enter {context} screen"))?;
-        }
-        let terminal = Terminal::new(CrosstermBackend::new(stdout))
-            .with_context(|| format!("failed to create terminal for {context}"))?;
+        };
+        entered.map_err(|source| TerminalError::EnterScreen {
+            view: context,
+            source,
+        })?;
+        let terminal = Terminal::new(CrosstermBackend::new(stdout)).map_err(|source| {
+            TerminalError::CreateTerminal {
+                view: context,
+                source,
+            }
+        })?;
         Ok(Self {
             terminal,
             mouse_capture,
@@ -44,7 +103,7 @@ impl Session {
         &mut self.terminal
     }
 
-    pub(crate) fn close(mut self) -> Result<()> {
+    pub(crate) fn close(mut self) -> Result<(), TerminalError> {
         restore_terminal(&mut self.terminal, self.mouse_capture, self.context)?;
         std::mem::forget(self);
         Ok(())
@@ -80,21 +139,29 @@ pub(crate) fn spawn_events() -> Receiver<CrosstermEvent> {
 fn restore_terminal(
     terminal: &mut ShellTerminal,
     mouse_capture: bool,
-    context: &str,
-) -> Result<()> {
-    disable_raw_mode().with_context(|| format!("failed to disable raw mode for {context}"))?;
-    if mouse_capture {
+    context: &'static str,
+) -> Result<(), TerminalError> {
+    disable_raw_mode().map_err(|source| TerminalError::DisableRawMode {
+        view: context,
+        source,
+    })?;
+    let left = if mouse_capture {
         execute!(
             terminal.backend_mut(),
             LeaveAlternateScreen,
             DisableMouseCapture
         )
-        .with_context(|| format!("failed to leave {context} screen"))?;
     } else {
         execute!(terminal.backend_mut(), LeaveAlternateScreen)
-            .with_context(|| format!("failed to leave {context} screen"))?;
-    }
+    };
+    left.map_err(|source| TerminalError::LeaveScreen {
+        view: context,
+        source,
+    })?;
     terminal
         .show_cursor()
-        .with_context(|| format!("failed to restore cursor after {context}"))
+        .map_err(|source| TerminalError::RestoreCursor {
+            view: context,
+            source,
+        })
 }

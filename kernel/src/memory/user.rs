@@ -7,7 +7,7 @@ use core::mem::size_of;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
-use buddy_system_allocator::LockedHeap;
+use buddy_system_allocator::Heap;
 use helios_hal::cpu::ProcessorId;
 use helios_hal::pmm::{
     FrameAllocError, FrameAllocStats, PhysFrame, PhysFrameAllocator, PhysFrameRange,
@@ -15,12 +15,18 @@ use helios_hal::pmm::{
 
 use crate::ProgramOutOfMemory;
 use crate::memory::frame_slab::FrameSlabCache;
+use crate::memory::irq_safe::IrqSafeMutex;
 use crate::memory::reported::{ReportedFrames, visit_free_runs};
 
 const USER_HEAP_ORDER: usize = 32;
 
 pub struct UserMemoryPool {
-    heap: LockedHeap<USER_HEAP_ORDER>,
+    /// The pool's buddy storage, behind the mask its callers need. The
+    /// kernel's global allocator grows itself out of this pool, and it
+    /// does so from wherever it was called — an interrupt handler
+    /// included — so this lock is on the same interrupt path as the
+    /// kernel heap's (#206).
+    heap: IrqSafeMutex<Heap<USER_HEAP_ORDER>>,
     frame_slab: FrameSlabCache,
     total_bytes: AtomicUsize,
     /// Frames shown to a free-page consumer. The memory is still the
@@ -31,7 +37,7 @@ pub struct UserMemoryPool {
 impl UserMemoryPool {
     pub const fn empty() -> Self {
         Self {
-            heap: LockedHeap::empty(),
+            heap: IrqSafeMutex::new(Heap::new()),
             frame_slab: FrameSlabCache::new(),
             total_bytes: AtomicUsize::new(0),
             reported: ReportedFrames::new(),
@@ -42,9 +48,9 @@ impl UserMemoryPool {
         if end <= start {
             return;
         }
-        unsafe {
-            self.heap.lock().add_to_heap(start, end);
-        }
+        self.heap.with(|heap| unsafe {
+            heap.add_to_heap(start, end);
+        });
         self.reported.cover(start, end);
         self.total_bytes.fetch_add(end - start, Ordering::Release);
     }
@@ -82,12 +88,13 @@ impl UserMemoryPool {
     }
 
     pub fn stats(&self) -> UserHeapStats {
-        let allocator = self.heap.lock();
-        let cached = self.frame_slab.cached_bytes();
-        UserHeapStats {
-            total_bytes: allocator.stats_total_bytes(),
-            allocated_bytes: allocator.stats_alloc_actual().saturating_sub(cached),
-        }
+        self.heap.with(|heap| {
+            let cached = self.frame_slab.cached_bytes();
+            UserHeapStats {
+                total_bytes: heap.stats_total_bytes(),
+                allocated_bytes: heap.stats_alloc_actual().saturating_sub(cached),
+            }
+        })
     }
 
     pub fn allocate_zeroed(&self, layout: Layout) -> Result<NonNull<u8>, ProgramOutOfMemory> {
@@ -201,29 +208,29 @@ impl UserMemoryPool {
             }
         }
 
-        let mut allocator = self.heap.lock();
-        let ptr = allocator
-            .alloc(layout)
-            .or_else(|_| {
-                self.frame_slab.drain(|ptr| unsafe {
-                    allocator.dealloc(ptr, single_frame_layout());
-                });
-                allocator.alloc(layout)
-            })
-            .map_err(|_| {
-                let stats = UserHeapStats {
-                    total_bytes: allocator.stats_total_bytes(),
-                    allocated_bytes: allocator
-                        .stats_alloc_actual()
-                        .saturating_sub(self.frame_slab.cached_bytes()),
-                };
-                ProgramOutOfMemory {
-                    requested_bytes: allocation_size,
-                    available_bytes: stats.available_bytes(),
-                    pool_bytes: stats.total_bytes,
-                    reserved_bytes: 0,
-                }
-            })?;
+        let ptr = self.heap.with(|heap| {
+            heap.alloc(layout)
+                .or_else(|_| {
+                    self.frame_slab.drain(|ptr| unsafe {
+                        heap.dealloc(ptr, single_frame_layout());
+                    });
+                    heap.alloc(layout)
+                })
+                .map_err(|_| {
+                    let stats = UserHeapStats {
+                        total_bytes: heap.stats_total_bytes(),
+                        allocated_bytes: heap
+                            .stats_alloc_actual()
+                            .saturating_sub(self.frame_slab.cached_bytes()),
+                    };
+                    ProgramOutOfMemory {
+                        requested_bytes: allocation_size,
+                        available_bytes: stats.available_bytes(),
+                        pool_bytes: stats.total_bytes,
+                        reserved_bytes: 0,
+                    }
+                })
+        })?;
         Ok((ptr, allocation_size))
     }
 
@@ -257,9 +264,9 @@ impl UserMemoryPool {
                 return;
             }
         }
-        unsafe {
-            self.heap.lock().dealloc(ptr, layout);
-        }
+        self.heap.with(|heap| unsafe {
+            heap.dealloc(ptr, layout);
+        });
     }
 }
 
@@ -483,6 +490,31 @@ pub fn allocate_user_frame_uninit_on(
     user_memory_pool()
         .allocate_uninit_on(processor, layout)
         .map(|(ptr, _)| ptr)
+}
+
+/// Allocates one physically contiguous, zeroed run of user memory.
+///
+/// A device that reads or writes memory by itself sees physical
+/// addresses and no page table, so a DMA buffer has to be one run of
+/// physical memory rather than a list of frames. The buddy allocator
+/// already answers in contiguous blocks, so the run is exactly what a
+/// single allocation of `layout` returns; splitting it back into
+/// frames is what would be wrong here, and is why the matching release
+/// takes the same layout.
+pub fn allocate_user_run_zeroed_on(
+    processor: ProcessorId,
+    layout: Layout,
+) -> Result<NonNull<u8>, ProgramOutOfMemory> {
+    user_memory_pool().allocate_zeroed_on(processor, layout)
+}
+
+/// Gives back a run from [`allocate_user_run_zeroed_on`].
+///
+/// `layout` is the one the run was allocated with. The buddy allocator
+/// derives the block order from it, so a different layout returns the
+/// memory to the wrong free list.
+pub fn deallocate_user_run_on(processor: ProcessorId, ptr: NonNull<u8>, layout: Layout) {
+    user_memory_pool().deallocate_bytes_on(processor, ptr, layout);
 }
 
 pub fn deallocate_user_frame(ptr: NonNull<u8>) {

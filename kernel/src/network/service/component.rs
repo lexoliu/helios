@@ -18,10 +18,9 @@ pub(super) enum DhcpClientState {
     Bound,
 }
 
-impl<CpuImpl, Runtime, DeviceImpl> NetworkService<CpuImpl, Runtime, DeviceImpl>
+impl<CpuImpl, DeviceImpl> NetworkService<CpuImpl, DeviceImpl>
 where
     CpuImpl: Cpu + Clone,
-    Runtime: ComponentRuntimeState + Sync,
     DeviceImpl: NetworkDevice,
 {
     pub async fn dns_resolve(
@@ -295,11 +294,9 @@ where
     }
 }
 
-impl<CpuImpl, Runtime, DeviceImpl> ComponentNetworkService
-    for NetworkService<CpuImpl, Runtime, DeviceImpl>
+impl<CpuImpl, DeviceImpl> ComponentNetworkService for NetworkService<CpuImpl, DeviceImpl>
 where
     CpuImpl: Cpu + Clone,
-    Runtime: ComponentRuntimeState + Sync,
     DeviceImpl: NetworkDevice,
 {
     type TcpStream = TcpStreamId;
@@ -455,6 +452,10 @@ where
         NetworkService::tcp_close(self, stream);
     }
 
+    fn tcp_listener_close(&self, listener: Self::TcpListener) {
+        NetworkService::tcp_listener_close(self, listener);
+    }
+
     async fn udp_bind(&self, local_port: u16) -> Result<UdpBinding<Self::UdpSocket>, UdpError> {
         NetworkService::udp_bind(self, local_port).await
     }
@@ -524,16 +525,14 @@ where
         NetworkService::udp_leave_multicast_v4(self, group, interface).await
     }
 
-    async fn udp_close(&self, socket: Self::UdpSocket) {
-        NetworkService::udp_close(self, socket).await
+    fn udp_close(&self, socket: Self::UdpSocket) {
+        NetworkService::udp_close(self, socket);
     }
 }
 
-impl<CpuImpl, Runtime, DeviceImpl> NetworkAdminBackend
-    for NetworkService<CpuImpl, Runtime, DeviceImpl>
+impl<CpuImpl, DeviceImpl> NetworkAdminBackend for NetworkService<CpuImpl, DeviceImpl>
 where
     CpuImpl: Cpu + Clone,
-    Runtime: ComponentRuntimeState + Sync,
     DeviceImpl: NetworkDevice,
 {
     fn network_stats(&self) -> crate::NetworkStats {

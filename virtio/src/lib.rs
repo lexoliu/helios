@@ -34,8 +34,8 @@ pub use bus::{
     OffsetDmaBuffer, OffsetDmaPool, PlatformDmaBuffer, PlatformDmaPool,
 };
 pub use discovery::{
-    InterruptTrigger, MmioCandidate, MmioInterrupt, mmio_candidates, mmio_device_matches,
-    node_interrupt,
+    InterruptTrigger, MmioCandidate, MmioInterrupt, NodeInterrupt, mmio_candidates,
+    mmio_device_matches, node_interrupt, node_interrupt_kind,
 };
 pub use features::{NegotiatedFeatures, RING_FEATURES, negotiate, negotiate_with};
 pub use iommu::{MAX_RESERVED_REGIONS, ReservedRegion, VirtioIommuDevice};
@@ -47,7 +47,8 @@ pub use mmio::{
     vsock_from_mmio_with_dma,
 };
 pub use net::{
-    NotificationCoalescing, QueuePairProgress, RxFrame, TxChecksumMeta, TxGsoMeta, VirtioNetDevice,
+    NotificationCoalescing, QueuePairProgress, RxDrain, RxFrame, TxChecksumMeta, TxGsoMeta,
+    VirtioNetDevice,
 };
 pub use p9::Virtio9pDevice;
 pub use pci::{

@@ -1,20 +1,26 @@
+use pin_project_lite::pin_project;
+
+use crate::ComponentHostNetwork;
+
 use super::*;
 
-pub(super) struct ComponentFsProfile<CpuImpl, HostFs>
+pub(super) struct ComponentFsProfile<CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    pub(super) runtime_state: HostRuntimeState<CpuImpl, HostFs>,
+    pub(super) runtime_state: HostRuntimeState<CpuImpl, Net, HostFs>,
     pub(super) cpu: CpuImpl,
     pub(super) started_ticks: u64,
 }
 
-pub(super) fn component_fs_profile<CpuImpl, HostFs>(
-    store: &StoreData<CpuImpl, HostFs>,
-) -> Option<ComponentFsProfile<CpuImpl, HostFs>>
+pub(super) fn component_fs_profile<CpuImpl, Net, HostFs>(
+    store: &StoreData<CpuImpl, Net, HostFs>,
+) -> Option<ComponentFsProfile<CpuImpl, Net, HostFs>>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     store
@@ -27,11 +33,12 @@ where
         })
 }
 
-pub(super) fn record_component_fs_profile<CpuImpl, HostFs>(
-    profile: Option<ComponentFsProfile<CpuImpl, HostFs>>,
+pub(super) fn record_component_fs_profile<CpuImpl, Net, HostFs>(
+    profile: Option<ComponentFsProfile<CpuImpl, Net, HostFs>>,
     operation: &'static str,
 ) where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     if let Some(profile) = profile {
@@ -284,12 +291,13 @@ where
 {
     /// Binds a descriptor to the host share when its path lives under the
     /// host mount, otherwise reports that the embedded filesystem owns it.
-    pub(crate) fn for_descriptor<CpuImpl>(
-        store: &StoreData<CpuImpl, HostFs>,
+    pub(crate) fn for_descriptor<CpuImpl, Net>(
+        store: &StoreData<CpuImpl, Net, HostFs>,
         descriptor: &FsDescriptor,
     ) -> core::result::Result<Option<Self>, fs_types::ErrorCode>
     where
         CpuImpl: Cpu + Clone,
+        Net: ComponentHostNetwork,
     {
         let Some(path) = crate::guest_host_share_path(&descriptor.path) else {
             return Ok(None);
@@ -301,169 +309,255 @@ where
     }
 }
 
-/// A 9p transfer a file stream started and is now waiting on.
-type PendingHostTransfer<T> = Pin<
-    Box<dyn core::future::Future<Output = core::result::Result<T, fs_types::ErrorCode>> + Send>,
->;
+/// What one bounded host read resolves with.
+type HostReadResult = core::result::Result<Vec<u8>, fs_types::ErrorCode>;
 
-pub(super) struct FileWriteConsumer<T, CpuImpl, HostFs>
+/// What one host write resolves with: the number of bytes handed over.
+type HostWriteResult = core::result::Result<usize, fs_types::ErrorCode>;
+
+/// One bounded 9p read, as a future the producer can own by value.
+///
+/// A free `async fn` rather than a method so its future has a type the
+/// producer can name through a `Fut` parameter: the target it reads
+/// through is owned by the future, so it borrows nothing across a poll.
+async fn read_host_file<HostFs>(
+    host: HostFileStreamTarget<HostFs>,
+    offset: u64,
+    max_bytes: u32,
+) -> HostReadResult
 where
-    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    pub(super) getter: fn(&mut T) -> &mut StoreData<CpuImpl, HostFs>,
-    pub(super) descriptor: FsDescriptor,
-    pub(super) mode: FileWriteMode,
-    pub(super) host: Option<HostFileStreamTarget<HostFs>>,
-    pub(super) pending: Option<PendingHostTransfer<usize>>,
-    pub(super) result: Option<oneshot::Sender<core::result::Result<(), fs_types::ErrorCode>>>,
+    host.service
+        .read_file_range(&host.path, offset, max_bytes)
+        .await
+        .map_err(map_host_fs_error)
 }
 
-pub(super) struct FileReadStreamProducer<T, CpuImpl, HostFs>
+/// One 9p write, as a future the consumer can own by value.
+///
+/// Positional writes carry the stream offset; append writes resolve the
+/// host's end of file inside the client so a concurrently grown file is
+/// never overwritten. Both resolve with the number of bytes handed over.
+async fn write_host_file<HostFs>(
+    host: HostFileStreamTarget<HostFs>,
+    mode: FileWriteMode,
+    bytes: Vec<u8>,
+) -> HostWriteResult
 where
-    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    pub(super) getter: fn(&mut T) -> &mut StoreData<CpuImpl, HostFs>,
-    pub(super) descriptor: FsDescriptor,
-    pub(super) offset: u64,
-    pub(super) chunk_bytes: usize,
-    pub(super) host: Option<HostFileStreamTarget<HostFs>>,
-    pub(super) pending: Option<PendingHostTransfer<Vec<u8>>>,
-    pub(super) result: Option<oneshot::Sender<core::result::Result<(), fs_types::ErrorCode>>>,
-}
-
-// The in-flight 9p transfer is already heap-pinned, and nothing else in
-// either stream is address-sensitive, so both drive their pending future
-// directly from `Pin<&mut Self>`.
-impl<T, CpuImpl, HostFs> Unpin for FileReadStreamProducer<T, CpuImpl, HostFs>
-where
-    CpuImpl: Cpu + Clone,
-    HostFs: crate::HostFileSystem,
-{
-}
-
-impl<T, CpuImpl, HostFs> Unpin for FileWriteConsumer<T, CpuImpl, HostFs>
-where
-    CpuImpl: Cpu + Clone,
-    HostFs: crate::HostFileSystem,
-{
-}
-
-impl<T, CpuImpl, HostFs> FileReadStreamProducer<T, CpuImpl, HostFs>
-where
-    CpuImpl: Cpu + Clone,
-    HostFs: crate::HostFileSystem,
-{
-    pub(super) fn new(
-        getter: fn(&mut T) -> &mut StoreData<CpuImpl, HostFs>,
-        descriptor: FsDescriptor,
-        offset: u64,
-        chunk_bytes: usize,
-        host: Option<HostFileStreamTarget<HostFs>>,
-        result: oneshot::Sender<core::result::Result<(), fs_types::ErrorCode>>,
-    ) -> Self {
-        Self {
-            getter,
-            descriptor,
-            offset,
-            chunk_bytes,
-            host,
-            pending: None,
-            result: Some(result),
-        }
-    }
-
-    pub(super) fn complete(&mut self, result: core::result::Result<(), fs_types::ErrorCode>) {
-        if let Some(tx) = self.result.take() {
-            let _ = tx.send(result);
-        }
-    }
-
-    /// Starts the next bounded host read.
-    ///
-    /// Only `chunk_bytes` are ever in flight, so a stream over a multi-gigabyte
-    /// host file never holds more than one chunk of kernel memory.
-    fn start_host_read(&mut self, capacity: Option<usize>) {
-        let Some(host) = self.host.clone() else {
-            return;
-        };
-        let request = capacity.unwrap_or(self.chunk_bytes).min(self.chunk_bytes);
-        let max_bytes = u32::try_from(request).unwrap_or(u32::MAX);
-        let offset = self.offset;
-        self.pending = Some(Box::pin(async move {
+    let written = bytes.len();
+    match mode {
+        FileWriteMode::At(offset) => {
+            let offset = u64::try_from(offset).expect("file offset overflowed u64");
             host.service
-                .read_file_range(&host.path, offset, max_bytes)
+                .write_file(&host.path, offset, &bytes)
                 .await
-                .map_err(map_host_fs_error)
-        }));
+                .map_err(map_host_fs_error)?;
+        }
+        FileWriteMode::Append => {
+            host.service
+                .append_file(&host.path, &bytes)
+                .await
+                .map_err(map_host_fs_error)?;
+        }
+    }
+    Ok(written)
+}
+
+/// Answers the `future<result>` a `read-via-stream`, `write-via-stream`
+/// or `append-via-stream` handed the guest, once. A dropped receiver
+/// means the guest stopped caring, which is not this side's problem.
+fn complete_file_transfer(
+    result: &mut Option<oneshot::Sender<core::result::Result<(), fs_types::ErrorCode>>>,
+    outcome: core::result::Result<(), fs_types::ErrorCode>,
+) {
+    if let Some(sender) = result.take() {
+        let _ = sender.send(outcome);
     }
 }
 
-impl<T, CpuImpl, HostFs> Drop for FileReadStreamProducer<T, CpuImpl, HostFs>
+pin_project! {
+    /// The `write-via-stream` and `append-via-stream` sink for one file.
+    ///
+    /// The in-flight 9p transfer is held by value under a `Fut`
+    /// parameter that [`file_write_consumer`] infers from
+    /// [`write_host_file`], and `start` is the function pointer that
+    /// mints the next one. A boxed `dyn Future` here would erase the
+    /// host filesystem the whole component host is generic over for the
+    /// sake of one field.
+    pub(super) struct FileWriteConsumer<T, CpuImpl, Net, HostFs, Fut>
+    where
+        // `pin_project!` parses each where-clause bound as one path, so
+        // `Cpu` and `Clone` are two predicates here rather than `Cpu + Clone`.
+        CpuImpl: Cpu,
+        CpuImpl: Clone,
+        Net: ComponentHostNetwork,
+        HostFs: crate::HostFileSystem,
+    {
+        pub(super) getter: fn(&mut T) -> &mut StoreData<CpuImpl, Net, HostFs>,
+        pub(super) descriptor: FsDescriptor,
+        pub(super) mode: FileWriteMode,
+        pub(super) host: Option<HostFileStreamTarget<HostFs>>,
+        pub(super) start: fn(HostFileStreamTarget<HostFs>, FileWriteMode, Vec<u8>) -> Fut,
+        #[pin]
+        pub(super) pending: Option<Fut>,
+        pub(super) result: Option<oneshot::Sender<core::result::Result<(), fs_types::ErrorCode>>>,
+    }
+
+    impl<T, CpuImpl, Net, HostFs, Fut> PinnedDrop
+        for FileWriteConsumer<T, CpuImpl, Net, HostFs, Fut>
+    where
+        CpuImpl: Cpu,
+        CpuImpl: Clone,
+        Net: ComponentHostNetwork,
+        HostFs: crate::HostFileSystem,
+    {
+        fn drop(this: Pin<&mut Self>) {
+            complete_file_transfer(this.project().result, Ok(()));
+        }
+    }
+}
+
+pin_project! {
+    /// The `read-via-stream` source for one file, the mirror of
+    /// [`FileWriteConsumer`]: the in-flight read is held by value under
+    /// a `Fut` parameter [`file_read_producer`] infers from
+    /// [`read_host_file`].
+    pub(super) struct FileReadStreamProducer<T, CpuImpl, Net, HostFs, Fut>
+    where
+        // `pin_project!` parses each where-clause bound as one path, so
+        // `Cpu` and `Clone` are two predicates here rather than `Cpu + Clone`.
+        CpuImpl: Cpu,
+        CpuImpl: Clone,
+        Net: ComponentHostNetwork,
+        HostFs: crate::HostFileSystem,
+    {
+        pub(super) getter: fn(&mut T) -> &mut StoreData<CpuImpl, Net, HostFs>,
+        pub(super) descriptor: FsDescriptor,
+        pub(super) offset: u64,
+        pub(super) chunk_bytes: usize,
+        pub(super) host: Option<HostFileStreamTarget<HostFs>>,
+        pub(super) start: fn(HostFileStreamTarget<HostFs>, u64, u32) -> Fut,
+        #[pin]
+        pub(super) pending: Option<Fut>,
+        pub(super) result: Option<oneshot::Sender<core::result::Result<(), fs_types::ErrorCode>>>,
+    }
+
+    impl<T, CpuImpl, Net, HostFs, Fut> PinnedDrop
+        for FileReadStreamProducer<T, CpuImpl, Net, HostFs, Fut>
+    where
+        CpuImpl: Cpu,
+        CpuImpl: Clone,
+        Net: ComponentHostNetwork,
+        HostFs: crate::HostFileSystem,
+    {
+        fn drop(this: Pin<&mut Self>) {
+            complete_file_transfer(this.project().result, Ok(()));
+        }
+    }
+}
+
+/// The `read-via-stream` source for one file, with the host read
+/// future's type inferred here and carried by the producer.
+pub(super) fn file_read_producer<T, CpuImpl, Net, HostFs>(
+    getter: fn(&mut T) -> &mut StoreData<CpuImpl, Net, HostFs>,
+    descriptor: FsDescriptor,
+    offset: u64,
+    chunk_bytes: usize,
+    host: Option<HostFileStreamTarget<HostFs>>,
+    result: oneshot::Sender<core::result::Result<(), fs_types::ErrorCode>>,
+) -> FileReadStreamProducer<
+    T,
+    CpuImpl,
+    Net,
+    HostFs,
+    impl core::future::Future<Output = HostReadResult> + Send,
+>
 where
+    T: 'static,
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    fn drop(&mut self) {
-        self.complete(Ok(()));
+    FileReadStreamProducer {
+        getter,
+        descriptor,
+        offset,
+        chunk_bytes,
+        host,
+        start: read_host_file::<HostFs>,
+        pending: None,
+        result: Some(result),
     }
 }
 
-impl<T: 'static, CpuImpl, HostFs> StreamProducer<T> for FileReadStreamProducer<T, CpuImpl, HostFs>
+impl<T: 'static, CpuImpl, Net, HostFs, Fut> StreamProducer<T>
+    for FileReadStreamProducer<T, CpuImpl, Net, HostFs, Fut>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
+    Fut: core::future::Future<Output = HostReadResult> + Send + 'static,
 {
     type Item = u8;
     type Buffer = BytesStreamBuffer;
 
     fn poll_produce<'a>(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         mut store: wasmtime::StoreContextMut<'_, T>,
         mut destination: Destination<'a, Self::Item, Self::Buffer>,
         finish: bool,
     ) -> Poll<wasmtime::Result<StreamResult>> {
+        let mut this = self.project();
         if finish {
-            self.complete(Ok(()));
+            complete_file_transfer(this.result, Ok(()));
             return Poll::Ready(Ok(StreamResult::Cancelled));
         }
 
-        if self.host.is_some() {
-            if self.descriptor.kind != FsNodeKind::File {
-                self.complete(Err(fs_types::ErrorCode::IsDirectory));
+        if let Some(host) = this.host.as_ref() {
+            if this.descriptor.kind != FsNodeKind::File {
+                complete_file_transfer(this.result, Err(fs_types::ErrorCode::IsDirectory));
                 return Poll::Ready(Ok(StreamResult::Dropped));
             }
-            if !self
+            if !this
                 .descriptor
                 .flags
                 .contains(fs_types::DescriptorFlags::READ)
             {
-                self.complete(Err(fs_types::ErrorCode::NotPermitted));
+                complete_file_transfer(this.result, Err(fs_types::ErrorCode::NotPermitted));
                 return Poll::Ready(Ok(StreamResult::Dropped));
             }
-            if self.pending.is_none() {
+            if this.pending.is_none() {
                 let capacity = destination.remaining(&mut store);
                 if capacity == Some(0) {
                     return Poll::Ready(Ok(StreamResult::Completed));
                 }
-                self.start_host_read(capacity);
+                // Only `chunk_bytes` are ever in flight, so a stream over a
+                // multi-gigabyte host file never holds more than one chunk of
+                // kernel memory.
+                let request = capacity.unwrap_or(*this.chunk_bytes).min(*this.chunk_bytes);
+                let max_bytes = u32::try_from(request).unwrap_or(u32::MAX);
+                let read = (*this.start)(host.clone(), *this.offset, max_bytes);
+                this.pending.set(Some(read));
             }
-            let pending = self
-                .pending
-                .as_mut()
-                .expect("host read future must be present before polling");
-            match pending.as_mut().poll(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Ok(bytes)) if bytes.is_empty() => {
-                    self.pending = None;
-                    self.complete(Ok(()));
-                    return Poll::Ready(Ok(StreamResult::Dropped));
+            let bytes = match this.pending.as_mut().as_pin_mut() {
+                Some(pending) => match pending.poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(result) => result,
+                },
+                None => unreachable!("host read future must be present before polling"),
+            };
+            this.pending.set(None);
+            return match bytes {
+                Ok(bytes) if bytes.is_empty() => {
+                    complete_file_transfer(this.result, Ok(()));
+                    Poll::Ready(Ok(StreamResult::Dropped))
                 }
-                Poll::Ready(Ok(bytes)) => {
-                    self.pending = None;
-                    self.offset = self
+                Ok(bytes) => {
+                    *this.offset = this
                         .offset
                         .checked_add(
                             u64::try_from(bytes.len()).expect("read chunk size overflowed u64"),
@@ -472,29 +566,28 @@ where
                             wasmtime::Error::new(WasiAdapterTrap::FileReadOffsetOverflow)
                         })?;
                     destination.set_buffer(BytesStreamBuffer::new(Bytes::from(bytes)));
-                    return Poll::Ready(Ok(StreamResult::Completed));
+                    Poll::Ready(Ok(StreamResult::Completed))
                 }
-                Poll::Ready(Err(error)) => {
-                    self.pending = None;
-                    self.complete(Err(error));
-                    return Poll::Ready(Ok(StreamResult::Dropped));
+                Err(error) => {
+                    complete_file_transfer(this.result, Err(error));
+                    Poll::Ready(Ok(StreamResult::Dropped))
                 }
-            }
+            };
         }
 
-        let getter = self.getter;
+        let getter = *this.getter;
         let store_data = getter(store.data_mut());
         match store_data.filesystem().read_file_chunk(
-            &self.descriptor,
-            self.offset,
-            self.chunk_bytes,
+            this.descriptor,
+            *this.offset,
+            *this.chunk_bytes,
         ) {
             Ok(bytes) if bytes.is_empty() => {
-                self.complete(Ok(()));
+                complete_file_transfer(this.result, Ok(()));
                 Poll::Ready(Ok(StreamResult::Dropped))
             }
             Ok(bytes) => {
-                self.offset = self
+                *this.offset = this
                     .offset
                     .checked_add(
                         u64::try_from(bytes.len()).expect("read chunk size overflowed u64"),
@@ -504,156 +597,110 @@ where
                 Poll::Ready(Ok(StreamResult::Completed))
             }
             Err(error) => {
-                self.complete(Err(error));
+                complete_file_transfer(this.result, Err(error));
                 Poll::Ready(Ok(StreamResult::Dropped))
             }
         }
     }
 }
 
-impl<T, CpuImpl, HostFs> FileWriteConsumer<T, CpuImpl, HostFs>
+/// The `write-via-stream` and `append-via-stream` sink for one file,
+/// with the host write future's type inferred here and carried by the
+/// consumer. `mode` decides whether each batch lands at the stream's
+/// own offset or at the host's end of file.
+pub(super) fn file_write_consumer<T, CpuImpl, Net, HostFs>(
+    getter: fn(&mut T) -> &mut StoreData<CpuImpl, Net, HostFs>,
+    descriptor: FsDescriptor,
+    mode: FileWriteMode,
+    host: Option<HostFileStreamTarget<HostFs>>,
+    result: oneshot::Sender<core::result::Result<(), fs_types::ErrorCode>>,
+) -> FileWriteConsumer<
+    T,
+    CpuImpl,
+    Net,
+    HostFs,
+    impl core::future::Future<Output = HostWriteResult> + Send,
+>
 where
+    T: 'static,
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    pub(super) fn new_at(
-        getter: fn(&mut T) -> &mut StoreData<CpuImpl, HostFs>,
-        descriptor: FsDescriptor,
-        offset: usize,
-        host: Option<HostFileStreamTarget<HostFs>>,
-        result: oneshot::Sender<core::result::Result<(), fs_types::ErrorCode>>,
-    ) -> Self {
-        Self {
-            getter,
-            descriptor,
-            mode: FileWriteMode::At(offset),
-            host,
-            pending: None,
-            result: Some(result),
-        }
-    }
-
-    pub(super) fn new_append(
-        getter: fn(&mut T) -> &mut StoreData<CpuImpl, HostFs>,
-        descriptor: FsDescriptor,
-        host: Option<HostFileStreamTarget<HostFs>>,
-        result: oneshot::Sender<core::result::Result<(), fs_types::ErrorCode>>,
-    ) -> Self {
-        Self {
-            getter,
-            descriptor,
-            mode: FileWriteMode::Append,
-            host,
-            pending: None,
-            result: Some(result),
-        }
-    }
-
-    pub(super) fn complete(&mut self, result: core::result::Result<(), fs_types::ErrorCode>) {
-        if let Some(tx) = self.result.take() {
-            let _ = tx.send(result);
-        }
-    }
-
-    /// Starts the 9p transfer for one batch of stream bytes.
-    ///
-    /// Positional writes carry the stream offset; append writes resolve the
-    /// host's end of file inside the client so a concurrently grown file is
-    /// never overwritten. Both resolve with the number of bytes handed over.
-    fn start_host_write(&mut self, bytes: Vec<u8>) {
-        let Some(host) = self.host.clone() else {
-            return;
-        };
-        let mode = self.mode;
-        self.pending = Some(Box::pin(async move {
-            let written = bytes.len();
-            match mode {
-                FileWriteMode::At(offset) => {
-                    let offset = u64::try_from(offset).expect("file offset overflowed u64");
-                    host.service
-                        .write_file(&host.path, offset, &bytes)
-                        .await
-                        .map_err(map_host_fs_error)?;
-                }
-                FileWriteMode::Append => {
-                    host.service
-                        .append_file(&host.path, &bytes)
-                        .await
-                        .map_err(map_host_fs_error)?;
-                }
-            }
-            Ok(written)
-        }));
+    FileWriteConsumer {
+        getter,
+        descriptor,
+        mode,
+        host,
+        start: write_host_file::<HostFs>,
+        pending: None,
+        result: Some(result),
     }
 }
 
-impl<T, CpuImpl, HostFs> Drop for FileWriteConsumer<T, CpuImpl, HostFs>
+impl<T: 'static, CpuImpl, Net, HostFs, Fut> StreamConsumer<T>
+    for FileWriteConsumer<T, CpuImpl, Net, HostFs, Fut>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
-{
-    fn drop(&mut self) {
-        self.complete(Ok(()));
-    }
-}
-
-impl<T: 'static, CpuImpl, HostFs> StreamConsumer<T> for FileWriteConsumer<T, CpuImpl, HostFs>
-where
-    CpuImpl: Cpu + Clone,
-    HostFs: crate::HostFileSystem,
+    Fut: core::future::Future<Output = HostWriteResult> + Send + 'static,
 {
     type Item = u8;
 
     fn poll_consume(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         mut store: wasmtime::StoreContextMut<'_, T>,
         mut source: Source<'_, Self::Item>,
         _: bool,
     ) -> Poll<Result<StreamResult>> {
-        if self.host.is_some() {
-            if self.descriptor.kind != FsNodeKind::File {
-                self.complete(Err(fs_types::ErrorCode::IsDirectory));
+        let mut this = self.project();
+        if let Some(host) = this.host.as_ref() {
+            if this.descriptor.kind != FsNodeKind::File {
+                complete_file_transfer(this.result, Err(fs_types::ErrorCode::IsDirectory));
                 return Poll::Ready(Ok(StreamResult::Dropped));
             }
-            if !self
+            if !this
                 .descriptor
                 .flags
                 .contains(fs_types::DescriptorFlags::WRITE)
             {
-                self.complete(Err(fs_types::ErrorCode::NotPermitted));
+                complete_file_transfer(this.result, Err(fs_types::ErrorCode::NotPermitted));
                 return Poll::Ready(Ok(StreamResult::Dropped));
             }
-            if self.pending.is_none() {
+            if this.pending.is_none() {
                 let available = source.remaining(&mut store);
                 if available == 0 {
                     return Poll::Ready(Ok(StreamResult::Completed));
                 }
                 let mut bytes = Vec::with_capacity(available);
                 source.read(&mut store, &mut bytes)?;
-                self.start_host_write(bytes);
+                let write = (*this.start)(host.clone(), *this.mode, bytes);
+                this.pending.set(Some(write));
             }
-            let pending = self
-                .pending
-                .as_mut()
-                .expect("host write future must be present before polling");
-            match pending.as_mut().poll(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Ok(written)) => {
-                    self.pending = None;
-                    if let FileWriteMode::At(offset) = &mut self.mode {
+            let written = match this.pending.as_mut().as_pin_mut() {
+                Some(pending) => match pending.poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(result) => result,
+                },
+                None => unreachable!("host write future must be present before polling"),
+            };
+            this.pending.set(None);
+            return match written {
+                Ok(written) => {
+                    if let FileWriteMode::At(offset) = this.mode {
                         *offset = offset
                             .checked_add(written)
                             .expect("file write offset overflowed usize");
                     }
-                    return Poll::Ready(Ok(StreamResult::Completed));
+                    Poll::Ready(Ok(StreamResult::Completed))
                 }
-                Poll::Ready(Err(error)) => {
-                    self.pending = None;
-                    self.complete(Err(error));
-                    return Poll::Ready(Ok(StreamResult::Dropped));
+                Err(error) => {
+                    complete_file_transfer(this.result, Err(error));
+                    Poll::Ready(Ok(StreamResult::Dropped))
                 }
-            }
+            };
         }
 
         let available = source.remaining(&mut store);
@@ -664,10 +711,11 @@ where
         let mut bytes = Vec::with_capacity(available);
         source.read(&mut store, &mut bytes)?;
 
-        let store_data = (self.getter)(store.data_mut());
-        let descriptor = self.descriptor.clone();
+        let getter = *this.getter;
+        let store_data = getter(store.data_mut());
+        let descriptor = this.descriptor.clone();
         let now_nanos = store_data.now_nanos();
-        let write_result = match &mut self.mode {
+        let write_result = match this.mode {
             FileWriteMode::At(offset) => {
                 let result =
                     store_data
@@ -690,7 +738,7 @@ where
         match write_result {
             Ok(()) => Poll::Ready(Ok(StreamResult::Completed)),
             Err(error) => {
-                self.complete(Err(error));
+                complete_file_transfer(this.result, Err(error));
                 Poll::Ready(Ok(StreamResult::Dropped))
             }
         }
@@ -2000,9 +2048,10 @@ pub(crate) fn effective_open_descriptor_flags(
     Ok(effective)
 }
 
-impl<CpuImpl, HostFs> wasi::filesystem::preopens::Host for StoreData<CpuImpl, HostFs>
+impl<CpuImpl, Net, HostFs> wasi::filesystem::preopens::Host for StoreData<CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     fn get_directories(&mut self) -> Result<Vec<(Resource<FsDescriptor>, String)>> {
@@ -2018,18 +2067,21 @@ where
     }
 }
 
-impl<CpuImpl, HostFs> wasi::filesystem::types::Host for StoreData<CpuImpl, HostFs>
+impl<CpuImpl, Net, HostFs> wasi::filesystem::types::Host for StoreData<CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     fn convert_error_code(&mut self, error: FsError) -> Result<fs_types::ErrorCode> {
         error.downcast()
     }
 }
-impl<CpuImpl, HostFs> wasi::filesystem::types::HostDescriptor for StoreData<CpuImpl, HostFs>
+impl<CpuImpl, Net, HostFs> wasi::filesystem::types::HostDescriptor
+    for StoreData<CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     fn drop(&mut self, descriptor: Resource<FsDescriptor>) -> Result<()> {
@@ -2038,10 +2090,11 @@ where
     }
 }
 
-impl<CpuImpl, HostFs, U> wasi::filesystem::types::HostDescriptorWithStore<U>
-    for HasSelf<StoreData<CpuImpl, HostFs>>
+impl<CpuImpl, Net, HostFs, U> wasi::filesystem::types::HostDescriptorWithStore<U>
+    for HasSelf<StoreData<CpuImpl, Net, HostFs>>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     fn read_via_stream(
@@ -2058,14 +2111,7 @@ where
         let (tx, rx) = oneshot::channel();
         let stream = StreamReader::new(
             &mut accessor,
-            FileReadStreamProducer::new(
-                getter,
-                descriptor,
-                offset,
-                FILE_READ_CHUNK_BYTES,
-                host,
-                tx,
-            ),
+            file_read_producer(getter, descriptor, offset, FILE_READ_CHUNK_BYTES, host, tx),
         )?;
         let future = FutureReader::new(&mut accessor, async move {
             match rx.await {
@@ -2096,7 +2142,7 @@ where
                 let (tx, rx) = oneshot::channel();
                 data.pipe(
                     &mut accessor,
-                    FileWriteConsumer::new_at(getter, descriptor, offset, host, tx),
+                    file_write_consumer(getter, descriptor, FileWriteMode::At(offset), host, tx),
                 )?;
                 FutureReader::new(&mut accessor, async move {
                     match rx.await {
@@ -2129,7 +2175,7 @@ where
                 let (tx, rx) = oneshot::channel();
                 data.pipe(
                     &mut accessor,
-                    FileWriteConsumer::new_append(getter, descriptor, host, tx),
+                    file_write_consumer(getter, descriptor, FileWriteMode::Append, host, tx),
                 )?;
                 FutureReader::new(&mut accessor, async move {
                     match rx.await {
@@ -3145,12 +3191,13 @@ where
 /// node in memory with no write-back stage, so there is nothing a sync could
 /// flush there — that no-op is the correct answer, not a missing feature, and
 /// is spelled out here rather than left implicit.
-async fn sync_descriptor<U, CpuImpl, HostFs>(
-    accessor: &Accessor<U, HasSelf<StoreData<CpuImpl, HostFs>>>,
+async fn sync_descriptor<U, CpuImpl, Net, HostFs>(
+    accessor: &Accessor<U, HasSelf<StoreData<CpuImpl, Net, HostFs>>>,
     descriptor: Resource<FsDescriptor>,
 ) -> Result<(), FsError>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     let path = accessor.with(|mut access| {
@@ -3174,12 +3221,13 @@ where
     Ok(())
 }
 
-pub(super) fn get_fs_descriptor<CpuImpl, HostFs>(
-    store: &mut StoreData<CpuImpl, HostFs>,
+pub(super) fn get_fs_descriptor<CpuImpl, Net, HostFs>(
+    store: &mut StoreData<CpuImpl, Net, HostFs>,
     resource: &Resource<FsDescriptor>,
 ) -> core::result::Result<FsDescriptor, fs_types::ErrorCode>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     store

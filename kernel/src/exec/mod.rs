@@ -29,9 +29,9 @@ pub use executor::{
 pub use observer::{
     DEFAULT_PERF_METRIC_CAPACITY, DEFAULT_PROFILE_STACK_CAPACITY, DEFAULT_TRACE_HISTORY_CAPACITY,
     FoldedProfileSample, PerfMetricFilter, PerfMetricHistory, PerfMetricSample, PerfSample,
-    ProfileFilter, ProfileHistory, ProfileScope, StatsSample, TraceEvent, TraceField, TraceFilter,
-    TraceHistory, TraceLevel, TraceValue, matches_perf_metric_filter, matches_profile_filter,
-    matches_trace_filter, parse_console_text,
+    ProfileFilter, ProfileHistory, ProfileScope, ProfileSink, StatsSample, TraceEvent, TraceField,
+    TraceFilter, TraceHistory, TraceLevel, TraceValue, matches_perf_metric_filter,
+    matches_profile_filter, matches_trace_filter, parse_console_text,
 };
 pub use sync::{
     Mutex, MutexGuard, Notified, Notify, NotifyWaiter, OwnedRawMutexLease, OwnedRawRwLockReadLease,
@@ -41,7 +41,7 @@ pub use sync::{
 };
 pub use task::{YieldNow, yield_now};
 pub use time::{
-    KernelClock, duration_to_ticks, elapsed_millis, monotonic_nanos,
+    KernelClock, UptimeClock, duration_to_ticks, elapsed_millis, monotonic_nanos,
     nanos_to_ticks_ceil_saturating, ticks_to_nanos, wall_clock_offset_nanos,
 };
 pub use timer::{Sleep, Timer};

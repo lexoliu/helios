@@ -231,6 +231,16 @@ pub(super) struct ShardCell {
     /// keeping up; a nonzero count that keeps climbing while the shard
     /// has no live socket is the signature of a leaked window.
     pub(super) rx_refused_frames: AtomicU64,
+    /// Receive drains of this pair the driver refused: a mergeable
+    /// chain it cannot reconstruct, a completion whose length makes the
+    /// virtio-net header unreadable, an offload combination the device
+    /// may not report. One count per refused drain rather than per
+    /// frame, because a refusal loses the frame and its length with it.
+    /// The frames the same drain had already taken are still delivered,
+    /// so this climbing while `rx_frames` climbs too is a device fault
+    /// rate; this climbing while `rx_frames` stands still is a pair
+    /// producing nothing the driver will take.
+    pub(super) rx_device_refusals: AtomicU64,
     /// Raised every time a frame is placed in this shard's stack.
     ///
     /// Deliberately outside the `SpinMutex`: the processor that drained
@@ -527,6 +537,7 @@ impl NetworkShardSet {
                 rx_frames: AtomicU64::new(0),
                 tx_frames: AtomicU64::new(0),
                 rx_refused_frames: AtomicU64::new(0),
+                rx_device_refusals: AtomicU64::new(0),
                 arrival: ProgressSignal::new(),
             }));
         }
@@ -707,6 +718,26 @@ impl NetworkShardSet {
             .load(AtomicOrdering::Relaxed)
     }
 
+    /// Records one receive drain of `pair_idx` that the driver refused.
+    ///
+    /// Attributed to the shard that owns the pair. A device may bring
+    /// up more queue pairs than the machine has processors, so the pair
+    /// index is folded onto the shard set the same way the receive
+    /// sweep folds a processor onto a pair.
+    #[inline]
+    pub(super) fn record_receive_device_refusal(&self, pair_idx: usize) {
+        self.shards[pair_idx % self.shards.len()]
+            .rx_device_refusals
+            .fetch_add(1, AtomicOrdering::Relaxed);
+    }
+
+    /// Receive drains of this pair the driver refused since boot.
+    pub(super) fn device_refusal_count(&self, idx: usize) -> u64 {
+        self.shards[idx]
+            .rx_device_refusals
+            .load(AtomicOrdering::Relaxed)
+    }
+
     /// The shard's cross-processor arrival signal. Raised by whichever
     /// processor placed a frame in the shard; waited on by the
     /// operations the shard owns.
@@ -748,6 +779,19 @@ impl NetworkShardSet {
             target: WaitTarget::AnyShard,
             mark: self.any_arrival.mark(),
         }
+    }
+
+    /// Releases everything parked on the whole shard set, the packet
+    /// pump included.
+    ///
+    /// The counterpart of [`Self::with_handle_receive_drain`] for an
+    /// event that belongs to no one shard: a synchronous retirement
+    /// queues a FIN and produces no frame, so nothing else raises a
+    /// signal and the pump would sleep to the next protocol deadline
+    /// with the segment still in the queue (#232). Callable from any
+    /// processor, and it takes no shard lock.
+    pub(super) fn wake_any_shard(&self) {
+        self.any_arrival.signal();
     }
 
     /// The signal a sampled wait belongs to.

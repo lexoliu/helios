@@ -5,13 +5,14 @@ use super::*;
 /// `Linker::instantiate_pre`; the result is reused across compile
 /// calls. Per-call work is reduced to a fresh `wasmtime::Store`,
 /// `instance_pre.instantiate`, then `initialize` / `alloc` / `compile`.
-pub(super) struct CompilerPluginRuntime<CpuImpl, HostFs>
+pub(super) struct CompilerPluginRuntime<CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    pub(super) instance_pre: Arc<InstancePre<CompilerCoreStore<CpuImpl, HostFs>>>,
-    pub(super) shared: Arc<CompilerCoreShared<CompilerCoreStore<CpuImpl, HostFs>>>,
+    pub(super) instance_pre: Arc<InstancePre<CompilerCoreStore<CpuImpl, Net, HostFs>>>,
+    pub(super) shared: Arc<CompilerCoreShared<CompilerCoreStore<CpuImpl, Net, HostFs>>>,
 }
 
 pub(super) struct CompilerCompileSlot<'a> {
@@ -25,16 +26,17 @@ impl Drop for CompilerCompileSlot<'_> {
 }
 
 #[derive(Clone)]
-pub(super) struct CompilerCoreStore<CpuImpl, HostFs>
+pub(super) struct CompilerCoreStore<CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     pub(super) cpu: CpuImpl,
     pub(super) spawner: crate::Spawner<CpuImpl>,
-    pub(super) runtime_state: HostRuntimeState<CpuImpl, HostFs>,
+    pub(super) runtime_state: HostRuntimeState<CpuImpl, Net, HostFs>,
     pub(super) instance: Arc<crate::RegisteredInstance>,
-    pub(super) shared: Arc<CompilerCoreShared<CompilerCoreStore<CpuImpl, HostFs>>>,
+    pub(super) shared: Arc<CompilerCoreShared<CompilerCoreStore<CpuImpl, Net, HostFs>>>,
     pub(super) preview1_descriptors: CompilerPreview1Descriptors,
     pub(super) write_serial: crate::DebugSerialWriter,
     pub(super) _marker: core::marker::PhantomData<fn() -> HostFs>,
@@ -85,9 +87,10 @@ pub(super) struct CompilerCoreShared<T> {
     pub(super) thread_tasks: Mutex<Vec<crate::JoinHandle<()>>>,
 }
 
-impl<CpuImpl, HostFs> CompilerCoreStore<CpuImpl, HostFs>
+impl<CpuImpl, Net, HostFs> CompilerCoreStore<CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     pub(super) fn memory(&self) -> &SharedMemory {
@@ -125,12 +128,13 @@ pub(super) fn define_compiler_shared_memory<T>(
     define_imported_shared_memory(linker, store, module, memory)
 }
 
-pub(super) fn add_compiler_core_imports<CpuImpl, HostFs>(
-    linker: &mut CoreLinker<CompilerCoreStore<CpuImpl, HostFs>>,
+pub(super) fn add_compiler_core_imports<CpuImpl, Net, HostFs>(
+    linker: &mut CoreLinker<CompilerCoreStore<CpuImpl, Net, HostFs>>,
     memory: SharedMemory,
 ) -> Result<(), ProgramExecError>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     add_wasi_p1_imports(linker)?;
@@ -153,13 +157,14 @@ pub(super) fn compiler_rayon_env_len(thread_count: u32) -> u32 {
     RAYON_NUM_THREADS_ENV.len() as u32 + decimal_len(thread_count) + 1
 }
 
-pub(super) fn compiler_environ_get<CpuImpl, HostFs>(
-    caller: Caller<'_, CompilerCoreStore<CpuImpl, HostFs>>,
+pub(super) fn compiler_environ_get<CpuImpl, Net, HostFs>(
+    caller: Caller<'_, CompilerCoreStore<CpuImpl, Net, HostFs>>,
     environ: u32,
     buf: u32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     let thread_count = compiler_plugin_worker_threads(&caller.data().cpu);
@@ -202,10 +207,11 @@ pub(super) fn write_decimal(memory: &SharedMemory, ptr: u32, mut value: u32) -> 
     write_shared_memory(memory, ptr, &digits[..len]).map_or(-1, |_| len as i32)
 }
 
-pub(super) fn configure_compiler_core_store<CpuImpl, HostFs>(
-    store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, HostFs>>,
+pub(super) fn configure_compiler_core_store<CpuImpl, Net, HostFs>(
+    store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, HostFs>>,
 ) where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     // The compiler must not be preempted by scheduler epoch ticks, but
@@ -224,12 +230,13 @@ pub(super) fn configure_compiler_core_store<CpuImpl, HostFs>(
     });
 }
 
-pub(super) fn compiler_tls_base<CpuImpl, HostFs>(
-    store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, HostFs>>,
+pub(super) fn compiler_tls_base<CpuImpl, Net, HostFs>(
+    store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, HostFs>>,
     instance: &wasmtime::Instance,
 ) -> Result<u32, ProgramExecError>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     let global = instance
@@ -250,14 +257,15 @@ where
     }
 }
 
-pub(super) fn compiler_alloc<CpuImpl, HostFs>(
-    store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, HostFs>>,
+pub(super) fn compiler_alloc<CpuImpl, Net, HostFs>(
+    store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, HostFs>>,
     alloc: &wasmtime::TypedFunc<(i32, i32), i32>,
     len: usize,
     align: usize,
 ) -> Result<u32, ProgramExecError>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     let ptr = alloc
@@ -291,18 +299,19 @@ pub(super) fn read_compiler_response(
     Ok(unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast::<CompilerResponseHeader>()) })
 }
 
-pub(super) fn compiler_fd_fdstat_get<CpuImpl, HostFs>(
-    caller: Caller<'_, CompilerCoreStore<CpuImpl, HostFs>>,
+pub(super) fn compiler_fd_fdstat_get<CpuImpl, Net, HostFs>(
+    caller: Caller<'_, CompilerCoreStore<CpuImpl, Net, HostFs>>,
     fd: i32,
     stat: u32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     let descriptor = match fd {
-        1 if caller.data().preview1_descriptors.stdout_open => Preview1Descriptor::Stdout,
-        2 if caller.data().preview1_descriptors.stderr_open => Preview1Descriptor::Stderr,
+        1 if caller.data().preview1_descriptors.stdout_open => Preview1Descriptor::<Net>::Stdout,
+        2 if caller.data().preview1_descriptors.stderr_open => Preview1Descriptor::<Net>::Stderr,
         _ => return p1::errno::BADF,
     };
     let bytes = p1_fdstat_bytes(2, 0, p1_descriptor_rights(&descriptor));
@@ -310,8 +319,8 @@ where
         .map_or(p1::errno::FAULT, |_| p1::errno::SUCCESS)
 }
 
-pub(super) fn fd_write<CpuImpl, HostFs>(
-    caller: Caller<'_, CompilerCoreStore<CpuImpl, HostFs>>,
+pub(super) fn fd_write<CpuImpl, Net, HostFs>(
+    caller: Caller<'_, CompilerCoreStore<CpuImpl, Net, HostFs>>,
     fd: i32,
     iovs: u32,
     iovs_len: u32,
@@ -319,6 +328,7 @@ pub(super) fn fd_write<CpuImpl, HostFs>(
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     if !caller.data().preview1_descriptors.can_write(fd) {

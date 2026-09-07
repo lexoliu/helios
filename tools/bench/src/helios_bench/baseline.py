@@ -21,7 +21,9 @@ Shared, and therefore unable to explain a difference between the columns:
 
 - the host, its CPU model, its load and its thermal state;
 - the QEMU release, the accelerator, the vCPU count and the memory;
-- the network backend and the host HTTP, TCP and echo servers on it;
+- the network backend and host HTTP, TCP and echo server implementations
+  and payloads; each guest boot gets independent listeners, except for
+  explicit diagnostic reuse of peer connection state;
 - the harness: the benchmark script, the inspector binary that boots
   both guests, and the `helios-cli` that signs their prebuilt `cwasm`
   and builds their boot images;

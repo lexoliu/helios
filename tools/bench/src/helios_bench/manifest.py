@@ -64,6 +64,13 @@ class Lane(BaseModel):
             "guest-arch": self.guest_arch,
             "net-backend": self.net_backend,
             "boot-timeout": str(self.boot_timeout_seconds),
+            # The guest RAM the lane's workloads are sized for. A job
+            # that boots this lane's workloads outside the matrix — the
+            # PGO collection, the PGO comparison — reads it here rather
+            # than naming a number of its own, because a workload that
+            # fits in the suite and not in the collection profiles
+            # nothing.
+            "memory": self.memory,
         }
 
 

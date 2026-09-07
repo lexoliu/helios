@@ -111,5 +111,14 @@ panic = "abort"
 [profile.profile-generate]
 inherits = "release"
 
+# The PGO kernel of docs/pgo.md: the same optimised build reading a
+# collected profile. `-C profile-use` is a rustflag rather than a profile
+# setting, and `helios-inspector vm --profile-use` adds it; the profile
+# exists so that a PGO image and a plain release image can be built from
+# one checkout and timed against each other without overwriting each
+# other's artifacts.
+[profile.profile-use]
+inherits = "release"
+
 [lints]
 workspace = true

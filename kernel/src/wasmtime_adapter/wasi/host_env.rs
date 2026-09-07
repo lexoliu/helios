@@ -1,4 +1,5 @@
 use super::*;
+use crate::ComponentHostNetwork;
 
 pub(crate) fn random_len(len: u64) -> Result<usize> {
     usize::try_from(len).map_err(|_| wasmtime::Error::new(WasiAdapterTrap::RandomLengthOverflow))
@@ -6,9 +7,10 @@ pub(crate) fn random_len(len: u64) -> Result<usize> {
 
 pub struct TerminalInput;
 pub struct TerminalOutput;
-impl<CpuImpl, HostFs> wasi::clocks::monotonic_clock::Host for StoreData<CpuImpl, HostFs>
+impl<CpuImpl, Net, HostFs> wasi::clocks::monotonic_clock::Host for StoreData<CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     fn now(&mut self) -> Result<wasi::clocks::monotonic_clock::Mark> {
@@ -20,10 +22,11 @@ where
     }
 }
 
-impl<CpuImpl, HostFs, U> wasi::clocks::monotonic_clock::HostWithStore<U>
-    for HasSelf<StoreData<CpuImpl, HostFs>>
+impl<CpuImpl, Net, HostFs, U> wasi::clocks::monotonic_clock::HostWithStore<U>
+    for HasSelf<StoreData<CpuImpl, Net, HostFs>>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     async fn wait_until(
@@ -52,9 +55,10 @@ where
     }
 }
 
-impl<CpuImpl, HostFs> wasi::clocks::system_clock::Host for StoreData<CpuImpl, HostFs>
+impl<CpuImpl, Net, HostFs> wasi::clocks::system_clock::Host for StoreData<CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     fn now(&mut self) -> Result<wasi::clocks::system_clock::Instant> {
@@ -91,9 +95,10 @@ impl HostTimezone {
     }
 }
 
-impl<CpuImpl, HostFs> wasi::clocks::timezone::Host for StoreData<CpuImpl, HostFs>
+impl<CpuImpl, Net, HostFs> wasi::clocks::timezone::Host for StoreData<CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     fn iana_id(&mut self) -> Result<Option<String>> {
@@ -109,9 +114,10 @@ where
     }
 }
 
-impl<CpuImpl, HostFs> wasi::cli::environment::Host for StoreData<CpuImpl, HostFs>
+impl<CpuImpl, Net, HostFs> wasi::cli::environment::Host for StoreData<CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     fn get_arguments(&mut self) -> Result<Vec<String>> {
@@ -130,9 +136,10 @@ where
     }
 }
 
-impl<CpuImpl, HostFs> wasi::cli::exit::Host for StoreData<CpuImpl, HostFs>
+impl<CpuImpl, Net, HostFs> wasi::cli::exit::Host for StoreData<CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     fn exit(&mut self, status: core::result::Result<(), ()>) -> Result<()> {
@@ -154,16 +161,19 @@ where
     }
 }
 
-impl<CpuImpl, HostFs> wasi::cli::stdin::Host for StoreData<CpuImpl, HostFs>
+impl<CpuImpl, Net, HostFs> wasi::cli::stdin::Host for StoreData<CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
 }
 
-impl<CpuImpl, HostFs, U> wasi::cli::stdin::HostWithStore<U> for HasSelf<StoreData<CpuImpl, HostFs>>
+impl<CpuImpl, Net, HostFs, U> wasi::cli::stdin::HostWithStore<U>
+    for HasSelf<StoreData<CpuImpl, Net, HostFs>>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     fn read_via_stream(
@@ -195,16 +205,19 @@ where
     }
 }
 
-impl<CpuImpl, HostFs> wasi::cli::stdout::Host for StoreData<CpuImpl, HostFs>
+impl<CpuImpl, Net, HostFs> wasi::cli::stdout::Host for StoreData<CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
 }
 
-impl<CpuImpl, HostFs, U> wasi::cli::stdout::HostWithStore<U> for HasSelf<StoreData<CpuImpl, HostFs>>
+impl<CpuImpl, Net, HostFs, U> wasi::cli::stdout::HostWithStore<U>
+    for HasSelf<StoreData<CpuImpl, Net, HostFs>>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     fn write_via_stream(
@@ -226,16 +239,19 @@ where
     }
 }
 
-impl<CpuImpl, HostFs> wasi::cli::stderr::Host for StoreData<CpuImpl, HostFs>
+impl<CpuImpl, Net, HostFs> wasi::cli::stderr::Host for StoreData<CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
 }
 
-impl<CpuImpl, HostFs, U> wasi::cli::stderr::HostWithStore<U> for HasSelf<StoreData<CpuImpl, HostFs>>
+impl<CpuImpl, Net, HostFs, U> wasi::cli::stderr::HostWithStore<U>
+    for HasSelf<StoreData<CpuImpl, Net, HostFs>>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     fn write_via_stream(
@@ -257,15 +273,18 @@ where
     }
 }
 
-impl<CpuImpl, HostFs> wasi::cli::terminal_input::Host for StoreData<CpuImpl, HostFs>
+impl<CpuImpl, Net, HostFs> wasi::cli::terminal_input::Host for StoreData<CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
 }
-impl<CpuImpl, HostFs> wasi::cli::terminal_input::HostTerminalInput for StoreData<CpuImpl, HostFs>
+impl<CpuImpl, Net, HostFs> wasi::cli::terminal_input::HostTerminalInput
+    for StoreData<CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     fn drop(&mut self, resource: Resource<TerminalInput>) -> Result<()> {
@@ -274,15 +293,18 @@ where
     }
 }
 
-impl<CpuImpl, HostFs> wasi::cli::terminal_output::Host for StoreData<CpuImpl, HostFs>
+impl<CpuImpl, Net, HostFs> wasi::cli::terminal_output::Host for StoreData<CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
 }
-impl<CpuImpl, HostFs> wasi::cli::terminal_output::HostTerminalOutput for StoreData<CpuImpl, HostFs>
+impl<CpuImpl, Net, HostFs> wasi::cli::terminal_output::HostTerminalOutput
+    for StoreData<CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     fn drop(&mut self, resource: Resource<TerminalOutput>) -> Result<()> {
@@ -291,9 +313,10 @@ where
     }
 }
 
-impl<CpuImpl, HostFs> wasi::cli::terminal_stdin::Host for StoreData<CpuImpl, HostFs>
+impl<CpuImpl, Net, HostFs> wasi::cli::terminal_stdin::Host for StoreData<CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     fn get_terminal_stdin(&mut self) -> Result<Option<Resource<TerminalInput>>> {
@@ -304,9 +327,10 @@ where
     }
 }
 
-impl<CpuImpl, HostFs> wasi::cli::terminal_stdout::Host for StoreData<CpuImpl, HostFs>
+impl<CpuImpl, Net, HostFs> wasi::cli::terminal_stdout::Host for StoreData<CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     fn get_terminal_stdout(&mut self) -> Result<Option<Resource<TerminalOutput>>> {
@@ -317,9 +341,10 @@ where
     }
 }
 
-impl<CpuImpl, HostFs> wasi::cli::terminal_stderr::Host for StoreData<CpuImpl, HostFs>
+impl<CpuImpl, Net, HostFs> wasi::cli::terminal_stderr::Host for StoreData<CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     fn get_terminal_stderr(&mut self) -> Result<Option<Resource<TerminalOutput>>> {
@@ -330,9 +355,10 @@ where
     }
 }
 
-impl<CpuImpl, HostFs> wasi::random::random::Host for StoreData<CpuImpl, HostFs>
+impl<CpuImpl, Net, HostFs> wasi::random::random::Host for StoreData<CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     fn get_random_bytes(&mut self, len: u64) -> Result<Vec<u8>> {
@@ -347,9 +373,10 @@ where
     }
 }
 
-impl<CpuImpl, HostFs> wasi::random::insecure::Host for StoreData<CpuImpl, HostFs>
+impl<CpuImpl, Net, HostFs> wasi::random::insecure::Host for StoreData<CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     fn get_insecure_random_bytes(&mut self, len: u64) -> Result<Vec<u8>> {
@@ -361,9 +388,10 @@ where
     }
 }
 
-impl<CpuImpl, HostFs> wasi::random::insecure_seed::Host for StoreData<CpuImpl, HostFs>
+impl<CpuImpl, Net, HostFs> wasi::random::insecure_seed::Host for StoreData<CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     fn get_insecure_seed(&mut self) -> Result<(u64, u64)> {

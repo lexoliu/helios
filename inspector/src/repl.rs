@@ -1,10 +1,9 @@
 use std::borrow::Cow::{self, Borrowed, Owned};
 use std::cell::RefCell;
 use std::fs;
-use std::io::Write as _;
+use std::io::Write;
 use std::rc::Rc;
 
-use anyhow::{Context as _, Result, bail};
 use clap::{ColorChoice, Parser};
 use helios_inspector_protocol::system::programs::{ExecOutput, ExecResult};
 use nu_ansi_term::{Color, Style as AnsiStyle};
@@ -22,12 +21,86 @@ use rustyline::{
     KeyCode as RustyKeyCode, KeyEvent as RustyKeyEvent, Modifiers as RustyModifiers,
 };
 
-use crate::programs::{self, REMOTE_SHELL_PATH};
+use crate::programs::{self, ProgramError, REMOTE_SHELL_PATH};
 use crate::runtime;
 use crate::serial::RpcClient;
 use crate::stats_tui;
-use crate::system;
+use crate::system::{self, SystemError};
+use crate::tui::TerminalError;
 use crate::{ShellCommand, TracingCommand};
+
+/// Why an interactive inspector session ended other than by the operator
+/// asking it to.
+///
+/// The editor, the local views and the remote shell fail for unrelated
+/// reasons, so each keeps the error of the layer that produced it rather
+/// than collapsing into one message about "the repl".
+#[derive(Debug, thiserror::Error)]
+pub enum ReplError {
+    #[error("failed to create line editor: {source}")]
+    CreateEditor {
+        #[source]
+        source: ReadlineError,
+    },
+    #[error("failed to record inspector history entry: {source}")]
+    RecordHistory {
+        #[source]
+        source: ReadlineError,
+    },
+    #[error("failed to read inspector input: {source}")]
+    ReadInput {
+        #[source]
+        source: ReadlineError,
+    },
+    #[error("failed to clear inspector screen: {source}")]
+    ClearScreen {
+        #[source]
+        source: ReadlineError,
+    },
+    #[error("failed to open stats view: {source}")]
+    StatsView {
+        #[from]
+        source: TerminalError,
+    },
+    #[error("failed to stream tracing events: {source}")]
+    Tracing {
+        #[from]
+        source: SystemError,
+    },
+    #[error("failed to listen for Ctrl+C during remote shell execution: {source}")]
+    Interrupt {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to write the inspector terminal: {source}")]
+    Write {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to run the remote shell: {source}")]
+    RemoteShell {
+        #[from]
+        source: ProgramError,
+    },
+}
+
+/// Why the `shell` command had no script to run.
+#[derive(Debug, thiserror::Error)]
+pub enum ShellScriptError {
+    #[error("failed to read local shell script {path}: {source}")]
+    ReadScript {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("shell requires either -c <script> or <script-file>")]
+    MissingScript,
+    #[error("failed to run the remote shell: {source}")]
+    RemoteShell {
+        #[from]
+        source: ProgramError,
+    },
+}
 
 const PROMPT: &str = "helios> ";
 const CONTINUATION_PROMPT: &str = "....> ";
@@ -58,7 +131,7 @@ enum ReplBuiltin {
     Quit,
 }
 
-pub fn run(mut client: RpcClient) -> Result<()> {
+pub fn run(mut client: RpcClient) -> Result<(), ReplError> {
     let editor = Rc::new(RefCell::new(build_editor()?));
     let mut terminal = InteractiveTerminal::new(Rc::clone(&editor));
 
@@ -78,16 +151,14 @@ pub fn run(mut client: RpcClient) -> Result<()> {
         editor
             .borrow_mut()
             .add_history_entry(input)
-            .context("failed to record inspector history entry")?;
+            .map_err(|source| ReplError::RecordHistory { source })?;
 
         match BuiltinCommand::parse(input) {
             BuiltinParse::Builtin(BuiltinCommand::Stats) => {
-                runtime::block_on(stats_tui::run(&mut client))
-                    .context("failed to open stats view")?;
+                runtime::block_on(stats_tui::run(&mut client))?;
             }
             BuiltinParse::Builtin(BuiltinCommand::Tracing(command)) => {
-                runtime::block_on(system::stream_tracing_command(&mut client, &command))
-                    .context("failed to stream tracing events")?;
+                runtime::block_on(system::stream_tracing_command(&mut client, &command))?;
             }
             BuiltinParse::Builtin(BuiltinCommand::Clear) => terminal.clear_screen()?,
             BuiltinParse::Builtin(BuiltinCommand::Exit) => return Ok(()),
@@ -96,7 +167,7 @@ pub fn run(mut client: RpcClient) -> Result<()> {
                     &mut client,
                     script,
                 )))
-                .context("failed to listen for Ctrl+C during remote shell execution")?
+                .map_err(|source| ReplError::Interrupt { source })?
                 {
                     runtime::CommandRun::Completed(result) => {
                         let output = result?;
@@ -112,22 +183,29 @@ pub fn run(mut client: RpcClient) -> Result<()> {
 pub async fn run_shell_command(
     client: &mut RpcClient,
     command: &ShellCommand,
-) -> Result<ExecResult> {
+) -> Result<ExecResult, ShellScriptError> {
     let script = match (&command.command, &command.script) {
         (Some(command), None) => command.clone(),
-        (None, Some(path)) => fs::read_to_string(path)
-            .with_context(|| format!("failed to read local shell script {path}"))?,
-        (None, None) => bail!("shell requires either -c <script> or <script-file>"),
+        (None, Some(path)) => {
+            fs::read_to_string(path).map_err(|source| ShellScriptError::ReadScript {
+                path: path.clone(),
+                source,
+            })?
+        }
+        (None, None) => return Err(ShellScriptError::MissingScript),
         (Some(_), Some(_)) => unreachable!("clap must reject conflicting shell inputs"),
     };
-    run_shell_script(client, script).await
+    Ok(run_shell_script(client, script).await?)
 }
 
-async fn run_shell_script(client: &mut RpcClient, script: String) -> Result<ExecResult> {
+async fn run_shell_script(
+    client: &mut RpcClient,
+    script: String,
+) -> Result<ExecResult, ProgramError> {
     programs::exec(client, REMOTE_SHELL_PATH, &["-c".to_owned(), script]).await
 }
 
-fn read_program(editor: &SharedEditor) -> Result<Option<String>> {
+fn read_program(editor: &SharedEditor) -> Result<Option<String>, ReplError> {
     let mut input = String::new();
     let mut prompt = PROMPT;
     loop {
@@ -135,7 +213,7 @@ fn read_program(editor: &SharedEditor) -> Result<Option<String>> {
             Ok(line) => line,
             Err(ReadlineError::Interrupted) => return Ok(Some(String::new())),
             Err(ReadlineError::Eof) => return Ok(None),
-            Err(error) => return Err(error).context("failed to read inspector input"),
+            Err(source) => return Err(ReplError::ReadInput { source }),
         };
         if !input.is_empty() {
             input.push('\n');
@@ -157,11 +235,11 @@ impl InteractiveTerminal {
         Self { editor }
     }
 
-    fn print(&mut self, text: &str) -> Result<()> {
+    fn print(&mut self, text: &str) -> Result<(), ReplError> {
         write_stdout(text.as_bytes())
     }
 
-    fn write_output(&mut self, output: &ExecOutput) -> Result<()> {
+    fn write_output(&mut self, output: &ExecOutput) -> Result<(), ReplError> {
         if !output.stdout.is_empty() {
             write_stdout(&output.stdout)?;
         }
@@ -171,11 +249,11 @@ impl InteractiveTerminal {
         Ok(())
     }
 
-    fn clear_screen(&mut self) -> Result<()> {
+    fn clear_screen(&mut self) -> Result<(), ReplError> {
         self.editor
             .borrow_mut()
             .clear_screen()
-            .context("failed to clear inspector screen")
+            .map_err(|source| ReplError::ClearScreen { source })
     }
 }
 
@@ -325,13 +403,14 @@ impl Validator for ShellHelper {
     }
 }
 
-fn build_editor() -> Result<Editor<ShellHelper, DefaultHistory>> {
+fn build_editor() -> Result<Editor<ShellHelper, DefaultHistory>, ReplError> {
     let config = Config::builder()
         .completion_type(CompletionType::List)
         .edit_mode(EditMode::Emacs)
         .history_ignore_space(true)
         .build();
-    let mut editor = Editor::with_config(config).context("failed to create line editor")?;
+    let mut editor =
+        Editor::with_config(config).map_err(|source| ReplError::CreateEditor { source })?;
     editor.set_helper(Some(ShellHelper::new()));
     editor.bind_sequence(
         RustyEvent::from(RustyKeyEvent(RustyKeyCode::Char('F'), RustyModifiers::CTRL)),
@@ -365,18 +444,20 @@ fn completion_candidates<'a>(tokens: &[&'a str], _current: &'a str) -> &'static 
     }
 }
 
-fn write_stdout(bytes: &[u8]) -> Result<()> {
+fn write_stdout(bytes: &[u8]) -> Result<(), ReplError> {
     let mut stdout = std::io::stdout().lock();
-    stdout.write_all(bytes)?;
-    stdout.flush()?;
-    Ok(())
+    write_all(&mut stdout, bytes)
 }
 
-fn write_stderr(bytes: &[u8]) -> Result<()> {
+fn write_stderr(bytes: &[u8]) -> Result<(), ReplError> {
     let mut stderr = std::io::stderr().lock();
-    stderr.write_all(bytes)?;
-    stderr.flush()?;
-    Ok(())
+    write_all(&mut stderr, bytes)
+}
+
+fn write_all(sink: &mut impl Write, bytes: &[u8]) -> Result<(), ReplError> {
+    sink.write_all(bytes)
+        .and_then(|()| sink.flush())
+        .map_err(|source| ReplError::Write { source })
 }
 
 fn needs_more_input(input: &str) -> bool {

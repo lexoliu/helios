@@ -160,6 +160,87 @@ pub struct TcpSegmentOutcome {
     pub reset: Option<TcpReset>,
 }
 
+/// What a socket's receive side has seen from its peer since it was
+/// opened. Running totals the stack folds into its own per-shard
+/// counters after every segment, so a socket that closes takes nothing
+/// with it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TcpReceiveCounters {
+    /// Segments whose whole payload lay at or below `receive_next`: the
+    /// peer resent data this side had already acknowledged.
+    pub peer_retransmits_received: u64,
+    /// Calls to `request_duplicate_ack`, one per segment that arrived
+    /// out of order or out of window.
+    pub duplicate_acks_requested: u64,
+}
+
+impl TcpReceiveCounters {
+    /// Adds what one socket saw between two snapshots to a running
+    /// total. The stack calls it after every segment, so the total
+    /// outlives the socket.
+    pub fn fold(&mut self, before: Self, after: Self) {
+        self.peer_retransmits_received = self.peer_retransmits_received.saturating_add(
+            after
+                .peer_retransmits_received
+                .wrapping_sub(before.peer_retransmits_received),
+        );
+        self.duplicate_acks_requested = self.duplicate_acks_requested.saturating_add(
+            after
+                .duplicate_acks_requested
+                .wrapping_sub(before.duplicate_acks_requested),
+        );
+    }
+}
+
+/// One half-open range of sequence space, `start..end`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TcpSequenceRange {
+    pub start: u32,
+    pub end: u32,
+}
+
+/// The acknowledgement a socket most recently put on the wire.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TcpAckSnapshot {
+    pub acknowledgement: u32,
+    /// The receive window that acknowledgement carried, in bytes rather
+    /// than in the header's scaled units.
+    pub window_bytes: u32,
+}
+
+/// The segment a socket most recently took off the wire, whether or not
+/// the receive path went on to accept it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TcpSegmentSnapshot {
+    pub sequence: u32,
+    pub payload_len: u32,
+}
+
+/// Everything the receive side of one socket holds at a single instant.
+///
+/// A read that times out reports this, so a stall names the state that
+/// produced it while the socket still exists: the per-shard counters are
+/// read after the workload has exited, by which time the socket is gone
+/// and its queues with it (#166).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TcpReceiveDiagnostics {
+    pub state: TcpState,
+    pub receive_next: u32,
+    /// Bytes queued in order, waiting for the reader.
+    pub receive_queued_bytes: usize,
+    /// Bytes held aside behind a hole in the sequence space.
+    pub out_of_order_queued_bytes: usize,
+    pub out_of_order_segments: usize,
+    /// The range immediately behind the hole and the one furthest from
+    /// it: with `receive_next` they say how wide the hole is and how far
+    /// past it the peer has already sent.
+    pub first_out_of_order: Option<TcpSequenceRange>,
+    pub last_out_of_order: Option<TcpSequenceRange>,
+    pub advertised_window_bytes: u32,
+    pub last_ack: Option<TcpAckSnapshot>,
+    pub last_segment: Option<TcpSegmentSnapshot>,
+}
+
 /// What one acknowledgement put on the wire was for.
 ///
 /// A pure ACK is indistinguishable from a window update on the wire, so
@@ -199,10 +280,21 @@ struct TcpPersistProbe {
     fin: bool,
 }
 
+/// One segment held aside until the hole in front of it is filled.
+///
+/// The payload is a `BytesMut` the socket owns outright, never the
+/// `Bytes` the caller passed in. Every payload reaching [`TcpSocket::on_segment`]
+/// is a slice of the frame the network driver handed up, so keeping it
+/// keeps one of the driver's receive buffers; a driver whose buffers are
+/// all parked in reassembly queues stops taking frames off its ring, and
+/// the retransmission that would fill the hole is the frame it stops
+/// taking. The contiguous path already copies out of the frame for the
+/// same reason (see `push_receive_segment_owned`), and the owning type
+/// here is what makes that rule hold for the out-of-order path too.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TcpOutOfOrderSegment {
     sequence: u32,
-    payload: Bytes,
+    payload: BytesMut,
 }
 
 // Hot TCP sockets should pay for the state they actually touch, not for every
@@ -222,6 +314,10 @@ impl TcpOutOfOrderQueue {
 
     fn first(&self) -> Option<&TcpOutOfOrderSegment> {
         self.segments.first()
+    }
+
+    fn last(&self) -> Option<&TcpOutOfOrderSegment> {
+        self.len().checked_sub(1).map(|index| &self[index])
     }
 
     fn push(&mut self, segment: TcpOutOfOrderSegment) -> Result<(), TcpOutOfOrderSegment> {
@@ -665,6 +761,11 @@ where
     send_unacknowledged: u32,
     receive_next: u32,
     advertised_window: u16,
+    /// The right edge of the receive window as the peer was last told
+    /// it: `receive_next` plus the window that went out with it, in
+    /// bytes. RFC 9293 3.8.6.2.1 forbids moving it left, and
+    /// `refresh_advertised_window` is where that rule is kept.
+    receive_window_right_edge: u32,
     peer_max_segment_size: usize,
     /// Scale applied to our advertised window. Zero until the handshake
     /// proves the peer sent a window-scale option; RFC 7323 only permits
@@ -679,6 +780,14 @@ where
     receive_fin_sequence: Option<u32>,
     out_of_order: Option<TcpOutOfOrderQueue>,
     out_of_order_queued_bytes: usize,
+    receive_counters: TcpReceiveCounters,
+    /// The last acknowledgement this socket handed to the transmit path,
+    /// and the last segment its peer handed to the receive path. Both
+    /// exist for [`TcpSocket::receive_diagnostics`]: a stalled reader has
+    /// to be able to say whether the socket had stopped hearing from the
+    /// peer or had stopped answering it.
+    last_ack_sent: Option<TcpAckSnapshot>,
+    last_segment_received: Option<TcpSegmentSnapshot>,
     transmit_queue: Option<TcpTransmitQueue>,
     in_flight: Option<TcpInFlightQueue>,
     bytes_in_flight: u32,
@@ -772,6 +881,37 @@ pub enum TcpCloseKind {
     Unresponsive,
 }
 
+/// What retiring a socket owes its peer, from RFC 9293 3.6.
+///
+/// The owner of a connection never decides this: it says only that it
+/// has let go, and the socket's own state and receive queue decide what
+/// goes on the wire. Keeping the decision here is what makes every way
+/// a connection can end — a guest's explicit close, a descriptor table
+/// dying with its program, a resource destructor — reach the same
+/// three answers.
+///
+/// The value is a snapshot of the socket it was read from and is
+/// consumed by the same `&mut Stack` that read it; it carries no
+/// ownership and outlives nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TcpCloseAction {
+    /// Nothing was ever synchronised under this four-tuple, or the
+    /// connection has already reached [`TcpState::Closed`]. RFC 9293
+    /// 3.10.4 deletes the transmission control block and returns, with
+    /// nothing on the wire.
+    Reclaim,
+    /// The connection is abandoned with data its owner will never read,
+    /// or from a half-open state that has no FIN to send. RFC 9293
+    /// 3.6.1 aborts with a reset rather than a FIN, because a FIN would
+    /// promise the peer a stream that was in fact truncated.
+    Reset,
+    /// The orderly close of RFC 9293 3.6: the FIN is already on the
+    /// wire, or [`TcpSocket::close_send`] is about to put it there, and
+    /// the socket runs `FIN-WAIT`/`CLOSING`/`TIME-WAIT` to its end
+    /// before its slot is reclaimed.
+    Finish,
+}
+
 impl TcpStateChangeReason {
     /// How a socket that entered [`TcpState::Closed`] through this
     /// transition reads to the application holding it.
@@ -812,6 +952,7 @@ where
             send_unacknowledged: 0,
             receive_next: 0,
             advertised_window: receive_window_size(0, 0),
+            receive_window_right_edge: 0,
             peer_max_segment_size: TCP_RECEIVE_SEGMENT_BYTES,
             local_window_scale: 0,
             peer_window_scale: 0,
@@ -823,6 +964,9 @@ where
             receive_fin_sequence: None,
             out_of_order: None,
             out_of_order_queued_bytes: 0,
+            receive_counters: TcpReceiveCounters::default(),
+            last_ack_sent: None,
+            last_segment_received: None,
             transmit_queue: None,
             in_flight: None,
             bytes_in_flight: 0,
@@ -890,7 +1034,7 @@ where
         socket.local = Some(local);
         socket.remote = Some(remote);
         socket.set_state(TcpState::SynReceived, TcpStateChangeReason::Accept);
-        socket.receive_next = receive_next;
+        socket.set_receive_base(receive_next);
         socket.send_next = initial_sequence.wrapping_add(1);
         socket.send_unacknowledged = initial_sequence;
         socket
@@ -1038,6 +1182,34 @@ where
             .on_packet_sent(1, self.bytes_in_flight, now_nanos);
     }
 
+    /// The reset this socket owes its peer when the local side tears
+    /// the connection down instead of closing it.
+    ///
+    /// A connection still queued in a listener's backlog has no other
+    /// way to end: the listener is going away, nobody will ever accept
+    /// the connection, and the peer completed a handshake it believes
+    /// in. RFC 9293 answers that with a reset rather than a FIN, so the
+    /// peer learns at once instead of retransmitting into a stack that
+    /// no longer owns the four-tuple.
+    ///
+    /// `None` for a socket with no peer — a listener, or one that never
+    /// left `Closed` — which has no four-tuple to reset.
+    pub fn pending_reset(&self) -> Option<TcpHeader> {
+        let local = self.local?;
+        let remote = self.remote?;
+        Some(TcpHeader {
+            source_port: local.port,
+            destination_port: remote.port,
+            sequence: self.send_next,
+            // The peer validates a reset against its own receive
+            // window, so it carries the acknowledgement this side would
+            // otherwise have sent.
+            acknowledgement: self.receive_next,
+            flags: TcpFlags::RST.union(TcpFlags::ACK),
+            window_size: 0,
+        })
+    }
+
     /// Acknowledgements this socket still owes its peer.
     ///
     /// Everything past the first is a duplicate ACK: the receive
@@ -1071,7 +1243,7 @@ where
     /// first frame of a duplicate-ACK run can be: the duplicates behind
     /// it repeat the same window.
     pub fn mark_ack_queued(&mut self) -> TcpAckQueued {
-        self.pending_acks = self.pending_acks.saturating_sub(1);
+        self.note_ack_emitted();
         self.delayed_ack_deadline_nanos = None;
         TcpAckQueued {
             reopened_window: core::mem::take(&mut self.pending_ack_reopens_window),
@@ -1082,6 +1254,23 @@ where
     /// bytes rather than in the header's scaled units.
     pub fn advertised_receive_window_bytes(&self) -> u32 {
         self.local_receive_window_bytes()
+    }
+
+    /// In-order data currently waiting in the receive queue that user
+    /// space has not read yet, in bytes.
+    pub fn receive_queued_bytes(&self) -> usize {
+        self.receive_queued_bytes
+    }
+
+    /// Data held in the out-of-order reassembly queue, in bytes.
+    pub fn out_of_order_queued_bytes(&self) -> usize {
+        self.out_of_order_queued_bytes
+    }
+
+    /// What the receive side has seen from the peer since the socket
+    /// was opened.
+    pub fn receive_counters(&self) -> TcpReceiveCounters {
+        self.receive_counters
     }
 
     pub fn pending_ack_options(&self, now_nanos: u64) -> TcpHeaderOptions {
@@ -1143,6 +1332,27 @@ where
 
     pub const fn peer_timestamp(&self) -> Option<TcpTimestampOption> {
         self.peer_timestamp
+    }
+
+    /// The receive side of this socket, whole, at this instant.
+    pub fn receive_diagnostics(&self) -> TcpReceiveDiagnostics {
+        let out_of_order = self.out_of_order.as_ref();
+        TcpReceiveDiagnostics {
+            state: self.state,
+            receive_next: self.receive_next,
+            receive_queued_bytes: self.receive_queued_bytes,
+            out_of_order_queued_bytes: self.out_of_order_queued_bytes,
+            out_of_order_segments: out_of_order.map_or(0, TcpOutOfOrderQueue::len),
+            first_out_of_order: out_of_order
+                .and_then(TcpOutOfOrderQueue::first)
+                .map(out_of_order_range),
+            last_out_of_order: out_of_order
+                .and_then(TcpOutOfOrderQueue::last)
+                .map(out_of_order_range),
+            advertised_window_bytes: self.local_receive_window_bytes(),
+            last_ack: self.last_ack_sent,
+            last_segment: self.last_segment_received,
+        }
     }
 
     pub fn receive_backpressured(&self) -> bool {
@@ -1291,7 +1501,7 @@ where
             window_size: self.advertised_window,
         };
         let options = self.timestamped_options(now_nanos);
-        self.pending_acks = self.pending_acks.saturating_sub(1);
+        self.note_ack_emitted();
         if persist_probe {
             self.mark_persist_probe_queued(
                 TcpPersistProbe {
@@ -1487,7 +1697,7 @@ where
             }
             self.schedule_next_pacing_send(sequence_len, now_nanos);
         }
-        self.pending_acks = self.pending_acks.saturating_sub(1);
+        self.note_ack_emitted();
         self.delayed_ack_deadline_nanos = None;
         Some(TcpTransmitSegment {
             local,
@@ -1738,19 +1948,22 @@ where
                     reset: None,
                 }
             }
-            TcpState::SynSent if packet.flags.contains(TcpFlags::SYN.union(TcpFlags::ACK)) => {
-                if !self.syn_sent_ack_acceptable(packet.acknowledgement) {
-                    return TcpSegmentOutcome {
-                        reset: self.unacceptable_ack_reset(packet.acknowledgement),
-                        ..TcpSegmentOutcome::default()
-                    };
+            TcpState::SynSent
+                if packet.flags.contains(TcpFlags::ACK)
+                    && !self.syn_sent_ack_acceptable(packet.acknowledgement) =>
+            {
+                TcpSegmentOutcome {
+                    reset: self.unacceptable_ack_reset(packet.acknowledgement),
+                    ..TcpSegmentOutcome::default()
                 }
+            }
+            TcpState::SynSent if packet.flags.contains(TcpFlags::SYN.union(TcpFlags::ACK)) => {
                 self.record_peer_options(packet);
                 self.remote = self.remote.map(|mut remote| {
                     remote.port = packet.source_port;
                     remote
                 });
-                self.receive_next = packet.sequence.wrapping_add(1);
+                self.set_receive_base(packet.sequence.wrapping_add(1));
                 let action = self.acknowledge_sent(
                     packet.acknowledgement,
                     now_nanos,
@@ -1820,6 +2033,10 @@ where
             | TcpState::CloseWait
             | TcpState::Closing
             | TcpState::LastAck => {
+                self.last_segment_received = Some(TcpSegmentSnapshot {
+                    sequence: packet.sequence,
+                    payload_len: u32::try_from(packet.payload.len()).unwrap_or(u32::MAX),
+                });
                 if packet.flags.contains(TcpFlags::RST) {
                     if self
                         .receive_sequence_acceptable(packet.sequence, receive_sequence_len(packet))
@@ -1847,6 +2064,7 @@ where
                 {
                     // RFC 9293 3.10.7.4: every unacceptable segment is
                     // answered with an acknowledgement of its own.
+                    self.record_old_payload(packet.sequence, packet.payload.len());
                     self.request_duplicate_ack();
                     return TcpSegmentOutcome::default();
                 }
@@ -1922,6 +2140,37 @@ where
                 TcpSegmentOutcome::default()
             }
             _ => TcpSegmentOutcome::default(),
+        }
+    }
+
+    /// What retiring this socket owes its peer.
+    ///
+    /// A socket that has already sent its FIN finishes the sequence it
+    /// started, whatever is left in its receive queue: the peer was
+    /// told the stream ended in order and a reset would retract that.
+    /// A socket that has not is abandoning undelivered data if its
+    /// receive queue is non-empty, and RFC 9293 3.6.1 makes that an
+    /// abort; with an empty queue it is the ordinary close, and the FIN
+    /// is what the peer is owed.
+    pub fn close_action(&self) -> TcpCloseAction {
+        match self.state {
+            TcpState::Closed | TcpState::Listen | TcpState::SynSent => TcpCloseAction::Reclaim,
+            TcpState::FinWait1
+            | TcpState::FinWait2
+            | TcpState::Closing
+            | TcpState::LastAck
+            | TcpState::TimeWait => TcpCloseAction::Finish,
+            // A handshake the peer believes in that never became a
+            // stream: there is no send sequence to close and nobody to
+            // hand the connection to.
+            TcpState::SynReceived => TcpCloseAction::Reset,
+            TcpState::Established | TcpState::CloseWait => {
+                if self.receive_buffered_bytes() == 0 {
+                    TcpCloseAction::Finish
+                } else {
+                    TcpCloseAction::Reset
+                }
+            }
         }
     }
 
@@ -2264,12 +2513,55 @@ where
         }
     }
 
-    fn refresh_advertised_window(&mut self) {
-        self.advertised_window =
-            receive_window_size(self.receive_buffered_bytes(), self.local_window_scale);
+    /// Anchors the receive window on the sequence number the peer's SYN
+    /// established. Called once per connection, before any data: from
+    /// here on the window's right edge only ever moves right.
+    fn set_receive_base(&mut self, receive_next: u32) {
+        self.receive_next = receive_next;
+        self.receive_window_right_edge = receive_next;
+        self.refresh_advertised_window();
     }
 
-    fn receive_buffered_bytes(&self) -> usize {
+    /// Recomputes the advertised window from the free receive space,
+    /// without ever moving the window's right edge left.
+    ///
+    /// Free space alone is not a window. Out-of-order data buffered
+    /// behind a hole consumes space without advancing `receive_next`, so
+    /// a free-space window retracts the edge the peer was already told
+    /// about, and `receive_sequence_acceptable` then refuses segments
+    /// the peer sent legally - including, once the retraction reaches
+    /// `receive_next`, the retransmission that would fill the hole,
+    /// which a reader holding an empty in-order queue can never unblock
+    /// by draining. RFC 9293 3.8.6.2.1 forbids the retraction, and the
+    /// receiver is free to drop what it has no room for and let the peer
+    /// resend it (#166).
+    fn refresh_advertised_window(&mut self) {
+        let free = receive_window_size(self.receive_buffered_bytes(), self.local_window_scale);
+        // What is still open at the edge the peer was last told about,
+        // in the scaled units the header carries: comparing there and
+        // not in bytes keeps this rule from firing on the truncation
+        // `receive_window_size` already does. In-order data advances
+        // `receive_next` by exactly what it buffers, so the two agree
+        // and the window is the free space; out-of-order data does not,
+        // and the edge holds.
+        self.advertised_window = if sequence_lt(self.receive_next, self.receive_window_right_edge) {
+            let open = self
+                .receive_window_right_edge
+                .wrapping_sub(self.receive_next)
+                >> self.local_window_scale;
+            free.max(u16::try_from(open).unwrap_or(u16::MAX))
+        } else {
+            free
+        };
+        self.receive_window_right_edge = self
+            .receive_next
+            .wrapping_add(u32::from(self.advertised_window) << self.local_window_scale);
+    }
+
+    /// Everything the receive path is holding for this socket: the
+    /// in-order bytes a reader has not taken, and the out-of-order
+    /// bytes waiting on the gap in front of them.
+    pub fn receive_buffered_bytes(&self) -> usize {
         self.receive_queued_bytes
             .checked_add(self.out_of_order_queued_bytes)
             .expect("TCP receive buffered byte count overflowed")
@@ -2379,6 +2671,24 @@ where
         Some(bytes)
     }
 
+    /// Counts a segment whose whole payload lies at or below
+    /// `receive_next` as a retransmission by the peer. Two paths see
+    /// one: the acceptability check refuses a segment that is entirely
+    /// old, and `receive_payload` catches the same shape when the
+    /// window check let it through by its end edge.
+    fn record_old_payload(&mut self, sequence: u32, payload_len: usize) {
+        let payload_len = u32::try_from(payload_len).unwrap_or(u32::MAX);
+        if payload_len == 0 {
+            return;
+        }
+        if sequence_leq(sequence.wrapping_add(payload_len), self.receive_next) {
+            self.receive_counters.peer_retransmits_received = self
+                .receive_counters
+                .peer_retransmits_received
+                .saturating_add(1);
+        }
+    }
+
     fn receive_payload(
         &mut self,
         sequence: u32,
@@ -2391,6 +2701,7 @@ where
             // Data the peer already had acknowledged. It resent it
             // because it believes something was lost, so answer every
             // copy rather than one per batch.
+            self.record_old_payload(sequence, payload.len());
             self.request_duplicate_ack();
             return Ok(false);
         }
@@ -2476,7 +2787,7 @@ where
                 segment.sequence = self.receive_next;
             }
             let len = segment.payload.len();
-            self.push_receive_payload(segment.payload)
+            self.push_receive_payload(segment.payload.freeze())
                 .unwrap_or_else(|_| panic!("TCP receive queue reported full after capacity check"));
             self.receive_next = self
                 .receive_next
@@ -2573,8 +2884,15 @@ where
         if payload.is_empty() {
             return Ok(());
         }
-        // payload is already an owning Bytes — slice or copied into
-        // by the caller. No further copy at the segment boundary.
+        // Take the bytes out of the frame they arrived in, exactly as
+        // `push_receive_segment_owned` does on the contiguous path:
+        // `try_into_mut` keeps a buffer this socket already owns, and a
+        // slice of a driver frame — which is what every fragment here is
+        // — is copied instead of parking the driver's receive buffer for
+        // as long as the hole lasts.
+        let payload = payload
+            .try_into_mut()
+            .unwrap_or_else(|shared| BytesMut::from(shared.as_ref()));
         let segment = TcpOutOfOrderSegment { sequence, payload };
         let len = segment.payload.len();
         self.out_of_order_mut().push(segment).map_err(|_| ())?;
@@ -2685,6 +3003,18 @@ where
         })
     }
 
+    /// Records one acknowledgement leaving the socket. Every outgoing
+    /// header carries `receive_next` and `advertised_window`, so the
+    /// snapshot is taken here rather than at each of the three places a
+    /// header is built.
+    fn note_ack_emitted(&mut self) {
+        self.pending_acks = self.pending_acks.saturating_sub(1);
+        self.last_ack_sent = Some(TcpAckSnapshot {
+            acknowledgement: self.receive_next,
+            window_bytes: self.local_receive_window_bytes(),
+        });
+    }
+
     fn request_ack(&mut self) {
         self.pending_acks = self.pending_acks.max(1);
         self.delayed_ack_deadline_nanos = None;
@@ -2701,6 +3031,10 @@ where
     /// which is every peer that did not negotiate it — has no other way
     /// to say so.
     fn request_duplicate_ack(&mut self) {
+        self.receive_counters.duplicate_acks_requested = self
+            .receive_counters
+            .duplicate_acks_requested
+            .saturating_add(1);
         self.pending_acks = self.pending_acks.saturating_add(1).min(TCP_MAX_QUEUED_ACKS);
         self.delayed_ack_deadline_nanos = None;
         self.unacked_receive_segments = 0;
@@ -2778,6 +3112,13 @@ where
         self.pending_window_update_bytes =
             self.pending_window_update_bytes.saturating_add(delta_bytes);
         self.pending_window_update_bytes >= u32::from(TCP_WINDOW_UPDATE_BYTES)
+    }
+}
+
+fn out_of_order_range(segment: &TcpOutOfOrderSegment) -> TcpSequenceRange {
+    TcpSequenceRange {
+        start: segment.sequence,
+        end: segment_end_from_parts(segment.sequence, segment.payload.len()),
     }
 }
 
@@ -3014,57 +3355,109 @@ mod tests {
     }
 
     #[test]
-    fn syn_sent_rejects_syn_ack_acknowledging_unsent_sequence() {
-        let mut socket = TcpSocket::connect(endpoint(49152), peer(80), 7, BbrV3::new(1460));
-        socket.mark_syn_queued(0);
-
-        let outcome = deliver_segment(
-            &mut socket,
-            TcpPacket {
-                source_port: 80,
-                destination_port: 49152,
-                sequence: 100,
-                acknowledgement: 9,
-                flags: TcpFlags::SYN.union(TcpFlags::ACK),
-                window_size: u16::MAX,
-                options: TcpOptions::empty(),
-                payload: &[],
-            },
-            TCP_INITIAL_RTO_NANOS,
-        );
-
-        assert_eq!(socket.state(), TcpState::SynSent);
-        assert_eq!(socket.receive_next, 0);
-        let reset = outcome
-            .reset
-            .expect("unacceptable SYN-SENT ACK must request a reset");
-        assert_eq!(reset.header.sequence, 9);
-        assert_eq!(reset.header.acknowledgement, 0);
-        assert_eq!(reset.header.flags, TcpFlags::RST);
+    fn syn_sent_resets_unacceptable_acks_with_or_without_syn() {
+        for flags in [
+            TcpFlags::ACK,
+            TcpFlags::SYN.union(TcpFlags::ACK),
+            TcpFlags::FIN.union(TcpFlags::ACK),
+        ] {
+            for acknowledgement in [7, 9] {
+                let mut socket = TcpSocket::connect(endpoint(49152), peer(80), 7, BbrV3::new(1460));
+                socket.mark_syn_queued(0);
+                let outcome = deliver_segment(
+                    &mut socket,
+                    TcpPacket {
+                        source_port: 80,
+                        destination_port: 49152,
+                        sequence: 100,
+                        acknowledgement,
+                        flags,
+                        window_size: u16::MAX,
+                        options: TcpOptions::empty(),
+                        payload: &[],
+                    },
+                    TCP_INITIAL_RTO_NANOS,
+                );
+                assert_eq!(socket.state(), TcpState::SynSent);
+                assert_eq!(socket.receive_next, 0);
+                assert_eq!(socket.send_unacknowledged, 7);
+                let reset = outcome.reset.unwrap_or_else(|| {
+                    panic!("unacceptable SYN-SENT ACK {acknowledgement} with {flags:?} must request a reset")
+                });
+                assert_eq!(reset.header.sequence, acknowledgement);
+                assert_eq!(reset.header.acknowledgement, 0);
+                assert_eq!(reset.header.flags, TcpFlags::RST);
+                assert!(
+                    socket
+                        .pending_retransmission(TCP_INITIAL_RTO_NANOS)
+                        .is_some()
+                );
+            }
+        }
     }
 
     #[test]
-    fn syn_sent_ignores_rst_without_ack() {
-        let mut socket = TcpSocket::connect(endpoint(49152), peer(80), 7, BbrV3::new(1460));
-        socket.mark_syn_queued(0);
+    fn syn_sent_ignores_rst_without_acceptable_ack() {
+        for (flags, acknowledgement) in [
+            (TcpFlags::RST, 0),
+            (TcpFlags::RST.union(TcpFlags::ACK), 7),
+            (TcpFlags::RST.union(TcpFlags::ACK), 9),
+            (TcpFlags::RST.union(TcpFlags::SYN).union(TcpFlags::ACK), 9),
+        ] {
+            let mut socket = TcpSocket::connect(endpoint(49152), peer(80), 7, BbrV3::new(1460));
+            socket.mark_syn_queued(0);
+            let outcome = deliver_segment(
+                &mut socket,
+                TcpPacket {
+                    source_port: 80,
+                    destination_port: 49152,
+                    sequence: 100,
+                    acknowledgement,
+                    flags,
+                    window_size: u16::MAX,
+                    options: TcpOptions::empty(),
+                    payload: &[],
+                },
+                TCP_INITIAL_RTO_NANOS,
+            );
+            assert_eq!(socket.state(), TcpState::SynSent);
+            assert_eq!(outcome, TcpSegmentOutcome::default());
+            assert!(
+                socket
+                    .pending_retransmission(TCP_INITIAL_RTO_NANOS)
+                    .is_some()
+            );
+        }
+    }
 
-        let outcome = deliver_segment(
-            &mut socket,
-            TcpPacket {
-                source_port: 80,
-                destination_port: 49152,
-                sequence: 100,
-                acknowledgement: 0,
-                flags: TcpFlags::RST,
-                window_size: u16::MAX,
-                options: TcpOptions::empty(),
-                payload: &[],
-            },
-            TCP_INITIAL_RTO_NANOS,
-        );
-
-        assert_eq!(socket.state(), TcpState::SynSent);
-        assert_eq!(outcome, TcpSegmentOutcome::default());
+    #[test]
+    fn syn_sent_acceptable_ack_without_syn_does_not_establish_or_reset() {
+        for flags in [TcpFlags::ACK, TcpFlags::FIN.union(TcpFlags::ACK)] {
+            let mut socket = TcpSocket::connect(endpoint(49152), peer(80), 7, BbrV3::new(1460));
+            socket.mark_syn_queued(0);
+            let outcome = deliver_segment(
+                &mut socket,
+                TcpPacket {
+                    source_port: 80,
+                    destination_port: 49152,
+                    sequence: 100,
+                    acknowledgement: 8,
+                    flags,
+                    window_size: u16::MAX,
+                    options: TcpOptions::empty(),
+                    payload: &[],
+                },
+                TCP_INITIAL_RTO_NANOS,
+            );
+            assert_eq!(socket.state(), TcpState::SynSent);
+            assert_eq!(outcome, TcpSegmentOutcome::default());
+            assert_eq!(socket.send_unacknowledged, 7);
+            assert!(
+                socket
+                    .pending_retransmission(TCP_INITIAL_RTO_NANOS)
+                    .is_some()
+            );
+        }
     }
 
     #[test]
@@ -5544,6 +5937,69 @@ mod tests {
         assert_eq!(ack.acknowledgement, receive_next_before);
     }
 
+    /// Out-of-order data must not keep the buffer the device filled.
+    ///
+    /// Every payload reaching `on_segment` is a slice of the frame the
+    /// driver handed up, so holding it holds one of the driver's
+    /// receive buffers. The in-order path already knows that and copies
+    /// (`push_receive_segment_owned`); the out-of-order queue stored the
+    /// caller's `Bytes` unchanged, so a hole in the sequence space
+    /// parked one device buffer per queued segment for as long as the
+    /// hole lasted.
+    #[test]
+    fn out_of_order_receive_payload_does_not_retain_the_device_buffer() {
+        struct TrackedBuffer {
+            bytes: [u8; 3],
+            released: alloc::sync::Arc<core::sync::atomic::AtomicBool>,
+        }
+
+        impl AsRef<[u8]> for TrackedBuffer {
+            fn as_ref(&self) -> &[u8] {
+                &self.bytes
+            }
+        }
+
+        impl Drop for TrackedBuffer {
+            fn drop(&mut self) {
+                self.released
+                    .store(true, core::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let released = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+        let mut socket = established_socket();
+        socket.mark_ack_queued();
+        let receive_next_before = socket.receive_next;
+        let payload = Bytes::from_owner(TrackedBuffer {
+            bytes: *b"def",
+            released: released.clone(),
+        });
+
+        let _ = socket.on_segment(
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: receive_next_before + 3,
+                acknowledgement: 8,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+                options: TcpOptions::empty(),
+                payload: b"def",
+            },
+            payload,
+            TCP_INITIAL_RTO_NANOS + 1,
+        );
+
+        assert_eq!(
+            socket.out_of_order_queued_bytes, 3,
+            "the segment itself must still be queued out of order"
+        );
+        assert!(
+            released.load(core::sync::atomic::Ordering::SeqCst),
+            "queuing a segment out of order must not hold the device buffer it arrived in"
+        );
+    }
+
     #[test]
     fn zero_receive_window_rejects_payload_but_accepts_empty_ack_at_receive_next() {
         let mut socket = established_socket();
@@ -5607,6 +6063,147 @@ mod tests {
 
         assert!(!outcome.receive_backpressure);
         assert_eq!(socket.peer_receive_window(), 4);
+    }
+
+    /// A hole must not cost the peer the window it was already given.
+    ///
+    /// Out-of-order data buffered behind a hole consumes receive space
+    /// without advancing `receive_next`, so a window computed from free
+    /// space alone retracts the right edge the peer was told about.
+    /// `receive_sequence_acceptable` then refuses segments the peer sent
+    /// legally, each refusal costing it another retransmission timeout,
+    /// and a reader whose in-order queue is empty has nothing to drain
+    /// that would reopen the window (#166). RFC 9293 3.8.6.2.1 forbids
+    /// the retraction: the receiver drops what it has no room for and
+    /// lets the peer resend it.
+    #[test]
+    fn out_of_order_data_never_retracts_the_advertised_receive_window() {
+        // The segment size a GRO peer delivers over virtio-net, which is
+        // what makes the retraction big enough to bite within one window.
+        const GRO_BYTES: usize = 64 * 1024;
+
+        let mut socket = established_scaled_socket();
+        let hole = socket.receive_next;
+        let right_edge = hole.wrapping_add(socket.advertised_receive_window_bytes());
+        let payload = [7u8; GRO_BYTES];
+
+        let mut sequence = hole.wrapping_add(GRO_BYTES as u32);
+        let mut buffered = 0usize;
+        let mut now_nanos = TCP_INITIAL_RTO_NANOS;
+        while sequence_leq(sequence.wrapping_add(GRO_BYTES as u32), right_edge) {
+            now_nanos += 1;
+            let _ = deliver_segment(
+                &mut socket,
+                TcpPacket {
+                    source_port: 80,
+                    destination_port: 49152,
+                    sequence,
+                    acknowledgement: 8,
+                    flags: TcpFlags::ACK,
+                    window_size: u16::MAX,
+                    options: TcpOptions::empty(),
+                    payload: &payload,
+                },
+                now_nanos,
+            );
+            buffered += GRO_BYTES;
+            let diagnostics = socket.receive_diagnostics();
+            assert_eq!(
+                diagnostics.out_of_order_queued_bytes, buffered,
+                "a segment inside the advertised window was refused at {sequence}"
+            );
+            assert!(
+                sequence_leq(
+                    right_edge,
+                    socket
+                        .receive_next
+                        .wrapping_add(socket.advertised_receive_window_bytes()),
+                ),
+                "the receive window's right edge retracted at {sequence}"
+            );
+            sequence = sequence.wrapping_add(GRO_BYTES as u32);
+        }
+        assert!(buffered != 0, "the window must hold more than one segment");
+        assert_eq!(socket.receive_next, hole);
+
+        // The retransmission that fills the hole releases every byte
+        // behind it to the reader.
+        let _ = deliver_segment(
+            &mut socket,
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: hole,
+                acknowledgement: 8,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+                options: TcpOptions::empty(),
+                payload: &payload,
+            },
+            now_nanos + 1,
+        );
+        let diagnostics = socket.receive_diagnostics();
+        assert_eq!(diagnostics.out_of_order_queued_bytes, 0);
+        assert_eq!(diagnostics.receive_queued_bytes, buffered + GRO_BYTES);
+        assert_eq!(
+            diagnostics.receive_next, sequence,
+            "every buffered byte behind the hole became readable"
+        );
+    }
+
+    #[test]
+    fn receive_diagnostics_report_the_hole_a_stalled_reader_waits_on() {
+        let mut socket = established_socket();
+        let hole = socket.receive_next;
+        let payload = [7u8; 4];
+
+        let _ = deliver_segment(
+            &mut socket,
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: hole + 8,
+                acknowledgement: 8,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+                options: TcpOptions::empty(),
+                payload: &payload,
+            },
+            TCP_INITIAL_RTO_NANOS + 1,
+        );
+        socket.mark_ack_queued();
+
+        let diagnostics = socket.receive_diagnostics();
+        assert_eq!(diagnostics.state, TcpState::Established);
+        assert_eq!(diagnostics.receive_next, hole);
+        assert_eq!(diagnostics.receive_queued_bytes, 0);
+        assert_eq!(diagnostics.out_of_order_queued_bytes, payload.len());
+        assert_eq!(diagnostics.out_of_order_segments, 1);
+        assert_eq!(
+            diagnostics.first_out_of_order,
+            Some(TcpSequenceRange {
+                start: hole + 8,
+                end: hole + 8 + payload.len() as u32,
+            })
+        );
+        assert_eq!(
+            diagnostics.first_out_of_order,
+            diagnostics.last_out_of_order
+        );
+        assert_eq!(
+            diagnostics.last_segment,
+            Some(TcpSegmentSnapshot {
+                sequence: hole + 8,
+                payload_len: payload.len() as u32,
+            })
+        );
+        assert_eq!(
+            diagnostics.last_ack,
+            Some(TcpAckSnapshot {
+                acknowledgement: hole,
+                window_bytes: socket.advertised_receive_window_bytes(),
+            })
+        );
     }
 
     #[test]

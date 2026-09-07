@@ -29,6 +29,12 @@ pub use service::{
 };
 pub use socket_stack::SocketStack;
 
+/// The established-connection fixture the retirement tests in
+/// `wasmtime_adapter` need. Its wiring is private to `network::service`
+/// and the owners it exercises are not.
+#[cfg(all(test, feature = "wasmtime-runtime"))]
+pub(crate) use service::fixture::EstablishedTcpFixture;
+
 /// Bringing a discovered interface online: the one place a backend
 /// hands the kernel a network device.
 ///
@@ -60,7 +66,7 @@ where
         &self,
         runtime_state: &crate::RuntimeState<
             ProgramService,
-            crate::ComponentHostNetworkService,
+            NetworkService<CpuImpl, DeviceImpl>,
             HostFsService,
         >,
         device: DeviceImpl,
@@ -71,13 +77,13 @@ where
     {
         let service = NetworkService::new(
             self.cpu.clone(),
-            runtime_state.clone(),
+            runtime_state.profiles(),
+            runtime_state.uptime_clock(),
             self.timer(),
             device,
         );
         let pump = service.clone();
-        runtime_state
-            .install_network_service(crate::ComponentHostNetworkService::from_service(service));
+        runtime_state.install_network_service(service);
         self.spawn_detached(async move {
             pump.run_packet_pump().await;
         });

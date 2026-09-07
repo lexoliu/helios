@@ -92,20 +92,20 @@ pub(super) struct Preview1Cwd {
 }
 
 #[derive(Clone)]
-pub(super) struct Preview1DescriptorTable {
-    pub(super) entries: Vec<Option<Preview1DescriptorEntry>>,
+pub(super) struct Preview1DescriptorTable<Net: ComponentHostNetwork> {
+    pub(super) entries: Vec<Option<Preview1DescriptorEntry<Net>>>,
     pub(super) free: FreeDescriptorSlots,
 }
 
 #[derive(Clone)]
-pub(super) struct Preview1DescriptorEntry {
-    pub(super) descriptor: Preview1Descriptor,
+pub(super) struct Preview1DescriptorEntry<Net: ComponentHostNetwork> {
+    pub(super) descriptor: Preview1Descriptor<Net>,
     pub(super) close_on_exec: bool,
     pub(super) fdflags: u16,
 }
 
 #[derive(Clone)]
-pub(super) enum Preview1Descriptor {
+pub(super) enum Preview1Descriptor<Net: ComponentHostNetwork> {
     Stdin {
         carry: Bytes,
     },
@@ -129,7 +129,7 @@ pub(super) enum Preview1Descriptor {
         fdflags: u16,
     },
     NullDevice,
-    Socket(WasixSocketDescriptor),
+    Socket(WasixSocketDescriptor<Net>),
     Epoll(EpollDescriptor),
 }
 
@@ -281,13 +281,14 @@ pub(super) async fn p1_wait_step<CpuImpl>(
 /// Descriptors backed by a kernel channel register a real waiter. Network
 /// sockets and the serial console have no wakeup source, so they only set the
 /// re-probe flag.
-pub(super) fn p1_add_wait_target<CpuImpl, HostFs>(
-    store: &Preview1ProgramStore<CpuImpl, HostFs>,
+pub(super) fn p1_add_wait_target<CpuImpl, Net, HostFs>(
+    store: &Preview1ProgramStore<CpuImpl, Net, HostFs>,
     fd: i32,
     event_type: u8,
     wait: &mut P1WaitSet,
 ) where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     match store.descriptors.get(fd) {
@@ -347,13 +348,14 @@ pub(super) fn p1_add_wait_target<CpuImpl, HostFs>(
 
 /// Resolve a descriptor's readiness, consulting the network service when the
 /// descriptor is a socket and the console when it is serial-backed stdin.
-pub(super) async fn p1_descriptor_readiness<CpuImpl, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+pub(super) async fn p1_descriptor_readiness<CpuImpl, Net, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     fd: i32,
     event_type: u8,
 ) -> Result<P1Readiness, i32>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     if event_type == P1_EVENTTYPE_FD_READ
@@ -410,9 +412,9 @@ pub(super) fn p1_readiness_from_socket(
 }
 
 #[derive(Clone)]
-pub(super) enum WasixSocketDescriptor {
-    Tcp(WasixTcpSocket),
-    Udp(WasixUdpSocket),
+pub(super) enum WasixSocketDescriptor<Net: ComponentHostNetwork> {
+    Tcp(WasixTcpSocket<Net>),
+    Udp(WasixUdpSocket<Net>),
     Pair {
         reader: crate::ByteReader,
         writer: crate::ByteWriter,
@@ -467,29 +469,60 @@ impl WasixSocketFamily {
 /// stream from `fd_close` alone left the stream behind in that last
 /// case, which is how eleven connections outlived the programs that
 /// opened them in #184.
-pub(super) struct WasixOwnedTcpStream {
-    service: ComponentHostNetworkService,
-    stream: u64,
+pub(super) struct WasixOwnedTcpStream<Net: ComponentHostNetwork> {
+    service: Net,
+    stream: Net::TcpStream,
 }
 
-impl WasixOwnedTcpStream {
-    pub(super) fn new(service: ComponentHostNetworkService, stream: u64) -> Arc<Self> {
+impl<Net: ComponentHostNetwork> WasixOwnedTcpStream<Net> {
+    pub(super) fn new(service: Net, stream: Net::TcpStream) -> Arc<Self> {
         Arc::new(Self { service, stream })
     }
 
-    pub(super) const fn id(&self) -> u64 {
+    pub(super) fn id(&self) -> Net::TcpStream {
         self.stream
     }
 }
 
-impl Drop for WasixOwnedTcpStream {
+impl<Net: ComponentHostNetwork> Drop for WasixOwnedTcpStream<Net> {
     fn drop(&mut self) {
         self.service.tcp_close(self.stream);
     }
 }
 
+/// A netstack TCP listener a preview1 descriptor owns.
+///
+/// The same rule as [`WasixOwnedTcpStream`], for the same reason: the
+/// listener is retired when the last descriptor holding it goes away,
+/// which covers `fd_close`, the duplicate an `exec` inherits, and the
+/// table a program takes with it when it exits. Nothing on any of those
+/// paths touched the listener before — the network service had no
+/// `tcp_listener_close` at all — so every listener a program opened
+/// stayed in its shard for the rest of the boot, holding the local port
+/// that `is_tcp_local_port_free` consults (#191).
+pub(super) struct WasixOwnedTcpListener<Net: ComponentHostNetwork> {
+    service: Net,
+    listener: Net::TcpListener,
+}
+
+impl<Net: ComponentHostNetwork> WasixOwnedTcpListener<Net> {
+    pub(super) fn new(service: Net, listener: Net::TcpListener) -> Arc<Self> {
+        Arc::new(Self { service, listener })
+    }
+
+    pub(super) fn id(&self) -> Net::TcpListener {
+        self.listener
+    }
+}
+
+impl<Net: ComponentHostNetwork> Drop for WasixOwnedTcpListener<Net> {
+    fn drop(&mut self) {
+        self.service.tcp_listener_close(self.listener);
+    }
+}
+
 #[derive(Clone)]
-pub(super) enum WasixTcpSocket {
+pub(super) enum WasixTcpSocket<Net: ComponentHostNetwork> {
     Unconnected {
         family: WasixSocketFamily,
         options: WasixSocketOptions,
@@ -501,28 +534,58 @@ pub(super) enum WasixTcpSocket {
     },
     Listening {
         family: WasixSocketFamily,
-        listener: u64,
+        listener: Arc<WasixOwnedTcpListener<Net>>,
         local_port: u16,
         options: WasixSocketOptions,
     },
     Connected {
         family: WasixSocketFamily,
-        stream: Arc<WasixOwnedTcpStream>,
+        stream: Arc<WasixOwnedTcpStream<Net>>,
         peer_address: crate::NetworkIpAddress,
         peer_port: u16,
         options: WasixSocketOptions,
     },
 }
 
+/// A netstack datagram socket a preview1 descriptor owns.
+///
+/// The same rule as [`WasixOwnedTcpStream`], for the same reason: the
+/// socket is retired when the last descriptor holding it goes away,
+/// which covers `fd_close`, the `sock_shutdown` that unbinds it, the
+/// duplicate an `exec` inherits, and the table a program takes with it
+/// when it exits. Nothing on any of those paths touched the netstack
+/// socket before, so a datagram socket stayed installed on every shard
+/// with its slot in `udp_slots` held (#190).
+pub(super) struct WasixOwnedUdpSocket<Net: ComponentHostNetwork> {
+    service: Net,
+    socket: Net::UdpSocket,
+}
+
+impl<Net: ComponentHostNetwork> WasixOwnedUdpSocket<Net> {
+    pub(super) fn new(service: Net, socket: Net::UdpSocket) -> Arc<Self> {
+        Arc::new(Self { service, socket })
+    }
+
+    pub(super) fn id(&self) -> Net::UdpSocket {
+        self.socket
+    }
+}
+
+impl<Net: ComponentHostNetwork> Drop for WasixOwnedUdpSocket<Net> {
+    fn drop(&mut self) {
+        self.service.udp_close(self.socket);
+    }
+}
+
 #[derive(Clone)]
-pub(super) enum WasixUdpSocket {
+pub(super) enum WasixUdpSocket<Net: ComponentHostNetwork> {
     Unbound {
         family: WasixSocketFamily,
         options: WasixSocketOptions,
     },
     Bound {
         family: WasixSocketFamily,
-        socket: u64,
+        socket: Arc<WasixOwnedUdpSocket<Net>>,
         local_port: u16,
         options: WasixSocketOptions,
     },
@@ -667,7 +730,7 @@ impl WasixSocketOptions {
     }
 }
 
-impl WasixSocketDescriptor {
+impl<Net: ComponentHostNetwork> WasixSocketDescriptor<Net> {
     pub(super) fn options(&self) -> &WasixSocketOptions {
         match self {
             WasixSocketDescriptor::Tcp(socket) => socket.options(),
@@ -701,7 +764,7 @@ impl WasixSocketDescriptor {
     }
 }
 
-impl WasixTcpSocket {
+impl<Net: ComponentHostNetwork> WasixTcpSocket<Net> {
     pub(super) fn options(&self) -> &WasixSocketOptions {
         match self {
             WasixTcpSocket::Unconnected { options, .. }
@@ -730,7 +793,7 @@ impl WasixTcpSocket {
     }
 }
 
-impl WasixUdpSocket {
+impl<Net: ComponentHostNetwork> WasixUdpSocket<Net> {
     pub(super) fn options(&self) -> &WasixSocketOptions {
         match self {
             WasixUdpSocket::Unbound { options, .. } | WasixUdpSocket::Bound { options, .. } => {
@@ -808,7 +871,7 @@ pub(super) fn guest_path_suffix<'a>(path: &'a str, preopen: &str) -> &'a str {
     }
 }
 
-impl Preview1DescriptorTable {
+impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
     pub(super) fn from_authority(authority: &ProcessAuthority) -> Self {
         let preopens = authority.directory_preopens();
         let mut entries = Vec::with_capacity(3 + preopens.len());
@@ -845,7 +908,7 @@ impl Preview1DescriptorTable {
         table
     }
 
-    pub(super) fn from_entries(entries: Vec<Option<Preview1DescriptorEntry>>) -> Self {
+    pub(super) fn from_entries(entries: Vec<Option<Preview1DescriptorEntry<Net>>>) -> Self {
         let mut free = FreeDescriptorSlots::with_capacity(entries.len());
         for (index, entry) in entries.iter().enumerate() {
             if entry.is_none() {
@@ -855,7 +918,7 @@ impl Preview1DescriptorTable {
         Self { entries, free }
     }
 
-    pub(super) fn get(&self, fd: i32) -> Option<&Preview1Descriptor> {
+    pub(super) fn get(&self, fd: i32) -> Option<&Preview1Descriptor<Net>> {
         usize::try_from(fd)
             .ok()
             .and_then(|index| self.entries.get(index))
@@ -863,7 +926,7 @@ impl Preview1DescriptorTable {
             .map(|entry| &entry.descriptor)
     }
 
-    pub(super) fn get_mut(&mut self, fd: i32) -> Option<&mut Preview1Descriptor> {
+    pub(super) fn get_mut(&mut self, fd: i32) -> Option<&mut Preview1Descriptor<Net>> {
         usize::try_from(fd)
             .ok()
             .and_then(|index| self.entries.get_mut(index))
@@ -871,13 +934,13 @@ impl Preview1DescriptorTable {
             .map(|entry| &mut entry.descriptor)
     }
 
-    pub(super) fn insert(&mut self, descriptor: Preview1Descriptor) -> Result<u32, i32> {
+    pub(super) fn insert(&mut self, descriptor: Preview1Descriptor<Net>) -> Result<u32, i32> {
         self.insert_with_close_on_exec(descriptor, false)
     }
 
     pub(super) fn insert_with_close_on_exec(
         &mut self,
-        descriptor: Preview1Descriptor,
+        descriptor: Preview1Descriptor<Net>,
         close_on_exec: bool,
     ) -> Result<u32, i32> {
         self.insert_entry(Preview1DescriptorEntry::new(descriptor, close_on_exec))
@@ -885,7 +948,7 @@ impl Preview1DescriptorTable {
 
     pub(super) fn insert_with_fdflags(
         &mut self,
-        descriptor: Preview1Descriptor,
+        descriptor: Preview1Descriptor<Net>,
         close_on_exec: bool,
         fdflags: u16,
     ) -> Result<u32, i32> {
@@ -896,7 +959,7 @@ impl Preview1DescriptorTable {
         })
     }
 
-    pub(super) fn insert_entry(&mut self, entry: Preview1DescriptorEntry) -> Result<u32, i32> {
+    pub(super) fn insert_entry(&mut self, entry: Preview1DescriptorEntry<Net>) -> Result<u32, i32> {
         let index = self.allocate_slot_index();
         self.entries[index] = Some(entry);
         u32::try_from(index).map_err(|_| p1::errno::OVERFLOW)
@@ -917,7 +980,7 @@ impl Preview1DescriptorTable {
     pub(super) fn insert_at(
         &mut self,
         fd: i32,
-        descriptor: Preview1Descriptor,
+        descriptor: Preview1Descriptor<Net>,
         close_on_exec: bool,
     ) -> Result<u32, i32> {
         self.insert_entry_at(fd, Preview1DescriptorEntry::new(descriptor, close_on_exec))
@@ -926,7 +989,7 @@ impl Preview1DescriptorTable {
     pub(super) fn insert_entry_at(
         &mut self,
         fd: i32,
-        entry: Preview1DescriptorEntry,
+        entry: Preview1DescriptorEntry<Net>,
     ) -> Result<u32, i32> {
         let to = usize::try_from(fd).map_err(|_| p1::errno::BADF)?;
         if self.entries.len() <= to {
@@ -938,14 +1001,14 @@ impl Preview1DescriptorTable {
         u32::try_from(to).map_err(|_| p1::errno::OVERFLOW)
     }
 
-    pub(super) fn get_entry(&self, fd: i32) -> Option<&Preview1DescriptorEntry> {
+    pub(super) fn get_entry(&self, fd: i32) -> Option<&Preview1DescriptorEntry<Net>> {
         usize::try_from(fd)
             .ok()
             .and_then(|index| self.entries.get(index))
             .and_then(Option::as_ref)
     }
 
-    pub(super) fn get_entry_mut(&mut self, fd: i32) -> Option<&mut Preview1DescriptorEntry> {
+    pub(super) fn get_entry_mut(&mut self, fd: i32) -> Option<&mut Preview1DescriptorEntry<Net>> {
         usize::try_from(fd)
             .ok()
             .and_then(|index| self.entries.get_mut(index))
@@ -1033,7 +1096,7 @@ impl Preview1DescriptorTable {
     pub(super) fn get_owned_entry(
         &mut self,
         fd: i32,
-    ) -> Result<(usize, Preview1DescriptorEntry), i32> {
+    ) -> Result<(usize, Preview1DescriptorEntry<Net>), i32> {
         let index = usize::try_from(fd).map_err(|_| p1::errno::BADF)?;
         let entry = self
             .entries
@@ -1071,8 +1134,8 @@ impl Preview1DescriptorTable {
     }
 }
 
-impl Preview1DescriptorEntry {
-    pub(super) fn new(descriptor: Preview1Descriptor, close_on_exec: bool) -> Self {
+impl<Net: ComponentHostNetwork> Preview1DescriptorEntry<Net> {
+    pub(super) fn new(descriptor: Preview1Descriptor<Net>, close_on_exec: bool) -> Self {
         let fdflags = preview1_descriptor_initial_fdflags(&descriptor);
         Self {
             descriptor,
@@ -1082,7 +1145,9 @@ impl Preview1DescriptorEntry {
     }
 }
 
-pub(super) fn preview1_descriptor_initial_fdflags(descriptor: &Preview1Descriptor) -> u16 {
+pub(super) fn preview1_descriptor_initial_fdflags<Net: ComponentHostNetwork>(
+    descriptor: &Preview1Descriptor<Net>,
+) -> u16 {
     match descriptor {
         Preview1Descriptor::File { fdflags, .. } => *fdflags,
         _ => 0,
@@ -1212,7 +1277,9 @@ pub(super) fn descriptor_flags_to_directory_authority(
     rights
 }
 
-pub(super) fn p1_descriptor_rights(descriptor: &Preview1Descriptor) -> u64 {
+pub(super) fn p1_descriptor_rights<Net: ComponentHostNetwork>(
+    descriptor: &Preview1Descriptor<Net>,
+) -> u64 {
     match descriptor {
         Preview1Descriptor::Stdin { .. } => P1_RIGHT_FD_READ | P1_RIGHT_POLL_FD_READWRITE,
         Preview1Descriptor::Stdout | Preview1Descriptor::Stderr => {
@@ -1285,7 +1352,9 @@ pub(super) fn p1_filetype_from_descriptor_type(type_: fs_types::DescriptorType) 
     }
 }
 
-pub(super) fn p1_descriptor_path(descriptor: Option<&Preview1Descriptor>) -> Option<&str> {
+pub(super) fn p1_descriptor_path<Net: ComponentHostNetwork>(
+    descriptor: Option<&Preview1Descriptor<Net>>,
+) -> Option<&str> {
     match descriptor {
         Some(Preview1Descriptor::Preopen { descriptor, .. })
         | Some(Preview1Descriptor::File { descriptor, .. }) => Some(&descriptor.path),
@@ -1313,8 +1382,8 @@ pub(super) fn p1_null_device_identity() -> crate::ObjectIdentity {
     crate::ObjectIdentity::new(crate::AuthorityDomain::GUEST_DEVICES, 1)
 }
 
-pub(super) fn p1_directory_descriptor(
-    descriptor: Option<&Preview1Descriptor>,
+pub(super) fn p1_directory_descriptor<Net: ComponentHostNetwork>(
+    descriptor: Option<&Preview1Descriptor<Net>>,
 ) -> Option<&FsDescriptor> {
     match descriptor {
         Some(Preview1Descriptor::Preopen { descriptor, .. })
@@ -1370,25 +1439,25 @@ impl P1Readiness {
 /// their readiness has to be resolved through the async network service.
 /// Making that an explicit variant keeps a caller from silently reading a
 /// socket as "not ready" when it simply never asked the network.
-pub(super) enum P1Probe {
+pub(super) enum P1Probe<Net: ComponentHostNetwork> {
     Local(P1Readiness),
-    Network(P1NetworkProbe),
+    Network(P1NetworkProbe<Net>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum P1NetworkProbe {
-    TcpStream(u64),
-    TcpListener(u64),
-    UdpSocket(u64),
+pub(super) enum P1NetworkProbe<Net: ComponentHostNetwork> {
+    TcpStream(Net::TcpStream),
+    TcpListener(Net::TcpListener),
+    UdpSocket(Net::UdpSocket),
 }
 
 /// Probe every descriptor whose readiness is answerable from local state.
 ///
 /// `event_type` is one of `P1_EVENTTYPE_FD_READ` / `P1_EVENTTYPE_FD_WRITE`.
-pub(super) fn p1_probe_descriptor(
-    descriptor: Option<&Preview1Descriptor>,
+pub(super) fn p1_probe_descriptor<Net: ComponentHostNetwork>(
+    descriptor: Option<&Preview1Descriptor<Net>>,
     event_type: u8,
-) -> Result<P1Probe, i32> {
+) -> Result<P1Probe<Net>, i32> {
     let local = |readiness| Ok(P1Probe::Local(readiness));
     match (descriptor, event_type) {
         (Some(Preview1Descriptor::Stdin { carry }), P1_EVENTTYPE_FD_READ) => {
@@ -1482,14 +1551,14 @@ pub(super) fn p1_probe_descriptor(
                 WasixTcpSocket::Listening { listener, .. },
             ))),
             P1_EVENTTYPE_FD_READ | P1_EVENTTYPE_FD_WRITE,
-        ) => Ok(P1Probe::Network(P1NetworkProbe::TcpListener(*listener))),
+        ) => Ok(P1Probe::Network(P1NetworkProbe::TcpListener(listener.id()))),
         (
             Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Bound {
                 socket,
                 ..
             }))),
             P1_EVENTTYPE_FD_READ | P1_EVENTTYPE_FD_WRITE,
-        ) => Ok(P1Probe::Network(P1NetworkProbe::UdpSocket(*socket))),
+        ) => Ok(P1Probe::Network(P1NetworkProbe::UdpSocket(socket.id()))),
         // A socket with no endpoint yet can never make progress; it is not
         // an error to poll it, it simply never becomes ready.
         (

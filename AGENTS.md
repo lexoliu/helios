@@ -56,7 +56,12 @@ transient experiment: `docs/wasmtime.md` records the branch and the revision
 it must be at, and CI checks out the same snapshot. Moving the dependency
 means updating `docs/wasmtime.md` and passing every check in §7 against the
 new revision in the same change. Changing the fork itself is a maintainer
-decision, taken before the change is written.
+decision, taken before the change is written. A task that finds the fork
+missing a primitive it needs (an accessor on a `wasmtime` type, a runtime
+hook) reports the gap with the call site and the shape the primitive would
+take, and stops there: it neither routes around the gap inside the kernel
+nor adds the primitive on its own, because the orchestrating agent holds the
+maintainer's decision and the fork's revision moves once, per §1.
 
 ## 2. Construction over conditional compilation
 
@@ -99,6 +104,11 @@ decision, taken before the change is written.
   instances, kernel plugins included, use user-memory allocation and
   accounting; user OOM kills the instance and reclaims its pool, and never
   grows a kernel budget or adds per-plugin policy.
+- A buffer the device handed up belongs to the driver and is on loan for one
+  receive pass. Nothing the stack queues (an out-of-order TCP segment, an
+  unread datagram, a deferred reply) retains it: the queued value owns its
+  bytes. A driver's receive pool is a shared, unsignalled resource, and one
+  pinned buffer stalls the ring for every socket on that queue pair.
 - Heap allocation in kernel-facing code needs a concrete reason tied to
   variable-sized guest data, plugin payloads, or runtime ownership. Stack
   storage, static capacity, caller-owned buffers, arenas and typed ownership
@@ -127,8 +137,12 @@ decision, taken before the change is written.
   `clippy::manual_async_fn` enforces the impl-block half of this rule and
   is never allowed off.
 - Errors are typed enums with `thiserror`; `anyhow` does not appear in this
-  repository. A CLI or test boundary may translate an error into text, but
-  every crate preserves structured provenance.
+  repository, and `cargo deny --workspace check bans` (`deny.toml`) refuses
+  any crate that depends on it. A CLI or test boundary may translate an error into text,
+  but every crate preserves structured provenance. When an upstream API
+  answers in `anyhow::Result` (`wit-component`, for one), the caller's typed
+  variant carries the rendered chain (`format!("{error:#}")`) in a named
+  `report: String` field; it never erases into `Box<dyn Error>`.
 - Diagnostics go through `tracing`, the only diagnostic crate in the tree.
   The `log` crate is never used; a dependency that emits `log` records
   (`cranelift_codegen`, for one) is bridged with `tracing_log::LogTracer`.
@@ -208,6 +222,15 @@ property of every kernel and `hal/` subsystem, never a follow-up.
 - Words written by different processors live on different cache lines
   (`crossbeam_utils::CachePadded`, sized per target), and a structure's
   docs say which processor writes each padded block.
+- A lock that an interrupt handler can reach (an allocator, a frame pool,
+  anything `Notify::notify_all` or a waker can touch) masks the local
+  processor's interrupts for as long as it is held, through
+  `IrqSafeMutex` in `kernel/src/memory/` and the
+  `hal::critical_section::LocalInterruptMask` it rests on. Cross-processor
+  exclusion stays the lock's own spin word; a machine-wide
+  `critical_section` around a lock that already has one is contention, not
+  safety, and is reserved for state only one processor may touch at a
+  time (an interrupt controller register, a PCI configuration cycle).
 - Hardware the target already has (XSAVE and AVX, MWAIT, cache-coherent I/O,
   GICv3) is brought up properly rather than avoided because its setup is
   SMP-aware.
@@ -222,11 +245,18 @@ riscv64 lanes are functional checks under TCG and never a performance
 surface. GitHub's Arm runners expose no KVM, and macOS runners are not used
 (§7).
 
-Capture a baseline before any change that affects kernel-side runtime
-performance, compare after, and cite the medians and any regression in the
-PR. Baseline logs live under `target/perf-baselines/` and are not committed.
-A developer laptop is not a benchmark host: take numbers from the CI lane or
-a dedicated machine.
+Capture a baseline before any change that touches a kernel hot path,
+correctness fixes included, compare after, and cite the medians and any
+regression in the PR. Baseline logs live under `target/perf-baselines/` and
+are not committed. A developer laptop is not a benchmark host: take numbers
+from the CI lane or a dedicated machine.
+
+Two runs of the lane are not a comparison: the runner's CPU model changes
+from run to run. The paired mode of `bench-suite.yml` (`baseline_ref`, or
+`--profile-use` for a build-kind pair) boots both images in one job on one
+host, reports the noise floor, and carries the compute control, and it is
+the instrument for any before/after claim. A PR cites the paired run and
+job ids and the control row beside its medians.
 
 The canonical compute workload is the in-kernel compiler plugin compiling a
 fixed wasm input. The regression target is the median `elapsed_ms` over
@@ -245,8 +275,10 @@ never touches the NIC. The canonical network workload is `tcp-throughput` on
 a multi-queue tap backend; slirp (`user`) is single-queue with no offload and
 is not evidence for anything the virtio-net driver negotiates. Cite the
 `virtio-net online` boot line beside the median: it records the queue-pair
-count and the checksum and TSO bits the run actually had. `docs/networking.md`
-covers the backends and the privileged setup.
+count and the checksum and TSO bits the run actually had. The lane boots one
+guest per workload class and prints the line for each; the one to cite is
+the boot that ran the workload being measured. `docs/networking.md` covers
+the backends and the privileged setup.
 
 ```bash
 helios-inspector vm net-setup \
@@ -273,8 +305,14 @@ and never comes from CI.
   time-cost framing do not appear in a proposal. The criteria are whether the
   change resolves a root problem, whether the result tracks modern practice
   and reads more cleanly, and whether it introduces a contract violation.
-- Large changes are discussed before they are built, to align on direction.
-  That discussion is for alignment, never for permission to land a degraded
+- "Discuss before building" is a rule about public API: the surface a
+  library exposes to other people, where a reshape is a commitment. Inside
+  this tree it almost never applies. A large internal change, a core
+  subsystem replaced included, is recorded on its issue with the diagnosis
+  and the decision, then built and measured; that record is the whole of
+  the discussion, and a performance change in particular is gated by the
+  paired measurement of §3.6 and by nothing else. Where a discussion does
+  happen it is for alignment, never for permission to land a degraded
   variant.
 
 ## 4. Async-first execution
@@ -283,6 +321,10 @@ The kernel runs a cooperative async executor. Anything that pins it blocks
 every other task: the 9p host-fs transport, WASI futures, timers, the network
 service. These rules bind every `#![no_std]` crate and every crate the
 executor drives (`hal/`, `kernel/`, the backends' runtime paths, components).
+The signal and lock rules below bind the host side of the inspector
+transport as well (`inspector-protocol`'s client: one reader, many waiters),
+because a lost wake there hangs a bench lane exactly as one in the kernel
+does.
 
 - `block_on` does not appear in production code. Its only uses are tests,
   bootstrap entry points that run before the executor starts, and its own
@@ -343,6 +385,10 @@ executor drives (`hal/`, `kernel/`, the backends' runtime paths, components).
   topology, trap, or runtime code. A stuck or silent VM is inspected through
   the process, the gdbstub, the symbols, the serial socket and the QEMU logs
   before any conclusion; `hosted/` evidence does not stand in for it.
+- An issue's own diagnosis is a hypothesis, not a finding. The cause is
+  re-established from the run's artifacts (the console log, the counter
+  lines, the QEMU and gdbstub state) before any code changes, and a PR that
+  fixes a different mechanism than the issue named says so.
 - Inspector and guest communicate through the WIT RPC defined in
   `helios-inspector-protocol`, never through a side channel.
 
@@ -362,7 +408,11 @@ executor drives (`hal/`, `kernel/`, the backends' runtime paths, components).
 Before a change is complete, run the recipes for every surface it can
 affect. `just check-target` and `just test-units` generate the
 `helios-cli kernel-prebuild` manifest and pass it through
-`HELIOS_KERNEL_PREBUILD_MANIFEST` themselves.
+`HELIOS_KERNEL_PREBUILD_MANIFEST` themselves. The `check-target` set is the
+backends the diff can reach: a change in `hal/`, a library crate, a shared
+ABI or `kernel/` runs all three bare-metal targets; a change confined to
+one backend runs that backend's target; a change confined to the host tools
+or a user program runs none.
 
 ```bash
 just check-host
@@ -374,11 +424,14 @@ just lint
 just test-units
 ```
 
-`just lint` is `tools/fmt.sh --check` plus `cargo clippy … -D warnings` over
-the host crates, each guest program, and the three bare-metal targets.
+`just lint` is `tools/fmt.sh --check`, `cargo deny --workspace check bans`
+against `deny.toml`, and `cargo clippy … -D warnings` over the host crates, each
+guest program, and the three bare-metal targets.
 `just test-units` runs the `hal`, `virtio`, `netstack`, `kernel`,
-`inspector-protocol` and `workspace-root` unit tests and the
-`hal_layering` test that enforces §1.
+`inspector-protocol` and `workspace-root` unit tests and the `hal_layering`
+test (`kernel/tests/`) that enforces §1. The recipe names each integration
+test with `--test <name>`, so a new enforcement test is added to the recipe
+in the same change or it never runs.
 
 CI (`.github/workflows/ci.yml`) runs the same recipes, one lane each, so a
 red lane names the surface that broke:
@@ -386,7 +439,7 @@ red lane names the surface that broke:
 | Lane | Runner | What it proves |
 | --- | --- | --- |
 | `check-host`, `check-aarch64`, `check-riscv`, `check-x86` | `ubuntu-24.04` | Every surface compiles. |
-| `lint-fmt`, `lint-host`, `lint-aarch64`, `lint-riscv`, `lint-x86` | `ubuntu-24.04` | Formatting and clippy at `-D warnings`. |
+| `lint-fmt`, `lint-host`, `lint-aarch64`, `lint-riscv`, `lint-x86` | `ubuntu-24.04` | Formatting, the `deny.toml` bans, and clippy at `-D warnings`. |
 | `test-units`, `test-embedded-debugger` | `ubuntu-24.04` | Unit tests and the embedded debugger. |
 | `smoke-x86-64` | `ubuntu-24.04`, `--accel kvm` | Boot, shell, CPython, the in-kernel compiler, a trapped OOB load, curl over virtio-net, the raw serial captures. |
 | `smoke-riscv64` | `ubuntu-24.04`, `--accel tcg` | Boot, shell, CPython, a trapped OOB load, the inspector RPC over vsock, curl over virtio-net. |
@@ -421,8 +474,9 @@ changelog by hand.
   Commit messages and PR bodies carry no attribution trailers, generated-by
   footers, or session identifiers.
 - A PR merges when every check it can affect is green. A red lane that is
-  already red on `dev` and untouched by the PR gets its own issue, is named
-  in the PR body, and does not block. Evidence in the PR body is concrete:
+  already red on `dev` and untouched by the PR is named in the PR body with
+  the issue that tracks it (filed by the PR if none exists yet) and does not
+  block. Evidence in the PR body is concrete:
   the run id, the lane, the median, the negotiated feature line, the log
   line that proved the diagnosis.
 - A change to the Wasmtime fork, to a CI runner or lane, to this file, or to
@@ -436,11 +490,24 @@ them from colliding:
 - One checkout per task. A delegated agent works in its own git worktree
   branched from `origin/dev`, with a cloned `target/` for a warm cache, and
   never edits, cleans, or builds inside another worktree or another project.
+  Nothing outside the worktree is modified for any reason: not another
+  project's `target/`, not a tool's cache under the home directory, not a
+  sibling worktree. When the resource-headroom floor refuses a build, the
+  agent may delete rebuildable directories inside its own `target/` and
+  otherwise stops and reports the shortfall; reclaiming space anywhere else
+  is the orchestrator's or the maintainer's action.
 - A delegated agent runs the per-crate checks for the crates it touched
-  (`cargo check -p`, `cargo clippy -p … -D warnings`, the crate's tests, the
+  (`cargo check -p`, `cargo clippy -p … --all-targets -D warnings`,
+  `cargo test -p <crate>` with every target and never `--lib` alone, because
+  the integration tests are where a crate's enforcement tests live, the
   relevant `just check-target`, file-scoped rustfmt). The workspace-wide
   lint and test suite is CI's job; running it locally as well pays the same
-  compile twice.
+  compile twice. A check that can outrun the agent harness's default shell
+  time limit runs under an explicit `timeout`, or in the background with one
+  waiter, so that a cut-off log is never read as a result. A local check the
+  machine cannot run (a boot refused by the resource floor) may be replaced
+  by the CI lane that runs the same check on the same target, and the PR
+  body names the substitution and the lane's run id.
 - Benchmarks never run on a developer machine. The CI bench lane produces
   comparable artifacts; a laptop under other load does not.
 - Waiting on CI is one bounded foreground command (`timeout 590 gh pr checks
@@ -448,8 +515,18 @@ them from colliding:
   minutes is a defect signal: shorten the loop rather than wait longer.
 - Every ordinary PR is one issue, one branch, one delivery. An agent that
   finds a second problem while fixing the first files a new issue and cites
-  it, rather than widening the PR.
+  it, rather than widening the PR. The exception is a defect the PR cannot
+  be proven without (a broken job the PR's evidence has to run through, a
+  tool the PR's check needs): that fix rides in the PR, under its own issue
+  and its own commit, and the PR body names it as a repair rather than a
+  widening.
 - Scratch files are shared between the agents of one session. A file an
   agent writes outside its worktree carries its branch or PR number in its
   name, and a PR body or issue body is written from a file named that way,
   never from a generic `pr.md`.
+- A worktree reaches `artifacts/python3-root`, `artifacts/wasi-tools` and
+  the `artifacts/wasix/*` entries through symlinks into the main checkout.
+  Those are read-only from the worktree: an agent that needs a different
+  artifact replaces the link with its own copy or directory and never runs
+  `tools/wasi-apps/build.sh` or any other staging step through the link,
+  because that rewrites another session's inputs while it is using them.

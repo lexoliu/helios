@@ -1,5 +1,8 @@
 //! Kernel-side memory management.
 //!
+//! `irq_safe` carries the lock every allocator here is built on: an
+//! interrupt handler allocates, so the lock that guards an allocator
+//! has to mask interrupts while it is held.
 //! `pmm` exposes the kernel's physical-frame allocator wrapper.
 //! `user` carries the per-program user-memory pool used by Wasmtime
 //! linear memories. `frame_slab` is the per-processor frame cache
@@ -14,6 +17,7 @@
 mod balloon;
 mod entropy;
 mod frame_slab;
+mod irq_safe;
 mod mapping_cost;
 mod owner;
 mod pmm;
@@ -29,6 +33,7 @@ pub use entropy::{
     NoCryptographicEntropy, NoEntropyDevice, ROOT_ENTROPY_MATERIAL_BYTES, RootEntropy,
     RootEntropyHandle, install_entropy_device, seed_root_entropy,
 };
+pub(crate) use irq_safe::IrqSafeMutex;
 pub use mapping_cost::user_mapping_kernel_heap_bytes;
 pub use owner::{
     MemoryOwner, UserMemoryOwnerScope, UserMemoryOwners, configure_user_memory_owner_processors,
@@ -52,8 +57,8 @@ pub use swap::{
 };
 pub use user::{
     UserHeapStats, UserMemoryPool, allocate_user_frame_uninit_on, allocate_user_frame_zeroed,
-    allocate_user_frame_zeroed_on, deallocate_user_frame, deallocate_user_frame_on,
-    largest_servable_user_bytes, user_heap_stats,
+    allocate_user_frame_zeroed_on, allocate_user_run_zeroed_on, deallocate_user_frame,
+    deallocate_user_frame_on, deallocate_user_run_on, largest_servable_user_bytes, user_heap_stats,
 };
 pub(crate) use user::{
     allocate_user_memory_pool, install_user_memory_pool, lend_user_memory_to_kernel_heap,

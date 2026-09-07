@@ -1,0 +1,34 @@
+# cargo-deny configuration.
+#
+# `cargo deny --workspace check bans` runs in `just lint` and in CI's
+# formatting lane. `--workspace` matters: the root manifest is a package,
+# and without it only that package's dependency tree is a root, so a
+# host tool that reaches for the banned crate would go unseen.
+# It is the enforcement for AGENTS.md §3.2: `anyhow` does not appear in
+# this workspace. Errors are typed enums built with `thiserror`, so a
+# caller dispatches on a stable contract and a failure keeps the
+# provenance of the layer that produced it; `anyhow` erases both. A
+# manifest is where a crate gains the ability to reach for it at all, so
+# the ban is checked on the dependency graph rather than at call sites,
+# and it holds for code nobody has written yet.
+
+[bans]
+multiple-versions = "allow"
+wildcards = "allow"
+deny = [
+    { crate = "anyhow", use-instead = "thiserror", reason = "AGENTS.md §3.2: errors are typed enums with thiserror; anyhow erases provenance", wrappers = [
+        # Upstream crates that report through anyhow. A caller captures
+        # the rendered chain in a named `report: String` field (§3.2).
+        "wit-component",
+        "wit-parser",
+        "wasm-metadata",
+        "wasmprinter",
+        "wit-bindgen-core",
+        "wit-bindgen-rust",
+        "wit-bindgen-rust-macro",
+        # The Wasmtime fork's build-time and macro crates.
+        "wasmtime-environ",
+        "wasmtime-internal-component-macro",
+        "wasmtime-internal-wit-bindgen",
+    ] },
+]

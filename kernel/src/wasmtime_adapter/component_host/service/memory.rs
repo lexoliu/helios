@@ -48,14 +48,15 @@ pub(super) fn nul_terminated_list_size<'a>(
     })
 }
 
-pub(super) fn p1_write_string_array<'a, CpuImpl, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+pub(super) fn p1_write_string_array<'a, CpuImpl, Net, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     pointers: u32,
     buffer: u32,
     values: impl Iterator<Item = &'a str>,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     let Some(memory) = p1_memory(caller) else {
@@ -86,11 +87,12 @@ where
     status
 }
 
-pub(super) fn p1_memory<CpuImpl, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+pub(super) fn p1_memory<CpuImpl, Net, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
 ) -> Option<Preview1Memory>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     if let Some(memory) = caller
@@ -111,12 +113,13 @@ where
     })
 }
 
-pub(super) fn p1_memory_from_instance<CpuImpl, HostFs>(
-    store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, HostFs>>,
+pub(super) fn p1_memory_from_instance<CpuImpl, Net, HostFs>(
+    store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     instance: &wasmtime::Instance,
 ) -> Option<Preview1Memory>
 where
     CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     if let Some(memory) = instance.get_memory(&mut *store, "memory") {

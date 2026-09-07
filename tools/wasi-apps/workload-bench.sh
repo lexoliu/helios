@@ -47,6 +47,14 @@ command=(
     --release
 )
 
+# The profile-guided build of docs/pgo.md. It reads a merged `.profdata`
+# and is otherwise the release build, so it composes with `--release`
+# above and lands in a target directory of its own — which is what lets a
+# paired run time a PGO image against a plain one out of one checkout.
+if [[ -n "${HELIOS_WORKLOAD_BENCH_PROFILE_USE:-}" ]]; then
+    command+=(--profile-use "${HELIOS_WORKLOAD_BENCH_PROFILE_USE}")
+fi
+
 # The build depends on the architecture and the profile and on nothing
 # else, so it is issued before the boot's own flags are gathered: a
 # machine description this host cannot satisfy must not stop the compile

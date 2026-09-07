@@ -61,10 +61,78 @@ static TLB_SHOOTDOWN_START: AtomicUsize = AtomicUsize::new(0);
 static TLB_SHOOTDOWN_LEN: AtomicUsize = AtomicUsize::new(0);
 static TLB_SHOOTDOWN_ACK_MASK: AtomicUsize = AtomicUsize::new(0);
 
+/// The logical id the bootstrap anchor carries, so that a processor asking
+/// which one it is before its runtime exists is told so by name instead of
+/// being answered with processor zero.
+const BOOTSTRAP_ANCHOR_LOGICAL_ID: u16 = u16::MAX;
+
+/// The anchor the bootstrap processor runs on between its first Rust
+/// instruction and [`activate_runtime`].
+///
+/// The bootstrap processor is singular, so one static anchor can never be
+/// mistaken for a second processor's; every application processor has a real
+/// runtime before it is started, and the wakeup trampoline installs that
+/// runtime's address in `IA32_FS_BASE` before the first compiler-generated
+/// instruction runs on it. This word exists before the allocator that would
+/// otherwise own it, which is the whole of why it is a `static`.
+static BOOTSTRAP_ANCHOR: ProcessorAnchor = ProcessorAnchor {
+    identity: AtomicUsize::new(0),
+    logical_id: BOOTSTRAP_ANCHOR_LOGICAL_ID,
+    _reserved: [0; 3],
+};
+
+/// The words the executing processor answers `fs`-relative loads with.
+///
+/// `IA32_FS_BASE` holds the address of the executing processor's anchor from
+/// before that processor's first Rust instruction onwards, so the two
+/// questions the kernel's hottest paths ask — which processor is this, and
+/// which identity does it take critical sections with — are one load off `fs`
+/// rather than an `rdmsr`, the way Linux's `this_cpu_*` reads `gs`. The layout
+/// is `#[repr(C)]` and the offsets the loads use are asserted below against
+/// `offset_of!`, so a field reordered here fails the build instead of
+/// silently reading the wrong word.
+///
+/// # Concurrency
+///
+/// Both words are written once, by the bootstrap processor, before the
+/// processor that reads them runs: `logical_id` when the runtime is
+/// constructed, `identity` when [`build_boot_context`] has settled the
+/// runtimes at their final addresses. Every read is the owning processor
+/// reading its own anchor through its own `IA32_FS_BASE`.
+#[repr(C)]
+pub(crate) struct ProcessorAnchor {
+    /// Offset 0: the identity this processor answers a critical-section
+    /// acquire with — its own runtime address once that runtime is installed,
+    /// or a tagged local-APIC id while it is still bootstrapping. Never zero
+    /// once the anchor is reachable through `IA32_FS_BASE`.
+    identity: AtomicUsize,
+    /// Offset 8: the logical processor index, or
+    /// [`BOOTSTRAP_ANCHOR_LOGICAL_ID`] on the bootstrap anchor.
+    logical_id: u16,
+    _reserved: [u16; 3],
+}
+
+/// Byte offset of [`ProcessorAnchor::identity`] from `IA32_FS_BASE`.
+const ANCHOR_IDENTITY_OFFSET: usize = 0;
+/// Byte offset of [`ProcessorAnchor::logical_id`] from `IA32_FS_BASE`.
+const ANCHOR_LOGICAL_ID_OFFSET: usize = 8;
+
+const _: () = assert!(
+    core::mem::offset_of!(ProcessorRuntime, anchor) == 0,
+    "the processor anchor must sit at IA32_FS_BASE itself"
+);
+const _: () = assert!(
+    core::mem::offset_of!(ProcessorAnchor, identity) == ANCHOR_IDENTITY_OFFSET,
+    "the fs-relative identity load would read the wrong word"
+);
+const _: () = assert!(
+    core::mem::offset_of!(ProcessorAnchor, logical_id) == ANCHOR_LOGICAL_ID_OFFSET,
+    "the fs-relative logical-id load would read the wrong word"
+);
+
 #[repr(C)]
 pub(crate) struct ProcessorRuntime {
-    logical_id: u16,
-    _reserved: u16,
+    anchor: ProcessorAnchor,
     physical_memory_offset: usize,
     tsc_hz: u64,
     pub(crate) wasmtime_tls: WasmtimeTlsSlots,
@@ -76,6 +144,42 @@ pub(crate) struct ProcessorRuntime {
     device_interrupts: Once<&'static DeviceInterruptRoutes>,
     local_timer_ready: AtomicBool,
     started: AtomicBool,
+    /// Set by [`X86PlatformState::publish_wake`] on the *target*
+    /// processor before the wake IPI goes out, and cleared by
+    /// `park_current` under masked interrupts. It closes the window
+    /// between the run loop finding its queue empty and the `hlt` that
+    /// parks: a wake published in that window is observed instead of
+    /// slept through. AArch64 carries the same latch for the same
+    /// reason (`aarch64/src/lib.rs`).
+    wake_pending: AtomicBool,
+}
+
+impl ProcessorAnchor {
+    /// The anchor of a runtime that has not been placed at its final address
+    /// yet; [`publish_anchor_identities`] fills the identity in.
+    const fn new(logical_id: u16) -> Self {
+        Self {
+            identity: AtomicUsize::new(0),
+            logical_id,
+            _reserved: [0; 3],
+        }
+    }
+}
+
+impl ProcessorRuntime {
+    pub(crate) fn logical_id(&self) -> u16 {
+        self.anchor.logical_id
+    }
+
+    /// Takes the pending wake, if there is one.
+    ///
+    /// Called by `park_current` with interrupts masked, so a wake
+    /// published after this returns `false` arrives as a pending
+    /// interrupt that the halt completes on rather than a store this
+    /// processor has already stopped looking at.
+    pub(crate) fn take_wake_pending(&self) -> bool {
+        self.wake_pending.swap(false, Ordering::AcqRel)
+    }
 }
 
 pub(crate) struct BootContext {
@@ -139,8 +243,7 @@ pub(crate) fn build_boot_context(
     processors.push(ProcessorSlot {
         apic_id: processor_info.boot_processor.local_apic_id,
         runtime: ProcessorRuntime {
-            logical_id: 0,
-            _reserved: 0,
+            anchor: ProcessorAnchor::new(0),
             physical_memory_offset,
             tsc_hz,
             wasmtime_tls: WasmtimeTlsSlots::new(),
@@ -152,6 +255,7 @@ pub(crate) fn build_boot_context(
             device_interrupts: Once::new(),
             local_timer_ready: AtomicBool::new(false),
             started: AtomicBool::new(false),
+            wake_pending: AtomicBool::new(false),
         },
         stack_top: 0,
     });
@@ -165,8 +269,7 @@ pub(crate) fn build_boot_context(
         processors.push(ProcessorSlot {
             apic_id: processor.local_apic_id,
             runtime: ProcessorRuntime {
-                logical_id: (index + 1) as u16,
-                _reserved: 0,
+                anchor: ProcessorAnchor::new((index + 1) as u16),
                 physical_memory_offset,
                 tsc_hz,
                 wasmtime_tls: WasmtimeTlsSlots::new(),
@@ -178,6 +281,7 @@ pub(crate) fn build_boot_context(
                 device_interrupts: Once::new(),
                 local_timer_ready: AtomicBool::new(false),
                 started: AtomicBool::new(false),
+                wake_pending: AtomicBool::new(false),
             },
             stack_top: stack + KERNEL_STACK_BYTES,
         });
@@ -195,13 +299,15 @@ pub(crate) fn build_boot_context(
     } else {
         None
     };
+    let mut processors = processors.into_boxed_slice();
+    publish_anchor_identities(&mut processors);
     let platform = Arc::new(X86PlatformState {
         tsc_base,
         tsc_hz,
         physical_memory_offset,
         debug_state,
         watchdog,
-        processors: processors.into_boxed_slice(),
+        processors,
         wakeup_page,
         boot_context: AtomicPtr::new(core::ptr::null_mut()),
     });
@@ -216,45 +322,115 @@ pub(crate) fn build_boot_context(
     context
 }
 
+/// Records each runtime's own address in its anchor, once the boxed slice has
+/// put every runtime where it will stay.
+///
+/// The identity has to be the runtime's final address — it is what
+/// [`current_runtime`] dereferences and what the critical section uses as its
+/// owner key — and a runtime that is still inside the `Vec` is one
+/// `into_boxed_slice` away from moving.
+fn publish_anchor_identities(processors: &mut [ProcessorSlot]) {
+    for slot in processors {
+        let address = core::ptr::from_ref(&slot.runtime) as usize;
+        *slot.runtime.anchor.identity.get_mut() = address;
+    }
+}
+
+/// Points the bootstrap processor's `IA32_FS_BASE` at [`BOOTSTRAP_ANCHOR`].
+///
+/// Called as the first statement of the kernel's Rust entry point, because
+/// every line after it may read `fs:0`. The anchor carries a tagged local-APIC
+/// id rather than a runtime address: the ACPI tables that name this processor,
+/// and the heap the runtimes live in, do not exist yet, and a bootstrapping
+/// identity is exactly what [`ProcessorIdentity`] has for that.
+pub(crate) fn install_bootstrap_anchor() {
+    let identity = ProcessorIdentity::bootstrapping(current_apic_id() as usize);
+    BOOTSTRAP_ANCHOR
+        .identity
+        .store(identity.raw(), Ordering::Relaxed);
+    unsafe {
+        wrmsr(IA32_FS_BASE, core::ptr::from_ref(&BOOTSTRAP_ANCHOR) as u64);
+    }
+}
+
 pub(crate) fn activate_runtime(runtime: &ProcessorRuntime) {
     unsafe {
         wrmsr(IA32_FS_BASE, runtime as *const _ as u64);
     }
-    let bit = processor_bit(usize::from(runtime.logical_id));
+    let bit = processor_bit(usize::from(runtime.logical_id()));
     ONLINE_PROCESSOR_MASK.fetch_or(bit, Ordering::AcqRel);
     runtime.started.store(true, Ordering::Release);
 }
 
+/// The identity word at `fs:0`.
+///
+/// # Safety of the load
+///
+/// `IA32_FS_BASE` addresses a [`ProcessorAnchor`] on every processor from
+/// before its first Rust instruction: the bootstrap processor installs
+/// [`BOOTSTRAP_ANCHOR`] in [`install_bootstrap_anchor`], and an application
+/// processor's runtime address is written by the wakeup trampoline
+/// (`secondary_wakeup.S`) before it calls into Rust at all.
+#[inline(always)]
+fn anchor_identity_word() -> usize {
+    let word: usize;
+    unsafe {
+        core::arch::asm!(
+            "mov {word}, fs:[{offset}]",
+            word = out(reg) word,
+            offset = const ANCHOR_IDENTITY_OFFSET,
+            options(nostack, preserves_flags, readonly),
+        );
+    }
+    word
+}
+
+/// The logical processor index at `fs:8`; see [`anchor_identity_word`] for why
+/// the load is always addressable.
+#[inline(always)]
+fn anchor_logical_id() -> u16 {
+    let logical_id: u16;
+    unsafe {
+        core::arch::asm!(
+            "mov {logical_id:x}, fs:[{offset}]",
+            logical_id = out(reg) logical_id,
+            offset = const ANCHOR_LOGICAL_ID_OFFSET,
+            options(nostack, preserves_flags, readonly),
+        );
+    }
+    logical_id
+}
+
 pub(crate) fn current_runtime() -> &'static ProcessorRuntime {
-    let runtime = current_runtime_address() as *const ProcessorRuntime;
-    assert!(
-        !runtime.is_null(),
-        "x86 processor runtime was not installed before use"
-    );
-    unsafe { &*runtime }
+    let runtime = current_identity()
+        .runtime_address()
+        .unwrap_or_else(|| panic!("x86 processor runtime was not installed before use"));
+    unsafe { &*(runtime.get() as *const ProcessorRuntime) }
 }
 
 pub(crate) fn current_processor() -> ProcessorId {
-    ProcessorId::new(current_runtime().logical_id)
-}
-
-pub(crate) fn current_runtime_address() -> usize {
-    unsafe { rdmsr(IA32_FS_BASE) as usize }
+    let logical_id = anchor_logical_id();
+    assert!(
+        logical_id != BOOTSTRAP_ANCHOR_LOGICAL_ID,
+        "x86 processor runtime was not installed before its logical id was asked for"
+    );
+    ProcessorId::new(logical_id)
 }
 
 /// The identity this processor answers critical-section acquires with.
 ///
 /// A processor takes critical sections from its first instruction, well before
 /// [`activate_runtime`] publishes its runtime address, and several application
-/// processors run that prologue concurrently. The local APIC id is unique and
-/// readable throughout, so it stands in until the runtime address exists;
-/// sharing one value across processors would make a second processor's acquire
-/// look like the first processor's nested re-acquire.
+/// processors run that prologue concurrently. Every processor therefore carries
+/// an anchor from the start: the bootstrap processor's holds a tagged local-APIC
+/// id until its runtime exists, and an application processor's is its runtime,
+/// installed by the wakeup trampoline. Sharing one value across processors would
+/// make a second processor's acquire look like the first processor's nested
+/// re-acquire.
 pub(crate) fn current_identity() -> ProcessorIdentity {
-    match NonZeroUsize::new(current_runtime_address()) {
-        Some(runtime) => ProcessorIdentity::from_raw(runtime),
-        None => ProcessorIdentity::bootstrapping(current_apic_id() as usize),
-    }
+    let word = NonZeroUsize::new(anchor_identity_word())
+        .unwrap_or_else(|| panic!("x86 processor anchor was read before it carried an identity"));
+    ProcessorIdentity::from_raw(word)
 }
 
 /// The local APIC id of the executing processor, from the topology leaf when
@@ -381,8 +557,21 @@ impl X86PlatformState {
             .map(|slot| slot.apic_id)
     }
 
+    /// Publishes a wake for `processor` and answers with the local-APIC
+    /// id to signal, or `None` when no such processor is configured.
+    ///
+    /// The store lands before the caller sends the IPI. A target on its
+    /// way into `park_current` either observes the flag in the masked
+    /// test there, or takes an interrupt that is already pending when
+    /// its halt begins; either way the wake is not lost.
+    pub(crate) fn publish_wake(&self, processor: ProcessorId) -> Option<u32> {
+        let slot = self.processors.get(processor.id() as usize)?;
+        slot.runtime.wake_pending.store(true, Ordering::Release);
+        Some(slot.apic_id)
+    }
+
     pub(crate) fn current_processor(&self) -> ProcessorId {
-        ProcessorId::new(current_runtime().logical_id)
+        current_processor()
     }
 
     pub(crate) fn start_processor(&self, processor: ProcessorId, entry: usize) {
@@ -497,9 +686,9 @@ pub(crate) fn handle_device_interrupt(vector: u8) {
 }
 
 pub(crate) fn handle_wake_interrupt() {
-    // Wake IPI carries no payload; receiving it is sufficient to
-    // bring the processor out of HLT and back into the kernel
-    // run loop. Just ack and return.
+    // The wake carries no payload: returning from HLT is the whole
+    // message, and `park_current` owns the flag the sender published in
+    // `X86PlatformState::publish_wake`. Just ack and return.
     local_apic_eoi();
 }
 
@@ -508,7 +697,7 @@ pub(crate) fn shootdown_tlb_range(start: usize, byte_len: usize) {
         return;
     }
     let online = ONLINE_PROCESSOR_MASK.load(Ordering::Acquire);
-    let current = usize::from(current_runtime().logical_id);
+    let current = usize::from(current_processor().id());
     let current_bit = processor_bit(current);
     let targets = online & !current_bit;
     if targets == 0 {
@@ -531,7 +720,7 @@ pub(crate) fn handle_tlb_shootdown_interrupt() {
     for offset in (0..byte_len).step_by(PAGE_BYTES) {
         tlb::flush(VirtAddr::new((start + offset) as u64));
     }
-    let bit = processor_bit(usize::from(current_runtime().logical_id));
+    let bit = processor_bit(usize::from(current_processor().id()));
     TLB_SHOOTDOWN_ACK_MASK.fetch_or(bit, Ordering::AcqRel);
     local_apic_eoi();
 }

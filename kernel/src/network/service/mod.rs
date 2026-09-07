@@ -34,21 +34,22 @@ use helios_netstack::{
     Icmpv6Packet, InterfaceEventMark, IpAddress, IpCidr, IpProtocol, Ipv4Address, Ipv4Cidr,
     Ipv4Packet, Ipv6Address, Ipv6Cidr, Ipv6Packet, MAX_OUTBOUND_FRAMES, NeighborEntry,
     NetworkInterface as NetworkDevice, OutboundBatchStatus, Route, RouteTable, RxChecksumOffload,
-    RxFrame, SegmentationOffload, Stack, StackConfig, StackError, StackEvent, StackInstant,
-    TcpCloseKind, TcpConnectState, TcpConnectTerminalError, TcpEndpoint, TcpListenBacklog,
-    TcpPacket, TcpReadIntoState, TcpReadState, TcpStackCounters, UdpEgress, UdpEndpoint, UdpPacket,
-    UdpPayload, UdpSocketBinding, UdpSocketError, flow_hash,
+    RxDrain, RxFrame, SegmentationOffload, Stack, StackConfig, StackError, StackEvent,
+    StackInstant, TcpCloseKind, TcpConnectState, TcpConnectTerminalError, TcpEndpoint,
+    TcpListenBacklog, TcpPacket, TcpReadIntoState, TcpReadState, TcpReceiveDiagnostics,
+    TcpStackCounters, UdpEgress, UdpEndpoint, UdpPacket, UdpPayload, UdpSocketBinding,
+    UdpSocketError, flow_hash,
 };
 use spin::{Mutex as SpinMutex, RwLock as SpinRwLock};
 
 use crate::SocketReadiness;
 use crate::{
-    ComponentNetworkService, ComponentRuntimeState, DnsError, DnsErrorKind,
-    Ipv4Address as KernelIpv4Address, Ipv4Cidr as KernelIpv4Cidr, Ipv4Route as KernelIpv4Route,
-    MacAddress, NetworkAdminBackend, NetworkBridgeRequest, NetworkControlError, NetworkErrorDetail,
-    NetworkIpAddress, NetworkPortId, PingError, PingErrorKind, PingReply, ProgressMark,
-    ProgressSignal, RegisteredTcpReadBuffer, TcpAccepted, TcpError, TcpErrorKind, TcpListener,
-    Timer, UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
+    ComponentNetworkService, DnsError, DnsErrorKind, Ipv4Address as KernelIpv4Address,
+    Ipv4Cidr as KernelIpv4Cidr, Ipv4Route as KernelIpv4Route, MacAddress, NetworkAdminBackend,
+    NetworkBridgeRequest, NetworkControlError, NetworkErrorDetail, NetworkIpAddress, NetworkPortId,
+    PingError, PingErrorKind, PingReply, ProfileSink, ProgressMark, ProgressSignal,
+    RegisteredTcpReadBuffer, TcpAccepted, TcpError, TcpErrorKind, TcpListener, Timer, UdpBinding,
+    UdpDatagram, UdpError, UdpErrorKind, UptimeClock,
 };
 use triomphe::Arc;
 
@@ -117,23 +118,24 @@ const NETWORK_POLLING_TCP_READ_ROUNDS: usize = NETWORK_BUSY_POLL_ROUNDS * 2;
 const NETWORK_TCP_READ_BURST_ROUNDS: usize = NETWORK_BUSY_POLL_ROUNDS;
 
 #[derive(Clone)]
-pub struct NetworkService<CpuImpl, Runtime, Device>
+pub struct NetworkService<CpuImpl, Device>
 where
     CpuImpl: Cpu + Clone,
-    Runtime: ComponentRuntimeState + Sync,
     Device: NetworkDevice,
 {
-    inner: Arc<NetworkServiceInner<CpuImpl, Runtime, Device>>,
+    inner: Arc<NetworkServiceInner<CpuImpl, Device>>,
 }
 
-struct NetworkServiceInner<CpuImpl, Runtime, Device>
+struct NetworkServiceInner<CpuImpl, Device>
 where
     CpuImpl: Cpu + Clone,
-    Runtime: ComponentRuntimeState + Sync,
     Device: NetworkDevice,
 {
     cpu: CpuImpl,
-    runtime_state: Runtime,
+    profiles: ProfileSink,
+    /// The kernel's uptime clock, the origin every protocol deadline
+    /// and every profile sample here is measured from.
+    clock: UptimeClock,
     timer: Timer<CpuImpl>,
     device: Device,
     state: NetworkShardSet,
@@ -219,6 +221,13 @@ pub struct NetworkQueueStats {
     /// room for them. Already off the ring when they were refused, so
     /// they are lost and the peer has to retransmit.
     pub rx_refused_frames: u64,
+    /// Receive drains of this pair the driver refused: a mergeable
+    /// chain it cannot reconstruct, a header it cannot read, an offload
+    /// combination the device may not report. One count per refused
+    /// drain, not per frame. The frames the same drain had already
+    /// taken are delivered anyway, so this climbing beside a climbing
+    /// `rx_frames` is a device fault rate rather than a dead pair.
+    pub rx_device_refusals: u64,
     /// Acknowledgements this shard has put on the wire, duplicates
     /// included.
     pub tcp_acks_sent: u64,
@@ -237,6 +246,24 @@ pub struct NetworkQueueStats {
     /// The receive window those connections advertise between them, in
     /// bytes. Zero with connections open is a shut receiver.
     pub tcp_receive_window_bytes: u64,
+    /// In-order payload bytes currently queued across live connections,
+    /// waiting to be read.
+    pub receive_queued_bytes: u64,
+    /// Out-of-order payload bytes currently buffered across live
+    /// connections, waiting on a hole to close.
+    pub out_of_order_queued_bytes: u64,
+    /// Segments this shard received whose payload sat wholly at or
+    /// below receive_next.
+    pub peer_retransmits_received: u64,
+    /// Duplicate acknowledgements this shard requested because an
+    /// out-of-order segment arrived.
+    pub duplicate_acks_requested: u64,
+    /// Times frame reception stalled because this queue pair's receive
+    /// reassembly pool had no free buffers.
+    pub rx_pool_stalls: u64,
+    /// Free reassembly buffers currently available in this queue pair's
+    /// receive pool. Zero if no pool is configured.
+    pub rx_pool_free: u32,
 }
 
 /// Per-shard network counters, one entry per processor.
@@ -260,18 +287,13 @@ impl From<TcpStreamId> for ShardHandle {
     }
 }
 
-#[cfg(feature = "wasmtime-runtime")]
-impl crate::ComponentHostTcpStreamToken for TcpStreamId {
+impl crate::NetworkHandle for TcpStreamId {
     fn into_raw(self) -> u64 {
         u64::from(self.0.get())
     }
 
     fn from_raw(raw: u64) -> Self {
-        let raw = u32::try_from(raw)
-            .unwrap_or_else(|_| panic!("tcp stream handle {raw} does not fit in u32"));
-        let raw =
-            NonZeroU32::new(raw).unwrap_or_else(|| panic!("tcp stream handle must be non-zero"));
-        Self(raw)
+        Self(non_zero_u32_handle("tcp stream", raw))
     }
 }
 
@@ -284,24 +306,19 @@ impl From<TcpListenerId> for u64 {
     }
 }
 
-impl From<TcpListenerId> for ReplicaHandle {
-    fn from(id: TcpListenerId) -> Self {
-        ReplicaHandle::from_raw(id.0)
-    }
-}
-
-#[cfg(feature = "wasmtime-runtime")]
-impl crate::ComponentHostTcpListenerToken for TcpListenerId {
+impl crate::NetworkHandle for TcpListenerId {
     fn into_raw(self) -> u64 {
         u64::from(self.0.get())
     }
 
     fn from_raw(raw: u64) -> Self {
-        let raw = u32::try_from(raw)
-            .unwrap_or_else(|_| panic!("tcp listener handle {raw} does not fit in u32"));
-        let raw =
-            NonZeroU32::new(raw).unwrap_or_else(|| panic!("tcp listener handle must be non-zero"));
-        Self(raw)
+        Self(non_zero_u32_handle("tcp listener", raw))
+    }
+}
+
+impl From<TcpListenerId> for ReplicaHandle {
+    fn from(id: TcpListenerId) -> Self {
+        ReplicaHandle::from_raw(id.0)
     }
 }
 
@@ -314,24 +331,30 @@ impl From<UdpSocketId> for u64 {
     }
 }
 
-impl From<UdpSocketId> for ReplicaHandle {
-    fn from(id: UdpSocketId) -> Self {
-        ReplicaHandle::from_raw(id.0)
-    }
-}
-
-#[cfg(feature = "wasmtime-runtime")]
-impl crate::ComponentHostUdpSocketToken for UdpSocketId {
+impl crate::NetworkHandle for UdpSocketId {
     fn into_raw(self) -> u64 {
         u64::from(self.0.get())
     }
 
     fn from_raw(raw: u64) -> Self {
-        let raw = u32::try_from(raw)
-            .unwrap_or_else(|_| panic!("udp socket handle {raw} does not fit in u32"));
-        let raw =
-            NonZeroU32::new(raw).unwrap_or_else(|| panic!("udp socket handle must be non-zero"));
-        Self(raw)
+        Self(non_zero_u32_handle("udp socket", raw))
+    }
+}
+
+/// The slab index behind a numeric handle name.
+///
+/// Every id these types carry was minted by this service and travels
+/// only inside the kernel, so a value that is not one is a kernel bug
+/// and stops here rather than becoming a handle to some other socket.
+fn non_zero_u32_handle(kind: &str, raw: u64) -> NonZeroU32 {
+    let raw =
+        u32::try_from(raw).unwrap_or_else(|_| panic!("{kind} handle {raw} does not fit in u32"));
+    NonZeroU32::new(raw).unwrap_or_else(|| panic!("{kind} handle must be non-zero"))
+}
+
+impl From<UdpSocketId> for ReplicaHandle {
+    fn from(id: UdpSocketId) -> Self {
+        ReplicaHandle::from_raw(id.0)
     }
 }
 
@@ -615,15 +638,15 @@ const fn next_transaction_id(current: u32) -> u32 {
     if next == 0 { 1 } else { next }
 }
 
-impl<CpuImpl, Runtime, DeviceImpl> NetworkService<CpuImpl, Runtime, DeviceImpl>
+impl<CpuImpl, DeviceImpl> NetworkService<CpuImpl, DeviceImpl>
 where
     CpuImpl: Cpu + Clone,
-    Runtime: ComponentRuntimeState + Sync,
     DeviceImpl: NetworkDevice,
 {
     pub fn new(
         cpu: CpuImpl,
-        runtime_state: Runtime,
+        profiles: ProfileSink,
+        clock: UptimeClock,
         timer: Timer<CpuImpl>,
         device: DeviceImpl,
     ) -> Self {
@@ -677,7 +700,8 @@ where
         Self {
             inner: Arc::new(NetworkServiceInner {
                 cpu,
-                runtime_state,
+                profiles,
+                clock,
                 timer,
                 state,
                 control: NetworkControlPlane::new(),
@@ -713,12 +737,19 @@ where
                         tx_frames,
                         interrupts: self.inner.device.queue_interrupts(idx),
                         rx_refused_frames: self.inner.state.refused_frame_count(idx),
+                        rx_device_refusals: self.inner.state.device_refusal_count(idx),
                         tcp_acks_sent: tcp.acks_sent,
                         tcp_window_updates_sent: tcp.window_updates_sent,
                         tcp_retransmits_sent: tcp.retransmits_sent,
                         tcp_sockets: tcp.sockets,
                         tcp_receive_backpressured_sockets: tcp.receive_backpressured_sockets,
                         tcp_receive_window_bytes: tcp.receive_window_bytes,
+                        receive_queued_bytes: tcp.receive_queued_bytes,
+                        out_of_order_queued_bytes: tcp.out_of_order_queued_bytes,
+                        peer_retransmits_received: tcp.peer_retransmits_received,
+                        duplicate_acks_requested: tcp.duplicate_acks_requested,
+                        rx_pool_stalls: self.inner.device.rx_pool_stalls(idx),
+                        rx_pool_free: self.inner.device.rx_pool_free(idx),
                     }
                 })
                 .collect(),
@@ -1248,20 +1279,32 @@ where
         self.deadline_wait(deadline_nanos).min(interval)
     }
 
+    /// Wakes the packet pump so a segment a synchronous close queued
+    /// leaves on the next executor turn rather than the next protocol
+    /// timer (#232, #231).
+    ///
+    /// The pump parks on the whole shard set, and the executor wakes
+    /// the processor its task lands on, so raising the signal is the
+    /// whole of it.
+    ///
+    /// Private because the kick is not a duty an owner can be asked to
+    /// remember: every close that can queue a segment —
+    /// [`NetworkService::tcp_close`] and
+    /// [`NetworkService::tcp_listener_close`] — ends with it, so a
+    /// `Drop` that retires a handle has nothing left to do (#231).
+    fn wake_packet_pump(&self) {
+        self.inner.state.wake_any_shard();
+    }
+
     fn now_nanos(&self) -> u64 {
-        self.inner
-            .runtime_state
-            .uptime_nanos(self.inner.cpu.now().ticks())
+        self.inner.clock.now_nanos(&self.inner.cpu)
     }
 
     fn profile_start(&self) -> Option<NetworkPerfStart> {
-        self.inner
-            .runtime_state
-            .profiling_enabled()
-            .then(|| NetworkPerfStart {
-                nanos: self.now_nanos(),
-                counters: self.inner.cpu.hardware_perf_counters(),
-            })
+        self.inner.profiles.enabled().then(|| NetworkPerfStart {
+            nanos: self.now_nanos(),
+            counters: self.inner.cpu.hardware_perf_counters(),
+        })
     }
 
     fn record_network_profile(&self, phase: &'static str, start: Option<NetworkPerfStart>) {
@@ -1308,13 +1351,13 @@ where
         };
         let counters = end.counters.delta_since(start.counters);
         let elapsed_nanos = end.nanos.saturating_sub(start.nanos);
-        self.inner.runtime_state.record_profile_stack_parts_nanos(
+        self.inner.profiles.record_profile_stack_parts_nanos(
             crate::ProfileScope::Kernel,
             "kernel;network;",
             phase,
             elapsed_nanos,
         );
-        self.inner.runtime_state.record_perf_metric_parts(
+        self.inner.profiles.record_perf_metric_parts(
             crate::ProfileScope::Kernel,
             "kernel;network;",
             phase,
@@ -1362,6 +1405,257 @@ fn usize_to_u64(value: usize, label: &'static str) -> u64 {
     u64::try_from(value).unwrap_or_else(|_| panic!("{label} does not fit into u64"))
 }
 
+/// A service whose stack already holds one established connection, for
+/// a test that owns that connection from outside this module.
+///
+/// The wiring lives here because all of it does: the shard lock, the
+/// local address, the neighbour entry, the stack socket and the stream
+/// slot are private to `network::service`, while the owners whose
+/// `Drop` retires a stream — a descriptor table, a guest socket
+/// resource — are in `wasmtime_adapter`.
+#[cfg(test)]
+pub(crate) mod fixture {
+    use super::*;
+
+    use alloc::boxed::Box;
+    use core::pin::Pin;
+    use futures_lite::future::{block_on, poll_once};
+    use helios_netstack::{
+        ETHERNET_FRAME_BYTES, NeighborState, TcpFlags, TcpHeader, TransportChecksum,
+    };
+
+    use crate::ProgressChanged;
+
+    /// The packet pump's park, sampled the way the pump takes one: the
+    /// arrival mark first, then the state it means to sleep through.
+    ///
+    /// This is what a close test reads instead of the wire. Whether a
+    /// FIN is on the outbound queue says nothing about when it leaves;
+    /// the pump publishes it, and a pump nobody woke sleeps out its
+    /// bound — the soonest protocol timer, `DHCP_RETRANSMIT_NANOS` away
+    /// on a guest with nothing else to send (#231).
+    pub(crate) struct PumpPark<'a> {
+        parked: Pin<Box<ProgressChanged<'a>>>,
+    }
+
+    impl PumpPark<'_> {
+        /// Whether the park has been released since it was sampled.
+        ///
+        /// Polls it exactly once, as the executor would; a park still
+        /// pending is left armed, so one sample answers both before and
+        /// after the event under test.
+        pub(crate) fn released(&mut self) -> bool {
+            block_on(poll_once(self.parked.as_mut())).is_some()
+        }
+    }
+
+    /// One TCP segment the stack put on its outbound queue, reduced to
+    /// what a close test asks about.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) struct FixtureSegment {
+        pub(crate) flags: TcpFlags,
+        pub(crate) sequence: u32,
+        pub(crate) acknowledgement: u32,
+    }
+
+    pub(crate) struct EstablishedTcpFixture {
+        service: NetworkService<
+            crate::test_support::TestCpu,
+            crate::test_support::RecordingNetworkInterface,
+        >,
+        stream: TcpStreamId,
+    }
+
+    impl EstablishedTcpFixture {
+        const LOCAL: Ipv4Address = Ipv4Address::new([192, 0, 2, 10]);
+        const PEER: Ipv4Address = Ipv4Address::new([192, 0, 2, 20]);
+        const LOCAL_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 1];
+        const PEER_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 2];
+        const LOCAL_PORT: u16 = 49_152;
+        const PEER_PORT: u16 = 80;
+        /// This side's initial send sequence, so a test can predict the
+        /// sequence its FIN or its reset carries.
+        pub(crate) const LOCAL_SEQUENCE: u32 = 7;
+        /// The peer's, for the acknowledgement they carry back.
+        pub(crate) const PEER_SEQUENCE: u32 = 100;
+
+        /// A connection in `ESTABLISHED`, with the handshake's own
+        /// frames already drained so the next segment on the wire is
+        /// whatever the test produces.
+        pub(crate) fn new() -> Self {
+            let cpu = crate::test_support::TestCpu::without_entropy();
+            let service = NetworkService::new(
+                cpu,
+                crate::test_support::test_profile_sink(),
+                crate::test_support::test_uptime_clock(),
+                Timer::new(cpu),
+                crate::test_support::RecordingNetworkInterface::new(1),
+            );
+            let fixture = Self {
+                service,
+                stream: {
+                    // Placeholder: replaced below once the shard has
+                    // the socket. `TcpStreamId` is non-zero, so the
+                    // stream slot has to come from the shard itself.
+                    TcpStreamId(NonZeroU32::new(1).expect("one is non-zero"))
+                },
+            };
+            let stream = {
+                let mut shard = fixture
+                    .service
+                    .inner
+                    .state
+                    .shard_at(DEFAULT_SHARD_IDX)
+                    .lock();
+                shard.stack.add_ipv4_address(Ipv4Cidr::new(Self::LOCAL, 24));
+                shard.stack.learn_neighbor(NeighborEntry {
+                    ip: IpAddress::Ipv4(Self::PEER),
+                    mac: Self::PEER_MAC,
+                    state: NeighborState::Reachable,
+                    updated_at: StackInstant::from_nanos(0),
+                });
+                fixture.service.inner.control.publish_from_shard(&shard);
+                let socket = shard
+                    .stack
+                    .open_tcp_connect(
+                        TcpEndpoint {
+                            address: IpAddress::Ipv4(Self::LOCAL),
+                            port: Self::LOCAL_PORT,
+                        },
+                        TcpEndpoint {
+                            address: IpAddress::Ipv4(Self::PEER),
+                            port: Self::PEER_PORT,
+                        },
+                        Self::LOCAL_SEQUENCE,
+                    )
+                    .expect("the fixture connection should allocate a socket");
+                shard.insert_tcp_stream(socket)
+            };
+            let fixture = Self { stream, ..fixture };
+            fixture.deliver(
+                TcpHeader {
+                    source_port: Self::PEER_PORT,
+                    destination_port: Self::LOCAL_PORT,
+                    sequence: Self::PEER_SEQUENCE,
+                    acknowledgement: Self::LOCAL_SEQUENCE.wrapping_add(1),
+                    flags: TcpFlags::SYN.union(TcpFlags::ACK),
+                    window_size: u16::MAX,
+                },
+                &[],
+            );
+            let _ = fixture.drive();
+            fixture
+        }
+
+        /// The service a component-host owner holds.
+        pub(crate) fn service(
+            &self,
+        ) -> NetworkService<
+            crate::test_support::TestCpu,
+            crate::test_support::RecordingNetworkInterface,
+        > {
+            self.service.clone()
+        }
+
+        /// The stream handle a component-host owner holds.
+        pub(crate) fn stream(&self) -> TcpStreamId {
+            self.stream
+        }
+
+        /// Samples the park the packet pump would be sitting in, for a
+        /// test that asks when a close's segment leaves rather than
+        /// whether it was queued.
+        pub(crate) fn pump_park(&self) -> PumpPark<'_> {
+            let wait = self.service.inner.state.any_shard_wait();
+            PumpPark {
+                parked: Box::pin(
+                    self.service
+                        .inner
+                        .state
+                        .arrival_for(wait.target)
+                        .changed(wait.mark),
+                ),
+            }
+        }
+
+        /// Hands the peer's segment to the stack.
+        pub(crate) fn deliver(&self, header: TcpHeader, payload: &[u8]) {
+            let mut frame = [0u8; ETHERNET_FRAME_BYTES];
+            let mut offset = EthernetFrame::encode_header(
+                &mut frame,
+                Self::LOCAL_MAC,
+                Self::PEER_MAC,
+                EthernetProtocol::Ipv4,
+            )
+            .expect("the fixture Ethernet header should fit");
+            let tcp_start = offset + Ipv4Packet::MIN_HEADER_LEN;
+            let tcp_len = TcpPacket::encode(
+                &mut frame[tcp_start..],
+                IpAddress::Ipv4(Self::PEER),
+                IpAddress::Ipv4(Self::LOCAL),
+                header,
+                payload,
+                TransportChecksum::Software,
+            )
+            .expect("the fixture TCP segment should fit");
+            offset += Ipv4Packet::encode_header(
+                &mut frame[offset..],
+                Self::PEER,
+                Self::LOCAL,
+                IpProtocol::Tcp,
+                tcp_len,
+                1,
+                64,
+            )
+            .expect("the fixture IPv4 header should fit");
+            self.service
+                .inner
+                .state
+                .shard_at(DEFAULT_SHARD_IDX)
+                .lock()
+                .stack
+                .receive_frame(
+                    &frame[..offset + tcp_len],
+                    StackInstant::from_nanos(self.service.now_nanos()),
+                )
+                .expect("the fixture segment should be accepted");
+        }
+
+        /// Drives the stack once and reports every TCP segment it
+        /// queued, which is what a close test reads instead of the
+        /// state the stack was left in.
+        pub(crate) fn drive(&self) -> Vec<FixtureSegment> {
+            let now = StackInstant::from_nanos(self.service.now_nanos());
+            let mut shard = self.service.inner.state.shard_at(DEFAULT_SHARD_IDX).lock();
+            shard
+                .stack
+                .drive_tcp(now)
+                .expect("the fixture stack should drive");
+            let mut segments = Vec::new();
+            while let Some(frame) = shard.stack.take_outbound() {
+                let Some(ethernet) = EthernetFrame::parse(frame.as_slice()) else {
+                    continue;
+                };
+                let Some(ipv4) = Ipv4Packet::parse(ethernet.payload) else {
+                    continue;
+                };
+                if ipv4.protocol != IpProtocol::Tcp {
+                    continue;
+                }
+                let Some(tcp) = TcpPacket::parse(ipv4.payload) else {
+                    continue;
+                };
+                segments.push(FixtureSegment {
+                    flags: tcp.flags,
+                    sequence: tcp.sequence,
+                    acknowledgement: tcp.acknowledgement,
+                });
+            }
+            segments
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// The peer's hardware address in the frames these tests build.
@@ -1381,9 +1675,7 @@ mod tests {
     use futures_lite::future::{block_on, poll_once};
     use helios_netstack::RxFrame;
 
-    use crate::test_support::{
-        RecordingNetworkInterface, RecordingSmpCpu, TestCpu, TestRuntimeState,
-    };
+    use crate::test_support::{RecordingNetworkInterface, RecordingSmpCpu, TestCpu};
 
     use super::{
         AddressAttemptError, DhcpClientState, HandleSlab, NETWORK_BUSY_POLL_ROUNDS,
@@ -2966,16 +3258,21 @@ mod tests {
 
     /// A service over an interface that reports events and moves no
     /// frames, which is all the wait needs.
-    fn test_network_service()
-    -> super::NetworkService<TestCpu, TestRuntimeState, RecordingNetworkInterface> {
+    fn test_network_service() -> super::NetworkService<TestCpu, RecordingNetworkInterface> {
         test_network_service_on(RecordingNetworkInterface::new(1))
     }
 
     fn test_network_service_on(
         device: RecordingNetworkInterface,
-    ) -> super::NetworkService<TestCpu, TestRuntimeState, RecordingNetworkInterface> {
+    ) -> super::NetworkService<TestCpu, RecordingNetworkInterface> {
         let cpu = TestCpu::without_entropy();
-        super::NetworkService::new(cpu, TestRuntimeState, crate::Timer::new(cpu), device)
+        super::NetworkService::new(
+            cpu,
+            crate::test_support::test_profile_sink(),
+            crate::test_support::test_uptime_clock(),
+            crate::Timer::new(cpu),
+            device,
+        )
     }
 
     /// #131: the interface event a park races has to be marked before
@@ -3212,6 +3509,62 @@ mod tests {
         }
     }
 
+    /// A listener retired the way its owner retires it gives its port
+    /// back, and the next listen can take it.
+    ///
+    /// `tcp_listener_close` is what every host boundary's `Drop` calls,
+    /// and before #191 there was nothing for those drops to call: the
+    /// listener stayed in every shard for the rest of the boot with its
+    /// slab slot held and its port bound, and `is_tcp_local_port_free`
+    /// consults exactly that list, so a leaked listener also refused
+    /// the next bind.
+    #[test]
+    fn a_retired_listener_gives_its_port_back_to_the_next_listen() {
+        let service = test_network_service();
+        let local_address = NetworkIpAddress::Ipv4(crate::Ipv4Address::new([0, 0, 0, 0]));
+        let listener = block_on(service.tcp_listen(
+            local_address,
+            8080,
+            4,
+            helios_netstack::DEFAULT_HOP_LIMIT,
+        ))
+        .expect("the first listen should take port 8080");
+        assert_eq!(listener.local_port, 8080);
+        for shard_idx in 0..service.inner.state.shard_count() {
+            assert!(
+                !service
+                    .inner
+                    .state
+                    .shard_at(shard_idx)
+                    .lock()
+                    .is_tcp_local_port_free(8080),
+                "a live listener holds its port on every shard"
+            );
+        }
+
+        service.tcp_listener_close(listener.listener);
+
+        for shard_idx in 0..service.inner.state.shard_count() {
+            assert!(
+                service
+                    .inner
+                    .state
+                    .shard_at(shard_idx)
+                    .lock()
+                    .is_tcp_local_port_free(8080),
+                "a retired listener releases its port on every shard"
+            );
+        }
+        let second = block_on(service.tcp_listen(
+            local_address,
+            8080,
+            4,
+            helios_netstack::DEFAULT_HOP_LIMIT,
+        ))
+        .expect("the port the first listener held should bind again");
+        assert_eq!(second.local_port, 8080);
+    }
+
     /// A listener exists on every shard, and `accept` starts at the
     /// caller's own shard and then visits the rest, so a connection the
     /// receive path placed on a foreign shard is never stranded.
@@ -3242,7 +3595,7 @@ mod tests {
                         helios_netstack::DEFAULT_HOP_LIMIT,
                     )
                 },
-                NetworkShard::remove_tcp_listener,
+                |shard, slot| shard.remove_tcp_listener(slot, StackInstant::from_nanos(0)),
             )
             .expect("the listener should install on every shard");
 
@@ -3954,6 +4307,46 @@ mod tests {
         assert_eq!(arp_reply.operation, ArpOperation::Reply);
         assert_eq!(arp_reply.sender_protocol, local);
         assert_eq!(arp_reply.target_protocol, peer);
+    }
+
+    /// #209. A drain the driver refuses partway still delivers the
+    /// frames it had already taken, and the refusal is counted.
+    ///
+    /// Those frames are off the ring by the time the refusal happens
+    /// and no used entry can be put back, so a poll that reported the
+    /// error on its own lost a whole batch of good frames for one
+    /// malformed chain. Nothing counted them either, so the statistics
+    /// said only that the shard had stopped moving frames — the same
+    /// shape as a receiver that is merely slow.
+    #[test]
+    fn a_refused_drain_delivers_the_frames_it_took_and_counts_the_refusal() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let service = test_network_service();
+        let device = service.inner.device.clone();
+
+        let (arp, arp_len) = arp_request_frame(peer, local);
+        device.deliver_on(0, &arp[..arp_len]);
+        device.deliver_on(0, &arp[..arp_len]);
+        // The malformed chain arrives behind them, inside the same
+        // batch the drain is filling.
+        device.refuse_on(0, helios_hal::io::IoError::DeviceFault);
+
+        let Err(error) = block_on(service.poll_network_receive_once(NetworkPollSource::Pump))
+        else {
+            panic!("the refusal is still reported to the caller");
+        };
+        assert_eq!(error, helios_hal::io::IoError::DeviceFault);
+
+        let queue = service.stats().queues[super::DEFAULT_SHARD_IDX];
+        assert_eq!(
+            queue.rx_frames, 2,
+            "the frames the refused drain had already taken must reach their shard"
+        );
+        assert_eq!(
+            queue.rx_device_refusals, 1,
+            "the refusal must be counted where the loss can be seen"
+        );
     }
 
     #[test]

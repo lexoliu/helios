@@ -145,9 +145,18 @@ A capture needs a single-queue netdev. QEMU attaches a netfilter to one
 queue, and a netdev serving more rejects the filter with `multiqueue is
 not supported` before the guest boots, so the inspector refuses
 `--net-pcap` beside more than one queue pair rather than letting QEMU
-die of it. On `tap`, capture with `--net-queues 1` and take the
-multi-queue measurement separately; that is also why the CI bench lane,
-whose entire point is a multi-queue tap, takes no capture.
+die of it. On `tap`, provision a separate capture interface using
+`vm net-setup --net-backend tap --net-queues 1` with its interface and
+bridge names, then capture with `--net-queues 1`. QEMU opens a single
+queue without `IFF_MULTI_QUEUE`, so a TAP created for multi-queue use
+cannot serve this request; the inspector rejects mismatched interfaces
+before boot instead of recreating them.
+
+An explicit TAP `--net-pcap` request uses `vhost=off`: QEMU 8.2's
+`filter-dump` cannot attach to a vhost-backed netdev. Normal runs remain
+on `vhost=on`. Capture runs are diagnostic only, not network performance
+evidence. Take the multi-queue vhost-net measurement separately; that is
+also why the CI performance lane takes no capture.
 
 `workload-bench.sh` adds `--net-pcap` whenever
 `HELIOS_WORKLOAD_BENCH_NET_PCAP` is set and a runtime directory was

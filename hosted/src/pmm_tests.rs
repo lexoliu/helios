@@ -2,8 +2,9 @@
 //!
 //! Hosted-side because the kernel crate's lib-test compilation has
 //! pre-existing breakage in unrelated WASI binding code. The frame
-//! allocator only depends on `buddy_system_allocator::LockedHeap`,
-//! which works the same way in any environment.
+//! allocator only depends on `buddy_system_allocator::Heap` behind the
+//! kernel's interrupt-masking lock, which works the same way in any
+//! environment.
 
 #![cfg(test)]
 

@@ -54,6 +54,45 @@ where
     }
 }
 
+/// The kernel's uptime clock, as a value a subsystem can carry.
+///
+/// Uptime is one clock with one origin, and a subsystem that needs to
+/// read it without holding the runtime state carries this rather than
+/// sampling an origin of its own. [`crate::RuntimeState`] mints it from
+/// the boot tick and timebase every other uptime reading uses, so a
+/// timestamp the network service takes and one the runtime takes are
+/// the same number.
+///
+/// Reading is lock-free and safe from any processor: the clock is two
+/// immutable words and the tick comes from the caller's own [`Cpu`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UptimeClock {
+    boot_ticks: u64,
+    timebase_frequency: u64,
+}
+
+impl UptimeClock {
+    pub const fn new(boot_ticks: u64, timebase_frequency: u64) -> Self {
+        Self {
+            boot_ticks,
+            timebase_frequency,
+        }
+    }
+
+    /// Nanoseconds of uptime at a tick reading the caller already has.
+    pub fn nanos_at(&self, current_ticks: u64) -> u64 {
+        ticks_to_nanos(
+            current_ticks.saturating_sub(self.boot_ticks),
+            self.timebase_frequency,
+        )
+    }
+
+    /// Nanoseconds of uptime now, on the calling processor.
+    pub fn now_nanos<CpuImpl: Cpu>(&self, cpu: &CpuImpl) -> u64 {
+        self.nanos_at(cpu.now().ticks())
+    }
+}
+
 /// The offset that carries the monotonic clock onto the wall.
 ///
 /// Adding it to a monotonic reading yields nanoseconds since the Unix
@@ -203,6 +242,14 @@ mod tests {
             None
         }
 
+        /// A test runtime publishes no devices; the registry is empty
+        /// and every claim through it reports the device is not there.
+        fn device_grants(&self) -> &crate::device::DeviceGrantRegistry {
+            static EMPTY: crate::device::DeviceGrantRegistry =
+                crate::device::DeviceGrantRegistry::new();
+            &EMPTY
+        }
+
         fn profiling_enabled(&self) -> bool {
             false
         }
@@ -218,6 +265,15 @@ mod tests {
             _: &str,
             _: crate::PerfSample,
         ) {
+        }
+
+        /// The clock fixture has no network service, and nothing it
+        /// drives opens a socket.
+        fn retire_network_handles(&self, retired: &crate::SocketRetirementQueue) {
+            assert!(
+                retired.is_empty(),
+                "the clock test state was handed a socket to retire"
+            );
         }
     }
 

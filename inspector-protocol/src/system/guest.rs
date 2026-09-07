@@ -432,6 +432,22 @@ fn convert_sample(sample: host_stats::Sample) -> stats::Sample {
         swap: sample.swap.map(convert_swap),
         host_share: sample.host_share.map(convert_host_share_cache),
         network: sample.network.map(convert_network),
+        devices: sample.devices.into_iter().map(convert_device).collect(),
+    }
+}
+
+fn convert_device(device: host_stats::GrantedDevice) -> stats::GrantedDevice {
+    stats::GrantedDevice {
+        name: device.name,
+        region_bytes: device.region_bytes,
+        regions: device.regions,
+        interrupts: device.interrupts,
+        dma_budget_bytes: device.dma_budget_bytes,
+        confined: device.confined,
+        claimed: device.claimed,
+        interrupts_forwarded: device.interrupts_forwarded,
+        interrupts_coalesced: device.interrupts_coalesced,
+        masked_sources: device.masked_sources,
     }
 }
 
@@ -458,12 +474,19 @@ fn convert_network(network: host_stats::Network) -> stats::Network {
                 tx_frames: queue.tx_frames,
                 interrupts: queue.interrupts,
                 rx_refused_frames: queue.rx_refused_frames,
+                rx_device_refusals: queue.rx_device_refusals,
                 tcp_acks_sent: queue.tcp_acks_sent,
                 tcp_window_updates_sent: queue.tcp_window_updates_sent,
                 tcp_retransmits_sent: queue.tcp_retransmits_sent,
                 tcp_sockets: queue.tcp_sockets,
                 tcp_receive_backpressured_sockets: queue.tcp_receive_backpressured_sockets,
                 tcp_receive_window_bytes: queue.tcp_receive_window_bytes,
+                receive_queued_bytes: queue.receive_queued_bytes,
+                out_of_order_queued_bytes: queue.out_of_order_queued_bytes,
+                peer_retransmits_received: queue.peer_retransmits_received,
+                duplicate_acks_requested: queue.duplicate_acks_requested,
+                rx_pool_stalls: queue.rx_pool_stalls,
+                rx_pool_free: queue.rx_pool_free,
             })
             .collect(),
     }

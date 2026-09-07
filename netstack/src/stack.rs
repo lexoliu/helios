@@ -6,7 +6,7 @@ use core::fmt;
 use core::mem::MaybeUninit;
 
 use arrayvec::ArrayVec;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use heapless::Deque;
 use heapless::binary_heap::{BinaryHeap, Min};
 
@@ -16,11 +16,12 @@ use crate::{
     Icmpv4Packet, Icmpv6DestinationUnreachableCode, Icmpv6Packet, IpAddress, IpCidr, Ipv4Address,
     Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6Cidr, Ipv6DnsServers, Ipv6Packet,
     Ipv6RouterConfiguration, Ipv6Scope, NeighborDiscovery, PacketBuffer, RxChecksumReport, RxFrame,
-    RxFrameOffload, SegmentationOffload, StackError, TcpCloseKind, TcpEndpoint, TcpFlags,
-    TcpHeader, TcpHeaderOptions, TcpPacket, TcpReceiveBuffer, TcpSegmentBudget, TcpSocket,
-    TcpTransmitSegment, TransportChecksum, TxChecksum, TxFrameRef, TxSegmentation, UdpPacket,
-    icmpv6_checksum_valid, interpret_router_advertisement, ipv4_checksum,
-    partial_transport_checksum_completes, tcp_checksum_valid, udp_checksum_valid,
+    RxFrameOffload, SegmentationOffload, StackError, TcpCloseAction, TcpCloseKind, TcpEndpoint,
+    TcpFlags, TcpHeader, TcpHeaderOptions, TcpPacket, TcpReceiveBuffer, TcpReceiveCounters,
+    TcpReceiveDiagnostics, TcpSegmentBudget, TcpSocket, TcpTransmitSegment, TransportChecksum,
+    TxChecksum, TxFrameRef, TxSegmentation, UdpPacket, icmpv6_checksum_valid,
+    interpret_router_advertisement, ipv4_checksum, partial_transport_checksum_completes,
+    tcp_checksum_valid, udp_checksum_valid,
 };
 
 pub const MAX_ROUTES: usize = 32;
@@ -563,11 +564,21 @@ impl Ipv4MulticastMembership {
     }
 }
 
+/// A received datagram's bytes, owned by the queue that holds them.
+///
+/// Small datagrams live in the inline block and cost no allocation at
+/// all; larger ones get a `BytesMut` this payload owns outright, never
+/// the `Bytes` of the frame it was parsed out of. Every payload the
+/// receive path builds is a slice of the frame the network driver handed
+/// up, so keeping that slice keeps one of the driver's receive buffers
+/// for as long as the datagram sits unread — up to [`MAX_UDP_RX`] of
+/// them, which is enough to starve the driver's reassembly pool and stop
+/// it taking frames off its ring.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UdpPayload {
     inline: [u8; UDP_INLINE_PAYLOAD_BYTES],
     inline_len: u16,
-    heap: Option<Bytes>,
+    heap: Option<BytesMut>,
 }
 
 impl UdpPayload {
@@ -578,12 +589,18 @@ impl UdpPayload {
         Self {
             inline: [0; UDP_INLINE_PAYLOAD_BYTES],
             inline_len: 0,
-            heap: Some(Bytes::copy_from_slice(bytes)),
+            heap: Some(BytesMut::from(bytes)),
         }
     }
 
-    /// Keeps small datagrams inline and retains large owning frame slices
-    /// without re-copying their payload bytes.
+    /// Keeps small datagrams inline and takes larger ones out of the
+    /// frame they arrived in.
+    ///
+    /// `try_into_mut` keeps a buffer the caller already owns outright and
+    /// copies anything shared. A frame from a network driver is built
+    /// with `Bytes::from_owner`, which never reports itself unique, so a
+    /// slice of one is always copied and the driver's buffer is released
+    /// as soon as the frame is dropped.
     pub fn from_bytes(bytes: Bytes) -> Self {
         if bytes.len() <= UDP_INLINE_PAYLOAD_BYTES {
             return Self::inline_from_slice(bytes.as_ref());
@@ -591,7 +608,11 @@ impl UdpPayload {
         Self {
             inline: [0; UDP_INLINE_PAYLOAD_BYTES],
             inline_len: 0,
-            heap: Some(bytes),
+            heap: Some(
+                bytes
+                    .try_into_mut()
+                    .unwrap_or_else(|shared| BytesMut::from(shared.as_ref())),
+            ),
         }
     }
 
@@ -616,30 +637,21 @@ impl UdpPayload {
 
     /// Converts the payload to reference-counted bytes for outer APIs.
     pub fn into_bytes(self) -> Bytes {
-        self.heap
-            .unwrap_or_else(|| Bytes::copy_from_slice(&self.inline[..usize::from(self.inline_len)]))
+        match self.heap {
+            Some(bytes) => bytes.freeze(),
+            None => Bytes::copy_from_slice(&self.inline[..usize::from(self.inline_len)]),
+        }
     }
 
     /// Converts at most `max_bytes` into reference-counted bytes.
     pub fn into_limited_bytes(self, max_bytes: usize) -> Bytes {
         let len = self.len().min(max_bytes);
         match self.heap {
-            Some(bytes) => bytes.slice(..len),
+            Some(mut bytes) => {
+                bytes.truncate(len);
+                bytes.freeze()
+            }
             None => Bytes::copy_from_slice(&self.inline[..len]),
-        }
-    }
-
-    #[cfg(test)]
-    fn frame_slice_offset_for_test(&self, frame: &Bytes) -> Option<usize> {
-        let payload = self.heap.as_ref()?;
-        let frame_start = frame.as_ptr() as usize;
-        let frame_end = frame_start + frame.len();
-        let payload_start = payload.as_ptr() as usize;
-        let payload_end = payload_start + payload.len();
-        if payload_start >= frame_start && payload_end <= frame_end {
-            Some(payload_start - frame_start)
-        } else {
-            None
         }
     }
 }
@@ -2107,6 +2119,9 @@ where
     tcp_accept: Deque<TcpQueuedAccept, MAX_TCP_ACCEPT>,
     tcp_listener_queues: TcpListenerQueues,
     tcp_listener_children: [Option<SocketId>; MAX_TCP_SOCKETS],
+    /// Connections the stack owns because their owner let go while they
+    /// were still finishing an orderly close.
+    tcp_orphans: TcpOrphans,
     tcp: TcpSocketSlab<C>,
     tcp_timers: BinaryHeap<TcpTimerEntry, Min, MAX_TCP_TIMER_ENTRIES>,
     tcp_timer_generations: [u32; MAX_TCP_SOCKETS],
@@ -2114,6 +2129,84 @@ where
     tcp_receive_backpressured: [bool; MAX_TCP_SOCKETS],
     tcp_receive_backpressured_count: usize,
     tcp_transmit_counters: TcpTransmitCounters,
+    tcp_receive_counters: TcpReceiveCounters,
+}
+
+/// The socket slots the stack is finishing on its own account.
+///
+/// A connection whose owner closed it while it still had a FIN sequence
+/// to run has no owner left to read its events, drain its receive queue
+/// or free its slot, so the stack keeps it and does all three itself.
+/// Membership ends exactly when the socket reaches [`TcpState::Closed`]
+/// and its slot, its endpoint and its timers go back to the slab.
+///
+/// Concurrency: this is `Stack` state, and a `Stack` belongs to one
+/// shard, mutated behind `&mut self` by whichever processor holds that
+/// shard. No operation here is reachable from another processor, so
+/// nothing is atomic and nothing is padded. The set is a list rather
+/// than a slot-wide bitmap because it is walked once per
+/// [`Stack::drive_tcp`] and is empty on almost every walk.
+#[derive(Clone, Debug)]
+struct TcpOrphans {
+    indices: ArrayVec<usize, MAX_TCP_SOCKETS>,
+}
+
+impl TcpOrphans {
+    const fn new() -> Self {
+        Self {
+            indices: ArrayVec::new_const(),
+        }
+    }
+
+    fn adopt(&mut self, index: usize) {
+        if self.contains(index) {
+            return;
+        }
+        self.indices
+            .try_push(index)
+            .unwrap_or_else(|_| panic!("TCP orphan set cannot exceed the socket slab"));
+    }
+
+    fn release(&mut self, index: usize) {
+        if let Some(position) = self.indices.iter().position(|orphan| *orphan == index) {
+            let _ = self.indices.swap_remove(position);
+        }
+    }
+
+    fn contains(&self, index: usize) -> bool {
+        self.indices.contains(&index)
+    }
+
+    fn len(&self) -> usize {
+        self.indices.len()
+    }
+
+    /// The slot at `position` in the walk order, which
+    /// [`TcpOrphans::release`] rearranges: a sweep that reclaims the
+    /// orphan at `position` re-reads the same position rather than
+    /// advancing past the one swapped into it.
+    fn at(&self, position: usize) -> usize {
+        *self
+            .indices
+            .get(position)
+            .unwrap_or_else(|| panic!("TCP orphan position {position} is outside the orphan set"))
+    }
+}
+
+/// What [`Stack::close_tcp_socket`] did with the socket it was handed.
+///
+/// The distinction matters to the caller only as bookkeeping: the
+/// socket id is invalid either way from the moment the call returns,
+/// because either the slot is already free or the stack owns what is
+/// left of the connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TcpCloseOutcome {
+    /// The connection is over and its slot, port and timers are free.
+    Reclaimed,
+    /// The connection is running out its FIN sequence under the stack's
+    /// ownership, and will be reclaimed when it reaches
+    /// [`TcpState::Closed`].
+    Finishing,
 }
 
 /// What this stack has put on the wire on behalf of its TCP sockets.
@@ -2152,6 +2245,18 @@ pub struct TcpStackCounters {
     /// The receive window those connections advertise between them, in
     /// bytes. Zero with a nonzero `sockets` is a shut receiver.
     pub receive_window_bytes: u64,
+    /// In-order data waiting in receive queues that user space has not
+    /// read yet, in bytes, summed across connections on this shard.
+    pub receive_queued_bytes: u64,
+    /// Data held in out-of-order reassembly queues across connections on
+    /// this shard, in bytes.
+    pub out_of_order_queued_bytes: u64,
+    /// Segments received whose whole payload lies at or below
+    /// `receive_next`, indicating the peer resent data it had already
+    /// sent.
+    pub peer_retransmits_received: u64,
+    /// Duplicate acknowledgements requested by connections on this shard.
+    pub duplicate_acks_requested: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -2403,6 +2508,7 @@ where
             tcp_accept: Deque::new(),
             tcp_listener_queues: TcpListenerQueues::new(),
             tcp_listener_children: [None; MAX_TCP_SOCKETS],
+            tcp_orphans: TcpOrphans::new(),
             tcp: TcpSocketSlab::new(),
             tcp_timers: BinaryHeap::new(),
             tcp_timer_generations: [0; MAX_TCP_SOCKETS],
@@ -2410,6 +2516,7 @@ where
             tcp_receive_backpressured: [false; MAX_TCP_SOCKETS],
             tcp_receive_backpressured_count: 0,
             tcp_transmit_counters: TcpTransmitCounters::default(),
+            tcp_receive_counters: TcpReceiveCounters::default(),
         }
     }
 
@@ -2417,6 +2524,8 @@ where
     pub fn tcp_counters(&self) -> TcpStackCounters {
         let mut sockets = 0u32;
         let mut receive_window_bytes = 0u64;
+        let mut receive_queued_bytes = 0u64;
+        let mut out_of_order_queued_bytes = 0u64;
         for active_slot in 0..self.tcp.active_len() {
             let index = self.tcp.active_index(active_slot);
             let Some(socket) = self.tcp.get(index) else {
@@ -2425,6 +2534,10 @@ where
             sockets += 1;
             receive_window_bytes = receive_window_bytes
                 .saturating_add(u64::from(socket.advertised_receive_window_bytes()));
+            receive_queued_bytes =
+                receive_queued_bytes.saturating_add(socket.receive_queued_bytes() as u64);
+            out_of_order_queued_bytes =
+                out_of_order_queued_bytes.saturating_add(socket.out_of_order_queued_bytes() as u64);
         }
         TcpStackCounters {
             acks_sent: self.tcp_transmit_counters.acks_sent,
@@ -2433,6 +2546,10 @@ where
             sockets,
             receive_backpressured_sockets: self.tcp_receive_backpressured_count as u32,
             receive_window_bytes,
+            receive_queued_bytes,
+            out_of_order_queued_bytes,
+            peer_retransmits_received: self.tcp_receive_counters.peer_retransmits_received,
+            duplicate_acks_requested: self.tcp_receive_counters.duplicate_acks_requested,
         }
     }
 
@@ -3135,6 +3252,20 @@ where
         })
     }
 
+    /// The receive state of one socket, for a caller that has to report
+    /// why it made no progress.
+    ///
+    /// Read-only, and taken while the socket is still alive: the
+    /// per-shard counters are folded in after a socket closes and so
+    /// cannot describe the queues a stalled reader was waiting on
+    /// (#166).
+    pub fn tcp_receive_diagnostics(
+        &self,
+        socket: SocketId,
+    ) -> Result<TcpReceiveDiagnostics, StackError> {
+        Ok(self.tcp_socket(socket)?.receive_diagnostics())
+    }
+
     /// Report whether `listener` has a completed connection waiting in the
     /// accept queue, without dequeuing it.
     ///
@@ -3343,12 +3474,18 @@ where
                 if self.tcp.terminal_error(index).is_none() {
                     self.retire_closed_tcp_socket(index);
                 }
-                Self::push_event_into(
-                    &mut self.events,
-                    StackEvent::TcpClosed {
-                        socket: socket_id(index),
-                    },
-                );
+                // An orphan's former owner is gone and its slot is
+                // about to be handed to another connection, so an event
+                // naming it would be read by whoever holds that slot
+                // next. The sweep below is the whole of its retirement.
+                if !self.tcp_orphans.contains(index) {
+                    Self::push_event_into(
+                        &mut self.events,
+                        StackEvent::TcpClosed {
+                            socket: socket_id(index),
+                        },
+                    );
+                }
             }
             self.schedule_tcp_timer_deadline(index, deadline);
         }
@@ -3481,6 +3618,7 @@ where
             )?;
             self.schedule_tcp_timer(index);
         }
+        self.sweep_tcp_orphans(now);
         Ok(())
     }
 
@@ -3504,12 +3642,23 @@ where
         Ok(None)
     }
 
-    pub fn remove_tcp_socket(&mut self, socket: SocketId) -> Result<(), StackError> {
+    /// Retires `socket` and everything that hung off it.
+    ///
+    /// `now` stamps the resets a listener owes: every connection its
+    /// backlog still holds — handshaken, queued, and never accepted —
+    /// is reset before it is dropped, because the peer completed a
+    /// handshake with a port that is about to stop existing. Removing a
+    /// connection queues nothing, so `now` goes unused on that path.
+    pub fn remove_tcp_socket(
+        &mut self,
+        socket: SocketId,
+        now: StackInstant,
+    ) -> Result<(), StackError> {
         let index = socket_index(socket);
         let listener = self.tcp_listener_children[index].take();
         let removing_listener = self.tcp_socket(socket)?.remote_endpoint().is_none();
         if removing_listener {
-            self.remove_tcp_listener_children(socket);
+            self.remove_tcp_listener_children(socket, now);
             self.remove_tcp_accepts_by_listener(socket);
         }
         let removed = self.tcp.remove(index).ok_or(StackError::UnknownSocket)?;
@@ -3523,6 +3672,55 @@ where
         self.tcp_listener_children[index] = None;
         self.remove_tcp_accepts_for(socket);
         Ok(())
+    }
+
+    /// Retires a connection the way RFC 9293 3.6 says a close ends one,
+    /// rather than by dropping its socket.
+    ///
+    /// This is the entry point for every way a connection's owner can
+    /// let go — a guest's explicit close, a descriptor table dying with
+    /// its program, a resource destructor — and the owner supplies no
+    /// policy: [`TcpSocket::close_action`] reads the socket's state and
+    /// its receive queue and answers with the FIN, the reset, or the
+    /// bare reclamation the peer is owed.
+    ///
+    /// A connection that still has a FIN sequence to run is adopted by
+    /// the stack and finishes it with no owner, so the slot, the local
+    /// port and the timers are released when the state machine reaches
+    /// [`TcpState::Closed`] and not when the owner let go. The socket
+    /// id is invalid to its former owner from the moment this returns,
+    /// whichever outcome it reports.
+    ///
+    /// [`Stack::remove_tcp_socket`] remains the listener's retirement:
+    /// a listener has no send sequence to close, and what its backlog
+    /// is owed is the reset that path already sends.
+    pub fn close_tcp_socket(
+        &mut self,
+        socket: SocketId,
+        now: StackInstant,
+    ) -> Result<TcpCloseOutcome, StackError> {
+        let index = socket_index(socket);
+        match self.tcp_socket(socket)?.close_action() {
+            TcpCloseAction::Reclaim => {
+                self.remove_tcp_socket(socket, now)?;
+                Ok(TcpCloseOutcome::Reclaimed)
+            }
+            TcpCloseAction::Reset => {
+                self.reset_tcp_socket(socket_id(index), now);
+                self.remove_tcp_socket(socket, now)?;
+                Ok(TcpCloseOutcome::Reclaimed)
+            }
+            TcpCloseAction::Finish => {
+                self.tcp_socket_mut(socket)?.close_send();
+                self.tcp_orphans.adopt(index);
+                // Receive backpressure is a promise that the stack will
+                // take frames again once this socket is drained, and an
+                // orphan has nobody left to drain it (#143).
+                self.clear_tcp_receive_backpressure(index);
+                self.schedule_tcp_timer(index);
+                Ok(TcpCloseOutcome::Finishing)
+            }
+        }
     }
 
     pub fn tcp_send(&mut self, socket: SocketId, bytes: &[u8]) -> Result<usize, StackError> {
@@ -4888,7 +5086,10 @@ where
                     .get_mut(index)
                     .expect("TCP endpoint index referenced a missing socket");
                 let previous_state = socket.state();
+                let before = socket.receive_counters();
                 let outcome = socket.on_segment(packet, payload_bytes, now.nanos());
+                self.tcp_receive_counters
+                    .fold(before, socket.receive_counters());
                 (
                     previous_state,
                     socket.state(),
@@ -4930,7 +5131,13 @@ where
             // A segment that ended the connection — a peer RST above all
             // — leaves a blocked reader with nothing else to wait for,
             // so the closure is the wakeup.
-            if previous_state != crate::TcpState::Closed && current_state == crate::TcpState::Closed
+            //
+            // An orphan has no reader to wake and a slot another
+            // connection is about to take, so its retirement is the
+            // sweep in `drive_tcp` and nothing else.
+            if previous_state != crate::TcpState::Closed
+                && current_state == crate::TcpState::Closed
+                && !self.tcp_orphans.contains(index)
             {
                 Self::push_event_into(
                     &mut self.events,
@@ -5482,6 +5689,69 @@ where
         self.remove_tcp_accepts_for(socket_id(index));
     }
 
+    /// Reclaims every orphan the state machine has finished with, and
+    /// resets the ones whose peer kept sending after the close.
+    ///
+    /// Membership, not a transition, is what the sweep tests. An orphan
+    /// reaches [`TcpState::Closed`] two ways — a timer this drive
+    /// expired, the `TIME-WAIT` 2MSL above all, and a segment the
+    /// receive path handled between drives — and only the first is a
+    /// transition a drive can observe.
+    ///
+    /// Data that arrives after the close has no reader and never will,
+    /// which RFC 9293 3.6.1 answers with a reset. Without it an orphan
+    /// in `FIN-WAIT-2` would sit on its slot and its advertised window
+    /// against a peer that had no reason to send a FIN.
+    fn sweep_tcp_orphans(&mut self, now: StackInstant) {
+        let mut position = 0;
+        while position < self.tcp_orphans.len() {
+            let index = self.tcp_orphans.at(position);
+            let socket = self
+                .tcp
+                .get(index)
+                .unwrap_or_else(|| panic!("orphaned TCP socket {index} left the slab behind it"));
+            if socket.state() == crate::TcpState::Closed {
+                self.reclaim_tcp_orphan(index);
+                continue;
+            }
+            if socket.receive_buffered_bytes() != 0 {
+                self.reset_tcp_socket(socket_id(index), now);
+                self.tcp
+                    .get_mut(index)
+                    .unwrap_or_else(|| {
+                        panic!("orphaned TCP socket {index} left the slab behind it")
+                    })
+                    .abort();
+                self.reclaim_tcp_orphan(index);
+                continue;
+            }
+            position += 1;
+        }
+    }
+
+    /// Frees an orphan's slot, its endpoint keys, its local port and
+    /// its timers.
+    ///
+    /// The tail of [`Stack::remove_tcp_socket`], minus the parts only a
+    /// listener has: an orphan is always a connection, so it has no
+    /// backlog to reset and no listener queue of its own — only the
+    /// backlog slot it may still hold in the listener it arrived on.
+    fn reclaim_tcp_orphan(&mut self, index: usize) {
+        self.tcp_orphans.release(index);
+        let listener = self.tcp_listener_children[index].take();
+        let removed = self.tcp.remove(index);
+        assert!(
+            removed.is_some(),
+            "orphaned TCP socket {index} left the slab behind it"
+        );
+        self.clear_tcp_timer(index);
+        self.clear_tcp_receive_backpressure(index);
+        if let Some(listener) = listener {
+            self.tcp_listener_queues.release(listener);
+        }
+        self.remove_tcp_accepts_for(socket_id(index));
+    }
+
     fn release_tcp_listener_child(&mut self, index: usize) {
         if let Some(listener) = self.tcp_listener_children[index].take() {
             self.tcp_listener_queues.release(listener);
@@ -5727,33 +5997,75 @@ where
         }
     }
 
-    fn remove_tcp_listener_children(&mut self, listener: SocketId) {
+    /// Tears down every connection the listener's backlog still owns.
+    ///
+    /// Ownership is `tcp_listener_children`, which records the listener
+    /// a child was born under and is cleared the moment `take_tcp_accept`
+    /// hands the child out. A connection the guest already accepted is
+    /// therefore not a child any more, and outlives the listener it
+    /// arrived on — it has its own owner, its own handle, and a peer
+    /// exchanging data with it. Matching children by endpoint instead
+    /// would sweep those up too, because an accepted connection keeps
+    /// the local endpoint its listener is bound to.
+    fn remove_tcp_listener_children(&mut self, listener: SocketId, now: StackInstant) {
         let mut children = ArrayVec::<SocketId, MAX_TCP_ACCEPT>::new();
-        for active_slot in 0..self.tcp.active_len() {
-            let index = self.tcp.active_index(active_slot);
-            if socket_id(index) == listener {
-                continue;
-            }
-            let Some(socket) = self.tcp.get(index) else {
-                panic!("TCP active socket index referenced a missing socket");
-            };
-            if socket.remote_endpoint().is_none() {
-                continue;
-            }
-            let Some(local) = socket.local_endpoint() else {
-                continue;
-            };
-            let Some(listener_index) = self.tcp.find_listener(local) else {
-                continue;
-            };
-            if socket_id(listener_index) == listener {
+        for (index, owner) in self.tcp_listener_children.iter().enumerate() {
+            if *owner == Some(listener) {
                 children
                     .try_push(socket_id(index))
                     .unwrap_or_else(|_| panic!("TCP listener child collection overflowed"));
             }
         }
         for child in children {
+            self.reset_tcp_socket(child, now);
             self.remove_tcp_child_without_backlog_release(child);
+        }
+    }
+
+    /// Queues the reset a connection is owed before it is dropped.
+    ///
+    /// Two paths reach it. A connection still in a listener's backlog
+    /// finished a handshake and is waiting on a port that is about to
+    /// stop existing. A connection whose owner closed it with data it
+    /// had never read is being aborted rather than closed, which RFC
+    /// 9293 3.6.1 answers with a reset because a FIN would tell the
+    /// peer a truncated stream had ended in order. Either way, dropping
+    /// the socket silently would leave the peer retransmitting until
+    /// its own timeout, into a stack that no longer owns the
+    /// four-tuple. The reset goes onto the same outbound queue a live
+    /// socket's segments take, so it leaves with the next drive.
+    ///
+    /// A reset that cannot be queued — no route, no neighbour, a full
+    /// output queue — is reported and dropped rather than failing the
+    /// close: the connection is going away either way, and a reset is
+    /// an unreliable notification even when it is sent.
+    fn reset_tcp_socket(&mut self, socket: SocketId, now: StackInstant) {
+        let index = socket_index(socket);
+        let Some(socket) = self.tcp.get(index) else {
+            return;
+        };
+        let (Some(local), Some(remote), Some(header)) = (
+            socket.local_endpoint(),
+            socket.remote_endpoint(),
+            socket.pending_reset(),
+        ) else {
+            return;
+        };
+        let hop_limit = socket.hop_limit();
+        let identification = header.sequence as u16;
+        if let Err(error) = self.queue_tcp(
+            local,
+            remote,
+            TcpEgress {
+                header,
+                options: TcpHeaderOptions::empty(),
+                payload: TcpTxPayload::Flat(&[]),
+                hop_limit,
+            },
+            identification,
+            now,
+        ) {
+            tracing::debug!(?local, ?remote, ?error, "TCP reset could not be queued");
         }
     }
 
@@ -7697,6 +8009,85 @@ mod tests {
     }
 
     #[test]
+    fn tcp_connect_resets_stale_ack_then_retransmits_syn_and_establishes() {
+        let config = StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES);
+        let (mut stack, socket, local, peer) = open_pending_tcp_connect_stack(config);
+        stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        stack.learn_neighbor(NeighborEntry {
+            ip: IpAddress::Ipv4(peer),
+            mac: PEER_MAC,
+            state: NeighborState::Reachable,
+            updated_at: StackInstant::from_nanos(0),
+        });
+        stack
+            .drive_tcp(StackInstant::from_nanos(0))
+            .expect("initial SYN should be queued");
+        assert!(stack.take_outbound().is_some());
+
+        let stale = ipv4_tcp_frame(
+            peer,
+            local,
+            TcpHeader {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 100,
+                acknowledgement: 9,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+            },
+            &[],
+        );
+        stack
+            .receive_frame(&stale, StackInstant::from_nanos(1))
+            .expect("stale ACK should be handled");
+        assert_eq!(
+            stack.tcp_connect_state(socket),
+            Ok(TcpConnectState::Pending)
+        );
+        let frame = stack.take_outbound().expect("stale ACK must queue RST");
+        let ethernet = EthernetFrame::parse(frame.as_slice()).expect("Ethernet frame");
+        let ipv4 = Ipv4Packet::parse(ethernet.payload).expect("IPv4 packet");
+        let reset = TcpPacket::parse(ipv4.payload).expect("TCP reset");
+        assert_eq!(reset.sequence, 9);
+        assert_eq!(reset.acknowledgement, 0);
+        assert_eq!(reset.flags, TcpFlags::RST);
+        assert!(crate::tcp_checksum_valid(
+            IpAddress::Ipv4(local),
+            IpAddress::Ipv4(peer),
+            ipv4.payload,
+        ));
+
+        let retry_at = StackInstant::from_nanos(crate::tcp::TCP_INITIAL_RTO_NANOS);
+        stack.drive_tcp(retry_at).expect("SYN should retransmit");
+        let frame = stack.take_outbound().expect("retransmitted SYN");
+        let ethernet = EthernetFrame::parse(frame.as_slice()).expect("Ethernet frame");
+        let ipv4 = Ipv4Packet::parse(ethernet.payload).expect("IPv4 packet");
+        let syn = TcpPacket::parse(ipv4.payload).expect("TCP SYN");
+        assert_eq!(syn.sequence, 7);
+        assert_eq!(syn.flags, TcpFlags::SYN);
+        let syn_ack = ipv4_tcp_frame(
+            peer,
+            local,
+            TcpHeader {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 200,
+                acknowledgement: 8,
+                flags: TcpFlags::SYN.union(TcpFlags::ACK),
+                window_size: u16::MAX,
+            },
+            &[],
+        );
+        stack
+            .receive_frame(&syn_ack, retry_at)
+            .expect("fresh SYN-ACK should establish");
+        assert_eq!(
+            stack.tcp_connect_state(socket),
+            Ok(TcpConnectState::Connected)
+        );
+    }
+
+    #[test]
     fn ipv4_icmp_port_unreachable_closes_pending_tcp_connect() {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
@@ -9229,9 +9620,36 @@ mod tests {
         assert_eq!(received.bytes.as_ref(), b"payload");
     }
 
+    /// A queued datagram must not keep the buffer the device filled.
+    ///
+    /// Every payload `receive_udp` builds is a slice of the frame the
+    /// driver handed up, so storing it stores one of the driver's
+    /// receive buffers until the datagram is read — up to `MAX_UDP_RX`
+    /// of them. Datagrams above `UDP_INLINE_PAYLOAD_BYTES` are the case
+    /// that used to keep the slice unchanged; the inline path always
+    /// copied.
     #[test]
-    fn ipv4_udp_large_payload_retains_owning_frame_slice() {
+    fn ipv4_udp_large_payload_does_not_retain_the_device_buffer() {
         const LARGE_PAYLOAD: [u8; 1024] = [0x5a; 1024];
+
+        struct TrackedFrame {
+            bytes: Vec<u8>,
+            released: alloc::sync::Arc<core::sync::atomic::AtomicBool>,
+        }
+
+        impl AsRef<[u8]> for TrackedFrame {
+            fn as_ref(&self) -> &[u8] {
+                &self.bytes
+            }
+        }
+
+        impl Drop for TrackedFrame {
+            fn drop(&mut self) {
+                self.released
+                    .store(true, core::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
@@ -9240,21 +9658,26 @@ mod tests {
             .open_udp(UdpSocketBinding::wildcard(4040))
             .expect("UDP socket should bind");
         let (frame, frame_len) = ipv4_udp_frame(peer, 53, local, 4040, &LARGE_PAYLOAD);
-        let frame = Bytes::copy_from_slice(&frame[..frame_len]);
+        let released = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+        let frame = Bytes::from_owner(TrackedFrame {
+            bytes: frame[..frame_len].to_vec(),
+            released: released.clone(),
+        });
 
         stack
             .receive_rx_frame(RxFrame::new(frame.clone()), StackInstant::from_nanos(1))
             .expect("large UDP frame should parse");
+        drop(frame);
 
+        assert!(
+            released.load(core::sync::atomic::Ordering::SeqCst),
+            "a queued datagram must not hold the device buffer it arrived in"
+        );
         let received = stack
             .take_udp(socket)
             .expect("UDP socket should exist")
-            .expect("large UDP datagram should be queued");
+            .expect("large UDP datagram should still be queued");
         assert_eq!(received.bytes.as_ref(), LARGE_PAYLOAD.as_slice());
-        assert_eq!(
-            received.bytes.frame_slice_offset_for_test(&frame),
-            Some(EthernetFrame::HEADER_LEN + Ipv4Packet::MIN_HEADER_LEN + UdpPacket::HEADER_LEN)
-        );
     }
 
     #[test]
@@ -10317,6 +10740,289 @@ mod tests {
         );
     }
 
+    /// The endpoints [`open_established_tcp_stack`] connects, so a
+    /// close test can ask whether the four-tuple is free again.
+    fn established_endpoints(local: Ipv4Address, peer: Ipv4Address) -> (TcpEndpoint, TcpEndpoint) {
+        (
+            TcpEndpoint {
+                address: IpAddress::Ipv4(local),
+                port: 49152,
+            },
+            TcpEndpoint {
+                address: IpAddress::Ipv4(peer),
+                port: 80,
+            },
+        )
+    }
+
+    /// The flags, sequence and acknowledgement of the next queued
+    /// frame, so a close test reads what went on the wire rather than
+    /// the state the stack was left in.
+    fn take_tcp_segment(stack: &mut Stack) -> Option<(TcpFlags, u32, u32)> {
+        let frame = stack.take_outbound()?;
+        let ethernet = EthernetFrame::parse(frame.as_slice()).expect("Ethernet frame should parse");
+        let ipv4 = Ipv4Packet::parse(ethernet.payload).expect("IPv4 packet should parse");
+        let tcp = TcpPacket::parse(ipv4.payload).expect("TCP packet should parse");
+        Some((tcp.flags, tcp.sequence, tcp.acknowledgement))
+    }
+
+    /// The peer's FIN, acknowledging everything this side has sent.
+    fn deliver_peer_fin(
+        stack: &mut Stack,
+        local: Ipv4Address,
+        peer: Ipv4Address,
+        acknowledgement: u32,
+        now: u64,
+    ) {
+        let (fin, fin_len) = tcp_segment(
+            peer,
+            local,
+            TcpHeader {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 101,
+                acknowledgement,
+                flags: TcpFlags::ACK.union(TcpFlags::FIN),
+                window_size: u16::MAX,
+            },
+        );
+        stack
+            .receive_tcp(
+                IpAddress::Ipv4(peer),
+                IpAddress::Ipv4(local),
+                &Bytes::copy_from_slice(&fin[..fin_len]),
+                RxFrameOffload::none(),
+                StackInstant::from_nanos(now),
+            )
+            .expect("the peer's FIN should be accepted");
+    }
+
+    /// A close that follows an explicit shutdown adds nothing to the
+    /// wire and finishes the sequence the shutdown started.
+    ///
+    /// On `dev` the close dropped the socket instead: the FIN had gone
+    /// out, but the peer's FIN then met a stack that no longer owned
+    /// the four-tuple, so it was answered with a bare reset from
+    /// `tcp_reset_response` and the connection never reached
+    /// `TIME-WAIT`.
+    #[test]
+    fn tcp_close_after_a_shutdown_finishes_the_sequence() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let (mut stack, socket) = open_established_tcp_stack(local, peer);
+
+        stack
+            .tcp_shutdown_send(socket)
+            .expect("the guest's shutdown should start the close");
+        stack
+            .drive_tcp(StackInstant::from_nanos(2))
+            .expect("the FIN should be queued");
+        let (flags, fin_sequence, _) =
+            take_tcp_segment(&mut stack).expect("the shutdown owes the peer a FIN");
+        assert!(flags.contains(TcpFlags::FIN));
+        while stack.take_outbound().is_some() {}
+
+        assert_eq!(
+            stack.close_tcp_socket(socket, StackInstant::from_nanos(3)),
+            Ok(TcpCloseOutcome::Finishing),
+            "a socket that has already sent its FIN finishes the sequence it started"
+        );
+        stack
+            .drive_tcp(StackInstant::from_nanos(3))
+            .expect("the close should queue nothing new");
+        assert_eq!(
+            take_tcp_segment(&mut stack),
+            None,
+            "the FIN is already on the wire; the close owes the peer nothing more"
+        );
+
+        deliver_peer_fin(&mut stack, local, peer, fin_sequence.wrapping_add(1), 4);
+        stack
+            .drive_tcp(StackInstant::from_nanos(4))
+            .expect("the peer's FIN should be acknowledged");
+        let (flags, _, acknowledgement) =
+            take_tcp_segment(&mut stack).expect("TIME-WAIT owes the peer's FIN an acknowledgement");
+        assert_eq!(flags, TcpFlags::ACK);
+        assert_eq!(acknowledgement, 102);
+        assert!(
+            stack
+                .tcp_read(socket, 8, StackInstant::from_nanos(5))
+                .is_ok(),
+            "the stack owns the socket until TIME-WAIT ends"
+        );
+
+        stack
+            .drive_tcp(StackInstant::from_nanos(
+                4 + crate::tcp::TCP_TIME_WAIT_NANOS,
+            ))
+            .expect("the 2MSL timer should expire");
+        assert_eq!(
+            stack.tcp_read(socket, 8, StackInstant::from_nanos(6)),
+            Err(StackError::UnknownSocket),
+            "the slot is released when the state machine reaches Closed"
+        );
+    }
+
+    /// A close with nothing left to read is the ordinary close of RFC
+    /// 9293 3.6, and the stack is what sends its FIN.
+    ///
+    /// On `dev` this assertion fails at the first `take_tcp_segment`:
+    /// the close queued no segment at all, which is #224.
+    #[test]
+    fn tcp_close_with_an_empty_receive_queue_sends_a_fin() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let (mut stack, socket) = open_established_tcp_stack(local, peer);
+
+        assert_eq!(
+            stack.close_tcp_socket(socket, StackInstant::from_nanos(2)),
+            Ok(TcpCloseOutcome::Finishing)
+        );
+        stack
+            .drive_tcp(StackInstant::from_nanos(2))
+            .expect("the close should queue a FIN");
+        let (flags, fin_sequence, _) =
+            take_tcp_segment(&mut stack).expect("a close with nothing unread owes its peer a FIN");
+        assert!(flags.contains(TcpFlags::FIN));
+        assert_eq!(fin_sequence, 8, "the FIN carries this side's send sequence");
+
+        deliver_peer_fin(&mut stack, local, peer, fin_sequence.wrapping_add(1), 3);
+        stack
+            .drive_tcp(StackInstant::from_nanos(
+                3 + crate::tcp::TCP_TIME_WAIT_NANOS,
+            ))
+            .expect("the 2MSL timer should expire");
+        assert_eq!(
+            stack.tcp_read(socket, 8, StackInstant::from_nanos(4)),
+            Err(StackError::UnknownSocket),
+            "the orphan reclaims itself once the sequence is over"
+        );
+    }
+
+    /// A close that abandons data nobody read is an abort, and RFC 9293
+    /// 3.6.1 aborts with a reset rather than a FIN.
+    ///
+    /// On `dev` the close put nothing on the wire, so the peer went on
+    /// believing in a connection whose reader had gone.
+    #[test]
+    fn tcp_close_with_unread_data_resets_and_reclaims_at_once() {
+        const UNREAD: &[u8] = b"unread";
+
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let (local_endpoint, remote_endpoint) = established_endpoints(local, peer);
+        let (mut stack, socket) = open_established_tcp_stack(local, peer);
+
+        let (data, data_len) = tcp_segment_with_payload(
+            peer,
+            local,
+            TcpHeader {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 101,
+                acknowledgement: 8,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+            },
+            UNREAD,
+        );
+        stack
+            .receive_tcp(
+                IpAddress::Ipv4(peer),
+                IpAddress::Ipv4(local),
+                &Bytes::copy_from_slice(&data[..data_len]),
+                RxFrameOffload::none(),
+                StackInstant::from_nanos(2),
+            )
+            .expect("the peer's data should be queued");
+        while stack.take_outbound().is_some() {}
+
+        assert_eq!(
+            stack.close_tcp_socket(socket, StackInstant::from_nanos(3)),
+            Ok(TcpCloseOutcome::Reclaimed),
+            "an aborted connection has no sequence left to run"
+        );
+        let (flags, sequence, acknowledgement) =
+            take_tcp_segment(&mut stack).expect("an abort owes its peer a reset");
+        assert_eq!(flags, TcpFlags::RST.union(TcpFlags::ACK));
+        assert_eq!(sequence, 8, "the reset carries this side's send sequence");
+        assert_eq!(
+            acknowledgement,
+            101 + UNREAD.len() as u32,
+            "and the acknowledgement this side would otherwise have sent"
+        );
+
+        assert_eq!(
+            stack.tcp_read(socket, 8, StackInstant::from_nanos(4)),
+            Err(StackError::UnknownSocket)
+        );
+        assert!(
+            stack
+                .open_tcp_connect(local_endpoint, remote_endpoint, 7)
+                .is_ok(),
+            "an abort frees the four-tuple immediately: there is no TIME-WAIT after a reset"
+        );
+    }
+
+    /// An orphan holds its four-tuple for the whole of `TIME-WAIT` and
+    /// hands back its slot, its port and its timers at the 2MSL
+    /// deadline, with nobody left to tell.
+    #[test]
+    fn tcp_orphan_is_reclaimed_when_time_wait_expires() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let (local_endpoint, remote_endpoint) = established_endpoints(local, peer);
+        let (mut stack, socket) = open_established_tcp_stack(local, peer);
+
+        assert_eq!(
+            stack.close_tcp_socket(socket, StackInstant::from_nanos(2)),
+            Ok(TcpCloseOutcome::Finishing)
+        );
+        stack
+            .drive_tcp(StackInstant::from_nanos(2))
+            .expect("the close should queue a FIN");
+        let (flags, fin_sequence, _) =
+            take_tcp_segment(&mut stack).expect("the close owes its peer a FIN");
+        assert!(flags.contains(TcpFlags::FIN));
+
+        let time_wait_started = 3;
+        deliver_peer_fin(
+            &mut stack,
+            local,
+            peer,
+            fin_sequence.wrapping_add(1),
+            time_wait_started,
+        );
+        assert_eq!(
+            stack.open_tcp_connect(local_endpoint, remote_endpoint, 99),
+            Err(StackError::AddressInUse),
+            "TIME-WAIT holds the four-tuple whether or not the connection still has an owner"
+        );
+        while stack.take_event().is_some() {}
+
+        stack
+            .drive_tcp(StackInstant::from_nanos(
+                time_wait_started + crate::tcp::TCP_TIME_WAIT_NANOS,
+            ))
+            .expect("the 2MSL timer should expire");
+        assert_eq!(
+            stack.tcp_read(socket, 8, StackInstant::from_nanos(5)),
+            Err(StackError::UnknownSocket),
+            "the orphan's slot goes back to the slab when it reaches Closed"
+        );
+        assert_eq!(
+            stack.take_event(),
+            None,
+            "an orphan has no owner to tell that it closed"
+        );
+        assert!(
+            stack
+                .open_tcp_connect(local_endpoint, remote_endpoint, 99)
+                .is_ok(),
+            "and its local port is free again"
+        );
+    }
+
     #[test]
     fn tcp_stack_accepts_replaceable_congestion_control() {
         let local = Ipv4Address::new([192, 0, 2, 10]);
@@ -10414,6 +11120,171 @@ mod tests {
                 address: IpAddress::Ipv4(peer),
                 port: 49152,
             }
+        );
+    }
+
+    /// Closing a listener resets the connections its backlog still
+    /// holds.
+    ///
+    /// A queued connection has no other owner: nobody will ever accept
+    /// it, and its peer finished a handshake with a port that is about
+    /// to stop existing. Dropping the socket silently would leave that
+    /// peer retransmitting until its own timeout, into a stack that no
+    /// longer owns the four-tuple (#191).
+    #[test]
+    fn closing_a_listener_resets_the_backlog_it_never_handed_out() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        stack.learn_neighbor(NeighborEntry {
+            ip: IpAddress::Ipv4(peer),
+            mac: PEER_MAC,
+            state: NeighborState::Reachable,
+            updated_at: StackInstant::from_nanos(0),
+        });
+        let listener = stack
+            .open_tcp_listen(
+                TcpEndpoint {
+                    address: IpAddress::Ipv4(Ipv4Address::UNSPECIFIED),
+                    port: 8080,
+                },
+                DEFAULT_TCP_LISTEN_BACKLOG,
+            )
+            .expect("wildcard TCP listener should allocate");
+        let syn_ack = drive_passive_open_to_syn_ack(&mut stack, peer, local, 49152, 1);
+        let (ack, ack_len) = tcp_segment(
+            peer,
+            local,
+            TcpHeader {
+                source_port: 49152,
+                destination_port: 8080,
+                sequence: 11,
+                acknowledgement: syn_ack.sequence.wrapping_add(1),
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+            },
+        );
+        stack
+            .receive_tcp(
+                IpAddress::Ipv4(peer),
+                IpAddress::Ipv4(local),
+                &Bytes::copy_from_slice(&ack[..ack_len]),
+                RxFrameOffload::none(),
+                StackInstant::from_nanos(2),
+            )
+            .expect("final ACK should establish the accepted socket");
+        assert!(
+            stack
+                .tcp_accept_pending(listener)
+                .expect("the listener should report its queue"),
+            "the connection is queued and nobody has accepted it"
+        );
+        while stack.take_outbound().is_some() {}
+
+        stack
+            .remove_tcp_socket(listener, StackInstant::from_nanos(3))
+            .expect("the listener should be removable");
+
+        let frame = stack
+            .take_outbound()
+            .expect("the queued connection should be reset");
+        let ethernet = EthernetFrame::parse(frame.as_slice()).expect("Ethernet frame should parse");
+        let ipv4 = Ipv4Packet::parse(ethernet.payload).expect("IPv4 packet should parse");
+        let reset = TcpPacket::parse(ipv4.payload).expect("TCP packet should parse");
+        assert_eq!(reset.source_port, 8080);
+        assert_eq!(reset.destination_port, 49152);
+        assert_eq!(reset.flags, TcpFlags::RST.union(TcpFlags::ACK));
+        assert_eq!(
+            reset.sequence,
+            syn_ack.sequence.wrapping_add(1),
+            "the reset carries the sequence the peer is expecting"
+        );
+        assert_eq!(reset.acknowledgement, 11);
+        assert!(reset.payload.is_empty());
+        assert!(
+            stack.take_outbound().is_none(),
+            "one reset, for the one connection that was queued"
+        );
+
+        assert!(stack.tcp_socket(listener).is_err());
+        assert_eq!(
+            stack.tcp.active_len(),
+            0,
+            "the listener and its backlog release every socket they held"
+        );
+    }
+
+    /// A connection the guest already accepted outlives the listener it
+    /// arrived on: it has its own handle and its own peer, and only the
+    /// backlog belongs to the listener.
+    #[test]
+    fn closing_a_listener_leaves_an_accepted_connection_alive() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        stack.learn_neighbor(NeighborEntry {
+            ip: IpAddress::Ipv4(peer),
+            mac: PEER_MAC,
+            state: NeighborState::Reachable,
+            updated_at: StackInstant::from_nanos(0),
+        });
+        let listener = stack
+            .open_tcp_listen(
+                TcpEndpoint {
+                    address: IpAddress::Ipv4(Ipv4Address::UNSPECIFIED),
+                    port: 8080,
+                },
+                DEFAULT_TCP_LISTEN_BACKLOG,
+            )
+            .expect("wildcard TCP listener should allocate");
+        let syn_ack = drive_passive_open_to_syn_ack(&mut stack, peer, local, 49152, 1);
+        let (ack, ack_len) = tcp_segment(
+            peer,
+            local,
+            TcpHeader {
+                source_port: 49152,
+                destination_port: 8080,
+                sequence: 11,
+                acknowledgement: syn_ack.sequence.wrapping_add(1),
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+            },
+        );
+        stack
+            .receive_tcp(
+                IpAddress::Ipv4(peer),
+                IpAddress::Ipv4(local),
+                &Bytes::copy_from_slice(&ack[..ack_len]),
+                RxFrameOffload::none(),
+                StackInstant::from_nanos(2),
+            )
+            .expect("final ACK should establish the accepted socket");
+        let accepted = stack
+            .take_tcp_accept(listener)
+            .expect("accept poll should succeed")
+            .expect("the connection should be queued")
+            .socket;
+        while stack.take_outbound().is_some() {}
+
+        stack
+            .remove_tcp_socket(listener, StackInstant::from_nanos(3))
+            .expect("the listener should be removable");
+
+        assert!(
+            stack.take_outbound().is_none(),
+            "an accepted connection is not reset by its listener's close"
+        );
+        assert!(
+            stack.tcp_socket(accepted).is_ok(),
+            "an accepted connection outlives the listener it arrived on"
+        );
+        assert_eq!(
+            stack
+                .tcp_send(accepted, b"hello")
+                .expect("the accepted connection should still send"),
+            5
         );
     }
 
@@ -11637,6 +12508,92 @@ mod tests {
     }
 
     #[test]
+    fn peer_retransmit_increments_counters() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let (mut stack, _socket) = open_established_tcp_stack(local, peer);
+
+        let payload = b"hello";
+        let (segment, segment_len) = tcp_segment_with_payload(
+            peer,
+            local,
+            TcpHeader {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 101,
+                acknowledgement: 8,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+            },
+            payload,
+        );
+
+        // Deliver an in-window segment.
+        stack
+            .receive_tcp(
+                IpAddress::Ipv4(peer),
+                IpAddress::Ipv4(local),
+                &Bytes::copy_from_slice(&segment[..segment_len]),
+                RxFrameOffload::none(),
+                StackInstant::from_nanos(2),
+            )
+            .expect("in-window segment should be accepted");
+
+        assert_eq!(stack.tcp_counters().peer_retransmits_received, 0);
+
+        // Deliver the same segment again.
+        stack
+            .receive_tcp(
+                IpAddress::Ipv4(peer),
+                IpAddress::Ipv4(local),
+                &Bytes::copy_from_slice(&segment[..segment_len]),
+                RxFrameOffload::none(),
+                StackInstant::from_nanos(3),
+            )
+            .expect("duplicate segment should be accepted");
+
+        let counters = stack.tcp_counters();
+        assert_eq!(counters.peer_retransmits_received, 1);
+        assert!(counters.duplicate_acks_requested >= 1);
+    }
+
+    #[test]
+    fn out_of_order_segment_queues_bytes() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let (mut stack, _socket) = open_established_tcp_stack(local, peer);
+
+        let payload = b"out-of-order payload";
+        let (segment, segment_len) = tcp_segment_with_payload(
+            peer,
+            local,
+            TcpHeader {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 200,
+                acknowledgement: 8,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+            },
+            payload,
+        );
+
+        stack
+            .receive_tcp(
+                IpAddress::Ipv4(peer),
+                IpAddress::Ipv4(local),
+                &Bytes::copy_from_slice(&segment[..segment_len]),
+                RxFrameOffload::none(),
+                StackInstant::from_nanos(2),
+            )
+            .expect("out-of-order segment should be accepted");
+
+        let counters = stack.tcp_counters();
+        assert_eq!(counters.out_of_order_queued_bytes, payload.len() as u64);
+        assert_eq!(counters.receive_queued_bytes, 0);
+    }
+
+    #[test]
     fn tcp_socket_slab_reuses_removed_slot() {
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
         let first = stack
@@ -11660,7 +12617,7 @@ mod tests {
         assert_eq!(stack.tcp.active_len(), 2);
 
         stack
-            .remove_tcp_socket(first)
+            .remove_tcp_socket(first, StackInstant::from_nanos(1))
             .expect("allocated socket should be removable");
         assert_eq!(stack.tcp.active_len(), 1);
         assert_eq!(stack.tcp.active_index(0), socket_index(second));
@@ -11726,7 +12683,7 @@ mod tests {
         );
 
         cloned
-            .remove_tcp_socket(first)
+            .remove_tcp_socket(first, StackInstant::from_nanos(1))
             .expect("cloned socket should be removable");
         assert!(cloned.tcp_socket(first).is_err());
         assert!(stack.tcp_socket(first).is_ok());

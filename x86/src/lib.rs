@@ -18,10 +18,19 @@ mod vsock;
 mod watchdog;
 
 mod debug_state {
-    pub(crate) type RuntimeState =
-        helios_kernel::HostRuntimeState<crate::X86Cpu, crate::host_fs::HostFileSystemService>;
-    pub(crate) type ProgramService =
-        helios_kernel::UserProgramService<crate::X86Cpu, crate::host_fs::HostFileSystemService>;
+    /// The network service this machine's virtio-net function backs.
+    pub(crate) type NetworkService =
+        helios_kernel::NetworkService<crate::X86Cpu, crate::net::VirtioNetworkDevice>;
+    pub(crate) type RuntimeState = helios_kernel::HostRuntimeState<
+        crate::X86Cpu,
+        NetworkService,
+        crate::host_fs::HostFileSystemService,
+    >;
+    pub(crate) type ProgramService = helios_kernel::UserProgramService<
+        crate::X86Cpu,
+        NetworkService,
+        crate::host_fs::HostFileSystemService,
+    >;
 }
 
 use alloc::sync::Arc;
@@ -29,7 +38,7 @@ use core::arch::asm;
 use core::arch::global_asm;
 use core::arch::x86_64::{__cpuid, __cpuid_count, _rdrand64_step, _rdtsc};
 use core::ops::Range;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicUsize, Ordering, compiler_fence};
 use helios_hal::boot::{BootMemoryMap, BootReservedRanges, usable_region_segments};
 use helios_hal::cpu::{Cpu, Instant, ProcessorId};
 use helios_hal::critical_section::ProcessorIdentity;
@@ -93,6 +102,10 @@ struct X86CriticalSection;
 
 critical_section::set_impl!(X86CriticalSection);
 
+// The processor-local half, for locks that carry their own spin word
+// and need only to keep this processor's interrupt handler out.
+helios_hal::critical_section::set_local_interrupt_mask_impl!(X86InterruptOps);
+
 unsafe impl critical_section::Impl for X86CriticalSection {
     unsafe fn acquire() -> usize {
         unsafe { CRITICAL_SECTION_STATE.acquire::<X86InterruptOps>() }
@@ -133,6 +146,10 @@ extern "C" fn _start() -> ! {
 }
 
 fn x86_kernel_main() -> ! {
+    // Before anything else: every line below may read this processor's
+    // identity at `fs:0`, and the bootstrap processor has no runtime to point
+    // `IA32_FS_BASE` at until the heap and the ACPI tables exist.
+    smp::install_bootstrap_anchor();
     // The one place COM1 is configured; see `serial_uart_init`.
     serial_uart_init();
     assert!(
@@ -683,15 +700,36 @@ impl Cpu for X86Cpu {
     }
 
     fn park_current(&self) {
-        // HLT halts the CPU until any unmasked interrupt fires. The
-        // local APIC timer always ticks at our scheduler frequency,
-        // and a remote core can drag this one out of HLT immediately
-        // by sending the wake IPI through `wake_processor`. Inside a
-        // critical section IRQs are masked and HLT would deadlock,
-        // but `park_current` is only called from the kernel run loop
-        // which never holds a critical section across the call.
+        // HLT halts the processor until an unmasked interrupt fires.
+        // Masking IRQs around the flag test and the halt is what makes
+        // the pair race-free: the run loop parks after finding its
+        // queue empty, and a wake published in the gap between those
+        // two either lands in `wake_pending`, which the masked test
+        // below observes, or arrives as an interrupt that is already
+        // pending when the halt begins. Without the latch that wake was
+        // acknowledged and discarded, and the processor slept on work
+        // it already had until the next local APIC tick.
+        //
+        // `sti` has a one-instruction shadow, so `sti; hlt` is atomic:
+        // an IPI arriving between the two cannot be taken before the
+        // halt. The same pairing on AArch64 is `wfi` under a masked
+        // DAIF (`aarch64/src/lib.rs`).
+        assert!(
+            x86_64::instructions::interrupts::are_enabled(),
+            "x86 park_current was entered with interrupts masked, where HLT never returns"
+        );
+        x86_64::instructions::interrupts::disable();
+        // `cli` is `asm!(..., options(nomem))`, which is not a
+        // synchronisation point, so the flag read must be pinned below
+        // it explicitly. `CriticalSectionState::acquire` fences the same
+        // way after masking, for the same reason.
+        compiler_fence(Ordering::SeqCst);
+        if smp::current_runtime().take_wake_pending() {
+            x86_64::instructions::interrupts::enable();
+            return;
+        }
         unsafe {
-            core::arch::asm!("hlt", options(nomem, nostack, preserves_flags));
+            core::arch::asm!("sti; hlt", options(nomem, nostack));
         }
     }
 
@@ -701,7 +739,10 @@ impl Cpu for X86Cpu {
     }
 
     fn wake_processor(&self, processor: ProcessorId) {
-        if let Some(apic_id) = self.state.apic_id_of(processor) {
+        // Publish before signalling: `park_current` masks interrupts
+        // around its own test, so a target on its way into HLT either
+        // sees this store or takes the pending IPI.
+        if let Some(apic_id) = self.state.publish_wake(processor) {
             smp::send_wake_ipi(apic_id);
         }
     }

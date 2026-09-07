@@ -1,6 +1,5 @@
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
 use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers};
 use futures_lite::future;
 use helios_inspector_protocol::system::instances;
@@ -16,19 +15,29 @@ use time::format_description::well_known::Rfc3339;
 
 use crate::serial::RpcClient;
 use crate::system;
-use crate::tui;
+use crate::tui::{self, TerminalError};
 
 const LIVE_STATS_PERIOD_MS: u64 = 1_000;
 
-pub async fn run(client: &mut RpcClient) -> Result<()> {
-    let mut session = tui::Session::open(false, "stats view")?;
+/// The view's name, which every terminal fault it raises is reported
+/// against.
+const STATS_VIEW: &str = "stats view";
+
+pub async fn run(client: &mut RpcClient) -> Result<(), TerminalError> {
+    let mut session = tui::Session::open(false, STATS_VIEW)?;
     let events = tui::spawn_events();
     let mut app = App::new(LIVE_STATS_PERIOD_MS);
 
     app.refresh(client).await;
 
     loop {
-        session.terminal().draw(|frame| draw(frame, &app))?;
+        session
+            .terminal()
+            .draw(|frame| draw(frame, &app))
+            .map_err(|source| TerminalError::Draw {
+                view: STATS_VIEW,
+                source,
+            })?;
         match future::or(
             async { events.recv().await.ok().and_then(UiEvent::from_crossterm) },
             async {
@@ -220,7 +229,73 @@ fn draw_main_panels(
     draw_iommu_panel(frame, panels[3], sample);
     draw_host_share_panel(frame, panels[4], sample);
     draw_network_panel(frame, panels[5], sample);
-    draw_instances_panel(frame, sections[1], instances);
+
+    // A device the kernel handed to a user-mode driver belongs beside
+    // the instances, because that is what one of those instances is
+    // doing. Both halves answer the same question from opposite ends:
+    // who is running, and what does it hold.
+    let bottom = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(64), Constraint::Percentage(36)])
+        .split(sections[1]);
+    draw_instances_panel(frame, bottom[0], instances);
+    draw_devices_panel(frame, bottom[1], sample);
+}
+
+/// The hardware the kernel does not drive itself, and who holds it.
+fn draw_devices_panel(frame: &mut ratatui::Frame<'_>, area: Rect, sample: &stats::Sample) {
+    let rows = sample.devices.iter().map(|device| {
+        let owner = if device.claimed { "held" } else { "free" };
+        let style = if device.claimed {
+            Style::default().fg(Color::Green)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        Row::new(vec![
+            Cell::from(device.name.clone()),
+            Cell::from(owner).style(style),
+            Cell::from(format_bytes(device.region_bytes)),
+            Cell::from(format!("{}", device.interrupts)),
+            Cell::from(format!(
+                "{}/{}",
+                device.interrupts_forwarded, device.masked_sources
+            )),
+        ])
+    });
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Min(12),
+            Constraint::Length(5),
+            Constraint::Length(8),
+            Constraint::Length(4),
+            Constraint::Length(9),
+        ],
+    )
+    .header(
+        Row::new(vec!["device", "owner", "regs", "irq", "fwd/msk"])
+            .style(Style::default().fg(Color::Cyan)),
+    )
+    .block(
+        Block::default()
+            .title("Granted devices")
+            .borders(Borders::ALL),
+    );
+    if sample.devices.is_empty() {
+        let empty = Paragraph::new(Text::from(vec![Line::from(Span::styled(
+            "no grantable devices on this machine",
+            Style::default().fg(Color::DarkGray),
+        ))]))
+        .block(
+            Block::default()
+                .title("Granted devices")
+                .borders(Borders::ALL),
+        )
+        .wrap(Wrap { trim: true });
+        frame.render_widget(empty, area);
+        return;
+    }
+    frame.render_widget(table, area);
 }
 
 fn draw_empty(frame: &mut ratatui::Frame<'_>, top: Rect, body: Rect, app: &App) {
@@ -658,11 +733,12 @@ fn draw_network_panel(frame: &mut ratatui::Frame<'_>, area: Rect, sample: &stats
                             Style::default().fg(Color::Cyan),
                         ),
                         Span::raw(format!(
-                            "{} rx  {} tx  {} irq  {} refused",
+                            "{} rx  {} tx  {} irq  {} refused  {} dev-refused",
                             queue.rx_frames,
                             queue.tx_frames,
                             queue.interrupts,
-                            queue.rx_refused_frames
+                            queue.rx_refused_frames,
+                            queue.rx_device_refusals
                         )),
                     ]),
                     Line::from(vec![

@@ -1,0 +1,122 @@
+name: Prepare a benchmark host
+description: >-
+  Everything a bench-suite job needs on the runner before it boots a
+  guest: the host packages, the toolchains the WASI artifacts are built
+  with, the Limine share, the cached `artifacts/` tree, the cargo cache,
+  and — for the jobs that time workloads — the flamegraph renderer, the
+  release inspector and the `tools/bench` environment. Three jobs
+  (`suite`, `profile-generate`, `suite-pgo`) prepare the same host, so
+  the sequence lives here and a change to it reaches all of them.
+
+  The Helios checkout and the pinned Wasmtime tree stay in the jobs:
+  they differ in the history they fetch, and a relative `uses:` inside a
+  composite action does not resolve the way one in a job does.
+inputs:
+  checkout-path:
+    description: Directory the Helios checkout is in, relative to the workspace.
+    required: false
+    default: helios
+  rust-cache-key:
+    description: Key that separates this job's cargo cache from the other jobs'.
+    required: true
+  network-tools:
+    description: >-
+      Install the packages `vm net-setup` needs to provision the
+      multi-queue tap backend.
+    required: false
+    default: "false"
+  guest-arch:
+    description: >-
+      Architecture whose pinned Fedora VM assets are restored, for a job
+      that times the Linux sides. Empty for a job that does not.
+    required: false
+    default: ""
+  flamegraphs:
+    description: >-
+      Install the renderer the workload harness folds its kernel profiles
+      with. It refuses to finish without one.
+    required: false
+    default: "false"
+  inspector:
+    description: Build the release inspector the job's boots are driven by.
+    required: false
+    default: "false"
+  bench-tooling:
+    description: Install the `tools/bench` environment `helios-bench` runs from.
+    required: false
+    default: "false"
+runs:
+  using: composite
+  steps:
+    - name: Install host dependencies
+      shell: bash
+      run: |
+        packages=(
+          libudev-dev just cmake ninja-build
+          qemu-system-x86 ovmf qemu-utils genisoimage
+        )
+        if [ "${{ inputs.network-tools }}" = true ]; then
+          packages+=(iproute2 nftables dnsmasq-base)
+        fi
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends "${packages[@]}"
+        # Every boot in this workflow names `--accel kvm`, and the
+        # inspector refuses rather than falling back to the emulator, so
+        # the device has to be usable by the runner's own user.
+        if [ -e /dev/kvm ]; then
+          sudo chmod 666 /dev/kvm
+        fi
+    - uses: astral-sh/setup-uv@v6
+    - uses: taiki-e/install-action@v2
+      with:
+        tool: wasm-tools
+    - uses: mlugg/setup-zig@v2
+      with:
+        version: 0.13.0
+    - name: Stage Limine bootloader share
+      shell: bash
+      run: |
+        git clone --depth 1 --branch v11.x-binary \
+          https://github.com/limine-bootloader/limine "$GITHUB_WORKSPACE/limine"
+        make -C "$GITHUB_WORKSPACE/limine"
+    - name: Restore WASI tooling artifacts
+      id: artifact-cache
+      uses: actions/cache@v4
+      with:
+        path: |
+          ${{ inputs.checkout-path }}/artifacts/wasi-tools
+          ${{ inputs.checkout-path }}/artifacts/python3-root
+          ${{ inputs.checkout-path }}/artifacts/wasix
+        key: wasi-artifacts-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles(format('{0}/tools/wasi-apps/**', inputs.checkout-path), format('{0}/Cargo.lock', inputs.checkout-path)) }}
+    - name: Stage WASI tooling artifacts
+      if: steps.artifact-cache.outputs.cache-hit != 'true'
+      shell: bash
+      working-directory: ${{ inputs.checkout-path }}
+      run: tools/wasi-apps/build.sh
+    - name: Restore pinned Fedora VM assets
+      if: inputs.guest-arch != ''
+      uses: actions/cache@v4
+      with:
+        path: |
+          ${{ inputs.checkout-path }}/target/perf-baselines/linux-vm/fedora-${{ inputs.guest-arch }}/*.qcow2
+          ${{ inputs.checkout-path }}/target/perf-baselines/linux-vm/fedora-${{ inputs.guest-arch }}/sources
+          ${{ inputs.checkout-path }}/target/perf-baselines/linux-vm/fedora-${{ inputs.guest-arch }}/tools
+        key: fedora-vm-assets-${{ inputs.guest-arch }}-${{ hashFiles(format('{0}/tools/wasi-apps/fedora_qemu_baseline.py', inputs.checkout-path)) }}
+    - uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: ${{ inputs.checkout-path }}
+        key: ${{ inputs.rust-cache-key }}
+    - name: Install inferno flamegraph renderer
+      if: inputs.flamegraphs == 'true'
+      shell: bash
+      run: cargo install inferno --locked
+    - name: Build inspector
+      if: inputs.inspector == 'true'
+      shell: bash
+      working-directory: ${{ inputs.checkout-path }}
+      run: cargo build --release -p helios-inspector
+    - name: Install the bench tooling
+      if: inputs.bench-tooling == 'true'
+      shell: bash
+      working-directory: ${{ inputs.checkout-path }}/tools/bench
+      run: uv sync --quiet

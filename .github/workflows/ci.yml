@@ -39,7 +39,7 @@ jobs:
           # splits them so a lint failure names the surface it came from
           # and each lane keeps its own build cache.
           - name: lint-fmt
-            command: just fmt-check
+            command: just fmt-check && just deny-check
           - name: lint-host
             command: just clippy-host && just clippy-programs
           - name: lint-aarch64
@@ -62,7 +62,7 @@ jobs:
             libudev-dev just cmake ninja-build
       - uses: taiki-e/install-action@v2
         with:
-          tool: wasm-tools
+          tool: wasm-tools,cargo-deny
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.13.0
@@ -265,6 +265,7 @@ jobs:
           # module, and the inspector refuses rather than falling back,
           # so a runner without it fails this step loudly.
           sudo modprobe vhost_vsock
+          sudo udevadm settle
           # udev creates the node root:kvm mode 0660 and the runner
           # account is not in that group, so QEMU's vhost backend cannot
           # open it. Hand the node to this account before asking for it.
@@ -451,6 +452,13 @@ jobs:
           cat boot-dt.out
           grep -Fqx ok boot-dt.out
           grep -F 'platform described by device-tree' "$runtime/inspector.log"
+          # The `virt` board's PL061 GPIO controller is hardware the
+          # kernel has no driver for, so discovery offers it to a
+          # user-mode one. This asserts the whole path from the device
+          # tree to a published grant, which is the only thing that
+          # proves the walk still sees a real device rather than
+          # nothing.
+          grep -F 'device grant published device=pl061@9030000' "$runtime/inspector.log"
       # The same guest under the same accelerator as the device-tree
       # boot above, described the other way. ACPI carries no counterpart
       # to `/chosen/rng-seed`, so this boot's seed comes from the CPU's
@@ -477,6 +485,12 @@ jobs:
           cat boot-acpi.out
           grep -Fqx ok boot-acpi.out
           grep -F 'platform described by acpi' "$runtime/inspector.log"
+          # The ACPI walk looks for virtio transports by hardware id and
+          # names nothing else, so an ACPI-described machine publishes
+          # no grants. Asserting the absence keeps that a stated fact
+          # rather than something that quietly starts or stops being
+          # true.
+          ! grep -qF 'device grant published' "$runtime/inspector.log"
       - name: Upload the inspector runtime directories
         if: failure()
         uses: actions/upload-artifact@v4

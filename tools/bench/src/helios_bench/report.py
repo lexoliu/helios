@@ -79,6 +79,19 @@ class RunInfo(BaseModel):
     baseline_ref: str | None = Field(
         default=None, description="what the run was asked to pair against, before it was resolved"
     )
+    kernel_build: str = Field(
+        default="release",
+        description=(
+            "the cargo profile the `helios` kernel was built with: `release`, or "
+            "`profile-use` for the profile-guided build of docs/pgo.md"
+        ),
+    )
+    baseline_kernel_build: str | None = Field(
+        default=None,
+        description=(
+            "the cargo profile the `helios_baseline` kernel was built with, when the run was paired"
+        ),
+    )
 
     @property
     def paired(self) -> bool:

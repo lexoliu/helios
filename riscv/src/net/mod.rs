@@ -22,7 +22,7 @@ type RiscvVirtioNetTransport = helios_virtio::VirtioMmioTransport<helios_virtio:
 type RiscvVirtioNetDevice = helios_virtio::VirtioNetDevice<RiscvVirtioNetTransport>;
 
 #[derive(Clone)]
-struct VirtioNetworkDevice {
+pub(crate) struct VirtioNetworkDevice {
     inner: Arc<RiscvVirtioNetDevice>,
     /// Held so the interrupt handler can steer by IPI.
     ///
@@ -129,8 +129,27 @@ impl ExternalInterrupts {
 
     fn enable_source(&self, source: InterruptSourceId) {
         self.plic.set_priority(source, 1);
-        self.plic.enable(source, self.context);
+        // Through the device path's guarded accessor, because that is
+        // the one place that owns the read-modify-write of a PLIC
+        // enable word — see its comment. A kernel device brought up
+        // while a granted one is being masked would otherwise lose a
+        // bit to it.
+        crate::device::set_source_enabled(self.plic, self.context, source, true);
         self.plic.set_threshold(self.context, 0);
+    }
+
+    /// Route a source a user-mode driver owns.
+    ///
+    /// Unlike every other attach, the source is left disabled: the
+    /// grant's owner arms it with its own `unmask`, and until something
+    /// owns the device an interrupt would have nowhere to go.
+    pub(crate) fn attach_device(
+        &mut self,
+        source: InterruptSourceId,
+        route: helios_kernel::DeviceInterruptRoute,
+    ) {
+        self.plic.set_threshold(self.context, 0);
+        self.routes.add_device(source, route);
     }
 
     pub(crate) fn handle(&self) {
@@ -207,7 +226,7 @@ impl NetworkDevice for VirtioNetworkDevice {
         &'a self,
         queue_idx: usize,
         frames: &'slots mut [Option<helios_virtio::RxFrame>],
-    ) -> Result<Option<usize>, IoError>
+    ) -> Option<helios_virtio::RxDrain>
     where
         'a: 'slots,
     {
@@ -251,6 +270,14 @@ impl NetworkDevice for VirtioNetworkDevice {
 
     fn queue_interrupts(&self, queue_idx: usize) -> u64 {
         self.inner.queue_interrupts(queue_idx)
+    }
+
+    fn rx_pool_stalls(&self, queue_idx: usize) -> u64 {
+        self.inner.rx_pool_stalls(queue_idx)
+    }
+
+    fn rx_pool_free(&self, queue_idx: usize) -> u32 {
+        self.inner.rx_pool_free(queue_idx)
     }
 }
 

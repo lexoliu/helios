@@ -47,6 +47,11 @@ HELIOS_OUT = "helios"
 HELIOS_BASELINE_OUT = "helios-baseline"
 LINUX_OUT = "linux"
 LINUX_SIDES = {Side.LINUX_NATIVE, Side.LINUX_WASMTIME}
+# The cargo profiles a Helios image of a run can be built with, as the
+# inspector names them. The baseline image is always the plain one: a
+# pairing varies the candidate.
+RELEASE_BUILD = "release"
+PROFILE_USE_BUILD = "profile-use"
 # Which subdirectory of the run's output each side's raw JSONL lands in.
 # The two Helios images write the same file names, so the directory is
 # what tells their records apart.
@@ -63,6 +68,7 @@ class NetworkOptions:
     ifname: str | None = None
     bridge: str | None = None
     queues: int | None = None
+    reuse_host_listeners: bool = False
 
 
 @dataclass(frozen=True)
@@ -95,6 +101,16 @@ class RunOptions:
     # shares it out over twice as many boots, and each of those boots
     # carries one workload rather than a whole class.
     baseline: Baseline | None = None
+    # The merged `.profdata` the candidate kernel is compiled against
+    # (docs/pgo.md). It pairs the same way a baseline commit does, and
+    # against the plain release build of this checkout: what varies
+    # between the columns is the profile, not the source.
+    profile_use: Path | None = None
+
+    @property
+    def kernel_build(self) -> str:
+        """The cargo profile the candidate kernel is built with."""
+        return PROFILE_USE_BUILD if self.profile_use else RELEASE_BUILD
 
 
 @dataclass(frozen=True)
@@ -152,6 +168,8 @@ def plan(options: RunOptions, manifest: Manifest, workloads: list[dict]) -> list
     ]
     if options.allow_busy_host:
         common.append("--allow-busy-host")
+    if options.network.reuse_host_listeners:
+        common.append("--reuse-host-listeners")
     for workload in workloads:
         common.extend(["--workload", workload["name"]])
     if Side.HELIOS in options.sides:
@@ -226,15 +244,20 @@ def plan(options: RunOptions, manifest: Manifest, workloads: list[dict]) -> list
 
 
 def baseline_arguments(options: RunOptions) -> list[str]:
-    """What the driver needs to time the second image beside the first."""
-    if options.baseline is None:
+    """What the driver needs to time the second image beside the first.
+
+    Either axis of a pairing names the same second output directory: the
+    two images write the same file names and the directory is what tells
+    their records apart.
+    """
+    arguments = []
+    if options.profile_use is not None:
+        arguments.extend(["--helios-profile-use", str(options.profile_use)])
+    if options.baseline is not None:
+        arguments.extend(["--helios-baseline-root", str(options.baseline.worktree)])
+    if not arguments:
         return []
-    return [
-        "--helios-baseline-root",
-        str(options.baseline.worktree),
-        "--helios-baseline-out-dir",
-        str(options.out_dir / HELIOS_BASELINE_OUT),
-    ]
+    return [*arguments, "--helios-baseline-out-dir", str(options.out_dir / HELIOS_BASELINE_OUT)]
 
 
 def execute(command: PlannedCommand) -> None:
@@ -266,15 +289,20 @@ def wasm_artifact_digests(workloads: list[dict]) -> dict[str, str]:
     return dict(sorted(digests.items()))
 
 
-def bootfs_cwasm_digests(lane: Lane) -> dict[str, str]:
-    """SHA256 of the signed cwasm files the Helios guest loaded."""
-    prebuild = REPO_ROOT / "target" / "kernel-prebuild" / CARGO_TARGETS[lane.helios_arch] / "release"
+def bootfs_cwasm_digests(lane: Lane, kernel_build: str) -> dict[str, str]:
+    """SHA256 of the signed cwasm files the Helios guest loaded.
+
+    Under the candidate's own build directory: the inspector's prebuild
+    writes beside the kernel it prebuilds for, so a PGO candidate's
+    bootfs is not in the plain release directory.
+    """
+    prebuild = REPO_ROOT / "target" / "kernel-prebuild" / CARGO_TARGETS[lane.helios_arch] / kernel_build
     if not prebuild.is_dir():
         return {}
     return {path.name: sha256_of(path) for path in sorted(prebuild.glob("*.cwasm"))}
 
 
-def collect_pins(lane: Lane, workloads: list[dict]) -> Pins:
+def collect_pins(lane: Lane, workloads: list[dict], kernel_build: str) -> Pins:
     image_url, image_sha256 = fedora_image(lane.guest_arch)
     return Pins(
         wasmtime_revision=vendored_wasmtime_revision(),
@@ -288,7 +316,7 @@ def collect_pins(lane: Lane, workloads: list[dict]) -> Pins:
         net_backend=lane.net_backend,
         devices=lane.devices,
         wasm_artifacts=wasm_artifact_digests(workloads),
-        bootfs_cwasm=bootfs_cwasm_digests(lane),
+        bootfs_cwasm=bootfs_cwasm_digests(lane, kernel_build),
     )
 
 
@@ -351,17 +379,24 @@ def read_controls(options: RunOptions, thresholds: Thresholds) -> dict[Side, tup
 def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) -> Report | None:
     lane = options.lane
     deviations = host_deviations(lane)
+    if options.network.reuse_host_listeners:
+        deviations.append(
+            "shared host listeners requested for reconnect diagnosis; not performance acceptance"
+        )
     if deviations and not options.advisory:
         raise SystemExit(
             "this host deviates from lane "
             f"{lane.name}; refusing to produce a publishable report:\n  - " + "\n  - ".join(deviations)
         )
-    if options.baseline is not None and not {Side.HELIOS, Side.HELIOS_BASELINE} <= options.sides:
+    paired = options.baseline is not None or options.profile_use is not None
+    if paired and not {Side.HELIOS, Side.HELIOS_BASELINE} <= options.sides:
         raise SystemExit(
             "a paired run times both Helios images: --sides has to name helios and helios_baseline"
         )
-    if options.baseline is None and Side.HELIOS_BASELINE in options.sides:
-        raise SystemExit("the helios_baseline side needs --baseline-ref to say what it is built from")
+    if not paired and Side.HELIOS_BASELINE in options.sides:
+        raise SystemExit(
+            "the helios_baseline side needs --baseline-ref or --profile-use to say what it is built from"
+        )
     workload_manifest = load_workloads()
     workloads = select_workloads(workload_manifest, options.workload_names)
     commands = plan(options, manifest, workloads)
@@ -402,8 +437,13 @@ def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) ->
         started_at=started,
         finished_at=finished,
         helios_git_sha=git_sha(),
-        baseline_git_sha=options.baseline.sha if options.baseline else None,
+        # A PGO pairing varies the build and not the commit, so the
+        # baseline image is this same commit: the run record says so
+        # rather than leaving the column unattributed.
+        baseline_git_sha=options.baseline.sha if options.baseline else (git_sha() if paired else None),
         baseline_ref=options.baseline.ref if options.baseline else None,
+        kernel_build=options.kernel_build,
+        baseline_kernel_build=RELEASE_BUILD if paired else None,
     )
     return assemble_report(
         workloads=workloads,
@@ -411,6 +451,6 @@ def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) ->
         control=control,
         run=run,
         hardware=collect_hardware(lane),
-        pins=collect_pins(lane, workloads),
+        pins=collect_pins(lane, workloads, options.kernel_build),
         thresholds=thresholds,
     )

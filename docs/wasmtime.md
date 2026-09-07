@@ -5,19 +5,26 @@ at `../wasmtime/crates/wasmtime`.
 
 ## Required revision
 
-The local checkout must be at (branch `helios/fiber-block-on-current`):
+The local checkout must be at (branch `helios/component-instance-memory`):
 
 ```text
-f9ea747c52b65aaa1b9216d6ac6d2a6c207e345a
+39819b1f81f3912dddfdcb25de6d5924aef15783
 ```
 
-CI does not clone that history. It checks out the vendored snapshot of the same
-tree, `lexoliu/wasmtime@6bbaceda21b3de992508f1c26e45f66bfd175e68` (branch
-`helios-vendored`), whose `crates/`, `cranelift/`, `winch/` and `pulley/`
-directories are identical to the revision above. The snapshot pin lives in one
-place, `.github/actions/checkout-wasmtime/action.yml`, and every workflow that
-needs the workspace to resolve uses that action. Update the pin there and the
-revision here in the same change.
+That revision is `helios/fiber-block-on-current` at
+`f9ea747c52b65aaa1b9216d6ac6d2a6c207e345a` plus one additive commit:
+`wasmtime::component::Instance::get_default_memory`, which returns the core
+memory a component instantiated for its own canonical ABI. The kernel's
+device grants (#5) place a device mapping inside a plugin's linear memory
+and need that memory's base and length; upstream exposes it for core
+modules (`wasmtime::Instance::get_memory`) and not for components. The
+accessor returns `None` when the component instantiated no memory or more
+than one.
+
+CI checks out the same commit from `lexoliu/wasmtime` at depth one; the pin
+lives in one place, `.github/actions/checkout-wasmtime/action.yml`, and every
+workflow that needs the workspace to resolve uses that action. Update the pin
+there and the revision here in the same change.
 
 This revision is based on upstream Wasmtime commit:
 

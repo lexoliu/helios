@@ -161,6 +161,13 @@ interface stats {
     /// room for them. They were already off the ring when they were
     /// refused, so they are lost and the peer has to retransmit.
     rx-refused-frames: u64,
+    /// Receive drains of this pair the driver refused: a mergeable chain
+    /// it cannot reconstruct, a header it cannot read, an offload
+    /// combination the device may not report. One count per refused
+    /// drain, not per frame. The frames the same drain had already taken
+    /// are delivered anyway, so this climbing beside a climbing
+    /// `rx-frames` is a device fault rate rather than a dead pair.
+    rx-device-refusals: u64,
     /// Acknowledgements this shard has put on the wire, duplicates
     /// included.
     tcp-acks-sent: u64,
@@ -179,6 +186,24 @@ interface stats {
     /// The receive window those connections advertise between them, in
     /// bytes. Zero with connections open is a shut receiver.
     tcp-receive-window-bytes: u64,
+    /// In-order payload bytes currently queued across live connections,
+    /// waiting to be read.
+    receive-queued-bytes: u64,
+    /// Out-of-order payload bytes currently buffered across live
+    /// connections, waiting on a hole to close.
+    out-of-order-queued-bytes: u64,
+    /// Segments this shard received whose payload sat wholly at or
+    /// below receive_next.
+    peer-retransmits-received: u64,
+    /// Duplicate acknowledgements this shard requested because an
+    /// out-of-order segment arrived.
+    duplicate-acks-requested: u64,
+    /// Times frame reception stalled because this queue pair's receive
+    /// reassembly pool had no free buffers.
+    rx-pool-stalls: u64,
+    /// Free reassembly buffers currently available in this queue pair's
+    /// receive pool. Zero if no pool is configured.
+    rx-pool-free: u32,
   }
 
   /// How the interface's work is spread across processors.
@@ -190,6 +215,36 @@ interface stats {
   /// frame on the first entry.
   record network {
     queues: list<network-queue>,
+  }
+
+  /// One piece of hardware the kernel does not drive itself, offered
+  /// to a user-mode driver.
+  record granted-device {
+    /// The name the firmware gave the device, which is the name a
+    /// driver asks for.
+    name: string,
+    /// Register space the grant covers, across all its regions.
+    region-bytes: u64,
+    /// How many separate windows that is.
+    regions: u32,
+    /// Interrupt lines the device raises.
+    interrupts: u32,
+    /// Most bytes the kernel will pin for the device at once.
+    dma-budget-bytes: u64,
+    /// Whether an I/O translation unit confines the device's own reads
+    /// and writes.
+    confined: bool,
+    /// Whether an instance currently holds it.
+    claimed: bool,
+    /// Interrupts the kernel has handed to the owner.
+    interrupts-forwarded: u64,
+    /// Interrupts that arrived while one was still outstanding, and
+    /// were folded into it rather than queued.
+    interrupts-coalesced: u64,
+    /// Lines currently held off at the controller, waiting for the
+    /// owner to acknowledge. Persistently equal to `interrupts` is a
+    /// driver that has stopped servicing its device.
+    masked-sources: u32,
   }
 
   record sample {
@@ -217,6 +272,9 @@ interface stats {
     host-share: option<host-share-cache>,
     /// Absent on a machine that gave the kernel no network device.
     network: option<network>,
+    /// Hardware the kernel has no driver for and has offered to
+    /// user-mode ones. Empty on a machine that described none.
+    devices: list<granted-device>,
   }
 
   /// Returns the latest coherent system-wide observation snapshot.

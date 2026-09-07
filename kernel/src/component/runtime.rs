@@ -256,6 +256,13 @@ pub trait ComponentRuntimeState: Clone + Send + 'static {
     /// memory back before it condemns an instance.
     fn memory_balloon(&self) -> Option<crate::memory::BalloonHandle>;
 
+    /// The devices discovery is willing to hand to a user-mode driver.
+    ///
+    /// Empty on a machine whose backend found nothing outside the
+    /// hardware it drives itself, which is every machine until a
+    /// backend publishes a grant.
+    fn device_grants(&self) -> &crate::device::DeviceGrantRegistry;
+
     fn profiling_enabled(&self) -> bool;
 
     fn record_profile_stack_nanos(
@@ -280,6 +287,15 @@ pub trait ComponentRuntimeState: Clone + Send + 'static {
         suffix: &str,
         sample: crate::PerfSample,
     );
+
+    /// Retires the network handles that a dying socket resource could
+    /// not retire itself, and wakes the packet pump if any did.
+    ///
+    /// The runtime state is the one value that holds the machine's
+    /// network service, so it is where a queue of bare handle ids turns
+    /// back into closes. See [`super::SocketRetirementQueue`] for why
+    /// a socket resource cannot do it itself.
+    fn retire_network_handles(&self, retired: &super::SocketRetirementQueue);
 }
 
 pub(crate) struct ComponentExecutionContext<FileSystem> {
@@ -298,6 +314,13 @@ where
     RuntimeStateImpl: ComponentRuntimeState,
 {
     pub table: ResourceTableImpl,
+    /// The handles of socket resources that have died, and the runtime
+    /// state that closes them.
+    ///
+    /// Declared after `table` on purpose: the table is torn down first,
+    /// so every socket resource still in it has already pushed what it
+    /// owned by the time this field's `Drop` drains the queue.
+    pub retirement: super::StoreSocketRetirement<RuntimeStateImpl>,
     pub cpu: CpuImpl,
     timer: Timer<CpuImpl>,
     spawner: crate::InstanceSpawner<CpuImpl>,
@@ -308,6 +331,10 @@ where
     execution_context: ComponentExecutionContext<FileSystem>,
     serial_reader: crate::SerialReader,
     serial_writer: crate::DebugSerialWriter,
+    /// Where this instance's linear memory sits and the device it
+    /// holds, if any. Empty on every instance that never asks for one,
+    /// which is every instance that is not a driver.
+    pub device: crate::device::DeviceOwnership,
     /// Set by the runtime exit interface before the guest
     /// traps; the executor reads it to distinguish a clean requested
     /// exit (turn into an exit code) from an actual runtime error.
@@ -378,6 +405,7 @@ where
         let clock = KernelClock::new(cpu.clone(), runtime_state.clone());
         Self {
             table,
+            retirement: super::StoreSocketRetirement::new(runtime_state.clone()),
             cpu,
             timer,
             spawner,
@@ -397,8 +425,19 @@ where
             ),
             serial_reader,
             serial_writer,
+            device: crate::device::DeviceOwnership::new(),
             requested_exit: None,
         }
+    }
+
+    /// Retires every network handle a dying socket resource queued
+    /// since the last drain.
+    ///
+    /// Called at the entry to every host call, and again right after a
+    /// socket resource is deleted so that the common case — a guest
+    /// closing its own connection — retires on that very call.
+    pub fn retire_sockets(&self) {
+        self.retirement.drain();
     }
 
     /// Record the exit code requested by the runtime exit interface so the

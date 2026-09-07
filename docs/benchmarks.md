@@ -134,7 +134,10 @@ Per cell (workload × side), `iterations` executions (11 by default):
     own report: one host, one job, the two images booted back to back for
     every workload. Nothing about the machine differs between the
     columns, so this half blocks on a headline regression whether or not
-    the report is publishable.
+    the report is publishable. Every headline also needs a valid cell
+    from both images: a missing, failed or variance-rejected cell blocks
+    as incomplete paired evidence, rather than disappearing from the
+    acceptance decision. Comparable rows remain in the report.
   - **Cross-run**, against the newest `dev` report of the same lane:
     another job, another runner. This half blocks only when both reports
     are publishable *and* their run records name the same host CPU;
@@ -376,10 +379,40 @@ own under `$XDG_RUNTIME_DIR` and links it as `<runtime>/sockets`; see
 
 `bench-suite.yml` runs a pull request in paired mode against
 `github.event.pull_request.base.sha`, and `workflow_dispatch` takes a
-`baseline_ref` input. The `bench-x86-64-linux` lane of `ci.yml` is
-unchanged except that the inspector now writes the host CPU model into
-the `run` record it emits, so a comparison between two of its runs can
-tell one machine from two.
+`baseline_ref` input. An advisory dispatch with an explicit baseline is
+revision acceptance: it runs only `helios` and `helios_baseline`, with
+all workloads, warm iterations, before/after compute controls, and the
+same enforced paired gate. It does not run the unrelated Linux
+comparisons or independent profile-generation/PGO experiment. Unpaired
+dispatches, labelled PR runs, dedicated runs and publication events retain
+the full suite and profiling flow. Mode selection is computed once by the
+tooling job, so profile generation starts only after tooling succeeds.
+
+Each guest boot gets fresh host HTTP, TCP throughput, and echo listeners
+with the same payloads and configuration, provisioned before timing and
+closed after that guest finishes. Reusing a listener across rebooted
+images also reuses the peer's old connection state: the later guest can
+pay a SYN retransmission for every reused four-tuple, contaminating even
+its warm series. Ordinary measurements isolate these listeners; explicit
+`--reuse-host-listeners` is reserved for reconnect diagnosis and marks the
+report as unsuitable for performance acceptance.
+
+The `bench-x86-64-linux` lane of `ci.yml` is unchanged except that the
+inspector now writes the host CPU model into the `run` record it emits,
+so a comparison between two of its runs can tell one machine from two.
+
+For TCP reconnect diagnosis, a dispatch can explicitly set `tcp_probe=true`
+and supply `baseline_ref`. That mode explicitly enables
+`--reuse-host-listeners` and captures two iterations of `tcp-throughput`
+on each image with `--net-queues 1`, as required by QEMU's packet filter.
+Setup provisions a matching single-queue TAP, and the explicit capture
+selects QEMU's userspace TAP path (`vhost=off`), because
+the filter cannot attach to vhost-net. Packet captures and raw logs are
+retained in the runtime artifact; the diagnostic report is named
+`tcp-probe-<lane>`. It is always
+non-publishable and does not run the performance gate or PGO experiment.
+It is not acceptance evidence: normal multi-queue acceptance still runs
+the full workload set and its configured warm series.
 
 ## Reproducing a published number
 

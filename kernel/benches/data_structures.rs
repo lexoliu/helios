@@ -11,9 +11,9 @@ use helios_hal::resource::KernelResource;
 use helios_hal::watchdog::ProgressCounter;
 use helios_kernel::SocketReadiness;
 use helios_kernel::{
-    ComponentHostNetworkService, ComponentNetworkService, DescriptorId, DescriptorTable, DnsError,
-    DnsErrorKind, Executor, FutexKey, FutexTable, GuestAddress, Ipv4Address, Ipv4Cidr, Ipv4Route,
-    MacAddress, NetworkAdminBackend, NetworkBridgeRequest, NetworkControlError, NetworkErrorDetail,
+    ComponentNetworkService, DescriptorId, DescriptorTable, DnsError, DnsErrorKind, Executor,
+    FutexKey, FutexTable, GuestAddress, Ipv4Address, Ipv4Cidr, Ipv4Route, MacAddress,
+    NetworkAdminBackend, NetworkBridgeRequest, NetworkControlError, NetworkErrorDetail,
     NetworkIpAddress, NetworkPortId, Notify, PingError, PingErrorKind, PingReply,
     ProcessMemoryIdentity, TcpAccepted, TcpError, TcpErrorKind, TcpListener, Timer, TryRead,
     TryWrite, UdpBinding, UdpDatagram, UdpError, UdpErrorKind, byte_channel,
@@ -32,11 +32,11 @@ struct BenchNetworkService {
 }
 
 struct MutexNetworkServiceSlot {
-    service: Mutex<Option<ComponentHostNetworkService>>,
+    service: Mutex<Option<BenchNetworkService>>,
 }
 
 struct OnceNetworkServiceSlot {
-    service: Once<ComponentHostNetworkService>,
+    service: Once<BenchNetworkService>,
 }
 
 #[derive(Clone)]
@@ -419,22 +419,23 @@ fn component_network_direct_tcp_read(bencher: Bencher, count: usize) {
     });
 }
 
-// This captures the current component-host network adapter tax: the typed
-// service call is allocation-free, while the erased adapter path boxes one
-// future per call. On this host, 1024 direct reads measured about 7.5 us while
-// the erased path measured about 16.9 us and allocated 1024 x 32 B. The VM TCP
-// profile uses this path for every typed read, so the next real fix is a typed
-// component-host network state, not another local TCP bridge workaround.
+// The component host's read path, as a component reaches it. It used to
+// run through an erased adapter that boxed one future per call — 1024
+// reads measured about 16.9 us against 7.5 us direct, and allocated
+// 1024 x 32 B — and this benchmark measured that tax. The host is
+// generic over the machine's network service now (#219), so the same
+// call is the direct one and the benchmark holds the floor it used to
+// name.
 #[divan::bench(args = [1usize, 64, 1024])]
-fn component_network_erased_tcp_read(bencher: Bencher, count: usize) {
-    let service = ComponentHostNetworkService::from_service(BenchNetworkService {
+fn component_network_tcp_read(bencher: Bencher, count: usize) {
+    let service = BenchNetworkService {
         payload: Bytes::copy_from_slice(&[7; 4096]),
-    });
+    };
     bencher.counter(ItemsCount::new(count)).bench_local(|| {
         for _ in 0..count {
             let bytes = futures_lite::future::block_on(service.tcp_read(1, 4096, 0))
-                .expect("erased benchmark TCP read should succeed")
-                .expect("erased benchmark TCP read should return data");
+                .expect("benchmark TCP read should succeed")
+                .expect("benchmark TCP read should return data");
             black_box(bytes);
         }
     });
@@ -469,26 +470,26 @@ fn file(id: u64) -> KernelResource<BenchFile, FileRights> {
     black_box(resource)
 }
 
-fn component_network_service() -> ComponentHostNetworkService {
-    ComponentHostNetworkService::from_service(BenchNetworkService {
+fn component_network_service() -> BenchNetworkService {
+    BenchNetworkService {
         payload: Bytes::copy_from_slice(&[7; 4096]),
-    })
+    }
 }
 
 impl MutexNetworkServiceSlot {
-    fn new(service: ComponentHostNetworkService) -> Self {
+    fn new(service: BenchNetworkService) -> Self {
         Self {
             service: Mutex::new(Some(service)),
         }
     }
 
-    fn get(&self) -> Option<ComponentHostNetworkService> {
+    fn get(&self) -> Option<BenchNetworkService> {
         self.service.lock().clone()
     }
 }
 
 impl OnceNetworkServiceSlot {
-    fn new(service: ComponentHostNetworkService) -> Self {
+    fn new(service: BenchNetworkService) -> Self {
         let slot = Self {
             service: Once::new(),
         };
@@ -496,7 +497,7 @@ impl OnceNetworkServiceSlot {
         slot
     }
 
-    fn get(&self) -> Option<ComponentHostNetworkService> {
+    fn get(&self) -> Option<BenchNetworkService> {
         self.service.get().cloned()
     }
 }
@@ -674,6 +675,8 @@ impl ComponentNetworkService for BenchNetworkService {
 
     fn tcp_close(&self, _stream: Self::TcpStream) {}
 
+    fn tcp_listener_close(&self, _listener: Self::TcpListener) {}
+
     async fn udp_bind(&self, local_port: u16) -> Result<UdpBinding<Self::UdpSocket>, UdpError> {
         Ok(UdpBinding {
             socket: 1,
@@ -728,7 +731,7 @@ impl ComponentNetworkService for BenchNetworkService {
         Ok(())
     }
 
-    async fn udp_close(&self, _socket: Self::UdpSocket) {}
+    fn udp_close(&self, _socket: Self::UdpSocket) {}
 }
 
 impl Cpu for BenchCpu {

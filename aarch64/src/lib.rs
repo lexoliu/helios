@@ -158,6 +158,7 @@ mod vmm;
 pub use vmm::Aarch64UserAddressSpace;
 mod balloon;
 mod block;
+mod device;
 mod entropy;
 mod gic;
 mod host_fs;
@@ -167,10 +168,19 @@ mod rtc;
 mod vsock;
 
 mod debug_state {
-    pub(crate) type RuntimeState =
-        helios_kernel::HostRuntimeState<crate::Aarch64Cpu, crate::host_fs::HostFileSystemService>;
-    pub(crate) type ProgramService =
-        helios_kernel::UserProgramService<crate::Aarch64Cpu, crate::host_fs::HostFileSystemService>;
+    /// The network service this machine's virtio-net device backs.
+    pub(crate) type NetworkService =
+        helios_kernel::NetworkService<crate::Aarch64Cpu, crate::net::VirtioNetworkDevice>;
+    pub(crate) type RuntimeState = helios_kernel::HostRuntimeState<
+        crate::Aarch64Cpu,
+        NetworkService,
+        crate::host_fs::HostFileSystemService,
+    >;
+    pub(crate) type ProgramService = helios_kernel::UserProgramService<
+        crate::Aarch64Cpu,
+        NetworkService,
+        crate::host_fs::HostFileSystemService,
+    >;
 }
 
 /// Interrupt routes the bootstrap processor installs for the virtio
@@ -500,6 +510,10 @@ struct Aarch64CriticalSection;
 
 critical_section::set_impl!(Aarch64CriticalSection);
 
+// The processor-local half, for locks that carry their own spin word
+// and need only to keep this processor's interrupt handler out.
+helios_hal::critical_section::set_local_interrupt_mask_impl!(Aarch64InterruptOps);
+
 unsafe impl critical_section::Impl for Aarch64CriticalSection {
     unsafe fn acquire() -> usize {
         unsafe { CRITICAL_SECTION_STATE.acquire::<Aarch64InterruptOps>() }
@@ -638,6 +652,9 @@ extern "C" fn aarch64_kernel_main() -> ! {
         &handoff,
     ));
     gic.attach_current_processor(platform_state.bootstrap_mpidr());
+    // The device path's platform surface comes up with the controller
+    // and before any grant is published, which the registry enforces.
+    device::install_hooks(gic);
 
     let mut routes = DeviceInterruptRoutes::new();
     if let Some(host_fs) = host_fs::install(
@@ -717,6 +734,17 @@ extern "C" fn aarch64_kernel_main() -> ! {
             platform_state.bootstrap_mpidr(),
         );
         routes.add_block(block.interrupt, block.device);
+    }
+
+    // Everything the kernel drives itself has claimed its interrupt by
+    // now, so what the firmware described and nobody took is exactly
+    // what a driver plugin may be handed.
+    for (intid, route) in device::publish_grants(
+        &platform,
+        debug_state.device_grants(),
+        platform_state.bootstrap_mpidr(),
+    ) {
+        routes.add_device(intid, route);
     }
 
     let runtime = current_processor_runtime();
@@ -1676,22 +1704,32 @@ fn table_from_physical(physical_address: usize, physical_memory_offset: usize) -
 }
 
 fn fdt_cells_to_usize(bytes: &[u8], name: &str) -> usize {
-    assert!(
-        bytes.len() == 4 || bytes.len() == 8,
-        "{name} must contain one or two 32-bit cells, got {} bytes",
-        bytes.len()
-    );
+    fdt_cells(bytes).unwrap_or_else(|| {
+        panic!(
+            "{name} must contain one or two 32-bit cells, got {} bytes",
+            bytes.len()
+        )
+    })
+}
+
+/// The value one or two big-endian cells spell, or `None` when the
+/// property is not that shape.
+///
+/// [`fdt_cells_to_usize`] is for a caller reading a node it chose,
+/// where a different shape means a tree this backend cannot boot on. A
+/// walk over nodes nobody chose meets `reg` properties written against
+/// `#size-cells = <0>` — a processor, a PCI function — and those are
+/// simply not devices with a register window.
+fn fdt_cells(bytes: &[u8]) -> Option<usize> {
+    if bytes.len() != 4 && bytes.len() != 8 {
+        return None;
+    }
     let mut value = 0usize;
     for cell in bytes.chunks_exact(4) {
-        value = value
-            .checked_shl(32)
-            .unwrap_or_else(|| panic!("{name} cell shift overflow"))
-            | u32::from_be_bytes(
-                cell.try_into()
-                    .unwrap_or_else(|_| panic!("{name} cell had invalid width")),
-            ) as usize;
+        let cell = u32::from_be_bytes(cell.try_into().ok()?) as usize;
+        value = value.checked_shl(32)? | cell;
     }
-    value
+    Some(value)
 }
 
 fn mmio_virtual_base(physical_base: usize, physical_memory_offset: usize) -> usize {

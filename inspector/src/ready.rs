@@ -4,12 +4,59 @@ use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use anyhow::{Context as _, Result};
 use futures_io::AsyncRead;
+use helios_inspector_protocol::RpcError;
 use helios_inspector_protocol::system::stats;
 
 use crate::runtime;
 use crate::serial::{RpcClient, RpcReader, SerialIo};
+
+/// Why the inspector never saw the guest reach `wasi:cli/run`.
+///
+/// The variants separate the three things that can go wrong on the way
+/// up, because each names a different place to look: the serial link
+/// itself, the guest's own console (a panic report), and the readiness
+/// probe that runs once the link is up.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum BootError {
+    #[error("timed out waiting for the embedded debugger cold-start markers")]
+    MarkersTimedOut,
+    #[error("failed to read kernel boot markers from the debug serial link: {source}")]
+    ReadMarkers {
+        #[source]
+        source: io::Error,
+    },
+    #[error("debug serial link closed before the embedded debugger entered wasi:cli/run")]
+    LinkClosedBeforeRun,
+    #[error("kernel panicked before the embedded debugger entered wasi:cli/run: {report}{trailer}")]
+    GuestPanicked { report: String, trailer: String },
+    #[error("failed to drain debugger boot preamble: {source}")]
+    DrainPreamble {
+        #[source]
+        source: io::Error,
+    },
+    #[error("debug serial link closed while draining boot preamble")]
+    LinkClosedDrainingPreamble,
+    #[error("debug serial preamble contained non-utf8 bytes: {source}")]
+    PreambleNotUtf8 {
+        #[source]
+        source: core::str::Utf8Error,
+    },
+    #[error("a debugger stage marker shared its serial line with other output: {line:?}")]
+    MarkerSharesLine { line: String },
+    #[error("multiple debugger stage markers appeared on one serial line: {line:?}")]
+    MultipleMarkersOnLine { line: String },
+    #[error("timed out waiting for remote stats readiness probe")]
+    ReadinessProbeTimedOut,
+    #[error(
+        "failed to fetch initial remote stats snapshot while waiting for debugger readiness: \
+         {source}"
+    )]
+    ReadinessProbeFailed {
+        #[source]
+        source: RpcError,
+    },
+}
 
 const BOOT_SYNC_TIMEOUT: Duration = Duration::from_secs(900);
 const READY_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
@@ -46,7 +93,7 @@ fn boot_sync_timeout() -> Duration {
         .unwrap_or(BOOT_SYNC_TIMEOUT)
 }
 
-pub(crate) async fn connect_after_boot(io: SerialIo) -> Result<RpcClient> {
+pub(crate) async fn connect_after_boot(io: SerialIo) -> Result<RpcClient, BootError> {
     let (read, write) = io.into_split();
     let read = wait_for_boot(read).await?;
     let mut client = helios_inspector_protocol::transport::Client::new(read, write);
@@ -63,7 +110,7 @@ pub(crate) async fn connect_after_boot(io: SerialIo) -> Result<RpcClient> {
 ///
 /// The transport comes back drained: the caller's next reader — the RPC
 /// client or the console echo — starts on the byte after the preamble.
-pub(crate) async fn wait_for_boot(read: RpcReader) -> Result<RpcReader> {
+pub(crate) async fn wait_for_boot(read: RpcReader) -> Result<RpcReader, BootError> {
     let echo = ConsoleEcho::new();
     let mut lines = SerialLines::new(read);
     runtime::timeout(
@@ -71,7 +118,7 @@ pub(crate) async fn wait_for_boot(read: RpcReader) -> Result<RpcReader> {
         wait_for_debugger_stage(&mut lines, &echo),
     )
     .await
-    .context("timed out waiting for the embedded debugger cold-start markers")??;
+    .ok_or(BootError::MarkersTimedOut)??;
     Ok(lines.into_transport())
 }
 
@@ -101,13 +148,11 @@ pub(crate) fn echo_serial_console(read: RpcReader) {
     });
 }
 
-pub(crate) async fn wait_until_ready(client: &mut RpcClient) -> Result<()> {
+pub(crate) async fn wait_until_ready(client: &mut RpcClient) -> Result<(), BootError> {
     runtime::timeout(READY_PROBE_TIMEOUT, stats::snapshot(client))
         .await
-        .context("timed out waiting for remote stats readiness probe")?
-        .context(
-            "failed to fetch initial remote stats snapshot while waiting for debugger readiness",
-        )?;
+        .ok_or(BootError::ReadinessProbeTimedOut)?
+        .map_err(|source| BootError::ReadinessProbeFailed { source })?;
     Ok(())
 }
 
@@ -231,16 +276,14 @@ impl<R: AsyncRead + Unpin> SerialLines<R> {
 async fn wait_for_debugger_stage(
     lines: &mut SerialLines<RpcReader>,
     echo: &ConsoleEcho,
-) -> Result<()> {
+) -> Result<(), BootError> {
     loop {
         let framed = lines
             .advance()
             .await
-            .context("failed to read kernel boot markers from the debug serial link")?;
+            .map_err(|source| BootError::ReadMarkers { source })?;
         if !framed {
-            anyhow::bail!(
-                "debug serial link closed before the embedded debugger entered wasi:cli/run"
-            );
+            return Err(BootError::LinkClosedBeforeRun);
         }
 
         if let Some(stage) = parse_stage_marker(lines.line())? {
@@ -254,10 +297,10 @@ async fn wait_for_debugger_stage(
             echo.guest_line(&text);
             if text.contains("panicked at") {
                 let trailer = collect_panic_trailer(lines).await;
-                anyhow::bail!(
-                    "kernel panicked before the embedded debugger entered \
-                     wasi:cli/run: {text}{trailer}"
-                );
+                return Err(BootError::GuestPanicked {
+                    report: text,
+                    trailer,
+                });
             }
         }
     }
@@ -313,13 +356,13 @@ async fn collect_panic_trailer(lines: &mut SerialLines<RpcReader>) -> String {
     trailer
 }
 
-async fn drain_boot_preamble(lines: &mut SerialLines<RpcReader>) -> Result<()> {
+async fn drain_boot_preamble(lines: &mut SerialLines<RpcReader>) -> Result<(), BootError> {
     let open = lines
         .drain_until_quiet(READY_DRAIN_QUIET_PERIOD)
         .await
-        .context("failed to drain debugger boot preamble")?;
+        .map_err(|source| BootError::DrainPreamble { source })?;
     if !open {
-        anyhow::bail!("debug serial link closed while draining boot preamble");
+        return Err(BootError::LinkClosedDrainingPreamble);
     }
     Ok(())
 }
@@ -337,9 +380,8 @@ const MARKER_PREFIX: &str = "[KDBG ";
 /// line that should not have held anything else; a line that carries
 /// the prefix and is not a marker is that guarantee breaking, and says
 /// so rather than recovering a marker out of it.
-fn parse_stage_marker(line: &[u8]) -> Result<Option<&str>> {
-    let text =
-        std::str::from_utf8(line).context("debug serial preamble contained non-utf8 bytes")?;
+fn parse_stage_marker(line: &[u8]) -> Result<Option<&str>, BootError> {
+    let text = std::str::from_utf8(line).map_err(|source| BootError::PreambleNotUtf8 { source })?;
     if !text.contains(MARKER_PREFIX) {
         return Ok(None);
     }
@@ -347,10 +389,14 @@ fn parse_stage_marker(line: &[u8]) -> Result<Option<&str>> {
         .strip_prefix(MARKER_PREFIX)
         .and_then(|stage| stage.strip_suffix(']'))
     else {
-        anyhow::bail!("a debugger stage marker shared its serial line with other output: {text:?}");
+        return Err(BootError::MarkerSharesLine {
+            line: text.to_owned(),
+        });
     };
     if stage.contains(']') {
-        anyhow::bail!("multiple debugger stage markers appeared on one serial line: {text:?}");
+        return Err(BootError::MultipleMarkersOnLine {
+            line: text.to_owned(),
+        });
     }
     Ok(Some(stage))
 }

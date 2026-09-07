@@ -84,13 +84,55 @@ where
     }
 }
 
-#[derive(Clone)]
+/// The kernel socket a `helios:system/net` `udp-socket` resource owns.
+///
+/// The same rule as [`ComponentTcpBackend`], for the same reason: the
+/// socket is retired when this backend is dropped, whichever way the
+/// resource's life ends. A datagram socket is replicated on every
+/// shard and holds a slot in `udp_slots`, so one left behind by a
+/// program that exited costs every shard, which is what #190 saw.
 pub struct ComponentUdpBackend<Service>
 where
     Service: ComponentNetworkService,
 {
     pub service: Service,
-    pub socket: Service::UdpSocket,
+    socket: Option<Service::UdpSocket>,
+}
+
+impl<Service> ComponentUdpBackend<Service>
+where
+    Service: ComponentNetworkService,
+{
+    pub fn new(service: Service, socket: Service::UdpSocket) -> Self {
+        Self {
+            service,
+            socket: Some(socket),
+        }
+    }
+
+    /// The socket this resource still owns, or `None` once `close` has
+    /// retired it.
+    pub fn socket(&self) -> Option<Service::UdpSocket> {
+        self.socket
+    }
+
+    /// Retires the socket now. A second call, and the drop that follows
+    /// it, do nothing: a handle is retired exactly once, because its
+    /// slab slot is reused by the next bind.
+    pub fn close(&mut self) {
+        if let Some(socket) = self.socket.take() {
+            self.service.udp_close(socket);
+        }
+    }
+}
+
+impl<Service> Drop for ComponentUdpBackend<Service>
+where
+    Service: ComponentNetworkService,
+{
+    fn drop(&mut self) {
+        self.close();
+    }
 }
 
 pub struct ComponentRawMutex {
@@ -115,7 +157,7 @@ pub struct ComponentRawRwLockWriteGuard {
 
 #[cfg(all(test, feature = "wasmtime-runtime"))]
 mod tests {
-    use super::ComponentTcpBackend;
+    use super::{ComponentTcpBackend, ComponentUdpBackend};
     use crate::test_support::TestNetworkService;
 
     /// A `helios:system/net` stream resource retires its kernel stream
@@ -159,5 +201,48 @@ mod tests {
         backend.close();
         drop(backend);
         assert_eq!(closed.count(), 1, "a stream is retired exactly once");
+    }
+
+    /// A `helios:system/net` datagram-socket resource retires its
+    /// kernel socket when it is dropped.
+    ///
+    /// `udp-socket`'s destructor is reached only when the *guest* drops
+    /// the handle; a store torn down with the handle still open runs
+    /// nothing. Closing from the destructor alone therefore left the
+    /// socket bound on every shard, and its slot in `udp_slots` taken,
+    /// for the rest of the boot (#190).
+    #[test]
+    fn a_system_net_udp_socket_retires_itself_when_its_resource_is_dropped() {
+        let service = TestNetworkService::new();
+        let closed = service.closed_udp_sockets();
+        let backend = ComponentUdpBackend::new(service, 9);
+
+        assert_eq!(backend.socket(), Some(9));
+        assert_eq!(closed.count(), 0);
+        drop(backend);
+        assert_eq!(closed.count(), 1, "the backend owns the socket it holds");
+        assert_eq!(closed.last(), 9);
+    }
+
+    /// `udp-socket.close` retires the socket once, and the drop that
+    /// follows it does nothing: the slab slot a retired handle frees is
+    /// handed to the next bind, so a second close would retire somebody
+    /// else's socket.
+    #[test]
+    fn a_closed_system_net_udp_socket_is_not_retired_a_second_time() {
+        let service = TestNetworkService::new();
+        let closed = service.closed_udp_sockets();
+        let mut backend = ComponentUdpBackend::new(service, 9);
+
+        backend.close();
+        assert_eq!(closed.count(), 1);
+        assert_eq!(
+            backend.socket(),
+            None,
+            "a closed socket is gone from the resource"
+        );
+        backend.close();
+        drop(backend);
+        assert_eq!(closed.count(), 1, "a socket is retired exactly once");
     }
 }

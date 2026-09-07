@@ -4,6 +4,7 @@
 extern crate alloc;
 mod balloon;
 mod block;
+mod device;
 mod entropy;
 mod host_fs;
 mod net;
@@ -13,10 +14,19 @@ mod vsock;
 mod watchdog;
 
 mod debug_state {
-    pub(crate) type RuntimeState =
-        helios_kernel::HostRuntimeState<crate::RiscvCpu, crate::host_fs::HostFileSystemService>;
-    pub(crate) type ProgramService =
-        helios_kernel::UserProgramService<crate::RiscvCpu, crate::host_fs::HostFileSystemService>;
+    /// The network service this machine's virtio-net device backs.
+    pub(crate) type NetworkService =
+        helios_kernel::NetworkService<crate::RiscvCpu, crate::net::VirtioNetworkDevice>;
+    pub(crate) type RuntimeState = helios_kernel::HostRuntimeState<
+        crate::RiscvCpu,
+        NetworkService,
+        crate::host_fs::HostFileSystemService,
+    >;
+    pub(crate) type ProgramService = helios_kernel::UserProgramService<
+        crate::RiscvCpu,
+        NetworkService,
+        crate::host_fs::HostFileSystemService,
+    >;
 }
 
 use ns16550a::Uart;
@@ -271,6 +281,10 @@ impl helios_hal::critical_section::InterruptOps for SupervisorInterruptOps {
 struct SupervisorCriticalSection;
 
 critical_section::set_impl!(SupervisorCriticalSection);
+
+// The processor-local half, for locks that carry their own spin word
+// and need only to keep this processor's interrupt handler out.
+helios_hal::critical_section::set_local_interrupt_mask_impl!(SupervisorInterruptOps);
 
 unsafe impl critical_section::Impl for SupervisorCriticalSection {
     unsafe fn acquire() -> usize {
@@ -697,6 +711,10 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
         // is opened once and each device attaches its own source to it.
         net::discover_plic_context(&fdt, bootstrap_processor.id()).map(|(plic, context)| {
             let mut interrupts = net::ExternalInterrupts::new(plic, context);
+            // The device path's platform surface comes up with the
+            // controller and before any grant is published, which the
+            // registry enforces.
+            device::install_hooks(plic, context);
             if let Some(network) = net::install_network_service(&cpu, &kernel, &fdt, &debug_state) {
                 interrupts.attach_network(network);
             }
@@ -716,6 +734,12 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
             }
             for block in block::install(&cpu, &kernel, &fdt, &debug_state, root_entropy) {
                 interrupts.attach_block(block);
+            }
+            // Everything the kernel drives itself has claimed its
+            // source by now, so what the tree describes and nobody took
+            // is exactly what a driver plugin may be handed.
+            for (source, route) in device::publish_grants(&fdt, debug_state.device_grants()) {
+                interrupts.attach_device(source, route);
             }
             // The Sv48 address space reserves and commits lazily, so a page
             // could be taken away here — but the backend has not wired the

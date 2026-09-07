@@ -43,6 +43,7 @@ futures = { version = "0.3.31", default-features = false, features = ["alloc"] }
 hashbrown = { version = "0.16.1", default-features = false, features = ["allocator-api2", "default-hasher", "equivalent", "inline-more"] }
 heapless = { version = "0.7.17", default-features = false }
 nu-ansi-term = { version = "0.50.3", default-features = false }
+pin-project-lite = "0.2.17"
 objectpool = { version = "0.1.0", default-features = false, features = ["alloc"] }
 helios-artifact.workspace = true
 helios-compiler-abi.workspace = true

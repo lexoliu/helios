@@ -19,6 +19,7 @@
 # enabled before the trampoline calls into any compiler-generated code.
 .equ HELIOS_X86_CR4_ENABLE_SSE, 0x00000600
 .equ HELIOS_X86_EFER_MSR, 0xC0000080
+.equ HELIOS_X86_FS_BASE_MSR, 0xC0000100
 .equ HELIOS_X86_EFER_LONG_MODE_ENABLE, 0x00000100
 .equ HELIOS_X86_EFER_NO_EXECUTE_ENABLE, 0x00000800
 .equ HELIOS_X86_PROTECTED_MODE_START_OFFSET, helios_x86_secondary_wakeup_protected_mode_start - helios_x86_secondary_wakeup_start
@@ -126,8 +127,19 @@ helios_x86_secondary_wakeup_long_mode_start:
 
     mov rsp, qword ptr [rip + helios_x86_secondary_wakeup_stack_top]
     xor rbp, rbp
-    mov rdi, qword ptr [rip + helios_x86_secondary_wakeup_context]
     mov rsi, qword ptr [rip + helios_x86_secondary_wakeup_runtime]
+
+    # This processor answers `fs:0` with its own identity from its first
+    # compiler-generated instruction onwards (`smp::ProcessorAnchor`), so
+    # IA32_FS_BASE is installed here rather than in the Rust entry point:
+    # the entry point is already such an instruction.
+    mov rax, rsi
+    mov rdx, rsi
+    shr rdx, 32
+    mov ecx, HELIOS_X86_FS_BASE_MSR
+    wrmsr
+
+    mov rdi, qword ptr [rip + helios_x86_secondary_wakeup_context]
     mov rax, qword ptr [rip + helios_x86_secondary_wakeup_entry]
     call rax
     ud2

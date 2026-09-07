@@ -12,8 +12,8 @@ use fdt::node::FdtNode;
 use helios_virtio::{InterruptTrigger, MmioInterrupt};
 
 use super::{
-    ConsoleDescription, GicDescription, MmioRegion, PlatformDescription, PlatformError,
-    PlatformSource, Slots, SpiInterrupt, VirtioMmioSlot,
+    ConsoleDescription, GicDescription, GrantableDevice, MAX_GRANTABLE_DEVICES, MmioRegion,
+    PlatformDescription, PlatformError, PlatformSource, Slots, SpiInterrupt, VirtioMmioSlot,
 };
 
 /// `compatible` string of the interrupt controller this backend drives.
@@ -22,6 +22,12 @@ const GIC_V3: &str = "arm,gic-v3";
 const PL011: &str = "arm,pl011";
 /// `compatible` string of the real-time clock.
 const PL031: &str = "arm,pl031";
+/// `compatible` string of a virtio transport slot, which the virtio
+/// walk already claims.
+const VIRTIO_MMIO: &str = "virtio,mmio";
+
+/// The mapping granule a grant's region has to respect.
+const FRAME: usize = helios_hal::pmm::PhysFrame::SIZE;
 
 /// Parses the blob Limine handed over.
 pub(super) fn parse(dtb: usize) -> Result<Fdt<'static>, PlatformError> {
@@ -71,7 +77,84 @@ pub(super) fn describe(
             .map(|node| first_region(&node, PL031))
             .transpose()?,
         virtio,
+        grantable: grantable(fdt),
         boot_entropy_seed: helios_hal::entropy::device_tree_seed(fdt),
+    })
+}
+
+/// Every node this backend has no driver for and can hand to one in
+/// user memory.
+///
+/// The filter is deliberately narrow, because a grant is a real
+/// capability over real hardware. A node qualifies when it has a
+/// register window, raises an interrupt this GIC can route, and is not
+/// something the kernel drives itself. Nodes that describe the machine
+/// rather than a device — the processors, the memory, `chosen`, the
+/// architected timer — have no `reg` and an `interrupts` property at
+/// most, so they never reach the region check.
+///
+/// A node whose window is not frame-aligned is skipped with a warning
+/// rather than refused: it is a device this backend cannot isolate,
+/// not a machine it cannot boot. Mapping it would put a neighbour's
+/// registers in the same page, which is the one thing a grant must
+/// never do.
+fn grantable(fdt: &Fdt<'static>) -> Slots<GrantableDevice, MAX_GRANTABLE_DEVICES> {
+    let mut devices = Slots::new();
+    for node in fdt.all_nodes() {
+        if drives_itself(&node) {
+            continue;
+        }
+        // The region is checked first: most of what a tree describes is
+        // the machine rather than a device — the processors, the
+        // memory, `chosen`, the architected timer — and none of it has
+        // a register window.
+        let Some(region) = described_region(&node) else {
+            continue;
+        };
+        let Some(interrupt) = node_interrupt(fdt, &node) else {
+            continue;
+        };
+        if !region.base.is_multiple_of(FRAME) || !region.size.is_multiple_of(FRAME) {
+            tracing::warn!(
+                node = node.name,
+                base = region.base,
+                size = region.size,
+                "the device tree describes a device whose window is not frame-aligned; \
+                 it cannot be isolated and is not offered to a driver"
+            );
+            continue;
+        }
+        devices.push(
+            GrantableDevice {
+                name: node.name,
+                region,
+                interrupt,
+                coherent: node.property("dma-coherent").is_some(),
+            },
+            "grantable devices",
+        );
+    }
+    devices
+}
+
+/// The register window a node declares, when it declares one this
+/// backend can read.
+///
+/// Unlike [`first_region`], a missing or oddly shaped `reg` is an
+/// answer rather than an error: this walks nodes nobody chose.
+fn described_region(node: &FdtNode<'_, '_>) -> Option<MmioRegion> {
+    let region = node.raw_reg().and_then(|mut regions| regions.next())?;
+    let base = crate::fdt_cells(region.address)?;
+    let size = crate::fdt_cells(region.size)?;
+    (size != 0).then_some(MmioRegion { base, size })
+}
+
+/// Whether the kernel drives this node itself.
+fn drives_itself(node: &FdtNode<'_, '_>) -> bool {
+    node.compatible().is_some_and(|entries| {
+        entries
+            .all()
+            .any(|entry| matches!(entry, GIC_V3 | PL011 | PL031 | VIRTIO_MMIO))
     })
 }
 
@@ -158,6 +241,11 @@ fn first_region(node: &FdtNode<'_, '_>, what: &str) -> Result<MmioRegion, Platfo
 /// property has the same shape whatever device declares it, and the
 /// GIC's three-cell binding is the only one an AArch64 tree uses.
 fn node_interrupt<'b, 'a: 'b>(fdt: &'b Fdt<'a>, node: &FdtNode<'b, 'a>) -> Option<SpiInterrupt> {
-    let interrupt = helios_virtio::node_interrupt(fdt, node)?;
-    Some(spi(interrupt).expect("a console interrupt specifier declares a trigger mode"))
+    match helios_virtio::node_interrupt_kind(fdt, node)? {
+        helios_virtio::NodeInterrupt::Shared(interrupt) => spi(interrupt).ok(),
+        // A private peripheral interrupt belongs to one processor and
+        // is not routed by affinity, so it is not something this
+        // backend can hand to a driver.
+        helios_virtio::NodeInterrupt::Private => None,
+    }
 }
