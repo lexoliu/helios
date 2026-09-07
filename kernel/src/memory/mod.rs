@@ -16,6 +16,7 @@
 
 mod balloon;
 mod entropy;
+mod frame_pool;
 mod frame_slab;
 mod irq_safe;
 mod mapping_cost;

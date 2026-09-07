@@ -1332,6 +1332,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
+name = "frame-alloc"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b5adb4b661164fa282d7b168d48821f36bea1a3bff55d0a367b4b4de58f025a2"
+
+[[package]]
 name = "funty"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1817,6 +1823,7 @@ dependencies = [
  "crossbeam-utils",
  "divan",
  "event-listener",
+ "frame-alloc",
  "futures",
  "futures-lite",
  "hashbrown 0.16.1",

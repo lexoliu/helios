@@ -629,7 +629,7 @@ mod tests {
         let start = unsafe { alloc::alloc::alloc(layout) } as usize;
         assert!(start != 0, "host allocation for the user pool failed");
         let pool: &'static UserMemoryPool = Box::leak(Box::new(UserMemoryPool::empty()));
-        pool.add_region(start, start + bytes);
+        pool.initialize(&[(start, start + bytes)]);
         pool
     }
 

@@ -55,7 +55,7 @@ fn instances_until_refusal(usable_bytes: usize) -> usize {
     let pool = UserMemoryPool::empty();
     pool.configure_processors(1);
     let (start, _end) = leak_machine_memory(usable_bytes);
-    pool.add_region(start + plan.kernel_boot_bytes, start + usable_bytes);
+    pool.initialize(&[(start + plan.kernel_boot_bytes, start + usable_bytes)]);
 
     let mut placed = 0;
     while take(&pool, USER_BYTES_PER_INSTANCE) && take(&pool, KERNEL_BYTES_PER_INSTANCE) {

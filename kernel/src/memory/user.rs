@@ -3,22 +3,19 @@ extern crate alloc;
 use alloc::boxed::Box;
 use core::alloc::Layout;
 use core::future::Future;
-use core::mem::size_of;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
-use buddy_system_allocator::Heap;
 use helios_hal::cpu::ProcessorId;
 use helios_hal::pmm::{
     FrameAllocError, FrameAllocStats, PhysFrame, PhysFrameAllocator, PhysFrameRange,
 };
 
 use crate::ProgramOutOfMemory;
+use crate::memory::frame_pool::FramePool;
 use crate::memory::frame_slab::FrameSlabCache;
 use crate::memory::irq_safe::IrqSafeMutex;
 use crate::memory::reported::{ReportedFrames, visit_free_runs};
-
-const USER_HEAP_ORDER: usize = 32;
 
 pub struct UserMemoryPool {
     /// The pool's buddy storage, behind the mask its callers need. The
@@ -26,7 +23,7 @@ pub struct UserMemoryPool {
     /// does so from wherever it was called — an interrupt handler
     /// included — so this lock is on the same interrupt path as the
     /// kernel heap's (#206).
-    heap: IrqSafeMutex<Heap<USER_HEAP_ORDER>>,
+    heap: IrqSafeMutex<FramePool>,
     frame_slab: FrameSlabCache,
     total_bytes: AtomicUsize,
     /// Frames shown to a free-page consumer. The memory is still the
@@ -37,22 +34,22 @@ pub struct UserMemoryPool {
 impl UserMemoryPool {
     pub const fn empty() -> Self {
         Self {
-            heap: IrqSafeMutex::new(Heap::new()),
+            heap: IrqSafeMutex::new(FramePool::new()),
             frame_slab: FrameSlabCache::new(),
             total_bytes: AtomicUsize::new(0),
             reported: ReportedFrames::new(),
         }
     }
 
-    pub fn add_region(&self, start: usize, end: usize) {
-        if end <= start {
-            return;
-        }
-        self.heap.with(|heap| unsafe {
-            heap.add_to_heap(start, end);
+    pub fn initialize(&self, regions: &[(usize, usize)]) {
+        let total = self.heap.with(|heap| {
+            heap.initialize(regions);
+            heap.total_bytes
         });
-        self.reported.cover(start, end);
-        self.total_bytes.fetch_add(end - start, Ordering::Release);
+        for &(start, end) in regions {
+            self.reported.cover(start, end);
+        }
+        self.total_bytes.store(total, Ordering::Release);
     }
 
     pub fn configure_processors(&self, processor_count: usize) {
@@ -91,8 +88,8 @@ impl UserMemoryPool {
         self.heap.with(|heap| {
             let cached = self.frame_slab.cached_bytes();
             UserHeapStats {
-                total_bytes: heap.stats_total_bytes(),
-                allocated_bytes: heap.stats_alloc_actual().saturating_sub(cached),
+                total_bytes: heap.total_bytes,
+                allocated_bytes: heap.allocated_bytes.saturating_sub(cached),
             }
         })
     }
@@ -209,18 +206,18 @@ impl UserMemoryPool {
         }
 
         let ptr = self.heap.with(|heap| {
-            heap.alloc(layout)
+            heap.allocate(allocation_size)
                 .or_else(|_| {
                     self.frame_slab.drain(|ptr| unsafe {
-                        heap.dealloc(ptr, single_frame_layout());
+                        heap.deallocate(ptr, PhysFrame::SIZE);
                     });
-                    heap.alloc(layout)
+                    heap.allocate(allocation_size)
                 })
                 .map_err(|_| {
                     let stats = UserHeapStats {
-                        total_bytes: heap.stats_total_bytes(),
+                        total_bytes: heap.total_bytes,
                         allocated_bytes: heap
-                            .stats_alloc_actual()
+                            .allocated_bytes
                             .saturating_sub(self.frame_slab.cached_bytes()),
                     };
                     ProgramOutOfMemory {
@@ -265,7 +262,7 @@ impl UserMemoryPool {
             }
         }
         self.heap.with(|heap| unsafe {
-            heap.dealloc(ptr, layout);
+            heap.deallocate(ptr, buddy_allocation_size(layout));
         });
     }
 }
@@ -534,16 +531,11 @@ fn buddy_allocation_size(layout: Layout) -> usize {
         .size()
         .next_power_of_two()
         .max(layout.align())
-        .max(size_of::<usize>())
+        .max(PhysFrame::SIZE)
 }
 
 fn is_single_frame_layout(layout: Layout) -> bool {
     layout.size() == PhysFrame::SIZE && layout.align() == PhysFrame::SIZE
-}
-
-fn single_frame_layout() -> Layout {
-    Layout::from_size_align(PhysFrame::SIZE, PhysFrame::SIZE)
-        .unwrap_or_else(|_| panic!("invalid user-frame layout"))
 }
 
 #[cfg(test)]
@@ -612,12 +604,12 @@ mod tests {
         assert!(base != 0, "host allocation for the user pool failed");
         let start = base.next_multiple_of(alignment) + offset;
         let pool = UserMemoryPool::empty();
-        pool.add_region(start, start + bytes);
+        pool.initialize(&[(start, start + bytes)]);
         pool
     }
 
-    /// A pool whose region is naturally aligned, which the buddy heap holds
-    /// as one intact block: it serves the whole pool in a single request.
+    /// A pool whose region is naturally aligned; its metadata occupies the
+    /// first frames and the largest remaining buddy meets its free-byte bound.
     fn pool(bytes: usize) -> UserMemoryPool {
         assert!(
             bytes.is_power_of_two(),
@@ -665,18 +657,22 @@ mod tests {
     #[test]
     fn the_granularity_bound_overstates_what_the_pool_serves() {
         let bytes = 8 * 1024 * 1024;
-        let pool = misaligned_pool(bytes);
+        let layout = Layout::from_size_align(bytes * 2, bytes).expect("fragmented pool layout");
+        let start = unsafe { alloc::alloc::alloc(layout) }.expose_provenance();
+        assert_ne!(start, 0, "host allocation for fragmented pool failed");
+        let pool = UserMemoryPool::empty();
+        pool.initialize(&[
+            (start + PhysFrame::SIZE, start + bytes / 2),
+            (start + bytes + PhysFrame::SIZE, start + bytes + bytes / 2),
+        ]);
 
         let bound = pool.stats().largest_allocatable_bytes();
-        assert_eq!(
-            bound, bytes,
-            "the bound counts every byte of the region, aligned or not"
-        );
+        assert_eq!(bound, bytes / 2, "the bound excludes metadata and holes");
         let servable = assert_advertises_what_it_serves(&pool);
         assert_eq!(
             servable,
-            bytes / 2,
-            "the largest buddy over a region offset by one frame is half of it"
+            bytes / 4,
+            "neither misaligned range holds a buddy as large as the combined bound"
         );
         assert!(
             servable < bound,
@@ -705,7 +701,8 @@ mod tests {
         let pool = pool(bytes);
 
         let bound = pool.stats().largest_allocatable_bytes();
-        assert_eq!(bound, bytes);
+        assert_eq!(bound, bytes / 2);
+        assert!(pool.stats().allocated_bytes > 0);
         assert_eq!(
             assert_advertises_what_it_serves(&pool),
             bound,

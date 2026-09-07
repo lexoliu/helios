@@ -103,16 +103,29 @@ padding is an upper bound, not occupied memory, and `rlsf 0.2.3` does not
 expose a constant-time occupied-block-size query. Talc's counters avoid
 both that approximation and dependency on private header layouts.
 
-The user pool (`kernel/src/memory/user.rs`) remains a buddy heap with a
-per-processor frame slab absorbing single-frame churn. The x86-64 user
-VM returns individual frames through `deallocate_user_frame_on`, not
-multi-frame runs. Returns beyond the shard quota reach the buddy heap;
-an allocation that the heap cannot serve also drains cached frames back
-to it before retrying. The multi-frame pinned-run callers are in the
-aarch64 and riscv backends. Issue #248 tracks the measured cost of the
-actual x86-64 path, not an assumed multi-frame teardown path. Frame-slab
-ownership during concurrent pop and drain is a separate correctness
-repair tracked by #251.
+The user pool (`kernel/src/memory/user.rs`) uses `frame-alloc`'s
+bitmap-only `SummaryBuddyAllocator`, behind the existing IRQ-safe lock.
+Its metadata is carved once from the complete, sorted user-owned boot
+map; reserved holes and metadata frames are never returned as payload.
+A deallocation checks buddy bits at each order rather than searching a
+free list. The existing maximum order remains 2 GiB, and requests are
+rounded to power-of-two frame blocks with their required alignment.
+
+The adapter's constant-time counters include reserved metadata and
+rounded live blocks. It does not call the allocator's bitmap-scanning
+free-space statistics on a production path. The per-processor frame
+slab still absorbs single-frame churn. The x86-64 user VM returns
+individual frames through `deallocate_user_frame_on`, not multi-frame
+runs. Returns beyond the shard quota reach the bitmap allocator; an
+allocation that cannot be served drains cached frames before retrying.
+The multi-frame pinned-run callers are in aarch64 and riscv. Issue #248
+measures this actual x86-64 path; #251 protects frame-slab ownership
+during concurrent pop and drain.
+
+Balloon inflation requests power-of-two runs no larger than the current
+pressure budget or remaining target. This accounts for actual occupied
+frames rather than a smaller requested count that the pool would round
+up, and rechecks available budget after awaiting the host (#266).
 
 `KernelPhysFrameAllocator` (`kernel/src/memory/pmm.rs`) also contains a
 buddy heap and frame slab, but has no production allocation call path in
