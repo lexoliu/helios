@@ -260,6 +260,12 @@ static BOOT_STATE: AtomicU8 = AtomicU8::new(BOOT_UNINITIALIZED);
 pub struct HeapStats {
     pub total_bytes: usize,
     pub allocated_bytes: usize,
+    /// Heap the per-processor magazines hold ready to serve.
+    ///
+    /// It is counted in `allocated_bytes`, because the heap really did
+    /// serve it, and it is free from a caller's point of view. A reader
+    /// comparing the two needs this to tell a leak from a cache.
+    pub magazine_cached_bytes: usize,
     pub requested_live_bytes: usize,
     pub allocation_count: u64,
     pub deallocation_count: u64,
@@ -343,6 +349,7 @@ impl KernelHeapState {
         HeapStats {
             total_bytes: self.total_bytes(),
             allocated_bytes: self.allocated_bytes(),
+            magazine_cached_bytes: 0,
             requested_live_bytes: counters.requested_live_bytes,
             allocation_count: counters.allocation_count,
             deallocation_count: counters.deallocation_count,
@@ -419,6 +426,9 @@ struct KernelAllocator {
     /// it, and then every other processor behind it (#206). See
     /// [`memory::IrqSafeMutex`] for the contract.
     heap: IrqSafeMutex<KernelHeapState>,
+    /// Per-processor caches in front of `heap`; see
+    /// [`memory::Magazines`] for what they hold and why.
+    magazines: memory::Magazines,
     /// Every usable byte the boot memory map described, and the free
     /// kernel heap a user grow may not dip into. Both are fixed by
     /// [`memory::BootMemoryPlan`] at boot and never move afterwards:
@@ -436,6 +446,7 @@ impl KernelAllocator {
     const fn empty() -> Self {
         Self {
             heap: IrqSafeMutex::new(KernelHeapState::new()),
+            magazines: memory::Magazines::new(),
             machine_usable_bytes: AtomicUsize::new(0),
             kernel_reserve_bytes: AtomicUsize::new(0),
             top_up_backoff: AtomicUsize::new(0),
@@ -562,6 +573,53 @@ impl KernelAllocator {
         }
     }
 
+    /// Serves `layout` from this processor's magazine, refilling it
+    /// from the heap under one lock when it is empty.
+    ///
+    /// Answers null for a layout no class serves, before the magazines
+    /// exist, and while per-class metrics bypass them; the caller then
+    /// takes the ordinary path.
+    fn alloc_cached(&self, layout: Layout) -> *mut u8 {
+        self.magazines.allocate(layout, |canonical, blocks| {
+            self.heap.with(|heap| {
+                let mut taken = 0;
+                while taken < blocks.len() {
+                    let block = heap.allocate(canonical);
+                    if block.is_null() {
+                        break;
+                    }
+                    blocks[taken] = block;
+                    taken += 1;
+                }
+                taken
+            })
+        })
+    }
+
+    /// Returns `ptr` to this processor's magazine, flushing what is
+    /// over capacity back to the heap under one lock.
+    ///
+    /// Answers `false` when no magazine took it, which is exactly when
+    /// [`Self::alloc_cached`] would not have served it.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be an allocation this heap served under `layout`.
+    unsafe fn free_cached(&self, ptr: *mut u8, layout: Layout) -> bool {
+        self.magazines.deallocate(ptr, layout, |canonical, blocks| {
+            self.heap.with(|heap| {
+                for block in blocks {
+                    let Some(block) = ptr::NonNull::new(*block) else {
+                        continue;
+                    };
+                    // Safety: every block came from a refill of this
+                    // class, allocated with `canonical`.
+                    unsafe { heap.deallocate(block, canonical) };
+                }
+            });
+        })
+    }
+
     /// Whether a reserve top-up should be attempted, counting down the
     /// backoff a failed one left behind.
     ///
@@ -578,10 +636,29 @@ impl KernelAllocator {
     }
 
     fn stats(&self) -> HeapStats {
-        self.heap.with(|heap| heap.stats())
+        let mut stats = self.heap.with(|heap| heap.stats());
+        let cached = self.magazines.stats();
+        stats.allocation_count = stats.allocation_count.wrapping_add(cached.allocation_count);
+        stats.deallocation_count = stats
+            .deallocation_count
+            .wrapping_add(cached.deallocation_count);
+        stats.total_allocation_bytes = stats
+            .total_allocation_bytes
+            .wrapping_add(cached.total_allocation_bytes);
+        stats.total_deallocation_bytes = stats
+            .total_deallocation_bytes
+            .wrapping_add(cached.total_deallocation_bytes);
+        stats.requested_live_bytes = stats
+            .requested_live_bytes
+            .wrapping_add_signed(cached.live_bytes as isize);
+        stats.magazine_cached_bytes = cached.cached_bytes;
+        stats
     }
 
     fn set_size_class_metrics_enabled(&self, enabled: bool) {
+        // Per-class counts describe what the heap was asked for, so the
+        // caches stand aside while they are on: see `memory::Magazines`.
+        self.magazines.set_bypassed(enabled);
         self.heap
             .with(|heap| heap.counters.size_class_metrics_enabled = enabled);
     }
@@ -589,13 +666,20 @@ impl KernelAllocator {
 
 unsafe impl GlobalAlloc for KernelAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let cached = self.alloc_cached(layout);
+        if !cached.is_null() {
+            return cached;
+        }
         let size = layout.size();
         self.alloc_growing(layout, |counters| counters.record_alloc(size))
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         let size = layout.size();
-        let ptr = self.alloc_growing(layout, |counters| counters.record_alloc(size));
+        let mut ptr = self.alloc_cached(layout);
+        if ptr.is_null() {
+            ptr = self.alloc_growing(layout, |counters| counters.record_alloc(size));
+        }
         if !ptr.is_null() {
             unsafe {
                 ptr::write_bytes(ptr, 0, size);
@@ -605,6 +689,11 @@ unsafe impl GlobalAlloc for KernelAllocator {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // Safety: the caller's promise is `dealloc`'s, and a block the
+        // magazine accepts was served by the same class.
+        if unsafe { self.free_cached(ptr, layout) } {
+            return;
+        }
         let size = layout.size();
         unsafe { self.free(ptr, layout, |counters| counters.record_dealloc(size)) };
     }
@@ -619,11 +708,18 @@ unsafe impl GlobalAlloc for KernelAllocator {
         }
 
         let old_size = layout.size();
-        unsafe {
-            ptr::copy_nonoverlapping(ptr, new_ptr, old_size.min(new_size));
-            self.free(ptr, layout, |counters| {
-                counters.record_realloc(old_size, new_size);
-            });
+        unsafe { ptr::copy_nonoverlapping(ptr, new_ptr, old_size.min(new_size)) };
+        // Safety: `ptr` was served under `layout`, so the same class
+        // that would take it back is the one that served it.
+        if unsafe { self.free_cached(ptr, layout) } {
+            self.heap
+                .with(|heap| heap.counters.record_realloc(old_size, new_size));
+        } else {
+            unsafe {
+                self.free(ptr, layout, |counters| {
+                    counters.record_realloc(old_size, new_size);
+                });
+            }
         }
         new_ptr
     }
@@ -1199,6 +1295,11 @@ where
     let pool =
         user_pool.unwrap_or_else(|| panic!("bootstrap did not provide memory for user pool"));
     pool.initialize(&user_regions);
+    // The caches come last: they allocate their own array, so the heap
+    // has to be able to serve before they exist. Every allocation until
+    // this point went straight to the heap, which is what the boot path
+    // wants anyway — it runs on one processor and contends with nobody.
+    ALLOCATOR.magazines.initialize(processor_count);
     pool
 }
 
