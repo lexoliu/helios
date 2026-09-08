@@ -87,13 +87,19 @@ static inline void report_metric_micros(const char *prefix, const char *suffix, 
            (unsigned long long)(nanos / 1000), (unsigned long long)(nanos % 1000));
 }
 
-/* Reports p50, p99, max and mean in microseconds, like LatencySamples::report. */
+/*
+ * Reports p50, p99, max, mean and the sample count, like
+ * LatencySamples::report. The count is what tells the benchmark gate
+ * whether a percentile is a percentile or, at a small sample size, just
+ * an extremum wearing its name (#286).
+ */
 static inline void samples_report(struct latency_samples *samples, const char *prefix) {
     if (samples->len == 0) {
         errno = 0;
         die("no latency samples were collected");
     }
     qsort(samples->nanos, samples->len, sizeof(uint64_t), compare_u64);
+    printf("bench.%s_samples=%zu\n", prefix, samples->len);
     report_metric_micros(prefix, "p50_us", samples_percentile(samples, 50));
     report_metric_micros(prefix, "p99_us", samples_percentile(samples, 99));
     report_metric_micros(prefix, "max_us", samples_percentile(samples, 100));

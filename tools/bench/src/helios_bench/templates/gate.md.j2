@@ -14,8 +14,12 @@ Informational only, and nothing here blocks: {% if result.baseline_host != resul
 | Workload | Measurement | Baseline | Candidate | Shift | CIs disjoint | Beyond noise | Verdict |
 | --- | --- | ---: | ---: | ---: | :---: | :---: | --- |
 {% for row in result.rows %}
-| `{{ row.workload }}`{% if row.headline %} (headline){% endif %} | `{{ row.measurement }}`{% if row.direction == Direction.HIGHER_IS_BETTER %} (higher is better){% endif %} | {{ row.baseline_median | ms }} | {{ row.candidate_median | ms }} | {{ row.shift | percent }} | {{ "yes" if row.ci_disjoint else "no" }} | {{ "yes" if row.beyond_noise else "no" }} | {% if row.rejected %}rejected: {{ row.rejection_reason }}{% elif row.regression %}**regression**{% elif row.improvement %}improvement{% else %}unchanged{% endif %} |
+| `{{ row.workload }}`{% if row.headline %} (headline){% endif %} | `{{ row.measurement }}`{% if row.direction == Direction.HIGHER_IS_BETTER %} (higher is better){% endif %} | {{ row.baseline_median | ms }} | {{ row.candidate_median | ms }} | {{ row.shift | percent }} | {{ "yes" if row.ci_disjoint else "no" }} | {{ "yes" if row.beyond_noise else "no" }} | {% if row.rejected %}rejected: {{ row.rejection_reason }}{% elif row.diagnostic %}diagnostic{% elif row.regression %}**regression**{% elif row.improvement %}improvement{% else %}unchanged{% endif %} |
 {% endfor %}
+{% if result.diagnostic_rows %}
+
+`diagnostic` rows are the tail of one iteration's samples — a maximum, or a percentile at p99 or above — and they record the scheduling order of the boot that produced them rather than anything the change did, so they are reported and never block.
+{% endif %}
 {% if result.unpaired_metrics %}
 
 Measured on one side only, so uncompared: {% for unpaired in result.unpaired_metrics %}`{{ unpaired.workload }}`/`{{ unpaired.metric }}` ({{ unpaired.measured_by }} only){% if not loop.last %}, {% endif %}{% endfor %}.

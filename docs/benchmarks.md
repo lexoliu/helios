@@ -147,14 +147,26 @@ Per cell (workload × side), `iterations` executions (11 by default):
     guessed at.
   - The noise floor is the control workload's drift, so it bounds how
     far the *machine* moved and applies to durations and rates. A
-    footprint does not grow because the host was busy, so it is held to
-    its bootstrap intervals alone; otherwise a repeatable regression
-    would sit under a timing floor it can never reach.
+    footprint is exposed to the page rather than to the clock: memory is
+    handed out in pages and `memory_per_instance_bytes` is a delta of
+    available bytes over an instance count, so a shift under 4 KiB is
+    accounting and anything past it counts, with no timing floor above
+    it that a real regression could hide under.
+  - A row the gate cannot attribute to the change is printed as
+    `diagnostic` and blocks nothing. A workload's latency metrics are
+    computed over the samples of *one iteration*, so a maximum is the
+    tail of that boot's scheduling order — no sample size makes it
+    attributable — and a percentile is only a percentile when enough
+    samples lie past its rank: `LatencySamples::report` prints
+    `<prefix>_samples` for exactly this, and the gate wants ten samples
+    beyond the rank, so p99 needs a thousand and p99.9 needs ten
+    thousand. Over a hundred samples the nearest-rank p99 *is* the
+    second largest, and a paired run of two identical kernels moved that
+    number 14% (#286). A percentile whose count the report does not
+    carry is diagnostic rather than trusted.
   - A metric row whose warm coefficient of variation exceeds the run's
     `cv_bound` on either side is printed with that reason and takes part
-    in no verdict, the way a variance-rejected cell does. In practice
-    that is where the `_max_us` rows go: the maximum of ten samples is
-    not a statistic the gate can hold anyone to.
+    in no verdict, the way a variance-rejected cell does.
   - A metric only one column measured is named under the table and
     blocks nothing: the run that introduces a metric has nothing to
     compare it against.

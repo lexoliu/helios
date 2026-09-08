@@ -50,11 +50,20 @@ impl LatencySamples {
         self.nanos.is_empty()
     }
 
-    /// Reports `<prefix>_p50_us`, `<prefix>_p99_us`, `<prefix>_max_us` and
-    /// `<prefix>_mean_us` for the samples collected so far.
+    /// Reports `<prefix>_p50_us`, `<prefix>_p99_us`, `<prefix>_max_us`,
+    /// `<prefix>_mean_us` and `<prefix>_samples` for the samples
+    /// collected so far.
+    ///
+    /// The count is reported because a percentile means different things
+    /// at different sample sizes: over a hundred samples the nearest-rank
+    /// p99 is the second largest of them, which is an extremum and not a
+    /// percentile, and the benchmark gate refuses to hold a change to a
+    /// number like that (#286). It is the only way the gate can tell the
+    /// two apart, since all it ever sees is `bench.<name>=<number>`.
     pub fn report(&mut self, prefix: &str) {
         assert!(!self.nanos.is_empty(), "no {prefix} samples were collected");
         self.nanos.sort_unstable();
+        report_metric(&format!("{prefix}_samples"), self.nanos.len());
         report_metric(&format!("{prefix}_p50_us"), micros(self.percentile(50)));
         report_metric(&format!("{prefix}_p99_us"), micros(self.percentile(99)));
         report_metric(&format!("{prefix}_max_us"), micros(self.percentile(100)));

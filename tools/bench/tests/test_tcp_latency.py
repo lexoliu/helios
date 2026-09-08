@@ -111,7 +111,14 @@ def test_the_workload_measures_a_round_trip(echo_server, native_client, tmp_path
     runner.validate_output(workload, completed.stdout, completed.stderr)
 
     metrics = runner.parse_metrics(completed.stdout.decode("utf-8"), WORKLOAD)
-    assert set(metrics) == {"rtt_p50_us", "rtt_p99_us", "rtt_max_us", "rtt_mean_us"}
+    assert set(metrics) == {
+        "rtt_p50_us",
+        "rtt_p99_us",
+        "rtt_max_us",
+        "rtt_mean_us",
+        # The count the gate reads to tell a percentile from an extremum.
+        "rtt_samples",
+    }
     assert metrics["rtt_p50_us"] > 0.0
     assert metrics["rtt_p50_us"] <= metrics["rtt_p99_us"] <= metrics["rtt_max_us"]
 

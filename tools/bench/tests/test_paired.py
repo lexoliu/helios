@@ -481,6 +481,7 @@ def test_a_paired_improvement_is_named_and_blocks_nothing(paired_improvement_rep
     assert [row.measurement for row in result.improvements] == [
         "elapsed_ms",
         "rtt_p50_us",
+        "rtt_p99_us",
         "switches_per_s",
     ]
     # More switches per second is the improvement, and the row says so
