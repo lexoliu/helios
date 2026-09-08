@@ -36,7 +36,7 @@ pub use entropy::{
     RootEntropyHandle, install_entropy_device, seed_root_entropy,
 };
 pub(crate) use irq_safe::IrqSafeMutex;
-pub(crate) use magazine::Magazines;
+pub(crate) use magazine::{Magazines, heap_layout};
 pub use mapping_cost::user_mapping_kernel_heap_bytes;
 pub use owner::{
     MemoryOwner, UserMemoryOwnerScope, UserMemoryOwners, configure_user_memory_owner_processors,

@@ -479,8 +479,9 @@ impl KernelAllocator {
     /// allocation.
     unsafe fn free(&self, ptr: *mut u8, layout: Layout, record: impl FnOnce(&mut HeapCounters)) {
         let ptr = ptr::NonNull::new(ptr).expect("the global allocator was handed a null pointer");
+        let served = memory::heap_layout(layout);
         self.heap.with(|heap| {
-            unsafe { heap.deallocate(ptr, layout) };
+            unsafe { heap.deallocate(ptr, served) };
             record(&mut heap.counters);
         });
     }
@@ -513,8 +514,9 @@ impl KernelAllocator {
         layout: Layout,
         record: impl Fn(&mut HeapCounters) + Copy,
     ) -> (*mut u8, usize) {
+        let served = memory::heap_layout(layout);
         self.heap.with(|heap| {
-            let ptr = heap.allocate(layout);
+            let ptr = heap.allocate(served);
             if !ptr.is_null() {
                 record(&mut heap.counters);
             }
@@ -551,7 +553,10 @@ impl KernelAllocator {
             return ptr;
         }
 
-        let Some(wanted) = self.heap.with(|heap| heap.growth_bytes(layout)) else {
+        let Some(wanted) = self
+            .heap
+            .with(|heap| heap.growth_bytes(memory::heap_layout(layout)))
+        else {
             return ptr;
         };
         match memory::lend_user_memory_to_kernel_heap(wanted) {

@@ -98,6 +98,21 @@ fn canonical_layout(class: usize) -> Layout {
     unsafe { Layout::from_size_align_unchecked(size, CACHED_ALIGN) }
 }
 
+/// The layout the heap sees for `layout`.
+///
+/// A cacheable layout is normalised to its class's canonical layout on
+/// every path, not only when a magazine serves it. The heap is handed
+/// one layout per block, so a block allocated while the caches were
+/// empty, absent or bypassed can still be freed into a magazine later
+/// and returned to the heap at the class's layout: the two agree
+/// because neither ever used the caller's.
+pub(crate) fn heap_layout(layout: Layout) -> Layout {
+    match class_of(layout) {
+        Some(class) => canonical_layout(class),
+        None => layout,
+    }
+}
+
 /// The class serving `layout`, or `None` when the heap must serve it
 /// directly.
 fn class_of(layout: Layout) -> Option<usize> {
@@ -670,5 +685,32 @@ mod tests {
                 .is_null()
         );
         assert_eq!(magazines.stats(), MagazineStats::default());
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    #[test]
+    fn the_heap_sees_one_layout_per_class_whatever_the_caller_asked() {
+        // The bug this pins: a block allocated while the caches were
+        // absent and freed once they exist would otherwise reach the
+        // heap under two different layouts.
+        for size in 1..=(CACHED_ALIGN << (CLASS_COUNT - 1)) {
+            let asked = Layout::from_size_align(size, 1).unwrap();
+            let served = heap_layout(asked);
+            let class = class_of(asked).expect("a small layout has a class");
+            assert_eq!(served, canonical_layout(class));
+            assert_eq!(heap_layout(served), served, "normalising is idempotent");
+        }
+    }
+
+    #[test]
+    fn a_layout_no_class_serves_reaches_the_heap_unchanged() {
+        let large = Layout::from_size_align(4096, 8).unwrap();
+        assert_eq!(heap_layout(large), large);
+        let over_aligned = Layout::from_size_align(64, 64).unwrap();
+        assert_eq!(heap_layout(over_aligned), over_aligned);
     }
 }
