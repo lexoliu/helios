@@ -1,6 +1,17 @@
 import pytest
 
-from helios_bench.gate import evaluate, evaluate_paired, gate_report
+from helios_bench.gate import (
+    DURATION,
+    FOOTPRINT,
+    RATE,
+    Column,
+    Unit,
+    UnpairedMetric,
+    evaluate,
+    evaluate_paired,
+    gate_report,
+    metric_unit,
+)
 from helios_bench.render import render_gate
 from helios_bench.report import Report, Side
 from helios_bench.stats import StatsConfig, series_stats
@@ -34,13 +45,14 @@ def test_overlapping_intervals_do_not_claim_all_shifts_are_within_noise(
 
 def test_significant_headline_regression_blocks(baseline_report: Report, regressed_report: Report) -> None:
     result = evaluate(baseline_report, regressed_report)
-    rows = {row.workload: row for row in result.rows}
-    assert rows["hostcall-loop"].regression
-    assert rows["hostcall-loop"].ci_disjoint and rows["hostcall-loop"].beyond_noise
-    assert rows["hostcall-loop"].shift == pytest.approx(0.5, abs=0.1)
-    assert not rows["quickjs-loop"].regression
+    rows = {(row.workload, row.measurement): row for row in result.rows}
+    assert rows["hostcall-loop", "elapsed_ms"].regression
+    assert rows["hostcall-loop", "elapsed_ms"].ci_disjoint
+    assert rows["hostcall-loop", "elapsed_ms"].beyond_noise
+    assert rows["hostcall-loop", "elapsed_ms"].shift == pytest.approx(0.5, abs=0.1)
+    assert not rows["quickjs-loop", "elapsed_ms"].regression
     assert result.blocking
-    assert [row.workload for row in result.headline_regressions] == ["hostcall-loop"]
+    assert {row.workload for row in result.headline_regressions} == {"hostcall-loop"}
 
 
 def test_advisory_reports_never_block(baseline_report: Report, advisory_report: Report) -> None:
@@ -93,3 +105,121 @@ def test_incomplete_nonheadline_pair_does_not_block(paired_flat_report: Report) 
     result = evaluate_paired(paired_flat_report)
     assert not result.blocking
     assert result.incomplete_headlines == []
+
+
+def rewrite_metric(report: Report, workload_name: str, metric: str, samples: list[float]) -> None:
+    """Replaces one metric's candidate-side warm statistics."""
+    config = StatsConfig(**report.thresholds.model_dump(exclude={"iterations", "warmup_discard"}))
+    report.workload(workload_name).cells[Side.HELIOS].metrics[metric] = series_stats(samples, config)
+
+
+def test_a_metric_the_wall_clock_hides_still_blocks(paired_flat_report: Report) -> None:
+    """The point of the whole thing (#279).
+
+    `procbench` times its teardown separately because the wall clock of
+    the round trip averages it away. A gate that compares the wall clock
+    alone puts it straight back.
+    """
+    baseline = paired_flat_report.workload("hostcall-loop").cells[Side.HELIOS_BASELINE]
+    rewrite_metric(
+        paired_flat_report,
+        "hostcall-loop",
+        "rtt_p50_us",
+        [baseline.metrics["rtt_p50_us"].median * 1.5 + offset for offset in (-0.4, 0.0, 0.4, 0.2, -0.2)],
+    )
+    result = evaluate_paired(paired_flat_report)
+    rows = {(row.workload, row.measurement): row for row in result.rows}
+
+    assert not rows["hostcall-loop", "elapsed_ms"].regression
+    assert rows["hostcall-loop", "rtt_p50_us"].regression
+    assert result.blocking
+    assert [row.measurement for row in result.headline_regressions] == ["rtt_p50_us"]
+
+    rendered = render_gate(gate_report(paired_flat_report, None), paired_flat_report.run.lane)
+    assert "`hostcall-loop`/`rtt_p50_us` regressed significantly" in rendered
+    assert "| `rtt_p50_us` |" in rendered
+
+
+def test_a_dispersed_metric_is_rejected_rather_than_judged(paired_flat_report: Report) -> None:
+    baseline = paired_flat_report.workload("hostcall-loop").cells[Side.HELIOS_BASELINE]
+    center = baseline.metrics["rtt_p50_us"].median
+    rewrite_metric(
+        paired_flat_report,
+        "hostcall-loop",
+        "rtt_p50_us",
+        [center * factor for factor in (0.4, 0.8, 1.5, 2.2, 3.0)],
+    )
+    result = evaluate_paired(paired_flat_report)
+    row = next(row for row in result.rows if row.measurement == "rtt_p50_us")
+
+    assert row.rejected
+    assert "coefficient of variation" in row.rejection_reason
+    assert not row.regression and not row.improvement
+    assert not result.blocking
+    assert row in result.rejected_rows
+    assert "rejected: warm coefficient of variation" in render_gate(
+        gate_report(paired_flat_report, None), paired_flat_report.run.lane
+    )
+
+
+def test_a_metric_only_one_column_measured_is_named_and_blocks_nothing(
+    paired_flat_report: Report,
+) -> None:
+    """A change that adds a metric must not fail on its own first run."""
+    cells = paired_flat_report.workload("hostcall-loop").cells
+    cells[Side.HELIOS_BASELINE].metrics.pop("switches_per_s")
+    result = evaluate_paired(paired_flat_report)
+
+    assert "switches_per_s" not in {row.measurement for row in result.rows if row.workload == "hostcall-loop"}
+    assert result.unpaired_metrics == [
+        UnpairedMetric(workload="hostcall-loop", metric="switches_per_s", measured_by=Column.CANDIDATE)
+    ]
+    assert not result.blocking
+    assert "`hostcall-loop`/`switches_per_s` (candidate only)" in render_gate(
+        gate_report(paired_flat_report, None), paired_flat_report.run.lane
+    )
+
+
+def test_a_metric_without_a_unit_stops_the_gate(paired_flat_report: Report) -> None:
+    """The name is the only declaration either harness gets."""
+    cells = paired_flat_report.workload("hostcall-loop").cells
+    for side in (Side.HELIOS, Side.HELIOS_BASELINE):
+        cells[side].metrics["throughput"] = cells[side].metrics["rtt_p50_us"]
+    with pytest.raises(SystemExit, match="ends in no unit"):
+        evaluate_paired(paired_flat_report)
+
+
+@pytest.mark.parametrize(
+    ("metric", "expected"),
+    [
+        ("mib_per_s", RATE),
+        ("switches_per_s", RATE),
+        ("ns_per_call", DURATION),
+        ("memory_per_instance_bytes", FOOTPRINT),
+        ("teardown_ms", DURATION),
+        ("first_output_p99_us", DURATION),
+    ],
+)
+def test_every_metric_in_the_tree_reads_its_unit(metric: str, expected: Unit) -> None:
+    assert metric_unit(metric) == expected
+
+
+def test_a_footprint_is_not_held_to_a_timing_floor(paired_flat_report: Report) -> None:
+    """A machine that drifts does not make an instance bigger.
+
+    The noise floor is the control workload's drift, so it bounds
+    durations. `memory_per_instance_bytes` repeats exactly, and holding
+    it to a timing floor would let a repeatable footprint regression
+    through under a floor it can never reach.
+    """
+    config = StatsConfig(**paired_flat_report.thresholds.model_dump(exclude={"iterations", "warmup_discard"}))
+    cells = paired_flat_report.workload("hostcall-loop").cells
+    cells[Side.HELIOS_BASELINE].metrics["memory_per_instance_bytes"] = series_stats([9_853_797.0] * 5, config)
+    cells[Side.HELIOS].metrics["memory_per_instance_bytes"] = series_stats([9_895_373.0] * 5, config)
+    result = evaluate_paired(paired_flat_report)
+    row = next(row for row in result.rows if row.measurement == "memory_per_instance_bytes")
+
+    assert row.shift == pytest.approx(0.0042, abs=0.0005)
+    assert row.shift < result.noise_floor
+    assert row.ci_disjoint and row.beyond_noise and row.regression
+    assert result.blocking

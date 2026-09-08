@@ -18,7 +18,7 @@ def test_cold_iteration_is_separated_from_the_warm_series(baseline_report: Repor
     assert cell.cold.count == 1
     assert cell.warm.count == 10
     assert cell.cold.median > cell.warm.median
-    assert cell.metrics["x"].median == 1.0
+    assert cell.metrics["rtt_p50_us"].median == pytest.approx(cell.warm.median * 10.0)
 
 
 def test_comparisons_and_parity_verdicts(baseline_report: Report, advisory_report: Report) -> None:

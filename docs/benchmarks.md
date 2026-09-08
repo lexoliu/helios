@@ -130,6 +130,34 @@ Per cell (workload × side), `iterations` executions (11 by default):
   and the difference between them is which one can be trusted to block.
   A headline workload is regressed when the two warm bootstrap intervals
   are disjoint and the median moved by more than the noise floor.
+- The gate judges every measurement a cell carries, one row each: the
+  host-side `elapsed_ms` of the round trip, and each `bench.<name>`
+  metric the workload printed from inside the guest. A workload times
+  part of itself separately because the round trip averages that part
+  away — `procbench` times the teardown of a startup batch on its own,
+  for the kernel allocator — and a gate that compared the round trip
+  alone would put it straight back (#279).
+  - The metric's name carries its unit, because `bench.<name>=<number>`
+    on stdout is all either harness gets, and the unit is what says how
+    to read a shift. `_us`, `_ms`, `_ns`, `_per_call` and `_per_op` are
+    durations and `_per_s`, `_per_second` are rates of them, so a
+    positive shift is a regression for the first group and an
+    improvement for the second; `_bytes` is a footprint. A metric whose
+    name ends in no known unit stops the gate by name rather than being
+    guessed at.
+  - The noise floor is the control workload's drift, so it bounds how
+    far the *machine* moved and applies to durations and rates. A
+    footprint does not grow because the host was busy, so it is held to
+    its bootstrap intervals alone; otherwise a repeatable regression
+    would sit under a timing floor it can never reach.
+  - A metric row whose warm coefficient of variation exceeds the run's
+    `cv_bound` on either side is printed with that reason and takes part
+    in no verdict, the way a variance-rejected cell does. In practice
+    that is where the `_max_us` rows go: the maximum of ten samples is
+    not a statistic the gate can hold anyone to.
+  - A metric only one column measured is named under the table and
+    blocks nothing: the run that introduces a metric has nothing to
+    compare it against.
   - **Paired**, against the `Helios (baseline)` side of the candidate's
     own report: one host, one job, the two images booted back to back for
     every workload. Nothing about the machine differs between the

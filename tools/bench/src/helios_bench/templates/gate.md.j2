@@ -11,23 +11,27 @@ Both reports are from dedicated runners on {{ result.candidate_host }}: headline
 Informational only, and nothing here blocks: {% if result.baseline_host != result.candidate_host %}the two runs did not land on the same host ({{ result.baseline_host }} against {{ result.candidate_host }}){% else %}at least one of the two reports is not publishable{% endif %}.
 {% endif %}
 
-| Workload | Baseline | Candidate | Shift | CIs disjoint | Beyond noise | Verdict |
-| --- | ---: | ---: | ---: | :---: | :---: | --- |
+| Workload | Measurement | Baseline | Candidate | Shift | CIs disjoint | Beyond noise | Verdict |
+| --- | --- | ---: | ---: | ---: | :---: | :---: | --- |
 {% for row in result.rows %}
-| `{{ row.workload }}`{% if row.headline %} (headline){% endif %} | {{ row.baseline_median | ms }} | {{ row.candidate_median | ms }} | {{ row.shift | percent }} | {{ "yes" if row.ci_disjoint else "no" }} | {{ "yes" if row.beyond_noise else "no" }} | {% if row.regression %}**regression**{% elif row.improvement %}improvement{% else %}unchanged{% endif %} |
+| `{{ row.workload }}`{% if row.headline %} (headline){% endif %} | `{{ row.measurement }}`{% if row.direction == Direction.HIGHER_IS_BETTER %} (higher is better){% endif %} | {{ row.baseline_median | ms }} | {{ row.candidate_median | ms }} | {{ row.shift | percent }} | {{ "yes" if row.ci_disjoint else "no" }} | {{ "yes" if row.beyond_noise else "no" }} | {% if row.rejected %}rejected: {{ row.rejection_reason }}{% elif row.regression %}**regression**{% elif row.improvement %}improvement{% else %}unchanged{% endif %} |
 {% endfor %}
+{% if result.unpaired_metrics %}
+
+Measured on one side only, so uncompared: {% for unpaired in result.unpaired_metrics %}`{{ unpaired.workload }}`/`{{ unpaired.metric }}` ({{ unpaired.measured_by }} only){% if not loop.last %}, {% endif %}{% endfor %}.
+{% endif %}
 
 {% if result.blocking %}
 {% if result.incomplete_headlines %}
 **Blocking: incomplete paired evidence** — {{ result.incomplete_headlines | join(", ") }} has no comparable baseline/candidate pair (missing, failed, or rejected cell).
 {% endif %}
 {% if result.headline_regressions %}
-**Blocking**: {{ result.headline_regressions | map(attribute="workload") | join(", ") }} regressed significantly.
+**Blocking**: {% for row in result.headline_regressions %}`{{ row.workload }}`/`{{ row.measurement }}`{% if not loop.last %}, {% endif %}{% endfor %} regressed significantly.
 {% endif %}
 {% elif result.regressions %}
-Significant regressions outside the headline set, or on a comparison that does not block: {{ result.regressions | map(attribute="workload") | join(", ") }}.
+Significant regressions outside the headline set, or on a comparison that does not block: {% for row in result.regressions %}`{{ row.workload }}`/`{{ row.measurement }}`{% if not loop.last %}, {% endif %}{% endfor %}.
 {% elif result.improvements %}
-No significant regression. Significant improvement: {{ result.improvements | map(attribute="workload") | join(", ") }}.
+No significant regression. Significant improvement: {% for row in result.improvements %}`{{ row.workload }}`/`{{ row.measurement }}`{% if not loop.last %}, {% endif %}{% endfor %}.
 {% else %}
 No significant regression or improvement: no row has both disjoint confidence intervals and a shift beyond the noise floor.
 {% endif %}
