@@ -162,6 +162,27 @@ def test_a_dispersed_metric_is_rejected_rather_than_judged(paired_flat_report: R
     )
 
 
+def test_a_footprint_that_did_not_move_is_not_a_regression(paired_flat_report: Report) -> None:
+    """The floor does not apply, so nothing else may stand in for it.
+
+    Two images built from the same kernel source report the same
+    footprint, and a rule that judges a footprint without a noise floor
+    has to say "unchanged" for that case or it blocks every tooling
+    change.
+    """
+    config = StatsConfig(**paired_flat_report.thresholds.model_dump(exclude={"iterations", "warmup_discard"}))
+    cells = paired_flat_report.workload("hostcall-loop").cells
+    for side in (Side.HELIOS_BASELINE, Side.HELIOS):
+        cells[side].metrics["memory_per_instance_bytes"] = series_stats([9_853_797.0] * 5, config)
+    result = evaluate_paired(paired_flat_report)
+    row = next(row for row in result.rows if row.measurement == "memory_per_instance_bytes")
+
+    assert row.shift == 0.0
+    assert not row.beyond_noise
+    assert not row.regression and not row.improvement
+    assert not result.blocking
+
+
 def test_a_metric_only_one_column_measured_is_named_and_blocks_nothing(
     paired_flat_report: Report,
 ) -> None:
