@@ -350,7 +350,6 @@ fn kernel_console(
 
 #[derive(Clone)]
 pub struct RiscvCpu {
-    current_hart: ProcessorId,
     bootstrap_hart: ProcessorId,
     hart_count: usize,
     timebase_frequency: u64,
@@ -359,14 +358,12 @@ pub struct RiscvCpu {
 
 impl RiscvCpu {
     pub(crate) fn new(
-        current_hart: ProcessorId,
         bootstrap_hart: ProcessorId,
         hart_count: usize,
         timebase_frequency: u64,
         fdt_addr: usize,
     ) -> Self {
         Self {
-            current_hart,
             bootstrap_hart,
             hart_count,
             timebase_frequency,
@@ -640,7 +637,6 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
         has_debug_transport && (!helios_kernel::has_embedded_system_component() || has_vsock),
     );
     let cpu = RiscvCpu::new(
-        current_hart,
         bootstrap_processor,
         hart_count,
         timebase_frequency,
