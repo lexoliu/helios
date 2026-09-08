@@ -15,12 +15,17 @@ const WASI_CLI_RUN_FUNC: &str = "run";
 const POOLING_MAX_UNUSED_WARM_SLOTS: u32 = 100;
 /// Elements one pooled table slot holds.
 ///
-/// Set here rather than inherited, because the table pool's
-/// address-space cost is this count times a pointer per slot and the
-/// kernel is what has to fit that in its window. The value is what
-/// Wasmtime has always defaulted to, and every component this tree
-/// builds declares far smaller tables.
-const POOLING_TABLE_ELEMENTS: usize = 20_000;
+/// Set here rather than inherited, and set from measurement: the largest
+/// table any component in this tree declares is `python3`'s 5,895-entry
+/// indirect-call table, against 168 for the curl program and 87 for
+/// `hello`. Wasmtime's default is 20,000, and every one of those entries
+/// is user memory the engine commits per slot whether a component uses
+/// it or not, so the default was paying three and a half times over.
+///
+/// A slot is this count times `NOMINAL_MAX_TABLE_ELEM_SIZE`, which is
+/// `size_of::<Option<SendSyncPtr<VMFuncRef>>>()` — one pointer — so 8192
+/// entries is exactly 64 KiB and needs no page rounding.
+const POOLING_TABLE_ELEMENTS: usize = 8_192;
 
 #[derive(Debug, Error)]
 enum WasiCliRunResolveError {
@@ -154,18 +159,29 @@ impl PoolingBudget {
 }
 
 impl PoolingBudget {
-    /// Address space the memory and table pools reserve up front.
+    /// Address space the linear-memory pool reserves up front.
     ///
-    /// Only these two pools pre-reserve: a memory slot takes the whole
-    /// `CWASM_MEMORY_RESERVATION + CWASM_MEMORY_GUARD_SIZE` so that
-    /// Cranelift can drop the bounds check behind it, and a table slot
-    /// takes its element array. Instance metadata and fiber stacks are
-    /// taken as they are used.
+    /// A memory slot takes the whole `CWASM_MEMORY_RESERVATION +
+    /// CWASM_MEMORY_GUARD_SIZE` so that Cranelift can drop the bounds
+    /// check behind it, and the pool maps every slot inaccessible, so
+    /// this is address space and not pages. GC heaps come out of the
+    /// same pool.
     const fn reserved_address_space(&self) -> u64 {
         let per_memory =
             helios_artifact::CWASM_MEMORY_RESERVATION + helios_artifact::CWASM_MEMORY_GUARD_SIZE;
+        (self.memories as u64) * per_memory
+    }
+
+    /// User memory the pools commit when the engine is built.
+    ///
+    /// The table pool is the one that does: it maps its whole allocation
+    /// accessible, one `POOLING_TABLE_ELEMENTS`-sized slot per table in
+    /// the budget. Nothing else here is paid before it is used — the
+    /// memory pool reserves, the bare-metal stack pool is a counter, and
+    /// instance metadata is allocated per instantiation.
+    const fn committed_user_bytes(&self) -> u64 {
         let per_table = (POOLING_TABLE_ELEMENTS as u64) * (size_of::<usize>() as u64);
-        (self.memories as u64) * per_memory + (self.tables as u64) * per_table
+        (self.tables as u64) * per_table
     }
 }
 
@@ -178,6 +194,11 @@ fn apply_pooling_config(config: &mut wasmtime::Config) {
     assert!(
         budget.reserved_address_space() <= MAX_POOLED_ADDRESS_SPACE,
         "the instance pools reserve more address space than the kernel allows"
+    );
+    // And the table pool is paid in pages, here, before a program runs.
+    assert!(
+        budget.committed_user_bytes() <= MAX_POOLED_USER_MEMORY,
+        "the instance pools commit more user memory than the kernel allows"
     );
     let mut pooling = PoolingAllocationConfig::default();
     pooling.max_unused_warm_slots(POOLING_MAX_UNUSED_WARM_SLOTS);
@@ -236,7 +257,8 @@ pub fn resolve_wasi_cli_run<T: 'static>(
 
 use super::config::{
     MAX_CONCURRENT_INSTANCES, MAX_CORE_INSTANCES_PER_COMPONENT, MAX_MEMORIES_PER_COMPONENT,
-    MAX_POOLED_ADDRESS_SPACE, MAX_TABLES_PER_COMPONENT, build_component_engine_config,
+    MAX_POOLED_ADDRESS_SPACE, MAX_POOLED_USER_MEMORY, MAX_TABLES_PER_COMPONENT,
+    build_component_engine_config,
 };
 
 #[cfg(test)]
@@ -285,9 +307,9 @@ mod tests {
         );
     }
 
-    /// The pools are reserved out of the 32 TiB window every backend
-    /// hands the runtime, so the budget has to fit before three targets
-    /// try to boot with it.
+    /// The memory pool is reserved out of the 32 TiB window every
+    /// backend hands the runtime, so the budget has to fit before three
+    /// targets try to boot with it.
     #[test]
     fn the_pools_fit_the_address_space_the_kernel_allows() {
         let reserved = PoolingBudget::of_kernel_policy().reserved_address_space();
@@ -296,22 +318,38 @@ mod tests {
             reserved <= MAX_POOLED_ADDRESS_SPACE,
             "pools reserve {reserved} bytes, budget is {MAX_POOLED_ADDRESS_SPACE}"
         );
-        // Nearly all of it is the memory pool, which is the term to read
-        // when either limit is widened: a slot reserves the whole 4 GiB a
-        // wasm32 guest can address, plus its guard region, before
-        // anything runs in it. The table pool is three orders of
-        // magnitude smaller, and nothing else pre-reserves at all.
-        let memory_pool = u64::from(PoolingBudget::of_kernel_policy().memories)
-            * (helios_artifact::CWASM_MEMORY_RESERVATION
-                + helios_artifact::CWASM_MEMORY_GUARD_SIZE);
-        assert!(
-            memory_pool * 1000 > reserved * 999,
-            "{memory_pool} of {reserved}"
-        );
         assert!(
             reserved > 8 << 40,
-            "the budget is documented as about 8.1 TiB"
+            "the memory pool is documented as about 8.1 TiB"
         );
+    }
+
+    /// The table pool is paid in user pages when the engine is built,
+    /// and that is what made the first draft of this budget a
+    /// regression: four tables per component at Wasmtime's default of
+    /// 20,000 elements committed 655 MiB per engine, and the kernel
+    /// builds two, so `cpython-json` was refused 40 MiB out of a
+    /// 1.44 GiB guest (run 34224973216).
+    #[test]
+    fn the_table_pool_commits_less_than_the_default_it_replaces() {
+        let budget = PoolingBudget::of_kernel_policy();
+        let committed = budget.committed_user_bytes();
+
+        assert!(
+            committed <= MAX_POOLED_USER_MEMORY,
+            "pools commit {committed} bytes, budget is {MAX_POOLED_USER_MEMORY}"
+        );
+        // What Wasmtime's default would have committed for the same
+        // engine: 1000 tables of 20,000 pointers. Serving three times
+        // the instances for less memory than that is the whole claim.
+        let upstream_default = 1000 * 20_000 * size_of::<usize>() as u64;
+        assert!(
+            committed < upstream_default,
+            "{committed} against the default's {upstream_default}"
+        );
+        // And it serves more programs than the default did: 1000 core
+        // instances is 250 components at four apiece.
+        assert!(budget.component_instances > 1000 / 4);
     }
 
     #[test]
