@@ -25,7 +25,7 @@ use core::cmp;
 use core::mem::{size_of, size_of_val};
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use helios_hal::cpu::Cpu;
+use helios_hal::cpu::{Cpu, current_processor};
 use helios_hal::fs::{
     BlockDevice, BlockDeviceCapabilities, BlockDeviceRights, BlockGeometry, BlockQueueTopology,
     BlockRange, BlockSerial,
@@ -120,7 +120,7 @@ pub trait QueueAffinity: Send + Sync + 'static {
 
 impl<C: Cpu> QueueAffinity for C {
     fn current_processor(&self) -> usize {
-        usize::from(Cpu::current_processor(self).id())
+        usize::from(current_processor().id())
     }
 
     fn processor_count(&self) -> usize {

@@ -298,10 +298,6 @@ mod tests {
     struct TestCpu;
 
     impl cpu::Cpu for TestCpu {
-        fn current_processor(&self) -> ProcessorId {
-            ProcessorId::new(0)
-        }
-
         fn processor_count(&self) -> usize {
             4
         }

@@ -272,7 +272,7 @@ where
     fn accepting_shard_idx(&self) -> usize {
         self.inner
             .state
-            .shard_idx_for_processor(self.inner.cpu.current_processor())
+            .shard_idx_for_processor(helios_hal::cpu::current_processor())
     }
 
     pub async fn tcp_shutdown_send(&self, stream: TcpStreamId) -> Result<(), TcpError> {
@@ -1042,7 +1042,7 @@ where
     /// the last place that knows which pair that was.
     fn receive_frames_immediate(&self, frames: &mut [Option<RxFrame>]) -> Option<RxDrain> {
         let pair_count = self.inner.device.queue_pair_count().max(1);
-        let local_pair = usize::from(self.inner.cpu.current_processor().id()) % pair_count;
+        let local_pair = usize::from(helios_hal::cpu::current_processor().id()) % pair_count;
         let mut received = 0usize;
         let mut drained_a_pair = false;
         for pair_idx in receive_pair_order(local_pair, pair_count) {

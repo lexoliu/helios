@@ -210,15 +210,21 @@ property of every kernel and `hal/` subsystem, never a follow-up.
   processors. "Add SMP later" is not a design note.
 - Every address-space mutation invalidates the local TLB and sends an IPI
   shootdown to every other processor that has run in that space.
-- Hot paths use per-CPU storage indexed by `Cpu::current_processor()`;
+- Hot paths use per-CPU storage indexed by the executing processor;
   cross-processor queues prefer atomics and lock-free channels to a mutex.
-  The processor index is only reachable where a `Cpu` is held: an executor,
-  a scheduler, a service that was constructed with one. A task future, a
-  drop path, or a global allocator holds none and never carries one (on
-  every backend a `Cpu` is a refcounted handle, and cloning it per task is
-  a cost on the spawn path), so a per-processor structure states which of
-  its operations run on the owner and which arrive from any processor, and
-  gives the latter a lock-free path that needs no processor index.
+  Which processor is executing is a property of the hardware, not state the
+  kernel owns and passes: every backend answers it in one instruction from
+  a register the boot path seeds before the heap exists (`fs:[8]`,
+  `tpidr_el1`, `tp`), so `hal` publishes it as a linkage contract the
+  backend fills, the way the global allocator and the panic handler are
+  published, and any code may ask — a task future, a drop path, the global
+  allocator. A `Cpu` handle describes the platform (its timebase, its
+  processor table, its watchdog) and is still passed explicitly; it is not
+  the route to the processor index and carries none.
+  What a per-processor structure must still state is which of its
+  operations run on the owner and which arrive from any processor: the
+  index says where you are, never that you are alone, and a foreign free
+  or a cross-processor push still needs a path that is correct without it.
 - Words written by different processors live on different cache lines
   (`crossbeam_utils::CachePadded`, sized per target), and a structure's
   docs say which processor writes each padded block.

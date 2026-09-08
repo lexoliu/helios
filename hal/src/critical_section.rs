@@ -75,6 +75,20 @@ impl ProcessorIdentity {
         self.0.get()
     }
 
+    /// The hardware id a bootstrapping identity was built from, or `None`
+    /// once the processor has installed its runtime.
+    ///
+    /// The bootstrapping form is the only identity a processor carries
+    /// before its runtime exists, and it is what a backend answers
+    /// `helios_current_processor` from during boot.
+    pub const fn hardware_id(self) -> Option<usize> {
+        if self.0.get() & BOOTSTRAPPING_TAG == 0 {
+            None
+        } else {
+            Some(self.0.get() >> 1)
+        }
+    }
+
     /// The address of the installed per-processor runtime, or `None` while the
     /// processor still carries its bootstrapping identity.
     pub const fn runtime_address(self) -> Option<NonZeroUsize> {

@@ -828,7 +828,7 @@ impl NetworkShardSet {
     fn raise_shard_progress<CpuImpl: Cpu>(&self, shard_idx: usize, cpu: &CpuImpl) {
         self.arrival(shard_idx).signal();
         let owner = self.owner_processor(shard_idx);
-        if owner != cpu.current_processor() {
+        if owner != helios_hal::cpu::current_processor() {
             cpu.wake_processor(owner);
         }
     }

@@ -110,7 +110,7 @@ use core::sync::atomic::{AtomicUsize, Ordering, compiler_fence};
 
 use arrayvec::ArrayVec;
 use fdt::Fdt;
-use helios_hal::cpu::{Cpu, Instant, ProcessorId};
+use helios_hal::cpu::{Cpu, Instant, ProcessorId, current_processor};
 use helios_hal::critical_section::ProcessorIdentity;
 use helios_hal::memory::MemoryRegion;
 use helios_hal::serial::ByteSerial;
@@ -375,11 +375,28 @@ impl RiscvCpu {
     }
 }
 
-impl Cpu for RiscvCpu {
-    fn current_processor(&self) -> ProcessorId {
-        installed_hart_runtime().map_or(self.current_hart, |runtime| runtime.hart_id)
+/// The processor identity `hal` publishes as a linkage contract.
+///
+/// `tp` carries the hart identity `run_hart` seeds before anything else
+/// runs, and its bootstrapping form until `HartRuntime::install`
+/// replaces it, so this answers from the first instruction of the
+/// kernel onwards.
+#[unsafe(no_mangle)]
+extern "Rust" fn helios_current_processor() -> ProcessorId {
+    match installed_hart_runtime() {
+        Some(runtime) => runtime.hart_id,
+        None => {
+            let hardware_id = read_hart_identity()
+                .hardware_id()
+                .expect("an identity without a runtime address carries a hardware id");
+            ProcessorId::new(
+                u16::try_from(hardware_id).expect("riscv hart id does not fit a processor id"),
+            )
+        }
     }
+}
 
+impl Cpu for RiscvCpu {
     fn processor_count(&self) -> usize {
         self.hart_count
     }
@@ -423,7 +440,7 @@ impl Cpu for RiscvCpu {
     }
 
     fn wake_processor(&self, hart: ProcessorId) {
-        if self.current_processor() == hart {
+        if current_processor() == hart {
             return;
         }
 

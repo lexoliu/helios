@@ -11,7 +11,7 @@ use crate::{
     KernelClock, KillReason, ProcessAuthority, RegisteredInstance, SetWallClockCap, Sleep, Timer,
     nanos_to_ticks_ceil_saturating,
 };
-use helios_hal::cpu::{Cpu, Instant};
+use helios_hal::cpu::{Cpu, Instant, current_processor};
 
 use crate::memory::{MemoryOwner, set_user_memory_owner, user_mapping_kernel_heap_bytes};
 use thiserror::Error;
@@ -684,7 +684,7 @@ where
     }
 
     fn apply_activity_change(&self, change: ActivityChange) {
-        name_user_memory_owner(&self.cpu, self.instance(), change);
+        name_user_memory_owner(self.instance(), change);
         if let ActivityChange::Left {
             instance_elapsed: Some(elapsed),
         } = change
@@ -764,15 +764,11 @@ pub async fn wait_until_runtime_deadline<CpuImpl, RuntimeStateImpl>(
 
 /// Charges pages committed on this processor to `instance` while its
 /// guest code runs, and to nobody once this store leaves it.
-fn name_user_memory_owner<CpuImpl: Cpu>(
-    cpu: &CpuImpl,
-    instance: &crate::RegisteredInstance,
-    change: ActivityChange,
-) {
+fn name_user_memory_owner(instance: &crate::RegisteredInstance, change: ActivityChange) {
     let owner = match change {
         ActivityChange::Entered => MemoryOwner::new(instance.id().raw()),
         ActivityChange::Left { .. } => MemoryOwner::NONE,
         ActivityChange::Unchanged => return,
     };
-    set_user_memory_owner(cpu.current_processor(), owner);
+    set_user_memory_owner(current_processor(), owner);
 }

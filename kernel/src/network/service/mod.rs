@@ -25,7 +25,7 @@ use core::task::Poll;
 use core::time::Duration;
 
 use bytes::Bytes;
-use helios_hal::cpu::{Cpu, HardwarePerfCounters};
+use helios_hal::cpu::{Cpu, HardwarePerfCounters, current_processor};
 use helios_hal::io::IoError;
 use helios_netstack::{
     DEFAULT_HOP_LIMIT, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DNS_PORT, DhcpClientMessage,
@@ -1144,7 +1144,7 @@ where
         let queue_idx = self
             .inner
             .state
-            .shard_idx_for_processor(self.inner.cpu.current_processor());
+            .shard_idx_for_processor(current_processor());
         self.network_wait(queue_idx, self.inner.state.any_shard_wait())
     }
 

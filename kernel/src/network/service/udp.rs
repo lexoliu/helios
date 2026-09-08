@@ -105,7 +105,7 @@ where
     fn receiving_shard_idx(&self) -> usize {
         self.inner
             .state
-            .shard_idx_for_processor(self.inner.cpu.current_processor())
+            .shard_idx_for_processor(helios_hal::cpu::current_processor())
     }
 
     pub async fn udp_join_multicast_v4(
