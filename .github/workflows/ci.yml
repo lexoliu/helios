@@ -967,10 +967,10 @@ jobs:
                   row = json.loads(line)
                   if row.get("type") != "summary":
                       continue
-                  iters = ", ".join(str(v) for v in row.get("elapsed_ms", []))
+                  iters = ", ".join(f"{float(v):.3f}" for v in row.get("elapsed_ms", []))
                   print(
                       f"| {row['workload']} | {row['class']} "
-                      f"| {row['median_elapsed_ms']} | {iters} |"
+                      f"| {float(row['median_elapsed_ms']):.3f} | {iters} |"
                   )
           EOF
       - uses: actions/upload-artifact@v4

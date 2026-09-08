@@ -44,7 +44,7 @@ if [ "$HELIOS_WORKLOAD_BENCH_CLASSES" = "@WEDGED@" ]; then
 fi
 for name in $(echo "$HELIOS_WORKLOAD_BENCH_WORKLOADS" | tr ',' ' '); do
     printf '{"type":"summary","workload":"%s","class":"%s","headline":false,\
-"runner":"program","median_elapsed_ms":1,"iterations":1,"elapsed_ms":[1],\
+"runner":"program","median_elapsed_ms":1.125,"iterations":1,"elapsed_ms":[1.125],\
 "validation":{"ok":true}}\\n' "$name" "$HELIOS_WORKLOAD_BENCH_CLASSES" >> "$log"
 done
 """.replace("@WEDGED@", WEDGED)

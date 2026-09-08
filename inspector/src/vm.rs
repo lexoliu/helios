@@ -2512,8 +2512,8 @@ fn run_aot_bench(
             let mut stdout = std::io::stdout().lock();
             writeln!(
                 stdout,
-                "iteration={iteration} elapsed_ms={} destination_path={}",
-                elapsed.as_millis(),
+                "iteration={iteration} elapsed_ms={:.3} destination_path={}",
+                elapsed.as_secs_f64() * 1_000.0,
                 result.destination_path
             )
             .map_err(|source| AotBenchError::Report { source })?;
