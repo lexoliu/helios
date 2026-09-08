@@ -381,7 +381,7 @@ where
             );
             let instantiate_started = profile_cpu.now().ticks();
             let instance = {
-                let _owner = own_committed_memory(&profile_cpu, instance_id);
+                let _owner = own_committed_memory(instance_id);
                 linker.instantiate_async(&mut store, &compiled.module).await
             };
             record_named_program_kernel_profile(
@@ -452,7 +452,7 @@ where
             );
             let instantiate_started = profile_cpu.now().ticks();
             let instance = {
-                let _owner = own_committed_memory(&profile_cpu, instance_id);
+                let _owner = own_committed_memory(instance_id);
                 instance_pre.instantiate_async(&mut store).await
             };
             record_named_program_kernel_profile(
@@ -675,7 +675,7 @@ where
         );
         let instantiate_started = profile_cpu.now().ticks();
         let instance = {
-            let _owner = own_committed_memory(&profile_cpu, instance_id);
+            let _owner = own_committed_memory(instance_id);
             linker.instantiate_async(&mut store, &compiled.module).await
         };
         record_named_program_kernel_profile(
@@ -889,7 +889,7 @@ where
         .profiling_enabled()
         .then(|| profile_cpu.now().ticks());
     let instance = {
-        let _owner = own_committed_memory(&profile_cpu, instance_id);
+        let _owner = own_committed_memory(instance_id);
         instance_pre.instantiate_async(&mut store).await
     };
     if let Some(instantiate_instance_started) = instantiate_instance_started {
@@ -1832,12 +1832,9 @@ pub(super) fn trusted_signed_payload(bytes: &Bytes) -> Result<Bytes, ProgramExec
 /// precision in choosing a victim and costs correctness nothing — the
 /// pages, their flags and their tokens are the address space's, not the
 /// owner tag's.
-fn own_committed_memory<CpuImpl: Cpu>(
-    cpu: &CpuImpl,
-    instance: crate::InstanceId,
-) -> crate::UserMemoryOwnerScope<'static> {
+fn own_committed_memory(instance: crate::InstanceId) -> crate::UserMemoryOwnerScope<'static> {
     crate::enter_user_memory_owner(
-        cpu.current_processor(),
+        helios_hal::cpu::current_processor(),
         crate::MemoryOwner::new(instance.raw()),
     )
 }

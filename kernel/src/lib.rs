@@ -201,7 +201,7 @@ use core::task::{Context, Poll, Waker};
 use core::time::Duration;
 
 use arrayvec::ArrayVec;
-use helios_hal::cpu::{Cpu, Instant, ProcessorId};
+use helios_hal::cpu::{Cpu, Instant, ProcessorId, current_processor};
 use helios_hal::memory::MemoryRegion;
 use helios_hal::watchdog::{NoWatchdog, ProgressCounter, Watchdog};
 use helios_hal::{DeviceInventory, DmaModel, ProcessorStartupPolicy, ProcessorTopology};
@@ -932,7 +932,7 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone> Kernel<CpuImpl, Watch
         let cpu = self.cpu.clone();
         let watchdog = self.watchdog.clone();
         let progress_notify = self.spawner().progress_notify();
-        if self.cpu.current_processor() == self.topology.bootstrap_processor {
+        if current_processor() == self.topology.bootstrap_processor {
             watchdog.arm();
         }
         self.spawner().spawn_local_detached_silent(async move {
@@ -956,7 +956,7 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone> Kernel<CpuImpl, Watch
         }
 
         let timer = self.timer();
-        let processor = self.cpu.current_processor().id();
+        let processor = current_processor().id();
         let delay = watchdog_self_test_delay();
         self.spawner().spawn_local_detached_silent(async move {
             timer.sleep_for(delay).await;
@@ -996,7 +996,7 @@ struct LocalFutureParker<CpuImpl: Cpu + Clone> {
 
 impl<CpuImpl: Cpu + Clone> LocalFutureParker<CpuImpl> {
     fn new(cpu: CpuImpl) -> Self {
-        let owner_processor = cpu.current_processor();
+        let owner_processor = current_processor();
         Self {
             cpu,
             owner_processor,
@@ -1019,14 +1019,14 @@ impl<CpuImpl: Cpu + Clone> LocalFutureParker<CpuImpl> {
 impl<CpuImpl: Cpu + Clone> Wake for LocalFutureParker<CpuImpl> {
     fn wake(self: Arc<Self>) {
         self.notified.store(true, Ordering::Release);
-        if self.cpu.current_processor() != self.owner_processor {
+        if current_processor() != self.owner_processor {
             self.cpu.wake_processor(self.owner_processor);
         }
     }
 
     fn wake_by_ref(self: &Arc<Self>) {
         self.notified.store(true, Ordering::Release);
-        if self.cpu.current_processor() != self.owner_processor {
+        if current_processor() != self.owner_processor {
             self.cpu.wake_processor(self.owner_processor);
         }
     }
@@ -1062,7 +1062,7 @@ where
         dma_model,
         devices,
     } = platform;
-    let current_processor = cpu.current_processor();
+    let current_processor = current_processor();
     assert!(
         cpu.bootstrap_processor() == topology.bootstrap_processor,
         "platform topology bootstrap processor {} does not match CPU bootstrap processor {}",
@@ -1464,6 +1464,31 @@ fn kernel_alloc_error(layout: core::alloc::Layout) -> ! {
         layout.size(),
         layout.align()
     )
+}
+
+/// The processor identity contract for host test builds.
+///
+/// A test binary links no backend, so it defines the symbol itself and
+/// answers from a per-thread slot. A host test binary is one processor
+/// unless a test says otherwise, which the SMP test CPUs do when they
+/// are built for a particular slot.
+#[cfg(test)]
+mod test_processor_identity {
+    use helios_hal::cpu::ProcessorId;
+
+    std::thread_local! {
+        static CURRENT: core::cell::Cell<Option<ProcessorId>> =
+            const { core::cell::Cell::new(None) };
+    }
+
+    pub(crate) fn set(processor: ProcessorId) {
+        CURRENT.with(|slot| slot.set(Some(processor)));
+    }
+
+    #[unsafe(no_mangle)]
+    extern "Rust" fn helios_current_processor() -> ProcessorId {
+        CURRENT.with(|slot| slot.get().unwrap_or(ProcessorId::new(0)))
+    }
 }
 
 #[cfg(test)]

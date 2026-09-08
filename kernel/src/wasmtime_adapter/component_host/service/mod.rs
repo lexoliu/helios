@@ -363,7 +363,7 @@ where
     WatchdogImpl: Watchdog + Clone,
 {
     let topology = kernel.topology();
-    if cpu.current_processor() != topology.bootstrap_processor {
+    if helios_hal::cpu::current_processor() != topology.bootstrap_processor {
         return None;
     }
 
@@ -585,7 +585,7 @@ where
 {
     let topology = kernel.topology();
     match component_host_processor_role(
-        cpu.current_processor(),
+        helios_hal::cpu::current_processor(),
         topology.configured_processors,
         topology.bootstrap_processor,
     ) {
@@ -629,7 +629,7 @@ where
     HostFs: crate::HostFileSystem,
     WatchdogImpl: Watchdog + Clone,
 {
-    let processor = cpu.current_processor().id();
+    let processor = helios_hal::cpu::current_processor().id();
     let stack = kernel_processor_profile_stack(processor);
     loop {
         let progress = if debug_state.profiling_enabled() {

@@ -40,7 +40,7 @@ use core::arch::x86_64::{__cpuid, __cpuid_count, _rdrand64_step, _rdtsc};
 use core::ops::Range;
 use core::sync::atomic::{AtomicUsize, Ordering, compiler_fence};
 use helios_hal::boot::{BootMemoryMap, BootReservedRanges, usable_region_segments};
-use helios_hal::cpu::{Cpu, Instant, ProcessorId};
+use helios_hal::cpu::{Cpu, Instant, ProcessorId, current_processor};
 use helios_hal::critical_section::ProcessorIdentity;
 use helios_hal::entropy::{EntropyQuality, EntropyUnavailable};
 use helios_hal::memory::MemoryRegion;
@@ -307,7 +307,7 @@ fn x86_kernel_main() -> ! {
     smp::current_runtime().install_program_service(
         program_service.unwrap_or_else(|| panic!("x86 bootstrap did not install program service")),
     );
-    if cpu.current_processor() == cpu.bootstrap_processor() {
+    if current_processor() == cpu.bootstrap_processor() {
         for processor in helios_kernel::component_host_processors_to_start(
             cpu.processor_count(),
             cpu.bootstrap_processor(),
@@ -686,11 +686,18 @@ impl X86Cpu {
     }
 }
 
-impl Cpu for X86Cpu {
-    fn current_processor(&self) -> ProcessorId {
-        self.state.current_processor()
-    }
+/// The processor identity `hal` publishes as a linkage contract.
+///
+/// `fs` carries this processor's anchor from `install_bootstrap_anchor`
+/// onwards, which `x86_kernel_main` runs before the heap and the ACPI
+/// tables exist, so this answers on every path including one that holds
+/// no state at all.
+#[unsafe(no_mangle)]
+extern "Rust" fn helios_current_processor() -> ProcessorId {
+    smp::current_processor()
+}
 
+impl Cpu for X86Cpu {
     fn processor_count(&self) -> usize {
         self.state.processor_count()
     }

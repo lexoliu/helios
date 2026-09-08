@@ -18,15 +18,39 @@ pub struct HostedCpu {
 
 impl HostedCpu {
     pub fn new(processor: ProcessorId, machine: Arc<HostedMachine>) -> Self {
+        set_current_processor(processor);
         Self { processor, machine }
     }
 }
 
-impl Cpu for HostedCpu {
-    fn current_processor(&self) -> ProcessorId {
-        self.processor
-    }
+thread_local! {
+    /// This thread's logical processor, seeded when the thread's
+    /// [`HostedCpu`] is built and read by the identity contract below.
+    static CURRENT_PROCESSOR: core::cell::Cell<Option<ProcessorId>> =
+        const { core::cell::Cell::new(None) };
+}
 
+/// Declares which logical processor the calling thread stands in for.
+///
+/// The bare-metal backends seed a register in their boot path; a hosted
+/// processor is an OS thread, so it seeds a thread-local instead. A
+/// thread that runs kernel code without doing this is a bug in the
+/// hosted machine's thread setup, and the contract below says so rather
+/// than answering with processor zero.
+pub fn set_current_processor(processor: ProcessorId) {
+    CURRENT_PROCESSOR.with(|slot| slot.set(Some(processor)));
+}
+
+/// The processor identity `hal` publishes as a linkage contract.
+#[unsafe(no_mangle)]
+extern "Rust" fn helios_current_processor() -> ProcessorId {
+    CURRENT_PROCESSOR.with(|slot| {
+        slot.get()
+            .expect("this thread runs kernel code without a hosted processor identity")
+    })
+}
+
+impl Cpu for HostedCpu {
     fn processor_count(&self) -> usize {
         self.machine.processor_count()
     }

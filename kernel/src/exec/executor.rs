@@ -15,7 +15,7 @@ use core::task::{Context, Poll};
 use async_task::{Builder, Runnable, Task};
 use concurrent_queue::{ConcurrentQueue, PopError, PushError};
 use crossbeam_utils::CachePadded;
-use helios_hal::cpu::{Cpu, ProcessorId};
+use helios_hal::cpu::{Cpu, ProcessorId, current_processor};
 use helios_hal::watchdog::ProgressCounter;
 use spin::Once;
 use triomphe::Arc as NoWeakArc;
@@ -108,7 +108,7 @@ struct ExecutorGroup {
 /// # Concurrency contract
 ///
 /// The arena belongs to one processor. A spawn is served by the arena
-/// of the processor it is running on — [`Cpu::current_processor`] picks
+/// of the processor it is running on — [`current_processor`] picks
 /// it, because a [`Spawner`] travels with the task that holds it — so
 /// every allocation, split, merge and free-list mutation happens on the
 /// owning processor. The metadata is single-owner and plain: no lock,
@@ -865,7 +865,7 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
     /// was made: the arena's metadata is owner-only, and the owner is
     /// the processor doing the allocating.
     fn task_arena(&self) -> &NoWeakArc<TaskArena> {
-        let processor = self.cpu.current_processor();
+        let processor = current_processor();
         self.group
             .task_arenas
             .get(processor.id() as usize)
@@ -1135,7 +1135,7 @@ impl<CpuImpl: Cpu + Clone> GlobalScheduler<CpuImpl> {
         if self.processor_count <= 1 {
             return;
         }
-        let current_processor = self.cpu.current_processor();
+        let current_processor = current_processor();
         let start = self
             .group
             .global_wake_cursor
@@ -1159,7 +1159,7 @@ impl<CpuImpl: Cpu + Clone> LocalScheduler<CpuImpl> {
         let previous_ready = push_ready(queue, ready_count, runnable);
         self.progress.record();
         if should_wake_owner_processor(previous_ready)
-            && self.cpu.current_processor() != self.owner_processor
+            && current_processor() != self.owner_processor
         {
             self.cpu.wake_processor(self.owner_processor);
         }
@@ -1173,7 +1173,7 @@ impl<CpuImpl: Cpu + Clone> LocalSilentScheduler<CpuImpl> {
         let ready_count = &self.group.local_ready_counts[self.local_queue_index];
         let previous_ready = push_ready(queue, ready_count, runnable);
         if should_wake_owner_processor(previous_ready)
-            && self.cpu.current_processor() != self.owner_processor
+            && current_processor() != self.owner_processor
         {
             self.cpu.wake_processor(self.owner_processor);
         }
@@ -1333,10 +1333,6 @@ mod tests {
     struct TestCpu;
 
     impl Cpu for TestCpu {
-        fn current_processor(&self) -> ProcessorId {
-            ProcessorId::new(0)
-        }
-
         fn processor_count(&self) -> usize {
             1
         }

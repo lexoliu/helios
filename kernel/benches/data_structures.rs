@@ -735,10 +735,6 @@ impl ComponentNetworkService for BenchNetworkService {
 }
 
 impl Cpu for BenchCpu {
-    fn current_processor(&self) -> ProcessorId {
-        ProcessorId::new(0)
-    }
-
     fn processor_count(&self) -> usize {
         1
     }

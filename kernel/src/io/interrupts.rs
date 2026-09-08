@@ -9,7 +9,7 @@
 //! bring-up and are read-only on the interrupt path afterwards.
 //! Handlers run in interrupt context and must be non-blocking.
 
-use helios_hal::cpu::{Cpu, ProcessorId};
+use helios_hal::cpu::{Cpu, ProcessorId, current_processor};
 
 use crate::device::DeviceInterruptRoute;
 
@@ -216,7 +216,7 @@ where
 /// and allocates nothing; `Cpu::wake_processor` is the only thing it
 /// does, once per queue, and never for the processor it runs on.
 pub fn wake_queue_owners<CpuImpl: Cpu>(cpu: &CpuImpl, queues: impl Iterator<Item = usize>) {
-    let current = cpu.current_processor();
+    let current = current_processor();
     let processors = cpu.processor_count();
     for queue in queues {
         // A queue beyond the processor count belongs to no shard: the

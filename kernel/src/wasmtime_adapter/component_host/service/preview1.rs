@@ -374,7 +374,7 @@ where
             crate::ActivityChange::Left { .. } => crate::MemoryOwner::NONE,
             crate::ActivityChange::Unchanged => return,
         };
-        crate::set_user_memory_owner(self.cpu.current_processor(), owner);
+        crate::set_user_memory_owner(helios_hal::cpu::current_processor(), owner);
         if let crate::ActivityChange::Left {
             instance_elapsed: Some(elapsed),
         } = change

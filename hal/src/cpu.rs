@@ -99,13 +99,35 @@ const fn wrapping_option_delta(end: Option<u64>, start: Option<u64>) -> u64 {
     }
 }
 
-pub trait Cpu: Send + Sync + 'static {
-    /// Returns the processor currently executing this code path.
+unsafe extern "Rust" {
+    /// The identity of the processor executing this code path, defined by
+    /// the backend the image links.
     ///
-    /// This must be cheap and stable for the lifetime of the `Cpu` value because
-    /// the kernel queries it during boot, scheduling, and panic reporting.
-    fn current_processor(&self) -> ProcessorId;
+    /// This is published as a linkage contract rather than a trait method
+    /// because the answer is a property of the executing hardware, not of
+    /// any value the kernel holds. Every backend reads it in one
+    /// instruction from a register its boot path seeds before the heap
+    /// exists — `fs:[8]`, `tpidr_el1`, `tp` — so the identity is available
+    /// strictly earlier than a [`Cpu`] handle can be constructed, and code
+    /// that holds no state at all can still ask: a task future, a drop
+    /// path, the global allocator.
+    ///
+    /// A backend defines it with `#[unsafe(no_mangle)]` under this exact
+    /// name, the way an image supplies its global allocator and its panic
+    /// handler. Calling it before the backend has seeded that register is
+    /// the backend's own bug to fail on, not a case to answer with a
+    /// default.
+    fn helios_current_processor() -> ProcessorId;
+}
 
+/// The processor executing this code path.
+pub fn current_processor() -> ProcessorId {
+    // Safety: the image is required to define `helios_current_processor`,
+    // and a Rust-ABI call to it carries `ProcessorId` unchanged.
+    unsafe { helios_current_processor() }
+}
+
+pub trait Cpu: Send + Sync + 'static {
     /// Returns the number of processors the platform exposes to the kernel.
     ///
     /// The kernel uses this to decide which secondary processors to start during SMP

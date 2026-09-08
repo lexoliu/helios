@@ -57,10 +57,6 @@ impl TestCpu {
 }
 
 impl Cpu for TestCpu {
-    fn current_processor(&self) -> ProcessorId {
-        ProcessorId::new(0)
-    }
-
     fn has_lazy_commit_virtual_memory(&self) -> bool {
         // The unit tests build on a hosted platform, where the operating
         // system commits a reservation lazily on its own. A test platform
@@ -140,10 +136,6 @@ impl ManualClockCpu {
 }
 
 impl Cpu for ManualClockCpu {
-    fn current_processor(&self) -> ProcessorId {
-        ProcessorId::new(0)
-    }
-
     fn processor_count(&self) -> usize {
         1
     }
@@ -199,7 +191,6 @@ impl Cpu for ManualClockCpu {
 /// needs and keeps the IPIs for the test to assert on.
 pub(crate) struct RecordingSmpCpu {
     base: TestCpu,
-    current: ProcessorId,
     processors: usize,
     woken: spin::Mutex<alloc::vec::Vec<ProcessorId>>,
 }
@@ -211,9 +202,9 @@ impl RecordingSmpCpu {
             usize::from(current) < processors,
             "test CPU slot {current} out of range for {processors} processors"
         );
+        crate::test_processor_identity::set(ProcessorId::new(current));
         Self {
             base: TestCpu::without_entropy(),
-            current: ProcessorId::new(current),
             processors,
             woken: spin::Mutex::new(alloc::vec::Vec::new()),
         }
@@ -226,10 +217,6 @@ impl RecordingSmpCpu {
 }
 
 impl Cpu for RecordingSmpCpu {
-    fn current_processor(&self) -> ProcessorId {
-        self.current
-    }
-
     fn processor_count(&self) -> usize {
         self.processors
     }

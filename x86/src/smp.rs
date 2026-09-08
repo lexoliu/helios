@@ -570,10 +570,6 @@ impl X86PlatformState {
         Some(slot.apic_id)
     }
 
-    pub(crate) fn current_processor(&self) -> ProcessorId {
-        current_processor()
-    }
-
     pub(crate) fn start_processor(&self, processor: ProcessorId, entry: usize) {
         let slot = self.processor_slot(processor);
         let wakeup_page = self

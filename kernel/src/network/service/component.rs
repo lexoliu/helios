@@ -141,7 +141,7 @@ where
     /// Opens a connected socket to `resolver` on the shard that will
     /// receive its answers.
     fn open_resolver_socket(&self, resolver: IpAddress) -> Result<ResolverSocket, DnsError> {
-        let processor = self.inner.cpu.current_processor();
+        let processor = helios_hal::cpu::current_processor();
         let shard_idx = self.inner.state.shard_idx_for_processor(processor);
         let shard_count = self.inner.state.shard_count();
         // The port is picked on this processor's shard, preferring one

@@ -785,11 +785,17 @@ pub struct Aarch64Cpu {
     state: &'static Aarch64PlatformState,
 }
 
-impl Cpu for Aarch64Cpu {
-    fn current_processor(&self) -> ProcessorId {
-        current_processor_runtime().logical_id()
-    }
+/// The processor identity `hal` publishes as a linkage contract.
+///
+/// `tpidr_el1` carries this processor's runtime from the boot path
+/// onwards, so this answers wherever the kernel runs, including paths
+/// that hold no state.
+#[unsafe(no_mangle)]
+extern "Rust" fn helios_current_processor() -> ProcessorId {
+    current_processor_runtime().logical_id()
+}
 
+impl Cpu for Aarch64Cpu {
     fn processor_count(&self) -> usize {
         self.state.processor_count()
     }
