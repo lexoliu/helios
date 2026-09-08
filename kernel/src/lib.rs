@@ -1597,6 +1597,127 @@ mod test_processor_identity {
     }
 }
 
+/// The allocator's own caching behaviour, driven through `GlobalAlloc`.
+///
+/// The magazine's unit tests drive [`memory::Magazines`] directly; these
+/// drive the allocator, which is where the refill and flush closures
+/// and the layout normalisation meet.
+#[cfg(test)]
+mod cached_allocation_tests {
+    use core::alloc::{GlobalAlloc, Layout};
+
+    use super::{KernelAllocator, memory};
+
+    /// An allocator owning one leaked region, with magazines for one
+    /// processor: the host test binary answers processor zero.
+    fn allocator(bytes: usize) -> KernelAllocator {
+        let allocator = KernelAllocator::empty();
+        let region = alloc::vec![0u8; bytes].leak();
+        let start = region.as_mut_ptr() as usize;
+        // Safety: the region is leaked, so nothing else owns it and it
+        // outlives the allocator this test builds.
+        unsafe { allocator.add_to_heap(start, start + bytes) };
+        allocator.magazines.initialize(1);
+        allocator
+    }
+
+    #[test]
+    fn a_cached_class_reaches_the_heap_once_per_refill() {
+        let allocator = allocator(1 << 20);
+        let layout = Layout::from_size_align(24, 8).unwrap();
+
+        // Safety: every pointer below is freed through the same
+        // allocator under the layout it was allocated with.
+        unsafe {
+            let first = allocator.alloc(layout);
+            assert!(!first.is_null());
+            let after_refill = allocator.stats();
+            assert!(
+                after_refill.magazine_cached_bytes > 0,
+                "a refill leaves its remainder in the magazine"
+            );
+
+            let held = after_refill.magazine_cached_bytes;
+            let second = allocator.alloc(layout);
+            assert!(!second.is_null());
+            let after_hit = allocator.stats();
+            assert_eq!(
+                after_hit.allocated_bytes, after_refill.allocated_bytes,
+                "a cache hit takes nothing further from the heap"
+            );
+            assert!(
+                after_hit.magazine_cached_bytes < held,
+                "a cache hit spends what the refill held"
+            );
+
+            allocator.dealloc(first, layout);
+            allocator.dealloc(second, layout);
+        }
+    }
+
+    #[test]
+    fn a_layout_no_class_serves_reaches_the_heap_every_time() {
+        let allocator = allocator(1 << 20);
+        let layout = Layout::from_size_align(4096, 8).unwrap();
+        // Safety: as above.
+        unsafe {
+            let first = allocator.alloc(layout);
+            assert!(!first.is_null());
+            let after_first = allocator.stats();
+            let second = allocator.alloc(layout);
+            assert!(!second.is_null());
+            assert!(
+                allocator.stats().allocated_bytes > after_first.allocated_bytes,
+                "an uncached class takes from the heap on every allocation"
+            );
+            assert_eq!(allocator.stats().magazine_cached_bytes, 0);
+            allocator.dealloc(first, layout);
+            allocator.dealloc(second, layout);
+        }
+    }
+
+    #[test]
+    fn a_block_served_before_the_caches_existed_is_freed_at_the_class_layout() {
+        // The layout-normalisation invariant, driven end to end: the
+        // heap must see one layout for a block whether or not a
+        // magazine was there when it was served.
+        let allocator = KernelAllocator::empty();
+        let region = alloc::vec![0u8; 1 << 20].leak();
+        let start = region.as_mut_ptr() as usize;
+        // Safety: the region is leaked and owned by this allocator.
+        unsafe { allocator.add_to_heap(start, start + (1 << 20)) };
+
+        let layout = Layout::from_size_align(24, 8).unwrap();
+        // Safety: freed below under the same layout.
+        let early = unsafe { allocator.alloc(layout) };
+        assert!(!early.is_null());
+        assert_eq!(allocator.stats().magazine_cached_bytes, 0, "no caches yet");
+
+        allocator.magazines.initialize(1);
+        // Safety: `early` was served by this allocator under `layout`.
+        unsafe { allocator.dealloc(early, layout) };
+        assert!(
+            allocator.stats().magazine_cached_bytes > 0,
+            "the block goes into the magazine that now exists"
+        );
+
+        // Draining it back through the heap is where a layout
+        // disagreement would corrupt Talc.
+        let mut held = alloc::vec::Vec::new();
+        for _ in 0..(memory::MAGAZINE_CAPACITY_FOR_TEST + 2) {
+            // Safety: freed below.
+            let block = unsafe { allocator.alloc(layout) };
+            assert!(!block.is_null());
+            held.push(block);
+        }
+        for block in held {
+            // Safety: each block came from `alloc` under `layout`.
+            unsafe { allocator.dealloc(block, layout) };
+        }
+        assert!(allocator.stats().total_bytes > 0, "the heap survived");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use alloc::boxed::Box;

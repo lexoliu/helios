@@ -36,6 +36,8 @@ pub use entropy::{
     RootEntropyHandle, install_entropy_device, seed_root_entropy,
 };
 pub(crate) use irq_safe::IrqSafeMutex;
+#[cfg(test)]
+pub(crate) use magazine::CAPACITY_FOR_TEST as MAGAZINE_CAPACITY_FOR_TEST;
 pub(crate) use magazine::{Magazines, heap_layout};
 pub use mapping_cost::user_mapping_kernel_heap_bytes;
 pub use owner::{

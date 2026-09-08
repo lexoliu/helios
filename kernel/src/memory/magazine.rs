@@ -83,6 +83,10 @@ const CLASS_COUNT: usize = 6;
 /// Blocks one class holds before a free flushes half of them back.
 const CAPACITY: usize = 64;
 
+/// [`CAPACITY`], for the allocator tests that drive a class past it.
+#[cfg(test)]
+pub(crate) const CAPACITY_FOR_TEST: usize = CAPACITY;
+
 /// Blocks one refill takes from the heap under a single lock.
 const REFILL: usize = 16;
 
