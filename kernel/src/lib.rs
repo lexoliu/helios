@@ -196,7 +196,7 @@ use alloc::task::Wake;
 use core::alloc::{GlobalAlloc, Layout};
 use core::future::Future;
 use core::ptr;
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use core::task::{Context, Poll, Waker};
 use core::time::Duration;
 
@@ -298,6 +298,7 @@ impl HeapStats {
 /// allocation charge that could disagree with the allocator's state.
 struct KernelHeapState {
     allocator: KernelHeap,
+    counters: HeapCounters,
 }
 
 /// The heap and its counters share the same IRQ-safe lock.
@@ -314,6 +315,7 @@ impl KernelHeapState {
     const fn new() -> Self {
         Self {
             allocator: Talc::new(Manual),
+            counters: HeapCounters::new(),
         }
     }
 
@@ -333,6 +335,28 @@ impl KernelHeapState {
     /// Heap not currently held by an allocation or allocator metadata.
     fn free_bytes(&self) -> usize {
         self.allocator.counters().available_bytes
+    }
+
+    /// Everything a stats caller wants, from one critical section.
+    fn stats(&self) -> HeapStats {
+        let counters = &self.counters;
+        HeapStats {
+            total_bytes: self.total_bytes(),
+            allocated_bytes: self.allocated_bytes(),
+            requested_live_bytes: counters.requested_live_bytes,
+            allocation_count: counters.allocation_count,
+            deallocation_count: counters.deallocation_count,
+            reallocation_count: counters.reallocation_count,
+            total_allocation_bytes: counters.total_allocation_bytes,
+            total_deallocation_bytes: counters.total_deallocation_bytes,
+            total_reallocation_bytes: counters.total_reallocation_bytes,
+            size_class_allocation_count: counters.size_class_allocation_count,
+            size_class_deallocation_count: counters.size_class_deallocation_count,
+            size_class_reallocation_count: counters.size_class_reallocation_count,
+            size_class_allocation_bytes: counters.size_class_allocation_bytes,
+            size_class_deallocation_bytes: counters.size_class_deallocation_bytes,
+            size_class_reallocation_bytes: counters.size_class_reallocation_bytes,
+        }
     }
 
     /// Gives the heap `start..end`.
@@ -395,7 +419,6 @@ struct KernelAllocator {
     /// it, and then every other processor behind it (#206). See
     /// [`memory::IrqSafeMutex`] for the contract.
     heap: IrqSafeMutex<KernelHeapState>,
-    stats: KernelAllocationStats,
     /// Every usable byte the boot memory map described, and the free
     /// kernel heap a user grow may not dip into. Both are fixed by
     /// [`memory::BootMemoryPlan`] at boot and never move afterwards:
@@ -413,7 +436,6 @@ impl KernelAllocator {
     const fn empty() -> Self {
         Self {
             heap: IrqSafeMutex::new(KernelHeapState::new()),
-            stats: KernelAllocationStats::new(),
             machine_usable_bytes: AtomicUsize::new(0),
             kernel_reserve_bytes: AtomicUsize::new(0),
             top_up_backoff: AtomicUsize::new(0),
@@ -438,10 +460,18 @@ impl KernelAllocator {
     ///
     /// `ptr` must be an allocation this heap served under `layout`,
     /// which is what every [`GlobalAlloc`] caller already promises.
-    unsafe fn free(&self, ptr: *mut u8, layout: Layout) {
+    ///
+    /// `record` charges the operation to the counters inside the
+    /// critical section the free already holds. A `dealloc` records a
+    /// deallocation; a `realloc`, whose free is the second half of one
+    /// operation, records the reallocation here and nothing at its
+    /// allocation.
+    unsafe fn free(&self, ptr: *mut u8, layout: Layout, record: impl FnOnce(&mut HeapCounters)) {
         let ptr = ptr::NonNull::new(ptr).expect("the global allocator was handed a null pointer");
-        self.heap
-            .with(|heap| unsafe { heap.deallocate(ptr, layout) });
+        self.heap.with(|heap| {
+            unsafe { heap.deallocate(ptr, layout) };
+            record(&mut heap.counters);
+        });
     }
 
     /// Records what the boot memory map came to and what the kernel
@@ -467,9 +497,16 @@ impl KernelAllocator {
     /// The two are read under the same lock the allocation took, so the
     /// growth decision below is made against the state the allocation
     /// actually produced rather than a racing re-read.
-    fn try_alloc(&self, layout: Layout) -> (*mut u8, usize) {
+    fn try_alloc(
+        &self,
+        layout: Layout,
+        record: impl Fn(&mut HeapCounters) + Copy,
+    ) -> (*mut u8, usize) {
         self.heap.with(|heap| {
             let ptr = heap.allocate(layout);
+            if !ptr.is_null() {
+                record(&mut heap.counters);
+            }
             (ptr, heap.free_bytes())
         })
     }
@@ -494,8 +531,8 @@ impl KernelAllocator {
     /// cannot serve one chunk cannot serve two, and a null return from
     /// here reaches `alloc_error_handler`, which panics — a kernel
     /// out-of-memory is fatal by contract, not something to spin on.
-    fn alloc_growing(&self, layout: Layout) -> *mut u8 {
-        let (ptr, free) = self.try_alloc(layout);
+    fn alloc_growing(&self, layout: Layout, record: impl Fn(&mut HeapCounters) + Copy) -> *mut u8 {
+        let (ptr, free) = self.try_alloc(layout, record);
         if !ptr.is_null() && free >= self.reserve_bytes() {
             return ptr;
         }
@@ -519,7 +556,7 @@ impl KernelAllocator {
         }
 
         if ptr.is_null() {
-            self.try_alloc(layout).0
+            self.try_alloc(layout, record).0
         } else {
             ptr
         }
@@ -541,178 +578,146 @@ impl KernelAllocator {
     }
 
     fn stats(&self) -> HeapStats {
-        let (total_bytes, allocated_bytes) = self
-            .heap
-            .with(|heap| (heap.total_bytes(), heap.allocated_bytes()));
-        HeapStats {
-            total_bytes,
-            allocated_bytes,
-            requested_live_bytes: self.stats.requested_live_bytes.load(Ordering::Relaxed),
-            allocation_count: self.stats.allocation_count.load(Ordering::Relaxed),
-            deallocation_count: self.stats.deallocation_count.load(Ordering::Relaxed),
-            reallocation_count: self.stats.reallocation_count.load(Ordering::Relaxed),
-            total_allocation_bytes: self.stats.total_allocation_bytes.load(Ordering::Relaxed),
-            total_deallocation_bytes: self.stats.total_deallocation_bytes.load(Ordering::Relaxed),
-            total_reallocation_bytes: self.stats.total_reallocation_bytes.load(Ordering::Relaxed),
-            size_class_allocation_count: self
-                .stats
-                .size_class_counts(&self.stats.size_class_allocation_count),
-            size_class_deallocation_count: self
-                .stats
-                .size_class_counts(&self.stats.size_class_deallocation_count),
-            size_class_reallocation_count: self
-                .stats
-                .size_class_counts(&self.stats.size_class_reallocation_count),
-            size_class_allocation_bytes: self
-                .stats
-                .size_class_counts(&self.stats.size_class_allocation_bytes),
-            size_class_deallocation_bytes: self
-                .stats
-                .size_class_counts(&self.stats.size_class_deallocation_bytes),
-            size_class_reallocation_bytes: self
-                .stats
-                .size_class_counts(&self.stats.size_class_reallocation_bytes),
-        }
+        self.heap.with(|heap| heap.stats())
     }
 
     fn set_size_class_metrics_enabled(&self, enabled: bool) {
-        self.stats.set_size_class_metrics_enabled(enabled);
+        self.heap
+            .with(|heap| heap.counters.size_class_metrics_enabled = enabled);
     }
 }
 
 unsafe impl GlobalAlloc for KernelAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let ptr = self.alloc_growing(layout);
-        if !ptr.is_null() {
-            self.stats.record_alloc(layout.size());
-        }
-        ptr
+        let size = layout.size();
+        self.alloc_growing(layout, |counters| counters.record_alloc(size))
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        let ptr = self.alloc_growing(layout);
+        let size = layout.size();
+        let ptr = self.alloc_growing(layout, |counters| counters.record_alloc(size));
         if !ptr.is_null() {
             unsafe {
-                ptr::write_bytes(ptr, 0, layout.size());
+                ptr::write_bytes(ptr, 0, size);
             }
-            self.stats.record_alloc(layout.size());
         }
         ptr
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { self.free(ptr, layout) };
-        self.stats.record_dealloc(layout.size());
+        let size = layout.size();
+        unsafe { self.free(ptr, layout, |counters| counters.record_dealloc(size)) };
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         let new_layout = unsafe { Layout::from_size_align_unchecked(new_size, layout.align()) };
-        let new_ptr = self.alloc_growing(new_layout);
+        // A reallocation is one operation: it is charged once, in the
+        // free below, which is the critical section that ends it.
+        let new_ptr = self.alloc_growing(new_layout, |_| {});
         if new_ptr.is_null() {
             return ptr::null_mut();
         }
 
+        let old_size = layout.size();
         unsafe {
-            ptr::copy_nonoverlapping(ptr, new_ptr, layout.size().min(new_size));
-            self.free(ptr, layout);
+            ptr::copy_nonoverlapping(ptr, new_ptr, old_size.min(new_size));
+            self.free(ptr, layout, |counters| {
+                counters.record_realloc(old_size, new_size);
+            });
         }
-        self.stats.record_realloc(layout.size(), new_size);
         new_ptr
     }
 }
 
-struct KernelAllocationStats {
-    requested_live_bytes: AtomicUsize,
-    allocation_count: AtomicU64,
-    deallocation_count: AtomicU64,
-    reallocation_count: AtomicU64,
-    total_allocation_bytes: AtomicU64,
-    total_deallocation_bytes: AtomicU64,
-    total_reallocation_bytes: AtomicU64,
-    size_class_metrics_enabled: AtomicBool,
-    size_class_allocation_count: [AtomicU64; HEAP_SIZE_CLASS_COUNT],
-    size_class_deallocation_count: [AtomicU64; HEAP_SIZE_CLASS_COUNT],
-    size_class_reallocation_count: [AtomicU64; HEAP_SIZE_CLASS_COUNT],
-    size_class_allocation_bytes: [AtomicU64; HEAP_SIZE_CLASS_COUNT],
-    size_class_deallocation_bytes: [AtomicU64; HEAP_SIZE_CLASS_COUNT],
-    size_class_reallocation_bytes: [AtomicU64; HEAP_SIZE_CLASS_COUNT],
+/// The kernel heap's own accounting, kept in the state the heap lock
+/// already protects.
+///
+/// These words are written on every allocation and every free from
+/// every processor. As atomics beside the lock they were three
+/// read-modify-writes on lines no processor owns for long, bouncing
+/// between cores on top of the lock the allocation had just taken.
+/// Inside the locked state they are plain fields on lines the lock
+/// holder owns exclusively, and a stats read gets them from the same
+/// critical section that reads the allocator's own counters, so a
+/// total can no longer belong to a different allocation than the free
+/// space beside it.
+struct HeapCounters {
+    requested_live_bytes: usize,
+    allocation_count: u64,
+    deallocation_count: u64,
+    reallocation_count: u64,
+    total_allocation_bytes: u64,
+    total_deallocation_bytes: u64,
+    total_reallocation_bytes: u64,
+    /// Off by default: the per-class arrays are diagnosis, and the
+    /// branch keeps them off the hot path when nothing is asking.
+    size_class_metrics_enabled: bool,
+    size_class_allocation_count: [u64; HEAP_SIZE_CLASS_COUNT],
+    size_class_deallocation_count: [u64; HEAP_SIZE_CLASS_COUNT],
+    size_class_reallocation_count: [u64; HEAP_SIZE_CLASS_COUNT],
+    size_class_allocation_bytes: [u64; HEAP_SIZE_CLASS_COUNT],
+    size_class_deallocation_bytes: [u64; HEAP_SIZE_CLASS_COUNT],
+    size_class_reallocation_bytes: [u64; HEAP_SIZE_CLASS_COUNT],
 }
 
-impl KernelAllocationStats {
+impl HeapCounters {
     const fn new() -> Self {
         Self {
-            requested_live_bytes: AtomicUsize::new(0),
-            allocation_count: AtomicU64::new(0),
-            deallocation_count: AtomicU64::new(0),
-            reallocation_count: AtomicU64::new(0),
-            total_allocation_bytes: AtomicU64::new(0),
-            total_deallocation_bytes: AtomicU64::new(0),
-            total_reallocation_bytes: AtomicU64::new(0),
-            size_class_metrics_enabled: AtomicBool::new(false),
-            size_class_allocation_count: [const { AtomicU64::new(0) }; HEAP_SIZE_CLASS_COUNT],
-            size_class_deallocation_count: [const { AtomicU64::new(0) }; HEAP_SIZE_CLASS_COUNT],
-            size_class_reallocation_count: [const { AtomicU64::new(0) }; HEAP_SIZE_CLASS_COUNT],
-            size_class_allocation_bytes: [const { AtomicU64::new(0) }; HEAP_SIZE_CLASS_COUNT],
-            size_class_deallocation_bytes: [const { AtomicU64::new(0) }; HEAP_SIZE_CLASS_COUNT],
-            size_class_reallocation_bytes: [const { AtomicU64::new(0) }; HEAP_SIZE_CLASS_COUNT],
+            requested_live_bytes: 0,
+            allocation_count: 0,
+            deallocation_count: 0,
+            reallocation_count: 0,
+            total_allocation_bytes: 0,
+            total_deallocation_bytes: 0,
+            total_reallocation_bytes: 0,
+            size_class_metrics_enabled: false,
+            size_class_allocation_count: [0; HEAP_SIZE_CLASS_COUNT],
+            size_class_deallocation_count: [0; HEAP_SIZE_CLASS_COUNT],
+            size_class_reallocation_count: [0; HEAP_SIZE_CLASS_COUNT],
+            size_class_allocation_bytes: [0; HEAP_SIZE_CLASS_COUNT],
+            size_class_deallocation_bytes: [0; HEAP_SIZE_CLASS_COUNT],
+            size_class_reallocation_bytes: [0; HEAP_SIZE_CLASS_COUNT],
         }
     }
 
-    fn size_class_counts(
-        &self,
-        values: &[AtomicU64; HEAP_SIZE_CLASS_COUNT],
-    ) -> [u64; HEAP_SIZE_CLASS_COUNT] {
-        core::array::from_fn(|index| values[index].load(Ordering::Relaxed))
-    }
-
-    fn record_alloc(&self, size: usize) {
+    fn record_alloc(&mut self, size: usize) {
         let size_u64 = usize_to_u64(size, "kernel allocation size");
-        self.allocation_count.fetch_add(1, Ordering::Relaxed);
-        self.requested_live_bytes.fetch_add(size, Ordering::Relaxed);
-        self.total_allocation_bytes
-            .fetch_add(size_u64, Ordering::Relaxed);
-        if self.size_class_metrics_enabled.load(Ordering::Relaxed) {
+        self.allocation_count += 1;
+        self.requested_live_bytes += size;
+        self.total_allocation_bytes += size_u64;
+        if self.size_class_metrics_enabled {
             let class = heap_size_class(size);
-            self.size_class_allocation_count[class].fetch_add(1, Ordering::Relaxed);
-            self.size_class_allocation_bytes[class].fetch_add(size_u64, Ordering::Relaxed);
+            self.size_class_allocation_count[class] += 1;
+            self.size_class_allocation_bytes[class] += size_u64;
         }
     }
 
-    fn record_dealloc(&self, size: usize) {
+    fn record_dealloc(&mut self, size: usize) {
         let size_u64 = usize_to_u64(size, "kernel deallocation size");
-        self.deallocation_count.fetch_add(1, Ordering::Relaxed);
-        self.requested_live_bytes.fetch_sub(size, Ordering::Relaxed);
-        self.total_deallocation_bytes
-            .fetch_add(size_u64, Ordering::Relaxed);
-        if self.size_class_metrics_enabled.load(Ordering::Relaxed) {
+        self.deallocation_count += 1;
+        self.requested_live_bytes -= size;
+        self.total_deallocation_bytes += size_u64;
+        if self.size_class_metrics_enabled {
             let class = heap_size_class(size);
-            self.size_class_deallocation_count[class].fetch_add(1, Ordering::Relaxed);
-            self.size_class_deallocation_bytes[class].fetch_add(size_u64, Ordering::Relaxed);
+            self.size_class_deallocation_count[class] += 1;
+            self.size_class_deallocation_bytes[class] += size_u64;
         }
     }
 
-    fn record_realloc(&self, old_size: usize, new_size: usize) {
+    fn record_realloc(&mut self, old_size: usize, new_size: usize) {
         let new_size_u64 = usize_to_u64(new_size, "kernel reallocation size");
-        self.reallocation_count.fetch_add(1, Ordering::Relaxed);
+        self.reallocation_count += 1;
         if new_size >= old_size {
-            self.requested_live_bytes
-                .fetch_add(new_size - old_size, Ordering::Relaxed);
+            self.requested_live_bytes += new_size - old_size;
         } else {
-            self.requested_live_bytes
-                .fetch_sub(old_size - new_size, Ordering::Relaxed);
+            self.requested_live_bytes -= old_size - new_size;
         }
-        self.total_reallocation_bytes
-            .fetch_add(new_size_u64, Ordering::Relaxed);
-        if self.size_class_metrics_enabled.load(Ordering::Relaxed) {
+        self.total_reallocation_bytes += new_size_u64;
+        if self.size_class_metrics_enabled {
             let class = heap_size_class(new_size);
-            self.size_class_reallocation_count[class].fetch_add(1, Ordering::Relaxed);
-            self.size_class_reallocation_bytes[class].fetch_add(new_size_u64, Ordering::Relaxed);
+            self.size_class_reallocation_count[class] += 1;
+            self.size_class_reallocation_bytes[class] += new_size_u64;
         }
-    }
-
-    fn set_size_class_metrics_enabled(&self, enabled: bool) {
-        self.size_class_metrics_enabled
-            .store(enabled, Ordering::Release);
     }
 }
 
