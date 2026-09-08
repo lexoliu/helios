@@ -792,7 +792,16 @@ pub struct Aarch64Cpu {
 /// that hold no state.
 #[unsafe(no_mangle)]
 extern "Rust" fn helios_current_processor() -> Option<ProcessorId> {
-    Some(current_processor_runtime().logical_id())
+    // `tpidr_el1` is null until this processor installs its runtime,
+    // and the kernel heap allocates in that window; see the contract in
+    // `helios_hal::cpu`.
+    let runtime = read_processor_runtime() as *const ProcessorRuntime;
+    if runtime.is_null() {
+        return None;
+    }
+    // Safety: only `install` publishes a runtime address, and it does
+    // so from a `&'static ProcessorRuntime`.
+    Some(unsafe { &*runtime }.logical_id())
 }
 
 impl Cpu for Aarch64Cpu {

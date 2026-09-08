@@ -380,17 +380,23 @@ impl RiscvCpu {
 /// kernel onwards.
 #[unsafe(no_mangle)]
 extern "Rust" fn helios_current_processor() -> Option<ProcessorId> {
-    Some(match installed_hart_runtime() {
-        Some(runtime) => runtime.hart_id,
+    // `tp` is zero until `run_hart` seeds this hart's identity, and the
+    // kernel heap allocates in that window; see the contract in
+    // `helios_hal::cpu`.
+    let identity = ProcessorIdentity::from_raw(NonZeroUsize::new(current_hart_runtime_ptr())?);
+    match identity.runtime_address() {
+        // Safety: only `HartRuntime::install` publishes a runtime
+        // address, and it does so from a `&'static HartRuntime`.
+        Some(address) => Some(unsafe { &*(address.get() as *const HartRuntime) }.hart_id),
         None => {
-            let hardware_id = read_hart_identity()
+            let hardware_id = identity
                 .hardware_id()
                 .expect("an identity without a runtime address carries a hardware id");
-            ProcessorId::new(
+            Some(ProcessorId::new(
                 u16::try_from(hardware_id).expect("riscv hart id does not fit a processor id"),
-            )
+            ))
         }
-    })
+    }
 }
 
 impl Cpu for RiscvCpu {
