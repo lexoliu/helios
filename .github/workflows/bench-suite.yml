@@ -447,7 +447,13 @@ jobs:
         if: always() && github.event_name == 'pull_request' && hashFiles('pgo-comment.md') != ''
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh pr comment "${{ github.event.pull_request.number }}" --body-file "$GITHUB_WORKSPACE/pgo-comment.md"
+        # `--repo` because `gh` otherwise reads the repository off the
+        # working directory's git remote, and this job checks out into
+        # `helios/` while the step runs at the workspace root (#283).
+        run: >-
+          gh pr comment "${{ github.event.pull_request.number }}"
+          --repo "$GITHUB_REPOSITORY"
+          --body-file "$GITHUB_WORKSPACE/pgo-comment.md"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -524,7 +530,9 @@ jobs:
             printf "### Benchmark gate, lane %s\n\nNeither a paired nor a dev baseline was available for this lane; the candidate tables are in the run artifacts.\n" \
               "${{ matrix.lane }}" > "$GITHUB_WORKSPACE/gate.md"
           fi
-          gh pr comment "${{ github.event.pull_request.number }}" --body-file "$GITHUB_WORKSPACE/gate.md"
+          gh pr comment "${{ github.event.pull_request.number }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --body-file "$GITHUB_WORKSPACE/gate.md"
 
   release-assets:
     name: release-assets

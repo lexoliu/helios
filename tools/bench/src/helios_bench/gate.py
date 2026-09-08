@@ -11,6 +11,13 @@ Two comparisons, and the difference between them is the whole point:
   not pin the CPU model, so this one is only as good as the machines
   happened to be alike: it enforces when both reports are publishable
   **and** name the same host CPU, and otherwise says what it saw.
+
+Either comparison judges every measurement a cell carries, not only its
+wall clock: the host-side `elapsed_ms` of the whole round trip, and each
+`bench.<name>` metric the workload printed from inside the guest. A
+workload that times its own teardown separately (`procbench`, for the
+kernel allocator) did so because the wall clock averages it away; the
+gate would undo that by comparing the wall clock alone.
 """
 
 from __future__ import annotations
@@ -19,13 +26,77 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import StrEnum
 
-from helios_bench.report import Cell, Report, Side, WorkloadResult
+from helios_bench.report import Cell, Report, SeriesStats, Side, WorkloadResult
 from helios_bench.stats import intervals_overlap, relative_shift
 
 
 class GateKind(StrEnum):
     PAIRED = "paired"
     CROSS_RUN = "cross_run"
+
+
+class Direction(StrEnum):
+    """Which way a measurement has to move to be an improvement."""
+
+    LOWER_IS_BETTER = "lower_is_better"
+    HIGHER_IS_BETTER = "higher_is_better"
+
+
+#: The wall clock of the whole round trip, as a row names it.
+ELAPSED = "elapsed_ms"
+
+
+@dataclass(frozen=True)
+class Unit:
+    """What a measurement's unit says about how to read a shift.
+
+    `drifts_with_the_host` is what the noise floor is for. The floor is
+    the control workload's drift between the run before the workloads and
+    the run after, so it bounds how much the *machine* moved: it applies
+    to a duration and to a rate of durations, and to nothing else. A
+    footprint in bytes does not get slower when the host is busy, so
+    holding it to a timing floor would let a repeatable regression
+    through — the bootstrap intervals are the whole test for it.
+    """
+
+    direction: Direction
+    drifts_with_the_host: bool
+
+
+DURATION = Unit(Direction.LOWER_IS_BETTER, drifts_with_the_host=True)
+RATE = Unit(Direction.HIGHER_IS_BETTER, drifts_with_the_host=True)
+FOOTPRINT = Unit(Direction.LOWER_IS_BETTER, drifts_with_the_host=False)
+
+#: Unit suffix -> unit, longest suffix first so `_per_s` is read as a rate
+#: rather than as whatever shorter suffix it happens to end with.
+#:
+#: Every metric in the tree carries its unit in its name, because both
+#: harnesses parse `bench.<name>=<number>` off a workload's stdout and the
+#: name is all either of them gets. Reading the unit off the name is
+#: therefore reading the only declaration there is, and a metric that
+#: declares none stops the gate rather than being guessed at.
+METRIC_UNITS: tuple[tuple[str, Unit], ...] = (
+    ("_per_second", RATE),
+    ("_per_call", DURATION),
+    ("_per_op", DURATION),
+    ("_per_s", RATE),
+    ("_bytes", FOOTPRINT),
+    ("_us", DURATION),
+    ("_ms", DURATION),
+    ("_ns", DURATION),
+)
+
+
+def metric_unit(name: str) -> Unit:
+    for suffix, unit in METRIC_UNITS:
+        if name.endswith(suffix):
+            return unit
+    raise SystemExit(
+        f"metric `{name}` ends in no unit the gate knows, so it cannot tell an improvement "
+        "from a regression; name it after its unit "
+        f"({', '.join(suffix for suffix, _ in METRIC_UNITS)}) or add the unit to "
+        "helios_bench.gate.METRIC_UNITS"
+    )
 
 
 GATE_TITLES = {
@@ -37,7 +108,10 @@ GATE_TITLES = {
 @dataclass(frozen=True)
 class GateRow:
     workload: str
+    #: `elapsed_ms`, or the name of the `bench.<name>` metric this row is.
+    measurement: str
     headline: bool
+    direction: Direction
     baseline_median: float
     candidate_median: float
     shift: float
@@ -45,6 +119,38 @@ class GateRow:
     beyond_noise: bool
     regression: bool
     improvement: bool
+    #: Set when either side's warm series is too dispersed to compare. The
+    #: row is printed with its reason and takes part in no verdict, the way
+    #: a variance-rejected cell does.
+    rejected: bool = False
+    rejection_reason: str | None = None
+
+
+class Column(StrEnum):
+    """Which side of a comparison a value came from.
+
+    Not `Side`: the two columns of a cross-run comparison are both
+    `Side.HELIOS`, and what distinguishes them is which report they are
+    in.
+    """
+
+    BASELINE = "baseline"
+    CANDIDATE = "candidate"
+
+
+@dataclass(frozen=True)
+class UnpairedMetric:
+    """A metric only one column of a comparison measured.
+
+    A candidate that adds a metric, or a baseline old enough to predate
+    one, has nothing to compare it against. That is reported rather than
+    dropped, and it does not block: the first run of a new metric would
+    otherwise fail the change that introduced it.
+    """
+
+    workload: str
+    metric: str
+    measured_by: Column
 
 
 @dataclass(frozen=True)
@@ -60,12 +166,17 @@ class GateResult:
     noise_floor: float
     rows: list[GateRow]
     incomplete_headlines: list[str]
+    unpaired_metrics: list[UnpairedMetric]
     blocking: bool
     enforced: bool
 
     @property
     def regressions(self) -> list[GateRow]:
         return [row for row in self.rows if row.regression]
+
+    @property
+    def rejected_rows(self) -> list[GateRow]:
+        return [row for row in self.rows if row.rejected]
 
     @property
     def improvements(self) -> list[GateRow]:
@@ -92,29 +203,82 @@ class GateReport:
         return any(result.blocking for result in self.results)
 
 
-def gate_rows(pairs: Iterable[tuple[WorkloadResult, Cell, Cell]], floor: float) -> list[GateRow]:
-    """A regression is significant when the two warm bootstrap intervals of
-    the compared cells do not overlap and the median moved by more than the
-    noise floor the two runs measured."""
-    rows = []
+def compare_series(
+    workload: WorkloadResult,
+    measurement: str,
+    before: SeriesStats,
+    after: SeriesStats,
+    floor: float,
+    cv_bound: float,
+) -> GateRow:
+    """One row: two warm series of one measurement, judged the same way.
+
+    Significant means the two bootstrap intervals of the medians are
+    disjoint **and** the median moved by more than the floor the run's
+    control measured. Which sign of movement is the bad one, and whether
+    the floor applies at all, come from the measurement's unit.
+    """
+    unit = DURATION if measurement == ELAPSED else metric_unit(measurement)
+    shift = relative_shift(before.median, after.median)
+    disjoint = not intervals_overlap(before, after)
+    beyond = abs(shift) > floor if unit.drifts_with_the_host else shift != 0.0
+    worse = shift > 0 if unit.direction is Direction.LOWER_IS_BETTER else shift < 0
+    dispersed = max(before.cv, after.cv)
+    rejected = dispersed > cv_bound
+    significant = disjoint and beyond and not rejected
+    return GateRow(
+        workload=workload.name,
+        measurement=measurement,
+        headline=workload.headline,
+        direction=unit.direction,
+        baseline_median=before.median,
+        candidate_median=after.median,
+        shift=shift,
+        ci_disjoint=disjoint,
+        beyond_noise=beyond,
+        regression=significant and worse,
+        improvement=significant and not worse,
+        rejected=rejected,
+        rejection_reason=(
+            f"warm coefficient of variation {dispersed:.3f} exceeds the run's bound {cv_bound:.3f}"
+            if rejected
+            else None
+        ),
+    )
+
+
+def gate_rows(
+    pairs: Iterable[tuple[WorkloadResult, Cell, Cell]], floor: float, cv_bound: float
+) -> tuple[list[GateRow], list[UnpairedMetric]]:
+    """Every measurement of every comparable cell pair.
+
+    The cell's own `elapsed_ms` first, then each `bench.<name>` metric
+    both sides measured, in the order the report stores them. A metric
+    only one side has cannot be compared and is reported separately.
+    """
+    rows: list[GateRow] = []
+    unpaired: list[UnpairedMetric] = []
     for workload, base_cell, cand_cell in pairs:
-        shift = relative_shift(base_cell.warm.median, cand_cell.warm.median)
-        disjoint = not intervals_overlap(base_cell.warm, cand_cell.warm)
-        beyond = abs(shift) > floor
-        rows.append(
-            GateRow(
-                workload=workload.name,
-                headline=workload.headline,
-                baseline_median=base_cell.warm.median,
-                candidate_median=cand_cell.warm.median,
-                shift=shift,
-                ci_disjoint=disjoint,
-                beyond_noise=beyond,
-                regression=disjoint and beyond and shift > 0,
-                improvement=disjoint and beyond and shift < 0,
-            )
-        )
-    return rows
+        rows.append(compare_series(workload, ELAPSED, base_cell.warm, cand_cell.warm, floor, cv_bound))
+        for metric in sorted(set(base_cell.metrics) | set(cand_cell.metrics)):
+            before = base_cell.metrics.get(metric)
+            after = cand_cell.metrics.get(metric)
+            if before is None or after is None:
+                unpaired.append(
+                    UnpairedMetric(
+                        workload=workload.name,
+                        metric=metric,
+                        measured_by=Column.CANDIDATE if before is None else Column.BASELINE,
+                    )
+                )
+                continue
+            if before.median <= 0:
+                # `relative_shift` has no reference to divide by, and a
+                # measurement that reads zero on the baseline is not a
+                # measurement of anything the candidate can be worse at.
+                continue
+            rows.append(compare_series(workload, metric, before, after, floor, cv_bound))
+    return rows, unpaired
 
 
 def comparable(base_cell: Cell | None, cand_cell: Cell | None) -> bool:
@@ -149,7 +313,7 @@ def evaluate(baseline: Report, candidate: Report) -> GateResult:
         if not comparable(base_cell, cand_cell):
             continue
         pairs.append((workload, base_cell, cand_cell))
-    rows = gate_rows(pairs, floor)
+    rows, unpaired = gate_rows(pairs, floor, candidate.thresholds.cv_bound)
     # Two runs of one lane are two machines as often as they are one
     # machine twice, and the run record is where that is visible.
     enforced = (
@@ -169,6 +333,7 @@ def evaluate(baseline: Report, candidate: Report) -> GateResult:
         noise_floor=floor,
         rows=rows,
         incomplete_headlines=[],
+        unpaired_metrics=unpaired,
         blocking=enforced and any(row.regression and row.headline for row in rows),
         enforced=enforced,
     )
@@ -225,7 +390,7 @@ def evaluate_paired(candidate: Report) -> GateResult | None:
                 incomplete_headlines.append(workload.name)
             continue
         pairs.append((workload, base_cell, cand_cell))
-    rows = gate_rows(pairs, floor)
+    rows, unpaired = gate_rows(pairs, floor, candidate.thresholds.cv_bound)
     return GateResult(
         kind=GateKind.PAIRED,
         lane=candidate.run.lane,
@@ -248,6 +413,7 @@ def evaluate_paired(candidate: Report) -> GateResult | None:
         noise_floor=floor,
         rows=rows,
         incomplete_headlines=incomplete_headlines,
+        unpaired_metrics=unpaired,
         blocking=bool(incomplete_headlines) or any(row.regression and row.headline for row in rows),
         enforced=True,
     )

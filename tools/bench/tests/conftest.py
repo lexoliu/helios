@@ -56,7 +56,18 @@ def iterations(
     values = generator.normal(center, spread, size=count)
     values[0] += cold_extra
     return [
-        Iteration(index=index + 1, elapsed_ms=float(max(value, 0.01)), cold=index == 0, metrics={"x": 1.0})
+        Iteration(
+            index=index + 1,
+            elapsed_ms=float(max(value, 0.01)),
+            cold=index == 0,
+            # Two metrics with opposite units, so the gate's direction
+            # rule is exercised by every fixture: a slower iteration has a
+            # longer round trip and fewer switches per second.
+            metrics={
+                "rtt_p50_us": float(max(value, 0.01)) * 10.0,
+                "switches_per_s": 1_000_000.0 / float(max(value, 0.01)),
+            },
+        )
         for index, value in enumerate(values)
     ]
 

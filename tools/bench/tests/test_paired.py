@@ -457,34 +457,48 @@ def test_a_paired_regression_blocks_on_a_shared_runner(paired_regression_report:
     """
     assert not paired_regression_report.run.publishable
     result = evaluate_paired(paired_regression_report)
-    rows = {row.workload: row for row in result.rows}
+    rows = {(row.workload, row.measurement): row for row in result.rows}
 
     assert result.kind is GateKind.PAIRED
     assert result.enforced and result.blocking
-    assert rows["hostcall-loop"].regression
-    assert rows["hostcall-loop"].shift == pytest.approx(0.5, abs=0.1)
-    assert not rows["quickjs-loop"].regression
+    assert rows["hostcall-loop", "elapsed_ms"].regression
+    assert rows["hostcall-loop", "elapsed_ms"].shift == pytest.approx(0.5, abs=0.1)
+    assert not rows["quickjs-loop", "elapsed_ms"].regression
+    # The workload's own measurements moved with it, and the rate metric
+    # moved the other way for the same reason.
+    assert rows["hostcall-loop", "rtt_p50_us"].regression
+    assert rows["hostcall-loop", "switches_per_s"].regression
+    assert rows["hostcall-loop", "switches_per_s"].shift < 0
 
 
 def test_a_paired_improvement_is_named_and_blocks_nothing(paired_improvement_report: Report) -> None:
     result = evaluate_paired(paired_improvement_report)
-    rows = {row.workload: row for row in result.rows}
+    rows = {(row.workload, row.measurement): row for row in result.rows}
 
     assert not result.blocking
-    assert rows["hostcall-loop"].improvement
-    assert rows["hostcall-loop"].shift == pytest.approx(-0.33, abs=0.05)
-    assert [row.workload for row in result.improvements] == ["hostcall-loop"]
+    assert rows["hostcall-loop", "elapsed_ms"].improvement
+    assert rows["hostcall-loop", "elapsed_ms"].shift == pytest.approx(-0.33, abs=0.05)
+    assert [row.measurement for row in result.improvements] == [
+        "elapsed_ms",
+        "rtt_p50_us",
+        "switches_per_s",
+    ]
+    # More switches per second is the improvement, and the row says so
+    # rather than reading the positive shift as a regression.
+    assert rows["hostcall-loop", "switches_per_s"].shift > 0
 
 
 def test_a_paired_shift_inside_the_floor_is_neither(paired_flat_report: Report) -> None:
     """A few tenths of a percent is the machine, not the change."""
     result = evaluate_paired(paired_flat_report)
-    rows = {row.workload: row for row in result.rows}
+    rows = {(row.workload, row.measurement): row for row in result.rows}
 
     assert result.noise_floor > 0
-    assert abs(rows["hostcall-loop"].shift) < result.noise_floor
-    assert not rows["hostcall-loop"].beyond_noise
-    assert not rows["hostcall-loop"].regression and not rows["hostcall-loop"].improvement
+    for measurement in ("elapsed_ms", "rtt_p50_us", "switches_per_s"):
+        row = rows["hostcall-loop", measurement]
+        assert abs(row.shift) < result.noise_floor
+        assert not row.beyond_noise
+        assert not row.regression and not row.improvement
     assert not result.blocking
 
 
