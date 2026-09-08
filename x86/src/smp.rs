@@ -409,12 +409,16 @@ pub(crate) fn current_runtime() -> &'static ProcessorRuntime {
 }
 
 pub(crate) fn current_processor() -> ProcessorId {
+    try_current_processor().unwrap_or_else(|| {
+        panic!("x86 processor runtime was not installed before its logical id was asked for")
+    })
+}
+
+/// This processor's logical index, or `None` while it still carries the
+/// bootstrap anchor `install_bootstrap_anchor` seeded.
+pub(crate) fn try_current_processor() -> Option<ProcessorId> {
     let logical_id = anchor_logical_id();
-    assert!(
-        logical_id != BOOTSTRAP_ANCHOR_LOGICAL_ID,
-        "x86 processor runtime was not installed before its logical id was asked for"
-    );
-    ProcessorId::new(logical_id)
+    (logical_id != BOOTSTRAP_ANCHOR_LOGICAL_ID).then(|| ProcessorId::new(logical_id))
 }
 
 /// The identity this processor answers critical-section acquires with.

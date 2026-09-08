@@ -368,7 +368,10 @@ impl Magazines {
             return None;
         }
         let processors = self.processors.get()?;
-        let index = usize::from(helios_hal::cpu::current_processor().id());
+        // A processor that has not taken its logical index yet owns no
+        // magazine: the boot path allocates in that window, and the
+        // answer is the shared heap, not an invented index.
+        let index = usize::from(helios_hal::cpu::try_current_processor()?.id());
         processors.get(index).map(|padded| &**padded)
     }
 

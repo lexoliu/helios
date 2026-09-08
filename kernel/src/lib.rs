@@ -1592,8 +1592,8 @@ mod test_processor_identity {
     }
 
     #[unsafe(no_mangle)]
-    extern "Rust" fn helios_current_processor() -> ProcessorId {
-        CURRENT.with(|slot| slot.get().unwrap_or(ProcessorId::new(0)))
+    extern "Rust" fn helios_current_processor() -> Option<ProcessorId> {
+        Some(CURRENT.with(|slot| slot.get().unwrap_or(ProcessorId::new(0))))
     }
 }
 

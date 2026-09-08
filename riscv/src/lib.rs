@@ -379,8 +379,8 @@ impl RiscvCpu {
 /// replaces it, so this answers from the first instruction of the
 /// kernel onwards.
 #[unsafe(no_mangle)]
-extern "Rust" fn helios_current_processor() -> ProcessorId {
-    match installed_hart_runtime() {
+extern "Rust" fn helios_current_processor() -> Option<ProcessorId> {
+    Some(match installed_hart_runtime() {
         Some(runtime) => runtime.hart_id,
         None => {
             let hardware_id = read_hart_identity()
@@ -390,7 +390,7 @@ extern "Rust" fn helios_current_processor() -> ProcessorId {
                 u16::try_from(hardware_id).expect("riscv hart id does not fit a processor id"),
             )
         }
-    }
+    })
 }
 
 impl Cpu for RiscvCpu {

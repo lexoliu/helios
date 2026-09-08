@@ -791,8 +791,8 @@ pub struct Aarch64Cpu {
 /// onwards, so this answers wherever the kernel runs, including paths
 /// that hold no state.
 #[unsafe(no_mangle)]
-extern "Rust" fn helios_current_processor() -> ProcessorId {
-    current_processor_runtime().logical_id()
+extern "Rust" fn helios_current_processor() -> Option<ProcessorId> {
+    Some(current_processor_runtime().logical_id())
 }
 
 impl Cpu for Aarch64Cpu {

@@ -693,8 +693,8 @@ impl X86Cpu {
 /// tables exist, so this answers on every path including one that holds
 /// no state at all.
 #[unsafe(no_mangle)]
-extern "Rust" fn helios_current_processor() -> ProcessorId {
-    smp::current_processor()
+extern "Rust" fn helios_current_processor() -> Option<ProcessorId> {
+    smp::try_current_processor()
 }
 
 impl Cpu for X86Cpu {

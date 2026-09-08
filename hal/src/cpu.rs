@@ -114,17 +114,38 @@ unsafe extern "Rust" {
     ///
     /// A backend defines it with `#[unsafe(no_mangle)]` under this exact
     /// name, the way an image supplies its global allocator and its panic
-    /// handler. Calling it before the backend has seeded that register is
-    /// the backend's own bug to fail on, not a case to answer with a
-    /// default.
-    fn helios_current_processor() -> ProcessorId;
+    /// handler.
+    ///
+    /// The answer is `None` only in the window before a processor has
+    /// taken its logical index: on x86 a processor carries a bootstrap
+    /// anchor from its first instruction and replaces it when its
+    /// runtime activates, and code that runs in between — the kernel
+    /// heap does — has no index to be told. It is not an error, and a
+    /// backend never answers a made-up index instead.
+    fn helios_current_processor() -> Option<ProcessorId>;
+}
+
+/// The processor executing this code path, once it has an index.
+///
+/// [`current_processor`] is the form for everything that runs after
+/// boot, which is nearly everything; this one is for the code that also
+/// runs during it, and whose answer to "not yet" is to do without an
+/// index rather than to fail.
+pub fn try_current_processor() -> Option<ProcessorId> {
+    // Safety: the image is required to define `helios_current_processor`,
+    // and a Rust-ABI call to it carries its answer unchanged.
+    unsafe { helios_current_processor() }
 }
 
 /// The processor executing this code path.
+///
+/// # Panics
+///
+/// Panics when the processor has not taken its logical index yet, which
+/// only the boot path can observe; see [`try_current_processor`].
 pub fn current_processor() -> ProcessorId {
-    // Safety: the image is required to define `helios_current_processor`,
-    // and a Rust-ABI call to it carries `ProcessorId` unchanged.
-    unsafe { helios_current_processor() }
+    try_current_processor()
+        .expect("this processor was asked for its index before its runtime activated")
 }
 
 pub trait Cpu: Send + Sync + 'static {

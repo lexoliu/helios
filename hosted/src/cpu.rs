@@ -43,11 +43,8 @@ pub fn set_current_processor(processor: ProcessorId) {
 
 /// The processor identity `hal` publishes as a linkage contract.
 #[unsafe(no_mangle)]
-extern "Rust" fn helios_current_processor() -> ProcessorId {
-    CURRENT_PROCESSOR.with(|slot| {
-        slot.get()
-            .expect("this thread runs kernel code without a hosted processor identity")
-    })
+extern "Rust" fn helios_current_processor() -> Option<ProcessorId> {
+    CURRENT_PROCESSOR.with(core::cell::Cell::get)
 }
 
 impl Cpu for HostedCpu {
