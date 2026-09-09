@@ -6,13 +6,13 @@ use std::process::Command;
 
 use askama::Template;
 use clap::{Parser, Subcommand, ValueEnum};
-use ed25519_dalek::{SigningKey, VerifyingKey};
+use ed25519_dalek::{SecretKey, SigningKey, VerifyingKey};
 use fatfs::{FatType, FileSystem, FormatVolumeOptions, FsOptions};
 use helios_artifact::{TrailerError, cwasm_target_supports_wasm_simd, sign_payload_with_key};
 use helios_compiler_support::{AotCompileHint, CompileError, precompile_artifact};
 use helios_workspace_root::{WorkspaceRoot, WorkspaceRootError};
 use mbrman::{BOOT_ACTIVE, CHS, MBR, MBRPartitionEntry};
-use rand::rngs::OsRng;
+use rand::{TryRng, rngs::SysRng};
 use serde::{Deserialize, Serialize};
 use toml::Value;
 use walkdir::WalkDir;
@@ -116,6 +116,11 @@ enum KeyError {
         path: String,
         #[source]
         source: io::Error,
+    },
+    #[error("the operating system refused to supply entropy for a new root key: {source}")]
+    Entropy {
+        #[source]
+        source: rand::rngs::SysError,
     },
 }
 
@@ -1759,7 +1764,11 @@ fn ensure_root_keypair(
     let signing_key = if root_secret_path.is_file() {
         read_signing_key(root_secret_path)?
     } else {
-        let signing_key = SigningKey::generate(&mut OsRng);
+        let mut secret = SecretKey::default();
+        SysRng
+            .try_fill_bytes(&mut secret)
+            .map_err(|source| KeyError::Entropy { source })?;
+        let signing_key = SigningKey::from_bytes(&secret);
         fs::write(root_secret_path, signing_key.to_bytes()).map_err(|source| KeyError::Write {
             path: root_secret_path.display().to_string(),
             source,

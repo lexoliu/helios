@@ -9,10 +9,10 @@ host = ["dep:bytes", "dep:futures-core", "dep:strip-ansi-escapes", "dep:tokio", 
 guest = ["dep:helios-api"]
 
 [dependencies]
-bytes = { version = "1.10.1", optional = true }
-thiserror = "2.0.17"
+bytes = { version = "1.12.1", optional = true }
+thiserror = "2.0.20"
 futures-core = { version = "0.3.31", optional = true }
-futures-io = "0.3.31"
+futures-io = "0.3.34"
 futures-lite = "2.6.1"
 futures-util = { version = "0.3.31", default-features = false, features = ["std", "async-await"] }
 helios-api = { path = "../api", optional = true, default-features = false, features = ["fs", "instances", "profiling", "programs", "serial", "stats", "tracing"] }
