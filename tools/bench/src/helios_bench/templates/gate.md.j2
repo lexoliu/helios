@@ -24,6 +24,10 @@ Informational only, and nothing here blocks: {% if result.baseline_host != resul
 
 `diagnostic` rows are the tail of one iteration's samples — a maximum, or a percentile at p99 or above — and they record the scheduling order of the boot that produced them rather than anything the change did, so they are reported and never block.
 {% endif %}
+{% if result.retaken %}
+
+Timed again on every Helios image after a first pass too dispersed to gate on: {% for name in result.retaken %}`{{ name }}`{% if not loop.last %}, {% endif %}{% endfor %}. The rows above are the retake.
+{% endif %}
 {% if result.unpaired_metrics %}
 
 Measured on one side only, so uncompared: {% for unpaired in result.unpaired_metrics %}`{{ unpaired.workload }}`/`{{ unpaired.metric }}` ({{ unpaired.measured_by }} only){% if not loop.last %}, {% endif %}{% endfor %}.

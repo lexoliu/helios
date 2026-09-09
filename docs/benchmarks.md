@@ -128,6 +128,14 @@ Per cell (workload × side), `iterations` executions (11 by default):
   by more than any effect a change could show, so no row gets a verdict.
   The paired gate fails the check and asks for a rerun; the cross-run and
   profile-use tables carry the banner and block nothing (#292).
+- A cell whose warm CV is past `cv_bound` is **rejected**: its median
+  cannot be trusted to detect a regression, and a headline workload without
+  a trustworthy pair blocks as incomplete evidence. Before the gate reads
+  the report, the runner times every headline workload with a rejected
+  Helios or baseline cell again, once, on every Helios image the run has,
+  through the same driver invocation into `retake/` beside the first pass,
+  and the retaken cells replace the first attempt on both images. The run
+  record names them and the gate table says so (#295).
 - A comparison between Helios and a Linux side is **significant** when
   the two warm bootstrap intervals do not overlap and the ratio of medians
   moves by more than the noise floor; otherwise it prints "within noise".

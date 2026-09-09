@@ -92,6 +92,10 @@ class RunInfo(BaseModel):
             "the cargo profile the `helios_baseline` kernel was built with, when the run was paired"
         ),
     )
+    retaken: list[str] = Field(
+        default_factory=list,
+        description="headline workloads timed again on every Helios image after a dispersed first pass",
+    )
 
     @property
     def paired(self) -> bool:

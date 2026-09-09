@@ -18,7 +18,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from helios_bench import REPO_ROOT, WASI_APPS_ROOT
-from helios_bench.assemble import assemble_report, build_control
+from helios_bench.assemble import assemble_report, build_cell, build_control
 from helios_bench.baseline import Baseline
 from helios_bench.baseline import prepare as prepare_baseline
 from helios_bench.manifest import (
@@ -45,6 +45,7 @@ BOOT_ARTIFACTS = WASI_APPS_ROOT / "boot-artifacts.toml"
 CARGO_TARGETS = {"aarch64": "aarch64-unknown-none", "x86-64": "x86_64-unknown-none"}
 HELIOS_OUT = "helios"
 HELIOS_BASELINE_OUT = "helios-baseline"
+RETAKE_OUT = "retake"
 LINUX_OUT = "linux"
 LINUX_SIDES = {Side.LINUX_NATIVE, Side.LINUX_WASMTIME}
 # The cargo profiles a Helios image of a run can be built with, as the
@@ -139,6 +140,72 @@ def sha256_of(path: Path) -> str:
     return digest.hexdigest()
 
 
+def driver_arguments(options: RunOptions, iterations: int, workloads: list[dict], control: bool) -> list[str]:
+    """The driver argv every side shares: the iteration count, the workload
+    selection, and the control pass when the invocation is the suite."""
+    lane = options.lane
+    arguments = ["python3", str(GAP_BENCH), "--iterations", str(iterations)]
+    if control:
+        arguments.append("--control")
+    arguments.extend(
+        [
+            # Every cell of the report is accounted for: a workload that fails
+            # is recorded as failed on that side and the run goes on.
+            "--keep-going",
+            "--helios-host-http-host",
+            lane.net_host,
+            "--helios-host-tcp-host",
+            lane.net_host,
+        ]
+    )
+    if options.allow_busy_host:
+        arguments.append("--allow-busy-host")
+    if options.network.reuse_host_listeners:
+        arguments.append("--reuse-host-listeners")
+    for workload in workloads:
+        arguments.extend(["--workload", workload["name"]])
+    return arguments
+
+
+def helios_command(
+    options: RunOptions, common: list[str], out_root: Path, description: str
+) -> PlannedCommand:
+    """The driver invocation that times the Helios image, and the baseline
+    image beside it when the run is paired, under ``out_root``."""
+    lane = options.lane
+    env = {
+        "HELIOS_WORKLOAD_BENCH_VM_MEMORY": lane.memory,
+        "HELIOS_WORKLOAD_BENCH_VM_SMP": str(lane.vcpus),
+        "HELIOS_WORKLOAD_BENCH_NET_BACKEND": lane.net_backend,
+    }
+    if options.network.ifname:
+        env["HELIOS_WORKLOAD_BENCH_NET_IFNAME"] = options.network.ifname
+    if options.network.bridge:
+        env["HELIOS_WORKLOAD_BENCH_NET_BRIDGE"] = options.network.bridge
+    if options.network.queues:
+        env["HELIOS_WORKLOAD_BENCH_NET_QUEUES"] = str(options.network.queues)
+    return PlannedCommand(
+        description=description,
+        argv=[
+            *common,
+            "--arch",
+            lane.helios_arch,
+            "--helios-accel",
+            lane.accelerator,
+            "--skip-linux",
+            "--helios-timeout-seconds",
+            str(options.helios_timeout_seconds),
+            "--helios-side-timeout-seconds",
+            str(options.helios_side_timeout_seconds),
+            "--out-dir",
+            str(out_root / HELIOS_OUT),
+            *baseline_arguments(options, out_root),
+        ],
+        env=env,
+        cwd=REPO_ROOT,
+    )
+
+
 def plan(options: RunOptions, manifest: Manifest, workloads: list[dict]) -> list[PlannedCommand]:
     lane = options.lane
     iterations = options.iterations or manifest.statistics.iterations
@@ -152,63 +219,9 @@ def plan(options: RunOptions, manifest: Manifest, workloads: list[dict]) -> list
                 cwd=REPO_ROOT,
             )
         )
-    common = [
-        "python3",
-        str(GAP_BENCH),
-        "--iterations",
-        str(iterations),
-        "--control",
-        # Every cell of the report is accounted for: a workload that fails
-        # is recorded as failed on that side and the run goes on.
-        "--keep-going",
-        "--helios-host-http-host",
-        lane.net_host,
-        "--helios-host-tcp-host",
-        lane.net_host,
-    ]
-    if options.allow_busy_host:
-        common.append("--allow-busy-host")
-    if options.network.reuse_host_listeners:
-        common.append("--reuse-host-listeners")
-    for workload in workloads:
-        common.extend(["--workload", workload["name"]])
+    common = driver_arguments(options, iterations, workloads, control=True)
     if Side.HELIOS in options.sides:
-        env = {
-            "HELIOS_WORKLOAD_BENCH_VM_MEMORY": lane.memory,
-            "HELIOS_WORKLOAD_BENCH_VM_SMP": str(lane.vcpus),
-            "HELIOS_WORKLOAD_BENCH_NET_BACKEND": lane.net_backend,
-        }
-        if options.network.ifname:
-            env["HELIOS_WORKLOAD_BENCH_NET_IFNAME"] = options.network.ifname
-        if options.network.bridge:
-            env["HELIOS_WORKLOAD_BENCH_NET_BRIDGE"] = options.network.bridge
-        if options.network.queues:
-            env["HELIOS_WORKLOAD_BENCH_NET_QUEUES"] = str(options.network.queues)
-        commands.append(
-            PlannedCommand(
-                description="time every workload on Helios",
-                argv=[
-                    *common,
-                    "--arch",
-                    lane.helios_arch,
-                    # The lane pins the accelerator and the inspector
-                    # requires one to be named, so the manifest says it
-                    # rather than each boot rediscovering it.
-                    "--helios-accel",
-                    lane.accelerator,
-                    "--skip-linux",
-                    "--helios-timeout-seconds",
-                    str(options.helios_timeout_seconds),
-                    "--helios-side-timeout-seconds",
-                    str(options.helios_side_timeout_seconds),
-                    "--out-dir",
-                    str(options.out_dir / HELIOS_OUT),
-                    *baseline_arguments(options),
-                ],
-                env=env,
-                cwd=REPO_ROOT,
-            )
-        )
+        commands.append(helios_command(options, common, options.out_dir, "time every workload on Helios"))
     if options.sides & LINUX_SIDES:
         commands.append(
             PlannedCommand(
@@ -243,7 +256,7 @@ def plan(options: RunOptions, manifest: Manifest, workloads: list[dict]) -> list
     return commands
 
 
-def baseline_arguments(options: RunOptions) -> list[str]:
+def baseline_arguments(options: RunOptions, out_root: Path) -> list[str]:
     """What the driver needs to time the second image beside the first.
 
     Either axis of a pairing names the same second output directory: the
@@ -257,7 +270,7 @@ def baseline_arguments(options: RunOptions) -> list[str]:
         arguments.extend(["--helios-baseline-root", str(options.baseline.worktree)])
     if not arguments:
         return []
-    return [*arguments, "--helios-baseline-out-dir", str(options.out_dir / HELIOS_BASELINE_OUT)]
+    return [*arguments, "--helios-baseline-out-dir", str(out_root / HELIOS_BASELINE_OUT)]
 
 
 def execute(command: PlannedCommand) -> None:
@@ -376,6 +389,82 @@ def read_controls(options: RunOptions, thresholds: Thresholds) -> dict[Side, tup
     return controls
 
 
+HELIOS_SIDES = frozenset({Side.HELIOS, Side.HELIOS_BASELINE})
+
+
+def dispersed_headline_workloads(
+    sides: dict[Side, RawSide], workloads: list[dict], thresholds: Thresholds
+) -> list[dict]:
+    """The headline workloads whose Helios or baseline cell the gate would
+    reject for dispersion, in manifest order."""
+    dispersed = []
+    for workload in workloads:
+        if not workload.get("headline", False):
+            continue
+        for side in HELIOS_SIDES:
+            raw = sides.get(side)
+            raw_cell = raw.cells.get(workload["name"]) if raw is not None else None
+            if raw_cell is None or raw_cell.failure is not None:
+                continue
+            if build_cell(side, raw_cell.iterations, thresholds).rejected:
+                dispersed.append(workload)
+                break
+    return dispersed
+
+
+def retake_plan(options: RunOptions, iterations: int, workloads: list[dict]) -> PlannedCommand:
+    """The driver invocation that times ``workloads`` again on every Helios
+    image the run has, under ``retake/`` beside the first pass."""
+    names = ", ".join(workload["name"] for workload in workloads)
+    return helios_command(
+        options,
+        driver_arguments(options, iterations, workloads, control=False),
+        options.out_dir / RETAKE_OUT,
+        f"re-measure {names} on every Helios image: the first pass was too dispersed to gate on",
+    )
+
+
+def retake(
+    options: RunOptions,
+    iterations: int,
+    workloads: list[dict],
+    sides: dict[Side, RawSide],
+    thresholds: Thresholds,
+) -> list[str]:
+    """Re-measures, once, each headline workload whose cell the gate would
+    reject for dispersion.
+
+    A cell past the dispersion bound cannot be trusted to detect a
+    regression, and a headline workload without a trustworthy pair blocks
+    (run 34390597958: one baseline cell at CV 0.15012 against 0.150 cost
+    the whole hour). The dispersed workloads are timed again on every Helios
+    image the run has, back to back through the same driver, and the new
+    cells replace the first pass on both images so the pair stays paired.
+    A retake that is still dispersed stands: a host that cannot produce two
+    clean series in a row is the inconclusive case, not a loop.
+
+    Returns the names of the retaken workloads.
+    """
+    if Side.HELIOS not in options.sides:
+        return []
+    dispersed = dispersed_headline_workloads(sides, workloads, thresholds)
+    if not dispersed:
+        return []
+    execute(retake_plan(options, iterations, dispersed))
+    for side in options.sides & HELIOS_SIDES:
+        out_dir = options.out_dir / RETAKE_OUT / SIDE_OUT[side]
+        raw = read_optional_side(out_dir, side, thresholds.warmup_discard)
+        if raw is None:
+            raise SystemExit(f"the retake produced no JSONL for the {side} side under {out_dir}")
+        for workload in dispersed:
+            name = workload["name"]
+            cell = raw.cells.get(name)
+            if cell is None:
+                raise SystemExit(f"the retake of {name} wrote no records for the {side} side under {out_dir}")
+            sides[side].cells[name] = cell
+    return [workload["name"] for workload in dispersed]
+
+
 def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) -> Report | None:
     lane = options.lane
     deviations = host_deviations(lane)
@@ -417,10 +506,10 @@ def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) ->
     options.out_dir.mkdir(parents=True, exist_ok=True)
     for command in commands:
         execute(command)
-    finished = datetime.now(UTC).isoformat(timespec="seconds")
-
     thresholds = thresholds_from(manifest, options.iterations)
     sides = read_sides(options, thresholds)
+    retaken = retake(options, thresholds.iterations, workloads, sides, thresholds)
+    finished = datetime.now(UTC).isoformat(timespec="seconds")
     control = build_control(
         workload_manifest["control_workload"], read_controls(options, thresholds), thresholds
     )
@@ -444,6 +533,7 @@ def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) ->
         baseline_ref=options.baseline.ref if options.baseline else None,
         kernel_build=options.kernel_build,
         baseline_kernel_build=RELEASE_BUILD if paired else None,
+        retaken=retaken,
     )
     return assemble_report(
         workloads=workloads,
