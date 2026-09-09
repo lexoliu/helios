@@ -13,17 +13,22 @@ from pathlib import Path
 
 import pytest
 from conftest import THRESHOLDS, iterations, raw_side
+from conftest import WORKLOADS as REPORT_WORKLOADS
 
 from helios_bench import runner
+from helios_bench.assemble import assemble_report
 from helios_bench.baseline import Baseline
 from helios_bench.gate import evaluate_paired, gate_report
 from helios_bench.manifest import load_manifest
 from helios_bench.render import render_gate
-from helios_bench.report import Report, Side
+from helios_bench.report import Report, RunInfo, Side
 from helios_bench.runner import (
+    RECONFIRM_OUT,
     RETAKE_OUT,
     RunOptions,
     dispersed_headline_workloads,
+    reconfirm,
+    regressed_headline_workloads,
     retake,
     retake_plan,
 )
@@ -73,8 +78,8 @@ def sides_with(baseline_headline, helios_sideshow):
     }
 
 
-def write_retake(out_dir: Path, side: Side, name: str, values) -> None:
-    path = out_dir / RETAKE_OUT / runner.SIDE_OUT[side] / "helios.jsonl"
+def write_retake(out_dir: Path, side: Side, name: str, values, out_name: str = RETAKE_OUT) -> None:
+    path = out_dir / out_name / runner.SIDE_OUT[side] / "helios.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
     lines = [json.dumps({"type": "run", "schema_version": 1})]
     for iteration in values:
@@ -117,7 +122,7 @@ def test_only_a_dispersed_headline_cell_is_retaken(options, monkeypatch) -> None
 
     monkeypatch.setattr(runner, "execute", fake_execute)
 
-    assert dispersed_headline_workloads(sides, WORKLOADS, THRESHOLDS) == [HEADLINE]
+    assert dispersed_headline_workloads(sides, WORKLOADS, THRESHOLDS) == ["hostcall-loop"]
     assert retake(options, 11, WORKLOADS, sides, THRESHOLDS) == ["hostcall-loop"]
     assert len(executed) == 1
 
@@ -161,7 +166,8 @@ def test_an_unpaired_run_retakes_its_one_image(tmp_path, monkeypatch) -> None:
     )
 
     assert retake(options, 11, WORKLOADS, sides, THRESHOLDS) == ["hostcall-loop"]
-    args = gap_bench().build_parser().parse_args(retake_plan(options, 11, [HEADLINE]).argv[2:])
+    plan = retake_plan(options, 11, ["hostcall-loop"], RETAKE_OUT, "dispersed")
+    args = gap_bench().build_parser().parse_args(plan.argv[2:])
     assert args.helios_baseline_out_dir is None
 
 
@@ -179,3 +185,85 @@ def test_the_gate_names_the_retaken_workloads(paired_flat_report: Report) -> Non
         gate_report(paired_flat_report, None),
         "x86-64-kvm",
     )
+
+
+def paired_report_from(sides, run: RunInfo, template: Report) -> Report:
+    return assemble_report(
+        REPORT_WORKLOADS, sides, template.control, run, template.hardware, template.pins, THRESHOLDS
+    )
+
+
+def test_a_clean_pair_is_not_measured_again(paired_flat_report: Report, options, monkeypatch) -> None:
+    monkeypatch.setattr(
+        runner, "execute", lambda command: pytest.fail("nothing regressed, yet ran the driver")
+    )
+
+    assert regressed_headline_workloads(paired_flat_report) == []
+    assert reconfirm(options, 11, paired_flat_report, {}, THRESHOLDS) == []
+
+
+def test_a_first_pass_regression_is_measured_again_and_a_drift_clears(
+    paired_regression_report: Report, options, monkeypatch
+) -> None:
+    """Run 34404354482: `sched-tasks` +6.9% on a 6.7% floor with identical
+    kernels. The second pair of boots is what the gate reads."""
+    sides = sides_with(baseline_headline=tight(20.0, 3), helios_sideshow=tight(25.0, 6))
+    sides[Side.HELIOS].cells["hostcall-loop"].iterations = tight(30.0, 1)
+    first = paired_report_from(sides, paired_regression_report.run, paired_regression_report)
+    assert regressed_headline_workloads(first) == ["hostcall-loop"]
+    executed = []
+
+    def fake_execute(command):
+        executed.append(command)
+        write_retake(options.out_dir, Side.HELIOS, "hostcall-loop", tight(20.3, 7), RECONFIRM_OUT)
+        write_retake(options.out_dir, Side.HELIOS_BASELINE, "hostcall-loop", tight(20.0, 8), RECONFIRM_OUT)
+
+    monkeypatch.setattr(runner, "execute", fake_execute)
+
+    assert reconfirm(options, 11, first, sides, THRESHOLDS) == ["hostcall-loop"]
+    assert len(executed) == 1
+    args = gap_bench().build_parser().parse_args(executed[0].argv[2:])
+    assert args.workloads == ["hostcall-loop"] and not args.control
+    assert Path(args.out_dir) == options.out_dir / RECONFIRM_OUT / "helios"
+
+    run = paired_regression_report.run.model_copy(update={"reconfirmed": ["hostcall-loop"]})
+    second = paired_report_from(sides, run, paired_regression_report)
+    result = evaluate_paired(second)
+    assert not result.blocking and result.regressions == []
+    text = render_gate(gate_report(second, None), "x86-64-kvm")
+    assert "Measured again on a second pair of boots after the first pair regressed: `hostcall-loop`" in text
+
+
+def test_a_regression_that_shows_twice_still_blocks(
+    paired_regression_report: Report, options, monkeypatch
+) -> None:
+    sides = sides_with(baseline_headline=tight(20.0, 3), helios_sideshow=tight(25.0, 6))
+    sides[Side.HELIOS].cells["hostcall-loop"].iterations = tight(30.0, 1)
+    first = paired_report_from(sides, paired_regression_report.run, paired_regression_report)
+
+    def fake_execute(command):
+        write_retake(options.out_dir, Side.HELIOS, "hostcall-loop", tight(30.5, 7), RECONFIRM_OUT)
+        write_retake(options.out_dir, Side.HELIOS_BASELINE, "hostcall-loop", tight(20.0, 8), RECONFIRM_OUT)
+
+    monkeypatch.setattr(runner, "execute", fake_execute)
+
+    assert reconfirm(options, 11, first, sides, THRESHOLDS) == ["hostcall-loop"]
+    run = paired_regression_report.run.model_copy(update={"reconfirmed": ["hostcall-loop"]})
+    second = paired_report_from(sides, run, paired_regression_report)
+    assert evaluate_paired(second).blocking
+    assert "showed twice" in render_gate(gate_report(second, None), "x86-64-kvm")
+
+
+def test_an_unpaired_run_is_never_reconfirmed(baseline_report: Report, tmp_path, monkeypatch) -> None:
+    options = RunOptions(
+        lane=load_manifest().lane("x86-64-kvm"),
+        out_dir=tmp_path / "out",
+        advisory=True,
+        sides=frozenset({Side.HELIOS}),
+    )
+    monkeypatch.setattr(
+        runner,
+        "execute",
+        lambda command: pytest.fail("an unpaired run has no second column to confirm against"),
+    )
+    assert reconfirm(options, 11, baseline_report, {}, THRESHOLDS) == []

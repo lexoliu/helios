@@ -136,6 +136,13 @@ Per cell (workload × side), `iterations` executions (11 by default):
   through the same driver invocation into `retake/` beside the first pass,
   and the retaken cells replace the first attempt on both images. The run
   record names them and the gate table says so (#295).
+- A headline regression has to show twice. When the paired gate would
+  block on a workload, the runner times that workload again on both
+  images back to back into `reconfirm/`, and the second pair replaces the
+  first: a regression that is the change's own reproduces, a drift
+  between two boots does not. One pass per run, so a host that drifts
+  twice in a row still fails the check; the run record names the
+  reconfirmed workloads and the gate table says so (#297).
 - A comparison between Helios and a Linux side is **significant** when
   the two warm bootstrap intervals do not overlap and the ratio of medians
   moves by more than the noise floor; otherwise it prints "within noise".

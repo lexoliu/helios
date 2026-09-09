@@ -261,6 +261,7 @@ class GateResult:
     floor_bound: float
     control: ControlDrift | None
     retaken: list[str]
+    reconfirmed: list[str]
     rows: list[GateRow]
     incomplete_headlines: list[str]
     unpaired_metrics: list[UnpairedMetric]
@@ -526,6 +527,7 @@ def evaluate(baseline: Report, candidate: Report) -> GateResult:
         floor_bound=bound,
         control=worst_control(baseline, candidate),
         retaken=list(candidate.run.retaken),
+        reconfirmed=list(candidate.run.reconfirmed),
         rows=rows,
         incomplete_headlines=[],
         unpaired_metrics=unpaired,
@@ -610,6 +612,7 @@ def evaluate_paired(candidate: Report) -> GateResult | None:
         floor_bound=bound,
         control=worst_control(candidate),
         retaken=list(candidate.run.retaken),
+        reconfirmed=list(candidate.run.reconfirmed),
         rows=rows,
         incomplete_headlines=incomplete_headlines,
         unpaired_metrics=unpaired,
