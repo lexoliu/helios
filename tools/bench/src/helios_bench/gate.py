@@ -22,6 +22,7 @@ gate would undo that by comparing the wall clock alone.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import StrEnum
@@ -99,6 +100,66 @@ def metric_unit(name: str) -> Unit:
     )
 
 
+#: The page every Helios target maps in. A footprint that moved by less
+#: than one of them did not move: memory is handed out in pages, and
+#: `memory_per_instance_bytes` is a delta of available bytes over an
+#: instance count, so its last digits are accounting rather than
+#: measurement.
+PAGE_BYTES = 4096
+
+#: How many samples have to lie beyond a percentile before the gate will
+#: hold a change to it.
+#:
+#: A workload's latency metrics are computed over the samples of one
+#: iteration, so `first_output_p99_us` on a hundred-way concurrent spawn
+#: is computed over a hundred samples, and `LatencySamples::percentile`'s
+#: nearest rank makes it the second largest of them. That is an extremum
+#: wearing a percentile's name: what it records is the scheduling order of
+#: the boot that produced it, and a paired run of two identical kernels
+#: moved it 14% (run 34223160269, #286). Ten samples past the rank is the
+#: line: p99 needs a thousand samples, p99.9 needs ten thousand, and a
+#: median needs twenty.
+MIN_SAMPLES_BEYOND_PERCENTILE = 10
+
+#: Suffix of the metric each `LatencySamples::report` prints its sample
+#: count under. It is context for the percentiles beside it rather than a
+#: measurement of anything, so it is never a row.
+SAMPLE_COUNT_SUFFIX = "_samples"
+
+PERCENTILE = re.compile(r"_p(?P<digits>\d{2,})$")
+
+
+def statistic_of(name: str) -> str:
+    """The metric name with its unit suffix removed."""
+    for suffix, _ in METRIC_UNITS:
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
+
+
+def samples_needed(name: str) -> float | None:
+    """Samples a percentile needs before the gate may block on it.
+
+    `None` for a measurement that is not a percentile of a sample. A
+    maximum returns infinity: no sample size makes an extremum
+    attributable to a change.
+    """
+    statistic = statistic_of(name)
+    if statistic.endswith("_max") or statistic.endswith("_min"):
+        return float("inf")
+    match = PERCENTILE.search(statistic)
+    if match is None:
+        return None
+    digits = match.group("digits")
+    # `_p99` is 99%, `_p999` is 99.9%: the digits are the percentage with
+    # the decimal point after the first two.
+    percent = float(digits[:2] + "." + digits[2:]) if len(digits) > 2 else float(digits)
+    beyond = (100.0 - percent) / 100.0
+    if beyond <= 0.0:
+        return float("inf")
+    return MIN_SAMPLES_BEYOND_PERCENTILE / beyond
+
+
 GATE_TITLES = {
     GateKind.PAIRED: "Paired, one host, one job",
     GateKind.CROSS_RUN: "Cross-run, against the latest `dev` report",
@@ -124,6 +185,11 @@ class GateRow:
     #: a variance-rejected cell does.
     rejected: bool = False
     rejection_reason: str | None = None
+    #: A measurement the gate reports and never blocks on, because a shift
+    #: in it is not attributable to the change: the tail of one
+    #: iteration's samples belongs to that boot's scheduling order.
+    diagnostic: bool = False
+    diagnostic_reason: str | None = None
 
 
 class Column(StrEnum):
@@ -179,6 +245,10 @@ class GateResult:
         return [row for row in self.rows if row.rejected]
 
     @property
+    def diagnostic_rows(self) -> list[GateRow]:
+        return [row for row in self.rows if row.diagnostic]
+
+    @property
     def improvements(self) -> list[GateRow]:
         return [row for row in self.rows if row.improvement]
 
@@ -210,22 +280,32 @@ def compare_series(
     after: SeriesStats,
     floor: float,
     cv_bound: float,
+    samples: float | None = None,
 ) -> GateRow:
     """One row: two warm series of one measurement, judged the same way.
 
     Significant means the two bootstrap intervals of the medians are
-    disjoint **and** the median moved by more than the floor the run's
-    control measured. Which sign of movement is the bad one, and whether
-    the floor applies at all, come from the measurement's unit.
+    disjoint **and** the median moved by more than the smallest shift
+    that could mean anything. Which sign of movement is the bad one, what
+    that smallest shift is, and whether the row may block at all, all
+    come from what the measurement is.
     """
     unit = DURATION if measurement == ELAPSED else metric_unit(measurement)
+    needed = None if measurement == ELAPSED else samples_needed(measurement)
+    diagnostic = needed is not None and (samples is None or samples < needed)
     shift = relative_shift(before.median, after.median)
     disjoint = not intervals_overlap(before, after)
-    beyond = abs(shift) > floor if unit.drifts_with_the_host else shift != 0.0
+    if unit.drifts_with_the_host:
+        # The control's drift bounds how far the machine moved, which is
+        # what a duration or a rate of durations is exposed to.
+        beyond = abs(shift) > floor
+    else:
+        # A footprint is exposed to the page, not to the clock.
+        beyond = abs(after.median - before.median) > PAGE_BYTES
     worse = shift > 0 if unit.direction is Direction.LOWER_IS_BETTER else shift < 0
     dispersed = max(before.cv, after.cv)
     rejected = dispersed > cv_bound
-    significant = disjoint and beyond and not rejected
+    significant = disjoint and beyond and not rejected and not diagnostic
     return GateRow(
         workload=workload.name,
         measurement=measurement,
@@ -239,11 +319,28 @@ def compare_series(
         regression=significant and worse,
         improvement=significant and not worse,
         rejected=rejected,
+        diagnostic=diagnostic,
+        diagnostic_reason=diagnostic_reason(measurement, samples, needed) if diagnostic else None,
         rejection_reason=(
             f"warm coefficient of variation {dispersed:.3f} exceeds the run's bound {cv_bound:.3f}"
             if rejected
             else None
         ),
+    )
+
+
+def diagnostic_reason(measurement: str, samples: float | None, needed: float | None) -> str:
+    """Why a row is reported rather than blocked on."""
+    if needed == float("inf"):
+        return "an extremum of one iteration's samples, which no sample size makes attributable"
+    if samples is None:
+        return (
+            "a percentile whose sample count the workload does not report, so the gate cannot "
+            "tell it from an extremum"
+        )
+    return (
+        f"a percentile over {samples:,.0f} samples, and {needed:,.0f} are needed before "
+        f"{MIN_SAMPLES_BEYOND_PERCENTILE} of them lie past its rank"
     )
 
 
@@ -261,6 +358,9 @@ def gate_rows(
     for workload, base_cell, cand_cell in pairs:
         rows.append(compare_series(workload, ELAPSED, base_cell.warm, cand_cell.warm, floor, cv_bound))
         for metric in sorted(set(base_cell.metrics) | set(cand_cell.metrics)):
+            if metric.endswith(SAMPLE_COUNT_SUFFIX):
+                # Context for the percentiles beside it, not a row.
+                continue
             before = base_cell.metrics.get(metric)
             after = cand_cell.metrics.get(metric)
             if before is None or after is None:
@@ -277,8 +377,39 @@ def gate_rows(
                 # measurement that reads zero on the baseline is not a
                 # measurement of anything the candidate can be worse at.
                 continue
-            rows.append(compare_series(workload, metric, before, after, floor, cv_bound))
+            rows.append(
+                compare_series(
+                    workload,
+                    metric,
+                    before,
+                    after,
+                    floor,
+                    cv_bound,
+                    samples=sample_count(base_cell, cand_cell, metric),
+                )
+            )
     return rows, unpaired
+
+
+def sample_count(base_cell: Cell, cand_cell: Cell, metric: str) -> float | None:
+    """The samples a percentile was computed over, as both cells report it.
+
+    The smaller of the two, because a percentile is only as attributable
+    as the thinner of the samples it is compared across. `None` when
+    either side does not report a count — a report written before its
+    harness did — which the gate reads as unknown rather than as enough.
+
+    The count belongs to the whole family: `first_output_p99_us` and
+    `first_output_max_us` are statistics of the samples counted by
+    `first_output_samples`, so the name to look up is the metric's with
+    its unit and its statistic taken off.
+    """
+    statistic = statistic_of(metric)
+    if "_" not in statistic:
+        return None
+    counted = f"{statistic.rsplit('_', 1)[0]}{SAMPLE_COUNT_SUFFIX}"
+    counts = [cell.metrics[counted].median for cell in (base_cell, cand_cell) if counted in cell.metrics]
+    return min(counts) if len(counts) == 2 else None
 
 
 def comparable(base_cell: Cell | None, cand_cell: Cell | None) -> bool:

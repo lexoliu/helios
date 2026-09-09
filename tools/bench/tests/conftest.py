@@ -65,6 +65,11 @@ def iterations(
             # longer round trip and fewer switches per second.
             metrics={
                 "rtt_p50_us": float(max(value, 0.01)) * 10.0,
+                "rtt_p99_us": float(max(value, 0.01)) * 30.0,
+                # Enough samples that both percentiles above are
+                # percentiles rather than extrema, which is what lets the
+                # gate hold a change to them.
+                "rtt_samples": 4096.0,
                 "switches_per_s": 1_000_000.0 / float(max(value, 0.01)),
             },
         )
