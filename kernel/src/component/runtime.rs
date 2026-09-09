@@ -27,6 +27,91 @@ use thiserror::Error;
 /// from here.
 pub const COMPONENT_ASYNC_STACK_SIZE: usize = 8 * 1024 * 1024;
 
+/// How many component instances the kernel serves at once.
+///
+/// This is kernel policy and belongs here for the same reason
+/// [`COMPONENT_ASYNC_STACK_SIZE`] does: the kernel is what pays for a
+/// live instance, and the runtime adapter reads the number rather than
+/// choosing it. Until #284 the number was Wasmtime's own default — one
+/// value, 1000, that its `InstanceLimits` assigns to every total it has,
+/// including the *core* instance count, which is not the same thing as a
+/// program: `instance-startup-500` never once completed on any bench run
+/// because 500 programs draw more than 1000 core instances between them.
+///
+/// The cap the runtime is told is not the real limit. What actually
+/// bounds concurrency is user memory, and the instance that cannot get
+/// its pages dies as any other user OOM does (AGENTS §3.1); this number
+/// exists so that the refusal comes from the memory the kernel accounts
+/// for rather than from a pool sized by a default nobody chose.
+pub const MAX_CONCURRENT_INSTANCES: u32 = 1024;
+
+/// The most core instances one component may instantiate.
+///
+/// Measured across every component this tree builds: `hello` and the
+/// curl program instantiate three core modules each — the component
+/// tooling's shim, the main module and the preview1 adapter — and
+/// `python3` four. Eight leaves room for a component that carries more
+/// without letting one draw the pool down.
+pub const MAX_CORE_INSTANCES_PER_COMPONENT: u32 = 8;
+
+/// The most linear memories one component may hold.
+///
+/// Every component in the tree defines exactly one, including the
+/// threaded ones: a guest's threads share its single memory rather than
+/// adding a second. Two is the multi-memory headroom, and it is what
+/// each unit of [`MAX_CONCURRENT_INSTANCES`] reserves address space for,
+/// so it is deliberately tight.
+pub const MAX_MEMORIES_PER_COMPONENT: u32 = 2;
+
+/// The most tables one component may hold.
+///
+/// Measured at exactly two for every component this tree builds: the
+/// main module's function table and the shim's. There is no headroom
+/// here on purpose — the table pool is the one pool the runtime commits
+/// up front rather than reserving, so this number is paid in user pages
+/// per live slot whether or not any component uses it. See
+/// [`MAX_POOLED_USER_MEMORY`].
+pub const MAX_TABLES_PER_COMPONENT: u32 = 2;
+
+/// The virtual address space the kernel will let the runtime's instance
+/// pools reserve.
+///
+/// A pooled linear-memory slot reserves
+/// `CWASM_MEMORY_RESERVATION + CWASM_MEMORY_GUARD_SIZE` of address space
+/// whether or not anything ever runs in it, so the instance budget is
+/// spent in address space long before it is spent in pages. Every
+/// bare-metal backend hands the runtime a 32 TiB window
+/// (`USER_VA_BASE..USER_VA_END` in `x86/src/vmm.rs`,
+/// `aarch64/src/vmm.rs` and `riscv/src/vmm.rs`), and the kernel keeps
+/// its pools inside half of it so that everything else mapped out of the
+/// same window — compiled code, the fiber stacks, a guest's own growth —
+/// still has somewhere to go. The pools the budget below implies reserve
+/// about 8.1 TiB of that.
+///
+/// This is the number to check before widening
+/// [`MAX_CONCURRENT_INSTANCES`] or [`MAX_MEMORIES_PER_COMPONENT`]; the
+/// runtime adapter asserts the derived pools fit.
+pub const MAX_POOLED_ADDRESS_SPACE: u64 = 16 << 40;
+
+/// The user memory one engine's instance pools may commit up front.
+///
+/// Reserved address space is not the only thing a pool costs, and the
+/// exception is what made the first draft of the instance budget a
+/// regression rather than a fix. The linear-memory, stack and GC-heap
+/// pools all take their space as they use it — the memory pool maps its
+/// whole slab inaccessible, the bare-metal stack pool is a counter — but
+/// the **table pool commits its entire mapping when the engine is
+/// built**, one page-rounded `table_elements`-sized slot per
+/// `total_tables`. On the bench lane that is user memory gone before a
+/// program runs: run 34224973216 refused `cpython-json` its 40 MiB with
+/// `available=34942976 of 1510993920`, because a fourfold table budget
+/// had committed 1.3 GiB of the 1.44 GiB the guest had.
+///
+/// It is per *engine*, and the kernel builds one per component-host
+/// consumer — two today, the host and its service path — so the figure
+/// to compare against a guest's budget is twice this.
+pub const MAX_POOLED_USER_MEMORY: u64 = 128 << 20;
+
 /// The kernel heap one wasm store costs the kernel.
 ///
 /// Two terms, and both are per *store* rather than per instance, which

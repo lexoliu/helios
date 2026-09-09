@@ -1,6 +1,10 @@
 use wasmtime::Config;
 
-pub use crate::component::COMPONENT_ASYNC_STACK_SIZE;
+pub use crate::component::{
+    COMPONENT_ASYNC_STACK_SIZE, MAX_CONCURRENT_INSTANCES, MAX_CORE_INSTANCES_PER_COMPONENT,
+    MAX_MEMORIES_PER_COMPONENT, MAX_POOLED_ADDRESS_SPACE, MAX_POOLED_USER_MEMORY,
+    MAX_TABLES_PER_COMPONENT,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AotCompileHint {
