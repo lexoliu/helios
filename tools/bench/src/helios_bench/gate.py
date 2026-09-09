@@ -260,6 +260,7 @@ class GateResult:
     noise_floor: float
     floor_bound: float
     control: ControlDrift | None
+    retaken: list[str]
     rows: list[GateRow]
     incomplete_headlines: list[str]
     unpaired_metrics: list[UnpairedMetric]
@@ -524,6 +525,7 @@ def evaluate(baseline: Report, candidate: Report) -> GateResult:
         noise_floor=floor,
         floor_bound=bound,
         control=worst_control(baseline, candidate),
+        retaken=list(candidate.run.retaken),
         rows=rows,
         incomplete_headlines=[],
         unpaired_metrics=unpaired,
@@ -607,6 +609,7 @@ def evaluate_paired(candidate: Report) -> GateResult | None:
         noise_floor=floor,
         floor_bound=bound,
         control=worst_control(candidate),
+        retaken=list(candidate.run.retaken),
         rows=rows,
         incomplete_headlines=incomplete_headlines,
         unpaired_metrics=unpaired,
