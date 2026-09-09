@@ -6,7 +6,7 @@ autobins = false
 
 [dependencies]
 helios-api = { path = "../../api", default-features = false }
-thiserror = { version = "2.0.17", default-features = false }
+thiserror = { version = "2.0.20", default-features = false }
 
 [lib]
 name = "helios_date"

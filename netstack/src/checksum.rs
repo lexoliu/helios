@@ -332,8 +332,8 @@ fn sum_words_wide(bytes: &[u8]) -> u32 {
     ]);
     while offset + 16 <= bytes.len() {
         let vector = u8x16::from(&bytes[offset..offset + 16]);
-        let high_bytes = vector.swizzle_relaxed(high_byte_indices);
-        let low_bytes = vector.swizzle_relaxed(low_byte_indices);
+        let high_bytes = vector.shuffle(high_byte_indices);
+        let low_bytes = vector.shuffle(low_byte_indices);
         let words = (u16x8::from_u8x16_low(high_bytes) << 8u8) | u16x8::from_u8x16_low(low_bytes);
         lanes += u32x8::from(words);
         offset += 16;

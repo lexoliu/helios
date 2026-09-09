@@ -17,7 +17,7 @@ pub async fn yield_now() {
 
 /// Spawns `future` to run concurrently within the current component task.
 pub fn spawn(future: impl Future<Output = ()> + 'static) {
-    crate::wit_bindgen::spawn(future);
+    crate::wit_bindgen::spawn_local(future);
 }
 
 fn duration_to_nanos(duration: Duration) -> u64 {
