@@ -62,7 +62,7 @@ jobs:
             libudev-dev just cmake ninja-build
       - uses: taiki-e/install-action@v2
         with:
-          tool: wasm-tools,cargo-deny
+          tool: wasm-tools,cargo-deny,nextest
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.13.0
