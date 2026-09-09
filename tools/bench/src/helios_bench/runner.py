@@ -21,6 +21,7 @@ from helios_bench import REPO_ROOT, WASI_APPS_ROOT
 from helios_bench.assemble import assemble_report, build_cell, build_control
 from helios_bench.baseline import Baseline
 from helios_bench.baseline import prepare as prepare_baseline
+from helios_bench.gate import evaluate_paired
 from helios_bench.manifest import (
     Lane,
     Manifest,
@@ -46,6 +47,7 @@ CARGO_TARGETS = {"aarch64": "aarch64-unknown-none", "x86-64": "x86_64-unknown-no
 HELIOS_OUT = "helios"
 HELIOS_BASELINE_OUT = "helios-baseline"
 RETAKE_OUT = "retake"
+RECONFIRM_OUT = "reconfirm"
 LINUX_OUT = "linux"
 LINUX_SIDES = {Side.LINUX_NATIVE, Side.LINUX_WASMTIME}
 # The cargo profiles a Helios image of a run can be built with, as the
@@ -394,7 +396,7 @@ HELIOS_SIDES = frozenset({Side.HELIOS, Side.HELIOS_BASELINE})
 
 def dispersed_headline_workloads(
     sides: dict[Side, RawSide], workloads: list[dict], thresholds: Thresholds
-) -> list[dict]:
+) -> list[str]:
     """The headline workloads whose Helios or baseline cell the gate would
     reject for dispersion, in manifest order."""
     dispersed = []
@@ -407,21 +409,52 @@ def dispersed_headline_workloads(
             if raw_cell is None or raw_cell.failure is not None:
                 continue
             if build_cell(side, raw_cell.iterations, thresholds).rejected:
-                dispersed.append(workload)
+                dispersed.append(workload["name"])
                 break
     return dispersed
 
 
-def retake_plan(options: RunOptions, iterations: int, workloads: list[dict]) -> PlannedCommand:
-    """The driver invocation that times ``workloads`` again on every Helios
-    image the run has, under ``retake/`` beside the first pass."""
-    names = ", ".join(workload["name"] for workload in workloads)
+def retake_plan(
+    options: RunOptions, iterations: int, names: list[str], out_name: str, reason: str
+) -> PlannedCommand:
+    """The driver invocation that times the workloads ``names`` again on
+    every Helios image the run has, under ``out_name/`` beside the first pass."""
     return helios_command(
         options,
-        driver_arguments(options, iterations, workloads, control=False),
-        options.out_dir / RETAKE_OUT,
-        f"re-measure {names} on every Helios image: the first pass was too dispersed to gate on",
+        driver_arguments(options, iterations, [{"name": name} for name in names], control=False),
+        options.out_dir / out_name,
+        f"measure {', '.join(names)} again on every Helios image: {reason}",
     )
+
+
+def retake_workloads(
+    options: RunOptions,
+    iterations: int,
+    names: list[str],
+    sides: dict[Side, RawSide],
+    thresholds: Thresholds,
+    out_name: str,
+    reason: str,
+) -> list[str]:
+    """Times the workloads ``names`` again on every Helios image the run has,
+    back to back through the same driver, and replaces their cells on every
+    image so the pair stays paired. Returns the names measured again."""
+    if not names:
+        return []
+    execute(retake_plan(options, iterations, names, out_name, reason))
+    for side in options.sides & HELIOS_SIDES:
+        out_dir = options.out_dir / out_name / SIDE_OUT[side]
+        raw = read_optional_side(out_dir, side, thresholds.warmup_discard)
+        if raw is None:
+            raise SystemExit(f"the second pass produced no JSONL for the {side} side under {out_dir}")
+        for name in names:
+            cell = raw.cells.get(name)
+            if cell is None:
+                raise SystemExit(
+                    f"the second pass of {name} wrote no records for the {side} side under {out_dir}"
+                )
+            sides[side].cells[name] = cell
+    return list(names)
 
 
 def retake(
@@ -437,32 +470,62 @@ def retake(
     A cell past the dispersion bound cannot be trusted to detect a
     regression, and a headline workload without a trustworthy pair blocks
     (run 34390597958: one baseline cell at CV 0.15012 against 0.150 cost
-    the whole hour). The dispersed workloads are timed again on every Helios
-    image the run has, back to back through the same driver, and the new
-    cells replace the first pass on both images so the pair stays paired.
-    A retake that is still dispersed stands: a host that cannot produce two
-    clean series in a row is the inconclusive case, not a loop.
-
-    Returns the names of the retaken workloads.
+    the whole hour). A retake that is still dispersed stands: a host that
+    cannot produce two clean series in a row is the inconclusive case, not
+    a loop.
     """
     if Side.HELIOS not in options.sides:
         return []
-    dispersed = dispersed_headline_workloads(sides, workloads, thresholds)
-    if not dispersed:
+    return retake_workloads(
+        options,
+        iterations,
+        dispersed_headline_workloads(sides, workloads, thresholds),
+        sides,
+        thresholds,
+        RETAKE_OUT,
+        "the first pass was too dispersed to gate on",
+    )
+
+
+def regressed_headline_workloads(report: Report) -> list[str]:
+    """The headline workloads the paired gate would block on, in report order."""
+    result = evaluate_paired(report)
+    if result is None or result.inconclusive:
         return []
-    execute(retake_plan(options, iterations, dispersed))
-    for side in options.sides & HELIOS_SIDES:
-        out_dir = options.out_dir / RETAKE_OUT / SIDE_OUT[side]
-        raw = read_optional_side(out_dir, side, thresholds.warmup_discard)
-        if raw is None:
-            raise SystemExit(f"the retake produced no JSONL for the {side} side under {out_dir}")
-        for workload in dispersed:
-            name = workload["name"]
-            cell = raw.cells.get(name)
-            if cell is None:
-                raise SystemExit(f"the retake of {name} wrote no records for the {side} side under {out_dir}")
-            sides[side].cells[name] = cell
-    return [workload["name"] for workload in dispersed]
+    names: list[str] = []
+    for row in result.headline_regressions:
+        if row.workload not in names:
+            names.append(row.workload)
+    return names
+
+
+def reconfirm(
+    options: RunOptions,
+    iterations: int,
+    report: Report,
+    sides: dict[Side, RawSide],
+    thresholds: Thresholds,
+) -> list[str]:
+    """Measures, once, every headline workload the paired gate would block on.
+
+    A regression that is the change's own reproduces on a second pair of
+    boots; a drift between two boots does not (run 34404354482:
+    `sched-tasks` +6.9% on a 6.7% floor, identical kernels). The regressed
+    workloads are timed again on both images back to back and the second
+    pair replaces the first, so the gate reads a regression that showed
+    twice. One pass: a host that drifts twice in a row still fails the check.
+    """
+    if not report.run.paired:
+        return []
+    return retake_workloads(
+        options,
+        iterations,
+        regressed_headline_workloads(report),
+        sides,
+        thresholds,
+        RECONFIRM_OUT,
+        "the first pair of boots regressed and a regression has to show twice",
+    )
 
 
 def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) -> Report | None:
@@ -509,38 +572,48 @@ def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) ->
     thresholds = thresholds_from(manifest, options.iterations)
     sides = read_sides(options, thresholds)
     retaken = retake(options, thresholds.iterations, workloads, sides, thresholds)
-    finished = datetime.now(UTC).isoformat(timespec="seconds")
     control = build_control(
         workload_manifest["control_workload"], read_controls(options, thresholds), thresholds
     )
     run_id, run_url, attempt = github_run()
-    run = RunInfo(
-        id=run_id,
-        url=run_url,
-        attempt=attempt,
-        lane=lane.name,
-        runner_label=options.runner_label or (lane.shared_runner if options.advisory else lane.runner_label),
-        advisory=options.advisory,
-        publishable=not options.advisory and not deviations,
-        deviations=deviations,
-        started_at=started,
-        finished_at=finished,
-        helios_git_sha=git_sha(),
-        # A PGO pairing varies the build and not the commit, so the
-        # baseline image is this same commit: the run record says so
-        # rather than leaving the column unattributed.
-        baseline_git_sha=options.baseline.sha if options.baseline else (git_sha() if paired else None),
-        baseline_ref=options.baseline.ref if options.baseline else None,
-        kernel_build=options.kernel_build,
-        baseline_kernel_build=RELEASE_BUILD if paired else None,
-        retaken=retaken,
-    )
-    return assemble_report(
-        workloads=workloads,
-        sides=sides,
-        control=control,
-        run=run,
-        hardware=collect_hardware(lane),
-        pins=collect_pins(lane, workloads, options.kernel_build),
-        thresholds=thresholds,
-    )
+
+    def build(reconfirmed: list[str]) -> Report:
+        finished = datetime.now(UTC).isoformat(timespec="seconds")
+        run = RunInfo(
+            id=run_id,
+            url=run_url,
+            attempt=attempt,
+            lane=lane.name,
+            runner_label=options.runner_label
+            or (lane.shared_runner if options.advisory else lane.runner_label),
+            advisory=options.advisory,
+            publishable=not options.advisory and not deviations,
+            deviations=deviations,
+            started_at=started,
+            finished_at=finished,
+            helios_git_sha=git_sha(),
+            # A PGO pairing varies the build and not the commit, so the
+            # baseline image is this same commit: the run record says so
+            # rather than leaving the column unattributed.
+            baseline_git_sha=options.baseline.sha if options.baseline else (git_sha() if paired else None),
+            baseline_ref=options.baseline.ref if options.baseline else None,
+            kernel_build=options.kernel_build,
+            baseline_kernel_build=RELEASE_BUILD if paired else None,
+            retaken=retaken,
+            reconfirmed=reconfirmed,
+        )
+        return assemble_report(
+            workloads=workloads,
+            sides=sides,
+            control=control,
+            run=run,
+            hardware=collect_hardware(lane),
+            pins=collect_pins(lane, workloads, options.kernel_build),
+            thresholds=thresholds,
+        )
+
+    report = build([])
+    reconfirmed = reconfirm(options, thresholds.iterations, report, sides, thresholds)
+    if reconfirmed:
+        report = build(reconfirmed)
+    return report

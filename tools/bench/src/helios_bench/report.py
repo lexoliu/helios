@@ -96,6 +96,10 @@ class RunInfo(BaseModel):
         default_factory=list,
         description="headline workloads timed again on every Helios image after a dispersed first pass",
     )
+    reconfirmed: list[str] = Field(
+        default_factory=list,
+        description="headline workloads timed again on both images after the first pair of boots regressed",
+    )
 
     @property
     def paired(self) -> bool:

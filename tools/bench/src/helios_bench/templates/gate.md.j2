@@ -28,6 +28,10 @@ Informational only, and nothing here blocks: {% if result.baseline_host != resul
 
 Timed again on every Helios image after a first pass too dispersed to gate on: {% for name in result.retaken %}`{{ name }}`{% if not loop.last %}, {% endif %}{% endfor %}. The rows above are the retake.
 {% endif %}
+{% if result.reconfirmed %}
+
+Measured again on a second pair of boots after the first pair regressed: {% for name in result.reconfirmed %}`{{ name }}`{% if not loop.last %}, {% endif %}{% endfor %}. The rows above are the second pair, so a regression that shows there showed twice.
+{% endif %}
 {% if result.unpaired_metrics %}
 
 Measured on one side only, so uncompared: {% for unpaired in result.unpaired_metrics %}`{{ unpaired.workload }}`/`{{ unpaired.metric }}` ({{ unpaired.measured_by }} only){% if not loop.last %}, {% endif %}{% endfor %}.
