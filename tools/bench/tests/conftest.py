@@ -89,6 +89,7 @@ def make_report(
     publishable: bool = True,
     seed: int = 1,
     baseline_centers: dict[str, float] | None = None,
+    control_drift: float = 0.01,
 ) -> Report:
     sides = {
         Side.HELIOS: raw_side(
@@ -114,7 +115,7 @@ def make_report(
     control_sides = {
         Side.HELIOS: (
             raw_side({"quickjs-loop": iterations(100.0, 1.0, seed + 31)}),
-            raw_side({"quickjs-loop": iterations(101.0, 1.0, seed + 32)}),
+            raw_side({"quickjs-loop": iterations(100.0 * (1.0 + control_drift), 1.0, seed + 32)}),
         )
     }
     if baseline_centers is not None:
@@ -187,7 +188,7 @@ def regressed_report() -> Report:
     )
 
 
-def paired(candidate: float, baseline: float, run_id: str, seed: int) -> Report:
+def paired(candidate: float, baseline: float, run_id: str, seed: int, control_drift: float = 0.01) -> Report:
     """A paired report: the same workloads, two Helios images, one host."""
     return make_report(
         {"hostcall-loop": candidate, "quickjs-loop": 100.5, "fs-smallfiles": 25.0},
@@ -195,6 +196,7 @@ def paired(candidate: float, baseline: float, run_id: str, seed: int) -> Report:
         publishable=False,
         seed=seed,
         baseline_centers={"hostcall-loop": baseline, "quickjs-loop": 100.5, "fs-smallfiles": 25.0},
+        control_drift=control_drift,
     )
 
 
@@ -212,6 +214,13 @@ def paired_regression_report() -> Report:
 def paired_flat_report() -> Report:
     """A candidate 0.4% away from its baseline: inside any run's floor."""
     return paired(candidate=20.08, baseline=20.0, run_id="2003", seed=3)
+
+
+@pytest.fixture
+def paired_noisy_host_report() -> Report:
+    """Run 34381896869: the control drifted 28.7% on one side while the
+    candidate regressed 50%. The host, not the change, is what was measured."""
+    return paired(candidate=30.0, baseline=20.0, run_id="2004", seed=3, control_drift=0.287)
 
 
 @pytest.fixture
