@@ -123,6 +123,11 @@ Per cell (workload × side), `iterations` executions (11 by default):
 - Machine noise is measured, not assumed: the `control_workload`
   (`quickjs-loop`) runs before and after the suite on every side, and the
   **noise floor** is the larger of the control's median drift and its CV.
+  A floor above `cv_bound` (0.15, the bound a single row's dispersion is
+  held to) makes the whole comparison **inconclusive**: the host moved
+  by more than any effect a change could show, so no row gets a verdict.
+  The paired gate fails the check and asks for a rerun; the cross-run and
+  profile-use tables carry the banner and block nothing (#292).
 - A comparison between Helios and a Linux side is **significant** when
   the two warm bootstrap intervals do not overlap and the ratio of medians
   moves by more than the noise floor; otherwise it prints "within noise".

@@ -503,6 +503,51 @@ def test_a_paired_shift_inside_the_floor_is_neither(paired_flat_report: Report) 
     assert not result.blocking
 
 
+def test_a_floor_past_the_bound_is_inconclusive_and_fails_the_check(
+    paired_noisy_host_report: Report,
+) -> None:
+    """Issue #292: a 28.7% floor let four rows through as regressions and
+    the check stayed green. Past the dispersion bound the run measured the
+    host, so no row is judged and the enforced comparison blocks."""
+    result = evaluate_paired(paired_noisy_host_report)
+
+    assert result.noise_floor > result.floor_bound == 0.15
+    assert result.inconclusive and result.blocking
+    assert result.regressions == [] and result.improvements == [] and result.headline_regressions == []
+    # The rows were still computed and the shift is real on the page: the
+    # verdict is what the floor withholds.
+    rows = {(row.workload, row.measurement): row for row in result.rows}
+    assert rows["hostcall-loop", "elapsed_ms"].shift == pytest.approx(0.5, abs=0.1)
+    assert result.control is not None
+    assert result.control.side is Side.HELIOS
+    assert result.control.drift == pytest.approx(0.287, abs=0.02)
+
+    text = render_gate(gate_report(paired_noisy_host_report, None), "x86-64-kvm")
+    assert "**Blocking: inconclusive**" in text
+    assert "rerun the lane" in text
+    assert "| inconclusive |" in text
+    assert "**regression**" not in text
+    assert gate_report(paired_noisy_host_report, None).blocking
+
+
+def test_an_unenforced_inconclusive_comparison_reports_and_blocks_nothing(
+    paired_noisy_host_report: Report, baseline_report: Report
+) -> None:
+    result = evaluate(baseline_report, paired_noisy_host_report)
+
+    assert not result.enforced
+    assert result.inconclusive and not result.blocking
+    text = render_gate(gate_report(paired_noisy_host_report, baseline_report), "x86-64-kvm")
+    assert "Inconclusive — the noise floor" in text
+    assert "Blocking" in text  # the paired half of the same report still blocks
+
+
+def test_a_quiet_host_is_conclusive(paired_flat_report: Report) -> None:
+    result = evaluate_paired(paired_flat_report)
+    assert not result.inconclusive
+    assert "nconclusive" not in render_gate(gate_report(paired_flat_report, None), "x86-64-kvm")
+
+
 def test_a_paired_run_that_measured_no_baseline_is_a_failure(paired_regression_report: Report) -> None:
     for result in paired_regression_report.workloads:
         result.cells.pop(Side.HELIOS_BASELINE, None)

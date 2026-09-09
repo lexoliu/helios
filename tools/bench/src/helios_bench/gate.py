@@ -220,6 +220,34 @@ class UnpairedMetric:
 
 
 @dataclass(frozen=True)
+class ControlDrift:
+    """The control side that set the floor: how far its median moved between
+    the boot before the suite and the boot after, and the larger of the two
+    series' coefficients of variation. One of the two is the floor."""
+
+    side: Side
+    drift: float
+    cv: float
+
+
+def worst_control(*reports: Report) -> ControlDrift | None:
+    worst: tuple[float, ControlDrift] | None = None
+    for report in reports:
+        if report.control is None:
+            continue
+        for side, control_side in report.control.sides.items():
+            if worst is not None and control_side.noise_floor <= worst[0]:
+                continue
+            drift = ControlDrift(
+                side=side,
+                drift=relative_shift(control_side.before.median, control_side.after.median),
+                cv=max(control_side.before.cv, control_side.after.cv),
+            )
+            worst = (control_side.noise_floor, drift)
+    return None if worst is None else worst[1]
+
+
+@dataclass(frozen=True)
 class GateResult:
     kind: GateKind
     lane: str
@@ -230,6 +258,8 @@ class GateResult:
     baseline_host: str
     candidate_host: str
     noise_floor: float
+    floor_bound: float
+    control: ControlDrift | None
     rows: list[GateRow]
     incomplete_headlines: list[str]
     unpaired_metrics: list[UnpairedMetric]
@@ -237,7 +267,20 @@ class GateResult:
     enforced: bool
 
     @property
+    def inconclusive(self) -> bool:
+        """The host could not resolve the comparison.
+
+        The floor is what the control workload says the machine moved by
+        during the run. Past the bound the gate holds a single row's
+        dispersion to, that movement hides any effect a change could have,
+        so no row gets a verdict: the run is rerun, not read.
+        """
+        return self.noise_floor > self.floor_bound
+
+    @property
     def regressions(self) -> list[GateRow]:
+        if self.inconclusive:
+            return []
         return [row for row in self.rows if row.regression]
 
     @property
@@ -250,11 +293,13 @@ class GateResult:
 
     @property
     def improvements(self) -> list[GateRow]:
+        if self.inconclusive:
+            return []
         return [row for row in self.rows if row.improvement]
 
     @property
     def headline_regressions(self) -> list[GateRow]:
-        return [row for row in self.rows if row.regression and row.headline]
+        return [row for row in self.regressions if row.headline]
 
 
 @dataclass(frozen=True)
@@ -422,6 +467,20 @@ def noise_floor(*reports: Report) -> float:
     return max((report.control.noise_floor if report.control else 0.0) for report in reports)
 
 
+def blocks(enforced: bool, floor: float, bound: float, incomplete: list[str], rows: list[GateRow]) -> bool:
+    """Whether an enforced comparison fails the check.
+
+    A floor past the bound blocks before any row is read: the host was too
+    noisy to measure the change, and a green check on such a run would let
+    a real regression through as noise.
+    """
+    if not enforced:
+        return False
+    if floor > bound:
+        return True
+    return bool(incomplete) or any(row.regression and row.headline for row in rows)
+
+
 def short(sha: str | None) -> str:
     return sha[:12] if sha else "unknown"
 
@@ -444,7 +503,8 @@ def evaluate(baseline: Report, candidate: Report) -> GateResult:
         if not comparable(base_cell, cand_cell):
             continue
         pairs.append((workload, base_cell, cand_cell))
-    rows, unpaired = gate_rows(pairs, floor, candidate.thresholds.cv_bound)
+    bound = candidate.thresholds.cv_bound
+    rows, unpaired = gate_rows(pairs, floor, bound)
     # Two runs of one lane are two machines as often as they are one
     # machine twice, and the run record is where that is visible.
     enforced = (
@@ -462,10 +522,12 @@ def evaluate(baseline: Report, candidate: Report) -> GateResult:
         baseline_host=baseline.hardware.cpu,
         candidate_host=candidate.hardware.cpu,
         noise_floor=floor,
+        floor_bound=bound,
+        control=worst_control(baseline, candidate),
         rows=rows,
         incomplete_headlines=[],
         unpaired_metrics=unpaired,
-        blocking=enforced and any(row.regression and row.headline for row in rows),
+        blocking=blocks(enforced, floor, bound, [], rows),
         enforced=enforced,
     )
 
@@ -521,7 +583,8 @@ def evaluate_paired(candidate: Report) -> GateResult | None:
                 incomplete_headlines.append(workload.name)
             continue
         pairs.append((workload, base_cell, cand_cell))
-    rows, unpaired = gate_rows(pairs, floor, candidate.thresholds.cv_bound)
+    bound = candidate.thresholds.cv_bound
+    rows, unpaired = gate_rows(pairs, floor, bound)
     return GateResult(
         kind=GateKind.PAIRED,
         lane=candidate.run.lane,
@@ -542,10 +605,12 @@ def evaluate_paired(candidate: Report) -> GateResult | None:
         baseline_host=candidate.hardware.cpu,
         candidate_host=candidate.hardware.cpu,
         noise_floor=floor,
+        floor_bound=bound,
+        control=worst_control(candidate),
         rows=rows,
         incomplete_headlines=incomplete_headlines,
         unpaired_metrics=unpaired,
-        blocking=bool(incomplete_headlines) or any(row.regression and row.headline for row in rows),
+        blocking=blocks(True, floor, bound, incomplete_headlines, rows),
         enforced=True,
     )
 
