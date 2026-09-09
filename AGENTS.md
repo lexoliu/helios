@@ -438,6 +438,9 @@ guest program, and the three bare-metal targets.
 test (`kernel/tests/`) that enforces §1. The recipe names each integration
 test with `--test <name>`, so a new enforcement test is added to the recipe
 in the same change or it never runs.
+Both recipes run through `cargo nextest run` under `.config/nextest.toml`:
+one process per test, so a test that hangs is killed after its slow-timeout
+and reported by name instead of stalling the lane.
 
 CI (`.github/workflows/ci.yml`) runs the same recipes, one lane each, so a
 red lane names the surface that broke:
@@ -504,7 +507,7 @@ them from colliding:
   is the orchestrator's or the maintainer's action.
 - A delegated agent runs the per-crate checks for the crates it touched
   (`cargo check -p`, `cargo clippy -p … --all-targets -D warnings`,
-  `cargo test -p <crate>` with every target and never `--lib` alone, because
+  `cargo nextest run -p <crate>` with every target and never `--lib` alone, because
   the integration tests are where a crate's enforcement tests live, the
   relevant `just check-target`, file-scoped rustfmt). The workspace-wide
   lint and test suite is CI's job; running it locally as well pays the same

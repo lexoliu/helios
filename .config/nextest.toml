@@ -1,0 +1,10 @@
+# Runner profile for `just test-units` and `just test-embedded-debugger`, local
+# and in CI. nextest runs every test in its own process across all cores, so
+# a hang is attributed to one test name instead of stalling a lane until its
+# 90-minute timeout.
+
+[profile.default]
+# The slowest test in the tree takes 0.6 s. A test still running after the
+# third period is killed and reported as a failure: a lost wake-up (AGENTS.md
+# §4) becomes a named failure in three minutes rather than a lane timeout.
+slow-timeout = { period = "60s", terminate-after = 3 }

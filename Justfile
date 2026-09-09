@@ -100,10 +100,10 @@ test-units:
         --profile "{{default_profile}}" \
         --cargo cargo
     export HELIOS_KERNEL_PREBUILD_MANIFEST="${out_dir}/kernel-prebuild.json"
-    cargo test -p helios-hal -p helios-virtio -p helios-netstack -p helios-kernel --lib
-    cargo test -p helios-workspace-root --lib
-    cargo test -p helios-inspector-protocol --lib
-    cargo test -p helios-kernel --test hal_layering
+    cargo nextest run -p helios-hal -p helios-virtio -p helios-netstack -p helios-kernel --lib
+    cargo nextest run -p helios-workspace-root --lib
+    cargo nextest run -p helios-inspector-protocol --lib
+    cargo nextest run -p helios-kernel --test hal_layering
     python3 "{{repo_root}}/x86/tests/interrupt_state.py"
 
 # Generate the kernel-prebuild manifest for `target` and run `cargo clippy`
@@ -199,7 +199,7 @@ test-embedded-debugger:
         --profile "{{default_profile}}" \
         --cargo cargo
     HELIOS_KERNEL_PREBUILD_MANIFEST="${out_dir}/kernel-prebuild.json" \
-        cargo test -p helios-hosted init_program::tests::embedded_debugger_ -- --nocapture
+        cargo nextest run -p helios-hosted --no-capture init_program::tests::embedded_debugger_
 
 # Unit tests and lint of the benchmark-suite tooling (tools/bench); no benchmark runs.
 check-bench-tools:
