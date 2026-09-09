@@ -57,6 +57,7 @@ jobs:
       - uses: ./helios/.github/actions/checkout-wasmtime
       - name: Install host dependencies
         run: |
+          sudo rm -f /etc/apt/sources.list.d/google-chrome*
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libudev-dev just cmake ninja-build
@@ -98,6 +99,7 @@ jobs:
       - uses: ./helios/.github/actions/checkout-wasmtime
       - name: Install host dependencies
         run: |
+          sudo rm -f /etc/apt/sources.list.d/google-chrome*
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libudev-dev just cmake ninja-build \
@@ -353,6 +355,7 @@ jobs:
       - uses: ./helios/.github/actions/checkout-wasmtime
       - name: Install host dependencies
         run: |
+          sudo rm -f /etc/apt/sources.list.d/google-chrome*
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libudev-dev just cmake ninja-build \
@@ -520,6 +523,7 @@ jobs:
       - uses: ./helios/.github/actions/checkout-wasmtime
       - name: Install host dependencies
         run: |
+          sudo rm -f /etc/apt/sources.list.d/google-chrome*
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libudev-dev just cmake ninja-build \
@@ -768,6 +772,7 @@ jobs:
       - uses: ./helios/.github/actions/checkout-wasmtime
       - name: Install host dependencies
         run: |
+          sudo rm -f /etc/apt/sources.list.d/google-chrome*
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libudev-dev just cmake ninja-build \
