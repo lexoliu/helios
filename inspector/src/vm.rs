@@ -5314,6 +5314,8 @@ mod tests {
                 run_wait_seconds: 0,
                 input: None,
                 input_interval_ms: 0,
+                kill_instance: None,
+                kill_settle_ms: 0,
             })
             .qmp_action(),
             Some("screendump")
@@ -6306,7 +6308,7 @@ mod tests {
             .socket_path()
             .to_str()
             .ok_or(GuestTestFailure::SocketPathNotUtf8)?;
-        let mut client = connect_client(socket, DEFAULT_BAUD, true).map_err(|source| {
+        let client = connect_client(socket, DEFAULT_BAUD, true).map_err(|source| {
             GuestTestFailure::Connect {
                 purpose: "shell",
                 source,
@@ -6317,7 +6319,7 @@ mod tests {
             crate::runtime::timeout(
                 DIRECT_EXEC_TIMEOUT,
                 crate::programs::exec(
-                    &mut client,
+                    &client,
                     crate::programs::REMOTE_SHELL_PATH,
                     &[
                         "-c".to_owned(),

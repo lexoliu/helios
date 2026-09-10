@@ -322,11 +322,7 @@ pub(crate) fn run_connected(
             Ok(stats_tui::run(&mut client).await?)
         }),
         SessionCommand::Instances(command) => run_interruptible(async move {
-            let mut client = client;
-            Ok(
-                system::run_instances(&mut client, command.kill, command.kill_name.as_deref())
-                    .await?,
-            )
+            Ok(system::run_instances(&client, command.kill, command.kill_name.as_deref()).await?)
         }),
         SessionCommand::Repl => Ok(repl::run(client)?),
     }

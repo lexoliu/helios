@@ -14,9 +14,11 @@
 //!   surfaces it holds.
 //!
 //! The compositor itself is a user-mode wasm program like any other. It
-//! is reached through a [`crate::ProviderSlot`], the way
-//! `wasi:http/client.send` reaches the `http-client` plugin, and the
-//! supervisor on the other end of that slot is what calls into it.
+//! is reached through a [`crate::ProviderSlot`], the same write-once
+//! typed hand-off the HTTP client plugin is reached through, and the
+//! supervisor on the other end of that slot is what calls into it. Which
+//! protocol names that slot carries is the adapter's business, not this
+//! module's.
 //!
 //! # Where the pixels are
 //!

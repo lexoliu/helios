@@ -69,7 +69,7 @@ clippy-host:
         --workspace --all-targets \
         --exclude helios \
         --exclude helios-aarch64 --exclude helios-riscv --exclude helios-x86 \
-        --exclude helios-compositor \
+        --exclude helios-compositor --exclude helios-desktop-text-check \
         --exclude helios-date --exclude helios-debugger --exclude helios-display-test \
         --exclude helios-http-client \
         --exclude helios-init --exclude helios-input-test \
@@ -84,8 +84,11 @@ clippy-programs:
     set -euo pipefail
     # One program per invocation: they select mutually exclusive
     # `helios-api` worlds, and a single invocation covering several of
-    # them would unify those features and fail to build.
-    for package in helios-compositor helios-date helios-debugger helios-display-test helios-http-client \
+    # them would unify those features and fail to build. The desktop's
+    # pixel check is here for the same reason rather than because it is
+    # a guest program: it links the compositor's own modules, so it
+    # selects the compositor's world too.
+    for package in helios-compositor helios-desktop-text-check helios-date helios-debugger helios-display-test helios-http-client \
         helios-init helios-input-test helios-oob-load helios-perf helios-ping \
         helios-procbench helios-sched-tasks; do
         cargo clippy -p "${package}" --all-targets -- -D warnings
