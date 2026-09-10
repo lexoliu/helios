@@ -319,6 +319,11 @@ window, or the wallpaper, which has no keyboard at all. Nothing else
 moves focus — there is no click to raise and no shortcut to cycle — and a
 change of focus damages only the two borders that changed colour.
 
+The rule holds from before the pointer's first report: the cursor plane
+starts at the mode's centre, and whatever lies under that has the
+keyboard already, so a terminal there is typed into without the mouse
+ever moving.
+
 Keys become bytes through one layout table indexed by evdev's own codes,
 because those codes are the keys' positions on the board. The terminal
 echoes what it is typed itself: there is no line discipline between the
