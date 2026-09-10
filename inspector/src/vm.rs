@@ -661,8 +661,53 @@ enum VmBalloonProfile {
 /// not ask for one boots the machine it booted before.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VmDisplayProfile {
-    VirtioGpuMmio,
-    VirtioGpuPci,
+    Mmio,
+    Pci,
+    /// The GL device: the same transport carrying a virglrenderer or
+    /// Venus renderer behind it.
+    GlMmio,
+    GlPci,
+    /// The rutabaga-gfx device: gfxstream and Venus capsets without a
+    /// host GL context.
+    RutabagaMmio,
+    RutabagaPci,
+}
+
+impl VmDisplayProfile {
+    /// Whether the device this profile names sits on the PCI bus.
+    const fn is_pci(self) -> bool {
+        matches!(self, Self::Pci | Self::GlPci | Self::RutabagaPci)
+    }
+
+    /// The same transport carrying the renderer the session asked for.
+    const fn with_renderer(self, renderer: VmGpuRenderer) -> Self {
+        match (self.is_pci(), renderer) {
+            (false, VmGpuRenderer::Gl) => Self::GlMmio,
+            (true, VmGpuRenderer::Gl) => Self::GlPci,
+            (false, VmGpuRenderer::Rutabaga) => Self::RutabagaMmio,
+            (true, VmGpuRenderer::Rutabaga) => Self::RutabagaPci,
+        }
+    }
+}
+
+/// Which renderer a desktop machine's GPU speaks to the guest's 3D
+/// contexts, when a session asks for one.
+///
+/// The values are QEMU's own device families rather than invented
+/// names: a renderer this host's QEMU was not built with is refused by
+/// QEMU, naming itself, rather than swapped for another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum VmGpuRenderer {
+    /// `virtio-gpu-gl` with `venus=on`: Venus through virglrenderer.
+    #[value(name = "virtio-gpu-gl")]
+    #[serde(rename = "virtio-gpu-gl")]
+    Gl,
+    /// `virtio-gpu-rutabaga` with `venus=on` and `gfxstream-vulkan=on`:
+    /// both renderer capsets rutabaga-gfx can publish.
+    #[value(name = "virtio-gpu-rutabaga")]
+    #[serde(rename = "virtio-gpu-rutabaga")]
+    Rutabaga,
 }
 
 /// How a profile exposes the guest's keyboard, tablet and mouse.
@@ -882,7 +927,7 @@ const AARCH64_VIRT_HVF_PROFILE: VmProfile = VmProfile {
     acpi_machine: Some(AARCH64_VIRT_ACPI_MACHINE),
     iommu: None,
     balloon: VmBalloonProfile::VirtioBalloonMmio,
-    display: VmDisplayProfile::VirtioGpuMmio,
+    display: VmDisplayProfile::Mmio,
     input: VmInputProfile::VirtioInputMmio,
     sound: VmSoundProfile::VirtioSoundMmio,
     vsock: VmVsockProfile::VhostVsockMmio,
@@ -916,7 +961,7 @@ const AARCH64_VIRT_TCG_PROFILE: VmProfile = VmProfile {
     acpi_machine: Some(AARCH64_VIRT_ACPI_MACHINE),
     iommu: None,
     balloon: VmBalloonProfile::VirtioBalloonMmio,
-    display: VmDisplayProfile::VirtioGpuMmio,
+    display: VmDisplayProfile::Mmio,
     input: VmInputProfile::VirtioInputMmio,
     sound: VmSoundProfile::VirtioSoundMmio,
     vsock: VmVsockProfile::VhostVsockMmio,
@@ -949,7 +994,7 @@ const RISCV64_VM_PROFILE: VmProfile = VmProfile {
     acpi_machine: None,
     iommu: None,
     balloon: VmBalloonProfile::VirtioBalloonMmio,
-    display: VmDisplayProfile::VirtioGpuMmio,
+    display: VmDisplayProfile::Mmio,
     input: VmInputProfile::VirtioInputMmio,
     sound: VmSoundProfile::VirtioSoundMmio,
     vsock: VmVsockProfile::VhostVsockMmio,
@@ -979,7 +1024,7 @@ const X86_64_VM_PROFILE: VmProfile = VmProfile {
     acpi_machine: None,
     iommu: Some(VmIommuProfile::VirtioIommuPci),
     balloon: VmBalloonProfile::VirtioBalloonPci,
-    display: VmDisplayProfile::VirtioGpuPci,
+    display: VmDisplayProfile::Pci,
     input: VmInputProfile::VirtioInputPci,
     sound: VmSoundProfile::VirtioSoundPci,
     vsock: VmVsockProfile::VhostVsockPci,
@@ -1088,16 +1133,29 @@ pub(crate) enum VmDisplayBackend {
     Cocoa,
     Gtk,
     Sdl,
+    /// A headless EGL surface: how a Linux runner with no window system
+    /// gives a virtio-gpu-gl device the GL context Venus renders
+    /// through.
+    EglHeadless,
 }
 
 impl VmDisplayBackend {
     /// The token QEMU's `-display` takes.
-    fn token(self) -> &'static str {
+    ///
+    /// `renderer` is whether the session's GPU carries one: a GL device
+    /// has no context to render into on a headless backend unless the
+    /// display is asked for one, so `egl-headless` becomes
+    /// `egl-headless,gl=on` only then. Every other token is unchanged —
+    /// `none` stays `none`, and the windowed backends carry no `gl`
+    /// flag because QEMU derives it from the device.
+    fn token(self, renderer: Option<VmGpuRenderer>) -> &'static str {
         match self {
             Self::None => "none",
             Self::Cocoa => "cocoa",
             Self::Gtk => "gtk",
             Self::Sdl => "sdl",
+            Self::EglHeadless if renderer.is_some() => "egl-headless,gl=on",
+            Self::EglHeadless => "egl-headless",
         }
     }
 }
@@ -1259,6 +1317,8 @@ pub(crate) struct VmConfigFile {
     pub(crate) desktop: Option<bool>,
     #[serde(default)]
     pub(crate) display: Option<VmDisplayBackend>,
+    #[serde(default)]
+    pub(crate) renderer: Option<VmGpuRenderer>,
     #[serde(default)]
     pub(crate) audiodev: Option<String>,
     #[serde(default)]
@@ -1467,6 +1527,16 @@ pub(crate) struct VmCommand {
     /// another.
     #[arg(long, value_enum)]
     display: Option<VmDisplayBackend>,
+
+    /// Give the desktop's GPU a renderer: `virtio-gpu-gl` for Venus
+    /// through virglrenderer, `virtio-gpu-rutabaga` for Venus and
+    /// gfxstream through rutabaga-gfx.
+    ///
+    /// Implies `--desktop`, because the renderer is a property of the
+    /// display device itself. A renderer this host's QEMU was not built
+    /// with is refused by QEMU rather than swapped for another.
+    #[arg(long, value_enum)]
+    renderer: Option<VmGpuRenderer>,
 
     /// Host audio backend the guest's sound device plays into:
     /// `none`, `wav:<path>`, or a backend of this host's own.
@@ -1760,6 +1830,7 @@ struct ResolvedVmCommand {
     iommu: bool,
     desktop: bool,
     display: VmDisplayBackend,
+    renderer: Option<VmGpuRenderer>,
     audiodev: VmAudioDev,
     virtio_devices: VirtioDeviceProfile,
     rpc_transport: VmRpcTransport,
@@ -2233,7 +2304,10 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
             arch: arch_label(arch),
         });
     }
-    let desktop = command.desktop || file.desktop.unwrap_or(false);
+    let renderer = command.renderer.or(file.renderer);
+    // A named renderer is a property of the desktop's display device,
+    // so asking for one is asking for the desktop it lives on.
+    let desktop = command.desktop || file.desktop.unwrap_or(false) || renderer.is_some();
     let display = command.display.or(file.display).unwrap_or_default();
     let audiodev = match command.audiodev.or(file.audiodev) {
         Some(text) => VmAudioDev::parse(&text)?,
@@ -2295,6 +2369,7 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
         iommu,
         desktop,
         display,
+        renderer,
         audiodev,
         virtio_devices,
         rpc_transport,
@@ -4124,7 +4199,8 @@ impl VmRuntime {
             Some(qemu_net) => qemu_net.command(&command.qemu_bin),
             None => Command::new(&command.qemu_bin),
         };
-        qemu.arg("-display").arg(command.display.token());
+        qemu.arg("-display")
+            .arg(command.display.token(command.renderer));
         if let Some(monitor) = monitor_endpoint(command, socket_dir.path())? {
             qemu.arg("-monitor").arg(monitor);
         } else {
@@ -4275,7 +4351,11 @@ impl VmRuntime {
         configure_entropy_device(&mut qemu, command.profile.entropy, command.virtio_devices);
         configure_balloon(&mut qemu, command.profile.balloon, command.virtio_devices);
         if command.desktop {
-            configure_display(&mut qemu, command.profile.display, command.virtio_devices);
+            let display = match command.renderer {
+                Some(renderer) => command.profile.display.with_renderer(renderer),
+                None => command.profile.display,
+            };
+            configure_display(&mut qemu, display, command.virtio_devices);
             configure_input(&mut qemu, command.profile.input, command.virtio_devices);
         }
         configure_sound(
@@ -4929,18 +5009,35 @@ fn configure_vsock_device(
 /// display device the guest never drove is worse than no capture: it
 /// looks exactly like one the guest failed to draw into.
 fn configure_display(qemu: &mut Command, display: VmDisplayProfile, queues: VirtioDeviceProfile) {
-    if display == VmDisplayProfile::VirtioGpuPci {
+    if display.is_pci() {
         qemu.arg("-vga").arg("none");
     }
     let mut device = QemuOptions::new(match display {
-        VmDisplayProfile::VirtioGpuMmio => "virtio-gpu-device",
-        VmDisplayProfile::VirtioGpuPci => "virtio-gpu-pci",
+        VmDisplayProfile::Mmio => "virtio-gpu-device",
+        VmDisplayProfile::Pci => "virtio-gpu-pci",
+        VmDisplayProfile::GlMmio => "virtio-gpu-gl-device",
+        VmDisplayProfile::GlPci => "virtio-gpu-gl-pci",
+        VmDisplayProfile::RutabagaMmio => "virtio-gpu-rutabaga-device",
+        VmDisplayProfile::RutabagaPci => "virtio-gpu-rutabaga-pci",
     });
-    apply_transport(
-        display == VmDisplayProfile::VirtioGpuPci,
-        queues,
-        &mut device,
-    );
+    match display {
+        VmDisplayProfile::Mmio | VmDisplayProfile::Pci => {}
+        VmDisplayProfile::GlMmio | VmDisplayProfile::GlPci => {
+            // Venus through virglrenderer; blob resources are what the
+            // renderer's own memory moves through, and `hostmem` is the
+            // aperture a host-visible blob is placed into.
+            device.set("venus", "on");
+            device.set("blob", "on");
+            device.set("hostmem", "256M");
+        }
+        VmDisplayProfile::RutabagaMmio | VmDisplayProfile::RutabagaPci => {
+            device.set("venus", "on");
+            device.set("gfxstream-vulkan", "on");
+            device.set("blob", "on");
+            device.set("hostmem", "256M");
+        }
+    }
+    apply_transport(display.is_pci(), queues, &mut device);
     qemu.arg("-device").arg(device.to_string());
 }
 
@@ -5198,7 +5295,7 @@ mod tests {
         assert_eq!(
             rendered(|qemu| configure_display(
                 qemu,
-                VmDisplayProfile::VirtioGpuMmio,
+                VmDisplayProfile::Mmio,
                 VirtioDeviceProfile::default()
             )),
             ["-device", "virtio-gpu-device"]
@@ -5206,10 +5303,60 @@ mod tests {
         assert_eq!(
             rendered(|qemu| configure_display(
                 qemu,
-                VmDisplayProfile::VirtioGpuPci,
+                VmDisplayProfile::Pci,
                 VirtioDeviceProfile::default()
             )),
             ["-vga", "none", "-device", "virtio-gpu-pci"]
+        );
+    }
+
+    /// A renderer the session asked for changes which device the
+    /// machine gets, on the same transport its profile picked: QEMU's
+    /// own `venus`/`gfxstream-vulkan`/`blob`/`hostmem` options carry the
+    /// 3D device, and a QEMU built without them refuses by name.
+    #[test]
+    fn a_named_renderer_changes_the_display_device() {
+        assert_eq!(
+            rendered(|qemu| configure_display(
+                qemu,
+                VmDisplayProfile::GlMmio,
+                VirtioDeviceProfile::default()
+            )),
+            [
+                "-device",
+                "virtio-gpu-gl-device,venus=on,blob=on,hostmem=256M"
+            ]
+        );
+        assert_eq!(
+            rendered(|qemu| configure_display(
+                qemu,
+                VmDisplayProfile::RutabagaPci,
+                VirtioDeviceProfile::default()
+            )),
+            [
+                "-vga",
+                "none",
+                "-device",
+                "virtio-gpu-rutabaga-pci,venus=on,gfxstream-vulkan=on,blob=on,hostmem=256M"
+            ]
+        );
+    }
+
+    /// The renderer selects the device on whatever transport the
+    /// profile's own display adapter uses.
+    #[test]
+    fn a_named_renderer_keeps_the_profile_transport() {
+        assert_eq!(
+            AARCH64_VIRT_HVF_PROFILE
+                .display
+                .with_renderer(VmGpuRenderer::Gl),
+            VmDisplayProfile::GlMmio
+        );
+        assert_eq!(
+            X86_64_VM_PROFILE
+                .display
+                .with_renderer(VmGpuRenderer::Rutabaga),
+            VmDisplayProfile::RutabagaPci
         );
     }
 
@@ -5301,11 +5448,11 @@ mod tests {
     #[test]
     fn every_profile_names_the_desktop_bus_its_other_devices_use() {
         for profile in [&AARCH64_VIRT_HVF_PROFILE, &RISCV64_VM_PROFILE] {
-            assert_eq!(profile.display, VmDisplayProfile::VirtioGpuMmio);
+            assert_eq!(profile.display, VmDisplayProfile::Mmio);
             assert_eq!(profile.input, VmInputProfile::VirtioInputMmio);
             assert_eq!(profile.sound, VmSoundProfile::VirtioSoundMmio);
         }
-        assert_eq!(X86_64_VM_PROFILE.display, VmDisplayProfile::VirtioGpuPci);
+        assert_eq!(X86_64_VM_PROFILE.display, VmDisplayProfile::Pci);
         assert_eq!(X86_64_VM_PROFILE.input, VmInputProfile::VirtioInputPci);
         assert_eq!(X86_64_VM_PROFILE.sound, VmSoundProfile::VirtioSoundPci);
     }
@@ -5315,10 +5462,29 @@ mod tests {
     #[test]
     fn the_display_backend_defaults_to_none() {
         assert_eq!(VmDisplayBackend::default(), VmDisplayBackend::None);
-        assert_eq!(VmDisplayBackend::None.token(), "none");
-        assert_eq!(VmDisplayBackend::Cocoa.token(), "cocoa");
-        assert_eq!(VmDisplayBackend::Gtk.token(), "gtk");
-        assert_eq!(VmDisplayBackend::Sdl.token(), "sdl");
+        assert_eq!(VmDisplayBackend::None.token(None), "none");
+        assert_eq!(VmDisplayBackend::Cocoa.token(None), "cocoa");
+        assert_eq!(VmDisplayBackend::Gtk.token(None), "gtk");
+        assert_eq!(VmDisplayBackend::Sdl.token(None), "sdl");
+        assert_eq!(VmDisplayBackend::EglHeadless.token(None), "egl-headless");
+    }
+
+    /// A headless GL context exists only because a renderer needs it:
+    /// `egl-headless` gains `gl=on` with one and stays itself without.
+    #[test]
+    fn egl_headless_carries_gl_only_for_a_renderer() {
+        assert_eq!(
+            VmDisplayBackend::EglHeadless.token(Some(VmGpuRenderer::Gl)),
+            "egl-headless,gl=on"
+        );
+        assert_eq!(
+            VmDisplayBackend::None.token(Some(VmGpuRenderer::Gl)),
+            "none"
+        );
+        assert_eq!(
+            VmDisplayBackend::Cocoa.token(Some(VmGpuRenderer::Gl)),
+            "cocoa"
+        );
     }
 
     #[test]
@@ -6104,6 +6270,7 @@ mod tests {
             virtio_in_order: false,
             desktop: false,
             display: None,
+            renderer: None,
             audiodev: None,
             network: default_network_args(),
             command: None,
@@ -6161,6 +6328,7 @@ mod tests {
             virtio_in_order: false,
             desktop: false,
             display: None,
+            renderer: None,
             audiodev: None,
             network: default_network_args(),
             command: None,
@@ -6297,6 +6465,7 @@ mod tests {
             virtio_in_order: false,
             desktop: false,
             display: None,
+            renderer: None,
             audiodev: None,
             network: default_network_args(),
             command: None,
@@ -6415,6 +6584,7 @@ mod tests {
             iommu: false,
             desktop: false,
             display: VmDisplayBackend::None,
+            renderer: None,
             audiodev: VmAudioDev::None,
             needs_qmp: false,
             virtio_devices: VirtioDeviceProfile::default(),
@@ -6621,6 +6791,7 @@ mod tests {
             iommu: false,
             desktop: false,
             display: VmDisplayBackend::None,
+            renderer: None,
             audiodev: VmAudioDev::None,
             needs_qmp: false,
             virtio_devices: VirtioDeviceProfile::default(),
