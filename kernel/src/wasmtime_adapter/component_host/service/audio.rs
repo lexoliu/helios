@@ -39,7 +39,7 @@ use wasmtime::component::{
 use crate::ComponentHostNetwork;
 use crate::audio::{
     AudioSender, AudioServiceError, Feedback, FeedbackReader, PeriodRing, PeriodWriter,
-    PlaybackFormat,
+    PlaybackFormat, Written,
 };
 use crate::wasmtime_adapter::bindings::audio::bindings::helios::system::audio as audio_wit;
 
@@ -321,11 +321,15 @@ impl<T: 'static> StreamProducer<T> for FeedbackStreamProducer {
             return Poll::Ready(Ok(StreamResult::Cancelled));
         }
         match self.feedback.poll_burst(cx) {
-            Poll::Ready(burst) => {
+            Poll::Ready(Some(burst)) => {
                 let items: Vec<Self::Item> = burst.into_iter().map(to_wit_feedback).collect();
                 destination.set_buffer(VecBuffer::from(items));
                 Poll::Ready(Ok(StreamResult::Completed))
             }
+            // The stream stopped and everything it published has been
+            // read. Ending the guest's stream here is what lets a player
+            // read its feedback to the close and then finish.
+            Poll::Ready(None) => Poll::Ready(Ok(StreamResult::Dropped)),
             Poll::Pending => Poll::Pending,
         }
     }
@@ -400,7 +404,15 @@ impl<T: 'static> StreamConsumer<T> for SampleStreamConsumer {
             .expect("a batch was just taken from the guest's stream");
         while *offset < bytes.len() {
             match consumer.writer.poll_write(cx, &bytes[*offset..]) {
-                Poll::Ready(taken) => *offset += taken,
+                Poll::Ready(Written::Took(taken)) => *offset += taken,
+                // The stream was stopped, or the claim let go, under a
+                // player that is still writing. Nothing more will ever
+                // be taken, so the rest of this batch is dropped with
+                // the consumer rather than waited on.
+                Poll::Ready(Written::Ended) => {
+                    consumer.pending = None;
+                    return Poll::Ready(Ok(StreamResult::Dropped));
+                }
                 Poll::Pending => return Poll::Pending,
             }
         }

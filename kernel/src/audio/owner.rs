@@ -231,6 +231,8 @@ async fn finish_release<Device: PlaybackDevice>(device: &Device, shared: &Stream
         drop(pins);
     }
     shared.drain_feedback();
+    // A claim let go without ever playing still owes its reader an end.
+    shared.close_feedback();
     shared.claim.store(ClaimState::FREE, Ordering::Release);
     tracing::info!(
         target: "helios_kernel::audio",
@@ -301,9 +303,16 @@ async fn serve_negotiation<Device, CpuImpl>(
     }
     play(device, shared, &ring, params, timer).await;
     quiesce(device, shared).await;
-    if let Some(reply) = ring.take_stop_reply() {
-        let _ = reply.send(Ok(()));
-    }
+    // The device has stopped and given back what it allocated, which is
+    // what a `stop` waits for. A player whose material simply ran out
+    // reaches this before it gets round to asking, so the answer is left
+    // on the ring rather than handed to whoever is waiting now.
+    ring.finish_teardown();
+    // Nothing will publish another period or another underrun for this
+    // stream, so its feedback ends here. A player reads it to the close
+    // to be sure it saw the last of it, and a close that never came
+    // would be a player that never finished.
+    shared.close_feedback();
 }
 
 async fn configure<Device: PlaybackDevice>(

@@ -70,7 +70,7 @@ pub use owner::install_audio_device;
 pub use service::{
     AudioClaim, AudioSender, AudioService, AudioStreamSnapshot, FEEDBACK_QUEUE_DEPTH, Feedback,
     FeedbackBurst, FeedbackReader, PERIOD_MICROS, PERIODS_IN_FLIGHT, PeriodRing, PeriodWriter,
-    PlaybackFormat,
+    PlaybackFormat, Written,
 };
 
 /// Why an audio request was refused.

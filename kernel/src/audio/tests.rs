@@ -9,10 +9,11 @@ use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::pin;
 use core::sync::atomic::{AtomicU32, Ordering};
-use core::task::Poll;
 
 use arrayvec::ArrayVec;
-use futures_lite::future::{block_on, poll_once};
+use futures::channel::oneshot;
+use futures::future::{Either, select};
+use futures_lite::future::{block_on, poll_once, yield_now};
 use helios_hal::audio::{
     AudioError, AudioEvent, AudioResult, ChannelMapList, JackList, PcmParams, PlaybackDevice,
     SampleFormat, SampleFormats, SampleRate, SampleRates, StreamDirection, StreamId, StreamInfo,
@@ -30,7 +31,7 @@ use crate::test_support::{ManualClockCpu, TestCpu};
 use super::owner::{drain_audio_events, play, serve_playback};
 use super::service::{
     AudioService, AudioShared, ClaimState, Feedback, PERIODS_IN_FLIGHT, PeriodWriter,
-    PlaybackFormat, PlaybackRequest, REQUEST_QUEUE_DEPTH, StreamShared,
+    PlaybackFormat, PlaybackRequest, REQUEST_QUEUE_DEPTH, StreamShared, Written,
 };
 use super::{AudioOwnership, AudioServiceError};
 
@@ -492,7 +493,8 @@ fn an_underrun_reaches_the_player_as_feedback_and_nothing_is_substituted() {
         );
     });
 
-    let burst = block_on(core::future::poll_fn(|cx| feedback.poll_burst(cx)));
+    let burst = block_on(core::future::poll_fn(|cx| feedback.poll_burst(cx)))
+        .expect("the stream is still publishing");
     assert_eq!(burst.as_slice(), &[Feedback::Xrun]);
     assert_eq!(
         device.played_bytes(),
@@ -560,7 +562,8 @@ fn every_period_the_device_takes_reports_its_latency() {
         assert!(ended, "the stream ends; the clock does not");
     });
 
-    let burst = block_on(core::future::poll_fn(|cx| feedback.poll_burst(cx)));
+    let burst = block_on(core::future::poll_fn(|cx| feedback.poll_burst(cx)))
+        .expect("the stream is still publishing");
     assert_eq!(
         burst.as_slice(),
         &[Feedback::LatencyBytes(640), Feedback::LatencyBytes(640)]
@@ -611,6 +614,185 @@ fn stream_of(service: &AudioService) -> &StreamShared {
     &shared_of(service).playback[0]
 }
 
+/// A `stop` asked for after the player's own material ran out is
+/// answered, rather than left waiting on a task that has already left
+/// the stream.
+///
+/// This is the ordinary end of a player and the order the two sides
+/// arrive in is not the player's to choose: dropping the sample writer
+/// closes the ring, the playback task stops the device and goes back to
+/// waiting for the next claim, and only then does the player get round
+/// to asking. Nobody is on the stream to hear it, so the ring answers.
+#[test]
+fn a_stop_asked_for_after_the_material_ran_out_is_answered() {
+    test_hooks::install();
+    let (service, inboxes) = service_of(&[playback_stream(0)]);
+    let mut audio = AudioOwnership::new();
+    audio
+        .claim(&service, 0, window())
+        .expect("the stream is free");
+    let (ring, params) = audio.negotiate(TONE).expect("the device takes this format");
+    let sender = audio
+        .claim_ref()
+        .expect("the claim was just taken")
+        .sender();
+
+    let device = ScriptedDevice::new(topology(&[playback_stream(0)]));
+    let timer = Timer::new(TestCpu::without_entropy());
+    let tone = alloc::vec![0x5a_u8; params.period_bytes as usize * 2];
+    let inbox = &inboxes[0];
+
+    let answered = block_on(async {
+        let player = async {
+            sender
+                .negotiate(params, ring.clone())
+                .await
+                .expect("the device takes this format");
+            let mut writer = PeriodWriter::new(ring.clone());
+            let mut offset = 0;
+            while offset < tone.len() {
+                offset += write_some(&mut writer, &tone[offset..]).await;
+            }
+            // What a guest dropping its sample writer does.
+            writer.finish();
+            // And then the task runs to the end of its teardown, which
+            // is where it is by the time a real player asks: the sample
+            // stream ends before `stop` is called, and everything the
+            // stop waits for has already happened.
+            while !ring.is_finished() {
+                yield_now().await;
+            }
+            let (reply, answer) = oneshot::channel();
+            ring.request_stop(reply);
+            answer.await
+        };
+        let served = pin!(serve_playback(&device, stream_of(&service), inbox, &timer));
+        match select(pin!(player), served).await {
+            Either::Left((answered, _)) => answered,
+            Either::Right(((), _)) => {
+                panic!("the playback task returned while a player still held the stream")
+            }
+        }
+    });
+    assert_eq!(
+        answered,
+        Ok(Ok(())),
+        "a stop that arrives after the teardown is answered by it"
+    );
+    assert_eq!(
+        device.started.load(Ordering::Acquire),
+        1,
+        "the tone reached the device before any of this"
+    );
+}
+
+/// A player's feedback ends when the stream it belongs to does.
+///
+/// Reading the feedback to its close is the only way a player can be
+/// sure it saw the last underrun, so a stream that stopped and left its
+/// feedback open is a player that never finishes.
+#[test]
+fn a_players_feedback_ends_when_the_stream_is_torn_down() {
+    test_hooks::install();
+    let (service, inboxes) = service_of(&[playback_stream(0)]);
+    let mut audio = AudioOwnership::new();
+    audio
+        .claim(&service, 0, window())
+        .expect("the stream is free");
+    let (ring, params) = audio.negotiate(TONE).expect("the device takes this format");
+    let claim = audio.claim_ref().expect("the claim was just taken");
+    let sender = claim.sender();
+    let mut feedback = claim.feedback();
+
+    let device = ScriptedDevice::new(topology(&[playback_stream(0)]));
+    let timer = Timer::new(TestCpu::without_entropy());
+    let tone = alloc::vec![0x5a_u8; params.period_bytes as usize * 2];
+    let inbox = &inboxes[0];
+
+    let items = block_on(async {
+        let player = async {
+            sender
+                .negotiate(params, ring.clone())
+                .await
+                .expect("the device takes this format");
+            let mut writer = PeriodWriter::new(ring.clone());
+            let mut offset = 0;
+            while offset < tone.len() {
+                offset += write_some(&mut writer, &tone[offset..]).await;
+            }
+            writer.finish();
+            let mut items = 0_usize;
+            while let Some(burst) = core::future::poll_fn(|cx| feedback.poll_burst(cx)).await {
+                items += burst.len();
+            }
+            items
+        };
+        let served = pin!(serve_playback(&device, stream_of(&service), inbox, &timer));
+        match select(pin!(player), served).await {
+            Either::Left((items, _)) => items,
+            Either::Right(((), _)) => {
+                panic!("the playback task returned while a player still held the stream")
+            }
+        }
+    });
+    assert_eq!(
+        items, 2,
+        "one item per period the device took, and then the end"
+    );
+}
+
+/// A `stop` asked for while a player is still writing ends that
+/// player's stream.
+///
+/// The alternative is worse than a truncated write: stopping the stream
+/// is what makes the playback task leave, so nothing is ever going to
+/// give the producer another period, and a producer that parked waiting
+/// for one would park for good.
+#[test]
+fn a_stop_mid_stream_ends_the_producer_rather_than_parking_it() {
+    test_hooks::install();
+    let (service, _inboxes) = service_of(&[playback_stream(0)]);
+    let mut audio = AudioOwnership::new();
+    audio
+        .claim(&service, 0, window())
+        .expect("the stream is free");
+    let (ring, params) = audio.negotiate(TONE).expect("the device takes this format");
+    let mut writer = PeriodWriter::new(ring.clone());
+    let period = alloc::vec![0x11_u8; params.period_bytes as usize];
+
+    block_on(async {
+        // Nothing is pumping the ring, so filling it is what puts the
+        // producer where a stop can strand it.
+        for _ in 0..PERIODS_IN_FLIGHT {
+            assert_eq!(write_some(&mut writer, &period).await, period.len());
+        }
+        assert_eq!(
+            poll_once(pin!(write_once(&mut writer, &period))).await,
+            None,
+            "a ring whose every period is with the device parks its producer"
+        );
+
+        let (reply, answer) = oneshot::channel();
+        ring.request_stop(reply);
+        assert_eq!(
+            poll_once(pin!(write_once(&mut writer, &period))).await,
+            Some(Written::Ended),
+            "a stopped ring ends its producer instead of parking it again"
+        );
+        // Nobody is serving the stream, so the answer is still owed; the
+        // task that stops the device is what sends it.
+        drop(answer);
+    });
+}
+
+/// One `poll_write`, whatever it comes to.
+fn write_once<'a>(
+    writer: &'a mut PeriodWriter,
+    bytes: &'a [u8],
+) -> impl Future<Output = Written> + 'a {
+    core::future::poll_fn(move |cx| writer.poll_write(cx, bytes))
+}
+
 /// One `poll_write` that has to make progress, which is what the
 /// producers above want: the ring is four periods deep and the pump is
 /// running beside them.
@@ -618,10 +800,12 @@ fn write_some<'a>(
     writer: &'a mut PeriodWriter,
     bytes: &'a [u8],
 ) -> impl Future<Output = usize> + 'a {
-    core::future::poll_fn(move |cx| match writer.poll_write(cx, bytes) {
-        Poll::Ready(taken) => Poll::Ready(taken),
-        Poll::Pending => Poll::Pending,
-    })
+    async move {
+        match write_once(writer, bytes).await {
+            Written::Took(taken) => taken,
+            Written::Ended => panic!("the ring ended under a producer that still had material"),
+        }
+    }
 }
 
 /// The claim word a released claim leaves behind, so a test can say

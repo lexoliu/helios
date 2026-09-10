@@ -246,6 +246,16 @@ pub struct PeriodRing {
     /// One slot: a claim is one instance's, and its store serves one
     /// host call at a time, so there is never a second stop to answer.
     stop: ConcurrentQueue<oneshot::Sender<Result<(), AudioServiceError>>>,
+    /// Set by the playback task once it has stopped the stream and let
+    /// the device release what it allocated.
+    ///
+    /// A `stop` is normally answered by that task. It does not have to
+    /// arrive first: a player whose material simply ran out ends the
+    /// ring, and the task tears the stream down and leaves before the
+    /// player gets round to asking. This word is what lets the late
+    /// caller answer itself instead of waiting for a task that is
+    /// already serving somebody else.
+    finished: AtomicBool,
     /// Bytes the producer has committed, which is what the device is
     /// asked to play.
     committed_bytes: AtomicU64,
@@ -283,6 +293,7 @@ impl PeriodRing {
             reclaimed: Notify::new(),
             closed: AtomicBool::new(false),
             stop: ConcurrentQueue::bounded(1),
+            finished: AtomicBool::new(false),
             committed_bytes: AtomicU64::new(0),
         }
     }
@@ -323,7 +334,8 @@ impl PeriodRing {
     ///
     /// Closing the ring is what the pump watches, so this is the whole
     /// of the request; the reply travels back when the task has stopped
-    /// the stream and let the device release what it allocated.
+    /// the stream and let the device release what it allocated — or
+    /// straight away, when it already has.
     pub fn request_stop(&self, reply: oneshot::Sender<Result<(), AudioServiceError>>) {
         // A second stop on the same ring answers the first caller and
         // waits for the same teardown, which is what a store serving one
@@ -335,11 +347,33 @@ impl PeriodRing {
             );
         }
         self.close();
+        // Queued before the test, never after: the teardown may have
+        // finished at any point up to here, and whichever of the two
+        // sides observes the other answers the caller. Both observing it
+        // is harmless — the second finds the queue empty.
+        if self.finished.load(Ordering::Acquire) {
+            self.answer_stops();
+        }
     }
 
-    /// The reply a stop is waiting for, if one asked.
-    pub fn take_stop_reply(&self) -> Option<oneshot::Sender<Result<(), AudioServiceError>>> {
-        self.stop.pop().ok()
+    /// Say that the device has stopped and given back what it allocated,
+    /// and answer every stop waiting on it.
+    ///
+    /// Called by the playback task, once, as it leaves the stream.
+    pub fn finish_teardown(&self) {
+        self.finished.store(true, Ordering::Release);
+        self.answer_stops();
+    }
+
+    /// Whether the playback task has finished tearing the stream down.
+    pub fn is_finished(&self) -> bool {
+        self.finished.load(Ordering::Acquire)
+    }
+
+    fn answer_stops(&self) {
+        while let Ok(reply) = self.stop.pop() {
+            let _ = reply.send(Ok(()));
+        }
     }
 
     /// A wait on the next commit, armed now.
@@ -442,6 +476,16 @@ impl PeriodRing {
     }
 }
 
+/// What one write into the period buffers came to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Written {
+    /// Bytes were taken, and the producer may keep writing.
+    Took(usize),
+    /// The ring is over — stopped, or the claim let go — and nothing
+    /// more will ever be taken from this producer.
+    Ended,
+}
+
 /// The producer's side of one playback session's period buffers.
 ///
 /// # Concurrency contract
@@ -482,9 +526,13 @@ impl PeriodWriter {
     /// Ready with how many bytes were taken, which is at least one;
     /// pending when every period is in the device's hands, in which case
     /// the wait is registered and one reclaimed period wakes it.
-    pub fn poll_write(&mut self, cx: &mut Context<'_>, bytes: &[u8]) -> Poll<usize> {
+    ///
+    /// [`Written::Ended`] once the ring has closed under the producer.
+    /// The device gives no further period back after that, so a producer
+    /// that parked instead would park for good.
+    pub fn poll_write(&mut self, cx: &mut Context<'_>, bytes: &[u8]) -> Poll<Written> {
         if bytes.is_empty() {
-            return Poll::Ready(0);
+            return Poll::Ready(Written::Took(0));
         }
         let period_bytes = self.ring.period_bytes();
         let mut taken = 0;
@@ -492,7 +540,11 @@ impl PeriodWriter {
             let (index, filled) = match self.current {
                 Some(current) => current,
                 None => match self.next_period(cx) {
-                    Poll::Ready(index) => (index, 0),
+                    Poll::Ready(Some(index)) => (index, 0),
+                    // The ring closed under this producer. Whatever it
+                    // handed over up to here is already committed, and
+                    // there is nothing left to wait on.
+                    Poll::Ready(None) => return Poll::Ready(Written::Ended),
                     // Every period is with the device. Anything already
                     // taken is committed and reported; a first pass that
                     // took nothing parks, which is the backpressure that
@@ -517,7 +569,7 @@ impl PeriodWriter {
             }
         }
         self.accepted += taken as u64;
-        Poll::Ready(taken)
+        Poll::Ready(Written::Took(taken))
     }
 
     /// End this writer's half of the stream.
@@ -538,13 +590,20 @@ impl PeriodWriter {
         self.ring.close();
     }
 
-    fn next_period(&mut self, cx: &mut Context<'_>) -> Poll<u8> {
+    /// The next period this producer may write into, `None` once the
+    /// ring has closed and no further period will come back.
+    fn next_period(&mut self, cx: &mut Context<'_>) -> Poll<Option<u8>> {
         loop {
             if let Some(index) = self.ring.take_free() {
-                return Poll::Ready(index);
+                return Poll::Ready(Some(index));
             }
             match self.ring.poll_reclaimed(cx, &mut self.waiter) {
                 Poll::Ready(()) => continue,
+                // The wait is registered before the close is read, and
+                // closing raises that same signal, so a ring that closed
+                // before this park is seen on the next pass rather than
+                // slept through.
+                Poll::Pending if self.ring.is_closed() => return Poll::Ready(None),
                 Poll::Pending => return Poll::Pending,
             }
         }
@@ -580,8 +639,17 @@ pub(super) struct StreamShared {
     pub(super) returned: ConcurrentQueue<AudioPins>,
     /// What the kernel has to say about the stream that is playing.
     feedback: ConcurrentQueue<Feedback>,
-    /// Raised once per feedback item published.
+    /// Raised once per feedback item published, and once when the
+    /// stream stops publishing.
     published: Notify,
+    /// Set while this stream may still publish feedback.
+    ///
+    /// A reader is handed the stream's own life: it parks while the
+    /// stream plays and ends once the playback task has left, because
+    /// nothing after that publishes another item. Without an end a
+    /// player that reads its feedback to the close — the only way to be
+    /// sure it saw the last underrun — would read for ever.
+    feedback_open: AtomicBool,
     /// Bytes the device has taken since boot.
     pub(super) played_bytes: AtomicU64,
     /// Underruns the device reported since boot.
@@ -601,6 +669,7 @@ impl StreamShared {
             returned: ConcurrentQueue::bounded(1),
             feedback: ConcurrentQueue::bounded(FEEDBACK_QUEUE_DEPTH),
             published: Notify::new(),
+            feedback_open: AtomicBool::new(true),
             played_bytes: AtomicU64::new(0),
             xruns: AtomicU64::new(0),
             lost_feedback: AtomicU64::new(0),
@@ -647,6 +716,23 @@ impl StreamShared {
     /// instance is handed feedback that was meant for the one before it.
     pub(super) fn drain_feedback(&self) {
         while self.feedback.pop().is_ok() {}
+    }
+
+    /// Say that this stream may publish again, for a claim that is about
+    /// to hold it.
+    pub(super) fn open_feedback(&self) {
+        self.feedback_open.store(true, Ordering::Release);
+    }
+
+    /// Say that nothing more will be published, and wake every reader so
+    /// that it sees the end rather than parking through it.
+    pub(super) fn close_feedback(&self) {
+        self.feedback_open.store(false, Ordering::Release);
+        self.published.notify_all();
+    }
+
+    fn feedback_is_open(&self) -> bool {
+        self.feedback_open.load(Ordering::Acquire)
     }
 
     fn snapshot(&self) -> AudioStreamSnapshot {
@@ -758,6 +844,7 @@ impl AudioService {
             .map_err(|_| AudioServiceError::AlreadyClaimed)?;
         let generation = stream.generation.fetch_add(1, Ordering::AcqRel) + 1;
         stream.drain_feedback();
+        stream.open_feedback();
         Ok(AudioClaim {
             shared: stream.clone(),
             generation,
@@ -903,7 +990,10 @@ pub type FeedbackBurst = ArrayVec<Feedback, FEEDBACK_QUEUE_DEPTH>;
 
 impl FeedbackReader {
     /// Every item queued right now, or a park until one is.
-    pub fn poll_burst(&mut self, cx: &mut Context<'_>) -> Poll<FeedbackBurst> {
+    ///
+    /// `None` once the stream has stopped publishing and everything it
+    /// did publish has been read, which is the end of the feedback.
+    pub fn poll_burst(&mut self, cx: &mut Context<'_>) -> Poll<Option<FeedbackBurst>> {
         loop {
             let mut burst = FeedbackBurst::new();
             while !burst.is_full() {
@@ -913,10 +1003,15 @@ impl FeedbackReader {
                 }
             }
             if !burst.is_empty() {
-                return Poll::Ready(burst);
+                return Poll::Ready(Some(burst));
             }
             match self.shared.published.poll_notified(cx, &mut self.waiter) {
                 Poll::Ready(()) => continue,
+                // The wait is registered before the end is read, and
+                // ending raises that same signal, so a stream that
+                // stopped between the drain and the park is seen on the
+                // next pass rather than slept through.
+                Poll::Pending if !self.shared.feedback_is_open() => return Poll::Ready(None),
                 Poll::Pending => return Poll::Pending,
             }
         }
