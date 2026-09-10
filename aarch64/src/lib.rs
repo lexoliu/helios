@@ -166,6 +166,7 @@ mod input;
 mod net;
 mod platform;
 mod rtc;
+mod snd;
 mod vsock;
 
 mod debug_state {
@@ -196,6 +197,7 @@ pub(crate) type DeviceInterruptRoutes = helios_kernel::ExternalInterruptRoutes<
     vsock::VirtioVsockDevice,
     gpu::VirtioDisplayDevice,
     input::VirtioInputDevice,
+    snd::VirtioSoundDevice,
     block::VirtioBlockDevice,
 >;
 
@@ -597,6 +599,9 @@ extern "C" fn aarch64_kernel_main() -> ! {
             "no virtio-input node on the platform bus; this machine has no input device"
         );
     }
+    if !snd::has_sound_device(&platform) {
+        tracing::info!("no virtio-snd node on the platform bus; this machine has no sound device");
+    }
     let block_device_count = block::count_block_devices(&platform);
     if block_device_count != 0 {
         devices = devices.with_block_devices(block_device_count);
@@ -756,6 +761,14 @@ extern "C" fn aarch64_kernel_main() -> ! {
             platform_state.bootstrap_mpidr(),
         );
         routes.add_input(device.interrupt, device.device);
+    }
+    if let Some(sound) = snd::install(&kernel, &platform, physical_memory_offset, &handoff) {
+        gic.enable_device_interrupt(
+            sound.interrupt,
+            sound.trigger,
+            platform_state.bootstrap_mpidr(),
+        );
+        routes.set_sound(sound.interrupt, sound.device);
     }
     for block in block::install(
         &cpu,

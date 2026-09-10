@@ -17,6 +17,7 @@ mod net;
 mod pci;
 mod rtc;
 mod smp;
+mod snd;
 mod vsock;
 mod watchdog;
 
@@ -223,6 +224,7 @@ fn x86_kernel_main() -> ! {
     let vsock_function = vsock::discover(&pci);
     let display_function = gpu::discover(&pci);
     let input_functions = input::discover(&pci);
+    let sound_function = snd::discover(&pci);
     let block_functions = block::discover(&pci);
     let mut devices = DeviceInventory::new().with_debug_serial();
     if network_function.is_some() {
@@ -300,6 +302,7 @@ fn x86_kernel_main() -> ! {
         vsock_function,
         display_function,
         &input_functions,
+        sound_function,
         &block_functions,
         &debug_state,
         root_entropy,
@@ -354,6 +357,7 @@ fn install_pci_devices<WatchdogImpl>(
     vsock_function: Option<pci_types::PciAddress>,
     display_function: Option<pci_types::PciAddress>,
     input_functions: &[pci_types::PciAddress],
+    sound_function: Option<pci_types::PciAddress>,
     block_functions: &[pci_types::PciAddress],
     debug_state: &debug_state::RuntimeState,
     root_entropy: helios_kernel::RootEntropyHandle,
@@ -495,6 +499,19 @@ fn install_pci_devices<WatchdogImpl>(
         debug_state,
     ) {
         routes.add_input(device.vector, device.device);
+    }
+    if let Some(address) = sound_function {
+        let device = snd::install(
+            kernel,
+            pci,
+            address,
+            dma_pool(address),
+            exceptions::SOUND_INTERRUPT_VECTOR,
+            destination_apic_id,
+        );
+        routes.set_sound(exceptions::SOUND_INTERRUPT_VECTOR, device);
+    } else {
+        tracing::info!("no virtio-snd function on the PCI bus; this machine has no sound device");
     }
     // The x86 address space reserves and commits lazily, so a page could
     // be taken away here — but the backend has not wired the other half:

@@ -13,6 +13,7 @@ mod iommu;
 mod panic_console;
 mod poll_registry;
 mod serial;
+mod sound;
 
 pub use block::{
     BlockInstallError, BlockSelfCheckError, BlockService, BlockStats, SCRATCH_DISK_SERIAL,
@@ -34,3 +35,4 @@ pub use poll_registry::{
     PollKey, PollRegistration, PollRegistry, PollRegistryError, PollSourceKind,
 };
 pub use serial::{SerialReader, read_serial, try_read_serial};
+pub use sound::install_sound_device;

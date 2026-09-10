@@ -756,6 +756,14 @@ jobs:
           grep -Fq 'display-test:cursor-set' "$runtime/inspector.log"
           grep -Eq 'display-test:frame sequence=[0-9]+ cursor=[0-9]+,[0-9]+' \
             "$runtime/inspector.log"
+          # The sound device `--audiodev` attached to this boot. The
+          # driver's own line is what says the device answered its three
+          # bring-up queries, and this is the only lane whose guest has a
+          # sound device at all (#305). The kernel writes its boot lines
+          # to the one UART the guest has, and `debug-serial.log` is the
+          # host's raw copy of it.
+          grep -Eq 'virtio-snd online transport=pci streams=[0-9]+ jacks=[0-9]+ rates=[0-9]+\.\.[0-9]+ formats=[A-Z0-9,]+' \
+            "$runtime/debug-serial.log"
           python3 tools/desktop/check-gradient.py \
             "$captures/drawn.png" "$captures/settled.png"
           # The pointer is a plane the capture does not hold, so the device's

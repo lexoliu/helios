@@ -19,6 +19,7 @@ mod p9;
 mod pci;
 mod queue;
 mod rng;
+mod snd;
 #[cfg(test)]
 mod testing;
 mod transport;
@@ -45,11 +46,12 @@ pub use input::VirtioInputDevice;
 pub use iommu::{MAX_RESERVED_REGIONS, ReservedRegion, VirtioIommuDevice};
 pub use mmio::{
     VirtioMmio9pDevice, VirtioMmioBalloonDevice, VirtioMmioBlockDevice, VirtioMmioGpuDevice,
-    VirtioMmioInputDevice, VirtioMmioNetDevice, VirtioMmioRngDevice, VirtioMmioVsockDevice,
-    balloon_from_mmio, balloon_from_mmio_with_dma, block_from_mmio, block_from_mmio_with_dma,
-    gpu_from_mmio, gpu_from_mmio_with_dma, input_from_mmio, input_from_mmio_with_dma,
-    net_from_mmio, net_from_mmio_with_dma, p9_from_mmio, p9_from_mmio_with_dma, rng_from_mmio,
-    rng_from_mmio_with_dma, vsock_from_mmio, vsock_from_mmio_with_dma,
+    VirtioMmioInputDevice, VirtioMmioNetDevice, VirtioMmioRngDevice, VirtioMmioSndDevice,
+    VirtioMmioVsockDevice, balloon_from_mmio, balloon_from_mmio_with_dma, block_from_mmio,
+    block_from_mmio_with_dma, gpu_from_mmio, gpu_from_mmio_with_dma, input_from_mmio,
+    input_from_mmio_with_dma, net_from_mmio, net_from_mmio_with_dma, p9_from_mmio,
+    p9_from_mmio_with_dma, rng_from_mmio, rng_from_mmio_with_dma, snd_from_mmio,
+    snd_from_mmio_with_dma, vsock_from_mmio, vsock_from_mmio_with_dma,
 };
 pub use net::{
     NotificationCoalescing, QueuePairProgress, RxDrain, RxFrame, TxChecksumMeta, TxGsoMeta,
@@ -59,10 +61,11 @@ pub use p9::Virtio9pDevice;
 pub use pci::{
     MsixBinding, PciMmioMapper, VIRTIO_PCI_VENDOR_ID, VirtioPciBus, VirtioPciTransport,
     balloon_from_pci, block_from_pci, gpu_from_pci, input_from_pci, iommu_from_pci, net_from_pci,
-    p9_from_pci, rng_from_pci, virtio_pci_device_type, vsock_from_pci,
+    p9_from_pci, rng_from_pci, snd_from_pci, virtio_pci_device_type, vsock_from_pci,
 };
 pub use queue::{MAX_CHAIN_BUFFERS, VirtQueue, VirtqueueError};
 pub use rng::VirtioRngDevice;
+pub use snd::VirtioSndDevice;
 pub use transport::{
     DeviceStatus, DeviceType, VirtioFeatures, VirtioMmioTransport, VirtioTransport,
 };

@@ -571,6 +571,48 @@ pub struct VirtQueue<T: VirtioTransport> {
 }
 
 impl<T: VirtioTransport> VirtQueue<T> {
+    /// Waits for `token`'s completion on a bring-up path and clears the
+    /// interrupt that completion raised.
+    ///
+    /// For the one moment a driver may spin on a ring: before the
+    /// executor exists, on the bootstrap processor, asking the device
+    /// what it is. The wait is the sub-microsecond descriptor completion
+    /// §4 allows a spin for; what makes the helper worth sharing is the
+    /// acknowledgement, which is the half that is easy to leave out and
+    /// impossible to notice here. Nothing on this path waits on an
+    /// interrupt, so a status register left set costs the bring-up
+    /// nothing at all. It costs everything afterwards: a virtio-mmio line
+    /// is edge-triggered, so a line that was raised and never lowered
+    /// cannot rise again, and every asynchronous request the driver
+    /// makes once the executor is running parks on an interrupt that can
+    /// no longer arrive (#336).
+    ///
+    /// Clearing whatever else is set costs nothing here: a configuration
+    /// change needs a device model somebody has already changed, and this
+    /// runs before the driver has told anybody the device exists.
+    ///
+    /// # Panics
+    ///
+    /// When the device completes a token other than `token`: on a
+    /// bring-up path the driver has exactly one request outstanding, so
+    /// any other completion is a device answering a request nobody made.
+    pub fn reap_blocking(&mut self, transport: &T, token: u16) -> u32 {
+        let written = loop {
+            match self.pop_used_with_len() {
+                Some((completed, written)) => {
+                    assert_eq!(
+                        completed, token,
+                        "a virtio device answered a bring-up request that was never issued"
+                    );
+                    break written;
+                }
+                None => core::hint::spin_loop(),
+            }
+        };
+        transport.ack_interrupt();
+        written
+    }
+
     /// Allocates and programs one virtqueue.
     ///
     /// `chain_limit` is the longest descriptor chain the owning driver

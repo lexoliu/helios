@@ -905,6 +905,28 @@ where
     Ok(device)
 }
 
+/// Builds a virtio-snd driver on top of a modern virtio-PCI function.
+///
+/// The device is asked what it is here, on the bring-up path, so that
+/// the line naming it also names what it can play.
+pub fn snd_from_pci<A, M, P>(
+    access: &A,
+    address: PciAddress,
+    mapper: &M,
+    dma: P,
+    msix: Option<MsixBinding>,
+) -> IoResult<crate::snd::VirtioSndDevice<VirtioPciTransport<P>>>
+where
+    A: ConfigRegionAccess,
+    M: PciMmioMapper,
+    P: DmaPool,
+{
+    let transport = VirtioPciTransport::new(access, address, mapper, dma, msix)?;
+    let device = crate::snd::VirtioSndDevice::new(transport)?;
+    crate::snd::report_snd_online(&device, "pci");
+    Ok(device)
+}
+
 /// Builds a virtio-vsock driver on top of a modern virtio-PCI function.
 pub fn vsock_from_pci<A, M, P>(
     access: &A,

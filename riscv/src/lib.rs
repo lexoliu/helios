@@ -12,6 +12,7 @@ mod input;
 mod net;
 mod pci;
 mod rtc;
+mod snd;
 mod vsock;
 mod watchdog;
 
@@ -681,6 +682,9 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
     if input::count_input_devices(&fdt) == 0 {
         tracing::info!("no virtio-input node in the device tree; this machine has no input device");
     }
+    if !snd::has_sound_device(&fdt) {
+        tracing::info!("no virtio-snd node in the device tree; this machine has no sound device");
+    }
     let kernel = helios_kernel::init_with_watchdog(
         helios_kernel::Platform::with_watchdog(
             console,
@@ -766,6 +770,9 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
             }
             for device in input::install(&kernel, &fdt, &debug_state) {
                 interrupts.attach_input(device);
+            }
+            if let Some(sound) = snd::install(&kernel, &fdt) {
+                interrupts.attach_sound(sound);
             }
             for block in block::install(&cpu, &kernel, &fdt, &debug_state, root_entropy) {
                 interrupts.attach_block(block);
