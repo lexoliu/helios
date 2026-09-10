@@ -1,5 +1,6 @@
 use bitflags::bitflags;
 use helios_hal::io::{IoError, IoResult};
+use helios_hal::iommu::PhysicalRange;
 
 use crate::bus::DeviceBus;
 
@@ -27,6 +28,14 @@ const REG_QUEUE_DRIVER_LOW: usize = 0x090;
 const REG_QUEUE_DRIVER_HIGH: usize = 0x094;
 const REG_QUEUE_DEVICE_LOW: usize = 0x0a0;
 const REG_QUEUE_DEVICE_HIGH: usize = 0x0a4;
+/// Shared-memory region selector and the four registers its answer is
+/// read out of (virtio 1.2 §4.2.2). A device that publishes no region
+/// under the selected id answers with a length of all ones.
+const REG_SHM_SEL: usize = 0x0ac;
+const REG_SHM_LEN_LOW: usize = 0x0b0;
+const REG_SHM_LEN_HIGH: usize = 0x0b4;
+const REG_SHM_BASE_LOW: usize = 0x0b8;
+const REG_SHM_BASE_HIGH: usize = 0x0bc;
 const CONFIG_SPACE_OFFSET: usize = 0x100;
 
 /// The virtio device kinds this kernel drives.
@@ -258,6 +267,37 @@ pub trait VirtioTransport: Send + Sync + 'static {
         let byte_index = offset & 0x3;
         self.read_config_u32(word_offset).to_le_bytes()[byte_index]
     }
+
+    /// The physical span of the device's shared-memory region `id`,
+    /// where the transport publishes one.
+    ///
+    /// A shared-memory region is the one place a virtio device puts
+    /// *its own* memory in the guest's physical address space instead
+    /// of reading the guest's (virtio 1.2 §4.1.4.7, §4.2.2).
+    /// virtio-gpu's host-visible aperture is such a region, and it is
+    /// the only address a host-3D blob can be mapped at.
+    ///
+    /// A transport whose register layout defines no such window, or a
+    /// device that publishes nothing under that id, answers `None`; the
+    /// driver then refuses the mapping rather than inventing an
+    /// address, because a blob mapped at an address the device does not
+    /// decode is memory that reads as all ones.
+    fn shared_memory_region(&self, _id: u8) -> Option<PhysicalRange> {
+        None
+    }
+}
+
+/// Decodes what a transport's shared-memory registers answered.
+///
+/// Absent is spelled two ways in practice: the specification's own
+/// all-ones length, and the zero a device that never implemented the
+/// registers reads back. Neither describes a window, and both are the
+/// same answer to a driver.
+const fn shared_memory_span(base: u64, length: u64) -> Option<PhysicalRange> {
+    if length == 0 || length == u64::MAX {
+        return None;
+    }
+    Some(PhysicalRange::new(base, length))
 }
 
 pub struct VirtioMmioTransport<B: DeviceBus> {
@@ -402,6 +442,22 @@ impl<B: DeviceBus> VirtioTransport for VirtioMmioTransport<B> {
     fn read_config_u8(&self, offset: usize) -> u8 {
         self.bus.read_u8(CONFIG_SPACE_OFFSET + offset)
     }
+
+    /// Reads the region out of the selector register file.
+    ///
+    /// The selector is written before the four value registers are
+    /// read, exactly as the queue selector is, and for the same reason:
+    /// the registers are one window onto whichever region was last
+    /// named. Bring-up is single-processor and no other task can be
+    /// between the write and the reads.
+    fn shared_memory_region(&self, id: u8) -> Option<PhysicalRange> {
+        self.bus.write_u32(REG_SHM_SEL, u32::from(id));
+        let length = u64::from(self.bus.read_u32(REG_SHM_LEN_LOW))
+            | (u64::from(self.bus.read_u32(REG_SHM_LEN_HIGH)) << 32);
+        let base = u64::from(self.bus.read_u32(REG_SHM_BASE_LOW))
+            | (u64::from(self.bus.read_u32(REG_SHM_BASE_HIGH)) << 32);
+        shared_memory_span(base, length)
+    }
 }
 
 #[cfg(test)]
@@ -410,7 +466,8 @@ mod tests {
         DeviceStatus, DeviceType, InterruptStatus, REG_DRIVER_FEATURES, REG_DRIVER_FEATURES_SEL,
         REG_INTERRUPT_ACK, REG_INTERRUPT_STATUS, REG_QUEUE_DESC_HIGH, REG_QUEUE_DESC_LOW,
         REG_QUEUE_DEVICE_HIGH, REG_QUEUE_DEVICE_LOW, REG_QUEUE_DRIVER_HIGH, REG_QUEUE_DRIVER_LOW,
-        REG_QUEUE_NOTIFY, REG_QUEUE_NUM, REG_QUEUE_READY, REG_QUEUE_SEL, REG_STATUS,
+        REG_QUEUE_NOTIFY, REG_QUEUE_NUM, REG_QUEUE_READY, REG_QUEUE_SEL, REG_SHM_BASE_HIGH,
+        REG_SHM_BASE_LOW, REG_SHM_LEN_HIGH, REG_SHM_LEN_LOW, REG_SHM_SEL, REG_STATUS,
         VirtioFeatures, VirtioMmioTransport, VirtioTransport,
     };
     use crate::bus::DeviceBus;
@@ -499,6 +556,49 @@ mod tests {
         assert!(status.config_change);
         assert!(status.is_pending());
         assert_eq!(transport.bus().register(REG_INTERRUPT_ACK), 2);
+    }
+
+    /// The window a device publishes is read out of the selector
+    /// register file, in the 64-bit halves the layout puts it in.
+    #[test]
+    fn mmio_transport_reads_a_published_shared_memory_region() {
+        let bus = MmioRegisterBus::new(DeviceType::Gpu, VirtioFeatures::VERSION_1.bits());
+        bus.write_u32(REG_SHM_LEN_LOW, 0x0010_0000);
+        bus.write_u32(REG_SHM_LEN_HIGH, 0);
+        bus.write_u32(REG_SHM_BASE_LOW, 0x4000_0000);
+        bus.write_u32(REG_SHM_BASE_HIGH, 0x0000_0001);
+        let transport = VirtioMmioTransport::new(bus).expect("transport should initialize");
+
+        let region = transport
+            .shared_memory_region(0)
+            .expect("the device published a window");
+
+        assert_eq!(transport.bus().register(REG_SHM_SEL), 0);
+        assert_eq!(region.start, 0x1_4000_0000);
+        assert_eq!(region.bytes, 0x0010_0000);
+    }
+
+    /// A device that publishes nothing under the selected id answers
+    /// with the specification's all-ones length, and one that never
+    /// implemented the registers reads back zero. Neither describes a
+    /// window, and the driver is told so rather than being handed an
+    /// address the device does not decode.
+    #[test]
+    fn mmio_transport_reports_an_absent_shared_memory_region_as_absent() {
+        let bus = MmioRegisterBus::new(DeviceType::Gpu, VirtioFeatures::VERSION_1.bits());
+        let transport = VirtioMmioTransport::new(bus).expect("transport should initialize");
+        assert!(
+            transport.shared_memory_region(0).is_none(),
+            "a register file that was never written publishes nothing"
+        );
+
+        transport.bus().write_u32(REG_SHM_LEN_LOW, u32::MAX);
+        transport.bus().write_u32(REG_SHM_LEN_HIGH, u32::MAX);
+        transport.bus().write_u32(REG_SHM_BASE_LOW, 0x4000_0000);
+        assert!(
+            transport.shared_memory_region(1).is_none(),
+            "an all-ones length is how the specification spells 'no such region'"
+        );
     }
 
     #[test]
