@@ -133,7 +133,9 @@ stdlib, and runs upstream WASI tools such as Python and curl, and
 host-side capture every session keeps of it, and how to read one.
 `docs/desktop.md` covers the guest's display, input and sound devices,
 the host display and audio backends, and how a headless session captures
-the scanout and drives the desktop.
+the scanout and drives the desktop; `docs/display.md` covers
+`helios:system/display`, the interface a guest draws through, and where
+its frame buffers live.
 
 ## Performance
 
