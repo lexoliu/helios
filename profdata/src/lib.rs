@@ -26,6 +26,8 @@ use std::fs::File;
 use std::io::Read as _;
 use std::path::Path;
 
+use sha2::{Digest as _, Sha256};
+
 mod store;
 
 pub use store::{FetchedProfile, KernelProfileStore, KernelProfileStoreError};
@@ -198,6 +200,65 @@ pub fn validate(path: &Path) -> Result<(), ProfileUseError> {
     check_header(&name, &header)
 }
 
+/// Hex characters of a profile's digest that [`ProfileDigest`] keeps.
+///
+/// Sixteen of them are sixty-four bits: enough that two profiles of one
+/// checkout cannot collide by accident, and short enough to read in a
+/// path.
+const DIGEST_CHARS: usize = 16;
+
+/// What identifies one profile among the profiles of a checkout: the
+/// SHA-256 of its bytes, shortened to name a directory with.
+///
+/// Two `-C profile-use` kernels of one commit are the same cargo
+/// profile, so what tells their artifacts apart has to come from the
+/// profiles themselves (#327). Content and not path, for two reasons:
+/// two names for one profile are one build and share its artifacts,
+/// and — the reason that would otherwise be silent — cargo fingerprints
+/// the rustflag that names the profile, never the bytes behind it, so a
+/// profile rewritten under a name that has been built against before
+/// would reuse the objects compiled against the profile it replaced.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ProfileDigest(String);
+
+impl ProfileDigest {
+    /// The digest as it is written into a path.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl core::fmt::Display for ProfileDigest {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// The digest of the profile at `path`.
+///
+/// Streamed rather than read whole: a merged kernel profile is tens of
+/// megabytes and nothing here needs it in memory.
+pub fn digest(path: &Path) -> Result<ProfileDigest, ProfileUseError> {
+    let name = path.display().to_string();
+    let on_read = |source| ProfileUseError::Read {
+        path: name.clone(),
+        source,
+    };
+    let mut file = File::open(path).map_err(on_read)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 1 << 16];
+    loop {
+        let read = file.read(&mut buffer).map_err(on_read)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let mut hex = hex::encode(hasher.finalize());
+    hex.truncate(DIGEST_CHARS);
+    Ok(ProfileDigest(hex))
+}
+
 /// The header check itself, over bytes rather than a file, so every
 /// refusal has a test.
 fn check_header(path: &str, header: &[u8; HEADER_BYTES]) -> Result<(), ProfileUseError> {
@@ -317,6 +378,39 @@ mod tests {
             matches!(error, ProfileUseError::NotAProfile { .. }),
             "{error}"
         );
+    }
+
+    /// A profile is identified by what is in it, so a rewritten file is
+    /// a different profile and a copy under another name is the same
+    /// one. The kernel directory of #327 is keyed by this, which is what
+    /// makes the second statement matter as much as the first: a copy
+    /// shares its build, and a rewrite gets its own.
+    #[test]
+    fn a_profiles_digest_follows_its_bytes_and_not_its_name() {
+        let directory = tempfile::tempdir().expect("a temporary directory for the profiles");
+        let first = directory.path().join("collected.profdata");
+        let copy = directory.path().join("same-bytes.profdata");
+        std::fs::write(&first, b"one collection").expect("writing the profile");
+        std::fs::write(&copy, b"one collection").expect("writing the copy");
+        let before = digest(&first).expect("a readable file has a digest");
+        assert_eq!(before, digest(&copy).expect("the copy is readable"));
+        assert_eq!(before.as_str().len(), DIGEST_CHARS);
+        assert_eq!(before.to_string(), before.as_str());
+
+        std::fs::write(&first, b"the next collection").expect("rewriting the profile");
+        assert_ne!(
+            before,
+            digest(&first).expect("the rewritten file is readable"),
+            "a profile rewritten under one name is not the profile it replaced"
+        );
+    }
+
+    #[test]
+    fn a_missing_profile_has_no_digest() {
+        let directory = tempfile::tempdir().expect("a temporary directory for the profile");
+        let error = digest(&directory.path().join("absent.profdata"))
+            .expect_err("a profile that is not there cannot be identified");
+        assert!(matches!(error, ProfileUseError::Read { .. }), "{error}");
     }
 
     #[test]

@@ -16,7 +16,9 @@ use helios_hal::fs::HOST_SHARE_MOUNT_TAG;
 use helios_inspector_protocol::debugger::filesystem as debugger_fs;
 use helios_inspector_protocol::system::profiling as system_profiling;
 use helios_inspector_protocol::system::programs as system_programs;
-use helios_profdata::{KernelProfileStore, KernelProfileStoreError, ProfileUseError};
+use helios_profdata::{
+    KernelProfileStore, KernelProfileStoreError, ProfileDigest, ProfileUseError,
+};
 use helios_workspace_root::{WorkspaceRoot, WorkspaceRootError};
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
@@ -1813,7 +1815,15 @@ pub(crate) fn run(mut command: VmCommand) -> Result<(), VmError> {
         // preflights the QEMU host state nor spawns a guest.
         Some(VmSessionCommand::Build) => {
             let file = load_config_file(command.config.as_deref())?;
-            return Ok(build_vm(&resolve_build(&command, &file, None)?)?);
+            let build = resolve_build(&command, &file, None)?;
+            build_vm(&build)?;
+            // A kernel built against a profile named on the command line
+            // lands in a directory keyed to that profile (#327), so the
+            // build names the image it produced rather than leaving the
+            // caller to reconstruct a path.
+            let kernel = build.kernel_path().map_err(VmConfigError::from)?;
+            println!("{}", kernel.display());
+            return Ok(());
         }
         // Answers from the build spec and boots nothing, so like `build`
         // it needs neither an accelerator nor a guest.
@@ -1855,12 +1865,115 @@ struct KernelBuildSpec {
     profile: &'static VmProfile,
     kind: KernelBuildProfile,
     /// The merged profile a [`KernelBuildProfile::ProfileUse`] build
-    /// reads, absolute so that the `--config` override cargo receives
-    /// does not depend on the directory the build is issued from.
-    /// `None` for every other kind.
-    profile_use: Option<PathBuf>,
+    /// reads, and how it was asked for. `None` for every other kind.
+    profile_use: Option<KernelProfileUse>,
     boot_programs: Vec<String>,
     no_compiler_plugin: bool,
+}
+
+/// Which profile a `profile-use` kernel reads, and what that makes of
+/// where the build lands.
+///
+/// One cargo profile is one output directory, and since #226 both
+/// columns of a profile-guided measurement are `profile-use` builds:
+/// the candidate reads the profile a collection just produced, the
+/// control the one the last release published. Sharing the target's
+/// `profile-use` directory between them meant whichever built second
+/// overwrote the first and both columns booted one file, which the
+/// paired run's identical-images guard then refused (#327). So the two
+/// ways of naming a profile are two variants here, and the one that can
+/// occur twice in a checkout carries what tells its build apart.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum KernelProfileUse {
+    /// The profile a `--release` build of this target reads without
+    /// being asked for one (docs/pgo.md, #226, #313). It is the release
+    /// kernel of the checkout, so it lands where every other target's
+    /// release kernel lands.
+    Fetched(PathBuf),
+    /// A profile named by `--profile-use`: one profile weighed against
+    /// another (docs/pgo.md, #211). Its build is keyed by the profile's
+    /// own digest, so that it neither overwrites the release kernel nor
+    /// is overwritten by it, and two named profiles are two kernels.
+    Named {
+        path: PathBuf,
+        digest: ProfileDigest,
+    },
+}
+
+impl KernelProfileUse {
+    /// The profile the build reads, however it was named. Absolute, so
+    /// that the `--config` override cargo receives does not depend on
+    /// the directory the build was issued from.
+    fn path(&self) -> &Path {
+        match self {
+            Self::Fetched(path) | Self::Named { path, .. } => path,
+        }
+    }
+}
+
+/// The directory under `target/` that holds the kernels built against a
+/// profile named on the command line, one subdirectory per profile.
+const NAMED_PROFILE_KERNELS: &str = "pgo-kernels";
+
+/// Where a kernel build's artifacts land.
+///
+/// Two variants rather than a path and a rule about it: cargo is told
+/// about the second and must not be told about the first, because
+/// naming the workspace's own `target/` as a `--target-dir` is a
+/// different directory to cargo on a checkout reached through a symlink.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum KernelTargetDir {
+    /// The checkout's own `target/`, which is cargo's default and where
+    /// every build but one lands.
+    Workspace(PathBuf),
+    /// A directory of this build's own, keyed by the profile it reads.
+    Keyed(PathBuf),
+}
+
+impl KernelTargetDir {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Workspace(path) | Self::Keyed(path) => path,
+        }
+    }
+
+    /// The `--target-dir` cargo has to be given, if any.
+    fn cargo_argument(&self) -> Option<&Path> {
+        match self {
+            Self::Workspace(_) => None,
+            Self::Keyed(path) => Some(path),
+        }
+    }
+}
+
+impl KernelBuildSpec {
+    /// Where this build's guest artifacts land.
+    ///
+    /// The checkout's own `target/`, except for a kernel built against a
+    /// profile named on the command line: that one is keyed by the
+    /// profile, because the cargo profile it shares with this target's
+    /// release kernel is one directory and the two would otherwise
+    /// overwrite each other in it (#327).
+    fn target_dir(&self, repo_root: &Path) -> KernelTargetDir {
+        let target = repo_root.join("target");
+        match &self.profile_use {
+            Some(KernelProfileUse::Named { digest, .. }) => {
+                KernelTargetDir::Keyed(target.join(NAMED_PROFILE_KERNELS).join(digest.as_str()))
+            }
+            Some(KernelProfileUse::Fetched(_)) | None => KernelTargetDir::Workspace(target),
+        }
+    }
+
+    /// The guest image this build produces, which is the image a session
+    /// that builds its own kernel boots.
+    fn kernel_path(&self) -> Result<PathBuf, WorkspaceRootError> {
+        Ok(self
+            .target_dir(&repo_root()?)
+            .path()
+            .join(self.profile.cargo_target)
+            .join(self.kind.directory())
+            .join(self.profile.kernel_artifact_name))
+    }
 }
 
 fn debug_shortcut(command: &VmCommand, file: &VmConfigFile) -> bool {
@@ -1893,11 +2006,17 @@ fn resolve_build(
     }
     // Before the build kind exists, so that a profile from another
     // toolchain costs a sixteen-byte read rather than a kernel compile
-    // that ends in an LLVM error naming no file.
+    // that ends in an LLVM error naming no file. The digest comes from
+    // the same pass: it is what keys this build's directory, so it is
+    // read where the profile is first opened rather than where the
+    // directory is assembled.
     let profile_use = profile_use
         .map(|path| {
             helios_profdata::validate(&path)?;
-            absolute_profile(&path)
+            Ok::<_, ProfileUseError>(KernelProfileUse::Named {
+                path: absolute_profile(&path)?,
+                digest: helios_profdata::digest(&path)?,
+            })
         })
         .transpose()?;
     // A release build of the architecture performance is measured on
@@ -1915,7 +2034,8 @@ fn resolve_build(
             profile,
             &KernelProfileStore::new(&repo_root()?),
             command.without_kernel_profile,
-        )?,
+        )?
+        .map(KernelProfileUse::Fetched),
         None => None,
     };
     let kind = if profile_use.is_some() {
@@ -2010,7 +2130,7 @@ fn resolve_kernel_path(
 ) -> Result<PathBuf, WorkspaceRootError> {
     match explicit.or(configured) {
         Some(kernel) => Ok(kernel),
-        None => default_kernel_path(build.profile.arch, build.kind.directory()),
+        None => build.kernel_path(),
     }
 }
 
@@ -2382,7 +2502,7 @@ fn build_vm(command: &KernelBuildSpec) -> Result<(), VmBuildError> {
         Some(profile) => format!(
             "building {} kernel against {}",
             arch_label(command.profile.arch),
-            profile.display()
+            profile.path().display()
         ),
         None => format!("building {} kernel", arch_label(command.profile.arch)),
     };
@@ -2434,6 +2554,13 @@ fn cargo_build_command(repo_root: &Path, build: KernelBuildProfile) -> Command {
 /// the target its link arguments and ISA features.
 fn kernel_build_command(repo_root: &Path, command: &KernelBuildSpec) -> Command {
     let mut cargo = cargo_build_command(repo_root, command.kind);
+    // The guest build alone moves. The host tools compiled beside it
+    // read no profile and are looked up beside the running inspector,
+    // so they stay in the two directories a host build ever uses
+    // (`workspace_helios_cli`).
+    if let Some(target_dir) = command.target_dir(repo_root).cargo_argument() {
+        cargo.arg("--target-dir").arg(target_dir);
+    }
     if command.kind.instrumented() {
         cargo
             .arg("--config")
@@ -2442,7 +2569,7 @@ fn kernel_build_command(repo_root: &Path, command: &KernelBuildSpec) -> Command 
     if let Some(profile) = &command.profile_use {
         cargo
             .arg("--config")
-            .arg(profile_use_rustflags(command.profile, profile));
+            .arg(profile_use_rustflags(command.profile, profile.path()));
     }
     cargo
 }
@@ -4449,15 +4576,6 @@ fn repo_root() -> Result<PathBuf, WorkspaceRootError> {
     Ok(WorkspaceRoot::resolve(None)?.path().to_path_buf())
 }
 
-fn default_kernel_path(arch: VmArch, profile_dir: &str) -> Result<PathBuf, WorkspaceRootError> {
-    let profile = arch.profile();
-    Ok(repo_root()?
-        .join("target")
-        .join(profile.cargo_target)
-        .join(profile_dir)
-        .join(profile.kernel_artifact_name))
-}
-
 /// Creates the scratch disk image this VM's guest kernel will own.
 ///
 /// It lives in the runtime directory, so every VM gets a disk of its own
@@ -5650,13 +5768,116 @@ mod tests {
             "it consumes counters, it does not emit them"
         );
         assert_eq!(
-            spec.profile_use.as_deref(),
+            spec.profile_use.as_ref().map(KernelProfileUse::path),
             Some(
                 profile
                     .canonicalize()
                     .expect("the profile exists")
                     .as_path()
             ),
+        );
+    }
+
+    /// The arguments a built cargo invocation carries, as strings.
+    fn cargo_arguments(command: &Command) -> Vec<String> {
+        command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// A named profile and the release profile are both `profile-use`
+    /// builds, and one cargo profile is one output directory: without a
+    /// directory of its own the named build overwrites the release
+    /// kernel, or is overwritten by it, and a paired run boots one file
+    /// twice. That is what run 34437890235 did — `images 'helios' and
+    /// 'helios-baseline' are the same guest build … profile-use/helios
+    /// and … profile-use/helios` — and #327 is that the two columns get
+    /// two locations.
+    #[test]
+    fn a_named_profile_builds_beside_the_release_kernel_and_not_over_it() {
+        let directory = tempfile::tempdir().expect("a temporary directory for the profile");
+        let profile = pinned_profile(directory.path());
+        let mut command = minimal_command();
+        command.profile_use = Some(profile.clone());
+        let named = resolve_build(&command, &VmConfigFile::default(), None)
+            .expect("a profile of the pinned format builds");
+        // The same profile as the release kernel's, so that what tells
+        // the two builds apart is how the profile was asked for and
+        // nothing about the file.
+        let release = KernelBuildSpec {
+            profile_use: Some(KernelProfileUse::Fetched(
+                profile.canonicalize().expect("the profile exists"),
+            )),
+            ..named.clone()
+        };
+        let root = Path::new("/checkout");
+
+        assert_eq!(
+            release.target_dir(root),
+            KernelTargetDir::Workspace(root.join("target")),
+            "the release kernel is the checkout's own"
+        );
+        let KernelTargetDir::Keyed(keyed) = named.target_dir(root) else {
+            panic!("a profile named on the command line builds in a directory of its own");
+        };
+        assert!(
+            keyed.starts_with(root.join("target").join(NAMED_PROFILE_KERNELS)),
+            "{}",
+            keyed.display()
+        );
+        assert_ne!(
+            named.kernel_path().expect("workspace root must resolve"),
+            release.kernel_path().expect("workspace root must resolve"),
+            "the two columns of a PGO pairing boot two files"
+        );
+
+        let arguments = cargo_arguments(&kernel_build_command(root, &named));
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair[0] == "--target-dir" && Path::new(&pair[1]) == keyed),
+            "{arguments:?}"
+        );
+        assert!(
+            !cargo_arguments(&kernel_build_command(root, &release))
+                .contains(&"--target-dir".to_owned()),
+            "the release kernel is where cargo puts it by default"
+        );
+    }
+
+    /// One profile weighed against another is the whole point of naming
+    /// one, so two of them are two kernels rather than one directory
+    /// rebuilt — and a kernel is only as good as the profile behind it,
+    /// so a directory that answered for both would hand cargo a
+    /// fingerprint it cannot tell apart, the profile's bytes being
+    /// nothing cargo reads.
+    #[test]
+    fn two_named_profiles_are_two_kernels() {
+        let directory = tempfile::tempdir().expect("a temporary directory for the profiles");
+        let collections = ["older", "newer"].map(|name| {
+            let collection = directory.path().join(name);
+            fs::create_dir_all(&collection).expect("a directory for the collection");
+            collection
+        });
+        let [older, newer] = collections.map(|collection| pinned_profile(&collection));
+        // Past the sixteen bytes the header check reads, so the two are
+        // the same kind of profile carrying different counts.
+        let mut counts = fs::read(&newer).expect("the profile was just written");
+        counts.push(0xa5);
+        fs::write(&newer, counts).expect("rewriting the newer profile");
+        let build = |profile: PathBuf| {
+            let mut command = minimal_command();
+            command.profile_use = Some(profile);
+            resolve_build(&command, &VmConfigFile::default(), None)
+                .expect("a profile of the pinned format builds")
+        };
+        let root = Path::new("/checkout");
+
+        assert_ne!(
+            build(older).target_dir(root),
+            build(newer).target_dir(root),
+            "two profiles are two kernels"
         );
     }
 
@@ -6151,18 +6372,18 @@ mod tests {
 
     fn watchdog_test_command(arch: VmArch) -> ResolvedVmCommand {
         let profile = arch.profile();
+        let build = KernelBuildSpec {
+            profile,
+            kind: KernelBuildProfile::Debug,
+            profile_use: None,
+            boot_programs: vec!["debugger".to_owned()],
+            no_compiler_plugin: true,
+        };
         ResolvedVmCommand {
             profile,
-            build: KernelBuildSpec {
-                profile,
-                kind: KernelBuildProfile::Debug,
-                profile_use: None,
-                boot_programs: vec!["debugger".to_owned()],
-                no_compiler_plugin: true,
-            },
+            build: build.clone(),
             qemu_bin: PathBuf::from(profile.qemu_bin),
-            kernel: default_kernel_path(arch, KernelBuildProfile::Debug.directory())
-                .expect("workspace root must resolve"),
+            kernel: build.kernel_path().expect("workspace root must resolve"),
             socket: None,
             serial_stdio: false,
             serial_pty: false,
@@ -6357,18 +6578,18 @@ mod tests {
 
     fn direct_exec_command(arch: VmArch) -> ResolvedVmCommand {
         let profile = arch.profile();
+        let build = KernelBuildSpec {
+            profile,
+            kind: KernelBuildProfile::Release,
+            profile_use: None,
+            boot_programs: Vec::new(),
+            no_compiler_plugin: false,
+        };
         ResolvedVmCommand {
             profile,
-            build: KernelBuildSpec {
-                profile,
-                kind: KernelBuildProfile::Release,
-                profile_use: None,
-                boot_programs: Vec::new(),
-                no_compiler_plugin: false,
-            },
+            build: build.clone(),
             qemu_bin: PathBuf::from(profile.qemu_bin),
-            kernel: default_kernel_path(arch, KernelBuildProfile::Release.directory())
-                .expect("workspace root must resolve"),
+            kernel: build.kernel_path().expect("workspace root must resolve"),
             socket: None,
             serial_stdio: false,
             serial_pty: false,
