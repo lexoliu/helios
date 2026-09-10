@@ -91,7 +91,7 @@ impl TracingConfig {
     }
 }
 
-pub async fn fetch_stats(client: &mut RpcClient) -> Result<stats::Sample, SystemError> {
+pub async fn fetch_stats(client: &RpcClient) -> Result<stats::Sample, SystemError> {
     remote::call(stats::snapshot(client), "remote stats snapshot")
         .await
         .map_err(|source| SystemError::Fetch {
