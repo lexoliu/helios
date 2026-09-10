@@ -33,6 +33,15 @@ pub struct AddressSpaceFixture<F> {
 
 const PAGE: usize = PhysFrame::SIZE;
 
+/// Two page-aligned addresses no conformance run ever reserves.
+///
+/// Spelled from the top of the address space rather than as a 48-bit
+/// literal: every implementation hands reservations out from the bottom,
+/// and a literal wide enough to be unreachable on a 64-bit pointer does
+/// not fit a narrower one at all.
+const UNRESERVED_PROTECT: usize = (usize::MAX - 4 * PAGE + 1) & !(PAGE - 1);
+const UNRESERVED_TRANSLATE: usize = (usize::MAX - 8 * PAGE + 1) & !(PAGE - 1);
+
 fn pages(count: usize) -> usize {
     count * PAGE
 }
@@ -174,7 +183,7 @@ where
     // success because the underlying mmap exists. Both are valid as
     // long as protect on a *never-reserved* range still errors.
     let address_space = fresh();
-    let bogus_range = VirtRange::new(VirtAddr::new(0xdead_dead_0000), PAGE);
+    let bogus_range = VirtRange::new(VirtAddr::new(UNRESERVED_PROTECT), PAGE);
     let result = address_space.protect(bogus_range, PageFlags::READ);
     assert!(
         result.is_err(),
@@ -229,7 +238,7 @@ where
     A: AddressSpace,
 {
     let address_space = fresh();
-    let translation = address_space.translate(VirtAddr::new(0xface_feed_0000));
+    let translation = address_space.translate(VirtAddr::new(UNRESERVED_TRANSLATE));
     assert_eq!(translation, Translation::Unmapped);
 }
 
