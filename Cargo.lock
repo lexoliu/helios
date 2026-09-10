@@ -1692,6 +1692,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "helios-audio-test"
+version = "0.1.0"
+dependencies = [
+ "helios-api",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "helios-bench-metrics"
 version = "0.1.0"
 
