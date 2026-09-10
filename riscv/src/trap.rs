@@ -141,15 +141,70 @@ pub(crate) unsafe fn seed_trap_stack(stack: &Range<usize>) {
 
 /// A frame outside the hart's trap stack means the swap in the entry is
 /// not in effect, and the next trap raised below `sp` recurses instead of
-/// being reported. Caught on the first trap of any kind rather than there.
+/// being reported. Caught on the first trap of any kind rather than there,
+/// and reported with that trap's cause and program counter: the trap
+/// that finds the swap off is never the one that turned it off, and the
+/// two addresses say what kind of context was running.
 pub(crate) fn assert_frame_on_trap_stack(frame: &TrapFrame, stack: &Range<usize>) {
     let address = core::ptr::from_ref(frame) as usize;
     assert!(
         stack.contains(&address),
-        "riscv trap frame at {address:#x} is not on this hart's trap stack {:#x}..{:#x}",
+        "riscv trap frame at {address:#x} is not on this hart's trap stack {:#x}..{:#x} \
+         (scause={:#x}, sepc={:#x}, interrupted sp={:#x})",
         stack.start,
-        stack.end
+        stack.end,
+        riscv::register::scause::read().bits(),
+        frame.sepc,
+        frame.general.sp,
     );
+}
+
+/// The trap stack top the exit would hand back to `sscratch` for
+/// `frame`, read from the slot the entry keeps above the frame; zero
+/// for a nested frame, whose exit leaves the hart inside the outer
+/// handler.
+fn trap_stack_top_for(frame: &TrapFrame) -> usize {
+    // SAFETY: the entry carves `TRAP_REGION_BYTES` per trap and writes
+    // the slot at `TRAP_FRAME_BYTES` above the frame; `frame` is one the
+    // entry built, which is what every caller holds.
+    unsafe {
+        core::ptr::from_ref(frame)
+            .cast::<u8>()
+            .add(TRAP_FRAME_BYTES)
+            .cast::<usize>()
+            .read()
+    }
+}
+
+/// Hands the trap stack top back to `sscratch` before `frame` unwinds.
+///
+/// A claimed runtime trap never returns through the entry's exit, and
+/// the exit is the one writer of `sscratch` on the way out: without
+/// this the hart stays marked "inside a handler" after the unwind, and
+/// the next trap it takes, of any kind, builds its frame under the
+/// interrupted `sp` and fails [`assert_frame_on_trap_stack`]. This is
+/// the trap-stack half of the contract `restore_sie_for_unwind` keeps
+/// for the interrupt mask: everything the exit would have restored, the
+/// unwind restores first.
+///
+/// # Panics
+///
+/// When `frame` is a nested one. A trap inside a handler is never a
+/// runtime trap, and unwinding out of it would leave the outer
+/// handler's frame below a live `sp`.
+pub(crate) fn restore_trap_stack_for_unwind(frame: &TrapFrame) {
+    let top = trap_stack_top_for(frame);
+    assert!(
+        top != 0,
+        "riscv runtime trap claimed a nested trap frame at {:#x} (sepc={:#x})",
+        core::ptr::from_ref(frame) as usize,
+        frame.sepc,
+    );
+    // SAFETY: the entry and exit own `sscratch`, and this stands in for
+    // the exit of a frame that will never reach it.
+    unsafe {
+        asm!("csrw sscratch, {top}", top = in(reg) top, options(nomem, nostack));
+    }
 }
 
 /// Points `stvec` at this backend's trap entry, in direct mode.

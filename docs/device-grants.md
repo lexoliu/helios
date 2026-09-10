@@ -288,3 +288,10 @@ turned off, and masking a granted line means reaching that function's
 own MSI-X vector-control bit rather than a controller the kernel owns.
 Both deserve their own design and their own review rather than a
 tail-end of this one. It is recorded on #5.
+
+What x86-64 does install is the contiguous half of the memory hooks
+(`x86/src/device.rs`): `commit_contiguous` and `release_contiguous` are
+the user address space's own, so a display frame buffer is pinned under
+an instance's reservation on this backend exactly as on the other two,
+while `map_device` and `unmap_device` answer `DeviceMappingUnsupported`
+because no grant ever names a region here.
