@@ -23,6 +23,14 @@ pub trait DeviceBus: Send + Sync + 'static {
     /// comes back all-ones rather than as the field.
     fn read_u16(&self, offset: usize) -> u16;
     fn read_u32(&self, offset: usize) -> u32;
+
+    /// Writes one 8-bit register.
+    ///
+    /// Not derived from [`DeviceBus::write_u32`] either: a
+    /// read-modify-write of the surrounding word would write the three
+    /// neighbouring bytes as well, and in a device configuration
+    /// register file those belong to the device.
+    fn write_u8(&self, offset: usize, value: u8);
     fn write_u32(&self, offset: usize, value: u32);
     fn dma(&self) -> &Self::DmaPool;
 }
@@ -336,6 +344,12 @@ impl<P: DmaPool> DeviceBus for MmioBus<P> {
 
     fn read_u32(&self, offset: usize) -> u32 {
         unsafe { self.checked_ptr(offset).read_volatile() }
+    }
+
+    fn write_u8(&self, offset: usize, value: u8) {
+        unsafe {
+            self.checked_byte_ptr(offset).write_volatile(value);
+        }
     }
 
     fn write_u32(&self, offset: usize, value: u32) {
