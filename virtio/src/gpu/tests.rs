@@ -808,3 +808,46 @@ fn concurrent_commands_are_routed_by_descriptor_not_by_arrival_order() {
         .expect("display info");
     assert_eq!(list[0].geometry, Rect::new(0, 0, 800, 600));
 }
+
+#[test]
+fn the_bring_up_round_trip_clears_the_interrupt_it_raised() {
+    let device = device();
+    let request = [0_u8; CTRL_HEADER_BYTES];
+    let mut response = [0_u8; CTRL_HEADER_BYTES];
+
+    let token = {
+        let mut queue = device
+            .control
+            .try_lock()
+            .expect("nothing else holds the control queue at bring-up");
+        let token = queue
+            .submit(
+                &device.transport,
+                &[request.as_slice()],
+                &mut [response.as_mut_slice()],
+            )
+            .expect("the bring-up chain fits in an empty ring");
+        queue.notify(&device.transport);
+        // The device answers and raises its line, which is the whole of
+        // what a real one does for a used buffer.
+        queue.device_complete(token, CTRL_HEADER_BYTES as u32);
+        device.transport.raise_interrupt(1);
+        token
+    };
+
+    let mut queue = device
+        .control
+        .try_lock()
+        .expect("nothing else holds the control queue at bring-up");
+    let written = device.reap_blocking(&mut queue, token);
+    drop(queue);
+
+    assert_eq!(written, CTRL_HEADER_BYTES as u32);
+    assert_eq!(
+        device.transport.acknowledged_interrupts(),
+        1,
+        "a used buffer nobody acknowledges leaves an edge-triggered line \
+         asserted, and a line that never falls cannot rise for the next \
+         completion"
+    );
+}
