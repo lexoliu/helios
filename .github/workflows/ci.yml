@@ -590,13 +590,27 @@ jobs:
           # thing that would have caught both.
           runtime="$GITHUB_WORKSPACE/smoke-runtime/boot"
           mkdir -p "$runtime"
+          # The three virtio-input functions ride on this boot rather
+          # than on one of their own: input bring-up is part of PCI
+          # bring-up, and a machine with a desktop presents keyboard,
+          # pointer and tablet at once, which is also what proves the
+          # backend installs every function it finds rather than the
+          # first (#301). This is the only x86-64 KVM boot that carries
+          # them; the developer machines have no KVM.
           ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
             --accel kvm \
             --runtime-dir "$runtime" --keep-runtime-dir \
+            --qemu-arg -device --qemu-arg virtio-keyboard-pci \
+            --qemu-arg -device --qemu-arg virtio-mouse-pci \
+            --qemu-arg -device --qemu-arg virtio-tablet-pci \
             --boot-program dash --boot-program debugger --no-compiler-plugin \
             shell -c 'echo ok' 2>&1 > boot-smoke.out | tee "$runtime/inspector.log"
           cat boot-smoke.out
           grep -Fqx ok boot-smoke.out
+          # The kernel writes its boot lines to the one UART the guest
+          # has, and `debug-serial.log` is the host's raw copy of it.
+          grep -F 'virtio-input online' "$runtime/debug-serial.log"
+          test "$(grep -cF 'virtio-input online' "$runtime/debug-serial.log")" -eq 3
       - name: Run the coreutils applets through dash
         shell: bash
         working-directory: helios
