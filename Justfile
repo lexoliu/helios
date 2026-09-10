@@ -71,7 +71,8 @@ clippy-host:
         --exclude helios-aarch64 --exclude helios-riscv --exclude helios-x86 \
         --exclude helios-date --exclude helios-debugger --exclude helios-display-test \
         --exclude helios-http-client \
-        --exclude helios-init --exclude helios-oob-load --exclude helios-perf \
+        --exclude helios-init --exclude helios-input-test \
+        --exclude helios-oob-load --exclude helios-perf \
         --exclude helios-ping --exclude helios-procbench \
         --exclude helios-sched-tasks \
         -- -D warnings
@@ -84,8 +85,8 @@ clippy-programs:
     # `helios-api` worlds, and a single invocation covering several of
     # them would unify those features and fail to build.
     for package in helios-date helios-debugger helios-display-test helios-http-client \
-        helios-init helios-oob-load helios-perf helios-ping helios-procbench \
-        helios-sched-tasks; do
+        helios-init helios-input-test helios-oob-load helios-perf helios-ping \
+        helios-procbench helios-sched-tasks; do
         cargo clippy -p "${package}" --all-targets -- -D warnings
     done
 
