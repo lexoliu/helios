@@ -1370,6 +1370,38 @@ fn a_second_mapped_blob_is_placed_past_the_first() {
     );
 }
 
+/// Two `map_blob`s whose device round trips overlap still get two
+/// different spans: the reservation is recorded before this call's
+/// first await, so a call that starts while another is in flight
+/// already sees its span as taken.
+#[test]
+fn two_maps_in_flight_at_once_get_different_spans() {
+    let device = render_device(1);
+    let context = open_context(&device);
+    let first = open_blob(&device, context, 0x1000);
+    let second = open_blob(&device, context, 0x1000);
+
+    let mut first_map = pin!(device.map_blob(first));
+    let mut second_map = pin!(device.map_blob(second));
+    let first_token = pending_control(&device, first_map.as_mut());
+    let second_token = pending_control(&device, second_map.as_mut());
+    let first_wire = control_request(&device, first_token);
+    let second_wire = control_request(&device, second_token);
+    answer_control(&device, first_token, &map_info_response(MAP_CACHE_CACHED));
+    answer_control(&device, second_token, &map_info_response(MAP_CACHE_CACHED));
+    let first_region = block_on(first_map).expect("the device mapped the first");
+    let second_region = block_on(second_map).expect("the device mapped the second");
+
+    assert_eq!(long_word_at(&first_wire, CTRL_HEADER_BYTES + 8), 0);
+    assert_eq!(
+        long_word_at(&second_wire, CTRL_HEADER_BYTES + 8),
+        APERTURE_ALIGN,
+        "the second call saw the first's span as taken while it was in flight"
+    );
+    assert_eq!(first_region.physical.start, APERTURE_BASE);
+    assert_eq!(second_region.physical.start, APERTURE_BASE + APERTURE_ALIGN);
+}
+
 /// The kernel maps the aperture as ordinary memory. A host that wants a
 /// blob accessed any other way is telling the guest a coherency rule
 /// nothing here can keep, so the mapping is taken back rather than

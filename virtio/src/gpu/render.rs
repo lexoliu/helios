@@ -278,15 +278,26 @@ impl<T: VirtioTransport> VirtioGpuDevice<T> {
         self.fences_signalled.notify_all();
     }
 
-    /// Reserves a span of the host-visible aperture for `bytes`.
+    /// Reserves a span of the host-visible aperture for `blob` and
+    /// records where it landed, under the one lock hold.
     ///
     /// First fit over the blobs already placed, at
     /// [`APERTURE_ALIGN`]. The set is bounded by [`MAX_BLOBS`], so the
     /// scan is bounded too, and a caller that has filled the aperture
-    /// is told rather than handed an overlapping offset.
-    fn reserve_aperture(&self, bytes: u64) -> Gpu3dResult<u64> {
+    /// is told rather than handed an overlapping offset. The record is
+    /// written before the lock is let go — reserve and record are the
+    /// same critical section — so a `map_blob` that starts while this
+    /// one's device round trip is still in flight already sees the span
+    /// as taken, and two calls can never be handed the same offset.
+    fn reserve_aperture(&self, blob: BlobId, bytes: u64) -> Gpu3dResult<u64> {
         let aperture = self.host_visible.ok_or(Gpu3dError::ApertureExhausted)?;
-        let blobs = self.blobs.lock();
+        let mut blobs = self.blobs.lock();
+        let Some(index) = blobs.iter().position(|record| record.id == blob) else {
+            return Err(Gpu3dError::UnknownBlob(blob));
+        };
+        if blobs[index].placed_at.is_some() {
+            return Err(Gpu3dError::NotMappable(blob));
+        }
         let mut candidate = 0_u64;
         // Every pass either accepts the candidate or moves it past one
         // more placed blob, and there are at most `MAX_BLOBS` of those.
@@ -307,7 +318,10 @@ impl<T: VirtioTransport> VirtioGpuDevice<T> {
                         .checked_next_multiple_of(APERTURE_ALIGN)
                         .ok_or(Gpu3dError::ApertureExhausted)?;
                 }
-                None => return Ok(candidate),
+                None => {
+                    blobs[index].placed_at = Some(candidate);
+                    return Ok(candidate);
+                }
             }
         }
         Err(Gpu3dError::ApertureExhausted)
@@ -567,14 +581,14 @@ impl<T: VirtioTransport> Gpu3d for VirtioGpuDevice<T> {
 
     async fn map_blob(&self, blob: BlobId) -> Gpu3dResult<DeviceRegion> {
         let record = self.blob_record(blob)?;
-        if !record.usage.contains(BlobUsage::MAPPABLE) || record.placed_at.is_some() {
+        if !record.usage.contains(BlobUsage::MAPPABLE) {
             return Err(Gpu3dError::NotMappable(blob));
         }
         let aperture = self.host_visible.ok_or(Gpu3dError::ApertureExhausted)?;
-        let offset = self.reserve_aperture(record.bytes)?;
-        // Recorded before the device is told, so a second task cannot
-        // reserve the same span while this one is in flight.
-        self.place_blob(blob, Some(offset));
+        // Chosen and recorded under the one lock hold, before the device
+        // is told, so a `map_blob` running at the same time is handed a
+        // different span rather than this one.
+        let offset = self.reserve_aperture(blob, record.bytes)?;
 
         let request = encode_map_blob(blob, offset);
         let mut response = [0_u8; RESP_MAP_INFO_BYTES];
