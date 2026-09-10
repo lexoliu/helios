@@ -5,14 +5,36 @@ at `../wasmtime/crates/wasmtime`.
 
 ## Required revision
 
-The local checkout must be at (branch `helios/component-instance-memory`):
+The local checkout must be at (branch `helios/pooling-host-stack`):
 
 ```text
-39819b1f81f3912dddfdcb25de6d5924aef15783
+7a17b5375af44664392d2a550e9724be0f1946c4
 ```
 
-That revision is `helios/fiber-block-on-current` at
-`f9ea747c52b65aaa1b9216d6ac6d2a6c207e345a` plus one additive commit:
+That revision is `helios/component-instance-memory` at
+`39819b1f81f3912dddfdcb25de6d5924aef15783` plus one additive commit, which
+lets the pooling allocator honour `Config::with_host_stack`:
+
+- `generic_stack_pool::StackPool` carries an optional
+  `Arc<dyn RuntimeFiberStackCreator>` and, when one is set, allocates through
+  `creator.new_stack(size, zeroed)` followed by `FiberStack::from_custom`,
+  leaving its live-stack accounting exactly as it was.
+- `PoolingInstanceAllocator::set_stack_creator` forwards to it, and
+  `Config::build_allocator` calls it for the pooling strategy the way it
+  already did for the on-demand one.
+- `unix_stack_pool::StackPool::set_stack_creator` *refuses* a creator with an
+  error naming the setting, because that pool carves its stacks out of one
+  mapping it owns; silently ignoring the creator is what the previous shape
+  did.
+
+Helios needs it because the kernel runs the pooling allocator on a
+`no_std` target, where the stack pool is the generic one and
+`FiberStack::new` has no `mmap` behind it — only the global allocator, fully
+committed, with no guard page. The creator is the one route by which the
+kernel can place fiber stacks in memory it commits on demand
+(`kernel/src/memory/fiber_stack.rs`, #288).
+
+The revision it replaces added
 `wasmtime::component::Instance::get_default_memory`, which returns the core
 memory a component instantiated for its own canonical ABI. The kernel's
 device grants (#5) place a device mapping inside a plugin's linear memory
@@ -132,10 +154,24 @@ backend: a not-present page-table encoding that carries a swap token, installed
 as a `SwapVmHooks` table. Only aarch64 has that today; riscv64 and x86_64 call
 `disable_swap(SwapDisabled::NoSwapHooks)` until they do.
 
+## Fiber stacks
+
+The generic stack pool asks the kernel for every async fiber stack, through
+the `StackCreator` installed by `kernel/src/wasmtime_adapter/fiber_stack.rs`.
+A stack is one slot of the arena in `kernel/src/memory/fiber_stack.rs`:
+`[guard][stack]` inside one reservation of
+`total_stacks × (64 KiB + COMPONENT_ASYNC_STACK_SIZE)` of user address space,
+with only the top page committed when the stack is created and every page
+below it committed by the page-fault handler that touches it.
+`async_stack_keep_resident` is not set, because the generic pool retains no
+stack between instances and there is nothing to keep resident.
+
 ## Runtime-performance context
 
-The generic pooling allocator keeps a bounded set of warm async fiber stacks on
-non-Unix targets. The custom-VM reset change limits anonymous-memory reset to
+The generic pooling allocator bounds how many async fiber stacks may be live
+at once on non-Unix targets; it keeps none warm, so every store pays for its
+own stack, which is what makes where those bytes come from worth changing. The
+custom-VM reset change limits anonymous-memory reset to
 the currently accessible linear-memory prefix. On AArch64/HVF, the original
 `quickjs-loop` profile showed one 8 MiB async stack allocation per run before
 stack reuse; limiting custom-VM reset then moved the profiled median from 57 ms
