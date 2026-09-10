@@ -568,7 +568,7 @@ jobs:
           key: smoke-x86-64
       - name: Build inspector
         working-directory: helios
-        run: cargo build --release -p helios-inspector
+        run: cargo build --release -p helios-inspector -p helios-desktop-text-check
       # Every x86-64 release build is built against the kernel profile
       # the newest kernel-profile.yml run on the default branch uploaded
       # (docs/pgo.md, #226, #313); the inspector refuses to build one
