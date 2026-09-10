@@ -12,6 +12,8 @@ pub(super) use display::add_display_to_linker;
 pub use display::{DisplayHandle, SurfaceHandle};
 mod gpu;
 pub(super) use gpu::add_gpu_to_linker;
+#[cfg(test)]
+pub(crate) use gpu::test_store;
 pub use gpu::{BlobHandle, CommandBufferHandle, ContextHandle, GpuHandle};
 mod input;
 pub use input::InputDeviceHandle;

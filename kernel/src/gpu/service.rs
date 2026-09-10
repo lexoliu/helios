@@ -230,8 +230,9 @@ pub(super) struct Gpu3dShared {
     pub(super) submit: ProviderSender<SubmitRequest>,
     /// One of [`ClaimState`]'s three values.
     pub(super) claim: AtomicU8,
-    /// Bumped by every successful claim, so a request that outlived its
-    /// claim can be told from one that did not.
+    /// Bumped by every successful claim and again when that claim is
+    /// let go, so a request that outlived its claim can be told from
+    /// one that did not whether or not another claim ever follows.
     pub(super) generation: AtomicU64,
     /// One permit per claim that has been let go.
     pub(super) release: Notify,
@@ -395,6 +396,12 @@ impl Gpu3dSender {
 
 impl Drop for Gpu3dClaim {
     fn drop(&mut self) {
+        // The generation moves here, not only on the next claim: a
+        // request queued under this one and still sitting in an inbox
+        // must fail the generation check however long the engine then
+        // sits unclaimed — and on a machine that never renders again,
+        // that is the rest of the run.
+        self.shared.generation.fetch_add(1, Ordering::AcqRel);
         // Not a message: a drop cannot await room in a queue, and the
         // instance this claim belonged to may already be dead. One
         // permit is enough, because there is exactly one claim to

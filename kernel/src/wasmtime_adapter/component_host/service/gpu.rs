@@ -33,6 +33,7 @@ use futures::channel::oneshot;
 use helios_hal::display::{
     BlobId, BlobMemory, BlobUsage, CapsetId, ContextId, ContextName, FenceId, MAX_CONTEXT_NAME,
 };
+use helios_hal::iommu::PhysicalRange;
 use triomphe::Arc;
 use wasmtime::StoreContextMut;
 use wasmtime::component::{
@@ -91,19 +92,19 @@ pub struct ContextHandle {
 
 /// One pinned command buffer, as its store records it.
 pub struct CommandBufferHandle {
-    generation: u64,
-    frame: PinnedFrame,
+    pub(crate) generation: u64,
+    pub(crate) frame: PinnedFrame,
 }
 
 /// One blob resource, as its store records it.
 pub struct BlobHandle {
-    generation: u64,
-    id: BlobId,
+    pub(crate) generation: u64,
+    pub(crate) id: BlobId,
     /// The pinned pages backing it, for the guest-backed kinds.
-    backing: Option<PinnedFrame>,
+    pub(crate) backing: Option<PinnedFrame>,
     /// The aperture placement the instance mapped, once `map-blob` has
     /// put one there.
-    mapped: Option<PinnedFrame>,
+    pub(crate) mapped: Option<PinnedFrame>,
 }
 
 fn to_wit_error(error: Gpu3dServiceError) -> gpu_wit::Error {
@@ -187,6 +188,39 @@ where
             return Err(Gpu3dServiceError::NotClaimed);
         }
         Ok(claim.sender())
+    }
+
+    /// The physical run `offset`/`length` name inside `commands`,
+    /// checked against `generation` — the live claim's.
+    ///
+    /// A buffer pinned under an older claim names a run the arena may
+    /// already have handed to whoever holds the engine now, so the
+    /// refusal is the WIT's answer for a dead claim, not a bounds one.
+    pub(crate) fn command_range(
+        &mut self,
+        commands: &Resource<CommandBufferHandle>,
+        offset: u64,
+        length: u64,
+        generation: u64,
+    ) -> wasmtime::Result<Result<PhysicalRange, gpu_wit::Error>> {
+        let buffer = self.table.get(commands)?;
+        if buffer.generation != generation {
+            return Ok(Err(gpu_wit::Error::NotClaimed));
+        }
+        // The submission is a run of the buffer's own pinned pages: the
+        // physical run is what the device reads, and it has to lie
+        // inside the run the buffer covers. An empty run is the
+        // device's to refuse, not ours: its fence still has to retire,
+        // and a fence spent here would never reach the stream the
+        // reader waits on.
+        let Some(end) = offset.checked_add(length) else {
+            return Ok(Err(gpu_wit::Error::OutOfBounds));
+        };
+        if end > buffer.frame.bytes {
+            return Ok(Err(gpu_wit::Error::OutOfBounds));
+        }
+        let physical = buffer.frame.physical();
+        Ok(Ok(PhysicalRange::new(physical.start + offset, length)))
     }
 }
 
@@ -302,7 +336,14 @@ where
         &mut self,
         handle: Resource<CommandBufferHandle>,
     ) -> wasmtime::Result<gpu_wit::Placement> {
-        Ok(to_wit_placement(self.table.get(&handle)?.frame))
+        let buffer = self.table.get(&handle)?;
+        // `buffer` cannot say `not-claimed` — the WIT signature carries
+        // no result — so a handle that outlived its claim is a trap:
+        // the run it would name may already back the next claim's
+        // buffers.
+        self.gpu_sender(buffer.generation)
+            .map_err(|error| wasmtime::Error::msg(alloc::format!("{error}")))?;
+        Ok(to_wit_placement(buffer.frame))
     }
 
     fn drop(&mut self, handle: Resource<CommandBufferHandle>) -> wasmtime::Result<()> {
@@ -334,7 +375,13 @@ where
         &mut self,
         handle: Resource<BlobHandle>,
     ) -> wasmtime::Result<Option<gpu_wit::Placement>> {
-        Ok(self.table.get(&handle)?.backing.map(to_wit_placement))
+        let blob = self.table.get(&handle)?;
+        // As for `command-buffer.buffer`: a stale handle names a run
+        // that is no longer this claim's, and the infallible signature
+        // leaves a trap as the only refusal.
+        self.gpu_sender(blob.generation)
+            .map_err(|error| wasmtime::Error::msg(alloc::format!("{error}")))?;
+        Ok(blob.backing.map(to_wit_placement))
     }
 
     fn drop(&mut self, handle: Resource<BlobHandle>) -> wasmtime::Result<()> {
@@ -746,26 +793,13 @@ where
             Ok(values) => values,
             Err(error) => return Ok(Err(error)),
         };
-        let range = accessor.with(|mut access| {
-            // The submission is a run of the buffer's own pinned pages:
-            // the physical run is what the device reads, and it has to
-            // lie inside the run the buffer covers. An empty run is the
-            // device's to refuse, not ours: its fence still has to
-            // retire, and a fence spent here would never reach the
-            // stream the reader waits on.
-            let buffer = access.get().table.get(&commands).ok()?.frame;
-            let end = offset.checked_add(length)?;
-            if end > buffer.bytes {
-                return None;
-            }
-            let physical = buffer.physical();
-            Some(helios_hal::iommu::PhysicalRange::new(
-                physical.start + offset,
-                length,
-            ))
-        });
-        let Some(range) = range else {
-            return Ok(Err(gpu_wit::Error::OutOfBounds));
+        let range = match accessor.with(|mut access| {
+            access
+                .get()
+                .command_range(&commands, offset, length, generation)
+        })? {
+            Ok(range) => range,
+            Err(error) => return Ok(Err(error)),
         };
         let (reply, answer) = oneshot::channel();
         let outcome = sender
@@ -973,5 +1007,103 @@ where
             )
             .await
             .map_err(to_wit_error))
+    }
+}
+
+/// A `ComponentStoreData` on the kernel's own test doubles, for the
+/// tests that exercise these host functions against a real resource
+/// table.
+///
+/// Lives inside the adapter because the store type names the adapter's
+/// debug filesystem, and the adapter's own names are not allowed to
+/// appear in `kernel/src` outside it (`kernel/tests/hal_layering.rs`).
+#[cfg(test)]
+pub(crate) mod test_store {
+    use alloc::vec::Vec;
+
+    use helios_hal::cpu::ProcessorId;
+    use helios_hal::watchdog::ProgressCounter;
+    use triomphe::Arc;
+    use wasmtime::component::ResourceTable;
+
+    use crate::component::{ComponentOutputMode, ComponentStoreData};
+    use crate::gpu::Gpu3dService;
+    use crate::test_support::{TestCpu, TestNetworkService};
+    use crate::wasmtime_adapter::wasi::DebugFileSystem;
+    use crate::{
+        Executor, InstanceRegistry, ProcessAuthority, TaskFunding, Timer, UnsupportedHostFileSystem,
+    };
+
+    use crate::wasmtime_adapter::component_host::{HostRuntimeState, StoreData};
+
+    /// The store data these tests exercise: the component host's own
+    /// generics, on the fixtures a kernel unit test carries.
+    pub(crate) type TestStoreData =
+        StoreData<TestCpu, TestNetworkService, UnsupportedHostFileSystem>;
+
+    /// The serial port the fixture's writer names: the store data has
+    /// to carry one, and nothing the tests do is about what it writes.
+    struct DiscardPort;
+
+    impl helios_hal::serial::ByteSerial for DiscardPort {
+        fn try_read_byte(&self) -> Option<u8> {
+            None
+        }
+
+        fn write_bytes(&self, _bytes: &[u8]) {}
+    }
+
+    static DISCARD_CONSOLE: crate::DebugConsole = crate::DebugConsole::new();
+
+    impl crate::DebugSerialAccess for DiscardPort {
+        type Port = Self;
+
+        fn port() -> Self {
+            Self
+        }
+
+        fn console() -> &'static crate::DebugConsole {
+            &DISCARD_CONSOLE
+        }
+    }
+
+    fn read_nothing(_: &mut Vec<u8>, _: u32) {}
+
+    /// A store on a runtime state that publishes `service`, holding no
+    /// claim yet.
+    pub(crate) fn store_data(service: &Gpu3dService) -> TestStoreData {
+        let cpu = TestCpu::with_entropy(0x5a);
+        let runtime_state: HostRuntimeState<
+            TestCpu,
+            TestNetworkService,
+            UnsupportedHostFileSystem,
+        > = crate::RuntimeState::new(1_000_000, 1, 0);
+        runtime_state.install_root_entropy(Arc::new(
+            crate::RootEntropy::from_platform(&cpu, None, None)
+                .expect("the fixture CPU has an entropy source"),
+        ));
+        runtime_state.install_gpu3d_service(service.clone());
+        let executor = Executor::new(ProgressCounter::new(), 1, ProcessorId::new(0));
+        let registry = InstanceRegistry::new();
+        let instance = registry.register("gpu-store", 0);
+        ComponentStoreData::new(
+            ResourceTable::new(),
+            cpu,
+            Timer::new(cpu),
+            executor
+                .spawner(cpu)
+                .instance_spawner(TaskFunding::Instance),
+            runtime_state.clone(),
+            registry,
+            instance,
+            None,
+            DebugFileSystem::new(runtime_state),
+            Vec::new(),
+            Vec::new(),
+            ProcessAuthority::empty(),
+            ComponentOutputMode::Serial,
+            read_nothing,
+            crate::DebugSerialWriter::of::<DiscardPort>(),
+        )
     }
 }

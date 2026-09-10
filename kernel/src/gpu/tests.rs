@@ -13,7 +13,7 @@ use core::pin::pin;
 use core::sync::atomic::AtomicBool;
 
 use futures::channel::oneshot;
-use futures_lite::future::block_on;
+use futures_lite::future::{block_on, poll_once};
 use helios_hal::device::{DeviceRegion, DeviceRegionAttributes};
 use helios_hal::display::{
     BlobId, BlobMemory, BlobRequest, BlobUsage, CapsetId, CapsetInfo, CapsetList, ContextId,
@@ -718,4 +718,148 @@ fn a_request_that_outlived_its_claim_is_not_served() {
         device.calls().is_empty(),
         "nothing reached the device under a claim that had ended"
     );
+}
+
+/// A request sitting in the inbox when its claim is let go is dropped
+/// rather than served, however long the engine then sits unclaimed:
+/// the generation that delimits a claim's window advances on release,
+/// not only on the next claim.
+#[test]
+fn a_request_queued_before_release_is_dropped() {
+    test_hooks::install();
+    let (shared, control, submit) = gpu3d_channels(true);
+    let device = FakeGpu3d::new();
+    let mut ownership = claimed(&shared);
+    let claim = ownership.claim_ref().expect("the claim is held");
+    let generation = claim.generation();
+    let sender = claim.sender();
+
+    // The request lands in the inbox before the servers run and before
+    // the claim is let go: it is the one thing the owner task finds
+    // waiting when it wakes for the release.
+    let (reply, answer) = oneshot::channel();
+    let mut pending = pin!(sender.control(
+        Gpu3dRequest::CreateContext {
+            generation,
+            capset: CAPSET,
+            name: ContextName::new(),
+            reply,
+        },
+        answer,
+    ));
+    assert!(
+        block_on(poll_once(pending.as_mut())).is_none(),
+        "the request is queued and unanswered"
+    );
+    ownership.release();
+
+    with_servers(&device, &shared, &control, &submit, async {
+        assert_eq!(
+            pending.await.err(),
+            Some(Gpu3dServiceError::Closed),
+            "the dead claim's request is dropped, not served"
+        );
+        crate::yield_now().await;
+        crate::yield_now().await;
+    });
+
+    assert!(
+        device.calls().is_empty(),
+        "no device-side context was created for a claim that had ended"
+    );
+    let service = Gpu3dService::from_shared(shared);
+    assert!(
+        service.claim().is_ok(),
+        "the engine is free once its resources are back"
+    );
+}
+
+/// The guest-facing handles a component holds are the store's resource
+/// table entries, so the stale-handle test builds a store for real: a
+/// `command-buffer` or `blob` handle minted under one claim names that
+/// claim's resources, and answered under the next it would be a run
+/// somebody else owns. The fixture itself lives with the adapter,
+/// because the store type names pieces that are adapter-only.
+#[cfg(feature = "wasmtime-runtime")]
+mod component_host {
+    use wasmtime::component::Resource;
+
+    use super::*;
+    use crate::wasmtime_adapter::bindings::gpu::bindings::helios::system::gpu as contract;
+    use crate::wasmtime_adapter::component_host::service::test_store;
+    use crate::wasmtime_adapter::component_host::service::{BlobHandle, CommandBufferHandle};
+
+    /// A buffer a component kept across its claim's release names a run
+    /// the arena may already have handed to whoever holds the engine
+    /// now — so `submit` refuses it with the contract's word for a dead
+    /// claim, and `buffer`, whose signature cannot carry an error,
+    /// traps instead.
+    #[test]
+    fn a_command_buffer_that_outlived_its_claim_is_refused() {
+        test_hooks::install();
+        let (shared, control, submit) = gpu3d_channels(true);
+        let device = FakeGpu3d::new();
+        let service = Gpu3dService::from_shared(shared.clone());
+        let mut data = test_store::store_data(&service);
+        data.device.set_memory(crate::device::LinearMemory {
+            base: VirtAddr::new(MEMORY_BASE),
+            reservation_bytes: RESERVATION_BYTES,
+        });
+        data.device.claim_gpu(&service).expect("the engine is free");
+        let first = data.device.gpu().claim_ref().expect("held").generation();
+        let frame = data
+            .device
+            .gpu_mut()
+            .pin(4096)
+            .expect("the window has room");
+        let commands = data
+            .table
+            .push(CommandBufferHandle {
+                generation: first,
+                frame,
+            })
+            .expect("the table has room");
+        let blob = data
+            .table
+            .push(BlobHandle {
+                generation: first,
+                id: BlobId::new(9),
+                backing: Some(frame),
+                mapped: None,
+            })
+            .expect("the table has room");
+
+        // The claim ends; the handles live on, as they do in a store
+        // nobody told. Whoever claims the engine next holds it under a
+        // generation that is not theirs.
+        with_servers(&device, &shared, &control, &submit, async {
+            data.device.gpu_mut().release();
+            while service.is_claimed() {
+                crate::yield_now().await;
+            }
+            data.device
+                .claim_gpu(&service)
+                .expect("the engine is free once its resources are back");
+        });
+        let live = data.device.gpu().claim_ref().expect("held").generation();
+        assert_ne!(live, first, "a release and a claim both move it");
+
+        let refused = data
+            .command_range(&commands, 0, 16, live)
+            .expect("the handle is still in the table");
+        assert_eq!(
+            refused,
+            Err(contract::Error::NotClaimed),
+            "submit's run check answers not-claimed for a dead claim's buffer"
+        );
+        assert!(
+            contract::HostCommandBuffer::buffer(&mut data, Resource::new_borrow(commands.rep()))
+                .is_err(),
+            "buffer traps rather than handing back the next claim's run"
+        );
+        assert!(
+            contract::HostBlob::buffer(&mut data, Resource::new_borrow(blob.rep())).is_err(),
+            "a blob handle from the dead claim is refused the same way"
+        );
+    }
 }
