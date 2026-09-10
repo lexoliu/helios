@@ -1,10 +1,24 @@
 // Supervisor trap entry for the RISC-V backend.
 //
-// The kernel never leaves supervisor mode: `run_user` is never called,
-// nothing writes `sscratch`, and `handle_user_exception` exists only to
-// panic if `sstatus.SPP` ever comes back clear. So this entry assumes a
-// valid supervisor stack and builds the frame on it, the same way the
-// aarch64 backend's exception entries do.
+// The kernel never leaves supervisor mode: `run_user` is never called
+// and `handle_user_exception` exists only to panic if `sstatus.SPP` ever
+// comes back clear. The entry does not build its frame on the interrupted
+// stack, though: a trap raised by a store below `sp` — a push into a page
+// that is not mapped, which is what a stack guard page and a stack
+// committed on first touch both are — would re-fault on the entry's own
+// first store and recurse down through whatever lies below. So the entry
+// switches to the hart's trap stack first, the way the aarch64 entry
+// switches to `SP_EL0`.
+//
+// `sscratch` carries the trap stack top while the hart is outside a
+// handler and zero while it is inside one. A trap taken inside a handler
+// therefore finds zero, knows it is already on the trap stack, and keeps
+// building downward from the interrupted `sp`; the outermost frame
+// records the top it has to hand back to `sscratch` on exit, in a slot
+// above the `TrapFrame` proper so that a scheduler that replaces the
+// whole frame (`ComputeTaskContext::restore_into_trap`) leaves it alone.
+// Before `HartRuntime::install` seeds `sscratch` the hart is on its boot
+// stack and every trap takes the nested path, which is the old behaviour.
 //
 // It saves the floating-point file as well as the integer file.
 // `riscv64gc-unknown-none-elf` is `+f,+d` with the `lp64d` ABI and
@@ -24,6 +38,11 @@
 .equ HELIOS_TRAP_FCSR,        0x110
 .equ HELIOS_TRAP_F0,          0x118
 .equ HELIOS_TRAP_FRAME_BYTES, 0x220
+// The word above the `TrapFrame`: what the exit writes back into
+// `sscratch` — the trap stack top for the outermost frame, zero for a
+// nested one. `HELIOS_TRAP_REGION_BYTES` is what the entry carves.
+.equ HELIOS_TRAP_SSCRATCH,    0x220
+.equ HELIOS_TRAP_REGION_BYTES, 0x230
 
 // `sstatus.FS`, bits 14:13. `Off` means this hart has no floating-point
 // state to preserve — and also that touching `f0`-`f31` here would fault.
@@ -39,17 +58,42 @@
 .global __helios_riscv_trap_entry
 .balign 4
 __helios_riscv_trap_entry:
-    addi sp, sp, -HELIOS_TRAP_FRAME_BYTES
+    // Swap onto the trap stack: `sp` takes what `sscratch` held (the trap
+    // stack top, or zero inside a handler) and `sscratch` keeps the
+    // interrupted `sp` until the frame has room for it.
+    csrrw sp, sscratch, sp
+    bnez sp, 1f
+    // Nested: the interrupted `sp` is already on the trap stack.
+    csrr sp, sscratch
+    addi sp, sp, -HELIOS_TRAP_REGION_BYTES
+    sd zero, HELIOS_TRAP_SSCRATCH(sp)
+    j 2f
+1:
+    // Outermost: mark the slot non-zero; the top is filled in once a
+    // register is free to compute it.
+    addi sp, sp, -HELIOS_TRAP_REGION_BYTES
+    sd sp, HELIOS_TRAP_SSCRATCH(sp)
+2:
     // `x0` is stored so the frame's `zero` field reads as it should in a
     // panic dump rather than as whatever the stack held.
     sd x0, 0(sp)
     .irp n, 1,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
     sd x\n, (\n * 8)(sp)
     .endr
-    // `x2` is the interrupted stack pointer, which is where this frame
-    // ends.
-    addi t0, sp, HELIOS_TRAP_FRAME_BYTES
+    // `x2` is the interrupted stack pointer, which the swap left in
+    // `sscratch`.
+    csrr t0, sscratch
     sd t0, HELIOS_TRAP_SP(sp)
+    // The outermost frame's slot becomes the trap stack top: this region
+    // is the topmost thing on that stack.
+    ld t0, HELIOS_TRAP_SSCRATCH(sp)
+    beqz t0, 3f
+    addi t0, sp, HELIOS_TRAP_REGION_BYTES
+    sd t0, HELIOS_TRAP_SSCRATCH(sp)
+3:
+    // Inside the handler `sscratch` is zero, so a nested trap takes the
+    // nested path above.
+    csrw sscratch, zero
     csrr t1, sstatus
     csrr t2, sepc
     sd t1, HELIOS_TRAP_SSTATUS(sp)
@@ -91,6 +135,11 @@ __helios_riscv_trap_entry:
 2:
     ld t2, HELIOS_TRAP_SEPC(sp)
     csrw sepc, t2
+    // Hand `sscratch` back: the trap stack top when this was the
+    // outermost frame, zero when the hart is returning into an outer
+    // handler.
+    ld t0, HELIOS_TRAP_SSCRATCH(sp)
+    csrw sscratch, t0
     .irp n, 1,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
     ld x\n, (\n * 8)(sp)
     .endr

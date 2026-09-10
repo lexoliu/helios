@@ -4,13 +4,25 @@
 //! builds, installs it in `stvec`, and proves at bring-up that the
 //! floating-point half of the frame actually round-trips.
 
+use alloc::alloc::{Layout, alloc_zeroed};
 use core::arch::{asm, global_asm};
+use core::ops::Range;
+use core::ptr::NonNull;
 
 global_asm!(include_str!("trap.S"));
 global_asm!(include_str!("fp_selfcheck.S"));
 
 /// Bytes `trap.S` reserves for one [`TrapFrame`].
 const TRAP_FRAME_BYTES: usize = 0x220;
+/// What the entry carves per trap: the frame plus the `sscratch` slot
+/// above it, kept outside [`TrapFrame`] so a whole-frame replacement
+/// cannot touch it.
+const TRAP_REGION_BYTES: usize = TRAP_FRAME_BYTES + 16;
+/// One hart's trap stack. Every trap on the hart, nested ones included,
+/// builds its region here; the runtime's trap handler and a panic's
+/// formatting run on it as well, so it is sized like the aarch64 and x86
+/// exception stacks.
+pub(crate) const TRAP_STACK_BYTES: usize = 64 * 1024;
 
 /// The integer file as the trap entry lays it out: `x0` through `x31` in
 /// architectural order, so the offset of `xN` is `8 * N`.
@@ -86,6 +98,8 @@ pub struct TrapFrame {
 
 const _: () = {
     assert!(core::mem::size_of::<TrapFrame>() == TRAP_FRAME_BYTES);
+    assert!(TRAP_REGION_BYTES == 0x230);
+    assert!(TRAP_STACK_BYTES.is_multiple_of(16));
     assert!(core::mem::size_of::<GeneralRegs>() == 0x100);
     assert!(core::mem::offset_of!(GeneralRegs, sp) == 0x010);
     assert!(core::mem::offset_of!(TrapFrame, sstatus) == 0x100);
@@ -97,6 +111,45 @@ const _: () = {
 unsafe extern "C" {
     fn __helios_riscv_trap_entry();
     fn __helios_riscv_fp_trap_selfcheck(seed: usize) -> usize;
+}
+
+/// Allocates one hart's trap stack and returns its byte range.
+pub(crate) fn allocate_trap_stack() -> Range<usize> {
+    let layout = Layout::from_size_align(TRAP_STACK_BYTES, 16)
+        .expect("trap stack layout is a power-of-two size at 16-byte alignment");
+    // SAFETY: the layout has non-zero size.
+    let base = unsafe { alloc_zeroed(layout) };
+    let base = NonNull::new(base)
+        .unwrap_or_else(|| panic!("failed to allocate a {TRAP_STACK_BYTES}-byte trap stack"))
+        .as_ptr() as usize;
+    base..base + TRAP_STACK_BYTES
+}
+
+/// Publishes `stack` as this hart's trap stack: from here on every trap
+/// the hart takes is built on it rather than on the interrupted stack.
+///
+/// # Safety
+///
+/// `stack` must be the range [`allocate_trap_stack`] returned for this
+/// hart and nothing else may ever write `sscratch`; the entry and exit
+/// own that register from this point.
+pub(crate) unsafe fn seed_trap_stack(stack: &Range<usize>) {
+    unsafe {
+        asm!("csrw sscratch, {top}", top = in(reg) stack.end, options(nomem, nostack));
+    }
+}
+
+/// A frame outside the hart's trap stack means the swap in the entry is
+/// not in effect, and the next trap raised below `sp` recurses instead of
+/// being reported. Caught on the first trap of any kind rather than there.
+pub(crate) fn assert_frame_on_trap_stack(frame: &TrapFrame, stack: &Range<usize>) {
+    let address = core::ptr::from_ref(frame) as usize;
+    assert!(
+        stack.contains(&address),
+        "riscv trap frame at {address:#x} is not on this hart's trap stack {:#x}..{:#x}",
+        stack.start,
+        stack.end
+    );
 }
 
 /// Points `stvec` at this backend's trap entry, in direct mode.
