@@ -1037,11 +1037,14 @@ impl AudioClaim {
     ///
     /// The wait is armed as the reader is built, so an item published
     /// between here and the first poll wakes it rather than being waited
-    /// past.
+    /// past. The claim's generation goes with it: a reader that outlived
+    /// its claim ends rather than reading the next owner's items, the
+    /// same refusal a stale sender gets.
     pub fn feedback(&self) -> FeedbackReader {
         FeedbackReader {
             waiter: self.shared.published.waiter(),
             shared: self.shared.clone(),
+            generation: self.generation,
         }
     }
 
@@ -1122,9 +1125,20 @@ impl AudioSender {
 /// re-arms as part of completing a wait, and the constructor arms the
 /// first one, so an item published between a look and a park cannot be
 /// slept through.
+///
+/// The reader belongs to the claim that opened it. It carries that
+/// claim's generation, because the queue it reads is the stream's —
+/// shared by every claim the stream ever sees — and a claim let go ends
+/// its reader: the release closes the feedback, and a claim that has
+/// since been retaken is a generation that no longer matches, which is
+/// the reader's own end rather than a window onto somebody else's items.
 pub struct FeedbackReader {
     shared: Arc<StreamShared>,
     waiter: NotifyWaiter,
+    /// The claim generation this reader was opened under. Once the
+    /// stream's generation has moved past it, the queue holds the next
+    /// claim's items and this reader's stream is over.
+    generation: u64,
 }
 
 /// Feedback published since a reader last looked.
@@ -1134,9 +1148,18 @@ impl FeedbackReader {
     /// Every item queued right now, or a park until one is.
     ///
     /// `None` once the stream has stopped publishing and everything it
-    /// did publish has been read, which is the end of the feedback.
+    /// did publish has been read, which is the end of the feedback — or
+    /// once the claim this reader was opened under is gone, whichever
+    /// comes first.
     pub fn poll_burst(&mut self, cx: &mut Context<'_>) -> Poll<Option<FeedbackBurst>> {
         loop {
+            // Before the drain, because a claim taken since this reader
+            // was opened owns what the queue holds now: items published
+            // under a newer generation are that claim's to see, never
+            // this one's.
+            if self.shared.generation.load(Ordering::Acquire) != self.generation {
+                return Poll::Ready(None);
+            }
             let mut burst = FeedbackBurst::new();
             while !burst.is_full() {
                 match self.shared.feedback.pop() {
@@ -1151,9 +1174,15 @@ impl FeedbackReader {
                 Poll::Ready(()) => continue,
                 // The wait is registered before the end is read, and
                 // ending raises that same signal, so a stream that
-                // stopped between the drain and the park is seen on the
-                // next pass rather than slept through.
-                Poll::Pending if !self.shared.feedback_is_open() => return Poll::Ready(None),
+                // stopped — or a claim that changed hands — between the
+                // drain and the park is seen on the next pass rather
+                // than slept through.
+                Poll::Pending
+                    if !self.shared.feedback_is_open()
+                        || self.shared.generation.load(Ordering::Acquire) != self.generation =>
+                {
+                    return Poll::Ready(None);
+                }
                 Poll::Pending => return Poll::Pending,
             }
         }

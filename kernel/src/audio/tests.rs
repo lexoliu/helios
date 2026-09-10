@@ -809,6 +809,78 @@ fn a_players_feedback_ends_when_the_stream_is_torn_down() {
     );
 }
 
+/// A feedback reader belongs to the claim that opened it: once that
+/// claim is let go, the reader's stream ends, and what the next claim
+/// publishes is never the released reader's to see.
+///
+/// The reader is armed before the release lands, so this is also the
+/// check that a wait parked through a hand-off wakes to its own end
+/// rather than to somebody else's queue.
+#[test]
+fn a_released_claims_reader_ends_and_never_sees_the_next_claims_feedback() {
+    test_hooks::install();
+    let (service, inboxes) = service_of(&[playback_stream(0)]);
+    let mut audio = AudioOwnership::new();
+    audio
+        .claim(&service, 0, window())
+        .expect("the stream is free");
+    let mut feedback = audio
+        .claim_ref()
+        .expect("the claim was just taken")
+        .feedback();
+
+    block_on(async {
+        assert_eq!(
+            poll_once(core::future::poll_fn(|cx| feedback.poll_burst(cx))).await,
+            None,
+            "a live claim's reader parks when nothing is queued"
+        );
+    });
+
+    audio.release();
+
+    let device = ScriptedDevice::new(topology(&[playback_stream(0)]));
+    let timer = Timer::new(TestCpu::without_entropy());
+    let inbox = &inboxes[0];
+    block_on(async {
+        // One turn of the task's loop takes the release: the claim word
+        // goes free and the feedback is closed under the armed reader.
+        let served = poll_once(pin!(serve_playback(
+            &device,
+            stream_of(&service),
+            inbox,
+            &timer
+        )))
+        .await;
+        assert_eq!(
+            served, None,
+            "the task keeps serving after it has released a claim"
+        );
+    });
+
+    let mut second = AudioOwnership::new();
+    second
+        .claim(&service, 0, window())
+        .expect("the released stream is free to take");
+    let mut fresh = second
+        .claim_ref()
+        .expect("the claim was just taken")
+        .feedback();
+    stream_of(&service).publish(Feedback::Xrun);
+
+    block_on(async {
+        assert_eq!(
+            poll_once(core::future::poll_fn(|cx| feedback.poll_burst(cx))).await,
+            Some(None),
+            "the released claim's reader ended rather than reading on"
+        );
+        let burst = core::future::poll_fn(|cx| fresh.poll_burst(cx))
+            .await
+            .expect("the holding claim's reader still reads");
+        assert_eq!(burst.as_slice(), &[Feedback::Xrun]);
+    });
+}
+
 /// A `stop` asked for while a player is still writing ends that
 /// player's stream.
 ///
