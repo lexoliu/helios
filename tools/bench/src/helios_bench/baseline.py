@@ -32,7 +32,10 @@ Shared, and therefore unable to explain a difference between the columns:
   (the CPython root, the WASI tools, the WASIX programs), linked into the
   baseline worktree entry by entry rather than copied;
 - the vendored Wasmtime checkout, linked as the worktree's sibling so
-  that both kernels compile against one revision.
+  that both kernels compile against one revision;
+- the fetched kernel profile store (`target/profiles`, docs/pgo.md),
+  linked into the worktree so that both x86-64 release kernels compile
+  against the one profile in force when the run started (#321).
 
 Per side, and therefore what the comparison measures: the kernel image,
 the bootfs it carries (the compiler plugin included) and the guest
@@ -60,6 +63,12 @@ ARTIFACTS = "artifacts"
 # directory below the worktree root.
 WASMTIME = "wasmtime"
 CHECKOUT = "helios"
+# Where `helios-cli profile-fetch` keeps the kernel profile a release
+# build reads, relative to a checkout (`helios-profdata`'s store). The
+# baseline worktree links the candidate's rather than fetching its own,
+# because a second fetch could resolve a newer collection than the
+# candidate read and the pairing would then vary two things.
+PROFILE_STORE = Path("target") / "profiles"
 
 
 @dataclass(frozen=True)
@@ -120,6 +129,7 @@ def prepare(baseline: Baseline) -> Path:
     """Creates or reuses the baseline worktree and everything it shares."""
     checkout = ensure_worktree(baseline.sha)
     link_wasmtime(baseline.sha)
+    link_profile_store(baseline.sha)
     link_missing(REPO_ROOT / ARTIFACTS, checkout / ARTIFACTS)
     return checkout
 
@@ -155,6 +165,21 @@ def link_wasmtime(sha: str) -> None:
             f"{source} is not the vendored Wasmtime checkout the workspace depends on; see docs/wasmtime.md"
         )
     link_to(source, worktree_root(sha) / WASMTIME)
+
+
+def link_profile_store(sha: str) -> None:
+    """Links the candidate's kernel profile store into the baseline worktree.
+
+    The inspector that builds the baseline guest is the candidate's, with
+    `HELIOS_WORKSPACE_ROOT` naming the worktree, so an x86-64 release
+    build reads the store under the worktree's own `target/`. Linking it
+    to the candidate's means both images read the record in force when
+    the run started, and a `baseline_ref` pairing attributes a difference
+    to the commit and never to a difference of profile. The link is made
+    whether or not the lane's target reads a profile: a target that does
+    not never opens the store.
+    """
+    link_to(REPO_ROOT / PROFILE_STORE, checkout_path(sha) / PROFILE_STORE)
 
 
 def link_to(source: Path, link: Path) -> None:
