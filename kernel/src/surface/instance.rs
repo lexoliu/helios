@@ -56,6 +56,9 @@ pub struct SurfaceOwnership {
     pins: Option<SurfacePins>,
     /// The windows this instance owns, alongside the run each lives in.
     held: ArrayVec<(Arc<SurfaceShared>, PinnedFrame), MAX_INSTANCE_SURFACES>,
+    /// The views this instance holds of somebody else's windows, which
+    /// is the compositor's half and empty on everybody else.
+    views: ArrayVec<(SurfaceId, PinnedFrame), MAX_LIVE_SURFACES>,
     /// The registry to hand `pins` back to. Present exactly when `pins`
     /// is.
     service: Option<SurfaceService>,
@@ -66,6 +69,7 @@ impl SurfaceOwnership {
         Self {
             pins: None,
             held: ArrayVec::new_const(),
+            views: ArrayVec::new_const(),
             service: None,
         }
     }
@@ -163,16 +167,30 @@ impl SurfaceOwnership {
         &mut self,
         registry: &SurfaceService,
         window: DeviceWindow,
+        id: SurfaceId,
         physical: helios_hal::iommu::PhysicalRange,
     ) -> Result<PinnedFrame, SurfaceServiceError> {
+        if self.views.is_full() {
+            return Err(SurfaceServiceError::TooManySurfaces);
+        }
         let arena = Self::arena(&mut self.pins, &mut self.service, window, registry);
-        Ok(arena.map(physical)?)
+        let view = arena.map(physical)?;
+        self.views.push((id, view));
+        Ok(view)
     }
 
-    /// Drop one view this instance holds.
-    pub fn unmap_view(&mut self, frame: PinnedFrame) {
+    /// Drop this instance's view of one window.
+    ///
+    /// Unmapping frees nothing — the pages are the client's — so this is
+    /// safe to do the moment the window is gone, and doing it then is
+    /// what proves the compositor can no longer read them.
+    pub fn unmap_view(&mut self, id: SurfaceId) {
+        let Some(index) = self.views.iter().position(|(held, _)| *held == id) else {
+            return;
+        };
+        let (_, view) = self.views.remove(index);
         if let Some(pins) = self.pins.as_mut() {
-            pins.unpin(frame);
+            pins.unpin(view);
         }
     }
 

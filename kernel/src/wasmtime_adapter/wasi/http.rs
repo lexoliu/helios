@@ -1149,7 +1149,9 @@ where
             Err(ProviderError::Unavailable) => {
                 return Err(http_types::ErrorCode::ConfigurationError.into());
             }
-            Err(ProviderError::Closed) => return Err(plugin_unavailable()),
+            // A full queue never reaches here: `send` parks for room
+            // rather than reporting one.
+            Err(ProviderError::Closed | ProviderError::Full) => return Err(plugin_unavailable()),
         }
 
         let response = match response_rx.await {

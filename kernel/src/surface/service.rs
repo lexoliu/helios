@@ -77,6 +77,15 @@ impl SurfaceId {
     pub const fn raw(self) -> u64 {
         self.0
     }
+
+    /// The identity a guest named.
+    ///
+    /// Every identity the kernel minted is live in the registry or it is
+    /// not; a number a guest invented names nothing and is refused by
+    /// the lookup, so this needs no validation of its own.
+    pub const fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
 }
 
 /// The pixel geometry of one window.

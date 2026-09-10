@@ -59,6 +59,9 @@ pub enum ProviderError {
     /// The provider was installed but has since stopped receiving.
     #[error("provider stopped")]
     Closed,
+    /// The provider's queue is full and the caller could not wait.
+    #[error("provider queue is full")]
+    Full,
 }
 
 /// Shared state of one provider queue.
@@ -138,6 +141,26 @@ impl<M> ProviderSender<M> {
     }
 }
 
+impl<M> ProviderSender<M> {
+    /// Queue `message` if there is room, and report rather than park
+    /// when there is not.
+    ///
+    /// For the callers that cannot await: a `Drop` telling a plugin that
+    /// something it was serving is gone. A message that does not fit is
+    /// a plugin that is already behind, and the caller says what losing
+    /// it costs at its own call site.
+    pub fn try_send(&self, message: M) -> Result<(), ProviderError> {
+        match self.channel.queue.push(message) {
+            Ok(()) => {
+                self.channel.ready.notify_one();
+                Ok(())
+            }
+            Err(PushError::Full(_)) => Err(ProviderError::Full),
+            Err(PushError::Closed(_)) => Err(ProviderError::Closed),
+        }
+    }
+}
+
 impl<M> ProviderReceiver<M> {
     /// Await the next message, or `None` once the queue is closed and drained.
     pub async fn recv(&self) -> Option<M> {
@@ -209,6 +232,16 @@ impl<M> ProviderSlot<M> {
             let sender = sender.ok_or(ProviderError::Unavailable)?;
             sender.send(message).await
         }
+    }
+
+    /// Hand `message` to the provider without waiting for room.
+    ///
+    /// For the callers that cannot await, which is every `Drop`.
+    pub fn try_send(&self, message: M) -> Result<(), ProviderError> {
+        self.sender
+            .get()
+            .ok_or(ProviderError::Unavailable)?
+            .try_send(message)
     }
 }
 

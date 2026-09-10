@@ -181,6 +181,15 @@ impl DeviceOwnership {
         Ok((&mut self.surfaces, window))
     }
 
+    /// Drop this instance's view of the window `id` names.
+    ///
+    /// The compositor's half of a surface's teardown, and a no-op on an
+    /// instance that never held a view — which is every instance that is
+    /// not the compositor.
+    pub fn unmap_surface_view(&mut self, id: crate::surface::SurfaceId) {
+        self.surfaces.unmap_view(id);
+    }
+
     /// This instance's side of the display path.
     pub const fn display(&self) -> &DisplayOwnership {
         &self.display

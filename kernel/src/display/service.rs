@@ -447,6 +447,8 @@ impl Drop for DisplayClaim {
 
 const fn closed(error: ProviderError) -> DisplayServiceError {
     match error {
-        ProviderError::Unavailable | ProviderError::Closed => DisplayServiceError::Closed,
+        ProviderError::Unavailable | ProviderError::Closed | ProviderError::Full => {
+            DisplayServiceError::Closed
+        }
     }
 }
