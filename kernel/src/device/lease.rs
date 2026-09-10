@@ -66,6 +66,21 @@ pub const MAX_DMA_BUFFERS: usize = 16;
 /// long as the claim.
 pub const DISPLAY_WINDOW_BYTES: u64 = 256 << 20;
 
+/// Bytes of a linear-memory reservation the kernel keeps for the client
+/// windows of an instance that draws on the desktop.
+///
+/// A compositor surface wants what a display frame buffer wants —
+/// pinned, physically contiguous pages at a fixed offset in an
+/// instance's own linear memory, above everything the instance can grow
+/// into — so it is the same mechanism with its own window rather than a
+/// second cursor into the display's arena. The window carries two
+/// different things depending on which side of the surface path the
+/// instance is on: a client's own frame buffers, or the compositor's
+/// views of every client's. Sized for the compositor's case, which is
+/// the larger: sixty-four windows of the sizes a desktop hands out. It
+/// costs an instance nothing until it asks for its first surface.
+pub const SURFACE_WINDOW_BYTES: u64 = 256 << 20;
+
 /// The part of one owner's linear memory the kernel devotes to its
 /// device.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

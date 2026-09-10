@@ -46,8 +46,8 @@ use concurrent_queue::ConcurrentQueue;
 use crate::component::{ProviderError, ProviderSender};
 use crate::exec::{Notify, NotifyWaiter};
 
+use super::DisplayPins;
 use super::DisplayServiceError;
-use super::pins::DisplayPins;
 
 /// Requests one claim may have in flight on each queue before its next
 /// one waits for room.
@@ -447,6 +447,8 @@ impl Drop for DisplayClaim {
 
 const fn closed(error: ProviderError) -> DisplayServiceError {
     match error {
-        ProviderError::Unavailable | ProviderError::Closed => DisplayServiceError::Closed,
+        ProviderError::Unavailable | ProviderError::Closed | ProviderError::Full => {
+            DisplayServiceError::Closed
+        }
     }
 }

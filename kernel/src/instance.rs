@@ -79,6 +79,15 @@ pub enum MemoryPool {
 pub struct InstanceId(u64);
 
 impl InstanceId {
+    /// The identifier an inspector or a guest names an instance by.
+    ///
+    /// Nothing about the number is meaningful outside the registry that
+    /// issued it: an identifier that names no live instance is answered
+    /// with a "no such instance", never with a different one.
+    pub const fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+
     pub const fn raw(self) -> u64 {
         self.0
     }
@@ -92,16 +101,32 @@ pub enum KillReason {
     OutOfMemory,
     /// Supervisor restart after a fault or quarantine breach.
     SupervisorRestart,
+    /// Asked for by an operator, through the inspector.
+    Operator,
+}
+
+/// What came of a request to stop an instance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KillOutcome {
+    /// The instance is flagged and unwinds at its next yield point.
+    Requested,
+    /// It was already condemned, by the OOM killer or an earlier
+    /// request, and the reason it is going stays the first one.
+    AlreadyStopping,
+    /// No live instance carries that identifier.
+    NoSuchInstance,
 }
 
 const KILL_FLAG_NONE: u8 = 0;
 const KILL_FLAG_OOM: u8 = 1;
 const KILL_FLAG_SUPERVISOR: u8 = 2;
+const KILL_FLAG_OPERATOR: u8 = 3;
 
 const fn encode_kill_reason(reason: KillReason) -> u8 {
     match reason {
         KillReason::OutOfMemory => KILL_FLAG_OOM,
         KillReason::SupervisorRestart => KILL_FLAG_SUPERVISOR,
+        KillReason::Operator => KILL_FLAG_OPERATOR,
     }
 }
 
@@ -109,6 +134,7 @@ const fn decode_kill_flag(value: u8) -> Option<KillReason> {
     match value {
         KILL_FLAG_OOM => Some(KillReason::OutOfMemory),
         KILL_FLAG_SUPERVISOR => Some(KillReason::SupervisorRestart),
+        KILL_FLAG_OPERATOR => Some(KillReason::Operator),
         _ => None,
     }
 }
@@ -481,14 +507,21 @@ impl InstanceRegistry {
     /// victim could run until its next host call, which on adversarial
     /// workloads is "indefinitely". It is also what bounds the ledger's
     /// wait: see [`OOM_RECLAIM_GRACE`].
-    pub fn request_kill(&self, id: InstanceId, reason: KillReason, now_nanos: u64) -> bool {
+    pub fn request_kill(&self, id: InstanceId, reason: KillReason, now_nanos: u64) -> KillOutcome {
         let entries = self.inner.entries.lock();
-        let flipped = condemn_entry(&entries, id, reason, now_nanos).is_some();
+        let outcome = if entries.iter().any(|(_, entry)| entry.id == id) {
+            match condemn_entry(&entries, id, reason, now_nanos) {
+                Some(_) => KillOutcome::Requested,
+                None => KillOutcome::AlreadyStopping,
+            }
+        } else {
+            KillOutcome::NoSuchInstance
+        };
         drop(entries);
-        if flipped {
+        if outcome == KillOutcome::Requested {
             self.notify_kill();
         }
-        flipped
+        outcome
     }
 
     fn notify_kill(&self) {

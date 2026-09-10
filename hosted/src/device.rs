@@ -213,6 +213,23 @@ fn unmap_device(virt: VirtRange) -> Result<(), AddressSpaceError> {
     platform().address_space.unmap_device(virt)
 }
 
+/// The hosted machine cannot hand two owners the same bytes: its
+/// "physical" addresses are host virtual addresses inside one anonymous
+/// mapping, so there is nothing to map a second time. The address space
+/// says so — this backend has no display device either, and a compositor
+/// is what asks for a shared surface.
+fn map_shared(
+    virt: VirtRange,
+    physical: PhysicalRange,
+    flags: PageFlags,
+) -> Result<(), AddressSpaceError> {
+    platform().address_space.map_shared(virt, physical, flags)
+}
+
+fn unmap_shared(virt: VirtRange) -> Result<(), AddressSpaceError> {
+    platform().address_space.unmap_shared(virt)
+}
+
 fn commit_contiguous(
     virt: VirtRange,
     flags: PageFlags,
@@ -248,6 +265,8 @@ fn unmask(source: u32) {
 static VM_HOOKS: DeviceVmHooks = DeviceVmHooks {
     map_device,
     unmap_device,
+    map_shared,
+    unmap_shared,
     commit_contiguous,
     release_contiguous,
     mapping_granule,

@@ -158,3 +158,58 @@ pub mod input {
         });
     }
 }
+
+/// Bindings for the interface a program reaches its windows on the
+/// desktop through.
+///
+/// Generated from the `surface-host` world, for the reason
+/// `display-host` is: the kernel implements this one interface — it
+/// serves none of it, it forwards — and the program bindings above
+/// already provide every `wasi:cli` import a client also has.
+pub mod surface {
+    pub mod bindings {
+        use wasmtime;
+
+        wasmtime::component::bindgen!({
+            path: "../wit",
+            world: "surface-host",
+            imports: {
+                // The call that hands back a reader has to see the store,
+                // so it can build one against it; it returns the reader
+                // immediately rather than awaiting.
+                "helios:system/surface.[method]surface.events": store | trappable,
+                // `create`, `commit` and `deliver` all reach the
+                // compositor and are `async func` in the WIT, generated
+                // against the store on their own account. What is left —
+                // reading back where a frame buffer landed, the geometry,
+                // dropping a handle — is store bookkeeping and answers
+                // without waiting.
+                default: trappable,
+            },
+            with: {
+                "helios:system/surface.surface":
+                    crate::wasmtime_adapter::component_host::ClientSurfaceHandle,
+            },
+            require_store_data_send: true,
+        });
+    }
+}
+
+/// Bindings for the export the compositor plugin answers on.
+///
+/// Generated from the `compositor-host` world rather than from
+/// `compositor`, the way `http-host` is separate from `http-handler`:
+/// this is the one interface the kernel *calls*, and the plugin's own
+/// imports are the program bindings above.
+pub mod compositor {
+    pub mod bindings {
+        use wasmtime;
+
+        wasmtime::component::bindgen!({
+            path: "../wit",
+            world: "compositor-host",
+            exports: { default: async | store },
+            require_store_data_send: true,
+        });
+    }
+}

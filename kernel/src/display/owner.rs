@@ -48,11 +48,11 @@ use crate::component::{ProviderReceiver, provider_channel};
 use crate::exec::monotonic_nanos;
 
 use super::DisplayServiceError;
-use super::pins::MAX_PINNED_FRAMES;
 use super::service::{
     ClaimState, ControlRequest, CursorRequest, DisplayService, DisplayShared, FrameToken,
     REQUEST_QUEUE_DEPTH,
 };
+use crate::pins::MAX_PINNED_FRAMES;
 
 /// Brings the machine's display under kernel ownership and publishes the
 /// service `helios:system/display` is served from.

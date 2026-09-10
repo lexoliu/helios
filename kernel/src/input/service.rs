@@ -469,6 +469,8 @@ impl InputEvents {
 
 const fn closed(error: ProviderError) -> InputServiceError {
     match error {
-        ProviderError::Unavailable | ProviderError::Closed => InputServiceError::Closed,
+        ProviderError::Unavailable | ProviderError::Closed | ProviderError::Full => {
+            InputServiceError::Closed
+        }
     }
 }

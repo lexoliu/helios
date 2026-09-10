@@ -1,0 +1,24 @@
+# Drive the compositor's desktop: put the pointer on the terminal, then
+# type a command at it.
+#
+# The axis range is QEMU's own 0..=32767 rather than guest pixels: the
+# host cannot know what mode the guest chose. The middle of the screen is
+# inside the terminal window, which the desktop lays out with a margin
+# around it, so this is what gives the terminal the keyboard — focus
+# follows the pointer and nothing else moves it.
+abs 16384 16384
+
+# `echo hello`, one key at a time, then Enter. The terminal echoes what
+# it is typed and the shell prints what it produces, so a capture taken
+# after this shows the command on one row and its output on the next.
+key e
+key c
+key h
+key o
+key spc
+key h
+key e
+key l
+key l
+key o
+key ret

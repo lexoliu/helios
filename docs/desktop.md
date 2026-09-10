@@ -237,3 +237,178 @@ and `MOVE_CURSOR` it processes with the position each carried, and
 `display-test` printed on a `display-test:frame` line is one the device
 logged as a move, after it logged the cursor image. The lane runs that
 check beside the gradient's.
+
+## The compositor
+
+`programs/compositor` is the kernel plugin that owns the desktop. It is
+bootfs-provisioned at `/bin/compositor`, installed at kernel startup and
+supervised the way `http-client` is: the same restart cost, the same
+user-memory contract, and no plugin-private policy anywhere. What makes
+it a plugin rather than a program is provisioning and lifecycle; inside
+Wasmtime it is an ordinary user-mode component under the ordinary
+isolation model. What it draws with — the glyph raster, the cell blend,
+the terminal grid, the damage tracker and the key translation — is a
+plain library, `programs/compositor/render`, with no world and no export
+in it; the plugin crate holds only the component and builds only the
+`cdylib` the kernel loads. The host-side capture check links the same
+library, so a host build never meets a component-model export name and
+the check cannot disagree with the desktop about a glyph, a colour or a
+cell.
+
+It claims the display through `helios:system/display` and every device
+`helios:system/input` lists, and says so on the way up:
+
+```text
+compositor:online scanout=0 width=1280 height=800
+compositor:terminal columns=173 rows=45 cell-width=7 cell-height=16 origin=34,34
+compositor:device name=QEMU Virtio Mouse
+compositor:device name=QEMU Virtio Tablet
+compositor:device name=QEMU Virtio Keyboard
+compositor:shell path=/bin/dash
+```
+
+and one line per frame it presents, carrying how many rectangles carried
+the change and where it put the pointer:
+
+```text
+compositor:frame sequence=7 regions=1 cursor=639,399
+```
+
+Neither of those is in a capture. A full-screen flush looks exactly like
+a damage-tracked one in a still, and the pointer is a plane the scanout
+does not hold, so the numbers on that line and the device's own cursor
+trace are what say otherwise. `tools/desktop/check-cursor.py` reads the
+two together.
+
+What it draws is a generated wallpaper — a function of the pixel's
+position, so any rectangle of it can be redrawn without a copy of it
+anywhere — a terminal window, and a window for each surface a client
+asked for.
+
+### Damage, and why a keystroke is not a frame
+
+The desktop never flushes the whole scanout because something changed on
+it. Every change records the rectangle it changed, `programs/compositor`'s
+damage tracker merges what overlaps or touches and keeps apart what does
+not, and `present` is called once per rectangle that survives. A
+keystroke is one character cell; a scrolled screen is the rows that
+moved; a client's commit is the strip the client named, clipped to its
+window. Past eight disjoint rectangles the two whose union wastes the
+fewest pixels are merged, so the set never grows without limit and never
+degenerates into "the whole screen" while a cheaper answer exists.
+
+The pointer costs no pixels at all. It is the display engine's own plane,
+set once with `set-cursor` and moved with `move-cursor`, so pointer
+motion never waits behind a frame and never damages one.
+
+### Focus follows the pointer
+
+What lies under the pointer has the keyboard: the terminal, a client
+window, or the wallpaper, which has no keyboard at all. Nothing else
+moves focus — there is no click to raise and no shortcut to cycle — and a
+change of focus damages only the two borders that changed colour.
+
+Keys become bytes through one layout table indexed by evdev's own codes,
+because those codes are the keys' positions on the board. The terminal
+echoes what it is typed itself: there is no line discipline between the
+compositor and the shell, which reads a stream rather than a terminal, so
+a desktop that did not echo would show nothing until a command produced
+output.
+
+## The surface contract
+
+`helios:system/surface` is how a program that is not the compositor puts
+pixels on the screen:
+
+```wit
+create: async func(width: u32, height: u32) -> result<surface, error>;
+
+resource surface {
+  buffer: func() -> placement;
+  commit: async func(region: rect) -> result<_, error>;
+  events: func() -> stream<input-event>;
+}
+```
+
+The kernel implements the client-facing half and the compositor exports
+`helios:system/compositor`, which the kernel forwards to through a typed
+provider slot. That is exactly the route `wasi:http/client.send` takes to
+the `http-client` plugin's `wasi:http/handler`, generalised rather than
+copied: the slot is a write-once typed hand-off, and a call that arrives
+before a plugin has claimed it is refused rather than queued.
+
+Pixels never travel through the kernel. `create` commits one physically
+contiguous run in the client's own surface window — charged to the
+client's pool, above its growth limit, so nothing the allocator hands out
+can reach it — and maps that same run a second time into the
+compositor's surface window with ordinary cacheable attributes. The two
+components address the same pages: what the client writes is what the
+compositor blits, and `commit` carries a rectangle rather than bytes.
+
+A surface's pages come back when the client's arena ends, not when one
+surface is dropped. Dropping a surface retires its identity and tells the
+compositor to forget the window; the pages stay pinned until the whole
+instance goes, at which point the kernel hands the arena to the
+supervisor, which calls the compositor's `destroy` for each window,
+unmaps the compositor's views, and only then drops the arena. Freeing
+pages the compositor still had mapped would be a use-after-free across an
+isolation boundary, and the ordering is what rules it out.
+
+`events` carries the input the focused surface is entitled to, in the
+same evdev vocabulary `helios:system/input` uses, with pointer positions
+translated into the surface's own pixels.
+
+## When the compositor dies
+
+The display and every input device are the compositor's claims, and the
+kernel releases them when the instance goes — a claim belongs to the
+instance that took it, and there is no path that leaves one held by a
+component that no longer exists. The scanout goes blank in the interval,
+because there is nothing to draw it. The supervisor rebuilds the plugin
+after a short delay, it claims the devices again, and the desktop comes
+back with a fresh terminal.
+
+Killing it is how that is shown:
+
+```bash
+./target/release/helios-inspector instances --kill-name compositor-plugin
+```
+
+and inside a capture sequence, which is where the evidence lives: a
+restart is one machine before and after, not two machines, so
+`screendump` takes it in one boot.
+
+```bash
+./target/release/helios-inspector vm --arch x86-64 --release --accel kvm \
+    --desktop --display none \
+    --boot-program dash --boot-program debugger --boot-program compositor \
+    screendump --settle-seconds 20 \
+      --input tools/desktop/desktop-probe.input --input-interval-ms 150 \
+      --kill-instance compositor-plugin --kill-settle-ms 200 \
+      before.png blank.png after.png
+```
+
+`before.png` shows the desktop with the command and its output on it,
+`blank.png` shows a scanout with nothing on it at all — the display was
+the compositor's claim and the kernel released it with the instance —
+and `after.png` shows the desktop the supervisor put back, with a fresh
+terminal rather than the dead one's. `smoke-x86-64` runs exactly that
+and checks all three.
+
+The kill is a flag the instance observes the next time it runs, so an
+instance parked on a host future — a compositor waiting for input — is
+given one pointer nudge after it, which is the turn it needs to see the
+flag.
+
+`instances` lists what the registry holds and stops one of them by
+identifier or by name. The kill is a flag, not a teardown: the instance
+unwinds at its next yield point, which is what makes it safe to ask for
+from outside. Naming the instance rather than its identifier is what a
+script wants — `compositor-plugin` is the same name on every boot, while
+the identifiers are whatever that boot allocated.
+
+```text
+ERROR [helios_kernel…::exec] program instance was killed reason=Operator
+WARN  [helios_kernel::supervisor] the compositor died; rebuilding it
+INFO  [helios_kernel::supervisor] compositor online instance=4
+```

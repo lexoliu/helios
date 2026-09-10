@@ -17,9 +17,12 @@
 use helios_hal::vmm::VirtAddr;
 
 use crate::display::{DisplayOwnership, DisplayService, DisplayServiceError};
+use crate::surface::{SurfaceOwnership, SurfaceServiceError};
 
 use super::grant::{DeviceName, GrantError};
-use super::lease::{DEVICE_WINDOW_BYTES, DISPLAY_WINDOW_BYTES, DeviceWindow, GrantLease};
+use super::lease::{
+    DEVICE_WINDOW_BYTES, DISPLAY_WINDOW_BYTES, DeviceWindow, GrantLease, SURFACE_WINDOW_BYTES,
+};
 use super::registry::DeviceGrantRegistry;
 
 /// Where an instance's linear memory sits, and how much address space
@@ -59,6 +62,10 @@ pub struct DeviceOwnership {
     lease: Option<GrantLease>,
     /// The display, once this instance claimed it.
     display: DisplayOwnership,
+    /// The client windows this instance draws in, or the views of
+    /// everybody's it composes. Empty on every instance that neither
+    /// asks for a window nor composes the desktop.
+    surfaces: SurfaceOwnership,
 }
 
 impl DeviceOwnership {
@@ -68,6 +75,7 @@ impl DeviceOwnership {
             high_water_bytes: 0,
             lease: None,
             display: DisplayOwnership::new(),
+            surfaces: SurfaceOwnership::new(),
         }
     }
 
@@ -105,10 +113,8 @@ impl DeviceOwnership {
             .filter(|_| self.lease.is_some())
             .map(|window| window.offset());
         let display = self.display.window().map(|window| window.offset());
-        match (device, display) {
-            (Some(device), Some(display)) => Some(device.min(display)),
-            (limit, None) | (None, limit) => limit,
-        }
+        let surfaces = self.surfaces.window().map(|window| window.offset());
+        [device, display, surfaces].into_iter().flatten().min()
     }
 
     /// The window this instance's device mappings would live in.
@@ -127,6 +133,61 @@ impl DeviceOwnership {
                 DeviceWindow::top_of(memory.base, memory.reservation_bytes)
                     .below(DISPLAY_WINDOW_BYTES)
             })
+    }
+
+    /// The window this instance's client windows would live in, which
+    /// is the span immediately below the display window.
+    ///
+    /// Below rather than beside: an instance may hold the display *and*
+    /// draw in a window of its own, and the growth cap has to be under
+    /// the lowest window it holds either way.
+    pub fn surface_window(&self) -> Option<DeviceWindow> {
+        self.memory
+            .filter(|memory| {
+                memory.reservation_bytes
+                    > DEVICE_WINDOW_BYTES + DISPLAY_WINDOW_BYTES + SURFACE_WINDOW_BYTES
+            })
+            .map(|memory| {
+                DeviceWindow::top_of(memory.base, memory.reservation_bytes)
+                    .below(DISPLAY_WINDOW_BYTES)
+                    .below(SURFACE_WINDOW_BYTES)
+            })
+    }
+
+    /// This instance's side of the surface path.
+    pub const fn surfaces(&self) -> &SurfaceOwnership {
+        &self.surfaces
+    }
+
+    /// This instance's side of the surface path, to act on, alongside
+    /// the window its pages go in.
+    ///
+    /// The two come together because they are needed together and
+    /// because the window is what this side cannot work out for itself:
+    /// where the instance's linear memory is.
+    ///
+    /// Refused when the instance's memory has already grown over that
+    /// window, for the same reason a display claim is: the pages would
+    /// land on memory it is using.
+    pub fn surfaces_mut(
+        &mut self,
+    ) -> Result<(&mut SurfaceOwnership, DeviceWindow), SurfaceServiceError> {
+        let window = self
+            .surface_window()
+            .ok_or(SurfaceServiceError::WindowExhausted)?;
+        if self.high_water_bytes > window.offset() {
+            return Err(SurfaceServiceError::WindowExhausted);
+        }
+        Ok((&mut self.surfaces, window))
+    }
+
+    /// Drop this instance's view of the window `id` names.
+    ///
+    /// The compositor's half of a surface's teardown, and a no-op on an
+    /// instance that never held a view — which is every instance that is
+    /// not the compositor.
+    pub fn unmap_surface_view(&mut self, id: crate::surface::SurfaceId) {
+        self.surfaces.unmap_view(id);
     }
 
     /// This instance's side of the display path.

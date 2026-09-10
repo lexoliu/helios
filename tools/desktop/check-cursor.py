@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check that the pointer `display-test` moved reached the display engine.
+"""Check that the pointer a guest moved reached the display engine.
 
 A scanout capture cannot show this. QEMU hands a virtio-gpu cursor to
 its display frontend as a separate plane, and `screendump` reads the
@@ -9,8 +9,9 @@ account: with `-d trace:virtio_gpu_update_cursor` QEMU logs every
 `UPDATE_CURSOR` and `MOVE_CURSOR` it processes, with the position each
 one carried.
 
-`display-test` prints the position it moved the cursor to on every
-frame it presents. The check is that each of those positions is one the
+A guest that drives the pointer prints the position it moved the cursor
+to on every frame it presents — `display-test` and the compositor both
+do. The check is that each of those positions is one the
 device logged as a move, and that the device saw the cursor image
 (`UPDATE_CURSOR`, logged as `update` with a non-zero resource) before
 any of them — which is what "the cursor is at the injected coordinates"
@@ -25,9 +26,12 @@ import re
 import sys
 from pathlib import Path
 
-# `display-test:frame sequence=<n> cursor=<x>,<y>`: the guest's own
-# account of where it put the pointer when it presented that frame.
-GUEST_FRAME = re.compile(r"display-test:frame sequence=(\d+) cursor=(\d+),(\d+)")
+# `<program>:frame sequence=<n> cursor=<x>,<y>`: the guest's own account
+# of where it put the pointer when it presented that frame. Any guest
+# that drives the cursor plane reports it the same way — `display-test`
+# and the compositor both do — so the program's name is matched rather
+# than spelled.
+GUEST_FRAME = re.compile(r"[\w-]+:frame sequence=(\d+)[^\n]*?cursor=(\d+),(\d+)")
 
 # QEMU's `virtio_gpu_update_cursor` trace event, as `hw/display/trace-events`
 # spells it: `scanout %d, x %d, y %d, %s, res 0x%x`, where the word is
@@ -76,7 +80,7 @@ def check(inspector_log: Path, trace_log: Path) -> list[str]:
     events = device_events(read_lines(trace_log))
 
     if not frames:
-        problems.append(f"{inspector_log}: no `display-test:frame … cursor=` line; the guest never reported a pointer position")
+        problems.append(f"{inspector_log}: no `…:frame … cursor=` line; the guest never reported a pointer position")
     if not events:
         problems.append(f"{trace_log}: no `virtio_gpu_update_cursor` event; QEMU was not asked for the trace, or the guest never touched the cursor queue")
     if problems:

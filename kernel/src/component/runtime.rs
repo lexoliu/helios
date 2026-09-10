@@ -361,6 +361,10 @@ pub trait ComponentRuntimeState: Clone + Send + 'static {
     /// brought none up on.
     fn input_service(&self) -> Option<crate::input::InputService>;
 
+    /// The machine's client windows, which every instance may ask for
+    /// one of.
+    fn surface_service(&self) -> crate::surface::SurfaceService;
+
     fn profiling_enabled(&self) -> bool;
 
     fn record_profile_stack_nanos(

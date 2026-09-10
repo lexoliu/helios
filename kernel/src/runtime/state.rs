@@ -69,6 +69,15 @@ struct RuntimeStateInner<ProgramService, NetworkService, HostFsService> {
     /// and the kernel took ownership of them. Empty on a machine with
     /// none, where a claim is refused rather than trapping.
     input_service: Once<crate::input::InputService>,
+    /// The machine's client windows. Always present — it costs a few
+    /// words and a program may ask for a window on any machine — and
+    /// empty of surfaces until a compositor is provisioned.
+    surface_service: crate::surface::SurfaceService,
+    /// Queue into the `compositor` kernel plugin. Empty on a kernel
+    /// image that does not provision the plugin, in which case
+    /// `helios:system/surface` answers `unavailable` rather than
+    /// trapping.
+    compositor: ProviderSlot<crate::surface::SurfaceRequest>,
     /// What the platform's IOMMU confines, once the backend has built
     /// the domains. Empty on a machine whose devices are not behind one.
     iommu_report: Once<alloc::sync::Arc<crate::IommuReport>>,
@@ -302,6 +311,8 @@ where
                 swap: Once::new(),
                 display_service: Once::new(),
                 input_service: Once::new(),
+                surface_service: crate::surface::SurfaceService::new(),
+                compositor: ProviderSlot::new(),
                 vsock_service: Once::new(),
                 futex_table: Mutex::new(FutexTable::new()),
                 bootfs: Mutex::new(embedded_init().map(|init| init.bootfs())),
@@ -778,6 +789,21 @@ where
         self.inner.input_service.get().cloned()
     }
 
+    /// The machine's client windows.
+    pub fn surface_service(&self) -> crate::surface::SurfaceService {
+        self.inner.surface_service.clone()
+    }
+
+    /// The hand-off slot for the `compositor` kernel plugin.
+    ///
+    /// The plugin supervisor installs the queue during startup; every
+    /// `helios:system/surface` call sends its work through it. The slot
+    /// stays empty when the plugin is not provisioned, which that
+    /// binding reports to the guest as `unavailable`.
+    pub fn compositor(&self) -> &ProviderSlot<crate::surface::SurfaceRequest> {
+        &self.inner.compositor
+    }
+
     /// Publishes the root DRBG the backend seeded at boot.
     pub fn install_root_entropy(&self, root: RootEntropyHandle) {
         let mut installed = false;
@@ -996,6 +1022,10 @@ where
 
     fn input_service(&self) -> Option<crate::input::InputService> {
         RuntimeState::input_service(self)
+    }
+
+    fn surface_service(&self) -> crate::surface::SurfaceService {
+        RuntimeState::surface_service(self)
     }
 
     fn profiling_enabled(&self) -> bool {

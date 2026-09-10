@@ -69,6 +69,7 @@ clippy-host:
         --workspace --all-targets \
         --exclude helios \
         --exclude helios-aarch64 --exclude helios-riscv --exclude helios-x86 \
+        --exclude helios-compositor \
         --exclude helios-date --exclude helios-debugger --exclude helios-display-test \
         --exclude helios-http-client \
         --exclude helios-init --exclude helios-input-test \
@@ -84,7 +85,7 @@ clippy-programs:
     # One program per invocation: they select mutually exclusive
     # `helios-api` worlds, and a single invocation covering several of
     # them would unify those features and fail to build.
-    for package in helios-date helios-debugger helios-display-test helios-http-client \
+    for package in helios-compositor helios-date helios-debugger helios-display-test helios-http-client \
         helios-init helios-input-test helios-oob-load helios-perf helios-ping \
         helios-procbench helios-sched-tasks; do
         cargo clippy -p "${package}" --all-targets -- -D warnings
@@ -104,6 +105,11 @@ test-units:
     export HELIOS_KERNEL_PREBUILD_MANIFEST="${out_dir}/kernel-prebuild.json"
     cargo nextest run -p helios-hal -p helios-virtio -p helios-netstack -p helios-kernel --lib
     cargo nextest run -p helios-workspace-root --lib
+    # What the desktop draws with — damage tracking, focus routing, the
+    # terminal grid — is a plain library (`programs/compositor/render`)
+    # and is tested here rather than only inside a boot, alongside the
+    # capture check that links it.
+    cargo nextest run -p helios-compositor-render -p helios-desktop-text-check
     cargo nextest run -p helios-inspector-protocol --lib
     cargo nextest run -p helios-kernel --test hal_layering
     python3 "{{repo_root}}/x86/tests/interrupt_state.py"
@@ -184,6 +190,7 @@ check-host:
     HELIOS_KERNEL_PREBUILD_MANIFEST="${manifest}" cargo check -p helios-kernel
     HELIOS_KERNEL_PREBUILD_MANIFEST="${manifest}" cargo check -p helios-hosted
     cargo check -p helios-inspector
+    cargo check -p helios-compositor-render -p helios-desktop-text-check
 
 # Run hosted embedded-debugger smoke test.
 test-embedded-debugger:

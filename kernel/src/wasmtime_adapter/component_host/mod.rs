@@ -21,11 +21,11 @@ use crate::{
 };
 use crate::{
     ComponentCache, ComponentOutputMode, ComponentOutputRoute, ComponentOutputStreamKind,
-    ComponentStoreData, DeadlinePollable, EmbeddedComponent, ExecResult, ProgramExecError,
-    ProgramExecErrorDetail, ProgramExecErrorKind, RawMutex, RawMutexGuardResource,
-    RawMutexResource, RawRwLock, RawRwLockReadGuardResource, RawRwLockResource,
-    RawRwLockWriteGuardResource, SerialPortResource, elapsed_millis, largest_servable_user_bytes,
-    machine_memory, monotonic_nanos, user_heap_stats,
+    ComponentStoreData, DeadlinePollable, EmbeddedComponent, ExecResult, InstanceId, KillOutcome,
+    KillReason, ProgramExecError, ProgramExecErrorDetail, ProgramExecErrorKind, RawMutex,
+    RawMutexGuardResource, RawMutexResource, RawRwLock, RawRwLockReadGuardResource,
+    RawRwLockResource, RawRwLockWriteGuardResource, SerialPortResource, elapsed_millis,
+    largest_servable_user_bytes, machine_memory, monotonic_nanos, user_heap_stats,
 };
 use helios_hal::cpu::Cpu;
 use spin::Mutex;
@@ -83,8 +83,8 @@ mod topology;
 mod vsock;
 
 pub use service::{
-    ChildExit, ChildHandle, DisplayHandle, InputDeviceHandle, SurfaceHandle, UserProgramService,
-    install_component_host_program_service, install_program_service,
+    ChildExit, ChildHandle, ClientSurfaceHandle, DisplayHandle, InputDeviceHandle, SurfaceHandle,
+    UserProgramService, install_component_host_program_service, install_program_service,
     run_component_host_processor_forever, run_embedded_component_forever,
     run_program_workers_forever,
 };
@@ -1616,6 +1616,7 @@ where
     device::add_device_to_linker(linker)?;
     service::add_display_to_linker(linker)?;
     service::add_input_to_linker(linker)?;
+    service::add_surface_to_linker(linker)?;
     add_instances_to_linker(linker)?;
     add_tracing_to_linker(linker)?;
     debugger_profiling::add_to_linker(linker)?;
@@ -1815,6 +1816,7 @@ where
     device::add_device_to_linker(linker)?;
     service::add_display_to_linker(linker)?;
     service::add_input_to_linker(linker)?;
+    service::add_surface_to_linker(linker)?;
     add_tracing_to_program_linker(linker)?;
     program_profiling::add_to_linker(linker)?;
     Ok(())
@@ -3330,6 +3332,24 @@ where
             .into_iter()
             .map(convert_instance)
             .collect::<Vec<_>>(),))
+    })?;
+    instance.func_wrap("kill", |caller, (id,): (u64,)| {
+        let now = caller.data().now_nanos();
+        // The flag is all this sets: the victim unwinds at its next
+        // yield point, and whoever owns it — a plugin supervisor, or
+        // nobody — decides what happens after.
+        let outcome = caller.data().instance_registry.request_kill(
+            InstanceId::from_raw(id),
+            KillReason::Operator,
+            now,
+        );
+        Ok((match outcome {
+            KillOutcome::Requested => Ok(()),
+            KillOutcome::AlreadyStopping => {
+                Err(debugger_wit::instances::KillError::AlreadyStopping)
+            }
+            KillOutcome::NoSuchInstance => Err(debugger_wit::instances::KillError::NoSuchInstance),
+        },))
     })?;
     Ok(())
 }

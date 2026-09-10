@@ -14,8 +14,8 @@
 use helios_hal::vmm::{NoSwap, SwapBackend};
 use helios_kernel::{
     ActivityChange, InstanceActivity, InstanceExecutionTransition, InstanceRegistry,
-    KernelHeapHeadroom, KillReason, MemoryPool, OOM_RECLAIM_GRACE, OomKillOutcome, OomPolicy,
-    store_kernel_heap_bytes, user_mapping_kernel_heap_bytes,
+    KernelHeapHeadroom, KillOutcome, KillReason, MemoryPool, OOM_RECLAIM_GRACE, OomKillOutcome,
+    OomPolicy, store_kernel_heap_bytes, user_mapping_kernel_heap_bytes,
 };
 
 /// A store value's own size, standing in for the wasmtime store the
@@ -92,7 +92,10 @@ fn system_components_are_never_oom_victims() {
 
     // Once that user program is condemned there is no one left to
     // condemn: the requester takes the grow failure instead.
-    assert!(registry.request_kill(victim.id, KillReason::OutOfMemory, 0));
+    assert_eq!(
+        registry.request_kill(victim.id, KillReason::OutOfMemory, 0),
+        KillOutcome::Requested
+    );
     assert!(
         registry.pick_oom_victim(MemoryPool::User).is_none(),
         "with every user instance condemned the killer must run out of victims, \
@@ -107,8 +110,8 @@ fn request_kill_flips_flag_observable_to_pending_kill() {
     instance.set_memory_bytes(128 * 1024 * 1024);
     assert_eq!(instance.pending_kill(), None);
 
-    let did_kill = registry.request_kill(instance.id(), KillReason::OutOfMemory, 0);
-    assert!(did_kill);
+    let outcome = registry.request_kill(instance.id(), KillReason::OutOfMemory, 0);
+    assert_eq!(outcome, KillOutcome::Requested);
     assert_eq!(instance.pending_kill(), Some(KillReason::OutOfMemory));
 }
 
@@ -118,10 +121,16 @@ fn request_kill_is_idempotent() {
     let instance = registry.register("victim", 0);
     instance.set_memory_bytes(64 * 1024 * 1024);
 
-    assert!(registry.request_kill(instance.id(), KillReason::OutOfMemory, 0));
+    assert_eq!(
+        registry.request_kill(instance.id(), KillReason::OutOfMemory, 0),
+        KillOutcome::Requested
+    );
     // Second call returns false — the kill is already in progress —
     // and the recorded reason is the original one.
-    assert!(!registry.request_kill(instance.id(), KillReason::SupervisorRestart, 10));
+    assert_eq!(
+        registry.request_kill(instance.id(), KillReason::SupervisorRestart, 10),
+        KillOutcome::AlreadyStopping
+    );
     assert_eq!(instance.pending_kill(), Some(KillReason::OutOfMemory));
 }
 
@@ -137,7 +146,10 @@ fn condemned_instances_are_excluded_from_subsequent_picks() {
         .pick_oom_victim(MemoryPool::User)
         .expect("first victim");
     assert_eq!(first.id, big.id());
-    assert!(registry.request_kill(first.id, KillReason::OutOfMemory, 0));
+    assert_eq!(
+        registry.request_kill(first.id, KillReason::OutOfMemory, 0),
+        KillOutcome::Requested
+    );
 
     // big is now condemned; the next pick must move on to small.
     let second = registry
@@ -151,7 +163,10 @@ fn kill_supervisor_restart_decodes_correctly() {
     let registry = InstanceRegistry::new();
     let instance = registry.register("plugin", 0);
     instance.set_memory_bytes(1);
-    assert!(registry.request_kill(instance.id(), KillReason::SupervisorRestart, 0));
+    assert_eq!(
+        registry.request_kill(instance.id(), KillReason::SupervisorRestart, 0),
+        KillOutcome::Requested
+    );
     assert_eq!(instance.pending_kill(), Some(KillReason::SupervisorRestart));
 }
 
@@ -404,7 +419,10 @@ fn a_condemnation_seen_on_a_resume_hook_still_closes_the_activation() {
     let requester = registry.register("procbench-child", 0);
     requester.set_memory_bytes(64 * 1024);
 
-    assert!(registry.request_kill(victim.id(), KillReason::OutOfMemory, 5));
+    assert_eq!(
+        registry.request_kill(victim.id(), KillReason::OutOfMemory, 5),
+        KillOutcome::Requested
+    );
 
     // The victim was in a host call when it was condemned, and the hook
     // that sees the flag is the one returning to wasm.

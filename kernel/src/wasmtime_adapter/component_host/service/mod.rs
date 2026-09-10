@@ -13,12 +13,17 @@ pub use display::{DisplayHandle, SurfaceHandle};
 mod input;
 pub use input::InputDeviceHandle;
 pub(super) use input::add_input_to_linker;
+mod surface;
+pub use surface::ClientSurfaceHandle;
+pub(super) use surface::add_surface_to_linker;
 mod compiler;
 use compiler::*;
 mod exec;
 use exec::*;
 mod http_plugin;
 use http_plugin::*;
+mod compositor_plugin;
+use compositor_plugin::*;
 mod preview1;
 use preview1::*;
 mod wasix_proc;
@@ -432,19 +437,18 @@ where
         }),
     };
     debug_state.install_program_service(service.clone());
-    install_http_client_plugin(
-        &service,
-        ProgramExecContext {
-            cpu: cpu.clone(),
-            timer: kernel.timer(),
-            spawner: kernel.spawner(),
-            runtime_state: debug_state.clone(),
-            instance_registry: debug_state.instance_registry(),
-            parent_instance_id: None,
-            read_serial,
-            write_serial,
-        },
-    );
+    let plugin_context = ProgramExecContext {
+        cpu: cpu.clone(),
+        timer: kernel.timer(),
+        spawner: kernel.spawner(),
+        runtime_state: debug_state.clone(),
+        instance_registry: debug_state.instance_registry(),
+        parent_instance_id: None,
+        read_serial,
+        write_serial,
+    };
+    install_http_client_plugin(&service, plugin_context.clone());
+    install_compositor_plugin(&service, plugin_context);
     service
 }
 

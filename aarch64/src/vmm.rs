@@ -36,6 +36,7 @@ use core::ffi::c_int;
 use core::ptr::{self, NonNull};
 
 use helios_hal::device::{DeviceRegion, DeviceRegionAttributes, DmaPlacement, MemoryKind};
+use helios_hal::iommu::PhysicalRange;
 use helios_hal::pmm::PhysFrame;
 use helios_hal::vmm::{
     AddressSpace, AddressSpaceError, PageAge, PageFlags, SwapToken, Translation, VirtAddr,
@@ -113,6 +114,10 @@ enum DeviceBacking {
     /// A pinned run from the user pool: one buddy allocation at `phys`,
     /// made with `align`.
     Pinned { phys: usize, align: usize },
+    /// A second view of a run another reservation committed. The bytes
+    /// belong to that reservation, so tearing this mapping down frees
+    /// nothing.
+    Shared,
 }
 
 /// One device mapping inside a user reservation.
@@ -1104,6 +1109,72 @@ impl AddressSpace for Aarch64UserAddressSpace {
             self.free_pinned_run(phys, mapping.range.byte_len, align);
         }
         Ok(())
+    }
+
+    fn map_shared(
+        &self,
+        virt: VirtRange,
+        physical: PhysicalRange,
+        flags: PageFlags,
+    ) -> Result<(), AddressSpaceError> {
+        validate_range(virt)?;
+        if physical.bytes as usize != virt.byte_len
+            || !(physical.start as usize).is_multiple_of(PAGE)
+        {
+            return Err(AddressSpaceError::Misaligned);
+        }
+        // Ordinary memory attributes, not the device ones `map_device`
+        // computes: these bytes are somebody's frame buffer, and a
+        // second holder that reached them uncached would see a picture
+        // the first holder's stores had not reached yet.
+        let pte_flags = page_flags_to_pte(flags)?;
+        let phys_base = physical.start as usize;
+        let pages = virt.byte_len / PAGE;
+        // The span is claimed before a single entry is written, so two
+        // views cannot both believe they own the same window.
+        let mut devices = self.devices.lock();
+        if devices
+            .iter()
+            .any(|mapping| ranges_overlap(mapping.range, virt))
+        {
+            return Err(AddressSpaceError::DeviceMapped);
+        }
+        for page in 0..pages {
+            let virt_addr = virt.start.raw() + page * PAGE;
+            if let Err(error) = self.map_4k_no_flush(virt_addr, phys_base + page * PAGE, pte_flags)
+            {
+                for undone in 0..page {
+                    let _ = self.unmap_4k_no_flush(virt.start.raw() + undone * PAGE);
+                }
+                unsafe {
+                    flush_tlb_pages(virt.start.raw(), page);
+                }
+                return Err(error);
+            }
+        }
+        unsafe {
+            flush_tlb_pages(virt.start.raw(), pages);
+        }
+        devices.push(DeviceMapping {
+            range: virt,
+            backing: DeviceBacking::Shared,
+        });
+        Ok(())
+    }
+
+    fn unmap_shared(&self, virt: VirtRange) -> Result<(), AddressSpaceError> {
+        validate_range(virt)?;
+        let mut devices = self.devices.lock();
+        let index = devices
+            .iter()
+            .position(|mapping| {
+                mapping.range.start.raw() == virt.start.raw()
+                    && matches!(mapping.backing, DeviceBacking::Shared)
+            })
+            .ok_or(AddressSpaceError::NotCommitted)?;
+        let mapping = devices.swap_remove(index);
+        drop(devices);
+        self.tear_down_device_range(mapping.range)
     }
 
     fn commit_contiguous(

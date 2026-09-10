@@ -568,7 +568,7 @@ jobs:
           key: smoke-x86-64
       - name: Build inspector
         working-directory: helios
-        run: cargo build --release -p helios-inspector
+        run: cargo build --release -p helios-inspector -p helios-desktop-text-check
       # Every x86-64 release build is built against the kernel profile
       # the newest kernel-profile.yml run on the default branch uploaded
       # (docs/pgo.md, #226, #313); the inspector refuses to build one
@@ -826,6 +826,140 @@ jobs:
           # A report lost is a reader that did not keep up, and this run
           # injects a handful of events into a queue 64 deep.
           ! grep -Fq 'input report was dropped' "$runtime/inspector.log"
+      - name: Boot the desktop with the compositor and type at its terminal
+        shell: bash
+        working-directory: helios
+        run: |
+          # Without this the step reports tee's status, not the
+          # command's, and a runner script that fails is invisible.
+          set -o pipefail
+          # A third desktop boot, for the third claim. The two above
+          # prove the services — a display a guest can draw on, input a
+          # guest can read — and this one proves the program that owns
+          # both at once: the compositor claims the display and every
+          # input device, draws a desktop, runs the shell in a terminal
+          # on it, and puts what is typed at it on the screen.
+          #
+          # No `--no-compiler-plugin` here, unlike the two boots above:
+          # the compositor spawns `/bin/dash`, which is a raw wasm the
+          # in-kernel compiler has to turn into an artifact first.
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/desktop-compositor"
+          captures="$GITHUB_WORKSPACE/desktop-scanout"
+          mkdir -p "$runtime" "$captures"
+          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+            --accel kvm \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --desktop --display none \
+            --qemu-trace trace:virtio_gpu_update_cursor \
+            --qemu-trace-log "$runtime/qemu-trace.log" \
+            --boot-program dash --boot-program debugger \
+            --boot-program compositor \
+            screendump \
+              --input tools/desktop/desktop-probe.input --input-interval-ms 150 \
+              --settle-seconds 20 "$captures/compositor.png" \
+            2>&1 | tee "$runtime/inspector.log"
+          # A PPM under a .png name would be an artifact nothing opens.
+          test -s "$captures/compositor.png"
+          file "$captures/compositor.png" | grep -Fq 'PNG image data'
+          # The compositor's own account: it claimed the display, laid a
+          # terminal out on it, and presented a frame per keystroke.
+          grep -Eq 'compositor:online scanout=0 width=[0-9]+ height=[0-9]+' \
+            "$runtime/inspector.log"
+          grep -Eq 'compositor:frame sequence=[0-9]+ regions=[0-9]+ cursor=[0-9]+,[0-9]+' \
+            "$runtime/inspector.log"
+          # Where the terminal put its top-left cell, read from the
+          # guest's own line rather than assumed: the layout is the
+          # desktop's business, and a check that guessed it would be
+          # checking a different rectangle.
+          origin="$(sed -n 's/.*compositor:terminal .*origin=\([0-9]*,[0-9]*\).*/\1/p' \
+            "$runtime/inspector.log" | head -1)"
+          test -n "$origin"
+          # The pixels of the two rows the script produced, against the
+          # same glyphs rendered by the same font crate the compositor
+          # draws with — `tools/desktop/check-text` links the modules the
+          # compositor draws with (`programs/compositor/render`), so the
+          # check and the desktop cannot disagree about what an `h`
+          # looks like. A capture that is a
+          # valid PNG of a desktop showing nothing passes every check
+          # above and fails this one.
+          #
+          # `helios$ ` is the prompt the compositor gave the shell it
+          # spawned, `echo hello` is what the terminal echoed as the
+          # script typed it, and `hello` on the row below is what the
+          # shell printed back — which together is the whole path:
+          # keyboard, focus, terminal, shell, terminal, scanout.
+          ./target/release/check-desktop-text \
+            --capture "$captures/compositor.png" --origin "$origin" \
+            --expect '0,0=helios$ echo hello' --expect '1,0=hello'
+          # The pointer is a plane the capture does not hold, so the
+          # device's own trace of every cursor command is checked against
+          # the positions the guest says it moved to.
+          python3 tools/desktop/check-cursor.py \
+            "$runtime/inspector.log" "$runtime/qemu-trace.log"
+      - name: Kill the compositor and watch the supervisor bring it back
+        shell: bash
+        working-directory: helios
+        run: |
+          # Without this the step reports tee's status, not the
+          # command's, and a runner script that fails is invisible.
+          set -o pipefail
+          # A restart is one machine before and after, so this is one
+          # boot with three captures: the desktop, the machine with the
+          # compositor gone, and the desktop the supervisor put back.
+          # `--kill-instance` stops the instance once the first capture
+          # is taken and `--kill-settle-ms` is the interval the second is
+          # meant to catch, before the rebuild has finished.
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/desktop-restart"
+          captures="$GITHUB_WORKSPACE/desktop-scanout"
+          mkdir -p "$runtime" "$captures"
+          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+            --accel kvm \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --desktop --display none \
+            --boot-program dash --boot-program debugger \
+            --boot-program compositor \
+            screendump \
+              --input tools/desktop/desktop-probe.input --input-interval-ms 150 \
+              --settle-seconds 20 \
+              --kill-instance compositor-plugin --kill-settle-ms 200 \
+              "$captures/restart-before.png" \
+              "$captures/restart-blank.png" \
+              "$captures/restart-after.png" \
+            2>&1 | tee "$runtime/inspector.log"
+          for capture in restart-before restart-blank restart-after; do
+            test -s "$captures/$capture.png"
+            file "$captures/$capture.png" | grep -Fq 'PNG image data'
+          done
+          # The kill reached the instance, and the supervisor said so.
+          grep -Fq 'reason=Operator' "$runtime/inspector.log"
+          grep -Fq 'the compositor died; rebuilding it' "$runtime/inspector.log"
+          # Two `compositor online` lines: the one that booted, and the
+          # one the supervisor built after the kill. One would mean
+          # nothing died.
+          online="$(grep -c 'compositor online instance=' "$runtime/inspector.log")"
+          test "$online" -ge 2
+          origin="$(sed -n 's/.*compositor:terminal .*origin=\([0-9]*,[0-9]*\).*/\1/p' \
+            "$runtime/inspector.log" | head -1)"
+          test -n "$origin"
+          # Before: the desktop, with the command and its output on it.
+          ./target/release/check-desktop-text \
+            --capture "$captures/restart-before.png" --origin "$origin" \
+            --expect '0,0=helios$ echo hello' --expect '1,0=hello'
+          # In between: nothing. The display is the compositor's claim
+          # and the kernel released it with the instance that held it, so
+          # there is no frame buffer for the engine to scan out.
+          if ./target/release/check-desktop-text \
+              --capture "$captures/restart-blank.png" --origin "$origin" \
+              --expect '0,0=helios$ echo hello'; then
+            echo "the scanout still showed the dead compositor's terminal" >&2
+            exit 1
+          fi
+          # After: a desktop again, with a fresh terminal rather than the
+          # dead one's — a restarted compositor rebuilds the desktop, it
+          # does not recover the old one's scrollback.
+          ./target/release/check-desktop-text \
+            --capture "$captures/restart-after.png" --origin "$origin" \
+            --expect '0,0=helios$ '
       - name: Upload the desktop scanout captures
         if: always()
         uses: actions/upload-artifact@v4

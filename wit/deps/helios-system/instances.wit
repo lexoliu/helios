@@ -19,6 +19,25 @@ interface instances {
     cpu-busy: permille,
   }
 
+  /// Why an instance could not be asked to stop.
+  enum kill-error {
+    /// No live instance carries that identifier.
+    no-such-instance,
+    /// The instance is already on its way out, because the out-of-memory
+    /// killer or an earlier request already condemned it.
+    already-stopping,
+  }
+
   /// Returns the current live program instances visible to the privileged caller.
   snapshot: func() -> list<instance>;
+
+  /// Asks a live instance to stop.
+  ///
+  /// The instance is flagged and unwound at its next yield point rather
+  /// than torn out from under itself, so the call returns as soon as the
+  /// flag is set and the instance is gone shortly after. What happens
+  /// next belongs to whoever owns the instance: a supervised kernel
+  /// plugin is rebuilt by its supervisor, and an ordinary program is
+  /// not.
+  kill: func(id: instance-id) -> result<_, kill-error>;
 }

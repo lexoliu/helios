@@ -1,0 +1,189 @@
+package helios:system@0.1.0;
+
+/// Windows on the machine's desktop, as the programs that draw in them
+/// see them.
+///
+/// The display belongs to one instance — the compositor — and everything
+/// else that wants pixels on the screen asks for a *surface*: a
+/// rectangle of its own, composed onto the desktop by whoever holds the
+/// display. The kernel implements this interface and serves none of it
+/// itself; it validates a request, turns it into a message and hands it
+/// to the compositor plugin, exactly as `wasi:http/client.send` reaches
+/// the `http-client` plugin. A machine whose image ships no compositor,
+/// or whose compositor has died, answers `no-compositor` rather than
+/// hanging.
+///
+/// # Where the pixels are
+///
+/// In this program's own linear memory, and in the compositor's, at the
+/// same time. `create` commits one physically contiguous run of pages
+/// from this program's pool, places it in this program's surface window
+/// and maps the same run into the compositor's — so a client writes its
+/// window with ordinary stores, `commit` costs one message rather than a
+/// copy, and the compositor composes from the bytes the client wrote
+/// rather than from a staging copy of them. Nothing is copied anywhere,
+/// and the pages are charged to the client that asked for them.
+///
+/// # What a surface is not
+///
+/// It is not a scanout and it carries no cursor. The pointer is the
+/// display engine's plane and the compositor is the only instance that
+/// moves it; a client learns where the pointer is only from the events
+/// it is handed while it has focus.
+interface surface {
+  use input.{input-event};
+
+  /// Why a surface request was refused.
+  enum error {
+    /// This kernel image ships no compositor plugin.
+    unavailable,
+    /// The compositor died and has not come back yet. The surfaces it
+    /// was composing died with it; a client makes a new one.
+    no-compositor,
+    /// A surface of that size has no pixels, or more of them than any
+    /// memory could back.
+    unsupported-size,
+    /// This program already holds as many surfaces as it may.
+    too-many-surfaces,
+    /// The rectangle does not lie inside the surface it names.
+    out-of-bounds,
+    /// The part of this program's linear memory the kernel devotes to
+    /// surfaces has no room left.
+    window-exhausted,
+    /// The frame buffer could not be pinned: the machine has no
+    /// contiguous run of that size left, or this program's own memory
+    /// accounting refused it.
+    out-of-memory,
+    /// A handle that outlived its surface. The compositor was restarted
+    /// under it, or the surface was already dropped.
+    gone,
+    /// Only the instance the kernel provisioned as the compositor may
+    /// deliver input to a surface.
+    not-the-compositor,
+  }
+
+  /// Where a surface's frame buffer landed in this program's linear
+  /// memory.
+  record placement {
+    /// Byte offset of the frame buffer.
+    offset: u64,
+    /// How many bytes of linear memory it covers, which is the frame
+    /// rounded up to whole pages.
+    length: u64,
+  }
+
+  /// A rectangular region of a surface.
+  record rect {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+  }
+
+  /// The pixel geometry of a surface.
+  record size {
+    width: u32,
+    height: u32,
+  }
+
+  /// One window on the desktop.
+  ///
+  /// The bytes at `buffer` are what the compositor composes from, not a
+  /// staging copy: what is written there is what reaches the screen when
+  /// `commit` names it. Rows are `width * 4` bytes in the display's own
+  /// `bgrx8888` ordering, top row first, no padding between them.
+  ///
+  /// Dropping the surface takes the window off the desktop and hands the
+  /// pages back to this program's pool.
+  resource surface {
+    /// Where this surface's frame buffer sits in linear memory.
+    buffer: func() -> placement;
+
+    /// The size this surface was created at.
+    %size: func() -> size;
+
+    /// Publish the pixels written into `region`.
+    ///
+    /// The returned result resolves when the compositor has taken the
+    /// damage, not when the frame reached the screen: the compositor
+    /// coalesces what it was given into its own next frame, which is the
+    /// whole reason damage is tracked rather than flushed.
+    commit: async func(region: rect) -> result<_, error>;
+
+    /// Every input event the compositor routed to this surface, from now
+    /// on.
+    ///
+    /// A surface is handed events while it has focus and none while it
+    /// does not, so a gap in the stream is the pointer having left. The
+    /// vocabulary is evdev's, unchanged, `SYN_REPORT` included, exactly
+    /// as `helios:system/input` delivers it.
+    ///
+    /// One stream per surface. A second call hands back a second reader
+    /// of the same queue, and an event goes to exactly one of them.
+    events: func() -> stream<input-event>;
+  }
+
+  /// Ask the compositor for a window of `width` by `height` pixels.
+  create: async func(width: u32, height: u32) -> result<surface, error>;
+
+  /// Hand `events` to the surface `id` names.
+  ///
+  /// This is the compositor's way back: it holds every input device, it
+  /// decides which surface has focus, and this is how what it decided
+  /// reaches the program that owns the surface. Every caller other than
+  /// the instance the kernel provisioned as the compositor is refused
+  /// with `not-the-compositor`, so a program cannot inject input into
+  /// its neighbour.
+  ///
+  /// Events for a surface whose queue is full are dropped a whole report
+  /// at a time, for the reason `helios:system/input` drops one: a
+  /// pointer never keeps one axis of a move it lost the other half of.
+  deliver: async func(id: u64, events: list<input-event>) -> result<_, error>;
+}
+
+/// What the compositor plugin exports back to the kernel.
+///
+/// The mirror of `wasi:http/handler`: the kernel implements
+/// `helios:system/surface` for every program and owns none of the
+/// behaviour, and this is the component on the other end of that slot.
+/// Only one instance exports it — the compositor the kernel provisions
+/// from bootfs — and the kernel calls it from the supervisor that owns
+/// its store.
+///
+/// A surface is named by an identifier here rather than carried as a
+/// resource, because the resource lives in the *client's* table and the
+/// two never meet: what the compositor is given is a number, a geometry,
+/// and where the client's pages landed in the compositor's own linear
+/// memory.
+interface compositor {
+  use surface.{error, placement, rect};
+
+  /// Stable identifier of one client surface, minted by the kernel.
+  type surface-id = u64;
+
+  /// Own the desktop until the machine goes down.
+  ///
+  /// Called once per instance, by the supervisor, as a task of its own:
+  /// it claims the display and the input devices, draws, and returns
+  /// only when it can no longer do so. Returning is a death like any
+  /// other and the supervisor rebuilds the instance.
+  ///
+  /// The calls below run concurrently with it, in the same store.
+  run: async func() -> result<_, error>;
+
+  /// Take a new client surface onto the desktop.
+  ///
+  /// `buffer` is where the client's frame buffer landed in *this*
+  /// component's linear memory: the kernel mapped the client's pinned
+  /// run a second time, so these bytes and the client's are the same
+  /// bytes.
+  create: async func(id: surface-id, dimensions: rect, buffer: placement) -> result<_, error>;
+
+  /// The client published the pixels in `region`.
+  commit: async func(id: surface-id, region: rect) -> result<_, error>;
+
+  /// The surface is gone: the client dropped it or died. Its pages are
+  /// unmapped from this component the moment this returns, so nothing
+  /// may read them afterwards.
+  destroy: async func(id: surface-id);
+}

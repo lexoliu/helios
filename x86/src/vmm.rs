@@ -21,6 +21,7 @@ use core::ptr;
 use core::ptr::NonNull;
 
 use helios_hal::device::DmaPlacement;
+use helios_hal::iommu::PhysicalRange;
 use helios_hal::pmm::PhysFrame;
 use helios_hal::vmm::{
     AddressSpace, AddressSpaceError, PageFlags, Translation, VirtAddr, VirtRange,
@@ -78,6 +79,11 @@ struct PinnedRun {
     range: VirtRange,
     phys: usize,
     align: usize,
+    /// Whether this reservation owns the run. A shared view of a run
+    /// another reservation committed does not: its mapping is torn down
+    /// with the reservation, and the allocation goes back only when the
+    /// owner releases it.
+    owned: bool,
 }
 
 pub struct X86UserAddressSpace {
@@ -221,7 +227,9 @@ impl X86UserAddressSpace {
             }
             pinned.swap_remove(index);
             self.unmap_run_pages(mapper, run.range.start.raw(), run.range.byte_len / PAGE);
-            self.free_pinned_run(run.phys, run.range.byte_len, run.align);
+            if run.owned {
+                self.free_pinned_run(run.phys, run.range.byte_len, run.align);
+            }
         }
     }
 
@@ -809,8 +817,70 @@ impl AddressSpace for X86UserAddressSpace {
             range: virt,
             phys,
             align,
+            owned: true,
         });
         Ok(PhysFrame::from_phys_addr(phys))
+    }
+
+    fn map_shared(
+        &self,
+        virt: VirtRange,
+        physical: PhysicalRange,
+        flags: PageFlags,
+    ) -> Result<(), AddressSpaceError> {
+        self.assert_smp_safe();
+        validate_range(virt)?;
+        if physical.bytes as usize != virt.byte_len
+            || !(physical.start as usize).is_multiple_of(PAGE)
+        {
+            return Err(AddressSpaceError::Misaligned);
+        }
+        // Ordinary memory attributes: these bytes are somebody's frame
+        // buffer, and a second holder that reached them uncached would
+        // see a picture the first holder's stores had not reached yet.
+        let pt_flags = page_flags_to_pt(flags)?;
+        let phys = physical.start as usize;
+        let mut mapper = unsafe { smp::current_mapper(self.physical_memory_offset) };
+        let mut frame_allocator = DirectMappedFrameAllocator {
+            physical_memory_offset: self.physical_memory_offset,
+        };
+        // The span is claimed before a single leaf is written, so two
+        // views cannot both believe they own the same window.
+        let mut pinned = self.pinned.lock();
+        if pinned.iter().any(|run| {
+            run.range.start.raw() < virt.start.raw() + virt.byte_len
+                && virt.start.raw() < run.range.start.raw() + run.range.byte_len
+        }) {
+            return Err(AddressSpaceError::DeviceMapped);
+        }
+        self.map_run(&mut mapper, &mut frame_allocator, virt, phys, pt_flags)?;
+        self.shootdown_range(virt);
+        pinned.push(PinnedRun {
+            range: virt,
+            phys,
+            align: PAGE,
+            owned: false,
+        });
+        Ok(())
+    }
+
+    fn unmap_shared(&self, virt: VirtRange) -> Result<(), AddressSpaceError> {
+        self.assert_smp_safe();
+        validate_range(virt)?;
+        let mut pinned = self.pinned.lock();
+        let index = pinned
+            .iter()
+            .position(|run| run.range.start.raw() == virt.start.raw() && !run.owned)
+            .ok_or(AddressSpaceError::NotCommitted)?;
+        let run = pinned.swap_remove(index);
+        drop(pinned);
+        let mut mapper = unsafe { smp::current_mapper(self.physical_memory_offset) };
+        self.unmap_run_pages(
+            &mut mapper,
+            run.range.start.raw(),
+            run.range.byte_len / PAGE,
+        );
+        Ok(())
     }
 
     fn release_contiguous(&self, virt: VirtRange, _align: u64) -> Result<(), AddressSpaceError> {
@@ -822,7 +892,7 @@ impl AddressSpace for X86UserAddressSpace {
         let mut pinned = self.pinned.lock();
         let index = pinned
             .iter()
-            .position(|run| run.range.start.raw() == virt.start.raw())
+            .position(|run| run.range.start.raw() == virt.start.raw() && run.owned)
             .ok_or(AddressSpaceError::NotCommitted)?;
         let run = pinned.swap_remove(index);
         drop(pinned);

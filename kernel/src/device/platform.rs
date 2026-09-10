@@ -18,6 +18,7 @@
 //! task context only.
 
 use helios_hal::device::{DeviceRegion, DmaPlacement};
+use helios_hal::iommu::PhysicalRange;
 use helios_hal::pmm::PhysFrame;
 use helios_hal::vmm::{AddressSpaceError, PageFlags, VirtRange};
 use spin::Once;
@@ -34,6 +35,16 @@ pub struct DeviceVmHooks {
     /// `limit`, and report its first frame.
     pub commit_contiguous:
         fn(VirtRange, PageFlags, DmaPlacement) -> Result<PhysFrame, AddressSpaceError>,
+    /// Map ordinary memory another instance already committed at a
+    /// range of an existing reservation, so both hold the same bytes.
+    ///
+    /// Nothing is allocated and nothing is accounted for: the run
+    /// belongs to whoever committed it, and this is the second view of
+    /// it.
+    pub map_shared: fn(VirtRange, PhysicalRange, PageFlags) -> Result<(), AddressSpaceError>,
+    /// Drop a mapping [`Self::map_shared`] installed, shooting down
+    /// every processor before returning. The run itself is untouched.
+    pub unmap_shared: fn(VirtRange) -> Result<(), AddressSpaceError>,
     /// Release backing [`Self::commit_contiguous`] installed.
     ///
     /// `align` is what the matching commit asked for. A contiguous run
@@ -136,6 +147,7 @@ pub(crate) mod test_hooks {
     use alloc::vec::Vec;
     use core::cell::RefCell;
     use helios_hal::device::{DeviceRegion, DmaPlacement};
+    use helios_hal::iommu::PhysicalRange;
     use helios_hal::pmm::PhysFrame;
     use helios_hal::vmm::{AddressSpaceError, PageFlags, VirtRange};
 
@@ -146,6 +158,8 @@ pub(crate) mod test_hooks {
         UnmapDevice(VirtRange),
         Commit(VirtRange),
         Released(VirtRange),
+        MapShared(VirtRange, PhysicalRange),
+        UnmapShared(VirtRange),
     }
 
     #[derive(Default)]
@@ -209,6 +223,23 @@ pub(crate) mod test_hooks {
         Ok(())
     }
 
+    fn map_shared(
+        virt: VirtRange,
+        physical: PhysicalRange,
+        _flags: PageFlags,
+    ) -> Result<(), AddressSpaceError> {
+        if physical.bytes as usize != virt.byte_len {
+            return Err(AddressSpaceError::Misaligned);
+        }
+        record(MappingChange::MapShared(virt, physical));
+        Ok(())
+    }
+
+    fn unmap_shared(virt: VirtRange) -> Result<(), AddressSpaceError> {
+        record(MappingChange::UnmapShared(virt));
+        Ok(())
+    }
+
     fn mask(source: u32) {
         RECORDING.with(|recording| recording.borrow_mut().masked.push(source));
     }
@@ -224,6 +255,8 @@ pub(crate) mod test_hooks {
     static VM: DeviceVmHooks = DeviceVmHooks {
         map_device,
         unmap_device,
+        map_shared,
+        unmap_shared,
         commit_contiguous,
         release_contiguous,
         mapping_granule,
