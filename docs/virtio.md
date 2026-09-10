@@ -192,7 +192,7 @@ Everything above the wire format is device-neutral. The display value
 types and the `DisplayDevice` trait live in `hal/src/display.rs` — a
 scanout and a cursor plane are display-engine facts that virtio-gpu is
 one implementation of — and the kernel holds the device through
-`install_display_device` (`kernel/src/io/display.rs`), whose task
+`install_display_device` (`kernel/src/display/owner.rs`), whose task
 consumes the device's `VIRTIO_GPU_EVENT_DISPLAY` announcements and reads
 the new topology back. An announcement nobody collects stays latched and
 the next change raises no interrupt at all, which is why the kernel owns
