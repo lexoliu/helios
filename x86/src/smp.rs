@@ -146,6 +146,10 @@ pub(crate) struct ProcessorRuntime {
     /// `exceptions::verify_page_fault_returns` expects to fault on; zero
     /// when no probe is running. Written by this processor only.
     pub(crate) probe_fault: AtomicUsize,
+    /// The zeroed frame the probe staged for the page-fault dispatcher
+    /// to map at `probe_fault`, as its direct-map address; zero when
+    /// none is staged. Written by this processor only.
+    pub(crate) probe_frame: AtomicUsize,
     watchdog: X86Watchdog,
     timer: Once<Timer<crate::X86Cpu>>,
     program_service: Once<debug_state::ProgramService>,
@@ -258,6 +262,7 @@ pub(crate) fn build_boot_context(
             exception_idt: ProcessorIdt::new(),
             segments: ProcessorSegments::new(exception_stack(), exception_stack()),
             probe_fault: AtomicUsize::new(0),
+            probe_frame: AtomicUsize::new(0),
             watchdog: watchdog.clone(),
             timer: Once::new(),
             program_service: Once::new(),
@@ -285,6 +290,7 @@ pub(crate) fn build_boot_context(
                 exception_idt: ProcessorIdt::new(),
                 segments: ProcessorSegments::new(exception_stack(), exception_stack()),
                 probe_fault: AtomicUsize::new(0),
+                probe_frame: AtomicUsize::new(0),
                 watchdog: watchdog.clone(),
                 timer: Once::new(),
                 program_service: Once::new(),

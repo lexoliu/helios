@@ -1,6 +1,7 @@
 use core::arch::global_asm;
 use core::cell::UnsafeCell;
 use core::ops::Range;
+use core::ptr::NonNull;
 use core::sync::atomic::Ordering;
 
 use helios_hal::vmm::VirtAddr as UserVirtAddr;
@@ -291,19 +292,40 @@ pub(crate) fn install_for_current_processor() {
 /// exception stack and that a fault the kernel resolves in place returns
 /// to the faulting instruction.
 ///
-/// The probe reserves one page of user address space without committing
-/// it, announces the address in `probe_fault`, and reads the page. The
-/// read faults; the dispatcher recognises the announced address, commits
-/// the page, marks the probe resolved and returns; the read then
-/// completes and sees the fresh frame's zero. Every step that could
-/// silently fail is asserted: a probe that did not fault, a fault that
-/// was not resolved, or a read that saw anything but zero is a boot
-/// failure with a message, because a kernel whose fault path cannot
-/// return would otherwise discover it at the first stack overflow.
+/// The probe reserves one page of user address space with its leaf table
+/// prepared and nothing mapped, stages a zeroed frame for it in
+/// `probe_frame`, announces the address in `probe_fault`, and reads the
+/// page. The read faults; the dispatcher recognises the announced
+/// address, maps the staged frame through the lock-free demand-commit
+/// path, marks the probe resolved and returns; the read then completes
+/// and sees the fresh frame's zero. Every step that could silently fail
+/// is asserted: a probe that did not fault, a fault that was not
+/// resolved, a frame the dispatcher did not take, or a read that saw
+/// anything but zero is a boot failure with a message, because a kernel
+/// whose fault path cannot return would otherwise discover it at the
+/// first stack overflow.
+///
+/// Everything that takes the address-space lock or broadcasts a TLB
+/// shootdown happens here, with interrupts enabled, and nothing of the
+/// kind happens in the dispatcher: a processor spinning for shootdown
+/// acknowledgements with interrupts masked cannot acknowledge anyone
+/// else's, and the secondaries probe at the same moment
+/// (`vmm::reserve_probe_page` has the failure this rule comes from).
 pub(crate) fn verify_page_fault_returns() {
     let runtime = smp::current_runtime();
     let page = crate::vmm::reserve_probe_page();
     let start = page.start.raw();
+    let frame = helios_kernel::allocate_user_frame_zeroed_on(smp::current_processor())
+        .unwrap_or_else(|error| {
+            panic!("x86 page-fault probe could not allocate the frame it commits: {error}")
+        });
+    let staged = runtime
+        .probe_frame
+        .swap(frame.as_ptr() as usize, Ordering::AcqRel);
+    assert!(
+        staged == 0,
+        "x86 page-fault probe re-entered with frame {staged:#x} still staged"
+    );
     let previous = runtime.probe_fault.swap(start, Ordering::AcqRel);
     assert!(
         previous == 0,
@@ -311,13 +333,19 @@ pub(crate) fn verify_page_fault_returns() {
     );
     // SAFETY: `page` is a reserved user page this processor owns for the
     // duration of the probe; reading it is the fault under test, and the
-    // dispatcher commits it before the read completes.
+    // dispatcher maps the staged frame there before the read completes.
     let value = unsafe { core::ptr::read_volatile(start as *const u64) };
     let outcome = runtime.probe_fault.swap(0, Ordering::AcqRel);
+    let left = runtime.probe_frame.swap(0, Ordering::AcqRel);
     assert!(
         outcome == PROBE_RESOLVED,
         "x86 page-fault probe at {start:#x} did not fault: the read completed with \
          the reservation uncommitted (probe word {outcome:#x})"
+    );
+    assert!(
+        left == 0,
+        "x86 page-fault probe at {start:#x} was resolved without the staged frame \
+         {left:#x}: the dispatcher mapped something else"
     );
     assert!(
         value == 0,
@@ -334,14 +362,19 @@ pub(crate) fn verify_page_fault_returns() {
 }
 
 /// Resolves the boot-time probe's fault, if `faulting_address` is the
-/// page it announced.
+/// page it announced, by mapping the frame it staged. Runs in the
+/// page-fault dispatcher: no lock, no shootdown.
 fn resolve_probe_fault(faulting_address: usize) -> bool {
     let runtime = smp::current_runtime();
     let expected = runtime.probe_fault.load(Ordering::Acquire);
     if expected == 0 || expected == PROBE_RESOLVED || faulting_address & !0xfff != expected {
         return false;
     }
-    crate::vmm::commit_probe_page(expected);
+    let staged = runtime.probe_frame.swap(0, Ordering::AcqRel);
+    let frame = NonNull::new(staged as *mut u8).unwrap_or_else(|| {
+        panic!("x86 page-fault probe at {expected:#x} faulted with no frame staged for it")
+    });
+    crate::vmm::commit_probe_page(expected, frame);
     runtime.probe_fault.store(PROBE_RESOLVED, Ordering::Release);
     true
 }

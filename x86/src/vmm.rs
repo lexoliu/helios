@@ -859,28 +859,62 @@ fn user_as() -> &'static X86UserAddressSpace {
         .expect("X86UserAddressSpace accessed before install_user_address_space")
 }
 
-/// One reserved, uncommitted user page for
-/// `exceptions::verify_page_fault_returns` to fault on.
+/// One reserved user page for `exceptions::verify_page_fault_returns` to
+/// fault on, with its leaf page table already in place.
+///
+/// The probe's fault is resolved from the page-fault dispatcher, with
+/// interrupts masked, and the only address-space operation allowed there
+/// is the one a fiber stack's fault takes: `commit_demand_page`, which
+/// writes one leaf entry under no lock and broadcasts nothing, because
+/// an unmapped-to-mapped transition invalidates no translation anywhere.
+/// The locked `commit` broadcasts a TLB shootdown and spins until every
+/// online processor has acknowledged it; a processor doing that with
+/// interrupts masked cannot acknowledge anyone else's, so two processors
+/// probing at once, or one probing while another commits or releases,
+/// wait on each other forever, and every later mutation queues behind
+/// them. Bench run 34443906698 stalled its candidate kernel that way
+/// while its fourth processor was still probing.
 pub(crate) fn reserve_probe_page() -> VirtRange {
-    user_as()
+    let range = user_as()
         .reserve(PAGE)
-        .unwrap_or_else(|error| panic!("x86 page-fault probe could not reserve a page: {error}"))
+        .unwrap_or_else(|error| panic!("x86 page-fault probe could not reserve a page: {error}"));
+    user_as()
+        .prepare_demand_commit(range, PageFlags::READ | PageFlags::WRITE)
+        .unwrap_or_else(|error| {
+            panic!(
+                "x86 page-fault probe could not prepare {:#x} for a demand commit: {error}",
+                range.start.raw()
+            )
+        });
+    range
 }
 
-/// Commits the probe's page from the page-fault dispatcher. Nothing on
-/// this processor holds the address-space lock while the probe's read
-/// is in flight, so the ordinary locked commit is the right path.
-pub(crate) fn commit_probe_page(start: usize) {
-    let range = VirtRange::new(VirtAddr::new(start), PAGE);
+/// Maps `frame` at the probe's page from the page-fault dispatcher:
+/// lock-free and shootdown-free, see `reserve_probe_page`.
+pub(crate) fn commit_probe_page(start: usize, frame: NonNull<u8>) {
     user_as()
-        .commit(range, PageFlags::READ | PageFlags::WRITE)
+        .commit_demand_page(
+            VirtAddr::new(start),
+            frame,
+            PageFlags::READ | PageFlags::WRITE,
+        )
         .unwrap_or_else(|error| {
             panic!("x86 page-fault probe could not commit {start:#x}: {error}")
         });
 }
 
-/// Gives the probe's page back once the probe has read it.
+/// Gives the probe's page and the frame mapped at it back once the probe
+/// has read it. Runs with interrupts enabled, where the shootdown the
+/// unmap broadcasts can be acknowledged by everyone it reaches.
 pub(crate) fn release_probe_page(range: VirtRange) {
+    user_as()
+        .end_demand_commit(range, range)
+        .unwrap_or_else(|error| {
+            panic!(
+                "x86 page-fault probe could not end the demand commit of {:#x}: {error}",
+                range.start.raw()
+            )
+        });
     user_as().release(range).unwrap_or_else(|error| {
         panic!(
             "x86 page-fault probe could not release {:#x}: {error}",
