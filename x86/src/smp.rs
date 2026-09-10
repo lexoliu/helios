@@ -39,7 +39,9 @@ use x86_64::structures::paging::{
 
 use crate::KERNEL_STACK_BYTES;
 use crate::debug_state;
-use crate::exceptions::{DeviceInterruptRoutes, ProcessorIdt};
+use crate::exceptions::{
+    DeviceInterruptRoutes, EXCEPTION_STACK_BYTES, ProcessorIdt, ProcessorSegments,
+};
 use crate::pci::LegacyPciConfigAccess;
 use crate::read_tsc;
 use crate::watchdog::X86Watchdog;
@@ -138,6 +140,13 @@ pub(crate) struct ProcessorRuntime {
     pub(crate) wasmtime_tls: WasmtimeTlsSlots,
     pub(crate) native_trap_handler: AtomicUsize,
     pub(crate) exception_idt: ProcessorIdt,
+    /// The GDT and TSS this processor loads beside its IDT, and the two
+    /// exception stacks the TSS names.
+    pub(crate) segments: ProcessorSegments,
+    /// The page the boot-time page-fault probe in
+    /// `exceptions::verify_page_fault_returns` expects to fault on; zero
+    /// when no probe is running. Written by this processor only.
+    pub(crate) probe_fault: AtomicUsize,
     watchdog: X86Watchdog,
     timer: Once<Timer<crate::X86Cpu>>,
     program_service: Once<debug_state::ProgramService>,
@@ -249,6 +258,8 @@ pub(crate) fn build_boot_context(
             wasmtime_tls: WasmtimeTlsSlots::new(),
             native_trap_handler: AtomicUsize::new(0),
             exception_idt: ProcessorIdt::new(),
+            segments: ProcessorSegments::new(exception_stack(), exception_stack()),
+            probe_fault: AtomicUsize::new(0),
             watchdog: watchdog.clone(),
             timer: Once::new(),
             program_service: Once::new(),
@@ -275,6 +286,8 @@ pub(crate) fn build_boot_context(
                 wasmtime_tls: WasmtimeTlsSlots::new(),
                 native_trap_handler: AtomicUsize::new(0),
                 exception_idt: ProcessorIdt::new(),
+                segments: ProcessorSegments::new(exception_stack(), exception_stack()),
+                probe_fault: AtomicUsize::new(0),
                 watchdog: watchdog.clone(),
                 timer: Once::new(),
                 program_service: Once::new(),
@@ -1553,6 +1566,13 @@ unsafe impl FrameAllocator<Size4KiB> for DirectMappedFrameAllocator {
             ),
         )
     }
+}
+
+/// One exception stack for one processor, as the byte range the TSS
+/// names the top of.
+fn exception_stack() -> Range<usize> {
+    let base = allocate_aligned_zeroed(EXCEPTION_STACK_BYTES, 16);
+    base..base + EXCEPTION_STACK_BYTES
 }
 
 fn allocate_aligned_zeroed(size: usize, align: usize) -> usize {

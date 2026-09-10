@@ -1,18 +1,34 @@
 use core::arch::global_asm;
 use core::cell::UnsafeCell;
 use core::mem;
+use core::ops::Range;
 use core::sync::atomic::Ordering;
 
 use helios_kernel::{
     KernelException, KernelExceptionCause, KernelExceptionDispatch, KernelNativeTrapHandler,
 };
 use x86_64::VirtAddr;
+use x86_64::instructions::segmentation::{CS, DS, ES, SS, Segment};
+use x86_64::instructions::tables::load_tss;
 use x86_64::registers::control::Cr2;
+use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable};
 use x86_64::structures::idt::InterruptDescriptorTable;
+use x86_64::structures::tss::TaskStateSegment;
 
 use crate::smp;
 
 const PAGE_FAULT_INSTRUCTION_FETCH: u64 = 1 << 4;
+const DOUBLE_FAULT_VECTOR: u64 = 8;
+const PAGE_FAULT_VECTOR: u64 = 14;
+/// Interrupt-stack-table slots, as `set_stack_index` counts them.
+const PAGE_FAULT_IST_INDEX: u16 = 0;
+const DOUBLE_FAULT_IST_INDEX: u16 = 1;
+/// One exception stack. The runtime's trap handler and a panic's
+/// formatting both run on it; AArch64 sizes its exception stack the same.
+pub(crate) const EXCEPTION_STACK_BYTES: usize = 64 * 1024;
+/// The value `ProcessorRuntime::probe_fault` takes once the boot-time
+/// page-fault probe has been resolved, distinct from every page address.
+const PROBE_RESOLVED: usize = usize::MAX;
 pub(crate) const TIMER_INTERRUPT_VECTOR: u8 = 0x20;
 pub(crate) const WAKE_INTERRUPT_VECTOR: u8 = 0x21;
 pub(crate) const TLB_SHOOTDOWN_INTERRUPT_VECTOR: u8 = 0x22;
@@ -63,6 +79,7 @@ unsafe extern "C" {
     fn helios_x86_exception_divide_error();
     fn helios_x86_exception_breakpoint();
     fn helios_x86_exception_invalid_opcode();
+    fn helios_x86_exception_double_fault();
     fn helios_x86_exception_general_protection();
     fn helios_x86_exception_page_fault();
     fn helios_x86_exception_x87_floating_point();
@@ -117,9 +134,20 @@ impl ProcessorIdt {
             table
                 .general_protection_fault
                 .set_handler_addr(handler_address(helios_x86_exception_general_protection));
+            // A page fault raised by a push below `rsp` cannot be taken
+            // on the interrupted stack: the processor's own push of the
+            // exception frame lands in the same unmapped page and faults
+            // during delivery, which is a double fault, and a double
+            // fault without a stack of its own is a triple fault and a
+            // reset. Both take a stack the TSS names.
             table
                 .page_fault
-                .set_handler_addr(handler_address(helios_x86_exception_page_fault));
+                .set_handler_addr(handler_address(helios_x86_exception_page_fault))
+                .set_stack_index(PAGE_FAULT_IST_INDEX);
+            table
+                .double_fault
+                .set_handler_addr(handler_address(helios_x86_exception_double_fault))
+                .set_stack_index(DOUBLE_FAULT_IST_INDEX);
             table
                 .x87_floating_point
                 .set_handler_addr(handler_address(helios_x86_exception_x87_floating_point));
@@ -170,8 +198,165 @@ impl ProcessorIdt {
     }
 }
 
+/// The segment state a processor loads beside its IDT: a GDT of its own
+/// carrying a TSS whose interrupt stack table names the two exception
+/// stacks. Limine hands the kernel a GDT with no TSS, so until this is
+/// loaded no IDT entry can ask for a stack switch.
+///
+/// Owned by one [`smp::ProcessorRuntime`] and touched only by the
+/// processor it belongs to, during `install_for_current_processor`.
+pub(crate) struct ProcessorSegments {
+    gdt: UnsafeCell<GlobalDescriptorTable>,
+    tss: UnsafeCell<TaskStateSegment>,
+    page_fault_stack: Range<usize>,
+    double_fault_stack: Range<usize>,
+}
+
+// SAFETY: the tables are written and loaded by the owning processor only,
+// before that processor enables interrupts; the stack ranges are immutable.
+unsafe impl Sync for ProcessorSegments {}
+
+impl ProcessorSegments {
+    /// `page_fault_stack` and `double_fault_stack` are the byte ranges of
+    /// two stacks allocated for this processor alone; the TSS names their
+    /// upper ends.
+    pub(crate) const fn new(
+        page_fault_stack: Range<usize>,
+        double_fault_stack: Range<usize>,
+    ) -> Self {
+        Self {
+            gdt: UnsafeCell::new(GlobalDescriptorTable::new()),
+            tss: UnsafeCell::new(TaskStateSegment::new()),
+            page_fault_stack,
+            double_fault_stack,
+        }
+    }
+
+    /// The stack every page fault on this processor is taken on.
+    pub(crate) fn page_fault_stack(&self) -> Range<usize> {
+        self.page_fault_stack.clone()
+    }
+
+    /// Builds the TSS and GDT and makes them the processor's own.
+    ///
+    /// `FS` and `GS` are deliberately left alone: `IA32_FS_BASE` carries
+    /// the processor anchor, and loading a selector into `FS` would reset
+    /// that base to the descriptor's.
+    fn install(&self) {
+        assert!(
+            self.page_fault_stack.end.is_multiple_of(16)
+                && self.double_fault_stack.end.is_multiple_of(16),
+            "x86 exception stack tops must be 16-byte aligned"
+        );
+        // SAFETY: this runs once per processor, on that processor, with
+        // interrupts disabled, and nothing else reaches these cells.
+        let tss = unsafe { &mut *self.tss.get() };
+        let gdt = unsafe { &mut *self.gdt.get() };
+        *tss = TaskStateSegment::new();
+        tss.interrupt_stack_table[usize::from(PAGE_FAULT_IST_INDEX)] =
+            VirtAddr::new(self.page_fault_stack.end as u64);
+        tss.interrupt_stack_table[usize::from(DOUBLE_FAULT_IST_INDEX)] =
+            VirtAddr::new(self.double_fault_stack.end as u64);
+        *gdt = GlobalDescriptorTable::new();
+        let code = gdt.append(Descriptor::kernel_code_segment());
+        let data = gdt.append(Descriptor::kernel_data_segment());
+        // SAFETY: the TSS lives in a `ProcessorRuntime` that
+        // `publish_anchor_identities` pinned at its final address before
+        // any processor was activated, so the descriptor's base stays
+        // valid for as long as the processor runs.
+        let tss_selector = gdt.append(unsafe { Descriptor::tss_segment_unchecked(tss) });
+        // SAFETY: the table outlives the processor for the reason above;
+        // the selectors loaded are the ones this table just produced.
+        unsafe {
+            gdt.load_unsafe();
+            CS::set_reg(code);
+            SS::set_reg(data);
+            DS::set_reg(data);
+            ES::set_reg(data);
+            load_tss(tss_selector);
+        }
+    }
+}
+
 pub(crate) fn install_for_current_processor() {
-    smp::current_runtime().exception_idt.install();
+    let runtime = smp::current_runtime();
+    runtime.segments.install();
+    runtime.exception_idt.install();
+}
+
+/// Proves, on the calling processor, that a page fault is taken on the
+/// exception stack and that a fault the kernel resolves in place returns
+/// to the faulting instruction.
+///
+/// The probe reserves one page of user address space without committing
+/// it, announces the address in `probe_fault`, and reads the page. The
+/// read faults; the dispatcher recognises the announced address, commits
+/// the page, marks the probe resolved and returns; the read then
+/// completes and sees the fresh frame's zero. Every step that could
+/// silently fail is asserted: a probe that did not fault, a fault that
+/// was not resolved, or a read that saw anything but zero is a boot
+/// failure with a message, because a kernel whose fault path cannot
+/// return would otherwise discover it at the first stack overflow.
+pub(crate) fn verify_page_fault_returns() {
+    let runtime = smp::current_runtime();
+    let page = crate::vmm::reserve_probe_page();
+    let start = page.start.raw();
+    let previous = runtime.probe_fault.swap(start, Ordering::AcqRel);
+    assert!(
+        previous == 0,
+        "x86 page-fault probe re-entered with {previous:#x} outstanding"
+    );
+    // SAFETY: `page` is a reserved user page this processor owns for the
+    // duration of the probe; reading it is the fault under test, and the
+    // dispatcher commits it before the read completes.
+    let value = unsafe { core::ptr::read_volatile(start as *const u64) };
+    let outcome = runtime.probe_fault.swap(0, Ordering::AcqRel);
+    assert!(
+        outcome == PROBE_RESOLVED,
+        "x86 page-fault probe at {start:#x} did not fault: the read completed with \
+         the reservation uncommitted (probe word {outcome:#x})"
+    );
+    assert!(
+        value == 0,
+        "x86 page-fault probe at {start:#x} read {value:#x} from a page committed \
+         from the exception stack; the frame was not zeroed"
+    );
+    crate::vmm::release_probe_page(page);
+    tracing::info!(
+        target: "helios_x86::exceptions",
+        processor = runtime.logical_id(),
+        page = start,
+        "page fault taken on the exception stack and resolved in place"
+    );
+}
+
+/// Resolves the boot-time probe's fault, if `faulting_address` is the
+/// page it announced.
+fn resolve_probe_fault(faulting_address: usize) -> bool {
+    let runtime = smp::current_runtime();
+    let expected = runtime.probe_fault.load(Ordering::Acquire);
+    if expected == 0 || expected == PROBE_RESOLVED || faulting_address & !0xfff != expected {
+        return false;
+    }
+    crate::vmm::commit_probe_page(expected);
+    runtime.probe_fault.store(PROBE_RESOLVED, Ordering::Release);
+    true
+}
+
+/// A page fault whose frame is not on this processor's exception stack
+/// means the TSS is not in effect, and the next fault below `rsp` will
+/// reset the machine instead of being reported. Caught here, on the
+/// first fault of any kind, rather than there.
+fn assert_frame_on_exception_stack(frame: &ExceptionFrame) {
+    let stack = smp::current_runtime().segments.page_fault_stack();
+    let address = core::ptr::from_ref(frame) as usize;
+    assert!(
+        stack.contains(&address),
+        "x86 page fault frame at {address:#x} is not on this processor's exception stack \
+         {:#x}..{:#x}: the IST is not in effect",
+        stack.start,
+        stack.end
+    );
 }
 
 fn handler_address(handler: unsafe extern "C" fn()) -> VirtAddr {
@@ -202,12 +387,34 @@ pub(crate) struct ExceptionFrame {
     rflags: u64,
 }
 
+/// The exception entry's dispatcher. Returning means the fault was
+/// resolved in place and the stub restores the interrupted context;
+/// everything unresolved diverges here, either into the runtime's trap
+/// handler (which unwinds the guest and never comes back) or into a
+/// panic.
 #[unsafe(no_mangle)]
-extern "C" fn helios_x86_exception_dispatch(frame: &mut ExceptionFrame) -> ! {
-    if let Some(exception) = exception_from_frame(frame)
-        && dispatch_to_wasmtime(exception) == KernelExceptionDispatch::Unhandled
-    {
-        panic!("unhandled x86 kernel exception after Wasmtime dispatch: {exception:?}");
+extern "C" fn helios_x86_exception_dispatch(frame: &mut ExceptionFrame) {
+    if frame.vector == PAGE_FAULT_VECTOR {
+        assert_frame_on_exception_stack(frame);
+        if resolve_probe_fault(Cr2::read_raw() as usize) {
+            return;
+        }
+    }
+    if frame.vector == DOUBLE_FAULT_VECTOR {
+        panic!(
+            "x86 double fault rip={:#x} rsp-at-fault-frame={:#x}: an exception could not be \
+             delivered on the interrupted stack",
+            frame.rip,
+            core::ptr::from_ref(frame) as usize
+        );
+    }
+    if let Some(exception) = exception_from_frame(frame) {
+        match dispatch_to_wasmtime(exception) {
+            KernelExceptionDispatch::Resolved => return,
+            KernelExceptionDispatch::Unhandled => {
+                panic!("unhandled x86 kernel exception after Wasmtime dispatch: {exception:?}")
+            }
+        }
     }
     panic!(
         "unhandled x86 kernel exception vector={} rip={:#x} error_code={:#x}",

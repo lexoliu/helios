@@ -22,8 +22,13 @@ pub type KernelNativeTrapHandler = extern "C" fn(
     faulting_address: usize,
 );
 
+/// What a backend's exception entry does next.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KernelExceptionDispatch {
+    /// The fault was resolved in place. The entry restores the
+    /// interrupted context and the faulting instruction runs again.
+    Resolved,
+    /// Nobody claimed the exception; the entry reports it as fatal.
     Unhandled,
 }
 
