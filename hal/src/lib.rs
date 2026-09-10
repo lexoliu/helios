@@ -18,6 +18,7 @@ pub mod interrupt;
 pub mod io;
 pub mod iommu;
 pub mod memory;
+pub mod mmio;
 pub mod pmm;
 pub mod resource;
 pub mod rtc;
