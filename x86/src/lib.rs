@@ -299,6 +299,7 @@ fn x86_kernel_main() -> ! {
         &debug_state,
         root_entropy,
     );
+    smp::join_shootdown_targets();
     x86_64::instructions::interrupts::enable();
     let program_service = helios_kernel::install_component_host_program_service(
         &kernel,
@@ -905,6 +906,7 @@ extern "C" fn secondary_start_rust(
         cpu.watchdog(),
     ));
     smp::current_runtime().install_timer(kernel.timer());
+    smp::join_shootdown_targets();
     x86_64::instructions::interrupts::enable();
     let program_service = debug_state
         .program_service()

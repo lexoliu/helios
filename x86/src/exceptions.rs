@@ -306,11 +306,12 @@ pub(crate) fn install_for_current_processor() {
 /// first stack overflow.
 ///
 /// Everything that takes the address-space lock or broadcasts a TLB
-/// shootdown happens here, with interrupts enabled, and nothing of the
-/// kind happens in the dispatcher: a processor spinning for shootdown
-/// acknowledgements with interrupts masked cannot acknowledge anyone
-/// else's, and the secondaries probe at the same moment
-/// (`vmm::reserve_probe_page` has the failure this rule comes from).
+/// shootdown happens here, outside the dispatcher. On a secondary the
+/// probe runs with interrupts still masked, which is why it runs before
+/// `smp::join_shootdown_targets`: nobody waits on a processor that has
+/// not joined, so its broadcast (the release's unmap) cannot be part of
+/// a cycle, and `smp::shootdown_tlb_range` asserts that rule for every
+/// broadcaster (`vmm::reserve_probe_page` has the failure it comes from).
 pub(crate) fn verify_page_fault_returns() {
     let runtime = smp::current_runtime();
     let page = crate::vmm::reserve_probe_page();

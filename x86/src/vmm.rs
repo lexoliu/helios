@@ -862,18 +862,16 @@ fn user_as() -> &'static X86UserAddressSpace {
 /// One reserved user page for `exceptions::verify_page_fault_returns` to
 /// fault on, with its leaf page table already in place.
 ///
-/// The probe's fault is resolved from the page-fault dispatcher, with
-/// interrupts masked, and the only address-space operation allowed there
-/// is the one a fiber stack's fault takes: `commit_demand_page`, which
-/// writes one leaf entry under no lock and broadcasts nothing, because
-/// an unmapped-to-mapped transition invalidates no translation anywhere.
-/// The locked `commit` broadcasts a TLB shootdown and spins until every
-/// online processor has acknowledged it; a processor doing that with
-/// interrupts masked cannot acknowledge anyone else's, so two processors
-/// probing at once, or one probing while another commits or releases,
-/// wait on each other forever, and every later mutation queues behind
-/// them. Bench run 34443906698 stalled its candidate kernel that way
-/// while its fourth processor was still probing.
+/// The probe's fault is resolved from the page-fault dispatcher, and the
+/// only address-space operation allowed there is the one a fiber stack's
+/// fault takes: `commit_demand_page`, which writes one leaf entry under
+/// no lock and broadcasts nothing, because an unmapped-to-mapped
+/// transition invalidates no translation anywhere. The dispatcher may
+/// have interrupted a holder of the address-space lock, and a TLB
+/// shootdown from a context that cannot take the shootdown IPI is what
+/// `smp::shootdown_tlb_range` refuses. The locked `commit` the probe used
+/// to resolve its fault with did both; bench run 34443906698 stalled its
+/// candidate kernel with its fourth processor inside that broadcast.
 pub(crate) fn reserve_probe_page() -> VirtRange {
     let range = user_as()
         .reserve(PAGE)
