@@ -649,6 +649,9 @@ fn report_fiber_stack_demand_commits<CpuImpl: Cpu>(cpu: &CpuImpl) {
         demand_commits = stats.demand_commits,
         committed_bytes = stats.committed_bytes,
         eager_bytes = stats.eager_bytes,
+        released_stacks = stats.released_stacks,
+        released_committed_bytes = stats.released_committed_bytes,
+        released_eager_bytes = stats.released_eager_bytes,
         reserve_bytes = crate::page_fault_frame_reserve_bytes(),
         "fiber stack arena totals for this boot"
     );

@@ -33,11 +33,20 @@
 //! - [`configure_processors`] runs once, on the bootstrap processor,
 //!   before any secondary is started.
 //!
-//! Nothing arrives from another processor today, and the shard lock is
-//! what keeps that from being an assumption the next edit can break: a
-//! foreign push would take the same lock rather than corrupt the list,
-//! and the local half of the lock is what keeps an interrupt handler
-//! that reaches a shard from re-entering its own processor's.
+//! A shard is a lock-free stack — one atomic head, pushed and popped
+//! with compare-and-swap — and not a locked list, because the one
+//! concurrency it does see is its own processor interrupting itself.
+//! Stack creation pops a shard from a fiber stack, and a fiber stack
+//! faults on first touch, so a pop can be interrupted mid-operation by
+//! the very fault that needs the shard: a lock there would be held by
+//! the context the fault interrupted, and spinning on it would never
+//! end. With compare-and-swap the interrupted pop simply loses its
+//! exchange and retries. The same shape carries a foreign push, should
+//! one ever arrive. The ABA case the pattern is known for needs a frame
+//! to leave the list and come back between a load and its exchange; a
+//! frame leaves only into a mapping and returns only through the pool
+//! on a stack release, and neither happens inside a fault on the
+//! processor that loaded it.
 //!
 //! The free list is threaded through the frames themselves, exactly as
 //! [`super::frame_slab`] does, so the reserve allocates nothing of its
@@ -49,14 +58,13 @@ extern crate alloc;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 use crossbeam_utils::CachePadded;
 use helios_hal::cpu::ProcessorId;
 use helios_hal::pmm::PhysFrame;
 use spin::Once;
 
-use super::IrqSafeMutex;
 use super::user::{allocate_user_frame_zeroed_on, try_allocate_user_frame_zeroed_on};
 
 /// Frames one processor's reserve holds when it is full.
@@ -85,61 +93,81 @@ struct FreeFrame {
 /// One processor's frames. `head` and `len` are written only by that
 /// processor; the padding around the shard is what keeps a neighbour's
 /// pushes off this processor's cache line.
+///
+/// `len` follows `head` by one atomic step, so a reader that lands
+/// between the two sees a count off by one. Every use of it is a
+/// threshold — the low-water mark, the capacity — where one frame either
+/// way changes nothing.
 struct ReserveShard {
-    head: IrqSafeMutex<*mut FreeFrame>,
+    head: AtomicPtr<FreeFrame>,
     len: AtomicUsize,
 }
-
-// SAFETY: the list is a chain of frames the pool handed out, each owned
-// exclusively by the reserve while it is on the list; the lock is what
-// serialises access to the head.
-unsafe impl Send for ReserveShard {}
-unsafe impl Sync for ReserveShard {}
 
 impl ReserveShard {
     const fn new() -> Self {
         Self {
-            head: IrqSafeMutex::new(core::ptr::null_mut()),
+            head: AtomicPtr::new(core::ptr::null_mut()),
             len: AtomicUsize::new(0),
         }
     }
 
     fn pop(&self) -> Option<NonNull<u8>> {
-        let frame = self.head.with(|head| {
-            let frame = NonNull::new(*head)?;
+        let mut head = self.head.load(Ordering::Acquire);
+        loop {
+            let frame = NonNull::new(head)?;
             // SAFETY: every frame on this list was pushed by `push`,
-            // which wrote its link word.
-            *head = unsafe { frame.as_ref().next };
-            self.len
-                .store(self.len.load(Ordering::Relaxed) - 1, Ordering::Release);
-            Some(frame.cast::<u8>())
-        })?;
-        // The link word is the only part of the frame that is not still
-        // the zero `push` left behind.
-        // SAFETY: the frame is now owned by this caller alone.
-        unsafe {
-            frame.cast::<FreeFrame>().write(FreeFrame {
-                next: core::ptr::null_mut(),
-            });
+            // which wrote its link word, and a frame leaves the list
+            // only through this exchange, so one that is still the head
+            // is still on it.
+            let next = unsafe { frame.as_ref().next };
+            match self
+                .head
+                .compare_exchange_weak(head, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => {
+                    self.len.fetch_sub(1, Ordering::AcqRel);
+                    // The link word is the only part of the frame that
+                    // is not still the zero `push` left behind.
+                    // SAFETY: the frame is now owned by this caller
+                    // alone.
+                    unsafe {
+                        frame.cast::<FreeFrame>().write(FreeFrame {
+                            next: core::ptr::null_mut(),
+                        });
+                    }
+                    return Some(frame.cast::<u8>());
+                }
+                Err(current) => head = current,
+            }
         }
-        Some(frame)
     }
 
     /// Puts a zeroed frame on the list, or reports that the reserve is
     /// already full and the caller must dispose of it.
     fn push(&self, frame: NonNull<u8>) -> bool {
-        self.head.with(|head| {
-            let len = self.len.load(Ordering::Relaxed);
-            if len >= RESERVE_CAPACITY {
-                return false;
+        if self.len.load(Ordering::Acquire) >= RESERVE_CAPACITY {
+            return false;
+        }
+        let mut frame = frame.cast::<FreeFrame>();
+        let mut head = self.head.load(Ordering::Acquire);
+        loop {
+            // SAFETY: the caller handed ownership of this page over, and
+            // nothing reads its link word until the exchange below has
+            // put it on the list.
+            unsafe { frame.as_mut().next = head };
+            match self.head.compare_exchange_weak(
+                head,
+                frame.as_ptr(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.len.fetch_add(1, Ordering::AcqRel);
+                    return true;
+                }
+                Err(current) => head = current,
             }
-            let mut frame = frame.cast::<FreeFrame>();
-            // SAFETY: the caller handed ownership of this page over.
-            unsafe { frame.as_mut().next = *head };
-            *head = frame.as_ptr();
-            self.len.store(len + 1, Ordering::Release);
-            true
-        })
+        }
     }
 
     fn len(&self) -> usize {
@@ -267,18 +295,22 @@ pub(crate) fn top_up(processor: ProcessorId) {
 }
 
 /// Fills `shard` as far as the pool will go without waiting.
+///
+/// Runs in fault context, so nothing here may wait on a lock: the
+/// pool is asked through its non-blocking path, and a shard that
+/// refuses a push is a broken invariant rather than a frame to hand
+/// back through the pool's locked free path.
 fn try_refill(shard: &ReserveShard, processor: ProcessorId) {
     while shard.len() < RESERVE_CAPACITY {
         let Some(frame) = try_allocate_user_frame_zeroed_on(processor) else {
             return;
         };
-        if !shard.push(frame) {
-            // The shard filled underneath this loop, which cannot
-            // happen on the owning processor; returning the frame keeps
-            // the code correct if a foreign push ever arrives.
-            super::deallocate_user_frame_on(processor, frame);
-            return;
-        }
+        assert!(
+            shard.push(frame),
+            "processor {} found its page-fault frame reserve full underneath a refill it was \
+             running itself: something other than the owning processor pushed to it",
+            processor.id()
+        );
     }
 }
 

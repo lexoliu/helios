@@ -55,6 +55,8 @@ const USER_VA_BASE: usize = 0x0000_2000_0000_0000;
 /// concurrently.
 const USER_VA_END: usize = 0x0000_4000_0000_0000;
 const PAGE: usize = PhysFrame::SIZE;
+/// Bytes one level-1 table maps: 512 four-kilobyte pages.
+const LEAF_TABLE_SPAN: usize = PAGE * 512;
 
 /// Pages one TLB-shootdown batch holds before flushing.
 ///
@@ -677,10 +679,11 @@ impl AddressSpace for X86UserAddressSpace {
         let mut frame_allocator = DirectMappedFrameAllocator {
             physical_memory_offset: self.physical_memory_offset,
         };
-        for offset in (0..virt.byte_len).step_by(PAGE) {
-            let virt_addr = virt.start.raw() + offset;
-            let page = Page::<Size4KiB>::from_start_address(X86VirtAddr::new(virt_addr as u64))
-                .map_err(|_| AddressSpaceError::Misaligned)?;
+        // One walk per level-1 table, not per page: every page of a
+        // block shares the table the walk builds, and this runs under
+        // the reservation lock on every store creation.
+        for block in virt.block_starts(LEAF_TABLE_SPAN) {
+            let page = Page::<Size4KiB>::containing_address(X86VirtAddr::new(block.raw() as u64));
             let p4 = self.level_4_table();
             let p3 = self.ensure_table(p4, page.p4_index(), &mut frame_allocator)?;
             let p2 = self.ensure_table(p3, page.p3_index(), &mut frame_allocator)?;
@@ -734,11 +737,18 @@ impl AddressSpace for X86UserAddressSpace {
         Ok(())
     }
 
-    fn end_demand_commit(&self, virt: VirtRange) -> Result<(), AddressSpaceError> {
+    fn end_demand_commit(
+        &self,
+        virt: VirtRange,
+        mapped: VirtRange,
+    ) -> Result<(), AddressSpaceError> {
         self.assert_smp_safe();
         validate_range(virt)?;
+        if !virt.encloses(mapped) {
+            return Err(AddressSpaceError::NotDemandCommit);
+        }
         let _ = self.state.lock().record_decommit(virt)?;
-        self.unmap_demand_pages(virt);
+        self.unmap_demand_pages(mapped);
         Ok(())
     }
 
@@ -1065,5 +1075,5 @@ static X86_FIBER_STACK_HOOKS: FiberStackVmHooks = FiberStackVmHooks {
     reserve: |bytes| user_as().reserve(bytes),
     prepare_demand_commit: |virt, flags| user_as().prepare_demand_commit(virt, flags),
     commit_demand_page: |addr, frame, flags| user_as().commit_demand_page(addr, frame, flags),
-    end_demand_commit: |virt| user_as().end_demand_commit(virt),
+    end_demand_commit: |virt, mapped| user_as().end_demand_commit(virt, mapped),
 };

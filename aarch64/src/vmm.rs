@@ -54,6 +54,8 @@ use helios_kernel::{
 use spin::{Mutex, Once};
 
 const PAGE: usize = 4096;
+/// Bytes one level-3 table maps: 512 four-kilobyte pages.
+const LEAF_TABLE_SPAN: usize = PAGE * 512;
 // Release AArch64/HVF `quickjs-loop` evidence: after Wasmtime stopped asking
 // the custom VM to scan full static reservations, batching page-table barriers
 // moved the profiled median from 46 ms to 45 ms and reduced Store teardown from
@@ -1177,8 +1179,11 @@ impl AddressSpace for Aarch64UserAddressSpace {
         let _ = page_flags_to_pte(flags)?;
         let mut state = self.state.lock();
         state.precheck_commit(virt)?;
-        for offset in (0..virt.byte_len).step_by(PAGE) {
-            self.ensure_leaf_table(virt.start.raw() + offset);
+        // One walk per leaf table, not per page: every page of a block
+        // shares the table the walk builds, and this runs under the
+        // reservation lock on every store creation.
+        for block in virt.block_starts(LEAF_TABLE_SPAN) {
+            self.ensure_leaf_table(block.raw());
         }
         // `MemoryOwner::NONE` on purpose, and it is load-bearing on this
         // backend: the swap policy's aging pass walks an owner's
@@ -1229,8 +1234,15 @@ impl AddressSpace for Aarch64UserAddressSpace {
         Ok(())
     }
 
-    fn end_demand_commit(&self, virt: VirtRange) -> Result<(), AddressSpaceError> {
+    fn end_demand_commit(
+        &self,
+        virt: VirtRange,
+        mapped: VirtRange,
+    ) -> Result<(), AddressSpaceError> {
         validate_range(virt)?;
+        if !virt.encloses(mapped) {
+            return Err(AddressSpaceError::NotDemandCommit);
+        }
         let mut state = self.state.lock();
         let swapped = state.record_decommit(virt)?;
         debug_assert!(
@@ -1238,7 +1250,7 @@ impl AddressSpace for Aarch64UserAddressSpace {
             "a demand-commit region is never offered to the swap policy"
         );
         self.orphan(swapped);
-        self.unmap_demand_pages(virt);
+        self.unmap_demand_pages(mapped);
         Ok(())
     }
 
@@ -1641,7 +1653,7 @@ static AARCH64_FIBER_STACK_HOOKS: FiberStackVmHooks = FiberStackVmHooks {
     reserve: |bytes| user_as().reserve(bytes),
     prepare_demand_commit: |virt, flags| user_as().prepare_demand_commit(virt, flags),
     commit_demand_page: |addr, frame, flags| user_as().commit_demand_page(addr, frame, flags),
-    end_demand_commit: |virt| user_as().end_demand_commit(virt),
+    end_demand_commit: |virt, mapped| user_as().end_demand_commit(virt, mapped),
 };
 
 /// Resolves an access-flag fault raised by the swap policy's aging pass.

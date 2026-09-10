@@ -75,6 +75,8 @@ impl FrameSlabShard {
     fn try_allocate(&self) -> Option<NonNull<u8>> {
         self.head.try_with(|head| {
             let frame = NonNull::new(*head)?;
+            // SAFETY: every frame on this list was pushed by
+            // `deallocate`, which wrote its link word.
             let next = unsafe { frame.as_ref().next };
             *head = next;
             let cached = self.cached_frames.load(Ordering::Relaxed);

@@ -88,6 +88,8 @@ use spin::{Mutex, Once};
 const PAGE_SHIFT: u32 = 12;
 const PAGE_SIZE: usize = 1 << PAGE_SHIFT;
 const PTE_COUNT: usize = 512;
+/// Bytes one leaf table maps: every entry of one table, a page each.
+const LEAF_TABLE_SPAN: usize = PAGE_SIZE * PTE_COUNT;
 const LEVEL_BITS: u32 = 9;
 /// Sv48 resolves a virtual address through four page-table levels; the
 /// root table is level 3 and the leaf table level 0.
@@ -456,6 +458,9 @@ impl RiscvUserAddressSpace {
     /// what makes `ensure_intermediate`'s heap allocation safe here and
     /// impossible in fault context.
     fn ensure_leaf_table(&self, virt: usize) {
+        // SAFETY: the root table is a live page table reached through
+        // the HHDM, and the caller holds the reservation lock, so no
+        // other processor is editing this walk.
         let mut table = unsafe { &mut *self.root_table() };
         for level in (1..LEVELS).rev() {
             table = Self::ensure_intermediate(table, level_index(virt, level));
@@ -980,8 +985,11 @@ impl AddressSpace for RiscvUserAddressSpace {
         let _ = page_flags_to_pte(flags)?;
         let mut state = self.state.lock();
         state.precheck_commit(virt)?;
-        for offset in (0..virt.byte_len).step_by(PAGE_SIZE) {
-            self.ensure_leaf_table(virt.start.raw() + offset);
+        // One walk per leaf table, not per page: every page of a block
+        // shares the table the walk builds, and this runs under the
+        // reservation lock on every store creation.
+        for block in virt.block_starts(LEAF_TABLE_SPAN) {
+            self.ensure_leaf_table(block.raw());
         }
         // `MemoryOwner::NONE` on purpose. Residency accounting and the
         // swap aging pass both key on a real owner, and neither may see
@@ -1040,12 +1048,19 @@ impl AddressSpace for RiscvUserAddressSpace {
         Ok(())
     }
 
-    fn end_demand_commit(&self, virt: VirtRange) -> Result<(), AddressSpaceError> {
+    fn end_demand_commit(
+        &self,
+        virt: VirtRange,
+        mapped: VirtRange,
+    ) -> Result<(), AddressSpaceError> {
         validate_range(virt)?;
+        if !virt.encloses(mapped) {
+            return Err(AddressSpaceError::NotDemandCommit);
+        }
         let mut state = self.state.lock();
         let swapped = state.record_decommit(virt)?;
         debug_assert!(swapped.is_empty());
-        self.unmap_demand_pages(virt);
+        self.unmap_demand_pages(mapped);
         Ok(())
     }
 
@@ -1185,7 +1200,7 @@ static RISCV_FIBER_STACK_HOOKS: FiberStackVmHooks = FiberStackVmHooks {
     reserve: |bytes| user_as().reserve(bytes),
     prepare_demand_commit: |virt, flags| user_as().prepare_demand_commit(virt, flags),
     commit_demand_page: |addr, frame, flags| user_as().commit_demand_page(addr, frame, flags),
-    end_demand_commit: |virt| user_as().end_demand_commit(virt),
+    end_demand_commit: |virt, mapped| user_as().end_demand_commit(virt, mapped),
 };
 
 /// The machine's one user address space.

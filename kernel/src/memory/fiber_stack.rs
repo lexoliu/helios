@@ -101,8 +101,10 @@ pub struct FiberStackVmHooks {
     pub prepare_demand_commit: fn(VirtRange, PageFlags) -> Result<(), AddressSpaceError>,
     /// Map one page of a prepared region from fault context.
     pub commit_demand_page: fn(VirtAddr, NonNull<u8>, PageFlags) -> Result<(), AddressSpaceError>,
-    /// Give one slot's body back, frames and record together.
-    pub end_demand_commit: fn(VirtRange) -> Result<(), AddressSpaceError>,
+    /// Give one slot's body back, frames and record together. The
+    /// second range is the part of the body a commit may have mapped:
+    /// from the slot's watermark to its top.
+    pub end_demand_commit: fn(VirtRange, VirtRange) -> Result<(), AddressSpaceError>,
 }
 
 /// What a backend's fault entry does with a faulting address.
@@ -188,6 +190,16 @@ pub struct FiberStackArena {
     /// resolving commits. Written from the release path, which is a
     /// place a `tracing` call is allowed; see [`Self::announce_processors`].
     announced: Box<[CachePadded<AtomicBool>]>,
+    /// What every released stack cost, summed. Written on the release
+    /// path from whichever processor tears the store down, which is why
+    /// the pair sits on its own line rather than beside a per-processor
+    /// counter.
+    released: CachePadded<ReleasedTotals>,
+}
+
+struct ReleasedTotals {
+    stacks: AtomicU64,
+    committed_bytes: AtomicU64,
 }
 
 /// What the arena is holding, for the boot log and the stats panel.
@@ -204,6 +216,12 @@ pub struct FiberStackArenaStats {
     pub eager_bytes: usize,
     /// Demand commits resolved since boot, across every processor.
     pub demand_commits: u64,
+    /// Stacks given back over the life of the arena.
+    pub released_stacks: u64,
+    /// Bytes those stacks had committed when they were given back.
+    pub released_committed_bytes: u64,
+    /// What the same stacks would have cost committed up front.
+    pub released_eager_bytes: u64,
 }
 
 static HOOKS: Once<&'static FiberStackVmHooks> = Once::new();
@@ -289,6 +307,10 @@ pub fn install_fiber_stack_arena(slots: usize, stack_bytes: usize, processor_cou
             claim_cursor: AtomicUsize::new(0),
             demand_commits: counters.into_boxed_slice(),
             announced: announced.into_boxed_slice(),
+            released: CachePadded::new(ReleasedTotals {
+                stacks: AtomicU64::new(0),
+                committed_bytes: AtomicU64::new(0),
+            }),
         }
     });
 }
@@ -414,7 +436,7 @@ impl FiberStackArena {
         let top_page = VirtAddr::new(body_top - PhysFrame::SIZE);
         let frame = frame_reserve::take_frame(processor);
         if let Err(error) = (self.hooks.commit_demand_page)(top_page, frame, flags) {
-            (self.hooks.end_demand_commit)(body).unwrap_or_else(|cleanup| {
+            (self.hooks.end_demand_commit)(body, body).unwrap_or_else(|cleanup| {
                 panic!(
                     "fiber stack slot {index} could not be given back after its top page was \
                      refused ({error}): {cleanup}"
@@ -454,11 +476,12 @@ impl FiberStackArena {
     /// that path already does.
     fn release(&self, index: usize) {
         let body = self.body(index);
-        let committed_bytes = body
-            .end()
-            .raw()
-            .saturating_sub(self.slots[index].watermark.load(Ordering::Acquire));
-        (self.hooks.end_demand_commit)(body).unwrap_or_else(|error| {
+        let watermark = self.slots[index].watermark.load(Ordering::Acquire);
+        let committed_bytes = body.end().raw().saturating_sub(watermark);
+        // Only the pages between the watermark and the top can be
+        // mapped, so that is all the address space walks.
+        let mapped = VirtRange::new(VirtAddr::new(watermark), committed_bytes);
+        (self.hooks.end_demand_commit)(body, mapped).unwrap_or_else(|error| {
             panic!(
                 "fiber stack slot {index} at {:#x} could not be given back: {error}",
                 body.start.raw()
@@ -469,16 +492,13 @@ impl FiberStackArena {
             .store(body.end().raw(), Ordering::Release);
         self.slots[index].live.store(false, Ordering::Release);
         // What this stack actually cost, against what it would have cost
-        // committed up front. One line per store teardown, on the
-        // ordinary locked path — the fault path itself logs nothing,
-        // because `tracing` reaches the debug console's lock.
-        tracing::info!(
-            target: "helios_kernel::fiber_stack",
-            slot = index,
-            committed_bytes,
-            stack_bytes = self.stack_bytes,
-            "fiber stack released; it committed only the pages it touched"
-        );
+        // committed up front, summed for the boot-end report. Nothing is
+        // logged per release: a store teardown is on the spawn path, and
+        // a console line there is a serial write per instance.
+        self.released.stacks.fetch_add(1, Ordering::Relaxed);
+        self.released
+            .committed_bytes
+            .fetch_add(committed_bytes as u64, Ordering::Relaxed);
         self.announce_processors();
     }
 
@@ -516,6 +536,7 @@ impl FiberStackArena {
             let top = self.body(index).end().raw();
             committed_bytes += top.saturating_sub(slot.watermark.load(Ordering::Acquire));
         }
+        let released_stacks = self.released.stacks.load(Ordering::Relaxed);
         FiberStackArenaStats {
             slots: self.slots.len(),
             live_slots,
@@ -526,6 +547,9 @@ impl FiberStackArena {
                 .iter()
                 .map(|counter| counter.load(Ordering::Relaxed))
                 .sum(),
+            released_stacks,
+            released_committed_bytes: self.released.committed_bytes.load(Ordering::Relaxed),
+            released_eager_bytes: released_stacks * self.stack_bytes as u64,
         }
     }
 }
@@ -590,6 +614,9 @@ mod tests {
     /// deep, so a fault below the top page is a real demand commit.
     const TEST_STACK_BYTES: usize = 16 * PhysFrame::SIZE;
     const TEST_SLOTS: usize = 3;
+    /// Two, so that a commit resolved on the test's processor can be
+    /// shown to land on that processor's counter and no other.
+    const TEST_PROCESSORS: usize = 2;
     /// Where the fake address space puts the arena. Any page-aligned
     /// value works; nothing dereferences it.
     const TEST_ARENA_BASE: usize = 0x0000_4000_0000_0000;
@@ -597,6 +624,9 @@ mod tests {
     static PREPARED: AtomicUsize = AtomicUsize::new(0);
     static COMMITTED: AtomicUsize = AtomicUsize::new(0);
     static ENDED: AtomicUsize = AtomicUsize::new(0);
+    /// The `mapped` range of the most recent `end_demand_commit`, as
+    /// `(start, byte_len)`.
+    static LAST_MAPPED: (AtomicUsize, AtomicUsize) = (AtomicUsize::new(0), AtomicUsize::new(0));
 
     /// An address space that records what the arena asked of it.
     ///
@@ -623,8 +653,14 @@ mod tests {
             COMMITTED.fetch_add(1, Ordering::Relaxed);
             Ok(())
         },
-        end_demand_commit: |virt| {
+        end_demand_commit: |virt, mapped| {
             assert_eq!(virt.byte_len, TEST_STACK_BYTES);
+            assert!(
+                virt.encloses(mapped),
+                "the mapped range {mapped:?} lies inside the body {virt:?}"
+            );
+            LAST_MAPPED.0.store(mapped.start.raw(), Ordering::Relaxed);
+            LAST_MAPPED.1.store(mapped.byte_len, Ordering::Relaxed);
             ENDED.fetch_add(1, Ordering::Relaxed);
             Ok(())
         },
@@ -637,15 +673,16 @@ mod tests {
         let layout = Layout::from_size_align(POOL_BYTES, PhysFrame::SIZE).expect("pool layout");
         // Leaked on purpose: the pool is a `&'static` for the life of
         // the machine, and a test process is that life.
+        // SAFETY: the layout has a non-zero size.
         let base = unsafe { alloc::alloc::alloc_zeroed(layout) } as usize;
         assert!(base != 0, "pool backing");
         let pool =
             super::super::install_user_memory_pool(super::super::allocate_user_memory_pool());
         pool.initialize(&[(base, base + POOL_BYTES)]);
-        pool.configure_processors(1);
-        frame_reserve::configure_processors(1);
+        pool.configure_processors(TEST_PROCESSORS);
+        frame_reserve::configure_processors(TEST_PROCESSORS);
         install_fiber_stack_hooks(&TEST_HOOKS);
-        install_fiber_stack_arena(TEST_SLOTS, TEST_STACK_BYTES, 1);
+        install_fiber_stack_arena(TEST_SLOTS, TEST_STACK_BYTES, TEST_PROCESSORS);
     }
 
     #[test]
@@ -730,9 +767,45 @@ mod tests {
 
         drop(held);
         assert_eq!(ENDED.load(Ordering::Relaxed), TEST_SLOTS);
-        assert_eq!(fiber_stack_arena_stats().expect("stats").live_slots, 0);
+        let stats = fiber_stack_arena_stats().expect("stats");
+        assert_eq!(stats.live_slots, 0);
+        assert_eq!(stats.released_stacks, TEST_SLOTS as u64);
+        assert_eq!(
+            stats.released_committed_bytes,
+            (TEST_SLOTS * PhysFrame::SIZE) as u64,
+            "an untouched stack cost its top page and nothing more"
+        );
         // And the slots are usable again.
-        let _reused = claim_fiber_stack(TEST_STACK_BYTES).expect("a slot came back");
+        let reused = claim_fiber_stack(TEST_STACK_BYTES).expect("a slot came back");
+        assert_eq!(fiber_stack_arena_stats().expect("stats").live_slots, 1);
+        assert_eq!(reused.range().end - reused.range().start, TEST_STACK_BYTES);
+    }
+
+    #[test]
+    fn a_released_stack_hands_back_only_the_span_it_touched() {
+        arena();
+        let stack = claim_fiber_stack(TEST_STACK_BYTES).expect("a free slot");
+        let range = stack.range();
+        let deep = range.end - 4 * PhysFrame::SIZE + 8;
+        assert_eq!(
+            resolve_stack_fault(VirtAddr::new(deep)),
+            StackFault::Committed
+        );
+
+        drop(stack);
+        let deepest_page = deep & !(PhysFrame::SIZE - 1);
+        assert_eq!(LAST_MAPPED.0.load(Ordering::Relaxed), deepest_page);
+        assert_eq!(
+            LAST_MAPPED.1.load(Ordering::Relaxed),
+            range.end - deepest_page,
+            "the address space walks from the watermark to the top and nothing below"
+        );
+        let stats = fiber_stack_arena_stats().expect("stats");
+        assert_eq!(stats.released_stacks, 1);
+        assert_eq!(
+            stats.released_committed_bytes,
+            (range.end - deepest_page) as u64
+        );
     }
 
     #[test]
@@ -752,8 +825,17 @@ mod tests {
         arena();
         let stack = claim_fiber_stack(TEST_STACK_BYTES).expect("a free slot");
         let range = stack.range();
-        resolve_stack_fault(VirtAddr::new(range.end - 2 * PhysFrame::SIZE));
+        assert_eq!(
+            resolve_stack_fault(VirtAddr::new(range.end - 2 * PhysFrame::SIZE)),
+            StackFault::Committed
+        );
 
-        assert!(fiber_stack_demand_commits_on(ProcessorId::new(0)) >= 1);
+        // A test runs on one processor; the other's counter has to stay
+        // where it was, or the counters are not per processor.
+        let here = current_processor();
+        let other = ProcessorId::new(u16::from(here.id() == 0));
+        assert_eq!(fiber_stack_demand_commits_on(here), 1);
+        assert_eq!(fiber_stack_demand_commits_on(other), 0);
+        assert_eq!(fiber_stack_arena_stats().expect("stats").demand_commits, 1);
     }
 }
