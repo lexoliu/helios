@@ -27,6 +27,9 @@ helios-hal.workspace = true
 helios-profdata.workspace = true
 helios-workspace-root.workspace = true
 nu-ansi-term = "0.50.3"
+# Reads the kernel image's function symbols: the denominator of the
+# profile-use build's uncovered-function count (#329).
+object = { version = "0.39", default-features = false, features = ["elf", "read", "std"] }
 ratatui = "0.30.0"
 rustyline = "14.0.0"
 serialport = "4.9.0"
@@ -34,6 +37,11 @@ shell-words = "1.1.0"
 thiserror = "2.0.20"
 toml = "0.8.23"
 time = { version = "0.3.47", default-features = false, features = ["formatting", "std"] }
+
+[dev-dependencies]
+# Synthesizes an ELF for the function-count test; `write` unifies onto
+# the read-only dependency only when the tests build.
+object = { version = "0.39", default-features = false, features = ["elf", "read", "write", "std"] }
 
 # AF_VSOCK exists only on Linux; the inspector's vsock transport is
 # compiled out elsewhere and reports a typed error instead.
