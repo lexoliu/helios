@@ -713,10 +713,24 @@ pub trait PlaybackDevice: Send + Sync + 'static {
 
     /// Stops the stream's clock, keeping everything
     /// [`PlaybackDevice::prepare`] allocated.
+    ///
+    /// Stopping is the clock alone: writes the device still holds stay
+    /// outstanding until [`PlaybackDevice::release`] completes them.
     fn stop(&self, stream: StreamId) -> impl Future<Output = AudioResult<()>> + Send + '_;
 
-    /// Hands back everything [`PlaybackDevice::prepare`] allocated. The
-    /// stream keeps its parameters and can be prepared again.
+    /// Hands back everything [`PlaybackDevice::prepare`] allocated, and
+    /// completes every [`PlaybackDevice::write`] it still holds first.
+    ///
+    /// The ordering is the load-bearing half of the contract: the
+    /// device may not answer `release` while a write it took is still
+    /// outstanding, so when the future resolves every one of them has
+    /// already resolved, and a caller settling its own in-flight writes
+    /// afterwards cannot park on a completion that is never coming.
+    /// The stream keeps its parameters and can be prepared again.
+    ///
+    /// A device that cannot promise this cannot implement the trait; a
+    /// `release` that failed made the promise to no one, and what the
+    /// device still holds is then the device's to account for.
     fn release(&self, stream: StreamId) -> impl Future<Output = AudioResult<()>> + Send + '_;
 
     /// Hands the device one period of samples.

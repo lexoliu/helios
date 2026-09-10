@@ -138,6 +138,10 @@ struct ScriptedDevice {
     /// `release` completes them — the behaviour the spec makes the
     /// device guarantee, which is what the pump's teardown collects.
     holds_after: u32,
+    /// When `Some`, `release` answers this error and completes nothing —
+    /// a device breaking the one promise the teardown's collection
+    /// rests on, leaving whatever it still held held.
+    release_error: Option<AudioError>,
     /// Set by `release`; the wake list for the writes it completes.
     released: AtomicBool,
     held_wakers: Mutex<Vec<core::task::Waker>>,
@@ -162,6 +166,7 @@ impl ScriptedDevice {
             writes_before_error: 0,
             writes_taken: AtomicU32::new(0),
             holds_after: u32::MAX,
+            release_error: None,
             released: AtomicBool::new(false),
             held_wakers: Mutex::new(Vec::new()),
             yield_on_write: true,
@@ -216,7 +221,11 @@ impl PlaybackDevice for ScriptedDevice {
         // The promise the spec makes of the device: a release answers
         // only once every message it still holds for the stream has
         // completed, so the held writes end here rather than being
-        // left outstanding.
+        // left outstanding. A refused release made no such promise —
+        // what it still held stays held.
+        if let Some(error) = self.release_error {
+            return Err(error);
+        }
         self.released.store(true, Ordering::Release);
         for waker in self.held_wakers.lock().drain(..) {
             waker.wake();
@@ -1128,6 +1137,88 @@ fn a_rejected_period_mid_stream_collects_the_rest_of_the_ring() {
         0,
         "the chains already with the device were collected, not left behind"
     );
+}
+
+/// A device that refuses `release` does not wedge the stream.
+///
+/// The teardown's collection of outstanding chains rests on the release
+/// having completed them, so a release the device would not take is the
+/// one time the pump leaves without them: waiting could park for ever,
+/// which is the wedge this whole path exists to avoid. What it owes
+/// instead is the error line — stream, step, the device's refusal, and
+/// how many chains it left the device holding — and the claim's word,
+/// which frees even so.
+#[test]
+fn a_device_that_refuses_to_release_keeps_its_chains_but_frees_the_claim() {
+    test_hooks::install();
+    let (service, inboxes) = service_of(&[playback_stream(0)]);
+    let mut audio = AudioOwnership::new();
+    audio
+        .claim(&service, 0, window())
+        .expect("the stream is free");
+    let (ring, params) = audio.negotiate(TONE).expect("the device takes this format");
+
+    let mut device = ScriptedDevice::new(topology(&[playback_stream(0)]));
+    // Two writes stay in the device's hands and the third is refused,
+    // which is what ends the pump while the held two are outstanding —
+    // and the release refuses too, so their completions never come.
+    device.holds_after = 0;
+    device.writes_before_error = 2;
+    device.write_error = Some(AudioError::DeviceIo);
+    device.release_error = Some(AudioError::DeviceIo);
+    let timer = Timer::new(TestCpu::without_entropy());
+    let period = alloc::vec![0x22_u8; params.period_bytes as usize];
+
+    let periods_written = block_on(async {
+        let player = async {
+            let mut writer = PeriodWriter::new(ring.clone());
+            let mut written = 0_usize;
+            while let Written::Took(taken) = write_once(&mut writer, &period).await {
+                assert_eq!(taken, period.len());
+                written += 1;
+            }
+            written
+        };
+        let pump = pin!(play(&device, stream_of(&service), &ring, params, &timer));
+        join(pin!(player), pump).await.0
+    });
+    // The writer loop only leaves on `Ended`: the pump died with two
+    // chains in the device's hands and still ended its producer.
+    assert!(
+        periods_written >= 3,
+        "the producer committed past the two the device still holds"
+    );
+    assert_eq!(
+        device.in_flight.load(Ordering::Acquire),
+        2,
+        "the two chains the device never completed stayed with it — the count the teardown logged"
+    );
+
+    audio.release();
+    let inbox = &inboxes[0];
+    block_on(async {
+        let served = poll_once(pin!(serve_playback(
+            &device,
+            stream_of(&service),
+            inbox,
+            &timer
+        )))
+        .await;
+        assert_eq!(
+            served, None,
+            "the task keeps serving after a release the device refused"
+        );
+    });
+
+    assert_eq!(
+        stream_of(&service).claim.load(Ordering::Acquire),
+        ClaimState::FREE,
+        "the claim word freed even though the device refused to release"
+    );
+    let mut second = AudioOwnership::new();
+    second
+        .claim(&service, 0, window())
+        .expect("a refused release did not wedge the stream");
 }
 
 /// A `write` that answers on its first poll — a device that completes

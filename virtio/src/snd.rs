@@ -622,7 +622,12 @@ impl<T: VirtioTransport> PlaybackDevice for VirtioSndDevice<T> {
     async fn release(&self, stream: StreamId) -> AudioResult<()> {
         // The parameters survive a release — the specification puts the
         // stream back in the state `PCM_SET_PARAMS` left it in — so the
-        // remembered period length stays with it.
+        // remembered period length stays with it. The device may not
+        // answer the request while an I/O message for the stream is
+        // still pending (virtio 1.2 §5.14.6.6.5.1 "Stream Release"):
+        // every `write` this driver submitted has resolved by the time
+        // it returns, which is where the trait's flush ordering comes
+        // from.
         self.stream_command(R_PCM_RELEASE, stream).await
     }
 

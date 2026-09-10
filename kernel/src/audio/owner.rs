@@ -38,7 +38,11 @@
 //!   completion would leave a descriptor in the device's ring that
 //!   nobody reaps, which is both why a stop closes the producer's ring
 //!   rather than interrupting the task and why the pump cannot simply
-//!   return on an error.
+//!   return on an error. The one time chains are left behind is a
+//!   release the device refused: that answer never carried the
+//!   completion promise the collection rests on, so waiting on them
+//!   could park for ever — they are logged by count instead, the
+//!   device's own ring being the device's to account for.
 //!
 //! Both hold the same device handle. The trait's own contract says every
 //! method takes `&self`, may be called from several tasks at once, and
@@ -231,7 +235,16 @@ pub(super) async fn serve_playback<Device, CpuImpl>(
 /// latching a period whose pages had gone back to a pool would play
 /// another instance's memory.
 async fn finish_release<Device: PlaybackDevice>(device: &Device, shared: &StreamShared) {
-    quiesce(device, shared).await;
+    if let Err(error) = quiesce(device, shared).await {
+        // The claim is going back either way — the device is told, its
+        // refusal is reported, and nothing is parked on it.
+        tracing::error!(
+            target: "helios_kernel::audio",
+            %error,
+            stream = shared.id().index(),
+            "the sound device would not release a stream whose claim is going back"
+        );
+    }
     while let Ok(pins) = shared.returned.pop() {
         drop(pins);
     }
@@ -246,29 +259,31 @@ async fn finish_release<Device: PlaybackDevice>(device: &Device, shared: &Stream
     );
 }
 
-/// Stop the stream's clock and let the device release what it allocated.
+/// Stop the stream's clock and let the device release what it
+/// allocated, answering whether the release went through.
 ///
-/// A stream that was never configured refuses both, which is not an
-/// error here: the claim is going back either way, and the message says
-/// which step the device would not take.
-async fn quiesce<Device: PlaybackDevice>(device: &Device, shared: &StreamShared) {
+/// A stream that was never configured refuses both steps, which is not
+/// an error here — the claim is going back either way — but a refused
+/// step is reported rather than walked past: `stop`'s refusal is logged
+/// and `release` is still asked for, because it is the one request a
+/// device may only answer after completing every write it still holds.
+/// Its answer is therefore the caller's to act on: an `Err` means no
+/// such completion was promised, and whatever the device is still
+/// holding may never come back.
+async fn quiesce<Device: PlaybackDevice>(
+    device: &Device,
+    shared: &StreamShared,
+) -> AudioResult<()> {
     let stream = shared.id();
     if let Err(error) = device.stop(stream).await {
-        tracing::debug!(
+        tracing::error!(
             target: "helios_kernel::audio",
             %error,
             stream = stream.index(),
             "the sound device would not stop a stream that is going back"
         );
     }
-    if let Err(error) = device.release(stream).await {
-        tracing::debug!(
-            target: "helios_kernel::audio",
-            %error,
-            stream = stream.index(),
-            "the sound device would not release a stream that is going back"
-        );
-    }
+    device.release(stream).await
 }
 
 async fn serve_negotiation<Device, CpuImpl>(
@@ -384,7 +399,11 @@ fn refused(stream: StreamId, step: &'static str, error: AudioError) -> AudioServ
 /// writes are in its used ring by then, and settling each of them keeps
 /// a `write` future from ever being dropped between its submission and
 /// its completion — which is the move that would leave a descriptor in
-/// the device's ring that nobody reaps.
+/// the device's ring that nobody reaps. A release the device refused
+/// carried none of that promise, so the chains are left with it —
+/// counted in the error line, because the device that broke the
+/// contract owns what its ring still holds — rather than parked on
+/// completions that may never come.
 pub(super) async fn play<Device, CpuImpl>(
     device: &Device,
     shared: &StreamShared,
@@ -486,11 +505,26 @@ pub(super) async fn play<Device, CpuImpl>(
     }
     // The release is what brings every chain the device still holds to
     // its used ring: the device is not allowed to answer it while a
-    // message is pending, so once it has, the drain below cannot park
-    // on a write that is never coming back.
-    quiesce(device, shared).await;
-    while let Some((index, outcome)) = writes.next().await {
-        settle(shared, ring, stream, index, outcome, &mut last_latency);
+    // message is pending, so once it has, the drain cannot park on a
+    // write that is never coming back. A release that failed promised
+    // nothing — the writes the device still holds are its ring's to
+    // account for now, and they are named and counted rather than
+    // waited on.
+    match quiesce(device, shared).await {
+        Ok(()) => {
+            while let Some((index, outcome)) = writes.next().await {
+                settle(shared, ring, stream, index, outcome, &mut last_latency);
+            }
+        }
+        Err(error) => {
+            tracing::error!(
+                target: "helios_kernel::audio",
+                %error,
+                stream = stream.index(),
+                outstanding = writes.len(),
+                "the sound device would not release a stream that still had writes outstanding"
+            );
+        }
     }
 }
 
