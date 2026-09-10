@@ -124,11 +124,8 @@ impl Desktop {
             terminal: Terminal::new(columns, rows),
             terminal_region,
             clients: Vec::new(),
-            pointer: Point {
-                x: mode.width / 2,
-                y: mode.height / 2,
-            },
-            focus: Focus::Desktop,
+            pointer: initial_pointer(mode),
+            focus: initial_focus(mode),
         }
     }
 
@@ -406,6 +403,27 @@ impl Desktop {
     }
 }
 
+/// Where the pointer is before the first report moves it: the mode's
+/// centre, which is where the display's cursor plane starts it.
+const fn initial_pointer(mode: Mode) -> Point {
+    Point {
+        x: mode.width / 2,
+        y: mode.height / 2,
+    }
+}
+
+/// What has the keyboard before the first pointer report: whatever the
+/// pointer's starting position lies over, resolved the same way
+/// `move_pointer` resolves a reported one. A terminal under the cursor
+/// is typed into from the first frame rather than the first mouse move.
+fn initial_focus(mode: Mode) -> Focus {
+    resolve_focus(
+        core::iter::empty(),
+        terminal_region(mode),
+        initial_pointer(mode),
+    )
+}
+
 /// What has the keyboard when the pointer is at `position`.
 ///
 /// Focus follows the pointer and nothing else moves it: there is no
@@ -618,6 +636,25 @@ mod tests {
         assert_eq!(row_of(34 + CELL_HEIGHT as u32 * 3 + 1, 34), 3);
         // Above the terminal is the first row rather than an underflow.
         assert_eq!(row_of(0, 34), 0);
+    }
+
+    /// Focus follows the pointer from before its first report: the
+    /// keyboard starts on whatever the cursor plane starts over, so a
+    /// terminal there takes keys without the mouse ever moving.
+    #[test]
+    fn the_keyboard_starts_where_the_pointer_starts() {
+        // The terminal fills this mode to within its margins, so the
+        // centred starting pointer is over it.
+        assert_eq!(initial_focus(MODE), Focus::Terminal);
+        // A mode too small for the margins leaves nothing under the
+        // pointer, and the wallpaper holds no keyboard.
+        assert_eq!(
+            initial_focus(Mode {
+                width: 48,
+                height: 48
+            }),
+            Focus::Desktop
+        );
     }
 
     #[test]

@@ -228,6 +228,17 @@ takes the two things that would otherwise need a second boot:
 | `--run-wait-seconds <n>` | After the last capture, how long to wait for that program to finish so what it printed reaches this session's output. A program still running when the wait ends is left running. |
 | `--input <script>` | An input script, same grammar as the `input` action, run once the program has started and before the first capture. |
 | `--input-interval-ms <n>` | How long to wait between that script's statements. |
+| `--input-wait-seconds <n>` | How long the script waits for the guest to claim its input devices before the first statement; 30 by default. |
+
+`--input` — here and on the `input` action — never sends on a delay.
+Before the first statement the inspector asks the guest, through
+`helios:system/stats`, whether every input device it reports is claimed,
+and keeps asking until they are or `--input-wait-seconds` runs out. A
+report sent earlier would land in the kernel's unclaimed-device drain
+rather than on the queue of whoever takes the device next, so the gate
+is the guest's own claim state: a wait that ends with devices still
+unclaimed fails the session naming them, and a guest that reports no
+input devices at all fails the same way.
 
 A guest program that exits before the captures are taken fails the
 session, naming itself: a capture is of a guest that is still drawing,
@@ -240,7 +251,6 @@ left.
     --boot-program dash --boot-program debugger --boot-program display-test \
     screendump \
       --run /bin/display-test --run-arg --seconds --run-arg 20 \
-      --input tools/desktop/display-probe.input --input-interval-ms 100 \
       --settle-seconds 2 target/probe/drawn.png
 ```
 
@@ -329,6 +339,11 @@ What lies under the pointer has the keyboard: the terminal, a client
 window, or the wallpaper, which has no keyboard at all. Nothing else
 moves focus — there is no click to raise and no shortcut to cycle — and a
 change of focus damages only the two borders that changed colour.
+
+The rule holds from before the pointer's first report: the cursor plane
+starts at the mode's centre, and whatever lies under that has the
+keyboard already, so a terminal there is typed into without the mouse
+ever moving.
 
 Keys become bytes through one layout table indexed by evdev's own codes,
 because those codes are the keys' positions on the board. The terminal

@@ -114,6 +114,29 @@ class RunInfo(BaseModel):
             "the kernel profile the `helios_baseline` kernel was built against, when the run was paired"
         ),
     )
+    kernel_pgo_uncovered: int | None = Field(
+        default=None,
+        description=(
+            "functions the `helios` kernel's profile-use build listed as uncovered "
+            "(`helios.pgo-uncovered.txt` beside the kernel image, docs/pgo.md); "
+            "None when the build was not a profile-use one or recorded no list"
+        ),
+    )
+    kernel_pgo_functions: int | None = Field(
+        default=None,
+        description=(
+            "functions the `helios` kernel image defines — the denominator of "
+            "`kernel_pgo_uncovered`, read off the image's symbol table"
+        ),
+    )
+    baseline_kernel_pgo_uncovered: int | None = Field(
+        default=None,
+        description="the uncovered count for the baseline image, when the run was paired",
+    )
+    baseline_kernel_pgo_functions: int | None = Field(
+        default=None,
+        description="the denominator for the baseline image, when the run was paired",
+    )
 
     @property
     def paired(self) -> bool:

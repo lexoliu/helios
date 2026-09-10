@@ -279,10 +279,15 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: bench-runtime-${{ matrix.lane }}
+          # The uncovered-function lists land beside the kernels the
+          # lane built (helios/target/…/profile-use/), not under
+          # bench-runtime; they ride the same upload so the step log's
+          # `full list:` path stays resolvable (#329).
           path: |
             bench-runtime/**/*.log
             bench-runtime/**/*.pcap
             kernel-symbols/**/*.symbols.json
+            helios/target/**/helios.pgo-uncovered.txt
           if-no-files-found: warn
       - name: Remove the tap network backend
         if: always() && matrix.net-backend == 'tap'
@@ -440,6 +445,16 @@ jobs:
         with:
           name: bench-runtime-pgo
           path: bench-runtime/**/*.log
+          if-no-files-found: warn
+      - name: Upload the uncovered-function lists
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          # The two profile-use kernels this job builds leave their lists
+          # beside their images under helios/target/ (#329); a green run's
+          # step-log `full list:` path has to resolve too.
+          name: bench-pgo-uncovered
+          path: helios/target/**/helios.pgo-uncovered.txt
           if-no-files-found: warn
       - name: Remove the tap network backend
         if: always() && steps.lane.outputs.net-backend == 'tap'

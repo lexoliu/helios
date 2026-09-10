@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import shlex
 import subprocess
 from dataclasses import dataclass, field
@@ -406,6 +407,75 @@ def wasm_artifact_digests(workloads: list[dict]) -> dict[str, str]:
     return dict(sorted(digests.items()))
 
 
+#: The first two lines of a `<kernel>.pgo-uncovered.txt`: the figures the
+#: build wrote (`# uncovered: <n> of <functions>` and `# warnings
+#: emitted: <m>`).
+PGO_UNCOVERED_HEADER = re.compile(r"# uncovered:\s*(\d+)\s+of\s+(\d+)\s+functions")
+PGO_WARNINGS_HEADER = re.compile(r"# warnings emitted:\s*(\d+)")
+
+
+def kernel_pgo_uncovered(
+    workspace_root: Path,
+    lane: Lane,
+    profile_use: Path | None,
+) -> tuple[int, int] | None:
+    """The uncovered/function counts a Helios image's kernel build recorded.
+
+    The inspector counts the `no profile data available for function`
+    warnings of a profile-use build and writes them beside the kernel as
+    `<kernel>.pgo-uncovered.txt`, headed by the image functions a warning
+    named — `<uncovered> of <functions>`, the functions the image defines
+    (docs/pgo.md). The kernel's own path is asked of the inspector rather
+    than rebuilt here: the mapping from architecture and profile to
+    target directory is the inspector's, and a second copy of it in this
+    file would be a second thing to keep true. `None` when the build kept
+    no list — a plain release build, a target whose releases read no
+    profile, or a kernel built before the list existed. A `kernel-path`
+    that fails is not that case: it is a broken inspector, a wrong
+    workspace root, or a refused profile, and it is fatal rather than a
+    missing count.
+    """
+    inspector = Path(
+        os.environ.get("HELIOS_INSPECTOR_BIN", REPO_ROOT / "target" / "release" / "helios-inspector")
+    )
+    argv = [
+        str(inspector),
+        "vm",
+        "--arch",
+        lane.helios_arch,
+        "--release",
+        "--accel",
+        lane.accelerator,
+    ]
+    if profile_use is not None:
+        argv += ["--profile-use", str(profile_use)]
+    argv.append("kernel-path")
+    env = os.environ.copy()
+    env["HELIOS_WORKSPACE_ROOT"] = str(workspace_root)
+    completed = subprocess.run(argv, cwd=REPO_ROOT, env=env, capture_output=True, text=True, check=False)
+    if completed.returncode != 0:
+        raise SystemExit(
+            f"`{shlex.join(argv)}` exited with status {completed.returncode}: {completed.stderr.strip()}"
+        )
+    listing = Path(completed.stdout.strip() + ".pgo-uncovered.txt")
+    if not listing.is_file():
+        return None
+    with listing.open("r", encoding="utf-8") as handle:
+        first, second = handle.readline(), handle.readline()
+    match, warnings = PGO_UNCOVERED_HEADER.match(first), PGO_WARNINGS_HEADER.match(second)
+    if match is None or warnings is None:
+        raise SystemExit(
+            f"{listing} does not open with its `# uncovered:`/`# warnings emitted:` "
+            f"lines: {first!r} {second!r}"
+        )
+    listed = sum(
+        1 for line in listing.open("r", encoding="utf-8") if line.strip() and not line.startswith("#")
+    )
+    if listed != int(warnings.group(1)):
+        raise SystemExit(f"{listing} names {warnings.group(1)} emitted warnings but lists {listed}")
+    return int(match.group(1)), int(match.group(2))
+
+
 def bootfs_cwasm_digests(lane: Lane, kernel_build: str) -> dict[str, str]:
     """SHA256 of the signed cwasm files the Helios guest loaded.
 
@@ -683,6 +753,22 @@ def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) ->
 
     def build(reconfirmed: list[str]) -> Report:
         finished = datetime.now(UTC).isoformat(timespec="seconds")
+        # The uncovered/function counts each profile-use image's build
+        # left beside its kernel; None where the build kept no list.
+        candidate_uncovered = (
+            kernel_pgo_uncovered(REPO_ROOT, lane, options.profile_use)
+            if options.kernel_build == PROFILE_USE_BUILD
+            else None
+        )
+        baseline_uncovered = (
+            kernel_pgo_uncovered(
+                options.baseline.worktree if options.baseline is not None else REPO_ROOT,
+                lane,
+                None,
+            )
+            if options.baseline_kernel_build == PROFILE_USE_BUILD
+            else None
+        )
         run = RunInfo(
             id=run_id,
             url=run_url,
@@ -705,6 +791,10 @@ def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) ->
             baseline_kernel_build=options.baseline_kernel_build,
             kernel_profile=candidate_profile,
             baseline_kernel_profile=baseline_profile,
+            kernel_pgo_uncovered=(candidate_uncovered[0] if candidate_uncovered is not None else None),
+            kernel_pgo_functions=(candidate_uncovered[1] if candidate_uncovered is not None else None),
+            baseline_kernel_pgo_uncovered=(baseline_uncovered[0] if baseline_uncovered is not None else None),
+            baseline_kernel_pgo_functions=(baseline_uncovered[1] if baseline_uncovered is not None else None),
             retaken=retaken,
             reconfirmed=reconfirmed,
         )

@@ -228,6 +228,40 @@ the way `just build-instrumented` is `vm --profile-generate build`, so
 the flags have one definition (`inspector/src/vm.rs`,
 `profile_use_rustflags`).
 
+#### What the warnings become
+
+`-pgo-warn-missing-function` emits one warning per uncovered function,
+and a kernel build has thousands of them — enough that a paired suite
+job's step log truncated itself and hid everything after the builds
+(#329). A profile-use build therefore pipes rustc's stderr rather than
+inheriting it: the `no profile data available for function` lines are
+counted per crate and written, verbatim, to
+`<kernel>.pgo-uncovered.txt` beside the image the build produced (so
+`target/x86_64-unknown-none/profile-use/helios.pgo-uncovered.txt` for
+the fetched-profile build, and the same name in the keyed directory of
+a named one, per the table below). Everything else — `Compiling`,
+`Finished`, other warnings, errors — reaches the log unchanged, and the
+build ends with one line naming what it redirected:
+
+```text
+pgo uncovered functions: 18055 of 18648 (96.8%) in 18 crates (helios_x86 11800, wasmtime 3100, …); full list: /path/to/helios.pgo-uncovered.txt
+```
+
+Both figures are read off the kernel image just built — rustc prints no
+total, so the denominator is the image's own defined `STT_FUNC` symbols
+(the same population `helios-bench symbols` exports), and the numerator
+is the subset a warning named: a function warned once per codegen unit
+still counts once, and one the linker dead-stripped warns and is listed
+without counting against an image it never entered. The percentage is
+the share uncovered, the parenthesised list is the uncovered count per
+crate, and the path is where every warning line went, header first. The
+bench run record carries both figures per column (`kernel_pgo_uncovered`
+and `kernel_pgo_functions`, plus the `baseline_` pair), the paired
+gate's labels name them, and the lists ride the runtime-directory upload
+— `bench-runtime-<lane>` on the matrix lanes, `bench-pgo-uncovered` on
+`suite-pgo`, where the failure-only log upload would have left a green
+run's `full list:` path pointing at nothing.
+
 #### Where each build lands
 
 One cargo profile is one output directory, and on x86-64 the release
@@ -360,9 +394,10 @@ candidate that does not beat the baseline says the release's profile
 still describes this kernel; one that does
 says the profile has aged, which is the argument for cutting the next
 release's collection. The run record names each column's profile
-(`kernel_profile`, `baseline_kernel_profile`) and the paired table's
-labels carry them, because two `profile-use` builds of one commit are
-otherwise indistinguishable.
+(`kernel_profile`, `baseline_kernel_profile`) and the coverage each
+profile left — `kernel_pgo_uncovered` of `kernel_pgo_functions`, and the
+`baseline_` pair — and the paired table's labels carry them, because two
+`profile-use` builds of one commit are otherwise indistinguishable.
 
 The pairing machinery varies one thing between its two columns. Until now
 that was the commit — a baseline worktree of another ref (#173, #178) —
@@ -665,3 +700,6 @@ does not.
   release kernel became a `profile-use` build itself, so both booted one
   image. A profile named on the command line now keys a target directory
   of its own; described under "Where each build lands".
+- #329: the missing-function warnings flooded the suite's step log until
+  it truncated. The build now counts them per crate and writes the list
+  beside the kernel; described under "What the warnings become".

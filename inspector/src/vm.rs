@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::fs::File;
 use std::io;
@@ -6,16 +7,17 @@ use std::os::unix::fs::symlink;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use askama::Template;
 use clap::{Args as ClapArgs, Subcommand, ValueEnum};
-use console::style;
+use console::{strip_ansi_codes, style};
 use directories::ProjectDirs;
 use helios_hal::fs::HOST_SHARE_MOUNT_TAG;
 use helios_inspector_protocol::debugger::filesystem as debugger_fs;
 use helios_inspector_protocol::system::profiling as system_profiling;
 use helios_inspector_protocol::system::programs as system_programs;
+use helios_inspector_protocol::system::stats;
 use helios_profdata::{
     KernelProfileStore, KernelProfileStoreError, ProfileDigest, ProfileUseError,
 };
@@ -24,6 +26,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 
+use crate::serial::RpcClient;
 use crate::stats_tui::format_bytes;
 use crate::system::{self, SystemError};
 use crate::workload_bench::{
@@ -190,6 +193,30 @@ pub(crate) enum BuildStepError {
     Exited {
         label: String,
         status: std::process::ExitStatus,
+    },
+    #[error("failed to capture and forward the stderr of {label}: {source}")]
+    Captured {
+        label: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to read the kernel image {path}: {source}")]
+    KernelImageRead {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to read the symbols of the kernel image {path}: {source}")]
+    KernelImageSymbols {
+        path: String,
+        #[source]
+        source: object::Error,
+    },
+    #[error("failed to write the uncovered-function list {path}: {source}")]
+    UncoveredList {
+        path: String,
+        #[source]
+        source: io::Error,
     },
 }
 
@@ -423,6 +450,20 @@ pub(crate) enum VmSessionError {
         #[source]
         source: QmpError,
     },
+    #[error("the guest reports no input devices for an input script to drive")]
+    NoInputDevices,
+    #[error(
+        "timed out after {seconds}s waiting for the guest to claim its input devices; \
+         still unclaimed: {devices}"
+    )]
+    InputClaimTimedOut { seconds: u64, devices: String },
+    #[error("failed to read the guest's input devices while waiting for their claims: {source}")]
+    InputClaimProbe {
+        #[source]
+        source: SystemError,
+    },
+    #[error("the session ended while the input gate was asking the guest about its devices")]
+    InputGateSessionEnded,
     #[error("{0}")]
     Size(#[from] SizeError),
     #[error("failed to set the balloon target to {target}: {source}")]
@@ -563,6 +604,9 @@ const BALLOON_IOTHREAD_ID: &str = "balloon-io";
 /// How long the guest's reported balloon size has to hold still before a
 /// wait calls it settled short of the target it was given.
 const BALLOON_STILL_FOR: Duration = Duration::from_secs(10);
+/// How often the input gate re-asks the guest while a device it
+/// reported is still unclaimed.
+const INPUT_CLAIM_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// How much of QEMU's log a failed session quotes.
 ///
 /// The log holds QEMU's own stdout and stderr and stays small, because
@@ -1678,6 +1722,17 @@ pub(crate) struct ScreendumpCommand {
     #[arg(long, default_value_t = 0)]
     input_interval_ms: u64,
 
+    /// How long `--input` waits for the guest to claim every input
+    /// device it reports before the first statement is sent.
+    ///
+    /// The wait is on the guest's own claim state, not on a delay: a
+    /// report sent while nobody holds the device is drained by the
+    /// kernel rather than queued for whoever claims it next. When the
+    /// wait runs out the session fails, naming the devices still
+    /// unclaimed.
+    #[arg(long, default_value_t = 30)]
+    input_wait_seconds: u64,
+
     /// Stop the instance registered under this name once the first
     /// capture is taken.
     ///
@@ -1740,8 +1795,21 @@ pub(crate) struct InputCommand {
     /// A program that reads input has to have claimed its devices
     /// before the host drives them: events sent while nobody holds a
     /// device are drained by the kernel and are not the guest's to see.
+    /// The claim itself is what `--input-wait-seconds` gates on; this is
+    /// slack on top of it for a program that needs it.
     #[arg(long, default_value_t = 0)]
     settle_seconds: u64,
+
+    /// How long to wait for the guest to claim every input device it
+    /// reports before the first statement is sent.
+    ///
+    /// The wait is on the guest's own claim state, not on a delay: a
+    /// report sent while nobody holds the device is drained by the
+    /// kernel rather than queued for whoever claims it next. When the
+    /// wait runs out the session fails, naming the devices still
+    /// unclaimed.
+    #[arg(long, default_value_t = 30)]
+    input_wait_seconds: u64,
 
     /// How long to wait, after the script, for the `--run` program to
     /// finish, so that whatever it printed reaches this session's
@@ -2581,15 +2649,22 @@ fn build_vm(command: &KernelBuildSpec) -> Result<(), VmBuildError> {
         ),
         None => format!("building {} kernel", arch_label(command.profile.arch)),
     };
-    run_step(
-        &kernel_label,
-        kernel_build_command(&repo_root, command)
-            .env("HELIOS_KERNEL_PREBUILD_MANIFEST", &prebuild_manifest)
-            .arg("--target")
-            .arg(command.profile.cargo_target)
-            .arg("--bin")
-            .arg(command.profile.kernel_artifact_name),
-    )?;
+    let mut kernel_build = kernel_build_command(&repo_root, command);
+    kernel_build
+        .env("HELIOS_KERNEL_PREBUILD_MANIFEST", &prebuild_manifest)
+        .arg("--target")
+        .arg(command.profile.cargo_target)
+        .arg("--bin")
+        .arg(command.profile.kernel_artifact_name);
+    if command.profile_use.is_some() {
+        // A profile-use build emits one warning per function the profile
+        // covers nothing about, thousands of them; they are captured to a
+        // list beside the kernel and the step log gets the count (#329).
+        let kernel = command.kernel_path()?;
+        run_pgo_kernel_step(&kernel_label, &mut kernel_build, command, &kernel)?;
+    } else {
+        run_step(&kernel_label, &mut kernel_build)?;
+    }
     run_step(
         "building inspector",
         cargo_build_command(&repo_root, command.kind.host())
@@ -2885,7 +2960,7 @@ enum VsockSessionError {
 /// `helios:system/stats` says how much of its user memory the balloon is
 /// holding and how much it has named as free.
 fn run_balloon(
-    mut client: crate::serial::RpcClient,
+    mut client: RpcClient,
     command: BalloonCommand,
     qmp_socket: &Path,
 ) -> Result<(), VmSessionError> {
@@ -2918,7 +2993,7 @@ fn run_balloon(
 /// produces an image — QEMU's blank scanout — and that is the evidence
 /// that the machine had a display at all.
 fn run_screendump(
-    client: crate::serial::RpcClient,
+    client: RpcClient,
     command: ScreendumpCommand,
     qmp_socket: &Path,
 ) -> Result<(), VmSessionError> {
@@ -2950,7 +3025,7 @@ fn run_screendump(
 /// asks something of the guest half-way through — a kill between two
 /// captures — has nowhere to ask from otherwise.
 fn alongside_guest_session<HostSide>(
-    client: crate::serial::RpcClient,
+    client: RpcClient,
     host_side: HostSide,
     requests: async_channel::Receiver<GuestRequest>,
 ) -> Result<(), VmSessionError>
@@ -2985,6 +3060,14 @@ enum GuestRequest {
         name: String,
         reply: async_channel::Sender<Result<u64, SystemError>>,
     },
+    /// The input devices the guest reports right now and who holds each.
+    ///
+    /// The input gate asks once per poll; the answer is the guest's own
+    /// claim state through `helios:system/stats`, the only account that
+    /// cannot be mistaken about whether a report would be read.
+    InputDevices {
+        reply: async_channel::Sender<Result<Vec<stats::InputDevice>, SystemError>>,
+    },
 }
 
 /// Serves the host thread's requests against the guest until the thread
@@ -2994,7 +3077,7 @@ enum GuestRequest {
 /// guest program does, and a request server that completed would end it
 /// early.
 async fn serve_guest_requests(
-    client: &crate::serial::RpcClient,
+    client: &RpcClient,
     requests: async_channel::Receiver<GuestRequest>,
 ) -> core::convert::Infallible {
     let serve = async {
@@ -3002,6 +3085,12 @@ async fn serve_guest_requests(
             match request {
                 GuestRequest::Kill { name, reply } => {
                     let outcome = system::kill_named_instance(client, &name).await;
+                    let _ = reply.send(outcome).await;
+                }
+                GuestRequest::InputDevices { reply } => {
+                    let outcome = system::fetch_stats(client)
+                        .await
+                        .map(|sample| sample.inputs);
                     let _ = reply.send(outcome).await;
                 }
             }
@@ -3043,7 +3132,7 @@ struct GuestRun {
 /// Shared by `screendump --run` and `input --run`, which differ only in
 /// what the host does while the guest runs.
 fn alongside_guest_program<HostSide>(
-    client: crate::serial::RpcClient,
+    client: RpcClient,
     run: GuestRun,
     host_side: HostSide,
     requests: async_channel::Receiver<GuestRequest>,
@@ -3161,6 +3250,10 @@ fn capture_scanout(
 ) -> Result<(), VmSessionError> {
     let mut qmp = QmpClient::connect(qmp_socket)?;
     if let Some(script) = &command.input {
+        // The gate is the guest's own claim state, not the socket being
+        // up: a report sent before the claim is one the kernel drains
+        // rather than queues for whoever takes the device next.
+        await_input_claims(requests, command.input_wait_seconds)?;
         send_input_script(&mut qmp, script, command.input_interval_ms)?;
     }
     // The capture that follows the kill waits for the kill's own
@@ -3241,37 +3334,117 @@ fn kill_instance(
     Ok(())
 }
 
+/// Waits until the guest holds every input device it reports.
+///
+/// A statement sent before the claim lands in the kernel's
+/// unclaimed-device drain and never reaches the program that would have
+/// read it, so the gate asks the guest — `helios:system/stats` names
+/// each device and whether an instance holds it — rather than waiting
+/// out a delay that could only ever be unlucky again.
+fn await_input_claims(
+    requests: &async_channel::Sender<GuestRequest>,
+    wait_seconds: u64,
+) -> Result<(), VmSessionError> {
+    wait_for_input_claims(
+        requests,
+        Duration::from_secs(wait_seconds),
+        INPUT_CLAIM_POLL_INTERVAL,
+    )
+}
+
+/// The gate's loop. The poll interval is a parameter so a test drives
+/// it without ever sleeping.
+fn wait_for_input_claims(
+    requests: &async_channel::Sender<GuestRequest>,
+    wait: Duration,
+    poll: Duration,
+) -> Result<(), VmSessionError> {
+    let started = Instant::now();
+    let deadline = started + wait;
+    loop {
+        let devices = input_devices(requests)?;
+        if devices.is_empty() {
+            return Err(VmSessionError::NoInputDevices);
+        }
+        let unclaimed: Vec<&str> = devices
+            .iter()
+            .filter(|device| !device.claimed)
+            .map(|device| device.name.as_str())
+            .collect();
+        if unclaimed.is_empty() {
+            println!(
+                "{} input devices after {:.1}s: {}",
+                style("claimed").green(),
+                started.elapsed().as_secs_f64(),
+                devices
+                    .iter()
+                    .map(|device| device.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(VmSessionError::InputClaimTimedOut {
+                seconds: wait.as_secs(),
+                devices: unclaimed.join(", "),
+            });
+        }
+        std::thread::sleep(poll);
+    }
+}
+
+/// One round of the gate: the input devices the guest reports now.
+///
+/// The reply channel rides inside the request, so an answer the serving
+/// half files between this side's polls still waits to be taken — the
+/// request is sent before its answer is awaited, never the other way.
+fn input_devices(
+    requests: &async_channel::Sender<GuestRequest>,
+) -> Result<Vec<stats::InputDevice>, VmSessionError> {
+    let (reply, answer) = async_channel::bounded(1);
+    requests
+        .send_blocking(GuestRequest::InputDevices { reply })
+        .map_err(|_| VmSessionError::InputGateSessionEnded)?;
+    answer
+        .recv_blocking()
+        .map_err(|_| VmSessionError::InputGateSessionEnded)?
+        .map_err(|source| VmSessionError::InputClaimProbe { source })
+}
+
 /// Runs an input script against the guest's keyboard and pointer.
 ///
 /// The whole script is parsed before the first event is sent: a script
 /// with a typo in its last line is a script that would otherwise leave
 /// the guest half-driven, in a state no later step could account for.
 fn run_input(
-    client: crate::serial::RpcClient,
+    client: RpcClient,
     command: InputCommand,
     qmp_socket: &Path,
 ) -> Result<(), VmSessionError> {
     let socket = qmp_socket.to_path_buf();
     let script = command.script.clone();
     let interval = command.interval_ms;
+    let wait_seconds = command.input_wait_seconds;
     let settle = Duration::from_secs(command.settle_seconds);
+    // The gate's questions reach the guest through the session's request
+    // channel, which the executor keeps serving for as long as the
+    // session runs.
+    let (requests, incoming) = async_channel::bounded(1);
     let drive = move || {
-        // The settle happens on the thread that sends, not before the
-        // guest was started: what it is waiting for is the guest
-        // claiming the devices this script is about to drive.
+        // The settle and the gate both happen on the thread that sends,
+        // not before the guest was started: what they are waiting for is
+        // the guest claiming the devices this script is about to drive.
         if !settle.is_zero() {
             std::thread::sleep(settle);
         }
+        await_input_claims(&requests, wait_seconds)?;
         let mut qmp = QmpClient::connect(&socket)?;
         send_input_script(&mut qmp, &script, interval)
     };
     let Some(program) = command.run.clone() else {
-        return drive();
+        return alongside_guest_session(client, drive, incoming);
     };
-    // The `input` action asks nothing of the guest half-way through, so
-    // its request channel is closed before the session starts.
-    let (requests, incoming) = async_channel::bounded(1);
-    drop(requests);
     alongside_guest_program(
         client,
         GuestRun {
@@ -3328,8 +3501,8 @@ fn send_input_script(
 /// inflate past its own pressure floor and reports the truth, so the
 /// wait ends when the guest stops moving and the caller sees where it
 /// stopped.
-fn settle_balloon(client: &mut crate::serial::RpcClient, target: u64, seconds: u64) {
-    let started = std::time::Instant::now();
+fn settle_balloon(client: &mut RpcClient, target: u64, seconds: u64) {
+    let started = Instant::now();
     let deadline = started + Duration::from_secs(seconds);
     let mut previous = None;
     let mut still_since = started;
@@ -3339,7 +3512,7 @@ fn settle_balloon(client: &mut crate::serial::RpcClient, target: u64, seconds: u
         // work. Not answering is not the same as having stopped, so it
         // does not end the wait or reset the stillness clock.
         let Some(sample) = guest_stats(client) else {
-            if std::time::Instant::now() >= deadline {
+            if Instant::now() >= deadline {
                 println!(
                     "{} guest stopped answering before the {seconds}s wait ran out",
                     style("settled").yellow()
@@ -3360,7 +3533,7 @@ fn settle_balloon(client: &mut crate::serial::RpcClient, target: u64, seconds: u
         }
         if actual != previous {
             previous = actual;
-            still_since = std::time::Instant::now();
+            still_since = Instant::now();
         } else if still_since.elapsed() >= BALLOON_STILL_FOR {
             println!(
                 "{} guest stopped at {} after {:.1}s",
@@ -3370,7 +3543,7 @@ fn settle_balloon(client: &mut crate::serial::RpcClient, target: u64, seconds: u
             );
             return;
         }
-        if std::time::Instant::now() >= deadline {
+        if Instant::now() >= deadline {
             println!(
                 "{} guest was still moving when the {seconds}s wait ran out",
                 style("settled").yellow()
@@ -3383,13 +3556,11 @@ fn settle_balloon(client: &mut crate::serial::RpcClient, target: u64, seconds: u
 
 /// Reads the guest's own view of its memory, or nothing when the guest
 /// is too busy to answer right now.
-fn guest_stats(
-    client: &mut crate::serial::RpcClient,
-) -> Option<helios_inspector_protocol::system::stats::Sample> {
+fn guest_stats(client: &mut RpcClient) -> Option<stats::Sample> {
     crate::runtime::block_on(crate::system::fetch_stats(client)).ok()
 }
 
-fn report_balloon(qmp: &mut QmpClient, client: &mut crate::serial::RpcClient, label: &str) {
+fn report_balloon(qmp: &mut QmpClient, client: &mut RpcClient, label: &str) {
     let Some(sample) = guest_stats(client) else {
         println!(
             "{} {label}: the guest did not answer",
@@ -3421,7 +3592,7 @@ fn report_balloon(qmp: &mut QmpClient, client: &mut crate::serial::RpcClient, la
 }
 
 fn run_workload_bench(
-    mut client: crate::serial::RpcClient,
+    mut client: RpcClient,
     command: WorkloadBenchCommand,
     provenance: VmProvenance,
 ) -> Result<(), VmSessionError> {
@@ -3542,7 +3713,7 @@ async fn profiling_step<T>(
 /// call that brings us here is often a guest that stopped answering, and
 /// a diagnostic that hangs replaces the failure it was fetched to
 /// explain.
-async fn print_recent_guest_errors(client: &mut crate::serial::RpcClient, seconds: u32) {
+async fn print_recent_guest_errors(client: &mut RpcClient, seconds: u32) {
     let mut config = crate::system::TracingConfig::new();
     config.limit = 100;
     config.min_level = Some(helios_inspector_protocol::system::tracing::Level::Info);
@@ -3564,10 +3735,7 @@ async fn print_recent_guest_errors(client: &mut crate::serial::RpcClient, second
     }
 }
 
-fn run_aot_bench(
-    mut client: crate::serial::RpcClient,
-    command: AotBenchCommand,
-) -> Result<(), VmSessionError> {
+fn run_aot_bench(mut client: RpcClient, command: AotBenchCommand) -> Result<(), VmSessionError> {
     crate::run_interruptible(async move {
         let wasm = fs::read(&command.wasm).map_err(|source| AotBenchError::ReadWasm {
             path: command.wasm.display().to_string(),
@@ -3625,7 +3793,7 @@ fn run_aot_bench(
             .map_err(|source| AotBenchError::Report { source })?;
         }
         for iteration in 1..=command.iterations {
-            let started = std::time::Instant::now();
+            let started = Instant::now();
             let outcome = system_programs::aot(
                 &client,
                 &system_programs::AotRequest {
@@ -3990,6 +4158,352 @@ fn run_step(label: &str, command: &mut Command) -> Result<(), BuildStepError> {
         label: label.to_owned(),
         status,
     })
+}
+
+/// The missing-function warnings a profile-use kernel build emitted.
+///
+/// A warning names a function as it was codegen'd in one unit, so the
+/// same function warns once per codegen unit it lands in and a function
+/// dead-stripped at link warns without ever reaching the image. The
+/// symbol-to-crate map is kept so the figures can be stated against the
+/// kernel's own symbol table rather than against warning volume.
+#[derive(Default)]
+struct PgoUncovered {
+    /// The warning lines, verbatim (ANSI codes stripped).
+    lines: Vec<String>,
+    /// Each function a warning named, under the crate of the codegen
+    /// unit that first warned it.
+    symbols: BTreeMap<String, String>,
+}
+
+/// How a profile-use kernel's functions split: the image's `STT_FUNC`
+/// symbols (normalized of the `.llvm.<hash>` suffix a link-time rename
+/// leaves) against the subset a warning named, per crate.
+struct PgoCoverage {
+    /// Function symbols the kernel image defines.
+    functions: u64,
+    /// Of them, how many a warning named.
+    uncovered: u64,
+    /// That subset, per crate.
+    per_crate: BTreeMap<String, u64>,
+}
+
+/// The function symbols the kernel image defines: the `STT_FUNC`
+/// population `helios-bench symbols` exports, with each name normalized
+/// of the `.llvm.<hash>` suffix the linker gives a duplicated internal
+/// function so it matches the warning's pre-link name.
+struct KernelFunctions {
+    total: u64,
+    names: Vec<String>,
+}
+
+/// The text LLVM puts between the codegen unit and the function a
+/// `-pgo-warn-missing-function` build names: `warning: <cgu>: no profile
+/// data available for function <symbol> Hash = <h> up to <n> count
+/// discarded`.
+const PGO_MISSING_FUNCTION: &str = ": no profile data available for function ";
+
+/// A `run_step` for the profile-use kernel build.
+///
+/// `-pgo-warn-missing-function` turns every uncovered function into a
+/// warning, and a kernel build has thousands of them — enough that a
+/// paired suite job truncates its own step log and the workload output
+/// after the builds is unreadable (#329). The build's stderr is piped
+/// instead of inherited: the flood lines are collected for the list file
+/// written beside the kernel, and everything else is forwarded
+/// unchanged.
+fn run_pgo_kernel_step(
+    label: &str,
+    command: &mut Command,
+    spec: &KernelBuildSpec,
+    kernel: &Path,
+) -> Result<(), BuildStepError> {
+    let spinner = spinner(label);
+    command.stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(|source| BuildStepError::Spawn {
+        label: label.to_owned(),
+        source,
+    })?;
+    let stderr = child
+        .stderr
+        .take()
+        .expect("the kernel build's stderr was piped");
+    // Each forwarded line takes the stderr lock for that one write; a
+    // lock held for the whole build would freeze the spinner's ticker
+    // thread on the longest step of the job.
+    let mut forward = io::stderr();
+    let uncovered = match filter_pgo_stderr(label, &mut io::BufReader::new(stderr), &mut forward) {
+        Ok(uncovered) => uncovered,
+        Err(error) => {
+            // Reap rather than orphan the build, and leave the spinner
+            // the way `run_step` leaves it.
+            let _ = child.wait();
+            spinner.finish_and_clear();
+            return Err(error);
+        }
+    };
+    let status = child.wait().map_err(|source| BuildStepError::Spawn {
+        label: label.to_owned(),
+        source,
+    })?;
+    if !status.success() {
+        spinner.finish_and_clear();
+        return Err(BuildStepError::Exited {
+            label: label.to_owned(),
+            status,
+        });
+    }
+    let profile = spec
+        .profile_use
+        .as_ref()
+        .expect("a profile-use build has its profile")
+        .path();
+    let result = kernel_functions(kernel).and_then(|functions| {
+        let coverage = uncovered.coverage(&functions);
+        write_pgo_uncovered(profile, kernel, &uncovered, &coverage).map(|list| (coverage, list))
+    });
+    let (coverage, list) = match result {
+        Ok(pair) => pair,
+        Err(error) => {
+            spinner.finish_and_clear();
+            return Err(error);
+        }
+    };
+    spinner.finish_with_message(format!("{} {}", style("built").green(), label));
+    // The step log's one line: how much of the kernel the profile says
+    // nothing about, and where the list landed.
+    eprintln!("{}", coverage.summary(&list));
+    Ok(())
+}
+
+/// Reads the build's stderr, collecting the missing-function warnings and
+/// forwarding every other line unchanged.
+///
+/// `read_line` rather than a chunk filter keeps each forwarded byte
+/// intact; the flood lines are cheap to spot and every crate's warning
+/// names it in one line.
+fn filter_pgo_stderr(
+    label: &str,
+    mut input: impl io::BufRead,
+    forward: &mut impl io::Write,
+) -> Result<PgoUncovered, BuildStepError> {
+    let captured = |source: io::Error| BuildStepError::Captured {
+        label: label.to_owned(),
+        source,
+    };
+    let mut uncovered = PgoUncovered::default();
+    let mut drop_blank = false;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if input.read_line(&mut line).map_err(captured)? == 0 {
+            break;
+        }
+        let plain = strip_ansi_codes(line.trim_end());
+        if let Some((krate, symbol)) = pgo_uncovered_parts(&plain) {
+            uncovered.lines.push(plain.into_owned());
+            uncovered.symbols.entry(symbol).or_insert(krate);
+            // rustc ends each diagnostic with a blank line; the one that
+            // belongs to a redirected warning goes with it.
+            drop_blank = true;
+            continue;
+        }
+        if drop_blank && plain.is_empty() {
+            drop_blank = false;
+            continue;
+        }
+        drop_blank = false;
+        forward.write_all(line.as_bytes()).map_err(captured)?;
+    }
+    Ok(uncovered)
+}
+
+/// The function symbols the kernel image defines: the denominator the
+/// uncovered warnings are a share of.
+///
+/// rustc prints no such figure — the warning names only what the profile
+/// missed — so the count is the image's own `STT_FUNC` symbols, the same
+/// population `helios-bench symbols` exports.
+fn kernel_functions(kernel: &Path) -> Result<KernelFunctions, BuildStepError> {
+    use object::{Object as _, ObjectSymbol as _, SymbolKind};
+    let kernel_image = |source: io::Error| BuildStepError::KernelImageRead {
+        path: kernel.display().to_string(),
+        source,
+    };
+    let image_symbols = |source: object::Error| BuildStepError::KernelImageSymbols {
+        path: kernel.display().to_string(),
+        source,
+    };
+    let bytes = fs::read(kernel).map_err(kernel_image)?;
+    let image = object::File::parse(&*bytes).map_err(image_symbols)?;
+    let mut total = 0;
+    let mut names = Vec::new();
+    for symbol in image.symbols() {
+        if symbol.kind() != SymbolKind::Text || symbol.is_undefined() {
+            continue;
+        }
+        total += 1;
+        names.push(base_name(symbol.name().map_err(image_symbols)?).to_owned());
+    }
+    Ok(KernelFunctions { total, names })
+}
+
+/// A symbol's name as the warning that precedes the link would know it:
+/// the `.llvm.<hash>` suffix a duplicated internal function picks up at
+/// link time stripped back off.
+fn base_name(symbol: &str) -> &str {
+    match symbol.rsplit_once(".llvm.") {
+        Some((base, suffix))
+            if !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            base
+        }
+        _ => symbol,
+    }
+}
+
+/// The crate a missing-function warning belongs to and the function it
+/// names, when the line is one.
+///
+/// The codegen-unit prefix (`<crate>.<hash>-cgu.<n>`) is how the warning
+/// itself names its crate, so the attribution stays right however the
+/// units of a parallel cargo build interleave. A line whose prefix fits
+/// no known shape is counted under the prefix rustc gave it.
+fn pgo_uncovered_parts(line: &str) -> Option<(String, String)> {
+    let (cgu, rest) = line
+        .strip_prefix("warning: ")?
+        .split_once(PGO_MISSING_FUNCTION)?;
+    let (symbol, _) = rest.split_once(' ').unwrap_or((rest, ""));
+    let krate = match cgu.rsplit_once("-cgu.") {
+        Some((stem, _)) => match stem.rsplit_once('.') {
+            Some((krate, hash))
+                if !krate.is_empty()
+                    && !hash.is_empty()
+                    && hash.bytes().all(|byte| byte.is_ascii_hexdigit()) =>
+            {
+                krate.to_owned()
+            }
+            _ => cgu.to_owned(),
+        },
+        None => cgu.to_owned(),
+    };
+    Some((krate, symbol.to_owned()))
+}
+
+/// The file a profile-use kernel's uncovered-function list is written
+/// to: `<kernel>.pgo-uncovered.txt`, beside the image it describes.
+fn pgo_uncovered_list_path(kernel: &Path) -> PathBuf {
+    let name = kernel
+        .file_name()
+        .expect("kernel_path names a file")
+        .to_string_lossy();
+    kernel.with_file_name(format!("{name}.pgo-uncovered.txt"))
+}
+
+/// The uncovered-function list of a profile-use kernel build, written
+/// beside the kernel image it describes. The header's first lines carry
+/// the same figures the step log's summary does — the counts the bench
+/// report reads off it.
+fn write_pgo_uncovered(
+    profile: &Path,
+    kernel: &Path,
+    uncovered: &PgoUncovered,
+    coverage: &PgoCoverage,
+) -> Result<PathBuf, BuildStepError> {
+    let list = pgo_uncovered_list_path(kernel);
+    let mut document = format!(
+        "# uncovered: {} of {} functions ({:.1}%)\n# warnings emitted: {} in {} crates\n# profile: {}\n",
+        coverage.uncovered,
+        coverage.functions,
+        coverage.percent(),
+        uncovered.lines.len(),
+        coverage.per_crate.len(),
+        profile.display(),
+    );
+    for (krate, count) in coverage.crates_by_size() {
+        document.push_str(&format!("# {krate}: {count}\n"));
+    }
+    for line in &uncovered.lines {
+        document.push_str(line);
+        document.push('\n');
+    }
+    fs::write(&list, document).map_err(|source| BuildStepError::UncoveredList {
+        path: list.display().to_string(),
+        source,
+    })?;
+    Ok(list)
+}
+
+impl PgoUncovered {
+    /// The warnings split against the kernel image's functions: of the
+    /// image's `STT_FUNC` symbols, the ones a warning named, per crate of
+    /// the codegen unit that warned. A warning for a function the linker
+    /// dead-stripped is listed but not counted — it describes no function
+    /// the image contains.
+    fn coverage(&self, functions: &KernelFunctions) -> PgoCoverage {
+        let mut uncovered = 0;
+        let mut per_crate: BTreeMap<String, u64> = BTreeMap::new();
+        for name in &functions.names {
+            if let Some(krate) = self.symbols.get(name) {
+                uncovered += 1;
+                *per_crate.entry(krate.clone()).or_default() += 1;
+            }
+        }
+        PgoCoverage {
+            functions: functions.total,
+            uncovered,
+            per_crate,
+        }
+    }
+}
+
+impl PgoCoverage {
+    /// The per-crate counts, largest first so the summary and the list
+    /// header lead with where the coverage is missing most.
+    fn crates_by_size(&self) -> Vec<(&str, u64)> {
+        let mut crates: Vec<(&str, u64)> = self
+            .per_crate
+            .iter()
+            .map(|(krate, count)| (krate.as_str(), *count))
+            .collect();
+        crates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+        crates
+    }
+
+    /// The share of the kernel's functions the profile covered nothing
+    /// about.
+    fn percent(&self) -> f64 {
+        if self.functions == 0 {
+            0.0
+        } else {
+            self.uncovered as f64 / self.functions as f64 * 100.0
+        }
+    }
+
+    /// The one line the step log gets for a profile-use kernel: the
+    /// uncovered count against the kernel's function count, the per-crate
+    /// counts it sums over, and where the full list was written.
+    fn summary(&self, list: &Path) -> String {
+        let crates = self
+            .crates_by_size()
+            .into_iter()
+            .map(|(krate, count)| format!("{krate} {count}"))
+            .collect::<Vec<_>>();
+        let crates = if crates.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", crates.join(", "))
+        };
+        format!(
+            "pgo uncovered functions: {} of {} ({:.1}%) in {} crates{crates}; \
+             full list: {}",
+            self.uncovered,
+            self.functions,
+            self.percent(),
+            self.per_crate.len(),
+            list.display()
+        )
+    }
 }
 
 struct VmRuntime {
@@ -4608,7 +5122,7 @@ fn wait_for_socket(
     qemu_log: &Path,
     child: &mut Child,
 ) -> Result<(), VmRuntimeError> {
-    let started = std::time::Instant::now();
+    let started = Instant::now();
     while started.elapsed() < DEFAULT_SOCKET_WAIT {
         if socket_path.exists() {
             return Ok(());
@@ -5606,6 +6120,7 @@ mod tests {
                 run_wait_seconds: 0,
                 input: None,
                 input_interval_ms: 0,
+                input_wait_seconds: 0,
                 kill_instance: None,
                 kill_settle_ms: 0,
             })
@@ -5619,6 +6134,7 @@ mod tests {
                 run: None,
                 run_args: Vec::new(),
                 settle_seconds: 0,
+                input_wait_seconds: 0,
                 run_wait_seconds: 0,
             })
             .qmp_action(),
@@ -5628,6 +6144,118 @@ mod tests {
             ResolvedVmSessionCommand::Session(SessionCommand::Stats).qmp_action(),
             None
         );
+    }
+
+    /// One input device the way `helios:system/stats` reports it, for
+    /// the gate's scripted answers.
+    fn input_device(name: &str, claimed: bool) -> stats::InputDevice {
+        stats::InputDevice {
+            name: name.to_owned(),
+            claimed,
+            events_delivered: 0,
+            lost_reports: 0,
+        }
+    }
+
+    /// Answers the gate's `InputDevices` requests with the snapshots the
+    /// test scripted, from a thread of its own — the same channel the
+    /// session's serving half answers through.
+    ///
+    /// The join is part of the check: a gate that asked one question too
+    /// few leaves scripted answers behind, and one that asked too many
+    /// meets a `remove` on an empty script, so either fails here.
+    fn answer_input_devices(
+        incoming: async_channel::Receiver<GuestRequest>,
+        mut snapshots: Vec<Vec<stats::InputDevice>>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            while let Ok(request) = incoming.recv_blocking() {
+                let GuestRequest::InputDevices { reply } = request else {
+                    panic!("the gate only ever asks about input devices");
+                };
+                let _ = reply.send_blocking(Ok(snapshots.remove(0)));
+            }
+            assert!(
+                snapshots.is_empty(),
+                "the gate stopped asking before the scripted answers ran out"
+            );
+        })
+    }
+
+    /// Devices already held let the script through on the first answer.
+    #[test]
+    fn the_input_gate_passes_when_every_reported_device_is_claimed() {
+        let (requests, incoming) = async_channel::bounded(1);
+        let answerer = answer_input_devices(
+            incoming,
+            vec![vec![
+                input_device("QEMU Virtio Keyboard", true),
+                input_device("QEMU Virtio Tablet", true),
+            ]],
+        );
+        wait_for_input_claims(&requests, Duration::from_secs(30), Duration::ZERO)
+            .expect("claimed devices are the gate's own answer to go");
+        drop(requests);
+        answerer.join().expect("every scripted answer was served");
+    }
+
+    /// A claim that lands between two polls is still met before the
+    /// first statement goes out.
+    #[test]
+    fn the_input_gate_waits_for_a_device_claimed_mid_wait() {
+        let (requests, incoming) = async_channel::bounded(1);
+        let answerer = answer_input_devices(
+            incoming,
+            vec![
+                vec![
+                    input_device("QEMU Virtio Keyboard", true),
+                    input_device("QEMU Virtio Tablet", false),
+                ],
+                vec![
+                    input_device("QEMU Virtio Keyboard", true),
+                    input_device("QEMU Virtio Tablet", true),
+                ],
+            ],
+        );
+        wait_for_input_claims(&requests, Duration::from_secs(30), Duration::ZERO)
+            .expect("a device claimed inside the wait still passes the gate");
+        drop(requests);
+        answerer.join().expect("every scripted answer was served");
+    }
+
+    /// A boot with nothing to drive refuses the script by name rather
+    /// than passing a gate that can never open.
+    #[test]
+    fn the_input_gate_refuses_a_guest_that_reports_no_devices() {
+        let (requests, incoming) = async_channel::bounded(1);
+        let answerer = answer_input_devices(incoming, vec![Vec::new()]);
+        let error = wait_for_input_claims(&requests, Duration::from_secs(30), Duration::ZERO)
+            .expect_err("a guest with no input devices has nothing to drive");
+        assert!(matches!(error, VmSessionError::NoInputDevices), "{error}");
+        drop(requests);
+        answerer.join().expect("every scripted answer was served");
+    }
+
+    /// The deadline running out names the devices that never took their
+    /// claims.
+    #[test]
+    fn the_input_gate_times_out_naming_what_stayed_unclaimed() {
+        let (requests, incoming) = async_channel::bounded(1);
+        let answerer = answer_input_devices(
+            incoming,
+            vec![vec![
+                input_device("QEMU Virtio Keyboard", true),
+                input_device("QEMU Virtio Tablet", false),
+            ]],
+        );
+        let error = wait_for_input_claims(&requests, Duration::ZERO, Duration::ZERO)
+            .expect_err("an unclaimed device past the deadline refuses the script");
+        let VmSessionError::InputClaimTimedOut { devices, .. } = &error else {
+            panic!("the refusal names the devices still unclaimed: {error}");
+        };
+        assert_eq!(*devices, "QEMU Virtio Tablet");
+        drop(requests);
+        answerer.join().expect("every scripted answer was served");
     }
 
     /// A balloon session needs a socket to speak QMP over, whether or
@@ -6146,6 +6774,237 @@ mod tests {
             flags.contains("-disable-vp=true"),
             "the collection turns value profiling off and the use side has to agree: {flags}"
         );
+    }
+
+    /// A `-pgo-warn-missing-function` line as rustc prints it under
+    /// `CARGO_TERM_COLOR=always`, which is how the suite lanes run: the
+    /// level and the line's end carry colour the pipe cannot strip.
+    const PGO_WARNING: &str = "\u{1b}[1m\u{1b}[33mwarning\u{1b}[0m\u{1b}[1m: helios_kernel.780e493b13e04ad8-cgu.08: no profile data available for function _RNvXNtB5_6kernel4main Hash = 742261418966908927 up to 0 count discarded\u{1b}[0m";
+
+    #[test]
+    fn an_uncovered_warning_names_its_crate_in_the_codegen_unit() {
+        assert_eq!(
+            pgo_uncovered_parts(&strip_ansi_codes(PGO_WARNING)),
+            Some((
+                "helios_kernel".to_owned(),
+                "_RNvXNtB5_6kernel4main".to_owned()
+            ))
+        );
+        // The hash between crate and `-cgu` is not fixed-width; run
+        // 34443906698's log carries `cranelift_bforest.ba39053f92a566e`.
+        let short_hash = "warning: cranelift_bforest.ba39053f92a566e-cgu.0: no profile data available for function _RNvY Hash = 451 up to 0 count discarded";
+        assert_eq!(
+            pgo_uncovered_parts(short_hash),
+            Some(("cranelift_bforest".to_owned(), "_RNvY".to_owned()))
+        );
+        // A prefix that fits no CGU shape is counted under itself rather
+        // than dropped: it is still one uncovered function.
+        let odd = "warning: something-else: no profile data available for function _RNvZ Hash = 1 up to 0 count discarded";
+        assert_eq!(
+            pgo_uncovered_parts(odd),
+            Some(("something-else".to_owned(), "_RNvZ".to_owned()))
+        );
+        assert!(pgo_uncovered_parts("warning: unused variable `x`").is_none());
+        assert!(pgo_uncovered_parts("    Finished `release` profile").is_none());
+    }
+
+    #[test]
+    fn the_missing_function_flood_leaves_the_log_and_the_rest_stays() {
+        let stderr = format!(
+            "   Compiling helios-kernel v0.1.0\n{PGO_WARNING}\n\n\
+             warning: target feature `soft-float` cannot be disabled\n\n\
+             warning: wasmtime.abcdef1234-cgu.0: no profile data available for function _RNvYbar Hash = 9 up to 0 count discarded\n\n\
+             warning: `helios-kernel` (lib) generated 2 warnings\n\
+             error: something failed elsewhere\n    Finished `profile-use` profile\n"
+        );
+        let mut forwarded = Vec::new();
+        let uncovered = filter_pgo_stderr("building kernel", stderr.as_bytes(), &mut forwarded)
+            .expect("the captured stderr drains");
+        assert_eq!(uncovered.lines.len(), 2, "{:?}", uncovered.lines);
+        assert_eq!(uncovered.symbols["_RNvXNtB5_6kernel4main"], "helios_kernel");
+        assert_eq!(uncovered.symbols["_RNvYbar"], "wasmtime");
+        let log = String::from_utf8(forwarded).expect("forwarded output is UTF-8");
+        assert!(!log.contains("no profile data"), "{log}");
+        for kept in [
+            "Compiling helios-kernel",
+            "soft-float",
+            "generated 2 warnings",
+            "error: something failed elsewhere",
+            "Finished",
+        ] {
+            assert!(log.contains(kept), "{kept} missing from {log}");
+        }
+        // The blank line belonging to a redirected warning went with it;
+        // the one belonging to the forwarded warning stayed.
+        assert_eq!(log.lines().filter(|line| line.is_empty()).count(), 1);
+    }
+
+    /// A build's warnings, its kernel image's functions, and the
+    /// coverage they add up to, for the list-file and summary tests.
+    fn coverage_fixture() -> (PgoUncovered, KernelFunctions, PgoCoverage) {
+        let uncovered = PgoUncovered {
+            lines: [
+                "warning: wasmtime.abcdef-cgu.0: no profile data available for function _RNvA Hash = 1 up to 0 count discarded",
+                "warning: helios_kernel.ab-cgu.08: no profile data available for function _RNvB Hash = 2 up to 0 count discarded",
+                "warning: wasmtime.abcdef-cgu.0: no profile data available for function _RNvC Hash = 3 up to 0 count discarded",
+                "warning: helios_kernel.ab-cgu.08: no profile data available for function _RNvD Hash = 4 up to 0 count discarded",
+                // One function warned in two codegen units is still one
+                // uncovered function, and a warning for a function the linker
+                // dropped is listed without counting against the image.
+                "warning: wasmtime.abcdef-cgu.1: no profile data available for function _RNvA Hash = 5 up to 0 count discarded",
+                "warning: wasmtime.abcdef-cgu.1: no profile data available for function _RNvStripped Hash = 6 up to 0 count discarded",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+            symbols: [
+                ("_RNvA", "wasmtime"),
+                ("_RNvB", "helios_kernel"),
+                ("_RNvC", "wasmtime"),
+                ("_RNvD", "helios_kernel"),
+                ("_RNvStripped", "wasmtime"),
+            ]
+            .into_iter()
+            .map(|(symbol, krate)| (symbol.to_owned(), krate.to_owned()))
+            .collect(),
+        };
+        let functions = KernelFunctions {
+            total: 6,
+            names: ["_RNvA", "_RNvB", "_RNvC", "_RNvD", "_RNvE", "_RNvF"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        };
+        let coverage = uncovered.coverage(&functions);
+        assert_eq!(
+            (
+                coverage.uncovered,
+                coverage.functions,
+                coverage.per_crate.len()
+            ),
+            (4, 6, 2)
+        );
+        (uncovered, functions, coverage)
+    }
+
+    #[test]
+    fn the_uncovered_list_lands_beside_the_kernel_and_carries_the_counts() {
+        let directory = tempfile::tempdir().expect("a temporary target directory");
+        let kernel = directory.path().join("profile-use").join("helios");
+        fs::create_dir_all(kernel.parent().expect("the kernel's directory"))
+            .expect("the build directory cargo made");
+        let (uncovered, _functions, coverage) = coverage_fixture();
+        let profile = Path::new("/checkout/target/profiles/run-1/helios-kernel.profdata");
+        let list = write_pgo_uncovered(profile, &kernel, &uncovered, &coverage)
+            .expect("a directory that exists takes the list");
+        assert_eq!(
+            list,
+            directory
+                .path()
+                .join("profile-use/helios.pgo-uncovered.txt")
+        );
+        let document = fs::read_to_string(&list).expect("the list was written");
+        assert!(
+            document.starts_with(
+                "# uncovered: 4 of 6 functions (66.7%)\n# warnings emitted: 6 in 2 crates\n"
+            ),
+            "{document}"
+        );
+        assert!(document.contains("# wasmtime: 2\n"), "{document}");
+        assert!(document.contains("# helios_kernel: 2\n"), "{document}");
+        // Every warning is listed, dead-stripped functions included.
+        assert_eq!(
+            document
+                .lines()
+                .filter(|line| !line.starts_with('#'))
+                .count(),
+            6,
+            "{document}"
+        );
+    }
+
+    #[test]
+    fn the_summary_line_carries_the_counts_the_total_and_the_list_path() {
+        let (_uncovered, _functions, coverage) = coverage_fixture();
+        let summary = coverage.summary(Path::new("/t/profile-use/helios.pgo-uncovered.txt"));
+        assert_eq!(
+            summary,
+            "pgo uncovered functions: 4 of 6 (66.7%) in 2 crates (helios_kernel 2, wasmtime 2); \
+             full list: /t/profile-use/helios.pgo-uncovered.txt"
+        );
+        // A fully-covered build reads as zero of a total, with no empty
+        // crate list trailing it.
+        let summary = PgoCoverage {
+            functions: 40000,
+            uncovered: 0,
+            per_crate: BTreeMap::new(),
+        }
+        .summary(Path::new("/t/profile-use/helios.pgo-uncovered.txt"));
+        assert_eq!(
+            summary,
+            "pgo uncovered functions: 0 of 40000 (0.0%) in 0 crates; \
+             full list: /t/profile-use/helios.pgo-uncovered.txt"
+        );
+    }
+
+    #[test]
+    fn the_function_count_is_the_defined_text_symbols() {
+        let mut elf = object::write::Object::new(
+            object::BinaryFormat::Elf,
+            object::Architecture::X86_64,
+            object::Endianness::Little,
+        );
+        let text = elf.section_id(object::write::StandardSection::Text);
+        let data = elf.section_id(object::write::StandardSection::Data);
+        for name in ["_a", "_b", "_c"] {
+            elf.add_symbol(object::write::Symbol {
+                name: name.as_bytes().to_vec(),
+                value: 0x1000,
+                size: 16,
+                kind: object::SymbolKind::Text,
+                scope: object::SymbolScope::Linkage,
+                weak: false,
+                section: object::write::SymbolSection::Section(text),
+                flags: object::SymbolFlags::None,
+            });
+        }
+        // A data symbol and an undefined import are not functions the
+        // image defines, and never counted.
+        elf.add_symbol(object::write::Symbol {
+            name: b"_data".to_vec(),
+            value: 0x2000,
+            size: 8,
+            kind: object::SymbolKind::Data,
+            scope: object::SymbolScope::Linkage,
+            weak: false,
+            section: object::write::SymbolSection::Section(data),
+            flags: object::SymbolFlags::None,
+        });
+        elf.add_symbol(object::write::Symbol {
+            name: b"_undef".to_vec(),
+            value: 0,
+            size: 0,
+            kind: object::SymbolKind::Text,
+            scope: object::SymbolScope::Linkage,
+            weak: false,
+            section: object::write::SymbolSection::Undefined,
+            flags: object::SymbolFlags::None,
+        });
+        let directory = tempfile::tempdir().expect("a temporary directory for the image");
+        let kernel = directory.path().join("helios");
+        fs::write(&kernel, elf.write().expect("the synthetic image writes"))
+            .expect("writing the image");
+        let functions = kernel_functions(&kernel).expect("the image parses");
+        assert_eq!(functions.total, 3);
+        assert_eq!(functions.names, ["_a", "_b", "_c"]);
+    }
+
+    #[test]
+    fn a_link_time_llvm_suffix_is_stripped_back_off_the_name() {
+        assert_eq!(base_name("_RNvB.llvm.4478483301174982385"), "_RNvB");
+        assert_eq!(base_name("_RNvB.llvm.abc"), "_RNvB.llvm.abc");
+        assert_eq!(base_name("_RNvB.llvm."), "_RNvB.llvm.");
+        assert_eq!(base_name("_RNvB"), "_RNvB");
     }
 
     #[test]
