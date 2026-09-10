@@ -493,8 +493,8 @@ enum ProfileFetchError {
     #[error("{0}")]
     WorkspaceRoot(#[from] WorkspaceRootError),
     #[error(
-        "{variable} holds characters a GitHub token does not: a token is [A-Za-z0-9_-], and \
-         this one would be passed to curl as a header"
+        "{variable} holds characters a GitHub token does not: a token is printable ASCII \
+         without quotes or backslashes, and this one would be passed to curl as a header"
     )]
     Token { variable: &'static str },
     #[error("failed to run curl for {url}: {source}; the fetch downloads over HTTPS with curl")]
@@ -1960,6 +1960,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn every_shape_of_github_token_makes_a_header_line() {
+        for token in [
+            "ghs_0123456789abcdefghijklmnopqrstuvwxyzAB",
+            "github_pat_11AAAAAAA0_abcdefghijklmnopqrstuvwxyz",
+            "v1.1f699f1069f60c4d3e2b8a7c5d4e3f2a1b0c9d8e7f",
+        ] {
+            let line = bearer_header("GITHUB_TOKEN", token).expect("a token curl can carry");
+            assert_eq!(
+                line,
+                format!("header = \"Authorization: Bearer {token}\"\n")
+            );
+        }
+    }
+
+    #[test]
+    fn a_value_that_would_escape_the_header_line_is_refused() {
+        for value in [
+            "ghs_abc\"",
+            "ghs_abc\\",
+            "ghs_abc\nurl = evil",
+            "ghs_ab c",
+            "ghs_ab\u{e9}",
+        ] {
+            let error = bearer_header("GH_TOKEN", value)
+                .expect_err("a value that could end or escape the config line is not a token");
+            assert!(
+                matches!(
+                    error,
+                    ProfileFetchError::Token {
+                        variable: "GH_TOKEN"
+                    }
+                ),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
     fn selected_target_mismatches_fail_fast() {
         let mut artifact = test_artifact(
             "simd-lanes",
@@ -2411,13 +2449,24 @@ fn github_token_header() -> Result<String, ProfileFetchError> {
         if token.is_empty() {
             continue;
         }
-        if !token
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
-        {
-            return Err(ProfileFetchError::Token { variable });
-        }
-        return Ok(format!("header = \"Authorization: Bearer {token}\"\n"));
+        return bearer_header(variable, &token);
     }
     Ok(String::new())
+}
+
+/// The curl configuration line carrying `token`.
+///
+/// The value lands inside a quoted `header = "…"` line, so what is
+/// refused is what would end or escape that line or the line after it:
+/// anything outside printable ASCII, a quote, or a backslash. GitHub's
+/// tokens have worn several shapes (`ghp_…`, `ghs_…`, `github_pat_…`,
+/// the older `v1.<hex>`) and this admits all of them without listing them.
+fn bearer_header(variable: &'static str, token: &str) -> Result<String, ProfileFetchError> {
+    if !token
+        .bytes()
+        .all(|byte| byte.is_ascii_graphic() && byte != b'"' && byte != b'\\')
+    {
+        return Err(ProfileFetchError::Token { variable });
+    }
+    Ok(format!("header = \"Authorization: Bearer {token}\"\n"))
 }
