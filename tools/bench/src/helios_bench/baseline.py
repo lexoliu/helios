@@ -46,6 +46,7 @@ be one build are refused rather than timed twice.
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -80,7 +81,10 @@ class Baseline:
     worktree: Path
 
 
-def git(*arguments: str, cwd: Path = REPO_ROOT) -> str:
+def git(*arguments: str, cwd: Path | None = None) -> str:
+    # `REPO_ROOT` is read at call time, not bound as a default, so that a
+    # test pointing the module at a repository of its own is obeyed.
+    cwd = REPO_ROOT if cwd is None else cwd
     completed = subprocess.run(["git", *arguments], cwd=cwd, capture_output=True, text=True, check=False)
     if completed.returncode != 0:
         raise SystemExit(
@@ -140,9 +144,20 @@ def ensure_worktree(sha: str) -> Path:
     Reused when it is already there and still at that commit, because a
     kept worktree is a warm target directory and the build it saves is
     the largest fixed cost of a paired run.
+
+    The directory can also come back without the repository knowing it:
+    the runner cache restores `target/`, the worktree included, into a
+    fresh checkout whose `.git/worktrees` never heard of it (#328). Git
+    then resolves the directory to the enclosing repository, so its
+    `HEAD` is the job's own. That shape is re-registered at `sha` with
+    its `target/` kept, which is the cache the reuse exists for; only a
+    registered worktree at some other commit is refused.
     """
     checkout = checkout_path(sha)
     if checkout.is_dir():
+        if not is_registered_worktree(checkout):
+            reregister_worktree(checkout, sha)
+            return checkout
         head = git("rev-parse", "HEAD", cwd=checkout)
         if head != sha:
             raise SystemExit(f"{checkout} is a worktree of {head}, not of {sha}")
@@ -151,6 +166,40 @@ def ensure_worktree(sha: str) -> Path:
     git("worktree", "prune")
     git("worktree", "add", "--detach", str(checkout), sha)
     return checkout
+
+
+def is_registered_worktree(checkout: Path) -> bool:
+    """Whether git resolves `checkout` to a worktree rooted there.
+
+    A directory whose registration is gone resolves to the repository
+    above it, or to nothing at all when its `.git` file still names the
+    missing registration; neither is the worktree this run wants.
+    """
+    completed = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        cwd=checkout,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        return False
+    return Path(completed.stdout.strip()).resolve() == checkout.resolve()
+
+
+def reregister_worktree(checkout: Path, sha: str) -> None:
+    """Replaces an unregistered checkout with a worktree at `sha`, keeping its `target/`."""
+    kept = checkout / "target"
+    parked = checkout.parent / "target.kept"
+    if parked.exists():
+        shutil.rmtree(parked)
+    if kept.is_dir():
+        kept.rename(parked)
+    shutil.rmtree(checkout)
+    git("worktree", "prune")
+    git("worktree", "add", "--detach", str(checkout), sha)
+    if parked.is_dir():
+        parked.rename(kept)
 
 
 def link_wasmtime(sha: str) -> None:
