@@ -83,8 +83,9 @@ mod topology;
 mod vsock;
 
 pub use service::{
-    ChildExit, ChildHandle, UserProgramService, install_component_host_program_service,
-    install_program_service, run_component_host_processor_forever, run_embedded_component_forever,
+    ChildExit, ChildHandle, DisplayHandle, SurfaceHandle, UserProgramService,
+    install_component_host_program_service, install_program_service,
+    run_component_host_processor_forever, run_embedded_component_forever,
     run_program_workers_forever,
 };
 pub(crate) use service::{ProgramArgv, ProgramExecContext, ProgramSource};
@@ -1613,6 +1614,7 @@ where
     vsock::add_vsock_to_linker::<vsock::DebuggerVsock, _, _, _>(linker)?;
     add_stats_to_linker(linker)?;
     device::add_device_to_linker(linker)?;
+    service::add_display_to_linker(linker)?;
     add_instances_to_linker(linker)?;
     add_tracing_to_linker(linker)?;
     debugger_profiling::add_to_linker(linker)?;
@@ -1810,6 +1812,7 @@ where
     vsock::add_vsock_to_linker::<vsock::ProgramVsock, _, _, _>(linker)?;
     add_stats_to_program_linker(linker)?;
     device::add_device_to_linker(linker)?;
+    service::add_display_to_linker(linker)?;
     add_tracing_to_program_linker(linker)?;
     program_profiling::add_to_linker(linker)?;
     Ok(())

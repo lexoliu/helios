@@ -1,0 +1,229 @@
+package helios:system@0.1.0;
+
+/// The machine's display engine, handed whole to one instance.
+///
+/// Helios drives the display device itself — a monitor plugged in or
+/// resized announces itself through a configuration-change interrupt
+/// that somebody has to consume, so the kernel owns the device for as
+/// long as the machine runs. What this interface hands out is the right
+/// to put pixels on it: exactly one instance holds the display at a
+/// time, and everything it creates is released when it lets go or dies.
+///
+/// Pixels never travel through the kernel. A surface's frame buffer is
+/// pinned, physically contiguous memory placed inside the claiming
+/// instance's own linear memory, and those same pages are what backs the
+/// device's resource. A compositor writes a frame with ordinary stores
+/// and calls `present`; the kernel turns that into the two commands the
+/// display engine needs — copy the dirty rectangle into the device's
+/// copy of the resource, then tell the scanouts showing it to re-read —
+/// and nothing is copied anywhere else.
+///
+/// The pointer is the display engine's, not the compositor's.
+/// `set-cursor` writes the cursor plane's own small resource and
+/// `move-cursor` moves it and does nothing else, so pointer motion costs
+/// no pixels and never waits on a repaint.
+interface display {
+  /// Why a request was refused.
+  enum error {
+    /// This machine has no display device, or the kernel never brought
+    /// one up.
+    unavailable,
+    /// Another instance already holds the display.
+    already-claimed,
+    /// The display was taken back before this handle was used. A handle
+    /// that outlived a reclaim names a display its instance no longer
+    /// holds.
+    not-claimed,
+    /// No such output on this device.
+    no-such-scanout,
+    /// The mode or pixel format is not one this display engine drives,
+    /// or the frame it describes is larger than any memory could back.
+    unsupported-mode,
+    /// The rectangle does not lie inside the surface it names.
+    out-of-bounds,
+    /// This claim already holds as many surfaces as it may.
+    too-many-surfaces,
+    /// The part of this instance's linear memory the kernel devotes to
+    /// display frame buffers has no room left.
+    window-exhausted,
+    /// The frame buffer could not be pinned: the machine has no
+    /// contiguous run of that size left, or the instance's own memory
+    /// accounting refused it.
+    out-of-memory,
+    /// The display engine answered a request with something that does
+    /// not belong to it, which is a device fault rather than a refusal.
+    device-fault,
+  }
+
+  /// A pixel position on a scanout or inside a surface.
+  record point {
+    x: u32,
+    y: u32,
+  }
+
+  /// A rectangular region of a surface or of a scanout.
+  record rect {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+  }
+
+  /// The pixel geometry of one scanout.
+  record mode {
+    width: u32,
+    height: u32,
+  }
+
+  /// How the display engine reads the bytes of one pixel.
+  ///
+  /// The set is the eight 32-bit orderings a 2D display engine latches
+  /// directly; `x` names a byte the engine ignores and `a` one it reads
+  /// as alpha. Every one of them is four bytes wide, so a surface's
+  /// stride is always its width times four.
+  enum pixel-format {
+    bgrx8888,
+    bgra8888,
+    xrgb8888,
+    argb8888,
+    rgbx8888,
+    rgba8888,
+    xbgr8888,
+    abgr8888,
+  }
+
+  /// One output the display device drives, as it presents it now.
+  record scanout {
+    /// Which output this is, and what `create` and the cursor calls
+    /// name it by.
+    id: u32,
+    /// Where the output sits in the device's desktop, and how large it
+    /// is. A single-head machine reports the whole desktop at the
+    /// origin.
+    geometry: rect,
+    /// Whether the host is presenting this output at all. A disabled
+    /// scanout still has geometry — the last the host published — and
+    /// still accepts a surface.
+    enabled: bool,
+  }
+
+  /// One announcement that the device's set of scanouts changed.
+  ///
+  /// A monitor plugged in, unplugged, or resized by whatever hosts this
+  /// machine is the event; what changed is read back with `scanouts`.
+  record display-change {
+    /// How many announcements the device has made, this one included.
+    /// A gap says this reader missed one, which is the only thing
+    /// beyond re-reading `scanouts` a compositor can act on.
+    generation: u64,
+  }
+
+  /// One frame that reached the display engine.
+  record frame-token {
+    /// How many frames this surface has published, this one included.
+    sequence: u64,
+    /// The kernel's monotonic clock when the display engine finished
+    /// the flush, in nanoseconds since boot.
+    presented-nanos: u64,
+  }
+
+  /// Where a surface's frame buffer landed in this instance's linear
+  /// memory.
+  record placement {
+    /// Byte offset of the frame buffer.
+    offset: u64,
+    /// How many bytes of linear memory it covers, which is the frame
+    /// rounded up to whole pages.
+    length: u64,
+  }
+
+  /// One frame buffer on one scanout.
+  ///
+  /// The bytes at `buffer` are the device's backing store, not a staging
+  /// copy: what is written there is what the display engine reads when
+  /// `present` names it. Rows are `width * 4` bytes, top row first, no
+  /// padding between them.
+  ///
+  /// Dropping the surface takes it off its scanout and hands the
+  /// device's resource back. The pages themselves stay with the claim —
+  /// a compositor builds its surfaces once — and go back to the
+  /// instance's pool when the display is released.
+  resource surface {
+    /// Where this surface's frame buffer sits in linear memory.
+    buffer: func() -> placement;
+
+    /// The mode the surface was created at.
+    resolution: func() -> mode;
+
+    /// Publish the pixels written into `region`.
+    ///
+    /// The returned future resolves when the display engine has taken
+    /// the frame: one copy of the rectangle into the device's own copy
+    /// of the resource, then one flush of the scanouts showing it. A
+    /// compositor that wants to pace itself awaits the future; one that
+    /// does not may present again before it resolves, and the kernel
+    /// serialises them in the order they were asked for.
+    present: func(region: rect) -> future<result<frame-token, error>>;
+
+    /// Every frame this surface published, one item per flush the
+    /// display engine completed.
+    ///
+    /// This is the same completion `present` reports, delivered as a
+    /// stream so a render loop can be driven by it rather than by
+    /// holding a future per frame.
+    vsync: func() -> stream<frame-token>;
+
+    /// Put `image` on the cursor plane of this surface's scanout.
+    ///
+    /// The image is exactly 64 by 64 pixels in this surface's format,
+    /// row-major with no padding, which is 16384 bytes; `hotspot` is
+    /// the pixel inside it that sits under the pointer position. The
+    /// pixels are published as part of this call.
+    set-cursor: async func(image: list<u8>, hotspot: point) -> result<_, error>;
+
+    /// Move the pointer without touching its image.
+    ///
+    /// This is the whole reason a cursor plane exists: it costs no
+    /// pixels and no frame-buffer traffic, and it is served on the
+    /// display engine's own cursor queue, so it never waits behind a
+    /// frame this surface is presenting.
+    move-cursor: async func(position: point) -> result<_, error>;
+
+    /// Take the pointer off this surface's scanout entirely.
+    hide-cursor: async func() -> result<_, error>;
+  }
+
+  /// One instance's exclusive hold on the machine's display.
+  ///
+  /// Dropping it — or dying while holding it — releases every surface,
+  /// hands every pinned page back to the instance's pool and leaves the
+  /// scanouts blank before the display is offered to anyone else.
+  resource display {
+    /// Every output the device presents right now.
+    scanouts: async func() -> result<list<scanout>, error>;
+
+    /// The modes `scanout` will accept, preferred first.
+    ///
+    /// The first entry is the display's own answer — the attached
+    /// monitor's preferred timing where the device reports EDID, and
+    /// the geometry the host published otherwise. It is not a mode a
+    /// compositor has to take: a surface may be created at any size and
+    /// the display engine scales it onto the output.
+    modes: async func(scanout: u32) -> result<list<mode>, error>;
+
+    /// Create a frame buffer of `mode` in `format` and point `scanout`
+    /// at it.
+    create: async func(scanout: u32, %mode: mode, format: pixel-format) -> result<surface, error>;
+
+    /// Every change to the device's set of outputs, from now on.
+    changed: func() -> stream<display-change>;
+  }
+
+  /// Take exclusive ownership of the machine's display.
+  ///
+  /// The second caller is refused rather than queued: a compositor
+  /// waiting for a display another compositor holds is a provisioning
+  /// mistake, not a shortage. This is the same rule `device.claim`
+  /// follows, for the same reason.
+  claim: func() -> result<display, error>;
+}
