@@ -97,9 +97,10 @@ than under the VM.
 ## Devices
 
 `DeviceType` lists exactly the virtio device kinds a Helios driver
-claims: network (1), block (2), entropy (4), 9P (9) and vsock (19). A
-transport that reads any other device id rejects the function rather than
-mapping it to a placeholder driver.
+claims: network (1), block (2), entropy (4), memory balloon (5), 9P (9),
+GPU (16), vsock (19) and IOMMU (23). A transport that reads any other
+device id rejects the function rather than mapping it to a placeholder
+driver.
 
 Four further device kinds have been evaluated and deliberately not
 claimed — RTC (17), memory (24), file system (26) and PMEM (27).
@@ -141,6 +142,69 @@ without the `vhost_vsock` module — no guest can have the device at all.
 before it builds anything and refuses with an explanation rather than
 booting a guest whose device is silently absent. The default transport
 stays the serial line; see `docs/inspector-vsock.md`.
+
+virtio-gpu is the machine's display engine. The driver in
+`virtio/src/gpu.rs` drives the two queues the device defines and nothing
+else:
+
+| Queue | Index | Commands |
+| --- | --- | --- |
+| control | 0 | `GET_DISPLAY_INFO`, `GET_EDID`, `RESOURCE_CREATE_2D`, `RESOURCE_ATTACH_BACKING`, `RESOURCE_DETACH_BACKING`, `RESOURCE_UNREF`, `SET_SCANOUT`, `TRANSFER_TO_HOST_2D`, `RESOURCE_FLUSH` |
+| cursor | 1 | `UPDATE_CURSOR`, `MOVE_CURSOR` |
+
+The split is what the hardware cursor plane is for: pointer motion is one
+command on a queue of its own, so it never queues behind a frame's
+transfer and costs no pixels at all. Every control response header is
+checked against the reply the request asked for, and an `ERR_*` answer
+becomes the `DisplayError` variant that names it —
+`ERR_INVALID_SCANOUT_ID` becomes `UnknownScanout`, `ERR_OUT_OF_MEMORY`
+becomes `OutOfMemory` — rather than a log line and a retry. A code that
+belongs to no request this driver issues, `ERR_INVALID_CONTEXT_ID`
+included, is reported as `UnexpectedResponse` because a 2D driver never
+asked the question it answers.
+
+One class feature is negotiated: `VIRTIO_GPU_F_EDID` (bit 1), so that a
+scanout's preferred mode is the attached monitor's own preferred detailed
+timing rather than whatever geometry the host last published.
+`VIRTIO_GPU_F_VIRGL` (0), `VIRTIO_GPU_F_RESOURCE_UUID` (2),
+`VIRTIO_GPU_F_RESOURCE_BLOB` (3) and `VIRTIO_GPU_F_CONTEXT_INIT` (4) are
+deliberately never asked for: the 3D path needs host-visible blob memory
+mapped into a guest address space plus a fence protocol, which is a
+different contract from this one. The configuration space is read whole —
+`events_read`/`events_clear` drive the display-change notification,
+`num_scanouts` bounds the display-info reply, and `num_capsets` is
+reported and otherwise unused, because a capability set describes a 3D
+context type.
+
+**The driver never allocates a frame buffer.** `create_framebuffer` is
+handed physical ranges the caller already owns and publishes them as the
+resource's backing store; the pages stay the caller's, the device only
+reads them, and `destroy_framebuffer` detaches the backing before
+dropping the resource so the caller's pages are never still on loan. A
+driver that allocated the pixels itself would own memory the kernel has
+to account for, would tie the frame buffer's lifetime to the device's,
+and would put a second allocator where the kernel most wants one. It
+follows that a virtio-gpu function behind a translation unit is refused
+at bring-up: its caller's pages are not in its domain, and the first
+scanout would fetch from an address the unit rejects.
+
+Everything above the wire format is device-neutral. The display value
+types and the `DisplayDevice` trait live in `hal/src/display.rs` — a
+scanout and a cursor plane are display-engine facts that virtio-gpu is
+one implementation of — and the kernel holds the device through
+`install_display_device` (`kernel/src/io/display.rs`), whose task
+consumes the device's `VIRTIO_GPU_EVENT_DISPLAY` announcements and reads
+the new topology back. An announcement nobody collects stays latched and
+the next change raises no interrupt at all, which is why the kernel owns
+the device from bring-up.
+
+The device is on the platform's own bus: virtio-pci on x86-64
+(`-device virtio-gpu-pci`) and virtio-mmio on aarch64 and riscv64
+(`-device virtio-gpu-device`). Each backend reports it on one line:
+
+```
+virtio-gpu online transport=mmio scanouts=1 preferred=1280x800 edid=on
+```
 
 virtio-net is the one device whose capabilities are decided outside the
 guest: multiqueue, segmentation offload and checksum offload are all
