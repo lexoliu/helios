@@ -131,6 +131,9 @@ standard WASIX `/bin/dash` boot artifact, boots CPython with its upstream
 stdlib, and runs upstream WASI tools such as Python and curl, and
 `docs/debug-serial.md` for the guest's debug serial line, the raw
 host-side capture every session keeps of it, and how to read one.
+`docs/desktop.md` covers the guest's display, input and sound devices,
+the host display and audio backends, and how a headless session captures
+the scanout and drives the desktop.
 
 ## Performance
 
