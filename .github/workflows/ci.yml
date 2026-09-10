@@ -876,9 +876,10 @@ jobs:
           test -n "$origin"
           # The pixels of the two rows the script produced, against the
           # same glyphs rendered by the same font crate the compositor
-          # draws with — `tools/desktop/check-text` links the
-          # compositor's own modules, so the check and the desktop cannot
-          # disagree about what an `h` looks like. A capture that is a
+          # draws with — `tools/desktop/check-text` links the modules the
+          # compositor draws with (`programs/compositor/render`), so the
+          # check and the desktop cannot disagree about what an `h`
+          # looks like. A capture that is a
           # valid PNG of a desktop showing nothing passes every check
           # above and fails this one.
           #

@@ -246,7 +246,14 @@ supervised the way `http-client` is: the same restart cost, the same
 user-memory contract, and no plugin-private policy anywhere. What makes
 it a plugin rather than a program is provisioning and lifecycle; inside
 Wasmtime it is an ordinary user-mode component under the ordinary
-isolation model.
+isolation model. What it draws with — the glyph raster, the cell blend,
+the terminal grid, the damage tracker and the key translation — is a
+plain library, `programs/compositor/render`, with no world and no export
+in it; the plugin crate holds only the component and builds only the
+`cdylib` the kernel loads. The host-side capture check links the same
+library, so a host build never meets a component-model export name and
+the check cannot disagree with the desktop about a glyph, a colour or a
+cell.
 
 It claims the display through `helios:system/display` and every device
 `helios:system/input` lists, and says so on the way up:

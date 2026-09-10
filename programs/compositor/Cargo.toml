@@ -14,21 +14,13 @@ helios-api = { path = "../../api", default-features = false, features = [
     "programs",
     "task",
 ] }
-noto-sans-mono-bitmap = { version = "0.3.2", default-features = false, features = [
-    "regular",
-    "size_16",
-    "unicode-basic-latin",
-] }
+helios-compositor-render = { path = "render" }
 thiserror = { version = "2.0.20", default-features = false }
 
 [lib]
 name = "helios_compositor"
 path = "src/main.rs"
-# `cdylib` is the component the kernel loads; `rlib` is what lets the
-# host-side pixel check link the very modules the desktop draws with, so
-# the check and the compositor cannot disagree about a glyph, a colour or
-# a cell.
-crate-type = ["cdylib", "rlib"]
+crate-type = ["cdylib"]
 
 [lints]
 workspace = true

@@ -1768,8 +1768,16 @@ name = "helios-compositor"
 version = "0.1.0"
 dependencies = [
  "helios-api",
- "noto-sans-mono-bitmap",
+ "helios-compositor-render",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "helios-compositor-render"
+version = "0.1.0"
+dependencies = [
+ "helios-api",
+ "noto-sans-mono-bitmap",
 ]
 
 [[package]]
@@ -1795,7 +1803,7 @@ name = "helios-desktop-text-check"
 version = "0.1.0"
 dependencies = [
  "clap",
- "helios-compositor",
+ "helios-compositor-render",
  "png",
  "thiserror 2.0.20",
 ]

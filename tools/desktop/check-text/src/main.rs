@@ -6,9 +6,9 @@
 //! character cell, and the only way to know what those should be is to
 //! rasterise the same glyph with the same face at the same size and
 //! blend it over the same background — which is why this links the
-//! compositor's own modules rather than describing them again. A check
-//! that carried its own idea of what an `h` looks like would pass a
-//! desktop that drew a `b`.
+//! modules the compositor draws with (`programs/compositor/render`)
+//! rather than describing them again. A check that carried its own idea
+//! of what an `h` looks like would pass a desktop that drew a `b`.
 //!
 //! ```text
 //! check-desktop-text --capture desktop.png --origin 34,34 \
@@ -25,9 +25,9 @@ use std::io::BufReader;
 use std::path::PathBuf;
 
 use clap::Parser;
-use helios_compositor::desktop::{TERMINAL_BACKGROUND, TERMINAL_FOREGROUND};
-use helios_compositor::font::{CELL_HEIGHT, CELL_WIDTH};
-use helios_compositor::term::Terminal;
+use helios_compositor_render::desktop::{TERMINAL_BACKGROUND, TERMINAL_FOREGROUND};
+use helios_compositor_render::font::{CELL_HEIGHT, CELL_WIDTH};
+use helios_compositor_render::term::Terminal;
 use thiserror::Error;
 
 /// Bytes one pixel of a rendered strip occupies.

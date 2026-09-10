@@ -32,13 +32,6 @@
 //! it. The queue's sending end is the one thing here that outlives a
 //! call, and it is written once.
 
-pub mod damage;
-pub mod desktop;
-pub mod font;
-pub mod keys;
-pub mod paint;
-pub mod term;
-
 use std::string::String;
 use std::sync::OnceLock;
 use std::vec::Vec;
@@ -56,10 +49,10 @@ use helios_api::surface;
 use helios_api::task::spawn;
 use thiserror::Error;
 
-use crate::damage::Region;
-use crate::desktop::{Desktop, Focus};
-use crate::font::{CELL_HEIGHT, CELL_WIDTH};
-use crate::keys::Keyboard;
+use helios_compositor_render::damage::Region;
+use helios_compositor_render::desktop::{Desktop, Focus};
+use helios_compositor_render::font::{CELL_HEIGHT, CELL_WIDTH};
+use helios_compositor_render::keys::Keyboard;
 
 mod bindings {
     pub use ::helios_api::bindings::*;
