@@ -44,6 +44,28 @@ A backend this host's QEMU was not built with is refused by QEMU, naming
 itself. Nothing substitutes another one — the same rule the accelerator
 follows.
 
+## `--renderer`
+
+`--renderer <virtio-gpu-gl|virtio-gpu-rutabaga>` puts a renderer behind
+the desktop's GPU, and implies `--desktop` because the renderer is a
+property of the display device itself:
+
+| Value | Device created | Renderer |
+| --- | --- | --- |
+| `virtio-gpu-gl` | `virtio-gpu-gl-pci` / `virtio-gpu-gl-device`, `venus=on,blob=on,hostmem=256M` | Venus through virglrenderer |
+| `virtio-gpu-rutabaga` | `virtio-gpu-rutabaga-pci` / `virtio-gpu-rutabaga-device`, `venus=on,gfxstream-vulkan=on,blob=on,hostmem=256M` | Venus and gfxstream through rutabaga-gfx |
+
+`blob=on` is what advertises `VIRTIO_GPU_F_RESOURCE_BLOB`, and `hostmem`
+is the host-visible aperture a mapped blob lands in. Without the flag the
+device is the 2D adapter every lane has always booted, and the boot line
+says `3d=none`.
+
+Venus is a build-time property of the host, not a flag the guest can
+supply: it wants QEMU ≥ 9.2 built `--enable-virglrenderer`, a
+virglrenderer built with Venus support, and a host Vulkan driver —
+lavapipe serves a headless runner. A QEMU that lacks the renderer fails
+with QEMU's own message.
+
 ## `--audiodev`
 
 `--audiodev <none|wav:<path>|<host backend>>` names the host audio

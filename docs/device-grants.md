@@ -63,6 +63,16 @@ grant construction. The page it shares with its neighbour would carry
 the neighbour's registers into the owner's memory, and the neighbour may
 be a device nobody granted away.
 
+A device can also *publish* a window rather than have one granted. The
+display engine's host-visible aperture — where a 3D blob's host storage
+is placed so the renderer and the guest share it — is the same kind of
+placement: `PinnedFrames::map_device` puts the `DeviceRegion` the device
+named into the claiming instance's own window at `memory-kind = normal`,
+commits nothing against the instance's pool because the bytes are the
+device's, and unmaps it when the claim is released. What changes is only
+who the memory belongs to; the window, the granule and the alignment
+rule are the window, the granule and the alignment rule.
+
 ### Interrupts are masked before they are forwarded
 
 The kernel-side handler does the least it can: hold the source off at
