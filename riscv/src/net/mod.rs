@@ -45,6 +45,7 @@ pub(crate) struct ExternalInterrupts {
         crate::vsock::VirtioVsockDevice,
         crate::gpu::VirtioDisplayDevice,
         crate::input::VirtioInputDevice,
+        crate::snd::VirtioSoundDevice,
         crate::block::VirtioBlockDevice,
     >,
 }
@@ -122,6 +123,11 @@ impl ExternalInterrupts {
     pub(crate) fn attach_input(&mut self, interrupt: crate::input::InputInterrupt) {
         self.enable_source(interrupt.source);
         self.routes.add_input(interrupt.source, interrupt.device);
+    }
+
+    pub(crate) fn attach_sound(&mut self, interrupt: crate::snd::SoundInterrupt) {
+        self.enable_source(interrupt.source);
+        self.routes.set_sound(interrupt.source, interrupt.device);
     }
 
     pub(crate) fn attach_entropy(&mut self, interrupt: crate::entropy::EntropyInterrupt) {
