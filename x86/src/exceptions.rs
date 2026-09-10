@@ -1,12 +1,11 @@
 use core::arch::global_asm;
 use core::cell::UnsafeCell;
-use core::mem;
 use core::ops::Range;
+use core::ptr::NonNull;
 use core::sync::atomic::Ordering;
 
-use helios_kernel::{
-    KernelException, KernelExceptionCause, KernelExceptionDispatch, KernelNativeTrapHandler,
-};
+use helios_hal::vmm::VirtAddr as UserVirtAddr;
+use helios_kernel::{KernelException, KernelExceptionCause, KernelExceptionDispatch, StackFault};
 use x86_64::VirtAddr;
 use x86_64::instructions::segmentation::{CS, DS, ES, SS, Segment};
 use x86_64::instructions::tables::load_tss;
@@ -293,19 +292,41 @@ pub(crate) fn install_for_current_processor() {
 /// exception stack and that a fault the kernel resolves in place returns
 /// to the faulting instruction.
 ///
-/// The probe reserves one page of user address space without committing
-/// it, announces the address in `probe_fault`, and reads the page. The
-/// read faults; the dispatcher recognises the announced address, commits
-/// the page, marks the probe resolved and returns; the read then
-/// completes and sees the fresh frame's zero. Every step that could
-/// silently fail is asserted: a probe that did not fault, a fault that
-/// was not resolved, or a read that saw anything but zero is a boot
-/// failure with a message, because a kernel whose fault path cannot
-/// return would otherwise discover it at the first stack overflow.
+/// The probe reserves one page of user address space with its leaf table
+/// prepared and nothing mapped, stages a zeroed frame for it in
+/// `probe_frame`, announces the address in `probe_fault`, and reads the
+/// page. The read faults; the dispatcher recognises the announced
+/// address, maps the staged frame through the lock-free demand-commit
+/// path, marks the probe resolved and returns; the read then completes
+/// and sees the fresh frame's zero. Every step that could silently fail
+/// is asserted: a probe that did not fault, a fault that was not
+/// resolved, a frame the dispatcher did not take, or a read that saw
+/// anything but zero is a boot failure with a message, because a kernel
+/// whose fault path cannot return would otherwise discover it at the
+/// first stack overflow.
+///
+/// Everything that takes the address-space lock or broadcasts a TLB
+/// shootdown happens here, outside the dispatcher. On a secondary the
+/// probe runs with interrupts still masked, which is why it runs before
+/// `smp::join_shootdown_targets`: nobody waits on a processor that has
+/// not joined, so its broadcast (the release's unmap) cannot be part of
+/// a cycle, and `smp::shootdown_tlb_range` asserts that rule for every
+/// broadcaster (`vmm::reserve_probe_page` has the failure it comes from).
 pub(crate) fn verify_page_fault_returns() {
     let runtime = smp::current_runtime();
     let page = crate::vmm::reserve_probe_page();
     let start = page.start.raw();
+    let frame = helios_kernel::allocate_user_frame_zeroed_on(smp::current_processor())
+        .unwrap_or_else(|error| {
+            panic!("x86 page-fault probe could not allocate the frame it commits: {error}")
+        });
+    let staged = runtime
+        .probe_frame
+        .swap(frame.as_ptr() as usize, Ordering::AcqRel);
+    assert!(
+        staged == 0,
+        "x86 page-fault probe re-entered with frame {staged:#x} still staged"
+    );
     let previous = runtime.probe_fault.swap(start, Ordering::AcqRel);
     assert!(
         previous == 0,
@@ -313,13 +334,19 @@ pub(crate) fn verify_page_fault_returns() {
     );
     // SAFETY: `page` is a reserved user page this processor owns for the
     // duration of the probe; reading it is the fault under test, and the
-    // dispatcher commits it before the read completes.
+    // dispatcher maps the staged frame there before the read completes.
     let value = unsafe { core::ptr::read_volatile(start as *const u64) };
     let outcome = runtime.probe_fault.swap(0, Ordering::AcqRel);
+    let left = runtime.probe_frame.swap(0, Ordering::AcqRel);
     assert!(
         outcome == PROBE_RESOLVED,
         "x86 page-fault probe at {start:#x} did not fault: the read completed with \
          the reservation uncommitted (probe word {outcome:#x})"
+    );
+    assert!(
+        left == 0,
+        "x86 page-fault probe at {start:#x} was resolved without the staged frame \
+         {left:#x}: the dispatcher mapped something else"
     );
     assert!(
         value == 0,
@@ -336,14 +363,19 @@ pub(crate) fn verify_page_fault_returns() {
 }
 
 /// Resolves the boot-time probe's fault, if `faulting_address` is the
-/// page it announced.
+/// page it announced, by mapping the frame it staged. Runs in the
+/// page-fault dispatcher: no lock, no shootdown.
 fn resolve_probe_fault(faulting_address: usize) -> bool {
     let runtime = smp::current_runtime();
     let expected = runtime.probe_fault.load(Ordering::Acquire);
     if expected == 0 || expected == PROBE_RESOLVED || faulting_address & !0xfff != expected {
         return false;
     }
-    crate::vmm::commit_probe_page(expected);
+    let staged = runtime.probe_frame.swap(0, Ordering::AcqRel);
+    let frame = NonNull::new(staged as *mut u8).unwrap_or_else(|| {
+        panic!("x86 page-fault probe at {expected:#x} faulted with no frame staged for it")
+    });
+    crate::vmm::commit_probe_page(expected, frame);
     runtime.probe_fault.store(PROBE_RESOLVED, Ordering::Release);
     true
 }
@@ -392,6 +424,28 @@ pub(crate) struct ExceptionFrame {
     rflags: u64,
 }
 
+const RFLAGS_INTERRUPT_FLAG: u64 = 1 << 9;
+
+/// Puts the interrupted context's interrupt flag back before an
+/// exception is handed to the runtime's trap handler.
+///
+/// The handler never returns for a trap it claims: it unwinds out of
+/// this handler onto the interrupted stack, so the `iretq` that would
+/// have restored RFLAGS never runs and the flag the entry gate cleared
+/// would stay cleared. Everything the unwind lands in — the store's
+/// teardown, its fiber stack's release, the TLB shootdown that release
+/// broadcasts — is the interrupted code's continuation and runs on that
+/// code's terms, so the flag is restored here, before the hand-over.
+/// A processor that kept the gate's mask past this point could not
+/// acknowledge another processor's shootdown, which
+/// `smp::shootdown_tlb_range` refuses. The panic path for a trap the
+/// runtime declines runs with the flag restored too.
+fn restore_interrupt_flag_for_unwind(rflags: u64) {
+    if rflags & RFLAGS_INTERRUPT_FLAG != 0 {
+        x86_64::instructions::interrupts::enable();
+    }
+}
+
 /// The exception entry's dispatcher. Returning means the fault was
 /// resolved in place and the stub restores the interrupted context;
 /// everything unresolved diverges here, either into the runtime's trap
@@ -399,9 +453,18 @@ pub(crate) struct ExceptionFrame {
 /// panic.
 #[unsafe(no_mangle)]
 extern "C" fn helios_x86_exception_dispatch(frame: &mut ExceptionFrame) {
+    let mut stack_fault = StackFault::Elsewhere;
     if frame.vector == PAGE_FAULT_VECTOR {
         assert_frame_on_exception_stack(frame);
-        if resolve_probe_fault(Cr2::read_raw() as usize) {
+        let faulting_address = Cr2::read_raw() as usize;
+        if resolve_probe_fault(faulting_address) {
+            return;
+        }
+        // A reserved page inside a live fiber stack is a demand commit
+        // the kernel resolves here, with no lock and no allocation; the
+        // guard page below one is a stack overflow and stays a fault.
+        stack_fault = helios_kernel::resolve_stack_fault(UserVirtAddr::new(faulting_address));
+        if stack_fault == StackFault::Committed {
             return;
         }
     }
@@ -414,10 +477,14 @@ extern "C" fn helios_x86_exception_dispatch(frame: &mut ExceptionFrame) {
         );
     }
     if let Some(exception) = exception_from_frame(frame) {
-        match dispatch_to_wasmtime(exception) {
+        restore_interrupt_flag_for_unwind(frame.rflags);
+        match helios_kernel::dispatch_native_trap(exception) {
             KernelExceptionDispatch::Resolved => return,
             KernelExceptionDispatch::Unhandled => {
-                panic!("unhandled x86 kernel exception after Wasmtime dispatch: {exception:?}")
+                panic!(
+                    "unhandled x86 kernel exception after Wasmtime dispatch: \
+                     {exception:?}{stack_fault}"
+                )
             }
         }
     }
@@ -473,22 +540,6 @@ fn is_device_interrupt(vector: u8) -> bool {
             | DISPLAY_INTERRUPT_VECTOR
     ) || BLOCK_INTERRUPT_VECTORS.contains(&vector)
         || NETWORK_QUEUE_INTERRUPT_VECTORS.contains(&vector)
-}
-
-fn dispatch_to_wasmtime(exception: KernelException) -> KernelExceptionDispatch {
-    let per_processor_handler = smp::current_runtime()
-        .native_trap_handler
-        .load(Ordering::Acquire);
-    let raw_handler = if per_processor_handler != 0 {
-        per_processor_handler
-    } else {
-        crate::WASMTIME_NATIVE_TRAP_HANDLER.load(Ordering::Acquire)
-    };
-    if raw_handler == 0 {
-        return KernelExceptionDispatch::Unhandled;
-    }
-    let handler: KernelNativeTrapHandler = unsafe { mem::transmute(raw_handler) };
-    exception.dispatch_to(handler)
 }
 
 fn exception_from_frame(frame: &ExceptionFrame) -> Option<KernelException> {

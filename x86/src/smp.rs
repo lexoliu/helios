@@ -58,7 +58,33 @@ const APIC_TIMER_MODE_MASK: u64 = 0b11 << 17;
 const APIC_TIMER_VECTOR_MASK: u64 = 0xff;
 const PAGE_BYTES: usize = 4096;
 
+// TLB shootdown, and who takes part in it.
+//
+// `ONLINE_PROCESSOR_MASK` is the set of processors a broadcast waits on:
+// a processor joins it in `join_shootdown_targets`, immediately before it
+// enables interrupts, and never earlier. A member that cannot take the
+// shootdown IPI would hold every broadcaster until it could, and a
+// broadcaster it was itself waiting on would never get there. Before it
+// joins, a processor may broadcast — its boot-time page-fault probe does,
+// with interrupts still masked — because nobody waits on it; once it has
+// joined it broadcasts with interrupts enabled only, and
+// `shootdown_tlb_range` asserts exactly that, so a broadcast from fault
+// context or from under a lock that masks interrupts fails at once with
+// the processor named instead of wedging the machine.
+//
+// One broadcast is in flight at a time: `TLB_SHOOTDOWN_LOCK` is held from
+// the moment the range is published until the last target has
+// acknowledged it, so a receiver always reads the range of the broadcast
+// whose IPI woke it, and an acknowledgement always counts toward the
+// broadcast it answers. Without the lock two concurrent broadcasters
+// overwrote each other's range and reset each other's acknowledgement
+// mask: some receivers flushed the wrong range, and a broadcaster whose
+// own bit the other had erased spun forever if it could not take the IPI
+// that would have restored it (#332). A processor spinning on the lock has
+// interrupts enabled, by the assertion above, so it keeps answering the
+// holder's broadcast while it waits.
 static ONLINE_PROCESSOR_MASK: AtomicUsize = AtomicUsize::new(0);
+static TLB_SHOOTDOWN_LOCK: spin::Mutex<()> = spin::Mutex::new(());
 static TLB_SHOOTDOWN_START: AtomicUsize = AtomicUsize::new(0);
 static TLB_SHOOTDOWN_LEN: AtomicUsize = AtomicUsize::new(0);
 static TLB_SHOOTDOWN_ACK_MASK: AtomicUsize = AtomicUsize::new(0);
@@ -138,7 +164,6 @@ pub(crate) struct ProcessorRuntime {
     physical_memory_offset: usize,
     tsc_hz: u64,
     pub(crate) wasmtime_tls: WasmtimeTlsSlots,
-    pub(crate) native_trap_handler: AtomicUsize,
     pub(crate) exception_idt: ProcessorIdt,
     /// The GDT and TSS this processor loads beside its IDT, and the two
     /// exception stacks the TSS names.
@@ -147,6 +172,10 @@ pub(crate) struct ProcessorRuntime {
     /// `exceptions::verify_page_fault_returns` expects to fault on; zero
     /// when no probe is running. Written by this processor only.
     pub(crate) probe_fault: AtomicUsize,
+    /// The zeroed frame the probe staged for the page-fault dispatcher
+    /// to map at `probe_fault`, as its direct-map address; zero when
+    /// none is staged. Written by this processor only.
+    pub(crate) probe_frame: AtomicUsize,
     watchdog: X86Watchdog,
     timer: Once<Timer<crate::X86Cpu>>,
     program_service: Once<debug_state::ProgramService>,
@@ -256,10 +285,10 @@ pub(crate) fn build_boot_context(
             physical_memory_offset,
             tsc_hz,
             wasmtime_tls: WasmtimeTlsSlots::new(),
-            native_trap_handler: AtomicUsize::new(0),
             exception_idt: ProcessorIdt::new(),
             segments: ProcessorSegments::new(exception_stack(), exception_stack()),
             probe_fault: AtomicUsize::new(0),
+            probe_frame: AtomicUsize::new(0),
             watchdog: watchdog.clone(),
             timer: Once::new(),
             program_service: Once::new(),
@@ -284,10 +313,10 @@ pub(crate) fn build_boot_context(
                 physical_memory_offset,
                 tsc_hz,
                 wasmtime_tls: WasmtimeTlsSlots::new(),
-                native_trap_handler: AtomicUsize::new(0),
                 exception_idt: ProcessorIdt::new(),
                 segments: ProcessorSegments::new(exception_stack(), exception_stack()),
                 probe_fault: AtomicUsize::new(0),
+                probe_frame: AtomicUsize::new(0),
                 watchdog: watchdog.clone(),
                 timer: Once::new(),
                 program_service: Once::new(),
@@ -370,9 +399,19 @@ pub(crate) fn activate_runtime(runtime: &ProcessorRuntime) {
     unsafe {
         wrmsr(IA32_FS_BASE, runtime as *const _ as u64);
     }
-    let bit = processor_bit(usize::from(runtime.logical_id()));
-    ONLINE_PROCESSOR_MASK.fetch_or(bit, Ordering::AcqRel);
     runtime.started.store(true, Ordering::Release);
+}
+
+/// Adds the calling processor to the set every TLB shootdown waits on.
+///
+/// Called immediately before the processor enables interrupts, once it
+/// can take the shootdown IPI, and never earlier; the contract is on the
+/// statics above. A processor has touched no user page it did not unmap
+/// itself before this point, so joining late leaves no translation
+/// unflushed.
+pub(crate) fn join_shootdown_targets() {
+    let bit = processor_bit(usize::from(current_processor().id()));
+    ONLINE_PROCESSOR_MASK.fetch_or(bit, Ordering::AcqRel);
 }
 
 /// The identity word at `fs:0`.
@@ -541,11 +580,12 @@ impl X86PlatformState {
     /// before it ran its first instruction; the interrupt path only
     /// loads a pointer, taking no lock and no allocation.
     pub(crate) fn install_device_interrupts(&self, routes: DeviceInterruptRoutes) {
-        assert_eq!(
-            ONLINE_PROCESSOR_MASK.load(Ordering::Acquire),
-            processor_bit(usize::from(self.bootstrap_processor().id())),
-            "x86 device interrupt routes must be published while the bootstrap \
-             processor is the only one online"
+        let secondaries_online = ONLINE_PROCESSOR_MASK.load(Ordering::Acquire)
+            & !processor_bit(usize::from(self.bootstrap_processor().id()));
+        assert!(
+            secondaries_online == 0,
+            "x86 device interrupt routes must be published before any secondary \
+             processor is online; online mask {secondaries_online:#b}"
         );
         let routes: &'static DeviceInterruptRoutes = Box::leak(Box::new(routes));
         for slot in self.processors.iter() {
@@ -705,20 +745,29 @@ pub(crate) fn shootdown_tlb_range(start: usize, byte_len: usize) {
     if byte_len == 0 {
         return;
     }
-    let online = ONLINE_PROCESSOR_MASK.load(Ordering::Acquire);
     let current = usize::from(current_processor().id());
     let current_bit = processor_bit(current);
-    let targets = online & !current_bit;
+    if ONLINE_PROCESSOR_MASK.load(Ordering::Acquire) & !current_bit == 0 {
+        return;
+    }
+    assert!(
+        ONLINE_PROCESSOR_MASK.load(Ordering::Acquire) & current_bit == 0
+            || x86_64::instructions::interrupts::are_enabled(),
+        "x86 TLB shootdown broadcast by processor {current} with interrupts masked while \
+         it is itself a shootdown target: it could not acknowledge another processor's \
+         broadcast, and the two would wait on each other"
+    );
+
+    let _broadcast = TLB_SHOOTDOWN_LOCK.lock();
+    let targets = ONLINE_PROCESSOR_MASK.load(Ordering::Acquire) & !current_bit;
     if targets == 0 {
         return;
     }
-
     TLB_SHOOTDOWN_START.store(start, Ordering::Release);
     TLB_SHOOTDOWN_LEN.store(byte_len, Ordering::Release);
-    TLB_SHOOTDOWN_ACK_MASK.store(current_bit, Ordering::Release);
+    TLB_SHOOTDOWN_ACK_MASK.store(0, Ordering::Release);
     send_tlb_shootdown_ipi_all_excluding_self();
-    let expected = online;
-    while TLB_SHOOTDOWN_ACK_MASK.load(Ordering::Acquire) & expected != expected {
+    while TLB_SHOOTDOWN_ACK_MASK.load(Ordering::Acquire) & targets != targets {
         core::hint::spin_loop();
     }
 }

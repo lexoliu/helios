@@ -13,6 +13,13 @@ use wasmtime::{AsContextMut, Engine};
 
 const WASI_CLI_RUN_FUNC: &str = "run";
 const POOLING_MAX_UNUSED_WARM_SLOTS: u32 = 100;
+/// The share of usable memory released fiber stacks may keep committed
+/// for the stacks that come after them (`memory::fiber_stack`): one
+/// sixty-fourth, a hundred or so stacks of the size a program actually
+/// touches, against a spawn path that would otherwise pay a TLB shootdown
+/// per teardown.
+#[cfg(all(target_os = "none", feature = "wasmtime-bare-metal"))]
+const FIBER_STACK_RETAIN_FRACTION: usize = 64;
 /// Elements one pooled table slot holds.
 ///
 /// Set here rather than inherited, and set from measurement: the largest
@@ -95,7 +102,21 @@ fn build_engine_for_platform<P: Cpu + Clone>(
     // exactly one that can take a page away underneath running guest code, so
     // the TLS slot that costs is asked for wherever that holds.
     config.block_on_current_fiber(true);
-    apply_pooling_config(&mut config);
+    let budget = apply_pooling_config(&mut config);
+    // Fiber stacks come out of the kernel's own arena, one page-fault at
+    // a time. The pool counts them exactly as before; only where the
+    // bytes come from changes, and the arena is what makes a live
+    // instance cost the stack it touches rather than the stack it might.
+    #[cfg(all(target_os = "none", feature = "wasmtime-bare-metal"))]
+    {
+        crate::memory::install_fiber_stack_arena(
+            budget.stacks as usize,
+            COMPONENT_ASYNC_STACK_SIZE,
+            platform.processor_count(),
+            crate::machine_memory().usable_bytes / FIBER_STACK_RETAIN_FRACTION,
+        );
+        config.with_host_stack(Arc::new(super::fiber_stack::ArenaStackCreator));
+    }
     config.memory_init_cow(true);
     config.memory_may_move(false);
     config.memory_reservation(helios_artifact::CWASM_MEMORY_RESERVATION);
@@ -108,6 +129,7 @@ fn build_engine_for_platform<P: Cpu + Clone>(
         memory_init_cow = engine.get_memory_init_cow(),
         memory_may_move = engine.get_memory_may_move(),
         signals_based_traps = engine.get_signals_based_traps(),
+        total_stacks = budget.stacks,
         "component engine built with the pooling allocator on the lazy-commit memory profile"
     );
     Ok(engine)
@@ -185,7 +207,9 @@ impl PoolingBudget {
     }
 }
 
-fn apply_pooling_config(config: &mut wasmtime::Config) {
+/// Configures the instance pools and reports the budget they were built
+/// from, which is also the number of fiber stacks the arena has to hold.
+fn apply_pooling_config(config: &mut wasmtime::Config) -> PoolingBudget {
     use wasmtime::{InstanceAllocationStrategy, PoolingAllocationConfig};
     let budget = PoolingBudget::of_kernel_policy();
     // The pools are reserved out of the one window every backend hands
@@ -202,7 +226,6 @@ fn apply_pooling_config(config: &mut wasmtime::Config) {
     );
     let mut pooling = PoolingAllocationConfig::default();
     pooling.max_unused_warm_slots(POOLING_MAX_UNUSED_WARM_SLOTS);
-    pooling.async_stack_keep_resident(super::config::COMPONENT_ASYNC_STACK_SIZE);
     pooling.total_component_instances(budget.component_instances);
     pooling.total_core_instances(budget.core_instances);
     pooling.total_memories(budget.memories);
@@ -218,6 +241,7 @@ fn apply_pooling_config(config: &mut wasmtime::Config) {
     pooling.table_elements(POOLING_TABLE_ELEMENTS);
     config.allocation_strategy(InstanceAllocationStrategy::Pooling(pooling));
     config.async_stack_zeroing(false);
+    budget
 }
 
 pub fn build_component_engine_for_platform<P: Cpu + Clone>(
@@ -255,6 +279,8 @@ pub fn resolve_wasi_cli_run<T: 'static>(
         .map_err(|error| wasmtime::Error::new(WasiCliRunResolveError::FunctionTypeMismatch(error)))
 }
 
+#[cfg(all(target_os = "none", feature = "wasmtime-bare-metal"))]
+use super::config::COMPONENT_ASYNC_STACK_SIZE;
 use super::config::{
     MAX_CONCURRENT_INSTANCES, MAX_CORE_INSTANCES_PER_COMPONENT, MAX_MEMORIES_PER_COMPONENT,
     MAX_POOLED_ADDRESS_SPACE, MAX_POOLED_USER_MEMORY, MAX_TABLES_PER_COMPONENT,

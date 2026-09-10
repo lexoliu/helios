@@ -3225,7 +3225,32 @@ impl VmRuntime {
             qemu.arg("-cpu").arg(cpu);
         }
         qemu.args(&command.qemu_arg);
+        // QEMU sits in its own process group, so a signal aimed at the
+        // inspector's group (a terminal's SIGINT, a driver's timeout kill)
+        // never reaches it and the shutdown in `VmRuntime::drop` is the one
+        // path that ends it. An inspector that dies by a signal runs no
+        // `Drop`, so on Linux the kernel ends QEMU with the thread that
+        // spawned it instead; `spawn` runs on the main thread, which lives
+        // as long as the process. Bench run 34443906698 left nineteen
+        // guests running that way, one per timed-out boot, under every
+        // boot that followed.
         qemu.process_group(0);
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: the closure runs in the child between fork and exec;
+            // `prctl` sets one flag on the calling task and allocates
+            // nothing, takes no lock and touches no memory the parent
+            // shares.
+            unsafe {
+                qemu.pre_exec(|| {
+                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == 0 {
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::last_os_error())
+                    }
+                });
+            }
+        }
         if command.serial_stdio {
             qemu.stdin(Stdio::piped());
             qemu.stdout(Stdio::piped());

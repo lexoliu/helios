@@ -86,6 +86,23 @@ impl<T> IrqSafeMutex<T> {
     pub(crate) fn with<R>(&self, act: impl FnOnce(&mut T) -> R) -> R {
         with_local_interrupts_masked(|| act(&mut self.value.lock()))
     }
+
+    /// Runs `act` when the lock is free, and answers `None` when it is
+    /// not, without ever spinning.
+    ///
+    /// This is the form a page-fault handler is allowed to use. A fault
+    /// arrives inside whatever the interrupted code was doing, and that
+    /// code may be holding this very lock on this very processor;
+    /// [`Self::with`] would then spin on a word only the interrupted
+    /// context can clear. Answering `None` lets the handler fall back on
+    /// state it owns alone instead of deadlocking against itself.
+    ///
+    /// The mask goes outside the attempt for the same reason it does in
+    /// [`Self::with`]: an interrupt that arrives between taking the lock
+    /// and running `act` would find the lock held.
+    pub(crate) fn try_with<R>(&self, act: impl FnOnce(&mut T) -> R) -> Option<R> {
+        with_local_interrupts_masked(|| self.value.try_lock().map(|mut value| act(&mut value)))
+    }
 }
 
 #[cfg(test)]

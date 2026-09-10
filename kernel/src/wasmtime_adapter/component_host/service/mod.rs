@@ -494,6 +494,7 @@ where
         component = component_name,
         "embedded system component exited cleanly"
     );
+    report_fiber_stack_demand_commits(&cpu);
     cpu.shutdown()
 }
 
@@ -616,6 +617,46 @@ where
             }
         }
     }
+}
+
+/// Prints what the fiber-stack arena did over this boot, per processor.
+///
+/// The arena's whole claim is that a live instance costs the stack it
+/// touched rather than the stack it might, and a demand commit is the
+/// event that makes that true. Counting them per processor is also what
+/// shows the fault path running on every processor rather than only on
+/// the one that created the stack.
+fn report_fiber_stack_demand_commits<CpuImpl: Cpu>(cpu: &CpuImpl) {
+    let Some(stats) = crate::fiber_stack_arena_stats() else {
+        return;
+    };
+    for processor in 0..cpu.processor_count() {
+        let processor =
+            helios_hal::cpu::ProcessorId::new(u16::try_from(processor).unwrap_or_else(|_| {
+                panic!("processor {processor} is beyond the identifiers this platform can name")
+            }));
+        tracing::info!(
+            target: "helios_kernel::fiber_stack",
+            processor = processor.id(),
+            demand_commits = crate::fiber_stack_demand_commits_on(processor),
+            "fiber stack demand commits resolved on this processor"
+        );
+    }
+    tracing::info!(
+        target: "helios_kernel::fiber_stack",
+        slots = stats.slots,
+        live_slots = stats.live_slots,
+        warm_slots = stats.warm_slots,
+        retained_bytes = stats.retained_bytes,
+        demand_commits = stats.demand_commits,
+        committed_bytes = stats.committed_bytes,
+        eager_bytes = stats.eager_bytes,
+        released_stacks = stats.released_stacks,
+        released_committed_bytes = stats.released_committed_bytes,
+        released_eager_bytes = stats.released_eager_bytes,
+        reserve_bytes = crate::page_fault_frame_reserve_bytes(),
+        "fiber stack arena totals for this boot"
+    );
 }
 
 fn run_kernel_processor_forever<CpuImpl, Net, HostFs, WatchdogImpl>(

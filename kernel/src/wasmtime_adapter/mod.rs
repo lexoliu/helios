@@ -14,6 +14,8 @@ pub mod config;
 pub mod custom_vm;
 pub(crate) mod cwasm;
 pub mod engine;
+#[cfg(all(target_os = "none", feature = "wasmtime-bare-metal"))]
+pub(crate) mod fiber_stack;
 pub mod store;
 pub mod swap_fault;
 #[cfg(all(target_os = "none", feature = "wasmtime-bare-metal"))]

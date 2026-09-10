@@ -231,6 +231,47 @@ impl UserMemoryPool {
         Ok((ptr, allocation_size))
     }
 
+    /// One zeroed user frame, or `None` when taking it would have
+    /// meant waiting on a lock.
+    ///
+    /// This is the page-fault path's allocation. A fault arrives inside
+    /// whatever the interrupted code was doing, and that code may be
+    /// holding the pool's own lock on this processor — the kernel heap
+    /// grows out of this pool from inside the global allocator — so a
+    /// blocking acquire here would spin on a word only the interrupted
+    /// context can clear. The caller keeps a per-processor reserve for
+    /// exactly the times this answers `None`; see
+    /// [`super::frame_reserve`].
+    ///
+    /// The frame-slab shard is tried first because it is the cheaper
+    /// lock and the one most likely to be free; the buddy heap is tried
+    /// only through [`IrqSafeMutex::try_with`]. Zeroing happens outside
+    /// both locks.
+    pub(crate) fn try_allocate_frame_on(&self, processor: ProcessorId) -> Option<NonNull<u8>> {
+        let ptr = match self.frame_slab.try_allocate_on(processor) {
+            Some(ptr) => ptr,
+            None => self
+                .heap
+                .try_with(|heap| heap.allocate(PhysFrame::SIZE).ok())
+                .flatten()?,
+        };
+        // A frame the pool showed to a free-page consumer may have been
+        // discarded by it, so the zeroing below is not an optimisation
+        // that can be skipped for a frame the caller will overwrite: it
+        // is what makes the page readable at all. Because it happens
+        // either way, the mark is cleared only if the bitmap is free —
+        // the blocking form would be waiting on whatever this fault
+        // interrupted.
+        let _ = self
+            .reported
+            .try_clear_bytes(ptr.as_ptr() as usize, PhysFrame::SIZE);
+        // SAFETY: `ptr` is one exclusively owned page from this pool.
+        unsafe {
+            core::ptr::write_bytes(ptr.as_ptr(), 0, PhysFrame::SIZE);
+        }
+        Some(ptr)
+    }
+
     /// Returns a byte allocation to the pool.
     ///
     /// Named apart from the frame-allocator contract's `deallocate`,
@@ -512,6 +553,11 @@ pub fn allocate_user_run_zeroed_on(
 /// memory to the wrong free list.
 pub fn deallocate_user_run_on(processor: ProcessorId, ptr: NonNull<u8>, layout: Layout) {
     user_memory_pool().deallocate_bytes_on(processor, ptr, layout);
+}
+
+/// See [`UserMemoryPool::try_allocate_frame_on`].
+pub(crate) fn try_allocate_user_frame_zeroed_on(processor: ProcessorId) -> Option<NonNull<u8>> {
+    installed_user_memory_pool()?.try_allocate_frame_on(processor)
 }
 
 pub fn deallocate_user_frame(ptr: NonNull<u8>) {

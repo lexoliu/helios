@@ -27,6 +27,19 @@
 //! to callers, so the OOM killer / supervisor can release a victim's
 //! whole reservation in one call without bookkeeping leaks.
 //!
+//! # Demand-commit regions
+//!
+//! A consumer that cannot afford to commit a whole reservation up
+//! front, and cannot take a fault through the ordinary locked path
+//! either, asks for a *demand-commit region*:
+//! [`AddressSpace::prepare_demand_commit`] records the range and builds
+//! every page-table level above the leaves, and
+//! [`AddressSpace::commit_demand_page`] then maps one page from fault
+//! context with no lock and no shootdown, because a page going from
+//! unmapped to mapped is one no processor can have cached.
+//! [`AddressSpace::end_demand_commit`] gives the region back, skipping
+//! the pages nothing ever faulted on.
+//!
 //! # SMP contract
 //!
 //! All methods take `&self` and are safe to call from any processor.
@@ -40,6 +53,7 @@
 use bitflags::bitflags;
 use core::future::Future;
 use core::num::NonZeroU32;
+use core::ptr::NonNull;
 
 use thiserror::Error;
 
@@ -100,6 +114,32 @@ impl VirtRange {
     pub fn contains(self, addr: VirtAddr) -> bool {
         addr.raw() >= self.start.raw() && addr.raw() < self.end().raw()
     }
+
+    /// Whether every address of `other` lies inside this range.
+    pub fn encloses(self, other: VirtRange) -> bool {
+        other.start.raw() >= self.start.raw() && other.end().raw() <= self.end().raw()
+    }
+
+    /// The first address of this range inside each `span`-aligned block
+    /// the range touches: `start` itself, then every block boundary
+    /// below `end`.
+    ///
+    /// A page-table level covers a power-of-two span, so this is how a
+    /// caller visits every leaf table under a range once, instead of
+    /// walking down to it from every page. `span` is a power of two.
+    pub fn block_starts(self, span: usize) -> impl Iterator<Item = VirtAddr> {
+        assert!(
+            span.is_power_of_two(),
+            "a block span is a power of two, not {span}"
+        );
+        let end = self.end().raw();
+        let first = self.start.raw();
+        let next_block = (first | (span - 1)).checked_add(1).unwrap_or(end);
+        core::iter::once(first)
+            .chain((next_block..end).step_by(span))
+            .take_while(move |addr| *addr < end)
+            .map(VirtAddr::new)
+    }
 }
 
 bitflags! {
@@ -154,6 +194,10 @@ pub enum AddressSpaceError {
     DeviceMappingUnsupported,
     #[error("the range is a device mapping, not ordinary memory")]
     DeviceMapped,
+    #[error("this address space cannot host demand-commit regions")]
+    DemandCommitUnsupported,
+    #[error("the page is not inside a prepared demand-commit region")]
+    NotDemandCommit,
 }
 
 /// Identity of one swapped-out page's backing store.
@@ -368,6 +412,89 @@ pub trait AddressSpace: Send + Sync + 'static {
     /// Look up the current state of `addr`. Lock-free.
     fn translate(&self, addr: VirtAddr) -> Translation;
 
+    /// Turn `virt` into a demand-commit region.
+    ///
+    /// The range is recorded as committed with `flags` and every
+    /// intermediate page-table level it spans is built, but no leaf
+    /// entry is written: every page of it still faults, and
+    /// [`Self::translate`] answers [`Translation::Reserved`] for it
+    /// until [`Self::commit_demand_page`] maps one.
+    ///
+    /// This is the locked half of a demand-commit region and does
+    /// everything that needs the lock: the region's bookkeeping and the
+    /// page-table levels above the leaf, which are what a fault-time
+    /// commit must find already there. Building a level from fault
+    /// context would take this address space's own lock, and a fault
+    /// arrives inside whatever the interrupted code was doing —
+    /// including a path already holding it — so it is done here instead,
+    /// once, on the ordinary path.
+    ///
+    /// A backend that cannot separate the levels from the leaves reports
+    /// [`AddressSpaceError::DemandCommitUnsupported`]; there is no
+    /// weaker version of the guarantee to fall back to, because a
+    /// consumer that asked for it cannot take the fault any other way.
+    fn prepare_demand_commit(
+        &self,
+        _virt: VirtRange,
+        _flags: PageFlags,
+    ) -> Result<(), AddressSpaceError> {
+        Err(AddressSpaceError::DemandCommitUnsupported)
+    }
+
+    /// Map one page inside a prepared demand-commit region, from fault
+    /// context, without taking this address space's lock.
+    ///
+    /// `frame` is one page of memory in the kernel's own view of
+    /// physical memory — exactly what this address space's frame source
+    /// hands out and takes back — and the caller gives up ownership of
+    /// it: [`Self::end_demand_commit`] returns it to that source with
+    /// every other page of the region.
+    ///
+    /// The page goes from unmapped to mapped, so no processor can hold a
+    /// translation for it and the local invalidate this does is the
+    /// whole of the TLB work; there is no shootdown and nothing to wait
+    /// for. `addr` must lie inside a range [`Self::prepare_demand_commit`]
+    /// prepared, or the call reports
+    /// [`AddressSpaceError::NotDemandCommit`] rather than building the
+    /// missing levels.
+    ///
+    /// Fails with [`AddressSpaceError::Overlap`] when the page is
+    /// already mapped, which is the caller's own race and not a case to
+    /// paper over: the frame it handed in is still the caller's to
+    /// return.
+    fn commit_demand_page(
+        &self,
+        _addr: VirtAddr,
+        _frame: NonNull<u8>,
+        _flags: PageFlags,
+    ) -> Result<(), AddressSpaceError> {
+        Err(AddressSpaceError::DemandCommitUnsupported)
+    }
+
+    /// Undo [`Self::prepare_demand_commit`] for `virt`.
+    ///
+    /// `mapped` is the part of `virt` a demand commit may have mapped a
+    /// page in. Outside it the caller knows nothing ever faulted, and
+    /// the backend does not walk there: a consumer that tracks how far
+    /// its region was touched hands that in, and one that does not hands
+    /// in `virt` itself. Inside it, every page a demand commit mapped is
+    /// unmapped and its frame returned; a page nothing ever faulted on
+    /// is skipped rather than reported, because a partly committed
+    /// region is the normal state of one — that is the whole point of
+    /// it. The shootdown is the one [`Self::decommit`] does, for the
+    /// same reason: a frame is not reusable while another processor can
+    /// still translate to it.
+    ///
+    /// A `mapped` that reaches outside `virt` is reported as
+    /// [`AddressSpaceError::NotDemandCommit`].
+    fn end_demand_commit(
+        &self,
+        _virt: VirtRange,
+        _mapped: VirtRange,
+    ) -> Result<(), AddressSpaceError> {
+        Err(AddressSpaceError::DemandCommitUnsupported)
+    }
+
     /// Relocate the physical backing of an already-committed range
     /// without changing its virtual base address.
     ///
@@ -495,5 +622,53 @@ pub trait AddressSpace: Send + Sync + 'static {
         Visit: FnMut(SwapToken),
     {
         0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{VirtAddr, VirtRange};
+
+    const SPAN: usize = 2 * 1024 * 1024;
+
+    fn starts(start: usize, byte_len: usize) -> alloc::vec::Vec<usize> {
+        VirtRange::new(VirtAddr::new(start), byte_len)
+            .block_starts(SPAN)
+            .map(VirtAddr::raw)
+            .collect()
+    }
+
+    #[test]
+    fn a_range_yields_its_start_then_every_block_boundary_below_its_end() {
+        let start = SPAN + 4096;
+        assert_eq!(
+            starts(start, 2 * SPAN),
+            alloc::vec![start, 2 * SPAN, 3 * SPAN],
+            "a range straddling three blocks visits each once"
+        );
+    }
+
+    #[test]
+    fn an_aligned_range_of_one_block_yields_its_start_alone() {
+        assert_eq!(starts(4 * SPAN, SPAN), alloc::vec![4 * SPAN]);
+    }
+
+    #[test]
+    fn a_range_shorter_than_a_block_yields_its_start_alone() {
+        assert_eq!(starts(4 * SPAN + 8192, 4096), alloc::vec![4 * SPAN + 8192]);
+    }
+
+    #[test]
+    fn an_empty_range_yields_nothing() {
+        assert!(starts(SPAN, 0).is_empty());
+    }
+
+    #[test]
+    fn encloses_is_inclusive_of_the_edges_and_nothing_past_them() {
+        let outer = VirtRange::new(VirtAddr::new(SPAN), SPAN);
+        assert!(outer.encloses(outer));
+        assert!(outer.encloses(VirtRange::new(VirtAddr::new(SPAN + 4096), 4096)));
+        assert!(!outer.encloses(VirtRange::new(VirtAddr::new(SPAN - 4096), 8192)));
+        assert!(!outer.encloses(VirtRange::new(VirtAddr::new(2 * SPAN - 4096), 8192)));
     }
 }

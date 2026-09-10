@@ -66,6 +66,25 @@ impl FrameSlabShard {
         })
     }
 
+    /// Pops a cached frame when the shard's lock is free, and answers
+    /// `None` when it is not.
+    ///
+    /// A shard's lock is taken by its own processor on the ordinary
+    /// path and by any processor during [`FrameSlabCache::drain`], so a
+    /// page-fault handler cannot afford to wait on it.
+    fn try_allocate(&self) -> Option<NonNull<u8>> {
+        self.head.try_with(|head| {
+            let frame = NonNull::new(*head)?;
+            // SAFETY: every frame on this list was pushed by
+            // `deallocate`, which wrote its link word.
+            let next = unsafe { frame.as_ref().next };
+            *head = next;
+            let cached = self.cached_frames.load(Ordering::Relaxed);
+            self.cached_frames.store(cached - 1, Ordering::Release);
+            Some(frame.cast())
+        })?
+    }
+
     fn deallocate(&self, frame: NonNull<u8>, capacity: usize) -> bool {
         self.head.with(|head| {
             let cached = self.cached_frames.load(Ordering::Relaxed);
@@ -122,6 +141,11 @@ impl FrameSlabCache {
 
     pub(crate) fn allocate_on(&self, processor: ProcessorId) -> Option<NonNull<u8>> {
         self.allocate_from(self.processor_shard(processor))
+    }
+
+    /// See [`FrameSlabShard::try_allocate`].
+    pub(crate) fn try_allocate_on(&self, processor: ProcessorId) -> Option<NonNull<u8>> {
+        self.processor_shard(processor).try_allocate()
     }
 
     pub(crate) fn deallocate(&self, frame: NonNull<u8>, total_frames: usize) -> bool {
