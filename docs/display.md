@@ -131,7 +131,6 @@ the capture's own dimensions and checks it at the corners and the middle.
     --boot-program dash --boot-program debugger --boot-program display-test \
     screendump \
       --run /bin/display-test --run-arg --seconds --run-arg 20 \
-      --input tools/desktop/display-probe.input --input-interval-ms 100 \
       --settle-seconds 2 target/probe/drawn.png
 python3 tools/desktop/check-gradient.py target/probe/drawn.png
 ```
