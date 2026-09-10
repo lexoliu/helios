@@ -16,6 +16,7 @@ use helios_hal::fs::HOST_SHARE_MOUNT_TAG;
 use helios_inspector_protocol::debugger::filesystem as debugger_fs;
 use helios_inspector_protocol::system::profiling as system_profiling;
 use helios_inspector_protocol::system::programs as system_programs;
+use helios_profdata::{KernelProfileStore, KernelProfileStoreError, ProfileUseError};
 use helios_workspace_root::{WorkspaceRoot, WorkspaceRootError};
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
@@ -31,7 +32,6 @@ use crate::{
 };
 
 mod network;
-mod profdata;
 mod qemu;
 mod qmp;
 mod raw_profile;
@@ -40,7 +40,6 @@ use network::{
     HostPlatform, NetSetupCommand, NetTeardownCommand, QemuNetArgs, VmNetwork, VmNetworkArgs,
     VmNetworkError, VmNetworkFile, VmNetworkProfile, VmNetworkSetupError,
 };
-use profdata::ProfileUseError;
 use qemu::QemuOptions;
 use qmp::{QmpClient, QmpError, SizeError};
 use raw_profile::{ProfileCommand, RawProfileCollectError};
@@ -94,6 +93,15 @@ pub(crate) enum VmConfigError {
     ProfileUseWithOtherProfile,
     #[error("{0}")]
     ProfileUse(#[from] ProfileUseError),
+    #[error(
+        "a --release {arch} kernel is built against the fetched kernel profile \
+         (docs/pgo.md): {source}"
+    )]
+    ReleaseKernelProfile {
+        arch: &'static str,
+        #[source]
+        source: KernelProfileStoreError,
+    },
     #[error("{0}")]
     WorkloadSelection(#[from] WorkloadSelectionError),
     #[error("failed to read inspector VM config {path}: {source}")]
@@ -728,6 +736,15 @@ struct VmProfile {
     /// the sections go, or the counters land outside the image the boot
     /// code loads (docs/pgo.md).
     profile_generate_linker_script: Option<&'static str>,
+    /// Whether a `--release` kernel for this target is built against the
+    /// fetched kernel profile (`docs/pgo.md`, #226, #313).
+    ///
+    /// Performance is measured on one architecture (AGENTS.md §3.6), and
+    /// it is the one whose releases carry a profile: on the others a
+    /// release build is a plain release build, because there is no
+    /// profile of that target to spend and a `.profdata` carries the
+    /// function hashes of the target it was collected on.
+    release_kernel_profile: bool,
 }
 
 /// The `virt` machine as the aarch64 kernel boots it by default: EDK2
@@ -769,6 +786,7 @@ const AARCH64_VIRT_HVF_PROFILE: VmProfile = VmProfile {
     balloon: VmBalloonProfile::VirtioBalloonMmio,
     vsock: VmVsockProfile::VhostVsockMmio,
     profile_generate_linker_script: Some("aarch64/profile-generate.ld"),
+    release_kernel_profile: false,
 };
 
 #[cfg(test)]
@@ -799,6 +817,7 @@ const AARCH64_VIRT_TCG_PROFILE: VmProfile = VmProfile {
     balloon: VmBalloonProfile::VirtioBalloonMmio,
     vsock: VmVsockProfile::VhostVsockMmio,
     profile_generate_linker_script: Some("aarch64/profile-generate.ld"),
+    release_kernel_profile: false,
 };
 
 const RISCV64_VM_PROFILE: VmProfile = VmProfile {
@@ -828,6 +847,7 @@ const RISCV64_VM_PROFILE: VmProfile = VmProfile {
     balloon: VmBalloonProfile::VirtioBalloonMmio,
     vsock: VmVsockProfile::VhostVsockMmio,
     profile_generate_linker_script: Some("riscv/profile-generate.x"),
+    release_kernel_profile: false,
 };
 
 const X86_64_VM_PROFILE: VmProfile = VmProfile {
@@ -854,6 +874,9 @@ const X86_64_VM_PROFILE: VmProfile = VmProfile {
     balloon: VmBalloonProfile::VirtioBalloonPci,
     vsock: VmVsockProfile::VhostVsockPci,
     profile_generate_linker_script: None,
+    // The one architecture performance is measured on, and the one
+    // release.yml collects and publishes a profile for.
+    release_kernel_profile: true,
 };
 
 /// Virtqueue ring layout the inspector asks every virtio device for.
@@ -1448,10 +1471,26 @@ fn resolve_build(
     // that ends in an LLVM error naming no file.
     let profile_use = profile_use
         .map(|path| {
-            profdata::validate(&path)?;
+            helios_profdata::validate(&path)?;
             absolute_profile(&path)
         })
         .transpose()?;
+    // A release build of the architecture performance is measured on
+    // reads the fetched profile, so the kernel a developer boots, the
+    // kernel the lanes measure and the kernel a release ships are the
+    // same build (#226, #313). An explicit `--profile-use` is still the profile that
+    // wins: it is how one profile is measured against another.
+    // A session that builds nothing and names the image it boots needs no
+    // profile: a profile describes a build, and there is none here.
+    let builds_its_own_kernel =
+        !(command.no_build && (command.kernel.is_some() || file.kernel.is_some()));
+    let profile_use = match profile_use {
+        Some(explicit) => Some(explicit),
+        None if release && builds_its_own_kernel => {
+            release_kernel_profile(profile, &KernelProfileStore::new(&repo_root()?))?
+        }
+        None => None,
+    };
     let kind = if profile_use.is_some() {
         KernelBuildProfile::ProfileUse
     } else if profile_generate {
@@ -1480,6 +1519,32 @@ fn resolve_build(
         boot_programs,
         no_compiler_plugin,
     })
+}
+
+/// The profile a `--release` kernel of this target is built against.
+///
+/// `None` for a target whose releases carry none: performance is
+/// measured on one architecture (AGENTS.md §3.6) and it is the one whose
+/// releases publish a profile, so on the others a release build is a
+/// plain release build rather than one silently missing its profile.
+///
+/// For the target that does carry one, an empty store is a refusal and
+/// never a plain kernel wearing a PGO label: the error names the fetch
+/// command and the release job that publishes the asset.
+fn release_kernel_profile(
+    profile: &VmProfile,
+    store: &KernelProfileStore,
+) -> Result<Option<PathBuf>, VmConfigError> {
+    if !profile.release_kernel_profile {
+        return Ok(None);
+    }
+    let (_, path) = store
+        .fetched()
+        .map_err(|source| VmConfigError::ReleaseKernelProfile {
+            arch: arch_label(profile.arch),
+            source,
+        })?;
+    Ok(Some(absolute_profile(&path)?))
 }
 
 /// The profile path as cargo will read it.
@@ -1860,8 +1925,19 @@ fn build_vm(command: &KernelBuildSpec) -> Result<(), VmBuildError> {
             .arg("helios-cli"),
     )?;
     let prebuild_manifest = run_kernel_prebuild(command)?;
+    let kernel_label = match &command.profile_use {
+        // Which profile a PGO kernel was built from is part of what it
+        // is, so the build says it rather than leaving a release build
+        // and a profile-guided one looking alike.
+        Some(profile) => format!(
+            "building {} kernel against {}",
+            arch_label(command.profile.arch),
+            profile.display()
+        ),
+        None => format!("building {} kernel", arch_label(command.profile.arch)),
+    };
     run_step(
-        &format!("building {} kernel", arch_label(command.profile.arch)),
+        &kernel_label,
         kernel_build_command(&repo_root, command)
             .env("HELIOS_KERNEL_PREBUILD_MANIFEST", &prebuild_manifest)
             .arg("--target")
@@ -4388,6 +4464,61 @@ mod tests {
                     .expect("the profile exists")
                     .as_path()
             ),
+        );
+    }
+
+    #[test]
+    fn a_release_build_of_the_measured_target_refuses_an_empty_store() {
+        let directory = tempfile::tempdir().expect("a temporary checkout");
+        let store = KernelProfileStore::new(directory.path());
+        let error = release_kernel_profile(&X86_64_VM_PROFILE, &store)
+            .expect_err("a release kernel of the measured target is built against a profile");
+        assert!(
+            matches!(error, VmConfigError::ReleaseKernelProfile { .. }),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains(helios_profdata::FETCH_COMMAND),
+            "the refusal says how to fill the store: {error}"
+        );
+    }
+
+    #[test]
+    fn a_release_build_of_another_target_reads_no_profile() {
+        let directory = tempfile::tempdir().expect("a temporary checkout");
+        let store = KernelProfileStore::new(directory.path());
+        for profile in [&RISCV64_VM_PROFILE, &AARCH64_VIRT_HVF_PROFILE] {
+            assert_eq!(
+                release_kernel_profile(profile, &store)
+                    .expect("a target whose releases carry no profile needs no store"),
+                None,
+            );
+        }
+    }
+
+    #[test]
+    fn a_release_build_of_the_measured_target_reads_the_fetched_profile() {
+        let directory = tempfile::tempdir().expect("a temporary checkout");
+        let store = KernelProfileStore::new(directory.path());
+        let tag = "helios-v0.1.0";
+        let stored = store
+            .profile_path(tag)
+            .expect("a tag that keys a directory");
+        fs::create_dir_all(stored.parent().expect("the tag's directory"))
+            .expect("creating the tag's directory");
+        pinned_profile(stored.parent().expect("the tag's directory"));
+        store
+            .publish(&helios_profdata::FetchedProfile::Release {
+                repository: helios_profdata::RELEASE_REPOSITORY.to_owned(),
+                tag: tag.to_owned(),
+            })
+            .expect("recording the profile in force");
+        let profile = release_kernel_profile(&X86_64_VM_PROFILE, &store)
+            .expect("the store holds a profile of the pinned format")
+            .expect("the measured target reads it");
+        assert_eq!(
+            profile,
+            stored.canonicalize().expect("the stored profile exists")
         );
     }
 

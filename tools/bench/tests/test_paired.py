@@ -719,3 +719,49 @@ def test_a_pgo_run_reports_without_a_linux_side(tmp_path) -> None:
     assert result is not None
     assert result.rows, "the PGO candidate is compared against the plain image"
     assert "profile-use" in render_gate(gate_report(report, None), report.run.lane)
+
+
+def test_an_x86_64_release_kernel_is_a_profile_use_build(tmp_path) -> None:
+    """There is no plain release kernel on the measured architecture.
+
+    Every x86-64 release build reads the profile the latest release
+    published (#226), so the run record names the build directory the
+    inspector actually wrote to — which is where the bootfs pins are
+    read from as well.
+    """
+    options = RunOptions(
+        lane=load_manifest().lane("x86-64-kvm"),
+        out_dir=tmp_path / "out",
+        advisory=True,
+        sides=frozenset({Side.HELIOS}),
+    )
+    assert options.kernel_build == "profile-use"
+    assert not options.paired
+    assert options.baseline_kernel_build is None, "an unpaired run has no second image"
+
+
+def test_a_pgo_pairing_names_the_profile_each_column_read(paired_regression_report) -> None:
+    """Once both columns are profile-use builds, the profile is what varies.
+
+    The baseline reads the profile the release published and the
+    candidate the one this run collected, on one commit and one host, so
+    the labels name the profiles or the table says nothing about which
+    column is which.
+    """
+    sha = paired_regression_report.run.helios_git_sha
+    run = paired_regression_report.run.model_copy(
+        update={
+            "baseline_git_sha": sha,
+            "baseline_ref": None,
+            "kernel_build": "profile-use",
+            "baseline_kernel_build": "profile-use",
+            "kernel_profile": "target/pgo-candidate/helios-kernel.profdata",
+            "baseline_kernel_profile": "release helios-v0.1.0",
+        }
+    )
+    result = evaluate_paired(paired_regression_report.model_copy(update={"run": run}))
+
+    assert result is not None and result.kind is GateKind.PAIRED
+    assert "release helios-v0.1.0" in result.baseline_label
+    assert "target/pgo-candidate/helios-kernel.profdata" in result.candidate_label
+    assert result.baseline_label != result.candidate_label

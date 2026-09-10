@@ -231,9 +231,12 @@ the way `just build-instrumented` is `vm --profile-generate build`, so
 the flags have one definition (`inspector/src/vm.rs`,
 `profile_use_rustflags`).
 
-The profile is an explicit argument on purpose: a PGO kernel is only as
-good as the profile behind it, so which profile that was is part of the
-command that built it and part of the run record of anything timed on it.
+The profile is an explicit argument whenever two profiles are being told
+apart: a PGO kernel is only as good as the profile behind it, so which
+profile that was is part of the command that built it and part of the run
+record of anything timed on it. The one profile that needs no argument is
+the release's, below: `--release` on x86-64 reads it, and naming
+`--profile-use` overrides it.
 `--profile-use` composes with `--release` and with nothing else:
 `--profile-generate`, `--debug` and `--kernel-debug` are refused by name,
 because a build cannot both collect a profile and read one, and an
@@ -242,7 +245,8 @@ unoptimised PGO build would measure neither.
 #### Refusing a profile the toolchain cannot read
 
 The build checks the profile's header before cargo starts
-(`inspector/src/vm/profdata.rs`), the way the guest writer checks
+(`helios-profdata`, the crate the inspector and `helios-cli` share),
+the way the guest writer checks
 `__llvm_profile_raw_version` before it writes a byte. Sixteen bytes
 answer three questions:
 
@@ -292,15 +296,29 @@ patching; and the artifact carries the run that produced it.
 
 `bench-suite.yml` has a `suite-pgo` job after `profile-generate`, on the
 same events. It downloads that run's `helios-kernel-profdata`, builds the
-candidate kernel with `--profile-use` and the baseline kernel plain from
-the same commit, and runs the paired suite of #173 with the two on one
-host: `--sides helios,helios_baseline`, which is Helios against Helios,
-because the Linux sides answer a different question and would double a job
-that already boots every workload twice.
+candidate kernel with `--profile-use` on it, builds the baseline kernel
+the way a plain `--release` build of this lane is built — which is
+against the fetched profile, the newest collection on the default
+branch — and runs the paired
+suite of #173 with the two on one host: `--sides
+helios,helios_baseline`, which is Helios against Helios, because the
+Linux sides answer a different question and would double a job that
+already boots every workload twice.
+
+That pairing is what "refresh at release time" has to be measured
+against. Both columns are `profile-use` builds of one commit and what
+varies between them is the profile: the release's counts against the
+counts this run collected. A candidate that does not beat the baseline
+says the release's profile still describes this kernel; one that does
+says the profile has aged, which is the argument for cutting the next
+release's collection. The run record names each column's profile
+(`kernel_profile`, `baseline_kernel_profile`) and the paired table's
+labels carry them, because two `profile-use` builds of one commit are
+otherwise indistinguishable.
 
 The pairing machinery varies one thing between its two columns. Until now
 that was the commit — a baseline worktree of another ref (#173, #178) —
-and here it is the build: one commit, two kernels, and
+and here it is the profile: one commit, two kernels, and
 `tools/bench/pgo-gate-note.md` beside the gate table saying which column
 read the profile. The report is the paired table and the per-workload
 medians; read the headline compute workloads first (`aot-curl`,
@@ -349,6 +367,67 @@ A release published before this job existed carries no profile.
 Dispatching `release.yml` with its `tag` input names such a release and
 attaches the two assets to it; a tag with no release behind it is refused
 by name, before the collection rather than after it.
+
+#### Spending it: `helios-cli profile-fetch`
+
+Every x86-64 release build reads a fetched profile, so the kernel a
+developer boots with `--release`, the kernel the smoke and bench lanes
+measure, and the kernel a release ships are one build.
+
+```bash
+helios-cli profile-fetch                 # the newest collection on the default branch
+helios-cli profile-fetch --branch perf/x  # the newest collection on a branch
+helios-cli profile-fetch --tag helios-v0.1.0   # the asset a release carries
+helios-inspector vm --arch x86-64 --release --accel kvm shell
+```
+
+The fetch is the one entry point that puts a profile in the store.
+Without `--tag` it lists the repository's `helios-kernel-profdata`
+artifacts through GitHub's API, takes the newest unexpired one whose run
+was on the default branch (`kernel-profile.yml`, #313), follows the
+archive redirect to GitHub's object store with curl and reads
+`helios-kernel.profdata` out of the archive; with `--tag` it reads the
+release and downloads the asset `release.yml` attached. Either way it
+checks the header before the file counts as fetched, and records where
+the profile came from:
+
+```text
+target/profiles/fetched.json                    the profile in force
+target/profiles/run-<id>/helios-kernel.profdata  a collection, keyed by its run
+target/profiles/<tag>/helios-kernel.profdata     a release, keyed by its tag
+```
+
+The record labels the profile the way the paired table will
+(`dev@85d20bc run 34424416974`, or `release helios-v0.1.0`), so a kernel
+image can be traced to the counts that shaped it. The store is under
+`target/` because a checkout reproduces it by fetching again;
+`helios-profdata` owns both the header check and the store, so the tool
+that writes it and the tool that reads it hold one definition of what a
+profile is and where it lives. The API and the archive need a token
+(`GITHUB_TOKEN`, or `GH_TOKEN` as `gh auth` sets it); a lane's is the
+job's own, with `actions: read`.
+
+Nothing about the path is discovered and nothing falls back. No
+collection on the branch, an expired one, a release without the asset, a
+header this toolchain cannot read, or an empty store at build time is a
+refusal that names what was checked and the command or the workflow that
+would fix it. A release build that quietly dropped the profile would
+produce exactly the kernel §"What a stale profile costs" warns about: a
+release build wearing a PGO label.
+
+Only x86-64 reads a profile this way. Performance is measured on one
+architecture (AGENTS.md §3.6) and it is the one whose releases carry a
+profile; on the others a release build is a release build, because a
+`.profdata` carries the function hashes of the target it was collected
+on and there is none for them to spend. The inspector says which target
+does in one field of its target table (`release_kernel_profile`), not in
+a `cfg`.
+
+Three CI lanes therefore fetch before they build: `smoke-x86-64`,
+`bench-x86-64-linux` and `bench-suite.yml`'s `suite`. Until a
+`kernel-profile.yml` run on the default branch has uploaded the artifact,
+every one of them fails at the fetch, and the message names the workflow
+to dispatch.
 
 ### Sample-based alternative already within reach
 

@@ -10,6 +10,7 @@ ed25519-dalek = { version = "3.0.0", default-features = false, features = ["allo
 fatfs = "0.3.6"
 helios-artifact.workspace = true
 helios-compiler-support.workspace = true
+helios-profdata.workspace = true
 helios-workspace-root.workspace = true
 hex = "0.4.3"
 mbrman = "0.5.4"
@@ -22,6 +23,7 @@ toml = "0.8.23"
 walkdir = "2.5.0"
 wasmparser = "0.245.0"
 wit-component = "0.245.0"
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 [lints]
 workspace = true
