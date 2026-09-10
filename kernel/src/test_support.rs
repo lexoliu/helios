@@ -353,6 +353,10 @@ impl crate::component::ComponentRuntimeState for TestRuntimeState {
         None
     }
 
+    fn gpu3d_service(&self) -> Option<crate::gpu::Gpu3dService> {
+        None
+    }
+
     fn surface_service(&self) -> crate::surface::SurfaceService {
         crate::surface::SurfaceService::new()
     }

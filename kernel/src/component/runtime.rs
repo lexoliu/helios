@@ -361,6 +361,14 @@ pub trait ComponentRuntimeState: Clone + Send + 'static {
     /// brought none up on.
     fn input_service(&self) -> Option<crate::input::InputService>;
 
+    /// The display engine's rendering half, once a backend brought the
+    /// device up.
+    ///
+    /// Empty on a machine with no display device at all, where a claim
+    /// is refused `unavailable` rather than trapping; a device that
+    /// renders nothing answers `no-renderer`.
+    fn gpu3d_service(&self) -> Option<crate::gpu::Gpu3dService>;
+
     /// The machine's client windows, which every instance may ask for
     /// one of.
     fn surface_service(&self) -> crate::surface::SurfaceService;

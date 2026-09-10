@@ -62,6 +62,8 @@ where
     let display = discover_display_device(platform, physical_memory_offset, handoff)?;
     let service = helios_kernel::install_display_device(kernel, cpu, display.device.device.clone());
     debug_state.install_display_service(service);
+    let service = helios_kernel::install_gpu3d_device(kernel, cpu, display.device.device.clone());
+    debug_state.install_gpu3d_service(service);
     Some(display)
 }
 

@@ -12,6 +12,7 @@ mod device;
 mod display;
 mod embedded;
 mod exec;
+mod gpu;
 mod host_fs;
 mod input;
 mod instance;
@@ -71,11 +72,11 @@ pub use component::{
 pub use device::{
     DEFAULT_DMA_BUDGET_BYTES, DEVICE_WINDOW_BYTES, DISPLAY_WINDOW_BYTES, DeviceGrant,
     DeviceGrantRegistry, DeviceInterruptHooks, DeviceInterruptRoute, DeviceName, DeviceOwnership,
-    DeviceVmHooks, DeviceWindow, DmaBudget, DmaBuffer, DmaBufferHandle, GrantError, GrantHandle,
-    GrantInterrupt, GrantLease, GrantStats, GrantedDeviceSnapshot, InterruptEvent, InterruptRelay,
-    InterruptStats, LinearMemory, MAX_DEVICE_NAME, MAX_DMA_BUFFERS, MAX_GRANT_INTERRUPTS,
-    MAX_GRANT_REGIONS, MAX_GRANTS, MappedRegion, PublishedDevice, SURFACE_WINDOW_BYTES,
-    install_device_interrupt_hooks, install_device_vm_hooks,
+    DeviceVmHooks, DeviceWindow, DmaBudget, DmaBuffer, DmaBufferHandle, GPU_WINDOW_BYTES,
+    GrantError, GrantHandle, GrantInterrupt, GrantLease, GrantStats, GrantedDeviceSnapshot,
+    InterruptEvent, InterruptRelay, InterruptStats, LinearMemory, MAX_DEVICE_NAME, MAX_DMA_BUFFERS,
+    MAX_GRANT_INTERRUPTS, MAX_GRANT_REGIONS, MAX_GRANTS, MappedRegion, PublishedDevice,
+    SURFACE_WINDOW_BYTES, install_device_interrupt_hooks, install_device_vm_hooks,
 };
 pub use display::{
     DisplayClaim, DisplayOwnership, DisplayPins, DisplaySender, DisplayService,
@@ -100,6 +101,10 @@ pub use exec::{
     elapsed_millis, matches_perf_metric_filter, matches_profile_filter, matches_trace_filter,
     monotonic_nanos, nanos_to_ticks_ceil_saturating, parse_console_text, wall_clock_offset_nanos,
     yield_now,
+};
+pub use gpu::{
+    ContextRecord, Gpu3dClaim, Gpu3dOwnership, Gpu3dSender, Gpu3dService, Gpu3dServiceError,
+    GpuPins, MAX_GPU_BLOBS, MAX_GPU_CONTEXTS, MAX_GPU_PINS, install_gpu3d_device,
 };
 pub use helios_hal::Platform;
 pub use helios_netstack::{

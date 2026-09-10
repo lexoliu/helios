@@ -1,0 +1,251 @@
+package helios:system@0.1.0;
+
+/// The display engine's rendering half, handed whole to one instance.
+///
+/// The kernel owns the device for as long as the machine runs — the
+/// same device the scanout half lives on — because the renderer's
+/// arrival is a property of the host's build, and a host that put one
+/// on the device is not a machine that can do without the owner that
+/// speaks to it. What this interface hands out is the right to feed it:
+/// exactly one instance holds the engine at a time, and everything it
+/// created is released when it lets go or dies.
+///
+/// Nothing the renderer speaks travels through the kernel. A command
+/// buffer is pinned, physically contiguous memory placed inside the
+/// claiming instance's own linear memory; `submit` names a run of it,
+/// the kernel hands the device its physical pages, and the bytes are
+/// the renderer's protocol — virgl's, Venus's, gfxstream's — which this
+/// interface carries and never interprets. Capability sets are the same
+/// shape: `capset` returns the renderer's bytes uninterpreted, so the
+/// contract does not grow when a renderer does.
+///
+/// Memory that is the host's rather than the machine's — a blob's
+/// host-side storage — reaches the instance through the engine's
+/// host-visible aperture: `map-blob` places it there and lands it in the
+/// instance's own linear memory, where the guest's writes are the host's
+/// without a copy through either side.
+///
+/// Completion is a fence stream, not a return value. A submission's
+/// future reports that the device took the command buffer; the `fences`
+/// stream of its context carries the fence itself when the device has
+/// finished the work, and a submission the device refused still retires
+/// its fence, because a reader must never wait for a point that will
+/// not come.
+interface gpu {
+  /// Why a request was refused.
+  enum error {
+    /// This machine has no display device, or the kernel never brought
+    /// one up.
+    unavailable,
+    /// The display engine this machine has renders nothing: the host
+    /// offered no 3D device, so there is no renderer to hold.
+    no-renderer,
+    /// Another instance already holds the 3D engine.
+    already-claimed,
+    /// The 3D engine was taken back before this handle was used. A
+    /// handle that outlived a reclaim names an engine its instance no
+    /// longer holds.
+    not-claimed,
+    /// No capability set of that identifier on this device.
+    no-such-capset,
+    /// The host renderer does not speak the context type that was
+    /// asked for: the capset it names is not one the device carries.
+    unsupported-context,
+    /// This claim already holds as many contexts as it may.
+    too-many-contexts,
+    /// This claim already holds as many blobs as it may.
+    too-many-blobs,
+    /// The blob cannot exist or be used as asked: its size or memory
+    /// kind is not one the device accepts, or it names a context this
+    /// claim does not hold.
+    invalid-blob,
+    /// The blob's host storage has no room left in the engine's
+    /// host-visible aperture.
+    aperture-exhausted,
+    /// The submission does not lie inside the command buffer it names,
+    /// or a range extends past the end of a resource.
+    out-of-bounds,
+    /// The fence does not come after every fence this context has
+    /// already submitted: the stream is one monotonically increasing
+    /// timeline, and a fence that would go backwards is a defect the
+    /// device is not asked to carry.
+    stale-fence,
+    /// The part of this instance's linear memory the kernel devotes to
+    /// the 3D engine has no room left.
+    window-exhausted,
+    /// The pages could not be pinned: the machine has no contiguous
+    /// run of that size left, or the instance's own memory accounting
+    /// refused it.
+    out-of-memory,
+    /// The display engine answered a request with something that does
+    /// not belong to it, which is a device fault rather than a refusal.
+    device-fault,
+  }
+
+  /// One capability set the device carries, as it reports it.
+  ///
+  /// The set itself — whose bytes name the renderer and its features —
+  /// is read with `capset`; this is only its envelope.
+  record capset-info {
+    /// Which set this is: virgl, venus, gfxstream or another.
+    id: u32,
+    /// The newest version of it the host speaks.
+    max-version: u32,
+    /// The largest reply it can produce, in bytes.
+    max-size: u32,
+  }
+
+  /// Where a run of bytes landed in this instance's linear memory.
+  record placement {
+    /// Byte offset of the run.
+    offset: u64,
+    /// How many bytes of linear memory it covers, which is the request
+    /// rounded up to whole pages.
+    length: u64,
+  }
+
+  /// Where a blob's storage lives.
+  enum blob-memory {
+    /// The instance's own pinned pages, which the device reads.
+    guest,
+    /// The renderer's own storage, reachable through the host-visible
+    /// aperture once `map-blob` has placed it there.
+    host3d,
+    /// The renderer's own storage, backed by the instance's pinned
+    /// pages as well: both `buffer` and `map-blob` answer for it.
+    host3d-guest,
+  }
+
+  /// What a blob may be used for.
+  flags blob-usage {
+    /// The blob may be placed in the host-visible aperture.
+    mappable,
+    /// The blob may be shared with another context.
+    shareable,
+    /// The blob may cross device domains.
+    cross-device,
+  }
+
+  /// One command buffer: pinned pages of this instance's own memory
+  /// that a `submit` names a run of.
+  ///
+  /// The bytes at `buffer` are the renderer's command stream, written
+  /// with ordinary stores. The buffer is reusable — a renderer writes
+  /// its commands into it, submits a run, and writes the next commands
+  /// over the same pages once their fence has retired — and dropping it
+  /// only forgets the handle; the pages stay with the claim.
+  resource command-buffer {
+    /// Where this buffer's pages sit in linear memory.
+    buffer: func() -> placement;
+  }
+
+  /// One renderer context: a virgl, Venus or gfxstream instance the
+  /// device multiplexes its command ring across.
+  ///
+  /// Dropping the context lets the renderer's half go; the device is
+  /// told by the task that owns it.
+  resource context {
+    /// Pin `bytes` of this instance's memory as a command buffer.
+    ///
+    /// The pages are committed from the instance's own pool into the
+    /// part of its linear memory the kernel devotes to the 3D engine,
+    /// and are what `submit` names a run of.
+    commands: async func(bytes: u64) -> result<command-buffer, error>;
+
+    /// Hand the device `length` bytes of `commands` starting at
+    /// `offset`, fenced at `fence`.
+    ///
+    /// The returned future resolves when the device has taken the
+    /// buffer, refused or not; the fence itself is retired on the
+    /// context's `fences` stream at the same moment, because a
+    /// submission's completion is the signal. `fence` must come after
+    /// every fence this context has already submitted.
+    submit: async func(commands: borrow<command-buffer>, offset: u64, length: u64, fence: u64) -> result<_, error>;
+
+    /// Every fence this context retires, in order.
+    ///
+    /// One item per fence the device finished, delivered as a stream so
+    /// a render loop can be driven by it rather than by holding a
+    /// future per submission. A reader that lags sees the newest fence
+    /// rather than every one between: retirement is monotone, so the
+    /// newest answers for all that came before it.
+    fences: func() -> stream<u64>;
+
+    /// Make `blob` reachable from this context's command stream.
+    attach: async func(blob: borrow<blob>) -> result<_, error>;
+
+    /// Take `blob` back out of this context's command stream.
+    detach: async func(blob: borrow<blob>) -> result<_, error>;
+  }
+
+  /// One blob resource: an object the renderer allocates, sized by the
+  /// guest and placed by the device.
+  ///
+  /// Where its bytes live depends on its memory kind: a guest blob's
+  /// are this instance's pinned pages at `buffer`; a host3d blob's are
+  /// the renderer's, reached through `map-blob`. Dropping the blob destroys
+  /// it; its pages or aperture placement go back with the claim.
+  resource blob {
+    /// Where this blob's own pages sit in linear memory, for the
+    /// guest-backed kinds; `none` for a host3d blob, which has none.
+    buffer: func() -> option<placement>;
+
+    /// Place this blob's host storage in the engine's host-visible
+    /// aperture and report where it landed in this instance's linear
+    /// memory.
+    ///
+    /// The placement is a window onto memory the machine does not own:
+    /// the bytes behind it are the renderer's, and the instance's
+    /// writes to them are the host's without a copy through either
+    /// side.
+    map-blob: async func() -> result<placement, error>;
+
+    /// Take this blob back out of the aperture.
+    unmap-blob: async func() -> result<_, error>;
+  }
+
+  /// One instance's exclusive hold on the machine's 3D engine.
+  ///
+  /// Dropping it — or dying while holding it — releases every context
+  /// and blob, unmaps every aperture placement and hands every pinned
+  /// page back to the instance's pool before the engine is offered to
+  /// anyone else.
+  resource gpu {
+    /// Every capability set the device carries, in its own order.
+    capsets: async func() -> result<list<capset-info>, error>;
+
+    /// The bytes of one capability set, at the newest version the host
+    /// speaks.
+    ///
+    /// The payload is the renderer's own encoding — feature bits,
+    /// version strings, whatever the set's format is — carried whole
+    /// and never interpreted: a new renderer needs a new plugin, not a
+    /// new interface.
+    capset: async func(id: u32) -> result<list<u8>, error>;
+
+    /// Open a renderer context of the type `capset` names.
+    ///
+    /// The capset identifier selects which renderer the context speaks:
+    /// virgl for a virglrenderer host, venus for a Vulkan one. `name`
+    /// is the debugging label the device carries, and may be empty.
+    create-context: async func(capset: u32, name: string) -> result<context, error>;
+
+    /// Create a blob resource of `size` bytes.
+    ///
+    /// `context` names the renderer that owns it — blobs without a
+    /// context cannot be created, because the resource belongs to a
+    /// renderer's address space. `memory` says where its storage lives
+    /// and `usage` what it may be used for; `host-id` lets the host
+    /// share the resource with other guests, and is `0` when it does
+    /// not.
+    create-blob: async func(context: borrow<context>, memory: blob-memory, usage: blob-usage, size: u64, host-id: u64) -> result<blob, error>;
+  }
+
+  /// Take exclusive ownership of the machine's 3D engine.
+  ///
+  /// Refused `unavailable` on a machine with no display device,
+  /// `no-renderer` on one whose device offers no 3D, and
+  /// `already-claimed` while another instance holds it or while its
+  /// resources are still being handed back.
+  claim: func() -> result<gpu, error>;
+}

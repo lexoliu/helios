@@ -1,0 +1,721 @@
+//! The 3D path's own tests.
+//!
+//! The device side is a recording fake: every call the owner tasks make
+//! is appended to a log, so a test asserts on the exact sequence the
+//! display engine was asked for rather than on what the kernel
+//! intended. The address space is the recording surface
+//! `device::platform`'s test hooks install, so a test can also see when
+//! a command buffer's pages were committed and when they went back.
+
+use alloc::vec::Vec;
+use core::future::Future;
+use core::pin::pin;
+use core::sync::atomic::AtomicBool;
+
+use futures::channel::oneshot;
+use futures_lite::future::block_on;
+use helios_hal::device::{DeviceRegion, DeviceRegionAttributes};
+use helios_hal::display::{
+    BlobId, BlobMemory, BlobRequest, BlobUsage, CapsetId, CapsetInfo, CapsetList, ContextId,
+    ContextName, FenceId, Gpu3d, Gpu3dResult,
+};
+use helios_hal::iommu::PhysicalRange;
+use helios_hal::vmm::VirtAddr;
+use std::sync::Mutex;
+use triomphe::Arc;
+
+use crate::component::ProviderReceiver;
+use crate::device::{DeviceWindow, test_hooks};
+use crate::display::SequenceSignal;
+use crate::test_support::TestCpu;
+
+use super::owner::{gpu3d_channels, serve_control, serve_submit};
+use super::service::{Gpu3dRequest, Gpu3dService, Gpu3dShared, SubmitRequest};
+use super::{Gpu3dOwnership, Gpu3dServiceError};
+
+/// The one linear-memory reservation the kernel builds, and where the
+/// tests pretend it sits.
+const RESERVATION_BYTES: u64 = 1 << 32;
+const MEMORY_BASE: usize = 0x1_0000_0000;
+
+/// The capset the fake renderer speaks.
+const CAPSET: CapsetId = CapsetId::VENUS;
+
+/// One thing the display engine's rendering half was asked to do.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Call {
+    Capsets,
+    Capset(CapsetId, u32),
+    CreateContext(CapsetId),
+    DestroyContext(ContextId),
+    CreateBlob(ContextId, BlobMemory, u64),
+    DestroyBlob(BlobId),
+    MapBlob(BlobId),
+    UnmapBlob(BlobId),
+    Attach(ContextId, BlobId),
+    Detach(ContextId, BlobId),
+    Submit(ContextId, FenceId),
+}
+
+/// A display engine that records what its rendering half was asked and
+/// always agrees.
+struct FakeGpu3d {
+    calls: Mutex<Vec<Call>>,
+    /// The capability-set payload [`Gpu3d::capset`] writes back.
+    capset_bytes: Vec<u8>,
+    /// Set to make every submission fail, as a device refusing a
+    /// command stream does.
+    refuse_submits: AtomicBool,
+    next_context: Mutex<u32>,
+    next_blob: Mutex<u32>,
+}
+
+impl FakeGpu3d {
+    fn new() -> Self {
+        Self {
+            calls: Mutex::new(Vec::new()),
+            capset_bytes: alloc::vec![0xde, 0xad, 0xbe, 0xef],
+            refuse_submits: AtomicBool::new(false),
+            next_context: Mutex::new(1),
+            next_blob: Mutex::new(1),
+        }
+    }
+
+    fn record(&self, call: Call) {
+        self.calls.lock().expect("no test panics here").push(call);
+    }
+
+    fn calls(&self) -> Vec<Call> {
+        self.calls.lock().expect("no test panics here").clone()
+    }
+}
+
+impl Gpu3d for FakeGpu3d {
+    fn renders(&self) -> bool {
+        true
+    }
+
+    async fn capsets(&self) -> Gpu3dResult<CapsetList> {
+        self.record(Call::Capsets);
+        let mut list = CapsetList::new();
+        list.push(CapsetInfo {
+            id: CAPSET,
+            max_version: 1,
+            max_size: 4,
+        });
+        Ok(list)
+    }
+
+    async fn capset(&self, id: CapsetId, version: u32, out: &mut [u8]) -> Gpu3dResult<usize> {
+        self.record(Call::Capset(id, version));
+        let written = self.capset_bytes.len().min(out.len());
+        out[..written].copy_from_slice(&self.capset_bytes[..written]);
+        Ok(written)
+    }
+
+    async fn create_context(&self, capset: CapsetId, _name: ContextName) -> Gpu3dResult<ContextId> {
+        let id = {
+            let mut next = self.next_context.lock().expect("no test panics here");
+            let id = ContextId::new(*next);
+            *next += 1;
+            id
+        };
+        self.record(Call::CreateContext(capset));
+        Ok(id)
+    }
+
+    async fn destroy_context(&self, context: ContextId) -> Gpu3dResult<()> {
+        self.record(Call::DestroyContext(context));
+        Ok(())
+    }
+
+    async fn create_blob(&self, request: BlobRequest<'_>) -> Gpu3dResult<BlobId> {
+        let id = {
+            let mut next = self.next_blob.lock().expect("no test panics here");
+            let id = BlobId::new(*next);
+            *next += 1;
+            id
+        };
+        self.record(Call::CreateBlob(
+            request.context,
+            request.memory,
+            request.size,
+        ));
+        Ok(id)
+    }
+
+    async fn destroy_blob(&self, blob: BlobId) -> Gpu3dResult<()> {
+        self.record(Call::DestroyBlob(blob));
+        Ok(())
+    }
+
+    async fn map_blob(&self, blob: BlobId) -> Gpu3dResult<DeviceRegion> {
+        self.record(Call::MapBlob(blob));
+        Ok(DeviceRegion::new(
+            PhysicalRange::new(0x8_0000_0000, 0x1000),
+            DeviceRegionAttributes::PREFETCHABLE_MEMORY,
+        ))
+    }
+
+    async fn unmap_blob(&self, blob: BlobId) -> Gpu3dResult<()> {
+        self.record(Call::UnmapBlob(blob));
+        Ok(())
+    }
+
+    async fn attach_resource(&self, context: ContextId, blob: BlobId) -> Gpu3dResult<()> {
+        self.record(Call::Attach(context, blob));
+        Ok(())
+    }
+
+    async fn detach_resource(&self, context: ContextId, blob: BlobId) -> Gpu3dResult<()> {
+        self.record(Call::Detach(context, blob));
+        Ok(())
+    }
+
+    async fn submit(
+        &self,
+        context: ContextId,
+        commands: PhysicalRange,
+        fence: FenceId,
+    ) -> Gpu3dResult<()> {
+        self.record(Call::Submit(context, fence));
+        if self
+            .refuse_submits
+            .load(core::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(helios_hal::display::Gpu3dError::Unspecified);
+        }
+        assert!(commands.bytes > 0, "a command buffer covers bytes");
+        Ok(())
+    }
+
+    async fn fences(&self, _context: ContextId, after: FenceId) -> Gpu3dResult<FenceId> {
+        // The kernel never asks the device for a fence: the submit
+        // server's completion is the signal. Resolving with the point
+        // asked after keeps a stray caller honest without parking it.
+        Ok(after)
+    }
+}
+
+/// The 3D window of an instance whose memory sits at [`MEMORY_BASE`].
+fn window() -> DeviceWindow {
+    DeviceWindow::top_of(VirtAddr::new(MEMORY_BASE), RESERVATION_BYTES)
+        .below(crate::device::DISPLAY_WINDOW_BYTES)
+        .below(crate::device::SURFACE_WINDOW_BYTES)
+        .below(crate::device::GPU_WINDOW_BYTES)
+}
+
+/// Run `work` with both servers running beside it.
+///
+/// The servers never return, so the result is the work's; what they are
+/// there for is to answer the requests the work makes.
+fn with_servers<T>(
+    device: &FakeGpu3d,
+    shared: &Gpu3dShared,
+    control: &ProviderReceiver<Gpu3dRequest>,
+    submit: &ProviderReceiver<SubmitRequest>,
+    work: impl Future<Output = T>,
+) -> T {
+    let cpu = TestCpu::without_entropy();
+    block_on(async {
+        let work = pin!(work);
+        let servers = pin!(async {
+            futures::future::join(
+                serve_control(device, shared, control),
+                serve_submit(device, shared, submit, &cpu),
+            )
+            .await;
+        });
+        futures_lite::future::or(async { Some(work.await) }, async {
+            servers.await;
+            None
+        })
+        .await
+        .expect("the 3D servers do not end on their own")
+    })
+}
+
+/// A claim, its arena, and the queues into the servers.
+fn claimed(shared: &Arc<Gpu3dShared>) -> Gpu3dOwnership {
+    let service = Gpu3dService::from_shared(shared.clone());
+    let mut ownership = Gpu3dOwnership::new();
+    ownership
+        .claim(&service, window())
+        .expect("the engine is free");
+    ownership
+}
+
+/// Ask the control server to open one context for `ownership`.
+async fn create_context(ownership: &Gpu3dOwnership) -> super::ContextRecord {
+    let claim = ownership.claim_ref().expect("the claim is held");
+    let (reply, answer) = oneshot::channel();
+    claim
+        .sender()
+        .control(
+            Gpu3dRequest::CreateContext {
+                generation: claim.generation(),
+                capset: CAPSET,
+                name: ContextName::new(),
+                reply,
+            },
+            answer,
+        )
+        .await
+        .expect("the fake engine agrees")
+}
+
+/// An instance is refused the engine another instance holds, and is
+/// still refused while the first owner's resources are being handed
+/// back: the engine is not free until the display engine says it is.
+#[test]
+fn a_second_instance_is_refused_the_engine_the_first_holds() {
+    test_hooks::install();
+    let (shared, _control, _submit) = gpu3d_channels(true);
+    let service = Gpu3dService::from_shared(shared.clone());
+
+    let first = service.claim().expect("the engine is free");
+    assert_eq!(
+        service.claim().err(),
+        Some(Gpu3dServiceError::AlreadyClaimed)
+    );
+
+    drop(first);
+    assert_eq!(
+        service.claim().err(),
+        Some(Gpu3dServiceError::AlreadyClaimed)
+    );
+}
+
+/// A device that renders nothing still answers the claim — with
+/// `no-renderer` rather than `unavailable`, because the machine has a
+/// display engine; it simply has no renderer on it.
+#[test]
+fn an_engine_that_renders_nothing_cannot_be_claimed() {
+    test_hooks::install();
+    let (shared, _control, _submit) = gpu3d_channels(false);
+    let service = Gpu3dService::from_shared(shared);
+
+    assert_eq!(service.claim().err(), Some(Gpu3dServiceError::NoRenderer));
+    assert!(!service.is_claimed());
+}
+
+/// One instance holds one engine: a second claim from the same store
+/// would make the release ambiguous.
+#[test]
+fn one_instance_holds_the_engine_once() {
+    test_hooks::install();
+    let (shared, _control, _submit) = gpu3d_channels(true);
+    let service = Gpu3dService::from_shared(shared.clone());
+    let mut ownership = Gpu3dOwnership::new();
+
+    ownership
+        .claim(&service, window())
+        .expect("the engine is free");
+    assert_eq!(
+        ownership.claim(&service, window()).err(),
+        Some(Gpu3dServiceError::AlreadyClaimed)
+    );
+}
+
+/// A command buffer is the instance's own memory: committed from its
+/// pool, counted against it, and inside its own window.
+#[test]
+fn a_command_buffer_is_pinned_in_the_instance_s_own_window() {
+    test_hooks::install();
+    let (shared, _control, _submit) = gpu3d_channels(true);
+    let mut ownership = claimed(&shared);
+    let before = test_hooks::shootdowns();
+
+    let frame = ownership.pin(4096).expect("the window has room");
+
+    assert_eq!(ownership.pinned_bytes(), 4096);
+    assert_eq!(
+        test_hooks::shootdowns() - before,
+        1,
+        "one contiguous commit, one shootdown"
+    );
+    assert_eq!(frame.bytes, 4096);
+    assert!(
+        !frame.is_device(),
+        "a command buffer is the instance's own pages"
+    );
+}
+
+/// A window a device published lands in the instance's memory without a
+/// page being committed: the memory behind it is the renderer's.
+#[test]
+fn a_mapped_blob_is_a_device_window_not_a_commit() {
+    test_hooks::install();
+    let (shared, _control, _submit) = gpu3d_channels(true);
+    let mut ownership = claimed(&shared);
+    let before = test_hooks::changes().len();
+
+    let frame = ownership
+        .map_blob(DeviceRegion::new(
+            PhysicalRange::new(0x8_0000_0000, 0x1000),
+            DeviceRegionAttributes::PREFETCHABLE_MEMORY,
+        ))
+        .expect("the window has room");
+
+    assert!(frame.is_device(), "a mapped blob is a window, not pages");
+    assert!(
+        matches!(
+            test_hooks::changes()[before],
+            test_hooks::MappingChange::MapDevice(_)
+        ),
+        "the aperture is mapped like a device's own frames"
+    );
+}
+
+/// The context type is checked against the device's own capability
+/// sets: an engine that negotiated no context-init would silently hand
+/// a venus asker a virgl context, and the guest could not tell.
+#[test]
+fn a_context_is_refused_for_a_renderer_the_host_does_not_speak() {
+    test_hooks::install();
+    let (shared, control, submit) = gpu3d_channels(true);
+    let device = FakeGpu3d::new();
+    let ownership = claimed(&shared);
+
+    with_servers(&device, &shared, &control, &submit, async {
+        let claim = ownership.claim_ref().expect("the claim is held");
+        let (reply, answer) = oneshot::channel();
+        let refused = claim
+            .sender()
+            .control(
+                Gpu3dRequest::CreateContext {
+                    generation: claim.generation(),
+                    capset: CapsetId::GFXSTREAM_VULKAN,
+                    name: ContextName::new(),
+                    reply,
+                },
+                answer,
+            )
+            .await;
+        assert_eq!(refused.err(), Some(Gpu3dServiceError::UnsupportedContext));
+    });
+
+    assert_eq!(
+        device.calls(),
+        alloc::vec![Call::Capsets],
+        "the context never reached the device"
+    );
+}
+
+/// A capability set is the renderer's bytes: read once for the list,
+/// then fetched whole for the guest that asked, and never interpreted.
+#[test]
+fn a_capset_s_bytes_reach_their_reader_undecoded() {
+    test_hooks::install();
+    let (shared, control, submit) = gpu3d_channels(true);
+    let device = FakeGpu3d::new();
+    let ownership = claimed(&shared);
+
+    with_servers(&device, &shared, &control, &submit, async {
+        let claim = ownership.claim_ref().expect("the claim is held");
+        let (reply, answer) = oneshot::channel();
+        let bytes = claim
+            .sender()
+            .control(
+                Gpu3dRequest::Capset {
+                    generation: claim.generation(),
+                    id: CAPSET,
+                    reply,
+                },
+                answer,
+            )
+            .await
+            .expect("the fake engine agrees");
+        assert_eq!(bytes, alloc::vec![0xde, 0xad, 0xbe, 0xef]);
+
+        let (reply, answer) = oneshot::channel();
+        let refused = claim
+            .sender()
+            .control(
+                Gpu3dRequest::Capset {
+                    generation: claim.generation(),
+                    id: CapsetId::VIRGL,
+                    reply,
+                },
+                answer,
+            )
+            .await;
+        assert_eq!(refused.err(), Some(Gpu3dServiceError::NoSuchCapset));
+    });
+}
+
+/// A blob names the context whose renderer owns it; a context the claim
+/// never opened is not a place a resource can live.
+#[test]
+fn a_blob_for_a_context_the_claim_never_opened_is_refused() {
+    test_hooks::install();
+    let (shared, control, submit) = gpu3d_channels(true);
+    let device = FakeGpu3d::new();
+    let mut ownership = claimed(&shared);
+
+    with_servers(&device, &shared, &control, &submit, async {
+        let frame = ownership.pin(4096).expect("the window has room");
+        let claim = ownership.claim_ref().expect("the claim is held");
+        let (reply, answer) = oneshot::channel();
+        let refused = claim
+            .sender()
+            .control(
+                Gpu3dRequest::CreateBlob {
+                    generation: claim.generation(),
+                    spec: crate::gpu::BlobSpec {
+                        context: ContextId::new(77),
+                        memory: BlobMemory::Guest,
+                        usage: BlobUsage::empty(),
+                        size: 4096,
+                        host_id: 0,
+                        backing: Some(frame.backing),
+                    },
+                    reply,
+                },
+                answer,
+            )
+            .await;
+        assert_eq!(refused.err(), Some(Gpu3dServiceError::InvalidBlob));
+    });
+
+    assert!(
+        !device
+            .calls()
+            .iter()
+            .any(|call| matches!(call, Call::CreateBlob(..))),
+        "the blob never reached the device"
+    );
+}
+
+/// A submission's completion is its fence: the context's signal carries
+/// it whether the device agreed with the command stream or not.
+#[test]
+fn a_submission_publishes_its_fence() {
+    test_hooks::install();
+    let (shared, control, submit) = gpu3d_channels(true);
+    let device = FakeGpu3d::new();
+    let mut ownership = claimed(&shared);
+
+    with_servers(&device, &shared, &control, &submit, async {
+        let context = create_context(&ownership).await;
+        let frame = ownership.pin(4096).expect("the window has room");
+        let claim = ownership.claim_ref().expect("the claim is held");
+
+        let (reply, answer) = oneshot::channel();
+        claim
+            .sender()
+            .submit(
+                SubmitRequest::Submit {
+                    generation: claim.generation(),
+                    context: context.id,
+                    commands: frame.physical(),
+                    fence: FenceId::new(7),
+                    fences: context.fences.clone(),
+                    reply,
+                },
+                answer,
+            )
+            .await
+            .expect("the fake engine agrees");
+        assert_eq!(
+            context.fences.sequence(),
+            7,
+            "the fence stream sees the fence the submission carried"
+        );
+    });
+
+    assert!(
+        device
+            .calls()
+            .contains(&Call::Submit(ContextId::new(1), FenceId::new(7))),
+        "the device saw the submission"
+    );
+}
+
+/// A command the device refuses still retires its fence: a reader of
+/// the context's stream must not wait for a point the device decided
+/// would not come.
+#[test]
+fn a_rejected_submission_still_retires_its_fence() {
+    test_hooks::install();
+    let (shared, control, submit) = gpu3d_channels(true);
+    let device = FakeGpu3d::new();
+    device
+        .refuse_submits
+        .store(true, core::sync::atomic::Ordering::Relaxed);
+    let mut ownership = claimed(&shared);
+
+    with_servers(&device, &shared, &control, &submit, async {
+        let context = create_context(&ownership).await;
+        let frame = ownership.pin(4096).expect("the window has room");
+        let claim = ownership.claim_ref().expect("the claim is held");
+
+        let (reply, answer) = oneshot::channel();
+        let refused = claim
+            .sender()
+            .submit(
+                SubmitRequest::Submit {
+                    generation: claim.generation(),
+                    context: context.id,
+                    commands: frame.physical(),
+                    fence: FenceId::new(3),
+                    fences: context.fences.clone(),
+                    reply,
+                },
+                answer,
+            )
+            .await;
+        assert!(refused.is_err(), "the device refused the command");
+        assert_eq!(context.fences.sequence(), 3, "its fence retired anyway");
+    });
+}
+
+/// Letting go gives the aperture placements back before the blobs, and
+/// the blobs before the contexts: a renderer still holding a context
+/// that names dead resources would be reading guest pages on their way
+/// back to a pool.
+#[test]
+fn a_released_claim_unmaps_then_destroys_then_frees() {
+    test_hooks::install();
+    let (shared, control, submit) = gpu3d_channels(true);
+    let device = FakeGpu3d::new();
+    let mut ownership = claimed(&shared);
+
+    with_servers(&device, &shared, &control, &submit, async {
+        let context = create_context(&ownership).await;
+        let claim = ownership.claim_ref().expect("the claim is held");
+        let generation = claim.generation();
+        let sender = claim.sender();
+        let frame = ownership.pin(4096).expect("the window has room");
+
+        let (reply, answer) = oneshot::channel();
+        let blob = sender
+            .control(
+                Gpu3dRequest::CreateBlob {
+                    generation,
+                    spec: crate::gpu::BlobSpec {
+                        context: context.id,
+                        memory: BlobMemory::Host3d,
+                        usage: BlobUsage::MAPPABLE,
+                        size: 4096,
+                        host_id: 0,
+                        backing: Some(frame.backing),
+                    },
+                    reply,
+                },
+                answer,
+            )
+            .await
+            .expect("the fake engine agrees");
+
+        let (reply, answer) = oneshot::channel();
+        sender
+            .control(
+                Gpu3dRequest::MapBlob {
+                    generation,
+                    blob,
+                    reply,
+                },
+                answer,
+            )
+            .await
+            .expect("the fake engine agrees");
+
+        let committed = test_hooks::changes().len();
+
+        // Killing the instance is dropping its store, which is this.
+        ownership.release();
+        assert_eq!(
+            test_hooks::changes().len(),
+            committed,
+            "the pages are not freed by the drop itself"
+        );
+
+        crate::yield_now().await;
+        crate::yield_now().await;
+    });
+
+    let calls = device.calls();
+    let unmap = calls
+        .iter()
+        .position(|call| matches!(call, Call::UnmapBlob(_)))
+        .expect("the blob leaves the aperture");
+    let destroy_blob = calls
+        .iter()
+        .position(|call| matches!(call, Call::DestroyBlob(_)))
+        .expect("the blob is destroyed");
+    let destroy_context = calls
+        .iter()
+        .position(|call| matches!(call, Call::DestroyContext(_)))
+        .expect("the context is destroyed");
+    assert!(
+        unmap < destroy_blob && destroy_blob < destroy_context,
+        "the renderer stops placing the storage before it forgets the resource"
+    );
+    assert!(
+        matches!(
+            test_hooks::changes().last(),
+            Some(test_hooks::MappingChange::Released(_))
+        ),
+        "the pages go back once the renderer has let go"
+    );
+
+    let service = Gpu3dService::from_shared(shared.clone());
+    assert!(
+        service.claim().is_ok(),
+        "the engine is free once its resources are back"
+    );
+}
+
+/// A request made under a claim that has ended is dropped rather than
+/// served: a dead plugin must not drive a live one's renderer.
+#[test]
+fn a_request_that_outlived_its_claim_is_not_served() {
+    test_hooks::install();
+    let (shared, control, submit) = gpu3d_channels(true);
+    let device = FakeGpu3d::new();
+    let mut ownership = claimed(&shared);
+    let stale = ownership.claim_ref().expect("the claim is held").sender();
+    let stale_generation = stale.generation();
+
+    with_servers(&device, &shared, &control, &submit, async {
+        // The first claim ends and a second one takes the engine.
+        ownership.release();
+        crate::yield_now().await;
+        crate::yield_now().await;
+        let _second = claimed(&shared);
+
+        let (reply, answer) = oneshot::channel();
+        let refused = stale
+            .control(
+                Gpu3dRequest::Capsets {
+                    generation: stale_generation,
+                    reply,
+                },
+                answer,
+            )
+            .await;
+        assert_eq!(refused.err(), Some(Gpu3dServiceError::Closed));
+
+        let (reply, answer) = oneshot::channel();
+        let refused = stale
+            .submit(
+                SubmitRequest::Submit {
+                    generation: stale_generation,
+                    context: ContextId::new(1),
+                    commands: PhysicalRange::new(0x4000_0000, 4096),
+                    fence: FenceId::new(1),
+                    fences: Arc::new(SequenceSignal::new()),
+                    reply,
+                },
+                answer,
+            )
+            .await;
+        assert_eq!(refused.err(), Some(Gpu3dServiceError::Closed));
+    });
+
+    assert!(
+        device.calls().is_empty(),
+        "nothing reached the device under a claim that had ended"
+    );
+}

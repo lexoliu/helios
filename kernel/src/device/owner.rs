@@ -17,11 +17,13 @@
 use helios_hal::vmm::VirtAddr;
 
 use crate::display::{DisplayOwnership, DisplayService, DisplayServiceError};
+use crate::gpu::{Gpu3dOwnership, Gpu3dService, Gpu3dServiceError};
 use crate::surface::{SurfaceOwnership, SurfaceServiceError};
 
 use super::grant::{DeviceName, GrantError};
 use super::lease::{
-    DEVICE_WINDOW_BYTES, DISPLAY_WINDOW_BYTES, DeviceWindow, GrantLease, SURFACE_WINDOW_BYTES,
+    DEVICE_WINDOW_BYTES, DISPLAY_WINDOW_BYTES, DeviceWindow, GPU_WINDOW_BYTES, GrantLease,
+    SURFACE_WINDOW_BYTES,
 };
 use super::registry::DeviceGrantRegistry;
 
@@ -42,13 +44,15 @@ pub struct LinearMemory {
 
 /// One instance's hold on the device path.
 ///
-/// Two things can put hardware inside an instance's memory: a device
-/// grant, whose registers and rings go in the device window, and a
-/// display claim, whose frame buffers go in the display window
-/// immediately below it. Both are here because both are bounded by the
-/// same fact — where this instance's linear memory is and how far it has
-/// grown — and an instance that holds one, the other, or both must have
-/// its growth capped below the lowest window it holds.
+/// Four things can put memory inside an instance's own: a device grant,
+/// whose registers and rings go in the device window; a display claim,
+/// whose frame buffers go in the display window immediately below it;
+/// the client windows of the surface path below that; and a claim on
+/// the 3D engine, whose command buffers and mapped host blobs go in the
+/// window below those. They are all here because they are all bounded
+/// by the same fact — where this instance's linear memory is and how far
+/// it has grown — and an instance that holds any of them must have its
+/// growth capped below the lowest window it holds.
 #[derive(Default)]
 pub struct DeviceOwnership {
     /// Resolved once, after the instance is built. Absent on an
@@ -66,6 +70,8 @@ pub struct DeviceOwnership {
     /// everybody's it composes. Empty on every instance that neither
     /// asks for a window nor composes the desktop.
     surfaces: SurfaceOwnership,
+    /// The machine's 3D engine, once this instance claimed it.
+    gpu: Gpu3dOwnership,
 }
 
 impl DeviceOwnership {
@@ -76,6 +82,7 @@ impl DeviceOwnership {
             lease: None,
             display: DisplayOwnership::new(),
             surfaces: SurfaceOwnership::new(),
+            gpu: Gpu3dOwnership::new(),
         }
     }
 
@@ -114,7 +121,8 @@ impl DeviceOwnership {
             .map(|window| window.offset());
         let display = self.display.window().map(|window| window.offset());
         let surfaces = self.surfaces.window().map(|window| window.offset());
-        [device, display, surfaces].into_iter().flatten().min()
+        let gpu = self.gpu.window().map(|window| window.offset());
+        [device, display, surfaces, gpu].into_iter().flatten().min()
     }
 
     /// The window this instance's device mappings would live in.
@@ -152,6 +160,56 @@ impl DeviceOwnership {
                     .below(DISPLAY_WINDOW_BYTES)
                     .below(SURFACE_WINDOW_BYTES)
             })
+    }
+
+    /// The window this instance's renderer state would live in, which
+    /// is the span immediately below the surface window.
+    ///
+    /// Below rather than beside, for the reason the surface window is:
+    /// one instance may hold the display, draw in a window of its own
+    /// *and* drive the renderer, and the growth cap has to be under the
+    /// lowest window it holds whichever of them that is.
+    pub fn gpu_window(&self) -> Option<DeviceWindow> {
+        self.memory
+            .filter(|memory| {
+                memory.reservation_bytes
+                    > DEVICE_WINDOW_BYTES
+                        + DISPLAY_WINDOW_BYTES
+                        + SURFACE_WINDOW_BYTES
+                        + GPU_WINDOW_BYTES
+            })
+            .map(|memory| {
+                DeviceWindow::top_of(memory.base, memory.reservation_bytes)
+                    .below(DISPLAY_WINDOW_BYTES)
+                    .below(SURFACE_WINDOW_BYTES)
+                    .below(GPU_WINDOW_BYTES)
+            })
+    }
+
+    /// This instance's side of the 3D path.
+    pub const fn gpu(&self) -> &Gpu3dOwnership {
+        &self.gpu
+    }
+
+    /// This instance's side of the 3D path, to act on.
+    pub const fn gpu_mut(&mut self) -> &mut Gpu3dOwnership {
+        &mut self.gpu
+    }
+
+    /// Take exclusive ownership of the machine's 3D engine.
+    ///
+    /// Refused when the instance's memory has already grown over the
+    /// window its command buffers and its mapped blobs would go in, for
+    /// the same reason a display claim is: they would land on memory it
+    /// is using.
+    pub fn claim_gpu(&mut self, service: &Gpu3dService) -> Result<(), Gpu3dServiceError> {
+        let window = self
+            .gpu_window()
+            .ok_or(Gpu3dServiceError::WindowExhausted)?;
+        if self.high_water_bytes > window.offset() {
+            return Err(Gpu3dServiceError::WindowExhausted);
+        }
+        self.gpu.claim(service, window)
     }
 
     /// This instance's side of the surface path.
