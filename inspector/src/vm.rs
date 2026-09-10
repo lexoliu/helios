@@ -6,7 +6,7 @@ use std::os::unix::fs::symlink;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use askama::Template;
 use clap::{Args as ClapArgs, Subcommand, ValueEnum};
@@ -16,6 +16,7 @@ use helios_hal::fs::HOST_SHARE_MOUNT_TAG;
 use helios_inspector_protocol::debugger::filesystem as debugger_fs;
 use helios_inspector_protocol::system::profiling as system_profiling;
 use helios_inspector_protocol::system::programs as system_programs;
+use helios_inspector_protocol::system::stats;
 use helios_profdata::{
     KernelProfileStore, KernelProfileStoreError, ProfileDigest, ProfileUseError,
 };
@@ -24,6 +25,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 
+use crate::serial::RpcClient;
 use crate::stats_tui::format_bytes;
 use crate::system::{self, SystemError};
 use crate::workload_bench::{
@@ -423,6 +425,20 @@ pub(crate) enum VmSessionError {
         #[source]
         source: QmpError,
     },
+    #[error("the guest reports no input devices for an input script to drive")]
+    NoInputDevices,
+    #[error(
+        "timed out after {seconds}s waiting for the guest to claim its input devices; \
+         still unclaimed: {devices}"
+    )]
+    InputClaimTimedOut { seconds: u64, devices: String },
+    #[error("failed to read the guest's input devices while waiting for their claims: {source}")]
+    InputClaimProbe {
+        #[source]
+        source: SystemError,
+    },
+    #[error("the session ended while the input gate was asking the guest about its devices")]
+    InputGateSessionEnded,
     #[error("{0}")]
     Size(#[from] SizeError),
     #[error("failed to set the balloon target to {target}: {source}")]
@@ -563,6 +579,9 @@ const BALLOON_IOTHREAD_ID: &str = "balloon-io";
 /// How long the guest's reported balloon size has to hold still before a
 /// wait calls it settled short of the target it was given.
 const BALLOON_STILL_FOR: Duration = Duration::from_secs(10);
+/// How often the input gate re-asks the guest while a device it
+/// reported is still unclaimed.
+const INPUT_CLAIM_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// How much of QEMU's log a failed session quotes.
 ///
 /// The log holds QEMU's own stdout and stderr and stays small, because
@@ -1608,6 +1627,17 @@ pub(crate) struct ScreendumpCommand {
     #[arg(long, default_value_t = 0)]
     input_interval_ms: u64,
 
+    /// How long `--input` waits for the guest to claim every input
+    /// device it reports before the first statement is sent.
+    ///
+    /// The wait is on the guest's own claim state, not on a delay: a
+    /// report sent while nobody holds the device is drained by the
+    /// kernel rather than queued for whoever claims it next. When the
+    /// wait runs out the session fails, naming the devices still
+    /// unclaimed.
+    #[arg(long, default_value_t = 30)]
+    input_wait_seconds: u64,
+
     /// Stop the instance registered under this name once the first
     /// capture is taken.
     ///
@@ -1670,8 +1700,21 @@ pub(crate) struct InputCommand {
     /// A program that reads input has to have claimed its devices
     /// before the host drives them: events sent while nobody holds a
     /// device are drained by the kernel and are not the guest's to see.
+    /// The claim itself is what `--input-wait-seconds` gates on; this is
+    /// slack on top of it for a program that needs it.
     #[arg(long, default_value_t = 0)]
     settle_seconds: u64,
+
+    /// How long to wait for the guest to claim every input device it
+    /// reports before the first statement is sent.
+    ///
+    /// The wait is on the guest's own claim state, not on a delay: a
+    /// report sent while nobody holds the device is drained by the
+    /// kernel rather than queued for whoever claims it next. When the
+    /// wait runs out the session fails, naming the devices still
+    /// unclaimed.
+    #[arg(long, default_value_t = 30)]
+    input_wait_seconds: u64,
 
     /// How long to wait, after the script, for the `--run` program to
     /// finish, so that whatever it printed reaches this session's
@@ -2810,7 +2853,7 @@ enum VsockSessionError {
 /// `helios:system/stats` says how much of its user memory the balloon is
 /// holding and how much it has named as free.
 fn run_balloon(
-    mut client: crate::serial::RpcClient,
+    mut client: RpcClient,
     command: BalloonCommand,
     qmp_socket: &Path,
 ) -> Result<(), VmSessionError> {
@@ -2843,7 +2886,7 @@ fn run_balloon(
 /// produces an image — QEMU's blank scanout — and that is the evidence
 /// that the machine had a display at all.
 fn run_screendump(
-    client: crate::serial::RpcClient,
+    client: RpcClient,
     command: ScreendumpCommand,
     qmp_socket: &Path,
 ) -> Result<(), VmSessionError> {
@@ -2875,7 +2918,7 @@ fn run_screendump(
 /// asks something of the guest half-way through — a kill between two
 /// captures — has nowhere to ask from otherwise.
 fn alongside_guest_session<HostSide>(
-    client: crate::serial::RpcClient,
+    client: RpcClient,
     host_side: HostSide,
     requests: async_channel::Receiver<GuestRequest>,
 ) -> Result<(), VmSessionError>
@@ -2910,6 +2953,14 @@ enum GuestRequest {
         name: String,
         reply: async_channel::Sender<Result<u64, SystemError>>,
     },
+    /// The input devices the guest reports right now and who holds each.
+    ///
+    /// The input gate asks once per poll; the answer is the guest's own
+    /// claim state through `helios:system/stats`, the only account that
+    /// cannot be mistaken about whether a report would be read.
+    InputDevices {
+        reply: async_channel::Sender<Result<Vec<stats::InputDevice>, SystemError>>,
+    },
 }
 
 /// Serves the host thread's requests against the guest until the thread
@@ -2919,7 +2970,7 @@ enum GuestRequest {
 /// guest program does, and a request server that completed would end it
 /// early.
 async fn serve_guest_requests(
-    client: &crate::serial::RpcClient,
+    client: &RpcClient,
     requests: async_channel::Receiver<GuestRequest>,
 ) -> core::convert::Infallible {
     let serve = async {
@@ -2927,6 +2978,12 @@ async fn serve_guest_requests(
             match request {
                 GuestRequest::Kill { name, reply } => {
                     let outcome = system::kill_named_instance(client, &name).await;
+                    let _ = reply.send(outcome).await;
+                }
+                GuestRequest::InputDevices { reply } => {
+                    let outcome = system::fetch_stats(client)
+                        .await
+                        .map(|sample| sample.inputs);
                     let _ = reply.send(outcome).await;
                 }
             }
@@ -2968,7 +3025,7 @@ struct GuestRun {
 /// Shared by `screendump --run` and `input --run`, which differ only in
 /// what the host does while the guest runs.
 fn alongside_guest_program<HostSide>(
-    client: crate::serial::RpcClient,
+    client: RpcClient,
     run: GuestRun,
     host_side: HostSide,
     requests: async_channel::Receiver<GuestRequest>,
@@ -3086,6 +3143,10 @@ fn capture_scanout(
 ) -> Result<(), VmSessionError> {
     let mut qmp = QmpClient::connect(qmp_socket)?;
     if let Some(script) = &command.input {
+        // The gate is the guest's own claim state, not the socket being
+        // up: a report sent before the claim is one the kernel drains
+        // rather than queues for whoever takes the device next.
+        await_input_claims(requests, command.input_wait_seconds)?;
         send_input_script(&mut qmp, script, command.input_interval_ms)?;
     }
     // The capture that follows the kill waits for the kill's own
@@ -3166,37 +3227,117 @@ fn kill_instance(
     Ok(())
 }
 
+/// Waits until the guest holds every input device it reports.
+///
+/// A statement sent before the claim lands in the kernel's
+/// unclaimed-device drain and never reaches the program that would have
+/// read it, so the gate asks the guest — `helios:system/stats` names
+/// each device and whether an instance holds it — rather than waiting
+/// out a delay that could only ever be unlucky again.
+fn await_input_claims(
+    requests: &async_channel::Sender<GuestRequest>,
+    wait_seconds: u64,
+) -> Result<(), VmSessionError> {
+    wait_for_input_claims(
+        requests,
+        Duration::from_secs(wait_seconds),
+        INPUT_CLAIM_POLL_INTERVAL,
+    )
+}
+
+/// The gate's loop. The poll interval is a parameter so a test drives
+/// it without ever sleeping.
+fn wait_for_input_claims(
+    requests: &async_channel::Sender<GuestRequest>,
+    wait: Duration,
+    poll: Duration,
+) -> Result<(), VmSessionError> {
+    let started = Instant::now();
+    let deadline = started + wait;
+    loop {
+        let devices = input_devices(requests)?;
+        if devices.is_empty() {
+            return Err(VmSessionError::NoInputDevices);
+        }
+        let unclaimed: Vec<&str> = devices
+            .iter()
+            .filter(|device| !device.claimed)
+            .map(|device| device.name.as_str())
+            .collect();
+        if unclaimed.is_empty() {
+            println!(
+                "{} input devices after {:.1}s: {}",
+                style("claimed").green(),
+                started.elapsed().as_secs_f64(),
+                devices
+                    .iter()
+                    .map(|device| device.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(VmSessionError::InputClaimTimedOut {
+                seconds: wait.as_secs(),
+                devices: unclaimed.join(", "),
+            });
+        }
+        std::thread::sleep(poll);
+    }
+}
+
+/// One round of the gate: the input devices the guest reports now.
+///
+/// The reply channel rides inside the request, so an answer the serving
+/// half files between this side's polls still waits to be taken — the
+/// request is sent before its answer is awaited, never the other way.
+fn input_devices(
+    requests: &async_channel::Sender<GuestRequest>,
+) -> Result<Vec<stats::InputDevice>, VmSessionError> {
+    let (reply, answer) = async_channel::bounded(1);
+    requests
+        .send_blocking(GuestRequest::InputDevices { reply })
+        .map_err(|_| VmSessionError::InputGateSessionEnded)?;
+    answer
+        .recv_blocking()
+        .map_err(|_| VmSessionError::InputGateSessionEnded)?
+        .map_err(|source| VmSessionError::InputClaimProbe { source })
+}
+
 /// Runs an input script against the guest's keyboard and pointer.
 ///
 /// The whole script is parsed before the first event is sent: a script
 /// with a typo in its last line is a script that would otherwise leave
 /// the guest half-driven, in a state no later step could account for.
 fn run_input(
-    client: crate::serial::RpcClient,
+    client: RpcClient,
     command: InputCommand,
     qmp_socket: &Path,
 ) -> Result<(), VmSessionError> {
     let socket = qmp_socket.to_path_buf();
     let script = command.script.clone();
     let interval = command.interval_ms;
+    let wait_seconds = command.input_wait_seconds;
     let settle = Duration::from_secs(command.settle_seconds);
+    // The gate's questions reach the guest through the session's request
+    // channel, which the executor keeps serving for as long as the
+    // session runs.
+    let (requests, incoming) = async_channel::bounded(1);
     let drive = move || {
-        // The settle happens on the thread that sends, not before the
-        // guest was started: what it is waiting for is the guest
-        // claiming the devices this script is about to drive.
+        // The settle and the gate both happen on the thread that sends,
+        // not before the guest was started: what they are waiting for is
+        // the guest claiming the devices this script is about to drive.
         if !settle.is_zero() {
             std::thread::sleep(settle);
         }
+        await_input_claims(&requests, wait_seconds)?;
         let mut qmp = QmpClient::connect(&socket)?;
         send_input_script(&mut qmp, &script, interval)
     };
     let Some(program) = command.run.clone() else {
-        return drive();
+        return alongside_guest_session(client, drive, incoming);
     };
-    // The `input` action asks nothing of the guest half-way through, so
-    // its request channel is closed before the session starts.
-    let (requests, incoming) = async_channel::bounded(1);
-    drop(requests);
     alongside_guest_program(
         client,
         GuestRun {
@@ -3253,8 +3394,8 @@ fn send_input_script(
 /// inflate past its own pressure floor and reports the truth, so the
 /// wait ends when the guest stops moving and the caller sees where it
 /// stopped.
-fn settle_balloon(client: &mut crate::serial::RpcClient, target: u64, seconds: u64) {
-    let started = std::time::Instant::now();
+fn settle_balloon(client: &mut RpcClient, target: u64, seconds: u64) {
+    let started = Instant::now();
     let deadline = started + Duration::from_secs(seconds);
     let mut previous = None;
     let mut still_since = started;
@@ -3264,7 +3405,7 @@ fn settle_balloon(client: &mut crate::serial::RpcClient, target: u64, seconds: u
         // work. Not answering is not the same as having stopped, so it
         // does not end the wait or reset the stillness clock.
         let Some(sample) = guest_stats(client) else {
-            if std::time::Instant::now() >= deadline {
+            if Instant::now() >= deadline {
                 println!(
                     "{} guest stopped answering before the {seconds}s wait ran out",
                     style("settled").yellow()
@@ -3285,7 +3426,7 @@ fn settle_balloon(client: &mut crate::serial::RpcClient, target: u64, seconds: u
         }
         if actual != previous {
             previous = actual;
-            still_since = std::time::Instant::now();
+            still_since = Instant::now();
         } else if still_since.elapsed() >= BALLOON_STILL_FOR {
             println!(
                 "{} guest stopped at {} after {:.1}s",
@@ -3295,7 +3436,7 @@ fn settle_balloon(client: &mut crate::serial::RpcClient, target: u64, seconds: u
             );
             return;
         }
-        if std::time::Instant::now() >= deadline {
+        if Instant::now() >= deadline {
             println!(
                 "{} guest was still moving when the {seconds}s wait ran out",
                 style("settled").yellow()
@@ -3308,13 +3449,11 @@ fn settle_balloon(client: &mut crate::serial::RpcClient, target: u64, seconds: u
 
 /// Reads the guest's own view of its memory, or nothing when the guest
 /// is too busy to answer right now.
-fn guest_stats(
-    client: &mut crate::serial::RpcClient,
-) -> Option<helios_inspector_protocol::system::stats::Sample> {
+fn guest_stats(client: &mut RpcClient) -> Option<stats::Sample> {
     crate::runtime::block_on(crate::system::fetch_stats(client)).ok()
 }
 
-fn report_balloon(qmp: &mut QmpClient, client: &mut crate::serial::RpcClient, label: &str) {
+fn report_balloon(qmp: &mut QmpClient, client: &mut RpcClient, label: &str) {
     let Some(sample) = guest_stats(client) else {
         println!(
             "{} {label}: the guest did not answer",
@@ -3346,7 +3485,7 @@ fn report_balloon(qmp: &mut QmpClient, client: &mut crate::serial::RpcClient, la
 }
 
 fn run_workload_bench(
-    mut client: crate::serial::RpcClient,
+    mut client: RpcClient,
     command: WorkloadBenchCommand,
     provenance: VmProvenance,
 ) -> Result<(), VmSessionError> {
@@ -3467,7 +3606,7 @@ async fn profiling_step<T>(
 /// call that brings us here is often a guest that stopped answering, and
 /// a diagnostic that hangs replaces the failure it was fetched to
 /// explain.
-async fn print_recent_guest_errors(client: &mut crate::serial::RpcClient, seconds: u32) {
+async fn print_recent_guest_errors(client: &mut RpcClient, seconds: u32) {
     let mut config = crate::system::TracingConfig::new();
     config.limit = 100;
     config.min_level = Some(helios_inspector_protocol::system::tracing::Level::Info);
@@ -3489,10 +3628,7 @@ async fn print_recent_guest_errors(client: &mut crate::serial::RpcClient, second
     }
 }
 
-fn run_aot_bench(
-    mut client: crate::serial::RpcClient,
-    command: AotBenchCommand,
-) -> Result<(), VmSessionError> {
+fn run_aot_bench(mut client: RpcClient, command: AotBenchCommand) -> Result<(), VmSessionError> {
     crate::run_interruptible(async move {
         let wasm = fs::read(&command.wasm).map_err(|source| AotBenchError::ReadWasm {
             path: command.wasm.display().to_string(),
@@ -3550,7 +3686,7 @@ fn run_aot_bench(
             .map_err(|source| AotBenchError::Report { source })?;
         }
         for iteration in 1..=command.iterations {
-            let started = std::time::Instant::now();
+            let started = Instant::now();
             let outcome = system_programs::aot(
                 &client,
                 &system_programs::AotRequest {
@@ -4528,7 +4664,7 @@ fn wait_for_socket(
     qemu_log: &Path,
     child: &mut Child,
 ) -> Result<(), VmRuntimeError> {
-    let started = std::time::Instant::now();
+    let started = Instant::now();
     while started.elapsed() < DEFAULT_SOCKET_WAIT {
         if socket_path.exists() {
             return Ok(());
@@ -5440,6 +5576,7 @@ mod tests {
                 run_wait_seconds: 0,
                 input: None,
                 input_interval_ms: 0,
+                input_wait_seconds: 0,
                 kill_instance: None,
                 kill_settle_ms: 0,
             })
@@ -5453,6 +5590,7 @@ mod tests {
                 run: None,
                 run_args: Vec::new(),
                 settle_seconds: 0,
+                input_wait_seconds: 0,
                 run_wait_seconds: 0,
             })
             .qmp_action(),
@@ -5462,6 +5600,118 @@ mod tests {
             ResolvedVmSessionCommand::Session(SessionCommand::Stats).qmp_action(),
             None
         );
+    }
+
+    /// One input device the way `helios:system/stats` reports it, for
+    /// the gate's scripted answers.
+    fn input_device(name: &str, claimed: bool) -> stats::InputDevice {
+        stats::InputDevice {
+            name: name.to_owned(),
+            claimed,
+            events_delivered: 0,
+            lost_reports: 0,
+        }
+    }
+
+    /// Answers the gate's `InputDevices` requests with the snapshots the
+    /// test scripted, from a thread of its own — the same channel the
+    /// session's serving half answers through.
+    ///
+    /// The join is part of the check: a gate that asked one question too
+    /// few leaves scripted answers behind, and one that asked too many
+    /// meets a `remove` on an empty script, so either fails here.
+    fn answer_input_devices(
+        incoming: async_channel::Receiver<GuestRequest>,
+        mut snapshots: Vec<Vec<stats::InputDevice>>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            while let Ok(request) = incoming.recv_blocking() {
+                let GuestRequest::InputDevices { reply } = request else {
+                    panic!("the gate only ever asks about input devices");
+                };
+                let _ = reply.send_blocking(Ok(snapshots.remove(0)));
+            }
+            assert!(
+                snapshots.is_empty(),
+                "the gate stopped asking before the scripted answers ran out"
+            );
+        })
+    }
+
+    /// Devices already held let the script through on the first answer.
+    #[test]
+    fn the_input_gate_passes_when_every_reported_device_is_claimed() {
+        let (requests, incoming) = async_channel::bounded(1);
+        let answerer = answer_input_devices(
+            incoming,
+            vec![vec![
+                input_device("QEMU Virtio Keyboard", true),
+                input_device("QEMU Virtio Tablet", true),
+            ]],
+        );
+        wait_for_input_claims(&requests, Duration::from_secs(30), Duration::ZERO)
+            .expect("claimed devices are the gate's own answer to go");
+        drop(requests);
+        answerer.join().expect("every scripted answer was served");
+    }
+
+    /// A claim that lands between two polls is still met before the
+    /// first statement goes out.
+    #[test]
+    fn the_input_gate_waits_for_a_device_claimed_mid_wait() {
+        let (requests, incoming) = async_channel::bounded(1);
+        let answerer = answer_input_devices(
+            incoming,
+            vec![
+                vec![
+                    input_device("QEMU Virtio Keyboard", true),
+                    input_device("QEMU Virtio Tablet", false),
+                ],
+                vec![
+                    input_device("QEMU Virtio Keyboard", true),
+                    input_device("QEMU Virtio Tablet", true),
+                ],
+            ],
+        );
+        wait_for_input_claims(&requests, Duration::from_secs(30), Duration::ZERO)
+            .expect("a device claimed inside the wait still passes the gate");
+        drop(requests);
+        answerer.join().expect("every scripted answer was served");
+    }
+
+    /// A boot with nothing to drive refuses the script by name rather
+    /// than passing a gate that can never open.
+    #[test]
+    fn the_input_gate_refuses_a_guest_that_reports_no_devices() {
+        let (requests, incoming) = async_channel::bounded(1);
+        let answerer = answer_input_devices(incoming, vec![Vec::new()]);
+        let error = wait_for_input_claims(&requests, Duration::from_secs(30), Duration::ZERO)
+            .expect_err("a guest with no input devices has nothing to drive");
+        assert!(matches!(error, VmSessionError::NoInputDevices), "{error}");
+        drop(requests);
+        answerer.join().expect("every scripted answer was served");
+    }
+
+    /// The deadline running out names the devices that never took their
+    /// claims.
+    #[test]
+    fn the_input_gate_times_out_naming_what_stayed_unclaimed() {
+        let (requests, incoming) = async_channel::bounded(1);
+        let answerer = answer_input_devices(
+            incoming,
+            vec![vec![
+                input_device("QEMU Virtio Keyboard", true),
+                input_device("QEMU Virtio Tablet", false),
+            ]],
+        );
+        let error = wait_for_input_claims(&requests, Duration::ZERO, Duration::ZERO)
+            .expect_err("an unclaimed device past the deadline refuses the script");
+        let VmSessionError::InputClaimTimedOut { devices, .. } = &error else {
+            panic!("the refusal names the devices still unclaimed: {error}");
+        };
+        assert_eq!(*devices, "QEMU Virtio Tablet");
+        drop(requests);
+        answerer.join().expect("every scripted answer was served");
     }
 
     /// A balloon session needs a socket to speak QMP over, whether or
