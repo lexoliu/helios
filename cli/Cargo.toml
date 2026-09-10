@@ -23,6 +23,7 @@ toml = "0.8.23"
 walkdir = "2.5.0"
 wasmparser = "0.245.0"
 wit-component = "0.245.0"
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 [lints]
 workspace = true

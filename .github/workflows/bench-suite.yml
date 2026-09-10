@@ -130,6 +130,9 @@ jobs:
       || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/'))
       || (github.event_name == 'push' && vars.HELIOS_BENCH_DEDICATED == 'true')
     runs-on: ${{ needs.tooling.outputs.advisory == 'true' && matrix.shared-runner || matrix.dedicated-runner }}
+    permissions:
+      contents: read
+      actions: read
     env:
       BENCH_ADVISORY: ${{ needs.tooling.outputs.advisory }}
       BENCH_PAIRED_ACCEPTANCE: ${{ needs.tooling.outputs.paired_acceptance }}
@@ -164,10 +167,12 @@ jobs:
           inspector: "true"
           bench-tooling: "true"
       # Every x86-64 release build is built against the kernel profile
-      # the latest release published (docs/pgo.md, #226); the inspector
-      # refuses to build one without it rather than producing a plain
-      # kernel wearing a PGO label, so the fetch comes before the build.
-      - name: Fetch the release kernel profile
+      # the newest kernel-profile.yml run on the default branch uploaded
+      # (docs/pgo.md, #226, #313); the inspector refuses to build one
+      # without it rather than producing a plain kernel wearing a PGO
+      # label, so the fetch comes before the build. Reading the artifact
+      # is what the job's `actions: read` is for.
+      - name: Fetch the kernel profile
         if: matrix.helios-arch == 'x86-64'
         working-directory: helios
         env:
@@ -355,6 +360,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
+      actions: read
     env:
       # The profile is collected from an x86-64 kernel, so this is the
       # lane that can spend it; a profile carries function hashes of the
@@ -391,10 +397,12 @@ jobs:
           name: helios-kernel-profdata
           path: helios/target/pgo-candidate
       # Every x86-64 release build is built against the kernel profile
-      # the latest release published (docs/pgo.md, #226); the inspector
-      # refuses to build one without it rather than producing a plain
-      # kernel wearing a PGO label, so the fetch comes before the build.
-      - name: Fetch the release kernel profile
+      # the newest kernel-profile.yml run on the default branch uploaded
+      # (docs/pgo.md, #226, #313); the inspector refuses to build one
+      # without it rather than producing a plain kernel wearing a PGO
+      # label, so the fetch comes before the build. Reading the artifact
+      # is what the job's `actions: read` is for.
+      - name: Fetch the kernel profile
         working-directory: helios
         env:
           GITHUB_TOKEN: ${{ github.token }}

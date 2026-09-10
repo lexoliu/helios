@@ -1,15 +1,14 @@
-//! Where the profile a release published lives once it is fetched.
+//! Where a fetched kernel profile lives.
 //!
-//! One profile is in force at a time — the one the latest release
-//! carries — but a profile is keyed by the release it came from, because
-//! a kernel built against a profile is only as good as the profile
-//! behind it and "which release was that" is part of the answer. The
-//! store therefore keeps every fetched profile under its own tag and one
-//! record naming the tag in force:
+//! One profile is in force at a time, but a profile is keyed by where it
+//! came from, because a kernel built against a profile is only as good as
+//! the profile behind it and "which collection was that" is part of the
+//! answer. The store therefore keeps every fetched profile under a key of
+//! its own and one record naming the one in force:
 //!
 //! ```text
-//! target/profiles/fetched.json          the release in force
-//! target/profiles/<tag>/helios-kernel.profdata
+//! target/profiles/fetched.json          the profile in force
+//! target/profiles/<key>/helios-kernel.profdata
 //! ```
 //!
 //! It lives under `target/` because it is a build input a checkout can
@@ -21,25 +20,88 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{FETCH_COMMAND, KERNEL_PROFILE_ASSET, ProfileUseError, validate};
+use crate::{
+    FETCH_COMMAND, KERNEL_PROFILE_ARTIFACT, KERNEL_PROFILE_ASSET, KERNEL_PROFILE_WORKFLOW,
+    ProfileUseError, validate,
+};
 
 /// The store's directory under `target/`.
 const STORE_DIRECTORY: &str = "profiles";
 
-/// The record naming the release whose profile is in force.
+/// The record naming the profile in force.
 const RECORD_FILE: &str = "fetched.json";
 
-/// The release a stored profile came from.
+/// Digits of a commit hash a label carries: enough to name it, short
+/// enough for a table cell.
+const SHORT_SHA_LEN: usize = 7;
+
+/// Where a stored profile came from.
 ///
 /// Written by `helios-cli profile-fetch` and read by every build that
 /// spends the profile, so a kernel image can be traced back to the
-/// release whose counts shaped it.
+/// collection whose counts shaped it. The two sources are the two
+/// producers of `docs/pgo.md`: a `kernel-profile.yml` run uploads the
+/// profile as a workflow artifact, and `release.yml` attaches the one a
+/// released kernel was built with to its release.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FetchedProfile {
-    /// `owner/name` of the repository the release was published in.
-    pub repository: String,
-    /// The release's tag, which is also the directory the profile is in.
-    pub tag: String,
+#[serde(tag = "source", rename_all = "kebab-case")]
+pub enum FetchedProfile {
+    /// The `helios-kernel-profdata` artifact a `kernel-profile.yml` run
+    /// uploaded (#313).
+    Collection {
+        /// `owner/name` of the repository the run was in.
+        repository: String,
+        /// The workflow run that uploaded the artifact.
+        run_id: u64,
+        /// The branch the run was on.
+        head_branch: String,
+        /// The commit the run collected on.
+        head_sha: String,
+    },
+    /// The `helios-kernel.profdata` asset `release.yml` attached to a
+    /// release (#226).
+    Release {
+        /// `owner/name` of the repository the release was published in.
+        repository: String,
+        /// The release's tag.
+        tag: String,
+    },
+}
+
+impl FetchedProfile {
+    /// `owner/name` of the repository the profile came from.
+    pub fn repository(&self) -> &str {
+        match self {
+            Self::Collection { repository, .. } | Self::Release { repository, .. } => repository,
+        }
+    }
+
+    /// The directory the profile is kept under in the store: the release
+    /// tag, or the run that uploaded the artifact.
+    pub fn key(&self) -> String {
+        match self {
+            Self::Collection { run_id, .. } => format!("run-{run_id}"),
+            Self::Release { tag, .. } => tag.clone(),
+        }
+    }
+
+    /// The profile named short enough for a table cell and precise
+    /// enough to find again: `release <tag>`, or the branch, the commit
+    /// and the run of a collection.
+    pub fn label(&self) -> String {
+        match self {
+            Self::Collection {
+                run_id,
+                head_branch,
+                head_sha,
+                ..
+            } => {
+                let short = head_sha.get(..SHORT_SHA_LEN).unwrap_or(head_sha);
+                format!("{head_branch}@{short} run {run_id}")
+            }
+            Self::Release { tag, .. } => format!("release {tag}"),
+        }
+    }
 }
 
 /// Why the fetched kernel profile could not be read or written.
@@ -48,8 +110,9 @@ pub enum KernelProfileStoreError {
     /// Nothing has been fetched into this checkout's store yet.
     #[error(
         "no kernel profile has been fetched into {record}; `{FETCH_COMMAND}` downloads the \
-         {KERNEL_PROFILE_ASSET} asset that release.yml's kernel-profile job attaches to \
-         every release (docs/pgo.md)"
+         {KERNEL_PROFILE_ARTIFACT} artifact the newest {KERNEL_PROFILE_WORKFLOW} run on the \
+         default branch uploaded, or with --tag the {KERNEL_PROFILE_ASSET} asset of a release \
+         (docs/pgo.md)"
     )]
     NotFetched {
         /// The record that is not there.
@@ -75,22 +138,22 @@ pub enum KernelProfileStoreError {
         #[source]
         source: serde_json::Error,
     },
-    /// The record names a release whose profile is not in the store.
+    /// The record names a profile that is not in the store.
     #[error(
-        "the store records the profile of release {tag} and {path} is not there; \
+        "the store records the profile of {label} and {path} is not there; \
          re-run `{FETCH_COMMAND}`"
     )]
     ProfileMissing {
-        /// The release the record names.
-        tag: String,
-        /// Where its profile should have been.
+        /// The profile the record names.
+        label: String,
+        /// Where it should have been.
         path: String,
     },
-    /// A tag that is not a single path segment cannot key a directory.
-    #[error("the release tag {tag} is not a single path segment and cannot key the profile store")]
-    TagNotASegment {
-        /// The tag that was refused.
-        tag: String,
+    /// A key that is not a single path segment cannot name a directory.
+    #[error("the profile key {key} is not a single path segment and cannot key the profile store")]
+    KeyNotASegment {
+        /// The key that was refused.
+        key: String,
     },
     /// The stored profile is not one this toolchain can build against.
     #[error("{0}")]
@@ -116,24 +179,24 @@ impl KernelProfileStore {
         &self.directory
     }
 
-    /// Where the profile of the release tagged `tag` is kept.
-    pub fn profile_path(&self, tag: &str) -> Result<PathBuf, KernelProfileStoreError> {
-        if tag.is_empty() || tag.contains(['/', '\\']) || tag.starts_with('.') {
-            return Err(KernelProfileStoreError::TagNotASegment {
-                tag: tag.to_owned(),
+    /// Where the profile keyed `key` is kept.
+    pub fn profile_path(&self, key: &str) -> Result<PathBuf, KernelProfileStoreError> {
+        if key.is_empty() || key.contains(['/', '\\']) || key.starts_with('.') {
+            return Err(KernelProfileStoreError::KeyNotASegment {
+                key: key.to_owned(),
             });
         }
-        Ok(self.directory.join(tag).join(KERNEL_PROFILE_ASSET))
+        Ok(self.directory.join(key).join(KERNEL_PROFILE_ASSET))
     }
 
-    /// The record naming the release whose profile is in force.
+    /// The record naming the profile in force.
     pub fn record_path(&self) -> PathBuf {
         self.directory.join(RECORD_FILE)
     }
 
-    /// Records `profile` as the release in force.
+    /// Records `profile` as the one in force.
     ///
-    /// Called once its profile is in the store and has passed the header
+    /// Called once its file is in the store and has passed the header
     /// check, so a record never names a profile a build cannot read.
     pub fn publish(&self, profile: &FetchedProfile) -> Result<(), KernelProfileStoreError> {
         let path = self.record_path();
@@ -147,12 +210,12 @@ impl KernelProfileStore {
         };
         fs::create_dir_all(&self.directory).map_err(record("create"))?;
         let document = serde_json::to_string_pretty(profile)
-            .expect("a repository and a tag serialise as JSON")
+            .expect("a fetched profile serialises as JSON")
             + "\n";
         fs::write(&path, document).map_err(record("write"))
     }
 
-    /// The release in force and the profile it published, header checked.
+    /// The profile in force and its file, header checked.
     ///
     /// Every failure names `helios-cli profile-fetch`: an empty store is
     /// the state a fresh checkout is in, and the answer to all of them is
@@ -180,10 +243,10 @@ impl KernelProfileStore {
                 source,
             }
         })?;
-        let path = self.profile_path(&profile.tag)?;
+        let path = self.profile_path(&profile.key())?;
         if !path.is_file() {
             return Err(KernelProfileStoreError::ProfileMissing {
-                tag: profile.tag,
+                label: profile.label(),
                 path: path.display().to_string(),
             });
         }
@@ -197,31 +260,61 @@ mod tests {
     use super::*;
     use crate::tests::pinned_header;
 
-    fn store_with_profile(root: &Path, tag: &str) -> KernelProfileStore {
+    fn release() -> FetchedProfile {
+        FetchedProfile::Release {
+            repository: "lexoliu/helios".to_owned(),
+            tag: "helios-v0.1.0".to_owned(),
+        }
+    }
+
+    fn collection() -> FetchedProfile {
+        FetchedProfile::Collection {
+            repository: "lexoliu/helios".to_owned(),
+            run_id: 34_424_416_974,
+            head_branch: "dev".to_owned(),
+            head_sha: "85d20bcd0a1b2c3d4e5f60718293a4b5c6d7e8f9".to_owned(),
+        }
+    }
+
+    fn store_with_profile(root: &Path, profile: &FetchedProfile) -> KernelProfileStore {
         let store = KernelProfileStore::new(root);
         let path = store
-            .profile_path(tag)
-            .expect("a tag that keys a directory");
-        fs::create_dir_all(path.parent().expect("the tag's directory"))
-            .expect("creating the tag's directory");
+            .profile_path(&profile.key())
+            .expect("a key that names a directory");
+        fs::create_dir_all(path.parent().expect("the key's directory"))
+            .expect("creating the key's directory");
         fs::write(&path, pinned_header()).expect("writing a profile header");
         store
     }
 
     #[test]
     fn a_published_record_reads_back_with_its_profile() {
-        let directory = tempfile::tempdir().expect("a temporary checkout");
-        let store = store_with_profile(directory.path(), "helios-v0.1.0");
-        let profile = FetchedProfile {
-            repository: "lexoliu/helios".to_owned(),
-            tag: "helios-v0.1.0".to_owned(),
-        };
-        store.publish(&profile).expect("publishing the record");
-        let (read, path) = store
-            .fetched()
-            .expect("the record names a readable profile");
-        assert_eq!(read, profile);
-        assert_eq!(path, store.profile_path("helios-v0.1.0").expect("the path"));
+        for profile in [release(), collection()] {
+            let directory = tempfile::tempdir().expect("a temporary checkout");
+            let store = store_with_profile(directory.path(), &profile);
+            store.publish(&profile).expect("publishing the record");
+            let (read, path) = store
+                .fetched()
+                .expect("the record names a readable profile");
+            assert_eq!(read, profile);
+            assert_eq!(path, store.profile_path(&profile.key()).expect("the path"));
+        }
+    }
+
+    #[test]
+    fn a_collection_is_keyed_by_its_run_and_labelled_by_where_it_ran() {
+        assert_eq!(collection().key(), "run-34424416974");
+        assert_eq!(collection().label(), "dev@85d20bc run 34424416974");
+        assert_eq!(release().key(), "helios-v0.1.0");
+        assert_eq!(release().label(), "release helios-v0.1.0");
+    }
+
+    #[test]
+    fn the_record_says_which_source_it_names() {
+        let document = serde_json::to_string(&collection()).expect("a record serialises");
+        assert!(document.contains("\"source\":\"collection\""), "{document}");
+        let document = serde_json::to_string(&release()).expect("a record serialises");
+        assert!(document.contains("\"source\":\"release\""), "{document}");
     }
 
     #[test]
@@ -236,18 +329,14 @@ mod tests {
             "{error}"
         );
         assert!(error.to_string().contains(FETCH_COMMAND));
+        assert!(error.to_string().contains(KERNEL_PROFILE_WORKFLOW));
     }
 
     #[test]
     fn a_record_without_its_profile_is_refused() {
         let directory = tempfile::tempdir().expect("a temporary checkout");
         let store = KernelProfileStore::new(directory.path());
-        store
-            .publish(&FetchedProfile {
-                repository: "lexoliu/helios".to_owned(),
-                tag: "helios-v0.1.0".to_owned(),
-            })
-            .expect("publishing the record");
+        store.publish(&release()).expect("publishing the record");
         let error = store
             .fetched()
             .expect_err("a record whose profile was deleted names no readable profile");
@@ -255,17 +344,18 @@ mod tests {
             matches!(error, KernelProfileStoreError::ProfileMissing { .. }),
             "{error}"
         );
+        assert!(error.to_string().contains("release helios-v0.1.0"));
     }
 
     #[test]
-    fn a_tag_that_is_not_a_path_segment_is_refused() {
+    fn a_key_that_is_not_a_path_segment_is_refused() {
         let directory = tempfile::tempdir().expect("a temporary checkout");
         let store = KernelProfileStore::new(directory.path());
         let error = store
             .profile_path("../elsewhere")
-            .expect_err("a tag keys one directory in the store and nothing above it");
+            .expect_err("a key names one directory in the store and nothing above it");
         assert!(
-            matches!(error, KernelProfileStoreError::TagNotASegment { .. }),
+            matches!(error, KernelProfileStoreError::KeyNotASegment { .. }),
             "{error}"
         );
     }

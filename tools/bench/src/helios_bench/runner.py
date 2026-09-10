@@ -62,8 +62,8 @@ PROFILE_USE_BUILD = "profile-use"
 # artifacts land in the `profile-use` directory, so the run record and the
 # bootfs pins below have to say so.
 RELEASE_PROFILE_ARCHS = frozenset({"x86-64"})
-# Where `helios-cli profile-fetch` records the release whose profile this
-# checkout builds against.
+# Where `helios-cli profile-fetch` records which profile this checkout
+# builds against.
 KERNEL_PROFILE_RECORD = REPO_ROOT / "target" / "profiles" / "fetched.json"
 # Which subdirectory of the run's output each side's raw JSONL lands in.
 # The two Helios images write the same file names, so the directory is
@@ -293,20 +293,28 @@ def plan(options: RunOptions, manifest: Manifest, workloads: list[dict]) -> list
     return commands
 
 
-def release_kernel_profile_tag() -> str:
-    """The release whose kernel profile this checkout builds against.
+def fetched_kernel_profile_label() -> str:
+    """The profile this checkout's release kernel was built against.
 
     `helios-cli profile-fetch` writes the record and the inspector
     refuses a release build without it, so a run that has already booted
     a guest has one; a missing record is a run that never built what it
-    says it built.
+    says it built. The label is the record's own: `release <tag>` for a
+    release's asset, or the branch, commit and run of a `kernel-profile.yml`
+    collection (docs/pgo.md, #313).
     """
     if not KERNEL_PROFILE_RECORD.is_file():
         raise SystemExit(
             f"{KERNEL_PROFILE_RECORD} is not there, so this lane's release kernel was not built "
-            "against a release profile: run `helios-cli profile-fetch` (docs/pgo.md)"
+            "against a fetched profile: run `helios-cli profile-fetch` (docs/pgo.md)"
         )
-    return json.loads(KERNEL_PROFILE_RECORD.read_text())["tag"]
+    record = json.loads(KERNEL_PROFILE_RECORD.read_text())
+    source = record["source"]
+    if source == "release":
+        return f"release {record['tag']}"
+    if source == "collection":
+        return f"{record['head_branch']}@{record['head_sha'][:7]} run {record['run_id']}"
+    raise SystemExit(f"{KERNEL_PROFILE_RECORD} names a profile source {source!r} this tool does not know")
 
 
 def profile_label(path: Path) -> str:
@@ -326,9 +334,9 @@ def kernel_profiles(options: RunOptions) -> tuple[str | None, str | None]:
     what a PGO pairing measures once every release publishes a profile:
     the release's counts against a freshly collected set (#226).
     """
-    release = f"release {release_kernel_profile_tag()}" if options.reads_release_profile else None
-    candidate = profile_label(options.profile_use) if options.profile_use else release
-    return candidate, release if options.paired else None
+    fetched = fetched_kernel_profile_label() if options.reads_release_profile else None
+    candidate = profile_label(options.profile_use) if options.profile_use else fetched
+    return candidate, fetched if options.paired else None
 
 
 def baseline_arguments(options: RunOptions, out_root: Path) -> list[str]:

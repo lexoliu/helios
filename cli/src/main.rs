@@ -11,8 +11,8 @@ use fatfs::{FatType, FileSystem, FormatVolumeOptions, FsOptions};
 use helios_artifact::{TrailerError, cwasm_target_supports_wasm_simd, sign_payload_with_key};
 use helios_compiler_support::{AotCompileHint, CompileError, precompile_artifact};
 use helios_profdata::{
-    FetchedProfile, KERNEL_PROFILE_ASSET, KernelProfileStore, KernelProfileStoreError,
-    ProfileUseError, RELEASE_REPOSITORY,
+    FetchedProfile, KERNEL_PROFILE_ARTIFACT, KERNEL_PROFILE_ASSET, KERNEL_PROFILE_WORKFLOW,
+    KernelProfileStore, KernelProfileStoreError, ProfileUseError, RELEASE_REPOSITORY,
 };
 use helios_workspace_root::{WorkspaceRoot, WorkspaceRootError};
 use mbrman::{BOOT_ACTIVE, CHS, MBR, MBRPartitionEntry};
@@ -482,7 +482,7 @@ const ROOT_PUBLIC_FILE: &str = "helios-root-public.key";
 const PREBUILD_MANIFEST_FILE: &str = "kernel-prebuild.json";
 const DEFAULT_INIT_ARGV0: &str = "/init.wasm";
 const DEFAULT_BOOT_ARTIFACTS_MANIFEST: &str = "tools/wasi-apps/boot-artifacts.toml";
-/// Why the kernel profile a release published did not reach the store.
+/// Why the kernel profile did not reach the store.
 ///
 /// A fetch either leaves a profile this toolchain can build against in
 /// the store or fails saying which step did not answer: a release build
@@ -515,12 +515,42 @@ enum ProfileFetchError {
         status: String,
         stderr: String,
     },
+    #[error("{url} answered 404: no such repository, release or artifact")]
+    NotFound { url: String },
     #[error(
-        "{url} answered 404. Every release carries {KERNEL_PROFILE_ASSET} from release.yml's \
-         kernel-profile job (docs/pgo.md); a release cut before that job existed gets its \
-         assets by dispatching that workflow with its tag"
+        "{repository} has no release tagged {tag}. Every release carries {KERNEL_PROFILE_ASSET} \
+         from release.yml's kernel-profile job (docs/pgo.md); a release cut before that job \
+         existed gets its assets by dispatching that workflow with its tag"
     )]
-    NoRelease { url: String },
+    NoRelease { repository: String, tag: String },
+    #[error(
+        "no unexpired {KERNEL_PROFILE_ARTIFACT} artifact from a run on {branch} of {repository} \
+         among the newest {ARTIFACT_PAGE}; dispatch {KERNEL_PROFILE_WORKFLOW} on that branch \
+         (docs/pgo.md). GitHub keeps an artifact ninety days"
+    )]
+    NoCollection { repository: String, branch: String },
+    #[error(
+        "{url} answered HTTP {status} without a redirect; GitHub answers an artifact download \
+         with a redirect to its object store"
+    )]
+    NoRedirect { url: String, status: String },
+    #[error("artifact {artifact} is not a zip archive this tool can read: {source}")]
+    Archive {
+        artifact: u64,
+        #[source]
+        source: zip::result::ZipError,
+    },
+    #[error(
+        "artifact {artifact} holds no {KERNEL_PROFILE_ASSET}; {KERNEL_PROFILE_WORKFLOW} uploads \
+         exactly that file"
+    )]
+    NoProfileInArchive { artifact: u64 },
+    #[error("failed to read {KERNEL_PROFILE_ASSET} out of artifact {artifact}: {source}")]
+    ReadArchive {
+        artifact: u64,
+        #[source]
+        source: io::Error,
+    },
     #[error("{url} answered HTTP {status}: {body}")]
     HttpStatus {
         url: String,
@@ -529,9 +559,10 @@ enum ProfileFetchError {
     },
     #[error("curl wrote no HTTP status for {url}; it answered {len} bytes")]
     NoHttpStatus { url: String, len: usize },
-    #[error("{url} did not answer with a GitHub release: {source}")]
-    DecodeRelease {
+    #[error("{url} did not answer with {what}: {source}")]
+    Decode {
         url: String,
+        what: &'static str,
         #[source]
         source: serde_json::Error,
     },
@@ -674,16 +705,21 @@ struct LimineUefiImageCommand {
     efi_arch: LimineEfiArch,
 }
 
-/// Download the kernel profile a release published, so that a `--release`
-/// x86-64 kernel is built the way the release's own kernel was
-/// (`docs/pgo.md`).
+/// Download a kernel profile, so that a `--release` x86-64 kernel has one
+/// to read (`docs/pgo.md`, #226, #313).
 #[derive(Parser)]
 struct ProfileFetchCommand {
-    /// Release to take the profile from. The latest release by default,
-    /// which is the one every release build between releases spends.
-    #[arg(long, value_name = "TAG")]
+    /// Release to take the profile from: the asset `release.yml` attached
+    /// to it. Without it, the newest artifact a `kernel-profile.yml` run
+    /// on the default branch uploaded.
+    #[arg(long, value_name = "TAG", conflicts_with = "branch")]
     tag: Option<String>,
-    /// `owner/name` of the repository whose releases carry the profile.
+    /// Branch whose newest collection to take, instead of the default
+    /// branch's.
+    #[arg(long, value_name = "BRANCH")]
+    branch: Option<String>,
+    /// `owner/name` of the repository whose collections and releases carry
+    /// the profile.
     #[arg(long, value_name = "REPOSITORY", default_value = RELEASE_REPOSITORY)]
     repository: String,
 }
@@ -2012,12 +2048,59 @@ struct GithubReleaseAsset {
     browser_download_url: String,
 }
 
-/// Downloads the kernel profile a release published into the store.
+/// The part of a GitHub repository this fetch reads.
+#[derive(Debug, Deserialize)]
+struct GithubRepository {
+    default_branch: String,
+}
+
+/// Artifacts the listing endpoint asks for at once. GitHub lists newest
+/// first, so the newest collection on a branch is within the first page
+/// unless that many newer runs on other branches uploaded one since; the
+/// refusal says so.
+const ARTIFACT_PAGE: usize = 100;
+
+/// One page of a repository's artifact listing.
+#[derive(Debug, Deserialize)]
+struct GithubArtifacts {
+    artifacts: Vec<GithubArtifact>,
+}
+
+/// The parts of a workflow artifact this fetch reads.
+#[derive(Debug, Deserialize)]
+struct GithubArtifact {
+    id: u64,
+    name: String,
+    expired: bool,
+    archive_download_url: String,
+    workflow_run: GithubWorkflowRun,
+}
+
+/// The run that uploaded an artifact.
+#[derive(Debug, Deserialize)]
+struct GithubWorkflowRun {
+    id: u64,
+    head_branch: String,
+    head_sha: String,
+}
+
+/// What curl answered: the status, the redirect it did not follow, and
+/// the body.
+struct HttpAnswer {
+    status: String,
+    redirect: String,
+    body: Vec<u8>,
+}
+
+/// Downloads a kernel profile into the store.
 ///
 /// The store is what `helios-inspector vm --release` reads to build an
-/// x86-64 kernel the way the release's own kernel was built
+/// x86-64 kernel the way the lanes and a release build it
 /// (`docs/pgo.md`), so this is the one entry point that puts a profile
-/// there: everything else names a profile it was given.
+/// there: everything else names a profile it was given. Without `--tag`
+/// the profile is the newest `helios-kernel-profdata` artifact a run on
+/// the default branch uploaded (#313); with it, the asset a release
+/// carries (#226).
 fn run_profile_fetch(
     command: ProfileFetchCommand,
     explicit_workspace_root: Option<&Path>,
@@ -2025,34 +2108,16 @@ fn run_profile_fetch(
     let workspace_root = WorkspaceRoot::resolve(explicit_workspace_root)?;
     let store = KernelProfileStore::new(workspace_root.path());
     let repository = &command.repository;
-    let url = match &command.tag {
-        Some(tag) => format!("{GITHUB_API}/repos/{repository}/releases/tags/{tag}"),
-        None => format!("{GITHUB_API}/repos/{repository}/releases/latest"),
+    let (fetched, profile) = match &command.tag {
+        Some(tag) => fetch_release_asset(repository, tag)?,
+        None => fetch_collection_artifact(repository, command.branch.as_deref())?,
     };
-    let document = github_get(&url, true)?;
-    let release: GithubRelease =
-        serde_json::from_slice(&document).map_err(|source| ProfileFetchError::DecodeRelease {
-            url: url.clone(),
-            source,
-        })?;
-    let asset = release
-        .assets
-        .iter()
-        .find(|asset| asset.name == KERNEL_PROFILE_ASSET)
-        .ok_or_else(|| ProfileFetchError::NoProfileAsset {
-            repository: repository.clone(),
-            tag: release.tag_name.clone(),
-        })?;
-    let path = store.profile_path(&release.tag_name)?;
-    let directory = path.parent().expect("a profile path names its release");
+    let path = store.profile_path(&fetched.key())?;
+    let directory = path.parent().expect("a profile path names its key");
     fs::create_dir_all(directory).map_err(|source| ProfileFetchError::CreateDirectory {
         path: directory.display().to_string(),
         source,
     })?;
-    // The download carries no token: GitHub redirects an asset to its own
-    // object store, and an Authorization header follows the redirect
-    // there.
-    let profile = github_get(&asset.browser_download_url, false)?;
     fs::write(&path, profile).map_err(|source| ProfileFetchError::Write {
         path: path.display().to_string(),
         source,
@@ -2060,39 +2125,204 @@ fn run_profile_fetch(
     // The header check before the record: a record names a profile a
     // build can read, or there is no record.
     helios_profdata::validate(&path)?;
-    store.publish(&FetchedProfile {
-        repository: repository.clone(),
-        tag: release.tag_name.clone(),
-    })?;
-    println!("{} {} {}", release.tag_name, repository, path.display());
+    store.publish(&fetched)?;
+    println!("{} {} {}", fetched.label(), repository, path.display());
     Ok(())
 }
 
-/// One HTTPS GET through curl, returning the body.
+/// The profile asset of the release tagged `tag`, and the record naming it.
+fn fetch_release_asset(
+    repository: &str,
+    tag: &str,
+) -> Result<(FetchedProfile, Vec<u8>), ProfileFetchError> {
+    let url = format!("{GITHUB_API}/repos/{repository}/releases/tags/{tag}");
+    let document = match github_get(&url, true) {
+        Err(ProfileFetchError::NotFound { .. }) => {
+            return Err(ProfileFetchError::NoRelease {
+                repository: repository.to_owned(),
+                tag: tag.to_owned(),
+            });
+        }
+        answer => answer?,
+    };
+    let release: GithubRelease = decode(&url, "a GitHub release", &document)?;
+    let asset = release
+        .assets
+        .iter()
+        .find(|asset| asset.name == KERNEL_PROFILE_ASSET)
+        .ok_or_else(|| ProfileFetchError::NoProfileAsset {
+            repository: repository.to_owned(),
+            tag: release.tag_name.clone(),
+        })?;
+    // The download carries no token: GitHub redirects an asset to its own
+    // object store, and an Authorization header follows the redirect
+    // there.
+    let profile = github_get(&asset.browser_download_url, false)?;
+    Ok((
+        FetchedProfile::Release {
+            repository: repository.to_owned(),
+            tag: release.tag_name,
+        },
+        profile,
+    ))
+}
+
+/// The profile inside the newest unexpired collection artifact a run on
+/// `branch` uploaded, the default branch when none is named, and the
+/// record naming that run.
+fn fetch_collection_artifact(
+    repository: &str,
+    branch: Option<&str>,
+) -> Result<(FetchedProfile, Vec<u8>), ProfileFetchError> {
+    let branch = match branch {
+        Some(branch) => branch.to_owned(),
+        None => default_branch(repository)?,
+    };
+    let url = format!(
+        "{GITHUB_API}/repos/{repository}/actions/artifacts\
+         ?name={KERNEL_PROFILE_ARTIFACT}&per_page={ARTIFACT_PAGE}"
+    );
+    let document = github_get(&url, true)?;
+    let listing: GithubArtifacts = decode(&url, "a GitHub artifact listing", &document)?;
+    let artifact = listing
+        .artifacts
+        .into_iter()
+        .find(|artifact| {
+            !artifact.expired
+                && artifact.name == KERNEL_PROFILE_ARTIFACT
+                && artifact.workflow_run.head_branch == branch
+        })
+        .ok_or_else(|| ProfileFetchError::NoCollection {
+            repository: repository.to_owned(),
+            branch: branch.clone(),
+        })?;
+    // The archive endpoint answers with a redirect to GitHub's object
+    // store, whose signed URL refuses the token the API wanted, so the
+    // redirect is read with the token and followed without it.
+    let location = github_redirect(&artifact.archive_download_url)?;
+    let archive = github_get(&location, false)?;
+    let profile = profile_in_archive(artifact.id, archive)?;
+    Ok((
+        FetchedProfile::Collection {
+            repository: repository.to_owned(),
+            run_id: artifact.workflow_run.id,
+            head_branch: artifact.workflow_run.head_branch,
+            head_sha: artifact.workflow_run.head_sha,
+        },
+        profile,
+    ))
+}
+
+/// The repository's default branch, which is where the collection runs
+/// every lane reads from.
+fn default_branch(repository: &str) -> Result<String, ProfileFetchError> {
+    let url = format!("{GITHUB_API}/repos/{repository}");
+    let document = github_get(&url, true)?;
+    let repository: GithubRepository = decode(&url, "a GitHub repository", &document)?;
+    Ok(repository.default_branch)
+}
+
+/// The profile file out of an artifact archive. An artifact downloads
+/// as a zip archive of the files the run uploaded, and the collection
+/// uploads exactly one.
+fn profile_in_archive(artifact: u64, archive: Vec<u8>) -> Result<Vec<u8>, ProfileFetchError> {
+    let mut archive = zip::ZipArchive::new(io::Cursor::new(archive))
+        .map_err(|source| ProfileFetchError::Archive { artifact, source })?;
+    let mut entry = match archive.by_name(KERNEL_PROFILE_ASSET) {
+        Ok(entry) => entry,
+        Err(zip::result::ZipError::FileNotFound) => {
+            return Err(ProfileFetchError::NoProfileInArchive { artifact });
+        }
+        Err(source) => return Err(ProfileFetchError::Archive { artifact, source }),
+    };
+    let mut profile = Vec::with_capacity(usize::try_from(entry.size()).unwrap_or(0));
+    entry
+        .read_to_end(&mut profile)
+        .map_err(|source| ProfileFetchError::ReadArchive { artifact, source })?;
+    Ok(profile)
+}
+
+/// One JSON answer decoded, naming the endpoint and what it was expected
+/// to be when it is not.
+fn decode<T: serde::de::DeserializeOwned>(
+    url: &str,
+    what: &'static str,
+    document: &[u8],
+) -> Result<T, ProfileFetchError> {
+    serde_json::from_slice(document).map_err(|source| ProfileFetchError::Decode {
+        url: url.to_owned(),
+        what,
+        source,
+    })
+}
+
+/// One HTTPS GET through curl, following redirects, returning the body
+/// of a 200.
+fn github_get(url: &str, authenticated: bool) -> Result<Vec<u8>, ProfileFetchError> {
+    let answer = curl_get(url, authenticated, true)?;
+    match answer.status.as_str() {
+        "200" => Ok(answer.body),
+        "404" => Err(ProfileFetchError::NotFound {
+            url: url.to_owned(),
+        }),
+        _ => Err(ProfileFetchError::HttpStatus {
+            url: url.to_owned(),
+            status: answer.status,
+            body: String::from_utf8_lossy(&answer.body[..answer.body.len().min(ERROR_BODY_BYTES)])
+                .trim()
+                .to_owned(),
+        }),
+    }
+}
+
+/// Where an authenticated GET of `url` redirects to, without following it.
+fn github_redirect(url: &str) -> Result<String, ProfileFetchError> {
+    let answer = curl_get(url, true, false)?;
+    if answer.status == "404" {
+        return Err(ProfileFetchError::NotFound {
+            url: url.to_owned(),
+        });
+    }
+    if !answer.status.starts_with('3') || answer.redirect.is_empty() {
+        return Err(ProfileFetchError::NoRedirect {
+            url: url.to_owned(),
+            status: answer.status,
+        });
+    }
+    Ok(answer.redirect)
+}
+
+/// One HTTPS GET through curl.
 ///
 /// curl is the HTTP client this repository already downloads its pinned
 /// artifacts with (`tools/wasi-apps/build.sh`). The status is asked for
 /// explicitly rather than through `--fail`, because a 404 on a release is
 /// the answer that has something to say and `--fail` throws the body away.
-fn github_get(url: &str, authenticated: bool) -> Result<Vec<u8>, ProfileFetchError> {
+/// The redirect curl did not follow is written after the body as well, on
+/// a line of its own, so the answer is parsed from its end: the status,
+/// the newline before it, and the redirect back to the newline before that.
+fn curl_get(url: &str, authenticated: bool, follow: bool) -> Result<HttpAnswer, ProfileFetchError> {
     let config = if authenticated {
         github_token_header()?
     } else {
         String::new()
     };
-    let mut child = Command::new("curl")
-        .args([
-            "--silent",
-            "--show-error",
-            "--location",
-            "--proto",
-            "=https",
-            "--tlsv1.2",
-            "--write-out",
-            "%{http_code}",
-            "--config",
-            "-",
-        ])
+    let mut command = Command::new("curl");
+    command.args([
+        "--silent",
+        "--show-error",
+        "--proto",
+        "=https",
+        "--tlsv1.2",
+        "--write-out",
+        "\n%{redirect_url}\n%{http_code}",
+        "--config",
+        "-",
+    ]);
+    if follow {
+        command.arg("--location");
+    }
+    let mut child = command
         .arg(url)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -2124,28 +2354,35 @@ fn github_get(url: &str, authenticated: bool) -> Result<Vec<u8>, ProfileFetchErr
             stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
         });
     }
-    let mut body = output.stdout;
-    if body.len() < HTTP_STATUS_DIGITS {
-        return Err(ProfileFetchError::NoHttpStatus {
-            url: url.to_owned(),
-            len: body.len(),
-        });
+    parse_answer(url, output.stdout)
+}
+
+/// Splits curl's output into the body, the redirect and the status.
+fn parse_answer(url: &str, mut body: Vec<u8>) -> Result<HttpAnswer, ProfileFetchError> {
+    let short = || ProfileFetchError::NoHttpStatus {
+        url: url.to_owned(),
+        len: body.len(),
+    };
+    let status_at = body
+        .len()
+        .checked_sub(HTTP_STATUS_DIGITS)
+        .ok_or_else(short)?;
+    let newline_at = status_at.checked_sub(1).ok_or_else(short)?;
+    if body[newline_at] != b'\n' {
+        return Err(short());
     }
-    let status = String::from_utf8_lossy(&body[body.len() - HTTP_STATUS_DIGITS..]).into_owned();
-    body.truncate(body.len() - HTTP_STATUS_DIGITS);
-    match status.as_str() {
-        "200" => Ok(body),
-        "404" => Err(ProfileFetchError::NoRelease {
-            url: url.to_owned(),
-        }),
-        _ => Err(ProfileFetchError::HttpStatus {
-            url: url.to_owned(),
-            status,
-            body: String::from_utf8_lossy(&body[..body.len().min(ERROR_BODY_BYTES)])
-                .trim()
-                .to_owned(),
-        }),
-    }
+    let redirect_at = body[..newline_at]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .ok_or_else(short)?;
+    let status = String::from_utf8_lossy(&body[status_at..]).into_owned();
+    let redirect = String::from_utf8_lossy(&body[redirect_at + 1..newline_at]).into_owned();
+    body.truncate(redirect_at);
+    Ok(HttpAnswer {
+        status,
+        redirect,
+        body,
+    })
 }
 
 /// The curl configuration carrying the GitHub token, or nothing.

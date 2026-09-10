@@ -2,11 +2,12 @@
 //! fetched one lives in.
 //!
 //! Two host tools hold one end of this each. `helios-cli profile-fetch`
-//! downloads the `helios-kernel.profdata` a release published and writes
-//! it into the store; `helios-inspector vm --release` reads the store to
-//! build the x86-64 kernel against it (`docs/pgo.md`, #226). What a
-//! profile has to be, and where a fetched one lives, is therefore one
-//! definition rather than a convention two crates keep separately.
+//! downloads the `helios-kernel.profdata` a `kernel-profile.yml` run
+//! uploaded, or a release attached, and writes it into the store;
+//! `helios-inspector vm --release` reads the store to build the x86-64
+//! kernel against it (`docs/pgo.md`, #226, #313). What a profile has to
+//! be, and where a fetched one lives, is therefore one definition rather
+//! than a convention two crates keep separately.
 //!
 //! `-C profile-use` takes the *indexed* profile `llvm-profdata merge`
 //! writes, not the `.profraw` the guest kernel exports
@@ -30,20 +31,31 @@ mod store;
 pub use store::{FetchedProfile, KernelProfileStore, KernelProfileStoreError};
 
 /// Name of the release asset every release carries the kernel's profile
-/// under (#226), and of the file the store keeps it in.
+/// under (#226), of the file inside the collection artifact, and of the
+/// file the store keeps it in.
 ///
-/// `release.yml`'s `kernel-profile` job uploads it; nothing else names
-/// it, so a rename is one edit.
+/// `release.yml`'s `kernel-profile` job attaches it and
+/// `kernel-profile.yml` uploads it; nothing else names it, so a rename
+/// is one edit.
 pub const KERNEL_PROFILE_ASSET: &str = "helios-kernel.profdata";
 
-/// The command that puts a release's profile in the store, spelled the
-/// way a user would type it.
+/// Name of the workflow artifact a `kernel-profile.yml` run uploads the
+/// profile as (#313), which is what a fetch without `--tag` resolves.
+pub const KERNEL_PROFILE_ARTIFACT: &str = "helios-kernel-profdata";
+
+/// The workflow that collects the profile on demand, named by every
+/// refusal whose answer is to dispatch it.
+pub const KERNEL_PROFILE_WORKFLOW: &str = "kernel-profile.yml";
+
+/// The command that puts a profile in the store, spelled the way a user
+/// would type it.
 ///
 /// Every refusal that comes of an empty store names it, so the fix is in
 /// the error rather than in the documentation.
 pub const FETCH_COMMAND: &str = "helios-cli profile-fetch";
 
-/// The repository whose releases carry the kernel profile.
+/// The repository whose collections and releases carry the kernel
+/// profile.
 ///
 /// This is where Helios publishes, the way `checkout-wasmtime` pins where
 /// the vendored Wasmtime comes from. `helios-cli profile-fetch --repo`

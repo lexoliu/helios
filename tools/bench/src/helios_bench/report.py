@@ -103,8 +103,9 @@ class RunInfo(BaseModel):
     kernel_profile: str | None = Field(
         default=None,
         description=(
-            "the kernel profile the `helios` kernel was built against: `release <tag>` for the "
-            "profile that release published, or the file the run named (docs/pgo.md)"
+            "the kernel profile the `helios` kernel was built against: the fetched one as its "
+            "record labels it (`release <tag>`, or `<branch>@<sha> run <id>` for a "
+            "kernel-profile.yml collection), or the file the run named (docs/pgo.md)"
         ),
     )
     baseline_kernel_profile: str | None = Field(

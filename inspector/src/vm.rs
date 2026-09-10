@@ -94,8 +94,8 @@ pub(crate) enum VmConfigError {
     #[error("{0}")]
     ProfileUse(#[from] ProfileUseError),
     #[error(
-        "a --release {arch} kernel is built against the kernel profile the latest release \
-         published (docs/pgo.md): {source}"
+        "a --release {arch} kernel is built against the fetched kernel profile \
+         (docs/pgo.md): {source}"
     )]
     ReleaseKernelProfile {
         arch: &'static str,
@@ -737,7 +737,7 @@ struct VmProfile {
     /// code loads (docs/pgo.md).
     profile_generate_linker_script: Option<&'static str>,
     /// Whether a `--release` kernel for this target is built against the
-    /// profile the latest release published (`docs/pgo.md`, #226).
+    /// fetched kernel profile (`docs/pgo.md`, #226, #313).
     ///
     /// Performance is measured on one architecture (AGENTS.md §3.6), and
     /// it is the one whose releases carry a profile: on the others a
@@ -1476,9 +1476,9 @@ fn resolve_build(
         })
         .transpose()?;
     // A release build of the architecture performance is measured on
-    // reads the profile the latest release published, so the kernel a
-    // developer boots and the kernel a release ships are the same build
-    // (#226). An explicit `--profile-use` is still the profile that
+    // reads the fetched profile, so the kernel a developer boots, the
+    // kernel the lanes measure and the kernel a release ships are the
+    // same build (#226, #313). An explicit `--profile-use` is still the profile that
     // wins: it is how one profile is measured against another.
     // A session that builds nothing and names the image it boots needs no
     // profile: a profile describes a build, and there is none here.
@@ -4508,11 +4508,11 @@ mod tests {
             .expect("creating the tag's directory");
         pinned_profile(stored.parent().expect("the tag's directory"));
         store
-            .publish(&helios_profdata::FetchedProfile {
+            .publish(&helios_profdata::FetchedProfile::Release {
                 repository: helios_profdata::RELEASE_REPOSITORY.to_owned(),
                 tag: tag.to_owned(),
             })
-            .expect("recording the release in force");
+            .expect("recording the profile in force");
         let profile = release_kernel_profile(&X86_64_VM_PROFILE, &store)
             .expect("the store holds a profile of the pinned format")
             .expect("the measured target reads it");
