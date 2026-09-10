@@ -8,7 +8,8 @@
 use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::pin;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::task::Poll;
 
 use arrayvec::ArrayVec;
 use futures::channel::oneshot;
@@ -125,8 +126,21 @@ struct ScriptedDevice {
     /// When `Some`, `start` answers this error instead of running.
     start_error: Option<AudioError>,
     /// When `Some`, `write` answers this error on its first poll
-    /// instead of recording the period.
+    /// instead of recording the period — once it has taken
+    /// `writes_before_error` periods, so a refusal can land while the
+    /// device is still holding earlier ones.
     write_error: Option<AudioError>,
+    /// Periods `write` takes before `write_error` starts answering.
+    writes_before_error: u32,
+    /// Periods `write` has taken so far.
+    writes_taken: AtomicU32,
+    /// Writes from this call index on stay in the device's hands until
+    /// `release` completes them — the behaviour the spec makes the
+    /// device guarantee, which is what the pump's teardown collects.
+    holds_after: u32,
+    /// Set by `release`; the wake list for the writes it completes.
+    released: AtomicBool,
+    held_wakers: Mutex<Vec<core::task::Waker>>,
     /// Whether `write` yields once before completing. A device that
     /// answers on its first poll is what the pump's priming has to
     /// keep up with.
@@ -145,6 +159,11 @@ impl ScriptedDevice {
             latency_bytes: 0,
             start_error: None,
             write_error: None,
+            writes_before_error: 0,
+            writes_taken: AtomicU32::new(0),
+            holds_after: u32::MAX,
+            released: AtomicBool::new(false),
+            held_wakers: Mutex::new(Vec::new()),
             yield_on_write: true,
         }
     }
@@ -194,16 +213,44 @@ impl PlaybackDevice for ScriptedDevice {
     }
 
     async fn release(&self, _stream: StreamId) -> AudioResult<()> {
+        // The promise the spec makes of the device: a release answers
+        // only once every message it still holds for the stream has
+        // completed, so the held writes end here rather than being
+        // left outstanding.
+        self.released.store(true, Ordering::Release);
+        for waker in self.held_wakers.lock().drain(..) {
+            waker.wake();
+        }
         Ok(())
     }
 
     async fn write(&self, _stream: StreamId, period: &[u8]) -> AudioResult<XferStatus> {
-        if let Some(error) = self.write_error {
+        let call = self.writes_taken.load(Ordering::Acquire);
+        if let Some(error) = self.write_error
+            && call >= self.writes_before_error
+        {
             return Err(error);
         }
+        self.writes_taken.fetch_add(1, Ordering::AcqRel);
         let held = self.in_flight.fetch_add(1, Ordering::AcqRel) + 1;
         self.high_water.fetch_max(held, Ordering::AcqRel);
-        if self.yield_on_write {
+        if call >= self.holds_after {
+            // Armed before the flag is read a second time, so a release
+            // that lands between the look and the park is not slept
+            // through.
+            core::future::poll_fn(|cx| {
+                if self.released.load(Ordering::Acquire) {
+                    return Poll::Ready(());
+                }
+                self.held_wakers.lock().push(cx.waker().clone());
+                if self.released.load(Ordering::Acquire) {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
+        } else if self.yield_on_write {
             // One yield, so several writes are genuinely outstanding at
             // once rather than each completing before the next is
             // pushed.
@@ -843,11 +890,15 @@ fn a_released_claim_frees_its_word_only_after_the_device_is_stopped() {
     );
 }
 
-/// A pump that dies before the clock starts still ends the producer.
+/// A pump that dies before the clock starts still ends the producer,
+/// and it takes back every chain it already handed the device.
 ///
-/// The device refused `start`, so no period is ever coming back; a
-/// producer left parked on one would wait for ever. Every exit of the
-/// pump closes the ring, which is what the producer's next write sees.
+/// The device refused `start`, so no period is ever coming back on its
+/// own; a producer left parked on one would wait for ever. Every exit
+/// of the pump closes the ring, which is what the producer's next write
+/// sees, and the release it then asks for is what makes the device
+/// complete the writes it is still holding — a pump that left without
+/// collecting them would have left the device holding periods for ever.
 #[test]
 fn a_device_that_refuses_to_start_ends_its_producer() {
     test_hooks::install();
@@ -860,6 +911,11 @@ fn a_device_that_refuses_to_start_ends_its_producer() {
 
     let mut device = ScriptedDevice::new(topology(&[playback_stream(0)]));
     device.start_error = Some(AudioError::DeviceIo);
+    // The primed writes stay in the device's hands until the release
+    // the teardown asks for completes them, which is the real device's
+    // promise — the `in_flight` count below is the leak this would
+    // leave if the pump dropped them instead.
+    device.holds_after = 0;
     let timer = Timer::new(TestCpu::without_entropy());
     let period = alloc::vec![0x11_u8; params.period_bytes as usize];
 
@@ -881,15 +937,23 @@ fn a_device_that_refuses_to_start_ends_its_producer() {
         Written::Ended,
         "the producer is ended, not parked, when the pump dies"
     );
+    assert_eq!(
+        device.in_flight.load(Ordering::Acquire),
+        0,
+        "every chain the pump submitted was collected before it left"
+    );
 }
 
 /// A period the device refuses kills the stream the same way: the pump
-/// closes the ring as it leaves, and the producer's next write ends
-/// rather than parking on a reclaim that cannot come.
+/// closes the ring as it leaves, the producer's next write ends rather
+/// than parking on a reclaim that cannot come — and the chains already
+/// submitted are collected rather than left with the device.
 ///
 /// The refusal is synchronous — the write answers on the first poll,
 /// inside the pump's priming pass — so this is also the check that a
-/// first-poll completion takes the same path as every other.
+/// first-poll completion takes the same path as every other. The first
+/// period is taken before the refusals start, which is what leaves a
+/// chain outstanding when the stream ends.
 #[test]
 fn a_rejected_period_ends_the_stream_and_its_producer() {
     test_hooks::install();
@@ -901,7 +965,11 @@ fn a_rejected_period_ends_the_stream_and_its_producer() {
     let (ring, params) = audio.negotiate(TONE).expect("the device takes this format");
 
     let mut device = ScriptedDevice::new(topology(&[playback_stream(0)]));
-    device.yield_on_write = false;
+    // The first write is taken and held — the release in the teardown
+    // is what completes it — so the refusal lands with a chain
+    // genuinely outstanding.
+    device.holds_after = 0;
+    device.writes_before_error = 1;
     device.write_error = Some(AudioError::PeriodLength {
         stream: StreamId::new(0),
         period_bytes: params.period_bytes,
@@ -930,6 +998,63 @@ fn a_rejected_period_ends_the_stream_and_its_producer() {
         device.started.load(Ordering::Acquire),
         1,
         "the clock was asked to start before the refusal settled"
+    );
+    assert_eq!(
+        device.in_flight.load(Ordering::Acquire),
+        0,
+        "the chain the device was still holding came back with the rest"
+    );
+}
+
+/// The same refusal arriving mid-stream — after the clock has started
+/// and with other chains still in the device's hands — ends the pump
+/// the same way, and the outstanding chains are collected before it
+/// leaves rather than dropped on the device.
+#[test]
+fn a_rejected_period_mid_stream_collects_the_rest_of_the_ring() {
+    test_hooks::install();
+    let (service, _inboxes) = service_of(&[playback_stream(0)]);
+    let mut audio = AudioOwnership::new();
+    audio
+        .claim(&service, 0, window())
+        .expect("the stream is free");
+    let (ring, params) = audio.negotiate(TONE).expect("the device takes this format");
+
+    let mut device = ScriptedDevice::new(topology(&[playback_stream(0)]));
+    // The first write plays out so its reclaim lets the producer commit
+    // the period the refusal arrives on; the rest stay in the device's
+    // hands until the release completes them — a mid-stream refusal
+    // with three chains genuinely outstanding.
+    device.holds_after = 1;
+    device.writes_before_error = PERIODS_IN_FLIGHT as u32;
+    device.write_error = Some(AudioError::DeviceIo);
+    let timer = Timer::new(TestCpu::without_entropy());
+    let period = alloc::vec![0x22_u8; params.period_bytes as usize];
+
+    let periods_written = block_on(async {
+        let player = async {
+            let mut writer = PeriodWriter::new(ring.clone());
+            // The write that lands between a reclaim and the refusal is
+            // still taken; what the pump owes the producer is an end,
+            // not a refusal of its own.
+            let mut written = 0_usize;
+            while let Written::Took(taken) = write_once(&mut writer, &period).await {
+                assert_eq!(taken, period.len());
+                written += 1;
+            }
+            written
+        };
+        let pump = pin!(play(&device, stream_of(&service), &ring, params, &timer));
+        join(pin!(player), pump).await.0
+    });
+    assert!(
+        periods_written > PERIODS_IN_FLIGHT,
+        "the refusal arrived mid-stream, past the ring's first fill"
+    );
+    assert_eq!(
+        device.in_flight.load(Ordering::Acquire),
+        0,
+        "the chains already with the device were collected, not left behind"
     );
 }
 

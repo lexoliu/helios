@@ -29,11 +29,16 @@
 //! * A stream's playback task is the only thing that submits to the
 //!   device's transmit queue for that stream, and it keeps
 //!   [`PERIODS_IN_FLIGHT`] chains there whenever the producer has
-//!   supplied them. It is never cancelled while a chain is outstanding:
-//!   a `write` future dropped between its submission and its completion
-//!   would leave a descriptor in the device's ring that nobody reaps,
-//!   which is why a stop closes the producer's ring rather than
-//!   interrupting the task.
+//!   supplied them. It is never cancelled while a chain is outstanding,
+//!   and it never leaves one outstanding either: every exit — a refused
+//!   start, a rejected period — releases the stream first, which is the
+//!   request that makes the device complete every message it still
+//!   holds, and the task collects each chain it submitted before it
+//!   returns. A `write` future dropped between its submission and its
+//!   completion would leave a descriptor in the device's ring that
+//!   nobody reaps, which is both why a stop closes the producer's ring
+//!   rather than interrupting the task and why the pump cannot simply
+//!   return on an error.
 //!
 //! Both hold the same device handle. The trait's own contract says every
 //! method takes `&self`, may be called from several tasks at once, and
@@ -301,12 +306,12 @@ async fn serve_negotiation<Device, CpuImpl>(
             return;
         }
     }
+    // The pump leaves with the stream stopped and released and every
+    // chain it submitted collected, which is what a `stop` waits for. A
+    // player whose material simply ran out reaches this before it gets
+    // round to asking, so the answer is left on the ring rather than
+    // handed to whoever is waiting now.
     play(device, shared, &ring, params, timer).await;
-    quiesce(device, shared).await;
-    // The device has stopped and given back what it allocated, which is
-    // what a `stop` waits for. A player whose material simply ran out
-    // reaches this before it gets round to asking, so the answer is left
-    // on the ring rather than handed to whoever is waiting now.
     ring.finish_teardown();
     // Nothing will publish another period or another underrun for this
     // stream, so its feedback ends here. A player reads it to the close
@@ -360,7 +365,8 @@ fn refused(stream: StreamId, step: &'static str, error: AudioError) -> AudioServ
     }
 }
 
-/// Keeps the device's transmit ring fed until the producer's ring ends.
+/// Keeps the device's transmit ring fed until the producer's ring ends,
+/// then leaves the device the way the task found it.
 ///
 /// Every period the producer commits is handed to the device as its own
 /// chain, up to [`PERIODS_IN_FLIGHT`] of them at once, and each one goes
@@ -368,6 +374,17 @@ fn refused(stream: StreamId, step: &'static str, error: AudioError) -> AudioServ
 /// started only once a chain has actually been submitted: a device told
 /// to play with nothing queued reports an underrun of the kernel's own
 /// making, and an underrun this path reports has to be the player's.
+///
+/// Every exit — the ring played out, a refused start, a rejected
+/// period — runs the same teardown: the clock stops, the device
+/// releases the stream, and each chain the pump submitted is collected.
+/// The order is what makes collecting them safe: the release is the one
+/// request the device must answer only after completing every I/O
+/// message it still holds, so the completions of the pump's outstanding
+/// writes are in its used ring by then, and settling each of them keeps
+/// a `write` future from ever being dropped between its submission and
+/// its completion — which is the move that would leave a descriptor in
+/// the device's ring that nobody reaps.
 pub(super) async fn play<Device, CpuImpl>(
     device: &Device,
     shared: &StreamShared,
@@ -385,6 +402,11 @@ pub(super) async fn play<Device, CpuImpl>(
     let mut writes = pin!(InFlight::<_, PERIODS_IN_FLIGHT>::new());
     let mut started = false;
     let mut last_latency = 0_u32;
+    // Set when the device refused the stream — a rejected period or a
+    // start that failed — because those endings carry no tail to wait
+    // out: the latency the device last reported describes sound it
+    // never began to play.
+    let mut refused = false;
     loop {
         // Armed before the filled list is read, so a period committed
         // between the read and the park still completes this wait.
@@ -416,19 +438,21 @@ pub(super) async fn play<Device, CpuImpl>(
                         stream = stream.index(),
                         "the sound device would not start a negotiated stream"
                     );
-                    // The producer may be parked mid-write; a pump that
-                    // leaves the ring open would park it for ever.
-                    ring.close();
-                    return;
+                    refused = true;
                 }
             }
             for (index, outcome) in primed {
                 if let Completion::Stop =
                     settle(shared, ring, stream, index, outcome, &mut last_latency)
                 {
-                    ring.close();
-                    return;
+                    refused = true;
                 }
+            }
+            if refused {
+                // The producer may be parked mid-write; a pump that
+                // leaves the ring open would park it for ever.
+                ring.close();
+                break;
             }
         }
         if writes.is_empty() {
@@ -443,8 +467,9 @@ pub(super) async fn play<Device, CpuImpl>(
                 if let Completion::Stop =
                     settle(shared, ring, stream, index, outcome, &mut last_latency)
                 {
+                    refused = true;
                     ring.close();
-                    return;
+                    break;
                 }
             }
             // The set is not empty, so its stream cannot have ended.
@@ -452,10 +477,21 @@ pub(super) async fn play<Device, CpuImpl>(
             Either::Right(((), _)) => continue,
         }
     }
-    // Every period is played out of the device's ring except the bytes
-    // it still held when it took the last one. Stopping now would cut
-    // them off, so the tail is waited out rather than truncated.
-    drain_device_latency(last_latency, params, timer).await;
+    if !refused {
+        // Every period is played out of the device's ring except the
+        // bytes it still held when it took the last one. Stopping now
+        // would cut them off, so the tail is waited out rather than
+        // truncated.
+        drain_device_latency(last_latency, params, timer).await;
+    }
+    // The release is what brings every chain the device still holds to
+    // its used ring: the device is not allowed to answer it while a
+    // message is pending, so once it has, the drain below cannot park
+    // on a write that is never coming back.
+    quiesce(device, shared).await;
+    while let Some((index, outcome)) = writes.next().await {
+        settle(shared, ring, stream, index, outcome, &mut last_latency);
+    }
 }
 
 /// What one finished write leaves the stream doing.
