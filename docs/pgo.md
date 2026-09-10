@@ -194,8 +194,8 @@ nothing for the classes behind it. It reports no numbers and it is not a
 benchmark surface — counter updates in the executor, the virtio queues
 and the netstack's per-packet path change scheduling, so anything timed
 on an instrumented kernel would be measuring the counters. The network
-class is not in the profile yet: it needs the privileged tap backend the
-suite lane provisions.
+class is in the profile: the collection provisions the tap backend the
+suite lane times it on and boots the instrumented kernel with it (#315).
 
 ### Spending it: `-C profile-use`
 
@@ -306,10 +306,10 @@ read the profile. The report is the paired table and the per-workload
 medians; read the headline compute workloads first (`aot-curl`,
 `cpython-json`, `quickjs-loop`), because they are what the profile covers.
 
-The `net` class is timed on both images and is **not in the profile**: the
-collection job runs the classes that need no privileged host networking,
-so the candidate's packet path carries no counts. Profiling it needs a
-collection run on a lane that provisions the tap backend.
+The `net` class is in the profile like every other: the collection
+provisions the tap backend and runs the whole suite on it, so the
+candidate's packet path carries counts from the workloads the table times
+it on (#315).
 
 The job reports and does not gate. Its verdict is about profile-guided
 optimisation of the kernel, not about the pull request that happened to
