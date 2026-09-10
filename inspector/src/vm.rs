@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use askama::Template;
 use clap::{Args as ClapArgs, Subcommand, ValueEnum};
-use console::style;
+use console::{strip_ansi_codes, style};
 use directories::ProjectDirs;
 use helios_hal::fs::HOST_SHARE_MOUNT_TAG;
 use helios_inspector_protocol::debugger::filesystem as debugger_fs;
@@ -197,6 +197,18 @@ pub(crate) enum BuildStepError {
         label: String,
         #[source]
         source: io::Error,
+    },
+    #[error("failed to read the kernel image {path}: {source}")]
+    KernelImageRead {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to read the symbols of the kernel image {path}: {source}")]
+    KernelImageSymbols {
+        path: String,
+        #[source]
+        source: object::Error,
     },
     #[error("failed to write the uncovered-function list {path}: {source}")]
     UncoveredList {
@@ -3939,15 +3951,39 @@ fn run_step(label: &str, command: &mut Command) -> Result<(), BuildStepError> {
 
 /// The missing-function warnings a profile-use kernel build emitted.
 ///
-/// The count is kept per crate because that is the figure a coverage gap
-/// is diagnosed from: a profile that misses `wasmtime` and one that
-/// misses `helios-kernel` ask for different collections.
+/// A warning names a function as it was codegen'd in one unit, so the
+/// same function warns once per codegen unit it lands in and a function
+/// dead-stripped at link warns without ever reaching the image. The
+/// symbol-to-crate map is kept so the figures can be stated against the
+/// kernel's own symbol table rather than against warning volume.
 #[derive(Default)]
 struct PgoUncovered {
     /// The warning lines, verbatim (ANSI codes stripped).
     lines: Vec<String>,
-    /// How many of them each crate's codegen units produced.
+    /// Each function a warning named, under the crate of the codegen
+    /// unit that first warned it.
+    symbols: BTreeMap<String, String>,
+}
+
+/// How a profile-use kernel's functions split: the image's `STT_FUNC`
+/// symbols (normalized of the `.llvm.<hash>` suffix a link-time rename
+/// leaves) against the subset a warning named, per crate.
+struct PgoCoverage {
+    /// Function symbols the kernel image defines.
+    functions: u64,
+    /// Of them, how many a warning named.
+    uncovered: u64,
+    /// That subset, per crate.
     per_crate: BTreeMap<String, u64>,
+}
+
+/// The function symbols the kernel image defines: the `STT_FUNC`
+/// population `helios-bench symbols` exports, with each name normalized
+/// of the `.llvm.<hash>` suffix the linker gives a duplicated internal
+/// function so it matches the warning's pre-link name.
+struct KernelFunctions {
+    total: u64,
+    names: Vec<String>,
 }
 
 /// The text LLVM puts between the codegen unit and the function a
@@ -3981,9 +4017,20 @@ fn run_pgo_kernel_step(
         .stderr
         .take()
         .expect("the kernel build's stderr was piped");
-    let mut forward = io::stderr().lock();
-    let uncovered = filter_pgo_stderr(label, &mut io::BufReader::new(stderr), &mut forward)?;
-    drop(forward);
+    // Each forwarded line takes the stderr lock for that one write; a
+    // lock held for the whole build would freeze the spinner's ticker
+    // thread on the longest step of the job.
+    let mut forward = io::stderr();
+    let uncovered = match filter_pgo_stderr(label, &mut io::BufReader::new(stderr), &mut forward) {
+        Ok(uncovered) => uncovered,
+        Err(error) => {
+            // Reap rather than orphan the build, and leave the spinner
+            // the way `run_step` leaves it.
+            let _ = child.wait();
+            spinner.finish_and_clear();
+            return Err(error);
+        }
+    };
     let status = child.wait().map_err(|source| BuildStepError::Spawn {
         label: label.to_owned(),
         source,
@@ -4000,11 +4047,21 @@ fn run_pgo_kernel_step(
         .as_ref()
         .expect("a profile-use build has its profile")
         .path();
-    let list = write_pgo_uncovered(profile, kernel, &uncovered)?;
+    let result = kernel_functions(kernel).and_then(|functions| {
+        let coverage = uncovered.coverage(&functions);
+        write_pgo_uncovered(profile, kernel, &uncovered, &coverage).map(|list| (coverage, list))
+    });
+    let (coverage, list) = match result {
+        Ok(pair) => pair,
+        Err(error) => {
+            spinner.finish_and_clear();
+            return Err(error);
+        }
+    };
     spinner.finish_with_message(format!("{} {}", style("built").green(), label));
     // The step log's one line: how much of the kernel the profile says
     // nothing about, and where the list landed.
-    eprintln!("{}", uncovered.summary(&list));
+    eprintln!("{}", coverage.summary(&list));
     Ok(())
 }
 
@@ -4031,10 +4088,10 @@ fn filter_pgo_stderr(
         if input.read_line(&mut line).map_err(captured)? == 0 {
             break;
         }
-        let plain = console::strip_ansi_codes(line.trim_end());
-        if let Some(krate) = pgo_uncovered_crate(&plain) {
+        let plain = strip_ansi_codes(line.trim_end());
+        if let Some((krate, symbol)) = pgo_uncovered_parts(&plain) {
             uncovered.lines.push(plain.into_owned());
-            *uncovered.per_crate.entry(krate).or_default() += 1;
+            uncovered.symbols.entry(symbol).or_insert(krate);
             // rustc ends each diagnostic with a blank line; the one that
             // belongs to a redirected warning goes with it.
             drop_blank = true;
@@ -4050,30 +4107,76 @@ fn filter_pgo_stderr(
     Ok(uncovered)
 }
 
-/// The crate a missing-function warning belongs to, when the line is
-/// one.
+/// The function symbols the kernel image defines: the denominator the
+/// uncovered warnings are a share of.
+///
+/// rustc prints no such figure — the warning names only what the profile
+/// missed — so the count is the image's own `STT_FUNC` symbols, the same
+/// population `helios-bench symbols` exports.
+fn kernel_functions(kernel: &Path) -> Result<KernelFunctions, BuildStepError> {
+    use object::{Object as _, ObjectSymbol as _, SymbolKind};
+    let kernel_image = |source: io::Error| BuildStepError::KernelImageRead {
+        path: kernel.display().to_string(),
+        source,
+    };
+    let image_symbols = |source: object::Error| BuildStepError::KernelImageSymbols {
+        path: kernel.display().to_string(),
+        source,
+    };
+    let bytes = fs::read(kernel).map_err(kernel_image)?;
+    let image = object::File::parse(&*bytes).map_err(image_symbols)?;
+    let mut total = 0;
+    let mut names = Vec::new();
+    for symbol in image.symbols() {
+        if symbol.kind() != SymbolKind::Text || symbol.is_undefined() {
+            continue;
+        }
+        total += 1;
+        names.push(base_name(symbol.name().map_err(image_symbols)?).to_owned());
+    }
+    Ok(KernelFunctions { total, names })
+}
+
+/// A symbol's name as the warning that precedes the link would know it:
+/// the `.llvm.<hash>` suffix a duplicated internal function picks up at
+/// link time stripped back off.
+fn base_name(symbol: &str) -> &str {
+    match symbol.rsplit_once(".llvm.") {
+        Some((base, suffix))
+            if !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            base
+        }
+        _ => symbol,
+    }
+}
+
+/// The crate a missing-function warning belongs to and the function it
+/// names, when the line is one.
 ///
 /// The codegen-unit prefix (`<crate>.<hash>-cgu.<n>`) is how the warning
-/// itself names its crate, so the count stays right however the units of
-/// a parallel cargo build interleave. A line whose prefix fits no known
-/// shape is counted under the prefix rustc gave it.
-fn pgo_uncovered_crate(line: &str) -> Option<String> {
-    let (cgu, _) = line
+/// itself names its crate, so the attribution stays right however the
+/// units of a parallel cargo build interleave. A line whose prefix fits
+/// no known shape is counted under the prefix rustc gave it.
+fn pgo_uncovered_parts(line: &str) -> Option<(String, String)> {
+    let (cgu, rest) = line
         .strip_prefix("warning: ")?
         .split_once(PGO_MISSING_FUNCTION)?;
-    let Some((stem, _)) = cgu.rsplit_once("-cgu.") else {
-        return Some(cgu.to_owned());
+    let (symbol, _) = rest.split_once(' ').unwrap_or((rest, ""));
+    let krate = match cgu.rsplit_once("-cgu.") {
+        Some((stem, _)) => match stem.rsplit_once('.') {
+            Some((krate, hash))
+                if !krate.is_empty()
+                    && !hash.is_empty()
+                    && hash.bytes().all(|byte| byte.is_ascii_hexdigit()) =>
+            {
+                krate.to_owned()
+            }
+            _ => cgu.to_owned(),
+        },
+        None => cgu.to_owned(),
     };
-    match stem.rsplit_once('.') {
-        Some((krate, hash))
-            if !krate.is_empty()
-                && !hash.is_empty()
-                && hash.bytes().all(|byte| byte.is_ascii_hexdigit()) =>
-        {
-            Some(krate.to_owned())
-        }
-        _ => Some(cgu.to_owned()),
-    }
+    Some((krate, symbol.to_owned()))
 }
 
 /// The file a profile-use kernel's uncovered-function list is written
@@ -4087,20 +4190,26 @@ fn pgo_uncovered_list_path(kernel: &Path) -> PathBuf {
 }
 
 /// The uncovered-function list of a profile-use kernel build, written
-/// beside the kernel image it describes.
+/// beside the kernel image it describes. The header's first lines carry
+/// the same figures the step log's summary does — the counts the bench
+/// report reads off it.
 fn write_pgo_uncovered(
     profile: &Path,
     kernel: &Path,
     uncovered: &PgoUncovered,
+    coverage: &PgoCoverage,
 ) -> Result<PathBuf, BuildStepError> {
     let list = pgo_uncovered_list_path(kernel);
-    let total: u64 = uncovered.per_crate.values().sum();
     let mut document = format!(
-        "# {total} functions the kernel profile covers nothing about, in {} crates\n# profile: {}\n",
-        uncovered.per_crate.len(),
+        "# uncovered: {} of {} functions ({:.1}%)\n# warnings emitted: {} in {} crates\n# profile: {}\n",
+        coverage.uncovered,
+        coverage.functions,
+        coverage.percent(),
+        uncovered.lines.len(),
+        coverage.per_crate.len(),
         profile.display(),
     );
-    for (krate, count) in uncovered.crates_by_size() {
+    for (krate, count) in coverage.crates_by_size() {
         document.push_str(&format!("# {krate}: {count}\n"));
     }
     for line in &uncovered.lines {
@@ -4115,6 +4224,29 @@ fn write_pgo_uncovered(
 }
 
 impl PgoUncovered {
+    /// The warnings split against the kernel image's functions: of the
+    /// image's `STT_FUNC` symbols, the ones a warning named, per crate of
+    /// the codegen unit that warned. A warning for a function the linker
+    /// dead-stripped is listed but not counted — it describes no function
+    /// the image contains.
+    fn coverage(&self, functions: &KernelFunctions) -> PgoCoverage {
+        let mut uncovered = 0;
+        let mut per_crate: BTreeMap<String, u64> = BTreeMap::new();
+        for name in &functions.names {
+            if let Some(krate) = self.symbols.get(name) {
+                uncovered += 1;
+                *per_crate.entry(krate.clone()).or_default() += 1;
+            }
+        }
+        PgoCoverage {
+            functions: functions.total,
+            uncovered,
+            per_crate,
+        }
+    }
+}
+
+impl PgoCoverage {
     /// The per-crate counts, largest first so the summary and the list
     /// header lead with where the coverage is missing most.
     fn crates_by_size(&self) -> Vec<(&str, u64)> {
@@ -4127,19 +4259,36 @@ impl PgoUncovered {
         crates
     }
 
+    /// The share of the kernel's functions the profile covered nothing
+    /// about.
+    fn percent(&self) -> f64 {
+        if self.functions == 0 {
+            0.0
+        } else {
+            self.uncovered as f64 / self.functions as f64 * 100.0
+        }
+    }
+
     /// The one line the step log gets for a profile-use kernel: the
-    /// uncovered count, the per-crate counts it sums over, and where the
-    /// full list was written.
+    /// uncovered count against the kernel's function count, the per-crate
+    /// counts it sums over, and where the full list was written.
     fn summary(&self, list: &Path) -> String {
-        let total: u64 = self.per_crate.values().sum();
         let crates = self
             .crates_by_size()
             .into_iter()
             .map(|(krate, count)| format!("{krate} {count}"))
-            .collect::<Vec<_>>()
-            .join(", ");
+            .collect::<Vec<_>>();
+        let crates = if crates.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", crates.join(", "))
+        };
         format!(
-            "pgo uncovered functions: {total} in {} crates ({crates}); full list: {}",
+            "pgo uncovered functions: {} of {} ({:.1}%) in {} crates{crates}; \
+             full list: {}",
+            self.uncovered,
+            self.functions,
+            self.percent(),
             self.per_crate.len(),
             list.display()
         )
@@ -6219,22 +6368,28 @@ mod tests {
     #[test]
     fn an_uncovered_warning_names_its_crate_in_the_codegen_unit() {
         assert_eq!(
-            pgo_uncovered_crate(&console::strip_ansi_codes(PGO_WARNING)).as_deref(),
-            Some("helios_kernel")
+            pgo_uncovered_parts(&strip_ansi_codes(PGO_WARNING)),
+            Some((
+                "helios_kernel".to_owned(),
+                "_RNvXNtB5_6kernel4main".to_owned()
+            ))
         );
         // The hash between crate and `-cgu` is not fixed-width; run
         // 34443906698's log carries `cranelift_bforest.ba39053f92a566e`.
         let short_hash = "warning: cranelift_bforest.ba39053f92a566e-cgu.0: no profile data available for function _RNvY Hash = 451 up to 0 count discarded";
         assert_eq!(
-            pgo_uncovered_crate(short_hash).as_deref(),
-            Some("cranelift_bforest")
+            pgo_uncovered_parts(short_hash),
+            Some(("cranelift_bforest".to_owned(), "_RNvY".to_owned()))
         );
         // A prefix that fits no CGU shape is counted under itself rather
         // than dropped: it is still one uncovered function.
         let odd = "warning: something-else: no profile data available for function _RNvZ Hash = 1 up to 0 count discarded";
-        assert_eq!(pgo_uncovered_crate(odd).as_deref(), Some("something-else"));
-        assert!(pgo_uncovered_crate("warning: unused variable `x`").is_none());
-        assert!(pgo_uncovered_crate("    Finished `release` profile").is_none());
+        assert_eq!(
+            pgo_uncovered_parts(odd),
+            Some(("something-else".to_owned(), "_RNvZ".to_owned()))
+        );
+        assert!(pgo_uncovered_parts("warning: unused variable `x`").is_none());
+        assert!(pgo_uncovered_parts("    Finished `release` profile").is_none());
     }
 
     #[test]
@@ -6250,8 +6405,8 @@ mod tests {
         let uncovered = filter_pgo_stderr("building kernel", stderr.as_bytes(), &mut forwarded)
             .expect("the captured stderr drains");
         assert_eq!(uncovered.lines.len(), 2, "{:?}", uncovered.lines);
-        assert_eq!(uncovered.per_crate["helios_kernel"], 1);
-        assert_eq!(uncovered.per_crate["wasmtime"], 1);
+        assert_eq!(uncovered.symbols["_RNvXNtB5_6kernel4main"], "helios_kernel");
+        assert_eq!(uncovered.symbols["_RNvYbar"], "wasmtime");
         let log = String::from_utf8(forwarded).expect("forwarded output is UTF-8");
         assert!(!log.contains("no profile data"), "{log}");
         for kept in [
@@ -6268,28 +6423,63 @@ mod tests {
         assert_eq!(log.lines().filter(|line| line.is_empty()).count(), 1);
     }
 
+    /// A build's warnings, its kernel image's functions, and the
+    /// coverage they add up to, for the list-file and summary tests.
+    fn coverage_fixture() -> (PgoUncovered, KernelFunctions, PgoCoverage) {
+        let uncovered = PgoUncovered {
+            lines: [
+                "warning: wasmtime.abcdef-cgu.0: no profile data available for function _RNvA Hash = 1 up to 0 count discarded",
+                "warning: helios_kernel.ab-cgu.08: no profile data available for function _RNvB Hash = 2 up to 0 count discarded",
+                "warning: wasmtime.abcdef-cgu.0: no profile data available for function _RNvC Hash = 3 up to 0 count discarded",
+                "warning: helios_kernel.ab-cgu.08: no profile data available for function _RNvD Hash = 4 up to 0 count discarded",
+                // One function warned in two codegen units is still one
+                // uncovered function, and a warning for a function the linker
+                // dropped is listed without counting against the image.
+                "warning: wasmtime.abcdef-cgu.1: no profile data available for function _RNvA Hash = 5 up to 0 count discarded",
+                "warning: wasmtime.abcdef-cgu.1: no profile data available for function _RNvStripped Hash = 6 up to 0 count discarded",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+            symbols: [
+                ("_RNvA", "wasmtime"),
+                ("_RNvB", "helios_kernel"),
+                ("_RNvC", "wasmtime"),
+                ("_RNvD", "helios_kernel"),
+                ("_RNvStripped", "wasmtime"),
+            ]
+            .into_iter()
+            .map(|(symbol, krate)| (symbol.to_owned(), krate.to_owned()))
+            .collect(),
+        };
+        let functions = KernelFunctions {
+            total: 6,
+            names: ["_RNvA", "_RNvB", "_RNvC", "_RNvD", "_RNvE", "_RNvF"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        };
+        let coverage = uncovered.coverage(&functions);
+        assert_eq!(
+            (
+                coverage.uncovered,
+                coverage.functions,
+                coverage.per_crate.len()
+            ),
+            (4, 6, 2)
+        );
+        (uncovered, functions, coverage)
+    }
+
     #[test]
     fn the_uncovered_list_lands_beside_the_kernel_and_carries_the_counts() {
         let directory = tempfile::tempdir().expect("a temporary target directory");
         let kernel = directory.path().join("profile-use").join("helios");
         fs::create_dir_all(kernel.parent().expect("the kernel's directory"))
             .expect("the build directory cargo made");
-        let mut uncovered = PgoUncovered::default();
-        for (krate, count) in [("helios_kernel", 2u64), ("wasmtime", 3)] {
-            uncovered.per_crate.insert(krate.to_owned(), count);
-        }
-        uncovered.lines = [
-            "warning: wasmtime.abcdef-cgu.0: no profile data available for function _RNvA Hash = 1 up to 0 count discarded",
-            "warning: helios_kernel.ab-cgu.08: no profile data available for function _RNvB Hash = 2 up to 0 count discarded",
-            "warning: wasmtime.abcdef-cgu.0: no profile data available for function _RNvC Hash = 3 up to 0 count discarded",
-            "warning: helios_kernel.ab-cgu.08: no profile data available for function _RNvD Hash = 4 up to 0 count discarded",
-            "warning: wasmtime.abcdef-cgu.1: no profile data available for function _RNvE Hash = 5 up to 0 count discarded",
-        ]
-        .into_iter()
-        .map(str::to_owned)
-        .collect();
+        let (uncovered, _functions, coverage) = coverage_fixture();
         let profile = Path::new("/checkout/target/profiles/run-1/helios-kernel.profdata");
-        let list = write_pgo_uncovered(profile, &kernel, &uncovered)
+        let list = write_pgo_uncovered(profile, &kernel, &uncovered, &coverage)
             .expect("a directory that exists takes the list");
         assert_eq!(
             list,
@@ -6300,33 +6490,105 @@ mod tests {
         let document = fs::read_to_string(&list).expect("the list was written");
         assert!(
             document.starts_with(
-                "# 5 functions the kernel profile covers nothing about, in 2 crates\n"
+                "# uncovered: 4 of 6 functions (66.7%)\n# warnings emitted: 6 in 2 crates\n"
             ),
             "{document}"
         );
-        assert!(document.contains("# wasmtime: 3\n"), "{document}");
+        assert!(document.contains("# wasmtime: 2\n"), "{document}");
         assert!(document.contains("# helios_kernel: 2\n"), "{document}");
+        // Every warning is listed, dead-stripped functions included.
         assert_eq!(
             document
                 .lines()
                 .filter(|line| !line.starts_with('#'))
                 .count(),
-            5,
+            6,
             "{document}"
         );
     }
 
     #[test]
-    fn the_summary_line_carries_the_counts_and_the_list_path() {
-        let mut uncovered = PgoUncovered::default();
-        uncovered.per_crate.insert("helios_kernel".to_owned(), 2792);
-        uncovered.per_crate.insert("wasmtime".to_owned(), 6129);
-        let summary = uncovered.summary(Path::new("/t/profile-use/helios.pgo-uncovered.txt"));
+    fn the_summary_line_carries_the_counts_the_total_and_the_list_path() {
+        let (_uncovered, _functions, coverage) = coverage_fixture();
+        let summary = coverage.summary(Path::new("/t/profile-use/helios.pgo-uncovered.txt"));
         assert_eq!(
             summary,
-            "pgo uncovered functions: 8921 in 2 crates (wasmtime 6129, helios_kernel 2792); \
+            "pgo uncovered functions: 4 of 6 (66.7%) in 2 crates (helios_kernel 2, wasmtime 2); \
              full list: /t/profile-use/helios.pgo-uncovered.txt"
         );
+        // A fully-covered build reads as zero of a total, with no empty
+        // crate list trailing it.
+        let summary = PgoCoverage {
+            functions: 40000,
+            uncovered: 0,
+            per_crate: BTreeMap::new(),
+        }
+        .summary(Path::new("/t/profile-use/helios.pgo-uncovered.txt"));
+        assert_eq!(
+            summary,
+            "pgo uncovered functions: 0 of 40000 (0.0%) in 0 crates; \
+             full list: /t/profile-use/helios.pgo-uncovered.txt"
+        );
+    }
+
+    #[test]
+    fn the_function_count_is_the_defined_text_symbols() {
+        let mut elf = object::write::Object::new(
+            object::BinaryFormat::Elf,
+            object::Architecture::X86_64,
+            object::Endianness::Little,
+        );
+        let text = elf.section_id(object::write::StandardSection::Text);
+        let data = elf.section_id(object::write::StandardSection::Data);
+        for name in ["_a", "_b", "_c"] {
+            elf.add_symbol(object::write::Symbol {
+                name: name.as_bytes().to_vec(),
+                value: 0x1000,
+                size: 16,
+                kind: object::SymbolKind::Text,
+                scope: object::SymbolScope::Linkage,
+                weak: false,
+                section: object::write::SymbolSection::Section(text),
+                flags: object::SymbolFlags::None,
+            });
+        }
+        // A data symbol and an undefined import are not functions the
+        // image defines, and never counted.
+        elf.add_symbol(object::write::Symbol {
+            name: b"_data".to_vec(),
+            value: 0x2000,
+            size: 8,
+            kind: object::SymbolKind::Data,
+            scope: object::SymbolScope::Linkage,
+            weak: false,
+            section: object::write::SymbolSection::Section(data),
+            flags: object::SymbolFlags::None,
+        });
+        elf.add_symbol(object::write::Symbol {
+            name: b"_undef".to_vec(),
+            value: 0,
+            size: 0,
+            kind: object::SymbolKind::Text,
+            scope: object::SymbolScope::Linkage,
+            weak: false,
+            section: object::write::SymbolSection::Undefined,
+            flags: object::SymbolFlags::None,
+        });
+        let directory = tempfile::tempdir().expect("a temporary directory for the image");
+        let kernel = directory.path().join("helios");
+        fs::write(&kernel, elf.write().expect("the synthetic image writes"))
+            .expect("writing the image");
+        let functions = kernel_functions(&kernel).expect("the image parses");
+        assert_eq!(functions.total, 3);
+        assert_eq!(functions.names, ["_a", "_b", "_c"]);
+    }
+
+    #[test]
+    fn a_link_time_llvm_suffix_is_stripped_back_off_the_name() {
+        assert_eq!(base_name("_RNvB.llvm.4478483301174982385"), "_RNvB");
+        assert_eq!(base_name("_RNvB.llvm.abc"), "_RNvB.llvm.abc");
+        assert_eq!(base_name("_RNvB.llvm."), "_RNvB.llvm.");
+        assert_eq!(base_name("_RNvB"), "_RNvB");
     }
 
     #[test]
