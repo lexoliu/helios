@@ -601,6 +601,48 @@ def test_a_profile_use_run_pairs_two_builds_of_one_checkout(tmp_path) -> None:
     assert args.helios_baseline_out_dir == options.out_dir / "helios-baseline"
 
 
+def test_a_plain_baseline_is_the_pgo_control(tmp_path) -> None:
+    """`--baseline-kernel-build release` pairs this checkout's
+    profile-guided release kernel against the same commit built without
+    the fetched profile (#322): the run is paired, the second image is a
+    `release` build, and the gap bench is told to build it that way."""
+    options = RunOptions(
+        lane=load_manifest().lane("x86-64-kvm"),
+        out_dir=tmp_path / "out",
+        advisory=True,
+        sides=frozenset({Side.HELIOS, Side.HELIOS_BASELINE}),
+        plain_baseline=True,
+    )
+    assert options.paired
+    assert options.kernel_build == "profile-use"
+    assert options.baseline_kernel_build == "release"
+    invocations = [
+        command.argv
+        for command in plan(options, load_manifest(), WORKLOADS)
+        if command.argv[1:2] == [str(GAP_BENCH)]
+    ]
+    assert len(invocations) == 1
+    args = gap_bench().build_parser().parse_args(invocations[0][2:])
+    assert args.helios_baseline_without_kernel_profile
+    assert args.helios_baseline_root is None and args.helios_profile_use is None
+    assert args.helios_baseline_out_dir == options.out_dir / "helios-baseline"
+
+
+def test_the_pgo_control_is_refused_where_the_release_kernel_is_plain(tmp_path) -> None:
+    """A lane whose release build reads no profile has no separate
+    control: its plain build is the only build, and pairing it against
+    itself would be the identical-images refusal one boot later."""
+    lane = load_manifest().lane("x86-64-kvm").model_copy(update={"helios_arch": "riscv64"})
+    with pytest.raises(SystemExit, match="reads no profile"):
+        RunOptions(
+            lane=lane,
+            out_dir=tmp_path / "out",
+            advisory=True,
+            sides=frozenset({Side.HELIOS, Side.HELIOS_BASELINE}),
+            plain_baseline=True,
+        )
+
+
 def test_a_pgo_pairing_names_the_build_in_both_columns(paired_regression_report) -> None:
     """Two columns of one commit are told apart by their build.
 
@@ -719,3 +761,49 @@ def test_a_pgo_run_reports_without_a_linux_side(tmp_path) -> None:
     assert result is not None
     assert result.rows, "the PGO candidate is compared against the plain image"
     assert "profile-use" in render_gate(gate_report(report, None), report.run.lane)
+
+
+def test_an_x86_64_release_kernel_is_a_profile_use_build(tmp_path) -> None:
+    """There is no plain release kernel on the measured architecture.
+
+    Every x86-64 release build reads the profile the latest release
+    published (#226), so the run record names the build directory the
+    inspector actually wrote to — which is where the bootfs pins are
+    read from as well.
+    """
+    options = RunOptions(
+        lane=load_manifest().lane("x86-64-kvm"),
+        out_dir=tmp_path / "out",
+        advisory=True,
+        sides=frozenset({Side.HELIOS}),
+    )
+    assert options.kernel_build == "profile-use"
+    assert not options.paired
+    assert options.baseline_kernel_build is None, "an unpaired run has no second image"
+
+
+def test_a_pgo_pairing_names_the_profile_each_column_read(paired_regression_report) -> None:
+    """Once both columns are profile-use builds, the profile is what varies.
+
+    The baseline reads the profile the release published and the
+    candidate the one this run collected, on one commit and one host, so
+    the labels name the profiles or the table says nothing about which
+    column is which.
+    """
+    sha = paired_regression_report.run.helios_git_sha
+    run = paired_regression_report.run.model_copy(
+        update={
+            "baseline_git_sha": sha,
+            "baseline_ref": None,
+            "kernel_build": "profile-use",
+            "baseline_kernel_build": "profile-use",
+            "kernel_profile": "target/pgo-candidate/helios-kernel.profdata",
+            "baseline_kernel_profile": "release helios-v0.1.0",
+        }
+    )
+    result = evaluate_paired(paired_regression_report.model_copy(update={"run": run}))
+
+    assert result is not None and result.kind is GateKind.PAIRED
+    assert "release helios-v0.1.0" in result.baseline_label
+    assert "target/pgo-candidate/helios-kernel.profdata" in result.candidate_label
+    assert result.baseline_label != result.candidate_label

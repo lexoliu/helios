@@ -7,9 +7,15 @@ from pathlib import Path
 from elftools.common.exceptions import ELFError
 from elftools.elf.elffile import ELFFile
 
+# A release kernel lives in the `release` directory, or in `profile-use`
+# on the target whose release builds read the fetched profile (docs/pgo.md,
+# #226): the inspector keeps the two apart so a plain build and a
+# profile-guided one never share an artifact.
 KERNEL_PATTERNS = (
     "target/*-unknown-none*/release/helios",
+    "target/*-unknown-none*/profile-use/helios",
     "target/perf-baselines/worktrees/*/helios/target/*-unknown-none*/release/helios",
+    "target/perf-baselines/worktrees/*/helios/target/*-unknown-none*/profile-use/helios",
 )
 
 
@@ -54,7 +60,7 @@ def kernel_symbols(image: Path, name: str) -> dict:
 def export_kernel_symbols(root: Path, out_dir: Path) -> list[Path]:
     images = sorted({image for pattern in KERNEL_PATTERNS for image in root.glob(pattern)})
     if not images:
-        raise SystemExit(f"no release kernel images found under {root}")
+        raise SystemExit(f"no release kernel images (release or profile-use builds) found under {root}")
     written = []
     for image in images:
         relative = image.relative_to(root)

@@ -6,6 +6,7 @@ use helios_hal::io::IoResult;
 use crate::balloon::VirtioBalloonDevice;
 use crate::block::{QueueAffinity, VirtioBlockDevice, VirtioBlockResource};
 use crate::bus::{DmaPool, IdentityDmaPool, MmioBus};
+use crate::gpu::{VirtioGpuDevice, report_gpu_online};
 use crate::net::VirtioNetDevice;
 use crate::p9::Virtio9pDevice;
 use crate::rng::VirtioRngDevice;
@@ -16,6 +17,7 @@ pub type VirtioMmioBlockDevice<C> = VirtioBlockResource<VirtioMmioTransport<Mmio
 pub type VirtioMmioNetDevice = VirtioNetDevice<VirtioMmioTransport<MmioBus>>;
 pub type VirtioMmio9pDevice = Virtio9pDevice<VirtioMmioTransport<MmioBus>>;
 pub type VirtioMmioRngDevice = VirtioRngDevice<VirtioMmioTransport<MmioBus>>;
+pub type VirtioMmioGpuDevice = VirtioGpuDevice<VirtioMmioTransport<MmioBus>>;
 pub type VirtioMmioVsockDevice = VirtioVsockDevice<VirtioMmioTransport<MmioBus>>;
 pub type VirtioMmioBalloonDevice = VirtioBalloonDevice<VirtioMmioTransport<MmioBus>>;
 
@@ -204,6 +206,49 @@ where
     let bus = unsafe { MmioBus::new(header, mmio_size, dma) }?;
     let transport = VirtioMmioTransport::new(bus)?;
     VirtioBalloonDevice::new(transport)
+}
+
+/// Builds a virtio-gpu device from a permanently mapped MMIO header.
+///
+/// The display topology is read here, on the bring-up path, so that the
+/// line naming the device also names what it presents.
+///
+/// # Safety
+///
+/// `header..header+mmio_size` must refer to a valid, permanently mapped VirtIO
+/// MMIO register block for a GPU device, and no other code may violate the
+/// transport's register access invariants while the returned driver is alive.
+pub unsafe fn gpu_from_mmio(
+    header: NonNull<u8>,
+    mmio_size: usize,
+) -> IoResult<VirtioMmioGpuDevice> {
+    let bus = unsafe { MmioBus::new(header, mmio_size, IdentityDmaPool) }?;
+    let transport = VirtioMmioTransport::new(bus)?;
+    let device = VirtioGpuDevice::new(transport)?;
+    report_gpu_online(&device, "mmio")?;
+    Ok(device)
+}
+
+/// Builds a virtio-gpu device on a bus whose DMA addresses are
+/// translated, such as a backend running behind a physical-memory
+/// offset map.
+///
+/// # Safety
+///
+/// Same as [`gpu_from_mmio`].
+pub unsafe fn gpu_from_mmio_with_dma<P>(
+    header: NonNull<u8>,
+    mmio_size: usize,
+    dma: P,
+) -> IoResult<VirtioGpuDevice<VirtioMmioTransport<MmioBus<P>>>>
+where
+    P: DmaPool,
+{
+    let bus = unsafe { MmioBus::new(header, mmio_size, dma) }?;
+    let transport = VirtioMmioTransport::new(bus)?;
+    let device = VirtioGpuDevice::new(transport)?;
+    report_gpu_online(&device, "mmio")?;
+    Ok(device)
 }
 
 /// Builds a VirtIO vsock device from a permanently mapped MMIO header.

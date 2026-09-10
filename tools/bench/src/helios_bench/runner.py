@@ -9,6 +9,7 @@ every pin, and turns the raw JSONL into a report.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import platform
 import shlex
@@ -55,6 +56,15 @@ LINUX_SIDES = {Side.LINUX_NATIVE, Side.LINUX_WASMTIME}
 # pairing varies the candidate.
 RELEASE_BUILD = "release"
 PROFILE_USE_BUILD = "profile-use"
+# Architectures whose `--release` kernel is built against the profile the
+# latest release published (docs/pgo.md, #226). On those there is no plain
+# release kernel: the inspector compiles one with `-C profile-use` and its
+# artifacts land in the `profile-use` directory, so the run record and the
+# bootfs pins below have to say so.
+RELEASE_PROFILE_ARCHS = frozenset({"x86-64"})
+# Where `helios-cli profile-fetch` records which profile this checkout
+# builds against.
+KERNEL_PROFILE_RECORD = REPO_ROOT / "target" / "profiles" / "fetched.json"
 # Which subdirectory of the run's output each side's raw JSONL lands in.
 # The two Helios images write the same file names, so the directory is
 # what tells their records apart.
@@ -109,11 +119,53 @@ class RunOptions:
     # against the plain release build of this checkout: what varies
     # between the columns is the profile, not the source.
     profile_use: Path | None = None
+    # The baseline built without the fetched kernel profile: the plain
+    # control of a PGO measurement (docs/pgo.md, #322). Alone, it pairs
+    # this checkout's profile-guided release kernel against its plain one;
+    # with a baseline commit, that commit's plain kernel.
+    plain_baseline: bool = False
+
+    def __post_init__(self) -> None:
+        if self.plain_baseline and not self.reads_release_profile:
+            raise SystemExit(
+                f"--baseline-kernel-build {RELEASE_BUILD} is the control of a PGO measurement, "
+                f"and a release kernel of lane {self.lane.name} ({self.lane.helios_arch}) reads "
+                "no profile: its plain build is the only build (docs/pgo.md)"
+            )
+
+    @property
+    def paired(self) -> bool:
+        """Whether this run times a second Helios image beside the first."""
+        return self.baseline is not None or self.profile_use is not None or self.plain_baseline
+
+    @property
+    def reads_release_profile(self) -> bool:
+        """Whether a plain release build of this lane reads a profile."""
+        return self.lane.helios_arch in RELEASE_PROFILE_ARCHS
 
     @property
     def kernel_build(self) -> str:
         """The cargo profile the candidate kernel is built with."""
-        return PROFILE_USE_BUILD if self.profile_use else RELEASE_BUILD
+        if self.profile_use or self.reads_release_profile:
+            return PROFILE_USE_BUILD
+        return RELEASE_BUILD
+
+    @property
+    def baseline_kernel_build(self) -> str | None:
+        """The cargo profile the second image is built with, if there is one.
+
+        The baseline image is built the way a `--release` build of this
+        lane is, which on an architecture whose release builds read a
+        profile is itself a `profile-use` build: what separates the two
+        columns of a PGO pairing is then the profile, not the build kind.
+        The plain control (`--baseline-kernel-build release`) is the one
+        baseline built without a profile on such a lane.
+        """
+        if not self.paired:
+            return None
+        if self.plain_baseline:
+            return RELEASE_BUILD
+        return PROFILE_USE_BUILD if self.reads_release_profile else RELEASE_BUILD
 
 
 @dataclass(frozen=True)
@@ -258,6 +310,54 @@ def plan(options: RunOptions, manifest: Manifest, workloads: list[dict]) -> list
     return commands
 
 
+def fetched_kernel_profile_label() -> str:
+    """The profile this checkout's release kernel was built against.
+
+    `helios-cli profile-fetch` writes the record and the inspector
+    refuses a release build without it, so a run that has already booted
+    a guest has one; a missing record is a run that never built what it
+    says it built. The label is the record's own: `release <tag>` for a
+    release's asset, or the branch, commit and run of a `kernel-profile.yml`
+    collection (docs/pgo.md, #313).
+    """
+    if not KERNEL_PROFILE_RECORD.is_file():
+        raise SystemExit(
+            f"{KERNEL_PROFILE_RECORD} is not there, so this lane's release kernel was not built "
+            "against a fetched profile: run `helios-cli profile-fetch` (docs/pgo.md)"
+        )
+    record = json.loads(KERNEL_PROFILE_RECORD.read_text())
+    source = record["source"]
+    if source == "release":
+        return f"release {record['tag']}"
+    if source == "collection":
+        return f"{record['head_branch']}@{record['head_sha'][:7]} run {record['run_id']}"
+    raise SystemExit(f"{KERNEL_PROFILE_RECORD} names a profile source {source!r} this tool does not know")
+
+
+def profile_label(path: Path) -> str:
+    """A profile named short enough for a table cell."""
+    try:
+        return str(path.relative_to(REPO_ROOT))
+    except ValueError:
+        return str(path)
+
+
+def kernel_profiles(options: RunOptions) -> tuple[str | None, str | None]:
+    """Which profile each column's kernel was built against.
+
+    The candidate reads the profile the run named, and otherwise the
+    release's on a lane whose release builds read one. The baseline image
+    is built plain, so it reads the release's or none — which is exactly
+    what a PGO pairing measures once every release publishes a profile:
+    the release's counts against a freshly collected set (#226).
+    """
+    fetched = fetched_kernel_profile_label() if options.reads_release_profile else None
+    candidate = profile_label(options.profile_use) if options.profile_use else fetched
+    if not options.paired or options.plain_baseline:
+        return candidate, None
+    return candidate, fetched
+
+
 def baseline_arguments(options: RunOptions, out_root: Path) -> list[str]:
     """What the driver needs to time the second image beside the first.
 
@@ -270,6 +370,8 @@ def baseline_arguments(options: RunOptions, out_root: Path) -> list[str]:
         arguments.extend(["--helios-profile-use", str(options.profile_use)])
     if options.baseline is not None:
         arguments.extend(["--helios-baseline-root", str(options.baseline.worktree)])
+    if options.plain_baseline:
+        arguments.append("--helios-baseline-without-kernel-profile")
     if not arguments:
         return []
     return [*arguments, "--helios-baseline-out-dir", str(out_root / HELIOS_BASELINE_OUT)]
@@ -540,7 +642,7 @@ def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) ->
             "this host deviates from lane "
             f"{lane.name}; refusing to produce a publishable report:\n  - " + "\n  - ".join(deviations)
         )
-    paired = options.baseline is not None or options.profile_use is not None
+    paired = options.paired
     if paired and not {Side.HELIOS, Side.HELIOS_BASELINE} <= options.sides:
         raise SystemExit(
             "a paired run times both Helios images: --sides has to name helios and helios_baseline"
@@ -577,6 +679,8 @@ def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) ->
     )
     run_id, run_url, attempt = github_run()
 
+    candidate_profile, baseline_profile = kernel_profiles(options)
+
     def build(reconfirmed: list[str]) -> Report:
         finished = datetime.now(UTC).isoformat(timespec="seconds")
         run = RunInfo(
@@ -598,7 +702,9 @@ def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) ->
             baseline_git_sha=options.baseline.sha if options.baseline else (git_sha() if paired else None),
             baseline_ref=options.baseline.ref if options.baseline else None,
             kernel_build=options.kernel_build,
-            baseline_kernel_build=RELEASE_BUILD if paired else None,
+            baseline_kernel_build=options.baseline_kernel_build,
+            kernel_profile=candidate_profile,
+            baseline_kernel_profile=baseline_profile,
             retaken=retaken,
             reconfirmed=reconfirmed,
         )

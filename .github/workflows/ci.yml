@@ -507,6 +507,9 @@ jobs:
   smoke-x86-64:
     name: smoke-x86-64
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
     timeout-minutes: 180
     env:
       HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
@@ -566,6 +569,17 @@ jobs:
       - name: Build inspector
         working-directory: helios
         run: cargo build --release -p helios-inspector
+      # Every x86-64 release build is built against the kernel profile
+      # the newest kernel-profile.yml run on the default branch uploaded
+      # (docs/pgo.md, #226, #313); the inspector refuses to build one
+      # without it rather than producing a plain kernel wearing a PGO
+      # label, so the fetch comes before the build. Reading the artifact
+      # is what the job's `actions: read` is for.
+      - name: Fetch the kernel profile
+        working-directory: helios
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: cargo run --release -p helios-cli -- profile-fetch
       - name: Boot x86-64 guest
         shell: bash
         working-directory: helios
@@ -705,6 +719,9 @@ jobs:
   bench:
     name: bench-${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      actions: read
     # The lane builds the inspector and the guest, then boots once per
     # workload class; a healthy run is around half an hour. The runner's
     # own per-iteration deadline is what catches a hung workload, so
@@ -819,6 +836,17 @@ jobs:
       # cache. Every class the driver then runs boots what this leaves in
       # the target directory (#153), and the compile's cost is this
       # step's own line in the job summary.
+      # Every x86-64 release build is built against the kernel profile
+      # the newest kernel-profile.yml run on the default branch uploaded
+      # (docs/pgo.md, #226, #313); the inspector refuses to build one
+      # without it rather than producing a plain kernel wearing a PGO
+      # label, so the fetch comes before the build. Reading the artifact
+      # is what the job's `actions: read` is for.
+      - name: Fetch the kernel profile
+        working-directory: helios
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: cargo run --release -p helios-cli -- profile-fetch
       - name: Build the Helios guest and inspector
         working-directory: helios
         env:

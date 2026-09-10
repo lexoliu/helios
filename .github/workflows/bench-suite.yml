@@ -42,6 +42,14 @@ on:
           timed beside this one on the same host (empty = no pairing)
         type: string
         default: ""
+      baseline_kernel_build:
+        description: >-
+          How the second image is built. `release` builds it without the
+          fetched kernel profile, the plain control of a PGO measurement:
+          alone, this commit's profile-guided kernel against its plain one
+        type: choice
+        options: [profile-use, release]
+        default: profile-use
       tcp_probe:
         description: Diagnose paired TCP reconnects with single-queue packet capture; not performance acceptance
         type: boolean
@@ -52,8 +60,12 @@ on:
     branches: [dev]
     tags: ["v*"]
 
+# A push supersedes the previous push and a dispatch the previous
+# dispatch. The event is part of the group because a push to `dev` runs
+# only `tooling`, and in one group with a dispatched measurement it
+# cancelled that measurement hours in (#318).
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -83,6 +95,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           REQUESTED_ADVISORY: ${{ inputs.advisory }}
           BASELINE_REF: ${{ inputs.baseline_ref }}
+          BASELINE_KERNEL_BUILD: ${{ inputs.baseline_kernel_build }}
         run: |
           if [ "$EVENT_NAME" = workflow_dispatch ]; then
             echo "advisory=$REQUESTED_ADVISORY" >> "$GITHUB_OUTPUT"
@@ -91,7 +104,8 @@ jobs:
           else
             echo "advisory=false" >> "$GITHUB_OUTPUT"
           fi
-          if [ "$EVENT_NAME" = workflow_dispatch ] && [ "$REQUESTED_ADVISORY" = true ] && [ -n "$BASELINE_REF" ]; then
+          if [ "$EVENT_NAME" = workflow_dispatch ] && [ "$REQUESTED_ADVISORY" = true ] \
+            && { [ -n "$BASELINE_REF" ] || [ "$BASELINE_KERNEL_BUILD" = release ]; }; then
             echo "paired_acceptance=true" >> "$GITHUB_OUTPUT"
           else
             echo "paired_acceptance=false" >> "$GITHUB_OUTPUT"
@@ -130,6 +144,9 @@ jobs:
       || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/'))
       || (github.event_name == 'push' && vars.HELIOS_BENCH_DEDICATED == 'true')
     runs-on: ${{ needs.tooling.outputs.advisory == 'true' && matrix.shared-runner || matrix.dedicated-runner }}
+    permissions:
+      contents: read
+      actions: read
     env:
       BENCH_ADVISORY: ${{ needs.tooling.outputs.advisory }}
       BENCH_PAIRED_ACCEPTANCE: ${{ needs.tooling.outputs.paired_acceptance }}
@@ -141,6 +158,7 @@ jobs:
         ${{ github.event_name == 'pull_request'
             && github.event.pull_request.base.sha
             || inputs.baseline_ref }}
+      BENCH_BASELINE_KERNEL_BUILD: ${{ inputs.baseline_kernel_build }}
     timeout-minutes: ${{ inputs.tcp_probe && 40 || 420 }}
     strategy:
       fail-fast: false
@@ -163,6 +181,18 @@ jobs:
           flamegraphs: "true"
           inspector: "true"
           bench-tooling: "true"
+      # Every x86-64 release build is built against the kernel profile
+      # the newest kernel-profile.yml run on the default branch uploaded
+      # (docs/pgo.md, #226, #313); the inspector refuses to build one
+      # without it rather than producing a plain kernel wearing a PGO
+      # label, so the fetch comes before the build. Reading the artifact
+      # is what the job's `actions: read` is for.
+      - name: Fetch the kernel profile
+        if: matrix.helios-arch == 'x86-64'
+        working-directory: helios
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: cargo run --release -p helios-cli -- profile-fetch
       - name: Report host deviations from the lane
         working-directory: helios/tools/bench
         run: uv run helios-bench host-check --lane ${{ matrix.lane }} || true
@@ -225,6 +255,9 @@ jobs:
           # because this job fetched the history.
           if [ -n "${BENCH_BASELINE_REF}" ]; then
             args+=(--baseline-ref "${BENCH_BASELINE_REF}")
+          fi
+          if [ "${BENCH_BASELINE_KERNEL_BUILD}" = release ]; then
+            args+=(--baseline-kernel-build release)
           fi
           if [ "${BENCH_PAIRED_ACCEPTANCE}" = true ]; then
             args+=(--sides "helios,helios_baseline")
@@ -322,6 +355,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
+      actions: read
     env:
       # The profile is collected from an x86-64 kernel, so this is the
       # lane that can spend it; a profile carries function hashes of the
@@ -351,10 +385,23 @@ jobs:
             printf '%s=%s\n' "$field" "$(printf '%s' "$entry" | jq -r --arg f "$field" '.[$f]')" \
               >> "$GITHUB_OUTPUT"
           done
+      # The candidate's profile: the one this run collected. It lands in
+      # the checkout so the paired table can name it as a path.
       - uses: actions/download-artifact@v4
         with:
           name: helios-kernel-profdata
-          path: profile
+          path: helios/target/pgo-candidate
+      # Every x86-64 release build is built against the kernel profile
+      # the newest kernel-profile.yml run on the default branch uploaded
+      # (docs/pgo.md, #226, #313); the inspector refuses to build one
+      # without it rather than producing a plain kernel wearing a PGO
+      # label, so the fetch comes before the build. Reading the artifact
+      # is what the job's `actions: read` is for.
+      - name: Fetch the kernel profile
+        working-directory: helios
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: cargo run --release -p helios-cli -- profile-fetch
       - name: Provision the multi-queue tap network backend
         if: steps.lane.outputs.net-backend == 'tap'
         working-directory: helios
@@ -378,7 +425,7 @@ jobs:
           args=(run --lane "${BENCH_LANE}" --out-dir "$GITHUB_WORKSPACE/bench-out/pgo"
                 --runner-label "${{ runner.name }}"
                 --sides "helios,helios_baseline"
-                --profile-use "$GITHUB_WORKSPACE/profile/helios-kernel.profdata"
+                --profile-use "$GITHUB_WORKSPACE/helios/target/pgo-candidate/helios-kernel.profdata"
                 --advisory --allow-busy-host)
           if [ -n "${{ inputs.iterations }}" ]; then
             args+=(--iterations "${{ inputs.iterations }}")

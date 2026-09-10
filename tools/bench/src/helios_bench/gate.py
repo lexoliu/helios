@@ -536,20 +536,31 @@ def evaluate(baseline: Report, candidate: Report) -> GateResult:
     )
 
 
-def image_label(sha: str | None, ref: str | None, build: str | None, other_build: str | None) -> str:
+def image_label(
+    sha: str | None,
+    ref: str | None,
+    build: str | None,
+    other_build: str | None,
+    profile: str | None = None,
+    other_profile: str | None = None,
+) -> str:
     """How one column of a paired table names its image.
 
     The commit always, then whatever distinguishes this image from the
-    other one: the ref it was asked for, and the cargo profile its kernel
-    was built with when the two differ — a PGO pairing varies the build
-    and not the commit, so without that the two columns would carry the
-    same label.
+    other one: the ref it was asked for, the cargo profile its kernel was
+    built with when the two differ, and the kernel profile it was built
+    against when those differ — a PGO pairing varies the build and not
+    the commit, and once every release build reads a profile it varies
+    which profile (#226), so without these the two columns would carry
+    the same label.
     """
     qualifiers = []
     if ref:
         qualifiers.append(ref)
     if build and other_build and build != other_build:
         qualifiers.append(build)
+    if profile and profile != other_profile:
+        qualifiers.append(profile)
     label = f"`{short(sha)}`"
     return f"{label} ({', '.join(qualifiers)})" if qualifiers else label
 
@@ -599,12 +610,16 @@ def evaluate_paired(candidate: Report) -> GateResult | None:
             candidate.run.baseline_ref,
             candidate.run.baseline_kernel_build,
             candidate.run.kernel_build,
+            candidate.run.baseline_kernel_profile,
+            candidate.run.kernel_profile,
         ),
         candidate_label=image_label(
             candidate.run.helios_git_sha,
             None,
             candidate.run.kernel_build,
             candidate.run.baseline_kernel_build,
+            candidate.run.kernel_profile,
+            candidate.run.baseline_kernel_profile,
         ),
         baseline_host=candidate.hardware.cpu,
         candidate_host=candidate.hardware.cpu,
