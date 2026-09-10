@@ -24,7 +24,7 @@ from helios_bench.render import (
     write_text,
 )
 from helios_bench.report import Side, load_report, save_report
-from helios_bench.runner import NetworkOptions, RunOptions, run_suite
+from helios_bench.runner import PROFILE_USE_BUILD, RELEASE_BUILD, NetworkOptions, RunOptions, run_suite
 from helios_bench.symbols import export_kernel_symbols
 
 README_PATH = REPO_ROOT / "README.md"
@@ -46,7 +46,8 @@ def command_run(args: argparse.Namespace) -> int:
     ref = MERGE_BASE if args.baseline_merge_base else args.baseline_ref
     baseline = resolve_baseline(ref) if ref else None
     sides = parse_sides(args.sides)
-    if baseline is not None or args.profile_use is not None:
+    plain_baseline = args.baseline_kernel_build == RELEASE_BUILD
+    if baseline is not None or args.profile_use is not None or plain_baseline:
         sides |= {Side.HELIOS_BASELINE}
     options = RunOptions(
         lane=lane,
@@ -69,6 +70,7 @@ def command_run(args: argparse.Namespace) -> int:
         ),
         baseline=baseline,
         profile_use=args.profile_use.resolve() if args.profile_use else None,
+        plain_baseline=plain_baseline,
     )
     report = run_suite(options, manifest, dry_run=args.dry_run)
     if report is None:
@@ -240,6 +242,18 @@ def build_parser() -> argparse.ArgumentParser:
             "against the plain release kernel of this same commit, on this host in this "
             "job (docs/pgo.md); the profile is what bench-suite.yml's profile-generate "
             "job uploads"
+        ),
+    )
+    run.add_argument(
+        "--baseline-kernel-build",
+        choices=[PROFILE_USE_BUILD, RELEASE_BUILD],
+        default=PROFILE_USE_BUILD,
+        help=(
+            "How the second image is built. `profile-use` is what a release build of the "
+            "lane is; `release` builds the baseline without the fetched kernel profile, the "
+            "plain control of a PGO measurement (docs/pgo.md): alone it pairs this "
+            "checkout's profile-guided kernel against its plain one, with --baseline-ref "
+            "that commit's plain kernel."
         ),
     )
     run.add_argument(

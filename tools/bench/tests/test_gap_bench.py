@@ -77,3 +77,25 @@ def test_a_class_that_never_started_leaves_a_failure_for_all_of_it(tmp_path) -> 
     gap_bench().record_unmeasured(log, WORKLOADS, SELECTED, REASON)
 
     assert [record["workload"] for record in records(log)] == SELECTED
+
+
+def test_the_plain_control_reaches_the_harness_and_the_artifact_lookup(tmp_path):
+    """The baseline built without the fetched profile (#322) is asked for
+    through the harness environment and identified the same way when the
+    inspector is asked which kernel it would boot."""
+    module = gap_bench()
+    control = module.HeliosImage(
+        name="helios-baseline",
+        workspace_root=tmp_path,
+        out_dir=tmp_path / "out",
+        without_kernel_profile=True,
+    )
+    candidate = module.HeliosImage(name="helios", workspace_root=tmp_path, out_dir=tmp_path / "out")
+    assert (
+        module.harness_environment(control, paired=True)["HELIOS_WORKLOAD_BENCH_WITHOUT_KERNEL_PROFILE"]
+        == "1"
+    )
+    assert (
+        module.harness_environment(candidate, paired=True)["HELIOS_WORKLOAD_BENCH_WITHOUT_KERNEL_PROFILE"]
+        == ""
+    )

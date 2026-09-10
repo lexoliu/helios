@@ -102,6 +102,11 @@ pub(crate) enum VmConfigError {
         #[source]
         source: KernelProfileStoreError,
     },
+    #[error(
+        "--without-kernel-profile is the plain control of a target whose release builds read \
+         the kernel profile, and a --release {arch} kernel reads none (docs/pgo.md)"
+    )]
+    WithoutKernelProfileOnPlainTarget { arch: &'static str },
     #[error("{0}")]
     WorkloadSelection(#[from] WorkloadSelectionError),
     #[error("failed to read inspector VM config {path}: {source}")]
@@ -1070,6 +1075,20 @@ pub(crate) struct VmCommand {
     #[arg(long, value_name = "FILE", conflicts_with_all = ["debug", "kernel_debug", "profile_generate"])]
     profile_use: Option<PathBuf>,
 
+    /// Build the `--release` kernel of a target whose release builds read
+    /// the fetched kernel profile without one: the plain control of a
+    /// profile-guided measurement (docs/pgo.md, #322). It lands in the
+    /// `release` directory, where a plain build of any other target
+    /// lands. Asking for it on a target that reads no profile is refused,
+    /// because there the control and the candidate are one build.
+    #[arg(
+        long,
+        default_value_t = false,
+        requires = "release",
+        conflicts_with = "profile_use"
+    )]
+    without_kernel_profile: bool,
+
     /// Build the kernel with debuginfo and unstripped symbols for GDB/LLDB.
     #[arg(long, default_value_t = false, conflicts_with = "release")]
     kernel_debug: bool,
@@ -1486,9 +1505,11 @@ fn resolve_build(
         !(command.no_build && (command.kernel.is_some() || file.kernel.is_some()));
     let profile_use = match profile_use {
         Some(explicit) => Some(explicit),
-        None if release && builds_its_own_kernel => {
-            release_kernel_profile(profile, &KernelProfileStore::new(&repo_root()?))?
-        }
+        None if release && builds_its_own_kernel => release_kernel_profile(
+            profile,
+            &KernelProfileStore::new(&repo_root()?),
+            command.without_kernel_profile,
+        )?,
         None => None,
     };
     let kind = if profile_use.is_some() {
@@ -1534,8 +1555,20 @@ fn resolve_build(
 fn release_kernel_profile(
     profile: &VmProfile,
     store: &KernelProfileStore,
+    without_kernel_profile: bool,
 ) -> Result<Option<PathBuf>, VmConfigError> {
     if !profile.release_kernel_profile {
+        if without_kernel_profile {
+            return Err(VmConfigError::WithoutKernelProfileOnPlainTarget {
+                arch: arch_label(profile.arch),
+            });
+        }
+        return Ok(None);
+    }
+    // The control of a PGO measurement: the same target, built the way
+    // every other target's release kernel is. Asked for by name and
+    // never reached by a missing store, which stays a refusal below.
+    if without_kernel_profile {
         return Ok(None);
     }
     let (_, path) = store
@@ -4471,7 +4504,7 @@ mod tests {
     fn a_release_build_of_the_measured_target_refuses_an_empty_store() {
         let directory = tempfile::tempdir().expect("a temporary checkout");
         let store = KernelProfileStore::new(directory.path());
-        let error = release_kernel_profile(&X86_64_VM_PROFILE, &store)
+        let error = release_kernel_profile(&X86_64_VM_PROFILE, &store, false)
             .expect_err("a release kernel of the measured target is built against a profile");
         assert!(
             matches!(error, VmConfigError::ReleaseKernelProfile { .. }),
@@ -4484,12 +4517,38 @@ mod tests {
     }
 
     #[test]
+    fn the_plain_control_reads_no_profile_and_needs_no_store() {
+        let directory = tempfile::tempdir().expect("a temporary checkout");
+        let store = KernelProfileStore::new(directory.path());
+        assert_eq!(
+            release_kernel_profile(&X86_64_VM_PROFILE, &store, true)
+                .expect("the control is built without a profile, whatever the store holds"),
+            None,
+        );
+    }
+
+    #[test]
+    fn the_plain_control_is_refused_where_the_release_kernel_is_already_plain() {
+        let directory = tempfile::tempdir().expect("a temporary checkout");
+        let store = KernelProfileStore::new(directory.path());
+        let error = release_kernel_profile(&RISCV64_VM_PROFILE, &store, true)
+            .expect_err("a target whose release build reads no profile has no separate control");
+        assert!(
+            matches!(
+                error,
+                VmConfigError::WithoutKernelProfileOnPlainTarget { .. }
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn a_release_build_of_another_target_reads_no_profile() {
         let directory = tempfile::tempdir().expect("a temporary checkout");
         let store = KernelProfileStore::new(directory.path());
         for profile in [&RISCV64_VM_PROFILE, &AARCH64_VIRT_HVF_PROFILE] {
             assert_eq!(
-                release_kernel_profile(profile, &store)
+                release_kernel_profile(profile, &store, false)
                     .expect("a target whose releases carry no profile needs no store"),
                 None,
             );
@@ -4513,7 +4572,7 @@ mod tests {
                 tag: tag.to_owned(),
             })
             .expect("recording the profile in force");
-        let profile = release_kernel_profile(&X86_64_VM_PROFILE, &store)
+        let profile = release_kernel_profile(&X86_64_VM_PROFILE, &store, false)
             .expect("the store holds a profile of the pinned format")
             .expect("the measured target reads it");
         assert_eq!(
@@ -4626,6 +4685,7 @@ mod tests {
             release: false,
             profile_generate: false,
             profile_use: None,
+            without_kernel_profile: false,
             kernel_debug: false,
             config: None,
             qemu_bin: None,
@@ -4679,6 +4739,7 @@ mod tests {
             release: false,
             profile_generate: false,
             profile_use: None,
+            without_kernel_profile: false,
             kernel_debug: false,
             config: Some(missing_config),
             qemu_bin: None,
@@ -4811,6 +4872,7 @@ mod tests {
             release: false,
             profile_generate: false,
             profile_use: None,
+            without_kernel_profile: false,
             kernel_debug: false,
             config: Some(tempdir.path().join("missing-vm.json")),
             qemu_bin: None,

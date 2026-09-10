@@ -334,6 +334,19 @@ optimisation of the kernel, not about the pull request that happened to
 run it, so a red headline row says PGO did not pay on this commit — which
 is the answer the job exists to produce.
 
+What profile-guided optimisation is worth on the kernel that ships is a
+different question, and it has a control: the same commit built without
+any profile. `helios-inspector vm --release --without-kernel-profile`
+builds it, on the one target whose release builds otherwise read the
+fetched profile, and puts it in the `release` directory where every
+other target's release kernel lands; asking for it elsewhere is refused,
+because there the plain build is the only build. `helios-bench run
+--baseline-kernel-build release` pairs the profile-guided kernel against
+that control in one job (`bench-suite.yml`'s `baseline_kernel_build`
+input), and the report says so: `kernel_profile` names the candidate's
+profile and `baseline_kernel_build` is `release` (#322). That pairing is
+the before/after every landed profile is measured by.
+
 #### Shipping it in a release
 
 A release carries the profile its kernel was built with (#226).
