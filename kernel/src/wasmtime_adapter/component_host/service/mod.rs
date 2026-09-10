@@ -646,6 +646,8 @@ fn report_fiber_stack_demand_commits<CpuImpl: Cpu>(cpu: &CpuImpl) {
         target: "helios_kernel::fiber_stack",
         slots = stats.slots,
         live_slots = stats.live_slots,
+        warm_slots = stats.warm_slots,
+        retained_bytes = stats.retained_bytes,
         demand_commits = stats.demand_commits,
         committed_bytes = stats.committed_bytes,
         eager_bytes = stats.eager_bytes,

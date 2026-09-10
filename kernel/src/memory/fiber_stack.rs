@@ -11,7 +11,25 @@
 //! out of it. A slot is `[guard][stack]` with the guard at the bottom,
 //! the direction a stack grows. Only the top page of a fresh stack is
 //! committed; every page below it arrives when something faults on it,
-//! and the whole slot is given back when the stack is dropped.
+//! and when the stack is dropped the slot keeps those pages for the next
+//! stack while a machine-wide budget has room for them, or gives them
+//! back when it does not.
+//!
+//! # Retained slots
+//!
+//! Giving a slot's pages back is the expensive half of a stack's life:
+//! every page unmapped is a TLB shootdown to every other processor, and
+//! under a hypervisor an interrupt to an idle processor is a wake-up
+//! measured in hundreds of microseconds. A store is torn down on the
+//! spawn path, so that cost lands on every process start. A released
+//! slot therefore stays *warm* — its committed pages kept, its region
+//! still recorded — and the next stack claims a warm slot before a cold
+//! one: no page-table work, no fault for the pages the last stack
+//! touched, and no shootdown when it goes. The pages a warm slot holds
+//! count against `retain_budget`; a release that would exceed it gives
+//! its pages back instead. A warm slot carries what its last stack
+//! wrote, which is the runtime's own contract for a reused stack
+//! (`async_stack_zeroing(false)`).
 //!
 //! # Why the arena exists at all
 //!
@@ -64,7 +82,7 @@ use alloc::vec::Vec;
 use core::fmt;
 use core::ops::Range;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
 use crossbeam_utils::CachePadded;
 use helios_hal::cpu::{ProcessorId, current_processor};
@@ -167,8 +185,19 @@ pub enum FiberStackError {
 /// fault path on whichever processor is running the fiber, and read by
 /// the release; it is the lowest address in this slot anything has ever
 /// faulted on, and `body_top` when nothing has.
+/// A slot with nothing mapped and no region recorded.
+const SLOT_COLD: u8 = 0;
+/// A released slot whose pages are still committed, counted against the
+/// arena's retain budget, waiting for the next claim.
+const SLOT_WARM: u8 = 1;
+/// A slot a running stack owns.
+const SLOT_LIVE: u8 = 2;
+
+/// Every move between the three states is one compare-and-swap on
+/// `state`, which is what lets a claim on one processor race a release
+/// on another without a lock.
 struct FiberStackSlot {
-    live: AtomicBool,
+    state: AtomicU8,
     watermark: AtomicUsize,
 }
 
@@ -179,9 +208,11 @@ pub struct FiberStackArena {
     slot_bytes: usize,
     stack_bytes: usize,
     slots: Box<[CachePadded<FiberStackSlot>]>,
-    /// Where the next claim starts looking, so a machine with hundreds
-    /// of live stacks does not rescan the live prefix every time.
-    claim_cursor: AtomicUsize,
+    /// The most bytes warm slots may hold between them.
+    retain_budget: usize,
+    /// Bytes warm slots hold now. Written on every claim and release from
+    /// whichever processor runs them, so it sits on its own line.
+    retained_bytes: CachePadded<AtomicUsize>,
     /// Demand commits this processor has resolved. One counter per
     /// processor, each on its own line, because every one of them is
     /// written from fault context on its own processor.
@@ -209,6 +240,10 @@ pub struct FiberStackArenaStats {
     pub slots: usize,
     /// Slots a live stack is using right now.
     pub live_slots: usize,
+    /// Released slots still holding their pages for the next stack.
+    pub warm_slots: usize,
+    /// Bytes those warm slots hold, against the retain budget.
+    pub retained_bytes: usize,
     /// Bytes of user memory the live stacks have actually faulted in.
     pub committed_bytes: usize,
     /// Bytes of user memory the same stacks would have cost committed
@@ -252,7 +287,12 @@ pub fn install_fiber_stack_hooks(hooks: &'static FiberStackVmHooks) {
 /// a target that has no second way to place a fiber stack, so they are
 /// reported here rather than answered with a smaller stack or an eagerly
 /// committed one.
-pub fn install_fiber_stack_arena(slots: usize, stack_bytes: usize, processor_count: usize) {
+pub fn install_fiber_stack_arena(
+    slots: usize,
+    stack_bytes: usize,
+    processor_count: usize,
+    retain_bytes: usize,
+) {
     ARENA.call_once(|| {
         let hooks = *HOOKS.get().unwrap_or_else(|| {
             panic!(
@@ -281,7 +321,7 @@ pub fn install_fiber_stack_arena(slots: usize, stack_bytes: usize, processor_cou
         let mut slot_states = Vec::with_capacity(slots);
         slot_states.resize_with(slots, || {
             CachePadded::new(FiberStackSlot {
-                live: AtomicBool::new(false),
+                state: AtomicU8::new(SLOT_COLD),
                 watermark: AtomicUsize::new(0),
             })
         });
@@ -296,6 +336,7 @@ pub fn install_fiber_stack_arena(slots: usize, stack_bytes: usize, processor_cou
             stack_bytes,
             guard_bytes = FIBER_STACK_GUARD_BYTES,
             reserved_bytes = bytes,
+            retain_bytes,
             "fiber stack arena reserved; stacks commit on demand"
         );
         FiberStackArena {
@@ -304,7 +345,8 @@ pub fn install_fiber_stack_arena(slots: usize, stack_bytes: usize, processor_cou
             slot_bytes,
             stack_bytes,
             slots: slot_states.into_boxed_slice(),
-            claim_cursor: AtomicUsize::new(0),
+            retain_budget: retain_bytes,
+            retained_bytes: CachePadded::new(AtomicUsize::new(0)),
             demand_commits: counters.into_boxed_slice(),
             announced: announced.into_boxed_slice(),
             released: CachePadded::new(ReleasedTotals {
@@ -374,7 +416,7 @@ impl FiberStackArena {
         let index = offset / self.slot_bytes;
         let within = offset - index * self.slot_bytes;
         let slot = &self.slots[index];
-        if !slot.live.load(Ordering::Acquire) {
+        if slot.state.load(Ordering::Acquire) != SLOT_LIVE {
             panic!(
                 "page fault at {raw:#x} inside fiber stack slot {index}, which no live stack \
                  owns: the runtime is running on a stack it gave back"
@@ -407,8 +449,8 @@ impl FiberStackArena {
         StackFault::Committed
     }
 
-    /// Takes a free slot, prepares it, and commits the one page the
-    /// runtime writes first.
+    /// Takes a slot: a warm one as it stands, or a cold one prepared
+    /// with the one page the runtime writes first.
     fn claim(&'static self, stack_bytes: usize) -> Result<FiberStack, FiberStackError> {
         if stack_bytes != self.stack_bytes {
             return Err(FiberStackError::WrongSize {
@@ -416,11 +458,25 @@ impl FiberStackArena {
                 slot: self.stack_bytes,
             });
         }
-        let index = self.claim_slot()?;
+        let processor = current_processor();
+        if let Some(index) = self.take_slot(SLOT_WARM) {
+            // The pages its last stack touched are still mapped, so the
+            // runtime's first frame lands on a committed page and nothing
+            // here touches the address space.
+            self.retained_bytes
+                .fetch_sub(self.committed_bytes(index), Ordering::AcqRel);
+            frame_reserve::top_up(processor);
+            return Ok(FiberStack { arena: self, index });
+        }
+        let index = self
+            .take_slot(SLOT_COLD)
+            .ok_or(FiberStackError::Exhausted {
+                slots: self.slots.len(),
+            })?;
         let body = self.body(index);
         let flags = PageFlags::READ | PageFlags::WRITE;
         if let Err(error) = (self.hooks.prepare_demand_commit)(body, flags) {
-            self.slots[index].live.store(false, Ordering::Release);
+            self.slots[index].state.store(SLOT_COLD, Ordering::Release);
             return Err(FiberStackError::Prepare(error));
         }
         let body_top = body.end().raw();
@@ -432,7 +488,6 @@ impl FiberStackArena {
         // fault: the write happens before anything has run on the stack,
         // and paying for it on the locked path keeps the very first
         // fault a stack the runtime is already using.
-        let processor = current_processor();
         let top_page = VirtAddr::new(body_top - PhysFrame::SIZE);
         let frame = frame_reserve::take_frame(processor);
         if let Err(error) = (self.hooks.commit_demand_page)(top_page, frame, flags) {
@@ -442,7 +497,7 @@ impl FiberStackArena {
                      refused ({error}): {cleanup}"
                 )
             });
-            self.slots[index].live.store(false, Ordering::Release);
+            self.slots[index].state.store(SLOT_COLD, Ordering::Release);
             return Err(FiberStackError::Prepare(error));
         }
         self.slots[index]
@@ -454,30 +509,57 @@ impl FiberStackArena {
         Ok(FiberStack { arena: self, index })
     }
 
-    fn claim_slot(&self) -> Result<usize, FiberStackError> {
-        let count = self.slots.len();
-        let start = self.claim_cursor.load(Ordering::Relaxed) % count;
-        for step in 0..count {
-            let index = (start + step) % count;
-            if self.slots[index]
-                .live
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                self.claim_cursor.store(index + 1, Ordering::Relaxed);
-                return Ok(index);
-            }
-        }
-        Err(FiberStackError::Exhausted { slots: count })
+    /// Moves the lowest slot in state `from` to live and returns it.
+    ///
+    /// Lowest first, on purpose: a cold claim then lands on a slot whose
+    /// leaf tables an earlier claim already built, and the warm slots
+    /// stay packed at the bottom of the arena. The load before the
+    /// exchange keeps a scan over hundreds of live slots to plain reads.
+    fn take_slot(&self, from: u8) -> Option<usize> {
+        self.slots.iter().position(|slot| {
+            slot.state.load(Ordering::Acquire) == from
+                && slot
+                    .state
+                    .compare_exchange(from, SLOT_LIVE, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+        })
     }
 
-    /// Gives slot `index` back: every page a fault ever mapped goes back
-    /// to the user pool, on the ordinary locked path with the shootdown
-    /// that path already does.
+    /// Bytes slot `index` has committed: from its watermark to its top.
+    fn committed_bytes(&self, index: usize) -> usize {
+        self.body(index)
+            .end()
+            .raw()
+            .saturating_sub(self.slots[index].watermark.load(Ordering::Acquire))
+    }
+
+    /// Gives slot `index` back: warm, keeping its pages for the next
+    /// stack, while the retain budget has room for them; otherwise cold,
+    /// with every page a fault ever mapped returned to the user pool on
+    /// the ordinary locked path with the shootdown that path already
+    /// does.
     fn release(&self, index: usize) {
+        let committed_bytes = self.committed_bytes(index);
+        // What this stack actually cost, against what it would have cost
+        // committed up front, summed for the boot-end report. Nothing is
+        // logged per release: a store teardown is on the spawn path, and
+        // a console line there is a serial write per instance.
+        self.released.stacks.fetch_add(1, Ordering::Relaxed);
+        self.released
+            .committed_bytes
+            .fetch_add(committed_bytes as u64, Ordering::Relaxed);
+        let retained = self
+            .retained_bytes
+            .fetch_add(committed_bytes, Ordering::AcqRel);
+        if retained + committed_bytes <= self.retain_budget {
+            self.slots[index].state.store(SLOT_WARM, Ordering::Release);
+            self.announce_processors();
+            return;
+        }
+        self.retained_bytes
+            .fetch_sub(committed_bytes, Ordering::AcqRel);
         let body = self.body(index);
         let watermark = self.slots[index].watermark.load(Ordering::Acquire);
-        let committed_bytes = body.end().raw().saturating_sub(watermark);
         // Only the pages between the watermark and the top can be
         // mapped, so that is all the address space walks.
         let mapped = VirtRange::new(VirtAddr::new(watermark), committed_bytes);
@@ -490,15 +572,7 @@ impl FiberStackArena {
         self.slots[index]
             .watermark
             .store(body.end().raw(), Ordering::Release);
-        self.slots[index].live.store(false, Ordering::Release);
-        // What this stack actually cost, against what it would have cost
-        // committed up front, summed for the boot-end report. Nothing is
-        // logged per release: a store teardown is on the spawn path, and
-        // a console line there is a serial write per instance.
-        self.released.stacks.fetch_add(1, Ordering::Relaxed);
-        self.released
-            .committed_bytes
-            .fetch_add(committed_bytes as u64, Ordering::Relaxed);
+        self.slots[index].state.store(SLOT_COLD, Ordering::Release);
         self.announce_processors();
     }
 
@@ -527,19 +601,24 @@ impl FiberStackArena {
 
     fn stats(&self) -> FiberStackArenaStats {
         let mut live_slots = 0;
+        let mut warm_slots = 0;
         let mut committed_bytes = 0;
         for (index, slot) in self.slots.iter().enumerate() {
-            if !slot.live.load(Ordering::Acquire) {
-                continue;
+            match slot.state.load(Ordering::Acquire) {
+                SLOT_LIVE => {
+                    live_slots += 1;
+                    committed_bytes += self.committed_bytes(index);
+                }
+                SLOT_WARM => warm_slots += 1,
+                _ => {}
             }
-            live_slots += 1;
-            let top = self.body(index).end().raw();
-            committed_bytes += top.saturating_sub(slot.watermark.load(Ordering::Acquire));
         }
         let released_stacks = self.released.stacks.load(Ordering::Relaxed);
         FiberStackArenaStats {
             slots: self.slots.len(),
             live_slots,
+            warm_slots,
+            retained_bytes: self.retained_bytes.load(Ordering::Acquire),
             committed_bytes,
             eager_bytes: live_slots * self.stack_bytes,
             demand_commits: self
@@ -617,6 +696,9 @@ mod tests {
     /// Two, so that a commit resolved on the test's processor can be
     /// shown to land on that processor's counter and no other.
     const TEST_PROCESSORS: usize = 2;
+    /// Two pages of warm slots: enough to keep two untouched stacks and
+    /// too little for one that grew.
+    const TEST_RETAIN_BYTES: usize = 2 * PhysFrame::SIZE;
     /// Where the fake address space puts the arena. Any page-aligned
     /// value works; nothing dereferences it.
     const TEST_ARENA_BASE: usize = 0x0000_4000_0000_0000;
@@ -682,7 +764,12 @@ mod tests {
         pool.configure_processors(TEST_PROCESSORS);
         frame_reserve::configure_processors(TEST_PROCESSORS);
         install_fiber_stack_hooks(&TEST_HOOKS);
-        install_fiber_stack_arena(TEST_SLOTS, TEST_STACK_BYTES, TEST_PROCESSORS);
+        install_fiber_stack_arena(
+            TEST_SLOTS,
+            TEST_STACK_BYTES,
+            TEST_PROCESSORS,
+            TEST_RETAIN_BYTES,
+        );
     }
 
     #[test]
@@ -766,19 +853,61 @@ mod tests {
         );
 
         drop(held);
-        assert_eq!(ENDED.load(Ordering::Relaxed), TEST_SLOTS);
+        // Two untouched stacks fit the retain budget and stay warm; the
+        // third does not and is given back.
+        assert_eq!(ENDED.load(Ordering::Relaxed), 1);
         let stats = fiber_stack_arena_stats().expect("stats");
         assert_eq!(stats.live_slots, 0);
+        assert_eq!(stats.warm_slots, 2);
+        assert_eq!(stats.retained_bytes, 2 * PhysFrame::SIZE);
         assert_eq!(stats.released_stacks, TEST_SLOTS as u64);
         assert_eq!(
             stats.released_committed_bytes,
             (TEST_SLOTS * PhysFrame::SIZE) as u64,
             "an untouched stack cost its top page and nothing more"
         );
-        // And the slots are usable again.
+        // And the slots are usable again: a warm one first, as it stands.
+        let prepared = PREPARED.load(Ordering::Relaxed);
+        let committed = COMMITTED.load(Ordering::Relaxed);
         let reused = claim_fiber_stack(TEST_STACK_BYTES).expect("a slot came back");
-        assert_eq!(fiber_stack_arena_stats().expect("stats").live_slots, 1);
+        let stats = fiber_stack_arena_stats().expect("stats");
+        assert_eq!(stats.live_slots, 1);
+        assert_eq!(stats.warm_slots, 1);
+        assert_eq!(stats.retained_bytes, PhysFrame::SIZE);
+        assert_eq!(PREPARED.load(Ordering::Relaxed), prepared);
+        assert_eq!(COMMITTED.load(Ordering::Relaxed), committed);
         assert_eq!(reused.range().end - reused.range().start, TEST_STACK_BYTES);
+    }
+
+    #[test]
+    fn a_warm_slot_serves_the_next_stack_without_touching_the_address_space() {
+        arena();
+        let first = claim_fiber_stack(TEST_STACK_BYTES).expect("a free slot");
+        let range = first.range();
+        assert_eq!(
+            resolve_stack_fault(VirtAddr::new(range.end - PhysFrame::SIZE - 8)),
+            StackFault::Committed
+        );
+        drop(first);
+        let stats = fiber_stack_arena_stats().expect("stats");
+        assert_eq!(stats.warm_slots, 1);
+        assert_eq!(stats.retained_bytes, 2 * PhysFrame::SIZE);
+        assert_eq!(ENDED.load(Ordering::Relaxed), 0);
+
+        let prepared = PREPARED.load(Ordering::Relaxed);
+        let committed = COMMITTED.load(Ordering::Relaxed);
+        let second = claim_fiber_stack(TEST_STACK_BYTES).expect("the warm slot");
+        assert_eq!(second.range(), range, "the warm slot is the one handed out");
+        assert_eq!(PREPARED.load(Ordering::Relaxed), prepared);
+        assert_eq!(COMMITTED.load(Ordering::Relaxed), committed);
+        let stats = fiber_stack_arena_stats().expect("stats");
+        assert_eq!(stats.warm_slots, 0);
+        assert_eq!(stats.retained_bytes, 0);
+        assert_eq!(
+            stats.committed_bytes,
+            2 * PhysFrame::SIZE,
+            "the pages the first stack touched are still the second's"
+        );
     }
 
     #[test]

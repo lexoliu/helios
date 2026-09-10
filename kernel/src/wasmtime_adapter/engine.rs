@@ -13,6 +13,13 @@ use wasmtime::{AsContextMut, Engine};
 
 const WASI_CLI_RUN_FUNC: &str = "run";
 const POOLING_MAX_UNUSED_WARM_SLOTS: u32 = 100;
+/// The share of usable memory released fiber stacks may keep committed
+/// for the stacks that come after them (`memory::fiber_stack`): one
+/// sixty-fourth, a hundred or so stacks of the size a program actually
+/// touches, against a spawn path that would otherwise pay a TLB shootdown
+/// per teardown.
+#[cfg(all(target_os = "none", feature = "wasmtime-bare-metal"))]
+const FIBER_STACK_RETAIN_FRACTION: usize = 64;
 /// Elements one pooled table slot holds.
 ///
 /// Set here rather than inherited, and set from measurement: the largest
@@ -106,6 +113,7 @@ fn build_engine_for_platform<P: Cpu + Clone>(
             budget.stacks as usize,
             COMPONENT_ASYNC_STACK_SIZE,
             platform.processor_count(),
+            crate::machine_memory().usable_bytes / FIBER_STACK_RETAIN_FRACTION,
         );
         config.with_host_stack(Arc::new(super::fiber_stack::ArenaStackCreator));
     }
