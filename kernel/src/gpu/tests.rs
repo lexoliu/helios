@@ -17,7 +17,7 @@ use futures_lite::future::{block_on, poll_once};
 use helios_hal::device::{DeviceRegion, DeviceRegionAttributes};
 use helios_hal::display::{
     BlobId, BlobMemory, BlobRequest, BlobUsage, CapsetId, CapsetInfo, CapsetList, ContextId,
-    ContextName, FenceId, Gpu3d, Gpu3dResult,
+    ContextName, FenceId, Gpu3d, Gpu3dError, Gpu3dResult,
 };
 use helios_hal::iommu::PhysicalRange;
 use helios_hal::vmm::VirtAddr;
@@ -771,6 +771,18 @@ fn a_request_queued_before_release_is_dropped() {
     assert!(
         service.claim().is_ok(),
         "the engine is free once its resources are back"
+    );
+}
+
+/// A submission too long for the wire's command-buffer field is a
+/// bounds refusal, which is what the WIT's `out-of-bounds` is written
+/// for — not `invalid-blob`, which is a blob's own parameters being
+/// wrong.
+#[test]
+fn a_command_buffer_too_long_for_the_wire_is_out_of_bounds() {
+    assert_eq!(
+        Gpu3dServiceError::from(Gpu3dError::CommandBufferLength { bytes: 8 << 20 }),
+        Gpu3dServiceError::OutOfBounds
     );
 }
 

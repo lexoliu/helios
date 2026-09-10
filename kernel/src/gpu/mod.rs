@@ -170,10 +170,13 @@ impl From<Gpu3dError> for Gpu3dServiceError {
             Gpu3dError::UnknownCapset { .. } => Self::NoSuchCapset,
             Gpu3dError::OutOfMemory => Self::OutOfMemory,
             Gpu3dError::ApertureExhausted => Self::ApertureExhausted,
-            Gpu3dError::InvalidBlob
-            | Gpu3dError::NotMappable(_)
-            | Gpu3dError::InvalidParameter
-            | Gpu3dError::CommandBufferLength { .. } => Self::InvalidBlob,
+            Gpu3dError::InvalidBlob | Gpu3dError::NotMappable(_) | Gpu3dError::InvalidParameter => {
+                Self::InvalidBlob
+            }
+            // A submission too long for the wire's command-buffer field
+            // is a bounds refusal: the WIT names it `out-of-bounds`, the
+            // same word a range past a resource's end gets.
+            Gpu3dError::CommandBufferLength { .. } => Self::OutOfBounds,
             Gpu3dError::TooMany { .. } => Self::TooManyBlobs,
             // Everything left is the display engine failing rather than
             // refusing: a context or a blob the kernel's own bookkeeping
