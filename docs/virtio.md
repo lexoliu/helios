@@ -98,9 +98,9 @@ than under the VM.
 
 `DeviceType` lists exactly the virtio device kinds a Helios driver
 claims: network (1), block (2), entropy (4), memory balloon (5), 9P (9),
-GPU (16), input (18), vsock (19) and IOMMU (23). A transport that reads
-any other device id rejects the function rather than mapping it to a
-placeholder driver.
+GPU (16), input (18), vsock (19), IOMMU (23) and sound (25). A transport
+that reads any other device id rejects the function rather than mapping
+it to a placeholder driver.
 
 Four further device kinds have been evaluated and deliberately not
 claimed — RTC (17), memory (24), file system (26) and PMEM (27).
@@ -277,6 +277,88 @@ line per device:
 
 ```
 virtio-input online transport=pci name="QEMU Virtio Tablet" ev=KEY,REL,ABS abs=x:0..32767,y:0..32767
+```
+
+virtio-snd is the machine's sound card. The driver in `virtio/src/snd.rs`
+plays PCM audio; capture is deliberately not driven, so the receive queue
+is programmed and never posted on — a queue the driver puts no buffer on
+is a queue the device has nothing to complete, which is how a
+capture-capable device is told this driver is not recording. Four queues
+serve it (virtio 1.2 §5.14.2):
+
+| Queue | Index | Carries |
+| --- | --- | --- |
+| control | 0 | `JACK_INFO`, `PCM_INFO`, `CHMAP_INFO`, `PCM_SET_PARAMS`, `PCM_PREPARE`, `PCM_START`, `PCM_STOP`, `PCM_RELEASE` |
+| event | 1 | `PCM_PERIOD_ELAPSED`, `PCM_XRUN`, `JACK_CONNECTED`, `JACK_DISCONNECTED` |
+| transmit | 2 | One period per chain, on its way to the device |
+| receive | 3 | Nothing: programmed and never posted |
+
+A stream is a state machine and the control queue is how it is driven.
+`PCM_SET_PARAMS` fixes the format, rate, channel count, buffer and
+period; `PCM_PREPARE` makes the device allocate; `PCM_START` begins its
+clock; `PCM_STOP` and `PCM_RELEASE` undo the two. Every reply carries a
+status word and every one of them is checked against the four the
+specification defines — `S_OK`, `S_BAD_MSG`, `S_NOT_SUPP`, `S_IO_ERR` —
+and turned into the `AudioError` variant that names it. A code outside
+those four is reported as `UnexpectedResponse`, because it answers a
+question this driver never asked. The parameters themselves are checked
+against the stream's own `PCM_INFO` description first: a format the
+stream does not accept, a rate it cannot be clocked at, a channel count
+outside its range, a period that does not divide the buffer or does not
+end on a frame boundary are all refused here, where the field that is
+wrong can still be named, rather than at the device, whose whole answer
+would be one `BAD_MSG`.
+
+One period is one transmit chain: a four-byte `virtio_snd_pcm_xfer`
+naming the stream, the caller's period, and an eight-byte
+`virtio_snd_pcm_status` the device writes back. **The driver never
+allocates a period.** The bytes are the caller's, on loan to the device
+between the submission and the completion, and the status carries
+`latency_bytes` — how much the device still held unplayed when it took
+this period — which is the only unit a device can state its latency in.
+The transmit ring is 64 chains deep and every chain has its own
+completion slot, so a caller with several `write` futures alive at once
+has several periods in flight; a device that runs dry between two periods
+plays a gap, and the gap is audible.
+
+The event ring is the driver's whole receive buffer pool — one eight-byte
+`virtio_snd_event` per descriptor, allocated at bring-up and reposted the
+moment it is read — so nothing on the receive path allocates. Like
+virtio-input, a sound device reports without being asked, so its reader
+clears the device's interrupt status before it parks rather than only
+when an interrupt arrives, and the bring-up path clears the interrupt its
+own polled query raised: on virtio-mmio the line is a function of a
+read-to-clear register, and a line that never falls never rises again.
+
+`VIRTIO_SND_F_CTLS` is deliberately not negotiated: it adds the mixer
+control protocol, which is a different contract from this one and has no
+consumer in the tree. Neither is any per-stream PCM feature —
+`MSG_POLLING` and the shared-memory period features are alternatives to
+the event ring this driver reads.
+
+Everything above the wire format is device-neutral. The PCM value types
+and the `PlaybackDevice` trait live in `hal/src/audio.rs` — a stream, a
+jack and a channel map are sound-hardware facts that virtio-snd is one
+implementation of — and the kernel holds the device through
+`install_sound_device` (`kernel/src/io/sound.rs`), whose task per device
+drains the event ring for as long as the machine runs and logs what it
+finds. A device nobody reads is a device that stops reporting, which is
+why the kernel owns it from bring-up; the audio service takes playback
+over from there. The formats the contract names are the linear ones a
+mixer can write straight into a buffer (`S8`, `U8`, `S16`, `U16`, `S32`,
+`U32`, `FLOAT`, `FLOAT64`); a device that also offers mu-law, a packed
+3-byte width, DSD or IEC958 subframes has that part of its bitmap dropped
+rather than refused, because each of those needs a conversion step that
+belongs to whatever produces the audio.
+
+The device is on the platform's own bus: virtio-pci on x86-64 (`-device
+virtio-sound-pci`) and virtio-mmio on aarch64 and riscv64 (`-device
+virtio-sound-device`). `helios-inspector vm --audiodev` is what attaches
+it, and `docs/desktop.md` describes the backends. Each backend reports it
+on one line:
+
+```
+virtio-snd online transport=pci streams=1 jacks=1 rates=5512..192000 formats=S16,S32,FLOAT
 ```
 
 virtio-net is the one device whose capabilities are decided outside the
