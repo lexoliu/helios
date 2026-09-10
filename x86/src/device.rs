@@ -7,7 +7,8 @@
 //! answer exactly that. What the kernel does reach through these hooks
 //! on this backend is pinned, physically contiguous memory under an
 //! instance's reservation — a display frame buffer the display engine
-//! reads by physical address — and that is the user address space's own
+//! reads by physical address, and a compositor surface a second
+//! instance holds a view of — and that is the user address space's own
 //! [`AddressSpace`] surface, installed here the moment the address space
 //! exists and before any device is discovered.
 //!
@@ -18,6 +19,7 @@
 //! processor before it returns. The hooks hold no state of their own.
 
 use helios_hal::device::{DeviceRegion, DmaPlacement};
+use helios_hal::iommu::PhysicalRange;
 use helios_hal::pmm::PhysFrame;
 use helios_hal::vmm::{AddressSpace, AddressSpaceError, PageFlags, VirtRange};
 use helios_kernel::DeviceVmHooks;
@@ -28,6 +30,18 @@ fn map_device(_virt: VirtRange, _region: DeviceRegion) -> Result<(), AddressSpac
 
 fn unmap_device(_virt: VirtRange) -> Result<(), AddressSpaceError> {
     Err(AddressSpaceError::DeviceMappingUnsupported)
+}
+
+fn map_shared(
+    virt: VirtRange,
+    physical: PhysicalRange,
+    flags: PageFlags,
+) -> Result<(), AddressSpaceError> {
+    crate::vmm::user_address_space().map_shared(virt, physical, flags)
+}
+
+fn unmap_shared(virt: VirtRange) -> Result<(), AddressSpaceError> {
+    crate::vmm::user_address_space().unmap_shared(virt)
 }
 
 fn commit_contiguous(
@@ -49,6 +63,8 @@ fn mapping_granule() -> u64 {
 static VM_HOOKS: DeviceVmHooks = DeviceVmHooks {
     map_device,
     unmap_device,
+    map_shared,
+    unmap_shared,
     commit_contiguous,
     release_contiguous,
     mapping_granule,

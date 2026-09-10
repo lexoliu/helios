@@ -100,6 +100,18 @@ fn unmap_device(virt: VirtRange) -> Result<(), AddressSpaceError> {
     crate::vmm::user_address_space_or_panic().unmap_device(virt)
 }
 
+fn map_shared(
+    virt: VirtRange,
+    physical: PhysicalRange,
+    flags: PageFlags,
+) -> Result<(), AddressSpaceError> {
+    crate::vmm::user_address_space_or_panic().map_shared(virt, physical, flags)
+}
+
+fn unmap_shared(virt: VirtRange) -> Result<(), AddressSpaceError> {
+    crate::vmm::user_address_space_or_panic().unmap_shared(virt)
+}
+
 fn commit_contiguous(
     virt: VirtRange,
     flags: PageFlags,
@@ -121,6 +133,8 @@ fn mapping_granule() -> u64 {
 static VM_HOOKS: DeviceVmHooks = DeviceVmHooks {
     map_device,
     unmap_device,
+    map_shared,
+    unmap_shared,
     commit_contiguous,
     release_contiguous,
     mapping_granule,

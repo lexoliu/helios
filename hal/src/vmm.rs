@@ -58,6 +58,7 @@ use core::ptr::NonNull;
 use thiserror::Error;
 
 use crate::device::{DeviceRegion, DmaPlacement};
+use crate::iommu::PhysicalRange;
 use crate::pmm::PhysFrame;
 
 /// Virtual address. No alignment guarantees; ranges check
@@ -192,6 +193,8 @@ pub enum AddressSpaceError {
     BadPageBuffer,
     #[error("this address space cannot map device memory")]
     DeviceMappingUnsupported,
+    #[error("this address space cannot map memory another owner holds")]
+    SharedMappingUnsupported,
     #[error("the range is a device mapping, not ordinary memory")]
     DeviceMapped,
     #[error("this address space cannot host demand-commit regions")]
@@ -396,6 +399,51 @@ pub trait AddressSpace: Send + Sync + 'static {
         _placement: DmaPlacement,
     ) -> Result<PhysFrame, AddressSpaceError> {
         Err(AddressSpaceError::DeviceMappingUnsupported)
+    }
+
+    /// Map `physical` — ordinary memory that already belongs to
+    /// somebody — at `virt`, which must be a sub-range of an existing
+    /// reservation exactly as long as the range.
+    ///
+    /// This is the one way two owners come to hold the same bytes. The
+    /// run was produced by [`Self::commit_contiguous`] in one owner's
+    /// reservation and is charged to that owner; mapping it a second
+    /// time neither allocates nor accounts for anything, so the second
+    /// holder sees the pixels without a copy and pays for none of them.
+    /// The leaf entries carry ordinary memory attributes — cacheable,
+    /// coherent between processors — because the bytes are memory and
+    /// not a register file, which is exactly the reason this is not
+    /// [`Self::map_device`].
+    ///
+    /// Per the SMP contract the call invalidates the local TLB and
+    /// shoots down every other processor that has run in this space
+    /// before it returns.
+    ///
+    /// A backend that cannot express a second mapping of memory it did
+    /// not allocate reports
+    /// [`AddressSpaceError::SharedMappingUnsupported`] rather than
+    /// copying, because a copy would answer a request for shared bytes
+    /// with two divergent ones.
+    fn map_shared(
+        &self,
+        _virt: VirtRange,
+        _physical: PhysicalRange,
+        _flags: PageFlags,
+    ) -> Result<(), AddressSpaceError> {
+        Err(AddressSpaceError::SharedMappingUnsupported)
+    }
+
+    /// Remove a mapping [`Self::map_shared`] installed, leaving the
+    /// range reserved and faulting.
+    ///
+    /// Nothing goes back to the frame pool: the run belongs to the owner
+    /// that committed it and is freed by that owner's
+    /// [`Self::release_contiguous`], never by a second holder letting go
+    /// of its view. The shootdown happens before the call returns, so
+    /// the second holder has provably lost its last path to the bytes by
+    /// the time the kernel reports the surface gone.
+    fn unmap_shared(&self, _virt: VirtRange) -> Result<(), AddressSpaceError> {
+        Err(AddressSpaceError::SharedMappingUnsupported)
     }
 
     /// Give back the run [`Self::commit_contiguous`] produced.
