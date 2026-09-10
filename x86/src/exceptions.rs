@@ -56,6 +56,9 @@ pub(crate) const DISPLAY_INTERRUPT_VECTOR: u8 = 0x38;
 /// separate functions, and each of them reports on its own message.
 pub(crate) const INPUT_INTERRUPT_VECTORS: [u8; helios_kernel::MAX_INPUT_DEVICES] =
     [0x39, 0x3a, 0x3b, 0x3c];
+/// The sound device's message. One vector: a machine carries one sound
+/// card, and its four queues share the interrupt the transport delivers.
+pub(crate) const SOUND_INTERRUPT_VECTOR: u8 = 0x3d;
 /// One vector per block device the routing table can hold: the platform
 /// exposes the boot image and the kernel's own disk as separate
 /// functions, and each of them delivers its completions on its own
@@ -77,6 +80,7 @@ pub(crate) type DeviceInterruptRoutes = helios_kernel::ExternalInterruptRoutes<
     crate::vsock::VirtioVsockFunction,
     crate::gpu::VirtioDisplayDevice,
     crate::input::VirtioInputFunction,
+    crate::snd::VirtioSoundDevice,
     crate::block::VirtioBlockDevice,
 >;
 
@@ -111,6 +115,7 @@ unsafe extern "C" {
     fn helios_x86_interrupt_input_1();
     fn helios_x86_interrupt_input_2();
     fn helios_x86_interrupt_input_3();
+    fn helios_x86_interrupt_sound();
     fn helios_x86_interrupt_block_0();
     fn helios_x86_interrupt_block_1();
     fn helios_x86_interrupt_block_2();
@@ -207,6 +212,8 @@ impl ProcessorIdt {
             for (vector, stub) in INPUT_INTERRUPT_VECTORS.iter().zip(input_stubs) {
                 table[*vector].set_handler_addr(handler_address(stub));
             }
+            table[SOUND_INTERRUPT_VECTOR]
+                .set_handler_addr(handler_address(helios_x86_interrupt_sound));
             let block_stubs: [unsafe extern "C" fn(); helios_kernel::MAX_BLOCK_DEVICES] = [
                 helios_x86_interrupt_block_0,
                 helios_x86_interrupt_block_1,
@@ -536,7 +543,7 @@ extern "C" fn helios_x86_interrupt_dispatch(frame: &mut ExceptionFrame) {
              network={NETWORK_INTERRUPT_VECTOR:#x} host-fs={HOST_FS_INTERRUPT_VECTOR:#x} \
              entropy={ENTROPY_INTERRUPT_VECTOR:#x} vsock={VSOCK_INTERRUPT_VECTOR:#x} \
              display={DISPLAY_INTERRUPT_VECTOR:#x} input={INPUT_INTERRUPT_VECTORS:#x?} \
-             block={BLOCK_INTERRUPT_VECTORS:#x?}",
+             sound={SOUND_INTERRUPT_VECTOR:#x} block={BLOCK_INTERRUPT_VECTORS:#x?}",
             frame.vector, frame.rip
         ),
     }
@@ -558,6 +565,7 @@ fn is_device_interrupt(vector: u8) -> bool {
             | ENTROPY_INTERRUPT_VECTOR
             | VSOCK_INTERRUPT_VECTOR
             | DISPLAY_INTERRUPT_VECTOR
+            | SOUND_INTERRUPT_VECTOR
     ) || BLOCK_INTERRUPT_VECTORS.contains(&vector)
         || INPUT_INTERRUPT_VECTORS.contains(&vector)
         || NETWORK_QUEUE_INTERRUPT_VECTORS.contains(&vector)
