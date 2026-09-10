@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitCode, Stdio};
 
 use askama::Template;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -810,8 +810,20 @@ struct ProgramManifest {
     artifact_name: String,
 }
 
-fn main() -> Result<(), CliError> {
-    let cli = Cli::parse();
+/// Every command's failure is a typed error whose message names what was
+/// checked and what fixes it; the process boundary prints that message,
+/// not the `Debug` form a `Result` returned from `main` would.
+fn main() -> ExitCode {
+    match run(Cli::parse()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("helios-cli: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run(cli: Cli) -> Result<(), CliError> {
     match cli.command {
         Commands::Aot(command) => Ok(run_aot(command)?),
         Commands::CompilerPlugin(command) => Ok(run_compiler_plugin(command)?),
