@@ -36,7 +36,7 @@ pub enum SystemError {
         #[from]
         source: core::fmt::Error,
     },
-    #[error("failed to listen for SIGINT: {source}")]
+    #[error("failed to listen for SIGINT and SIGTERM: {source}")]
     Signals {
         #[source]
         source: std::io::Error,

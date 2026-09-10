@@ -17,17 +17,18 @@ pub(crate) fn block_on<T>(future: impl Future<Output = T>) -> T {
 pub(crate) async fn interruptible<T>(
     command: impl Future<Output = T>,
 ) -> std::io::Result<CommandRun<T>> {
-    let mut signals = Signals::new([Signal::Int])?;
+    let mut signals = Signals::new([Signal::Int, Signal::Term])?;
     future::or(
         async move { Ok(CommandRun::Completed(command.await)) },
         async move {
             match signals.next().await {
-                Some(Ok(Signal::Int)) => Ok(CommandRun::Interrupted),
+                Some(Ok(Signal::Int | Signal::Term)) => Ok(CommandRun::Interrupted),
                 Some(Ok(signal)) => panic!(
-                    "unexpected signal while waiting for SIGINT command cancellation: {signal:?}"
+                    "unexpected signal while waiting for SIGINT or SIGTERM command \
+                     cancellation: {signal:?}"
                 ),
                 Some(Err(error)) => Err(error),
-                None => panic!("signal stream ended while waiting for SIGINT"),
+                None => panic!("signal stream ended while waiting for SIGINT or SIGTERM"),
             }
         },
     )
