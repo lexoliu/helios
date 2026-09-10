@@ -13,6 +13,7 @@ pub mod device;
 pub mod display;
 pub mod entropy;
 pub mod fs;
+pub mod input;
 pub mod interrupt;
 pub mod io;
 pub mod iommu;
