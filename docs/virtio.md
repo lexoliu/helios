@@ -98,9 +98,9 @@ than under the VM.
 
 `DeviceType` lists exactly the virtio device kinds a Helios driver
 claims: network (1), block (2), entropy (4), memory balloon (5), 9P (9),
-GPU (16), vsock (19) and IOMMU (23). A transport that reads any other
-device id rejects the function rather than mapping it to a placeholder
-driver.
+GPU (16), input (18), vsock (19) and IOMMU (23). A transport that reads
+any other device id rejects the function rather than mapping it to a
+placeholder driver.
 
 Four further device kinds have been evaluated and deliberately not
 claimed — RTC (17), memory (24), file system (26) and PMEM (27).
@@ -204,6 +204,57 @@ The device is on the platform's own bus: virtio-pci on x86-64
 
 ```
 virtio-gpu online transport=mmio scanouts=1 preferred=1280x800 edid=on
+```
+
+virtio-input is the machine's keyboard, pointer and tablet. The driver
+in `virtio/src/input.rs` carries evdev events unchanged — a
+`virtio_input_event` is a Linux `input_event` without its timestamp — so
+there is no Helios event model to translate through. The codes
+themselves are generated from a named revision of Linux's
+`include/uapi/linux/input-event-codes.h` into `hal/src/input/codes.rs`
+by `tools/gen-input-event-codes.py`; the header is `GPL-2.0-only WITH
+Linux-syscall-note`, and the note is what allows a non-GPL tree to carry
+the ABI constants. The `input-event-codes` crate on crates.io was not
+used: it is plain `GPL-2.0-only` with no such note, and its newest
+release describes Linux 6.2.
+
+Two queues serve the device: `eventq` (0), which the device reports on,
+and `statusq` (1), which carries indicator changes back to it. The event
+ring is the driver's whole receive buffer pool — one eight-byte event per
+descriptor, allocated at bring-up and reposted the moment it is read — so
+nothing on the receive path allocates. Events are handed to the reader
+one at a time, `SYN_REPORT` included: a frame boundary is a fact the
+consumer acts on, and a driver that buffered a frame would add latency to
+the one path a person can feel.
+
+The device describes itself through a select/sub-select configuration
+register file rather than a command protocol (virtio 1.2 §5.8.5): the
+driver writes `select` and `subsel`, reads back `size`, and then reads
+that many payload bytes. `ID_NAME`, `ID_SERIAL` and `ID_DEVIDS` name the
+device; `PROP_BITS` says what kind of thing it is; `EV_BITS` answers per
+event type, and a non-zero size *is* the declaration that the type is
+supported, because the specification defines no query that lists them;
+`ABS_INFO` gives each absolute axis its range. The selector is
+device-wide state, so the file is read exactly once, on the bring-up
+path, by the processor that programs the device, and never afterwards.
+
+Everything above the wire format is device-neutral. The evdev value
+types and the `InputDevice` trait live in `hal/src/input.rs`, and the
+kernel holds each device through `install_input_device`
+(`kernel/src/io/input.rs`), whose task drains the ring and reports every
+event with the frame it belongs to. A device nobody reads is a device
+that stops working — its ring is its whole buffer pool — which is why the
+kernel owns it from bring-up.
+
+The device is on the platform's own bus: virtio-pci on x86-64
+(`-device virtio-keyboard-pci`, `-device virtio-mouse-pci`, `-device
+virtio-tablet-pci`) and virtio-mmio on aarch64 and riscv64 (the same
+names ending `-device`). A machine presents several at once and every one
+of them is brought up, each on its own interrupt; the backends report one
+line per device:
+
+```
+virtio-input online transport=pci name="QEMU Virtio Tablet" ev=KEY,REL,ABS abs=x:0..32767,y:0..32767
 ```
 
 virtio-net is the one device whose capabilities are decided outside the
