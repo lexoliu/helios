@@ -16,7 +16,7 @@ from contextlib import ExitStack, nullcontext
 from pathlib import Path
 
 import pytest
-from bench_stub import fake_checkout, records, workload
+from bench_stub import fake_checkout, fake_inspector, records, workload
 
 from helios_bench.baseline import Baseline
 from helios_bench.gate import GateKind, evaluate, evaluate_paired, gate_report
@@ -599,6 +599,53 @@ def test_a_profile_use_run_pairs_two_builds_of_one_checkout(tmp_path) -> None:
     assert args.helios_profile_use == profile
     assert args.helios_baseline_root is None, "the baseline is this checkout, built plain"
     assert args.helios_baseline_out_dir == options.out_dir / "helios-baseline"
+
+
+def test_a_profile_use_pairing_plans_two_distinct_kernel_paths(tmp_path, monkeypatch) -> None:
+    """The two columns of a PGO pairing boot two files.
+
+    Both are `profile-use` builds since a release kernel of this lane
+    reads the fetched profile (#226), and one cargo profile is one output
+    directory, so until #327 the second build overwrote the first and
+    both images resolved to
+    `target/x86_64-unknown-none/profile-use/helios`: run 34437890235
+    refused itself on the identical-images guard. The driver asks the
+    inspector where each image lives, per image and with that image's
+    profile in the question, so the pairing turns on the inspector
+    keeping the two builds apart — and on nothing this file could paper
+    over, which is why the pairing that still names one build twice is
+    pinned here beside the one that does not.
+    """
+    module = gap_bench()
+    checkout = fake_checkout(tmp_path / "candidate")
+    monkeypatch.setattr(module, "repo_root", lambda: checkout)
+    monkeypatch.setenv("HELIOS_INSPECTOR_BIN", str(fake_inspector(tmp_path)))
+    profile = tmp_path / "helios-kernel.profdata"
+    profile.write_bytes(b"\x00" * 16)
+    candidate = module.HeliosImage(
+        name="helios",
+        workspace_root=checkout,
+        out_dir=tmp_path / "out" / "helios",
+        profile_use=profile,
+    )
+    baseline = module.HeliosImage(
+        name="helios-baseline",
+        workspace_root=checkout,
+        out_dir=tmp_path / "out" / "helios-baseline",
+    )
+
+    paths = [module.guest_artifact(image, "x86-64", "kvm") for image in (candidate, baseline)]
+    assert paths[0] != paths[1], "one checkout, two profiles, two kernel images"
+    module.refuse_identical_images([candidate, baseline], "x86-64", "kvm")
+
+    twin = module.HeliosImage(
+        name="helios-twin",
+        workspace_root=checkout,
+        out_dir=tmp_path / "out" / "helios-twin",
+        profile_use=profile,
+    )
+    with pytest.raises(module.IdenticalHeliosImages, match="same guest build"):
+        module.refuse_identical_images([candidate, twin], "x86-64", "kvm")
 
 
 def test_a_plain_baseline_is_the_pgo_control(tmp_path) -> None:

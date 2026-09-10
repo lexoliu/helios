@@ -10,10 +10,15 @@ from elftools.elf.elffile import ELFFile
 # A release kernel lives in the `release` directory, or in `profile-use`
 # on the target whose release builds read the fetched profile (docs/pgo.md,
 # #226): the inspector keeps the two apart so a plain build and a
-# profile-guided one never share an artifact.
+# profile-guided one never share an artifact. A kernel built against a
+# profile named on the command line lives under `target/pgo-kernels/`, in
+# a directory keyed to that profile, because it is a `profile-use` build
+# too and would otherwise be the release kernel's own artifact (#327);
+# the inspector names that directory (`NAMED_PROFILE_KERNELS`).
 KERNEL_PATTERNS = (
     "target/*-unknown-none*/release/helios",
     "target/*-unknown-none*/profile-use/helios",
+    "target/pgo-kernels/*/*-unknown-none*/profile-use/helios",
     "target/perf-baselines/worktrees/*/helios/target/*-unknown-none*/release/helios",
     "target/perf-baselines/worktrees/*/helios/target/*-unknown-none*/profile-use/helios",
 )

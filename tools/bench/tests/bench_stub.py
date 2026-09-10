@@ -50,6 +50,39 @@ done
 """.replace("@WEDGED@", WEDGED)
 
 
+# Stands in for `helios-inspector vm … kernel-path`: the question decides
+# the answer. The real one resolves the image from the workspace root it
+# is pointed at and from the build the flags describe — a profile named
+# with `--profile-use` keys a directory of its own (#327) — so the
+# stand-in keys its answer by exactly those two, and leaves an image
+# there because a query in a real run follows the build that produced
+# one.
+FAKE_INSPECTOR = """#!/usr/bin/env python3
+import hashlib
+import os
+import sys
+from pathlib import Path
+
+argv = sys.argv[1:]
+if argv[-1] != "kernel-path":
+    raise SystemExit(f"the stand-in answers kernel-path and nothing else: {argv}")
+root = Path(os.environ["HELIOS_WORKSPACE_ROOT"])
+build = hashlib.sha256(" ".join([str(root), *argv]).encode()).hexdigest()[:16]
+image = root / "target" / build / "helios"
+image.parent.mkdir(parents=True, exist_ok=True)
+image.write_text(build, encoding="utf-8")
+print(image)
+"""
+
+
+def fake_inspector(root: Path) -> Path:
+    """An inspector whose `kernel-path` answers without a build."""
+    inspector = root / "helios-inspector"
+    inspector.write_text(FAKE_INSPECTOR, encoding="utf-8")
+    inspector.chmod(0o755)
+    return inspector
+
+
 def workload(name: str, workload_class: str) -> dict:
     return {"name": name, "class": workload_class, "runner": "program", "headline": False}
 
