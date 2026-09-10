@@ -757,9 +757,10 @@ jobs:
           # The smoke lane's QEMU offers a 2D device only, so its answer
           # is `3d=none` — on the guest's own line and on the kernel's
           # boot line, which is where "this machine has no 3D" is read
-          # off rather than deduced from a missing message.
+          # off rather than deduced from a missing message. The feature
+          # tail says what a 2D device negotiates: none of them.
           grep -Fq 'gpu-test:3d=none' "$runtime/inspector.log"
-          grep -Fq '3d=none' "$runtime/debug-serial.log"
+          grep -Fq '3d=none blob=off context-init=off uuid=off' "$runtime/debug-serial.log"
           grep -Eq 'display-test:surface scanout=0 width=[0-9]+ height=[0-9]+' \
             "$runtime/inspector.log"
           grep -Fq 'display-test:cursor-set' "$runtime/inspector.log"

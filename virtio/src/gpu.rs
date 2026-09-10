@@ -914,6 +914,20 @@ pub(crate) fn report_gpu_online<T: VirtioTransport>(
         );
         IoError::DeviceFault
     })?;
+    tracing::info!("{}", online_line(device, transport, &topology));
+    Ok(topology)
+}
+
+/// The `virtio-gpu online` line's text.
+///
+/// Built in one place rather than inside the `tracing` call so a test
+/// can pin what a lane greps for, down to the field order and the
+/// feature each field names.
+fn online_line<T: VirtioTransport>(
+    device: &VirtioGpuDevice<T>,
+    transport: &str,
+    topology: &DisplayTopology,
+) -> alloc::string::String {
     let edid = if device.edid_supported() { "on" } else { "off" };
     let scanouts = topology.scanouts.len();
     let width = topology.preferred.width;
@@ -929,12 +943,12 @@ pub(crate) fn report_gpu_online<T: VirtioTransport>(
     };
     let blob = on_off(features.device(render::GPU_FEATURE_RESOURCE_BLOB));
     let context_init = on_off(features.device(render::GPU_FEATURE_CONTEXT_INIT));
-    tracing::info!(
+    let uuid = on_off(features.device(render::GPU_FEATURE_RESOURCE_UUID));
+    alloc::format!(
         "virtio-gpu online transport={transport} scanouts={scanouts} \
          preferred={width}x{height} edid={edid} 3d={three_d} blob={blob} \
-         context-init={context_init}"
-    );
-    Ok(topology)
+         context-init={context_init} uuid={uuid}"
+    )
 }
 
 const fn on_off(enabled: bool) -> &'static str {

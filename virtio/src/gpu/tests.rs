@@ -38,9 +38,9 @@ use super::{
     CMD_GET_DISPLAY_INFO, CMD_MOVE_CURSOR, CMD_RESOURCE_ATTACH_BACKING, CMD_RESOURCE_CREATE_2D,
     CMD_RESOURCE_DETACH_BACKING, CMD_RESOURCE_FLUSH, CMD_RESOURCE_UNREF, CMD_SET_SCANOUT,
     CMD_TRANSFER_TO_HOST_2D, CMD_UPDATE_CURSOR, CTRL_HEADER_BYTES, DISPLAY_ONE_BYTES,
-    RESP_ERR_INVALID_RESOURCE_ID, RESP_ERR_INVALID_SCANOUT_ID, RESP_ERR_OUT_OF_MEMORY,
-    RESP_OK_DISPLAY_INFO, RESP_OK_NODATA, VirtioGpuDevice, decode_display_info,
-    decode_edid_preferred_mode,
+    DisplayTopology, RESP_ERR_INVALID_RESOURCE_ID, RESP_ERR_INVALID_SCANOUT_ID,
+    RESP_ERR_OUT_OF_MEMORY, RESP_OK_DISPLAY_INFO, RESP_OK_NODATA, VirtioGpuDevice,
+    decode_display_info, decode_edid_preferred_mode, online_line,
 };
 use crate::testing::{FakeTransport, FakeTransportConfig};
 use crate::transport::{DeviceType, VirtioFeatures, VirtioTransport};
@@ -300,6 +300,35 @@ fn the_three_dimensional_features_are_taken_one_at_a_time() {
     assert!(features.device(GPU_FEATURE_VIRGL));
     assert!(features.device(GPU_FEATURE_CONTEXT_INIT));
     assert!(!features.device(GPU_FEATURE_RESOURCE_BLOB));
+}
+
+/// The `virtio-gpu online` line is what a lane greps: it names the
+/// transport and the topology and then reports each negotiated renderer
+/// feature in a fixed order, `uuid=` included.
+#[test]
+fn the_online_line_reports_what_was_negotiated() {
+    let topology = DisplayTopology {
+        scanouts: decode_display_info(
+            &display_info_response(&[(Rect::new(0, 0, 1280, 800), true)]),
+            1,
+        )
+        .expect("the reply describes one scanout"),
+        preferred: DisplayMode::new(1280, 800),
+    };
+
+    let rendered = render_device(1);
+    assert_eq!(
+        online_line(&rendered, "pci", &topology),
+        "virtio-gpu online transport=pci scanouts=1 preferred=1280x800 \
+         edid=on 3d=virgl blob=on context-init=on uuid=on"
+    );
+
+    let plain = device();
+    assert_eq!(
+        online_line(&plain, "mmio", &topology),
+        "virtio-gpu online transport=mmio scanouts=1 preferred=1280x800 \
+         edid=off 3d=none blob=off context-init=off uuid=off"
+    );
 }
 
 #[test]

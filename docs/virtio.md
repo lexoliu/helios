@@ -221,13 +221,16 @@ The device is on the platform's own bus: virtio-pci on x86-64
 (`-device virtio-gpu-device`). Each backend reports it on one line:
 
 ```
-virtio-gpu online transport=mmio scanouts=1 preferred=1280x800 edid=on 3d=none blob=off context-init=off
+virtio-gpu online transport=mmio scanouts=1 preferred=1280x800 edid=on 3d=none blob=off context-init=off uuid=off
 ```
 
 `3d=` names the renderer the device carries — `none` for a 2D-only
 device, `virgl` for one whose control queue speaks the 3D commands —
 because "this machine has no 3D" is a fact a lane reads off the boot log
-rather than deduces from the absence of one.
+rather than deduces from the absence of one. `blob=`, `context-init=`
+and `uuid=` are the negotiated feature bits after it
+(`VIRTIO_GPU_F_RESOURCE_BLOB`, `VIRTIO_GPU_F_CONTEXT_INIT` and
+`VIRTIO_GPU_F_RESOURCE_UUID`), each `on` or `off` for the same reason.
 
 A renderer is a host property, not a guest one. `helios-inspector vm`
 attaches the plain 2D device unless a session asks for one with
