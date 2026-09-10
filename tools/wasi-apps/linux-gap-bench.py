@@ -545,8 +545,9 @@ class IdenticalHeliosImages(RuntimeError):
     nothing to attribute, so the run says so rather than reporting the
     noise between one build and itself — which is also what a paired run
     would silently become if both checkouts ever shared a target
-    directory or a workspace root, or if a `--profile-use` build landed
-    in the plain release directory.
+    directory or a workspace root, or if two kernels that differ only by
+    the profile they read shared the one directory their cargo profile
+    names (#327).
     """
 
 

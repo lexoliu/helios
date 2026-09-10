@@ -200,10 +200,7 @@ suite lane times it on and boots the instrumented kernel with it (#315).
 ### Spending it: `-C profile-use`
 
 `vm --profile-use <file>` is the other half. It is the release build plus
-two rustflags, in a cargo profile and a target directory of its own, so a
-PGO image and a plain one can be built from one checkout without
-overwriting each other — which is what lets the two be timed against each
-other.
+two rustflags, in the `profile-use` cargo profile.
 
 | Flag | Why |
 | --- | --- |
@@ -230,6 +227,52 @@ what the profile contains.
 the way `just build-instrumented` is `vm --profile-generate build`, so
 the flags have one definition (`inspector/src/vm.rs`,
 `profile_use_rustflags`).
+
+#### Where each build lands
+
+One cargo profile is one output directory, and on x86-64 the release
+kernel is a `profile-use` build too (#226), so the directory alone no
+longer says which kernel is which. What a build reads decides where it
+goes:
+
+| Build | Directory | Image |
+| --- | --- | --- |
+| `--release` on x86-64, reading the fetched profile | `target/x86_64-unknown-none/profile-use/` | `helios` |
+| `--release --without-kernel-profile`, the plain control | `target/x86_64-unknown-none/release/` | `helios` |
+| `--profile-use <file>` | `target/pgo-kernels/<digest of the profile>/x86_64-unknown-none/profile-use/` | `helios` |
+
+The named build gets a `--target-dir` of its own, keyed by the SHA-256 of
+the profile it reads, because it is the same cargo profile as the release
+kernel and the two would otherwise be one file: whichever built second
+overwrote the first, and a paired run booted one image twice (#327). The
+key is the profile's bytes rather than its path for the same reason the
+directory exists at all — cargo fingerprints the rustflag that names the
+profile and never the bytes behind it, so a profile rewritten under a
+name that has been built against before would reuse the objects compiled
+against the profile it replaced.
+
+A `--target-dir` rather than a cargo profile of its own, for two reasons.
+A cargo profile is written into `Cargo.toml`, so there is one of them
+however many profiles a checkout weighs: two named profiles would land in
+it together and be the same collision one directory down. And a profile
+of its own is a second set of optimisation settings to keep in step with
+`profile-use`, where the whole claim of a PGO pairing is that the two
+columns differ by their profile and by nothing else. The release kernel
+keeps cargo's default directory and its cache: the fetched-profile build
+is the one that runs on every release lane and on every `--release` boot
+of this target, and it is untouched by a named profile arriving beside
+it.
+
+The guest programs, the compiler plugin and the signed `cwasm` bootfs are
+not built against the kernel's profile, so the prebuild stays where it is
+(`target/kernel-prebuild/<target>/profile-use/`) and both columns of a
+pairing carry the same one: what varies between them is the kernel's own
+code generation and nothing else.
+
+Nothing reconstructs these paths. `vm … kernel-path` prints the image a
+set of flags resolves to and `vm … build` prints the image it produced;
+the paired driver and `release.yml` both ask rather than spell a path out
+(`inspector/src/vm.rs`, `KernelBuildSpec::target_dir`).
 
 The profile is an explicit argument whenever two profiles are being told
 apart: a PGO kernel is only as good as the profile behind it, so which
@@ -308,8 +351,13 @@ already boots every workload twice.
 That pairing is what "refresh at release time" has to be measured
 against. Both columns are `profile-use` builds of one commit and what
 varies between them is the profile: the release's counts against the
-counts this run collected. A candidate that does not beat the baseline
-says the release's profile still describes this kernel; one that does
+counts this run collected. The candidate boots
+`target/pgo-kernels/<digest>/x86_64-unknown-none/profile-use/helios` and
+the baseline `target/x86_64-unknown-none/profile-use/helios`, per the
+table above; before they had two directories the job built both into the
+second one and the identical-images guard refused the run (#327). A
+candidate that does not beat the baseline says the release's profile
+still describes this kernel; one that does
 says the profile has aged, which is the argument for cutting the next
 release's collection. The run record names each column's profile
 (`kernel_profile`, `baseline_kernel_profile`) and the paired table's
@@ -613,3 +661,7 @@ does not.
   resolve.
 - #211: `-C profile-use` for the kernel, the `profile-use` build kind and
   the paired `suite-pgo` job. Implemented; described above.
+- #327: the two columns of that job built into one directory once a
+  release kernel became a `profile-use` build itself, so both booted one
+  image. A profile named on the command line now keys a target directory
+  of its own; described under "Where each build lands".

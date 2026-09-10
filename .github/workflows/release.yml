@@ -141,7 +141,14 @@ jobs:
           # and every x86-64 release build ask for them by name.
           mkdir -p assets
           cp profiles/helios-kernel.profdata assets/helios-kernel.profdata
-          cp helios/target/x86_64-unknown-none/profile-use/helios assets/helios-kernel-x86-64
+          # Where the step above put the kernel is the inspector's
+          # answer, not a path spelled twice: a build against a profile
+          # named on the command line lands in a directory keyed to that
+          # profile (docs/pgo.md, #327).
+          kernel="$(cd helios && cargo run -p helios-inspector --quiet -- \
+            vm --arch x86-64 --profile-use "$GITHUB_WORKSPACE/profiles/helios-kernel.profdata" \
+            kernel-path)"
+          cp "$kernel" assets/helios-kernel-x86-64
           gh release upload "${RELEASE_TAG}" \
             assets/helios-kernel.profdata \
             assets/helios-kernel-x86-64 \
