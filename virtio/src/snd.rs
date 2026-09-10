@@ -877,39 +877,12 @@ fn query_blocking<T: VirtioTransport>(
         &mut [response.as_mut_slice()],
     )?;
     queue.notify(transport);
-    let written = reap_blocking(transport, queue, token);
+    let written = queue.reap_blocking(transport, token);
     if (written as usize) < HEADER_BYTES {
         return Err(IoError::DeviceFault.into());
     }
     check_status(status_of(&response)?)?;
     Ok(response)
-}
-
-/// Waits for `token`'s completion on the bring-up path and clears the
-/// interrupt that completion raised.
-///
-/// The acknowledgement is the half that is easy to leave out and
-/// impossible to notice here: nothing on this path waits on an
-/// interrupt, so a status register left set costs the bring-up nothing
-/// at all. It costs everything afterwards. A virtio-mmio line is
-/// edge-triggered, so a line that was raised and never lowered cannot
-/// rise again — and every asynchronous request the driver makes once the
-/// executor is running parks on an interrupt that can no longer arrive.
-fn reap_blocking<T: VirtioTransport>(transport: &T, queue: &mut VirtQueue<T>, token: u16) -> u32 {
-    let written = loop {
-        match queue.pop_used_with_len() {
-            Some((completed, written)) => {
-                assert_eq!(
-                    completed, token,
-                    "virtio-snd answered a bring-up query that was never issued"
-                );
-                break written;
-            }
-            None => core::hint::spin_loop(),
-        }
-    };
-    transport.ack_interrupt();
-    written
 }
 
 /// Whether the parameters describe something this stream can play.

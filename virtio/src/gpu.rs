@@ -491,46 +491,13 @@ impl<T: VirtioTransport> VirtioGpuDevice<T> {
             &mut [response.as_mut_slice()],
         )?;
         queue.notify(&self.transport);
-        let written = self.reap_blocking(&mut queue, token);
+        let written = queue.reap_blocking(&self.transport, token);
         drop(queue);
         if (written as usize) < CTRL_HEADER_BYTES {
             return Err(IoError::DeviceFault.into());
         }
         check_response(&response, expected, RequestSubject::none())?;
         Ok(response)
-    }
-
-    /// Waits for `token`'s completion on the bring-up path and clears
-    /// the interrupt that completion raised.
-    ///
-    /// The acknowledgement is the half that is easy to leave out and
-    /// impossible to notice here: nothing on this path waits on an
-    /// interrupt, so a status register left set costs the bring-up
-    /// nothing at all. It costs everything afterwards. A virtio-mmio
-    /// line is edge-triggered, so a line that was raised and never
-    /// lowered cannot rise again — and every asynchronous request the
-    /// driver makes once the executor is running parks on an interrupt
-    /// that can no longer arrive.
-    ///
-    /// Clearing whatever else is set costs nothing here: a
-    /// configuration change needs a device model somebody has already
-    /// changed, and this runs before the driver has told anybody the
-    /// device exists.
-    fn reap_blocking(&self, queue: &mut VirtQueue<T>, token: u16) -> u32 {
-        let written = loop {
-            match queue.pop_used_with_len() {
-                Some((completed, written)) => {
-                    assert_eq!(
-                        completed, token,
-                        "virtio-gpu answered a bring-up request that was never issued"
-                    );
-                    break written;
-                }
-                None => core::hint::spin_loop(),
-            }
-        };
-        self.transport.ack_interrupt();
-        written
     }
 
     fn read_display_info_blocking(&self) -> DisplayResult<ScanoutList> {

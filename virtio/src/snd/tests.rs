@@ -13,8 +13,9 @@
 //! poll and be the device answering it. The decoders those queries run
 //! are exercised directly, on the bytes QEMU's device answers with, and
 //! the poll's own obligation — clearing the interrupt its completion
-//! raised — is exercised through [`super::reap_blocking`] on the
-//! driver's real control queue.
+//! raised — is exercised through the shared
+//! [`VirtQueue::reap_blocking`](crate::queue::VirtQueue::reap_blocking) on
+//! the driver's real control queue.
 
 use core::future::Future;
 use core::pin::{Pin, pin};
@@ -775,10 +776,7 @@ fn a_bring_up_query_clears_the_interrupt_its_answer_raised() {
     queue.device_complete(token, written);
     device.transport.raise_interrupt(1);
 
-    assert_eq!(
-        super::reap_blocking(&device.transport, &mut queue, token),
-        written
-    );
+    assert_eq!(queue.reap_blocking(&device.transport, token), written);
     assert!(
         !device.transport.ack_interrupt().used_buffer,
         "the bring-up query cleared the interrupt its own answer raised"
