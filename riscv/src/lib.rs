@@ -303,6 +303,9 @@ struct HartRuntime {
     native_trap_handler: Cell<Option<KernelNativeTrapHandler>>,
     external_interrupts: Option<net::ExternalInterrupts>,
     program_service: Option<debug_state::ProgramService>,
+    /// The stack every trap on this hart is built on once
+    /// [`HartRuntime::install`] has published it through `sscratch`.
+    trap_stack: Range<usize>,
 }
 
 impl HartRuntime {
@@ -319,6 +322,12 @@ impl HartRuntime {
     /// stack frame holding it lives as long as the hart does.
     fn install(&self) {
         write_hart_identity(ProcessorIdentity::installed(self));
+        // SAFETY: `trap_stack` came from `allocate_trap_stack` for this
+        // hart, and this is the only writer of `sscratch` outside the
+        // trap entry and exit.
+        unsafe {
+            trap::seed_trap_stack(&self.trap_stack);
+        }
     }
 }
 
@@ -537,6 +546,9 @@ extern "C" fn __helios_riscv_trap_dispatch(tf: &mut TrapFrame) {
 
 #[inline(never)]
 fn trap_dispatch(tf: &mut TrapFrame) {
+    if let Some(runtime) = installed_hart_runtime() {
+        trap::assert_frame_on_trap_stack(tf, &runtime.trap_stack);
+    }
     match riscv::register::scause::read().cause().try_into() {
         Ok(Trap::Interrupt(Interrupt::SupervisorTimer)) => {
             if let Some(program_service) = current_hart_runtime().program_service.as_ref() {
@@ -771,6 +783,7 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
         native_trap_handler: Cell::new(None),
         external_interrupts,
         program_service: None,
+        trap_stack: trap::allocate_trap_stack(),
     };
     hart_runtime.install();
     let program_service = helios_kernel::install_component_host_program_service(
