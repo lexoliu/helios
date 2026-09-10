@@ -58,10 +58,13 @@ pub use grant::{
 pub use handle::{DmaBufferHandle, GrantHandle};
 pub use interrupt::{InterruptEvent, InterruptRelay, InterruptStats};
 pub use lease::{
-    DEVICE_WINDOW_BYTES, DeviceWindow, DmaBuffer, GrantLease, GrantStats, MAX_DMA_BUFFERS,
-    MappedRegion, PublishedDevice,
+    DEVICE_WINDOW_BYTES, DISPLAY_WINDOW_BYTES, DeviceWindow, DmaBuffer, GrantLease, GrantStats,
+    MAX_DMA_BUFFERS, MappedRegion, PublishedDevice,
 };
 pub use owner::{DeviceOwnership, LinearMemory};
+pub(crate) use platform::device_vm_hooks;
+#[cfg(test)]
+pub(crate) use platform::test_hooks;
 pub use platform::{
     DeviceInterruptHooks, DeviceVmHooks, install_device_interrupt_hooks, install_device_vm_hooks,
 };

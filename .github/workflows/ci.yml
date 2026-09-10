@@ -705,7 +705,7 @@ jobs:
             2>&1 > curl-smoke.out | tee "$runtime/inspector.log"
           cat curl-smoke.out
           grep -Fqx success curl-smoke.out
-      - name: Capture the desktop scanout
+      - name: Draw on the display and capture the scanout
         shell: bash
         working-directory: helios
         run: |
@@ -719,6 +719,14 @@ jobs:
           # with no host display backend — the whole point of reading the
           # scanout through QMP is that a headless runner sees what a
           # window would have shown (docs/desktop.md).
+          #
+          # `display-test` claims the display through
+          # `helios:system/display`, fills a surface with a gradient whose
+          # colour at every pixel is a function of that pixel's position,
+          # and keeps presenting while the pointer is driven and the
+          # captures are taken. The gradient is what makes the capture
+          # evidence: a display nothing ever attached a resource to also
+          # produces a valid PNG, and only the pixels tell the two apart.
           runtime="$GITHUB_WORKSPACE/smoke-runtime/desktop"
           captures="$GITHUB_WORKSPACE/desktop-scanout"
           mkdir -p "$runtime" "$captures"
@@ -726,15 +734,35 @@ jobs:
             --accel kvm \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --desktop --display none --audiodev "wav:$runtime/desktop.wav" \
-            --boot-program dash --boot-program debugger --no-compiler-plugin \
-            screendump --settle-seconds 2 "$captures/boot.png" "$captures/settled.png" \
+            --qemu-trace trace:virtio_gpu_update_cursor \
+            --qemu-trace-log "$runtime/qemu-trace.log" \
+            --boot-program dash --boot-program debugger \
+            --boot-program display-test --no-compiler-plugin \
+            screendump \
+              --run /bin/display-test --run-arg --seconds --run-arg 20 \
+              --input tools/desktop/display-probe.input --input-interval-ms 100 \
+              --settle-seconds 2 "$captures/drawn.png" "$captures/settled.png" \
             2>&1 | tee "$runtime/inspector.log"
           # A PPM under a .png name would be an artifact nothing opens,
           # so the format QEMU was asked for is the format checked.
-          for capture in "$captures/boot.png" "$captures/settled.png"; do
+          for capture in "$captures/drawn.png" "$captures/settled.png"; do
             test -s "$capture"
             file "$capture" | grep -Fq 'PNG image data'
           done
+          # The guest's own account of what it drew, and the picture's.
+          grep -Fq 'display-test:claimed' "$runtime/inspector.log"
+          grep -Eq 'display-test:surface scanout=0 width=[0-9]+ height=[0-9]+' \
+            "$runtime/inspector.log"
+          grep -Fq 'display-test:cursor-set' "$runtime/inspector.log"
+          grep -Eq 'display-test:frame sequence=[0-9]+ cursor=[0-9]+,[0-9]+' \
+            "$runtime/inspector.log"
+          python3 tools/desktop/check-gradient.py \
+            "$captures/drawn.png" "$captures/settled.png"
+          # The pointer is a plane the capture does not hold, so the device's
+          # own trace of every cursor command is checked against the
+          # positions the guest says it moved to.
+          python3 tools/desktop/check-cursor.py \
+            "$runtime/inspector.log" "$runtime/qemu-trace.log"
       - name: Upload the desktop scanout captures
         if: always()
         uses: actions/upload-artifact@v4

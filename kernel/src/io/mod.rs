@@ -8,7 +8,6 @@ mod block;
 mod child;
 mod console;
 mod debug_serial;
-mod display;
 mod input;
 mod interrupts;
 mod iommu;
@@ -26,7 +25,6 @@ pub use child::{
 };
 pub use console::RecordingConsole;
 pub use debug_serial::{DebugConsole, DebugSerialAccess, DebugSerialWriter, read_debug_serial};
-pub use display::install_display_device;
 pub use input::install_input_device;
 pub use interrupts::{
     ExternalInterruptHandler, ExternalInterruptRoutes, MAX_BLOCK_DEVICES, MAX_DEVICE_INTERRUPTS,

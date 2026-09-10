@@ -491,23 +491,46 @@ impl<T: VirtioTransport> VirtioGpuDevice<T> {
             &mut [response.as_mut_slice()],
         )?;
         queue.notify(&self.transport);
-        loop {
+        let written = self.reap_blocking(&mut queue, token);
+        drop(queue);
+        if (written as usize) < CTRL_HEADER_BYTES {
+            return Err(IoError::DeviceFault.into());
+        }
+        check_response(&response, expected, RequestSubject::none())?;
+        Ok(response)
+    }
+
+    /// Waits for `token`'s completion on the bring-up path and clears
+    /// the interrupt that completion raised.
+    ///
+    /// The acknowledgement is the half that is easy to leave out and
+    /// impossible to notice here: nothing on this path waits on an
+    /// interrupt, so a status register left set costs the bring-up
+    /// nothing at all. It costs everything afterwards. A virtio-mmio
+    /// line is edge-triggered, so a line that was raised and never
+    /// lowered cannot rise again — and every asynchronous request the
+    /// driver makes once the executor is running parks on an interrupt
+    /// that can no longer arrive.
+    ///
+    /// Clearing whatever else is set costs nothing here: a
+    /// configuration change needs a device model somebody has already
+    /// changed, and this runs before the driver has told anybody the
+    /// device exists.
+    fn reap_blocking(&self, queue: &mut VirtQueue<T>, token: u16) -> u32 {
+        let written = loop {
             match queue.pop_used_with_len() {
                 Some((completed, written)) => {
                     assert_eq!(
                         completed, token,
                         "virtio-gpu answered a bring-up request that was never issued"
                     );
-                    if (written as usize) < CTRL_HEADER_BYTES {
-                        return Err(IoError::DeviceFault.into());
-                    }
-                    break;
+                    break written;
                 }
                 None => core::hint::spin_loop(),
             }
-        }
-        check_response(&response, expected, RequestSubject::none())?;
-        Ok(response)
+        };
+        self.transport.ack_interrupt();
+        written
     }
 
     fn read_display_info_blocking(&self) -> DisplayResult<ScanoutList> {
@@ -731,6 +754,25 @@ impl<T: VirtioTransport> helios_hal::display::DisplayDevice for VirtioGpuDevice<
             &mut response,
             RESP_OK_NODATA,
             RequestSubject::both(scanout, record.id),
+        )
+        .await
+    }
+
+    async fn blank_scanout(&self, scanout: ScanoutId) -> DisplayResult<()> {
+        // virtio-gpu spells "show nothing" as a `SET_SCANOUT` naming the
+        // reserved resource id and an empty rectangle (virtio 1.2
+        // §5.7.6.8): there is no separate command, and a driver that
+        // simply destroyed the resource would leave the device scanning
+        // out memory it no longer has a reference to.
+        let request =
+            encode_set_scanout(scanout, FramebufferId::new(RESOURCE_NONE), Rect::default());
+        let mut response = [0_u8; CTRL_HEADER_BYTES];
+        self.control_command(
+            &request,
+            &[],
+            &mut response,
+            RESP_OK_NODATA,
+            RequestSubject::scanout(scanout),
         )
         .await
     }

@@ -51,6 +51,21 @@ pub const DEVICE_WINDOW_BYTES: u64 = 64 << 20;
 /// Buffers one owner may pin for its device at once.
 pub const MAX_DMA_BUFFERS: usize = 16;
 
+/// Bytes immediately below the device window the kernel keeps for the
+/// frame buffers of an instance that holds the display.
+///
+/// A display frame buffer wants exactly what a granted device's ring
+/// wants — pinned, physically contiguous pages at a fixed offset in the
+/// instance's own linear memory, above everything the instance can grow
+/// into — so it is the same mechanism with its own window rather than a
+/// second cursor into one arena. Sized for the large end of what a
+/// compositor asks a single machine's display engine for: a handful of
+/// surfaces at 4K in a 32-bit format, whose frames are 33 MiB each. The
+/// window costs an instance nothing until it claims the display, and
+/// the growth cap that keeps a `memory.grow` off it lasts exactly as
+/// long as the claim.
+pub const DISPLAY_WINDOW_BYTES: u64 = 256 << 20;
+
 /// The part of one owner's linear memory the kernel devotes to its
 /// device.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,6 +102,29 @@ impl DeviceWindow {
         }
     }
 
+    /// The window of `bytes` immediately below this one.
+    ///
+    /// The two never overlap and neither moves, so an instance that
+    /// holds a device *and* the display maps each into its own span and
+    /// caps its growth below the lower of them.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the reservation cannot carry both windows, for the
+    /// same reason [`Self::top_of`] panics: placing a window inside
+    /// addressable memory would let the owner grow over its own device.
+    pub fn below(self, bytes: u64) -> Self {
+        let offset = self
+            .offset
+            .checked_sub(bytes)
+            .expect("a linear-memory reservation carries every window the kernel places in it");
+        Self {
+            base: self.base,
+            offset,
+            bytes,
+        }
+    }
+
     /// The offset the window starts at, which is also the highest the
     /// owner's memory may grow to.
     pub const fn offset(&self) -> u64 {
@@ -104,7 +142,7 @@ impl DeviceWindow {
     /// of the owner's linear memory: the window's own offset is what
     /// turns one into the other, and forgetting it would map the device
     /// over the owner's data.
-    fn range_at(&self, offset: u64, bytes: u64) -> VirtRange {
+    pub(crate) fn range_at(&self, offset: u64, bytes: u64) -> VirtRange {
         assert!(
             offset + bytes <= self.bytes,
             "a span of {bytes} bytes at {offset} runs past the device window"

@@ -9,6 +9,7 @@ extern crate std;
 mod bootfs;
 mod component;
 mod device;
+mod display;
 mod embedded;
 mod exec;
 mod host_fs;
@@ -65,13 +66,18 @@ pub use component::{
     wait_until_runtime_deadline,
 };
 pub use device::{
-    DEFAULT_DMA_BUDGET_BYTES, DEVICE_WINDOW_BYTES, DeviceGrant, DeviceGrantRegistry,
-    DeviceInterruptHooks, DeviceInterruptRoute, DeviceName, DeviceOwnership, DeviceVmHooks,
-    DeviceWindow, DmaBudget, DmaBuffer, DmaBufferHandle, GrantError, GrantHandle, GrantInterrupt,
-    GrantLease, GrantStats, GrantedDeviceSnapshot, InterruptEvent, InterruptRelay, InterruptStats,
-    LinearMemory, MAX_DEVICE_NAME, MAX_DMA_BUFFERS, MAX_GRANT_INTERRUPTS, MAX_GRANT_REGIONS,
-    MAX_GRANTS, MappedRegion, PublishedDevice, install_device_interrupt_hooks,
+    DEFAULT_DMA_BUDGET_BYTES, DEVICE_WINDOW_BYTES, DISPLAY_WINDOW_BYTES, DeviceGrant,
+    DeviceGrantRegistry, DeviceInterruptHooks, DeviceInterruptRoute, DeviceName, DeviceOwnership,
+    DeviceVmHooks, DeviceWindow, DmaBudget, DmaBuffer, DmaBufferHandle, GrantError, GrantHandle,
+    GrantInterrupt, GrantLease, GrantStats, GrantedDeviceSnapshot, InterruptEvent, InterruptRelay,
+    InterruptStats, LinearMemory, MAX_DEVICE_NAME, MAX_DMA_BUFFERS, MAX_GRANT_INTERRUPTS,
+    MAX_GRANT_REGIONS, MAX_GRANTS, MappedRegion, PublishedDevice, install_device_interrupt_hooks,
     install_device_vm_hooks,
+};
+pub use display::{
+    DisplayClaim, DisplayOwnership, DisplayPins, DisplaySender, DisplayService,
+    DisplayServiceError, FrameToken, MAX_CLAIMED_SCANOUTS, MAX_PINNED_FRAMES, PinnedFrame,
+    REQUEST_QUEUE_DEPTH, SequenceSignal, install_display_device,
 };
 pub use embedded::{
     EmbeddedComponent, EmbeddedInit, embedded_boot_component, embedded_init,
@@ -116,8 +122,7 @@ pub use io::{
     MAX_IOMMU_ENDPOINTS, MAX_NETWORK_INTERRUPTS, PanicSerial, PollKey, PollRegistration,
     PollRegistry, PollRegistryError, PollSourceKind, RecordingConsole, SCRATCH_DISK_SERIAL,
     SerialReader, TryRead, TryWrite, byte_channel, emit_panic_report, install_block_devices,
-    install_display_device, install_input_device, read_debug_serial, read_serial, try_read_serial,
-    wake_queue_owners,
+    install_input_device, read_debug_serial, read_serial, try_read_serial, wake_queue_owners,
 };
 pub use kernel_exception::{
     KernelException, KernelExceptionCause, KernelExceptionDispatch, KernelNativeTrapHandler,

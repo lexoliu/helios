@@ -376,6 +376,13 @@ pub(crate) enum VmSessionError {
     Qmp(#[from] QmpError),
     #[error("{0}")]
     InputScript(#[from] InputScriptError),
+    #[error("the thread taking the captures ended without reporting what it did")]
+    CaptureThreadLost,
+    #[error(
+        "the guest program {program} exited before the captures were taken; a program a capture \
+         is taken of has to still be drawing when it is"
+    )]
+    GuestProgramExitedEarly { program: String },
     #[error("failed to prepare the screendump directory {path}: {source}")]
     ScreendumpDirectory {
         path: String,
@@ -1532,6 +1539,13 @@ pub(crate) struct BalloonCommand {
 /// The capture is QEMU's own view of the display device's surface, so a
 /// headless session sees exactly what a host window would have shown and
 /// a lane can keep the image as evidence of what the guest drew.
+///
+/// A capture of a guest that is *doing* something needs the guest to be
+/// doing it at the time, and one session runs one action — so the guest
+/// program and the input script that would otherwise need two boots are
+/// options here. `--run` starts a program in the guest and leaves it
+/// running; `--input` drives the desktop once it has started; the
+/// captures follow.
 #[derive(Debug, Clone, ClapArgs)]
 pub(crate) struct ScreendumpCommand {
     /// Where to write the PNG. Repeat to take several captures, one
@@ -1542,6 +1556,40 @@ pub(crate) struct ScreendumpCommand {
     /// How long to let the guest draw before each capture.
     #[arg(long, default_value_t = 0)]
     settle_seconds: u64,
+
+    /// Guest path of a program to start before capturing, and leave
+    /// running while the captures are taken.
+    #[arg(long)]
+    run: Option<String>,
+
+    /// One argument for `--run`. Repeat for several, in order.
+    ///
+    /// Hyphens are allowed through: what follows is the *guest*
+    /// program's own flag, and reading `--seconds` as one of this
+    /// command's would make every guest program that takes options
+    /// unreachable from here.
+    #[arg(long = "run-arg", allow_hyphen_values = true)]
+    run_args: Vec<String>,
+
+    /// How long to wait, after the last capture, for the `--run`
+    /// program to finish, so that whatever it printed reaches this
+    /// session's output.
+    ///
+    /// A program that is still running when the wait ends is left
+    /// running and the machine is torn down around it, which is what a
+    /// program written to draw until somebody stops it wants.
+    #[arg(long, default_value_t = 30)]
+    run_wait_seconds: u64,
+
+    /// An input script to run against the guest's keyboard and pointers
+    /// once `--run` has started and before the first capture. Same
+    /// grammar as the `input` action.
+    #[arg(long)]
+    input: Option<PathBuf>,
+
+    /// How long to wait between the statements of `--input`.
+    #[arg(long, default_value_t = 0)]
+    input_interval_ms: u64,
 }
 
 /// Runs an input script against the guest's keyboard and pointer.
@@ -2518,7 +2566,7 @@ fn connect_and_run(
             let socket = qmp_socket.ok_or(VmSessionError::NeedsQmp {
                 action: "screendump",
             })?;
-            run_screendump(screendump, &socket)
+            run_screendump(client, screendump, &socket)
         }
         Some(ResolvedVmSessionCommand::Input(input)) => {
             let socket = qmp_socket.ok_or(VmSessionError::NeedsQmp { action: "input" })?;
@@ -2592,8 +2640,113 @@ fn run_balloon(
 /// it from the host. A session whose guest never drove the device still
 /// produces an image — QEMU's blank scanout — and that is the evidence
 /// that the machine had a display at all.
-fn run_screendump(command: ScreendumpCommand, qmp_socket: &Path) -> Result<(), VmSessionError> {
+fn run_screendump(
+    client: crate::serial::RpcClient,
+    command: ScreendumpCommand,
+    qmp_socket: &Path,
+) -> Result<(), VmSessionError> {
+    let Some(program) = command.run.clone() else {
+        return capture_scanout(&command, qmp_socket);
+    };
+    let arguments = command.run_args.clone();
+    let socket = qmp_socket.to_path_buf();
+    let capture_command = command.clone();
+    let wait = Duration::from_secs(command.run_wait_seconds);
+    crate::runtime::block_on(async move {
+        // The captures are blocking work on QEMU's monitor socket, and
+        // the guest program has to keep running while they happen. A
+        // thread for the blocking half and the executor for the guest
+        // half is what lets one session do both: the thread's result
+        // arrives on a channel the executor is woken by, so the guest's
+        // RPC keeps being driven throughout.
+        // One slot: the thread sends exactly one result and then ends.
+        let (sender, receiver) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let _ = sender.send_blocking(capture_scanout(&capture_command, &socket));
+        });
+        println!(
+            "{} {} in the guest",
+            style("started").cyan(),
+            display_command(&program, &arguments)
+        );
+        let mut client = client;
+        let guest = crate::programs::exec(&mut client, &program, &arguments);
+        let mut guest = core::pin::pin!(guest);
+        let captured = futures_lite::future::or(
+            async { CaptureRace::Captured(receiver.recv().await) },
+            async { CaptureRace::GuestExited(guest.as_mut().await) },
+        )
+        .await;
+        match captured {
+            CaptureRace::Captured(Ok(result)) => {
+                result?;
+                // Whatever the program printed is the guest's own account
+                // of what it drew, and it is worth having beside the PNG.
+                // A program that is still drawing when the wait ends is
+                // left drawing.
+                match crate::runtime::timeout(wait, guest).await {
+                    Some(outcome) => report_guest_run(&program, outcome),
+                    None => println!(
+                        "{} {} is still running after {}s",
+                        style("running").cyan(),
+                        program,
+                        command.run_wait_seconds
+                    ),
+                }
+                Ok(())
+            }
+            CaptureRace::Captured(Err(_)) => Err(VmSessionError::CaptureThreadLost),
+            CaptureRace::GuestExited(outcome) => {
+                report_guest_run(&program, outcome);
+                Err(VmSessionError::GuestProgramExitedEarly {
+                    program: program.clone(),
+                })
+            }
+        }
+    })
+}
+
+/// Which half of a `screendump --run` finished first.
+enum CaptureRace {
+    Captured(Result<Result<(), VmSessionError>, async_channel::RecvError>),
+    GuestExited(GuestRunOutcome),
+}
+
+/// How the `--run` program ended, once it did.
+type GuestRunOutcome =
+    Result<helios_inspector_protocol::system::programs::ExecResult, crate::programs::ProgramError>;
+
+fn display_command(program: &str, arguments: &[String]) -> String {
+    let mut rendered = String::from(program);
+    for argument in arguments {
+        rendered.push(' ');
+        rendered.push_str(argument);
+    }
+    rendered
+}
+
+/// Print what a `--run` program said and how it ended.
+fn report_guest_run(program: &str, outcome: GuestRunOutcome) {
+    match outcome {
+        Ok(result) => {
+            print!("{}", String::from_utf8_lossy(&result.output.stdout));
+            eprint!("{}", String::from_utf8_lossy(&result.output.stderr));
+            println!(
+                "{} {program} exited with {}",
+                style("guest").cyan(),
+                result.exit_code
+            );
+        }
+        Err(error) => println!("{} {program}: {error}", style("guest").red()),
+    }
+}
+
+/// Drive the desktop, if asked, and write each capture.
+fn capture_scanout(command: &ScreendumpCommand, qmp_socket: &Path) -> Result<(), VmSessionError> {
     let mut qmp = QmpClient::connect(qmp_socket)?;
+    if let Some(script) = &command.input {
+        send_input_script(&mut qmp, script, command.input_interval_ms)?;
+    }
     for path in &command.paths {
         if command.settle_seconds != 0 {
             std::thread::sleep(Duration::from_secs(command.settle_seconds));
@@ -2627,26 +2780,38 @@ fn run_screendump(command: ScreendumpCommand, qmp_socket: &Path) -> Result<(), V
 /// with a typo in its last line is a script that would otherwise leave
 /// the guest half-driven, in a state no later step could account for.
 fn run_input(command: InputCommand, qmp_socket: &Path) -> Result<(), VmSessionError> {
-    let script = InputScript::read(&command.script)?;
     let mut qmp = QmpClient::connect(qmp_socket)?;
+    send_input_script(&mut qmp, &command.script, command.interval_ms)
+}
+
+/// Parse `script` and send every statement in it.
+///
+/// Shared with `screendump --input`, which drives the desktop and then
+/// captures it in one session rather than in two boots.
+fn send_input_script(
+    qmp: &mut QmpClient,
+    script_path: &Path,
+    interval_ms: u64,
+) -> Result<(), VmSessionError> {
+    let script = InputScript::read(script_path)?;
     for (index, statement) in script.statements().iter().enumerate() {
         for batch in statement.batches() {
             qmp.input_send_event(&batch)
                 .map_err(|source| VmSessionError::SendInput {
-                    path: command.script.display().to_string(),
+                    path: script_path.display().to_string(),
                     statement: index + 1,
                     source,
                 })?;
         }
-        if command.interval_ms != 0 {
-            std::thread::sleep(Duration::from_millis(command.interval_ms));
+        if interval_ms != 0 {
+            std::thread::sleep(Duration::from_millis(interval_ms));
         }
     }
     println!(
         "{} {} statement(s) from {}",
         style("sent").green(),
         script.statements().len(),
-        command.script.display()
+        script_path.display()
     );
     Ok(())
 }
@@ -4851,6 +5016,11 @@ mod tests {
             ResolvedVmSessionCommand::Screendump(ScreendumpCommand {
                 paths: vec![PathBuf::from("desktop.png")],
                 settle_seconds: 0,
+                run: None,
+                run_args: Vec::new(),
+                run_wait_seconds: 0,
+                input: None,
+                input_interval_ms: 0,
             })
             .qmp_action(),
             Some("screendump")

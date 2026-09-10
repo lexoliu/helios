@@ -761,7 +761,7 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
             if let Some(vsock) = vsock::install(&kernel, &cpu, &fdt, &debug_state) {
                 interrupts.attach_vsock(vsock);
             }
-            if let Some(display) = gpu::install(&kernel, &fdt) {
+            if let Some(display) = gpu::install(&cpu, &kernel, &fdt, &debug_state) {
                 interrupts.attach_display(display);
             }
             for device in input::install(&kernel, &fdt) {
@@ -1096,6 +1096,7 @@ fn dispatch_kernel_exception(
     let Some(cause) = kernel_exception_cause(exception) else {
         return KernelExceptionDispatch::Unhandled;
     };
+    trap::restore_trap_stack_for_unwind(tf);
     restore_sie_for_unwind(tf);
     helios_kernel::dispatch_native_trap(KernelException {
         cause,

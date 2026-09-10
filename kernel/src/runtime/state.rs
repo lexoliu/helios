@@ -61,6 +61,10 @@ struct RuntimeStateInner<ProgramService, NetworkService, HostFsService> {
     /// as discovery published them. Empty on a machine whose backend
     /// found nothing outside the hardware it drives itself.
     device_grants: DeviceGrantRegistry,
+    /// The machine's display, once the backend brought the device up
+    /// and the kernel took ownership of it. Empty on a machine with no
+    /// display device, where a claim is refused rather than trapping.
+    display_service: Once<crate::display::DisplayService>,
     /// What the platform's IOMMU confines, once the backend has built
     /// the domains. Empty on a machine whose devices are not behind one.
     iommu_report: Once<alloc::sync::Arc<crate::IommuReport>>,
@@ -292,6 +296,7 @@ where
                 iommu_report: Once::new(),
                 balloon: Once::new(),
                 swap: Once::new(),
+                display_service: Once::new(),
                 vsock_service: Once::new(),
                 futex_table: Mutex::new(FutexTable::new()),
                 bootfs: Mutex::new(embedded_init().map(|init| init.bootfs())),
@@ -728,6 +733,26 @@ where
         &self.inner.device_grants
     }
 
+    /// Publishes the machine's display.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a second display is installed. One machine has one
+    /// display device the kernel owns, and two would make a claim
+    /// ambiguous.
+    pub fn install_display_service(&self, service: crate::display::DisplayService) {
+        let mut installed = false;
+        self.inner.display_service.call_once(|| {
+            installed = true;
+            service
+        });
+        assert!(installed, "the display service was installed twice");
+    }
+
+    pub fn display_service(&self) -> Option<crate::display::DisplayService> {
+        self.inner.display_service.get().cloned()
+    }
+
     /// Publishes the root DRBG the backend seeded at boot.
     pub fn install_root_entropy(&self, root: RootEntropyHandle) {
         let mut installed = false;
@@ -932,6 +957,10 @@ where
 
     fn device_grants(&self) -> &DeviceGrantRegistry {
         RuntimeState::device_grants(self)
+    }
+
+    fn display_service(&self) -> Option<crate::display::DisplayService> {
+        RuntimeState::display_service(self)
     }
 
     fn profiling_enabled(&self) -> bool {

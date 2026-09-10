@@ -116,14 +116,56 @@ the guest says so on the serial line:
 virtio-gpu online transport=mmio scanouts=1 preferred=1280x800 edid=on
 ```
 
-Nothing has attached a scanout resource to that device yet, so the
-capture is QEMU's blank scanout — 640x480, black, carrying QEMU's own
-"Display output is not active." placeholder. What it proves is the whole
-path around the pixels: the machine has a display device, the guest
-brought it up, and the host can read its surface back as a file. When
-something draws, the same capture shows it.
+A guest that has claimed the display through `helios:system/display`
+draws into a frame buffer of its own, and the capture is that frame
+buffer: `docs/display.md` describes the interface and
+`programs/display-test` is the program the lane runs. A session that
+boots nothing which draws still produces an image — QEMU's blank scanout,
+640x480, carrying QEMU's own "Display output is not active."
+placeholder — which is the evidence that the machine had a display at
+all.
 
-`smoke-x86-64` takes two on every run — one at the boot the debugger came
-up on, one two seconds later — and uploads them as the
-`smoke-x86-64-desktop` artifact, so the step a drawing guest needs is
-already there and only its assertions have to be written.
+## Capturing a guest that is drawing
+
+One `vm` session runs one action, and a capture of a guest that is
+drawing needs the guest to be drawing at the time. `screendump` therefore
+takes the two things that would otherwise need a second boot:
+
+| Option | What it does |
+| --- | --- |
+| `--run <guest path>` | Starts a program in the guest and leaves it running while the captures are taken. |
+| `--run-arg <arg>` | One argument for `--run`. Repeat for several, in order. |
+| `--run-wait-seconds <n>` | After the last capture, how long to wait for that program to finish so what it printed reaches this session's output. A program still running when the wait ends is left running. |
+| `--input <script>` | An input script, same grammar as the `input` action, run once the program has started and before the first capture. |
+| `--input-interval-ms <n>` | How long to wait between that script's statements. |
+
+A guest program that exits before the captures are taken fails the
+session, naming itself: a capture is of a guest that is still drawing,
+and one taken after the drawing stopped is a capture of whatever was
+left.
+
+```bash
+./target/release/helios-inspector vm --arch x86-64 --release --accel kvm \
+    --desktop --display none \
+    --boot-program dash --boot-program debugger --boot-program display-test \
+    screendump \
+      --run /bin/display-test --run-arg --seconds --run-arg 20 \
+      --input tools/desktop/display-probe.input --input-interval-ms 100 \
+      --settle-seconds 2 target/probe/drawn.png
+```
+
+`smoke-x86-64` runs that on every push and uploads the captures as the
+`smoke-x86-64-desktop` artifact, checking the pixels with
+`tools/desktop/check-gradient.py` rather than only the file type.
+
+The pointer is not in those pixels. QEMU hands a virtio-gpu cursor to
+its display frontend as a plane of its own, and `screendump` reads the
+scanout surface alone, so a capture of a guest driving its cursor looks
+exactly like one that never set it. The evidence for the cursor is the
+device's own account instead: `--qemu-trace
+trace:virtio_gpu_update_cursor` makes QEMU log every `UPDATE_CURSOR`
+and `MOVE_CURSOR` it processes with the position each carried, and
+`tools/desktop/check-cursor.py` checks that every position
+`display-test` printed on a `display-test:frame` line is one the device
+logged as a move, after it logged the cursor image. The lane runs that
+check beside the gradient's.

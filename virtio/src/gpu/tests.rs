@@ -517,6 +517,35 @@ fn moving_the_pointer_costs_one_cursor_command_and_no_frame_traffic() {
     );
 }
 
+/// Releasing a frame buffer is not enough: a scanout still pointed at
+/// the resource would keep the display engine reading pages that have
+/// gone back to their owner, so blanking has to reach the device as its
+/// own command before anything is destroyed.
+#[test]
+fn blanking_a_scanout_names_the_reserved_resource_and_an_empty_rectangle() {
+    let device = device();
+    let mut blanked = pin!(device.blank_scanout(ScanoutId::new(0)));
+
+    let token = pending_control(&device, blanked.as_mut());
+    let request = control_request(&device, token);
+    assert_eq!(command_of(&request), CMD_SET_SCANOUT);
+    for (index, field) in ["x", "y", "width", "height"].iter().enumerate() {
+        assert_eq!(
+            word_at(&request, CTRL_HEADER_BYTES + index * 4),
+            0,
+            "a blanked scanout shows an empty rectangle, but {field} was not zero"
+        );
+    }
+    assert_eq!(word_at(&request, CTRL_HEADER_BYTES + 16), 0, "scanout zero");
+    assert_eq!(
+        word_at(&request, CTRL_HEADER_BYTES + 20),
+        0,
+        "resource zero is how a scanout is switched off"
+    );
+    answer_control(&device, token, &header_response(RESP_OK_NODATA));
+    assert_eq!(block_on(poll_once(blanked.as_mut())), Some(Ok(())));
+}
+
 #[test]
 fn hiding_the_pointer_names_the_reserved_resource() {
     let device = device();
@@ -807,4 +836,47 @@ fn concurrent_commands_are_routed_by_descriptor_not_by_arrival_order() {
         .expect("the first reply is in")
         .expect("display info");
     assert_eq!(list[0].geometry, Rect::new(0, 0, 800, 600));
+}
+
+#[test]
+fn the_bring_up_round_trip_clears_the_interrupt_it_raised() {
+    let device = device();
+    let request = [0_u8; CTRL_HEADER_BYTES];
+    let mut response = [0_u8; CTRL_HEADER_BYTES];
+
+    let token = {
+        let mut queue = device
+            .control
+            .try_lock()
+            .expect("nothing else holds the control queue at bring-up");
+        let token = queue
+            .submit(
+                &device.transport,
+                &[request.as_slice()],
+                &mut [response.as_mut_slice()],
+            )
+            .expect("the bring-up chain fits in an empty ring");
+        queue.notify(&device.transport);
+        // The device answers and raises its line, which is the whole of
+        // what a real one does for a used buffer.
+        queue.device_complete(token, CTRL_HEADER_BYTES as u32);
+        device.transport.raise_interrupt(1);
+        token
+    };
+
+    let mut queue = device
+        .control
+        .try_lock()
+        .expect("nothing else holds the control queue at bring-up");
+    let written = device.reap_blocking(&mut queue, token);
+    drop(queue);
+
+    assert_eq!(written, CTRL_HEADER_BYTES as u32);
+    assert_eq!(
+        device.transport.acknowledged_interrupts(),
+        1,
+        "a used buffer nobody acknowledges leaves an edge-triggered line \
+         asserted, and a line that never falls cannot rise for the next \
+         completion"
+    );
 }

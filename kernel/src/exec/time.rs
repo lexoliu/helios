@@ -246,6 +246,12 @@ mod tests {
             &EMPTY
         }
 
+        /// A test machine has no display device, and a claim on one is
+        /// refused rather than trapping.
+        fn display_service(&self) -> Option<crate::display::DisplayService> {
+            None
+        }
+
         fn profiling_enabled(&self) -> bool {
             false
         }

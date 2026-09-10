@@ -347,6 +347,20 @@ pub trait DisplayDevice: Send + Sync + 'static {
         source: Rect,
     ) -> impl Future<Output = DisplayResult<()>> + Send + '_;
 
+    /// Takes whatever `scanout` is showing off it.
+    ///
+    /// The output keeps its geometry and stays a scanout the device
+    /// presents; what it loses is the frame buffer it was latching. The
+    /// operation exists because releasing a frame buffer is not enough:
+    /// a scanout still pointed at a resource the caller is about to
+    /// destroy would leave the display engine reading pages that have
+    /// gone back to their owner's pool, so an owner that is letting go
+    /// blanks its outputs before it destroys anything.
+    fn blank_scanout(
+        &self,
+        scanout: ScanoutId,
+    ) -> impl Future<Output = DisplayResult<()>> + Send + '_;
+
     /// Publishes the pixels the caller wrote into `region` of
     /// `framebuffer`.
     ///
@@ -437,6 +451,13 @@ impl<Device: DisplayDevice + ?Sized> DisplayDevice for alloc::sync::Arc<Device> 
         source: Rect,
     ) -> impl Future<Output = DisplayResult<()>> + Send + '_ {
         Device::set_scanout(self, scanout, framebuffer, source)
+    }
+
+    fn blank_scanout(
+        &self,
+        scanout: ScanoutId,
+    ) -> impl Future<Output = DisplayResult<()>> + Send + '_ {
+        Device::blank_scanout(self, scanout)
     }
 
     fn flush(

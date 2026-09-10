@@ -6,6 +6,7 @@ edition.workspace = true
 [features]
 default = ["channel", "fs", "http", "io", "net", "serial", "stats", "sync", "task", "tracing"]
 channel = ["dep:async-channel"]
+display = ["dep:thiserror"]
 fs = ["dep:futures-lite"]
 http = ["io", "dep:http", "dep:thiserror"]
 http-handler = ["http"]

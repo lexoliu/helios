@@ -84,3 +84,42 @@ pub mod device {
         });
     }
 }
+
+/// Bindings for the interface a compositor reaches the display through.
+///
+/// Generated from the `display-host` world rather than from a program
+/// world for the same reason `device-host` is: the kernel implements
+/// this one interface, and the program bindings above already provide
+/// every `wasi:cli` import a compositor also has.
+pub mod display {
+    pub mod bindings {
+        use wasmtime;
+
+        wasmtime::component::bindgen!({
+            path: "../wit",
+            world: "display-host",
+            imports: {
+                // The three calls that hand back a reader have to see
+                // the store, so they can build it against one; they
+                // return the reader immediately rather than awaiting.
+                "helios:system/display.[method]display.changed": store | trappable,
+                "helios:system/display.[method]surface.present": store | trappable,
+                "helios:system/display.[method]surface.vsync": store | trappable,
+                // Everything else that reaches the display engine is an
+                // `async func` in the WIT and is generated against the
+                // store on its own account. What is left — claiming,
+                // reading back where a frame buffer landed, dropping a
+                // handle — is store bookkeeping and answers without
+                // waiting.
+                default: trappable,
+            },
+            with: {
+                "helios:system/display.display":
+                    crate::wasmtime_adapter::component_host::DisplayHandle,
+                "helios:system/display.surface":
+                    crate::wasmtime_adapter::component_host::SurfaceHandle,
+            },
+            require_store_data_send: true,
+        });
+    }
+}

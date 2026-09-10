@@ -16,8 +16,10 @@
 
 use helios_hal::vmm::VirtAddr;
 
+use crate::display::{DisplayOwnership, DisplayService, DisplayServiceError};
+
 use super::grant::{DeviceName, GrantError};
-use super::lease::{DEVICE_WINDOW_BYTES, DeviceWindow, GrantLease};
+use super::lease::{DEVICE_WINDOW_BYTES, DISPLAY_WINDOW_BYTES, DeviceWindow, GrantLease};
 use super::registry::DeviceGrantRegistry;
 
 /// Where an instance's linear memory sits, and how much address space
@@ -36,6 +38,14 @@ pub struct LinearMemory {
 }
 
 /// One instance's hold on the device path.
+///
+/// Two things can put hardware inside an instance's memory: a device
+/// grant, whose registers and rings go in the device window, and a
+/// display claim, whose frame buffers go in the display window
+/// immediately below it. Both are here because both are bounded by the
+/// same fact — where this instance's linear memory is and how far it has
+/// grown — and an instance that holds one, the other, or both must have
+/// its growth capped below the lowest window it holds.
 #[derive(Default)]
 pub struct DeviceOwnership {
     /// Resolved once, after the instance is built. Absent on an
@@ -47,6 +57,8 @@ pub struct DeviceOwnership {
     high_water_bytes: u64,
     /// The device, once this instance claimed one.
     lease: Option<GrantLease>,
+    /// The display, once this instance claimed it.
+    display: DisplayOwnership,
 }
 
 impl DeviceOwnership {
@@ -55,6 +67,7 @@ impl DeviceOwnership {
             memory: None,
             high_water_bytes: 0,
             lease: None,
+            display: DisplayOwnership::new(),
         }
     }
 
@@ -78,16 +91,24 @@ impl DeviceOwnership {
     }
 
     /// The most bytes the instance's memory may hold, while it holds a
-    /// device.
+    /// device or the display.
     ///
-    /// A `memory.grow` past the window would put ordinary memory on top
-    /// of a register file. There is no limit before a claim: an
-    /// instance that holds no device is an ordinary instance and pays
+    /// A `memory.grow` past a window would put ordinary memory on top of
+    /// a register file or of a frame buffer the display engine is
+    /// scanning out. The limit is the lower of the windows the instance
+    /// actually holds; there is none before a claim, because an
+    /// instance that holds neither is an ordinary instance and pays
     /// nothing for the path existing.
     pub fn growth_limit(&self) -> Option<u64> {
-        self.window()
+        let device = self
+            .window()
             .filter(|_| self.lease.is_some())
-            .map(|window| window.offset())
+            .map(|window| window.offset());
+        let display = self.display.window().map(|window| window.offset());
+        match (device, display) {
+            (Some(device), Some(display)) => Some(device.min(display)),
+            (limit, None) | (None, limit) => limit,
+        }
     }
 
     /// The window this instance's device mappings would live in.
@@ -95,6 +116,42 @@ impl DeviceOwnership {
         self.memory
             .filter(|memory| memory.reservation_bytes > DEVICE_WINDOW_BYTES)
             .map(|memory| DeviceWindow::top_of(memory.base, memory.reservation_bytes))
+    }
+
+    /// The window this instance's display frame buffers would live in,
+    /// which is the span immediately below the device window.
+    pub fn display_window(&self) -> Option<DeviceWindow> {
+        self.memory
+            .filter(|memory| memory.reservation_bytes > DEVICE_WINDOW_BYTES + DISPLAY_WINDOW_BYTES)
+            .map(|memory| {
+                DeviceWindow::top_of(memory.base, memory.reservation_bytes)
+                    .below(DISPLAY_WINDOW_BYTES)
+            })
+    }
+
+    /// This instance's side of the display path.
+    pub const fn display(&self) -> &DisplayOwnership {
+        &self.display
+    }
+
+    /// This instance's side of the display path, to act on.
+    pub const fn display_mut(&mut self) -> &mut DisplayOwnership {
+        &mut self.display
+    }
+
+    /// Take exclusive ownership of the machine's display.
+    ///
+    /// Refused when the instance's memory has already grown over the
+    /// window its frame buffers would be pinned in, for the same reason
+    /// a device claim is: the pages would land on memory it is using.
+    pub fn claim_display(&mut self, service: &DisplayService) -> Result<(), DisplayServiceError> {
+        let window = self
+            .display_window()
+            .ok_or(DisplayServiceError::WindowExhausted)?;
+        if self.high_water_bytes > window.offset() {
+            return Err(DisplayServiceError::WindowExhausted);
+        }
+        self.display.claim(service, window)
     }
 
     /// Whether this instance holds a device.

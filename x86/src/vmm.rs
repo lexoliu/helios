@@ -15,10 +15,12 @@
 //! returned to the user-memory pool.
 
 use alloc::vec::Vec;
+use core::alloc::Layout;
 use core::ffi::c_int;
 use core::ptr;
 use core::ptr::NonNull;
 
+use helios_hal::device::DmaPlacement;
 use helios_hal::pmm::PhysFrame;
 use helios_hal::vmm::{
     AddressSpace, AddressSpaceError, PageFlags, Translation, VirtAddr, VirtRange,
@@ -29,8 +31,8 @@ use helios_kernel::runtime_memory::{
 };
 use helios_kernel::{
     FiberStackVmHooks, MemoryOwner, ReservationLookup, ReservationTracker, VaCursor,
-    allocate_user_frame_zeroed_on, deallocate_user_frame_on, install_fiber_stack_hooks,
-    validate_range,
+    allocate_user_frame_zeroed_on, allocate_user_run_zeroed_on, deallocate_user_frame_on,
+    deallocate_user_run_on, install_fiber_stack_hooks, validate_range,
 };
 use spin::{Mutex, Once};
 use x86_64::PhysAddr;
@@ -68,6 +70,16 @@ const TLB_SHOOTDOWN_BATCH_PAGES: usize = 128;
 
 /// Owned x86 user address space. Built once at boot, accessed through
 /// `&'static`.
+/// One physically contiguous run pinned under a reservation for a
+/// device to read by physical address, with the layout the pool gave
+/// it, so that it can be given back as the one allocation it is.
+#[derive(Clone, Copy)]
+struct PinnedRun {
+    range: VirtRange,
+    phys: usize,
+    align: usize,
+}
+
 pub struct X86UserAddressSpace {
     physical_memory_offset: usize,
     processor_count: usize,
@@ -79,6 +91,11 @@ pub struct X86UserAddressSpace {
     /// tight reservation churn.
     va_cursor: VaCursor,
     state: Mutex<ReservationTracker>,
+    /// Runs [`AddressSpace::commit_contiguous`] pinned. They are not
+    /// the reservation tracker's: the tracker hands frames back one at
+    /// a time and a run is one allocation. Lock order is `state` then
+    /// `pinned`; nothing takes `pinned` and then `state`.
+    pinned: Mutex<Vec<PinnedRun>>,
 }
 
 #[derive(Clone, Copy)]
@@ -97,6 +114,7 @@ impl X86UserAddressSpace {
             processor_count,
             va_cursor: VaCursor::new(USER_VA_BASE, USER_VA_END),
             state: Mutex::new(ReservationTracker::new()),
+            pinned: Mutex::new(Vec::new()),
         }
     }
 
@@ -111,6 +129,100 @@ impl X86UserAddressSpace {
 
     fn shootdown_range(&self, virt: VirtRange) {
         smp::shootdown_tlb_range(virt.start.raw(), virt.byte_len);
+    }
+
+    /// Give one pinned run back to the user pool with the layout it was
+    /// allocated with: a contiguous run is one allocation, not a pile of
+    /// frames, and the allocator is owed the size and alignment it
+    /// produced.
+    fn free_pinned_run(&self, phys: usize, bytes: usize, align: usize) {
+        let layout = Layout::from_size_align(bytes, align)
+            .unwrap_or_else(|_| panic!("x86 pinned run has an invalid layout"));
+        let ptr = NonNull::new((phys + self.physical_memory_offset) as *mut u8)
+            .unwrap_or_else(|| panic!("x86 pinned run has a null pointer"));
+        deallocate_user_run_on(smp::current_processor(), ptr, layout);
+    }
+
+    /// Map `virt` onto the consecutive frames starting at `phys`, one
+    /// leaf per page, undoing every leaf written so far when one cannot
+    /// be. The frames are the caller's: nothing here allocates or frees
+    /// one.
+    fn map_run(
+        &self,
+        mapper: &mut OffsetPageTable<'static>,
+        frame_allocator: &mut DirectMappedFrameAllocator,
+        virt: VirtRange,
+        phys: usize,
+        flags: PageTableFlags,
+    ) -> Result<(), AddressSpaceError> {
+        for (index, offset) in (0..virt.byte_len).step_by(PAGE).enumerate() {
+            let virt_addr = virt.start.raw() + offset;
+            let mapped = Page::<Size4KiB>::from_start_address(X86VirtAddr::new(virt_addr as u64))
+                .map_err(|_| AddressSpaceError::Misaligned)
+                .and_then(|page| {
+                    x86_64::structures::paging::PhysFrame::from_start_address(PhysAddr::new(
+                        (phys + offset) as u64,
+                    ))
+                    .map(|frame| (page, frame))
+                    .map_err(|_| AddressSpaceError::Misaligned)
+                })
+                .and_then(|(page, frame)| {
+                    unsafe { mapper.map_to(page, frame, flags, frame_allocator) }
+                        .map(|flush| flush.flush())
+                        .map_err(|_| AddressSpaceError::PageTableExhausted)
+                });
+            if let Err(error) = mapped {
+                self.unmap_run_pages(mapper, virt.start.raw(), index);
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    /// Drop the leaves under `mapped_pages` pages from `start` and shoot
+    /// the range down on every processor, leaving the frames where they
+    /// are: they are one run the pool takes back as a whole.
+    fn unmap_run_pages(
+        &self,
+        mapper: &mut OffsetPageTable<'static>,
+        start: usize,
+        mapped_pages: usize,
+    ) {
+        for index in 0..mapped_pages {
+            let virt = start + index * PAGE;
+            let page = Page::<Size4KiB>::from_start_address(X86VirtAddr::new(virt as u64))
+                .unwrap_or_else(|error| {
+                    panic!("x86 pinned run unmap got invalid page {virt:#x}: {error}")
+                });
+            match mapper.unmap(page) {
+                Ok((_, flush)) => flush.flush(),
+                Err(error) => panic!("x86 pinned run page {virt:#x} was not mapped: {error:?}"),
+            }
+        }
+        smp::shootdown_tlb_range(start, mapped_pages * PAGE);
+    }
+
+    /// Remove every pinned run that falls inside `virt`.
+    ///
+    /// A reservation can be released while an instance still holds its
+    /// frame buffers — a store torn down by an OOM kill does exactly
+    /// that — and the address space is the last place that can give
+    /// each run back as the one allocation it was.
+    fn sweep_pinned_runs(&self, mapper: &mut OffsetPageTable<'static>, virt: VirtRange) {
+        let mut pinned = self.pinned.lock();
+        let mut index = 0;
+        while index < pinned.len() {
+            let run = pinned[index];
+            if run.range.start.raw() < virt.start.raw()
+                || run.range.start.raw() + run.range.byte_len > virt.start.raw() + virt.byte_len
+            {
+                index += 1;
+                continue;
+            }
+            pinned.swap_remove(index);
+            self.unmap_run_pages(mapper, run.range.start.raw(), run.range.byte_len / PAGE);
+            self.free_pinned_run(run.phys, run.range.byte_len, run.align);
+        }
     }
 
     fn carve_reservation(&self, byte_len: usize) -> Option<VirtRange> {
@@ -609,12 +721,16 @@ impl AddressSpace for X86UserAddressSpace {
 
     fn release(&self, virt: VirtRange) -> Result<(), AddressSpaceError> {
         self.assert_smp_safe();
+        let mut mapper = unsafe { smp::current_mapper(self.physical_memory_offset) };
+        // Before anything is given back: the frames under a pinned run
+        // are the pool's as one allocation, not this reservation's one
+        // page at a time.
+        self.sweep_pinned_runs(&mut mapper, virt);
         let released = self.state.lock().release(virt)?;
         // This backend has no swap, so a released reservation never holds a
         // swap token; the assertion keeps that true if swap ever reaches
         // this architecture (#25).
         debug_assert!(released.swapped.is_empty());
-        let mut mapper = unsafe { smp::current_mapper(self.physical_memory_offset) };
         for region in &released.committed {
             self.unmap_pages(&mut mapper, region.range)?;
         }
@@ -640,6 +756,83 @@ impl AddressSpace for X86UserAddressSpace {
         self.state
             .lock()
             .record_commit(virt, flags, MemoryOwner::NONE)?;
+        Ok(())
+    }
+
+    fn commit_contiguous(
+        &self,
+        virt: VirtRange,
+        flags: PageFlags,
+        placement: DmaPlacement,
+    ) -> Result<PhysFrame, AddressSpaceError> {
+        self.assert_smp_safe();
+        validate_range(virt)?;
+        let align = usize::try_from(placement.align)
+            .ok()
+            .filter(|align| align.is_power_of_two() && *align >= PAGE)
+            .ok_or(AddressSpaceError::Misaligned)?;
+        let pt_flags = page_flags_to_pt(flags)?;
+        let layout = Layout::from_size_align(virt.byte_len, align)
+            .map_err(|_| AddressSpaceError::Misaligned)?;
+        // The run comes out of the user pool's direct map; what the
+        // device is told is where it sits in physical memory.
+        let raw = allocate_user_run_zeroed_on(smp::current_processor(), layout)
+            .map_err(|_| AddressSpaceError::OutOfFrames)?;
+        let phys = raw.as_ptr() as usize - self.physical_memory_offset;
+        if !placement.accepts(phys as u64, virt.byte_len as u64) {
+            self.free_pinned_run(phys, virt.byte_len, align);
+            return Err(AddressSpaceError::OutOfFrames);
+        }
+        let mut mapper = unsafe { smp::current_mapper(self.physical_memory_offset) };
+        let mut frame_allocator = DirectMappedFrameAllocator {
+            physical_memory_offset: self.physical_memory_offset,
+        };
+        // The range is claimed before a single leaf is written, so two
+        // callers naming overlapping ranges cannot both believe they own
+        // it.
+        let mut pinned = self.pinned.lock();
+        if pinned.iter().any(|run| {
+            run.range.start.raw() < virt.start.raw() + virt.byte_len
+                && virt.start.raw() < run.range.start.raw() + run.range.byte_len
+        }) {
+            drop(pinned);
+            self.free_pinned_run(phys, virt.byte_len, align);
+            return Err(AddressSpaceError::DeviceMapped);
+        }
+        if let Err(error) = self.map_run(&mut mapper, &mut frame_allocator, virt, phys, pt_flags) {
+            drop(pinned);
+            self.free_pinned_run(phys, virt.byte_len, align);
+            return Err(error);
+        }
+        self.shootdown_range(virt);
+        pinned.push(PinnedRun {
+            range: virt,
+            phys,
+            align,
+        });
+        Ok(PhysFrame::from_phys_addr(phys))
+    }
+
+    fn release_contiguous(&self, virt: VirtRange, _align: u64) -> Result<(), AddressSpaceError> {
+        self.assert_smp_safe();
+        validate_range(virt)?;
+        // The alignment the run was made with was recorded at commit
+        // time, so it is read back from there rather than trusted from
+        // the caller: the allocator is owed the layout it produced.
+        let mut pinned = self.pinned.lock();
+        let index = pinned
+            .iter()
+            .position(|run| run.range.start.raw() == virt.start.raw())
+            .ok_or(AddressSpaceError::NotCommitted)?;
+        let run = pinned.swap_remove(index);
+        drop(pinned);
+        let mut mapper = unsafe { smp::current_mapper(self.physical_memory_offset) };
+        self.unmap_run_pages(
+            &mut mapper,
+            run.range.start.raw(),
+            run.range.byte_len / PAGE,
+        );
+        self.free_pinned_run(run.phys, run.range.byte_len, run.align);
         Ok(())
     }
 
@@ -851,6 +1044,11 @@ pub fn install_user_address_space(physical_memory_offset: usize, processor_count
     USER_AS.call_once(|| X86UserAddressSpace::new(physical_memory_offset, processor_count));
     runtime_memory::install_hooks(&X86_VMM_HOOKS);
     install_fiber_stack_hooks(&X86_FIBER_STACK_HOOKS);
+}
+
+/// The installed user address space, for the backend's device hooks.
+pub(crate) fn user_address_space() -> &'static X86UserAddressSpace {
+    user_as()
 }
 
 fn user_as() -> &'static X86UserAddressSpace {

@@ -92,11 +92,15 @@ pub fn install_native_trap_handler(handler: KernelNativeTrapHandler) {
 /// claimed exception never returns here, because the handler unwinds
 /// out of the faulting stack.
 ///
-/// A backend restores the interrupted context's interrupt mask before
-/// it calls this: the exception entry masked interrupts, a claimed
-/// trap never returns through the entry's epilogue, and what the
+/// A backend restores everything its entry's epilogue would have
+/// restored before it calls this: the interrupted context's interrupt
+/// mask, and any per-processor entry state the epilogue hands back (the
+/// RISC-V entry's trap stack top in `sscratch`). The exception entry
+/// masked interrupts and marked the processor as inside a handler, a
+/// claimed trap never returns through the epilogue, and what the
 /// handler unwinds into is the interrupted code's continuation, which
-/// must run on that code's terms.
+/// must run on that code's terms and take its next trap on the trap
+/// stack.
 pub fn dispatch_native_trap(exception: KernelException) -> KernelExceptionDispatch {
     let raw_handler = NATIVE_TRAP_HANDLER.load(Ordering::Acquire);
     if raw_handler == 0 {

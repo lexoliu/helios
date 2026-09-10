@@ -6,6 +6,7 @@ extern crate alloc;
 mod balloon;
 mod block;
 mod boot;
+mod device;
 mod entropy;
 mod exceptions;
 mod gpu;
@@ -207,6 +208,7 @@ fn x86_kernel_main() -> ! {
     let console = serial_console(debug_state.clone());
     let cpu = X86Cpu::new(boot.platform());
     vmm::install_user_address_space(physical_memory_offset, cpu.processor_count());
+    device::install_hooks();
     exceptions::verify_page_fault_returns();
     let pci = pci::PciRoot::new(physical_memory_offset);
     // The translation topology is read before any device is programmed:
@@ -460,12 +462,14 @@ fn install_pci_devices<WatchdogImpl>(
     }
     if let Some(address) = display_function {
         let device = gpu::install(
+            cpu,
             kernel,
             pci,
             address,
             dma_pool(address),
             exceptions::DISPLAY_INTERRUPT_VECTOR,
             destination_apic_id,
+            debug_state,
         );
         routes.set_display(exceptions::DISPLAY_INTERRUPT_VECTOR, device);
     } else {

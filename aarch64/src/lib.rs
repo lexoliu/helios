@@ -728,7 +728,14 @@ extern "C" fn aarch64_kernel_main() -> ! {
         );
         routes.set_vsock(vsock.interrupt, vsock.device);
     }
-    if let Some(display) = gpu::install(&kernel, &platform, physical_memory_offset, &handoff) {
+    if let Some(display) = gpu::install(
+        &cpu,
+        &kernel,
+        &platform,
+        physical_memory_offset,
+        &handoff,
+        &debug_state,
+    ) {
         gic.enable_device_interrupt(
             display.interrupt,
             display.trigger,
