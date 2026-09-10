@@ -56,6 +56,8 @@ pub enum DeviceType {
     /// virtio-iommu: the translation unit the platform's confined
     /// devices issue their DMA through.
     Iommu = 23,
+    /// virtio-snd: the sound card the machine plays PCM audio through.
+    Sound = 25,
 }
 
 impl DeviceType {
@@ -73,6 +75,7 @@ impl DeviceType {
             18 => Some(Self::Input),
             19 => Some(Self::Vsock),
             23 => Some(Self::Iommu),
+            25 => Some(Self::Sound),
             _ => None,
         }
     }

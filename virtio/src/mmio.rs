@@ -11,6 +11,7 @@ use crate::input::{VirtioInputDevice, report_input_online};
 use crate::net::VirtioNetDevice;
 use crate::p9::Virtio9pDevice;
 use crate::rng::VirtioRngDevice;
+use crate::snd::{VirtioSndDevice, report_snd_online};
 use crate::transport::VirtioMmioTransport;
 use crate::vsock::VirtioVsockDevice;
 
@@ -22,6 +23,7 @@ pub type VirtioMmioGpuDevice = VirtioGpuDevice<VirtioMmioTransport<MmioBus>>;
 pub type VirtioMmioVsockDevice = VirtioVsockDevice<VirtioMmioTransport<MmioBus>>;
 pub type VirtioMmioBalloonDevice = VirtioBalloonDevice<VirtioMmioTransport<MmioBus>>;
 pub type VirtioMmioInputDevice = VirtioInputDevice<VirtioMmioTransport<MmioBus>>;
+pub type VirtioMmioSndDevice = VirtioSndDevice<VirtioMmioTransport<MmioBus>>;
 
 /// Builds a VirtIO block resource from a permanently mapped MMIO header.
 ///
@@ -329,5 +331,45 @@ where
     let transport = VirtioMmioTransport::new(bus)?;
     let device = VirtioInputDevice::new(transport)?;
     report_input_online(&device, "mmio");
+    Ok(device)
+}
+
+/// Builds a virtio-snd device from a permanently mapped MMIO header.
+///
+/// # Safety
+///
+/// `header..header+mmio_size` must refer to a valid, permanently mapped VirtIO
+/// MMIO register block for a sound device, and no other code may violate the
+/// transport's register access invariants while the returned driver is alive.
+pub unsafe fn snd_from_mmio(
+    header: NonNull<u8>,
+    mmio_size: usize,
+) -> IoResult<VirtioMmioSndDevice> {
+    let bus = unsafe { MmioBus::new(header, mmio_size, IdentityDmaPool) }?;
+    let transport = VirtioMmioTransport::new(bus)?;
+    let device = VirtioSndDevice::new(transport)?;
+    report_snd_online(&device, "mmio");
+    Ok(device)
+}
+
+/// Builds a virtio-snd device on a bus whose DMA addresses are
+/// translated, such as a backend running behind a physical-memory
+/// offset map.
+///
+/// # Safety
+///
+/// Same as [`snd_from_mmio`].
+pub unsafe fn snd_from_mmio_with_dma<P>(
+    header: NonNull<u8>,
+    mmio_size: usize,
+    dma: P,
+) -> IoResult<VirtioSndDevice<VirtioMmioTransport<MmioBus<P>>>>
+where
+    P: DmaPool,
+{
+    let bus = unsafe { MmioBus::new(header, mmio_size, dma) }?;
+    let transport = VirtioMmioTransport::new(bus)?;
+    let device = VirtioSndDevice::new(transport)?;
+    report_snd_online(&device, "mmio");
     Ok(device)
 }
