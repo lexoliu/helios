@@ -45,9 +45,10 @@
 //!
 //! Fences are the exception, and the reason they exist: they are the
 //! one ordering guarantee this contract makes without a caller waiting.
-//! Every fence a context signals is delivered in increasing order on
-//! that context, so a reader that asks for "the first fence after `n`"
-//! never misses one and never sees one twice.
+//! A context's fence timeline is monotone, so the newest signalled
+//! fence answers for every one before it: a reader that asks for "the
+//! first fence after `n`" may be handed the newest of several retired
+//! since it last looked, and has still missed nothing.
 
 use core::future::Future;
 
@@ -459,13 +460,14 @@ pub trait Gpu3d: Send + Sync + 'static {
         fence: FenceId,
     ) -> impl Future<Output = Gpu3dResult<()>> + Send + '_;
 
-    /// The first fence `context` signals after `after`.
+    /// The newest fence `context` has signalled past `after`.
     ///
     /// This is the context's completion stream, read one point at a
-    /// time: fences on one context are signalled in increasing order,
-    /// so a reader that passes back what it last saw sees every fence
-    /// once and in order however long it was away. A reader that has
-    /// seen none passes [`FenceId::START`].
+    /// time: the timeline is monotone, so an implementation that has
+    /// retired several fences since the reader last asked hands back
+    /// the newest of them rather than every one between — the newest
+    /// answers for all that came before it. A reader that has seen none
+    /// passes [`FenceId::START`].
     fn fences(
         &self,
         context: ContextId,

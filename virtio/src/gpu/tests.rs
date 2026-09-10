@@ -1554,6 +1554,30 @@ fn the_fence_stream_is_read_in_order_from_where_the_reader_left_off() {
     );
 }
 
+/// A reader that was away while several fences retired is handed the
+/// newest of them rather than the next in sequence: the timeline is
+/// monotone, so the newest answers for every one before it.
+#[test]
+fn a_lagging_fence_reader_is_handed_the_newest_fence() {
+    let device = render_device(1);
+    let context = open_context(&device);
+
+    let future = pin!(device.submit(context, command_buffer(&[1_u8, 2, 3, 4]), FenceId::new(4)));
+    let (_, submitted) = exchange(&device, future, &header_response(RESP_OK_NODATA));
+    submitted.expect("the device took the first command buffer");
+    let future = pin!(device.submit(context, command_buffer(&[5_u8, 6, 7, 8]), FenceId::new(9)));
+    let (_, submitted) = exchange(&device, future, &header_response(RESP_OK_NODATA));
+    submitted.expect("the device took the second command buffer");
+
+    let fence = block_on(device.fences(context, FenceId::START))
+        .expect("two fences have retired since the reader last looked");
+    assert_eq!(
+        fence,
+        FenceId::new(9),
+        "the newest fence answers for every one before it"
+    );
+}
+
 /// One context's fences are not another's: a reader following one
 /// timeline is not woken through by work on the other.
 #[test]
