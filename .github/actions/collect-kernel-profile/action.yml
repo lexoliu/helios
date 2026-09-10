@@ -14,9 +14,15 @@ description: >-
 
   The host preparation stays in the jobs. `bench-host` is a relative
   `uses:` and one inside a composite action does not resolve the way one
-  in a job does, so a caller runs it first and this action assumes the
-  host it leaves behind: `just`, `uv`, the WASI artifacts, and a usable
-  `/dev/kvm`.
+  in a job does, so a caller runs it first, with `network-tools`, and
+  this action assumes the host it leaves behind: `just`, `uv`, the WASI
+  artifacts, a usable `/dev/kvm`, and the tools the tap backend needs.
+
+  The profile covers every workload the suite measures (#315). The
+  network class needs the tap backend, so the action provisions it the
+  way the bench lane does, boots the instrumented kernel on it, and
+  removes it after: a workload the kernel is measured on and not
+  profiled on is a workload the optimisation is not applied to.
 inputs:
   checkout-path:
     description: Directory the Helios checkout is in, relative to the workspace.
@@ -40,6 +46,14 @@ inputs:
       Absolute path of the merged indexed profile to write. The raw
       profiles are collected beside it in a directory of their own.
     required: true
+  net-ifname:
+    description: The tap interface the collection creates for the guest.
+    required: false
+    default: helios0
+  net-bridge:
+    description: The bridge the tap interface is attached to.
+    required: false
+    default: helios-br0
 runs:
   using: composite
   steps:
@@ -79,6 +93,17 @@ runs:
           --accel kvm --memory "${{ steps.lane.outputs.memory }}" \
           aot-bench artifacts/wasi-tools/curl.wasm --iterations 2 \
           --llvm-raw-profile-output "${RUNNER_TEMP}/kernel-profile-raw/aot-bench.profraw"
+    - name: Provision the tap network backend
+      shell: bash
+      working-directory: ${{ inputs.checkout-path }}
+      run: |
+        sudo modprobe vhost_net
+        sudo chmod 0666 /dev/vhost-net
+        ./target/release/helios-inspector vm net-setup \
+          --net-backend tap --net-queues "$(nproc)" \
+          --net-ifname "${{ inputs.net-ifname }}" \
+          --net-bridge "${{ inputs.net-bridge }}" \
+          --net-dhcp
     - name: Collect the workload profile
       shell: bash
       working-directory: ${{ inputs.checkout-path }}
@@ -86,9 +111,9 @@ runs:
         HELIOS_LIMINE_SHARE: ${{ inputs.limine-dir }}
         HELIOS_LIMINE_BIN: ${{ inputs.limine-dir }}/limine
       run: |
-        # Every class the suite runs that needs no privileged host
-        # networking. The network path is profiled once a lane provisions
-        # the tap backend for a collection run.
+        # Every class the suite runs, the network class on the tap
+        # backend the suite times it on, so the profile covers every
+        # workload the kernel is measured on (#315).
         # --keep-going for the same reason the suite passes it: a
         # workload this machine cannot run is a recorded failure and not
         # the end of the pass. instance-startup-500 wants more guest than
@@ -98,10 +123,20 @@ runs:
         # it would collect nothing for them.
         ./target/release/helios-inspector vm --arch x86-64 --profile-generate \
           --accel kvm --memory "${{ steps.lane.outputs.memory }}" \
+          --net-backend tap --net-queues "$(nproc)" \
+          --net-ifname "${{ inputs.net-ifname }}" \
+          --net-bridge "${{ inputs.net-bridge }}" \
           workload-bench --iterations 1 --keep-going \
-          --class compute --class startup --class hostcall \
-          --class ipc --class sched --class fs \
           --llvm-raw-profile-output "${RUNNER_TEMP}/kernel-profile-raw/workloads.profraw"
+    - name: Remove the tap network backend
+      if: always()
+      shell: bash
+      working-directory: ${{ inputs.checkout-path }}
+      run: |
+        ./target/release/helios-inspector vm net-teardown \
+          --net-backend tap \
+          --net-ifname "${{ inputs.net-ifname }}" \
+          --net-bridge "${{ inputs.net-bridge }}"
     - name: Merge the profiles
       shell: bash
       run: |
