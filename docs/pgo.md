@@ -228,6 +228,32 @@ the way `just build-instrumented` is `vm --profile-generate build`, so
 the flags have one definition (`inspector/src/vm.rs`,
 `profile_use_rustflags`).
 
+#### What the warnings become
+
+`-pgo-warn-missing-function` emits one warning per uncovered function,
+and a kernel build has thousands of them — enough that a paired suite
+job's step log truncated itself and hid everything after the builds
+(#329). A profile-use build therefore pipes rustc's stderr rather than
+inheriting it: the `no profile data available for function` lines are
+counted per crate and written, verbatim, to
+`<kernel>.pgo-uncovered.txt` beside the image the build produced (so
+`target/x86_64-unknown-none/profile-use/helios.pgo-uncovered.txt` for
+the fetched-profile build, and the same name in the keyed directory of
+a named one, per the table below). Everything else — `Compiling`,
+`Finished`, other warnings, errors — reaches the log unchanged, and the
+build ends with one line naming what it redirected:
+
+```text
+pgo uncovered functions: 34166 in 14 crates (helios_x86 23058, wasmtime 6127, helios_kernel 2790, …); full list: /path/to/helios.pgo-uncovered.txt
+```
+
+The first figure is how many functions the profile covered nothing
+about, the parenthesised list is that same count per crate, and the
+path is where the whole list went. The bench run record carries the
+count per column (`kernel_pgo_uncovered`,
+`baseline_kernel_pgo_uncovered`), the paired gate's labels name it, and
+the runtime-directory upload of `bench-suite.yml` collects the lists.
+
 #### Where each build lands
 
 One cargo profile is one output directory, and on x86-64 the release
@@ -360,9 +386,11 @@ candidate that does not beat the baseline says the release's profile
 still describes this kernel; one that does
 says the profile has aged, which is the argument for cutting the next
 release's collection. The run record names each column's profile
-(`kernel_profile`, `baseline_kernel_profile`) and the paired table's
-labels carry them, because two `profile-use` builds of one commit are
-otherwise indistinguishable.
+(`kernel_profile`, `baseline_kernel_profile`) and the uncovered-function
+count each profile left (`kernel_pgo_uncovered`,
+`baseline_kernel_pgo_uncovered`), and the paired table's labels carry
+them, because two `profile-use` builds of one commit are otherwise
+indistinguishable.
 
 The pairing machinery varies one thing between its two columns. Until now
 that was the commit — a baseline worktree of another ref (#173, #178) —
@@ -665,3 +693,6 @@ does not.
   release kernel became a `profile-use` build itself, so both booted one
   image. A profile named on the command line now keys a target directory
   of its own; described under "Where each build lands".
+- #329: the missing-function warnings flooded the suite's step log until
+  it truncated. The build now counts them per crate and writes the list
+  beside the kernel; described under "What the warnings become".
