@@ -118,7 +118,7 @@ fn code_label(event: InputEvent) -> String {
 /// onto the shared line queue.
 async fn read_device(device: Device, lines: Sender<String>) {
     let name = device.name();
-    let events = device.events();
+    let mut events = device.events();
     loop {
         let (result, burst) = events.read(Vec::with_capacity(READ_EVENTS)).await;
         for event in burst {
