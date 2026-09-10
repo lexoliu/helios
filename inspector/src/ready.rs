@@ -5,6 +5,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use futures_io::AsyncRead;
+use futures_lite::io::{AsyncReadExt, Cursor};
 use helios_inspector_protocol::RpcError;
 use helios_inspector_protocol::system::stats;
 
@@ -30,13 +31,6 @@ pub(crate) enum BootError {
     LinkClosedBeforeRun,
     #[error("kernel panicked before the embedded debugger entered wasi:cli/run: {report}{trailer}")]
     GuestPanicked { report: String, trailer: String },
-    #[error("failed to drain debugger boot preamble: {source}")]
-    DrainPreamble {
-        #[source]
-        source: io::Error,
-    },
-    #[error("debug serial link closed while draining boot preamble")]
-    LinkClosedDrainingPreamble,
     #[error("debug serial preamble contained non-utf8 bytes: {source}")]
     PreambleNotUtf8 {
         #[source]
@@ -60,7 +54,6 @@ pub(crate) enum BootError {
 
 const BOOT_SYNC_TIMEOUT: Duration = Duration::from_secs(900);
 const READY_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
-const READY_DRAIN_QUIET_PERIOD: Duration = Duration::from_millis(100);
 const PANIC_TRAILER_QUIET_PERIOD: Duration = Duration::from_secs(2);
 const DEBUGGER_RUN_STAGE: &str = "run:begin";
 /// Bytes one serial line may gather before it is rendered anyway.
@@ -108,8 +101,14 @@ pub(crate) async fn connect_after_boot(io: SerialIo) -> Result<RpcClient, BootEr
 /// itself uses: they are printed before any RPC transport exists, and a
 /// session on vsock still has to know when the guest is up.
 ///
-/// The transport comes back drained: the caller's next reader — the RPC
-/// client or the console echo — starts on the byte after the preamble.
+/// The transport comes back with every byte the guest wrote after the
+/// marker still ahead of it. The marker's chunk may already hold what
+/// the guest printed next — a plugin's own lines, the first RPC frame —
+/// and the caller's next reader, the RPC client or the console echo,
+/// starts on the byte after the marker rather than after whatever
+/// happened to be read with it. Nothing is drained: a reader that waited
+/// for the line to go quiet would throw away every line a guest printing
+/// steadily through the handover produced (#343).
 pub(crate) async fn wait_for_boot(read: RpcReader) -> Result<RpcReader, BootError> {
     let echo = ConsoleEcho::new();
     let mut lines = SerialLines::new(read);
@@ -119,7 +118,11 @@ pub(crate) async fn wait_for_boot(read: RpcReader) -> Result<RpcReader, BootErro
     )
     .await
     .ok_or(BootError::MarkersTimedOut)??;
-    Ok(lines.into_transport())
+    let (read, unframed) = lines.into_transport();
+    if unframed.is_empty() {
+        return Ok(read);
+    }
+    Ok(Box::new(Cursor::new(unframed).chain(read)))
 }
 
 /// Keeps draining the guest's serial line for the rest of the session,
@@ -196,12 +199,11 @@ impl<R: AsyncRead + Unpin> SerialLines<R> {
 
     /// Gives the transport back, once nothing read from it is still
     /// held here.
-    fn into_transport(self) -> R {
-        debug_assert_eq!(
-            self.taken, self.filled,
-            "the debug serial transport was handed on with bytes still buffered"
-        );
-        self.read
+    /// Hands the transport on, with the bytes already read but not yet
+    /// framed beside it, so that the next reader loses nothing.
+    fn into_transport(self) -> (R, Vec<u8>) {
+        let unframed = self.chunk[self.taken..self.filled].to_vec();
+        (self.read, unframed)
     }
 
     /// Frames the bytes of the current chunk that are not framed yet,
@@ -254,23 +256,6 @@ impl<R: AsyncRead + Unpin> SerialLines<R> {
             }
         }
     }
-
-    /// Discards whatever the guest is still writing until the line goes
-    /// quiet for `quiet`, so the transport can be handed on.
-    ///
-    /// `false` means the transport closed while draining.
-    async fn drain_until_quiet(&mut self, quiet: Duration) -> io::Result<bool> {
-        loop {
-            self.taken = self.filled;
-            self.line.clear();
-            match runtime::timeout(quiet, self.fill()).await {
-                Some(Ok(0)) => return Ok(false),
-                Some(Ok(_)) => {}
-                Some(Err(error)) => return Err(error),
-                None => return Ok(true),
-            }
-        }
-    }
 }
 
 async fn wait_for_debugger_stage(
@@ -290,7 +275,6 @@ async fn wait_for_debugger_stage(
             let run_begin = stage == DEBUGGER_RUN_STAGE;
             echo.stage(stage);
             if run_begin {
-                drain_boot_preamble(lines).await?;
                 return Ok(());
             }
         } else if let Some(text) = printable_guest_line(lines.line()) {
@@ -354,17 +338,6 @@ async fn collect_panic_trailer(lines: &mut SerialLines<RpcReader>) -> String {
         trailer.push_str(&text);
     }
     trailer
-}
-
-async fn drain_boot_preamble(lines: &mut SerialLines<RpcReader>) -> Result<(), BootError> {
-    let open = lines
-        .drain_until_quiet(READY_DRAIN_QUIET_PERIOD)
-        .await
-        .map_err(|source| BootError::DrainPreamble { source })?;
-    if !open {
-        return Err(BootError::LinkClosedDrainingPreamble);
-    }
-    Ok(())
 }
 
 /// How a `[KDBG …]` stage marker opens.
@@ -656,6 +629,40 @@ mod tests {
         assert_eq!(framed.len(), 2);
         assert_eq!(framed[0].len(), MAX_GUEST_LINE_BYTES);
         assert_eq!(framed[1].len(), 16);
+    }
+
+    #[test]
+    fn what_was_read_with_the_marker_is_handed_on_unread() {
+        let tail = b"compositor:device name=QEMU Virtio Tablet\ncompositor:shell path=/bin/dash\n";
+        let mut stream = b"[KDBG run:begin]\n".to_vec();
+        stream.extend_from_slice(tail);
+        let transport = ChunkedTransport::new(&stream, &[stream.len()], 0);
+        let mut lines = SerialLines::new(transport);
+        runtime::block_on(async move {
+            assert!(lines.advance().await.expect("framing the marker"));
+            assert_eq!(lines.line(), b"[KDBG run:begin]");
+            let (_, unframed) = lines.into_transport();
+            assert_eq!(unframed, tail);
+        });
+    }
+
+    #[test]
+    fn the_next_reader_sees_the_handed_on_bytes_before_the_transport() {
+        // One read takes the marker and two bytes of what followed it.
+        let transport = ChunkedTransport::new(b"[KDBG run:begin]\ncompos", &[19], 0);
+        let mut lines = SerialLines::new(transport);
+        runtime::block_on(async move {
+            assert!(lines.advance().await.expect("framing the marker"));
+            let (read, unframed) = lines.into_transport();
+            assert_eq!(unframed, b"co");
+            let mut rest = Vec::new();
+            Cursor::new(unframed)
+                .chain(read)
+                .read_to_end(&mut rest)
+                .await
+                .expect("reading the chained transport");
+            assert_eq!(rest, b"compos");
+        });
     }
 
     #[test]

@@ -143,7 +143,14 @@ of the socket is written to make it impossible:
   scan of bytes already taken;
 - the console echo renders on its own thread, so a write to the
   inspector's stderr — a pipe in every CI lane — is never time the
-  socket is not being read.
+  socket is not being read;
+- the boot-marker reader hands the transport on the moment it frames
+  `[KDBG run:begin]`, with the bytes it had already read past the marker
+  replayed ahead of the transport, so the RPC client's reader starts on
+  the byte after the marker. Nothing waits for the line to go quiet: a
+  guest that keeps printing through the handover (a plugin the kernel
+  starts at boot, say) would lose every one of those lines to such a
+  wait (#343).
 
 Anything added between one read of this socket and the next has to be
 bounded and non-blocking. The line has no flow control: what the host
