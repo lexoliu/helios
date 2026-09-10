@@ -147,6 +147,8 @@ enum Command {
     Tracing(TracingCommand),
     /// Open the live system monitor.
     Stats,
+    /// List the live program instances, and optionally stop one.
+    Instances(InstancesCommand),
     /// Start an interactive shell that forwards most input to the remote shell.
     Repl,
     /// Launch a local QEMU VM, wait for the debugger, and connect the inspector.
@@ -164,6 +166,8 @@ pub(crate) enum SessionCommand {
     Tracing(TracingCommand),
     /// Open the live system monitor.
     Stats,
+    /// List the live program instances, and optionally stop one.
+    Instances(InstancesCommand),
     /// Start an interactive shell that forwards most input to the remote shell.
     Repl,
 }
@@ -199,6 +203,23 @@ pub(crate) struct ShellCommand {
     trace_log_limit: u32,
 }
 
+/// Which live instances there are, and which of them to stop.
+///
+/// Stopping one by name rather than by identifier is what a script
+/// wants: the identifiers a registry hands out are whatever the boot
+/// happened to allocate, while `compositor-plugin` is the same name on
+/// every boot.
+#[derive(Debug, Clone, ClapArgs)]
+pub(crate) struct InstancesCommand {
+    /// Stop the instance carrying this identifier.
+    #[arg(long = "kill", value_name = "ID", conflicts_with = "kill_name")]
+    kill: Option<u64>,
+
+    /// Stop the instance registered under this name.
+    #[arg(long = "kill-name", value_name = "NAME", conflicts_with = "kill")]
+    kill_name: Option<String>,
+}
+
 #[derive(Debug, Clone, ClapArgs)]
 pub(crate) struct TracingCommand {
     /// Maximum number of recent events kept in the incremental polling window.
@@ -222,6 +243,7 @@ fn main() -> Result<(), InspectorError> {
         Some(Command::Shell(command)) => Some(SessionCommand::Shell(command)),
         Some(Command::Tracing(command)) => Some(SessionCommand::Tracing(command)),
         Some(Command::Stats) => Some(SessionCommand::Stats),
+        Some(Command::Instances(command)) => Some(SessionCommand::Instances(command)),
         Some(Command::Repl) => Some(SessionCommand::Repl),
         None => None,
     };
@@ -298,6 +320,13 @@ pub(crate) fn run_connected(
         SessionCommand::Stats => run_interruptible(async move {
             let mut client = client;
             Ok(stats_tui::run(&mut client).await?)
+        }),
+        SessionCommand::Instances(command) => run_interruptible(async move {
+            let mut client = client;
+            Ok(
+                system::run_instances(&mut client, command.kill, command.kill_name.as_deref())
+                    .await?,
+            )
         }),
         SessionCommand::Repl => Ok(repl::run(client)?),
     }

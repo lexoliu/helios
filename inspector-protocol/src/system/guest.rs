@@ -9,8 +9,8 @@ use crate::system::server::{self, Dispatcher};
 
 use super::bindings::helios::system::{instances, profiling, programs, stats, tracing};
 use super::methods::{
-    INSTANCES_INSTANCE, INSTANCES_SNAPSHOT, PROFILING_CLEAR, PROFILING_FOLDED, PROFILING_INSTANCE,
-    PROFILING_METRICS, PROFILING_RAW_PROFILE_READ, PROFILING_RAW_PROFILE_SIZE,
+    INSTANCES_INSTANCE, INSTANCES_KILL, INSTANCES_SNAPSHOT, PROFILING_CLEAR, PROFILING_FOLDED,
+    PROFILING_INSTANCE, PROFILING_METRICS, PROFILING_RAW_PROFILE_READ, PROFILING_RAW_PROFILE_SIZE,
     PROFILING_SET_ENABLED, PROGRAMS_AOT, PROGRAMS_EXEC, PROGRAMS_INSTANCE, STATS_INSTANCE,
     STATS_SNAPSHOT, TRACING_INSTANCE, TRACING_RECENT,
 };
@@ -52,6 +52,7 @@ fn supports_request(instance: &str, func: &str) -> bool {
             | (PROGRAMS_INSTANCE, PROGRAMS_AOT)
             | (STATS_INSTANCE, STATS_SNAPSHOT)
             | (INSTANCES_INSTANCE, INSTANCES_SNAPSHOT)
+            | (INSTANCES_INSTANCE, INSTANCES_KILL)
             | (TRACING_INSTANCE, TRACING_RECENT)
             | (PROFILING_INSTANCE, PROFILING_SET_ENABLED)
             | (PROFILING_INSTANCE, PROFILING_CLEAR)
@@ -153,6 +154,19 @@ async fn dispatch(instance: &str, func: &str, payload: &[u8]) -> Result<Vec<u8>,
                 .collect::<Vec<_>>();
             postcard::to_allocvec(&snapshot).map_err(|source| DispatchError::Encode {
                 operation: "instances.snapshot",
+                source,
+            })
+        }
+        (INSTANCES_INSTANCE, INSTANCES_KILL) => {
+            let id = postcard::from_bytes::<instances::InstanceId>(payload).map_err(|source| {
+                DispatchError::Decode {
+                    operation: "instances.kill",
+                    source,
+                }
+            })?;
+            let answer = host_instances::kill(id).map_err(convert_kill_error);
+            postcard::to_allocvec(&answer).map_err(|source| DispatchError::Encode {
+                operation: "instances.kill",
                 source,
             })
         }
@@ -583,6 +597,13 @@ fn convert_instance(instance: host_instances::Instance) -> instances::Instance {
         uptime: instance.uptime,
         memory_bytes: instance.memory_bytes,
         cpu_busy: instance.cpu_busy,
+    }
+}
+
+fn convert_kill_error(error: host_instances::KillError) -> instances::KillError {
+    match error {
+        host_instances::KillError::NoSuchInstance => instances::KillError::NoSuchInstance,
+        host_instances::KillError::AlreadyStopping => instances::KillError::AlreadyStopping,
     }
 }
 

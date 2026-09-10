@@ -58,12 +58,12 @@ impl From<ExecError> for ProgramError {
 }
 
 pub async fn exec(
-    client: &mut RpcClient,
+    client: &RpcClient,
     path: &str,
     args: &[String],
 ) -> Result<ExecResult, ProgramError> {
     let path = normalize_absolute(path)?;
-    let outcome = debugger_programs::exec_path(&*client, &path, args)
+    let outcome = debugger_programs::exec_path(client, &path, args)
         .await
         .map_err(|source| ProgramError::Invoke { source })?;
     outcome.map_err(ProgramError::from)

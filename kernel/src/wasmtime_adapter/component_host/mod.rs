@@ -21,11 +21,11 @@ use crate::{
 };
 use crate::{
     ComponentCache, ComponentOutputMode, ComponentOutputRoute, ComponentOutputStreamKind,
-    ComponentStoreData, DeadlinePollable, EmbeddedComponent, ExecResult, ProgramExecError,
-    ProgramExecErrorDetail, ProgramExecErrorKind, RawMutex, RawMutexGuardResource,
-    RawMutexResource, RawRwLock, RawRwLockReadGuardResource, RawRwLockResource,
-    RawRwLockWriteGuardResource, SerialPortResource, elapsed_millis, largest_servable_user_bytes,
-    machine_memory, monotonic_nanos, user_heap_stats,
+    ComponentStoreData, DeadlinePollable, EmbeddedComponent, ExecResult, InstanceId, KillOutcome,
+    KillReason, ProgramExecError, ProgramExecErrorDetail, ProgramExecErrorKind, RawMutex,
+    RawMutexGuardResource, RawMutexResource, RawRwLock, RawRwLockReadGuardResource,
+    RawRwLockResource, RawRwLockWriteGuardResource, SerialPortResource, elapsed_millis,
+    largest_servable_user_bytes, machine_memory, monotonic_nanos, user_heap_stats,
 };
 use helios_hal::cpu::Cpu;
 use spin::Mutex;
@@ -3332,6 +3332,24 @@ where
             .into_iter()
             .map(convert_instance)
             .collect::<Vec<_>>(),))
+    })?;
+    instance.func_wrap("kill", |caller, (id,): (u64,)| {
+        let now = caller.data().now_nanos();
+        // The flag is all this sets: the victim unwinds at its next
+        // yield point, and whoever owns it — a plugin supervisor, or
+        // nobody — decides what happens after.
+        let outcome = caller.data().instance_registry.request_kill(
+            InstanceId::from_raw(id),
+            KillReason::Operator,
+            now,
+        );
+        Ok((match outcome {
+            KillOutcome::Requested => Ok(()),
+            KillOutcome::AlreadyStopping => {
+                Err(debugger_wit::instances::KillError::AlreadyStopping)
+            }
+            KillOutcome::NoSuchInstance => Err(debugger_wit::instances::KillError::NoSuchInstance),
+        },))
     })?;
     Ok(())
 }

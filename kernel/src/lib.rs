@@ -119,8 +119,8 @@ pub use input::{
 pub use instance::{
     ActivityChange, ActivityStep, CondemnedMemory, InstanceActivity, InstanceExecutionTransition,
     InstanceId, InstanceProfileTotal, InstanceRegistry, InstanceSnapshot, KernelHeapCharge,
-    KillReason, MemoryPool, OOM_RECLAIM_GRACE, OomKillDecision, OomKillOutcome, OomPolicy,
-    OomVictim, RegisteredInstance, allow_instance_resource_growth,
+    KillOutcome, KillReason, MemoryPool, OOM_RECLAIM_GRACE, OomKillDecision, OomKillOutcome,
+    OomPolicy, OomVictim, RegisteredInstance, allow_instance_resource_growth,
 };
 pub use io::{
     BlockInstallError, BlockSelfCheckError, BlockService, BlockStats, ByteReadWait, ByteReader,

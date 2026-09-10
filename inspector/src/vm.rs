@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 
 use crate::stats_tui::format_bytes;
+use crate::system::{self, SystemError};
 use crate::workload_bench::{
     DEFAULT_WORKLOAD_TIMEOUT_SECONDS, VmProvenance, WorkloadBenchCommand, WorkloadBenchError,
     WorkloadSelectionError, guest_step_under_deadline,
@@ -37,7 +38,7 @@ mod qemu;
 mod qmp;
 mod raw_profile;
 
-use input::{InputScript, InputScriptError};
+use input::{InputScript, InputScriptError, InputStatement};
 use network::{
     HostPlatform, NetSetupCommand, NetTeardownCommand, QemuNetArgs, VmNetwork, VmNetworkArgs,
     VmNetworkError, VmNetworkFile, VmNetworkProfile, VmNetworkSetupError,
@@ -378,6 +379,18 @@ pub(crate) enum VmSessionError {
     InputScript(#[from] InputScriptError),
     #[error("the thread taking the captures ended without reporting what it did")]
     CaptureThreadLost,
+    #[error("failed to stop the instance {name}: {source}")]
+    KillInstance {
+        name: String,
+        #[source]
+        source: SystemError,
+    },
+    #[error("failed to wake {name} so that it would notice it was stopped: {source}")]
+    WakeKilledInstance {
+        name: String,
+        #[source]
+        source: QmpError,
+    },
     #[error(
         "the guest program {program} exited before the captures were taken; a program a capture \
          is taken of has to still be drawing when it is"
@@ -1472,6 +1485,8 @@ enum VmSessionCommand {
     Shell(crate::ShellCommand),
     Tracing(crate::TracingCommand),
     Stats,
+    /// List the live program instances, and optionally stop one.
+    Instances(crate::InstancesCommand),
     Repl,
     AotBench(AotBenchCommand),
     WorkloadBench(WorkloadBenchCommand),
@@ -1590,6 +1605,26 @@ pub(crate) struct ScreendumpCommand {
     /// How long to wait between the statements of `--input`.
     #[arg(long, default_value_t = 0)]
     input_interval_ms: u64,
+
+    /// Stop the instance registered under this name once the first
+    /// capture is taken.
+    ///
+    /// What the captures that follow show is the machine without it and
+    /// whatever its supervisor put back, which is a claim no second boot
+    /// can make: a restart is one machine before and after, not two
+    /// machines.
+    #[arg(long = "kill-instance", value_name = "NAME")]
+    kill_instance: Option<String>,
+
+    /// How long after that kill to wait before the capture that follows
+    /// it, instead of `--settle-seconds`.
+    ///
+    /// This is the interval the machine is meant to be caught in — after
+    /// the instance is gone and before its supervisor has finished
+    /// rebuilding it — so it is spelled in milliseconds and defaults to
+    /// something shorter than any restart.
+    #[arg(long, default_value_t = 250)]
+    kill_settle_ms: u64,
 }
 
 /// Runs an input script against the guest's keyboard and pointer.
@@ -2685,20 +2720,90 @@ fn run_screendump(
     command: ScreendumpCommand,
     qmp_socket: &Path,
 ) -> Result<(), VmSessionError> {
-    let Some(program) = command.run.clone() else {
-        return capture_scanout(&command, qmp_socket);
-    };
     let socket = qmp_socket.to_path_buf();
     let capture_command = command.clone();
-    alongside_guest_program(
-        client,
-        GuestRun {
-            program,
-            arguments: command.run_args.clone(),
-            wait: Duration::from_secs(command.run_wait_seconds),
-        },
-        move || capture_scanout(&capture_command, &socket),
-    )
+    // One slot: a request is answered before the next is made, because
+    // the thread that makes them is waiting for the answer.
+    let (requests, incoming) = async_channel::bounded(1);
+    let host_side = move || capture_scanout(&capture_command, &socket, &requests);
+    match command.run.clone() {
+        Some(program) => alongside_guest_program(
+            client,
+            GuestRun {
+                program,
+                arguments: command.run_args.clone(),
+                wait: Duration::from_secs(command.run_wait_seconds),
+            },
+            host_side,
+            incoming,
+        ),
+        None => alongside_guest_session(client, host_side, incoming),
+    }
+}
+
+/// Do `host_side` on a thread while the session's RPC keeps being
+/// driven, with no guest program of its own.
+///
+/// `screendump` with no `--run` still needs the executor: an action that
+/// asks something of the guest half-way through — a kill between two
+/// captures — has nowhere to ask from otherwise.
+fn alongside_guest_session<HostSide>(
+    client: crate::serial::RpcClient,
+    host_side: HostSide,
+    requests: async_channel::Receiver<GuestRequest>,
+) -> Result<(), VmSessionError>
+where
+    HostSide: FnOnce() -> Result<(), VmSessionError> + Send + 'static,
+{
+    crate::runtime::block_on(async move {
+        let (sender, receiver) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let _ = sender.send_blocking(host_side());
+        });
+        let mut served = core::pin::pin!(serve_guest_requests(&client, requests));
+        futures_lite::future::or(async { receiver.recv().await }, async {
+            match served.as_mut().await {}
+        })
+        .await
+        .map_err(|_| VmSessionError::CaptureThreadLost)?
+    })
+}
+
+/// Something the host-side thread needs the *guest* to do while it
+/// works.
+///
+/// Captures and input run on a thread of their own, because QMP is
+/// blocking; anything that has to reach the guest goes through the
+/// session's RPC client, which lives on the executor. This is the one
+/// channel between the two, and it exists so that one session can drive
+/// the machine and act on it in the same sequence.
+enum GuestRequest {
+    /// Stop the instance registered under this name.
+    Kill {
+        name: String,
+        reply: async_channel::Sender<Result<u64, SystemError>>,
+    },
+}
+
+/// Serves the host thread's requests against the guest until the thread
+/// drops its sender.
+///
+/// Never finishes on its own: the session ends when the host side or the
+/// guest program does, and a request server that completed would end it
+/// early.
+async fn serve_guest_requests(
+    client: &crate::serial::RpcClient,
+    requests: async_channel::Receiver<GuestRequest>,
+) -> core::convert::Infallible {
+    while let Ok(request) = requests.recv().await {
+        match request {
+            GuestRequest::Kill { name, reply } => {
+                let outcome = system::kill_named_instance(client, &name).await;
+                let _ = reply.send(outcome).await;
+            }
+        }
+    }
+    core::future::pending().await
 }
 
 /// The `--run` program one host-side action is performed alongside.
@@ -2726,6 +2831,7 @@ fn alongside_guest_program<HostSide>(
     client: crate::serial::RpcClient,
     run: GuestRun,
     host_side: HostSide,
+    requests: async_channel::Receiver<GuestRequest>,
 ) -> Result<(), VmSessionError>
 where
     HostSide: FnOnce() -> Result<(), VmSessionError> + Send + 'static,
@@ -2746,12 +2852,18 @@ where
             style("started").cyan(),
             display_command(&program, &arguments)
         );
-        let mut client = client;
-        let guest = crate::programs::exec(&mut client, &program, &arguments);
+        // The requests the host thread makes are served against the same
+        // client the guest program runs through, so they are interleaved
+        // rather than queued behind it.
+        let mut served = core::pin::pin!(serve_guest_requests(&client, requests));
+        let guest = crate::programs::exec(&client, &program, &arguments);
         let mut guest = core::pin::pin!(guest);
         let raced = futures_lite::future::or(
-            async { GuestRace::HostFinished(receiver.recv().await) },
-            async { GuestRace::GuestExited(guest.as_mut().await) },
+            futures_lite::future::or(
+                async { GuestRace::HostFinished(receiver.recv().await) },
+                async { GuestRace::GuestExited(guest.as_mut().await) },
+            ),
+            async { match served.as_mut().await {} },
         )
         .await;
         match raced {
@@ -2819,13 +2931,23 @@ fn report_guest_run(program: &str, outcome: GuestRunOutcome) {
 }
 
 /// Drive the desktop, if asked, and write each capture.
-fn capture_scanout(command: &ScreendumpCommand, qmp_socket: &Path) -> Result<(), VmSessionError> {
+fn capture_scanout(
+    command: &ScreendumpCommand,
+    qmp_socket: &Path,
+    requests: &async_channel::Sender<GuestRequest>,
+) -> Result<(), VmSessionError> {
     let mut qmp = QmpClient::connect(qmp_socket)?;
     if let Some(script) = &command.input {
         send_input_script(&mut qmp, script, command.input_interval_ms)?;
     }
-    for path in &command.paths {
-        if command.settle_seconds != 0 {
+    // The capture that follows the kill waits for the kill's own
+    // interval instead of the settle: what it is meant to catch is the
+    // machine between the instance going and its supervisor finishing.
+    let mut killed = false;
+    for (index, path) in command.paths.iter().enumerate() {
+        if index == 1 && killed {
+            std::thread::sleep(Duration::from_millis(command.kill_settle_ms));
+        } else if command.settle_seconds != 0 {
             std::thread::sleep(Duration::from_secs(command.settle_seconds));
         }
         // QEMU resolves a relative filename against its own working
@@ -2847,6 +2969,51 @@ fn capture_scanout(command: &ScreendumpCommand, qmp_socket: &Path) -> Result<(),
                 source,
             })?;
         println!("{} {}", style("captured").green(), path.display());
+        if index == 0
+            && let Some(name) = &command.kill_instance
+        {
+            kill_instance(&mut qmp, requests, name)?;
+            killed = true;
+        }
+    }
+    Ok(())
+}
+
+/// Stops one instance, and wakes it so that it notices.
+///
+/// A kill is a flag the instance observes the next time it runs. An
+/// instance parked on a host future — a compositor waiting for input, a
+/// server waiting for a connection — is not running, so the kill is
+/// followed by one pointer nudge: the desktop's own event source, which
+/// gives the instance the turn it needs to see the flag. Nothing else
+/// about the machine changes, and an instance that was already running
+/// was gone before the nudge arrived.
+fn kill_instance(
+    qmp: &mut QmpClient,
+    requests: &async_channel::Sender<GuestRequest>,
+    name: &str,
+) -> Result<(), VmSessionError> {
+    let (reply, answer) = async_channel::bounded(1);
+    requests
+        .send_blocking(GuestRequest::Kill {
+            name: name.to_owned(),
+            reply,
+        })
+        .map_err(|_| VmSessionError::CaptureThreadLost)?;
+    let id = answer
+        .recv_blocking()
+        .map_err(|_| VmSessionError::CaptureThreadLost)?
+        .map_err(|source| VmSessionError::KillInstance {
+            name: name.to_owned(),
+            source,
+        })?;
+    println!("{} {name} (instance {id})", style("killed").yellow());
+    for batch in (InputStatement::Rel { dx: 1, dy: 0 }).batches() {
+        qmp.input_send_event(&batch)
+            .map_err(|source| VmSessionError::WakeKilledInstance {
+                name: name.to_owned(),
+                source,
+            })?;
     }
     Ok(())
 }
@@ -2878,6 +3045,10 @@ fn run_input(
     let Some(program) = command.run.clone() else {
         return drive();
     };
+    // The `input` action asks nothing of the guest half-way through, so
+    // its request channel is closed before the session starts.
+    let (requests, incoming) = async_channel::bounded(1);
+    drop(requests);
     alongside_guest_program(
         client,
         GuestRun {
@@ -2886,6 +3057,7 @@ fn run_input(
             wait: Duration::from_secs(command.run_wait_seconds),
         },
         drive,
+        incoming,
     )
 }
 
@@ -4699,6 +4871,9 @@ impl From<VmSessionCommand> for ResolvedVmSessionCommand {
             VmSessionCommand::Shell(command) => Self::Session(SessionCommand::Shell(command)),
             VmSessionCommand::Tracing(command) => Self::Session(SessionCommand::Tracing(command)),
             VmSessionCommand::Stats => Self::Session(SessionCommand::Stats),
+            VmSessionCommand::Instances(command) => {
+                Self::Session(SessionCommand::Instances(command))
+            }
             VmSessionCommand::Repl => Self::Session(SessionCommand::Repl),
             VmSessionCommand::AotBench(command) => Self::AotBench(command),
             VmSessionCommand::WorkloadBench(command) => Self::WorkloadBench(command),

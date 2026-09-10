@@ -31,6 +31,10 @@ pub enum SystemError {
     },
     #[error("unknown tracing level {level}")]
     UnknownLevel { level: String },
+    #[error("no live instance is named {name}")]
+    NoInstanceNamed { name: String },
+    #[error("the guest refused to stop instance {id}: {reason}")]
+    KillRefused { id: u64, reason: &'static str },
     #[error("failed to render a guest tracing event: {source}")]
     Render {
         #[from]
@@ -55,6 +59,8 @@ impl SystemError {
         match self {
             Self::Fetch { source, .. } => source.guest_panic(),
             Self::UnknownLevel { .. }
+            | Self::NoInstanceNamed { .. }
+            | Self::KillRefused { .. }
             | Self::Render { .. }
             | Self::Signals { .. }
             | Self::Write { .. } => None,
@@ -94,15 +100,93 @@ pub async fn fetch_stats(client: &mut RpcClient) -> Result<stats::Sample, System
         })
 }
 
-pub async fn fetch_instances(
-    client: &mut RpcClient,
-) -> Result<Vec<instances::Instance>, SystemError> {
+pub async fn fetch_instances(client: &RpcClient) -> Result<Vec<instances::Instance>, SystemError> {
     remote::call(instances::snapshot(client), "remote instances snapshot")
         .await
         .map_err(|source| SystemError::Fetch {
             what: "remote instances snapshot",
             source,
         })
+}
+
+/// Prints the live instances, and stops one when asked to.
+///
+/// The listing is printed whichever way the call goes, because what an
+/// operator wants to see after asking for a kill is the registry the
+/// kill was aimed at.
+pub async fn run_instances(
+    client: &RpcClient,
+    kill_id: Option<u64>,
+    kill_name: Option<&str>,
+) -> Result<(), SystemError> {
+    let live = fetch_instances(client).await?;
+    let target = match (kill_id, kill_name) {
+        (Some(id), _) => Some(id),
+        (None, Some(name)) => Some(named_instance(&live, name)?),
+        (None, None) => None,
+    };
+    let mut out = std::io::stdout();
+    for instance in &live {
+        writeln!(
+            out,
+            "{:>6}  {:<24} up {:>8} ms  {:>9} KiB  {:>4}‰ cpu",
+            instance.id,
+            instance.name,
+            instance.uptime / 1_000_000,
+            instance.memory_bytes / 1024,
+            instance.cpu_busy,
+        )
+        .map_err(|source| SystemError::Write { source })?;
+    }
+    let Some(id) = target else {
+        return Ok(());
+    };
+    kill(client, id).await?;
+    writeln!(out, "killed instance {id}").map_err(|source| SystemError::Write { source })?;
+    Ok(())
+}
+
+/// The identifier the instance registered under `name` holds.
+fn named_instance(live: &[instances::Instance], name: &str) -> Result<u64, SystemError> {
+    live.iter()
+        .find(|instance| instance.name == name)
+        .map(|instance| instance.id)
+        .ok_or_else(|| SystemError::NoInstanceNamed {
+            name: name.to_owned(),
+        })
+}
+
+/// Stops the instance registered under `name`, and reports which one it
+/// was.
+///
+/// The kill is a flag the instance observes at its next yield point, so
+/// this returns when the guest has been told, not when the instance is
+/// gone. What proves it went is what happens next: the instance leaving a
+/// later snapshot, or its supervisor's own line on the way back up.
+pub async fn kill_named_instance(client: &RpcClient, name: &str) -> Result<u64, SystemError> {
+    let id = named_instance(&fetch_instances(client).await?, name)?;
+    kill(client, id).await?;
+    Ok(id)
+}
+
+async fn kill(client: &RpcClient, id: u64) -> Result<(), SystemError> {
+    let answer = remote::call(instances::kill(client, id), "remote instance kill")
+        .await
+        .map_err(|source| SystemError::Fetch {
+            what: "remote instance kill",
+            source,
+        })?;
+    match answer {
+        Ok(()) => Ok(()),
+        Err(instances::KillError::NoSuchInstance) => Err(SystemError::KillRefused {
+            id,
+            reason: "no live instance carries that identifier",
+        }),
+        Err(instances::KillError::AlreadyStopping) => Err(SystemError::KillRefused {
+            id,
+            reason: "it is already stopping",
+        }),
+    }
 }
 
 pub async fn fetch_tracing(
