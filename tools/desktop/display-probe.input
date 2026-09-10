@@ -1,0 +1,13 @@
+# Drive the desktop's absolute pointer to a position the capture that
+# follows can be checked against.
+#
+# The axis range is QEMU's own 0..=32767 rather than guest pixels: the
+# host cannot know what mode the guest chose. 16384 on both axes is the
+# middle of whatever the guest is presenting.
+abs 16384 16384
+btn left down
+btn left up
+
+# One keystroke, so the capture is taken of a desktop that has had both
+# kinds of input rather than only pointer motion.
+key spc
