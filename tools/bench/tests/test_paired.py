@@ -474,17 +474,19 @@ def test_a_build_record_with_an_uncovered_count_names_it_in_the_gate(
             "kernel_profile": "dev@abc1234 run 34424416974",
             "baseline_kernel_profile": "release helios-v0.1.0",
             "kernel_pgo_uncovered": 34166,
+            "kernel_pgo_functions": 42053,
             "baseline_kernel_pgo_uncovered": 7897,
+            "baseline_kernel_pgo_functions": 42053,
         }
     )
     report = paired_regression_report.model_copy(update={"run": run})
 
     verdict = evaluate_paired(report)
-    assert "34,166 uncovered functions" in verdict.candidate_label
-    assert "7,897 uncovered functions" in verdict.baseline_label
+    assert "34,166 of 42,053 functions uncovered" in verdict.candidate_label
+    assert "7,897 of 42,053 functions uncovered" in verdict.baseline_label
     gate_text = render_gate(gate_report(report, None), report.run.lane)
-    assert "34,166 uncovered functions" in gate_text
-    assert "7,897 uncovered functions" in gate_text
+    assert "34,166 of 42,053 functions uncovered" in gate_text
+    assert "7,897 of 42,053 functions uncovered" in gate_text
 
 
 def test_the_uncovered_count_is_read_from_the_list_beside_the_kernel(
@@ -519,17 +521,45 @@ def test_the_uncovered_count_is_read_from_the_list_beside_the_kernel(
     kernel = Path(answered.stdout.strip())
     listing = Path(str(kernel) + ".pgo-uncovered.txt")
     listing.write_text(
-        "# 3 functions the kernel profile covers nothing about\n"
+        "# uncovered: 3 of 42 functions (7.1%)\n"
+        "# warnings emitted: 3 in 2 crates\n"
         "warning: a.1-cgu.0: no profile data available for function _A Hash = 1 up to 0 count discarded\n"
         "warning: a.1-cgu.0: no profile data available for function _B Hash = 2 up to 0 count discarded\n"
         "warning: b.2-cgu.3: no profile data available for function _C Hash = 3 up to 0 count discarded\n",
         encoding="utf-8",
     )
-    assert kernel_pgo_uncovered(checkout, lane, None) == 3
+    assert kernel_pgo_uncovered(checkout, lane, None) == (3, 42)
 
     # A kernel whose build kept no list reports no count rather than zero.
     plain = fake_checkout(tmp_path / "plain")
     assert kernel_pgo_uncovered(plain, lane, None) is None
+
+    # And a list whose header disagrees with its lines is a broken
+    # artifact, not a count.
+    listing.write_text(
+        "# uncovered: 4 of 42 functions (9.5%)\n"
+        "# warnings emitted: 4 in 2 crates\n"
+        "warning: a.1-cgu.0: no profile data available for function _A Hash = 1 up to 0 count discarded\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(SystemExit, match="names 4 emitted warnings but lists 1"):
+        kernel_pgo_uncovered(checkout, lane, None)
+
+
+def test_a_kernel_path_that_fails_is_a_failure_not_an_empty_count(tmp_path, monkeypatch) -> None:
+    """A nonzero `kernel-path` names what refused, rather than reading None."""
+    inspector = tmp_path / "helios-inspector"
+    inspector.write_text(
+        "#!/bin/sh\necho 'the profile is not in the store' >&2\nexit 3\n", encoding="utf-8"
+    )
+    inspector.chmod(0o755)
+    monkeypatch.setenv("HELIOS_INSPECTOR_BIN", str(inspector))
+    lane = load_manifest().lane("x86-64-kvm")
+    checkout = fake_checkout(tmp_path / "candidate")
+    with pytest.raises(
+        SystemExit, match="exited with status 3: the profile is not in the store"
+    ):
+        kernel_pgo_uncovered(checkout, lane, None)
 
 
 def test_a_paired_regression_blocks_on_a_shared_runner(paired_regression_report: Report) -> None:
