@@ -261,6 +261,28 @@ impl<T: VirtioTransport> InputDevice for VirtioInputDevice<T> {
                 if let Some(event) = Self::take_event(&mut state, &self.transport)? {
                     return Ok(event);
                 }
+                // The ring is empty, so this reader is about to park and
+                // nobody is looking at the device: it hands the
+                // interrupt line back to the platform before it does.
+                //
+                // The interrupt-status register is read-to-clear, and on
+                // a transport whose interrupt line is a function of it —
+                // virtio-mmio's is — a status nobody reads holds that
+                // line asserted. A line that never falls never rises
+                // again, so an edge-triggered controller sees no further
+                // interrupt and the device goes silent for the life of
+                // the machine. An input device reports without being
+                // asked, so it can raise its line before the platform
+                // has routed that line anywhere, and the reader's first
+                // park is what clears the raise nobody could deliver.
+                self.transport.ack_interrupt();
+                // The device may have published between the drain above
+                // and that acknowledgement, in which case the line it
+                // raised has just been cleared and the ring holds an
+                // event the wait below would never be woken for.
+                if let Some(event) = Self::take_event(&mut state, &self.transport)? {
+                    return Ok(event);
+                }
             }
             notified.await;
         }
@@ -765,6 +787,34 @@ mod tests {
         assert_eq!(
             block_on(poll_once(pin!(device.next_event()))),
             Some(Ok(key))
+        );
+    }
+
+    /// A reader that finds nothing left never parks on an interrupt the
+    /// device has already raised.
+    ///
+    /// This is what keeps an edge-triggered controller able to deliver
+    /// the device's next event: virtio-mmio derives its interrupt line
+    /// from the read-to-clear status register, so a status nobody reads
+    /// holds the line asserted, and a line that never falls never rises
+    /// again.
+    #[test]
+    fn a_park_leaves_no_interrupt_outstanding() {
+        use crate::transport::VirtioTransport as _;
+
+        let transport = keyboard();
+        let device = VirtioInputDevice::new(transport).expect("a keyboard initializes");
+        // The device reported before anyone could be listening, which is
+        // what an input device does.
+        device.transport.raise_interrupt(1);
+
+        assert!(
+            block_on(poll_once(pin!(device.next_event()))).is_none(),
+            "an empty ring parks the reader"
+        );
+        assert!(
+            !device.transport.ack_interrupt().used_buffer,
+            "the park cleared the interrupt the device had raised"
         );
     }
 

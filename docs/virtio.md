@@ -227,6 +227,20 @@ one at a time, `SYN_REPORT` included: a frame boundary is a fact the
 consumer acts on, and a driver that buffered a frame would add latency to
 the one path a person can feel.
 
+An input device is also the only device in the tree that reports without
+being asked, and that changes what its driver owes the interrupt line.
+The reader clears the device's interrupt status before it parks, not only
+when an interrupt arrives: virtio-mmio derives its line from that
+read-to-clear register, so a status nobody reads holds the line asserted,
+and a line that never falls never rises again — an edge-triggered
+controller sees no further interrupt and the device is silent for the
+life of the machine. The case is not hypothetical. A device that is
+started before the platform routes its interrupt raises that line into a
+controller which is not yet listening, and on GICv3 the pending state a
+level-configured line left behind is discarded when the trigger is
+reprogrammed to edge; the reader's first park is what clears the raise
+nobody could deliver.
+
 The device describes itself through a select/sub-select configuration
 register file rather than a command protocol (virtio 1.2 §5.8.5): the
 driver writes `select` and `subsel`, reads back `size`, and then reads
