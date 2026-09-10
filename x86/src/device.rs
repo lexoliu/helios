@@ -21,7 +21,7 @@
 use helios_hal::device::{DeviceRegion, DmaPlacement};
 use helios_hal::iommu::PhysicalRange;
 use helios_hal::pmm::PhysFrame;
-use helios_hal::vmm::{AddressSpace, AddressSpaceError, PageFlags, VirtRange};
+use helios_hal::vmm::{AddressSpace, AddressSpaceError, PageFlags, VirtAddr, VirtRange};
 use helios_kernel::DeviceVmHooks;
 
 fn map_device(_virt: VirtRange, _region: DeviceRegion) -> Result<(), AddressSpaceError> {
@@ -60,6 +60,10 @@ fn mapping_granule() -> u64 {
     PhysFrame::SIZE as u64
 }
 
+fn kernel_alias(frame: PhysFrame) -> VirtAddr {
+    crate::vmm::user_address_space().kernel_alias(frame)
+}
+
 static VM_HOOKS: DeviceVmHooks = DeviceVmHooks {
     map_device,
     unmap_device,
@@ -68,6 +72,7 @@ static VM_HOOKS: DeviceVmHooks = DeviceVmHooks {
     commit_contiguous,
     release_contiguous,
     mapping_granule,
+    kernel_alias,
 };
 
 /// Install the backend's half of the device path.

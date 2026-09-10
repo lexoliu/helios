@@ -29,10 +29,8 @@ use helios_hal::display::DisplayMode;
 use crate::device::DeviceWindow;
 
 use super::DisplayServiceError;
-use crate::pins::PinnedFrame;
-
-use super::DisplayPins;
 use super::service::{DisplayClaim, DisplayService};
+use super::{DisplayPins, PinnedFrame};
 
 /// One instance's side of the display path.
 #[derive(Default)]

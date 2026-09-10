@@ -28,7 +28,7 @@ use fdt::node::FdtNode;
 use helios_hal::device::{DeviceRegion, DeviceRegionAttributes, DmaCapability, DmaPlacement};
 use helios_hal::iommu::{DmaTranslation, PhysicalRange};
 use helios_hal::pmm::PhysFrame;
-use helios_hal::vmm::{AddressSpace, AddressSpaceError, PageFlags, VirtRange};
+use helios_hal::vmm::{AddressSpace, AddressSpaceError, PageFlags, VirtAddr, VirtRange};
 use helios_kernel::{
     DEFAULT_DMA_BUDGET_BYTES, DeviceGrant, DeviceGrantRegistry, DeviceInterruptHooks,
     DeviceInterruptRoute, DeviceName, DeviceVmHooks, DmaBudget, GrantError, GrantInterrupt,
@@ -130,6 +130,12 @@ fn mapping_granule() -> u64 {
     PhysFrame::SIZE as u64
 }
 
+/// The kernel identity-maps physical memory on this backend, so a
+/// frame's kernel address is its physical address.
+fn kernel_alias(frame: PhysFrame) -> VirtAddr {
+    VirtAddr::new(frame.phys_addr())
+}
+
 static VM_HOOKS: DeviceVmHooks = DeviceVmHooks {
     map_device,
     unmap_device,
@@ -138,6 +144,7 @@ static VM_HOOKS: DeviceVmHooks = DeviceVmHooks {
     commit_contiguous,
     release_contiguous,
     mapping_granule,
+    kernel_alias,
 };
 
 fn mask(raw: u32) {

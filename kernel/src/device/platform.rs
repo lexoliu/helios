@@ -20,7 +20,7 @@
 use helios_hal::device::{DeviceRegion, DmaPlacement};
 use helios_hal::iommu::PhysicalRange;
 use helios_hal::pmm::PhysFrame;
-use helios_hal::vmm::{AddressSpaceError, PageFlags, VirtRange};
+use helios_hal::vmm::{AddressSpaceError, PageFlags, VirtAddr, VirtRange};
 use spin::Once;
 
 /// The address space's device-mapping surface.
@@ -51,6 +51,20 @@ pub struct DeviceVmHooks {
     /// is one allocation, not a pile of frames, and an allocator that
     /// was given a size and an alignment has to be given them back.
     pub release_contiguous: fn(VirtRange, u64) -> Result<(), AddressSpaceError>,
+    /// Where a physical frame appears in the kernel's own address
+    /// space.
+    ///
+    /// The mapping [`Self::commit_contiguous`] installs is in the
+    /// owner's linear memory, which is a window no device's DMA pool
+    /// translates: every pool this kernel builds turns a pointer into a
+    /// bus address by the fixed relation between physical memory and
+    /// the kernel's own map. So a driver handed a slice — which is what
+    /// the playback contract takes — has to be handed that alias, and
+    /// the alias is the address a kernel-side producer writes the bytes
+    /// through as well. Every backend has one: an offset map on x86 and
+    /// aarch64, an identity map on riscv64, and the host's own address
+    /// under `hosted`.
+    pub kernel_alias: fn(PhysFrame) -> VirtAddr,
     /// The smallest unit at which this address space can change a
     /// mapping, in bytes.
     ///
@@ -144,12 +158,13 @@ pub(crate) mod test_hooks {
     //! another's timing.
 
     use super::{DeviceInterruptHooks, DeviceVmHooks};
+    use alloc::alloc::{Layout, alloc_zeroed, dealloc};
     use alloc::vec::Vec;
     use core::cell::RefCell;
     use helios_hal::device::{DeviceRegion, DmaPlacement};
     use helios_hal::iommu::PhysicalRange;
     use helios_hal::pmm::PhysFrame;
-    use helios_hal::vmm::{AddressSpaceError, PageFlags, VirtRange};
+    use helios_hal::vmm::{AddressSpaceError, PageFlags, VirtAddr, VirtRange};
 
     /// One mapping change the kernel asked the address space for.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -170,16 +185,18 @@ pub(crate) mod test_hooks {
         shootdowns: u64,
         masked: Vec<u32>,
         unmasked: Vec<u32>,
-        /// Where the next contiguous commit lands. Bumped per
-        /// allocation so two buffers never claim the same physical run.
-        next_frame: usize,
+        /// Host memory standing in for the physical runs a commit hands
+        /// out, keyed by the range each was committed at.
+        ///
+        /// Real bytes rather than a bumped frame number, because
+        /// [`DeviceVmHooks::kernel_alias`] is what a producer writes a
+        /// period through and what a device is told to read: a test that
+        /// drives the sample path dereferences this.
+        runs: Vec<(usize, *mut u8, Layout)>,
     }
 
     std::thread_local! {
-        static RECORDING: RefCell<Recording> = RefCell::new(Recording {
-            next_frame: 0x1000,
-            ..Recording::default()
-        });
+        static RECORDING: RefCell<Recording> = RefCell::new(Recording::default());
     }
 
     fn record(change: MappingChange) {
@@ -205,20 +222,49 @@ pub(crate) mod test_hooks {
         _flags: PageFlags,
         placement: DmaPlacement,
     ) -> Result<PhysFrame, AddressSpaceError> {
-        let frame = RECORDING.with(|recording| {
-            let mut recording = recording.borrow_mut();
-            let index = recording.next_frame;
-            recording.next_frame += virt.frame_count();
-            PhysFrame::from_index(index)
-        });
-        if !placement.accepts(frame.phys_addr() as u64, virt.byte_len as u64) {
+        let align = usize::try_from(placement.align)
+            .unwrap_or(PhysFrame::SIZE)
+            .max(PhysFrame::SIZE);
+        let layout = Layout::from_size_align(virt.byte_len, align)
+            .map_err(|_| AddressSpaceError::Misaligned)?;
+        // SAFETY: the layout has a non-zero size, because a commit of no
+        // bytes is refused before it reaches an address space.
+        let run = unsafe { alloc_zeroed(layout) };
+        if run.is_null() {
             return Err(AddressSpaceError::OutOfFrames);
         }
+        let frame = PhysFrame::from_phys_addr(run as usize);
+        if !placement.accepts(frame.phys_addr() as u64, virt.byte_len as u64) {
+            // SAFETY: `run` came from `alloc_zeroed` with this layout
+            // and nothing has been recorded against it.
+            unsafe { dealloc(run, layout) };
+            return Err(AddressSpaceError::OutOfFrames);
+        }
+        RECORDING.with(|recording| {
+            recording
+                .borrow_mut()
+                .runs
+                .push((virt.start.raw(), run, layout));
+        });
         record(MappingChange::Commit(virt));
         Ok(frame)
     }
 
     fn release_contiguous(virt: VirtRange, _align: u64) -> Result<(), AddressSpaceError> {
+        let held = RECORDING.with(|recording| {
+            let mut recording = recording.borrow_mut();
+            let index = recording
+                .runs
+                .iter()
+                .position(|(start, _, _)| *start == virt.start.raw())?;
+            Some(recording.runs.remove(index))
+        });
+        if let Some((_, run, layout)) = held {
+            // SAFETY: `run` came from this module's own `alloc_zeroed`
+            // with `layout`, and it is removed from the list before it
+            // is freed, so nothing frees it twice.
+            unsafe { dealloc(run, layout) };
+        }
         record(MappingChange::Released(virt));
         Ok(())
     }
@@ -252,6 +298,12 @@ pub(crate) mod test_hooks {
         PhysFrame::SIZE as u64
     }
 
+    /// A commit's "physical" address under these tables is the host
+    /// allocation behind it, so the kernel's alias for it is itself.
+    fn kernel_alias(frame: PhysFrame) -> VirtAddr {
+        VirtAddr::new(frame.phys_addr())
+    }
+
     static VM: DeviceVmHooks = DeviceVmHooks {
         map_device,
         unmap_device,
@@ -260,6 +312,7 @@ pub(crate) mod test_hooks {
         commit_contiguous,
         release_contiguous,
         mapping_granule,
+        kernel_alias,
     };
 
     static INTERRUPTS: DeviceInterruptHooks = DeviceInterruptHooks { mask, unmask };

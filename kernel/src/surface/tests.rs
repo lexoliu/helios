@@ -16,7 +16,7 @@ use helios_hal::vmm::VirtAddr;
 
 use crate::device::test_hooks::MappingChange;
 use crate::device::{DeviceWindow, test_hooks};
-use crate::pins::PinnedFrames;
+use crate::pins::PinnedArena;
 
 use super::service::{SurfaceGeometry, SurfaceRect, SurfaceService, SurfaceShared};
 
@@ -182,13 +182,13 @@ fn a_surfaces_pages_are_committed_once_and_viewed_once() {
     test_hooks::install();
     let before = test_hooks::changes().len();
 
-    let mut client = PinnedFrames::<4>::new(window());
+    let mut client = PinnedArena::<4>::new(window());
     let frame = client
         .pin(geometry(64, 64).frame_bytes().expect("a real geometry"))
         .expect("the window has room");
     assert!(!frame.is_shared());
 
-    let mut compositor = PinnedFrames::<4>::new(window());
+    let mut compositor = PinnedArena::<4>::new(window());
     let view = compositor
         .map(frame.physical())
         .expect("the address space can hand out a second view");
@@ -218,7 +218,7 @@ fn a_surfaces_pages_are_committed_once_and_viewed_once() {
 #[test]
 fn a_frames_physical_range_covers_exactly_the_pages_it_was_given() {
     test_hooks::install();
-    let mut client = PinnedFrames::<4>::new(window());
+    let mut client = PinnedArena::<4>::new(window());
     let frame = client.pin(PhysFrame::SIZE as u64 + 1).expect("room");
     // Rounded up to whole granules, and the physical range says the same
     // thing the mapping does.

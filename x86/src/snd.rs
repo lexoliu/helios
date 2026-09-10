@@ -21,7 +21,7 @@ type X86VirtioSndDevice = VirtioSndDevice<VirtioPciTransport<X86DmaPool>>;
 
 /// The interrupt route's view of the machine's sound device.
 ///
-/// The kernel's event drain holds the same `Arc`, which satisfies the
+/// The kernel's audio service holds the same `Arc`, which satisfies the
 /// playback contract through hal's shared-handle impl; this newtype
 /// exists only to give the route an interrupt handler to dispatch to.
 #[derive(Clone)]
@@ -42,6 +42,7 @@ pub(crate) fn discover(pci: &PciRoot) -> Option<PciAddress> {
 
 /// Brings up the virtio-snd function at `address` and hands it to the
 /// kernel.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn install<WatchdogImpl>(
     kernel: &helios_kernel::Kernel<crate::X86Cpu, WatchdogImpl>,
     pci: &PciRoot,
@@ -49,6 +50,7 @@ pub(crate) fn install<WatchdogImpl>(
     dma: X86DmaPool,
     vector: u8,
     destination_apic_id: u32,
+    debug_state: &crate::debug_state::RuntimeState,
 ) -> VirtioSoundDevice
 where
     WatchdogImpl: helios_hal::watchdog::Watchdog + Clone,
@@ -59,7 +61,8 @@ where
             panic!("failed to initialize the virtio-snd function at {address}: {error}")
         });
     let device = Arc::new(device);
-    helios_kernel::install_sound_device(kernel, Arc::clone(&device));
+    let service = helios_kernel::install_audio_device(kernel, Arc::clone(&device));
+    debug_state.install_audio_service(service);
     tracing::info!("virtio-snd function={address} msix_vector={vector:#x}");
     VirtioSoundDevice { device }
 }

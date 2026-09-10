@@ -762,7 +762,13 @@ extern "C" fn aarch64_kernel_main() -> ! {
         );
         routes.add_input(device.interrupt, device.device);
     }
-    if let Some(sound) = snd::install(&kernel, &platform, physical_memory_offset, &handoff) {
+    if let Some(sound) = snd::install(
+        &kernel,
+        &platform,
+        physical_memory_offset,
+        &handoff,
+        &debug_state,
+    ) {
         gic.enable_device_interrupt(
             sound.interrupt,
             sound.trigger,

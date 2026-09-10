@@ -53,12 +53,14 @@ pub(crate) fn install<WatchdogImpl>(
     platform: &PlatformDescription,
     physical_memory_offset: usize,
     handoff: &crate::LimineBootHandoff,
+    debug_state: &crate::debug_state::RuntimeState,
 ) -> Option<SoundInterrupt>
 where
     WatchdogImpl: helios_hal::watchdog::Watchdog + Clone,
 {
     let sound = discover_sound_device(platform, physical_memory_offset, handoff)?;
-    helios_kernel::install_sound_device(kernel, sound.device.device.clone());
+    let service = helios_kernel::install_audio_device(kernel, sound.device.device.clone());
+    debug_state.install_audio_service(service);
     Some(sound)
 }
 

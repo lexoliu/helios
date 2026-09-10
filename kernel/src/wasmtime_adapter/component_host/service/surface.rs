@@ -36,7 +36,7 @@ use wasmtime::component::{
 
 use crate::ComponentHostNetwork;
 use crate::component::ProviderError;
-use crate::pins::PinnedFrame;
+use crate::pins::PinnedRun;
 use crate::surface::{
     SurfaceCreate, SurfaceEvents, SurfaceGeometry, SurfaceId, SurfaceRect, SurfaceRequest,
     SurfaceServiceError, SurfaceShared,
@@ -65,7 +65,7 @@ where
 /// One client window, as its store records it.
 pub struct ClientSurfaceHandle {
     shared: Arc<SurfaceShared>,
-    frame: PinnedFrame,
+    frame: PinnedRun,
 }
 
 const fn to_wit_error(error: SurfaceServiceError) -> surface_wit::Error {

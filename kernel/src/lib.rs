@@ -6,6 +6,7 @@ extern crate self as helios_kernel;
 #[cfg(not(target_os = "none"))]
 extern crate std;
 
+mod audio;
 mod bootfs;
 mod component;
 mod device;
@@ -45,6 +46,11 @@ pub mod runtime_memory {
         publish_code_memory, unpublish_code_memory,
     };
 }
+pub use audio::{
+    AudioClaim, AudioOwnership, AudioSender, AudioService, AudioServiceError, AudioStreamSnapshot,
+    FEEDBACK_QUEUE_DEPTH, Feedback, FeedbackBurst, FeedbackReader, PERIOD_MICROS,
+    PERIODS_IN_FLIGHT, PeriodRing, PeriodWriter, PlaybackFormat, install_audio_device,
+};
 pub use bootfs::{
     BootDirectory, BootDirectoryEntry, BootDirectoryHandleExt, BootFile, EmbeddedBootDirectory,
     EmbeddedBootFile, EmbeddedBootFs,
@@ -69,18 +75,18 @@ pub use component::{
     wait_until_runtime_deadline,
 };
 pub use device::{
-    DEFAULT_DMA_BUDGET_BYTES, DEVICE_WINDOW_BYTES, DISPLAY_WINDOW_BYTES, DeviceGrant,
-    DeviceGrantRegistry, DeviceInterruptHooks, DeviceInterruptRoute, DeviceName, DeviceOwnership,
-    DeviceVmHooks, DeviceWindow, DmaBudget, DmaBuffer, DmaBufferHandle, GrantError, GrantHandle,
-    GrantInterrupt, GrantLease, GrantStats, GrantedDeviceSnapshot, InterruptEvent, InterruptRelay,
-    InterruptStats, LinearMemory, MAX_DEVICE_NAME, MAX_DMA_BUFFERS, MAX_GRANT_INTERRUPTS,
-    MAX_GRANT_REGIONS, MAX_GRANTS, MappedRegion, PublishedDevice, SURFACE_WINDOW_BYTES,
-    install_device_interrupt_hooks, install_device_vm_hooks,
+    AUDIO_WINDOW_BYTES, DEFAULT_DMA_BUDGET_BYTES, DEVICE_WINDOW_BYTES, DISPLAY_WINDOW_BYTES,
+    DeviceGrant, DeviceGrantRegistry, DeviceInterruptHooks, DeviceInterruptRoute, DeviceName,
+    DeviceOwnership, DeviceVmHooks, DeviceWindow, DmaBudget, DmaBuffer, DmaBufferHandle,
+    GrantError, GrantHandle, GrantInterrupt, GrantLease, GrantStats, GrantedDeviceSnapshot,
+    InterruptEvent, InterruptRelay, InterruptStats, LinearMemory, MAX_DEVICE_NAME, MAX_DMA_BUFFERS,
+    MAX_GRANT_INTERRUPTS, MAX_GRANT_REGIONS, MAX_GRANTS, MappedRegion, PublishedDevice,
+    SURFACE_WINDOW_BYTES, install_device_interrupt_hooks, install_device_vm_hooks,
 };
 pub use display::{
     DisplayClaim, DisplayOwnership, DisplayPins, DisplaySender, DisplayService,
-    DisplayServiceError, FrameToken, MAX_CLAIMED_SCANOUTS, REQUEST_QUEUE_DEPTH, SequenceSignal,
-    install_display_device,
+    DisplayServiceError, FrameToken, MAX_CLAIMED_SCANOUTS, MAX_PINNED_FRAMES, PinnedFrame,
+    REQUEST_QUEUE_DEPTH, SequenceSignal, install_display_device,
 };
 pub use embedded::{
     EmbeddedComponent, EmbeddedInit, embedded_boot_component, embedded_init,
@@ -130,7 +136,7 @@ pub use io::{
     MAX_IOMMU_ENDPOINTS, MAX_NETWORK_INTERRUPTS, PanicSerial, PollKey, PollRegistration,
     PollRegistry, PollRegistryError, PollSourceKind, RecordingConsole, SCRATCH_DISK_SERIAL,
     SerialReader, TryRead, TryWrite, byte_channel, emit_panic_report, install_block_devices,
-    install_sound_device, read_debug_serial, read_serial, try_read_serial, wake_queue_owners,
+    read_debug_serial, read_serial, try_read_serial, wake_queue_owners,
 };
 pub use kernel_exception::{
     KernelException, KernelExceptionCause, KernelExceptionDispatch, KernelNativeTrapHandler,
@@ -170,7 +176,7 @@ pub use network::{
     SocketStack, TcpListenerId, TcpStreamId, UdpSocketId, validate_http_authority,
     validate_http_path_with_query, validate_http_status_code,
 };
-pub use pins::{BYTES_PER_PIXEL, MAX_PINNED_FRAMES, PinError, PinnedFrame, PinnedFrames};
+pub use pins::{BYTES_PER_PIXEL, PinError, PinnedArena, PinnedRun};
 pub use process::{
     ClockAuthorityRights, DescriptorEntry, DescriptorId, DescriptorTable, DescriptorTableError,
     DirectoryAuthorityRights, DirectoryCap, DirectoryPreopen, DnsCap, ExecAuthority, ForkAuthority,

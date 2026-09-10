@@ -270,6 +270,10 @@ mod tests {
             crate::surface::SurfaceService::new()
         }
 
+        fn audio_service(&self) -> Option<crate::audio::AudioService> {
+            None
+        }
+
         fn profiling_enabled(&self) -> bool {
             false
         }
