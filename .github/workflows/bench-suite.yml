@@ -52,8 +52,12 @@ on:
     branches: [dev]
     tags: ["v*"]
 
+# A push supersedes the previous push and a dispatch the previous
+# dispatch. The event is part of the group because a push to `dev` runs
+# only `tooling`, and in one group with a dispatched measurement it
+# cancelled that measurement hours in (#318).
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
