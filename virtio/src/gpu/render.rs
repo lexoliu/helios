@@ -76,9 +76,23 @@ pub(super) const GPU_FEATURE_RESOURCE_BLOB: u64 = 1 << 3;
 /// when it is created, instead of every context being virgl's.
 pub(super) const GPU_FEATURE_CONTEXT_INIT: u64 = 1 << 4;
 
+/// `VIRTIO_GPU_SHM_ID_UNDEFINED`: no region (virtio 1.2 §5.7.4). Named
+/// so the id a driver must never ask for is written down beside the
+/// one it must: `0` is the spec's way of spelling "absent", not the
+/// aperture's address.
+pub(super) const SHM_ID_UNDEFINED: u8 = 0;
+
 /// The shared-memory region a device publishes its host-visible
-/// aperture as (virtio 1.2 §5.7.4).
-pub(super) const SHM_ID_HOST_VISIBLE: u8 = 0;
+/// aperture as: `VIRTIO_GPU_SHM_ID_HOST_VISIBLE` (virtio 1.2 §5.7.4).
+pub(super) const SHM_ID_HOST_VISIBLE: u8 = 1;
+
+// The two ids name different things, and the aperture is the second:
+// a value that could collapse them is exactly the mistake the
+// constants exist to keep from compiling into the driver.
+const _: () = assert!(
+    SHM_ID_HOST_VISIBLE != SHM_ID_UNDEFINED,
+    "the host-visible aperture id is not the undefined id"
+);
 
 /// Contexts one device holds at once.
 ///

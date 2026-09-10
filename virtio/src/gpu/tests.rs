@@ -32,7 +32,7 @@ use super::render::{
     CTRL_FLAG_FENCE, GPU_FEATURE_CONTEXT_INIT, GPU_FEATURE_RESOURCE_BLOB,
     GPU_FEATURE_RESOURCE_UUID, GPU_FEATURE_VIRGL, MAP_CACHE_CACHED, RESP_CAPSET_INFO_BYTES,
     RESP_ERR_INVALID_CONTEXT_ID, RESP_MAP_INFO_BYTES, RESP_OK_CAPSET, RESP_OK_CAPSET_INFO,
-    RESP_OK_MAP_INFO, SHM_ID_HOST_VISIBLE,
+    RESP_OK_MAP_INFO, SHM_ID_HOST_VISIBLE, SHM_ID_UNDEFINED,
 };
 use super::{
     CMD_GET_DISPLAY_INFO, CMD_MOVE_CURSOR, CMD_RESOURCE_ATTACH_BACKING, CMD_RESOURCE_CREATE_2D,
@@ -974,7 +974,12 @@ fn render_device(capsets: u32) -> VirtioGpuDevice<FakeTransport> {
     transport.set_config_u32(CONFIG_NUM_SCANOUTS, 1);
     transport.set_config_u32(CONFIG_NUM_CAPSETS, capsets);
     transport.set_shared_memory_region(
-        SHM_ID_HOST_VISIBLE,
+        // `VIRTIO_GPU_SHM_ID_HOST_VISIBLE` is the spec's literal 1
+        // (virtio 1.2 §5.7.4), spelled out rather than quoted from the
+        // driver's constant: a driver that asked for the wrong id is
+        // answered `None`, which is what makes the constant's value
+        // observable to a test at all.
+        1,
         PhysicalRange::new(APERTURE_BASE, APERTURE_BYTES),
     );
     VirtioGpuDevice::new(transport).expect("the rendering device should initialize")
@@ -1285,6 +1290,32 @@ fn a_blob_that_names_the_wrong_memory_is_refused_before_the_device_sees_it() {
 
     assert_eq!(refused.err(), Some(Gpu3dError::InvalidBlob));
     assert_eq!(device.transport.kick_count(), kicks);
+}
+
+/// The aperture lives under `VIRTIO_GPU_SHM_ID_HOST_VISIBLE` — the
+/// spec's id 1, not `VIRTIO_GPU_SHM_ID_UNDEFINED`'s 0 (virtio 1.2
+/// §5.7.4). Both values are pinned against literals because quoting the
+/// constants would be vouching for the driver's own numbers; the fake
+/// publishes the region under the literal id, so a driver asking for
+/// the wrong one would find nothing.
+#[test]
+fn the_host_visible_aperture_is_the_specification_s_region() {
+    assert_eq!(SHM_ID_UNDEFINED, 0, "the spec's 'no such region'");
+    assert_eq!(SHM_ID_HOST_VISIBLE, 1, "the spec's aperture id");
+
+    let device = render_device(1);
+    assert_eq!(
+        device.host_visible_aperture(),
+        Some(PhysicalRange::new(APERTURE_BASE, APERTURE_BYTES)),
+        "the driver asked the transport for the host-visible id"
+    );
+    assert!(
+        device
+            .transport
+            .shared_memory_region(SHM_ID_UNDEFINED)
+            .is_none(),
+        "nothing is published under the undefined id"
+    );
 }
 
 /// Mapping places the blob at an offset in the engine's aperture and
