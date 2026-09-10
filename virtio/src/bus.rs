@@ -4,6 +4,7 @@ use core::ptr::NonNull;
 
 use helios_hal::io::{IoError, IoResult};
 use helios_hal::iommu::DmaTranslation;
+use helios_hal::mmio;
 
 pub trait DeviceBus: Send + Sync + 'static {
     type DmaPool: DmaPool;
@@ -335,26 +336,26 @@ impl<P: DmaPool> DeviceBus for MmioBus<P> {
     type DmaPool = P;
 
     fn read_u8(&self, offset: usize) -> u8 {
-        unsafe { self.checked_byte_ptr(offset).read_volatile() }
+        unsafe { mmio::read_u8(self.checked_byte_ptr(offset)) }
     }
 
     fn read_u16(&self, offset: usize) -> u16 {
-        unsafe { self.checked_half_ptr(offset).read_volatile() }
+        unsafe { mmio::read_u16(self.checked_half_ptr(offset)) }
     }
 
     fn read_u32(&self, offset: usize) -> u32 {
-        unsafe { self.checked_ptr(offset).read_volatile() }
+        unsafe { mmio::read_u32(self.checked_ptr(offset)) }
     }
 
     fn write_u8(&self, offset: usize, value: u8) {
         unsafe {
-            self.checked_byte_ptr(offset).write_volatile(value);
+            mmio::write_u8(self.checked_byte_ptr(offset), value);
         }
     }
 
     fn write_u32(&self, offset: usize, value: u32) {
         unsafe {
-            self.checked_ptr(offset).write_volatile(value);
+            mmio::write_u32(self.checked_ptr(offset), value);
         }
     }
 
