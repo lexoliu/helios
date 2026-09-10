@@ -37,7 +37,7 @@ use helios_hal::vsock::{
 use crate::features::{NegotiatedFeatures, RING_FEATURES, negotiate};
 use crate::inflight::{InFlight, await_completion, submit_chain};
 use crate::notify::Notify;
-use crate::queue::VirtQueue;
+use crate::queue::{VirtQueue, negotiated_queue_size};
 use crate::transport::{DeviceStatus, DeviceType, VirtioTransport};
 
 const RX_QUEUE_INDEX: u16 = 0;
@@ -184,9 +184,9 @@ impl<T: VirtioTransport> VirtioVsockDevice<T> {
 
         let features = negotiate(&transport, RING_FEATURES | VSOCK_FEATURE_STREAM)?;
 
-        let rx_size = queue_size(&transport, RX_QUEUE_INDEX, DATA_QUEUE_SIZE)?;
-        let tx_size = queue_size(&transport, TX_QUEUE_INDEX, DATA_QUEUE_SIZE)?;
-        let event_size = queue_size(&transport, EVENT_QUEUE_INDEX, EVENT_QUEUE_SIZE)?;
+        let rx_size = negotiated_queue_size(&transport, RX_QUEUE_INDEX, DATA_QUEUE_SIZE)?;
+        let tx_size = negotiated_queue_size(&transport, TX_QUEUE_INDEX, DATA_QUEUE_SIZE)?;
+        let event_size = negotiated_queue_size(&transport, EVENT_QUEUE_INDEX, EVENT_QUEUE_SIZE)?;
 
         let mut rx_queue = VirtQueue::new(
             &transport,
@@ -375,14 +375,6 @@ impl<T: VirtioTransport> VirtioVsockDevice<T> {
         }
         Ok(reset)
     }
-}
-
-fn queue_size<T: VirtioTransport>(transport: &T, index: u16, wanted: u16) -> IoResult<u16> {
-    let size = transport.queue_max_size(index).min(wanted);
-    if size == 0 || !size.is_power_of_two() {
-        return Err(IoError::Unsupported);
-    }
-    Ok(size)
 }
 
 /// Reads the 64-bit `guest_cid` out of the device configuration space.

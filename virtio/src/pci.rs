@@ -25,6 +25,7 @@ use pci_types::{Bar, CommandRegister, ConfigRegionAccess, EndpointHeader, PciAdd
 use crate::balloon::VirtioBalloonDevice;
 use crate::block::{QueueAffinity, VirtioBlockDevice, VirtioBlockResource};
 use crate::bus::{DeviceBus, DmaPool};
+use crate::gpu::{VirtioGpuDevice, report_gpu_online};
 use crate::iommu::VirtioIommuDevice;
 use crate::net::VirtioNetDevice;
 use crate::p9::Virtio9pDevice;
@@ -849,6 +850,28 @@ where
 {
     let transport = VirtioPciTransport::new(access, address, mapper, dma, msix)?;
     VirtioBalloonDevice::new(transport)
+}
+
+/// Builds a virtio-gpu driver on top of a modern virtio-PCI function.
+///
+/// The display topology is read here, on the bring-up path, so that the
+/// line naming the device also names what it presents.
+pub fn gpu_from_pci<A, M, P>(
+    access: &A,
+    address: PciAddress,
+    mapper: &M,
+    dma: P,
+    msix: Option<MsixBinding>,
+) -> IoResult<VirtioGpuDevice<VirtioPciTransport<P>>>
+where
+    A: ConfigRegionAccess,
+    M: PciMmioMapper,
+    P: DmaPool,
+{
+    let transport = VirtioPciTransport::new(access, address, mapper, dma, msix)?;
+    let device = VirtioGpuDevice::new(transport)?;
+    report_gpu_online(&device, "pci")?;
+    Ok(device)
 }
 
 /// Builds a virtio-vsock driver on top of a modern virtio-PCI function.

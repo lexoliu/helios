@@ -51,6 +51,7 @@ pub(crate) const NETWORK_QUEUE_INTERRUPT_VECTORS: [u8; MAX_NETWORK_QUEUE_VECTORS
 pub(crate) const HOST_FS_INTERRUPT_VECTOR: u8 = 0x31;
 pub(crate) const ENTROPY_INTERRUPT_VECTOR: u8 = 0x32;
 pub(crate) const VSOCK_INTERRUPT_VECTOR: u8 = 0x37;
+pub(crate) const DISPLAY_INTERRUPT_VECTOR: u8 = 0x38;
 /// One vector per block device the routing table can hold: the platform
 /// exposes the boot image and the kernel's own disk as separate
 /// functions, and each of them delivers its completions on its own
@@ -70,6 +71,7 @@ pub(crate) type DeviceInterruptRoutes = helios_kernel::ExternalInterruptRoutes<
     crate::entropy::VirtioEntropyDevice,
     core::convert::Infallible,
     crate::vsock::VirtioVsockFunction,
+    crate::gpu::VirtioDisplayDevice,
     crate::block::VirtioBlockDevice,
 >;
 
@@ -99,6 +101,7 @@ unsafe extern "C" {
     fn helios_x86_interrupt_host_fs();
     fn helios_x86_interrupt_entropy();
     fn helios_x86_interrupt_vsock();
+    fn helios_x86_interrupt_display();
     fn helios_x86_interrupt_block_0();
     fn helios_x86_interrupt_block_1();
     fn helios_x86_interrupt_block_2();
@@ -184,6 +187,8 @@ impl ProcessorIdt {
                 .set_handler_addr(handler_address(helios_x86_interrupt_entropy));
             table[VSOCK_INTERRUPT_VECTOR]
                 .set_handler_addr(handler_address(helios_x86_interrupt_vsock));
+            table[DISPLAY_INTERRUPT_VECTOR]
+                .set_handler_addr(handler_address(helios_x86_interrupt_display));
             let block_stubs: [unsafe extern "C" fn(); helios_kernel::MAX_BLOCK_DEVICES] = [
                 helios_x86_interrupt_block_0,
                 helios_x86_interrupt_block_1,
@@ -444,7 +449,7 @@ extern "C" fn helios_x86_interrupt_dispatch(frame: &mut ExceptionFrame) {
             "unhandled x86 interrupt vector={:#x} rip={:#x}; device vectors are \
              network={NETWORK_INTERRUPT_VECTOR:#x} host-fs={HOST_FS_INTERRUPT_VECTOR:#x} \
              entropy={ENTROPY_INTERRUPT_VECTOR:#x} vsock={VSOCK_INTERRUPT_VECTOR:#x} \
-             block={BLOCK_INTERRUPT_VECTORS:#x?}",
+             display={DISPLAY_INTERRUPT_VECTOR:#x} block={BLOCK_INTERRUPT_VECTORS:#x?}",
             frame.vector, frame.rip
         ),
     }
@@ -465,6 +470,7 @@ fn is_device_interrupt(vector: u8) -> bool {
             | HOST_FS_INTERRUPT_VECTOR
             | ENTROPY_INTERRUPT_VECTOR
             | VSOCK_INTERRUPT_VECTOR
+            | DISPLAY_INTERRUPT_VECTOR
     ) || BLOCK_INTERRUPT_VECTORS.contains(&vector)
         || NETWORK_QUEUE_INTERRUPT_VECTORS.contains(&vector)
 }

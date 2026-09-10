@@ -544,6 +544,25 @@ impl<T: VirtioTransport> Ring<T> {
     }
 }
 
+/// The depth to program `index` at: the smaller of what the device
+/// offers and what the driver asked for.
+///
+/// A device that presents no queue at `index` reports a maximum of
+/// zero, and a maximum that is not a power of two contradicts the ring
+/// layout. Both are bring-up faults that name a device the driver
+/// cannot drive, rather than sizes to round into range.
+pub(crate) fn negotiated_queue_size<T: VirtioTransport>(
+    transport: &T,
+    index: u16,
+    wanted: u16,
+) -> IoResult<u16> {
+    let size = transport.queue_max_size(index).min(wanted);
+    if size == 0 || !size.is_power_of_two() {
+        return Err(IoError::Unsupported);
+    }
+    Ok(size)
+}
+
 /// A virtqueue in whichever layout the device and driver agreed on.
 pub struct VirtQueue<T: VirtioTransport> {
     index: u16,

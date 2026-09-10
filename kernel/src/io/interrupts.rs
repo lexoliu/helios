@@ -58,12 +58,14 @@ impl ExternalInterruptHandler for core::convert::Infallible {
 
 /// Maps claimed interrupt sources to the device handlers a backend
 /// registered at boot.
-pub struct ExternalInterruptRoutes<Source, Network, HostFs, Entropy, Balloon, Vsock, Block> {
+pub struct ExternalInterruptRoutes<Source, Network, HostFs, Entropy, Balloon, Vsock, Display, Block>
+{
     network: [Option<(Source, Network)>; MAX_NETWORK_INTERRUPTS],
     host_fs: Option<(Source, HostFs)>,
     entropy: Option<(Source, Entropy)>,
     balloon: Option<(Source, Balloon)>,
     vsock: Option<(Source, Vsock)>,
+    display: Option<(Source, Display)>,
     block: [Option<(Source, Block)>; MAX_BLOCK_DEVICES],
     /// Sources a user-mode driver owns. Concrete rather than generic:
     /// what a granted source reaches is the kernel's own relay, which
@@ -72,8 +74,8 @@ pub struct ExternalInterruptRoutes<Source, Network, HostFs, Entropy, Balloon, Vs
     device: [Option<(Source, DeviceInterruptRoute)>; MAX_DEVICE_INTERRUPTS],
 }
 
-impl<Source, Network, HostFs, Entropy, Balloon, Vsock, Block>
-    ExternalInterruptRoutes<Source, Network, HostFs, Entropy, Balloon, Vsock, Block>
+impl<Source, Network, HostFs, Entropy, Balloon, Vsock, Display, Block>
+    ExternalInterruptRoutes<Source, Network, HostFs, Entropy, Balloon, Vsock, Display, Block>
 where
     Source: PartialEq + Copy,
     Network: ExternalInterruptHandler,
@@ -81,6 +83,7 @@ where
     Entropy: ExternalInterruptHandler,
     Balloon: ExternalInterruptHandler,
     Vsock: ExternalInterruptHandler,
+    Display: ExternalInterruptHandler,
     Block: ExternalInterruptHandler,
 {
     pub const fn new() -> Self {
@@ -90,6 +93,7 @@ where
             entropy: None,
             balloon: None,
             vsock: None,
+            display: None,
             block: [const { None }; MAX_BLOCK_DEVICES],
             device: [const { None }; MAX_DEVICE_INTERRUPTS],
         }
@@ -144,6 +148,14 @@ where
         self.vsock = Some((source, handler));
     }
 
+    pub fn set_display(&mut self, source: Source, handler: Display) {
+        assert!(
+            self.display.is_none(),
+            "display interrupt route was installed more than once"
+        );
+        self.display = Some((source, handler));
+    }
+
     /// Registers one more block device.
     ///
     /// Unlike the single-device slots this one takes several handlers:
@@ -191,6 +203,7 @@ where
             || dispatch(&self.entropy, source)
             || dispatch(&self.balloon, source)
             || dispatch(&self.vsock, source)
+            || dispatch(&self.display, source)
         {
             return true;
         }
@@ -248,8 +261,8 @@ where
     }
 }
 
-impl<Source, Network, HostFs, Entropy, Balloon, Vsock, Block> Default
-    for ExternalInterruptRoutes<Source, Network, HostFs, Entropy, Balloon, Vsock, Block>
+impl<Source, Network, HostFs, Entropy, Balloon, Vsock, Display, Block> Default
+    for ExternalInterruptRoutes<Source, Network, HostFs, Entropy, Balloon, Vsock, Display, Block>
 where
     Source: PartialEq + Copy,
     Network: ExternalInterruptHandler,
@@ -257,6 +270,7 @@ where
     Entropy: ExternalInterruptHandler,
     Balloon: ExternalInterruptHandler,
     Vsock: ExternalInterruptHandler,
+    Display: ExternalInterruptHandler,
     Block: ExternalInterruptHandler,
 {
     fn default() -> Self {

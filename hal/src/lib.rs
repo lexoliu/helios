@@ -10,6 +10,7 @@ pub mod boot;
 pub mod cpu;
 pub mod critical_section;
 pub mod device;
+pub mod display;
 pub mod entropy;
 pub mod fs;
 pub mod interrupt;

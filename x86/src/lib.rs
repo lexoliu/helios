@@ -8,6 +8,7 @@ mod block;
 mod boot;
 mod entropy;
 mod exceptions;
+mod gpu;
 mod host_fs;
 mod iommu;
 mod net;
@@ -218,6 +219,7 @@ fn x86_kernel_main() -> ! {
     let entropy_function = entropy::discover(&pci);
     let balloon_function = balloon::discover(&pci);
     let vsock_function = vsock::discover(&pci);
+    let display_function = gpu::discover(&pci);
     let block_functions = block::discover(&pci);
     let mut devices = DeviceInventory::new().with_debug_serial();
     if network_function.is_some() {
@@ -293,6 +295,7 @@ fn x86_kernel_main() -> ! {
         entropy_function,
         balloon_function,
         vsock_function,
+        display_function,
         &block_functions,
         &debug_state,
         root_entropy,
@@ -344,6 +347,7 @@ fn install_pci_devices<WatchdogImpl>(
     entropy_function: Option<pci_types::PciAddress>,
     balloon_function: Option<pci_types::PciAddress>,
     vsock_function: Option<pci_types::PciAddress>,
+    display_function: Option<pci_types::PciAddress>,
     block_functions: &[pci_types::PciAddress],
     debug_state: &debug_state::RuntimeState,
     root_entropy: helios_kernel::RootEntropyHandle,
@@ -449,6 +453,19 @@ fn install_pci_devices<WatchdogImpl>(
         routes.set_vsock(exceptions::VSOCK_INTERRUPT_VECTOR, device);
     } else {
         tracing::warn!("virtio vsock device was not discovered on the PCI bus");
+    }
+    if let Some(address) = display_function {
+        let device = gpu::install(
+            kernel,
+            pci,
+            address,
+            dma_pool(address),
+            exceptions::DISPLAY_INTERRUPT_VECTOR,
+            destination_apic_id,
+        );
+        routes.set_display(exceptions::DISPLAY_INTERRUPT_VECTOR, device);
+    } else {
+        tracing::info!("no virtio-gpu function on the PCI bus; this machine has no display");
     }
     if let Some(address) = balloon_function {
         let handle = balloon::install(kernel, pci, address, physical_memory_offset);
