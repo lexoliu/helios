@@ -1764,6 +1764,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "helios-display-test"
+version = "0.1.0"
+dependencies = [
+ "helios-api",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "helios-hal"
 version = "0.1.0"
 dependencies = [
