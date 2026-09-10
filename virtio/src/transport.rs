@@ -47,6 +47,9 @@ pub enum DeviceType {
     /// virtio-gpu: the 2D display engine that owns the machine's
     /// scanouts and its hardware cursor plane.
     Gpu = 16,
+    /// virtio-input: a keyboard, a pointer, or a tablet, reporting
+    /// evdev events.
+    Input = 18,
     /// virtio-vsock: the host/guest socket transport the inspector RPC
     /// and the debugger ride on.
     Vsock = 19,
@@ -67,6 +70,7 @@ impl DeviceType {
             5 => Some(Self::MemoryBalloon),
             9 => Some(Self::_9P),
             16 => Some(Self::Gpu),
+            18 => Some(Self::Input),
             19 => Some(Self::Vsock),
             23 => Some(Self::Iommu),
             _ => None,
@@ -237,6 +241,15 @@ pub trait VirtioTransport: Send + Sync + 'static {
     /// transport alongside the read.
     fn write_config_u32(&self, offset: usize, value: u32);
 
+    /// Writes one 8-bit device configuration field.
+    ///
+    /// Not derived from the dword write: virtio-input's configuration
+    /// is a register file whose selector and sub-selector are single
+    /// bytes sitting immediately before the device-owned `size` field
+    /// (virtio 1.2 §5.8.5), so a dword write that covered them would
+    /// also write a field the driver does not own.
+    fn write_config_u8(&self, offset: usize, value: u8);
+
     fn read_config_u8(&self, offset: usize) -> u8 {
         let word_offset = offset & !0x3;
         let byte_index = offset & 0x3;
@@ -377,6 +390,10 @@ impl<B: DeviceBus> VirtioTransport for VirtioMmioTransport<B> {
 
     fn write_config_u32(&self, offset: usize, value: u32) {
         self.bus.write_u32(CONFIG_SPACE_OFFSET + offset, value);
+    }
+
+    fn write_config_u8(&self, offset: usize, value: u8) {
+        self.bus.write_u8(CONFIG_SPACE_OFFSET + offset, value);
     }
 
     fn read_config_u8(&self, offset: usize) -> u8 {

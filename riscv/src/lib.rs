@@ -8,6 +8,7 @@ mod device;
 mod entropy;
 mod gpu;
 mod host_fs;
+mod input;
 mod net;
 mod pci;
 mod rtc;
@@ -677,6 +678,9 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
     if !gpu::has_display_device(&fdt) {
         tracing::info!("no virtio-gpu node in the device tree; this machine has no display");
     }
+    if input::count_input_devices(&fdt) == 0 {
+        tracing::info!("no virtio-input node in the device tree; this machine has no input device");
+    }
     let kernel = helios_kernel::init_with_watchdog(
         helios_kernel::Platform::with_watchdog(
             console,
@@ -759,6 +763,9 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
             }
             if let Some(display) = gpu::install(&cpu, &kernel, &fdt, &debug_state) {
                 interrupts.attach_display(display);
+            }
+            for device in input::install(&kernel, &fdt) {
+                interrupts.attach_input(device);
             }
             for block in block::install(&cpu, &kernel, &fdt, &debug_state, root_entropy) {
                 interrupts.attach_block(block);

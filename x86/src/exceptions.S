@@ -120,6 +120,30 @@ helios_x86_interrupt_display:
     push 0x38
     jmp helios_x86_interrupt_common
 
+.global helios_x86_interrupt_input_0
+helios_x86_interrupt_input_0:
+    push 0
+    push 0x39
+    jmp helios_x86_interrupt_common
+
+.global helios_x86_interrupt_input_1
+helios_x86_interrupt_input_1:
+    push 0
+    push 0x3a
+    jmp helios_x86_interrupt_common
+
+.global helios_x86_interrupt_input_2
+helios_x86_interrupt_input_2:
+    push 0
+    push 0x3b
+    jmp helios_x86_interrupt_common
+
+.global helios_x86_interrupt_input_3
+helios_x86_interrupt_input_3:
+    push 0
+    push 0x3c
+    jmp helios_x86_interrupt_common
+
 .global helios_x86_interrupt_block_0
 helios_x86_interrupt_block_0:
     push 0

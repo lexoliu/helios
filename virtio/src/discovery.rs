@@ -7,6 +7,7 @@
 
 use fdt::Fdt;
 use fdt::node::FdtNode;
+use helios_hal::mmio;
 
 use crate::DeviceType;
 
@@ -249,7 +250,7 @@ fn reg_cells_to_usize(bytes: &[u8], name: &str) -> usize {
 }
 
 unsafe fn read_u32(address: usize) -> u32 {
-    unsafe { (address as *const u32).read_volatile() }
+    unsafe { mmio::read_u32(address as *const u32) }
 }
 
 #[cfg(test)]

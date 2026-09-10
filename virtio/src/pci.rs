@@ -19,6 +19,7 @@ use core::sync::atomic::{AtomicU16, Ordering};
 
 use helios_hal::fs::BlockDeviceRights;
 use helios_hal::io::{IoError, IoResult};
+use helios_hal::mmio;
 use pci_types::capability::PciCapability;
 use pci_types::{Bar, CommandRegister, ConfigRegionAccess, EndpointHeader, PciAddress, PciHeader};
 
@@ -223,27 +224,27 @@ impl BarWindow {
     }
 
     fn read_u8(&self, offset: usize) -> u8 {
-        unsafe { self.byte_ptr(offset, 1).read_volatile() }
+        unsafe { mmio::read_u8(self.byte_ptr(offset, 1)) }
     }
 
     fn read_u16(&self, offset: usize) -> u16 {
-        unsafe { self.byte_ptr(offset, 2).cast::<u16>().read_volatile() }
+        unsafe { mmio::read_u16(self.byte_ptr(offset, 2).cast::<u16>()) }
     }
 
     fn read_u32(&self, offset: usize) -> u32 {
-        unsafe { self.byte_ptr(offset, 4).cast::<u32>().read_volatile() }
+        unsafe { mmio::read_u32(self.byte_ptr(offset, 4).cast::<u32>()) }
     }
 
     fn write_u8(&self, offset: usize, value: u8) {
-        unsafe { self.byte_ptr(offset, 1).write_volatile(value) }
+        unsafe { mmio::write_u8(self.byte_ptr(offset, 1), value) }
     }
 
     fn write_u16(&self, offset: usize, value: u16) {
-        unsafe { self.byte_ptr(offset, 2).cast::<u16>().write_volatile(value) }
+        unsafe { mmio::write_u16(self.byte_ptr(offset, 2).cast::<u16>(), value) }
     }
 
     fn write_u32(&self, offset: usize, value: u32) {
-        unsafe { self.byte_ptr(offset, 4).cast::<u32>().write_volatile(value) }
+        unsafe { mmio::write_u32(self.byte_ptr(offset, 4).cast::<u32>(), value) }
     }
 
     /// Writes a 64-bit common-configuration field as the two 32-bit
@@ -285,6 +286,10 @@ impl<P: DmaPool> DeviceBus for VirtioPciBus<P> {
 
     fn read_u32(&self, offset: usize) -> u32 {
         self.config().read_u32(offset)
+    }
+
+    fn write_u8(&self, offset: usize, value: u8) {
+        self.config().write_u8(offset, value);
     }
 
     fn write_u32(&self, offset: usize, value: u32) {
@@ -638,6 +643,10 @@ impl<P: DmaPool> VirtioTransport for VirtioPciTransport<P> {
         self.bus.write_u32(offset, value);
     }
 
+    fn write_config_u8(&self, offset: usize, value: u8) {
+        self.bus.write_u8(offset, value);
+    }
+
     fn read_config_u8(&self, offset: usize) -> u8 {
         self.bus.read_u8(offset)
     }
@@ -871,6 +880,28 @@ where
     let transport = VirtioPciTransport::new(access, address, mapper, dma, msix)?;
     let device = VirtioGpuDevice::new(transport)?;
     report_gpu_online(&device, "pci")?;
+    Ok(device)
+}
+
+/// Builds a virtio-input driver on top of a modern virtio-PCI function.
+///
+/// The device is asked what it is here, on the bring-up path, so that
+/// the line naming it also names what it reports.
+pub fn input_from_pci<A, M, P>(
+    access: &A,
+    address: PciAddress,
+    mapper: &M,
+    dma: P,
+    msix: Option<MsixBinding>,
+) -> IoResult<crate::input::VirtioInputDevice<VirtioPciTransport<P>>>
+where
+    A: ConfigRegionAccess,
+    M: PciMmioMapper,
+    P: DmaPool,
+{
+    let transport = VirtioPciTransport::new(access, address, mapper, dma, msix)?;
+    let device = crate::input::VirtioInputDevice::new(transport)?;
+    crate::input::report_input_online(&device, "pci");
     Ok(device)
 }
 

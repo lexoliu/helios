@@ -162,6 +162,7 @@ mod entropy;
 mod gic;
 mod gpu;
 mod host_fs;
+mod input;
 mod net;
 mod platform;
 mod rtc;
@@ -194,6 +195,7 @@ pub(crate) type DeviceInterruptRoutes = helios_kernel::ExternalInterruptRoutes<
     balloon::VirtioBalloonInterrupt,
     vsock::VirtioVsockDevice,
     gpu::VirtioDisplayDevice,
+    input::VirtioInputDevice,
     block::VirtioBlockDevice,
 >;
 
@@ -590,6 +592,11 @@ extern "C" fn aarch64_kernel_main() -> ! {
     if !gpu::has_display_device(&platform) {
         tracing::info!("no virtio-gpu node on the platform bus; this machine has no display");
     }
+    if input::count_input_devices(&platform) == 0 {
+        tracing::info!(
+            "no virtio-input node on the platform bus; this machine has no input device"
+        );
+    }
     let block_device_count = block::count_block_devices(&platform);
     if block_device_count != 0 {
         devices = devices.with_block_devices(block_device_count);
@@ -735,6 +742,14 @@ extern "C" fn aarch64_kernel_main() -> ! {
             platform_state.bootstrap_mpidr(),
         );
         routes.set_display(display.interrupt, display.device);
+    }
+    for device in input::install(&kernel, &platform, physical_memory_offset, &handoff) {
+        gic.enable_device_interrupt(
+            device.interrupt,
+            device.trigger,
+            platform_state.bootstrap_mpidr(),
+        );
+        routes.add_input(device.interrupt, device.device);
     }
     for block in block::install(
         &cpu,
