@@ -5016,6 +5016,11 @@ mod tests {
             ResolvedVmSessionCommand::Screendump(ScreendumpCommand {
                 paths: vec![PathBuf::from("desktop.png")],
                 settle_seconds: 0,
+                run: None,
+                run_args: Vec::new(),
+                run_wait_seconds: 0,
+                input: None,
+                input_interval_ms: 0,
             })
             .qmp_action(),
             Some("screendump")
