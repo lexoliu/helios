@@ -29,7 +29,9 @@ use helios_hal::display::DisplayMode;
 use crate::device::DeviceWindow;
 
 use super::DisplayServiceError;
-use super::pins::{DisplayPins, PinnedFrame};
+use crate::pins::PinnedFrame;
+
+use super::DisplayPins;
 use super::service::{DisplayClaim, DisplayService};
 
 /// One instance's side of the display path.
@@ -107,6 +109,7 @@ impl DisplayOwnership {
             .as_mut()
             .ok_or(DisplayServiceError::NotClaimed)?
             .pin(bytes)
+            .map_err(DisplayServiceError::from)
     }
 
     /// Hand one frame buffer's pages back to this instance's pool.

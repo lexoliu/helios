@@ -59,7 +59,7 @@ pub use handle::{DmaBufferHandle, GrantHandle};
 pub use interrupt::{InterruptEvent, InterruptRelay, InterruptStats};
 pub use lease::{
     DEVICE_WINDOW_BYTES, DISPLAY_WINDOW_BYTES, DeviceWindow, DmaBuffer, GrantLease, GrantStats,
-    MAX_DMA_BUFFERS, MappedRegion, PublishedDevice,
+    MAX_DMA_BUFFERS, MappedRegion, PublishedDevice, SURFACE_WINDOW_BYTES,
 };
 pub use owner::{DeviceOwnership, LinearMemory};
 pub(crate) use platform::device_vm_hooks;

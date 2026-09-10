@@ -46,8 +46,8 @@ use concurrent_queue::ConcurrentQueue;
 use crate::component::{ProviderError, ProviderSender};
 use crate::exec::{Notify, NotifyWaiter};
 
+use super::DisplayPins;
 use super::DisplayServiceError;
-use super::pins::DisplayPins;
 
 /// Requests one claim may have in flight on each queue before its next
 /// one waits for room.

@@ -12,6 +12,7 @@ world init {
   import helios:system/serial@0.1.0;
   import helios:system/display@0.1.0;
   import helios:system/input@0.1.0;
+  import helios:system/surface@0.1.0;
   import wasi:http/types@0.3.0;
   import wasi:http/client@0.3.0;
 }
@@ -29,6 +30,7 @@ world debugger {
   import helios:system/instances@0.1.0;
   import helios:system/display@0.1.0;
   import helios:system/input@0.1.0;
+  import helios:system/surface@0.1.0;
   import wasi:http/types@0.3.0;
   import wasi:http/client@0.3.0;
 }
@@ -114,4 +116,42 @@ world display-host {
 /// bindings already provide.
 world input-host {
   import helios:system/input@0.1.0;
+}
+
+/// World implemented by the `compositor` kernel plugin: it owns the
+/// display and every input device, composes the desktop, and answers the
+/// surface calls the kernel forwards to it.
+///
+/// It must not import `helios:system/surface` — it *is* the compositor —
+/// except for `deliver`, which is how the input it routed reaches the
+/// client that owns the focused surface. There is no `wasi:cli/run`
+/// here: the supervisor spawns `compositor.run` as a task of the same
+/// store the surface calls are dispatched into, so composition and the
+/// calls into it are concurrent inside one instance.
+world compositor {
+  include wasi:cli/imports@0.3.0;
+  import helios:system/programs@0.1.0;
+  import helios:system/display@0.1.0;
+  import helios:system/input@0.1.0;
+  import helios:system/surface@0.1.0;
+  import helios:system/sync@0.1.0;
+  import helios:system/tracing@0.1.0;
+  export helios:system/compositor@0.1.0;
+}
+
+/// World the kernel generates its own `helios:system/surface` bindings
+/// from.
+///
+/// Separate from the program worlds for the same reason `display-host`
+/// is: it keeps the kernel's bindgen down to the one interface it serves
+/// here instead of regenerating every `wasi:cli` import the program
+/// bindings already provide.
+world surface-host {
+  import helios:system/surface@0.1.0;
+}
+
+/// World the kernel generates the compositor plugin's *export* bindings
+/// from, the way `http-host` carries `wasi:http/handler`.
+world compositor-host {
+  export helios:system/compositor@0.1.0;
 }

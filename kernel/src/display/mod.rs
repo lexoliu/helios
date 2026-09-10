@@ -11,9 +11,11 @@
 //! * [`service`] is how everything else reaches those tasks: a claim
 //!   word, two bounded queues, and the signal a claim's release travels
 //!   on. No trait object and no lock crosses that boundary.
-//! * [`pins`] is the claiming instance's side: the pinned, physically
-//!   contiguous pages its frame buffers live in, inside its own linear
-//!   memory, which are what the display engine is told to read.
+//! * [`crate::pins`] is the claiming instance's side: the pinned,
+//!   physically contiguous pages its frame buffers live in, inside its
+//!   own linear memory, which are what the display engine is told to
+//!   read. It is shared with the compositor-surface path, which pins the
+//!   same way.
 //!
 //! # Where the pixels are
 //!
@@ -28,7 +30,7 @@
 //! # Concurrency contract
 //!
 //! Stated per part: [`service`] for the claim word and the queues,
-//! [`owner`] for the tasks, [`pins`] for the arena. The one rule that
+//! [`owner`] for the tasks, [`crate::pins`] for the arena. The one rule that
 //! spans them is the release: a claim is let go by a drop, which cannot
 //! await anything, so the display is neither held nor free until the
 //! owner task has taken the resources back — and the pages themselves
@@ -37,7 +39,6 @@
 
 mod instance;
 mod owner;
-mod pins;
 mod service;
 #[cfg(test)]
 mod tests;
@@ -45,9 +46,13 @@ mod tests;
 use helios_hal::display::MAX_SCANOUTS;
 use thiserror::Error;
 
+use crate::pins::{MAX_PINNED_FRAMES, PinError, PinnedFrames};
+
+/// The arena one display claim pins its frame buffers in.
+pub type DisplayPins = PinnedFrames<MAX_PINNED_FRAMES>;
+
 pub use instance::DisplayOwnership;
 pub use owner::install_display_device;
-pub use pins::{DisplayPins, MAX_PINNED_FRAMES, PinnedFrame};
 pub(crate) use service::{ControlRequest, CursorRequest};
 pub use service::{
     DisplayClaim, DisplaySender, DisplayService, FrameToken, REQUEST_QUEUE_DEPTH, SequenceSignal,
@@ -101,6 +106,23 @@ pub enum DisplayServiceError {
     /// happens only when the machine is going down.
     #[error("the kernel's display owner stopped serving requests")]
     Closed,
+}
+
+impl From<PinError> for DisplayServiceError {
+    fn from(error: PinError) -> Self {
+        match error {
+            // A frame of no pixels is a mode the display engine does not
+            // drive, which is what the caller named.
+            PinError::Empty => Self::UnsupportedMode,
+            PinError::TooMany => Self::TooManySurfaces,
+            PinError::WindowExhausted => Self::WindowExhausted,
+            PinError::OutOfMemory => Self::OutOfMemory,
+            // A display claim never asks for a view of somebody else's
+            // run, so an address space refusing one here is a wiring
+            // fault rather than a shortage.
+            PinError::ShareRefused => Self::DeviceFault,
+        }
+    }
 }
 
 /// Outputs one claim may point at something at once.

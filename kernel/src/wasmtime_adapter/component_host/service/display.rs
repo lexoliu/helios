@@ -39,8 +39,9 @@ use wasmtime::component::{
 
 use crate::ComponentHostNetwork;
 use crate::display::{
-    ControlRequest, CursorRequest, DisplaySender, DisplayServiceError, PinnedFrame, SequenceSignal,
+    ControlRequest, CursorRequest, DisplaySender, DisplayServiceError, SequenceSignal,
 };
+use crate::pins::PinnedFrame;
 use crate::wasmtime_adapter::bindings::display::bindings::helios::system::display as display_wit;
 
 use super::super::StoreData;

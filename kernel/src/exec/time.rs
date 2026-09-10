@@ -256,6 +256,10 @@ mod tests {
             None
         }
 
+        fn surface_service(&self) -> crate::surface::SurfaceService {
+            crate::surface::SurfaceService::new()
+        }
+
         fn profiling_enabled(&self) -> bool {
             false
         }
