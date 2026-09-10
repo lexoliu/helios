@@ -8,6 +8,7 @@ default = ["channel", "fs", "http", "io", "net", "serial", "stats", "sync", "tas
 channel = ["dep:async-channel"]
 compositor = ["surface"]
 display = ["dep:thiserror"]
+gpu = ["dep:thiserror"]
 input = ["dep:helios-hal", "dep:thiserror"]
 fs = ["dep:futures-lite"]
 http = ["io", "dep:http", "dep:thiserror"]
