@@ -1189,6 +1189,7 @@ extern "C" fn aarch64_handle_sync_exception(
         0b100100 | 0b100101 => (KernelExceptionCause::DataFault, Some(far_el1)),
         0b111100 => (KernelExceptionCause::Breakpoint, None),
         0b001110 => (KernelExceptionCause::IllegalInstruction, None),
+    let mut stack_fault = helios_kernel::StackFault::Elsewhere;
         _ => (KernelExceptionCause::IllegalInstruction, None),
     };
 
@@ -1199,6 +1200,13 @@ extern "C" fn aarch64_handle_sync_exception(
         // that it was touched: set the bit and retry the instruction.
         if ACCESS_FLAG_FAULT_STATUS.contains(&(esr_el1 & 0x3f))
             && vmm::resolve_access_flag_fault(far_el1)
+        // A reserved page inside a live fiber stack is a demand commit
+        // the kernel resolves here, with no lock and no allocation; the
+        // guard page below one is a stack overflow and stays a fault.
+        stack_fault = helios_kernel::resolve_stack_fault(helios_hal::vmm::VirtAddr::new(far_el1));
+        if stack_fault == helios_kernel::StackFault::Committed {
+            return;
+        }
         {
             return;
         }
@@ -1227,7 +1235,8 @@ extern "C" fn aarch64_handle_sync_exception(
     });
 
     panic!(
-        "unhandled AArch64 synchronous exception ec={exception_class:#x} esr={esr_el1:#x} elr={elr_el1:#x} far={far_el1:#x}"
+        "unhandled AArch64 synchronous exception ec={exception_class:#x} esr={esr_el1:#x} \
+         elr={elr_el1:#x} far={far_el1:#x}{stack_fault}"
     )
 }
 

@@ -46,9 +46,10 @@ use helios_kernel::runtime_memory::{
     default_memory_image_map_at, default_memory_image_new, default_page_size,
 };
 use helios_kernel::{
-    MemoryOwner, ReservationLookup, ReservationTracker, SwapEntry, SwapVmHooks, VaCursor,
-    allocate_user_frame_uninit_on, allocate_user_run_zeroed_on, current_user_memory_owner,
-    deallocate_user_frame_on, deallocate_user_run_on, validate_range,
+    FiberStackVmHooks, MemoryOwner, ReservationLookup, ReservationTracker, SwapEntry, SwapVmHooks,
+    VaCursor, allocate_user_frame_uninit_on, allocate_user_run_zeroed_on,
+    current_user_memory_owner, deallocate_user_frame_on, deallocate_user_run_on,
+    install_fiber_stack_hooks, validate_range,
 };
 use spin::{Mutex, Once};
 
@@ -435,6 +436,44 @@ impl Aarch64UserAddressSpace {
             asm!("dsb ishst", options(nostack, preserves_flags));
         }
         virt as *mut u64
+    }
+
+    /// Builds every table level above the leaf for `virt`, leaving the
+    /// leaf entry itself absent. The caller holds the reservation lock,
+    /// which is what makes `ensure_table`'s heap allocation safe here
+    /// and impossible in fault context.
+    fn ensure_leaf_table(&self, virt: usize) {
+        let l0 = self.root();
+        let l1 = self.ensure_table(l0, (virt >> 39) & 0x1ff);
+        let l2 = self.ensure_table(l1, (virt >> 30) & 0x1ff);
+        let _ = self.ensure_table(l2, (virt >> 21) & 0x1ff);
+    }
+
+    /// Unmaps every page of `virt` a demand commit mapped, leaving the
+    /// pages nothing ever faulted on alone.
+    fn unmap_demand_pages(&self, virt: VirtRange) {
+        let mut batch_entries = [0u64; TLB_DECOMMIT_BATCH_PAGES];
+        let mut batch_count = 0;
+        let mut batch_start = virt.start.raw();
+        for offset in (0..virt.byte_len).step_by(PAGE) {
+            let page = virt.start.raw() + offset;
+            let entry = match self.unmap_4k_no_flush(page) {
+                Ok(entry) => entry,
+                Err(_) => continue,
+            };
+            if batch_count == 0 {
+                batch_start = page;
+            }
+            batch_entries[batch_count] = entry;
+            batch_count += 1;
+            if batch_count == TLB_DECOMMIT_BATCH_PAGES {
+                self.flush_and_dealloc_entries(batch_start, &batch_entries[..batch_count]);
+                batch_count = 0;
+            }
+        }
+        if batch_count != 0 {
+            self.flush_and_dealloc_entries(batch_start, &batch_entries[..batch_count]);
+        }
     }
 
     fn map_4k_no_flush(
@@ -1127,6 +1166,82 @@ impl AddressSpace for Aarch64UserAddressSpace {
         self.unmap_device(virt)
     }
 
+    fn prepare_demand_commit(
+        &self,
+        virt: VirtRange,
+        flags: PageFlags,
+    ) -> Result<(), AddressSpaceError> {
+        validate_range(virt)?;
+        // Validated here rather than at the first fault: a fault-time
+        // commit has no way to report a bad flag combination.
+        let _ = page_flags_to_pte(flags)?;
+        let mut state = self.state.lock();
+        state.precheck_commit(virt)?;
+        for offset in (0..virt.byte_len).step_by(PAGE) {
+            self.ensure_leaf_table(virt.start.raw() + offset);
+        }
+        // `MemoryOwner::NONE` on purpose, and it is load-bearing on this
+        // backend: the swap policy's aging pass walks an owner's
+        // committed regions, and a demand-commit region's pages are not
+        // resident until something faults on them. Offering the policy a
+        // fiber stack would also let it take away the very stack a fault
+        // handler is standing on.
+        self.orphan(state.record_commit(virt, flags, MemoryOwner::NONE)?);
+        Ok(())
+    }
+
+    fn commit_demand_page(
+        &self,
+        addr: VirtAddr,
+        frame: NonNull<u8>,
+        flags: PageFlags,
+    ) -> Result<(), AddressSpaceError> {
+        if !addr.is_page_aligned() {
+            return Err(AddressSpaceError::Misaligned);
+        }
+        let pte_flags = page_flags_to_pte(flags)?;
+        let virt = addr.raw();
+        let entry_ptr = self
+            .leaf_ptr(virt)
+            .ok_or(AddressSpaceError::NotDemandCommit)?;
+        let phys = (frame.as_ptr() as usize)
+            .checked_sub(self.physical_memory_offset)
+            .ok_or(AddressSpaceError::Misaligned)?;
+        // SAFETY: the walk above ran through live tables, and the leaf
+        // it names belongs to a prepared demand-commit region, which
+        // only the fiber running on it ever faults on.
+        let entry = unsafe { entry_ptr.read_volatile() };
+        if entry & VALID != 0 {
+            return Err(AddressSpaceError::Overlap);
+        }
+        let descriptor = (phys as u64) | pte_flags | PAGE_DESCRIPTOR | AF | SH_INNER;
+        // SAFETY: as above; the store publishes a complete descriptor
+        // and the barrier orders it before any walk that can see it.
+        unsafe {
+            entry_ptr.write_volatile(descriptor);
+            asm!("dsb ishst", options(nostack, preserves_flags));
+            asm!("isb", options(nostack, preserves_flags));
+        }
+        // No TLB maintenance and no shootdown: the architecture does not
+        // let a TLB hold an invalid descriptor, so the page going from
+        // invalid to valid is one no processor can have cached, and the
+        // barriers above are the whole of the ordering it needs.
+        Ok(())
+    }
+
+    fn end_demand_commit(&self, virt: VirtRange) -> Result<(), AddressSpaceError> {
+        validate_range(virt)?;
+        let mut state = self.state.lock();
+        let swapped = state.record_decommit(virt)?;
+        debug_assert!(
+            swapped.is_empty(),
+            "a demand-commit region is never offered to the swap policy"
+        );
+        self.orphan(swapped);
+        self.unmap_demand_pages(virt);
+        Ok(())
+    }
+
     fn translate(&self, addr: VirtAddr) -> Translation {
         if addr.raw() < USER_VA_BASE || addr.raw() >= USER_VA_END {
             return Translation::Unmapped;
@@ -1273,6 +1388,7 @@ pub fn install_user_address_space(physical_memory_offset: usize) {
     USER_AS.call_once(|| Aarch64UserAddressSpace::new(physical_memory_offset));
     runtime_memory::install_hooks(&AARCH64_VMM_HOOKS);
     helios_kernel::install_swap_hooks(&AARCH64_SWAP_HOOKS);
+    install_fiber_stack_hooks(&AARCH64_FIBER_STACK_HOOKS);
 }
 
 /// The machine's one user address space.
@@ -1512,6 +1628,20 @@ pub static AARCH64_SWAP_HOOKS: SwapVmHooks = SwapVmHooks {
     scan_committed_pages: hook_scan_committed_pages,
     owned_resident_bytes: hook_owned_resident_bytes,
     drain_orphaned_swap_tokens: hook_drain_orphaned_swap_tokens,
+};
+
+/// The arena's address-space surface for this backend.
+///
+/// Separate from [`AARCH64_VMM_HOOKS`] because it is a different
+/// contract: that one answers the runtime's C mmap ABI, this one is the
+/// typed route the kernel's fiber-stack arena takes to the same address
+/// space, and one of its entries runs in page-fault context where the
+/// other's may not.
+static AARCH64_FIBER_STACK_HOOKS: FiberStackVmHooks = FiberStackVmHooks {
+    reserve: |bytes| user_as().reserve(bytes),
+    prepare_demand_commit: |virt, flags| user_as().prepare_demand_commit(virt, flags),
+    commit_demand_page: |addr, frame, flags| user_as().commit_demand_page(addr, frame, flags),
+    end_demand_commit: |virt| user_as().end_demand_commit(virt),
 };
 
 /// Resolves an access-flag fault raised by the swap policy's aging pass.
