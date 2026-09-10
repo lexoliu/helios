@@ -444,11 +444,17 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: bench-runtime-pgo
-          # The two profile-use kernels this job builds leave their
-          # uncovered-function lists under helios/target/ (#329).
-          path: |
-            bench-runtime/**/*.log
-            helios/target/**/helios.pgo-uncovered.txt
+          path: bench-runtime/**/*.log
+          if-no-files-found: warn
+      - name: Upload the uncovered-function lists
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          # The two profile-use kernels this job builds leave their lists
+          # beside their images under helios/target/ (#329); a green run's
+          # step-log `full list:` path has to resolve too.
+          name: bench-pgo-uncovered
+          path: helios/target/**/helios.pgo-uncovered.txt
           if-no-files-found: warn
       - name: Remove the tap network backend
         if: always() && steps.lane.outputs.net-backend == 'tap'
