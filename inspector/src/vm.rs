@@ -6,7 +6,7 @@ use std::os::unix::fs::symlink;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use askama::Template;
 use clap::{Args as ClapArgs, Subcommand, ValueEnum};
@@ -25,6 +25,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 
+use crate::serial::RpcClient;
 use crate::stats_tui::format_bytes;
 use crate::system::{self, SystemError};
 use crate::workload_bench::{
@@ -2852,7 +2853,7 @@ enum VsockSessionError {
 /// `helios:system/stats` says how much of its user memory the balloon is
 /// holding and how much it has named as free.
 fn run_balloon(
-    mut client: crate::serial::RpcClient,
+    mut client: RpcClient,
     command: BalloonCommand,
     qmp_socket: &Path,
 ) -> Result<(), VmSessionError> {
@@ -2885,7 +2886,7 @@ fn run_balloon(
 /// produces an image — QEMU's blank scanout — and that is the evidence
 /// that the machine had a display at all.
 fn run_screendump(
-    client: crate::serial::RpcClient,
+    client: RpcClient,
     command: ScreendumpCommand,
     qmp_socket: &Path,
 ) -> Result<(), VmSessionError> {
@@ -2917,7 +2918,7 @@ fn run_screendump(
 /// asks something of the guest half-way through — a kill between two
 /// captures — has nowhere to ask from otherwise.
 fn alongside_guest_session<HostSide>(
-    client: crate::serial::RpcClient,
+    client: RpcClient,
     host_side: HostSide,
     requests: async_channel::Receiver<GuestRequest>,
 ) -> Result<(), VmSessionError>
@@ -2969,7 +2970,7 @@ enum GuestRequest {
 /// guest program does, and a request server that completed would end it
 /// early.
 async fn serve_guest_requests(
-    client: &crate::serial::RpcClient,
+    client: &RpcClient,
     requests: async_channel::Receiver<GuestRequest>,
 ) -> core::convert::Infallible {
     let serve = async {
@@ -3024,7 +3025,7 @@ struct GuestRun {
 /// Shared by `screendump --run` and `input --run`, which differ only in
 /// what the host does while the guest runs.
 fn alongside_guest_program<HostSide>(
-    client: crate::serial::RpcClient,
+    client: RpcClient,
     run: GuestRun,
     host_side: HostSide,
     requests: async_channel::Receiver<GuestRequest>,
@@ -3251,7 +3252,7 @@ fn wait_for_input_claims(
     wait: Duration,
     poll: Duration,
 ) -> Result<(), VmSessionError> {
-    let started = std::time::Instant::now();
+    let started = Instant::now();
     let deadline = started + wait;
     loop {
         let devices = input_devices(requests)?;
@@ -3276,7 +3277,7 @@ fn wait_for_input_claims(
             );
             return Ok(());
         }
-        if std::time::Instant::now() >= deadline {
+        if Instant::now() >= deadline {
             return Err(VmSessionError::InputClaimTimedOut {
                 seconds: wait.as_secs(),
                 devices: unclaimed.join(", "),
@@ -3310,7 +3311,7 @@ fn input_devices(
 /// with a typo in its last line is a script that would otherwise leave
 /// the guest half-driven, in a state no later step could account for.
 fn run_input(
-    client: crate::serial::RpcClient,
+    client: RpcClient,
     command: InputCommand,
     qmp_socket: &Path,
 ) -> Result<(), VmSessionError> {
@@ -3393,8 +3394,8 @@ fn send_input_script(
 /// inflate past its own pressure floor and reports the truth, so the
 /// wait ends when the guest stops moving and the caller sees where it
 /// stopped.
-fn settle_balloon(client: &mut crate::serial::RpcClient, target: u64, seconds: u64) {
-    let started = std::time::Instant::now();
+fn settle_balloon(client: &mut RpcClient, target: u64, seconds: u64) {
+    let started = Instant::now();
     let deadline = started + Duration::from_secs(seconds);
     let mut previous = None;
     let mut still_since = started;
@@ -3404,7 +3405,7 @@ fn settle_balloon(client: &mut crate::serial::RpcClient, target: u64, seconds: u
         // work. Not answering is not the same as having stopped, so it
         // does not end the wait or reset the stillness clock.
         let Some(sample) = guest_stats(client) else {
-            if std::time::Instant::now() >= deadline {
+            if Instant::now() >= deadline {
                 println!(
                     "{} guest stopped answering before the {seconds}s wait ran out",
                     style("settled").yellow()
@@ -3425,7 +3426,7 @@ fn settle_balloon(client: &mut crate::serial::RpcClient, target: u64, seconds: u
         }
         if actual != previous {
             previous = actual;
-            still_since = std::time::Instant::now();
+            still_since = Instant::now();
         } else if still_since.elapsed() >= BALLOON_STILL_FOR {
             println!(
                 "{} guest stopped at {} after {:.1}s",
@@ -3435,7 +3436,7 @@ fn settle_balloon(client: &mut crate::serial::RpcClient, target: u64, seconds: u
             );
             return;
         }
-        if std::time::Instant::now() >= deadline {
+        if Instant::now() >= deadline {
             println!(
                 "{} guest was still moving when the {seconds}s wait ran out",
                 style("settled").yellow()
@@ -3448,11 +3449,11 @@ fn settle_balloon(client: &mut crate::serial::RpcClient, target: u64, seconds: u
 
 /// Reads the guest's own view of its memory, or nothing when the guest
 /// is too busy to answer right now.
-fn guest_stats(client: &mut crate::serial::RpcClient) -> Option<stats::Sample> {
+fn guest_stats(client: &mut RpcClient) -> Option<stats::Sample> {
     crate::runtime::block_on(crate::system::fetch_stats(client)).ok()
 }
 
-fn report_balloon(qmp: &mut QmpClient, client: &mut crate::serial::RpcClient, label: &str) {
+fn report_balloon(qmp: &mut QmpClient, client: &mut RpcClient, label: &str) {
     let Some(sample) = guest_stats(client) else {
         println!(
             "{} {label}: the guest did not answer",
@@ -3484,7 +3485,7 @@ fn report_balloon(qmp: &mut QmpClient, client: &mut crate::serial::RpcClient, la
 }
 
 fn run_workload_bench(
-    mut client: crate::serial::RpcClient,
+    mut client: RpcClient,
     command: WorkloadBenchCommand,
     provenance: VmProvenance,
 ) -> Result<(), VmSessionError> {
@@ -3605,7 +3606,7 @@ async fn profiling_step<T>(
 /// call that brings us here is often a guest that stopped answering, and
 /// a diagnostic that hangs replaces the failure it was fetched to
 /// explain.
-async fn print_recent_guest_errors(client: &mut crate::serial::RpcClient, seconds: u32) {
+async fn print_recent_guest_errors(client: &mut RpcClient, seconds: u32) {
     let mut config = crate::system::TracingConfig::new();
     config.limit = 100;
     config.min_level = Some(helios_inspector_protocol::system::tracing::Level::Info);
@@ -3627,10 +3628,7 @@ async fn print_recent_guest_errors(client: &mut crate::serial::RpcClient, second
     }
 }
 
-fn run_aot_bench(
-    mut client: crate::serial::RpcClient,
-    command: AotBenchCommand,
-) -> Result<(), VmSessionError> {
+fn run_aot_bench(mut client: RpcClient, command: AotBenchCommand) -> Result<(), VmSessionError> {
     crate::run_interruptible(async move {
         let wasm = fs::read(&command.wasm).map_err(|source| AotBenchError::ReadWasm {
             path: command.wasm.display().to_string(),
@@ -3688,7 +3686,7 @@ fn run_aot_bench(
             .map_err(|source| AotBenchError::Report { source })?;
         }
         for iteration in 1..=command.iterations {
-            let started = std::time::Instant::now();
+            let started = Instant::now();
             let outcome = system_programs::aot(
                 &client,
                 &system_programs::AotRequest {
@@ -4666,7 +4664,7 @@ fn wait_for_socket(
     qemu_log: &Path,
     child: &mut Child,
 ) -> Result<(), VmRuntimeError> {
-    let started = std::time::Instant::now();
+    let started = Instant::now();
     while started.elapsed() < DEFAULT_SOCKET_WAIT {
         if socket_path.exists() {
             return Ok(());

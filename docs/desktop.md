@@ -206,7 +206,7 @@ takes the two things that would otherwise need a second boot:
 | `--run-wait-seconds <n>` | After the last capture, how long to wait for that program to finish so what it printed reaches this session's output. A program still running when the wait ends is left running. |
 | `--input <script>` | An input script, same grammar as the `input` action, run once the program has started and before the first capture. |
 | `--input-interval-ms <n>` | How long to wait between that script's statements. |
-| `--input-wait-seconds <n>` | How long the script waits for the guest to claim its input devices before the first statement. |
+| `--input-wait-seconds <n>` | How long the script waits for the guest to claim its input devices before the first statement; 30 by default. |
 
 `--input` — here and on the `input` action — never sends on a delay.
 Before the first statement the inspector asks the guest, through
