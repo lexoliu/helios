@@ -691,6 +691,47 @@ jobs:
             2>&1 > curl-smoke.out | tee "$runtime/inspector.log"
           cat curl-smoke.out
           grep -Fqx success curl-smoke.out
+      - name: Capture the desktop scanout
+        shell: bash
+        working-directory: helios
+        run: |
+          # Without this the step reports tee's status, not the
+          # command's, and a runner script that fails is invisible.
+          set -o pipefail
+          # The desktop devices on the PCI machine: a virtio-GPU that
+          # replaces q35's default VGA adapter, the keyboard and both
+          # pointers, and a virtio-sound device playing into the `wav`
+          # sink, which needs no host audio at all. The capture is taken
+          # with no host display backend — the whole point of reading the
+          # scanout through QMP is that a headless runner sees what a
+          # window would have shown (docs/desktop.md).
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/desktop"
+          captures="$GITHUB_WORKSPACE/desktop-scanout"
+          mkdir -p "$runtime" "$captures"
+          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+            --accel kvm \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --desktop --display none --audiodev "wav:$runtime/desktop.wav" \
+            --boot-program dash --boot-program debugger --no-compiler-plugin \
+            screendump --settle-seconds 2 "$captures/boot.png" "$captures/settled.png" \
+            2>&1 | tee "$runtime/inspector.log"
+          # A PPM under a .png name would be an artifact nothing opens,
+          # so the format QEMU was asked for is the format checked.
+          for capture in "$captures/boot.png" "$captures/settled.png"; do
+            test -s "$capture"
+            file "$capture" | grep -Fq 'PNG image data'
+          done
+      - name: Upload the desktop scanout captures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-x86-64-desktop
+          # The captures and nothing else. A kernel image carries the
+          # signing material the guest verifies its own artifacts with
+          # and never leaves the job.
+          path: desktop-scanout/*.png
+          if-no-files-found: warn
+          retention-days: 7
       # The host keeps its own copy of the debug serial, written by the
       # QEMU chardev before the inspector frames a byte of it. A stage
       # marker broken in that copy was lost inside QEMU's transmit
