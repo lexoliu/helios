@@ -206,6 +206,7 @@ fn x86_kernel_main() -> ! {
     let console = serial_console(debug_state.clone());
     let cpu = X86Cpu::new(boot.platform());
     vmm::install_user_address_space(physical_memory_offset, cpu.processor_count());
+    exceptions::verify_page_fault_returns();
     let pci = pci::PciRoot::new(physical_memory_offset);
     // The translation topology is read before any device is programmed:
     // whether a function is confined decides which addresses its driver
@@ -876,6 +877,7 @@ extern "C" fn secondary_start_rust(
     let runtime = unsafe { &*runtime };
     smp::activate_runtime(runtime);
     exceptions::install_for_current_processor();
+    exceptions::verify_page_fault_returns();
 
     let debug_state = boot.platform().debug_state();
     let console = serial_console(debug_state.clone());

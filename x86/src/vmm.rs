@@ -653,6 +653,36 @@ fn user_as() -> &'static X86UserAddressSpace {
         .expect("X86UserAddressSpace accessed before install_user_address_space")
 }
 
+/// One reserved, uncommitted user page for
+/// `exceptions::verify_page_fault_returns` to fault on.
+pub(crate) fn reserve_probe_page() -> VirtRange {
+    user_as()
+        .reserve(PAGE)
+        .unwrap_or_else(|error| panic!("x86 page-fault probe could not reserve a page: {error}"))
+}
+
+/// Commits the probe's page from the page-fault dispatcher. Nothing on
+/// this processor holds the address-space lock while the probe's read
+/// is in flight, so the ordinary locked commit is the right path.
+pub(crate) fn commit_probe_page(start: usize) {
+    let range = VirtRange::new(VirtAddr::new(start), PAGE);
+    user_as()
+        .commit(range, PageFlags::READ | PageFlags::WRITE)
+        .unwrap_or_else(|error| {
+            panic!("x86 page-fault probe could not commit {start:#x}: {error}")
+        });
+}
+
+/// Gives the probe's page back once the probe has read it.
+pub(crate) fn release_probe_page(range: VirtRange) {
+    user_as().release(range).unwrap_or_else(|error| {
+        panic!(
+            "x86 page-fault probe could not release {:#x}: {error}",
+            range.start.raw()
+        )
+    });
+}
+
 const ENOMEM: c_int = 12;
 const EINVAL: c_int = 22;
 

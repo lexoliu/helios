@@ -20,6 +20,7 @@ HELIOS_X86_EXCEPTION_NO_ERROR helios_x86_exception_breakpoint, 3
 HELIOS_X86_EXCEPTION_NO_ERROR helios_x86_exception_invalid_opcode, 6
 HELIOS_X86_EXCEPTION_NO_ERROR helios_x86_exception_x87_floating_point, 16
 HELIOS_X86_EXCEPTION_NO_ERROR helios_x86_exception_simd_floating_point, 19
+HELIOS_X86_EXCEPTION_WITH_ERROR helios_x86_exception_double_fault, 8
 HELIOS_X86_EXCEPTION_WITH_ERROR helios_x86_exception_general_protection, 13
 HELIOS_X86_EXCEPTION_WITH_ERROR helios_x86_exception_page_fault, 14
 
@@ -156,9 +157,37 @@ helios_x86_exception_common:
 
     mov rdi, rsp
     mov r12, rsp
+    // The dispatcher returns when the kernel resolved the fault in
+    // place, so the interrupted context's FP/SSE file has to survive it
+    // exactly as it survives an interrupt handler.
+    sub rsp, 512
     and rsp, -16
+    fxsave64 [rsp]
+    sub rsp, 16
+    mov dword ptr [rsp], 0x1f80
+    fninit
+    ldmxcsr [rsp]
     call helios_x86_exception_dispatch
-    ud2
+    add rsp, 16
+    fxrstor64 [rsp]
+    mov rsp, r12
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rbp
+    pop rbx
+    pop rdx
+    pop rcx
+    pop rax
+    add rsp, 16
+    iretq
 
 helios_x86_interrupt_common:
     push rax
