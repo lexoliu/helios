@@ -1089,12 +1089,34 @@ fn dispatch_kernel_exception(
     let Some(cause) = kernel_exception_cause(exception) else {
         return KernelExceptionDispatch::Unhandled;
     };
+    restore_sie_for_unwind(tf);
     helios_kernel::dispatch_native_trap(KernelException {
         cause,
         instruction_pointer: tf.sepc,
         frame_pointer: tf.general.s0,
         faulting_address: kernel_exception_faulting_address(exception, stval),
     })
+}
+
+/// Puts the interrupted context's supervisor interrupt enable back
+/// before an exception is handed to the runtime's trap handler.
+///
+/// The handler never returns for a trap it claims: it unwinds out of
+/// this handler onto the interrupted stack, so the `sret` that would
+/// have restored `SIE` from `SPIE` never runs and the trap entry's
+/// clearing of it would outlive the handler. Everything the unwind
+/// lands in — the store's teardown, its fiber stack's release, the TLB
+/// shootdown that release broadcasts — is the interrupted code's
+/// continuation and runs on that code's terms, so `SIE` is restored
+/// here, before the hand-over. The panic path for a trap the runtime
+/// declines runs with it restored too.
+fn restore_sie_for_unwind(tf: &TrapFrame) {
+    if tf.sstatus & SSTATUS_SPIE_BIT != 0 {
+        // SAFETY: the interrupted context ran with supervisor interrupts
+        // enabled, and what runs from here is that context's
+        // continuation.
+        unsafe { riscv::interrupt::supervisor::enable() };
+    }
 }
 
 fn kernel_exception_cause(exception: Exception) -> Option<KernelExceptionCause> {

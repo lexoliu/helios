@@ -424,6 +424,28 @@ pub(crate) struct ExceptionFrame {
     rflags: u64,
 }
 
+const RFLAGS_INTERRUPT_FLAG: u64 = 1 << 9;
+
+/// Puts the interrupted context's interrupt flag back before an
+/// exception is handed to the runtime's trap handler.
+///
+/// The handler never returns for a trap it claims: it unwinds out of
+/// this handler onto the interrupted stack, so the `iretq` that would
+/// have restored RFLAGS never runs and the flag the entry gate cleared
+/// would stay cleared. Everything the unwind lands in — the store's
+/// teardown, its fiber stack's release, the TLB shootdown that release
+/// broadcasts — is the interrupted code's continuation and runs on that
+/// code's terms, so the flag is restored here, before the hand-over.
+/// A processor that kept the gate's mask past this point could not
+/// acknowledge another processor's shootdown, which
+/// `smp::shootdown_tlb_range` refuses. The panic path for a trap the
+/// runtime declines runs with the flag restored too.
+fn restore_interrupt_flag_for_unwind(rflags: u64) {
+    if rflags & RFLAGS_INTERRUPT_FLAG != 0 {
+        x86_64::instructions::interrupts::enable();
+    }
+}
+
 /// The exception entry's dispatcher. Returning means the fault was
 /// resolved in place and the stub restores the interrupted context;
 /// everything unresolved diverges here, either into the runtime's trap
@@ -455,6 +477,7 @@ extern "C" fn helios_x86_exception_dispatch(frame: &mut ExceptionFrame) {
         );
     }
     if let Some(exception) = exception_from_frame(frame) {
+        restore_interrupt_flag_for_unwind(frame.rflags);
         match helios_kernel::dispatch_native_trap(exception) {
             KernelExceptionDispatch::Resolved => return,
             KernelExceptionDispatch::Unhandled => {

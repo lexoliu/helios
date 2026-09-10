@@ -91,6 +91,12 @@ pub fn install_native_trap_handler(handler: KernelNativeTrapHandler) {
 /// installed yet or when the runtime did not claim the exception; a
 /// claimed exception never returns here, because the handler unwinds
 /// out of the faulting stack.
+///
+/// A backend restores the interrupted context's interrupt mask before
+/// it calls this: the exception entry masked interrupts, a claimed
+/// trap never returns through the entry's epilogue, and what the
+/// handler unwinds into is the interrupted code's continuation, which
+/// must run on that code's terms.
 pub fn dispatch_native_trap(exception: KernelException) -> KernelExceptionDispatch {
     let raw_handler = NATIVE_TRAP_HANDLER.load(Ordering::Acquire);
     if raw_handler == 0 {

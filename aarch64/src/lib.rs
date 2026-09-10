@@ -1239,6 +1239,8 @@ extern "C" fn aarch64_handle_sync_exception(
     let (elr_el1, frame_pointer) = unsafe { ((*frame).elr as usize, (*frame).x[29] as usize) };
     // A claimed trap unwinds out of this stack and never comes back, so
     // reaching the panic below is the runtime declining the exception.
+    // SAFETY: the frame is intact; only its saved `spsr` is read.
+    restore_irq_mask_for_unwind(unsafe { (*frame).spsr });
     let _ = helios_kernel::dispatch_native_trap(KernelException {
         cause,
         instruction_pointer: elr_el1,
@@ -1314,6 +1316,8 @@ extern "C" fn swap_fault_trampoline(frame: *mut SyncTrapFrame, faulting_address:
         "page fault on a swapped-out page could not be resolved"
     );
     // As above: the handler returns only when it did not claim the fault.
+    // SAFETY: the frame is intact; only its saved `spsr` is read.
+    restore_irq_mask_for_unwind(unsafe { (*frame).spsr });
     let _ = helios_kernel::dispatch_native_trap(KernelException {
         cause: KernelExceptionCause::DataFault,
         instruction_pointer: elr_el1,
@@ -1365,6 +1369,28 @@ extern "C" fn aarch64_handle_irq() {
 /// keep the mask the boot path gave them: they are fatal here, and a
 /// critical section that unmasked them on exit would enable more than
 /// it disabled.
+const SPSR_IRQ_MASK: u64 = 1 << 7;
+
+/// Puts the interrupted context's IRQ mask back before an exception is
+/// handed to the runtime's trap handler.
+///
+/// The handler never returns for a trap it claims: it unwinds out of
+/// this handler onto the interrupted stack, so the `eret` that would
+/// have restored `PSTATE` from the saved `SPSR_EL1` never runs and the
+/// mask the exception entry set would stay set. Everything the unwind
+/// lands in — the store's teardown, its fiber stack's release, the TLB
+/// shootdown that release broadcasts — is the interrupted code's
+/// continuation and runs on that code's terms, so its mask is restored
+/// here, before the hand-over. The panic path for a trap the runtime
+/// declines runs with it restored too.
+fn restore_irq_mask_for_unwind(spsr: u64) {
+    if spsr & SPSR_IRQ_MASK == 0 {
+        // SAFETY: the interrupted context ran with IRQs unmasked, and
+        // what runs from here is that context's continuation.
+        unsafe { unmask_irq() };
+    }
+}
+
 fn mask_irq() {
     unsafe {
         asm!(
