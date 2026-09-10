@@ -43,6 +43,7 @@ pub(crate) struct ExternalInterrupts {
         crate::entropy::VirtioEntropyDevice,
         crate::balloon::VirtioBalloonInterrupt,
         crate::vsock::VirtioVsockDevice,
+        crate::gpu::VirtioDisplayDevice,
         crate::block::VirtioBlockDevice,
     >,
 }
@@ -110,6 +111,11 @@ impl ExternalInterrupts {
     pub(crate) fn attach_vsock(&mut self, interrupt: crate::vsock::VsockInterrupt) {
         self.enable_source(interrupt.source);
         self.routes.set_vsock(interrupt.source, interrupt.device);
+    }
+
+    pub(crate) fn attach_display(&mut self, interrupt: crate::gpu::DisplayInterrupt) {
+        self.enable_source(interrupt.source);
+        self.routes.set_display(interrupt.source, interrupt.device);
     }
 
     pub(crate) fn attach_entropy(&mut self, interrupt: crate::entropy::EntropyInterrupt) {

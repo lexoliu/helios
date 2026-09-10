@@ -113,6 +113,12 @@ helios_x86_interrupt_vsock:
     push 0x37
     jmp helios_x86_interrupt_common
 
+.global helios_x86_interrupt_display
+helios_x86_interrupt_display:
+    push 0
+    push 0x38
+    jmp helios_x86_interrupt_common
+
 .global helios_x86_interrupt_block_0
 helios_x86_interrupt_block_0:
     push 0
