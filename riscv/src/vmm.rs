@@ -79,8 +79,9 @@ use helios_kernel::runtime_memory::{
     default_memory_image_new, default_page_size,
 };
 use helios_kernel::{
-    MemoryOwner, ReservationLookup, ReservationTracker, VaCursor, allocate_user_frame_zeroed_on,
-    allocate_user_run_zeroed_on, deallocate_user_frame_on, deallocate_user_run_on, validate_range,
+    FiberStackVmHooks, MemoryOwner, ReservationLookup, ReservationTracker, VaCursor,
+    allocate_user_frame_zeroed_on, allocate_user_run_zeroed_on, deallocate_user_frame_on,
+    deallocate_user_run_on, install_fiber_stack_hooks, validate_range,
 };
 use spin::{Mutex, Once};
 
@@ -446,6 +447,46 @@ impl RiscvUserAddressSpace {
             table = entry_phys(entry) as *mut [u64; PTE_COUNT];
         }
         Some(unsafe { &raw mut (*table)[level_index(virt, 0)] })
+    }
+
+    /// Builds every table level above the leaf for `virt`, leaving the
+    /// leaf entry itself absent.
+    ///
+    /// The caller holds this address space's reservation lock, which is
+    /// what makes `ensure_intermediate`'s heap allocation safe here and
+    /// impossible in fault context.
+    fn ensure_leaf_table(&self, virt: usize) {
+        let mut table = unsafe { &mut *self.root_table() };
+        for level in (1..LEVELS).rev() {
+            table = Self::ensure_intermediate(table, level_index(virt, level));
+        }
+    }
+
+    /// Unmaps every page of `virt` a demand commit mapped, leaving the
+    /// pages nothing ever faulted on alone.
+    fn unmap_demand_pages(&self, virt: VirtRange) {
+        let mut batch_entries = [0u64; TLB_DECOMMIT_BATCH_PAGES];
+        let mut batch_count = 0;
+        let mut batch_start = virt.start.raw();
+        for offset in (0..virt.byte_len).step_by(PAGE_SIZE) {
+            let page = virt.start.raw() + offset;
+            let entry = match self.unmap_4k_no_flush(page) {
+                Ok(entry) => entry,
+                Err(_) => continue,
+            };
+            if batch_count == 0 {
+                batch_start = page;
+            }
+            batch_entries[batch_count] = entry;
+            batch_count += 1;
+            if batch_count == TLB_DECOMMIT_BATCH_PAGES {
+                self.flush_and_dealloc_entries(batch_start, &batch_entries[..batch_count]);
+                batch_count = 0;
+            }
+        }
+        if batch_count != 0 {
+            self.flush_and_dealloc_entries(batch_start, &batch_entries[..batch_count]);
+        }
     }
 
     fn map_4k_no_flush(
@@ -928,6 +969,86 @@ impl AddressSpace for RiscvUserAddressSpace {
         self.protect_locked(&mut state, virt, flags)
     }
 
+    fn prepare_demand_commit(
+        &self,
+        virt: VirtRange,
+        flags: PageFlags,
+    ) -> Result<(), AddressSpaceError> {
+        validate_range(virt)?;
+        // Validated here rather than at the first fault: a fault-time
+        // commit has no way to report a bad flag combination.
+        let _ = page_flags_to_pte(flags)?;
+        let mut state = self.state.lock();
+        state.precheck_commit(virt)?;
+        for offset in (0..virt.byte_len).step_by(PAGE_SIZE) {
+            self.ensure_leaf_table(virt.start.raw() + offset);
+        }
+        // `MemoryOwner::NONE` on purpose. Residency accounting and the
+        // swap aging pass both key on a real owner, and neither may see
+        // this region: its pages are not resident until something faults
+        // on them, and ageing one would offer the policy the very stack
+        // its fault handler is standing on.
+        let orphaned = state.record_commit(virt, flags, MemoryOwner::NONE)?;
+        debug_assert!(orphaned.is_empty());
+        Ok(())
+    }
+
+    fn commit_demand_page(
+        &self,
+        addr: VirtAddr,
+        frame: NonNull<u8>,
+        flags: PageFlags,
+    ) -> Result<(), AddressSpaceError> {
+        if !addr.is_page_aligned() {
+            return Err(AddressSpaceError::Misaligned);
+        }
+        let pte_flags = page_flags_to_pte(flags)?;
+        let virt = addr.raw();
+        let entry_ptr = self
+            .leaf_entry(virt)
+            .ok_or(AddressSpaceError::NotDemandCommit)?;
+        // SAFETY: the walk above ran through live tables, and the leaf
+        // it names belongs to a prepared demand-commit region, which
+        // only the fiber running on it ever faults on. This backend
+        // identity-maps physical memory, so the pool's pointer is the
+        // physical address.
+        let entry = unsafe { entry_ptr.read_volatile() };
+        if entry & PTE_VALID != 0 {
+            return Err(AddressSpaceError::Overlap);
+        }
+        let ppn = (frame.as_ptr() as u64) >> PAGE_SHIFT;
+        // SAFETY: as above; the store publishes a complete leaf.
+        unsafe {
+            entry_ptr.write_volatile(
+                (ppn << PTE_PPN_SHIFT) | pte_flags | PTE_VALID | PTE_ACCESSED | PTE_DIRTY,
+            );
+        }
+        // A local fence and no remote one: the entry went from invalid
+        // to valid, and RISC-V allows an implementation to have cached
+        // the invalid entry on the hart that walked it — which is this
+        // one, the one that just faulted. No other hart has looked at
+        // this page, because no other hart runs this fiber.
+        // SAFETY: `sfence.vma` with a virtual address operand is a
+        // supervisor-legal local fence.
+        unsafe {
+            core::arch::asm!(
+                "sfence.vma {addr}, zero",
+                addr = in(reg) virt,
+                options(nostack, preserves_flags),
+            );
+        }
+        Ok(())
+    }
+
+    fn end_demand_commit(&self, virt: VirtRange) -> Result<(), AddressSpaceError> {
+        validate_range(virt)?;
+        let mut state = self.state.lock();
+        let swapped = state.record_decommit(virt)?;
+        debug_assert!(swapped.is_empty());
+        self.unmap_demand_pages(virt);
+        Ok(())
+    }
+
     fn translate(&self, addr: VirtAddr) -> Translation {
         if addr.raw() < USER_VA_BASE || addr.raw() >= USER_VA_END {
             return Translation::Unmapped;
@@ -1050,7 +1171,22 @@ const _: () = {
 /// runtime engine is constructed.
 pub fn install_runtime_memory_hooks() {
     runtime_memory::install_hooks(&RISCV_VMM_HOOKS);
+    install_fiber_stack_hooks(&RISCV_FIBER_STACK_HOOKS);
 }
+
+/// The arena's address-space surface for this backend.
+///
+/// Separate from [`RISCV_VMM_HOOKS`] because it is a different contract:
+/// that one answers the runtime's C mmap ABI, this one is the typed
+/// route the kernel's fiber-stack arena takes to the same address space,
+/// and one of its entries runs in trap context where the other's may
+/// not.
+static RISCV_FIBER_STACK_HOOKS: FiberStackVmHooks = FiberStackVmHooks {
+    reserve: |bytes| user_as().reserve(bytes),
+    prepare_demand_commit: |virt, flags| user_as().prepare_demand_commit(virt, flags),
+    commit_demand_page: |addr, frame, flags| user_as().commit_demand_page(addr, frame, flags),
+    end_demand_commit: |virt| user_as().end_demand_commit(virt),
+};
 
 /// The machine's one user address space.
 pub(crate) fn user_address_space_or_panic() -> &'static RiscvUserAddressSpace {

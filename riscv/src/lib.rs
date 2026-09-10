@@ -1044,14 +1044,34 @@ unsafe fn configure_interrupts() {
     trap::verify_trap_preserves_fp_state();
 }
 
-fn handle_exception(exception: Exception, tf: &TrapFrame) -> ! {
+/// Handles one synchronous exception.
+///
+    // A reserved page inside a live fiber stack is a demand commit the
+    // kernel resolves here, with no lock and no allocation; the guard
+    // page below one is a stack overflow and stays a fault. This is the
+    // first fault this backend can resolve without unwinding, which is
+    // why the function above it returns at all.
+    let stack_fault = match kernel_exception_faulting_address(exception, stval) {
+        Some(addr) => helios_kernel::resolve_stack_fault(helios_hal::vmm::VirtAddr::new(addr)),
+        None => helios_kernel::StackFault::Elsewhere,
+    };
+    if stack_fault == helios_kernel::StackFault::Committed {
+        return;
+    }
+/// Returns only when the fault was resolved in place and the trap
+/// epilogue should restore the interrupted context and run the faulting
+/// instruction again. Every other path diverges: into the runtime's trap
+/// handler, which unwinds the guest and never comes back, or into a
+/// panic.
+fn handle_exception(exception: Exception, tf: &TrapFrame) {
     let stval = riscv::register::stval::read();
     match trap_origin(tf) {
         TrapOrigin::Kernel => {
             if dispatch_kernel_exception(exception, stval, tf) == KernelExceptionDispatch::Unhandled
             {
                 panic!(
-                    "kernel exception: {exception:?}, sepc={:#x}, stval={:#x}, tf={tf:#x?}",
+                    "kernel exception: {exception:?}, sepc={:#x}, stval={:#x}{stack_fault}, \
+                     tf={tf:#x?}",
                     tf.sepc, stval,
                 );
             }
