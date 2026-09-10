@@ -124,21 +124,23 @@ def read_mono(path: str) -> tuple[list[float], int]:
     if frames == 0:
         raise CheckFailed(f"{path} holds no frames at all")
 
-    typecode = {1: "b", 2: "h", 4: "i"}.get(width)
+    # Eight-bit WAV samples are unsigned — silence is the byte 128 —
+    # where every wider width is two's complement. Reading the first as
+    # signed folds everything above silence onto the floor.
+    typecode = {1: "B", 2: "h", 4: "i"}.get(width)
     if typecode is None:
         raise CheckFailed(
             f"{path} carries {width}-byte samples, which this check does not read"
         )
     samples = array.array(typecode, raw[: frames * channels * width])
-    if sys.byteorder == "big":
+    if sys.byteorder == "big" and width > 1:
         # WAV is little-endian; the check has to read it the same way
-        # wherever it runs.
+        # wherever it runs. A one-byte sample has no order to swap.
         samples.byteswap()
 
     full_scale = float(1 << (8 * width - 1))
     if width == 1:
-        # Eight-bit WAV samples are unsigned, with 128 as silence.
-        return ([(sample + 128) / 128.0 - 1.0 for sample in samples[::channels]], rate)
+        return ([sample / 128.0 - 1.0 for sample in samples[::channels]], rate)
     return ([sample / full_scale for sample in samples[::channels]], rate)
 
 
@@ -238,6 +240,16 @@ def check(path: str, expect_hz: float, expect_seconds: float) -> None:
     # device still held at the end is in the transform.
     middle = first + (last - first + 1 - WINDOW_FRAMES) // 2
     window = samples[middle : middle + WINDOW_FRAMES]
+
+    # The tone swings both ways around silence. A decode that mistook
+    # the samples' sign convention folds it onto one side — which is
+    # precisely what an unsigned eight-bit recording read as signed
+    # does — and no transform can tell the difference after that.
+    if min(window) >= -SILENCE_FLOOR or max(window) <= SILENCE_FLOOR:
+        raise CheckFailed(
+            "the tone never crosses silence, which is a decode artifact, "
+            "not the sine the guest generated"
+        )
 
     bin_hz = rate / WINDOW_FRAMES
     step = bin_hz / 2.0
