@@ -268,13 +268,7 @@ impl<const RUNS: usize> PinnedArena<RUNS> {
         Ok((offset, bytes, granule))
     }
 
-    fn record(
-        &mut self,
-        offset: u64,
-        bytes: u64,
-        first: PhysFrame,
-        kind: PinBacking,
-    ) -> PinnedRun {
+    fn record(&mut self, offset: u64, bytes: u64, first: PhysFrame, kind: PinBacking) -> PinnedRun {
         let run = PinnedRun {
             offset: self.window.offset() + offset,
             bytes,

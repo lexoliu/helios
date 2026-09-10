@@ -84,9 +84,8 @@ mod vsock;
 
 pub use service::{
     ChildExit, ChildHandle, ClientSurfaceHandle, DisplayHandle, InputDeviceHandle, PlaybackHandle,
-    SurfaceHandle,
-    UserProgramService, install_component_host_program_service, install_program_service,
-    run_component_host_processor_forever, run_embedded_component_forever,
+    SurfaceHandle, UserProgramService, install_component_host_program_service,
+    install_program_service, run_component_host_processor_forever, run_embedded_component_forever,
     run_program_workers_forever,
 };
 pub(crate) use service::{ProgramArgv, ProgramExecContext, ProgramSource};
