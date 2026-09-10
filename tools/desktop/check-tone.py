@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import array
 import math
+import pathlib
 import sys
 import wave
 
@@ -68,15 +69,58 @@ class CheckFailed(Exception):
     """A recording that is not the sound the guest said it played."""
 
 
+def read_unfinalized(path: str) -> tuple[int, int, int, bytes]:
+    """Channels, sample width, rate and samples of a half-written WAV.
+
+    QEMU patches a recording's RIFF and `data` lengths as it closes the
+    file, so a run that was killed leaves both at zero and the standard
+    library refuses the result. The samples are all there; only the two
+    lengths are missing, and the file's own size supplies them. Reading
+    it anyway is what lets this check run against the recording a
+    retained runtime directory kept from an interrupted session.
+    """
+    raw = pathlib.Path(path).read_bytes()
+    if len(raw) < 44 or raw[:4] != b"RIFF" or raw[8:12] != b"WAVE":
+        raise CheckFailed(f"{path} is not a WAV file at all")
+    offset = 12
+    fmt = None
+    while offset + 8 <= len(raw):
+        name = raw[offset : offset + 4]
+        size = int.from_bytes(raw[offset + 4 : offset + 8], "little")
+        body = offset + 8
+        if name == b"fmt " and size >= 16:
+            fmt = raw[body : body + 16]
+        elif name == b"data":
+            if fmt is None:
+                raise CheckFailed(f"{path} carries samples it never described")
+            channels = int.from_bytes(fmt[2:4], "little")
+            rate = int.from_bytes(fmt[4:8], "little")
+            width = int.from_bytes(fmt[14:16], "little") // 8
+            # Zero is the length QEMU never got round to writing; the
+            # rest of the file is the recording.
+            end = body + size if size else len(raw)
+            return channels, width, rate, raw[body:end]
+        if size == 0:
+            break
+        offset = body + size + (size & 1)
+    raise CheckFailed(f"{path} carries no samples")
+
+
 def read_mono(path: str) -> tuple[list[float], int]:
     """The first channel of `path`, as samples in -1.0..1.0, and its rate."""
-    with wave.open(path, "rb") as recording:
-        channels = recording.getnchannels()
-        width = recording.getsampwidth()
-        rate = recording.getframerate()
-        frames = recording.getnframes()
-        raw = recording.readframes(frames)
+    try:
+        with wave.open(path, "rb") as recording:
+            channels = recording.getnchannels()
+            width = recording.getsampwidth()
+            rate = recording.getframerate()
+            raw = recording.readframes(recording.getnframes())
+    except wave.Error:
+        channels, width, rate, raw = read_unfinalized(path)
+        print(f"check-tone: {path} was never closed; reading it by its length")
 
+    if channels < 1 or rate < 1:
+        raise CheckFailed(f"{path} describes {channels} channels at {rate} Hz")
+    frames = len(raw) // max(channels * width, 1)
     if frames == 0:
         raise CheckFailed(f"{path} holds no frames at all")
 
@@ -85,7 +129,7 @@ def read_mono(path: str) -> tuple[list[float], int]:
         raise CheckFailed(
             f"{path} carries {width}-byte samples, which this check does not read"
         )
-    samples = array.array(typecode, raw)
+    samples = array.array(typecode, raw[: frames * channels * width])
     if sys.byteorder == "big":
         # WAV is little-endian; the check has to read it the same way
         # wherever it runs.
