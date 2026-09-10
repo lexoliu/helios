@@ -111,6 +111,28 @@ impl ReportedFrames {
         })
     }
 
+    /// Clears the marks over `[start, start + len)` when the bitmap can
+    /// be taken without waiting, and reports whether it was.
+    ///
+    /// This is the page-fault path's form. That path zeroes the frame
+    /// unconditionally, so a mark it fails to clear costs one redundant
+    /// zeroing the next time the frame is handed out and nothing else —
+    /// whereas waiting for the lock would be waiting on whatever the
+    /// fault interrupted, which may be the context holding it.
+    pub(crate) fn try_clear_bytes(&self, start: usize, len: usize) -> bool {
+        if len == 0 {
+            return false;
+        }
+        let covered = start.div_ceil(PhysFrame::SIZE)..(start + len) / PhysFrame::SIZE;
+        self.bits
+            .try_with(|bits| {
+                for frame in covered {
+                    bits.clear(frame);
+                }
+            })
+            .is_some()
+    }
+
     /// How many frames are currently marked.
     pub(crate) fn count(&self) -> usize {
         self.bits.with(|bits| bits.count())

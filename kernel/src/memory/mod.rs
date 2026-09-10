@@ -4,6 +4,9 @@
 //! interrupt handler allocates, so the lock that guards an allocator
 //! has to mask interrupts while it is held.
 //! `pmm` exposes the kernel's physical-frame allocator wrapper.
+//! `fiber_stack` owns the arena the runtime's async stacks are committed
+//! out of one page-fault at a time, and `frame_reserve` holds the frames
+//! that fault path is allowed to allocate.
 //! `user` carries the per-program user-memory pool used by Wasmtime
 //! linear memories. `frame_slab` is the per-processor frame cache
 //! that backs both. `entropy` owns the boot-seeded root DRBG and the
@@ -16,7 +19,9 @@
 
 mod balloon;
 mod entropy;
+mod fiber_stack;
 mod frame_pool;
+mod frame_reserve;
 mod frame_slab;
 mod irq_safe;
 mod mapping_cost;
@@ -33,6 +38,15 @@ pub use entropy::{
     ENTROPY_RESEED_INTERVAL, EntropyPool, EntropySources, HardwareEntropySource,
     NoCryptographicEntropy, NoEntropyDevice, ROOT_ENTROPY_MATERIAL_BYTES, RootEntropy,
     RootEntropyHandle, install_entropy_device, seed_root_entropy,
+};
+pub use fiber_stack::{
+    FIBER_STACK_GUARD_BYTES, FiberStack, FiberStackArenaStats, FiberStackError, FiberStackVmHooks,
+    StackFault, claim_fiber_stack, fiber_stack_arena_stats, fiber_stack_demand_commits_on,
+    install_fiber_stack_arena, install_fiber_stack_hooks, resolve_stack_fault,
+};
+pub use frame_reserve::reserved_bytes as page_fault_frame_reserve_bytes;
+pub(crate) use frame_reserve::{
+    configure_processors as configure_frame_reserve_processors, top_up as top_up_frame_reserve,
 };
 pub(crate) use irq_safe::IrqSafeMutex;
 pub use mapping_cost::user_mapping_kernel_heap_bytes;

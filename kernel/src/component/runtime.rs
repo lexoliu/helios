@@ -124,11 +124,14 @@ pub const MAX_POOLED_USER_MEMORY: u64 = 128 << 20;
 ///   directories, signal state, stdio plumbing, the entropy pool. The
 ///   kernel owns the whole thing on its own heap.
 /// - The page tables and reservation records for the fiber stack the
-///   store runs on. The stack's pages come from the user pool, but the
-///   kernel heap pays to address them, and the pooling allocator keeps
-///   the whole [`COMPONENT_ASYNC_STACK_SIZE`] resident
-///   (`async_stack_keep_resident`), so the whole span is mapped for as
-///   long as the store lives.
+///   store runs on. The stack's pages come from the user pool and
+///   arrive one page-fault at a time, but the kernel heap pays to
+///   address the whole span the moment the stack is created: the
+///   arena's `prepare_demand_commit` builds every page-table level over
+///   [`COMPONENT_ASYNC_STACK_SIZE`] up front, because a fault-time
+///   commit cannot build one. So this term is the store's true
+///   kernel-heap cost rather than a stand-in for resident user pages,
+///   which are now only the pages the store actually touched.
 pub fn store_kernel_heap_bytes(store_bytes: usize) -> u64 {
     let bytes =
         store_bytes.saturating_add(user_mapping_kernel_heap_bytes(COMPONENT_ASYNC_STACK_SIZE));

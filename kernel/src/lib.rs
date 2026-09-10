@@ -123,22 +123,26 @@ pub use kernel_exception::{
 };
 pub use memory::{
     AccessibilityPlan, BalloonHandle, BalloonStats, BootMemoryPlan, BootRegionSplitter,
-    CommittedRegion, ENTROPY_RESEED_INTERVAL, EntropyPool, EntropySources,
-    FREE_PAGE_REPORT_INTERVAL, HardwareEntropySource, IDLE_SWAP_AFTER, KERNEL_HEAP_BOOTSTRAP_BYTES,
+    CommittedRegion, ENTROPY_RESEED_INTERVAL, EntropyPool, EntropySources, FIBER_STACK_GUARD_BYTES,
+    FREE_PAGE_REPORT_INTERVAL, FiberStack, FiberStackArenaStats, FiberStackError,
+    FiberStackVmHooks, HardwareEntropySource, IDLE_SWAP_AFTER, KERNEL_HEAP_BOOTSTRAP_BYTES,
     KERNEL_HEAP_GROWTH_CHUNK_BYTES, KERNEL_HEAP_MAX_BOOT_FRACTION, KERNEL_HEAP_MIN_RESERVE_BYTES,
     KERNEL_HEAP_RESERVE_FRACTION, KernelPhysFrameAllocator, MemoryOwner, NoCryptographicEntropy,
     NoEntropyDevice, ROOT_ENTROPY_MATERIAL_BYTES, RegionShares, ReleasedReservation,
     ReservationLookup, ReservationTracker, RootEntropy, RootEntropyHandle, SWAP_BATCH_BYTES,
-    SWAP_TICK, SwapDisabled, SwapEntry, SwapFaultError, SwapHandle, SwapStats, SwapVmHooks,
-    TASK_ARENA_FRACTION, TASK_ARENA_MIN_BYTES, USER_POOL_MIN_REGION_BYTES, UserHeapStats,
-    UserMemoryOwnerScope, UserMemoryOwners, UserMemoryPool, VaCursor,
+    SWAP_TICK, StackFault, SwapDisabled, SwapEntry, SwapFaultError, SwapHandle, SwapStats,
+    SwapVmHooks, TASK_ARENA_FRACTION, TASK_ARENA_MIN_BYTES, USER_POOL_MIN_REGION_BYTES,
+    UserHeapStats, UserMemoryOwnerScope, UserMemoryOwners, UserMemoryPool, VaCursor,
     allocate_user_frame_uninit_on, allocate_user_frame_zeroed, allocate_user_frame_zeroed_on,
-    allocate_user_run_zeroed_on, configure_user_memory_owner_processors, current_user_memory_owner,
-    deallocate_user_frame, deallocate_user_frame_on, deallocate_user_run_on, disable_swap,
-    enter_user_memory_owner, install_entropy_device, install_memory_balloon, install_swap,
-    install_swap_hooks, installed_swap_handle, installed_swap_hooks, kernel_reserve_for,
-    largest_servable_user_bytes, seed_root_entropy, set_user_memory_owner, swapped_token,
-    task_arena_bytes_for, user_heap_stats, user_mapping_kernel_heap_bytes, validate_range,
+    allocate_user_run_zeroed_on, claim_fiber_stack, configure_user_memory_owner_processors,
+    current_user_memory_owner, deallocate_user_frame, deallocate_user_frame_on,
+    deallocate_user_run_on, disable_swap, enter_user_memory_owner, fiber_stack_arena_stats,
+    fiber_stack_demand_commits_on, install_entropy_device, install_fiber_stack_arena,
+    install_fiber_stack_hooks, install_memory_balloon, install_swap, install_swap_hooks,
+    installed_swap_handle, installed_swap_hooks, kernel_reserve_for, largest_servable_user_bytes,
+    page_fault_frame_reserve_bytes, resolve_stack_fault, seed_root_entropy, set_user_memory_owner,
+    swapped_token, task_arena_bytes_for, user_heap_stats, user_mapping_kernel_heap_bytes,
+    validate_range,
 };
 pub use network::{
     HTTP_FORBIDDEN_FIELD_NAMES, HTTP_MAX_FIELD_SECTION_BYTES, HTTP_MAX_FIELD_VALUE_BYTES, HttpBody,
@@ -850,6 +854,13 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone> Kernel<CpuImpl, Watch
 
     pub fn run_until_stalled_with_stats(&self) -> KernelRunStats {
         let mut progress = 0;
+        // The page-fault path that commits a fiber stack page takes its
+        // frame from this processor's reserve and may not wait on the
+        // pool's lock to refill it, so the refill happens here instead:
+        // every executor loop on every processor comes through this
+        // call, outside fault context and holding nothing. It is one
+        // relaxed load when the reserve is full, which is nearly always.
+        memory::top_up_frame_reserve(current_processor());
         let mut stats = KernelRunStats::default();
 
         loop {
@@ -1186,6 +1197,10 @@ where
             // table with the pool it describes.
             memory::configure_user_memory_owner_processors(processor_count);
             pool
+            // And the frames the page-fault path is allowed to take,
+            // which come out of this same pool and are held per
+            // processor because a fault may not wait on its lock.
+            memory::configure_frame_reserve_processors(processor_count);
         });
         user_regions.push((user.start, user.end));
     }
