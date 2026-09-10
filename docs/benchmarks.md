@@ -382,6 +382,14 @@ that commit out as a git worktree under
 `target/perf-baselines/worktrees/<sha>/helios` and times its guest
 against the candidate's.
 
+The second image is built the way a release build of the lane is, which
+on x86-64 reads the fetched kernel profile (`docs/pgo.md`).
+`--baseline-kernel-build release` builds it without one instead: alone,
+that pairs this commit's profile-guided kernel against its plain one,
+the control of a PGO measurement; with `--baseline-ref`, that commit's
+plain kernel. The dispatch input `baseline_kernel_build` is the same
+switch in CI.
+
 The baseline checkout supplies a **guest**, never a harness. One harness
 times both images: the candidate's `tools/wasi-apps/workload-bench.sh`,
 its `helios-inspector` and its `helios-cli`. An image is selected with

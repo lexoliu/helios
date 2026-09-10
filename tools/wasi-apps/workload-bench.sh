@@ -55,6 +55,13 @@ if [[ -n "${HELIOS_WORKLOAD_BENCH_PROFILE_USE:-}" ]]; then
     command+=(--profile-use "${HELIOS_WORKLOAD_BENCH_PROFILE_USE}")
 fi
 
+# The plain control of a PGO measurement (docs/pgo.md, #322): the release
+# kernel built without the fetched profile, on the one target whose
+# release builds otherwise read it.
+if [[ -n "${HELIOS_WORKLOAD_BENCH_WITHOUT_KERNEL_PROFILE:-}" ]]; then
+    command+=(--without-kernel-profile)
+fi
+
 # The build depends on the architecture and the profile and on nothing
 # else, so it is issued before the boot's own flags are gathered: a
 # machine description this host cannot satisfy must not stop the compile

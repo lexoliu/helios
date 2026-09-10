@@ -42,6 +42,14 @@ on:
           timed beside this one on the same host (empty = no pairing)
         type: string
         default: ""
+      baseline_kernel_build:
+        description: >-
+          How the second image is built. `release` builds it without the
+          fetched kernel profile, the plain control of a PGO measurement:
+          alone, this commit's profile-guided kernel against its plain one
+        type: choice
+        options: [profile-use, release]
+        default: profile-use
       tcp_probe:
         description: Diagnose paired TCP reconnects with single-queue packet capture; not performance acceptance
         type: boolean
@@ -87,6 +95,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           REQUESTED_ADVISORY: ${{ inputs.advisory }}
           BASELINE_REF: ${{ inputs.baseline_ref }}
+          BASELINE_KERNEL_BUILD: ${{ inputs.baseline_kernel_build }}
         run: |
           if [ "$EVENT_NAME" = workflow_dispatch ]; then
             echo "advisory=$REQUESTED_ADVISORY" >> "$GITHUB_OUTPUT"
@@ -95,7 +104,8 @@ jobs:
           else
             echo "advisory=false" >> "$GITHUB_OUTPUT"
           fi
-          if [ "$EVENT_NAME" = workflow_dispatch ] && [ "$REQUESTED_ADVISORY" = true ] && [ -n "$BASELINE_REF" ]; then
+          if [ "$EVENT_NAME" = workflow_dispatch ] && [ "$REQUESTED_ADVISORY" = true ] \
+            && { [ -n "$BASELINE_REF" ] || [ "$BASELINE_KERNEL_BUILD" = release ]; }; then
             echo "paired_acceptance=true" >> "$GITHUB_OUTPUT"
           else
             echo "paired_acceptance=false" >> "$GITHUB_OUTPUT"
@@ -148,6 +158,7 @@ jobs:
         ${{ github.event_name == 'pull_request'
             && github.event.pull_request.base.sha
             || inputs.baseline_ref }}
+      BENCH_BASELINE_KERNEL_BUILD: ${{ inputs.baseline_kernel_build }}
     timeout-minutes: ${{ inputs.tcp_probe && 40 || 420 }}
     strategy:
       fail-fast: false
@@ -244,6 +255,9 @@ jobs:
           # because this job fetched the history.
           if [ -n "${BENCH_BASELINE_REF}" ]; then
             args+=(--baseline-ref "${BENCH_BASELINE_REF}")
+          fi
+          if [ "${BENCH_BASELINE_KERNEL_BUILD}" = release ]; then
+            args+=(--baseline-kernel-build release)
           fi
           if [ "${BENCH_PAIRED_ACCEPTANCE}" = true ]; then
             args+=(--sides "helios,helios_baseline")

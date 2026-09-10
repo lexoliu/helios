@@ -119,11 +119,24 @@ class RunOptions:
     # against the plain release build of this checkout: what varies
     # between the columns is the profile, not the source.
     profile_use: Path | None = None
+    # The baseline built without the fetched kernel profile: the plain
+    # control of a PGO measurement (docs/pgo.md, #322). Alone, it pairs
+    # this checkout's profile-guided release kernel against its plain one;
+    # with a baseline commit, that commit's plain kernel.
+    plain_baseline: bool = False
+
+    def __post_init__(self) -> None:
+        if self.plain_baseline and not self.reads_release_profile:
+            raise SystemExit(
+                f"--baseline-kernel-build {RELEASE_BUILD} is the control of a PGO measurement, "
+                f"and a release kernel of lane {self.lane.name} ({self.lane.helios_arch}) reads "
+                "no profile: its plain build is the only build (docs/pgo.md)"
+            )
 
     @property
     def paired(self) -> bool:
         """Whether this run times a second Helios image beside the first."""
-        return self.baseline is not None or self.profile_use is not None
+        return self.baseline is not None or self.profile_use is not None or self.plain_baseline
 
     @property
     def reads_release_profile(self) -> bool:
@@ -141,13 +154,17 @@ class RunOptions:
     def baseline_kernel_build(self) -> str | None:
         """The cargo profile the second image is built with, if there is one.
 
-        The baseline image is built the way a plain `--release` build of
-        this lane is, which on an architecture whose releases carry a
+        The baseline image is built the way a `--release` build of this
+        lane is, which on an architecture whose release builds read a
         profile is itself a `profile-use` build: what separates the two
         columns of a PGO pairing is then the profile, not the build kind.
+        The plain control (`--baseline-kernel-build release`) is the one
+        baseline built without a profile on such a lane.
         """
         if not self.paired:
             return None
+        if self.plain_baseline:
+            return RELEASE_BUILD
         return PROFILE_USE_BUILD if self.reads_release_profile else RELEASE_BUILD
 
 
@@ -336,7 +353,9 @@ def kernel_profiles(options: RunOptions) -> tuple[str | None, str | None]:
     """
     fetched = fetched_kernel_profile_label() if options.reads_release_profile else None
     candidate = profile_label(options.profile_use) if options.profile_use else fetched
-    return candidate, fetched if options.paired else None
+    if not options.paired or options.plain_baseline:
+        return candidate, None
+    return candidate, fetched
 
 
 def baseline_arguments(options: RunOptions, out_root: Path) -> list[str]:
@@ -351,6 +370,8 @@ def baseline_arguments(options: RunOptions, out_root: Path) -> list[str]:
         arguments.extend(["--helios-profile-use", str(options.profile_use)])
     if options.baseline is not None:
         arguments.extend(["--helios-baseline-root", str(options.baseline.worktree)])
+    if options.plain_baseline:
+        arguments.append("--helios-baseline-without-kernel-profile")
     if not arguments:
         return []
     return [*arguments, "--helios-baseline-out-dir", str(out_root / HELIOS_BASELINE_OUT)]

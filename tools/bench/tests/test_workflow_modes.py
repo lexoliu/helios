@@ -21,17 +21,20 @@ def jobs(workflow):
 
 
 @pytest.mark.parametrize(
-    ("event", "requested", "baseline", "advisory", "paired"),
+    ("event", "requested", "baseline", "build", "advisory", "paired"),
     [
-        ("workflow_dispatch", "true", "baseline", "true", "true"),
-        ("workflow_dispatch", "true", "", "true", "false"),
-        ("workflow_dispatch", "false", "baseline", "false", "false"),
-        ("workflow_dispatch", "false", "", "false", "false"),
-        ("pull_request", "", "", "true", "false"),
-        ("push", "", "", "false", "false"),
+        ("workflow_dispatch", "true", "baseline", "profile-use", "true", "true"),
+        ("workflow_dispatch", "true", "", "profile-use", "true", "false"),
+        # The plain control (#322) is a pairing of one commit against itself built plain.
+        ("workflow_dispatch", "true", "", "release", "true", "true"),
+        ("workflow_dispatch", "false", "baseline", "profile-use", "false", "false"),
+        ("workflow_dispatch", "false", "", "release", "false", "false"),
+        ("workflow_dispatch", "false", "", "profile-use", "false", "false"),
+        ("pull_request", "", "", "", "true", "false"),
+        ("push", "", "", "", "false", "false"),
     ],
 )
-def test_workflow_mode(jobs, tmp_path, event, requested, baseline, advisory, paired):
+def test_workflow_mode(jobs, tmp_path, event, requested, baseline, build, advisory, paired):
     mode = next(step for step in jobs["tooling"]["steps"] if step.get("id") == "mode")
     output = tmp_path / "outputs"
     subprocess.run(
@@ -42,6 +45,7 @@ def test_workflow_mode(jobs, tmp_path, event, requested, baseline, advisory, pai
             "EVENT_NAME": event,
             "REQUESTED_ADVISORY": requested,
             "BASELINE_REF": baseline,
+            "BASELINE_KERNEL_BUILD": build,
             "GITHUB_OUTPUT": str(output),
         },
     )
@@ -51,7 +55,13 @@ def test_workflow_mode(jobs, tmp_path, event, requested, baseline, advisory, pai
     }
 
 
-def run_arguments(script: str, tmp_path: Path, paired: str, baseline: str = "baseline") -> list[str]:
+def run_arguments(
+    script: str,
+    tmp_path: Path,
+    paired: str,
+    baseline: str = "baseline",
+    baseline_kernel_build: str = "profile-use",
+) -> list[str]:
     expressions = {
         "matrix.lane": "x86-64-kvm",
         "runner.name": "test-runner",
@@ -73,6 +83,7 @@ def run_arguments(script: str, tmp_path: Path, paired: str, baseline: str = "bas
             "BENCH_ADVISORY": "true",
             "BENCH_BASELINE_REF": baseline,
             "BENCH_PAIRED_ACCEPTANCE": paired,
+            "BENCH_BASELINE_KERNEL_BUILD": baseline_kernel_build,
         },
     )
     return result.stdout.splitlines()
@@ -91,6 +102,18 @@ def test_suite_preserves_workloads_and_pairing(jobs, tmp_path: Path, paired):
         assert arguments[arguments.index("--sides") + 1] == "helios,helios_baseline"
     else:
         assert "--sides" not in arguments
+
+
+@pytest.mark.parametrize(("build", "asked"), [("profile-use", False), ("release", True)])
+def test_suite_passes_the_plain_baseline_control_through(jobs, tmp_path: Path, build, asked):
+    """`baseline_kernel_build: release` reaches `helios-bench run` as the
+    PGO control (#322); the default asks for nothing."""
+    suite = next(step for step in jobs["suite"]["steps"] if step.get("name") == "Run the suite")
+    assert jobs["suite"]["env"]["BENCH_BASELINE_KERNEL_BUILD"] == "${{ inputs.baseline_kernel_build }}"
+    arguments = run_arguments(suite["run"], tmp_path, "true", baseline_kernel_build=build)
+    assert ("--baseline-kernel-build" in arguments) is asked
+    if asked:
+        assert arguments[arguments.index("--baseline-kernel-build") + 1] == "release"
 
 
 @pytest.mark.parametrize(("probe", "queues"), [("true", "1"), ("false", "8"), ("", "8")])

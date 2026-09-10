@@ -502,6 +502,11 @@ class HeliosImage:
     # `--profile-use` kernel in a target directory of its own, so the two
     # images of a PGO pairing share a checkout without sharing artifacts.
     profile_use: Path | None = None
+    # Built without the fetched kernel profile: the plain control of a
+    # PGO measurement on the target whose release builds read one
+    # (docs/pgo.md, #322). The inspector puts it in the `release`
+    # directory, beside the `profile-use` build it is measured against.
+    without_kernel_profile: bool = False
 
     def log(self, key: str | None = None) -> Path:
         return self.out_dir / ("helios.jsonl" if key is None else f"helios-{key}.jsonl")
@@ -594,6 +599,7 @@ def harness_environment(image: HeliosImage, paired: bool) -> dict[str, str]:
     # not: the caller's environment is inherited, and a leaked profile
     # would silently make a PGO pairing two PGO kernels.
     env["HELIOS_WORKLOAD_BENCH_PROFILE_USE"] = str(image.profile_use) if image.profile_use else ""
+    env["HELIOS_WORKLOAD_BENCH_WITHOUT_KERNEL_PROFILE"] = "1" if image.without_kernel_profile else ""
     return env
 
 
@@ -613,6 +619,8 @@ def guest_artifact(image: HeliosImage, arch: str, accel: str | None = None) -> P
         # The PGO kernel of a pairing is a different artifact in a
         # different directory, and this is what identifies it.
         argv.extend(["--profile-use", str(image.profile_use)])
+    if image.without_kernel_profile:
+        argv.append("--without-kernel-profile")
     if accel:
         # The lane's accelerator, for the same reason every boot names
         # it: a resolved command needs one, and rediscovering it here
@@ -2156,6 +2164,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--helios-baseline-without-kernel-profile",
+        action="store_true",
+        help=(
+            "Build the baseline image without the fetched kernel profile: the plain "
+            "control of a PGO measurement on a target whose release builds read one "
+            "(docs/pgo.md). Alone, it pairs this checkout's profile-guided release "
+            "kernel against its plain one."
+        ),
+    )
+    parser.add_argument(
         "--helios-baseline-out-dir",
         type=Path,
         default=None,
@@ -2220,10 +2238,14 @@ def main() -> None:
         args.helios_baseline_out_dir is not None
         and args.helios_baseline_root is None
         and args.helios_profile_use is None
+        and not args.helios_baseline_without_kernel_profile
     ):
         raise SystemExit(
-            "--helios-baseline-out-dir needs --helios-baseline-root or --helios-profile-use"
+            "--helios-baseline-out-dir needs --helios-baseline-root, --helios-profile-use or "
+            "--helios-baseline-without-kernel-profile"
         )
+    if args.helios_baseline_without_kernel_profile and args.skip_helios:
+        raise SystemExit("--helios-baseline-without-kernel-profile has nothing to build under --skip-helios")
     if args.helios_baseline_root is not None:
         if args.skip_helios:
             raise SystemExit("--helios-baseline-root has nothing to pair with under --skip-helios")
@@ -2320,11 +2342,17 @@ def main() -> None:
                 )
             ]
             # A pairing varies one thing: the commit the baseline is built
-            # from, or the profile the candidate is built against. The
-            # baseline is always the plain release build of whichever
-            # checkout it names, which is what the candidate is measured
-            # against in either case.
-            if args.helios_baseline_root is not None or args.helios_profile_use is not None:
+            # from, the profile the candidate is built against, or whether
+            # the baseline reads a profile at all. The baseline is the
+            # release build of whichever checkout it names, plain when
+            # the control is asked for, which is what the candidate is
+            # measured against in every case.
+            paired = (
+                args.helios_baseline_root is not None
+                or args.helios_profile_use is not None
+                or args.helios_baseline_without_kernel_profile
+            )
+            if paired:
                 baseline_out_dir = args.helios_baseline_out_dir or out_dir.parent / "helios-baseline"
                 if not baseline_out_dir.is_absolute():
                     baseline_out_dir = repo_root() / baseline_out_dir
@@ -2335,6 +2363,7 @@ def main() -> None:
                         name="helios-baseline",
                         workspace_root=args.helios_baseline_root or repo_root(),
                         out_dir=baseline_out_dir,
+                        without_kernel_profile=args.helios_baseline_without_kernel_profile,
                     )
                 )
             helios_jsonl = run_helios(
