@@ -28,6 +28,15 @@ pub const MAX_BLOCK_DEVICES: usize = 4;
 /// vectors the x86 backend hands out, and the configuration message.
 pub const MAX_NETWORK_INTERRUPTS: usize = 9;
 
+/// Input devices one platform may route interrupts for.
+///
+/// A desktop machine presents a keyboard, a relative pointer and an
+/// absolute tablet as three separate functions — the tablet is what
+/// carries a host cursor's position — so the bound is those plus one
+/// spare, which is what a machine with a second keyboard or a touch
+/// panel needs.
+pub const MAX_INPUT_DEVICES: usize = 4;
+
 /// Interrupt sources one platform may route to user-mode drivers.
 ///
 /// Granted devices are routed through the same table as the kernel's
@@ -58,14 +67,24 @@ impl ExternalInterruptHandler for core::convert::Infallible {
 
 /// Maps claimed interrupt sources to the device handlers a backend
 /// registered at boot.
-pub struct ExternalInterruptRoutes<Source, Network, HostFs, Entropy, Balloon, Vsock, Display, Block>
-{
+pub struct ExternalInterruptRoutes<
+    Source,
+    Network,
+    HostFs,
+    Entropy,
+    Balloon,
+    Vsock,
+    Display,
+    Input,
+    Block,
+> {
     network: [Option<(Source, Network)>; MAX_NETWORK_INTERRUPTS],
     host_fs: Option<(Source, HostFs)>,
     entropy: Option<(Source, Entropy)>,
     balloon: Option<(Source, Balloon)>,
     vsock: Option<(Source, Vsock)>,
     display: Option<(Source, Display)>,
+    input: [Option<(Source, Input)>; MAX_INPUT_DEVICES],
     block: [Option<(Source, Block)>; MAX_BLOCK_DEVICES],
     /// Sources a user-mode driver owns. Concrete rather than generic:
     /// what a granted source reaches is the kernel's own relay, which
@@ -74,8 +93,8 @@ pub struct ExternalInterruptRoutes<Source, Network, HostFs, Entropy, Balloon, Vs
     device: [Option<(Source, DeviceInterruptRoute)>; MAX_DEVICE_INTERRUPTS],
 }
 
-impl<Source, Network, HostFs, Entropy, Balloon, Vsock, Display, Block>
-    ExternalInterruptRoutes<Source, Network, HostFs, Entropy, Balloon, Vsock, Display, Block>
+impl<Source, Network, HostFs, Entropy, Balloon, Vsock, Display, Input, Block>
+    ExternalInterruptRoutes<Source, Network, HostFs, Entropy, Balloon, Vsock, Display, Input, Block>
 where
     Source: PartialEq + Copy,
     Network: ExternalInterruptHandler,
@@ -84,6 +103,7 @@ where
     Balloon: ExternalInterruptHandler,
     Vsock: ExternalInterruptHandler,
     Display: ExternalInterruptHandler,
+    Input: ExternalInterruptHandler,
     Block: ExternalInterruptHandler,
 {
     pub const fn new() -> Self {
@@ -94,6 +114,7 @@ where
             balloon: None,
             vsock: None,
             display: None,
+            input: [const { None }; MAX_INPUT_DEVICES],
             block: [const { None }; MAX_BLOCK_DEVICES],
             device: [const { None }; MAX_DEVICE_INTERRUPTS],
         }
@@ -156,6 +177,23 @@ where
         self.display = Some((source, handler));
     }
 
+    /// Registers one more input device.
+    ///
+    /// Like the block slots this one takes several handlers: a machine
+    /// presents each input function separately — the keyboard and the
+    /// tablet are different devices on the same bus — and every one of
+    /// them has to be reachable or its events are never drained.
+    pub fn add_input(&mut self, source: Source, handler: Input) {
+        let slot = self
+            .input
+            .iter_mut()
+            .find(|slot| slot.is_none())
+            .unwrap_or_else(|| {
+                panic!("more than {MAX_INPUT_DEVICES} input interrupt routes were installed")
+            });
+        *slot = Some((source, handler));
+    }
+
     /// Registers one more block device.
     ///
     /// Unlike the single-device slots this one takes several handlers:
@@ -205,6 +243,9 @@ where
             || dispatch(&self.vsock, source)
             || dispatch(&self.display, source)
         {
+            return true;
+        }
+        if self.input.iter().any(|slot| dispatch(slot, source)) {
             return true;
         }
         if self.block.iter().any(|slot| dispatch(slot, source)) {
@@ -261,8 +302,18 @@ where
     }
 }
 
-impl<Source, Network, HostFs, Entropy, Balloon, Vsock, Display, Block> Default
-    for ExternalInterruptRoutes<Source, Network, HostFs, Entropy, Balloon, Vsock, Display, Block>
+impl<Source, Network, HostFs, Entropy, Balloon, Vsock, Display, Input, Block> Default
+    for ExternalInterruptRoutes<
+        Source,
+        Network,
+        HostFs,
+        Entropy,
+        Balloon,
+        Vsock,
+        Display,
+        Input,
+        Block,
+    >
 where
     Source: PartialEq + Copy,
     Network: ExternalInterruptHandler,
@@ -271,6 +322,7 @@ where
     Balloon: ExternalInterruptHandler,
     Vsock: ExternalInterruptHandler,
     Display: ExternalInterruptHandler,
+    Input: ExternalInterruptHandler,
     Block: ExternalInterruptHandler,
 {
     fn default() -> Self {

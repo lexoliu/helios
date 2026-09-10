@@ -32,6 +32,14 @@ const MAGIC_VALUE: u32 = 0x7472_6976;
 const MODERN_VERSION: u32 = 2;
 const REGISTER_WORDS: usize = 128;
 
+/// Offsets in the select/sub-select configuration register file, as
+/// `struct virtio_input_config` lays it out.
+const CFG_SELECT: usize = 0;
+const CFG_SUBSEL: usize = 1;
+const CFG_SIZE: usize = 2;
+const CFG_PAYLOAD: usize = 8;
+const CFG_PAYLOAD_BYTES: usize = 128;
+
 /// A virtio-mmio register file backed by an array.
 pub(crate) struct MmioRegisterBus {
     registers: UnsafeCell<[u32; REGISTER_WORDS]>,
@@ -80,6 +88,13 @@ impl DeviceBus for MmioRegisterBus {
         self.register(offset)
     }
 
+    fn write_u8(&self, offset: usize, value: u8) {
+        let word = offset & !0x3;
+        let shift = (offset & 0x3) * 8;
+        let current = self.read_u32(word) & !(0xff_u32 << shift);
+        self.write_u32(word, current | (u32::from(value) << shift));
+    }
+
     fn write_u32(&self, offset: usize, value: u32) {
         unsafe {
             (*self.registers.get())[offset / 4] = value;
@@ -98,16 +113,17 @@ unsafe impl Sync for MmioRegisterBus {}
 /// DMA address is their virtual address, put through whatever platform
 /// translation the test gave the bus.
 pub(crate) struct HeapBus<P = IdentityDmaPool> {
-    /// Wide enough for the largest device configuration a driver in this
-    /// crate reads (virtio-blk's runs to offset 0x40).
-    config: UnsafeCell<[u32; 32]>,
+    /// Wide enough for the largest device configuration a driver in
+    /// this crate reads: virtio-input's select/sub-select register file
+    /// ends at offset 0x88, and virtio-blk's structure at 0x40.
+    config: UnsafeCell<[u32; 64]>,
     dma: P,
 }
 
 impl<P> HeapBus<P> {
     fn new(dma: P) -> Self {
         Self {
-            config: UnsafeCell::new([0; 32]),
+            config: UnsafeCell::new([0; 64]),
             dma,
         }
     }
@@ -121,6 +137,13 @@ impl<P: DmaPool> DeviceBus for HeapBus<P> {
 
     fn read_u32(&self, offset: usize) -> u32 {
         unsafe { (*self.config.get())[offset / 4] }
+    }
+
+    fn write_u8(&self, offset: usize, value: u8) {
+        let word = offset & !0x3;
+        let shift = (offset & 0x3) * 8;
+        let current = self.read_u32(word) & !(0xff_u32 << shift);
+        self.write_u32(word, current | (u32::from(value) << shift));
     }
 
     fn write_u32(&self, offset: usize, value: u32) {
@@ -220,6 +243,14 @@ pub(crate) struct FakeTransport<P = IdentityDmaPool> {
     /// sees exactly what a driver reading a field with the wrong width
     /// would see.
     config_len: AtomicUsize,
+    /// The blocks a select/sub-select configuration register file
+    /// answers with, keyed by the pair that selects them.
+    ///
+    /// virtio-input presents its whole self-description this way
+    /// (virtio 1.2 §5.8.5), so a fake that only held a flat byte array
+    /// could not present a device at all. Empty for every other device
+    /// class, which leaves the flat array untouched.
+    config_blocks: Mutex<Vec<(u8, u8, Vec<u8>)>>,
     log: Mutex<FakeTransportLog>,
 }
 
@@ -244,6 +275,7 @@ impl<P: DmaPool> FakeTransport<P> {
             supports_queue_reset: config.supports_queue_reset,
             absent_queues: config.absent_queues,
             config_len: AtomicUsize::new(usize::MAX),
+            config_blocks: Mutex::new(Vec::new()),
             log: Mutex::new(FakeTransportLog::default()),
         }
     }
@@ -309,6 +341,46 @@ impl<P: DmaPool> FakeTransport<P> {
         current &= !(0xffff_u32 << shift);
         current |= u32::from(value) << shift;
         self.bus.write_u32(word, current);
+    }
+
+    /// Presets what the configuration register file answers for one
+    /// `(select, subsel)` pair.
+    ///
+    /// A pair with no block answers a size of zero, which is how a real
+    /// device says it does not support the question.
+    pub(crate) fn set_config_block(&self, select: u8, subsel: u8, payload: &[u8]) {
+        self.config_blocks
+            .lock()
+            .push((select, subsel, payload.to_vec()));
+    }
+
+    /// Answers the currently selected pair, the way a device refills
+    /// its configuration structure when the driver writes the
+    /// selectors.
+    fn publish_selected_block(&self) {
+        let blocks = self.config_blocks.lock();
+        if blocks.is_empty() {
+            return;
+        }
+        let select = self.bus.read_u8(CFG_SELECT);
+        let subsel = self.bus.read_u8(CFG_SUBSEL);
+        let payload = blocks
+            .iter()
+            .find(|(block_select, block_subsel, _)| {
+                *block_select == select && *block_subsel == subsel
+            })
+            .map(|(_, _, payload)| payload.as_slice())
+            .unwrap_or(&[]);
+        self.bus.write_u8(
+            CFG_SIZE,
+            u8::try_from(payload.len()).expect("a configuration block fits its size field"),
+        );
+        for offset in 0..CFG_PAYLOAD_BYTES {
+            self.bus.write_u8(
+                CFG_PAYLOAD + offset,
+                payload.get(offset).copied().unwrap_or(0),
+            );
+        }
     }
 
     /// Presets one 8-bit device configuration field.
@@ -428,6 +500,13 @@ impl<P: DmaPool> VirtioTransport for FakeTransport<P> {
 
     fn write_config_u32(&self, offset: usize, value: u32) {
         self.bus.write_u32(offset, value);
+    }
+
+    fn write_config_u8(&self, offset: usize, value: u8) {
+        self.bus.write_u8(offset, value);
+        if offset == CFG_SELECT || offset == CFG_SUBSEL {
+            self.publish_selected_block();
+        }
     }
 }
 

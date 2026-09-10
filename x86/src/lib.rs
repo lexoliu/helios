@@ -10,6 +10,7 @@ mod entropy;
 mod exceptions;
 mod gpu;
 mod host_fs;
+mod input;
 mod iommu;
 mod net;
 mod pci;
@@ -219,6 +220,7 @@ fn x86_kernel_main() -> ! {
     let balloon_function = balloon::discover(&pci);
     let vsock_function = vsock::discover(&pci);
     let display_function = gpu::discover(&pci);
+    let input_functions = input::discover(&pci);
     let block_functions = block::discover(&pci);
     let mut devices = DeviceInventory::new().with_debug_serial();
     if network_function.is_some() {
@@ -295,6 +297,7 @@ fn x86_kernel_main() -> ! {
         balloon_function,
         vsock_function,
         display_function,
+        &input_functions,
         &block_functions,
         &debug_state,
         root_entropy,
@@ -348,6 +351,7 @@ fn install_pci_devices<WatchdogImpl>(
     balloon_function: Option<pci_types::PciAddress>,
     vsock_function: Option<pci_types::PciAddress>,
     display_function: Option<pci_types::PciAddress>,
+    input_functions: &[pci_types::PciAddress],
     block_functions: &[pci_types::PciAddress],
     debug_state: &debug_state::RuntimeState,
     root_entropy: helios_kernel::RootEntropyHandle,
@@ -470,6 +474,17 @@ fn install_pci_devices<WatchdogImpl>(
     if let Some(address) = balloon_function {
         let handle = balloon::install(kernel, pci, address, physical_memory_offset);
         debug_state.install_memory_balloon(handle);
+    }
+    if input_functions.is_empty() {
+        tracing::info!("no virtio-input function on the PCI bus; this machine has no input device");
+    }
+    let input_devices: alloc::vec::Vec<(pci_types::PciAddress, iommu::X86DmaPool)> =
+        input_functions
+            .iter()
+            .map(|address| (*address, dma_pool(*address)))
+            .collect();
+    for device in input::install(kernel, pci, &input_devices, destination_apic_id) {
+        routes.add_input(device.vector, device.device);
     }
     // The x86 address space reserves and commits lazily, so a page could
     // be taken away here — but the backend has not wired the other half:
