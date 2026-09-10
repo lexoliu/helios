@@ -110,6 +110,27 @@ def test_export_keeps_both_image_identities_without_copying_elfs(tmp_path, kerne
     assert all(not path.read_bytes().startswith(b"\x7fELF") for path in files)
 
 
+def test_export_finds_a_profile_use_release_kernel(tmp_path, kernel_elf):
+    """An x86-64 release build reads the fetched profile and lands in
+    `profile-use` (docs/pgo.md, #226); the symbols beside a bench run
+    have to come from the image that was booted."""
+    root = tmp_path / "checkout"
+    images = [
+        root / "target/x86_64-unknown-none/profile-use/helios",
+        root
+        / "target/perf-baselines/worktrees/baseline/helios/target/x86_64-unknown-none/profile-use/helios",
+    ]
+    for image in images:
+        image.parent.mkdir(parents=True)
+        image.write_bytes(kernel_elf)
+    written = export_kernel_symbols(root, tmp_path / "symbols")
+    assert len(written) == 2
+    snapshots = [json.loads(path.read_text()) for path in written]
+    assert {snapshot["image"] for snapshot in snapshots} == {
+        image.relative_to(root).as_posix() for image in images
+    }
+
+
 def test_missing_kernels_are_refused(tmp_path):
     with pytest.raises(SystemExit, match="no release kernel images"):
         export_kernel_symbols(tmp_path, tmp_path / "out")
