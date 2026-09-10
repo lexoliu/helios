@@ -3,7 +3,7 @@
 //! Each capability area lives behind a Cargo feature so programs only
 //! link the WIT interfaces they use: `fs`, `http`, `http-handler`, `io`,
 //! `net`, `programs`, `serial`, `stats`, `sync`, `task`, `tracing`,
-//! `profiling`, `instances`, `display`, `vsock`, and `channel`. `bindings` exposes the raw generated WIT
+//! `profiling`, `instances`, `display`, `input`, `vsock`, and `channel`. `bindings` exposes the raw generated WIT
 //! bindings for anything the typed helpers do not cover, and
 //! [`main`](macro@main) wraps a program's async entry point.
 
@@ -18,6 +18,8 @@ mod error;
 pub mod fs;
 #[cfg(feature = "http")]
 pub mod http;
+#[cfg(feature = "input")]
+pub mod input;
 #[cfg(feature = "instances")]
 pub mod instances;
 #[cfg(feature = "io")]
