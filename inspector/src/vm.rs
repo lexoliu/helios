@@ -31,11 +31,13 @@ use crate::{
     ConnectError, InterruptError, SessionCommand, SessionError, connect_client, run_connected,
 };
 
+mod input;
 mod network;
 mod qemu;
 mod qmp;
 mod raw_profile;
 
+use input::{InputScript, InputScriptError};
 use network::{
     HostPlatform, NetSetupCommand, NetTeardownCommand, QemuNetArgs, VmNetwork, VmNetworkArgs,
     VmNetworkError, VmNetworkFile, VmNetworkProfile, VmNetworkSetupError,
@@ -150,6 +152,8 @@ pub(crate) enum VmConfigError {
     IommuUnavailable { arch: &'static str },
     #[error("{0}")]
     Network(#[from] VmNetworkError),
+    #[error("{0}")]
+    AudioDev(#[from] AudioDevError),
     #[error("shared directory does not exist: {path}")]
     SharedDirMissing { path: String },
     #[error("aarch64-virt-hvf requires an aarch64 host; pass --accel tcg explicitly for TCG")]
@@ -366,10 +370,37 @@ pub(crate) enum VmSessionError {
         #[source]
         source: crate::vsock::VsockConnectError,
     },
-    #[error("the balloon command needs a QMP socket; pass --qmp unix:<path>,server=on,wait=off")]
-    BalloonNeedsQmp,
+    #[error("the {action} command needs a QMP socket; pass --qmp unix:<path>,server=on,wait=off")]
+    NeedsQmp { action: &'static str },
     #[error("{0}")]
     Qmp(#[from] QmpError),
+    #[error("{0}")]
+    InputScript(#[from] InputScriptError),
+    #[error("failed to prepare the screendump directory {path}: {source}")]
+    ScreendumpDirectory {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to resolve the screendump path {path}: {source}")]
+    ScreendumpPath {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to capture the guest scanout into {path}: {source}")]
+    Screendump {
+        path: String,
+        #[source]
+        source: QmpError,
+    },
+    #[error("failed to send statement {statement} of the input script {path}: {source}")]
+    SendInput {
+        path: String,
+        statement: usize,
+        #[source]
+        source: QmpError,
+    },
     #[error("{0}")]
     Size(#[from] SizeError),
     #[error("failed to set the balloon target to {target}: {source}")]
@@ -601,6 +632,40 @@ enum VmBalloonProfile {
     VirtioBalloonPci,
 }
 
+/// How a profile exposes the guest's display adapter.
+///
+/// Attached only when a session asks for the desktop devices: a guest
+/// that draws nothing has no use for a scanout, and every lane that does
+/// not ask for one boots the machine it booted before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VmDisplayProfile {
+    VirtioGpuMmio,
+    VirtioGpuPci,
+}
+
+/// How a profile exposes the guest's keyboard, tablet and mouse.
+///
+/// The three arrive together because they are one desktop's input: the
+/// tablet is what an absolute pointer event moves, the mouse is what a
+/// relative one moves, and a guest given only one of them would silently
+/// ignore half of an input script.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VmInputProfile {
+    VirtioInputMmio,
+    VirtioInputPci,
+}
+
+/// How a profile exposes the guest's sound device.
+///
+/// Attached only when a session names a host audio backend, because the
+/// device is created against one: QEMU refuses a virtio-sound device
+/// whose `audiodev` names nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VmSoundProfile {
+    VirtioSoundMmio,
+    VirtioSoundPci,
+}
+
 /// How a profile exposes the guest's vsock transport.
 ///
 /// Unlike the other devices this one is optional at run time as well as
@@ -727,6 +792,12 @@ struct VmProfile {
     /// behind, if any.
     iommu: Option<VmIommuProfile>,
     balloon: VmBalloonProfile,
+    /// How this profile would attach a display adapter, its input
+    /// devices and its sound device, when a session asks for the desktop
+    /// (`--desktop`) or names an audio backend (`--audiodev`).
+    display: VmDisplayProfile,
+    input: VmInputProfile,
+    sound: VmSoundProfile,
     /// How this profile would attach a vsock device, when a session asks
     /// for the vsock RPC transport.
     vsock: VmVsockProfile,
@@ -789,6 +860,9 @@ const AARCH64_VIRT_HVF_PROFILE: VmProfile = VmProfile {
     acpi_machine: Some(AARCH64_VIRT_ACPI_MACHINE),
     iommu: None,
     balloon: VmBalloonProfile::VirtioBalloonMmio,
+    display: VmDisplayProfile::VirtioGpuMmio,
+    input: VmInputProfile::VirtioInputMmio,
+    sound: VmSoundProfile::VirtioSoundMmio,
     vsock: VmVsockProfile::VhostVsockMmio,
     profile_generate_linker_script: Some("aarch64/profile-generate.ld"),
     release_kernel_profile: false,
@@ -820,6 +894,9 @@ const AARCH64_VIRT_TCG_PROFILE: VmProfile = VmProfile {
     acpi_machine: Some(AARCH64_VIRT_ACPI_MACHINE),
     iommu: None,
     balloon: VmBalloonProfile::VirtioBalloonMmio,
+    display: VmDisplayProfile::VirtioGpuMmio,
+    input: VmInputProfile::VirtioInputMmio,
+    sound: VmSoundProfile::VirtioSoundMmio,
     vsock: VmVsockProfile::VhostVsockMmio,
     profile_generate_linker_script: Some("aarch64/profile-generate.ld"),
     release_kernel_profile: false,
@@ -850,6 +927,9 @@ const RISCV64_VM_PROFILE: VmProfile = VmProfile {
     acpi_machine: None,
     iommu: None,
     balloon: VmBalloonProfile::VirtioBalloonMmio,
+    display: VmDisplayProfile::VirtioGpuMmio,
+    input: VmInputProfile::VirtioInputMmio,
+    sound: VmSoundProfile::VirtioSoundMmio,
     vsock: VmVsockProfile::VhostVsockMmio,
     profile_generate_linker_script: Some("riscv/profile-generate.x"),
     release_kernel_profile: false,
@@ -877,6 +957,9 @@ const X86_64_VM_PROFILE: VmProfile = VmProfile {
     acpi_machine: None,
     iommu: Some(VmIommuProfile::VirtioIommuPci),
     balloon: VmBalloonProfile::VirtioBalloonPci,
+    display: VmDisplayProfile::VirtioGpuPci,
+    input: VmInputProfile::VirtioInputPci,
+    sound: VmSoundProfile::VirtioSoundPci,
     vsock: VmVsockProfile::VhostVsockPci,
     profile_generate_linker_script: None,
     // The one architecture performance is measured on, and the one
@@ -968,6 +1051,116 @@ enum VmIommuProfile {
     VirtioIommuPci,
 }
 
+/// The host display backend QEMU opens for the session.
+///
+/// `none` is the default and what every existing lane boots: the
+/// machine still has whatever display device the session attached, and
+/// its scanout is read through QMP rather than shown. A backend this
+/// host's QEMU was not built with is refused by QEMU, naming itself;
+/// nothing here substitutes another one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum VmDisplayBackend {
+    #[default]
+    None,
+    Cocoa,
+    Gtk,
+    Sdl,
+}
+
+impl VmDisplayBackend {
+    /// The token QEMU's `-display` takes.
+    fn token(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Cocoa => "cocoa",
+            Self::Gtk => "gtk",
+            Self::Sdl => "sdl",
+        }
+    }
+}
+
+/// The host audio backend the guest's sound device plays into.
+///
+/// `none` attaches no sound device at all, which is what every lane that
+/// does not ask for audio boots. `wav` writes the guest's playback to a
+/// file and needs no host audio at all, so it is the sink a headless
+/// runner records with; anything else names a backend of the host's own
+/// and is QEMU's to refuse.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) enum VmAudioDev {
+    #[default]
+    None,
+    Wav {
+        path: PathBuf,
+    },
+    Host {
+        backend: String,
+    },
+}
+
+/// Why `--audiodev` does not name a backend QEMU could be handed.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum AudioDevError {
+    #[error("--audiodev wav needs the file to write: pass --audiodev wav:<path>")]
+    WavWithoutPath,
+    #[error(
+        "--audiodev {text:?} is not a backend name: QEMU names them in one word, like \
+         `coreaudio`, `pa` or `alsa`, and `wav:<path>` writes to a file"
+    )]
+    NotABackendName { text: String },
+}
+
+impl VmAudioDev {
+    /// The identifier the sound device names its backend by.
+    const ID: &'static str = "snd0";
+
+    fn parse(text: &str) -> Result<Self, AudioDevError> {
+        if text == "none" {
+            return Ok(Self::None);
+        }
+        if let Some(path) = text.strip_prefix("wav:") {
+            if path.is_empty() {
+                return Err(AudioDevError::WavWithoutPath);
+            }
+            return Ok(Self::Wav {
+                path: PathBuf::from(path),
+            });
+        }
+        // A backend whose name carries a comma or an equals sign would
+        // smuggle further options into the `-audiodev` list; QEMU's own
+        // names never do.
+        let named = !text.is_empty()
+            && text
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '-');
+        if !named {
+            return Err(AudioDevError::NotABackendName {
+                text: text.to_owned(),
+            });
+        }
+        Ok(Self::Host {
+            backend: text.to_owned(),
+        })
+    }
+
+    /// The `-audiodev` option list QEMU creates the backend from, or
+    /// `None` when the session asked for no sound at all.
+    fn options(&self) -> Option<QemuOptions> {
+        let mut options = match self {
+            Self::None => return None,
+            Self::Wav { path } => {
+                let mut options = QemuOptions::new("wav");
+                options.set("path", path.display());
+                options
+            }
+            Self::Host { backend } => QemuOptions::new(backend.clone()),
+        };
+        options.set("id", Self::ID);
+        Some(options)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub(crate) struct VmConfigFile {
     #[serde(default)]
@@ -1040,6 +1233,12 @@ pub(crate) struct VmConfigFile {
     pub(crate) virtio_packed: Option<bool>,
     #[serde(default)]
     pub(crate) virtio_in_order: Option<bool>,
+    #[serde(default)]
+    pub(crate) desktop: Option<bool>,
+    #[serde(default)]
+    pub(crate) display: Option<VmDisplayBackend>,
+    #[serde(default)]
+    pub(crate) audiodev: Option<String>,
     #[serde(default)]
     pub(crate) network: VmNetworkFile,
 }
@@ -1229,6 +1428,31 @@ pub(crate) struct VmCommand {
     #[arg(long, default_value_t = false)]
     virtio_in_order: bool,
 
+    /// Attach the desktop devices: a virtio-GPU and the keyboard,
+    /// tablet and mouse an input script drives.
+    ///
+    /// The scanout is read through QMP by the `screendump` action, so
+    /// this is worth asking for with `--display none` as well as with a
+    /// host window.
+    #[arg(long, default_value_t = false)]
+    desktop: bool,
+
+    /// Host display backend QEMU opens for the guest's scanout.
+    ///
+    /// The default is `none`: the machine keeps whatever display device
+    /// it was given and nothing is shown. A backend this host's QEMU was
+    /// not built with is refused by QEMU rather than swapped for
+    /// another.
+    #[arg(long, value_enum)]
+    display: Option<VmDisplayBackend>,
+
+    /// Host audio backend the guest's sound device plays into:
+    /// `none`, `wav:<path>`, or a backend of this host's own.
+    ///
+    /// Anything but `none` attaches a virtio-sound device to the guest.
+    #[arg(long, value_name = "BACKEND")]
+    audiodev: Option<String>,
+
     #[command(flatten)]
     network: VmNetworkArgs,
 
@@ -1246,6 +1470,10 @@ enum VmSessionCommand {
     WorkloadBench(WorkloadBenchCommand),
     /// Move the guest's memory balloon and watch the guest follow.
     Balloon(BalloonCommand),
+    /// Write the guest's current scanout to a PNG.
+    Screendump(ScreendumpCommand),
+    /// Drive the guest's keyboard and pointer from an input script.
+    Input(InputCommand),
     /// Build the guest image and the inspector, and stop there.
     ///
     /// The boots that follow reuse what this leaves in the target
@@ -1297,6 +1525,37 @@ pub(crate) struct BalloonCommand {
     /// How long to hold each target before moving to the next one.
     #[arg(long, default_value_t = 0)]
     hold_seconds: u64,
+}
+
+/// Captures the machine's scanout through QMP.
+///
+/// The capture is QEMU's own view of the display device's surface, so a
+/// headless session sees exactly what a host window would have shown and
+/// a lane can keep the image as evidence of what the guest drew.
+#[derive(Debug, Clone, ClapArgs)]
+pub(crate) struct ScreendumpCommand {
+    /// Where to write the PNG. Repeat to take several captures, one
+    /// after the other.
+    #[arg(required = true)]
+    paths: Vec<PathBuf>,
+
+    /// How long to let the guest draw before each capture.
+    #[arg(long, default_value_t = 0)]
+    settle_seconds: u64,
+}
+
+/// Runs an input script against the guest's keyboard and pointer.
+#[derive(Debug, Clone, ClapArgs)]
+pub(crate) struct InputCommand {
+    /// The script to run: one statement per line, `key <qcode>`,
+    /// `abs <x> <y>`, `rel <dx> <dy>` or `btn <left|right|middle>
+    /// <down|up>`, with `#` starting a comment.
+    script: PathBuf,
+
+    /// How long to wait between statements, so a guest that redraws
+    /// between them has the chance to.
+    #[arg(long, default_value_t = 0)]
+    interval_ms: u64,
 }
 
 #[derive(Debug, Clone, ClapArgs)]
@@ -1374,6 +1633,9 @@ struct ResolvedVmCommand {
     keep_runtime_dir: bool,
     acpi: bool,
     iommu: bool,
+    desktop: bool,
+    display: VmDisplayBackend,
+    audiodev: VmAudioDev,
     virtio_devices: VirtioDeviceProfile,
     rpc_transport: VmRpcTransport,
     vsock_cid: u32,
@@ -1392,7 +1654,28 @@ enum ResolvedVmSessionCommand {
     AotBench(AotBenchCommand),
     WorkloadBench(WorkloadBenchCommand),
     Balloon(BalloonCommand),
+    Screendump(ScreendumpCommand),
+    Input(InputCommand),
     Profile(ProfileCommand),
+}
+
+impl ResolvedVmSessionCommand {
+    /// Whether this action drives QEMU's machine protocol, and so needs
+    /// a QMP socket whether or not the runtime directory is kept.
+    ///
+    /// The name of the action travels with the answer because it is what
+    /// the refusal has to say when the socket is a hand-written endpoint
+    /// the inspector cannot talk to.
+    fn qmp_action(&self) -> Option<&'static str> {
+        match self {
+            Self::Balloon(_) => Some("balloon"),
+            Self::Screendump(_) => Some("screendump"),
+            Self::Input(_) => Some("input"),
+            Self::Session(_) | Self::AotBench(_) | Self::WorkloadBench(_) | Self::Profile(_) => {
+                None
+            }
+        }
+    }
 }
 
 pub(crate) fn run(mut command: VmCommand) -> Result<(), VmError> {
@@ -1707,6 +1990,12 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
             arch: arch_label(arch),
         });
     }
+    let desktop = command.desktop || file.desktop.unwrap_or(false);
+    let display = command.display.or(file.display).unwrap_or_default();
+    let audiodev = match command.audiodev.or(file.audiodev) {
+        Some(text) => VmAudioDev::parse(&text)?,
+        None => VmAudioDev::default(),
+    };
     let virtio_devices = VirtioDeviceProfile {
         ring: if command.virtio_packed || file.virtio_packed.unwrap_or(false) {
             VirtioRingLayout::Packed
@@ -1761,12 +2050,17 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
         keep_runtime_dir,
         acpi,
         iommu,
+        desktop,
+        display,
+        audiodev,
         virtio_devices,
         rpc_transport,
         vsock_cid,
         network,
         qemu_net,
-        needs_qmp: matches!(session_command, Some(ResolvedVmSessionCommand::Balloon(_))),
+        needs_qmp: session_command
+            .as_ref()
+            .is_some_and(|command| command.qmp_action().is_some()),
         command: session_command,
     })
 }
@@ -2217,8 +2511,18 @@ fn connect_and_run(
             },
         ),
         Some(ResolvedVmSessionCommand::Balloon(balloon)) => {
-            let socket = qmp_socket.ok_or(VmSessionError::BalloonNeedsQmp)?;
+            let socket = qmp_socket.ok_or(VmSessionError::NeedsQmp { action: "balloon" })?;
             run_balloon(client, balloon, &socket)
+        }
+        Some(ResolvedVmSessionCommand::Screendump(screendump)) => {
+            let socket = qmp_socket.ok_or(VmSessionError::NeedsQmp {
+                action: "screendump",
+            })?;
+            run_screendump(screendump, &socket)
+        }
+        Some(ResolvedVmSessionCommand::Input(input)) => {
+            let socket = qmp_socket.ok_or(VmSessionError::NeedsQmp { action: "input" })?;
+            run_input(input, &socket)
         }
         Some(ResolvedVmSessionCommand::Profile(profile)) => {
             crate::run_interruptible(async move { Ok(raw_profile::run(&client, &profile).await?) })
@@ -2278,6 +2582,72 @@ fn run_balloon(
             report_balloon(&mut qmp, &mut client, &format!("{target} after hold"));
         }
     }
+    Ok(())
+}
+
+/// Captures the guest's scanout into each file the caller named.
+///
+/// The guest is not asked anything: the capture is of the display
+/// device's surface as QEMU holds it, which is the whole point of taking
+/// it from the host. A session whose guest never drove the device still
+/// produces an image — QEMU's blank scanout — and that is the evidence
+/// that the machine had a display at all.
+fn run_screendump(command: ScreendumpCommand, qmp_socket: &Path) -> Result<(), VmSessionError> {
+    let mut qmp = QmpClient::connect(qmp_socket)?;
+    for path in &command.paths {
+        if command.settle_seconds != 0 {
+            std::thread::sleep(Duration::from_secs(command.settle_seconds));
+        }
+        // QEMU resolves a relative filename against its own working
+        // directory, which is the inspector's only by accident of how it
+        // was spawned; an absolute path names the same file either way.
+        let path = std::path::absolute(path).map_err(|source| VmSessionError::ScreendumpPath {
+            path: path.display().to_string(),
+            source,
+        })?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|source| VmSessionError::ScreendumpDirectory {
+                path: parent.display().to_string(),
+                source,
+            })?;
+        }
+        qmp.screendump(&path)
+            .map_err(|source| VmSessionError::Screendump {
+                path: path.display().to_string(),
+                source,
+            })?;
+        println!("{} {}", style("captured").green(), path.display());
+    }
+    Ok(())
+}
+
+/// Runs an input script against the guest's keyboard and pointer.
+///
+/// The whole script is parsed before the first event is sent: a script
+/// with a typo in its last line is a script that would otherwise leave
+/// the guest half-driven, in a state no later step could account for.
+fn run_input(command: InputCommand, qmp_socket: &Path) -> Result<(), VmSessionError> {
+    let script = InputScript::read(&command.script)?;
+    let mut qmp = QmpClient::connect(qmp_socket)?;
+    for (index, statement) in script.statements().iter().enumerate() {
+        for batch in statement.batches() {
+            qmp.input_send_event(&batch)
+                .map_err(|source| VmSessionError::SendInput {
+                    path: command.script.display().to_string(),
+                    statement: index + 1,
+                    source,
+                })?;
+        }
+        if command.interval_ms != 0 {
+            std::thread::sleep(Duration::from_millis(command.interval_ms));
+        }
+    }
+    println!(
+        "{} {} statement(s) from {}",
+        style("sent").green(),
+        script.statements().len(),
+        command.script.display()
+    );
     Ok(())
 }
 
@@ -3164,7 +3534,7 @@ impl VmRuntime {
             Some(qemu_net) => qemu_net.command(&command.qemu_bin),
             None => Command::new(&command.qemu_bin),
         };
-        qemu.arg("-display").arg("none");
+        qemu.arg("-display").arg(command.display.token());
         if let Some(monitor) = monitor_endpoint(command, socket_dir.path())? {
             qemu.arg("-monitor").arg(monitor);
         } else {
@@ -3314,6 +3684,16 @@ impl VmRuntime {
         }
         configure_entropy_device(&mut qemu, command.profile.entropy, command.virtio_devices);
         configure_balloon(&mut qemu, command.profile.balloon, command.virtio_devices);
+        if command.desktop {
+            configure_display(&mut qemu, command.profile.display, command.virtio_devices);
+            configure_input(&mut qemu, command.profile.input, command.virtio_devices);
+        }
+        configure_sound(
+            &mut qemu,
+            command.profile.sound,
+            &command.audiodev,
+            command.virtio_devices,
+        );
         if command.rpc_transport == VmRpcTransport::Vsock {
             configure_vsock_device(
                 &mut qemu,
@@ -3959,6 +4339,81 @@ fn configure_vsock_device(
     qemu.arg("-device").arg(device.to_string());
 }
 
+/// Gives the guest a virtio-GPU, and makes it the only display adapter
+/// the machine has.
+///
+/// The PCI machine creates a VGA adapter of its own unless it is told
+/// not to, and QEMU's console 0 — the one `screendump` captures — would
+/// then be that adapter's rather than the guest's. A capture of a
+/// display device the guest never drove is worse than no capture: it
+/// looks exactly like one the guest failed to draw into.
+fn configure_display(qemu: &mut Command, display: VmDisplayProfile, queues: VirtioDeviceProfile) {
+    if display == VmDisplayProfile::VirtioGpuPci {
+        qemu.arg("-vga").arg("none");
+    }
+    let mut device = QemuOptions::new(match display {
+        VmDisplayProfile::VirtioGpuMmio => "virtio-gpu-device",
+        VmDisplayProfile::VirtioGpuPci => "virtio-gpu-pci",
+    });
+    apply_transport(
+        display == VmDisplayProfile::VirtioGpuPci,
+        queues,
+        &mut device,
+    );
+    qemu.arg("-device").arg(device.to_string());
+}
+
+/// Gives the guest the three input devices a desktop is driven through.
+///
+/// The tablet carries absolute positions and the mouse relative ones,
+/// which are different virtio-input devices rather than two modes of
+/// one, so a session that can send both kinds of event needs both.
+fn configure_input(qemu: &mut Command, input: VmInputProfile, queues: VirtioDeviceProfile) {
+    let pci = input == VmInputProfile::VirtioInputPci;
+    let devices: [&str; 3] = match input {
+        VmInputProfile::VirtioInputMmio => [
+            "virtio-keyboard-device",
+            "virtio-tablet-device",
+            "virtio-mouse-device",
+        ],
+        VmInputProfile::VirtioInputPci => [
+            "virtio-keyboard-pci",
+            "virtio-tablet-pci",
+            "virtio-mouse-pci",
+        ],
+    };
+    for name in devices {
+        let mut device = QemuOptions::new(name);
+        apply_transport(pci, queues, &mut device);
+        qemu.arg("-device").arg(device.to_string());
+    }
+}
+
+/// Gives the guest a virtio-sound device playing into the host backend
+/// the session named, and nothing at all when it named none.
+///
+/// The backend is created first and the device names it: QEMU refuses a
+/// virtio-sound device whose `audiodev` points at nothing, which is why
+/// the two are one step rather than two.
+fn configure_sound(
+    qemu: &mut Command,
+    sound: VmSoundProfile,
+    audiodev: &VmAudioDev,
+    queues: VirtioDeviceProfile,
+) {
+    let Some(backend) = audiodev.options() else {
+        return;
+    };
+    qemu.arg("-audiodev").arg(backend.to_string());
+    let mut device = QemuOptions::new(match sound {
+        VmSoundProfile::VirtioSoundMmio => "virtio-sound-device",
+        VmSoundProfile::VirtioSoundPci => "virtio-sound-pci",
+    });
+    device.set("audiodev", VmAudioDev::ID);
+    apply_transport(sound == VmSoundProfile::VirtioSoundPci, queues, &mut device);
+    qemu.arg("-device").arg(device.to_string());
+}
+
 fn configure_watchdog(qemu: &mut Command, watchdog: VmWatchdogProfile) {
     match watchdog {
         VmWatchdogProfile::I6300Esb => {
@@ -3978,6 +4433,8 @@ impl From<VmSessionCommand> for ResolvedVmSessionCommand {
             VmSessionCommand::AotBench(command) => Self::AotBench(command),
             VmSessionCommand::WorkloadBench(command) => Self::WorkloadBench(command),
             VmSessionCommand::Balloon(command) => Self::Balloon(command),
+            VmSessionCommand::Screendump(command) => Self::Screendump(command),
+            VmSessionCommand::Input(command) => Self::Input(command),
             VmSessionCommand::Profile(command) => Self::Profile(command),
             VmSessionCommand::Build
             | VmSessionCommand::KernelPath
@@ -4139,6 +4596,172 @@ mod tests {
         assert_eq!(X86_64_VM_PROFILE.vsock, VmVsockProfile::VhostVsockPci);
     }
 
+    /// Renders the arguments one `configure_*` call would pass QEMU,
+    /// without spawning one.
+    fn rendered(configure: impl FnOnce(&mut Command)) -> Vec<String> {
+        let mut qemu = Command::new("true");
+        configure(&mut qemu);
+        qemu.get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// A capture is only evidence if it is a capture of the guest's own
+    /// display, so the PCI machine's default VGA adapter goes away with
+    /// the same call that attaches the virtio-GPU.
+    #[test]
+    fn the_desktop_display_is_the_only_adapter_the_machine_has() {
+        assert_eq!(
+            rendered(|qemu| configure_display(
+                qemu,
+                VmDisplayProfile::VirtioGpuMmio,
+                VirtioDeviceProfile::default()
+            )),
+            ["-device", "virtio-gpu-device"]
+        );
+        assert_eq!(
+            rendered(|qemu| configure_display(
+                qemu,
+                VmDisplayProfile::VirtioGpuPci,
+                VirtioDeviceProfile::default()
+            )),
+            ["-vga", "none", "-device", "virtio-gpu-pci"]
+        );
+    }
+
+    /// Absolute and relative pointer events go to different devices, so
+    /// a desktop that can be driven by both carries both.
+    #[test]
+    fn the_desktop_input_devices_cover_keys_and_both_pointers() {
+        assert_eq!(
+            rendered(|qemu| configure_input(
+                qemu,
+                VmInputProfile::VirtioInputMmio,
+                VirtioDeviceProfile::default()
+            )),
+            [
+                "-device",
+                "virtio-keyboard-device",
+                "-device",
+                "virtio-tablet-device",
+                "-device",
+                "virtio-mouse-device"
+            ]
+        );
+        assert_eq!(
+            rendered(|qemu| configure_input(
+                qemu,
+                VmInputProfile::VirtioInputPci,
+                VirtioDeviceProfile::default()
+            )),
+            [
+                "-device",
+                "virtio-keyboard-pci",
+                "-device",
+                "virtio-tablet-pci",
+                "-device",
+                "virtio-mouse-pci"
+            ]
+        );
+    }
+
+    /// The sound device is created against a backend, so it appears
+    /// exactly when a session names one.
+    #[test]
+    fn a_sound_device_arrives_with_the_backend_it_plays_into() {
+        assert_eq!(
+            rendered(|qemu| configure_sound(
+                qemu,
+                VmSoundProfile::VirtioSoundPci,
+                &VmAudioDev::None,
+                VirtioDeviceProfile::default()
+            )),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            rendered(|qemu| configure_sound(
+                qemu,
+                VmSoundProfile::VirtioSoundPci,
+                &VmAudioDev::Wav {
+                    path: PathBuf::from("/tmp/guest.wav")
+                },
+                VirtioDeviceProfile::default()
+            )),
+            [
+                "-audiodev",
+                "wav,path=/tmp/guest.wav,id=snd0",
+                "-device",
+                "virtio-sound-pci,audiodev=snd0"
+            ]
+        );
+        assert_eq!(
+            rendered(|qemu| configure_sound(
+                qemu,
+                VmSoundProfile::VirtioSoundMmio,
+                &VmAudioDev::Host {
+                    backend: "coreaudio".to_owned()
+                },
+                VirtioDeviceProfile::default()
+            )),
+            [
+                "-audiodev",
+                "coreaudio,id=snd0",
+                "-device",
+                "virtio-sound-device,audiodev=snd0"
+            ]
+        );
+    }
+
+    /// A profile that attached a PCI display to an MMIO-only machine
+    /// would fail at QEMU startup rather than at review.
+    #[test]
+    fn every_profile_names_the_desktop_bus_its_other_devices_use() {
+        for profile in [&AARCH64_VIRT_HVF_PROFILE, &RISCV64_VM_PROFILE] {
+            assert_eq!(profile.display, VmDisplayProfile::VirtioGpuMmio);
+            assert_eq!(profile.input, VmInputProfile::VirtioInputMmio);
+            assert_eq!(profile.sound, VmSoundProfile::VirtioSoundMmio);
+        }
+        assert_eq!(X86_64_VM_PROFILE.display, VmDisplayProfile::VirtioGpuPci);
+        assert_eq!(X86_64_VM_PROFILE.input, VmInputProfile::VirtioInputPci);
+        assert_eq!(X86_64_VM_PROFILE.sound, VmSoundProfile::VirtioSoundPci);
+    }
+
+    /// Every lane that does not ask for a window boots the machine it
+    /// booted before, so the default stays the headless one.
+    #[test]
+    fn the_display_backend_defaults_to_none() {
+        assert_eq!(VmDisplayBackend::default(), VmDisplayBackend::None);
+        assert_eq!(VmDisplayBackend::None.token(), "none");
+        assert_eq!(VmDisplayBackend::Cocoa.token(), "cocoa");
+        assert_eq!(VmDisplayBackend::Gtk.token(), "gtk");
+        assert_eq!(VmDisplayBackend::Sdl.token(), "sdl");
+    }
+
+    #[test]
+    fn an_audio_backend_is_named_as_qemu_names_it() {
+        assert_eq!(
+            VmAudioDev::parse("none").expect("no sound"),
+            VmAudioDev::None
+        );
+        assert_eq!(
+            VmAudioDev::parse("wav:/tmp/guest.wav").expect("the file sink"),
+            VmAudioDev::Wav {
+                path: PathBuf::from("/tmp/guest.wav")
+            }
+        );
+        assert_eq!(
+            VmAudioDev::parse("coreaudio").expect("a host backend"),
+            VmAudioDev::Host {
+                backend: "coreaudio".to_owned()
+            }
+        );
+        VmAudioDev::parse("wav:").expect_err("the wav sink needs a file to write");
+        VmAudioDev::parse("").expect_err("an empty backend names nothing");
+        // A name carrying an option separator would smuggle further
+        // options into the `-audiodev` list.
+        VmAudioDev::parse("coreaudio,id=other").expect_err("a backend name is one word");
+    }
+
     #[test]
     fn the_rpc_transport_defaults_to_the_serial_line() {
         // vsock needs a host that can provide the device, so it is opted
@@ -4208,6 +4831,41 @@ mod tests {
         assert_eq!(
             X86_64_VM_PROFILE.balloon,
             VmBalloonProfile::VirtioBalloonPci
+        );
+    }
+
+    /// Every action that speaks to QEMU rather than to the guest has to
+    /// say so, or it reaches a session with no socket to speak over.
+    #[test]
+    fn every_action_that_drives_the_monitor_asks_for_a_socket() {
+        assert_eq!(
+            ResolvedVmSessionCommand::Balloon(BalloonCommand {
+                targets: Vec::new(),
+                settle_seconds: 1,
+                hold_seconds: 0,
+            })
+            .qmp_action(),
+            Some("balloon")
+        );
+        assert_eq!(
+            ResolvedVmSessionCommand::Screendump(ScreendumpCommand {
+                paths: vec![PathBuf::from("desktop.png")],
+                settle_seconds: 0,
+            })
+            .qmp_action(),
+            Some("screendump")
+        );
+        assert_eq!(
+            ResolvedVmSessionCommand::Input(InputCommand {
+                script: PathBuf::from("desktop.input"),
+                interval_ms: 0,
+            })
+            .qmp_action(),
+            Some("input")
+        );
+        assert_eq!(
+            ResolvedVmSessionCommand::Session(SessionCommand::Stats).qmp_action(),
+            None
         );
     }
 
@@ -4746,6 +5404,9 @@ mod tests {
             iommu: false,
             virtio_packed: false,
             virtio_in_order: false,
+            desktop: false,
+            display: None,
+            audiodev: None,
             network: default_network_args(),
             command: None,
         }
@@ -4800,6 +5461,9 @@ mod tests {
             iommu: false,
             virtio_packed: false,
             virtio_in_order: false,
+            desktop: false,
+            display: None,
+            audiodev: None,
             network: default_network_args(),
             command: None,
         };
@@ -4933,6 +5597,9 @@ mod tests {
             iommu: false,
             virtio_packed: false,
             virtio_in_order: false,
+            desktop: false,
+            display: None,
+            audiodev: None,
             network: default_network_args(),
             command: None,
         };
@@ -5048,6 +5715,9 @@ mod tests {
             keep_runtime_dir: false,
             acpi: false,
             iommu: false,
+            desktop: false,
+            display: VmDisplayBackend::None,
+            audiodev: VmAudioDev::None,
             needs_qmp: false,
             virtio_devices: VirtioDeviceProfile::default(),
             rpc_transport: VmRpcTransport::Serial,
@@ -5251,6 +5921,9 @@ mod tests {
             keep_runtime_dir: false,
             acpi: false,
             iommu: false,
+            desktop: false,
+            display: VmDisplayBackend::None,
+            audiodev: VmAudioDev::None,
             needs_qmp: false,
             virtio_devices: VirtioDeviceProfile::default(),
             rpc_transport: VmRpcTransport::Serial,
