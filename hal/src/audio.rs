@@ -667,14 +667,22 @@ pub type AudioResult<T> = Result<T, AudioError>;
 
 /// A device that plays PCM audio.
 ///
-/// The three queries are asked of the device rather than read from a
-/// snapshot because a jack's connected state changes underneath them: a
-/// plug pulled is an event, and the answer after it is different from
-/// the answer before.
+/// The two asynchronous queries are asked of the device rather than
+/// read from a snapshot because a jack's connected state changes
+/// underneath them: a plug pulled is an event, and the answer after it
+/// is different from the answer before. The stream topology is the
+/// exception and is read straight back, because it is silicon.
 pub trait PlaybackDevice: Send + Sync + 'static {
     /// Every stream the device presents, capture streams included, so a
     /// caller can see the whole device rather than the half it may use.
-    fn streams(&self) -> impl Future<Output = AudioResult<StreamList>> + Send + '_;
+    ///
+    /// The one query that is not a round trip. A stream's direction,
+    /// its formats, its rates and its channel range are properties of
+    /// the silicon: the device answered them once, while it was brought
+    /// up, and no later answer can differ. What does change underneath
+    /// a caller is a jack's connected state, which is why that one is
+    /// asked for again every time.
+    fn stream_topology(&self) -> &StreamList;
 
     /// Every jack the device presents, with its connected state as of
     /// this call.
@@ -740,8 +748,8 @@ pub trait PlaybackDevice: Send + Sync + 'static {
 /// so the shared handle satisfies the contract without every backend
 /// writing the same eleven forwarding methods.
 impl<Device: PlaybackDevice + ?Sized> PlaybackDevice for alloc::sync::Arc<Device> {
-    fn streams(&self) -> impl Future<Output = AudioResult<StreamList>> + Send + '_ {
-        Device::streams(self)
+    fn stream_topology(&self) -> &StreamList {
+        Device::stream_topology(self)
     }
 
     fn jacks(&self) -> impl Future<Output = AudioResult<JackList>> + Send + '_ {
