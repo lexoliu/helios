@@ -433,6 +433,16 @@ fn convert_sample(sample: host_stats::Sample) -> stats::Sample {
         host_share: sample.host_share.map(convert_host_share_cache),
         network: sample.network.map(convert_network),
         devices: sample.devices.into_iter().map(convert_device).collect(),
+        inputs: sample.inputs.into_iter().map(convert_input).collect(),
+    }
+}
+
+fn convert_input(device: host_stats::InputDevice) -> stats::InputDevice {
+    stats::InputDevice {
+        name: device.name,
+        claimed: device.claimed,
+        events_delivered: device.events_delivered,
+        lost_reports: device.lost_reports,
     }
 }
 

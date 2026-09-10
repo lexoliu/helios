@@ -123,3 +123,38 @@ pub mod display {
         });
     }
 }
+
+/// Bindings for the interface a program reaches the machine's input
+/// devices through.
+///
+/// Generated from the `input-host` world, for the reason `display-host`
+/// is: the kernel implements this one interface, and the program
+/// bindings above already provide every `wasi:cli` import a compositor
+/// also has.
+pub mod input {
+    pub mod bindings {
+        use wasmtime;
+
+        wasmtime::component::bindgen!({
+            path: "../wit",
+            world: "input-host",
+            imports: {
+                // The call that hands back a reader has to see the store,
+                // so it can build one against it; it returns the reader
+                // immediately rather than awaiting.
+                "helios:system/input.[method]device.events": store | trappable,
+                // `set-led` is the one call that reaches the device and
+                // is an `async func` in the WIT, generated against the
+                // store on its own account. What is left — claiming,
+                // listing, reading capabilities back, dropping a handle
+                // — is store bookkeeping and answers without waiting.
+                default: trappable,
+            },
+            with: {
+                "helios:system/input.device":
+                    crate::wasmtime_adapter::component_host::InputDeviceHandle,
+            },
+            require_store_data_send: true,
+        });
+    }
+}

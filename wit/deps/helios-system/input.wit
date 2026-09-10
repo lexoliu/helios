@@ -1,0 +1,150 @@
+package helios:system@0.1.0;
+
+/// The machine's human-input devices, handed one at a time to one
+/// instance each.
+///
+/// Helios drives every input device itself — an event ring nobody drains
+/// is a ring the host runs out of buffers on, and the next keystroke has
+/// nowhere to go — so the kernel owns each device for as long as the
+/// machine runs. What this interface hands out is the right to *read*
+/// one: exactly one instance holds a device at a time, and the device
+/// goes back to the kernel's own drain when that instance lets go or
+/// dies.
+///
+/// The vocabulary is evdev's, unchanged. An event is a `(kind, code,
+/// value)` triple, a device describes itself by the codes it reports for
+/// each kind, and a burst of triples that belong to one physical moment
+/// — a pointer that moved in both axes, a key pressed while a modifier
+/// was held — is closed by a `SYN_REPORT`. Nothing here translates that
+/// into a model of its own: every consumer would have to undo the
+/// translation, and there is no fact about input a Helios-specific
+/// encoding could carry that evdev does not.
+///
+/// # What a slow reader loses
+///
+/// A device's events are relayed through a queue as deep as the driver's
+/// own event ring, so a reader that stops reading cannot pin the ring
+/// and stall every other device on the machine. What it loses when the
+/// queue is full is a *whole report*: the kernel commits a report or
+/// drops it, never half of one, so a pointer never keeps one axis of a
+/// move it lost the other half of. Reports dropped that way are counted
+/// and published on `helios:system/stats`.
+interface input {
+  /// Why an input request was refused.
+  enum error {
+    /// This machine has no input device, or the kernel never brought
+    /// one up.
+    unavailable,
+    /// No device of that name on this machine.
+    no-such-device,
+    /// Every device of that name is already held by somebody.
+    already-claimed,
+    /// A handle that outlived a release names a device its instance no
+    /// longer holds.
+    not-claimed,
+    /// The device faulted rather than refused.
+    device-fault,
+  }
+
+  /// One input event: a Linux `struct input_event` without its
+  /// timestamp, which is what a device puts on the wire.
+  ///
+  /// `kind` is an `EV_*` type, `code` names a code within that type's
+  /// namespace, and `value` is what the code reports — a key's state, a
+  /// relative displacement, an absolute position.
+  record input-event {
+    kind: u16,
+    code: u16,
+    value: s32,
+  }
+
+  /// The codes one device reports for one event type, as the bit per
+  /// code the device publishes.
+  ///
+  /// The length is the device's own: it publishes as many bytes as its
+  /// highest code needs, and a code past the end is one this device does
+  /// not have. Byte `n` bit `b` is code `n * 8 + b`.
+  record event-type {
+    /// The `EV_*` type these codes belong to.
+    kind: u16,
+    /// The device's bitmap for that type. Empty for a type the device
+    /// declares without codes, which is a fact about the device and not
+    /// an absence: a keyboard declares `EV_REP` exactly that way to say
+    /// that it repeats held keys itself.
+    codes: list<u8>,
+  }
+
+  /// One absolute axis a device reports, and the range it reports over,
+  /// as `struct input_absinfo` describes it.
+  ///
+  /// `fuzz` is the noise the device's own filtering leaves behind,
+  /// `flat` the dead zone around the resting position, and `res` the
+  /// units per millimetre (or per radian, for a rotational axis) — zero
+  /// where the device does not know its own scale.
+  record abs-axis {
+    code: u16,
+    min: s32,
+    max: s32,
+    fuzz: s32,
+    flat: s32,
+    res: s32,
+  }
+
+  /// Everything a device says about itself, read once while the kernel
+  /// brought it up and immutable afterwards.
+  record capabilities {
+    /// The name the device presents itself by, which is the name
+    /// `claim` asks for.
+    name: string,
+    /// Every event type the device declares, in the order it declared
+    /// them, with the codes it reports for each.
+    ev-bits: list<event-type>,
+    /// Every absolute axis the device reports, in ascending code order.
+    /// Empty on a device with no absolute axis, which is every keyboard
+    /// and every relative pointer.
+    abs-info: list<abs-axis>,
+  }
+
+  /// One instance's exclusive hold on one input device.
+  ///
+  /// Dropping it — or dying while holding it — hands the device back to
+  /// the kernel's own drain, and the next caller of `claim` may have it.
+  resource device {
+    /// What this device says about itself.
+    capabilities: func() -> capabilities;
+
+    /// Every event this device reports, from now on.
+    ///
+    /// `SYN_REPORT` is in the stream like any other event: the frame
+    /// boundary belongs to whoever is interpreting the events, and a
+    /// consumer that acts on a pointer's first axis before the report
+    /// closes draws a diagonal as a staircase.
+    ///
+    /// One stream per device. A second call hands back a second reader
+    /// of the same queue, and an event goes to exactly one of them, so
+    /// a consumer that wants its events in one place asks once.
+    events: func() -> stream<input-event>;
+
+    /// Turn one of the device's indicators on or off.
+    ///
+    /// `code` is an `LED_*` code the device reports for `EV_LED`; this
+    /// is the one direction in which events travel towards the device.
+    set-led: async func(code: u16, on: bool) -> result<_, error>;
+  }
+
+  /// Every input device the kernel brought up, whether or not somebody
+  /// holds it. Empty on a machine that has none.
+  available: func() -> list<capabilities>;
+
+  /// Take exclusive ownership of the device `name` names.
+  ///
+  /// The second caller is refused rather than queued: a compositor
+  /// waiting for a keyboard another compositor holds is a provisioning
+  /// mistake, not a shortage. This is the rule `display.claim` and
+  /// `device.claim` both follow.
+  ///
+  /// A machine with two devices of the same name — two identical
+  /// keyboards — hands out the first free one, so claiming that name
+  /// twice yields both of them.
+  claim: func(name: string) -> result<device, error>;
+}

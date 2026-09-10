@@ -247,6 +247,21 @@ interface stats {
     masked-sources: u32,
   }
 
+  /// One input device the kernel owns and drains.
+  record input-device {
+    /// The name the device presents itself by, which is the name
+    /// `helios:system/input`'s `claim` asks for.
+    name: string,
+    /// Whether an instance is reading it right now.
+    claimed: bool,
+    /// Events the kernel has handed to a reader since boot.
+    events-delivered: u64,
+    /// Whole reports dropped because a reader had not kept up with the
+    /// device. Persistently moving is a compositor that is not draining
+    /// its event stream.
+    lost-reports: u64,
+  }
+
   record sample {
     timestamp: mono-nanos,
     uptime: mono-nanos,
@@ -275,6 +290,9 @@ interface stats {
     /// Hardware the kernel has no driver for and has offered to
     /// user-mode ones. Empty on a machine that described none.
     devices: list<granted-device>,
+    /// The input devices the kernel owns and drains. Empty on a machine
+    /// that gave it none.
+    inputs: list<input-device>,
   }
 
   /// Returns the latest coherent system-wide observation snapshot.

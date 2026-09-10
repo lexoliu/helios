@@ -202,6 +202,16 @@ impl CodeBitmap {
         Ok(bitmap)
     }
 
+    /// The bytes the device published, as it published them.
+    ///
+    /// Bit `b` of byte `n` is code `n * 8 + b`, which is the encoding
+    /// evdev itself uses and the one a consumer outside this kernel is
+    /// handed: rebuilding the bitmap from [`Self::codes`] would cost a
+    /// pass over every code in the namespace to say the same thing.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+
     /// Whether the device reports `code`.
     pub const fn contains(&self, code: u16) -> bool {
         let index = code as usize / 8;

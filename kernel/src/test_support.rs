@@ -349,6 +349,10 @@ impl crate::component::ComponentRuntimeState for TestRuntimeState {
         None
     }
 
+    fn input_service(&self) -> Option<crate::input::InputService> {
+        None
+    }
+
     fn profiling_enabled(&self) -> bool {
         false
     }

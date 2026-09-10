@@ -764,7 +764,7 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
             if let Some(display) = gpu::install(&cpu, &kernel, &fdt, &debug_state) {
                 interrupts.attach_display(display);
             }
-            for device in input::install(&kernel, &fdt) {
+            for device in input::install(&kernel, &fdt, &debug_state) {
                 interrupts.attach_input(device);
             }
             for block in block::install(&cpu, &kernel, &fdt, &debug_state, root_entropy) {

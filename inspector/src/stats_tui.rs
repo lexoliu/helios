@@ -239,7 +239,73 @@ fn draw_main_panels(
         .constraints([Constraint::Percentage(64), Constraint::Percentage(36)])
         .split(sections[1]);
     draw_instances_panel(frame, bottom[0], instances);
-    draw_devices_panel(frame, bottom[1], sample);
+    // The two kinds of device the kernel hands out share the column,
+    // because both answer "who holds this piece of hardware": one for
+    // the registers a user-mode driver drives, one for the events a
+    // compositor reads.
+    let held = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(bottom[1]);
+    draw_devices_panel(frame, held[0], sample);
+    draw_input_panel(frame, held[1], sample);
+}
+
+/// The input devices the kernel drains, and who is reading them.
+fn draw_input_panel(frame: &mut ratatui::Frame<'_>, area: Rect, sample: &stats::Sample) {
+    if sample.inputs.is_empty() {
+        let empty = Paragraph::new(Text::from(vec![Line::from(Span::styled(
+            "no input devices on this machine",
+            Style::default().fg(Color::DarkGray),
+        ))]))
+        .block(
+            Block::default()
+                .title("Input devices")
+                .borders(Borders::ALL),
+        )
+        .wrap(Wrap { trim: true });
+        frame.render_widget(empty, area);
+        return;
+    }
+    let rows = sample.inputs.iter().map(|device| {
+        let owner = if device.claimed { "held" } else { "free" };
+        let style = if device.claimed {
+            Style::default().fg(Color::Green)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        // A lost report is a reader that did not keep up, which is the
+        // one number on this row that means something is wrong.
+        let lost = if device.lost_reports == 0 {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default().fg(Color::Red)
+        };
+        Row::new(vec![
+            Cell::from(device.name.clone()),
+            Cell::from(owner).style(style),
+            Cell::from(format!("{}", device.events_delivered)),
+            Cell::from(format!("{}", device.lost_reports)).style(lost),
+        ])
+    });
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Min(12),
+            Constraint::Length(5),
+            Constraint::Length(9),
+            Constraint::Length(5),
+        ],
+    )
+    .header(
+        Row::new(vec!["device", "owner", "events", "lost"]).style(Style::default().fg(Color::Cyan)),
+    )
+    .block(
+        Block::default()
+            .title("Input devices")
+            .borders(Borders::ALL),
+    );
+    frame.render_widget(table, area);
 }
 
 /// The hardware the kernel does not drive itself, and who holds it.

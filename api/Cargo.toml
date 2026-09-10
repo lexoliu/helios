@@ -7,6 +7,7 @@ edition.workspace = true
 default = ["channel", "fs", "http", "io", "net", "serial", "stats", "sync", "task", "tracing"]
 channel = ["dep:async-channel"]
 display = ["dep:thiserror"]
+input = ["dep:helios-hal", "dep:thiserror"]
 fs = ["dep:futures-lite"]
 http = ["io", "dep:http", "dep:thiserror"]
 http-handler = ["http"]
@@ -27,6 +28,7 @@ async-channel = { version = "2.5.0", optional = true }
 futures-io = { version = "0.3.34", optional = true }
 futures-lite = { version = "2.6.1", optional = true }
 helios-api-macro = { path = "../api-macro" }
+helios-hal = { path = "../hal", optional = true }
 http = { version = "1.5.0", optional = true }
 thiserror = { version = "2.0.20", optional = true }
 wit-bindgen = { workspace = true, features = ["async", "async-spawn", "macros", "realloc"] }

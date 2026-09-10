@@ -254,11 +254,19 @@ path, by the processor that programs the device, and never afterwards.
 
 Everything above the wire format is device-neutral. The evdev value
 types and the `InputDevice` trait live in `hal/src/input.rs`, and the
-kernel holds each device through `install_input_device`
-(`kernel/src/io/input.rs`), whose task drains the ring and reports every
-event with the frame it belongs to. A device nobody reads is a device
-that stops working — its ring is its whole buffer pool — which is why the
-kernel owns it from bring-up.
+kernel holds every device through `install_input_devices`
+(`kernel/src/input/`), whose task per device drains the ring for as long
+as the machine runs. A device nobody reads is a device that stops
+working — its ring is its whole buffer pool — which is why the kernel
+owns it from bring-up and never hands the device itself anywhere.
+
+What is *done* with the events is the claim's business.
+`helios:system/input` hands the right to read one device to exactly one
+instance at a time, and the drain relays whole reports into that
+instance's stream; a device nobody has claimed has its events written to
+the kernel's log instead, which is what makes a machine with no
+compositor readable. `docs/desktop.md` describes the interface and the
+lane that drives it.
 
 The device is on the platform's own bus: virtio-pci on x86-64
 (`-device virtio-keyboard-pci`, `-device virtio-mouse-pci`, `-device

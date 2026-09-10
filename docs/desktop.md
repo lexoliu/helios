@@ -107,6 +107,74 @@ between them.
     --desktop input target/probe/desktop.input
 ```
 
+## What the guest reads
+
+The other end of the same path is `helios:system/input`. The kernel owns
+every input device the backend brings up and drains it whether or not
+anybody is reading — an event ring nobody empties is a ring the host runs
+out of buffers on — and hands the right to *read* one device to exactly
+one instance at a time. Each device says so on the serial line as it
+comes up:
+
+```text
+virtio-input online transport=pci name="QEMU Virtio Keyboard" ev=KEY,LED,REP abs=none
+virtio-input online transport=pci name="QEMU Virtio Tablet" ev=KEY,REL,ABS abs=x:0..32767,y:0..32767
+```
+
+`available()` lists what the machine has, `claim(name)` takes one, and
+the claim's `events()` stream carries the device's `(kind, code, value)`
+triples with evdev's own `SYN_REPORT` framing intact. Nothing is
+translated: the numbers are Linux's, from the same generated table the
+kernel's drivers read them by, so a program names a key the way every
+other operating system does.
+
+A reader that stops reading cannot stall the machine's input. Each
+device's events are relayed through a queue as deep as the driver's own
+ring, and what a slow reader loses is a whole report at a time, never
+half of one — a pointer never keeps one axis of a move whose other half
+it dropped. Reports lost that way are counted per device and published on
+`helios:system/stats`, where the stats view shows them beside the events
+each device delivered.
+
+`programs/input-test` is the guest side of that: it claims every device
+`available()` lists and prints one line per event.
+
+```text
+input-test:claimed device=QEMU Virtio Keyboard types=3 axes=0
+input-test:reading devices=3
+input-test:event device=QEMU Virtio Keyboard kind=EV_KEY code=KEY_SPACE value=1
+input-test:event device=QEMU Virtio Keyboard kind=EV_SYN code=SYN_REPORT value=0
+input-test:event device=QEMU Virtio Tablet kind=EV_ABS code=ABS_X value=16384
+input-test:event device=QEMU Virtio Tablet kind=EV_ABS code=ABS_Y value=16384
+input-test:event device=QEMU Virtio Tablet kind=EV_SYN code=SYN_REPORT value=0
+```
+
+A guest reading input has to be reading before the host drives the
+devices — events sent while nobody holds a device are drained by the
+kernel and are not the guest's to see — so the `input` action takes the
+same `--run` options `screendump` does, plus `--settle-seconds <n>` for
+the interval between starting the program and the first statement:
+
+```bash
+./target/release/helios-inspector vm --arch x86-64 --release --accel kvm \
+    --desktop --display none \
+    --boot-program dash --boot-program debugger --boot-program input-test \
+    input tools/desktop/input-probe.input \
+      --run /bin/input-test --run-arg --seconds --run-arg 12 \
+      --settle-seconds 3 --interval-ms 200
+```
+
+`smoke-x86-64` runs exactly that on every push and asserts the four
+evdev events the script produces — `EV_KEY`, the `EV_SYN` that closed
+that report, `EV_ABS` on both axes, and the `EV_SYN` that closed theirs —
+in that order in the guest's own output. The order is the assertion: four
+separate greps would pass on a capture that had them backwards.
+
+It is a second boot rather than a second action on the display's,
+because one `vm` session runs one action and neither half survives being
+weakened — a capture taken while nothing is drawing, or an input script
+sent before anything claimed the devices, is evidence of nothing.
+
 ## What the capture proves today
 
 `--desktop` is what the kernel's virtio-GPU driver finds a device on, and

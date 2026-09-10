@@ -1648,6 +1648,7 @@ dependencies = [
  "futures-io",
  "futures-lite",
  "helios-api-macro",
+ "helios-hal",
  "http",
  "thiserror 2.0.20",
  "wit-bindgen 0.61.1",
@@ -1818,6 +1819,14 @@ name = "helios-init"
 version = "0.1.0"
 dependencies = [
  "helios-api",
+]
+
+[[package]]
+name = "helios-input-test"
+version = "0.1.0"
+dependencies = [
+ "helios-api",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

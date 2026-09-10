@@ -83,7 +83,7 @@ mod topology;
 mod vsock;
 
 pub use service::{
-    ChildExit, ChildHandle, DisplayHandle, SurfaceHandle, UserProgramService,
+    ChildExit, ChildHandle, DisplayHandle, InputDeviceHandle, SurfaceHandle, UserProgramService,
     install_component_host_program_service, install_program_service,
     run_component_host_processor_forever, run_embedded_component_forever,
     run_program_workers_forever,
@@ -1615,6 +1615,7 @@ where
     add_stats_to_linker(linker)?;
     device::add_device_to_linker(linker)?;
     service::add_display_to_linker(linker)?;
+    service::add_input_to_linker(linker)?;
     add_instances_to_linker(linker)?;
     add_tracing_to_linker(linker)?;
     debugger_profiling::add_to_linker(linker)?;
@@ -1813,6 +1814,7 @@ where
     add_stats_to_program_linker(linker)?;
     device::add_device_to_linker(linker)?;
     service::add_display_to_linker(linker)?;
+    service::add_input_to_linker(linker)?;
     add_tracing_to_program_linker(linker)?;
     program_profiling::add_to_linker(linker)?;
     Ok(())
@@ -3991,6 +3993,26 @@ macro_rules! convert_device_stats {
     };
 }
 
+/// Maps the kernel's input-device inventory onto one binding set's
+/// `input-device` list, for the same reason [`convert_device_stats`]
+/// exists.
+macro_rules! convert_input_stats {
+    ($bindings:path, $inputs:expr) => {
+        $inputs
+            .into_iter()
+            .map(|device: crate::InputDeviceSnapshot| {
+                use $bindings as stats_bindings;
+                stats_bindings::InputDevice {
+                    name: device.name,
+                    claimed: device.claimed,
+                    events_delivered: device.events_delivered,
+                    lost_reports: device.lost_reports,
+                }
+            })
+            .collect()
+    };
+}
+
 macro_rules! convert_block_stats {
     ($bindings:path, $block:expr) => {
         $block.map(|block: crate::BlockStats| {
@@ -4088,6 +4110,7 @@ fn convert_sample(sample: StatsSample) -> debugger_wit::stats::Sample {
         host_share: convert_host_share_stats!(debugger_wit::stats, sample.host_share),
         network: convert_network_stats!(debugger_wit::stats, sample.network),
         devices: convert_device_stats!(debugger_wit::stats, sample.devices),
+        inputs: convert_input_stats!(debugger_wit::stats, sample.inputs),
     }
 }
 
@@ -4122,6 +4145,7 @@ fn convert_program_sample(sample: StatsSample) -> program_wit::stats::Sample {
         host_share: convert_host_share_stats!(program_wit::stats, sample.host_share),
         network: convert_network_stats!(program_wit::stats, sample.network),
         devices: convert_device_stats!(program_wit::stats, sample.devices),
+        inputs: convert_input_stats!(program_wit::stats, sample.inputs),
     }
 }
 

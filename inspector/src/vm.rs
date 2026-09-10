@@ -1593,6 +1593,14 @@ pub(crate) struct ScreendumpCommand {
 }
 
 /// Runs an input script against the guest's keyboard and pointer.
+/// Runs an input script against the guest's keyboard and pointer.
+///
+/// A script that is evidence of what the *guest* saw needs the guest to
+/// be reading at the time, and one session runs one action — so the
+/// guest program that would otherwise need a second boot is an option
+/// here, exactly as it is on `screendump`. `--run` starts a program in
+/// the guest and leaves it running, `--settle-seconds` gives it time to
+/// claim what it is going to read, and the script follows.
 #[derive(Debug, Clone, ClapArgs)]
 pub(crate) struct InputCommand {
     /// The script to run: one statement per line, `key <qcode>`,
@@ -1604,6 +1612,38 @@ pub(crate) struct InputCommand {
     /// between them has the chance to.
     #[arg(long, default_value_t = 0)]
     interval_ms: u64,
+
+    /// Guest path of a program to start before the script runs, and
+    /// leave running while it does.
+    #[arg(long)]
+    run: Option<String>,
+
+    /// One argument for `--run`. Repeat for several, in order.
+    ///
+    /// Hyphens are allowed through: what follows is the *guest*
+    /// program's own flag, and reading `--seconds` as one of this
+    /// command's would make every guest program that takes options
+    /// unreachable from here.
+    #[arg(long = "run-arg", allow_hyphen_values = true)]
+    run_args: Vec<String>,
+
+    /// How long to let the `--run` program start before the first
+    /// statement is sent.
+    ///
+    /// A program that reads input has to have claimed its devices
+    /// before the host drives them: events sent while nobody holds a
+    /// device are drained by the kernel and are not the guest's to see.
+    #[arg(long, default_value_t = 0)]
+    settle_seconds: u64,
+
+    /// How long to wait, after the script, for the `--run` program to
+    /// finish, so that whatever it printed reaches this session's
+    /// output.
+    ///
+    /// A program still running when the wait ends is left running and
+    /// the machine is torn down around it.
+    #[arg(long, default_value_t = 30)]
+    run_wait_seconds: u64,
 }
 
 #[derive(Debug, Clone, ClapArgs)]
@@ -2570,7 +2610,7 @@ fn connect_and_run(
         }
         Some(ResolvedVmSessionCommand::Input(input)) => {
             let socket = qmp_socket.ok_or(VmSessionError::NeedsQmp { action: "input" })?;
-            run_input(input, &socket)
+            run_input(client, input, &socket)
         }
         Some(ResolvedVmSessionCommand::Profile(profile)) => {
             crate::run_interruptible(async move { Ok(raw_profile::run(&client, &profile).await?) })
@@ -2648,21 +2688,58 @@ fn run_screendump(
     let Some(program) = command.run.clone() else {
         return capture_scanout(&command, qmp_socket);
     };
-    let arguments = command.run_args.clone();
     let socket = qmp_socket.to_path_buf();
     let capture_command = command.clone();
-    let wait = Duration::from_secs(command.run_wait_seconds);
+    alongside_guest_program(
+        client,
+        GuestRun {
+            program,
+            arguments: command.run_args.clone(),
+            wait: Duration::from_secs(command.run_wait_seconds),
+        },
+        move || capture_scanout(&capture_command, &socket),
+    )
+}
+
+/// The `--run` program one host-side action is performed alongside.
+struct GuestRun {
+    program: String,
+    arguments: Vec<String>,
+    /// How long to wait, once the host side is done, for the program to
+    /// finish so that what it printed reaches this session's output.
+    wait: Duration,
+}
+
+/// Start `run`'s program in the guest, do `host_side` while it runs, and
+/// report what the program said.
+///
+/// The host side is blocking work on QEMU's monitor socket, and the
+/// guest program has to keep running while it happens. A thread for the
+/// blocking half and the executor for the guest half is what lets one
+/// session do both: the thread's result arrives on a channel the
+/// executor is woken by, so the guest's RPC keeps being driven
+/// throughout.
+///
+/// Shared by `screendump --run` and `input --run`, which differ only in
+/// what the host does while the guest runs.
+fn alongside_guest_program<HostSide>(
+    client: crate::serial::RpcClient,
+    run: GuestRun,
+    host_side: HostSide,
+) -> Result<(), VmSessionError>
+where
+    HostSide: FnOnce() -> Result<(), VmSessionError> + Send + 'static,
+{
+    let GuestRun {
+        program,
+        arguments,
+        wait,
+    } = run;
     crate::runtime::block_on(async move {
-        // The captures are blocking work on QEMU's monitor socket, and
-        // the guest program has to keep running while they happen. A
-        // thread for the blocking half and the executor for the guest
-        // half is what lets one session do both: the thread's result
-        // arrives on a channel the executor is woken by, so the guest's
-        // RPC keeps being driven throughout.
         // One slot: the thread sends exactly one result and then ends.
         let (sender, receiver) = async_channel::bounded(1);
         std::thread::spawn(move || {
-            let _ = sender.send_blocking(capture_scanout(&capture_command, &socket));
+            let _ = sender.send_blocking(host_side());
         });
         println!(
             "{} {} in the guest",
@@ -2672,31 +2749,31 @@ fn run_screendump(
         let mut client = client;
         let guest = crate::programs::exec(&mut client, &program, &arguments);
         let mut guest = core::pin::pin!(guest);
-        let captured = futures_lite::future::or(
-            async { CaptureRace::Captured(receiver.recv().await) },
-            async { CaptureRace::GuestExited(guest.as_mut().await) },
+        let raced = futures_lite::future::or(
+            async { GuestRace::HostFinished(receiver.recv().await) },
+            async { GuestRace::GuestExited(guest.as_mut().await) },
         )
         .await;
-        match captured {
-            CaptureRace::Captured(Ok(result)) => {
+        match raced {
+            GuestRace::HostFinished(Ok(result)) => {
                 result?;
-                // Whatever the program printed is the guest's own account
-                // of what it drew, and it is worth having beside the PNG.
-                // A program that is still drawing when the wait ends is
-                // left drawing.
+                // Whatever the program printed is the guest's own
+                // account of what happened, and it is the half of the
+                // evidence the host cannot produce. A program still
+                // running when the wait ends is left running.
                 match crate::runtime::timeout(wait, guest).await {
                     Some(outcome) => report_guest_run(&program, outcome),
                     None => println!(
                         "{} {} is still running after {}s",
                         style("running").cyan(),
                         program,
-                        command.run_wait_seconds
+                        wait.as_secs()
                     ),
                 }
                 Ok(())
             }
-            CaptureRace::Captured(Err(_)) => Err(VmSessionError::CaptureThreadLost),
-            CaptureRace::GuestExited(outcome) => {
+            GuestRace::HostFinished(Err(_)) => Err(VmSessionError::CaptureThreadLost),
+            GuestRace::GuestExited(outcome) => {
                 report_guest_run(&program, outcome);
                 Err(VmSessionError::GuestProgramExitedEarly {
                     program: program.clone(),
@@ -2706,9 +2783,9 @@ fn run_screendump(
     })
 }
 
-/// Which half of a `screendump --run` finished first.
-enum CaptureRace {
-    Captured(Result<Result<(), VmSessionError>, async_channel::RecvError>),
+/// Which half of a `--run` session finished first.
+enum GuestRace {
+    HostFinished(Result<Result<(), VmSessionError>, async_channel::RecvError>),
     GuestExited(GuestRunOutcome),
 }
 
@@ -2779,9 +2856,37 @@ fn capture_scanout(command: &ScreendumpCommand, qmp_socket: &Path) -> Result<(),
 /// The whole script is parsed before the first event is sent: a script
 /// with a typo in its last line is a script that would otherwise leave
 /// the guest half-driven, in a state no later step could account for.
-fn run_input(command: InputCommand, qmp_socket: &Path) -> Result<(), VmSessionError> {
-    let mut qmp = QmpClient::connect(qmp_socket)?;
-    send_input_script(&mut qmp, &command.script, command.interval_ms)
+fn run_input(
+    client: crate::serial::RpcClient,
+    command: InputCommand,
+    qmp_socket: &Path,
+) -> Result<(), VmSessionError> {
+    let socket = qmp_socket.to_path_buf();
+    let script = command.script.clone();
+    let interval = command.interval_ms;
+    let settle = Duration::from_secs(command.settle_seconds);
+    let drive = move || {
+        // The settle happens on the thread that sends, not before the
+        // guest was started: what it is waiting for is the guest
+        // claiming the devices this script is about to drive.
+        if !settle.is_zero() {
+            std::thread::sleep(settle);
+        }
+        let mut qmp = QmpClient::connect(&socket)?;
+        send_input_script(&mut qmp, &script, interval)
+    };
+    let Some(program) = command.run.clone() else {
+        return drive();
+    };
+    alongside_guest_program(
+        client,
+        GuestRun {
+            program,
+            arguments: command.run_args.clone(),
+            wait: Duration::from_secs(command.run_wait_seconds),
+        },
+        drive,
+    )
 }
 
 /// Parse `script` and send every statement in it.
@@ -5029,6 +5134,10 @@ mod tests {
             ResolvedVmSessionCommand::Input(InputCommand {
                 script: PathBuf::from("desktop.input"),
                 interval_ms: 0,
+                run: None,
+                run_args: Vec::new(),
+                settle_seconds: 0,
+                run_wait_seconds: 0,
             })
             .qmp_action(),
             Some("input")

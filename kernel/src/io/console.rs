@@ -262,6 +262,10 @@ mod tests {
             None
         }
 
+        fn input_service(&self) -> Option<crate::input::InputService> {
+            None
+        }
+
         fn profiling_enabled(&self) -> bool {
             false
         }

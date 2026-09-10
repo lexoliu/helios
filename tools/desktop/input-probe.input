@@ -1,0 +1,15 @@
+# Drive the desktop's keyboard and absolute pointer so a guest reading
+# `helios:system/input` has both kinds of event to report.
+#
+# The order is the assertion: one key press, then one absolute move. A
+# guest that prints its events in the order it was handed them shows
+# `EV_KEY`, the `EV_SYN` that closed that report, then `EV_ABS` on both
+# axes and the `EV_SYN` that closed theirs.
+key spc
+
+# The axis range is QEMU's own 0..=32767 rather than guest pixels: the
+# host cannot know what mode the guest chose. Two moves, because a tablet
+# reports only the axes that changed and the first move from the corner
+# is the one that proves both are wired.
+abs 8192 4096
+abs 16384 16384

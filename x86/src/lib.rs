@@ -487,7 +487,13 @@ fn install_pci_devices<WatchdogImpl>(
             .iter()
             .map(|address| (*address, dma_pool(*address)))
             .collect();
-    for device in input::install(kernel, pci, &input_devices, destination_apic_id) {
+    for device in input::install(
+        kernel,
+        pci,
+        &input_devices,
+        destination_apic_id,
+        debug_state,
+    ) {
         routes.add_input(device.vector, device.device);
     }
     // The x86 address space reserves and commits lazily, so a page could
