@@ -406,6 +406,58 @@ def wasm_artifact_digests(workloads: list[dict]) -> dict[str, str]:
     return dict(sorted(digests.items()))
 
 
+def kernel_pgo_uncovered(
+    workspace_root: Path,
+    lane: Lane,
+    profile_use: Path | None,
+    without_kernel_profile: bool = False,
+) -> int | None:
+    """The uncovered-function count a Helios image's kernel build recorded.
+
+    The inspector counts the `no profile data available for function`
+    warnings of a profile-use build and writes them beside the kernel as
+    `<kernel>.pgo-uncovered.txt` (docs/pgo.md). The kernel's own path is
+    asked of the inspector rather than rebuilt here: the mapping from
+    architecture and profile to target directory is the inspector's, and
+    a second copy of it in this file would be a second thing to keep
+    true. `None` when the build kept no list — a plain release build, a
+    target whose releases read no profile, or a kernel built before the
+    list existed.
+    """
+    inspector = Path(
+        os.environ.get("HELIOS_INSPECTOR_BIN", REPO_ROOT / "target" / "release" / "helios-inspector")
+    )
+    argv = [
+        str(inspector),
+        "vm",
+        "--arch",
+        lane.helios_arch,
+        "--release",
+        "--accel",
+        lane.accelerator,
+    ]
+    if profile_use is not None:
+        argv += ["--profile-use", str(profile_use)]
+    if without_kernel_profile:
+        argv += ["--without-kernel-profile"]
+    argv.append("kernel-path")
+    env = os.environ.copy()
+    env["HELIOS_WORKSPACE_ROOT"] = str(workspace_root)
+    completed = subprocess.run(
+        argv, cwd=REPO_ROOT, env=env, capture_output=True, text=True, check=False
+    )
+    if completed.returncode != 0:
+        return None
+    listing = Path(completed.stdout.strip() + ".pgo-uncovered.txt")
+    if not listing.is_file():
+        return None
+    return sum(
+        1
+        for line in listing.open("r", encoding="utf-8")
+        if line.strip() and not line.startswith("#")
+    )
+
+
 def bootfs_cwasm_digests(lane: Lane, kernel_build: str) -> dict[str, str]:
     """SHA256 of the signed cwasm files the Helios guest loaded.
 
@@ -705,6 +757,20 @@ def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) ->
             baseline_kernel_build=options.baseline_kernel_build,
             kernel_profile=candidate_profile,
             baseline_kernel_profile=baseline_profile,
+            kernel_pgo_uncovered=(
+                kernel_pgo_uncovered(REPO_ROOT, lane, options.profile_use)
+                if options.kernel_build == PROFILE_USE_BUILD
+                else None
+            ),
+            baseline_kernel_pgo_uncovered=(
+                kernel_pgo_uncovered(
+                    options.baseline.worktree if options.baseline is not None else REPO_ROOT,
+                    lane,
+                    None,
+                )
+                if options.baseline_kernel_build == PROFILE_USE_BUILD
+                else None
+            ),
             retaken=retaken,
             reconfirmed=reconfirmed,
         )

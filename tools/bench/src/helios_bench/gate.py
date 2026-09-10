@@ -543,6 +543,7 @@ def image_label(
     other_build: str | None,
     profile: str | None = None,
     other_profile: str | None = None,
+    uncovered: int | None = None,
 ) -> str:
     """How one column of a paired table names its image.
 
@@ -552,7 +553,8 @@ def image_label(
     against when those differ — a PGO pairing varies the build and not
     the commit, and once every release build reads a profile it varies
     which profile (#226), so without these the two columns would carry
-    the same label.
+    the same label. A profile-use column also names how many functions
+    its profile covered nothing about (#329).
     """
     qualifiers = []
     if ref:
@@ -561,6 +563,8 @@ def image_label(
         qualifiers.append(build)
     if profile and profile != other_profile:
         qualifiers.append(profile)
+    if uncovered is not None:
+        qualifiers.append(f"{uncovered:,} uncovered functions")
     label = f"`{short(sha)}`"
     return f"{label} ({', '.join(qualifiers)})" if qualifiers else label
 
@@ -612,6 +616,7 @@ def evaluate_paired(candidate: Report) -> GateResult | None:
             candidate.run.kernel_build,
             candidate.run.baseline_kernel_profile,
             candidate.run.kernel_profile,
+            candidate.run.baseline_kernel_pgo_uncovered,
         ),
         candidate_label=image_label(
             candidate.run.helios_git_sha,
@@ -620,6 +625,7 @@ def evaluate_paired(candidate: Report) -> GateResult | None:
             candidate.run.baseline_kernel_build,
             candidate.run.kernel_profile,
             candidate.run.baseline_kernel_profile,
+            candidate.run.kernel_pgo_uncovered,
         ),
         baseline_host=candidate.hardware.cpu,
         candidate_host=candidate.hardware.cpu,

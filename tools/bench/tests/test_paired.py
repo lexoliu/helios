@@ -11,7 +11,9 @@ cannot.
 
 from __future__ import annotations
 
+import os
 import socket
+import subprocess
 from contextlib import ExitStack, nullcontext
 from pathlib import Path
 
@@ -24,7 +26,14 @@ from helios_bench.manifest import load_manifest
 from helios_bench.plots import plot_report
 from helios_bench.render import render_gate, render_tables
 from helios_bench.report import Report, Side, load_report, save_report
-from helios_bench.runner import GAP_BENCH, NetworkOptions, RunOptions, plan, run_suite
+from helios_bench.runner import (
+    GAP_BENCH,
+    NetworkOptions,
+    RunOptions,
+    kernel_pgo_uncovered,
+    plan,
+    run_suite,
+)
 from helios_bench.wasi_apps import gap_bench
 
 # Two classes, three workloads, and none of them the class that wedges:
@@ -447,6 +456,80 @@ def test_an_unpaired_report_keeps_its_three_columns(baseline_report: Report) -> 
     assert not baseline_report.run.paired
     assert baseline_report.table_sides() == [Side.HELIOS, Side.LINUX_WASMTIME, Side.LINUX_NATIVE]
     assert evaluate_paired(baseline_report) is None
+
+
+def test_a_build_record_with_an_uncovered_count_names_it_in_the_gate(
+    paired_regression_report: Report,
+) -> None:
+    """#329: the figure a profile-use build counted rides the column's label.
+
+    Two profile-use columns pair identical builds against two profiles —
+    the uncovered count is part of what each column was, and the gate
+    names it the way it names the profile.
+    """
+    run = paired_regression_report.run.model_copy(
+        update={
+            "kernel_build": "profile-use",
+            "baseline_kernel_build": "profile-use",
+            "kernel_profile": "dev@abc1234 run 34424416974",
+            "baseline_kernel_profile": "release helios-v0.1.0",
+            "kernel_pgo_uncovered": 34166,
+            "baseline_kernel_pgo_uncovered": 7897,
+        }
+    )
+    report = paired_regression_report.model_copy(update={"run": run})
+
+    verdict = evaluate_paired(report)
+    assert "34,166 uncovered functions" in verdict.candidate_label
+    assert "7,897 uncovered functions" in verdict.baseline_label
+    gate_text = render_gate(gate_report(report, None), report.run.lane)
+    assert "34,166 uncovered functions" in gate_text
+    assert "7,897 uncovered functions" in gate_text
+
+
+def test_the_uncovered_count_is_read_from_the_list_beside_the_kernel(
+    tmp_path, monkeypatch
+) -> None:
+    """The runner asks the inspector where the kernel is and counts its list.
+
+    The list lives beside whatever `kernel-path` answers rather than under
+    a path spelled twice, so the stand-in's keying is what the test counts
+    through.
+    """
+    inspector = fake_inspector(tmp_path)
+    monkeypatch.setenv("HELIOS_INSPECTOR_BIN", str(inspector))
+    lane = load_manifest().lane("x86-64-kvm")
+    checkout = fake_checkout(tmp_path / "candidate")
+    answered = subprocess.run(
+        [
+            str(inspector),
+            "vm",
+            "--arch",
+            lane.helios_arch,
+            "--release",
+            "--accel",
+            lane.accelerator,
+            "kernel-path",
+        ],
+        env={**os.environ, "HELIOS_WORKSPACE_ROOT": str(checkout)},
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    kernel = Path(answered.stdout.strip())
+    listing = Path(str(kernel) + ".pgo-uncovered.txt")
+    listing.write_text(
+        "# 3 functions the kernel profile covers nothing about\n"
+        "warning: a.1-cgu.0: no profile data available for function _A Hash = 1 up to 0 count discarded\n"
+        "warning: a.1-cgu.0: no profile data available for function _B Hash = 2 up to 0 count discarded\n"
+        "warning: b.2-cgu.3: no profile data available for function _C Hash = 3 up to 0 count discarded\n",
+        encoding="utf-8",
+    )
+    assert kernel_pgo_uncovered(checkout, lane, None) == 3
+
+    # A kernel whose build kept no list reports no count rather than zero.
+    plain = fake_checkout(tmp_path / "plain")
+    assert kernel_pgo_uncovered(plain, lane, None) is None
 
 
 def test_a_paired_regression_blocks_on_a_shared_runner(paired_regression_report: Report) -> None:
