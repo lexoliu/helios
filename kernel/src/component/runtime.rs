@@ -351,6 +351,12 @@ pub trait ComponentRuntimeState: Clone + Send + 'static {
     /// backend publishes a grant.
     fn device_grants(&self) -> &crate::device::DeviceGrantRegistry;
 
+    /// The machine's display, once a backend has brought one up.
+    ///
+    /// Empty on a machine with no display device, where a claim is
+    /// refused with `unavailable` rather than trapping.
+    fn display_service(&self) -> Option<crate::display::DisplayService>;
+
     fn profiling_enabled(&self) -> bool;
 
     fn record_profile_stack_nanos(

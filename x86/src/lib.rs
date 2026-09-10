@@ -456,12 +456,14 @@ fn install_pci_devices<WatchdogImpl>(
     }
     if let Some(address) = display_function {
         let device = gpu::install(
+            cpu,
             kernel,
             pci,
             address,
             dma_pool(address),
             exceptions::DISPLAY_INTERRUPT_VECTOR,
             destination_apic_id,
+            debug_state,
         );
         routes.set_display(exceptions::DISPLAY_INTERRUPT_VECTOR, device);
     } else {

@@ -757,7 +757,7 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
             if let Some(vsock) = vsock::install(&kernel, &cpu, &fdt, &debug_state) {
                 interrupts.attach_vsock(vsock);
             }
-            if let Some(display) = gpu::install(&kernel, &fdt) {
+            if let Some(display) = gpu::install(&cpu, &kernel, &fdt, &debug_state) {
                 interrupts.attach_display(display);
             }
             for block in block::install(&cpu, &kernel, &fdt, &debug_state, root_entropy) {

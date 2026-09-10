@@ -49,16 +49,19 @@ pub(crate) fn has_display_device(platform: &PlatformDescription) -> bool {
 
 /// Brings the platform's display engine up and hands it to the kernel.
 pub(crate) fn install<WatchdogImpl>(
+    cpu: &crate::Aarch64Cpu,
     kernel: &helios_kernel::Kernel<crate::Aarch64Cpu, WatchdogImpl>,
     platform: &PlatformDescription,
     physical_memory_offset: usize,
     handoff: &crate::LimineBootHandoff,
+    debug_state: &crate::debug_state::RuntimeState,
 ) -> Option<DisplayInterrupt>
 where
     WatchdogImpl: helios_hal::watchdog::Watchdog + Clone,
 {
     let display = discover_display_device(platform, physical_memory_offset, handoff)?;
-    helios_kernel::install_display_device(kernel, display.device.device.clone());
+    let service = helios_kernel::install_display_device(kernel, cpu, display.device.device.clone());
+    debug_state.install_display_service(service);
     Some(display)
 }
 

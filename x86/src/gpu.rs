@@ -37,13 +37,16 @@ pub(crate) fn discover(pci: &PciRoot) -> Option<PciAddress> {
 
 /// Brings up the virtio-gpu function at `address` and hands it to the
 /// kernel.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn install<WatchdogImpl>(
+    cpu: &crate::X86Cpu,
     kernel: &helios_kernel::Kernel<crate::X86Cpu, WatchdogImpl>,
     pci: &PciRoot,
     address: PciAddress,
     dma: X86DmaPool,
     vector: u8,
     destination_apic_id: u32,
+    debug_state: &crate::debug_state::RuntimeState,
 ) -> VirtioDisplayDevice
 where
     WatchdogImpl: helios_hal::watchdog::Watchdog + Clone,
@@ -54,7 +57,8 @@ where
             panic!("failed to initialize the virtio-gpu function at {address}: {error}")
         });
     let device = Arc::new(device);
-    helios_kernel::install_display_device(kernel, Arc::clone(&device));
+    let service = helios_kernel::install_display_device(kernel, cpu, Arc::clone(&device));
+    debug_state.install_display_service(service);
     tracing::info!("virtio-gpu function={address} msix_vector={vector:#x}");
     VirtioDisplayDevice { device }
 }
