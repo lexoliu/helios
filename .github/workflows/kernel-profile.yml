@@ -1,0 +1,59 @@
+name: kernel-profile
+
+# The `-C profile-generate` collection of docs/pgo.md, on demand (#313).
+#
+# Every x86-64 release build spends the kernel profile this workflow
+# uploads (#226): one `helios-kernel-profdata` artifact holding the merged
+# `helios-kernel.profdata`, collected on the lane's own machine by
+# `.github/actions/collect-kernel-profile`. It is dispatched by hand when
+# the kernel has moved enough for its counts to have aged, and runs on a
+# schedule so the artifact never ages past GitHub's retention: a lane that
+# fetches an expired profile fails at the fetch, by design.
+#
+# `bench-suite.yml`'s `profile-generate` job calls this workflow, so the
+# profile `suite-pgo` spends and the one a release build reads come from
+# one job; `release.yml` runs the same composite action on the released
+# tree and attaches what it collected to the release. A profile collected
+# two ways would be two profiles wearing one name.
+#
+# Only the profile is uploaded. A kernel image embeds the bootfs signing
+# material and is never a workflow artifact.
+
+on:
+  workflow_dispatch:
+  schedule:
+    # The first of every month. Artifacts live ninety days at most.
+    - cron: "17 3 1 * *"
+  workflow_call:
+
+jobs:
+  kernel-profile:
+    name: kernel-profile
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    permissions:
+      contents: read
+    env:
+      # The lane whose workloads and machine the profile describes: the
+      # one benchmark lane of AGENTS.md §3.6.
+      BENCH_LANE: x86-64-kvm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: helios
+      - uses: ./helios/.github/actions/checkout-wasmtime
+      - uses: ./helios/.github/actions/bench-host
+        with:
+          rust-cache-key: kernel-profile
+          bench-tooling: "true"
+      - uses: ./helios/.github/actions/collect-kernel-profile
+        with:
+          lane: ${{ env.BENCH_LANE }}
+          limine-dir: ${{ github.workspace }}/limine
+          output: ${{ github.workspace }}/profiles/helios-kernel.profdata
+      - uses: actions/upload-artifact@v4
+        with:
+          name: helios-kernel-profdata
+          path: profiles/helios-kernel.profdata
+          if-no-files-found: error
+          retention-days: 90

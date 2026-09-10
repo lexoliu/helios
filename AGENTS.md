@@ -465,11 +465,13 @@ Suppressing a lint needs `#[expect(…, reason = "…")]` on the item, with a
 reason that says why the lint is wrong there. `clippy::manual_async_fn` is
 the gate for §3.2's `async fn` rule.
 
-`dep-check.yml` runs on a schedule and on demand. `release.yml` runs
-`release-plz` on every push to `main`: it owns version numbers, the
-changelog and tags, so commits follow the conventional format (`feat:`,
-`fix:`, `feat!:`, `BREAKING CHANGE:`) and nobody edits a version or a
-changelog by hand.
+`dep-check.yml` runs on a schedule and on demand. `kernel-profile.yml`
+collects the x86-64 kernel profile every release build spends, on demand
+and monthly (`docs/pgo.md`); `bench-suite.yml`'s `profile-generate` job
+calls it. `release.yml` runs `release-plz` on every push to `main`: it
+owns version numbers, the changelog and tags, so commits follow the
+conventional format (`feat:`, `fix:`, `feat!:`, `BREAKING CHANGE:`) and
+nobody edits a version or a changelog by hand.
 
 ## 8. Branches, pull requests, evidence
 

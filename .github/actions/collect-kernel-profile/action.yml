@@ -5,8 +5,9 @@ description: >-
   merged `helios-kernel.profdata` written where the caller asks for it.
 
   Two workflows collect a profile and they collect the same one.
-  `bench-suite.yml`'s `profile-generate` job uploads it as an artifact for
-  `suite-pgo` to spend; `release.yml` attaches it to the release the
+  `kernel-profile.yml` uploads it as the artifact every x86-64 release
+  build spends, on demand and for `bench-suite.yml`'s `profile-generate`
+  job, which calls it (#313); `release.yml` attaches it to the release the
   kernel beside it was built from (#226). The sequence lives here so a
   change to what the profile covers reaches both, because a profile
   collected two ways is two profiles.
