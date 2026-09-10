@@ -2885,8 +2885,16 @@ where
                 // Whatever the program printed is the guest's own
                 // account of what happened, and it is the half of the
                 // evidence the host cannot produce. A program still
-                // running when the wait ends is left running.
-                match crate::runtime::timeout(wait, guest).await {
+                // running when the wait ends is left running. The router
+                // stays polled through the wait: it holds the transport's
+                // reader, so a wait that polled only the guest future
+                // would leave nobody reading the program's exit reply.
+                let outcome =
+                    futures_lite::future::or(crate::runtime::timeout(wait, guest), async {
+                        match served.as_mut().await {}
+                    })
+                    .await;
+                match outcome {
                     Some(outcome) => report_guest_run(&program, outcome),
                     None => println!(
                         "{} {} is still running after {}s",
