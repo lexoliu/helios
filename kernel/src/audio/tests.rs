@@ -12,7 +12,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use arrayvec::ArrayVec;
 use futures::channel::oneshot;
-use futures::future::{Either, select};
+use futures::future::{Either, join, select};
 use futures_lite::future::{block_on, poll_once, yield_now};
 use helios_hal::audio::{
     AudioError, AudioEvent, AudioResult, ChannelMapList, JackList, PcmParams, PlaybackDevice,
@@ -122,6 +122,15 @@ struct ScriptedDevice {
     /// How many bytes the device claims to still hold when it takes a
     /// period.
     latency_bytes: u32,
+    /// When `Some`, `start` answers this error instead of running.
+    start_error: Option<AudioError>,
+    /// When `Some`, `write` answers this error on its first poll
+    /// instead of recording the period.
+    write_error: Option<AudioError>,
+    /// Whether `write` yields once before completing. A device that
+    /// answers on its first poll is what the pump's priming has to
+    /// keep up with.
+    yield_on_write: bool,
 }
 
 impl ScriptedDevice {
@@ -134,6 +143,9 @@ impl ScriptedDevice {
             started: AtomicU32::new(0),
             events: Mutex::new(Vec::new()),
             latency_bytes: 0,
+            start_error: None,
+            write_error: None,
+            yield_on_write: true,
         }
     }
 
@@ -171,7 +183,10 @@ impl PlaybackDevice for ScriptedDevice {
 
     async fn start(&self, _stream: StreamId) -> AudioResult<()> {
         self.started.fetch_add(1, Ordering::AcqRel);
-        Ok(())
+        match self.start_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     async fn stop(&self, _stream: StreamId) -> AudioResult<()> {
@@ -183,11 +198,17 @@ impl PlaybackDevice for ScriptedDevice {
     }
 
     async fn write(&self, _stream: StreamId, period: &[u8]) -> AudioResult<XferStatus> {
+        if let Some(error) = self.write_error {
+            return Err(error);
+        }
         let held = self.in_flight.fetch_add(1, Ordering::AcqRel) + 1;
         self.high_water.fetch_max(held, Ordering::AcqRel);
-        // One yield, so several writes are genuinely outstanding at once
-        // rather than each completing before the next is pushed.
-        crate::yield_now().await;
+        if self.yield_on_write {
+            // One yield, so several writes are genuinely outstanding at
+            // once rather than each completing before the next is
+            // pushed.
+            crate::yield_now().await;
+        }
         self.played.lock().push(period.to_vec());
         self.in_flight.fetch_sub(1, Ordering::AcqRel);
         Ok(XferStatus {
@@ -796,15 +817,10 @@ fn write_once<'a>(
 /// One `poll_write` that has to make progress, which is what the
 /// producers above want: the ring is four periods deep and the pump is
 /// running beside them.
-fn write_some<'a>(
-    writer: &'a mut PeriodWriter,
-    bytes: &'a [u8],
-) -> impl Future<Output = usize> + 'a {
-    async move {
-        match write_once(writer, bytes).await {
-            Written::Took(taken) => taken,
-            Written::Ended => panic!("the ring ended under a producer that still had material"),
-        }
+async fn write_some(writer: &mut PeriodWriter, bytes: &[u8]) -> usize {
+    match write_once(writer, bytes).await {
+        Written::Took(taken) => taken,
+        Written::Ended => panic!("the ring ended under a producer that still had material"),
     }
 }
 
@@ -825,4 +841,228 @@ fn a_released_claim_frees_its_word_only_after_the_device_is_stopped() {
         ClaimState::RELEASING,
         "the word says the stream is neither held nor free"
     );
+}
+
+/// A pump that dies before the clock starts still ends the producer.
+///
+/// The device refused `start`, so no period is ever coming back; a
+/// producer left parked on one would wait for ever. Every exit of the
+/// pump closes the ring, which is what the producer's next write sees.
+#[test]
+fn a_device_that_refuses_to_start_ends_its_producer() {
+    test_hooks::install();
+    let (service, _inboxes) = service_of(&[playback_stream(0)]);
+    let mut audio = AudioOwnership::new();
+    audio
+        .claim(&service, 0, window())
+        .expect("the stream is free");
+    let (ring, params) = audio.negotiate(TONE).expect("the device takes this format");
+
+    let mut device = ScriptedDevice::new(topology(&[playback_stream(0)]));
+    device.start_error = Some(AudioError::DeviceIo);
+    let timer = Timer::new(TestCpu::without_entropy());
+    let period = alloc::vec![0x11_u8; params.period_bytes as usize];
+
+    let outcome = block_on(async {
+        let player = async {
+            let mut writer = PeriodWriter::new(ring.clone());
+            // Fill the ring, so the next write has to wait on a period
+            // the dead pump will never hand back.
+            for _ in 0..PERIODS_IN_FLIGHT {
+                assert_eq!(write_some(&mut writer, &period).await, period.len());
+            }
+            write_once(&mut writer, &period).await
+        };
+        let pump = pin!(play(&device, stream_of(&service), &ring, params, &timer));
+        join(pin!(player), pump).await.0
+    });
+    assert_eq!(
+        outcome,
+        Written::Ended,
+        "the producer is ended, not parked, when the pump dies"
+    );
+}
+
+/// A period the device refuses kills the stream the same way: the pump
+/// closes the ring as it leaves, and the producer's next write ends
+/// rather than parking on a reclaim that cannot come.
+///
+/// The refusal is synchronous — the write answers on the first poll,
+/// inside the pump's priming pass — so this is also the check that a
+/// first-poll completion takes the same path as every other.
+#[test]
+fn a_rejected_period_ends_the_stream_and_its_producer() {
+    test_hooks::install();
+    let (service, _inboxes) = service_of(&[playback_stream(0)]);
+    let mut audio = AudioOwnership::new();
+    audio
+        .claim(&service, 0, window())
+        .expect("the stream is free");
+    let (ring, params) = audio.negotiate(TONE).expect("the device takes this format");
+
+    let mut device = ScriptedDevice::new(topology(&[playback_stream(0)]));
+    device.yield_on_write = false;
+    device.write_error = Some(AudioError::PeriodLength {
+        stream: StreamId::new(0),
+        period_bytes: params.period_bytes,
+        actual: params.period_bytes as usize + 1,
+    });
+    let timer = Timer::new(TestCpu::without_entropy());
+    let period = alloc::vec![0x22_u8; params.period_bytes as usize];
+
+    let outcome = block_on(async {
+        let player = async {
+            let mut writer = PeriodWriter::new(ring.clone());
+            for _ in 0..PERIODS_IN_FLIGHT {
+                assert_eq!(write_some(&mut writer, &period).await, period.len());
+            }
+            write_once(&mut writer, &period).await
+        };
+        let pump = pin!(play(&device, stream_of(&service), &ring, params, &timer));
+        join(pin!(player), pump).await.0
+    });
+    assert_eq!(
+        outcome,
+        Written::Ended,
+        "a refused period ends the producer rather than losing the refusal"
+    );
+    assert_eq!(
+        device.started.load(Ordering::Acquire),
+        1,
+        "the clock was asked to start before the refusal settled"
+    );
+}
+
+/// A `write` that answers on its first poll — a device that completes
+/// without an interrupt — is a completion like any other: the period is
+/// reclaimed, its bytes counted, its latency published.
+///
+/// The priming poll is the only place such an answer could be lost, and
+/// losing it would drop the period's index with it: the free list would
+/// shrink by one and the player's accounting would be a period short.
+#[test]
+fn a_write_that_completes_on_its_first_poll_is_settled_the_same() {
+    test_hooks::install();
+    let (service, _inboxes) = service_of(&[playback_stream(0)]);
+    let mut audio = AudioOwnership::new();
+    audio
+        .claim(&service, 0, window())
+        .expect("the stream is free");
+    let (ring, params) = audio.negotiate(TONE).expect("the device takes this format");
+
+    let mut device = ScriptedDevice::new(topology(&[playback_stream(0)]));
+    device.yield_on_write = false;
+    let timer = Timer::new(TestCpu::without_entropy());
+    let periods = 9;
+    let tone = alloc::vec![0x5a_u8; params.period_bytes as usize * periods];
+
+    let written = block_on(async {
+        let produce = async {
+            let mut writer = PeriodWriter::new(ring.clone());
+            let mut offset = 0;
+            while offset < tone.len() {
+                offset += write_some(&mut writer, &tone[offset..]).await;
+            }
+            writer.finish();
+            writer.accepted()
+        };
+        let pump = pin!(play(&device, stream_of(&service), &ring, params, &timer));
+        join(pin!(produce), pump).await.0
+    });
+    assert_eq!(written, tone.len() as u64);
+    assert_eq!(
+        device.played_bytes(),
+        tone.len(),
+        "every period reached the device"
+    );
+    assert_eq!(
+        stream_of(&service).played_bytes.load(Ordering::Acquire),
+        tone.len() as u64,
+        "every completion was settled, including the ones the priming poll found"
+    );
+    assert_eq!(
+        device.started.load(Ordering::Acquire),
+        1,
+        "the clock started once, on the primed chains"
+    );
+}
+
+/// A closed ring takes nothing, even while its free list still shows
+/// periods: the pump that would have played them is gone, so handing
+/// one out would only pretend the bytes were going somewhere.
+#[test]
+fn a_closed_ring_takes_no_more_bytes() {
+    test_hooks::install();
+    let (service, _inboxes) = service_of(&[playback_stream(0)]);
+    let mut audio = AudioOwnership::new();
+    audio
+        .claim(&service, 0, window())
+        .expect("the stream is free");
+    let (ring, params) = audio.negotiate(TONE).expect("the device takes this format");
+    let mut writer = PeriodWriter::new(ring.clone());
+    let period = alloc::vec![0x33_u8; params.period_bytes as usize];
+
+    ring.close();
+    block_on(async {
+        assert_eq!(
+            write_once(&mut writer, &period).await,
+            Written::Ended,
+            "a free period on a closed ring is not the producer's to take"
+        );
+    });
+}
+
+/// The cursor a producer is handed writes into the pinned period
+/// itself: the bytes the device is later handed are the bytes the
+/// cursor wrote, at the same address — there is no staging copy.
+#[test]
+fn a_period_cursor_writes_into_the_pinned_period_itself() {
+    test_hooks::install();
+    let (service, _inboxes) = service_of(&[playback_stream(0)]);
+    let mut audio = AudioOwnership::new();
+    audio
+        .claim(&service, 0, window())
+        .expect("the stream is free");
+    let (ring, params) = audio.negotiate(TONE).expect("the device takes this format");
+
+    block_on(async {
+        let mut writer = PeriodWriter::new(ring.clone());
+
+        // A cursor returned short of full leaves the period open; the
+        // next one resumes it where it left off.
+        let mut cursor = core::future::poll_fn(|cx| writer.poll_cursor(cx))
+            .await
+            .expect("the free list has a period");
+        let head = alloc::vec![0xa5_u8; 64];
+        cursor.fill(&head);
+        writer.return_cursor(cursor);
+
+        let mut cursor = core::future::poll_fn(|cx| writer.poll_cursor(cx))
+            .await
+            .expect("the same period is handed back out");
+        assert_eq!(
+            cursor.room(),
+            params.period_bytes as usize - head.len(),
+            "the resumed period keeps what the first cursor wrote"
+        );
+        let tail = cursor.tail().as_ptr() as usize;
+        let body = alloc::vec![0x5a_u8; cursor.room()];
+        cursor.fill(&body);
+        writer.return_cursor(cursor);
+
+        let index = ring.take_filled().expect("a full period was committed");
+        // SAFETY: the index came off the filled list, which is this
+        // test's side of the ring's ownership split.
+        let period = unsafe { ring.period(index) };
+        assert_eq!(
+            period[head.len()..].as_ptr() as usize,
+            tail,
+            "the cursor's buffer is the pinned period's own memory"
+        );
+        assert!(
+            period[..head.len()].iter().all(|byte| *byte == 0xa5)
+                && period[head.len()..].iter().all(|byte| *byte == 0x5a),
+            "the bytes the cursors wrote are the bytes the device is handed"
+        );
+    });
 }

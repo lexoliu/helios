@@ -32,14 +32,14 @@ use helios_hal::audio::{SampleFormat, SampleRate, StreamInfo};
 use triomphe::Arc;
 use wasmtime::StoreContextMut;
 use wasmtime::component::{
-    Access, Accessor, Destination, FutureReader, HasSelf, Linker, Resource, Source, StreamConsumer,
-    StreamProducer, StreamReader, StreamResult, VecBuffer,
+    Access, Accessor, Destination, FutureReader, HasSelf, Linker, ReadBuffer, Resource, Source,
+    StreamConsumer, StreamProducer, StreamReader, StreamResult, VecBuffer, WriteBuffer,
 };
 
 use crate::ComponentHostNetwork;
 use crate::audio::{
-    AudioSender, AudioServiceError, Feedback, FeedbackReader, PeriodRing, PeriodWriter,
-    PlaybackFormat, Written,
+    AudioSender, AudioServiceError, Feedback, FeedbackReader, PeriodCursor, PeriodRing,
+    PeriodWriter, PlaybackFormat,
 };
 use crate::wasmtime_adapter::bindings::audio::bindings::helios::system::audio as audio_wit;
 
@@ -335,18 +335,55 @@ impl<T: 'static> StreamProducer<T> for FeedbackStreamProducer {
     }
 }
 
-/// The consumer that copies a player's samples into the kernel's period
+/// The guest's samples land in the period a [`PeriodCursor`] covers.
+///
+/// The pinned pages are the kernel's own alias and outlive every read,
+/// and the only writer is the task that owns the writer — which is what
+/// makes a raw-addressed cursor safe to hand `Source::read` as the
+/// buffer it fills.
+impl ReadBuffer<u8> for PeriodCursor {
+    /// Copy the lifted items into the room left. `lift` never asks for
+    /// more than `remaining_capacity`, so a tail overrun is the caller
+    /// miscounting — `tail`'s own bounds check says so.
+    fn extend<I: IntoIterator<Item = u8>>(&mut self, iter: I) {
+        Extend::extend(self, iter);
+    }
+
+    fn remaining_capacity(&self) -> usize {
+        self.room()
+    }
+
+    fn move_from(&mut self, input: &mut dyn WriteBuffer<u8>, count: usize) {
+        input.take(count, &mut |slice| {
+            let tail = self.tail();
+            // `take`'s contract is that the slice carries `count`
+            // initialized items.
+            assert_eq!(
+                slice.len(),
+                count,
+                "a WriteBuffer::take hands over exactly what was asked for"
+            );
+            // SAFETY: per the `WriteBuffer` contract every item in
+            // `slice` is initialized, and the period's pages cannot
+            // alias a buffer that lives in the host.
+            let bytes =
+                unsafe { core::slice::from_raw_parts(slice.as_ptr().cast::<u8>(), slice.len()) };
+            tail[..bytes.len()].copy_from_slice(bytes);
+            self.advance(bytes.len());
+        });
+    }
+}
+
+/// The consumer that lands a player's samples in the kernel's period
 /// buffers.
 ///
-/// It parks when every period is with the device, which is the whole of
-/// the backpressure a playback path has: a writer that is never made to
-/// wait is a writer that has run ahead of the sound.
+/// The read goes straight into the pinned pages — the buffer it fills
+/// is the period itself, so no copy the kernel owns ever holds a
+/// sample. It parks when every period is with the device, which is the
+/// whole of the backpressure a playback path has: a writer that is
+/// never made to wait is a writer that has run ahead of the sound.
 struct SampleStreamConsumer {
     writer: PeriodWriter,
-    /// The batch taken off the guest's stream and how much of it has
-    /// been copied. Held here — never dropped — until the ring has room
-    /// for the rest of it.
-    pending: Option<(Vec<u8>, usize)>,
     completion: Option<oneshot::Sender<Result<(), AudioServiceError>>>,
 }
 
@@ -359,7 +396,6 @@ impl SampleStreamConsumer {
     ) -> Self {
         Self {
             writer,
-            pending: None,
             completion: Some(completion),
         }
     }
@@ -388,35 +424,24 @@ impl<T: 'static> StreamConsumer<T> for SampleStreamConsumer {
         mut source: Source<'_, Self::Item>,
         _finish: bool,
     ) -> Poll<wasmtime::Result<StreamResult>> {
-        if self.pending.is_none() {
-            let available = source.remaining(&mut store);
-            if available == 0 {
-                return Poll::Ready(Ok(StreamResult::Completed));
-            }
-            let mut bytes = Vec::with_capacity(available);
-            source.read(&mut store, &mut bytes)?;
-            self.pending = Some((bytes, 0));
+        if source.remaining(&mut store) == 0 {
+            return Poll::Ready(Ok(StreamResult::Completed));
         }
-        let consumer = &mut *self;
-        let (bytes, offset) = consumer
-            .pending
-            .as_mut()
-            .expect("a batch was just taken from the guest's stream");
-        while *offset < bytes.len() {
-            match consumer.writer.poll_write(cx, &bytes[*offset..]) {
-                Poll::Ready(Written::Took(taken)) => *offset += taken,
-                // The stream was stopped, or the claim let go, under a
-                // player that is still writing. Nothing more will ever
-                // be taken, so the rest of this batch is dropped with
-                // the consumer rather than waited on.
-                Poll::Ready(Written::Ended) => {
-                    consumer.pending = None;
-                    return Poll::Ready(Ok(StreamResult::Dropped));
-                }
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-        consumer.pending = None;
+        let mut cursor = match self.writer.poll_cursor(cx) {
+            Poll::Ready(Some(cursor)) => cursor,
+            // The ring closed under a player that is still writing —
+            // a stop asked for, or the claim let go. Nothing more is
+            // ever taken, so what is left of this write goes back to
+            // the guest undelivered.
+            Poll::Ready(None) => return Poll::Ready(Ok(StreamResult::Dropped)),
+            Poll::Pending => return Poll::Pending,
+        };
+        // At most the room the current period has left; a filled period
+        // is committed as the cursor comes back, and the rest of the
+        // guest's write arrives on the next poll.
+        let read = source.read(&mut store, &mut cursor);
+        self.writer.return_cursor(cursor);
+        read?;
         Poll::Ready(Ok(StreamResult::Completed))
     }
 }

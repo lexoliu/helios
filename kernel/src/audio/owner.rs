@@ -40,7 +40,7 @@
 //! that an implementation serialises access to its own rings.
 
 use core::future::Future;
-use core::pin::pin;
+use core::pin::{Pin, pin};
 use core::task::Poll;
 use core::time::Duration;
 
@@ -48,9 +48,9 @@ use arrayvec::ArrayVec;
 use core::sync::atomic::Ordering;
 use futures::StreamExt;
 use futures::future::{Either, select};
-use futures::stream::FuturesUnordered;
 use helios_hal::audio::{
-    AudioEvent, MAX_STREAMS, PcmParams, PlaybackDevice, StreamDirection, StreamId,
+    AudioError, AudioEvent, AudioResult, MAX_STREAMS, PcmParams, PlaybackDevice, StreamDirection,
+    StreamId, XferStatus,
 };
 use helios_hal::cpu::Cpu;
 use helios_hal::watchdog::Watchdog;
@@ -58,7 +58,7 @@ use triomphe::Arc;
 
 use crate::Kernel;
 use crate::component::{ProviderReceiver, provider_channel};
-use crate::exec::Timer;
+use crate::exec::{InFlight, Timer};
 
 use super::AudioServiceError;
 use super::service::{
@@ -342,11 +342,7 @@ async fn configure<Device: PlaybackDevice>(
     Ok(())
 }
 
-fn refused(
-    stream: StreamId,
-    step: &'static str,
-    error: helios_hal::audio::AudioError,
-) -> AudioServiceError {
+fn refused(stream: StreamId, step: &'static str, error: AudioError) -> AudioServiceError {
     tracing::warn!(
         target: "helios_kernel::audio",
         %error,
@@ -355,10 +351,11 @@ fn refused(
         "the sound device refused a playback stream"
     );
     match error {
-        helios_hal::audio::AudioError::InvalidParams(_)
-        | helios_hal::audio::AudioError::NotSupported => AudioServiceError::UnsupportedFormat,
-        helios_hal::audio::AudioError::UnknownStream(_) => AudioServiceError::NoSuchStream,
-        helios_hal::audio::AudioError::NotPlayback(_) => AudioServiceError::NotPlayback,
+        AudioError::InvalidParams(_) | AudioError::NotSupported => {
+            AudioServiceError::UnsupportedFormat
+        }
+        AudioError::UnknownStream(_) => AudioServiceError::NoSuchStream,
+        AudioError::NotPlayback(_) => AudioServiceError::NotPlayback,
         _ => AudioServiceError::DeviceFault,
     }
 }
@@ -382,7 +379,10 @@ pub(super) async fn play<Device, CpuImpl>(
     CpuImpl: Cpu + Clone,
 {
     let stream = shared.id();
-    let mut writes = FuturesUnordered::new();
+    // A fixed set of write chains: the ring is `PERIODS_IN_FLIGHT` deep
+    // and every `write` here is the same concrete future, so the set is
+    // an array rather than an allocation per period.
+    let mut writes = pin!(InFlight::<_, PERIODS_IN_FLIGHT>::new());
     let mut started = false;
     let mut last_latency = 0_u32;
     loop {
@@ -396,13 +396,17 @@ pub(super) async fn play<Device, CpuImpl>(
             // reclaimed until this chain completes, so the device is the
             // only reader of that period for as long as it holds it.
             let period = unsafe { ring.period(index) };
-            writes.push(async move { (index, device.write(stream, period).await) });
+            writes
+                .as_mut()
+                .push(async move { (index, device.write(stream, period).await) });
         }
         if !started && !writes.is_empty() {
-            // One poll of the set, which is what submits every chain it
-            // holds; it returns immediately and is not a wait. The clock
-            // must not start on an empty transmit ring.
-            prime(&mut writes).await;
+            // One poll of the set submits every chain it holds. A write
+            // may answer on that very poll — a refusal, or a device
+            // that completes without an interrupt — and an answer is a
+            // completion the same path settles: it is collected rather
+            // than dropped.
+            let primed = prime(writes.as_mut()).await;
             match device.start(stream).await {
                 Ok(()) => started = true,
                 Err(error) => {
@@ -412,6 +416,17 @@ pub(super) async fn play<Device, CpuImpl>(
                         stream = stream.index(),
                         "the sound device would not start a negotiated stream"
                     );
+                    // The producer may be parked mid-write; a pump that
+                    // leaves the ring open would park it for ever.
+                    ring.close();
+                    return;
+                }
+            }
+            for (index, outcome) in primed {
+                if let Completion::Stop =
+                    settle(shared, ring, stream, index, outcome, &mut last_latency)
+                {
+                    ring.close();
                     return;
                 }
             }
@@ -425,26 +440,12 @@ pub(super) async fn play<Device, CpuImpl>(
         }
         match select(writes.next(), committed).await {
             Either::Left((Some((index, outcome)), _)) => {
-                match outcome {
-                    Ok(status) => {
-                        last_latency = status.latency_bytes;
-                        shared
-                            .played_bytes
-                            .fetch_add(ring.period_bytes() as u64, Ordering::AcqRel);
-                        shared.publish(Feedback::LatencyBytes(status.latency_bytes));
-                    }
-                    Err(error) => {
-                        tracing::error!(
-                            target: "helios_kernel::audio",
-                            %error,
-                            stream = stream.index(),
-                            "the sound device rejected a period; the stream stops here"
-                        );
-                        ring.reclaim(index);
-                        return;
-                    }
+                if let Completion::Stop =
+                    settle(shared, ring, stream, index, outcome, &mut last_latency)
+                {
+                    ring.close();
+                    return;
                 }
-                ring.reclaim(index);
             }
             // The set is not empty, so its stream cannot have ended.
             Either::Left((None, _)) => unreachable!("a non-empty write set never ends"),
@@ -455,6 +456,50 @@ pub(super) async fn play<Device, CpuImpl>(
     // it still held when it took the last one. Stopping now would cut
     // them off, so the tail is waited out rather than truncated.
     drain_device_latency(last_latency, params, timer).await;
+}
+
+/// What one finished write leaves the stream doing.
+enum Completion {
+    /// Its period is back on the free list; the pump keeps feeding.
+    Playing,
+    /// The device refused it; the stream ends here.
+    Stop,
+}
+
+/// Reclaim the period a finished write carried, report what the device
+/// said about it, and say what the stream does next.
+///
+/// This is the one path every completion takes — a write that answered
+/// on its first poll takes it no differently than one that needed an
+/// interrupt.
+fn settle(
+    shared: &StreamShared,
+    ring: &PeriodRing,
+    stream: StreamId,
+    index: u8,
+    outcome: AudioResult<XferStatus>,
+    last_latency: &mut u32,
+) -> Completion {
+    ring.reclaim(index);
+    match outcome {
+        Ok(status) => {
+            *last_latency = status.latency_bytes;
+            shared
+                .played_bytes
+                .fetch_add(ring.period_bytes() as u64, Ordering::AcqRel);
+            shared.publish(Feedback::LatencyBytes(status.latency_bytes));
+            Completion::Playing
+        }
+        Err(error) => {
+            tracing::error!(
+                target: "helios_kernel::audio",
+                %error,
+                stream = stream.index(),
+                "the sound device rejected a period; the stream stops here"
+            );
+            Completion::Stop
+        }
+    }
 }
 
 /// Wait for the bytes the device still held when it took the last
@@ -477,16 +522,26 @@ async fn drain_device_latency<CpuImpl: Cpu + Clone>(
 }
 
 /// Poll a set of writes once, which is what submits the chains they
-/// carry, and return whether or not any of them completed.
+/// carry, and collect whatever answered on that poll.
 ///
 /// Not a wait: the returned future is ready on its first poll. It exists
 /// because a chain reaches the device on the first poll of its write and
 /// not before, and starting a stream whose transmit ring is still empty
-/// is an underrun the kernel would have caused itself.
-async fn prime<Fut: Future>(writes: &mut FuturesUnordered<Fut>) {
+/// is an underrun the kernel would have caused itself. What answered is
+/// returned rather than dropped: a `write` that completes on its first
+/// poll — a refusal like `NotConfigured` or `PeriodLength`, or a device
+/// that needs no interrupt — is a completion like any other, and its
+/// period index and error are the caller's to settle.
+async fn prime<Fut: Future, const N: usize>(
+    mut writes: Pin<&mut InFlight<Fut, N>>,
+) -> ArrayVec<Fut::Output, N> {
+    let mut done = ArrayVec::new();
     core::future::poll_fn(|cx| {
-        let _ = writes.poll_next_unpin(cx);
+        while let Poll::Ready(Some(output)) = writes.as_mut().poll_next(cx) {
+            done.push(output);
+        }
         Poll::Ready(())
     })
     .await;
+    done
 }

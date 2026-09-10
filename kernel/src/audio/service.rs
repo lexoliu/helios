@@ -59,8 +59,8 @@ use helios_hal::vmm::VirtAddr;
 use triomphe::Arc;
 
 use crate::component::{ProviderError, ProviderSender};
-use crate::pins::PinnedRun;
 use crate::exec::{Notify, NotifyWaiter};
+use crate::pins::PinnedRun;
 
 use super::AudioServiceError;
 use super::instance::AudioPins;
@@ -389,10 +389,6 @@ impl PeriodRing {
         self.reclaimed.waiter()
     }
 
-    pub fn poll_committed(&self, cx: &mut Context<'_>, waiter: &mut NotifyWaiter) -> Poll<()> {
-        self.committed.poll_notified(cx, waiter)
-    }
-
     pub fn poll_reclaimed(&self, cx: &mut Context<'_>, waiter: &mut NotifyWaiter) -> Poll<()> {
         self.reclaimed.poll_notified(cx, waiter)
     }
@@ -534,42 +530,82 @@ impl PeriodWriter {
         if bytes.is_empty() {
             return Poll::Ready(Written::Took(0));
         }
-        let period_bytes = self.ring.period_bytes();
         let mut taken = 0;
         while taken < bytes.len() {
-            let (index, filled) = match self.current {
-                Some(current) => current,
-                None => match self.next_period(cx) {
-                    Poll::Ready(Some(index)) => (index, 0),
-                    // The ring closed under this producer. Whatever it
-                    // handed over up to here is already committed, and
-                    // there is nothing left to wait on.
-                    Poll::Ready(None) => return Poll::Ready(Written::Ended),
-                    // Every period is with the device. Anything already
-                    // taken is committed and reported; a first pass that
-                    // took nothing parks, which is the backpressure that
-                    // paces a player to its own stream.
-                    Poll::Pending if taken == 0 => return Poll::Pending,
-                    Poll::Pending => break,
-                },
+            let mut cursor = match self.poll_cursor(cx) {
+                Poll::Ready(Some(cursor)) => cursor,
+                // The ring closed under this producer. Whatever it
+                // handed over up to here is already committed, and
+                // there is nothing left to wait on.
+                Poll::Ready(None) if taken == 0 => return Poll::Ready(Written::Ended),
+                Poll::Ready(None) => break,
+                // Every period is with the device. Anything already
+                // taken is committed and reported; a first pass that
+                // took nothing parks, which is the backpressure that
+                // paces a player to its own stream.
+                Poll::Pending if taken == 0 => return Poll::Pending,
+                Poll::Pending => break,
             };
-            let room = period_bytes - filled;
-            let take = room.min(bytes.len() - taken);
-            // SAFETY: `index` came off the free list and has not been
-            // committed, so this task owns the period.
-            let period = unsafe { self.ring.period_mut(index) };
-            period[filled..filled + take].copy_from_slice(&bytes[taken..taken + take]);
+            let take = cursor.room().min(bytes.len() - taken);
+            cursor.fill(&bytes[taken..taken + take]);
+            self.return_cursor(cursor);
             taken += take;
-            let filled = filled + take;
-            if filled == period_bytes {
-                self.current = None;
-                self.ring.commit(index);
-            } else {
-                self.current = Some((index, filled));
-            }
         }
         self.accepted += taken as u64;
         Poll::Ready(Written::Took(taken))
+    }
+
+    /// The cursor over the period being filled: the buffer a caller
+    /// that can write into pinned memory itself is handed, so the
+    /// guest's bytes land in the period directly rather than in a copy
+    /// the kernel would have to own.
+    ///
+    /// `Ready(None)` once the ring has closed under this producer —
+    /// a closed ring hands out nothing, whatever room its free list
+    /// still shows, because the pump that would have played the period
+    /// is gone — and `Pending` while every period is with the device.
+    /// [`Self::return_cursor`] takes the cursor back; while it is out
+    /// the writer is between periods.
+    pub fn poll_cursor(&mut self, cx: &mut Context<'_>) -> Poll<Option<PeriodCursor>> {
+        if self.ring.is_closed() {
+            return Poll::Ready(None);
+        }
+        let (index, filled) = match self.current.take() {
+            Some(current) => current,
+            None => match self.next_period(cx) {
+                Poll::Ready(Some(index)) => (index, 0),
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending => return Poll::Pending,
+            },
+        };
+        // SAFETY: the period came off the free list and is not
+        // committed, so it is this task's to write.
+        let period = unsafe { self.ring.period_mut(index) };
+        Poll::Ready(Some(PeriodCursor {
+            base: VirtAddr::new(period.as_mut_ptr() as usize),
+            filled,
+            capacity: period.len(),
+            index,
+        }))
+    }
+
+    /// Take a cursor back. A period the write filled is committed; one
+    /// it left room in stays the period being filled.
+    ///
+    /// # Panics
+    ///
+    /// Panics in debug builds when a second cursor is handed back while
+    /// the first is still out, which the single caller never produces.
+    pub fn return_cursor(&mut self, cursor: PeriodCursor) {
+        debug_assert!(
+            self.current.is_none(),
+            "a writer has at most one cursor out at a time"
+        );
+        if cursor.filled == cursor.capacity {
+            self.ring.commit(cursor.index);
+        } else {
+            self.current = Some((cursor.index, cursor.filled));
+        }
     }
 
     /// End this writer's half of the stream.
@@ -594,6 +630,13 @@ impl PeriodWriter {
     /// ring has closed and no further period will come back.
     fn next_period(&mut self, cx: &mut Context<'_>) -> Poll<Option<u8>> {
         loop {
+            // A closed ring hands out nothing, whatever its free list
+            // still holds: the pump that would have played the period
+            // is gone, so taking it would only pretend the bytes were
+            // going somewhere.
+            if self.ring.is_closed() {
+                return Poll::Ready(None);
+            }
             if let Some(index) = self.ring.take_free() {
                 return Poll::Ready(Some(index));
             }
@@ -619,7 +662,106 @@ impl Drop for PeriodWriter {
     }
 }
 
+/// A write cursor over the room left in one period.
+///
+/// The whole of the buffer a caller fills: pointer, capacity and fill.
+/// [`PeriodWriter::poll_cursor`] hands one out over the period the
+/// writer's task owns and [`PeriodWriter::return_cursor`] takes it
+/// back; between the two, whatever is written through it lands in the
+/// pinned pages themselves rather than in a copy the kernel would have
+/// to own. A cursor is only ever out for the length of one call on that
+/// task — the writer asserts as much when it comes back — so although
+/// it is a plain value, nothing about the period aliases while it is.
+pub struct PeriodCursor {
+    /// The kernel alias of the period's first byte.
+    base: VirtAddr,
+    /// Bytes already in the period, including what this cursor adds.
+    filled: usize,
+    /// The period's whole length.
+    capacity: usize,
+    /// The period's own index in its ring, so the writer can commit it.
+    index: u8,
+}
+
+impl PeriodCursor {
+    /// Bytes of room the cursor still has.
+    pub fn room(&self) -> usize {
+        self.capacity - self.filled
+    }
+
+    /// The room left, as a slice to write into.
+    ///
+    /// Writing the tail does not move the fill on its own —
+    /// [`Self::advance`] does — which is what keeps a partially consumed
+    /// write from stranding bytes the caller was never told it took.
+    pub(crate) fn tail(&mut self) -> &mut [u8] {
+        // SAFETY: `base` is the kernel alias of a pinned period whose
+        // ownership the ring's free list made exclusive to this task,
+        // and `room()` bytes follow `base + filled` inside it.
+        unsafe {
+            core::slice::from_raw_parts_mut(
+                self.base.saturating_add(self.filled).raw() as *mut u8,
+                self.room(),
+            )
+        }
+    }
+
+    /// Move the fill forward after `count` bytes were written into
+    /// [`Self::tail`].
+    ///
+    /// # Panics
+    ///
+    /// Panics when `count` exceeds the room the cursor had, which would
+    /// mean the caller wrote past the period — a bug, not a shortage.
+    pub(crate) fn advance(&mut self, count: usize) {
+        assert!(
+            count <= self.room(),
+            "a cursor is advanced past the room it had"
+        );
+        self.filled += count;
+    }
+
+    /// Copy `bytes` into the room left.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `bytes` does not fit, which is the caller miscounting
+    /// the room rather than a shortage.
+    pub fn fill(&mut self, bytes: &[u8]) {
+        self.tail()[..bytes.len()].copy_from_slice(bytes);
+        self.filled += bytes.len();
+    }
+}
+
+/// The bulk form of [`PeriodCursor::fill`], which is what a `Source`'s
+/// read calls for every item it lifts.
+impl Extend<u8> for PeriodCursor {
+    fn extend<I: IntoIterator<Item = u8>>(&mut self, iter: I) {
+        let tail = self.tail();
+        let mut written = 0_usize;
+        for byte in iter {
+            tail[written] = byte;
+            written += 1;
+        }
+        self.filled += written;
+    }
+}
+
 /// One playback stream, as everything outside its owner tasks sees it.
+///
+/// # Concurrency contract
+///
+/// Shared between two tasks on one processor: the task that runs the
+/// claiming instance's store — which moves the claim word, queues the
+/// stream's requests and reads its feedback — and the stream's playback
+/// task, which serves that queue and publishes the feedback. Neither
+/// ever locks or blocks the other: the fields are either single atomic
+/// words read and written with `Acquire`/`Release` (`claim`,
+/// `generation`, `played_bytes`, `xruns`, `lost_feedback`,
+/// `feedback_open`), bounded wait-free queues (`requests`, `returned`,
+/// `feedback`), or notifications (`release`, `published`) armed before
+/// the state they report is read. The two-party ownership of the period
+/// ring itself is documented on [`PeriodRing`].
 pub(super) struct StreamShared {
     info: StreamInfo,
     requests: ProviderSender<PlaybackRequest>,
