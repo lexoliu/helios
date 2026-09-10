@@ -123,6 +123,12 @@ Per cell (workload × side), `iterations` executions (11 by default):
 - Machine noise is measured, not assumed: the `control_workload`
   (`quickjs-loop`) runs before and after the suite on every side, and the
   **noise floor** is the larger of the control's median drift and its CV.
+  Every side times an iteration in floating-point milliseconds — the
+  inspector from an `Instant`, the Linux runner from
+  `time.perf_counter_ns()` — so the floor reports how far the machine
+  actually moved. Truncating to whole milliseconds used to put a floor
+  under the floor: the control finishes in about thirty of them, so one
+  tick was 3.3% before the host had drifted at all (#278).
   A floor above `cv_bound` (0.15, the bound a single row's dispersion is
   held to) makes the whole comparison **inconclusive**: the host moved
   by more than any effect a change could show, so no row gets a verdict.

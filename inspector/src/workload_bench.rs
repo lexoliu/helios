@@ -532,7 +532,7 @@ enum JsonlRecord<'a> {
         headline: bool,
         runner: WorkloadRunner,
         iteration: u16,
-        elapsed_ms: u128,
+        elapsed_ms: f64,
         /// Secondary measurements the workload printed as `bench.<name>=<number>`.
         metrics: BTreeMap<String, f64>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -558,13 +558,13 @@ enum JsonlRecord<'a> {
         class: WorkloadClass,
         headline: bool,
         runner: WorkloadRunner,
-        median_elapsed_ms: u128,
+        median_elapsed_ms: f64,
         #[serde(skip_serializing_if = "Option::is_none")]
         throughput_bytes: Option<u64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         throughput_mib_per_second: Option<f64>,
         iterations: u16,
-        elapsed_ms: Vec<u128>,
+        elapsed_ms: Vec<f64>,
         validation: ValidationSummary,
     },
 }
@@ -711,7 +711,7 @@ async fn measure_workload(
     client: &mut crate::serial::RpcClient,
     workload: &Workload,
     command: &WorkloadBenchCommand,
-) -> Result<Vec<u128>, WorkloadBenchError> {
+) -> Result<Vec<f64>, WorkloadBenchError> {
     let mut elapsed_ms = Vec::new();
     for iteration in 1..=command.iterations {
         let attempt = match workload.runner {
@@ -785,7 +785,7 @@ async fn measure_workload(
 
 #[derive(Debug)]
 struct WorkloadOutput {
-    elapsed_ms: u128,
+    elapsed_ms: f64,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
 }
@@ -869,7 +869,7 @@ async fn run_shell_workload(
         workload: workload.name.clone(),
         source,
     })?;
-    let elapsed_ms = started.elapsed().as_millis();
+    let elapsed_ms = elapsed_millis(started);
     if output.exit_code != 0 {
         write_guest_output(workload, &output.output.stdout, &output.output.stderr)?;
         return Err(WorkloadBenchError::WorkloadExited {
@@ -914,7 +914,7 @@ async fn run_program_workload(
             workload: workload.name.clone(),
             source,
         })?;
-    let elapsed_ms = started.elapsed().as_millis();
+    let elapsed_ms = elapsed_millis(started);
     if output.exit_code != 0 {
         write_guest_output(workload, &output.output.stdout, &output.output.stderr)?;
         return Err(WorkloadBenchError::WorkloadExited {
@@ -986,7 +986,7 @@ async fn run_aot_workload(
         detail: error.detail,
     })?;
     Ok(WorkloadOutput {
-        elapsed_ms: started.elapsed().as_millis(),
+        elapsed_ms: elapsed_millis(started),
         stdout: Vec::new(),
         stderr: Vec::new(),
     })
@@ -1244,23 +1244,40 @@ fn stream_validation<'a>(
     }
 }
 
-fn median(values: &[u128]) -> Result<u128, WorkloadBenchError> {
+/// Wall-clock milliseconds since `started`, with the sub-millisecond
+/// digits kept.
+///
+/// The Linux side of the suite measures with `time.perf_counter_ns()`
+/// and writes a float, so a truncating `as_millis()` here would leave
+/// the two columns of every comparison measured differently. It would
+/// also decide the noise floor on its own: the floor comes from the
+/// control workload, and one whole millisecond is 3.3% of a 30 ms
+/// control (#278).
+fn elapsed_millis(started: Instant) -> f64 {
+    millis_of(started.elapsed())
+}
+
+fn millis_of(elapsed: Duration) -> f64 {
+    elapsed.as_secs_f64() * 1_000.0
+}
+
+fn median(values: &[f64]) -> Result<f64, WorkloadBenchError> {
     if values.is_empty() {
         return Err(WorkloadBenchError::EmptyMedianSample);
     }
     let mut sorted = values.to_vec();
-    sorted.sort_unstable();
+    sorted.sort_by(f64::total_cmp);
     let lower = (sorted.len() - 1) / 2;
     let upper = sorted.len() / 2;
-    Ok((sorted[lower] + sorted[upper]) / 2)
+    Ok((sorted[lower] + sorted[upper]) / 2.0)
 }
 
-fn throughput_mib_per_second(bytes: Option<u64>, elapsed_ms: u128) -> Option<f64> {
+fn throughput_mib_per_second(bytes: Option<u64>, elapsed_ms: f64) -> Option<f64> {
     let bytes = bytes?;
-    if elapsed_ms == 0 {
+    if elapsed_ms <= 0.0 {
         return None;
     }
-    Some((bytes as f64 / (1024.0 * 1024.0)) / (elapsed_ms as f64 / 1000.0))
+    Some((bytes as f64 / (1024.0 * 1024.0)) / (elapsed_ms / 1000.0))
 }
 
 fn extend_unique(programs: &mut Vec<String>, required: &[String]) {
@@ -1668,11 +1685,11 @@ mod tests {
     #[test]
     fn throughput_rate_uses_manifest_payload_bytes() {
         assert_eq!(
-            throughput_mib_per_second(Some(64 * 1024 * 1024), 64),
+            throughput_mib_per_second(Some(64 * 1024 * 1024), 64.0),
             Some(1000.0)
         );
-        assert_eq!(throughput_mib_per_second(None, 64), None);
-        assert_eq!(throughput_mib_per_second(Some(64 * 1024 * 1024), 0), None);
+        assert_eq!(throughput_mib_per_second(None, 64.0), None);
+        assert_eq!(throughput_mib_per_second(Some(64 * 1024 * 1024), 0.0), None);
     }
 
     fn timeout_test_command(workload_timeout_seconds: u32) -> WorkloadBenchCommand {
@@ -1759,14 +1776,69 @@ mod tests {
             1,
             &command,
             std::future::ready(Ok(WorkloadOutput {
-                elapsed_ms: 24,
+                elapsed_ms: 24.375,
                 stdout: b"process-startup:ok\n".to_vec(),
                 stderr: Vec::new(),
             })),
         ))
         .expect("a workload that answers in time must not be failed");
 
-        assert_eq!(output.elapsed_ms, 24);
+        assert_eq!(output.elapsed_ms, 24.375);
+    }
+
+    /// An iteration keeps its sub-millisecond digits all the way into the
+    /// JSONL record.
+    ///
+    /// The control workload of the paired suite runs in about thirty
+    /// milliseconds, and the noise floor is that control's drift between
+    /// the run before the workloads and the run after. Truncating each
+    /// measurement to a whole millisecond put a floor of its own under
+    /// that number: one tick is 3.3% of a 30 ms control, and run
+    /// 34199216398 reported an 8.33% floor from a machine that was not
+    /// moving by anything like that much (#278).
+    #[test]
+    fn an_iteration_keeps_its_sub_millisecond_digits() {
+        assert_eq!(millis_of(Duration::from_nanos(1_500_250)), 1.50025);
+
+        let record = JsonlRecord::Iteration {
+            workload: "quickjs-loop",
+            class: WorkloadClass::Compute,
+            headline: true,
+            runner: WorkloadRunner::Shell,
+            iteration: 2,
+            elapsed_ms: 30.125_5,
+            metrics: BTreeMap::new(),
+            throughput_bytes: None,
+            throughput_mib_per_second: None,
+            stdout: StreamValidation {
+                bytes: 0,
+                contains: &[],
+                contains_ok: true,
+                empty_required: false,
+                empty_ok: true,
+            },
+            stderr: StreamValidation {
+                bytes: 0,
+                contains: &[],
+                contains_ok: true,
+                empty_required: true,
+                empty_ok: true,
+            },
+            validation: ValidationSummary { ok: true },
+        };
+        let encoded = serde_json::to_string(&record).expect("the record must serialise");
+        assert!(
+            encoded.contains("\"elapsed_ms\":30.1255"),
+            "the record must carry the fractional milliseconds, got {encoded}"
+        );
+    }
+
+    /// The median of an even sample is the mean of the two middle values,
+    /// and it is no longer rounded to a whole millisecond.
+    #[test]
+    fn the_median_averages_the_two_middle_measurements() {
+        let median = median(&[3.5, 1.25, 2.0, 4.0]).expect("a non-empty sample has a median");
+        assert_eq!(median, 2.75);
     }
 
     /// The steps around the workloads are bounded too.

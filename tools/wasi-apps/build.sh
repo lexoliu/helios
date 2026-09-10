@@ -15,7 +15,7 @@
 #   reads (docs/pgo.md section (b)).
 #
 # Network-gated: the CPython download needs internet; pass a pre-staged
-# zip via `CPYTHON_WASI_ZIP=<path>` to skip the curl step. Wasmer
+# zip via `CPYTHON_WASI_ZIP=<path>` to skip the download step. Wasmer
 # artifacts may be supplied as raw modules (`*_WASM=<path>`) or WEBc images
 # (`*_WEBC=<path>`); otherwise this script downloads the pinned official WEBc
 # images and extracts their wasm atoms. QuickJS may be supplied as a raw SIMD
@@ -24,6 +24,22 @@
 # source archive and builds the wasm module locally.
 
 set -euo pipefail
+
+# Every download this script makes goes through here.
+#
+# A staged artifact is fetched once per cache miss and every lane that
+# misses runs this script, so a bare `curl` makes one reset TCP
+# connection cost a whole lane: `check-aarch64` of run 34204734734 died
+# in 38 seconds on `curl: (35) Recv failure` while fetching CPython
+# (#282). Retrying costs seconds and changes nothing about what is
+# fetched — the URL is pinned and the artifact is validated downstream —
+# and a download that genuinely cannot be had still fails the script.
+download() {
+  local output="$1"
+  local url="$2"
+  curl -fL --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 30 \
+    -o "$output" "$url"
+}
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 artifacts_root="${ARTIFACTS_ROOT:-$repo_root/artifacts}"
@@ -104,7 +120,7 @@ stage_wasmer_webc_atom() {
     if [[ -z "$webc_path" ]]; then
       webc_path="$staging/$label.webc"
       echo "Downloading $label WEBc image..."
-      curl -fL -o "$webc_path" "$webc_url"
+      download "$webc_path" "$webc_url"
     fi
     "$repo_root/tools/wasi-apps/extract-webc-wasm.pl" "$webc_path" "$output"
   fi
@@ -126,7 +142,7 @@ build_quickjs_wasm() {
   if [[ -z "$archive" ]]; then
     archive="$staging/quickjs-$quickjs_version.tar.gz"
     echo "Downloading QuickJS $quickjs_package@$quickjs_version_tag source..."
-    curl -fL -o "$archive" "$quickjs_source_url"
+    download "$archive" "$quickjs_source_url"
   fi
 
   require_tool zig
@@ -183,13 +199,13 @@ zip_path="${CPYTHON_WASI_ZIP:-}"
 if [[ -z "$zip_path" ]]; then
   zip_path="$staging/cpython.zip"
   echo "Downloading CPython $cpython_version WASI build..."
-  curl -fL -o "$zip_path" \
+  download "$zip_path" \
     "https://github.com/brettcannon/cpython-wasi-build/releases/download/v${cpython_version}/python-${cpython_version}-wasi_sdk-24.zip"
 fi
 
 adapter_path="$staging/wasi_snapshot_preview1.command.wasm"
 echo "Downloading wasmtime $wasmtime_version preview1 adapter..."
-curl -fL -o "$adapter_path" \
+download "$adapter_path" \
   "https://github.com/bytecodealliance/wasmtime/releases/download/v${wasmtime_version}/wasi_snapshot_preview1.command.wasm"
 
 echo "Extracting CPython..."

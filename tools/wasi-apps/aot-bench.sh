@@ -48,7 +48,7 @@ printf 'writing AOT benchmark log to %s\n' "${log}" >&2
 "${command[@]}" | tee "${log}"
 
 median="$(
-    sed -nE 's/^iteration=([0-9]+) elapsed_ms=([0-9]+).*/\1 \2/p' "${log}" \
+    sed -nE 's/^iteration=([0-9]+) elapsed_ms=([0-9]+(\.[0-9]+)?).*/\1 \2/p' "${log}" \
         | awk '$1 > 1 { print $2 }' \
         | sort -n \
         | awk '
@@ -59,7 +59,7 @@ median="$(
                 }
                 lower = int((NR + 1) / 2)
                 upper = int((NR + 2) / 2)
-                print int((values[lower] + values[upper]) / 2)
+                printf "%.3f\n", (values[lower] + values[upper]) / 2
             }
         '
 )"
