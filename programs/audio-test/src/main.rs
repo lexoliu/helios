@@ -48,6 +48,18 @@ const AMPLITUDE: f64 = 0.5;
 /// for the same room.
 const BATCH_FRAMES: usize = 480;
 
+/// How long the stream is held open after its last write.
+///
+/// The kernel's account of playback ends where the device takes a
+/// period; a host backend such as QEMU's `wav` audiodev renders on a
+/// queue of its own past that door, and a stream ended the moment its
+/// material is committed loses whatever that queue still holds. The
+/// recording is what a host checks this program by, so the claim
+/// outlives the last write by a beat: long enough for a backend's queue
+/// to play out, short enough that the run is still the seconds it
+/// asked for.
+const SETTLE: std::time::Duration = std::time::Duration::from_millis(100);
+
 #[derive(Debug, Error)]
 enum AudioTestError {
     #[error("usage: audio-test [--seconds <n>] [--stream <id>]")]
@@ -58,6 +70,8 @@ enum AudioTestError {
     Audio(#[from] AudioError),
     #[error("the kernel stopped taking samples after {written} of {total} bytes")]
     Truncated { written: usize, total: usize },
+    #[error("the feedback stream closed without a report from the reader")]
+    MissingReport,
 }
 
 struct Options {
@@ -224,6 +238,14 @@ async fn main() -> Result<(), AudioTestError> {
         }
         frame += frames as u64;
     }
+    // The stream still holds what the last periods carried: "taken"
+    // ends at the device's door, and a host backend keeps its own queue
+    // past it. Ending the stream now would stop the clock with that
+    // tail unrendered — the recording this program leaves behind is the
+    // evidence, so the tone has to be heard to its end. The kernel's
+    // own latency report is the device's; the backend's is not, and a
+    // beat of wall clock is what covers it.
+    helios_api::task::sleep(SETTLE).await;
     // Dropping the writer is what says the material is over; the future
     // resolves when the kernel has taken the last of it.
     drop(samples);
@@ -231,10 +253,13 @@ async fn main() -> Result<(), AudioTestError> {
     println!("audio-test:wrote bytes={written} frames={total_frames}");
 
     playback.stop().await?;
-    let summary = reports.recv().await.unwrap_or(Reports {
-        latency_bytes: 0,
-        xruns: 0,
-    });
+    // A missing report is not a quiet zero: it means the feedback
+    // reader ended without sending, which is the stream's account of
+    // itself being lost — the run cannot claim xruns=0 it never saw.
+    let summary = reports
+        .recv()
+        .await
+        .map_err(|_| AudioTestError::MissingReport)?;
     println!(
         "audio-test:done latency-bytes={} xruns={}",
         summary.latency_bytes, summary.xruns
