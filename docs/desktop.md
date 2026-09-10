@@ -203,7 +203,7 @@ sent before anything claimed the devices, is evidence of nothing.
 the guest says so on the serial line:
 
 ```text
-virtio-gpu online transport=mmio scanouts=1 preferred=1280x800 edid=on
+virtio-gpu online transport=mmio scanouts=1 preferred=1280x800 edid=on 3d=none blob=off context-init=off uuid=off
 ```
 
 A guest that has claimed the display through `helios:system/display`
