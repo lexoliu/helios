@@ -720,6 +720,8 @@ jobs:
             --accel kvm \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --desktop --display none --audiodev "wav:$runtime/desktop.wav" \
+            --qemu-trace trace:virtio_gpu_update_cursor \
+            --qemu-trace-log "$runtime/qemu-trace.log" \
             --boot-program dash --boot-program debugger \
             --boot-program display-test --no-compiler-plugin \
             screendump \
@@ -742,6 +744,11 @@ jobs:
             "$runtime/inspector.log"
           python3 tools/desktop/check-gradient.py \
             "$captures/drawn.png" "$captures/settled.png"
+          # The pointer is a plane the capture does not hold, so the device's
+          # own trace of every cursor command is checked against the
+          # positions the guest says it moved to.
+          python3 tools/desktop/check-cursor.py \
+            "$runtime/inspector.log" "$runtime/qemu-trace.log"
       - name: Upload the desktop scanout captures
         if: always()
         uses: actions/upload-artifact@v4

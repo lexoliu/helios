@@ -157,3 +157,15 @@ left.
 `smoke-x86-64` runs that on every push and uploads the captures as the
 `smoke-x86-64-desktop` artifact, checking the pixels with
 `tools/desktop/check-gradient.py` rather than only the file type.
+
+The pointer is not in those pixels. QEMU hands a virtio-gpu cursor to
+its display frontend as a plane of its own, and `screendump` reads the
+scanout surface alone, so a capture of a guest driving its cursor looks
+exactly like one that never set it. The evidence for the cursor is the
+device's own account instead: `--qemu-trace
+trace:virtio_gpu_update_cursor` makes QEMU log every `UPDATE_CURSOR`
+and `MOVE_CURSOR` it processes with the position each carried, and
+`tools/desktop/check-cursor.py` checks that every position
+`display-test` printed on a `display-test:frame` line is one the device
+logged as a move, after it logged the cursor image. The lane runs that
+check beside the gradient's.
