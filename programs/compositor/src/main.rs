@@ -47,7 +47,7 @@ use helios_api::bindings::wit_stream;
 use helios_api::channel::{Receiver, Sender, bounded};
 use helios_api::compositor::{Error, Guest, Placement, Rect};
 use helios_api::display::{Display, DisplayError, Mode, PixelFormat, Point};
-use helios_api::input::{Device, InputError, InputEvent, codes, ends_frame};
+use helios_api::input::{Device, InputError, InputEvent, available, codes, ends_frame};
 use helios_api::programs::{
     Child, SpawnError, SpawnRequest, root_directory_grant, root_link_grant, root_process_grant,
     root_terminal_grant,
@@ -256,18 +256,31 @@ async fn run_desktop() -> Result<(), DesktopError> {
 
 /// Claim every input device and read it into the desktop's queue.
 fn start_input(events: &Sender<Event>, mode: Mode) -> Result<(), DesktopError> {
-    let devices = Device::claim_all();
-    if devices.is_empty() {
-        return Err(DesktopError::NoInput);
+    let mut claimed = 0;
+    for capabilities in available() {
+        // Each device is named as it is taken, and a refusal is named
+        // too: a desktop running with no keyboard because something else
+        // holds it is a fact about the machine, not a detail to keep.
+        match Device::claim(&capabilities.name) {
+            Ok(device) => {
+                let axes = AbsoluteAxes::of(&device);
+                println!("compositor:device name={}", capabilities.name);
+                claimed += 1;
+                let events = events.clone();
+                spawn(async move {
+                    read_device(device, axes, mode, events).await;
+                });
+            }
+            Err(error) => {
+                println!(
+                    "compositor:device-refused name={} error={error}",
+                    capabilities.name
+                );
+            }
+        }
     }
-    for device in devices {
-        let name = device.name();
-        let axes = AbsoluteAxes::of(&device);
-        println!("compositor:device name={name}");
-        let events = events.clone();
-        spawn(async move {
-            read_device(device, axes, mode, events).await;
-        });
+    if claimed == 0 {
+        return Err(DesktopError::NoInput);
     }
     Ok(())
 }

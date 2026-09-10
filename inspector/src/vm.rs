@@ -2795,15 +2795,28 @@ async fn serve_guest_requests(
     client: &crate::serial::RpcClient,
     requests: async_channel::Receiver<GuestRequest>,
 ) -> core::convert::Infallible {
-    while let Ok(request) = requests.recv().await {
-        match request {
-            GuestRequest::Kill { name, reply } => {
-                let outcome = system::kill_named_instance(client, &name).await;
-                let _ = reply.send(outcome).await;
+    let serve = async {
+        while let Ok(request) = requests.recv().await {
+            match request {
+                GuestRequest::Kill { name, reply } => {
+                    let outcome = system::kill_named_instance(client, &name).await;
+                    let _ = reply.send(outcome).await;
+                }
             }
         }
-    }
-    core::future::pending().await
+        core::future::pending().await
+    };
+    // A session that asks the guest nothing reads nothing, and a guest
+    // that keeps talking into a transport nobody drains blocks on it —
+    // which for a compositor writing its own account of every frame
+    // means a desktop that stops after its first two lines. Holding the
+    // reader role for as long as the session lasts is what keeps it
+    // running.
+    let route = async {
+        let _ = client.route_frames().await;
+        core::future::pending().await
+    };
+    futures_lite::future::or(serve, route).await
 }
 
 /// The `--run` program one host-side action is performed alongside.
