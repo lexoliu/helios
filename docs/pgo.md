@@ -169,12 +169,19 @@ matches the instrumentation.
 
 #### Collecting in CI
 
-`bench-suite.yml` has a `profile-generate` job: it prepares a bench host
-and then runs `.github/actions/collect-kernel-profile`, which builds the
-instrumented x86-64 kernel, runs the compiler workload and the suite's
-non-network classes on it under KVM and merges every `.profraw` into one
-`helios-kernel.profdata`; the job uploads that. The collection is a
-composite action because the release job below runs the same one. It boots the lane's own machine, read from
+`kernel-profile.yml` is the collection job (#313): it prepares a bench
+host and then runs `.github/actions/collect-kernel-profile`, which builds
+the instrumented x86-64 kernel, runs the compiler workload and the
+suite's non-network classes on it under KVM and merges every `.profraw`
+into one `helios-kernel.profdata`; the job uploads that as the
+`helios-kernel-profdata` artifact, which is the profile every x86-64
+release build spends (#226). It runs on `workflow_dispatch`, and on the
+first of every month so the artifact never ages past GitHub's ninety-day
+retention. `bench-suite.yml`'s `profile-generate` job calls the same
+workflow, so the profile `suite-pgo` measures is collected by the job a
+release build reads from; the collection itself is a composite action
+because the release job below runs the same one on the released tree.
+It boots the lane's own machine, read from
 `tools/bench/manifest.toml`: the collection runs the lane's workloads, and
 a guest smaller than the one the suite times cannot run them — `4G`
 against the lane's `6G` took the x86-64 kernel's memory pool down on
@@ -330,11 +337,13 @@ job of `bench-suite.yml` runs and what the release job runs. A profile
 collected two ways would be two profiles wearing one name, and the kernel
 a release ships would not be the kernel `suite-pgo` measured.
 
-The release is also the refresh cadence, and it is the cadence the
-paragraphs above argue for: a profile goes stale in its counts long
-before it goes stale in its hashes, and silently, so the point to collect
-again is the one at which the kernel it describes has moved — a release.
-Between releases the profile is the one the last release published.
+The refresh cadence is the on-demand collection above, not the release:
+a profile goes stale in its counts long before it goes stale in its
+hashes, and silently, so `kernel-profile.yml` is dispatched when the
+kernel it describes has moved and runs monthly regardless. A release
+attaches the profile its own kernel was built with so that the released
+image can be reproduced, and a release build between releases reads the
+newest collection on the default branch.
 
 A release published before this job existed carries no profile.
 Dispatching `release.yml` with its `tag` input names such a release and
