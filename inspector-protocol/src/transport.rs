@@ -157,6 +157,45 @@ where
         }
     }
 
+    /// Routes frames until the transport closes.
+    ///
+    /// A connection is read by whoever is waiting on it, so a session
+    /// with no call in flight reads nothing — and a guest that keeps
+    /// talking while the host asks it for nothing fills the transport
+    /// and blocks on it. A session that drives the machine without
+    /// asking it anything (taking a capture, driving its input) holds
+    /// this instead, and the guest keeps running.
+    ///
+    /// The reader role still passes: the read lock is released between
+    /// frames, and while this is parked inside a read it routes whatever
+    /// arrives into whichever invocation named it, which is exactly what
+    /// a waiter would have done for itself.
+    pub async fn route_frames(&self) -> Result<()> {
+        loop {
+            if is_closed(&self.inner.closed) {
+                return Ok(());
+            }
+            let frame = {
+                let mut io = self.inner.read.lock().await;
+                match read_frame(&mut *io).await {
+                    Ok(Some(frame)) => frame,
+                    Ok(None) => {
+                        close_client(&self.inner, "client transport closed while routing frames");
+                        return Ok(());
+                    }
+                    Err(source) => {
+                        close_client(&self.inner, &source.to_string());
+                        return Err(TransportError::io("route client frames", source));
+                    }
+                }
+            };
+            route_client_frame(&self.inner, frame).map_err(|source| {
+                close_client(&self.inner, &source.to_string());
+                TransportError::io("route client frame", source)
+            })?;
+        }
+    }
+
     pub async fn invoke_raw(
         &self,
         instance: &str,
