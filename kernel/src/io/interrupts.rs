@@ -76,6 +76,7 @@ pub struct ExternalInterruptRoutes<
     Vsock,
     Display,
     Input,
+    Sound,
     Block,
 > {
     network: [Option<(Source, Network)>; MAX_NETWORK_INTERRUPTS],
@@ -85,6 +86,7 @@ pub struct ExternalInterruptRoutes<
     vsock: Option<(Source, Vsock)>,
     display: Option<(Source, Display)>,
     input: [Option<(Source, Input)>; MAX_INPUT_DEVICES],
+    sound: Option<(Source, Sound)>,
     block: [Option<(Source, Block)>; MAX_BLOCK_DEVICES],
     /// Sources a user-mode driver owns. Concrete rather than generic:
     /// what a granted source reaches is the kernel's own relay, which
@@ -93,8 +95,19 @@ pub struct ExternalInterruptRoutes<
     device: [Option<(Source, DeviceInterruptRoute)>; MAX_DEVICE_INTERRUPTS],
 }
 
-impl<Source, Network, HostFs, Entropy, Balloon, Vsock, Display, Input, Block>
-    ExternalInterruptRoutes<Source, Network, HostFs, Entropy, Balloon, Vsock, Display, Input, Block>
+impl<Source, Network, HostFs, Entropy, Balloon, Vsock, Display, Input, Sound, Block>
+    ExternalInterruptRoutes<
+        Source,
+        Network,
+        HostFs,
+        Entropy,
+        Balloon,
+        Vsock,
+        Display,
+        Input,
+        Sound,
+        Block,
+    >
 where
     Source: PartialEq + Copy,
     Network: ExternalInterruptHandler,
@@ -104,6 +117,7 @@ where
     Vsock: ExternalInterruptHandler,
     Display: ExternalInterruptHandler,
     Input: ExternalInterruptHandler,
+    Sound: ExternalInterruptHandler,
     Block: ExternalInterruptHandler,
 {
     pub const fn new() -> Self {
@@ -115,6 +129,7 @@ where
             vsock: None,
             display: None,
             input: [const { None }; MAX_INPUT_DEVICES],
+            sound: None,
             block: [const { None }; MAX_BLOCK_DEVICES],
             device: [const { None }; MAX_DEVICE_INTERRUPTS],
         }
@@ -194,6 +209,18 @@ where
         *slot = Some((source, handler));
     }
 
+    /// Registers the machine's sound device.
+    ///
+    /// One slot: a machine carries one sound card, and its four queues
+    /// share the one interrupt the transport delivers.
+    pub fn set_sound(&mut self, source: Source, handler: Sound) {
+        assert!(
+            self.sound.is_none(),
+            "sound interrupt route was installed more than once"
+        );
+        self.sound = Some((source, handler));
+    }
+
     /// Registers one more block device.
     ///
     /// Unlike the single-device slots this one takes several handlers:
@@ -246,6 +273,9 @@ where
             return true;
         }
         if self.input.iter().any(|slot| dispatch(slot, source)) {
+            return true;
+        }
+        if dispatch(&self.sound, source) {
             return true;
         }
         if self.block.iter().any(|slot| dispatch(slot, source)) {
@@ -302,7 +332,7 @@ where
     }
 }
 
-impl<Source, Network, HostFs, Entropy, Balloon, Vsock, Display, Input, Block> Default
+impl<Source, Network, HostFs, Entropy, Balloon, Vsock, Display, Input, Sound, Block> Default
     for ExternalInterruptRoutes<
         Source,
         Network,
@@ -312,6 +342,7 @@ impl<Source, Network, HostFs, Entropy, Balloon, Vsock, Display, Input, Block> De
         Vsock,
         Display,
         Input,
+        Sound,
         Block,
     >
 where
@@ -323,6 +354,7 @@ where
     Vsock: ExternalInterruptHandler,
     Display: ExternalInterruptHandler,
     Input: ExternalInterruptHandler,
+    Sound: ExternalInterruptHandler,
     Block: ExternalInterruptHandler,
 {
     fn default() -> Self {
