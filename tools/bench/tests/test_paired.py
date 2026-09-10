@@ -489,9 +489,7 @@ def test_a_build_record_with_an_uncovered_count_names_it_in_the_gate(
     assert "7,897 of 42,053 functions uncovered" in gate_text
 
 
-def test_the_uncovered_count_is_read_from_the_list_beside_the_kernel(
-    tmp_path, monkeypatch
-) -> None:
+def test_the_uncovered_count_is_read_from_the_list_beside_the_kernel(tmp_path, monkeypatch) -> None:
     """The runner asks the inspector where the kernel is and counts its list.
 
     The list lives beside whatever `kernel-path` answers rather than under
@@ -549,16 +547,12 @@ def test_the_uncovered_count_is_read_from_the_list_beside_the_kernel(
 def test_a_kernel_path_that_fails_is_a_failure_not_an_empty_count(tmp_path, monkeypatch) -> None:
     """A nonzero `kernel-path` names what refused, rather than reading None."""
     inspector = tmp_path / "helios-inspector"
-    inspector.write_text(
-        "#!/bin/sh\necho 'the profile is not in the store' >&2\nexit 3\n", encoding="utf-8"
-    )
+    inspector.write_text("#!/bin/sh\necho 'the profile is not in the store' >&2\nexit 3\n", encoding="utf-8")
     inspector.chmod(0o755)
     monkeypatch.setenv("HELIOS_INSPECTOR_BIN", str(inspector))
     lane = load_manifest().lane("x86-64-kvm")
     checkout = fake_checkout(tmp_path / "candidate")
-    with pytest.raises(
-        SystemExit, match="exited with status 3: the profile is not in the store"
-    ):
+    with pytest.raises(SystemExit, match="exited with status 3: the profile is not in the store"):
         kernel_pgo_uncovered(checkout, lane, None)
 
 

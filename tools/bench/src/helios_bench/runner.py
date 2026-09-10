@@ -452,13 +452,10 @@ def kernel_pgo_uncovered(
     argv.append("kernel-path")
     env = os.environ.copy()
     env["HELIOS_WORKSPACE_ROOT"] = str(workspace_root)
-    completed = subprocess.run(
-        argv, cwd=REPO_ROOT, env=env, capture_output=True, text=True, check=False
-    )
+    completed = subprocess.run(argv, cwd=REPO_ROOT, env=env, capture_output=True, text=True, check=False)
     if completed.returncode != 0:
         raise SystemExit(
-            f"`{shlex.join(argv)}` exited with status {completed.returncode}: "
-            f"{completed.stderr.strip()}"
+            f"`{shlex.join(argv)}` exited with status {completed.returncode}: {completed.stderr.strip()}"
         )
     listing = Path(completed.stdout.strip() + ".pgo-uncovered.txt")
     if not listing.is_file():
@@ -472,14 +469,10 @@ def kernel_pgo_uncovered(
             f"lines: {first!r} {second!r}"
         )
     listed = sum(
-        1
-        for line in listing.open("r", encoding="utf-8")
-        if line.strip() and not line.startswith("#")
+        1 for line in listing.open("r", encoding="utf-8") if line.strip() and not line.startswith("#")
     )
     if listed != int(warnings.group(1)):
-        raise SystemExit(
-            f"{listing} names {warnings.group(1)} emitted warnings but lists {listed}"
-        )
+        raise SystemExit(f"{listing} names {warnings.group(1)} emitted warnings but lists {listed}")
     return int(match.group(1)), int(match.group(2))
 
 
@@ -798,18 +791,10 @@ def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) ->
             baseline_kernel_build=options.baseline_kernel_build,
             kernel_profile=candidate_profile,
             baseline_kernel_profile=baseline_profile,
-            kernel_pgo_uncovered=(
-                candidate_uncovered[0] if candidate_uncovered is not None else None
-            ),
-            kernel_pgo_functions=(
-                candidate_uncovered[1] if candidate_uncovered is not None else None
-            ),
-            baseline_kernel_pgo_uncovered=(
-                baseline_uncovered[0] if baseline_uncovered is not None else None
-            ),
-            baseline_kernel_pgo_functions=(
-                baseline_uncovered[1] if baseline_uncovered is not None else None
-            ),
+            kernel_pgo_uncovered=(candidate_uncovered[0] if candidate_uncovered is not None else None),
+            kernel_pgo_functions=(candidate_uncovered[1] if candidate_uncovered is not None else None),
+            baseline_kernel_pgo_uncovered=(baseline_uncovered[0] if baseline_uncovered is not None else None),
+            baseline_kernel_pgo_functions=(baseline_uncovered[1] if baseline_uncovered is not None else None),
             retaken=retaken,
             reconfirmed=reconfirmed,
         )
