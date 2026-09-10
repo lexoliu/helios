@@ -26,8 +26,7 @@ use helios_hal::{
     DeviceInventory, DmaModel, Platform, ProcessorStartupPolicy, ProcessorTopology, align_up,
 };
 use helios_kernel::{
-    DebugSerialAccess, KernelException, KernelExceptionCause, KernelNativeTrapHandler, Timer,
-    WasmtimeTlsSlots,
+    DebugSerialAccess, KernelException, KernelExceptionCause, Timer, WasmtimeTlsSlots,
 };
 use limine::BaseRevision;
 use limine::file::File;
@@ -259,7 +258,6 @@ struct ProcessorRuntime {
     logical_id: u16,
     _reserved: u16,
     wasmtime_tls: WasmtimeTlsSlots,
-    native_trap_handler: AtomicUsize,
     started: AtomicBool,
     /// This processor's kernel timer, published once its own
     /// `helios_kernel::init` has run so the timer PPI can advance it.
@@ -290,7 +288,6 @@ impl ProcessorRuntime {
             logical_id,
             _reserved: 0,
             wasmtime_tls: WasmtimeTlsSlots::new(),
-            native_trap_handler: AtomicUsize::new(0),
             started: AtomicBool::new(false),
             timer: Once::new(),
             program_service: Once::new(),
@@ -1189,10 +1186,10 @@ extern "C" fn aarch64_handle_sync_exception(
         0b100100 | 0b100101 => (KernelExceptionCause::DataFault, Some(far_el1)),
         0b111100 => (KernelExceptionCause::Breakpoint, None),
         0b001110 => (KernelExceptionCause::IllegalInstruction, None),
-    let mut stack_fault = helios_kernel::StackFault::Elsewhere;
         _ => (KernelExceptionCause::IllegalInstruction, None),
     };
 
+    let mut stack_fault = helios_kernel::StackFault::Elsewhere;
     if faulting_address.is_some() {
         // The swap policy's aging pass clears access flags to measure
         // which pages are still being used. This machine may not set
@@ -1200,14 +1197,14 @@ extern "C" fn aarch64_handle_sync_exception(
         // that it was touched: set the bit and retry the instruction.
         if ACCESS_FLAG_FAULT_STATUS.contains(&(esr_el1 & 0x3f))
             && vmm::resolve_access_flag_fault(far_el1)
+        {
+            return;
+        }
         // A reserved page inside a live fiber stack is a demand commit
         // the kernel resolves here, with no lock and no allocation; the
         // guard page below one is a stack overflow and stays a fault.
         stack_fault = helios_kernel::resolve_stack_fault(helios_hal::vmm::VirtAddr::new(far_el1));
         if stack_fault == helios_kernel::StackFault::Committed {
-            return;
-        }
-        {
             return;
         }
         // A swapped-out page is ours to resolve, and resolving it means
@@ -1227,7 +1224,9 @@ extern "C" fn aarch64_handle_sync_exception(
 
     // SAFETY: the entry wrote a complete frame at this address.
     let (elr_el1, frame_pointer) = unsafe { ((*frame).elr as usize, (*frame).x[29] as usize) };
-    dispatch_to_native_trap_handler(KernelException {
+    // A claimed trap unwinds out of this stack and never comes back, so
+    // reaching the panic below is the runtime declining the exception.
+    let _ = helios_kernel::dispatch_native_trap(KernelException {
         cause,
         instruction_pointer: elr_el1,
         frame_pointer,
@@ -1238,26 +1237,6 @@ extern "C" fn aarch64_handle_sync_exception(
         "unhandled AArch64 synchronous exception ec={exception_class:#x} esr={esr_el1:#x} \
          elr={elr_el1:#x} far={far_el1:#x}{stack_fault}"
     )
-}
-
-/// Hands an exception to the runtime's own trap handler. Returns only
-/// when the runtime did not claim it; when it does claim it, the handler
-/// jumps out of this stack and never comes back.
-fn dispatch_to_native_trap_handler(exception: KernelException) {
-    let runtime = read_processor_runtime();
-    if runtime == 0 {
-        return;
-    }
-    let handler = unsafe {
-        (*(runtime as *const ProcessorRuntime))
-            .native_trap_handler
-            .load(Ordering::Acquire)
-    };
-    if handler == 0 {
-        return;
-    }
-    let handler: KernelNativeTrapHandler = unsafe { core::mem::transmute(handler) };
-    let _ = exception.dispatch_to(handler);
 }
 
 /// Rewrites a saved context so the exception epilogue returns into
@@ -1321,7 +1300,8 @@ extern "C" fn swap_fault_trampoline(frame: *mut SyncTrapFrame, faulting_address:
         error = ?outcome.err(),
         "page fault on a swapped-out page could not be resolved"
     );
-    dispatch_to_native_trap_handler(KernelException {
+    // As above: the handler returns only when it did not claim the fault.
+    let _ = helios_kernel::dispatch_native_trap(KernelException {
         cause: KernelExceptionCause::DataFault,
         instruction_pointer: elr_el1,
         frame_pointer,
@@ -2118,9 +2098,7 @@ extern "C" fn wasmtime_tls_set(slot: usize, ptr: *mut u8) {
 #[cfg(target_os = "none")]
 #[unsafe(no_mangle)]
 extern "C" fn wasmtime_init_traps(handler: helios_kernel::KernelNativeTrapHandler) -> i32 {
-    current_processor_runtime()
-        .native_trap_handler
-        .store(handler as usize, Ordering::Release);
+    helios_kernel::install_native_trap_handler(handler);
     0
 }
 

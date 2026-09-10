@@ -102,8 +102,6 @@ pub(crate) fn count_virtio_mmio_devices(fdt: &Fdt<'_>, expected: DeviceType) -> 
 }
 
 use core::arch::{asm, global_asm};
-use core::cell::Cell;
-use core::mem;
 use core::num::NonZeroUsize;
 use core::ops::Range;
 use core::sync::atomic::{AtomicUsize, Ordering, compiler_fence};
@@ -151,7 +149,6 @@ static BOOT_HART_ID: AtomicUsize = AtomicUsize::new(UNINITIALIZED_BOOT_HART);
 static ONLINE_HARTS: AtomicUsize = AtomicUsize::new(0);
 static CRITICAL_SECTION_STATE: helios_hal::critical_section::CriticalSectionState =
     helios_hal::critical_section::CriticalSectionState::new();
-static WASMTIME_NATIVE_TRAP_HANDLER: AtomicUsize = AtomicUsize::new(0);
 static DEBUG_STATE: Once<debug_state::RuntimeState> = Once::new();
 static WATCHDOG_STATE: Once<watchdog::RiscvWatchdog> = Once::new();
 
@@ -300,7 +297,6 @@ struct HartRuntime {
     hart_id: ProcessorId,
     timer: Timer<RiscvCpu>,
     wasmtime_tls: WasmtimeTlsSlots,
-    native_trap_handler: Cell<Option<KernelNativeTrapHandler>>,
     external_interrupts: Option<net::ExternalInterrupts>,
     program_service: Option<debug_state::ProgramService>,
     /// The stack every trap on this hart is built on once
@@ -780,7 +776,6 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
         hart_id: current_hart,
         timer: kernel.timer(),
         wasmtime_tls: WasmtimeTlsSlots::new(),
-        native_trap_handler: Cell::new(None),
         external_interrupts,
         program_service: None,
         trap_stack: trap::allocate_trap_stack(),
@@ -1024,9 +1019,7 @@ extern "C" fn wasmtime_tls_set(slot: usize, ptr: *mut u8) {
 
 #[unsafe(no_mangle)]
 extern "C" fn wasmtime_init_traps(handler: KernelNativeTrapHandler) -> i32 {
-    WASMTIME_NATIVE_TRAP_HANDLER.store(handler as usize, Ordering::Release);
-    let runtime = current_hart_runtime();
-    runtime.native_trap_handler.set(Some(handler));
+    helios_kernel::install_native_trap_handler(handler);
     0
 }
 
@@ -1046,6 +1039,13 @@ unsafe fn configure_interrupts() {
 
 /// Handles one synchronous exception.
 ///
+/// Returns only when the fault was resolved in place and the trap
+/// epilogue should restore the interrupted context and run the faulting
+/// instruction again. Every other path diverges: into the runtime's trap
+/// handler, which unwinds the guest and never comes back, or into a
+/// panic.
+fn handle_exception(exception: Exception, tf: &TrapFrame) {
+    let stval = riscv::register::stval::read();
     // A reserved page inside a live fiber stack is a demand commit the
     // kernel resolves here, with no lock and no allocation; the guard
     // page below one is a stack overflow and stays a fault. This is the
@@ -1058,13 +1058,6 @@ unsafe fn configure_interrupts() {
     if stack_fault == helios_kernel::StackFault::Committed {
         return;
     }
-/// Returns only when the fault was resolved in place and the trap
-/// epilogue should restore the interrupted context and run the faulting
-/// instruction again. Every other path diverges: into the runtime's trap
-/// handler, which unwinds the guest and never comes back, or into a
-/// panic.
-fn handle_exception(exception: Exception, tf: &TrapFrame) {
-    let stval = riscv::register::stval::read();
     match trap_origin(tf) {
         TrapOrigin::Kernel => {
             if dispatch_kernel_exception(exception, stval, tf) == KernelExceptionDispatch::Unhandled
@@ -1086,28 +1079,15 @@ fn dispatch_kernel_exception(
     stval: usize,
     tf: &TrapFrame,
 ) -> KernelExceptionDispatch {
-    let handler = if let Some(handler) = current_hart_runtime().native_trap_handler.get() {
-        handler
-    } else {
-        let raw_handler = WASMTIME_NATIVE_TRAP_HANDLER.load(Ordering::Acquire);
-        if raw_handler == 0 {
-            return KernelExceptionDispatch::Unhandled;
-        }
-        // SAFETY: the only writer of this slot stores a
-        // `KernelNativeTrapHandler` cast to `usize`, and a zero means
-        // "unset", which the check above has already ruled out.
-        unsafe { mem::transmute::<usize, KernelNativeTrapHandler>(raw_handler) }
-    };
     let Some(cause) = kernel_exception_cause(exception) else {
         return KernelExceptionDispatch::Unhandled;
     };
-    KernelException {
+    helios_kernel::dispatch_native_trap(KernelException {
         cause,
         instruction_pointer: tf.sepc,
         frame_pointer: tf.general.s0,
         faulting_address: kernel_exception_faulting_address(exception, stval),
-    }
-    .dispatch_to(handler)
+    })
 }
 
 fn kernel_exception_cause(exception: Exception) -> Option<KernelExceptionCause> {

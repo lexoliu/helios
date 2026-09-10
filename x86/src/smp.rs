@@ -138,7 +138,6 @@ pub(crate) struct ProcessorRuntime {
     physical_memory_offset: usize,
     tsc_hz: u64,
     pub(crate) wasmtime_tls: WasmtimeTlsSlots,
-    pub(crate) native_trap_handler: AtomicUsize,
     pub(crate) exception_idt: ProcessorIdt,
     /// The GDT and TSS this processor loads beside its IDT, and the two
     /// exception stacks the TSS names.
@@ -256,7 +255,6 @@ pub(crate) fn build_boot_context(
             physical_memory_offset,
             tsc_hz,
             wasmtime_tls: WasmtimeTlsSlots::new(),
-            native_trap_handler: AtomicUsize::new(0),
             exception_idt: ProcessorIdt::new(),
             segments: ProcessorSegments::new(exception_stack(), exception_stack()),
             probe_fault: AtomicUsize::new(0),
@@ -284,7 +282,6 @@ pub(crate) fn build_boot_context(
                 physical_memory_offset,
                 tsc_hz,
                 wasmtime_tls: WasmtimeTlsSlots::new(),
-                native_trap_handler: AtomicUsize::new(0),
                 exception_idt: ProcessorIdt::new(),
                 segments: ProcessorSegments::new(exception_stack(), exception_stack()),
                 probe_fault: AtomicUsize::new(0),

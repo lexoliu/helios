@@ -38,7 +38,7 @@ use core::arch::asm;
 use core::arch::global_asm;
 use core::arch::x86_64::{__cpuid, __cpuid_count, _rdrand64_step, _rdtsc};
 use core::ops::Range;
-use core::sync::atomic::{AtomicUsize, Ordering, compiler_fence};
+use core::sync::atomic::{Ordering, compiler_fence};
 use helios_hal::boot::{BootMemoryMap, BootReservedRanges, usable_region_segments};
 use helios_hal::cpu::{Cpu, Instant, ProcessorId, current_processor};
 use helios_hal::critical_section::ProcessorIdentity;
@@ -69,7 +69,6 @@ const PIT_BASE_HZ: u64 = 1_193_182;
 const PIT_CALIBRATION_HZ: u64 = 100;
 const PAGE_BYTES: usize = 4096;
 pub(crate) const KERNEL_STACK_BYTES: usize = 4 * 1024 * 1024;
-pub(crate) static WASMTIME_NATIVE_TRAP_HANDLER: AtomicUsize = AtomicUsize::new(0);
 static CRITICAL_SECTION_STATE: helios_hal::critical_section::CriticalSectionState =
     helios_hal::critical_section::CriticalSectionState::new();
 
@@ -1151,10 +1150,7 @@ extern "C" fn wasmtime_tls_set(slot: usize, ptr: *mut u8) {
 
 #[unsafe(no_mangle)]
 extern "C" fn wasmtime_init_traps(handler: helios_kernel::KernelNativeTrapHandler) -> i32 {
-    WASMTIME_NATIVE_TRAP_HANDLER.store(handler as usize, Ordering::Release);
-    smp::current_runtime()
-        .native_trap_handler
-        .store(handler as usize, Ordering::Release);
+    helios_kernel::install_native_trap_handler(handler);
     0
 }
 

@@ -1,13 +1,10 @@
 use core::arch::global_asm;
 use core::cell::UnsafeCell;
-use core::mem;
 use core::ops::Range;
 use core::sync::atomic::Ordering;
 
-use helios_kernel::{
-    KernelException, KernelExceptionCause, KernelExceptionDispatch, KernelNativeTrapHandler,
-    StackFault,
-};
+use helios_hal::vmm::VirtAddr as UserVirtAddr;
+use helios_kernel::{KernelException, KernelExceptionCause, KernelExceptionDispatch, StackFault};
 use x86_64::VirtAddr;
 use x86_64::instructions::segmentation::{CS, DS, ES, SS, Segment};
 use x86_64::instructions::tables::load_tss;
@@ -393,9 +390,9 @@ pub(crate) struct ExceptionFrame {
 /// everything unresolved diverges here, either into the runtime's trap
 /// handler (which unwinds the guest and never comes back) or into a
 /// panic.
-    let mut stack_fault = StackFault::Elsewhere;
 #[unsafe(no_mangle)]
 extern "C" fn helios_x86_exception_dispatch(frame: &mut ExceptionFrame) {
+    let mut stack_fault = StackFault::Elsewhere;
     if frame.vector == PAGE_FAULT_VECTOR {
         assert_frame_on_exception_stack(frame);
         let faulting_address = Cr2::read_raw() as usize;
@@ -419,7 +416,7 @@ extern "C" fn helios_x86_exception_dispatch(frame: &mut ExceptionFrame) {
         );
     }
     if let Some(exception) = exception_from_frame(frame) {
-        match dispatch_to_wasmtime(exception) {
+        match helios_kernel::dispatch_native_trap(exception) {
             KernelExceptionDispatch::Resolved => return,
             KernelExceptionDispatch::Unhandled => {
                 panic!(
@@ -480,22 +477,6 @@ fn is_device_interrupt(vector: u8) -> bool {
             | VSOCK_INTERRUPT_VECTOR
     ) || BLOCK_INTERRUPT_VECTORS.contains(&vector)
         || NETWORK_QUEUE_INTERRUPT_VECTORS.contains(&vector)
-}
-
-fn dispatch_to_wasmtime(exception: KernelException) -> KernelExceptionDispatch {
-    let per_processor_handler = smp::current_runtime()
-        .native_trap_handler
-        .load(Ordering::Acquire);
-    let raw_handler = if per_processor_handler != 0 {
-        per_processor_handler
-    } else {
-        crate::WASMTIME_NATIVE_TRAP_HANDLER.load(Ordering::Acquire)
-    };
-    if raw_handler == 0 {
-        return KernelExceptionDispatch::Unhandled;
-    }
-    let handler: KernelNativeTrapHandler = unsafe { mem::transmute(raw_handler) };
-    exception.dispatch_to(handler)
 }
 
 fn exception_from_frame(frame: &ExceptionFrame) -> Option<KernelException> {
