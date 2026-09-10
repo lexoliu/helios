@@ -758,6 +758,25 @@ impl<T: VirtioTransport> helios_hal::display::DisplayDevice for VirtioGpuDevice<
         .await
     }
 
+    async fn blank_scanout(&self, scanout: ScanoutId) -> DisplayResult<()> {
+        // virtio-gpu spells "show nothing" as a `SET_SCANOUT` naming the
+        // reserved resource id and an empty rectangle (virtio 1.2
+        // §5.7.6.8): there is no separate command, and a driver that
+        // simply destroyed the resource would leave the device scanning
+        // out memory it no longer has a reference to.
+        let request =
+            encode_set_scanout(scanout, FramebufferId::new(RESOURCE_NONE), Rect::default());
+        let mut response = [0_u8; CTRL_HEADER_BYTES];
+        self.control_command(
+            &request,
+            &[],
+            &mut response,
+            RESP_OK_NODATA,
+            RequestSubject::scanout(scanout),
+        )
+        .await
+    }
+
     async fn flush(&self, framebuffer: FramebufferId, region: Rect) -> DisplayResult<()> {
         let record = self.record(framebuffer)?;
         self.transfer_to_host(record, region).await?;

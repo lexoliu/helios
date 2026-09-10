@@ -517,6 +517,35 @@ fn moving_the_pointer_costs_one_cursor_command_and_no_frame_traffic() {
     );
 }
 
+/// Releasing a frame buffer is not enough: a scanout still pointed at
+/// the resource would keep the display engine reading pages that have
+/// gone back to their owner, so blanking has to reach the device as its
+/// own command before anything is destroyed.
+#[test]
+fn blanking_a_scanout_names_the_reserved_resource_and_an_empty_rectangle() {
+    let device = device();
+    let mut blanked = pin!(device.blank_scanout(ScanoutId::new(0)));
+
+    let token = pending_control(&device, blanked.as_mut());
+    let request = control_request(&device, token);
+    assert_eq!(command_of(&request), CMD_SET_SCANOUT);
+    for (index, field) in ["x", "y", "width", "height"].iter().enumerate() {
+        assert_eq!(
+            word_at(&request, CTRL_HEADER_BYTES + index * 4),
+            0,
+            "a blanked scanout shows an empty rectangle, but {field} was not zero"
+        );
+    }
+    assert_eq!(word_at(&request, CTRL_HEADER_BYTES + 16), 0, "scanout zero");
+    assert_eq!(
+        word_at(&request, CTRL_HEADER_BYTES + 20),
+        0,
+        "resource zero is how a scanout is switched off"
+    );
+    answer_control(&device, token, &header_response(RESP_OK_NODATA));
+    assert_eq!(block_on(poll_once(blanked.as_mut())), Some(Ok(())));
+}
+
 #[test]
 fn hiding_the_pointer_names_the_reserved_resource() {
     let device = device();
