@@ -244,15 +244,23 @@ a named one, per the table below). Everything else — `Compiling`,
 build ends with one line naming what it redirected:
 
 ```text
-pgo uncovered functions: 34166 in 14 crates (helios_x86 23058, wasmtime 6127, helios_kernel 2790, …); full list: /path/to/helios.pgo-uncovered.txt
+pgo uncovered functions: 18055 of 18648 (96.8%) in 18 crates (helios_x86 11800, wasmtime 3100, …); full list: /path/to/helios.pgo-uncovered.txt
 ```
 
-The first figure is how many functions the profile covered nothing
-about, the parenthesised list is that same count per crate, and the
-path is where the whole list went. The bench run record carries the
-count per column (`kernel_pgo_uncovered`,
-`baseline_kernel_pgo_uncovered`), the paired gate's labels name it, and
-the runtime-directory upload of `bench-suite.yml` collects the lists.
+Both figures are read off the kernel image just built — rustc prints no
+total, so the denominator is the image's own defined `STT_FUNC` symbols
+(the same population `helios-bench symbols` exports), and the numerator
+is the subset a warning named: a function warned once per codegen unit
+still counts once, and one the linker dead-stripped warns and is listed
+without counting against an image it never entered. The percentage is
+the share uncovered, the parenthesised list is the uncovered count per
+crate, and the path is where every warning line went, header first. The
+bench run record carries both figures per column (`kernel_pgo_uncovered`
+and `kernel_pgo_functions`, plus the `baseline_` pair), the paired
+gate's labels name them, and the lists ride the runtime-directory upload
+— `bench-runtime-<lane>` on the matrix lanes, `bench-pgo-uncovered` on
+`suite-pgo`, where the failure-only log upload would have left a green
+run's `full list:` path pointing at nothing.
 
 #### Where each build lands
 
@@ -386,11 +394,10 @@ candidate that does not beat the baseline says the release's profile
 still describes this kernel; one that does
 says the profile has aged, which is the argument for cutting the next
 release's collection. The run record names each column's profile
-(`kernel_profile`, `baseline_kernel_profile`) and the uncovered-function
-count each profile left (`kernel_pgo_uncovered`,
-`baseline_kernel_pgo_uncovered`), and the paired table's labels carry
-them, because two `profile-use` builds of one commit are otherwise
-indistinguishable.
+(`kernel_profile`, `baseline_kernel_profile`) and the coverage each
+profile left — `kernel_pgo_uncovered` of `kernel_pgo_functions`, and the
+`baseline_` pair — and the paired table's labels carry them, because two
+`profile-use` builds of one commit are otherwise indistinguishable.
 
 The pairing machinery varies one thing between its two columns. Until now
 that was the commit — a baseline worktree of another ref (#173, #178) —
