@@ -11,6 +11,7 @@ world init {
   import helios:system/sync@0.1.0;
   import helios:system/serial@0.1.0;
   import helios:system/display@0.1.0;
+  import helios:system/input@0.1.0;
   import wasi:http/types@0.3.0;
   import wasi:http/client@0.3.0;
 }
@@ -27,6 +28,7 @@ world debugger {
   import helios:system/serial@0.1.0;
   import helios:system/instances@0.1.0;
   import helios:system/display@0.1.0;
+  import helios:system/input@0.1.0;
   import wasi:http/types@0.3.0;
   import wasi:http/client@0.3.0;
 }
@@ -101,4 +103,15 @@ world device-host {
 /// `wasi:cli` import the program bindings already provide.
 world display-host {
   import helios:system/display@0.1.0;
+}
+
+/// World the kernel generates its own `helios:system/input` bindings
+/// from.
+///
+/// Separate from the program worlds for the same reason `display-host`
+/// is: it keeps the kernel's bindgen down to the one interface it serves
+/// here instead of regenerating every `wasi:cli` import the program
+/// bindings already provide.
+world input-host {
+  import helios:system/input@0.1.0;
 }

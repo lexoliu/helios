@@ -357,6 +357,10 @@ pub trait ComponentRuntimeState: Clone + Send + 'static {
     /// refused with `unavailable` rather than trapping.
     fn display_service(&self) -> Option<crate::display::DisplayService>;
 
+    /// The machine's input devices, or `None` on a machine the backend
+    /// brought none up on.
+    fn input_service(&self) -> Option<crate::input::InputService>;
+
     fn profiling_enabled(&self) -> bool;
 
     fn record_profile_stack_nanos(
@@ -429,6 +433,10 @@ where
     /// holds, if any. Empty on every instance that never asks for one,
     /// which is every instance that is not a driver.
     pub device: crate::device::DeviceOwnership,
+    /// The input devices this instance holds, if any. Empty on every
+    /// instance that never claims one, which is every instance that is
+    /// not a compositor.
+    pub input: crate::input::InputOwnership,
     /// Set by the runtime exit interface before the guest
     /// traps; the executor reads it to distinguish a clean requested
     /// exit (turn into an exit code) from an actual runtime error.
@@ -520,6 +528,7 @@ where
             serial_reader,
             serial_writer,
             device: crate::device::DeviceOwnership::new(),
+            input: crate::input::InputOwnership::new(),
             requested_exit: None,
         }
     }

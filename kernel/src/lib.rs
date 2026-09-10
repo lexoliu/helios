@@ -13,6 +13,7 @@ mod display;
 mod embedded;
 mod exec;
 mod host_fs;
+mod input;
 mod instance;
 mod io;
 mod kernel_exception;
@@ -108,6 +109,11 @@ pub use host_fs::{
     HOST_SHARE_GUEST_MOUNT_PATH, HOST_SHARE_MOUNT_TAG, HostFsCacheStats, HostFsClient,
     HostFsTransport, UnsupportedHostFileSystem, guest_host_share_path,
 };
+pub use input::{
+    DeviceIndex, EVENT_QUEUE_DEPTH, EventBurst, InputClaim, InputDeviceSnapshot, InputEvents,
+    InputLedSender, InputOwnership, InputService, InputServiceError, MAX_CLAIMED_DEVICES,
+    MAX_REPORT_EVENTS, install_input_devices,
+};
 pub use instance::{
     ActivityChange, ActivityStep, CondemnedMemory, InstanceActivity, InstanceExecutionTransition,
     InstanceId, InstanceProfileTotal, InstanceRegistry, InstanceSnapshot, KernelHeapCharge,
@@ -122,7 +128,7 @@ pub use io::{
     MAX_IOMMU_ENDPOINTS, MAX_NETWORK_INTERRUPTS, PanicSerial, PollKey, PollRegistration,
     PollRegistry, PollRegistryError, PollSourceKind, RecordingConsole, SCRATCH_DISK_SERIAL,
     SerialReader, TryRead, TryWrite, byte_channel, emit_panic_report, install_block_devices,
-    install_input_device, read_debug_serial, read_serial, try_read_serial, wake_queue_owners,
+    read_debug_serial, read_serial, try_read_serial, wake_queue_owners,
 };
 pub use kernel_exception::{
     KernelException, KernelExceptionCause, KernelExceptionDispatch, KernelNativeTrapHandler,

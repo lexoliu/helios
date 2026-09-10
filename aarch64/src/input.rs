@@ -53,21 +53,31 @@ pub(crate) fn count_input_devices(platform: &PlatformDescription) -> usize {
     crate::count_virtio_mmio_devices(platform, helios_virtio::DeviceType::Input)
 }
 
-/// Brings up every input device on the platform bus and hands each to
-/// the kernel.
+/// Brings up every input device on the platform bus, hands them all to
+/// the kernel, and publishes the service `helios:system/input` is served
+/// from.
+///
+/// One call for every device rather than one per device: the kernel owns
+/// the machine's input devices as a set, because that is what a program
+/// asking "what can I read?" is answered from.
 pub(crate) fn install<WatchdogImpl>(
     kernel: &helios_kernel::Kernel<crate::Aarch64Cpu, WatchdogImpl>,
     platform: &PlatformDescription,
     physical_memory_offset: usize,
     handoff: &crate::LimineBootHandoff,
+    debug_state: &crate::debug_state::RuntimeState,
 ) -> Vec<InputInterrupt>
 where
     WatchdogImpl: helios_hal::watchdog::Watchdog + Clone,
 {
     let discovered = discover_input_devices(platform, physical_memory_offset, handoff);
-    for device in &discovered {
-        helios_kernel::install_input_device(kernel, device.device.inner.clone());
-    }
+    let service = helios_kernel::install_input_devices(
+        kernel,
+        discovered
+            .iter()
+            .map(|installed| installed.device.inner.clone()),
+    );
+    debug_state.install_input_service(service);
     discovered
 }
 

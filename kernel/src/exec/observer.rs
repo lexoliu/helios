@@ -88,6 +88,9 @@ pub struct StatsSample {
     /// The hardware the kernel does not drive itself and has offered to
     /// user-mode drivers. Empty on a machine that described none.
     pub devices: Vec<crate::GrantedDeviceSnapshot>,
+    /// The input devices the kernel owns and drains. Empty on a machine
+    /// that gave it none.
+    pub inputs: Vec<crate::InputDeviceSnapshot>,
 }
 
 #[derive(Clone, Debug)]

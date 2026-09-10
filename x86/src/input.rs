@@ -61,17 +61,23 @@ pub(crate) fn discover(pci: &PciRoot) -> Vec<PciAddress> {
     functions
 }
 
-/// Brings up every input function and hands each to the kernel.
+/// Brings up every input function, hands them all to the kernel, and
+/// publishes the service `helios:system/input` is served from.
+///
+/// One call for every function rather than one per function: the kernel
+/// owns the machine's input devices as a set, because that is what a
+/// program asking "what can I read?" is answered from.
 pub(crate) fn install<WatchdogImpl>(
     kernel: &helios_kernel::Kernel<crate::X86Cpu, WatchdogImpl>,
     pci: &PciRoot,
     functions: &[(PciAddress, X86DmaPool)],
     destination_apic_id: u32,
+    debug_state: &crate::debug_state::RuntimeState,
 ) -> Vec<InputInterrupt>
 where
     WatchdogImpl: helios_hal::watchdog::Watchdog + Clone,
 {
-    functions
+    let discovered: Vec<InputInterrupt> = functions
         .iter()
         .zip(INPUT_INTERRUPT_VECTORS)
         .map(|((address, dma), vector)| {
@@ -86,13 +92,21 @@ where
             .unwrap_or_else(|error| {
                 panic!("failed to initialize the virtio-input function at {address}: {error}")
             });
-            let device = Arc::new(device);
-            helios_kernel::install_input_device(kernel, Arc::clone(&device));
             tracing::info!("virtio-input function={address} msix_vector={vector:#x}");
             InputInterrupt {
                 vector,
-                device: VirtioInputFunction { device },
+                device: VirtioInputFunction {
+                    device: Arc::new(device),
+                },
             }
         })
-        .collect()
+        .collect();
+    let service = helios_kernel::install_input_devices(
+        kernel,
+        discovered
+            .iter()
+            .map(|installed| Arc::clone(&installed.device.device)),
+    );
+    debug_state.install_input_service(service);
+    discovered
 }

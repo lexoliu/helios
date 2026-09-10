@@ -65,6 +65,10 @@ struct RuntimeStateInner<ProgramService, NetworkService, HostFsService> {
     /// and the kernel took ownership of it. Empty on a machine with no
     /// display device, where a claim is refused rather than trapping.
     display_service: Once<crate::display::DisplayService>,
+    /// The machine's input devices, once the backend brought them up
+    /// and the kernel took ownership of them. Empty on a machine with
+    /// none, where a claim is refused rather than trapping.
+    input_service: Once<crate::input::InputService>,
     /// What the platform's IOMMU confines, once the backend has built
     /// the domains. Empty on a machine whose devices are not behind one.
     iommu_report: Once<alloc::sync::Arc<crate::IommuReport>>,
@@ -297,6 +301,7 @@ where
                 balloon: Once::new(),
                 swap: Once::new(),
                 display_service: Once::new(),
+                input_service: Once::new(),
                 vsock_service: Once::new(),
                 futex_table: Mutex::new(FutexTable::new()),
                 bootfs: Mutex::new(embedded_init().map(|init| init.bootfs())),
@@ -753,6 +758,26 @@ where
         self.inner.display_service.get().cloned()
     }
 
+    /// Publishes the machine's input devices.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a second set is installed. One machine's devices are
+    /// brought up once, together, and a second set would leave two
+    /// answers to `available` and two claim words per device.
+    pub fn install_input_service(&self, service: crate::input::InputService) {
+        let mut installed = false;
+        self.inner.input_service.call_once(|| {
+            installed = true;
+            service
+        });
+        assert!(installed, "the input service was installed twice");
+    }
+
+    pub fn input_service(&self) -> Option<crate::input::InputService> {
+        self.inner.input_service.get().cloned()
+    }
+
     /// Publishes the root DRBG the backend seeded at boot.
     pub fn install_root_entropy(&self, root: RootEntropyHandle) {
         let mut installed = false;
@@ -914,6 +939,12 @@ where
                 .network_service()
                 .map(|service| service.network_stats()),
             devices: self.inner.device_grants.snapshot(),
+            inputs: self
+                .inner
+                .input_service
+                .get()
+                .map(crate::input::InputService::snapshot)
+                .unwrap_or_default(),
         }
     }
 }
@@ -961,6 +992,10 @@ where
 
     fn display_service(&self) -> Option<crate::display::DisplayService> {
         RuntimeState::display_service(self)
+    }
+
+    fn input_service(&self) -> Option<crate::input::InputService> {
+        RuntimeState::input_service(self)
     }
 
     fn profiling_enabled(&self) -> bool {

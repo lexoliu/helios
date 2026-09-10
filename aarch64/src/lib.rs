@@ -743,7 +743,13 @@ extern "C" fn aarch64_kernel_main() -> ! {
         );
         routes.set_display(display.interrupt, display.device);
     }
-    for device in input::install(&kernel, &platform, physical_memory_offset, &handoff) {
+    for device in input::install(
+        &kernel,
+        &platform,
+        physical_memory_offset,
+        &handoff,
+        &debug_state,
+    ) {
         gic.enable_device_interrupt(
             device.interrupt,
             device.trigger,
