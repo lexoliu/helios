@@ -6,6 +6,7 @@ use core::sync::atomic::Ordering;
 
 use helios_kernel::{
     KernelException, KernelExceptionCause, KernelExceptionDispatch, KernelNativeTrapHandler,
+    StackFault,
 };
 use x86_64::VirtAddr;
 use x86_64::instructions::segmentation::{CS, DS, ES, SS, Segment};
@@ -392,11 +393,20 @@ pub(crate) struct ExceptionFrame {
 /// everything unresolved diverges here, either into the runtime's trap
 /// handler (which unwinds the guest and never comes back) or into a
 /// panic.
+    let mut stack_fault = StackFault::Elsewhere;
 #[unsafe(no_mangle)]
 extern "C" fn helios_x86_exception_dispatch(frame: &mut ExceptionFrame) {
     if frame.vector == PAGE_FAULT_VECTOR {
         assert_frame_on_exception_stack(frame);
-        if resolve_probe_fault(Cr2::read_raw() as usize) {
+        let faulting_address = Cr2::read_raw() as usize;
+        if resolve_probe_fault(faulting_address) {
+            return;
+        }
+        // A reserved page inside a live fiber stack is a demand commit
+        // the kernel resolves here, with no lock and no allocation; the
+        // guard page below one is a stack overflow and stays a fault.
+        stack_fault = helios_kernel::resolve_stack_fault(UserVirtAddr::new(faulting_address));
+        if stack_fault == StackFault::Committed {
             return;
         }
     }
@@ -412,7 +422,10 @@ extern "C" fn helios_x86_exception_dispatch(frame: &mut ExceptionFrame) {
         match dispatch_to_wasmtime(exception) {
             KernelExceptionDispatch::Resolved => return,
             KernelExceptionDispatch::Unhandled => {
-                panic!("unhandled x86 kernel exception after Wasmtime dispatch: {exception:?}")
+                panic!(
+                    "unhandled x86 kernel exception after Wasmtime dispatch: \
+                     {exception:?}{stack_fault}"
+                )
             }
         }
     }
