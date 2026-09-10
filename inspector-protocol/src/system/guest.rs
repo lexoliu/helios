@@ -448,6 +448,7 @@ fn convert_sample(sample: host_stats::Sample) -> stats::Sample {
         network: sample.network.map(convert_network),
         devices: sample.devices.into_iter().map(convert_device).collect(),
         inputs: sample.inputs.into_iter().map(convert_input).collect(),
+        audio: sample.audio.into_iter().map(convert_audio_stream).collect(),
     }
 }
 
@@ -457,6 +458,16 @@ fn convert_input(device: host_stats::InputDevice) -> stats::InputDevice {
         claimed: device.claimed,
         events_delivered: device.events_delivered,
         lost_reports: device.lost_reports,
+    }
+}
+
+fn convert_audio_stream(stream: host_stats::AudioStream) -> stats::AudioStream {
+    stats::AudioStream {
+        id: stream.id,
+        claimed: stream.claimed,
+        played_bytes: stream.played_bytes,
+        xruns: stream.xruns,
+        lost_feedback: stream.lost_feedback,
     }
 }
 

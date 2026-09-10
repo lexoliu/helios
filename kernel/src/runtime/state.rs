@@ -996,6 +996,12 @@ where
                 .get()
                 .map(crate::input::InputService::snapshot)
                 .unwrap_or_default(),
+            audio: self
+                .inner
+                .audio_service
+                .get()
+                .map(crate::audio::AudioService::snapshot)
+                .unwrap_or_default(),
         }
     }
 }

@@ -262,6 +262,22 @@ interface stats {
     lost-reports: u64,
   }
 
+  /// One playback stream the kernel owns and pumps.
+  record audio-stream {
+    /// The device's own id for the stream, which is the id
+    /// `helios:system/audio`'s `claim` asks for.
+    id: u32,
+    /// Whether an instance is playing it right now.
+    claimed: bool,
+    /// Bytes the device has taken since boot.
+    played-bytes: u64,
+    /// Underruns the device reported since boot. Persistently moving is
+    /// a player that is not keeping up with its own stream.
+    xruns: u64,
+    /// Feedback dropped because a reader had not kept up with it.
+    lost-feedback: u64,
+  }
+
   record sample {
     timestamp: mono-nanos,
     uptime: mono-nanos,
@@ -293,6 +309,9 @@ interface stats {
     /// The input devices the kernel owns and drains. Empty on a machine
     /// that gave it none.
     inputs: list<input-device>,
+    /// The playback streams the kernel owns and pumps. Empty on a
+    /// machine that gave it no sound device.
+    audio: list<audio-stream>,
   }
 
   /// Returns the latest coherent system-wide observation snapshot.
