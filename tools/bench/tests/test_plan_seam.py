@@ -17,7 +17,7 @@ from helios_bench.runner import GAP_BENCH, RunOptions, plan
 from helios_bench.wasi_apps import gap_bench
 from helios_bench.workloads import load_workloads
 
-SKIPPED = ("instance-startup-100", "instance-startup-500")
+SKIPPED = ("instance-startup-500",)
 
 
 def driver_invocations(options: RunOptions, workloads: list[dict]) -> list[list[str]]:

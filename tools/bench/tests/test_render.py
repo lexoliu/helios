@@ -13,7 +13,7 @@ from helios_bench.render import (
     render_tables,
     replace_marked_section,
 )
-from helios_bench.report import Report
+from helios_bench.report import Report, Side
 
 
 def test_tables_list_every_class_and_flag_parity_bugs(
@@ -36,6 +36,24 @@ def test_readme_section_names_the_run_and_only_headline_rows(baseline_report: Re
     assert "`hostcall-loop`" in text
     assert "`fs-smallfiles`" not in text
     assert "advisory mode" not in text
+
+
+def test_an_uncompared_row_names_the_side_and_reason(baseline_report: Report) -> None:
+    """A cell the manifest says cannot exist prints `uncompared`, and the
+    recorded reason lands under the table like a failure's does."""
+    fs = baseline_report.workload("fs-smallfiles")
+    marked = fs.model_copy(update={"uncompared": {Side.LINUX_WASMTIME: "the fixture reason"}})
+    report = baseline_report.model_copy(
+        update={
+            "workloads": [
+                marked if workload.name == fs.name else workload for workload in baseline_report.workloads
+            ]
+        }
+    )
+    tables = render_tables(report)
+    row = next(line for line in tables.splitlines() if "`fs-smallfiles`" in line)
+    assert "| uncompared |" in row
+    assert "`fs-smallfiles` is not compared on Linux + Wasmtime: the fixture reason" in tables
 
 
 def test_readme_section_says_when_numbers_are_advisory(advisory_report: Report) -> None:

@@ -25,6 +25,7 @@ Noise floor from `{{ report.control.workload }}` before and after the suite: {{ 
 - `{{ workload.name }}` failed on {{ SIDE_LABELS[side] }}: {{ reason }}
 
 {% endfor %}
+{{ m.uncompared_notes(workload, sides) -}}
 {% set helios = workload.cells.get(Side.HELIOS) %}
 {% if helios and helios.metrics %}
 `{{ workload.name }}` secondary metrics (warm medians):

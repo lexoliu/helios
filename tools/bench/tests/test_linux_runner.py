@@ -58,8 +58,78 @@ def test_missing_counterpart_is_explicit(context) -> None:
     runner = workload_runner()
     workload = runner.selected_workload(load_workloads(), "sched-tasks")
     assert runner.counterpart(workload, "linux_wasmtime") is None
+    assert "linux_wasmtime" in workload["uncompared"]
     with pytest.raises(SystemExit):
         runner.counterpart_command(workload, "linux_wasmtime", context)
+
+
+def test_process_startup_times_wasmtime_spawn_the_same_way(context) -> None:
+    runner = workload_runner()
+    workload = runner.selected_workload(load_workloads(), "process-startup")
+    argv = runner.counterpart_command(workload, "linux_wasmtime", context)
+    assert argv[:2] == ["/bin/sh", "-c"]
+    command = argv[2]
+    assert "while [ $i -lt 20 ]" in command
+    wasmtime = str(GUEST_ROOT / "tools/wasmtime")
+    hello = str(GUEST_ROOT / "artifacts/wasi-tools/hello.wasm.cwasm")
+    assert f"{wasmtime} run --allow-precompiled {hello}" in command
+
+
+def test_the_shell_fs_and_ipc_rows_run_the_stubbed_coreutils(context) -> None:
+    """`stdio-pipe`, `fs-smallfiles` and `fs-readstream` share one recipe:
+    the same coreutils module with its WASIX imports stubbed, driven under
+    `wasmtime run --dir` so the file work lands on the WASI filesystem."""
+    runner = workload_runner()
+    wasmtime = str(GUEST_ROOT / "tools/wasmtime")
+    module = str(GUEST_ROOT / "artifacts/wasix/coreutils/coreutils-wasi.wasm.cwasm")
+    for name in ("stdio-pipe", "fs-smallfiles", "fs-readstream"):
+        workload = runner.selected_workload(load_workloads(), name)
+        argv = runner.counterpart_command(workload, "linux_wasmtime", context)
+        assert argv[:2] == ["/bin/sh", "-c"]
+        command = argv[2]
+        assert f"{wasmtime} run --allow-precompiled -W shared-memory" in command
+        assert "--dir /tmp/work::/work" in command
+        assert module in command
+    stdio = runner.selected_workload(load_workloads(), "stdio-pipe")
+    command = runner.counterpart_command(stdio, "linux_wasmtime", context)[2]
+    assert f"--dir {GUEST_ROOT}/artifacts/wasix/bash::/input" in command
+    assert "/input/bash.wasm" in command
+
+
+def test_tcp_rows_share_the_wasi_client_with_the_row_label(context) -> None:
+    runner = workload_runner()
+    client = str(GUEST_ROOT / "artifacts/wasi-tools/wasi-tcp-throughput.wasm.cwasm")
+    for name, tail in (
+        ("tcp-throughput", ["10.0.2.2", "5000", "67108864", "--label", "tcp-throughput"]),
+        ("tcp-upload", ["10.0.2.2", "5000", "67108864", "up", "--label", "tcp-upload"]),
+        ("wasix-tcp-throughput", ["10.0.2.2", "5000", "67108864", "--label", "wasix-tcp-throughput"]),
+    ):
+        workload = runner.selected_workload(load_workloads(), name)
+        argv = runner.counterpart_command(workload, "linux_wasmtime", context)
+        assert client in argv, name
+        assert "inherit-network=y" in argv, name
+        assert argv[-len(tail) :] == tail, name
+
+
+def test_the_curl_rows_run_the_plain_wasi_http_client(context) -> None:
+    runner = workload_runner()
+    client = str(GUEST_ROOT / "artifacts/wasi-tools/wasi-curl.wasm.cwasm")
+    workload = runner.selected_workload(load_workloads(), "curl-local-http")
+    argv = runner.counterpart_command(workload, "linux_wasmtime", context)
+    assert client in argv
+    assert "inherit-network=y" in argv
+    assert argv[-1] == "http://10.0.2.2:80/payload.txt"
+
+    throughput = runner.selected_workload(load_workloads(), "curl-http-throughput")
+    argv = runner.counterpart_command(throughput, "linux_wasmtime", context)
+    assert client in argv
+    assert argv[-5:] == [
+        "--output",
+        "/dev/null",
+        "--write-out",
+        "curl-http-throughput:%{size_download}\\n",
+        "http://10.0.2.2:80/payload-64m.bin",
+    ]
 
 
 def test_precompile_sources_cover_every_wasm_the_wasmtime_side_runs() -> None:
@@ -69,6 +139,9 @@ def test_precompile_sources_cover_every_wasm_the_wasmtime_side_runs() -> None:
         for path in runner.precompile_sources(REPO_ROOT, load_workloads()["workloads"])
     }
     assert "artifacts/wasi-tools/hello.wasm" in sources
+    assert "artifacts/wasi-tools/wasi-curl.wasm" in sources
+    assert "artifacts/wasi-tools/wasi-tcp-throughput.wasm" in sources
+    assert "artifacts/wasix/coreutils/coreutils-wasi.wasm" in sources
     assert "artifacts/wasix/quickjs/qjs.wasm" in sources
     assert "artifacts/python3-root/python3.wasm" in sources
 

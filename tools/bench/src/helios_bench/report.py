@@ -233,6 +233,10 @@ class WorkloadResult(BaseModel):
         default_factory=dict,
         description="sides that could not measure this workload, with the harness's reason",
     )
+    uncompared: dict[Side, str] = Field(
+        default_factory=dict,
+        description="sides the manifest records as uncompared for this workload, with the reason",
+    )
     comparisons: list[Comparison]
     parity_bug: bool = Field(
         description="compared workload where Helios is significantly slower than Linux + Wasmtime, "

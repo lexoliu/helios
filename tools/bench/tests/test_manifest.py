@@ -47,6 +47,28 @@ def test_workload_manifest_has_a_headline_per_class_and_a_control() -> None:
         assert set(workload["counterparts"]) == {"linux_native", "linux_wasmtime"}
 
 
+def test_every_row_names_a_wasmtime_counterpart_or_the_reason_it_lacks_one() -> None:
+    """#311: no workload may be slower than Linux + Wasmtime, so a row
+    without that cell must say why the comparison does not exist."""
+    manifest = load_workloads()
+    missing = []
+    for workload in manifest["workloads"]:
+        if workload["counterparts"]["linux_wasmtime"] is None:
+            missing.append(workload["name"])
+            assert "linux_wasmtime" in workload.get("uncompared", {}), workload["name"]
+    assert missing == ["sched-tasks"]
+
+    by_name = {workload["name"]: workload for workload in manifest["workloads"]}
+    # The 500-instance row keeps its counterpart commands but the lane
+    # skips it on every side; the recorded reason is what the table shows.
+    five_hundred = by_name["instance-startup-500"]
+    assert set(five_hundred["uncompared"]) == {"linux_native", "linux_wasmtime"}
+    for workload in manifest["workloads"]:
+        for side, reason in workload.get("uncompared", {}).items():
+            assert side in ("linux_native", "linux_wasmtime", "helios"), (workload["name"], side)
+            assert reason.strip(), workload["name"]
+
+
 def test_native_counterparts_exist_for_every_native_bin_reference() -> None:
     manifest = load_workloads()
     sources = {path.stem for path in (REPO_ROOT / "tools/bench/native").glob("*.c")}

@@ -50,21 +50,24 @@ level, with both artifacts' SHA256 recorded in the report.
 
 Each workload isolates one design claim; its class names that claim, and
 its `counterparts` in `workloads.json` say what the Linux sides run. A
-`null` counterpart is reported as uncovered, never approximated.
+`null` counterpart is reported as uncovered, never approximated, and the
+workload's `uncompared` entry records why; the renderer prints that
+reason under the table the cell is missing from.
 
 | Class | Workload | Helios | Linux + Wasmtime | Native Linux |
 | --- | --- | --- | --- | --- |
 | startup | `instance-startup-{1,100,500}` | `procbench startup N hello hold` through `helios:system/programs`; time to first stdout byte per instance, memory per instance as the drop in `helios:system/stats` available memory while all are alive | `procbench` spawning `wasmtime run --allow-precompiled hello.cwasm hold` | `procbench` spawning the C `hello`; RSS from `/proc` |
 | startup | `spawn-wait` | 200 sequential spawn+wait | same, Wasmtime child | same, native child |
-| startup | `process-startup` | 20 × `dash -c true` | — | same |
+| startup | `process-startup` | 20 × `dash -c true` | 20 × `wasmtime run hello.cwasm` | same |
 | hostcall | `hostcall-loop` | 2 000 000 × `wasi:clocks/monotonic-clock.now` | same wasm | 2 000 000 × `clock_gettime(CLOCK_MONOTONIC)` |
 | ipc | `pipe-pingpong` | 20 000 × 64-byte round trip through a child's stdin/stdout | Wasmtime `pipe-echo` child | C `pipe-echo` child |
 | ipc | `pipe-stream` | 64 MiB through the child | same | same |
-| ipc | `stdio-pipe` | coreutils pipeline | — | same |
-| sched | `sched-tasks` | 64 cooperative tasks × 2000 `yield_now` (one host call each) | — (Wasmtime has no cooperative scheduler for a CLI program) | 64 threads × 2000 `sched_yield` |
-| net | `tcp-throughput`, `tcp-upload`, `wasi-tcp-throughput`, `wasix-tcp-throughput`, `curl-*` | 64 MiB streams through the in-kernel stack | `wasi-tcp-throughput` only | Python client / curl |
+| ipc | `stdio-pipe` | coreutils pipeline | the same coreutils module with its WASIX imports stubbed (`coreutils-wasi.wasm`) under `wasmtime run --dir` | same |
+| sched | `sched-tasks` | 64 cooperative tasks × 2000 `yield_now` (one host call each) | uncompared (Wasmtime's CLI has no cooperative scheduler for a CLI program) | 64 threads × 2000 `sched_yield` |
+| net | `tcp-throughput`, `tcp-upload`, `wasi-tcp-throughput`, `wasix-tcp-throughput` | 64 MiB streams through the in-kernel stack | `wasi-tcp-throughput.wasm` labelled per row under `wasmtime run -S inherit-network` | Python client |
+| net | `curl-local-http`, `curl-http-throughput` | `curl.wasm` over `wasi:http` | `wasi-curl.wasm` (the same curl CLI contract over plain WASI sockets) under `wasmtime run -S inherit-network` | curl |
 | net | `tcp-latency` | 5000 × 16-byte round trip to a host echo server | same wasm | C client with `TCP_NODELAY` |
-| fs | `fs-smallfiles`, `fs-readstream` | coreutils on the embedded filesystem root | — | ext4 in the guest |
+| fs | `fs-smallfiles`, `fs-readstream` | coreutils on the embedded filesystem root | `coreutils-wasi.wasm` under `wasmtime run --dir` | ext4 in the guest |
 | compute | `quickjs-loop`, `cpython-json`, `cpython-regex`, `wasm-simd-lanes` | interpreter or SIMD loops | same wasm | native QuickJS/CPython/NEON-or-SSE probe |
 | compute | `aot-curl` | compiler plugin AOT of `curl.wasm` | `wasmtime compile` of the same input | — |
 

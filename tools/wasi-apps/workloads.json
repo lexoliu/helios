@@ -259,6 +259,10 @@
         "instance-startup:500"
       ],
       "stderr_empty": true,
+      "uncompared": {
+        "linux_native": "500 concurrent instances want about 6.1 GiB of guest memory before the kernel's own baseline and the lane's guests have less, so neither Linux side can run it; the Helios half is still attempted and its failure recorded.",
+        "linux_wasmtime": "500 concurrent instances want about 6.1 GiB of guest memory before the kernel's own baseline and the lane's guests have less, so neither Linux side can run it; the Helios half is still attempted and its failure recorded."
+      },
       "counterparts": {
         "linux_native": {
           "program": "{native_bin}/procbench",
@@ -339,7 +343,9 @@
         "linux_native": {
           "inherit": true
         },
-        "linux_wasmtime": null
+        "linux_wasmtime": {
+          "command": "i=0; while [ $i -lt 20 ]; do {wasmtime} run --allow-precompiled {cwasm:artifacts/wasi-tools/hello.wasm}; i=$((i+1)); done; echo process-startup:ok"
+        }
       }
     },
     {
@@ -478,7 +484,9 @@
         "linux_native": {
           "inherit": true
         },
-        "linux_wasmtime": null
+        "linux_wasmtime": {
+          "command": "cu=\"{wasmtime} run --allow-precompiled -W shared-memory --dir {workdir}::/work --dir {repo_root}/artifacts/wasix/bash::/input {cwasm:artifacts/wasix/coreutils/coreutils-wasi.wasm}\"; out=/work/pipe-$HELIOS_PROCESS_ID.out; copy=/work/pipe-$HELIOS_PROCESS_ID.copy; $cu head --bytes=131072 /input/bash.wasm | $cu tee $out >/dev/null; $cu cat $out | $cu tee $copy >/dev/null; $cu cat $copy >/dev/null; echo stdio-pipe:ok"
+        }
       }
     },
     {
@@ -499,6 +507,9 @@
         "sched-tasks:128000"
       ],
       "stderr_empty": true,
+      "uncompared": {
+        "linux_wasmtime": "Wasmtime's CLI has no cooperative scheduler for a guest's tasks to run against; the native Linux thread row is the only reference."
+      },
       "counterparts": {
         "linux_native": {
           "program": "{native_bin}/sched-tasks",
@@ -529,7 +540,9 @@
         "linux_native": {
           "inherit": true
         },
-        "linux_wasmtime": null
+        "linux_wasmtime": {
+          "command": "cu=\"{wasmtime} run --allow-precompiled -W shared-memory --dir {workdir}::/work {cwasm:artifacts/wasix/coreutils/coreutils-wasi.wasm}\"; dir=/work/bench-smallfiles-$HELIOS_PROCESS_ID; $cu mkdir $dir; i=0; while [ $i -lt 64 ]; do echo data-$i | $cu tee $dir/f$i >/dev/null; $cu cat $dir/f$i | $cu tee $dir/c$i >/dev/null; i=$((i+1)); done; echo fs-smallfiles:ok"
+        }
       }
     },
     {
@@ -552,7 +565,9 @@
         "linux_native": {
           "inherit": true
         },
-        "linux_wasmtime": null
+        "linux_wasmtime": {
+          "command": "cu=\"{wasmtime} run --allow-precompiled -W shared-memory --dir {workdir}::/work --dir {repo_root}/artifacts/wasix/bash::/input {cwasm:artifacts/wasix/coreutils/coreutils-wasi.wasm}\"; file=/work/bench-readstream-$HELIOS_PROCESS_ID.in; copy=/work/bench-readstream-$HELIOS_PROCESS_ID.out; $cu head --bytes=1048576 /input/bash.wasm | $cu tee $file >/dev/null; $cu cat $file | $cu tee $copy >/dev/null; $cu cat $copy >/dev/null; echo fs-readstream:ok"
+        }
       }
     },
     {
@@ -578,7 +593,16 @@
         "linux_native": {
           "inherit": true
         },
-        "linux_wasmtime": null
+        "linux_wasmtime": {
+          "wasm_path": "artifacts/wasi-tools/wasi-curl.wasm",
+          "wasmtime_flags": [
+            "-S",
+            "inherit-network=y"
+          ],
+          "args": [
+            "{host_http_url}"
+          ]
+        }
       }
     },
     {
@@ -606,7 +630,20 @@
         "linux_native": {
           "inherit": true
         },
-        "linux_wasmtime": null
+        "linux_wasmtime": {
+          "wasm_path": "artifacts/wasi-tools/wasi-tcp-throughput.wasm",
+          "wasmtime_flags": [
+            "-S",
+            "inherit-network=y"
+          ],
+          "args": [
+            "{host_tcp_host}",
+            "{host_tcp_port}",
+            "67108864",
+            "--label",
+            "tcp-throughput"
+          ]
+        }
       }
     },
     {
@@ -678,7 +715,21 @@
         "linux_native": {
           "inherit": true
         },
-        "linux_wasmtime": null
+        "linux_wasmtime": {
+          "wasm_path": "artifacts/wasi-tools/wasi-tcp-throughput.wasm",
+          "wasmtime_flags": [
+            "-S",
+            "inherit-network=y"
+          ],
+          "args": [
+            "{host_tcp_host}",
+            "{host_tcp_port}",
+            "67108864",
+            "up",
+            "--label",
+            "tcp-upload"
+          ]
+        }
       }
     },
     {
@@ -706,7 +757,20 @@
         "linux_native": {
           "inherit": true
         },
-        "linux_wasmtime": null
+        "linux_wasmtime": {
+          "wasm_path": "artifacts/wasi-tools/wasi-tcp-throughput.wasm",
+          "wasmtime_flags": [
+            "-S",
+            "inherit-network=y"
+          ],
+          "args": [
+            "{host_tcp_host}",
+            "{host_tcp_port}",
+            "67108864",
+            "--label",
+            "wasix-tcp-throughput"
+          ]
+        }
       }
     },
     {
@@ -776,7 +840,20 @@
         "linux_native": {
           "inherit": true
         },
-        "linux_wasmtime": null
+        "linux_wasmtime": {
+          "wasm_path": "artifacts/wasi-tools/wasi-curl.wasm",
+          "wasmtime_flags": [
+            "-S",
+            "inherit-network=y"
+          ],
+          "args": [
+            "--output",
+            "/dev/null",
+            "--write-out",
+            "curl-http-throughput:%{size_download}\\n",
+            "{host_http_large_url}"
+          ]
+        }
       }
     }
   ]

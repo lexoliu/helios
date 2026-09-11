@@ -8,8 +8,10 @@
 #   component + stdlib under `$out_dir/../python3-root`.
 # - Builds our Rust `curl-wasi`, the TCP throughput tools, and the
 #   benchmark-suite workload programs from source.
-# - Stages standard Wasmer WASIX shell/coreutils artifacts and builds QuickJS
-#   with wasm SIMD enabled for the boot filesystem.
+# - Stages standard Wasmer WASIX shell/coreutils artifacts, derives the
+#   WASI-loadable `coreutils-wasi.wasm` for the Linux + Wasmtime bench
+#   side, and builds QuickJS with wasm SIMD enabled for the boot
+#   filesystem.
 # - Writes the recorded branch hints back into every artifact a profile
 #   exists for, so a rebuilt artifact keeps the hints the compiler plugin
 #   reads (docs/pgo.md section (b)).
@@ -273,6 +275,14 @@ stage_wasmer_webc_atom \
 echo "coreutils installed at: $coreutils_root/coreutils.wasm"
 ls -lh "$coreutils_root/coreutils.wasm"
 
+echo "Deriving a WASI-loadable coreutils for the Linux + Wasmtime side..."
+"$repo_root/tools/wasi-apps/stub-wasix-imports.py" \
+  "$coreutils_root/coreutils.wasm" \
+  "$coreutils_root/coreutils-wasi.wasm"
+
+echo "coreutils-wasi installed at: $coreutils_root/coreutils-wasi.wasm"
+ls -lh "$coreutils_root/coreutils-wasi.wasm"
+
 echo "Building Helios WASIX conformance artifacts..."
 for test_name in thread-futex continuation simd-lanes; do
   test_root="$artifacts_root/wasix/$test_name"
@@ -322,6 +332,10 @@ build_wasi_tool curl helios_curl_wasi wasm32-wasip2 curl
 build_wasi_tool tcp-throughput helios_tcp_throughput_wasi wasm32-wasip2 tcp-throughput
 build_wasi_tool wasi-tcp-throughput helios_wasi_tcp_throughput wasm32-wasip2 wasi-tcp-throughput
 build_wasi_tool wasix-tcp-throughput wasix-tcp-throughput wasm32-wasip1 wasix-tcp-throughput
+# The Helios curl imports helios:system/programs and wasi:http@0.3.0,
+# which upstream Wasmtime cannot instantiate; the Linux + Wasmtime side
+# runs this plain-WASI HTTP/1.1 client instead.
+build_wasi_tool wasi-curl helios_wasi_curl wasm32-wasip2 wasi-curl
 # Benchmark-suite workloads that run unchanged on Helios and under Wasmtime
 # on Linux; docs/benchmarks.md lists what each one measures.
 build_wasi_tool hello helios_hello_wasi wasm32-wasip2 hello
@@ -330,4 +344,4 @@ build_wasi_tool hostcall-loop helios_hostcall_loop_wasi wasm32-wasip2 hostcall-l
 build_wasi_tool tcp-latency helios_tcp_latency_wasi wasm32-wasip2 tcp-latency
 
 echo "wasi artifacts written to: $out_dir and $python_root"
-ls -lh "$out_dir"/{curl,tcp-throughput,wasi-tcp-throughput,wasix-tcp-throughput,hello,pipe-echo,hostcall-loop,tcp-latency}*.wasm
+ls -lh "$out_dir"/{curl,tcp-throughput,wasi-tcp-throughput,wasix-tcp-throughput,wasi-curl,hello,pipe-echo,hostcall-loop,tcp-latency}*.wasm
