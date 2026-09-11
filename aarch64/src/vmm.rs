@@ -174,6 +174,21 @@ impl Aarch64UserAddressSpace {
         }
     }
 
+    /// Where `frame` appears in the kernel's own map.
+    ///
+    /// This backend maps every byte of physical memory at
+    /// `physical_memory_offset`, and the pinned runs
+    /// `commit_contiguous` hands out come out of that map, so the alias
+    /// is the offset applied again.
+    pub fn kernel_alias(&self, frame: PhysFrame) -> VirtAddr {
+        VirtAddr::new(
+            frame
+                .phys_addr()
+                .checked_add(self.physical_memory_offset)
+                .expect("a physical frame plus the kernel's map offset fits the address space"),
+        )
+    }
+
     fn orphan(&self, entries: Vec<SwapEntry>) {
         if entries.is_empty() {
             return;

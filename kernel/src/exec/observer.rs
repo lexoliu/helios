@@ -91,6 +91,9 @@ pub struct StatsSample {
     /// The input devices the kernel owns and drains. Empty on a machine
     /// that gave it none.
     pub inputs: Vec<crate::InputDeviceSnapshot>,
+    /// The playback streams the kernel owns and pumps. Empty on a
+    /// machine that gave it no sound device.
+    pub audio: Vec<crate::AudioStreamSnapshot>,
 }
 
 #[derive(Clone, Debug)]

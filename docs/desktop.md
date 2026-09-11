@@ -1,10 +1,12 @@
 # The desktop devices and how a session drives them
 
 A guest that draws needs a display adapter, a keyboard and two pointers,
-and a host that wants to prove what it drew needs to read the scanout
-back. `helios-inspector vm` attaches the devices and reads the scanout
-through QEMU's machine protocol, so the evidence is a PNG a lane can keep
-rather than a window somebody watched.
+one that makes a sound needs a sound device, and a host that wants to
+prove what came out of either needs to read it back.
+`helios-inspector vm` attaches the devices, reads the scanout through
+QEMU's machine protocol and records the playback to a file, so the
+evidence is a PNG and a WAV a lane can keep rather than a window somebody
+watched and a speaker somebody heard.
 
 ## The devices
 
@@ -174,6 +176,84 @@ It is a second boot rather than a second action on the display's,
 because one `vm` session runs one action and neither half survives being
 weakened — a capture taken while nothing is drawing, or an input script
 sent before anything claimed the devices, is evidence of nothing.
+
+## What the guest plays
+
+The third of the desktop's paths is `helios:system/audio`, and it is the
+one that runs the other way: the guest produces the bytes and the device
+consumes them. `--audiodev` is what gives the machine a sound device at
+all, and the driver says what it found as it comes up:
+
+```text
+virtio-snd online transport=pci streams=2 jacks=2 rates=8000..48000 formats=S16,S32,FLOAT
+```
+
+The kernel owns the device and hands the right to *play* one stream to
+exactly one instance at a time, the way it hands out a display surface
+and an input device. `available()` lists every stream that plays and what
+each will accept; `claim(id)` takes one, and a second caller is refused
+rather than queued.
+
+A claim is one agreement and then one byte stream. `negotiate(format)`
+fixes the rate, the channel count and the sample layout — a format the
+device did not list is refused, never answered with the nearest one it
+does have, because the samples were generated for what was asked for —
+and it is where the stream's period buffers are pinned, in the claiming
+instance's own memory pool and accounted to it, through the same arena
+the display's frame buffers come from. `samples()` then hands back the
+writer every frame goes into: bytes in the negotiated format,
+interleaved, with no framing of any kind.
+
+What the writer does not do is run ahead of the sound. The kernel keeps
+four periods in flight and takes bytes as fast as the device takes
+periods, so a program that is never made to wait is a program producing
+material slower than real time.
+
+That is also what makes an underrun a fact rather than a guess. When the
+periods run dry the kernel reports `xrun` on the claim's `feedback()`
+stream, beside the latency the device reports for each period it takes,
+and it plays nothing in the gap: a program that wants silence sends
+silence. Substituted silence would make a recording that is two seconds
+long and a program that produced one second indistinguishable, which is
+exactly the failure this path exists to show.
+
+`programs/audio-test` is the guest side of it: two seconds of a 440 Hz
+sine at 48 kHz stereo S16, with a line for each step.
+
+```text
+audio-test:claimed stream=0 rates=6 formats=3 channels=1..2
+audio-test:negotiated rate=48000 channels=2 format=S16
+audio-test:wrote bytes=384000 frames=96000
+audio-test:done latency-bytes=1920 xruns=0
+```
+
+```bash
+./target/release/helios-inspector vm --arch x86-64 --release --accel kvm \
+    --audiodev "wav:$PWD/tone.wav" \
+    --boot-program dash --boot-program debugger --boot-program audio-test \
+    shell -c '/bin/audio-test --seconds 2'
+```
+
+The recording is the evidence, and `tools/desktop/check-tone.py` is what
+reads it: it finds the part of the file that is above the silence floor,
+asserts it lasts the two seconds the guest played for within one period,
+and asserts that the strongest partial in the middle of it is the 440 Hz
+the guest generated, within one bin of the transform that found it. A
+device nothing ever sent a period to leaves behind a valid WAV header
+too; only the samples tell the two apart.
+
+```text
+check-tone: tone.wav rate=44100 frames=95256 duration=2.160s sounding=2.000s
+check-tone: dominant=439.9Hz expected=440.0Hz bin=10.8Hz margin=40.7x
+check-tone: tone.wav holds the tone the guest played
+```
+
+`smoke-x86-64` runs exactly that on every push, greps the guest's four
+lines and the kernel's own `audio service online` and `playback stream
+negotiated`, and uploads the recording with the desktop captures. It is a
+third boot for the same reason the input probe is a second one: a
+recording taken while something else was also driving the machine could
+not be attributed to the audio path.
 
 ## What the capture proves today
 

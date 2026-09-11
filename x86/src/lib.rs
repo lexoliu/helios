@@ -508,6 +508,7 @@ fn install_pci_devices<WatchdogImpl>(
             dma_pool(address),
             exceptions::SOUND_INTERRUPT_VECTOR,
             destination_apic_id,
+            debug_state,
         );
         routes.set_sound(exceptions::SOUND_INTERRUPT_VECTOR, device);
     } else {

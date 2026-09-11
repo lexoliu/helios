@@ -1,0 +1,194 @@
+package helios:system@0.1.0;
+
+/// The machine's sound device, one playback stream at a time.
+///
+/// Helios drives the sound device itself — an event ring nobody drains
+/// is a ring the host runs out of buffers on, and on a transport whose
+/// interrupt line is a function of a read-to-clear register the line
+/// never falls again — so the kernel owns the device for as long as the
+/// machine runs. What this interface hands out is the right to *play
+/// down* one of its streams: exactly one instance holds a stream at a
+/// time, and everything it configured is released when it lets go or
+/// dies.
+///
+/// Samples never travel through a buffer the kernel owns. A stream's
+/// period buffers are pinned, physically contiguous pages committed
+/// from the claiming instance's own memory pool and accounted to it,
+/// and those same pages are what the device is told to read; the bytes
+/// on `samples` are copied into them once, in the order they arrive.
+///
+/// # What is never played
+///
+/// Silence the kernel made up. A stream whose samples stop arriving is
+/// a stream the device runs dry on, and what comes back is an `xrun` on
+/// `feedback` rather than a gap nobody was told about: a player that
+/// wants silence sends silence. The only zeros the kernel writes are the
+/// tail of a final part-filled period, without which the samples before
+/// them could not be handed to a device that takes whole periods.
+interface audio {
+  /// Why a playback request was refused.
+  enum error {
+    /// This machine has no sound device, or the kernel has not finished
+    /// bringing one up.
+    unavailable,
+    /// No stream of that id on this device.
+    no-such-stream,
+    /// The stream exists and records rather than plays.
+    not-playback,
+    /// Another instance already holds that stream, or this one already
+    /// holds a stream, or the last owner's resources have not been
+    /// handed back yet.
+    already-claimed,
+    /// A handle that outlived a release names a stream its instance no
+    /// longer holds.
+    not-claimed,
+    /// This stream has already agreed a format. A stream is negotiated
+    /// once per claim: its period buffers are pinned then.
+    already-negotiated,
+    /// Samples were offered to a stream whose format has not been
+    /// agreed. Nothing says how long a period is, so nothing can be
+    /// played.
+    not-negotiated,
+    /// The rate, channel count or sample layout is not one this stream
+    /// accepts. Refused rather than answered with the nearest thing the
+    /// device does take, which would play the caller's samples at a
+    /// speed it never asked for.
+    unsupported-format,
+    /// The period buffers could not be pinned: the machine has no
+    /// contiguous run of that size left, or this instance's own memory
+    /// accounting refused it.
+    out-of-memory,
+    /// The device faulted rather than refused.
+    device-fault,
+  }
+
+  /// How one sample is laid out in the byte stream.
+  ///
+  /// The multi-byte layouts are little-endian, which is the order every
+  /// PCM device Helios drives latches. The names are spelled out
+  /// because `s16` and its neighbours are the component model's own
+  /// type keywords.
+  enum sample-format {
+    signed-8,
+    unsigned-8,
+    signed-16,
+    unsigned-16,
+    signed-32,
+    unsigned-32,
+    float-32,
+    float-64,
+  }
+
+  /// What a caller chooses about a stream.
+  ///
+  /// The period and the device-side buffer are not here: they follow
+  /// from the rate and the frame size, and a caller that picked them
+  /// itself would be picking its own latency without being able to see
+  /// what the device does with it. What the latency actually is arrives
+  /// on `feedback`, one item per period the device takes.
+  record format {
+    /// Frames per second.
+    rate: u32,
+    /// Channels per frame, interleaved in the stream.
+    channels: u8,
+    /// How one sample of one channel is laid out.
+    sample-format: sample-format,
+  }
+
+  /// What the device says about one stream that plays.
+  record stream-info {
+    /// The device's own id for the stream, which is what `claim` names.
+    id: u32,
+    /// Every rate it can be clocked at, ascending.
+    rates: list<u32>,
+    /// Every sample layout it accepts.
+    formats: list<sample-format>,
+    /// Fewest channels per frame it accepts.
+    channels-min: u8,
+    /// Most channels per frame it accepts.
+    channels-max: u8,
+  }
+
+  /// What the kernel reports back about a stream that is playing.
+  variant feedback {
+    /// The device took a period, and still held this many bytes
+    /// unplayed when it did. This is the latency the player is running
+    /// at, in the only unit the device can state it in; divided by the
+    /// frame size and the rate it is a time.
+    latency-bytes(u32),
+    /// The device ran out of samples before the next period arrived,
+    /// and what came out of the jack is a gap. Nothing was substituted
+    /// for the samples that did not arrive.
+    xrun,
+  }
+
+  /// One instance's exclusive hold on one playback stream.
+  ///
+  /// Dropping it — or dying while holding it — stops the stream, hands
+  /// every pinned page back to this instance's pool and leaves the
+  /// device reading nothing before the stream is offered to anyone
+  /// else.
+  resource playback {
+    /// What the device says about the stream this holds.
+    info: func() -> stream-info;
+
+    /// Agree the format this stream will play at.
+    ///
+    /// A format the stream does not accept is refused rather than
+    /// answered with the nearest one it does. What comes back is the
+    /// format the device was configured with, which is the format that
+    /// was asked for; it is returned rather than implied so that a
+    /// caller reading it back needs no second call.
+    ///
+    /// Called once per claim: the period buffers are pinned here, and a
+    /// second format would need the device to have stopped reading the
+    /// first set, which is what releasing this resource is.
+    negotiate: async func(desired: format) -> result<format, error>;
+
+    /// Hand the kernel this stream's samples.
+    ///
+    /// The bytes are frames in the negotiated format, interleaved,
+    /// with no framing of any kind: the stream is the sound. The future
+    /// resolves when the last of them has been taken, and the stream
+    /// ending is what says the material is over.
+    ///
+    /// Backpressure is the device's: the kernel takes bytes as fast as
+    /// the stream can be fed periods, and no faster, so a writer that is
+    /// never made to wait is a writer that has run ahead of the sound.
+    samples: func(data: stream<u8>) -> future<result<_, error>>;
+
+    /// Everything the kernel has to say about this stream while it
+    /// plays: one item per period the device takes, and one per
+    /// underrun.
+    ///
+    /// One stream per claim. A second call hands back a second reader
+    /// of the same queue, and an item goes to exactly one of them, so a
+    /// consumer that wants its feedback in one place asks once.
+    feedback: func() -> stream<feedback>;
+
+    /// Stop the clock and let the device release what it allocated.
+    ///
+    /// The `samples` stream ends with it. The stream stays claimed —
+    /// nobody else may take it — but it cannot be negotiated again;
+    /// dropping this resource is what gives it back.
+    stop: async func() -> result<_, error>;
+
+    /// Give the stream back without waiting for the drop.
+    ///
+    /// Exactly what dropping this resource does, spelled as a call for
+    /// a player that wants to say when.
+    release: func();
+  }
+
+  /// Every playback stream the kernel brought up, whether or not
+  /// somebody holds it. Empty on a machine with no sound device.
+  available: func() -> list<stream-info>;
+
+  /// Take exclusive ownership of the stream `stream` names.
+  ///
+  /// The second caller is refused rather than queued: a player waiting
+  /// for a stream another player holds is a provisioning mistake, not a
+  /// shortage. This is the rule `display.claim` and `input.claim` both
+  /// follow, for the same reason.
+  claim: func(%stream: u32) -> result<playback, error>;
+}

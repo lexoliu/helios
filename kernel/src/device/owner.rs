@@ -16,12 +16,14 @@
 
 use helios_hal::vmm::VirtAddr;
 
+use crate::audio::{AudioOwnership, AudioService, AudioServiceError};
 use crate::display::{DisplayOwnership, DisplayService, DisplayServiceError};
 use crate::surface::{SurfaceOwnership, SurfaceServiceError};
 
 use super::grant::{DeviceName, GrantError};
 use super::lease::{
-    DEVICE_WINDOW_BYTES, DISPLAY_WINDOW_BYTES, DeviceWindow, GrantLease, SURFACE_WINDOW_BYTES,
+    AUDIO_WINDOW_BYTES, DEVICE_WINDOW_BYTES, DISPLAY_WINDOW_BYTES, DeviceWindow, GrantLease,
+    SURFACE_WINDOW_BYTES,
 };
 use super::registry::DeviceGrantRegistry;
 
@@ -42,13 +44,15 @@ pub struct LinearMemory {
 
 /// One instance's hold on the device path.
 ///
-/// Two things can put hardware inside an instance's memory: a device
-/// grant, whose registers and rings go in the device window, and a
-/// display claim, whose frame buffers go in the display window
-/// immediately below it. Both are here because both are bounded by the
-/// same fact — where this instance's linear memory is and how far it has
-/// grown — and an instance that holds one, the other, or both must have
-/// its growth capped below the lowest window it holds.
+/// Four things can put hardware inside an instance's memory: a device
+/// grant, whose registers and rings go in the device window, a display
+/// claim, whose frame buffers go in the display window immediately
+/// below it, a surface, whose client window goes below that, and a
+/// playback claim, whose period buffers go in the audio window at the
+/// bottom. All four are here because all four are bounded
+/// by the same fact — where this instance's linear memory is and how far
+/// it has grown — and an instance that holds any of them must have its
+/// growth capped below the lowest window it holds.
 #[derive(Default)]
 pub struct DeviceOwnership {
     /// Resolved once, after the instance is built. Absent on an
@@ -66,6 +70,8 @@ pub struct DeviceOwnership {
     /// everybody's it composes. Empty on every instance that neither
     /// asks for a window nor composes the desktop.
     surfaces: SurfaceOwnership,
+    /// The playback stream, once this instance claimed one.
+    audio: AudioOwnership,
 }
 
 impl DeviceOwnership {
@@ -76,6 +82,7 @@ impl DeviceOwnership {
             lease: None,
             display: DisplayOwnership::new(),
             surfaces: SurfaceOwnership::new(),
+            audio: AudioOwnership::new(),
         }
     }
 
@@ -114,7 +121,11 @@ impl DeviceOwnership {
             .map(|window| window.offset());
         let display = self.display.window().map(|window| window.offset());
         let surfaces = self.surfaces.window().map(|window| window.offset());
-        [device, display, surfaces].into_iter().flatten().min()
+        let audio = self.audio.window().map(|window| window.offset());
+        [device, display, surfaces, audio]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     /// The window this instance's device mappings would live in.
@@ -154,6 +165,27 @@ impl DeviceOwnership {
             })
     }
 
+    /// The window this instance's period buffers would live in, which
+    /// is the span at the bottom of the four: an instance may hold the
+    /// display, draw in a window of its own *and* play a stream, and
+    /// the growth cap has to be under the lowest window it holds.
+    pub fn audio_window(&self) -> Option<DeviceWindow> {
+        self.memory
+            .filter(|memory| {
+                memory.reservation_bytes
+                    > DEVICE_WINDOW_BYTES
+                        + DISPLAY_WINDOW_BYTES
+                        + SURFACE_WINDOW_BYTES
+                        + AUDIO_WINDOW_BYTES
+            })
+            .map(|memory| {
+                DeviceWindow::top_of(memory.base, memory.reservation_bytes)
+                    .below(DISPLAY_WINDOW_BYTES)
+                    .below(SURFACE_WINDOW_BYTES)
+                    .below(AUDIO_WINDOW_BYTES)
+            })
+    }
+
     /// This instance's side of the surface path.
     pub const fn surfaces(&self) -> &SurfaceOwnership {
         &self.surfaces
@@ -188,6 +220,36 @@ impl DeviceOwnership {
     /// not the compositor.
     pub fn unmap_surface_view(&mut self, id: crate::surface::SurfaceId) {
         self.surfaces.unmap_view(id);
+    }
+
+    /// This instance's side of the audio path.
+    pub const fn audio(&self) -> &AudioOwnership {
+        &self.audio
+    }
+
+    /// This instance's side of the audio path, to act on.
+    pub const fn audio_mut(&mut self) -> &mut AudioOwnership {
+        &mut self.audio
+    }
+
+    /// Take exclusive ownership of one of the machine's playback
+    /// streams.
+    ///
+    /// Refused when the instance's memory has already grown over the
+    /// window its period buffers would be pinned in, for the reason a
+    /// display claim is: the pages would land on memory it is using.
+    pub fn claim_audio(
+        &mut self,
+        service: &AudioService,
+        id: u32,
+    ) -> Result<(), AudioServiceError> {
+        let window = self
+            .audio_window()
+            .ok_or(AudioServiceError::WindowExhausted)?;
+        if self.high_water_bytes > window.offset() {
+            return Err(AudioServiceError::WindowExhausted);
+        }
+        self.audio.claim(service, id, window)
     }
 
     /// This instance's side of the display path.
