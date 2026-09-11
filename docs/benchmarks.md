@@ -69,10 +69,11 @@ its `counterparts` in `workloads.json` say what the Linux sides run. A
 | compute | `aot-curl` | compiler plugin AOT of `curl.wasm` | `wasmtime compile` of the same input | — |
 
 `headline: true` marks the rows the README table and the regression gate
-carry. Compute is a parity check, not a claim: Helios running the same
-wasm on the same Cranelift must be within noise of Linux + Wasmtime, and
-a significant loss there is flagged `parity_bug` in the report and filed
-as a bug rather than reported as a number.
+carry. Every compared row is a parity check, not a claim: Helios running
+the same wasm on the same Cranelift must be within noise of Linux +
+Wasmtime, whatever the workload's class, and a significant loss on any
+of them is flagged `parity_bug` in the report and filed as a bug rather
+than reported as a number.
 
 Workloads print secondary measurements as `bench.<name>=<value>` lines
 (latency percentiles, bytes per instance, switches per second); both

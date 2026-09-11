@@ -235,7 +235,8 @@ class WorkloadResult(BaseModel):
     )
     comparisons: list[Comparison]
     parity_bug: bool = Field(
-        description="compute-class workload where Helios is significantly slower than Linux + Wasmtime"
+        description="compared workload where Helios is significantly slower than Linux + Wasmtime, "
+        "whatever its class"
     )
 
 

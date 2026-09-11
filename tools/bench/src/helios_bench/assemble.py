@@ -88,7 +88,6 @@ def build_workload(
             comparisons.append(comparison)
             if (
                 side is Side.LINUX_WASMTIME
-                and workload["class"] == WorkloadClass.COMPUTE
                 and comparison.speedup < 1.0
                 and comparison.significant
                 and comparison.beyond_noise
