@@ -411,14 +411,7 @@ macro_rules! impl_program_bindings {
                 });
                 async move {
                     let (service, context, caller_authority, cpu) = snapshot?;
-                    tracing::debug!(
-                        target: phases::TARGET,
-                        at_ns = monotonic_nanos(&cpu),
-                        op = "spawn",
-                        program = request.path.as_str(),
-                        instance = 0u64,
-                        phase = LaunchPhase::RpcArrival.as_str(),
-                    );
+                    let mut launch = phases::Trace::begin(cpu, "spawn", &request.path);
                     let Some(service) = service else {
                         return Ok(Err($bindings::helios::system::programs::SpawnError {
                             kind: $bindings::helios::system::programs::SpawnErrorKind::Unavailable,
@@ -445,16 +438,8 @@ macro_rules! impl_program_bindings {
                                 ))));
                             }
                         };
-                    tracing::debug!(
-                        target: phases::TARGET,
-                        at_ns = monotonic_nanos(&cpu),
-                        op = "spawn",
-                        program = request.path.as_str(),
-                        instance = 0u64,
-                        phase = LaunchPhase::SourceRead.as_str(),
-                        source_bytes = source.payload_len() as u64,
-                    );
-                    let mut spawned_instance = None;
+                    launch.record(LaunchPhase::SourceRead);
+                    launch.record_source_bytes(source.payload_len());
                     let spawned = match service
                         .spawn(
                             context,
@@ -465,12 +450,13 @@ macro_rules! impl_program_bindings {
                                 request.env,
                                 child_authority,
                                 None,
-                            ),
+                            )
+                            .with_timeline(launch.timeline().for_task()),
                         )
                         .await
                     {
                         Ok(child) => {
-                            spawned_instance = Some(child.instance_id);
+                            launch.set_instance(child.instance_id);
                             let handle = accessor.with(|mut access| {
                                 access
                                     .get()
@@ -482,14 +468,12 @@ macro_rules! impl_program_bindings {
                         }
                         Err(error) => Ok(Err($convert_error(error))),
                     };
-                    tracing::debug!(
-                        target: phases::TARGET,
-                        at_ns = monotonic_nanos(&cpu),
-                        op = "spawn",
-                        program = request.path.as_str(),
-                        instance = spawned_instance.map_or(0u64, InstanceId::raw),
-                        phase = LaunchPhase::Reply.as_str(),
-                    );
+                    launch.record(LaunchPhase::Reply);
+                    // A spawned launch's line is the run task's to
+                    // emit; only a failed spawn leaves this guard armed.
+                    if matches!(spawned, Ok(Ok(_))) {
+                        launch.disarm();
+                    }
                     spawned
                 }
             }
@@ -515,14 +499,7 @@ macro_rules! impl_program_bindings {
                 });
                 async move {
                     let (service, context, caller_authority, cpu) = snapshot?;
-                    tracing::debug!(
-                        target: phases::TARGET,
-                        at_ns = monotonic_nanos(&cpu),
-                        op = "exec",
-                        program = request.path.as_str(),
-                        instance = 0u64,
-                        phase = LaunchPhase::RpcArrival.as_str(),
-                    );
+                    let launch = phases::Trace::begin(cpu, "exec", &request.path);
                     let Some(service) = service else {
                         return Ok(Err($bindings::helios::system::programs::ExecError {
                             kind: $bindings::helios::system::programs::ExecErrorKind::Unavailable,
@@ -549,15 +526,8 @@ macro_rules! impl_program_bindings {
                                 ))));
                             }
                         };
-                    tracing::debug!(
-                        target: phases::TARGET,
-                        at_ns = monotonic_nanos(&cpu),
-                        op = "exec",
-                        program = request.path.as_str(),
-                        instance = 0u64,
-                        phase = LaunchPhase::SourceRead.as_str(),
-                        source_bytes = source.payload_len() as u64,
-                    );
+                    launch.record(LaunchPhase::SourceRead);
+                    launch.record_source_bytes(source.payload_len());
                     let hint = match request.hint {
                         Some($bindings::helios::system::programs::AotHint::Fast) => {
                             Some(AotCompileHint::Fast)
@@ -581,22 +551,19 @@ macro_rules! impl_program_bindings {
                                 request.env,
                                 child_authority,
                                 None,
-                            ),
+                            )
+                            .with_timeline(launch.timeline().clone()),
                         )
                         .await
                         .map($convert_result)
                         .map_err($convert_error);
-                    tracing::debug!(
-                        target: phases::TARGET,
-                        at_ns = monotonic_nanos(&cpu),
-                        op = "exec",
-                        program = request.path.as_str(),
-                        instance = executed
-                            .as_ref()
-                            .map(|result| result.instance_id)
-                            .unwrap_or(0),
-                        phase = LaunchPhase::Reply.as_str(),
-                    );
+                    if let Ok(result) = &executed {
+                        launch.set_instance(InstanceId::from_raw(result.instance_id));
+                    }
+                    launch.record(LaunchPhase::Reply);
+                    // The guard stays armed: it drops here and emits
+                    // the line — `reply` included — for an exec the
+                    // run task does not own emission.
                     Ok(executed)
                 }
             }
