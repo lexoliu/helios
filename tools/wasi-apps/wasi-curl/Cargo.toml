@@ -1,17 +1,15 @@
 [package]
-name = "helios-curl-wasi"
+name = "helios-wasi-curl"
 version = "0.1.0"
 edition = "2024"
 autobins = false
 
 [dependencies]
-helios-api = { path = "../../../api", default-features = false, features = ["http"] }
 helios-curl-write-out = { path = "../curl-write-out" }
 thiserror = "2.0.17"
 
-[lib]
-name = "helios_curl_wasi"
+[[bin]]
+name = "helios_wasi_curl"
 path = "src/main.rs"
-crate-type = ["cdylib"]
 
 [workspace]

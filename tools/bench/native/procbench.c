@@ -36,12 +36,14 @@ struct child {
     int stdout_fd;
 };
 
-/* Spawns argv with fresh pipes on stdin and stdout; stderr is inherited. */
+/* Spawns argv with fresh pipes on stdin and stdout; stderr is inherited.
+ * The ends the parent keeps are O_CLOEXEC, or a later spawn inherits an
+ * earlier child's stdin writer and that child never sees its stdin close. */
 static struct child spawn_child(char **argv) {
     int stdin_pipe[2];
     int stdout_pipe[2];
-    if (pipe(stdin_pipe) != 0 || pipe(stdout_pipe) != 0) {
-        die("pipe");
+    if (pipe2(stdin_pipe, O_CLOEXEC) != 0 || pipe2(stdout_pipe, O_CLOEXEC) != 0) {
+        die("pipe2");
     }
     posix_spawn_file_actions_t actions;
     posix_spawn_file_actions_init(&actions);
