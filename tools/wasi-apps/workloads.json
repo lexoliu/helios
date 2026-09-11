@@ -116,6 +116,9 @@
       "wasm_path": "artifacts/wasi-tools/curl.wasm",
       "remote_path": "/aot-bench-curl-input.wasm",
       "destination_path": "/aot-bench-curl-output.cwasm",
+      "uncompared": {
+        "linux_native": "The in-guest AOT compile is already a compile; `wasmtime compile` on Linux is the native equivalent, so the Linux + Wasmtime column is the comparison."
+      },
       "counterparts": {
         "linux_native": null,
         "linux_wasmtime": {

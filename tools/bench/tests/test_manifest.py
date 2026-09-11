@@ -54,9 +54,11 @@ def test_every_row_names_a_wasmtime_counterpart_or_the_reason_it_lacks_one() -> 
     manifest = load_workloads()
     missing = []
     for workload in manifest["workloads"]:
+        for side in ("linux_native", "linux_wasmtime"):
+            if workload["counterparts"][side] is None:
+                assert side in workload.get("uncompared", {}), (workload["name"], side)
         if workload["counterparts"]["linux_wasmtime"] is None:
             missing.append(workload["name"])
-            assert "linux_wasmtime" in workload.get("uncompared", {}), workload["name"]
     assert missing == ["sched-tasks"]
 
     by_name = {workload["name"]: workload for workload in manifest["workloads"]}
@@ -81,9 +83,7 @@ def test_coreutils_counterparts_run_one_exec_per_helios_exec() -> None:
     for name in ("stdio-pipe", "fs-smallfiles", "fs-readstream"):
         workload = next(w for w in manifest["workloads"] if w["name"] == name)
         helios_execs = len(re.findall(r"\{(?!workdir|repo_root)\w+\}", workload["command"]))
-        wasmtime_execs = len(
-            re.findall(r"\$cu\s+\w+", workload["counterparts"]["linux_wasmtime"]["command"])
-        )
+        wasmtime_execs = len(re.findall(r"\$cu\s+\w+", workload["counterparts"]["linux_wasmtime"]["command"]))
         assert helios_execs == wasmtime_execs, (name, helios_execs, wasmtime_execs)
 
 
