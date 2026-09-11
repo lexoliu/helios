@@ -210,6 +210,69 @@ Per cell (workload × side), `iterations` executions (11 by default):
     otherwise it comments the table and enforces nothing.
   The gate comment on a pull request prints the paired table first.
 
+## Reading a launch's phases
+
+`workload-bench` times a launch end to end; when that number needs a
+breakdown the kernel can say where the launch itself went. Every
+boundary an `exec` or `spawn` crosses is one `DEBUG` event under the
+target `helios_kernel::exec::phases`, and a phase is the gap between two
+consecutive events of one launch — the `at_ns` field is the kernel
+monotonic timestamp in nanoseconds:
+
+| phase | boundary |
+| --- | --- |
+| `rpc-arrival` | the `exec`/`spawn` host call entered the kernel, or the wasix `proc_spawn*`/`proc_exec*` syscall began a launch (`op`, `program`, `instance=0` before one is registered) |
+| `source-read` | the program's bytes are read out of their source (`source_bytes`) |
+| `trust` | artifact trust established — bootfs trailer parse or signature check |
+| `cache-lookup` | the deserialize cache answered (`kind`, `hit`) |
+| `deserialize` | the `cwasm` payload deserialized; absent on a warm cache |
+| `instantiate-pre` | the `InstancePre` cache answered or `instantiate_pre` built (`kind`, `hit`) |
+| `load-begin` / `load-complete` | `load_executable` entered / returned |
+| `task-begin` | the run task is live |
+| `shared-memory` | a core module's shared memory is prepared |
+| `store-prepare` | the store and its filesystem snapshot are prepared |
+| `instantiate` | `instantiate_async` returned — memory slot, data segments, imports resolved |
+| `start` | the run function resolved and guest start is dispatching |
+| `guest-begin` / `guest-end` | guest code running / returned |
+| `store-teardown` | a core module's store is torn down |
+| `completion` | the run task finished |
+| `reply` | the host call's reply — or the wasix launch's result — is being written |
+
+A launch through `helios:system/programs` spells `program` as the
+request's path on the RPC boundaries and as the argv program name
+inside the load and run phases; a launch a guest makes through wasix
+spells it as the argv program name at `rpc-arrival` and as the resolved
+guest path at `source-read`/`reply`. `instance` is `0` until the
+registry assigns one, then the launched program's id.
+
+The target is off by default, so a boot that never asked for it emits
+nothing and the events cost one `enabled` check per boundary. Open it
+for one session with `--enable-target`, either on `vm` (before the
+session action runs) or on `tracing` (before the stream starts):
+
+```bash
+helios-inspector vm --arch x86-64 --release --accel kvm \
+    --boot-program dash --boot-program debugger --boot-program python3 \
+    --no-compiler-plugin \
+    --enable-target helios_kernel::exec::phases \
+    shell -c 'python3 -c "print(1)"; python3 -c "print(2)"'
+```
+
+The events land on the debug serial line, so `<runtime>/debug-serial.log`
+(docs/debug-serial.md) holds them, `instance=<n>` joins the load-phase
+events (`instance=0` — no instance yet) to the run-phase ones, and
+`program` names the launch throughout. The same target streamed live is
+`helios-inspector tracing --enable-target helios_kernel::exec::phases
+--min-level debug --target-prefix helios_kernel::exec::phases`.
+
+Two launches of the same program are the cold/warm pair the launch-cost
+question is usually about: the cold one's `cache-lookup` and
+`instantiate-pre` read `hit=false` and its `deserialize` event exists;
+the warm one's read `hit=true` and it emits none. The `smoke-x86-64`
+step "Run CPython twice and record its launch phases" runs exactly this
+under KVM, so a PR's x86-64 launch-phase split is read from that step's
+`debug-serial.log` artifact rather than reproduced locally.
+
 ## Reports and where the numbers come from
 
 One `report.json` per lane per run (schema in
