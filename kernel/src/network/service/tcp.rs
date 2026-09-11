@@ -231,12 +231,15 @@ where
         })
     }
 
-    /// Bytes `stream`'s send queue takes right now, zero when the
-    /// connection cannot send.
+    /// What `stream`'s send side does with a write right now.
     ///
-    /// The write permit of a socket-backed output stream: a `write` of
-    /// at most this many bytes never has to park.
-    pub fn tcp_send_room(&self, stream: TcpStreamId) -> Result<usize, TcpError> {
+    /// The write permit of a socket-backed output stream: `Room` is the
+    /// byte count a `write` of at most that many never has to park for,
+    /// `Pending` is a full send queue on a live connection, and `Closed`
+    /// is a send side that cannot take bytes again — the answer that
+    /// resolves a parked `ready` instead of letting it sleep through the
+    /// close.
+    pub fn tcp_send_room(&self, stream: TcpStreamId) -> Result<TcpWriteProgress, TcpError> {
         self.inner
             .state
             .with_handle(stream, |state| state.tcp_send_room(stream))
@@ -297,21 +300,25 @@ where
         self.poll_tcp_read_once(stream, max_bytes, TcpReadPhasePrefix::Initial)
     }
 
-    /// Resolves when `stream`'s send queue has room or the stream is
-    /// gone — a socket-backed output stream's readiness wait.
+    /// Resolves when `stream`'s send queue has room, when the send side
+    /// can no longer send, or when the stream is gone — a socket-backed
+    /// output stream's readiness wait.
     ///
-    /// Each round samples the shard's wait before the room probe, so an
-    /// ACK another processor drains between the probe and the park
+    /// `Closed` resolves the wait rather than propagating its error:
+    /// the pollable's contract is that a dead send side is ready, and
+    /// the accessor that follows reports the state itself. Each round
+    /// samples the shard's wait before the room probe, so an ACK — or a
+    /// reset — another processor drains between the probe and the park
     /// resolves the wait rather than being slept through. The drive in
-    /// between is what consumes the ACKs that free the window.
+    /// between is what consumes the segments that change the answer.
     pub async fn tcp_write_ready(&self, stream: TcpStreamId) -> Result<(), TcpError> {
         loop {
             let wait = self.shard_wait_for_handle(stream);
-            if self.tcp_send_room(stream)? != 0 {
+            if !matches!(self.tcp_send_room(stream)?, TcpWriteProgress::Pending) {
                 return Ok(());
             }
             self.drive_tcp().await?;
-            if self.tcp_send_room(stream)? != 0 {
+            if !matches!(self.tcp_send_room(stream)?, TcpWriteProgress::Pending) {
                 return Ok(());
             }
             self.wait_for_tcp_progress(wait, u64::MAX).await;
@@ -683,6 +690,14 @@ where
             self.drive_tcp().await?;
             if written != 0 {
                 continue;
+            }
+            // A write that queued nothing is either a full send queue —
+            // the park below waits out the drain — or a send side that
+            // cannot send again, which queue_send_bytes answers with the
+            // same zero. The probe says which, and a close fails the
+            // write rather than parking on it forever.
+            if let TcpWriteProgress::Closed(error) = self.tcp_send_room(stream)? {
+                return Err(error);
             }
             if self.now_nanos() >= deadline_nanos {
                 return Err(TcpError {
@@ -1632,14 +1647,29 @@ impl NetworkShard {
         }
     }
 
-    /// Bytes `stream`'s send queue takes right now, zero when the
-    /// connection cannot send.
-    pub(super) fn tcp_send_room(&self, stream: TcpStreamId) -> Result<usize, TcpError> {
+    /// What `stream`'s send side does with a write right now.
+    ///
+    /// The stack's tri-state with the close kind already folded into the
+    /// error a writer reports: a reset reads as `ConnectionReset`, the
+    /// orderly close as "no longer writable".
+    pub(super) fn tcp_send_room(&self, stream: TcpStreamId) -> Result<TcpWriteProgress, TcpError> {
         let socket = self.tcp_socket(stream)?;
-        self.stack.tcp_send_room(socket).map_err(|_| TcpError {
-            kind: TcpErrorKind::Unavailable,
-            detail: NetworkErrorDetail::UnknownTcpStream,
-        })
+        self.stack
+            .tcp_send_room(socket)
+            .map(|state| match state {
+                TcpSendState::Pending => TcpWriteProgress::Pending,
+                TcpSendState::Room(room) => TcpWriteProgress::Room(room),
+                TcpSendState::Closed(close) => {
+                    TcpWriteProgress::Closed(tcp_close_error(close).unwrap_or(TcpError {
+                        kind: TcpErrorKind::Unavailable,
+                        detail: NetworkErrorDetail::TcpNoLongerWritable,
+                    }))
+                }
+            })
+            .map_err(|_| TcpError {
+                kind: TcpErrorKind::Unavailable,
+                detail: NetworkErrorDetail::UnknownTcpStream,
+            })
     }
 
     pub(super) fn try_write_tcp_bytes(

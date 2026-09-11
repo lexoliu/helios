@@ -15,8 +15,9 @@ use helios_kernel::{
     FutexKey, FutexTable, GuestAddress, Ipv4Address, Ipv4Cidr, Ipv4Route, MacAddress,
     NetworkAdminBackend, NetworkBridgeRequest, NetworkControlError, NetworkErrorDetail,
     NetworkIpAddress, NetworkPortId, Notify, PingError, PingErrorKind, PingReply,
-    ProcessMemoryIdentity, TcpAccepted, TcpError, TcpErrorKind, TcpListener, Timer, TryRead,
-    TryWrite, UdpBinding, UdpDatagram, UdpError, UdpErrorKind, byte_channel,
+    ProcessMemoryIdentity, TcpAccepted, TcpError, TcpErrorKind, TcpListener, TcpReadProgress,
+    TcpWriteProgress, Timer, TryRead, TryWrite, UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
+    byte_channel,
 };
 use spin::{Mutex, Once};
 
@@ -673,12 +674,12 @@ impl ComponentNetworkService for BenchNetworkService {
         &self,
         _stream: Self::TcpStream,
         _max_bytes: usize,
-    ) -> Result<helios_kernel::TcpReadProgress, TcpError> {
-        Ok(helios_kernel::TcpReadProgress::Data(self.payload.clone()))
+    ) -> Result<TcpReadProgress, TcpError> {
+        Ok(TcpReadProgress::Data(self.payload.clone()))
     }
 
-    fn tcp_send_room(&self, _stream: Self::TcpStream) -> Result<usize, TcpError> {
-        Ok(usize::MAX)
+    fn tcp_send_room(&self, _stream: Self::TcpStream) -> Result<TcpWriteProgress, TcpError> {
+        Ok(TcpWriteProgress::Room(usize::MAX))
     }
 
     fn tcp_try_write(

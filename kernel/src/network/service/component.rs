@@ -443,7 +443,7 @@ where
         NetworkService::tcp_try_read(self, stream, max_bytes)
     }
 
-    fn tcp_send_room(&self, stream: Self::TcpStream) -> Result<usize, TcpError> {
+    fn tcp_send_room(&self, stream: Self::TcpStream) -> Result<crate::TcpWriteProgress, TcpError> {
         NetworkService::tcp_send_room(self, stream)
     }
 

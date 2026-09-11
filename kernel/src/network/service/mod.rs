@@ -37,8 +37,8 @@ use helios_netstack::{
     RxDrain, RxFrame, SegmentationOffload, Stack, StackConfig, StackError, StackEvent,
     StackInstant, TcpCloseKind, TcpConnectState, TcpConnectTerminalError, TcpEndpoint,
     TcpListenBacklog, TcpPacket, TcpReadIntoState, TcpReadState, TcpReceiveDiagnostics,
-    TcpStackCounters, UdpEgress, UdpEndpoint, UdpPacket, UdpPayload, UdpSocketBinding,
-    UdpSocketError, flow_hash,
+    TcpSendState, TcpStackCounters, UdpEgress, UdpEndpoint, UdpPacket, UdpPayload,
+    UdpSocketBinding, UdpSocketError, flow_hash,
 };
 use spin::{Mutex as SpinMutex, RwLock as SpinRwLock};
 
@@ -49,7 +49,7 @@ use crate::{
     NetworkBridgeRequest, NetworkControlError, NetworkErrorDetail, NetworkIpAddress, NetworkPortId,
     PingError, PingErrorKind, PingReply, ProfileSink, ProgressMark, ProgressSignal,
     RegisteredTcpReadBuffer, TcpAccepted, TcpError, TcpErrorKind, TcpListener, TcpReadProgress,
-    Timer, UdpBinding, UdpDatagram, UdpError, UdpErrorKind, UptimeClock,
+    TcpWriteProgress, Timer, UdpBinding, UdpDatagram, UdpError, UdpErrorKind, UptimeClock,
 };
 use triomphe::Arc;
 
@@ -1456,6 +1456,7 @@ pub(crate) mod fixture {
         pub(crate) flags: TcpFlags,
         pub(crate) sequence: u32,
         pub(crate) acknowledgement: u32,
+        pub(crate) payload_len: usize,
     }
 
     pub(crate) struct EstablishedTcpFixture {
@@ -1674,6 +1675,7 @@ pub(crate) mod fixture {
                     flags: tcp.flags,
                     sequence: tcp.sequence,
                     acknowledgement: tcp.acknowledgement,
+                    payload_len: tcp.payload.len(),
                 });
             }
             segments

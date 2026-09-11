@@ -585,6 +585,24 @@ pub enum TcpReadProgress {
     Eof,
 }
 
+/// What a non-parking probe of a TCP stream's send side found — the
+/// send twin of [`TcpReadProgress`].
+///
+/// `Pending` is the one answer that changes without the connection
+/// ending: the send queue is full and the next drain frees it, so the
+/// caller parks on the stream's readiness. `Room` carries the byte
+/// count a `write` may queue right now. `Closed` is a connection that
+/// cannot send again — this side's shutdown, the peer's reset, the
+/// retransmission limit — and carries the error its next write reports,
+/// so a waiter resolves and names the state instead of sleeping through
+/// it.
+#[derive(Debug)]
+pub enum TcpWriteProgress {
+    Pending,
+    Room(usize),
+    Closed(TcpError),
+}
+
 /// What the component host needs of the machine's network service.
 ///
 /// The host is generic over this the way it is generic over
@@ -764,12 +782,14 @@ pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
         max_bytes: usize,
     ) -> Result<TcpReadProgress, TcpError>;
 
-    /// Bytes `stream`'s send queue takes right now — the write permit a
-    /// stream reports: a `write` of at most this many never has to park.
+    /// What `stream`'s send side does with a write right now — the
+    /// permit a stream reports.
     ///
-    /// Zero on a connection that cannot send, so a caller parking on the
-    /// answer does not sleep through a shutdown.
-    fn tcp_send_room(&self, stream: Self::TcpStream) -> Result<usize, TcpError>;
+    /// `Room` is the byte count a `write` may queue without parking,
+    /// `Pending` is a full send queue on a live connection, and `Closed`
+    /// is a connection that cannot send again — so a caller parking on
+    /// the answer does not sleep through a shutdown.
+    fn tcp_send_room(&self, stream: Self::TcpStream) -> Result<TcpWriteProgress, TcpError>;
 
     /// Queues up to `bytes.len()` on `stream`'s send path and publishes
     /// it synchronously: the stack's segment production, the egress drain
@@ -782,12 +802,16 @@ pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
     /// submit — is held for the call and released before it returns.
     fn tcp_try_write(&self, stream: Self::TcpStream, bytes: &mut Bytes) -> Result<usize, TcpError>;
 
-    /// Resolves when `stream`'s send queue has room or the stream is
-    /// gone — a socket-backed output stream's readiness wait.
+    /// Resolves when `stream`'s send queue has room, when the send side
+    /// can no longer send, or when the stream is gone — a socket-backed
+    /// output stream's readiness wait.
     ///
-    /// The implementation samples the owning shard's arrival mark and
-    /// the queue pair's event mark before it probes the send queue, so
-    /// an ACK another processor drains between the probe and the park
+    /// A dead send side resolves the wait rather than failing it: the
+    /// pollable contract is that a closed stream is ready, and the
+    /// accessor that follows reports the state. The implementation
+    /// samples the owning shard's arrival mark and the queue pair's
+    /// event mark before it probes the send queue, so an ACK — or a
+    /// reset — another processor drains between the probe and the park
     /// resolves the wait rather than being slept through.
     fn tcp_write_ready(
         &self,

@@ -934,6 +934,12 @@ where
 {
     socket: TcpSocket,
     service: Net,
+    /// The failure `ready` saw driving the device — one `read`'s own
+    /// non-parking probe can never reproduce, since it does not drive —
+    /// kept so the next accessor reports it instead of returning empty
+    /// forever. The way `wasi-io`'s own stream impls carry a prior
+    /// error.
+    failed: Option<crate::TcpError>,
 }
 
 impl<Net> TcpSocketInputStream<Net>
@@ -941,8 +947,18 @@ where
     Net: ComponentHostNetwork,
 {
     pub fn new(socket: TcpSocket, service: Net) -> Self {
-        Self { socket, service }
+        Self {
+            socket,
+            service,
+            failed: None,
+        }
     }
+}
+
+/// The recorded failure a stream accessor reports as the operation that
+/// failed.
+fn recorded_failure(error: &crate::TcpError) -> StreamError {
+    StreamError::LastOperationFailed(wasmtime::Error::new(error.clone()))
 }
 
 #[wasmtime_wasi_io::async_trait]
@@ -965,11 +981,16 @@ where
         // the receive queue is non-empty or the connection has ended,
         // without consuming a byte. The service samples the shard's
         // arrival mark before it inspects the queue, which is what makes
-        // this a wait rather than a spin.
-        let _ = self
+        // this a wait rather than a spin. A drive-level failure is kept
+        // rather than dropped: `read`'s own probe cannot see it, and a
+        // resolving `ready` whose read answers empty forever is a spin.
+        if let Err(error) = self
             .service
             .tcp_read(NetworkHandle::from_raw(stream), 0, u64::MAX)
-            .await;
+            .await
+        {
+            self.failed = Some(error);
+        }
     }
 }
 
@@ -979,6 +1000,9 @@ where
     Net: ComponentHostNetwork,
 {
     fn read(&mut self, size: usize) -> core::result::Result<Bytes, StreamError> {
+        if let Some(error) = &self.failed {
+            return Err(recorded_failure(error));
+        }
         if self.socket.inner.lock().receive_shutdown {
             return Err(StreamError::Closed);
         }
@@ -1020,8 +1044,14 @@ where
     socket: TcpSocket,
     service: Net,
     /// The unwritten remainder of a `write` the send queue could not
-    /// take, completed by `ready` before the next permit is issued.
+    /// take, completed by `ready` before the next permit is issued. It
+    /// stays parked until that write succeeds — a failed one keeps the
+    /// bytes and records the error, which `check_write` and `flush`
+    /// then report.
     pending: Option<Bytes>,
+    /// The failure a `ready` pass hit, reported by the next accessor —
+    /// see [`TcpSocketInputStream::failed`].
+    failed: Option<crate::TcpError>,
 }
 
 impl<Net> TcpSocketOutputStream<Net>
@@ -1033,6 +1063,7 @@ where
             socket,
             service,
             pending: None,
+            failed: None,
         }
     }
 }
@@ -1043,21 +1074,34 @@ where
     Net: ComponentHostNetwork,
 {
     async fn ready(&mut self) {
+        // The send-side mirror of the input stream's `receive_shutdown`
+        // early-out: a shut-down send side is permanently ready — the
+        // accessor that follows reports `closed`.
+        if self.socket.inner.lock().send_shutdown {
+            return;
+        }
         let Ok(stream) = self.socket.connected_stream() else {
             return;
         };
         let handle = NetworkHandle::from_raw(stream);
-        if let Some(bytes) = self.pending.take() {
+        if let Some(bytes) = self.pending.clone() {
             // The service's write-all carries the batch through whatever
             // window opens — its own loop arms the shard wait before it
-            // re-tries the queue.
-            let _ = self
+            // re-tries the queue, and ends the write rather than parking
+            // on a send side that can no longer send.
+            match self
                 .service
                 .tcp_write_all_bytes(handle, bytes, u64::MAX)
-                .await;
+                .await
+            {
+                Ok(()) => self.pending = None,
+                Err(error) => self.failed = Some(error),
+            }
             return;
         }
-        let _ = self.service.tcp_write_ready(handle).await;
+        if let Err(error) = self.service.tcp_write_ready(handle).await {
+            self.failed = Some(error);
+        }
     }
 }
 
@@ -1067,6 +1111,9 @@ where
     Net: ComponentHostNetwork,
 {
     fn write(&mut self, bytes: Bytes) -> core::result::Result<(), StreamError> {
+        if let Some(error) = &self.failed {
+            return Err(recorded_failure(error));
+        }
         if self.socket.inner.lock().send_shutdown {
             return Err(StreamError::Closed);
         }
@@ -1080,9 +1127,22 @@ where
                 "TCP output stream write exceeded its check-write permit",
             ));
         }
+        let handle = NetworkHandle::from_raw(stream);
+        // Queueing gives a dead send side the same 0 it gives a full
+        // queue — probe first so the dead one answers `closed` rather
+        // than parking bytes that can never leave.
+        match self.service.tcp_send_room(handle) {
+            Ok(crate::TcpWriteProgress::Closed(_)) => return Err(StreamError::Closed),
+            Ok(_) => {}
+            Err(error) => {
+                return Err(StreamError::LastOperationFailed(wasmtime::Error::new(
+                    error,
+                )));
+            }
+        }
         let mut bytes = bytes;
         self.service
-            .tcp_try_write(NetworkHandle::from_raw(stream), &mut bytes)
+            .tcp_try_write(handle, &mut bytes)
             .map_err(|error| StreamError::LastOperationFailed(wasmtime::Error::new(error)))?;
         // What the send queue could not take is parked rather than
         // dropped or errored: `ready` completes it, and `check_write`
@@ -1098,6 +1158,9 @@ where
         // batch is `ready`'s to complete — `check_write` pends on it,
         // which is the contract's "flush completes" point. There is
         // nothing left to push here.
+        if let Some(error) = &self.failed {
+            return Err(recorded_failure(error));
+        }
         if self.socket.inner.lock().send_shutdown {
             return Err(StreamError::Closed);
         }
@@ -1105,6 +1168,9 @@ where
     }
 
     fn check_write(&mut self) -> core::result::Result<usize, StreamError> {
+        if let Some(error) = &self.failed {
+            return Err(recorded_failure(error));
+        }
         if self.socket.inner.lock().send_shutdown {
             return Err(StreamError::Closed);
         }
@@ -1116,9 +1182,14 @@ where
         if self.pending.is_some() {
             return Ok(0);
         }
-        self.service
-            .tcp_send_room(NetworkHandle::from_raw(stream))
-            .map_err(|error| StreamError::LastOperationFailed(wasmtime::Error::new(error)))
+        match self.service.tcp_send_room(NetworkHandle::from_raw(stream)) {
+            Ok(crate::TcpWriteProgress::Room(room)) => Ok(room),
+            Ok(crate::TcpWriteProgress::Pending) => Ok(0),
+            Ok(crate::TcpWriteProgress::Closed(_)) => Err(StreamError::Closed),
+            Err(error) => Err(StreamError::LastOperationFailed(wasmtime::Error::new(
+                error,
+            ))),
+        }
     }
 }
 

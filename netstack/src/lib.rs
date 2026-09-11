@@ -58,8 +58,8 @@ pub use stack::{
     MAX_OUTBOUND_FRAMES, MAX_UDP_RX, MAX_UDP_SOCKETS, NeighborEntry, NeighborState,
     OutboundBatchStatus, Route, RouteTable, RxChecksumOffload, SocketId, Stack, StackConfig,
     StackEvent, StackInstant, TcpAccept, TcpCloseOutcome, TcpConnectState, TcpConnectTerminalError,
-    TcpListenBacklog, TcpReadIntoState, TcpReadState, TcpStackCounters, UdpEgress, UdpEndpoint,
-    UdpPayload, UdpReceive, UdpSocketBinding, UdpSocketError, UdpSocketId,
+    TcpListenBacklog, TcpReadIntoState, TcpReadState, TcpSendState, TcpStackCounters, UdpEgress,
+    UdpEndpoint, UdpPayload, UdpReceive, UdpSocketBinding, UdpSocketError, UdpSocketId,
 };
 pub use tcp::{TCP_RECEIVE_WINDOW_BYTES, TCP_TRANSMIT_BUFFER_BYTES};
 pub use tcp::{

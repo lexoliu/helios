@@ -397,8 +397,8 @@ mod tests {
             Ok(crate::TcpReadProgress::Eof)
         }
 
-        fn tcp_send_room(&self, _: Self::TcpStream) -> Result<usize, TcpError> {
-            Ok(usize::MAX)
+        fn tcp_send_room(&self, _: Self::TcpStream) -> Result<crate::TcpWriteProgress, TcpError> {
+            Ok(crate::TcpWriteProgress::Room(usize::MAX))
         }
 
         fn tcp_try_write(&self, _: Self::TcpStream, bytes: &mut Bytes) -> Result<usize, TcpError> {
