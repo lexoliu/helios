@@ -1240,11 +1240,28 @@ where
             .device
             .wait_for_event_since(wait.queue_idx, wait.device);
         let mut event = core::pin::pin!(event);
+        // TEMP probe #354: which of arrival / device-event / timer
+        // resolved the wait, and how long the wait was armed for.
+        let mut reason = 0u64; // 0 arrival, 1 device event, 2 timer, 3 already-ready
         if core::future::poll_fn(|cx| {
-            Poll::Ready(arrival.as_mut().poll(cx).is_ready() || event.as_mut().poll(cx).is_ready())
+            if arrival.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(true);
+            }
+            if event.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(true);
+            }
+            Poll::Ready(false)
         })
         .await
         {
+            reason = 3;
+            helios_netstack::probe::mark(
+                helios_netstack::probe::now_nanos(),
+                current_processor().id() as u8,
+                helios_netstack::probe::hop::WAIT_DONE,
+                reason | (wait.queue_idx as u64) << 8,
+                duration.as_micros() as u64,
+            );
             return;
         }
 
@@ -1253,17 +1270,27 @@ where
 
         core::future::poll_fn(|cx| {
             if arrival.as_mut().poll(cx).is_ready() {
+                reason = 0;
                 return Poll::Ready(());
             }
             if event.as_mut().poll(cx).is_ready() {
+                reason = 1;
                 return Poll::Ready(());
             }
             if timer.as_mut().poll(cx).is_ready() {
+                reason = 2;
                 return Poll::Ready(());
             }
             Poll::Pending
         })
         .await;
+        helios_netstack::probe::mark(
+            helios_netstack::probe::now_nanos(),
+            current_processor().id() as u8,
+            helios_netstack::probe::hop::WAIT_DONE,
+            reason | (wait.queue_idx as u64) << 8,
+            duration.as_micros() as u64,
+        );
     }
 
     /// The wait for a caller whose only bound is its own deadline.

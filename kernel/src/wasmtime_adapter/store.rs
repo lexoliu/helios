@@ -267,6 +267,14 @@ impl Pollable for ChannelInputStream {
             return;
         }
         if let Some(bytes) = self.reader.read().await {
+            // TEMP probe #354: the guest's input pollable resolved.
+            helios_netstack::probe::mark(
+                helios_netstack::probe::now_nanos(),
+                helios_hal::cpu::current_processor().id() as u8,
+                helios_netstack::probe::hop::GUEST_READY,
+                bytes.len() as u64,
+                0,
+            );
             self.carry = bytes;
         }
     }
@@ -275,17 +283,31 @@ impl Pollable for ChannelInputStream {
 #[wasmtime_wasi_io::async_trait]
 impl InputStream for ChannelInputStream {
     fn read(&mut self, size: usize) -> StreamResult<Bytes> {
+        // TEMP probe #354: a guest read() returned bytes.
+        let probe = |len: usize| {
+            helios_netstack::probe::mark(
+                helios_netstack::probe::now_nanos(),
+                helios_hal::cpu::current_processor().id() as u8,
+                helios_netstack::probe::hop::GUEST_READ,
+                len as u64,
+                0,
+            );
+        };
         if !self.carry.is_empty() {
             let take = self.carry.len().min(size);
-            return Ok(self.carry.split_to(take));
+            let bytes = self.carry.split_to(take);
+            probe(bytes.len());
+            return Ok(bytes);
         }
         match self.reader.try_read() {
             crate::io::TryRead::Ready(mut bytes) => {
                 if bytes.len() > size {
                     let taken = bytes.split_to(size);
                     self.carry = bytes;
+                    probe(taken.len());
                     return Ok(taken);
                 }
+                probe(bytes.len());
                 Ok(bytes)
             }
             crate::io::TryRead::Pending => Ok(Bytes::new()),
@@ -328,6 +350,14 @@ impl ChannelOutputStream {
         };
         // A vanished reader is surfaced by the next `check_write`/`write`
         // as `StreamError::Closed`; there is nothing left to deliver.
+        // TEMP probe #354: a guest write batch is parked for channel room.
+        helios_netstack::probe::mark(
+            helios_netstack::probe::now_nanos(),
+            helios_hal::cpu::current_processor().id() as u8,
+            helios_netstack::probe::hop::GUEST_WRITE_PARK,
+            bytes.len() as u64,
+            0,
+        );
         let _: Result<(), crate::ClosedPeer> = self.writer.write(bytes).await;
     }
 }
@@ -342,6 +372,20 @@ impl Pollable for ChannelOutputStream {
 #[wasmtime_wasi_io::async_trait]
 impl OutputStream for ChannelOutputStream {
     fn write(&mut self, bytes: Bytes) -> StreamResult<()> {
+        // TEMP probe #354: guest write() bytes entered the channel
+        // stream; b is the payload's first eight bytes (the workload's
+        // round-trip tag) when present.
+        helios_netstack::probe::mark(
+            helios_netstack::probe::now_nanos(),
+            helios_hal::cpu::current_processor().id() as u8,
+            helios_netstack::probe::hop::GUEST_WRITE,
+            bytes.len() as u64,
+            bytes
+                .get(..8)
+                .and_then(|tag| tag.try_into().ok())
+                .map(u64::from_le_bytes)
+                .unwrap_or(0),
+        );
         if self.writer.is_reader_closed() {
             return Err(StreamError::Closed);
         }

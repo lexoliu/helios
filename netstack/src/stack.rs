@@ -4313,6 +4313,14 @@ where
         identification: u16,
         now: StackInstant,
     ) -> Result<bool, StackError> {
+        // TEMP probe #354: outbound TCP segment queued to the wire.
+        crate::probe::mark(
+            crate::probe::now_nanos(),
+            crate::probe::CPU_NONE,
+            crate::probe::hop::SEG_OUT,
+            segment.header.sequence as u64,
+            segment.payload.wire_segment_len() as u64 | (segment.header.flags.bits() as u64) << 32,
+        );
         match (local.address, remote.address) {
             (IpAddress::Ipv4(source), IpAddress::Ipv4(destination)) => {
                 self.queue_tcp_ipv4(source, destination, segment, identification, now)
@@ -5087,7 +5095,19 @@ where
                     .expect("TCP endpoint index referenced a missing socket");
                 let previous_state = socket.state();
                 let before = socket.receive_counters();
+                // TEMP probe #354: inbound TCP segment fields, captured
+                // before `on_segment` consumes the packet.
+                let probe_seq = packet.sequence as u64;
+                let probe_len_flags =
+                    payload_bytes.len() as u64 | (packet.flags.bits() as u64) << 32;
                 let outcome = socket.on_segment(packet, payload_bytes, now.nanos());
+                crate::probe::mark(
+                    crate::probe::now_nanos(),
+                    crate::probe::CPU_NONE,
+                    crate::probe::hop::SEG_IN,
+                    probe_seq,
+                    probe_len_flags,
+                );
                 self.tcp_receive_counters
                     .fold(before, socket.receive_counters());
                 (

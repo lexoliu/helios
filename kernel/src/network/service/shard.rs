@@ -828,7 +828,17 @@ impl NetworkShardSet {
     fn raise_shard_progress<CpuImpl: Cpu>(&self, shard_idx: usize, cpu: &CpuImpl) {
         self.arrival(shard_idx).signal();
         let owner = self.owner_processor(shard_idx);
-        if owner != helios_hal::cpu::current_processor() {
+        let foreign = owner != helios_hal::cpu::current_processor();
+        // TEMP probe #354: a shard's waiters were signalled; b is 1
+        // when the owning processor also got a wake.
+        helios_netstack::probe::mark(
+            helios_netstack::probe::now_nanos(),
+            helios_hal::cpu::current_processor().id() as u8,
+            helios_netstack::probe::hop::SHARD_SIG,
+            shard_idx as u64,
+            foreign as u64,
+        );
+        if foreign {
             cpu.wake_processor(owner);
         }
     }
@@ -894,7 +904,17 @@ impl NetworkShardSet {
         let shard_idx = shard_idx_for_frame(frame, self.shard_count());
         let mut shard = self.shards[shard_idx].inner.lock();
         let dispatch = match shard.stack.receive_rx_frame(frame.clone(), received_at) {
-            Ok(_) => RxFrameDispatch::Delivered { shard_idx },
+            Ok(_) => {
+                // TEMP probe #354: a frame was placed into this shard.
+                helios_netstack::probe::mark(
+                    helios_netstack::probe::now_nanos(),
+                    helios_hal::cpu::current_processor().id() as u8,
+                    helios_netstack::probe::hop::SHARD_RX,
+                    shard_idx as u64,
+                    frame.len() as u64,
+                );
+                RxFrameDispatch::Delivered { shard_idx }
+            }
             Err(StackError::ReceiveBackpressure) => RxFrameDispatch::Backpressured { shard_idx },
             Err(error) => {
                 tracing::debug!(?error, "dropped malformed network frame");

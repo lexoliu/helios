@@ -572,6 +572,20 @@ where
     ) -> Result<(), TcpError> {
         let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
         while !bytes.is_empty() {
+            // TEMP probe #354: the write call enters the socket layer;
+            // b carries the payload's first eight bytes (the workload's
+            // round-trip tag) when present.
+            helios_netstack::probe::mark(
+                helios_netstack::probe::now_nanos(),
+                helios_hal::cpu::current_processor().id() as u8,
+                helios_netstack::probe::hop::SOCK_WRITE,
+                bytes.len() as u64,
+                bytes
+                    .get(..8)
+                    .and_then(|tag| tag.try_into().ok())
+                    .map(u64::from_le_bytes)
+                    .unwrap_or(0),
+            );
             // A blocked write is unblocked by the peer's window opening,
             // which arrives as an ACK on this stream's shard.
             let wait = self.shard_wait_for_handle(stream);
@@ -599,6 +613,13 @@ where
             // reclaims the peer's ACKs, and the wait it parks on was
             // sampled before this poll, so a drain that made room here
             // releases the park at once instead of being slept through.
+            helios_netstack::probe::mark(
+                helios_netstack::probe::now_nanos(),
+                helios_hal::cpu::current_processor().id() as u8,
+                helios_netstack::probe::hop::SOCK_QUEUED,
+                written as u64,
+                0,
+            );
             self.drive_tcp().await?;
             if written != 0 {
                 continue;
@@ -609,6 +630,13 @@ where
                     detail: NetworkErrorDetail::TcpWriteTimeout,
                 });
             }
+            helios_netstack::probe::mark(
+                helios_netstack::probe::now_nanos(),
+                helios_hal::cpu::current_processor().id() as u8,
+                helios_netstack::probe::hop::WRITE_PARK,
+                0,
+                0,
+            );
             self.wait_for_tcp_progress(wait, deadline_nanos).await;
         }
         Ok(())
@@ -654,6 +682,14 @@ where
                 });
             }
             let wait_started = self.profile_start();
+            // TEMP probe #354: the read parked on shard progress.
+            helios_netstack::probe::mark(
+                helios_netstack::probe::now_nanos(),
+                helios_hal::cpu::current_processor().id() as u8,
+                helios_netstack::probe::hop::READ_PARK,
+                0,
+                0,
+            );
             self.wait_for_tcp_progress(wait, deadline_nanos).await;
             self.record_network_profile("tcp-read-wait", wait_started);
         }
@@ -801,6 +837,14 @@ where
                 return Ok(TcpReadProgress::Pending);
             }
             let yield_started = self.profile_start();
+            // TEMP probe #354: the receive path yielded the executor.
+            helios_netstack::probe::mark(
+                helios_netstack::probe::now_nanos(),
+                helios_hal::cpu::current_processor().id() as u8,
+                helios_netstack::probe::hop::READ_YIELD,
+                0,
+                0,
+            );
             crate::yield_now().await;
             self.record_network_profile("tcp-read-polling-yield", yield_started);
 
@@ -1280,6 +1324,15 @@ where
             transmitted_frames: transmitted,
         };
         self.inner.poll.complete(progress);
+        // TEMP probe #354: one interface drive, its harvest packed
+        // rx | tx<<20 | reclaimed<<40.
+        helios_netstack::probe::mark(
+            helios_netstack::probe::now_nanos(),
+            helios_hal::cpu::current_processor().id() as u8,
+            helios_netstack::probe::hop::NET_POLL,
+            source as u64,
+            received as u64 | (transmitted as u64) << 20 | (reclaimed as u64) << 40,
+        );
         Ok(NetworkPollOutcome {
             progress,
             budget,
@@ -1589,7 +1642,17 @@ impl NetworkShard {
                 detail: NetworkErrorDetail::TcpReceiveFailed,
             })? {
             TcpReadState::Pending => Ok(TcpReadProgress::Pending),
-            TcpReadState::Data(bytes) => Ok(TcpReadProgress::Data(bytes)),
+            TcpReadState::Data(bytes) => {
+                // TEMP probe #354: socket-level read delivered bytes.
+                helios_netstack::probe::mark(
+                    helios_netstack::probe::now_nanos(),
+                    helios_hal::cpu::current_processor().id() as u8,
+                    helios_netstack::probe::hop::READ_DATA,
+                    bytes.len() as u64,
+                    0,
+                );
+                Ok(TcpReadProgress::Data(bytes))
+            }
             TcpReadState::Closed(close) => match tcp_close_error(close) {
                 Some(error) => Err(error),
                 None => Ok(TcpReadProgress::Eof),

@@ -3094,6 +3094,15 @@ where
             // close ends the bridge with the store it belongs to; a
             // cancelled read leaves its bytes in the socket, which is
             // about to be retired anyway.
+            // TEMP probe #354: the read bridge issued a socket read
+            // (what follows is either data or a park).
+            helios_netstack::probe::mark(
+                helios_netstack::probe::now_nanos(),
+                helios_hal::cpu::current_processor().id() as u8,
+                helios_netstack::probe::hop::BRIDGE_READ_WAIT,
+                0,
+                0,
+            );
             let Some(read) = p2_tcp_bridge_read(
                 &read_socket,
                 &read_service,
@@ -3106,6 +3115,14 @@ where
             };
             match read {
                 Ok(Some(bytes)) => {
+                    // TEMP probe #354: socket bytes reached the bridge.
+                    helios_netstack::probe::mark(
+                        helios_netstack::probe::now_nanos(),
+                        helios_hal::cpu::current_processor().id() as u8,
+                        helios_netstack::probe::hop::BRIDGE_DATA,
+                        bytes.len() as u64,
+                        0,
+                    );
                     let byte_len = p2_usize_to_u64(bytes.len(), "preview2 tcp bridge byte count");
                     p2_record_kernel_profile_events_bytes(
                         &read_runtime_state,
@@ -3119,6 +3136,7 @@ where
                     // Awaiting here is the guest's backpressure: the
                     // bridge stops pulling from the socket while the
                     // guest-side channel is full.
+                    let probe_len = bytes.len() as u64;
                     if network_writer.write(bytes).await.is_err() {
                         p2_record_kernel_profile_events_bytes(
                             &read_runtime_state,
@@ -3137,6 +3155,15 @@ where
                         enqueue_started,
                         1,
                         byte_len,
+                    );
+                    // TEMP probe #354: bytes are now visible to the
+                    // guest's pollable.
+                    helios_netstack::probe::mark(
+                        helios_netstack::probe::now_nanos(),
+                        helios_hal::cpu::current_processor().id() as u8,
+                        helios_netstack::probe::hop::BRIDGE_CHAN,
+                        probe_len,
+                        0,
                     );
                 }
                 Ok(None) => {
@@ -3175,6 +3202,20 @@ where
     let write_runtime_state = store.runtime_state.clone();
     store.spawner().try_spawn_detached(async move {
         while let Some(bytes) = network_reader.read().await {
+            // TEMP probe #354: the write bridge task resumed with guest
+            // bytes; b is the payload's first eight bytes (the
+            // workload's round-trip tag) when present.
+            helios_netstack::probe::mark(
+                helios_netstack::probe::now_nanos(),
+                helios_hal::cpu::current_processor().id() as u8,
+                helios_netstack::probe::hop::BRIDGE_WRITE_WAKE,
+                bytes.len() as u64,
+                bytes
+                    .get(..8)
+                    .and_then(|tag| tag.try_into().ok())
+                    .map(u64::from_le_bytes)
+                    .unwrap_or(0),
+            );
             let started = write_cpu.now().ticks();
             if let Err(error) = socket.write_all_bytes(&write_service, bytes).await {
                 p2_record_kernel_profile(

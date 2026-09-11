@@ -201,6 +201,15 @@ where
                     NetworkPumpAction::Continue => {}
                     NetworkPumpAction::Yield => crate::yield_now().await,
                     NetworkPumpAction::Wait => {
+                        // TEMP probe #354: the pump parked (its
+                        // wait_done follows this mark).
+                        helios_netstack::probe::mark(
+                            helios_netstack::probe::now_nanos(),
+                            current_processor().id() as u8,
+                            helios_netstack::probe::hop::PUMP_POLL,
+                            1,
+                            0,
+                        );
                         self.wait_for_shard_progress(wait, self.pump_wait()).await;
                     }
                 },

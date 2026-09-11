@@ -312,6 +312,14 @@ pub fn wake_queue_owners<CpuImpl: Cpu>(cpu: &CpuImpl, queues: impl Iterator<Item
             u16::try_from(queue)
                 .unwrap_or_else(|_| panic!("queue {queue} exceeds the processor id range")),
         );
+        // TEMP probe #354: queue-owner wake decided (b=1 foreign IPI).
+        helios_netstack::probe::mark(
+            helios_netstack::probe::now_nanos(),
+            current.id() as u8,
+            helios_netstack::probe::hop::IRQ_WAKE,
+            owner.id() as u64,
+            (owner != current) as u64,
+        );
         if owner != current {
             cpu.wake_processor(owner);
         }

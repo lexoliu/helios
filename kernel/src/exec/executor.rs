@@ -832,6 +832,15 @@ impl Executor {
                 return stats;
             };
 
+            // TEMP probe #354: one executor poll of a runnable;
+            // a=0 local queue, a=1 global queue.
+            helios_netstack::probe::mark(
+                helios_netstack::probe::now_nanos(),
+                current_processor().id() as u8,
+                helios_netstack::probe::hop::TASK_RUN,
+                matches!(source, ReadySource::Global) as u64,
+                0,
+            );
             runnable.run();
             match source {
                 ReadySource::Local => stats.local_runnable_count += 1,

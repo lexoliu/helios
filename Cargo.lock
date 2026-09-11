@@ -1649,6 +1649,7 @@ dependencies = [
  "fdt",
  "helios-hal",
  "helios-kernel",
+ "helios-netstack",
  "helios-virtio",
  "limine 0.6.5",
  "spin 0.12.3",

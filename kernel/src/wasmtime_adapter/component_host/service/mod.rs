@@ -1131,6 +1131,8 @@ where
                 output_mode,
             )
             .await;
+            // TEMP probe #354: flush the hop ring when a program exits.
+            helios_netstack::probe::dump();
             let _ = exit_tx.send(result);
         });
         if let Err(error) = launched {

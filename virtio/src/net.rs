@@ -1527,7 +1527,22 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
     /// one. A pair another processor currently holds is left out: that
     /// processor is draining it and needs no wake.
     pub fn handle_interrupt(&self) -> QueuePairProgress {
+        // TEMP probe #354: net device interrupt entered.
+        helios_netstack::probe::mark(
+            helios_netstack::probe::now_nanos(),
+            helios_hal::cpu::current_processor().id() as u8,
+            helios_netstack::probe::hop::NET_IRQ,
+            0,
+            0,
+        );
         let status = self.transport.ack_interrupt();
+        helios_netstack::probe::mark(
+            helios_netstack::probe::now_nanos(),
+            helios_hal::cpu::current_processor().id() as u8,
+            helios_netstack::probe::hop::IRQ_ACK,
+            status.used_buffer as u64 | (status.config_change as u64) << 1,
+            0,
+        );
         if status.config_change {
             self.refresh_link_state();
         }
@@ -1536,13 +1551,36 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             if !pair.has_pending_completions() {
                 continue;
             }
+            helios_netstack::probe::mark(
+                helios_netstack::probe::now_nanos(),
+                helios_hal::cpu::current_processor().id() as u8,
+                helios_netstack::probe::hop::IRQ_PAIR,
+                pair_idx as u64,
+                0,
+            );
             progress.record(pair_idx);
             pair.raise_interrupt();
+        }
+        if progress.is_empty() {
+            helios_netstack::probe::mark(
+                helios_netstack::probe::now_nanos(),
+                helios_hal::cpu::current_processor().id() as u8,
+                helios_netstack::probe::hop::SPURIOUS_IRQ,
+                0,
+                0,
+            );
         }
         // A configuration change belongs to no pair, and neither does a
         // control-queue completion, so the device-wide notification
         // still exists for the waiters that watch those.
         self.interrupts.notify_all();
+        helios_netstack::probe::mark(
+            helios_netstack::probe::now_nanos(),
+            helios_hal::cpu::current_processor().id() as u8,
+            helios_netstack::probe::hop::NET_IRQ_DONE,
+            progress.is_empty() as u64,
+            0,
+        );
         progress
     }
 
@@ -1788,6 +1826,14 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         let Some((token, used_len)) = state.rx_queue.pop_used_with_len() else {
             return Ok(None);
         };
+        // TEMP probe #354: a completed RX descriptor left the ring.
+        helios_netstack::probe::mark(
+            helios_netstack::probe::now_nanos(),
+            helios_hal::cpu::current_processor().id() as u8,
+            helios_netstack::probe::hop::RX_POP,
+            pair_idx as u64,
+            used_len as u64,
+        );
         let (slot_index, position) = Self::complete_rx_slot(state, token);
         let used_len = used_len as usize;
         if used_len < self.header_len || used_len > self.rx_buffer_len {
@@ -2043,7 +2089,18 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         let Some(mut state) = self.queue_pairs[pair_idx].tx_state.try_lock() else {
             return Ok(None);
         };
-        Ok(Some(Self::drain_tx_completions(&mut state, budget)))
+        let drained = Self::drain_tx_completions(&mut state, budget);
+        // TEMP probe #354: TX used entries reclaimed.
+        if drained != 0 {
+            helios_netstack::probe::mark(
+                helios_netstack::probe::now_nanos(),
+                helios_hal::cpu::current_processor().id() as u8,
+                helios_netstack::probe::hop::TX_POLL,
+                drained as u64,
+                pair_idx as u64,
+            );
+        }
+        Ok(Some(drained))
     }
 
     /// Immediate zero-copy TX: headers are copied into the descriptor
@@ -2057,8 +2114,25 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         pair_idx: usize,
         frames: &[helios_netstack::TxFrameRef<'_>],
     ) -> IoResult<Option<usize>> {
+        // TEMP probe #354: TX submission entered on this pair.
+        helios_netstack::probe::mark(
+            helios_netstack::probe::now_nanos(),
+            helios_hal::cpu::current_processor().id() as u8,
+            helios_netstack::probe::hop::VTX_SUBMIT,
+            frames.len() as u64,
+            pair_idx as u64,
+        );
         let pair_idx = self.normalize_pair_idx(pair_idx);
         let Some(mut state) = self.queue_pairs[pair_idx].tx_state.try_lock() else {
+            // TEMP probe #354: the pair's tx_state is held by another
+            // processor — the frames are deferred to its drain.
+            helios_netstack::probe::mark(
+                helios_netstack::probe::now_nanos(),
+                helios_hal::cpu::current_processor().id() as u8,
+                helios_netstack::probe::hop::TX_DEFER,
+                pair_idx as u64,
+                0,
+            );
             return Ok(None);
         };
         // Only when the ring has run dry: a sweep of the used ring costs
@@ -2123,7 +2197,29 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         }
         if submitted != 0 {
             tx_queue.publish();
+            // TEMP probe #354: whether the doorbell will actually be
+            // written is decided inside `notify` by event_idx; record
+            // the verdict so a suppressed kick is distinguishable.
+            let wants_notify = tx_queue.wants_notify();
             tx_queue.notify(&self.transport);
+            // TEMP probe #354: the MMIO kick (a VM exit) has returned;
+            // b bit 8 says the doorbell was suppressed.
+            helios_netstack::probe::mark(
+                helios_netstack::probe::now_nanos(),
+                helios_hal::cpu::current_processor().id() as u8,
+                helios_netstack::probe::hop::VTX_KICK,
+                submitted as u64,
+                pair_idx as u64 | (wants_notify as u64) << 8,
+            );
+        } else {
+            // TEMP probe #354: entered with frames but none fit.
+            helios_netstack::probe::mark(
+                helios_netstack::probe::now_nanos(),
+                helios_hal::cpu::current_processor().id() as u8,
+                helios_netstack::probe::hop::TX_DEFER,
+                pair_idx as u64,
+                1,
+            );
         }
         Ok(Some(submitted))
     }
@@ -2202,6 +2298,14 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         // fresh buffers, so an unkicked repost leaves the receive path
         // stalled until the peer retransmits.
         state.rx_queue.notify(&self.transport);
+        // TEMP probe #354: RX repost kick (a VM exit) returned.
+        helios_netstack::probe::mark(
+            helios_netstack::probe::now_nanos(),
+            helios_hal::cpu::current_processor().id() as u8,
+            helios_netstack::probe::hop::RX_REPOST,
+            pair_idx as u64,
+            0,
+        );
         Ok(())
     }
 

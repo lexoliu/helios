@@ -560,6 +560,8 @@ extern "C" fn aarch64_kernel_main() -> ! {
     vmm::install_user_address_space(physical_memory_offset);
     let platform_state = Aarch64PlatformState::from_limine_mp(timer_frequency());
     activate_processor_runtime(platform_state.bootstrap_runtime());
+    // TEMP probe #354: install the mach clock every probe mark stamps.
+    helios_netstack::probe::set_clock(mach_now_nanos);
 
     let cpu = Aarch64Cpu {
         state: platform_state,
@@ -873,9 +875,32 @@ impl Cpu for Aarch64Cpu {
         // becomes a spin that burns a whole host core per processor.
         mask_irq();
         if !runtime.wake_pending.swap(false, Ordering::AcqRel) {
+            // TEMP probe #354: cpu parking in wfi.
+            helios_netstack::probe::mark(
+                mach_now_nanos(),
+                runtime.logical_id().id() as u8,
+                helios_netstack::probe::hop::PARK,
+                0,
+                0,
+            );
             unsafe {
                 asm!("wfi", options(nomem, nostack, preserves_flags));
             }
+            helios_netstack::probe::mark(
+                mach_now_nanos(),
+                runtime.logical_id().id() as u8,
+                helios_netstack::probe::hop::UNPARK,
+                0,
+                0,
+            );
+        } else {
+            helios_netstack::probe::mark(
+                mach_now_nanos(),
+                runtime.logical_id().id() as u8,
+                helios_netstack::probe::hop::UNPARK,
+                0,
+                1,
+            );
         }
         // SAFETY: restores exactly the mask state the caller had.
         unsafe { write_daif(daif) };
@@ -892,6 +917,14 @@ impl Cpu for Aarch64Cpu {
         // `wfi` either sees this store or takes the pending SGI.
         slot.runtime.wake_pending.store(true, Ordering::Release);
         gic::send_wake(slot.mp_info.mpidr);
+        // TEMP probe #354: cross-processor wake SGI sent.
+        helios_netstack::probe::mark(
+            mach_now_nanos(),
+            current_processor_runtime().logical_id().id() as u8,
+            helios_netstack::probe::hop::WAKE_CPU,
+            processor.id() as u64,
+            0,
+        );
     }
 
     fn now(&self) -> Instant {
@@ -1385,6 +1418,14 @@ extern "C" fn swap_fault_trampoline(frame: *mut SyncTrapFrame, faulting_address:
 extern "C" fn aarch64_handle_irq() {
     let runtime = current_processor_runtime();
     while let Some(intid) = gic::acknowledge_interrupt() {
+        // TEMP probe #354: every acknowledged interrupt, one record per intid.
+        helios_netstack::probe::mark(
+            mach_now_nanos(),
+            runtime.logical_id().id() as u8,
+            helios_netstack::probe::hop::IRQ_ENTER,
+            u32::from(intid) as u64,
+            0,
+        );
         if intid == gic::WAKE_SGI {
             // The wake carries no payload: returning from `wfi` is the
             // whole message, and `park_current` owns the flag.
@@ -1626,6 +1667,12 @@ fn timer_frequency() -> u64 {
     }
     assert!(value != 0, "AArch64 CNTFRQ_EL0 reported zero");
     value
+}
+
+/// TEMP probe #354: the mach clock `helios_netstack::probe` stamps
+/// with — `cntvct_el0` scaled by `cntfrq_el0`.
+fn mach_now_nanos() -> u64 {
+    helios_hal::cpu::ticks_to_nanos(read_counter(), timer_frequency())
 }
 
 fn cache_line_bytes() -> usize {

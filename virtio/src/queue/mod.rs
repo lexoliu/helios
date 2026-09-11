@@ -781,6 +781,12 @@ impl<T: VirtioTransport> VirtQueue<T> {
         drained
     }
 
+    /// TEMP probe #354: the verdict `notify` would take — exposed so
+    /// the kick probe can tell a written doorbell from a suppressed one.
+    pub(crate) fn wants_notify(&self) -> bool {
+        self.ring.should_notify()
+    }
+
     /// Kicks the device if it has not suppressed notifications.
     pub fn notify(&mut self, transport: &T) {
         if self.ring.should_notify() {

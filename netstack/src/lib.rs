@@ -9,6 +9,7 @@ mod dns;
 mod hash;
 mod ndp;
 mod packet;
+pub mod probe;
 mod stack;
 mod tcp;
 mod types;
