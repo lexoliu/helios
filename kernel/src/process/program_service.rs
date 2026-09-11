@@ -60,12 +60,21 @@ impl ProgramExecErrorKind {
     }
 
     /// The index this kind's name is stored under in a
-    /// [`crate::exec::phases::LaunchTimeline`].
+    /// [`crate::exec::phases::LaunchTimeline`] — its literal position in
+    /// [`Self::ALL`], pinned by the round-trip test beside it.
     pub(crate) fn index(self) -> usize {
-        Self::ALL
-            .iter()
-            .position(|entry| *entry == self)
-            .expect("every kind is listed")
+        match self {
+            Self::InvalidBinary => 0,
+            Self::MissingEntry => 1,
+            Self::UnsupportedImport => 2,
+            Self::InvalidSignature => 3,
+            Self::InvalidPath => 4,
+            Self::PermissionDenied => 5,
+            Self::InvalidHint => 6,
+            Self::OutOfMemory => 7,
+            Self::Unavailable => 8,
+            Self::Internal => 9,
+        }
     }
 }
 
@@ -340,5 +349,21 @@ mod tests {
             ProgramExecErrorDetail::ImportedSharedMemoryBudgetExceeded.as_str(),
             "imported shared memory exceeds the user-memory budget"
         );
+    }
+
+    /// `index()` is a literal the compiler forces listed for every
+    /// variant; the round trip pins that the literal is the kind's
+    /// actual position in `ALL`, so `ALL`'s order is load-bearing and
+    /// a reorder fails here, not in a diagnostic field's silence.
+    #[test]
+    fn every_kind_index_round_trips_through_all() {
+        for (i, kind) in ProgramExecErrorKind::ALL.iter().enumerate() {
+            assert_eq!(kind.index(), i, "{kind:?}'s index is not its position");
+            assert_eq!(
+                ProgramExecErrorKind::ALL[kind.index()],
+                *kind,
+                "{kind:?} is not stored at its index"
+            );
+        }
     }
 }

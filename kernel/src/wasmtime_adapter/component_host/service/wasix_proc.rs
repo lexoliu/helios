@@ -2134,7 +2134,8 @@ where
     .await
     {
         Ok(result) => result,
-        Err(errno) => return launch_exit_errno(&trace, errno),
+        // The child marked the launch's terminal on the error it returned.
+        Err(errno) => return errno,
     };
     wasix_write_process_handles(caller, memory, ret_handles, result)
 }
@@ -2432,7 +2433,8 @@ where
     .await
     {
         Ok(result) => result,
-        Err(errno) => return launch_exit_errno(&trace, errno),
+        // The child marked the launch's terminal on the error it returned.
+        Err(errno) => return errno,
     };
     p1_write_u32(caller, memory, ret_pid, result.pid)
 }
@@ -3402,6 +3404,11 @@ pub(super) fn wasix_search_path_candidate(
     crate::resolve_child_path(&directory, name).ok()
 }
 
+/// Spawns `prepared` as a child of the calling instance. Every error
+/// it returns already carries the launch's terminal mark — typed
+/// `error_kind`/`errno` where the error was a `ProgramExecError`,
+/// classified `end`+`errno` otherwise — so its callers return the
+/// errno untouched rather than reclassifying from the bare `i32`.
 pub(super) async fn wasix_spawn_child<CpuImpl, Net, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     prepared: WasixPreparedProgram,
