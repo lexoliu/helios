@@ -21,6 +21,10 @@ type Result<T> = core::result::Result<T, CurlError>;
 const NULL_DEVICE_PATH: &str = "/dev/null";
 const USER_AGENT: &str = "helios-wasi-curl/0.1";
 
+/// Bytes taken from the response body per read; the Helios curl moves
+/// its body through the same 64 KiB buffer.
+const BODY_CHUNK_BYTES: usize = 64 * 1024;
+
 #[derive(Debug, Error)]
 enum CurlError {
     #[error("usage: wasi-curl <http-url>")]
@@ -73,6 +77,8 @@ enum OutputTarget {
     Stdout,
     Discard,
     File(File),
+    #[cfg(test)]
+    Memory(Vec<u8>),
 }
 
 impl OutputTarget {
@@ -96,6 +102,11 @@ impl OutputTarget {
             }
             Self::Discard => Ok(()),
             Self::File(file) => file.write_all(bytes).map_err(CurlError::WriteResponseBody),
+            #[cfg(test)]
+            Self::Memory(memory) => {
+                memory.extend_from_slice(bytes);
+                Ok(())
+            }
         }
     }
 }
@@ -171,16 +182,130 @@ fn parse_options() -> Result<CurlOptions> {
     })
 }
 
-fn write_out(template: &str, size_download: usize) -> Result<()> {
-    let rendered = template.replace("%{size_download}", &size_download.to_string());
-    if rendered.contains("%{") {
-        return Err(CurlError::UnsupportedWriteOut(template.to_owned()));
+/// `--write-out` interpolation, the curl subset this tool's callers use:
+/// `%{size_download}` for the received body length, `%%` for a literal
+/// percent sign, and the `\\n`, `\\r`, `\\t` and `\\\\` escapes curl
+/// expands. An unknown `%{…}` variable is an error; an unknown `\\x`
+/// escape passes both characters through.
+fn expand_write_out(template: &str, size_download: usize) -> Result<String> {
+    const SIZE_DOWNLOAD: &str = "%{size_download}";
+    let mut rendered = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(ch) = rest.chars().next() {
+        if let Some(tail) = rest.strip_prefix(SIZE_DOWNLOAD) {
+            rendered.push_str(&size_download.to_string());
+            rest = tail;
+            continue;
+        }
+        if let Some(tail) = rest.strip_prefix("%%") {
+            rendered.push('%');
+            rest = tail;
+            continue;
+        }
+        if rest.starts_with("%{") {
+            return Err(CurlError::UnsupportedWriteOut(template.to_owned()));
+        }
+        if ch != '\\' {
+            rendered.push(ch);
+            rest = &rest[ch.len_utf8()..];
+            continue;
+        }
+        rest = &rest[1..];
+        let Some(escape) = rest.chars().next() else {
+            rendered.push('\\');
+            break;
+        };
+        rest = &rest[escape.len_utf8()..];
+        match escape {
+            'n' => rendered.push('\n'),
+            'r' => rendered.push('\r'),
+            't' => rendered.push('\t'),
+            '\\' => rendered.push('\\'),
+            other => {
+                rendered.push('\\');
+                rendered.push(other);
+            }
+        }
     }
+    Ok(rendered)
+}
+
+fn write_out(template: &str, size_download: usize) -> Result<()> {
+    let rendered = expand_write_out(template, size_download)?;
     let mut stdout = io::stdout();
     stdout
         .write_all(rendered.as_bytes())
         .map_err(CurlError::WriteResponseBody)?;
     stdout.flush().map_err(CurlError::WriteResponseBody)
+}
+
+fn header_boundary(buffer: &[u8]) -> Option<usize> {
+    buffer.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+fn check_headers(head: &str, url: &str) -> Result<()> {
+    let status: u16 = head
+        .split_whitespace()
+        .nth(1)
+        .ok_or(CurlError::MalformedResponse {
+            reason: "no status code",
+        })?
+        .parse()
+        .map_err(|_| CurlError::MalformedResponse {
+            reason: "unparsable status code",
+        })?;
+    if status != 200 {
+        return Err(CurlError::HttpStatus {
+            status,
+            url: url.to_owned(),
+        });
+    }
+    if head
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
+        return Err(CurlError::MalformedResponse {
+            reason: "chunked transfer encoding",
+        });
+    }
+    Ok(())
+}
+
+/// Streams one response: headers up to the first CRLF pair boundary are
+/// checked, and every body byte after it goes to the sink as it arrives —
+/// the Helios curl writes body chunks through the same 64 KiB buffer
+/// rather than accumulating the payload.
+fn fetch(stream: &mut TcpStream, output: &mut OutputTarget, url: &str) -> Result<usize> {
+    let mut buffer = vec![0u8; BODY_CHUNK_BYTES];
+    let mut pending = Vec::new();
+    let boundary = loop {
+        let read = stream
+            .read(&mut buffer)
+            .map_err(|source| CurlError::Request { source })?;
+        if read == 0 {
+            return Err(CurlError::MalformedResponse {
+                reason: "connection closed before the header boundary",
+            });
+        }
+        pending.extend_from_slice(&buffer[..read]);
+        if let Some(boundary) = header_boundary(&pending) {
+            break boundary;
+        }
+    };
+    check_headers(&String::from_utf8_lossy(&pending[..boundary]), url)?;
+    let mut size_download = pending.len() - boundary - 4;
+    output.write_body(&pending[boundary + 4..])?;
+    loop {
+        let read = stream
+            .read(&mut buffer)
+            .map_err(|source| CurlError::Request { source })?;
+        if read == 0 {
+            break;
+        }
+        output.write_body(&buffer[..read])?;
+        size_download += read;
+    }
+    Ok(size_download)
 }
 
 fn run() -> Result<()> {
@@ -196,49 +321,7 @@ fn run() -> Result<()> {
         url.path, url.authority, USER_AGENT
     )
     .map_err(|source| CurlError::Request { source })?;
-
-    // The host server answers with Content-Length and then closes, so the
-    // response ends at EOF; headers and body are split at the first CRLF
-    // pair boundary.
-    let mut response = Vec::new();
-    stream
-        .read_to_end(&mut response)
-        .map_err(|source| CurlError::Request { source })?;
-    let split = response
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .ok_or(CurlError::MalformedResponse {
-            reason: "no header boundary",
-        })?;
-    let head = String::from_utf8_lossy(&response[..split]);
-    let status: u16 = head
-        .split_whitespace()
-        .nth(1)
-        .ok_or(CurlError::MalformedResponse {
-            reason: "no status code",
-        })?
-        .parse()
-        .map_err(|_| CurlError::MalformedResponse {
-            reason: "unparsable status code",
-        })?;
-    if status != 200 {
-        return Err(CurlError::HttpStatus {
-            status,
-            url: options.url.clone(),
-        });
-    }
-    if head
-        .to_ascii_lowercase()
-        .contains("transfer-encoding: chunked")
-    {
-        return Err(CurlError::MalformedResponse {
-            reason: "chunked transfer encoding",
-        });
-    }
-
-    let body = &response[split + 4..];
-    let size_download = body.len();
-    options.output.write_body(body)?;
+    let size_download = fetch(&mut stream, &mut options.output, &options.url)?;
     if let Some(template) = options.write_out.as_deref() {
         write_out(template, size_download)?;
     }
@@ -247,4 +330,61 @@ fn run() -> Result<()> {
 
 fn main() -> Result<()> {
     run()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::TcpListener;
+    use std::thread;
+
+    use super::*;
+
+    #[test]
+    fn write_out_interprets_curl_escapes() {
+        assert_eq!(
+            expand_write_out("curl-http-throughput:%{size_download}\\n", 67108864).unwrap(),
+            "curl-http-throughput:67108864\n"
+        );
+        assert_eq!(expand_write_out("\\ta\\rb\\\\c", 0).unwrap(), "\ta\rb\\c");
+        assert_eq!(expand_write_out("100%%", 0).unwrap(), "100%");
+        assert!(expand_write_out("%{unknown}", 0).is_err());
+    }
+
+    #[test]
+    fn fetch_streams_the_body_as_it_arrives() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut connection, _) = listener.accept().unwrap();
+            // The header boundary and the body arrive split across writes.
+            connection
+                .write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 12\r\n\r\nhello ")
+                .unwrap();
+            connection.write_all(b"world!").unwrap();
+        });
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let mut output = OutputTarget::Memory(Vec::new());
+        let size = fetch(&mut stream, &mut output, "http://127.0.0.1/").unwrap();
+        server.join().unwrap();
+        assert_eq!(size, 12);
+        let OutputTarget::Memory(body) = output else {
+            unreachable!()
+        };
+        assert_eq!(body, b"hello world!");
+    }
+
+    #[test]
+    fn fetch_fails_when_the_stream_ends_before_headers() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut connection, _) = listener.accept().unwrap();
+            connection.write_all(b"HTTP/1.0 200 OK\r\npartial").unwrap();
+        });
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let mut output = OutputTarget::Memory(Vec::new());
+        let result = fetch(&mut stream, &mut output, "http://127.0.0.1/");
+        server.join().unwrap();
+        assert!(matches!(result, Err(CurlError::MalformedResponse { .. })));
+    }
 }
