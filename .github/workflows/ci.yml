@@ -632,6 +632,45 @@ jobs:
           cat coreutils-smoke.out
           grep -Fqx coreutils:ok coreutils-smoke.out
           grep -Fqx bin coreutils-smoke.out
+      - name: Run CPython twice and record its launch phases
+        shell: bash
+        working-directory: helios
+        run: |
+          # Without this the step reports tee's status, not the
+          # command's, and a runner script that fails is invisible.
+          set -o pipefail
+          # Issue #311's fixed per-launch cost lives somewhere in the
+          # exec path; on aarch64/HVF the trace cleared the bootfs read,
+          # the signature check and 9p, leaving the x86-specific memory
+          # path unmeasured (#352). This boot is the KVM measurement:
+          # --enable-target opens helios_kernel::exec::phases on the
+          # kernel console filter, two python3 launches give one cold
+          # and one warm split, and debug-serial.log is the artifact the
+          # orchestrator reads the split from. docs/benchmarks.md lists
+          # the phase names.
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/cpython-phases"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+            --accel kvm \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger --boot-program python3 \
+            --no-compiler-plugin \
+            --enable-target helios_kernel::exec::phases \
+            shell -c 'python3 -c "print(1)"; python3 -c "print(2)"' \
+            2>&1 > cpython-phases-smoke.out | tee "$runtime/inspector.log"
+          cat cpython-phases-smoke.out
+          # `program` is the launched program's name in every phase
+          # event: the path on the RPC boundaries, the argv program name
+          # inside the load and run phases — both name python3 here.
+          phases="$(grep -F 'python3' "$runtime/debug-serial.log")"
+          echo "$phases"
+          # Two launches arrived, one cold and one warm: the deserialize
+          # boundary exists once, the warm launch's deserialize-cache
+          # lookup hits, and each launch brackets its guest run.
+          test "$(echo "$phases" | grep -cF 'phase=rpc-arrival')" -eq 2
+          test "$(echo "$phases" | grep -cF 'phase=deserialize')" -eq 1
+          test "$(echo "$phases" | grep -cF 'phase=cache-lookup kind=component hit=true')" -eq 1
+          test "$(echo "$phases" | grep -cE 'phase=guest-(begin|end)')" -eq 4
       - name: Compile a guest with the in-kernel compiler plugin
         shell: bash
         working-directory: helios
