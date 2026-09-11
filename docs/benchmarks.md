@@ -382,9 +382,19 @@ uv run helios-bench run --lane x86-64-kvm --out-dir … --baseline-ref
 
 Given a ref, `--baseline-ref` resolves it; given none, it means the merge
 base with `dev`, the commit the branch is a change to. The suite checks
-that commit out as a git worktree under
-`target/perf-baselines/worktrees/<sha>/helios` and times its guest
-against the candidate's.
+that commit out as a git worktree beside the candidate checkout,
+`<candidate dir>-baseline-<sha12>`, and times its guest against the
+candidate's. The checkout is the candidate's sibling so that the kernel's
+`../wasmtime/crates/wasmtime` path dependency resolves to the same
+absolute directory for both images: cargo hashes a path dependency
+outside the workspace by its absolute path, and a baseline that reached
+the vendored checkout through a link of its own compiled every Wasmtime
+crate under another crate hash, so the kernel profile matched none of
+the symbols named through Wasmtime and the pair timed a profile-guided
+candidate against an unprofiled baseline (#359). The baseline's warm
+build directory is `target/perf-baselines/worktrees/<sha>/target` under
+the candidate's `target/`, where the runner cache restores it; the
+checkout reaches it through its `target/` link.
 
 The second image is built the way a release build of the lane is, which
 on x86-64 reads the fetched kernel profile (`docs/pgo.md`).
