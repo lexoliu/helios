@@ -171,8 +171,7 @@ const XFER_HEADER_BYTES: usize = 4;
 /// `struct virtio_snd_pcm_status`: a status code and a latency.
 const XFER_STATUS_BYTES: usize = 8;
 
-/// The largest reply any query in this driver asks for.
-const MAX_PCM_INFO_REPLY: usize = HEADER_BYTES + MAX_STREAMS * PCM_INFO_BYTES;
+/// The largest reply either query in this driver asks for.
 const MAX_JACK_INFO_REPLY: usize = HEADER_BYTES + MAX_JACKS * JACK_INFO_BYTES;
 const MAX_CHMAP_INFO_REPLY: usize = HEADER_BYTES + MAX_CHANNEL_MAPS * CHMAP_INFO_BYTES;
 
@@ -459,15 +458,6 @@ impl<T: VirtioTransport> VirtioSndDevice<T> {
         self.features
     }
 
-    /// The streams the device described at bring-up.
-    ///
-    /// Immutable: a stream's direction, formats and rates are properties
-    /// of the silicon. What changes underneath a caller is a jack's
-    /// connected state, which is why that one is asked for again.
-    pub fn stream_topology(&self) -> &StreamList {
-        &self.topology.streams
-    }
-
     /// The jacks the device described at bring-up, with the connected
     /// state they had then.
     pub fn jack_topology(&self) -> &JackList {
@@ -580,11 +570,13 @@ impl<T: VirtioTransport> VirtioSndDevice<T> {
 }
 
 impl<T: VirtioTransport> PlaybackDevice for VirtioSndDevice<T> {
-    async fn streams(&self) -> AudioResult<StreamList> {
-        let request = encode_query_info(R_PCM_INFO, self.topology.streams.len(), PCM_INFO_BYTES);
-        let mut response = [0_u8; MAX_PCM_INFO_REPLY];
-        self.control_command(&request, &mut response).await?;
-        decode_streams(&response, self.topology.streams.len())
+    /// The streams the device described at bring-up.
+    ///
+    /// Read straight back rather than asked for again: a stream's
+    /// direction, formats and rates are properties of the silicon, and
+    /// the device answered them once while it was being brought up.
+    fn stream_topology(&self) -> &StreamList {
+        &self.topology.streams
     }
 
     async fn jacks(&self) -> AudioResult<JackList> {
@@ -630,7 +622,12 @@ impl<T: VirtioTransport> PlaybackDevice for VirtioSndDevice<T> {
     async fn release(&self, stream: StreamId) -> AudioResult<()> {
         // The parameters survive a release — the specification puts the
         // stream back in the state `PCM_SET_PARAMS` left it in — so the
-        // remembered period length stays with it.
+        // remembered period length stays with it. The device may not
+        // answer the request while an I/O message for the stream is
+        // still pending (virtio 1.2 §5.14.6.6.5.1 "Stream Release"):
+        // every `write` this driver submitted has resolved by the time
+        // it returns, which is where the trait's flush ordering comes
+        // from.
         self.stream_command(R_PCM_RELEASE, stream).await
     }
 

@@ -236,6 +236,43 @@ pub mod gpu {
     }
 }
 
+/// Bindings for the interface a player reaches the machine's sound
+/// device through.
+///
+/// Generated from the `audio-host` world, for the reason `input-host`
+/// is: the kernel implements this one interface, and the program
+/// bindings above already provide every `wasi:cli` import a player also
+/// has.
+pub mod audio {
+    pub mod bindings {
+        use wasmtime;
+
+        wasmtime::component::bindgen!({
+            path: "../wit",
+            world: "audio-host",
+            imports: {
+                // The two calls that hand a reader over — the samples
+                // the guest writes and the feedback it reads — have to
+                // see the store, so they can pipe against one; they
+                // answer immediately rather than awaiting.
+                "helios:system/audio.[method]playback.samples": store | trappable,
+                "helios:system/audio.[method]playback.feedback": store | trappable,
+                // `negotiate` and `stop` reach the device and are
+                // `async func` in the WIT, generated against the store
+                // on their own account. What is left — claiming,
+                // listing, reading the topology back, dropping a handle
+                // — is store bookkeeping and answers without waiting.
+                default: trappable,
+            },
+            with: {
+                "helios:system/audio.playback":
+                    crate::wasmtime_adapter::component_host::PlaybackHandle,
+            },
+            require_store_data_send: true,
+        });
+    }
+}
+
 /// Bindings for the export the compositor plugin answers on.
 ///
 /// Generated from the `compositor-host` world rather than from

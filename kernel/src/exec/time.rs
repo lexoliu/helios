@@ -264,6 +264,12 @@ mod tests {
             crate::surface::SurfaceService::new()
         }
 
+        /// A test machine has no sound device, and a claim on one is
+        /// refused rather than trapping.
+        fn audio_service(&self) -> Option<crate::audio::AudioService> {
+            None
+        }
+
         fn profiling_enabled(&self) -> bool {
             false
         }

@@ -1,6 +1,7 @@
 pub use super::bindings::helios::system::stats::{
-    BlockDevice, GrantedDevice, HostShareCache, InputDevice, Iommu, IommuEndpoint, Memory,
-    MemoryPressure, MonoNanos, Network, NetworkQueue, Permille, Processor, Processors, Sample,
+    AudioStream, BlockDevice, GrantedDevice, HostShareCache, InputDevice, Iommu, IommuEndpoint,
+    Memory, MemoryPressure, MonoNanos, Network, NetworkQueue, Permille, Processor, Processors,
+    Sample,
 };
 
 #[cfg(feature = "host")]

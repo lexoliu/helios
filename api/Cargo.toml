@@ -5,6 +5,7 @@ edition.workspace = true
 
 [features]
 default = ["channel", "fs", "http", "io", "net", "serial", "stats", "sync", "task", "tracing"]
+audio = ["dep:thiserror"]
 channel = ["dep:async-channel"]
 compositor = ["surface"]
 display = ["dep:thiserror"]

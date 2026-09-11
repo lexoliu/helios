@@ -84,7 +84,7 @@ mod vsock;
 
 pub use service::{
     BlobHandle, ChildExit, ChildHandle, ClientSurfaceHandle, CommandBufferHandle, ContextHandle,
-    DisplayHandle, GpuHandle, InputDeviceHandle, SurfaceHandle, UserProgramService,
+    DisplayHandle, GpuHandle, InputDeviceHandle, PlaybackHandle, SurfaceHandle, UserProgramService,
     install_component_host_program_service, install_program_service,
     run_component_host_processor_forever, run_embedded_component_forever,
     run_program_workers_forever,
@@ -1619,6 +1619,7 @@ where
     service::add_input_to_linker(linker)?;
     service::add_surface_to_linker(linker)?;
     service::add_gpu_to_linker(linker)?;
+    service::add_audio_to_linker(linker)?;
     add_instances_to_linker(linker)?;
     add_tracing_to_linker(linker)?;
     debugger_profiling::add_to_linker(linker)?;
@@ -1820,6 +1821,7 @@ where
     service::add_input_to_linker(linker)?;
     service::add_surface_to_linker(linker)?;
     service::add_gpu_to_linker(linker)?;
+    service::add_audio_to_linker(linker)?;
     add_tracing_to_program_linker(linker)?;
     program_profiling::add_to_linker(linker)?;
     Ok(())
@@ -4036,6 +4038,27 @@ macro_rules! convert_input_stats {
     };
 }
 
+/// Maps the kernel's playback-stream inventory onto one binding set's
+/// `audio-stream` list, for the same reason [`convert_input_stats`]
+/// exists.
+macro_rules! convert_audio_stats {
+    ($bindings:path, $audio:expr) => {
+        $audio
+            .into_iter()
+            .map(|stream: crate::AudioStreamSnapshot| {
+                use $bindings as stats_bindings;
+                stats_bindings::AudioStream {
+                    id: stream.id,
+                    claimed: stream.claimed,
+                    played_bytes: stream.played_bytes,
+                    xruns: stream.xruns,
+                    lost_feedback: stream.lost_feedback,
+                }
+            })
+            .collect()
+    };
+}
+
 macro_rules! convert_block_stats {
     ($bindings:path, $block:expr) => {
         $block.map(|block: crate::BlockStats| {
@@ -4134,6 +4157,7 @@ fn convert_sample(sample: StatsSample) -> debugger_wit::stats::Sample {
         network: convert_network_stats!(debugger_wit::stats, sample.network),
         devices: convert_device_stats!(debugger_wit::stats, sample.devices),
         inputs: convert_input_stats!(debugger_wit::stats, sample.inputs),
+        audio: convert_audio_stats!(debugger_wit::stats, sample.audio),
     }
 }
 
@@ -4169,6 +4193,7 @@ fn convert_program_sample(sample: StatsSample) -> program_wit::stats::Sample {
         network: convert_network_stats!(program_wit::stats, sample.network),
         devices: convert_device_stats!(program_wit::stats, sample.devices),
         inputs: convert_input_stats!(program_wit::stats, sample.inputs),
+        audio: convert_audio_stats!(program_wit::stats, sample.audio),
     }
 }
 

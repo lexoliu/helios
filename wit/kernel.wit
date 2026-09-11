@@ -14,11 +14,12 @@ world init {
   import helios:system/input@0.1.0;
   import helios:system/surface@0.1.0;
   import helios:system/gpu@0.1.0;
+  import helios:system/audio@0.1.0;
   import wasi:http/types@0.3.0;
   import wasi:http/client@0.3.0;
 }
 
-world debugger {
+world debugger{
   include wasi:cli/command@0.3.0;
   import helios:system/programs@0.1.0;
   import helios:system/net@0.1.0;
@@ -33,6 +34,7 @@ world debugger {
   import helios:system/input@0.1.0;
   import helios:system/surface@0.1.0;
   import helios:system/gpu@0.1.0;
+  import helios:system/audio@0.1.0;
   import wasi:http/types@0.3.0;
   import wasi:http/client@0.3.0;
 }
@@ -168,4 +170,14 @@ world gpu-host {
 /// from, the way `http-host` carries `wasi:http/handler`.
 world compositor-host {
   export helios:system/compositor@0.1.0;
+}
+
+/// World the kernel generates its own `helios:system/audio` bindings
+/// from.
+///
+/// Separate from the program worlds for the reason `input-host` is: it
+/// keeps the kernel's bindgen down to the one interface it serves here
+/// instead of regenerating every `wasi:cli` import a player also has.
+world audio-host {
+  import helios:system/audio@0.1.0;
 }

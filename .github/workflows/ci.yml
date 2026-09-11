@@ -969,15 +969,78 @@ jobs:
           ./target/release/check-desktop-text \
             --capture "$captures/restart-after.png" --origin "$origin" \
             --expect '0,0=helios$ '
+      - name: Play a tone through the desktop's sound device
+        shell: bash
+        working-directory: helios
+        run: |
+          # Without this the step reports tee's status, not the
+          # command's, and a runner script that fails is invisible.
+          set -o pipefail
+          # A boot of its own, for the same reason the input probe has
+          # one: this session's whole job is the recording, and a capture
+          # taken while `display-test` was also driving the machine could
+          # not be attributed to the audio path.
+          #
+          # `--audiodev` alone attaches the virtio-sound device — the
+          # desktop's display and input adapters are not needed to make a
+          # sound — and the `wav` backend writes what the device played
+          # to a file, so a headless runner with no sound card at all
+          # produces the same recording a speaker would have made
+          # (docs/desktop.md).
+          #
+          # `audio-test` claims the playback stream through
+          # `helios:system/audio`, negotiates 48 kHz stereo S16 and
+          # writes two seconds of a 440 Hz sine into it. The tone is the
+          # evidence: a device nothing ever sent a period to also leaves
+          # a valid WAV header behind, and only the samples tell the two
+          # apart.
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/desktop-audio"
+          evidence="$GITHUB_WORKSPACE/desktop-scanout"
+          mkdir -p "$runtime" "$evidence"
+          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+            --accel kvm \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --audiodev "wav:$evidence/tone.wav" \
+            --boot-program dash --boot-program debugger \
+            --boot-program audio-test --no-compiler-plugin \
+            shell -c '/bin/audio-test --seconds 2' \
+            2>&1 > audio-smoke.out | tee "$runtime/inspector.log"
+          cat audio-smoke.out
+          # The driver answered its bring-up queries before any of this.
+          grep -Eq 'virtio-snd online transport=pci streams=[0-9]+ jacks=[0-9]+ rates=[0-9]+\.\.[0-9]+ formats=[A-Z0-9,]+' \
+            "$runtime/debug-serial.log"
+          # The kernel's own account: the service came up, and the stream
+          # was configured with what the guest asked for rather than with
+          # the nearest thing the device offered.
+          grep -Fq 'audio service online' "$runtime/debug-serial.log"
+          grep -Eq 'playback stream negotiated .*rate=48000 channels=2' \
+            "$runtime/debug-serial.log"
+          # The guest's own account, in the order the path runs in.
+          grep -Eq 'audio-test:claimed stream=[0-9]+' audio-smoke.out
+          grep -Fq 'audio-test:negotiated rate=48000 channels=2 format=S16' \
+            audio-smoke.out
+          grep -Eq 'audio-test:wrote bytes=384000 frames=96000' audio-smoke.out
+          # An underrun is a period the kernel had nothing to play, and
+          # nothing substitutes silence for it (#306), so a run that
+          # reports one produced a recording with a hole in it.
+          grep -Eq 'audio-test:done latency-bytes=[0-9]+ xruns=0' audio-smoke.out
+          # And the recording itself: two seconds of one partial at the
+          # frequency the guest generated.
+          test -s "$evidence/tone.wav"
+          file "$evidence/tone.wav" | grep -Fq 'WAVE audio'
+          python3 tools/desktop/check-tone.py "$evidence/tone.wav" \
+            --hz 440 --seconds 2
       - name: Upload the desktop scanout captures
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: smoke-x86-64-desktop
-          # The captures and nothing else. A kernel image carries the
-          # signing material the guest verifies its own artifacts with
-          # and never leaves the job.
-          path: desktop-scanout/*.png
+          # The pictures, the recording, and nothing else. A kernel image
+          # carries the signing material the guest verifies its own
+          # artifacts with and never leaves the job.
+          path: |
+            desktop-scanout/*.png
+            desktop-scanout/*.wav
           if-no-files-found: warn
           retention-days: 7
       # The host keeps its own copy of the debug serial, written by the

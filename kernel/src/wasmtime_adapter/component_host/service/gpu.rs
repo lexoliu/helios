@@ -44,7 +44,7 @@ use wasmtime::component::{
 use crate::ComponentHostNetwork;
 use crate::display::SequenceSignal;
 use crate::gpu::{BlobSpec, Gpu3dRequest, Gpu3dSender, Gpu3dServiceError, SubmitRequest};
-use crate::pins::PinnedFrame;
+use crate::pins::PinnedRun;
 use crate::wasmtime_adapter::bindings::gpu::bindings::helios::system::gpu as gpu_wit;
 
 use super::super::StoreData;
@@ -93,7 +93,7 @@ pub struct ContextHandle {
 /// One pinned command buffer, as its store records it.
 pub struct CommandBufferHandle {
     pub(crate) generation: u64,
-    pub(crate) frame: PinnedFrame,
+    pub(crate) frame: PinnedRun,
 }
 
 /// One blob resource, as its store records it.
@@ -101,10 +101,10 @@ pub struct BlobHandle {
     pub(crate) generation: u64,
     pub(crate) id: BlobId,
     /// The pinned pages backing it, for the guest-backed kinds.
-    pub(crate) backing: Option<PinnedFrame>,
+    pub(crate) backing: Option<PinnedRun>,
     /// The aperture placement the instance mapped, once `map-blob` has
     /// put one there.
-    pub(crate) mapped: Option<PinnedFrame>,
+    pub(crate) mapped: Option<PinnedRun>,
 }
 
 fn to_wit_error(error: Gpu3dServiceError) -> gpu_wit::Error {
@@ -152,7 +152,7 @@ fn from_wit_blob_usage(usage: gpu_wit::BlobUsage) -> BlobUsage {
     flags
 }
 
-const fn to_wit_placement(frame: PinnedFrame) -> gpu_wit::Placement {
+const fn to_wit_placement(frame: PinnedRun) -> gpu_wit::Placement {
     gpu_wit::Placement {
         offset: frame.offset,
         length: frame.bytes,

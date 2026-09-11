@@ -34,7 +34,7 @@
 //! They are the client's, charged to the client's pool, and they come
 //! back when the client's arena ends — which is when the instance dies —
 //! not when one surface of many is dropped. That is the rule
-//! [`crate::PinnedFrames`] already states for a display frame buffer,
+//! [`crate::PinnedArena`] already states for a display frame buffer,
 //! and it is here for the same reason: a span released while somebody
 //! else still holds a view of it would put whatever the pool hands out
 //! next in front of the compositor. A client that churns through windows
@@ -111,8 +111,8 @@ pub enum SurfaceServiceError {
 impl From<crate::PinError> for SurfaceServiceError {
     fn from(error: crate::PinError) -> Self {
         match error {
-            crate::PinError::Empty => Self::UnsupportedSize,
-            crate::PinError::TooMany => Self::TooManySurfaces,
+            crate::PinError::EmptyRun => Self::UnsupportedSize,
+            crate::PinError::TooManyRuns => Self::TooManySurfaces,
             crate::PinError::WindowExhausted => Self::WindowExhausted,
             // A machine that cannot hand the compositor a view of the
             // client's pages cannot compose the client's window at all,

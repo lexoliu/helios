@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use helios_hal::device::{DeviceRegion, DeviceRegionAttributes, DmaCapability, DmaPlacement};
 use helios_hal::iommu::{DmaTranslation, PhysicalRange};
 use helios_hal::pmm::PhysFrame;
-use helios_hal::vmm::{AddressSpace, AddressSpaceError, PageFlags, VirtRange};
+use helios_hal::vmm::{AddressSpace, AddressSpaceError, PageFlags, VirtAddr, VirtRange};
 use helios_kernel::{
     DeviceGrant, DeviceInterruptHooks, DeviceName, DeviceVmHooks, DmaBudget, GrantError,
     GrantInterrupt, install_device_interrupt_hooks, install_device_vm_hooks,
@@ -262,6 +262,13 @@ fn unmask(source: u32) {
     platform().unmasked.fetch_add(1, Ordering::Relaxed);
 }
 
+/// There is no physical memory under this backend: a commit's "frame"
+/// is the host address the mapping already lives at, so the kernel's
+/// alias for it is itself.
+fn kernel_alias(frame: PhysFrame) -> VirtAddr {
+    VirtAddr::new(frame.phys_addr())
+}
+
 static VM_HOOKS: DeviceVmHooks = DeviceVmHooks {
     map_device,
     unmap_device,
@@ -270,6 +277,7 @@ static VM_HOOKS: DeviceVmHooks = DeviceVmHooks {
     commit_contiguous,
     release_contiguous,
     mapping_granule,
+    kernel_alias,
 };
 
 static INTERRUPT_HOOKS: DeviceInterruptHooks = DeviceInterruptHooks { mask, unmask };

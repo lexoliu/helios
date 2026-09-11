@@ -771,7 +771,7 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
             for device in input::install(&kernel, &fdt, &debug_state) {
                 interrupts.attach_input(device);
             }
-            if let Some(sound) = snd::install(&kernel, &fdt) {
+            if let Some(sound) = snd::install(&kernel, &fdt, &debug_state) {
                 interrupts.attach_sound(sound);
             }
             for block in block::install(&cpu, &kernel, &fdt, &debug_state, root_entropy) {

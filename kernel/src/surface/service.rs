@@ -39,7 +39,7 @@ use triomphe::Arc;
 
 use crate::InstanceId;
 use crate::exec::{Notify, NotifyWaiter};
-use crate::pins::PinnedFrames;
+use crate::pins::PinnedArena;
 
 use super::SurfaceServiceError;
 
@@ -269,7 +269,7 @@ pub struct ReturnedSurfaces {
     /// The windows this client held, in no particular order.
     pub ids: ArrayVec<SurfaceId, MAX_INSTANCE_SURFACES>,
     /// The pages they lived in.
-    pub pins: PinnedFrames<MAX_LIVE_SURFACES>,
+    pub pins: PinnedArena<MAX_LIVE_SURFACES>,
 }
 
 /// One `create` the kernel forwards to the compositor.

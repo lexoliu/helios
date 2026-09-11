@@ -239,16 +239,21 @@ fn draw_main_panels(
         .constraints([Constraint::Percentage(64), Constraint::Percentage(36)])
         .split(sections[1]);
     draw_instances_panel(frame, bottom[0], instances);
-    // The two kinds of device the kernel hands out share the column,
-    // because both answer "who holds this piece of hardware": one for
-    // the registers a user-mode driver drives, one for the events a
-    // compositor reads.
+    // The things the kernel hands out share the column, because they
+    // all answer "who holds this piece of hardware": the registers a
+    // user-mode driver drives, the events a compositor reads, and the
+    // stream a player writes.
     let held = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .constraints([
+            Constraint::Percentage(34),
+            Constraint::Percentage(33),
+            Constraint::Percentage(33),
+        ])
         .split(bottom[1]);
     draw_devices_panel(frame, held[0], sample);
     draw_input_panel(frame, held[1], sample);
+    draw_audio_panel(frame, held[2], sample);
 }
 
 /// The input devices the kernel drains, and who is reading them.
@@ -303,6 +308,69 @@ fn draw_input_panel(frame: &mut ratatui::Frame<'_>, area: Rect, sample: &stats::
     .block(
         Block::default()
             .title("Input devices")
+            .borders(Borders::ALL),
+    );
+    frame.render_widget(table, area);
+}
+
+/// The playback streams the kernel pumps, and who is playing them.
+fn draw_audio_panel(frame: &mut ratatui::Frame<'_>, area: Rect, sample: &stats::Sample) {
+    if sample.audio.is_empty() {
+        let empty = Paragraph::new(Text::from(vec![Line::from(Span::styled(
+            "no playback streams on this machine",
+            Style::default().fg(Color::DarkGray),
+        ))]))
+        .block(
+            Block::default()
+                .title("Audio streams")
+                .borders(Borders::ALL),
+        )
+        .wrap(Wrap { trim: true });
+        frame.render_widget(empty, area);
+        return;
+    }
+    let rows = sample.audio.iter().map(|stream| {
+        let owner = if stream.claimed { "held" } else { "free" };
+        let style = if stream.claimed {
+            Style::default().fg(Color::Green)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        // A climbing underrun or lost-feedback count is a player that
+        // did not keep up — the rows' one number that means something
+        // is wrong, the same reading the input panel gives `lost`.
+        let trouble = |count: u64| {
+            if count == 0 {
+                Style::default().fg(Color::DarkGray)
+            } else {
+                Style::default().fg(Color::Red)
+            }
+        };
+        Row::new(vec![
+            Cell::from(format!("{}", stream.id)),
+            Cell::from(owner).style(style),
+            Cell::from(format_bytes(stream.played_bytes)),
+            Cell::from(format!("{}", stream.xruns)).style(trouble(stream.xruns)),
+            Cell::from(format!("{}", stream.lost_feedback)).style(trouble(stream.lost_feedback)),
+        ])
+    });
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(6),
+            Constraint::Length(5),
+            Constraint::Min(9),
+            Constraint::Length(5),
+            Constraint::Length(5),
+        ],
+    )
+    .header(
+        Row::new(vec!["stream", "owner", "played", "xrun", "lost"])
+            .style(Style::default().fg(Color::Cyan)),
+    )
+    .block(
+        Block::default()
+            .title("Audio streams")
             .borders(Borders::ALL),
     );
     frame.render_widget(table, area);

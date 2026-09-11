@@ -31,7 +31,7 @@ use arrayvec::ArrayVec;
 use triomphe::Arc;
 
 use crate::device::DeviceWindow;
-use crate::pins::{PinnedFrame, PinnedFrames};
+use crate::pins::{PinnedArena, PinnedRun};
 
 use super::SurfaceServiceError;
 use super::service::{
@@ -45,7 +45,7 @@ use super::service::{
 /// Sized for the compositor rather than for a client: a client holds at
 /// most [`MAX_INSTANCE_SURFACES`] windows, and the compositor holds a
 /// view of every window on the machine.
-pub type SurfacePins = PinnedFrames<MAX_LIVE_SURFACES>;
+pub type SurfacePins = PinnedArena<MAX_LIVE_SURFACES>;
 
 /// One instance's hold on the surface path.
 #[derive(Default)]
@@ -55,10 +55,10 @@ pub struct SurfaceOwnership {
     /// nothing for the path existing.
     pins: Option<SurfacePins>,
     /// The windows this instance owns, alongside the run each lives in.
-    held: ArrayVec<(Arc<SurfaceShared>, PinnedFrame), MAX_INSTANCE_SURFACES>,
+    held: ArrayVec<(Arc<SurfaceShared>, PinnedRun), MAX_INSTANCE_SURFACES>,
     /// The views this instance holds of somebody else's windows, which
     /// is the compositor's half and empty on everybody else.
-    views: ArrayVec<(SurfaceId, PinnedFrame), MAX_LIVE_SURFACES>,
+    views: ArrayVec<(SurfaceId, PinnedRun), MAX_LIVE_SURFACES>,
     /// The registry to hand `pins` back to. Present exactly when `pins`
     /// is.
     service: Option<SurfaceService>,
@@ -117,7 +117,7 @@ impl SurfaceOwnership {
         registry: &SurfaceService,
         window: DeviceWindow,
         geometry: SurfaceGeometry,
-    ) -> Result<(Arc<SurfaceShared>, PinnedFrame), SurfaceServiceError> {
+    ) -> Result<(Arc<SurfaceShared>, PinnedRun), SurfaceServiceError> {
         if self.held.is_full() {
             return Err(SurfaceServiceError::TooManySurfaces);
         }
@@ -169,7 +169,7 @@ impl SurfaceOwnership {
         window: DeviceWindow,
         id: SurfaceId,
         physical: helios_hal::iommu::PhysicalRange,
-    ) -> Result<PinnedFrame, SurfaceServiceError> {
+    ) -> Result<PinnedRun, SurfaceServiceError> {
         if self.views.is_full() {
             return Err(SurfaceServiceError::TooManySurfaces);
         }

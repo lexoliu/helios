@@ -28,7 +28,7 @@
 use helios_hal::device::DeviceRegion;
 
 use crate::device::DeviceWindow;
-use crate::pins::PinnedFrame;
+use crate::pins::PinnedRun;
 
 use super::service::{Gpu3dClaim, Gpu3dService};
 use super::{Gpu3dServiceError, GpuPins};
@@ -101,7 +101,7 @@ impl Gpu3dOwnership {
     /// The one kind of pin the renderer's own memory takes: a command
     /// buffer the instance writes and the device reads, and a guest
     /// blob's backing store, are the same thing to the arena.
-    pub fn pin(&mut self, bytes: u64) -> Result<PinnedFrame, Gpu3dServiceError> {
+    pub fn pin(&mut self, bytes: u64) -> Result<PinnedRun, Gpu3dServiceError> {
         self.pins
             .as_mut()
             .ok_or(Gpu3dServiceError::NotClaimed)?
@@ -116,7 +116,7 @@ impl Gpu3dOwnership {
     /// the region are the renderer's, placed in the engine's
     /// host-visible aperture, and this arena holds only the path to
     /// them.
-    pub fn map_blob(&mut self, region: DeviceRegion) -> Result<PinnedFrame, Gpu3dServiceError> {
+    pub fn map_blob(&mut self, region: DeviceRegion) -> Result<PinnedRun, Gpu3dServiceError> {
         self.pins
             .as_mut()
             .ok_or(Gpu3dServiceError::NotClaimed)?
@@ -130,7 +130,7 @@ impl Gpu3dOwnership {
     /// Called once the renderer has let the resource go, never before:
     /// a blob unmapped while the engine still places it would leave the
     /// device decoding a span that no longer names anything.
-    pub fn unpin(&mut self, frame: PinnedFrame) {
+    pub fn unpin(&mut self, frame: PinnedRun) {
         if let Some(pins) = self.pins.as_mut() {
             pins.unpin(frame);
         }

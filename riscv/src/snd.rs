@@ -47,12 +47,14 @@ pub(crate) fn has_sound_device(fdt: &Fdt<'_>) -> bool {
 pub(crate) fn install<WatchdogImpl>(
     kernel: &helios_kernel::Kernel<crate::RiscvCpu, WatchdogImpl>,
     fdt: &Fdt<'_>,
+    debug_state: &crate::debug_state::RuntimeState,
 ) -> Option<SoundInterrupt>
 where
     WatchdogImpl: helios_hal::watchdog::Watchdog + Clone,
 {
     let (device, source) = discover_sound_device(fdt)?;
-    helios_kernel::install_sound_device(kernel, device.inner.clone());
+    let service = helios_kernel::install_audio_device(kernel, device.inner.clone());
+    debug_state.install_audio_service(service);
     Some(SoundInterrupt { source, device })
 }
 

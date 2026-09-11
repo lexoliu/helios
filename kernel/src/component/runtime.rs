@@ -372,6 +372,11 @@ pub trait ComponentRuntimeState: Clone + Send + 'static {
     /// The machine's client windows, which every instance may ask for
     /// one of.
     fn surface_service(&self) -> crate::surface::SurfaceService;
+    /// The machine's sound device, once a backend has brought one up.
+    ///
+    /// Empty on a machine with no sound device, where a claim is
+    /// refused with `unavailable` rather than trapping.
+    fn audio_service(&self) -> Option<crate::audio::AudioService>;
 
     fn profiling_enabled(&self) -> bool;
 

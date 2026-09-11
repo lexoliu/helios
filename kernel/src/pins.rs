@@ -1,71 +1,78 @@
-//! The pages one instance has pinned inside its own linear memory.
+//! The pinned, physically contiguous runs one instance holds inside its
+//! own linear memory.
 //!
-//! Three paths put memory there and they want the same thing. A display
-//! frame buffer is the claiming instance's own memory: pinned,
-//! physically contiguous pages committed from the user pool, placed at a
-//! fixed offset inside that instance's linear memory, and handed to the
-//! display engine as the backing store of its resource. A compositor
-//! surface is the client's own memory in exactly the same sense, plus a
-//! second view of the same run inside the compositor, so that the
+//! Three things in this kernel want the same memory: a granted device's
+//! rings, a display's frame buffers, and a sound stream's period
+//! buffers. All three are pinned, physically contiguous pages committed
+//! from the claiming instance's user pool and placed at a fixed offset
+//! inside that instance's linear memory, so that nothing is copied
+//! through a kernel-owned buffer on the way to the hardware and nothing
+//! the kernel owns grows when an instance asks for a larger one. A
+//! compositor surface is the client's own memory in exactly the same
+//! sense, plus a second view of the same run inside the compositor —
+//! mapped with [`PinnedArena::map`] rather than committed — so that the
 //! compositor composes from the bytes the client wrote rather than from
 //! a copy of them.
 //!
-//! The third is a window a device published: a display engine's
-//! host-visible aperture, where the host's own storage for a 3D blob is
-//! placed. Those bytes are not this machine's memory at all — nothing is
-//! committed and nothing is charged — but they land in the same kind of
-//! span, for the same reason, and are given back the same way.
+//! A fourth path is a window a device published rather than memory this
+//! machine owns at all: a display engine's host-visible aperture, where
+//! the host's own storage for a 3D blob is placed. Nothing is committed
+//! and nothing is charged, but the window lands in the same kind of
+//! span, for the same reason, and is given back the same way.
 //!
-//! All of them live in a window — a span of the reservation above everything
-//! the instance can grow into — for the same reason a granted device's
-//! registers do: a `memory.grow` that landed on a frame buffer would
-//! hand the display engine, or the compositor, whatever the instance put
-//! there next.
+//! The pages go in a [`DeviceWindow`] — a span of the reservation above
+//! everything the instance can grow into — for the same reason a
+//! granted device's registers do: a `memory.grow` that landed on one of
+//! them would hand the hardware whatever the instance put there next.
 //!
-//! Nothing is copied through the kernel on the way to the screen, and
-//! nothing the kernel owns grows when a compositor asks for a larger
-//! surface.
+//! This is the arena the display, the surface registry, the audio
+//! service and the 3D engine all carve from. It says nothing about what the runs are
+//! *for*: the owning service names the bound on how many there may be
+//! and translates [`PinError`] into its own refusal, because "this
+//! claim holds as many frame buffers as it may" and "as many period
+//! buffers as it may" are answers a caller acts on differently.
 //!
 //! # Concurrency contract
 //!
 //! An arena belongs to the one task running its instance's store and is
-//! never shared, so it needs no lock. Every commit, map and release goes
-//! through the address space, which invalidates the local translation
-//! cache and shoots down every other processor that has run in the space
-//! before it returns.
+//! never shared, so it needs no lock. It may be *moved* to another task
+//! — that is what handing a released claim's pages to the owner task
+//! is — and it is still single-owned there. Every commit, map and
+//! release goes through the address space, which invalidates the local
+//! translation cache and shoots down every other processor that has run
+//! in the space before it returns.
 
 use arrayvec::ArrayVec;
 use helios_hal::device::{DeviceRegion, DmaPlacement};
 use helios_hal::iommu::PhysicalRange;
 use helios_hal::pmm::{PhysFrame, PhysFrameRange};
-use helios_hal::vmm::PageFlags;
+use helios_hal::vmm::{PageFlags, VirtAddr};
 use thiserror::Error;
 
 use crate::device::{DeviceWindow, device_vm_hooks};
-
-/// Frame buffers one display claim may hold at once, cursor planes
-/// included.
-///
-/// A compositor builds its scanout surfaces once and presents into them;
-/// the bound is what keeps the arena a value on the store's own stack
-/// rather than an allocation whose size a guest chooses.
-pub const MAX_PINNED_FRAMES: usize = 16;
 
 /// Every pixel format a Helios display engine latches is four bytes
 /// wide, so a frame's size is its area times this and its stride is its
 /// width times this.
 pub const BYTES_PER_PIXEL: usize = 4;
 
-/// Why an arena refused.
+/// Why a run could not be pinned.
+///
+/// Kept apart rather than folded into one fault because the owning
+/// service answers each of them differently: a zero-length request is a
+/// bug in the caller, a full arena is a claim asking for more than it
+/// may hold, an exhausted window is an instance that has churned
+/// through its span, and no memory is the machine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
 pub enum PinError {
-    /// A zero-byte run has nothing to pin.
-    #[error("a pinned run covers at least one page")]
-    Empty,
+    /// A run of no bytes, which describes no memory any device could
+    /// read.
+    #[error("a pinned run of no bytes describes no memory")]
+    EmptyRun,
     /// The arena already holds as many runs as it may.
     #[error("this arena holds as many pinned runs as it may")]
-    TooMany,
-    /// The window has no room left.
+    TooManyRuns,
+    /// The window has no room left for a run of that size.
     #[error("this instance's window has no room left")]
     WindowExhausted,
     /// The machine has no contiguous run of that size left, or the
@@ -101,19 +108,19 @@ enum PinBacking {
 /// One pinned, physically contiguous run inside an instance's linear
 /// memory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PinnedFrame {
+pub struct PinnedRun {
     /// Byte offset of the run in the instance's linear memory.
     pub offset: u64,
     /// How many bytes it covers, which is the request rounded up to
     /// whole mapping granules.
     pub bytes: u64,
-    /// The physical pages behind it, which are what the display engine
-    /// is told to read and what a second instance is handed a view of.
+    /// The physical pages behind it, which are what the hardware is
+    /// told to read and what a second instance is handed a view of.
     pub backing: PhysFrameRange,
     kind: PinBacking,
 }
 
-impl PinnedFrame {
+impl PinnedRun {
     /// The physical bytes behind this run.
     pub const fn physical(&self) -> PhysicalRange {
         PhysicalRange::new(self.backing.start.phys_addr() as u64, self.bytes)
@@ -130,31 +137,43 @@ impl PinnedFrame {
     pub const fn is_device(&self) -> bool {
         matches!(self.kind, PinBacking::Device)
     }
+
+    /// Where these bytes appear in the kernel's own address space.
+    ///
+    /// The instance's mapping of them is in the user window, which no
+    /// device's DMA pool translates and which only the task running
+    /// that instance is looking at. The kernel's own alias is the
+    /// address every backend's pool does translate, so it is the one a
+    /// kernel-side producer writes through and the one a driver is
+    /// handed.
+    pub fn kernel_alias(&self) -> VirtAddr {
+        (device_vm_hooks().kernel_alias)(self.backing.start)
+    }
 }
 
-/// One window of one instance, as a bump arena.
+/// One instance's window, as a bump arena of pinned runs.
 ///
 /// Runs are handed out in the order they are asked for. Releasing the
 /// most recent one gives its span back — which is the whole of what a
-/// compositor changing mode does — and releasing an older one leaves its
-/// span held until the arena ends, exactly as a granted device's pinned
-/// rings are held for as long as the grant. An arena that churns through
-/// its window is answered with [`PinError::WindowExhausted`] rather than
-/// quietly reusing memory the display engine, or a compositor, may still
-/// be reading.
-pub struct PinnedFrames<const CAPACITY: usize> {
+/// compositor changing mode or a stream renegotiating its format does —
+/// and releasing an older one leaves its span held until the claim
+/// ends, exactly as a granted device's pinned rings are held for as
+/// long as the grant. A claim that churns through the window is
+/// answered with [`PinError::WindowExhausted`] rather than quietly
+/// reusing memory the hardware may still be reading.
+pub struct PinnedArena<const RUNS: usize> {
     window: DeviceWindow,
     cursor: u64,
-    frames: ArrayVec<PinnedFrame, CAPACITY>,
+    runs: ArrayVec<PinnedRun, RUNS>,
     pinned_bytes: u64,
 }
 
-impl<const CAPACITY: usize> PinnedFrames<CAPACITY> {
+impl<const RUNS: usize> PinnedArena<RUNS> {
     pub fn new(window: DeviceWindow) -> Self {
         Self {
             window,
             cursor: 0,
-            frames: ArrayVec::new(),
+            runs: ArrayVec::new(),
             pinned_bytes: 0,
         }
     }
@@ -171,13 +190,13 @@ impl<const CAPACITY: usize> PinnedFrames<CAPACITY> {
     }
 
     /// How many runs are held.
-    pub fn frame_count(&self) -> usize {
-        self.frames.len()
+    pub fn run_count(&self) -> usize {
+        self.runs.len()
     }
 
     /// Commit a physically contiguous run of at least `bytes` from this
     /// instance's own pool.
-    pub fn pin(&mut self, bytes: u64) -> Result<PinnedFrame, PinError> {
+    pub fn pin(&mut self, bytes: u64) -> Result<PinnedRun, PinError> {
         let (offset, bytes, granule) = self.carve_for(bytes)?;
         let virt = self.window.range_at(offset, bytes);
         let first = (device_vm_hooks().commit_contiguous)(
@@ -185,7 +204,7 @@ impl<const CAPACITY: usize> PinnedFrames<CAPACITY> {
             PageFlags::READ | PageFlags::WRITE,
             DmaPlacement {
                 align: granule,
-                // The display engine is told the run's physical address
+                // The hardware is told the run's physical address
                 // directly, so what bounds it is the machine's memory
                 // rather than a translation unit's window.
                 limit: u64::MAX,
@@ -200,7 +219,7 @@ impl<const CAPACITY: usize> PinnedFrames<CAPACITY> {
     ///
     /// Nothing is allocated and nothing is charged: the pages belong to
     /// whoever pinned them, and this arena holds only the view.
-    pub fn map(&mut self, physical: PhysicalRange) -> Result<PinnedFrame, PinError> {
+    pub fn map(&mut self, physical: PhysicalRange) -> Result<PinnedRun, PinError> {
         let (offset, bytes, _granule) = self.carve_for(physical.bytes)?;
         if bytes != physical.bytes {
             // A run whose owner rounded it to a different granule than
@@ -232,7 +251,7 @@ impl<const CAPACITY: usize> PinnedFrames<CAPACITY> {
     /// reason a granted device's does: the page it shared with its
     /// neighbour would carry the neighbour's bytes into this
     /// instance's memory.
-    pub fn map_device(&mut self, region: DeviceRegion) -> Result<PinnedFrame, PinError> {
+    pub fn map_device(&mut self, region: DeviceRegion) -> Result<PinnedRun, PinError> {
         if !region.is_frame_aligned() {
             return Err(PinError::ShareRefused);
         }
@@ -254,24 +273,24 @@ impl<const CAPACITY: usize> PinnedFrames<CAPACITY> {
     /// Its span returns to the arena only when it is the most recent
     /// one; otherwise the pages are released and the span stays held
     /// until the arena ends, exactly as a granted device's pinned rings
-    /// are held for as long as the grant. Either way the instance's pool
-    /// has its pages back on return — or, for a view, has lost its last
-    /// path to somebody else's.
+    /// are held for as long as the grant. Either way the instance's
+    /// pool has its pages back on return — or, for a view, has lost
+    /// its last path to somebody else's.
     ///
     /// # Panics
     ///
     /// Panics when the address space refuses to release the run. The
     /// kernel cannot then prove the pages are the instance's again, and
     /// handing them to the next allocation would be a silent corruption.
-    pub fn unpin(&mut self, frame: PinnedFrame) {
-        let Some(index) = self.frames.iter().position(|held| *held == frame) else {
+    pub fn unpin(&mut self, run: PinnedRun) {
+        let Some(index) = self.runs.iter().position(|held| *held == run) else {
             return;
         };
-        self.frames.remove(index);
-        self.pinned_bytes -= frame.bytes;
-        let offset = frame.offset - self.window.offset();
-        release(self.window, frame);
-        if offset + frame.bytes == self.cursor {
+        self.runs.remove(index);
+        self.pinned_bytes -= run.bytes;
+        let offset = run.offset - self.window.offset();
+        release(self.window, run);
+        if offset + run.bytes == self.cursor {
             self.cursor = offset;
         }
     }
@@ -279,17 +298,17 @@ impl<const CAPACITY: usize> PinnedFrames<CAPACITY> {
     /// Carve a span for a run of `bytes`, rounded up to the granule.
     fn carve_for(&mut self, bytes: u64) -> Result<(u64, u64, u64), PinError> {
         if bytes == 0 {
-            return Err(PinError::Empty);
+            return Err(PinError::EmptyRun);
         }
-        if self.frames.is_full() {
-            return Err(PinError::TooMany);
+        if self.runs.is_full() {
+            return Err(PinError::TooManyRuns);
         }
         let granule = self.granule();
-        // `bytes` is derived from a geometry a guest named, so the
-        // rounding is checked: an unchecked one wraps in a release build
-        // and would answer a request for most of the address space with
-        // a run of a few pages, which the display engine would then be
-        // told to scan out.
+        // `bytes` is derived from something a guest named — a display
+        // mode, a sample rate — so the rounding is checked: an
+        // unchecked one wraps in a release build and would answer a
+        // request for most of the address space with a run of a few
+        // pages, which the hardware would then be told to read.
         let bytes = bytes
             .checked_next_multiple_of(granule)
             .ok_or(PinError::WindowExhausted)?;
@@ -297,14 +316,8 @@ impl<const CAPACITY: usize> PinnedFrames<CAPACITY> {
         Ok((offset, bytes, granule))
     }
 
-    fn record(
-        &mut self,
-        offset: u64,
-        bytes: u64,
-        first: PhysFrame,
-        kind: PinBacking,
-    ) -> PinnedFrame {
-        let frame = PinnedFrame {
+    fn record(&mut self, offset: u64, bytes: u64, first: PhysFrame, kind: PinBacking) -> PinnedRun {
+        let run = PinnedRun {
             offset: self.window.offset() + offset,
             bytes,
             backing: PhysFrameRange {
@@ -314,9 +327,9 @@ impl<const CAPACITY: usize> PinnedFrames<CAPACITY> {
             },
             kind,
         };
-        self.frames.push(frame);
+        self.runs.push(run);
         self.pinned_bytes += bytes;
-        frame
+        run
     }
 
     /// The smallest unit the address space can change a mapping at,
@@ -344,10 +357,10 @@ impl<const CAPACITY: usize> PinnedFrames<CAPACITY> {
     }
 }
 
-impl<const CAPACITY: usize> Drop for PinnedFrames<CAPACITY> {
+impl<const RUNS: usize> Drop for PinnedArena<RUNS> {
     fn drop(&mut self) {
-        for frame in &self.frames {
-            release(self.window, *frame);
+        for run in &self.runs {
+            release(self.window, *run);
         }
     }
 }
@@ -358,12 +371,12 @@ impl<const CAPACITY: usize> Drop for PinnedFrames<CAPACITY> {
 /// # Panics
 ///
 /// Panics when the address space refuses, for the reason
-/// [`PinnedFrames::unpin`] documents.
-fn release(window: DeviceWindow, frame: PinnedFrame) {
-    let offset = frame.offset - window.offset();
-    let virt = window.range_at(offset, frame.bytes);
+/// [`PinnedArena::unpin`] documents.
+fn release(window: DeviceWindow, run: PinnedRun) {
+    let offset = run.offset - window.offset();
+    let virt = window.range_at(offset, run.bytes);
     let hooks = device_vm_hooks();
-    let released = match frame.kind {
+    let released = match run.kind {
         PinBacking::Owned { align } => (hooks.release_contiguous)(virt, align),
         PinBacking::Shared => (hooks.unmap_shared)(virt),
         PinBacking::Device => (hooks.unmap_device)(virt),

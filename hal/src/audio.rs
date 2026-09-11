@@ -667,14 +667,22 @@ pub type AudioResult<T> = Result<T, AudioError>;
 
 /// A device that plays PCM audio.
 ///
-/// The three queries are asked of the device rather than read from a
-/// snapshot because a jack's connected state changes underneath them: a
-/// plug pulled is an event, and the answer after it is different from
-/// the answer before.
+/// The two asynchronous queries are asked of the device rather than
+/// read from a snapshot because a jack's connected state changes
+/// underneath them: a plug pulled is an event, and the answer after it
+/// is different from the answer before. The stream topology is the
+/// exception and is read straight back, because it is silicon.
 pub trait PlaybackDevice: Send + Sync + 'static {
     /// Every stream the device presents, capture streams included, so a
     /// caller can see the whole device rather than the half it may use.
-    fn streams(&self) -> impl Future<Output = AudioResult<StreamList>> + Send + '_;
+    ///
+    /// The one query that is not a round trip. A stream's direction,
+    /// its formats, its rates and its channel range are properties of
+    /// the silicon: the device answered them once, while it was brought
+    /// up, and no later answer can differ. What does change underneath
+    /// a caller is a jack's connected state, which is why that one is
+    /// asked for again every time.
+    fn stream_topology(&self) -> &StreamList;
 
     /// Every jack the device presents, with its connected state as of
     /// this call.
@@ -705,10 +713,24 @@ pub trait PlaybackDevice: Send + Sync + 'static {
 
     /// Stops the stream's clock, keeping everything
     /// [`PlaybackDevice::prepare`] allocated.
+    ///
+    /// Stopping is the clock alone: writes the device still holds stay
+    /// outstanding until [`PlaybackDevice::release`] completes them.
     fn stop(&self, stream: StreamId) -> impl Future<Output = AudioResult<()>> + Send + '_;
 
-    /// Hands back everything [`PlaybackDevice::prepare`] allocated. The
-    /// stream keeps its parameters and can be prepared again.
+    /// Hands back everything [`PlaybackDevice::prepare`] allocated, and
+    /// completes every [`PlaybackDevice::write`] it still holds first.
+    ///
+    /// The ordering is the load-bearing half of the contract: the
+    /// device may not answer `release` while a write it took is still
+    /// outstanding, so when the future resolves every one of them has
+    /// already resolved, and a caller settling its own in-flight writes
+    /// afterwards cannot park on a completion that is never coming.
+    /// The stream keeps its parameters and can be prepared again.
+    ///
+    /// A device that cannot promise this cannot implement the trait; a
+    /// `release` that failed made the promise to no one, and what the
+    /// device still holds is then the device's to account for.
     fn release(&self, stream: StreamId) -> impl Future<Output = AudioResult<()>> + Send + '_;
 
     /// Hands the device one period of samples.
@@ -740,8 +762,8 @@ pub trait PlaybackDevice: Send + Sync + 'static {
 /// so the shared handle satisfies the contract without every backend
 /// writing the same eleven forwarding methods.
 impl<Device: PlaybackDevice + ?Sized> PlaybackDevice for alloc::sync::Arc<Device> {
-    fn streams(&self) -> impl Future<Output = AudioResult<StreamList>> + Send + '_ {
-        Device::streams(self)
+    fn stream_topology(&self) -> &StreamList {
+        Device::stream_topology(self)
     }
 
     fn jacks(&self) -> impl Future<Output = AudioResult<JackList>> + Send + '_ {

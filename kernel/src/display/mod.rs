@@ -46,13 +46,31 @@ mod tests;
 use helios_hal::display::MAX_SCANOUTS;
 use thiserror::Error;
 
-use crate::pins::{MAX_PINNED_FRAMES, PinError, PinnedFrames};
-
-/// The arena one display claim pins its frame buffers in.
-pub type DisplayPins = PinnedFrames<MAX_PINNED_FRAMES>;
+use crate::pins::{PinError, PinnedArena, PinnedRun};
 
 pub use instance::DisplayOwnership;
 pub use owner::install_display_device;
+
+/// Frame buffers one claim may hold at once, cursor planes included.
+///
+/// A compositor builds its surfaces once and presents into them; the
+/// bound is what keeps the arena a value on the store's own stack rather
+/// than an allocation whose size a guest chooses.
+pub const MAX_PINNED_FRAMES: usize = 16;
+
+/// The display window of one instance, as a bump arena.
+///
+/// A display frame buffer is the claiming instance's own memory —
+/// pinned, physically contiguous pages committed from the user pool and
+/// placed at a fixed offset inside that instance's linear memory — so
+/// it is [`PinnedArena`] with the display's own bound on how many runs
+/// one claim may hold. Nothing is copied through the kernel on the way
+/// to the screen, and nothing the kernel owns grows when a compositor
+/// asks for a larger surface.
+pub type DisplayPins = PinnedArena<MAX_PINNED_FRAMES>;
+
+/// One pinned, physically contiguous frame buffer.
+pub type PinnedFrame = PinnedRun;
 pub(crate) use service::{ControlRequest, CursorRequest};
 pub use service::{
     DisplayClaim, DisplaySender, DisplayService, FrameToken, REQUEST_QUEUE_DEPTH, SequenceSignal,
@@ -108,13 +126,15 @@ pub enum DisplayServiceError {
     Closed,
 }
 
+/// A frame buffer the arena refused, in the vocabulary a compositor
+/// acts on.
 impl From<PinError> for DisplayServiceError {
     fn from(error: PinError) -> Self {
         match error {
-            // A frame of no pixels is a mode the display engine does not
-            // drive, which is what the caller named.
-            PinError::Empty => Self::UnsupportedMode,
-            PinError::TooMany => Self::TooManySurfaces,
+            // A mode with no pixels in it is a mode no display engine
+            // drives, which is the answer a compositor can act on.
+            PinError::EmptyRun => Self::UnsupportedMode,
+            PinError::TooManyRuns => Self::TooManySurfaces,
             PinError::WindowExhausted => Self::WindowExhausted,
             PinError::OutOfMemory => Self::OutOfMemory,
             // A display claim never asks for a view of somebody else's

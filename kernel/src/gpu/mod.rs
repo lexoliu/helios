@@ -51,7 +51,7 @@ mod tests;
 use helios_hal::display::Gpu3dError;
 use thiserror::Error;
 
-use crate::pins::{PinError, PinnedFrames};
+use crate::pins::{PinError, PinnedArena};
 
 /// Pinned runs one 3D claim may hold at once.
 ///
@@ -69,7 +69,7 @@ pub const MAX_GPU_BLOBS: usize = 32;
 
 /// The arena one 3D claim pins its command buffers and maps its host
 /// blobs in.
-pub type GpuPins = PinnedFrames<MAX_GPU_PINS>;
+pub type GpuPins = PinnedArena<MAX_GPU_PINS>;
 
 pub use instance::Gpu3dOwnership;
 pub use owner::install_gpu3d_device;
@@ -150,8 +150,8 @@ impl From<PinError> for Gpu3dServiceError {
         match error {
             // A command buffer of no bytes is not a command buffer, and
             // neither is a blob of none.
-            PinError::Empty => Self::InvalidBlob,
-            PinError::TooMany => Self::TooManyBlobs,
+            PinError::EmptyRun => Self::InvalidBlob,
+            PinError::TooManyRuns => Self::TooManyBlobs,
             PinError::WindowExhausted => Self::WindowExhausted,
             PinError::OutOfMemory => Self::OutOfMemory,
             // A 3D claim asks for a second view of somebody else's run

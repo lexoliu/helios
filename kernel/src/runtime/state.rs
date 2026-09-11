@@ -84,6 +84,10 @@ struct RuntimeStateInner<ProgramService, NetworkService, HostFsService> {
     /// `helios:system/surface` answers `unavailable` rather than
     /// trapping.
     compositor: ProviderSlot<crate::surface::SurfaceRequest>,
+    /// The machine's sound device, once the backend brought it up and
+    /// the kernel took ownership of it. Empty on a machine with none,
+    /// where a claim is refused rather than trapping.
+    audio_service: Once<crate::audio::AudioService>,
     /// What the platform's IOMMU confines, once the backend has built
     /// the domains. Empty on a machine whose devices are not behind one.
     iommu_report: Once<alloc::sync::Arc<crate::IommuReport>>,
@@ -320,6 +324,7 @@ where
                 gpu3d_service: Once::new(),
                 surface_service: crate::surface::SurfaceService::new(),
                 compositor: ProviderSlot::new(),
+                audio_service: Once::new(),
                 vsock_service: Once::new(),
                 futex_table: Mutex::new(FutexTable::new()),
                 bootfs: Mutex::new(embedded_init().map(|init| init.bootfs())),
@@ -831,6 +836,26 @@ where
         &self.inner.compositor
     }
 
+    /// Publishes the machine's sound device.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a second device is installed. One machine's sound
+    /// device is brought up once, and a second would leave two answers
+    /// to `available` and two claim words per stream.
+    pub fn install_audio_service(&self, service: crate::audio::AudioService) {
+        let mut installed = false;
+        self.inner.audio_service.call_once(|| {
+            installed = true;
+            service
+        });
+        assert!(installed, "the audio service was installed twice");
+    }
+
+    pub fn audio_service(&self) -> Option<crate::audio::AudioService> {
+        self.inner.audio_service.get().cloned()
+    }
+
     /// Publishes the root DRBG the backend seeded at boot.
     pub fn install_root_entropy(&self, root: RootEntropyHandle) {
         let mut installed = false;
@@ -998,6 +1023,12 @@ where
                 .get()
                 .map(crate::input::InputService::snapshot)
                 .unwrap_or_default(),
+            audio: self
+                .inner
+                .audio_service
+                .get()
+                .map(crate::audio::AudioService::snapshot)
+                .unwrap_or_default(),
         }
     }
 }
@@ -1057,6 +1088,10 @@ where
 
     fn surface_service(&self) -> crate::surface::SurfaceService {
         RuntimeState::surface_service(self)
+    }
+
+    fn audio_service(&self) -> Option<crate::audio::AudioService> {
+        RuntimeState::audio_service(self)
     }
 
     fn profiling_enabled(&self) -> bool {

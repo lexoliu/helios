@@ -4,10 +4,12 @@
 //! link the WIT interfaces they use: `fs`, `http`, `http-handler`, `io`,
 //! `net`, `programs`, `serial`, `stats`, `sync`, `task`, `tracing`,
 //! `profiling`, `instances`, `display`, `gpu`, `input`, `surface`,
-//! `compositor`, `vsock`, and `channel`. `bindings` exposes the raw generated WIT
+//! `compositor`, `audio`, `vsock`, and `channel`. `bindings` exposes the raw generated WIT
 //! bindings for anything the typed helpers do not cover, and
 //! [`main`](macro@main) wraps a program's async entry point.
 
+#[cfg(feature = "audio")]
+pub mod audio;
 pub mod bindings;
 #[cfg(feature = "channel")]
 pub mod channel;

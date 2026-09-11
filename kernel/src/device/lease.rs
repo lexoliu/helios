@@ -80,6 +80,20 @@ pub const DISPLAY_WINDOW_BYTES: u64 = 256 << 20;
 /// the larger: sixty-four windows of the sizes a desktop hands out. It
 /// costs an instance nothing until it asks for its first surface.
 pub const SURFACE_WINDOW_BYTES: u64 = 256 << 20;
+/// Bytes immediately below the display window the kernel keeps for the
+/// period buffers of an instance that holds a playback stream.
+///
+/// A sound stream's period buffers want exactly what a display's frame
+/// buffers want — pinned, physically contiguous pages at a fixed offset
+/// in the instance's own linear memory, above everything the instance
+/// can grow into — so it is the same mechanism with a window of its
+/// own rather than a second cursor into one arena. Sized well past what
+/// a stream asks for: the widest format the playback contract names, at
+/// its highest rate and its largest channel count, is about a megabyte
+/// of periods, and the rest is room for an instance that renegotiates
+/// its format many times over. The window costs an instance nothing
+/// until it claims a stream.
+pub const AUDIO_WINDOW_BYTES: u64 = 8 << 20;
 
 /// Bytes of a linear-memory reservation the kernel keeps for the
 /// renderer state of an instance that drives the machine's 3D engine.
