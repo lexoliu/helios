@@ -413,29 +413,39 @@ macro_rules! impl_program_bindings {
                     let (service, context, caller_authority, cpu) = snapshot?;
                     let mut launch = phases::Trace::begin(cpu, "spawn", &request.path);
                     let Some(service) = service else {
+                        launch.refused(ProgramExecErrorKind::Unavailable);
                         return Ok(Err($bindings::helios::system::programs::SpawnError {
                             kind: $bindings::helios::system::programs::SpawnErrorKind::Unavailable,
                             detail: "program spawn is unavailable on this machine".to_owned(),
                         }));
                     };
                     if let Err(error) = require_spawn_authority(&caller_authority) {
+                        launch.refused(error.kind);
                         return Ok(Err($convert_error(error)));
                     }
                     let child_authority =
                         match $build_authority(&caller_authority, request.capability_grants) {
                             Ok(authority) => authority,
-                            Err(error) => return Ok(Err($convert_error(error))),
+                            Err(error) => {
+                                launch.refused(error.kind);
+                                return Ok(Err($convert_error(error)));
+                            }
                         };
                     let source =
                         match read_program_source(accessor, &request.path, &caller_authority).await
                         {
                             Ok(Ok(source)) => source,
-                            Ok(Err(error)) => return Ok(Err($convert_error(error))),
+                            Ok(Err(error)) => {
+                                launch.exit_error(&error);
+                                return Ok(Err($convert_error(error)));
+                            }
                             Err(error) => {
-                                return Ok(Err($convert_error(map_program_host_error(
+                                let error = map_program_host_error(
                                     ProgramHostOperation::ReadSpawnSource,
                                     error,
-                                ))));
+                                );
+                                launch.exit_error(&error);
+                                return Ok(Err($convert_error(error)));
                             }
                         };
                     launch.record(LaunchPhase::SourceRead);
@@ -457,6 +467,10 @@ macro_rules! impl_program_bindings {
                     {
                         Ok(child) => {
                             launch.set_instance(child.instance_id);
+                            // The child's run task owns the line from
+                            // here — even a handle-push failure below is
+                            // the reply's problem, not the launch's.
+                            launch.disarm();
                             let handle = accessor.with(|mut access| {
                                 access
                                     .get()
@@ -466,14 +480,12 @@ macro_rules! impl_program_bindings {
                             })?;
                             Ok(Ok(handle))
                         }
-                        Err(error) => Ok(Err($convert_error(error))),
+                        Err(error) => {
+                            launch.exit_error(&error);
+                            Ok(Err($convert_error(error)))
+                        }
                     };
                     launch.record(LaunchPhase::Reply);
-                    // A spawned launch's line is the run task's to
-                    // emit; only a failed spawn leaves this guard armed.
-                    if matches!(spawned, Ok(Ok(_))) {
-                        launch.disarm();
-                    }
                     spawned
                 }
             }
@@ -501,29 +513,39 @@ macro_rules! impl_program_bindings {
                     let (service, context, caller_authority, cpu) = snapshot?;
                     let launch = phases::Trace::begin(cpu, "exec", &request.path);
                     let Some(service) = service else {
+                        launch.refused(ProgramExecErrorKind::Unavailable);
                         return Ok(Err($bindings::helios::system::programs::ExecError {
                             kind: $bindings::helios::system::programs::ExecErrorKind::Unavailable,
                             detail: "program exec is unavailable on this machine".to_owned(),
                         }));
                     };
                     if let Err(error) = require_exec_authority(&caller_authority) {
+                        launch.refused(error.kind);
                         return Ok(Err($convert_error(error)));
                     }
                     let child_authority =
                         match $build_authority(&caller_authority, request.capability_grants) {
                             Ok(authority) => authority,
-                            Err(error) => return Ok(Err($convert_error(error))),
+                            Err(error) => {
+                                launch.refused(error.kind);
+                                return Ok(Err($convert_error(error)));
+                            }
                         };
                     let source =
                         match read_program_source(accessor, &request.path, &caller_authority).await
                         {
                             Ok(Ok(source)) => source,
-                            Ok(Err(error)) => return Ok(Err($convert_error(error))),
+                            Ok(Err(error)) => {
+                                launch.exit_error(&error);
+                                return Ok(Err($convert_error(error)));
+                            }
                             Err(error) => {
-                                return Ok(Err($convert_error(map_program_host_error(
+                                let error = map_program_host_error(
                                     ProgramHostOperation::ReadExecSource,
                                     error,
-                                ))));
+                                );
+                                launch.exit_error(&error);
+                                return Ok(Err($convert_error(error)));
                             }
                         };
                     launch.record(LaunchPhase::SourceRead);
@@ -554,17 +576,20 @@ macro_rules! impl_program_bindings {
                             )
                             .with_timeline(launch.timeline().clone()),
                         )
-                        .await
-                        .map($convert_result)
-                        .map_err($convert_error);
-                    if let Ok(result) = &executed {
-                        launch.set_instance(InstanceId::from_raw(result.instance_id));
+                        .await;
+                    match &executed {
+                        Ok(result) => launch.set_instance(result.instance_id),
+                        // The run task already marked the end for a
+                        // failure it produced — a guest trap — and an
+                        // error this task produced, like the load, is
+                        // the mark itself.
+                        Err(error) => launch.exit_error(error),
                     }
                     launch.record(LaunchPhase::Reply);
                     // The guard stays armed: it drops here and emits
                     // the line — `reply` included — for an exec the
                     // run task does not own emission.
-                    Ok(executed)
+                    Ok(executed.map($convert_result).map_err($convert_error))
                 }
             }
 

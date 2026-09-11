@@ -28,6 +28,16 @@
 //! Every slot is written exactly once by exactly one task, so the
 //! slots are bare `AtomicU64`s and emit is an acquire read of each.
 //!
+//! Every launch that recorded `rpc-arrival` ends its line with a
+//! terminal [`LaunchEnd`]: `completed`, `refused`, or `failed`, with
+//! the `error_kind` (a [`ProgramExecErrorKind`] name) or `errno` the
+//! exit carried. The caller-side [`Trace`] emits on drop, so each
+//! early return is the terminal record; the run task's
+//! [`TaskTrace::finish`] marks the outcome the run produced — a guest
+//! trap is `failed` with its kind — and the `instance` field carries
+//! whichever id the launch last registered, so a trapped launch still
+//! names its instance.
+//!
 //! Off costs one `enabled` check at [`Timeline::begin`] and one
 //! `Option` branch per boundary: the slots exist only when the target
 //! was enabled at `rpc-arrival`, so no timestamp is read and no
@@ -36,11 +46,12 @@
 
 use alloc::string::String;
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU64, Ordering};
 
 use helios_hal::cpu::Cpu;
 
 use super::monotonic_nanos;
+use crate::{ProgramExecError, ProgramExecErrorKind};
 
 /// The `tracing` target the one-line launch report is emitted under.
 ///
@@ -50,12 +61,19 @@ use super::monotonic_nanos;
 pub(crate) const TARGET: &str = "helios_kernel::exec::phases";
 
 /// The session gate for [`TARGET`], registered in
-/// [`crate::log::DIAGNOSTIC_TARGETS`].
+/// [`crate::log::DIAGNOSTIC_TARGETS`]. A runtime flip needs a globally
+/// reachable flag because the subscriber's concrete type is erased at
+/// install — the linkage contract this is one half of is documented in
+/// `kernel/src/log.rs`'s module doc.
 pub(crate) static GATE: crate::log::DiagnosticTarget = crate::log::DiagnosticTarget::new(TARGET);
 
 /// A slot the launch never recorded keeps this value; `emit` treats
 /// it as "the launch ended before this phase" and omits the field.
 const UNRECORDED: u64 = u64::MAX;
+
+/// The `errno` slot's unset marker — a launch's `errno` field exists
+/// only on an errno-shaped syscall exit.
+const ERRNO_UNSET: i32 = i32::MIN;
 
 /// One boundary a launch crosses, named for the work it completes.
 ///
@@ -72,7 +90,8 @@ pub(crate) enum LaunchPhase {
     /// The program's bytes were read out of its source.
     SourceRead,
     /// The artifact's trust was established — the bootfs trailer parse,
-    /// or the signature check for a signed artifact.
+    /// the signature check for a signed artifact, or — on a raw-wasm
+    /// source — the whole in-kernel compile+sign the trust step runs.
     ArtifactTrust,
     /// The deserialize cache answered. Its `hit` lands in the line's
     /// `cache_hit` field.
@@ -203,6 +222,35 @@ impl LaunchPhase {
     }
 }
 
+/// How a launch's timeline ended — the `end` field of the emitted
+/// line. Every exit of a launch that passed `rpc-arrival` records one:
+/// the run task for the outcome it produced, the launch-call task for
+/// an exit that never reached the run task.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum LaunchEnd {
+    /// The guest ran to its exit — any exit code completes a launch.
+    Completed = 1,
+    /// The launch was refused before it ran — denied authority, an
+    /// unresolvable name, a malformed call, an unavailable service.
+    Refused = 2,
+    /// The launch was attempted and died — the source could not be
+    /// read, the load or spawn failed, the guest trapped.
+    Failed = 3,
+}
+
+impl LaunchEnd {
+    /// The terminal a [`ProgramExecErrorKind`] exit maps to: a
+    /// machinery failure is `failed`; a rejection of the call or the
+    /// program itself is a refusal.
+    pub(crate) fn of(kind: ProgramExecErrorKind) -> Self {
+        match kind {
+            ProgramExecErrorKind::OutOfMemory | ProgramExecErrorKind::Internal => Self::Failed,
+            _ => Self::Refused,
+        }
+    }
+}
+
 /// One launch's recorded phase timestamps and the identity the emitted
 /// line carries. Slots are atomic because a `spawn`'s `reply` lands on
 /// the parent's task while the child's run task holds the timeline;
@@ -213,6 +261,13 @@ pub(crate) struct LaunchTimeline {
     cache_hit: AtomicBool,
     instantiate_pre_hit: AtomicBool,
     instance: AtomicU64,
+    /// `0` until an exit marks it; stores `end as u8`.
+    end: AtomicU8,
+    /// `0` until a `ProgramExecErrorKind`-carrying exit marks it;
+    /// stores `kind.index() + 1`.
+    error_kind: AtomicU8,
+    /// [`ERRNO_UNSET`] until an errno-shaped syscall exit marks it.
+    errno: AtomicI32,
     op: &'static str,
     program: String,
 }
@@ -225,6 +280,9 @@ impl LaunchTimeline {
             cache_hit: AtomicBool::new(false),
             instantiate_pre_hit: AtomicBool::new(false),
             instance: AtomicU64::new(0),
+            end: AtomicU8::new(0),
+            error_kind: AtomicU8::new(0),
+            errno: AtomicI32::new(ERRNO_UNSET),
             op,
             program,
         }
@@ -251,6 +309,38 @@ impl LaunchTimeline {
             .count() as u64
     }
 
+    /// The `end` field's text — the recorded terminal, or the honest
+    /// reading of one nobody classified: a launch that ran to
+    /// `completion` completed; anything else failed.
+    fn end_name(&self) -> &'static str {
+        match self.end.load(Ordering::Acquire) {
+            end if end == LaunchEnd::Completed as u8 => "completed",
+            end if end == LaunchEnd::Refused as u8 => "refused",
+            end if end == LaunchEnd::Failed as u8 => "failed",
+            _ if self
+                .at_ns
+                .get(LaunchPhase::Completion.index())
+                .is_some_and(|slot| slot.load(Ordering::Acquire) != UNRECORDED) =>
+            {
+                "completed"
+            }
+            _ => "failed",
+        }
+    }
+
+    /// The `error_kind` field's name — `None` when no
+    /// `ProgramExecErrorKind`-carrying exit marked it.
+    fn error_kind_name(&self) -> Option<&'static str> {
+        let index = self.error_kind.load(Ordering::Acquire);
+        (index != 0).then(|| ProgramExecErrorKind::ALL[index as usize - 1].field_name())
+    }
+
+    /// The `errno` field — `None` when no errno-shaped exit marked it.
+    fn errno_value(&self) -> Option<i32> {
+        let errno = self.errno.load(Ordering::Acquire);
+        (errno != ERRNO_UNSET).then_some(errno)
+    }
+
     /// The one line a launch emits — every recorded phase's offset
     /// from `rpc-arrival`, written once when the launch ends so the
     /// serial cost never lands inside a measured interval.
@@ -265,6 +355,9 @@ impl LaunchTimeline {
             cache_hit = self.cache_hit.load(Ordering::Acquire),
             instantiate_pre_hit = self.instantiate_pre_hit.load(Ordering::Acquire),
             phase_count = self.recorded(),
+            end = self.end_name(),
+            error_kind = self.error_kind_name(),
+            errno = self.errno_value(),
             rpc_arrival_ns = self.offset(LaunchPhase::RpcArrival),
             source_read_ns = self.offset(LaunchPhase::SourceRead),
             trust_ns = self.offset(LaunchPhase::ArtifactTrust),
@@ -375,6 +468,34 @@ impl Timeline {
         }
     }
 
+    /// Records how the launch ended — `end` on the emitted line. Set
+    /// by whichever task knows the outcome: the run task for the
+    /// outcome it produced, the launch-call task for an exit that
+    /// never reached the run task.
+    pub(crate) fn set_end(&self, end: LaunchEnd) {
+        if let Some(timeline) = &self.inner {
+            timeline.end.store(end as u8, Ordering::Release);
+        }
+    }
+
+    /// The `error_kind` field on the emitted line — the
+    /// [`ProgramExecErrorKind`] a refused or failed exit carried.
+    pub(crate) fn set_error_kind(&self, kind: ProgramExecErrorKind) {
+        if let Some(timeline) = &self.inner {
+            timeline
+                .error_kind
+                .store(kind.index() as u8 + 1, Ordering::Release);
+        }
+    }
+
+    /// The `errno` field on the emitted line — the syscall's errno on
+    /// a refused or failed errno-shaped exit.
+    pub(crate) fn set_errno(&self, errno: i32) {
+        if let Some(timeline) = &self.inner {
+            timeline.errno.store(errno, Ordering::Release);
+        }
+    }
+
     /// Emits the launch's line — only meaningful through the handle
     /// that owns emission (a `for_task` handle in the run task, or the
     /// caller-side [`Trace`]).
@@ -396,12 +517,29 @@ impl Timeline {
 }
 
 /// The run task's end of a [`Timeline`]: drops into the line's emit.
-/// Held in a `let _guard` for the duration of the run so every exit —
-/// completion, guest error, host error — emits what the launch
-/// reached.
+/// Held for the duration of the run so every exit — completion, guest
+/// error, host error — emits what the launch reached, and
+/// [`finish`](Self::finish) records the run's outcome on the shared
+/// timeline so the emitting side (this task for `spawn`, the awaiting
+/// caller for `exec`) reads it.
 pub(crate) struct TaskTrace<CpuImpl: Cpu> {
     cpu: CpuImpl,
     timeline: Timeline,
+}
+
+impl<CpuImpl: Cpu> TaskTrace<CpuImpl> {
+    /// The run produced the launch's terminal: `completed` on any
+    /// child exit, `failed` with the error's kind on a guest trap or
+    /// host failure.
+    pub(crate) fn finish<T>(&self, outcome: &Result<T, ProgramExecError>) {
+        match outcome {
+            Ok(_) => self.timeline.set_end(LaunchEnd::Completed),
+            Err(error) => {
+                self.timeline.set_end(LaunchEnd::Failed);
+                self.timeline.set_error_kind(error.kind);
+            }
+        }
+    }
 }
 
 impl<CpuImpl: Cpu> Drop for TaskTrace<CpuImpl> {
@@ -466,6 +604,58 @@ impl<CpuImpl: Cpu> Trace<CpuImpl> {
     /// Records the instance the launch produced.
     pub(crate) fn set_instance(&self, instance: crate::InstanceId) {
         self.timeline.set_instance(instance);
+    }
+
+    /// The launch ends refused — denied authority, an unresolvable
+    /// name, a malformed call — carrying the kind. Marks nothing once
+    /// disarmed: a disarmed caller's later exits are the child's line
+    /// to print, not this launch's.
+    pub(crate) fn refused(&self, kind: ProgramExecErrorKind) {
+        if self.emit_on_drop {
+            self.timeline.set_end(LaunchEnd::Refused);
+            self.timeline.set_error_kind(kind);
+        }
+    }
+
+    /// The launch ends failed — the machinery attempted it and lost —
+    /// carrying the kind.
+    pub(crate) fn failed(&self, kind: ProgramExecErrorKind) {
+        if self.emit_on_drop {
+            self.timeline.set_end(LaunchEnd::Failed);
+            self.timeline.set_error_kind(kind);
+        }
+    }
+
+    /// The launch ends carrying an error's own kind — refused or
+    /// failed as the kind classifies it.
+    pub(crate) fn exit_error(&self, error: &ProgramExecError) {
+        if self.emit_on_drop {
+            self.timeline.set_end(LaunchEnd::of(error.kind));
+            self.timeline.set_error_kind(error.kind);
+        }
+    }
+
+    /// An errno-shaped syscall exit carrying an error's kind too —
+    /// the launch-line gets `error_kind` and `errno` both — yields the
+    /// errno back out for the `return` site.
+    pub(crate) fn exit_error_errno(&self, error: &ProgramExecError, errno: i32) -> i32 {
+        if self.emit_on_drop {
+            self.timeline.set_end(LaunchEnd::of(error.kind));
+            self.timeline.set_error_kind(error.kind);
+            self.timeline.set_errno(errno);
+        }
+        errno
+    }
+
+    /// An errno-shaped syscall exit — `end` is the call site's
+    /// classification — records the `errno` field and yields the value
+    /// back out for the `return` site.
+    pub(crate) fn exit_errno(&self, end: LaunchEnd, errno: i32) -> i32 {
+        if self.emit_on_drop {
+            self.timeline.set_end(end);
+            self.timeline.set_errno(errno);
+        }
+        errno
     }
 
     /// Hands emission to the run task: the line comes out when that
@@ -580,5 +770,154 @@ mod tests {
     fn phases_target_name_is_stable() {
         assert_eq!(TARGET, "helios_kernel::exec::phases");
         assert_eq!(GATE.name(), TARGET);
+    }
+
+    /// A subscriber that captures the emitted launch lines as
+    /// `name=value` text — the terminal tests drive launch exits and
+    /// assert what the line says about them.
+    struct Capture {
+        lines: std::sync::Mutex<alloc::vec::Vec<String>>,
+    }
+
+    struct FieldWriter(String);
+
+    impl tracing::field::Visit for FieldWriter {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn core::fmt::Debug) {
+            use core::fmt::Write;
+            let _ = write!(self.0, " {}={:?}", field.name(), value);
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            use core::fmt::Write;
+            let _ = write!(self.0, " {}={value}", field.name());
+        }
+
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            use core::fmt::Write;
+            let _ = write!(self.0, " {}={value}", field.name());
+        }
+    }
+
+    impl tracing::Subscriber for Capture {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            metadata.target() == TARGET
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut writer = FieldWriter(String::new());
+            event.record(&mut writer);
+            self.lines.lock().unwrap().push(writer.0);
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    /// A spawn refused by authority ends with a terminal line naming
+    /// the refusal — the only phase it crossed is `rpc-arrival`.
+    #[test]
+    fn a_refused_launch_ends_its_line_refused() {
+        use super::Trace;
+        use crate::ProgramExecErrorKind;
+        use crate::test_support::TestCpu;
+
+        let lines = alloc::sync::Arc::new(Capture {
+            lines: std::sync::Mutex::new(alloc::vec::Vec::new()),
+        });
+        let captured = lines.clone();
+        tracing::subscriber::with_default(captured, || {
+            let trace = Trace::begin(TestCpu::without_entropy(), "spawn", "/bin/python3");
+            trace.refused(ProgramExecErrorKind::PermissionDenied);
+            drop(trace);
+        });
+
+        let lines = lines.lines.lock().unwrap();
+        assert_eq!(lines.len(), 1, "one launch emits one line");
+        let line = &lines[0];
+        assert!(line.contains("end=refused"), "line was: {line}");
+        assert!(
+            line.contains("error_kind=permission-denied"),
+            "line was: {line}"
+        );
+        assert!(line.contains("rpc_arrival_ns=0"), "line was: {line}");
+        // A phase the launch never reached leaves no field at all.
+        assert!(!line.contains("completion_ns"), "line was: {line}");
+    }
+
+    /// A guest that traps between `guest-end` and `completion` ends
+    /// its line `failed` with the error's kind — the run task's
+    /// `finish` marks what the run produced and the guard emits it.
+    #[test]
+    fn a_trapping_guest_ends_its_line_failed() {
+        use super::{LaunchPhase, Trace};
+        use crate::test_support::TestCpu;
+        use crate::{ProgramExecError, ProgramExecErrorDetail, ProgramExecErrorKind};
+
+        let lines = alloc::sync::Arc::new(Capture {
+            lines: std::sync::Mutex::new(alloc::vec::Vec::new()),
+        });
+        let captured = lines.clone();
+        tracing::subscriber::with_default(captured, || {
+            let mut trace = Trace::begin(TestCpu::without_entropy(), "exec", "/bin/python3");
+            let task = trace.timeline().for_task();
+            {
+                let guard = task.task_guard(TestCpu::without_entropy());
+                task.record(&TestCpu::without_entropy(), LaunchPhase::TaskBegin);
+                task.record(&TestCpu::without_entropy(), LaunchPhase::GuestBegin);
+                task.record(&TestCpu::without_entropy(), LaunchPhase::GuestEnd);
+                guard.finish(&Err::<(), ProgramExecError>(ProgramExecError {
+                    kind: ProgramExecErrorKind::Internal,
+                    detail: ProgramExecErrorDetail::InternalInvariant,
+                }));
+            }
+            trace.disarm();
+        });
+
+        let lines = lines.lines.lock().unwrap();
+        assert_eq!(lines.len(), 1, "one launch emits one line");
+        let line = &lines[0];
+        assert!(line.contains("end=failed"), "line was: {line}");
+        assert!(line.contains("error_kind=internal"), "line was: {line}");
+        assert!(line.contains("guest_end_ns=0"), "line was: {line}");
+        assert!(!line.contains("completion_ns"), "line was: {line}");
+    }
+
+    /// A run that produced a child exit ends its line `completed` —
+    /// `TaskTrace::finish` marks the outcome the run task produced.
+    #[test]
+    fn a_finished_run_ends_its_line_completed() {
+        use super::{LaunchPhase, Trace};
+        use crate::test_support::TestCpu;
+
+        let lines = alloc::sync::Arc::new(Capture {
+            lines: std::sync::Mutex::new(alloc::vec::Vec::new()),
+        });
+        let captured = lines.clone();
+        tracing::subscriber::with_default(captured, || {
+            let mut trace = Trace::begin(TestCpu::without_entropy(), "spawn", "/bin/dash");
+            let task = trace.timeline().for_task();
+            {
+                let guard = task.task_guard(TestCpu::without_entropy());
+                task.record(&TestCpu::without_entropy(), LaunchPhase::TaskBegin);
+                task.record(&TestCpu::without_entropy(), LaunchPhase::Completion);
+                guard.finish(&Ok::<(), crate::ProgramExecError>(()));
+            }
+            trace.disarm();
+        });
+
+        let lines = lines.lines.lock().unwrap();
+        assert_eq!(lines.len(), 1, "one launch emits one line");
+        let line = &lines[0];
+        assert!(line.contains("end=completed"), "line was: {line}");
+        assert!(line.contains("completion_ns=0"), "line was: {line}");
     }
 }

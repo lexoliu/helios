@@ -27,6 +27,48 @@ pub enum ProgramExecErrorKind {
     Internal,
 }
 
+impl ProgramExecErrorKind {
+    /// Every kind, in one order — the launch timeline's `error_kind`
+    /// slot stores the index into it.
+    pub(crate) const ALL: [Self; 10] = [
+        Self::InvalidBinary,
+        Self::MissingEntry,
+        Self::UnsupportedImport,
+        Self::InvalidSignature,
+        Self::InvalidPath,
+        Self::PermissionDenied,
+        Self::InvalidHint,
+        Self::OutOfMemory,
+        Self::Unavailable,
+        Self::Internal,
+    ];
+
+    /// The `error_kind` name the launch-phase line prints.
+    pub(crate) fn field_name(self) -> &'static str {
+        match self {
+            Self::InvalidBinary => "invalid-binary",
+            Self::MissingEntry => "missing-entry",
+            Self::UnsupportedImport => "unsupported-import",
+            Self::InvalidSignature => "invalid-signature",
+            Self::InvalidPath => "invalid-path",
+            Self::PermissionDenied => "permission-denied",
+            Self::InvalidHint => "invalid-hint",
+            Self::OutOfMemory => "out-of-memory",
+            Self::Unavailable => "unavailable",
+            Self::Internal => "internal",
+        }
+    }
+
+    /// The index this kind's name is stored under in a
+    /// [`crate::exec::phases::LaunchTimeline`].
+    pub(crate) fn index(self) -> usize {
+        Self::ALL
+            .iter()
+            .position(|entry| *entry == self)
+            .expect("every kind is listed")
+    }
+}
+
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 #[error(
     "program memory request of {requested_bytes} bytes exceeds its memory budget: available={available_bytes} of {pool_bytes} reserved={reserved_bytes}"

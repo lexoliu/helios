@@ -1709,6 +1709,45 @@ where
     wasix_call_asyncify_start_unwind(caller, stack_lower).await
 }
 
+/// The launch line's terminal for an errno-shaped exit: resource
+/// failures are failures; every other errno exit refused the call.
+fn launch_end_for_errno(errno: i32) -> phases::LaunchEnd {
+    match errno {
+        p1::errno::IO | p1::errno::NOMEM => phases::LaunchEnd::Failed,
+        _ => phases::LaunchEnd::Refused,
+    }
+}
+
+/// Marks `trace`'s terminal for an errno return site and yields the
+/// errno back out for the `return`.
+fn launch_exit_errno<CpuImpl: Cpu>(trace: &phases::Trace<CpuImpl>, errno: i32) -> i32 {
+    trace.exit_errno(launch_end_for_errno(errno), errno)
+}
+
+/// Marks `trace`'s terminal for a launch-path error — the
+/// `ProgramExecError`'s own kind when it carries one, `internal`
+/// otherwise.
+fn launch_exit_error<CpuImpl: Cpu>(trace: &phases::Trace<CpuImpl>, error: &wasmtime::Error) {
+    match error.downcast_ref::<ProgramExecError>() {
+        Some(error) => trace.exit_error(error),
+        None => trace.failed(ProgramExecErrorKind::Internal),
+    }
+}
+
+/// Marks `trace`'s terminal for a launch-path error on an errno
+/// return site — `error_kind` and `errno` both when the error carries
+/// a kind — and yields the errno back out for the `return`.
+fn launch_exit_error_errno<CpuImpl: Cpu>(
+    trace: &phases::Trace<CpuImpl>,
+    error: &wasmtime::Error,
+) -> i32 {
+    let errno = p1_errno_from_wasmtime_error(error);
+    match error.downcast_ref::<ProgramExecError>() {
+        Some(error) => trace.exit_error_errno(error, errno),
+        None => trace.exit_errno(launch_end_for_errno(errno), errno),
+    }
+}
+
 pub(super) async fn wasix_proc_exec<CpuImpl, Net, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     name: u32,
@@ -1722,13 +1761,6 @@ where
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    let status = caller.data().require_exec_authority();
-    if status != p1::errno::SUCCESS {
-        return Err(wasmtime::Error::new(ProgramExecError {
-            kind: ProgramExecErrorKind::PermissionDenied,
-            detail: ProgramExecErrorDetail::ProcessAuthorityDenied,
-        }));
-    }
     let Some(memory) = p1_memory(caller) else {
         return Err(wasmtime::Error::new(ProgramExecError {
             kind: ProgramExecErrorKind::InvalidBinary,
@@ -1742,7 +1774,21 @@ where
         .flatten()
         .unwrap_or_default();
     let mut trace = phases::Trace::begin(caller.data().cpu.clone(), "exec", &program);
-    let prepared = wasix_prepare_program(caller, memory, name, name_len).await?;
+    let status = caller.data().require_exec_authority();
+    if status != p1::errno::SUCCESS {
+        trace.refused(ProgramExecErrorKind::PermissionDenied);
+        return Err(wasmtime::Error::new(ProgramExecError {
+            kind: ProgramExecErrorKind::PermissionDenied,
+            detail: ProgramExecErrorDetail::ProcessAuthorityDenied,
+        }));
+    }
+    let prepared = match wasix_prepare_program(caller, memory, name, name_len).await {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            launch_exit_error(&trace, &error);
+            return Err(error);
+        }
+    };
     trace.record(LaunchPhase::SourceRead);
     trace.record_source_bytes(prepared.source.payload_len());
     // Emission hands to the exec path's own guard.
@@ -1776,7 +1822,8 @@ where
     let mut trace = phases::Trace::adopt(caller.data().cpu.clone(), timeline);
     let argv = wasix_read_exec_string(caller, memory, args, args_len)
         .map(|value| wasix_split_lines(&value))
-        .map_err(wasmtime::Error::new)?;
+        .map_err(wasmtime::Error::new)
+        .inspect_err(|error| launch_exit_error(&trace, error))?;
     let argv = ProgramArgv::from_caller(&prepared.guest_name, argv);
     let mut environment = match env {
         Some((ptr, len)) => wasix_read_exec_string(caller, memory, ptr, len)
@@ -1791,12 +1838,12 @@ where
         .data()
         .runtime_state
         .program_service()
-        .ok_or_else(|| {
-            wasmtime::Error::new(ProgramExecError {
-                kind: ProgramExecErrorKind::Unavailable,
-                detail: ProgramExecErrorDetail::HostOperationFailed,
-            })
-        })?;
+        .ok_or(ProgramExecError {
+            kind: ProgramExecErrorKind::Unavailable,
+            detail: ProgramExecErrorDetail::HostOperationFailed,
+        })
+        .inspect_err(|error| trace.exit_error(error))
+        .map_err(wasmtime::Error::new)?;
     let exec_context = caller.data().exec_context();
     let authority = caller.data().authority.clone();
     let descriptors = caller.data().descriptors.clone_for_exec();
@@ -1813,7 +1860,8 @@ where
             trace.timeline(),
         )
         .await
-        .map_err(wasmtime::Error::new)?;
+        .map_err(wasmtime::Error::new)
+        .inspect_err(|error| launch_exit_error(&trace, error))?;
     // The reply of an exec is the replacement itself: the call returns
     // by unwinding the calling instance into the new program, which
     // then owns the timeline's emit at its completion.
@@ -1889,13 +1937,6 @@ where
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    let status = caller.data().require_exec_authority();
-    if status != p1::errno::SUCCESS {
-        return Err(wasmtime::Error::new(ProgramExecError {
-            kind: ProgramExecErrorKind::PermissionDenied,
-            detail: ProgramExecErrorDetail::ProcessAuthorityDenied,
-        }));
-    }
     let Some(memory) = p1_memory(caller) else {
         return Err(wasmtime::Error::new(ProgramExecError {
             kind: ProgramExecErrorKind::InvalidBinary,
@@ -1906,7 +1947,15 @@ where
         .flatten()
         .unwrap_or_default();
     let mut trace = phases::Trace::begin(caller.data().cpu.clone(), "exec", &program);
-    let prepared = wasix_prepare_program_with_search(
+    let status = caller.data().require_exec_authority();
+    if status != p1::errno::SUCCESS {
+        trace.refused(ProgramExecErrorKind::PermissionDenied);
+        return Err(wasmtime::Error::new(ProgramExecError {
+            kind: ProgramExecErrorKind::PermissionDenied,
+            detail: ProgramExecErrorDetail::ProcessAuthorityDenied,
+        }));
+    }
+    let prepared = match wasix_prepare_program_with_search(
         caller,
         memory,
         name,
@@ -1915,7 +1964,14 @@ where
         path,
         path_len,
     )
-    .await?;
+    .await
+    {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            launch_exit_error(&trace, &error);
+            return Err(error);
+        }
+    };
     trace.record(LaunchPhase::SourceRead);
     trace.record_source_bytes(prepared.source.payload_len());
     trace.disarm();
@@ -1997,44 +2053,53 @@ where
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    let status = caller.data().require_spawn_authority();
-    if status != p1::errno::SUCCESS {
-        return status;
-    }
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
+    // The boundary lands at the argv decode — before the chroot,
+    // preopen and cwd work — symmetric with `proc_spawn2` and
+    // `proc_exec`.
+    let argv = match wasix_read_exec_string(caller, memory, args, args_len) {
+        Ok(value) => wasix_split_lines(&value),
+        Err(_) => return p1::errno::FAULT,
+    };
+    let program = phases::gated(|| argv.first().cloned().unwrap_or_default()).unwrap_or_default();
+    let mut trace = phases::Trace::begin(caller.data().cpu.clone(), "spawn", &program);
+    let status = caller.data().require_spawn_authority();
+    if status != p1::errno::SUCCESS {
+        return launch_exit_errno(&trace, status);
+    }
     let chroot = match chroot {
         0 => false,
         1 => true,
-        _ => return p1::errno::INVAL,
+        _ => return launch_exit_errno(&trace, p1::errno::INVAL),
     };
     let mut authority = if preopen_len == 0 {
         if chroot {
-            return p1::errno::INVAL;
+            return launch_exit_errno(&trace, p1::errno::INVAL);
         }
         caller.data().authority.clone()
     } else {
         let preopen = match wasix_read_exec_string(caller, memory, preopen, preopen_len) {
             Ok(preopen) => preopen,
-            Err(_) => return p1::errno::FAULT,
+            Err(_) => return launch_exit_errno(&trace, p1::errno::FAULT),
         };
         match wasix_proc_spawn_preopen_authority(caller.data(), &preopen, chroot) {
             Ok(authority) => authority,
-            Err(errno) => return errno,
+            Err(errno) => return launch_exit_errno(&trace, errno),
         }
     };
     if working_dir_len != 0 {
         let working_dir = match wasix_read_exec_string(caller, memory, working_dir, working_dir_len)
         {
             Ok(working_dir) => working_dir,
-            Err(_) => return p1::errno::FAULT,
+            Err(_) => return launch_exit_errno(&trace, p1::errno::FAULT),
         };
         if !working_dir.is_empty() && working_dir != "." {
             let cwd =
                 match wasix_proc_spawn_resolve_child_cwd(caller.data(), &authority, &working_dir) {
                     Ok(cwd) => cwd,
-                    Err(errno) => return errno,
+                    Err(errno) => return launch_exit_errno(&trace, errno),
                 };
             let cap = match authority.derive_directory_cap(
                 &cwd.descriptor.path,
@@ -2042,20 +2107,14 @@ where
                 descriptor_flags_to_directory_authority(cwd.descriptor.flags),
             ) {
                 Ok(cap) => cap,
-                Err(_) => return p1::errno::NOTCAPABLE,
+                Err(_) => return launch_exit_errno(&trace, p1::errno::NOTCAPABLE),
             };
             authority.chdir(cap);
         }
     }
-    let argv = match wasix_read_exec_string(caller, memory, args, args_len) {
-        Ok(value) => wasix_split_lines(&value),
-        Err(_) => return p1::errno::FAULT,
-    };
-    let program = phases::gated(|| argv.first().cloned().unwrap_or_default()).unwrap_or_default();
-    let mut trace = phases::Trace::begin(caller.data().cpu.clone(), "spawn", &program);
     let prepared = match wasix_prepare_program(caller, memory, name, name_len).await {
         Ok(prepared) => prepared,
-        Err(error) => return p1_errno_from_wasmtime_error(&error),
+        Err(error) => return launch_exit_error_errno(&trace, &error),
     };
     trace.record(LaunchPhase::SourceRead);
     trace.record_source_bytes(prepared.source.payload_len());
@@ -2075,7 +2134,7 @@ where
     .await
     {
         Ok(result) => result,
-        Err(errno) => return errno,
+        Err(errno) => return launch_exit_errno(&trace, errno),
     };
     wasix_write_process_handles(caller, memory, ret_handles, result)
 }
@@ -2303,10 +2362,6 @@ where
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    let status = caller.data().require_spawn_authority();
-    if status != p1::errno::SUCCESS {
-        return status;
-    }
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
@@ -2316,12 +2371,16 @@ where
     };
     let program = phases::gated(|| argv.first().cloned().unwrap_or_default()).unwrap_or_default();
     let mut trace = phases::Trace::begin(caller.data().cpu.clone(), "spawn", &program);
+    let status = caller.data().require_spawn_authority();
+    if status != p1::errno::SUCCESS {
+        return launch_exit_errno(&trace, status);
+    }
     let environment = if env == 0 && env_len == 0 {
         None
     } else {
         match wasix_read_exec_string(caller, memory, env, env_len) {
             Ok(value) => Some(wasix_split_environment(&value)),
-            Err(_) => return p1::errno::FAULT,
+            Err(_) => return launch_exit_errno(&trace, p1::errno::FAULT),
         }
     };
     let prepared = match wasix_prepare_program_with_search(
@@ -2336,7 +2395,7 @@ where
     .await
     {
         Ok(prepared) => prepared,
-        Err(error) => return p1_errno_from_wasmtime_error(&error),
+        Err(error) => return launch_exit_error_errno(&trace, &error),
     };
     trace.record(LaunchPhase::SourceRead);
     trace.record_source_bytes(prepared.source.payload_len());
@@ -2345,7 +2404,7 @@ where
     } else {
         match wasix_spawn_descriptor_snapshot(caller, memory, fd_ops, fd_ops_len).await {
             Ok(snapshot) => Some(snapshot),
-            Err(errno) => return errno,
+            Err(errno) => return launch_exit_errno(&trace, errno),
         }
     };
     let (authority, descriptors) = match snapshot {
@@ -2355,7 +2414,7 @@ where
     let signal_dispositions =
         match wasix_read_signal_dispositions(caller, memory, signals, signals_len) {
             Ok(dispositions) => dispositions,
-            Err(errno) => return errno,
+            Err(errno) => return launch_exit_errno(&trace, errno),
         };
     let result = match wasix_spawn_child(
         caller,
@@ -2373,7 +2432,7 @@ where
     .await
     {
         Ok(result) => result,
-        Err(errno) => return errno,
+        Err(errno) => return launch_exit_errno(&trace, errno),
     };
     p1_write_u32(caller, memory, ret_pid, result.pid)
 }
@@ -3362,7 +3421,9 @@ where
         descriptors,
         signal_dispositions,
     } = inheritance;
-    let prepared_io = wasix_prepare_child_io(caller.data(), io)?;
+    let prepared_io = wasix_prepare_child_io(caller.data(), io).inspect_err(|errno| {
+        launch_exit_errno(trace, *errno);
+    })?;
     let argv = ProgramArgv::from_caller(&prepared.guest_name, argv);
     let mut environment = environment.unwrap_or_else(|| caller.data().environment.clone());
     environment.retain(|(name, _)| name.as_str() != HELIOS_PROCESS_ID_ENV);
@@ -3394,7 +3455,9 @@ where
             },
         )
         .await
-        .map_err(|error| p1_errno_from_program_exec_error(&error))?;
+        .map_err(|error| {
+            trace.exit_error_errno(&error, p1_errno_from_program_exec_error(&error))
+        })?;
     p1_record_optional_kernel_profile(caller.data(), "proc_spawn_child_launch", launch_started);
     // The child's task holds a `for_task` handle and owns the line's
     // emit from here on — a failure wiring its stdio is this call's to
