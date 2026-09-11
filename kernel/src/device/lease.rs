@@ -95,6 +95,19 @@ pub const SURFACE_WINDOW_BYTES: u64 = 256 << 20;
 /// until it claims a stream.
 pub const AUDIO_WINDOW_BYTES: u64 = 8 << 20;
 
+/// Bytes of a linear-memory reservation the kernel keeps for the
+/// renderer state of an instance that drives the machine's 3D engine.
+///
+/// It carries two things a rendering plugin needs inside its own linear
+/// memory and above everything it can grow into: the command buffers it
+/// writes and the guest-backed blobs it creates, both pinned pages of
+/// its own; and the host-visible windows the display engine places its
+/// own storage in, which are not this machine's memory at all. Sized
+/// for the large end of what a Vulkan translation layer asks for — a
+/// handful of staging buffers and a host-visible heap — and it costs an
+/// instance nothing until it claims the 3D engine.
+pub const GPU_WINDOW_BYTES: u64 = 256 << 20;
+
 /// The part of one owner's linear memory the kernel devotes to its
 /// device.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

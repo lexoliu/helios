@@ -14,13 +14,19 @@
 //! compositor composes from the bytes the client wrote rather than from
 //! a copy of them.
 //!
+//! A fourth path is a window a device published rather than memory this
+//! machine owns at all: a display engine's host-visible aperture, where
+//! the host's own storage for a 3D blob is placed. Nothing is committed
+//! and nothing is charged, but the window lands in the same kind of
+//! span, for the same reason, and is given back the same way.
+//!
 //! The pages go in a [`DeviceWindow`] — a span of the reservation above
 //! everything the instance can grow into — for the same reason a
 //! granted device's registers do: a `memory.grow` that landed on one of
 //! them would hand the hardware whatever the instance put there next.
 //!
-//! This is the arena the display, the surface registry and the audio
-//! service all carve from. It says nothing about what the runs are
+//! This is the arena the display, the surface registry, the audio
+//! service and the 3D engine all carve from. It says nothing about what the runs are
 //! *for*: the owning service names the bound on how many there may be
 //! and translates [`PinError`] into its own refusal, because "this
 //! claim holds as many frame buffers as it may" and "as many period
@@ -37,7 +43,7 @@
 //! in the space before it returns.
 
 use arrayvec::ArrayVec;
-use helios_hal::device::DmaPlacement;
+use helios_hal::device::{DeviceRegion, DmaPlacement};
 use helios_hal::iommu::PhysicalRange;
 use helios_hal::pmm::{PhysFrame, PhysFrameRange};
 use helios_hal::vmm::{PageFlags, VirtAddr};
@@ -91,6 +97,12 @@ enum PinBacking {
     /// drops the view and frees nothing: the pages go back when their
     /// owner's arena lets them go.
     Shared,
+    /// A window a device published in the machine's physical address
+    /// space — a display engine's host-visible aperture, say. Releasing
+    /// it drops the mapping and frees nothing: the memory is the
+    /// device's, and the device is told separately that the guest has
+    /// stopped reading it.
+    Device,
 }
 
 /// One pinned, physically contiguous run inside an instance's linear
@@ -118,6 +130,12 @@ impl PinnedRun {
     /// of this instance's own.
     pub const fn is_shared(&self) -> bool {
         matches!(self.kind, PinBacking::Shared)
+    }
+
+    /// Whether this is a window a device published rather than memory
+    /// this machine's allocator owns.
+    pub const fn is_device(&self) -> bool {
+        matches!(self.kind, PinBacking::Device)
     }
 
     /// Where these bytes appear in the kernel's own address space.
@@ -218,6 +236,36 @@ impl<const RUNS: usize> PinnedArena<RUNS> {
             PhysFrame::from_phys_addr(physical.start as usize),
             PinBacking::Shared,
         ))
+    }
+
+    /// Map `region` — a window a device published in the machine's
+    /// physical address space — into this instance's window.
+    ///
+    /// Nothing is allocated and nothing is charged: the memory behind
+    /// the region is the device's, and this arena holds only the path
+    /// to it. It is the same mechanism a granted device's registers are
+    /// mapped through, and the region says how the hardware requires
+    /// the bytes to be accessed.
+    ///
+    /// The region has to start and end on a frame boundary for the
+    /// reason a granted device's does: the page it shared with its
+    /// neighbour would carry the neighbour's bytes into this
+    /// instance's memory.
+    pub fn map_device(&mut self, region: DeviceRegion) -> Result<PinnedRun, PinError> {
+        if !region.is_frame_aligned() {
+            return Err(PinError::ShareRefused);
+        }
+        let (offset, bytes, _granule) = self.carve_for(region.physical.bytes)?;
+        if bytes != region.physical.bytes {
+            // A window whose publisher sized it to a different granule
+            // than this instance maps at cannot be handed over: the
+            // tail page would carry whatever the device decodes past
+            // the end of it.
+            return Err(PinError::ShareRefused);
+        }
+        let virt = self.window.range_at(offset, bytes);
+        (device_vm_hooks().map_device)(virt, region).map_err(|_| PinError::ShareRefused)?;
+        Ok(self.record(offset, bytes, region.first_frame(), PinBacking::Device))
     }
 
     /// Hand one run back.
@@ -331,6 +379,7 @@ fn release(window: DeviceWindow, run: PinnedRun) {
     let released = match run.kind {
         PinBacking::Owned { align } => (hooks.release_contiguous)(virt, align),
         PinBacking::Shared => (hooks.unmap_shared)(virt),
+        PinBacking::Device => (hooks.unmap_device)(virt),
     };
     released.unwrap_or_else(|error| {
         panic!("a pinned run the address space would not release: {error}")

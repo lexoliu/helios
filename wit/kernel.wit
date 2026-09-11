@@ -13,12 +13,13 @@ world init {
   import helios:system/display@0.1.0;
   import helios:system/input@0.1.0;
   import helios:system/surface@0.1.0;
+  import helios:system/gpu@0.1.0;
   import helios:system/audio@0.1.0;
   import wasi:http/types@0.3.0;
   import wasi:http/client@0.3.0;
 }
 
-world debugger {
+world debugger{
   include wasi:cli/command@0.3.0;
   import helios:system/programs@0.1.0;
   import helios:system/net@0.1.0;
@@ -32,6 +33,7 @@ world debugger {
   import helios:system/display@0.1.0;
   import helios:system/input@0.1.0;
   import helios:system/surface@0.1.0;
+  import helios:system/gpu@0.1.0;
   import helios:system/audio@0.1.0;
   import wasi:http/types@0.3.0;
   import wasi:http/client@0.3.0;
@@ -136,6 +138,7 @@ world compositor {
   import helios:system/display@0.1.0;
   import helios:system/input@0.1.0;
   import helios:system/surface@0.1.0;
+  import helios:system/gpu@0.1.0;
   import helios:system/sync@0.1.0;
   import helios:system/tracing@0.1.0;
   export helios:system/compositor@0.1.0;
@@ -150,6 +153,17 @@ world compositor {
 /// bindings already provide.
 world surface-host {
   import helios:system/surface@0.1.0;
+}
+
+/// World the kernel generates its own `helios:system/gpu` bindings
+/// from.
+///
+/// Separate from the program worlds for the same reason `display-host`
+/// is: it keeps the kernel's bindgen down to the one interface it serves
+/// here instead of regenerating every `wasi:cli` import the program
+/// bindings already provide.
+world gpu-host {
+  import helios:system/gpu@0.1.0;
 }
 
 /// World the kernel generates the compositor plugin's *export* bindings

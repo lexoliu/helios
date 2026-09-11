@@ -195,6 +195,47 @@ pub mod surface {
     }
 }
 
+/// Bindings for the interface a rendering plugin reaches the 3D engine
+/// through.
+///
+/// Generated from the `gpu-host` world, for the reason `display-host`
+/// is: the kernel implements this one interface, and the program
+/// bindings above already provide every `wasi:cli` import a plugin also
+/// has.
+pub mod gpu {
+    pub mod bindings {
+        use wasmtime;
+
+        wasmtime::component::bindgen!({
+            path: "../wit",
+            world: "gpu-host",
+            imports: {
+                // The call that hands back a reader has to see the store,
+                // so it can build one against it; it returns the reader
+                // immediately rather than awaiting.
+                "helios:system/gpu.[method]context.fences": store | trappable,
+                // Everything that reaches the display engine is an
+                // `async func` in the WIT and is generated against the
+                // store on its own account. What is left — claiming,
+                // reading back where a buffer landed, dropping a handle
+                // — is store bookkeeping and answers without waiting.
+                default: trappable,
+            },
+            with: {
+                "helios:system/gpu.gpu":
+                    crate::wasmtime_adapter::component_host::GpuHandle,
+                "helios:system/gpu.context":
+                    crate::wasmtime_adapter::component_host::ContextHandle,
+                "helios:system/gpu.command-buffer":
+                    crate::wasmtime_adapter::component_host::CommandBufferHandle,
+                "helios:system/gpu.blob":
+                    crate::wasmtime_adapter::component_host::BlobHandle,
+            },
+            require_store_data_send: true,
+        });
+    }
+}
+
 /// Bindings for the interface a player reaches the machine's sound
 /// device through.
 ///

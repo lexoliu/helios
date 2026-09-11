@@ -56,6 +56,8 @@ where
     let (device, source) = discover_display_device(fdt)?;
     let service = helios_kernel::install_display_device(kernel, cpu, device.inner.clone());
     debug_state.install_display_service(service);
+    let service = helios_kernel::install_gpu3d_device(kernel, cpu, device.inner.clone());
+    debug_state.install_gpu3d_service(service);
     Some(DisplayInterrupt { source, device })
 }
 

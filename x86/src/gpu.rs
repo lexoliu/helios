@@ -59,6 +59,8 @@ where
     let device = Arc::new(device);
     let service = helios_kernel::install_display_device(kernel, cpu, Arc::clone(&device));
     debug_state.install_display_service(service);
+    let service = helios_kernel::install_gpu3d_device(kernel, cpu, Arc::clone(&device));
+    debug_state.install_gpu3d_service(service);
     tracing::info!("virtio-gpu function={address} msix_vector={vector:#x}");
     VirtioDisplayDevice { device }
 }

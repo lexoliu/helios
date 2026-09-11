@@ -39,6 +39,7 @@ use core::task::{Context, Poll, Waker};
 
 use async_lock::Mutex as AsyncMutex;
 use helios_hal::io::IoResult;
+use helios_hal::iommu::PhysicalRange;
 use spin::Mutex;
 
 use crate::notify::Notify;
@@ -216,7 +217,27 @@ pub(crate) async fn submit_chain<T, const N: usize>(
 where
     T: VirtioTransport,
 {
-    let buffers = inputs.len() + outputs.len();
+    submit_chain_with_payload(inflight, queue, transport, inputs, None, outputs).await
+}
+
+/// [`submit_chain`], with a run of memory the driver holds no pointer to
+/// carried between the read-only buffers and the writable ones.
+///
+/// The payload is somebody else's pages — a guest's own pinned command
+/// buffer — named by the physical run they occupy. Nothing is copied
+/// and nothing is allocated: the device reads them where they are.
+pub(crate) async fn submit_chain_with_payload<T, const N: usize>(
+    inflight: &InFlight<N>,
+    queue: &AsyncMutex<VirtQueue<T>>,
+    transport: &T,
+    inputs: &[&[u8]],
+    payload: Option<PhysicalRange>,
+    outputs: &mut [&mut [u8]],
+) -> IoResult<u16>
+where
+    T: VirtioTransport,
+{
+    let buffers = inputs.len() + usize::from(payload.is_some()) + outputs.len();
     let mut announced = false;
     let outcome = loop {
         // Armed before the ring is tested, for the same reason the
@@ -226,7 +247,7 @@ where
         let drained = {
             let mut queue = queue.lock().await;
             if queue.has_room_for(buffers) && inflight.is_idle(queue.next_free_descriptor()) {
-                match queue.submit(transport, inputs, outputs) {
+                match queue.submit_with_payload(transport, inputs, payload, outputs) {
                     Ok(token) => {
                         queue.notify(transport);
                         inflight.register(token);

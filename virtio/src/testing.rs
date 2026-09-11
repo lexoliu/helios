@@ -251,6 +251,9 @@ pub(crate) struct FakeTransport<P = IdentityDmaPool> {
     /// could not present a device at all. Empty for every other device
     /// class, which leaves the flat array untouched.
     config_blocks: Mutex<Vec<(u8, u8, Vec<u8>)>>,
+    /// The device's own memory windows, by region id, as a transport
+    /// that publishes shared memory answers for them.
+    shared_memory: Mutex<Vec<(u8, helios_hal::iommu::PhysicalRange)>>,
     log: Mutex<FakeTransportLog>,
 }
 
@@ -276,8 +279,19 @@ impl<P: DmaPool> FakeTransport<P> {
             absent_queues: config.absent_queues,
             config_len: AtomicUsize::new(usize::MAX),
             config_blocks: Mutex::new(Vec::new()),
+            shared_memory: Mutex::new(Vec::new()),
             log: Mutex::new(FakeTransportLog::default()),
         }
+    }
+
+    /// Publishes a shared-memory region under `id`, the way a device
+    /// with a host-visible aperture does.
+    pub(crate) fn set_shared_memory_region(
+        &self,
+        id: u8,
+        region: helios_hal::iommu::PhysicalRange,
+    ) {
+        self.shared_memory.lock().push((id, region));
     }
 
     /// Ends the device configuration structure at `len` bytes, the way
@@ -508,6 +522,14 @@ impl<P: DmaPool> VirtioTransport for FakeTransport<P> {
             self.publish_selected_block();
         }
     }
+
+    fn shared_memory_region(&self, id: u8) -> Option<helios_hal::iommu::PhysicalRange> {
+        self.shared_memory
+            .lock()
+            .iter()
+            .find(|(published, _)| *published == id)
+            .map(|(_, region)| *region)
+    }
 }
 
 /// Where the device-visible window of a [`WindowDmaPool`] starts.
@@ -613,6 +635,12 @@ impl DmaPool for WindowDmaPool {
             Some(offset) if offset < self.arena_len() => Ok(DEVICE_WINDOW_BASE + offset as u64),
             _ => Ok(host as u64),
         }
+    }
+
+    /// A run named by its address is already in the window, the way a
+    /// guest's own pinned pages reach a real device.
+    fn device_range(&self, physical: u64, _bytes: u64) -> IoResult<u64> {
+        Ok(physical)
     }
 
     fn addressing(&self) -> DmaAddressing {

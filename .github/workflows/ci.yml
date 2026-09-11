@@ -737,9 +737,11 @@ jobs:
             --qemu-trace trace:virtio_gpu_update_cursor \
             --qemu-trace-log "$runtime/qemu-trace.log" \
             --boot-program dash --boot-program debugger \
-            --boot-program display-test --no-compiler-plugin \
+            --boot-program display-test --boot-program gpu-test \
+            --no-compiler-plugin \
             screendump \
-              --run /bin/display-test --run-arg --seconds --run-arg 20 \
+              --run /bin/dash --run-arg -c \
+              --run-arg "gpu-test; display-test --seconds 20 & wait" \
               --settle-seconds 2 "$captures/drawn.png" "$captures/settled.png" \
             2>&1 | tee "$runtime/inspector.log"
           # A PPM under a .png name would be an artifact nothing opens,
@@ -750,6 +752,14 @@ jobs:
           done
           # The guest's own account of what it drew, and the picture's.
           grep -Fq 'display-test:claimed' "$runtime/inspector.log"
+          # `gpu-test` claims the 3D engine through `helios:system/gpu`.
+          # The smoke lane's QEMU offers a 2D device only, so its answer
+          # is `3d=none` — on the guest's own line and on the kernel's
+          # boot line, which is where "this machine has no 3D" is read
+          # off rather than deduced from a missing message. The feature
+          # tail says what a 2D device negotiates: none of them.
+          grep -Fq 'gpu-test:3d=none' "$runtime/inspector.log"
+          grep -Fq '3d=none blob=off context-init=off uuid=off' "$runtime/debug-serial.log"
           grep -Eq 'display-test:surface scanout=0 width=[0-9]+ height=[0-9]+' \
             "$runtime/inspector.log"
           grep -Fq 'display-test:cursor-set' "$runtime/inspector.log"

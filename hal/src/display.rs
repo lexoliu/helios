@@ -10,6 +10,14 @@
 //! so the value types and the device trait live here and the concrete
 //! driver encodes them onto its own wire format.
 //!
+//! A display engine that can also *render* carries a second contract,
+//! [`Gpu3d`], beside this one: capability sets, renderer contexts, blob
+//! resources and fences. Two traits rather than one because a machine
+//! may have the first without the second — every virtio-gpu drives
+//! scanouts, and only a host built against a renderer carries a
+//! capability set — and a scanout contract that named a context would
+//! have to be answered by devices that hold none.
+//!
 //! Frame buffers are never allocated here. A [`DisplayDevice`] is handed
 //! the physical pages a caller already owns and attaches them as the
 //! backing store of a device-side resource; the pages stay the caller's
@@ -36,6 +44,13 @@ use thiserror::Error;
 
 use crate::io::IoError;
 use crate::pmm::PhysFrameRange;
+
+mod gpu3d;
+
+pub use gpu3d::{
+    BlobId, BlobMemory, BlobRequest, BlobUsage, CapsetId, CapsetInfo, CapsetList, ContextId,
+    ContextName, FenceId, Gpu3d, Gpu3dError, Gpu3dResult, MAX_CAPSETS, MAX_CONTEXT_NAME,
+};
 
 /// Largest number of scanouts a display device may present.
 ///
