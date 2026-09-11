@@ -24,7 +24,7 @@ from helios_bench.baseline import Baseline
 from helios_bench.gate import GateKind, evaluate, evaluate_paired, gate_report
 from helios_bench.manifest import load_manifest
 from helios_bench.plots import plot_report
-from helios_bench.render import render_gate, render_tables
+from helios_bench.render import render_gate, render_pins, render_tables
 from helios_bench.report import Report, Side, load_report, save_report
 from helios_bench.runner import (
     GAP_BENCH,
@@ -46,10 +46,10 @@ WORKLOADS = [
 ]
 
 
-def boot_order(order_log: Path) -> list[tuple[str, str, str]]:
-    """(harness, guest workspace, workloads) of every boot, in order."""
+def boot_order(order_log: Path) -> list[tuple[str, str, str, str]]:
+    """(harness, guest workspace, inspector, workloads) of every boot, in order."""
     return [
-        tuple(line.split(" ", 2))
+        tuple(line.split(" ", 3))
         for line in order_log.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
@@ -242,7 +242,7 @@ def test_a_paired_side_boots_the_two_images_back_to_back(driver, tmp_path) -> No
     images = images_of(driver, tmp_path, paired=True)
     order = boot_order(run_side(driver, tmp_path, images))
 
-    assert [names for _, _, names in order] == [
+    assert [names for _, _, _, names in order] == [
         "quickjs-loop",
         "quickjs-loop",
         "cpython-json",
@@ -250,7 +250,7 @@ def test_a_paired_side_boots_the_two_images_back_to_back(driver, tmp_path) -> No
         "hostcall-loop",
         "hostcall-loop",
     ], "one boot per workload per image, and the pair is never split"
-    assert [guest for _, guest, _ in order] == [
+    assert [guest for _, guest, _, _ in order] == [
         "candidate",
         "baseline",
         "baseline",
@@ -273,8 +273,8 @@ def test_an_unpaired_side_still_boots_one_guest_per_class(driver, tmp_path) -> N
     order = boot_order(run_side(driver, tmp_path, images))
 
     assert order == [
-        ("candidate", "candidate", "quickjs-loop,cpython-json"),
-        ("candidate", "candidate", "hostcall-loop"),
+        ("candidate", "candidate", "-", "quickjs-loop,cpython-json"),
+        ("candidate", "candidate", "-", "hostcall-loop"),
     ]
 
 
@@ -284,12 +284,51 @@ def test_one_harness_boots_both_images(driver, tmp_path) -> None:
     Run 33995029872 died the other way round: the baseline checkout's own
     `workload-bench.sh` and its own inspector drove its half, and that
     inspector predated a fix to the host side, so the paired run failed
-    on the older harness rather than on anything about the guest.
+    on the older harness rather than on anything about the guest. What is
+    shared is the scheduling harness; the protocol peer is each image's
+    own — the next test pins that half.
     """
     order = boot_order(run_side(driver, tmp_path, images_of(driver, tmp_path, paired=True)))
 
-    assert {harness for harness, _, _ in order} == {"candidate"}, "every boot runs this checkout's harness"
-    assert {guest for _, guest, _ in order} == {"candidate", "baseline"}
+    assert {harness for harness, _, _, _ in order} == {"candidate"}, "every boot runs this checkout's harness"
+    assert {guest for _, guest, _, _ in order} == {"candidate", "baseline"}
+
+
+def test_each_image_is_booted_by_the_tooling_of_its_own_checkout(driver, tmp_path) -> None:
+    """#356: the candidate's inspector cannot answer for a baseline guest.
+
+    The inspector and the guest's debugger speak
+    helios-inspector-protocol, and a record added between the two refs
+    (the `audio` list #347 added to `stats.wit`) left the candidate's
+    decoder asking the baseline guest for a field it never sent: run
+    34551261487's baseline readiness probe died `DeserializeUnexpectedEnd`.
+    Each image is built and booted by the `helios-inspector`/`helios-cli`
+    of its own checkout, kept under its own `target/release`.
+    """
+    order = boot_order(run_side(driver, tmp_path, images_of(driver, tmp_path, paired=True)))
+
+    expected = {
+        "candidate": str(tmp_path / "candidate" / "target" / "release" / "helios-inspector"),
+        "baseline": str(tmp_path / "baseline" / "target" / "release" / "helios-inspector"),
+    }
+    for _harness, guest, inspector, _names in order:
+        assert inspector == expected[guest]
+
+
+def test_a_baseline_boot_without_its_own_inspector_is_refused(driver, tmp_path, monkeypatch) -> None:
+    """No fallback: a baseline with no inspector of its own never boots.
+
+    The refusal names the path the image's own checkout would have
+    produced, and it fires before the first boot rather than inside one —
+    and it can never be answered by the candidate's inspector, which is
+    the skew of #356.
+    """
+    inspector = tmp_path / "baseline" / "target" / "release" / "helios-inspector"
+    monkeypatch.setenv("HELIOS_TEST_TOOLS_ABSENT", str(inspector))
+    with pytest.raises(driver.HeliosRunFailed) as error:
+        run_side(driver, tmp_path, images_of(driver, tmp_path, paired=True))
+    assert str(inspector) in str(error.value)
+    assert "baseline" in str(error.value)
 
 
 def test_two_images_that_are_one_build_are_refused(driver, tmp_path, monkeypatch) -> None:
@@ -435,6 +474,11 @@ def test_a_baseline_side_survives_the_schema_round_trip(paired_regression_report
     assert read_back.run.paired
     assert read_back.run.baseline_git_sha == paired_regression_report.run.baseline_git_sha
     assert read_back.run.baseline_ref == "merge-base"
+    # Beside each kernel's commit, the commit its inspector was built
+    # from (#356) — the pairing's tooling provenance survives the round
+    # trip too.
+    assert read_back.run.inspector_git_sha == paired_regression_report.run.helios_git_sha
+    assert read_back.run.baseline_inspector_git_sha == (paired_regression_report.run.baseline_git_sha)
     assert Side.HELIOS_BASELINE in read_back.measured_sides()
     assert read_back.table_sides() == [
         Side.HELIOS,
@@ -450,6 +494,26 @@ def test_a_baseline_side_survives_the_schema_round_trip(paired_regression_report
         Side.LINUX_WASMTIME,
         Side.LINUX_NATIVE,
     }
+
+
+def test_a_paired_report_names_each_side_tooling_revision(paired_regression_report: Report) -> None:
+    """The rendered report prints the inspector revision beside each kernel's.
+
+    The fields are the same shape as the kernel shas they sit beside —
+    the commit the side's `helios-inspector`/`helios-cli` were built from
+    (#356) — and the header and the pins table carry them so a paired
+    report says which tooling booted which image.
+    """
+    run = paired_regression_report.run
+    assert run.inspector_git_sha == run.helios_git_sha
+    assert run.baseline_inspector_git_sha == run.baseline_git_sha
+
+    tables = render_tables(paired_regression_report)
+    assert f"inspector `{run.helios_git_sha[:12]}`" in tables
+    assert f"inspector `{run.baseline_git_sha[:12]}`" in tables
+    pins = render_pins(paired_regression_report)
+    assert f"| `helios-inspector`/`helios-cli` | `{run.inspector_git_sha}` |" in pins
+    assert f"| `helios-inspector`/`helios-cli`, baseline | `{run.baseline_inspector_git_sha}` |" in pins
 
 
 def test_an_unpaired_report_keeps_its_three_columns(baseline_report: Report) -> None:
@@ -489,17 +553,17 @@ def test_a_build_record_with_an_uncovered_count_names_it_in_the_gate(
     assert "7,897 of 42,053 functions uncovered" in gate_text
 
 
-def test_the_uncovered_count_is_read_from_the_list_beside_the_kernel(tmp_path, monkeypatch) -> None:
+def test_the_uncovered_count_is_read_from_the_list_beside_the_kernel(tmp_path) -> None:
     """The runner asks the inspector where the kernel is and counts its list.
 
     The list lives beside whatever `kernel-path` answers rather than under
     a path spelled twice, so the stand-in's keying is what the test counts
-    through.
+    through. The inspector asked is the workspace's own — where a paired
+    run leaves each side's tooling (#356).
     """
-    inspector = fake_inspector(tmp_path)
-    monkeypatch.setenv("HELIOS_INSPECTOR_BIN", str(inspector))
     lane = load_manifest().lane("x86-64-kvm")
     checkout = fake_checkout(tmp_path / "candidate")
+    inspector = fake_inspector(checkout / "target" / "release")
     answered = subprocess.run(
         [
             str(inspector),
@@ -530,6 +594,7 @@ def test_the_uncovered_count_is_read_from_the_list_beside_the_kernel(tmp_path, m
 
     # A kernel whose build kept no list reports no count rather than zero.
     plain = fake_checkout(tmp_path / "plain")
+    fake_inspector(plain / "target" / "release")
     assert kernel_pgo_uncovered(plain, lane, None) is None
 
     # And a list whose header disagrees with its lines is a broken
@@ -544,14 +609,14 @@ def test_the_uncovered_count_is_read_from_the_list_beside_the_kernel(tmp_path, m
         kernel_pgo_uncovered(checkout, lane, None)
 
 
-def test_a_kernel_path_that_fails_is_a_failure_not_an_empty_count(tmp_path, monkeypatch) -> None:
+def test_a_kernel_path_that_fails_is_a_failure_not_an_empty_count(tmp_path) -> None:
     """A nonzero `kernel-path` names what refused, rather than reading None."""
-    inspector = tmp_path / "helios-inspector"
-    inspector.write_text("#!/bin/sh\necho 'the profile is not in the store' >&2\nexit 3\n", encoding="utf-8")
-    inspector.chmod(0o755)
-    monkeypatch.setenv("HELIOS_INSPECTOR_BIN", str(inspector))
     lane = load_manifest().lane("x86-64-kvm")
     checkout = fake_checkout(tmp_path / "candidate")
+    inspector = checkout / "target" / "release" / "helios-inspector"
+    inspector.parent.mkdir(parents=True)
+    inspector.write_text("#!/bin/sh\necho 'the profile is not in the store' >&2\nexit 3\n", encoding="utf-8")
+    inspector.chmod(0o755)
     with pytest.raises(SystemExit, match="exited with status 3: the profile is not in the store"):
         kernel_pgo_uncovered(checkout, lane, None)
 

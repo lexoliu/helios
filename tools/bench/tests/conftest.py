@@ -149,6 +149,12 @@ def make_report(
             "89abcdef0123456789abcdef0123456789abcdef" if baseline_centers is not None else None
         ),
         baseline_ref="merge-base" if baseline_centers is not None else None,
+        # Each side's tooling is built from the commit its guest is built
+        # from (#356), so the two revisions travel with the two kernels'.
+        inspector_git_sha="0123456789abcdef0123456789abcdef01234567",
+        baseline_inspector_git_sha=(
+            "89abcdef0123456789abcdef0123456789abcdef" if baseline_centers is not None else None
+        ),
     )
     hardware = Hardware(
         host_os="Darwin 25.6.0",

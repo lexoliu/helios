@@ -28,14 +28,25 @@ if [ -n "${HELIOS_WORKLOAD_BENCH_BUILD_ONLY:-}" ]; then
     # builds unless a test says otherwise.
     printf '%s\n' "${HELIOS_TEST_KERNEL_CONTENT:-$HELIOS_WORKSPACE_ROOT}" \
         > "$HELIOS_WORKSPACE_ROOT/kernel"
+    # And the tooling the image's own checkout would compile, where the
+    # driver pinned it — HELIOS_TEST_TOOLS_ABSENT names one a broken
+    # build leaves behind, so the refusal that checks it can be seen.
+    for tool in "${HELIOS_INSPECTOR_BIN:-}" "${HELIOS_CLI_BIN:-}"; do
+        if [ -n "$tool" ] && [ "$tool" != "${HELIOS_TEST_TOOLS_ABSENT:-}" ]; then
+            mkdir -p "$(dirname "$tool")"
+            printf '#!/bin/sh\nexit 0\n' > "$tool"
+            chmod +x "$tool"
+        fi
+    done
     exit 0
 fi
 log="$HELIOS_WORKLOAD_BENCH_LOG"
 mkdir -p "$(dirname "$log")"
 if [ -n "${HELIOS_TEST_ORDER:-}" ]; then
-    # The harness that ran, the guest it was pointed at, and what it ran.
-    printf '%s %s %s\n' "$(basename "$PWD")" "$(basename "$HELIOS_WORKSPACE_ROOT")" \
-        "$HELIOS_WORKLOAD_BENCH_WORKLOADS" >> "$HELIOS_TEST_ORDER"
+    # The harness that ran, the guest it was pointed at, the inspector
+    # it was pinned to, and what it ran.
+    printf '%s %s %s %s\n' "$(basename "$PWD")" "$(basename "$HELIOS_WORKSPACE_ROOT")" \
+        "${HELIOS_INSPECTOR_BIN:--}" "$HELIOS_WORKLOAD_BENCH_WORKLOADS" >> "$HELIOS_TEST_ORDER"
 fi
 if [ "$HELIOS_WORKLOAD_BENCH_CLASSES" = "@WEDGED@" ]; then
     sleep 600 &
@@ -77,6 +88,7 @@ print(image)
 
 def fake_inspector(root: Path) -> Path:
     """An inspector whose `kernel-path` answers without a build."""
+    root.mkdir(parents=True, exist_ok=True)
     inspector = root / "helios-inspector"
     inspector.write_text(FAKE_INSPECTOR, encoding="utf-8")
     inspector.chmod(0o755)
