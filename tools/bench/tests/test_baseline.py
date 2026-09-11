@@ -6,6 +6,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from helios_bench import baseline
 
 
@@ -97,8 +99,11 @@ def test_the_baseline_checkout_is_the_candidates_sibling(tmp_path, monkeypatch):
 
     assert checkout.parent == repo.parent
     assert checkout.name == f"helios-baseline-{base[:12]}"
-    assert (checkout / ".." / "wasmtime").resolve() == (repo / ".." / "wasmtime").resolve()
-    assert not (checkout / ".." / "wasmtime").is_symlink() and not (checkout.parent / "wasmtime").is_symlink()
+    # Lexically the same directory, not merely the same after resolving
+    # links: the old layout's linked sibling also resolved to it.
+    assert checkout.parent / "wasmtime" == repo.parent / "wasmtime"
+    assert not checkout.is_symlink() and not (checkout.parent / "wasmtime").is_symlink()
+    assert not any(part.is_symlink() for part in [checkout, *checkout.parents])
     assert git("rev-parse", "HEAD", cwd=checkout) == base
     assert (checkout / "target").is_symlink()
     assert (checkout / "target").readlink() == baseline.build_dir(base)
@@ -158,24 +163,29 @@ def test_a_cached_build_directory_is_reused_by_a_fresh_checkout(tmp_path, monkey
     assert (checkout / "a.txt").read_text() == "base\n"
 
 
-def test_a_checkout_git_no_longer_resolves_is_replaced(tmp_path, monkeypatch):
-    """A directory at the checkout path that is not a registered worktree
-    — a repository re-cloned since, the shape #328 met — holds nothing the
-    run needs: its build lives in the cached directory. It is replaced by
-    a worktree at the baseline commit."""
+def test_a_directory_this_repository_did_not_register_is_never_touched(tmp_path, monkeypatch):
+    """The checkout path is beside the candidate, outside the repository.
+    Whatever is there that this repository does not list as its worktree
+    — a repository of someone else's, which would answer
+    `--show-toplevel` with itself, or a plain file — stops the run naming
+    the path and is left exactly as found (§9)."""
     repo = tmp_path / "helios"
     base, _candidate = repository_with_two_commits(repo)
     monkeypatch.setattr(baseline, "REPO_ROOT", repo)
     monkeypatch.setattr(baseline, "WORKTREES", repo / "target" / "perf-baselines" / "worktrees")
-    stale = baseline.checkout_path(base)
-    stale.mkdir(parents=True)
-    (stale / "a.txt").write_text("stale\n")
+    other = baseline.checkout_path(base)
+    git("init", "-q", str(other), cwd=tmp_path)
+    (other / "theirs.txt").write_text("not ours\n")
 
-    checkout = baseline.ensure_worktree(base)
+    with pytest.raises(SystemExit, match=str(other)):
+        baseline.ensure_worktree(base)
+    assert (other / "theirs.txt").read_text() == "not ours\n"
 
-    assert checkout == stale
-    assert git("rev-parse", "HEAD", cwd=checkout) == base
-    assert (checkout / "a.txt").read_text() == "base\n"
+    shutil.rmtree(other)
+    other.write_text("a file\n")
+    with pytest.raises(SystemExit, match=str(other)):
+        baseline.ensure_worktree(base)
+    assert other.read_text() == "a file\n"
 
 
 def test_a_registered_worktree_at_another_commit_is_still_refused(tmp_path, monkeypatch):

@@ -428,7 +428,7 @@ boot.
 | Host | CPU, load, thermal state, QEMU release, accelerator, vCPUs, memory, network backend and its host servers | — |
 | Harness | `workload-bench.sh`, the workload manifest, the run's iteration count and budgets | — |
 | Tooling | — | `helios-inspector` and `helios-cli`, built from each side's own commit under its own `target/release` |
-| Guest inputs | everything `tools/wasi-apps/build.sh` stages under `artifacts/`, linked into the baseline worktree entry by entry; the vendored Wasmtime checkout, linked as the worktree's sibling | — |
+| Guest inputs | everything `tools/wasi-apps/build.sh` stages under `artifacts/`, linked into the baseline worktree entry by entry; the vendored Wasmtime checkout, `../wasmtime` of both checkouts at the one absolute path (#359) | — |
 | Guest | — | the kernel image, the bootfs it carries, the compiler plugin, the guest programs the prebuild signs |
 
 Two checkouts that turn out to be one build are refused before the first
@@ -455,8 +455,9 @@ backend and the host HTTP, TCP and echo servers on it; the workload
 manifest, read from the candidate checkout for both; everything under
 `artifacts/` that `tools/wasi-apps/build.sh` stages, linked into the
 baseline worktree entry by entry rather than copied; and the vendored
-Wasmtime checkout, linked as the worktree's sibling so both kernels
-compile against one revision. What differs is the kernel image, the
+Wasmtime checkout, which both checkouts reach as `../wasmtime` at the
+one absolute path, so both kernels compile against one revision under
+the same cargo crate hashes (#359). What differs is the kernel image, the
 bootfs it carries (the compiler plugin included) and the
 `helios-inspector`/`helios-cli` that build and boot it — each side's own,
 compiled from the side's own commit.

@@ -59,7 +59,6 @@ revisions of each (`*_git_sha` beside `*_inspector_git_sha`).
 
 from __future__ import annotations
 
-import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -173,24 +172,28 @@ def prepare(baseline: Baseline) -> Path:
 def ensure_worktree(sha: str) -> Path:
     """The worktree at `checkout_path(sha)`, the candidate's sibling.
 
-    Reused when it is already there, registered, and still at that
-    commit. The build it saves lives in `build_dir(sha)` and not in the
-    checkout, so the checkout itself holds nothing worth keeping: one
-    that git no longer resolves to a worktree rooted there — a directory
-    left by a repository that was since re-cloned, the shape #328 met
-    when the runner cache restored a checkout under `target/` — is
-    replaced by a fresh worktree at `sha`, and the warm build directory
-    is what the cache carries. Only a registered worktree at some other
-    commit is refused.
+    Reused when it is already there, registered to this repository, and
+    still at that commit. The build it saves lives in `build_dir(sha)`
+    and not in the checkout, so nothing under the checkout is ever
+    deleted here: the path is outside the repository, beside the
+    candidate, and a directory or file there that this repository does
+    not list as its worktree is someone else's (§9) and stops the run
+    naming it. A registered worktree at some other commit is refused
+    the same way. The #328 shape — a checkout restored under `target/`
+    by the runner cache into a repository that never registered it —
+    cannot occur at this path, which the cache does not reach.
     """
     checkout = checkout_path(sha)
-    if checkout.is_dir():
-        if is_registered_worktree(checkout):
-            head = git("rev-parse", "HEAD", cwd=checkout)
-            if head != sha:
-                raise SystemExit(f"{checkout} is a worktree of {head}, not of {sha}")
-            return checkout
-        shutil.rmtree(checkout)
+    if checkout.exists() or checkout.is_symlink():
+        if not is_registered_worktree(checkout):
+            raise SystemExit(
+                f"{checkout} exists and is not a worktree of {REPO_ROOT}; "
+                "the baseline checkout is created there, so move or remove it"
+            )
+        head = git("rev-parse", "HEAD", cwd=checkout)
+        if head != sha:
+            raise SystemExit(f"{checkout} is a worktree of {head}, not of {sha}")
+        return checkout
     checkout.parent.mkdir(parents=True, exist_ok=True)
     git("worktree", "prune")
     git("worktree", "add", "--detach", str(checkout), sha)
@@ -225,22 +228,21 @@ def require_wasmtime_sibling() -> None:
 
 
 def is_registered_worktree(checkout: Path) -> bool:
-    """Whether git resolves `checkout` to a worktree rooted there.
+    """Whether this repository lists `checkout` among its worktrees.
 
-    A directory whose registration is gone resolves to the repository
-    above it, or to nothing at all when its `.git` file still names the
-    missing registration; neither is the worktree this run wants.
+    Asked of the repository, not of the directory: a directory that is a
+    repository of its own, or a worktree of another one, answers
+    `git rev-parse --show-toplevel` with itself and would pass a check
+    made from inside it. `git worktree list --porcelain` names exactly the
+    paths this repository registered.
     """
-    completed = subprocess.run(
-        ["git", "rev-parse", "--show-toplevel"],
-        cwd=checkout,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if completed.returncode != 0:
-        return False
-    return Path(completed.stdout.strip()).resolve() == checkout.resolve()
+    listing = git("worktree", "list", "--porcelain")
+    registered = {
+        Path(line.removeprefix("worktree ")).resolve()
+        for line in listing.splitlines()
+        if line.startswith("worktree ")
+    }
+    return checkout.resolve() in registered
 
 
 def link_profile_store(sha: str) -> None:
