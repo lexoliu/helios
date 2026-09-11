@@ -1993,6 +1993,114 @@ mod tests {
         );
     }
 
+    /// The reply a connected socket would read back, as the peer's
+    /// segment header. `acked_len` is how many bytes this side sent —
+    /// the acknowledgement may not outrun it.
+    fn peer_data_segment(acked_len: u32) -> helios_netstack::TcpHeader {
+        use crate::network::EstablishedTcpFixture;
+        use helios_netstack::TcpFlags;
+        helios_netstack::TcpHeader {
+            source_port: EstablishedTcpFixture::PEER_PORT,
+            destination_port: EstablishedTcpFixture::LOCAL_PORT,
+            // The handshake consumed one sequence number on each side;
+            // the peer's next payload rides on `PEER_SEQUENCE + 1`, and
+            // its acknowledgement covers this side's SYN plus what the
+            // test sent.
+            sequence: EstablishedTcpFixture::PEER_SEQUENCE + 1,
+            acknowledgement: EstablishedTcpFixture::LOCAL_SEQUENCE + 1 + acked_len,
+            flags: TcpFlags::ACK.union(TcpFlags::PSH),
+            window_size: u16::MAX,
+        }
+    }
+
+    /// The `wasi:io` streams on a connected TCP socket run the whole
+    /// exchange on the task that polls them (#354).
+    ///
+    /// Both halves prove it the same way: nothing between the stream and
+    /// the socket can run a task — the types hold no spawner — so the
+    /// write's segment reaching the device's transmit ring and the read
+    /// answering from the receive queue happen inside this test's own
+    /// `block_on`. The bridge they replaced needed two detached tasks for
+    /// the same round trip.
+    #[test]
+    fn p2_tcp_socket_streams_run_the_exchange_on_the_calling_task() {
+        use crate::network::EstablishedTcpFixture;
+        use wasmtime_wasi_io::poll::Pollable;
+        use wasmtime_wasi_io::streams::{InputStream, OutputStream};
+
+        let device = crate::test_support::RecordingNetworkInterface::accepting_transmissions(1);
+        let fixture = EstablishedTcpFixture::with_interface(device.clone());
+        let retirement = crate::SocketRetirementQueue::new();
+        let socket = TcpSocket::new(retirement.sender(), WasiTcpSocketFamily::Ipv4);
+        socket.inner.lock().stream = Some(crate::NetworkHandle::into_raw(fixture.stream()));
+        let service = fixture.service();
+        let mut input = super::net::TcpSocketInputStream::new(socket.clone(), service.clone());
+        let mut output = super::net::TcpSocketOutputStream::new(socket, service);
+
+        // `write` is queue, segment, submit and doorbell on this poll —
+        // the frame on the device's ring is the proof.
+        block_on(output.ready());
+        assert!(
+            output
+                .check_write()
+                .expect("a fresh connection has send room")
+                > 0,
+            "the permit must cover at least one byte"
+        );
+        output
+            .write(Bytes::from_static(b"ping"))
+            .expect("the write queues onto the send path");
+        let wire = device.transmitted_frames();
+        assert!(
+            wire.iter()
+                .any(|frame| frame.windows(4).any(|window| window == b"ping")),
+            "the write's payload reached the wire inside the write call"
+        );
+
+        // `read` drains the socket's queue synchronously: the reply the
+        // stack already accepted comes back from the same call.
+        fixture.deliver(peer_data_segment(4), b"pong");
+        let bytes = input.read(4).expect("the queued reply reads back");
+        assert_eq!(&bytes[..], b"pong");
+    }
+
+    /// A segment landing between `ready`'s queue probe and its park
+    /// still wakes the reader — the arm-before-test rule.
+    ///
+    /// The first `poll` finds an empty queue and parks on the shard's
+    /// wait with the signal already armed; `deliver_rx` then puts the
+    /// reply on the device's ring and raises the completion event — the
+    /// arrive-between-test-and-park window, reproduced exactly. The next
+    /// poll must resolve: sleeping through it is the defect §4 exists to
+    /// prevent.
+    #[test]
+    fn p2_tcp_input_stream_wakes_when_a_segment_arrives_between_probe_and_park() {
+        use crate::network::EstablishedTcpFixture;
+        use futures_lite::future::poll_once;
+        use wasmtime_wasi_io::poll::Pollable;
+        use wasmtime_wasi_io::streams::InputStream;
+
+        let fixture = EstablishedTcpFixture::new();
+        let retirement = crate::SocketRetirementQueue::new();
+        let socket = TcpSocket::new(retirement.sender(), WasiTcpSocketFamily::Ipv4);
+        socket.inner.lock().stream = Some(crate::NetworkHandle::into_raw(fixture.stream()));
+        let mut input = super::net::TcpSocketInputStream::new(socket, fixture.service());
+
+        let mut ready = input.ready();
+        assert!(
+            block_on(poll_once(ready.as_mut())).is_none(),
+            "an empty receive queue parks the readiness wait"
+        );
+        fixture.deliver_rx(peer_data_segment(0), b"pong");
+        assert!(
+            block_on(poll_once(ready.as_mut())).is_some(),
+            "the segment that arrived between probe and park resolves the wait"
+        );
+        drop(ready);
+        let bytes = input.read(4).expect("the parked reader's reply reads back");
+        assert_eq!(&bytes[..], b"pong");
+    }
+
     /// A `wasi:sockets` socket's kernel listener dies with the socket.
     ///
     /// Nothing retired it before: the resource destructor deleted the

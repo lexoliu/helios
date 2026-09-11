@@ -435,6 +435,26 @@ where
         NetworkService::tcp_read(self, stream, max_bytes, timeout_nanos).await
     }
 
+    fn tcp_try_read(
+        &self,
+        stream: Self::TcpStream,
+        max_bytes: usize,
+    ) -> Result<crate::TcpReadProgress, TcpError> {
+        NetworkService::tcp_try_read(self, stream, max_bytes)
+    }
+
+    fn tcp_send_room(&self, stream: Self::TcpStream) -> Result<usize, TcpError> {
+        NetworkService::tcp_send_room(self, stream)
+    }
+
+    fn tcp_try_write(&self, stream: Self::TcpStream, bytes: &mut Bytes) -> Result<usize, TcpError> {
+        NetworkService::tcp_try_write(self, stream, bytes)
+    }
+
+    async fn tcp_write_ready(&self, stream: Self::TcpStream) -> Result<(), TcpError> {
+        NetworkService::tcp_write_ready(self, stream).await
+    }
+
     async fn tcp_read_into<'a>(
         &'a self,
         stream: Self::TcpStream,

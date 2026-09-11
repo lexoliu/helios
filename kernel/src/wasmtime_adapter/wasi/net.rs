@@ -1,4 +1,8 @@
+use alloc::boxed::Box;
 use pin_project_lite::pin_project;
+
+use wasmtime_wasi_io::poll::Pollable;
+use wasmtime_wasi_io::streams::{InputStream, OutputStream, StreamError};
 
 use crate::{ComponentHostNetwork, NetworkHandle, RetiredNetworkHandle, SocketRetirementSender};
 
@@ -898,6 +902,223 @@ impl TcpSocket {
         let stream = state.stream.ok_or(socket_types::ErrorCode::InvalidState)?;
         state.send_shutdown = true;
         Ok(stream)
+    }
+}
+
+/// A `wasi:io` `input-stream` on a connected `wasi:sockets` TCP socket,
+/// driven by the guest task's own poll rather than a bridge task.
+///
+/// # Concurrency contract
+///
+/// The connection lives on one `NetworkShard`, the shard its flow hash
+/// placed on the processor that opened or accepted it; the shard's spin
+/// lock serializes every stack access this stream makes, and the shard's
+/// arrival signal is the only cross-processor hand-off. The guest task
+/// polling this stream may be running on any processor the executor put
+/// it on: `read` takes the owning shard's lock for exactly one queue
+/// drain ([`ComponentNetworkService::tcp_try_read`]), and `ready` parks
+/// the guest task on the shard's arrival signal plus the device event of
+/// the queue pair this processor drains — both marks sampled before the
+/// receive queue is probed, so a segment placed by another processor
+/// between the probe and the park resolves the wait rather than being
+/// slept through (§4's arm-before-test). Nothing here blocks,
+/// busy-waits, or holds a lock across an await.
+///
+/// What replaced the bridge's per-chunk channel messages: nothing.
+/// `read` hands the caller the `Bytes` the receive path already produced
+/// — the one allocation a socket read has always had — with no channel
+/// hop between the socket and the guest.
+pub struct TcpSocketInputStream<Net>
+where
+    Net: ComponentHostNetwork,
+{
+    socket: TcpSocket,
+    service: Net,
+}
+
+impl<Net> TcpSocketInputStream<Net>
+where
+    Net: ComponentHostNetwork,
+{
+    pub fn new(socket: TcpSocket, service: Net) -> Self {
+        Self { socket, service }
+    }
+}
+
+#[wasmtime_wasi_io::async_trait]
+impl<Net> Pollable for TcpSocketInputStream<Net>
+where
+    Net: ComponentHostNetwork,
+{
+    async fn ready(&mut self) {
+        if self.socket.inner.lock().receive_shutdown {
+            // A guest-directed shutdown reads as end-of-stream, and a
+            // closed stream is always ready: there is nothing to wait
+            // for.
+            return;
+        }
+        let Ok(stream) = self.socket.connected_stream() else {
+            // No connection: resolve so `read` reports the state itself.
+            return;
+        };
+        // A zero-length read is the readiness probe: it resolves when
+        // the receive queue is non-empty or the connection has ended,
+        // without consuming a byte. The service samples the shard's
+        // arrival mark before it inspects the queue, which is what makes
+        // this a wait rather than a spin.
+        let _ = self
+            .service
+            .tcp_read(NetworkHandle::from_raw(stream), 0, u64::MAX)
+            .await;
+    }
+}
+
+#[wasmtime_wasi_io::async_trait]
+impl<Net> InputStream for TcpSocketInputStream<Net>
+where
+    Net: ComponentHostNetwork,
+{
+    fn read(&mut self, size: usize) -> core::result::Result<Bytes, StreamError> {
+        if self.socket.inner.lock().receive_shutdown {
+            return Err(StreamError::Closed);
+        }
+        let Ok(stream) = self.socket.connected_stream() else {
+            return Err(StreamError::trap(
+                "TCP input stream read on a socket with no connection",
+            ));
+        };
+        match self
+            .service
+            .tcp_try_read(NetworkHandle::from_raw(stream), size)
+        {
+            Ok(crate::TcpReadProgress::Data(bytes)) => Ok(bytes),
+            // Empty is "not ready": the guest's `ready` is the wait.
+            Ok(crate::TcpReadProgress::Pending) => Ok(Bytes::new()),
+            Ok(crate::TcpReadProgress::Eof) => Err(StreamError::Closed),
+            Err(error) => Err(StreamError::LastOperationFailed(wasmtime::Error::new(
+                error,
+            ))),
+        }
+    }
+}
+
+/// A `wasi:io` `output-stream` on the same connection, under the same
+/// contract as [`TcpSocketInputStream`].
+///
+/// `write` queues onto the socket's send path and drives it to the wire
+/// — the shard's segment production, the ring submit and the doorbell —
+/// inside the caller's own poll, the publish the detached write bridge
+/// used to do one channel hop later. A batch the send queue could not
+/// take whole is parked in `pending`: `ready` completes it through the
+/// service's own write wait, and `check_write` withholds the next permit
+/// until it is gone — the same flow control the channel output stream
+/// applied, minus the hop.
+pub struct TcpSocketOutputStream<Net>
+where
+    Net: ComponentHostNetwork,
+{
+    socket: TcpSocket,
+    service: Net,
+    /// The unwritten remainder of a `write` the send queue could not
+    /// take, completed by `ready` before the next permit is issued.
+    pending: Option<Bytes>,
+}
+
+impl<Net> TcpSocketOutputStream<Net>
+where
+    Net: ComponentHostNetwork,
+{
+    pub fn new(socket: TcpSocket, service: Net) -> Self {
+        Self {
+            socket,
+            service,
+            pending: None,
+        }
+    }
+}
+
+#[wasmtime_wasi_io::async_trait]
+impl<Net> Pollable for TcpSocketOutputStream<Net>
+where
+    Net: ComponentHostNetwork,
+{
+    async fn ready(&mut self) {
+        let Ok(stream) = self.socket.connected_stream() else {
+            return;
+        };
+        let handle = NetworkHandle::from_raw(stream);
+        if let Some(bytes) = self.pending.take() {
+            // The service's write-all carries the batch through whatever
+            // window opens — its own loop arms the shard wait before it
+            // re-tries the queue.
+            let _ = self
+                .service
+                .tcp_write_all_bytes(handle, bytes, u64::MAX)
+                .await;
+            return;
+        }
+        let _ = self.service.tcp_write_ready(handle).await;
+    }
+}
+
+#[wasmtime_wasi_io::async_trait]
+impl<Net> OutputStream for TcpSocketOutputStream<Net>
+where
+    Net: ComponentHostNetwork,
+{
+    fn write(&mut self, bytes: Bytes) -> core::result::Result<(), StreamError> {
+        if self.socket.inner.lock().send_shutdown {
+            return Err(StreamError::Closed);
+        }
+        let Ok(stream) = self.socket.connected_stream() else {
+            return Err(StreamError::trap(
+                "TCP output stream write on a socket with no connection",
+            ));
+        };
+        if self.pending.is_some() {
+            return Err(StreamError::trap(
+                "TCP output stream write exceeded its check-write permit",
+            ));
+        }
+        let mut bytes = bytes;
+        self.service
+            .tcp_try_write(NetworkHandle::from_raw(stream), &mut bytes)
+            .map_err(|error| StreamError::LastOperationFailed(wasmtime::Error::new(error)))?;
+        // What the send queue could not take is parked rather than
+        // dropped or errored: `ready` completes it, and `check_write`
+        // withholds the next permit until then.
+        if !bytes.is_empty() {
+            self.pending = Some(bytes);
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> core::result::Result<(), StreamError> {
+        // A write has already pushed its bytes to the wire, and a parked
+        // batch is `ready`'s to complete — `check_write` pends on it,
+        // which is the contract's "flush completes" point. There is
+        // nothing left to push here.
+        if self.socket.inner.lock().send_shutdown {
+            return Err(StreamError::Closed);
+        }
+        Ok(())
+    }
+
+    fn check_write(&mut self) -> core::result::Result<usize, StreamError> {
+        if self.socket.inner.lock().send_shutdown {
+            return Err(StreamError::Closed);
+        }
+        let Ok(stream) = self.socket.connected_stream() else {
+            return Err(StreamError::trap(
+                "TCP output stream check-write on a socket with no connection",
+            ));
+        };
+        if self.pending.is_some() {
+            return Ok(0);
+        }
+        self.service
+            .tcp_send_room(NetworkHandle::from_raw(stream))
+            .map_err(|error| StreamError::LastOperationFailed(wasmtime::Error::new(error)))
     }
 }
 

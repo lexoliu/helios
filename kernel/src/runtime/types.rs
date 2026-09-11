@@ -573,6 +573,18 @@ pub struct SocketReadiness {
     pub hangup: bool,
 }
 
+/// What a non-parking poll of a TCP stream's receive queue found.
+///
+/// The tri-state a `read` that must never block resolves to: bytes to
+/// hand the caller, the peer's send side done, or nothing ready — which
+/// is the caller's signal to park on the stream's readiness, not to poll
+/// again.
+pub enum TcpReadProgress {
+    Pending,
+    Data(Bytes),
+    Eof,
+}
+
 /// What the component host needs of the machine's network service.
 ///
 /// The host is generic over this the way it is generic over
@@ -736,6 +748,51 @@ pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
         max_bytes: u32,
         timeout_nanos: u64,
     ) -> impl Future<Output = Result<Option<Bytes>, TcpError>> + Send + 'a;
+
+    /// Drains up to `max_bytes` of what `stream`'s receive queue already
+    /// holds, without parking and without driving the device.
+    ///
+    /// This is the non-blocking `read` of a socket-backed byte stream: it
+    /// runs on the guest task's own poll, so the only bytes it may report
+    /// are the ones already delivered to the shard — anything still in
+    /// the device's rings belongs to the readiness wait that follows a
+    /// `Pending` answer. A drain that relieves receive backpressure
+    /// raises the shard's arrival signal itself.
+    fn tcp_try_read(
+        &self,
+        stream: Self::TcpStream,
+        max_bytes: usize,
+    ) -> Result<TcpReadProgress, TcpError>;
+
+    /// Bytes `stream`'s send queue takes right now — the write permit a
+    /// stream reports: a `write` of at most this many never has to park.
+    ///
+    /// Zero on a connection that cannot send, so a caller parking on the
+    /// answer does not sleep through a shutdown.
+    fn tcp_send_room(&self, stream: Self::TcpStream) -> Result<usize, TcpError>;
+
+    /// Queues up to `bytes.len()` on `stream`'s send path and publishes
+    /// it synchronously: the stack's segment production, the egress drain
+    /// onto the rings and the doorbell all run on the caller's own poll.
+    /// Returns the count `bytes` gave up; whatever did not fit stays in
+    /// `bytes` for the caller to park or complete later.
+    ///
+    /// Synchronous because a guest stream's `write` may not block:
+    /// everything it touches — the shard lock, the ring's `try_lock`
+    /// submit — is held for the call and released before it returns.
+    fn tcp_try_write(&self, stream: Self::TcpStream, bytes: &mut Bytes) -> Result<usize, TcpError>;
+
+    /// Resolves when `stream`'s send queue has room or the stream is
+    /// gone — a socket-backed output stream's readiness wait.
+    ///
+    /// The implementation samples the owning shard's arrival mark and
+    /// the queue pair's event mark before it probes the send queue, so
+    /// an ACK another processor drains between the probe and the park
+    /// resolves the wait rather than being slept through.
+    fn tcp_write_ready(
+        &self,
+        stream: Self::TcpStream,
+    ) -> impl Future<Output = Result<(), TcpError>> + Send + '_;
 
     fn tcp_read_into<'a>(
         &'a self,

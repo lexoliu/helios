@@ -233,7 +233,13 @@ where
         Ok((outcome.progress, outcome.budget))
     }
 
-    pub(super) async fn submit_network_transmit(
+    /// Drains every shard's egress onto its ring and rings the doorbell.
+    ///
+    /// Synchronous because nothing in it awaits: the stack's outbound
+    /// drain and the device's `try_lock` submit both complete where they
+    /// are called, which is what lets a non-blocking socket `write`
+    /// publish its own segment on the caller's task.
+    pub(super) fn submit_network_transmit(
         &self,
         source: NetworkPollSource,
         budget: NetworkPollBudget,

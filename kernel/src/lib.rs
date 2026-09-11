@@ -204,7 +204,7 @@ pub use runtime::{
     HostFileSystem, HostFsError, HostFsErrorKind, HostMetadata, Ipv4Address, NetworkErrorDetail,
     NetworkHandle, NetworkIpAddress, ObjectIdentity, PingError, PingErrorKind, PingReply,
     RegisteredTcpReadBuffer, RuntimeState, SocketReadiness, TcpAccepted, TcpError, TcpErrorKind,
-    TcpListener, UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
+    TcpListener, TcpReadProgress, UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
 };
 pub use surface::{
     MAX_INSTANCE_SURFACES, MAX_LIVE_SURFACES, ReturnedSurfaces, SURFACE_EVENT_QUEUE_DEPTH,

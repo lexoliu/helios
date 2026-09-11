@@ -669,6 +669,32 @@ impl ComponentNetworkService for BenchNetworkService {
         Ok(Some(self.payload.clone()))
     }
 
+    fn tcp_try_read(
+        &self,
+        _stream: Self::TcpStream,
+        _max_bytes: usize,
+    ) -> Result<helios_kernel::TcpReadProgress, TcpError> {
+        Ok(helios_kernel::TcpReadProgress::Data(self.payload.clone()))
+    }
+
+    fn tcp_send_room(&self, _stream: Self::TcpStream) -> Result<usize, TcpError> {
+        Ok(usize::MAX)
+    }
+
+    fn tcp_try_write(
+        &self,
+        _stream: Self::TcpStream,
+        bytes: &mut Bytes,
+    ) -> Result<usize, TcpError> {
+        let written = bytes.len();
+        bytes.clear();
+        Ok(written)
+    }
+
+    async fn tcp_write_ready(&self, _stream: Self::TcpStream) -> Result<(), TcpError> {
+        Ok(())
+    }
+
     async fn tcp_shutdown_send(&self, _stream: Self::TcpStream) -> Result<(), TcpError> {
         Ok(())
     }

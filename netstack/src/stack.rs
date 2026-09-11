@@ -3334,11 +3334,23 @@ where
     }
 
     pub fn tcp_send_ready(&self, socket: SocketId) -> Result<bool, StackError> {
+        Ok(self.tcp_send_room(socket)? != 0)
+    }
+
+    /// Bytes `socket`'s send queue takes right now.
+    ///
+    /// Zero on a connection that cannot send — one not yet established or
+    /// past its own close — so a caller parking on this answer does not
+    /// sleep through a shutdown. `send_capacity_bytes` alone reports
+    /// queue room on a dead socket and cannot be the probe.
+    pub fn tcp_send_room(&self, socket: SocketId) -> Result<usize, StackError> {
         let socket = self.tcp_socket(socket)?;
-        Ok(matches!(
-            socket.state(),
-            crate::TcpState::Established | crate::TcpState::CloseWait
-        ) && socket.send_capacity_bytes() != 0)
+        Ok(match socket.state() {
+            crate::TcpState::Established | crate::TcpState::CloseWait => {
+                socket.send_capacity_bytes()
+            }
+            _ => 0,
+        })
     }
 
     /// Report whether `socket` has a datagram waiting, without dequeuing it.

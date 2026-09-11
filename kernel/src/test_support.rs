@@ -908,6 +908,35 @@ mod network {
             core::future::ready(Ok(Some(Bytes::from_static(&[4, 2]))))
         }
 
+        fn tcp_try_read(
+            &self,
+            _: Self::TcpStream,
+            _: usize,
+        ) -> Result<crate::TcpReadProgress, crate::TcpError> {
+            Ok(crate::TcpReadProgress::Data(Bytes::from_static(&[4, 2])))
+        }
+
+        fn tcp_send_room(&self, _: Self::TcpStream) -> Result<usize, crate::TcpError> {
+            Ok(usize::MAX)
+        }
+
+        fn tcp_try_write(
+            &self,
+            _: Self::TcpStream,
+            bytes: &mut Bytes,
+        ) -> Result<usize, crate::TcpError> {
+            let written = bytes.len();
+            bytes.clear();
+            Ok(written)
+        }
+
+        fn tcp_write_ready(
+            &self,
+            _: Self::TcpStream,
+        ) -> impl core::future::Future<Output = Result<(), crate::TcpError>> + Send + '_ {
+            core::future::ready(Ok(()))
+        }
+
         fn tcp_shutdown_send(
             &self,
             _: Self::TcpStream,

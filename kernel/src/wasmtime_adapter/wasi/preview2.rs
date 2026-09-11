@@ -4,8 +4,6 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::future::Future as _;
-use core::task::Poll;
 
 use helios_hal::cpu::Cpu;
 use helios_netstack::Ipv6Address;
@@ -22,6 +20,7 @@ use wasmtime_wasi_io::{self};
 use super::bindings::clocks::system_clock::Instant as P3SystemInstant;
 use super::bindings::filesystem::types as p3fs;
 use super::bindings::filesystem::types::{ErrorCode as P3ErrorCode, OpenFlags as P3OpenFlags};
+use super::net::{TcpSocketInputStream, TcpSocketOutputStream};
 use super::{
     DebugFileSystem, FsDescriptor, FsNodeKind, HostFileStreamTarget, P2IncomingDatagramStream,
     P2Network, P2OutgoingDatagramStream, P2ResolveAddressStream, PendingAccept, Preview2GuestExit,
@@ -40,7 +39,7 @@ use crate::wasmtime_adapter::store::{
 use crate::wasmtime_adapter::wasi::map_host_fs_error;
 use crate::{
     ComponentOutputMode, ComponentOutputRoute, ComponentOutputStreamKind, NetworkHandle,
-    PerfSample, ProfileScope,
+    ProfileScope,
 };
 
 #[cfg(test)]
@@ -2957,96 +2956,18 @@ fn p2_record_kernel_profile<CpuImpl, Net, HostFs>(
     }
 }
 
-struct P2KernelProfileStart {
-    ticks: u64,
-    counters: helios_hal::cpu::HardwarePerfCounters,
-}
-
-fn p2_kernel_profile_start<CpuImpl, Net, HostFs>(
-    runtime_state: &HostRuntimeState<CpuImpl, Net, HostFs>,
-    cpu: &CpuImpl,
-) -> Option<P2KernelProfileStart>
-where
-    CpuImpl: Cpu + Clone,
-    Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
-{
-    runtime_state
-        .profiling_enabled()
-        .then(|| P2KernelProfileStart {
-            ticks: cpu.now().ticks(),
-            counters: cpu.hardware_perf_counters(),
-        })
-}
-
-fn p2_record_kernel_profile_events_bytes<CpuImpl, Net, HostFs>(
-    runtime_state: &HostRuntimeState<CpuImpl, Net, HostFs>,
-    cpu: &CpuImpl,
-    phase: &'static str,
-    profile: Option<P2KernelProfileStart>,
-    events: u64,
-    bytes: u64,
-) where
-    CpuImpl: Cpu + Clone,
-    Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
-{
-    let Some(profile) = profile else {
-        return;
-    };
-    let finished_ticks = cpu.now().ticks();
-    let elapsed_ticks = finished_ticks.saturating_sub(profile.ticks);
-    runtime_state.record_profile_stack_parts(
-        ProfileScope::Kernel,
-        "kernel;preview2;",
-        phase,
-        elapsed_ticks,
-    );
-    let elapsed_nanos = runtime_state
-        .uptime_nanos(finished_ticks)
-        .saturating_sub(runtime_state.uptime_nanos(profile.ticks));
-    let counters = cpu.hardware_perf_counters().delta_since(profile.counters);
-    runtime_state.record_perf_metric_parts(
-        ProfileScope::Kernel,
-        "kernel;preview2;",
-        phase,
-        PerfSample {
-            events,
-            elapsed_nanos,
-            counters,
-            bytes,
-        },
-    );
-}
-
-fn p2_usize_to_u64(value: usize, label: &'static str) -> u64 {
-    u64::try_from(value).unwrap_or_else(|_| panic!("{label} does not fit into u64"))
-}
-
-/// One bridge read, raced against the guest half of the channel going
-/// away. `None` means the channel is gone and the bridge is done.
-async fn p2_tcp_bridge_read<Net: ComponentHostNetwork>(
-    socket: &TcpSocket,
-    service: &Net,
-    writer: &crate::ByteWriter,
-    max_bytes: u32,
-) -> Option<core::result::Result<Option<Bytes>, super::socket_types::ErrorCode>> {
-    let read = socket.read(service, max_bytes);
-    let closed = writer.reader_closed();
-    let mut read = core::pin::pin!(read);
-    let mut closed = core::pin::pin!(closed);
-    core::future::poll_fn(|cx| {
-        if let Poll::Ready(read) = read.as_mut().poll(cx) {
-            return Poll::Ready(Some(read));
-        }
-        if closed.as_mut().poll(cx).is_ready() {
-            return Poll::Ready(None);
-        }
-        Poll::Pending
-    })
-    .await
-}
-
+/// The `input-stream`/`output-stream` pair a connected TCP socket hands
+/// the guest.
+///
+/// The streams are the socket: no bridge task and no byte channel stands
+/// between them and the connection. `write` queues onto the send path and
+/// submits it on the guest task's own poll, `read` drains the socket's
+/// receive queue directly, and `ready`/`subscribe` park that same task on
+/// the owning shard's progress signal — see [`TcpSocketInputStream`] for
+/// the concurrency contract. Two fewer tasks per connection is also what
+/// makes teardown trivial: a parked `ready` lives inside the guest's own
+/// task and dies with the store, which is the lifetime the bridge's
+/// channel race had to re-create by hand (#184).
 fn p2_tcp_stream_pair<CpuImpl, Net, HostFs>(
     store: &mut StoreData<CpuImpl, Net, HostFs>,
     socket_resource: &Resource<TcpSocket>,
@@ -3058,146 +2979,23 @@ where
     HostFs: crate::HostFileSystem,
 {
     let started = store.cpu.now().ticks();
-    let (network_writer, guest_reader) = crate::byte_channel();
-    let (guest_writer, network_reader) = crate::byte_channel();
-    let input = store.table.push_child(
-        Box::new(ChannelInputStream::new(guest_reader)) as DynInputStream,
-        socket_resource,
-    )?;
-    let output = store.table.push_child(
-        Box::new(ChannelOutputStream::new(guest_writer)) as DynOutputStream,
-        socket_resource,
-    )?;
-    let read_socket = socket.clone();
-    let read_cpu = store.cpu.clone();
-    let read_runtime_state = store.runtime_state.clone();
-    // Both bridge tasks run without a store, so each carries its own
-    // clone of the concrete service rather than reading one back out of
-    // the socket, which holds none.
-    let Some(read_service) = store.runtime_state.network_service() else {
+    // The streams run without a store, so each carries its own clone of
+    // the concrete service rather than reading one back out of the
+    // socket, which holds none.
+    let Some(service) = store.runtime_state.network_service() else {
         return Err(wasmtime::Error::new(crate::ProgramExecError {
             kind: crate::ProgramExecErrorKind::Internal,
             detail: crate::ProgramExecErrorDetail::InternalInvariant,
         }));
     };
-    let write_service = read_service.clone();
-    store.spawner().try_spawn_detached(async move {
-        loop {
-            let read_started = p2_kernel_profile_start(&read_runtime_state, &read_cpu);
-            // The bridge holds a clone of the socket, so it is the
-            // bridge that decides when the socket's kernel stream can
-            // be retired. A backend read carries no deadline, so left
-            // alone this parks for ever — and when the instance goes
-            // away, taking the guest half of the channel with it, the
-            // bridge stayed parked and the connection stayed in its
-            // shard (#184). Racing the read against the channel's own
-            // close ends the bridge with the store it belongs to; a
-            // cancelled read leaves its bytes in the socket, which is
-            // about to be retired anyway.
-            let Some(read) = p2_tcp_bridge_read(
-                &read_socket,
-                &read_service,
-                &network_writer,
-                super::FILE_READ_CHUNK_BYTES as u32,
-            )
-            .await
-            else {
-                break;
-            };
-            match read {
-                Ok(Some(bytes)) => {
-                    let byte_len = p2_usize_to_u64(bytes.len(), "preview2 tcp bridge byte count");
-                    p2_record_kernel_profile_events_bytes(
-                        &read_runtime_state,
-                        &read_cpu,
-                        "tcp-bridge-read-backend",
-                        read_started,
-                        1,
-                        byte_len,
-                    );
-                    let enqueue_started = p2_kernel_profile_start(&read_runtime_state, &read_cpu);
-                    // Awaiting here is the guest's backpressure: the
-                    // bridge stops pulling from the socket while the
-                    // guest-side channel is full.
-                    if network_writer.write(bytes).await.is_err() {
-                        p2_record_kernel_profile_events_bytes(
-                            &read_runtime_state,
-                            &read_cpu,
-                            "tcp-bridge-read-enqueue-closed",
-                            enqueue_started,
-                            1,
-                            byte_len,
-                        );
-                        break;
-                    }
-                    p2_record_kernel_profile_events_bytes(
-                        &read_runtime_state,
-                        &read_cpu,
-                        "tcp-bridge-read-enqueue",
-                        enqueue_started,
-                        1,
-                        byte_len,
-                    );
-                }
-                Ok(None) => {
-                    let read_started = read_started
-                        .map(|profile| profile.ticks)
-                        .unwrap_or_else(|| read_cpu.now().ticks());
-                    p2_record_kernel_profile(
-                        &read_runtime_state,
-                        &read_cpu,
-                        "tcp-bridge-read-eof",
-                        read_started,
-                    );
-                    break;
-                }
-                Err(error) => {
-                    let read_started = read_started
-                        .map(|profile| profile.ticks)
-                        .unwrap_or_else(|| read_cpu.now().ticks());
-                    p2_record_kernel_profile(
-                        &read_runtime_state,
-                        &read_cpu,
-                        "tcp-bridge-read-error",
-                        read_started,
-                    );
-                    tracing::warn!(
-                        target: "helios_kernel::wasi::preview2::tcp",
-                        ?error,
-                        "tcp input stream bridge stopped after backend read error"
-                    );
-                    break;
-                }
-            }
-        }
-    })?;
-    let write_cpu = store.cpu.clone();
-    let write_runtime_state = store.runtime_state.clone();
-    store.spawner().try_spawn_detached(async move {
-        while let Some(bytes) = network_reader.read().await {
-            let started = write_cpu.now().ticks();
-            if let Err(error) = socket.write_all_bytes(&write_service, bytes).await {
-                p2_record_kernel_profile(
-                    &write_runtime_state,
-                    &write_cpu,
-                    "tcp-bridge-write-error",
-                    started,
-                );
-                tracing::warn!(
-                    target: "helios_kernel::wasi::preview2::tcp",
-                    ?error,
-                    "tcp output stream bridge stopped after backend write error"
-                );
-                break;
-            }
-            p2_record_kernel_profile(
-                &write_runtime_state,
-                &write_cpu,
-                "tcp-bridge-write",
-                started,
-            );
-        }
-    })?;
+    let input = store.table.push_child(
+        Box::new(TcpSocketInputStream::new(socket.clone(), service.clone())) as DynInputStream,
+        socket_resource,
+    )?;
+    let output = store.table.push_child(
+        Box::new(TcpSocketOutputStream::new(socket, service)) as DynOutputStream,
+        socket_resource,
+    )?;
     p2_record_kernel_profile(&store.runtime_state, &store.cpu, "tcp-stream-pair", started);
     Ok((input, output))
 }
