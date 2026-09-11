@@ -3,6 +3,7 @@ use std::io::{self, Write};
 
 use helios_api::ReadExt;
 use helios_api::http::{ErrorCode, Request, UrlError};
+use helios_curl_write_out::expand_write_out;
 use thiserror::Error;
 
 type Result<T> = core::result::Result<T, CurlError>;
@@ -50,8 +51,8 @@ enum CurlError {
         #[source]
         source: io::Error,
     },
-    #[error("unsupported write-out variable in `{0}`")]
-    UnsupportedWriteOut(String),
+    #[error(transparent)]
+    UnsupportedWriteOut(#[from] helios_curl_write_out::Error),
 }
 
 struct CurlOptions {
@@ -125,56 +126,6 @@ fn parse_options() -> Result<CurlOptions> {
         output,
         write_out,
     })
-}
-
-/// `--write-out` interpolation, the curl subset this tool's callers use:
-/// `%{size_download}` for the received body length, `%%` for a literal
-/// percent sign, and the `\\n`, `\\r`, `\\t` and `\\\\` escapes curl
-/// expands. An unknown `%{…}` variable is an error; an unknown `\\x`
-/// escape passes both characters through. The same expansion runs in
-/// `tools/wasi-apps/wasi-curl`, so both sides of the benchmark emit the
-/// same bytes.
-fn expand_write_out(template: &str, size_download: usize) -> Result<String> {
-    const SIZE_DOWNLOAD: &str = "%{size_download}";
-    let mut rendered = String::with_capacity(template.len());
-    let mut rest = template;
-    while let Some(ch) = rest.chars().next() {
-        if let Some(tail) = rest.strip_prefix(SIZE_DOWNLOAD) {
-            rendered.push_str(&size_download.to_string());
-            rest = tail;
-            continue;
-        }
-        if let Some(tail) = rest.strip_prefix("%%") {
-            rendered.push('%');
-            rest = tail;
-            continue;
-        }
-        if rest.starts_with("%{") {
-            return Err(CurlError::UnsupportedWriteOut(template.to_owned()));
-        }
-        if ch != '\\' {
-            rendered.push(ch);
-            rest = &rest[ch.len_utf8()..];
-            continue;
-        }
-        rest = &rest[1..];
-        let Some(escape) = rest.chars().next() else {
-            rendered.push('\\');
-            break;
-        };
-        rest = &rest[escape.len_utf8()..];
-        match escape {
-            'n' => rendered.push('\n'),
-            'r' => rendered.push('\r'),
-            't' => rendered.push('\t'),
-            '\\' => rendered.push('\\'),
-            other => {
-                rendered.push('\\');
-                rendered.push(other);
-            }
-        }
-    }
-    Ok(rendered)
 }
 
 fn write_out(template: &str, size_download: usize) -> Result<()> {

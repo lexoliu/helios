@@ -14,6 +14,7 @@ use std::io::{self, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::num::ParseIntError;
 
+use helios_curl_write_out::expand_write_out;
 use thiserror::Error;
 
 type Result<T> = core::result::Result<T, CurlError>;
@@ -63,8 +64,8 @@ enum CurlError {
         #[source]
         source: io::Error,
     },
-    #[error("unsupported write-out variable in `{0}`")]
-    UnsupportedWriteOut(String),
+    #[error(transparent)]
+    UnsupportedWriteOut(#[from] helios_curl_write_out::Error),
 }
 
 struct CurlOptions {
@@ -182,54 +183,6 @@ fn parse_options() -> Result<CurlOptions> {
     })
 }
 
-/// `--write-out` interpolation, the curl subset this tool's callers use:
-/// `%{size_download}` for the received body length, `%%` for a literal
-/// percent sign, and the `\\n`, `\\r`, `\\t` and `\\\\` escapes curl
-/// expands. An unknown `%{…}` variable is an error; an unknown `\\x`
-/// escape passes both characters through.
-fn expand_write_out(template: &str, size_download: usize) -> Result<String> {
-    const SIZE_DOWNLOAD: &str = "%{size_download}";
-    let mut rendered = String::with_capacity(template.len());
-    let mut rest = template;
-    while let Some(ch) = rest.chars().next() {
-        if let Some(tail) = rest.strip_prefix(SIZE_DOWNLOAD) {
-            rendered.push_str(&size_download.to_string());
-            rest = tail;
-            continue;
-        }
-        if let Some(tail) = rest.strip_prefix("%%") {
-            rendered.push('%');
-            rest = tail;
-            continue;
-        }
-        if rest.starts_with("%{") {
-            return Err(CurlError::UnsupportedWriteOut(template.to_owned()));
-        }
-        if ch != '\\' {
-            rendered.push(ch);
-            rest = &rest[ch.len_utf8()..];
-            continue;
-        }
-        rest = &rest[1..];
-        let Some(escape) = rest.chars().next() else {
-            rendered.push('\\');
-            break;
-        };
-        rest = &rest[escape.len_utf8()..];
-        match escape {
-            'n' => rendered.push('\n'),
-            'r' => rendered.push('\r'),
-            't' => rendered.push('\t'),
-            '\\' => rendered.push('\\'),
-            other => {
-                rendered.push('\\');
-                rendered.push(other);
-            }
-        }
-    }
-    Ok(rendered)
-}
-
 fn write_out(template: &str, size_download: usize) -> Result<()> {
     let rendered = expand_write_out(template, size_download)?;
     let mut stdout = io::stdout();
@@ -338,17 +291,6 @@ mod tests {
     use std::thread;
 
     use super::*;
-
-    #[test]
-    fn write_out_interprets_curl_escapes() {
-        assert_eq!(
-            expand_write_out("curl-http-throughput:%{size_download}\\n", 67108864).unwrap(),
-            "curl-http-throughput:67108864\n"
-        );
-        assert_eq!(expand_write_out("\\ta\\rb\\\\c", 0).unwrap(), "\ta\rb\\c");
-        assert_eq!(expand_write_out("100%%", 0).unwrap(), "100%");
-        assert!(expand_write_out("%{unknown}", 0).is_err());
-    }
 
     #[test]
     fn fetch_streams_the_body_as_it_arrives() {
