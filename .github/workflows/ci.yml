@@ -644,10 +644,12 @@ jobs:
           # the signature check and 9p, leaving the x86-specific memory
           # path unmeasured (#352). This boot is the KVM measurement:
           # --enable-target opens helios_kernel::exec::phases on the
-          # kernel console filter, two python3 launches give one cold
-          # and one warm split, and debug-serial.log is the artifact the
-          # orchestrator reads the split from. docs/benchmarks.md lists
-          # the phase names.
+          # kernel console filter and each launch emits one line — every
+          # phase's offset from rpc-arrival, written once after the
+          # guest ran so the UART cost lands outside every interval.
+          # Two python3 launches give one cold and one warm split, and
+          # debug-serial.log is the artifact the orchestrator reads the
+          # split from. docs/benchmarks.md lists the fields.
           runtime="$GITHUB_WORKSPACE/smoke-runtime/cpython-phases"
           mkdir -p "$runtime"
           ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
@@ -659,18 +661,22 @@ jobs:
             shell -c 'python3 -c "print(1)"; python3 -c "print(2)"' \
             2>&1 > cpython-phases-smoke.out | tee "$runtime/inspector.log"
           cat cpython-phases-smoke.out
-          # `program` is the launched program's name in every phase
-          # event: the path on the RPC boundaries, the argv program name
-          # inside the load and run phases — both name python3 here.
-          phases="$(grep -F 'python3' "$runtime/debug-serial.log")"
-          echo "$phases"
-          # Two launches arrived, one cold and one warm: the deserialize
-          # boundary exists once, the warm launch's deserialize-cache
-          # lookup hits, and each launch brackets its guest run.
-          test "$(echo "$phases" | grep -cF 'phase=rpc-arrival')" -eq 2
-          test "$(echo "$phases" | grep -cF 'phase=deserialize')" -eq 1
-          test "$(echo "$phases" | grep -cF 'phase=cache-lookup kind=component hit=true')" -eq 1
-          test "$(echo "$phases" | grep -cE 'phase=guest-(begin|end)')" -eq 4
+          # debug-serial.log carries console escape bytes, so grep reads
+          # it as text with -a. `program` on a launch line is the
+          # launched program's name — the RPC path or the argv name or
+          # the resolved guest path, all of which name python3 here.
+          lines="$(grep -a 'phase_count' "$runtime/debug-serial.log" | grep -a 'python3')"
+          echo "$lines"
+          # Each launch emits exactly one line carrying phase_count.
+          test "$(echo "$lines" | grep -ac 'phase_count')" -eq 2
+          # The cold launch paid a deserialize; the warm launch's
+          # deserialize cache hit means it never reached that phase, so
+          # the field is absent from its line.
+          cold="$(echo "$lines" | grep -a 'cache_hit=false')"
+          warm="$(echo "$lines" | grep -a 'cache_hit=true')"
+          echo "$cold" | grep -aq 'deserialize_ns'
+          test "$(echo "$warm" | grep -ac 'deserialize_ns')" -eq 0
+          echo "$warm" | grep -aq 'cache_hit=true'
       - name: Compile a guest with the in-kernel compiler plugin
         shell: bash
         working-directory: helios
