@@ -215,10 +215,11 @@ where
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    // The line's owner: emits when this run ends — on any exit — but
-    // only when the caller marked the handle `for_task`.
-    let _task_trace = timeline.task_guard(exec_context.cpu.clone());
-    match executable {
+    // The line's owner: marks the run's terminal and emits when this
+    // run ends — on any exit — but only when the caller marked the
+    // handle `for_task`.
+    let task_trace = timeline.task_guard(exec_context.cpu.clone());
+    let outcome = match executable {
         ProgramExecutable::Component(compiled) => {
             run_program_component(
                 exec_context,
@@ -285,7 +286,11 @@ where
             )
             .await
         }
-    }
+    };
+    // The terminal the line ends with: `completed` on any child exit,
+    // `failed` with the error's kind on a guest trap or host failure.
+    task_trace.finish(&outcome);
+    outcome
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -315,7 +320,14 @@ where
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    let profile_name = argv.program_name().to_owned();
+    // The name feeds only the named kernel-profile records, which are
+    // gated on `profiling_enabled` — the `String` it owns exists only
+    // when that diagnostic is on.
+    let profile_name = if exec_context.runtime_state.profiling_enabled() {
+        argv.program_name().to_owned()
+    } else {
+        String::new()
+    };
     let argv = argv.into_vec();
     let run_cpu = exec_context.cpu.clone();
     let run_timer = exec_context.timer.clone();
@@ -632,7 +644,14 @@ where
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    let profile_name = argv.program_name().to_owned();
+    // The name feeds only the named kernel-profile records, which are
+    // gated on `profiling_enabled` — the `String` it owns exists only
+    // when that diagnostic is on.
+    let profile_name = if exec_context.runtime_state.profiling_enabled() {
+        argv.program_name().to_owned()
+    } else {
+        String::new()
+    };
     let argv = argv.into_vec();
     let run_started_at = monotonic_nanos(&exec_context.cpu);
     let run_cpu = exec_context.cpu.clone();
