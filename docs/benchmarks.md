@@ -226,7 +226,7 @@ nanoseconds from `rpc-arrival`:
 | --- | --- |
 | `rpc_arrival_ns` | the launch call entered the kernel; always `0`, the epoch |
 | `source_read_ns` | the program's bytes are read out of their source (`source_bytes` carries the size) |
-| `trust_ns` | artifact trust established — bootfs trailer parse or signature check |
+| `trust_ns` | artifact trust established — the bootfs trailer parse, the signature check for a signed artifact, or — on a raw-wasm source — the whole in-kernel compile+sign between `load_begin` and here |
 | `cache_lookup_ns` | the deserialize cache answered (`cache_hit` carries its answer) |
 | `deserialize_ns` | the `cwasm` payload deserialized; present only on a cache miss |
 | `instantiate_pre_ns` | the `InstancePre` cache answered or `instantiate_pre` built (`instantiate_pre_hit`) |
@@ -252,13 +252,23 @@ UART MMIO exit per byte — never lands inside a measured interval. That
 is the whole reason for the single-event shape: an event per boundary
 would price each offset at the ~150-byte serial write it costs.
 
-`op` names the launch call (`exec`/`spawn`), `program` the launched
-program (the request path on an RPC launch, the argv name or decoded
-program name on a guest syscall launch), and `instance` the id the
-registry assigned it — `0` when the launch failed before registering.
+`op` names the launch call (`exec`/`spawn`). `program`'s provenance
+differs per surface: an RPC launch carries the request's `path`; a
+guest `proc_spawn*` carries `argv[0]`; a guest `proc_exec*` carries
+the decoded `name` operand — which for a PATH-resolving caller like
+dash is the resolved path, so `program=/bin/python3` there and
+`program=dash`-style argv names on the spawn surface. `instance` is
+the id the registry assigned the launch — `0` when it failed before
+registering, and the real id even on a trapped guest, since the run
+task sets it before the guest ran. `end` says which exit the launch
+took — `completed`, `refused`, `failed` — with `error_kind` (a
+`ProgramExecErrorKind` name) or `errno` when the exit carried one.
 The calling task writes `rpc_arrival` through `load_complete` and
 `reply`; the run task writes `task_begin` through `completion`, through
-the same timeline the launch handed it.
+the same timeline the launch handed it. `reply` is last only on a
+buffered `exec` — on `spawn` and `proc_exec*` the reply boundary is
+recorded while the run task is still starting, so its offset sits
+before `task_begin_ns`.
 
 The target is off by default, so a boot that never asked for it reads
 no timestamp and keeps no timeline — the whole cost is one `enabled`
