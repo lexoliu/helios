@@ -485,7 +485,8 @@
           "inherit": true
         },
         "linux_wasmtime": {
-          "command": "cu=\"{wasmtime} run --allow-precompiled -W shared-memory --dir {workdir}::/work --dir {repo_root}/artifacts/wasix/bash::/input {cwasm:artifacts/wasix/coreutils/coreutils-wasi.wasm}\"; out=/work/pipe-$HELIOS_PROCESS_ID.out; copy=/work/pipe-$HELIOS_PROCESS_ID.copy; $cu head --bytes=131072 /input/bash.wasm | $cu tee $out >/dev/null; $cu cat $out | $cu tee $copy >/dev/null; $cu cat $copy >/dev/null; echo stdio-pipe:ok"
+          "command": "cu=\"{wasmtime} run --allow-precompiled -W shared-memory --dir {workdir}::/work --dir {repo_root}/artifacts/wasix/bash::/input {cwasm:artifacts/wasix/coreutils/coreutils-wasi.wasm}\"; out=pipe-$HELIOS_PROCESS_ID.out; copy=pipe-$HELIOS_PROCESS_ID.copy; $cu head --bytes=131072 /input/bash.wasm | $cu cat > {workdir}/$out; $cu cat /work/$out > {workdir}/$copy; $cu cat /work/$copy > /dev/null; echo stdio-pipe:ok",
+          "exec_parity": "4 execs a side per iteration — head|cat, cat, cat. The > redirects and echo are each side's shell builtins; the host shell's writes land in the directory the WASI side preopens, so no extra process is needed. No residual asymmetry."
         }
       }
     },
@@ -541,7 +542,8 @@
           "inherit": true
         },
         "linux_wasmtime": {
-          "command": "cu=\"{wasmtime} run --allow-precompiled -W shared-memory --dir {workdir}::/work {cwasm:artifacts/wasix/coreutils/coreutils-wasi.wasm}\"; dir=/work/bench-smallfiles-$HELIOS_PROCESS_ID; $cu mkdir $dir; i=0; while [ $i -lt 64 ]; do echo data-$i | $cu tee $dir/f$i >/dev/null; $cu cat $dir/f$i | $cu tee $dir/c$i >/dev/null; i=$((i+1)); done; echo fs-smallfiles:ok"
+          "command": "cu=\"{wasmtime} run --allow-precompiled -W shared-memory --dir {workdir}::/work {cwasm:artifacts/wasix/coreutils/coreutils-wasi.wasm}\"; dir=bench-smallfiles-$HELIOS_PROCESS_ID; $cu mkdir /work/$dir; i=0; while [ $i -lt 64 ]; do echo data-$i > {workdir}/$dir/f$i; $cu cat /work/$dir/f$i > {workdir}/$dir/c$i; i=$((i+1)); done; echo fs-smallfiles:ok",
+          "exec_parity": "65 execs a side per iteration — mkdir + 64 × cat. `echo data > f` and the > redirects are each side's shell builtins; the host shell's write lands in the preopened workdir the WASI cat reads. No residual asymmetry."
         }
       }
     },
@@ -566,7 +568,8 @@
           "inherit": true
         },
         "linux_wasmtime": {
-          "command": "cu=\"{wasmtime} run --allow-precompiled -W shared-memory --dir {workdir}::/work --dir {repo_root}/artifacts/wasix/bash::/input {cwasm:artifacts/wasix/coreutils/coreutils-wasi.wasm}\"; file=/work/bench-readstream-$HELIOS_PROCESS_ID.in; copy=/work/bench-readstream-$HELIOS_PROCESS_ID.out; $cu head --bytes=1048576 /input/bash.wasm | $cu tee $file >/dev/null; $cu cat $file | $cu tee $copy >/dev/null; $cu cat $copy >/dev/null; echo fs-readstream:ok"
+          "command": "cu=\"{wasmtime} run --allow-precompiled -W shared-memory --dir {workdir}::/work --dir {repo_root}/artifacts/wasix/bash::/input {cwasm:artifacts/wasix/coreutils/coreutils-wasi.wasm}\"; file=bench-readstream-$HELIOS_PROCESS_ID.in; copy=bench-readstream-$HELIOS_PROCESS_ID.out; $cu head --bytes=1048576 /input/bash.wasm > {workdir}/$file; $cu cat /work/$file > {workdir}/$copy; $cu cat /work/$copy > /dev/null; echo fs-readstream:ok",
+          "exec_parity": "3 execs a side per iteration — head, cat, cat. The > redirects and echo are each side's shell builtins. No residual asymmetry."
         }
       }
     },

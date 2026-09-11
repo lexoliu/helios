@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 from helios_bench import REPO_ROOT
@@ -67,6 +68,23 @@ def test_every_row_names_a_wasmtime_counterpart_or_the_reason_it_lacks_one() -> 
         for side, reason in workload.get("uncompared", {}).items():
             assert side in ("linux_native", "linux_wasmtime", "helios"), (workload["name"], side)
             assert reason.strip(), workload["name"]
+
+
+def test_coreutils_counterparts_run_one_exec_per_helios_exec() -> None:
+    """A counterpart that measures something wider than the Helios row
+    can never flag a Helios regression. Each `{tool}` placeholder in the
+    Helios command is one guest exec, and each `$cu <applet>` in the
+    counterpart is one `wasmtime run`; redirects, `echo`, assignments and
+    the `while`/`test` builtins are each side's own shell, so the counts
+    must match literal marker for marker."""
+    manifest = load_workloads()
+    for name in ("stdio-pipe", "fs-smallfiles", "fs-readstream"):
+        workload = next(w for w in manifest["workloads"] if w["name"] == name)
+        helios_execs = len(re.findall(r"\{(?!workdir|repo_root)\w+\}", workload["command"]))
+        wasmtime_execs = len(
+            re.findall(r"\$cu\s+\w+", workload["counterparts"]["linux_wasmtime"]["command"])
+        )
+        assert helios_execs == wasmtime_execs, (name, helios_execs, wasmtime_execs)
 
 
 def test_native_counterparts_exist_for_every_native_bin_reference() -> None:
