@@ -35,7 +35,11 @@
 //! inbox, and the claim word moves to [`ClaimState::RELEASING`] at the
 //! same moment, so nobody is handed the engine between the moment its
 //! last owner let go and the moment the renderer has actually given the
-//! resources back.
+//! resources back. The submit server may still be holding one: a
+//! request it already popped is in flight until the device answers it,
+//! and the release waits that count out — a chain parked for ring room
+//! otherwise publishes after `CTX_DESTROY`, onto command pages the
+//! release is about to free.
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
@@ -236,6 +240,22 @@ pub(super) struct Gpu3dShared {
     pub(super) generation: AtomicU64,
     /// One permit per claim that has been let go.
     pub(super) release: Notify,
+    /// Submissions the submit server has popped and the device has not
+    /// finished with.
+    ///
+    /// Counted from the pop — before the generation check — because a
+    /// release noticed between the two reads would otherwise see the
+    /// count still at zero and destroy a context underneath a chain
+    /// the device is about to take. The release path waits the count
+    /// out before it hands anything back.
+    pub(super) submits_in_flight: AtomicU64,
+    /// Raised every time `submits_in_flight` drains to nothing, so the
+    /// release path can wait for it.
+    ///
+    /// A progress signal rather than a permit: the waiter samples it
+    /// before it reads the count, so a drain that lands between the
+    /// two is not missed.
+    pub(super) submits_drained: crate::exec::ProgressSignal,
     /// Whether the device renders at all. Read once at bring-up and
     /// never again: a renderer is a property of the host's build, not
     /// of anything the machine does while it runs.
@@ -247,6 +267,38 @@ pub(super) struct Gpu3dShared {
     /// at a time, and the claim word does not return to
     /// [`ClaimState::FREE`] until this has been drained.
     pub(super) returned: ConcurrentQueue<GpuPins>,
+}
+
+/// One submission the submit server has taken out of the queue and the
+/// device has not finished with.
+///
+/// Held from the pop — before the generation check — until the device
+/// has answered, because the release path drains this count before it
+/// destroys a context or frees a page: a submission still parked for
+/// ring room publishes onto the control ring whenever the device takes
+/// it, and a context destroyed underneath one leaves the engine
+/// reading command memory the release already handed back to the pool.
+/// A request the check drops still counted: between the pop and the
+/// check it was in flight like any other, and a release that noticed
+/// the claim's end in that window must still be able to wait it out.
+pub(super) struct InFlightSubmit<'a> {
+    shared: &'a Gpu3dShared,
+}
+
+impl<'a> InFlightSubmit<'a> {
+    /// Count one more submission with the device.
+    pub(super) fn begin(shared: &'a Gpu3dShared) -> Self {
+        shared.submits_in_flight.fetch_add(1, Ordering::AcqRel);
+        Self { shared }
+    }
+}
+
+impl Drop for InFlightSubmit<'_> {
+    fn drop(&mut self) {
+        if self.shared.submits_in_flight.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.shared.submits_drained.signal();
+        }
+    }
 }
 
 /// The machine's 3D engine, as everything outside the owner tasks sees

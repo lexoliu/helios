@@ -20,7 +20,12 @@
 //! * The submit server owns the command streams. It is a separate task
 //!   for the reason the queues are separate: a submission must not wait
 //!   behind a capset read of tens of kilobytes, and the driver serialises
-//!   the two chains onto its one control ring itself.
+//!   the two chains onto its one control ring itself. Every request it
+//!   pops counts against the claim's in-flight tally until the device
+//!   has answered it, and a release waits that tally out before it
+//!   destroys anything — a chain still parked for ring room publishes
+//!   after `CTX_DESTROY` otherwise, onto command pages the release is
+//!   about to free.
 //!
 //! Both hold the same device handle. The trait's own contract says every
 //! method takes `&self`, may be called from several tasks at once, and
@@ -43,7 +48,9 @@ use crate::Kernel;
 use crate::component::{ProviderReceiver, provider_channel};
 use crate::exec::monotonic_nanos;
 
-use super::service::{ClaimState, Gpu3dRequest, Gpu3dService, Gpu3dShared, SubmitRequest};
+use super::service::{
+    ClaimState, Gpu3dRequest, Gpu3dService, Gpu3dShared, InFlightSubmit, SubmitRequest,
+};
 use super::{ContextRecord, Gpu3dServiceError, MAX_GPU_BLOBS, MAX_GPU_CONTEXTS};
 
 /// Bytes of one capability-set read the kernel will carry.
@@ -117,6 +124,8 @@ pub(super) fn gpu3d_channels(
         claim: AtomicU8::new(ClaimState::FREE),
         generation: AtomicU64::new(0),
         release: crate::exec::Notify::new(),
+        submits_in_flight: AtomicU64::new(0),
+        submits_drained: crate::exec::ProgressSignal::new(),
         renders,
         returned: concurrent_queue::ConcurrentQueue::bounded(1),
     });
@@ -178,7 +187,7 @@ pub(super) async fn serve_control<Device>(
         let next = pin!(inbox.recv());
         match select(released, next).await {
             Either::Left(((), _)) => {
-                release_claim(device, &mut held).await;
+                release_claim(device, shared, &mut held).await;
                 // Only now: the renderer has stopped reading, so
                 // dropping the arena hands the pages back to a pool
                 // nothing is decoding.
@@ -475,12 +484,30 @@ async fn attach<Device: Gpu3d>(
 
 /// Hand everything the claim held back to the machine.
 ///
-/// The order is what makes it safe to release the caller's pages
-/// afterwards: every mapped blob leaves the aperture, every blob is
+/// The wait first is what makes it safe to destroy anything at all: a
+/// submission the submit server popped before the release was noticed
+/// can still be inside `device.submit`, parked for ring room, and it
+/// publishes onto the control ring whenever the device takes it —
+/// after `CTX_DESTROY` if nothing orders it. Every one of those counts
+/// against the shared in-flight tally, so nothing is handed back until
+/// the tally reads zero; the mark is sampled before the count so a
+/// drain between the two is not missed.
+///
+/// The order after that is what makes it safe to release the caller's
+/// pages: every mapped blob leaves the aperture, every blob is
 /// destroyed, and only then is a context let go — a renderer still
 /// holding a context that names dead resources would be reading guest
 /// pages on their way back to a pool.
-async fn release_claim<Device: Gpu3d>(device: &Device, held: &mut ClaimResources) {
+async fn release_claim<Device: Gpu3d>(
+    device: &Device,
+    shared: &Gpu3dShared,
+    held: &mut ClaimResources,
+) {
+    let mut drained = shared.submits_drained.mark();
+    while shared.submits_in_flight.load(Ordering::Acquire) != 0 {
+        shared.submits_drained.changed(drained).await;
+        drained = shared.submits_drained.mark();
+    }
     for blob in &held.blobs {
         if blob.mapped
             && let Err(error) = device.unmap_blob(blob.id).await
@@ -516,6 +543,14 @@ async fn release_claim<Device: Gpu3d>(device: &Device, held: &mut ClaimResources
 
 /// Serves the command streams a claim's contexts submit.
 ///
+/// Every request counts against the shared in-flight tally from the
+/// pop until the device has answered it — including the ones the
+/// generation check drops, which were in flight like any other in the
+/// window between the two. The tally, not the check, is what a release
+/// waits out: a chain parked for ring room publishes whenever the
+/// device takes it, and destroying the context underneath it would
+/// leave the engine reading command pages the release has freed.
+///
 /// The fence a submission carries is published to the signal the
 /// request brought with it the moment the device has taken the buffer,
 /// whatever it answered: the completion is the signal, and a reader of
@@ -531,6 +566,11 @@ pub(super) async fn serve_submit<Device, CpuImpl>(
     CpuImpl: Cpu,
 {
     while let Some(request) = inbox.recv().await {
+        // Counted from the pop, ahead of the generation check: the
+        // release path waits this count out before it lets a context
+        // go, and a submission it could not see between the two reads
+        // would be free to publish after `CTX_DESTROY`.
+        let _in_flight = InFlightSubmit::begin(shared);
         let SubmitRequest::Submit {
             generation,
             context,

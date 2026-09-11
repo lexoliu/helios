@@ -66,6 +66,10 @@ struct FakeGpu3d {
     /// Set to make every submission fail, as a device refusing a
     /// command stream does.
     refuse_submits: AtomicBool,
+    /// When `Some`, `submit` records the call and then parks on the
+    /// receiver until the test lets it answer — a device still working
+    /// on a chain it was given.
+    submit_hold: Mutex<Option<oneshot::Receiver<()>>>,
     next_context: Mutex<u32>,
     next_blob: Mutex<u32>,
 }
@@ -76,6 +80,7 @@ impl FakeGpu3d {
             calls: Mutex::new(Vec::new()),
             capset_bytes: alloc::vec![0xde, 0xad, 0xbe, 0xef],
             refuse_submits: AtomicBool::new(false),
+            submit_hold: Mutex::new(None),
             next_context: Mutex::new(1),
             next_blob: Mutex::new(1),
         }
@@ -179,6 +184,10 @@ impl Gpu3d for FakeGpu3d {
         fence: FenceId,
     ) -> Gpu3dResult<()> {
         self.record(Call::Submit(context, fence));
+        let hold = self.submit_hold.lock().expect("no test panics here").take();
+        if let Some(hold) = hold {
+            let _ = hold.await;
+        }
         if self
             .refuse_submits
             .load(core::sync::atomic::Ordering::Relaxed)
@@ -771,6 +780,116 @@ fn a_request_queued_before_release_is_dropped() {
     assert!(
         service.claim().is_ok(),
         "the engine is free once its resources are back"
+    );
+}
+
+/// A submission the device is still working on is not torn down under
+/// it: the release waits the in-flight tally out, so the destroy lands
+/// on the control ring only after the device has finished the chain,
+/// and no command page is freed while the engine may still be reading
+/// it.
+#[test]
+fn a_submission_in_flight_is_finished_before_the_claim_is_released() {
+    test_hooks::install();
+    let (shared, control, submit) = gpu3d_channels(true);
+    let device = FakeGpu3d::new();
+    let (gate, hold) = oneshot::channel();
+    *device.submit_hold.lock().expect("no test panics here") = Some(hold);
+    let service = Gpu3dService::from_shared(shared.clone());
+    let mut ownership = claimed(&shared);
+
+    with_servers(&device, &shared, &control, &submit, async {
+        let context = create_context(&ownership).await;
+        let frame = ownership.pin(4096).expect("the window has room");
+        let generation = ownership
+            .claim_ref()
+            .expect("the claim is held")
+            .generation();
+
+        // The device takes the submission and keeps working on it, as
+        // a chain parked for ring room is.
+        let (reply, answer) = oneshot::channel();
+        shared
+            .submit
+            .send(SubmitRequest::Submit {
+                generation,
+                context: context.id,
+                commands: frame.physical(),
+                fence: FenceId::new(1),
+                fences: context.fences.clone(),
+                reply,
+            })
+            .await
+            .expect("the queue has room");
+        for _ in 0..64 {
+            if device
+                .calls()
+                .contains(&Call::Submit(context.id, FenceId::new(1)))
+            {
+                break;
+            }
+            crate::yield_now().await;
+        }
+        assert!(
+            device
+                .calls()
+                .contains(&Call::Submit(context.id, FenceId::new(1))),
+            "the device is holding the chain"
+        );
+
+        // The claim ends while the device holds it. The teardown is
+        // given every chance to run ahead of it.
+        ownership.release();
+        for _ in 0..8 {
+            crate::yield_now().await;
+        }
+        assert!(
+            !device
+                .calls()
+                .iter()
+                .any(|call| matches!(call, Call::DestroyContext(_))),
+            "the destroy is not issued while a submission is in flight"
+        );
+        assert!(
+            !shared.returned.is_empty(),
+            "the claim's pages stay parked while the device reads them"
+        );
+        assert!(
+            !test_hooks::changes()
+                .iter()
+                .any(|change| matches!(change, test_hooks::MappingChange::Released(_))),
+            "no page is freed while the device holds the chain"
+        );
+
+        // The device finishes; only then may the claim's teardown run.
+        gate.send(()).expect("the device is parked on it");
+        answer
+            .await
+            .expect("the submission is answered")
+            .expect("the fake engine agrees");
+        while service.is_claimed() {
+            crate::yield_now().await;
+        }
+    });
+
+    let calls = device.calls();
+    let submitted = calls
+        .iter()
+        .position(|call| matches!(call, Call::Submit(..)))
+        .expect("the device saw the submission");
+    let destroyed = calls
+        .iter()
+        .position(|call| matches!(call, Call::DestroyContext(_)))
+        .expect("the context is destroyed once the device is done");
+    assert!(
+        submitted < destroyed,
+        "the chain is taken before its context goes"
+    );
+    assert!(
+        test_hooks::changes()
+            .iter()
+            .any(|change| matches!(change, test_hooks::MappingChange::Released(_))),
+        "the pages go back once the renderer has let go"
     );
 }
 
