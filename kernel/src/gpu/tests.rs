@@ -874,4 +874,75 @@ mod component_host {
             "a blob handle from the dead claim is refused the same way"
         );
     }
+
+    /// A context that outlived its claim must not hand out the dead
+    /// claim's fence signal — nothing publishes to it again, so the
+    /// guest's stream read would hang — so `fences` traps the way
+    /// `buffer` does: its signature cannot carry `not-claimed` either.
+    #[test]
+    fn a_context_that_outlived_its_claim_opens_no_fence_stream() {
+        test_hooks::install();
+        let (shared, control, submit) = gpu3d_channels(true);
+        let device = FakeGpu3d::new();
+        let service = Gpu3dService::from_shared(shared.clone());
+        let mut data = test_store::store_data(&service);
+        data.device.set_memory(crate::device::LinearMemory {
+            base: VirtAddr::new(MEMORY_BASE),
+            reservation_bytes: RESERVATION_BYTES,
+        });
+        data.device.claim_gpu(&service).expect("the engine is free");
+        let first = data.device.gpu().claim_ref().expect("held").generation();
+        let context = data
+            .table
+            .push(test_store::context_handle(first, ContextId::new(4)))
+            .expect("the table has room");
+
+        // The claim ends and another takes the engine; the handle lives
+        // on, as it does in a store nobody told.
+        with_servers(&device, &shared, &control, &submit, async {
+            data.device.gpu_mut().release();
+            while service.is_claimed() {
+                crate::yield_now().await;
+            }
+            data.device
+                .claim_gpu(&service)
+                .expect("the engine is free once its resources are back");
+        });
+        let live = data.device.gpu().claim_ref().expect("held").generation();
+        assert_ne!(live, first, "a release and a claim both move it");
+        let live_context = data
+            .table
+            .push(test_store::context_handle(live, ContextId::new(5)))
+            .expect("the table has room");
+
+        // `fences` is a with-store host call, so it wants a real store
+        // to take its `Access` from.
+        let engine =
+            wasmtime::Engine::new(&wasmtime::Config::new()).expect("the host engine builds");
+        let mut store = wasmtime::Store::new(&engine, data);
+        type GpuAccess<'a> = wasmtime::component::Access<
+            'a,
+            test_store::TestStoreData,
+            wasmtime::component::HasSelf<test_store::TestStoreData>,
+        >;
+        use wasmtime::AsContextMut;
+        let refused = contract::HostContextWithStore::fences(
+            GpuAccess::new(store.as_context_mut(), |data| data),
+            Resource::new_borrow(context.rep()),
+        );
+        assert!(
+            refused.is_err_and(
+                |error| alloc::format!("{error}").contains("does not hold the 3D engine")
+            ),
+            "the dead claim's context is a trap, not a stream nobody feeds"
+        );
+        let served = contract::HostContextWithStore::fences(
+            GpuAccess::new(store.as_context_mut(), |data| data),
+            Resource::new_borrow(live_context.rep()),
+        );
+        assert!(
+            served.is_ok(),
+            "the live claim's context still opens its stream"
+        );
+    }
 }

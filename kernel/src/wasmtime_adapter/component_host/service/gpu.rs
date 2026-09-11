@@ -829,7 +829,16 @@ where
         mut accessor: Access<'_, U, Self>,
         handle: Resource<ContextHandle>,
     ) -> wasmtime::Result<StreamReader<u64>> {
-        let signal = accessor.get().table.get(&handle)?.fences.clone();
+        let data = accessor.get();
+        let context = data.table.get(&handle)?;
+        // As for `command-buffer.buffer`: the signature cannot carry
+        // `not-claimed`, so a context that outlived its claim is a
+        // trap. Answering it would hand back the dead claim's signal —
+        // one nothing publishes to again — and the guest's stream read
+        // would hang on a fence that never retires.
+        data.gpu_sender(context.generation)
+            .map_err(|error| wasmtime::Error::msg(alloc::format!("{error}")))?;
+        let signal = context.fences.clone();
         // From the stream's creation on, not from the context's first
         // submission: a reader that asks for a stream mid-render-loop
         // wants the fences that retire next, and the newest retired
@@ -1068,6 +1077,20 @@ pub(crate) mod test_store {
     }
 
     fn read_nothing(_: &mut Vec<u8>, _: u32) {}
+
+    /// A context resource minted under `generation`, as a store that
+    /// opened one through `create-context` would carry.
+    pub(crate) fn context_handle(
+        generation: u64,
+        id: helios_hal::display::ContextId,
+    ) -> super::ContextHandle {
+        super::ContextHandle {
+            generation,
+            id,
+            fences: Arc::new(crate::display::SequenceSignal::new()),
+            submitted: core::cell::Cell::new(0),
+        }
+    }
 
     /// A store on a runtime state that publishes `service`, holding no
     /// claim yet.
