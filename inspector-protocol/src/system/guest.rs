@@ -12,7 +12,7 @@ use super::methods::{
     INSTANCES_INSTANCE, INSTANCES_KILL, INSTANCES_SNAPSHOT, PROFILING_CLEAR, PROFILING_FOLDED,
     PROFILING_INSTANCE, PROFILING_METRICS, PROFILING_RAW_PROFILE_READ, PROFILING_RAW_PROFILE_SIZE,
     PROFILING_SET_ENABLED, PROGRAMS_AOT, PROGRAMS_EXEC, PROGRAMS_INSTANCE, STATS_INSTANCE,
-    STATS_SNAPSHOT, TRACING_INSTANCE, TRACING_RECENT,
+    STATS_SNAPSHOT, TRACING_INSTANCE, TRACING_RECENT, TRACING_SET_TARGET_ENABLED,
 };
 use crate::debugger::{filesystem, programs as debugger_programs};
 
@@ -54,6 +54,7 @@ fn supports_request(instance: &str, func: &str) -> bool {
             | (INSTANCES_INSTANCE, INSTANCES_SNAPSHOT)
             | (INSTANCES_INSTANCE, INSTANCES_KILL)
             | (TRACING_INSTANCE, TRACING_RECENT)
+            | (TRACING_INSTANCE, TRACING_SET_TARGET_ENABLED)
             | (PROFILING_INSTANCE, PROFILING_SET_ENABLED)
             | (PROFILING_INSTANCE, PROFILING_CLEAR)
             | (PROFILING_INSTANCE, PROFILING_FOLDED)
@@ -167,6 +168,23 @@ async fn dispatch(instance: &str, func: &str, payload: &[u8]) -> Result<Vec<u8>,
             let answer = host_instances::kill(id).map_err(convert_kill_error);
             postcard::to_allocvec(&answer).map_err(|source| DispatchError::Encode {
                 operation: "instances.kill",
+                source,
+            })
+        }
+        (TRACING_INSTANCE, TRACING_SET_TARGET_ENABLED) => {
+            let (target, enabled): (String, bool) =
+                postcard::from_bytes(payload).map_err(|source| DispatchError::Decode {
+                    operation: "tracing.set-target-enabled",
+                    source,
+                })?;
+            let result =
+                host_tracing::set_target_enabled(&target, enabled).map_err(|error| match error {
+                    host_tracing::TargetError::UnknownTarget(name) => {
+                        tracing::TargetError::UnknownTarget(name)
+                    }
+                });
+            postcard::to_allocvec(&result).map_err(|source| DispatchError::Encode {
+                operation: "tracing.set-target-enabled",
                 source,
             })
         }
