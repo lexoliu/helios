@@ -79,6 +79,21 @@ class RunInfo(BaseModel):
     baseline_ref: str | None = Field(
         default=None, description="what the run was asked to pair against, before it was resolved"
     )
+    inspector_git_sha: str | None = Field(
+        default=None,
+        description=(
+            "the commit the `helios` side's `helios-inspector` and `helios-cli` were built "
+            "from — the tooling that builds the kernel and speaks the guest's "
+            "helios-inspector-protocol at boot (#356)"
+        ),
+    )
+    baseline_inspector_git_sha: str | None = Field(
+        default=None,
+        description=(
+            "the commit the `helios_baseline` side's `helios-inspector` and `helios-cli` "
+            "were built from, when the run was paired"
+        ),
+    )
     kernel_build: str = Field(
         default="release",
         description=(

@@ -394,21 +394,30 @@ the control of a PGO measurement; with `--baseline-ref`, that commit's
 plain kernel. The dispatch input `baseline_kernel_build` is the same
 switch in CI.
 
-The baseline checkout supplies a **guest**, never a harness. One harness
-times both images: the candidate's `tools/wasi-apps/workload-bench.sh`,
-its `helios-inspector` and its `helios-cli`. An image is selected with
+The baseline checkout supplies a guest and the tooling that guest is
+built and booted by; the scheduling harness stays the candidate's. One
+harness times both images — the candidate's
+`tools/wasi-apps/workload-bench.sh`, its workload manifest, its iteration
+counts and budgets — and an image is selected with
 `HELIOS_WORKSPACE_ROOT`, the checkout the inspector resolves the guest
 against — the kernel artifact, the prebuild manifest, the bootfs sources
-and the program manifests — so the same inspector that boots a guest is
-the one that built it. (`vm build` also compiles the baseline checkout's
-own host tools; nothing built there runs, and the run pins
-`HELIOS_INSPECTOR_BIN` and `HELIOS_CLI_BIN` to the candidate's binaries
-so that it cannot.)
+and the program manifests. But the `helios-inspector` and `helios-cli` a
+side runs are compiled from that side's own ref into its own
+`target/release`: the inspector and the guest's debugger speak
+`helios-inspector-protocol`, and when a record changed between the two
+refs the candidate's decoder asked the baseline guest for a field it did
+not send — the baseline's readiness probe failed
+`DeserializeUnexpectedEnd`, and the whole pair was lost (run
+34551261487, #356). A baseline whose own tooling does not build fails the
+run naming its checkout; there is no fallback to the candidate's
+binaries, and a run that cannot produce them is refused before the first
+boot.
 
 | | Shared by both columns | Per side |
 | --- | --- | --- |
 | Host | CPU, load, thermal state, QEMU release, accelerator, vCPUs, memory, network backend and its host servers | — |
-| Harness | `workload-bench.sh`, `helios-inspector`, `helios-cli`, the workload manifest, the run's iteration count and budgets | — |
+| Harness | `workload-bench.sh`, the workload manifest, the run's iteration count and budgets | — |
+| Tooling | — | `helios-inspector` and `helios-cli`, built from each side's own commit under its own `target/release` |
 | Guest inputs | everything `tools/wasi-apps/build.sh` stages under `artifacts/`, linked into the baseline worktree entry by entry; the vendored Wasmtime checkout, linked as the worktree's sibling | — |
 | Guest | — | the kernel image, the bootfs it carries, the compiler plugin, the guest programs the prebuild signs |
 
@@ -438,14 +447,17 @@ manifest, read from the candidate checkout for both; everything under
 baseline worktree entry by entry rather than copied; and the vendored
 Wasmtime checkout, linked as the worktree's sibling so both kernels
 compile against one revision. What differs is the kernel image, the
-bootfs it carries (the compiler plugin included) and the inspector that
-boots them.
+bootfs it carries (the compiler plugin included) and the
+`helios-inspector`/`helios-cli` that build and boot it — each side's own,
+compiled from the side's own commit.
 
 The report carries the second column as the `helios_baseline` side, and
 its run record carries both commits (`helios_git_sha` for the candidate,
-`baseline_git_sha` for the baseline). A run that was asked to pair and
-could not build or measure its baseline is a failed run, not a report
-with one column missing.
+`baseline_git_sha` for the baseline) and both tooling revisions
+(`inspector_git_sha` and `baseline_inspector_git_sha`), which the
+rendered tables print beside the kernels'. A run that was asked to pair
+and could not build or measure its baseline is a failed run, not a
+report with one column missing.
 
 A boot's unix sockets do not live in its runtime directory. That path is
 the caller's, and the paired layout nests it per image and per workload,

@@ -8,14 +8,20 @@ against, including workloads its change could not touch (#173). The
 answer is not a quieter runner but a second column taken on the same
 machine.
 
-The baseline checkout supplies a **guest**, never a harness. One harness
-times both images — this checkout's `tools/wasi-apps/workload-bench.sh`,
-its `helios-inspector` and its `helios-cli` — and an image is selected by
-`HELIOS_WORKSPACE_ROOT`, the checkout the inspector resolves the guest
-against. Two harnesses would compare the harnesses as much as the
-kernels, and the older one need not even work: run 33995029872 failed
-because the baseline checkout's inspector predated a fix to the host
-side.
+The baseline checkout supplies a guest and the tooling that guest is
+built and booted by; the scheduling harness stays the candidate's. One
+harness times both images — this checkout's
+`tools/wasi-apps/workload-bench.sh`, its workload manifest, its budgets —
+and an image is selected by `HELIOS_WORKSPACE_ROOT`, the checkout the
+inspector resolves the guest against. But the `helios-inspector` and
+`helios-cli` a side runs are compiled from that side's own ref into its
+own `target/release`: the inspector and the guest's debugger speak
+helios-inspector-protocol, and a record added to it between the two refs
+is unanswerable by the other side's tooling — run 34551261487's baseline
+boot died in the readiness probe with `DeserializeUnexpectedEnd` under
+the candidate's inspector (#356). A baseline whose own tooling does not
+build fails the run naming its checkout; there is no fallback to the
+candidate's.
 
 Shared, and therefore unable to explain a difference between the columns:
 
@@ -24,10 +30,8 @@ Shared, and therefore unable to explain a difference between the columns:
 - the network backend and host HTTP, TCP and echo server implementations
   and payloads; each guest boot gets independent listeners, except for
   explicit diagnostic reuse of peer connection state;
-- the harness: the benchmark script, the inspector binary that boots
-  both guests, and the `helios-cli` that signs their prebuilt `cwasm`
-  and builds their boot images;
-- the workload manifest, read from the candidate checkout for both;
+- the harness: the benchmark script that orders and budgets the boots,
+  and the workload manifest, read from the candidate checkout for both;
 - everything under `artifacts/` that `tools/wasi-apps/build.sh` stages
   (the CPython root, the WASI tools, the WASIX programs), linked into the
   baseline worktree entry by entry rather than copied;
@@ -38,10 +42,12 @@ Shared, and therefore unable to explain a difference between the columns:
   against the one profile in force when the run started (#321).
 
 Per side, and therefore what the comparison measures: the kernel image,
-the bootfs it carries (the compiler plugin included) and the guest
-programs its prebuild signs — each built from its own checkout, and each
-digested before the first boot so that two checkouts which turn out to
-be one build are refused rather than timed twice.
+the bootfs it carries (the compiler plugin included), the guest programs
+its prebuild signs and the `helios-inspector`/`helios-cli` that build and
+boot it — each built from its own checkout, and each guest digested
+before the first boot so that two checkouts which turn out to be one
+build are refused rather than timed twice. The run record names both
+revisions of each (`*_git_sha` beside `*_inspector_git_sha`).
 """
 
 from __future__ import annotations
