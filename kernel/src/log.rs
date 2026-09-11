@@ -1,3 +1,17 @@
+//! The kernel's console subscriber and its gated diagnostic targets.
+//!
+//! This file publishes the diagnostics layer's two linkage contracts:
+//! the subscriber install in `init_logger`
+//! (`tracing::subscriber::set_global_default`), and
+//! [`DIAGNOSTIC_TARGETS`] — the file's only mutable global — the
+//! registry of session-gated diagnostic targets. A runtime flip under
+//! `tracing`'s `enabled(&self)` API needs a globally reachable flag:
+//! `set_gated_target` cannot downcast the installed dispatch back to
+//! `KernelConsoleSubscriber` because its `Console` parameter is
+//! erased at install, so each module that owns a gated target
+//! declares one `DiagnosticTarget` static (e.g.
+//! `crate::exec::phases::GATE`) and the registry consults those.
+
 extern crate alloc;
 
 use alloc::string::String;
@@ -66,6 +80,16 @@ fn gated_target_enabled(target: &str) -> bool {
         .any(|entry| entry.name == target && entry.enabled.load(Ordering::Relaxed))
 }
 
+/// Whether any diagnostic gate is open — while all are shut, every
+/// `DEBUG`/`TRACE` callsite can answer `never()`: [`enabled`] returns
+/// false for all of them, and the callsite-local interest cache then
+/// costs one atomic load per event and no subscriber call.
+fn any_diagnostic_gate_open() -> bool {
+    DIAGNOSTIC_TARGETS
+        .iter()
+        .any(|entry| entry.enabled.load(Ordering::Relaxed))
+}
+
 /// The tracing service asked for a target nothing registered.
 #[derive(Debug, thiserror::Error)]
 #[error("the kernel gates no diagnostic target named {0:?}")]
@@ -81,16 +105,31 @@ pub(crate) fn set_gated_target(name: &str, enabled: bool) -> Result<(), UnknownD
         .copied()
         .ok_or_else(|| UnknownDiagnosticTarget(String::from(name)))?;
     target.enabled.store(enabled, Ordering::Relaxed);
+    // The callsite interest cache is rebuilt so a `DEBUG`/`TRACE`
+    // site that answered `never()` while every gate was shut re-asks
+    // `enabled` once this gate opens — and a gate that just closed
+    // lets its sites settle back to `never()`.
+    tracing::callsite::rebuild_interest_cache();
     Ok(())
 }
 
 impl<Console: Write + Send + 'static> Subscriber for KernelConsoleSubscriber<Console> {
-    /// Diagnostic targets flip at runtime, so no callsite may answer
-    /// permanently: every event asks [`enabled`](Self::enabled), which
-    /// is one atomic load for a `DEBUG`/`TRACE` event on a target the
-    /// registry does not gate.
-    fn register_callsite(&self, _metadata: &'static tracing::Metadata<'static>) -> Interest {
-        Interest::sometimes()
+    /// `enabled` is constant-true for `INFO` and stronger, so those
+    /// callsites answer `always()` and pay nothing per event. `DEBUG`
+    /// and `TRACE` sites exist only for gated diagnostic targets:
+    /// while every gate is shut they answer `never()` — one
+    /// callsite-local atomic per event, the pre-gate off-cost — and
+    /// while any gate is open they answer `sometimes()` and re-ask
+    /// [`enabled`](Self::enabled) per event. `set_gated_target`
+    /// rebuilds the interest cache on each flip so the answers move.
+    fn register_callsite(&self, metadata: &'static tracing::Metadata<'static>) -> Interest {
+        match *metadata.level() {
+            tracing::Level::ERROR | tracing::Level::WARN | tracing::Level::INFO => {
+                Interest::always()
+            }
+            _ if any_diagnostic_gate_open() => Interest::sometimes(),
+            _ => Interest::never(),
+        }
     }
 
     fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
