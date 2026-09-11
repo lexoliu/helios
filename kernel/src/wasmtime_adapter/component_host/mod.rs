@@ -36,6 +36,7 @@ use wasmtime::component::{
 };
 use wasmtime::{self, Engine, Store, StoreContextMut};
 
+use crate::exec::phases::{self, LaunchPhase};
 use crate::runtime::ComponentHostFilesystemState;
 use crate::wasmtime_adapter::bindings::debugger::bindings as debugger_bindings;
 use crate::wasmtime_adapter::bindings::program::bindings as program_bindings;
@@ -405,10 +406,19 @@ macro_rules! impl_program_bindings {
                         access.get().runtime_state.program_service(),
                         ProgramExecContext::from_store(access.get()),
                         access.get().process_authority().clone(),
+                        access.get().cpu.clone(),
                     ))
                 });
                 async move {
-                    let (service, context, caller_authority) = snapshot?;
+                    let (service, context, caller_authority, cpu) = snapshot?;
+                    tracing::debug!(
+                        target: phases::TARGET,
+                        at_ns = monotonic_nanos(&cpu),
+                        op = "spawn",
+                        program = request.path.as_str(),
+                        instance = 0u64,
+                        phase = LaunchPhase::RpcArrival.as_str(),
+                    );
                     let Some(service) = service else {
                         return Ok(Err($bindings::helios::system::programs::SpawnError {
                             kind: $bindings::helios::system::programs::SpawnErrorKind::Unavailable,
@@ -435,7 +445,17 @@ macro_rules! impl_program_bindings {
                                 ))));
                             }
                         };
-                    match service
+                    tracing::debug!(
+                        target: phases::TARGET,
+                        at_ns = monotonic_nanos(&cpu),
+                        op = "spawn",
+                        program = request.path.as_str(),
+                        instance = 0u64,
+                        phase = LaunchPhase::SourceRead.as_str(),
+                        source_bytes = source.payload_len() as u64,
+                    );
+                    let mut spawned_instance = None;
+                    let spawned = match service
                         .spawn(
                             context,
                             source,
@@ -450,6 +470,7 @@ macro_rules! impl_program_bindings {
                         .await
                     {
                         Ok(child) => {
+                            spawned_instance = Some(child.instance_id);
                             let handle = accessor.with(|mut access| {
                                 access
                                     .get()
@@ -460,7 +481,16 @@ macro_rules! impl_program_bindings {
                             Ok(Ok(handle))
                         }
                         Err(error) => Ok(Err($convert_error(error))),
-                    }
+                    };
+                    tracing::debug!(
+                        target: phases::TARGET,
+                        at_ns = monotonic_nanos(&cpu),
+                        op = "spawn",
+                        program = request.path.as_str(),
+                        instance = spawned_instance.map_or(0u64, InstanceId::raw),
+                        phase = LaunchPhase::Reply.as_str(),
+                    );
+                    spawned
                 }
             }
 
@@ -480,10 +510,19 @@ macro_rules! impl_program_bindings {
                         access.get().runtime_state.program_service(),
                         ProgramExecContext::from_store(access.get()),
                         access.get().process_authority().clone(),
+                        access.get().cpu.clone(),
                     ))
                 });
                 async move {
-                    let (service, context, caller_authority) = snapshot?;
+                    let (service, context, caller_authority, cpu) = snapshot?;
+                    tracing::debug!(
+                        target: phases::TARGET,
+                        at_ns = monotonic_nanos(&cpu),
+                        op = "exec",
+                        program = request.path.as_str(),
+                        instance = 0u64,
+                        phase = LaunchPhase::RpcArrival.as_str(),
+                    );
                     let Some(service) = service else {
                         return Ok(Err($bindings::helios::system::programs::ExecError {
                             kind: $bindings::helios::system::programs::ExecErrorKind::Unavailable,
@@ -510,6 +549,15 @@ macro_rules! impl_program_bindings {
                                 ))));
                             }
                         };
+                    tracing::debug!(
+                        target: phases::TARGET,
+                        at_ns = monotonic_nanos(&cpu),
+                        op = "exec",
+                        program = request.path.as_str(),
+                        instance = 0u64,
+                        phase = LaunchPhase::SourceRead.as_str(),
+                        source_bytes = source.payload_len() as u64,
+                    );
                     let hint = match request.hint {
                         Some($bindings::helios::system::programs::AotHint::Fast) => {
                             Some(AotCompileHint::Fast)
@@ -522,7 +570,7 @@ macro_rules! impl_program_bindings {
                         }
                         None => None,
                     };
-                    Ok(service
+                    let executed = service
                         .exec_buffered(
                             context,
                             source,
@@ -537,7 +585,19 @@ macro_rules! impl_program_bindings {
                         )
                         .await
                         .map($convert_result)
-                        .map_err($convert_error))
+                        .map_err($convert_error);
+                    tracing::debug!(
+                        target: phases::TARGET,
+                        at_ns = monotonic_nanos(&cpu),
+                        op = "exec",
+                        program = request.path.as_str(),
+                        instance = executed
+                            .as_ref()
+                            .map(|result| result.instance_id)
+                            .unwrap_or(0),
+                        phase = LaunchPhase::Reply.as_str(),
+                    );
+                    Ok(executed)
                 }
             }
 
@@ -2727,6 +2787,15 @@ where
 {
     let mut instance = linker.instance(TRACING_INSTANCE)?;
     instance.func_wrap(
+        "set-target-enabled",
+        |_caller, (target, enabled): (String, bool)| {
+            let result = crate::log::set_gated_target(&target, enabled).map_err(|error| {
+                debugger_wit::tracing::TargetError::UnknownTarget(error.to_string())
+            });
+            Ok((result,))
+        },
+    )?;
+    instance.func_wrap(
         "recent",
         |caller, (filter, limit): (debugger_wit::tracing::Filter, u32)| {
             let filter = convert_filter(filter);
@@ -2972,6 +3041,15 @@ where
     HostFs: crate::HostFileSystem,
 {
     let mut instance = linker.instance(TRACING_INSTANCE)?;
+    instance.func_wrap(
+        "set-target-enabled",
+        |_caller, (target, enabled): (String, bool)| {
+            let result = crate::log::set_gated_target(&target, enabled).map_err(|error| {
+                program_wit::tracing::TargetError::UnknownTarget(error.to_string())
+            });
+            Ok((result,))
+        },
+    )?;
     instance.func_wrap(
         "recent",
         |caller, (filter, limit): (program_wit::tracing::Filter, u32)| {

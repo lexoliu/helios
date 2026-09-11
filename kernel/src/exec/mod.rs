@@ -11,6 +11,7 @@ mod compaction;
 mod executor;
 mod in_flight;
 mod observer;
+pub(crate) mod phases;
 mod sync;
 mod task;
 mod time;

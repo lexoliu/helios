@@ -147,8 +147,12 @@ where
     );
 
     let payload = trusted_bootfs_payload(artifact)?;
-    let instance_pre =
-        service.load_precompiled_component(payload, exec_context.write_serial, started_at)?;
+    let instance_pre = service.load_precompiled_component(
+        payload,
+        HTTP_PLUGIN_INSTANCE_NAME,
+        exec_context.write_serial,
+        started_at,
+    )?;
 
     let mut store = crate::wasmtime_adapter::store_with_state(
         service.inner.engine.raw(),

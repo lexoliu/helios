@@ -306,12 +306,18 @@ where
 {
     let profile_name = argv.program_name().to_owned();
     let argv = argv.into_vec();
-    let run_started_at = monotonic_nanos(&exec_context.cpu);
     let run_cpu = exec_context.cpu.clone();
     let run_timer = exec_context.timer.clone();
     let profile_cpu = exec_context.cpu.clone();
     let profile_runtime_state = exec_context.runtime_state.clone();
     let instance_id = launched_instance.id();
+    let run_started_at = monotonic_nanos(&exec_context.cpu);
+    phases::boundary(
+        &run_cpu,
+        &profile_name,
+        Some(instance_id),
+        LaunchPhase::TaskBegin,
+    );
     let wasix_abi = core_module_imports_wasix(&compiled.module);
     let replacement_state = wasix_abi.then(|| CoreModuleReplacementState {
         exec_context: exec_context.clone(),
@@ -332,6 +338,12 @@ where
     record_program_kernel_profile_sample(
         shared_memory_prepare_profile,
         "core-shared-memory-prepare",
+    );
+    phases::boundary(
+        &run_cpu,
+        &profile_name,
+        Some(instance_id),
+        LaunchPhase::SharedMemory,
     );
     let recycle_memory = imported_memory.clone();
     let store_teardown_profile: Option<ProgramKernelProfile<CpuImpl, Net, HostFs>>;
@@ -364,6 +376,12 @@ where
         );
         configure_preview1_program_store(&mut store);
         record_program_kernel_profile_sample(store_prepare_profile, "core-store-prepare");
+        phases::boundary(
+            &run_cpu,
+            &profile_name,
+            Some(instance_id),
+            LaunchPhase::StorePrepare,
+        );
 
         let instance = if let Some(memory) = imported_memory {
             let mut linker = preview1_core_linker;
@@ -408,6 +426,7 @@ where
                 cache_lookup_profile,
                 "core-instance-pre-cache-lookup",
             );
+            let instance_pre_hit = cached_instance_pre.is_some();
             let instance_pre = if let Some(instance_pre) = cached_instance_pre {
                 super::emit_program_stage_marker(
                     exec_context.write_serial,
@@ -445,6 +464,15 @@ where
                 );
                 inserted
             };
+            tracing::debug!(
+                target: phases::TARGET,
+                at_ns = monotonic_nanos(&run_cpu),
+                program = profile_name.as_str(),
+                instance = instance_id.raw(),
+                phase = LaunchPhase::InstantiatePre.as_str(),
+                kind = "core",
+                hit = instance_pre_hit,
+            );
 
             super::emit_program_stage_marker(
                 exec_context.write_serial,
@@ -472,6 +500,12 @@ where
         };
         let instance = instance.map_err(map_program_runtime_error)?;
         super::emit_program_stage_marker(exec_context.write_serial, "program:instantiate-core-ok");
+        phases::boundary(
+            &run_cpu,
+            &profile_name,
+            Some(instance_id),
+            LaunchPhase::Instantiate,
+        );
 
         let resolve_start_profile =
             start_program_kernel_profile(&profile_runtime_state, &profile_cpu);
@@ -482,6 +516,12 @@ where
                 detail: ProgramExecErrorDetail::InvalidEntryPoint,
             })?;
         record_program_kernel_profile_sample(resolve_start_profile, "resolve-core-start");
+        phases::boundary(
+            &run_cpu,
+            &profile_name,
+            Some(instance_id),
+            LaunchPhase::Start,
+        );
 
         let run_heartbeat = super::spawn_component_phase_heartbeat(
             &spawner,
@@ -497,6 +537,12 @@ where
         .map_err(map_task_capacity_error)?;
         super::emit_program_stage_marker(exec_context.write_serial, "program:run-core-begin");
         let run_phase_started = profile_cpu.now().ticks();
+        phases::boundary(
+            &run_cpu,
+            &profile_name,
+            Some(instance_id),
+            LaunchPhase::GuestBegin,
+        );
         let result = loop {
             let result = start.call_async(&mut store, ()).await;
             if handle_wasix_asyncify_completion(&mut store, &instance).await? {
@@ -504,6 +550,12 @@ where
             }
             break result;
         };
+        phases::boundary(
+            &run_cpu,
+            &profile_name,
+            Some(instance_id),
+            LaunchPhase::GuestEnd,
+        );
         record_named_program_kernel_profile(
             &profile_runtime_state,
             &profile_cpu,
@@ -547,11 +599,17 @@ where
         (completion, store.data().threads.is_empty())
     };
     record_program_kernel_profile_sample(store_teardown_profile, "core-store-teardown");
+    phases::boundary(
+        &run_cpu,
+        &profile_name,
+        Some(instance_id),
+        LaunchPhase::StoreTeardown,
+    );
 
     if recycle_allowed && let (Some(spec), Some(memory)) = (imported_memory_spec, recycle_memory) {
         spawn_scrubbed_recycle(&recycle_spawner, shared_memory_pool.clone(), spec, memory).await;
     }
-    match completion {
+    let outcome = match completion {
         CoreModuleRunCompletion::Exit(result) => result,
         CoreModuleRunCompletion::Exec(replacement) => {
             let replacement_state = replacement_state
@@ -578,7 +636,14 @@ where
             ))
             .await
         }
-    }
+    };
+    phases::boundary(
+        &run_cpu,
+        &profile_name,
+        Some(instance_id),
+        LaunchPhase::Completion,
+    );
+    outcome
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -837,12 +902,19 @@ where
 
     let instance_id = launched_instance.id();
 
+    let profile_name = argv.program_name().to_owned();
     let argv = argv.into_vec();
     let run_started_at = monotonic_nanos(&exec_context.cpu);
     let run_cpu = exec_context.cpu.clone();
     let run_timer = exec_context.timer.clone();
     let profile_cpu = exec_context.cpu.clone();
     let profile_runtime_state = exec_context.runtime_state.clone();
+    phases::boundary(
+        &run_cpu,
+        &profile_name,
+        Some(instance_id),
+        LaunchPhase::TaskBegin,
+    );
 
     // Use the engine that compiled the component — Wasmtime requires
     // component and store to share the same engine instance.
@@ -888,10 +960,22 @@ where
     let instantiate_instance_started = profile_runtime_state
         .profiling_enabled()
         .then(|| profile_cpu.now().ticks());
+    phases::boundary(
+        &run_cpu,
+        &profile_name,
+        Some(instance_id),
+        LaunchPhase::StorePrepare,
+    );
     let instance = {
         let _owner = own_committed_memory(instance_id);
         instance_pre.instantiate_async(&mut store).await
     };
+    phases::boundary(
+        &run_cpu,
+        &profile_name,
+        Some(instance_id),
+        LaunchPhase::Instantiate,
+    );
     if let Some(instantiate_instance_started) = instantiate_instance_started {
         record_program_kernel_profile(
             &profile_runtime_state,
@@ -933,6 +1017,12 @@ where
     );
     let executor = executor.map_err(map_program_runtime_error)?;
     super::emit_program_stage_marker(exec_context.write_serial, "program:instantiate-ok");
+    phases::boundary(
+        &run_cpu,
+        &profile_name,
+        Some(instance_id),
+        LaunchPhase::Start,
+    );
 
     let run_heartbeat = super::spawn_component_phase_heartbeat(
         &spawner,
@@ -948,7 +1038,19 @@ where
     .map_err(map_task_capacity_error)?;
     super::emit_program_stage_marker(exec_context.write_serial, "program:run-begin");
     let run_phase_started = profile_cpu.now().ticks();
+    phases::boundary(
+        &run_cpu,
+        &profile_name,
+        Some(instance_id),
+        LaunchPhase::GuestBegin,
+    );
     let result = executor.run().await;
+    phases::boundary(
+        &run_cpu,
+        &profile_name,
+        Some(instance_id),
+        LaunchPhase::GuestEnd,
+    );
     record_program_kernel_profile(
         &profile_runtime_state,
         &profile_cpu,
@@ -958,6 +1060,12 @@ where
     drop(run_heartbeat);
     let result = result.map_err(map_program_runtime_error)?;
     super::emit_program_stage_marker(exec_context.write_serial, "program:run-end");
+    phases::boundary(
+        &run_cpu,
+        &profile_name,
+        Some(instance_id),
+        LaunchPhase::Completion,
+    );
 
     Ok(ChildExit {
         instance_id: result.instance_id,

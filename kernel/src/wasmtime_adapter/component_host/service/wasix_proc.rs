@@ -1735,6 +1735,20 @@ where
             detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
         }));
     };
+    // The launch call arrives before its program string can be
+    // decoded, so the boundary event lands at the decode — and only a
+    // watched stream pays for reading `name` twice.
+    if let Some(program) =
+        phases::gated(|| wasix_read_exec_string(caller, memory, name, name_len).ok()).flatten()
+    {
+        phases::syscall_boundary(
+            &caller.data().exec_context().cpu,
+            "exec",
+            &program,
+            0,
+            LaunchPhase::RpcArrival,
+        );
+    }
     let prepared = wasix_prepare_program(caller, memory, name, name_len).await?;
     wasix_exec_prepared_program(caller, memory, prepared, args, args_len, env).await
 }
@@ -1783,9 +1797,25 @@ where
     let signal_dispositions = caller.data().signal_dispositions.clone();
     let write_serial = caller.data().write_serial;
     let executable = service
-        .load_executable(&exec_context, &prepared.source, None, write_serial)
+        .load_executable(
+            &exec_context,
+            &prepared.source,
+            None,
+            argv.program_name(),
+            write_serial,
+        )
         .await
         .map_err(wasmtime::Error::new)?;
+    // The reply of an exec is the replacement itself: the call returns
+    // by unwinding the calling instance into the new program.
+    tracing::debug!(
+        target: phases::TARGET,
+        at_ns = monotonic_nanos(&caller.data().exec_context().cpu),
+        op = "exec",
+        program = argv.program_name(),
+        instance = caller.data().instance().id().raw(),
+        phase = LaunchPhase::Reply.as_str(),
+    );
     caller
         .data_mut()
         .request_exec_replacement(WasixExecReplacement {
@@ -1867,6 +1897,17 @@ where
             detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
         }));
     };
+    if let Some(program) =
+        phases::gated(|| wasix_read_exec_string(caller, memory, name, name_len).ok()).flatten()
+    {
+        phases::syscall_boundary(
+            &caller.data().exec_context().cpu,
+            "exec",
+            &program,
+            0,
+            LaunchPhase::RpcArrival,
+        );
+    }
     let prepared = wasix_prepare_program_with_search(
         caller,
         memory,
@@ -2000,6 +2041,15 @@ where
         Ok(value) => wasix_split_lines(&value),
         Err(_) => return p1::errno::FAULT,
     };
+    if let Some(program) = phases::gated(|| argv.first().cloned().unwrap_or_default()) {
+        phases::syscall_boundary(
+            &caller.data().exec_context().cpu,
+            "spawn",
+            &program,
+            0,
+            LaunchPhase::RpcArrival,
+        );
+    }
     let prepared = match wasix_prepare_program(caller, memory, name, name_len).await {
         Ok(prepared) => prepared,
         Err(error) => return p1_errno_from_wasmtime_error(&error),
@@ -2258,6 +2308,15 @@ where
         Ok(value) => wasix_split_lines(&value),
         Err(_) => return p1::errno::FAULT,
     };
+    if let Some(program) = phases::gated(|| argv.first().cloned().unwrap_or_default()) {
+        phases::syscall_boundary(
+            &caller.data().exec_context().cpu,
+            "spawn",
+            &program,
+            0,
+            LaunchPhase::RpcArrival,
+        );
+    }
     let environment = if env == 0 && env_len == 0 {
         None
     } else {
@@ -3152,6 +3211,14 @@ where
 {
     let source_path = wasix_resolve_exec_source_path(caller.data(), &guest_name)?;
     let source = wasix_read_program_source(caller, &source_path).await?;
+    tracing::debug!(
+        target: phases::TARGET,
+        at_ns = monotonic_nanos(&caller.data().exec_context().cpu),
+        program = guest_name.as_str(),
+        instance = 0u64,
+        phase = LaunchPhase::SourceRead.as_str(),
+        source_bytes = source.payload_len(),
+    );
     Ok(WasixPreparedProgram { guest_name, source })
 }
 
@@ -3301,6 +3368,7 @@ where
         signal_dispositions,
     } = inheritance;
     let prepared_io = wasix_prepare_child_io(caller.data(), io)?;
+    let phase_program = phases::gated(|| prepared.guest_name.clone());
     let argv = ProgramArgv::from_caller(&prepared.guest_name, argv);
     let mut environment = environment.unwrap_or_else(|| caller.data().environment.clone());
     environment.retain(|(name, _)| name.as_str() != HELIOS_PROCESS_ID_ENV);
@@ -3345,6 +3413,14 @@ where
     caller
         .data_mut()
         .insert_child(pid, child.signal_state(), exit);
+    tracing::debug!(
+        target: phases::TARGET,
+        at_ns = monotonic_nanos(&caller.data().exec_context().cpu),
+        op = "spawn",
+        program = phase_program.as_deref().unwrap_or(""),
+        instance = u64::from(pid),
+        phase = LaunchPhase::Reply.as_str(),
+    );
     Ok(WasixSpawnResult {
         pid,
         stdin_fd,

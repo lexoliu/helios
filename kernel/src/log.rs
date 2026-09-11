@@ -9,6 +9,7 @@ use concurrent_queue::{ConcurrentQueue, PopError, PushError};
 use nu_ansi_term::{Color, Style};
 use objectpool::{Pool, ReusableObject};
 use tracing::Subscriber;
+use tracing::subscriber::Interest;
 
 const LOG_BUFFER_INITIAL_CAPACITY: usize = 256;
 const LOG_BUFFER_RETAINED_CAPACITY: usize = 4096;
@@ -25,12 +26,78 @@ pub struct KernelConsoleSubscriber<Console> {
     next_span_id: AtomicU64,
 }
 
+/// A kernel diagnostic target the console filter holds off until a
+/// session enables it by name through `helios:system/tracing`.
+///
+/// Registration is static so the subscriber can consult it without
+/// allocation: a module that owns a gated target declares one
+/// `DiagnosticTarget` and lists it in [`DIAGNOSTIC_TARGETS`], and a
+/// name no module registered is refused rather than silently matching
+/// nothing.
+pub(crate) struct DiagnosticTarget {
+    name: &'static str,
+    enabled: AtomicBool,
+}
+
+impl DiagnosticTarget {
+    pub(crate) const fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            enabled: AtomicBool::new(false),
+        }
+    }
+
+    /// The `tracing` target string this gate answers to.
+    #[cfg(test)]
+    pub(crate) fn name(&self) -> &'static str {
+        self.name
+    }
+}
+
+/// Every diagnostic target the kernel gates behind the tracing
+/// service. The list is a fixed slice: enabling a name nothing
+/// registered is an error, not a silent no-op.
+static DIAGNOSTIC_TARGETS: &[&DiagnosticTarget] = &[&crate::exec::phases::GATE];
+
+/// Whether `target` names a diagnostic target a session has enabled.
+fn gated_target_enabled(target: &str) -> bool {
+    DIAGNOSTIC_TARGETS
+        .iter()
+        .any(|entry| entry.name == target && entry.enabled.load(Ordering::Relaxed))
+}
+
+/// The tracing service asked for a target nothing registered.
+#[derive(Debug, thiserror::Error)]
+#[error("the kernel gates no diagnostic target named {0:?}")]
+pub(crate) struct UnknownDiagnosticTarget(pub String);
+
+/// Turns one gated diagnostic target on or off for the rest of the
+/// boot. Called by the `helios:system/tracing.set-target-enabled` host
+/// function.
+pub(crate) fn set_gated_target(name: &str, enabled: bool) -> Result<(), UnknownDiagnosticTarget> {
+    let target = DIAGNOSTIC_TARGETS
+        .iter()
+        .find(|entry| entry.name == name)
+        .copied()
+        .ok_or_else(|| UnknownDiagnosticTarget(String::from(name)))?;
+    target.enabled.store(enabled, Ordering::Relaxed);
+    Ok(())
+}
+
 impl<Console: Write + Send + 'static> Subscriber for KernelConsoleSubscriber<Console> {
+    /// Diagnostic targets flip at runtime, so no callsite may answer
+    /// permanently: every event asks [`enabled`](Self::enabled), which
+    /// is one atomic load for a `DEBUG`/`TRACE` event on a target the
+    /// registry does not gate.
+    fn register_callsite(&self, _metadata: &'static tracing::Metadata<'static>) -> Interest {
+        Interest::sometimes()
+    }
+
     fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
-        matches!(
-            *metadata.level(),
-            tracing::Level::ERROR | tracing::Level::WARN | tracing::Level::INFO
-        )
+        match *metadata.level() {
+            tracing::Level::ERROR | tracing::Level::WARN | tracing::Level::INFO => true,
+            _ => gated_target_enabled(metadata.target()),
+        }
     }
 
     fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
@@ -208,7 +275,7 @@ mod tests {
 
     use super::{
         KernelConsoleSubscriber, LOG_BUFFER_INITIAL_CAPACITY, LOG_BUFFER_RETAINED_CAPACITY,
-        LOG_QUEUE_CAPACITY, reset_log_buffer,
+        LOG_QUEUE_CAPACITY, reset_log_buffer, set_gated_target,
     };
 
     #[test]
@@ -227,5 +294,32 @@ mod tests {
         let logger = KernelConsoleSubscriber::new(String::new());
 
         assert_eq!(logger.queue.capacity(), Some(LOG_QUEUE_CAPACITY));
+    }
+
+    /// The gate refuses names nothing registered, and an enabled
+    /// target is what `enabled` admits at `DEBUG`. The flag is global,
+    /// so the test restores it on the way out.
+    #[test]
+    fn diagnostic_target_gate_opens_and_refuses() {
+        let logger = KernelConsoleSubscriber::new(String::new());
+
+        tracing::subscriber::with_default(logger, || {
+            assert!(!tracing::enabled!(
+                target: crate::exec::phases::TARGET,
+                tracing::Level::DEBUG
+            ));
+            set_gated_target(crate::exec::phases::TARGET, true).unwrap();
+            assert!(tracing::enabled!(
+                target: crate::exec::phases::TARGET,
+                tracing::Level::DEBUG
+            ));
+            set_gated_target(crate::exec::phases::TARGET, false).unwrap();
+            assert!(!tracing::enabled!(
+                target: crate::exec::phases::TARGET,
+                tracing::Level::DEBUG
+            ));
+        });
+
+        assert!(set_gated_target("helios_kernel::exec::nope", true).is_err());
     }
 }
