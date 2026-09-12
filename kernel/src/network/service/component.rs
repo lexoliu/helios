@@ -447,7 +447,11 @@ where
         NetworkService::tcp_send_room(self, stream)
     }
 
-    fn tcp_try_write(&self, stream: Self::TcpStream, bytes: &mut Bytes) -> Result<usize, TcpError> {
+    fn tcp_try_write(
+        &self,
+        stream: Self::TcpStream,
+        bytes: &mut Bytes,
+    ) -> Result<crate::TcpWriteProgress, TcpError> {
         NetworkService::tcp_try_write(self, stream, bytes)
     }
 

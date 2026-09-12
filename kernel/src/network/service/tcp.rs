@@ -249,12 +249,22 @@ where
     /// on the caller's own task: the owning shard's segment production,
     /// then the egress drain onto the rings and the doorbell.
     ///
+    /// `Room` is the count the queue took. A queue that took nothing is
+    /// classified under the same lock, so the one pass answers what a
+    /// `tcp_send_room` probe would take a second pass to say: `Pending`
+    /// for a full send window on a live connection, `Closed` for a send
+    /// side that cannot send again.
+    ///
     /// The drive is the transmit half of a poll. The receive half's
     /// async device read is unreachable from a `write` that may not
     /// block — and unneeded: inbound frames keep landing through the
     /// device's own delivery, and the parked reads and write waits
     /// consume them as they always have.
-    pub fn tcp_try_write(&self, stream: TcpStreamId, bytes: &mut Bytes) -> Result<usize, TcpError> {
+    pub fn tcp_try_write(
+        &self,
+        stream: TcpStreamId,
+        bytes: &mut Bytes,
+    ) -> Result<TcpWriteProgress, TcpError> {
         let budget = self.inner.poll.budget();
         // Completions first, so a ring full of used descriptors frees
         // before the new segment asks it for room — the order the full
@@ -263,15 +273,15 @@ where
             .reclaim_transmit_completions(budget.tx_completions)
             .map_err(|error| TcpError::from_io(error, NetworkErrorDetail::VirtioAdvanceFailed))?;
         let now = StackInstant::from_nanos(self.now_nanos());
-        let written = self.inner.state.with_handle(stream, |state| {
-            let written = state.try_write_tcp_bytes(stream, bytes)?;
+        let progress = self.inner.state.with_handle(stream, |state| {
+            let progress = state.try_write_tcp_bytes(stream, bytes)?;
             // What was queued becomes a segment on this shard's egress
             // while the lock is already held; nothing else has to run
             // for the write to reach the wire.
             state.stack.drive_tcp(now).unwrap_or_else(|error| {
                 tracing::debug!(?error, "failed to drive TCP after stream write")
             });
-            Ok(written)
+            Ok(progress)
         })?;
         let (transmitted, _) = self
             .submit_network_transmit(NetworkPollSource::Tcp, budget)
@@ -283,7 +293,7 @@ where
                 transmitted_frames: transmitted,
             });
         }
-        Ok(written)
+        Ok(progress)
     }
 
     /// Drains up to `max_bytes` of what `stream`'s receive queue already
@@ -663,7 +673,7 @@ where
             // A blocked write is unblocked by the peer's window opening,
             // which arrives as an ACK on this stream's shard.
             let wait = self.shard_wait_for_handle(stream);
-            let written = self.inner.state.with_handle(stream, |state| {
+            let progress = self.inner.state.with_handle(stream, |state| {
                 state.try_write_tcp_bytes(stream, &mut bytes)
             })?;
             // Queuing bytes on a socket puts nothing on the wire and
@@ -688,16 +698,15 @@ where
             // sampled before this poll, so a drain that made room here
             // releases the park at once instead of being slept through.
             self.drive_tcp().await?;
-            if written != 0 {
-                continue;
-            }
-            // A write that queued nothing is either a full send queue —
-            // the park below waits out the drain — or a send side that
-            // cannot send again, which queue_send_bytes answers with the
-            // same zero. The probe says which, and a close fails the
-            // write rather than parking on it forever.
-            if let TcpWriteProgress::Closed(error) = self.tcp_send_room(stream)? {
-                return Err(error);
+            match progress {
+                // `Room` queued bytes, so retry what is left. `Pending`
+                // is a full send queue, which the park below waits out;
+                // `Closed` fails the write rather than parking on a send
+                // side that cannot send again — the queue pass answered
+                // which under the lock it already held.
+                TcpWriteProgress::Room(_) => continue,
+                TcpWriteProgress::Pending => {}
+                TcpWriteProgress::Closed(error) => return Err(error),
             }
             if self.now_nanos() >= deadline_nanos {
                 return Err(TcpError {
@@ -1672,18 +1681,28 @@ impl NetworkShard {
             })
     }
 
+    /// Queues what `bytes` gives `stream`'s send queue. `Room` is the
+    /// count queued; a queue that took nothing asks `tcp_send_room`
+    /// while the state the write saw is still held — `Pending` for a
+    /// full send window, `Closed` for a send side that cannot send
+    /// again, and `Room` only for a write that carried no bytes.
     pub(super) fn try_write_tcp_bytes(
         &mut self,
         stream: TcpStreamId,
         bytes: &mut Bytes,
-    ) -> Result<usize, TcpError> {
+    ) -> Result<TcpWriteProgress, TcpError> {
         let socket = self.tcp_socket(stream)?;
-        self.stack
+        let written = self
+            .stack
             .tcp_send_bytes(socket, bytes)
             .map_err(|_| TcpError {
                 kind: TcpErrorKind::Unavailable,
                 detail: NetworkErrorDetail::TcpWriteQueueFailed,
-            })
+            })?;
+        match written {
+            0 => self.tcp_send_room(stream),
+            written => Ok(TcpWriteProgress::Room(written)),
+        }
     }
 
     pub(super) fn shutdown_tcp_send(&mut self, stream: TcpStreamId) -> Result<(), TcpError> {

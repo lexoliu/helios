@@ -686,10 +686,10 @@ impl ComponentNetworkService for BenchNetworkService {
         &self,
         _stream: Self::TcpStream,
         bytes: &mut Bytes,
-    ) -> Result<usize, TcpError> {
+    ) -> Result<TcpWriteProgress, TcpError> {
         let written = bytes.len();
         bytes.clear();
-        Ok(written)
+        Ok(TcpWriteProgress::Room(written))
     }
 
     async fn tcp_write_ready(&self, _stream: Self::TcpStream) -> Result<(), TcpError> {

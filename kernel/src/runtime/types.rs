@@ -585,17 +585,19 @@ pub enum TcpReadProgress {
     Eof,
 }
 
-/// What a non-parking probe of a TCP stream's send side found — the
-/// send twin of [`TcpReadProgress`].
+/// What a TCP stream's send side answered — the send twin of
+/// [`TcpReadProgress`], reported by the `tcp_send_room` probe and by
+/// `tcp_try_write` itself.
 ///
 /// `Pending` is the one answer that changes without the connection
 /// ending: the send queue is full and the next drain frees it, so the
-/// caller parks on the stream's readiness. `Room` carries the byte
-/// count a `write` may queue right now. `Closed` is a connection that
-/// cannot send again — this side's shutdown, the peer's reset, the
-/// retransmission limit — and carries the error its next write reports,
-/// so a waiter resolves and names the state instead of sleeping through
-/// it.
+/// caller parks on the stream's readiness. `Room` carries a byte count
+/// — the capacity a `write` may queue when the probe answered, the
+/// count the write just queued when `tcp_try_write` answered. `Closed`
+/// is a connection that cannot send again — this side's shutdown, the
+/// peer's reset, the retransmission limit — and carries the error its
+/// next write reports, so a waiter resolves and names the state instead
+/// of sleeping through it.
 #[derive(Debug)]
 pub enum TcpWriteProgress {
     Pending,
@@ -794,13 +796,22 @@ pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
     /// Queues up to `bytes.len()` on `stream`'s send path and publishes
     /// it synchronously: the stack's segment production, the egress drain
     /// onto the rings and the doorbell all run on the caller's own poll.
-    /// Returns the count `bytes` gave up; whatever did not fit stays in
-    /// `bytes` for the caller to park or complete later.
+    /// `Room` is the count `bytes` gave up; whatever did not fit stays
+    /// in `bytes` for the caller to park or complete later. `Pending`
+    /// and `Closed` are a queue that took nothing, classified under the
+    /// same lock that ran the write: a full send queue on a live
+    /// connection, or a send side that cannot send again — so the one
+    /// call answers what a separate probe would take a second lock to
+    /// say.
     ///
     /// Synchronous because a guest stream's `write` may not block:
     /// everything it touches — the shard lock, the ring's `try_lock`
     /// submit — is held for the call and released before it returns.
-    fn tcp_try_write(&self, stream: Self::TcpStream, bytes: &mut Bytes) -> Result<usize, TcpError>;
+    fn tcp_try_write(
+        &self,
+        stream: Self::TcpStream,
+        bytes: &mut Bytes,
+    ) -> Result<TcpWriteProgress, TcpError>;
 
     /// Resolves when `stream`'s send queue has room, when the send side
     /// can no longer send, or when the stream is gone — a socket-backed

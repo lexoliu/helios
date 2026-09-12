@@ -401,10 +401,14 @@ mod tests {
             Ok(crate::TcpWriteProgress::Room(usize::MAX))
         }
 
-        fn tcp_try_write(&self, _: Self::TcpStream, bytes: &mut Bytes) -> Result<usize, TcpError> {
+        fn tcp_try_write(
+            &self,
+            _: Self::TcpStream,
+            bytes: &mut Bytes,
+        ) -> Result<crate::TcpWriteProgress, TcpError> {
             let written = bytes.len();
             bytes.clear();
-            Ok(written)
+            Ok(crate::TcpWriteProgress::Room(written))
         }
 
         fn tcp_write_ready(

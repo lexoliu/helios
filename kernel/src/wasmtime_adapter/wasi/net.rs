@@ -1128,25 +1128,23 @@ where
             ));
         }
         let handle = NetworkHandle::from_raw(stream);
-        // Queueing gives a dead send side the same 0 it gives a full
-        // queue — probe first so the dead one answers `closed` rather
-        // than parking bytes that can never leave.
-        match self.service.tcp_send_room(handle) {
+        let mut bytes = bytes;
+        // One locked pass both queues and classifies a queue that took
+        // nothing: `Pending` is a full send queue on a live connection,
+        // `Closed` a send side that cannot send again — the answer a
+        // separate probe used to fetch under a second lock.
+        match self.service.tcp_try_write(handle, &mut bytes) {
+            // What the send queue could not take is parked rather than
+            // dropped or errored: `ready` completes it, and
+            // `check_write` withholds the next permit until then.
+            Ok(crate::TcpWriteProgress::Room(_)) | Ok(crate::TcpWriteProgress::Pending) => {}
             Ok(crate::TcpWriteProgress::Closed(_)) => return Err(StreamError::Closed),
-            Ok(_) => {}
             Err(error) => {
                 return Err(StreamError::LastOperationFailed(wasmtime::Error::new(
                     error,
                 )));
             }
         }
-        let mut bytes = bytes;
-        self.service
-            .tcp_try_write(handle, &mut bytes)
-            .map_err(|error| StreamError::LastOperationFailed(wasmtime::Error::new(error)))?;
-        // What the send queue could not take is parked rather than
-        // dropped or errored: `ready` completes it, and `check_write`
-        // withholds the next permit until then.
         if !bytes.is_empty() {
             self.pending = Some(bytes);
         }

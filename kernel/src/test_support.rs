@@ -981,13 +981,13 @@ mod network {
             &self,
             _: Self::TcpStream,
             bytes: &mut Bytes,
-        ) -> Result<usize, crate::TcpError> {
+        ) -> Result<crate::TcpWriteProgress, crate::TcpError> {
             if self.drive_failure.load(Ordering::Acquire) {
-                return Ok(0);
+                return Ok(crate::TcpWriteProgress::Pending);
             }
             let written = bytes.len();
             bytes.clear();
-            Ok(written)
+            Ok(crate::TcpWriteProgress::Room(written))
         }
 
         fn tcp_write_ready(
