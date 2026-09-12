@@ -47,7 +47,12 @@ from helios_bench.report import (
     Side,
     Thresholds,
 )
-from helios_bench.sources import RawSide, read_control, read_optional_side
+from helios_bench.sources import (
+    SIDE_CONTROL_JSONL,
+    RawSide,
+    read_control,
+    read_optional_side,
+)
 from helios_bench.wasi_apps import workload_runner
 from helios_bench.workloads import load_workloads, select_workloads
 
@@ -753,7 +758,10 @@ def retry(
     The second pass re-runs only the Helios pair — the Linux sides'
     first-pass cells stand — so a retry pass needs a baseline
     (``--baseline-ref`` or ``--profile-use``) to compare, which every paired
-    run already has.
+    run already has. And a retry pass that comes back without the control
+    pair it was asked to measure is a failed pass, not a clean one: the run
+    stops naming the side and the files it expected rather than reporting
+    a floor of zero.
     """
     result = evaluate_paired(report)
     if result is None or not result.inconclusive:
@@ -774,12 +782,29 @@ def retry(
     )
     second_sides = read_sides(retry_options, thresholds)
     retaken = retake(retry_options, iterations, workloads, second_sides, thresholds)
-    control = build_control(report.control.workload, read_controls(retry_options, thresholds), thresholds)
+    controls = read_controls(retry_options, thresholds)
+    for side in sorted(retry_options.sides):
+        out_dir = retry_options.out_dir / SIDE_OUT[side]
+        pair = controls.get(side)
+        if pair is None:
+            raise SystemExit(
+                f"the retry pass produced no control pair for the {side} side: "
+                f"{out_dir / SIDE_CONTROL_JSONL[side].format(moment='before')} and "
+                f"{out_dir / SIDE_CONTROL_JSONL[side].format(moment='after')} were expected"
+            )
+        for moment, raw in (("before", pair[0]), ("after", pair[1])):
+            if report.control.workload not in raw.cells:
+                raise SystemExit(
+                    f"the retry pass's {side} side control at "
+                    f"{out_dir / SIDE_CONTROL_JSONL[side].format(moment=moment)} "
+                    f"recorded no `{report.control.workload}` cell"
+                )
+    control = build_control(report.control.workload, controls, thresholds)
     for side, raw in first_sides.items():
         second_sides.setdefault(side, raw)
     record = NoiseRetry(
         first_noise_floor=result.noise_floor,
-        second_noise_floor=control.noise_floor if control is not None else 0.0,
+        second_noise_floor=control.noise_floor,
     )
     second = build(second_sides, control, retaken, [], record)
     reconfirmed = reconfirm(retry_options, iterations, second, second_sides, thresholds)
