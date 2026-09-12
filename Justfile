@@ -75,7 +75,7 @@ clippy-host:
         --exclude helios-init --exclude helios-input-test \
         --exclude helios-oob-load --exclude helios-perf \
         --exclude helios-ping --exclude helios-procbench \
-        --exclude helios-sched-tasks \
+        --exclude helios-sched-tasks --exclude helios-surface-test \
         -- -D warnings
 
 # Clippy each guest program on its own, denying warnings.
@@ -88,7 +88,7 @@ clippy-programs:
     for package in helios-audio-test helios-compositor helios-date helios-debugger helios-display-test helios-gpu-test \
         helios-http-client \
         helios-init helios-input-test helios-oob-load helios-perf helios-ping \
-        helios-procbench helios-sched-tasks; do
+        helios-procbench helios-sched-tasks helios-surface-test; do
         cargo clippy -p "${package}" --all-targets -- -D warnings
     done
 

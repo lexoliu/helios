@@ -2102,6 +2102,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "helios-surface-test"
+version = "0.1.0"
+dependencies = [
+ "helios-api",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "helios-virtio"
 version = "0.1.0"
 dependencies = [
