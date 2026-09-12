@@ -3,7 +3,7 @@ Numbers below are from CI run [{{ run_id }}]({{ reports[0].run.url }}){% if repo
 Each cell is the median warm wall time in milliseconds with its 95% bootstrap interval; the "vs" columns divide the other side's median by Helios's, so above 1x Helios is faster. Same QEMU, accelerator, vCPUs, memory and virtio devices on every side; Linux + Wasmtime runs the same wasm precompiled by the same Wasmtime revision Helios vendors. Methodology, pins and the full tables: [docs/benchmarks.md](docs/benchmarks.md).
 
 {% for report in reports %}
-**{{ report.run.lane }}** — {{ report.hardware.cpu }}, {{ report.hardware.accelerator }}{% if report.control %}, noise floor {{ report.control.noise_floor | percent }}{% if report.run.noise_retry %} on the retry (first pass {{ report.run.noise_retry.first_noise_floor | percent }}){% endif %}{% endif %}
+**{{ report.run.lane }}** — {{ report.hardware.cpu }}, {{ report.hardware.accelerator }}{% if report.control %}, noise floor {{ report.control.noise_floor | percent }}{% if report.run.noise_retry %}{% if report.run.noise_retry.skipped_for_budget %} (the retry was skipped for the job's budget){% else %} on the retry (first pass {{ report.run.noise_retry.first_noise_floor | percent }}){% endif %}{% endif %}{% endif %}
 
 {% set sides = report.table_sides() %}
 {{ m.header(sides) }}

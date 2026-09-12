@@ -39,6 +39,11 @@ def format_percent(value: float) -> str:
     return f"{value * 100:+.1f}%"
 
 
+def format_seconds(value: float) -> str:
+    """A count of seconds, for the budget the retry was sized against."""
+    return f"{value:.0f} s"
+
+
 def environment() -> Environment:
     env = Environment(
         loader=FileSystemLoader(TEMPLATES_ROOT),
@@ -52,6 +57,7 @@ def environment() -> Environment:
     env.filters["ci"] = format_ci
     env.filters["speedup"] = format_speedup
     env.filters["percent"] = format_percent
+    env.filters["seconds"] = format_seconds
     env.globals["Side"] = Side
     env.globals["SIDE_LABELS"] = SIDE_LABELS
     env.globals["CLASS_LABELS"] = CLASS_LABELS

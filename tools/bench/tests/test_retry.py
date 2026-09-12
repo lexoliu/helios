@@ -13,6 +13,7 @@ reading, report assembly, the retry itself — is the production code's.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -177,6 +178,7 @@ def test_a_noisy_first_pass_with_a_clean_retry_gates_on_the_retry(
     """Run 34381896869 again: the control drifted 28.7% on the first pass.
     The retry measured a quiet host, so its report is the one the gate
     reads — and the run record carries both floors."""
+    options = replace(options, job_timeout_minutes=420)
     fake, executed = fake_driver(
         options,
         {
@@ -209,6 +211,7 @@ def test_a_noisy_first_pass_with_a_clean_retry_gates_on_the_retry(
 
     record = report.run.noise_retry
     assert record is not None
+    assert not record.skipped_for_budget
     assert record.first_noise_floor > THRESHOLDS.cv_bound
     assert record.second_noise_floor == pytest.approx(report.control.noise_floor)
     assert record.second_noise_floor < THRESHOLDS.cv_bound
@@ -424,3 +427,41 @@ def test_a_retry_pass_without_its_control_pair_fails_fast(
     assert f"the {side} side" in message
     assert "helios-control-before.jsonl" in message
     assert "helios-control-after.jsonl" in message
+
+
+def test_a_retry_that_would_outlast_the_job_budget_is_skipped(
+    options, baseline_report: Report, monkeypatch, capsys
+) -> None:
+    """`--job-timeout-minutes` is what the job gives the whole run; a second
+    pass estimated at the first pass's Helios wall time that cannot fit
+    what remains is not started — the first pass stands, inconclusive, and
+    the record says why."""
+    options = replace(options, job_timeout_minutes=0)
+    fake, executed = fake_driver(options, {"": first_pass(noisy_control(10))})
+    monkeypatch.setattr(runner, "execute", fake)
+
+    report = suite(options, load_manifest(), monkeypatch, baseline_report)
+
+    record = report.run.noise_retry
+    assert record is not None
+    assert record.skipped_for_budget
+    assert record.first_noise_floor > THRESHOLDS.cv_bound
+    assert record.second_noise_floor is None
+    assert record.needed_seconds is not None
+    assert record.remaining_seconds is not None
+
+    # No second pass ran: the three first-pass commands only.
+    assert len(executed) == 3
+    assert not (options.out_dir / RETRY_OUT).exists()
+
+    result = evaluate_paired(report)
+    assert result.inconclusive
+    assert result.blocking
+
+    log = capsys.readouterr().out
+    assert "the second pass would need" in log
+    assert "remain" in log
+    text = render_gate(gate_report(report, None), "x86-64-kvm")
+    assert "**Blocking: inconclusive**" in text
+    assert "the second pass would need" in text
+    assert "of the job's budget" in text

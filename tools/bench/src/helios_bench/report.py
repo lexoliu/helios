@@ -11,7 +11,7 @@ import json
 from enum import StrEnum
 from pathlib import Path
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 REPORT_SCHEMA_VERSION = 1
 
@@ -61,20 +61,58 @@ CLASS_LABELS = {
 
 
 class NoiseRetry(BaseModel):
-    """The two passes' noise floors when a paired run was measured twice.
+    """The two passes' noise floors when a paired run was measured twice —
+    or, with ``skipped_for_budget``, the record that the one retry was not
+    started because a second pass would not have fit the job's budget.
 
     A first pass whose control dispersed past the bound is not evidence of
     anything about the host an hour later, so the paired suite runs once
     more in the same job; both floors are kept so a report says the host
-    needed a second pass (#375).
+    needed a second pass (#375). When the skip happened, the report is the
+    first pass's — still inconclusive — and the two budget numbers are
+    what the decision was made from.
     """
 
     first_noise_floor: float = Field(
         description="the first pass's noise floor — the one that crossed cv_bound"
     )
-    second_noise_floor: float = Field(
-        description="the retry pass's noise floor — the one this report's verdicts read"
+    second_noise_floor: float | None = Field(
+        default=None,
+        description=(
+            "the retry pass's noise floor — the one this report's verdicts read; "
+            "None when the retry was skipped for budget"
+        ),
     )
+    skipped_for_budget: bool = Field(
+        default=False,
+        description=(
+            "the first pass was inconclusive but the one retry was not started: "
+            "a second pass was estimated to outlast the job's remaining budget"
+        ),
+    )
+    needed_seconds: float | None = Field(
+        default=None,
+        description="the first pass's Helios wall time — what a second pass was sized at",
+    )
+    remaining_seconds: float | None = Field(
+        default=None,
+        description="what remained of the run's --job-timeout-minutes when the retry was weighed",
+    )
+
+    @model_validator(mode="after")
+    def check_consistent(self) -> NoiseRetry:
+        """The floors and the budget numbers answer to each other: a retry
+        that ran records the second pass's floor, and a skipped one records
+        the two numbers it was sized by."""
+        if self.skipped_for_budget:
+            if self.needed_seconds is None or self.remaining_seconds is None:
+                raise ValueError(
+                    "a budget-skipped retry records the seconds a second pass "
+                    "needed and the seconds the job had left"
+                )
+        elif self.second_noise_floor is None:
+            raise ValueError("a retry that ran records the second pass's noise floor")
+        return self
 
 
 class RunInfo(BaseModel):

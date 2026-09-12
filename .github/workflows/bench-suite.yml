@@ -231,8 +231,12 @@ jobs:
         if: ${{ !inputs.tcp_probe }}
         working-directory: helios/tools/bench
         run: |
+          # --job-timeout-minutes is this job's timeout-minutes above (the
+          # arm this step runs under): the runner skips the one retry of an
+          # inconclusive paired control when a second pass would outlast
+          # what remains, and a test asserts the two literals agree.
           args=(run --lane "${{ matrix.lane }}" --out-dir "$GITHUB_WORKSPACE/bench-out/${{ matrix.lane }}"
-                --runner-label "${{ runner.name }}")
+                --runner-label "${{ runner.name }}" --job-timeout-minutes 420)
           # instance-startup-500 wants about 6.1 GiB of guest before the
           # kernel's own baseline and the lane guest has less, so its
           # Helios half cannot be measured on this machine and a Linux

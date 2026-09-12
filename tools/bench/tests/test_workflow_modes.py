@@ -104,6 +104,20 @@ def test_suite_preserves_workloads_and_pairing(jobs, tmp_path: Path, paired):
         assert "--sides" not in arguments
 
 
+def test_the_retry_budget_is_the_suite_job_timeout(jobs, tmp_path):
+    """`--job-timeout-minutes` is the same literal as the suite job's
+    `timeout-minutes`: the one retry of an inconclusive paired control is
+    sized against what remains of the job it runs in, so the two cannot
+    drift."""
+    suite = next(step for step in jobs["suite"]["steps"] if step.get("name") == "Run the suite")
+    # The step runs only when tcp_probe is off, which is when the job's
+    # timeout expression resolves to its second arm: 420 minutes.
+    assert suite["if"] == "${{ !inputs.tcp_probe }}"
+    assert jobs["suite"]["timeout-minutes"] == "${{ inputs.tcp_probe && 40 || 420 }}"
+    arguments = run_arguments(suite["run"], tmp_path, "true")
+    assert arguments[arguments.index("--job-timeout-minutes") + 1] == "420"
+
+
 @pytest.mark.parametrize(("build", "asked"), [("profile-use", False), ("release", True)])
 def test_suite_passes_the_plain_baseline_control_through(jobs, tmp_path: Path, build, asked):
     """`baseline_kernel_build: release` reaches `helios-bench run` as the
