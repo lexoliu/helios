@@ -17,8 +17,10 @@
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU16, Ordering};
 
+use arrayvec::ArrayVec;
 use helios_hal::fs::BlockDeviceRights;
 use helios_hal::io::{IoError, IoResult};
+use helios_hal::iommu::PhysicalRange;
 use helios_hal::mmio;
 use pci_types::capability::PciCapability;
 use pci_types::{Bar, CommandRegister, ConfigRegionAccess, EndpointHeader, PciAddress, PciHeader};
@@ -48,6 +50,18 @@ const VIRTIO_PCI_CAP_COMMON_CFG: u8 = 1;
 const VIRTIO_PCI_CAP_NOTIFY_CFG: u8 = 2;
 const VIRTIO_PCI_CAP_ISR_CFG: u8 = 3;
 const VIRTIO_PCI_CAP_DEVICE_CFG: u8 = 4;
+/// `VIRTIO_PCI_CAP_SHARED_MEMORY_CFG`: a window of the device's own
+/// memory placed in the guest's physical address space (virtio 1.2
+/// §4.1.4.7). virtio-gpu publishes its host-visible blob aperture here.
+const VIRTIO_PCI_CAP_SHARED_MEMORY_CFG: u8 = 8;
+
+/// Shared-memory regions one function may publish.
+///
+/// virtio-gpu publishes one (the host-visible aperture) and the
+/// specification's other users publish one or two; four is what keeps
+/// the table a value on the bring-up stack rather than an allocation
+/// whose size a device chooses.
+const MAX_SHARED_MEMORY_REGIONS: usize = 4;
 
 /// `struct virtio_pci_cap` field offsets, read as aligned dwords.
 const CAP_TYPE_WORD: u16 = 0x00;
@@ -55,6 +69,11 @@ const CAP_BAR_WORD: u16 = 0x04;
 const CAP_OFFSET_WORD: u16 = 0x08;
 const CAP_LENGTH_WORD: u16 = 0x0c;
 const CAP_NOTIFY_MULTIPLIER_WORD: u16 = 0x10;
+/// `struct virtio_pci_cap64`: the high halves of a shared-memory
+/// region's offset and length, which is what makes it a 64-bit window
+/// rather than the 32-bit one every other capability describes.
+const CAP_OFFSET_HIGH_WORD: u16 = 0x10;
+const CAP_LENGTH_HIGH_WORD: u16 = 0x14;
 
 /// `struct virtio_pci_common_cfg` field offsets.
 const COMMON_DEVICE_FEATURE_SELECT: usize = 0x00;
@@ -311,6 +330,10 @@ pub struct VirtioPciTransport<P: DmaPool> {
     device_type: DeviceType,
     msix: Option<MsixBinding>,
     queue_notify_offsets: [AtomicU16; MAX_VIRTQUEUES],
+    /// The device's own memory windows, resolved to physical spans at
+    /// bring-up. Empty on every function that publishes none, which is
+    /// every virtio device but a rendering GPU.
+    shared_memory: SharedMemoryRegions,
 }
 
 /// The virtio device type a PCI function implements, or `None` when the
@@ -346,6 +369,31 @@ struct VirtioCapability {
     length: u32,
 }
 
+/// One shared-memory region a function publishes, as its capability
+/// describes it: which BAR carries it, where in that BAR it starts and
+/// how long it is, both 64-bit.
+#[derive(Clone, Copy)]
+struct SharedMemoryCapability {
+    id: u8,
+    bar: u8,
+    offset: u64,
+    length: u64,
+}
+
+/// Every shared-memory region one function publishes, in capability
+/// order.
+type SharedMemoryRegions = ArrayVec<PublishedSharedMemory, MAX_SHARED_MEMORY_REGIONS>;
+
+/// One shared-memory region resolved to the physical span it occupies.
+///
+/// Resolved at bring-up, because the BAR it sits in is read through the
+/// configuration space and nothing holds that access afterwards.
+#[derive(Clone, Copy)]
+struct PublishedSharedMemory {
+    id: u8,
+    physical: PhysicalRange,
+}
+
 #[derive(Default)]
 struct VirtioCapabilities {
     common: Option<VirtioCapability>,
@@ -353,6 +401,7 @@ struct VirtioCapabilities {
     isr: Option<VirtioCapability>,
     device: Option<VirtioCapability>,
     notify_off_multiplier: Option<u32>,
+    shared_memory: ArrayVec<SharedMemoryCapability, MAX_SHARED_MEMORY_REGIONS>,
 }
 
 impl<P: DmaPool> VirtioPciTransport<P> {
@@ -433,6 +482,10 @@ impl<P: DmaPool> VirtioPciTransport<P> {
             })
             .map(|capability| map_capability(access, &endpoint, mapper, capability))
             .transpose()?;
+        // Resolved while the configuration space is still readable:
+        // nothing holds the access afterwards, and the aperture's
+        // address is a BAR address plus an offset.
+        let shared_memory = resolve_shared_memory(access, &endpoint, &capabilities.shared_memory);
 
         // Memory decode and bus mastering are both required before the
         // device may read the descriptor rings out of guest memory.
@@ -455,6 +508,7 @@ impl<P: DmaPool> VirtioPciTransport<P> {
             device_type,
             msix,
             queue_notify_offsets: [const { AtomicU16::new(0) }; MAX_VIRTQUEUES],
+            shared_memory,
         })
     }
 
@@ -650,6 +704,14 @@ impl<P: DmaPool> VirtioTransport for VirtioPciTransport<P> {
     fn read_config_u8(&self, offset: usize) -> u8 {
         self.bus.read_u8(offset)
     }
+
+    /// The window `id` names, out of the table bring-up resolved.
+    fn shared_memory_region(&self, id: u8) -> Option<PhysicalRange> {
+        self.shared_memory
+            .iter()
+            .find(|region| region.id == id)
+            .map(|region| region.physical)
+    }
 }
 
 /// The interrupt cause a virtio-PCI function reports.
@@ -679,7 +741,8 @@ fn parse_capabilities<A: ConfigRegionAccess>(
         let offset = location.offset;
         let type_word = unsafe { access.read(address, offset + CAP_TYPE_WORD) };
         let cfg_type = (type_word >> 24) as u8;
-        let bar = unsafe { access.read(address, offset + CAP_BAR_WORD) } as u8;
+        let bar_word = unsafe { access.read(address, offset + CAP_BAR_WORD) };
+        let bar = bar_word as u8;
         let region = VirtioCapability {
             bar,
             offset: unsafe { access.read(address, offset + CAP_OFFSET_WORD) },
@@ -694,10 +757,71 @@ fn parse_capabilities<A: ConfigRegionAccess>(
             }
             VIRTIO_PCI_CAP_ISR_CFG => capabilities.isr = Some(region),
             VIRTIO_PCI_CAP_DEVICE_CFG => capabilities.device = Some(region),
+            VIRTIO_PCI_CAP_SHARED_MEMORY_CFG => {
+                // `struct virtio_pci_cap64` puts the high halves where
+                // the notification capability keeps its multiplier, and
+                // the region's own id in the byte after the BAR number.
+                let offset_high = unsafe { access.read(address, offset + CAP_OFFSET_HIGH_WORD) };
+                let length_high = unsafe { access.read(address, offset + CAP_LENGTH_HIGH_WORD) };
+                // A function that publishes more windows than the table
+                // holds keeps the ones it declared first; the driver
+                // then refuses a region it cannot name rather than
+                // reading one at the wrong address.
+                let _ = capabilities.shared_memory.try_push(SharedMemoryCapability {
+                    id: ((bar_word >> 8) & 0xff) as u8,
+                    bar,
+                    offset: u64::from(region.offset) | (u64::from(offset_high) << 32),
+                    length: u64::from(region.length) | (u64::from(length_high) << 32),
+                });
+            }
             _ => {}
         }
     }
     capabilities
+}
+
+/// Resolves every published shared-memory region to the physical span
+/// it occupies.
+///
+/// A region whose BAR the platform left unassigned, or whose window
+/// runs past that BAR, is dropped rather than reported: the driver then
+/// answers "there is no aperture" and refuses to map, which is the same
+/// answer it gives on a device that publishes none at all. Reporting an
+/// address the function does not decode would hand a guest a mapping
+/// that reads as all ones.
+fn resolve_shared_memory<A: ConfigRegionAccess>(
+    access: &A,
+    endpoint: &EndpointHeader,
+    published: &[SharedMemoryCapability],
+) -> SharedMemoryRegions {
+    let mut regions = SharedMemoryRegions::new();
+    for capability in published {
+        let Some(bar) = endpoint.bar(capability.bar, access) else {
+            continue;
+        };
+        let (bar_address, bar_size) = match bar {
+            Bar::Memory32 { address, size, .. } => (u64::from(address), u64::from(size)),
+            Bar::Memory64 { address, size, .. } => (address, size),
+            Bar::Io { .. } => continue,
+        };
+        if bar_address == 0 || capability.length == 0 {
+            continue;
+        }
+        let Some(end) = capability.offset.checked_add(capability.length) else {
+            continue;
+        };
+        if end > bar_size {
+            continue;
+        }
+        let Some(start) = bar_address.checked_add(capability.offset) else {
+            continue;
+        };
+        let _ = regions.try_push(PublishedSharedMemory {
+            id: capability.id,
+            physical: PhysicalRange::new(start, capability.length),
+        });
+    }
+    regions
 }
 
 fn map_capability<A, M>(

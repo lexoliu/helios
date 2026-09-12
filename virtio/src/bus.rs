@@ -56,6 +56,22 @@ pub trait DmaPool: Send + Sync + 'static {
     fn allocate_zeroed(&self, layout: Layout) -> IoResult<Self::Buffer>;
     fn dma_addr(&self, ptr: *const u8) -> IoResult<u64>;
 
+    /// The address a device has to issue to reach `bytes` of physical
+    /// memory at `physical`, which this pool did not allocate.
+    ///
+    /// [`DmaPool::dma_addr`] answers for a buffer the driver holds a
+    /// pointer to, which is a buffer in whatever mapping the driver
+    /// allocates out of. This one answers for memory that is somebody
+    /// else's and is named by its physical address alone — a guest's
+    /// own pinned pages, handed to the device by address instead of
+    /// copied — and it is the only way such a run reaches a descriptor.
+    /// A pool whose device sees physical addresses answers with the
+    /// address it was given; one behind a translation answers with the
+    /// address inside the device's domain, and refuses a run the domain
+    /// does not map contiguously rather than handing over one the
+    /// device would read the wrong half of.
+    fn device_range(&self, physical: u64, bytes: u64) -> IoResult<u64>;
+
     /// What kind of address this pool hands out.
     fn addressing(&self) -> DmaAddressing;
 }
@@ -172,6 +188,12 @@ impl DmaPool for IdentityDmaPool {
         Ok(ptr as usize as u64)
     }
 
+    /// Physical addresses and host addresses are the same thing in this
+    /// pool, so a run of somebody else's memory is reached where it is.
+    fn device_range(&self, physical: u64, _bytes: u64) -> IoResult<u64> {
+        Ok(physical)
+    }
+
     fn addressing(&self) -> DmaAddressing {
         DmaAddressing::Physical
     }
@@ -189,6 +211,14 @@ impl DmaPool for OffsetDmaPool {
             layout,
             physical_address,
         })
+    }
+
+    /// The device sees physical addresses, so a run named by one is
+    /// already the address it has to issue. The offset this pool holds
+    /// turns a kernel pointer into a physical address and has nothing
+    /// to say about memory that arrived as one.
+    fn device_range(&self, physical: u64, _bytes: u64) -> IoResult<u64> {
+        Ok(physical)
     }
 
     fn dma_addr(&self, ptr: *const u8) -> IoResult<u64> {
@@ -263,6 +293,10 @@ impl<P: DmaPool> DmaPool for PlatformDmaPool<P> {
     fn dma_addr(&self, ptr: *const u8) -> IoResult<u64> {
         let physical = self.inner.dma_addr(ptr)?;
         Ok(self.translation.device_address(physical)?)
+    }
+
+    fn device_range(&self, physical: u64, bytes: u64) -> IoResult<u64> {
+        Ok(self.translation.device_range(physical, bytes)?)
     }
 
     fn addressing(&self) -> DmaAddressing {

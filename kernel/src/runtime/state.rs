@@ -69,6 +69,12 @@ struct RuntimeStateInner<ProgramService, NetworkService, HostFsService> {
     /// and the kernel took ownership of them. Empty on a machine with
     /// none, where a claim is refused rather than trapping.
     input_service: Once<crate::input::InputService>,
+    /// The display engine's rendering half, once the backend brought
+    /// the device up and the kernel took ownership of it. Empty on a
+    /// machine with no display device at all, where a claim is refused
+    /// `unavailable` rather than trapping; installed even when the
+    /// device renders nothing, where a claim answers `no-renderer`.
+    gpu3d_service: Once<crate::gpu::Gpu3dService>,
     /// The machine's client windows. Always present — it costs a few
     /// words and a program may ask for a window on any machine — and
     /// empty of surfaces until a compositor is provisioned.
@@ -315,6 +321,7 @@ where
                 swap: Once::new(),
                 display_service: Once::new(),
                 input_service: Once::new(),
+                gpu3d_service: Once::new(),
                 surface_service: crate::surface::SurfaceService::new(),
                 compositor: ProviderSlot::new(),
                 audio_service: Once::new(),
@@ -794,6 +801,26 @@ where
         self.inner.input_service.get().cloned()
     }
 
+    /// Publishes the display engine's rendering half.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a second service is installed. One machine has one
+    /// display device the kernel owns, and two would make a claim
+    /// ambiguous.
+    pub fn install_gpu3d_service(&self, service: crate::gpu::Gpu3dService) {
+        let mut installed = false;
+        self.inner.gpu3d_service.call_once(|| {
+            installed = true;
+            service
+        });
+        assert!(installed, "the 3D service was installed twice");
+    }
+
+    pub fn gpu3d_service(&self) -> Option<crate::gpu::Gpu3dService> {
+        self.inner.gpu3d_service.get().cloned()
+    }
+
     /// The machine's client windows.
     pub fn surface_service(&self) -> crate::surface::SurfaceService {
         self.inner.surface_service.clone()
@@ -1053,6 +1080,10 @@ where
 
     fn input_service(&self) -> Option<crate::input::InputService> {
         RuntimeState::input_service(self)
+    }
+
+    fn gpu3d_service(&self) -> Option<crate::gpu::Gpu3dService> {
+        RuntimeState::gpu3d_service(self)
     }
 
     fn surface_service(&self) -> crate::surface::SurfaceService {

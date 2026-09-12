@@ -16,13 +16,14 @@
 //! different urgency, and this driver keeps them separate: a cursor
 //! command never waits behind a frame's transfer.
 //!
-//! Only the 2D subset is negotiated. `VIRTIO_GPU_F_VIRGL`,
-//! `VIRTIO_GPU_F_RESOURCE_BLOB` and `VIRTIO_GPU_F_CONTEXT_INIT` stay off
-//! deliberately: the 3D path needs host-visible blob memory mapped into
-//! a guest address space and a fence protocol, which is a different
-//! contract and its own change. `VIRTIO_GPU_F_EDID` is asked for,
-//! because the monitor's own preferred timing is a better answer than
-//! the geometry the host happens to have published.
+//! `VIRTIO_GPU_F_EDID` is always asked for, because the monitor's own
+//! preferred timing is a better answer than the geometry the host
+//! happens to have published. The 3D features — `VIRTIO_GPU_F_VIRGL`,
+//! `VIRTIO_GPU_F_RESOURCE_BLOB`, `VIRTIO_GPU_F_CONTEXT_INIT`,
+//! `VIRTIO_GPU_F_RESOURCE_UUID` — are asked for only where the device
+//! offers them, and the rendering half they open up lives in
+//! [`render`]. A device that offers no renderer negotiates exactly what
+//! a 2D-only driver did, which is what the boot line's `3d=none` says.
 //!
 //! The driver never allocates a frame buffer. Backing pages arrive from
 //! the caller as physical ranges and are published to the device as they
@@ -57,11 +58,12 @@ use helios_hal::display::{
     MAX_SCANOUTS, PixelFormat, Point, Rect, ScanoutId, ScanoutInfo, ScanoutList,
 };
 use helios_hal::io::{IoError, IoResult};
+use helios_hal::iommu::PhysicalRange;
 use helios_hal::pmm::PhysFrameRange;
 
 use crate::bus::{DeviceBus, DmaAddressing, DmaPool};
-use crate::features::{NegotiatedFeatures, RING_FEATURES, negotiate};
-use crate::inflight::{InFlight, await_completion, submit_chain};
+use crate::features::{NegotiatedFeatures, RING_FEATURES, negotiate_with};
+use crate::inflight::{InFlight, await_completion, submit_chain, submit_chain_with_payload};
 use crate::notify::Notify;
 use crate::queue::{VirtQueue, negotiated_queue_size};
 use crate::transport::{DeviceStatus, DeviceType, VirtioTransport};
@@ -264,6 +266,23 @@ pub struct VirtioGpuDevice<T: VirtioTransport> {
     scanout_count: u32,
     capset_count: u32,
     features: NegotiatedFeatures,
+    /// Next context id to hand out. Context zero is the device's own
+    /// "no context", so the counter starts at one and never reuses.
+    next_context: AtomicU32,
+    /// The renderer contexts this device holds, and where each one's
+    /// completion timeline has reached.
+    contexts: Mutex<render::ContextRecords>,
+    /// The blob resources this device holds, and where in the aperture
+    /// each mapped one sits.
+    blobs: Mutex<render::BlobRecords>,
+    /// Raised whenever a fence retires on any context. A broadcast,
+    /// because every reader of a timeline is owed the same event; each
+    /// re-reads the timeline it is following for itself.
+    fences_signalled: Notify,
+    /// The device's host-visible aperture, where a host-3D blob is
+    /// mapped. Absent on a device that publishes no such window, which
+    /// is every device with no renderer.
+    host_visible: Option<PhysicalRange>,
 }
 
 impl<T: VirtioTransport> VirtioGpuDevice<T> {
@@ -287,7 +306,9 @@ impl<T: VirtioTransport> VirtioGpuDevice<T> {
             ));
         }
 
-        let features = negotiate(&transport, RING_FEATURES | GPU_FEATURE_EDID)?;
+        let features = negotiate_with(&transport, |offered| {
+            render::wanted_features(offered, RING_FEATURES | GPU_FEATURE_EDID)
+        })?;
 
         let control_size =
             negotiated_queue_size(&transport, CONTROL_QUEUE_INDEX, CONTROL_QUEUE_SIZE)?;
@@ -322,6 +343,12 @@ impl<T: VirtioTransport> VirtioGpuDevice<T> {
                 | DeviceStatus::DRIVER_OK,
         );
 
+        // The aperture is read here rather than on first use: it is a
+        // property of the transport's own capability list, and the
+        // configuration space that carries it is no longer reachable
+        // once bring-up has handed the transport over.
+        let host_visible = transport.shared_memory_region(render::SHM_ID_HOST_VISIBLE);
+
         Ok(Self {
             transport,
             control: AsyncMutex::new(control),
@@ -335,6 +362,11 @@ impl<T: VirtioTransport> VirtioGpuDevice<T> {
             scanout_count,
             capset_count,
             features,
+            next_context: AtomicU32::new(1),
+            contexts: Mutex::new(ArrayVec::new()),
+            blobs: Mutex::new(ArrayVec::new()),
+            fences_signalled: Notify::new(),
+            host_visible,
         })
     }
 
@@ -348,12 +380,20 @@ impl<T: VirtioTransport> VirtioGpuDevice<T> {
         self.scanout_count
     }
 
-    /// How many capability sets the device carries.
+    /// How many capability sets the device says it carries.
     ///
-    /// Read and reported only: a capability set describes a 3D context
-    /// type, and this driver negotiates none.
+    /// The device's own count. What each of them describes is read at
+    /// bring-up and answered by
+    /// [`helios_hal::display::Gpu3d::capsets`], which is empty on a
+    /// device that offers no renderer however many the count claims.
     pub fn capset_count(&self) -> u32 {
         self.capset_count
+    }
+
+    /// The device's host-visible aperture, where a host-3D blob is
+    /// mapped, or `None` on a device that publishes none.
+    pub fn host_visible_aperture(&self) -> Option<PhysicalRange> {
+        self.host_visible
     }
 
     /// Whether the device answers `GET_EDID`.
@@ -405,7 +445,53 @@ impl<T: VirtioTransport> VirtioGpuDevice<T> {
         self.completions.notify_all();
     }
 
-    /// Runs one control command and checks the response header.
+    /// Publishes one chain on the control queue and waits for the
+    /// device to finish with it, reporting how many bytes it wrote.
+    ///
+    /// The shape both halves of this driver share: the 2D commands, and
+    /// the rendering commands in [`render`]. The queue lock is held
+    /// only long enough to publish the chain and is never held across
+    /// an await, so several commands are in flight at once and
+    /// completions are routed back by descriptor identifier.
+    pub(crate) async fn control_exchange(
+        &self,
+        inputs: &[&[u8]],
+        outputs: &mut [&mut [u8]],
+    ) -> IoResult<u32> {
+        self.control_exchange_with_payload(inputs, None, outputs)
+            .await
+    }
+
+    /// [`Self::control_exchange`], with a run of memory this driver
+    /// holds no pointer to carried between the request and the reply.
+    ///
+    /// The one command that has such a body is `SUBMIT_3D`, whose
+    /// command buffer is the guest's own pinned pages: the device reads
+    /// them where the guest wrote them.
+    pub(crate) async fn control_exchange_with_payload(
+        &self,
+        inputs: &[&[u8]],
+        payload: Option<PhysicalRange>,
+        outputs: &mut [&mut [u8]],
+    ) -> IoResult<u32> {
+        let token = submit_chain_with_payload(
+            &self.control_inflight,
+            &self.control,
+            &self.transport,
+            inputs,
+            payload,
+            outputs,
+        )
+        .await?;
+        Ok(
+            await_completion(&self.control_inflight, &self.control, token, || {
+                self.completions.notified()
+            })
+            .await,
+        )
+    }
+
+    /// Runs one 2D control command and checks the response header.
     async fn control_command(
         &self,
         request: &[u8],
@@ -420,20 +506,7 @@ impl<T: VirtioTransport> VirtioGpuDevice<T> {
         } else {
             &all_inputs[..]
         };
-        let written = {
-            let token = submit_chain(
-                &self.control_inflight,
-                &self.control,
-                &self.transport,
-                inputs,
-                &mut [&mut *response],
-            )
-            .await?;
-            await_completion(&self.control_inflight, &self.control, token, || {
-                self.completions.notified()
-            })
-            .await
-        };
+        let written = self.control_exchange(inputs, &mut [&mut *response]).await?;
         if (written as usize) < CTRL_HEADER_BYTES {
             return Err(IoError::DeviceFault.into());
         }
@@ -619,7 +692,10 @@ impl<T: VirtioTransport> helios_hal::display::DisplayDevice for VirtioGpuDevice<
         if frame_bytes == 0 || backing_bytes < frame_bytes {
             return Err(DisplayError::InvalidParameter);
         }
-        let entries = encode_mem_entries(backing)?;
+        let entries = encode_mem_entries(backing).map_err(|error| match error {
+            MemEntryError::Empty => DisplayError::InvalidParameter,
+            MemEntryError::Unrepresentable => DisplayError::Transport(IoError::DeviceFault),
+        })?;
 
         let id = FramebufferId::new(self.next_resource.fetch_add(1, Ordering::Relaxed));
         // The record is claimed before the device is told, so a second
@@ -838,15 +914,45 @@ pub(crate) fn report_gpu_online<T: VirtioTransport>(
         );
         IoError::DeviceFault
     })?;
+    tracing::info!("{}", online_line(device, transport, &topology));
+    Ok(topology)
+}
+
+/// The `virtio-gpu online` line's text.
+///
+/// Built in one place rather than inside the `tracing` call so a test
+/// can pin what a lane greps for, down to the field order and the
+/// feature each field names.
+fn online_line<T: VirtioTransport>(
+    device: &VirtioGpuDevice<T>,
+    transport: &str,
+    topology: &DisplayTopology,
+) -> alloc::string::String {
     let edid = if device.edid_supported() { "on" } else { "off" };
     let scanouts = topology.scanouts.len();
     let width = topology.preferred.width;
     let height = topology.preferred.height;
-    tracing::info!(
+    let features = device.features();
+    // The renderer half, named on the same line as the scanouts,
+    // because "this machine has no 3D" is a fact a lane reads off the
+    // boot log rather than deduces from the absence of one.
+    let three_d = if features.device(render::GPU_FEATURE_VIRGL) {
+        "virgl"
+    } else {
+        "none"
+    };
+    let blob = on_off(features.device(render::GPU_FEATURE_RESOURCE_BLOB));
+    let context_init = on_off(features.device(render::GPU_FEATURE_CONTEXT_INIT));
+    let uuid = on_off(features.device(render::GPU_FEATURE_RESOURCE_UUID));
+    alloc::format!(
         "virtio-gpu online transport={transport} scanouts={scanouts} \
-         preferred={width}x{height} edid={edid}"
-    );
-    Ok(topology)
+         preferred={width}x{height} edid={edid} 3d={three_d} blob={blob} \
+         context-init={context_init} uuid={uuid}"
+    )
+}
+
+const fn on_off(enabled: bool) -> &'static str {
+    if enabled { "on" } else { "off" }
 }
 
 /// `struct virtio_gpu_ctrl_hdr` for a command that carries no payload.
@@ -856,7 +962,7 @@ fn encode_header(command: u32) -> [u8; CTRL_HEADER_BYTES] {
     bytes
 }
 
-fn write_header(bytes: &mut [u8], command: u32) {
+pub(crate) fn write_header(bytes: &mut [u8], command: u32) {
     bytes[0..4].copy_from_slice(&command.to_le_bytes());
 }
 
@@ -891,7 +997,10 @@ fn encode_resource_create_2d(
 
 /// `RESOURCE_UNREF` and `RESOURCE_DETACH_BACKING` share a body: one
 /// resource id and its padding.
-fn encode_resource_only(command: u32, resource: FramebufferId) -> [u8; RESOURCE_ONLY_BYTES] {
+pub(crate) fn encode_resource_only(
+    command: u32,
+    resource: FramebufferId,
+) -> [u8; RESOURCE_ONLY_BYTES] {
     let mut bytes = [0_u8; RESOURCE_ONLY_BYTES];
     write_header(&mut bytes, command);
     bytes[CTRL_HEADER_BYTES..CTRL_HEADER_BYTES + 4].copy_from_slice(&resource.raw().to_le_bytes());
@@ -911,13 +1020,30 @@ fn encode_attach_backing(resource: FramebufferId, entries: usize) -> [u8; ATTACH
     bytes
 }
 
-/// The `struct virtio_gpu_mem_entry` table that follows an attach
-/// request.
+/// Why a backing store could not be put on the wire.
+///
+/// Two answers rather than one, because the callers spell them
+/// differently: a range that describes no memory is the caller's
+/// mistake, and a range no `virtio_gpu_mem_entry` can carry is a
+/// machine whose memory does not fit the wire format.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MemEntryError {
+    /// One of the ranges covers no bytes.
+    Empty,
+    /// One of the ranges has an address or a length the entry cannot
+    /// carry.
+    Unrepresentable,
+}
+
+/// The `struct virtio_gpu_mem_entry` table that follows an attach or
+/// blob-creation request.
 ///
 /// The caller has already refused a backing store of more than
 /// [`MAX_BACKING_RANGES`] ranges, which is what makes the table a value
 /// rather than an allocation.
-fn encode_mem_entries(backing: &[PhysFrameRange]) -> DisplayResult<MemEntryTable> {
+pub(crate) fn encode_mem_entries(
+    backing: &[PhysFrameRange],
+) -> Result<MemEntryTable, MemEntryError> {
     assert!(
         backing.len() <= MAX_BACKING_RANGES,
         "a backing store of {} ranges reached the encoder past the {MAX_BACKING_RANGES}-range check",
@@ -926,10 +1052,12 @@ fn encode_mem_entries(backing: &[PhysFrameRange]) -> DisplayResult<MemEntryTable
     let mut table = MemEntryTable::new();
     for range in backing {
         if range.is_empty() {
-            return Err(DisplayError::InvalidParameter);
+            return Err(MemEntryError::Empty);
         }
-        let address = u64::try_from(range.start.phys_addr()).map_err(|_| IoError::DeviceFault)?;
-        let length = u32::try_from(range.byte_size()).map_err(|_| IoError::DeviceFault)?;
+        let address =
+            u64::try_from(range.start.phys_addr()).map_err(|_| MemEntryError::Unrepresentable)?;
+        let length =
+            u32::try_from(range.byte_size()).map_err(|_| MemEntryError::Unrepresentable)?;
         let mut entry = [0_u8; MEM_ENTRY_BYTES];
         entry[0..8].copy_from_slice(&address.to_le_bytes());
         entry[8..12].copy_from_slice(&length.to_le_bytes());
@@ -1105,6 +1233,8 @@ fn decode_edid_preferred_mode(response: &[u8]) -> Option<DisplayMode> {
     }
     Some(DisplayMode::new(width, height))
 }
+
+mod render;
 
 #[cfg(test)]
 mod tests;

@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 from helios_bench import REPO_ROOT
@@ -45,6 +46,45 @@ def test_workload_manifest_has_a_headline_per_class_and_a_control() -> None:
         )
     for workload in workloads:
         assert set(workload["counterparts"]) == {"linux_native", "linux_wasmtime"}
+
+
+def test_every_row_names_a_wasmtime_counterpart_or_the_reason_it_lacks_one() -> None:
+    """#311: no workload may be slower than Linux + Wasmtime, so a row
+    without that cell must say why the comparison does not exist."""
+    manifest = load_workloads()
+    missing = []
+    for workload in manifest["workloads"]:
+        for side in ("linux_native", "linux_wasmtime"):
+            if workload["counterparts"][side] is None:
+                assert side in workload.get("uncompared", {}), (workload["name"], side)
+        if workload["counterparts"]["linux_wasmtime"] is None:
+            missing.append(workload["name"])
+    assert missing == ["sched-tasks"]
+
+    by_name = {workload["name"]: workload for workload in manifest["workloads"]}
+    # The 500-instance row keeps its counterpart commands but the lane
+    # skips it on every side; the recorded reason is what the table shows.
+    five_hundred = by_name["instance-startup-500"]
+    assert set(five_hundred["uncompared"]) == {"linux_native", "linux_wasmtime"}
+    for workload in manifest["workloads"]:
+        for side, reason in workload.get("uncompared", {}).items():
+            assert side in ("linux_native", "linux_wasmtime", "helios"), (workload["name"], side)
+            assert reason.strip(), workload["name"]
+
+
+def test_coreutils_counterparts_run_one_exec_per_helios_exec() -> None:
+    """A counterpart that measures something wider than the Helios row
+    can never flag a Helios regression. Each `{tool}` placeholder in the
+    Helios command is one guest exec, and each `$cu <applet>` in the
+    counterpart is one `wasmtime run`; redirects, `echo`, assignments and
+    the `while`/`test` builtins are each side's own shell, so the counts
+    must match literal marker for marker."""
+    manifest = load_workloads()
+    for name in ("stdio-pipe", "fs-smallfiles", "fs-readstream"):
+        workload = next(w for w in manifest["workloads"] if w["name"] == name)
+        helios_execs = len(re.findall(r"\{(?!workdir|repo_root)\w+\}", workload["command"]))
+        wasmtime_execs = len(re.findall(r"\$cu\s+\w+", workload["counterparts"]["linux_wasmtime"]["command"]))
+        assert helios_execs == wasmtime_execs, (name, helios_execs, wasmtime_execs)
 
 
 def test_native_counterparts_exist_for_every_native_bin_reference() -> None:

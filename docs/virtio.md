@@ -149,7 +149,7 @@ else:
 
 | Queue | Index | Commands |
 | --- | --- | --- |
-| control | 0 | `GET_DISPLAY_INFO`, `GET_EDID`, `RESOURCE_CREATE_2D`, `RESOURCE_ATTACH_BACKING`, `RESOURCE_DETACH_BACKING`, `RESOURCE_UNREF`, `SET_SCANOUT`, `TRANSFER_TO_HOST_2D`, `RESOURCE_FLUSH` |
+| control | 0 | `GET_DISPLAY_INFO`, `GET_EDID`, `RESOURCE_CREATE_2D`, `RESOURCE_ATTACH_BACKING`, `RESOURCE_DETACH_BACKING`, `RESOURCE_UNREF`, `SET_SCANOUT`, `TRANSFER_TO_HOST_2D`, `RESOURCE_FLUSH`, `GET_CAPSET_INFO`, `GET_CAPSET`, `CTX_CREATE`, `CTX_DESTROY`, `CTX_ATTACH_RESOURCE`, `CTX_DETACH_RESOURCE`, `RESOURCE_CREATE_BLOB`, `RESOURCE_MAP_BLOB`, `RESOURCE_UNMAP_BLOB`, `SUBMIT_3D` |
 | cursor | 1 | `UPDATE_CURSOR`, `MOVE_CURSOR` |
 
 The split is what the hardware cursor plane is for: pointer motion is one
@@ -163,18 +163,31 @@ belongs to no request this driver issues, `ERR_INVALID_CONTEXT_ID`
 included, is reported as `UnexpectedResponse` because a 2D driver never
 asked the question it answers.
 
-One class feature is negotiated: `VIRTIO_GPU_F_EDID` (bit 1), so that a
-scanout's preferred mode is the attached monitor's own preferred detailed
-timing rather than whatever geometry the host last published.
+Five class features are negotiated where the device offers them:
+`VIRTIO_GPU_F_EDID` (bit 1), so that a scanout's preferred mode is the
+attached monitor's own preferred detailed timing rather than whatever
+geometry the host last published, and the four that carry a renderer —
 `VIRTIO_GPU_F_VIRGL` (0), `VIRTIO_GPU_F_RESOURCE_UUID` (2),
-`VIRTIO_GPU_F_RESOURCE_BLOB` (3) and `VIRTIO_GPU_F_CONTEXT_INIT` (4) are
-deliberately never asked for: the 3D path needs host-visible blob memory
-mapped into a guest address space plus a fence protocol, which is a
-different contract from this one. The configuration space is read whole —
-`events_read`/`events_clear` drive the display-change notification,
-`num_scanouts` bounds the display-info reply, and `num_capsets` is
-reported and otherwise unused, because a capability set describes a 3D
-context type.
+`VIRTIO_GPU_F_RESOURCE_BLOB` (3) and `VIRTIO_GPU_F_CONTEXT_INIT` (4).
+`VIRGL` is the name the virtio spec gives its whole 3D command set; the
+renderer behind it is a property of the host, and virglrenderer, Venus
+and gfxstream are all reached through it. `CONTEXT_INIT` is what lets
+`CTX_CREATE` say which renderer a context speaks — venus is capset 4,
+gfxstream-vulkan is capset 3 — and `RESOURCE_BLOB` is what puts the
+renderer its own memory: a blob created in `HOST3D` memory can be placed
+in the host-visible aperture by `RESOURCE_MAP_BLOB` and the guest's
+window onto it is the placement the reply names.
+
+The renderer's bytes are never decoded. `GET_CAPSET_INFO` and
+`GET_CAPSET` hand the kernel a capability set's bytes whole, at the
+newest version the host speaks, and `SUBMIT_3D` hands it a command
+stream the same way; the driver's part is the transport — the commands
+above, the fence flag and `fence_id` every one of them carries, and the
+per-context fence stream the control queue's used ring becomes. The
+configuration space is read whole — `events_read`/`events_clear` drive
+the display-change notification, `num_scanouts` bounds the display-info
+reply, and `num_capsets` bounds the capset table `GET_CAPSET_INFO`
+enumerates.
 
 **The driver never allocates a frame buffer.** `create_framebuffer` is
 handed physical ranges the caller already owns and publishes them as the
@@ -194,7 +207,12 @@ scanout and a cursor plane are display-engine facts that virtio-gpu is
 one implementation of — and the kernel holds the device through
 `install_display_device` (`kernel/src/display/owner.rs`), whose task
 consumes the device's `VIRTIO_GPU_EVENT_DISPLAY` announcements and reads
-the new topology back. An announcement nobody collects stays latched and
+the new topology back. The renderer half is a second trait of the same
+kind — `hal::display::Gpu3d`, naming capability sets, contexts, blobs,
+opaque submissions and per-context fences — and the kernel holds it
+through `install_gpu3d_device` (`kernel/src/gpu/owner.rs`), which serves
+the `helios:system/gpu` contract from a claim at most one instance may
+hold. An announcement nobody collects stays latched and
 the next change raises no interrupt at all, which is why the kernel owns
 the device from bring-up.
 
@@ -203,8 +221,26 @@ The device is on the platform's own bus: virtio-pci on x86-64
 (`-device virtio-gpu-device`). Each backend reports it on one line:
 
 ```
-virtio-gpu online transport=mmio scanouts=1 preferred=1280x800 edid=on
+virtio-gpu online transport=mmio scanouts=1 preferred=1280x800 edid=on 3d=none blob=off context-init=off uuid=off
 ```
+
+`3d=` names the renderer the device carries — `none` for a 2D-only
+device, `virgl` for one whose control queue speaks the 3D commands —
+because "this machine has no 3D" is a fact a lane reads off the boot log
+rather than deduces from the absence of one. `blob=`, `context-init=`
+and `uuid=` are the negotiated feature bits after it
+(`VIRTIO_GPU_F_RESOURCE_BLOB`, `VIRTIO_GPU_F_CONTEXT_INIT` and
+`VIRTIO_GPU_F_RESOURCE_UUID`), each `on` or `off` for the same reason.
+
+A renderer is a host property, not a guest one. `helios-inspector vm`
+attaches the plain 2D device unless a session asks for one with
+`--renderer virtio-gpu-gl` (Venus through virglrenderer) or
+`--renderer virtio-gpu-rutabaga` (Venus and gfxstream through
+rutabaga-gfx); both come with `blob=on` and a `hostmem` aperture, and a
+host QEMU that lacks the renderer fails with QEMU's own message rather
+than a substitute device. Venus needs a QEMU ≥ 9.2 built
+`--enable-virglrenderer`, a virglrenderer built with Venus support, and
+a host Vulkan driver — lavapipe serves a headless runner.
 
 virtio-input is the machine's keyboard, pointer and tablet. The driver
 in `virtio/src/input.rs` carries evdev events unchanged — a

@@ -1,7 +1,7 @@
 {% import "macros.md.j2" as m with context %}
 # {{ report.run.lane }} — {{ "advisory" if report.run.advisory else "dedicated" }} run{% if report.run.id %} [{{ report.run.id }}]({{ report.run.url }}){% endif %}
 
-Helios `{{ report.run.helios_git_sha[:12] }}` on {{ report.hardware.cpu }} ({{ report.hardware.logical_cpus }} logical CPUs, {{ report.hardware.accelerator }}, QEMU {{ report.hardware.qemu_version or "unknown" }}).
+Helios `{{ report.run.helios_git_sha[:12] }}`{% if report.run.inspector_git_sha %} (inspector `{{ report.run.inspector_git_sha[:12] }}`){% endif %}{% if report.run.baseline_git_sha %} against baseline `{{ report.run.baseline_git_sha[:12] }}`{% if report.run.baseline_inspector_git_sha %} (inspector `{{ report.run.baseline_inspector_git_sha[:12] }}`){% endif %}{% endif %} on {{ report.hardware.cpu }} ({{ report.hardware.logical_cpus }} logical CPUs, {{ report.hardware.accelerator }}, QEMU {{ report.hardware.qemu_version or "unknown" }}).
 Warm series: {{ report.thresholds.iterations - report.thresholds.warmup_discard }} iterations after {{ report.thresholds.warmup_discard }} discarded; median with the {{ (report.thresholds.confidence * 100) | round | int }}% bootstrap interval of the median ({{ report.thresholds.bootstrap_resamples }} resamples). Times in milliseconds.
 {% if report.control %}
 Noise floor from `{{ report.control.workload }}` before and after the suite: {{ report.control.noise_floor | percent }}.
@@ -25,6 +25,7 @@ Noise floor from `{{ report.control.workload }}` before and after the suite: {{ 
 - `{{ workload.name }}` failed on {{ SIDE_LABELS[side] }}: {{ reason }}
 
 {% endfor %}
+{{ m.uncompared_notes(workload, sides) -}}
 {% set helios = workload.cells.get(Side.HELIOS) %}
 {% if helios and helios.metrics %}
 `{{ workload.name }}` secondary metrics (warm medians):

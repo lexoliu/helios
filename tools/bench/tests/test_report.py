@@ -37,6 +37,31 @@ def test_comparisons_and_parity_verdicts(baseline_report: Report, advisory_repor
     fs = baseline_report.workload("fs-smallfiles")
     assert Side.LINUX_WASMTIME not in fs.cells
     assert [comparison.against for comparison in fs.comparisons] == [Side.LINUX_NATIVE]
+    assert not fs.parity_bug
+
+
+def test_parity_bug_applies_to_every_compared_class() -> None:
+    """A loss to Linux + Wasmtime is a bug on any class, not only compute.
+
+    The rule is the same for every row that has a Linux + Wasmtime cell:
+    a Helios median slower beyond the run's noise floor carries the flag.
+    """
+    from conftest import make_report
+
+    report = make_report({"hostcall-loop": 300.0, "quickjs-loop": 100.5, "fs-smallfiles": 25.0})
+
+    hostcall = report.workload("hostcall-loop")
+    assert hostcall.workload_class is WorkloadClass.HOSTCALL
+    assert hostcall.parity_bug
+
+    quickjs = report.workload("quickjs-loop")
+    against = {comparison.against: comparison for comparison in quickjs.comparisons}
+    assert not against[Side.LINUX_WASMTIME].beyond_noise
+    assert not quickjs.parity_bug
+
+    fs = report.workload("fs-smallfiles")
+    assert Side.LINUX_WASMTIME not in fs.cells
+    assert not fs.parity_bug
 
 
 def test_grouping_helpers(baseline_report: Report) -> None:

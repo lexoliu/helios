@@ -27,8 +27,18 @@ if [[ -n "${build_only}" && -n "${no_build}" ]]; then
     exit 1
 fi
 
+# The inspector and helios-cli an image is built and booted by are the
+# ones the image's own checkout compiles. `HELIOS_WORKSPACE_ROOT` names
+# the checkout a guest image is selected from, and for a paired run's
+# baseline that is the baseline worktree, not this one: the inspector and
+# the guest speak helios-inspector-protocol, and a record changed between
+# the two refs is unanswerable by the other side's tooling (#356 — run
+# 34551261487's baseline readiness probe failed DeserializeUnexpectedEnd
+# under the candidate's inspector). For an unpaired build the two are the
+# same directory.
+build_root="${HELIOS_WORKSPACE_ROOT:-${repo_root}}"
 if [[ -z "${no_build}" ]]; then
-    "${cargo_bin}" build --release -p helios-inspector
+    (cd "${build_root}" && "${cargo_bin}" build --release -p helios-inspector -p helios-cli)
 elif [[ ! -x "${inspector}" ]]; then
     printf '%s does not exist; run this script with HELIOS_WORKLOAD_BENCH_BUILD_ONLY=1 first\n' \
         "${inspector}" >&2

@@ -6,6 +6,7 @@ autobins = false
 
 [dependencies]
 helios-api = { path = "../../../api", default-features = false, features = ["http"] }
+helios-curl-write-out = { path = "../curl-write-out" }
 thiserror = "2.0.17"
 
 [lib]

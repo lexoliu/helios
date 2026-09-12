@@ -50,29 +50,33 @@ level, with both artifacts' SHA256 recorded in the report.
 
 Each workload isolates one design claim; its class names that claim, and
 its `counterparts` in `workloads.json` say what the Linux sides run. A
-`null` counterpart is reported as uncovered, never approximated.
+`null` counterpart is reported as uncovered, never approximated, and the
+workload's `uncompared` entry records why; the renderer prints that
+reason under the table the cell is missing from.
 
 | Class | Workload | Helios | Linux + Wasmtime | Native Linux |
 | --- | --- | --- | --- | --- |
 | startup | `instance-startup-{1,100,500}` | `procbench startup N hello hold` through `helios:system/programs`; time to first stdout byte per instance, memory per instance as the drop in `helios:system/stats` available memory while all are alive | `procbench` spawning `wasmtime run --allow-precompiled hello.cwasm hold` | `procbench` spawning the C `hello`; RSS from `/proc` |
 | startup | `spawn-wait` | 200 sequential spawn+wait | same, Wasmtime child | same, native child |
-| startup | `process-startup` | 20 × `dash -c true` | — | same |
+| startup | `process-startup` | 20 × `dash -c true` | 20 × `wasmtime run hello.cwasm` | same |
 | hostcall | `hostcall-loop` | 2 000 000 × `wasi:clocks/monotonic-clock.now` | same wasm | 2 000 000 × `clock_gettime(CLOCK_MONOTONIC)` |
 | ipc | `pipe-pingpong` | 20 000 × 64-byte round trip through a child's stdin/stdout | Wasmtime `pipe-echo` child | C `pipe-echo` child |
 | ipc | `pipe-stream` | 64 MiB through the child | same | same |
-| ipc | `stdio-pipe` | coreutils pipeline | — | same |
-| sched | `sched-tasks` | 64 cooperative tasks × 2000 `yield_now` (one host call each) | — (Wasmtime has no cooperative scheduler for a CLI program) | 64 threads × 2000 `sched_yield` |
-| net | `tcp-throughput`, `tcp-upload`, `wasi-tcp-throughput`, `wasix-tcp-throughput`, `curl-*` | 64 MiB streams through the in-kernel stack | `wasi-tcp-throughput` only | Python client / curl |
+| ipc | `stdio-pipe` | coreutils pipeline | the same coreutils module with its WASIX imports stubbed (`coreutils-wasi.wasm`) under `wasmtime run --dir` | same |
+| sched | `sched-tasks` | 64 cooperative tasks × 2000 `yield_now` (one host call each) | uncompared (Wasmtime's CLI has no cooperative scheduler for a CLI program) | 64 threads × 2000 `sched_yield` |
+| net | `tcp-throughput`, `tcp-upload`, `wasi-tcp-throughput`, `wasix-tcp-throughput` | 64 MiB streams through the in-kernel stack | `wasi-tcp-throughput.wasm` labelled per row under `wasmtime run -S inherit-network` | Python client |
+| net | `curl-local-http`, `curl-http-throughput` | `curl.wasm` over `wasi:http` | `wasi-curl.wasm` (the same curl CLI contract over plain WASI sockets) under `wasmtime run -S inherit-network` | curl |
 | net | `tcp-latency` | 5000 × 16-byte round trip to a host echo server | same wasm | C client with `TCP_NODELAY` |
-| fs | `fs-smallfiles`, `fs-readstream` | coreutils on the embedded filesystem root | — | ext4 in the guest |
+| fs | `fs-smallfiles`, `fs-readstream` | coreutils on the embedded filesystem root | `coreutils-wasi.wasm` under `wasmtime run --dir` | ext4 in the guest |
 | compute | `quickjs-loop`, `cpython-json`, `cpython-regex`, `wasm-simd-lanes` | interpreter or SIMD loops | same wasm | native QuickJS/CPython/NEON-or-SSE probe |
-| compute | `aot-curl` | compiler plugin AOT of `curl.wasm` | `wasmtime compile` of the same input | — |
+| compute | `aot-curl` | compiler plugin AOT of `curl.wasm` | `wasmtime compile` of the same input | uncompared (`wasmtime compile` is the native equivalent of the in-guest step) |
 
 `headline: true` marks the rows the README table and the regression gate
-carry. Compute is a parity check, not a claim: Helios running the same
-wasm on the same Cranelift must be within noise of Linux + Wasmtime, and
-a significant loss there is flagged `parity_bug` in the report and filed
-as a bug rather than reported as a number.
+carry. Every compared row is a parity check, not a claim: Helios running
+the same wasm on the same Cranelift must be within noise of Linux +
+Wasmtime, whatever the workload's class, and a significant loss on any
+of them is flagged `parity_bug` in the report and filed as a bug rather
+than reported as a number.
 
 Workloads print secondary measurements as `bench.<name>=<value>` lines
 (latency percentiles, bytes per instance, switches per second); both
@@ -466,9 +470,19 @@ uv run helios-bench run --lane x86-64-kvm --out-dir … --baseline-ref
 
 Given a ref, `--baseline-ref` resolves it; given none, it means the merge
 base with `dev`, the commit the branch is a change to. The suite checks
-that commit out as a git worktree under
-`target/perf-baselines/worktrees/<sha>/helios` and times its guest
-against the candidate's.
+that commit out as a git worktree beside the candidate checkout,
+`<candidate dir>-baseline-<sha12>`, and times its guest against the
+candidate's. The checkout is the candidate's sibling so that the kernel's
+`../wasmtime/crates/wasmtime` path dependency resolves to the same
+absolute directory for both images: cargo hashes a path dependency
+outside the workspace by its absolute path, and a baseline that reached
+the vendored checkout through a link of its own compiled every Wasmtime
+crate under another crate hash, so the kernel profile matched none of
+the symbols named through Wasmtime and the pair timed a profile-guided
+candidate against an unprofiled baseline (#359). The baseline's warm
+build directory is `target/perf-baselines/worktrees/<sha>/target` under
+the candidate's `target/`, where the runner cache restores it; the
+checkout reaches it through its `target/` link.
 
 The second image is built the way a release build of the lane is, which
 on x86-64 reads the fetched kernel profile (`docs/pgo.md`).
@@ -478,22 +492,31 @@ the control of a PGO measurement; with `--baseline-ref`, that commit's
 plain kernel. The dispatch input `baseline_kernel_build` is the same
 switch in CI.
 
-The baseline checkout supplies a **guest**, never a harness. One harness
-times both images: the candidate's `tools/wasi-apps/workload-bench.sh`,
-its `helios-inspector` and its `helios-cli`. An image is selected with
+The baseline checkout supplies a guest and the tooling that guest is
+built and booted by; the scheduling harness stays the candidate's. One
+harness times both images — the candidate's
+`tools/wasi-apps/workload-bench.sh`, its workload manifest, its iteration
+counts and budgets — and an image is selected with
 `HELIOS_WORKSPACE_ROOT`, the checkout the inspector resolves the guest
 against — the kernel artifact, the prebuild manifest, the bootfs sources
-and the program manifests — so the same inspector that boots a guest is
-the one that built it. (`vm build` also compiles the baseline checkout's
-own host tools; nothing built there runs, and the run pins
-`HELIOS_INSPECTOR_BIN` and `HELIOS_CLI_BIN` to the candidate's binaries
-so that it cannot.)
+and the program manifests. But the `helios-inspector` and `helios-cli` a
+side runs are compiled from that side's own ref into its own
+`target/release`: the inspector and the guest's debugger speak
+`helios-inspector-protocol`, and when a record changed between the two
+refs the candidate's decoder asked the baseline guest for a field it did
+not send — the baseline's readiness probe failed
+`DeserializeUnexpectedEnd`, and the whole pair was lost (run
+34551261487, #356). A baseline whose own tooling does not build fails the
+run naming its checkout; there is no fallback to the candidate's
+binaries, and a run that cannot produce them is refused before the first
+boot.
 
 | | Shared by both columns | Per side |
 | --- | --- | --- |
 | Host | CPU, load, thermal state, QEMU release, accelerator, vCPUs, memory, network backend and its host servers | — |
-| Harness | `workload-bench.sh`, `helios-inspector`, `helios-cli`, the workload manifest, the run's iteration count and budgets | — |
-| Guest inputs | everything `tools/wasi-apps/build.sh` stages under `artifacts/`, linked into the baseline worktree entry by entry; the vendored Wasmtime checkout, linked as the worktree's sibling | — |
+| Harness | `workload-bench.sh`, the workload manifest, the run's iteration count and budgets | — |
+| Tooling | — | `helios-inspector` and `helios-cli`, built from each side's own commit under its own `target/release` |
+| Guest inputs | everything `tools/wasi-apps/build.sh` stages under `artifacts/`, linked into the baseline worktree entry by entry; the vendored Wasmtime checkout, `../wasmtime` of both checkouts at the one absolute path (#359) | — |
 | Guest | — | the kernel image, the bootfs it carries, the compiler plugin, the guest programs the prebuild signs |
 
 Two checkouts that turn out to be one build are refused before the first
@@ -520,16 +543,20 @@ backend and the host HTTP, TCP and echo servers on it; the workload
 manifest, read from the candidate checkout for both; everything under
 `artifacts/` that `tools/wasi-apps/build.sh` stages, linked into the
 baseline worktree entry by entry rather than copied; and the vendored
-Wasmtime checkout, linked as the worktree's sibling so both kernels
-compile against one revision. What differs is the kernel image, the
-bootfs it carries (the compiler plugin included) and the inspector that
-boots them.
+Wasmtime checkout, which both checkouts reach as `../wasmtime` at the
+one absolute path, so both kernels compile against one revision under
+the same cargo crate hashes (#359). What differs is the kernel image, the
+bootfs it carries (the compiler plugin included) and the
+`helios-inspector`/`helios-cli` that build and boot it — each side's own,
+compiled from the side's own commit.
 
 The report carries the second column as the `helios_baseline` side, and
 its run record carries both commits (`helios_git_sha` for the candidate,
-`baseline_git_sha` for the baseline). A run that was asked to pair and
-could not build or measure its baseline is a failed run, not a report
-with one column missing.
+`baseline_git_sha` for the baseline) and both tooling revisions
+(`inspector_git_sha` and `baseline_inspector_git_sha`), which the
+rendered tables print beside the kernels'. A run that was asked to pair
+and could not build or measure its baseline is a failed run, not a
+report with one column missing.
 
 A boot's unix sockets do not live in its runtime directory. That path is
 the caller's, and the paired layout nests it per image and per workload,

@@ -1,0 +1,15 @@
+[package]
+name = "helios-wasi-curl"
+version = "0.1.0"
+edition = "2024"
+autobins = false
+
+[dependencies]
+helios-curl-write-out = { path = "../curl-write-out" }
+thiserror = "2.0.17"
+
+[[bin]]
+name = "helios_wasi_curl"
+path = "src/main.rs"
+
+[workspace]
