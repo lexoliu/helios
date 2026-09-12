@@ -44,6 +44,8 @@ from helios_bench.report import (
     NoiseRetry,
     Pins,
     Report,
+    RetriedForNoise,
+    RetrySkippedForBudget,
     RunInfo,
     Side,
     Thresholds,
@@ -790,7 +792,7 @@ def retry(
     first pass's Helios wall time (``helios_seconds``, measured against the
     monotonic ``run_started``), and one that would outlast what the budget
     has left is not started — the first pass's report stands, still
-    inconclusive, with ``skipped_for_budget`` on the record. And a retry
+    inconclusive, with a ``skipped-for-budget`` record on the run. And a retry
     pass that comes back without the control pair it was asked to measure
     is a failed pass, not a clean one: the run stops naming the side and
     the files it expected rather than reporting a floor of zero.
@@ -811,9 +813,8 @@ def retry(
                 report.control,
                 report.run.retaken,
                 report.run.reconfirmed,
-                NoiseRetry(
+                RetrySkippedForBudget(
                     first_noise_floor=result.noise_floor,
-                    skipped_for_budget=True,
                     needed_seconds=helios_seconds,
                     remaining_seconds=remaining,
                 ),
@@ -854,7 +855,7 @@ def retry(
     control = build_control(report.control.workload, controls, thresholds)
     for side, raw in first_sides.items():
         second_sides.setdefault(side, raw)
-    record = NoiseRetry(
+    record = RetriedForNoise(
         first_noise_floor=result.noise_floor,
         second_noise_floor=control.noise_floor,
     )

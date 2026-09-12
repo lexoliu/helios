@@ -158,8 +158,8 @@ Per cell (workload × side), `iterations` executions (11 by default):
   `--job-timeout-minutes`, and the runner measures the first pass's
   Helios wall time so a second pass that would outlast what remains is
   skipped rather than killed mid-flight — the run stands inconclusive
-  and `noise_retry.skipped_for_budget` keeps the estimate and the
-  remainder it was weighed against. A retry pass that comes back without
+  and `noise_retry` records `kind: skipped-for-budget` with the estimate
+  and the remainder it was weighed against. A retry pass that comes back without
   the control pair it was asked for is a failed pass, not a quiet host:
   the run stops there, naming the side and the files it expected.
 - A cell whose warm CV is past `cv_bound` is **rejected**: its median
@@ -503,8 +503,9 @@ still past the bound stands inconclusive and the check fails naming
 them (#375). The retry runs only when it fits: sized at the first pass's
 Helios wall time against the job's `--job-timeout-minutes`, a second
 pass that would outlast the budget is skipped and the run stays
-inconclusive with `skipped_for_budget` on the record rather than losing
-the whole job to a timeout. And a retry pass whose control files never
+inconclusive, the record a `skipped-for-budget` carrying the two numbers
+the decision was made from, rather than losing the whole job to a
+timeout. And a retry pass whose control files never
 landed fails the run at once, naming the side and the expected pair —
 an unmeasured control is not a clean one.
 

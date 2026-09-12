@@ -18,13 +18,22 @@ from pathlib import Path
 
 import pytest
 from conftest import THRESHOLDS, iterations
+from pydantic import TypeAdapter, ValidationError
 
 from helios_bench import runner
 from helios_bench.baseline import Baseline
 from helios_bench.gate import evaluate_paired, gate_report
 from helios_bench.manifest import load_manifest
 from helios_bench.render import format_percent, render_gate, render_tables
-from helios_bench.report import Report, Side, load_report, save_report
+from helios_bench.report import (
+    NoiseRetry,
+    Report,
+    RetriedForNoise,
+    RetrySkippedForBudget,
+    Side,
+    load_report,
+    save_report,
+)
 from helios_bench.runner import RECONFIRM_OUT, RETAKE_OUT, RETRY_OUT, RunOptions, run_suite
 from helios_bench.wasi_apps import gap_bench
 
@@ -211,7 +220,7 @@ def test_a_noisy_first_pass_with_a_clean_retry_gates_on_the_retry(
 
     record = report.run.noise_retry
     assert record is not None
-    assert not record.skipped_for_budget
+    assert isinstance(record, RetriedForNoise)
     assert record.first_noise_floor > THRESHOLDS.cv_bound
     assert record.second_noise_floor == pytest.approx(report.control.noise_floor)
     assert record.second_noise_floor < THRESHOLDS.cv_bound
@@ -444,11 +453,10 @@ def test_a_retry_that_would_outlast_the_job_budget_is_skipped(
 
     record = report.run.noise_retry
     assert record is not None
-    assert record.skipped_for_budget
+    assert isinstance(record, RetrySkippedForBudget)
     assert record.first_noise_floor > THRESHOLDS.cv_bound
-    assert record.second_noise_floor is None
-    assert record.needed_seconds is not None
-    assert record.remaining_seconds is not None
+    assert record.needed_seconds > 0
+    assert record.remaining_seconds < record.needed_seconds
 
     # No second pass ran: the three first-pass commands only.
     assert len(executed) == 3
@@ -465,3 +473,32 @@ def test_a_retry_that_would_outlast_the_job_budget_is_skipped(
     assert "**Blocking: inconclusive**" in text
     assert "the second pass would need" in text
     assert "of the job's budget" in text
+
+
+def test_a_retried_record_round_trips_through_json() -> None:
+    """The ran shape carries both floors and nothing else."""
+    record = RetriedForNoise(first_noise_floor=0.287, second_noise_floor=0.05)
+    parsed = TypeAdapter(NoiseRetry).validate_json(record.model_dump_json())
+    assert parsed == record
+    assert type(parsed) is RetriedForNoise
+
+
+def test_a_skipped_record_round_trips_through_json() -> None:
+    """The skipped shape carries the two numbers the decision was made
+    from and nothing else."""
+    record = RetrySkippedForBudget(first_noise_floor=0.287, needed_seconds=1200.0, remaining_seconds=300.0)
+    parsed = TypeAdapter(NoiseRetry).validate_json(record.model_dump_json())
+    assert parsed == record
+    assert type(parsed) is RetrySkippedForBudget
+
+
+def test_one_retry_shape_does_not_parse_as_the_other() -> None:
+    """Each shape's `kind` and fields close it to the other: a retried
+    record has no budget numbers and a skipped one has no second floor,
+    so neither's JSON satisfies the other's model."""
+    retried = RetriedForNoise(first_noise_floor=0.287, second_noise_floor=0.05)
+    skipped = RetrySkippedForBudget(first_noise_floor=0.287, needed_seconds=1200.0, remaining_seconds=300.0)
+    with pytest.raises(ValidationError):
+        RetrySkippedForBudget.model_validate_json(retried.model_dump_json())
+    with pytest.raises(ValidationError):
+        RetriedForNoise.model_validate_json(skipped.model_dump_json())
