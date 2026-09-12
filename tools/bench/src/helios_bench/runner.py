@@ -15,7 +15,8 @@ import platform
 import re
 import shlex
 import subprocess
-from dataclasses import dataclass, field
+from collections.abc import Callable
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -36,7 +37,16 @@ from helios_bench.manifest import (
     vendored_wasmtime_revision,
     wasmtime_linux_release,
 )
-from helios_bench.report import Hardware, Pins, Report, RunInfo, Side, Thresholds
+from helios_bench.report import (
+    Control,
+    Hardware,
+    NoiseRetry,
+    Pins,
+    Report,
+    RunInfo,
+    Side,
+    Thresholds,
+)
 from helios_bench.sources import RawSide, read_control, read_optional_side
 from helios_bench.wasi_apps import workload_runner
 from helios_bench.workloads import load_workloads, select_workloads
@@ -50,6 +60,7 @@ HELIOS_OUT = "helios"
 HELIOS_BASELINE_OUT = "helios-baseline"
 RETAKE_OUT = "retake"
 RECONFIRM_OUT = "reconfirm"
+RETRY_OUT = "retry"
 LINUX_OUT = "linux"
 LINUX_SIDES = {Side.LINUX_NATIVE, Side.LINUX_WASMTIME}
 # The cargo profiles a Helios image of a run can be built with, as the
@@ -715,6 +726,68 @@ def reconfirm(
     )
 
 
+def retry(
+    options: RunOptions,
+    iterations: int,
+    workloads: list[dict],
+    report: Report,
+    first_sides: dict[Side, RawSide],
+    thresholds: Thresholds,
+    build: Callable[[dict[Side, RawSide], Control | None, list[str], list[str], NoiseRetry | None], Report],
+) -> Report | None:
+    """Measures the paired suite a second time when the first pass's control is unreadable.
+
+    An inconclusive control means the host moved by more than any effect a
+    change could show while the suite ran, so no row can take a verdict —
+    but one noisy stretch says nothing about the same machine an hour later,
+    and redispatching would only hope to draw a quieter one. The control
+    pair and the suite therefore run once more in the same job, on the same
+    host, under ``retry/`` beside the first pass; retake and reconfirm apply
+    to the second pass as they did to the first, and the report the gate
+    reads is the second pass's. One retry: a second pass still past the
+    bound is a host that could not produce a clean control twice, and the
+    run fails as it would have without one (#375). An unpaired run has no
+    paired verdict to retry and is never re-measured, and neither is a
+    first pass whose floor stayed under the bound.
+
+    The second pass re-runs only the Helios pair — the Linux sides'
+    first-pass cells stand — so a retry pass needs a baseline
+    (``--baseline-ref`` or ``--profile-use``) to compare, which every paired
+    run already has.
+    """
+    result = evaluate_paired(report)
+    if result is None or not result.inconclusive:
+        return None
+    retry_options = replace(
+        options,
+        out_dir=options.out_dir / RETRY_OUT,
+        sides=options.sides & HELIOS_SIDES,
+    )
+    execute(
+        helios_command(
+            retry_options,
+            driver_arguments(retry_options, iterations, workloads, control=True),
+            retry_options.out_dir,
+            "measure the control pair and every workload on both Helios images once more: "
+            f"the first pass's noise floor crossed the {result.floor_bound:.3f} bound",
+        )
+    )
+    second_sides = read_sides(retry_options, thresholds)
+    retaken = retake(retry_options, iterations, workloads, second_sides, thresholds)
+    control = build_control(report.control.workload, read_controls(retry_options, thresholds), thresholds)
+    for side, raw in first_sides.items():
+        second_sides.setdefault(side, raw)
+    record = NoiseRetry(
+        first_noise_floor=result.noise_floor,
+        second_noise_floor=control.noise_floor if control is not None else 0.0,
+    )
+    second = build(second_sides, control, retaken, [], record)
+    reconfirmed = reconfirm(retry_options, iterations, second, second_sides, thresholds)
+    if reconfirmed:
+        second = build(second_sides, control, retaken, reconfirmed, record)
+    return second
+
+
 def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) -> Report | None:
     lane = options.lane
     deviations = host_deviations(lane)
@@ -766,7 +839,13 @@ def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) ->
 
     candidate_profile, baseline_profile = kernel_profiles(options)
 
-    def build(reconfirmed: list[str]) -> Report:
+    def build(
+        sides: dict[Side, RawSide],
+        control: Control | None,
+        retaken: list[str],
+        reconfirmed: list[str],
+        noise_retry: NoiseRetry | None = None,
+    ) -> Report:
         finished = datetime.now(UTC).isoformat(timespec="seconds")
         # The uncovered/function counts each profile-use image's build
         # left beside its kernel; None where the build kept no list.
@@ -819,6 +898,7 @@ def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) ->
             baseline_kernel_pgo_functions=(baseline_uncovered[1] if baseline_uncovered is not None else None),
             retaken=retaken,
             reconfirmed=reconfirmed,
+            noise_retry=noise_retry,
         )
         return assemble_report(
             workloads=workloads,
@@ -830,8 +910,9 @@ def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) ->
             thresholds=thresholds,
         )
 
-    report = build([])
+    report = build(sides, control, retaken, [])
     reconfirmed = reconfirm(options, thresholds.iterations, report, sides, thresholds)
     if reconfirmed:
-        report = build(reconfirmed)
-    return report
+        report = build(sides, control, retaken, reconfirmed)
+    retried = retry(options, thresholds.iterations, workloads, report, sides, thresholds, build)
+    return retried or report

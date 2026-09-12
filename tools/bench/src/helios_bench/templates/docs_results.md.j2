@@ -27,7 +27,7 @@ Advisory: this report is from `{{ report.run.runner_label }}`, not a dedicated r
 | Guest | {{ report.pins.vcpus }} vCPUs, {{ report.pins.memory }} (Helios) / {{ report.pins.linux_vm_memory }} (Linux), `{{ report.pins.net_backend }}` network, {{ report.pins.devices | join(", ") }} |
 | Host | {{ report.hardware.cpu }}, {{ report.hardware.logical_cpus }} logical CPUs, {{ report.hardware.accelerator }} |
 {% if report.control %}
-| Noise floor | {{ report.control.noise_floor | percent }} from `{{ report.control.workload }}` before and after the suite |
+| Noise floor | {{ report.control.noise_floor | percent }} from `{{ report.control.workload }}` before and after the suite{% if report.run.noise_retry %}; retried once after a first pass at {{ report.run.noise_retry.first_noise_floor | percent }}{% endif %} |
 {% endif %}
 
 {% for workload_class, workloads in report.by_class().items() %}

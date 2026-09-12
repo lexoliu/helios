@@ -27,7 +27,14 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import StrEnum
 
-from helios_bench.report import Cell, Report, SeriesStats, Side, WorkloadResult
+from helios_bench.report import (
+    Cell,
+    NoiseRetry,
+    Report,
+    SeriesStats,
+    Side,
+    WorkloadResult,
+)
 from helios_bench.stats import intervals_overlap, relative_shift
 
 
@@ -262,6 +269,9 @@ class GateResult:
     control: ControlDrift | None
     retaken: list[str]
     reconfirmed: list[str]
+    #: The candidate run's two passes' floors, when its paired suite was
+    #: measured twice in one job: `noise_floor` is then the second pass's.
+    noise_retry: NoiseRetry | None
     rows: list[GateRow]
     incomplete_headlines: list[str]
     unpaired_metrics: list[UnpairedMetric]
@@ -528,6 +538,7 @@ def evaluate(baseline: Report, candidate: Report) -> GateResult:
         control=worst_control(baseline, candidate),
         retaken=list(candidate.run.retaken),
         reconfirmed=list(candidate.run.reconfirmed),
+        noise_retry=candidate.run.noise_retry,
         rows=rows,
         incomplete_headlines=[],
         unpaired_metrics=unpaired,
@@ -639,6 +650,7 @@ def evaluate_paired(candidate: Report) -> GateResult | None:
         control=worst_control(candidate),
         retaken=list(candidate.run.retaken),
         reconfirmed=list(candidate.run.reconfirmed),
+        noise_retry=candidate.run.noise_retry,
         rows=rows,
         incomplete_headlines=incomplete_headlines,
         unpaired_metrics=unpaired,

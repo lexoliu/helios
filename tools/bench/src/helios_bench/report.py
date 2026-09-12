@@ -60,6 +60,23 @@ CLASS_LABELS = {
 }
 
 
+class NoiseRetry(BaseModel):
+    """The two passes' noise floors when a paired run was measured twice.
+
+    A first pass whose control dispersed past the bound is not evidence of
+    anything about the host an hour later, so the paired suite runs once
+    more in the same job; both floors are kept so a report says the host
+    needed a second pass (#375).
+    """
+
+    first_noise_floor: float = Field(
+        description="the first pass's noise floor — the one that crossed cv_bound"
+    )
+    second_noise_floor: float = Field(
+        description="the retry pass's noise floor — the one this report's verdicts read"
+    )
+
+
 class RunInfo(BaseModel):
     id: str | None
     url: str | None
@@ -114,6 +131,14 @@ class RunInfo(BaseModel):
     reconfirmed: list[str] = Field(
         default_factory=list,
         description="headline workloads timed again on both images after the first pair of boots regressed",
+    )
+    noise_retry: NoiseRetry | None = Field(
+        default=None,
+        description=(
+            "the paired suite was measured once more because the first pass's noise floor "
+            "crossed the bound (#375); None when the first pass was readable or the run "
+            "was not paired"
+        ),
     )
     kernel_profile: str | None = Field(
         default=None,
