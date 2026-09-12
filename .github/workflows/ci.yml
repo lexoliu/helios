@@ -862,8 +862,9 @@ jobs:
             --qemu-trace trace:virtio_gpu_update_cursor \
             --qemu-trace-log "$runtime/qemu-trace.log" \
             --boot-program dash --boot-program debugger \
-            --boot-program compositor \
+            --boot-program compositor --boot-program surface-test \
             screendump \
+              --run /bin/surface-test --run-wait-seconds 60 \
               --input tools/desktop/desktop-probe.input --input-interval-ms 150 \
               --settle-seconds 20 "$captures/compositor.png" \
             2>&1 | tee "$runtime/inspector.log"
@@ -876,6 +877,13 @@ jobs:
             "$runtime/inspector.log"
           grep -Eq 'compositor:frame sequence=[0-9]+ regions=[0-9]+ cursor=[0-9]+,[0-9]+' \
             "$runtime/inspector.log"
+          # The first client window the desktop ever saw: surface-test
+          # asked for one, drew a frame and gave it back, and each of its
+          # three lines is evidence that part of the surface path ran —
+          # a missing one is a call the compositor did not survive.
+          grep -Fq 'surface-test:created' "$runtime/inspector.log"
+          grep -Fq 'surface-test:committed' "$runtime/inspector.log"
+          grep -Fq 'surface-test:destroyed' "$runtime/inspector.log"
           # Where the terminal put its top-left cell, read from the
           # guest's own line rather than assumed: the layout is the
           # desktop's business, and a check that guessed it would be
