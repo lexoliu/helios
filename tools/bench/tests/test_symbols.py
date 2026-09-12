@@ -91,7 +91,7 @@ def test_export_keeps_both_image_identities_without_copying_elfs(tmp_path, kerne
     root = tmp_path / "checkout"
     images = [
         root / "target/x86_64-unknown-none/release/helios",
-        root / "target/perf-baselines/worktrees/baseline/helios/target/x86_64-unknown-none/release/helios",
+        root / "target/perf-baselines/worktrees/baseline/target/x86_64-unknown-none/release/helios",
     ]
     for image in images:
         image.parent.mkdir(parents=True)
@@ -117,8 +117,7 @@ def test_export_finds_a_profile_use_release_kernel(tmp_path, kernel_elf):
     root = tmp_path / "checkout"
     images = [
         root / "target/x86_64-unknown-none/profile-use/helios",
-        root
-        / "target/perf-baselines/worktrees/baseline/helios/target/x86_64-unknown-none/profile-use/helios",
+        root / "target/perf-baselines/worktrees/baseline/target/x86_64-unknown-none/profile-use/helios",
     ]
     for image in images:
         image.parent.mkdir(parents=True)

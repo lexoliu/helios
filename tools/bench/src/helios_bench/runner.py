@@ -414,6 +414,23 @@ PGO_UNCOVERED_HEADER = re.compile(r"# uncovered:\s*(\d+)\s+of\s+(\d+)\s+function
 PGO_WARNINGS_HEADER = re.compile(r"# warnings emitted:\s*(\d+)")
 
 
+def inspector_for(workspace_root: Path) -> Path:
+    """The `helios-inspector` the checkout at ``workspace_root`` compiles.
+
+    A question about a workspace's kernel artifacts goes to that
+    workspace's own tooling: a paired run builds and boots each image
+    with the `helios-inspector`/`helios-cli` of its own ref (#356), so a
+    baseline worktree's kernel is asked of the baseline's inspector under
+    its `target/release`. `HELIOS_INSPECTOR_BIN` names this checkout's
+    inspector and no other — it is the pin a run sets for the candidate.
+    """
+    if workspace_root.resolve() == REPO_ROOT.resolve():
+        return Path(
+            os.environ.get("HELIOS_INSPECTOR_BIN", workspace_root / "target" / "release" / "helios-inspector")
+        )
+    return workspace_root / "target" / "release" / "helios-inspector"
+
+
 def kernel_pgo_uncovered(
     workspace_root: Path,
     lane: Lane,
@@ -435,9 +452,7 @@ def kernel_pgo_uncovered(
     workspace root, or a refused profile, and it is fatal rather than a
     missing count.
     """
-    inspector = Path(
-        os.environ.get("HELIOS_INSPECTOR_BIN", REPO_ROOT / "target" / "release" / "helios-inspector")
-    )
+    inspector = inspector_for(workspace_root)
     argv = [
         str(inspector),
         "vm",
@@ -787,6 +802,13 @@ def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) ->
             # rather than leaving the column unattributed.
             baseline_git_sha=options.baseline.sha if options.baseline else (git_sha() if paired else None),
             baseline_ref=options.baseline.ref if options.baseline else None,
+            # The tooling is the same statement as the kernel's: each
+            # side's helios-inspector/helios-cli are built from the commit
+            # its guest is built from (#356).
+            inspector_git_sha=git_sha(),
+            baseline_inspector_git_sha=options.baseline.sha
+            if options.baseline
+            else (git_sha() if paired else None),
             kernel_build=options.kernel_build,
             baseline_kernel_build=options.baseline_kernel_build,
             kernel_profile=candidate_profile,

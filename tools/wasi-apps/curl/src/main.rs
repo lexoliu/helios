@@ -3,6 +3,7 @@ use std::io::{self, Write};
 
 use helios_api::ReadExt;
 use helios_api::http::{ErrorCode, Request, UrlError};
+use helios_curl_write_out::expand_write_out;
 use thiserror::Error;
 
 type Result<T> = core::result::Result<T, CurlError>;
@@ -50,8 +51,8 @@ enum CurlError {
         #[source]
         source: io::Error,
     },
-    #[error("unsupported write-out variable in `{0}`")]
-    UnsupportedWriteOut(String),
+    #[error(transparent)]
+    UnsupportedWriteOut(#[from] helios_curl_write_out::Error),
 }
 
 struct CurlOptions {
@@ -128,10 +129,7 @@ fn parse_options() -> Result<CurlOptions> {
 }
 
 fn write_out(template: &str, size_download: usize) -> Result<()> {
-    let rendered = template.replace("%{size_download}", &size_download.to_string());
-    if rendered.contains("%{") {
-        return Err(CurlError::UnsupportedWriteOut(template.to_owned()));
-    }
+    let rendered = expand_write_out(template, size_download)?;
     let mut stdout = io::stdout();
     stdout
         .write_all(rendered.as_bytes())

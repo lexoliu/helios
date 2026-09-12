@@ -10,5 +10,6 @@ Each cell is the median warm wall time in milliseconds with its 95% bootstrap in
 {% for workload in report.headline_workloads() %}
 {{ m.row(workload, sides) }}
 {% endfor %}
+{% for workload in report.headline_workloads() %}{{ m.uncompared_notes(workload, sides) }}{% endfor %}
 
 {% endfor %}

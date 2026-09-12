@@ -31,8 +31,18 @@ This script:
    `wasm32-wasi` C toolchain, `-O3`, and `-msimd128`; the script fails if
    the resulting `qjs.wasm` has no wasm SIMD instructions.
 6. Builds the helios `curl-wasi` program from source with the optimized
-   release profile into `artifacts/wasi-tools/`.
-7. Builds the Helios WASIX conformance WAT modules for thread/futex and
+   release profile into `artifacts/wasi-tools/`, along with
+   `wasi-curl.wasm`, the plain-WASI HTTP/1.1 client the curl workloads'
+   Linux + Wasmtime cells run under `wasmtime run -S inherit-network`
+   (the Helios `curl.wasm` imports `helios:system/programs`, which
+   upstream Wasmtime cannot instantiate).
+7. Derives `artifacts/wasix/coreutils/coreutils-wasi.wasm` from the
+   coreutils atom with `tools/wasi-apps/stub-wasix-imports.py`, which
+   defines the imported shared `env.memory` locally and replaces every
+   `wasix_32v1` import with a stub so upstream Wasmtime loads the same
+   module; it is what the `stdio-pipe` and `fs-*` workloads' Linux +
+   Wasmtime cells run under `wasmtime run --dir`.
+8. Builds the Helios WASIX conformance WAT modules for thread/futex and
    stack continuation execution into `artifacts/wasix/`.
 
 Artifacts produced:
@@ -47,6 +57,10 @@ Artifacts produced:
   coreutils WASIX raw module. `boot-artifacts.toml` exposes the same
   module as `/bin/cat`, `/bin/env`, `/bin/head`, `/bin/ls`,
   `/bin/mkdir`, and `/bin/pwd`.
+- `artifacts/wasix/coreutils/coreutils-wasi.wasm` — the same module with
+  its shared `env.memory` defined and its `wasix_32v1` imports stubbed,
+  so upstream Wasmtime instantiates it for the Linux + Wasmtime side of
+  the fs and ipc workloads.
 - `artifacts/wasix/thread-futex/thread-futex.wasm` — Helios WASIX
   conformance module covering `thread_spawn_v2`, `thread_join`,
   `futex_wait`, `futex_wake`, and `thread_exit`.
@@ -55,6 +69,8 @@ Artifacts produced:
   the asyncify unwind/rewind exports expected by the adapter.
 - `artifacts/wasi-tools/curl.wasm`
 - `artifacts/wasi-tools/curl-stripped.wasm`
+- `artifacts/wasi-tools/wasi-curl.wasm` — plain-WASI HTTP/1.1 client,
+  Linux + Wasmtime side of `curl-local-http` and `curl-http-throughput`.
 
 The CPython download requires network. To re-stage in an offline
 environment, place a pre-downloaded

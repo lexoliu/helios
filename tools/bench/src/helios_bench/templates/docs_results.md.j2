@@ -11,6 +11,15 @@ Advisory: this report is from `{{ report.run.runner_label }}`, not a dedicated r
 | Pin | Value |
 | --- | --- |
 | Helios | `{{ report.run.helios_git_sha }}` |
+{% if report.run.inspector_git_sha %}
+| `helios-inspector`/`helios-cli` | `{{ report.run.inspector_git_sha }}` |
+{% endif %}
+{% if report.run.baseline_git_sha %}
+| Helios, baseline | `{{ report.run.baseline_git_sha }}` |
+{% endif %}
+{% if report.run.baseline_inspector_git_sha %}
+| `helios-inspector`/`helios-cli`, baseline | `{{ report.run.baseline_inspector_git_sha }}` |
+{% endif %}
 | Vendored Wasmtime | `{{ report.pins.wasmtime_revision }}` |
 | Wasmtime on Linux | `{{ report.pins.wasmtime_linux_release }}` |
 | Fedora image | `{{ report.pins.fedora_image_sha256[:16] }}…` |
@@ -31,6 +40,7 @@ Advisory: this report is from `{{ report.run.runner_label }}`, not a dedicated r
 {% for workload in workloads %}
 {{ m.row(workload, sides) }}
 {% endfor %}
+{% for workload in workloads %}{{ m.uncompared_notes(workload, sides) }}{% endfor %}
 
 {% endfor %}
 {% endfor %}

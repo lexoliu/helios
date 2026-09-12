@@ -1,6 +1,12 @@
 {% macro cell(workload, side) -%}
 {% set cell = workload.cells.get(side) %}
-{% if cell is none %}{% if side in workload.failures %}**failed**{% else %}n/a{% endif %}{% else %}{{ cell.warm.median | ms }} {{ cell.warm.ci_low | ci(cell.warm.ci_high) }}{% if cell.rejected %} (rejected){% endif %}{% endif %}
+{% if cell is none %}{% if side in workload.failures %}**failed**{% elif side in workload.uncompared %}uncompared{% else %}n/a{% endif %}{% else %}{{ cell.warm.median | ms }} {{ cell.warm.ci_low | ci(cell.warm.ci_high) }}{% if cell.rejected %} (rejected){% endif %}{% endif %}
+{%- endmacro %}
+{% macro uncompared_notes(workload, sides) -%}
+{% for side in sides %}{% if workload.cells.get(side) is none and side not in workload.failures and side in workload.uncompared %}
+- `{{ workload.name }}` is not compared on {{ SIDE_LABELS[side] }}: {{ workload.uncompared[side] }}
+
+{% endif %}{% endfor %}
 {%- endmacro %}
 {% macro speedup(workload, side) -%}
 {% set found = namespace(text="n/a") %}

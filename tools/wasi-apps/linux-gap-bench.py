@@ -483,15 +483,20 @@ class HeliosImage:
       collected profile, which is what says whether profile-guided
       optimisation of the kernel pays (docs/pgo.md, #211).
 
-    An image is a *guest*, not a harness. Both images are booted by this
-    checkout's `workload-bench.sh` and this checkout's `helios-inspector`
-    and `helios-cli`; what an image contributes is the workspace root
-    those tools resolve the guest against, through `HELIOS_WORKSPACE_ROOT`
+    An image is a guest plus the tooling its own commit compiles. One
+    harness times both images — this checkout's `workload-bench.sh`, its
+    workload manifest, its budgets — and timing two guests with two
+    harnesses would compare the harnesses as much as the kernels. But the
+    `helios-inspector` and `helios-cli` a side builds and boots with are
+    that side's own: the inspector and the guest's debugger speak
+    helios-inspector-protocol, and a record added to it between the two
+    refs is unanswerable by the other side's tooling — run 34551261487's
+    baseline boot died in the readiness probe with
+    `DeserializeUnexpectedEnd` under the candidate's inspector (#356).
+    What an image contributes is the workspace root the protocol peer and
+    the build resolve the guest against, through `HELIOS_WORKSPACE_ROOT`
     — the kernel image, the bootfs it carries, the compiler plugin, and
-    the guest programs the prebuild signs. Timing two guests with two
-    harnesses would compare the harnesses as much as the kernels, and the
-    older one need not even work: run 33995029872 died because the
-    baseline checkout's inspector predated a fix to the host side.
+    the guest programs the prebuild signs.
     """
 
     name: str
@@ -582,6 +587,48 @@ def helios_cli_bin() -> Path:
     )
 
 
+def image_tools(image: HeliosImage) -> tuple[Path, Path]:
+    """The `helios-inspector`/`helios-cli` an image is built and booted by.
+
+    The ones its own checkout compiles under `target/release`: the
+    inspector and the guest speak helios-inspector-protocol, so the
+    baseline of a pairing can only ever be served by the baseline ref's
+    tooling — the candidate's decoder asking a baseline guest for a
+    record the ref predates is the `DeserializeUnexpectedEnd` of #356's
+    run 34551261487. The pins a process-level environment sets name
+    *this* checkout's tools and so apply to its image only.
+    """
+    if image.workspace_root.resolve() == repo_root().resolve():
+        return inspector_bin(), helios_cli_bin()
+    release = image.workspace_root / "target" / "release"
+    return release / "helios-inspector", release / "helios-cli"
+
+
+def require_image_tools(image: HeliosImage) -> None:
+    """Refuses an image whose own tooling the build did not leave behind.
+
+    A baseline image is booted by the inspector and helios-cli its own
+    checkout compiles — never by the candidate's, which is the skew of
+    #356 — and one absent under the baseline's `target/release` means the
+    pairing was asked to boot a guest it has no matching tooling for.
+    Checked once after the builds rather than discovered inside a boot:
+    the run has failed, not the workload.
+    """
+    if image.workspace_root.resolve() == repo_root().resolve():
+        # This checkout's own tools, whose absence the script's own -x
+        # check already refuses at the boot that needs them.
+        return
+    missing = [
+        tool for tool in image_tools(image) if not (tool.is_file() and os.access(tool, os.X_OK))
+    ]
+    if missing:
+        raise HeliosRunFailed(
+            f"the {image.name} image is built and booted by the tooling its own checkout "
+            f"compiles, and {missing[0]} does not exist or is not executable under "
+            f"{image.workspace_root}"
+        )
+
+
 def harness_environment(image: HeliosImage, paired: bool) -> dict[str, str]:
     """What points one harness at one image's guest.
 
@@ -591,11 +638,15 @@ def harness_environment(image: HeliosImage, paired: bool) -> dict[str, str]:
     half of the same statement, and they are set only when there are two
     checkouts to confuse: with one, this checkout's layout already
     answers, and a lane that builds under another profile keeps doing so.
+    Each image's pair names the tooling its own ref compiled — the
+    candidate's inspector asking a baseline guest's protocol a question
+    it predates is the skew of #356.
     """
     env = {"HELIOS_WORKSPACE_ROOT": str(image.workspace_root)}
     if paired:
-        env["HELIOS_INSPECTOR_BIN"] = str(inspector_bin())
-        env["HELIOS_CLI_BIN"] = str(helios_cli_bin())
+        inspector, cli = image_tools(image)
+        env["HELIOS_INSPECTOR_BIN"] = str(inspector)
+        env["HELIOS_CLI_BIN"] = str(cli)
     # Set for the image that has one and cleared for the image that does
     # not: the caller's environment is inherited, and a leaked profile
     # would silently make a PGO pairing two PGO kernels.
@@ -607,12 +658,14 @@ def harness_environment(image: HeliosImage, paired: bool) -> dict[str, str]:
 def guest_artifact(image: HeliosImage, arch: str, accel: str | None = None) -> Path:
     """The guest kernel this image would boot.
 
-    Asked of the inspector rather than rebuilt here: the mapping from
-    architecture and profile to Cargo target and artifact name is the
-    inspector's, and a second copy of it in this file would be a second
-    thing to keep true.
+    Asked of the image's own inspector rather than rebuilt here: the
+    mapping from architecture and profile to Cargo target and artifact
+    name is the inspector's, a second copy of it in this file would be a
+    second thing to keep true, and the answer is only self-consistent
+    when the build that produced the artifact and the question about it
+    come from the same ref (#356).
     """
-    inspector = inspector_bin()
+    inspector, _ = image_tools(image)
     env = os.environ.copy()
     env["HELIOS_WORKSPACE_ROOT"] = str(image.workspace_root)
     argv = [str(inspector), "vm", "--arch", arch, "--release"]
@@ -701,6 +754,12 @@ def run_helios(
     if not skip_build:
         for image in images:
             build_helios(image, arch, accel, build_timeout_seconds, paired)
+
+    for image in images:
+        # A baseline image is booted by the tooling its own ref compiled;
+        # a run that cannot produce it is refused before its first boot
+        # rather than served by the candidate's (#356).
+        require_image_tools(image)
 
     if paired:
         # Before the first boot, not after the run: two images that turn
@@ -886,9 +945,12 @@ def build_helios(
 ) -> None:
     """Builds the guest artifacts this image's boots reuse.
 
-    Run through this checkout's harness with the image's workspace root,
-    so the compile that produces a baseline guest is driven by the same
-    inspector that will boot it.
+    Run through this checkout's harness with the image's workspace root
+    and the image's own tooling, so the compile that produces a baseline
+    guest — its `helios-cli kernel-prebuild` manifest included — is
+    driven by the same ref's inspector that will boot it (#356). A
+    baseline image whose checkout does not compile its tooling fails the
+    run here, naming the checkout, rather than at its first boot.
     """
     env = os.environ.copy()
     env["HELIOS_WORKLOAD_BENCH_ARCH"] = arch
@@ -897,12 +959,18 @@ def build_helios(
     env["HELIOS_WORKLOAD_BENCH_BUILD_ONLY"] = "1"
     env.pop("HELIOS_WORKLOAD_BENCH_NO_BUILD", None)
     env.update(harness_environment(image, paired))
-    run_isolated(
-        [str(workload_bench_script())],
-        env=env,
-        timeout_seconds=timeout_seconds,
-        cwd=repo_root(),
-    )
+    try:
+        run_isolated(
+            [str(workload_bench_script())],
+            env=env,
+            timeout_seconds=timeout_seconds,
+            cwd=repo_root(),
+        )
+    except HeliosRunFailed as error:
+        raise HeliosRunFailed(
+            f"the {image.name} image is built and booted by the tooling its own checkout "
+            f"compiles, and the build under {image.workspace_root} failed: {error}"
+        ) from error
 
 
 def run_helios_once(

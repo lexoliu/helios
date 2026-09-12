@@ -173,7 +173,7 @@ def test_benchmark_diagnostics_keep_symbols_but_not_kernels_or_keys(filename, jo
     paths = upload["with"]["path"].splitlines()
     candidate = Path("helios/target/x86_64-unknown-none/release/helios")
     baseline = Path(
-        "helios/target/perf-baselines/worktrees/baseline/helios/target/x86_64-unknown-none/release/helios"
+        "helios/target/perf-baselines/worktrees/baseline/target/x86_64-unknown-none/release/helios"
     )
     kernels = [candidate, baseline] if job == "suite" else [candidate]
     snapshots = set()

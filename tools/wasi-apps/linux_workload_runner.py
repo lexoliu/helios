@@ -485,7 +485,14 @@ def precompile(manifest_path: Path, names: list[str], wasmtime_bin: str, root: P
         target = cwasm_path(source)
         if target.exists() and target.stat().st_mtime >= source.stat().st_mtime:
             continue
-        subprocess.run([wasmtime_bin, "compile", "-o", str(target), str(source)], check=True)
+        # coreutils-wasi.wasm defines a shared memory (the WASIX atom it
+        # is stubbed from imports one, and the module is full of atomic
+        # ops); compiling it without the feature on is refused. The flag
+        # only permits the feature, so every source gets the same set.
+        subprocess.run(
+            [wasmtime_bin, "compile", "-W", "shared-memory", "-o", str(target), str(source)],
+            check=True,
+        )
         print(f"precompiled {source} -> {target}")
 
 

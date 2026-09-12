@@ -228,8 +228,8 @@ def build_parser() -> argparse.ArgumentParser:
         const=MERGE_BASE,
         default=None,
         help=(
-            "time a second Helios image, built from this ref in a worktree under "
-            "target/perf-baselines/worktrees/, against this one on this host in this "
+            "time a second Helios image, built from this ref in a worktree beside this "
+            "checkout (<dir>-baseline-<sha12>), against this one on this host in this "
             f"job; without a value, {MERGE_BASE} with the upstream default branch"
         ),
     )
