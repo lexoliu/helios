@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 from pathlib import Path
+
+import pytest
 
 from helios_bench import baseline
 
@@ -16,9 +19,10 @@ def test_the_baseline_worktree_reads_the_candidates_profile_store(tmp_path, monk
     (candidate / baseline.PROFILE_STORE).mkdir(parents=True)
     (candidate / baseline.PROFILE_STORE / "fetched.json").write_text("{}\n")
     monkeypatch.setattr(baseline, "REPO_ROOT", candidate)
-    monkeypatch.setattr(baseline, "WORKTREES", tmp_path / "worktrees")
+    monkeypatch.setattr(baseline, "WORKTREES", candidate / "target" / "perf-baselines" / "worktrees")
     sha = "081e6f4c56aed629b0a09e6dc48e6a96e9c5719a"
-    (baseline.checkout_path(sha) / "target").mkdir(parents=True)
+    baseline.checkout_path(sha).mkdir(parents=True)
+    baseline.link_build_dir(sha)
 
     baseline.link_profile_store(sha)
 
@@ -26,6 +30,9 @@ def test_the_baseline_worktree_reads_the_candidates_profile_store(tmp_path, monk
     assert store.is_symlink()
     assert store.readlink() == candidate / baseline.PROFILE_STORE
     assert (store / "fetched.json").read_text() == "{}\n"
+    # The store link lives in the cached build directory, reached
+    # through the checkout's `target/` link.
+    assert (baseline.build_dir(sha) / "profiles").is_symlink()
     # Preparing the same worktree again keeps the link rather than refusing it.
     baseline.link_profile_store(sha)
     assert store.readlink() == candidate / baseline.PROFILE_STORE
@@ -35,8 +42,10 @@ def test_a_real_store_in_the_worktree_is_refused_rather_than_replaced(tmp_path, 
     candidate = tmp_path / "candidate"
     (candidate / baseline.PROFILE_STORE).mkdir(parents=True)
     monkeypatch.setattr(baseline, "REPO_ROOT", candidate)
-    monkeypatch.setattr(baseline, "WORKTREES", tmp_path / "worktrees")
+    monkeypatch.setattr(baseline, "WORKTREES", candidate / "target" / "perf-baselines" / "worktrees")
     sha = "081e6f4c56aed629b0a09e6dc48e6a96e9c5719a"
+    baseline.checkout_path(sha).mkdir(parents=True)
+    baseline.link_build_dir(sha)
     own_store = baseline.checkout_path(sha) / baseline.PROFILE_STORE
     own_store.mkdir(parents=True)
 
@@ -70,39 +79,113 @@ def repository_with_two_commits(root: Path) -> tuple[str, str]:
     return base, git("rev-parse", "HEAD", cwd=root)
 
 
-def test_a_cached_worktree_that_lost_its_registration_is_reused_with_its_target(tmp_path, monkeypatch):
-    """The runner cache brings `target/` back, the baseline worktree
-    inside it included, into a fresh checkout that never registered it
-    (#328). Git then answers the enclosing repository's HEAD for it, which
-    is the candidate's merge commit and not the baseline's; the run
-    re-registers the directory at the baseline commit and keeps the warm
-    `target/` that made caching it worthwhile."""
+def test_the_baseline_checkout_is_the_candidates_sibling(tmp_path, monkeypatch):
+    """The kernel depends on `../wasmtime/crates/wasmtime` by path, and
+    cargo hashes a path dependency outside the workspace by its absolute
+    path (#359). A baseline that reached the vendored checkout through a
+    link under `target/` compiled every Wasmtime crate under another crate
+    hash and matched none of the profile's symbols; laid out beside the
+    candidate, its `../wasmtime` is the candidate's, absolute path and
+    all."""
+    repo = tmp_path / "helios"
+    base, _candidate = repository_with_two_commits(repo)
+    monkeypatch.setattr(baseline, "REPO_ROOT", repo)
+    monkeypatch.setattr(baseline, "WORKTREES", repo / "target" / "perf-baselines" / "worktrees")
+    (tmp_path / "wasmtime" / "crates" / "wasmtime").mkdir(parents=True)
+    (repo / baseline.ARTIFACTS).mkdir()
+    (repo / baseline.ARTIFACTS / "python3-root").mkdir()
+
+    checkout = baseline.prepare(baseline.Baseline(ref="dev", sha=base, worktree=baseline.checkout_path(base)))
+
+    assert checkout.parent == repo.parent
+    assert checkout.name == f"helios-baseline-{base[:12]}"
+    # Lexically the same directory, not merely the same after resolving
+    # links: the old layout's linked sibling also resolved to it.
+    assert checkout.parent / "wasmtime" == repo.parent / "wasmtime"
+    assert not checkout.is_symlink() and not (checkout.parent / "wasmtime").is_symlink()
+    assert not any(part.is_symlink() for part in [checkout, *checkout.parents])
+    assert git("rev-parse", "HEAD", cwd=checkout) == base
+    assert (checkout / "target").is_symlink()
+    assert (checkout / "target").readlink() == baseline.build_dir(base)
+    assert (checkout / baseline.ARTIFACTS / "python3-root").is_symlink()
+
+
+def test_a_missing_wasmtime_sibling_stops_the_run_before_the_worktree(tmp_path, monkeypatch):
+    repo = tmp_path / "helios"
+    base, _candidate = repository_with_two_commits(repo)
+    monkeypatch.setattr(baseline, "REPO_ROOT", repo)
+    monkeypatch.setattr(baseline, "WORKTREES", repo / "target" / "perf-baselines" / "worktrees")
+
+    try:
+        baseline.prepare(baseline.Baseline(ref="dev", sha=base, worktree=baseline.checkout_path(base)))
+    except SystemExit as refused:
+        assert str(tmp_path / "wasmtime") in str(refused)
+    else:
+        raise AssertionError("a baseline without the vendored checkout beside it is not built")
+    assert not baseline.checkout_path(base).exists()
+
+
+def test_a_cached_build_directory_is_reused_by_a_fresh_checkout(tmp_path, monkeypatch):
+    """The runner cache brings `target/` back — the baseline's warm build
+    directory under it included — into a job whose repository never
+    registered the previous run's checkout (#328). The checkout is
+    recreated at the baseline commit and its `target/` link lands on the
+    build the cache carried, which is what made caching it worthwhile."""
     repo = tmp_path / "helios"
     base, _candidate = repository_with_two_commits(repo)
     monkeypatch.setattr(baseline, "REPO_ROOT", repo)
     monkeypatch.setattr(baseline, "WORKTREES", repo / "target" / "perf-baselines" / "worktrees")
 
     checkout = baseline.ensure_worktree(base)
+    baseline.link_build_dir(base)
     assert git("rev-parse", "HEAD", cwd=checkout) == base
     warm = checkout / "target" / "x86_64-unknown-none" / "release" / "helios"
     warm.parent.mkdir(parents=True)
     warm.write_bytes(b"warm kernel")
 
-    # The cache restored the files; the fresh checkout has no registration.
-    (checkout / ".git").unlink()
+    # A fresh runner: the checkout is gone and so is its registration;
+    # the cache restored `target/` with the build directory in it.
+    shutil.rmtree(checkout)
     for registration in (repo / ".git" / "worktrees").iterdir():
         for entry in sorted(registration.rglob("*"), reverse=True):
             entry.unlink() if entry.is_file() else entry.rmdir()
         registration.rmdir()
-    assert git("rev-parse", "HEAD", cwd=checkout) != base, "the shape the runner produced"
+    cached = baseline.build_dir(base) / "x86_64-unknown-none" / "release" / "helios"
+    assert cached.read_bytes() == b"warm kernel"
 
     again = baseline.ensure_worktree(base)
+    baseline.link_build_dir(base)
 
     assert again == checkout
     assert git("rev-parse", "HEAD", cwd=checkout) == base
     assert git("rev-parse", "--show-toplevel", cwd=checkout) == str(checkout.resolve())
     assert warm.read_bytes() == b"warm kernel", "the build the cache carried is still there"
     assert (checkout / "a.txt").read_text() == "base\n"
+
+
+def test_a_directory_this_repository_did_not_register_is_never_touched(tmp_path, monkeypatch):
+    """The checkout path is beside the candidate, outside the repository.
+    Whatever is there that this repository does not list as its worktree
+    — a repository of someone else's, which would answer
+    `--show-toplevel` with itself, or a plain file — stops the run naming
+    the path and is left exactly as found (§9)."""
+    repo = tmp_path / "helios"
+    base, _candidate = repository_with_two_commits(repo)
+    monkeypatch.setattr(baseline, "REPO_ROOT", repo)
+    monkeypatch.setattr(baseline, "WORKTREES", repo / "target" / "perf-baselines" / "worktrees")
+    other = baseline.checkout_path(base)
+    git("init", "-q", str(other), cwd=tmp_path)
+    (other / "theirs.txt").write_text("not ours\n")
+
+    with pytest.raises(SystemExit, match=str(other)):
+        baseline.ensure_worktree(base)
+    assert (other / "theirs.txt").read_text() == "not ours\n"
+
+    shutil.rmtree(other)
+    other.write_text("a file\n")
+    with pytest.raises(SystemExit, match=str(other)):
+        baseline.ensure_worktree(base)
+    assert other.read_text() == "a file\n"
 
 
 def test_a_registered_worktree_at_another_commit_is_still_refused(tmp_path, monkeypatch):

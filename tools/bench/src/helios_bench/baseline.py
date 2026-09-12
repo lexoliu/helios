@@ -35,8 +35,15 @@ Shared, and therefore unable to explain a difference between the columns:
 - everything under `artifacts/` that `tools/wasi-apps/build.sh` stages
   (the CPython root, the WASI tools, the WASIX programs), linked into the
   baseline worktree entry by entry rather than copied;
-- the vendored Wasmtime checkout, linked as the worktree's sibling so
-  that both kernels compile against one revision;
+- the vendored Wasmtime checkout, reached by both kernels through the
+  one `../wasmtime` path: the baseline checkout is laid out beside the
+  candidate's, so the workspace path dependency resolves to the same
+  absolute directory. Cargo hashes a path dependency outside the
+  workspace by that absolute path, and a baseline that reached the
+  checkout through a link of its own compiled every Wasmtime crate
+  under a different crate hash — every symbol the kernel profile names
+  through Wasmtime then missed, and the pair timed a profile-guided
+  candidate against a 94%-unprofiled baseline (#359);
 - the fetched kernel profile store (`target/profiles`, docs/pgo.md),
   linked into the worktree so that both x86-64 release kernels compile
   against the one profile in force when the run started (#321).
@@ -52,24 +59,31 @@ revisions of each (`*_git_sha` beside `*_inspector_git_sha`).
 
 from __future__ import annotations
 
-import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
 from helios_bench import REPO_ROOT
 
+# Where the baseline's warm build directory lives: under the candidate's
+# `target/`, so the runner cache that restores `target/` restores the
+# baseline kernel build with it. The checkout itself is not here (see
+# `checkout_path`).
 WORKTREES = REPO_ROOT / "target" / "perf-baselines" / "worktrees"
+BUILD_DIR = "target"
 # What `--baseline-ref` means when it is given without a value.
 MERGE_BASE = "merge-base"
 MERGE_BASE_AGAINST = "origin/dev"
 ARTIFACTS = "artifacts"
 # The vendored fork the kernel builds against, as a workspace path
 # dependency on `../wasmtime/crates/wasmtime` (docs/wasmtime.md). The
-# baseline worktree needs the same sibling, so it is laid out one
-# directory below the worktree root.
+# baseline checkout is the candidate's sibling so that its `../wasmtime`
+# is this very directory — the same absolute path, hence the same cargo
+# crate hashes and the same profile symbols (#359).
 WASMTIME = "wasmtime"
-CHECKOUT = "helios"
+# The baseline checkout's name beside the candidate's: `<candidate
+# dir>-baseline-<sha12>`.
+CHECKOUT_INFIX = "-baseline-"
 # Where `helios-cli profile-fetch` keeps the kernel profile a release
 # build reads, relative to a checkout (`helios-profdata`'s store). The
 # baseline worktree links the candidate's rather than fetching its own,
@@ -112,12 +126,22 @@ def resolve_sha(ref: str) -> str:
     return git("rev-parse", "--verify", f"{ref}^{{commit}}")
 
 
-def worktree_root(sha: str) -> Path:
-    return WORKTREES / sha
+def build_dir(sha: str) -> Path:
+    """The baseline's warm `target/`, kept under the candidate's `target/`
+    where the runner cache restores it."""
+    return WORKTREES / sha / BUILD_DIR
 
 
 def checkout_path(sha: str) -> Path:
-    return worktree_root(sha) / CHECKOUT
+    """The baseline checkout: the candidate's sibling, so that the
+    kernel's `../wasmtime` path dependency names the candidate's vendored
+    checkout at the same absolute path (#359)."""
+    return REPO_ROOT.parent / f"{REPO_ROOT.name}{CHECKOUT_INFIX}{sha[:12]}"
+
+
+def wasmtime_sibling() -> Path:
+    """The vendored Wasmtime checkout both kernels compile against."""
+    return REPO_ROOT.parent / WASMTIME
 
 
 def resolve(ref: str) -> Baseline:
@@ -137,33 +161,35 @@ def resolve(ref: str) -> Baseline:
 
 def prepare(baseline: Baseline) -> Path:
     """Creates or reuses the baseline worktree and everything it shares."""
+    require_wasmtime_sibling()
     checkout = ensure_worktree(baseline.sha)
-    link_wasmtime(baseline.sha)
+    link_build_dir(baseline.sha)
     link_profile_store(baseline.sha)
     link_missing(REPO_ROOT / ARTIFACTS, checkout / ARTIFACTS)
     return checkout
 
 
 def ensure_worktree(sha: str) -> Path:
-    """The worktree at `target/perf-baselines/worktrees/<sha>/helios`.
+    """The worktree at `checkout_path(sha)`, the candidate's sibling.
 
-    Reused when it is already there and still at that commit, because a
-    kept worktree is a warm target directory and the build it saves is
-    the largest fixed cost of a paired run.
-
-    The directory can also come back without the repository knowing it:
-    the runner cache restores `target/`, the worktree included, into a
-    fresh checkout whose `.git/worktrees` never heard of it (#328). Git
-    then resolves the directory to the enclosing repository, so its
-    `HEAD` is the job's own. That shape is re-registered at `sha` with
-    its `target/` kept, which is the cache the reuse exists for; only a
-    registered worktree at some other commit is refused.
+    Reused when it is already there, registered to this repository, and
+    still at that commit. The build it saves lives in `build_dir(sha)`
+    and not in the checkout, so nothing under the checkout is ever
+    deleted here: the path is outside the repository, beside the
+    candidate, and a directory or file there that this repository does
+    not list as its worktree is someone else's (§9) and stops the run
+    naming it. A registered worktree at some other commit is refused
+    the same way. The #328 shape — a checkout restored under `target/`
+    by the runner cache into a repository that never registered it —
+    cannot occur at this path, which the cache does not reach.
     """
     checkout = checkout_path(sha)
-    if checkout.is_dir():
+    if checkout.exists() or checkout.is_symlink():
         if not is_registered_worktree(checkout):
-            reregister_worktree(checkout, sha)
-            return checkout
+            raise SystemExit(
+                f"{checkout} exists and is not a worktree of {REPO_ROOT}; "
+                "the baseline checkout is created there, so move or remove it"
+            )
         head = git("rev-parse", "HEAD", cwd=checkout)
         if head != sha:
             raise SystemExit(f"{checkout} is a worktree of {head}, not of {sha}")
@@ -174,58 +200,55 @@ def ensure_worktree(sha: str) -> Path:
     return checkout
 
 
-def is_registered_worktree(checkout: Path) -> bool:
-    """Whether git resolves `checkout` to a worktree rooted there.
+def link_build_dir(sha: str) -> None:
+    """Points the checkout's `target/` at the cached build directory.
 
-    A directory whose registration is gone resolves to the repository
-    above it, or to nothing at all when its `.git` file still names the
-    missing registration; neither is the worktree this run wants.
+    The checkout is the candidate's sibling and outside its `target/`;
+    the build it accumulates is kept under the candidate's `target/`
+    where the runner cache restores it, so a paired run on a warm cache
+    pays for the baseline kernel once.
     """
-    completed = subprocess.run(
-        ["git", "rev-parse", "--show-toplevel"],
-        cwd=checkout,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if completed.returncode != 0:
-        return False
-    return Path(completed.stdout.strip()).resolve() == checkout.resolve()
+    directory = build_dir(sha)
+    directory.mkdir(parents=True, exist_ok=True)
+    link_to(directory, checkout_path(sha) / BUILD_DIR)
 
 
-def reregister_worktree(checkout: Path, sha: str) -> None:
-    """Replaces an unregistered checkout with a worktree at `sha`, keeping its `target/`."""
-    kept = checkout / "target"
-    parked = checkout.parent / "target.kept"
-    if parked.exists():
-        shutil.rmtree(parked)
-    if kept.is_dir():
-        kept.rename(parked)
-    shutil.rmtree(checkout)
-    git("worktree", "prune")
-    git("worktree", "add", "--detach", str(checkout), sha)
-    if parked.is_dir():
-        parked.rename(kept)
+def require_wasmtime_sibling() -> None:
+    """The candidate's `../wasmtime` is the vendored checkout, or the run stops.
 
-
-def link_wasmtime(sha: str) -> None:
-    """Links the vendored Wasmtime checkout beside the baseline worktree.
-
-    Both kernels compile against one revision by construction: a paired
-    column that also changed Wasmtime would measure two things at once.
+    The baseline checkout reaches the same directory through its own
+    `../wasmtime` by being laid out beside the candidate; nothing is
+    linked, so nothing can differ.
     """
-    source = (REPO_ROOT.parent / WASMTIME).resolve()
-    if not (source / "crates" / "wasmtime").is_dir():
+    sibling = wasmtime_sibling()
+    if not (sibling / "crates" / "wasmtime").is_dir():
         raise SystemExit(
-            f"{source} is not the vendored Wasmtime checkout the workspace depends on; see docs/wasmtime.md"
+            f"{sibling} is not the vendored Wasmtime checkout the workspace depends on; see docs/wasmtime.md"
         )
-    link_to(source, worktree_root(sha) / WASMTIME)
+
+
+def is_registered_worktree(checkout: Path) -> bool:
+    """Whether this repository lists `checkout` among its worktrees.
+
+    Asked of the repository, not of the directory: a directory that is a
+    repository of its own, or a worktree of another one, answers
+    `git rev-parse --show-toplevel` with itself and would pass a check
+    made from inside it. `git worktree list --porcelain` names exactly the
+    paths this repository registered.
+    """
+    listing = git("worktree", "list", "--porcelain")
+    registered = {
+        Path(line.removeprefix("worktree ")).resolve()
+        for line in listing.splitlines()
+        if line.startswith("worktree ")
+    }
+    return checkout.resolve() in registered
 
 
 def link_profile_store(sha: str) -> None:
     """Links the candidate's kernel profile store into the baseline worktree.
 
-    The inspector that builds the baseline guest is the candidate's, with
+    The baseline's own inspector builds the baseline guest with
     `HELIOS_WORKSPACE_ROOT` naming the worktree, so an x86-64 release
     build reads the store under the worktree's own `target/`. Linking it
     to the candidate's means both images read the record in force when
