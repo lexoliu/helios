@@ -430,12 +430,14 @@ jobs:
         run: |
           # Helios against Helios: the Linux sides answer a different
           # question (docs/benchmarks.md) and would double a job that
-          # already boots every workload twice.
+          # already boots every workload twice. --job-timeout-minutes is
+          # this job's timeout-minutes above: the one retry of an
+          # inconclusive paired control is sized against it.
           args=(run --lane "${BENCH_LANE}" --out-dir "$GITHUB_WORKSPACE/bench-out/pgo"
                 --runner-label "${{ runner.name }}"
                 --sides "helios,helios_baseline"
                 --profile-use "$GITHUB_WORKSPACE/helios/target/pgo-candidate/helios-kernel.profdata"
-                --advisory --allow-busy-host)
+                --advisory --allow-busy-host --job-timeout-minutes 420)
           if [ -n "${{ inputs.iterations }}" ]; then
             args+=(--iterations "${{ inputs.iterations }}")
           fi
