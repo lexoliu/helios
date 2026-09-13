@@ -150,10 +150,17 @@ where
             u16::try_from(steered).unwrap_or_else(|_| panic!("{steered} queue vectors exceed u16")),
         )
     };
-    let device = helios_virtio::net_from_pci(&pci.access(), address, pci, dma, Some(binding))
-        .unwrap_or_else(|error| {
-            panic!("failed to initialize the virtio-net function at {address}: {error}")
-        });
+    // The pair budget is the processor count: every activated pair is
+    // drained by the one packet pump its owning processor runs, so a
+    // device advertising more pairs than the machine has processors is
+    // clamped to what has a pump rather than left to collect frames
+    // nobody drains.
+    let pair_budget = helios_virtio::QueuePairBudget::new(cpu.processor_count());
+    let device =
+        helios_virtio::net_from_pci(&pci.access(), address, pci, dma, Some(binding), pair_budget)
+            .unwrap_or_else(|error| {
+                panic!("failed to initialize the virtio-net function at {address}: {error}")
+            });
     let device = Arc::new(device);
     let queue_pairs = device.queue_pair_count();
     let configuration = VirtioNetworkDevice {
@@ -162,6 +169,7 @@ where
     };
     kernel.install_network_interface(debug_state, configuration.clone());
     tracing::info!(
+        pair_budget = pair_budget.get(),
         queue_pairs,
         msix_queue_entries = steered,
         steered_queue_pairs = steered.min(queue_pairs),

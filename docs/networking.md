@@ -34,6 +34,16 @@ can be measured on either ring layout.
 everywhere else; asking any other backend for more than one pair is an
 error rather than a quiet downgrade.
 
+Inside the guest the driver brings up no more pairs than the machine
+has processors: each activated pair is drained by the one packet pump
+its owning processor runs, so a device advertising more pairs than
+`--smp` is clamped to the processor count — which every backend passes
+in as the pair budget — rather than left with rings nobody drains.
+Both numbers land in the boot log: the `virtio-net bring-up` line
+reports `max_virtqueue_pairs` beside `pair_budget` and the clamped
+`queue_pairs`, and each backend's `virtio network online` line repeats
+them where the interface comes up.
+
 ## Reading back what was negotiated
 
 Two `info` lines per device land in the boot log. The generic

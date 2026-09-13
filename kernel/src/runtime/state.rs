@@ -40,6 +40,7 @@ struct RuntimeStateInner<ProgramService, NetworkService, HostFsService> {
     program_service_ready: Notify,
     network_service_installed: AtomicBool,
     network_service: Once<NetworkService>,
+    network_service_ready: Notify,
     /// The boot-seeded root DRBG. Installed by the backend before any
     /// component runs; every instance's `EntropyPool` is derived from
     /// it, so a kernel that reaches component start-up without one is a
@@ -310,6 +311,7 @@ where
                 program_service_ready: Notify::new(),
                 network_service_installed: AtomicBool::new(false),
                 network_service: Once::new(),
+                network_service_ready: Notify::new(),
                 root_entropy: Once::new(),
                 wall_clock_offset_nanos: Once::new(),
                 http_client: ProviderSlot::new(),
@@ -736,10 +738,32 @@ where
             "network service was installed more than once"
         );
         self.inner.network_service.call_once(|| service);
+        self.inner.network_service_ready.notify_all();
     }
 
     pub fn network_service(&self) -> Option<NetworkService> {
         self.inner.network_service.get().cloned()
+    }
+
+    /// Resolves once the machine's network service is installed.
+    ///
+    /// The service arrives late on every backend — device discovery
+    /// installs it from a task processors may start their run loops
+    /// before — so a caller that needs it waits out the install the
+    /// way [`Self::wait_for_program_service`] waits out its own.
+    pub async fn wait_for_network_service(&self) -> NetworkService {
+        loop {
+            // Armed before the slot is read: installation broadcasts to
+            // every task waiting for the service and banks nothing, so a
+            // wait created after an install it just missed would park
+            // for a second install that never comes.
+            let installed = self.inner.network_service_ready.notified();
+            if let Some(service) = self.network_service() {
+                return service;
+            }
+
+            installed.await;
+        }
     }
 
     /// The hand-off slot for the `http-client` kernel plugin.

@@ -1,5 +1,6 @@
 use crate::platform::PlatformDescription;
 use arm_gic::{IntId, Trigger};
+use helios_hal::cpu::Cpu;
 use helios_hal::io::IoError;
 use helios_hal::watchdog::Watchdog;
 use helios_kernel::{
@@ -49,13 +50,25 @@ pub(crate) fn install<WatchdogImpl>(
 where
     WatchdogImpl: Watchdog + Clone,
 {
-    let Some(network) = discover_network_device(cpu, platform, physical_memory_offset, handoff)
+    // The pair budget is the processor count: every activated pair is
+    // drained by the one packet pump its owning processor runs, so a
+    // device advertising more pairs than the machine has processors is
+    // clamped to what has a pump rather than left to collect frames
+    // nobody drains.
+    let pair_budget = helios_virtio::QueuePairBudget::new(cpu.processor_count());
+    let Some(network) =
+        discover_network_device(cpu, platform, physical_memory_offset, handoff, pair_budget)
     else {
         tracing::warn!("virtio network device was not discovered on the platform bus");
         return None;
     };
     kernel.install_network_interface(debug_state, network.device.clone());
-    tracing::info!("virtio network online interrupt={:?}", network.interrupt);
+    tracing::info!(
+        pair_budget = pair_budget.get(),
+        queue_pairs = network.device.queue_pair_count(),
+        "virtio network online interrupt={:?}",
+        network.interrupt
+    );
     Some(network)
 }
 
@@ -179,6 +192,7 @@ fn discover_network_device(
     platform: &PlatformDescription,
     physical_memory_offset: usize,
     handoff: &crate::LimineBootHandoff,
+    pair_budget: helios_virtio::QueuePairBudget,
 ) -> Option<NetworkInterrupt> {
     let candidate = crate::virtio_slots(
         platform,
@@ -197,6 +211,7 @@ fn discover_network_device(
             candidate.region.size,
             physical_memory_offset,
             handoff,
+            pair_budget,
         ),
     })
 }
@@ -207,6 +222,7 @@ fn init_network_device(
     size: usize,
     physical_memory_offset: usize,
     handoff: &crate::LimineBootHandoff,
+    pair_budget: helios_virtio::QueuePairBudget,
 ) -> VirtioNetworkDevice {
     assert!(size != 0, "AArch64 virtio-net node has zero MMIO size");
     crate::map_mmio_page(physical_base, physical_memory_offset, handoff);
@@ -214,7 +230,7 @@ fn init_network_device(
     let header = core::ptr::NonNull::new(virtual_base as *mut u8)
         .unwrap_or_else(|| panic!("virtio MMIO base {virtual_base:#x} was unexpectedly null"));
     let dma = helios_virtio::OffsetDmaPool::new(physical_memory_offset);
-    let device = unsafe { helios_virtio::net_from_mmio_with_dma(header, size, dma) }
+    let device = unsafe { helios_virtio::net_from_mmio_with_dma(header, size, dma, pair_budget) }
         .unwrap_or_else(|error| {
             panic!("failed to initialize virtio-net device at {physical_base:#x}: {error}")
         });

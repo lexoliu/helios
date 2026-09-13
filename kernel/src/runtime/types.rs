@@ -611,13 +611,36 @@ pub enum TcpWriteProgress {
 /// [`helios_hal::cpu::Cpu`]: the backend names the one service its
 /// machine has, and every socket call from a component compiles to a
 /// direct call on it. The trait carries nothing of its own — it names
-/// the pair of contracts together so a generic item that only passes
-/// the service along spells one bound instead of two.
-pub trait ComponentHostNetwork: ComponentNetworkService + crate::NetworkAdminBackend {}
+/// the contracts together so a generic item that only passes the
+/// service along spells one bound instead of three.
+pub trait ComponentHostNetwork:
+    ComponentNetworkService + crate::NetworkAdminBackend + NetworkPacketPump
+{
+}
 
 impl<Service> ComponentHostNetwork for Service where
-    Service: ComponentNetworkService + crate::NetworkAdminBackend
+    Service: ComponentNetworkService + crate::NetworkAdminBackend + NetworkPacketPump
 {
+}
+
+/// The queue-pair packet pump a network service runs per processor.
+///
+/// A queue pair's interrupt is routed to one processor, so the pump
+/// that drains the pair is pinned to it: every processor calls this
+/// once from its own run loop through `spawn_local_detached`, and the
+/// service either runs the pump for the pair the processor owns or
+/// returns at once. Which pair a processor owns is decided from the
+/// topology inside the service, never by which task got there first —
+/// with more processors than pairs, only the lowest processor mapped
+/// to each pair runs a pump.
+pub trait NetworkPacketPump {
+    /// Runs the packet pump for the queue pair `processor` owns, for as
+    /// long as the interface lives — or completes immediately when the
+    /// processor owns no pair.
+    fn run_packet_pump(
+        &self,
+        processor: helios_hal::cpu::ProcessorId,
+    ) -> impl Future<Output = ()> + Send + '_;
 }
 
 /// A network handle's stable numeric name.

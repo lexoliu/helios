@@ -30,7 +30,7 @@ use crate::block::{QueueAffinity, VirtioBlockDevice, VirtioBlockResource};
 use crate::bus::{DeviceBus, DmaPool};
 use crate::gpu::{VirtioGpuDevice, report_gpu_online};
 use crate::iommu::VirtioIommuDevice;
-use crate::net::VirtioNetDevice;
+use crate::net::{QueuePairBudget, VirtioNetDevice};
 use crate::p9::Virtio9pDevice;
 use crate::rng::VirtioRngDevice;
 use crate::transport::{DeviceStatus, DeviceType, InterruptStatus, VirtioTransport};
@@ -877,12 +877,17 @@ where
 }
 
 /// Builds a virtio-net driver on top of a modern virtio-PCI function.
+///
+/// `pair_budget` caps the queue pairs the device may activate; it is
+/// the machine's processor count, because each pair is drained by the
+/// one packet pump its processor runs.
 pub fn net_from_pci<A, M, P>(
     access: &A,
     address: PciAddress,
     mapper: &M,
     dma: P,
     msix: Option<MsixBinding>,
+    pair_budget: QueuePairBudget,
 ) -> IoResult<VirtioNetDevice<VirtioPciTransport<P>>>
 where
     A: ConfigRegionAccess,
@@ -890,7 +895,7 @@ where
     P: DmaPool,
 {
     let transport = VirtioPciTransport::new(access, address, mapper, dma, msix)?;
-    VirtioNetDevice::new(transport)
+    VirtioNetDevice::new(transport, pair_budget)
 }
 
 /// Builds a virtio-9p driver on top of a modern virtio-PCI function.

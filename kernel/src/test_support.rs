@@ -189,10 +189,13 @@ impl Cpu for ManualClockCpu {
 /// the owning processor out of its idle park. That is invisible to a
 /// single-processor fixture, so this one reports the topology the test
 /// needs and keeps the IPIs for the test to assert on.
+#[derive(Clone)]
 pub(crate) struct RecordingSmpCpu {
     base: TestCpu,
     processors: usize,
-    woken: spin::Mutex<alloc::vec::Vec<ProcessorId>>,
+    /// One machine's wake log: a clone is the same CPU, so it shares
+    /// the record rather than starting a new one.
+    woken: Arc<spin::Mutex<alloc::vec::Vec<ProcessorId>>>,
 }
 
 impl RecordingSmpCpu {
@@ -206,7 +209,7 @@ impl RecordingSmpCpu {
         Self {
             base: TestCpu::without_entropy(),
             processors,
-            woken: spin::Mutex::new(alloc::vec::Vec::new()),
+            woken: Arc::new(spin::Mutex::new(alloc::vec::Vec::new())),
         }
     }
 
@@ -428,10 +431,17 @@ struct RecordingInterfaceState {
     /// order. A test that wants to prove the kernel takes a frame off
     /// the device has to put one there first.
     pending: alloc::vec::Vec<spin::Mutex<alloc::collections::VecDeque<PendingReceive>>>,
-    /// Events reported that belong to no queue pair.
+    /// Wakes whatever is parked on the same pair's counter — a per-queue
+    /// interrupt reaches the pair's listeners and nobody else's, the
+    /// way the real driver's does.
+    queue_signals: alloc::vec::Vec<crate::ProgressSignal>,
+    /// Events reported on the interface-wide channel: the ones that
+    /// belong to no queue pair. A pair's own completions stay on the
+    /// pair's counter — every pair has a packet pump parked on it, so
+    /// the completion has a listener of its own already.
     device: AtomicU64,
-    /// Wakes whatever is parked on either counter.
-    progress: crate::ProgressSignal,
+    /// Wakes whatever armed the interface-wide leg of its wait.
+    device_signal: crate::ProgressSignal,
     /// Whether the transmit ring takes frames. A recording interface
     /// refuses them by default so a test can read what the stack queued;
     /// one built with [`RecordingNetworkInterface::accepting_transmissions`]
@@ -462,8 +472,11 @@ impl RecordingNetworkInterface {
                 pending: (0..queue_pairs)
                     .map(|_| spin::Mutex::new(alloc::collections::VecDeque::new()))
                     .collect(),
+                queue_signals: (0..queue_pairs)
+                    .map(|_| crate::ProgressSignal::new())
+                    .collect(),
                 device: AtomicU64::new(0),
-                progress: crate::ProgressSignal::new(),
+                device_signal: crate::ProgressSignal::new(),
                 accept_transmissions,
                 transmitted: spin::Mutex::new(alloc::vec::Vec::new()),
             }),
@@ -499,18 +512,37 @@ impl RecordingNetworkInterface {
     }
 
     /// Raises the event one queue pair's completions raise, as the
-    /// driver's interrupt handler would.
+    /// driver's per-queue interrupt handler would: the pair's own
+    /// counter and the pair's own signal, and nothing else — a waiter
+    /// parked on another pair learns of the frame from the pump that
+    /// drains it, through that shard's arrival signal.
     pub(crate) fn complete_on(&self, queue_idx: usize) {
         self.inner.queues[queue_idx].fetch_add(1, Ordering::AcqRel);
-        self.inner.progress.signal();
+        self.inner.queue_signals[queue_idx].signal();
+    }
+
+    /// Raises an event that belongs to no queue pair — a link or
+    /// configuration change, as the driver's configuration interrupt
+    /// handler would.
+    pub(crate) fn complete_device(&self) {
+        self.inner.device.fetch_add(1, Ordering::AcqRel);
+        self.inner.device_signal.signal();
     }
 }
 
 impl RecordingInterfaceState {
+    /// Folds a caller's queue index onto the pairs the interface has,
+    /// the way the real driver's `normalize_pair_idx` does: callers
+    /// hand the device a shard-scale index and the device answers for
+    /// the pair that shard submits on.
+    fn pair(&self, queue_idx: usize) -> usize {
+        queue_idx % self.queues.len()
+    }
+
     fn mark(&self, queue_idx: usize) -> helios_netstack::InterfaceEventMark {
         helios_netstack::InterfaceEventMark {
-            queue: self.queues[queue_idx].load(Ordering::Acquire),
-            device: self.device.load(Ordering::Acquire),
+            queue: self.queues[self.pair(queue_idx)].load(Ordering::Acquire),
+            device: Some(self.device.load(Ordering::Acquire)),
         }
     }
 }
@@ -637,16 +669,35 @@ impl helios_netstack::NetworkInterface for RecordingNetworkInterface {
     ) -> impl core::future::Future<Output = ()> + Send + '_ {
         // Armed here, not at the first poll, exactly as a driver must:
         // the wake this races is raised by an interrupt handler that
-        // does not wait to be observed.
-        let progress = self.inner.progress.mark();
+        // does not wait to be observed. The pair's signal is always
+        // armed; the interface-wide one only while the wait asked for
+        // it, the way `mark.device` being `None` says it did not.
+        let pair_idx = self.inner.pair(queue_idx);
+        let queue = self.inner.queue_signals[pair_idx].mark();
+        let device_changed = mark.device.map(|_| {
+            let sampled = self.inner.device_signal.mark();
+            self.inner.device_signal.changed(sampled)
+        });
         async move {
-            let changed = self.inner.progress.changed(progress);
-            let mut changed = core::pin::pin!(changed);
+            let queue_changed = self.inner.queue_signals[pair_idx].changed(queue);
+            let mut queue_changed = core::pin::pin!(queue_changed);
+            let mut device_changed = core::pin::pin!(device_changed);
             core::future::poll_fn(|cx| {
-                if self.inner.mark(queue_idx) != mark {
+                let current = self.inner.mark(queue_idx);
+                if current.queue != mark.queue
+                    || (mark.device.is_some() && current.device != mark.device)
+                {
                     return core::task::Poll::Ready(());
                 }
-                core::future::Future::poll(changed.as_mut(), cx)
+                if core::future::Future::poll(queue_changed.as_mut(), cx).is_ready() {
+                    return core::task::Poll::Ready(());
+                }
+                if let Some(device_changed) = device_changed.as_mut().as_pin_mut()
+                    && core::future::Future::poll(device_changed, cx).is_ready()
+                {
+                    return core::task::Poll::Ready(());
+                }
+                core::task::Poll::Pending
             })
             .await;
         }
@@ -1228,6 +1279,13 @@ mod network {
                 crate::Ipv4Address::new([127, 0, 0, 1]),
             )]))
         }
+    }
+
+    impl crate::NetworkPacketPump for TestNetworkService {
+        /// The double has no device and therefore no queue pairs for a
+        /// pump to own — whichever processor calls, the answer is that
+        /// there is nothing to drive.
+        async fn run_packet_pump(&self, _: helios_hal::cpu::ProcessorId) {}
     }
 }
 
