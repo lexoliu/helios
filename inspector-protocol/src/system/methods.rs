@@ -11,6 +11,7 @@ pub const INSTANCES_KILL: &str = "kill";
 
 pub const TRACING_INSTANCE: &str = "helios:system/tracing@0.1.0";
 pub const TRACING_RECENT: &str = "recent";
+pub const TRACING_SET_TARGET_ENABLED: &str = "set-target-enabled";
 
 pub const PROFILING_INSTANCE: &str = "helios:system/profiling@0.1.0";
 pub const PROFILING_SET_ENABLED: &str = "set-enabled";

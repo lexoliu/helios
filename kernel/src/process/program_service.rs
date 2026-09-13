@@ -27,6 +27,57 @@ pub enum ProgramExecErrorKind {
     Internal,
 }
 
+impl ProgramExecErrorKind {
+    /// Every kind, in one order — the launch timeline's `error_kind`
+    /// slot stores the index into it.
+    pub(crate) const ALL: [Self; 10] = [
+        Self::InvalidBinary,
+        Self::MissingEntry,
+        Self::UnsupportedImport,
+        Self::InvalidSignature,
+        Self::InvalidPath,
+        Self::PermissionDenied,
+        Self::InvalidHint,
+        Self::OutOfMemory,
+        Self::Unavailable,
+        Self::Internal,
+    ];
+
+    /// The `error_kind` name the launch-phase line prints.
+    pub(crate) fn field_name(self) -> &'static str {
+        match self {
+            Self::InvalidBinary => "invalid-binary",
+            Self::MissingEntry => "missing-entry",
+            Self::UnsupportedImport => "unsupported-import",
+            Self::InvalidSignature => "invalid-signature",
+            Self::InvalidPath => "invalid-path",
+            Self::PermissionDenied => "permission-denied",
+            Self::InvalidHint => "invalid-hint",
+            Self::OutOfMemory => "out-of-memory",
+            Self::Unavailable => "unavailable",
+            Self::Internal => "internal",
+        }
+    }
+
+    /// The index this kind's name is stored under in a
+    /// [`crate::exec::phases::LaunchTimeline`] — its literal position in
+    /// [`Self::ALL`], pinned by the round-trip test beside it.
+    pub(crate) fn index(self) -> usize {
+        match self {
+            Self::InvalidBinary => 0,
+            Self::MissingEntry => 1,
+            Self::UnsupportedImport => 2,
+            Self::InvalidSignature => 3,
+            Self::InvalidPath => 4,
+            Self::PermissionDenied => 5,
+            Self::InvalidHint => 6,
+            Self::OutOfMemory => 7,
+            Self::Unavailable => 8,
+            Self::Internal => 9,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 #[error(
     "program memory request of {requested_bytes} bytes exceeds its memory budget: available={available_bytes} of {pool_bytes} reserved={reserved_bytes}"
@@ -298,5 +349,21 @@ mod tests {
             ProgramExecErrorDetail::ImportedSharedMemoryBudgetExceeded.as_str(),
             "imported shared memory exceeds the user-memory budget"
         );
+    }
+
+    /// `index()` is a literal the compiler forces listed for every
+    /// variant; the round trip pins that the literal is the kind's
+    /// actual position in `ALL`, so `ALL`'s order is load-bearing and
+    /// a reorder fails here, not in a diagnostic field's silence.
+    #[test]
+    fn every_kind_index_round_trips_through_all() {
+        for (i, kind) in ProgramExecErrorKind::ALL.iter().enumerate() {
+            assert_eq!(kind.index(), i, "{kind:?}'s index is not its position");
+            assert_eq!(
+                ProgramExecErrorKind::ALL[kind.index()],
+                *kind,
+                "{kind:?} is not stored at its index"
+            );
+        }
     }
 }

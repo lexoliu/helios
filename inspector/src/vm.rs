@@ -402,6 +402,11 @@ pub(crate) enum VmSessionError {
     },
     #[error("the {action} command needs a QMP socket; pass --qmp unix:<path>,server=on,wait=off")]
     NeedsQmp { action: &'static str },
+    #[error("failed to enable the session's tracing targets: {source}")]
+    EnableTargets {
+        #[source]
+        source: SystemError,
+    },
     #[error("{0}")]
     Qmp(#[from] QmpError),
     #[error("{0}")]
@@ -1340,6 +1345,8 @@ pub(crate) struct VmConfigFile {
     #[serde(default)]
     pub(crate) qemu_arg: Vec<String>,
     #[serde(default)]
+    pub(crate) enable_targets: Vec<String>,
+    #[serde(default)]
     pub(crate) boot_programs: Vec<String>,
     #[serde(default)]
     pub(crate) no_compiler_plugin: Option<bool>,
@@ -1508,6 +1515,13 @@ pub(crate) struct VmCommand {
     /// Extra raw QEMU argument. Repeat for multiple arguments.
     #[arg(long, allow_hyphen_values = true)]
     qemu_arg: Vec<String>,
+
+    /// Enable a kernel diagnostic tracing target for the session, for the
+    /// rest of this boot; repeat to enable several. The launch phases of
+    /// `exec` and `spawn` live at `helios_kernel::exec::phases`
+    /// (docs/benchmarks.md).
+    #[arg(long = "enable-target", value_name = "TARGET")]
+    enable_targets: Vec<String>,
 
     /// Restrict bootfs program prebuilds to a named program. Repeat for multiple programs.
     #[arg(long = "boot-program")]
@@ -1892,6 +1906,7 @@ struct ResolvedVmCommand {
     qemu_trace: Vec<String>,
     qemu_trace_log: Option<PathBuf>,
     qemu_arg: Vec<String>,
+    enable_targets: Vec<String>,
     runtime_dir: Option<PathBuf>,
     keep_runtime_dir: bool,
     acpi: bool,
@@ -2357,6 +2372,8 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
     let qemu_trace_log = command.qemu_trace_log.or(file.qemu_trace_log);
     let mut qemu_arg = file.qemu_arg;
     qemu_arg.extend(command.qemu_arg);
+    let mut enable_targets = file.enable_targets;
+    enable_targets.extend(command.enable_targets);
     let runtime_dir = command.runtime_dir.or(file.runtime_dir);
     let keep_runtime_dir =
         debug || command.keep_runtime_dir || file.keep_runtime_dir.unwrap_or(false);
@@ -2431,6 +2448,7 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
         qemu_trace,
         qemu_trace_log,
         qemu_arg,
+        enable_targets,
         runtime_dir,
         keep_runtime_dir,
         acpi,
@@ -2896,6 +2914,16 @@ fn connect_and_run(
             })?
         }
     };
+    // Diagnostic targets open before the session action so its launches
+    // are the ones that get traced; enabling is by name, so a target the
+    // kernel does not gate refuses here rather than streaming nothing.
+    if !command.enable_targets.is_empty() {
+        crate::runtime::block_on(async {
+            system::enable_tracing_targets(&client, &command.enable_targets)
+                .await
+                .map_err(|source| VmSessionError::EnableTargets { source })
+        })?;
+    }
     match command.command.clone() {
         Some(ResolvedVmSessionCommand::AotBench(command)) => run_aot_bench(client, command),
         Some(ResolvedVmSessionCommand::WorkloadBench(workload_command)) => run_workload_bench(
@@ -7119,6 +7147,7 @@ mod tests {
             qemu_trace: Vec::new(),
             qemu_trace_log: None,
             qemu_arg: Vec::new(),
+            enable_targets: Vec::new(),
             boot_programs: Vec::new(),
             no_compiler_plugin: false,
             runtime_dir: None,
@@ -7177,6 +7206,7 @@ mod tests {
             qemu_trace: Vec::new(),
             qemu_trace_log: None,
             qemu_arg: Vec::new(),
+            enable_targets: Vec::new(),
             boot_programs: Vec::new(),
             no_compiler_plugin: false,
             runtime_dir: None,
@@ -7314,6 +7344,7 @@ mod tests {
             qemu_trace: Vec::new(),
             qemu_trace_log: None,
             qemu_arg: Vec::new(),
+            enable_targets: Vec::new(),
             boot_programs: Vec::new(),
             no_compiler_plugin: false,
             runtime_dir: None,
@@ -7437,6 +7468,7 @@ mod tests {
             qemu_trace: Vec::new(),
             qemu_trace_log: None,
             qemu_arg: Vec::new(),
+            enable_targets: Vec::new(),
             runtime_dir: None,
             keep_runtime_dir: false,
             acpi: false,
@@ -7644,6 +7676,7 @@ mod tests {
             qemu_trace: Vec::new(),
             qemu_trace_log: None,
             qemu_arg: Vec::new(),
+            enable_targets: Vec::new(),
             runtime_dir: None,
             keep_runtime_dir: false,
             acpi: false,

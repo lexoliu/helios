@@ -238,6 +238,94 @@ Per cell (workload × side), `iterations` executions (11 by default):
     otherwise it comments the table and enforces nothing.
   The gate comment on a pull request prints the paired table first.
 
+## Reading a launch's phases
+
+`workload-bench` times a launch end to end; when that number needs a
+breakdown the kernel can say where the launch itself went. A launch —
+an `exec`/`spawn` host call, or a guest's own `proc_spawn*`/`proc_exec*`
+syscall — records the kernel monotonic timestamp of every phase
+boundary it crosses into a fixed-capacity in-memory timeline and emits
+one `DEBUG` event under the target `helios_kernel::exec::phases` when
+the launch ends: at completion, or at the failure exit with whichever
+phases it reached. The line's `*_ns` fields are each phase's offset in
+nanoseconds from `rpc-arrival`:
+
+| field | phase boundary |
+| --- | --- |
+| `rpc_arrival_ns` | the launch call entered the kernel; always `0`, the epoch |
+| `source_read_ns` | the program's bytes are read out of their source (`source_bytes` carries the size) |
+| `trust_ns` | artifact trust established — the bootfs trailer parse, the signature check for a signed artifact, or — on a raw-wasm source — the whole in-kernel compile+sign between `load_begin` and here |
+| `cache_lookup_ns` | the deserialize cache answered (`cache_hit` carries its answer) |
+| `deserialize_ns` | the `cwasm` payload deserialized; present only on a cache miss |
+| `instantiate_pre_ns` | the `InstancePre` cache answered or `instantiate_pre` built (`instantiate_pre_hit`) |
+| `load_begin_ns` / `load_complete_ns` | `load_executable` entered / returned |
+| `task_begin_ns` | the run task is live |
+| `shared_memory_ns` | a core module's shared memory is prepared |
+| `store_prepare_ns` | the store and its filesystem snapshot are prepared |
+| `instantiate_ns` | `instantiate_async` returned — memory slot, data segments, imports resolved |
+| `start_ns` | the run function resolved and guest start is dispatching |
+| `guest_begin_ns` / `guest_end_ns` | guest code running / returned |
+| `store_teardown_ns` | a core module's store is torn down |
+| `completion_ns` | the run task finished |
+| `reply_ns` | the launch call's reply — or the syscall's result — is being written |
+
+A phase the launch never reached — the warm launch's `deserialize`, a
+failed launch's tail — leaves no field, and `phase_count` says how many
+the line carries. The phase a launch's duration spent in is the gap
+between one field and the next; the guest's own run is
+`guest_begin_ns` to `guest_end_ns`.
+
+The line emits once, after the guest ran, so the serial write — one
+UART MMIO exit per byte — never lands inside a measured interval. That
+is the whole reason for the single-event shape: an event per boundary
+would price each offset at the ~150-byte serial write it costs.
+
+`op` names the launch call (`exec`/`spawn`). `program`'s provenance
+differs per surface: an RPC launch carries the request's `path`; a
+guest `proc_spawn*` carries `argv[0]`; a guest `proc_exec*` carries
+the decoded `name` operand — which for a PATH-resolving caller like
+dash is the resolved path, so `program=/bin/python3` there and
+`program=dash`-style argv names on the spawn surface. `instance` is
+the id the registry assigned the launch — `0` when it failed before
+registering, and the real id even on a trapped guest, since the run
+task sets it before the guest ran. `end` says which exit the launch
+took — `completed`, `refused`, `failed` — with `error_kind` (a
+`ProgramExecErrorKind` name) or `errno` when the exit carried one.
+The calling task writes `rpc_arrival` through `load_complete` and
+`reply`; the run task writes `task_begin` through `completion`, through
+the same timeline the launch handed it. `reply` is last only on a
+buffered `exec` — on `spawn` and `proc_exec*` the reply boundary is
+recorded while the run task is still starting, so its offset sits
+before `task_begin_ns`.
+
+The target is off by default, so a boot that never asked for it reads
+no timestamp and keeps no timeline — the whole cost is one `enabled`
+check at `rpc-arrival`. Open it for one session with `--enable-target`,
+either on `vm` (before the session action runs) or on `tracing`
+(before the stream starts):
+
+```bash
+helios-inspector vm --arch x86-64 --release --accel kvm \
+    --boot-program dash --boot-program debugger --boot-program python3 \
+    --no-compiler-plugin \
+    --enable-target helios_kernel::exec::phases \
+    shell -c 'python3 -c "print(1)"; python3 -c "print(2)"'
+```
+
+The lines land on the debug serial line, so `<runtime>/debug-serial.log`
+(docs/debug-serial.md) holds them — it carries console escape bytes, so
+grep it with `-a`. The same target streamed live is `helios-inspector
+tracing --enable-target helios_kernel::exec::phases --min-level debug
+--target-prefix helios_kernel::exec::phases`.
+
+Two launches of the same program are the cold/warm pair the launch-cost
+question is usually about: the cold line reads `cache_hit=false` and
+carries `deserialize_ns`; the warm line reads `cache_hit=true` and does
+not. The `smoke-x86-64` step "Run CPython twice and record its launch
+phases" runs exactly this under KVM, so a PR's x86-64 launch-phase split
+is read from that step's `debug-serial.log` artifact rather than
+reproduced locally.
+
 ## Reports and where the numbers come from
 
 One `report.json` per lane per run (schema in

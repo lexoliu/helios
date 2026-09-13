@@ -177,6 +177,10 @@ pub(super) struct ProgramLaunch<Net: ComponentHostNetwork> {
     /// descriptor table; a component ignores one.
     descriptors: Option<Preview1DescriptorTable<Net>>,
     signal_dispositions: Vec<WasixSignalDisposition>,
+    /// The launch's phase timeline: [`phases::Timeline::disabled`]
+    /// when the launch-phase target is off or the launcher is not a
+    /// launch call (plugin loads record nothing).
+    timeline: phases::Timeline,
 }
 
 impl<Net: ComponentHostNetwork> ProgramLaunch<Net> {
@@ -195,7 +199,17 @@ impl<Net: ComponentHostNetwork> ProgramLaunch<Net> {
             filesystem,
             descriptors: None,
             signal_dispositions: Vec::new(),
+            timeline: phases::Timeline::disabled(),
         }
+    }
+
+    /// The timeline this launch's phases record into. The handle's
+    /// `task_emits` flag decides whether the run task emits the line —
+    /// set by [`phases::Timeline::for_task`] for launches whose line is
+    /// the run task's to write.
+    pub(super) fn with_timeline(mut self, timeline: phases::Timeline) -> Self {
+        self.timeline = timeline;
+        self
     }
 }
 
@@ -284,6 +298,18 @@ pub(crate) enum ProgramSource {
     RawWasm(Bytes),
     SignedArtifact(Bytes),
     BootfsArtifact(Bytes),
+}
+
+impl ProgramSource {
+    /// Byte length of the payload the source carries, whichever
+    /// variant it is.
+    pub(crate) fn payload_len(&self) -> usize {
+        match self {
+            Self::RawWasm(bytes) | Self::SignedArtifact(bytes) | Self::BootfsArtifact(bytes) => {
+                bytes.len()
+            }
+        }
+    }
 }
 
 /// Handle to a spawned child component as seen by the kernel and its
@@ -997,7 +1023,13 @@ where
     ) -> Result<ChildHandle, ProgramExecError> {
         super::emit_program_stage_marker(exec_context.write_serial, "program:spawn-begin");
         let executable = self
-            .load_executable(&exec_context, &source, hint, exec_context.write_serial)
+            .load_executable(
+                &exec_context,
+                &source,
+                hint,
+                exec_context.write_serial,
+                &launch.timeline,
+            )
             .await?;
         self.spawn_loaded(exec_context, executable, launch)
     }
@@ -1018,7 +1050,13 @@ where
     ) -> Result<ChildHandle, ProgramExecError> {
         super::emit_program_stage_marker(exec_context.write_serial, "program:spawn-begin");
         let executable = self
-            .load_executable(&exec_context, &source, hint, exec_context.write_serial)
+            .load_executable(
+                &exec_context,
+                &source,
+                hint,
+                exec_context.write_serial,
+                &launch.timeline,
+            )
             .await?;
         if matches!(executable, ProgramExecutable::Component(_)) {
             launch.descriptors = None;
@@ -1067,6 +1105,7 @@ where
             filesystem,
             descriptors,
             signal_dispositions,
+            timeline,
         } = launch;
         let started_at = exec_context
             .runtime_state
@@ -1129,6 +1168,7 @@ where
                 core_module_instance_pre_cache,
                 launched_instance,
                 output_mode,
+                timeline,
             )
             .await;
             let _ = exit_tx.send(result);
@@ -1187,7 +1227,13 @@ where
         launch: ProgramLaunch<Net>,
     ) -> Result<(ExecResult, Option<DebugFileSystemSnapshot>), ProgramExecError> {
         let executable = self
-            .load_executable(&exec_context, &source, hint, exec_context.write_serial)
+            .load_executable(
+                &exec_context,
+                &source,
+                hint,
+                exec_context.write_serial,
+                &launch.timeline,
+            )
             .await?;
         self.exec_loaded_buffered(exec_context, executable, stdin, launch)
             .await
@@ -1264,8 +1310,10 @@ where
         source: &ProgramSource,
         hint: Option<AotCompileHint>,
         write_serial: crate::DebugSerialWriter,
+        timeline: &phases::Timeline,
     ) -> Result<ProgramExecutable<CpuImpl, Net, HostFs>, ProgramExecError> {
         let started_at = monotonic_nanos(&self.inner.clock_cpu);
+        timeline.record(&self.inner.clock_cpu, LaunchPhase::LoadBegin);
         let payload = match source {
             ProgramSource::SignedArtifact(bytes) => {
                 if hint.is_some() {
@@ -1296,7 +1344,10 @@ where
                 trusted_signed_payload(&signed)?
             }
         };
-        self.load_precompiled_executable(payload, write_serial, started_at)
+        timeline.record(&self.inner.clock_cpu, LaunchPhase::ArtifactTrust);
+        let loaded = self.load_precompiled_executable(payload, write_serial, started_at, timeline);
+        timeline.record(&self.inner.clock_cpu, LaunchPhase::LoadComplete);
+        loaded
     }
 
     fn load_precompiled_executable(
@@ -1304,13 +1355,14 @@ where
         payload: Bytes,
         write_serial: crate::DebugSerialWriter,
         started_at: u64,
+        timeline: &phases::Timeline,
     ) -> Result<ProgramExecutable<CpuImpl, Net, HostFs>, ProgramExecError> {
         match WasmtimePrecompiledKind::detect(&payload) {
             Some(WasmtimePrecompiledKind::Component) => self
-                .load_precompiled_component(payload, write_serial, started_at)
+                .load_precompiled_component(payload, write_serial, started_at, timeline)
                 .map(ProgramExecutable::Component),
             Some(WasmtimePrecompiledKind::CoreModule) => self
-                .load_precompiled_core_module(payload, write_serial, started_at)
+                .load_precompiled_core_module(payload, write_serial, started_at, timeline)
                 .map(ProgramExecutable::CoreModule),
             None => Err(ProgramExecError {
                 kind: ProgramExecErrorKind::InvalidBinary,
@@ -1324,8 +1376,15 @@ where
         payload: Bytes,
         write_serial: crate::DebugSerialWriter,
         started_at: u64,
+        timeline: &phases::Timeline,
     ) -> Result<PreparedComponent<CpuImpl, Net, HostFs>, ProgramExecError> {
-        let component = if let Some(component) = self.inner.component_cache.lock().get(&payload) {
+        let cached = self.inner.component_cache.lock().get(&payload);
+        timeline.record_hit(
+            &self.inner.clock_cpu,
+            LaunchPhase::CacheLookup,
+            cached.is_some(),
+        );
+        let component = if let Some(component) = cached {
             super::emit_program_stage_marker(write_serial, "program:deserialize-cache-hit");
             let now = monotonic_nanos(&self.inner.clock_cpu);
             tracing::debug!(
@@ -1362,6 +1421,7 @@ where
                 }
             }
             let compiled = self.deserialize_component(&payload)?;
+            timeline.record(&self.inner.clock_cpu, LaunchPhase::Deserialize);
             super::emit_program_stage_marker(write_serial, "program:deserialize-end");
             let component = Arc::new(compiled);
             let now = monotonic_nanos(&self.inner.clock_cpu);
@@ -1379,29 +1439,32 @@ where
                 .insert_if_missing(payload.clone(), component)
         };
 
-        if let Some(instance_pre) = self.inner.component_instance_pre_cache.lock().get(&payload) {
+        let cached_pre = self.inner.component_instance_pre_cache.lock().get(&payload);
+        let hit = cached_pre.is_some();
+        let instance_pre = if let Some(instance_pre) = cached_pre {
             super::emit_program_stage_marker(write_serial, "program:instantiate-pre-cache-hit");
-            return Ok(instance_pre);
-        }
-
-        super::emit_program_stage_marker(write_serial, "program:instantiate-pre-begin");
-        let linker = super::component_linker(
-            self.inner.engine.raw(),
-            ComponentBindingSet::Program,
-            &component.component,
-        )
-        .map_err(map_program_runtime_error)?;
-        let instance_pre = Arc::new(
-            linker
-                .instantiate_pre(&component.component)
-                .map_err(map_program_runtime_error)?,
-        );
-        super::emit_program_stage_marker(write_serial, "program:instantiate-pre-end");
-        Ok(self
-            .inner
-            .component_instance_pre_cache
-            .lock()
-            .insert_if_missing(payload, instance_pre))
+            instance_pre
+        } else {
+            super::emit_program_stage_marker(write_serial, "program:instantiate-pre-begin");
+            let linker = super::component_linker(
+                self.inner.engine.raw(),
+                ComponentBindingSet::Program,
+                &component.component,
+            )
+            .map_err(map_program_runtime_error)?;
+            let instance_pre = Arc::new(
+                linker
+                    .instantiate_pre(&component.component)
+                    .map_err(map_program_runtime_error)?,
+            );
+            super::emit_program_stage_marker(write_serial, "program:instantiate-pre-end");
+            self.inner
+                .component_instance_pre_cache
+                .lock()
+                .insert_if_missing(payload, instance_pre)
+        };
+        timeline.record_hit(&self.inner.clock_cpu, LaunchPhase::InstantiatePre, hit);
+        Ok(instance_pre)
     }
 
     fn load_precompiled_core_module(
@@ -1409,8 +1472,15 @@ where
         payload: Bytes,
         write_serial: crate::DebugSerialWriter,
         started_at: u64,
+        timeline: &phases::Timeline,
     ) -> Result<Arc<WasmtimeCompiledCoreModule>, ProgramExecError> {
-        if let Some(module) = self.inner.core_module_cache.lock().get(&payload) {
+        let cached = self.inner.core_module_cache.lock().get(&payload);
+        timeline.record_hit(
+            &self.inner.clock_cpu,
+            LaunchPhase::CacheLookup,
+            cached.is_some(),
+        );
+        if let Some(module) = cached {
             super::emit_program_stage_marker(write_serial, "program:deserialize-core-cache-hit");
             let now = monotonic_nanos(&self.inner.clock_cpu);
             tracing::debug!(
@@ -1429,6 +1499,7 @@ where
             .map_err(map_program_runtime_error)?;
         validate_preview1_program_module_imports(&module)?;
         super::emit_program_stage_marker(write_serial, "program:deserialize-core-end");
+        timeline.record(&self.inner.clock_cpu, LaunchPhase::Deserialize);
         let compiled = Arc::new(WasmtimeCompiledCoreModule {
             cache_key: payload.clone(),
             module,
