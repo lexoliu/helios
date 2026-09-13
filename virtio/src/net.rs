@@ -1540,8 +1540,10 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             pair.raise_interrupt();
         }
         // A configuration change belongs to no pair, and neither does a
-        // control-queue completion, so the device-wide notification
-        // still exists for the waiters that watch those.
+        // control-queue completion — and a completion that does belong
+        // to a pair is still invisible to every waiter parked on a
+        // different one, so the device-wide notification is raised on
+        // every interrupt either way.
         self.interrupts.notify_all();
         progress
     }
@@ -1550,7 +1552,12 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
     ///
     /// A transport with per-queue interrupts already knows which pair
     /// made progress and has already delivered the message to that
-    /// pair's processor, so there is nothing to scan and nobody to wake.
+    /// pair's processor, so there is nothing to scan and nobody else to
+    /// wake: every pair has a packet pump parked on its own channel, so
+    /// the completion has exactly the listener the park arms. A waiter
+    /// parked on another pair learns of the frame from that pump, which
+    /// hands it to its shard through the arrival signal — one hop, and
+    /// no interrupt reaches for the interface-wide channel to do it.
     pub fn handle_interrupt_on(&self, pair_idx: usize) {
         let pair_idx = self.normalize_pair_idx(pair_idx);
         self.transport.ack_interrupt();
@@ -2140,19 +2147,24 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         let pair_idx = self.normalize_pair_idx(pair_idx);
         InterfaceEventMark {
             queue: self.queue_pairs[pair_idx].interrupts.generation(),
-            device: self.interrupts.generation(),
+            device: Some(self.interrupts.generation()),
         }
     }
 
-    /// Waits for progress on one queue pair past `mark`, or for
-    /// anything the device reports that belongs to no pair.
+    /// Waits for progress on one queue pair past `mark`, and while
+    /// `mark.device` is armed also for anything the device reports on
+    /// the interface-wide channel.
     ///
     /// An operation belongs to one shard, which drains one pair, so this
     /// is what its wait parks on: a completion on another pair is not
     /// progress it can use, and waking for it would cost the same as
-    /// waking the task that did make progress.
+    /// waking the task that did make progress. The device channel rides
+    /// alongside for the waiter that owns the duties no pair has — the
+    /// bootstrap processor's packet pump — because a configuration
+    /// change arrives on no pair at all. Every other waiter's frame
+    /// reaches it through the pump parked on the pair it landed on.
     ///
-    /// The two listeners are armed here, against `mark`, and not inside
+    /// The listeners are armed here, against `mark`, and not inside
     /// the future this returns: an interrupt raised between the
     /// caller's last drain and its park is then already past the mark,
     /// and the wait is over before it begins. Arming at first poll
@@ -2168,13 +2180,18 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         let pair = self.queue_pairs[pair_idx]
             .interrupts
             .notified_since(mark.queue);
-        let device = self.interrupts.notified_since(mark.device);
+        let device = mark.device.map(|mark| self.interrupts.notified_since(mark));
         async move {
             let mut pair = core::pin::pin!(pair);
             let mut device = core::pin::pin!(device);
             core::future::poll_fn(|cx| {
                 use core::task::Poll;
-                if pair.as_mut().poll(cx).is_ready() || device.as_mut().poll(cx).is_ready() {
+                if pair.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(());
+                }
+                if let Some(device) = device.as_mut().as_pin_mut()
+                    && device.poll(cx).is_ready()
+                {
                     return Poll::Ready(());
                 }
                 Poll::Pending
@@ -3336,6 +3353,33 @@ mod tests {
         harness.device.transport.raise_interrupt(2);
         harness.device.handle_interrupt();
         assert_eq!(harness.device.link_state(), LinkState::Up);
+    }
+
+    /// A per-queue interrupt is that pair's progress alone. The
+    /// transport has already delivered it to the pair's own processor,
+    /// and every pair has a packet pump parked on its channel, so the
+    /// waiters this interrupt can serve are exactly the ones parked on
+    /// the pair — a waiter anywhere else learns of the frame through
+    /// the arrival signal the pump raises for its shard. Raising the
+    /// interface-wide channel here would wake every parked socket on
+    /// every pair to look at work none of them owns.
+    #[test]
+    fn a_per_queue_interrupt_reports_progress_on_its_own_channel() {
+        let harness = NetHarness::new(0);
+        let mark = harness.device.interrupt_mark(0);
+
+        harness.device.handle_interrupt_on(0);
+
+        assert_eq!(
+            harness.device.queue_pairs[0].interrupts.generation(),
+            mark.queue + 1,
+            "the pair's own waiters must hear its interrupt"
+        );
+        assert_eq!(
+            mark.device,
+            Some(harness.device.interrupts.generation()),
+            "the device-wide channel is for events that belong to no pair"
+        );
     }
 
     #[test]

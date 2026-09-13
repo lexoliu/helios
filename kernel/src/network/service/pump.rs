@@ -34,6 +34,21 @@ pub(super) enum NetworkTransmitStop {
     RingFull,
 }
 
+/// The queue pair one processor's packet pump owns, decided once from
+/// the topology rather than by whichever task happens to run first.
+///
+/// `pair` names everything the pump covers: the queue pair it drains
+/// and submits on, and the shard whose arrival it parks on —
+/// `shard == pair` in the shard-per-processor layout the service
+/// builds. `interface_wide` marks the pump on the bootstrap
+/// processor's pair: the only one that also carries the duties no
+/// pair owns.
+#[derive(Clone, Copy)]
+pub struct NetworkPumpAssignment {
+    pub(crate) pair: usize,
+    pub(crate) interface_wide: bool,
+}
+
 #[derive(Clone, Copy)]
 pub(super) enum NetworkPollSource {
     Pump,
@@ -42,6 +57,107 @@ pub(super) enum NetworkPollSource {
     Tcp,
     Udp,
     Configuration,
+}
+
+/// What of the interface one poll round serves.
+///
+/// The split is between the packet pump and everyone else. A pump is
+/// one queue pair's owner and works only what that pair carries; a
+/// socket operation that polls is the stack's whole driver while it
+/// runs, so it works everything.
+#[derive(Clone, Copy)]
+pub(super) enum NetworkPollScope {
+    /// Every queue pair's rings and every shard's timers and egress,
+    /// plus the interface-wide duties — what an operation driving the
+    /// stack itself needs.
+    Interface,
+    /// One queue pair: its rings, and the shards whose egress submits
+    /// on it. `interface_wide` is set on the pump that owns the
+    /// bootstrap processor's pair alone — link and configuration
+    /// events and control-plane publication belong to it, because
+    /// they arrive on no pair at all.
+    Pair { pair: usize, interface_wide: bool },
+}
+
+impl NetworkPollScope {
+    /// Whether this poll acts on link and configuration state and
+    /// republishes the control plane — true for operations, which keep
+    /// their whole-interface shape, and for the bootstrap processor's
+    /// pump, which carries the duties no pair owns.
+    pub(super) const fn interface_wide(self) -> bool {
+        match self {
+            Self::Interface => true,
+            Self::Pair { interface_wide, .. } => interface_wide,
+        }
+    }
+
+    /// Whether this poll drives `shard_idx`'s timers and submits its
+    /// egress. A pump serves the shards that submit on its pair — the
+    /// ones whose index folds onto it — so with more processors than
+    /// pairs the pair's pump still covers every shard the pair carries.
+    pub(super) fn serves_shard(self, shard_idx: usize, pair_count: usize) -> bool {
+        match self {
+            Self::Interface => true,
+            Self::Pair { pair, .. } => shard_idx % pair_count == pair,
+        }
+    }
+
+    /// The queue pairs this poll drains and reclaims: an operation
+    /// sweeps every pair starting at its own; a pump visits only the
+    /// pair it owns.
+    pub(super) fn pairs(self, local_pair: usize, pair_count: usize) -> NetworkPollPairs {
+        match self {
+            Self::Interface => NetworkPollPairs::Sweep(receive_pair_order(local_pair, pair_count)),
+            Self::Pair { pair, .. } => NetworkPollPairs::One(core::iter::once(pair)),
+        }
+    }
+
+    /// Whether the pair-agnostic async receive fallback is this scope's
+    /// to use. The fallback drains pair zero under its async lock, so
+    /// it belongs to the scope that owns pair zero — every operation,
+    /// and the pump on pair zero — not to a pump whose pair somebody
+    /// else is already draining.
+    pub(super) const fn covers_pair_zero(self) -> bool {
+        match self {
+            Self::Interface => true,
+            Self::Pair { pair, .. } => pair == 0,
+        }
+    }
+
+    /// Whether this poll owes the interface's configuration state
+    /// machines — the DHCP exchange and router solicitation — a drive.
+    /// An operation that is configuring drives them itself through
+    /// `drive_ipv4_configuration`; the duty otherwise belongs to the
+    /// bootstrap processor's pump, which is the only task still
+    /// advancing the interface when no socket is polling it.
+    pub(super) const fn drives_configuration(self) -> bool {
+        matches!(
+            self,
+            Self::Pair {
+                interface_wide: true,
+                ..
+            }
+        )
+    }
+}
+
+/// The pair walk [`NetworkPollScope::pairs`] returns: either the
+/// operation's sweep of every pair starting at its own, or the pump's
+/// single pair.
+pub(super) enum NetworkPollPairs {
+    Sweep(ReceivePairOrder),
+    One(core::iter::Once<usize>),
+}
+
+impl Iterator for NetworkPollPairs {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<usize> {
+        match self {
+            Self::Sweep(pairs) => pairs.next(),
+            Self::One(pair) => pair.next(),
+        }
+    }
 }
 
 impl NetworkPollProgress {
@@ -187,27 +303,102 @@ where
     CpuImpl: Cpu + Clone,
     DeviceImpl: NetworkDevice,
 {
-    pub async fn run_packet_pump(&self) -> ! {
+    /// The queue pair a processor's packet pump owns, if it runs one.
+    ///
+    /// Pair `p` belongs to the lowest processor whose shard folds onto
+    /// it: processor `i`'s shard is `i % shard_count` and a shard
+    /// submits on pair `shard % pair_count`, so pair `p`'s candidate
+    /// owners are processors `p`, `p + pair_count`, … and `p` itself is
+    /// the smallest. With more processors than pairs the rest run no
+    /// pump; with more pairs than processors the pairs past the shard
+    /// set have no pump for the same reason `wake_queue_owners` gives
+    /// them no IPI — the shard set is sized to the processors the
+    /// machine has.
+    ///
+    /// The bootstrap processor's pump is identified through its pair:
+    /// it is the pump on the pair the bootstrap processor's shard
+    /// submits on, which is the bootstrap processor's own pump whenever
+    /// it owns one.
+    pub(crate) fn pump_assignment_for(
+        &self,
+        processor: helios_hal::cpu::ProcessorId,
+    ) -> Option<NetworkPumpAssignment> {
+        let pair_count = self.inner.device.queue_pair_count().max(1);
+        let shard = self.inner.state.shard_idx_for_processor(processor);
+        let pair = shard % pair_count;
+        if usize::from(processor.id()) != pair {
+            // This processor's shard submits on a pair a lower
+            // processor already pumps.
+            return None;
+        }
+        let bootstrap = self.inner.cpu.bootstrap_processor();
+        let bootstrap_pair = self.inner.state.shard_idx_for_processor(bootstrap) % pair_count;
+        Some(NetworkPumpAssignment {
+            pair,
+            interface_wide: pair == bootstrap_pair,
+        })
+    }
+
+    /// Drives one queue pair for as long as the interface lives.
+    ///
+    /// There is one of these per queue pair, pinned by
+    /// `spawn_local_detached` to the processor that owns the pair
+    /// ([`Self::pump_assignment_for`]). The pump parks on
+    /// `shard_wait(pair)`: the pair's event mark for work the device
+    /// reports there, and the arrival of the shard its index names —
+    /// the signal raised for a frame another processor drained into it
+    /// and for work queued on any shard the pair serves. On a wake it
+    /// drains its own pair only, hands each frame to the shard its
+    /// flow hashes to through the existing demux, reclaims the pair's
+    /// transmit completions, drives the TCP timers of the shards the
+    /// pair serves, and submits their egress back onto the pair. It
+    /// never sweeps the other pairs — that is the whole point (#378):
+    /// a completion the host steered to pair `q` wakes pump `q` and
+    /// nobody else.
+    ///
+    /// The pump on the bootstrap processor's pair additionally carries
+    /// the duties no pair has — link and configuration events and
+    /// control-plane publication — and is the only one that arms the
+    /// device-wide channel to learn of them.
+    pub async fn run_packet_pump(&self, assignment: NetworkPumpAssignment) -> ! {
+        let NetworkPumpAssignment {
+            pair,
+            interface_wide,
+        } = assignment;
+        let scope = NetworkPollScope::Pair {
+            pair,
+            interface_wide,
+        };
         let mut cadence = NetworkPumpCadence::new();
+        // The adaptive budget is the pump's own: a pair running hot
+        // widens its own drain rather than every pair's.
+        let poll = NetworkPollState::new(
+            self.inner.poll.base_rx_budget,
+            self.inner.poll.base_tx_completion_budget,
+            self.inner.poll.base_tx_frame_budget,
+        );
         loop {
-            // The pump produces for every shard, so its park is the
-            // set-wide arrival signal — and, like every other waiter,
-            // it samples the mark *before* the poll that decides
-            // whether to park, so progress made in between is not
-            // slept through.
-            let wait = self.any_shard_wait();
-            match self.poll_network_once(NetworkPollSource::Pump).await {
-                Ok((progress, budget)) => match cadence.complete(progress, budget) {
+            // Like every other waiter, the pump samples the mark
+            // *before* the poll that decides whether to park, so
+            // progress made in between is not slept through.
+            let wait = self.pump_shard_wait(pair, interface_wide);
+            match self
+                .poll_network_once_with_tcp_read(NetworkPollSource::Pump, None, true, scope, &poll)
+                .await
+            {
+                Ok(outcome) => match cadence.complete(outcome.progress, outcome.budget) {
                     NetworkPumpAction::Continue => {}
                     NetworkPumpAction::Yield => crate::yield_now().await,
                     NetworkPumpAction::Wait => {
-                        self.wait_for_shard_progress(wait, self.pump_wait()).await;
+                        self.wait_for_shard_progress(wait, self.pump_wait(pair))
+                            .await;
                     }
                 },
                 Err(error) => {
                     cadence.reset();
                     tracing::debug!(?error, "network packet pump failed to drive device");
-                    self.wait_for_shard_progress(wait, self.pump_wait()).await;
+                    self.wait_for_shard_progress(wait, self.pump_wait(pair))
+                        .await;
                 }
             }
         }
@@ -218,7 +409,13 @@ where
         source: NetworkPollSource,
     ) -> Result<(NetworkPollProgress, NetworkPollBudget), IoError> {
         let outcome = self
-            .poll_network_once_with_tcp_read(source, None, true)
+            .poll_network_once_with_tcp_read(
+                source,
+                None,
+                true,
+                NetworkPollScope::Interface,
+                &self.inner.poll,
+            )
             .await?;
         Ok((outcome.progress, outcome.budget))
     }
@@ -228,12 +425,21 @@ where
         source: NetworkPollSource,
     ) -> Result<(NetworkPollProgress, NetworkPollBudget), IoError> {
         let outcome = self
-            .poll_network_once_with_tcp_read(source, None, false)
+            .poll_network_once_with_tcp_read(
+                source,
+                None,
+                false,
+                NetworkPollScope::Interface,
+                &self.inner.poll,
+            )
             .await?;
         Ok((outcome.progress, outcome.budget))
     }
 
-    /// Drains every shard's egress onto its ring and rings the doorbell.
+    /// Drains the egress this poll scope owns onto its ring and rings
+    /// the doorbell: every shard's for an operation driving the
+    /// interface, the shards that submit on the pump's pair for a
+    /// pump.
     ///
     /// Synchronous because nothing in it awaits: the stack's outbound
     /// drain and the device's `try_lock` submit both complete where they
@@ -243,15 +449,20 @@ where
         &self,
         source: NetworkPollSource,
         budget: NetworkPollBudget,
+        scope: NetworkPollScope,
     ) -> Result<(usize, usize), IoError> {
         let mut transmitted = 0usize;
         let mut transmitted_bytes = 0usize;
         let transmit_started = self.profile_start();
         let mut transmit_stop = NetworkTransmitStop::Drained;
+        let shard_count = self.inner.state.shard_count();
+        let pair_count = self.inner.device.queue_pair_count().max(1);
         while transmitted < budget.tx_frames {
             let mut immediate_submitted = false;
-            let shard_count = self.inner.state.shard_count();
             for shard_idx in 0..shard_count {
+                if !scope.serves_shard(shard_idx, pair_count) {
+                    continue;
+                }
                 if transmitted >= budget.tx_frames {
                     break;
                 }
@@ -270,10 +481,13 @@ where
                             // device keeps each accepted payload's
                             // handle until its descriptor completes, so
                             // releasing the outbound slot here is safe.
+                            // A shard submits on the pair its index
+                            // folds onto, which is also how the scope's
+                            // `serves_shard` picked this shard.
                             let result = self
                                 .inner
                                 .device
-                                .try_transmit_scatter_immediate_on(shard_idx, frames);
+                                .try_transmit_scatter_immediate_on(shard_idx % pair_count, frames);
                             immediate_device_finished = self.profile_start();
                             result
                         },
@@ -332,6 +546,19 @@ where
             );
         }
         Ok((transmitted, transmitted_bytes))
+    }
+}
+
+impl<CpuImpl, DeviceImpl> crate::NetworkPacketPump for NetworkService<CpuImpl, DeviceImpl>
+where
+    CpuImpl: Cpu + Clone,
+    DeviceImpl: NetworkDevice,
+{
+    async fn run_packet_pump(&self, processor: helios_hal::cpu::ProcessorId) {
+        let Some(assignment) = self.pump_assignment_for(processor) else {
+            return;
+        };
+        self.run_packet_pump(assignment).await;
     }
 }
 

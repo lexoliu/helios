@@ -1028,6 +1028,32 @@ where
         Ok(configured)
     }
 
+    /// Advances the interface's own configuration — the DHCP exchange
+    /// and router solicitation on the default shard — and publishes
+    /// whatever they learned to the control plane.
+    ///
+    /// This is the no-operation path of `drive_ipv4_configuration`:
+    /// the pump on the bootstrap processor's pair runs it on every
+    /// poll round, so a dropped DISCOVER or solicitation is still
+    /// retransmitted while every socket on the machine is parked. The
+    /// default shard submits on pair zero, which is that pump's own
+    /// pair, so a datagram queued here goes out on the same round's
+    /// transmit pass. An operation that is itself configuring drives
+    /// the same machines directly instead of waiting a round.
+    fn drive_interface_configuration(&self) {
+        let now = StackInstant::from_nanos(self.now_nanos());
+        let mut state = self.inner.state.shard_for_default().lock();
+        state
+            .drive_dhcp(now)
+            .unwrap_or_else(|error| tracing::debug!(?error, "failed to drive DHCP"));
+        state.drive_ipv6_autoconfig(now).unwrap_or_else(|error| {
+            tracing::debug!(?error, "failed to drive IPv6 autoconfiguration")
+        });
+        if state.is_configured() {
+            self.inner.control.publish_from_shard(&state);
+        }
+    }
+
     async fn drive_ping(&self) -> Result<(), PingError> {
         self.drive_network(NetworkPollSource::Ping)
             .await
@@ -1075,12 +1101,13 @@ where
         tracing::info!("network link up: reconfiguring the interface");
     }
 
-    /// The timer bound the packet pump takes when a poll round found
-    /// nothing.
+    /// The timer bound a pair's packet pump takes when a poll round
+    /// found nothing.
     ///
     /// The pump has no caller deadline, but it does own the stack's
-    /// timer duties — DHCP retransmission, TCP retransmit and
-    /// delayed-ACK deadlines — so the park has to be bounded by the
+    /// timer duties for the shards its pair serves — TCP retransmit
+    /// and delayed-ACK deadlines, and on the bootstrap pump DHCP
+    /// retransmission besides — so the park has to be bounded by the
     /// soonest of them. Left purely event-driven, a lost DHCP reply
     /// would never be retransmitted, because the wake that would drive
     /// the retransmit is the reply that never came.
@@ -1090,12 +1117,13 @@ where
     /// hand it — a frame another processor drained, a read that
     /// relieved receive backpressure — raises the arrival signal the
     /// park races this bound against.
-    fn pump_wait(&self) -> Duration {
+    fn pump_wait(&self, pair: usize) -> Duration {
+        let pair_count = self.inner.device.queue_pair_count().max(1);
         let now = self.now_nanos();
         let next_stack_deadline = self
             .inner
             .state
-            .min_tcp_deadline_nanos()
+            .pair_tcp_deadline_nanos(pair, pair_count)
             .map_or(DHCP_RETRANSMIT_NANOS, |deadline| {
                 deadline.saturating_sub(now).min(DHCP_RETRANSMIT_NANOS)
             });
@@ -1134,8 +1162,7 @@ where
 
     /// The same for a waiter that belongs to no single shard: a
     /// replicated socket, whose next connection or datagram lands on
-    /// whichever shard its flow hashes to, and the packet pump, which
-    /// produces for every shard at once.
+    /// whichever shard its flow hashes to.
     ///
     /// Such a waiter still watches one queue pair — the one this
     /// processor drains — because the cross-shard hand-off is the
@@ -1146,6 +1173,24 @@ where
             .state
             .shard_idx_for_processor(current_processor());
         self.network_wait(queue_idx, self.inner.state.any_shard_wait())
+    }
+
+    /// Samples the wait one queue pair's packet pump parks on.
+    ///
+    /// The pump is the pair's owner: it watches the pair's event mark
+    /// for work the device reports there, and the arrival of the shard
+    /// the pair's index names — which is also the signal raised for
+    /// work queued on any shard the pair serves, since a shard's egress
+    /// submits on the pair its index folds onto. The bootstrap
+    /// processor's pump is the only one that also arms the device-wide
+    /// channel: link and configuration events arrive on no pair, and
+    /// nobody else may act on them.
+    fn pump_shard_wait(&self, pair: usize, interface_wide: bool) -> NetworkWait {
+        let mut wait = self.shard_wait(pair);
+        if !interface_wide {
+            wait.device.device = None;
+        }
+        wait
     }
 
     /// Samples the wait for the shard that owns `handle`.
@@ -1279,21 +1324,36 @@ where
         self.deadline_wait(deadline_nanos).min(interval)
     }
 
-    /// Wakes the packet pump so a segment a synchronous close queued
-    /// leaves on the next executor turn rather than the next protocol
-    /// timer (#232, #231).
+    /// Wakes the packet pump whose pair serves `shard_idx` so a segment
+    /// a synchronous close queued leaves on the next executor turn
+    /// rather than the next protocol timer (#232, #231).
     ///
-    /// The pump parks on the whole shard set, and the executor wakes
-    /// the processor its task lands on, so raising the signal is the
-    /// whole of it.
+    /// A shard's egress submits on the pair its index folds onto, so
+    /// the pump parked on that pair's arrival signal is the one to
+    /// raise.
     ///
     /// Private because the kick is not a duty an owner can be asked to
     /// remember: every close that can queue a segment —
     /// [`NetworkService::tcp_close`] and
     /// [`NetworkService::tcp_listener_close`] — ends with it, so a
     /// `Drop` that retires a handle has nothing left to do (#231).
-    fn wake_packet_pump(&self) {
-        self.inner.state.wake_any_shard();
+    fn wake_packet_pump(&self, shard_idx: usize) {
+        let pair = shard_idx % self.inner.device.queue_pair_count().max(1);
+        self.inner.state.raise_shard_progress(pair, &self.inner.cpu);
+    }
+
+    /// Wakes every pair's packet pump, for a close whose queued
+    /// segments could sit on any shard — a replicated listener's
+    /// backlog scatters them wherever a connection waited.
+    fn wake_packet_pumps(&self) {
+        let pumps = self
+            .inner
+            .state
+            .shard_count()
+            .min(self.inner.device.queue_pair_count().max(1));
+        for pair in 0..pumps {
+            self.inner.state.raise_shard_progress(pair, &self.inner.cpu);
+        }
     }
 
     fn now_nanos(&self) -> u64 {
@@ -1575,8 +1635,14 @@ pub(crate) mod fixture {
         /// Samples the park the packet pump would be sitting in, for a
         /// test that asks when a close's segment leaves rather than
         /// whether it was queued.
+        ///
+        /// The pump parks on the arrival signal of the shard its pair
+        /// is named for — the shard this fixture's stream lives on,
+        /// since a shard submits on the pair its index folds onto.
         pub(crate) fn pump_park(&self) -> PumpPark<'_> {
-            let wait = self.service.inner.state.any_shard_wait();
+            let pair_count = self.service.inner.device.queue_pair_count().max(1);
+            let pair = self.service.inner.state.shard_idx_for_handle(self.stream) % pair_count;
+            let wait = self.service.inner.state.shard_wait(pair);
             PumpPark {
                 parked: Box::pin(
                     self.service
@@ -1707,9 +1773,10 @@ mod tests {
     use super::{
         AddressAttemptError, DhcpClientState, HandleSlab, NETWORK_BUSY_POLL_ROUNDS,
         NETWORK_TX_BATCH_FRAMES, NetworkIpAddress, NetworkPollBudget, NetworkPollProgress,
-        NetworkPollSource, NetworkPollState, NetworkPumpAction, NetworkPumpCadence, NetworkShard,
-        ReplicaHandle, TcpListenerId, TcpReadProgress, UdpSocketId, icmp_echo_payload,
-        limit_udp_datagram_bytes, map_ipv4_address, parse_ipv6, receive_pair_order,
+        NetworkPollScope, NetworkPollSource, NetworkPollState, NetworkPumpAction,
+        NetworkPumpCadence, NetworkShard, ReplicaHandle, TcpListenerId, TcpReadProgress,
+        UdpSocketId, icmp_echo_payload, limit_udp_datagram_bytes, map_ipv4_address, parse_ipv6,
+        receive_pair_order,
     };
 
     fn ipv6_tcp_frame(
@@ -3236,8 +3303,11 @@ mod tests {
         }
 
         // The pump's park, taken the way `run_packet_pump` takes it:
-        // the mark first, then the poll that finds nothing.
-        let wait = state.any_shard_wait();
+        // the pump on the socket's pair parks on that shard's arrival,
+        // and the mark is sampled before the drain that would relieve
+        // it — this fixture's two shards pair one-to-one with two
+        // queue pairs.
+        let wait = state.shard_wait(owner);
         let mut parked = core::pin::pin!(state.arrival_for(wait.target).changed(wait.mark));
         assert!(
             block_on(poll_once(parked.as_mut())).is_none(),
@@ -3247,7 +3317,7 @@ mod tests {
         // The application reads. Nothing else can make room, so this is
         // the whole event the pump is waiting for.
         let read = state
-            .with_handle_receive_drain(stream, &cpu, |shard| {
+            .with_handle_receive_drain(stream, &cpu, 2, |shard| {
                 shard.poll_tcp_read(stream, SEGMENT_BYTES, StackInstant::from_nanos(1_000))
             })
             .expect("the queued data should read");
@@ -3269,10 +3339,10 @@ mod tests {
 
         // A read that relieves nothing raises nothing: the signal is a
         // hand-off, not a heartbeat.
-        let wait = state.any_shard_wait();
+        let wait = state.shard_wait(owner);
         let mut parked = core::pin::pin!(state.arrival_for(wait.target).changed(wait.mark));
         let read = state
-            .with_handle_receive_drain(stream, &cpu, |shard| {
+            .with_handle_receive_drain(stream, &cpu, 2, |shard| {
                 shard.poll_tcp_read(stream, SEGMENT_BYTES, StackInstant::from_nanos(1_001))
             })
             .expect("the rest of the queued data should read");
@@ -3360,6 +3430,186 @@ mod tests {
             block_on(poll_once(parked.as_mut())).is_none(),
             "a wait taken after the event has nothing to observe yet"
         );
+    }
+
+    /// #378: a frame the device steers to pair B reaches a waiter
+    /// parked on shard A through the pump that owns pair B.
+    ///
+    /// The pair's interrupt ends that pump's park and nobody else's —
+    /// the operation parked on shard A watches pair A's counters and
+    /// shard A's arrival signal, and a pair-B completion is neither.
+    /// The woken pump drains its own pair, the demux places the frame
+    /// in the shard its flow hashes to, and that shard's arrival signal
+    /// is what ends the operation's park: one hop, and no broadcast —
+    /// the broadcast was the rejected fix (#381), not the mechanism.
+    #[test]
+    fn a_frame_on_another_pair_reaches_its_shard_through_that_pairs_pump() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let service = test_network_service_smp(4, RecordingNetworkInterface::new(4));
+        let device = service.inner.device.clone();
+        // An address for the ARP exchange to answer on, so the frame
+        // demuxes into the default shard rather than dropping.
+        service
+            .inner
+            .state
+            .shard_at(0)
+            .lock()
+            .stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24));
+
+        // Both marks are sampled before the interrupt lands, the way
+        // `run_packet_pump` and every operation take theirs before
+        // inspecting anything.
+        let operation_wait = service.shard_wait(0);
+        let pump_wait = service.pump_shard_wait(1, false);
+
+        // The host steers the ARP request to pair 1.
+        let (arp, arp_len) = arp_request_frame(peer, local);
+        device.deliver_on(1, &arp[..arp_len]);
+
+        // The interrupt is pair 1's: it ends that pump's park, and it
+        // must not end the operation's — a completion on a pair the
+        // wait does not watch is not progress it can use.
+        let mut operation_parked = core::pin::pin!(
+            service.wait_for_shard_progress(operation_wait, core::time::Duration::from_secs(3600))
+        );
+        assert!(
+            block_on(poll_once(operation_parked.as_mut())).is_none(),
+            "a completion on pair 1 must not wake a wait that watches pair 0"
+        );
+        let mut pump_parked = core::pin::pin!(
+            service.wait_for_shard_progress(pump_wait, core::time::Duration::from_secs(3600))
+        );
+        assert!(
+            block_on(poll_once(pump_parked.as_mut())).is_some(),
+            "the pair's own interrupt ends its pump's park"
+        );
+
+        // The woken pump drains its own pair only: the ARP request
+        // demuxes to the default shard, and the shard's arrival signal
+        // — raised by the pump, not by the interrupt — ends the
+        // operation's park.
+        let poll = NetworkPollState::new(
+            service.inner.poll.base_rx_budget,
+            service.inner.poll.base_tx_completion_budget,
+            service.inner.poll.base_tx_frame_budget,
+        );
+        block_on(service.poll_network_once_with_tcp_read(
+            NetworkPollSource::Pump,
+            None,
+            true,
+            NetworkPollScope::Pair {
+                pair: 1,
+                interface_wide: false,
+            },
+            &poll,
+        ))
+        .expect("the pair's pump drains it");
+
+        assert!(
+            block_on(poll_once(operation_parked.as_mut())).is_some(),
+            "the pump hands the frame to its shard through the arrival signal"
+        );
+    }
+
+    /// One pump per queue pair, decided from the topology: with more
+    /// processors than pairs, exactly the lowest processor mapped to
+    /// each pair runs one.
+    ///
+    /// The machine here is eight processors on a four-pair interface,
+    /// so processor 5's shard submits on pair 1 — which processor 1's
+    /// pump already owns — and processor 5 runs no pump. There is no
+    /// race in it: `pump_assignment_for` answers the same way whenever
+    /// each processor's run loop asks.
+    #[test]
+    fn each_pair_has_exactly_one_pump_when_processors_outnumber_pairs() {
+        let service = test_network_service_smp(8, RecordingNetworkInterface::new(4));
+        for processor in 0..8u16 {
+            let assignment =
+                service.pump_assignment_for(helios_hal::cpu::ProcessorId::new(processor));
+            if usize::from(processor) < 4 {
+                let assignment =
+                    assignment.expect("a processor under the pair count owns its pair");
+                assert_eq!(assignment.pair, usize::from(processor));
+                assert_eq!(
+                    assignment.interface_wide,
+                    processor == 0,
+                    "only the bootstrap processor's pump carries interface-wide duties"
+                );
+            } else {
+                assert!(
+                    assignment.is_none(),
+                    "a processor whose shard folds onto a lower pair runs no pump"
+                );
+            }
+        }
+    }
+
+    /// Of the pumps, only the bootstrap processor's arms the
+    /// interface-wide channel: a link or configuration event arrives on
+    /// no pair, and that pump is the one that acts on them. The others
+    /// park on their pair's mark alone.
+    #[test]
+    fn only_the_bootstrap_pumps_wait_arms_the_device_wide_channel() {
+        let service = test_network_service_smp(4, RecordingNetworkInterface::new(4));
+        for processor in 0..4u16 {
+            let assignment = service
+                .pump_assignment_for(helios_hal::cpu::ProcessorId::new(processor))
+                .expect("every processor owns a pair when the counts match");
+            let wait = service.pump_shard_wait(assignment.pair, assignment.interface_wide);
+            assert_eq!(
+                wait.device.device.is_some(),
+                processor == 0,
+                "the device-wide leg belongs to the bootstrap pump alone"
+            );
+        }
+    }
+
+    /// And armed is what it has to be: a link or configuration event
+    /// ends the bootstrap pump's park and ends no other pair's.
+    #[test]
+    fn a_device_wide_event_wakes_the_bootstrap_pump_alone() {
+        let service = test_network_service_smp(4, RecordingNetworkInterface::new(4));
+        let device = service.inner.device.clone();
+
+        let bootstrap_wait = service.pump_shard_wait(0, true);
+        let pair_wait = service.pump_shard_wait(1, false);
+
+        device.complete_device();
+
+        let mut bootstrap_parked = core::pin::pin!(
+            service.wait_for_shard_progress(bootstrap_wait, core::time::Duration::from_secs(3600))
+        );
+        assert!(
+            block_on(poll_once(bootstrap_parked.as_mut())).is_some(),
+            "the interface-wide event is the bootstrap pump's to hear"
+        );
+        let mut pair_parked = core::pin::pin!(
+            service.wait_for_shard_progress(pair_wait, core::time::Duration::from_secs(3600))
+        );
+        assert!(
+            block_on(poll_once(pair_parked.as_mut())).is_none(),
+            "a pair's pump parks on its pair alone"
+        );
+    }
+
+    /// A service over an interface that reports events and moves no
+    /// frames, on a machine of `processors` processors — the fixture
+    /// the pump-ownership tests need, since the shard set is sized to
+    /// the processors the machine reports.
+    fn test_network_service_smp(
+        processors: usize,
+        device: RecordingNetworkInterface,
+    ) -> super::NetworkService<RecordingSmpCpu, RecordingNetworkInterface> {
+        let cpu = RecordingSmpCpu::new(0, processors);
+        super::NetworkService::new(
+            cpu.clone(),
+            crate::test_support::test_profile_sink(),
+            crate::test_support::test_uptime_clock(),
+            crate::Timer::new(cpu),
+            device,
+        )
     }
 
     /// The receive rule and the placement rule have to agree, or a

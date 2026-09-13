@@ -601,10 +601,40 @@ where
     }
 }
 
+/// Starts the packet pump for the queue pair this processor owns, when
+/// it owns one.
+///
+/// A queue pair's interrupt is routed to one processor, so the pump
+/// that drains the pair has to be that processor's own task: this is
+/// called from every processor's run loop, before the role dispatch
+/// decides what else the processor does, and `spawn_local_detached`
+/// pins the task to it. The service is installed by a device-discovery
+/// task that may not have run yet, so the task awaits the install
+/// rather than checking and giving up; `run_packet_pump` then resolves
+/// the pair assignment from the topology and either pumps it or
+/// returns.
+fn spawn_network_packet_pump<CpuImpl, Net, HostFs, WatchdogImpl>(
+    kernel: &crate::Kernel<CpuImpl, WatchdogImpl>,
+    debug_state: &HostRuntimeState<CpuImpl, Net, HostFs>,
+) where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    HostFs: crate::HostFileSystem,
+    WatchdogImpl: Watchdog + Clone,
+{
+    let debug_state = debug_state.clone();
+    kernel.spawn_local_detached(async move {
+        let service = debug_state.wait_for_network_service().await;
+        service
+            .run_packet_pump(helios_hal::cpu::current_processor())
+            .await;
+    });
+}
+
 pub fn run_program_workers_forever<CpuImpl, Net, HostFs, WatchdogImpl>(
     _cpu: CpuImpl,
     kernel: crate::Kernel<CpuImpl, WatchdogImpl>,
-    _debug_state: HostRuntimeState<CpuImpl, Net, HostFs>,
+    debug_state: HostRuntimeState<CpuImpl, Net, HostFs>,
 ) -> !
 where
     CpuImpl: Cpu + Clone,
@@ -612,6 +642,7 @@ where
     HostFs: crate::HostFileSystem,
     WatchdogImpl: Watchdog + Clone,
 {
+    spawn_network_packet_pump(&kernel, &debug_state);
     kernel.run()
 }
 
@@ -628,6 +659,7 @@ where
     HostFs: crate::HostFileSystem,
     WatchdogImpl: Watchdog + Clone,
 {
+    spawn_network_packet_pump(&kernel, &debug_state);
     let topology = kernel.topology();
     match component_host_processor_role(
         helios_hal::cpu::current_processor(),

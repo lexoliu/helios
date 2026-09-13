@@ -477,11 +477,10 @@ pub(super) struct NetworkShardSet {
     pub(super) udp_slots: ReplicaSlots<MAX_UDP_SOCKET_HANDLES>,
     /// Raised whenever any shard makes receive-side progress.
     ///
-    /// Two kinds of waiter have no single shard to watch. A replicated
+    /// One kind of waiter has no single shard to watch: a replicated
     /// socket's accept and datagram-receive calls do not know which
-    /// shard their next connection or datagram will hash to, and the
-    /// packet pump serves every shard at once. Raising it costs one
-    /// atomic increment per receive batch.
+    /// shard their next connection or datagram will hash to. Raising it
+    /// costs one atomic increment per receive batch.
     pub(super) any_arrival: ProgressSignal,
 }
 
@@ -772,26 +771,13 @@ impl NetworkShardSet {
 
     /// Samples the set-wide arrival signal, for a waiter that belongs
     /// to no single shard: an operation on a socket that lives on every
-    /// shard, or the packet pump, which serves them all.
+    /// shard.
     #[inline]
     pub(super) fn any_shard_wait(&self) -> ShardWait {
         ShardWait {
             target: WaitTarget::AnyShard,
             mark: self.any_arrival.mark(),
         }
-    }
-
-    /// Releases everything parked on the whole shard set, the packet
-    /// pump included.
-    ///
-    /// The counterpart of [`Self::with_handle_receive_drain`] for an
-    /// event that belongs to no one shard: a synchronous retirement
-    /// queues a FIN and produces no frame, so nothing else raises a
-    /// signal and the pump would sleep to the next protocol deadline
-    /// with the segment still in the queue (#232). Callable from any
-    /// processor, and it takes no shard lock.
-    pub(super) fn wake_any_shard(&self) {
-        self.any_arrival.signal();
     }
 
     /// The signal a sampled wait belongs to.
@@ -818,14 +804,13 @@ impl NetworkShardSet {
         }
         // A replicated socket's operations watch the whole set, because
         // the shard their next connection or datagram lands on is not
-        // known until its flow is hashed, and so does the packet pump,
-        // which produces for every shard.
+        // known until its flow is hashed.
         self.any_arrival.signal();
     }
 
     /// Raises one shard's arrival signal and pulls the owning processor
     /// out of its idle park when this is not that processor.
-    fn raise_shard_progress<CpuImpl: Cpu>(&self, shard_idx: usize, cpu: &CpuImpl) {
+    pub(super) fn raise_shard_progress<CpuImpl: Cpu>(&self, shard_idx: usize, cpu: &CpuImpl) {
         self.arrival(shard_idx).signal();
         let owner = self.owner_processor(shard_idx);
         if owner != helios_hal::cpu::current_processor() {
@@ -850,10 +835,18 @@ impl NetworkShardSet {
     ///
     /// The signal is raised after the lock is released, so a woken
     /// waiter never contends with the drain that woke it.
+    ///
+    /// Two signals go up on a relieve: the shard's own, for the
+    /// operations parked on it, and the arrival the packet pump of the
+    /// shard's pair parks on — the pump is what turns a reopened window
+    /// into a window update, and when more processors than pairs fold
+    /// several shards onto one pair its arrival is a different shard's
+    /// than the one just drained.
     pub(super) fn with_handle_receive_drain<H, R, CpuImpl>(
         &self,
         handle: H,
         cpu: &CpuImpl,
+        pair_count: usize,
         f: impl FnOnce(&mut NetworkShard) -> R,
     ) -> R
     where
@@ -872,6 +865,10 @@ impl NetworkShardSet {
         };
         if relieved {
             self.raise_shard_progress(shard_idx, cpu);
+            let pump_shard = shard_idx % pair_count;
+            if pump_shard != shard_idx {
+                self.raise_shard_progress(pump_shard, cpu);
+            }
             self.any_arrival.signal();
         }
         result
@@ -963,6 +960,39 @@ impl NetworkShardSet {
             let mut guard = shard.inner.lock();
             f(&mut guard);
         }
+    }
+
+    /// Iterates the shards whose egress submits on `pair_idx`, calling
+    /// `f` once per shard under its own lock.
+    ///
+    /// Shard `s` submits on pair `s % pair_count`, so a pump that owns
+    /// a pair drives every shard that shares it — with fewer pairs than
+    /// processors, the pair's shards are exactly the ones its pump can
+    /// ever move.
+    pub(super) fn for_each_on_pair<F>(&self, pair_idx: usize, pair_count: usize, mut f: F)
+    where
+        F: FnMut(&mut NetworkShard),
+    {
+        for shard_idx in (pair_idx..self.shards.len()).step_by(pair_count) {
+            let mut guard = self.shards[shard_idx].inner.lock();
+            f(&mut guard);
+        }
+    }
+
+    /// The soonest TCP deadline among the shards that submit on
+    /// `pair_idx`, or `None` when none of them owes one.
+    pub(super) fn pair_tcp_deadline_nanos(
+        &self,
+        pair_idx: usize,
+        pair_count: usize,
+    ) -> Option<u64> {
+        let mut next = None;
+        self.for_each_on_pair(pair_idx, pair_count, |shard| {
+            if let Some(deadline) = shard.stack.next_tcp_deadline().map(StackInstant::nanos) {
+                next = Some(next.map_or(deadline, |current: u64| current.min(deadline)));
+            }
+        });
+        next
     }
 
     pub(super) fn min_tcp_deadline_nanos(&self) -> Option<u64> {
