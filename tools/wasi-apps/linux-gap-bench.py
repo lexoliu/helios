@@ -2233,6 +2233,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--helios-baseline-profile-use",
+        type=Path,
+        default=None,
+        help=(
+            "Merged .profdata the baseline image of --helios-baseline-root is "
+            "compiled against: the baseline column's own collection, so a paired "
+            "run holds each commit's kernel to a profile collected from that "
+            "commit rather than both to one fetched profile (docs/pgo.md, #384)."
+        ),
+    )
+    parser.add_argument(
         "--helios-baseline-without-kernel-profile",
         action="store_true",
         help=(
@@ -2324,6 +2335,25 @@ def main() -> None:
                 f"{args.helios_baseline_root} is not a Helios checkout: it has no "
                 "tools/wasi-apps/workload-bench.sh"
             )
+    if args.helios_baseline_profile_use is not None:
+        if args.skip_helios:
+            raise SystemExit(
+                "--helios-baseline-profile-use has nothing to build under --skip-helios"
+            )
+        if args.helios_baseline_root is None:
+            raise SystemExit(
+                "--helios-baseline-profile-use names the profile of the "
+                "--helios-baseline-root image, which is not set"
+            )
+        if args.helios_baseline_without_kernel_profile:
+            raise SystemExit(
+                "--helios-baseline-profile-use and "
+                "--helios-baseline-without-kernel-profile ask for two builds of "
+                "the baseline image"
+            )
+        args.helios_baseline_profile_use = args.helios_baseline_profile_use.resolve()
+        if not args.helios_baseline_profile_use.is_file():
+            raise SystemExit(f"{args.helios_baseline_profile_use} is not a file")
     if args.linux_vm_smp <= 0:
         raise SystemExit("--linux-vm-smp must be positive")
     if args.linux_vm_setup_timeout_seconds <= 0:
@@ -2413,9 +2443,12 @@ def main() -> None:
             # A pairing varies one thing: the commit the baseline is built
             # from, the profile the candidate is built against, or whether
             # the baseline reads a profile at all. The baseline is the
-            # release build of whichever checkout it names, plain when
-            # the control is asked for, which is what the candidate is
-            # measured against in every case.
+            # release build of whichever checkout it names —
+            # --helios-baseline-profile-use instead names its own column's
+            # collection, so a paired run holds each commit's kernel to a
+            # profile of that commit (#384) — plain when the control is
+            # asked for, which is what the candidate is measured against
+            # in every case.
             paired = (
                 args.helios_baseline_root is not None
                 or args.helios_profile_use is not None
@@ -2432,6 +2465,7 @@ def main() -> None:
                         name="helios-baseline",
                         workspace_root=args.helios_baseline_root or repo_root(),
                         out_dir=baseline_out_dir,
+                        profile_use=args.helios_baseline_profile_use,
                         without_kernel_profile=args.helios_baseline_without_kernel_profile,
                     )
                 )

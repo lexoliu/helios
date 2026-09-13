@@ -25,6 +25,18 @@ on:
     # The first of every month. Artifacts live ninety days at most.
     - cron: "17 3 1 * *"
   workflow_call:
+    inputs:
+      ref:
+        description: >-
+          Commit, branch or tag to collect the profile from; the
+          collection runs that ref's own checkout. Empty means the
+          caller's github.sha.
+        type: string
+        default: ""
+      artifact:
+        description: Name the merged profile is uploaded under
+        type: string
+        default: helios-kernel-profdata
 
 jobs:
   kernel-profile:
@@ -41,6 +53,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: helios
+          ref: ${{ inputs.ref || github.sha }}
       - uses: ./helios/.github/actions/checkout-wasmtime
       - uses: ./helios/.github/actions/bench-host
         with:
@@ -54,7 +67,9 @@ jobs:
           output: ${{ github.workspace }}/profiles/helios-kernel.profdata
       - uses: actions/upload-artifact@v4
         with:
-          name: helios-kernel-profdata
+          # Dispatch and schedule runs leave `inputs.artifact` empty; they
+          # publish the fetched profile under its stable name.
+          name: ${{ inputs.artifact || 'helios-kernel-profdata' }}
           path: profiles/helios-kernel.profdata
           if-no-files-found: error
           retention-days: 90

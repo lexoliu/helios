@@ -407,6 +407,27 @@ read the profile. The report is the paired table and the per-workload
 medians; read the headline compute workloads first (`aot-curl`,
 `cpython-json`, `quickjs-loop`), because they are what the profile covers.
 
+A paired run — an advisory `bench-suite.yml` dispatch that names a
+`baseline_ref`, the instrument a kernel change is held to, or a
+pull request labelled `bench`, which the suite pairs against its base
+SHA — cannot spend the fetched profile on both columns: it describes the
+default branch's kernel, so a candidate that renamed or reshaped
+functions would be measured with an unknown negative term beside a
+baseline the profile still matched. That is exactly what the week's
+pairs showed before #384: the candidate at 3,377–4,251 uncovered
+functions against the baseline's 501, the stale profile's cost billed to
+the change. The `profile-columns` job therefore calls
+`kernel-profile.yml` once per column — the candidate's at the run's own
+commit and the baseline's at the ref the suite pairs against, so each
+collection runs the ref's own tooling — and `suite` downloads the two artifacts as
+`helios-kernel-profdata-candidate` and `helios-kernel-profdata-baseline`,
+then passes them to `helios-bench run` as `--profile-use` and
+`--baseline-profile-use`. A `release` baseline collects none: the plain
+control reads no profile. And the paired gate holds each column's
+uncovered share to `UNDERPROFILED_SHARE`: a column past it was not built
+against a profile of its own commit, so the run is inconclusive for that
+named reason, the way a high control CV is, rather than read.
+
 The `net` class is in the profile like every other: the collection
 provisions the tap backend and runs the whole suite on it, so the
 candidate's packet path carries counts from the workloads the table times

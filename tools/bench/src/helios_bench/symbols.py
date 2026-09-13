@@ -21,6 +21,7 @@ KERNEL_PATTERNS = (
     "target/pgo-kernels/*/*-unknown-none*/profile-use/helios",
     "target/perf-baselines/worktrees/*/target/*-unknown-none*/release/helios",
     "target/perf-baselines/worktrees/*/target/*-unknown-none*/profile-use/helios",
+    "target/perf-baselines/worktrees/*/target/pgo-kernels/*/*-unknown-none*/profile-use/helios",
 )
 
 

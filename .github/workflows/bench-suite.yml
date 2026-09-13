@@ -86,6 +86,12 @@ jobs:
       # reads it through the needs context, the only one it can read.
       advisory: ${{ steps.mode.outputs.advisory }}
       paired_acceptance: ${{ steps.mode.outputs.paired_acceptance }}
+      # Whether this run pairs two images and collects a kernel profile
+      # per column, the collections it then needs (one matrix entry per
+      # column), and whether the baseline column has one (#384).
+      per_column_profiles: ${{ steps.mode.outputs.per_column_profiles }}
+      profile_columns: ${{ steps.columns.outputs.profile_columns }}
+      baseline_profile: ${{ steps.mode.outputs.baseline_profile }}
       # The suite's matrix, from tools/bench/manifest.toml: the lanes have
       # one definition.
       matrix: ${{ steps.lanes.outputs.matrix }}
@@ -96,6 +102,11 @@ jobs:
           REQUESTED_ADVISORY: ${{ inputs.advisory }}
           BASELINE_REF: ${{ inputs.baseline_ref }}
           BASELINE_KERNEL_BUILD: ${{ inputs.baseline_kernel_build }}
+          TCP_PROBE: ${{ inputs.tcp_probe }}
+          # A labelled pull request is paired against its base the way
+          # the suite job pairs it, by the base SHA GitHub merged against.
+          PR_BENCH: ${{ github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'bench') }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           if [ "$EVENT_NAME" = workflow_dispatch ]; then
             echo "advisory=$REQUESTED_ADVISORY" >> "$GITHUB_OUTPUT"
@@ -110,7 +121,65 @@ jobs:
           else
             echo "paired_acceptance=false" >> "$GITHUB_OUTPUT"
           fi
+          # A paired run's kernel profile is collected per column (#384):
+          # the candidate's always, and the baseline's when a second
+          # commit is paired and built the profiled way — a plain control
+          # has no profile to collect. Paired runs are the acceptance
+          # dispatches above and a labelled pull request, which the suite
+          # pairs against its base SHA; the TCP probe pairs too but is
+          # diagnosis, not measurement, and reads the fetched profile.
+          # `profile-columns` spends the list as its matrix;
+          # `baseline_profile` tells the suite whether the baseline
+          # column's artifact exists.
+          pairing_ref="$BASELINE_REF"
+          per_column_profiles=false
+          if [ "$TCP_PROBE" != true ]; then
+            if [ "$PR_BENCH" = true ]; then
+              pairing_ref="$PR_BASE_SHA"
+              per_column_profiles=true
+            elif [ "$EVENT_NAME" = workflow_dispatch ] && [ "$REQUESTED_ADVISORY" = true ] \
+              && { [ -n "$BASELINE_REF" ] || [ "$BASELINE_KERNEL_BUILD" = release ]; }; then
+              per_column_profiles=true
+            fi
+          fi
+          echo "per_column_profiles=$per_column_profiles" >> "$GITHUB_OUTPUT"
+          if [ -n "$pairing_ref" ] && [ "$BASELINE_KERNEL_BUILD" != release ]; then
+            baseline_profile=true
+          else
+            baseline_profile=false
+          fi
+          echo "baseline_profile=$baseline_profile" >> "$GITHUB_OUTPUT"
+          echo "pairing_ref=$pairing_ref" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
+        with:
+          # The matrix below resolves the pairing ref against history.
+          fetch-depth: 0
+      # The collections' matrix, with every ref resolved to its commit:
+      # `actions/checkout` reads a `ref` that is not forty hex digits as
+      # a branch or tag, so a short SHA or `merge-base` has to be
+      # resolved here, where the history is, before it is handed on.
+      - id: columns
+        env:
+          CANDIDATE_SHA: ${{ github.sha }}
+          PAIRING_REF: ${{ steps.mode.outputs.pairing_ref }}
+          BASELINE_PROFILE: ${{ steps.mode.outputs.baseline_profile }}
+        run: |
+          candidate="$(jq -c -n --arg ref "$CANDIDATE_SHA" \
+            '{column: "candidate", ref: $ref, artifact: "helios-kernel-profdata-candidate"}')"
+          if [ "$BASELINE_PROFILE" = true ]; then
+            if [ "$PAIRING_REF" = merge-base ]; then
+              sha="$(git merge-base HEAD origin/dev)"
+            else
+              sha="$(git rev-parse --verify "$PAIRING_REF^{commit}")"
+            fi
+            baseline="$(jq -c -n --arg ref "$sha" \
+              '{column: "baseline", ref: $ref, artifact: "helios-kernel-profdata-baseline"}')"
+            columns="$(jq -c -n --argjson candidate "$candidate" --argjson baseline "$baseline" \
+              '[$candidate, $baseline]')"
+          else
+            columns="$(jq -c -n --argjson candidate "$candidate" '[$candidate]')"
+          fi
+          echo "profile_columns=$columns" >> "$GITHUB_OUTPUT"
       - uses: astral-sh/setup-uv@v6
       - name: Lint and test tools/bench
         working-directory: tools/bench
@@ -133,16 +202,49 @@ jobs:
       - name: Build the native counterparts
         run: tools/bench/native/build.sh x86_64
 
+  # A paired run holds each column to a profile collected from the commit
+  # the column carries. Before #384 a paired run skipped profile
+  # collection and both columns read the newest default-branch profile:
+  # the baseline was still described by it while the candidate paid for
+  # every function the profile no longer covered — the week's pairs
+  # reported the candidate at 3,377–4,251 uncovered functions beside the
+  # baseline's 501 — so the gate compared a matched baseline against a
+  # half-matched candidate and no verdict could separate the change's
+  # effect from the stale profile's. One matrix entry per column, each
+  # collection checked out at the ref it profiles so it runs that ref's
+  # own tooling, each artifact named for its column. A plain `release`
+  # control has no profile to collect, and the non-paired events keep
+  # `profile-generate`'s one collection below.
+  profile-columns:
+    name: profile-columns-${{ matrix.column }}
+    needs: tooling
+    if: needs.tooling.outputs.per_column_profiles == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.tooling.outputs.profile_columns) }}
+    uses: ./.github/workflows/kernel-profile.yml
+    with:
+      ref: ${{ matrix.ref }}
+      artifact: ${{ matrix.artifact }}
+
   suite:
     name: suite-${{ matrix.lane }}
-    needs: tooling
+    needs: [tooling, profile-columns]
     # Heavy: only on dispatch, labelled PRs, tags, and dev pushes once the
-    # dedicated machines exist.
+    # dedicated machines exist. `always()` keeps a non-paired run from
+    # waiting on a skipped `profile-columns`, and a paired run stops here
+    # rather than measuring a column built on a stale profile — without
+    # both collections the pair is not the instrument (#384).
     if: >-
-      github.event_name == 'workflow_dispatch'
-      || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'bench'))
-      || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/'))
-      || (github.event_name == 'push' && vars.HELIOS_BENCH_DEDICATED == 'true')
+      always()
+      && needs.tooling.result == 'success'
+      && (needs.profile-columns.result == 'success'
+          || needs.profile-columns.result == 'skipped')
+      && (github.event_name == 'workflow_dispatch'
+          || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'bench'))
+          || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/'))
+          || (github.event_name == 'push' && vars.HELIOS_BENCH_DEDICATED == 'true'))
     runs-on: ${{ needs.tooling.outputs.advisory == 'true' && matrix.shared-runner || matrix.dedicated-runner }}
     permissions:
       contents: read
@@ -150,6 +252,8 @@ jobs:
     env:
       BENCH_ADVISORY: ${{ needs.tooling.outputs.advisory }}
       BENCH_PAIRED_ACCEPTANCE: ${{ needs.tooling.outputs.paired_acceptance }}
+      BENCH_PER_COLUMN_PROFILES: ${{ needs.tooling.outputs.per_column_profiles }}
+      BENCH_BASELINE_PROFILE: ${{ needs.tooling.outputs.baseline_profile }}
       HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
       HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
       HELIOS_BOOT_SYNC_TIMEOUT_SECS: ${{ matrix.boot-timeout }}
@@ -193,6 +297,23 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: cargo run --release -p helios-cli -- profile-fetch
+      # A paired run builds each column against the profile its own
+      # `profile-columns` collection produced this run (#384); a paired
+      # run whose collections failed never reaches this step. The fetch
+      # above still runs — the non-paired path needs it, and the
+      # inspector refuses a release build whose record names no profile.
+      - name: Download the candidate column's kernel profile
+        if: env.BENCH_PER_COLUMN_PROFILES == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: helios-kernel-profdata-candidate
+          path: helios/target/pgo-candidate
+      - name: Download the baseline column's kernel profile
+        if: env.BENCH_PER_COLUMN_PROFILES == 'true' && env.BENCH_BASELINE_PROFILE == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: helios-kernel-profdata-baseline
+          path: helios/target/pgo-baseline
       - name: Report host deviations from the lane
         working-directory: helios/tools/bench
         run: uv run helios-bench host-check --lane ${{ matrix.lane }} || true
@@ -265,6 +386,15 @@ jobs:
           fi
           if [ "${BENCH_PAIRED_ACCEPTANCE}" = true ]; then
             args+=(--sides "helios,helios_baseline")
+          fi
+          # Each column's kernel is built against the profile its own
+          # collection produced this run, not the fetched one both
+          # would otherwise share (#384).
+          if [ "${BENCH_PER_COLUMN_PROFILES}" = true ]; then
+            args+=(--profile-use "$GITHUB_WORKSPACE/helios/target/pgo-candidate/helios-kernel.profdata")
+            if [ "${BENCH_BASELINE_PROFILE}" = true ]; then
+              args+=(--baseline-profile-use "$GITHUB_WORKSPACE/helios/target/pgo-baseline/helios-kernel.profdata")
+            fi
           fi
           if [ "${{ matrix.net-backend }}" = tap ]; then
             args+=(--net-ifname "${HELIOS_NET_IFNAME}" --net-bridge "${HELIOS_NET_BRIDGE}" --net-queues "$(nproc)")
@@ -348,11 +478,11 @@ jobs:
     uses: ./.github/workflows/kernel-profile.yml
 
   # The other half of docs/pgo.md: the profile the job above collected,
-  # spent. One commit is built twice — the plain release kernel and the
-  # same kernel compiled against the profile — and the paired suite of
-  # #173 boots both back to back for every workload on this host, so what
-  # separates the two columns is profile-guided optimisation and nothing
-  # else (#211).
+  # spent. One commit is built twice — against the newest default-branch
+  # profile every release build reads, and against this run's own
+  # collection — and the paired suite of #173 boots both back to back for
+  # every workload on this host, so what separates the two profile-use
+  # columns is the profile each build reads and nothing else (#211).
   suite-pgo:
     name: suite-pgo
     needs: profile-generate

@@ -8,7 +8,7 @@ from pathlib import Path
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
 from helios_bench import PACKAGE_ROOT
-from helios_bench.gate import GATE_TITLES, Direction, GateKind, GateReport
+from helios_bench.gate import GATE_TITLES, UNDERPROFILED_SHARE, Direction, GateKind, GateReport
 from helios_bench.report import CLASS_LABELS, SIDE_LABELS, Report, Side, WorkloadClass
 
 TEMPLATES_ROOT = PACKAGE_ROOT / "templates"
@@ -65,6 +65,7 @@ def environment() -> Environment:
     env.globals["GateKind"] = GateKind
     env.globals["GATE_TITLES"] = GATE_TITLES
     env.globals["Direction"] = Direction
+    env.globals["UNDERPROFILED_SHARE"] = UNDERPROFILED_SHARE
     return env
 
 

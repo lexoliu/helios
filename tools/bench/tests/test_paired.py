@@ -11,6 +11,7 @@ cannot.
 
 from __future__ import annotations
 
+import json
 import os
 import socket
 import subprocess
@@ -31,6 +32,7 @@ from helios_bench.runner import (
     NetworkOptions,
     RunOptions,
     kernel_pgo_uncovered,
+    kernel_profiles,
     plan,
     run_suite,
 )
@@ -1026,3 +1028,148 @@ def test_a_pgo_pairing_names_the_profile_each_column_read(paired_regression_repo
     assert "release helios-v0.1.0" in result.baseline_label
     assert "target/pgo-candidate/helios-kernel.profdata" in result.candidate_label
     assert result.baseline_label != result.candidate_label
+
+
+def test_a_paired_baseline_can_carry_its_own_profile(tmp_path) -> None:
+    """#384: each column of a paired run builds against a profile
+    collected from the commit it carries.
+
+    The plan asks the driver for the baseline's profile the way it asks
+    for the candidate's, and the driver's parser accepts it — the argv and
+    the parser are edited together.
+    """
+    profile = tmp_path / "helios-kernel.profdata"
+    profile.write_bytes(b"\x00" * 16)
+    options = RunOptions(
+        lane=load_manifest().lane("x86-64-kvm"),
+        out_dir=tmp_path / "out",
+        advisory=True,
+        sides=frozenset({Side.HELIOS, Side.HELIOS_BASELINE}),
+        baseline=Baseline(ref="dev", sha="b" * 40, worktree=tmp_path / "worktree"),
+        baseline_profile_use=profile,
+    )
+    # The named profile makes the second image a profile-use build of its
+    # own commit wherever the lane's release build is one.
+    assert options.baseline_kernel_build == "profile-use"
+    invocations = [
+        command.argv
+        for command in plan(options, load_manifest(), WORKLOADS)
+        if command.argv[1:2] == [str(GAP_BENCH)]
+    ]
+    assert len(invocations) == 1
+    args = gap_bench().build_parser().parse_args(invocations[0][2:])
+    assert args.helios_baseline_root == tmp_path / "worktree"
+    assert args.helios_baseline_profile_use == profile
+    assert not args.helios_baseline_without_kernel_profile
+
+
+def test_a_baseline_profile_needs_the_pairing_it_profiles(tmp_path) -> None:
+    """--baseline-profile-use with no --baseline-ref names a profile for
+    an image that does not exist."""
+    profile = tmp_path / "helios-kernel.profdata"
+    profile.write_bytes(b"\x00" * 16)
+    with pytest.raises(SystemExit, match="--baseline-ref"):
+        RunOptions(
+            lane=load_manifest().lane("x86-64-kvm"),
+            out_dir=tmp_path / "out",
+            advisory=True,
+            sides=frozenset({Side.HELIOS, Side.HELIOS_BASELINE}),
+            baseline_profile_use=profile,
+        )
+
+
+def test_the_plain_control_reads_no_profile(tmp_path) -> None:
+    """--baseline-kernel-build release is the PGO-versus-plain control: a
+    profile on it would be a different build wearing the control's name."""
+    profile = tmp_path / "helios-kernel.profdata"
+    profile.write_bytes(b"\x00" * 16)
+    with pytest.raises(SystemExit, match="the plain control reads no profile"):
+        RunOptions(
+            lane=load_manifest().lane("x86-64-kvm"),
+            out_dir=tmp_path / "out",
+            advisory=True,
+            sides=frozenset({Side.HELIOS, Side.HELIOS_BASELINE}),
+            baseline=Baseline(ref="dev", sha="b" * 40, worktree=tmp_path / "worktree"),
+            baseline_profile_use=profile,
+            plain_baseline=True,
+        )
+
+
+def test_a_per_column_baseline_profile_names_itself(tmp_path, monkeypatch) -> None:
+    """#384: the baseline column's label is its own collection's path,
+    not the fetched record both columns would otherwise read."""
+    record = tmp_path / "fetched.json"
+    record.write_text(
+        json.dumps(
+            {
+                "source": "collection",
+                "head_branch": "dev",
+                "head_sha": "a" * 40,
+                "run_id": "42",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("helios_bench.runner.KERNEL_PROFILE_RECORD", record)
+    profile = tmp_path / "pgo-baseline" / "helios-kernel.profdata"
+    profile.parent.mkdir(parents=True)
+    profile.write_bytes(b"\x00" * 16)
+    options = RunOptions(
+        lane=load_manifest().lane("x86-64-kvm"),
+        out_dir=tmp_path / "out",
+        advisory=True,
+        sides=frozenset({Side.HELIOS, Side.HELIOS_BASELINE}),
+        baseline=Baseline(ref="dev", sha="b" * 40, worktree=tmp_path / "worktree"),
+        profile_use=tmp_path / "pgo-candidate" / "helios-kernel.profdata",
+        baseline_profile_use=profile,
+    )
+    candidate_label, baseline_label = kernel_profiles(options)
+    assert baseline_label == str(profile)
+    assert baseline_label != "dev@aaaaaaa run 42", "the fetched record is not this column's profile"
+    assert candidate_label == str(tmp_path / "pgo-candidate" / "helios-kernel.profdata")
+
+
+def test_the_baselines_uncovered_count_reads_its_own_profile_build(tmp_path) -> None:
+    """#384: a per-column baseline profile keys the pgo-kernels directory
+    the uncovered list is read from, the same way the candidate's does.
+
+    The stand-in inspector keys its answer by the workspace root and the
+    flags it is asked with, so the list the count reads is the one the
+    baseline worktree's own profile-use build wrote — the fetched-profile
+    build beside it keeps a different list under a different directory.
+    """
+    lane = load_manifest().lane("x86-64-kvm")
+    checkout = fake_checkout(tmp_path / "baseline")
+    inspector = fake_inspector(checkout / "target" / "release")
+    profile = tmp_path / "helios-kernel.profdata"
+    profile.write_bytes(b"\x00" * 16)
+    answered = subprocess.run(
+        [
+            str(inspector),
+            "vm",
+            "--arch",
+            lane.helios_arch,
+            "--release",
+            "--accel",
+            lane.accelerator,
+            "--profile-use",
+            str(profile),
+            "kernel-path",
+        ],
+        env={**os.environ, "HELIOS_WORKSPACE_ROOT": str(checkout)},
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    listing = Path(answered.stdout.strip() + ".pgo-uncovered.txt")
+    listing.write_text(
+        "# uncovered: 3 of 42 functions (7.1%)\n"
+        "# warnings emitted: 3 in 2 crates\n"
+        "warning: a.1-cgu.0: no profile data available for function _A Hash = 1 up to 0 count discarded\n"
+        "warning: a.1-cgu.0: no profile data available for function _B Hash = 2 up to 0 count discarded\n"
+        "warning: b.2-cgu.3: no profile data available for function _C Hash = 3 up to 0 count discarded\n",
+        encoding="utf-8",
+    )
+    assert kernel_pgo_uncovered(checkout, lane, profile) == (3, 42)
+    # The plain release build beside it kept no list.
+    assert kernel_pgo_uncovered(checkout, lane, None) is None
