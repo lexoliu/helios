@@ -202,6 +202,20 @@ suite lane times it on and boots the instrumented kernel with it (#315).
 `vm --profile-use <file>` is the other half. It is the release build plus
 two rustflags, in the `profile-use` cargo profile.
 
+The release build itself is the `kernel-release` cargo profile
+(`Cargo.toml`): `release` plus `lto = "fat"` and `codegen-units = 1`, the
+profile every kernel image is built with and the one `profile-generate`
+and `profile-use` inherit. The image links `hal`, `netstack`, `virtio`,
+the backend, `kernel` and the Wasmtime crates, and every hot path crosses
+those crate boundaries; a per-crate build leaves each of those calls out
+of line, which a profile can weight but never inline, so whole-program
+optimisation is what the counts are worth the most on (#383). The
+counters survive it: instrumentation is inserted per function before the
+link, and the linker-defined `__start_`/`__stop_` bounds the in-kernel
+runtime reads are laid out after. The host tools stay on `release`;
+nothing times the inspector, and a fat-LTO link of it on every check
+would cost every lane and every developer loop.
+
 | Flag | Why |
 | --- | --- |
 | `-C profile-use=<file>` | reads the merged profile; the path is an argument, never discovered |
@@ -272,7 +286,7 @@ goes:
 | Build | Directory | Image |
 | --- | --- | --- |
 | `--release` on x86-64, reading the fetched profile | `target/x86_64-unknown-none/profile-use/` | `helios` |
-| `--release --without-kernel-profile`, the plain control | `target/x86_64-unknown-none/release/` | `helios` |
+| `--release --without-kernel-profile`, the plain control | `target/x86_64-unknown-none/kernel-release/` | `helios` |
 | `--profile-use <file>` | `target/pgo-kernels/<digest of the profile>/x86_64-unknown-none/profile-use/` | `helios` |
 
 The named build gets a `--target-dir` of its own, keyed by the SHA-256 of
@@ -421,8 +435,8 @@ What profile-guided optimisation is worth on the kernel that ships is a
 different question, and it has a control: the same commit built without
 any profile. `helios-inspector vm --release --without-kernel-profile`
 builds it, on the one target whose release builds otherwise read the
-fetched profile, and puts it in the `release` directory where every
-other target's release kernel lands; asking for it elsewhere is refused,
+fetched profile, and puts it in the `kernel-release` directory where
+every other target's release kernel lands; asking for it elsewhere is refused,
 because there the plain build is the only build. `helios-bench run
 --baseline-kernel-build release` pairs the profile-guided kernel against
 that control in one job (`bench-suite.yml`'s `baseline_kernel_build`
