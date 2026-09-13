@@ -66,7 +66,7 @@ def kernel_elf() -> bytes:
 def test_symbols_exclude_private_data_and_non_function_objects(tmp_path, kernel_elf):
     image = tmp_path / "helios"
     image.write_bytes(kernel_elf)
-    snapshot = kernel_symbols(image, "target/x86_64-unknown-none/release/helios")
+    snapshot = kernel_symbols(image, "target/x86_64-unknown-none/kernel-release/helios")
     assert snapshot["functions"] == [{"name": "sample_function", "address": 0x401000, "size": 1}]
     assert snapshot["sha256"] == hashlib.sha256(kernel_elf).hexdigest()
     assert snapshot["entry"] == 0x401000
@@ -90,8 +90,8 @@ def test_symbols_exclude_private_data_and_non_function_objects(tmp_path, kernel_
 def test_export_keeps_both_image_identities_without_copying_elfs(tmp_path, kernel_elf):
     root = tmp_path / "checkout"
     images = [
-        root / "target/x86_64-unknown-none/release/helios",
-        root / "target/perf-baselines/worktrees/baseline/target/x86_64-unknown-none/release/helios",
+        root / "target/x86_64-unknown-none/kernel-release/helios",
+        root / "target/perf-baselines/worktrees/baseline/target/x86_64-unknown-none/kernel-release/helios",
     ]
     for image in images:
         image.parent.mkdir(parents=True)

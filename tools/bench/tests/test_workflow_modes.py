@@ -197,9 +197,9 @@ def test_benchmark_diagnostics_keep_symbols_but_not_kernels_or_keys(filename, jo
     )
     assert upload["if"] == condition
     paths = upload["with"]["path"].splitlines()
-    candidate = Path("helios/target/x86_64-unknown-none/release/helios")
+    candidate = Path("helios/target/x86_64-unknown-none/kernel-release/helios")
     baseline = Path(
-        "helios/target/perf-baselines/worktrees/baseline/target/x86_64-unknown-none/release/helios"
+        "helios/target/perf-baselines/worktrees/baseline/target/x86_64-unknown-none/kernel-release/helios"
     )
     kernels = [candidate, baseline] if job == "suite" else [candidate]
     snapshots = set()
@@ -212,7 +212,7 @@ def test_benchmark_diagnostics_keep_symbols_but_not_kernels_or_keys(filename, jo
         snapshot.parent.mkdir(parents=True, exist_ok=True)
         snapshot.write_text("{}")
         snapshots.add(relative)
-    key = Path("helios/target/kernel-prebuild/x86_64-unknown-none/release/helios-root-secret.key")
+    key = Path("helios/target/kernel-prebuild/x86_64-unknown-none/kernel-release/helios-root-secret.key")
     (tmp_path / key).parent.mkdir(parents=True, exist_ok=True)
     (tmp_path / key).write_bytes(b"test-only-private-key")
     matched = {path.relative_to(tmp_path) for pattern in paths for path in tmp_path.glob(pattern)}

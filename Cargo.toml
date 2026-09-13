@@ -106,13 +106,29 @@ debug = 2
 [profile.release]
 panic = "abort"
 
-# The instrumented kernel of docs/pgo.md: an optimised build that also
+# The kernel image's optimised build, the one every release kernel and both
+# PGO kernels below are: `release` plus whole-program optimisation. The
+# image links `hal`, `netstack`, `virtio`, the backend, `kernel` and the
+# Wasmtime crates, and every hot path crosses those boundaries — the
+# executor into the virtio queues, the netstack per segment, a hostcall
+# into a WIT service — so a per-crate build leaves each of those calls out
+# of line for PGO to weight but never inline. Fat LTO with one codegen unit
+# hands the whole image to one optimisation, which is what a collected
+# profile is worth the most on. The host tools keep `release`: nothing
+# times them, and a fat-LTO link of the inspector on every check would
+# be paid by every lane and every developer loop for no measurement.
+[profile.kernel-release]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+
+# The instrumented kernel of docs/pgo.md: the optimised build that also
 # carries LLVM's counters. The instrumentation itself comes from rustflags,
 # which are not a profile setting; `helios-inspector vm --profile-generate`
 # adds them and this profile keeps the artifacts in a directory of their own,
 # so an instrumented image and a plain one never overwrite each other.
 [profile.profile-generate]
-inherits = "release"
+inherits = "kernel-release"
 
 # The PGO kernel of docs/pgo.md: the same optimised build reading a
 # collected profile. `-C profile-use` is a rustflag rather than a profile
@@ -121,7 +137,7 @@ inherits = "release"
 # one checkout and timed against each other without overwriting each
 # other's artifacts.
 [profile.profile-use]
-inherits = "release"
+inherits = "kernel-release"
 
 [lints]
 workspace = true
