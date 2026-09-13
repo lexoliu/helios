@@ -5,10 +5,19 @@ name: kernel-profile
 # Every x86-64 release build spends the kernel profile this workflow
 # uploads (#226): one `helios-kernel-profdata` artifact holding the merged
 # `helios-kernel.profdata`, collected on the lane's own machine by
-# `.github/actions/collect-kernel-profile`. It is dispatched by hand when
-# the kernel has moved enough for its counts to have aged, and runs on a
-# schedule so the artifact never ages past GitHub's retention: a lane that
-# fetches an expired profile fails at the fetch, by design.
+# `.github/actions/collect-kernel-profile`. It runs on every push to `dev`
+# that touches what the kernel image is built from (#385): `helios-cli
+# profile-fetch` spends the newest collection on the default branch, and
+# between a monthly collection and the next `dev` merged kernel changes
+# several times a day — `dev` at 9541b9ec built 3,377 of 27,500 functions
+# uncovered against the profile collected at 5fe1df2b, and a release
+# kernel built that way is optimised on the profile of another kernel.
+# A burst of merges collects once, for the newest: an in-flight push
+# collection is cancelled by the next, so the last artifact uploaded is
+# the last commit's rather than whichever run finished last. It can still
+# be dispatched by hand, and runs on a schedule so the artifact never
+# ages past GitHub's retention: a lane that fetches an expired profile
+# fails at the fetch, by design.
 #
 # `bench-suite.yml`'s `profile-generate` job calls this workflow, so the
 # profile `suite-pgo` spends and the one a release build reads come from
@@ -21,6 +30,39 @@ name: kernel-profile
 
 on:
   workflow_dispatch:
+  push:
+    branches: [dev]
+    # What the x86-64 kernel image and the workloads it is profiled on
+    # are built from: the kernel crates and their layers below (§1 of
+    # AGENTS.md), the backend, the root crate, the guest programs the
+    # bootfs embeds, the workload manifest and the WASI apps the
+    # collection boots, the collection sequence itself, and the Wasmtime
+    # pin. A merge that touches none of these leaves the profile as it
+    # was.
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".cargo/**"
+      - "src/**"
+      - "hal/**"
+      - "netstack/**"
+      - "virtio/**"
+      - "i6300esb/**"
+      - "compiler-abi/**"
+      - "artifact/**"
+      - "kernel/**"
+      - "kernel-macro/**"
+      - "x86/**"
+      - "api/**"
+      - "api-macro/**"
+      - "programs/**"
+      - "compiler-plugin/**"
+      - "wit/**"
+      - "tools/bench/manifest.toml"
+      - "tools/wasi-apps/**"
+      - "docs/wasmtime.md"
+      - ".github/actions/**"
+      - ".github/workflows/kernel-profile.yml"
   schedule:
     # The first of every month. Artifacts live ninety days at most.
     - cron: "17 3 1 * *"
@@ -30,6 +72,17 @@ jobs:
   kernel-profile:
     name: kernel-profile
     runs-on: ubuntu-24.04
+    # A push collection is superseded by the next push: the newest
+    # commit's profile is the one `profile-fetch` should find newest, so
+    # the older run is cancelled rather than left to finish last. Every
+    # other event gets a group of its own — a dispatch, or the call from
+    # `bench-suite.yml`, whose own concurrency already governs it.
+    concurrency:
+      group: >-
+        ${{ github.event_name == 'push'
+            && format('kernel-profile-push-{0}', github.ref)
+            || format('kernel-profile-{0}-{1}', github.run_id, github.job) }}
+      cancel-in-progress: ${{ github.event_name == 'push' }}
     timeout-minutes: 240
     permissions:
       contents: read
