@@ -175,8 +175,16 @@ the instrumented x86-64 kernel, runs the compiler workload and the
 suite's non-network classes on it under KVM and merges every `.profraw`
 into one `helios-kernel.profdata`; the job uploads that as the
 `helios-kernel-profdata` artifact, which is the profile every x86-64
-release build spends (#226). It runs on `workflow_dispatch`, and on the
-first of every month so the artifact never ages past GitHub's ninety-day
+release build spends (#226). It runs on every push to `dev` that touches
+what the image is built from — the kernel crates and the layers below
+them, the backend, the root crate, the guest programs, the workload
+manifest and the WASI apps, the collection sequence, the Wasmtime pin
+(the `paths` list in the workflow) — so the newest collection is at most
+one merge behind the kernel a release build reads it for (#385); a
+burst of merges cancels the in-flight push collection for the newer one,
+so the artifact uploaded last is the last commit's rather than whichever
+run finished last. It also runs on `workflow_dispatch`, and on the first
+of every month so the artifact never ages past GitHub's ninety-day
 retention. `bench-suite.yml`'s `profile-generate` job calls the same
 workflow, so the profile `suite-pgo` measures is collected by the job a
 release build reads from; the collection itself is a composite action
@@ -451,10 +459,10 @@ job of `bench-suite.yml` runs and what the release job runs. A profile
 collected two ways would be two profiles wearing one name, and the kernel
 a release ships would not be the kernel `suite-pgo` measured.
 
-The refresh cadence is the on-demand collection above, not the release:
-a profile goes stale in its counts long before it goes stale in its
-hashes, and silently, so `kernel-profile.yml` is dispatched when the
-kernel it describes has moved and runs monthly regardless. A release
+The refresh cadence is the push collection above, not the release: a
+profile goes stale in its counts long before it goes stale in its
+hashes, and silently, so `kernel-profile.yml` collects on every `dev`
+merge that moves the kernel and runs monthly regardless. A release
 attaches the profile its own kernel was built with so that the released
 image can be reproduced, and a release build between releases reads the
 newest collection on the default branch.

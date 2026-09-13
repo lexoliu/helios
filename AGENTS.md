@@ -466,8 +466,9 @@ reason that says why the lint is wrong there. `clippy::manual_async_fn` is
 the gate for §3.2's `async fn` rule.
 
 `dep-check.yml` runs on a schedule and on demand. `kernel-profile.yml`
-collects the x86-64 kernel profile every release build spends, on demand
-and monthly (`docs/pgo.md`); `bench-suite.yml`'s `profile-generate` job
+collects the x86-64 kernel profile every release build spends, on every
+push to `dev` that touches the kernel image's inputs, on demand and
+monthly (`docs/pgo.md`); `bench-suite.yml`'s `profile-generate` job
 calls it. `release.yml` runs `release-plz` on every push to `main`: it
 owns version numbers, the changelog and tags, so commits follow the
 conventional format (`feat:`, `fix:`, `feat!:`, `BREAKING CHANGE:`) and
