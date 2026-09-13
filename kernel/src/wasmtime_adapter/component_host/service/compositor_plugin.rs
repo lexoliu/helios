@@ -17,6 +17,16 @@
 //! scanout. So the supervisor builds an instance at startup and rebuilds
 //! it whenever it dies.
 //!
+//! Whether the machine can hold a desktop at all is decided once, here,
+//! from the devices the backend brought up before the program service
+//! was installed. A machine with no display or no input device never
+//! grows one, so the plugin is not started on it: `helios:system/surface`
+//! reports `unavailable` exactly as it does on an image that ships no
+//! compositor, and nothing runs in the background. The alternative, a
+//! compositor that is built, refused by the display and rebuilt every
+//! `RESTART_DELAY`, is a periodic instantiate-and-tear-down on the
+//! bootstrap processor for the life of the kernel (#379).
+//!
 //! A death is a death whatever it looked like from inside: `run`
 //! returning is as much the end of the desktop as a trap or an OOM kill,
 //! so both come back here as an error and the supervisor rebuilds. What
@@ -38,12 +48,14 @@
 
 use super::*;
 
+use crate::component::ComponentRuntimeState;
 use crate::surface::{
     SURFACE_REQUEST_QUEUE_DEPTH, SurfaceCreate, SurfaceId, SurfaceRequest, SurfaceService,
     SurfaceServiceError,
 };
 use crate::wasmtime_adapter::bindings::compositor::bindings::{CompositorHost, exports};
 use crate::{ProcessAuthority, ProviderReceiver, provider_channel};
+use thiserror::Error;
 use wasmtime::component::{Accessor, AccessorTask, HasSelf, ResourceTable};
 
 /// Bootfs path of the plugin. Absent on a kernel image built without it,
@@ -86,6 +98,15 @@ pub(super) fn install_compositor_plugin<CpuImpl, Net, HostFs>(
         );
         return;
     };
+    if let Some(refusal) = desktop_refusal(&exec_context.runtime_state) {
+        tracing::info!(
+            path = COMPOSITOR_PLUGIN_PATH,
+            %refusal,
+            "compositor plugin is provisioned but this machine cannot hold a desktop; \
+             helios:system/surface will report it unavailable"
+        );
+        return;
+    }
 
     let (sender, receiver) = provider_channel(SURFACE_REQUEST_QUEUE_DEPTH);
     exec_context
@@ -102,6 +123,31 @@ pub(super) fn install_compositor_plugin<CpuImpl, Net, HostFs>(
         artifact,
         receiver,
     ));
+}
+
+/// Why this machine cannot hold a desktop.
+///
+/// Decided from the services the backend installed at boot, which is
+/// the same answer the compositor would get from `Display::claim` and
+/// `Device::claim`; the difference is that the answer is known before
+/// anything is instantiated, and it never changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
+enum DesktopRefusal {
+    #[error("this machine has no display device")]
+    NoDisplay,
+    #[error("this machine has no input device")]
+    NoInput,
+}
+
+/// Whether the machine can hold a desktop, from the devices it has.
+fn desktop_refusal(runtime_state: &impl ComponentRuntimeState) -> Option<DesktopRefusal> {
+    if runtime_state.display_service().is_none() {
+        return Some(DesktopRefusal::NoDisplay);
+    }
+    let input_devices = runtime_state
+        .input_service()
+        .map_or(0, |service| service.device_count());
+    (input_devices == 0).then_some(DesktopRefusal::NoInput)
 }
 
 /// Own the desktop for the lifetime of the kernel, rebuilding it when it
@@ -466,5 +512,23 @@ where
             }
             core::future::poll_fn(|cx| registry.poll_returns(cx, &mut waiter)).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DesktopRefusal, desktop_refusal};
+    use crate::test_support::TestRuntimeState;
+
+    /// A bench-lane or smoke boot has no display device. The plugin is
+    /// not started there, instead of being rebuilt every restart delay
+    /// for the life of the kernel (#379).
+    #[test]
+    fn a_machine_without_a_display_never_starts_the_compositor() {
+        let runtime_state = TestRuntimeState::default();
+        assert_eq!(
+            desktop_refusal(&runtime_state),
+            Some(DesktopRefusal::NoDisplay)
+        );
     }
 }

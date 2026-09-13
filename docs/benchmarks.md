@@ -136,8 +136,32 @@ Per cell (workload × side), `iterations` executions (11 by default):
   A floor above `cv_bound` (0.15, the bound a single row's dispersion is
   held to) makes the whole comparison **inconclusive**: the host moved
   by more than any effect a change could show, so no row gets a verdict.
-  The paired gate fails the check and asks for a rerun; the cross-run and
-  profile-use tables carry the banner and block nothing (#292).
+  The cross-run and profile-use tables carry the banner and block
+  nothing (#292); the paired gate fails the check, but not before the
+  one retry below.
+- An inconclusive paired run is measured once more before the job fails:
+  a noisy stretch says something about that hour of the host and nothing
+  about the next, and a redispatch would only hope to draw a quieter
+  machine. The runner boots the control pair and the paired suite again,
+  through the same driver invocation into `retry/` beside the first
+  pass, and the report the gate reads is the second pass's; the retake
+  and reconfirm passes below apply to it as they do to the first. The
+  run record carries both floors (`noise_retry.first_noise_floor` and
+  `noise_retry.second_noise_floor`), and the rendered tables say the run
+  retried and print both. A second pass still past the bound is a host
+  that could not produce a clean control twice: the run stands
+  inconclusive and the check fails as it did without the retry, with
+  both floors named (#375). An unpaired run has no paired verdict to
+  retry and is never measured twice.
+  The retry is sized against the job's budget before it starts:
+  `bench-suite.yml` passes its `timeout-minutes` as
+  `--job-timeout-minutes`, and the runner measures the first pass's
+  Helios wall time so a second pass that would outlast what remains is
+  skipped rather than killed mid-flight — the run stands inconclusive
+  and `noise_retry` records `kind: skipped-for-budget` with the estimate
+  and the remainder it was weighed against. A retry pass that comes back without
+  the control pair it was asked for is a failed pass, not a quiet host:
+  the run stops there, naming the side and the files it expected.
 - A cell whose warm CV is past `cv_bound` is **rejected**: its median
   cannot be trusted to detect a regression, and a headline workload without
   a trustworthy pair blocks as incomplete evidence. Before the gate reads
@@ -557,6 +581,21 @@ its run record carries both commits (`helios_git_sha` for the candidate,
 rendered tables print beside the kernels'. A run that was asked to pair
 and could not build or measure its baseline is a failed run, not a
 report with one column missing.
+
+An inconclusive first pass is not yet a failed run either: the control
+pair and the paired suite run once more in the same job on the same
+host, into `retry/` beside the first pass, and the report and gate
+verdict are the second pass's. The run record's `noise_retry` keeps both
+floors so the report says the host needed two passes; a second pass
+still past the bound stands inconclusive and the check fails naming
+them (#375). The retry runs only when it fits: sized at the first pass's
+Helios wall time against the job's `--job-timeout-minutes`, a second
+pass that would outlast the budget is skipped and the run stays
+inconclusive, the record a `skipped-for-budget` carrying the two numbers
+the decision was made from, rather than losing the whole job to a
+timeout. And a retry pass whose control files never
+landed fails the run at once, naming the side and the expected pair —
+an unmeasured control is not a clean one.
 
 A boot's unix sockets do not live in its runtime directory. That path is
 the caller's, and the paired layout nests it per image and per workload,

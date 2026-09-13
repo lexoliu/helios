@@ -231,8 +231,12 @@ jobs:
         if: ${{ !inputs.tcp_probe }}
         working-directory: helios/tools/bench
         run: |
+          # --job-timeout-minutes is this job's timeout-minutes above (the
+          # arm this step runs under): the runner skips the one retry of an
+          # inconclusive paired control when a second pass would outlast
+          # what remains, and a test asserts the two literals agree.
           args=(run --lane "${{ matrix.lane }}" --out-dir "$GITHUB_WORKSPACE/bench-out/${{ matrix.lane }}"
-                --runner-label "${{ runner.name }}")
+                --runner-label "${{ runner.name }}" --job-timeout-minutes 420)
           # instance-startup-500 wants about 6.1 GiB of guest before the
           # kernel's own baseline and the lane guest has less, so its
           # Helios half cannot be measured on this machine and a Linux
@@ -426,12 +430,14 @@ jobs:
         run: |
           # Helios against Helios: the Linux sides answer a different
           # question (docs/benchmarks.md) and would double a job that
-          # already boots every workload twice.
+          # already boots every workload twice. --job-timeout-minutes is
+          # this job's timeout-minutes above: the one retry of an
+          # inconclusive paired control is sized against it.
           args=(run --lane "${BENCH_LANE}" --out-dir "$GITHUB_WORKSPACE/bench-out/pgo"
                 --runner-label "${{ runner.name }}"
                 --sides "helios,helios_baseline"
                 --profile-use "$GITHUB_WORKSPACE/helios/target/pgo-candidate/helios-kernel.profdata"
-                --advisory --allow-busy-host)
+                --advisory --allow-busy-host --job-timeout-minutes 420)
           if [ -n "${{ inputs.iterations }}" ]; then
             args+=(--iterations "${{ inputs.iterations }}")
           fi

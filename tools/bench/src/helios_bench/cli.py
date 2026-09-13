@@ -62,6 +62,7 @@ def command_run(args: argparse.Namespace) -> int:
         helios_side_timeout_seconds=args.helios_side_timeout_seconds,
         skip_linux_workloads=tuple(args.skip_linux_workloads),
         linux_setup_timeout_seconds=args.linux_setup_timeout_seconds,
+        job_timeout_minutes=args.job_timeout_minutes,
         network=NetworkOptions(
             ifname=args.net_ifname,
             bridge=args.net_bridge,
@@ -222,6 +223,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="leave a workload out of the Linux side, by name",
     )
     run.add_argument("--linux-setup-timeout-seconds", type=int, default=5400)
+    run.add_argument(
+        "--job-timeout-minutes",
+        type=int,
+        default=None,
+        help=(
+            "the timeout-minutes of the job this run executes inside (bench-suite.yml "
+            "passes its own): the one retry of an inconclusive paired control is "
+            "skipped when a second pass would outlast what remains of it"
+        ),
+    )
     run.add_argument(
         "--baseline-ref",
         nargs="?",

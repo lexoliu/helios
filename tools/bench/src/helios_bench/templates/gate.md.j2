@@ -2,10 +2,10 @@
 
 #### {{ GATE_TITLES[result.kind] }}
 
-Baseline {{ result.baseline_label }}, candidate {{ result.candidate_label }}, noise floor {{ result.noise_floor | percent }}.
+Baseline {{ result.baseline_label }}, candidate {{ result.candidate_label }}, noise floor {{ result.noise_floor | percent }}{% if result.noise_retry %}{% if result.noise_retry.kind == "skipped-for-budget" %} — the first pass measured {{ result.noise_retry.first_noise_floor | percent }}, past the bound, and the one retry was skipped: a second pass would have outlasted the job's budget{% else %} on the retry pass — the first pass measured {{ result.noise_retry.first_noise_floor | percent }}, past the bound, so the suite ran once more on this host{% endif %}{% endif %}.
 {% if result.inconclusive %}
 
-**Inconclusive**: the noise floor exceeds the {{ result.floor_bound | percent }} bound the gate holds a single row's dispersion to. {% if result.control %}The control's median drifted {{ result.control.drift | percent }} between the boots before and after the suite on the `{{ result.control.side }}` side and its coefficient of variation reached {{ result.control.cv | percent }}, {% else %}No control workload ran, {% endif %}so this host hides any effect below the floor and no row below gets a verdict.{% if result.enforced %} The check fails; rerun the lane.{% endif %}
+**Inconclusive**: the noise floor exceeds the {{ result.floor_bound | percent }} bound the gate holds a single row's dispersion to. {% if result.noise_retry %}{% if result.noise_retry.kind == "skipped-for-budget" %}The one retry was skipped — the second pass would need {{ result.noise_retry.needed_seconds | seconds }} and {{ result.noise_retry.remaining_seconds | seconds }} remain of the job's budget — so the first pass's floor stands. {% else %}Twice over — {{ result.noise_retry.first_noise_floor | percent }} on the first pass and {{ result.noise_retry.second_noise_floor | percent }} on the retry — so the host could not produce a clean control two passes in a row. {% endif %}{% endif %}{% if result.control %}The control's median drifted {{ result.control.drift | percent }} between the boots before and after the suite on the `{{ result.control.side }}` side and its coefficient of variation reached {{ result.control.cv | percent }}, {% else %}No control workload ran, {% endif %}so this host hides any effect below the floor and no row below gets a verdict.{% if result.enforced %} The check fails; rerun the lane.{% endif %}
 {% endif %}
 {% if result.kind == GateKind.PAIRED %}
 Both columns were measured in this job on {{ result.candidate_host }}, the two images booted back to back for every workload: headline regressions block whether or not the report is publishable.
@@ -38,7 +38,7 @@ Measured on one side only, so uncompared: {% for unpaired in result.unpaired_met
 {% endif %}
 
 {% if result.inconclusive %}
-{% if result.enforced %}**Blocking: inconclusive** — {% else %}Inconclusive — {% endif %}the noise floor {{ result.noise_floor | percent }} is above the {{ result.floor_bound | percent }} bound, so this comparison measured the host and not the change.
+{% if result.enforced %}**Blocking: inconclusive** — {% else %}Inconclusive — {% endif %}the noise floor {{ result.noise_floor | percent }} is above the {{ result.floor_bound | percent }} bound{% if result.noise_retry %}{% if result.noise_retry.kind == "skipped-for-budget" %} and the retry was skipped for the job's budget ({{ result.noise_retry.needed_seconds | seconds }} needed, {{ result.noise_retry.remaining_seconds | seconds }} left){% else %} on the retry as well (the first pass measured {{ result.noise_retry.first_noise_floor | percent }}){% endif %}{% endif %}, so this comparison measured the host and not the change.
 {% elif result.blocking %}
 {% if result.incomplete_headlines %}
 **Blocking: incomplete paired evidence** — {{ result.incomplete_headlines | join(", ") }} has no comparable baseline/candidate pair (missing, failed, or rejected cell).
