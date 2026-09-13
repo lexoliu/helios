@@ -485,6 +485,13 @@ because there is nothing to draw it. The supervisor rebuilds the plugin
 after a short delay, it claims the devices again, and the desktop comes
 back with a fresh terminal.
 
+That rebuild is for a compositor that had a desktop and lost it. A
+machine that cannot hold one, because it has no display device or no
+input device, never starts the plugin: the kernel decides that once at
+boot from the devices the backend brought up, logs why, and
+`helios:system/surface` reports `unavailable` exactly as it does on an
+image that ships no compositor. A bench-lane boot is such a machine.
+
 Killing it is how that is shown:
 
 ```bash
