@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 from enum import StrEnum
 from pathlib import Path
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field
 
@@ -58,6 +59,48 @@ CLASS_LABELS = {
     WorkloadClass.FS: "File I/O",
     WorkloadClass.COMPUTE: "Compute parity",
 }
+
+
+class RetriedForNoise(BaseModel):
+    """The paired suite was measured once more because the first pass's
+    noise floor crossed the bound (#375): a noisy stretch says something
+    about that hour of the host and nothing about the next, so both
+    floors are kept and the second pass's is the one this report's
+    verdicts read."""
+
+    kind: Literal["retried"] = "retried"
+    first_noise_floor: float = Field(
+        description="the first pass's noise floor — the one that crossed cv_bound"
+    )
+    second_noise_floor: float = Field(
+        description="the retry pass's noise floor — the one this report's verdicts read"
+    )
+
+
+class RetrySkippedForBudget(BaseModel):
+    """The first pass's noise floor crossed the bound but the one retry
+    was not started: a second pass, estimated at the first pass's Helios
+    wall time, would have outlasted what remained of the job's
+    ``--job-timeout-minutes``. The report is the first pass's — still
+    inconclusive — and the two numbers are what the decision was made
+    from."""
+
+    kind: Literal["skipped-for-budget"] = "skipped-for-budget"
+    first_noise_floor: float = Field(
+        description="the first pass's noise floor — the one that crossed cv_bound"
+    )
+    needed_seconds: float = Field(
+        description="the first pass's Helios wall time — what a second pass was sized at"
+    )
+    remaining_seconds: float = Field(
+        description="what remained of the run's --job-timeout-minutes when the retry was weighed"
+    )
+
+
+#: What `RunInfo.noise_retry` carries: the retry either ran or it did
+#: not, and each outcome's shape has exactly the fields it can produce —
+#: an impossible combination has no representation.
+NoiseRetry = Annotated[RetriedForNoise | RetrySkippedForBudget, Field(discriminator="kind")]
 
 
 class RunInfo(BaseModel):
@@ -114,6 +157,14 @@ class RunInfo(BaseModel):
     reconfirmed: list[str] = Field(
         default_factory=list,
         description="headline workloads timed again on both images after the first pair of boots regressed",
+    )
+    noise_retry: NoiseRetry | None = Field(
+        default=None,
+        description=(
+            "the paired suite was measured once more because the first pass's noise floor "
+            "crossed the bound (#375); None when the first pass was readable or the run "
+            "was not paired"
+        ),
     )
     kernel_profile: str | None = Field(
         default=None,
