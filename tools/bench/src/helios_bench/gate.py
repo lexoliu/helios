@@ -135,6 +135,15 @@ SAMPLE_COUNT_SUFFIX = "_samples"
 
 PERCENTILE = re.compile(r"_p(?P<digits>\d{2,})$")
 
+#: The share of a column's kernel functions its profile may leave
+#: uncovered before the column stops being the profiled image a paired
+#: comparison is between. A collection from the commit it covers leaves
+#: about 1.7–1.8% uncovered — 478 of 27,615 on run 34737497450, 501 of
+#: about 27,500 on the week's pairs — and a candidate built against a
+#: profile collected from another commit left 12–15%; the bound sits
+#: between the two classes (#384).
+UNDERPROFILED_SHARE = 0.05
+
 
 def statistic_of(name: str) -> str:
     """The metric name with its unit suffix removed."""
@@ -275,19 +284,34 @@ class GateResult:
     rows: list[GateRow]
     incomplete_headlines: list[str]
     unpaired_metrics: list[UnpairedMetric]
+    #: The `(uncovered, functions)` each column's profile-use build
+    #: recorded beside its kernel, keyed by the column's name — what
+    #: `underprofiled` was computed from and what its reason names. A
+    #: column whose build kept no list — the plain control above all —
+    #: has no entry.
+    pgo_uncovered: dict[str, tuple[int, int]]
+    #: The columns whose kernel profile covered nothing about more than
+    #: `UNDERPROFILED_SHARE` of the image's functions. A column past the
+    #: bound was built against a profile that does not describe its
+    #: commit, so it is not the profiled image the pairing is between and
+    #: the comparison is inconclusive (#384).
+    underprofiled: list[str]
     blocking: bool
     enforced: bool
 
     @property
     def inconclusive(self) -> bool:
-        """The host could not resolve the comparison.
+        """The run cannot resolve the comparison.
 
         The floor is what the control workload says the machine moved by
         during the run. Past the bound the gate holds a single row's
-        dispersion to, that movement hides any effect a change could have,
-        so no row gets a verdict: the run is rerun, not read.
+        dispersion to, that movement hides any effect a change could have;
+        and a column whose profile left more than `UNDERPROFILED_SHARE` of
+        the kernel uncovered is not the profiled image the pairing is
+        between. Either way no row gets a verdict: the run is rerun, not
+        read.
         """
-        return self.noise_floor > self.floor_bound
+        return self.noise_floor > self.floor_bound or bool(self.underprofiled)
 
     @property
     def regressions(self) -> list[GateRow]:
@@ -479,16 +503,40 @@ def noise_floor(*reports: Report) -> float:
     return max((report.control.noise_floor if report.control else 0.0) for report in reports)
 
 
-def blocks(enforced: bool, floor: float, bound: float, incomplete: list[str], rows: list[GateRow]) -> bool:
+def kernel_profile_coverage(
+    columns: Iterable[tuple[Column, int | None, int | None]],
+) -> dict[str, tuple[int, int]]:
+    """The (uncovered, functions) counts each column's build recorded.
+
+    Only columns whose build kept a list appear: a plain `release` control
+    reads no profile and records none, and a zero denominator is no
+    denominator.
+    """
+    return {
+        column.value: (uncovered, functions)
+        for column, uncovered, functions in columns
+        if uncovered is not None and functions
+    }
+
+
+def blocks(
+    enforced: bool,
+    floor: float,
+    bound: float,
+    incomplete: list[str],
+    rows: list[GateRow],
+    underprofiled: list[str],
+) -> bool:
     """Whether an enforced comparison fails the check.
 
     A floor past the bound blocks before any row is read: the host was too
     noisy to measure the change, and a green check on such a run would let
-    a real regression through as noise.
+    a real regression through as noise. An under-profiled column blocks
+    the same way: what ran is not the comparison the table answers.
     """
     if not enforced:
         return False
-    if floor > bound:
+    if floor > bound or underprofiled:
         return True
     return bool(incomplete) or any(row.regression and row.headline for row in rows)
 
@@ -542,7 +590,11 @@ def evaluate(baseline: Report, candidate: Report) -> GateResult:
         rows=rows,
         incomplete_headlines=[],
         unpaired_metrics=unpaired,
-        blocking=blocks(enforced, floor, bound, [], rows),
+        # The under-profiled refusal is the paired instrument's: it is the
+        # run that was asked to collect a profile per column (#384).
+        pgo_uncovered={},
+        underprofiled=[],
+        blocking=blocks(enforced, floor, bound, [], rows, []),
         enforced=enforced,
     )
 
@@ -618,6 +670,34 @@ def evaluate_paired(candidate: Report) -> GateResult | None:
         pairs.append((workload, base_cell, cand_cell))
     bound = candidate.thresholds.cv_bound
     rows, unpaired = gate_rows(pairs, floor, bound)
+    # What each column's profile covered of its own kernel decides whether
+    # the comparison is the one it claims: a column built against a
+    # profile collected from another commit is not the profiled image the
+    # pairing is between, and the verdict cannot separate the change's
+    # effect from the stale profile's (#384). The rule is the commit
+    # pairing's — two commits, each owed a profile of its own. A pairing
+    # of one commit against itself varies the profile on purpose: the
+    # fetched profile against this run's collection (`suite-pgo`), where
+    # an under-profiled column is the measurement, not a fault in it.
+    pgo_uncovered = kernel_profile_coverage(
+        [
+            (
+                Column.BASELINE,
+                candidate.run.baseline_kernel_pgo_uncovered,
+                candidate.run.baseline_kernel_pgo_functions,
+            ),
+            (
+                Column.CANDIDATE,
+                candidate.run.kernel_pgo_uncovered,
+                candidate.run.kernel_pgo_functions,
+            ),
+        ]
+    )
+    underprofiled = [
+        name
+        for name, (uncovered, functions) in pgo_uncovered.items()
+        if candidate.run.baseline_ref is not None and uncovered / functions > UNDERPROFILED_SHARE
+    ]
     return GateResult(
         kind=GateKind.PAIRED,
         lane=candidate.run.lane,
@@ -654,7 +734,9 @@ def evaluate_paired(candidate: Report) -> GateResult | None:
         rows=rows,
         incomplete_headlines=incomplete_headlines,
         unpaired_metrics=unpaired,
-        blocking=blocks(True, floor, bound, incomplete_headlines, rows),
+        pgo_uncovered=pgo_uncovered,
+        underprofiled=underprofiled,
+        blocking=blocks(True, floor, bound, incomplete_headlines, rows, underprofiled),
         enforced=True,
     )
 
