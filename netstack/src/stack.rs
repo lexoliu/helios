@@ -751,6 +751,23 @@ pub enum TcpReadIntoState {
     Closed(TcpCloseKind),
 }
 
+/// The send-side twin of [`TcpReadState`]: what a probe of a socket's
+/// send path found.
+///
+/// `Pending` is the one answer that changes without the connection
+/// ending — the transmit queue is full and the next drain frees it, so
+/// a waiter parks. `Room` carries the bytes a write may queue right
+/// now. `Closed` is every state that can no longer send — including the
+/// FIN this side's `tcp_shutdown_send` queued — and carries how the
+/// connection got there, so a caller reports a reset differently from a
+/// local close.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TcpSendState {
+    Pending,
+    Room(usize),
+    Closed(TcpCloseKind),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StackEvent {
     DhcpConfigured(DhcpLease),
@@ -3334,11 +3351,28 @@ where
     }
 
     pub fn tcp_send_ready(&self, socket: SocketId) -> Result<bool, StackError> {
+        Ok(matches!(self.tcp_send_room(socket)?, TcpSendState::Room(_)))
+    }
+
+    /// What `socket`'s send side does with a write right now.
+    ///
+    /// `Pending` is a live connection whose transmit queue is full —
+    /// the answer a waiter parks behind. `Room` is the byte count the
+    /// queue takes. `Closed` is every state that can no longer send, so
+    /// a caller parked on the answer wakes and reports the close instead
+    /// of sleeping through it: `send_capacity_bytes` alone reports queue
+    /// room on a dead socket and cannot be the probe.
+    pub fn tcp_send_room(&self, socket: SocketId) -> Result<TcpSendState, StackError> {
         let socket = self.tcp_socket(socket)?;
-        Ok(matches!(
-            socket.state(),
-            crate::TcpState::Established | crate::TcpState::CloseWait
-        ) && socket.send_capacity_bytes() != 0)
+        Ok(match socket.state() {
+            crate::TcpState::Established | crate::TcpState::CloseWait => {
+                match socket.send_capacity_bytes() {
+                    0 => TcpSendState::Pending,
+                    room => TcpSendState::Room(room),
+                }
+            }
+            _ => TcpSendState::Closed(tcp_send_termination(socket)),
+        })
     }
 
     /// Report whether `socket` has a datagram waiting, without dequeuing it.
@@ -6529,6 +6563,37 @@ where
         | crate::TcpState::Established
         | crate::TcpState::FinWait1
         | crate::TcpState::FinWait2 => None,
+    }
+}
+
+/// The close kind a send-side probe reports, for a socket that can no
+/// longer send.
+///
+/// Unlike [`tcp_read_termination`] this is total: every state outside
+/// `Established`/`CloseWait` answers `Closed` to a write, and the kind
+/// says how it got there. `FinWait1`/`FinWait2`/`Closing`/`LastAck`/
+/// `TimeWait` are the orderly close either side walked; a socket that
+/// never established — `Listen`, `SynSent`, `SynReceived` — has no close
+/// to record and reports `Graceful`, the same end the send side reads
+/// as locally finished.
+fn tcp_send_termination<C>(socket: &TcpSocket<C>) -> TcpCloseKind
+where
+    C: CongestionControl,
+{
+    match socket.state() {
+        crate::TcpState::FinWait1
+        | crate::TcpState::FinWait2
+        | crate::TcpState::Closing
+        | crate::TcpState::LastAck
+        | crate::TcpState::TimeWait => TcpCloseKind::Graceful,
+        crate::TcpState::Closed => socket
+            .close_kind()
+            .unwrap_or_else(|| panic!("TCP socket reached Closed without recording why it closed")),
+        crate::TcpState::Listen
+        | crate::TcpState::SynSent
+        | crate::TcpState::SynReceived
+        | crate::TcpState::Established
+        | crate::TcpState::CloseWait => TcpCloseKind::Graceful,
     }
 }
 

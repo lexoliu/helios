@@ -37,8 +37,8 @@ use helios_netstack::{
     RxDrain, RxFrame, SegmentationOffload, Stack, StackConfig, StackError, StackEvent,
     StackInstant, TcpCloseKind, TcpConnectState, TcpConnectTerminalError, TcpEndpoint,
     TcpListenBacklog, TcpPacket, TcpReadIntoState, TcpReadState, TcpReceiveDiagnostics,
-    TcpStackCounters, UdpEgress, UdpEndpoint, UdpPacket, UdpPayload, UdpSocketBinding,
-    UdpSocketError, flow_hash,
+    TcpSendState, TcpStackCounters, UdpEgress, UdpEndpoint, UdpPacket, UdpPayload,
+    UdpSocketBinding, UdpSocketError, flow_hash,
 };
 use spin::{Mutex as SpinMutex, RwLock as SpinRwLock};
 
@@ -48,8 +48,8 @@ use crate::{
     Ipv4Cidr as KernelIpv4Cidr, Ipv4Route as KernelIpv4Route, MacAddress, NetworkAdminBackend,
     NetworkBridgeRequest, NetworkControlError, NetworkErrorDetail, NetworkIpAddress, NetworkPortId,
     PingError, PingErrorKind, PingReply, ProfileSink, ProgressMark, ProgressSignal,
-    RegisteredTcpReadBuffer, TcpAccepted, TcpError, TcpErrorKind, TcpListener, Timer, UdpBinding,
-    UdpDatagram, UdpError, UdpErrorKind, UptimeClock,
+    RegisteredTcpReadBuffer, TcpAccepted, TcpError, TcpErrorKind, TcpListener, TcpReadProgress,
+    TcpWriteProgress, Timer, UdpBinding, UdpDatagram, UdpError, UdpErrorKind, UptimeClock,
 };
 use triomphe::Arc;
 
@@ -1456,6 +1456,7 @@ pub(crate) mod fixture {
         pub(crate) flags: TcpFlags,
         pub(crate) sequence: u32,
         pub(crate) acknowledgement: u32,
+        pub(crate) payload_len: usize,
     }
 
     pub(crate) struct EstablishedTcpFixture {
@@ -1471,8 +1472,8 @@ pub(crate) mod fixture {
         const PEER: Ipv4Address = Ipv4Address::new([192, 0, 2, 20]);
         const LOCAL_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 1];
         const PEER_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 2];
-        const LOCAL_PORT: u16 = 49_152;
-        const PEER_PORT: u16 = 80;
+        pub(crate) const LOCAL_PORT: u16 = 49_152;
+        pub(crate) const PEER_PORT: u16 = 80;
         /// This side's initial send sequence, so a test can predict the
         /// sequence its FIN or its reset carries.
         pub(crate) const LOCAL_SEQUENCE: u32 = 7;
@@ -1483,13 +1484,22 @@ pub(crate) mod fixture {
         /// frames already drained so the next segment on the wire is
         /// whatever the test produces.
         pub(crate) fn new() -> Self {
+            Self::with_interface(crate::test_support::RecordingNetworkInterface::new(1))
+        }
+
+        /// The same connection on an interface the test chose — one
+        /// built `accepting_transmissions` when the test reads the wire
+        /// rather than the stack's outbound queue.
+        pub(crate) fn with_interface(
+            device: crate::test_support::RecordingNetworkInterface,
+        ) -> Self {
             let cpu = crate::test_support::TestCpu::without_entropy();
             let service = NetworkService::new(
                 cpu,
                 crate::test_support::test_profile_sink(),
                 crate::test_support::test_uptime_clock(),
                 Timer::new(cpu),
-                crate::test_support::RecordingNetworkInterface::new(1),
+                device,
             );
             let fixture = Self {
                 service,
@@ -1578,8 +1588,9 @@ pub(crate) mod fixture {
             }
         }
 
-        /// Hands the peer's segment to the stack.
-        pub(crate) fn deliver(&self, header: TcpHeader, payload: &[u8]) {
+        /// The peer's segment as a wire frame, headers and payload
+        /// joined.
+        fn frame(&self, header: TcpHeader, payload: &[u8]) -> ([u8; ETHERNET_FRAME_BYTES], usize) {
             let mut frame = [0u8; ETHERNET_FRAME_BYTES];
             let mut offset = EthernetFrame::encode_header(
                 &mut frame,
@@ -1608,6 +1619,12 @@ pub(crate) mod fixture {
                 64,
             )
             .expect("the fixture IPv4 header should fit");
+            (frame, offset + tcp_len)
+        }
+
+        /// Hands the peer's segment to the stack.
+        pub(crate) fn deliver(&self, header: TcpHeader, payload: &[u8]) {
+            let (frame, len) = self.frame(header, payload);
             self.service
                 .inner
                 .state
@@ -1615,10 +1632,19 @@ pub(crate) mod fixture {
                 .lock()
                 .stack
                 .receive_frame(
-                    &frame[..offset + tcp_len],
+                    &frame[..len],
                     StackInstant::from_nanos(self.service.now_nanos()),
                 )
                 .expect("the fixture segment should be accepted");
+        }
+
+        /// The same segment arriving the way the device delivers one: in
+        /// the queue pair's ring with the completion event raised, where
+        /// the next network poll — not the test — dispatches it into the
+        /// shard.
+        pub(crate) fn deliver_rx(&self, header: TcpHeader, payload: &[u8]) {
+            let (frame, len) = self.frame(header, payload);
+            self.service.inner.device.deliver_on(0, &frame[..len]);
         }
 
         /// Drives the stack once and reports every TCP segment it
@@ -1649,6 +1675,7 @@ pub(crate) mod fixture {
                     flags: tcp.flags,
                     sequence: tcp.sequence,
                     acknowledgement: tcp.acknowledgement,
+                    payload_len: tcp.payload.len(),
                 });
             }
             segments
