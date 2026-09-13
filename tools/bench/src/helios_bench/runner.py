@@ -15,7 +15,9 @@ import platform
 import re
 import shlex
 import subprocess
-from dataclasses import dataclass, field
+import time
+from collections.abc import Callable
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -36,8 +38,24 @@ from helios_bench.manifest import (
     vendored_wasmtime_revision,
     wasmtime_linux_release,
 )
-from helios_bench.report import Hardware, Pins, Report, RunInfo, Side, Thresholds
-from helios_bench.sources import RawSide, read_control, read_optional_side
+from helios_bench.report import (
+    Control,
+    Hardware,
+    NoiseRetry,
+    Pins,
+    Report,
+    RetriedForNoise,
+    RetrySkippedForBudget,
+    RunInfo,
+    Side,
+    Thresholds,
+)
+from helios_bench.sources import (
+    SIDE_CONTROL_JSONL,
+    RawSide,
+    read_control,
+    read_optional_side,
+)
 from helios_bench.wasi_apps import workload_runner
 from helios_bench.workloads import load_workloads, select_workloads
 
@@ -50,6 +68,7 @@ HELIOS_OUT = "helios"
 HELIOS_BASELINE_OUT = "helios-baseline"
 RETAKE_OUT = "retake"
 RECONFIRM_OUT = "reconfirm"
+RETRY_OUT = "retry"
 LINUX_OUT = "linux"
 LINUX_SIDES = {Side.LINUX_NATIVE, Side.LINUX_WASMTIME}
 # The cargo profiles a Helios image of a run can be built with, as the
@@ -107,6 +126,13 @@ class RunOptions:
     # runs, so an uncomparable one takes its share from the rest.
     skip_linux_workloads: tuple[str, ...] = ()
     linux_setup_timeout_seconds: int = 5400
+    # The timeout of the job this run executes inside, in minutes —
+    # `bench-suite.yml` passes its own `timeout-minutes`. The one retry of
+    # an inconclusive paired control is sized against it: a second pass
+    # that would outlast what remains is skipped rather than killed
+    # mid-flight, and the run record says so. None bounds nothing: a local
+    # run has no job to outlast.
+    job_timeout_minutes: int | None = None
     network: NetworkOptions = NetworkOptions()
     # The second Helios image this run is timed against, or None for an
     # ordinary run. Its presence adds the `helios_baseline` side and makes
@@ -175,6 +201,10 @@ class PlannedCommand:
     argv: list[str]
     env: dict[str, str]
     cwd: Path
+    #: Whether this invocation is the suite's Helios pass — the one the
+    #: retry of an inconclusive paired control repeats, whose wall time is
+    #: the estimate that retry is sized against.
+    helios_pass: bool = False
 
     def shell(self) -> str:
         exports = " ".join(f"{key}={shlex.quote(value)}" for key, value in sorted(self.env.items()))
@@ -223,7 +253,11 @@ def driver_arguments(options: RunOptions, iterations: int, workloads: list[dict]
 
 
 def helios_command(
-    options: RunOptions, common: list[str], out_root: Path, description: str
+    options: RunOptions,
+    common: list[str],
+    out_root: Path,
+    description: str,
+    helios_pass: bool = False,
 ) -> PlannedCommand:
     """The driver invocation that times the Helios image, and the baseline
     image beside it when the run is paired, under ``out_root``."""
@@ -258,6 +292,7 @@ def helios_command(
         ],
         env=env,
         cwd=REPO_ROOT,
+        helios_pass=helios_pass,
     )
 
 
@@ -276,7 +311,15 @@ def plan(options: RunOptions, manifest: Manifest, workloads: list[dict]) -> list
         )
     common = driver_arguments(options, iterations, workloads, control=True)
     if Side.HELIOS in options.sides:
-        commands.append(helios_command(options, common, options.out_dir, "time every workload on Helios"))
+        commands.append(
+            helios_command(
+                options,
+                common,
+                options.out_dir,
+                "time every workload on Helios",
+                helios_pass=True,
+            )
+        )
     if options.sides & LINUX_SIDES:
         commands.append(
             PlannedCommand(
@@ -715,6 +758,114 @@ def reconfirm(
     )
 
 
+def retry(
+    options: RunOptions,
+    iterations: int,
+    workloads: list[dict],
+    report: Report,
+    first_sides: dict[Side, RawSide],
+    thresholds: Thresholds,
+    build: Callable[[dict[Side, RawSide], Control | None, list[str], list[str], NoiseRetry | None], Report],
+    helios_seconds: float,
+    run_started: float,
+) -> Report | None:
+    """Measures the paired suite a second time when the first pass's control is unreadable.
+
+    An inconclusive control means the host moved by more than any effect a
+    change could show while the suite ran, so no row can take a verdict —
+    but one noisy stretch says nothing about the same machine an hour later,
+    and redispatching would only hope to draw a quieter one. The control
+    pair and the suite therefore run once more in the same job, on the same
+    host, under ``retry/`` beside the first pass; retake and reconfirm apply
+    to the second pass as they did to the first, and the report the gate
+    reads is the second pass's. One retry: a second pass still past the
+    bound is a host that could not produce a clean control twice, and the
+    run fails as it would have without one (#375). An unpaired run has no
+    paired verdict to retry and is never re-measured, and neither is a
+    first pass whose floor stayed under the bound.
+
+    The second pass re-runs only the Helios pair — the Linux sides'
+    first-pass cells stand — so a retry pass needs a baseline
+    (``--baseline-ref`` or ``--profile-use``) to compare, which every paired
+    run already has. When the run carries a ``--job-timeout-minutes`` the
+    retry is sized against it first: a second pass is estimated at the
+    first pass's Helios wall time (``helios_seconds``, measured against the
+    monotonic ``run_started``), and one that would outlast what the budget
+    has left is not started — the first pass's report stands, still
+    inconclusive, with a ``skipped-for-budget`` record on the run. And a retry
+    pass that comes back without the control pair it was asked to measure
+    is a failed pass, not a clean one: the run stops naming the side and
+    the files it expected rather than reporting a floor of zero.
+    """
+    result = evaluate_paired(report)
+    if result is None or not result.inconclusive:
+        return None
+    if options.job_timeout_minutes is not None:
+        remaining = options.job_timeout_minutes * 60 - (time.monotonic() - run_started)
+        if helios_seconds > remaining:
+            print(
+                f"the second pass would need {helios_seconds:.0f} s and "
+                f"{remaining:.0f} s remain of the job's budget; the run stays inconclusive",
+                flush=True,
+            )
+            return build(
+                first_sides,
+                report.control,
+                report.run.retaken,
+                report.run.reconfirmed,
+                RetrySkippedForBudget(
+                    first_noise_floor=result.noise_floor,
+                    needed_seconds=helios_seconds,
+                    remaining_seconds=remaining,
+                ),
+            )
+    retry_options = replace(
+        options,
+        out_dir=options.out_dir / RETRY_OUT,
+        sides=options.sides & HELIOS_SIDES,
+    )
+    execute(
+        helios_command(
+            retry_options,
+            driver_arguments(retry_options, iterations, workloads, control=True),
+            retry_options.out_dir,
+            "measure the control pair and every workload on both Helios images once more: "
+            f"the first pass's noise floor crossed the {result.floor_bound:.3f} bound",
+        )
+    )
+    second_sides = read_sides(retry_options, thresholds)
+    retaken = retake(retry_options, iterations, workloads, second_sides, thresholds)
+    controls = read_controls(retry_options, thresholds)
+    for side in sorted(retry_options.sides):
+        out_dir = retry_options.out_dir / SIDE_OUT[side]
+        pair = controls.get(side)
+        if pair is None:
+            raise SystemExit(
+                f"the retry pass produced no control pair for the {side} side: "
+                f"{out_dir / SIDE_CONTROL_JSONL[side].format(moment='before')} and "
+                f"{out_dir / SIDE_CONTROL_JSONL[side].format(moment='after')} were expected"
+            )
+        for moment, raw in (("before", pair[0]), ("after", pair[1])):
+            if report.control.workload not in raw.cells:
+                raise SystemExit(
+                    f"the retry pass's {side} side control at "
+                    f"{out_dir / SIDE_CONTROL_JSONL[side].format(moment=moment)} "
+                    f"recorded no `{report.control.workload}` cell"
+                )
+    control = build_control(report.control.workload, controls, thresholds)
+    for side, raw in first_sides.items():
+        second_sides.setdefault(side, raw)
+    record = RetriedForNoise(
+        first_noise_floor=result.noise_floor,
+        second_noise_floor=control.noise_floor,
+    )
+    second = build(second_sides, control, retaken, [], record)
+    reconfirmed = reconfirm(retry_options, iterations, second, second_sides, thresholds)
+    if reconfirmed:
+        second = build(second_sides, control, retaken, reconfirmed, record)
+    return second
+
+
 def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) -> Report | None:
     lane = options.lane
     deviations = host_deviations(lane)
@@ -746,6 +897,10 @@ def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) ->
             print(f"# {command.description}\n{command.shell()}")
         return None
 
+    # The monotonic clock the retry's budget check reads, started before
+    # the baseline is prepared and the first command runs: `started`
+    # below is the report's wall timestamp.
+    run_started = time.monotonic()
     if options.baseline is not None:
         # Before the clock starts: the worktree, the links it shares with
         # the candidate, and the build the driver then does are all fixed
@@ -754,8 +909,12 @@ def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) ->
 
     started = datetime.now(UTC).isoformat(timespec="seconds")
     options.out_dir.mkdir(parents=True, exist_ok=True)
+    helios_seconds = 0.0
     for command in commands:
+        before = time.monotonic()
         execute(command)
+        if command.helios_pass:
+            helios_seconds = time.monotonic() - before
     thresholds = thresholds_from(manifest, options.iterations)
     sides = read_sides(options, thresholds)
     retaken = retake(options, thresholds.iterations, workloads, sides, thresholds)
@@ -766,7 +925,13 @@ def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) ->
 
     candidate_profile, baseline_profile = kernel_profiles(options)
 
-    def build(reconfirmed: list[str]) -> Report:
+    def build(
+        sides: dict[Side, RawSide],
+        control: Control | None,
+        retaken: list[str],
+        reconfirmed: list[str],
+        noise_retry: NoiseRetry | None = None,
+    ) -> Report:
         finished = datetime.now(UTC).isoformat(timespec="seconds")
         # The uncovered/function counts each profile-use image's build
         # left beside its kernel; None where the build kept no list.
@@ -819,6 +984,7 @@ def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) ->
             baseline_kernel_pgo_functions=(baseline_uncovered[1] if baseline_uncovered is not None else None),
             retaken=retaken,
             reconfirmed=reconfirmed,
+            noise_retry=noise_retry,
         )
         return assemble_report(
             workloads=workloads,
@@ -830,8 +996,19 @@ def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) ->
             thresholds=thresholds,
         )
 
-    report = build([])
+    report = build(sides, control, retaken, [])
     reconfirmed = reconfirm(options, thresholds.iterations, report, sides, thresholds)
     if reconfirmed:
-        report = build(reconfirmed)
-    return report
+        report = build(sides, control, retaken, reconfirmed)
+    retried = retry(
+        options,
+        thresholds.iterations,
+        workloads,
+        report,
+        sides,
+        thresholds,
+        build,
+        helios_seconds,
+        run_started,
+    )
+    return retried or report

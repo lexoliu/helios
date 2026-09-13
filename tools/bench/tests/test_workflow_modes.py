@@ -67,6 +67,7 @@ def run_arguments(
         "runner.name": "test-runner",
         "inputs.iterations": "11",
         "matrix.net-backend": "user",
+        "steps.lane.outputs.net-backend": "user",
     }
     script = re.sub(r"\$\{\{(.*?)\}\}", lambda match: expressions[match[1].strip()], script)
     invocation = 'uv run helios-bench "${args[@]}"'
@@ -84,6 +85,7 @@ def run_arguments(
             "BENCH_BASELINE_REF": baseline,
             "BENCH_PAIRED_ACCEPTANCE": paired,
             "BENCH_BASELINE_KERNEL_BUILD": baseline_kernel_build,
+            "BENCH_LANE": "x86-64-kvm",
         },
     )
     return result.stdout.splitlines()
@@ -102,6 +104,30 @@ def test_suite_preserves_workloads_and_pairing(jobs, tmp_path: Path, paired):
         assert arguments[arguments.index("--sides") + 1] == "helios,helios_baseline"
     else:
         assert "--sides" not in arguments
+
+
+@pytest.mark.parametrize(
+    ("job", "step_name"),
+    [
+        ("suite", "Run the suite"),
+        ("suite-pgo", "Time the profile-guided kernel against the plain one"),
+    ],
+)
+def test_the_retry_budget_is_the_job_timeout(jobs, tmp_path, job, step_name):
+    """`--job-timeout-minutes` is the same literal as the job's
+    `timeout-minutes`: the one retry of an inconclusive paired control is
+    sized against what remains of the job it runs in, so the two cannot
+    drift."""
+    step = next(step for step in jobs[job]["steps"] if step.get("name") == step_name)
+    if job == "suite":
+        # The step runs only when tcp_probe is off, which is when the
+        # job's timeout expression resolves to its second arm: 420 minutes.
+        assert step["if"] == "${{ !inputs.tcp_probe }}"
+        assert jobs[job]["timeout-minutes"] == "${{ inputs.tcp_probe && 40 || 420 }}"
+    else:
+        assert str(jobs[job]["timeout-minutes"]) == "420"
+    arguments = run_arguments(step["run"], tmp_path, "true")
+    assert arguments[arguments.index("--job-timeout-minutes") + 1] == "420"
 
 
 @pytest.mark.parametrize(("build", "asked"), [("profile-use", False), ("release", True)])
