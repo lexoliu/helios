@@ -820,12 +820,14 @@ enum KernelBuildProfile {
     Debug,
     /// `kernel-debug`: debuginfo and unstripped symbols for GDB and LLDB.
     KernelDebug,
-    /// `release`.
+    /// `kernel-release`: the optimised image, `release` plus fat LTO and
+    /// one codegen unit (`Cargo.toml`). The host tools built beside it
+    /// stay on `release`; [`Self::host`] is that distinction.
     Release,
-    /// `profile-generate`: release plus `-C profile-generate`, the image a
-    /// PGO collection boots (docs/pgo.md).
+    /// `profile-generate`: `kernel-release` plus `-C profile-generate`,
+    /// the image a PGO collection boots (docs/pgo.md).
     ProfileGenerate,
-    /// `profile-use`: release plus `-C profile-use`, the image a
+    /// `profile-use`: `kernel-release` plus `-C profile-use`, the image a
     /// collected profile optimises (docs/pgo.md). The profile itself is
     /// named by [`KernelBuildSpec::profile_use`]: a build kind says what
     /// kind of build it is, and two PGO kernels from two profiles are the
@@ -839,7 +841,7 @@ impl KernelBuildProfile {
         match self {
             Self::Debug => "debug",
             Self::KernelDebug => "kernel-debug",
-            Self::Release => "release",
+            Self::Release => "kernel-release",
             Self::ProfileGenerate => "profile-generate",
             Self::ProfileUse => "profile-use",
         }
@@ -869,15 +871,50 @@ impl KernelBuildProfile {
     }
 
     /// The profile the host tools built alongside the guest use. They are
-    /// never instrumented — nothing profiles the inspector — and they are
-    /// found next to the running binary, so they stay in the two
-    /// directories a host build ever uses.
-    fn host(self) -> Self {
+    /// never instrumented — nothing profiles the inspector — and never
+    /// whole-program optimised — nothing times it — so they stay in the
+    /// two directories a host build ever uses.
+    fn host(self) -> HostBuildProfile {
         if self.optimised() {
-            Self::Release
+            HostBuildProfile::Release
         } else {
-            Self::Debug
+            HostBuildProfile::Debug
         }
+    }
+}
+
+/// Which build of the host tools (`helios-cli`, `helios-inspector`) a
+/// kernel build compiles beside the image.
+///
+/// A type of its own rather than two of [`KernelBuildProfile`]'s variants,
+/// because the two do not share a cargo profile: the kernel's optimised
+/// build is `kernel-release`, and a host tool asked to build under it
+/// would pay a fat-LTO link on every check for no measurement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostBuildProfile {
+    /// Cargo's `dev` profile.
+    Debug,
+    /// Cargo's `release` profile.
+    Release,
+}
+
+impl HostBuildProfile {
+    /// The `target/` subdirectory the tools land in.
+    fn directory(self) -> &'static str {
+        match self {
+            Self::Debug => "debug",
+            Self::Release => "release",
+        }
+    }
+
+    /// The cargo invocation that builds a host tool under this profile.
+    fn cargo_build_command(self, repo_root: &Path) -> Command {
+        let mut command = Command::new("cargo");
+        command.current_dir(repo_root).arg("build");
+        if self == Self::Release {
+            command.arg("--release");
+        }
+        command
     }
 }
 
@@ -1410,8 +1447,8 @@ pub(crate) struct VmCommand {
     /// Build the `--release` kernel of a target whose release builds read
     /// the fetched kernel profile without one: the plain control of a
     /// profile-guided measurement (docs/pgo.md, #322). It lands in the
-    /// `release` directory, where a plain build of any other target
-    /// lands. Asking for it on a target that reads no profile is refused,
+    /// `kernel-release` directory, where a plain build of any other
+    /// target lands. Asking for it on a target that reads no profile is refused,
     /// because there the control and the candidate are one build.
     #[arg(
         long,
@@ -2651,7 +2688,10 @@ fn build_vm(command: &KernelBuildSpec) -> Result<(), VmBuildError> {
     let repo_root = repo_root()?;
     run_step(
         "building helios-cli",
-        cargo_build_command(&repo_root, command.kind.host())
+        command
+            .kind
+            .host()
+            .cargo_build_command(&repo_root)
             .arg("-p")
             .arg("helios-cli"),
     )?;
@@ -2685,7 +2725,10 @@ fn build_vm(command: &KernelBuildSpec) -> Result<(), VmBuildError> {
     }
     run_step(
         "building inspector",
-        cargo_build_command(&repo_root, command.kind.host())
+        command
+            .kind
+            .host()
+            .cargo_build_command(&repo_root)
             .arg("-p")
             .arg("helios-inspector"),
     )?;
@@ -2701,7 +2744,7 @@ fn cargo_build_command(repo_root: &Path, build: KernelBuildProfile) -> Command {
             command.arg("--profile").arg("kernel-debug");
         }
         KernelBuildProfile::Release => {
-            command.arg("--release");
+            command.arg("--profile").arg("kernel-release");
         }
         KernelBuildProfile::ProfileGenerate => {
             command.arg("--profile").arg("profile-generate");
@@ -4155,7 +4198,7 @@ fn discover_helios_cli(kind: KernelBuildProfile) -> Result<PathBuf, ToolDiscover
 /// Where [`build_vm`] leaves the `helios-cli` a build of `kind` needs.
 ///
 /// One expression, so the build and the lookup cannot disagree about the
-/// profile: `cargo_build_command` compiles it under `kind.host()`, and
+/// profile: [`build_vm`] compiles it under `kind.host()`, and
 /// this names the directory that profile writes into.
 fn workspace_helios_cli(root: &Path, kind: KernelBuildProfile) -> PathBuf {
     root.join("target")
@@ -7402,7 +7445,11 @@ mod tests {
         let command = watchdog_test_command(arch);
         run_step(
             "building helios-cli",
-            cargo_build_command(&repo_root()?, command.build.kind.host())
+            command
+                .build
+                .kind
+                .host()
+                .cargo_build_command(&repo_root()?)
                 .arg("-p")
                 .arg("helios-cli"),
         )?;
