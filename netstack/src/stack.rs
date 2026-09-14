@@ -12217,6 +12217,41 @@ mod tests {
             .take_outbound()
             .expect("handshake ACK frame should be queued");
 
+        // The first TCP_QUICKACK_SEGMENTS inbound data segments are
+        // answered at once; the segment under measurement has to arrive
+        // past that window to belong to the delayed-ACK timer. The owed
+        // acknowledgements collapse into one pure ACK on the next drive.
+        let mut sequence = 101u32;
+        for _ in 0..crate::tcp::TCP_QUICKACK_SEGMENTS {
+            let (segment, segment_len) = tcp_segment_with_payload(
+                peer,
+                local,
+                TcpHeader {
+                    source_port: 80,
+                    destination_port: 49152,
+                    sequence,
+                    acknowledgement: 8,
+                    flags: TcpFlags::ACK,
+                    window_size: u16::MAX,
+                },
+                b"x",
+            );
+            stack
+                .receive_tcp(
+                    IpAddress::Ipv4(peer),
+                    IpAddress::Ipv4(local),
+                    &Bytes::copy_from_slice(&segment[..segment_len]),
+                    RxFrameOffload::none(),
+                    StackInstant::from_nanos(1),
+                )
+                .expect("quick-ack window segment should be accepted");
+            sequence += 1;
+        }
+        stack
+            .drive_tcp(StackInstant::from_nanos(1))
+            .expect("the window's owed ACK should be queued");
+        while stack.take_outbound().is_some() {}
+
         let payload = [0u8; crate::tcp::TCP_RECEIVE_SEGMENT_BYTES];
         let received_at = 2;
         let (request, request_len) = tcp_segment_with_payload(
@@ -12225,7 +12260,7 @@ mod tests {
             TcpHeader {
                 source_port: 80,
                 destination_port: 49152,
-                sequence: 101,
+                sequence,
                 acknowledgement: 8,
                 flags: TcpFlags::ACK,
                 window_size: u16::MAX,
