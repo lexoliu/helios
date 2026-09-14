@@ -348,9 +348,10 @@ Wasmtime's cross-platform Firefox-profiler JSON.
 ## Run In Helios (RISC-V VM)
 
 Use inspector `vm` mode when checking RISC-V-specific behavior. Use
-`--release` when the VM command should rebuild the guest kernel plus
-embedded user-space programs (`init`, `debugger`) in release mode before
-boot. CPython needs substantial guest memory; pass `--memory 2G`.
+`--release` when the VM command should rebuild the guest kernel and the
+`helios-bootfs` payload's user-space programs (`init`, `debugger`) in
+release mode before boot. CPython needs substantial guest memory; pass
+`--memory 2G`.
 
 ```bash
 cargo run -p helios-inspector -- vm --arch riscv64 --memory 2G \
