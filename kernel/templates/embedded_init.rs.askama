@@ -1,4 +1,4 @@
-pub const EMBEDDED_INIT: Option<EmbeddedInitDescriptor> = Some(EmbeddedInitDescriptor {
+pub static EMBEDDED_INIT: Option<EmbeddedInitDescriptor> = Some(EmbeddedInitDescriptor {
     component: EmbeddedComponent::new(
         r#"{{ name }}"#,
         include_bytes!(r#"{{ component }}"#),
