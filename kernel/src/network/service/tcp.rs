@@ -888,7 +888,6 @@ where
         let now = StackInstant::from_nanos(self.now_nanos());
         let read = self.inner.state.with_handle_receive_drain(
             stream,
-            &self.inner.cpu,
             self.inner.device.queue_pair_count().max(1),
             |state| state.poll_tcp_read(stream, max_bytes, now),
         )?;
@@ -906,7 +905,6 @@ where
         let now = StackInstant::from_nanos(self.now_nanos());
         let read = self.inner.state.with_handle_receive_drain(
             stream,
-            &self.inner.cpu,
             self.inner.device.queue_pair_count().max(1),
             |state| state.poll_tcp_read_into(stream, buffer, now),
         )?;
@@ -1392,13 +1390,11 @@ where
                 dispatch_started,
                 received_batch,
             );
-            // Every shard that took a frame is released here, and the
-            // processor that owns it is pulled out of its idle park when
-            // this is not that processor. Without this a reply demuxed
-            // into a foreign shard would sit there until its waiter's own
-            // deadline expired.
+            // Every shard that took a frame is released here. Without
+            // this a reply demuxed into a foreign shard would sit there
+            // until its waiter's own deadline expired.
             let signal_started = self.profile_start();
-            self.inner.state.notify_arrivals(&arrivals, &self.inner.cpu);
+            self.inner.state.notify_arrivals(&arrivals);
             self.record_network_profile_events(
                 source.rx_signal_phase(),
                 signal_started,
@@ -1461,7 +1457,6 @@ where
             tcp_read_started = self.profile_start();
             tcp_read = Some(self.inner.state.with_handle_receive_drain(
                 probe.stream,
-                &self.inner.cpu,
                 pair_count,
                 |state| state.poll_tcp_read(probe.stream, probe.max_bytes, now),
             ));

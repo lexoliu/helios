@@ -1339,7 +1339,7 @@ where
     /// `Drop` that retires a handle has nothing left to do (#231).
     fn wake_packet_pump(&self, shard_idx: usize) {
         let pair = shard_idx % self.inner.device.queue_pair_count().max(1);
-        self.inner.state.raise_shard_progress(pair, &self.inner.cpu);
+        self.inner.state.raise_shard_progress(pair);
     }
 
     /// Wakes every pair's packet pump, for a close whose queued
@@ -1352,7 +1352,7 @@ where
             .shard_count()
             .min(self.inner.device.queue_pair_count().max(1));
         for pair in 0..pumps {
-            self.inner.state.raise_shard_progress(pair, &self.inner.cpu);
+            self.inner.state.raise_shard_progress(pair);
         }
     }
 
@@ -2832,16 +2832,16 @@ mod tests {
             }
             _ => panic!("the owning shard should have taken the reply"),
         }
-        state.notify_arrivals(&arrivals, &cpu);
+        state.notify_arrivals(&arrivals);
 
         assert!(
             block_on(poll_once(parked)).is_some(),
             "the foreign drain must release the wait, not its deadline"
         );
-        assert_eq!(
-            cpu.woken(),
-            alloc::vec![helios_hal::cpu::ProcessorId::new(1)],
-            "the owning processor must be pulled out of its idle park"
+        assert!(
+            cpu.woken().is_empty(),
+            "the signal wakes no processor by itself: the parked task's own \
+             scheduler sends the IPI when it is woken"
         );
         assert!(
             state
@@ -2933,7 +2933,7 @@ mod tests {
                 }
                 _ => panic!("the owning shard should have taken the segment"),
             }
-            state.notify_arrivals(&arrivals, &cpu);
+            state.notify_arrivals(&arrivals);
         };
 
         deliver(
@@ -2988,9 +2988,10 @@ mod tests {
             "the foreign drain must release the reader, not its deadline"
         );
         assert_eq!(
-            cpu.woken()[woken_before_reply..],
-            [helios_hal::cpu::ProcessorId::new(1)],
-            "the owning processor must be pulled out of its idle park"
+            cpu.woken().len(),
+            woken_before_reply,
+            "the signal wakes no processor by itself: the parked task's own \
+             scheduler sends the IPI when it is woken"
         );
         assert!(
             matches!(
@@ -3317,7 +3318,7 @@ mod tests {
         // The application reads. Nothing else can make room, so this is
         // the whole event the pump is waiting for.
         let read = state
-            .with_handle_receive_drain(stream, &cpu, 2, |shard| {
+            .with_handle_receive_drain(stream, 2, |shard| {
                 shard.poll_tcp_read(stream, SEGMENT_BYTES, StackInstant::from_nanos(1_000))
             })
             .expect("the queued data should read");
@@ -3331,10 +3332,10 @@ mod tests {
             block_on(poll_once(parked)).is_some(),
             "the drain must release the pump's park, not the DHCP retransmit timer"
         );
-        assert_eq!(
-            cpu.woken(),
-            alloc::vec![helios_hal::cpu::ProcessorId::new(1)],
-            "the shard's owning processor must be pulled out of its idle park"
+        assert!(
+            cpu.woken().is_empty(),
+            "the signal wakes no processor by itself: the parked pump's own \
+             scheduler sends the IPI when it is woken"
         );
 
         // A read that relieves nothing raises nothing: the signal is a
@@ -3342,7 +3343,7 @@ mod tests {
         let wait = state.shard_wait(owner);
         let mut parked = core::pin::pin!(state.arrival_for(wait.target).changed(wait.mark));
         let read = state
-            .with_handle_receive_drain(stream, &cpu, 2, |shard| {
+            .with_handle_receive_drain(stream, 2, |shard| {
                 shard.poll_tcp_read(stream, SEGMENT_BYTES, StackInstant::from_nanos(1_001))
             })
             .expect("the rest of the queued data should read");
@@ -4047,7 +4048,7 @@ mod tests {
         assert_eq!(arrivals.iter().collect::<Vec<_>>(), alloc::vec![2, 0]);
 
         let marks: Vec<_> = (0..4).map(|idx| (idx, state.shard_wait(idx))).collect();
-        state.notify_arrivals(&arrivals, &cpu);
+        state.notify_arrivals(&arrivals);
 
         for (shard_idx, wait) in marks {
             let touched = arrivals.iter().any(|idx| idx == shard_idx);
@@ -4058,11 +4059,10 @@ mod tests {
                 "only a shard that took a frame is released"
             );
         }
-        // Shard 0 is this processor's own, so only shard 2 costs an IPI.
-        assert_eq!(
-            cpu.woken(),
-            alloc::vec![helios_hal::cpu::ProcessorId::new(2)]
-        );
+        // No signal costs an IPI of its own: the tasks it releases are
+        // scheduled onto their processors, and that is where the wake
+        // is sent.
+        assert!(cpu.woken().is_empty());
     }
 
     /// A replicated bind exists on every shard, and an ICMPv6 Packet

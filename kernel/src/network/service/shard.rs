@@ -749,19 +749,6 @@ impl NetworkShardSet {
         &self.shards[idx].arrival
     }
 
-    /// The processor whose executor owns `idx`'s work.
-    ///
-    /// The inverse of [`Self::shard_idx_for_processor`] for the
-    /// `shard_count == processor_count` layout the service builds:
-    /// shard `i` belongs to processor `i`.
-    #[inline]
-    pub(super) fn owner_processor(&self, idx: usize) -> helios_hal::cpu::ProcessorId {
-        helios_hal::cpu::ProcessorId::new(
-            u16::try_from(idx)
-                .unwrap_or_else(|_| panic!("network shard index {idx} exceeds processor id range")),
-        )
-    }
-
     /// Samples `idx`'s arrival signal. Callers take this *before* they
     /// inspect the shard, so an arrival that lands between the
     /// inspection and the park is still observed.
@@ -794,17 +781,16 @@ impl NetworkShardSet {
     }
 
     /// Releases every operation parked on a shard that just took a
-    /// frame, and pulls the owning processor out of its idle park when
-    /// the frame was drained somewhere else.
+    /// frame.
     ///
     /// Signalling happens after the per-frame shard locks are released,
     /// so a woken waiter never contends with the drain that woke it.
-    pub(super) fn notify_arrivals<CpuImpl: Cpu>(&self, arrivals: &ShardArrivals, cpu: &CpuImpl) {
+    pub(super) fn notify_arrivals(&self, arrivals: &ShardArrivals) {
         if arrivals.is_empty() {
             return;
         }
         for shard_idx in arrivals.iter() {
-            self.raise_shard_progress(shard_idx, cpu);
+            self.raise_shard_progress(shard_idx);
         }
         // A replicated socket's operations watch the whole set, because
         // the shard their next connection or datagram lands on is not
@@ -812,14 +798,19 @@ impl NetworkShardSet {
         self.any_arrival.signal();
     }
 
-    /// Raises one shard's arrival signal and pulls the owning processor
-    /// out of its idle park when this is not that processor.
-    pub(super) fn raise_shard_progress<CpuImpl: Cpu>(&self, shard_idx: usize, cpu: &CpuImpl) {
+    /// Raises one shard's arrival signal.
+    ///
+    /// Nothing here reaches for the owning processor: a waiter parked
+    /// on the signal is a task, and waking it schedules it on its own
+    /// processor's queue, which sends the wake IPI itself when that
+    /// processor is idle (`LocalScheduler::schedule`). An IPI sent from
+    /// here as well was one per drained frame whenever a stream's task
+    /// ran on a processor other than the one that opened it — two VM
+    /// exits on x86 to wake a processor that had nothing to run — and
+    /// it was 42 µs of the 47 µs a stream operation spent per receive
+    /// (`rx-signal-tcp` against `rx-signal-pump`, #401).
+    pub(super) fn raise_shard_progress(&self, shard_idx: usize) {
         self.arrival(shard_idx).signal();
-        let owner = self.owner_processor(shard_idx);
-        if owner != helios_hal::cpu::current_processor() {
-            cpu.wake_processor(owner);
-        }
     }
 
     /// Runs `f` against the shard owning `handle`, and signals that
@@ -846,16 +837,14 @@ impl NetworkShardSet {
     /// into a window update, and when more processors than pairs fold
     /// several shards onto one pair its arrival is a different shard's
     /// than the one just drained.
-    pub(super) fn with_handle_receive_drain<H, R, CpuImpl>(
+    pub(super) fn with_handle_receive_drain<H, R>(
         &self,
         handle: H,
-        cpu: &CpuImpl,
         pair_count: usize,
         f: impl FnOnce(&mut NetworkShard) -> R,
     ) -> R
     where
         H: Into<ShardHandle>,
-        CpuImpl: Cpu,
     {
         let shard_idx = self.shard_idx_for_handle(handle);
         let (result, relieved) = {
@@ -868,10 +857,10 @@ impl NetworkShardSet {
             )
         };
         if relieved {
-            self.raise_shard_progress(shard_idx, cpu);
+            self.raise_shard_progress(shard_idx);
             let pump_shard = shard_idx % pair_count;
             if pump_shard != shard_idx {
-                self.raise_shard_progress(pump_shard, cpu);
+                self.raise_shard_progress(pump_shard);
             }
             self.any_arrival.signal();
         }
