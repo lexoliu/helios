@@ -1283,13 +1283,29 @@ where
             let receive_limit = remaining_rx_budget.min(NETWORK_RX_BATCH_FRAMES);
             let mut frames: [Option<RxFrame>; NETWORK_RX_BATCH_FRAMES] =
                 core::array::from_fn(|_| None);
+            let ring_started = self.profile_start();
+            let drain = self.receive_frames_immediate(
+                scope.pairs(local_pair, pair_count),
+                &mut frames[..receive_limit],
+            );
+            // Only the immediate path's frames count as ring events: a
+            // fallback's frames come from pair zero's async receive and
+            // belong to `rx-fallback`.
+            let ring_frames = drain.as_ref().map_or(0, |drain| drain.received);
+            self.record_network_profile_events_bytes(
+                source.rx_ring_phase(),
+                ring_started,
+                ring_frames,
+                frames[..ring_frames]
+                    .iter()
+                    .flatten()
+                    .map(RxFrame::len)
+                    .sum(),
+            );
             let RxDrain {
                 received: received_batch,
                 refusal,
-            } = match self.receive_frames_immediate(
-                scope.pairs(local_pair, pair_count),
-                &mut frames[..receive_limit],
-            ) {
+            } = match drain {
                 Some(drain) => drain,
                 // The immediate path found every pair it covers held
                 // mid-drain by somebody else. The pair-agnostic receive
@@ -1303,8 +1319,17 @@ where
                         else {
                             break;
                         };
+                        // The lock wait inside `try_receive_frame` is
+                        // outside this span: only the synchronous
+                        // hand-off of the frame it produced is measured.
+                        let fallback_started = self.profile_start();
                         *frame = Some(received_frame);
                         received_batch += 1;
+                        self.record_network_profile_events(
+                            source.rx_fallback_phase(),
+                            fallback_started,
+                            1,
+                        );
                     }
                     RxDrain::completed(received_batch)
                 }
@@ -1332,6 +1357,7 @@ where
             // released, and a batch that lands several frames in the
             // same shard should release its waiters once.
             let mut arrivals = ShardArrivals::new();
+            let dispatch_started = self.profile_start();
             for frame in frames[..received_batch].iter().flatten() {
                 let frame_len = frame.len();
                 match self
@@ -1361,19 +1387,33 @@ where
                     }
                 }
             }
+            self.record_network_profile_events(
+                source.rx_dispatch_phase(),
+                dispatch_started,
+                received_batch,
+            );
             // Every shard that took a frame is released here, and the
             // processor that owns it is pulled out of its idle park when
             // this is not that processor. Without this a reply demuxed
             // into a foreign shard would sit there until its waiter's own
             // deadline expired.
+            let signal_started = self.profile_start();
             self.inner.state.notify_arrivals(&arrivals, &self.inner.cpu);
+            self.record_network_profile_events(
+                source.rx_signal_phase(),
+                signal_started,
+                arrivals.len(),
+            );
 
-            if self
+            let repost_started = self.profile_start();
+            let reposted = self
                 .inner
                 .device
-                .repost_rx_frames_immediate(&mut frames[..received_batch])?
-                .is_none()
-            {
+                .repost_rx_frames_immediate(&mut frames[..received_batch])?;
+            // Returning the batch's slots is the same driver receive the
+            // ring phase covers; it records no frames of its own.
+            self.record_network_profile_events(source.rx_ring_phase(), repost_started, 0);
+            if reposted.is_none() {
                 for frame in &mut frames[..received_batch] {
                     drop(frame.take());
                 }
