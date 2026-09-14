@@ -566,17 +566,25 @@ impl Default for PacketBuffer {
 ///
 /// Two counters, because an interface reports two kinds of progress.
 /// `queue` counts what one queue pair completed, which is the only
-/// progress an operation pinned to that pair can use; `device` counts
-/// what the interface reported that belongs to no pair — a
-/// configuration change, a control-queue completion, or any event a
-/// transport with one interrupt line cannot attribute to a pair. A
-/// waiter observes an increment of either.
+/// progress an operation pinned to that pair can use; `device`, when
+/// the caller arms it, counts what the interface reported on the
+/// interface-wide channel — a configuration change, a control-queue
+/// completion.
+///
+/// Who clears `device` is the waiter's decision. The per-pair packet
+/// pumps clear it: a pair's completions always have their own listener
+/// in the pump parked on that pair, so the wide channel would only
+/// wake them on interrupts they cannot act on. Socket waiters keep it
+/// armed because a link or configuration event can change what they
+/// are waiting for, and the bootstrap processor's pump keeps it
+/// because it is the one that acts on those events.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct InterfaceEventMark {
     /// Events the sampled queue pair had reported.
     pub queue: u64,
-    /// Events the interface had reported that belong to no queue pair.
-    pub device: u64,
+    /// Events the interface had reported that belong to no queue pair,
+    /// or `None` for a wait that parks on the pair alone.
+    pub device: Option<u64>,
 }
 
 /// Multi-core aware network interface contract used by packet stacks.
@@ -705,7 +713,8 @@ pub trait NetworkInterface: Clone + Send + Sync + 'static {
     fn event_mark(&self, queue_idx: usize) -> InterfaceEventMark;
 
     /// Waits until the interface reports an event past `mark`, on
-    /// `queue_idx` or on the interface as a whole.
+    /// `queue_idx` or — while `mark.device` is armed — on the
+    /// interface as a whole.
     ///
     /// An operation belongs to one shard, which drains one queue pair,
     /// so a completion on another pair is not progress it can use.

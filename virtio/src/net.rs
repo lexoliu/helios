@@ -27,6 +27,7 @@ use bytes::Bytes;
 use core::cell::UnsafeCell;
 use core::future::Future;
 use core::mem::size_of;
+use core::num::NonZeroU16;
 use core::ops::Range;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crossbeam_utils::CachePadded;
@@ -308,6 +309,38 @@ impl CoalescingBudget {
         // Bytes 2..4 are the reserved half of the header and stay zero.
         payload[4..].copy_from_slice(&self.encode());
         payload
+    }
+}
+
+/// The most queue pairs a virtio-net device may activate.
+///
+/// The kernel runs one packet pump per pair, pinned to the processor
+/// the pair's interrupts reach, so the budget is the machine's
+/// processor count: a pair activated past it would collect completions
+/// nobody is parked on. The bound is a type so a constructor cannot
+/// take "as many as the device offers" by accident — and a machine
+/// with no processors brings up no device, which the non-zero
+/// representation makes unsayable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct QueuePairBudget(NonZeroU16);
+
+impl QueuePairBudget {
+    /// The budget a machine with `processor_count` processors gives a
+    /// device.
+    ///
+    /// A count past what a pair index can name saturates rather than
+    /// failing: the driver caps at `NET_MAX_QUEUE_PAIRS` long before
+    /// the bound matters.
+    pub fn new(processor_count: usize) -> Self {
+        let pairs = u16::try_from(processor_count).unwrap_or(u16::MAX);
+        Self(NonZeroU16::new(pairs).unwrap_or_else(|| {
+            panic!("a machine with zero processors brings up no network device")
+        }))
+    }
+
+    /// The most queue pairs the device may activate.
+    pub const fn get(self) -> u16 {
+        self.0.get()
     }
 }
 
@@ -829,7 +862,15 @@ impl core::fmt::Debug for FeatureWord {
 }
 
 impl<T: VirtioTransport> VirtioNetDevice<T> {
-    pub fn new(transport: T) -> IoResult<Self> {
+    /// Brings the device up, activating at most `pair_budget` queue
+    /// pairs no matter how many the device advertises.
+    ///
+    /// The budget is the machine's processor count because each pair is
+    /// drained by the one packet pump that processor runs: a pair past
+    /// it would be programmed on the device — the control queue tells
+    /// it the count — while its completions had no listener, which is
+    /// the stall #381's review caught.
+    pub fn new(transport: T, pair_budget: QueuePairBudget) -> IoResult<Self> {
         if transport.device_type() != DeviceType::Network {
             return Err(IoError::Unsupported);
         }
@@ -993,6 +1034,12 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         } else {
             1
         };
+        // One bound tighter still: the kernel runs one packet pump per
+        // pair, pinned to the processor that owns it, so a pair past
+        // the processor count would be activated on the device and
+        // never drained. The budget the backend handed in is what
+        // keeps the activated set inside the pumped set.
+        let pair_count = advertised_pairs.min(pair_budget.get());
 
         // One record, before the first queue is programmed, holding
         // everything a bring-up failure is diagnosed from: what the
@@ -1003,7 +1050,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         // `2 * max_virtqueue_pairs + 1` is about to be programmed for
         // queues it does not have, and nothing else in the boot log
         // would say so.
-        let probed_queues = usize::from(advertised_pairs) * 2 + 1;
+        let probed_queues = usize::from(pair_count) * 2 + 1;
         let mut queue_sizes = [0_u16; NET_MAX_QUEUE_PAIRS as usize * 2 + 1];
         for (index, size) in queue_sizes[..probed_queues].iter_mut().enumerate() {
             *size = transport.queue_max_size(index as u16);
@@ -1012,14 +1059,16 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             offered = ?FeatureWord(offered_features.get()),
             accepted = ?FeatureWord(features.bits()),
             max_virtqueue_pairs = advertised_pairs,
+            pair_budget = pair_budget.get(),
+            queue_pairs = pair_count,
             presented_queues = ?transport.presented_queue_count(),
             queue_sizes = ?&queue_sizes[..probed_queues],
             "virtio-net bring-up"
         );
 
         let mut queue_pairs: Vec<CachePadded<NetQueuePair<T>>> =
-            Vec::with_capacity(usize::from(advertised_pairs));
-        for pair_idx in 0..advertised_pairs {
+            Vec::with_capacity(usize::from(pair_count));
+        for pair_idx in 0..pair_count {
             let rx_queue_index = rx_queue_index(pair_idx);
             let tx_queue_index = tx_queue_index(pair_idx);
             let rx_queue_size = transport.queue_max_size(rx_queue_index).min(NET_QUEUE_SIZE);
@@ -1035,6 +1084,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
                 }
                 tracing::warn!(
                     advertised_pairs,
+                    pair_budget = pair_budget.get(),
                     usable_pairs = pair_idx,
                     "virtio-net advertised more queue pairs than it presents; \
                      bringing up the pairs that exist"
@@ -1540,8 +1590,10 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             pair.raise_interrupt();
         }
         // A configuration change belongs to no pair, and neither does a
-        // control-queue completion, so the device-wide notification
-        // still exists for the waiters that watch those.
+        // control-queue completion — and a completion that does belong
+        // to a pair is still invisible to every waiter parked on a
+        // different one, so the device-wide notification is raised on
+        // every interrupt either way.
         self.interrupts.notify_all();
         progress
     }
@@ -1550,7 +1602,12 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
     ///
     /// A transport with per-queue interrupts already knows which pair
     /// made progress and has already delivered the message to that
-    /// pair's processor, so there is nothing to scan and nobody to wake.
+    /// pair's processor, so there is nothing to scan and nobody else to
+    /// wake: every pair has a packet pump parked on its own channel, so
+    /// the completion has exactly the listener the park arms. A waiter
+    /// parked on another pair learns of the frame from that pump, which
+    /// hands it to its shard through the arrival signal — one hop, and
+    /// no interrupt reaches for the interface-wide channel to do it.
     pub fn handle_interrupt_on(&self, pair_idx: usize) {
         let pair_idx = self.normalize_pair_idx(pair_idx);
         self.transport.ack_interrupt();
@@ -2140,19 +2197,26 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         let pair_idx = self.normalize_pair_idx(pair_idx);
         InterfaceEventMark {
             queue: self.queue_pairs[pair_idx].interrupts.generation(),
-            device: self.interrupts.generation(),
+            device: Some(self.interrupts.generation()),
         }
     }
 
-    /// Waits for progress on one queue pair past `mark`, or for
-    /// anything the device reports that belongs to no pair.
+    /// Waits for progress on one queue pair past `mark`, and while
+    /// `mark.device` is armed also for anything the device reports on
+    /// the interface-wide channel.
     ///
     /// An operation belongs to one shard, which drains one pair, so this
     /// is what its wait parks on: a completion on another pair is not
     /// progress it can use, and waking for it would cost the same as
-    /// waking the task that did make progress.
+    /// waking the task that did make progress. Who keeps `mark.device`
+    /// armed is the waiter's business, not this driver's: the per-pair
+    /// pumps disarm it because a pair's completions always have their
+    /// own listener, socket waiters keep it because a link or
+    /// configuration event can change what they are waiting for, and
+    /// the bootstrap processor's pump keeps it because it is the one
+    /// that acts on those events.
     ///
-    /// The two listeners are armed here, against `mark`, and not inside
+    /// The listeners are armed here, against `mark`, and not inside
     /// the future this returns: an interrupt raised between the
     /// caller's last drain and its park is then already past the mark,
     /// and the wait is over before it begins. Arming at first poll
@@ -2168,13 +2232,18 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         let pair = self.queue_pairs[pair_idx]
             .interrupts
             .notified_since(mark.queue);
-        let device = self.interrupts.notified_since(mark.device);
+        let device = mark.device.map(|mark| self.interrupts.notified_since(mark));
         async move {
             let mut pair = core::pin::pin!(pair);
             let mut device = core::pin::pin!(device);
             core::future::poll_fn(|cx| {
                 use core::task::Poll;
-                if pair.as_mut().poll(cx).is_ready() || device.as_mut().poll(cx).is_ready() {
+                if pair.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(());
+                }
+                if let Some(device) = device.as_mut().as_pin_mut()
+                    && device.poll(cx).is_ready()
+                {
                     return Poll::Ready(());
                 }
                 Poll::Pending
@@ -2503,9 +2572,10 @@ mod tests {
         NET_FEATURE_GUEST_CSUM, NET_FEATURE_GUEST_ECN, NET_FEATURE_GUEST_TSO4,
         NET_FEATURE_GUEST_TSO6, NET_FEATURE_GUEST_UFO, NET_FEATURE_HOST_ECN, NET_FEATURE_HOST_TSO4,
         NET_FEATURE_HOST_TSO6, NET_FEATURE_MQ, NET_FEATURE_MRG_RXBUF, NET_FEATURE_STATUS,
-        NET_STATUS_LINK_UP, RX_PAGE_BYTES, RxFrame, RxReassemblyPool, TxChecksumMeta, TxGsoMeta,
-        VIRTIO_NET_HDR_F_DATA_VALID, VIRTIO_NET_HDR_F_NEEDS_CSUM, VIRTIO_NET_HDR_GSO_TCPV4,
-        VirtioNetDevice, VirtioNetHeader, read_max_virtqueue_pairs, write_tx_payload,
+        NET_STATUS_LINK_UP, QueuePairBudget, RX_PAGE_BYTES, RxFrame, RxReassemblyPool,
+        TxChecksumMeta, TxGsoMeta, VIRTIO_NET_HDR_F_DATA_VALID, VIRTIO_NET_HDR_F_NEEDS_CSUM,
+        VIRTIO_NET_HDR_GSO_TCPV4, VirtioNetDevice, VirtioNetHeader, read_max_virtqueue_pairs,
+        write_tx_payload,
     };
     use crate::testing::{FakeTransport, FakeTransportConfig};
     use crate::transport::{DeviceType, VirtioFeatures};
@@ -2551,7 +2621,11 @@ mod tests {
             });
             configure(&transport);
             Self {
-                device: VirtioNetDevice::new(transport).expect("fake virtio-net should initialize"),
+                device: VirtioNetDevice::new(
+                    transport,
+                    QueuePairBudget::new(usize::from(super::NET_MAX_QUEUE_PAIRS)),
+                )
+                .expect("fake virtio-net should initialize"),
             }
         }
 
@@ -3338,6 +3412,33 @@ mod tests {
         assert_eq!(harness.device.link_state(), LinkState::Up);
     }
 
+    /// A per-queue interrupt is that pair's progress alone. The
+    /// transport has already delivered it to the pair's own processor,
+    /// and every pair has a packet pump parked on its channel, so the
+    /// waiters this interrupt can serve are exactly the ones parked on
+    /// the pair — a waiter anywhere else learns of the frame through
+    /// the arrival signal the pump raises for its shard. Raising the
+    /// interface-wide channel here would wake every parked socket on
+    /// every pair to look at work none of them owns.
+    #[test]
+    fn a_per_queue_interrupt_reports_progress_on_its_own_channel() {
+        let harness = NetHarness::new(0);
+        let mark = harness.device.interrupt_mark(0);
+
+        harness.device.handle_interrupt_on(0);
+
+        assert_eq!(
+            harness.device.queue_pairs[0].interrupts.generation(),
+            mark.queue + 1,
+            "the pair's own waiters must hear its interrupt"
+        );
+        assert_eq!(
+            mark.device,
+            Some(harness.device.interrupts.generation()),
+            "the device-wide channel is for events that belong to no pair"
+        );
+    }
+
     #[test]
     fn descriptor_bitset_tracks_sparse_tokens() {
         let mut bits = DescriptorBitSet::new(130);
@@ -3841,10 +3942,43 @@ mod tests {
             &[2],
         );
 
-        let device = VirtioNetDevice::new(transport)
-            .expect("a device with one usable pair is a device the driver can drive");
+        let device = VirtioNetDevice::new(
+            transport,
+            QueuePairBudget::new(usize::from(super::NET_MAX_QUEUE_PAIRS)),
+        )
+        .expect("a device with one usable pair is a device the driver can drive");
 
         assert_eq!(device.queue_pair_count(), 1);
+    }
+
+    /// #381: a pair past the processor count is programmed on the
+    /// device but drained by nobody — one packet pump runs per
+    /// processor — so the pair budget the backend hands in caps the
+    /// activated set, whatever the device advertised.
+    ///
+    /// The budget here is a single pair because the fake transport
+    /// cannot answer the control-queue command that activates a
+    /// second one; what the test pins is that four advertised pairs
+    /// come up as exactly the budget, with the control queue still
+    /// found at the index the *device's* count puts it at.
+    #[test]
+    fn a_device_advertising_more_pairs_than_the_budget_activates_the_budget() {
+        let transport = multiqueue_transport(NET_FEATURE_MQ | NET_FEATURE_CTRL_VQ, 4, &[]);
+
+        let device = VirtioNetDevice::new(transport, QueuePairBudget::new(1))
+            .expect("a device with more pairs than the budget still comes up");
+
+        assert_eq!(device.queue_pair_count(), 1);
+        let programmed = device
+            .transport
+            .programmed_queues()
+            .iter()
+            .map(|queue| queue.index)
+            .collect::<alloc::vec::Vec<_>>();
+        // Pair 0's receive and transmit virtqueues, then the control
+        // queue at `2 * advertised` — two pairs' worth of indices
+        // nobody probed sit between them.
+        assert_eq!(programmed, [0, 1, 8]);
     }
 
     /// The driver accepts `CTRL_VQ` before it can see whether the queue
@@ -3858,7 +3992,10 @@ mod tests {
         // queue — at 2 * 4 — missing.
         let transport = multiqueue_transport(NET_FEATURE_MQ | NET_FEATURE_CTRL_VQ, 4, &[8]);
 
-        let Err(error) = VirtioNetDevice::new(transport) else {
+        let Err(error) = VirtioNetDevice::new(
+            transport,
+            QueuePairBudget::new(usize::from(super::NET_MAX_QUEUE_PAIRS)),
+        ) else {
             panic!("a device that offers a queue it does not have is misconfigured");
         };
 

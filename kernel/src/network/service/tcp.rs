@@ -4,15 +4,39 @@ use super::*;
 /// the pair belonging to the polling processor first, then every other
 /// pair once, wrapping.
 ///
-/// Ownership of a pair is a locality preference, not a claim: a frame
-/// the host steered onto another processor's pair still has to be
-/// drained by whoever is polling, so the sweep covers all of them.
-pub(super) fn receive_pair_order(
+/// Ownership of a pair is a locality preference, not a claim: an
+/// operation that polls the device itself still visits every pair,
+/// because the pump that owns a pair may not be scheduled before this
+/// caller's own deadline. The walk is a concrete type so a caller can
+/// hold it beside the pump's single-pair walk in one value.
+pub(super) fn receive_pair_order(local_pair: usize, pair_count: usize) -> ReceivePairOrder {
+    assert!(pair_count != 0, "an interface has at least one queue pair");
+    ReceivePairOrder {
+        offset: 0,
+        local_pair,
+        pair_count,
+    }
+}
+
+/// [`receive_pair_order`]'s iterator, named so [`NetworkPollScope`]
+/// can hold it next to a pump's one-pair walk.
+pub(super) struct ReceivePairOrder {
+    offset: usize,
     local_pair: usize,
     pair_count: usize,
-) -> impl Iterator<Item = usize> {
-    assert!(pair_count != 0, "an interface has at least one queue pair");
-    (0..pair_count).map(move |offset| (local_pair + offset) % pair_count)
+}
+
+impl Iterator for ReceivePairOrder {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<usize> {
+        if self.offset >= self.pair_count {
+            return None;
+        }
+        let pair = (self.local_pair + self.offset) % self.pair_count;
+        self.offset += 1;
+        Some(pair)
+    }
 }
 
 pub(super) struct TcpListenerState {
@@ -270,7 +294,7 @@ where
         // before the new segment asks it for room — the order the full
         // poll keeps.
         let reclaimed = self
-            .reclaim_transmit_completions(budget.tx_completions)
+            .reclaim_transmit_completions(budget.tx_completions, NetworkPollScope::Interface)
             .map_err(|error| TcpError::from_io(error, NetworkErrorDetail::VirtioAdvanceFailed))?;
         let now = StackInstant::from_nanos(self.now_nanos());
         let progress = self.inner.state.with_handle(stream, |state| {
@@ -284,7 +308,7 @@ where
             Ok(progress)
         })?;
         let (transmitted, _) = self
-            .submit_network_transmit(NetworkPollSource::Tcp, budget)
+            .submit_network_transmit(NetworkPollSource::Tcp, budget, NetworkPollScope::Interface)
             .map_err(|error| TcpError::from_io(error, NetworkErrorDetail::VirtioAdvanceFailed))?;
         if transmitted != 0 || reclaimed != 0 {
             self.inner.poll.complete(NetworkPollProgress {
@@ -416,7 +440,7 @@ where
         self.inner.state.with_handle(stream, |state| {
             state.remove_tcp_stream(stream, now);
         });
-        self.wake_packet_pump();
+        self.wake_packet_pump(self.inner.state.shard_idx_for_handle(stream));
     }
 
     /// Retires `listener`, freeing its slab slot, its replica on every
@@ -450,7 +474,7 @@ where
             })
             .unwrap_or_else(|infallible| match infallible {});
         self.inner.state.listener_slots.release(slot);
-        self.wake_packet_pump();
+        self.wake_packet_pumps();
     }
 
     pub(super) async fn execute_tcp_connect(
@@ -862,12 +886,12 @@ where
     ) -> Result<TcpReadProgress, TcpError> {
         let started = self.profile_start();
         let now = StackInstant::from_nanos(self.now_nanos());
-        let read =
-            self.inner
-                .state
-                .with_handle_receive_drain(stream, &self.inner.cpu, |state| {
-                    state.poll_tcp_read(stream, max_bytes, now)
-                })?;
+        let read = self.inner.state.with_handle_receive_drain(
+            stream,
+            &self.inner.cpu,
+            self.inner.device.queue_pair_count().max(1),
+            |state| state.poll_tcp_read(stream, max_bytes, now),
+        )?;
         self.record_tcp_read_progress(profile_prefix, started, &read);
         Ok(read)
     }
@@ -880,12 +904,12 @@ where
     ) -> Result<TcpReadIntoProgress, TcpError> {
         let started = self.profile_start();
         let now = StackInstant::from_nanos(self.now_nanos());
-        let read =
-            self.inner
-                .state
-                .with_handle_receive_drain(stream, &self.inner.cpu, |state| {
-                    state.poll_tcp_read_into(stream, buffer, now)
-                })?;
+        let read = self.inner.state.with_handle_receive_drain(
+            stream,
+            &self.inner.cpu,
+            self.inner.device.queue_pair_count().max(1),
+            |state| state.poll_tcp_read_into(stream, buffer, now),
+        )?;
         self.record_tcp_read_into_progress(profile_prefix, started, &read);
         Ok(read)
     }
@@ -919,6 +943,8 @@ where
                         profile_prefix: TcpReadPhasePrefix::Polling,
                     }),
                     true,
+                    NetworkPollScope::Interface,
+                    &self.inner.poll,
                 )
                 .await
                 .map_err(|error| {
@@ -1072,7 +1098,11 @@ where
                 // `tcp-read-drive-network` work in local AArch64/HVF profiles.
                 let budget = self.inner.poll.budget();
                 let (transmitted, _) = self
-                    .submit_network_transmit(NetworkPollSource::Tcp, budget)
+                    .submit_network_transmit(
+                        NetworkPollSource::Tcp,
+                        budget,
+                        NetworkPollScope::Interface,
+                    )
                     .map_err(|error| {
                         TcpError::from_io(error, NetworkErrorDetail::VirtioAdvanceFailed)
                     })?;
@@ -1088,24 +1118,31 @@ where
         Ok(())
     }
 
-    /// Drains finished transmit descriptors on every queue pair, which
-    /// is what frees the scatter payloads the device was reading in
-    /// place.
+    /// Drains finished transmit descriptors on the queue pairs this
+    /// poll scope owns, which is what frees the scatter payloads the
+    /// device was reading in place.
     ///
-    /// Every shard submits to its own queue pair, so a reclaim that
-    /// visited only pair zero would leave the other pairs' rings full.
-    /// A pair another processor currently holds is skipped: that
+    /// An operation sweeps every pair — it is the stack's whole driver
+    /// while it runs — while a pump reclaims only the pair it owns:
+    /// every other pair has a pump of its own parked on it. A pair
+    /// another processor currently holds is skipped either way: that
     /// processor is draining it, and this poll has nothing to add.
-    fn reclaim_transmit_completions(&self, budget: usize) -> Result<usize, IoError> {
+    fn reclaim_transmit_completions(
+        &self,
+        budget: usize,
+        scope: NetworkPollScope,
+    ) -> Result<usize, IoError> {
         let mut reclaimed = 0usize;
-        for shard_idx in 0..self.inner.state.shard_count() {
+        let pair_count = self.inner.device.queue_pair_count().max(1);
+        let local_pair = usize::from(helios_hal::cpu::current_processor().id()) % pair_count;
+        for pair_idx in scope.pairs(local_pair, pair_count) {
             if reclaimed >= budget {
                 break;
             }
             let Some(completed) = self
                 .inner
                 .device
-                .reclaim_transmit_completions_immediate_on(shard_idx, budget - reclaimed)?
+                .reclaim_transmit_completions_immediate_on(pair_idx, budget - reclaimed)?
             else {
                 continue;
             };
@@ -1114,27 +1151,24 @@ where
         Ok(reclaimed)
     }
 
-    /// Drains received frames from every queue pair, which is what puts
-    /// a reply into the shard that is waiting for it.
+    /// Drains received frames from the queue pairs this poll scope
+    /// owns, which is what puts a reply into the shard that is waiting
+    /// for it.
     ///
-    /// Every pair has to be visited, for the receive-side reason the
-    /// reclaim above visits every pair on the transmit side: the device
-    /// delivers a frame on whichever pair *it* steered the flow to, and
-    /// that choice is the host's rather than this processor's. A reply
-    /// to a broadcast exchange — a DHCP offer, an ARP reply — is hashed
-    /// independently of the request that provoked it, so on a
-    /// multi-queue backend it routinely arrives on a pair belonging to
-    /// a processor that is not polling. Nothing else then drains it: a
-    /// packet pump is a backend's own choice to install, and a backend
-    /// without one drives the interface entirely from the operation
-    /// waiting on it, on that operation's processor.
+    /// An operation sweeps every pair, because the device delivers a
+    /// frame on whichever pair *it* steered the flow to and the pump
+    /// that owns the pair may not be scheduled before this caller's own
+    /// deadline: a reply to a broadcast exchange — a DHCP offer, an ARP
+    /// reply — is hashed independently of the request that provoked it.
+    /// A pump visits only the pair it owns; every other pair has a pump
+    /// of its own parked on it, so a frame is never without a drainer.
     ///
     /// The local pair is visited first, so a processor drains its own
     /// ring before it looks at anyone else's, and a pair another
     /// processor already holds is skipped by the device's `try_lock` —
     /// that processor is draining it and this poll has nothing to add.
-    /// `None` means every pair was held, which is the same "come back
-    /// later" a single-pair drain reports.
+    /// `None` means every pair the scope covers was held, which is the
+    /// same "come back later" a single-pair drain reports.
     ///
     /// A pair that refuses ends the sweep, and the refusal travels back
     /// beside the frames the sweep had already collected rather than in
@@ -1144,12 +1178,14 @@ where
     /// the peer retransmit data the guest did receive. The refusal is
     /// counted against the pair that produced it here, because this is
     /// the last place that knows which pair that was.
-    fn receive_frames_immediate(&self, frames: &mut [Option<RxFrame>]) -> Option<RxDrain> {
-        let pair_count = self.inner.device.queue_pair_count().max(1);
-        let local_pair = usize::from(helios_hal::cpu::current_processor().id()) % pair_count;
+    fn receive_frames_immediate(
+        &self,
+        pairs: impl Iterator<Item = usize>,
+        frames: &mut [Option<RxFrame>],
+    ) -> Option<RxDrain> {
         let mut received = 0usize;
         let mut drained_a_pair = false;
-        for pair_idx in receive_pair_order(local_pair, pair_count) {
+        for pair_idx in pairs {
             if received >= frames.len() {
                 break;
             }
@@ -1178,16 +1214,29 @@ where
         source: NetworkPollSource,
         tcp_read_probe: Option<NetworkTcpReadProbe>,
         submit_transmit: bool,
+        scope: NetworkPollScope,
+        poll: &NetworkPollState,
     ) -> Result<NetworkPollOutcome, IoError> {
         // Carrier first: a link that moved invalidates the very
         // configuration the control plane is about to push into the
-        // shards.
-        self.synchronize_link_state();
-        self.synchronize_control_plane();
-        let budget = self.inner.poll.budget();
+        // shards. Both are interface-wide duties — an operation driving
+        // the stack itself keeps them, and of the pumps only the one on
+        // the bootstrap processor's pair does, since a link or
+        // configuration event arrives on no pair. That pump also runs
+        // the configuration state machines themselves, between the link
+        // check that may have restarted them and the publication of
+        // what they learn.
+        if scope.interface_wide() {
+            self.synchronize_link_state();
+            if scope.drives_configuration() {
+                self.drive_interface_configuration();
+            }
+            self.synchronize_control_plane();
+        }
+        let budget = poll.budget();
 
         let reclaim_started = self.profile_start();
-        let reclaimed = self.reclaim_transmit_completions(budget.tx_completions)?;
+        let reclaimed = self.reclaim_transmit_completions(budget.tx_completions, scope)?;
         if reclaimed != 0 {
             self.record_network_profile_events(
                 source.tx_reclaim_phase(),
@@ -1220,6 +1269,8 @@ where
         // shard its flow belongs to, and a shard that will not take one
         // loses that frame and nothing else.
         let stack_rx_budget = self.inner.stack_rx_budget;
+        let pair_count = self.inner.device.queue_pair_count().max(1);
+        let local_pair = usize::from(helios_hal::cpu::current_processor().id()) % pair_count;
         loop {
             let remaining_rx_budget = budget
                 .rx_frames
@@ -1235,9 +1286,17 @@ where
             let RxDrain {
                 received: received_batch,
                 refusal,
-            } = match self.receive_frames_immediate(&mut frames[..receive_limit]) {
+            } = match self.receive_frames_immediate(
+                scope.pairs(local_pair, pair_count),
+                &mut frames[..receive_limit],
+            ) {
                 Some(drain) => drain,
-                None => {
+                // The immediate path found every pair it covers held
+                // mid-drain by somebody else. The pair-agnostic receive
+                // is pair zero's async lock — worth taking only when
+                // this scope owns pair zero; any other held pair is
+                // being drained by its pump and needs nothing from us.
+                None if scope.covers_pair_zero() => {
                     let mut received_batch = 0usize;
                     for frame in &mut frames[..receive_limit] {
                         let Some(received_frame) = self.inner.device.try_receive_frame().await?
@@ -1249,6 +1308,7 @@ where
                     }
                     RxDrain::completed(received_batch)
                 }
+                None => break,
             };
             // A refused drain still falls through the demux below, so
             // the frames it did take reach their shards and their
@@ -1339,20 +1399,30 @@ where
         let mut tcp_read = None;
         let mut tcp_read_started = None;
         let mut tcp_read_finished = None;
-        // Each shard owns its own TCP connections, so the timer
-        // drive must hit every shard's Stack.
-        self.inner.state.for_each(|state| {
+        // Each shard owns its own TCP connections, so the timer drive
+        // hits every shard this scope serves: all of them for an
+        // operation driving the interface, the shards that submit on
+        // the pump's pair for a pump.
+        let drive_tcp = |state: &mut NetworkShard| {
             state
                 .stack
                 .drive_tcp(now)
                 .unwrap_or_else(|error| tracing::debug!(?error, "failed to drive TCP control"));
-        });
+        };
+        match scope {
+            NetworkPollScope::Interface => self.inner.state.for_each(drive_tcp),
+            NetworkPollScope::Pair { pair, .. } => self
+                .inner
+                .state
+                .for_each_on_pair(pair, pair_count, drive_tcp),
+        }
         let tcp_finished = self.profile_start();
         if let Some(probe) = tcp_read_probe {
             tcp_read_started = self.profile_start();
             tcp_read = Some(self.inner.state.with_handle_receive_drain(
                 probe.stream,
                 &self.inner.cpu,
+                pair_count,
                 |state| state.poll_tcp_read(probe.stream, probe.max_bytes, now),
             ));
             tcp_read_finished = self.profile_start();
@@ -1374,7 +1444,7 @@ where
         }
 
         let (transmitted, _) = if submit_transmit {
-            self.submit_network_transmit(source, budget)?
+            self.submit_network_transmit(source, budget, scope)?
         } else {
             (0, 0)
         };
@@ -1383,7 +1453,7 @@ where
             reclaimed_tx: reclaimed,
             transmitted_frames: transmitted,
         };
-        self.inner.poll.complete(progress);
+        poll.complete(progress);
         Ok(NetworkPollOutcome {
             progress,
             budget,

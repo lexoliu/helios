@@ -14,7 +14,8 @@ pub use types::{
     AuthorityDomain, ComponentHostFilesystemState, ComponentHostNetwork, ComponentNetworkService,
     ComponentNetworkState, DnsError, DnsErrorKind, ExecOutput, ExecResult, HostDirEntry,
     HostFileSystem, HostFsError, HostFsErrorKind, HostMetadata, Ipv4Address, NetworkErrorDetail,
-    NetworkHandle, NetworkIpAddress, ObjectIdentity, PingError, PingErrorKind, PingReply,
-    RegisteredTcpReadBuffer, SocketReadiness, TcpAccepted, TcpError, TcpErrorKind, TcpListener,
-    TcpReadProgress, TcpWriteProgress, UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
+    NetworkHandle, NetworkIpAddress, NetworkPacketPump, ObjectIdentity, PingError, PingErrorKind,
+    PingReply, RegisteredTcpReadBuffer, SocketReadiness, TcpAccepted, TcpError, TcpErrorKind,
+    TcpListener, TcpReadProgress, TcpWriteProgress, UdpBinding, UdpDatagram, UdpError,
+    UdpErrorKind,
 };
