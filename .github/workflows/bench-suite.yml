@@ -446,7 +446,11 @@ jobs:
             bench-out/${{ matrix.lane }}/*.svg
             bench-out/${{ matrix.lane }}/helios/*.jsonl
             bench-out/${{ matrix.lane }}/helios/*.md
+            bench-out/${{ matrix.lane }}/helios/*.perf.json
+            bench-out/${{ matrix.lane }}/helios/*.kernel.folded
             bench-out/${{ matrix.lane }}/helios-baseline/*.jsonl
+            bench-out/${{ matrix.lane }}/helios-baseline/*.perf.json
+            bench-out/${{ matrix.lane }}/helios-baseline/*.kernel.folded
             bench-out/${{ matrix.lane }}/linux/*.jsonl
             bench-out/${{ matrix.lane }}/linux/*.md
             bench-out/${{ matrix.lane }}/linux/summary.json
@@ -638,7 +642,11 @@ jobs:
             bench-out/pgo/tables.md
             bench-out/pgo/*.svg
             bench-out/pgo/helios/*.jsonl
+            bench-out/pgo/helios/*.perf.json
+            bench-out/pgo/helios/*.kernel.folded
             bench-out/pgo/helios-baseline/*.jsonl
+            bench-out/pgo/helios-baseline/*.perf.json
+            bench-out/pgo/helios-baseline/*.kernel.folded
             pgo-comment.md
           if-no-files-found: warn
           retention-days: 90

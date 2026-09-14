@@ -334,7 +334,13 @@ the SHA256 of every wasm and `cwasm` the run used, every iteration of
 every cell, the statistics above, the comparisons and verdicts, and the
 run's GitHub id. It is uploaded as the `bench-report-<lane>` workflow
 artifact, and on a tag it is attached to the release so a paper can cite
-the tag.
+the tag. The same artifact carries, for the run's own image and for a
+paired baseline, every boot's raw records beside its `helios-*.jsonl`:
+the kernel counters the guest reported (`helios-*.perf.json`, the
+`kernel;network;*` rows the report tabulates only the top of) and the
+sampled kernel profile (`helios-*.kernel.folded`), so a diagnosis that
+needs a counter the table cut, or the baseline's counters at all, reads
+them from the artifact instead of re-running the lane.
 
 Every number in this repository's documentation is traceable to one run
 id: `helios-bench render readme --run <id>` and `render docs --run <id>`
