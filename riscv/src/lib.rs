@@ -594,8 +594,13 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
         "FDT describes {hart_count} harts but this backend tracks at most {MAX_TRACKED_HARTS}"
     );
     let timebase_frequency = first_cpu.timebase_frequency() as u64;
+    // QEMU delivers the user payload through `-initrd` and publishes its
+    // physical range in `/chosen`; the bytes stay borrowed for the
+    // kernel's lifetime, so the range is carved out of the memory the
+    // allocator is primed with below.
+    let initrd = initrd_range(&fdt);
     let allocator_window = allocator_window();
-    let memory_regions = collect_memory_regions(fdt.memory(), allocator_window.clone());
+    let memory_regions = collect_memory_regions(fdt.memory(), allocator_window.clone(), &initrd);
     let current_hart = ProcessorId::new(hart_id as u16);
     let bootstrap_processor = remember_bootstrap_hart(hart_id);
     mark_hart_online(current_hart);
@@ -633,7 +638,7 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
         helios_kernel::prime_bootstrap_allocator(memory_regions.iter().copied(), hart_count);
     }
 
-    let debug_state = shared_debug_state(timebase_frequency, hart_count);
+    let debug_state = shared_debug_state(timebase_frequency, hart_count, initrd.clone());
     let has_debug_transport = publish_debug_transport(DebugTransport::discover(&fdt));
     let watchdog = shared_watchdog(&fdt);
     let has_vsock = vsock::has_vsock_device(&fdt);
@@ -645,7 +650,7 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
     // device tree describes no console has no line to carry it at all.
     let console = kernel_console(
         debug_state.clone(),
-        has_debug_transport && (!helios_kernel::has_embedded_system_component() || has_vsock),
+        has_debug_transport && (!debug_state.has_system_component() || has_vsock),
     );
     let cpu = RiscvCpu::new(
         bootstrap_processor,
@@ -829,13 +834,25 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
     );
 }
 
-fn shared_debug_state(timebase_frequency: u64, hart_count: usize) -> debug_state::RuntimeState {
+fn shared_debug_state(
+    timebase_frequency: u64,
+    hart_count: usize,
+    initrd: Range<usize>,
+) -> debug_state::RuntimeState {
     DEBUG_STATE
         .call_once(|| {
+            // The Sv48 identity map is already active, so the initrd's
+            // physical range reads directly.
+            let bytes =
+                unsafe { core::slice::from_raw_parts(initrd.start as *const u8, initrd.len()) };
+            let payload = helios_kernel::BootPayload::parse(bytes).unwrap_or_else(|error| {
+                panic!("initrd is not a valid helios-bootfs payload: {error}")
+            });
             debug_state::RuntimeState::new(
                 timebase_frequency,
                 hart_count,
                 riscv::register::time::read64(),
+                payload,
             )
         })
         .clone()
@@ -864,9 +881,39 @@ fn allocator_window() -> Range<usize> {
     start..usize::MAX
 }
 
+/// The physical range QEMU placed the `-initrd` payload in, published
+/// in `/chosen` as `linux,initrd-start`/`linux,initrd-end`.
+///
+/// riscv64 does not boot through Limine — its Limine protocol entry is
+/// a higher-half handoff with paging already enabled, a different
+/// backend contract — so the payload arrives as an initrd instead.
+/// Absent or malformed properties panic: a kernel without the payload
+/// has no init to run.
+fn initrd_range(fdt: &Fdt<'_>) -> Range<usize> {
+    let chosen = fdt
+        .find_node("/chosen")
+        .unwrap_or_else(|| panic!("FDT has no /chosen node to name the initrd"));
+    let property = |name: &str| {
+        chosen
+            .property(name)
+            .and_then(|property| property.as_usize())
+            .unwrap_or_else(|| {
+                panic!("FDT /chosen/{name} is missing or malformed; the payload needs -initrd")
+            })
+    };
+    let start = property("linux,initrd-start");
+    let end = property("linux,initrd-end");
+    assert!(
+        start < end,
+        "FDT /chosen initrd range {start:#x}..{end:#x} is empty or reversed"
+    );
+    start..end
+}
+
 fn collect_memory_regions<'fdt>(
     memory: fdt::standard_nodes::Memory<'fdt, 'fdt>,
     allocator_window: Range<usize>,
+    initrd: &Range<usize>,
 ) -> ArrayVec<MemoryRegion, 8> {
     let mut regions = ArrayVec::new();
 
@@ -880,7 +927,9 @@ fn collect_memory_regions<'fdt>(
 
             start..end
         })
-        .filter_map(move |region| intersect(region, allocator_window.clone()))
+        .filter_map(|region| intersect(region, allocator_window.clone()))
+        .flat_map(|region| subtract(region, initrd))
+        .flatten()
         .map(range_to_memory_region)
     {
         regions.try_push(region).unwrap_or_else(|_| {
@@ -889,6 +938,18 @@ fn collect_memory_regions<'fdt>(
     }
 
     regions
+}
+
+/// `region` with `reserved` taken out of it: up to two pieces, either of
+/// which may be empty. The riscv backend's only reservation is the
+/// initrd, a single contiguous range, so a region never splits further.
+fn subtract(region: Range<usize>, reserved: &Range<usize>) -> [Option<Range<usize>>; 2] {
+    if reserved.end <= region.start || reserved.start >= region.end {
+        return [Some(region), None];
+    }
+    let below = (reserved.start > region.start).then_some(region.start..reserved.start);
+    let above = (reserved.end < region.end).then_some(reserved.end..region.end);
+    [below, above]
 }
 
 fn intersect(left: Range<usize>, right: Range<usize>) -> Option<Range<usize>> {

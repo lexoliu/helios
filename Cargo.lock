@@ -1857,6 +1857,7 @@ dependencies = [
  "helios-kernel",
  "libc",
  "mimalloc",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
@@ -1972,7 +1973,6 @@ dependencies = [
  "helios-artifact",
  "helios-compiler-abi",
  "helios-hal",
- "helios-kernel-macro",
  "helios-netstack",
  "lru 0.16.4",
  "nu-ansi-term",
@@ -1980,35 +1980,19 @@ dependencies = [
  "pin-project-lite",
  "rand_chacha",
  "rand_core 0.6.4",
- "serde",
- "serde_json",
  "sha2 0.10.9",
  "slab",
  "smallvec",
  "spin 0.9.9",
  "talc",
  "thiserror 2.0.20",
- "toml",
  "tracing",
  "triomphe",
  "unsize",
- "walkdir",
  "wasm-encoder 0.245.1",
  "wasmparser 0.245.1",
  "wasmtime",
  "wasmtime-wasi-io",
- "wit-component 0.245.1",
-]
-
-[[package]]
-name = "helios-kernel-macro"
-version = "0.1.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 3.0.5",
- "walkdir",
- "wat",
 ]
 
 [[package]]

@@ -20,11 +20,12 @@ check-target target package:
         --target "{{target}}" \
         --profile "{{default_profile}}" \
         --cargo cargo
-    manifest="${out_dir}/kernel-prebuild.json"
-    HELIOS_KERNEL_PREBUILD_MANIFEST="${manifest}" cargo check -p helios-kernel \
+    export HELIOS_KERNEL_ROOT_PUBLIC_KEY="${out_dir}/helios-root-public.key"
+    export HELIOS_KERNEL_ROOT_SECRET_KEY="${out_dir}/helios-root-secret.key"
+    cargo check -p helios-kernel \
         --no-default-features --features wasmtime-bare-metal,embedded-debugger \
         --target "{{target}}"
-    HELIOS_KERNEL_PREBUILD_MANIFEST="${manifest}" cargo check -p "{{package}}" --target "{{target}}"
+    cargo check -p "{{package}}" --target "{{target}}"
 
 # Every clippy and rustfmt gate CI enforces.
 lint:
@@ -65,7 +66,9 @@ clippy-host:
         --target "${target}" \
         --profile "{{default_profile}}" \
         --cargo cargo
-    HELIOS_KERNEL_PREBUILD_MANIFEST="${out_dir}/kernel-prebuild.json" cargo clippy \
+    export HELIOS_KERNEL_ROOT_PUBLIC_KEY="${out_dir}/helios-root-public.key"
+    export HELIOS_KERNEL_ROOT_SECRET_KEY="${out_dir}/helios-root-secret.key"
+    cargo clippy \
         --workspace --all-targets \
         --exclude helios \
         --exclude helios-aarch64 --exclude helios-riscv --exclude helios-x86 \
@@ -103,7 +106,8 @@ test-units:
         --target "${target}" \
         --profile "{{default_profile}}" \
         --cargo cargo
-    export HELIOS_KERNEL_PREBUILD_MANIFEST="${out_dir}/kernel-prebuild.json"
+    export HELIOS_KERNEL_ROOT_PUBLIC_KEY="${out_dir}/helios-root-public.key"
+    export HELIOS_KERNEL_ROOT_SECRET_KEY="${out_dir}/helios-root-secret.key"
     cargo nextest run -p helios-hal -p helios-virtio -p helios-netstack -p helios-kernel --lib
     cargo nextest run -p helios-workspace-root --lib
     # What the desktop draws with — damage tracking, focus routing, the
@@ -127,15 +131,16 @@ clippy-target target package:
         --target "{{target}}" \
         --profile "{{default_profile}}" \
         --cargo cargo
-    manifest="${out_dir}/kernel-prebuild.json"
+    export HELIOS_KERNEL_ROOT_PUBLIC_KEY="${out_dir}/helios-root-public.key"
+    export HELIOS_KERNEL_ROOT_SECRET_KEY="${out_dir}/helios-root-secret.key"
     # Two invocations, for the same reason `check-target` uses explicit
     # features: cargo would otherwise unify helios-kernel's host defaults with
     # the backend's `wasmtime-bare-metal` selection.
-    HELIOS_KERNEL_PREBUILD_MANIFEST="${manifest}" cargo clippy \
+    cargo clippy \
         -p helios-kernel --no-default-features \
         --features wasmtime-bare-metal,embedded-debugger \
         --target "{{target}}" -- -D warnings
-    HELIOS_KERNEL_PREBUILD_MANIFEST="${manifest}" cargo clippy \
+    cargo clippy \
         -p "{{package}}" --target "{{target}}" -- -D warnings
 
 # Build the instrumented kernel image of docs/pgo.md for `arch` (aarch64,
@@ -187,9 +192,10 @@ check-host:
         --target "${target}" \
         --profile "{{default_profile}}" \
         --cargo cargo
-    manifest="${out_dir}/kernel-prebuild.json"
-    HELIOS_KERNEL_PREBUILD_MANIFEST="${manifest}" cargo check -p helios-kernel
-    HELIOS_KERNEL_PREBUILD_MANIFEST="${manifest}" cargo check -p helios-hosted
+    export HELIOS_KERNEL_ROOT_PUBLIC_KEY="${out_dir}/helios-root-public.key"
+    export HELIOS_KERNEL_ROOT_SECRET_KEY="${out_dir}/helios-root-secret.key"
+    cargo check -p helios-kernel
+    cargo check -p helios-hosted
     cargo check -p helios-inspector
     cargo check -p helios-compositor-render -p helios-desktop-text-check
 
@@ -208,8 +214,10 @@ test-embedded-debugger:
         --target "${target}" \
         --profile "{{default_profile}}" \
         --cargo cargo
-    HELIOS_KERNEL_PREBUILD_MANIFEST="${out_dir}/kernel-prebuild.json" \
-        cargo nextest run -p helios-hosted --no-capture init_program::tests::embedded_debugger_
+    export HELIOS_KERNEL_ROOT_PUBLIC_KEY="${out_dir}/helios-root-public.key"
+    export HELIOS_KERNEL_ROOT_SECRET_KEY="${out_dir}/helios-root-secret.key"
+    export HELIOS_KERNEL_PREBUILD_MANIFEST="${out_dir}/kernel-prebuild.json"
+    cargo nextest run -p helios-hosted --no-capture init_program::tests::embedded_debugger_
 
 # Unit tests and lint of the benchmark-suite tooling (tools/bench); no benchmark runs.
 check-bench-tools:

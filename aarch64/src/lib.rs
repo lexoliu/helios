@@ -552,6 +552,7 @@ extern "C" fn aarch64_kernel_main() -> ! {
     let reserved_ranges = boot_reserved_ranges(&handoff);
     let memory_regions = boot_memory_regions(&handoff, physical_memory_offset, &reserved_ranges);
     helios_kernel::prime_bootstrap_allocator(memory_regions, processor_count);
+    let payload = helios_kernel::BootPayload::from_boot_modules(&handoff.modules);
     // The rest of the description needs the heap: the ACPI path has to
     // interpret AML to reach a device's `_CRS`.
     let platform = tables
@@ -568,6 +569,7 @@ extern "C" fn aarch64_kernel_main() -> ! {
         cpu.timer_frequency(),
         cpu.processor_count(),
         cpu.now().ticks(),
+        payload,
     );
     platform_state.install_debug_state(debug_state.clone());
     let console = helios_kernel::RecordingConsole::new(

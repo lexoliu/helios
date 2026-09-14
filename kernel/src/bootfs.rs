@@ -490,8 +490,10 @@ fn with_trailing_slash(path: &str) -> String {
 mod tests {
     extern crate std;
 
+    use alloc::boxed::Box;
+
     use futures_lite::future::block_on;
-    use helios_kernel_macro::bootfs;
+    use helios_artifact::bootfs::{EntryKind, WriteEntry, write_image};
 
     use super::{BootDirectoryHandleExt, EmbeddedBootDirectory, EmbeddedBootFile, EmbeddedBootFs};
     use helios_hal::fs::{
@@ -507,7 +509,40 @@ mod tests {
             EmbeddedBootFile::new("etc/config.txt", b"config", 0),
         ],
     );
-    const MACRO_IMAGE: EmbeddedBootFs = bootfs!("tests/bootfs_data");
+
+    /// A bootfs read back out of a real `helios-bootfs` image — the same
+    /// parse the kernel applies to the payload a backend hands it.
+    fn payload_image() -> EmbeddedBootFs {
+        let bytes = write_image(&[
+            WriteEntry {
+                kind: EntryKind::InitComponent,
+                path: "init",
+                data: b"init",
+                modified_nanos: 0,
+            },
+            WriteEntry {
+                kind: EntryKind::InitArgv0,
+                path: "init",
+                data: b"",
+                modified_nanos: 0,
+            },
+            WriteEntry {
+                kind: EntryKind::File,
+                path: "bin/init.txt",
+                data: b"boot init\n",
+                modified_nanos: 0,
+            },
+            WriteEntry {
+                kind: EntryKind::File,
+                path: "lib/module.txt",
+                data: b"boot module\n",
+                modified_nanos: 0,
+            },
+        ]);
+        crate::BootPayload::parse(Box::leak(bytes.into_boxed_slice()))
+            .expect("payload image must parse")
+            .bootfs()
+    }
 
     #[test]
     fn lists_root_entries() {
@@ -552,8 +587,8 @@ mod tests {
     }
 
     #[test]
-    fn packs_directory_tree_with_macro() {
-        let root = MACRO_IMAGE.root_directory(DirectoryRights::READ);
+    fn packs_directory_tree_in_payload() {
+        let root = payload_image().root_directory(DirectoryRights::READ);
         let bin = root
             .open_directory("bin", DirectoryRights::READ)
             .expect("macro-packed bin directory must exist");
@@ -573,7 +608,7 @@ mod tests {
 
     #[test]
     fn exposes_read_only_filesystem_trait() {
-        let entry = block_on(MACRO_IMAGE.open("/lib/module.txt"))
+        let entry = block_on(payload_image().open("/lib/module.txt"))
             .expect("bootfs open should succeed")
             .expect("module.txt must exist");
         let mut file = match entry {
@@ -590,7 +625,7 @@ mod tests {
 
     #[test]
     fn lists_directories_via_filesystem_trait() {
-        let entry = block_on(MACRO_IMAGE.open("/"))
+        let entry = block_on(payload_image().open("/"))
             .expect("bootfs open should succeed")
             .expect("bootfs root must exist");
         let directory = match entry {

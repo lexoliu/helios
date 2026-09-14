@@ -1350,6 +1350,8 @@ pub(crate) struct VmConfigFile {
     #[serde(default)]
     pub(crate) kernel: Option<PathBuf>,
     #[serde(default)]
+    pub(crate) bootfs: Option<PathBuf>,
+    #[serde(default)]
     pub(crate) smp: Option<u16>,
     #[serde(default)]
     pub(crate) memory: Option<String>,
@@ -1470,6 +1472,12 @@ pub(crate) struct VmCommand {
 
     #[arg(long)]
     kernel: Option<PathBuf>,
+
+    /// The `helios-bootfs` payload the boot protocol hands the kernel —
+    /// the file `kernel-prebuild` wrote. Name one explicitly when
+    /// `--no-build --kernel` boots an image from outside this checkout.
+    #[arg(long)]
+    bootfs: Option<PathBuf>,
 
     #[arg(long)]
     socket: Option<PathBuf>,
@@ -1922,6 +1930,7 @@ struct ResolvedVmCommand {
     build: KernelBuildSpec,
     qemu_bin: PathBuf,
     kernel: PathBuf,
+    bootfs: PathBuf,
     socket: Option<PathBuf>,
     serial_stdio: bool,
     serial_pty: bool,
@@ -2337,6 +2346,10 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
         .or(file.qemu_bin)
         .unwrap_or_else(|| PathBuf::from(profile.qemu_bin));
     let kernel = resolve_kernel_path(command.kernel, file.kernel, &build)?;
+    let bootfs = match command.bootfs.or(file.bootfs) {
+        Some(bootfs) => bootfs,
+        None => bootfs_path(&build)?,
+    };
     let smp = command.smp.or(file.smp).unwrap_or(profile.default_smp);
     let memory = command
         .memory
@@ -2464,6 +2477,7 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
         build,
         qemu_bin,
         kernel,
+        bootfs,
         socket: command.socket,
         serial_stdio: command.serial_stdio,
         serial_pty: command.serial_pty,
@@ -2695,7 +2709,7 @@ fn build_vm(command: &KernelBuildSpec) -> Result<(), VmBuildError> {
             .arg("-p")
             .arg("helios-cli"),
     )?;
-    let prebuild_manifest = run_kernel_prebuild(command)?;
+    run_kernel_prebuild(command)?;
     let kernel_label = match &command.profile_use {
         // Which profile a PGO kernel was built from is part of what it
         // is, so the build says it rather than leaving a release build
@@ -2708,8 +2722,16 @@ fn build_vm(command: &KernelBuildSpec) -> Result<(), VmBuildError> {
         None => format!("building {} kernel", arch_label(command.profile.arch)),
     };
     let mut kernel_build = kernel_build_command(&repo_root, command);
+    let prebuild_dir = kernel_prebuild_dir(command)?;
     kernel_build
-        .env("HELIOS_KERNEL_PREBUILD_MANIFEST", &prebuild_manifest)
+        .env(
+            "HELIOS_KERNEL_ROOT_PUBLIC_KEY",
+            prebuild_dir.join("helios-root-public.key"),
+        )
+        .env(
+            "HELIOS_KERNEL_ROOT_SECRET_KEY",
+            prebuild_dir.join("helios-root-secret.key"),
+        )
         .arg("--target")
         .arg(command.profile.cargo_target)
         .arg("--bin")
@@ -2859,14 +2881,28 @@ fn profile_use_rustflags(profile: &VmProfile, used: &Path) -> String {
     format!("target.\"{}\".rustflags={flags}", profile.cargo_target)
 }
 
-fn run_kernel_prebuild(command: &KernelBuildSpec) -> Result<PathBuf, VmBuildError> {
-    let cli = discover_helios_cli(command.kind)?;
-    let repo_root = repo_root()?;
-    let out_dir = repo_root
+/// Where `kernel-prebuild` writes this build's manifest and
+/// `helios-bootfs` payload — the same directory the kernel build reads
+/// its trusted keys out of.
+fn kernel_prebuild_dir(build: &KernelBuildSpec) -> Result<PathBuf, WorkspaceRootError> {
+    Ok(repo_root()?
         .join("target")
         .join("kernel-prebuild")
-        .join(command.profile.cargo_target)
-        .join(command.kind.directory());
+        .join(build.profile.cargo_target)
+        .join(build.kind.directory()))
+}
+
+/// The `helios-bootfs` payload a `kernel-prebuild` run wrote for this
+/// build — the boot module the Limine image and the riscv64 initrd
+/// carry.
+fn bootfs_path(build: &KernelBuildSpec) -> Result<PathBuf, WorkspaceRootError> {
+    Ok(kernel_prebuild_dir(build)?.join("helios-bootfs"))
+}
+
+fn run_kernel_prebuild(command: &KernelBuildSpec) -> Result<(), VmBuildError> {
+    let cli = discover_helios_cli(command.kind)?;
+    let repo_root = repo_root()?;
+    let out_dir = kernel_prebuild_dir(command)?;
     let mut prebuild = Command::new(&cli);
     prebuild
         .current_dir(&repo_root)
@@ -2886,7 +2922,7 @@ fn run_kernel_prebuild(command: &KernelBuildSpec) -> Result<PathBuf, VmBuildErro
         prebuild.arg("--no-compiler-plugin");
     }
     run_step("prebuilding kernel bootfs", &mut prebuild)?;
-    Ok(out_dir.join("kernel-prebuild.json"))
+    Ok(())
 }
 
 fn connect_and_run(
@@ -4104,6 +4140,7 @@ fn prepare_limine_uefi_image(
             path: command.kernel.display().to_string(),
             source,
         })?;
+    let bootfs = command.bootfs.as_path();
     let image = match runtime_dir {
         Some(dir) => dir.join("kernel.uefi.img"),
         None => kernel.with_extension("uefi.img"),
@@ -4117,6 +4154,8 @@ fn prepare_limine_uefi_image(
         .arg("limine-uefi-image")
         .arg("--kernel")
         .arg(&kernel)
+        .arg("--bootfs")
+        .arg(bootfs)
         .arg("--output")
         .arg(&image)
         .arg("--baud")
@@ -4902,7 +4941,11 @@ impl VmRuntime {
         configure_firmware(&mut qemu, command, runtime_dir.path())?;
         match command.profile.boot_artifact {
             VmBootArtifactKind::KernelBinary => {
+                // riscv64's `-kernel` boot is the one path without a
+                // bootloader to hand modules over; the payload rides as
+                // the initrd, whose range `/chosen` publishes.
                 qemu.arg("-kernel").arg(&artifact);
+                qemu.arg("-initrd").arg(&command.bootfs);
             }
             VmBootArtifactKind::LimineUefiDiskImage => {}
         }
@@ -7167,6 +7210,7 @@ mod tests {
             config: None,
             qemu_bin: None,
             kernel: None,
+            bootfs: None,
             socket: None,
             serial_stdio: false,
             serial_pty: false,
@@ -7226,6 +7270,7 @@ mod tests {
             config: Some(missing_config),
             qemu_bin: None,
             kernel: None,
+            bootfs: None,
             socket: None,
             serial_stdio: false,
             serial_pty: false,
@@ -7364,6 +7409,7 @@ mod tests {
             config: Some(tempdir.path().join("missing-vm.json")),
             qemu_bin: None,
             kernel: None,
+            bootfs: None,
             socket: None,
             serial_stdio: false,
             serial_pty: false,
@@ -7453,7 +7499,8 @@ mod tests {
                 .arg("-p")
                 .arg("helios-cli"),
         )?;
-        let prebuild_manifest = run_kernel_prebuild(&command.build)?;
+        run_kernel_prebuild(&command.build)?;
+        let prebuild_dir = kernel_prebuild_dir(&command.build)?;
         let status = std::process::Command::new("cargo")
             .current_dir(repo_root()?)
             .arg("build")
@@ -7461,7 +7508,14 @@ mod tests {
             .arg(arch.profile().cargo_target)
             .arg("--bin")
             .arg(arch.profile().kernel_artifact_name)
-            .env("HELIOS_KERNEL_PREBUILD_MANIFEST", prebuild_manifest)
+            .env(
+                "HELIOS_KERNEL_ROOT_PUBLIC_KEY",
+                prebuild_dir.join("helios-root-public.key"),
+            )
+            .env(
+                "HELIOS_KERNEL_ROOT_SECRET_KEY",
+                prebuild_dir.join("helios-root-secret.key"),
+            )
             .env("HELIOS_WATCHDOG_SELF_TEST", "1")
             .env("HELIOS_WATCHDOG_TIMEOUT_SECS", WATCHDOG_TIMEOUT_SECS)
             .env(
@@ -7490,6 +7544,9 @@ mod tests {
             build: build.clone(),
             qemu_bin: PathBuf::from(profile.qemu_bin),
             kernel: build.kernel_path().expect("workspace root must resolve"),
+            bootfs: kernel_prebuild_dir(&build)
+                .expect("workspace root must resolve")
+                .join("helios-bootfs"),
             socket: None,
             serial_stdio: false,
             serial_pty: false,
@@ -7698,6 +7755,9 @@ mod tests {
             build: build.clone(),
             qemu_bin: PathBuf::from(profile.qemu_bin),
             kernel: build.kernel_path().expect("workspace root must resolve"),
+            bootfs: kernel_prebuild_dir(&build)
+                .expect("workspace root must resolve")
+                .join("helios-bootfs"),
             socket: None,
             serial_stdio: false,
             serial_pty: false,
