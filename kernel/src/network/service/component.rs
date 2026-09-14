@@ -253,7 +253,11 @@ where
     }
 
     pub(super) async fn drive_dns(&self) -> Result<(), DnsError> {
-        self.drive_network(NetworkPollSource::Dns)
+        // The resolver socket lives on one shard, but a lookup is not a
+        // stream operation: the answer arrives on whichever pair the
+        // device steered it to, and the exchange can still owe
+        // neighbour resolution for the resolver on the default shard.
+        self.drive_network(NetworkPollSource::Dns, NetworkPollScope::Interface)
             .await
             .map_err(|error| DnsError::from_io(error, NetworkErrorDetail::VirtioAdvanceFailed))
     }
@@ -263,9 +267,16 @@ where
             // The lease is negotiated on the default shard, which is
             // where the offer demuxes back to.
             let wait = self.default_shard_wait();
-            self.drive_network(NetworkPollSource::Configuration)
-                .await
-                .map_err(|_| NetworkControlError::BackendFault)?;
+            // Acquiring a lease is the interface operation itself: the
+            // exchange is broadcast, the offer lands on whichever pair
+            // the device put it on, and the drive carries the link and
+            // control-plane duties.
+            self.drive_network(
+                NetworkPollSource::Configuration,
+                NetworkPollScope::Interface,
+            )
+            .await
+            .map_err(|_| NetworkControlError::BackendFault)?;
             let now = StackInstant::from_nanos(self.now_nanos());
             let next = self.inner.state.with_mut(|state| {
                 state.drive_dhcp(now)?;
@@ -278,9 +289,14 @@ where
                 self.synchronize_control_plane();
                 return Ok(cidr);
             }
-            self.drive_network(NetworkPollSource::Configuration)
-                .await
-                .map_err(|_| NetworkControlError::BackendFault)?;
+            // Still the interface's own round: the retransmitted
+            // DISCOVER's offer arrives wherever the device steers it.
+            self.drive_network(
+                NetworkPollSource::Configuration,
+                NetworkPollScope::Interface,
+            )
+            .await
+            .map_err(|_| NetworkControlError::BackendFault)?;
             // This walk has no caller deadline of its own; a dropped
             // DISCOVER is retried at the client's retransmission
             // interval, and an offer that lands sooner wakes it through

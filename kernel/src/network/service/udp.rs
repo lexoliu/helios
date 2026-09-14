@@ -412,7 +412,11 @@ where
     }
 
     pub(super) async fn drive_udp(&self) -> Result<(), UdpError> {
-        self.drive_network(NetworkPollSource::Udp)
+        // A bound datagram socket is replicated on every shard — which
+        // replica a datagram lands on is decided by its flow's hash —
+        // so a datagram operation drives the whole interface rather
+        // than one shard's pair.
+        self.drive_network(NetworkPollSource::Udp, NetworkPollScope::Interface)
             .await
             .map_err(|error| UdpError::from_io(error, NetworkErrorDetail::VirtioAdvanceFailed))
     }

@@ -224,7 +224,7 @@ where
     /// receive queue is non-empty (or the peer half-closed) and leaves the
     /// queue intact.
     pub async fn tcp_readiness(&self, stream: TcpStreamId) -> Result<SocketReadiness, TcpError> {
-        self.drive_tcp().await?;
+        self.drive_tcp(self.stream_poll_scope(stream)).await?;
         let now = StackInstant::from_nanos(self.now_nanos());
         self.inner.state.with_handle(stream, |state| {
             let socket = state.tcp_socket(stream)?;
@@ -290,11 +290,16 @@ where
         bytes: &mut Bytes,
     ) -> Result<TcpWriteProgress, TcpError> {
         let budget = self.inner.poll.budget();
+        // The write's drive is scoped to the stream's own shard: the
+        // pair that shard submits on is the only ring whose completions
+        // this write can be waiting on, and the only one its segment
+        // goes out on. Every other pair has a pump parked on it.
+        let scope = self.stream_poll_scope(stream);
         // Completions first, so a ring full of used descriptors frees
         // before the new segment asks it for room — the order the full
         // poll keeps.
         let reclaimed = self
-            .reclaim_transmit_completions(budget.tx_completions, NetworkPollScope::Interface)
+            .reclaim_transmit_completions(budget.tx_completions, scope)
             .map_err(|error| TcpError::from_io(error, NetworkErrorDetail::VirtioAdvanceFailed))?;
         let now = StackInstant::from_nanos(self.now_nanos());
         let progress = self.inner.state.with_handle(stream, |state| {
@@ -308,7 +313,7 @@ where
             Ok(progress)
         })?;
         let (transmitted, _) = self
-            .submit_network_transmit(NetworkPollSource::Tcp, budget, NetworkPollScope::Interface)
+            .submit_network_transmit(NetworkPollSource::Tcp, budget, scope)
             .map_err(|error| TcpError::from_io(error, NetworkErrorDetail::VirtioAdvanceFailed))?;
         if transmitted != 0 || reclaimed != 0 {
             self.inner.poll.complete(NetworkPollProgress {
@@ -351,7 +356,7 @@ where
             if !matches!(self.tcp_send_room(stream)?, TcpWriteProgress::Pending) {
                 return Ok(());
             }
-            self.drive_tcp().await?;
+            self.drive_tcp(self.stream_poll_scope(stream)).await?;
             if !matches!(self.tcp_send_room(stream)?, TcpWriteProgress::Pending) {
                 return Ok(());
             }
@@ -364,7 +369,10 @@ where
         &self,
         listener: TcpListenerId,
     ) -> Result<SocketReadiness, TcpError> {
-        self.drive_tcp().await?;
+        // A listener is replicated on every shard — the shard its next
+        // SYN lands on is not known until that flow is hashed — so its
+        // probe drives the whole interface, not one stream's shard.
+        self.drive_tcp(NetworkPollScope::Interface).await?;
         // Readable means "some replica has a connection queued", so the
         // probe walks them the same way `accept` does.
         let readable = self
@@ -401,7 +409,7 @@ where
         self.inner
             .state
             .with_handle(stream, |state| state.shutdown_tcp_send(stream))?;
-        self.drive_tcp().await
+        self.drive_tcp(self.stream_poll_scope(stream)).await
     }
 
     /// Retires `stream`, freeing its slab slot and its stack socket.
@@ -567,7 +575,13 @@ where
             // Sampled before the handshake state is inspected, so a SYN-ACK
             // another processor drains in between resolves the wait.
             let wait = self.shard_wait_for_handle(stream);
-            self.drive_tcp().await?;
+            // The stream already names its shard, but the handshake is
+            // not established yet: the SYN-ACK arrives on whichever
+            // pair the device steered the flow to, and the exchange
+            // can still owe a neighbour resolution on the default
+            // shard. Connect keeps the whole-interface drive until the
+            // stream is up.
+            self.drive_tcp(NetworkPollScope::Interface).await?;
             let now_nanos = self.now_nanos();
             let now = StackInstant::from_nanos(now_nanos);
             let poll_connect = self.inner.state.with_handle(stream, |state| {
@@ -668,7 +682,10 @@ where
             // flow is hashed.
             let wait = self.any_shard_wait();
             let start = self.accepting_shard_idx();
-            self.drive_tcp().await?;
+            // The listener is replicated on every shard and the next
+            // SYN's shard is not known until its flow is hashed, so
+            // accept drives the whole interface rather than one pair.
+            self.drive_tcp(NetworkPollScope::Interface).await?;
             let accepted = self
                 .inner
                 .state
@@ -721,7 +738,12 @@ where
             // reclaims the peer's ACKs, and the wait it parks on was
             // sampled before this poll, so a drain that made room here
             // releases the park at once instead of being slept through.
-            self.drive_tcp().await?;
+            //
+            // The drive is scoped to the stream's own shard: the ACK
+            // that frees the writer's window arrives on the pair that
+            // shard submits on, and every other pair has a pump parked
+            // on it.
+            self.drive_tcp(self.stream_poll_scope(stream)).await?;
             match progress {
                 // `Room` queued bytes, so retry what is left. `Pending`
                 // is a full send queue, which the park below waits out;
@@ -809,7 +831,7 @@ where
             }
 
             let drive_started = self.profile_start();
-            self.drive_tcp_read_network_burst(max_bytes).await?;
+            self.drive_tcp_read_network_burst(stream, max_bytes).await?;
             self.record_network_profile("tcp-read-into-drive-network", drive_started);
             match self.poll_tcp_read_into_once(
                 stream,
@@ -943,7 +965,7 @@ where
                         profile_prefix: TcpReadPhasePrefix::Polling,
                     }),
                     true,
-                    NetworkPollScope::Interface,
+                    self.stream_poll_scope(stream),
                     &self.inner.poll,
                 )
                 .await
@@ -991,7 +1013,7 @@ where
 
             let drive_started = self.profile_start();
             let outcome = self
-                .poll_network_once(NetworkPollSource::Tcp)
+                .poll_network_once(NetworkPollSource::Tcp, self.stream_poll_scope(stream))
                 .await
                 .map_err(|error| {
                     TcpError::from_io(error, NetworkErrorDetail::VirtioAdvanceFailed)
@@ -1048,8 +1070,20 @@ where
         })
     }
 
-    pub(super) async fn drive_tcp(&self) -> Result<(), TcpError> {
-        self.drive_network(NetworkPollSource::Tcp)
+    /// The poll scope of an operation bound to one stream: the shard
+    /// its handle names, and the one queue pair that shard submits
+    /// on. Everything else already has an owner — each pair has a pump
+    /// parked on it, and a frame steered to a foreign pair still
+    /// reaches this stream through that pump and the shard's arrival,
+    /// which the operation's wait watches.
+    fn stream_poll_scope(&self, stream: TcpStreamId) -> NetworkPollScope {
+        NetworkPollScope::Shard {
+            shard: self.inner.state.shard_idx_for_handle(stream),
+        }
+    }
+
+    pub(super) async fn drive_tcp(&self, scope: NetworkPollScope) -> Result<(), TcpError> {
+        self.drive_network(NetworkPollSource::Tcp, scope)
             .await
             .map_err(|error| TcpError::from_io(error, NetworkErrorDetail::VirtioAdvanceFailed))
     }
@@ -1059,14 +1093,20 @@ where
         stream: TcpStreamId,
         max_bytes: usize,
     ) -> Result<TcpReadProgress, TcpError> {
-        self.drive_tcp_read_network_burst(max_bytes).await?;
+        self.drive_tcp_read_network_burst(stream, max_bytes).await?;
         self.poll_tcp_read_once(stream, max_bytes, TcpReadPhasePrefix::AfterDrive)
     }
 
     pub(super) async fn drive_tcp_read_network_burst(
         &self,
+        stream: TcpStreamId,
         max_bytes: usize,
     ) -> Result<(), TcpError> {
+        // A read burst belongs to the stream that asked for it: it
+        // drains and reclaims the pair the stream's shard submits on
+        // and drives that shard alone, leaving every other pair to the
+        // pump parked on it.
+        let scope = self.stream_poll_scope(stream);
         let capabilities = self.inner.device.capabilities().events;
         let rounds = if capabilities.polling && max_bytes > self.inner.device.max_frame_len() {
             NETWORK_TCP_READ_BURST_ROUNDS
@@ -1074,14 +1114,14 @@ where
             1
         };
         let outcome = self
-            .poll_network_once(NetworkPollSource::Tcp)
+            .poll_network_once(NetworkPollSource::Tcp, scope)
             .await
             .map_err(|error| TcpError::from_io(error, NetworkErrorDetail::VirtioAdvanceFailed))?;
         if rounds > 1 && outcome.0.receive_saturated(outcome.1) {
             let mut deferred_transmit = false;
             for _ in 1..rounds {
                 let outcome = self
-                    .poll_network_receive_once(NetworkPollSource::Tcp)
+                    .poll_network_receive_once(NetworkPollSource::Tcp, scope)
                     .await
                     .map_err(|error| {
                         TcpError::from_io(error, NetworkErrorDetail::VirtioAdvanceFailed)
@@ -1098,11 +1138,7 @@ where
                 // `tcp-read-drive-network` work in local AArch64/HVF profiles.
                 let budget = self.inner.poll.budget();
                 let (transmitted, _) = self
-                    .submit_network_transmit(
-                        NetworkPollSource::Tcp,
-                        budget,
-                        NetworkPollScope::Interface,
-                    )
+                    .submit_network_transmit(NetworkPollSource::Tcp, budget, scope)
                     .map_err(|error| {
                         TcpError::from_io(error, NetworkErrorDetail::VirtioAdvanceFailed)
                     })?;
@@ -1122,11 +1158,13 @@ where
     /// poll scope owns, which is what frees the scatter payloads the
     /// device was reading in place.
     ///
-    /// An operation sweeps every pair — it is the stack's whole driver
-    /// while it runs — while a pump reclaims only the pair it owns:
-    /// every other pair has a pump of its own parked on it. A pair
-    /// another processor currently holds is skipped either way: that
-    /// processor is draining it, and this poll has nothing to add.
+    /// An interface operation sweeps every pair — it is the stack's
+    /// whole driver while it runs — while a pump reclaims only the
+    /// pair it owns and a stream operation only the pair its shard
+    /// submits on: every other pair has a pump of its own parked on
+    /// it. A pair another processor currently holds is skipped either
+    /// way: that processor is draining it, and this poll has nothing
+    /// to add.
     fn reclaim_transmit_completions(
         &self,
         budget: usize,
@@ -1155,13 +1193,15 @@ where
     /// owns, which is what puts a reply into the shard that is waiting
     /// for it.
     ///
-    /// An operation sweeps every pair, because the device delivers a
-    /// frame on whichever pair *it* steered the flow to and the pump
-    /// that owns the pair may not be scheduled before this caller's own
-    /// deadline: a reply to a broadcast exchange — a DHCP offer, an ARP
-    /// reply — is hashed independently of the request that provoked it.
-    /// A pump visits only the pair it owns; every other pair has a pump
-    /// of its own parked on it, so a frame is never without a drainer.
+    /// An interface operation sweeps every pair, because the device
+    /// delivers a frame on whichever pair *it* steered the flow to and
+    /// the pump that owns the pair may not be scheduled before this
+    /// caller's own deadline: a reply to a broadcast exchange — a DHCP
+    /// offer, an ARP reply — is hashed independently of the request
+    /// that provoked it. A pump visits only the pair it owns, and a
+    /// stream operation only the pair its shard submits on; every
+    /// other pair has a pump of its own parked on it, so a frame is
+    /// never without a drainer.
     ///
     /// The local pair is visited first, so a processor drains its own
     /// ring before it looks at anyone else's, and a pair another
@@ -1296,7 +1336,7 @@ where
                 // is pair zero's async lock — worth taking only when
                 // this scope owns pair zero; any other held pair is
                 // being drained by its pump and needs nothing from us.
-                None if scope.covers_pair_zero() => {
+                None if scope.covers_pair_zero(pair_count) => {
                     let mut received_batch = 0usize;
                     for frame in &mut frames[..receive_limit] {
                         let Some(received_frame) = self.inner.device.try_receive_frame().await?
@@ -1402,7 +1442,8 @@ where
         // Each shard owns its own TCP connections, so the timer drive
         // hits every shard this scope serves: all of them for an
         // operation driving the interface, the shards that submit on
-        // the pump's pair for a pump.
+        // the pump's pair for a pump, and a stream operation's own
+        // shard alone for it.
         let drive_tcp = |state: &mut NetworkShard| {
             state
                 .stack
@@ -1415,6 +1456,10 @@ where
                 .inner
                 .state
                 .for_each_on_pair(pair, pair_count, drive_tcp),
+            NetworkPollScope::Shard { shard } => {
+                let mut guard = self.inner.state.shard_at(shard).lock();
+                drive_tcp(&mut guard);
+            }
         }
         let tcp_finished = self.profile_start();
         if let Some(probe) = tcp_read_probe {

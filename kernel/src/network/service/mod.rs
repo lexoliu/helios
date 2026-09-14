@@ -995,9 +995,16 @@ where
     }
 
     async fn drive_ipv4_configuration(&self) -> Result<bool, NetworkConfigurationError> {
-        self.drive_network(NetworkPollSource::Configuration)
-            .await
-            .map_err(NetworkConfigurationError::Device)?;
+        // Configuring the interface is the interface operation
+        // outright: the drive owes the link and control-plane sweep,
+        // and the broadcast exchange's answer lands on whichever pair
+        // the device put it on, on no one shard's pair.
+        self.drive_network(
+            NetworkPollSource::Configuration,
+            NetworkPollScope::Interface,
+        )
+        .await
+        .map_err(NetworkConfigurationError::Device)?;
         let now = StackInstant::from_nanos(self.now_nanos());
         // DHCP runs on the default shard, and so does IPv6 stateless
         // autoconfiguration: the DHCP exchange is broadcast at a moment
@@ -1022,9 +1029,14 @@ where
         if configured {
             self.synchronize_control_plane();
         }
-        self.drive_network(NetworkPollSource::Configuration)
-            .await
-            .map_err(NetworkConfigurationError::Device)?;
+        // The same interface-wide round: the solicitation just sent is
+        // answered on whichever pair the device steers the reply to.
+        self.drive_network(
+            NetworkPollSource::Configuration,
+            NetworkPollScope::Interface,
+        )
+        .await
+        .map_err(NetworkConfigurationError::Device)?;
         Ok(configured)
     }
 
@@ -1055,13 +1067,22 @@ where
     }
 
     async fn drive_ping(&self) -> Result<(), PingError> {
-        self.drive_network(NetworkPollSource::Ping)
+        // An echo exchange belongs to no stream: the reply carries no
+        // ports, demuxes to the default shard, and arrives on
+        // whichever pair the device steered it to — and while the next
+        // hop is unresolved its ARP exchange is the default shard's
+        // besides.
+        self.drive_network(NetworkPollSource::Ping, NetworkPollScope::Interface)
             .await
             .map_err(|error| PingError::from_io(error, NetworkErrorDetail::VirtioAdvanceFailed))
     }
 
-    async fn drive_network(&self, source: NetworkPollSource) -> Result<(), IoError> {
-        let _ = self.poll_network_once(source).await?;
+    async fn drive_network(
+        &self,
+        source: NetworkPollSource,
+        scope: NetworkPollScope,
+    ) -> Result<(), IoError> {
+        let _ = self.poll_network_once(source, scope).await?;
         Ok(())
     }
 
@@ -1775,8 +1796,8 @@ mod tests {
         NETWORK_TX_BATCH_FRAMES, NetworkIpAddress, NetworkPollBudget, NetworkPollProgress,
         NetworkPollScope, NetworkPollSource, NetworkPollState, NetworkPumpAction,
         NetworkPumpCadence, NetworkShard, ReplicaHandle, TcpListenerId, TcpReadProgress,
-        UdpSocketId, icmp_echo_payload, limit_udp_datagram_bytes, map_ipv4_address, parse_ipv6,
-        receive_pair_order,
+        TcpStreamId, UdpSocketId, icmp_echo_payload, limit_udp_datagram_bytes, map_ipv4_address,
+        parse_ipv6, receive_pair_order,
     };
 
     fn ipv6_tcp_frame(
@@ -3513,6 +3534,253 @@ mod tests {
         );
     }
 
+    /// #401: a stream operation's poll serves the stream's own shard
+    /// and the pair it submits on — and touches nothing else.
+    ///
+    /// The fixture mirrors
+    /// `a_frame_on_another_pair_reaches_its_shard_through_that_pairs_pump`:
+    /// on a four-pair machine a stream on shard 1 polls at
+    /// `Shard { 1 }`. The ARP request the host steered to pair 2 stays
+    /// in that ring for pair 2's pump, and the bytes queued on shard
+    /// 2's own stream never become a segment, because the poll drives
+    /// no shard but the stream's own.
+    #[test]
+    fn a_stream_poll_serves_only_its_own_shard_and_pair() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let service =
+            test_network_service_smp(4, RecordingNetworkInterface::accepting_transmissions(4));
+        let device = service.inner.device.clone();
+        let state = &service.inner.state;
+        // The default shard answers ARP for the address the host asks
+        // about.
+        state
+            .shard_at(0)
+            .lock()
+            .stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24));
+
+        // The stream the operation belongs to, on shard 1, with bytes
+        // queued for it — and a second stream on shard 2 in the same
+        // shape, whose queued bytes a wider drive would have turned
+        // into a segment.
+        let (stream, _) = established_stream_on(&service, 1, local, peer, 80);
+        let (foreign, _) = established_stream_on(&service, 2, local, peer, 443);
+        let mut own_bytes = Bytes::from_static(b"own");
+        state
+            .shard_at(1)
+            .lock()
+            .try_write_tcp_bytes(stream, &mut own_bytes)
+            .expect("an established stream takes the write");
+        let mut foreign_bytes = Bytes::from_static(b"foreign");
+        state
+            .shard_at(2)
+            .lock()
+            .try_write_tcp_bytes(foreign, &mut foreign_bytes)
+            .expect("an established stream takes the write");
+
+        // The waiter parked on the default shard samples its marks
+        // before anything lands, the way every operation does.
+        let default_wait = service.shard_wait(0);
+
+        // The host steers the ARP request to pair 2.
+        let (arp, arp_len) = arp_request_frame(peer, local);
+        device.deliver_on(2, &arp[..arp_len]);
+
+        block_on(service.poll_network_once_with_tcp_read(
+            NetworkPollSource::Tcp,
+            None,
+            true,
+            NetworkPollScope::Shard {
+                shard: state.shard_idx_for_handle(stream),
+            },
+            &service.inner.poll,
+        ))
+        .expect("the stream's poll drives its own pair");
+
+        // Assert before the pump below runs: its own drain and reclaim
+        // of pair 2 would be indistinguishable from a leak in the
+        // stream operation's scope.
+        for pair in 0..4 {
+            if pair == 1 {
+                assert_ne!(
+                    device.receive_drains_on(pair),
+                    0,
+                    "the stream operation drains the pair its shard submits on"
+                );
+                assert_ne!(
+                    device.transmit_reclaims_on(pair),
+                    0,
+                    "and reclaims its completions"
+                );
+            } else {
+                assert_eq!(
+                    device.receive_drains_on(pair),
+                    0,
+                    "pair {pair} belongs to its own pump, not to a stream operation"
+                );
+                assert_eq!(
+                    device.transmit_reclaims_on(pair),
+                    0,
+                    "and its completions to the same"
+                );
+            }
+        }
+        assert!(
+            device.transmitted_on().iter().all(|pair| *pair == 1),
+            "the stream's egress submits on the pair its shard folds onto"
+        );
+        let own_segment_sent = device.transmitted_frames().into_iter().any(|frame| {
+            EthernetFrame::parse(&frame)
+                .and_then(|ethernet| Ipv4Packet::parse(ethernet.payload))
+                .filter(|ipv4| ipv4.protocol == IpProtocol::Tcp)
+                .and_then(|ipv4| TcpPacket::parse(ipv4.payload))
+                .is_some_and(|tcp| tcp.payload == b"own".as_slice())
+        });
+        assert!(
+            own_segment_sent,
+            "the stream's own segment reaches the device on its pair"
+        );
+        assert!(
+            state.shard_at(2).lock().stack.take_outbound().is_none(),
+            "shard 2's queued bytes must still be socket bytes: the poll drives no \
+             shard but the stream's own"
+        );
+        let mut default_parked = core::pin::pin!(
+            service.wait_for_shard_progress(default_wait, core::time::Duration::from_secs(3600))
+        );
+        assert!(
+            block_on(poll_once(default_parked.as_mut())).is_none(),
+            "a frame on a foreign pair is not the stream operation's to deliver"
+        );
+
+        // Pair 2's pump drains its own pair: the ARP request demuxes
+        // to the default shard, whose arrival ends the parked wait.
+        let poll = NetworkPollState::new(
+            service.inner.poll.base_rx_budget,
+            service.inner.poll.base_tx_completion_budget,
+            service.inner.poll.base_tx_frame_budget,
+        );
+        block_on(service.poll_network_once_with_tcp_read(
+            NetworkPollSource::Pump,
+            None,
+            true,
+            NetworkPollScope::Pair {
+                pair: 2,
+                interface_wide: false,
+            },
+            &poll,
+        ))
+        .expect("the pair's pump drains it");
+        assert!(
+            block_on(poll_once(default_parked.as_mut())).is_some(),
+            "the pump hands the frame to its shard through the arrival signal"
+        );
+    }
+
+    /// The stream half of the same contract: a read's pre-park poll
+    /// still drains the pair its shard submits on, so a reply sitting
+    /// in that ring reaches the read without any pump running.
+    #[test]
+    fn a_stream_read_drains_its_own_pair_without_the_pump() {
+        const REPLY: [u8; 16] = [7; 16];
+
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let service = test_network_service_smp(4, RecordingNetworkInterface::new(4));
+        let device = service.inner.device.clone();
+
+        let (stream, local_port) = established_stream_on(&service, 2, local, peer, 80);
+
+        // The host's reply lands on the pair the stream's shard
+        // submits on.
+        let (reply, reply_len) = ipv4_tcp_frame(
+            peer,
+            local,
+            TcpHeader {
+                source_port: 80,
+                destination_port: local_port,
+                sequence: 101,
+                acknowledgement: 8,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+            },
+            &REPLY,
+        );
+        device.deliver_on(2, &reply[..reply_len]);
+
+        let read = block_on(service.tcp_read(stream, REPLY.len() as u32, u64::MAX))
+            .expect("the read should complete without a pump running");
+        assert_eq!(
+            read.as_deref(),
+            Some(&REPLY[..]),
+            "the reply the read's own poll drained"
+        );
+        for pair in 0..4 {
+            if pair == 2 {
+                assert_ne!(
+                    device.receive_drains_on(pair),
+                    0,
+                    "the read's own poll drains the pair its shard submits on"
+                );
+            } else {
+                assert_eq!(
+                    device.receive_drains_on(pair),
+                    0,
+                    "pair {pair} belongs to its own pump, not to a stream read"
+                );
+            }
+        }
+    }
+
+    /// And in the other direction: a stream's write submits on the
+    /// pair its shard folds onto and reclaims that pair's completions
+    /// only.
+    #[test]
+    fn a_stream_write_submits_and_reclaims_on_its_own_pair() {
+        /// The `tcp-latency` request: sixteen bytes, which every
+        /// congestion window and send queue has room for.
+        const REQUEST: &[u8] = b"0123456789abcdef";
+
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let service =
+            test_network_service_smp(4, RecordingNetworkInterface::accepting_transmissions(4));
+        let device = service.inner.device.clone();
+
+        let (stream, _) = established_stream_on(&service, 3, local, peer, 80);
+
+        block_on(service.tcp_write_all_bytes(stream, Bytes::from_static(REQUEST), u64::MAX))
+            .expect("a sixteen-byte write into an open window should complete");
+
+        let submitted_on = device.transmitted_on();
+        assert!(
+            !submitted_on.is_empty() && submitted_on.iter().all(|pair| *pair == 3),
+            "the write's segments submit on the pair its shard folds onto"
+        );
+        for pair in 0..4 {
+            assert_eq!(
+                device.transmit_reclaims_on(pair),
+                u64::from(pair == 3),
+                "the write reclaims pair {pair} only if its shard submits there"
+            );
+        }
+        let request_segment = device.transmitted_frames().into_iter().find_map(|frame| {
+            let ethernet = EthernetFrame::parse(&frame)?;
+            let ipv4 = Ipv4Packet::parse(ethernet.payload)?;
+            if ipv4.protocol != IpProtocol::Tcp {
+                return None;
+            }
+            let segment = TcpPacket::parse(ipv4.payload)?;
+            (!segment.payload.is_empty()).then(|| segment.payload.to_vec())
+        });
+        assert_eq!(
+            request_segment.as_deref(),
+            Some(REQUEST),
+            "the write's payload is on the wire"
+        );
+    }
+
     /// One pump per queue pair, decided from the topology: with more
     /// processors than pairs, exactly the lowest processor mapped to
     /// each pair runs one.
@@ -3653,6 +3921,96 @@ mod tests {
             crate::Timer::new(cpu),
             device,
         )
+    }
+
+    /// Opens an established TCP connection to `peer`:`peer_port` on
+    /// `shard_idx` — a local port whose replies hash back to it, the
+    /// handshake's SYN-ACK delivered straight into the shard's stack,
+    /// and whatever the handshake owed taken back off the outbound
+    /// queue — and returns the stream's handle and the port it sits
+    /// on.
+    fn established_stream_on(
+        service: &super::NetworkService<RecordingSmpCpu, RecordingNetworkInterface>,
+        shard_idx: usize,
+        local: Ipv4Address,
+        peer: Ipv4Address,
+        peer_port: u16,
+    ) -> (TcpStreamId, u16) {
+        let state = &service.inner.state;
+        // The port is picked the way `allocate_tcp_local_port_for`
+        // picks it: the one whose peer's answers hash back to the
+        // shard the connection is being placed on.
+        let local_port = (49_152..u16::MAX)
+            .find(|local_port| {
+                super::shard_idx_for_flow(
+                    IpAddress::Ipv4(local),
+                    *local_port,
+                    IpAddress::Ipv4(peer),
+                    peer_port,
+                    state.shard_count(),
+                ) == shard_idx
+            })
+            .expect("some ephemeral port hashes to the shard");
+        let stream = {
+            let mut shard = state.shard_at(shard_idx).lock();
+            shard.stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+            shard.stack.learn_neighbor(NeighborEntry {
+                ip: IpAddress::Ipv4(peer),
+                mac: PEER_MAC,
+                state: NeighborState::Reachable,
+                updated_at: StackInstant::from_nanos(0),
+            });
+            service.inner.control.publish_from_shard(&shard);
+            let socket = shard
+                .stack
+                .open_tcp_connect(
+                    TcpEndpoint {
+                        address: IpAddress::Ipv4(local),
+                        port: local_port,
+                    },
+                    TcpEndpoint {
+                        address: IpAddress::Ipv4(peer),
+                        port: peer_port,
+                    },
+                    7,
+                )
+                .expect("the test connection should allocate a socket");
+            shard.insert_tcp_stream(socket)
+        };
+        assert_eq!(
+            state.shard_idx_for_handle(stream),
+            shard_idx,
+            "the stream belongs to the shard that minted it"
+        );
+
+        let (syn_ack, syn_ack_len) = ipv4_tcp_frame(
+            peer,
+            local,
+            TcpHeader {
+                source_port: peer_port,
+                destination_port: local_port,
+                sequence: 100,
+                acknowledgement: 8,
+                flags: TcpFlags::SYN.union(TcpFlags::ACK),
+                window_size: u16::MAX,
+            },
+            &[],
+        );
+        state
+            .shard_at(shard_idx)
+            .lock()
+            .stack
+            .receive_frame(&syn_ack[..syn_ack_len], StackInstant::from_nanos(1))
+            .expect("the SYN-ACK should establish the connection");
+        // Whatever the handshake queued is not the test's business.
+        while state
+            .shard_at(shard_idx)
+            .lock()
+            .stack
+            .take_outbound()
+            .is_some()
+        {}
+        (stream, local_port)
     }
 
     /// The receive rule and the placement rule have to agree, or a
@@ -4600,8 +4958,16 @@ mod tests {
         let (arp, arp_len) = arp_request_frame(peer, local);
         device.deliver_on(0, &arp[..arp_len]);
 
-        let (progress, _) = block_on(service.poll_network_receive_once(NetworkPollSource::Pump))
-            .expect("the poll should drive the device");
+        let (progress, _) = block_on(service.poll_network_receive_once(
+            NetworkPollSource::Pump,
+            // The scope the one pair's pump runs on a single-pair
+            // interface: pair zero, carrying the interface-wide duties.
+            NetworkPollScope::Pair {
+                pair: 0,
+                interface_wide: true,
+            },
+        ))
+        .expect("the poll should drive the device");
 
         assert_eq!(
             progress.received_frames, 1,
@@ -4652,8 +5018,15 @@ mod tests {
         // batch the drain is filling.
         device.refuse_on(0, helios_hal::io::IoError::DeviceFault);
 
-        let Err(error) = block_on(service.poll_network_receive_once(NetworkPollSource::Pump))
-        else {
+        let Err(error) = block_on(service.poll_network_receive_once(
+            NetworkPollSource::Pump,
+            // The scope the one pair's pump runs on a single-pair
+            // interface: pair zero, carrying the interface-wide duties.
+            NetworkPollScope::Pair {
+                pair: 0,
+                interface_wide: true,
+            },
+        )) else {
             panic!("the refusal is still reported to the caller");
         };
         assert_eq!(error, helios_hal::io::IoError::DeviceFault);

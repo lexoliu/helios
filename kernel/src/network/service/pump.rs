@@ -61,10 +61,15 @@ pub(super) enum NetworkPollSource {
 
 /// What of the interface one poll round serves.
 ///
-/// The split is between the packet pump and everyone else. A pump is
-/// one queue pair's owner and works only what that pair carries; a
-/// socket operation that polls is the stack's whole driver while it
-/// runs, so it works everything.
+/// The split is who owns what. A packet pump owns one queue pair: its
+/// rings, and the shards whose egress submits on it. A stream
+/// operation owns the shard its handle lives on: that shard's timers
+/// and egress, and the one queue pair the shard submits on — every
+/// other pair has a pump of its own parked on it. An interface
+/// operation — configuration, ping, DNS, a replicated UDP socket or
+/// listener — owns the whole interface: the shard its answer belongs
+/// to is not known until its flow is hashed, or it carries no flow at
+/// all.
 #[derive(Clone, Copy)]
 pub(super) enum NetworkPollScope {
     /// Every queue pair's rings and every shard's timers and egress,
@@ -77,17 +82,25 @@ pub(super) enum NetworkPollScope {
     /// events and control-plane publication belong to it, because
     /// they arrive on no pair at all.
     Pair { pair: usize, interface_wide: bool },
+    /// One shard: its timers and egress, and the single queue pair
+    /// the shard submits on. A frame steered to a different pair is
+    /// that pair's pump's to deliver, which the stream's wait observes
+    /// through the shard's arrival either way.
+    Shard { shard: usize },
 }
 
 impl NetworkPollScope {
     /// Whether this poll acts on link and configuration state and
-    /// republishes the control plane — true for operations, which keep
-    /// their whole-interface shape, and for the bootstrap processor's
-    /// pump, which carries the duties no pair owns.
+    /// republishes the control plane — true for interface operations,
+    /// which keep their whole-interface shape, and for the bootstrap
+    /// processor's pump, which carries the duties no pair owns. A
+    /// stream operation owns none of them: link and configuration are
+    /// the bootstrap pump's.
     pub(super) const fn interface_wide(self) -> bool {
         match self {
             Self::Interface => true,
             Self::Pair { interface_wide, .. } => interface_wide,
+            Self::Shard { .. } => false,
         }
     }
 
@@ -95,32 +108,38 @@ impl NetworkPollScope {
     /// egress. A pump serves the shards that submit on its pair — the
     /// ones whose index folds onto it — so with more processors than
     /// pairs the pair's pump still covers every shard the pair carries.
+    /// A stream operation serves its own shard alone.
     pub(super) fn serves_shard(self, shard_idx: usize, pair_count: usize) -> bool {
         match self {
             Self::Interface => true,
             Self::Pair { pair, .. } => shard_idx % pair_count == pair,
+            Self::Shard { shard } => shard_idx == shard,
         }
     }
 
-    /// The queue pairs this poll drains and reclaims: an operation
-    /// sweeps every pair starting at its own; a pump visits only the
-    /// pair it owns.
+    /// The queue pairs this poll drains and reclaims: an interface
+    /// operation sweeps every pair starting at its own; a pump visits
+    /// only the pair it owns; a stream operation visits only the pair
+    /// its shard submits on.
     pub(super) fn pairs(self, local_pair: usize, pair_count: usize) -> NetworkPollPairs {
         match self {
             Self::Interface => NetworkPollPairs::Sweep(receive_pair_order(local_pair, pair_count)),
             Self::Pair { pair, .. } => NetworkPollPairs::One(core::iter::once(pair)),
+            Self::Shard { shard } => NetworkPollPairs::One(core::iter::once(shard % pair_count)),
         }
     }
 
     /// Whether the pair-agnostic async receive fallback is this scope's
     /// to use. The fallback drains pair zero under its async lock, so
-    /// it belongs to the scope that owns pair zero — every operation,
-    /// and the pump on pair zero — not to a pump whose pair somebody
+    /// it belongs to whoever owns pair zero — every interface
+    /// operation, the pump on pair zero, and a stream operation whose
+    /// shard submits on pair zero — not to a poll whose pair somebody
     /// else is already draining.
-    pub(super) const fn covers_pair_zero(self) -> bool {
+    pub(super) const fn covers_pair_zero(self, pair_count: usize) -> bool {
         match self {
             Self::Interface => true,
             Self::Pair { pair, .. } => pair == 0,
+            Self::Shard { shard } => shard % pair_count == 0,
         }
     }
 
@@ -142,8 +161,8 @@ impl NetworkPollScope {
 }
 
 /// The pair walk [`NetworkPollScope::pairs`] returns: either the
-/// operation's sweep of every pair starting at its own, or the pump's
-/// single pair.
+/// interface operation's sweep of every pair starting at its own, or
+/// the single pair a pump or a stream operation owns.
 pub(super) enum NetworkPollPairs {
     Sweep(ReceivePairOrder),
     One(core::iter::Once<usize>),
@@ -411,34 +430,34 @@ where
         }
     }
 
+    /// One full poll round on the pairs and shards `scope` owns.
+    ///
+    /// The budget is always the shared `self.inner.poll`: adapting it
+    /// is how the interface's aggregate demand is learned, and a
+    /// stream operation's round is part of that demand just as an
+    /// interface operation's is. Only a pump runs on a budget of its
+    /// own, since a pair running hot should widen its own drain rather
+    /// than every pair's.
     pub(super) async fn poll_network_once(
         &self,
         source: NetworkPollSource,
+        scope: NetworkPollScope,
     ) -> Result<(NetworkPollProgress, NetworkPollBudget), IoError> {
         let outcome = self
-            .poll_network_once_with_tcp_read(
-                source,
-                None,
-                true,
-                NetworkPollScope::Interface,
-                &self.inner.poll,
-            )
+            .poll_network_once_with_tcp_read(source, None, true, scope, &self.inner.poll)
             .await?;
         Ok((outcome.progress, outcome.budget))
     }
 
+    /// The receive half of [`Self::poll_network_once`], for a burst
+    /// that continues a drain without re-submitting egress.
     pub(super) async fn poll_network_receive_once(
         &self,
         source: NetworkPollSource,
+        scope: NetworkPollScope,
     ) -> Result<(NetworkPollProgress, NetworkPollBudget), IoError> {
         let outcome = self
-            .poll_network_once_with_tcp_read(
-                source,
-                None,
-                false,
-                NetworkPollScope::Interface,
-                &self.inner.poll,
-            )
+            .poll_network_once_with_tcp_read(source, None, false, scope, &self.inner.poll)
             .await?;
         Ok((outcome.progress, outcome.budget))
     }
@@ -446,7 +465,7 @@ where
     /// Drains the egress this poll scope owns onto its ring and rings
     /// the doorbell: every shard's for an operation driving the
     /// interface, the shards that submit on the pump's pair for a
-    /// pump.
+    /// pump, the one shard a stream operation owns for it.
     ///
     /// Synchronous because nothing in it awaits: the stack's outbound
     /// drain and the device's `try_lock` submit both complete where they

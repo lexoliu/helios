@@ -447,9 +447,16 @@ struct RecordingInterfaceState {
     /// one built with [`RecordingNetworkInterface::accepting_transmissions`]
     /// takes every frame and counts it instead.
     accept_transmissions: bool,
-    /// Every frame the transmit ring took, headers and payload joined,
-    /// in the order it took them.
-    transmitted: spin::Mutex<alloc::vec::Vec<alloc::vec::Vec<u8>>>,
+    /// Every frame the transmit ring took: the pair it was submitted
+    /// on, then its headers and payload joined, in the order it took
+    /// them.
+    transmitted: spin::Mutex<alloc::vec::Vec<(usize, alloc::vec::Vec<u8>)>>,
+    /// How many receive drains each queue pair has served — a scope
+    /// that leaves a pair alone shows up as a zero here.
+    receive_drains: alloc::vec::Vec<AtomicU64>,
+    /// How many transmit-completion reclaims each queue pair has
+    /// served, for the same assertion in the other direction.
+    transmit_reclaims: alloc::vec::Vec<AtomicU64>,
 }
 
 impl RecordingNetworkInterface {
@@ -479,6 +486,8 @@ impl RecordingNetworkInterface {
                 device_signal: crate::ProgressSignal::new(),
                 accept_transmissions,
                 transmitted: spin::Mutex::new(alloc::vec::Vec::new()),
+                receive_drains: (0..queue_pairs).map(|_| AtomicU64::new(0)).collect(),
+                transmit_reclaims: (0..queue_pairs).map(|_| AtomicU64::new(0)).collect(),
             }),
         }
     }
@@ -486,7 +495,35 @@ impl RecordingNetworkInterface {
     /// The frames the transmit ring has taken since the interface was
     /// built, each with its scatter payload appended to its headers.
     pub(crate) fn transmitted_frames(&self) -> alloc::vec::Vec<alloc::vec::Vec<u8>> {
-        self.inner.transmitted.lock().clone()
+        self.inner
+            .transmitted
+            .lock()
+            .iter()
+            .map(|(_, bytes)| bytes.clone())
+            .collect()
+    }
+
+    /// The queue pair each transmitted frame was submitted on, in the
+    /// order the frames were taken.
+    pub(crate) fn transmitted_on(&self) -> alloc::vec::Vec<usize> {
+        self.inner
+            .transmitted
+            .lock()
+            .iter()
+            .map(|(pair, _)| *pair)
+            .collect()
+    }
+
+    /// How many receive drains `queue_idx`'s ring has served since the
+    /// interface was built.
+    pub(crate) fn receive_drains_on(&self, queue_idx: usize) -> u64 {
+        self.inner.receive_drains[queue_idx].load(Ordering::Acquire)
+    }
+
+    /// How many transmit-completion reclaims `queue_idx` has served
+    /// since the interface was built.
+    pub(crate) fn transmit_reclaims_on(&self, queue_idx: usize) -> u64 {
+        self.inner.transmit_reclaims[queue_idx].load(Ordering::Acquire)
     }
 
     /// Puts a frame in one queue pair's receive ring, where the next
@@ -597,6 +634,7 @@ impl helios_netstack::NetworkInterface for RecordingNetworkInterface {
     where
         'a: 'slots,
     {
+        self.inner.receive_drains[queue_idx].fetch_add(1, Ordering::AcqRel);
         let mut pending = self.inner.pending[queue_idx].lock();
         let mut received = 0;
         for slot in slots.iter_mut() {
@@ -633,7 +671,7 @@ impl helios_netstack::NetworkInterface for RecordingNetworkInterface {
 
     fn try_transmit_scatter_immediate_on(
         &self,
-        _: usize,
+        queue_idx: usize,
         frames: &[helios_netstack::TxFrameRef<'_>],
     ) -> helios_hal::io::IoResult<Option<usize>> {
         if !self.inner.accept_transmissions {
@@ -645,16 +683,17 @@ impl helios_netstack::NetworkInterface for RecordingNetworkInterface {
             if let Some(payload) = frame.payload {
                 bytes.extend_from_slice(payload);
             }
-            transmitted.push(bytes);
+            transmitted.push((queue_idx, bytes));
         }
         Ok(Some(frames.len()))
     }
 
     fn reclaim_transmit_completions_immediate_on(
         &self,
-        _: usize,
+        queue_idx: usize,
         _: usize,
     ) -> helios_hal::io::IoResult<Option<usize>> {
+        self.inner.transmit_reclaims[queue_idx].fetch_add(1, Ordering::AcqRel);
         Ok(Some(0))
     }
 
