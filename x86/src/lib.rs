@@ -205,6 +205,9 @@ fn x86_kernel_main() -> ! {
         debug_state.clone(),
     );
     smp::activate_runtime(boot.bootstrap_runtime());
+    // The local APIC is enabled once, here, and never re-attached on the
+    // interrupt or IPI paths (`smp::ProcessorRuntime::attach_local_apic`).
+    smp::current_runtime().attach_local_apic();
     exceptions::install_for_current_processor();
     let console = serial_console(debug_state.clone());
     let cpu = X86Cpu::new(boot.platform());
@@ -936,6 +939,7 @@ extern "C" fn secondary_start_rust(
     let boot = unsafe { &*boot };
     let runtime = unsafe { &*runtime };
     smp::activate_runtime(runtime);
+    smp::current_runtime().attach_local_apic();
     exceptions::install_for_current_processor();
     exceptions::verify_page_fault_returns();
 
