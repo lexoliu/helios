@@ -146,6 +146,11 @@ class RunOptions:
     # against the plain release build of this checkout: what varies
     # between the columns is the profile, not the source.
     profile_use: Path | None = None
+    # The merged `.profdata` the second image of a `--baseline-ref`
+    # pairing is compiled against: the baseline column's own collection,
+    # so a paired run holds each commit's kernel to a profile collected
+    # from that commit rather than both to one fetched profile (#384).
+    baseline_profile_use: Path | None = None
     # The baseline built without the fetched kernel profile: the plain
     # control of a PGO measurement (docs/pgo.md, #322). Alone, it pairs
     # this checkout's profile-guided release kernel against its plain one;
@@ -159,6 +164,18 @@ class RunOptions:
                 f"and a release kernel of lane {self.lane.name} ({self.lane.helios_arch}) reads "
                 "no profile: its plain build is the only build (docs/pgo.md)"
             )
+        if self.baseline_profile_use is not None:
+            if self.baseline is None:
+                raise SystemExit(
+                    "--baseline-profile-use names the profile the second image of a "
+                    "--baseline-ref pairing is built against; without a baseline ref "
+                    "there is no second image to name it for"
+                )
+            if self.plain_baseline:
+                raise SystemExit(
+                    "--baseline-profile-use with --baseline-kernel-build release: "
+                    "the plain control reads no profile"
+                )
 
     @property
     def paired(self) -> bool:
@@ -192,7 +209,11 @@ class RunOptions:
             return None
         if self.plain_baseline:
             return RELEASE_BUILD
-        return PROFILE_USE_BUILD if self.reads_release_profile else RELEASE_BUILD
+        return (
+            PROFILE_USE_BUILD
+            if self.reads_release_profile or self.baseline_profile_use is not None
+            else RELEASE_BUILD
+        )
 
 
 @dataclass(frozen=True)
@@ -391,15 +412,20 @@ def kernel_profiles(options: RunOptions) -> tuple[str | None, str | None]:
 
     The candidate reads the profile the run named, and otherwise the
     release's on a lane whose release builds read one. The baseline image
-    is built plain, so it reads the release's or none — which is exactly
-    what a PGO pairing measures once every release publishes a profile:
-    the release's counts against a freshly collected set (#226).
+    reads the profile `--baseline-profile-use` named — its own column's
+    collection, when a paired run gathers one per column — and otherwise
+    the release's or none, which is exactly what a PGO pairing measures
+    once every release publishes a profile: the release's counts against
+    a freshly collected set (#226, #384).
     """
     fetched = fetched_kernel_profile_label() if options.reads_release_profile else None
     candidate = profile_label(options.profile_use) if options.profile_use else fetched
     if not options.paired or options.plain_baseline:
         return candidate, None
-    return candidate, fetched
+    baseline = (
+        profile_label(options.baseline_profile_use) if options.baseline_profile_use is not None else fetched
+    )
+    return candidate, baseline
 
 
 def baseline_arguments(options: RunOptions, out_root: Path) -> list[str]:
@@ -414,6 +440,8 @@ def baseline_arguments(options: RunOptions, out_root: Path) -> list[str]:
         arguments.extend(["--helios-profile-use", str(options.profile_use)])
     if options.baseline is not None:
         arguments.extend(["--helios-baseline-root", str(options.baseline.worktree)])
+    if options.baseline_profile_use is not None:
+        arguments.extend(["--helios-baseline-profile-use", str(options.baseline_profile_use)])
     if options.plain_baseline:
         arguments.append("--helios-baseline-without-kernel-profile")
     if not arguments:
@@ -798,7 +826,10 @@ def retry(
     the files it expected rather than reporting a floor of zero.
     """
     result = evaluate_paired(report)
-    if result is None or not result.inconclusive:
+    # Only the floor can be redrawn on this host: an under-profiled column
+    # needs a profile collected from its own commit, which a second pass
+    # of the same builds cannot produce (#384).
+    if result is None or result.noise_floor <= result.floor_bound:
         return None
     if options.job_timeout_minutes is not None:
         remaining = options.job_timeout_minutes * 60 - (time.monotonic() - run_started)
@@ -944,7 +975,11 @@ def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) ->
             kernel_pgo_uncovered(
                 options.baseline.worktree if options.baseline is not None else REPO_ROOT,
                 lane,
-                None,
+                # A per-column profile names the baseline's own
+                # pgo-kernels/<digest> build directory the same way the
+                # candidate's does (#384); None is the shared
+                # fetched-profile build it replaces.
+                options.baseline_profile_use,
             )
             if options.baseline_kernel_build == PROFILE_USE_BUILD
             else None

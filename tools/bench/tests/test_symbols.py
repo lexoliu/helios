@@ -133,16 +133,25 @@ def test_export_finds_a_profile_use_release_kernel(tmp_path, kernel_elf):
 def test_export_finds_a_kernel_built_against_a_named_profile(tmp_path, kernel_elf):
     """A `--profile-use` kernel is a `profile-use` build in a directory
     keyed to its profile (#327), so the export has to look there too or
-    the candidate column of a PGO pairing has no symbols."""
+    the candidate column of a PGO pairing has no symbols — and under the
+    baseline worktree's `target/` as well, where a paired run's baseline
+    column builds against its own collection (#384)."""
     root = tmp_path / "checkout"
-    image = root / "target/pgo-kernels/6f1c9a2b3d4e5f60/x86_64-unknown-none/profile-use/helios"
-    image.parent.mkdir(parents=True)
-    image.write_bytes(kernel_elf)
+    images = [
+        root / "target/pgo-kernels/6f1c9a2b3d4e5f60/x86_64-unknown-none/profile-use/helios",
+        root
+        / "target/perf-baselines/worktrees/baseline/target/pgo-kernels/0a1b2c3d4e5f6071"
+        / "x86_64-unknown-none/profile-use/helios",
+    ]
+    for image in images:
+        image.parent.mkdir(parents=True)
+        image.write_bytes(kernel_elf)
 
     written = export_kernel_symbols(root, tmp_path / "symbols")
 
-    assert len(written) == 1
-    assert json.loads(written[0].read_text())["image"] == image.relative_to(root).as_posix()
+    assert {json.loads(path.read_text())["image"] for path in written} == {
+        image.relative_to(root).as_posix() for image in images
+    }
 
 
 def test_missing_kernels_are_refused(tmp_path):

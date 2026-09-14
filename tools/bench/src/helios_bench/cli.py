@@ -71,6 +71,7 @@ def command_run(args: argparse.Namespace) -> int:
         ),
         baseline=baseline,
         profile_use=args.profile_use.resolve() if args.profile_use else None,
+        baseline_profile_use=(args.baseline_profile_use.resolve() if args.baseline_profile_use else None),
         plain_baseline=plain_baseline,
     )
     report = run_suite(options, manifest, dry_run=args.dry_run)
@@ -253,6 +254,18 @@ def build_parser() -> argparse.ArgumentParser:
             "against the plain release kernel of this same commit, on this host in this "
             "job (docs/pgo.md); the profile is what bench-suite.yml's profile-generate "
             "job uploads"
+        ),
+    )
+    run.add_argument(
+        "--baseline-profile-use",
+        type=Path,
+        default=None,
+        help=(
+            "build the second image of a --baseline-ref pairing against this merged "
+            ".profdata — the baseline column's own collection, so a paired run holds "
+            "each commit's kernel to a profile collected from that commit "
+            "(docs/pgo.md, #384); refused with --baseline-kernel-build release, the "
+            "plain control that reads no profile"
         ),
     )
     run.add_argument(

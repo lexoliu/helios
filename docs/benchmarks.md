@@ -509,7 +509,11 @@ the candidate's `target/`, where the runner cache restores it; the
 checkout reaches it through its `target/` link.
 
 The second image is built the way a release build of the lane is, which
-on x86-64 reads the fetched kernel profile (`docs/pgo.md`).
+on x86-64 reads the fetched kernel profile (`docs/pgo.md`) — or, in a
+paired run, the profile its own column's collection produced:
+`--baseline-profile-use` builds it against a named `.profdata` the way
+`--profile-use` does the candidate's, so each commit's kernel is held to
+a profile collected from that commit (#384).
 `--baseline-kernel-build release` builds it without one instead: alone,
 that pairs this commit's profile-guided kernel against its plain one,
 the control of a PGO measurement; with `--baseline-ref`, that commit's
@@ -611,7 +615,19 @@ own under `$XDG_RUNTIME_DIR` and links it as `<runtime>/sockets`; see
 revision acceptance: it runs only `helios` and `helios_baseline`, with
 all workloads, warm iterations, before/after compute controls, and the
 same enforced paired gate. It does not run the unrelated Linux
-comparisons or independent profile-generation/PGO experiment. Unpaired
+comparisons or the independent profile-generation/PGO experiment —
+`profile-generate` and `suite-pgo` answer what a fresh profile on the
+default branch buys, and a comparison between a commit and its baseline
+is not that. But the comparison still costs a profile per column: the
+`profile-columns` job runs `kernel-profile.yml` once at the run's own
+commit and once at the ref the suite pairs against — `baseline_ref`, or
+a labelled pull request's base — and the two artifacts feed the two
+columns' builds, because a candidate held to a profile of the default
+branch's kernel would bill a stale-profile term to the change (#384). A
+`baseline_kernel_build=release` control collects only the candidate's.
+The paired gate holds each column's uncovered share to a bound and is
+inconclusive for the named reason when either exceeds it, the way it is
+for a noisy host. Unpaired
 dispatches, labelled PR runs, dedicated runs and publication events retain
 the full suite and profiling flow. Mode selection is computed once by the
 tooling job, so profile generation starts only after tooling succeeds.

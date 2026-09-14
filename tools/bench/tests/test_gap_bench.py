@@ -99,3 +99,32 @@ def test_the_plain_control_reaches_the_harness_and_the_artifact_lookup(tmp_path)
         module.harness_environment(candidate, paired=True)["HELIOS_WORKLOAD_BENCH_WITHOUT_KERNEL_PROFILE"]
         == ""
     )
+
+
+def test_the_baselines_own_profile_reaches_the_harness(tmp_path):
+    """#384: the baseline image's own collection is handed to its boots
+    the way the candidate's is, and the parser takes the flag the plan
+    emits."""
+    module = gap_bench()
+    profile = tmp_path / "helios-kernel.profdata"
+    profile.write_bytes(b"\x00" * 16)
+    baseline = module.HeliosImage(
+        name="helios-baseline",
+        workspace_root=tmp_path / "baseline",
+        out_dir=tmp_path / "out",
+        profile_use=profile,
+    )
+    candidate = module.HeliosImage(
+        name="helios",
+        workspace_root=tmp_path,
+        out_dir=tmp_path / "out",
+        profile_use=tmp_path / "candidate.profdata",
+    )
+    assert module.harness_environment(baseline, paired=True)["HELIOS_WORKLOAD_BENCH_PROFILE_USE"] == str(
+        profile
+    )
+    assert module.harness_environment(candidate, paired=True)["HELIOS_WORKLOAD_BENCH_PROFILE_USE"] == str(
+        tmp_path / "candidate.profdata"
+    )
+    args = module.build_parser().parse_args(["--helios-baseline-profile-use", str(profile)])
+    assert args.helios_baseline_profile_use == profile
