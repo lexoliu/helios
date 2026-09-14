@@ -61,8 +61,14 @@ const TCP_RECEIVE_OVERFLOW_INITIAL_SEGMENTS: usize = 64;
 const TCP_RECEIVE_BYTES: usize = MAX_TCP_RECEIVE_SEGMENTS * TCP_RECEIVE_SEGMENT_BYTES;
 const TCP_RECEIVE_BACKPRESSURE_BYTES: usize =
     TCP_RECEIVE_BACKPRESSURE_SEGMENTS * TCP_RECEIVE_SEGMENT_BYTES;
-const TCP_SMALL_PAYLOAD_ACK_BYTES: usize = TCP_RECEIVE_SEGMENT_BYTES / 2;
 const TCP_DELAYED_ACK_SEGMENTS: u8 = 2;
+// A peer that coalesces its small writes (a Linux sender without
+// TCP_NODELAY) holds its next write until the segment in flight is
+// acknowledged, so leaving a fresh connection's first segments to the
+// 40 ms delayed-ACK timer stalls the very exchanges that open its
+// congestion window. Linux answers a young connection's inbound
+// segments immediately under a quick-ack budget of the same order.
+pub(crate) const TCP_QUICKACK_SEGMENTS: u8 = 16;
 const TCP_WINDOW_UPDATE_BYTES: u16 = (TCP_RECEIVE_SEGMENT_BYTES * 4) as u16;
 /// Acknowledgements a socket may owe at once.
 ///
@@ -809,6 +815,10 @@ where
     delayed_ack_deadline_nanos: Option<u64>,
     time_wait_deadline_nanos: Option<u64>,
     unacked_receive_segments: u8,
+    /// Inbound data segments this connection still answers
+    /// immediately; once spent, [`TCP_DELAYED_ACK_SEGMENTS`] and the
+    /// delayed-ACK timer take over.
+    quickack_segments_remaining: u8,
     pending_window_update_bytes: u32,
     /// Whether the acknowledgement this socket owes exists to
     /// reopen its receive window rather than to acknowledge data.
@@ -985,6 +995,7 @@ where
             delayed_ack_deadline_nanos: None,
             time_wait_deadline_nanos: None,
             unacked_receive_segments: 0,
+            quickack_segments_remaining: TCP_QUICKACK_SEGMENTS,
             pending_window_update_bytes: 0,
             pending_ack_reopens_window: false,
             hop_limit: crate::DEFAULT_HOP_LIMIT,
@@ -1244,7 +1255,6 @@ where
     /// it repeat the same window.
     pub fn mark_ack_queued(&mut self) -> TcpAckQueued {
         self.note_ack_emitted();
-        self.delayed_ack_deadline_nanos = None;
         TcpAckQueued {
             reopened_window: core::mem::take(&mut self.pending_ack_reopens_window),
         }
@@ -1698,7 +1708,6 @@ where
             self.schedule_next_pacing_send(sequence_len, now_nanos);
         }
         self.note_ack_emitted();
-        self.delayed_ack_deadline_nanos = None;
         Some(TcpTransmitSegment {
             local,
             remote,
@@ -2206,6 +2215,7 @@ where
         self.delayed_ack_deadline_nanos = None;
         self.time_wait_deadline_nanos = None;
         self.unacked_receive_segments = 0;
+        self.quickack_segments_remaining = TCP_QUICKACK_SEGMENTS;
         self.pending_window_update_bytes = 0;
         self.pending_ack_reopens_window = false;
     }
@@ -2731,7 +2741,7 @@ where
         let drained_segments = self.drain_contiguous_out_of_order();
         self.refresh_advertised_window();
         if drained_segments == 0 {
-            self.note_inbound_payload(payload_len, now_nanos);
+            self.note_inbound_payload(now_nanos);
         } else {
             self.request_ack();
         }
@@ -2918,11 +2928,11 @@ where
         Ok(())
     }
 
-    fn note_inbound_payload(&mut self, payload_len: usize, now_nanos: u64) {
+    fn note_inbound_payload(&mut self, now_nanos: u64) {
         self.unacked_receive_segments = self.unacked_receive_segments.saturating_add(1);
-        if self.unacked_receive_segments >= TCP_DELAYED_ACK_SEGMENTS
-            || payload_len < TCP_SMALL_PAYLOAD_ACK_BYTES
-        {
+        let quickack = self.quickack_segments_remaining != 0;
+        self.quickack_segments_remaining = self.quickack_segments_remaining.saturating_sub(1);
+        if quickack || self.unacked_receive_segments >= TCP_DELAYED_ACK_SEGMENTS {
             self.request_ack();
         } else if self.delayed_ack_deadline_nanos.is_none() {
             self.delayed_ack_deadline_nanos = Some(now_nanos.saturating_add(TCP_DELAYED_ACK_NANOS));
@@ -3007,8 +3017,14 @@ where
     /// header carries `receive_next` and `advertised_window`, so the
     /// snapshot is taken here rather than at each of the three places a
     /// header is built.
+    ///
+    /// The frame acknowledges everything received so far whether or not
+    /// it is a pure ACK — a data segment or a FIN discharges the
+    /// delayed-ACK bookkeeping exactly the same way.
     fn note_ack_emitted(&mut self) {
         self.pending_acks = self.pending_acks.saturating_sub(1);
+        self.delayed_ack_deadline_nanos = None;
+        self.unacked_receive_segments = 0;
         self.last_ack_sent = Some(TcpAckSnapshot {
             acknowledgement: self.receive_next,
             window_bytes: self.local_receive_window_bytes(),
@@ -5572,6 +5588,9 @@ mod tests {
             TCP_INITIAL_RTO_NANOS,
         );
         socket.mark_ack_queued();
+        // Past the quick-ack window every segment belongs to the
+        // delayed-ack rules.
+        socket.quickack_segments_remaining = 0;
 
         let payload = [0u8; TCP_RECEIVE_SEGMENT_BYTES];
         let _ = deliver_segment(
@@ -5610,6 +5629,7 @@ mod tests {
     #[test]
     fn full_size_receive_payload_delayed_ack_expires() {
         let mut socket = established_socket();
+        socket.quickack_segments_remaining = 0;
         let payload = [0u8; TCP_RECEIVE_SEGMENT_BYTES];
         let received_at = TCP_INITIAL_RTO_NANOS + 1;
         let _ = deliver_segment(
@@ -5639,8 +5659,11 @@ mod tests {
         assert_eq!(socket.next_deadline_nanos(), None);
     }
 
+    /// Inside the quick-ack window every inbound segment — a small one
+    /// included — is acknowledged at once so a peer holding back its
+    /// next write behind Nagle is not stalled on the delayed-ack timer.
     #[test]
-    fn small_receive_payload_ack_is_immediate() {
+    fn quickack_window_receive_payload_ack_is_immediate() {
         let mut socket = TcpSocket::connect(endpoint(49152), peer(80), 7, BbrV3::new(1460));
         socket.mark_syn_queued(0);
         let _ = deliver_segment(
@@ -5674,6 +5697,45 @@ mod tests {
             TCP_INITIAL_RTO_NANOS + 1,
         );
         assert!(socket.pending_ack().is_some());
+    }
+
+    /// Once the quick-ack window is spent a small segment waits on the
+    /// delayed-ack timer like any other, and the next outbound segment
+    /// carries the acknowledgement with it.
+    #[test]
+    fn small_receive_payload_delayed_ack_rides_next_outbound_segment() {
+        let mut socket = established_socket();
+        socket.quickack_segments_remaining = 0;
+
+        let received_at = TCP_INITIAL_RTO_NANOS + 1;
+        let _ = deliver_segment(
+            &mut socket,
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 101,
+                acknowledgement: 8,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+                options: TcpOptions::empty(),
+                payload: b"ok",
+            },
+            received_at,
+        );
+        assert_eq!(socket.pending_ack(), None);
+        assert_eq!(
+            socket.delayed_ack_deadline_nanos,
+            Some(received_at + TCP_DELAYED_ACK_NANOS)
+        );
+
+        assert_eq!(socket.queue_send(b"reply"), 5);
+        let segment = socket
+            .take_transmit_segment(received_at + 1, TcpSegmentBudget::wire_segments(usize::MAX))
+            .expect("queued data should carry the delayed acknowledgement");
+        assert_eq!(segment.header.acknowledgement, socket.receive_next);
+        assert_eq!(segment.payload.as_ref(), b"reply");
+        assert_eq!(socket.delayed_ack_deadline_nanos, None);
+        assert_eq!(socket.pending_ack(), None);
     }
 
     #[test]
