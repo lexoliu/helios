@@ -237,6 +237,50 @@ impl NetworkPollSource {
         }
     }
 
+    pub(super) const fn rx_ring_phase(self) -> &'static str {
+        match self {
+            Self::Pump => "rx-ring-pump",
+            Self::Ping => "rx-ring-ping",
+            Self::Dns => "rx-ring-dns",
+            Self::Tcp => "rx-ring-tcp",
+            Self::Udp => "rx-ring-udp",
+            Self::Configuration => "rx-ring-configuration",
+        }
+    }
+
+    pub(super) const fn rx_dispatch_phase(self) -> &'static str {
+        match self {
+            Self::Pump => "rx-dispatch-pump",
+            Self::Ping => "rx-dispatch-ping",
+            Self::Dns => "rx-dispatch-dns",
+            Self::Tcp => "rx-dispatch-tcp",
+            Self::Udp => "rx-dispatch-udp",
+            Self::Configuration => "rx-dispatch-configuration",
+        }
+    }
+
+    pub(super) const fn rx_fallback_phase(self) -> &'static str {
+        match self {
+            Self::Pump => "rx-fallback-pump",
+            Self::Ping => "rx-fallback-ping",
+            Self::Dns => "rx-fallback-dns",
+            Self::Tcp => "rx-fallback-tcp",
+            Self::Udp => "rx-fallback-udp",
+            Self::Configuration => "rx-fallback-configuration",
+        }
+    }
+
+    pub(super) const fn rx_signal_phase(self) -> &'static str {
+        match self {
+            Self::Pump => "rx-signal-pump",
+            Self::Ping => "rx-signal-ping",
+            Self::Dns => "rx-signal-dns",
+            Self::Tcp => "rx-signal-tcp",
+            Self::Udp => "rx-signal-udp",
+            Self::Configuration => "rx-signal-configuration",
+        }
+    }
+
     pub(super) const fn tx_reclaim_phase(self) -> &'static str {
         match self {
             Self::Pump => "tx-reclaim-pump",
