@@ -163,6 +163,7 @@ pub(crate) struct ProcessorRuntime {
     anchor: ProcessorAnchor,
     physical_memory_offset: usize,
     tsc_hz: u64,
+    apic_mode: LocalApicMode,
     pub(crate) wasmtime_tls: WasmtimeTlsSlots,
     pub(crate) exception_idt: ProcessorIdt,
     /// The GDT and TSS this processor loads beside its IDT, and the two
@@ -181,6 +182,11 @@ pub(crate) struct ProcessorRuntime {
     program_service: Once<debug_state::ProgramService>,
     device_interrupts: Once<&'static DeviceInterruptRoutes>,
     local_timer_ready: AtomicBool,
+    /// Whether this processor has enabled its local APIC — the base
+    /// MSR's enable bits and the spurious vector — which happens once,
+    /// in [`attach_local_apic`], before the processor sends an IPI or
+    /// ends an interrupt. Written by this processor only.
+    local_apic_attached: AtomicBool,
     started: AtomicBool,
     /// Set by [`X86PlatformState::publish_wake`] on the *target*
     /// processor before the wake IPI goes out, and cleared by
@@ -276,6 +282,7 @@ pub(crate) fn build_boot_context(
         .as_ref()
         .unwrap_or_else(|| panic!("ACPI platform info did not expose processor topology"));
 
+    let apic_mode = LocalApicMode::probe();
     let mut processors =
         alloc::vec::Vec::with_capacity(1 + processor_info.application_processors.len());
     processors.push(ProcessorSlot {
@@ -284,6 +291,7 @@ pub(crate) fn build_boot_context(
             anchor: ProcessorAnchor::new(0),
             physical_memory_offset,
             tsc_hz,
+            apic_mode,
             wasmtime_tls: WasmtimeTlsSlots::new(),
             exception_idt: ProcessorIdt::new(),
             segments: ProcessorSegments::new(exception_stack(), exception_stack()),
@@ -294,6 +302,7 @@ pub(crate) fn build_boot_context(
             program_service: Once::new(),
             device_interrupts: Once::new(),
             local_timer_ready: AtomicBool::new(false),
+            local_apic_attached: AtomicBool::new(false),
             started: AtomicBool::new(false),
             wake_pending: AtomicBool::new(false),
         },
@@ -312,6 +321,7 @@ pub(crate) fn build_boot_context(
                 anchor: ProcessorAnchor::new((index + 1) as u16),
                 physical_memory_offset,
                 tsc_hz,
+                apic_mode,
                 wasmtime_tls: WasmtimeTlsSlots::new(),
                 exception_idt: ProcessorIdt::new(),
                 segments: ProcessorSegments::new(exception_stack(), exception_stack()),
@@ -322,6 +332,7 @@ pub(crate) fn build_boot_context(
                 program_service: Once::new(),
                 device_interrupts: Once::new(),
                 local_timer_ready: AtomicBool::new(false),
+                local_apic_attached: AtomicBool::new(false),
                 started: AtomicBool::new(false),
                 wake_pending: AtomicBool::new(false),
             },
@@ -527,6 +538,35 @@ impl ProcessorRuntime {
     fn platform_tsc_hz(&self) -> u64 {
         self.tsc_hz
     }
+
+    fn apic_mode(&self) -> LocalApicMode {
+        self.apic_mode
+    }
+
+    /// Enables this processor's local APIC, once. Every later ICR
+    /// write, EOI and timer program assumes it; a processor that sends
+    /// a wake before this ran would write an ICR the hardware has not
+    /// enabled, which is why the entry paths call it before interrupts
+    /// are enabled rather than leaving it to the first timer arm.
+    pub(crate) fn attach_local_apic(&self) {
+        if self
+            .local_apic_attached
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        match self.apic_mode {
+            LocalApicMode::X2Apic => {
+                let mut apic = X2APIC::new();
+                apic.attach();
+            }
+            LocalApicMode::XApic { physical_base } => {
+                let apic_region = xapic_mmio_region(physical_base, self.physical_memory_offset);
+                attach_xapic(apic_region);
+            }
+        }
+    }
 }
 
 impl BootContext {
@@ -693,9 +733,45 @@ impl X86PlatformState {
     }
 }
 
+/// How this machine's local APICs are addressed.
+///
+/// Decided once, on the bootstrap processor, from CPUID and the APIC
+/// base MSR, and carried in every processor's runtime: both reads are
+/// VM exits under KVM, and the answer cannot change after boot. Every
+/// interrupt end and every wake IPI used to re-ask — a `cpuid`, an MSR
+/// read and, for a send, a full re-attach of the local APIC (two more
+/// MSR writes) — so a cross-processor wake cost five exits where the
+/// ICR write is the one that does anything.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LocalApicMode {
     XApic { physical_base: usize },
     X2Apic,
+}
+
+impl LocalApicMode {
+    /// Probes the mode of the local APIC this processor runs on. The
+    /// mode is a property of the machine, so the bootstrap processor
+    /// probes it once and every runtime carries the answer.
+    fn probe() -> Self {
+        let cpuid = __cpuid(1);
+        if cpuid.ecx & (1 << 21) != 0 {
+            return Self::X2Apic;
+        }
+        let base = unsafe { rdmsr(x86::msr::IA32_APIC_BASE) };
+        if base & (1 << 10) != 0 {
+            return Self::X2Apic;
+        }
+        Self::XApic {
+            physical_base: (base as usize) & 0xffff_f000,
+        }
+    }
+
+    /// The xAPIC destination for `apic_id`, which the 8-bit destination
+    /// field of an xAPIC ICR has to be able to name.
+    fn xapic_target(apic_id: u32) -> u8 {
+        u8::try_from(apic_id)
+            .unwrap_or_else(|_| panic!("x86 target apic id {apic_id} requires x2APIC support"))
+    }
 }
 
 pub(crate) fn ensure_local_scheduler_timer(vector: u8) {
@@ -796,10 +872,13 @@ pub(crate) fn send_wake_ipi(target_apic_id: u32) {
         Icr, Level, TriggerMode,
     };
     let runtime = current_runtime();
-    match local_apic_mode(target_apic_id) {
+    debug_assert!(
+        runtime.local_apic_attached.load(Ordering::Acquire),
+        "x86 wake IPI sent before this processor attached its local APIC"
+    );
+    match runtime.apic_mode() {
         LocalApicMode::X2Apic => {
             let mut apic = X2APIC::new();
-            apic.attach();
             let icr = Icr::for_x2apic(
                 crate::exceptions::WAKE_INTERRUPT_VECTOR,
                 ApicId::X2Apic(target_apic_id),
@@ -815,12 +894,9 @@ pub(crate) fn send_wake_ipi(target_apic_id: u32) {
         LocalApicMode::XApic { physical_base } => {
             let apic_region = xapic_mmio_region(physical_base, runtime.physical_memory_offset);
             let mut apic = XAPIC::new(apic_region);
-            apic.attach();
-            let target = u8::try_from(target_apic_id)
-                .unwrap_or_else(|_| panic!("xAPIC wake target id {target_apic_id} exceeds 8 bits"));
             let icr = Icr::for_xapic(
                 crate::exceptions::WAKE_INTERRUPT_VECTOR,
-                ApicId::XApic(target),
+                ApicId::XApic(LocalApicMode::xapic_target(target_apic_id)),
                 DestinationShorthand::NoShorthand,
                 DeliveryMode::Fixed,
                 DestinationMode::Physical,
@@ -839,10 +915,9 @@ fn send_tlb_shootdown_ipi_all_excluding_self() {
         Icr, Level, TriggerMode,
     };
     let runtime = current_runtime();
-    match local_apic_mode(0) {
+    match runtime.apic_mode() {
         LocalApicMode::X2Apic => {
             let mut apic = X2APIC::new();
-            apic.attach();
             let icr = Icr::for_x2apic(
                 crate::exceptions::TLB_SHOOTDOWN_INTERRUPT_VECTOR,
                 ApicId::X2Apic(0),
@@ -858,7 +933,6 @@ fn send_tlb_shootdown_ipi_all_excluding_self() {
         LocalApicMode::XApic { physical_base } => {
             let apic_region = xapic_mmio_region(physical_base, runtime.physical_memory_offset);
             let mut apic = XAPIC::new(apic_region);
-            apic.attach();
             let icr = Icr::for_xapic(
                 crate::exceptions::TLB_SHOOTDOWN_INTERRUPT_VECTOR,
                 ApicId::XApic(0),
@@ -886,16 +960,14 @@ fn processor_bit(processor: usize) -> usize {
 
 fn enable_local_scheduler_timer(vector: u8) {
     let runtime = current_runtime();
-    match local_apic_mode(0) {
+    runtime.attach_local_apic();
+    match runtime.apic_mode() {
         LocalApicMode::X2Apic => {
-            let mut apic = X2APIC::new();
-            apic.attach();
             let initial_count = calibrate_x2apic_timer(runtime.platform_tsc_hz());
             program_x2apic_periodic_timer(vector, initial_count);
         }
         LocalApicMode::XApic { physical_base } => {
             let apic_region = xapic_mmio_region(physical_base, runtime.physical_memory_offset);
-            attach_xapic(apic_region);
             let initial_count = calibrate_xapic_timer(apic_region, runtime.platform_tsc_hz());
             program_xapic_periodic_timer(apic_region, vector, initial_count);
         }
@@ -983,7 +1055,7 @@ fn write_xapic_register(apic_region: &[u32], offset: u32, value: u32) {
 
 fn local_apic_eoi() {
     let runtime = current_runtime();
-    match local_apic_mode(0) {
+    match runtime.apic_mode() {
         LocalApicMode::X2Apic => {
             let mut apic = X2APIC::new();
             apic.eoi();
@@ -1014,39 +1086,22 @@ unsafe fn wake_application_processor(
     let startup_vector = u8::try_from(wakeup_page_physical >> 12)
         .unwrap_or_else(|_| panic!("x86 SIPI vector exceeded 8 bits"));
 
-    match local_apic_mode(apic_id) {
+    let runtime = current_runtime();
+    runtime.attach_local_apic();
+    match runtime.apic_mode() {
         LocalApicMode::X2Apic => {
             let mut apic = X2APIC::new();
-            apic.attach();
             send_startup_ipis(&mut apic, ApicId::X2Apic(apic_id), startup_vector, tsc_hz);
         }
         LocalApicMode::XApic { physical_base } => {
             let apic_region = xapic_mmio_region(physical_base, physical_memory_offset);
             let mut apic = XAPIC::new(apic_region);
-            apic.attach();
             let apic_id = u8::try_from(apic_id).map_err(|_| "xAPIC target id exceeded 8 bits")?;
             send_startup_ipis(&mut apic, ApicId::XApic(apic_id), startup_vector, tsc_hz);
         }
     }
 
     Ok(())
-}
-
-fn local_apic_mode(target_apic_id: u32) -> LocalApicMode {
-    let cpuid = __cpuid(1);
-    if cpuid.ecx & (1 << 21) != 0 {
-        return LocalApicMode::X2Apic;
-    }
-    let base = unsafe { rdmsr(x86::msr::IA32_APIC_BASE) };
-    if base & (1 << 10) != 0 {
-        return LocalApicMode::X2Apic;
-    }
-    if target_apic_id <= u8::MAX.into() {
-        return LocalApicMode::XApic {
-            physical_base: (base as usize) & 0xffff_f000,
-        };
-    }
-    panic!("x86 target apic id {target_apic_id} requires x2APIC support")
 }
 
 fn send_startup_ipis(
