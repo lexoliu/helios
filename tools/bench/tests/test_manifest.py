@@ -113,6 +113,6 @@ def test_the_suite_measures_one_lane() -> None:
     lane = manifest.lane("x86-64-kvm")
     assert lane.accelerator == "kvm"
     assert lane.rpc_transport == "serial"
-    assert lane.github_matrix_entry()["rpc-transport"] == "vsock"
+    assert lane.github_matrix_entry()["rpc-transport"] == "serial"
     assert lane.runs_on(advisory=True) == "ubuntu-24.04"
     assert lane.runs_on(advisory=False) == "helios-bench-x86-kvm"
