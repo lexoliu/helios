@@ -109,6 +109,10 @@ pub(crate) struct HostedMachine {
     bootstrap_processor: ProcessorId,
     started_at: StdInstant,
     heap: HeapReservation,
+    /// The user payload `--bootfs` named, parsed once at start-up and
+    /// shared by every processor thread — the hosted backend's boot
+    /// module.
+    payload: helios_kernel::BootPayload,
     slots: Box<[ProcessorSlot]>,
     timer_tx: Sender<TimerCommand>,
 }
@@ -172,11 +176,13 @@ impl HostedMachine {
     pub(crate) fn new(config: &HostedConfig) -> Arc<Self> {
         let (timer_tx, timer_rx) = crossbeam_channel::unbounded();
         let started_at = StdInstant::now();
+        let payload = load_payload(config.bootfs());
         let machine = Arc::new(Self {
             processor_count: config.processor_count(),
             bootstrap_processor: config.bootstrap_processor(),
             started_at,
             heap: HeapReservation::new(config.heap_bytes()),
+            payload,
             slots: (0..config.processor_count())
                 .map(|_| ProcessorSlot::new())
                 .collect(),
@@ -355,6 +361,19 @@ fn spawn_processor_thread(
         .unwrap_or_else(|err| panic!("failed to spawn processor {}: {err}", processor.id()))
 }
 
+/// Reads `--bootfs` once, up front: a missing or malformed payload is a
+/// start-up failure, not something a booted kernel discovers.
+fn load_payload(path: &std::path::Path) -> helios_kernel::BootPayload {
+    let bytes = std::fs::read(path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+    helios_kernel::BootPayload::parse(Box::leak(bytes.into_boxed_slice())).unwrap_or_else(|error| {
+        panic!(
+            "{} is not a valid helios-bootfs payload: {error}",
+            path.display()
+        )
+    })
+}
+
 fn shared_debug_state(machine: &HostedMachine) -> HostedRuntimeState {
     DEBUG_STATE
         .get_or_init(|| {
@@ -362,6 +381,7 @@ fn shared_debug_state(machine: &HostedMachine) -> HostedRuntimeState {
                 machine.timer_frequency(),
                 machine.processor_count(),
                 machine.now_ticks(),
+                machine.payload,
             )
         })
         .clone()

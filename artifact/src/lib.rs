@@ -2,6 +2,8 @@
 
 extern crate alloc;
 
+pub mod bootfs;
+
 use alloc::vec::Vec;
 use core::fmt;
 

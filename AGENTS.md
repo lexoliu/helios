@@ -19,8 +19,8 @@ never depends on anything above it.
 | --- | --- | --- |
 | Hardware contracts | `hal/` | Traits, capability types and value types only. `#![no_std]`. |
 | Device and protocol libraries | `netstack/`, `virtio/`, `i6300esb/` | `#![no_std]` protocol engines and drivers. `virtio/` builds on `netstack/`; all three depend on `hal/` and none on the kernel. |
-| Shared ABIs | `compiler-abi/`, `artifact/` | `#![no_std]` wire formats shared by the kernel and host tools: the compiler plugin's request and response headers, `cwasm` target flags, the signature trailer. |
-| Kernel | `kernel/`, `kernel-macro/` | Every piece of hardware-independent runtime logic: executor, timer, memory and OOM, instance registry, component host, Wasmtime adapter, network service, host-fs client, every WIT service. `#![no_std]`, generic over `Cpu`. `kernel-macro/` embeds wasm and the bootfs at build time. |
+| Shared ABIs | `compiler-abi/`, `artifact/` | `#![no_std]` wire formats shared by the kernel and host tools: the compiler plugin's request and response headers, `cwasm` target flags, the signature trailer, and the `helios-bootfs` payload image the kernel reads at bring-up. |
+| Kernel | `kernel/` | Every piece of hardware-independent runtime logic: executor, timer, memory and OOM, instance registry, component host, Wasmtime adapter, network service, host-fs client, every WIT service. `#![no_std]`, generic over `Cpu`. The user payload is not linked into the kernel: it arrives as a boot module (`docs/boot.md`). |
 | Backends | `aarch64/`, `riscv/`, `x86/`, `hosted/` | Boot, trap, IRQ, timer, MMIO, UART, virtio transport and SMP wiring, and nothing else. `hosted/` runs the same kernel on the host OS under the same restriction. |
 | Kernel image | the root crate `helios` (`src/`) | The binary that links whichever backend the target selects, and runs `hosted` on the host. |
 | User space | `api/`, `api-macro/`, `programs/*` | The userland SDK and the wasm programs, kernel plugins included: `init`, `debugger`, `http-client`, `date`, `ping`, `perf`, `oob-load`. `compiler-plugin/` is the in-kernel compiler, a kernel plugin built by the host tools. |
@@ -412,9 +412,12 @@ does.
 ## 7. Checks and CI
 
 Before a change is complete, run the recipes for every surface it can
-affect. `just check-target` and `just test-units` generate the
-`helios-cli kernel-prebuild` manifest and pass it through
-`HELIOS_KERNEL_PREBUILD_MANIFEST` themselves. The `check-target` set is the
+affect. `just check-target` and `just test-units` run `helios-cli
+kernel-prebuild` themselves and export the two trusted-root key files it
+writes as `HELIOS_KERNEL_ROOT_PUBLIC_KEY` and `HELIOS_KERNEL_ROOT_SECRET_KEY`,
+the only prebuild outputs the kernel build tracks; the `helios-bootfs`
+payload it also writes is loaded at boot, never compiled in, so changing
+the boot programs never relinks the kernel. The `check-target` set is the
 backends the diff can reach: a change in `hal/`, a library crate, a shared
 ABI or `kernel/` runs all three bare-metal targets; a change confined to
 one backend runs that backend's target; a change confined to the host tools

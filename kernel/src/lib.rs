@@ -90,10 +90,7 @@ pub use display::{
     DisplayServiceError, FrameToken, MAX_CLAIMED_SCANOUTS, MAX_PINNED_FRAMES, PinnedFrame,
     REQUEST_QUEUE_DEPTH, SequenceSignal, install_display_device,
 };
-pub use embedded::{
-    EmbeddedComponent, EmbeddedInit, embedded_boot_component, embedded_init,
-    embedded_system_component, has_embedded_system_component,
-};
+pub use embedded::{BootPayload, EmbeddedComponent, EmbeddedInit};
 pub use exec::{
     CompactionBudget, CompactionPolicy, CompactionReport, CompactionTarget, Compactor,
     DEFAULT_PERF_METRIC_CAPACITY, DEFAULT_PROFILE_STACK_CAPACITY, DEFAULT_TRACE_HISTORY_CAPACITY,

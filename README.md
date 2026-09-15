@@ -61,7 +61,6 @@ hardware support lives in thin adaptation crates.
 | `compiler-support/` | Shared AOT engine configuration used by the CLI and plugin |
 | `api/` | Async userland SDK for programs built as wasm components |
 | `api-macro/` | `#[helios_api::main]` proc macro |
-| `kernel-macro/` | Kernel-side proc macros |
 | `programs/init/` | Embedded init component |
 | `programs/debugger/` | Debugger component that exports `helios:system/*` back over RPC |
 | `inspector/` | Host-side CLI (`shell`, `stats`, `tracing`, `repl`, `vm`) |
@@ -97,9 +96,10 @@ workspace dependency so the kernel can track Component Model / WASI 0.3 changes
 ahead of crates.io releases. Clone Wasmtime next to this repository before
 building.
 
-`helios-cli` is part of the build pipeline. It AOT-compiles the bootfs-managed
-kernel plugins and other boot artifacts before `helios-kernel` packages them
-into the embedded boot filesystem.
+`helios-cli` is part of the build pipeline. `kernel-prebuild` AOT-compiles the
+bootfs-managed kernel plugins and other boot artifacts and writes them as a
+`helios-bootfs` payload that reaches the kernel as a boot module (or a file
+under the hosted backend).
 
 ## Running
 

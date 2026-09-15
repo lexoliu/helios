@@ -670,7 +670,7 @@ where
             run_kernel_processor_forever(cpu, kernel, debug_state);
         }
         ComponentHostProcessorRole::SharedRuntime | ComponentHostProcessorRole::SystemComponent => {
-            match crate::embedded_system_component() {
+            match debug_state.system_component() {
                 Some(component) => run_embedded_component_forever(
                     component,
                     ComponentBindingSet::System,

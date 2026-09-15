@@ -1,21 +1,8 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
 
 use askama::Template;
-use serde::Deserialize;
-use walkdir::WalkDir;
-
-#[derive(Template)]
-#[template(path = "embedded_init.rs.askama", escape = "none")]
-struct EmbeddedInitTemplate<'a> {
-    name: &'a str,
-    component: &'a str,
-    argv0: &'a str,
-    bootfs_directories: &'a [EmbeddedBootDirectoryAsset],
-    bootfs_files: &'a [EmbeddedBootFileAsset],
-}
 
 #[derive(Template)]
 #[template(path = "trusted_roots.rs.askama", escape = "none")]
@@ -36,7 +23,8 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(helios_profile_generate)");
     println!("cargo:rustc-check-cfg=cfg(helios_watchdog_self_test)");
     println!("cargo:rerun-if-env-changed=HELIOS_BUILD_TARGET");
-    println!("cargo:rerun-if-env-changed=HELIOS_KERNEL_PREBUILD_MANIFEST");
+    println!("cargo:rerun-if-env-changed=HELIOS_KERNEL_ROOT_PUBLIC_KEY");
+    println!("cargo:rerun-if-env-changed=HELIOS_KERNEL_ROOT_SECRET_KEY");
     println!("cargo:rerun-if-env-changed=HELIOS_WATCHDOG_SELF_TEST");
     println!("cargo:rerun-if-env-changed=HELIOS_WATCHDOG_SELF_TEST_DELAY_MS");
 
@@ -52,136 +40,27 @@ fn main() {
     }
 
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is missing"));
-    let init_destination = out_dir.join("embedded_init.rs");
-    let init_source = generate_embedded_init(&out_dir, &target);
-    fs::write(init_destination, init_source).expect("failed to write embedded init description");
+    write_trusted_root_file(&out_dir);
 }
 
-fn generate_embedded_init(out_dir: &Path, target: &str) -> String {
-    let prebuild = read_kernel_prebuild_manifest(target);
-    write_trusted_root_file(
-        out_dir,
-        &prebuild.root_public_key,
-        &prebuild.root_secret_key,
-    );
-
-    let component_path = prebuild.init_component;
-    let name = component_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_else(|| panic!("{} has no valid UTF-8 file name", component_path.display()));
-    let (bootfs_directories, bootfs_files) = embedded_bootfs_entries(
-        &prebuild.bootfs_root,
-        &prebuild
-            .bootfs_assets
-            .into_iter()
-            .map(|asset| EmbeddedBootAsset {
-                path: asset.path,
-                source: asset.source.display().to_string(),
-                kind: asset.kind,
-                modified_nanos: file_modified_nanos(&asset.source),
-            })
-            .collect::<Vec<_>>(),
-    );
-
-    let component = component_path.display().to_string();
-    EmbeddedInitTemplate {
-        name,
-        component: &component,
-        argv0: &prebuild.init_argv0,
-        bootfs_directories: &bootfs_directories,
-        bootfs_files: &bootfs_files,
-    }
-    .render()
-    .unwrap_or_else(|error| panic!("failed to render embedded init template: {error}"))
-}
-
-#[derive(Deserialize)]
-struct PrebuildManifest {
-    target: String,
-    init_component: PathBuf,
-    init_argv0: String,
-    bootfs_root: PathBuf,
-    root_public_key: PathBuf,
-    root_secret_key: PathBuf,
-    bootfs_assets: Vec<BootAssetManifest>,
-}
-
-#[derive(Deserialize)]
-struct BootAssetManifest {
-    path: String,
-    source: PathBuf,
-    kind: BootAssetKind,
-}
-
-#[derive(Clone, Copy, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-enum BootAssetKind {
-    Directory,
-    File,
-}
-
-fn read_kernel_prebuild_manifest(target: &str) -> PrebuildManifest {
-    let manifest_path = env::var_os("HELIOS_KERNEL_PREBUILD_MANIFEST")
+/// The kernel image carries the trusted root keys — verification of the
+/// signed payload has to happen inside the signed artifact — and nothing
+/// else the prebuild produces. The key files are the only inputs the
+/// kernel build tracks: a `kernel-prebuild` rerun that changes the
+/// user payload but leaves them byte-identical recompiles nothing here.
+fn trusted_key_file(env_name: &str) -> PathBuf {
+    let path = env::var_os(env_name)
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            panic!(
-                "HELIOS_KERNEL_PREBUILD_MANIFEST must point to a cli-generated kernel-prebuild.json"
-            )
-        });
-    println!("cargo:rerun-if-changed={}", manifest_path.display());
-    let manifest = fs::read(&manifest_path)
-        .unwrap_or_else(|error| panic!("failed to read {}: {error}", manifest_path.display()));
-    let mut manifest: PrebuildManifest = serde_json::from_slice(&manifest)
-        .unwrap_or_else(|error| panic!("failed to decode {}: {error}", manifest_path.display()));
-    absolutize_prebuild_manifest_paths(&manifest_path, &mut manifest);
-    assert!(
-        manifest.target == target,
-        "prebuild target {} does not match kernel target {}",
-        manifest.target,
-        target
-    );
-    rerun_if_changed_recursive(&manifest.bootfs_root);
-    println!(
-        "cargo:rerun-if-changed={}",
-        manifest.init_component.display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        manifest.root_public_key.display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        manifest.root_secret_key.display()
-    );
-    for asset in &manifest.bootfs_assets {
-        println!("cargo:rerun-if-changed={}", asset.source.display());
-    }
-    manifest
+        .unwrap_or_else(|| panic!("{env_name} must name the key file kernel-prebuild wrote"));
+    println!("cargo:rerun-if-changed={}", path.display());
+    path
 }
 
-fn absolutize_prebuild_manifest_paths(manifest_path: &Path, manifest: &mut PrebuildManifest) {
-    let manifest_dir = manifest_path
-        .parent()
-        .unwrap_or_else(|| panic!("{} has no parent directory", manifest_path.display()));
-    manifest.init_component = manifest_relative_path(manifest_dir, &manifest.init_component);
-    manifest.bootfs_root = manifest_relative_path(manifest_dir, &manifest.bootfs_root);
-    manifest.root_public_key = manifest_relative_path(manifest_dir, &manifest.root_public_key);
-    manifest.root_secret_key = manifest_relative_path(manifest_dir, &manifest.root_secret_key);
-    for asset in &mut manifest.bootfs_assets {
-        asset.source = manifest_relative_path(manifest_dir, &asset.source);
-    }
-}
+fn write_trusted_root_file(out_dir: &Path) {
+    let root_public_key = trusted_key_file("HELIOS_KERNEL_ROOT_PUBLIC_KEY");
+    let root_secret_key = trusted_key_file("HELIOS_KERNEL_ROOT_SECRET_KEY");
 
-fn manifest_relative_path(manifest_dir: &Path, path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        return path.to_owned();
-    }
-    manifest_dir.join(path)
-}
-
-fn write_trusted_root_file(out_dir: &Path, root_public_key: &Path, root_secret_key: &Path) {
-    let bytes = fs::read(root_public_key)
+    let bytes = fs::read(&root_public_key)
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", root_public_key.display()));
     assert!(
         bytes.len() == 32,
@@ -195,10 +74,9 @@ fn write_trusted_root_file(out_dir: &Path, root_public_key: &Path, root_secret_k
     }
     .render()
     .unwrap_or_else(|error| panic!("failed to render trusted roots template: {error}"));
-    fs::write(&destination, source)
-        .unwrap_or_else(|error| panic!("failed to write {}: {error}", destination.display()));
+    write_if_changed(&destination, source.as_bytes());
 
-    let secret_bytes = fs::read(root_secret_key)
+    let secret_bytes = fs::read(&root_secret_key)
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", root_secret_key.display()));
     assert!(
         secret_bytes.len() == 32,
@@ -212,139 +90,18 @@ fn write_trusted_root_file(out_dir: &Path, root_public_key: &Path, root_secret_k
     }
     .render()
     .unwrap_or_else(|error| panic!("failed to render trusted signing key template: {error}"));
-    fs::write(&signing_destination, signing_source).unwrap_or_else(|error| {
-        panic!("failed to write {}: {error}", signing_destination.display())
-    });
+    write_if_changed(&signing_destination, signing_source.as_bytes());
 }
 
-struct EmbeddedBootAsset {
-    path: String,
-    source: String,
-    kind: BootAssetKind,
-    modified_nanos: u64,
-}
-
-struct EmbeddedBootDirectoryAsset {
-    path: String,
-    modified_nanos: u64,
-}
-
-struct EmbeddedBootFileAsset {
-    path: String,
-    source: String,
-    modified_nanos: u64,
-}
-
-fn embedded_bootfs_entries(
-    root: &Path,
-    extra_assets: &[EmbeddedBootAsset],
-) -> (Vec<EmbeddedBootDirectoryAsset>, Vec<EmbeddedBootFileAsset>) {
-    let mut directories = Vec::new();
-    let mut files = Vec::new();
-
-    for entry in WalkDir::new(root).sort_by_file_name() {
-        let entry = entry.unwrap_or_else(|error| {
-            panic!(
-                "failed to walk embedded bootfs root {}: {error}",
-                root.display()
-            )
-        });
-        if entry.path() == root {
-            continue;
-        }
-
-        let path = entry.into_path();
-        let relative = path
-            .strip_prefix(root)
-            .unwrap_or_else(|error| {
-                panic!(
-                    "failed to strip embedded bootfs root {} from {}: {error}",
-                    root.display(),
-                    path.display()
-                )
-            })
-            .to_str()
-            .unwrap_or_else(|| panic!("{} is not valid UTF-8", path.display()))
-            .replace('\\', "/");
-        let modified_nanos = file_modified_nanos(&path);
-        if path.is_dir() {
-            if !is_empty_directory(&path) {
-                continue;
-            }
-            directories.push(EmbeddedBootDirectoryAsset {
-                path: relative,
-                modified_nanos,
-            });
-        } else if path.is_file() {
-            files.push(EmbeddedBootFileAsset {
-                path: relative,
-                source: path.display().to_string(),
-                modified_nanos,
-            });
-        }
-    }
-
-    for asset in extra_assets {
-        match asset.kind {
-            BootAssetKind::Directory => directories.push(EmbeddedBootDirectoryAsset {
-                path: asset.path.clone(),
-                modified_nanos: asset.modified_nanos,
-            }),
-            BootAssetKind::File => files.push(EmbeddedBootFileAsset {
-                path: asset.path.clone(),
-                source: asset.source.clone(),
-                modified_nanos: asset.modified_nanos,
-            }),
-        }
-    }
-
-    directories.sort_by(|left, right| left.path.cmp(&right.path));
-    files.sort_by(|left, right| left.path.cmp(&right.path));
-    (directories, files)
-}
-
-fn file_modified_nanos(path: &Path) -> u64 {
-    let modified = fs::metadata(path)
-        .unwrap_or_else(|error| panic!("failed to read metadata for {}: {error}", path.display()))
-        .modified()
-        .unwrap_or_else(|error| {
-            panic!(
-                "failed to read modification time for {}: {error}",
-                path.display()
-            )
-        });
-    let duration = modified.duration_since(UNIX_EPOCH).unwrap_or_else(|error| {
-        panic!(
-            "modification time for {} is before the Unix epoch: {error}",
-            path.display()
-        )
-    });
-    duration
-        .as_secs()
-        .checked_mul(1_000_000_000)
-        .and_then(|seconds| seconds.checked_add(u64::from(duration.subsec_nanos())))
-        .unwrap_or_else(|| panic!("modification time for {} overflowed u64", path.display()))
-}
-
-fn is_empty_directory(path: &Path) -> bool {
-    fs::read_dir(path)
-        .unwrap_or_else(|error| panic!("failed to read directory {}: {error}", path.display()))
-        .next()
-        .is_none()
-}
-
-fn rerun_if_changed_recursive(root: &Path) {
-    if !root.exists() {
+/// Writes `bytes` to `destination` only when the content differs. The
+/// generated files feed `include!`, so a same-bytes rewrite would still
+/// bump the mtime rustc's dep-info checks and recompile the kernel for
+/// nothing — the whole point of the boot-module split is that a new
+/// payload leaves the kernel binary alone.
+fn write_if_changed(destination: &Path, bytes: &[u8]) {
+    if fs::read(destination).ok().as_deref() == Some(bytes) {
         return;
     }
-
-    for entry in WalkDir::new(root).sort_by_file_name() {
-        let entry = entry.unwrap_or_else(|error| {
-            panic!(
-                "failed to walk {} for rerun tracking: {error}",
-                root.display()
-            )
-        });
-        println!("cargo:rerun-if-changed={}", entry.path().display());
-    }
+    fs::write(destination, bytes)
+        .unwrap_or_else(|error| panic!("failed to write {}: {error}", destination.display()));
 }

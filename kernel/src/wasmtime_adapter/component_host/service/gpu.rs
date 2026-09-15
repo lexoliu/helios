@@ -1100,7 +1100,7 @@ pub(crate) mod test_store {
             TestCpu,
             TestNetworkService,
             UnsupportedHostFileSystem,
-        > = crate::RuntimeState::new(1_000_000, 1, 0);
+        > = crate::RuntimeState::new(1_000_000, 1, 0, crate::BootPayload::for_tests());
         runtime_state.install_root_entropy(Arc::new(
             crate::RootEntropy::from_platform(&cpu, None, None)
                 .expect("the fixture CPU has an entropy source"),

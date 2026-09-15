@@ -195,7 +195,8 @@ fn x86_kernel_main() -> ! {
     );
     let tsc_hz = detect_tsc_frequency_hz();
     let tsc_base = read_tsc();
-    let debug_state = debug_state::RuntimeState::new(tsc_hz, processor_count, 0);
+    let payload = helios_kernel::BootPayload::from_boot_modules(&handoff.modules);
+    let debug_state = debug_state::RuntimeState::new(tsc_hz, processor_count, 0, payload);
     let boot = smp::build_boot_context(
         rsdp_address,
         physical_memory_offset,

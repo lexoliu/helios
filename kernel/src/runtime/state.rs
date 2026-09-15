@@ -6,11 +6,11 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use triomphe::Arc;
 
 use crate::{
-    DEFAULT_PERF_METRIC_CAPACITY, DEFAULT_PROFILE_STACK_CAPACITY, DEFAULT_TRACE_HISTORY_CAPACITY,
-    EmbeddedBootFs, FoldedProfileSample, FutexKey, FutexTable, FutexWaitRegistration,
-    HEAP_SIZE_CLASS_COUNT, HeapStats, InstanceRegistry, Notify, PerfMetricFilter,
-    PerfMetricHistory, PerfMetricSample, PerfSample, ProfileFilter, ProfileScope, ProfileSink,
-    StatsSample, TraceEvent, TraceFilter, TraceHistory, embedded_init,
+    BootPayload, DEFAULT_PERF_METRIC_CAPACITY, DEFAULT_PROFILE_STACK_CAPACITY,
+    DEFAULT_TRACE_HISTORY_CAPACITY, EmbeddedBootFs, EmbeddedComponent, FoldedProfileSample,
+    FutexKey, FutexTable, FutexWaitRegistration, HEAP_SIZE_CLASS_COUNT, HeapStats,
+    InstanceRegistry, Notify, PerfMetricFilter, PerfMetricHistory, PerfMetricSample, PerfSample,
+    ProfileFilter, ProfileScope, ProfileSink, StatsSample, TraceEvent, TraceFilter, TraceHistory,
 };
 use crate::{RootEntropy, RootEntropyHandle};
 use helios_hal::cpu::HardwarePerfCounterDelta;
@@ -103,6 +103,10 @@ struct RuntimeStateInner<ProgramService, NetworkService, HostFsService> {
     /// runtime adapter answers `unavailable` rather than trapping.
     vsock_service: Once<ComponentHostVsockService>,
     futex_table: Mutex<FutexTable>,
+    /// The user payload the backend handed the kernel — init component,
+    /// `argv0`, and the boot filesystem it carries — parsed from the
+    /// boot module at bring-up.
+    payload: BootPayload,
     bootfs: Mutex<Option<EmbeddedBootFs>>,
     tracing: Mutex<TraceHistory>,
     /// The profile and perf histories, held as a handle rather than as
@@ -300,7 +304,12 @@ where
     NetworkService: Clone,
     HostFsService: Clone,
 {
-    pub fn new(timebase_frequency: u64, processor_count: usize, boot_ticks: u64) -> Self {
+    pub fn new(
+        timebase_frequency: u64,
+        processor_count: usize,
+        boot_ticks: u64,
+        payload: BootPayload,
+    ) -> Self {
         Self {
             inner: Arc::new(RuntimeStateInner {
                 boot_ticks,
@@ -329,7 +338,8 @@ where
                 audio_service: Once::new(),
                 vsock_service: Once::new(),
                 futex_table: Mutex::new(FutexTable::new()),
-                bootfs: Mutex::new(embedded_init().map(|init| init.bootfs())),
+                payload,
+                bootfs: Mutex::new(Some(payload.bootfs())),
                 tracing: Mutex::new(TraceHistory::new(DEFAULT_TRACE_HISTORY_CAPACITY)),
                 profiles: ProfileSink::new(
                     DEFAULT_PROFILE_STACK_CAPACITY,
@@ -1001,6 +1011,18 @@ where
         *self.inner.bootfs.lock()
     }
 
+    /// The system component this payload carries, when this build would
+    /// autostart one.
+    pub fn system_component(&self) -> Option<EmbeddedComponent> {
+        self.inner.payload.system_component()
+    }
+
+    /// Whether the payload carries a system component this build would
+    /// autostart.
+    pub fn has_system_component(&self) -> bool {
+        self.inner.payload.has_system_component()
+    }
+
     pub fn retire_bootfs(&self) {
         *self.inner.bootfs.lock() = None;
     }
@@ -1176,7 +1198,7 @@ mod tests {
 
     #[test]
     fn runtime_state_records_kernel_heap_delta_metrics() {
-        let state = RuntimeState::<(), (), ()>::new(1_000_000_000, 1, 0);
+        let state = RuntimeState::<(), (), ()>::new(1_000_000_000, 1, 0, BootPayload::for_tests());
         let baseline = crate::heap_stats();
         state.inner.heap_perf_snapshot.reset(baseline);
         state.set_profiling_enabled(true);
