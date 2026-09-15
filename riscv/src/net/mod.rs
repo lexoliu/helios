@@ -9,8 +9,8 @@ use helios_hal::cpu::Cpu;
 use helios_hal::io::IoError;
 use helios_hal::watchdog::Watchdog;
 use helios_kernel::{
-    DebugSerialInterrupt, DebugSerialIrqStatus, ExternalInterruptHandler, ExternalInterruptRoutes,
-    InterfaceCapabilities, InterfaceEventMark, Kernel, LinkState, NetworkDevice, PacketBuffer,
+    DebugSerialInterrupt, ExternalInterruptHandler, ExternalInterruptRoutes, InterfaceCapabilities,
+    InterfaceEventMark, Kernel, LinkState, NetworkDevice, PacketBuffer,
 };
 use plic::Plic;
 
@@ -34,9 +34,10 @@ pub(crate) struct VirtioNetworkDevice {
     cpu: RiscvCpu,
 }
 
-/// The debug UART's route handler: a `fn` pointer keeps the routes'
-/// last type parameter nameable.
-type DebugSerialHandler = DebugSerialInterrupt<fn() -> DebugSerialIrqStatus>;
+/// The debug UART's route handler, keyed by the port's access type:
+/// it masks the port's receive interrupt through `DebugTransport` and
+/// raises the debug console's receive signal.
+type DebugSerialHandler = DebugSerialInterrupt<crate::DebugTransport>;
 
 pub(crate) struct ExternalInterrupts {
     plic: &'static Plic,

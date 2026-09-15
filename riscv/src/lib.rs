@@ -34,22 +34,10 @@ mod debug_state {
 
 use ns16550a::Uart;
 
-/// 16550 interrupt-enable register, and the two conditions this driver
-/// arms: received data, and the transmit holding register going empty.
+/// 16550 interrupt-enable register; this port arms only the
+/// received-data condition.
 const UART_IER: usize = 1;
 const UART_IER_RDI: u8 = 1 << 0;
-const UART_IER_THRI: u8 = 1 << 1;
-/// 16550 interrupt-identification register: bit 0 clear means a
-/// condition is pending, and the low nibble names the
-/// highest-priority one. Reading it retires the transmitter-empty
-/// condition; the receive conditions retire when the reader drains the
-/// FIFO below its trigger.
-const UART_IIR: usize = 2;
-const UART_IIR_ID: u8 = 0x0f;
-const UART_IIR_THRE: u8 = 0x02;
-const UART_IIR_RDA: u8 = 0x04;
-const UART_IIR_RLS: u8 = 0x06;
-const UART_IIR_CTI: u8 = 0x0c;
 
 /// Debugger byte transport backed by the machine's boot UART. Kernel tracing
 /// stays in memory so the line remains reserved for RPC traffic after boot.
@@ -99,39 +87,6 @@ impl DebugTransport {
         })
     }
 
-    /// Arms the line: interrupt on received data and on the transmit
-    /// holding register emptying.
-    ///
-    /// The interrupt-enable register shares its address with the low
-    /// divisor latch; the boot firmware left the latch bit clear, which
-    /// the port's writes already rely on to reach the holding register.
-    fn enable_interrupts(&self) {
-        let ier = (self.uart_base + UART_IER) as *mut u8;
-        unsafe { ier.write_volatile(ier.read_volatile() | UART_IER_RDI | UART_IER_THRI) };
-    }
-
-    /// The pending interrupt state, acknowledged in the same read.
-    ///
-    /// Runs in interrupt context: a register read, no lock, no
-    /// allocation.
-    fn interrupt_status(&self) -> DebugSerialIrqStatus {
-        let iir = unsafe { ((self.uart_base + UART_IIR) as *const u8).read_volatile() };
-        match iir & UART_IIR_ID {
-            UART_IIR_RLS | UART_IIR_RDA | UART_IIR_CTI => DebugSerialIrqStatus {
-                receive_ready: true,
-                transmit_empty: false,
-            },
-            UART_IIR_THRE => DebugSerialIrqStatus {
-                receive_ready: false,
-                transmit_empty: true,
-            },
-            _ => DebugSerialIrqStatus {
-                receive_ready: false,
-                transmit_empty: false,
-            },
-        }
-    }
-
     pub(crate) fn try_read_byte(&self) -> Option<u8> {
         Uart::new(self.uart_base).get()
     }
@@ -153,6 +108,18 @@ impl ByteSerial for DebugTransport {
 
     fn write_bytes(&self, bytes: &[u8]) {
         DebugTransport::write_bytes(self, bytes);
+    }
+
+    /// Received data is the only condition this port arms, so a plain
+    /// write of exactly that bit rather than a read-modify-write.
+    /// Idempotent, and callable from interrupt context: a register
+    /// write, no lock, no allocation.
+    fn enable_receive_interrupt(&self) {
+        unsafe { ((self.uart_base + UART_IER) as *mut u8).write_volatile(UART_IER_RDI) };
+    }
+
+    fn disable_receive_interrupt(&self) {
+        unsafe { ((self.uart_base + UART_IER) as *mut u8).write_volatile(0) };
     }
 }
 
@@ -183,8 +150,8 @@ use helios_hal::memory::MemoryRegion;
 use helios_hal::serial::ByteSerial;
 use helios_hal::{DeviceInventory, DmaModel, ProcessorStartupPolicy, ProcessorTopology};
 use helios_kernel::{
-    DebugSerialAccess, DebugSerialIrqStatus, KernelException, KernelExceptionCause,
-    KernelExceptionDispatch, KernelNativeTrapHandler, Timer, WasmtimeTlsSlots,
+    DebugSerialAccess, KernelException, KernelExceptionCause, KernelExceptionDispatch,
+    KernelNativeTrapHandler, Timer, WasmtimeTlsSlots,
 };
 use riscv::interrupt::Trap;
 use riscv::interrupt::supervisor::{Exception, Interrupt};
@@ -821,13 +788,13 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
             device::install_hooks(plic, context);
             // The boot UART is a device the kernel drives itself: its
             // PLIC source is enabled and prioritised like the virtio
-            // devices', and its handler raises the debug console's
-            // receive and transmit signals.
+            // devices'. The handler masks the receive line at the port
+            // and raises the debug console's receive signal; the waiter
+            // re-arms the line while it listens.
             if let Some(transport) = DEBUG_TRANSPORT.get().copied() {
-                let irq_status: fn() -> DebugSerialIrqStatus = debug_transport_irq_status;
                 interrupts.attach_debug_serial(
                     transport.plic_source,
-                    DebugTransport::console().interrupt_handler(irq_status),
+                    DebugTransport::console().interrupt_handler::<DebugTransport>(),
                 );
             }
             if let Some(network) = net::install_network_service(&cpu, &kernel, &fdt, &debug_state) {
@@ -1134,18 +1101,9 @@ static DEBUG_CONSOLE: helios_kernel::DebugConsole = helios_kernel::DebugConsole:
 /// device tree, so the value is installed once and read afterwards.
 fn publish_debug_transport(discovered: Option<DebugTransport>) -> bool {
     if let Some(transport) = discovered {
-        DEBUG_TRANSPORT.call_once(|| {
-            transport.enable_interrupts();
-            transport
-        });
+        DEBUG_TRANSPORT.call_once(|| transport);
     }
     DEBUG_TRANSPORT.get().is_some()
-}
-
-/// The debug UART's interrupt state for the route handler: a `fn` item
-/// coerced to a pointer so the routes' handler type stays nameable.
-fn debug_transport_irq_status() -> DebugSerialIrqStatus {
-    DebugTransport::port().interrupt_status()
 }
 
 impl DebugSerialAccess for DebugTransport {
