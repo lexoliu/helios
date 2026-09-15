@@ -463,6 +463,22 @@ or a developer's own arm64 box, taken by hand with the same harness
 that machine), never from hosted CI. AGENTS.md §3.5's arm64 baseline is
 that kind of measurement.
 
+### The RPC the numbers are taken around
+
+Every Helios row is timed host-side around the inspector's
+`programs.exec` RPC, so the transport that RPC rides is inside the
+number. The lane names it: `rpc_transport = "vsock"` in `manifest.toml`
+puts the RPC on vhost-vsock, the virtio debug transport AGENTS.md
+prescribes, and `.github/actions/vhost-vsock` provisions the device on
+the runner. The inspector's default, the debug serial line, is QEMU's
+16550 on x86-64 — one I/O-port exit per byte in each direction, and a
+guest reader that yields between polls — and cost 10–20 ms inside every
+elapsed before the lane moved (#413: `instance-startup-1` measured
+22 ms around a 1.4 ms batch). `host-check` reports a host whose
+`/dev/vhost-vsock` is not usable as a deviation, the run record's `vm`
+provenance and the report's pins name the transport, and a lane on a
+host with no vhost-vsock (macOS) says `serial` and is read as such.
+
 ## Dedicated runners
 
 Publishable numbers come from a self-hosted machine registered with this

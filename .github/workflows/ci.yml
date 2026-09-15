@@ -257,23 +257,13 @@ jobs:
           grep -Fqx oob-load:before-fault oob-load-smoke.out
           grep -Fqx guest-alive oob-load-smoke.out
           ! grep -Fq 'Kernel panic' oob-load-smoke.out
+      - uses: ./helios/.github/actions/vhost-vsock
       - name: Boot riscv64 guest with the inspector RPC on vsock
         shell: bash
         working-directory: helios
         env:
           HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
         run: |
-          # vsock is the only transport whose host half needs a kernel
-          # module, and the inspector refuses rather than falling back,
-          # so a runner without it fails this step loudly.
-          sudo modprobe vhost_vsock
-          sudo udevadm settle
-          # udev creates the node root:kvm mode 0660 and the runner
-          # account is not in that group, so QEMU's vhost backend cannot
-          # open it. Hand the node to this account before asking for it.
-          sudo chmod 0666 /dev/vhost-vsock
-          ls -l /dev/vhost-vsock
-          id
           ./target/release/helios-inspector vm --arch riscv64 --release --memory 2G \
             --accel tcg \
             --rpc-transport vsock \
@@ -1144,6 +1134,10 @@ jobs:
             # the emulator would be worse than no benchmark (#118), and
             # this runner does publish /dev/kvm (probe run 33944339758).
             accel: kvm
+            # The inspector RPC every row is timed around rides vsock,
+            # not the 16550 (#413); tools/bench/manifest.toml says the
+            # same for the suite's lane.
+            rpc-transport: vsock
             # KVM boots in seconds; a marker hang should fail fast.
             boot-timeout: "300"
             # `instance-startup-100` gates this lane again. Neither
@@ -1261,6 +1255,7 @@ jobs:
           path: kernel-symbols/**/*.symbols.json
           if-no-files-found: error
           retention-days: 7
+      - uses: ./helios/.github/actions/vhost-vsock
       - name: Provision the multi-queue tap network backend
         if: matrix.net-backend == 'tap'
         working-directory: helios
@@ -1288,6 +1283,7 @@ jobs:
           HELIOS_WORKLOAD_BENCH_NET_BACKEND: ${{ matrix.net-backend }}
           HELIOS_WORKLOAD_BENCH_RUNTIME_DIR: ${{ env.BENCH_RUNTIME_DIR }}
           HELIOS_WORKLOAD_BENCH_ACCEL: ${{ matrix.accel }}
+          HELIOS_WORKLOAD_BENCH_RPC_TRANSPORT: ${{ matrix.rpc-transport }}
           # No capture here. The network workloads are the only ones
           # whose failure leaves nothing behind to read, but QEMU's
           # netfilters attach to a single-queue netdev only, and this

@@ -175,6 +175,7 @@ def make_report(
         memory="2G",
         linux_vm_memory="4G",
         net_backend="user",
+        rpc_transport="serial",
         devices=["virtio-blk-device", "virtio-net-device", "virtio-rng-device"],
         wasm_artifacts={"artifacts/wasi-tools/hostcall-loop.wasm": "ab" * 32},
         bootfs_cwasm={"hostcall-loop_bootfs_component.cwasm": "cd" * 32},

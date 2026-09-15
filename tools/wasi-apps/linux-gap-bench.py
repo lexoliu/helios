@@ -1929,6 +1929,7 @@ def write_report(
                 f"- Arch: `{vm['arch']}`",
                 f"- Release: `{str(vm['release']).lower()}`",
                 f"- QEMU accel: `{', '.join(vm['accel']) or 'none'}`",
+                f"- Inspector RPC transport: `{vm.get('rpc_transport', 'unrecorded')}`",
                 f"- CPU: `{vm.get('cpu') or 'default'}`",
                 f"- SMP: `{vm['smp']}`",
                 f"- Memory: `{vm['memory']}`",

@@ -510,16 +510,54 @@ def test_gate_pipeline_preserves_the_producer_exit_status(jobs, tmp_path, gate_s
     assert result.returncode == gate_status
 
 
+VHOST_VSOCK_ACTION = "./helios/.github/actions/vhost-vsock"
+
+
 def test_vsock_setup_waits_for_device_rules_before_setting_permissions():
-    workflow = yaml.load((REPO_ROOT / ".github/workflows/ci.yml").read_text(), Loader=yaml.BaseLoader)
-    steps = workflow["jobs"]["smoke-riscv64"]["steps"]
-    script = next(
-        step["run"]
-        for step in steps
-        if step.get("name") == "Boot riscv64 guest with the inspector RPC on vsock"
+    action = yaml.load(
+        (REPO_ROOT / ".github/actions/vhost-vsock/action.yml").read_text(), Loader=yaml.BaseLoader
     )
+    (step,) = action["runs"]["steps"]
+    script = step["run"]
     assert script.index("sudo modprobe vhost_vsock") < script.index("sudo udevadm settle")
     assert script.index("sudo udevadm settle") < script.index("sudo chmod 0666 /dev/vhost-vsock")
-    assert script.index("sudo chmod 0666 /dev/vhost-vsock") < script.index(
-        "./target/release/helios-inspector"
+
+
+def _step_index(steps: list[dict], predicate) -> int:
+    return next(index for index, step in enumerate(steps) if predicate(step))
+
+
+def test_every_vsock_boot_is_preceded_by_the_device_provisioning():
+    """The device is provisioned by one action wherever a guest is booted
+    with `--rpc-transport vsock`: the riscv64 smoke step, CI's own bench
+    lane, and `bench-host` for the suite and the PGO collection (#413)."""
+    workflow = yaml.load((REPO_ROOT / ".github/workflows/ci.yml").read_text(), Loader=yaml.BaseLoader)
+    smoke = workflow["jobs"]["smoke-riscv64"]["steps"]
+    provision = _step_index(smoke, lambda step: step.get("uses") == VHOST_VSOCK_ACTION)
+    boot = _step_index(
+        smoke,
+        lambda step: step.get("name") == "Boot riscv64 guest with the inspector RPC on vsock",
     )
+    assert provision < boot
+    assert "--rpc-transport vsock" in smoke[boot]["run"]
+
+    bench = workflow["jobs"]["bench"]["steps"]
+    provision = _step_index(bench, lambda step: step.get("uses") == VHOST_VSOCK_ACTION)
+    run = _step_index(bench, lambda step: step.get("name") == "Run Helios workload benchmarks")
+    assert provision < run
+    assert bench[run]["env"]["HELIOS_WORKLOAD_BENCH_RPC_TRANSPORT"] == "${{ matrix.rpc-transport }}"
+    (lane,) = workflow["jobs"]["bench"]["strategy"]["matrix"]["include"]
+    assert lane["rpc-transport"] == "vsock"
+
+    host = yaml.load(
+        (REPO_ROOT / ".github/actions/bench-host/action.yml").read_text(), Loader=yaml.BaseLoader
+    )
+    assert any(step.get("uses") == VHOST_VSOCK_ACTION for step in host["runs"]["steps"])
+
+    collect = yaml.load(
+        (REPO_ROOT / ".github/actions/collect-kernel-profile/action.yml").read_text(),
+        Loader=yaml.BaseLoader,
+    )
+    boots = [step["run"] for step in collect["runs"]["steps"] if "workload-bench" in step.get("run", "")]
+    assert boots
+    assert all('--rpc-transport "${{ steps.lane.outputs.rpc-transport }}"' in run for run in boots)

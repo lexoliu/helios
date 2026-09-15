@@ -93,6 +93,17 @@ if [[ -n "${HELIOS_WORKLOAD_BENCH_ACCEL:-}" ]]; then
     command+=(--accel "${HELIOS_WORKLOAD_BENCH_ACCEL}")
 fi
 
+# Which transport carries the inspector RPC that every workload is timed
+# around. The inspector's default is the debug serial line, which on
+# x86-64 is QEMU's 16550: one I/O-port exit per byte each way, and 10–20
+# ms of round trip inside every `elapsed_ms` (#413). A lane that can
+# provide vhost-vsock names `vsock` here and the inspector refuses rather
+# than falling back when the host cannot, so a number's transport is
+# never a guess.
+if [[ -n "${HELIOS_WORKLOAD_BENCH_RPC_TRANSPORT:-}" ]]; then
+    command+=(--rpc-transport "${HELIOS_WORKLOAD_BENCH_RPC_TRANSPORT}")
+fi
+
 if [[ -n "${HELIOS_WORKLOAD_BENCH_VM_SMP:-}" ]]; then
     command+=(--smp "${HELIOS_WORKLOAD_BENCH_VM_SMP}")
 fi

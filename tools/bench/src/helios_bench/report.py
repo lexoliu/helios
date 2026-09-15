@@ -229,6 +229,14 @@ class Pins(BaseModel):
     memory: str
     linux_vm_memory: str
     net_backend: str
+    rpc_transport: Literal["serial", "vsock"] | None = Field(
+        default=None,
+        description=(
+            "the transport the inspector RPC every Helios row is timed around rode; "
+            "None for a report written before the field existed, which the gate "
+            "still reads as the lane's previous run"
+        ),
+    )
     devices: list[str]
     wasm_artifacts: dict[str, str] = Field(
         description="repo-relative path -> sha256 of every wasm the run used"

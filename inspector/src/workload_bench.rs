@@ -504,6 +504,11 @@ pub(crate) struct VmProvenance {
     pub(crate) memory: String,
     pub(crate) cpu: Option<String>,
     pub(crate) accel: Vec<String>,
+    /// The transport the inspector RPC that every workload is timed
+    /// around rode: the serial line is QEMU's 16550 on x86-64 and
+    /// costs an exit per byte, so a number without its transport is
+    /// not comparable to one with (#413).
+    pub(crate) rpc_transport: crate::vm::VmRpcTransport,
 }
 
 #[derive(Debug, Serialize)]
