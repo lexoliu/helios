@@ -162,8 +162,9 @@ impl ExternalInterrupts {
         self.routes.add_block(interrupt.source, interrupt.device);
     }
 
-    /// Route the debug UART's source; the handler raises the debug
-    /// console's receive and transmit signals in interrupt context.
+    /// Route the debug UART's source; the handler masks the port's
+    /// receive line and raises the debug console's receive signal in
+    /// interrupt context.
     pub(crate) fn attach_debug_serial(
         &mut self,
         source: InterruptSourceId,

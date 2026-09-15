@@ -89,10 +89,10 @@ pub struct ExternalInterruptRoutes<
     input: [Option<(Source, Input)>; MAX_INPUT_DEVICES],
     sound: Option<(Source, Sound)>,
     block: [Option<(Source, Block)>; MAX_BLOCK_DEVICES],
-    /// The debug UART's source. Its handler raises the console's
-    /// receive and transmit signals — see
+    /// The debug UART's receive source. Its handler masks the line and
+    /// raises the console's receive signal — see
     /// [`DebugSerialInterrupt`](super::debug_serial::DebugSerialInterrupt)
-    /// — so input and output waiters park instead of polling the port.
+    /// — so input waiters park instead of polling the port.
     debug_serial: Option<(Source, DebugSerial)>,
     /// Sources a user-mode driver owns. Concrete rather than generic:
     /// what a granted source reaches is the kernel's own relay, which
@@ -233,9 +233,9 @@ where
     /// Registers the machine's debug UART.
     ///
     /// One slot: there is one debug serial line and one console that
-    /// owns it. The handler runs in interrupt context, reads the UART's
-    /// status through the backend's closure, and raises the console's
-    /// receive and transmit signals for the conditions it reports.
+    /// owns it. The handler runs in interrupt context, masks the UART's
+    /// receive interrupt through the backend's port, and raises the
+    /// console's receive signal.
     pub fn set_debug_serial(&mut self, source: Source, handler: DebugSerial) {
         assert!(
             self.debug_serial.is_none(),
