@@ -24,8 +24,7 @@ pub use child::{
 };
 pub use console::RecordingConsole;
 pub use debug_serial::{
-    DebugConsole, DebugSerialAccess, DebugSerialInterrupt, DebugSerialIrqStatus, DebugSerialWriter,
-    read_debug_serial,
+    DebugConsole, DebugSerialAccess, DebugSerialInterrupt, DebugSerialWriter, read_debug_serial,
 };
 pub use interrupts::{
     ExternalInterruptHandler, ExternalInterruptRoutes, MAX_BLOCK_DEVICES, MAX_DEVICE_INTERRUPTS,

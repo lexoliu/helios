@@ -102,6 +102,12 @@ impl helios_hal::serial::ByteSerial for HostedDebugPort {
             let _ = stdout.flush();
         }
     }
+
+    /// The reader thread raises the receive signal itself and never
+    /// masks, so there is no line to re-enable.
+    fn enable_receive_interrupt(&self) {}
+
+    fn disable_receive_interrupt(&self) {}
 }
 
 /// The console that owns the right to write to the process's stdout.

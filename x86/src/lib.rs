@@ -62,19 +62,15 @@ const COM1_BASE: u16 = 0x3f8;
 const COM1_DATA: u16 = COM1_BASE;
 const COM1_INTERRUPT_ENABLE: u16 = COM1_BASE + 1;
 const COM1_FIFO_CONTROL: u16 = COM1_BASE + 2;
-const COM1_INTERRUPT_IDENTIFICATION: u16 = COM1_BASE + 2;
 const COM1_LINE_CONTROL: u16 = COM1_BASE + 3;
 const COM1_MODEM_CONTROL: u16 = COM1_BASE + 4;
 const COM1_LINE_STATUS: u16 = COM1_BASE + 5;
 const LSR_DATA_READY: u8 = 0x01;
 const LSR_TX_EMPTY: u8 = 0x20;
-/// Interrupt identification register: bit 0 clear means an interrupt
-/// is pending and bits 3:1 name which.
-const IIR_NO_INTERRUPT: u8 = 0x01;
-const IIR_TRANSMITTER_EMPTY: u8 = 0x02;
-const IIR_RECEIVED_DATA: u8 = 0x04;
-const IIR_INTERRUPT_ID_MASK: u8 = 0x0e;
-const IIR_CHARACTER_TIMEOUT: u8 = 0x0c;
+/// Interrupt enable register: received-data-available is the only
+/// source this backend arms. Transmission is synchronous on the line
+/// status register, so no holding-register-empty interrupt is wanted.
+const IER_RECEIVED_DATA: u8 = 0x01;
 const PIT_COMMAND: u16 = 0x43;
 const PIT_CHANNEL2_DATA: u16 = 0x42;
 const PIT_SPEAKER_GATE: u16 = 0x61;
@@ -558,8 +554,7 @@ fn install_pci_devices<WatchdogImpl>(
     // can precede its handler.
     routes.set_debug_serial(
         exceptions::DEBUG_SERIAL_INTERRUPT_VECTOR,
-        DebugSerial::console()
-            .interrupt_handler(com1_irq_status as fn() -> helios_kernel::DebugSerialIrqStatus),
+        DebugSerial::console().interrupt_handler::<DebugSerial>(),
     );
     cpu.platform_state().install_device_interrupts(routes);
     cpu.platform_state().io_apic().program_redirection(
@@ -1133,9 +1128,10 @@ fn serial_uart_init() {
         PortWriteOnly::new(COM1_DATA).write(0x01_u8);
         PortWriteOnly::new(COM1_INTERRUPT_ENABLE).write(0x00_u8);
         PortWriteOnly::new(COM1_LINE_CONTROL).write(0x03_u8);
-        // The divisor latch is closed, so this reaches the real IER:
-        // receive-data and holding-register-empty interrupts on.
-        PortWriteOnly::new(COM1_INTERRUPT_ENABLE).write(0x03_u8);
+        // The divisor latch is closed, so this reaches the real IER. The
+        // receive interrupt stays off until the first input waiter arms
+        // it through `ByteSerial::enable_receive_interrupt`.
+        PortWriteOnly::new(COM1_INTERRUPT_ENABLE).write(0x00_u8);
         PortWriteOnly::new(COM1_FIFO_CONTROL).write(0xc7_u8);
         PortWriteOnly::new(COM1_MODEM_CONTROL).write(0x0b_u8);
     }
@@ -1158,6 +1154,21 @@ impl ByteSerial for DebugSerial {
     fn write_bytes(&self, bytes: &[u8]) {
         for &byte in bytes {
             serial_write_byte(byte);
+        }
+    }
+
+    /// One port write each way. The divisor latch is closed after
+    /// `serial_uart_init`, so the interrupt-enable register is the one
+    /// at this offset; nothing else on the machine writes it.
+    fn enable_receive_interrupt(&self) {
+        unsafe {
+            PortWriteOnly::new(COM1_INTERRUPT_ENABLE).write(IER_RECEIVED_DATA);
+        }
+    }
+
+    fn disable_receive_interrupt(&self) {
+        unsafe {
+            PortWriteOnly::new(COM1_INTERRUPT_ENABLE).write(0x00_u8);
         }
     }
 }
@@ -1191,33 +1202,6 @@ fn serial_tx_ready() -> bool {
         let mut status: PortReadOnly<u8> = PortReadOnly::new(COM1_LINE_STATUS);
         status.read() & LSR_TX_EMPTY != 0
     }
-}
-
-/// COM1's interrupt identification, in the shape the kernel's
-/// debug-serial route handler consumes.
-///
-/// Runs in interrupt context: the port read is all it does. The read
-/// itself acknowledges a transmitter-empty interrupt and the reader
-/// acknowledges received data by draining the data port — the line
-/// status register would describe the same events but consume neither,
-/// so a THRE would outlive its acknowledgement.
-fn com1_irq_status() -> helios_kernel::DebugSerialIrqStatus {
-    let iir = unsafe {
-        let mut identification: PortReadOnly<u8> = PortReadOnly::new(COM1_INTERRUPT_IDENTIFICATION);
-        identification.read()
-    };
-    let mut status = helios_kernel::DebugSerialIrqStatus {
-        receive_ready: false,
-        transmit_empty: false,
-    };
-    if iir & IIR_NO_INTERRUPT == 0 {
-        match iir & IIR_INTERRUPT_ID_MASK {
-            IIR_RECEIVED_DATA | IIR_CHARACTER_TIMEOUT => status.receive_ready = true,
-            IIR_TRANSMITTER_EMPTY => status.transmit_empty = true,
-            _ => {}
-        }
-    }
-    status
 }
 
 /// The console that owns the right to write to COM1.

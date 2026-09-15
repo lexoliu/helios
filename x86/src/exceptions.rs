@@ -86,7 +86,7 @@ pub(crate) type DeviceInterruptRoutes = helios_kernel::ExternalInterruptRoutes<
     crate::input::VirtioInputFunction,
     crate::snd::VirtioSoundDevice,
     crate::block::VirtioBlockDevice,
-    helios_kernel::DebugSerialInterrupt<fn() -> helios_kernel::DebugSerialIrqStatus>,
+    helios_kernel::DebugSerialInterrupt<crate::DebugSerial>,
 >;
 
 global_asm!(include_str!("exceptions.S"));

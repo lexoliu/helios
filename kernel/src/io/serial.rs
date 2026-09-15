@@ -73,6 +73,10 @@ mod tests {
         }
 
         fn write_bytes(&self, _bytes: &[u8]) {}
+
+        fn enable_receive_interrupt(&self) {}
+
+        fn disable_receive_interrupt(&self) {}
     }
 
     #[test]
