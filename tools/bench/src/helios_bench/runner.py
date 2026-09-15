@@ -287,6 +287,7 @@ def helios_command(
         "HELIOS_WORKLOAD_BENCH_VM_MEMORY": lane.memory,
         "HELIOS_WORKLOAD_BENCH_VM_SMP": str(lane.vcpus),
         "HELIOS_WORKLOAD_BENCH_NET_BACKEND": lane.net_backend,
+        "HELIOS_WORKLOAD_BENCH_RPC_TRANSPORT": lane.rpc_transport,
     }
     if options.network.ifname:
         env["HELIOS_WORKLOAD_BENCH_NET_IFNAME"] = options.network.ifname
@@ -587,6 +588,7 @@ def collect_pins(lane: Lane, workloads: list[dict], kernel_build: str) -> Pins:
         memory=lane.memory,
         linux_vm_memory=lane.linux_vm_memory,
         net_backend=lane.net_backend,
+        rpc_transport=lane.rpc_transport,
         devices=lane.devices,
         wasm_artifacts=wasm_artifact_digests(workloads),
         bootfs_cwasm=bootfs_cwasm_digests(lane, kernel_build),

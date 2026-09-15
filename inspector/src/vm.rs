@@ -3015,6 +3015,7 @@ fn connect_and_run(
                 memory: command.memory.clone(),
                 cpu: command.cpu.clone(),
                 accel: command.accel.clone(),
+                rpc_transport: command.rpc_transport,
             },
         ),
         Some(ResolvedVmSessionCommand::Balloon(balloon)) => {

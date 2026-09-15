@@ -14,7 +14,7 @@
 | Wasmtime on Linux | `{{ report.pins.wasmtime_linux_release }}` |
 | Fedora image | `{{ report.pins.fedora_image_url }}` (`{{ report.pins.fedora_image_sha256 }}`) |
 | QEMU | `{{ report.pins.qemu_version }}` |
-| Guest | {{ report.pins.vcpus }} vCPUs, {{ report.pins.memory }} (Helios) / {{ report.pins.linux_vm_memory }} (Linux), `{{ report.pins.net_backend }}` network, {{ report.pins.devices | join(", ") }} |
+| Guest | {{ report.pins.vcpus }} vCPUs, {{ report.pins.memory }} (Helios) / {{ report.pins.linux_vm_memory }} (Linux), `{{ report.pins.net_backend }}` network, inspector RPC over `{{ report.pins.rpc_transport or "unrecorded" }}`, {{ report.pins.devices | join(", ") }} |
 {% for path, digest in report.pins.wasm_artifacts.items() %}
 | wasm `{{ path }}` | `{{ digest }}` |
 {% endfor %}

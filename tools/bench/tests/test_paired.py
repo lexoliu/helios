@@ -963,6 +963,7 @@ def test_a_pgo_run_reports_without_a_linux_side(tmp_path) -> None:
             memory="6G",
             linux_vm_memory="4G",
             net_backend="tap",
+            rpc_transport="serial",
             devices=["virtio-net-pci"],
             wasm_artifacts={},
             bootfs_cwasm={},

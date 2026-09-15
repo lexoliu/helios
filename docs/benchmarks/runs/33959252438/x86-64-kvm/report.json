@@ -32,6 +32,7 @@
     "memory": "6G",
     "linux_vm_memory": "4G",
     "net_backend": "tap",
+    "rpc_transport": "serial",
     "devices": [
       "virtio-blk-pci",
       "virtio-net-pci",

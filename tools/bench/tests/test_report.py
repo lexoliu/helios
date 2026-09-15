@@ -1,7 +1,9 @@
+import json
 from pathlib import Path
 
 import pytest
 
+from helios_bench.render import render_pins
 from helios_bench.report import Report, Side, WorkloadClass, load_report, save_report
 
 
@@ -105,3 +107,20 @@ def test_failure_records_become_failed_cells(tmp_path, baseline_report: Report) 
     text = render_tables(report)
     assert "| `tcp-throughput` (headline) | **failed** | n/a | n/a | n/a | n/a |" in text
     assert "`tcp-throughput` failed on Helios: TcpErrorKind::Timeout: TCP read timed out" in text
+
+
+def test_a_report_written_before_the_rpc_transport_was_recorded_still_loads(
+    tmp_path: Path, baseline_report: Report
+) -> None:
+    """The gate compares a run against the lane's previous run, and the
+    previous run's report may predate the field (#413): it loads, its
+    transport reads as unrecorded, and nothing about the comparison
+    depends on it."""
+    path = tmp_path / "report.json"
+    save_report(baseline_report, path)
+    raw = json.loads(path.read_text())
+    del raw["pins"]["rpc_transport"]
+    path.write_text(json.dumps(raw))
+    loaded = load_report(path)
+    assert loaded.pins.rpc_transport is None
+    assert "inspector RPC over `unrecorded`" in render_pins(loaded)

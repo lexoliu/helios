@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import os
 import platform
 import re
 import shutil
 import subprocess
 import tomllib
 from pathlib import Path
+from typing import Literal
 
 import yaml
 from pydantic import BaseModel, Field
@@ -35,6 +37,7 @@ class Lane(BaseModel):
     helios_arch: str
     guest_arch: str
     accelerator: str
+    rpc_transport: Literal["serial", "vsock"]
     runner_label: str
     shared_runner: str
     qemu_version: str
@@ -63,6 +66,10 @@ class Lane(BaseModel):
             "helios-arch": self.helios_arch,
             "guest-arch": self.guest_arch,
             "net-backend": self.net_backend,
+            # The inspector RPC transport the lane's numbers are taken
+            # over; a job that boots the lane's workloads outside the
+            # matrix reads it here for the same reason it reads `memory`.
+            "rpc-transport": self.rpc_transport,
             "boot-timeout": str(self.boot_timeout_seconds),
             # The guest RAM the lane's workloads are sized for. A job
             # that boots this lane's workloads outside the matrix — the
@@ -195,6 +202,8 @@ def host_deviations(lane: Lane) -> list[str]:
         deviations.append(f"{lane.qemu_binary} is {version}, lane pins {lane.qemu_version}")
     if not accelerator_available(lane.accelerator):
         deviations.append(f"accelerator {lane.accelerator} is not available on this host")
+    if lane.rpc_transport == "vsock" and not os.access("/dev/vhost-vsock", os.R_OK | os.W_OK):
+        deviations.append("/dev/vhost-vsock is not usable, lane carries the inspector RPC over vsock")
     cpus = platform.os.cpu_count() or 0
     if cpus < lane.vcpus:
         deviations.append(f"host has {cpus} logical CPUs, lane needs {lane.vcpus} vCPUs")

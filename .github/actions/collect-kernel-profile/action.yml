@@ -68,6 +68,7 @@ runs:
         # definition of the one in tools/bench/manifest.toml.
         entry="$(uv run helios-bench lanes --select "${{ inputs.lane }}" --format github-matrix | jq -c '.[0]')"
         printf 'memory=%s\n' "$(printf '%s' "$entry" | jq -r '.memory')" >> "$GITHUB_OUTPUT"
+        printf 'rpc-transport=%s\n' "$(printf '%s' "$entry" | jq -r '."rpc-transport"')" >> "$GITHUB_OUTPUT"
     - name: Put llvm-profdata on PATH
       # The inspector merges the raw profile before it writes anything and
       # names this tool if it cannot find it; the toolchain's own copy is
@@ -123,6 +124,7 @@ runs:
         # it would collect nothing for them.
         ./target/release/helios-inspector vm --arch x86-64 --profile-generate \
           --accel kvm --memory "${{ steps.lane.outputs.memory }}" \
+          --rpc-transport "${{ steps.lane.outputs.rpc-transport }}" \
           --net-backend tap --net-queues "$(nproc)" \
           --net-ifname "${{ inputs.net-ifname }}" \
           --net-bridge "${{ inputs.net-bridge }}" \
