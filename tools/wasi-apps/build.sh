@@ -4,8 +4,9 @@
 #
 # - Downloads the official (unofficial-but-canonical) CPython WASI build
 #   from `brettcannon/cpython-wasi-build`, runs it through the wasi
-#   preview1→p2 adapter shipped alongside wasmtime, and stashes the
-#   component + stdlib under `$out_dir/../python3-root`.
+#   preview1→p2 adapter shipped alongside wasmtime, compiles the stdlib
+#   to bytecode with the interpreter itself, and stashes the component
+#   + stdlib under `$out_dir/../python3-root`.
 # - Builds our Rust `curl-wasi`, the TCP throughput tools, and the
 #   benchmark-suite workload programs from source.
 # - Stages standard Wasmer WASIX shell/coreutils artifacts, derives the
@@ -17,7 +18,9 @@
 #   reads (docs/pgo.md section (b)).
 #
 # Network-gated: the CPython download needs internet; pass a pre-staged
-# zip via `CPYTHON_WASI_ZIP=<path>` to skip the download step. Wasmer
+# zip via `CPYTHON_WASI_ZIP=<path>` to skip the download step, and a
+# wasmtime CLI via `WASMTIME_BIN=<path>` to skip fetching the pinned
+# release's binary that compiles the stdlib. Wasmer
 # artifacts may be supplied as raw modules (`*_WASM=<path>`) or WEBc images
 # (`*_WEBC=<path>`); otherwise this script downloads the pinned official WEBc
 # images and extracts their wasm atoms. QuickJS may be supplied as a raw SIMD
@@ -138,6 +141,41 @@ require_tool() {
   fi
 }
 
+# The wasmtime CLI of the pinned release, for running a staged
+# interpreter on the host: `WASMTIME_BIN` when the caller has one,
+# otherwise the release asset for this machine, fetched next to the
+# preview1 adapter that comes from the same release.
+stage_wasmtime_cli() {
+  if [[ -n "${WASMTIME_BIN:-}" ]]; then
+    printf '%s\n' "$WASMTIME_BIN"
+    return 0
+  fi
+  local machine os
+  case "$(uname -m)" in
+    x86_64 | amd64) machine=x86_64 ;;
+    aarch64 | arm64) machine=aarch64 ;;
+    *)
+      printf 'no wasmtime release asset for machine %s; set WASMTIME_BIN\n' "$(uname -m)" >&2
+      exit 1
+      ;;
+  esac
+  case "$(uname -s)" in
+    Linux) os=linux ;;
+    Darwin) os=macos ;;
+    *)
+      printf 'no wasmtime release asset for OS %s; set WASMTIME_BIN\n' "$(uname -s)" >&2
+      exit 1
+      ;;
+  esac
+  local asset="wasmtime-v${wasmtime_version}-${machine}-${os}"
+  local archive="$staging/$asset.tar.xz"
+  echo "Downloading wasmtime $wasmtime_version CLI ($machine-$os)..." >&2
+  download "$archive" \
+    "https://github.com/bytecodealliance/wasmtime/releases/download/v${wasmtime_version}/$asset.tar.xz"
+  tar -C "$staging" -xf "$archive"
+  printf '%s\n' "$staging/$asset/wasmtime"
+}
+
 build_quickjs_wasm() {
   local output="$1"
   local archive="${QUICKJS_SOURCE_ARCHIVE:-}"
@@ -223,6 +261,25 @@ wasm-tools component new \
   -o "$python_component_raw"
 wasm-tools strip "$python_component_raw" -o "$python_root/python3.wasm"
 apply_branch_hints python3 "$python_root/python3.wasm"
+
+# CPython compiles every stdlib module it imports from source unless a
+# `__pycache__` entry exists, and the release zip ships none. In the
+# guest the stdlib is a read-only bootfs tree, so without this step
+# every run of `python3` recompiles its whole import closure (`import
+# json` alone is 21 modules); the Linux + Wasmtime bench side, on a
+# writable `--dir`, compiles once and reads bytecode from then on (#374).
+# The interpreter compiles its own stdlib so the magic number and marshal
+# format match by construction, and hash-based unchecked bytecode is
+# never validated against a source mtime the image does not carry.
+# `-B` keeps the interpreter's own start-up imports from writing
+# timestamp-validated bytecode first, and `-f` recompiles a module even
+# when such an entry exists: without both, `encodings`, `re`, `enum` and
+# everything else `compileall` itself imports stayed timestamp-based and
+# the guest, whose mtimes never match, rejected them as stale.
+echo "Compiling the CPython stdlib to bytecode..."
+wasmtime_bin="$(stage_wasmtime_cli)"
+"$wasmtime_bin" run --dir "$staging/cpython::/" "$staging/cpython/python.wasm" -B \
+  -m compileall -f --invalidation-mode unchecked-hash -q /lib
 
 cp -r "$staging/cpython/lib" "$python_root/"
 
