@@ -66,6 +66,11 @@ pub(crate) enum AcpiError {
     #[error("the SPCR declares no console: the firmware redirects to no serial port")]
     NoConsole,
     #[error(
+        "the SPCR names no global system interrupt for the console UART; the debug console could \
+         only be polled"
+    )]
+    ConsoleInterruptMissing,
+    #[error(
         "the SPCR console is in address space {0:?}; AArch64 consoles are memory mapped and this \
          kernel has no other way to reach one"
     )]
@@ -120,6 +125,10 @@ pub(super) fn console(tables: &AcpiPlatformTables) -> Result<ConsoleDescription,
     if address.address_space != AddressSpace::SystemMemory {
         return Err(AcpiError::ConsoleAddressSpace(address.address_space));
     }
+    let interrupt = spcr
+        .global_system_interrupt()
+        .ok_or(AcpiError::ConsoleInterruptMissing)
+        .and_then(spi_from_gsiv)?;
     Ok(ConsoleDescription {
         region: MmioRegion {
             base: address.address as usize,
@@ -128,17 +137,13 @@ pub(super) fn console(tables: &AcpiPlatformTables) -> Result<ConsoleDescription,
             // mapping in this backend is made of.
             size: crate::PAGE_BYTES,
         },
-        interrupt: spcr
-            .global_system_interrupt()
-            .map(spi_from_gsiv)
-            .transpose()?
-            // A UART line is edge-triggered nowhere on this platform,
-            // and the SPCR's interrupt-type flags say nothing about
-            // trigger mode.
-            .map(|number| SpiInterrupt {
-                number,
-                trigger: Trigger::Level,
-            }),
+        // A UART line is edge-triggered nowhere on this platform, and
+        // the SPCR's interrupt-type flags say nothing about trigger
+        // mode.
+        interrupt: SpiInterrupt {
+            number: interrupt,
+            trigger: Trigger::Level,
+        },
     })
 }
 

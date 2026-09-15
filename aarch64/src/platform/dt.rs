@@ -45,7 +45,9 @@ pub(super) fn console(fdt: &Fdt<'static>) -> Result<ConsoleDescription, Platform
     ))?;
     Ok(ConsoleDescription {
         region: first_region(&node, PL011)?,
-        interrupt: node_interrupt(fdt, &node),
+        interrupt: node_interrupt(fdt, &node).ok_or(PlatformError::DeviceTreeMissing(
+            "shared peripheral interrupt on the arm,pl011 console UART node",
+        ))?,
     })
 }
 
