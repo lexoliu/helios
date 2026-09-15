@@ -71,6 +71,80 @@
       }
     },
     {
+      "name": "cpython-startup",
+      "class": "compute",
+      "headline": false,
+      "runner": "program",
+      "description": "CPython interpreter start-up and `site` import; the fixed cost every CPython row pays.",
+      "program": "{python3}",
+      "args": [
+        "-c",
+        "print(\"cpython-startup:ok\")"
+      ],
+      "boot_programs": [
+        "python3"
+      ],
+      "stdout_contains": [
+        "cpython-startup:ok"
+      ],
+      "counterparts": {
+        "linux_native": {
+          "inherit": true
+        },
+        "linux_wasmtime": {
+          "wasm_path": "artifacts/python3-root/python3.wasm",
+          "guest_paths": [
+            "artifacts/python3-root"
+          ],
+          "wasmtime_flags": [
+            "--dir",
+            "{repo_root}/artifacts/python3-root::/"
+          ],
+          "args": [
+            "-c",
+            "print(\"cpython-startup:ok\")"
+          ]
+        }
+      }
+    },
+    {
+      "name": "cpython-import-json",
+      "class": "compute",
+      "headline": false,
+      "runner": "program",
+      "description": "CPython start-up plus `import json`: the stdlib import path over the host share.",
+      "program": "{python3}",
+      "args": [
+        "-c",
+        "import json; print(\"cpython-import-json:ok\")"
+      ],
+      "boot_programs": [
+        "python3"
+      ],
+      "stdout_contains": [
+        "cpython-import-json:ok"
+      ],
+      "counterparts": {
+        "linux_native": {
+          "inherit": true
+        },
+        "linux_wasmtime": {
+          "wasm_path": "artifacts/python3-root/python3.wasm",
+          "guest_paths": [
+            "artifacts/python3-root"
+          ],
+          "wasmtime_flags": [
+            "--dir",
+            "{repo_root}/artifacts/python3-root::/"
+          ],
+          "args": [
+            "-c",
+            "import json; print(\"cpython-import-json:ok\")"
+          ]
+        }
+      }
+    },
+    {
       "name": "cpython-regex",
       "class": "compute",
       "headline": false,

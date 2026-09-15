@@ -69,6 +69,7 @@ reason under the table the cell is missing from.
 | net | `tcp-latency` | 5000 × 16-byte round trip to a host echo server | same wasm | C client with `TCP_NODELAY` |
 | fs | `fs-smallfiles`, `fs-readstream` | coreutils on the embedded filesystem root | `coreutils-wasi.wasm` under `wasmtime run --dir` | ext4 in the guest |
 | compute | `quickjs-loop`, `cpython-json`, `cpython-regex`, `wasm-simd-lanes` | interpreter or SIMD loops | same wasm | native QuickJS/CPython/NEON-or-SSE probe |
+| compute | `cpython-startup`, `cpython-import-json` | the CPython row decomposed — interpreter start-up alone, then start-up plus `import json` over the host share | same wasm | native CPython |
 | compute | `aot-curl` | compiler plugin AOT of `curl.wasm` | `wasmtime compile` of the same input | uncompared (`wasmtime compile` is the native equivalent of the in-guest step) |
 
 `headline: true` marks the rows the README table and the regression gate
@@ -341,6 +342,17 @@ the kernel counters the guest reported (`helios-*.perf.json`, the
 sampled kernel profile (`helios-*.kernel.folded`), so a diagnosis that
 needs a counter the table cut, or the baseline's counters at all, reads
 them from the artifact instead of re-running the lane.
+
+The `kernel;hostfs;*` counters decompose the virtio-9p host share the
+way `kernel;network;*` does the interface:
+
+- `kernel;hostfs;op-*` — one `HostFileSystem` operation end to end;
+  count is calls, nanos is wall time, bytes is payload moved.
+- `kernel;hostfs;msg-*` — one 9p exchange per message type, from
+  submission to a reply matched on the request's tag; nanos is the
+  device round trip plus the waiter's wake latency.
+- `kernel;hostfs;cache-hit` / `kernel;hostfs;cache-miss` — attribute
+  cache outcomes; count only, no interval.
 
 Every number in this repository's documentation is traceable to one run
 id: `helios-bench render readme --run <id>` and `render docs --run <id>`
