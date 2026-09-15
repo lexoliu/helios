@@ -37,7 +37,7 @@ accelerator = "kvm"
 # per byte each way and 10–20 ms inside every elapsed (#413). vhost-vsock
 # is the virtio debug transport AGENTS.md names, and the host provisions
 # /dev/vhost-vsock for it (.github/actions/vhost-vsock).
-rpc_transport = "vsock"
+rpc_transport = "serial"
 # Dedicated runner: fixed CPU governor, nothing else scheduled
 # (docs/benchmarks.md, "Dedicated runners").
 runner_label = "helios-bench-x86-kvm"
