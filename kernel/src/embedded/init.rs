@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 use core::fmt::Write;
 
 use helios_artifact::bootfs::{self, BootfsError, EntryKind};
-use helios_hal::boot::BootModules;
+use helios_hal::boot::{BootModule, BootModules};
 
 use crate::{EmbeddedBootDirectory, EmbeddedBootFile, EmbeddedBootFs, EmbeddedComponent};
 
@@ -114,7 +114,7 @@ impl BootPayload {
     /// name: a kernel booted without one has no init to run and nothing
     /// honest to continue with.
     pub fn from_boot_modules<'a>(modules: &impl BootModules<'a>) -> Self {
-        let mut found = None;
+        let mut found: Option<BootModule<'a>> = None;
         let mut names = String::new();
         for module in modules.modules() {
             if !names.is_empty() {
@@ -128,7 +128,7 @@ impl BootPayload {
                 .next()
                 .is_some_and(|name| name == BOOTFS_MODULE_NAME);
             if is_bootfs {
-                if let Some(first) = found {
+                if let Some(first) = &found {
                     panic!(
                         "two helios-bootfs modules among boot modules: {} and {}",
                         String::from_utf8_lossy(first.path).as_ref(),
