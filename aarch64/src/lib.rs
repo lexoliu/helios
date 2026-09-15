@@ -26,8 +26,8 @@ use helios_hal::{
     DeviceInventory, DmaModel, Platform, ProcessorStartupPolicy, ProcessorTopology, align_up,
 };
 use helios_kernel::{
-    DebugSerialAccess, DebugSerialInterrupt, DebugSerialIrqStatus, KernelException,
-    KernelExceptionCause, Timer, WasmtimeTlsSlots,
+    DebugSerialAccess, DebugSerialInterrupt, KernelException, KernelExceptionCause, Timer,
+    WasmtimeTlsSlots,
 };
 use limine::BaseRevision;
 use limine::file::File;
@@ -75,12 +75,10 @@ const PL011_FLAG_RXFE: u32 = 1 << 4;
 const PL011_FLAG_TXFF: u32 = 1 << 5;
 const PL011_IFLS: usize = 0x034;
 const PL011_IMSC: usize = 0x038;
-const PL011_MIS: usize = 0x040;
 const PL011_ICR: usize = 0x044;
-/// Receive, transmit and receive-timeout interrupt bits, which share
-/// their positions across the mask, status and clear registers.
+/// Receive and receive-timeout interrupt bits, which share their
+/// positions across the mask and clear registers.
 const PL011_INT_RX: u32 = 1 << 4;
-const PL011_INT_TX: u32 = 1 << 5;
 const PL011_INT_RT: u32 = 1 << 6;
 
 #[cfg(target_os = "none")]
@@ -209,7 +207,7 @@ pub(crate) type DeviceInterruptRoutes = helios_kernel::ExternalInterruptRoutes<
     input::VirtioInputDevice,
     snd::VirtioSoundDevice,
     block::VirtioBlockDevice,
-    DebugSerialInterrupt<fn() -> DebugSerialIrqStatus>,
+    DebugSerialInterrupt<DebugSerial>,
 >;
 
 #[used]
@@ -686,17 +684,17 @@ extern "C" fn aarch64_kernel_main() -> ! {
     let mut routes = DeviceInterruptRoutes::new();
     // The console UART is a device the kernel drives itself: its SPI is
     // routed to the bootstrap processor and enabled exactly like the
-    // virtio transports', and its handler raises the debug console's
-    // receive and transmit signals.
+    // virtio transports'. The handler masks the receive line at the port
+    // and raises the debug console's receive signal; the waiter re-arms
+    // the line while it listens.
     gic.enable_device_interrupt(
         platform.console.interrupt.intid(),
         platform.console.interrupt.trigger,
         platform_state.bootstrap_mpidr(),
     );
-    let irq_status: fn() -> DebugSerialIrqStatus = pl011_irq_status;
     routes.set_debug_serial(
         platform.console.interrupt.intid(),
-        DebugSerial::console().interrupt_handler(irq_status),
+        DebugSerial::console().interrupt_handler::<DebugSerial>(),
     );
     if let Some(host_fs) = host_fs::install(
         &cpu,
@@ -1905,34 +1903,18 @@ impl DebugSerial {
         }
     }
 
-    /// Arms the receive, transmit and receive-timeout interrupts.
+    /// Programs the FIFO triggers the receive interrupt fires on, and
+    /// retires any condition the firmware left latched.
     ///
-    /// The receive FIFO trigger is the lowest the hardware offers —
+    /// The line itself stays masked — the debug console's first waiter
+    /// arms it. The receive trigger is the lowest the hardware offers —
     /// one eighth full — so a burst below it still raises the timeout
-    /// interrupt once the line goes quiet. The transmit trigger is the
-    /// same setting, so `transmit_empty` fires when the FIFO is nearly
-    /// drained rather than half full.
+    /// interrupt once the line goes quiet.
     fn init(self) {
         unsafe {
-            ((self.base + PL011_ICR) as *mut u32)
-                .write_volatile(PL011_INT_RX | PL011_INT_TX | PL011_INT_RT);
+            ((self.base + PL011_IMSC) as *mut u32).write_volatile(0);
+            ((self.base + PL011_ICR) as *mut u32).write_volatile(PL011_INT_RX | PL011_INT_RT);
             ((self.base + PL011_IFLS) as *mut u32).write_volatile(0);
-            ((self.base + PL011_IMSC) as *mut u32)
-                .write_volatile(PL011_INT_RX | PL011_INT_TX | PL011_INT_RT);
-        }
-    }
-
-    /// The masked interrupt state, acknowledged in the same pass.
-    ///
-    /// Runs in interrupt context: two register accesses, no lock, no
-    /// allocation. Writing the reported bits to ICR retires exactly the
-    /// conditions the caller is told about.
-    fn interrupt_status(self) -> DebugSerialIrqStatus {
-        let masked = unsafe { ((self.base + PL011_MIS) as *const u32).read_volatile() };
-        unsafe { ((self.base + PL011_ICR) as *mut u32).write_volatile(masked) };
-        DebugSerialIrqStatus {
-            receive_ready: masked & (PL011_INT_RX | PL011_INT_RT) != 0,
-            transmit_empty: masked & PL011_INT_TX != 0,
         }
     }
 
@@ -1967,6 +1949,20 @@ impl ByteSerial for DebugSerial {
             self.write_byte(byte);
         }
     }
+
+    /// Receive and receive-timeout are the only mask bits this port
+    /// uses, so a plain write of exactly them rather than a
+    /// read-modify-write. Idempotent, and callable from interrupt
+    /// context: a register write, no lock, no allocation.
+    fn enable_receive_interrupt(&self) {
+        unsafe {
+            ((self.base + PL011_IMSC) as *mut u32).write_volatile(PL011_INT_RX | PL011_INT_RT)
+        };
+    }
+
+    fn disable_receive_interrupt(&self) {
+        unsafe { ((self.base + PL011_IMSC) as *mut u32).write_volatile(0) };
+    }
 }
 
 fn active_debug_serial() -> DebugSerial {
@@ -1976,13 +1972,6 @@ fn active_debug_serial() -> DebugSerial {
         "AArch64 debug serial was used before firmware discovery completed"
     );
     DebugSerial { base }
-}
-
-/// The console UART's interrupt state for the route handler: a `fn`
-/// item coerced to a pointer so the routes' handler type stays
-/// nameable.
-fn pl011_irq_status() -> DebugSerialIrqStatus {
-    active_debug_serial().interrupt_status()
 }
 
 /// The console that owns the right to write to the machine's debug UART.
