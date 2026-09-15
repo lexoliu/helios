@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,35 +27,58 @@ type HostedRuntimeState =
 /// Shared debug state across all hosted processor threads.
 static DEBUG_STATE: OnceLock<HostedRuntimeState> = OnceLock::new();
 
-/// Shared serial I/O mutex for debug transport over stdin/stdout.
-static SERIAL_INPUT: Mutex<Option<std::io::Stdin>> = Mutex::new(None);
+/// Bytes the host's stdin reader thread has pulled and not yet handed
+/// to the kernel, and the process's stdout for the write side.
+static SERIAL_INCOMING: Mutex<VecDeque<u8>> = Mutex::new(VecDeque::new());
 static SERIAL_OUTPUT: Mutex<Option<std::io::Stdout>> = Mutex::new(None);
 
 fn init_serial() {
-    let _ = SERIAL_INPUT.lock().unwrap().insert(std::io::stdin());
     let _ = SERIAL_OUTPUT.lock().unwrap().insert(std::io::stdout());
+    spawn_serial_reader();
 }
 
 /// Hosted's debug transport is the process's own stdin, which is why it
 /// does not go through `helios_kernel::DebugSerialAccess` like the
 /// bare-metal backends.
 ///
-/// That contract is built on `ByteSerial::try_read_byte`: a port that
-/// answers immediately, so the kernel takes what is there and yields.
-/// A host stream has no such answer — `read` either returns bytes or
-/// parks the thread until some arrive. Draining it a byte at a time
-/// through the shared path would block until `max_bytes` had arrived
-/// rather than until the debugger's next frame had, so the read stays
-/// here, one blocking call for whatever the stream hands over.
+/// A host stream has no `ByteSerial::try_read_byte` answer — `read`
+/// either returns bytes or parks the thread until some arrive — so the
+/// blocking call lives on this dedicated reader thread instead of a
+/// processor thread. Each chunk the stream hands over is queued for
+/// `read_debug_serial` to drain and raises the console's receive
+/// signal, which is what the kernel's input waiters park on.
+fn spawn_serial_reader() {
+    thread::Builder::new()
+        .name("helios-serial-reader".to_owned())
+        .spawn(|| {
+            let mut stdin = std::io::stdin();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                match stdin.read(&mut chunk) {
+                    Ok(0) => return,
+                    Ok(read) => {
+                        SERIAL_INCOMING
+                            .lock()
+                            .unwrap()
+                            .extend(chunk[..read].iter().copied());
+                        DEBUG_CONSOLE.receive_signal().notify_all();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => return,
+                }
+            }
+        })
+        .unwrap_or_else(|err| panic!("failed to spawn serial reader thread: {err}"));
+}
+
+/// Drains up to `max_bytes` of what the reader thread has received.
+/// Empty means no byte has arrived: the caller parks on the console's
+/// receive signal, which the reader thread raises per chunk.
 fn read_debug_serial(buffer: &mut Vec<u8>, max_bytes: u32) {
     buffer.clear();
-    let mut guard = SERIAL_INPUT.lock().unwrap();
-    let stdin = guard.as_mut().expect("serial not initialized");
-    buffer.resize(max_bytes as usize, 0);
-    match stdin.read(buffer) {
-        Ok(n) => buffer.truncate(n),
-        Err(_) => buffer.clear(),
-    }
+    let mut incoming = SERIAL_INCOMING.lock().unwrap();
+    let take = incoming.len().min(max_bytes as usize);
+    buffer.extend(incoming.drain(..take));
 }
 
 /// Hosted's write side is the process's own stdout, and it reaches it
@@ -78,6 +102,12 @@ impl helios_hal::serial::ByteSerial for HostedDebugPort {
             let _ = stdout.flush();
         }
     }
+
+    /// The reader thread raises the receive signal itself and never
+    /// masks, so there is no line to re-enable.
+    fn enable_receive_interrupt(&self) {}
+
+    fn disable_receive_interrupt(&self) {}
 }
 
 /// The console that owns the right to write to the process's stdout.

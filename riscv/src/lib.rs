@@ -32,13 +32,21 @@ mod debug_state {
     >;
 }
 
-use ns16550a::Uart;
+use ns16550a::{Break, DLAB, ParityBit, ParitySelect, StickParity, StopBits, Uart, WordLength};
+
+/// 16550 interrupt-enable register; this port arms only the
+/// received-data condition.
+const UART_IER: usize = 1;
+const UART_IER_RDI: u8 = 1 << 0;
 
 /// Debugger byte transport backed by the machine's boot UART. Kernel tracing
 /// stays in memory so the line remains reserved for RPC traffic after boot.
 #[derive(Clone, Copy)]
 pub(crate) struct DebugTransport {
     uart_base: usize,
+    /// The PLIC source the same device-tree node routes the port's
+    /// interrupt to.
+    plic_source: net::InterruptSourceId,
 }
 
 impl DebugTransport {
@@ -61,8 +69,21 @@ impl DebugTransport {
             .find_node(path)
             .or_else(|| fdt.aliases().and_then(|aliases| aliases.resolve_node(path)))?;
         let region = node.reg()?.next()?;
+        // The PLIC's specifier is a bare source number, the same
+        // one-cell binding the grant walk decodes.
+        let plic_source = helios_virtio::node_interrupt(fdt, &node)
+            .and_then(|interrupt| NonZeroU32::new(interrupt.number))
+            .map(net::InterruptSourceId)
+            .unwrap_or_else(|| {
+                panic!(
+                    "the {} debug UART node declares no PLIC source in its interrupts cell; \
+                     the serial line could only be polled",
+                    node.name
+                )
+            });
         Some(Self {
             uart_base: region.starting_address as usize,
+            plic_source,
         })
     }
 
@@ -88,6 +109,18 @@ impl ByteSerial for DebugTransport {
     fn write_bytes(&self, bytes: &[u8]) {
         DebugTransport::write_bytes(self, bytes);
     }
+
+    /// Received data is the only condition this port arms, so a plain
+    /// write of exactly that bit rather than a read-modify-write.
+    /// Idempotent, and callable from interrupt context: a register
+    /// write, no lock, no allocation.
+    fn enable_receive_interrupt(&self) {
+        unsafe { ((self.uart_base + UART_IER) as *mut u8).write_volatile(UART_IER_RDI) };
+    }
+
+    fn disable_receive_interrupt(&self) {
+        unsafe { ((self.uart_base + UART_IER) as *mut u8).write_volatile(0) };
+    }
 }
 
 use helios_virtio::DeviceType;
@@ -105,7 +138,7 @@ pub(crate) fn count_virtio_mmio_devices(fdt: &Fdt<'_>, expected: DeviceType) -> 
 }
 
 use core::arch::{asm, global_asm};
-use core::num::NonZeroUsize;
+use core::num::{NonZeroU32, NonZeroUsize};
 use core::ops::Range;
 use core::sync::atomic::{AtomicUsize, Ordering, compiler_fence};
 
@@ -753,6 +786,17 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
             // controller and before any grant is published, which the
             // registry enforces.
             device::install_hooks(plic, context);
+            // The boot UART is a device the kernel drives itself: its
+            // PLIC source is enabled and prioritised like the virtio
+            // devices'. The handler masks the receive line at the port
+            // and raises the debug console's receive signal; the waiter
+            // re-arms the line while it listens.
+            if let Some(transport) = DEBUG_TRANSPORT.get().copied() {
+                interrupts.attach_debug_serial(
+                    transport.plic_source,
+                    DebugTransport::console().interrupt_handler::<DebugTransport>(),
+                );
+            }
             if let Some(network) = net::install_network_service(&cpu, &kernel, &fdt, &debug_state) {
                 interrupts.attach_network(network);
             }
@@ -798,6 +842,17 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
             interrupts
         })
     });
+    // The debug console's readers park on the UART's interrupt, so a
+    // machine that describes the UART but gives this hart no PLIC
+    // context to route it through would hang every serial read; refuse
+    // it here rather than at the first parked reader.
+    assert!(
+        current_hart != bootstrap_processor
+            || external_interrupts.is_some()
+            || DEBUG_TRANSPORT.get().is_none(),
+        "the device tree describes a debug UART but no PLIC supervisor-external context for \
+         hart {hart_id}; the serial line could only be polled"
+    );
     let mut hart_runtime = HartRuntime {
         hart_id: current_hart,
         timer: kernel.timer(),
@@ -1057,7 +1112,25 @@ static DEBUG_CONSOLE: helios_kernel::DebugConsole = helios_kernel::DebugConsole:
 /// device tree, so the value is installed once and read afterwards.
 fn publish_debug_transport(discovered: Option<DebugTransport>) -> bool {
     if let Some(transport) = discovered {
-        DEBUG_TRANSPORT.call_once(|| transport);
+        DEBUG_TRANSPORT.call_once(|| {
+            // The interrupt-enable register shares its offset with the
+            // high divisor latch, so the line-control register is set
+            // here — eight data bits, one stop bit, no parity, latch
+            // closed — rather than inherited from whatever the firmware
+            // left: an IER write behind an open latch would corrupt the
+            // divisor and never arm the line. Firmware already picked
+            // the divisor; it is not touched.
+            Uart::new(transport.uart_base).set_lcr(
+                WordLength::EIGHT,
+                StopBits::ONE,
+                ParityBit::DISABLE,
+                ParitySelect::EVEN,
+                StickParity::DISABLE,
+                Break::DISABLE,
+                DLAB::CLEAR,
+            );
+            transport
+        });
     }
     DEBUG_TRANSPORT.get().is_some()
 }

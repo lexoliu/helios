@@ -1060,6 +1060,10 @@ pub(crate) mod test_store {
         }
 
         fn write_bytes(&self, _bytes: &[u8]) {}
+
+        fn enable_receive_interrupt(&self) {}
+
+        fn disable_receive_interrupt(&self) {}
     }
 
     static DISCARD_CONSOLE: crate::DebugConsole = crate::DebugConsole::new();

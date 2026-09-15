@@ -26,7 +26,8 @@ use helios_hal::{
     DeviceInventory, DmaModel, Platform, ProcessorStartupPolicy, ProcessorTopology, align_up,
 };
 use helios_kernel::{
-    DebugSerialAccess, KernelException, KernelExceptionCause, Timer, WasmtimeTlsSlots,
+    DebugSerialAccess, DebugSerialInterrupt, KernelException, KernelExceptionCause, Timer,
+    WasmtimeTlsSlots,
 };
 use limine::BaseRevision;
 use limine::file::File;
@@ -72,6 +73,13 @@ const PL011_DATA: usize = 0x000;
 const PL011_FLAG: usize = 0x018;
 const PL011_FLAG_RXFE: u32 = 1 << 4;
 const PL011_FLAG_TXFF: u32 = 1 << 5;
+const PL011_IFLS: usize = 0x034;
+const PL011_IMSC: usize = 0x038;
+const PL011_ICR: usize = 0x044;
+/// Receive and receive-timeout interrupt bits, which share their
+/// positions across the mask and clear registers.
+const PL011_INT_RX: u32 = 1 << 4;
+const PL011_INT_RT: u32 = 1 << 6;
 
 #[cfg(target_os = "none")]
 global_asm!(
@@ -199,6 +207,7 @@ pub(crate) type DeviceInterruptRoutes = helios_kernel::ExternalInterruptRoutes<
     input::VirtioInputDevice,
     snd::VirtioSoundDevice,
     block::VirtioBlockDevice,
+    DebugSerialInterrupt<DebugSerial>,
 >;
 
 #[used]
@@ -673,6 +682,20 @@ extern "C" fn aarch64_kernel_main() -> ! {
     device::install_hooks(gic);
 
     let mut routes = DeviceInterruptRoutes::new();
+    // The console UART is a device the kernel drives itself: its SPI is
+    // routed to the bootstrap processor and enabled exactly like the
+    // virtio transports'. The handler masks the receive line at the port
+    // and raises the debug console's receive signal; the waiter re-arms
+    // the line while it listens.
+    gic.enable_device_interrupt(
+        platform.console.interrupt.intid(),
+        platform.console.interrupt.trigger,
+        platform_state.bootstrap_mpidr(),
+    );
+    routes.set_debug_serial(
+        platform.console.interrupt.intid(),
+        DebugSerial::console().interrupt_handler::<DebugSerial>(),
+    );
     if let Some(host_fs) = host_fs::install(
         &cpu,
         &platform,
@@ -1880,7 +1903,20 @@ impl DebugSerial {
         }
     }
 
-    fn init(self) {}
+    /// Programs the FIFO triggers the receive interrupt fires on, and
+    /// retires any condition the firmware left latched.
+    ///
+    /// The line itself stays masked — the debug console's first waiter
+    /// arms it. The receive trigger is the lowest the hardware offers —
+    /// one eighth full — so a burst below it still raises the timeout
+    /// interrupt once the line goes quiet.
+    fn init(self) {
+        unsafe {
+            ((self.base + PL011_IMSC) as *mut u32).write_volatile(0);
+            ((self.base + PL011_ICR) as *mut u32).write_volatile(PL011_INT_RX | PL011_INT_RT);
+            ((self.base + PL011_IFLS) as *mut u32).write_volatile(0);
+        }
+    }
 
     fn read_flag(self) -> u32 {
         unsafe { ((self.base + PL011_FLAG) as *const u32).read_volatile() }
@@ -1912,6 +1948,20 @@ impl ByteSerial for DebugSerial {
         for &byte in bytes {
             self.write_byte(byte);
         }
+    }
+
+    /// Receive and receive-timeout are the only mask bits this port
+    /// uses, so a plain write of exactly them rather than a
+    /// read-modify-write. Idempotent, and callable from interrupt
+    /// context: a register write, no lock, no allocation.
+    fn enable_receive_interrupt(&self) {
+        unsafe {
+            ((self.base + PL011_IMSC) as *mut u32).write_volatile(PL011_INT_RX | PL011_INT_RT)
+        };
+    }
+
+    fn disable_receive_interrupt(&self) {
+        unsafe { ((self.base + PL011_IMSC) as *mut u32).write_volatile(0) };
     }
 }
 

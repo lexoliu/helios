@@ -169,6 +169,12 @@ pub(super) enum EpollWaitTarget {
         event: EventFd,
         wait: crate::NotifyWaiter,
     },
+    /// Serial-backed stdin: the debug console's receive signal is the
+    /// wakeup source, parked on through the writer handle's poll form.
+    SerialInput {
+        serial: crate::DebugSerialWriter,
+        wait: crate::NotifyWaiter,
+    },
 }
 
 impl EpollWaitTarget {
@@ -177,6 +183,7 @@ impl EpollWaitTarget {
             Self::ByteReader { reader, wait } => reader.poll_readable(cx, wait),
             Self::ByteWriter { writer, wait } => writer.poll_writable(cx, wait),
             Self::Event { event, wait } => event.poll_readable(cx, wait),
+            Self::SerialInput { serial, wait } => serial.poll_debug_serial_input(cx, wait),
         }
     }
 }
@@ -184,10 +191,10 @@ impl EpollWaitTarget {
 /// How long a waiter sleeps between re-probing descriptors that have no
 /// wakeup source of their own.
 ///
-/// Network sockets only advance when the device is driven and the serial
-/// console has no readiness interrupt, so a waiter registered on one of them
-/// has to come back and look. This matches the network service's own
-/// progress cadence; it is a bounded sleep, not a spin.
+/// Network sockets only advance when the device is driven, so a waiter
+/// registered on one of them has to come back and look. This matches the
+/// network service's own progress cadence; it is a bounded sleep, not a
+/// spin.
 pub(super) const P1_READINESS_REPOLL_INTERVAL: Duration = Duration::from_micros(50);
 
 /// Everything a `poll_oneoff`/`epoll_wait` sleep has to watch.
@@ -196,7 +203,7 @@ pub(super) struct P1WaitSet {
     /// eventfds, child stdin).
     pub(super) notified: Vec<EpollWaitTarget>,
     /// Set when at least one descriptor only reveals readiness by being
-    /// re-probed (network sockets, the serial console).
+    /// re-probed (network sockets).
     pub(super) repoll: bool,
 }
 
@@ -278,9 +285,9 @@ pub(super) async fn p1_wait_step<CpuImpl>(
 
 /// Register whatever wakes `fd` into `wait`.
 ///
-/// Descriptors backed by a kernel channel register a real waiter. Network
-/// sockets and the serial console have no wakeup source, so they only set the
-/// re-probe flag.
+/// Descriptors backed by a kernel channel register a real waiter, and
+/// serial-backed stdin parks on the console's receive signal. Network
+/// sockets have no wakeup source, so they only set the re-probe flag.
 pub(super) fn p1_add_wait_target<CpuImpl, Net, HostFs>(
     store: &Preview1ProgramStore<CpuImpl, Net, HostFs>,
     fd: i32,
@@ -329,8 +336,12 @@ pub(super) fn p1_add_wait_target<CpuImpl, Net, HostFs>(
                         wait: stdin_rx.wait_state(),
                     });
                 }
-                // The serial console has no readiness interrupt.
-                OutputMode::Serial => wait.repoll = true,
+                // The serial console's receive signal is the wakeup
+                // source, parked on the same way a channel's is.
+                OutputMode::Serial => wait.notified.push(EpollWaitTarget::SerialInput {
+                    serial: store.write_serial,
+                    wait: store.write_serial.debug_serial_input_waiter(),
+                }),
                 // Trace output never delivers input; the probe reports it as
                 // an immediate hangup, so there is nothing to wait for.
                 OutputMode::Trace => {}
