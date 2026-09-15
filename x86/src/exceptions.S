@@ -1,5 +1,44 @@
 .section .text.helios_x86_exceptions, "ax"
 
+// Bytes reserved on the stack for one XSAVE area. Large enough for every
+// component `extended_state::enable_for_current_processor` may enable
+// (x87, SSE, AVX, AVX-512 opmask/ZMM), which it asserts against the
+// size CPUID reports for the XCR0 it programmed.
+.equ HELIOS_X86_XSAVE_AREA_BYTES, 4096
+
+// Saves the interrupted context's extended register state below the
+// pushed general registers and gives the handler a clean x87/SSE
+// control state. Every general register is already on the stack, so
+// rax, rcx, rdx and rdi are free to zero the XSAVE header: XRSTOR
+// refuses an area whose header (bytes 512..575) carries anything but
+// what XSAVE wrote, and uninitialised stack memory carries anything.
+// The mask in edx:eax selects every component XCR0 enables.
+.macro HELIOS_X86_XSAVE_ENTER
+    sub rsp, HELIOS_X86_XSAVE_AREA_BYTES
+    and rsp, -64
+    lea rdi, [rsp + 512]
+    xor eax, eax
+    mov ecx, 8
+    cld
+    rep stosq
+    mov eax, 0xffffffff
+    mov edx, 0xffffffff
+    xsave64 [rsp]
+    sub rsp, 16
+    mov dword ptr [rsp], 0x1f80
+    fninit
+    ldmxcsr [rsp]
+.endm
+
+// Restores what HELIOS_X86_XSAVE_ENTER saved; the caller then drops the
+// area by reloading the stack pointer it kept.
+.macro HELIOS_X86_XSAVE_LEAVE
+    add rsp, 16
+    mov eax, 0xffffffff
+    mov edx, 0xffffffff
+    xrstor64 [rsp]
+.endm
+
 .macro HELIOS_X86_EXCEPTION_NO_ERROR name, vector
 .global \name
 \name:
@@ -191,21 +230,15 @@ helios_x86_exception_common:
     push r14
     push r15
 
-    mov rdi, rsp
     mov r12, rsp
     // The dispatcher returns when the kernel resolved the fault in
-    // place, so the interrupted context's FP/SSE file has to survive it
-    // exactly as it survives an interrupt handler.
-    sub rsp, 512
-    and rsp, -16
-    fxsave64 [rsp]
-    sub rsp, 16
-    mov dword ptr [rsp], 0x1f80
-    fninit
-    ldmxcsr [rsp]
+    // place, so the interrupted context's whole extended register file
+    // (x87, SSE, AVX and AVX-512 state, everything XCR0 enables) has
+    // to survive it exactly as it survives an interrupt handler.
+    HELIOS_X86_XSAVE_ENTER
+    mov rdi, r12
     call helios_x86_exception_dispatch
-    add rsp, 16
-    fxrstor64 [rsp]
+    HELIOS_X86_XSAVE_LEAVE
     mov rsp, r12
     pop r15
     pop r14
@@ -242,18 +275,11 @@ helios_x86_interrupt_common:
     push r14
     push r15
 
-    mov rdi, rsp
     mov r12, rsp
-    sub rsp, 512
-    and rsp, -16
-    fxsave64 [rsp]
-    sub rsp, 16
-    mov dword ptr [rsp], 0x1f80
-    fninit
-    ldmxcsr [rsp]
+    HELIOS_X86_XSAVE_ENTER
+    mov rdi, r12
     call helios_x86_interrupt_dispatch
-    add rsp, 16
-    fxrstor64 [rsp]
+    HELIOS_X86_XSAVE_LEAVE
     mov rsp, r12
 
     pop r15

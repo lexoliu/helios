@@ -58,6 +58,15 @@ pub fn cwasm_target_cranelift_flags(target: &str) -> &'static [&'static str] {
             "has_bmi1",
             "has_bmi2",
             "has_lzcnt",
+            // x86-64-v3: the floor every KVM host Helios targets clears.
+            // The x86 kernel keeps the AVX register file alive across
+            // exceptions (`extended_state` in the x86 backend), and
+            // Wasmtime refuses the artifact on a host without these
+            // features. AVX-512 stays off the floor: it is not on every
+            // host and an artifact carries one flag set.
+            "has_avx",
+            "has_avx2",
+            "has_fma",
         ];
     }
     &[]

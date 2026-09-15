@@ -9,6 +9,7 @@ mod boot;
 mod device;
 mod entropy;
 mod exceptions;
+mod extended_state;
 mod gpu;
 mod host_fs;
 mod input;
@@ -209,6 +210,9 @@ fn x86_kernel_main() -> ! {
     // The local APIC is enabled once, here, and never re-attached on the
     // interrupt or IPI paths (`smp::ProcessorRuntime::attach_local_apic`).
     smp::current_runtime().attach_local_apic();
+    // XSAVE and XCR0 come before the IDT: the exception entry saves the
+    // interrupted context with `xsave64`, which faults until then.
+    extended_state::enable_for_current_processor();
     exceptions::install_for_current_processor();
     let console = serial_console(debug_state.clone());
     let cpu = X86Cpu::new(boot.platform());
@@ -545,10 +549,6 @@ fn install_pci_devices<WatchdogImpl>(
     }
     cpu.platform_state().install_device_interrupts(routes);
 }
-
-// TODO(x86-avx): enable OSXSAVE, program XCR0, and preserve XSAVE state
-// (in `_start` and the secondary wakeup trampoline) before advertising
-// AVX/FMA/AVX512 to Wasmtime-generated code.
 
 /// Counts usable processors from the MADT. Runs before the bootstrap
 /// allocator is primed (the count sizes the allocator's per-processor
@@ -941,6 +941,9 @@ extern "C" fn secondary_start_rust(
     let runtime = unsafe { &*runtime };
     smp::activate_runtime(runtime);
     smp::current_runtime().attach_local_apic();
+    // XSAVE and XCR0 come before the IDT: the exception entry saves the
+    // interrupted context with `xsave64`, which faults until then.
+    extended_state::enable_for_current_processor();
     exceptions::install_for_current_processor();
     exceptions::verify_page_fault_returns();
 

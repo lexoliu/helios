@@ -192,9 +192,13 @@ maintainer's decision and the fork's revision moves once, per §1.
   bounds checks, with `memory_init_cow(true)` and `memory_may_move(false)`.
   Disabling any of them needs a same-PR justification of the alternative
   semantic path.
-- Full x86 AVX, FMA and AVX-512 enablement waits on the x86 kernel providing
-  OSXSAVE, XCR0 configuration and XSAVE/XRSTOR state preservation, and is
-  tracked as such.
+- The x86 kernel enables XSAVE on every processor (`CR4.OSXSAVE`, XCR0 with
+  the x87, SSE, AVX and, where present, AVX-512 components) before its IDT
+  and saves the interrupted context with `xsave64`/`xrstor64` on every
+  exception and interrupt entry, so artifacts are compiled with the
+  x86-64-v3 floor (`has_avx`, `has_avx2`, `has_fma`). AVX-512 codegen is not
+  on the floor: an artifact carries one flag set and not every KVM host has
+  it.
 - Performance decisions rest on bare-metal targets and explicit capabilities,
   never on `hosted/`.
 - A performance test, benchmark, or acceptance measurement runs `--release`
