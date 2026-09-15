@@ -42,6 +42,7 @@ use crate::debug_state;
 use crate::exceptions::{
     DeviceInterruptRoutes, EXCEPTION_STACK_BYTES, ProcessorIdt, ProcessorSegments,
 };
+use crate::ioapic::IoApic;
 use crate::pci::LegacyPciConfigAccess;
 use crate::read_tsc;
 use crate::watchdog::X86Watchdog;
@@ -236,6 +237,7 @@ pub(crate) struct X86PlatformState {
     physical_memory_offset: usize,
     debug_state: debug_state::RuntimeState,
     watchdog: X86Watchdog,
+    io_apic: IoApic,
     processors: Box<[ProcessorSlot]>,
     wakeup_page: Option<WakeupPage>,
     boot_context: AtomicPtr<BootContext>,
@@ -275,6 +277,10 @@ pub(crate) fn build_boot_context(
     let tables = unsafe { AcpiTables::from_rsdp(handler.clone(), rsdp_address) }
         .unwrap_or_else(|error| panic!("failed to parse ACPI tables: {error:?}"));
     let watchdog = crate::watchdog::discover(&tables, physical_memory_offset);
+    // Probed before the MADT is consumed: the I/O APIC's destination
+    // encoding depends on which local-APIC mode the machine runs.
+    let apic_mode = LocalApicMode::probe();
+    let io_apic = crate::ioapic::discover(&tables, physical_memory_offset, apic_mode);
     let platform = AcpiPlatform::new(tables, handler.clone())
         .unwrap_or_else(|error| panic!("failed to construct ACPI platform info: {error:?}"));
     let processor_info = platform
@@ -282,7 +288,6 @@ pub(crate) fn build_boot_context(
         .as_ref()
         .unwrap_or_else(|| panic!("ACPI platform info did not expose processor topology"));
 
-    let apic_mode = LocalApicMode::probe();
     let mut processors =
         alloc::vec::Vec::with_capacity(1 + processor_info.application_processors.len());
     processors.push(ProcessorSlot {
@@ -360,6 +365,7 @@ pub(crate) fn build_boot_context(
         physical_memory_offset,
         debug_state,
         watchdog,
+        io_apic,
         processors,
         wakeup_page,
         boot_context: AtomicPtr::new(core::ptr::null_mut()),
@@ -637,6 +643,11 @@ impl X86PlatformState {
         }
     }
 
+    /// The I/O APIC carrying COM1's line, located from the MADT at boot.
+    pub(crate) fn io_apic(&self) -> &IoApic {
+        &self.io_apic
+    }
+
     pub(crate) fn bootstrap_processor(&self) -> ProcessorId {
         ProcessorId::new(0)
     }
@@ -743,7 +754,7 @@ impl X86PlatformState {
 /// MSR writes) — so a cross-processor wake cost five exits where the
 /// ICR write is the one that does anything.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LocalApicMode {
+pub(crate) enum LocalApicMode {
     XApic { physical_base: usize },
     X2Apic,
 }
@@ -768,7 +779,7 @@ impl LocalApicMode {
 
     /// The xAPIC destination for `apic_id`, which the 8-bit destination
     /// field of an xAPIC ICR has to be able to name.
-    fn xapic_target(apic_id: u32) -> u8 {
+    pub(crate) fn xapic_target(apic_id: u32) -> u8 {
         u8::try_from(apic_id)
             .unwrap_or_else(|_| panic!("x86 target apic id {apic_id} requires x2APIC support"))
     }

@@ -170,6 +170,14 @@ where
     };
 
     let ready = loop {
+        // Arm the interests before testing them: a waiter's notification
+        // generation is sampled when it is built, so a byte landing
+        // between a descriptor's probe and its waiter's creation would be
+        // invisible to the parked wait.
+        let mut wait = match wasix_epoll_wait_set(caller, epfd) {
+            Ok(wait) => wait,
+            Err(errno) => return errno,
+        };
         let ready = wasix_collect_epoll_events(caller, epfd, maxevents).await;
         if !ready.is_empty() {
             break ready;
@@ -185,10 +193,6 @@ where
                 }
                 Some(Duration::from_nanos(deadline - now))
             }
-        };
-        let mut wait = match wasix_epoll_wait_set(caller, epfd) {
-            Ok(wait) => wait,
-            Err(errno) => return errno,
         };
         let timer = caller.data().timer();
         p1_wait_step(&timer, &mut wait, remaining).await;

@@ -9,8 +9,8 @@ use helios_hal::cpu::Cpu;
 use helios_hal::io::IoError;
 use helios_hal::watchdog::Watchdog;
 use helios_kernel::{
-    ExternalInterruptHandler, ExternalInterruptRoutes, InterfaceCapabilities, InterfaceEventMark,
-    Kernel, LinkState, NetworkDevice, PacketBuffer,
+    DebugSerialInterrupt, ExternalInterruptHandler, ExternalInterruptRoutes, InterfaceCapabilities,
+    InterfaceEventMark, Kernel, LinkState, NetworkDevice, PacketBuffer,
 };
 use plic::Plic;
 
@@ -34,6 +34,11 @@ pub(crate) struct VirtioNetworkDevice {
     cpu: RiscvCpu,
 }
 
+/// The debug UART's route handler, keyed by the port's access type:
+/// it masks the port's receive interrupt through `DebugTransport` and
+/// raises the debug console's receive signal.
+type DebugSerialHandler = DebugSerialInterrupt<crate::DebugTransport>;
+
 pub(crate) struct ExternalInterrupts {
     plic: &'static Plic,
     context: PlicContext,
@@ -48,6 +53,7 @@ pub(crate) struct ExternalInterrupts {
         crate::input::VirtioInputDevice,
         crate::snd::VirtioSoundDevice,
         crate::block::VirtioBlockDevice,
+        DebugSerialHandler,
     >,
 }
 
@@ -154,6 +160,18 @@ impl ExternalInterrupts {
     pub(crate) fn attach_block(&mut self, interrupt: crate::block::BlockInterrupt) {
         self.enable_source(interrupt.source);
         self.routes.add_block(interrupt.source, interrupt.device);
+    }
+
+    /// Route the debug UART's source; the handler masks the port's
+    /// receive line and raises the debug console's receive signal in
+    /// interrupt context.
+    pub(crate) fn attach_debug_serial(
+        &mut self,
+        source: InterruptSourceId,
+        handler: DebugSerialHandler,
+    ) {
+        self.enable_source(source);
+        self.routes.set_debug_serial(source, handler);
     }
 
     fn enable_source(&self, source: InterruptSourceId) {

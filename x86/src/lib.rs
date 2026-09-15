@@ -12,6 +12,7 @@ mod exceptions;
 mod gpu;
 mod host_fs;
 mod input;
+mod ioapic;
 mod iommu;
 mod net;
 mod pci;
@@ -66,6 +67,10 @@ const COM1_MODEM_CONTROL: u16 = COM1_BASE + 4;
 const COM1_LINE_STATUS: u16 = COM1_BASE + 5;
 const LSR_DATA_READY: u8 = 0x01;
 const LSR_TX_EMPTY: u8 = 0x20;
+/// Interrupt enable register: received-data-available is the only
+/// source this backend arms. Transmission is synchronous on the line
+/// status register, so no holding-register-empty interrupt is wanted.
+const IER_RECEIVED_DATA: u8 = 0x01;
 const PIT_COMMAND: u16 = 0x43;
 const PIT_CHANNEL2_DATA: u16 = 0x42;
 const PIT_SPEAKER_GATE: u16 = 0x61;
@@ -543,7 +548,19 @@ fn install_pci_devices<WatchdogImpl>(
     ) {
         routes.add_block(block.vector, block.device);
     }
+    // COM1 interrupts through the I/O APIC, not MSI-X, but its vector
+    // registers beside the message-signalled routes. The redirection
+    // entry is armed only once the table is installed, so no delivery
+    // can precede its handler.
+    routes.set_debug_serial(
+        exceptions::DEBUG_SERIAL_INTERRUPT_VECTOR,
+        DebugSerial::console().interrupt_handler::<DebugSerial>(),
+    );
     cpu.platform_state().install_device_interrupts(routes);
+    cpu.platform_state().io_apic().program_redirection(
+        exceptions::DEBUG_SERIAL_INTERRUPT_VECTOR,
+        destination_apic_id,
+    );
 }
 
 // TODO(x86-avx): enable OSXSAVE, program XCR0, and preserve XSAVE state
@@ -1111,6 +1128,10 @@ fn serial_uart_init() {
         PortWriteOnly::new(COM1_DATA).write(0x01_u8);
         PortWriteOnly::new(COM1_INTERRUPT_ENABLE).write(0x00_u8);
         PortWriteOnly::new(COM1_LINE_CONTROL).write(0x03_u8);
+        // The divisor latch is closed, so this reaches the real IER. The
+        // receive interrupt stays off until the first input waiter arms
+        // it through `ByteSerial::enable_receive_interrupt`.
+        PortWriteOnly::new(COM1_INTERRUPT_ENABLE).write(0x00_u8);
         PortWriteOnly::new(COM1_FIFO_CONTROL).write(0xc7_u8);
         PortWriteOnly::new(COM1_MODEM_CONTROL).write(0x0b_u8);
     }
@@ -1133,6 +1154,21 @@ impl ByteSerial for DebugSerial {
     fn write_bytes(&self, bytes: &[u8]) {
         for &byte in bytes {
             serial_write_byte(byte);
+        }
+    }
+
+    /// One port write each way. The divisor latch is closed after
+    /// `serial_uart_init`, so the interrupt-enable register is the one
+    /// at this offset; nothing else on the machine writes it.
+    fn enable_receive_interrupt(&self) {
+        unsafe {
+            PortWriteOnly::new(COM1_INTERRUPT_ENABLE).write(IER_RECEIVED_DATA);
+        }
+    }
+
+    fn disable_receive_interrupt(&self) {
+        unsafe {
+            PortWriteOnly::new(COM1_INTERRUPT_ENABLE).write(0x00_u8);
         }
     }
 }

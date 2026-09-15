@@ -659,18 +659,21 @@ where
     /// Deliver an owned stdout/stderr chunk from a synchronous poll
     /// context, honouring child-channel backpressure.
     ///
-    /// Serial, trace, and discard sinks complete immediately. A child pipe
-    /// that is at capacity parks the caller: `pending` keeps the chunk and
-    /// `wait` keeps the registration, so the next poll retries the very
-    /// same bytes once the parent has drained. Nothing is dropped and a
-    /// full pipe is never reported as an error — a vanished reader is
-    /// swallowed like a POSIX write to a closed pipe with SIGPIPE
-    /// suppressed.
+    /// A serial sink parks on the debug console's transmit signal:
+    /// `serial_wait` keeps the registration armed across polls, so the
+    /// UART releasing the port wakes this task into another write
+    /// attempt. A child pipe that is at capacity parks the caller:
+    /// `pending` keeps the chunk and `wait` keeps the registration, so
+    /// the next poll retries the very same bytes once the parent has
+    /// drained. Nothing is dropped and a full pipe is never reported
+    /// as an error — a vanished reader is swallowed like a POSIX write
+    /// to a closed pipe with SIGPIPE suppressed.
     pub fn poll_write_output_bytes(
         &self,
         stream: ComponentOutputStreamKind,
         cx: &mut core::task::Context<'_>,
         wait: &mut Option<crate::ByteWriteWait>,
+        serial_wait: &mut Option<crate::NotifyWaiter>,
         pending: &mut Option<Bytes>,
     ) -> core::task::Poll<()> {
         let Some(bytes) = pending.as_ref() else {
@@ -682,19 +685,30 @@ where
         }
         match self.execution_context.output_mode.sink(stream) {
             ComponentOutputSink::Local(local) => {
-                let chunk = pending.take().expect("the chunk was present a line ago");
-                let taken = local.write(&self.cpu, &self.runtime_state, self.serial_writer, &chunk);
-                if taken == chunk.len() {
-                    return core::task::Poll::Ready(());
+                // The waiter is armed before the port is tried, so a
+                // transmit release that lands between the write and the
+                // poll is not lost.
+                let serial_wait = serial_wait
+                    .get_or_insert_with(|| self.serial_writer.debug_serial_output_waiter());
+                loop {
+                    let chunk = pending.take().expect("the chunk was present a line ago");
+                    let taken =
+                        local.write(&self.cpu, &self.runtime_state, self.serial_writer, &chunk);
+                    if taken == chunk.len() {
+                        return core::task::Poll::Ready(());
+                    }
+                    // The debug UART's owner is another processor. Keep
+                    // what is left and come back for it when the
+                    // console's transmit signal fires.
+                    *pending = Some(chunk.slice(taken..));
+                    match self
+                        .serial_writer
+                        .poll_debug_serial_output_ready(cx, serial_wait)
+                    {
+                        core::task::Poll::Ready(()) => continue,
+                        core::task::Poll::Pending => return core::task::Poll::Pending,
+                    }
                 }
-                // The debug UART's owner is another processor. Keep what
-                // is left and come back for it: there is no readiness
-                // signal to register on a port that is written to, so
-                // the wake is this task's own, which is what
-                // `yield_now` does from a poll context.
-                *pending = Some(chunk.slice(taken..));
-                cx.waker().wake_by_ref();
-                core::task::Poll::Pending
             }
             ComponentOutputSink::Child(writer) => {
                 let wait = wait.get_or_insert_with(|| writer.wait_state());
@@ -704,9 +718,10 @@ where
     }
 
     /// Non-blocking drain of whatever stdin bytes are currently buffered,
-    /// up to `max_bytes`.  Returns an empty `Vec` when the port is idle so
-    /// callers can yield to the kernel executor.  For `Child` mode, the
-    /// reader half of the parent-provided channel is polled once.
+    /// up to `max_bytes`.  Returns an empty `Vec` when the port is idle;
+    /// callers that need bytes arm the console's receive wait before this
+    /// call and park on it.  For `Child` mode, the reader half of the
+    /// parent-provided channel is polled once.
     pub fn try_read_stdin(&self, max_bytes: u32) -> Vec<u8> {
         match &self.execution_context.output_mode {
             ComponentOutputMode::Serial => {
@@ -729,21 +744,23 @@ where
         }
     }
 
-    /// Await the next stdin chunk, yielding the executor between polls.
-    /// Returns `None` on EOF (Child mode after parent closes stdin, or
-    /// for Trace mode which never produces bytes).
+    /// Await the next stdin chunk, parking on the debug console's
+    /// receive signal between polls. Returns `None` on EOF (Child mode
+    /// after parent closes stdin, or for Trace mode which never
+    /// produces bytes).
     pub async fn await_stdin_chunk(&self) -> Option<Vec<u8>> {
         match &self.execution_context.output_mode {
             ComponentOutputMode::Serial => {
-                // Busy-poll with yield_now between polls — the serial
-                // port is a raw hardware reader without async wakeup.
+                // Arm the wait before testing the FIFO so a byte that
+                // lands between the two still completes it.
                 loop {
+                    let wait = self.serial_writer.wait_for_debug_serial_input();
                     let mut bytes = Vec::new();
                     (self.serial_reader)(&mut bytes, u32::MAX);
                     if !bytes.is_empty() {
                         return Some(bytes);
                     }
-                    crate::yield_now().await;
+                    wait.await;
                 }
             }
             ComponentOutputMode::Trace => None,
