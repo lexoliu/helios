@@ -545,6 +545,7 @@ where
         if carry.is_empty() {
             match &self.output_mode {
                 OutputMode::Serial => loop {
+                    let wait = self.write_serial.wait_for_debug_serial_input();
                     (self.read_serial)(
                         &mut self.serial_read_buffer,
                         u32::try_from(max_bytes)
@@ -554,7 +555,7 @@ where
                         *carry = Bytes::copy_from_slice(&self.serial_read_buffer);
                         break;
                     }
-                    crate::yield_now().await;
+                    wait.await;
                 },
                 OutputMode::Trace => {}
                 OutputMode::Child { stdin_rx, .. } | OutputMode::RoutedChild { stdin_rx, .. } => {
@@ -569,11 +570,11 @@ where
 
     /// Probe stdin for `poll_oneoff`/`epoll_wait` without blocking.
     ///
-    /// Serial-backed stdin has no readiness notification, so the probe pulls
-    /// whatever the console already has into the descriptor's carry; a later
-    /// `fd_read` drains that carry, so nothing is lost. A child's stdin is a
-    /// byte channel that answers directly, and trace output never delivers
-    /// input at all.
+    /// Serial-backed stdin waits on the console's receive signal, so the
+    /// probe pulls whatever the console already has into the descriptor's
+    /// carry; a later `fd_read` drains that carry, so nothing is lost. A
+    /// child's stdin is a byte channel that answers directly, and trace
+    /// output never delivers input at all.
     pub(super) fn probe_stdin(&mut self, fd: i32) -> P1Readiness {
         match self.descriptors.get(fd) {
             Some(Preview1Descriptor::Stdin { carry }) if !carry.is_empty() => {
@@ -3994,6 +3995,17 @@ where
     };
 
     let ready = loop {
+        // Arm every subscribed descriptor before testing any of them: a
+        // waiter's notification generation is sampled when it is built,
+        // so a byte landing between a descriptor's probe and its waiter's
+        // creation would be invisible to the parked wait.
+        let mut wait = P1WaitSet::new();
+        for subscription in &parsed {
+            if let P1Subscription::Fd { fd, event_type, .. } = subscription {
+                p1_add_wait_target(caller.data(), *fd, *event_type, &mut wait);
+            }
+        }
+
         let mut ready = Vec::new();
         let mut earliest: Option<Duration> = None;
 
@@ -4047,15 +4059,9 @@ where
             break ready;
         }
 
-        // Nothing is ready and no deadline has expired: register on every
-        // subscribed descriptor and sleep until one of them makes progress
-        // or the earliest deadline arrives.
-        let mut wait = P1WaitSet::new();
-        for subscription in &parsed {
-            if let P1Subscription::Fd { fd, event_type, .. } = subscription {
-                p1_add_wait_target(caller.data(), *fd, *event_type, &mut wait);
-            }
-        }
+        // Nothing is ready and no deadline has expired: sleep until one
+        // of the armed descriptors makes progress or the earliest
+        // deadline arrives.
         let timer = caller.data().timer();
         p1_wait_step(&timer, &mut wait, earliest).await;
     };
@@ -4748,8 +4754,12 @@ where
     HostFs: crate::HostFileSystem,
 {
     let written = u32::try_from(bytes.len()).map_err(|_| p1::errno::OVERFLOW)?;
+    let serial = caller.data().write_serial;
     let mut placed = 0;
     let writer = loop {
+        // Armed before the offer so a transmit release that lands
+        // between the two is not lost.
+        let wait = serial.wait_for_debug_serial_output_ready();
         match caller.data().route_output(stream, &bytes[placed..]) {
             RoutedOutput::Child(writer) => break writer,
             RoutedOutput::Local(taken) => {
@@ -4759,7 +4769,8 @@ where
                 }
                 // The debug UART is owned by another processor right
                 // now. A non-blocking descriptor reports what it did
-                // place; a blocking one yields and offers the rest.
+                // place; a blocking one waits on the console's transmit
+                // signal and offers the rest.
                 if taken == 0 {
                     if nonblocking {
                         // POSIX: a non-blocking write that placed
@@ -4771,7 +4782,7 @@ where
                             u32::try_from(placed).map_err(|_| p1::errno::OVERFLOW)
                         };
                     }
-                    crate::yield_now().await;
+                    wait.await;
                 }
             }
         }

@@ -14,6 +14,9 @@ where
     /// — until the child channel behind this stream has room again.
     pub(super) pending: Option<Bytes>,
     pub(super) write_wait: Option<crate::ByteWriteWait>,
+    /// The debug console's transmit wait, kept armed across polls so a
+    /// serial sink parked on a busy port is woken by its release.
+    pub(super) serial_wait: Option<crate::NotifyWaiter>,
 }
 
 impl<T, CpuImpl, Net, HostFs> Unpin for SerialStreamConsumer<T, CpuImpl, Net, HostFs>
@@ -41,6 +44,7 @@ where
             result: Some(result),
             pending: None,
             write_wait: None,
+            serial_wait: None,
         }
     }
 
@@ -100,6 +104,7 @@ where
             stream,
             cx,
             &mut consumer.write_wait,
+            &mut consumer.serial_wait,
             &mut consumer.pending,
         ) {
             Poll::Pending => Poll::Pending,

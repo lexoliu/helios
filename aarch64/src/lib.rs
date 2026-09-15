@@ -199,6 +199,7 @@ pub(crate) type DeviceInterruptRoutes = helios_kernel::ExternalInterruptRoutes<
     input::VirtioInputDevice,
     snd::VirtioSoundDevice,
     block::VirtioBlockDevice,
+    core::convert::Infallible,
 >;
 
 #[used]

@@ -3500,19 +3500,20 @@ where
         resource: Resource<SbiSerialPort>,
         max_bytes: u32,
     ) -> wasmtime::Result<Vec<u8>> {
-        accessor.with(|mut access| {
+        let writer = accessor.with(|mut access| {
             let _ = access.get().table.get(&resource)?;
-            Ok::<_, wasmtime::Error>(())
+            Ok::<_, wasmtime::Error>(access.get().serial_writer())
         })?;
-        // Poll the non-blocking serial reader and yield to the kernel
-        // executor between polls so host-fs transport and other tasks keep
-        // making progress while we wait for input.
+        // Arm the console's receive wait before polling the
+        // non-blocking serial reader so a byte that lands between the
+        // two is never lost, then park on it when the port was empty.
         loop {
+            let wait = writer.wait_for_debug_serial_input();
             let bytes = accessor.with(|mut access| access.get().try_read_serial_port(max_bytes));
             if !bytes.is_empty() {
                 return Ok(bytes);
             }
-            crate::yield_now().await;
+            wait.await;
         }
     }
 
@@ -3529,12 +3530,15 @@ where
         // whole RPC frame on the wire with a single write, and the
         // console keeps a segment indivisible, which is what stops a
         // kernel console record from landing inside a frame (#103).
-        // Another processor may own the port, so this yields to the
-        // executor rather than waiting on it.
-        while !writer.try_write(&bytes) {
-            crate::yield_now().await;
+        // Another processor may own the port, so the attempt waits on
+        // the console's transmit signal rather than on the executor.
+        loop {
+            let wait = writer.wait_for_debug_serial_output_ready();
+            if writer.try_write(&bytes) {
+                return Ok(());
+            }
+            wait.await;
         }
-        Ok(())
     }
 
     async fn flush(

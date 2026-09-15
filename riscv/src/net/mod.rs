@@ -48,6 +48,7 @@ pub(crate) struct ExternalInterrupts {
         crate::input::VirtioInputDevice,
         crate::snd::VirtioSoundDevice,
         crate::block::VirtioBlockDevice,
+        core::convert::Infallible,
     >,
 }
 

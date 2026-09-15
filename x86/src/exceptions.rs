@@ -82,6 +82,7 @@ pub(crate) type DeviceInterruptRoutes = helios_kernel::ExternalInterruptRoutes<
     crate::input::VirtioInputFunction,
     crate::snd::VirtioSoundDevice,
     crate::block::VirtioBlockDevice,
+    core::convert::Infallible,
 >;
 
 global_asm!(include_str!("exceptions.S"));

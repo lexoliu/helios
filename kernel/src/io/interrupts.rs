@@ -78,6 +78,7 @@ pub struct ExternalInterruptRoutes<
     Input,
     Sound,
     Block,
+    DebugSerial,
 > {
     network: [Option<(Source, Network)>; MAX_NETWORK_INTERRUPTS],
     host_fs: Option<(Source, HostFs)>,
@@ -88,6 +89,11 @@ pub struct ExternalInterruptRoutes<
     input: [Option<(Source, Input)>; MAX_INPUT_DEVICES],
     sound: Option<(Source, Sound)>,
     block: [Option<(Source, Block)>; MAX_BLOCK_DEVICES],
+    /// The debug UART's source. Its handler raises the console's
+    /// receive and transmit signals — see
+    /// [`DebugSerialInterrupt`](super::debug_serial::DebugSerialInterrupt)
+    /// — so input and output waiters park instead of polling the port.
+    debug_serial: Option<(Source, DebugSerial)>,
     /// Sources a user-mode driver owns. Concrete rather than generic:
     /// what a granted source reaches is the kernel's own relay, which
     /// only holds the source off and wakes the owner, so no backend has
@@ -95,7 +101,7 @@ pub struct ExternalInterruptRoutes<
     device: [Option<(Source, DeviceInterruptRoute)>; MAX_DEVICE_INTERRUPTS],
 }
 
-impl<Source, Network, HostFs, Entropy, Balloon, Vsock, Display, Input, Sound, Block>
+impl<Source, Network, HostFs, Entropy, Balloon, Vsock, Display, Input, Sound, Block, DebugSerial>
     ExternalInterruptRoutes<
         Source,
         Network,
@@ -107,6 +113,7 @@ impl<Source, Network, HostFs, Entropy, Balloon, Vsock, Display, Input, Sound, Bl
         Input,
         Sound,
         Block,
+        DebugSerial,
     >
 where
     Source: PartialEq + Copy,
@@ -119,6 +126,7 @@ where
     Input: ExternalInterruptHandler,
     Sound: ExternalInterruptHandler,
     Block: ExternalInterruptHandler,
+    DebugSerial: ExternalInterruptHandler,
 {
     pub const fn new() -> Self {
         Self {
@@ -131,6 +139,7 @@ where
             input: [const { None }; MAX_INPUT_DEVICES],
             sound: None,
             block: [const { None }; MAX_BLOCK_DEVICES],
+            debug_serial: None,
             device: [const { None }; MAX_DEVICE_INTERRUPTS],
         }
     }
@@ -221,6 +230,20 @@ where
         self.sound = Some((source, handler));
     }
 
+    /// Registers the machine's debug UART.
+    ///
+    /// One slot: there is one debug serial line and one console that
+    /// owns it. The handler runs in interrupt context, reads the UART's
+    /// status through the backend's closure, and raises the console's
+    /// receive and transmit signals for the conditions it reports.
+    pub fn set_debug_serial(&mut self, source: Source, handler: DebugSerial) {
+        assert!(
+            self.debug_serial.is_none(),
+            "debug serial interrupt route was installed more than once"
+        );
+        self.debug_serial = Some((source, handler));
+    }
+
     /// Registers one more block device.
     ///
     /// Unlike the single-device slots this one takes several handlers:
@@ -269,6 +292,7 @@ where
             || dispatch(&self.balloon, source)
             || dispatch(&self.vsock, source)
             || dispatch(&self.display, source)
+            || dispatch(&self.debug_serial, source)
         {
             return true;
         }
@@ -332,7 +356,8 @@ where
     }
 }
 
-impl<Source, Network, HostFs, Entropy, Balloon, Vsock, Display, Input, Sound, Block> Default
+impl<Source, Network, HostFs, Entropy, Balloon, Vsock, Display, Input, Sound, Block, DebugSerial>
+    Default
     for ExternalInterruptRoutes<
         Source,
         Network,
@@ -344,6 +369,7 @@ impl<Source, Network, HostFs, Entropy, Balloon, Vsock, Display, Input, Sound, Bl
         Input,
         Sound,
         Block,
+        DebugSerial,
     >
 where
     Source: PartialEq + Copy,
@@ -356,6 +382,7 @@ where
     Input: ExternalInterruptHandler,
     Sound: ExternalInterruptHandler,
     Block: ExternalInterruptHandler,
+    DebugSerial: ExternalInterruptHandler,
 {
     fn default() -> Self {
         Self::new()
