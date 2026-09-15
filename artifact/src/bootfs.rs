@@ -25,6 +25,7 @@
 //! component, or the init component's `argv0`. Path and data offsets are
 //! relative to the string table and data sections respectively.
 
+use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 use core::ops::Range;
 
@@ -96,6 +97,17 @@ impl EntryKind {
             Self::File => KIND_FILE,
             Self::InitComponent => KIND_INIT_COMPONENT,
             Self::InitArgv0 => KIND_INIT_ARGV0,
+        }
+    }
+}
+
+impl core::fmt::Display for EntryKind {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Directory => f.write_str("directory"),
+            Self::File => f.write_str("file"),
+            Self::InitComponent => f.write_str("init-component"),
+            Self::InitArgv0 => f.write_str("init-argv0"),
         }
     }
 }
@@ -207,11 +219,25 @@ impl Image {
         };
         let mut init_components = 0_u32;
         let mut init_argv0s = 0_u32;
+        // One bring-up allocation bounded by the entry count: the writer
+        // sorts directories and files separately, so the paths are not
+        // globally ordered and an adjacent-entry comparison cannot catch
+        // a duplicate.
+        let mut bootfs_paths = BTreeSet::new();
         for index in 0..entry_count {
             let entry = image.entry(index)?;
             match entry.kind {
                 EntryKind::InitComponent => init_components += 1,
                 EntryKind::InitArgv0 => init_argv0s += 1,
+                // The bootfs lookup views are first-match-wins, so a
+                // second entry naming a path the table already carries
+                // makes the image ambiguous rather than shadowed.
+                EntryKind::Directory | EntryKind::File if !bootfs_paths.insert(entry.path) => {
+                    return Err(BootfsError::DuplicatePath {
+                        index,
+                        path: entry.path,
+                    });
+                }
                 EntryKind::Directory | EntryKind::File => {}
             }
         }
@@ -269,6 +295,13 @@ impl Image {
         let path =
             core::str::from_utf8(path).map_err(|_| BootfsError::EntryPathNotUtf8 { index })?;
         let data = self.slice_in(&self.data, data_offset, data_len, index, true)?;
+        if !data.is_empty() && matches!(kind, EntryKind::Directory | EntryKind::InitArgv0) {
+            return Err(BootfsError::EntryDataUnexpected {
+                index,
+                kind,
+                data_len,
+            });
+        }
         Ok(ImageEntry {
             kind,
             path,
@@ -508,6 +541,14 @@ pub enum BootfsError {
     InitComponentCount { found: u32 },
     #[error("bootfs image carries {found} init-argv0 entries, expected exactly one")]
     InitArgv0Count { found: u32 },
+    #[error("{kind} entry {index} carries {data_len} data bytes; its kind carries none")]
+    EntryDataUnexpected {
+        index: usize,
+        kind: EntryKind,
+        data_len: u64,
+    },
+    #[error("bootfs image entry {index} repeats the path {path:?}")]
+    DuplicatePath { index: usize, path: &'static str },
 }
 
 #[cfg(test)]
@@ -714,6 +755,101 @@ mod tests {
         assert!(matches!(
             Image::parse(bytes),
             Err(BootfsError::EntryKind { index: 0, kind: 9 })
+        ));
+    }
+
+    #[test]
+    fn directory_with_data_fails() {
+        let bytes = image(&[
+            WriteEntry {
+                kind: EntryKind::Directory,
+                path: "bin/empty",
+                data: b"stowaway",
+                modified_nanos: 0,
+            },
+            WriteEntry {
+                kind: EntryKind::InitComponent,
+                path: "init",
+                data: b"i",
+                modified_nanos: 0,
+            },
+            WriteEntry {
+                kind: EntryKind::InitArgv0,
+                path: "/init.wasm",
+                data: b"",
+                modified_nanos: 0,
+            },
+        ]);
+        assert!(matches!(
+            Image::parse(bytes),
+            Err(BootfsError::EntryDataUnexpected {
+                index: 0,
+                kind: EntryKind::Directory,
+                data_len: 8,
+            })
+        ));
+    }
+
+    #[test]
+    fn init_argv0_with_data_fails() {
+        let bytes = image(&[
+            WriteEntry {
+                kind: EntryKind::InitComponent,
+                path: "init",
+                data: b"i",
+                modified_nanos: 0,
+            },
+            WriteEntry {
+                kind: EntryKind::InitArgv0,
+                path: "/init.wasm",
+                data: b"stowaway",
+                modified_nanos: 0,
+            },
+        ]);
+        assert!(matches!(
+            Image::parse(bytes),
+            Err(BootfsError::EntryDataUnexpected {
+                index: 1,
+                kind: EntryKind::InitArgv0,
+                data_len: 8,
+            })
+        ));
+    }
+
+    #[test]
+    fn duplicate_paths_fail() {
+        let bytes = image(&[
+            WriteEntry {
+                kind: EntryKind::File,
+                path: "bin/tool",
+                data: b"first",
+                modified_nanos: 0,
+            },
+            WriteEntry {
+                kind: EntryKind::File,
+                path: "bin/tool",
+                data: b"second",
+                modified_nanos: 0,
+            },
+            WriteEntry {
+                kind: EntryKind::InitComponent,
+                path: "init",
+                data: b"i",
+                modified_nanos: 0,
+            },
+            WriteEntry {
+                kind: EntryKind::InitArgv0,
+                path: "/init.wasm",
+                data: b"",
+                modified_nanos: 0,
+            },
+        ]);
+        assert!(matches!(
+            Image::parse(bytes),
+            Err(BootfsError::DuplicatePath {
+                index: 1,
+                path: "bin/tool",
+            })
         ));
     }
 

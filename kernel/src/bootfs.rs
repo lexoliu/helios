@@ -10,7 +10,7 @@ use helios_hal::fs::{
 };
 use helios_hal::resource::KernelResource;
 
-/// Single immutable file embedded into the kernel image at compile time.
+/// Single immutable file view into the payload the backend hands the kernel.
 #[derive(Clone, Copy)]
 pub struct EmbeddedBootFile {
     path: &'static str,
@@ -18,7 +18,8 @@ pub struct EmbeddedBootFile {
     modified_nanos: u64,
 }
 
-/// Single immutable directory embedded into the kernel image at compile time.
+/// Single immutable directory view into the payload the backend hands the
+/// kernel.
 #[derive(Clone, Copy)]
 pub struct EmbeddedBootDirectory {
     path: &'static str,
@@ -591,16 +592,16 @@ mod tests {
         let root = payload_image().root_directory(DirectoryRights::READ);
         let bin = root
             .open_directory("bin", DirectoryRights::READ)
-            .expect("macro-packed bin directory must exist");
+            .expect("payload bin directory must exist");
         let init = bin
             .open_file("init.txt", FileRights::READ)
-            .expect("macro-packed init.txt must exist");
+            .expect("payload init.txt must exist");
         let lib = root
             .open_directory("lib", DirectoryRights::READ)
-            .expect("macro-packed lib directory must exist");
+            .expect("payload lib directory must exist");
         let module = lib
             .open_file("module.txt", FileRights::READ)
-            .expect("macro-packed module.txt must exist");
+            .expect("payload module.txt must exist");
 
         assert_eq!(init.object().contents(), b"boot init\n");
         assert_eq!(module.object().contents(), b"boot module\n");

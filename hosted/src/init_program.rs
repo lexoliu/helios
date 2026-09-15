@@ -3,25 +3,16 @@ mod tests {
     use std::path::PathBuf;
 
     /// The payload `kernel-prebuild` wrote for this host, named in the
-    /// manifest the Justfile exports for the test.
+    /// `HELIOS_BOOTFS` path the Justfile exports for the test.
     fn test_payload() -> helios_kernel::BootPayload {
-        let manifest_path = PathBuf::from(
-            std::env::var_os("HELIOS_KERNEL_PREBUILD_MANIFEST")
-                .expect("HELIOS_KERNEL_PREBUILD_MANIFEST must name the kernel-prebuild manifest"),
+        let bootfs = PathBuf::from(
+            std::env::var_os("HELIOS_BOOTFS")
+                .expect("HELIOS_BOOTFS must name the kernel-prebuild payload"),
         );
-        let manifest = std::fs::read(&manifest_path)
-            .unwrap_or_else(|error| panic!("failed to read {}: {error}", manifest_path.display()));
-        let manifest: serde_json::Value =
-            serde_json::from_slice(&manifest).unwrap_or_else(|error| {
-                panic!("failed to decode {}: {error}", manifest_path.display())
-            });
-        let bootfs = manifest["bootfs"]
-            .as_str()
-            .expect("kernel-prebuild manifest must carry a bootfs path");
-        let bytes = std::fs::read(bootfs)
-            .unwrap_or_else(|error| panic!("failed to read {bootfs}: {error}"));
+        let bytes = std::fs::read(&bootfs)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", bootfs.display()));
         helios_kernel::BootPayload::parse(Box::leak(bytes.into_boxed_slice()))
-            .unwrap_or_else(|error| panic!("{bootfs} is not a valid payload: {error}"))
+            .unwrap_or_else(|error| panic!("{} is not a valid payload: {error}", bootfs.display()))
     }
 
     #[test]

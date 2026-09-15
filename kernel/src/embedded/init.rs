@@ -110,8 +110,9 @@ impl BootPayload {
     /// `BootModule::address` must already be a readable pointer — under
     /// Limine it is an HHDM address, so the payload needs no mapping of
     /// its own. Panics naming every module the bootloader did load when
-    /// none is the payload: a kernel booted without one has no init to
-    /// run and nothing honest to continue with.
+    /// none is the payload, and naming both when two claim the payload
+    /// name: a kernel booted without one has no init to run and nothing
+    /// honest to continue with.
     pub fn from_boot_modules<'a>(modules: &impl BootModules<'a>) -> Self {
         let mut found = None;
         let mut names = String::new();
@@ -127,6 +128,13 @@ impl BootPayload {
                 .next()
                 .is_some_and(|name| name == BOOTFS_MODULE_NAME);
             if is_bootfs {
+                if let Some(first) = found {
+                    panic!(
+                        "two helios-bootfs modules among boot modules: {} and {}",
+                        String::from_utf8_lossy(first.path).as_ref(),
+                        String::from_utf8_lossy(module.path).as_ref(),
+                    );
+                }
                 found = Some(module);
             }
         }

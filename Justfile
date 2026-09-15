@@ -216,7 +216,7 @@ test-embedded-debugger:
         --cargo cargo
     export HELIOS_KERNEL_ROOT_PUBLIC_KEY="${out_dir}/helios-root-public.key"
     export HELIOS_KERNEL_ROOT_SECRET_KEY="${out_dir}/helios-root-secret.key"
-    export HELIOS_KERNEL_PREBUILD_MANIFEST="${out_dir}/kernel-prebuild.json"
+    export HELIOS_BOOTFS="${out_dir}/helios-bootfs"
     cargo nextest run -p helios-hosted --no-capture init_program::tests::embedded_debugger_
 
 # Unit tests and lint of the benchmark-suite tooling (tools/bench); no benchmark runs.

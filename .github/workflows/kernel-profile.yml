@@ -51,7 +51,6 @@ on:
       - "compiler-abi/**"
       - "artifact/**"
       - "kernel/**"
-      - "kernel-macro/**"
       - "x86/**"
       - "api/**"
       - "api-macro/**"
