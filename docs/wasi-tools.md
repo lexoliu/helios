@@ -21,34 +21,40 @@ This script:
    `wasi_snapshot_preview1.command.wasm` adapter.
 2. Wraps the preview1 core module into a WASI P2 component via
    `wasm-tools component new --adapt …`.
-3. Installs `python3.wasm` and `lib/python3.14/` (the CPython stdlib)
-   under `artifacts/python3-root/`.
-4. Downloads and extracts the pinned official Wasmer WEBc images for
+3. Compiles the stdlib to bytecode with the interpreter it just staged
+   (`python.wasm -m compileall --invalidation-mode unchecked-hash`,
+   run under the wasmtime CLI of the same pinned release), so every
+   module carries a `__pycache__` entry that a read-only bootfs can
+   load without validating a source mtime.
+4. Installs `python3.wasm` and `lib/python3.14/` (the CPython stdlib
+   with its bytecode) under `artifacts/python3-root/`.
+5. Downloads and extracts the pinned official Wasmer WEBc images for
    `sharrattj/dash` `1.0.19`, `wasmer/bash` `1.0.25`, and
    `wasmer/coreutils` `1.0.19`; validates their raw wasm atoms with
    `wasm-tools`.
-5. Builds `quickjs-ng/quickjs` `v0.14.0` from source with Zig's
+6. Builds `quickjs-ng/quickjs` `v0.14.0` from source with Zig's
    `wasm32-wasi` C toolchain, `-O3`, and `-msimd128`; the script fails if
    the resulting `qjs.wasm` has no wasm SIMD instructions.
-6. Builds the helios `curl-wasi` program from source with the optimized
+7. Builds the helios `curl-wasi` program from source with the optimized
    release profile into `artifacts/wasi-tools/`, along with
    `wasi-curl.wasm`, the plain-WASI HTTP/1.1 client the curl workloads'
    Linux + Wasmtime cells run under `wasmtime run -S inherit-network`
    (the Helios `curl.wasm` imports `helios:system/programs`, which
    upstream Wasmtime cannot instantiate).
-7. Derives `artifacts/wasix/coreutils/coreutils-wasi.wasm` from the
+8. Derives `artifacts/wasix/coreutils/coreutils-wasi.wasm` from the
    coreutils atom with `tools/wasi-apps/stub-wasix-imports.py`, which
    defines the imported shared `env.memory` locally and replaces every
    `wasix_32v1` import with a stub so upstream Wasmtime loads the same
    module; it is what the `stdio-pipe` and `fs-*` workloads' Linux +
    Wasmtime cells run under `wasmtime run --dir`.
-8. Builds the Helios WASIX conformance WAT modules for thread/futex and
+9. Builds the Helios WASIX conformance WAT modules for thread/futex and
    stack continuation execution into `artifacts/wasix/`.
 
 Artifacts produced:
 
 - `artifacts/python3-root/python3.wasm` — real CPython 3.14 component.
-- `artifacts/python3-root/lib/python3.14/` — CPython standard library.
+- `artifacts/python3-root/lib/python3.14/` — CPython standard library,
+  with unchecked-hash bytecode under every `__pycache__/`.
 - `artifacts/wasix/dash/dash.wasm` — standard WASIX dash raw module.
 - `artifacts/wasix/bash/bash.wasm` — standard Wasmer WASIX Bash raw module.
 - `artifacts/wasix/quickjs/qjs.wasm` — QuickJS-NG WASI raw module built
@@ -75,7 +81,9 @@ Artifacts produced:
 The CPython download requires network. To re-stage in an offline
 environment, place a pre-downloaded
 `python-${VERSION}-wasi_sdk-24.zip` somewhere and pass its path via
-`CPYTHON_WASI_ZIP=/path/to/zip tools/wasi-apps/build.sh`.
+`CPYTHON_WASI_ZIP=/path/to/zip tools/wasi-apps/build.sh`. The bytecode
+step downloads the pinned wasmtime CLI the same way; pass a local binary
+via `WASMTIME_BIN=/path/to/wasmtime` to skip that download.
 
 The shell and coreutils artifacts must be official Wasmer package payloads.
 QuickJS is built locally from the matching QuickJS-NG source archive so the
@@ -383,7 +391,10 @@ Expected output contains:
 - `artifacts/python3-root/python3.wasm` is the real CPython interpreter
   converted from WASI preview1 to the preview2 component we run. In bootfs
   the stdlib is mounted under `usr/local/lib/python3.14/`, matching the
-  upstream CPython build prefix.
+  upstream CPython build prefix. The tree is read-only in the guest, so
+  the bytecode `build.sh` compiles is the only bytecode CPython will
+  ever have there: without it every run recompiles its import closure
+  from source (#374).
 - `tools/wasi-apps/curl` uses `helios_api::http` (`wasi:http/client`)
   instead of host libc sockets, so it runs correctly inside helios. The
   kernel forwards each request to the `http-client` kernel plugin
