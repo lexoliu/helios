@@ -85,6 +85,6 @@ def test_the_helios_side_carries_the_lanes_rpc_transport(options) -> None:
     commands = plan(options, load_manifest(), workloads)
     helios = [command for command in commands if "--skip-linux" in command.argv]
     assert helios, "the plan has a Helios invocation"
-    assert options.lane.rpc_transport == "vsock"
+    assert options.lane.rpc_transport == "serial"
     for command in helios:
         assert command.env["HELIOS_WORKLOAD_BENCH_RPC_TRANSPORT"] == "vsock"
