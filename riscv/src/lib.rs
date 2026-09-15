@@ -32,7 +32,7 @@ mod debug_state {
     >;
 }
 
-use ns16550a::Uart;
+use ns16550a::{Break, DLAB, ParityBit, ParitySelect, StickParity, StopBits, Uart, WordLength};
 
 /// 16550 interrupt-enable register; this port arms only the
 /// received-data condition.
@@ -842,6 +842,17 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
             interrupts
         })
     });
+    // The debug console's readers park on the UART's interrupt, so a
+    // machine that describes the UART but gives this hart no PLIC
+    // context to route it through would hang every serial read; refuse
+    // it here rather than at the first parked reader.
+    assert!(
+        current_hart != bootstrap_processor
+            || external_interrupts.is_some()
+            || DEBUG_TRANSPORT.get().is_none(),
+        "the device tree describes a debug UART but no PLIC supervisor-external context for \
+         hart {hart_id}; the serial line could only be polled"
+    );
     let mut hart_runtime = HartRuntime {
         hart_id: current_hart,
         timer: kernel.timer(),
@@ -1101,7 +1112,25 @@ static DEBUG_CONSOLE: helios_kernel::DebugConsole = helios_kernel::DebugConsole:
 /// device tree, so the value is installed once and read afterwards.
 fn publish_debug_transport(discovered: Option<DebugTransport>) -> bool {
     if let Some(transport) = discovered {
-        DEBUG_TRANSPORT.call_once(|| transport);
+        DEBUG_TRANSPORT.call_once(|| {
+            // The interrupt-enable register shares its offset with the
+            // high divisor latch, so the line-control register is set
+            // here — eight data bits, one stop bit, no parity, latch
+            // closed — rather than inherited from whatever the firmware
+            // left: an IER write behind an open latch would corrupt the
+            // divisor and never arm the line. Firmware already picked
+            // the divisor; it is not touched.
+            Uart::new(transport.uart_base).set_lcr(
+                WordLength::EIGHT,
+                StopBits::ONE,
+                ParityBit::DISABLE,
+                ParitySelect::EVEN,
+                StickParity::DISABLE,
+                Break::DISABLE,
+                DLAB::CLEAR,
+            );
+            transport
+        });
     }
     DEBUG_TRANSPORT.get().is_some()
 }

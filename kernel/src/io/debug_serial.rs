@@ -265,9 +265,12 @@ impl DebugSerialWriter {
     /// otherwise.
     ///
     /// Arming re-enables the UART's receive interrupt, which the
-    /// handler masked when it last fired: the enable comes first, then
-    /// the signal is sampled, so an interrupt raised by a byte already
-    /// waiting lands before the sample and completes the wait at once.
+    /// handler masked when it last fired. A byte already waiting raises
+    /// the line at once; whether its interrupt lands before or after the
+    /// signal is sampled does not matter, because the FIFO test that
+    /// follows the arm finds the byte either way — the handler never
+    /// consumes bytes, it only signals. A byte that lands after the test
+    /// is the case the sampled signal covers.
     pub fn wait_for_debug_serial_input(&self) -> Notified<'static> {
         (self.enable_receive_interrupt)();
         (self.receive_signal)().notified()
@@ -684,12 +687,15 @@ mod tests {
 
     use alloc::vec;
     use alloc::vec::Vec;
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use core::task::Context;
     use std::sync::{Arc, Mutex};
     use std::thread;
 
     use helios_hal::serial::ByteSerial;
 
     use super::{DebugConsole, MAX_STREAM_SEGMENT_BYTES, stream_segment};
+    use crate::ExternalInterruptHandler;
 
     /// The RPC frame header the inspector scans for, byte for byte as
     /// `helios-inspector-protocol` writes it. The point of the test is
@@ -873,13 +879,21 @@ mod tests {
     /// way the interrupt handler's status read would find it.
     struct WaitPort {
         fifo: Mutex<alloc::collections::VecDeque<u8>>,
+        /// The receive-interrupt mask bit, as the handler and the
+        /// waiters toggle it.
+        receive_interrupt_enabled: AtomicBool,
     }
 
     impl WaitPort {
         const fn new() -> Self {
             Self {
                 fifo: Mutex::new(alloc::collections::VecDeque::new()),
+                receive_interrupt_enabled: AtomicBool::new(false),
             }
+        }
+
+        fn receive_interrupt_enabled(&self) -> bool {
+            self.receive_interrupt_enabled.load(Ordering::Acquire)
         }
 
         /// A byte the UART received: pushed by the test where the
@@ -902,9 +916,15 @@ mod tests {
 
         fn write_bytes(&self, _bytes: &[u8]) {}
 
-        fn enable_receive_interrupt(&self) {}
+        fn enable_receive_interrupt(&self) {
+            self.receive_interrupt_enabled
+                .store(true, Ordering::Release);
+        }
 
-        fn disable_receive_interrupt(&self) {}
+        fn disable_receive_interrupt(&self) {
+            self.receive_interrupt_enabled
+                .store(false, Ordering::Release);
+        }
     }
 
     /// The read loop every serial-input caller runs: arm the wait, try
@@ -1001,5 +1021,66 @@ mod tests {
         WAIT_PORT_B.push(b'y');
         WAIT_CONSOLE_B.receive_signal().notify_all();
         assert_eq!(futures_lite::future::block_on(read), b"y");
+    }
+
+    struct WaitAccessC;
+    static WAIT_CONSOLE_C: DebugConsole = DebugConsole::new();
+    static WAIT_PORT_C: WaitPort = WaitPort::new();
+
+    impl super::DebugSerialAccess for WaitAccessC {
+        type Port = &'static WaitPort;
+
+        fn port() -> &'static WaitPort {
+            &WAIT_PORT_C
+        }
+
+        fn console() -> &'static DebugConsole {
+            &WAIT_CONSOLE_C
+        }
+    }
+
+    /// The handler masks the port's receive interrupt before it signals,
+    /// and every way of arming a wait — the future, the reusable waiter,
+    /// a parking poll — re-enables it, so a level-triggered line is quiet
+    /// between the interrupt and the drain and live again before the
+    /// reader parks.
+    #[test]
+    fn the_handler_masks_the_receive_line_and_arming_re_enables_it() {
+        let writer = super::DebugSerialWriter::of::<WaitAccessC>();
+        let handler = WAIT_CONSOLE_C.interrupt_handler::<WaitAccessC>();
+
+        let wait = writer.wait_for_debug_serial_input();
+        assert!(WAIT_PORT_C.receive_interrupt_enabled());
+
+        handler.handle_interrupt();
+        assert!(!WAIT_PORT_C.receive_interrupt_enabled());
+        // The signal the handler raised completes the wait that was
+        // armed before it fired.
+        futures_lite::future::block_on(wait);
+
+        let mut waiter = writer.debug_serial_input_waiter();
+        assert!(WAIT_PORT_C.receive_interrupt_enabled());
+
+        handler.handle_interrupt();
+        assert!(!WAIT_PORT_C.receive_interrupt_enabled());
+        // The waiter observes that broadcast, and the poll that parks
+        // afterwards re-arms the line.
+        let waker = futures_lite::future::block_on(async {
+            core::future::poll_fn(|cx| core::task::Poll::Ready(cx.waker().clone())).await
+        });
+        let mut cx = Context::from_waker(&waker);
+        assert!(
+            writer
+                .poll_debug_serial_input(&mut cx, &mut waiter)
+                .is_ready()
+        );
+        assert!(WAIT_PORT_C.receive_interrupt_enabled());
+        (&WAIT_PORT_C).disable_receive_interrupt();
+        assert!(
+            writer
+                .poll_debug_serial_input(&mut cx, &mut waiter)
+                .is_pending()
+        );
+        assert!(WAIT_PORT_C.receive_interrupt_enabled());
     }
 }

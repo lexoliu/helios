@@ -15,9 +15,9 @@ pub trait ByteSerial: Send + Sync {
 
     /// Lets the device raise its receive interrupt again.
     ///
-    /// A consumer calls this after it has drained the receive path and
-    /// found it empty, right before it parks: a byte that is already
-    /// waiting, or that lands afterwards, raises the line. Idempotent.
+    /// A consumer calls this as it arms its wait, before the drain that
+    /// decides whether to park: a byte that is already waiting, or that
+    /// lands afterwards, raises the line. Idempotent.
     fn enable_receive_interrupt(&self);
 
     /// Stops the device raising its receive interrupt.

@@ -203,7 +203,7 @@ pub(super) struct P1WaitSet {
     /// eventfds, child stdin).
     pub(super) notified: Vec<EpollWaitTarget>,
     /// Set when at least one descriptor only reveals readiness by being
-    /// re-probed (network sockets, the serial console).
+    /// re-probed (network sockets).
     pub(super) repoll: bool,
 }
 
