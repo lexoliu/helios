@@ -998,6 +998,7 @@ fn detect_x86_native_feature(feature: &str) -> Option<bool> {
         "sse4.2" => Some(leaf1.ecx & (1 << 20) != 0),
         "popcnt" => Some(leaf1.ecx & (1 << 23) != 0),
         "avx" => Some(avx_os_enabled),
+        "avx2" => Some(leaf7.is_some_and(|leaf| leaf.ebx & (1 << 5) != 0) && avx_os_enabled),
         "fma" => Some(leaf1.ecx & (1 << 12) != 0 && avx_os_enabled),
         "bmi1" => Some(leaf7.is_some_and(|leaf| leaf.ebx & (1 << 3) != 0)),
         "bmi2" => Some(leaf7.is_some_and(|leaf| leaf.ebx & (1 << 8) != 0)),
