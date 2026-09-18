@@ -182,6 +182,20 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
         self.cpu.now()
     }
 
+    /// The platform `Cpu` this timer reads the time from.
+    pub(crate) fn cpu(&self) -> &CpuImpl {
+        &self.cpu
+    }
+
+    /// Whether a sleep deadline is already due as of `now` — the idle
+    /// loop's reason to stop polling without parking.
+    pub(crate) fn is_due(&self, now: Instant) -> bool {
+        self.shared
+            .next_sleep_deadline
+            .load(AtomicOrdering::Acquire)
+            <= now.ticks()
+    }
+
     pub fn sleep_until(&self, deadline: Instant) -> Sleep<CpuImpl> {
         if deadline <= self.now() {
             return Sleep {

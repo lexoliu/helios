@@ -766,7 +766,10 @@ where
             continue;
         }
 
-        cpu.park_current();
+        let outcome = kernel.park_until_work();
+        if debug_state.profiling_enabled() {
+            record_executor_idle_metrics(&debug_state, outcome);
+        }
     }
 }
 
@@ -823,6 +826,45 @@ fn record_executor_metrics<CpuImpl, Net, HostFs>(
     );
     record_executor_event_metric(debug_state, "timer-fired", stats.timer_fired_count);
     debug_state.record_kernel_heap_metrics(crate::heap_stats());
+}
+
+/// What one idle park cost: the poll phase under
+/// `kernel;executor;idle-poll`, the parked span under
+/// `kernel;executor;idle-parked`, and a hit/miss event so a profile
+/// can weigh IPI-and-halt-exit wakes against polled ones.
+fn record_executor_idle_metrics<CpuImpl, Net, HostFs>(
+    debug_state: &HostRuntimeState<CpuImpl, Net, HostFs>,
+    outcome: crate::IdleOutcome,
+) where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    HostFs: crate::HostFileSystem,
+{
+    let (polled_ticks, parked_ticks) = match outcome {
+        crate::IdleOutcome::Polled { polled_ticks } => {
+            record_executor_event_metric(debug_state, "idle-poll-hit", 1);
+            (polled_ticks, None)
+        }
+        crate::IdleOutcome::Parked {
+            polled_ticks,
+            parked_ticks,
+        } => {
+            record_executor_event_metric(debug_state, "idle-poll-miss", 1);
+            (polled_ticks, Some(parked_ticks))
+        }
+    };
+    debug_state.record_profile_stack_str(
+        ProfileScope::Kernel,
+        "kernel;executor;idle-poll",
+        polled_ticks,
+    );
+    if let Some(parked_ticks) = parked_ticks {
+        debug_state.record_profile_stack_str(
+            ProfileScope::Kernel,
+            "kernel;executor;idle-parked",
+            parked_ticks,
+        );
+    }
 }
 
 fn record_executor_event_metric<CpuImpl, Net, HostFs>(

@@ -94,17 +94,17 @@ pub use embedded::{BootPayload, EmbeddedComponent, EmbeddedInit};
 pub use exec::{
     CompactionBudget, CompactionPolicy, CompactionReport, CompactionTarget, Compactor,
     DEFAULT_PERF_METRIC_CAPACITY, DEFAULT_PROFILE_STACK_CAPACITY, DEFAULT_TRACE_HISTORY_CAPACITY,
-    Executor, ExecutorRunStats, FoldedProfileSample, InstanceSpawner, JoinHandle, KernelClock,
-    LocalJoinHandle, Mutex, MutexGuard, Notified, Notify, NotifyWaiter, OwnedRawMutexLease,
-    OwnedRawRwLockReadLease, OwnedRawRwLockWriteLease, PerfMetricFilter, PerfMetricHistory,
-    PerfMetricSample, PerfSample, PressureLevel, ProfileFilter, ProfileHistory, ProfileScope,
-    ProfileSink, ProgressChanged, ProgressMark, ProgressSignal, RawMutex, RawMutexLease, RawRwLock,
-    RawRwLockReadLease, RawRwLockWriteLease, RwLock, RwLockReadGuard, RwLockWriteGuard, Sleep,
-    Spawner, StatsSample, TaskCapacityError, TaskFunding, Timer, TraceEvent, TraceField,
-    TraceFilter, TraceHistory, TraceLevel, TraceValue, UptimeClock, YieldNow, duration_to_ticks,
-    elapsed_millis, matches_perf_metric_filter, matches_profile_filter, matches_trace_filter,
-    monotonic_nanos, nanos_to_ticks_ceil_saturating, parse_console_text, wall_clock_offset_nanos,
-    yield_now,
+    Executor, ExecutorRunStats, FoldedProfileSample, IdleOutcome, InstanceSpawner, JoinHandle,
+    KernelClock, LocalJoinHandle, Mutex, MutexGuard, Notified, Notify, NotifyWaiter,
+    OwnedRawMutexLease, OwnedRawRwLockReadLease, OwnedRawRwLockWriteLease, PerfMetricFilter,
+    PerfMetricHistory, PerfMetricSample, PerfSample, PressureLevel, ProfileFilter, ProfileHistory,
+    ProfileScope, ProfileSink, ProgressChanged, ProgressMark, ProgressSignal, RawMutex,
+    RawMutexLease, RawRwLock, RawRwLockReadLease, RawRwLockWriteLease, RwLock, RwLockReadGuard,
+    RwLockWriteGuard, Sleep, Spawner, StatsSample, TaskCapacityError, TaskFunding, Timer,
+    TraceEvent, TraceField, TraceFilter, TraceHistory, TraceLevel, TraceValue, UptimeClock,
+    YieldNow, duration_to_ticks, elapsed_millis, matches_perf_metric_filter,
+    matches_profile_filter, matches_trace_filter, monotonic_nanos, nanos_to_ticks_ceil_saturating,
+    parse_console_text, wall_clock_offset_nanos, yield_now,
 };
 pub use gpu::{
     ContextRecord, Gpu3dClaim, Gpu3dOwnership, Gpu3dSender, Gpu3dService, Gpu3dServiceError,
@@ -917,10 +917,18 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone> Kernel<CpuImpl, Watch
         }
     }
 
+    /// Parks this processor until a task or a timer deadline is ready,
+    /// spending the adaptive idle-poll window on the ready queues
+    /// first. The outcome says whether the wake arrived during the
+    /// poll or after the park, for the host-side profile.
+    pub fn park_until_work(&self) -> IdleOutcome {
+        self.executor.park_until_work(&self.timer, || false)
+    }
+
     pub fn run(&self) -> ! {
         loop {
             if self.run_until_stalled() == 0 {
-                self.cpu.park_current();
+                self.park_until_work();
             }
         }
     }
@@ -941,7 +949,14 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone> Kernel<CpuImpl, Watch
                 Poll::Ready(output) => return output,
                 Poll::Pending => {
                     if self.run_until_stalled() == 0 {
-                        parker.park();
+                        // The same idle policy as every other processor:
+                        // this loop is the bootstrap processor's run loop
+                        // for as long as the root future runs, and a
+                        // processor that halts without publishing
+                        // `Parked` is one whose cross-processor wakes
+                        // arrive on the next scheduler tick.
+                        self.executor
+                            .park_until_work(&self.timer, || parker.is_notified());
                     }
                 }
             }
@@ -1051,17 +1066,19 @@ impl<CpuImpl: Cpu + Clone> LocalFutureParker<CpuImpl> {
         self.notified.store(false, Ordering::Release);
     }
 
-    fn park(&self) {
-        if self.notified.swap(false, Ordering::AcqRel) {
-            return;
-        }
-        self.cpu.park_current();
+    /// Whether the root future was woken since the last `clear`.
+    /// `SeqCst`: the parker half of the idle handshake, read after the
+    /// executor has published `Parked`.
+    fn is_notified(&self) -> bool {
+        self.notified.load(Ordering::SeqCst)
     }
 }
 
 impl<CpuImpl: Cpu + Clone> Wake for LocalFutureParker<CpuImpl> {
     fn wake(self: Arc<Self>) {
-        self.notified.store(true, Ordering::Release);
+        // `SeqCst`: the publisher half of the idle handshake; the owner
+        // publishes `Parked` and then reads this flag.
+        self.notified.store(true, Ordering::SeqCst);
         if current_processor() != self.owner_processor {
             self.cpu.wake_processor(self.owner_processor);
         }
