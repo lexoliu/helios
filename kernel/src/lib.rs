@@ -94,17 +94,17 @@ pub use embedded::{BootPayload, EmbeddedComponent, EmbeddedInit};
 pub use exec::{
     CompactionBudget, CompactionPolicy, CompactionReport, CompactionTarget, Compactor,
     DEFAULT_PERF_METRIC_CAPACITY, DEFAULT_PROFILE_STACK_CAPACITY, DEFAULT_TRACE_HISTORY_CAPACITY,
-    Executor, ExecutorRunStats, FoldedProfileSample, InstanceSpawner, JoinHandle, KernelClock,
-    LocalJoinHandle, Mutex, MutexGuard, Notified, Notify, NotifyWaiter, OwnedRawMutexLease,
-    OwnedRawRwLockReadLease, OwnedRawRwLockWriteLease, PerfMetricFilter, PerfMetricHistory,
-    PerfMetricSample, PerfSample, PressureLevel, ProfileFilter, ProfileHistory, ProfileScope,
-    ProfileSink, ProgressChanged, ProgressMark, ProgressSignal, RawMutex, RawMutexLease, RawRwLock,
-    RawRwLockReadLease, RawRwLockWriteLease, RwLock, RwLockReadGuard, RwLockWriteGuard, Sleep,
-    Spawner, StatsSample, TaskCapacityError, TaskFunding, Timer, TraceEvent, TraceField,
-    TraceFilter, TraceHistory, TraceLevel, TraceValue, UptimeClock, YieldNow, duration_to_ticks,
-    elapsed_millis, matches_perf_metric_filter, matches_profile_filter, matches_trace_filter,
-    monotonic_nanos, nanos_to_ticks_ceil_saturating, parse_console_text, wall_clock_offset_nanos,
-    yield_now,
+    Executor, ExecutorRunStats, FoldedProfileSample, IdleOutcome, InstanceSpawner, JoinHandle,
+    KernelClock, LocalJoinHandle, Mutex, MutexGuard, Notified, Notify, NotifyWaiter,
+    OwnedRawMutexLease, OwnedRawRwLockReadLease, OwnedRawRwLockWriteLease, PerfMetricFilter,
+    PerfMetricHistory, PerfMetricSample, PerfSample, PressureLevel, ProfileFilter, ProfileHistory,
+    ProfileScope, ProfileSink, ProgressChanged, ProgressMark, ProgressSignal, RawMutex,
+    RawMutexLease, RawRwLock, RawRwLockReadLease, RawRwLockWriteLease, RwLock, RwLockReadGuard,
+    RwLockWriteGuard, Sleep, Spawner, StatsSample, TaskCapacityError, TaskFunding, Timer,
+    TraceEvent, TraceField, TraceFilter, TraceHistory, TraceLevel, TraceValue, UptimeClock,
+    YieldNow, duration_to_ticks, elapsed_millis, matches_perf_metric_filter,
+    matches_profile_filter, matches_trace_filter, monotonic_nanos, nanos_to_ticks_ceil_saturating,
+    parse_console_text, wall_clock_offset_nanos, yield_now,
 };
 pub use gpu::{
     ContextRecord, Gpu3dClaim, Gpu3dOwnership, Gpu3dSender, Gpu3dService, Gpu3dServiceError,
@@ -917,10 +917,18 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone> Kernel<CpuImpl, Watch
         }
     }
 
+    /// Parks this processor until a task or a timer deadline is ready,
+    /// spending the adaptive idle-poll window on the ready queues
+    /// first. The outcome says whether the wake arrived during the
+    /// poll or after the park, for the host-side profile.
+    pub fn park_until_work(&self) -> IdleOutcome {
+        self.executor.park_until_work(&self.timer)
+    }
+
     pub fn run(&self) -> ! {
         loop {
             if self.run_until_stalled() == 0 {
-                self.cpu.park_current();
+                self.park_until_work();
             }
         }
     }
