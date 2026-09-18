@@ -859,22 +859,19 @@ pub(crate) fn shootdown_tlb_range(start: usize, byte_len: usize) {
     }
 }
 
-/// Pages past which one whole-TLB flush is cheaper than one `INVLPG`
-/// per page. The number is Linux's `tlb_single_page_flush_ceiling`. A
-/// `CR3` reload drops every non-global translation this processor
-/// holds, and what that costs is the refill of the ones that were
-/// live, a bounded price a range this size mostly covers anyway; an
-/// `INVLPG` per page of a linear memory being torn down is thousands
-/// of instructions on every processor for every teardown.
-const TLB_SINGLE_PAGE_FLUSH_CEILING: usize = 33;
-
-/// Invalidates `byte_len` bytes from `start` on this processor: per
-/// page below the ceiling, the whole TLB above it.
+/// Invalidates `byte_len` bytes from `start` on this processor, one
+/// `INVLPG` per page.
+///
+/// Always per page, never a `CR3` reload: an unmap is one task's
+/// memory going away while the other processors run other tasks, and a
+/// whole-TLB flush on them evicts those tasks' translations too. Under
+/// nested paging a refill is a two-dimensional walk, and the paired
+/// lane priced it — a reload past a 33-page ceiling (Linux's
+/// `tlb_single_page_flush_ceiling`, tuned for native refills on the
+/// same address space) cost `fs-smallfiles` its stability and
+/// `stdio-pipe` 17 % on run 35384279049, while the per-page loop keeps
+/// the cost inside the range being torn down.
 pub(crate) fn flush_tlb_range_local(start: usize, byte_len: usize) {
-    if byte_len / PAGE_BYTES > TLB_SINGLE_PAGE_FLUSH_CEILING {
-        tlb::flush_all();
-        return;
-    }
     for offset in (0..byte_len).step_by(PAGE_BYTES) {
         tlb::flush(VirtAddr::new((start + offset) as u64));
     }
