@@ -859,12 +859,28 @@ pub(crate) fn shootdown_tlb_range(start: usize, byte_len: usize) {
     }
 }
 
-pub(crate) fn handle_tlb_shootdown_interrupt() {
-    let start = TLB_SHOOTDOWN_START.load(Ordering::Acquire);
-    let byte_len = TLB_SHOOTDOWN_LEN.load(Ordering::Acquire);
+/// Invalidates `byte_len` bytes from `start` on this processor, one
+/// `INVLPG` per page.
+///
+/// Always per page, never a `CR3` reload: an unmap is one task's
+/// memory going away while the other processors run other tasks, and a
+/// whole-TLB flush on them evicts those tasks' translations too. Under
+/// nested paging a refill is a two-dimensional walk, and the paired
+/// lane priced it — a reload past a 33-page ceiling (Linux's
+/// `tlb_single_page_flush_ceiling`, tuned for native refills on the
+/// same address space) cost `fs-smallfiles` its stability and
+/// `stdio-pipe` 17 % on run 35384279049, while the per-page loop keeps
+/// the cost inside the range being torn down.
+pub(crate) fn flush_tlb_range_local(start: usize, byte_len: usize) {
     for offset in (0..byte_len).step_by(PAGE_BYTES) {
         tlb::flush(VirtAddr::new((start + offset) as u64));
     }
+}
+
+pub(crate) fn handle_tlb_shootdown_interrupt() {
+    let start = TLB_SHOOTDOWN_START.load(Ordering::Acquire);
+    let byte_len = TLB_SHOOTDOWN_LEN.load(Ordering::Acquire);
+    flush_tlb_range_local(start, byte_len);
     let bit = processor_bit(usize::from(current_processor().id()));
     TLB_SHOOTDOWN_ACK_MASK.fetch_or(bit, Ordering::AcqRel);
     local_apic_eoi();
