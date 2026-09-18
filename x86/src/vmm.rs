@@ -1030,6 +1030,13 @@ impl AddressSpace for X86UserAddressSpace {
     }
 }
 
+/// Restores the flags a failed `protect_pages` had already changed.
+///
+/// The pages briefly carried the new flags, and another processor may
+/// have translated one in that window, so the restored range is shot
+/// down the way the success path is: a stale narrower translation is
+/// a spurious fault on a page the tracker says is committed, and a
+/// stale wider one is a permission the caller withdrew.
 fn rollback_partial_protect(
     mapper: &mut OffsetPageTable<'static>,
     old_flags: &[(Page<Size4KiB>, PageTableFlags)],
@@ -1043,6 +1050,11 @@ fn rollback_partial_protect(
                 })
                 .flush();
         }
+    }
+    if let (Some((first, _)), Some((last, _))) = (old_flags.first(), old_flags.last()) {
+        let start = first.start_address().as_u64() as usize;
+        let end = last.start_address().as_u64() as usize + PAGE;
+        smp::shootdown_tlb_range(start, end - start);
     }
 }
 
