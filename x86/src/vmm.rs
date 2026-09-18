@@ -714,8 +714,8 @@ impl X86UserAddressSpace {
         }
         for subrange in plan.commit {
             state.precheck_commit(subrange)?;
+            // No shootdown: see `commit`.
             self.map_pages(&mut mapper, &mut frame_allocator, subrange, pt_flags)?;
-            self.shootdown_range(subrange);
             // This backend has no swap, so committing over the range can
             // never orphan a swap extent; the assertion keeps that true if
             // swap reaches this architecture (#25).
@@ -761,6 +761,16 @@ impl AddressSpace for X86UserAddressSpace {
         Ok(())
     }
 
+    /// Maps fresh frames under `virt`.
+    ///
+    /// No shootdown goes out: every page here was not present a moment
+    /// ago, x86-64 caches no not-present translation, and every path
+    /// that unmaps a page broadcasts before its frame is freed, so no
+    /// processor can hold a translation for any of these pages. The
+    /// local `INVLPG` `map_pages` issues is the whole of the TLB work,
+    /// the same as `commit_demand_page` and the aarch64 and riscv
+    /// backends. A broadcast here was one IPI round per `memory.grow`,
+    /// and the compute rows that grow paid it on every step (#419).
     fn commit(&self, virt: VirtRange, flags: PageFlags) -> Result<(), AddressSpaceError> {
         self.assert_smp_safe();
         validate_range(virt)?;
@@ -773,7 +783,6 @@ impl AddressSpace for X86UserAddressSpace {
             physical_memory_offset: self.physical_memory_offset,
         };
         self.map_pages(&mut mapper, &mut frame_allocator, virt, pt_flags)?;
-        self.shootdown_range(virt);
 
         self.state
             .lock()
@@ -826,7 +835,7 @@ impl AddressSpace for X86UserAddressSpace {
             self.free_pinned_run(phys, virt.byte_len, align);
             return Err(error);
         }
-        self.shootdown_range(virt);
+        // No shootdown: a fresh mapping, see `commit`.
         pinned.push(PinnedRun {
             range: virt,
             phys,
@@ -868,7 +877,7 @@ impl AddressSpace for X86UserAddressSpace {
             return Err(AddressSpaceError::DeviceMapped);
         }
         self.map_run(&mut mapper, &mut frame_allocator, virt, phys, pt_flags)?;
-        self.shootdown_range(virt);
+        // No shootdown: a fresh mapping, see `commit`.
         pinned.push(PinnedRun {
             range: virt,
             phys,
