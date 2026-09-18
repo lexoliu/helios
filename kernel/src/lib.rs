@@ -922,7 +922,7 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone> Kernel<CpuImpl, Watch
     /// first. The outcome says whether the wake arrived during the
     /// poll or after the park, for the host-side profile.
     pub fn park_until_work(&self) -> IdleOutcome {
-        self.executor.park_until_work(&self.timer)
+        self.executor.park_until_work(&self.timer, || false)
     }
 
     pub fn run(&self) -> ! {
@@ -949,7 +949,14 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone> Kernel<CpuImpl, Watch
                 Poll::Ready(output) => return output,
                 Poll::Pending => {
                     if self.run_until_stalled() == 0 {
-                        parker.park();
+                        // The same idle policy as every other processor:
+                        // this loop is the bootstrap processor's run loop
+                        // for as long as the root future runs, and a
+                        // processor that halts without publishing
+                        // `Parked` is one whose cross-processor wakes
+                        // arrive on the next scheduler tick.
+                        self.executor
+                            .park_until_work(&self.timer, || parker.is_notified());
                     }
                 }
             }
@@ -1059,17 +1066,19 @@ impl<CpuImpl: Cpu + Clone> LocalFutureParker<CpuImpl> {
         self.notified.store(false, Ordering::Release);
     }
 
-    fn park(&self) {
-        if self.notified.swap(false, Ordering::AcqRel) {
-            return;
-        }
-        self.cpu.park_current();
+    /// Whether the root future was woken since the last `clear`.
+    /// `SeqCst`: the parker half of the idle handshake, read after the
+    /// executor has published `Parked`.
+    fn is_notified(&self) -> bool {
+        self.notified.load(Ordering::SeqCst)
     }
 }
 
 impl<CpuImpl: Cpu + Clone> Wake for LocalFutureParker<CpuImpl> {
     fn wake(self: Arc<Self>) {
-        self.notified.store(true, Ordering::Release);
+        // `SeqCst`: the publisher half of the idle handshake; the owner
+        // publishes `Parked` and then reads this flag.
+        self.notified.store(true, Ordering::SeqCst);
         if current_processor() != self.owner_processor {
             self.cpu.wake_processor(self.owner_processor);
         }

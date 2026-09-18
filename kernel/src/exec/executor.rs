@@ -864,7 +864,19 @@ impl Executor {
     /// `park_current` returns on any interrupt (the scheduler tick
     /// included), so a park that returns with no work simply loops
     /// back through `run_until_stalled` and here again.
-    pub fn park_until_work<CpuImpl: Cpu + Clone>(&self, timer: &Timer<CpuImpl>) -> IdleOutcome {
+    ///
+    /// `root_ready` is the readiness of whatever the caller polls
+    /// outside the ready queues — the bootstrap processor's root
+    /// future in `Kernel::run_local_future` — and is tested in the
+    /// same two places as the ready counts, so a wake published for
+    /// it takes part in the same handshake: the publisher stores its
+    /// flag, then reads this processor's idle state; this processor
+    /// publishes `Parked`, then reads the flag.
+    pub fn park_until_work<CpuImpl: Cpu + Clone>(
+        &self,
+        timer: &Timer<CpuImpl>,
+        root_ready: impl Fn() -> bool,
+    ) -> IdleOutcome {
         let cpu = timer.cpu();
         let idle = &self.group.idle[self.local_queue_index];
         let limit = idle.poll_limit_ticks();
@@ -873,7 +885,7 @@ impl Executor {
         if limit != 0 {
             loop {
                 let now = cpu.now();
-                if self.has_ready_work() || timer.is_due(now) {
+                if self.has_ready_work() || root_ready() || timer.is_due(now) {
                     idle.store(IdleState::Running);
                     return IdleOutcome::Polled {
                         polled_ticks: now.ticks() - started.ticks(),
@@ -892,7 +904,7 @@ impl Executor {
         // module doc.
         idle.store(IdleState::Parked);
         let now = cpu.now();
-        if self.has_ready_work() || timer.is_due(now) {
+        if self.has_ready_work() || root_ready() || timer.is_due(now) {
             idle.store(IdleState::Running);
             return IdleOutcome::Polled {
                 polled_ticks: now.ticks() - started.ticks(),
@@ -1954,13 +1966,13 @@ mod tests {
         // which then doubles per short park up to the cap.
         cpu.set_park_advance(max / 20);
         assert!(matches!(
-            executor.park_until_work(&timer),
+            executor.park_until_work(&timer, || false),
             IdleOutcome::Parked { .. }
         ));
         assert_eq!(idle.poll_limit_ticks(), grow_start);
         for expected in [grow_start * 2, max, max] {
             assert!(matches!(
-                executor.park_until_work(&timer),
+                executor.park_until_work(&timer, || false),
                 IdleOutcome::Parked { .. }
             ));
             assert_eq!(idle.poll_limit_ticks(), expected);
@@ -1969,10 +1981,28 @@ mod tests {
         // A park longer than the maximum window halves it.
         cpu.set_park_advance(max * 50);
         assert!(matches!(
-            executor.park_until_work(&timer),
+            executor.park_until_work(&timer, || false),
             IdleOutcome::Parked { .. }
         ));
         assert_eq!(idle.poll_limit_ticks(), max / 2);
+    }
+
+    /// The root future's readiness is tested where the ready counts
+    /// are: a root wake published before the park returns `Polled`
+    /// with nothing in any queue. `park_current` panics if reached.
+    #[test]
+    fn a_ready_root_future_is_seen_before_the_park() {
+        let _serialized = super::executor_test_guard();
+        let cpu = SteppingClockCpu::new(1_000);
+        cpu.forbid_park();
+        let executor = Executor::new(ProgressCounter::new(), 2, ProcessorId::new(0));
+        let timer = Timer::new(cpu.clone());
+        let root_ready = AtomicBool::new(true);
+
+        let outcome = executor.park_until_work(&timer, || root_ready.load(Ordering::SeqCst));
+
+        assert!(matches!(outcome, IdleOutcome::Polled { .. }));
+        assert_eq!(executor.group.idle[0].state(), IdleState::Running);
     }
 
     /// The push that lands between the `Parked` store and the park is
@@ -1988,7 +2018,7 @@ mod tests {
         let timer = Timer::new(cpu.clone());
         executor.spawner(cpu).spawn_local_detached(async {});
 
-        let outcome = executor.park_until_work(&timer);
+        let outcome = executor.park_until_work(&timer, || false);
 
         assert!(matches!(outcome, IdleOutcome::Polled { .. }));
         assert_eq!(executor.group.idle[0].state(), IdleState::Running);
