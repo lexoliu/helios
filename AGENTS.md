@@ -202,6 +202,20 @@ maintainer's decision and the fork's revision moves once, per §1.
 
 ### 3.5 Modern hardware, SMP first
 
+Helios's production target is a cloud provider's KVM: an x86-64 Linux
+host virtualizing the guest with hardware acceleration, and a macOS
+development host under HVF is the same class. Design and policy
+decisions assume that environment — guest CPU time is cheap and device
+I/O crosses a virtualization boundary, so a mechanism that trades
+processor work for fewer device round-trips is usually the right one,
+and host-visible facilities (the balloon, free-page reporting,
+generation-id class resume signals) are part of the machine model, not
+an edge case. The host's device models are a trust boundary: untrusted
+device input is a real attack surface, and constraining what a device
+may DMA or claim is a legitimate design input. TCG exists to exercise
+correctness on architectures CI cannot virtualize; it is never a design
+target, and an optimization that only wins under emulation wins nowhere.
+
 Helios targets modern multi-core hardware. SMP correctness is a day-one
 property of every kernel and `hal/` subsystem, never a follow-up.
 
