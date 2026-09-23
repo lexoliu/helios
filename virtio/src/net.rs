@@ -117,6 +117,14 @@ impl TxFrame for TxFrameDescriptor<'_> {
 
 impl TxFrame for helios_netstack::TxFrameRef<'_> {
     fn frame_bytes(&self) -> &[u8] {
+        // The contiguous entry points cannot carry a scatter payload; a
+        // frame that reaches them with one attached would go on the wire
+        // truncated with a matching-length IP header. Scatter frames must
+        // go through the scatter transmit entry points.
+        assert!(
+            self.payload.is_none(),
+            "scatter TCP frame routed through a contiguous transmit path"
+        );
         self.bytes
     }
 
@@ -130,6 +138,10 @@ impl TxFrame for helios_netstack::TxFrameRef<'_> {
 
 impl TxFrame for helios_netstack::PacketBuffer {
     fn frame_bytes(&self) -> &[u8] {
+        assert!(
+            self.payload().is_none(),
+            "scatter TCP frame routed through a contiguous transmit path"
+        );
         self.as_slice()
     }
 
@@ -1146,6 +1158,11 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             self.repost_rx_buffer_deferred(pair_idx, state, token)?;
         }
         state.rx_queue.publish_deferred_heads();
+        // Kick the device: after the RX ring runs dry QEMU re-enables
+        // notification and parks arrived packets until the guest signals
+        // fresh buffers, so an unkicked repost leaves the receive path
+        // stalled until the peer retransmits.
+        state.rx_queue.notify(&self.transport);
         Ok(())
     }
 
@@ -1157,6 +1174,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
     ) -> IoResult<()> {
         let submitted_token = self.repost_rx_buffer_deferred(pair_idx, state, token)?;
         state.rx_queue.publish_deferred_heads();
+        state.rx_queue.notify(&self.transport);
         assert_eq!(
             submitted_token, token,
             "virtio net RX descriptor allocation moved while buffer was reposted"

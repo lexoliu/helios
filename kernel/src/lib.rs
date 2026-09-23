@@ -49,16 +49,17 @@ pub(crate) use component::ComponentCache;
 pub use component::{
     CompiledComponent, ComponentExecContext, ComponentExecutor, ComponentExitStatus,
     ComponentFsNodeKind, ComponentFsPathError, ComponentFsResourceError, ComponentOutputMode,
-    ComponentOutputRoute, ComponentOutputStreamKind, ComponentRawMutex, ComponentRawMutexGuard,
-    ComponentRawRwLock, ComponentRawRwLockReadGuard, ComponentRawRwLockWriteGuard,
-    ComponentResourceTableError, ComponentRunResult, ComponentRuntimeEngine,
-    ComponentRuntimeFactory, ComponentRuntimeState, ComponentSerialPort, ComponentStoreData,
-    ComponentTcpBackend, ComponentTcpStream, ComponentUdpBackend, ComponentUdpSocket,
-    ComponentWorld, DeadlinePollable, InstanceKilled, RawMutexGuardResource, RawMutexResource,
-    RawRwLockReadGuardResource, RawRwLockResource, RawRwLockWriteGuardResource, SerialPortResource,
-    TcpStreamResource, UdpSocketResource, directory_prefix, map_resource_table_error, parent_path,
-    path_is_within_directory, resolve_absolute_path, resolve_child_path, resolve_guest_path,
-    strip_directory_prefix, wait_until_runtime_deadline,
+    ComponentOutputRoute, ComponentOutputSink, ComponentOutputStreamKind, ComponentRawMutex,
+    ComponentRawMutexGuard, ComponentRawRwLock, ComponentRawRwLockReadGuard,
+    ComponentRawRwLockWriteGuard, ComponentResourceTableError, ComponentRunResult,
+    ComponentRuntimeEngine, ComponentRuntimeFactory, ComponentRuntimeState, ComponentSerialPort,
+    ComponentStoreData, ComponentTcpBackend, ComponentTcpStream, ComponentUdpBackend,
+    ComponentUdpSocket, ComponentWorld, DeadlinePollable, InstanceKilled, LocalOutputSink,
+    RawMutexGuardResource, RawMutexResource, RawRwLockReadGuardResource, RawRwLockResource,
+    RawRwLockWriteGuardResource, SerialPortResource, TcpStreamResource, UdpSocketResource,
+    directory_prefix, map_resource_table_error, parent_path, path_is_within_directory,
+    resolve_absolute_path, resolve_child_path, resolve_guest_path, strip_directory_prefix,
+    wait_until_runtime_deadline,
 };
 pub use embedded::{
     EmbeddedComponent, EmbeddedInit, embedded_boot_component, embedded_init,
@@ -93,9 +94,9 @@ pub use instance::{
     record_instance_transition,
 };
 pub use io::{
-    ByteReadWait, ByteReader, ByteWriter, ClosedPeer, ExternalInterruptHandler,
+    ByteReadWait, ByteReader, ByteWriteWait, ByteWriter, ClosedPeer, ExternalInterruptHandler,
     ExternalInterruptRoutes, PollKey, PollRegistration, PollRegistry, PollRegistryError,
-    PollSourceKind, RecordingConsole, SerialReader, TryRead, byte_channel,
+    PollSourceKind, RecordingConsole, SerialReader, TryRead, TryWrite, byte_channel,
     emit_serial_error_marker, emit_serial_stage_marker, read_serial, try_read_serial, write_serial,
 };
 pub use kernel_exception::{
@@ -129,8 +130,8 @@ pub use runtime::{
     DnsError, DnsErrorKind, ExecOutput, ExecResult, HostDirEntry, HostFileSystem, HostFsError,
     HostFsErrorKind, HostMetadata, Ipv4Address, NetworkErrorDetail, NetworkIpAddress,
     ObjectIdentity, PingError, PingErrorKind, PingReply, RegisteredTcpReadBuffer, RuntimeState,
-    TcpAccepted, TcpError, TcpErrorKind, TcpListener, UdpBinding, UdpDatagram, UdpError,
-    UdpErrorKind,
+    SocketReadiness, TcpAccepted, TcpError, TcpErrorKind, TcpListener, UdpBinding, UdpDatagram,
+    UdpError, UdpErrorKind,
 };
 #[cfg(feature = "wasmtime-runtime")]
 pub use wasmtime_adapter::component_host::{
@@ -883,6 +884,12 @@ fn finish_bootstrap<Console, CpuImpl>(
         "Kernel topology processors={} startup_policy={:?}",
         topology.configured_processors,
         topology.startup_policy
+    );
+    let user_heap = memory::user_heap_stats();
+    tracing::info!(
+        "User memory pool total_bytes={} available_bytes={}",
+        user_heap.total_bytes,
+        user_heap.available_bytes()
     );
     tracing::info!(
         "Platform dma_model={dma_model:?} debug_serial={} network={} block_devices={} host_share={}",

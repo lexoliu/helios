@@ -17,14 +17,20 @@ import tomllib
 from pathlib import Path
 
 from fedora_qemu_baseline import (
-    DEFAULT_ASSET_DIR,
     DEFAULT_DISK_SIZE,
-    DEFAULT_FEDORA_IMAGE_URL,
     DEFAULT_MEMORY,
     DEFAULT_SMP,
+    FEDORA_IMAGE_SHA256,
+    FEDORA_IMAGE_URLS,
+    QEMU_BINS,
+    default_asset_dir,
+    host_arch,
     wasm_uses_simd as fedora_wasm_uses_simd,
     run_fedora_qemu_linux,
 )
+
+# Helios inspector arch name -> Fedora guest arch name.
+LINUX_GUEST_ARCHES = {"aarch64": "aarch64", "x86-64": "x86_64"}
 from tcp_throughput_server import DEFAULT_PAYLOAD_BYTES, start_tcp_throughput_server
 
 HTTP_PAYLOAD_FILE = "payload.txt"
@@ -404,6 +410,7 @@ def run_linux(
     iterations: int,
     workloads: list[dict],
     fedora_image_url: str,
+    fedora_image_sha256: str,
     linux_vm_dir: Path,
     linux_vm_qemu_bin: str,
     linux_vm_ssh_port: int | None,
@@ -417,6 +424,8 @@ def run_linux(
     quickjs_source_archive: Path | None,
     wasmtime_linux_bin: Path | None,
     wasmtime_linux_archive: Path | None,
+    guest_arch: str,
+    accel: str | None,
 ) -> tuple[Path | None, Path | None, dict]:
     return run_fedora_qemu_linux(
         repo_root(),
@@ -424,6 +433,7 @@ def run_linux(
         iterations,
         workloads,
         fedora_image_url,
+        fedora_image_sha256,
         linux_vm_dir,
         linux_vm_qemu_bin,
         linux_vm_ssh_port,
@@ -437,6 +447,8 @@ def run_linux(
         quickjs_source_archive,
         wasmtime_linux_bin,
         wasmtime_linux_archive,
+        guest_arch=guest_arch,
+        accel=accel,
     )
 
 
@@ -829,7 +841,10 @@ def write_summary_json(
         "helios_git_sha": run_record.get("git_sha", git_sha()),
         "linux_baseline": linux_provenance,
         "wasmtime_linux_baseline": {
-            "kind": "wasmtime-on-fedora-qemu-aarch64-hvf",
+            "kind": (
+                f"wasmtime-on-{linux_provenance['kind']}" if linux_provenance else "not-run"
+            ),
+            "release": (linux_provenance or {}).get("wasmtime_linux_release"),
             "workloads": [
                 workload["name"] for workload in workloads if workload.get("wasmtime_profile")
             ],
@@ -914,7 +929,14 @@ def throughput_pair(
     return f"H {helios_text} / L {linux_text} / W {wasmtime_text}"
 
 
-def write_svg(path: Path, rows: list[dict]) -> None:
+def linux_baseline_label(linux_provenance: dict | None) -> str:
+    """Name the guest both Linux lanes ran in, as recorded by the VM itself."""
+    if not linux_provenance:
+        return "the Fedora QEMU Linux guest"
+    return f"the {linux_provenance['kind']} guest"
+
+
+def write_svg(path: Path, rows: list[dict], baseline_label: str) -> None:
     drawable_rows = [
         row
         for row in rows
@@ -945,7 +967,7 @@ def write_svg(path: Path, rows: list[dict]) -> None:
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
         '<rect width="100%" height="100%" fill="#ffffff"/>',
         '<text x="32" y="34" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="22" font-weight="700" fill="#111827">Helios vs Fedora Native vs Fedora Wasmtime</text>',
-        '<text x="32" y="58" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="13" fill="#4b5563">Lower is better. Both baselines run inside the same Fedora aarch64 QEMU/HVF guest.</text>',
+        f'<text x="32" y="58" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="13" fill="#4b5563">Lower is better. Both baselines run inside {html.escape(baseline_label)}.</text>',
         f'<line x1="{left}" y1="{top - 14}" x2="{left + chart_width}" y2="{top - 14}" stroke="#d1d5db" stroke-width="1"/>',
         f'<text x="{left}" y="{top - 22}" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="12" fill="#6b7280">0 ms</text>',
         f'<text x="{left + chart_width - 64}" y="{top - 22}" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="12" fill="#6b7280">{max_ms:.1f} ms</text>',
@@ -1114,8 +1136,9 @@ def write_report(
     perf_metric_paths = helios_perf_metric_paths(helios_jsonl)
     helios_kernel_flamegraphs = render_helios_kernel_flamegraphs(helios_jsonl)
     helios_kernel_profile_top = helios_kernel_profile_top_rows(helios_jsonl)
+    baseline_label = linux_baseline_label(linux_provenance)
     svg_path = path.with_name("helios-vs-linux.svg")
-    write_svg(svg_path, rows)
+    write_svg(svg_path, rows, baseline_label)
     throughput_svg_path = path.with_name("network-throughput.svg")
     has_throughput_svg = write_throughput_svg(throughput_svg_path, rows)
     network_perf = network_perf_rows(perf_metric_paths)
@@ -1178,7 +1201,7 @@ def write_report(
             [
                 "## Wasmtime-On-Linux Floor",
                 "",
-                "Target: Helios must be faster than Wasmtime running the same wasm artifact inside the Fedora QEMU/HVF Linux guest. Native Linux remains the aspirational CPU baseline and the IO target to beat.",
+                f"Target: Helios must be faster than Wasmtime running the same wasm artifact inside {baseline_label}. Native Linux remains the aspirational CPU baseline and the IO target to beat.",
                 "",
             ]
         )
@@ -1419,9 +1442,28 @@ def main() -> None:
     parser.add_argument("--arch", default="aarch64")
     parser.add_argument("--helios-host-http-host", default="10.0.2.2")
     parser.add_argument("--helios-host-tcp-host", default="10.0.2.2")
-    parser.add_argument("--fedora-image-url", default=DEFAULT_FEDORA_IMAGE_URL)
-    parser.add_argument("--linux-vm-dir", type=Path, default=DEFAULT_ASSET_DIR)
-    parser.add_argument("--linux-vm-qemu-bin", default="qemu-system-aarch64")
+    parser.add_argument("--fedora-image-url", default=None)
+    parser.add_argument(
+        "--fedora-image-sha256",
+        default=None,
+        help="SHA256 of --fedora-image-url. Required with it; the pinned per-architecture images carry their own.",
+    )
+    parser.add_argument(
+        "--linux-guest-arch",
+        choices=sorted(set(LINUX_GUEST_ARCHES.values())),
+        default=None,
+        help=(
+            "Fedora guest architecture for the Linux lane. Defaults to this host's "
+            "architecture, the only guest that boots at a usable speed here."
+        ),
+    )
+    parser.add_argument("--linux-vm-dir", type=Path, default=None)
+    parser.add_argument("--linux-vm-qemu-bin", default=None)
+    parser.add_argument(
+        "--linux-vm-accel",
+        default=None,
+        help="QEMU accelerator for the Fedora guest (default: hvf/kvm when native, else tcg).",
+    )
     parser.add_argument("--linux-vm-ssh-port", type=int)
     parser.add_argument("--linux-vm-memory", default=DEFAULT_MEMORY)
     parser.add_argument("--linux-vm-smp", type=int, default=DEFAULT_SMP)
@@ -1435,12 +1477,12 @@ def main() -> None:
     parser.add_argument(
         "--wasmtime-linux-bin",
         type=Path,
-        help="Pre-staged aarch64 Linux wasmtime executable copied into the Fedora guest for the Wasmtime-on-Linux timing baseline.",
+        help="Pre-staged Linux wasmtime executable for the guest architecture, copied into the Fedora guest for the Wasmtime-on-Linux timing baseline. Without it the pinned Wasmtime release for the guest architecture is staged into the VM asset directory.",
     )
     parser.add_argument(
         "--wasmtime-linux-archive",
         type=Path,
-        help="Pre-staged aarch64 Linux Wasmtime tar archive copied into the Fedora guest for the Wasmtime-on-Linux timing baseline.",
+        help="Pre-staged Linux Wasmtime tar archive for the guest architecture, copied into the Fedora guest for the Wasmtime-on-Linux timing baseline.",
     )
     parser.add_argument("--out-dir", type=Path)
     parser.add_argument("--skip-helios", action="store_true")
@@ -1478,6 +1520,37 @@ def main() -> None:
         raise SystemExit("--linux-vm-setup-timeout-seconds must be positive")
     if args.wasmtime_linux_bin is not None and args.wasmtime_linux_archive is not None:
         raise SystemExit("pass either --wasmtime-linux-bin or --wasmtime-linux-archive, not both")
+
+    linux_guest_arch = args.linux_guest_arch
+    if not args.skip_linux:
+        if linux_guest_arch is None:
+            linux_guest_arch = host_arch()
+        if not args.skip_helios:
+            helios_guest_arch = LINUX_GUEST_ARCHES.get(args.arch)
+            if helios_guest_arch is None:
+                raise SystemExit(
+                    f"no Fedora baseline mapping for --arch {args.arch}; pass --skip-linux"
+                )
+            # A Fedora guest of a different architecture than the host runs
+            # under cross-architecture TCG, where the cloud image's own device
+            # and service timeouts expire before it finishes booting. Split the
+            # two lanes across hosts instead of producing a cross-ISA gap.
+            if helios_guest_arch != linux_guest_arch:
+                raise SystemExit(
+                    f"Helios --arch {args.arch} needs a {helios_guest_arch} Linux baseline, but "
+                    f"this {platform.machine()} host can only run a {linux_guest_arch} Fedora "
+                    "guest. Run each lane on its own hardware with --skip-linux and "
+                    "--skip-helios, or force the guest with --linux-guest-arch."
+                )
+        if args.fedora_image_url is None:
+            args.fedora_image_url = FEDORA_IMAGE_URLS[linux_guest_arch]
+            args.fedora_image_sha256 = FEDORA_IMAGE_SHA256[linux_guest_arch]
+        elif args.fedora_image_sha256 is None:
+            raise SystemExit("--fedora-image-url requires --fedora-image-sha256")
+        if args.linux_vm_qemu_bin is None:
+            args.linux_vm_qemu_bin = QEMU_BINS[linux_guest_arch]
+        if args.linux_vm_dir is None:
+            args.linux_vm_dir = default_asset_dir(linux_guest_arch)
 
     if not args.skip_helios:
         enforce_no_stale_helios_benchmark_processes()
@@ -1538,6 +1611,7 @@ def main() -> None:
                 args.iterations,
                 workloads,
                 args.fedora_image_url,
+                args.fedora_image_sha256,
                 args.linux_vm_dir,
                 args.linux_vm_qemu_bin,
                 args.linux_vm_ssh_port,
@@ -1551,6 +1625,8 @@ def main() -> None:
                 args.quickjs_source_archive,
                 args.wasmtime_linux_bin,
                 args.wasmtime_linux_archive,
+                linux_guest_arch,
+                args.linux_vm_accel,
             )
         if args.wasmtime_profile_workload:
             wasmtime_profiles = run_wasmtime_profiles(

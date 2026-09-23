@@ -28,6 +28,13 @@ command=(
     --arch
     "${arch}"
     --release
+)
+
+if [[ -n "${HELIOS_WORKLOAD_BENCH_VM_MEMORY:-}" ]]; then
+    command+=(--memory "${HELIOS_WORKLOAD_BENCH_VM_MEMORY}")
+fi
+
+command+=(
     workload-bench
     --manifest
     "${manifest}"

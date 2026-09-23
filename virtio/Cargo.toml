@@ -11,6 +11,7 @@ bytes = { version = "1.10.1", default-features = false }
 event-listener = { version = "5.4.1", default-features = false, features = ["critical-section"] }
 helios-hal.workspace = true
 helios-netstack.workspace = true
+pci_types = "0.10.1"
 spin = { version = "0.9.8", default-features = false, features = ["mutex", "spin_mutex"] }
 thiserror = { version = "2.0.17", default-features = false }
 

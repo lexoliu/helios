@@ -37,6 +37,7 @@ const P9_TREADLINK: u8 = 22;
 const P9_TGETATTR: u8 = 24;
 const P9_TSETATTR: u8 = 26;
 const P9_TREADDIR: u8 = 40;
+const P9_TFSYNC: u8 = 50;
 const P9_TLINK: u8 = 70;
 const P9_TMKDIR: u8 = 72;
 const P9_TRENAMEAT: u8 = 74;
@@ -53,6 +54,20 @@ const P9_SETATTR_MTIME_SET: u32 = 0x0000_0100;
 const P9_QTDIR: u8 = 0x80;
 const P9_WRITE_CHUNK: usize = (DEFAULT_MSIZE as usize) - 24;
 const P9_HEADER_LEN: usize = 7;
+/// Byte offsets of the `Rgetattr` fields, measured from the start of the
+/// message (the 7-byte `size[4] type[1] tag[2]` header included). 9P2000.L
+/// fixes this layout, so the reply is parsed by offset instead of by a
+/// running cursor that hides which fields are being skipped.
+const P9_RGETATTR_QID_TYPE: usize = 15;
+const P9_RGETATTR_QID_PATH: usize = 20;
+const P9_RGETATTR_MODE: usize = 28;
+const P9_RGETATTR_NLINK: usize = 40;
+const P9_RGETATTR_SIZE: usize = 56;
+const P9_RGETATTR_ATIME_SECONDS: usize = 80;
+const P9_RGETATTR_MTIME_SECONDS: usize = 96;
+const P9_RGETATTR_CTIME_SECONDS: usize = 112;
+/// Full `Rgetattr` reply length, up to and including `data_version`.
+const P9_RGETATTR_LEN: usize = 160;
 const P9_DEFAULT_REQUEST_BODY_BYTES: usize = 256;
 const P9_TWRITE_FIXED_BODY_BYTES: usize = 4 + 8 + 4;
 
@@ -221,32 +236,10 @@ impl<Transport: HostFsTransport> HostFsClient<Transport> {
                     push_u32(body, fid);
                     push_u64(body, P9_STATS_BASIC);
                 },
-                160,
+                P9_RGETATTR_LEN,
             )
             .await?;
-        let mut cursor = 7;
-        let _mask = read_u64_le(&response, cursor)?;
-        cursor += 8;
-        let qid_type = read_u8(&response, cursor)?;
-        cursor += 1;
-        let _qid_version = read_u32_le(&response, cursor)?;
-        cursor += 4;
-        let qid_path = read_u64_le(&response, cursor)?;
-        cursor += 8;
-        let mode = read_u32_le(&response, cursor)?;
-        cursor += 4;
-        cursor += 4;
-        cursor += 4;
-        cursor += 8;
-        cursor += 8;
-        let size = read_u64_le(&response, cursor)?;
-        Ok(HostMetadata {
-            identity: ObjectIdentity::new(AuthorityDomain::HOST_SHARE_9P, qid_path),
-            qid_path,
-            qid_type,
-            mode,
-            size,
-        })
+        parse_getattr_reply(&response)
     }
 
     async fn read_chunk(
@@ -621,6 +614,52 @@ impl<Transport: HostFsTransport> HostFsClient<Transport> {
         result
     }
 
+    /// Appends at the host's current end of file.
+    ///
+    /// 9p `Twrite` always carries an explicit offset — the server `pwrite`s,
+    /// so `O_APPEND` on `Tlopen` would not make the write positionless. The
+    /// end of file is therefore resolved with `Tgetattr` on the same fid that
+    /// then performs the write, which is the closest the protocol gets to
+    /// append semantics.
+    async fn append_file_impl(&self, path: &str, bytes: &[u8]) -> Result<u64, HostFsError> {
+        let root = self.attach_root().await?;
+        let file = self.walk(root, 1, path).await?;
+        let result = async {
+            let offset = self.get_attr(file).await?.size;
+            self.open(file, P9_DOTL_WRONLY).await?;
+            self.write_chunks(file, offset, bytes).await?;
+            Ok(offset)
+        }
+        .await;
+        let _ = self.clunk(file).await;
+        let _ = self.clunk(root).await;
+        result
+    }
+
+    async fn sync_file_impl(&self, path: &str) -> Result<(), HostFsError> {
+        let root = self.attach_root().await?;
+        let file = self.walk(root, 1, path).await?;
+        let result = async {
+            // `Tfsync` requires an open fid; the host flushes the underlying
+            // file description, so a read-only open is enough to name it.
+            self.open(file, P9_DOTL_RDONLY).await?;
+            self.transact(
+                P9_TFSYNC,
+                |body| {
+                    push_u32(body, file);
+                    push_u32(body, 0);
+                },
+                P9_HEADER_LEN,
+            )
+            .await
+            .map(|_| ())
+        }
+        .await;
+        let _ = self.clunk(file).await;
+        let _ = self.clunk(root).await;
+        result
+    }
+
     async fn remove_impl(&self, path: &str, directory: bool) -> Result<(), HostFsError> {
         let (parent, name) = split_parent_name(path)?;
         let root = self.attach_root().await?;
@@ -767,6 +806,21 @@ impl<Transport: HostFsTransport> HostFileSystem for HostFsClient<Transport> {
         bytes: &'a [u8],
     ) -> impl Future<Output = Result<(), HostFsError>> + Send + 'a {
         async move { self.write_file_impl(path, offset, bytes).await }
+    }
+
+    fn append_file<'a>(
+        &'a self,
+        path: &'a str,
+        bytes: &'a [u8],
+    ) -> impl Future<Output = Result<u64, HostFsError>> + Send + 'a {
+        async move { self.append_file_impl(path, bytes).await }
+    }
+
+    fn sync_file<'a>(
+        &'a self,
+        path: &'a str,
+    ) -> impl Future<Output = Result<(), HostFsError>> + Send + 'a {
+        async move { self.sync_file_impl(path).await }
     }
 
     fn truncate_file<'a>(
@@ -968,6 +1022,42 @@ fn read_string(buf: &[u8], cursor: &mut usize) -> Result<String, HostFsError> {
     String::from_utf8(bytes.to_vec()).map_err(|_| HostFsError::Utf8)
 }
 
+/// Decodes an `Rgetattr` reply into the kernel's host metadata type.
+///
+/// `st_dev`/`st_ino` identity comes from the qid path within the host-share
+/// authority domain, which is stable for the lifetime of a mount; timestamps
+/// are the host's own, normalised to nanoseconds since the Unix epoch.
+fn parse_getattr_reply(response: &[u8]) -> Result<HostMetadata, HostFsError> {
+    let qid_type = read_u8(response, P9_RGETATTR_QID_TYPE)?;
+    let qid_path = read_u64_le(response, P9_RGETATTR_QID_PATH)?;
+    let mode = read_u32_le(response, P9_RGETATTR_MODE)?;
+    let link_count = read_u64_le(response, P9_RGETATTR_NLINK)?;
+    let size = read_u64_le(response, P9_RGETATTR_SIZE)?;
+    let access_nanos = read_p9_timestamp(response, P9_RGETATTR_ATIME_SECONDS)?;
+    let modified_nanos = read_p9_timestamp(response, P9_RGETATTR_MTIME_SECONDS)?;
+    let status_nanos = read_p9_timestamp(response, P9_RGETATTR_CTIME_SECONDS)?;
+    Ok(HostMetadata {
+        identity: ObjectIdentity::new(AuthorityDomain::HOST_SHARE_9P, qid_path),
+        qid_path,
+        qid_type,
+        mode,
+        size,
+        link_count,
+        access_nanos,
+        modified_nanos,
+        status_nanos,
+    })
+}
+
+/// Reads a `seconds[8] nanoseconds[8]` 9p timestamp pair as nanoseconds.
+fn read_p9_timestamp(buf: &[u8], offset: usize) -> Result<u64, HostFsError> {
+    let seconds = read_u64_le(buf, offset)?;
+    let subnanoseconds = read_u64_le(buf, offset + 8)?;
+    Ok(seconds
+        .saturating_mul(1_000_000_000)
+        .saturating_add(subnanoseconds))
+}
+
 fn append_read_payload(response: &[u8], output: &mut Vec<u8>) -> Result<usize, HostFsError> {
     let mut cursor = 7;
     let count = usize::try_from(read_u32_le(response, cursor)?)
@@ -1020,6 +1110,87 @@ mod tests {
 
         assert_eq!(read, 3);
         assert_eq!(output, b"prefix-abc");
+    }
+
+    /// Builds an `Rgetattr` reply with the 9P2000.L field layout.
+    fn rgetattr_reply(
+        qid_type: u8,
+        qid_path: u64,
+        mode: u32,
+        link_count: u64,
+        size: u64,
+        access: (u64, u64),
+        modified: (u64, u64),
+        status: (u64, u64),
+    ) -> alloc::vec::Vec<u8> {
+        let mut reply = alloc::vec![0_u8; P9_RGETATTR_LEN];
+        reply[..4].copy_from_slice(&(P9_RGETATTR_LEN as u32).to_le_bytes());
+        reply[4] = P9_TGETATTR + 1;
+        reply[5..7].copy_from_slice(&P9_NOTAG.to_le_bytes());
+        reply[7..15].copy_from_slice(&P9_STATS_BASIC.to_le_bytes());
+        reply[P9_RGETATTR_QID_TYPE] = qid_type;
+        reply[P9_RGETATTR_QID_PATH..P9_RGETATTR_QID_PATH + 8]
+            .copy_from_slice(&qid_path.to_le_bytes());
+        reply[P9_RGETATTR_MODE..P9_RGETATTR_MODE + 4].copy_from_slice(&mode.to_le_bytes());
+        reply[P9_RGETATTR_NLINK..P9_RGETATTR_NLINK + 8]
+            .copy_from_slice(&link_count.to_le_bytes());
+        reply[P9_RGETATTR_SIZE..P9_RGETATTR_SIZE + 8].copy_from_slice(&size.to_le_bytes());
+        for (offset, (seconds, subnanoseconds)) in [
+            (P9_RGETATTR_ATIME_SECONDS, access),
+            (P9_RGETATTR_MTIME_SECONDS, modified),
+            (P9_RGETATTR_CTIME_SECONDS, status),
+        ] {
+            reply[offset..offset + 8].copy_from_slice(&seconds.to_le_bytes());
+            reply[offset + 8..offset + 16].copy_from_slice(&subnanoseconds.to_le_bytes());
+        }
+        reply
+    }
+
+    #[test]
+    fn getattr_reply_carries_identity_link_count_and_timestamps() {
+        let reply = rgetattr_reply(
+            0,
+            0x1234_5678_9abc_def0,
+            0o100_644,
+            3,
+            4096,
+            (11, 12),
+            (13, 14),
+            (15, 16),
+        );
+
+        let metadata = parse_getattr_reply(&reply).expect("Rgetattr reply should decode");
+
+        assert_eq!(metadata.identity.domain(), AuthorityDomain::HOST_SHARE_9P);
+        assert_eq!(metadata.identity.local(), 0x1234_5678_9abc_def0);
+        assert_eq!(metadata.qid_path, 0x1234_5678_9abc_def0);
+        assert_eq!(metadata.mode, 0o100_644);
+        assert_eq!(metadata.link_count, 3);
+        assert_eq!(metadata.size, 4096);
+        assert_eq!(metadata.access_nanos, 11_000_000_012);
+        assert_eq!(metadata.modified_nanos, 13_000_000_014);
+        assert_eq!(metadata.status_nanos, 15_000_000_016);
+    }
+
+    #[test]
+    fn getattr_reply_reports_directory_qid_type() {
+        let reply = rgetattr_reply(P9_QTDIR, 7, 0o040_755, 2, 0, (0, 0), (0, 0), (0, 0));
+
+        let metadata = parse_getattr_reply(&reply).expect("Rgetattr reply should decode");
+
+        assert_eq!(metadata.qid_type & P9_QTDIR, P9_QTDIR);
+        assert_eq!(metadata.identity.local(), 7);
+    }
+
+    #[test]
+    fn getattr_reply_shorter_than_the_fixed_layout_is_rejected() {
+        let mut reply = rgetattr_reply(0, 1, 0, 1, 0, (0, 0), (0, 0), (0, 0));
+        reply.truncate(P9_RGETATTR_CTIME_SECONDS + 4);
+
+        assert!(matches!(
+            parse_getattr_reply(&reply),
+            Err(HostFsError::Protocol(_))
+        ));
     }
 
     #[test]

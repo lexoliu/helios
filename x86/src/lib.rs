@@ -6,6 +6,7 @@ extern crate alloc;
 mod boot;
 mod exceptions;
 mod host_fs;
+mod net;
 mod pci;
 mod smp;
 mod watchdog;
@@ -32,7 +33,7 @@ use helios_hal::serial::ByteSerial;
 use helios_hal::watchdog::Watchdog;
 use helios_hal::{DeviceInventory, DmaModel, Platform, ProcessorStartupPolicy, ProcessorTopology};
 use x86_64::instructions::port::{Port, PortReadOnly, PortWriteOnly};
-use x86_64::registers::control::{Cr0, Cr0Flags, Cr3, Cr4, Cr4Flags};
+use x86_64::registers::control::{Cr0Flags, Cr3, Cr4Flags};
 
 const COM1_BASE: u16 = 0x3f8;
 const COM1_DATA: u16 = COM1_BASE;
@@ -104,9 +105,33 @@ unsafe impl critical_section::Impl for X86CriticalSection {
     }
 }
 
+/// Kernel entry from the bootloader. The kernel is compiled with SSE
+/// enabled, but the Limine x86_64 handoff does not guarantee an
+/// SSE-enabled machine state (the Limine 9 EFI loader hands off with
+/// CR4.OSFXSR clear), so no compiler-generated code may run before the
+/// FPU/SSE control bits are set: LLVM freely emits SSE moves into early
+/// boot code. This naked stub is the only pre-SSE code in the kernel.
 #[unsafe(no_mangle)]
+#[unsafe(naked)]
 extern "C" fn _start() -> ! {
-    x86_kernel_main()
+    core::arch::naked_asm!(
+        "mov rax, cr0",
+        "and eax, {cr0_clear}",
+        "or eax, {cr0_set}",
+        "mov cr0, rax",
+        "mov rax, cr4",
+        "or eax, {cr4_set}",
+        "mov cr4, rax",
+        "fninit",
+        "jmp {main}",
+        // Clear EM and TS, set MP.
+        cr0_clear = const !(Cr0Flags::EMULATE_COPROCESSOR.bits() as u32
+            | Cr0Flags::TASK_SWITCHED.bits() as u32),
+        cr0_set = const Cr0Flags::MONITOR_COPROCESSOR.bits() as u32,
+        cr4_set = const (Cr4Flags::OSFXSR.bits() as u32
+            | Cr4Flags::OSXMMEXCPT_ENABLE.bits() as u32),
+        main = sym x86_kernel_main,
+    )
 }
 
 fn x86_kernel_main() -> ! {
@@ -116,7 +141,6 @@ fn x86_kernel_main() -> ! {
         "Limine bootloader does not support the required base protocol revision"
     );
     let handoff = boot::limine_boot_handoff();
-    enable_fpu_simd();
     let physical_memory_offset = boot::physical_memory_offset();
     let reserved_ranges = boot_reserved_ranges(&handoff);
     let reserved_wakeup_page = reserve_wakeup_page(&handoff, &reserved_ranges);
@@ -158,6 +182,16 @@ fn x86_kernel_main() -> ! {
     let console = serial_console(debug_state.clone(), mirror_to_uart);
     let cpu = X86Cpu::new(boot.platform());
     vmm::install_user_address_space(physical_memory_offset, cpu.processor_count());
+    let pci = pci::PciRoot::new(physical_memory_offset);
+    let network_function = net::discover(&pci);
+    let host_share_function = host_fs::discover(&pci);
+    let mut devices = DeviceInventory::new().with_debug_serial();
+    if network_function.is_some() {
+        devices = devices.with_network();
+    }
+    if host_share_function.is_some() {
+        devices = devices.with_host_share();
+    }
     let kernel = helios_kernel::init_with_watchdog(
         Platform::with_watchdog(console, memory_regions, cpu.clone(), cpu.watchdog())
             .with_topology(
@@ -168,11 +202,23 @@ fn x86_kernel_main() -> ! {
                 .with_startup_policy(ProcessorStartupPolicy::BootstrapOnly),
             )
             .with_dma_model(DmaModel::Translated)
-            .with_devices(DeviceInventory::new().with_debug_serial()),
+            .with_devices(devices),
     );
     smp::current_runtime().install_timer(kernel.timer());
-    x86_64::instructions::interrupts::enable();
     let debug_state = cpu.debug_state();
+    // Devices are brought up while the bootstrap processor still runs
+    // with interrupts masked, so their MSI-X routes are published before
+    // the first message can be delivered.
+    install_pci_devices(
+        &cpu,
+        &kernel,
+        &pci,
+        physical_memory_offset,
+        network_function,
+        host_share_function,
+        &debug_state,
+    );
+    x86_64::instructions::interrupts::enable();
     let program_service =
         helios_kernel::install_component_host_program_service(&kernel, &cpu, &debug_state);
     smp::current_runtime().install_program_service(
@@ -189,40 +235,95 @@ fn x86_kernel_main() -> ! {
     run_current_processor(cpu, kernel, debug_state)
 }
 
-fn enable_fpu_simd() {
-    unsafe {
-        let mut cr0 = Cr0::read();
-        cr0.remove(Cr0Flags::EMULATE_COPROCESSOR | Cr0Flags::TASK_SWITCHED);
-        cr0.insert(Cr0Flags::MONITOR_COPROCESSOR);
-        Cr0::write(cr0);
-
-        let mut cr4 = Cr4::read();
-        cr4.insert(Cr4Flags::OSFXSR | Cr4Flags::OSXMMEXCPT_ENABLE);
-        Cr4::write(cr4);
-
-        asm!("fninit", options(nostack, preserves_flags));
+/// Brings up the virtio-PCI devices the platform exposes and publishes
+/// their MSI-X routes on the bootstrap processor.
+///
+/// Every device message is addressed to the bootstrap local APIC, which
+/// is the processor that owns the routing table; the routes are
+/// installed unconditionally so an interrupt from a device the kernel
+/// never claimed fails loudly instead of being silently acknowledged.
+fn install_pci_devices<WatchdogImpl>(
+    cpu: &X86Cpu,
+    kernel: &helios_kernel::Kernel<X86Cpu, WatchdogImpl>,
+    pci: &pci::PciRoot,
+    physical_memory_offset: usize,
+    network_function: Option<pci_types::PciAddress>,
+    host_share_function: Option<pci_types::PciAddress>,
+    debug_state: &debug_state::RuntimeState,
+) where
+    WatchdogImpl: Watchdog + Clone,
+{
+    let destination_apic_id = cpu.bootstrap_apic_id();
+    let mut routes = exceptions::DeviceInterruptRoutes::new();
+    if let Some(address) = host_share_function {
+        let transport = host_fs::install(
+            pci,
+            address,
+            physical_memory_offset,
+            exceptions::HOST_FS_INTERRUPT_VECTOR,
+            destination_apic_id,
+            debug_state,
+        );
+        routes.set_host_fs(exceptions::HOST_FS_INTERRUPT_VECTOR, transport);
+    } else {
+        tracing::warn!("virtio 9p device was not discovered on the PCI bus");
     }
-    // TODO(x86-avx): enable OSXSAVE, program XCR0, and preserve XSAVE state
-    // before advertising AVX/FMA/AVX512 to Wasmtime-generated code.
+    if let Some(address) = network_function {
+        let device = net::install(
+            cpu,
+            kernel,
+            pci,
+            address,
+            physical_memory_offset,
+            exceptions::NETWORK_INTERRUPT_VECTOR,
+            destination_apic_id,
+            debug_state,
+        );
+        routes.set_network(exceptions::NETWORK_INTERRUPT_VECTOR, device);
+    } else {
+        tracing::warn!("virtio network device was not discovered on the PCI bus");
+    }
+    smp::current_runtime().install_device_interrupts(routes);
 }
 
+// TODO(x86-avx): enable OSXSAVE, program XCR0, and preserve XSAVE state
+// (in `_start` and the secondary wakeup trampoline) before advertising
+// AVX/FMA/AVX512 to Wasmtime-generated code.
+
+/// Counts usable processors from the MADT. Runs before the bootstrap
+/// allocator is primed (the count sizes the allocator's per-processor
+/// structures), so it must not allocate: iterate MADT entries directly
+/// instead of building `AcpiPlatform` processor info.
 fn processor_count(rsdp_address: usize, physical_memory_offset: usize) -> usize {
+    use acpi::sdt::madt::{Madt, MadtEntry};
+
+    const LAPIC_ENABLED: u32 = 1 << 0;
+    const LAPIC_ONLINE_CAPABLE: u32 = 1 << 1;
+    const LAPIC_USABLE: u32 = LAPIC_ENABLED | LAPIC_ONLINE_CAPABLE;
+
     let handler = smp::PhysicalOffsetAcpiHandler {
         physical_memory_offset,
         tsc_base: 0,
         tsc_hz: 1,
     };
-    let tables = unsafe { acpi::AcpiTables::from_rsdp(handler.clone(), rsdp_address) }
-        .unwrap_or_else(|error| {
+    let tables =
+        unsafe { acpi::AcpiTables::from_rsdp(handler, rsdp_address) }.unwrap_or_else(|error| {
             panic!("failed to parse ACPI tables for processor count: {error:?}")
         });
-    let platform = acpi::platform::AcpiPlatform::new(tables, handler)
-        .unwrap_or_else(|error| panic!("failed to construct ACPI platform info: {error:?}"));
-    let processor_info = platform
-        .processor_info
-        .as_ref()
-        .unwrap_or_else(|| panic!("ACPI platform info did not expose processor topology"));
-    1 + processor_info.application_processors.len()
+    let madt = tables
+        .find_table::<Madt>()
+        .unwrap_or_else(|| panic!("ACPI tables did not expose an MADT"));
+    let count = madt
+        .get()
+        .entries()
+        .filter(|entry| match entry {
+            MadtEntry::LocalApic(apic) => apic.flags & LAPIC_USABLE != 0,
+            MadtEntry::LocalX2Apic(apic) => apic.flags & LAPIC_USABLE != 0,
+            _ => false,
+        })
+        .count();
+    assert!(count > 0, "MADT did not list any usable processors");
+    count
 }
 
 #[derive(Clone, Debug)]
@@ -504,6 +605,15 @@ impl X86Cpu {
         self.state.debug_state()
     }
 
+    /// Local-APIC id of the bootstrap processor: the destination every
+    /// device MSI-X message is addressed to.
+    pub(crate) fn bootstrap_apic_id(&self) -> u32 {
+        let bootstrap = self.state.bootstrap_processor();
+        self.state
+            .apic_id_of(bootstrap)
+            .unwrap_or_else(|| panic!("x86 bootstrap processor {bootstrap:?} has no local-APIC id"))
+    }
+
     pub(crate) fn watchdog(&self) -> crate::watchdog::X86Watchdog {
         self.state.watchdog()
     }
@@ -649,8 +759,9 @@ extern "C" fn secondary_start_rust(
     boot: *const smp::BootContext,
     runtime: *const smp::ProcessorRuntime,
 ) -> ! {
+    // FPU/SSE control bits are set by the secondary wakeup trampoline
+    // before any compiler-generated code runs on this processor.
     serial_uart_init();
-    enable_fpu_simd();
     let boot = unsafe { &*boot };
     let runtime = unsafe { &*runtime };
     smp::activate_runtime(runtime);
@@ -690,7 +801,7 @@ fn detect_x86_native_feature(feature: &str) -> Option<bool> {
         ((edx as u64) << 32) | u64::from(eax)
     }
 
-    let max_basic = unsafe { __cpuid(0) }.eax;
+    let max_basic = __cpuid(0).eax;
     let max_extended = unsafe { __cpuid(0x8000_0000) }.eax;
     let leaf1 = unsafe { __cpuid(1) };
     let leaf7 = (max_basic >= 7).then(|| unsafe { __cpuid_count(7, 0) });
@@ -821,9 +932,9 @@ fn read_tsc() -> u64 {
 }
 
 fn detect_tsc_frequency_hz() -> u64 {
-    let max_basic = unsafe { __cpuid(0) }.eax;
+    let max_basic = __cpuid(0).eax;
     if max_basic >= 0x15 {
-        let leaf_15 = unsafe { __cpuid(0x15) };
+        let leaf_15 = __cpuid(0x15);
         let denominator = u64::from(leaf_15.eax);
         let numerator = u64::from(leaf_15.ebx);
         let crystal_hz = u64::from(leaf_15.ecx);
@@ -837,7 +948,7 @@ fn detect_tsc_frequency_hz() -> u64 {
     }
 
     if max_basic >= 0x16 {
-        let base_mhz = u64::from(unsafe { __cpuid(0x16) }.eax);
+        let base_mhz = u64::from(__cpuid(0x16).eax);
         if base_mhz != 0 {
             let tsc_hz = base_mhz.saturating_mul(1_000_000);
             assert!(tsc_hz != 0, "computed TSC frequency is zero");

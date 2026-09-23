@@ -541,10 +541,45 @@ pub struct TcpAccepted<Stream> {
     pub port: u16,
 }
 
+/// Non-destructive readiness of one socket, as `poll_oneoff` and
+/// `epoll_wait` observe it.
+///
+/// Readiness reporting cannot use the ordinary receive/accept entry points:
+/// those dequeue the very data the caller is about to read. Every field here
+/// is derived from a probe that leaves the socket's queues untouched.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SocketReadiness {
+    /// A receive would return data now, or end-of-stream when `hangup` is
+    /// also set. For a listener this means an accept would succeed.
+    pub readable: bool,
+    /// A send would make progress now.
+    pub writable: bool,
+    /// The peer closed its send side, so receives report end-of-stream.
+    pub hangup: bool,
+}
+
 pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
     type TcpStream: Copy + Send + 'static;
     type TcpListener: Copy + Send + 'static;
     type UdpSocket: Copy + Send + 'static;
+
+    /// Probe a connected stream without consuming buffered bytes.
+    fn tcp_readiness(
+        &self,
+        stream: Self::TcpStream,
+    ) -> impl Future<Output = Result<SocketReadiness, TcpError>> + Send + '_;
+
+    /// Probe a listener without consuming a queued connection.
+    fn tcp_listener_readiness(
+        &self,
+        listener: Self::TcpListener,
+    ) -> impl Future<Output = Result<SocketReadiness, TcpError>> + Send + '_;
+
+    /// Probe a bound datagram socket without consuming a queued datagram.
+    fn udp_readiness(
+        &self,
+        socket: Self::UdpSocket,
+    ) -> impl Future<Output = Result<SocketReadiness, UdpError>> + Send + '_;
 
     fn hardware_address(&self) -> [u8; 6];
 
@@ -560,7 +595,7 @@ pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
         &'a self,
         host: &'a str,
         timeout_nanos: u64,
-    ) -> impl Future<Output = Result<Vec<Ipv4Address>, DnsError>> + Send + 'a;
+    ) -> impl Future<Output = Result<Vec<NetworkIpAddress>, DnsError>> + Send + 'a;
 
     fn tcp_connect<'a>(
         &'a self,
@@ -574,23 +609,43 @@ pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
         host: &'a str,
         port: u16,
         local_port: u16,
+        hop_limit: u8,
         timeout_nanos: u64,
     ) -> impl Future<Output = Result<Self::TcpStream, TcpError>> + Send + 'a;
 
+    /// Connects with an explicit IPv4 TTL / IPv6 hop limit.
+    ///
+    /// The hop limit is applied before the SYN leaves the stack, so a guest
+    /// that sets it on an unconnected socket sees it on every packet of the
+    /// connection rather than from the first data segment onwards.
     fn tcp_connect_address(
         &self,
         remote_address: NetworkIpAddress,
         port: u16,
         local_port: u16,
+        hop_limit: u8,
         timeout_nanos: u64,
     ) -> impl Future<Output = Result<Self::TcpStream, TcpError>> + Send + '_;
 
+    /// Listens with an explicit hop limit, inherited by accepted connections
+    /// so their SYN-ACK carries it too.
     fn tcp_listen(
         &self,
         local_address: NetworkIpAddress,
         local_port: u16,
         backlog: u16,
+        hop_limit: u8,
     ) -> impl Future<Output = Result<TcpListener<Self::TcpListener>, TcpError>> + Send + '_;
+
+    /// Retargets a connected stream's TTL / hop limit.
+    fn tcp_set_hop_limit(&self, stream: Self::TcpStream, hop_limit: u8) -> Result<(), TcpError>;
+
+    /// Retargets a listener's TTL / hop limit.
+    fn tcp_listener_set_hop_limit(
+        &self,
+        listener: Self::TcpListener,
+        hop_limit: u8,
+    ) -> Result<(), TcpError>;
 
     fn tcp_accept(
         &self,
@@ -667,6 +722,9 @@ pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
 
     fn udp_disconnect(&self, socket: Self::UdpSocket) -> Result<(), UdpError>;
 
+    /// Retargets a bound datagram socket's TTL / hop limit.
+    fn udp_set_hop_limit(&self, socket: Self::UdpSocket, hop_limit: u8) -> Result<(), UdpError>;
+
     fn udp_send<'a>(
         &'a self,
         socket: Self::UdpSocket,
@@ -726,6 +784,10 @@ pub struct AuthorityDomain(u64);
 impl AuthorityDomain {
     pub const GUEST_BOOTFS: Self = Self(1);
     pub const HOST_SHARE_9P: Self = Self(2);
+    /// Synthetic character devices the kernel exposes to guests (`/dev/null`).
+    /// They belong to no real filesystem, so they need a device id of their
+    /// own for `st_dev` to stay distinct from bootfs and the host share.
+    pub const GUEST_DEVICES: Self = Self(3);
     const HOST_DEVICE_NAMESPACE: u64 = 1 << 63;
 
     pub const fn new(raw: u64) -> Self {
@@ -769,6 +831,14 @@ pub struct HostMetadata {
     pub qid_type: u8,
     pub mode: u32,
     pub size: u64,
+    /// Hard-link count reported by the host (`Rgetattr.nlink`).
+    pub link_count: u64,
+    /// Last access time in nanoseconds since the Unix epoch.
+    pub access_nanos: u64,
+    /// Last data modification time in nanoseconds since the Unix epoch.
+    pub modified_nanos: u64,
+    /// Last status change time in nanoseconds since the Unix epoch.
+    pub status_nanos: u64,
 }
 
 #[derive(Clone, Debug, Error)]
@@ -848,6 +918,19 @@ pub trait HostFileSystem: Clone + Send + 'static {
         path: &'a str,
         offset: u64,
         bytes: &'a [u8],
+    ) -> impl Future<Output = Result<(), HostFsError>> + Send + 'a;
+    /// Appends to the end of `path`, resolving the current end of file on the
+    /// host so concurrent growth is not overwritten. Resolves with the offset
+    /// the bytes were written at.
+    fn append_file<'a>(
+        &'a self,
+        path: &'a str,
+        bytes: &'a [u8],
+    ) -> impl Future<Output = Result<u64, HostFsError>> + Send + 'a;
+    /// Flushes host-side buffers for `path` (9p `Tfsync`).
+    fn sync_file<'a>(
+        &'a self,
+        path: &'a str,
     ) -> impl Future<Output = Result<(), HostFsError>> + Send + 'a;
     fn truncate_file<'a>(
         &'a self,

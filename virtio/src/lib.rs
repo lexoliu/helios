@@ -11,6 +11,7 @@ mod mmio;
 mod net;
 mod notify;
 mod p9;
+mod pci;
 mod queue;
 mod rng;
 mod transport;
@@ -34,6 +35,10 @@ pub use net::{
     RxFrame, TxChecksumMeta, TxFrame, TxFrameDescriptor, TxScatterFrame, VirtioNetDevice,
 };
 pub use p9::Virtio9pDevice;
+pub use pci::{
+    PciMmioMapper, VIRTIO_PCI_VENDOR_ID, VirtioPciBus, VirtioPciTransport, net_from_pci,
+    p9_from_pci, virtio_pci_device_type,
+};
 pub use rng::VirtioRngDevice;
 pub use transport::{
     DeviceStatus, DeviceType, VirtioFeatures, VirtioMmioTransport, VirtioTransport,

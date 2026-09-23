@@ -13,6 +13,9 @@ critical-section = { version = "1.2.0", features = ["restore-state-usize"] }
 helios-hal.workspace = true
 i6300esb.workspace = true
 helios-kernel = { workspace = true, default-features = false, features = ["wasmtime-x86"] }
+helios-virtio.workspace = true
+bytes = { version = "1.10.1", default-features = false }
+tracing.workspace = true
 limine = "0.5.0"
 pci_types = "0.10.1"
 spin = { version = "0.9.8", default-features = false, features = ["once"] }

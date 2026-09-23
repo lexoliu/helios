@@ -6,7 +6,8 @@ use helios_netstack::{
     IpProtocol, Ipv4Address, Ipv4Cidr, Ipv4Packet, MAX_OUTBOUND_FRAMES, NeighborEntry,
     NeighborState, OutboundBatchStatus, PacketBuffer, RxChecksumOffload, Stack, StackConfig,
     StackInstant, TCP_TRANSMIT_BUFFER_BYTES, TcpEndpoint, TcpFlags, TcpHeader, TcpOptions,
-    TcpPacket, TcpSocket, TcpState, UdpPacket, UdpSocketBinding, UdpSocketId, internet_checksum,
+    TcpPacket, TcpSocket, TcpState, TransportChecksum, UdpPacket, UdpSocketBinding, UdpSocketId,
+    internet_checksum,
 };
 
 #[global_allocator]
@@ -107,6 +108,7 @@ fn tcp_ipv4_frame(header: TcpHeader, payload: &[u8]) -> PacketBuffer {
         IpAddress::Ipv4(LOCAL_IP),
         header,
         payload,
+        TransportChecksum::Software,
     )
     .expect("benchmark TCP packet should fit");
     frame.set_len(offset);
@@ -145,6 +147,7 @@ fn udp_ipv4_frame_to(
         source_port,
         destination_port,
         payload,
+        TransportChecksum::Software,
     )
     .expect("benchmark UDP packet should fit");
     frame.set_len(offset);
@@ -211,6 +214,7 @@ fn udp_ipv4_fragment_frames(payload: &[u8]) -> [Bytes; 2] {
         8080,
         49152,
         payload,
+        TransportChecksum::Software,
     )
     .expect("benchmark UDP datagram should fit");
     let split_at = 16usize;
@@ -838,7 +842,7 @@ fn udp_queue_and_immediate_submit(bencher: Bencher) {
         let status = stack
             .try_submit_outbound_slices(1, |frames| {
                 assert_eq!(frames.len(), 1, "benchmark submits one queued frame");
-                black_box(frames[0]);
+                black_box(&frames[0]);
                 Ok::<Option<usize>, ()>(Some(1))
             })
             .expect("outbound immediate submit should succeed");

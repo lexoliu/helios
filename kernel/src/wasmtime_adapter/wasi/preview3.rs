@@ -10,6 +10,7 @@ use crate::wasmtime_adapter::component_host::StoreData;
 pub(crate) const LINKED_INTERFACES: &[&str] = &[
     "wasi:clocks/monotonic-clock",
     "wasi:clocks/system-clock",
+    "wasi:clocks/timezone",
     "wasi:cli/environment",
     "wasi:cli/exit",
     "wasi:cli/stdin",
@@ -70,6 +71,18 @@ where
             |state| state,
         )?;
     }
+    if imports.has("wasi:clocks/timezone", "0.3") {
+        // Every member of `wasi:clocks/timezone` is gated behind the
+        // `clocks-timezone` unstable feature, so the generated link options
+        // must opt in or the interface links with no functions at all.
+        let mut options = wasi::clocks::timezone::LinkOptions::default();
+        options.clocks_timezone(true);
+        wasi::clocks::timezone::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
+            linker,
+            &options,
+            |state| state,
+        )?;
+    }
     if imports.has("wasi:cli/environment", "0.3") {
         wasi::cli::environment::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
             linker,
@@ -77,9 +90,14 @@ where
         )?;
     }
     if imports.has("wasi:cli/exit", "0.3") {
+        // `exit-with-code` is gated behind the `cli-exit-with-code`
+        // unstable feature; without opting in, a component importing it
+        // fails instantiation even though the interface is linked.
+        let mut options = wasi::cli::exit::LinkOptions::default();
+        options.cli_exit_with_code(true);
         wasi::cli::exit::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
             linker,
-            &Default::default(),
+            &options,
             |state| state,
         )?;
     }

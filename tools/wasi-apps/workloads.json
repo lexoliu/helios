@@ -133,7 +133,7 @@
       "class": "io-bound",
       "runner": "shell",
       "description": "Generate bytes, pipe through cat, write and read the result.",
-      "command": "out=/pipe-$HELIOS_PROCESS_ID.out; copy=/pipe-$HELIOS_PROCESS_ID.copy; {head} --bytes=131072 /bin/bash | {cat} > $out; {cat} $out > $copy; {cat} $copy >/dev/null; echo stdio-pipe:ok",
+      "command": "out={workdir}/pipe-$HELIOS_PROCESS_ID.out; copy={workdir}/pipe-$HELIOS_PROCESS_ID.copy; {head} --bytes=131072 /bin/bash | {cat} > $out; {cat} $out > $copy; {cat} $copy >/dev/null; echo stdio-pipe:ok",
       "boot_programs": [
         "bash",
         "cat",
@@ -149,7 +149,7 @@
       "class": "io-bound",
       "runner": "shell",
       "description": "Create, read, and copy many small files.",
-      "command": "dir=/bench-smallfiles-$HELIOS_PROCESS_ID; {mkdir} $dir; i=0; while [ $i -lt 64 ]; do echo data-$i > $dir/f$i; {cat} $dir/f$i > $dir/c$i; i=$((i+1)); done; echo fs-smallfiles:ok",
+      "command": "dir={workdir}/bench-smallfiles-$HELIOS_PROCESS_ID; {mkdir} $dir; i=0; while [ $i -lt 64 ]; do echo data-$i > $dir/f$i; {cat} $dir/f$i > $dir/c$i; i=$((i+1)); done; echo fs-smallfiles:ok",
       "boot_programs": [
         "mkdir",
         "cat"
@@ -164,7 +164,7 @@
       "class": "io-bound",
       "runner": "shell",
       "description": "Sequential read of a larger generated file.",
-      "command": "file=/bench-readstream-$HELIOS_PROCESS_ID.in; copy=/bench-readstream-$HELIOS_PROCESS_ID.out; {head} --bytes=1048576 /bin/bash > $file; {cat} $file > $copy; {cat} $copy >/dev/null; echo fs-readstream:ok",
+      "command": "file={workdir}/bench-readstream-$HELIOS_PROCESS_ID.in; copy={workdir}/bench-readstream-$HELIOS_PROCESS_ID.out; {head} --bytes=1048576 /bin/bash > $file; {cat} $file > $copy; {cat} $copy >/dev/null; echo fs-readstream:ok",
       "boot_programs": [
         "bash",
         "cat",

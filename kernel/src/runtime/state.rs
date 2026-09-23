@@ -647,7 +647,7 @@ where
     }
 
     pub fn ticks_to_nanos(&self, ticks: u64) -> u64 {
-        ticks.saturating_mul(1_000_000_000) / self.inner.timebase_frequency
+        crate::exec::ticks_to_nanos(ticks, self.inner.timebase_frequency)
     }
 
     pub fn uptime_nanos(&self, current_ticks: u64) -> u64 {

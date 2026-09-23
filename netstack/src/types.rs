@@ -40,9 +40,77 @@ impl Ipv6Address {
     pub const LOOPBACK: Self = Self([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
     pub const ALL_NODES_LINK_LOCAL: Self =
         Self([0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    pub const ALL_ROUTERS_LINK_LOCAL: Self =
+        Self([0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+    /// Prefix length of the link-local prefix `fe80::/64` and of every
+    /// prefix SLAAC can build a modified EUI-64 interface identifier for.
+    pub const LINK_LOCAL_PREFIX_LEN: u8 = 64;
 
     pub const fn new(octets: [u8; 16]) -> Self {
         Self(octets)
+    }
+
+    /// Builds the modified EUI-64 interface identifier (RFC 4291 §2.5.1,
+    /// Appendix A) for a 48-bit Ethernet address: the OUI and the NIC id
+    /// with `fffe` spliced between them and the universal/local bit of
+    /// the first octet inverted.
+    pub const fn eui64_interface_identifier(mac: EthernetAddress) -> [u8; 8] {
+        [
+            mac[0] ^ 0x02,
+            mac[1],
+            mac[2],
+            0xff,
+            0xfe,
+            mac[3],
+            mac[4],
+            mac[5],
+        ]
+    }
+
+    /// Builds `fe80::/64` + modified EUI-64 for this interface's MAC.
+    pub const fn link_local_from_mac(mac: EthernetAddress) -> Self {
+        Self::from_prefix_and_eui64(Self([0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), mac)
+    }
+
+    /// Combines the top 64 bits of `prefix` with the modified EUI-64
+    /// interface identifier of `mac`. Only defined for /64 prefixes,
+    /// which is the only prefix length SLAAC autoconfigures from.
+    pub const fn from_prefix_and_eui64(prefix: Self, mac: EthernetAddress) -> Self {
+        let identifier = Self::eui64_interface_identifier(mac);
+        let p = prefix.0;
+        Self([
+            p[0],
+            p[1],
+            p[2],
+            p[3],
+            p[4],
+            p[5],
+            p[6],
+            p[7],
+            identifier[0],
+            identifier[1],
+            identifier[2],
+            identifier[3],
+            identifier[4],
+            identifier[5],
+            identifier[6],
+            identifier[7],
+        ])
+    }
+
+    pub const fn is_link_local(self) -> bool {
+        self.0[0] == 0xfe && (self.0[1] & 0xc0) == 0x80
+    }
+
+    pub const fn is_loopback(self) -> bool {
+        let mut index = 0;
+        while index < 15 {
+            if self.0[index] != 0 {
+                return false;
+            }
+            index += 1;
+        }
+        self.0[15] == 1
     }
 
     pub const fn octets(self) -> [u8; 16] {

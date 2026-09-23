@@ -129,6 +129,24 @@ impl HostFileSystem for HostedFileSystem {
         })
     }
 
+    fn append_file(
+        &self,
+        path: &str,
+        bytes: &[u8],
+    ) -> impl core::future::Future<Output = Result<u64, HostFsError>> + Send + '_ {
+        let bytes = bytes.to_vec();
+        blocking_path(self.resolve(path), move |path| {
+            append_file_impl(&path, &bytes)
+        })
+    }
+
+    fn sync_file(
+        &self,
+        path: &str,
+    ) -> impl core::future::Future<Output = Result<(), HostFsError>> + Send + '_ {
+        blocking_path(self.resolve(path), |path| sync_file_impl(&path))
+    }
+
     fn truncate_file(
         &self,
         path: &str,
@@ -243,7 +261,21 @@ fn stat_impl(path: &Path) -> Result<HostMetadata, HostFsError> {
         qid_type,
         mode,
         size: meta.len(),
+        link_count: meta.nlink(),
+        access_nanos: unix_timestamp_nanos(meta.atime(), meta.atime_nsec()),
+        modified_nanos: unix_timestamp_nanos(meta.mtime(), meta.mtime_nsec()),
+        status_nanos: unix_timestamp_nanos(meta.ctime(), meta.ctime_nsec()),
     })
+}
+
+/// Normalises a host `seconds`/`nanoseconds` pair to nanoseconds since the
+/// Unix epoch. Pre-epoch timestamps clamp to zero: WASI timestamps are
+/// unsigned, so there is no representation for them.
+fn unix_timestamp_nanos(seconds: i64, subnanoseconds: i64) -> u64 {
+    u64::try_from(seconds)
+        .unwrap_or(0)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(u64::try_from(subnanoseconds).unwrap_or(0))
 }
 
 fn read_dir_impl(path: &Path) -> Result<Vec<HostDirEntry>, HostFsError> {
@@ -280,6 +312,26 @@ fn write_file_impl(path: &Path, offset: u64, bytes: &[u8]) -> Result<(), HostFsE
     file.seek(SeekFrom::Start(offset)).map_err(map_io_error)?;
     file.write_all(bytes).map_err(map_io_error)?;
     Ok(())
+}
+
+fn append_file_impl(path: &Path, bytes: &[u8]) -> Result<u64, HostFsError> {
+    use std::io::Write;
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .map_err(map_io_error)?;
+    // `O_APPEND` positions the write at the end of file itself; the length
+    // read here is only reported back so callers can track the stream offset.
+    let offset = file.metadata().map_err(map_io_error)?.len();
+    file.write_all(bytes).map_err(map_io_error)?;
+    Ok(offset)
+}
+
+fn sync_file_impl(path: &Path) -> Result<(), HostFsError> {
+    fs::File::open(path)
+        .map_err(map_io_error)?
+        .sync_all()
+        .map_err(map_io_error)
 }
 
 fn truncate_impl(path: &Path) -> Result<(), HostFsError> {
@@ -441,6 +493,94 @@ mod tests {
             assert_eq!(metadata.atime_nsec(), 500_000_002);
             assert_eq!(metadata.mtime(), 2);
             assert_eq!(metadata.mtime_nsec(), 3);
+        });
+    }
+
+    /// Appending must land at the host's current end of file even when the
+    /// caller never tracked an offset, and must report where it wrote so a
+    /// stream can keep its own position.
+    #[test]
+    fn hosted_filesystem_appends_at_the_current_end_of_file() {
+        run_hosted_fs_test(async {
+            let root = TestRoot::new();
+            std::fs::write(root.path.join("log"), b"first").expect("seed file must be written");
+            let filesystem = root.filesystem();
+
+            let offset = filesystem
+                .append_file("log", b"-second")
+                .await
+                .expect("append must succeed");
+            assert_eq!(offset, b"first".len() as u64);
+
+            filesystem
+                .append_file("log", b"-third")
+                .await
+                .expect("second append must succeed");
+
+            let contents = std::fs::read(root.path.join("log")).expect("file must be readable");
+            assert_eq!(contents, b"first-second-third");
+        });
+    }
+
+    /// `fd_sync` must reach the host rather than report success without
+    /// flushing; a missing file has to surface as an error, which proves the
+    /// call is really being made.
+    #[test]
+    fn hosted_filesystem_syncs_files_and_reports_missing_ones() {
+        run_hosted_fs_test(async {
+            let root = TestRoot::new();
+            std::fs::write(root.path.join("data"), b"payload").expect("file must be written");
+            let filesystem = root.filesystem();
+
+            filesystem
+                .sync_file("data")
+                .await
+                .expect("sync of an existing file must succeed");
+
+            let error = filesystem
+                .sync_file("absent")
+                .await
+                .expect_err("sync of a missing file must fail");
+            assert!(matches!(
+                error,
+                helios_kernel::HostFsError::Transport(helios_hal::io::IoError::NotFound)
+            ));
+        });
+    }
+
+    /// Stat has to carry the host's own identity, link count, and timestamps:
+    /// `st_dev`/`st_ino` are derived from the identity and must never be zero.
+    #[test]
+    fn hosted_filesystem_stat_carries_identity_links_and_timestamps() {
+        run_hosted_fs_test(async {
+            let root = TestRoot::new();
+            std::fs::write(root.path.join("source"), b"payload").expect("file must be written");
+            std::fs::hard_link(root.path.join("source"), root.path.join("alias"))
+                .expect("hard link must be created");
+            let filesystem = root.filesystem();
+            filesystem
+                .set_times("source", Some(1_500_000_002), Some(2_000_000_003))
+                .await
+                .expect("times must be set");
+
+            let metadata = filesystem
+                .stat_path("source")
+                .await
+                .expect("stat must succeed");
+
+            assert_ne!(metadata.identity.domain().raw(), 0);
+            assert_ne!(metadata.identity.local(), 0);
+            assert_eq!(metadata.link_count, 2);
+            assert_eq!(metadata.size, b"payload".len() as u64);
+            assert_eq!(metadata.access_nanos, 1_500_000_002);
+            assert_eq!(metadata.modified_nanos, 2_000_000_003);
+            assert_ne!(metadata.status_nanos, 0);
+
+            let alias = filesystem
+                .stat_path("alias")
+                .await
+                .expect("alias stat must succeed");
+            assert_eq!(alias.identity, metadata.identity);
         });
     }
 

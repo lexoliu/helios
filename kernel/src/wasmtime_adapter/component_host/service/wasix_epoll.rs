@@ -157,19 +157,39 @@ where
         Some(_) => return p1::errno::INVAL,
         None => return p1::errno::BADF,
     }
-    let mut ready = wasix_collect_epoll_events(caller, epfd, maxevents);
-    if ready.is_empty() && timeout != 0 {
-        let targets = match wasix_epoll_wait_targets(caller, epfd) {
-            Ok(targets) => targets,
+    // A negative timeout blocks indefinitely; otherwise anchor the deadline
+    // once so the wait loop cannot restart its countdown on every re-probe.
+    let deadline_nanos = if timeout < 0 {
+        None
+    } else {
+        Some(caller.data().now_nanos().saturating_add(timeout as u64))
+    };
+
+    let ready = loop {
+        let ready = wasix_collect_epoll_events(caller, epfd, maxevents).await;
+        if !ready.is_empty() {
+            break ready;
+        }
+        let remaining = match deadline_nanos {
+            None => None,
+            Some(deadline) => {
+                let now = caller.data().now_nanos();
+                if now >= deadline {
+                    // Includes `timeout == 0`, which makes epoll_wait a
+                    // non-blocking readiness snapshot.
+                    break ready;
+                }
+                Some(Duration::from_nanos(deadline - now))
+            }
+        };
+        let mut wait = match wasix_epoll_wait_set(caller, epfd) {
+            Ok(wait) => wait,
             Err(errno) => return errno,
         };
-        if let Err(errno) =
-            wasix_wait_epoll_readiness(caller.data().timer(), targets, timeout).await
-        {
-            return errno;
-        }
-        ready = wasix_collect_epoll_events(caller, epfd, maxevents);
-    }
+        let timer = caller.data().timer();
+        p1_wait_step(&timer, &mut wait, remaining).await;
+    };
+
     for (index, event) in ready.iter().enumerate() {
         let offset = match (index as u32).checked_mul(WASIX_EPOLL_EVENT_SIZE) {
             Some(offset) => offset,
@@ -191,41 +211,6 @@ where
     p1_write_u32(caller, memory, ret_nevents, returned)
 }
 
-pub(super) async fn wasix_wait_epoll_readiness<CpuImpl>(
-    timer: crate::Timer<CpuImpl>,
-    mut targets: Vec<EpollWaitTarget>,
-    timeout: i64,
-) -> Result<(), i32>
-where
-    CpuImpl: Cpu + Clone,
-{
-    if timeout < 0 {
-        if targets.is_empty() {
-            core::future::pending::<()>().await;
-            return Ok(());
-        }
-        core::future::poll_fn(|cx| poll_epoll_wait_targets(&mut targets, cx)).await;
-        return Ok(());
-    }
-
-    let mut timer = core::pin::pin!(timer.sleep_for(Duration::from_nanos(timeout as u64)));
-    if targets.is_empty() {
-        timer.await;
-        return Ok(());
-    }
-    core::future::poll_fn(|cx| {
-        if poll_epoll_wait_targets(&mut targets, cx).is_ready() {
-            return Poll::Ready(());
-        }
-        if timer.as_mut().poll(cx).is_ready() {
-            return Poll::Ready(());
-        }
-        Poll::Pending
-    })
-    .await;
-    Ok(())
-}
-
 pub(super) fn poll_epoll_wait_targets(
     targets: &mut [EpollWaitTarget],
     cx: &mut Context<'_>,
@@ -238,10 +223,17 @@ pub(super) fn poll_epoll_wait_targets(
     Poll::Pending
 }
 
-pub(super) fn wasix_epoll_wait_targets<CpuImpl, HostFs>(
+/// Collect everything the registered interests need in order to be woken.
+///
+/// This used to build wait targets only for pipes, socketpairs and eventfds,
+/// so `epoll_wait` on a TCP/UDP socket or on stdin had nothing to wait on:
+/// with an infinite timeout it parked forever, and with a timeout it always
+/// timed out. `p1_add_wait_target` covers every descriptor kind, flagging the
+/// poll-driven ones for re-probing.
+pub(super) fn wasix_epoll_wait_set<CpuImpl, HostFs>(
     caller: &Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     epfd: i32,
-) -> Result<Vec<EpollWaitTarget>, i32>
+) -> Result<P1WaitSet, i32>
 where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
@@ -251,36 +243,16 @@ where
         Some(_) => return Err(p1::errno::INVAL),
         None => return Err(p1::errno::BADF),
     };
-    let mut targets = Vec::new();
+    let mut wait = P1WaitSet::new();
     for interest in interests {
-        if interest.events & WASIX_EPOLL_TYPE_EPOLLIN == 0 {
-            continue;
+        if interest.events & WASIX_EPOLL_TYPE_EPOLLIN != 0 {
+            p1_add_wait_target(caller.data(), interest.fd, P1_EVENTTYPE_FD_READ, &mut wait);
         }
-        match caller.data().descriptors.get(interest.fd) {
-            Some(Preview1Descriptor::PipeRead { reader, carry }) if carry.is_empty() => {
-                targets.push(EpollWaitTarget::ByteReader {
-                    reader: reader.clone(),
-                    wait: reader.wait_state(),
-                });
-            }
-            Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair {
-                reader, carry, ..
-            })) if carry.is_empty() => {
-                targets.push(EpollWaitTarget::ByteReader {
-                    reader: reader.clone(),
-                    wait: reader.wait_state(),
-                });
-            }
-            Some(Preview1Descriptor::Event(event)) if !event.is_readable() => {
-                targets.push(EpollWaitTarget::Event {
-                    event: event.clone(),
-                    wait: event.wait_state(),
-                });
-            }
-            _ => {}
+        if interest.events & WASIX_EPOLL_TYPE_EPOLLOUT != 0 {
+            p1_add_wait_target(caller.data(), interest.fd, P1_EVENTTYPE_FD_WRITE, &mut wait);
         }
     }
-    Ok(targets)
+    Ok(wait)
 }
 
 pub(super) fn wasix_read_epoll_event<T>(
@@ -352,7 +324,7 @@ pub(super) fn wasix_write_epoll_event<T>(
         ))
 }
 
-pub(super) fn wasix_collect_epoll_events<CpuImpl, HostFs>(
+pub(super) async fn wasix_collect_epoll_events<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     epfd: i32,
     maxevents: u32,
@@ -371,8 +343,7 @@ where
         if ready.len() >= maxevents as usize {
             break;
         }
-        let events =
-            wasix_epoll_ready_mask(caller.data().descriptors.get(interest.fd), interest.events);
+        let events = wasix_epoll_ready_mask(caller, interest.fd, interest.events).await;
         if events == 0 {
             continue;
         }
@@ -394,26 +365,157 @@ where
     ready
 }
 
-pub(super) fn wasix_epoll_ready_mask(
-    descriptor: Option<&Preview1Descriptor>,
+/// Compute the ready mask for one registered interest.
+///
+/// The old mask required a non-zero byte count for `EPOLLIN`. Sockets and
+/// regular files reported `Ok(0)` from the probe whether or not they were
+/// readable, so they never raised `EPOLLIN`. The tri-state readiness makes
+/// "ready with nothing buffered" (end-of-stream, a drained regular file)
+/// distinguishable from "would block".
+pub(super) async fn wasix_epoll_ready_mask<CpuImpl, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+    fd: i32,
     interest: u32,
-) -> u32 {
-    let Some(descriptor) = descriptor else {
+) -> u32
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    if caller.data().descriptors.get(fd).is_none() {
         return WASIX_EPOLL_TYPE_EPOLLERR | WASIX_EPOLL_TYPE_EPOLLHUP;
-    };
+    }
     let mut ready = 0;
     if interest & WASIX_EPOLL_TYPE_EPOLLIN != 0 {
-        match p1_poll_descriptor(Some(descriptor), P1_EVENTTYPE_FD_READ) {
-            Ok(bytes) if bytes != 0 => ready |= WASIX_EPOLL_TYPE_EPOLLIN,
-            Err(_) => ready |= WASIX_EPOLL_TYPE_EPOLLERR,
-            _ => {}
-        }
+        ready |= wasix_epoll_mask_bit(
+            p1_descriptor_readiness(caller, fd, P1_EVENTTYPE_FD_READ).await,
+            P1_EVENTTYPE_FD_READ,
+        );
     }
     if interest & WASIX_EPOLL_TYPE_EPOLLOUT != 0 {
-        match p1_poll_descriptor(Some(descriptor), P1_EVENTTYPE_FD_WRITE) {
-            Ok(_) => ready |= WASIX_EPOLL_TYPE_EPOLLOUT,
-            Err(_) => ready |= WASIX_EPOLL_TYPE_EPOLLERR,
-        }
+        ready |= wasix_epoll_mask_bit(
+            p1_descriptor_readiness(caller, fd, P1_EVENTTYPE_FD_WRITE).await,
+            P1_EVENTTYPE_FD_WRITE,
+        );
     }
     ready
+}
+
+/// Fold one direction's readiness into the epoll bits it implies.
+///
+/// `Ready` and `Hangup` both raise the direction's bit — an ended stream is
+/// reported as readable so the guest performs the read that returns zero.
+/// Only a hangup additionally raises `EPOLLHUP`.
+pub(super) fn wasix_epoll_mask_bit(readiness: Result<P1Readiness, i32>, event_type: u8) -> u32 {
+    let bit = if event_type == P1_EVENTTYPE_FD_WRITE {
+        WASIX_EPOLL_TYPE_EPOLLOUT
+    } else {
+        WASIX_EPOLL_TYPE_EPOLLIN
+    };
+    match readiness {
+        Ok(P1Readiness::Pending) => 0,
+        Ok(P1Readiness::Hangup) => bit | WASIX_EPOLL_TYPE_EPOLLHUP,
+        Ok(P1Readiness::Ready { .. }) => bit,
+        Err(_) => WASIX_EPOLL_TYPE_EPOLLERR,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn socket_mask(readiness: crate::SocketReadiness, event_type: u8) -> u32 {
+        wasix_epoll_mask_bit(
+            Ok(p1_readiness_from_socket(readiness, event_type)),
+            event_type,
+        )
+    }
+
+    /// A socket holding buffered bytes raises `EPOLLIN`. The old mask keyed
+    /// off a non-zero byte count, and the socket probe always answered zero,
+    /// so a readable socket never showed up in `epoll_wait`.
+    #[test]
+    fn epoll_mask_reports_a_socket_with_buffered_data() {
+        assert_eq!(
+            socket_mask(
+                crate::SocketReadiness {
+                    readable: true,
+                    writable: true,
+                    hangup: false,
+                },
+                P1_EVENTTYPE_FD_READ,
+            ),
+            WASIX_EPOLL_TYPE_EPOLLIN
+        );
+    }
+
+    /// A peer that closed its send side is readable *and* hung up, so the
+    /// guest performs the read that returns zero and sees the EOF.
+    #[test]
+    fn epoll_mask_reports_a_socket_at_end_of_stream() {
+        assert_eq!(
+            socket_mask(
+                crate::SocketReadiness {
+                    readable: true,
+                    writable: true,
+                    hangup: true,
+                },
+                P1_EVENTTYPE_FD_READ,
+            ),
+            WASIX_EPOLL_TYPE_EPOLLIN | WASIX_EPOLL_TYPE_EPOLLHUP
+        );
+    }
+
+    /// A socket with an empty receive queue contributes no bits at all, so
+    /// `epoll_wait` goes on to sleep instead of returning a phantom event.
+    #[test]
+    fn epoll_mask_ignores_a_socket_that_would_block() {
+        assert_eq!(
+            socket_mask(
+                crate::SocketReadiness {
+                    readable: false,
+                    writable: true,
+                    hangup: false,
+                },
+                P1_EVENTTYPE_FD_READ,
+            ),
+            0
+        );
+    }
+
+    /// Writability is tracked separately: a socket that cannot send yet must
+    /// not raise `EPOLLOUT`.
+    #[test]
+    fn epoll_mask_tracks_socket_writability() {
+        assert_eq!(
+            socket_mask(
+                crate::SocketReadiness {
+                    readable: false,
+                    writable: true,
+                    hangup: false,
+                },
+                P1_EVENTTYPE_FD_WRITE,
+            ),
+            WASIX_EPOLL_TYPE_EPOLLOUT
+        );
+        assert_eq!(
+            socket_mask(
+                crate::SocketReadiness {
+                    readable: true,
+                    writable: false,
+                    hangup: false,
+                },
+                P1_EVENTTYPE_FD_WRITE,
+            ),
+            0
+        );
+    }
+
+    /// A failed probe surfaces as `EPOLLERR` rather than silent readiness.
+    #[test]
+    fn epoll_mask_reports_probe_failures() {
+        assert_eq!(
+            wasix_epoll_mask_bit(Err(p1::errno::BADF), P1_EVENTTYPE_FD_READ),
+            WASIX_EPOLL_TYPE_EPOLLERR
+        );
+    }
 }

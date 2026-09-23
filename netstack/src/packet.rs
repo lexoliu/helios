@@ -1112,14 +1112,192 @@ pub struct Icmpv6PacketTooBig<'a> {
     pub original: &'a [u8],
 }
 
+/// One Neighbor Discovery option (RFC 4861 §4.6, RFC 8106 §5).
+///
+/// Options the stack has no use for are surfaced as [`NdpOption::Other`]
+/// rather than dropped so a caller can log or count them; the iterator
+/// still skips over their bytes correctly because every NDP option is
+/// length-prefixed in units of 8 octets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NdpOption<'a> {
+    SourceLinkLayerAddress(EthernetAddress),
+    TargetLinkLayerAddress(EthernetAddress),
+    PrefixInformation(NdpPrefixInformation),
+    Mtu(u32),
+    RecursiveDnsServers(NdpRecursiveDnsServers<'a>),
+    Other { kind: u8 },
+}
+
+/// Prefix Information option (RFC 4861 §4.6.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NdpPrefixInformation {
+    pub prefix: Ipv6Address,
+    pub prefix_len: u8,
+    /// L bit: the prefix identifies an on-link subnet.
+    pub on_link: bool,
+    /// A bit: the prefix may be used for stateless address autoconfiguration.
+    pub autonomous: bool,
+    pub valid_lifetime_seconds: u32,
+    pub preferred_lifetime_seconds: u32,
+}
+
+/// Recursive DNS Server option (RFC 8106 §5.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NdpRecursiveDnsServers<'a> {
+    pub lifetime_seconds: u32,
+    addresses: &'a [u8],
+}
+
+impl<'a> NdpRecursiveDnsServers<'a> {
+    pub fn addresses(self) -> impl Iterator<Item = Ipv6Address> + 'a {
+        self.addresses
+            .chunks_exact(16)
+            .map(|chunk| Ipv6Address::new(chunk.try_into().expect("16-byte chunk")))
+    }
+}
+
+/// Borrowed NDP option list; iterating it parses lazily.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NdpOptions<'a> {
+    bytes: &'a [u8],
+}
+
+impl<'a> NdpOptions<'a> {
+    pub const fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes }
+    }
+
+    pub const fn raw(self) -> &'a [u8] {
+        self.bytes
+    }
+
+    pub fn iter(self) -> NdpOptionIter<'a> {
+        NdpOptionIter { bytes: self.bytes }
+    }
+
+    /// First Source Link-Layer Address option, if any.
+    pub fn source_link_layer_address(self) -> Option<EthernetAddress> {
+        self.iter().find_map(|option| match option {
+            NdpOption::SourceLinkLayerAddress(mac) => Some(mac),
+            _ => None,
+        })
+    }
+
+    /// First Target Link-Layer Address option, if any.
+    pub fn target_link_layer_address(self) -> Option<EthernetAddress> {
+        self.iter().find_map(|option| match option {
+            NdpOption::TargetLinkLayerAddress(mac) => Some(mac),
+            _ => None,
+        })
+    }
+
+    /// First MTU option, if any.
+    pub fn mtu(self) -> Option<u32> {
+        self.iter().find_map(|option| match option {
+            NdpOption::Mtu(mtu) => Some(mtu),
+            _ => None,
+        })
+    }
+}
+
+impl<'a> IntoIterator for NdpOptions<'a> {
+    type Item = NdpOption<'a>;
+    type IntoIter = NdpOptionIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct NdpOptionIter<'a> {
+    bytes: &'a [u8],
+}
+
+impl<'a> Iterator for NdpOptionIter<'a> {
+    type Item = NdpOption<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.bytes.len() < 2 {
+                self.bytes = &[];
+                return None;
+            }
+            let kind = self.bytes[0];
+            // Length counts 8-octet units and includes the type/length
+            // bytes; zero is illegal and would otherwise loop forever.
+            let len = usize::from(self.bytes[1]).checked_mul(8)?;
+            if len == 0 || len > self.bytes.len() {
+                self.bytes = &[];
+                return None;
+            }
+            let (option, rest) = self.bytes.split_at(len);
+            self.bytes = rest;
+            let body = &option[2..];
+            let parsed = match kind {
+                1 if body.len() >= 6 => Some(NdpOption::SourceLinkLayerAddress(
+                    body[..6].try_into().ok()?,
+                )),
+                2 if body.len() >= 6 => Some(NdpOption::TargetLinkLayerAddress(
+                    body[..6].try_into().ok()?,
+                )),
+                3 if len == 32 => Some(NdpOption::PrefixInformation(NdpPrefixInformation {
+                    prefix: Ipv6Address::new(read_array::<16>(option, 16)?),
+                    prefix_len: option[2],
+                    on_link: option[3] & 0x80 != 0,
+                    autonomous: option[3] & 0x40 != 0,
+                    valid_lifetime_seconds: read_u32(option, 4)?,
+                    preferred_lifetime_seconds: read_u32(option, 8)?,
+                })),
+                5 if len == 8 => Some(NdpOption::Mtu(read_u32(option, 4)?)),
+                25 if len >= 24 => Some(NdpOption::RecursiveDnsServers(NdpRecursiveDnsServers {
+                    lifetime_seconds: read_u32(option, 4)?,
+                    addresses: &option[8..],
+                })),
+                _ => Some(NdpOption::Other { kind }),
+            };
+            if let Some(parsed) = parsed {
+                return Some(parsed);
+            }
+        }
+    }
+}
+
+/// Router Advertisement body (RFC 4861 §4.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Icmpv6RouterAdvertisement<'a> {
+    pub current_hop_limit: u8,
+    /// M bit: addresses are available through stateful DHCPv6.
+    pub managed_address_configuration: bool,
+    /// O bit: other configuration is available through stateful DHCPv6.
+    pub other_configuration: bool,
+    /// Lifetime of this router as a default router; zero means the
+    /// sender is not a default router.
+    pub router_lifetime_seconds: u16,
+    pub reachable_time_millis: u32,
+    pub retransmit_timer_millis: u32,
+    pub options: NdpOptions<'a>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Icmpv6Packet<'a> {
     EchoRequest(Icmpv6Echo<'a>),
     EchoReply(Icmpv6Echo<'a>),
     DestinationUnreachable(Icmpv6DestinationUnreachable<'a>),
     PacketTooBig(Icmpv6PacketTooBig<'a>),
-    NeighborSolicitation { target: Ipv6Address },
-    NeighborAdvertisement { target: Ipv6Address },
+    RouterAdvertisement(Icmpv6RouterAdvertisement<'a>),
+    NeighborSolicitation {
+        target: Ipv6Address,
+        options: NdpOptions<'a>,
+    },
+    NeighborAdvertisement {
+        target: Ipv6Address,
+        /// S bit: this advertisement answers a solicitation.
+        solicited: bool,
+        /// O bit: the advertisement overrides an existing cache entry.
+        override_cache: bool,
+        options: NdpOptions<'a>,
+    },
 }
 
 impl<'a> Icmpv6Packet<'a> {
@@ -1129,6 +1307,13 @@ impl<'a> Icmpv6Packet<'a> {
         Icmpv6DestinationUnreachableCode::PortUnreachable;
     pub const PACKET_TOO_BIG_HEADER_LEN: usize = 8;
     pub const NEIGHBOR_MESSAGE_LEN: usize = 32;
+    /// Router Advertisement fixed header, before its options.
+    pub const ROUTER_ADVERTISEMENT_HEADER_LEN: usize = 16;
+    /// Router Solicitation carrying one Source Link-Layer Address option.
+    pub const ROUTER_SOLICITATION_LEN: usize = 16;
+    /// Router Solicitation sent from the unspecified address, which
+    /// RFC 4861 §4.1 forbids from carrying a link-layer address option.
+    pub const ROUTER_SOLICITATION_ANONYMOUS_LEN: usize = 8;
 
     pub fn parse(bytes: &'a [u8]) -> Option<Self> {
         if bytes.len() < Self::ECHO_HEADER_LEN {
@@ -1153,14 +1338,58 @@ impl<'a> Icmpv6Packet<'a> {
                 mtu: read_u32(bytes, 4)?,
                 original: &bytes[Self::PACKET_TOO_BIG_HEADER_LEN..],
             })),
+            134 if bytes.len() >= Self::ROUTER_ADVERTISEMENT_HEADER_LEN => {
+                Some(Self::RouterAdvertisement(Icmpv6RouterAdvertisement {
+                    current_hop_limit: bytes[4],
+                    managed_address_configuration: bytes[5] & 0x80 != 0,
+                    other_configuration: bytes[5] & 0x40 != 0,
+                    router_lifetime_seconds: read_u16(bytes, 6)?,
+                    reachable_time_millis: read_u32(bytes, 8)?,
+                    retransmit_timer_millis: read_u32(bytes, 12)?,
+                    options: NdpOptions::new(&bytes[Self::ROUTER_ADVERTISEMENT_HEADER_LEN..]),
+                }))
+            }
             135 if bytes.len() >= 24 => Some(Self::NeighborSolicitation {
                 target: Ipv6Address::new(read_array::<16>(bytes, 8)?),
+                options: NdpOptions::new(&bytes[24..]),
             }),
             136 if bytes.len() >= 24 => Some(Self::NeighborAdvertisement {
                 target: Ipv6Address::new(read_array::<16>(bytes, 8)?),
+                solicited: bytes[4] & 0x40 != 0,
+                override_cache: bytes[4] & 0x20 != 0,
+                options: NdpOptions::new(&bytes[24..]),
             }),
             _ => None,
         }
+    }
+
+    /// Encodes a Router Solicitation (RFC 4861 §4.1). `source_mac` is
+    /// omitted when `source` is the unspecified address, because the
+    /// Source Link-Layer Address option must not appear then.
+    pub fn encode_router_solicitation(
+        output: &mut [u8],
+        source: Ipv6Address,
+        destination: Ipv6Address,
+        source_mac: Option<EthernetAddress>,
+    ) -> Option<usize> {
+        let len = if source_mac.is_some() {
+            Self::ROUTER_SOLICITATION_LEN
+        } else {
+            Self::ROUTER_SOLICITATION_ANONYMOUS_LEN
+        };
+        if output.len() < len {
+            return None;
+        }
+        output[..len].fill(0);
+        output[0] = 133;
+        if let Some(mac) = source_mac {
+            output[8] = 1;
+            output[9] = 1;
+            output[10..16].copy_from_slice(&mac);
+        }
+        let checksum = icmpv6_checksum(source, destination, &output[..len]);
+        write_u16(output, 2, checksum)?;
+        Some(len)
     }
 
     pub fn encode_neighbor_solicitation(

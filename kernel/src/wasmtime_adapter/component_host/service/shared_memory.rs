@@ -23,6 +23,11 @@ pub(super) struct SharedMemoryPool {
     pub(super) budget_bytes: usize,
     pub(super) resident_bytes: usize,
     pub(super) buckets: HashMap<SharedMemorySpec, Vec<SharedMemory>>,
+    /// Recycles claimed by `reserve_for_recycle` whose scrub has not yet
+    /// landed in a bucket. Spawns that lose the allocation race wait on
+    /// `recycled` instead of failing while this is non-zero.
+    pending_scrubs: usize,
+    recycled: Arc<crate::exec::Notify>,
 }
 
 impl SharedMemoryPool {
@@ -31,9 +36,17 @@ impl SharedMemoryPool {
             budget_bytes,
             resident_bytes: 0,
             buckets: HashMap::new(),
+            pending_scrubs: 0,
+            recycled: Arc::new(crate::exec::Notify::new()),
         }
     }
 
+    /// Hands out a pre-zeroed pooled memory, or a fresh one. Pooled
+    /// entries were scrubbed off the spawn path by the recycle task, so
+    /// this never zeroes memory on the process-start critical path.
+    /// The pool is a cache: when a fresh allocation fails, entries
+    /// retained under other specs are evicted (freeing their user RAM)
+    /// and the allocation retried before the failure propagates.
     pub(super) fn acquire(
         &mut self,
         engine: &wasmtime::Engine,
@@ -44,36 +57,153 @@ impl SharedMemoryPool {
                 .resident_bytes
                 .checked_sub(spec.byte_size())
                 .expect("shared-memory pool byte accounting underflow");
-            zero_shared_memory(&memory);
             return Ok(memory);
         }
 
-        SharedMemory::new(engine, spec.memory_type()).map_err(map_program_runtime_error)
+        loop {
+            match SharedMemory::new(engine, spec.memory_type()) {
+                Ok(memory) => return Ok(memory),
+                Err(error) => {
+                    if !self.evict_one() {
+                        return Err(map_program_runtime_error(error));
+                    }
+                }
+            }
+        }
     }
 
-    pub(super) fn recycle(&mut self, spec: SharedMemorySpec, memory: SharedMemory) {
+    /// Drops one pooled memory, releasing its user RAM and budget.
+    /// Returns false when every bucket is empty.
+    pub(super) fn evict_one(&mut self) -> bool {
+        let Some(spec) = self
+            .buckets
+            .iter()
+            .find_map(|(spec, bucket)| (!bucket.is_empty()).then_some(*spec))
+        else {
+            return false;
+        };
+        let memory = self
+            .buckets
+            .get_mut(&spec)
+            .and_then(|bucket| bucket.pop())
+            .expect("shared-memory pool eviction found an empty bucket");
+        self.resident_bytes = self
+            .resident_bytes
+            .checked_sub(spec.byte_size())
+            .expect("shared-memory pool byte accounting underflow");
+        drop(memory);
+        true
+    }
+
+    /// Claims budget for a memory about to be scrubbed and re-pooled.
+    /// The bytes count as resident from this point so a burst of exits
+    /// cannot overshoot the pool budget while scrubs are in flight.
+    pub(super) fn reserve_for_recycle(&mut self, spec: SharedMemorySpec, memory: &SharedMemory) -> bool {
         if memory.size() != u64::from(spec.initial_pages) {
-            return;
+            return false;
         }
         let bytes = spec.byte_size();
         if self.resident_bytes.saturating_add(bytes) > self.budget_bytes {
-            return;
+            return false;
         }
         self.resident_bytes = self
             .resident_bytes
             .checked_add(bytes)
             .expect("shared-memory pool byte accounting overflow");
+        self.pending_scrubs += 1;
+        true
+    }
+
+    /// Returns a scrubbed memory to its bucket. Budget was claimed by
+    /// `reserve_for_recycle`.
+    pub(super) fn finish_recycle(&mut self, spec: SharedMemorySpec, memory: SharedMemory) {
         self.buckets.entry(spec).or_default().push(memory);
+        self.pending_scrubs = self
+            .pending_scrubs
+            .checked_sub(1)
+            .expect("shared-memory pool finished a recycle it never reserved");
+        self.recycled.notify_one();
     }
 }
 
-pub(super) fn zero_shared_memory(memory: &SharedMemory) {
-    let data = memory.data();
-    let ptr = data.as_ptr().cast::<u8>() as *mut u8;
-    // The pool only calls this after the previous Store/Instance holders have
-    // been dropped, before handing the memory to a new guest.
-    unsafe {
-        core::ptr::write_bytes(ptr, 0, memory.data_size());
+/// Acquires a shared memory, waiting for in-flight recycles when a fresh
+/// allocation fails. Fast spawn/exit cycles can outrun the background
+/// scrub: the exited guest's memory holds pool budget (and user RAM)
+/// until its scrub lands, so a burst of spawns would otherwise allocate
+/// fresh multi-hundred-megabyte memories until the user pool is empty.
+/// Waiting turns that transient shortage into backpressure; the error
+/// only propagates once no recycle is in flight to satisfy the retry.
+pub(super) async fn acquire_or_wait_for_recycle(
+    pool: &Mutex<SharedMemoryPool>,
+    engine: &wasmtime::Engine,
+    spec: SharedMemorySpec,
+) -> Result<SharedMemory, ProgramExecError> {
+    loop {
+        let recycled = {
+            let mut guard = pool.lock();
+            match guard.acquire(engine, spec) {
+                Ok(memory) => return Ok(memory),
+                Err(error) => {
+                    if guard.pending_scrubs == 0 {
+                        return Err(error);
+                    }
+                    guard.recycled.clone()
+                }
+            }
+        };
+        // The kernel Notify stores permits, so a recycle that lands
+        // between releasing the lock and awaiting is still observed.
+        recycled.notified().await;
+    }
+}
+
+/// Recycles an exited guest's shared memory through a background scrub
+/// task: zeroing a multi-megabyte memory is the dominant cost of
+/// re-pooling, and doing it here would land it on the child's exit path
+/// (which `proc_join` waits on). The scrub overlaps with other guests
+/// on other processors and yields between chunks.
+pub(super) fn spawn_scrubbed_recycle<CpuImpl>(
+    spawner: &crate::Spawner<CpuImpl>,
+    pool: Arc<Mutex<SharedMemoryPool>>,
+    spec: SharedMemorySpec,
+    memory: SharedMemory,
+) where
+    CpuImpl: Cpu + Clone,
+{
+    if !pool.lock().reserve_for_recycle(spec, &memory) {
+        return;
+    }
+    spawner.spawn_detached(async move {
+        scrub_shared_memory(&memory).await;
+        pool.lock().finish_recycle(spec, memory);
+    });
+}
+
+/// Bytes zeroed between cooperative yields while scrubbing. Sized so a
+/// 512 MiB memory turns around in ~128 yields: spawn bursts wait on the
+/// scrub through `acquire_or_wait_for_recycle`, so recycle latency is
+/// spawn latency under pressure, while each chunk still clears in well
+/// under a millisecond and keeps the executor responsive.
+const SCRUB_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+
+pub(super) async fn scrub_shared_memory(memory: &SharedMemory) {
+    let len = memory.data_size();
+    let mut offset = 0;
+    while offset < len {
+        let chunk = SCRUB_CHUNK_BYTES.min(len - offset);
+        // Re-derive the pointer each chunk: holding a raw pointer across
+        // the yield would make the scrub future non-Send.
+        let base = memory.data().as_ptr().cast::<u8>() as *mut u8;
+        // SAFETY: the previous Store/Instance holders have been dropped
+        // and the memory is owned by the scrub task until it re-enters
+        // the pool, so no guest can observe the partial zeroing.
+        unsafe {
+            core::ptr::write_bytes(base.add(offset), 0, chunk);
+        }
+        offset += chunk;
+        if offset < len {
+            crate::exec::yield_now().await;
+        }
     }
 }
 

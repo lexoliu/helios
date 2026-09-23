@@ -10,8 +10,14 @@
 .equ HELIOS_X86_DATA_SELECTOR, 0x10
 .equ HELIOS_X86_LONG_MODE_CODE_SELECTOR, 0x18
 .equ HELIOS_X86_CR0_PROTECTED_MODE_ENABLE, 0x00000001
+.equ HELIOS_X86_CR0_MONITOR_COPROCESSOR, 0x00000002
+.equ HELIOS_X86_CR0_EMULATE_COPROCESSOR, 0x00000004
+.equ HELIOS_X86_CR0_TASK_SWITCHED, 0x00000008
 .equ HELIOS_X86_CR0_ENABLE_PAGING, 0x80000000
 .equ HELIOS_X86_CR4_ENABLE_PAE, 0x00000020
+# OSFXSR | OSXMMEXCPT: the kernel is compiled with SSE, so it must be
+# enabled before the trampoline calls into any compiler-generated code.
+.equ HELIOS_X86_CR4_ENABLE_SSE, 0x00000600
 .equ HELIOS_X86_EFER_MSR, 0xC0000080
 .equ HELIOS_X86_EFER_LONG_MODE_ENABLE, 0x00000100
 .equ HELIOS_X86_EFER_NO_EXECUTE_ENABLE, 0x00000800
@@ -88,7 +94,7 @@ helios_x86_secondary_wakeup_protected_mode_start:
     mov cr3, eax
 
     mov eax, cr4
-    or eax, HELIOS_X86_CR4_ENABLE_PAE
+    or eax, HELIOS_X86_CR4_ENABLE_PAE | HELIOS_X86_CR4_ENABLE_SSE
     mov cr4, eax
 
     mov ecx, HELIOS_X86_EFER_MSR
@@ -97,7 +103,8 @@ helios_x86_secondary_wakeup_protected_mode_start:
     wrmsr
 
     mov eax, cr0
-    or eax, HELIOS_X86_CR0_ENABLE_PAGING
+    and eax, ~(HELIOS_X86_CR0_EMULATE_COPROCESSOR | HELIOS_X86_CR0_TASK_SWITCHED)
+    or eax, HELIOS_X86_CR0_ENABLE_PAGING | HELIOS_X86_CR0_MONITOR_COPROCESSOR
     mov cr0, eax
 helios_x86_secondary_wakeup_long_mode_jump:
     .byte 0xea
@@ -114,6 +121,8 @@ helios_x86_secondary_wakeup_long_mode_start:
     xor eax, eax
     mov fs, ax
     mov gs, ax
+
+    fninit
 
     mov rsp, qword ptr [rip + helios_x86_secondary_wakeup_stack_top]
     xor rbp, rbp

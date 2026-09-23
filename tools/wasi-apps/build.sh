@@ -114,8 +114,18 @@ build_quickjs_wasm() {
     llvm_ranlib="$(command -v llvm-ranlib || true)"
   fi
   if [[ -z "$llvm_ar" || -z "$llvm_ranlib" ]]; then
-    llvm_ar="/opt/homebrew/opt/llvm/bin/llvm-ar"
-    llvm_ranlib="/opt/homebrew/opt/llvm/bin/llvm-ranlib"
+    if [[ -x /opt/homebrew/opt/llvm/bin/llvm-ar && -x /opt/homebrew/opt/llvm/bin/llvm-ranlib ]]; then
+      llvm_ar="/opt/homebrew/opt/llvm/bin/llvm-ar"
+      llvm_ranlib="/opt/homebrew/opt/llvm/bin/llvm-ranlib"
+    else
+      # No LLVM binutils on this host; zig ships them as subcommands.
+      # CMake needs plain executables, so wrap the subcommands.
+      llvm_ar="$staging/zig-ar"
+      llvm_ranlib="$staging/zig-ranlib"
+      printf '#!/bin/sh\nexec zig ar "$@"\n' > "$llvm_ar"
+      printf '#!/bin/sh\nexec zig ranlib "$@"\n' > "$llvm_ranlib"
+      chmod +x "$llvm_ar" "$llvm_ranlib"
+    fi
   fi
   if [[ ! -x "$llvm_ar" || ! -x "$llvm_ranlib" ]]; then
     printf 'required LLVM archive tools missing: llvm-ar=%s llvm-ranlib=%s\n' "$llvm_ar" "$llvm_ranlib" >&2

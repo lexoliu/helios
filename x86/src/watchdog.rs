@@ -158,7 +158,11 @@ impl EnhancedPciConfigAccess {
     }
 
     fn mapped_virtual_address(&self, physical_address: usize, bytes: usize) -> Option<usize> {
-        crate::smp::ensure_hhdm_range_mapped(self.physical_memory_offset, physical_address, bytes);
-        self.physical_memory_offset.checked_add(physical_address)
+        // ECAM is MMIO: map it uncacheable rather than as plain HHDM RAM.
+        Some(crate::smp::map_mmio_window(
+            self.physical_memory_offset,
+            physical_address,
+            bytes,
+        ))
     }
 }

@@ -27,9 +27,10 @@ use helios_hal::cpu::{Cpu, HardwarePerfCounters};
 use helios_hal::io::IoError;
 use helios_netstack::{
     DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DNS_PORT, DhcpClientMessage, DhcpDnsServers,
-    DhcpMessageType, DhcpPacket, DnsQuestionWriter, DnsResponse, EthernetFrame, EthernetProtocol,
-    Icmpv4Packet, Icmpv6Packet, IpAddress, IpCidr, IpProtocol, Ipv4Address, Ipv4Cidr, Ipv4Packet,
-    Ipv6Address, Ipv6Packet, MAX_OUTBOUND_FRAMES, NeighborEntry, NetworkInterface as NetworkDevice,
+    DhcpMessageType, DhcpPacket, DnsQuestionWriter, DnsRecordType, DnsResponse, EthernetFrame,
+    EthernetProtocol, Icmpv4Packet, Icmpv6Packet, IpAddress, IpCidr, IpProtocol, Ipv4Address,
+    Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6Cidr, Ipv6Packet, MAX_OUTBOUND_FRAMES, NeighborEntry,
+    NetworkInterface as NetworkDevice,
     OutboundBatchStatus, PacketBuffer, Route, RouteTable, RxChecksumOffload, Stack, StackConfig,
     StackError, StackEvent, StackInstant, TcpConnectState, TcpConnectTerminalError, TcpEndpoint,
     TcpListenBacklog, TcpPacket, TcpReadIntoState, TcpReadState, UdpEndpoint, UdpPacket,
@@ -37,6 +38,7 @@ use helios_netstack::{
 };
 use spin::{Mutex as SpinMutex, RwLock as SpinRwLock};
 
+use crate::SocketReadiness;
 use crate::{
     ComponentNetworkService, ComponentRuntimeState, DnsError, DnsErrorKind,
     Ipv4Address as KernelIpv4Address, Ipv4Cidr as KernelIpv4Cidr, Ipv4Route as KernelIpv4Route,
@@ -116,9 +118,17 @@ where
 
 struct NetworkControlPlane {
     ipv4_addresses: SnapshotCell<NetworkIpv4AddressTable>,
+    /// SLAAC-configured and link-local IPv6 addresses. Republished to
+    /// every shard the same way the IPv4 table is, so a socket created
+    /// on any processor sees the addresses autoconfiguration installed
+    /// on the shard that received the Router Advertisement.
+    ipv6_addresses: SnapshotCell<NetworkIpv6AddressTable>,
     routes: SnapshotCell<RouteTable>,
     neighbors: SnapshotCell<NetworkNeighborTable>,
     dns_servers: SnapshotCell<DhcpDnsServers>,
+    /// Recursive resolvers learned from a Router Advertisement's RDNSS
+    /// option, the IPv6 counterpart of the DHCPv4 resolver list.
+    ipv6_dns_servers: SnapshotCell<NetworkIpv6DnsServers>,
 }
 
 struct SnapshotCell<T> {
@@ -128,6 +138,16 @@ struct SnapshotCell<T> {
 #[derive(Clone, Debug)]
 struct NetworkIpv4AddressTable {
     entries: Vec<Ipv4Cidr>,
+}
+
+#[derive(Clone, Debug)]
+struct NetworkIpv6AddressTable {
+    entries: Vec<Ipv6Cidr>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct NetworkIpv6DnsServers {
+    entries: Vec<Ipv6Address>,
 }
 
 #[derive(Clone, Debug)]
@@ -211,9 +231,11 @@ impl NetworkControlPlane {
     fn new() -> Self {
         Self {
             ipv4_addresses: SnapshotCell::new(NetworkIpv4AddressTable::new()),
+            ipv6_addresses: SnapshotCell::new(NetworkIpv6AddressTable::new()),
             routes: SnapshotCell::new(RouteTable::new()),
             neighbors: SnapshotCell::new(NetworkNeighborTable::new()),
             dns_servers: SnapshotCell::new(DhcpDnsServers::new()),
+            ipv6_dns_servers: SnapshotCell::new(NetworkIpv6DnsServers::default()),
         }
     }
 
@@ -221,6 +243,12 @@ impl NetworkControlPlane {
         shard
             .stack
             .replace_ipv4_addresses(self.ipv4_addresses.load_full().entries.iter().copied());
+        shard
+            .stack
+            .replace_ipv6_addresses(self.ipv6_addresses.load_full().entries.iter().copied());
+        shard
+            .stack
+            .replace_ipv6_dns_servers(self.ipv6_dns_servers.load_full().entries.iter().copied());
         shard
             .stack
             .replace_routes(self.routes.load_full().as_ref().clone());
@@ -234,6 +262,14 @@ impl NetworkControlPlane {
         self.ipv4_addresses
             .store(StdArc::new(NetworkIpv4AddressTable {
                 entries: shard.stack.ipv4_addresses().collect(),
+            }));
+        self.ipv6_addresses
+            .store(StdArc::new(NetworkIpv6AddressTable {
+                entries: shard.stack.ipv6_addresses().collect(),
+            }));
+        self.ipv6_dns_servers
+            .store(StdArc::new(NetworkIpv6DnsServers {
+                entries: shard.stack.ipv6_dns_servers().collect(),
             }));
         self.routes.store(StdArc::new(shard.stack.routes().clone()));
         self.neighbors.store(StdArc::new(NetworkNeighborTable {
@@ -285,6 +321,10 @@ impl NetworkControlPlane {
                 _ => None,
             })
             .collect()
+    }
+
+    fn list_ipv6_addresses(&self) -> Vec<Ipv6Cidr> {
+        self.ipv6_addresses.load_full().entries.clone()
     }
 
     fn list_ipv4_addresses(&self) -> Vec<KernelIpv4Cidr> {
@@ -339,6 +379,14 @@ impl NetworkIpv4AddressTable {
 
     fn clear(&mut self) {
         self.entries.clear();
+    }
+}
+
+impl NetworkIpv6AddressTable {
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
     }
 }
 
@@ -527,18 +575,90 @@ where
         .await
     }
 
+    /// Picks the first resolved address this interface can actually
+    /// reach, in resolver order.
+    ///
+    /// A dual-family lookup routinely returns AAAA records on a link
+    /// where nothing configured an IPv6 address, and vice versa, so
+    /// connecting blindly to the first answer would fail on exactly the
+    /// hosts that also published a usable one. Addresses of a family
+    /// this interface holds no source address for are skipped; when no
+    /// family is configured the resolver order stands, leaving the
+    /// unreachability to surface from the send path.
+    fn first_usable_address(
+        &self,
+        addresses: impl IntoIterator<Item = NetworkIpAddress>,
+    ) -> Option<IpAddress> {
+        let has_ipv4 = !self.inner.control.list_ipv4_addresses().is_empty();
+        let has_ipv6 = !self.inner.control.list_ipv6_addresses().is_empty();
+        let mut fallback = None;
+        for address in addresses {
+            let address = map_network_ip_address(address);
+            let usable = match address {
+                IpAddress::Ipv4(_) => has_ipv4,
+                IpAddress::Ipv6(_) => has_ipv6,
+            };
+            if usable {
+                return Some(address);
+            }
+            fallback.get_or_insert(address);
+        }
+        fallback
+    }
+
     async fn wait_for_ipv4_configured<Error>(
         &self,
         deadline_nanos: u64,
         timeout_error: fn() -> Error,
         configuration_error: fn(NetworkConfigurationError) -> Error,
     ) -> Result<(), Error> {
+        self.wait_for_configured(deadline_nanos, timeout_error, configuration_error, |ready| {
+            ready
+        })
+        .await
+    }
+
+    /// Waits until a resolver is reachable in either family.
+    ///
+    /// DNS does not require IPv4 specifically: a link that only ever
+    /// completed IPv6 autoconfiguration still has a resolver if a Router
+    /// Advertisement carried an RDNSS option, and the query goes out
+    /// over IPv6. Gating this on the DHCPv4 lease alone would make that
+    /// path unreachable.
+    async fn wait_for_dns_configured<Error>(
+        &self,
+        deadline_nanos: u64,
+        timeout_error: fn() -> Error,
+        configuration_error: fn(NetworkConfigurationError) -> Error,
+    ) -> Result<(), Error> {
+        self.wait_for_configured(deadline_nanos, timeout_error, configuration_error, |ready| {
+            ready || self.has_ipv6_resolver()
+        })
+        .await
+    }
+
+    /// Whether IPv6 autoconfiguration produced both an address to send
+    /// from and a resolver to send to.
+    fn has_ipv6_resolver(&self) -> bool {
+        self.inner
+            .state
+            .with(|state| state.stack.ipv6_dns_servers().next().is_some())
+            && !self.inner.control.list_ipv6_addresses().is_empty()
+    }
+
+    async fn wait_for_configured<Error>(
+        &self,
+        deadline_nanos: u64,
+        timeout_error: fn() -> Error,
+        configuration_error: fn(NetworkConfigurationError) -> Error,
+        ready: impl Fn(bool) -> bool,
+    ) -> Result<(), Error> {
         loop {
-            if self
+            let ipv4_configured = self
                 .drive_ipv4_configuration()
                 .await
-                .map_err(configuration_error)?
-            {
+                .map_err(configuration_error)?;
+            if ready(ipv4_configured) {
                 return Ok(());
             }
             if self.now_nanos() >= deadline_nanos {
@@ -556,12 +676,22 @@ where
         // DHCP runs on the shard that owns DHCP_CLIENT_PORT (68);
         // since 68 < EPHEMERAL_PORT_START it always routes to
         // shard 0, which is where DHCP responses also demux back.
+        //
+        // IPv6 stateless autoconfiguration rides the same poll and the
+        // same shard. Router Advertisements are ICMPv6, which the RX
+        // demux has no local port for and therefore also routes to
+        // shard 0, so the shard that solicits is the shard that
+        // receives — and `publish_from_shard` republishes the resulting
+        // addresses and routes to the rest of the set.
         let configured = self
             .inner
             .state
             .with_local_port(DHCP_CLIENT_PORT, |state| {
                 state
                     .drive_dhcp(now)
+                    .map_err(NetworkConfigurationError::Control)?;
+                state
+                    .drive_ipv6_autoconfig(now)
                     .map_err(NetworkConfigurationError::Control)?;
                 if state.is_configured() {
                     self.inner.control.publish_from_shard(state);
@@ -964,7 +1094,12 @@ mod tests {
         });
 
         state
-            .start_tcp_connect(IpAddress::Ipv6(remote), 443, 0)
+            .start_tcp_connect(
+                IpAddress::Ipv6(remote),
+                443,
+                0,
+                helios_netstack::DEFAULT_HOP_LIMIT,
+            )
             .expect("IPv6 TCP connect should allocate a socket");
         state
             .stack
@@ -1450,6 +1585,7 @@ mod tests {
                 NetworkIpAddress::Ipv6(local),
                 8080,
                 TcpListenBacklog::new(1),
+                helios_netstack::DEFAULT_HOP_LIMIT,
             )
             .expect("IPv6 TCP listen should allocate a listener");
 

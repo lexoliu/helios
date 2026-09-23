@@ -238,20 +238,49 @@ impl InputStream for ChannelInputStream {
     }
 }
 
+/// Bytes a p2 `check-write` permit is worth while the channel has room.
+const P2_CHANNEL_WRITE_PERMIT_BYTES: usize = 64 * 1024;
+
 /// WASI P2 adapter: exposes a kernel `ByteWriter` as an `OutputStream`.
+///
+/// The p2 contract is permit-driven and `write` must never block, so a
+/// full channel is handled the same way the host-file output stream
+/// handles a 9p round trip: `check_write` withholds the permit, one batch
+/// is parked in `pending`, and `Pollable::ready` completes it once the
+/// reader has drained. No byte is dropped and a transiently full channel
+/// is never reported as an error.
 pub struct ChannelOutputStream {
     writer: ByteWriter,
+    pending: Option<Bytes>,
 }
 
 impl ChannelOutputStream {
     pub fn new(writer: ByteWriter) -> Self {
-        Self { writer }
+        Self {
+            writer,
+            pending: None,
+        }
+    }
+
+    /// Hand the parked batch to the channel, waiting for room.
+    async fn flush_pending(&mut self) {
+        let Some(bytes) = self.pending.take() else {
+            // Nothing parked: report ready as soon as the channel could
+            // take a batch, so the guest's next `check-write` is non-zero.
+            self.writer.writable().await;
+            return;
+        };
+        // A vanished reader is surfaced by the next `check_write`/`write`
+        // as `StreamError::Closed`; there is nothing left to deliver.
+        let _: Result<(), crate::ClosedPeer> = self.writer.write(bytes).await;
     }
 }
 
 #[wasmtime_wasi_io::async_trait]
 impl Pollable for ChannelOutputStream {
-    async fn ready(&mut self) {}
+    async fn ready(&mut self) {
+        self.flush_pending().await;
+    }
 }
 
 #[wasmtime_wasi_io::async_trait]
@@ -260,10 +289,30 @@ impl OutputStream for ChannelOutputStream {
         if self.writer.is_reader_closed() {
             return Err(StreamError::Closed);
         }
-        self.writer.write(bytes).map_err(|_| StreamError::Closed)
+        if self.pending.is_some() {
+            return Err(StreamError::trap(
+                "channel output stream write exceeded its check-write permit",
+            ));
+        }
+        match self.writer.try_write(bytes) {
+            crate::TryWrite::Written => Ok(()),
+            // Park the batch rather than dropping it or erroring: `ready`
+            // completes it and `check_write` withholds the next permit
+            // until then.
+            crate::TryWrite::Full(bytes) => {
+                self.pending = Some(bytes);
+                Ok(())
+            }
+            crate::TryWrite::Closed => Err(StreamError::Closed),
+        }
     }
 
     fn flush(&mut self) -> StreamResult<()> {
+        // A parked batch is drained by `ready`, which `check_write` pends
+        // on, so there is nothing to push here.
+        if self.writer.is_reader_closed() {
+            return Err(StreamError::Closed);
+        }
         Ok(())
     }
 
@@ -271,7 +320,10 @@ impl OutputStream for ChannelOutputStream {
         if self.writer.is_reader_closed() {
             return Err(StreamError::Closed);
         }
-        Ok(64 * 1024)
+        if self.pending.is_some() || !self.writer.is_writable() {
+            return Ok(0);
+        }
+        Ok(P2_CHANNEL_WRITE_PERMIT_BYTES)
     }
 }
 
@@ -290,7 +342,14 @@ pub enum StdioOutputStream {
 
 #[wasmtime_wasi_io::async_trait]
 impl Pollable for StdioOutputStream {
-    async fn ready(&mut self) {}
+    async fn ready(&mut self) {
+        match self {
+            // The child channel is bounded, so readiness is real work:
+            // complete a parked batch and wait for room.
+            StdioOutputStream::Child(inner) => inner.ready().await,
+            StdioOutputStream::Serial(_) | StdioOutputStream::Trace => {}
+        }
+    }
 }
 
 #[wasmtime_wasi_io::async_trait]

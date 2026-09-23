@@ -62,7 +62,9 @@ pub(crate) fn open_child_stdio(stdout: ChildStdout, stdin: ChildStdin) -> Result
 pub(crate) fn open_pty_transport() -> Result<PtyTransport> {
     let mut master_fd = 0;
     let mut slave_fd = 0;
-    let mut name = [0_i8; 128];
+    // `c_char` is i8 on x86-64 Linux but u8 on aarch64 Linux; spell the
+    // libc type so the buffer matches on both.
+    let mut name = [0 as libc::c_char; 128];
     let status = unsafe {
         libc::openpty(
             &mut master_fd,

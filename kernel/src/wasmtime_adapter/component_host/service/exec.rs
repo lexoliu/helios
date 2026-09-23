@@ -299,11 +299,14 @@ where
         output_mode: output_mode.clone(),
         core_linker: preview1_core_linker.clone(),
     });
+    let recycle_spawner = exec_context.spawner.clone();
     let shared_memory_prepare_profile =
         start_program_kernel_profile(&profile_runtime_state, &profile_cpu);
     let imported_memory_spec = imported_shared_memory_spec_with_user_budget(&compiled.module)?;
     let imported_memory = match imported_memory_spec {
-        Some(spec) => Some(shared_memory_pool.lock().acquire(engine.raw(), spec)?),
+        Some(spec) => {
+            Some(acquire_or_wait_for_recycle(&shared_memory_pool, engine.raw(), spec).await?)
+        }
         None => None,
     };
     record_program_kernel_profile_sample(
@@ -520,7 +523,7 @@ where
 
     if recycle_allowed {
         if let (Some(spec), Some(memory)) = (imported_memory_spec, recycle_memory) {
-            shared_memory_pool.lock().recycle(spec, memory);
+            spawn_scrubbed_recycle(&recycle_spawner, shared_memory_pool.clone(), spec, memory);
         }
     }
     match completion {
@@ -757,9 +760,12 @@ where
     record_program_kernel_profile_sample(store_teardown_profile, "core-store-teardown-rewind");
 
     if recycle_allowed {
-        shared_memory_pool
-            .lock()
-            .recycle(memory_spec, recycle_memory);
+        spawn_scrubbed_recycle(
+            &spawner,
+            shared_memory_pool.clone(),
+            memory_spec,
+            recycle_memory,
+        );
     }
     match completion {
         CoreModuleRunCompletion::Exit(result) => result,
@@ -1096,7 +1102,8 @@ where
                 stack_pointer,
                 memory_stack.clone(),
                 rewind_stack.clone(),
-            )?;
+            )
+            .await?;
             let snapshot_bytes = child_pid.to_le_bytes();
             if ret_pid >= stack_pointer && ret_pid.saturating_add(4) <= stack_upper {
                 let offset =
@@ -1360,7 +1367,7 @@ pub(super) fn trace_wasix_process_snapshot(snapshot: &WasixProcessSnapshot, snap
     );
 }
 
-pub(super) fn spawn_wasix_fork_child<CpuImpl, HostFs>(
+pub(super) async fn spawn_wasix_fork_child<CpuImpl, HostFs>(
     store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, HostFs>>,
     stack_lower: u32,
     stack_upper: u32,
@@ -1380,8 +1387,10 @@ where
             kind: ProgramExecErrorKind::InvalidBinary,
             detail: ProgramExecErrorDetail::ImportedSharedMemoryContractInvalid,
         })?;
-    let data = memory.data();
-    let current_bytes = data.len();
+    // Clone the parent memory handle and re-derive its data view after
+    // the acquire below: the raw view is not Send across the await.
+    let parent_memory = memory.clone();
+    let current_bytes = parent_memory.data_size();
     let current_pages = current_bytes.div_ceil(WASM_PAGE_SIZE);
     let current_pages = u32::try_from(current_pages).map_err(|_| ProgramExecError {
         kind: ProgramExecErrorKind::OutOfMemory,
@@ -1399,11 +1408,15 @@ where
         initial_pages: current_pages,
         maximum_pages: PROGRAM_SHARED_MEMORY_MAX_PAGES,
     };
-    let fork_memory = service
-        .inner
-        .shared_memory_pool
-        .lock()
-        .acquire(service.inner.engine.raw(), memory_spec)?;
+    // Fork bursts in shell pipelines outrun the background scrub just
+    // like exec spawns do; wait for an in-flight recycle before treating
+    // the shortage as a real OOM.
+    let fork_memory = acquire_or_wait_for_recycle(
+        &service.inner.shared_memory_pool,
+        service.inner.engine.raw(),
+        memory_spec,
+    )
+    .await?;
     let fork_data = fork_memory.data();
     if fork_data.len() < current_bytes {
         return Err(ProgramExecError {
@@ -1418,7 +1431,7 @@ where
         .then(|| store.data().cpu.now().ticks());
     unsafe {
         core::ptr::copy_nonoverlapping(
-            data.as_ptr().cast::<u8>(),
+            parent_memory.data().as_ptr().cast::<u8>(),
             fork_data.as_ptr().cast::<u8>().cast_mut(),
             current_bytes,
         );

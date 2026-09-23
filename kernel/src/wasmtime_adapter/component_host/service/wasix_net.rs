@@ -516,7 +516,7 @@ where
             Some(entry) => entry,
             None => return p1::errno::OVERFLOW,
         };
-        let status = write_wasix_addr_ip4(caller, memory, entry, *address);
+        let status = write_wasix_addr_ip(caller, memory, entry, *address);
         if status != p1::errno::SUCCESS {
             return status;
         }
@@ -1033,26 +1033,28 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
+    // A bind never names a local address in WASIX, only a port, so the
+    // local address is the socket family's wildcard: `0.0.0.0` or `::`.
     match caller.data().descriptors.get(fd) {
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Bound {
             local_port,
+            family,
             ..
-        }))) => write_wasix_addr_port_ip4(
-            caller,
-            memory,
-            ret_addr,
-            crate::Ipv4Address::new([0, 0, 0, 0]),
-            *local_port,
-        ),
+        }))) => {
+            let (address, local_port) = (family.unspecified_address(), *local_port);
+            write_wasix_addr_port(caller, memory, ret_addr, address, local_port)
+        }
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
-            WasixTcpSocket::Bound { local_port, .. } | WasixTcpSocket::Listening { local_port, .. },
-        ))) => write_wasix_addr_port_ip4(
-            caller,
-            memory,
-            ret_addr,
-            crate::Ipv4Address::new([0, 0, 0, 0]),
-            *local_port,
-        ),
+            WasixTcpSocket::Bound {
+                local_port, family, ..
+            }
+            | WasixTcpSocket::Listening {
+                local_port, family, ..
+            },
+        ))) => {
+            let (address, local_port) = (family.unspecified_address(), *local_port);
+            write_wasix_addr_port(caller, memory, ret_addr, address, local_port)
+        }
         Some(Preview1Descriptor::Socket(_)) => {
             write_wasix_addr_port_unspec(caller, memory, ret_addr)
         }
@@ -1080,7 +1082,7 @@ where
                 peer_port,
                 ..
             },
-        ))) => write_wasix_addr_port_ip4(caller, memory, ret_addr, *peer_address, *peer_port),
+        ))) => write_wasix_addr_port(caller, memory, ret_addr, *peer_address, *peer_port),
         Some(Preview1Descriptor::Socket(_)) => {
             write_wasix_addr_port_unspec(caller, memory, ret_addr)
         }
@@ -1095,8 +1097,10 @@ pub(super) fn wasix_validate_network_socket_request(
     proto: i32,
 ) -> Result<(), i32> {
     match af {
-        WASIX_ADDRESS_FAMILY_UNSPEC_I32 | WASIX_ADDRESS_FAMILY_IP_INET4_I32 => {}
-        WASIX_ADDRESS_FAMILY_IP_INET6_I32 | WASIX_ADDRESS_FAMILY_UNIX_I32 => {
+        WASIX_ADDRESS_FAMILY_UNSPEC_I32
+        | WASIX_ADDRESS_FAMILY_IP_INET4_I32
+        | WASIX_ADDRESS_FAMILY_IP_INET6_I32 => {}
+        WASIX_ADDRESS_FAMILY_UNIX_I32 => {
             return Err(p1::errno::NOTSUP);
         }
         _ => return Err(p1::errno::INVAL),
@@ -1142,6 +1146,12 @@ where
     if let Err(errno) = wasix_validate_network_socket_request(af, socktype, proto) {
         return errno;
     }
+    // AF_UNSPEC keeps the historical IPv4 default, matching what a
+    // `socket(0, SOCK_STREAM, 0)` caller gets from WASIX today.
+    let family = match af {
+        WASIX_ADDRESS_FAMILY_IP_INET6_I32 => WasixSocketFamily::Ipv6,
+        _ => WasixSocketFamily::Ipv4,
+    };
     let status = match socktype {
         WASIX_SOCK_TYPE_STREAM => caller.data().require_tcp_authority(),
         WASIX_SOCK_TYPE_DGRAM => caller.data().require_udp_authority(),
@@ -1159,11 +1169,13 @@ where
     let descriptor = match socktype {
         WASIX_SOCK_TYPE_STREAM => {
             Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(WasixTcpSocket::Unconnected {
+                family,
                 options: WasixSocketOptions::default(),
             }))
         }
         WASIX_SOCK_TYPE_DGRAM => {
             Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Unbound {
+                family,
                 options: WasixSocketOptions::default(),
             }))
         }
@@ -1441,7 +1453,58 @@ where
             None => p1::errno::BADF,
         };
     };
-    descriptor.options_mut().set_size(option, size)
+    let status = descriptor.options_mut().set_size(option, size);
+    if status != p1::errno::SUCCESS || option != WASIX_SOCK_OPTION_TTL {
+        return status;
+    }
+    // A socket that already exists in the netstack takes the new TTL now;
+    // one that has not connected, listened, or bound yet gets it applied at
+    // that point, so no packet ever leaves with a stale value.
+    let hop_limit = descriptor.options().hop_limit();
+    let target = wasix_socket_backend_handle(descriptor);
+    let Some(service) = caller.data().runtime_state.network_service() else {
+        return p1::errno::SUCCESS;
+    };
+    match target {
+        Some(WasixSocketBackendHandle::TcpStream(stream)) => service
+            .tcp_set_hop_limit(stream, hop_limit)
+            .map_or_else(p1_errno_from_tcp_error, |()| p1::errno::SUCCESS),
+        Some(WasixSocketBackendHandle::TcpListener(listener)) => service
+            .tcp_listener_set_hop_limit(listener, hop_limit)
+            .map_or_else(p1_errno_from_tcp_error, |()| p1::errno::SUCCESS),
+        Some(WasixSocketBackendHandle::UdpSocket(socket)) => service
+            .udp_set_hop_limit(socket, hop_limit)
+            .map_or_else(p1_errno_from_udp_error, |()| p1::errno::SUCCESS),
+        None => p1::errno::SUCCESS,
+    }
+}
+
+/// The netstack handle a WASIX socket descriptor currently owns, if any.
+enum WasixSocketBackendHandle {
+    TcpStream(u64),
+    TcpListener(u64),
+    UdpSocket(u64),
+}
+
+fn wasix_socket_backend_handle(
+    descriptor: &WasixSocketDescriptor,
+) -> Option<WasixSocketBackendHandle> {
+    match descriptor {
+        WasixSocketDescriptor::Tcp(WasixTcpSocket::Connected { stream, .. }) => {
+            Some(WasixSocketBackendHandle::TcpStream(*stream))
+        }
+        WasixSocketDescriptor::Tcp(WasixTcpSocket::Listening { listener, .. }) => {
+            Some(WasixSocketBackendHandle::TcpListener(*listener))
+        }
+        WasixSocketDescriptor::Udp(WasixUdpSocket::Bound { socket, .. }) => {
+            Some(WasixSocketBackendHandle::UdpSocket(*socket))
+        }
+        WasixSocketDescriptor::Tcp(
+            WasixTcpSocket::Unconnected { .. } | WasixTcpSocket::Bound { .. },
+        )
+        | WasixSocketDescriptor::Udp(WasixUdpSocket::Unbound { .. })
+        | WasixSocketDescriptor::Pair { .. } => None,
+    }
 }
 
 pub(super) fn wasix_sock_get_opt_size<CpuImpl, HostFs>(
@@ -1611,7 +1674,14 @@ where
                 return p1::errno::BADF;
             };
             let options = *slot.options();
+            let family = slot.family();
+            // Nothing can leave a datagram socket before its bind completes,
+            // so applying the descriptor's TTL here covers every packet.
+            if let Err(error) = service.udp_set_hop_limit(binding.socket, options.hop_limit()) {
+                return p1_errno_from_udp_error(error);
+            }
             *slot = WasixUdpSocket::Bound {
+                family,
                 socket: binding.socket,
                 local_port: binding.local_port,
                 options,
@@ -1629,6 +1699,7 @@ where
             };
             let options = *slot.options();
             *slot = WasixTcpSocket::Bound {
+                family: slot.family(),
                 local_port: port,
                 options,
             };
@@ -1665,25 +1736,28 @@ where
         Ok(backlog) => backlog,
         Err(_) => return p1::errno::OVERFLOW,
     };
-    let local_port = match caller.data().descriptors.get(fd) {
+    let (local_port, hop_limit, family) = match caller.data().descriptors.get(fd) {
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
-            WasixTcpSocket::Unconnected { .. },
-        ))) => 0,
+            WasixTcpSocket::Unconnected { options, family },
+        ))) => (0, options.hop_limit(), *family),
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(WasixTcpSocket::Bound {
             local_port,
-            ..
-        }))) => *local_port,
+            options,
+            family,
+        }))) => (*local_port, options.hop_limit(), *family),
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(_))) => {
             return p1::errno::INVAL;
         }
         Some(_) => return p1::errno::NOTSOCK,
         None => return p1::errno::BADF,
     };
+    // A wildcard listen means `::` on an AF_INET6 socket, not `0.0.0.0`.
     let listener = match service
         .tcp_listen(
-            crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([0, 0, 0, 0])),
+            family.unspecified_address(),
             local_port,
             backlog,
+            hop_limit,
         )
         .await
     {
@@ -1697,6 +1771,7 @@ where
     };
     let options = *slot.options();
     *slot = WasixTcpSocket::Listening {
+        family,
         listener: listener.listener,
         local_port: listener.local_port,
         options,
@@ -1722,12 +1797,15 @@ where
     if status != p1::errno::SUCCESS {
         return status;
     }
-    let (listener, accept_timeout) = match caller.data().descriptors.get(fd) {
+    let (listener, accept_timeout, family) = match caller.data().descriptors.get(fd) {
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
             WasixTcpSocket::Listening {
-                listener, options, ..
+                listener,
+                options,
+                family,
+                ..
             },
-        ))) => (*listener, options.accept_timeout),
+        ))) => (*listener, options.accept_timeout, *family),
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(_))) => {
             return p1::errno::INVAL;
         }
@@ -1746,12 +1824,10 @@ where
         Ok(accepted) => accepted,
         Err(error) => return p1_errno_from_tcp_error_for_fdflags(error, fdflags),
     };
-    let peer_address = match accepted.address {
-        crate::NetworkIpAddress::Ipv4(address) => address,
-        crate::NetworkIpAddress::Ipv6(_) => return p1::errno::NOTSUP,
-    };
+    let peer_address = accepted.address;
     let descriptor =
         Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(WasixTcpSocket::Connected {
+            family,
             stream: accepted.stream,
             peer_address,
             peer_port: accepted.port,
@@ -1771,7 +1847,7 @@ where
         return status;
     }
     if ret_addr != 0 {
-        return write_wasix_addr_port_ip4(caller, memory, ret_addr, peer_address, accepted.port);
+        return write_wasix_addr_port(caller, memory, ret_addr, peer_address, accepted.port);
     }
     p1::errno::SUCCESS
 }
@@ -1819,14 +1895,20 @@ where
     if status != p1::errno::SUCCESS {
         return status;
     }
-    let (local_port, connect_timeout) = match caller.data().descriptors.get(fd) {
+    let (local_port, connect_timeout, hop_limit, family) = match caller.data().descriptors.get(fd) {
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
-            WasixTcpSocket::Unconnected { options },
-        ))) => (0, options.connect_timeout),
+            WasixTcpSocket::Unconnected { options, family },
+        ))) => (0, options.connect_timeout, options.hop_limit(), *family),
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(WasixTcpSocket::Bound {
             local_port,
             options,
-        }))) => (*local_port, options.connect_timeout),
+            family,
+        }))) => (
+            *local_port,
+            options.connect_timeout,
+            options.hop_limit(),
+            *family,
+        ),
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
             WasixTcpSocket::Connected { .. },
         ))) => return p1::errno::INVAL,
@@ -1839,18 +1921,21 @@ where
         Some(_) => return p1::errno::NOTSOCK,
         None => return p1::errno::BADF,
     };
+    if !family.accepts(address) {
+        return p1::errno::AFNOSUPPORT;
+    }
     let Some(service) = caller.data().runtime_state.network_service() else {
         return p1::errno::NETDOWN;
     };
-    let mut host_buffer = [0; 15];
-    let host = address.write_dotted_decimal(&mut host_buffer);
     let fdflags = match caller.data().descriptors.fdflags(fd) {
         Ok(fdflags) => fdflags,
         Err(errno) => return errno,
     };
     let timeout = wasix_effective_socket_timeout(connect_timeout, fdflags);
+    // The typed address entry point keeps the family intact; formatting
+    // it back into a host string would lose IPv6 outright.
     let stream = match service
-        .tcp_connect_from(host, port, local_port, timeout)
+        .tcp_connect_address(address, port, local_port, hop_limit, timeout)
         .await
     {
         Ok(stream) => stream,
@@ -1863,6 +1948,7 @@ where
     };
     let options = *slot.options();
     *slot = WasixTcpSocket::Connected {
+        family,
         stream,
         peer_address: address,
         peer_port: port,
@@ -1967,11 +2053,7 @@ where
             if status != p1::errno::SUCCESS {
                 return status;
             }
-            let peer_address = match datagram.address {
-                crate::NetworkIpAddress::Ipv4(address) => address,
-                crate::NetworkIpAddress::Ipv6(_) => return p1::errno::NOTSUP,
-            };
-            write_wasix_addr_port_ip4(caller, memory, ret_addr, peer_address, datagram.port)
+            write_wasix_addr_port(caller, memory, ret_addr, datagram.address, datagram.port)
         }
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Unbound {
             ..
@@ -2108,7 +2190,7 @@ where
                 WasixUdpSocket::Bound {
                     socket, options, ..
                 } => (socket, options.send_timeout),
-                WasixUdpSocket::Unbound { options } => {
+                WasixUdpSocket::Unbound { options, family } => {
                     let Some(service) = caller.data().runtime_state.network_service() else {
                         return p1::errno::NETDOWN;
                     };
@@ -2116,12 +2198,18 @@ where
                         Ok(binding) => binding,
                         Err(error) => return p1_errno_from_udp_error(error),
                     };
+                    if let Err(error) =
+                        service.udp_set_hop_limit(binding.socket, options.hop_limit())
+                    {
+                        return p1_errno_from_udp_error(error);
+                    }
                     let Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(slot))) =
                         caller.data_mut().descriptors.get_mut(fd)
                     else {
                         return p1::errno::BADF;
                     };
                     *slot = WasixUdpSocket::Bound {
+                        family,
                         socket: binding.socket,
                         local_port: binding.local_port,
                         options,
@@ -2140,14 +2228,15 @@ where
             let Some(service) = caller.data().runtime_state.network_service() else {
                 return p1::errno::NETDOWN;
             };
-            let mut host_buffer = [0; 15];
-            let host = address.write_dotted_decimal(&mut host_buffer);
             let fdflags = match caller.data().descriptors.fdflags(fd) {
                 Ok(fdflags) => fdflags,
                 Err(errno) => return errno,
             };
             let timeout = wasix_effective_socket_timeout(send_timeout, fdflags);
-            let sent = match service.udp_send(socket, host, port, &bytes, timeout).await {
+            let sent = match service
+                .udp_send_address(socket, address, port, &bytes, timeout)
+                .await
+            {
                 Ok(sent) => sent,
                 Err(error) => return p1_errno_from_udp_error_for_fdflags(error, fdflags),
             };
@@ -2191,14 +2280,51 @@ where
                 Ok(written) => written,
                 Err(_) => return p1::errno::OVERFLOW,
             };
-            if writer.write(bytes).is_err() {
-                return p1::errno::IO;
+            let fdflags = match caller.data().descriptors.fdflags(fd) {
+                Ok(fdflags) => fdflags,
+                Err(errno) => return errno,
+            };
+            if let Err(errno) = p1_send_to_socketpair(&writer, bytes, fdflags).await {
+                return errno;
             }
             p1_write_u32(caller, memory, ret_size, written)
         }
         Some(_) => p1::errno::NOTSOCK,
         None => p1::errno::BADF,
     }
+}
+
+/// Reads one range of a `sock_send_file` source descriptor.
+async fn wasix_read_send_file_range<CpuImpl, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+    file: &crate::wasmtime_adapter::wasi::FsDescriptor,
+    offset: u64,
+    count: usize,
+) -> Result<Bytes, i32>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    if let Some(host_path) = crate::guest_host_share_path(&file.path).map(ToOwned::to_owned) {
+        let service = caller
+            .data()
+            .filesystem
+            .host_service()
+            .map_err(p1_errno_from_fs)?;
+        let max_bytes = u32::try_from(count).map_err(|_| p1::errno::OVERFLOW)?;
+        return service
+            .read_file_range(&host_path, offset, max_bytes)
+            .await
+            .map(Bytes::from)
+            .map_err(|error| {
+                p1_errno_from_fs(crate::wasmtime_adapter::wasi::map_host_fs_error(error))
+            });
+    }
+    caller
+        .data()
+        .filesystem
+        .read_file_chunk(file, offset, count)
+        .map_err(p1_errno_from_fs)
 }
 
 pub(super) async fn wasix_sock_send_file<CpuImpl, HostFs>(
@@ -2233,12 +2359,10 @@ where
         Ok(count) => count,
         Err(_) => return p1::errno::OVERFLOW,
     };
-    let bytes = match caller
-        .data()
-        .filesystem
-        .read_file_chunk(&file, offset, count)
-        .map_err(p1_errno_from_fs)
-    {
+    // `sendfile` reads its source the same way `fd_pread` does: a host-share
+    // file is pulled over 9p for the requested range, everything else comes
+    // from the embedded node list.
+    let bytes = match wasix_read_send_file_range(caller, &file, offset, count).await {
         Ok(bytes) => bytes,
         Err(errno) => return errno,
     };
@@ -2272,7 +2396,17 @@ where
             p1_write_u64(caller, memory, ret_size, written)
         }
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair { writer, .. })) => {
-            if writer.write(bytes).is_err() {
+            let fdflags = match caller.data().descriptors.fdflags(out_fd) {
+                Ok(fdflags) => fdflags,
+                Err(errno) => return errno,
+            };
+            if p1_fdflags_nonblocking(fdflags) {
+                match writer.try_write(bytes) {
+                    crate::TryWrite::Written => {}
+                    crate::TryWrite::Full(_) => return p1::errno::AGAIN,
+                    crate::TryWrite::Closed => return p1::errno::IO,
+                }
+            } else if writer.write(bytes).await.is_err() {
                 return p1::errno::IO;
             }
             p1_write_u64(caller, memory, ret_size, written)
@@ -2283,11 +2417,14 @@ where
     }
 }
 
+/// Reads a `__wasi_addr_port_t`, which carries the address family in
+/// its tag, so both `AF_INET` and `AF_INET6` peers arrive through the
+/// same entry point.
 pub(super) fn wasix_read_addr_port<T>(
     caller: &mut Caller<'_, T>,
     memory: Preview1Memory,
     ptr: u32,
-) -> Result<(Option<crate::Ipv4Address>, u16), i32> {
+) -> Result<(Option<crate::NetworkIpAddress>, u16), i32> {
     let tag = p1_try_read_u8(caller, memory, ptr).map_err(|_| p1::errno::FAULT)?;
     match tag {
         WASIX_ADDRESS_FAMILY_UNSPEC => Ok((None, 0)),
@@ -2302,9 +2439,31 @@ pub(super) fn wasix_read_addr_port<T>(
                 &mut octets,
             )
             .map_err(|_| p1::errno::FAULT)?;
-            Ok((Some(crate::Ipv4Address::new(octets)), port))
+            Ok((
+                Some(crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new(
+                    octets,
+                ))),
+                port,
+            ))
         }
-        WASIX_ADDRESS_FAMILY_IP_INET6 => Err(p1::errno::NOTSUP),
+        WASIX_ADDRESS_FAMILY_IP_INET6 => {
+            let port = p1_try_read_u16(caller, memory, ptr + WASIX_ADDR_PORT_UNION_OFFSET)
+                .map_err(|_| p1::errno::FAULT)?;
+            let mut octets = [0_u8; 16];
+            p1_read_memory_into(
+                caller,
+                memory,
+                ptr + WASIX_ADDR_PORT_IP6_ADDRESS_OFFSET,
+                &mut octets,
+            )
+            .map_err(|_| p1::errno::FAULT)?;
+            Ok((
+                Some(crate::NetworkIpAddress::Ipv6(
+                    helios_netstack::Ipv6Address::new(octets),
+                )),
+                port,
+            ))
+        }
         WASIX_ADDRESS_FAMILY_UNIX => Err(p1::errno::NOTSUP),
         _ => Err(p1::errno::INVAL),
     }
@@ -2489,6 +2648,31 @@ pub(super) fn p1_read_wasix_bool<T>(
     }
 }
 
+/// Writes a `__wasi_addr_t` in the address's own family. The union is
+/// 16 bytes wide, so an IPv6 address fills it exactly and an IPv4 one
+/// occupies its first four bytes.
+pub(super) fn write_wasix_addr_ip<T>(
+    caller: &mut Caller<'_, T>,
+    memory: Preview1Memory,
+    ptr: u32,
+    address: crate::NetworkIpAddress,
+) -> i32 {
+    match address {
+        crate::NetworkIpAddress::Ipv4(address) => {
+            write_wasix_addr_ip4(caller, memory, ptr, address)
+        }
+        crate::NetworkIpAddress::Ipv6(address) => {
+            let octets = address.octets();
+            p1_write_u8(caller, memory, ptr, WASIX_ADDRESS_FAMILY_IP_INET6).max(p1_write_memory(
+                caller,
+                memory,
+                ptr + WASIX_ADDR_IP_UNION_OFFSET,
+                &octets,
+            ))
+        }
+    }
+}
+
 pub(super) fn write_wasix_addr_ip4<T>(
     caller: &mut Caller<'_, T>,
     memory: Preview1Memory,
@@ -2555,6 +2739,38 @@ pub(super) fn write_wasix_route_ip4<T>(
         ptr + WASIX_ROUTE_EXPIRES_AT_OFFSET,
         route.expires_at_nanos(),
     ))
+}
+
+/// Writes a `__wasi_addr_port_t` in the address's own family, so an
+/// `AF_INET6` peer is reported as one rather than being flattened.
+pub(super) fn write_wasix_addr_port<T>(
+    caller: &mut Caller<'_, T>,
+    memory: Preview1Memory,
+    ptr: u32,
+    address: crate::NetworkIpAddress,
+    port: u16,
+) -> i32 {
+    match address {
+        crate::NetworkIpAddress::Ipv4(address) => {
+            write_wasix_addr_port_ip4(caller, memory, ptr, address, port)
+        }
+        crate::NetworkIpAddress::Ipv6(address) => {
+            let octets = address.octets();
+            p1_write_u8(caller, memory, ptr, WASIX_ADDRESS_FAMILY_IP_INET6)
+                .max(p1_write_u16(
+                    caller,
+                    memory,
+                    ptr + WASIX_ADDR_PORT_UNION_OFFSET,
+                    port,
+                ))
+                .max(p1_write_memory(
+                    caller,
+                    memory,
+                    ptr + WASIX_ADDR_PORT_IP6_ADDRESS_OFFSET,
+                    &octets,
+                ))
+        }
+    }
 }
 
 pub(super) fn write_wasix_addr_port_ip4<T>(

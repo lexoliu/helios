@@ -1519,7 +1519,17 @@ where
         },
     );
     store.set_epoch_deadline(1);
-    store.epoch_deadline_async_yield_and_update(1);
+    // The epoch tick is also the only place a CPU-bound instance can
+    // observe a pending kill: host-call hooks never run during long pure
+    // wasm stretches (e.g. an AOT compile), and cancelling the future
+    // instead would surface a bare interrupt trap that loses the kill
+    // reason (OOM vs supervisor restart).
+    store.epoch_deadline_callback(|caller| {
+        if let Some(reason) = caller.data().check_pending_kill() {
+            return Err(wasmtime::Error::from(crate::InstanceKilled { reason }));
+        }
+        Ok(wasmtime::UpdateDeadline::Yield(1))
+    });
     store
 }
 

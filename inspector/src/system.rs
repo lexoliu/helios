@@ -158,7 +158,7 @@ async fn wait_for_tracing_tick_or_interrupt(signals: &mut Signals) -> std::io::R
     .await
 }
 
-fn render_tracing_event(event: &tracing::Event) -> Result<String> {
+pub fn render_tracing_event(event: &tracing::Event) -> Result<String> {
     let mut text = String::new();
     write!(
         &mut text,

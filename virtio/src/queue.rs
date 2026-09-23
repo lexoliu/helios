@@ -115,11 +115,23 @@ impl<T: VirtioTransport> VirtQueue<T> {
         let mut last = self.free_head;
 
         for buffer in inputs {
-            last = self.push_descriptor(transport, buffer, false)?;
+            match self.push_descriptor(transport, buffer, false) {
+                Ok(index) => last = index,
+                Err(error) => {
+                    self.restore_free_head(head);
+                    return Err(error);
+                }
+            }
         }
 
         for output in outputs.iter_mut() {
-            last = self.push_descriptor(transport, output, true)?;
+            match self.push_descriptor(transport, output, true) {
+                Ok(index) => last = index,
+                Err(error) => {
+                    self.restore_free_head(head);
+                    return Err(error);
+                }
+            }
         }
 
         self.desc_shadow[usize::from(last)].flags &= !DESC_FLAG_NEXT;
@@ -150,7 +162,10 @@ impl<T: VirtioTransport> VirtQueue<T> {
 
         let head = self.free_head;
         self.free_head = self.desc_shadow[usize::from(head)].next;
-        self.write_descriptor_with_flags(transport, head, input, 0)?;
+        if let Err(error) = self.write_descriptor_with_flags(transport, head, input, 0) {
+            self.restore_free_head(head);
+            return Err(error);
+        }
         self.num_used += 1;
         Ok(head)
     }
@@ -171,13 +186,20 @@ impl<T: VirtioTransport> VirtQueue<T> {
             return Err(IoError::DeviceFault);
         }
 
+        if parts.iter().any(|part| part.is_empty()) {
+            return Err(IoError::DeviceFault);
+        }
+
         let head = self.free_head;
         let mut last = head;
         for part in parts {
-            if part.is_empty() {
-                return Err(IoError::DeviceFault);
+            match self.push_descriptor(transport, part, false) {
+                Ok(index) => last = index,
+                Err(error) => {
+                    self.restore_free_head(head);
+                    return Err(error);
+                }
             }
-            last = self.push_descriptor(transport, part, false)?;
         }
         self.desc_shadow[usize::from(last)].flags &= !DESC_FLAG_NEXT;
         self.write_desc(last);
@@ -199,7 +221,11 @@ impl<T: VirtioTransport> VirtQueue<T> {
         }
 
         self.remove_free_descriptor(token);
-        self.write_descriptor(transport, token, output, true)?;
+        if let Err(error) = self.write_descriptor(transport, token, output, true) {
+            self.desc_shadow[usize::from(token)].next = self.free_head;
+            self.free_head = token;
+            return Err(error);
+        }
         self.desc_shadow[usize::from(token)].flags &= !DESC_FLAG_NEXT;
         self.write_desc(token);
         self.stage_deferred_head(token);
@@ -244,6 +270,12 @@ impl<T: VirtioTransport> VirtQueue<T> {
         self.last_used_idx = self.last_used_idx.wrapping_add(1);
         if self.event_idx {
             self.write_used_event(self.last_used_idx);
+            // Store-load barrier (Linux's virtqueue_enable_cb_prepare +
+            // virtqueue_poll): used_event must reach the device before the
+            // caller's next used_idx read decides the ring is empty, or the
+            // device can publish an entry against the stale used_event and
+            // skip the interrupt while we go to sleep.
+            fence(Ordering::SeqCst);
         }
         let head = elem.id as u16;
         self.recycle_chain(head);
@@ -255,6 +287,13 @@ impl<T: VirtioTransport> VirtQueue<T> {
             transport.notify_queue(self.index);
         }
         self.num_added = 0;
+    }
+
+    /// Returns descriptors popped since `head` to the free list. Popping
+    /// leaves each shadow descriptor's `next` link intact, so the original
+    /// list is recovered by pointing the head back at the first popped entry.
+    fn restore_free_head(&mut self, head: u16) {
+        self.free_head = head;
     }
 
     fn push_descriptor(&mut self, transport: &T, buffer: &[u8], writable: bool) -> IoResult<u16> {
@@ -397,6 +436,13 @@ impl<T: VirtioTransport> VirtQueue<T> {
     }
 
     fn should_notify(&self) -> bool {
+        // Store-load barrier (virtio 1.2 §2.7.10, Linux's virtqueue_kick_
+        // prepare): the avail_idx store must be visible to the device before
+        // reading its suppression state, or a device that just re-enabled
+        // notifications can miss the entry while we read a stale avail_event
+        // (or NO_NOTIFY flag) and suppress the kick — stalling the queue
+        // until the next submission.
+        fence(Ordering::SeqCst);
         if self.event_idx {
             // vring_need_event (virtio 1.2 §2.7.6.1): kick only when the
             // device's advertised avail_event falls inside the window of

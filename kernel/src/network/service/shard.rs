@@ -367,7 +367,9 @@ impl NetworkShard {
                 StackEvent::NeighborUpdated(entry) => {
                     control.update_neighbors(|neighbors| neighbors.learn(entry));
                 }
-                StackEvent::DhcpConfigured(_) => control.publish_from_shard(self),
+                StackEvent::DhcpConfigured(_) | StackEvent::Ipv6Autoconfigured(_) => {
+                    control.publish_from_shard(self)
+                }
                 StackEvent::UdpDatagram { .. }
                 | StackEvent::TcpConnected { .. }
                 | StackEvent::TcpReadable { .. }

@@ -37,7 +37,10 @@ pub struct P2ResolveAddressStream {
 }
 
 pub(super) struct P2ResolveAddressStreamState {
-    pub(super) result: Option<core::result::Result<Vec<crate::Ipv4Address>, crate::DnsError>>,
+    /// Every resolved address, in both families. `wasi:sockets`
+    /// `resolve-address-stream` promises no ordering, so the resolver's
+    /// own answer order is preserved.
+    pub(super) result: Option<core::result::Result<Vec<crate::NetworkIpAddress>, crate::DnsError>>,
     pub(super) cursor: usize,
 }
 
@@ -192,7 +195,7 @@ impl P2ResolveAddressStream {
 
     pub(crate) fn complete(
         &self,
-        result: core::result::Result<Vec<crate::Ipv4Address>, crate::DnsError>,
+        result: core::result::Result<Vec<crate::NetworkIpAddress>, crate::DnsError>,
     ) {
         self.inner.lock().result = Some(result);
         self.ready.notify_all();
@@ -213,7 +216,7 @@ impl P2ResolveAddressStream {
 
     pub(crate) fn next_address(
         &mut self,
-    ) -> core::result::Result<Option<crate::Ipv4Address>, crate::DnsError> {
+    ) -> core::result::Result<Option<crate::NetworkIpAddress>, crate::DnsError> {
         let mut state = self.inner.lock();
         let Some(result) = state.result.as_ref() else {
             return Err(crate::DnsError {
@@ -254,8 +257,8 @@ impl TcpSocket {
                 keep_alive_interval: DEFAULT_WASI_TCP_KEEP_ALIVE_INTERVAL_NANOS,
                 keep_alive_count: DEFAULT_WASI_TCP_KEEP_ALIVE_COUNT,
                 hop_limit: DEFAULT_WASI_TCP_HOP_LIMIT,
-                receive_buffer_size: DEFAULT_WASI_UDP_BUFFER_BYTES,
-                send_buffer_size: DEFAULT_WASI_UDP_BUFFER_BYTES,
+                receive_buffer_size: WASI_TCP_RECEIVE_BUFFER_BYTES,
+                send_buffer_size: WASI_TCP_SEND_BUFFER_BYTES,
             })),
             ready: Arc::new(crate::Notify::new()),
         }
@@ -290,8 +293,8 @@ impl TcpSocket {
                 keep_alive_interval: DEFAULT_WASI_TCP_KEEP_ALIVE_INTERVAL_NANOS,
                 keep_alive_count: DEFAULT_WASI_TCP_KEEP_ALIVE_COUNT,
                 hop_limit: DEFAULT_WASI_TCP_HOP_LIMIT,
-                receive_buffer_size: DEFAULT_WASI_UDP_BUFFER_BYTES,
-                send_buffer_size: DEFAULT_WASI_UDP_BUFFER_BYTES,
+                receive_buffer_size: WASI_TCP_RECEIVE_BUFFER_BYTES,
+                send_buffer_size: WASI_TCP_SEND_BUFFER_BYTES,
             })),
             ready: Arc::new(crate::Notify::new()),
         }
@@ -379,10 +382,19 @@ impl TcpSocket {
         Ok(self.inner.lock().keep_alive_enabled)
     }
 
+    /// Enabling keepalive is rejected rather than recorded.
+    ///
+    /// The netstack has no keepalive timer, so accepting `true` would make a
+    /// guest believe idle connections are being probed and dead peers
+    /// detected when neither happens. Disabling it is the state the stack is
+    /// already in, so that direction succeeds.
     pub(super) fn set_keep_alive_enabled(
         &self,
         value: bool,
     ) -> core::result::Result<(), socket_types::ErrorCode> {
+        if value {
+            return Err(socket_types::ErrorCode::NotSupported);
+        }
         self.inner.lock().keep_alive_enabled = value;
         Ok(())
     }
@@ -438,6 +450,13 @@ impl TcpSocket {
         Ok(self.inner.lock().receive_buffer_size)
     }
 
+    /// Records a receive-buffer request clamped to what the stack reserves.
+    ///
+    /// `wasi:sockets` allows an implementation to clamp this hint, and reading
+    /// the option back is documented to return the effective value. The
+    /// netstack's per-socket receive window is fixed, so the effective value
+    /// is that window and the getter reports it instead of echoing whatever
+    /// the guest asked for.
     pub(super) fn set_receive_buffer_size(
         &self,
         value: u64,
@@ -445,7 +464,7 @@ impl TcpSocket {
         if value == 0 {
             return Err(socket_types::ErrorCode::InvalidArgument);
         }
-        self.inner.lock().receive_buffer_size = value;
+        self.inner.lock().receive_buffer_size = value.min(WASI_TCP_RECEIVE_BUFFER_BYTES);
         Ok(())
     }
 
@@ -453,6 +472,7 @@ impl TcpSocket {
         Ok(self.inner.lock().send_buffer_size)
     }
 
+    /// Records a send-buffer request clamped to the stack's transmit buffer.
     pub(super) fn set_send_buffer_size(
         &self,
         value: u64,
@@ -460,7 +480,7 @@ impl TcpSocket {
         if value == 0 {
             return Err(socket_types::ErrorCode::InvalidArgument);
         }
-        self.inner.lock().send_buffer_size = value;
+        self.inner.lock().send_buffer_size = value.min(WASI_TCP_SEND_BUFFER_BYTES);
         Ok(())
     }
 
@@ -468,6 +488,12 @@ impl TcpSocket {
         Ok(self.inner.lock().hop_limit)
     }
 
+    /// Sets the IPv4 TTL / IPv6 hop limit and pushes it into the netstack.
+    ///
+    /// An unbound socket has nothing to push to yet, so the value is held on
+    /// the descriptor and handed to `connect`/`listen`, which apply it before
+    /// the first packet leaves. Once a stream or listener exists the change
+    /// takes effect on the live socket.
     pub(super) fn set_hop_limit(
         &self,
         value: u8,
@@ -475,7 +501,21 @@ impl TcpSocket {
         if value == 0 {
             return Err(socket_types::ErrorCode::InvalidArgument);
         }
-        self.inner.lock().hop_limit = value;
+        let (service, stream, listener) = {
+            let mut state = self.inner.lock();
+            state.hop_limit = value;
+            (state.service.clone(), state.stream, state.listener)
+        };
+        if let Some(stream) = stream {
+            service
+                .tcp_set_hop_limit(stream, value)
+                .map_err(map_p3_tcp_error)?;
+        }
+        if let Some(listener) = listener {
+            service
+                .tcp_listener_set_hop_limit(listener, value)
+                .map_err(map_p3_tcp_error)?;
+        }
         Ok(())
     }
 
@@ -483,7 +523,7 @@ impl TcpSocket {
         &self,
         remote_address: WasiTcpSocketAddress,
     ) -> core::result::Result<(), socket_types::ErrorCode> {
-        let (service, local_port) = {
+        let (service, local_port, hop_limit) = {
             let state = self.inner.lock();
             if state.stream.is_some() {
                 return Err(socket_types::ErrorCode::InvalidState);
@@ -491,6 +531,7 @@ impl TcpSocket {
             (
                 state.service.clone(),
                 state.local_address.map_or(0, |address| address.port),
+                state.hop_limit,
             )
         };
         let stream = service
@@ -498,6 +539,7 @@ impl TcpSocket {
                 remote_address.address.network_address(),
                 remote_address.port,
                 local_port,
+                hop_limit,
                 u64::MAX,
             )
             .await
@@ -997,6 +1039,10 @@ impl UdpSocket {
         Ok(self.inner.lock().hop_limit)
     }
 
+    /// Sets the datagram TTL / hop limit and pushes it into the netstack.
+    ///
+    /// An unbound socket has no stack socket yet, so the value is applied when
+    /// the bind completes; a bound socket takes it immediately.
     pub(super) fn set_unicast_hop_limit(
         &self,
         value: u8,
@@ -1004,7 +1050,16 @@ impl UdpSocket {
         if value == 0 {
             return Err(WasiUdpSocketError::InvalidArgument);
         }
-        self.inner.lock().hop_limit = value;
+        let (service, bound) = {
+            let mut state = self.inner.lock();
+            state.hop_limit = value;
+            (state.service.clone(), state.bound.or(state.pending_bind))
+        };
+        if let Some(bound) = bound {
+            service
+                .udp_set_hop_limit(bound.socket, value)
+                .map_err(WasiUdpSocketError::Backend)?;
+        }
         Ok(())
     }
 
@@ -1256,16 +1311,22 @@ impl UdpSocket {
         local_port: u16,
         pending_bind: bool,
     ) -> core::result::Result<(), WasiUdpSocketError> {
-        let service = {
+        let (service, hop_limit) = {
             let state = self.inner.lock();
             if state.pending_bind.is_some() || state.bound.is_some() {
                 return Err(WasiUdpSocketError::InvalidState);
             }
-            state.service.clone()
+            (state.service.clone(), state.hop_limit)
         };
         let binding = service
             .udp_bind(local_port)
             .await
+            .map_err(WasiUdpSocketError::Backend)?;
+        // A datagram socket cannot emit anything before its bind completes,
+        // so applying the descriptor's hop limit here covers every packet it
+        // will ever send.
+        service
+            .udp_set_hop_limit(binding.socket, hop_limit)
             .map_err(WasiUdpSocketError::Backend)?;
         let bound = BoundUdpSocket {
             socket: binding.socket,
@@ -1789,7 +1850,7 @@ where
     ) -> Result<core::result::Result<StreamReader<Resource<TcpSocket>>, socket_types::ErrorCode>>
     {
         let socket = access.get().table.get(&socket_resource)?.clone();
-        let (local_address, listen_backlog) = {
+        let (local_address, listen_backlog, hop_limit) = {
             let state = socket.inner.lock();
             if state.stream.is_some()
                 || state.listener.is_some()
@@ -1803,7 +1864,7 @@ where
                 address: state.family.unspecified_address(),
                 port: 0,
             });
-            (local_address, state.listen_backlog)
+            (local_address, state.listen_backlog, state.hop_limit)
         };
         if !has_wasi_network_rights(
             access.get().process_authority(),
@@ -1840,6 +1901,7 @@ where
                     local_address.address.network_address(),
                     local_address.port,
                     listen_backlog,
+                    hop_limit,
                 )
                 .await;
             let mut state = inner.lock();
@@ -2226,9 +2288,35 @@ where
     }
 }
 
-pub(super) fn format_p3_ip_address(address: crate::Ipv4Address) -> socket_types::IpAddress {
-    let [a, b, c, d] = address.octets();
-    socket_types::IpAddress::Ipv4((a, b, c, d))
+pub(super) fn format_p3_ip_address(address: crate::NetworkIpAddress) -> socket_types::IpAddress {
+    match address {
+        crate::NetworkIpAddress::Ipv4(address) => {
+            let [a, b, c, d] = address.octets();
+            socket_types::IpAddress::Ipv4((a, b, c, d))
+        }
+        crate::NetworkIpAddress::Ipv6(address) => {
+            socket_types::IpAddress::Ipv6(ipv6_address_groups(address))
+        }
+    }
+}
+
+/// Splits an IPv6 address into the eight big-endian 16-bit groups the
+/// `wasi:sockets` `ipv6-address` tuple carries.
+pub(super) fn ipv6_address_groups(
+    address: helios_netstack::Ipv6Address,
+) -> (u16, u16, u16, u16, u16, u16, u16, u16) {
+    let octets = address.octets();
+    let group = |index: usize| u16::from_be_bytes([octets[index * 2], octets[index * 2 + 1]]);
+    (
+        group(0),
+        group(1),
+        group(2),
+        group(3),
+        group(4),
+        group(5),
+        group(6),
+        group(7),
+    )
 }
 
 pub(super) fn map_p3_dns_error(error: crate::DnsError) -> ip_name_lookup::ErrorCode {

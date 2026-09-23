@@ -9,6 +9,7 @@ use bytes::Bytes;
 use triomphe::Arc;
 use unsize::{CoerceUnsize, Coercion};
 
+use crate::SocketReadiness;
 use crate::{
     ComponentNetworkService, DnsError, Ipv4Address, Ipv4Cidr, Ipv4Route, MacAddress,
     NetworkAdminBackend, NetworkBridgeRequest, NetworkControlError, NetworkIpAddress,
@@ -79,7 +80,7 @@ trait DynComponentHostNetworkService: Send + Sync + 'static {
         &'a self,
         host: &'a str,
         timeout_nanos: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<Ipv4Address>, DnsError>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<NetworkIpAddress>, DnsError>> + Send + 'a>>;
 
     fn tcp_connect<'a>(
         &'a self,
@@ -93,6 +94,7 @@ trait DynComponentHostNetworkService: Send + Sync + 'static {
         host: &'a str,
         port: u16,
         local_port: u16,
+        hop_limit: u8,
         timeout_nanos: u64,
     ) -> Pin<Box<dyn Future<Output = Result<u64, TcpError>> + Send + 'a>>;
 
@@ -101,6 +103,7 @@ trait DynComponentHostNetworkService: Send + Sync + 'static {
         remote_address: NetworkIpAddress,
         port: u16,
         local_port: u16,
+        hop_limit: u8,
         timeout_nanos: u64,
     ) -> Pin<Box<dyn Future<Output = Result<u64, TcpError>> + Send + 'a>>;
 
@@ -109,13 +112,33 @@ trait DynComponentHostNetworkService: Send + Sync + 'static {
         local_address: NetworkIpAddress,
         local_port: u16,
         backlog: u16,
+        hop_limit: u8,
     ) -> Pin<Box<dyn Future<Output = Result<TcpListener<u64>, TcpError>> + Send + 'a>>;
+
+    fn tcp_set_hop_limit(&self, stream: u64, hop_limit: u8) -> Result<(), TcpError>;
+
+    fn tcp_listener_set_hop_limit(&self, listener: u64, hop_limit: u8) -> Result<(), TcpError>;
 
     fn tcp_accept<'a>(
         &'a self,
         listener: u64,
         timeout_nanos: u64,
     ) -> Pin<Box<dyn Future<Output = Result<TcpAccepted<u64>, TcpError>> + Send + 'a>>;
+
+    fn tcp_readiness(
+        &self,
+        stream: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<SocketReadiness, TcpError>> + Send + '_>>;
+
+    fn tcp_listener_readiness(
+        &self,
+        listener: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<SocketReadiness, TcpError>> + Send + '_>>;
+
+    fn udp_readiness(
+        &self,
+        socket: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<SocketReadiness, UdpError>> + Send + '_>>;
 
     fn tcp_write_all<'a>(
         &'a self,
@@ -165,6 +188,8 @@ trait DynComponentHostNetworkService: Send + Sync + 'static {
     ) -> Result<(), UdpError>;
 
     fn udp_disconnect(&self, socket: u64) -> Result<(), UdpError>;
+
+    fn udp_set_hop_limit(&self, socket: u64, hop_limit: u8) -> Result<(), UdpError>;
 
     fn udp_send<'a>(
         &'a self,
@@ -337,7 +362,7 @@ impl ComponentNetworkService for ComponentHostNetworkService {
         &'a self,
         host: &'a str,
         timeout_nanos: u64,
-    ) -> impl Future<Output = Result<Vec<Ipv4Address>, DnsError>> + Send + 'a {
+    ) -> impl Future<Output = Result<Vec<NetworkIpAddress>, DnsError>> + Send + 'a {
         self.inner.dns_resolve(host, timeout_nanos)
     }
 
@@ -355,10 +380,11 @@ impl ComponentNetworkService for ComponentHostNetworkService {
         host: &'a str,
         port: u16,
         local_port: u16,
+        hop_limit: u8,
         timeout_nanos: u64,
     ) -> impl Future<Output = Result<Self::TcpStream, TcpError>> + Send + 'a {
         self.inner
-            .tcp_connect_from(host, port, local_port, timeout_nanos)
+            .tcp_connect_from(host, port, local_port, hop_limit, timeout_nanos)
     }
 
     fn tcp_connect_address(
@@ -366,10 +392,11 @@ impl ComponentNetworkService for ComponentHostNetworkService {
         remote_address: NetworkIpAddress,
         port: u16,
         local_port: u16,
+        hop_limit: u8,
         timeout_nanos: u64,
     ) -> impl Future<Output = Result<Self::TcpStream, TcpError>> + Send + '_ {
         self.inner
-            .tcp_connect_address(remote_address, port, local_port, timeout_nanos)
+            .tcp_connect_address(remote_address, port, local_port, hop_limit, timeout_nanos)
     }
 
     fn tcp_listen(
@@ -377,8 +404,22 @@ impl ComponentNetworkService for ComponentHostNetworkService {
         local_address: NetworkIpAddress,
         local_port: u16,
         backlog: u16,
+        hop_limit: u8,
     ) -> impl Future<Output = Result<TcpListener<Self::TcpListener>, TcpError>> + Send + '_ {
-        self.inner.tcp_listen(local_address, local_port, backlog)
+        self.inner
+            .tcp_listen(local_address, local_port, backlog, hop_limit)
+    }
+
+    fn tcp_set_hop_limit(&self, stream: Self::TcpStream, hop_limit: u8) -> Result<(), TcpError> {
+        self.inner.tcp_set_hop_limit(stream, hop_limit)
+    }
+
+    fn tcp_listener_set_hop_limit(
+        &self,
+        listener: Self::TcpListener,
+        hop_limit: u8,
+    ) -> Result<(), TcpError> {
+        self.inner.tcp_listener_set_hop_limit(listener, hop_limit)
     }
 
     fn tcp_accept(
@@ -387,6 +428,27 @@ impl ComponentNetworkService for ComponentHostNetworkService {
         timeout_nanos: u64,
     ) -> impl Future<Output = Result<TcpAccepted<Self::TcpStream>, TcpError>> + Send + '_ {
         self.inner.tcp_accept(listener, timeout_nanos)
+    }
+
+    fn tcp_readiness(
+        &self,
+        stream: Self::TcpStream,
+    ) -> impl Future<Output = Result<SocketReadiness, TcpError>> + Send + '_ {
+        self.inner.tcp_readiness(stream)
+    }
+
+    fn tcp_listener_readiness(
+        &self,
+        listener: Self::TcpListener,
+    ) -> impl Future<Output = Result<SocketReadiness, TcpError>> + Send + '_ {
+        self.inner.tcp_listener_readiness(listener)
+    }
+
+    fn udp_readiness(
+        &self,
+        socket: Self::UdpSocket,
+    ) -> impl Future<Output = Result<SocketReadiness, UdpError>> + Send + '_ {
+        self.inner.udp_readiness(socket)
     }
 
     fn tcp_write_all<'a>(
@@ -445,6 +507,10 @@ impl ComponentNetworkService for ComponentHostNetworkService {
 
     fn udp_disconnect(&self, socket: Self::UdpSocket) -> Result<(), UdpError> {
         self.inner.udp_disconnect(socket)
+    }
+
+    fn udp_set_hop_limit(&self, socket: Self::UdpSocket, hop_limit: u8) -> Result<(), UdpError> {
+        self.inner.udp_set_hop_limit(socket, hop_limit)
     }
 
     fn udp_send<'a>(
@@ -631,7 +697,7 @@ where
         &'a self,
         host: &'a str,
         timeout_nanos: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<Ipv4Address>, DnsError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<NetworkIpAddress>, DnsError>> + Send + 'a>> {
         Box::pin(self.service.dns_resolve(host, timeout_nanos))
     }
 
@@ -652,12 +718,13 @@ where
         host: &'a str,
         port: u16,
         local_port: u16,
+        hop_limit: u8,
         timeout_nanos: u64,
     ) -> Pin<Box<dyn Future<Output = Result<u64, TcpError>> + Send + 'a>> {
         Box::pin(async move {
             let stream = self
                 .service
-                .tcp_connect_from(host, port, local_port, timeout_nanos)
+                .tcp_connect_from(host, port, local_port, hop_limit, timeout_nanos)
                 .await?;
             Ok(stream.into_raw())
         })
@@ -668,15 +735,30 @@ where
         remote_address: NetworkIpAddress,
         port: u16,
         local_port: u16,
+        hop_limit: u8,
         timeout_nanos: u64,
     ) -> Pin<Box<dyn Future<Output = Result<u64, TcpError>> + Send + 'a>> {
         Box::pin(async move {
             let stream = self
                 .service
-                .tcp_connect_address(remote_address, port, local_port, timeout_nanos)
+                .tcp_connect_address(remote_address, port, local_port, hop_limit, timeout_nanos)
                 .await?;
             Ok(stream.into_raw())
         })
+    }
+
+    fn tcp_set_hop_limit(&self, stream: u64, hop_limit: u8) -> Result<(), TcpError> {
+        self.service.tcp_set_hop_limit(
+            <Service::TcpStream as ComponentHostTcpStreamToken>::from_raw(stream),
+            hop_limit,
+        )
+    }
+
+    fn tcp_listener_set_hop_limit(&self, listener: u64, hop_limit: u8) -> Result<(), TcpError> {
+        self.service.tcp_listener_set_hop_limit(
+            <Service::TcpListener as ComponentHostTcpListenerToken>::from_raw(listener),
+            hop_limit,
+        )
     }
 
     fn tcp_listen<'a>(
@@ -684,11 +766,12 @@ where
         local_address: NetworkIpAddress,
         local_port: u16,
         backlog: u16,
+        hop_limit: u8,
     ) -> Pin<Box<dyn Future<Output = Result<TcpListener<u64>, TcpError>> + Send + 'a>> {
         Box::pin(async move {
             let listener = self
                 .service
-                .tcp_listen(local_address, local_port, backlog)
+                .tcp_listen(local_address, local_port, backlog, hop_limit)
                 .await?;
             Ok(TcpListener {
                 listener: listener.listener.into_raw(),
@@ -716,6 +799,37 @@ where
                 port: accepted.port,
             })
         })
+    }
+
+    fn tcp_readiness(
+        &self,
+        stream: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<SocketReadiness, TcpError>> + Send + '_>> {
+        Box::pin(
+            self.service.tcp_readiness(
+                <Service::TcpStream as ComponentHostTcpStreamToken>::from_raw(stream),
+            ),
+        )
+    }
+
+    fn tcp_listener_readiness(
+        &self,
+        listener: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<SocketReadiness, TcpError>> + Send + '_>> {
+        Box::pin(self.service.tcp_listener_readiness(
+            <Service::TcpListener as ComponentHostTcpListenerToken>::from_raw(listener),
+        ))
+    }
+
+    fn udp_readiness(
+        &self,
+        socket: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<SocketReadiness, UdpError>> + Send + '_>> {
+        Box::pin(
+            self.service.udp_readiness(
+                <Service::UdpSocket as ComponentHostUdpSocketToken>::from_raw(socket),
+            ),
+        )
     }
 
     fn tcp_write_all<'a>(
@@ -815,6 +929,13 @@ where
     fn udp_disconnect(&self, socket: u64) -> Result<(), UdpError> {
         self.service
             .udp_disconnect(<Service::UdpSocket as ComponentHostUdpSocketToken>::from_raw(socket))
+    }
+
+    fn udp_set_hop_limit(&self, socket: u64, hop_limit: u8) -> Result<(), UdpError> {
+        self.service.udp_set_hop_limit(
+            <Service::UdpSocket as ComponentHostUdpSocketToken>::from_raw(socket),
+            hop_limit,
+        )
     }
 
     fn udp_send<'a>(

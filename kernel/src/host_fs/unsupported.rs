@@ -56,6 +56,19 @@ impl HostFileSystem for UnsupportedHostFileSystem {
     ) -> impl core::future::Future<Output = Result<(), HostFsError>> + Send + '_ {
         unsupported()
     }
+    fn append_file(
+        &self,
+        _path: &str,
+        _bytes: &[u8],
+    ) -> impl core::future::Future<Output = Result<u64, HostFsError>> + Send + '_ {
+        unsupported()
+    }
+    fn sync_file(
+        &self,
+        _path: &str,
+    ) -> impl core::future::Future<Output = Result<(), HostFsError>> + Send + '_ {
+        unsupported()
+    }
     fn truncate_file(
         &self,
         _path: &str,

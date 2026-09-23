@@ -1,21 +1,124 @@
 #!/usr/bin/env python3
+import hashlib
 import json
 import os
+import platform
 import re
 import shlex
 import shutil
 import socket
 import subprocess
+import sys
+import tarfile
 import tomllib
 import time
 from pathlib import Path
 
 
-DEFAULT_FEDORA_IMAGE_URL = (
-    "https://download.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/aarch64/images/"
-    "Fedora-Cloud-Base-Generic-44-1.7.aarch64.qcow2"
-)
-DEFAULT_ASSET_DIR = Path("target/perf-baselines/linux-vm/fedora-aarch64")
+# Pinned Fedora Cloud Base images. Both architectures track the same Fedora
+# compose so the two host lanes measure the same userspace, and both are
+# verified against the SHA256 published in the compose's signed CHECKSUM file.
+FEDORA_IMAGES = {
+    "aarch64": {
+        "url": (
+            "https://download.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/aarch64/images/"
+            "Fedora-Cloud-Base-Generic-44-1.7.aarch64.qcow2"
+        ),
+        "sha256": "55c60a3b80d3616a08705afd0459e75fe9f03c54aba7a46e4002a41a72fa0d5b",
+    },
+    "x86_64": {
+        "url": (
+            "https://download.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/x86_64/images/"
+            "Fedora-Cloud-Base-Generic-44-1.7.x86_64.qcow2"
+        ),
+        "sha256": "28680fe5b371a5a82ebf43a31926e086a168e59949d03969c5093e7071f90b7f",
+    },
+}
+FEDORA_IMAGE_URLS = {arch: image["url"] for arch, image in FEDORA_IMAGES.items()}
+FEDORA_IMAGE_SHA256 = {arch: image["sha256"] for arch, image in FEDORA_IMAGES.items()}
+QEMU_BINS = {
+    "aarch64": "qemu-system-aarch64",
+    "x86_64": "qemu-system-x86_64",
+}
+# platform.machine() spelling -> Fedora guest architecture. Only a guest whose
+# architecture matches the host boots fast enough for this benchmark: the
+# cloud image's own systemd device and service timeouts expire long before a
+# cross-architecture TCG guest finishes bringing up its root filesystem.
+HOST_ARCHES = {
+    "aarch64": "aarch64",
+    "arm64": "aarch64",
+    "AMD64": "x86_64",
+    "amd64": "x86_64",
+    "x86_64": "x86_64",
+}
+# Wasmtime release used for the Wasmtime-on-Linux floor. It tracks the
+# release line of the `../wasmtime` checkout in docs/wasmtime.md so the floor
+# and Helios execute comparable compiler and runtime code, and it is the same
+# pin for every guest architecture.
+WASMTIME_LINUX_VERSION = "48.0.0"
+
+
+def host_arch() -> str:
+    """Fedora guest architecture this host can run at usable speed."""
+    machine = platform.machine()
+    arch = HOST_ARCHES.get(machine)
+    if arch is None:
+        raise SystemExit(
+            f"unsupported host architecture for the Fedora Linux baseline: {machine}"
+        )
+    return arch
+
+
+def wasmtime_linux_release(guest_arch: str) -> tuple[str, str]:
+    """Release directory name and download URL of the pinned Wasmtime build."""
+    release = f"wasmtime-v{WASMTIME_LINUX_VERSION}-{guest_arch}-linux"
+    url = (
+        "https://github.com/bytecodealliance/wasmtime/releases/download/"
+        f"v{WASMTIME_LINUX_VERSION}/{release}.tar.xz"
+    )
+    return release, url
+
+
+def default_asset_dir(guest_arch: str) -> Path:
+    return Path(f"target/perf-baselines/linux-vm/fedora-{guest_arch}")
+
+
+def default_accel(guest_arch: str) -> str:
+    """Pick the fastest available QEMU accelerator for `guest_arch` on this host."""
+    native = HOST_ARCHES.get(platform.machine()) == guest_arch
+    if native and platform.system() == "Darwin":
+        return "hvf"
+    if native and platform.system() == "Linux" and os.access("/dev/kvm", os.R_OK | os.W_OK):
+        return "kvm"
+    return "tcg"
+
+
+def machine_and_cpu(guest_arch: str, accel: str) -> tuple[str, str]:
+    """QEMU -machine/-cpu values for the Fedora guest."""
+    virtualized = accel in ("hvf", "kvm")
+    if guest_arch == "aarch64":
+        # `-cpu max` asks TCG to emulate every architectural extension QEMU
+        # knows, including SVE, which Fedora never issues here and which costs
+        # real time to translate. A concrete ARMv8.2 core is what the Fedora
+        # aarch64 kernel is built for.
+        cpu = "host" if virtualized else "cortex-a76"
+        return f"virt,gic-version=3,accel={accel}", cpu
+    if guest_arch == "x86_64":
+        return f"q35,accel={accel}", "host" if virtualized else "max"
+    raise SystemExit(f"unsupported Fedora guest architecture: {guest_arch}")
+
+
+def virtio_devices(guest_arch: str) -> tuple[str, str, str]:
+    """Block, network, and entropy virtio device models for `guest_arch`.
+
+    aarch64 `virt` has no default firmware and exposes virtio over MMIO;
+    x86_64 `q35` boots the cloud image through SeaBIOS with PCI transports.
+    """
+    if guest_arch == "aarch64":
+        return "virtio-blk-device", "virtio-net-device", "virtio-rng-device"
+    if guest_arch == "x86_64":
+        return "virtio-blk-pci", "virtio-net-pci", "virtio-rng-pci"
+    raise SystemExit(f"unsupported Fedora guest architecture: {guest_arch}")
 DEFAULT_DISK_SIZE = "12G"
 DEFAULT_MEMORY = "2G"
 DEFAULT_SMP = 4
@@ -174,18 +277,20 @@ def resolve_quickjs_source_archive(
     repo_root: Path,
     asset_dir: Path,
     archive: Path | None,
-) -> Path | None:
-    resolved = resolve_optional_path(repo_root, archive)
-    if resolved is None:
-        resolved = asset_dir / "sources" / QUICKJS_SOURCE_ARCHIVE_NAME
-    if resolved.is_file():
-        return resolved
-    if archive is None:
-        return None
-    raise SystemExit(
-        "explicit QuickJS native source archive does not exist: "
-        f"{resolved}. Expected QuickJS-NG v{QUICKJS_VERSION} source from "
-        f"{QUICKJS_SOURCE_URL}."
+) -> Path:
+    """Locate the QuickJS-NG source the guest rebuilds its native qjs from.
+
+    An explicit archive is used as given; otherwise the pinned release source
+    is staged beside the Fedora image on the host, so the guest still builds
+    without reaching the network itself.
+    """
+    if archive is not None:
+        return resolve_optional_path(repo_root, archive)
+    return download_pinned(
+        repo_root,
+        QUICKJS_SOURCE_URL,
+        asset_dir / "sources" / QUICKJS_SOURCE_ARCHIVE_NAME,
+        None,
     )
 
 
@@ -197,7 +302,93 @@ def ensure_private_key(repo_root: Path, asset_dir: Path) -> Path:
     return key
 
 
-def render_seed(repo_root: Path, asset_dir: Path, public_key: str) -> Path:
+def proxy_cloud_config() -> tuple[list[tuple[str, str]], list[str]]:
+    """cloud-config additions for hosts whose outbound traffic must pass
+    an HTTP(S) proxy (e.g. CI containers with TLS-intercepting egress).
+
+    Driven by HELIOS_LINUX_VM_HTTP_PROXY (proxy URL as seen from the
+    guest, typically via QEMU user-net's 10.0.2.2 host alias) and
+    HELIOS_LINUX_VM_PROXY_CA (host path of the proxy's CA bundle).
+    """
+    proxy = os.environ.get("HELIOS_LINUX_VM_HTTP_PROXY")
+    if not proxy:
+        return [], []
+    no_proxy = "localhost,127.0.0.1,10.0.2.2"
+    write_files = [
+        (
+            "/etc/profile.d/helios-proxy.sh",
+            f"export http_proxy={proxy}\n"
+            f"export https_proxy={proxy}\n"
+            f"export no_proxy={no_proxy}\n",
+        ),
+    ]
+    runcmd = [f"echo 'proxy={proxy}' >> /etc/dnf/dnf.conf"]
+    ca_path = os.environ.get("HELIOS_LINUX_VM_PROXY_CA")
+    if ca_path:
+        ca_content = Path(ca_path).read_text(encoding="utf-8")
+        write_files.append(
+            ("/etc/pki/ca-trust/source/anchors/helios-proxy-ca.crt", ca_content)
+        )
+        runcmd.append("update-ca-trust")
+    return write_files, runcmd
+
+
+def emulated_guest_cloud_config(accel: str) -> tuple[list[tuple[str, str]], list[str]]:
+    """cloud-config additions for a guest running under pure emulation.
+
+    Fedora's stock unit, device, and udev event timeouts are sized for
+    hardware-virtualized guests. Under TCG every guest instruction is
+    translated, so provisioning, `dnf`, and the QuickJS rebuild run an order
+    of magnitude slower and routinely exceed the stock 90s limits. cloud-init
+    applies these drop-ins during `write-files`, and `runcmd` reloads the
+    manager so every unit started from there on picks them up.
+    """
+    if accel != "tcg":
+        return [], []
+    write_files = [
+        (
+            "/etc/systemd/system.conf.d/10-helios-emulated-timeouts.conf",
+            "[Manager]\n"
+            "DefaultTimeoutStartSec=900s\n"
+            "DefaultTimeoutStopSec=120s\n"
+            "DefaultDeviceTimeoutSec=900s\n",
+        ),
+        (
+            "/etc/udev/udev.conf.d/10-helios-emulated-timeouts.conf",
+            "event_timeout=900\n",
+        ),
+    ]
+    return write_files, ["systemctl daemon-reload"]
+
+
+def render_cloud_config_extras(
+    write_files: list[tuple[str, str]],
+    runcmd: list[str],
+) -> str:
+    """Render one `write_files`/`runcmd` block appended to the user-data.
+
+    cloud-config is YAML, so each key may appear only once: every contributor
+    must funnel through here rather than emitting its own block.
+    """
+    lines: list[str] = []
+    if write_files:
+        lines.append("write_files:")
+        for path, content in write_files:
+            lines.append(f"  - path: {path}")
+            lines.append('    permissions: "0644"')
+            lines.append("    content: |")
+            for content_line in content.splitlines():
+                lines.append(f"      {content_line}")
+    if runcmd:
+        lines.append("runcmd:")
+        for command in runcmd:
+            lines.append(f"  - {command}")
+    if not lines:
+        return ""
+    return "\n".join(lines) + "\n"
+
+
+def render_seed(repo_root: Path, asset_dir: Path, public_key: str, accel: str) -> Path:
     seed_dir = asset_dir / "seed"
     seed_dir.mkdir(parents=True, exist_ok=True)
     template_dir = repo_root / "tools/wasi-apps/fedora-cloud-init"
@@ -206,47 +397,127 @@ def render_seed(repo_root: Path, asset_dir: Path, public_key: str) -> Path:
         encoding="utf-8",
     )
     user_data = (template_dir / "user-data").read_text(encoding="utf-8")
-    (seed_dir / "user-data").write_text(
-        user_data.replace("{ssh_public_key}", public_key),
-        encoding="utf-8",
+    user_data = user_data.replace("{ssh_public_key}", public_key)
+    proxy_write_files, proxy_runcmd = proxy_cloud_config()
+    emulated_write_files, emulated_runcmd = emulated_guest_cloud_config(accel)
+    extras = render_cloud_config_extras(
+        [*proxy_write_files, *emulated_write_files],
+        [*proxy_runcmd, *emulated_runcmd],
     )
+    if extras:
+        user_data = user_data.rstrip("\n") + "\n" + extras
+    (seed_dir / "user-data").write_text(user_data, encoding="utf-8")
     seed_iso = asset_dir / "cidata.iso"
     tmp_stem = asset_dir / "cidata.tmp"
     tmp_iso = tmp_stem.with_suffix(".tmp.iso")
     if tmp_iso.exists():
         tmp_iso.unlink()
-    run(
-        [
-            "hdiutil",
-            "makehybrid",
-            "-quiet",
-            "-o",
-            str(tmp_stem),
-            "-iso",
-            "-joliet",
-            "-default-volume-name",
-            "cidata",
-            str(seed_dir),
-        ],
-        repo_root,
-    )
+    if shutil.which("hdiutil"):
+        run(
+            [
+                "hdiutil",
+                "makehybrid",
+                "-quiet",
+                "-o",
+                str(tmp_stem),
+                "-iso",
+                "-joliet",
+                "-default-volume-name",
+                "cidata",
+                str(seed_dir),
+            ],
+            repo_root,
+        )
+    else:
+        iso_tool = next(
+            (tool for tool in ("genisoimage", "mkisofs", "xorrisofs") if shutil.which(tool)),
+            None,
+        )
+        if iso_tool is None:
+            raise SystemExit(
+                "no ISO tool found for the cloud-init seed; install genisoimage "
+                "(Linux) or run on macOS (hdiutil)"
+            )
+        run(
+            [
+                iso_tool,
+                "-quiet",
+                "-output",
+                str(tmp_iso),
+                "-volid",
+                "cidata",
+                "-joliet",
+                "-rock",
+                str(seed_dir),
+            ],
+            repo_root,
+        )
     tmp_iso.replace(seed_iso)
     return seed_iso
 
 
-def download_base_image(repo_root: Path, asset_dir: Path, image_url: str) -> Path:
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def download_pinned(repo_root: Path, url: str, destination: Path, sha256: str | None) -> Path:
+    """Download `url` to `destination` once, verifying `sha256` every run."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if not destination.is_file():
+        tmp = destination.with_suffix(destination.suffix + ".tmp")
+        if tmp.exists():
+            tmp.unlink()
+        run(["curl", "--fail", "--location", "--output", str(tmp), url], repo_root)
+        tmp.replace(destination)
+    if sha256 is not None:
+        actual = file_sha256(destination)
+        if actual != sha256:
+            raise SystemExit(
+                f"checksum mismatch for {destination} downloaded from {url}: "
+                f"expected {sha256}, got {actual}"
+            )
+    return destination
+
+
+def download_base_image(
+    repo_root: Path,
+    asset_dir: Path,
+    image_url: str,
+    image_sha256: str,
+) -> Path:
     image_name = image_url.rstrip("/").rsplit("/", 1)[-1]
     if not image_name:
         raise SystemExit(f"Fedora image URL has no filename: {image_url}")
-    base = asset_dir / image_name
-    if base.is_file():
-        return base
-    tmp = base.with_suffix(base.suffix + ".tmp")
-    if tmp.exists():
-        tmp.unlink()
-    run(["curl", "--fail", "--location", "--output", str(tmp), image_url], repo_root)
-    tmp.replace(base)
-    return base
+    return download_pinned(repo_root, image_url, asset_dir / image_name, image_sha256)
+
+
+def stage_wasmtime_linux_bin(repo_root: Path, asset_dir: Path, guest_arch: str) -> Path:
+    """Unpack the pinned Wasmtime Linux release for `guest_arch` on the host.
+
+    The guest never reaches the network: the archive is fetched and expanded
+    beside the Fedora image, and only the `wasmtime` executable is copied in.
+    """
+    release, url = wasmtime_linux_release(guest_arch)
+    binary = asset_dir / "tools" / release / "wasmtime"
+    if binary.is_file():
+        return binary
+    archive = download_pinned(
+        repo_root, url, asset_dir / "sources" / f"{release}.tar.xz", None
+    )
+    member_name = f"{release}/wasmtime"
+    binary.parent.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(archive, "r:xz") as tar:
+        member = tar.extractfile(member_name)
+        if member is None:
+            raise SystemExit(f"{archive} does not contain {member_name}")
+        with binary.open("wb") as handle:
+            shutil.copyfileobj(member, handle)
+    binary.chmod(0o755)
+    return binary
 
 
 def ensure_guest_disk(repo_root: Path, base: Path, asset_dir: Path, disk_size: str) -> Path:
@@ -271,28 +542,59 @@ def ensure_guest_disk(repo_root: Path, base: Path, asset_dir: Path, disk_size: s
     return disk
 
 
-def find_qemu_file(qemu_bin: str, filename: str) -> Path:
+# Matched (code, vars) aarch64 edk2 builds. Both halves must come from the
+# same distribution build: `virt` maps them as two pflash banks of identical
+# size, so pairing e.g. a Fedora code image with a Debian vars image fails at
+# QEMU startup. Only flash-padded builds qualify — Debian's unpadded
+# `/usr/share/qemu-efi-aarch64/QEMU_EFI.fd` is a bare firmware volume, not a
+# pflash image.
+AARCH64_FIRMWARE_PAIRS = (
+    ("edk2-aarch64-code.fd", "edk2-arm-vars.fd"),
+    ("AAVMF_CODE.fd", "AAVMF_VARS.fd"),
+)
+
+
+def qemu_share_dirs(qemu_bin: str) -> list[Path]:
+    """Directories that may hold firmware images for `qemu_bin`, best first."""
     qemu_path = shutil.which(qemu_bin) if len(Path(qemu_bin).parts) == 1 else qemu_bin
-    candidates = []
+    share_dirs = []
     if qemu_path:
-        qemu_parent = Path(qemu_path).resolve().parent.parent
-        candidates.append(qemu_parent / "share/qemu" / filename)
-    candidates.extend(
+        qemu_prefix = Path(qemu_path).resolve().parent.parent
+        share_dirs.append(qemu_prefix / "share/qemu")
+    share_dirs.extend(
         [
-            Path("/opt/homebrew/share/qemu") / filename,
-            Path("/usr/local/share/qemu") / filename,
+            Path("/opt/homebrew/share/qemu"),
+            Path("/usr/local/share/qemu"),
+            Path("/usr/share/qemu"),
+            # Fedora hosts split edk2 out of the QEMU data package.
+            Path("/usr/share/edk2/aarch64"),
+            # Debian/Ubuntu ship the aarch64 edk2 firmware as AAVMF.
+            Path("/usr/share/AAVMF"),
         ]
     )
-    for candidate in candidates:
-        if candidate.is_file():
-            return candidate
-    searched = ", ".join(str(candidate) for candidate in candidates)
-    raise SystemExit(f"failed to find QEMU firmware {filename}; searched {searched}")
+    return list(dict.fromkeys(share_dirs))
+
+
+def find_aarch64_firmware(qemu_bin: str) -> tuple[Path, Path]:
+    share_dirs = qemu_share_dirs(qemu_bin)
+    candidates = [
+        (share_dir / code_name, share_dir / vars_name)
+        for share_dir in share_dirs
+        for code_name, vars_name in AARCH64_FIRMWARE_PAIRS
+    ]
+    for code, vars_template in candidates:
+        if code.is_file() and vars_template.is_file():
+            return code, vars_template
+    searched = ", ".join(f"{code}+{vars_template.name}" for code, vars_template in candidates)
+    raise SystemExit(
+        "failed to find a matched aarch64 edk2 code/vars firmware pair; searched "
+        f"{searched}. Install the distribution's aarch64 UEFI firmware (Debian/Ubuntu: "
+        "qemu-efi-aarch64, Fedora: edk2-aarch64, Homebrew: qemu)."
+    )
 
 
 def ensure_firmware_vars(asset_dir: Path, qemu_bin: str) -> tuple[Path, Path]:
-    code = find_qemu_file(qemu_bin, "edk2-aarch64-code.fd")
-    vars_template = find_qemu_file(qemu_bin, "edk2-arm-vars.fd")
+    code, vars_template = find_aarch64_firmware(qemu_bin)
     vars_path = asset_dir / "edk2-aarch64-vars.fd"
     if not vars_path.is_file():
         shutil.copyfile(vars_template, vars_path)
@@ -330,6 +632,10 @@ def ssh_output(
     return output([*ssh_base(key, port), f"bash -lc {shlex.quote(command)}"], repo_root, timeout=timeout)
 
 
+class GuestUnreachable(RuntimeError):
+    """The guest never became reachable over SSH within its boot budget."""
+
+
 def wait_for_ssh(repo_root: Path, key: Path, port: int, timeout_seconds: int) -> None:
     deadline = time.monotonic() + timeout_seconds
     last_error = "ssh not attempted"
@@ -340,7 +646,62 @@ def wait_for_ssh(repo_root: Path, key: Path, port: int, timeout_seconds: int) ->
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
             last_error = str(error)
             time.sleep(2)
-    raise SystemExit(f"Fedora QEMU guest did not become reachable over SSH: {last_error}")
+    raise GuestUnreachable(
+        f"Fedora QEMU guest did not become reachable over SSH: {last_error}"
+    )
+
+
+# Fedora 44's systemd occasionally fails its manager startup under TCG
+# ("Failed to fork off sandboxing environment for executing generators:
+# Protocol error") and freezes before sshd, observed on the arm64 CI
+# runner on a fresh first boot. That is an upstream guest flake, not a
+# harness bug, so the boot is retried on a pristine overlay; each failed
+# attempt's serial log is preserved for diagnosis.
+BOOT_ATTEMPTS = 3
+BOOT_SSH_TIMEOUT_CEILING_SECONDS = 900
+
+
+def boot_reachable_vm(
+    repo_root: Path,
+    asset_dir: Path,
+    qemu_bin: str,
+    base: Path,
+    disk_size: str,
+    seed_iso: Path,
+    key: Path,
+    port: int,
+    memory: str,
+    smp: int,
+    guest_arch: str,
+    accel: str,
+    setup_timeout_seconds: int,
+) -> tuple[subprocess.Popen, Path]:
+    ssh_budget = min(setup_timeout_seconds, BOOT_SSH_TIMEOUT_CEILING_SECONDS)
+    serial_log = asset_dir / "serial.log"
+    last_error = "boot not attempted"
+    for attempt in range(1, BOOT_ATTEMPTS + 1):
+        disk = ensure_guest_disk(repo_root, base, asset_dir, disk_size)
+        process = start_vm(
+            repo_root, asset_dir, qemu_bin, disk, seed_iso, port, memory, smp, guest_arch, accel
+        )
+        try:
+            wait_for_ssh(repo_root, key, port, ssh_budget)
+            return process, disk
+        except GuestUnreachable as error:
+            last_error = str(error)
+            stop_vm(process)
+            preserved = asset_dir / f"serial.boot-attempt-{attempt}.log"
+            if serial_log.is_file():
+                shutil.copyfile(serial_log, preserved)
+            print(
+                f"guest boot attempt {attempt}/{BOOT_ATTEMPTS} failed; "
+                f"serial preserved at {preserved}",
+                file=sys.stderr,
+            )
+            disk.unlink(missing_ok=True)
+    raise SystemExit(
+        f"Fedora QEMU guest failed to boot after {BOOT_ATTEMPTS} attempts: {last_error}"
+    )
 
 
 def start_vm(
@@ -352,15 +713,18 @@ def start_vm(
     ssh_port: int,
     memory: str,
     smp: int,
+    guest_arch: str,
+    accel: str,
 ) -> subprocess.Popen:
-    code, vars_path = ensure_firmware_vars(asset_dir, qemu_bin)
+    machine, cpu = machine_and_cpu(guest_arch, accel)
     serial_log = asset_dir / "serial.log"
+    blk_device, net_device, rng_device = virtio_devices(guest_arch)
     command = [
         qemu_bin,
         "-machine",
-        "virt,gic-version=3,accel=hvf",
+        machine,
         "-cpu",
-        "host",
+        cpu,
         "-smp",
         str(smp),
         "-m",
@@ -371,22 +735,34 @@ def start_vm(
         "none",
         "-serial",
         f"file:{serial_log}",
-        "-drive",
-        f"if=pflash,format=raw,readonly=on,file={code}",
-        "-drive",
-        f"if=pflash,format=raw,file={vars_path}",
+    ]
+    if guest_arch == "aarch64":
+        code, vars_path = ensure_firmware_vars(asset_dir, qemu_bin)
+        command += [
+            "-drive",
+            f"if=pflash,format=raw,readonly=on,file={code}",
+            "-drive",
+            f"if=pflash,format=raw,file={vars_path}",
+        ]
+    command += [
         "-drive",
         f"if=none,format=qcow2,file={disk},id=rootfs",
         "-device",
-        "virtio-blk-device,drive=rootfs",
+        f"{blk_device},drive=rootfs",
         "-drive",
         f"if=none,format=raw,readonly=on,file={seed_iso},id=seed",
         "-device",
-        "virtio-blk-device,drive=seed",
+        f"{blk_device},drive=seed",
         "-netdev",
         f"user,id=net0,hostfwd=tcp:127.0.0.1:{ssh_port}-:22",
         "-device",
-        "virtio-net-device,netdev=net0",
+        f"{net_device},netdev=net0",
+        # Entropy consumers on the Fedora boot path (systemd's random seed and
+        # the first-boot sshd host keys) block until the pool is credited.
+        "-object",
+        "rng-random,id=rng0,filename=/dev/urandom",
+        "-device",
+        f"{rng_device},rng=rng0",
     ]
     return subprocess.Popen(command, cwd=repo_root, start_new_session=True)
 
@@ -419,7 +795,6 @@ def ensure_provisioned(
     port: int,
     timeout_seconds: int,
     quickjs_policy: dict | None,
-    quickjs_source_archive_available: bool,
     require_simd_probe: bool,
 ) -> None:
     marker = "/var/lib/helios-fedora-qemu-bench-provisioned"
@@ -455,14 +830,6 @@ def ensure_provisioned(
     )
     if ssh_output(repo_root, key, port, f"({verify_command}) && echo yes || true", timeout=20) == "yes":
         return
-    if quickjs_policy is not None and not quickjs_source_archive_available:
-        raise SystemExit(
-            "Fedora guest QuickJS is not already provisioned with policy "
-            f"{quickjs_policy['id']}, and no local QuickJS-NG v{QUICKJS_VERSION} "
-            "source archive is staged for offline rebuild. Place the archive at "
-            f"{DEFAULT_ASSET_DIR}/sources/{QUICKJS_SOURCE_ARCHIVE_NAME} or pass "
-            "--quickjs-source-archive."
-        )
     package_list = " ".join(shlex.quote(package) for package in FEDORA_PACKAGES)
     command_parts = [f"({base_verify_command}) || sudo dnf install -y {package_list}"]
     if quickjs_policy is not None:
@@ -592,12 +959,8 @@ def ensure_wasmtime_linux(
     repo_root: Path,
     key: Path,
     port: int,
-    wasmtime_linux_bin: Path | None,
     wasmtime_linux_archive: Path | None,
 ) -> str:
-    if wasmtime_linux_bin is not None:
-        version = ssh_output(repo_root, key, port, f"{shlex.quote(REMOTE_WASMTIME_BIN)} --version", timeout=20)
-        return f"{REMOTE_WASMTIME_BIN} ({version})"
     if wasmtime_linux_archive is not None:
         install = " && ".join(
             [
@@ -611,17 +974,8 @@ def ensure_wasmtime_linux(
             ]
         )
         ssh(repo_root, key, port, install, timeout=60)
-        version = ssh_output(repo_root, key, port, f"{shlex.quote(REMOTE_WASMTIME_BIN)} --version", timeout=20)
-        return f"{REMOTE_WASMTIME_BIN} ({version})"
-    version = ssh_output(repo_root, key, port, "wasmtime --version 2>/dev/null || true", timeout=20)
-    if not version:
-        raise SystemExit(
-            "Wasmtime-on-Linux baseline requested, but the Fedora guest has no "
-            "wasmtime binary. Pass --wasmtime-linux-bin with an aarch64 Linux "
-            "wasmtime executable or --wasmtime-linux-archive with a pre-staged "
-            "aarch64 Linux Wasmtime tar archive."
-        )
-    return f"wasmtime ({version})"
+    version = ssh_output(repo_root, key, port, f"{shlex.quote(REMOTE_WASMTIME_BIN)} --version", timeout=20)
+    return f"{REMOTE_WASMTIME_BIN} ({version})"
 
 
 def linux_cpu_features(
@@ -634,13 +988,14 @@ def linux_cpu_features(
     cpuinfo = ssh_output(repo_root, key, port, "cat /proc/cpuinfo", timeout=20)
     features = []
     for line in cpuinfo.splitlines():
-        if line.startswith("Features"):
+        # aarch64 reports "Features", x86_64 reports "flags".
+        if line.startswith(("Features", "flags")):
             _, _, value = line.partition(":")
             features = value.split()
             break
     result = {
-        "aarch64_features": features,
-        "asimd": "asimd" in features,
+        "cpu_features": features,
+        "simd": "asimd" in features or "sse2" in features,
         "quickjs_required": quickjs_policy is not None,
         "native_simd_probe_required": require_simd_probe,
     }
@@ -738,6 +1093,7 @@ def run_fedora_qemu_linux(
     iterations: int,
     workloads: list[dict],
     image_url: str,
+    image_sha256: str,
     asset_dir: Path,
     qemu_bin: str,
     ssh_port: int | None,
@@ -751,12 +1107,18 @@ def run_fedora_qemu_linux(
     quickjs_source_archive: Path | None = None,
     wasmtime_linux_bin: Path | None = None,
     wasmtime_linux_archive: Path | None = None,
+    guest_arch: str | None = None,
+    accel: str | None = None,
 ) -> tuple[Path | None, Path | None, dict]:
+    guest_arch = guest_arch or host_arch()
+    accel = accel or default_accel(guest_arch)
+    machine, cpu = machine_and_cpu(guest_arch, accel)
     native_workloads = [
         workload for workload in workloads if workload["runner"] in ("shell", "program")
     ]
     wasmtime_workloads = [workload for workload in workloads if workload.get("wasmtime_profile")]
     asset_dir = resolve_asset_dir(repo_root, asset_dir)
+    asset_dir.mkdir(parents=True, exist_ok=True)
     wasmtime_linux_bin = resolve_optional_path(repo_root, wasmtime_linux_bin)
     wasmtime_linux_archive = resolve_optional_path(repo_root, wasmtime_linux_archive)
     quickjs_required = any(
@@ -771,24 +1133,30 @@ def run_fedora_qemu_linux(
         if quickjs_required
         else None
     )
-    asset_dir.mkdir(parents=True, exist_ok=True)
+    staged_wasmtime_release = None
+    if wasmtime_workloads and wasmtime_linux_bin is None and wasmtime_linux_archive is None:
+        wasmtime_linux_bin = stage_wasmtime_linux_bin(repo_root, asset_dir, guest_arch)
+        staged_wasmtime_release = wasmtime_linux_release(guest_arch)[0]
     key = ensure_private_key(repo_root, asset_dir)
     public_key = key.with_suffix(key.suffix + ".pub").read_text(encoding="utf-8").strip()
-    seed_iso = render_seed(repo_root, asset_dir, public_key)
-    base = download_base_image(repo_root, asset_dir, image_url)
-    disk = ensure_guest_disk(repo_root, base, asset_dir, disk_size)
+    seed_iso = render_seed(repo_root, asset_dir, public_key, accel)
+    base = download_base_image(repo_root, asset_dir, image_url, image_sha256)
+    disk = asset_dir / "fedora-bench.qcow2"
+    blk_device, net_device, _ = virtio_devices(guest_arch)
     provenance = {
-        "kind": "fedora-qemu-aarch64-hvf",
+        "kind": f"fedora-qemu-{guest_arch}-{accel}",
+        "host_arch": platform.machine(),
         "fedora_image_url": image_url,
+        "fedora_image_sha256": image_sha256,
         "fedora_base_image": str(base),
         "fedora_guest_disk": str(disk),
         "qemu_bin": qemu_bin,
-        "qemu_machine": "virt,gic-version=3,accel=hvf",
-        "qemu_cpu": "host",
+        "qemu_machine": machine,
+        "qemu_cpu": cpu,
         "qemu_smp": smp,
         "qemu_memory": memory,
-        "network": "virtio-net-device over QEMU user net; workloads connect to host through 10.0.2.2",
-        "block": "virtio-blk-device",
+        "network": f"{net_device} over QEMU user net; workloads connect to host through 10.0.2.2",
+        "block": blk_device,
         "quickjs_required": quickjs_required,
         "native_simd_probe_required": simd_probe_required,
         "wasmtime_linux_required": bool(wasmtime_workloads),
@@ -796,8 +1164,8 @@ def run_fedora_qemu_linux(
     }
     if quickjs_source_archive is not None:
         provenance["quickjs_source_archive"] = str(quickjs_source_archive)
-    elif quickjs_required:
-        provenance["quickjs_source_archive"] = "not-staged; using pre-provisioned guest qjs"
+    if staged_wasmtime_release is not None:
+        provenance["wasmtime_linux_release"] = staged_wasmtime_release
     if wasmtime_linux_bin is not None:
         provenance["wasmtime_linux_bin"] = str(wasmtime_linux_bin)
     if wasmtime_linux_archive is not None:
@@ -805,9 +1173,22 @@ def run_fedora_qemu_linux(
     if not native_workloads and not wasmtime_workloads:
         return None, None, provenance
     port = ssh_port or free_tcp_port()
-    process = start_vm(repo_root, asset_dir, qemu_bin, disk, seed_iso, port, memory, smp)
+    process, disk = boot_reachable_vm(
+        repo_root,
+        asset_dir,
+        qemu_bin,
+        base,
+        disk_size,
+        seed_iso,
+        key,
+        port,
+        memory,
+        smp,
+        guest_arch,
+        accel,
+        setup_timeout_seconds,
+    )
     try:
-        wait_for_ssh(repo_root, key, port, setup_timeout_seconds)
         copy_guest_files(
             repo_root,
             key,
@@ -823,7 +1204,6 @@ def run_fedora_qemu_linux(
             port,
             setup_timeout_seconds,
             quickjs_policy,
-            quickjs_source_archive is not None,
             simd_probe_required,
         )
         provenance.update(
@@ -835,12 +1215,9 @@ def run_fedora_qemu_linux(
                 repo_root,
                 key,
                 port,
-                wasmtime_linux_bin,
                 wasmtime_linux_archive,
             )
-            wasmtime_bin = REMOTE_WASMTIME_BIN if (
-                wasmtime_linux_bin is not None or wasmtime_linux_archive is not None
-            ) else "wasmtime"
+            wasmtime_bin = REMOTE_WASMTIME_BIN
         hyperfine_json = None
         if native_workloads:
             ssh(

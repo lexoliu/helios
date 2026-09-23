@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 
 use bytes::Bytes;
 
-use crate::io::{ByteReader, ByteWriter, ClosedPeer, TryRead};
+use crate::io::{ByteReader, ByteWriter, TryRead};
 use crate::{
     EntropyError, EntropyPool, InstanceExecutionTransition, InstanceRegistry, KernelClock,
     KillReason, ProcessAuthority, RegisteredInstance, SetWallClockCap, Sleep, Timer,
@@ -43,8 +43,41 @@ pub enum ComponentOutputRoute {
 }
 
 impl ComponentOutputRoute {
+    /// Borrow this route as a sink so every writer path matches on one
+    /// exhaustive set of destinations.
+    pub fn sink(&self) -> ComponentOutputSink<'_> {
+        match self {
+            Self::Serial => ComponentOutputSink::Local(LocalOutputSink::Serial),
+            Self::Trace => ComponentOutputSink::Local(LocalOutputSink::Trace),
+            Self::Child(writer) => ComponentOutputSink::Child(writer),
+            Self::Discard => ComponentOutputSink::Local(LocalOutputSink::Discard),
+        }
+    }
+}
+
+/// Borrowed resolution of where one stdio stream's bytes go.
+///
+/// The split is exactly the flow-control boundary: a [`LocalOutputSink`]
+/// accepts bytes unconditionally and never blocks, while `Child` is a
+/// bounded byte channel that applies backpressure — callers must either
+/// await [`ByteWriter::write`] or drive [`ByteWriter::poll_write`] from a
+/// poll context.
+pub enum ComponentOutputSink<'a> {
+    Local(LocalOutputSink),
+    Child(&'a ByteWriter),
+}
+
+/// Output destinations that can always take one more chunk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalOutputSink {
+    Serial,
+    Trace,
+    Discard,
+}
+
+impl LocalOutputSink {
     pub(crate) fn write<CpuImpl, RuntimeStateImpl>(
-        &self,
+        self,
         cpu: &CpuImpl,
         runtime_state: &RuntimeStateImpl,
         serial_writer: fn(&[u8]),
@@ -61,33 +94,7 @@ impl ComponentOutputRoute {
                 });
                 runtime_state.record_console_text(cpu.now().ticks(), text);
             }
-            Self::Child(writer) => {
-                let _: Result<(), ClosedPeer> = writer.write(Bytes::copy_from_slice(bytes));
-            }
             Self::Discard => {}
-        }
-    }
-
-    pub(crate) fn write_bytes<CpuImpl, RuntimeStateImpl>(
-        &self,
-        cpu: &CpuImpl,
-        runtime_state: &RuntimeStateImpl,
-        serial_writer: fn(&[u8]),
-        bytes: Bytes,
-    ) where
-        CpuImpl: Cpu + Clone,
-        RuntimeStateImpl: ComponentRuntimeState,
-    {
-        if bytes.is_empty() {
-            return;
-        }
-        match self {
-            Self::Child(writer) => {
-                let _: Result<(), ClosedPeer> = writer.write(bytes);
-            }
-            Self::Serial | Self::Trace | Self::Discard => {
-                self.write(cpu, runtime_state, serial_writer, &bytes);
-            }
         }
     }
 }
@@ -111,8 +118,7 @@ pub enum ComponentOutputMode {
 impl ComponentOutputMode {
     /// Obtain a cloneable writer for the requested child stream, when
     /// this mode has one. Returns `None` for `Serial`/`Trace`; callers
-    /// should dispatch through `ComponentStoreData::write_output` for
-    /// those routes.
+    /// that need every route should use [`Self::sink`] instead.
     pub fn child_writer(&self, kind: ComponentOutputStreamKind) -> Option<ByteWriter> {
         match (self, kind) {
             (ComponentOutputMode::Child { stdout_tx, .. }, ComponentOutputStreamKind::Stdout) => {
@@ -136,6 +142,28 @@ impl ComponentOutputMode {
                 ComponentOutputStreamKind::Stderr,
             ) => Some(writer.clone()),
             _ => None,
+        }
+    }
+
+    /// Resolve where `kind` goes without cloning a writer handle.
+    pub fn sink(&self, kind: ComponentOutputStreamKind) -> ComponentOutputSink<'_> {
+        match (self, kind) {
+            (ComponentOutputMode::Serial, _) => ComponentOutputSink::Local(LocalOutputSink::Serial),
+            (ComponentOutputMode::Trace, _) => ComponentOutputSink::Local(LocalOutputSink::Trace),
+            (ComponentOutputMode::Child { stdout_tx, .. }, ComponentOutputStreamKind::Stdout) => {
+                ComponentOutputSink::Child(stdout_tx)
+            }
+            (ComponentOutputMode::Child { stderr_tx, .. }, ComponentOutputStreamKind::Stderr) => {
+                ComponentOutputSink::Child(stderr_tx)
+            }
+            (
+                ComponentOutputMode::RoutedChild { stdout, .. },
+                ComponentOutputStreamKind::Stdout,
+            ) => stdout.sink(),
+            (
+                ComponentOutputMode::RoutedChild { stderr, .. },
+                ComponentOutputStreamKind::Stderr,
+            ) => stderr.sink(),
         }
     }
 
@@ -411,73 +439,39 @@ where
         self.entropy.insecure_seed()
     }
 
-    /// Deliver a chunk of stdout/stderr bytes to whatever sink is
-    /// configured for this component. Never blocks.
-    pub fn write_output(&self, stream: ComponentOutputStreamKind, bytes: &[u8]) {
+    /// Deliver an owned stdout/stderr chunk from a synchronous poll
+    /// context, honouring child-channel backpressure.
+    ///
+    /// Serial, trace, and discard sinks complete immediately. A child pipe
+    /// that is at capacity parks the caller: `pending` keeps the chunk and
+    /// `wait` keeps the registration, so the next poll retries the very
+    /// same bytes once the parent has drained. Nothing is dropped and a
+    /// full pipe is never reported as an error — a vanished reader is
+    /// swallowed like a POSIX write to a closed pipe with SIGPIPE
+    /// suppressed.
+    pub fn poll_write_output_bytes(
+        &self,
+        stream: ComponentOutputStreamKind,
+        cx: &mut core::task::Context<'_>,
+        wait: &mut Option<crate::ByteWriteWait>,
+        pending: &mut Option<Bytes>,
+    ) -> core::task::Poll<()> {
+        let Some(bytes) = pending.as_ref() else {
+            return core::task::Poll::Ready(());
+        };
         if bytes.is_empty() {
-            return;
+            *pending = None;
+            return core::task::Poll::Ready(());
         }
-        match &self.execution_context.output_mode {
-            ComponentOutputMode::Serial => (self.serial_writer)(bytes),
-            ComponentOutputMode::Trace => {
-                let text = core::str::from_utf8(bytes).unwrap_or_else(|error| {
-                    panic!("guest attempted to write non-utf8 stdout/stderr bytes: {error}")
-                });
-                self.runtime_state
-                    .record_console_text(self.cpu.now().ticks(), text);
+        match self.execution_context.output_mode.sink(stream) {
+            ComponentOutputSink::Local(local) => {
+                let bytes = pending.take().expect("the chunk was present a line ago");
+                local.write(&self.cpu, &self.runtime_state, self.serial_writer, &bytes);
+                core::task::Poll::Ready(())
             }
-            ComponentOutputMode::Child {
-                stdout_tx,
-                stderr_tx,
-                ..
-            } => {
-                let writer = match stream {
-                    ComponentOutputStreamKind::Stdout => stdout_tx,
-                    ComponentOutputStreamKind::Stderr => stderr_tx,
-                };
-                // Ignore ClosedPeer: the parent dropped the reader, so
-                // further writes are simply discarded. This matches POSIX
-                // behavior when writing to a closed pipe with SIGPIPE
-                // suppressed.
-                let _: Result<(), ClosedPeer> = writer.write(Bytes::copy_from_slice(bytes));
-            }
-            ComponentOutputMode::RoutedChild { stdout, stderr, .. } => {
-                let route = match stream {
-                    ComponentOutputStreamKind::Stdout => stdout,
-                    ComponentOutputStreamKind::Stderr => stderr,
-                };
-                route.write(&self.cpu, &self.runtime_state, self.serial_writer, bytes);
-            }
-        }
-    }
-
-    /// Deliver an owned stdout/stderr chunk. Child-pipe routes keep the `Bytes`
-    /// allocation instead of copying into a second channel buffer.
-    pub fn write_output_bytes(&self, stream: ComponentOutputStreamKind, bytes: Bytes) {
-        if bytes.is_empty() {
-            return;
-        }
-        match &self.execution_context.output_mode {
-            ComponentOutputMode::Child {
-                stdout_tx,
-                stderr_tx,
-                ..
-            } => {
-                let writer = match stream {
-                    ComponentOutputStreamKind::Stdout => stdout_tx,
-                    ComponentOutputStreamKind::Stderr => stderr_tx,
-                };
-                let _: Result<(), ClosedPeer> = writer.write(bytes);
-            }
-            ComponentOutputMode::RoutedChild { stdout, stderr, .. } => {
-                let route = match stream {
-                    ComponentOutputStreamKind::Stdout => stdout,
-                    ComponentOutputStreamKind::Stderr => stderr,
-                };
-                route.write_bytes(&self.cpu, &self.runtime_state, self.serial_writer, bytes);
-            }
-            ComponentOutputMode::Serial | ComponentOutputMode::Trace => {
-                self.write_output(stream, &bytes);
+            ComponentOutputSink::Child(writer) => {
+                let wait = wait.get_or_insert_with(|| writer.wait_state());
+                writer.poll_write(cx, wait, pending).map(|_closed_or_ok| ())
             }
         }
     }

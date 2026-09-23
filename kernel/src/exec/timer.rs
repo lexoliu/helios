@@ -26,9 +26,11 @@ const TIMER_WHEEL_SLOTS: usize = 256;
 const TIMER_INBOX_CAPACITY: usize = TIMER_WHEEL_SLOTS * 16;
 const TIMER_READY_POOL_SLOTS: usize = 8;
 const TIMER_READY_RETAINED_ENTRIES: usize = TIMER_WHEEL_SLOTS;
-/// Slots reserved for the per-Timer SleepState pool. Sized so the
-/// fast path covers the same in-flight depth as `TIMER_INBOX_CAPACITY`
-/// without reintroducing per-sleep heap allocation.
+/// Slots reserved for the per-Timer SleepState pool. A slot is held
+/// exactly as long as its `Sleep` future is alive — the wheel holds
+/// generation-validated weak handles and never pins a slot — so this
+/// bounds the number of concurrently live pending sleeps on one timer,
+/// matching the `TIMER_INBOX_CAPACITY` capacity contract.
 const SLEEP_STATE_POOL_SLOTS: usize = TIMER_INBOX_CAPACITY;
 
 #[derive(Clone)]
@@ -65,21 +67,20 @@ struct TimerShared {
 struct TimerEntry {
     deadline: Instant,
     deadline_tick: u64,
-    state: SleepRef,
+    state: SleepHandle,
 }
 
 struct SleepState {
-    deadline: Instant,
     queued: AtomicBool,
     fired: AtomicBool,
-    cancelled: AtomicBool,
     waker: AtomicWaker,
 }
 
 /// Bounded slab pool that hands out reference-counted handles to a
-/// fixed array of `SleepState` cells. Exhaustion is a kernel capacity
-/// contract violation and fails immediately instead of reintroducing
-/// the previous per-Sleep heap allocation path.
+/// fixed array of `SleepState` cells. Slots are pinned only by live
+/// `Sleep` futures, so exhaustion means more concurrently pending
+/// sleeps than the kernel capacity contract allows and fails
+/// immediately instead of reintroducing per-Sleep heap allocation.
 struct SleepStatePool {
     slots: Box<[SleepStateSlot]>,
     free_indices: ConcurrentQueue<u32>,
@@ -91,8 +92,12 @@ struct SleepStateSlot {
     /// and the cell is uninitialised; readers must consult the
     /// freelist before touching the cell.
     refcount: AtomicU32,
+    /// Bumped on every final release, before the slot returns to the
+    /// freelist. Weak handles snapshot it and validate against it so a
+    /// recycled slot can never satisfy a stale wheel entry.
+    generation: AtomicU64,
     /// Slot storage. Initialised between `acquire` and the final
-    /// `Drop` of every `SleepRef::Pooled` referencing this slot.
+    /// `Drop` of every `SleepRef` referencing this slot.
     cell: UnsafeCell<MaybeUninit<SleepState>>,
 }
 
@@ -106,12 +111,22 @@ struct SleepStateSlot {
 unsafe impl Send for SleepStateSlot {}
 unsafe impl Sync for SleepStateSlot {}
 
-/// Pool-backed handle. The `shared` Arc keeps the pool alive for the
-/// lifetime of every clone of this handle; the slot is reclaimed once
-/// the last ref drops.
+/// Pool-backed strong handle. The `shared` Arc keeps the pool alive
+/// for the lifetime of every clone of this handle; the slot is
+/// reclaimed once the last ref drops.
 struct SleepRef {
     shared: Arc<TimerShared>,
     idx: u32,
+}
+
+/// Weak, generation-validated handle held by timer inbox and wheel
+/// entries. It pins nothing: the slot is reclaimed the moment the
+/// owning `Sleep` drops, and a stale handle just fails validation.
+/// All accesses go through the pool the handle was minted from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct SleepHandle {
+    idx: u32,
+    generation: u64,
 }
 
 struct TimingWheel {
@@ -195,14 +210,15 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
         // processor. Sleep futures only enqueue through the lock-free inbox, and
         // interrupt handlers only disarm the hardware timer.
         let state = unsafe { &mut *self.shared.state.get() };
+        let pool = &self.shared.sleep_pool;
         self.drain_inbox(state);
 
         let now_tick = wheel_tick_floor(now, self.shared.wheel_quantum_ticks);
-        state.wheel.drain_expired(now_tick, &mut ready);
-        let next_deadline = state.wheel.next_live_deadline();
+        state.wheel.drain_expired(pool, now_tick, &mut ready);
+        let next_deadline = state.wheel.next_live_deadline(pool);
 
         for entry in ready.iter() {
-            entry.state.fire();
+            entry.state.fire(pool);
         }
 
         self.commit_deadline(next_deadline, now);
@@ -215,8 +231,7 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
         0
     }
 
-    fn enqueue(&self, state: SleepRef) {
-        let deadline = state.deadline;
+    fn enqueue(&self, deadline: Instant, state: SleepHandle) {
         let entry = TimerEntry {
             deadline,
             deadline_tick: wheel_tick_ceil(deadline, self.shared.wheel_quantum_ticks),
@@ -235,7 +250,7 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
     fn drain_inbox(&self, state: &mut TimerState) {
         loop {
             match self.shared.inbox.pop() {
-                Ok(entry) => state.wheel.insert(entry),
+                Ok(entry) => state.wheel.insert(&self.shared.sleep_pool, entry),
                 Err(PopError::Empty | PopError::Closed) => return,
             }
         }
@@ -321,7 +336,7 @@ impl<CpuImpl: Cpu + Clone> Future for Sleep<CpuImpl> {
         }
 
         if this.state.is_none() {
-            this.state = Some(SleepRef::new_for_deadline(&this.timer.shared, deadline));
+            this.state = Some(SleepRef::new(&this.timer.shared));
         }
         let state = this
             .state
@@ -335,7 +350,7 @@ impl<CpuImpl: Cpu + Clone> Future for Sleep<CpuImpl> {
         state.waker.register(cx.waker());
 
         if !state.queued.swap(true, AtomicOrdering::AcqRel) {
-            this.timer.enqueue(state.clone());
+            this.timer.enqueue(deadline, state.downgrade());
         }
 
         if state.fired.load(AtomicOrdering::Acquire) {
@@ -348,21 +363,11 @@ impl<CpuImpl: Cpu + Clone> Future for Sleep<CpuImpl> {
 
 impl<CpuImpl: Cpu + Clone> Unpin for Sleep<CpuImpl> {}
 
-impl<CpuImpl: Cpu + Clone> Drop for Sleep<CpuImpl> {
-    fn drop(&mut self) {
-        if let Some(state) = self.state.as_ref() {
-            state.cancelled.store(true, AtomicOrdering::Release);
-        }
-    }
-}
-
 impl SleepState {
-    fn new(deadline: Instant) -> Self {
+    fn new() -> Self {
         Self {
-            deadline,
             queued: AtomicBool::new(false),
             fired: AtomicBool::new(false),
-            cancelled: AtomicBool::new(false),
             waker: AtomicWaker::new(),
         }
     }
@@ -381,6 +386,7 @@ impl SleepStatePool {
         let slots: Box<[SleepStateSlot]> = (0..capacity)
             .map(|_| SleepStateSlot {
                 refcount: AtomicU32::new(0),
+                generation: AtomicU64::new(0),
                 cell: UnsafeCell::new(MaybeUninit::uninit()),
             })
             .collect();
@@ -424,11 +430,41 @@ impl SleepStatePool {
     fn slot(&self, idx: u32) -> &SleepStateSlot {
         &self.slots[idx as usize]
     }
+
+    /// Drops one reference to `idx`, tearing down and recycling the
+    /// slot when it was the last.
+    fn release(&self, idx: u32) {
+        let slot = self.slot(idx);
+        // AcqRel: pair Acquire on the last-drop branch with all
+        // Release stores on prior clones so we observe the most
+        // recent state writes before tearing down the cell.
+        let prev = slot.refcount.fetch_sub(1, AtomicOrdering::AcqRel);
+        if prev != 1 {
+            return;
+        }
+        // Last reference. Synchronise with any concurrent pre-drop
+        // reads from other threads.
+        fence(AtomicOrdering::Acquire);
+        // SAFETY: we are the last observer of the slot; the refcount
+        // is now zero, no other thread can touch the cell until
+        // acquire republishes it. Drop-in-place releases the
+        // SleepState's `AtomicWaker` registration and any other
+        // resources before the slot is recycled.
+        unsafe {
+            (*slot.cell.get()).assume_init_drop();
+        }
+        // Invalidate outstanding weak handles before the index becomes
+        // acquirable again.
+        slot.generation.fetch_add(1, AtomicOrdering::Release);
+        self.free_indices
+            .push(idx)
+            .unwrap_or_else(|_| panic!("sleep state pool freelist overflow"));
+    }
 }
 
 impl SleepRef {
-    fn new_for_deadline(shared: &Arc<TimerShared>, deadline: Instant) -> Self {
-        let idx = shared.sleep_pool.acquire(SleepState::new(deadline));
+    fn new(shared: &Arc<TimerShared>) -> Self {
+        let idx = shared.sleep_pool.acquire(SleepState::new());
         Self {
             shared: shared.clone(),
             idx,
@@ -448,12 +484,55 @@ impl SleepRef {
         unsafe { (*slot.cell.get()).assume_init_ref() }
     }
 
-    /// Compares two refs for the same underlying SleepState. Used by
-    /// the wheel tests to assert entry identity after the pool
-    /// indirection replaces the previous `Arc::ptr_eq` pattern.
-    #[cfg(test)]
-    fn ptr_eq(left: &Self, right: &Self) -> bool {
-        Arc::ptr_eq(&left.shared, &right.shared) && left.idx == right.idx
+    /// Weak handle for the timer inbox and wheel. Snapshotting the
+    /// generation under a live strong ref is race-free: it only moves
+    /// when the refcount reaches zero.
+    fn downgrade(&self) -> SleepHandle {
+        let slot = self.shared.sleep_pool.slot(self.idx);
+        SleepHandle {
+            idx: self.idx,
+            generation: slot.generation.load(AtomicOrdering::Relaxed),
+        }
+    }
+}
+
+impl SleepHandle {
+    /// True once the owning `Sleep` released the slot (or the slot has
+    /// been recycled for a newer sleeper). Only touches the slot
+    /// header, never the cell, so it is safe on stale handles.
+    fn is_dead(&self, pool: &SleepStatePool) -> bool {
+        let slot = pool.slot(self.idx);
+        slot.refcount.load(AtomicOrdering::Acquire) == 0
+            || slot.generation.load(AtomicOrdering::Acquire) != self.generation
+    }
+
+    /// Wakes the sleeper if this handle is still current. Takes a
+    /// temporary strong reference so the cell cannot be torn down
+    /// mid-wake by a concurrent `Sleep` drop on another processor.
+    fn fire(&self, pool: &SleepStatePool) {
+        let slot = pool.slot(self.idx);
+        let mut refcount = slot.refcount.load(AtomicOrdering::Acquire);
+        loop {
+            if refcount == 0 {
+                return;
+            }
+            match slot.refcount.compare_exchange_weak(
+                refcount,
+                refcount + 1,
+                AtomicOrdering::Acquire,
+                AtomicOrdering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(current) => refcount = current,
+            }
+        }
+        if slot.generation.load(AtomicOrdering::Acquire) == self.generation {
+            // SAFETY: the reference taken above keeps the cell
+            // initialised, and the matching generation proves it still
+            // holds this handle's sleeper.
+            unsafe { (*slot.cell.get()).assume_init_ref() }.fire();
+        }
+        pool.release(self.idx);
     }
 }
 
@@ -465,45 +544,9 @@ impl Deref for SleepRef {
     }
 }
 
-impl Clone for SleepRef {
-    fn clone(&self) -> Self {
-        let slot = self.shared.sleep_pool.slot(self.idx);
-        let prev = slot.refcount.fetch_add(1, AtomicOrdering::Relaxed);
-        debug_assert!(prev > 0, "cloning a dropped sleep ref");
-        debug_assert!(prev < u32::MAX - 1, "sleep ref refcount overflow");
-        Self {
-            shared: self.shared.clone(),
-            idx: self.idx,
-        }
-    }
-}
-
 impl Drop for SleepRef {
     fn drop(&mut self) {
-        let slot = self.shared.sleep_pool.slot(self.idx);
-        // AcqRel: pair Acquire on the last-drop branch with all
-        // Release stores on prior clones so we observe the most
-        // recent state writes before tearing down the cell.
-        let prev = slot.refcount.fetch_sub(1, AtomicOrdering::AcqRel);
-        if prev != 1 {
-            return;
-        }
-        // Last reference. Synchronise with any concurrent pre-drop
-        // reads from other threads.
-        fence(AtomicOrdering::Acquire);
-        // SAFETY: we are the last observer of the slot; the refcount
-        // is now zero, no other thread can touch the cell until
-        // acquire republishes it. Drop-in-place releases the
-        // SleepState's `AtomicWaker` registration and any other
-        // resources before the slot is recycled.
-        unsafe {
-            (*slot.cell.get()).assume_init_drop();
-        }
-        self.shared
-            .sleep_pool
-            .free_indices
-            .push(self.idx)
-            .unwrap_or_else(|_| panic!("sleep state pool freelist overflow"));
+        self.shared.sleep_pool.release(self.idx);
     }
 }
 
@@ -518,10 +561,13 @@ impl TimingWheel {
         }
     }
 
-    fn insert(&mut self, entry: TimerEntry) {
-        if !entry.is_dead() {
-            self.observe_deadline(entry.deadline, entry.deadline_tick);
+    fn insert(&mut self, pool: &SleepStatePool, entry: TimerEntry) {
+        // A sleep dropped between enqueue and drain arrives already dead;
+        // dropping it here keeps wheel buckets bounded by live sleeps.
+        if entry.is_dead(pool) {
+            return;
         }
+        self.observe_deadline(entry.deadline, entry.deadline_tick);
         let target_tick = entry.deadline_tick.max(self.current_tick);
         let delay = target_tick.saturating_sub(self.current_tick);
         let level = wheel_level(delay);
@@ -529,22 +575,22 @@ impl TimingWheel {
         self.levels[level].buckets[slot].push(entry);
     }
 
-    fn drain_expired(&mut self, now_tick: u64, ready: &mut Vec<TimerEntry>) {
+    fn drain_expired(&mut self, pool: &SleepStatePool, now_tick: u64, ready: &mut Vec<TimerEntry>) {
         while self.current_tick < now_tick {
             self.current_tick = self.current_tick.saturating_add(1);
-            self.cascade();
-            self.drain_current_slot(ready);
+            self.cascade(pool);
+            self.drain_current_slot(pool, ready);
         }
-        self.drain_current_slot(ready);
+        self.drain_current_slot(pool, ready);
     }
 
-    fn next_live_deadline(&mut self) -> Option<Instant> {
+    fn next_live_deadline(&mut self, pool: &SleepStatePool) -> Option<Instant> {
         if self.next_deadline_dirty
             || self
                 .next_deadline_tick
                 .is_some_and(|deadline_tick| deadline_tick <= self.current_tick)
         {
-            self.rebuild_next_deadline();
+            self.rebuild_next_deadline(pool);
         }
         self.next_deadline
     }
@@ -559,47 +605,50 @@ impl TimingWheel {
         }
     }
 
-    fn rebuild_next_deadline(&mut self) {
+    fn rebuild_next_deadline(&mut self, pool: &SleepStatePool) {
         let next = self
             .levels
             .iter()
             .flat_map(|level| level.buckets.iter())
             .flat_map(|bucket| bucket.iter())
-            .filter(|entry| !entry.is_dead())
+            .filter(|entry| !entry.is_dead(pool))
             .min_by_key(|entry| entry.deadline);
         self.next_deadline = next.map(|entry| entry.deadline);
         self.next_deadline_tick = next.map(|entry| entry.deadline_tick);
         self.next_deadline_dirty = false;
     }
 
-    fn cascade(&mut self) {
+    fn cascade(&mut self, pool: &SleepStatePool) {
         for level in (1..TIMER_WHEEL_LEVELS).rev() {
             let lower_mask = (1_u64 << (level * 8)) - 1;
             if self.current_tick & lower_mask == 0 {
-                self.cascade_level(level);
+                self.cascade_level(pool, level);
             }
         }
     }
 
-    fn cascade_level(&mut self, level: usize) {
+    fn cascade_level(&mut self, pool: &SleepStatePool, level: usize) {
         let slot = wheel_slot(self.current_tick, level);
         while let Some(entry) = self.levels[level].buckets[slot].pop() {
             self.next_deadline_dirty = true;
-            self.insert(entry);
+            if entry.is_dead(pool) {
+                continue;
+            }
+            self.insert(pool, entry);
         }
     }
 
-    fn drain_current_slot(&mut self, ready: &mut Vec<TimerEntry>) {
+    fn drain_current_slot(&mut self, pool: &SleepStatePool, ready: &mut Vec<TimerEntry>) {
         let slot = wheel_slot(self.current_tick, 0);
         while let Some(entry) = self.levels[0].buckets[slot].pop() {
             self.next_deadline_dirty = true;
-            if entry.is_dead() {
+            if entry.is_dead(pool) {
                 continue;
             }
             if entry.deadline_tick <= self.current_tick {
                 ready.push(entry);
             } else {
-                self.insert(entry);
+                self.insert(pool, entry);
             }
         }
     }
@@ -616,9 +665,8 @@ impl WheelLevel {
 }
 
 impl TimerEntry {
-    fn is_dead(&self) -> bool {
-        self.state.cancelled.load(AtomicOrdering::Acquire)
-            || self.state.fired.load(AtomicOrdering::Acquire)
+    fn is_dead(&self, pool: &SleepStatePool) -> bool {
+        self.state.is_dead(pool)
     }
 }
 
@@ -671,8 +719,8 @@ mod tests {
     use helios_hal::cpu::{Cpu, Instant, ProcessorId};
 
     use super::{
-        AtomicOrdering, TIMER_INBOX_CAPACITY, TIMER_READY_RETAINED_ENTRIES, TimerEntry,
-        TimingWheel, reset_timer_ready_entries, wheel_tick_ceil, wheel_tick_floor,
+        TIMER_INBOX_CAPACITY, TIMER_READY_RETAINED_ENTRIES, TimerEntry, TimingWheel,
+        reset_timer_ready_entries, wheel_tick_ceil, wheel_tick_floor,
     };
 
     #[derive(Clone)]
@@ -726,17 +774,24 @@ mod tests {
         }
     }
 
-    fn sleep_state(deadline: u64) -> super::SleepRef {
-        let timer = super::Timer::new(TestCpu { now: 0 });
-        super::SleepRef::new_for_deadline(&timer.shared, Instant::new(deadline))
+    fn test_timer() -> super::Timer<TestCpu> {
+        super::Timer::new(TestCpu { now: 0 })
     }
 
-    fn timer_entry(deadline: u64, quantum_ticks: u64) -> TimerEntry {
-        TimerEntry {
+    /// Builds a wheel entry plus the strong ref that keeps its slot
+    /// live; dropping the ref cancels the sleep.
+    fn timer_entry(
+        timer: &super::Timer<TestCpu>,
+        deadline: u64,
+        quantum_ticks: u64,
+    ) -> (super::SleepRef, TimerEntry) {
+        let state = super::SleepRef::new(&timer.shared);
+        let entry = TimerEntry {
             deadline: Instant::new(deadline),
             deadline_tick: wheel_tick_ceil(Instant::new(deadline), quantum_ticks),
-            state: sleep_state(deadline),
-        }
+            state: state.downgrade(),
+        };
+        (state, entry)
     }
 
     #[test]
@@ -748,94 +803,144 @@ mod tests {
 
     #[test]
     fn timing_wheel_expires_entries_after_deadline_tick() {
+        let timer = test_timer();
+        let pool = &timer.shared.sleep_pool;
         let mut wheel = TimingWheel::new(0);
-        let entry = timer_entry(150, 50);
-        let state = entry.state.clone();
-        wheel.insert(entry);
+        let (state, entry) = timer_entry(&timer, 150, 50);
+        let handle = entry.state;
+        wheel.insert(pool, entry);
 
         let mut ready = Vec::new();
-        wheel.drain_expired(2, &mut ready);
+        wheel.drain_expired(pool, 2, &mut ready);
         assert!(ready.is_empty());
-        wheel.drain_expired(3, &mut ready);
+        wheel.drain_expired(pool, 3, &mut ready);
         assert_eq!(ready.len(), 1);
-        assert!(super::SleepRef::ptr_eq(&ready[0].state, &state));
+        assert!(ready[0].state == handle);
+        drop(state);
     }
 
     #[test]
     fn timing_wheel_cascades_higher_level_entries() {
+        let timer = test_timer();
+        let pool = &timer.shared.sleep_pool;
         let mut wheel = TimingWheel::new(0);
-        let entry = timer_entry(300 * 50, 50);
-        let state = entry.state.clone();
-        wheel.insert(entry);
+        let (state, entry) = timer_entry(&timer, 300 * 50, 50);
+        let handle = entry.state;
+        wheel.insert(pool, entry);
 
         let mut ready = Vec::new();
-        wheel.drain_expired(255, &mut ready);
+        wheel.drain_expired(pool, 255, &mut ready);
         assert!(ready.is_empty());
-        wheel.drain_expired(300, &mut ready);
+        wheel.drain_expired(pool, 300, &mut ready);
         assert_eq!(ready.len(), 1);
-        assert!(super::SleepRef::ptr_eq(&ready[0].state, &state));
+        assert!(ready[0].state == handle);
+        drop(state);
     }
 
     #[test]
     fn timing_wheel_skips_cancelled_entries() {
+        let timer = test_timer();
+        let pool = &timer.shared.sleep_pool;
         let mut wheel = TimingWheel::new(0);
-        let entry = timer_entry(100, 50);
-        entry.state.cancelled.store(true, AtomicOrdering::Release);
-        wheel.insert(entry);
+        let (state, entry) = timer_entry(&timer, 100, 50);
+        drop(state);
+        wheel.insert(pool, entry);
 
         let mut ready = Vec::new();
-        wheel.drain_expired(2, &mut ready);
+        wheel.drain_expired(pool, 2, &mut ready);
         assert!(ready.is_empty());
     }
 
     #[test]
+    fn cancelled_sleep_releases_slot_and_stale_handles_fail_validation() {
+        let timer = test_timer();
+        let pool = &timer.shared.sleep_pool;
+        let (state, entry) = timer_entry(&timer, 300 * 50, 50);
+        let handle = entry.state;
+
+        // Cancelling releases the slot immediately even though a wheel
+        // entry could still reference it until its distant deadline.
+        drop(state);
+        assert!(handle.is_dead(pool));
+
+        // Recycle slots until the same index is handed out again and
+        // prove the stale handle never validates against the new
+        // occupant while the fresh handle does.
+        let mut held = Vec::new();
+        let reused = loop {
+            let sleep_ref = super::SleepRef::new(&timer.shared);
+            if sleep_ref.idx == handle.idx {
+                break sleep_ref;
+            }
+            held.push(sleep_ref);
+        };
+        let fresh = reused.downgrade();
+        assert_eq!(fresh.idx, handle.idx);
+        assert_ne!(fresh.generation, handle.generation);
+        assert!(handle.is_dead(pool));
+        assert!(!fresh.is_dead(pool));
+        drop(entry);
+    }
+
+    #[test]
     fn timing_wheel_drain_retains_bucket_capacity() {
+        let timer = test_timer();
+        let pool = &timer.shared.sleep_pool;
         let mut wheel = TimingWheel::new(0);
-        wheel.insert(timer_entry(100, 50));
+        let (state, entry) = timer_entry(&timer, 100, 50);
+        wheel.insert(pool, entry);
         let slot = super::wheel_slot(2, 0);
         let retained_capacity = wheel.levels[0].buckets[slot].capacity();
         assert_ne!(retained_capacity, 0);
 
         let mut ready = Vec::new();
-        wheel.drain_expired(2, &mut ready);
+        wheel.drain_expired(pool, 2, &mut ready);
 
         assert_eq!(ready.len(), 1);
         assert_eq!(wheel.levels[0].buckets[slot].capacity(), retained_capacity);
+        drop(state);
     }
 
     #[test]
     fn timing_wheel_cascade_retains_bucket_capacity() {
+        let timer = test_timer();
+        let pool = &timer.shared.sleep_pool;
         let mut wheel = TimingWheel::new(0);
-        wheel.insert(timer_entry(300 * 50, 50));
+        let (state, entry) = timer_entry(&timer, 300 * 50, 50);
+        wheel.insert(pool, entry);
         let slot = super::wheel_slot(256, 1);
         let retained_capacity = wheel.levels[1].buckets[slot].capacity();
         assert_ne!(retained_capacity, 0);
 
         let mut ready = Vec::new();
-        wheel.drain_expired(256, &mut ready);
+        wheel.drain_expired(pool, 256, &mut ready);
 
         assert!(ready.is_empty());
         assert_eq!(wheel.levels[1].buckets[slot].capacity(), retained_capacity);
+        drop(state);
     }
 
     #[test]
     fn timing_wheel_rebuilds_cached_deadline_after_cancelled_front_entry() {
+        let timer = test_timer();
+        let pool = &timer.shared.sleep_pool;
         let mut wheel = TimingWheel::new(0);
-        let cancelled = timer_entry(100, 50);
-        cancelled
-            .state
-            .cancelled
-            .store(true, AtomicOrdering::Release);
-        wheel.insert(cancelled);
-        wheel.insert(timer_entry(200, 50));
+        let (cancelled, entry) = timer_entry(&timer, 100, 50);
+        drop(cancelled);
+        wheel.insert(pool, entry);
+        let (state, entry) = timer_entry(&timer, 200, 50);
+        wheel.insert(pool, entry);
 
         let mut ready = Vec::new();
-        wheel.drain_expired(2, &mut ready);
+        wheel.drain_expired(pool, 2, &mut ready);
         assert!(ready.is_empty());
         assert_eq!(
-            wheel.next_live_deadline().map(|deadline| deadline.ticks()),
+            wheel
+                .next_live_deadline(pool)
+                .map(|deadline| deadline.ticks()),
             Some(200)
         );
+        drop(state);
     }
 
     #[test]
@@ -868,12 +973,15 @@ mod tests {
 
     #[test]
     fn timer_ready_pool_reset_drops_oversized_capacity() {
+        let timer = test_timer();
         let mut ready = Vec::with_capacity(TIMER_READY_RETAINED_ENTRIES + 1);
-        ready.push(timer_entry(100, 50));
+        let (state, entry) = timer_entry(&timer, 100, 50);
+        ready.push(entry);
 
         reset_timer_ready_entries(&mut ready);
 
         assert!(ready.is_empty());
         assert_eq!(ready.capacity(), TIMER_READY_RETAINED_ENTRIES);
+        drop(state);
     }
 }

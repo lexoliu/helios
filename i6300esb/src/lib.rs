@@ -190,12 +190,13 @@ where
             0x04,
             command | CommandRegister::MEMORY_ENABLE.bits(),
         );
+        // WDT_CONFIG is not read-back-identical: QEMU's model decodes the
+        // 2-byte write into internal state and reconstructs reads from it
+        // (int-type masked with 0x11), so writing 0x0003 reads back 0x0001
+        // by design. Config-space reachability is verified functionally by
+        // the WDT_LOCK read-back in `arm`, which the model round-trips.
         self.access
             .write_u16(self.address, ESB_CONFIG_REG, ESB_DISABLE_TIMER1_INTERRUPT);
-        assert!(
-            self.access.read_u16(self.address, ESB_CONFIG_REG) == ESB_DISABLE_TIMER1_INTERRUPT,
-            "i6300esb config register write did not stick"
-        );
         self.disarm();
         self.clear_timeout_latched();
         self.program_timeout(timeout);
