@@ -10,5 +10,8 @@ thiserror = "2.0.20"
 wasmparser = "0.245.0"
 wasmtime = { path = "../../wasmtime/crates/wasmtime", default-features = false, features = ["all-arch", "component-model", "component-model-async-compile", "cranelift", "gc-null", "parallel-compilation", "std", "threads", "winch"] }
 
+[dev-dependencies]
+wasmtime = { path = "../../wasmtime/crates/wasmtime", default-features = false, features = ["all-arch", "component-model", "component-model-async", "component-model-async-compile", "cranelift", "gc-null", "parallel-compilation", "runtime", "std", "threads", "winch"] }
+
 [lints]
 workspace = true

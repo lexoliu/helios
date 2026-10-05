@@ -187,3 +187,45 @@ fn build_engine_config(target: &str, hint: AotCompileHint, worker_count: usize) 
     config.memory_guard_size(CWASM_MEMORY_GUARD_SIZE);
     Ok(config)
 }
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod tests {
+    use super::{AotCompileHint, build_engine_config, precompile_artifact};
+    use wasmtime::{Engine, Module};
+
+    const MINIMAL_MODULE: &[u8] = &[
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // wasm header
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00, // type
+        0x03, 0x02, 0x01, 0x00, // function
+        0x07, 0x05, 0x01, 0x01, 0x66, 0x00, 0x00, // export f
+        0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b, // body
+    ];
+
+    #[test]
+    fn deserialization_rejects_an_unavailable_enabled_isa_flag() {
+        let target = "x86_64-unknown-linux-gnu";
+        let artifact = precompile_artifact(MINIMAL_MODULE, target, AotCompileHint::Performance)
+            .expect("the minimal module precompiles");
+
+        let mut unavailable = build_engine_config(target, AotCompileHint::Performance, 1)
+            .expect("the mismatch engine config builds");
+        unsafe {
+            unavailable.detect_host_feature(|feature| Some(feature != "avx2"));
+        }
+        let unavailable_engine = Engine::new(&unavailable).expect("the mismatch engine builds");
+        let error = unsafe { Module::deserialize(&unavailable_engine, &artifact.bytes) }
+            .expect_err("an artifact requiring avx2 must not deserialize");
+        let debug = format!("{error:?}");
+        assert!(debug.contains("has_avx2"), "{debug}");
+        assert!(debug.contains("not available on the host"), "{debug}");
+
+        let mut available = build_engine_config(target, AotCompileHint::Performance, 1)
+            .expect("the compatible engine config builds");
+        unsafe {
+            available.detect_host_feature(|_| Some(true));
+        }
+        let available_engine = Engine::new(&available).expect("the compatible engine builds");
+        unsafe { Module::deserialize(&available_engine, &artifact.bytes) }
+            .expect("the same artifact deserializes when every feature is available");
+    }
+}
