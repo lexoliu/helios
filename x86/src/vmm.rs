@@ -61,13 +61,14 @@ const PAGE: usize = PhysFrame::SIZE;
 /// Bytes one level-1 table maps: 512 four-kilobyte pages.
 const LEAF_TABLE_SPAN: usize = PAGE * 512;
 
-/// Pages one TLB-shootdown batch holds before flushing.
+/// A leaf an unmap has retired but whose frame is not yet free.
 ///
-/// A frame must not be reusable while another processor can still translate
-/// to it, so the frames an unmap produces are held until the shootdown for
-/// their range has been acknowledged. Batching bounds that on-stack array
-/// while keeping the IPI count to one round per 128 pages.
-const TLB_SHOOTDOWN_BATCH_PAGES: usize = 128;
+/// The first pass of [`X86UserAddressSpace::unmap_range`] clears
+/// `PRESENT` and sets this bit, keeping the frame address in the leaf;
+/// the shootdown goes out once for the whole range; the second pass
+/// reads the frame back out of every leaf so marked and frees it. The
+/// bit is one of the three the architecture leaves to software.
+const RETIRED: PageTableFlags = PageTableFlags::BIT_9;
 
 /// Owned x86 user address space. Built once at boot, accessed through
 /// `&'static`.
@@ -267,7 +268,7 @@ impl X86UserAddressSpace {
             let phys = match self.alloc_user_frame() {
                 Ok(phys) => phys,
                 Err(error) => {
-                    self.rollback_partial_commit(mapper, virt.start.raw(), mapped_pages);
+                    self.rollback_partial_commit(virt.start.raw(), mapped_pages);
                     return Err(error);
                 }
             };
@@ -276,13 +277,13 @@ impl X86UserAddressSpace {
             ))
             .map_err(|_| {
                 self.dealloc_user_phys(phys);
-                self.rollback_partial_commit(mapper, virt.start.raw(), mapped_pages);
+                self.rollback_partial_commit(virt.start.raw(), mapped_pages);
                 AddressSpaceError::Misaligned
             })?;
             let page = Page::<Size4KiB>::from_start_address(X86VirtAddr::new(virt_addr as u64))
                 .map_err(|_| {
                     self.dealloc_user_phys(phys);
-                    self.rollback_partial_commit(mapper, virt.start.raw(), mapped_pages);
+                    self.rollback_partial_commit(virt.start.raw(), mapped_pages);
                     AddressSpaceError::Misaligned
                 })?;
             unsafe {
@@ -290,7 +291,7 @@ impl X86UserAddressSpace {
                     Ok(flush) => flush.flush(),
                     Err(_) => {
                         self.dealloc_user_phys(phys);
-                        self.rollback_partial_commit(mapper, virt.start.raw(), mapped_pages);
+                        self.rollback_partial_commit(virt.start.raw(), mapped_pages);
                         return Err(AddressSpaceError::PageTableExhausted);
                     }
                 }
@@ -299,65 +300,62 @@ impl X86UserAddressSpace {
         Ok(())
     }
 
-    /// Unmap every committed page of `virt`, shooting the range down on
-    /// every processor before its frames go back to the user-memory pool.
+    /// Unmaps every mapped page of `virt`, one shootdown for the whole
+    /// range, and frees the frames on the far side of it.
     ///
-    /// `MapperFlush::flush` issues `INVLPG` on the calling processor only, so
-    /// until the IPI has been acknowledged another core can still translate
-    /// to a frame this loop has unmapped. Handing such a frame back would let
-    /// the next allocation alias it through that stale translation, so the
-    /// frames wait in a bounded batch and are freed on the far side of the
-    /// shootdown (AGENTS §3.4). Batching is what keeps that array on the
-    /// stack while still costing one IPI round per 128 pages rather than one
-    /// per page.
-    fn unmap_pages(
-        &self,
-        mapper: &mut OffsetPageTable<'static>,
-        virt: VirtRange,
-    ) -> Result<(), AddressSpaceError> {
-        let mut batch = [0usize; TLB_SHOOTDOWN_BATCH_PAGES];
-        let mut batch_count = 0;
-        let mut batch_start = virt.start.raw();
+    /// A frame must not be reusable while another processor can still
+    /// translate to it, and `MapperFlush::flush` invalidates the calling
+    /// processor only, so the frames wait for the acknowledgement of the
+    /// broadcast. Rather than holding them in a batch and broadcasting
+    /// once per batch — one IPI round per 128 pages, so a linear
+    /// memory's teardown was hundreds of rounds — the leaves themselves
+    /// hold them: the first pass retires each leaf (`PRESENT` off,
+    /// [`RETIRED`] on, frame kept), one broadcast covers the range, and
+    /// the second pass frees what the retired leaves name. Pages that
+    /// were never mapped are left alone, which is what the runtime's
+    /// imprecise decommit of a pooled slot and a demand-commit region
+    /// nothing faulted on both need.
+    fn unmap_range(&self, virt: VirtRange) {
+        let mut retired = 0;
         for offset in (0..virt.byte_len).step_by(PAGE) {
             let virt_addr = virt.start.raw() + offset;
-            let page = Page::<Size4KiB>::from_start_address(X86VirtAddr::new(virt_addr as u64))
-                .map_err(|_| AddressSpaceError::Misaligned)?;
-            match mapper.unmap(page) {
-                Ok((frame, flush)) => {
-                    flush.flush();
-                    if batch_count == 0 {
-                        batch_start = virt_addr;
-                    }
-                    batch[batch_count] = frame.start_address().as_u64() as usize;
-                    batch_count += 1;
-                    if batch_count == TLB_SHOOTDOWN_BATCH_PAGES {
-                        self.shootdown_and_dealloc(batch_start, &batch[..batch_count]);
-                        batch_count = 0;
-                    }
-                }
-                Err(_) => {
-                    // The page was never committed. It also breaks the run the
-                    // batch describes, so what is held has to be shot down as
-                    // its own range before the walk moves past this address.
-                    if batch_count != 0 {
-                        self.shootdown_and_dealloc(batch_start, &batch[..batch_count]);
-                        batch_count = 0;
-                    }
-                }
+            let Some(entry_ptr) = self.leaf_entry(virt_addr) else {
+                continue;
+            };
+            // SAFETY: the pointer came from a completed walk of live
+            // tables, and the caller owns the range: it holds the
+            // reservation lock or has already taken the range out of
+            // the reservation tracker.
+            let entry = unsafe { &mut *entry_ptr };
+            if entry.is_unused() {
+                continue;
             }
+            assert!(
+                entry.flags().contains(PageTableFlags::PRESENT),
+                "x86 user page {virt_addr:#x} was already retired"
+            );
+            let flags = (entry.flags() - PageTableFlags::PRESENT) | RETIRED;
+            entry.set_flags(flags);
+            retired += 1;
         }
-        if batch_count != 0 {
-            self.shootdown_and_dealloc(batch_start, &batch[..batch_count]);
+        if retired == 0 {
+            return;
         }
-        Ok(())
-    }
-
-    /// Invalidate the `frames.len()` pages starting at `start` everywhere,
-    /// then return those frames to the user-memory pool.
-    fn shootdown_and_dealloc(&self, start: usize, frames: &[usize]) {
-        smp::shootdown_tlb_range(start, frames.len() * PAGE);
-        for phys in frames {
-            self.dealloc_user_phys(*phys);
+        smp::flush_tlb_range_local(virt.start.raw(), virt.byte_len);
+        smp::shootdown_tlb_range(virt.start.raw(), virt.byte_len);
+        for offset in (0..virt.byte_len).step_by(PAGE) {
+            let virt_addr = virt.start.raw() + offset;
+            let Some(entry_ptr) = self.leaf_entry(virt_addr) else {
+                continue;
+            };
+            // SAFETY: as above.
+            let entry = unsafe { &mut *entry_ptr };
+            if !entry.flags().contains(RETIRED) {
+                continue;
+            }
+            let phys = entry.addr().as_u64() as usize;
+            entry.set_unused();
+            self.dealloc_user_phys(phys);
         }
     }
 
@@ -472,36 +470,7 @@ impl X86UserAddressSpace {
     /// Walks every page of `virt`, unmapping the ones a demand commit
     /// mapped and leaving the ones nothing faulted on alone.
     fn unmap_demand_pages(&self, virt: VirtRange) {
-        let mut batch = [0usize; TLB_SHOOTDOWN_BATCH_PAGES];
-        let mut batch_count = 0;
-        let mut batch_start = virt.start.raw();
-        for offset in (0..virt.byte_len).step_by(PAGE) {
-            let virt_addr = virt.start.raw() + offset;
-            let Some(entry_ptr) = self.leaf_entry(virt_addr) else {
-                continue;
-            };
-            // SAFETY: the pointer came from a completed walk of live
-            // tables, and the caller holds the reservation lock.
-            let entry = unsafe { &mut *entry_ptr };
-            if entry.is_unused() {
-                continue;
-            }
-            let phys = entry.addr().as_u64() as usize;
-            entry.set_unused();
-            tlb::flush(X86VirtAddr::new(virt_addr as u64));
-            if batch_count == 0 {
-                batch_start = virt_addr;
-            }
-            batch[batch_count] = phys;
-            batch_count += 1;
-            if batch_count == TLB_SHOOTDOWN_BATCH_PAGES {
-                self.shootdown_and_dealloc(batch_start, &batch[..batch_count]);
-                batch_count = 0;
-            }
-        }
-        if batch_count != 0 {
-            self.shootdown_and_dealloc(batch_start, &batch[..batch_count]);
-        }
+        self.unmap_range(virt);
     }
 
     fn alloc_user_frame(&self) -> Result<usize, AddressSpaceError> {
@@ -639,38 +608,11 @@ impl X86UserAddressSpace {
         }
     }
 
-    fn rollback_partial_commit(
-        &self,
-        mapper: &mut OffsetPageTable<'static>,
-        start: usize,
-        mapped_pages: usize,
-    ) {
-        let mut batch = [0usize; TLB_SHOOTDOWN_BATCH_PAGES];
-        let mut batch_count = 0;
-        let mut batch_start = start;
-        for page_index in 0..mapped_pages {
-            let virt = start + page_index * PAGE;
-            let page = Page::<Size4KiB>::from_start_address(X86VirtAddr::new(virt as u64))
-                .unwrap_or_else(|error| {
-                    panic!("x86 AddressSpace::commit rollback got invalid page {virt:#x}: {error}")
-                });
-            let (frame, flush) = mapper.unmap(page).unwrap_or_else(|error| {
-                panic!("x86 AddressSpace::commit rollback failed at {virt:#x}: {error:?}")
-            });
-            flush.flush();
-            if batch_count == 0 {
-                batch_start = virt;
-            }
-            batch[batch_count] = frame.start_address().as_u64() as usize;
-            batch_count += 1;
-            if batch_count == TLB_SHOOTDOWN_BATCH_PAGES {
-                self.shootdown_and_dealloc(batch_start, &batch[..batch_count]);
-                batch_count = 0;
-            }
+    fn rollback_partial_commit(&self, start: usize, mapped_pages: usize) {
+        if mapped_pages == 0 {
+            return;
         }
-        if batch_count != 0 {
-            self.shootdown_and_dealloc(batch_start, &batch[..batch_count]);
-        }
+        self.unmap_range(VirtRange::new(VirtAddr::new(start), mapped_pages * PAGE));
     }
 
     /// Decommit only the parts of `range` that are actually committed.
@@ -683,9 +625,8 @@ impl X86UserAddressSpace {
         validate_range(range)?;
         let mut state = self.state.lock();
         let subranges = state.take_committed_intersections(range)?;
-        let mut mapper = unsafe { smp::current_mapper(self.physical_memory_offset) };
         for subrange in subranges {
-            self.unmap_pages(&mut mapper, subrange)?;
+            self.unmap_range(subrange);
         }
         Ok(())
     }
@@ -714,8 +655,8 @@ impl X86UserAddressSpace {
         }
         for subrange in plan.commit {
             state.precheck_commit(subrange)?;
+            // No shootdown: see `commit`.
             self.map_pages(&mut mapper, &mut frame_allocator, subrange, pt_flags)?;
-            self.shootdown_range(subrange);
             // This backend has no swap, so committing over the range can
             // never orphan a swap extent; the assertion keeps that true if
             // swap reaches this architecture (#25).
@@ -754,13 +695,23 @@ impl AddressSpace for X86UserAddressSpace {
         // this architecture (#25).
         debug_assert!(released.swapped.is_empty());
         for region in &released.committed {
-            self.unmap_pages(&mut mapper, region.range)?;
+            self.unmap_range(region.range);
         }
 
         self.state.lock().push_free_range(virt);
         Ok(())
     }
 
+    /// Maps fresh frames under `virt`.
+    ///
+    /// No shootdown goes out: every page here was not present a moment
+    /// ago, x86-64 caches no not-present translation, and every path
+    /// that unmaps a page broadcasts before its frame is freed, so no
+    /// processor can hold a translation for any of these pages. The
+    /// local `INVLPG` `map_pages` issues is the whole of the TLB work,
+    /// the same as `commit_demand_page` and the aarch64 and riscv
+    /// backends. A broadcast here was one IPI round per `memory.grow`,
+    /// and the compute rows that grow paid it on every step (#419).
     fn commit(&self, virt: VirtRange, flags: PageFlags) -> Result<(), AddressSpaceError> {
         self.assert_smp_safe();
         validate_range(virt)?;
@@ -773,7 +724,6 @@ impl AddressSpace for X86UserAddressSpace {
             physical_memory_offset: self.physical_memory_offset,
         };
         self.map_pages(&mut mapper, &mut frame_allocator, virt, pt_flags)?;
-        self.shootdown_range(virt);
 
         self.state
             .lock()
@@ -826,7 +776,7 @@ impl AddressSpace for X86UserAddressSpace {
             self.free_pinned_run(phys, virt.byte_len, align);
             return Err(error);
         }
-        self.shootdown_range(virt);
+        // No shootdown: a fresh mapping, see `commit`.
         pinned.push(PinnedRun {
             range: virt,
             phys,
@@ -868,7 +818,7 @@ impl AddressSpace for X86UserAddressSpace {
             return Err(AddressSpaceError::DeviceMapped);
         }
         self.map_run(&mut mapper, &mut frame_allocator, virt, phys, pt_flags)?;
-        self.shootdown_range(virt);
+        // No shootdown: a fresh mapping, see `commit`.
         pinned.push(PinnedRun {
             range: virt,
             phys,
@@ -924,9 +874,8 @@ impl AddressSpace for X86UserAddressSpace {
         self.assert_smp_safe();
         validate_range(virt)?;
         let _ = self.state.lock().record_decommit(virt)?;
-
-        let mut mapper = unsafe { smp::current_mapper(self.physical_memory_offset) };
-        self.unmap_pages(&mut mapper, virt)
+        self.unmap_range(virt);
+        Ok(())
     }
 
     fn protect(&self, virt: VirtRange, flags: PageFlags) -> Result<(), AddressSpaceError> {
@@ -1081,6 +1030,13 @@ impl AddressSpace for X86UserAddressSpace {
     }
 }
 
+/// Restores the flags a failed `protect_pages` had already changed.
+///
+/// The pages briefly carried the new flags, and another processor may
+/// have translated one in that window, so the restored range is shot
+/// down the way the success path is: a stale narrower translation is
+/// a spurious fault on a page the tracker says is committed, and a
+/// stale wider one is a permission the caller withdrew.
 fn rollback_partial_protect(
     mapper: &mut OffsetPageTable<'static>,
     old_flags: &[(Page<Size4KiB>, PageTableFlags)],
@@ -1094,6 +1050,11 @@ fn rollback_partial_protect(
                 })
                 .flush();
         }
+    }
+    if let (Some((first, _)), Some((last, _))) = (old_flags.first(), old_flags.last()) {
+        let start = first.start_address().as_u64() as usize;
+        let end = last.start_address().as_u64() as usize + PAGE;
+        smp::shootdown_tlb_range(start, end - start);
     }
 }
 
