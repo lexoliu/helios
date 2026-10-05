@@ -208,8 +208,12 @@ property of every kernel and `hal/` subsystem, never a follow-up.
 - A new abstraction states its concurrency contract before its API: which
   operations are lock-free, which take an async mutex, which fan out to other
   processors. "Add SMP later" is not a design note.
-- Every address-space mutation invalidates the local TLB and sends an IPI
-  shootdown to every other processor that has run in that space.
+- Every address-space mutation invalidates the local TLB. One that removes
+  a translation or narrows its permissions also sends an IPI shootdown to
+  every other processor that has run in that space, and frees nothing it
+  unmapped until every one has acknowledged; making a not-present page
+  present needs no shootdown, because no processor caches a not-present
+  translation.
 - Hot paths use per-CPU storage indexed by the executing processor;
   cross-processor queues prefer atomics and lock-free channels to a mutex.
   Which processor is executing is a property of the hardware, not state the
