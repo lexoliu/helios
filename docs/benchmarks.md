@@ -429,6 +429,20 @@ what the one below it cannot see.
   its first boot was refused. The Linux side has had the same bound as
   `--side-timeout-seconds` since it lost a side to one hung workload.
 
+A bound says that the guest stopped answering, not what it was doing
+instead. So when an iteration or a guest step times out, the inspector
+first asks QEMU — before anything else is sent to the guest — for every
+vCPU's registers (`info registers -a`) and local APIC (`info lapic`,
+per vCPU), and appends the raw text to `<runtime>/vcpu-state.log`. The
+run log then carries one line per vCPU: its RIP, the kernel function
+containing it, whether interrupts were enabled and whether it was
+halted. The RIP is symbolised against the kernel ELF the session booted,
+shifted by the load base the x86 kernel logs at boot (`kernel image
+loaded virtual_base=…` in `debug-serial.log`). Every bench boot gets
+the inspector's QMP socket for this; the capture is x86-64 only, and a
+capture that cannot be taken says why beside the timeout, which is
+still what the cell records.
+
 The bugs the first runs of this suite found are fixed: the x86 kernel
 refusing a multi-queue `vhost` tap (#91), a user-mode spawn storm
 panicking the kernel through the task arena (#94), the OOM killer

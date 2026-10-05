@@ -38,10 +38,12 @@ use crate::{
 };
 
 mod input;
+mod kernel_image;
 mod network;
 mod qemu;
 mod qmp;
 mod raw_profile;
+mod vcpu_state;
 
 use input::{InputScript, InputScriptError, InputStatement};
 use network::{
@@ -51,6 +53,7 @@ use network::{
 use qemu::QemuOptions;
 use qmp::{QmpClient, QmpError, SizeError};
 use raw_profile::{ProfileCommand, RawProfileCollectError};
+pub(crate) use vcpu_state::VcpuStateCapture;
 
 /// Why a `vm` session did not run.
 ///
@@ -1967,9 +1970,9 @@ struct ResolvedVmCommand {
     network: VmNetwork,
     qemu_net: Option<QemuNetArgs>,
     command: Option<ResolvedVmSessionCommand>,
-    /// Whether the session command drives QEMU's machine protocol and
-    /// therefore needs a socket even when the runtime directory is not
-    /// being kept.
+    /// Whether the session command drives QEMU's machine protocol, or
+    /// captures vCPU state through it, and therefore needs a socket even
+    /// when the runtime directory is not being kept.
     needs_qmp: bool,
 }
 
@@ -2000,6 +2003,16 @@ impl ResolvedVmSessionCommand {
                 None
             }
         }
+    }
+
+    /// Whether the session needs an inspector-owned QMP socket.
+    ///
+    /// The QMP actions drive the machine through it. A bench action does
+    /// not, but a bench guest that stops answering is captured through
+    /// it before QEMU is torn down (`vcpu_state`), and every lane has to
+    /// be able to leave that capture behind.
+    fn needs_qmp(&self) -> bool {
+        self.qmp_action().is_some() || matches!(self, Self::AotBench(_) | Self::WorkloadBench(_))
     }
 }
 
@@ -2515,7 +2528,7 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
         qemu_net,
         needs_qmp: session_command
             .as_ref()
-            .is_some_and(|command| command.qmp_action().is_some()),
+            .is_some_and(ResolvedVmSessionCommand::needs_qmp),
         command: session_command,
     })
 }
@@ -2930,6 +2943,13 @@ fn connect_and_run(
     runtime: &mut VmRuntime,
 ) -> Result<(), VmSessionError> {
     let qmp_socket = runtime.qmp_socket.clone();
+    let vcpus = VcpuStateCapture::new(
+        command.profile.arch,
+        qmp_socket.clone(),
+        runtime.runtime_dir.path(),
+        runtime.debug_serial_log.clone(),
+        command.kernel.clone(),
+    );
     let client = match runtime.take_transport()? {
         VmTransport::SerialSocket(socket_path) => {
             let socket = socket_path
@@ -3004,7 +3024,7 @@ fn connect_and_run(
         })?;
     }
     match command.command.clone() {
-        Some(ResolvedVmSessionCommand::AotBench(command)) => run_aot_bench(client, command),
+        Some(ResolvedVmSessionCommand::AotBench(command)) => run_aot_bench(client, command, vcpus),
         Some(ResolvedVmSessionCommand::WorkloadBench(workload_command)) => run_workload_bench(
             client,
             workload_command,
@@ -3017,6 +3037,7 @@ fn connect_and_run(
                 accel: command.accel.clone(),
                 rpc_transport: command.rpc_transport,
             },
+            vcpus,
         ),
         Some(ResolvedVmSessionCommand::Balloon(balloon)) => {
             let socket = qmp_socket.ok_or(VmSessionError::NeedsQmp { action: "balloon" })?;
@@ -3703,6 +3724,7 @@ fn run_workload_bench(
     mut client: RpcClient,
     command: WorkloadBenchCommand,
     provenance: VmProvenance,
+    vcpus: VcpuStateCapture,
 ) -> Result<(), VmSessionError> {
     crate::run_interruptible(async move {
         let profile_filter = system_profiling::Filter {
@@ -3718,7 +3740,7 @@ fn run_workload_bench(
             || command.perf_metrics_output.is_some();
         let seconds = command.workload_timeout_seconds;
         let before_profile = if collect_profile {
-            guest_step_under_deadline("the profile reset", seconds, async {
+            guest_step_under_deadline("the profile reset", seconds, &vcpus, async {
                 Ok::<_, VmSessionError>(
                     profiling_step(
                         "clear remote profile samples",
@@ -3728,7 +3750,7 @@ fn run_workload_bench(
                 )
             })
             .await?;
-            guest_step_under_deadline("the profiler hand-off", seconds, async {
+            guest_step_under_deadline("the profiler hand-off", seconds, &vcpus, async {
                 Ok::<_, VmSessionError>(
                     profiling_step(
                         "enable remote profiling",
@@ -3738,7 +3760,7 @@ fn run_workload_bench(
                 )
             })
             .await?;
-            guest_step_under_deadline("the initial profile read", seconds, async {
+            guest_step_under_deadline("the initial profile read", seconds, &vcpus, async {
                 Ok::<_, VmSessionError>(
                     profiling_step(
                         "read initial remote profile samples",
@@ -3753,14 +3775,14 @@ fn run_workload_bench(
         };
 
         if let Err(error) =
-            crate::workload_bench::run_inner(&mut client, &command, &provenance).await
+            crate::workload_bench::run_inner(&mut client, &command, &provenance, &vcpus).await
         {
-            print_recent_guest_errors(&mut client, seconds).await;
+            print_recent_guest_errors(&mut client, seconds, &vcpus).await;
             return Err(error.into());
         }
 
         if collect_profile {
-            guest_step_under_deadline("the profiler stop", seconds, async {
+            guest_step_under_deadline("the profiler stop", seconds, &vcpus, async {
                 Ok::<_, VmSessionError>(
                     profiling_step(
                         "disable remote profiling",
@@ -3771,7 +3793,7 @@ fn run_workload_bench(
             })
             .await?;
             let after_profile =
-                guest_step_under_deadline("the final profile read", seconds, async {
+                guest_step_under_deadline("the final profile read", seconds, &vcpus, async {
                     Ok::<_, VmSessionError>(
                         profiling_step(
                             "read final remote profile samples",
@@ -3781,16 +3803,17 @@ fn run_workload_bench(
                     )
                 })
                 .await?;
-            let metrics = guest_step_under_deadline("the perf metric read", seconds, async {
-                Ok::<_, VmSessionError>(
-                    profiling_step(
-                        "read final remote perf metrics",
-                        system_profiling::metrics(&client, &metric_filter, 0),
+            let metrics =
+                guest_step_under_deadline("the perf metric read", seconds, &vcpus, async {
+                    Ok::<_, VmSessionError>(
+                        profiling_step(
+                            "read final remote perf metrics",
+                            system_profiling::metrics(&client, &metric_filter, 0),
+                        )
+                        .await?,
                     )
-                    .await?,
-                )
-            })
-            .await?;
+                })
+                .await?;
             write_requested_profile_outputs(&command, &before_profile, &after_profile, &metrics)?;
         }
         if let Some(output) = command.llvm_raw_profile_output() {
@@ -3821,11 +3844,11 @@ async fn profiling_step<T>(
 /// call that brings us here is often a guest that stopped answering, and
 /// a diagnostic that hangs replaces the failure it was fetched to
 /// explain.
-async fn print_recent_guest_errors(client: &mut RpcClient, seconds: u32) {
+async fn print_recent_guest_errors(client: &mut RpcClient, seconds: u32, vcpus: &VcpuStateCapture) {
     let mut config = crate::system::TracingConfig::new();
     config.limit = 100;
     config.min_level = Some(helios_inspector_protocol::system::tracing::Level::Info);
-    let fetched = guest_step_under_deadline("the tracing fetch", seconds, async {
+    let fetched = guest_step_under_deadline("the tracing fetch", seconds, vcpus, async {
         Ok::<_, WorkloadBenchError>(crate::system::fetch_tracing(client, &config).await?)
     })
     .await;
@@ -3843,7 +3866,11 @@ async fn print_recent_guest_errors(client: &mut RpcClient, seconds: u32) {
     }
 }
 
-fn run_aot_bench(mut client: RpcClient, command: AotBenchCommand) -> Result<(), VmSessionError> {
+fn run_aot_bench(
+    mut client: RpcClient,
+    command: AotBenchCommand,
+    vcpus: VcpuStateCapture,
+) -> Result<(), VmSessionError> {
     crate::run_interruptible(async move {
         let wasm = fs::read(&command.wasm).map_err(|source| AotBenchError::ReadWasm {
             path: command.wasm.display().to_string(),
@@ -3919,7 +3946,12 @@ fn run_aot_bench(mut client: RpcClient, command: AotBenchCommand) -> Result<(), 
                     // Surface the guest-side error events before failing:
                     // the RPC error kind alone (e.g. `Internal`) does not
                     // say which runtime operation actually failed.
-                    print_recent_guest_errors(&mut client, DEFAULT_WORKLOAD_TIMEOUT_SECONDS).await;
+                    print_recent_guest_errors(
+                        &mut client,
+                        DEFAULT_WORKLOAD_TIMEOUT_SECONDS,
+                        &vcpus,
+                    )
+                    .await;
                     return Err(AotBenchError::Refused {
                         iteration,
                         kind: error.kind,
@@ -4436,8 +4468,7 @@ fn filter_pgo_stderr(
 /// missed — so the count is the image's own `STT_FUNC` symbols, the same
 /// population `helios-bench symbols` exports.
 fn kernel_functions(kernel: &Path) -> Result<KernelFunctions, BuildStepError> {
-    use object::{Object as _, ObjectSymbol as _, SymbolKind};
-    let kernel_image = |source: io::Error| BuildStepError::KernelImageRead {
+    let image_read = |source: io::Error| BuildStepError::KernelImageRead {
         path: kernel.display().to_string(),
         source,
     };
@@ -4445,16 +4476,13 @@ fn kernel_functions(kernel: &Path) -> Result<KernelFunctions, BuildStepError> {
         path: kernel.display().to_string(),
         source,
     };
-    let bytes = fs::read(kernel).map_err(kernel_image)?;
+    let bytes = fs::read(kernel).map_err(image_read)?;
     let image = object::File::parse(&*bytes).map_err(image_symbols)?;
     let mut total = 0;
     let mut names = Vec::new();
-    for symbol in image.symbols() {
-        if symbol.kind() != SymbolKind::Text || symbol.is_undefined() {
-            continue;
-        }
+    for symbol in kernel_image::function_symbols(&image) {
         total += 1;
-        names.push(base_name(symbol.name().map_err(image_symbols)?).to_owned());
+        names.push(base_name(symbol.map_err(image_symbols)?.name).to_owned());
     }
     Ok(KernelFunctions { total, names })
 }
@@ -4622,6 +4650,9 @@ struct VmRuntime {
     _serial_pty_slave: Option<fs::File>,
     /// The QMP socket the inspector created, when it owns one.
     qmp_socket: Option<PathBuf>,
+    /// The raw copy of the guest's debug serial line, when the console
+    /// is a socket the chardev can log.
+    debug_serial_log: Option<PathBuf>,
     runtime_dir: VmRuntimeDir,
     /// Held for the life of the VM: dropping it takes the sockets with
     /// it, and QEMU is still bound to them until it exits.
@@ -4805,6 +4836,7 @@ impl VmRuntime {
         } else {
             None
         };
+        let mut debug_serial_log = None;
 
         if !command.serial_stdio && serial_pty.is_none() {
             prepare_socket_path(&socket_path)?;
@@ -4853,17 +4885,18 @@ impl VmRuntime {
             // into a socket it could not write apart from one the
             // inspector's reader lost, and both are otherwise invisible
             // — the guest sees a successful transmit either way.
-            let debug_serial_log = command
+            let log = command
                 .debug_serial_log
                 .clone()
                 .unwrap_or_else(|| runtime_dir.path().join(DEBUG_SERIAL_LOG_NAME));
-            prepare_log_path(&debug_serial_log)?;
+            prepare_log_path(&log)?;
             qemu.arg("-chardev").arg(format!(
                 "socket,id={DEBUG_SERIAL_CHARDEV},path={},server=on,wait=on,\
                  logfile={},logappend=off",
                 qemu_option_value(&socket_path)?,
-                qemu_option_value(&debug_serial_log)?,
+                qemu_option_value(&log)?,
             ));
+            debug_serial_log = Some(log);
             qemu.arg("-serial")
                 .arg(format!("chardev:{DEBUG_SERIAL_CHARDEV}"));
         }
@@ -5040,6 +5073,7 @@ impl VmRuntime {
             transport: Some(transport),
             _serial_pty_slave: serial_pty_slave,
             qmp_socket: qmp_socket_path(command, socket_dir.path())?,
+            debug_serial_log,
             qemu_log,
             runtime_dir,
             _socket_dir: socket_dir,
@@ -6259,6 +6293,39 @@ mod tests {
             ResolvedVmSessionCommand::Session(SessionCommand::Stats).qmp_action(),
             None
         );
+    }
+
+    /// A bench guest that stops answering is captured through QMP before
+    /// QEMU is torn down, so every bench session asks for the socket
+    /// although it drives no QMP action of its own.
+    #[test]
+    fn every_bench_action_asks_for_a_socket() {
+        let aot = ResolvedVmSessionCommand::AotBench(AotBenchCommand {
+            wasm: PathBuf::from("artifacts/wasi-tools/curl.wasm"),
+            remote_path: "/aot-bench-input.wasm".to_owned(),
+            destination_path: "/aot-bench-output.cwasm".to_owned(),
+            iterations: 5,
+            compiler_timing: false,
+            profile_output: None,
+            kernel_profile_output: None,
+            user_profile_output: None,
+            perf_metrics_output: None,
+            llvm_raw_profile_output: None,
+        });
+        assert_eq!(aot.qmp_action(), None);
+        assert!(aot.needs_qmp());
+        /// The bench command as its own command line resolves it.
+        #[derive(clap::Parser)]
+        struct WorkloadBenchLine {
+            #[command(flatten)]
+            command: WorkloadBenchCommand,
+        }
+        let line = <WorkloadBenchLine as clap::Parser>::try_parse_from(["workload-bench"])
+            .expect("workload-bench takes no required argument");
+        let workload = ResolvedVmSessionCommand::WorkloadBench(line.command);
+        assert_eq!(workload.qmp_action(), None);
+        assert!(workload.needs_qmp());
+        assert!(!ResolvedVmSessionCommand::Session(SessionCommand::Stats).needs_qmp());
     }
 
     /// One input device the way `helios:system/stats` reports it, for
