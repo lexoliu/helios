@@ -7,9 +7,11 @@
 //! was executing. Both go through [`function_symbols`], so they cannot
 //! disagree about what a function is.
 
+use std::ops::Range;
 use std::path::Path;
 
-use object::{Object as _, ObjectSegment as _, ObjectSymbol as _, SymbolKind};
+use object::elf::PF_X;
+use object::{Object as _, ObjectSegment as _, ObjectSymbol as _, SegmentFlags, SymbolKind};
 
 /// One function the image defines, as its symbol table records it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,23 +55,40 @@ pub(crate) enum KernelSymbolsError {
     },
     #[error("kernel image {path} has no loadable segment to take its link base from")]
     NoLoadSegment { path: String },
+    #[error("kernel image {path} has no executable loadable segment")]
+    NoExecutableSegment { path: String },
+    #[error("kernel image {path} has a segment carrying {flags:?} rather than ELF flags")]
+    NotElfSegment { path: String, flags: SegmentFlags },
+    #[error(
+        "kernel image {path} has an executable segment of {size:#x} bytes at {address:#x}, \
+         which runs past the end of the address space"
+    )]
+    SegmentOverflow {
+        path: String,
+        address: u64,
+        size: u64,
+    },
 }
 
 /// A function of the image, owned so the table outlives the file bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Function {
-    name: String,
-    address: u64,
-    size: u64,
+pub(crate) struct Function {
+    pub(crate) name: String,
+    pub(crate) address: u64,
+    pub(crate) size: u64,
 }
 
-/// The image's functions, ordered by address, and the address the image
-/// was linked to start at.
+/// The image's functions, ordered by address, the address the image was
+/// linked to start at, and the link-time ranges of its executable
+/// segments.
 #[derive(Debug)]
 pub(crate) struct KernelSymbols {
     /// The lowest `PT_LOAD` virtual address: the address the bootloader's
     /// reported virtual base corresponds to.
     link_base: u64,
+    /// Every executable `PT_LOAD` segment, `p_vaddr..p_vaddr + p_memsz`:
+    /// the addresses a return address into the kernel can hold.
+    text: Vec<Range<u64>>,
     /// Sorted by `address`. A zero-sized symbol contains no address, so
     /// none is kept.
     functions: Vec<Function>,
@@ -95,6 +114,32 @@ impl KernelSymbols {
             .map(|segment| segment.address())
             .min()
             .ok_or_else(|| KernelSymbolsError::NoLoadSegment { path: display() })?;
+        let mut text = Vec::new();
+        for segment in image.segments() {
+            let executable = match segment.flags() {
+                SegmentFlags::Elf { p_flags } => p_flags & PF_X != 0,
+                flags => {
+                    return Err(KernelSymbolsError::NotElfSegment {
+                        path: display(),
+                        flags,
+                    });
+                }
+            };
+            if executable {
+                let (address, size) = (segment.address(), segment.size());
+                let end = address.checked_add(size).ok_or_else(|| {
+                    KernelSymbolsError::SegmentOverflow {
+                        path: display(),
+                        address,
+                        size,
+                    }
+                })?;
+                text.push(address..end);
+            }
+        }
+        if text.is_empty() {
+            return Err(KernelSymbolsError::NoExecutableSegment { path: display() });
+        }
         let functions = function_symbols(&image)
             .map(|symbol| {
                 symbol.map(|symbol| Function {
@@ -105,14 +150,16 @@ impl KernelSymbols {
             })
             .collect::<Result<Vec<_>, _>>()
             .map_err(symbols)?;
-        Ok(Self::new(link_base, functions))
+        Ok(Self::new(link_base, text, functions))
     }
 
-    fn new(link_base: u64, mut functions: Vec<Function>) -> Self {
+    /// A table from its parts, all at link-time addresses.
+    pub(crate) fn new(link_base: u64, text: Vec<Range<u64>>, mut functions: Vec<Function>) -> Self {
         functions.retain(|function| function.size != 0);
         functions.sort_by_key(|function| function.address);
         Self {
             link_base,
+            text,
             functions,
         }
     }
@@ -153,6 +200,17 @@ impl core::fmt::Display for SymbolizedAddress {
 }
 
 impl LoadedKernelSymbols<'_> {
+    /// Whether the runtime address `address` lies in one of the image's
+    /// executable segments: the only addresses a return address into the
+    /// kernel can hold.
+    pub(crate) fn contains_text(&self, address: u64) -> bool {
+        let link_address = address.wrapping_sub(self.slide);
+        self.symbols
+            .text
+            .iter()
+            .any(|segment| segment.contains(&link_address))
+    }
+
     /// The function whose bytes contain the runtime address `address`.
     pub(crate) fn symbolize(&self, address: u64) -> Option<SymbolizedAddress> {
         let link_address = address.wrapping_sub(self.slide);
@@ -183,8 +241,10 @@ mod tests {
     /// v0-mangled Rust function, a legacy-mangled one, a C symbol and a
     /// zero-sized label inside the first function.
     fn table() -> KernelSymbols {
+        let text = 0xffff_ffff_8000_1000..0xffff_ffff_8000_2080;
         KernelSymbols::new(
             0xffff_ffff_8000_0000,
+            vec![text],
             vec![
                 function("memcpy", 0xffff_ffff_8000_2000, 0x80),
                 function(
@@ -246,5 +306,30 @@ mod tests {
         assert_eq!(loaded.symbolize(0xffff_ffff_8120_2080), None);
         // Below the first function.
         assert_eq!(loaded.symbolize(0xffff_ffff_8120_0000), None);
+    }
+
+    #[test]
+    fn only_an_address_inside_an_executable_segment_is_text() {
+        let table = KernelSymbols::new(
+            0xffff_ffff_8000_0000,
+            vec![
+                0xffff_ffff_8000_1000..0xffff_ffff_8000_2000,
+                0xffff_ffff_8000_8000..0xffff_ffff_8000_9000,
+            ],
+            Vec::new(),
+        );
+        let loaded = table.loaded_at(0xffff_ffff_8120_0000);
+        // Both segments, shifted by the slide, at their first and last
+        // byte.
+        assert!(loaded.contains_text(0xffff_ffff_8120_1000));
+        assert!(loaded.contains_text(0xffff_ffff_8120_1fff));
+        assert!(loaded.contains_text(0xffff_ffff_8120_8800));
+        // The gap between them, one past each, and the unslid address.
+        assert!(!loaded.contains_text(0xffff_ffff_8120_2000));
+        assert!(!loaded.contains_text(0xffff_ffff_8120_9000));
+        assert!(!loaded.contains_text(0xffff_ffff_8000_1000));
+        // A small integer and a user address are never text.
+        assert!(!loaded.contains_text(0x246));
+        assert!(!loaded.contains_text(0x0000_7f00_0010_2030));
     }
 }
