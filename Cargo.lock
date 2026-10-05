@@ -1910,6 +1910,7 @@ dependencies = [
  "helios-inspector-protocol",
  "helios-profdata",
  "helios-workspace-root",
+ "iced-x86",
  "indicatif",
  "ipnet",
  "libc",
@@ -2129,6 +2130,7 @@ dependencies = [
  "helios-kernel",
  "helios-virtio",
  "i6300esb",
+ "libm",
  "limine 0.5.0",
  "pci_types",
  "spin 0.9.9",
@@ -2214,6 +2216,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f31827a206f56af32e590ba56d5d2d085f558508192593743f16b2306495269f"
 dependencies = [
  "cc",
+]
+
+[[package]]
+name = "iced-x86"
+version = "1.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c447cff8c7f384a7d4f741cfcff32f75f3ad02b406432e8d6c878d56b1edf6b"
+dependencies = [
+ "lazy_static",
 ]
 
 [[package]]

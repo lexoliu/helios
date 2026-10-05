@@ -15,6 +15,9 @@ i6300esb.workspace = true
 helios-kernel = { workspace = true, default-features = false, features = ["wasmtime-bare-metal"] }
 helios-virtio.workspace = true
 bytes = { version = "1.10.1", default-features = false }
+# The kernel saves only the legacy FXSAVE x87/SSE state on interrupt entry,
+# so it must not contain libm's CPUID-dispatched FMA/FMA4 paths.
+libm = { version = "0.2.16", default-features = false, features = ["force-soft-floats"] }
 tracing.workspace = true
 limine = "0.5.0"
 pci_types = "0.10.1"

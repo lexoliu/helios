@@ -56,6 +56,8 @@ use helios_hal::{
     DeviceInventory, DmaModel, Platform, ProcessorStartupPolicy, ProcessorTopology, align_up,
 };
 use helios_kernel::DebugSerialAccess;
+// Keep the unified kernel libm dependency's soft-float feature active.
+use libm as _;
 use x86_64::instructions::port::{Port, PortReadOnly, PortWriteOnly};
 use x86_64::registers::control::{Cr0Flags, Cr4Flags};
 

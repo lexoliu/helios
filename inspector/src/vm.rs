@@ -44,6 +44,7 @@ mod qemu;
 mod qmp;
 mod raw_profile;
 mod vcpu_state;
+mod x86_image_audit;
 
 use input::{InputScript, InputScriptError, InputStatement};
 use network::{
@@ -181,6 +182,8 @@ pub(crate) enum VmBuildError {
     Tool(#[from] ToolDiscoveryError),
     #[error("{0}")]
     WorkspaceRoot(#[from] WorkspaceRootError),
+    #[error("{0}")]
+    X86ImageAudit(#[from] x86_image_audit::X86ImageAuditError),
 }
 
 /// One build or provisioning step run as a child process.
@@ -861,6 +864,14 @@ impl KernelBuildProfile {
     /// Whether the image carries LLVM instrumentation.
     fn instrumented(self) -> bool {
         matches!(self, Self::ProfileGenerate)
+    }
+
+    /// Whether the x86 image audit in [`x86_image_audit`] applies to this profile.
+    fn audited_for_legacy_encoding(self) -> bool {
+        match self {
+            Self::Debug | Self::KernelDebug | Self::Release | Self::ProfileUse => true,
+            Self::ProfileGenerate => false,
+        }
     }
 
     /// The profile the guest programs of the bootfs are built with.
@@ -2757,6 +2768,9 @@ fn build_vm(command: &KernelBuildSpec) -> Result<(), VmBuildError> {
         run_pgo_kernel_step(&kernel_label, &mut kernel_build, command, &kernel)?;
     } else {
         run_step(&kernel_label, &mut kernel_build)?;
+    }
+    if command.profile.arch == VmArch::X86_64 && command.kind.audited_for_legacy_encoding() {
+        x86_image_audit::audit(&command.kernel_path()?)?;
     }
     run_step(
         "building inspector",
@@ -6752,6 +6766,15 @@ mod tests {
                     .as_path()
             ),
         );
+    }
+
+    #[test]
+    fn every_kernel_profile_except_profile_generate_is_audited_for_legacy_encoding() {
+        assert!(KernelBuildProfile::Release.audited_for_legacy_encoding());
+        assert!(KernelBuildProfile::ProfileUse.audited_for_legacy_encoding());
+        assert!(KernelBuildProfile::Debug.audited_for_legacy_encoding());
+        assert!(KernelBuildProfile::KernelDebug.audited_for_legacy_encoding());
+        assert!(!KernelBuildProfile::ProfileGenerate.audited_for_legacy_encoding());
     }
 
     /// The arguments a built cargo invocation carries, as strings.

@@ -37,6 +37,8 @@
 
 .section .text.helios_x86_secondary_wakeup, "ax"
 .balign 4096
+# The inspector's x86 image audit decodes this trampoline by its mode-boundary
+# labels and excludes the GDT/data range below from instruction decoding.
 .code16
 helios_x86_secondary_wakeup_start:
     cli
