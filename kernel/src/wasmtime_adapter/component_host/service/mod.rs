@@ -115,6 +115,7 @@ type Preview1Iovs = SmallVec<[(u32, u32); 8]>;
 type Preview1IovRanges = SmallVec<[(usize, usize); 8]>;
 type CompilerThreadTasks = SmallVec<[crate::JoinHandle<CompilerThreadReport>; 8]>;
 type CompilerThreadReports = SmallVec<[CompilerThreadReport; 8]>;
+type CompilerPluginHandle<CpuImpl, Net, HostFs> = Arc<CompilerPluginRuntime<CpuImpl, Net, HostFs>>;
 
 #[derive(Clone, Copy, Default)]
 struct CompilerPhaseTimestamps {
@@ -1997,7 +1998,7 @@ where
         &self,
         exec_context: &ProgramExecContext<CpuImpl, Net, HostFs>,
         compiler_payload: &Bytes,
-    ) -> Result<(Arc<CompilerPluginRuntime<CpuImpl, Net, HostFs>>, bool), ProgramExecError> {
+    ) -> Result<(CompilerPluginHandle<CpuImpl, Net, HostFs>, bool), ProgramExecError> {
         let mut slot = self.inner.compiler_plugin.lock();
         if let Some(plugin) = slot.as_ref() {
             return Ok((plugin.clone(), true));
