@@ -88,7 +88,17 @@ pub(super) struct CompilerCoreShared<T> {
     pub(super) entropy: Mutex<crate::EntropyPool>,
     pub(super) instance_pre: spin::Once<Arc<InstancePre<T>>>,
     pub(super) next_thread_id: AtomicI32,
-    pub(super) thread_tasks: Mutex<Vec<crate::JoinHandle<()>>>,
+    pub(super) thread_tasks: Mutex<Vec<crate::JoinHandle<CompilerThreadReport>>>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct CompilerThreadReport {
+    pub(super) thread_id: i32,
+    pub(super) processor: u16,
+    pub(super) spawned_ns: u64,
+    pub(super) started_ns: u64,
+    pub(super) instantiated_ns: u64,
+    pub(super) finished_ns: u64,
 }
 
 impl<CpuImpl, Net, HostFs> CompilerCoreStore<CpuImpl, Net, HostFs>

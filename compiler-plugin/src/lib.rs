@@ -7,7 +7,10 @@ use helios_compiler_abi::{
     CompileHint, CompilerRequestHeader, CompilerResponseHeader, CompilerStatus,
     HELIOS_COMPILER_ABI_VERSION, HELIOS_COMPILER_REQUEST_PROFILE, OutputKind,
 };
-use helios_compiler_support::{AotCompileHint, PrecompiledArtifactKind, precompile_artifact};
+use helios_compiler_support::{
+    AotCompileHint, CompileProfile, PrecompiledArtifactKind, precompile_artifact,
+    precompile_artifact_profiled,
+};
 use tracing_log::LogTracer;
 use tracing_subscriber::fmt::Subscriber;
 
@@ -127,18 +130,36 @@ fn compile(request: CompileRequest<'_>) -> u32 {
         enable_compiler_timing_log();
     }
     let started = request.profile.then(Instant::now);
-    let result = precompile_artifact(request.wasm, request.target, request.hint);
+    let memory_pages_before = request.profile.then(compiler_memory_pages);
+    let result = if request.profile {
+        precompile_artifact_profiled(request.wasm, request.target, request.hint)
+            .map(|(artifact, profile)| (artifact, Some(profile)))
+    } else {
+        precompile_artifact(request.wasm, request.target, request.hint)
+            .map(|artifact| (artifact, None))
+    };
     match result {
-        Ok(artifact) => {
+        Ok((artifact, profile)) => {
             let output_kind = match artifact.kind {
                 PrecompiledArtifactKind::CoreModule => OutputKind::CoreModule,
                 PrecompiledArtifactKind::Component => OutputKind::Component,
             };
-            let diagnostic = started
-                .map(|started| {
-                    compiler_timing_report(started, output_kind, artifact.bytes.len()).into_bytes()
-                })
-                .unwrap_or_default();
+            let diagnostic = if let Some(started) = started {
+                let report_started = Instant::now();
+                let mut diagnostic =
+                    compiler_timing_report(started, output_kind, artifact.bytes.len());
+                let report_us = elapsed_us(report_started);
+                let profile = profile.as_ref().expect("profile result missing");
+                diagnostic.push_str(&compile_phase_report(
+                    profile,
+                    report_us,
+                    memory_pages_before.expect("profile memory size missing"),
+                    compiler_memory_pages(),
+                ));
+                diagnostic.into_bytes()
+            } else {
+                Vec::new()
+            };
             response(CompilerStatus::Ok, output_kind, artifact.bytes, diagnostic)
         }
         Err(error) => response(
@@ -182,8 +203,48 @@ fn compiler_timing_report(started: Instant, output_kind: OutputKind, output_len:
     let pass_times = cranelift_codegen::timing::take_global();
     format!(
         "INFO [helios_compiler_plugin] profile total_ms={} output_kind={output_kind:?} output_len={output_len}\n{pass_times}",
-        elapsed.as_millis()
+        elapsed.as_millis(),
     )
+}
+
+fn compile_phase_report(
+    profile: &CompileProfile,
+    report_us: u64,
+    memory_pages_before: u32,
+    memory_pages_after: u32,
+) -> String {
+    let mut report = format!(
+        "compile-phases engine_us={} pool_us={} compile_us={} report_us={report_us} workers={} memory_pages_before={memory_pages_before} memory_pages_after={memory_pages_after}\n",
+        profile.engine_us, profile.pool_us, profile.compile_us, profile.worker_count,
+    );
+    for worker in &profile.workers {
+        report.push_str(&format!(
+            "compile-worker index={} translate_n={} translate_us={} compile_n={} compile_us={} lifetime_us={}\n",
+            worker.index,
+            worker.translate_count,
+            worker.translate_us,
+            worker.compile_count,
+            worker.compile_us,
+            worker.lifetime_us,
+        ));
+    }
+    report
+}
+
+#[inline]
+fn compiler_memory_pages() -> u32 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        core::arch::wasm32::memory_size::<0>() as u32
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        0
+    }
+}
+
+fn elapsed_us(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
 fn response(

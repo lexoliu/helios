@@ -2,8 +2,11 @@ use helios_artifact::{
     CWASM_MEMORY_GUARD_SIZE, CWASM_MEMORY_RESERVATION, cwasm_target_cranelift_flags,
     cwasm_target_supports_wasm_simd,
 };
+use std::cell::Cell;
 use std::env;
 use std::num::NonZeroUsize;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use thiserror::Error;
 use wasmparser::{Encoding, Parser, Payload};
 use wasmtime::{Config, Engine, OptLevel, Strategy};
@@ -24,6 +27,25 @@ pub enum PrecompiledArtifactKind {
 pub struct PrecompiledArtifact {
     pub bytes: Vec<u8>,
     pub kind: PrecompiledArtifactKind,
+}
+
+#[derive(Clone, Debug)]
+pub struct WorkerStat {
+    pub index: usize,
+    pub translate_count: u64,
+    pub translate_us: u64,
+    pub compile_count: u64,
+    pub compile_us: u64,
+    pub lifetime_us: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct CompileProfile {
+    pub engine_us: u64,
+    pub pool_us: u64,
+    pub compile_us: u64,
+    pub worker_count: usize,
+    pub workers: Vec<WorkerStat>,
 }
 
 #[derive(Debug, Error)]
@@ -57,7 +79,25 @@ pub fn precompile_artifact(
     target: &str,
     hint: AotCompileHint,
 ) -> Result<PrecompiledArtifact> {
+    Ok(precompile_artifact_inner(bytes, target, hint, false)?.0)
+}
+
+pub fn precompile_artifact_profiled(
+    bytes: &[u8],
+    target: &str,
+    hint: AotCompileHint,
+) -> Result<(PrecompiledArtifact, CompileProfile)> {
+    precompile_artifact_inner(bytes, target, hint, true)
+}
+
+fn precompile_artifact_inner(
+    bytes: &[u8],
+    target: &str,
+    hint: AotCompileHint,
+    profile: bool,
+) -> Result<(PrecompiledArtifact, CompileProfile)> {
     let worker_count = compiler_worker_count();
+    let engine_started = Instant::now();
     let engine =
         Engine::new(&build_engine_config(target, hint, worker_count)?).map_err(|source| {
             CompileError::Engine {
@@ -65,18 +105,92 @@ pub fn precompile_artifact(
                 source,
             }
         })?;
+    let encoding = wasm_encoding(bytes)?;
+    let engine_us = elapsed_us(engine_started);
     if worker_count <= 1 {
-        return precompile_artifact_with_engine(bytes, &engine);
+        let compile_started = Instant::now();
+        let artifact = precompile_artifact_with_engine(bytes, encoding, &engine)?;
+        return Ok((
+            artifact,
+            CompileProfile {
+                engine_us,
+                pool_us: 0,
+                compile_us: elapsed_us(compile_started),
+                worker_count,
+                workers: Vec::new(),
+            },
+        ));
     }
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(worker_count)
-        .build()
-        .map_err(CompileError::WorkerPool)?;
-    pool.install(|| precompile_artifact_with_engine(bytes, &engine))
+
+    let worker_stats = profile.then(|| Arc::new(Mutex::new(Vec::with_capacity(worker_count))));
+    let pool_started = Instant::now();
+    let mut builder = rayon::ThreadPoolBuilder::new().num_threads(worker_count);
+    if let Some(worker_stats) = worker_stats.clone() {
+        builder = builder
+            .start_handler(|_| {
+                WORKER_COUNTERS.with(|counters| counters.set(WorkerCounters::default()));
+                WORKER_LIFETIME_START.with(|started| started.set(Some(Instant::now())));
+                cranelift_codegen::timing::set_thread_profiler(Box::new(WorkerProfiler));
+            })
+            .exit_handler(move |index| {
+                let started = WORKER_LIFETIME_START.with(|started| {
+                    started
+                        .take()
+                        .expect("rayon worker exited without a profiling start")
+                });
+                let counters = WORKER_COUNTERS.with(Cell::take);
+                worker_stats
+                    .lock()
+                    .expect("compiler worker profile lock was poisoned")
+                    .push(WorkerStat {
+                        index,
+                        translate_count: counters.translate_count,
+                        translate_us: counters.translate_ns / 1_000,
+                        compile_count: counters.compile_count,
+                        compile_us: counters.compile_ns / 1_000,
+                        lifetime_us: elapsed_us(started),
+                    });
+            });
+    }
+    let pool = builder.build().map_err(CompileError::WorkerPool)?;
+    let pool_us = elapsed_us(pool_started);
+    let compile_started = Instant::now();
+    let artifact = pool.install(|| precompile_artifact_with_engine(bytes, encoding, &engine))?;
+    let compile_us = elapsed_us(compile_started);
+    drop(pool);
+    let workers = worker_stats
+        .map(|worker_stats| {
+            while worker_stats
+                .lock()
+                .expect("compiler worker profile lock was poisoned")
+                .len()
+                < worker_count
+            {
+                std::thread::yield_now();
+            }
+            worker_stats
+                .lock()
+                .expect("compiler worker profile lock was poisoned")
+                .clone()
+        })
+        .unwrap_or_default();
+    Ok((
+        artifact,
+        CompileProfile {
+            engine_us,
+            pool_us,
+            compile_us,
+            worker_count,
+            workers,
+        },
+    ))
 }
 
-fn precompile_artifact_with_engine(bytes: &[u8], engine: &Engine) -> Result<PrecompiledArtifact> {
-    let encoding = wasm_encoding(bytes)?;
+fn precompile_artifact_with_engine(
+    bytes: &[u8],
+    encoding: Encoding,
+    engine: &Engine,
+) -> Result<PrecompiledArtifact> {
     match encoding {
         Encoding::Module => {
             let bytes = engine
@@ -97,6 +211,73 @@ fn precompile_artifact_with_engine(bytes: &[u8], engine: &Engine) -> Result<Prec
             })
         }
     }
+}
+
+#[derive(Clone, Copy, Default)]
+struct WorkerCounters {
+    translate_count: u64,
+    translate_ns: u64,
+    compile_count: u64,
+    compile_ns: u64,
+}
+
+thread_local! {
+    static WORKER_COUNTERS: Cell<WorkerCounters> = const { Cell::new(WorkerCounters {
+        translate_count: 0,
+        translate_ns: 0,
+        compile_count: 0,
+        compile_ns: 0,
+    }) };
+    static WORKER_LIFETIME_START: Cell<Option<Instant>> = const { Cell::new(None) };
+}
+
+struct WorkerProfiler;
+
+impl cranelift_codegen::timing::Profiler for WorkerProfiler {
+    fn start_pass(&self, pass: cranelift_codegen::timing::Pass) -> Box<dyn std::any::Any> {
+        let started = Instant::now();
+        let inner = cranelift_codegen::timing::DefaultProfiler.start_pass(pass);
+        Box::new(WorkerTimingToken {
+            _inner: inner,
+            pass,
+            started,
+        })
+    }
+}
+
+struct WorkerTimingToken {
+    _inner: Box<dyn std::any::Any>,
+    pass: cranelift_codegen::timing::Pass,
+    started: Instant,
+}
+
+impl Drop for WorkerTimingToken {
+    fn drop(&mut self) {
+        let elapsed = elapsed_ns(self.started);
+        WORKER_COUNTERS.with(|cell| {
+            let mut counters = cell.get();
+            match self.pass {
+                cranelift_codegen::timing::Pass::wasm_translate_function => {
+                    counters.translate_count += 1;
+                    counters.translate_ns += elapsed;
+                }
+                cranelift_codegen::timing::Pass::compile => {
+                    counters.compile_count += 1;
+                    counters.compile_ns += elapsed;
+                }
+                _ => {}
+            }
+            cell.set(counters);
+        });
+    }
+}
+
+fn elapsed_us(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
+fn elapsed_ns(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
 pub fn wasm_encoding(bytes: &[u8]) -> Result<Encoding> {
