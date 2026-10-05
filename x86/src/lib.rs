@@ -267,6 +267,16 @@ fn x86_kernel_main() -> ! {
             .with_devices(devices),
     );
     smp::current_runtime().install_timer(kernel.timer());
+    // The first line the logger can carry. The bootloader decides where
+    // the kernel runs, so a runtime address means nothing against the
+    // image's own symbols until it is shifted by this base; the inspector
+    // reads this exact line out of the debug serial log to symbolise the
+    // vCPUs of a guest that stopped answering.
+    tracing::info!(
+        virtual_base = format_args!("{:#x}", handoff.kernel.virtual_base),
+        physical_base = format_args!("{:#x}", handoff.kernel.physical_base),
+        "kernel image loaded"
+    );
     let debug_state = cpu.debug_state();
     // The root DRBG is seeded before any component can ask for random
     // bytes. x86 has no firmware seed to read — the boot protocol here
