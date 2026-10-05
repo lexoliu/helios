@@ -4445,15 +4445,15 @@ fn emit_program_stage_marker(write_serial: crate::DebugSerialWriter, stage: &str
 
 #[derive(Debug, Error)]
 enum DebuggerError {
-    #[error("failed to initialize Wasmtime engine: {0}")]
+    #[error("failed to initialize Wasmtime engine: {0:#}")]
     CreateEngine(wasmtime::Error),
     #[error("failed to validate embedded debugger artifact: {0}")]
     TrustComponent(ArtifactTrustError),
-    #[error("failed to load embedded debugger component: {0}")]
+    #[error("failed to load embedded debugger component: {0:#}")]
     LoadComponent(wasmtime::Error),
-    #[error("failed to instantiate debugger component: {0}")]
+    #[error("failed to instantiate debugger component: {0:#}")]
     InstantiateComponent(wasmtime::Error),
-    #[error("debugger component trapped: {0}")]
+    #[error("debugger component trapped: {0:#}")]
     RunComponent(wasmtime::Error),
     #[error("debugger component returned a non-zero result")]
     GuestFailed,
