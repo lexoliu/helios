@@ -13,6 +13,10 @@ where
 {
     pub(super) instance_pre: Arc<InstancePre<CompilerCoreStore<CpuImpl, Net, HostFs>>>,
     pub(super) shared: Arc<CompilerCoreShared<CompilerCoreStore<CpuImpl, Net, HostFs>>>,
+    /// The linker-reserved main-thread TLS block, initialised once by the
+    /// instance that wins the memory-init flag; every per-compile instance
+    /// adopts it because later instances skip that init and see `__tls_base == 0`.
+    pub(super) main_thread_tls_base: u32,
 }
 
 pub(super) struct CompilerCompileSlot<'a> {
@@ -255,6 +259,27 @@ where
             },
         }),
     }
+}
+
+pub(super) fn set_compiler_tls_base<CpuImpl, Net, HostFs>(
+    store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, HostFs>>,
+    instance: &wasmtime::Instance,
+    tls_base: u32,
+) -> Result<(), ProgramExecError>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    HostFs: crate::HostFileSystem,
+{
+    let global = instance
+        .get_global(&mut *store, "__tls_base")
+        .ok_or(ProgramExecError {
+            kind: ProgramExecErrorKind::InvalidBinary,
+            detail: ProgramExecErrorDetail::CompilerPluginInvalid,
+        })?;
+    global
+        .set(&mut *store, Val::I32(tls_base as i32))
+        .map_err(map_program_runtime_error)
 }
 
 pub(super) fn compiler_alloc<CpuImpl, Net, HostFs>(
