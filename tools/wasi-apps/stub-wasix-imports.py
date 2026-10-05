@@ -30,7 +30,9 @@ from typing import NoReturn
 
 IMPORT_LINE = re.compile(r'^\s*\(import "([^"]+)" "([^"]+)"')
 WASIX_FUNC = re.compile(
-    r'^\s*\(import "wasix_32v1" "([a-z0-9_]+)" \(func (\$[^ ]+) \(;\d+;\) \(type (\d+)\)\)\)$'
+    r'^\s*\(import "wasix_32v1" "([a-z0-9_]+)" \(func (\$[^ ]+) \(;\d+;\) \(type (\d+)\)'
+    # wasm-tools 1.261 and later repeat the signature after the type index.
+    r'(?: \(param[^()]*\))?(?: \(result[^()]*\))?\)\)$'
 )
 ENV_MEMORY = re.compile(r'^\s*\(import "env" "memory" \(memory \(;\d+;\) (\d+) (\d+) shared\)\)$')
 TYPE_FUNC = re.compile(r"^\s*\(type \(;(\d+);\) \(func (.*)\)\)$")
