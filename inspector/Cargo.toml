@@ -9,6 +9,8 @@ async-channel = "2.5.0"
 async-io = "2.6.0"
 async-net = "2.0.0"
 async-signal = "0.2.13"
+# Runs the blocking QMP capture of a wedged guest off the executor thread.
+blocking = "1.7.0"
 clap = { version = "4.5.48", features = ["derive"] }
 crossterm = "0.29.0"
 console = "0.16.1"
@@ -31,6 +33,8 @@ nu-ansi-term = "0.50.3"
 # profile-use build's uncovered-function count (#329).
 object = { version = "0.39", default-features = false, features = ["elf", "read", "std"] }
 ratatui = "0.30.0"
+# Names the function each vCPU of a wedged guest was executing.
+rustc-demangle = "0.1.28"
 rustyline = "14.0.0"
 serialport = "4.9.0"
 shell-words = "1.1.0"

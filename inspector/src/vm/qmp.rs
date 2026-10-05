@@ -83,6 +83,8 @@ pub(crate) enum QmpError {
     },
     #[error("the screendump path must be valid UTF-8, and {path:?} is not")]
     ScreendumpPathNotUtf8 { path: String },
+    #[error("the human monitor answered {command:?} with {value} instead of its text output")]
+    DecodeHumanMonitor { command: String, value: Value },
 }
 
 /// Why a value the caller wrote is not one QEMU's input layer names.
@@ -228,6 +230,20 @@ struct InputSendEventArguments<'a> {
     events: &'a [InputEvent],
 }
 
+/// The arguments of one `human-monitor-command`.
+///
+/// `cpu-index` is QMP's own way of choosing the vCPU a monitor command
+/// acts on when the command takes an implicit one (`info lapic`), so the
+/// caller names a vCPU by the same index `info registers -a` prints
+/// rather than by an APIC ID it has no way to learn.
+#[derive(Debug, Serialize)]
+struct HumanMonitorCommandArguments<'a> {
+    #[serde(rename = "command-line")]
+    command_line: &'a str,
+    #[serde(rename = "cpu-index", skip_serializing_if = "Option::is_none")]
+    cpu_index: Option<u32>,
+}
+
 /// Why a size the caller wrote is not one QEMU would accept.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum SizeError {
@@ -327,6 +343,40 @@ impl QmpClient {
         serde_json::from_value(value).map_err(|source| QmpError::DecodeBalloon { source })
     }
 
+    /// Runs one human monitor (HMP) command and returns its text output.
+    ///
+    /// A command the monitor does not know is not a QMP error: the
+    /// monitor answers with its own complaint as the text, which the
+    /// caller sees in the output.
+    pub(crate) fn human_monitor_command(&mut self, command: &str) -> Result<String, QmpError> {
+        self.human_monitor(command, None)
+    }
+
+    /// Runs one human monitor command against vCPU `cpu_index`, for the
+    /// commands that act on the monitor's current vCPU.
+    pub(crate) fn human_monitor_command_on(
+        &mut self,
+        cpu_index: u32,
+        command: &str,
+    ) -> Result<String, QmpError> {
+        self.human_monitor(command, Some(cpu_index))
+    }
+
+    fn human_monitor(&mut self, command: &str, cpu_index: Option<u32>) -> Result<String, QmpError> {
+        let arguments = serde_json::to_value(HumanMonitorCommandArguments {
+            command_line: command,
+            cpu_index,
+        })
+        .map_err(|source| QmpError::Encode { source })?;
+        match self.execute("human-monitor-command", arguments)? {
+            Value::String(output) => Ok(output),
+            value => Err(QmpError::DecodeHumanMonitor {
+                command: command.to_owned(),
+                value,
+            }),
+        }
+    }
+
     fn execute(&mut self, command: &str, arguments: Value) -> Result<Value, QmpError> {
         let mut request = json!({ "execute": command });
         if !arguments.is_null() {
@@ -408,9 +458,29 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ABS_AXIS_MAX, AbsCoordinate, InputEvent, InputSendEventArguments, KeyValue, PointerAxis,
-        PointerButton, QKeyCode, ScreendumpArguments, parse_size,
+        ABS_AXIS_MAX, AbsCoordinate, HumanMonitorCommandArguments, InputEvent,
+        InputSendEventArguments, KeyValue, PointerAxis, PointerButton, QKeyCode,
+        ScreendumpArguments, parse_size,
     };
+
+    #[test]
+    fn a_monitor_command_names_its_vcpu_only_when_it_has_one() {
+        let everywhere = serde_json::to_value(HumanMonitorCommandArguments {
+            command_line: "info registers -a",
+            cpu_index: None,
+        })
+        .expect("the monitor arguments serialise");
+        assert_eq!(everywhere, json!({ "command-line": "info registers -a" }));
+        let on_one = serde_json::to_value(HumanMonitorCommandArguments {
+            command_line: "info lapic",
+            cpu_index: Some(3),
+        })
+        .expect("the monitor arguments serialise");
+        assert_eq!(
+            on_one,
+            json!({ "command-line": "info lapic", "cpu-index": 3 })
+        );
+    }
 
     #[test]
     fn a_capture_names_the_format_it_wants() {
