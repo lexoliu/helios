@@ -6,6 +6,24 @@ import tempfile
 from pathlib import Path
 
 
+def host_components():
+    if platform.system() == "Linux":
+        flags = set()
+        for line in Path("/proc/cpuinfo").read_text().splitlines():
+            if line.startswith("Features") or line.startswith("flags"):
+                flags.update(line.split(":", 1)[1].split())
+        return flags
+    if platform.system() == "Darwin":
+        output = subprocess.run(
+            ["sysctl", "-n", "machdep.cpu.features"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        return set(output.lower().split())
+    return set()
+
+
 def main():
     root = Path(__file__).resolve().parents[2]
     source = root / "x86/src/exceptions.S"
@@ -43,6 +61,7 @@ def main():
             timeout=60,
         )
         result = subprocess.run([str(binary)], check=False, timeout=10)
+        components = subprocess.run([str(binary), "--components"], check=False, timeout=10)
     categories = {
         0: "preserved",
         1: "x87 control/status/tag corrupted",
@@ -50,13 +69,28 @@ def main():
         3: "x87 register corrupted",
         4: "XMM register corrupted",
         5: "general-purpose register corrupted",
+        6: "YMM upper state corrupted",
+        7: "ZMM state corrupted",
+        8: "opmask state corrupted",
     }
+    component_mask = components.returncode
+    verified_components = ["x87", "sse"]
+    if component_mask & 1:
+        verified_components.append("avx")
+    if component_mask & 2:
+        verified_components.append("avx512")
+    flags = host_components()
     print(
         json.dumps(
             {
                 "source_sha256": hashlib.sha256(assembly).hexdigest(),
                 "exit_code": result.returncode,
                 "result": categories.get(result.returncode, "unexpected termination"),
+                "verified_components": verified_components,
+                "component_mask": component_mask,
+                "host_avx": "avx" in flags,
+                "host_avx512f": "avx512f" in flags,
+                "host_avx512bw": "avx512bw" in flags,
                 "nested_interrupt": True,
             }
         )

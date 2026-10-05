@@ -9,6 +9,7 @@ mod boot;
 mod device;
 mod entropy;
 mod exceptions;
+mod extended_state;
 mod gpu;
 mod host_fs;
 mod input;
@@ -129,7 +130,9 @@ unsafe impl critical_section::Impl for X86CriticalSection {
 /// SSE-enabled machine state (the Limine 9 EFI loader hands off with
 /// CR4.OSFXSR clear), so no compiler-generated code may run before the
 /// FPU/SSE control bits are set: LLVM freely emits SSE moves into early
-/// boot code. This naked stub is the only pre-SSE code in the kernel.
+/// boot code. This naked stub is the only pre-SSE code in the kernel;
+/// `x86_kernel_main` enables OSXSAVE and the CPUID-reported XCR0 in Rust
+/// after it has configured COM1.
 #[unsafe(no_mangle)]
 #[unsafe(naked)]
 extern "C" fn _start() -> ! {
@@ -160,6 +163,7 @@ fn x86_kernel_main() -> ! {
     smp::install_bootstrap_anchor();
     // The one place COM1 is configured; see `serial_uart_init`.
     serial_uart_init();
+    let xcr0 = extended_state::enable_on_bootstrap_processor();
     assert!(
         boot::base_revision_supported(),
         "Limine bootloader does not support the required base protocol revision"
@@ -209,6 +213,7 @@ fn x86_kernel_main() -> ! {
         tsc_base,
         tsc_hz,
         debug_state.clone(),
+        xcr0,
     );
     smp::activate_runtime(boot.bootstrap_runtime());
     // The local APIC is enabled once, here, and never re-attached on the
@@ -276,6 +281,14 @@ fn x86_kernel_main() -> ! {
         virtual_base = format_args!("{:#x}", handoff.kernel.virtual_base),
         physical_base = format_args!("{:#x}", handoff.kernel.physical_base),
         "kernel image loaded"
+    );
+    let (xsave_standard_bytes, xsave_max_bytes) = extended_state::xsave_sizes();
+    tracing::info!(
+        xcr0 = format_args!("{:#x}", xcr0.bits()),
+        xsave_standard_bytes,
+        xsave_max_bytes,
+        avx512 = xcr0.bits() & extended_state::AVX512_STATE != 0,
+        "x86 extended state enabled"
     );
     let debug_state = cpu.debug_state();
     // The root DRBG is seeded before any component can ask for random
@@ -572,10 +585,6 @@ fn install_pci_devices<WatchdogImpl>(
         destination_apic_id,
     );
 }
-
-// TODO(x86-avx): enable OSXSAVE, program XCR0, and preserve XSAVE state
-// (in `_start` and the secondary wakeup trampoline) before advertising
-// AVX/FMA/AVX512 to Wasmtime-generated code.
 
 /// Counts usable processors from the MADT. Runs before the bootstrap
 /// allocator is primed (the count sizes the allocator's per-processor
@@ -958,13 +967,15 @@ extern "C" fn secondary_start_rust(
     boot: *const smp::BootContext,
     runtime: *const smp::ProcessorRuntime,
 ) -> ! {
-    // FPU/SSE control bits are set by the secondary wakeup trampoline
-    // before any compiler-generated code runs on this processor.
+    let boot = unsafe { &*boot };
+    // FPU/SSE control bits are set by the secondary wakeup trampoline;
+    // OSXSAVE and the bootstrap processor's XCR0 are set here, before any
+    // guest code can run on this processor.
     //
     // COM1 is deliberately not configured here: the bootstrap processor
     // configured it before it woke anyone, and configuring it again is
     // destructive rather than idempotent. See `serial_uart_init`.
-    let boot = unsafe { &*boot };
+    extended_state::enable_on_secondary_processor(boot.xcr0());
     let runtime = unsafe { &*runtime };
     smp::activate_runtime(runtime);
     smp::current_runtime().attach_local_apic();
@@ -1022,6 +1033,7 @@ fn detect_x86_native_feature(feature: &str) -> Option<bool> {
         "sse4.2" => Some(leaf1.ecx & (1 << 20) != 0),
         "popcnt" => Some(leaf1.ecx & (1 << 23) != 0),
         "avx" => Some(avx_os_enabled),
+        "avx2" => Some(leaf7.is_some_and(|leaf| leaf.ebx & (1 << 5) != 0) && avx_os_enabled),
         "fma" => Some(leaf1.ecx & (1 << 12) != 0 && avx_os_enabled),
         "bmi1" => Some(leaf7.is_some_and(|leaf| leaf.ebx & (1 << 3) != 0)),
         "bmi2" => Some(leaf7.is_some_and(|leaf| leaf.ebx & (1 << 8) != 0)),

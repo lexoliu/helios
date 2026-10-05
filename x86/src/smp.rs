@@ -42,6 +42,7 @@ use crate::debug_state;
 use crate::exceptions::{
     DeviceInterruptRoutes, EXCEPTION_STACK_BYTES, ProcessorIdt, ProcessorSegments,
 };
+use crate::extended_state::Xcr0;
 use crate::ioapic::IoApic;
 use crate::pci::LegacyPciConfigAccess;
 use crate::read_tsc;
@@ -256,6 +257,7 @@ impl ProcessorRuntime {
 
 pub(crate) struct BootContext {
     platform: Arc<X86PlatformState>,
+    xcr0: Xcr0,
 }
 
 pub(crate) struct X86PlatformState {
@@ -295,6 +297,7 @@ pub(crate) fn build_boot_context(
     tsc_base: u64,
     tsc_hz: u64,
     debug_state: debug_state::RuntimeState,
+    xcr0: Xcr0,
 ) -> &'static BootContext {
     let handler = PhysicalOffsetAcpiHandler {
         physical_memory_offset,
@@ -410,7 +413,7 @@ pub(crate) fn build_boot_context(
     if let Some(wakeup_page) = platform.wakeup_page.as_ref() {
         prepare_wakeup_page(&platform, wakeup_page);
     }
-    let context = Box::leak(Box::new(BootContext { platform }));
+    let context = Box::leak(Box::new(BootContext { platform, xcr0 }));
     context
         .platform
         .boot_context
@@ -615,6 +618,12 @@ impl ProcessorRuntime {
 impl BootContext {
     pub(crate) fn platform(&self) -> Arc<X86PlatformState> {
         self.platform.clone()
+    }
+
+    /// The XCR0 the bootstrap processor programmed; see
+    /// [`crate::extended_state::enable_on_secondary_processor`].
+    pub(crate) fn xcr0(&self) -> Xcr0 {
+        self.xcr0
     }
 
     pub(crate) fn bootstrap_runtime(&self) -> &ProcessorRuntime {
