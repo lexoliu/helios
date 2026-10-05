@@ -167,9 +167,14 @@ pub(crate) struct ProcessorRuntime {
     apic_mode: LocalApicMode,
     pub(crate) wasmtime_tls: WasmtimeTlsSlots,
     pub(crate) exception_idt: ProcessorIdt,
-    /// The GDT and TSS this processor loads beside its IDT, and the two
-    /// exception stacks the TSS names.
+    /// The GDT and TSS this processor loads beside its IDT, and the
+    /// exception and interrupt stacks the TSS names.
     pub(crate) segments: ProcessorSegments,
+    /// Whether an external interrupt is being dispatched on this
+    /// processor's interrupt stack, which holds exactly one frame at a
+    /// time. Written by this processor only, from
+    /// `exceptions::helios_x86_interrupt_dispatch`.
+    pub(crate) interrupt_in_progress: AtomicBool,
     /// The page the boot-time page-fault probe in
     /// `exceptions::verify_page_fault_returns` expects to fault on; zero
     /// when no probe is running. Written by this processor only.
@@ -224,6 +229,28 @@ impl ProcessorRuntime {
     /// processor has already stopped looking at.
     pub(crate) fn take_wake_pending(&self) -> bool {
         self.wake_pending.swap(false, Ordering::AcqRel)
+    }
+
+    /// Marks an external-interrupt dispatch as running on this
+    /// processor's interrupt stack, asserting that none already is. The
+    /// stack holds one frame at a time and a second dispatch would
+    /// overwrite the first: every external vector arrives through an
+    /// interrupt gate, which clears IF on delivery, and no handler
+    /// re-enables it, so the flag may only be set once at a time. Only
+    /// this processor touches it, which makes `Relaxed` the whole
+    /// ordering it needs.
+    pub(crate) fn begin_interrupt_dispatch(&self, vector: u64) {
+        assert!(
+            !self.interrupt_in_progress.swap(true, Ordering::Relaxed),
+            "x86 interrupt vector {vector:#x} was delivered while an interrupt was already \
+             in progress on this processor's interrupt stack"
+        );
+    }
+
+    /// Marks the interrupt stack free again; see
+    /// [`Self::begin_interrupt_dispatch`].
+    pub(crate) fn end_interrupt_dispatch(&self) {
+        self.interrupt_in_progress.store(false, Ordering::Relaxed);
     }
 }
 
@@ -299,7 +326,12 @@ pub(crate) fn build_boot_context(
             apic_mode,
             wasmtime_tls: WasmtimeTlsSlots::new(),
             exception_idt: ProcessorIdt::new(),
-            segments: ProcessorSegments::new(exception_stack(), exception_stack()),
+            segments: ProcessorSegments::new(
+                exception_stack(),
+                exception_stack(),
+                exception_stack(),
+            ),
+            interrupt_in_progress: AtomicBool::new(false),
             probe_fault: AtomicUsize::new(0),
             probe_frame: AtomicUsize::new(0),
             watchdog: watchdog.clone(),
@@ -329,7 +361,12 @@ pub(crate) fn build_boot_context(
                 apic_mode,
                 wasmtime_tls: WasmtimeTlsSlots::new(),
                 exception_idt: ProcessorIdt::new(),
-                segments: ProcessorSegments::new(exception_stack(), exception_stack()),
+                segments: ProcessorSegments::new(
+                    exception_stack(),
+                    exception_stack(),
+                    exception_stack(),
+                ),
+                interrupt_in_progress: AtomicBool::new(false),
                 probe_fault: AtomicUsize::new(0),
                 probe_frame: AtomicUsize::new(0),
                 watchdog: watchdog.clone(),
@@ -1683,8 +1720,8 @@ unsafe impl FrameAllocator<Size4KiB> for DirectMappedFrameAllocator {
     }
 }
 
-/// One exception stack for one processor, as the byte range the TSS
-/// names the top of.
+/// One exception or interrupt stack for one processor, as the byte
+/// range the TSS names the top of.
 fn exception_stack() -> Range<usize> {
     let base = allocate_aligned_zeroed(EXCEPTION_STACK_BYTES, 16);
     base..base + EXCEPTION_STACK_BYTES
