@@ -8,14 +8,15 @@
 //! all. The secondary-wakeup trampoline is decoded in the mode each of its
 //! parts runs in, and its GDT and data tail are not code.
 //!
-//! Release and profile-use images are built from the same source as
-//! profile-generate, and link-time dead-code elimination retains everything
-//! reachable from a call path, so the release audit covers any code
-//! profile-generate can execute. Profile-generate only collects profiles; it
-//! never ships or is measured, and its `__llvm_prf_data` deliberately keeps
-//! uncalled functions alive, so it is not audited. The exemption is selected
-//! only by the build profile (`KernelBuildProfile`), never by a symbol or
-//! section heuristic.
+//! The audit runs on the x86 images the inspector boots for measurement or
+//! shipping: release and profile-use. These builds share source with all other
+//! profiles, and link-time dead-code elimination retains everything reachable
+//! from a call path, so the release audit covers what those builds can execute.
+//! Profile-generate only collects profiles; its `__llvm_prf_data` deliberately
+//! keeps uncalled functions alive. Debug and kernel-debug are development
+//! builds, neither measured nor shipped, and `dev` strips the symbols needed
+//! to decode the trampoline. The exemption is selected only by the build
+//! profile (`KernelBuildProfile`), never by a symbol or section heuristic.
 
 use std::ops::Range;
 use std::path::Path;

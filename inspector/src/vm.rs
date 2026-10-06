@@ -866,11 +866,12 @@ impl KernelBuildProfile {
         matches!(self, Self::ProfileGenerate)
     }
 
-    /// Whether the x86 image audit in [`x86_image_audit`] applies to this profile.
+    /// Whether [`x86_image_audit`] runs on this profile's x86 image: only the
+    /// images the inspector boots for measurement or shipping.
     fn audited_for_legacy_encoding(self) -> bool {
         match self {
-            Self::Debug | Self::KernelDebug | Self::Release | Self::ProfileUse => true,
-            Self::ProfileGenerate => false,
+            Self::Release | Self::ProfileUse => true,
+            Self::Debug | Self::KernelDebug | Self::ProfileGenerate => false,
         }
     }
 
@@ -6769,11 +6770,11 @@ mod tests {
     }
 
     #[test]
-    fn every_kernel_profile_except_profile_generate_is_audited_for_legacy_encoding() {
+    fn only_measured_and_shipped_kernel_profiles_are_audited_for_legacy_encoding() {
         assert!(KernelBuildProfile::Release.audited_for_legacy_encoding());
         assert!(KernelBuildProfile::ProfileUse.audited_for_legacy_encoding());
-        assert!(KernelBuildProfile::Debug.audited_for_legacy_encoding());
-        assert!(KernelBuildProfile::KernelDebug.audited_for_legacy_encoding());
+        assert!(!KernelBuildProfile::Debug.audited_for_legacy_encoding());
+        assert!(!KernelBuildProfile::KernelDebug.audited_for_legacy_encoding());
         assert!(!KernelBuildProfile::ProfileGenerate.audited_for_legacy_encoding());
     }
 
