@@ -1041,25 +1041,46 @@ where
                     .clone();
                 let spawner = store_data.spawner.clone();
                 let shared = store_data.shared.clone();
+                let spawned_ns = crate::monotonic_nanos(&store_data.cpu);
                 let task = spawner.spawn(async move {
+                    let started_ns = crate::monotonic_nanos(&store_data.cpu);
+                    let processor = helios_hal::cpu::current_processor().id();
                     let mut store =
                         wasmtime::Store::new(instance_pre.module().engine(), store_data);
                     configure_compiler_core_store(&mut store);
-                    let thread_started = store.data().cpu.now().ticks();
-                    let result = instance_pre.instantiate(&mut store).and_then(|instance| {
-                        let start = instance
-                            .get_typed_func::<(i32, i32), ()>(&mut store, "wasi_thread_start")?;
-                        start.call(&mut store, (thread_id, start_arg))
-                    });
+                    let thread_started_ticks = store.data().cpu.now().ticks();
+                    let (result, instantiated_ns) = match instance_pre.instantiate(&mut store) {
+                        Ok(instance) => {
+                            let start = instance
+                                .get_typed_func::<(i32, i32), ()>(&mut store, "wasi_thread_start");
+                            let instantiated_ns = crate::monotonic_nanos(&store.data().cpu);
+                            let result = start
+                                .and_then(|start| start.call(&mut store, (thread_id, start_arg)));
+                            (result, instantiated_ns)
+                        }
+                        Err(error) => {
+                            let instantiated_ns = crate::monotonic_nanos(&store.data().cpu);
+                            (Err(error), instantiated_ns)
+                        }
+                    };
+                    let finished_ns = crate::monotonic_nanos(&store.data().cpu);
                     let thread_elapsed = store
                         .data()
                         .cpu
                         .now()
                         .ticks()
-                        .saturating_sub(thread_started);
+                        .saturating_sub(thread_started_ticks);
                     store.data().record_user_ticks(thread_elapsed);
                     if let Err(error) = result {
                         tracing::error!(thread_id, "compiler plugin thread failed: {error:#}");
+                    }
+                    CompilerThreadReport {
+                        thread_id,
+                        processor,
+                        spawned_ns,
+                        started_ns,
+                        instantiated_ns,
+                        finished_ns,
                     }
                 });
                 shared.thread_tasks.lock().push(task);

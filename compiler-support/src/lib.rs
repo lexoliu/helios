@@ -2,8 +2,11 @@ use helios_artifact::{
     CWASM_MEMORY_GUARD_SIZE, CWASM_MEMORY_RESERVATION, cwasm_target_cranelift_flags,
     cwasm_target_supports_wasm_simd,
 };
+use std::cell::{Cell, RefCell};
 use std::env;
 use std::num::NonZeroUsize;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use thiserror::Error;
 use wasmparser::{Encoding, Parser, Payload};
 use wasmtime::{Config, Engine, OptLevel, Strategy};
@@ -25,6 +28,49 @@ pub struct PrecompiledArtifact {
     pub bytes: Vec<u8>,
     pub kind: PrecompiledArtifactKind,
 }
+
+#[derive(Clone, Debug)]
+pub struct WorkerStat {
+    pub index: usize,
+    pub translate_count: u64,
+    pub translate_us: u64,
+    pub compile_count: u64,
+    pub compile_us: u64,
+    pub lifetime_us: u64,
+    /// Start of this worker's first translate or compile pass, relative to
+    /// the start of the compile.
+    pub first_pass_us: i64,
+    /// End of this worker's last translate or compile pass, relative to the
+    /// start of the compile.
+    pub last_pass_us: i64,
+    /// Time between this worker's consecutive translate/compile passes.
+    pub between_passes_us: u64,
+    /// The longest single stretch between two consecutive passes.
+    pub longest_between_us: u64,
+    /// When that stretch began, relative to the compile start.
+    pub longest_between_start_us: i64,
+}
+
+/// One function's `compile` pass, timed on the worker that ran it.
+#[derive(Clone, Debug)]
+pub struct FunctionSpan {
+    pub worker: usize,
+    pub start_us: i64,
+    pub duration_us: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct CompileProfile {
+    pub engine_us: u64,
+    pub pool_us: u64,
+    pub compile_us: u64,
+    pub worker_count: usize,
+    pub workers: Vec<WorkerStat>,
+    /// The longest `compile` passes, longest first.
+    pub longest: Vec<FunctionSpan>,
+}
+
+const PROFILE_LONGEST_FUNCTIONS: usize = 8;
 
 #[derive(Debug, Error)]
 pub enum CompileError {
@@ -57,7 +103,25 @@ pub fn precompile_artifact(
     target: &str,
     hint: AotCompileHint,
 ) -> Result<PrecompiledArtifact> {
+    Ok(precompile_artifact_inner(bytes, target, hint, false)?.0)
+}
+
+pub fn precompile_artifact_profiled(
+    bytes: &[u8],
+    target: &str,
+    hint: AotCompileHint,
+) -> Result<(PrecompiledArtifact, CompileProfile)> {
+    precompile_artifact_inner(bytes, target, hint, true)
+}
+
+fn precompile_artifact_inner(
+    bytes: &[u8],
+    target: &str,
+    hint: AotCompileHint,
+    profile: bool,
+) -> Result<(PrecompiledArtifact, CompileProfile)> {
     let worker_count = compiler_worker_count();
+    let engine_started = Instant::now();
     let engine =
         Engine::new(&build_engine_config(target, hint, worker_count)?).map_err(|source| {
             CompileError::Engine {
@@ -65,18 +129,180 @@ pub fn precompile_artifact(
                 source,
             }
         })?;
+    let encoding = wasm_encoding(bytes)?;
+    let engine_us = elapsed_us(engine_started);
     if worker_count <= 1 {
-        return precompile_artifact_with_engine(bytes, &engine);
+        let compile_started = Instant::now();
+        let artifact = precompile_artifact_with_engine(bytes, encoding, &engine)?;
+        return Ok((
+            artifact,
+            CompileProfile {
+                engine_us,
+                pool_us: 0,
+                compile_us: elapsed_us(compile_started),
+                worker_count,
+                workers: Vec::new(),
+                longest: Vec::new(),
+            },
+        ));
     }
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(worker_count)
-        .build()
-        .map_err(CompileError::WorkerPool)?;
-    pool.install(|| precompile_artifact_with_engine(bytes, &engine))
+
+    let worker_stats = profile.then(|| Arc::new(Mutex::new(Vec::with_capacity(worker_count))));
+    let pool_started = Instant::now();
+    let mut builder = rayon::ThreadPoolBuilder::new().num_threads(worker_count);
+    if let Some(worker_stats) = worker_stats.clone() {
+        builder = builder
+            .start_handler(|_| {
+                WORKER_COUNTERS.with(|counters| counters.set(WorkerCounters::default()));
+                WORKER_SPANS.with(|spans| spans.borrow_mut().clear());
+                WORKER_LIFETIME_START.with(|started| started.set(Some(Instant::now())));
+                cranelift_codegen::timing::set_thread_profiler(Box::new(WorkerProfiler));
+            })
+            .exit_handler(move |index| {
+                let started = WORKER_LIFETIME_START.with(|started| {
+                    started
+                        .take()
+                        .expect("rayon worker exited without a profiling start")
+                });
+                let counters = WORKER_COUNTERS.with(Cell::take);
+                let spans = WORKER_SPANS.with(RefCell::take);
+                worker_stats
+                    .lock()
+                    .expect("compiler worker profile lock was poisoned")
+                    .push(RawWorkerStat {
+                        index,
+                        counters,
+                        lifetime_us: elapsed_us(started),
+                        spans,
+                    });
+            });
+    }
+    let pool = builder.build().map_err(CompileError::WorkerPool)?;
+    let pool_us = elapsed_us(pool_started);
+    let compile_started = Instant::now();
+    let artifact = pool.install(|| precompile_artifact_with_engine(bytes, encoding, &engine))?;
+    let compile_us = elapsed_us(compile_started);
+    drop(pool);
+    let raw_workers = worker_stats
+        .map(|worker_stats| {
+            while worker_stats
+                .lock()
+                .expect("compiler worker profile lock was poisoned")
+                .len()
+                < worker_count
+            {
+                std::thread::yield_now();
+            }
+            core::mem::take(
+                &mut *worker_stats
+                    .lock()
+                    .expect("compiler worker profile lock was poisoned"),
+            )
+        })
+        .unwrap_or_default();
+    let (workers, longest) = summarize_workers(compile_started, raw_workers);
+    Ok((
+        artifact,
+        CompileProfile {
+            engine_us,
+            pool_us,
+            compile_us,
+            worker_count,
+            workers,
+            longest,
+        },
+    ))
 }
 
-fn precompile_artifact_with_engine(bytes: &[u8], engine: &Engine) -> Result<PrecompiledArtifact> {
-    let encoding = wasm_encoding(bytes)?;
+fn summarize_workers(
+    compile_started: Instant,
+    raw_workers: Vec<RawWorkerStat>,
+) -> (Vec<WorkerStat>, Vec<FunctionSpan>) {
+    let offset_us = |at: Instant| match at.checked_duration_since(compile_started) {
+        Some(after) => i64::try_from(after.as_micros()).unwrap_or(i64::MAX),
+        None => -i64::try_from((compile_started - at).as_micros()).unwrap_or(i64::MAX),
+    };
+    let mut longest = Vec::new();
+    let workers = raw_workers
+        .into_iter()
+        .map(|raw| {
+            let mut ordered: Vec<&PassSpan> = raw.spans.iter().collect();
+            ordered.sort_by_key(|span| span.started);
+            let gaps = ordered.windows(2).map(|pair| {
+                let gap = pair[1].started.saturating_duration_since(pair[0].finished);
+                (
+                    pair[0].finished,
+                    u64::try_from(gap.as_micros()).unwrap_or(u64::MAX),
+                )
+            });
+            let mut between_passes_us = 0u64;
+            let mut longest_between: Option<(Instant, u64)> = None;
+            for (began, gap) in gaps {
+                between_passes_us = between_passes_us.saturating_add(gap);
+                if longest_between.is_none_or(|(_, longest)| gap > longest) {
+                    longest_between = Some((began, gap));
+                }
+            }
+            let (longest_between_start_us, longest_between_us) =
+                longest_between.map_or((0, 0), |(began, gap)| (offset_us(began), gap));
+            let first_pass_us = raw
+                .spans
+                .iter()
+                .map(|span| span.started)
+                .min()
+                .map_or(0, offset_us);
+            let last_pass_us = raw
+                .spans
+                .iter()
+                .map(|span| span.finished)
+                .max()
+                .map_or(0, offset_us);
+            longest.extend(raw.spans.iter().filter(|span| !span.translate).map(|span| {
+                FunctionSpan {
+                    worker: raw.index,
+                    start_us: offset_us(span.started),
+                    duration_us: u64::try_from((span.finished - span.started).as_micros())
+                        .unwrap_or(u64::MAX),
+                }
+            }));
+            WorkerStat {
+                index: raw.index,
+                translate_count: raw.counters.translate_count,
+                translate_us: raw.counters.translate_ns / 1_000,
+                compile_count: raw.counters.compile_count,
+                compile_us: raw.counters.compile_ns / 1_000,
+                lifetime_us: raw.lifetime_us,
+                first_pass_us,
+                last_pass_us,
+                between_passes_us,
+                longest_between_us,
+                longest_between_start_us,
+            }
+        })
+        .collect();
+    longest.sort_by_key(|span| core::cmp::Reverse(span.duration_us));
+    longest.truncate(PROFILE_LONGEST_FUNCTIONS);
+    (workers, longest)
+}
+
+struct RawWorkerStat {
+    index: usize,
+    counters: WorkerCounters,
+    lifetime_us: u64,
+    spans: Vec<PassSpan>,
+}
+
+struct PassSpan {
+    started: Instant,
+    finished: Instant,
+    translate: bool,
+}
+
+fn precompile_artifact_with_engine(
+    bytes: &[u8],
+    encoding: Encoding,
+    engine: &Engine,
+) -> Result<PrecompiledArtifact> {
     match encoding {
         Encoding::Module => {
             let bytes = engine
@@ -97,6 +323,79 @@ fn precompile_artifact_with_engine(bytes: &[u8], engine: &Engine) -> Result<Prec
             })
         }
     }
+}
+
+#[derive(Clone, Copy, Default)]
+struct WorkerCounters {
+    translate_count: u64,
+    translate_ns: u64,
+    compile_count: u64,
+    compile_ns: u64,
+}
+
+thread_local! {
+    static WORKER_COUNTERS: Cell<WorkerCounters> = const { Cell::new(WorkerCounters {
+        translate_count: 0,
+        translate_ns: 0,
+        compile_count: 0,
+        compile_ns: 0,
+    }) };
+    static WORKER_LIFETIME_START: Cell<Option<Instant>> = const { Cell::new(None) };
+    static WORKER_SPANS: RefCell<Vec<PassSpan>> = const { RefCell::new(Vec::new()) };
+}
+
+struct WorkerProfiler;
+
+impl cranelift_codegen::timing::Profiler for WorkerProfiler {
+    fn start_pass(&self, pass: cranelift_codegen::timing::Pass) -> Box<dyn std::any::Any> {
+        let started = Instant::now();
+        let inner = cranelift_codegen::timing::DefaultProfiler.start_pass(pass);
+        Box::new(WorkerTimingToken {
+            _inner: inner,
+            pass,
+            started,
+        })
+    }
+}
+
+struct WorkerTimingToken {
+    _inner: Box<dyn std::any::Any>,
+    pass: cranelift_codegen::timing::Pass,
+    started: Instant,
+}
+
+impl Drop for WorkerTimingToken {
+    fn drop(&mut self) {
+        let finished = Instant::now();
+        let elapsed = u64::try_from((finished - self.started).as_nanos()).unwrap_or(u64::MAX);
+        let translate = match self.pass {
+            cranelift_codegen::timing::Pass::wasm_translate_function => true,
+            cranelift_codegen::timing::Pass::compile => false,
+            _ => return,
+        };
+        WORKER_COUNTERS.with(|cell| {
+            let mut counters = cell.get();
+            if translate {
+                counters.translate_count += 1;
+                counters.translate_ns += elapsed;
+            } else {
+                counters.compile_count += 1;
+                counters.compile_ns += elapsed;
+            }
+            cell.set(counters);
+        });
+        WORKER_SPANS.with(|spans| {
+            spans.borrow_mut().push(PassSpan {
+                started: self.started,
+                finished,
+                translate,
+            });
+        });
+    }
+}
+
+fn elapsed_us(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
 pub fn wasm_encoding(bytes: &[u8]) -> Result<Encoding> {
