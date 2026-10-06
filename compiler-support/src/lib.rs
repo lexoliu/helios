@@ -2,7 +2,7 @@ use helios_artifact::{
     CWASM_MEMORY_GUARD_SIZE, CWASM_MEMORY_RESERVATION, cwasm_target_cranelift_flags,
     cwasm_target_supports_wasm_simd,
 };
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::env;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
@@ -37,6 +37,26 @@ pub struct WorkerStat {
     pub compile_count: u64,
     pub compile_us: u64,
     pub lifetime_us: u64,
+    /// Start of this worker's first translate or compile pass, relative to
+    /// the start of the compile.
+    pub first_pass_us: i64,
+    /// End of this worker's last translate or compile pass, relative to the
+    /// start of the compile.
+    pub last_pass_us: i64,
+    /// Time between this worker's consecutive translate/compile passes.
+    pub between_passes_us: u64,
+    /// The longest single stretch between two consecutive passes.
+    pub longest_between_us: u64,
+    /// When that stretch began, relative to the compile start.
+    pub longest_between_start_us: i64,
+}
+
+/// One function's `compile` pass, timed on the worker that ran it.
+#[derive(Clone, Debug)]
+pub struct FunctionSpan {
+    pub worker: usize,
+    pub start_us: i64,
+    pub duration_us: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -46,7 +66,11 @@ pub struct CompileProfile {
     pub compile_us: u64,
     pub worker_count: usize,
     pub workers: Vec<WorkerStat>,
+    /// The longest `compile` passes, longest first.
+    pub longest: Vec<FunctionSpan>,
 }
+
+const PROFILE_LONGEST_FUNCTIONS: usize = 8;
 
 #[derive(Debug, Error)]
 pub enum CompileError {
@@ -118,6 +142,7 @@ fn precompile_artifact_inner(
                 compile_us: elapsed_us(compile_started),
                 worker_count,
                 workers: Vec::new(),
+                longest: Vec::new(),
             },
         ));
     }
@@ -129,6 +154,7 @@ fn precompile_artifact_inner(
         builder = builder
             .start_handler(|_| {
                 WORKER_COUNTERS.with(|counters| counters.set(WorkerCounters::default()));
+                WORKER_SPANS.with(|spans| spans.borrow_mut().clear());
                 WORKER_LIFETIME_START.with(|started| started.set(Some(Instant::now())));
                 cranelift_codegen::timing::set_thread_profiler(Box::new(WorkerProfiler));
             })
@@ -139,16 +165,15 @@ fn precompile_artifact_inner(
                         .expect("rayon worker exited without a profiling start")
                 });
                 let counters = WORKER_COUNTERS.with(Cell::take);
+                let spans = WORKER_SPANS.with(RefCell::take);
                 worker_stats
                     .lock()
                     .expect("compiler worker profile lock was poisoned")
-                    .push(WorkerStat {
+                    .push(RawWorkerStat {
                         index,
-                        translate_count: counters.translate_count,
-                        translate_us: counters.translate_ns / 1_000,
-                        compile_count: counters.compile_count,
-                        compile_us: counters.compile_ns / 1_000,
+                        counters,
                         lifetime_us: elapsed_us(started),
+                        spans,
                     });
             });
     }
@@ -158,7 +183,7 @@ fn precompile_artifact_inner(
     let artifact = pool.install(|| precompile_artifact_with_engine(bytes, encoding, &engine))?;
     let compile_us = elapsed_us(compile_started);
     drop(pool);
-    let workers = worker_stats
+    let raw_workers = worker_stats
         .map(|worker_stats| {
             while worker_stats
                 .lock()
@@ -168,12 +193,14 @@ fn precompile_artifact_inner(
             {
                 std::thread::yield_now();
             }
-            worker_stats
-                .lock()
-                .expect("compiler worker profile lock was poisoned")
-                .clone()
+            core::mem::take(
+                &mut *worker_stats
+                    .lock()
+                    .expect("compiler worker profile lock was poisoned"),
+            )
         })
         .unwrap_or_default();
+    let (workers, longest) = summarize_workers(compile_started, raw_workers);
     Ok((
         artifact,
         CompileProfile {
@@ -182,8 +209,93 @@ fn precompile_artifact_inner(
             compile_us,
             worker_count,
             workers,
+            longest,
         },
     ))
+}
+
+fn summarize_workers(
+    compile_started: Instant,
+    raw_workers: Vec<RawWorkerStat>,
+) -> (Vec<WorkerStat>, Vec<FunctionSpan>) {
+    let offset_us = |at: Instant| match at.checked_duration_since(compile_started) {
+        Some(after) => i64::try_from(after.as_micros()).unwrap_or(i64::MAX),
+        None => -i64::try_from((compile_started - at).as_micros()).unwrap_or(i64::MAX),
+    };
+    let mut longest = Vec::new();
+    let workers = raw_workers
+        .into_iter()
+        .map(|raw| {
+            let mut ordered: Vec<&PassSpan> = raw.spans.iter().collect();
+            ordered.sort_by_key(|span| span.started);
+            let gaps = ordered.windows(2).map(|pair| {
+                let gap = pair[1].started.saturating_duration_since(pair[0].finished);
+                (
+                    pair[0].finished,
+                    u64::try_from(gap.as_micros()).unwrap_or(u64::MAX),
+                )
+            });
+            let mut between_passes_us = 0u64;
+            let mut longest_between: Option<(Instant, u64)> = None;
+            for (began, gap) in gaps {
+                between_passes_us = between_passes_us.saturating_add(gap);
+                if longest_between.is_none_or(|(_, longest)| gap > longest) {
+                    longest_between = Some((began, gap));
+                }
+            }
+            let (longest_between_start_us, longest_between_us) =
+                longest_between.map_or((0, 0), |(began, gap)| (offset_us(began), gap));
+            let first_pass_us = raw
+                .spans
+                .iter()
+                .map(|span| span.started)
+                .min()
+                .map_or(0, offset_us);
+            let last_pass_us = raw
+                .spans
+                .iter()
+                .map(|span| span.finished)
+                .max()
+                .map_or(0, offset_us);
+            longest.extend(raw.spans.iter().filter(|span| !span.translate).map(|span| {
+                FunctionSpan {
+                    worker: raw.index,
+                    start_us: offset_us(span.started),
+                    duration_us: u64::try_from((span.finished - span.started).as_micros())
+                        .unwrap_or(u64::MAX),
+                }
+            }));
+            WorkerStat {
+                index: raw.index,
+                translate_count: raw.counters.translate_count,
+                translate_us: raw.counters.translate_ns / 1_000,
+                compile_count: raw.counters.compile_count,
+                compile_us: raw.counters.compile_ns / 1_000,
+                lifetime_us: raw.lifetime_us,
+                first_pass_us,
+                last_pass_us,
+                between_passes_us,
+                longest_between_us,
+                longest_between_start_us,
+            }
+        })
+        .collect();
+    longest.sort_by_key(|span| core::cmp::Reverse(span.duration_us));
+    longest.truncate(PROFILE_LONGEST_FUNCTIONS);
+    (workers, longest)
+}
+
+struct RawWorkerStat {
+    index: usize,
+    counters: WorkerCounters,
+    lifetime_us: u64,
+    spans: Vec<PassSpan>,
+}
+
+struct PassSpan {
+    started: Instant,
+    finished: Instant,
+    translate: bool,
 }
 
 fn precompile_artifact_with_engine(
@@ -229,6 +341,7 @@ thread_local! {
         compile_ns: 0,
     }) };
     static WORKER_LIFETIME_START: Cell<Option<Instant>> = const { Cell::new(None) };
+    static WORKER_SPANS: RefCell<Vec<PassSpan>> = const { RefCell::new(Vec::new()) };
 }
 
 struct WorkerProfiler;
@@ -253,31 +366,36 @@ struct WorkerTimingToken {
 
 impl Drop for WorkerTimingToken {
     fn drop(&mut self) {
-        let elapsed = elapsed_ns(self.started);
+        let finished = Instant::now();
+        let elapsed = u64::try_from((finished - self.started).as_nanos()).unwrap_or(u64::MAX);
+        let translate = match self.pass {
+            cranelift_codegen::timing::Pass::wasm_translate_function => true,
+            cranelift_codegen::timing::Pass::compile => false,
+            _ => return,
+        };
         WORKER_COUNTERS.with(|cell| {
             let mut counters = cell.get();
-            match self.pass {
-                cranelift_codegen::timing::Pass::wasm_translate_function => {
-                    counters.translate_count += 1;
-                    counters.translate_ns += elapsed;
-                }
-                cranelift_codegen::timing::Pass::compile => {
-                    counters.compile_count += 1;
-                    counters.compile_ns += elapsed;
-                }
-                _ => {}
+            if translate {
+                counters.translate_count += 1;
+                counters.translate_ns += elapsed;
+            } else {
+                counters.compile_count += 1;
+                counters.compile_ns += elapsed;
             }
             cell.set(counters);
+        });
+        WORKER_SPANS.with(|spans| {
+            spans.borrow_mut().push(PassSpan {
+                started: self.started,
+                finished,
+                translate,
+            });
         });
     }
 }
 
 fn elapsed_us(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
-}
-
-fn elapsed_ns(started: Instant) -> u64 {
-    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
 pub fn wasm_encoding(bytes: &[u8]) -> Result<Encoding> {

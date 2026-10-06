@@ -219,13 +219,24 @@ fn compile_phase_report(
     );
     for worker in &profile.workers {
         report.push_str(&format!(
-            "compile-worker index={} translate_n={} translate_us={} compile_n={} compile_us={} lifetime_us={}\n",
+            "compile-worker index={} translate_n={} translate_us={} compile_n={} compile_us={} lifetime_us={} first_pass_us={} last_pass_us={} between_us={} longest_between_us={} longest_between_start_us={}\n",
             worker.index,
             worker.translate_count,
             worker.translate_us,
             worker.compile_count,
             worker.compile_us,
             worker.lifetime_us,
+            worker.first_pass_us,
+            worker.last_pass_us,
+            worker.between_passes_us,
+            worker.longest_between_us,
+            worker.longest_between_start_us,
+        ));
+    }
+    for span in &profile.longest {
+        report.push_str(&format!(
+            "compile-longest worker={} start_us={} duration_us={}\n",
+            span.worker, span.start_us, span.duration_us,
         ));
     }
     report
