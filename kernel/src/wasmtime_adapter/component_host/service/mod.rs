@@ -1743,7 +1743,8 @@ where
             .instance_pre
             .instantiate(&mut store)
             .map_err(map_program_runtime_error)?;
-        let tls_base = compiler_tls_base(&mut store, &instance)?;
+        let tls_base = plugin.main_thread_tls_base;
+        set_compiler_tls_base(&mut store, &instance, tls_base)?;
         let pthread_self_offset = instance
             .get_typed_func::<(), i32>(&mut store, HELIOS_COMPILER_PTHREAD_SELF_OFFSET)
             .map_err(map_program_runtime_error)?
@@ -1938,21 +1939,34 @@ where
             write_serial: exec_context.write_serial,
             _marker: core::marker::PhantomData,
         };
-        let scratch_store = wasmtime::Store::new(engine, scratch_store_data);
+        let mut scratch_store = wasmtime::Store::new(engine, scratch_store_data);
         define_compiler_shared_memory(&mut linker, &scratch_store, &module, shared_memory)?;
-        drop(scratch_store);
 
         let instance_pre = Arc::new(
             linker
                 .instantiate_pre(&module)
                 .map_err(map_program_runtime_error)?,
         );
+        configure_compiler_core_store(&mut scratch_store);
+        let scratch_instance = instance_pre
+            .instantiate(&mut scratch_store)
+            .map_err(map_program_runtime_error)?;
+        let main_thread_tls_base = compiler_tls_base(&mut scratch_store, &scratch_instance)?;
+        if main_thread_tls_base == 0 {
+            tracing::error!("compiler plugin start did not publish a static TLS block");
+            return Err(ProgramExecError {
+                kind: ProgramExecErrorKind::InvalidBinary,
+                detail: ProgramExecErrorDetail::CompilerPluginInvalid,
+            });
+        }
+        drop(scratch_store);
         shared.instance_pre.call_once(|| instance_pre.clone());
 
         let _ = module; // InstancePre holds the Module via Arc internally.
         let plugin = Arc::new(CompilerPluginRuntime {
             instance_pre,
             shared,
+            main_thread_tls_base,
         });
         *slot = Some(plugin.clone());
         Ok(plugin)
