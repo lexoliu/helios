@@ -199,6 +199,13 @@ const SLOT_LIVE: u8 = 2;
 struct FiberStackSlot {
     state: AtomicU8,
     watermark: AtomicUsize,
+    /// The Wasmtime unpark generation the fiber on this stack last
+    /// returned from a parking wait at; see
+    /// `wasmtime_adapter::parking`. A value left by an earlier fiber is
+    /// one the generation has already reached, so it can only make the
+    /// next fiber's first wait return early, never miss an unpark.
+    #[cfg(all(target_os = "none", feature = "wasmtime-bare-metal"))]
+    parked_generation: AtomicU64,
 }
 
 /// The machine's fiber stacks.
@@ -323,6 +330,8 @@ pub fn install_fiber_stack_arena(
             CachePadded::new(FiberStackSlot {
                 state: AtomicU8::new(SLOT_COLD),
                 watermark: AtomicUsize::new(0),
+                #[cfg(all(target_os = "none", feature = "wasmtime-bare-metal"))]
+                parked_generation: AtomicU64::new(0),
             })
         });
         let mut counters = Vec::with_capacity(processor_count);
@@ -403,6 +412,27 @@ impl FiberStackArena {
     fn guard(&self, index: usize) -> Range<*mut u8> {
         let start = self.base + index * self.slot_bytes;
         (start as *mut u8)..((start + FIBER_STACK_GUARD_BYTES) as *mut u8)
+    }
+
+    #[cfg(all(target_os = "none", feature = "wasmtime-bare-metal"))]
+    fn parked_generation(&self, addr: usize) -> &AtomicU64 {
+        let index = addr
+            .checked_sub(self.base)
+            .filter(|offset| *offset < self.reserved_bytes())
+            .map(|offset| offset / self.slot_bytes)
+            .unwrap_or_else(|| {
+                panic!(
+                    "Wasmtime parking wait at stack address {addr:#x}, outside the fiber-stack \
+                     arena: only a fiber can give its processor back while it waits"
+                )
+            });
+        let slot = &self.slots[index];
+        assert_eq!(
+            slot.state.load(Ordering::Acquire),
+            SLOT_LIVE,
+            "Wasmtime parking wait on fiber stack slot {index}, which no live stack owns"
+        );
+        &slot.parked_generation
     }
 
     fn resolve(&self, addr: VirtAddr) -> StackFault {
@@ -666,6 +696,17 @@ impl Drop for FiberStack {
     fn drop(&mut self) {
         self.arena.release(self.index);
     }
+}
+
+/// The unpark generation the fiber running on the stack that holds
+/// `addr` last returned from a Wasmtime parking wait at. Panics when
+/// `addr` is not inside a live fiber stack.
+#[cfg(all(target_os = "none", feature = "wasmtime-bare-metal"))]
+pub fn fiber_parked_generation(addr: usize) -> &'static AtomicU64 {
+    ARENA
+        .get()
+        .expect("Wasmtime parking wait before the fiber-stack arena was installed")
+        .parked_generation(addr)
 }
 
 /// Takes one stack out of the arena.

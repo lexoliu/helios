@@ -1049,13 +1049,20 @@ where
                         wasmtime::Store::new(instance_pre.module().engine(), store_data);
                     configure_compiler_core_store(&mut store);
                     let thread_started_ticks = store.data().cpu.now().ticks();
-                    let (result, instantiated_ns) = match instance_pre.instantiate(&mut store) {
+                    let (result, instantiated_ns) = match instance_pre
+                        .instantiate_async(&mut store)
+                        .await
+                    {
                         Ok(instance) => {
                             let start = instance
                                 .get_typed_func::<(i32, i32), ()>(&mut store, "wasi_thread_start");
                             let instantiated_ns = crate::monotonic_nanos(&store.data().cpu);
-                            let result = start
-                                .and_then(|start| start.call(&mut store, (thread_id, start_arg)));
+                            let result = match start {
+                                Ok(start) => {
+                                    start.call_async(&mut store, (thread_id, start_arg)).await
+                                }
+                                Err(error) => Err(error),
+                            };
                             (result, instantiated_ns)
                         }
                         Err(error) => {

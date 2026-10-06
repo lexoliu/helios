@@ -560,6 +560,12 @@ impl ProcessorRuntime {
         self.timer.call_once(|| timer);
     }
 
+    pub(crate) fn timer(&self) -> &Timer<crate::X86Cpu> {
+        self.timer
+            .get()
+            .expect("x86 processor timer was read before it was installed")
+    }
+
     pub(crate) fn install_program_service(&self, service: debug_state::ProgramService) {
         assert!(
             self.program_service.get().is_none(),
