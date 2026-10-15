@@ -2124,6 +2124,7 @@ name = "helios-x86"
 version = "0.1.0"
 dependencies = [
  "acpi",
+ "bitflags 2.13.1",
  "bytes",
  "critical-section",
  "helios-hal",

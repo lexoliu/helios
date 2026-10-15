@@ -19,13 +19,13 @@ use pci_types::ConfigRegionAccess;
 use spin::Once;
 use x86::apic::x2apic::X2APIC;
 use x86::apic::xapic::{
-    XAPIC, XAPIC_LVT_TIMER, XAPIC_SVR, XAPIC_TIMER_CURRENT_COUNT, XAPIC_TIMER_DIV_CONF,
-    XAPIC_TIMER_INIT_COUNT,
+    XAPIC, XAPIC_ESR, XAPIC_LVT_ERROR, XAPIC_LVT_TIMER, XAPIC_SVR, XAPIC_TIMER_CURRENT_COUNT,
+    XAPIC_TIMER_DIV_CONF, XAPIC_TIMER_INIT_COUNT,
 };
 use x86::apic::{ApicControl, ApicId};
 use x86::msr::{
-    IA32_APIC_BASE, IA32_FS_BASE, IA32_X2APIC_CUR_COUNT, IA32_X2APIC_DIV_CONF,
-    IA32_X2APIC_INIT_COUNT, IA32_X2APIC_LVT_TIMER, rdmsr, wrmsr,
+    IA32_APIC_BASE, IA32_FS_BASE, IA32_X2APIC_CUR_COUNT, IA32_X2APIC_DIV_CONF, IA32_X2APIC_ESR,
+    IA32_X2APIC_INIT_COUNT, IA32_X2APIC_LVT_ERROR, IA32_X2APIC_LVT_TIMER, rdmsr, wrmsr,
 };
 use x86_64::PhysAddr;
 use x86_64::VirtAddr;
@@ -603,6 +603,13 @@ impl ProcessorRuntime {
             LocalApicMode::X2Apic => {
                 let mut apic = X2APIC::new();
                 apic.attach();
+                unsafe {
+                    wrmsr(IA32_X2APIC_ESR, 0);
+                    wrmsr(
+                        IA32_X2APIC_LVT_ERROR,
+                        u64::from(crate::exceptions::APIC_ERROR_INTERRUPT_VECTOR),
+                    );
+                }
             }
             LocalApicMode::XApic { physical_base } => {
                 let apic_region = xapic_mmio_region(physical_base, self.physical_memory_offset);
@@ -1045,6 +1052,12 @@ fn attach_xapic(apic_region: &[u32]) {
         wrmsr(IA32_APIC_BASE, base);
     }
     write_xapic_register(apic_region, XAPIC_SVR, (1 << 8) | 15);
+    write_xapic_register(apic_region, XAPIC_ESR, 0);
+    write_xapic_register(
+        apic_region,
+        XAPIC_LVT_ERROR,
+        u32::from(crate::exceptions::APIC_ERROR_INTERRUPT_VECTOR),
+    );
 }
 
 fn calibrate_x2apic_timer(tsc_hz: u64) -> u32 {
@@ -1103,6 +1116,42 @@ fn program_xapic_periodic_timer(apic_region: &[u32], vector: u8, initial_count: 
         | APIC_TIMER_PERIODIC;
     write_xapic_register(apic_region, XAPIC_LVT_TIMER, lvt as u32);
     write_xapic_register(apic_region, XAPIC_TIMER_INIT_COUNT, initial_count);
+}
+
+bitflags::bitflags! {
+    /// The local APIC error status register.
+    #[derive(Debug, Clone, Copy)]
+    struct ApicErrors: u32 {
+        const SEND_CHECKSUM = 1 << 0;
+        const RECEIVE_CHECKSUM = 1 << 1;
+        const SEND_ACCEPT = 1 << 2;
+        const RECEIVE_ACCEPT = 1 << 3;
+        const REDIRECTABLE_IPI = 1 << 4;
+        const SEND_ILLEGAL_VECTOR = 1 << 5;
+        const RECEIVE_ILLEGAL_VECTOR = 1 << 6;
+        const ILLEGAL_REGISTER_ADDRESS = 1 << 7;
+    }
+}
+
+/// Reports local-APIC errors by latching and reading ESR; IPI sends do not poll it.
+pub(crate) fn handle_apic_error_interrupt() -> ! {
+    let runtime = current_runtime();
+    let esr = match runtime.apic_mode() {
+        LocalApicMode::X2Apic => unsafe {
+            wrmsr(IA32_X2APIC_ESR, 0);
+            rdmsr(IA32_X2APIC_ESR) as u32
+        },
+        LocalApicMode::XApic { physical_base } => {
+            let apic_region = xapic_mmio_region(physical_base, runtime.physical_memory_offset);
+            write_xapic_register(apic_region, XAPIC_ESR, 0);
+            read_xapic_register(apic_region, XAPIC_ESR)
+        }
+    };
+    let id = current_processor().id();
+    panic!(
+        "x86 local APIC error interrupt on processor {id}: ESR={esr:#x} {errors:?}",
+        errors = ApicErrors::from_bits_retain(esr)
+    );
 }
 
 fn read_xapic_register(apic_region: &[u32], offset: u32) -> u32 {

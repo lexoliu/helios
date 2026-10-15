@@ -36,6 +36,12 @@ helios_x86_interrupt_wake:
     push 0x21
     jmp helios_x86_interrupt_common
 
+.global helios_x86_interrupt_apic_error
+helios_x86_interrupt_apic_error:
+    push 0
+    push 0x23
+    jmp helios_x86_interrupt_common
+
 .global helios_x86_interrupt_tlb_shootdown
 helios_x86_interrupt_tlb_shootdown:
     push 0
