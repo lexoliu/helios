@@ -41,6 +41,7 @@ const PROBE_RESOLVED: usize = usize::MAX;
 pub(crate) const TIMER_INTERRUPT_VECTOR: u8 = 0x20;
 pub(crate) const WAKE_INTERRUPT_VECTOR: u8 = 0x21;
 pub(crate) const TLB_SHOOTDOWN_INTERRUPT_VECTOR: u8 = 0x22;
+pub(crate) const APIC_ERROR_INTERRUPT_VECTOR: u8 = 0x23;
 /// MSI-X vectors for the PCI devices the kernel drives. One vector per
 /// device keeps dispatch a direct lookup in [`DeviceInterruptRoutes`]
 /// without a shared interrupt-status scan.
@@ -112,6 +113,7 @@ unsafe extern "C" {
     fn helios_x86_exception_simd_floating_point();
     fn helios_x86_interrupt_timer();
     fn helios_x86_interrupt_wake();
+    fn helios_x86_interrupt_apic_error();
     fn helios_x86_interrupt_tlb_shootdown();
     fn helios_x86_interrupt_network();
     fn helios_x86_interrupt_network_queue_0();
@@ -189,6 +191,11 @@ impl ProcessorIdt {
                 .set_handler_addr(handler_address(helios_x86_exception_simd_floating_point));
             install_interrupt(table, TIMER_INTERRUPT_VECTOR, helios_x86_interrupt_timer);
             install_interrupt(table, WAKE_INTERRUPT_VECTOR, helios_x86_interrupt_wake);
+            install_interrupt(
+                table,
+                APIC_ERROR_INTERRUPT_VECTOR,
+                helios_x86_interrupt_apic_error,
+            );
             install_interrupt(
                 table,
                 TLB_SHOOTDOWN_INTERRUPT_VECTOR,
@@ -610,6 +617,9 @@ extern "C" fn helios_x86_interrupt_dispatch(frame: &mut ExceptionFrame) {
             // back into the kernel run loop; receiving it is enough,
             // no work to do beyond ack.
             smp::handle_wake_interrupt();
+        }
+        Ok(APIC_ERROR_INTERRUPT_VECTOR) => {
+            smp::handle_apic_error_interrupt();
         }
         Ok(TLB_SHOOTDOWN_INTERRUPT_VECTOR) => {
             smp::handle_tlb_shootdown_interrupt();
