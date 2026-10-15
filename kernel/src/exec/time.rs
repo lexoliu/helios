@@ -1,6 +1,4 @@
-use core::time::Duration;
-use helios_hal::cpu::Cpu;
-pub use helios_hal::cpu::ticks_to_nanos;
+use helios_hal::cpu::{Cpu, Timebase};
 use helios_hal::rtc::UnixSeconds;
 
 use crate::{ComponentRuntimeState, SetWallClockCap};
@@ -63,28 +61,26 @@ where
 /// timestamp the network service takes and one the runtime takes are
 /// the same number.
 ///
-/// Reading is lock-free and safe from any processor: the clock is two
-/// immutable words and the tick comes from the caller's own [`Cpu`].
+/// Reading is lock-free and safe from any processor: the clock is
+/// immutable and the tick comes from the caller's own [`Cpu`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UptimeClock {
     boot_ticks: u64,
-    timebase_frequency: u64,
+    timebase: Timebase,
 }
 
 impl UptimeClock {
-    pub const fn new(boot_ticks: u64, timebase_frequency: u64) -> Self {
+    pub const fn new(boot_ticks: u64, timebase: Timebase) -> Self {
         Self {
             boot_ticks,
-            timebase_frequency,
+            timebase,
         }
     }
 
     /// Nanoseconds of uptime at a tick reading the caller already has.
     pub fn nanos_at(&self, current_ticks: u64) -> u64 {
-        ticks_to_nanos(
-            current_ticks.saturating_sub(self.boot_ticks),
-            self.timebase_frequency,
-        )
+        self.timebase
+            .ticks_to_nanos(current_ticks.saturating_sub(self.boot_ticks))
     }
 
     /// Nanoseconds of uptime now, on the calling processor.
@@ -110,28 +106,11 @@ pub fn wall_clock_offset_nanos(wall: UnixSeconds, monotonic_nanos: u64) -> i128 
 }
 
 pub fn monotonic_nanos<CpuImpl: Cpu>(cpu: &CpuImpl) -> u64 {
-    ticks_to_nanos(cpu.now().ticks(), cpu.timer_frequency())
+    cpu.timebase().ticks_to_nanos(cpu.now().ticks())
 }
 
 pub fn elapsed_millis(since_nanos: u64, now_nanos: u64) -> u64 {
     now_nanos.saturating_sub(since_nanos) / 1_000_000
-}
-
-/// Guests legitimately pass `u64::MAX` nanoseconds as an "infinite"
-/// timeout (futex and poll waits). On timebases at or above 1 GHz
-/// that product exceeds `u64` ticks; a deadline centuries out is
-/// semantically "never", so the conversion saturates instead of
-/// treating guest input as a kernel invariant.
-pub fn duration_to_ticks(duration: Duration, frequency: u64) -> u64 {
-    let seconds = (duration.as_secs() as u128) * (frequency as u128);
-    let subsec = ((duration.subsec_nanos() as u128) * (frequency as u128)) / 1_000_000_000u128;
-    u64::try_from(seconds.saturating_add(subsec)).unwrap_or(u64::MAX)
-}
-
-pub fn nanos_to_ticks_ceil_saturating(nanos: u64, frequency: u64) -> u64 {
-    let numerator = (nanos as u128) * (frequency as u128);
-    let ticks = numerator.saturating_add(999_999_999) / 1_000_000_000u128;
-    u64::try_from(ticks).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
@@ -147,9 +126,17 @@ mod tests {
     #[derive(Clone)]
     struct TestCpu {
         ticks: &'static AtomicU64,
+        timebase: Timebase,
     }
 
     impl TestCpu {
+        fn new(ticks: &'static AtomicU64) -> Self {
+            Self {
+                ticks,
+                timebase: Timebase::new(1_000_000_000),
+            }
+        }
+
         fn set_ticks(&self, ticks: u64) {
             self.ticks.store(ticks, Ordering::Release);
         }
@@ -174,8 +161,8 @@ mod tests {
             Instant::new(self.ticks.load(Ordering::Acquire))
         }
 
-        fn timer_frequency(&self) -> u64 {
-            1_000_000_000
+        fn timebase(&self) -> Timebase {
+            self.timebase
         }
 
         fn set_deadline(&self, _: Instant) {}
@@ -301,7 +288,7 @@ mod tests {
     fn kernel_clock_reads_monotonic_time() {
         static TICKS: AtomicU64 = AtomicU64::new(5);
         TICKS.store(5, Ordering::Release);
-        let cpu = TestCpu { ticks: &TICKS };
+        let cpu = TestCpu::new(&TICKS);
         let clock = KernelClock::new(cpu.clone(), TestRuntimeState::unseeded());
         assert_eq!(clock.monotonic_nanos(), 5);
         cpu.set_ticks(9);
@@ -312,7 +299,7 @@ mod tests {
     fn system_clock_mutation_requires_typed_capability() {
         static TICKS: AtomicU64 = AtomicU64::new(5);
         TICKS.store(5, Ordering::Release);
-        let cpu = TestCpu { ticks: &TICKS };
+        let cpu = TestCpu::new(&TICKS);
         let mut clock = KernelClock::new(cpu.clone(), TestRuntimeState::unseeded());
         let mut authority = crate::ProcessAuthority::empty();
         authority.grant_clock_rights(ClockAuthorityRights::SET_WALL_CLOCK);
@@ -337,7 +324,7 @@ mod tests {
 
         static TICKS: AtomicU64 = AtomicU64::new(BOOT_MONOTONIC_NANOS);
         TICKS.store(BOOT_MONOTONIC_NANOS, Ordering::Release);
-        let cpu = TestCpu { ticks: &TICKS };
+        let cpu = TestCpu::new(&TICKS);
         let clock = KernelClock::new(cpu.clone(), TestRuntimeState::seeded(offset));
         assert_eq!(clock.system_time_nanos(), wall.as_nanos() as u64);
 
@@ -353,7 +340,7 @@ mod tests {
     fn a_machine_without_a_real_time_clock_reads_wall_time_as_uptime() {
         static TICKS: AtomicU64 = AtomicU64::new(7);
         TICKS.store(7, Ordering::Release);
-        let cpu = TestCpu { ticks: &TICKS };
+        let cpu = TestCpu::new(&TICKS);
         let clock = KernelClock::new(cpu, TestRuntimeState::unseeded());
         assert_eq!(wall_clock_offset_nanos(UnixSeconds::new(0), 0), 0);
         assert_eq!(clock.system_time_nanos(), 7);
@@ -370,64 +357,10 @@ mod tests {
 
         static TICKS: AtomicU64 = AtomicU64::new(1_000_000_000);
         TICKS.store(1_000_000_000, Ordering::Release);
-        let cpu = TestCpu { ticks: &TICKS };
+        let cpu = TestCpu::new(&TICKS);
         let clock = KernelClock::new(cpu.clone(), TestRuntimeState::seeded(offset));
         assert_eq!(clock.system_time_nanos(), 0);
         cpu.set_ticks(5_000_000_000);
         assert_eq!(clock.system_time_nanos(), 2_000_000_000);
-    }
-
-    #[test]
-    fn infinite_guest_timeout_saturates_instead_of_panicking() {
-        // Guests pass u64::MAX nanoseconds as an "infinite"
-        // futex/poll timeout. On a 1 GHz timebase the tick product
-        // exceeds u64; the conversion must saturate to a
-        // never-expiring deadline rather than panic the kernel on
-        // guest-controlled input. Below 1 GHz the product still fits
-        // and must stay exact.
-        const GIGAHERTZ: u64 = 1_000_000_000;
-        let infinite = Duration::from_nanos(u64::MAX);
-        assert_eq!(duration_to_ticks(infinite, GIGAHERTZ), u64::MAX);
-        assert_eq!(duration_to_ticks(infinite, 3 * GIGAHERTZ), u64::MAX);
-        let arm_frequency = 62_500_000;
-        assert_eq!(
-            duration_to_ticks(infinite, arm_frequency),
-            ((u64::MAX as u128 / 1_000_000_000) * arm_frequency as u128) as u64
-                + (u64::MAX as u128 % 1_000_000_000 * arm_frequency as u128 / 1_000_000_000) as u64
-        );
-        assert_eq!(
-            duration_to_ticks(Duration::from_secs(1), GIGAHERTZ),
-            GIGAHERTZ
-        );
-    }
-
-    #[test]
-    fn tick_conversion_keeps_advancing_past_the_u64_nanosecond_product() {
-        // A 1 GHz TSC timebase crosses `u64::MAX / 1e9` ticks after
-        // roughly 18.4 s of uptime. The naive `ticks * 1e9` product
-        // saturates there and pins every derived deadline to a
-        // constant, so the conversion has to stay monotonic well past
-        // that point.
-        const GIGAHERTZ: u64 = 1_000_000_000;
-        let cliff_ticks = u64::MAX / GIGAHERTZ;
-
-        assert_eq!(ticks_to_nanos(cliff_ticks, GIGAHERTZ), cliff_ticks);
-        assert_eq!(
-            ticks_to_nanos(cliff_ticks + 1, GIGAHERTZ),
-            cliff_ticks + 1,
-            "conversion must not saturate one tick past the u64 product limit"
-        );
-
-        let hour_ticks = 3_600 * GIGAHERTZ;
-        assert_eq!(ticks_to_nanos(hour_ticks, GIGAHERTZ), hour_ticks);
-        assert!(
-            ticks_to_nanos(hour_ticks + GIGAHERTZ, GIGAHERTZ)
-                > ticks_to_nanos(hour_ticks, GIGAHERTZ),
-            "conversion must stay strictly monotonic across long uptimes"
-        );
-
-        // A slower timebase reaches the same product limit later, which
-        // is why only the TSC-backed backend hit this in practice.
-        assert_eq!(ticks_to_nanos(cliff_ticks, 62_500_000), 295_147_905_168);
     }
 }

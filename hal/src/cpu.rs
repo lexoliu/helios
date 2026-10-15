@@ -1,4 +1,7 @@
 use core::ptr::NonNull;
+use core::time::Duration;
+
+use strength_reduce::StrengthReducedU64;
 
 use crate::entropy::{EntropyQuality, EntropyUnavailable};
 
@@ -42,28 +45,124 @@ impl Instant {
     }
 }
 
-/// Converts a timer-tick count to nanoseconds against a platform
-/// timebase `frequency`.
+const NANOS_PER_SECOND: u64 = 1_000_000_000;
+
+/// A platform timebase: the tick frequency of [`Cpu::now`] together with
+/// the precomputed reductions that convert between ticks and nanoseconds.
 ///
-/// The multiplication is widened to `u128` on purpose: `ticks * 1e9`
-/// overflows a `u64` once the tick count passes `u64::MAX / 1e9`
-/// (about 1.845e10 ticks). On a TSC timebase that ceiling is only a
-/// handful of seconds of uptime, and a saturating `u64` product pins
-/// the result to a constant — every wall-clock deadline derived from
-/// it (TCP pacing and retransmission timers, operation timeouts, guest
-/// clock reads) then stops advancing and the waiting tasks park forever.
-/// Timebases with a lower frequency merely hit the same cliff later,
-/// which is why the conversion lives here and is shared by every
-/// backend rather than being rewritten per platform.
-pub const fn ticks_to_nanos(ticks: u64, frequency: u64) -> u64 {
-    assert!(frequency != 0, "platform timer frequency must be non-zero");
-    let nanos = (ticks as u128 * 1_000_000_000u128) / frequency as u128;
-    if nanos > u64::MAX as u128 {
-        u64::MAX
-    } else {
-        nanos as u64
+/// The frequency is fixed for the life of the machine, so the divisor of
+/// every conversion is invariant. A backend builds its `Timebase` once at
+/// bring-up, where it learns the frequency, and every conversion after that
+/// divides by a precomputed exact reciprocal (a multiply-high) instead of
+/// a hardware or software division.
+///
+/// Every conversion is exact and saturates at `u64::MAX`. A naive
+/// `ticks * 1e9` product overflows a `u64` once the tick count passes
+/// `u64::MAX / 1e9` (about 1.845e10 ticks), which on a TSC timebase is
+/// a handful of seconds of uptime; a saturating product there pins every
+/// derived deadline (TCP pacing and retransmission timers, operation
+/// timeouts, guest clock reads) to a constant and parks the waiting tasks
+/// forever. The conversions therefore split the count at the divisor
+/// (`ticks = q * f + r`) and scale only the remainder, which stays below
+/// `f * 1e9`. That product fits a `u64` only up to
+/// [`Timebase::MAX_FREQUENCY`], which [`Timebase::new`] enforces.
+///
+/// The value is immutable and `Copy`, so any processor reads it without
+/// synchronisation.
+#[derive(Clone, Copy, Debug)]
+pub struct Timebase {
+    frequency: StrengthReducedU64,
+}
+
+impl Timebase {
+    /// The highest frequency whose sub-second products (`r * 1e9` with
+    /// `r < f`, and `ns * f` with `ns < 1e9`) fit a `u64`: about 18.4 GHz.
+    pub const MAX_FREQUENCY: u64 = u64::MAX / NANOS_PER_SECOND;
+
+    /// Builds the timebase for a timer that ticks `frequency` times a
+    /// second.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `frequency` is zero or above [`Timebase::MAX_FREQUENCY`]:
+    /// either is a platform that misreported its timer, and no conversion
+    /// against it could be exact.
+    pub fn new(frequency: u64) -> Self {
+        assert!(frequency != 0, "platform timer frequency must be non-zero");
+        assert!(
+            frequency <= Self::MAX_FREQUENCY,
+            "platform timer frequency {frequency} Hz exceeds the {} Hz an exact tick conversion supports",
+            Self::MAX_FREQUENCY
+        );
+        Self {
+            frequency: StrengthReducedU64::new(frequency),
+        }
+    }
+
+    /// The number of timer ticks that elapse per second.
+    #[inline]
+    pub fn frequency(&self) -> u64 {
+        self.frequency.get()
+    }
+
+    /// Converts a tick count to nanoseconds, rounding down and saturating
+    /// at `u64::MAX`.
+    #[inline]
+    pub fn ticks_to_nanos(&self, ticks: u64) -> u64 {
+        let (seconds, remainder) = StrengthReducedU64::div_rem(ticks, self.frequency);
+        // `remainder < frequency <= MAX_FREQUENCY`, so the product fits.
+        let subsecond = (remainder * NANOS_PER_SECOND) / self.frequency;
+        seconds
+            .saturating_mul(NANOS_PER_SECOND)
+            .saturating_add(subsecond)
+    }
+
+    /// Converts nanoseconds to ticks, rounding up and saturating at
+    /// `u64::MAX`.
+    ///
+    /// Rounding up keeps a deadline derived from it from firing before the
+    /// requested time has passed.
+    #[inline]
+    pub fn nanos_to_ticks_ceil_saturating(&self, nanos: u64) -> u64 {
+        let frequency = self.frequency();
+        let seconds = nanos / NANOS_PER_SECOND;
+        let subsecond = nanos % NANOS_PER_SECOND;
+        // `subsecond < 1e9` and `frequency <= MAX_FREQUENCY`, so the
+        // product fits.
+        seconds
+            .saturating_mul(frequency)
+            .saturating_add((subsecond * frequency).div_ceil(NANOS_PER_SECOND))
+    }
+
+    /// Converts a duration to ticks, rounding down and saturating at
+    /// `u64::MAX`.
+    ///
+    /// Guests legitimately pass `u64::MAX` nanoseconds as an "infinite"
+    /// timeout (futex and poll waits). On timebases at or above 1 GHz that
+    /// exceeds `u64` ticks; a deadline centuries out is semantically
+    /// "never", so the conversion saturates instead of treating guest input
+    /// as a kernel invariant.
+    #[inline]
+    pub fn duration_to_ticks(&self, duration: Duration) -> u64 {
+        let frequency = self.frequency();
+        // `subsec_nanos() < 1e9` and `frequency <= MAX_FREQUENCY`, so the
+        // product fits.
+        let subsecond = u64::from(duration.subsec_nanos()) * frequency / NANOS_PER_SECOND;
+        duration
+            .as_secs()
+            .saturating_mul(frequency)
+            .saturating_add(subsecond)
     }
 }
+
+impl PartialEq for Timebase {
+    fn eq(&self, other: &Self) -> bool {
+        // The reductions are a function of the frequency alone.
+        self.frequency() == other.frequency()
+    }
+}
+
+impl Eq for Timebase {}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct HardwarePerfCounters {
@@ -166,12 +265,14 @@ pub trait Cpu: Send + Sync + 'static {
     /// Returns the current monotonic time in platform timer ticks.
     fn now(&self) -> Instant;
 
-    /// Returns the number of timer ticks that elapse per second.
+    /// Returns the timebase of [`Cpu::now`]: its tick frequency and the
+    /// conversions between ticks and nanoseconds.
     ///
     /// The async timer layer uses this to translate Rust `Duration` values into
     /// backend timer ticks without hardcoding any platform frequency in kernel
-    /// code.
-    fn timer_frequency(&self) -> u64;
+    /// code. A backend builds the value once at bring-up and returns the stored
+    /// copy; it never rebuilds it per call.
+    fn timebase(&self) -> Timebase;
 
     /// Snapshots hardware performance counters visible to the current
     /// privilege level on the current processor.
@@ -258,4 +359,225 @@ pub trait Cpu: Send + Sync + 'static {
 
     /// Reboots the machine and never returns.
     fn reboot(&self) -> !;
+}
+
+#[cfg(test)]
+mod tests {
+    use core::time::Duration;
+
+    use super::Timebase;
+
+    const GIGAHERTZ: u64 = 1_000_000_000;
+
+    #[test]
+    fn infinite_guest_timeout_saturates_instead_of_panicking() {
+        // Guests pass u64::MAX nanoseconds as an "infinite"
+        // futex/poll timeout. On a 1 GHz timebase the tick product
+        // exceeds u64; the conversion must saturate to a
+        // never-expiring deadline rather than panic the kernel on
+        // guest-controlled input. Below 1 GHz the product still fits
+        // and must stay exact.
+        let infinite = Duration::from_nanos(u64::MAX);
+        assert_eq!(
+            Timebase::new(GIGAHERTZ).duration_to_ticks(infinite),
+            u64::MAX
+        );
+        assert_eq!(
+            Timebase::new(3 * GIGAHERTZ).duration_to_ticks(infinite),
+            u64::MAX
+        );
+        let arm_frequency = 62_500_000;
+        assert_eq!(
+            Timebase::new(arm_frequency).duration_to_ticks(infinite),
+            ((u64::MAX as u128 / 1_000_000_000) * arm_frequency as u128) as u64
+                + (u64::MAX as u128 % 1_000_000_000 * arm_frequency as u128 / 1_000_000_000) as u64
+        );
+        assert_eq!(
+            Timebase::new(GIGAHERTZ).duration_to_ticks(Duration::from_secs(1)),
+            GIGAHERTZ
+        );
+    }
+
+    #[test]
+    fn tick_conversion_keeps_advancing_past_the_u64_nanosecond_product() {
+        // A 1 GHz TSC timebase crosses `u64::MAX / 1e9` ticks after
+        // roughly 18.4 s of uptime. The naive `ticks * 1e9` product
+        // saturates there and pins every derived deadline to a
+        // constant, so the conversion has to stay monotonic well past
+        // that point.
+        let timebase = Timebase::new(GIGAHERTZ);
+        let cliff_ticks = u64::MAX / GIGAHERTZ;
+
+        assert_eq!(timebase.ticks_to_nanos(cliff_ticks), cliff_ticks);
+        assert_eq!(
+            timebase.ticks_to_nanos(cliff_ticks + 1),
+            cliff_ticks + 1,
+            "conversion must not saturate one tick past the u64 product limit"
+        );
+
+        let hour_ticks = 3_600 * GIGAHERTZ;
+        assert_eq!(timebase.ticks_to_nanos(hour_ticks), hour_ticks);
+        assert!(
+            timebase.ticks_to_nanos(hour_ticks + GIGAHERTZ) > timebase.ticks_to_nanos(hour_ticks),
+            "conversion must stay strictly monotonic across long uptimes"
+        );
+
+        // A slower timebase reaches the same product limit later, which
+        // is why only the TSC-backed backend hit this in practice.
+        assert_eq!(
+            Timebase::new(62_500_000).ticks_to_nanos(cliff_ticks),
+            295_147_905_168
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "platform timer frequency must be non-zero")]
+    fn zero_frequency_is_refused() {
+        Timebase::new(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "platform timer frequency 18446744074 Hz exceeds")]
+    fn frequency_above_the_exact_bound_is_refused() {
+        Timebase::new(Timebase::MAX_FREQUENCY + 1);
+    }
+
+    /// The `u128` formulas the conversions replaced, kept here as the
+    /// reference they must match bit for bit.
+    fn reference_ticks_to_nanos(ticks: u64, frequency: u64) -> u64 {
+        let nanos = (ticks as u128 * 1_000_000_000u128) / frequency as u128;
+        u64::try_from(nanos).unwrap_or(u64::MAX)
+    }
+
+    fn reference_nanos_to_ticks_ceil_saturating(nanos: u64, frequency: u64) -> u64 {
+        let numerator = (nanos as u128) * (frequency as u128);
+        let ticks = numerator.saturating_add(999_999_999) / 1_000_000_000u128;
+        u64::try_from(ticks).unwrap_or(u64::MAX)
+    }
+
+    fn reference_duration_to_ticks(duration: Duration, frequency: u64) -> u64 {
+        let seconds = (duration.as_secs() as u128) * (frequency as u128);
+        let subsec = ((duration.subsec_nanos() as u128) * (frequency as u128)) / 1_000_000_000u128;
+        u64::try_from(seconds.saturating_add(subsec)).unwrap_or(u64::MAX)
+    }
+
+    const FREQUENCIES: [u64; 6] = [
+        1,
+        62_500_000,
+        GIGAHERTZ,
+        2_345_678_901,
+        3_000_000_000,
+        Timebase::MAX_FREQUENCY,
+    ];
+
+    /// SplitMix64: a deterministic stream of well-mixed `u64`s, so a
+    /// failure reproduces.
+    struct SplitMix64(u64);
+
+    impl SplitMix64 {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        /// Draws across magnitudes rather than only near `u64::MAX`.
+        fn next_scaled(&mut self) -> u64 {
+            let value = self.next();
+            value >> (self.next() % 64)
+        }
+    }
+
+    /// Inputs around every boundary the decomposition splits at, for a
+    /// value `unit` that divides the input (`frequency` for ticks, 1e9 for
+    /// nanoseconds) and the input `cliff` where the result saturates.
+    fn edge_inputs(unit: u64, cliff: u128) -> impl Iterator<Item = u64> {
+        let around = |center: u128| {
+            (-3i128..=3).filter_map(move |delta| u64::try_from(center as i128 + delta).ok())
+        };
+        let multiples = [
+            1u128,
+            2,
+            1_000,
+            3_600,
+            86_400,
+            u64::MAX as u128 / unit as u128,
+        ]
+        .into_iter()
+        .flat_map(move |k| around(k * unit as u128));
+        [0u64, 1, u64::MAX / GIGAHERTZ, u64::MAX - 1, u64::MAX]
+            .into_iter()
+            .chain(around(unit as u128))
+            .chain(multiples)
+            .chain(around(cliff))
+            .chain(around(u64::MAX as u128 / GIGAHERTZ as u128))
+    }
+
+    #[test]
+    fn conversions_match_the_u128_reference() {
+        let mut rng = SplitMix64(0x6865_6c69_6f73_0441);
+        for frequency in FREQUENCIES {
+            let timebase = Timebase::new(frequency);
+            assert_eq!(timebase.frequency(), frequency);
+
+            // The tick count at which `ticks * 1e9 / f` first exceeds u64.
+            let ticks_cliff = (u64::MAX as u128 + 1) * frequency as u128 / GIGAHERTZ as u128;
+            let ticks =
+                edge_inputs(frequency, ticks_cliff).chain((0..20_000).map(|_| rng.next_scaled()));
+            for ticks in ticks.collect::<alloc::vec::Vec<_>>() {
+                assert_eq!(
+                    timebase.ticks_to_nanos(ticks),
+                    reference_ticks_to_nanos(ticks, frequency),
+                    "ticks_to_nanos({ticks}) at {frequency} Hz"
+                );
+            }
+
+            // The nanosecond count at which `ceil(nanos * f / 1e9)` first
+            // exceeds u64.
+            let nanos_cliff = u64::MAX as u128 * GIGAHERTZ as u128 / frequency as u128;
+            let nanos =
+                edge_inputs(GIGAHERTZ, nanos_cliff).chain((0..20_000).map(|_| rng.next_scaled()));
+            for nanos in nanos.collect::<alloc::vec::Vec<_>>() {
+                assert_eq!(
+                    timebase.nanos_to_ticks_ceil_saturating(nanos),
+                    reference_nanos_to_ticks_ceil_saturating(nanos, frequency),
+                    "nanos_to_ticks_ceil_saturating({nanos}) at {frequency} Hz"
+                );
+                let duration = Duration::from_nanos(nanos);
+                assert_eq!(
+                    timebase.duration_to_ticks(duration),
+                    reference_duration_to_ticks(duration, frequency),
+                    "duration_to_ticks({duration:?}) at {frequency} Hz"
+                );
+            }
+
+            // Durations whose whole seconds exceed what nanoseconds in a
+            // u64 can express, up to `Duration::MAX`.
+            let seconds_cliff = u64::MAX / frequency;
+            let seconds = [
+                0,
+                1,
+                seconds_cliff,
+                seconds_cliff.saturating_add(1),
+                u64::MAX,
+            ]
+            .into_iter()
+            .chain((0..20_000).map(|_| rng.next_scaled()))
+            .collect::<alloc::vec::Vec<_>>();
+            for seconds in seconds {
+                let random_subsec =
+                    u32::try_from(rng.next() % GIGAHERTZ).expect("a value below 1e9 fits u32");
+                for subsec in [0, 1, 999_999_999, random_subsec] {
+                    let duration = Duration::new(seconds, subsec);
+                    assert_eq!(
+                        timebase.duration_to_ticks(duration),
+                        reference_duration_to_ticks(duration, frequency),
+                        "duration_to_ticks({duration:?}) at {frequency} Hz"
+                    );
+                }
+            }
+        }
+    }
 }

@@ -6,7 +6,7 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use helios_hal::cpu::{Cpu, Instant, ProcessorId};
+use helios_hal::cpu::{Cpu, Instant, ProcessorId, Timebase};
 
 /// The processor-local interrupt mask for the kernel's own unit tests.
 ///
@@ -42,17 +42,22 @@ use triomphe::Arc;
 #[derive(Clone, Copy)]
 pub(crate) struct TestCpu {
     entropy: Option<u8>,
+    timebase: Timebase,
 }
 
 impl TestCpu {
-    pub(crate) const fn with_entropy(fill: u8) -> Self {
+    pub(crate) fn with_entropy(fill: u8) -> Self {
         Self {
             entropy: Some(fill),
+            timebase: Timebase::new(1_000_000),
         }
     }
 
-    pub(crate) const fn without_entropy() -> Self {
-        Self { entropy: None }
+    pub(crate) fn without_entropy() -> Self {
+        Self {
+            entropy: None,
+            timebase: Timebase::new(1_000_000),
+        }
     }
 }
 
@@ -83,8 +88,8 @@ impl Cpu for TestCpu {
         Instant::new(11)
     }
 
-    fn timer_frequency(&self) -> u64 {
-        1_000_000
+    fn timebase(&self) -> Timebase {
+        self.timebase
     }
 
     fn set_deadline(&self, _: Instant) {}
@@ -120,12 +125,14 @@ impl Cpu for TestCpu {
 #[derive(Clone)]
 pub(crate) struct ManualClockCpu {
     nanos: Arc<AtomicU64>,
+    timebase: Timebase,
 }
 
 impl ManualClockCpu {
     pub(crate) fn new() -> Self {
         Self {
             nanos: Arc::new(AtomicU64::new(0)),
+            timebase: Timebase::new(1_000_000_000),
         }
     }
 
@@ -154,8 +161,8 @@ impl Cpu for ManualClockCpu {
         Instant::new(self.nanos.load(Ordering::Relaxed))
     }
 
-    fn timer_frequency(&self) -> u64 {
-        1_000_000_000
+    fn timebase(&self) -> Timebase {
+        self.timebase
     }
 
     fn set_deadline(&self, _: Instant) {}
@@ -244,8 +251,8 @@ impl Cpu for RecordingSmpCpu {
         self.base.now()
     }
 
-    fn timer_frequency(&self) -> u64 {
-        self.base.timer_frequency()
+    fn timebase(&self) -> Timebase {
+        self.base.timebase()
     }
 
     fn set_deadline(&self, deadline: Instant) {
@@ -292,7 +299,7 @@ pub(crate) fn test_profile_sink() -> crate::ProfileSink {
 /// origin is the boot tick, so a tick is a nanosecond and a test can
 /// state deadlines in either.
 pub(crate) fn test_uptime_clock() -> crate::UptimeClock {
-    crate::UptimeClock::new(0, 1_000_000_000)
+    crate::UptimeClock::new(0, Timebase::new(1_000_000_000))
 }
 
 /// Runtime state that answers the few questions a store asks and

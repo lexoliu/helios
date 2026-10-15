@@ -1030,7 +1030,7 @@ where
 pub(crate) mod test_store {
     use alloc::vec::Vec;
 
-    use helios_hal::cpu::ProcessorId;
+    use helios_hal::cpu::{Cpu, ProcessorId};
     use helios_hal::watchdog::ProgressCounter;
     use triomphe::Arc;
     use wasmtime::component::ResourceTable;
@@ -1104,7 +1104,7 @@ pub(crate) mod test_store {
             TestCpu,
             TestNetworkService,
             UnsupportedHostFileSystem,
-        > = crate::RuntimeState::new(1_000_000, 1, 0, crate::BootPayload::for_tests());
+        > = crate::RuntimeState::new(cpu.timebase(), 1, 0, crate::BootPayload::for_tests());
         runtime_state.install_root_entropy(Arc::new(
             crate::RootEntropy::from_platform(&cpu, None, None)
                 .expect("the fixture CPU has an entropy source"),

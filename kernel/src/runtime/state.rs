@@ -14,7 +14,7 @@ use crate::{
     TraceEvent, TraceFilter, TraceHistory,
 };
 use crate::{RootEntropy, RootEntropyHandle};
-use helios_hal::cpu::HardwarePerfCounterDelta;
+use helios_hal::cpu::{HardwarePerfCounterDelta, Timebase};
 use helios_hal::rtc::{RealTimeClock, UnixSeconds};
 use spin::{Mutex, Once};
 
@@ -34,7 +34,7 @@ pub struct RuntimeState<ProgramService, NetworkService, HostFsService> {
 
 struct RuntimeStateInner<ProgramService, NetworkService, HostFsService> {
     boot_ticks: u64,
-    timebase_frequency: u64,
+    timebase: Timebase,
     processor_count: u32,
     instance_registry: InstanceRegistry,
     program_service: Mutex<Option<ProgramService>>,
@@ -310,7 +310,7 @@ where
     HostFsService: Clone,
 {
     pub fn new(
-        timebase_frequency: u64,
+        timebase: Timebase,
         processor_count: usize,
         boot_ticks: u64,
         payload: BootPayload,
@@ -318,7 +318,7 @@ where
         Self {
             inner: Arc::new(RuntimeStateInner {
                 boot_ticks,
-                timebase_frequency,
+                timebase,
                 processor_count: processor_count as u32,
                 instance_registry: InstanceRegistry::new(),
                 program_service: Mutex::new(None),
@@ -647,7 +647,7 @@ where
     }
 
     pub fn ticks_to_nanos(&self, ticks: u64) -> u64 {
-        crate::exec::ticks_to_nanos(ticks, self.inner.timebase_frequency)
+        self.inner.timebase.ticks_to_nanos(ticks)
     }
 
     pub fn uptime_nanos(&self, current_ticks: u64) -> u64 {
@@ -662,7 +662,7 @@ where
     /// runtime state that used to answer for it. Handing it this keeps
     /// one origin for both.
     pub fn uptime_clock(&self) -> crate::UptimeClock {
-        crate::UptimeClock::new(self.inner.boot_ticks, self.inner.timebase_frequency)
+        crate::UptimeClock::new(self.inner.boot_ticks, self.inner.timebase)
     }
 
     /// Places the monotonic clock on the wall, from the platform's
@@ -1211,7 +1211,12 @@ mod tests {
 
     #[test]
     fn runtime_state_records_kernel_heap_delta_metrics() {
-        let state = RuntimeState::<(), (), ()>::new(1_000_000_000, 1, 0, BootPayload::for_tests());
+        let state = RuntimeState::<(), (), ()>::new(
+            Timebase::new(1_000_000_000),
+            1,
+            0,
+            BootPayload::for_tests(),
+        );
         let baseline = crate::heap_stats();
         state.inner.heap_perf_snapshot.reset(baseline);
         state.set_profiling_enabled(true);
