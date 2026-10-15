@@ -412,6 +412,13 @@ pub(crate) struct WorkloadBenchCommand {
     #[arg(long)]
     pub(crate) kernel_profile_output: Option<PathBuf>,
 
+    /// Write the instruction addresses the guest's timers sampled during the
+    /// workload run, as a folded profile of wasm and kernel functions.
+    /// Sampling runs only when this is given: it raises every guest
+    /// processor's timer rate tenfold, so the run's timings are perturbed.
+    #[arg(long)]
+    pub(crate) instruction_profile_output: Option<PathBuf>,
+
     /// Write folded user-only profile samples collected during the workload run.
     #[arg(long)]
     pub(crate) user_profile_output: Option<PathBuf>,
@@ -1573,6 +1580,7 @@ mod tests {
             keep_going: false,
             profile_output: None,
             kernel_profile_output: None,
+            instruction_profile_output: None,
             user_profile_output: None,
             perf_metrics_output: None,
             llvm_raw_profile_output: None,
@@ -1636,6 +1644,7 @@ mod tests {
             keep_going: false,
             profile_output: None,
             kernel_profile_output: None,
+            instruction_profile_output: None,
             user_profile_output: None,
             perf_metrics_output: None,
             llvm_raw_profile_output: None,
@@ -1666,6 +1675,7 @@ mod tests {
             keep_going: false,
             profile_output: None,
             kernel_profile_output: None,
+            instruction_profile_output: None,
             user_profile_output: None,
             perf_metrics_output: None,
             llvm_raw_profile_output: None,
@@ -1729,6 +1739,7 @@ mod tests {
             keep_going: false,
             profile_output: None,
             kernel_profile_output: None,
+            instruction_profile_output: None,
             user_profile_output: None,
             perf_metrics_output: None,
             llvm_raw_profile_output: None,

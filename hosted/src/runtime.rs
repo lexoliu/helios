@@ -7,7 +7,7 @@ use std::thread::{self, JoinHandle, Thread};
 use std::time::{Duration, Instant as StdInstant};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
-use helios_hal::cpu::{Cpu, Instant, ProcessorId};
+use helios_hal::cpu::{Cpu, Instant, ProcessorId, Timebase};
 use helios_hal::memory::MemoryRegion;
 use helios_hal::{DeviceInventory, DmaModel, Platform, ProcessorStartupPolicy, ProcessorTopology};
 
@@ -138,6 +138,9 @@ pub(crate) struct HostedMachine {
     processor_count: usize,
     bootstrap_processor: ProcessorId,
     started_at: StdInstant,
+    /// The host's monotonic clock in nanoseconds: one tick is one
+    /// nanosecond.
+    timebase: Timebase,
     heap: HeapReservation,
     /// The user payload `--bootfs` named, parsed once at start-up and
     /// shared by every processor thread — the hosted backend's boot
@@ -211,6 +214,7 @@ impl HostedMachine {
             processor_count: config.processor_count(),
             bootstrap_processor: config.bootstrap_processor(),
             started_at,
+            timebase: Timebase::new(NANOS_PER_SECOND),
             heap: HeapReservation::new(config.heap_bytes()),
             payload,
             slots: (0..config.processor_count())
@@ -234,8 +238,8 @@ impl HostedMachine {
         Instant::new(self.now_ticks())
     }
 
-    pub(crate) fn timer_frequency(&self) -> u64 {
-        NANOS_PER_SECOND
+    pub(crate) fn timebase(&self) -> Timebase {
+        self.timebase
     }
 
     pub(crate) fn start_processor(&self, processor: ProcessorId) {
@@ -408,7 +412,7 @@ fn shared_debug_state(machine: &HostedMachine) -> HostedRuntimeState {
     DEBUG_STATE
         .get_or_init(|| {
             helios_kernel::RuntimeState::new(
-                machine.timer_frequency(),
+                machine.timebase(),
                 machine.processor_count(),
                 machine.now_ticks(),
                 machine.payload,

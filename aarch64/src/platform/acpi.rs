@@ -41,6 +41,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use arm_gic::Trigger;
 use core::str::FromStr;
+use helios_hal::cpu::Timebase;
 use thiserror::Error;
 
 use super::{
@@ -98,7 +99,7 @@ pub(crate) struct AcpiPlatformTables {
 pub(super) fn open(rsdp: usize) -> Result<AcpiPlatformTables, AcpiError> {
     let handler = Aarch64AcpiHandler {
         physical_memory_offset: crate::physical_memory_offset(),
-        timer_frequency: crate::timer_frequency(),
+        timebase: crate::timebase(),
         bootstrap_mpidr: crate::read_mpidr_affinity(),
     };
     // SAFETY: the address is the one the bootloader read out of the EFI
@@ -413,7 +414,7 @@ fn spi_from_gsiv(gsiv: u32) -> Result<u32, AcpiError> {
 #[derive(Clone)]
 pub(crate) struct Aarch64AcpiHandler {
     physical_memory_offset: usize,
-    timer_frequency: u64,
+    timebase: Timebase,
     /// Affinity of the processor the interpreter is allowed to run on;
     /// see the mutex hooks below.
     bootstrap_mpidr: usize,
@@ -533,14 +534,13 @@ impl Handler for Aarch64AcpiHandler {
     }
 
     fn nanos_since_boot(&self) -> u64 {
-        crate::read_counter()
-            .saturating_mul(1_000_000_000)
-            .wrapping_div(self.timer_frequency)
+        self.timebase.ticks_to_nanos(crate::read_counter())
     }
 
     fn stall(&self, microseconds: u64) {
         let ticks = self
-            .timer_frequency
+            .timebase
+            .frequency()
             .saturating_mul(microseconds)
             .wrapping_div(1_000_000);
         let deadline = crate::read_counter().saturating_add(ticks);

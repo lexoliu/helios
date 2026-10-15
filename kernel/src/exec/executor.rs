@@ -24,7 +24,6 @@ use crate::exec::idle::{
     IDLE_POLL_GROW_START, IDLE_POLL_MAX, IdleOutcome, IdleState, ProcessorIdle,
 };
 use crate::exec::sync::Notify;
-use crate::exec::time::duration_to_ticks;
 use crate::exec::timer::Timer;
 use crate::memory::task_arena_bytes_for;
 
@@ -916,8 +915,8 @@ impl Executor {
         let parked_ticks = cpu.now().ticks() - parked_at.ticks();
         idle.adapt_poll_limit(
             parked_ticks,
-            duration_to_ticks(IDLE_POLL_GROW_START, cpu.timer_frequency()),
-            duration_to_ticks(IDLE_POLL_MAX, cpu.timer_frequency()),
+            cpu.timebase().duration_to_ticks(IDLE_POLL_GROW_START),
+            cpu.timebase().duration_to_ticks(IDLE_POLL_MAX),
         );
         IdleOutcome::Parked {
             polled_ticks: parked_at.ticks() - started.ticks(),
@@ -1445,15 +1444,25 @@ mod tests {
         Executor, GlobalScheduler, IDLE_POLL_GROW_START, IDLE_POLL_MAX, IdleOutcome, IdleState,
         LocalScheduler, LocalSilentScheduler, READY_QUEUE_CAPACITY, Spawner,
         TASK_ARENA_CLASS_COUNT, TASK_ARENA_KERNEL_RESERVE_BYTES, TASK_ARENA_TOP_BYTES, TaskArena,
-        Timer, duration_to_ticks, pop_ready, ready_queue, should_wake_global_processor,
-        should_wake_owner_processor, task_arena_bytes,
+        Timer, pop_ready, ready_queue, should_wake_global_processor, should_wake_owner_processor,
+        task_arena_bytes,
     };
     use crate::test_support::RecordingSmpCpu;
-    use helios_hal::cpu::{Cpu, HardwarePerfCounters, Instant, ProcessorId};
+    use helios_hal::cpu::{Cpu, HardwarePerfCounters, Instant, ProcessorId, Timebase};
     use helios_hal::watchdog::ProgressCounter;
 
     #[derive(Clone)]
-    struct TestCpu;
+    struct TestCpu {
+        timebase: Timebase,
+    }
+
+    impl TestCpu {
+        fn new() -> Self {
+            Self {
+                timebase: Timebase::new(1_000_000_000),
+            }
+        }
+    }
 
     impl Cpu for TestCpu {
         fn processor_count(&self) -> usize {
@@ -1474,8 +1483,8 @@ mod tests {
             Instant::new(0)
         }
 
-        fn timer_frequency(&self) -> u64 {
-            1_000_000_000
+        fn timebase(&self) -> Timebase {
+            self.timebase
         }
 
         fn hardware_perf_counters(&self) -> HardwarePerfCounters {
@@ -1513,6 +1522,7 @@ mod tests {
         step: u64,
         park_advance: Arc<AtomicU64>,
         may_park: Arc<AtomicBool>,
+        timebase: Timebase,
     }
 
     impl SteppingClockCpu {
@@ -1523,6 +1533,7 @@ mod tests {
                 step,
                 park_advance: Arc::new(AtomicU64::new(0)),
                 may_park: Arc::new(AtomicBool::new(true)),
+                timebase: Timebase::new(1_000_000_000),
             }
         }
 
@@ -1561,8 +1572,8 @@ mod tests {
             Instant::new(self.nanos.fetch_add(self.step, Ordering::Relaxed))
         }
 
-        fn timer_frequency(&self) -> u64 {
-            1_000_000_000
+        fn timebase(&self) -> Timebase {
+            self.timebase
         }
 
         fn hardware_perf_counters(&self) -> HardwarePerfCounters {
@@ -1621,7 +1632,7 @@ mod tests {
     fn global_batch_does_not_probe_empty_local_queue_per_task() {
         let _serialized = super::executor_test_guard();
         let executor = Executor::new(ProgressCounter::new(), 1, ProcessorId::new(0));
-        let spawner = executor.spawner(TestCpu);
+        let spawner = executor.spawner(TestCpu::new());
         for _ in 0..8 {
             spawner.spawn_detached(async {});
         }
@@ -1958,8 +1969,8 @@ mod tests {
         let executor = Executor::new(ProgressCounter::new(), 2, ProcessorId::new(0));
         let timer = Timer::new(cpu.clone());
         let idle = &executor.group.idle[0];
-        let grow_start = duration_to_ticks(IDLE_POLL_GROW_START, cpu.timer_frequency());
-        let max = duration_to_ticks(IDLE_POLL_MAX, cpu.timer_frequency());
+        let grow_start = cpu.timebase().duration_to_ticks(IDLE_POLL_GROW_START);
+        let max = cpu.timebase().duration_to_ticks(IDLE_POLL_MAX);
         assert_eq!(idle.poll_limit_ticks(), 0);
 
         // A park shorter than the maximum window earns a poll window,

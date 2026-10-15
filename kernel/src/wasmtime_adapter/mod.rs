@@ -8,6 +8,7 @@
 use crate::ComponentHostNetwork;
 pub(crate) mod artifact_profile;
 pub mod bindings;
+pub(crate) mod code_map;
 pub(crate) mod component_host;
 pub mod config;
 #[cfg(all(target_os = "none", feature = "wasmtime-bare-metal"))]
@@ -53,6 +54,8 @@ impl CompiledComponent for WasmtimeCompiledComponent {}
 pub(crate) struct WasmtimeCompiledCoreModule {
     pub(crate) cache_key: Bytes,
     pub(crate) module: Module,
+    /// Names the module's code to the instruction sampler while it lives.
+    pub(crate) _code: code_map::CodeRegistration,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

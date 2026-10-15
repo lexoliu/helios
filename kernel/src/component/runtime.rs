@@ -8,7 +8,7 @@ use bytes::Bytes;
 use crate::io::{ByteReader, ByteWriter, TryRead};
 use crate::{
     EntropyPool, InstanceActivity, InstanceRegistry, KernelClock, KillReason, ProcessAuthority,
-    RegisteredInstance, SetWallClockCap, Sleep, Timer, nanos_to_ticks_ceil_saturating,
+    RegisteredInstance, SetWallClockCap, Sleep, Timer,
 };
 use helios_hal::cpu::{Cpu, Instant};
 
@@ -857,8 +857,10 @@ pub async fn wait_until_runtime_deadline<CpuImpl, RuntimeStateImpl>(
         }
 
         let remaining_nanos = deadline_nanos.saturating_sub(now_nanos);
-        let remaining_ticks =
-            nanos_to_ticks_ceil_saturating(remaining_nanos, cpu.timer_frequency()).max(1);
+        let remaining_ticks = cpu
+            .timebase()
+            .nanos_to_ticks_ceil_saturating(remaining_nanos)
+            .max(1);
         timer
             .sleep_until(Instant::new(now_ticks.saturating_add(remaining_ticks)))
             .await;

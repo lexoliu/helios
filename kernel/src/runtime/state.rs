@@ -9,11 +9,12 @@ use crate::{
     BootPayload, DEFAULT_PERF_METRIC_CAPACITY, DEFAULT_PROFILE_STACK_CAPACITY,
     DEFAULT_TRACE_HISTORY_CAPACITY, EmbeddedBootFs, EmbeddedComponent, FoldedProfileSample,
     FutexKey, FutexTable, FutexWaitRegistration, HEAP_SIZE_CLASS_COUNT, HeapStats,
-    InstanceRegistry, Notify, PerfMetricFilter, PerfMetricHistory, PerfMetricSample, PerfSample,
-    ProfileFilter, ProfileScope, ProfileSink, StatsSample, TraceEvent, TraceFilter, TraceHistory,
+    InstanceRegistry, InstructionSampler, Notify, PerfMetricFilter, PerfMetricHistory,
+    PerfMetricSample, PerfSample, ProfileFilter, ProfileScope, ProfileSink, StatsSample,
+    TraceEvent, TraceFilter, TraceHistory,
 };
 use crate::{RootEntropy, RootEntropyHandle};
-use helios_hal::cpu::HardwarePerfCounterDelta;
+use helios_hal::cpu::{HardwarePerfCounterDelta, Timebase};
 use helios_hal::rtc::{RealTimeClock, UnixSeconds};
 use spin::{Mutex, Once};
 
@@ -33,7 +34,7 @@ pub struct RuntimeState<ProgramService, NetworkService, HostFsService> {
 
 struct RuntimeStateInner<ProgramService, NetworkService, HostFsService> {
     boot_ticks: u64,
-    timebase_frequency: u64,
+    timebase: Timebase,
     processor_count: u32,
     instance_registry: InstanceRegistry,
     program_service: Mutex<Option<ProgramService>>,
@@ -113,6 +114,10 @@ struct RuntimeStateInner<ProgramService, NetworkService, HostFsService> {
     /// fields so a subsystem this state owns can record into them
     /// without naming the state's own type (see [`ProfileSink`]).
     profiles: ProfileSink,
+    /// Instruction-address samples, with their own start and stop. A
+    /// backend whose timer captures them installs its capture here during
+    /// bring-up.
+    instructions: InstructionSampler,
     heap_perf_snapshot: HeapPerfSnapshot,
 }
 
@@ -305,7 +310,7 @@ where
     HostFsService: Clone,
 {
     pub fn new(
-        timebase_frequency: u64,
+        timebase: Timebase,
         processor_count: usize,
         boot_ticks: u64,
         payload: BootPayload,
@@ -313,7 +318,7 @@ where
         Self {
             inner: Arc::new(RuntimeStateInner {
                 boot_ticks,
-                timebase_frequency,
+                timebase,
                 processor_count: processor_count as u32,
                 instance_registry: InstanceRegistry::new(),
                 program_service: Mutex::new(None),
@@ -345,6 +350,7 @@ where
                     DEFAULT_PROFILE_STACK_CAPACITY,
                     DEFAULT_PERF_METRIC_CAPACITY,
                 ),
+                instructions: InstructionSampler::new(processor_count),
                 heap_perf_snapshot: HeapPerfSnapshot::new(),
             }),
         }
@@ -372,6 +378,13 @@ where
             self.inner.heap_perf_snapshot.reset(crate::heap_stats());
         }
         self.inner.profiles.set_enabled(enabled);
+    }
+
+    /// The instruction-address sampler. It has its own start and stop
+    /// (`profiling.set-instruction-sampling`), independent of the scoped
+    /// profiler, because sampling shortens every processor's timer period.
+    pub fn instruction_sampler(&self) -> InstructionSampler {
+        self.inner.instructions.clone()
     }
 
     /// The profile and perf histories this state records into.
@@ -634,7 +647,7 @@ where
     }
 
     pub fn ticks_to_nanos(&self, ticks: u64) -> u64 {
-        crate::exec::ticks_to_nanos(ticks, self.inner.timebase_frequency)
+        self.inner.timebase.ticks_to_nanos(ticks)
     }
 
     pub fn uptime_nanos(&self, current_ticks: u64) -> u64 {
@@ -649,7 +662,7 @@ where
     /// runtime state that used to answer for it. Handing it this keeps
     /// one origin for both.
     pub fn uptime_clock(&self) -> crate::UptimeClock {
-        crate::UptimeClock::new(self.inner.boot_ticks, self.inner.timebase_frequency)
+        crate::UptimeClock::new(self.inner.boot_ticks, self.inner.timebase)
     }
 
     /// Places the monotonic clock on the wall, from the platform's
@@ -1198,7 +1211,12 @@ mod tests {
 
     #[test]
     fn runtime_state_records_kernel_heap_delta_metrics() {
-        let state = RuntimeState::<(), (), ()>::new(1_000_000_000, 1, 0, BootPayload::for_tests());
+        let state = RuntimeState::<(), (), ()>::new(
+            Timebase::new(1_000_000_000),
+            1,
+            0,
+            BootPayload::for_tests(),
+        );
         let baseline = crate::heap_stats();
         state.inner.heap_perf_snapshot.reset(baseline);
         state.set_profiling_enabled(true);

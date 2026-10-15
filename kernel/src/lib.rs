@@ -104,9 +104,8 @@ pub use exec::{
     RawMutexLease, RawRwLock, RawRwLockReadLease, RawRwLockWriteLease, RwLock, RwLockReadGuard,
     RwLockWriteGuard, Sleep, Spawner, StatsSample, TaskCapacityError, TaskFunding, Timer,
     TraceEvent, TraceField, TraceFilter, TraceHistory, TraceLevel, TraceValue, UptimeClock,
-    YieldNow, duration_to_ticks, elapsed_millis, matches_perf_metric_filter,
-    matches_profile_filter, matches_trace_filter, monotonic_nanos, nanos_to_ticks_ceil_saturating,
-    parse_console_text, wall_clock_offset_nanos, yield_now,
+    YieldNow, elapsed_millis, matches_perf_metric_filter, matches_profile_filter,
+    matches_trace_filter, monotonic_nanos, parse_console_text, wall_clock_offset_nanos, yield_now,
 };
 pub use gpu::{
     ContextRecord, Gpu3dClaim, Gpu3dOwnership, Gpu3dSender, Gpu3dService, Gpu3dServiceError,
@@ -194,7 +193,10 @@ pub use process::{
     ThreadRecord, ThreadState, ThreadTable, ThreadTableError, TtyControlCap, UdpCap,
 };
 pub use profiling::{
+    CodeAttribution, InstructionProfile, InstructionProfileError, InstructionSampler,
     KernelLlvmProfile, LlvmProfile, LlvmProfileError, MAX_PROFILE_READ, ProfileSection,
+    SAMPLE_DRAIN_INTERVAL_MILLIS, SAMPLE_RING_CAPACITY, SampleCapture, SampledCode,
+    WasmFunctionSample,
 };
 pub use runtime::{
     AuthorityDomain, ComponentHostFilesystemState, ComponentHostNetwork, ComponentNetworkService,
@@ -982,7 +984,7 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone> Kernel<CpuImpl, Watch
             "watchdog check interval computed as zero for timeout {timeout:?}"
         );
 
-        let min_pet_ticks = duration_to_ticks(interval, self.cpu.timer_frequency());
+        let min_pet_ticks = self.cpu.timebase().duration_to_ticks(interval);
         assert!(
             min_pet_ticks != 0,
             "watchdog pet interval {interval:?} converted to zero timer ticks"
@@ -1137,10 +1139,10 @@ where
         cpu.processor_count()
     );
     assert!(
-        cpu.timer_frequency() == timer_frequency_hz,
+        cpu.timebase().frequency() == timer_frequency_hz,
         "platform timer frequency {} does not match CPU timer frequency {}",
         timer_frequency_hz,
-        cpu.timer_frequency()
+        cpu.timebase().frequency()
     );
 
     if current_processor == topology.bootstrap_processor {

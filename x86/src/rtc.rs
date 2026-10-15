@@ -18,6 +18,7 @@
 //! the index register needs no lock.
 
 use acpi::sdt::fadt::Fadt;
+use helios_hal::cpu::Timebase;
 use helios_hal::rtc::{CalendarEncoding, RawCalendar, RealTimeClock, RtcError, UnixSeconds};
 use x86_64::instructions::port::{Port, PortWriteOnly};
 
@@ -115,7 +116,7 @@ pub(crate) fn discover(rsdp_address: usize, physical_memory_offset: usize) -> Op
     let handler = crate::smp::PhysicalOffsetAcpiHandler {
         physical_memory_offset,
         tsc_base: 0,
-        tsc_hz: 1,
+        timebase: Timebase::new(1),
     };
     let tables = unsafe { acpi::AcpiTables::from_rsdp(handler, rsdp_address) }
         .unwrap_or_else(|error| panic!("failed to parse ACPI tables for the FADT: {error:?}"));

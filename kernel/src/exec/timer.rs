@@ -17,8 +17,6 @@ use helios_hal::cpu::{Cpu, Instant};
 use objectpool::Pool;
 use triomphe::Arc;
 
-use crate::exec::time::duration_to_ticks;
-
 const SCHEDULER_INTERRUPT_INTERVAL: Duration = Duration::from_millis(100);
 const TIMER_WHEEL_QUANTUM: Duration = Duration::from_micros(50);
 const TIMER_WHEEL_LEVELS: usize = 4;
@@ -143,9 +141,9 @@ struct WheelLevel {
 
 impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
     pub fn new(cpu: CpuImpl) -> Self {
-        let interrupt_interval_ticks =
-            duration_to_ticks(SCHEDULER_INTERRUPT_INTERVAL, cpu.timer_frequency());
-        let wheel_quantum_ticks = duration_to_ticks(TIMER_WHEEL_QUANTUM, cpu.timer_frequency());
+        let timebase = cpu.timebase();
+        let interrupt_interval_ticks = timebase.duration_to_ticks(SCHEDULER_INTERRUPT_INTERVAL);
+        let wheel_quantum_ticks = timebase.duration_to_ticks(TIMER_WHEEL_QUANTUM);
         assert!(
             interrupt_interval_ticks != 0,
             "scheduler interrupt interval {SCHEDULER_INTERRUPT_INTERVAL:?} converted to zero timer ticks"
@@ -213,7 +211,7 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
     }
 
     pub fn sleep_for(&self, duration: Duration) -> Sleep<CpuImpl> {
-        let ticks = duration_to_ticks(duration, self.cpu.timer_frequency());
+        let ticks = self.cpu.timebase().duration_to_ticks(duration);
         self.sleep_until(self.now().saturating_add(ticks))
     }
 
@@ -734,7 +732,7 @@ mod tests {
     use core::task::Context;
 
     use futures::task::noop_waker_ref;
-    use helios_hal::cpu::{Cpu, Instant, ProcessorId};
+    use helios_hal::cpu::{Cpu, Instant, ProcessorId, Timebase};
 
     use super::{
         TIMER_INBOX_CAPACITY, TIMER_READY_RETAINED_ENTRIES, TimerEntry, TimingWheel,
@@ -744,6 +742,16 @@ mod tests {
     #[derive(Clone)]
     struct TestCpu {
         now: u64,
+        timebase: Timebase,
+    }
+
+    impl TestCpu {
+        fn at(now: u64) -> Self {
+            Self {
+                now,
+                timebase: Timebase::new(1_000_000),
+            }
+        }
     }
 
     impl Cpu for TestCpu {
@@ -765,8 +773,8 @@ mod tests {
             Instant::new(self.now)
         }
 
-        fn timer_frequency(&self) -> u64 {
-            1_000_000
+        fn timebase(&self) -> Timebase {
+            self.timebase
         }
 
         fn set_deadline(&self, _deadline: Instant) {}
@@ -789,7 +797,7 @@ mod tests {
     }
 
     fn test_timer() -> super::Timer<TestCpu> {
-        super::Timer::new(TestCpu { now: 0 })
+        super::Timer::new(TestCpu::at(0))
     }
 
     /// Builds a wheel entry plus the strong ref that keeps its slot
@@ -959,7 +967,7 @@ mod tests {
 
     #[test]
     fn elapsed_sleep_does_not_allocate_state() {
-        let timer = super::Timer::new(TestCpu { now: 100 });
+        let timer = super::Timer::new(TestCpu::at(100));
         assert!(timer.sleep_until(Instant::new(101)).state.is_none());
         assert!(timer.sleep_until(Instant::new(100)).state.is_none());
         assert!(timer.sleep_until(Instant::new(99)).state.is_none());
@@ -968,7 +976,7 @@ mod tests {
 
     #[test]
     fn pending_sleep_allocates_state_on_first_poll() {
-        let timer = super::Timer::new(TestCpu { now: 100 });
+        let timer = super::Timer::new(TestCpu::at(100));
         let mut sleep = timer.sleep_until(Instant::new(101));
         assert!(sleep.state.is_none());
 
@@ -980,7 +988,7 @@ mod tests {
 
     #[test]
     fn timer_inbox_is_bounded_to_kernel_capacity() {
-        let timer = super::Timer::new(TestCpu { now: 100 });
+        let timer = super::Timer::new(TestCpu::at(100));
 
         assert_eq!(timer.shared.inbox.capacity(), Some(TIMER_INBOX_CAPACITY));
     }
