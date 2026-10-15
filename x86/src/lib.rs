@@ -285,11 +285,14 @@ fn x86_kernel_main() -> ! {
         "kernel image loaded"
     );
     let (xsave_standard_bytes, xsave_max_bytes) = extended_state::xsave_sizes();
+    let supervisor_state = extended_state::supervisor_state_support();
     tracing::info!(
         xcr0 = format_args!("{:#x}", xcr0.bits()),
         xsave_standard_bytes,
         xsave_max_bytes,
         avx512 = xcr0.bits() & extended_state::AVX512_STATE != 0,
+        xsaves = supervisor_state.xsaves,
+        xss_supported = format_args!("{:#x}", supervisor_state.xss_mask),
         "x86 extended state enabled"
     );
     let debug_state = cpu.debug_state();

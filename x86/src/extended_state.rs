@@ -166,3 +166,23 @@ pub(crate) fn xsave_sizes() -> (u32, u32) {
     let leaf = __cpuid_count(0xD, 0);
     (leaf.ebx, leaf.ecx)
 }
+
+/// What CPUID.(EAX=0DH,ECX=1) reports about supervisor state. Helios
+/// enables no supervisor state, so its IA32_XSS stays 0. Under KVM, a
+/// guest whose CPUID reports XSAVES makes the host write IA32_XSS on every
+/// VM entry and exit whenever the host's own IA32_XSS is non-zero, which is
+/// why the boot line records both fields.
+pub(crate) struct SupervisorStateSupport {
+    /// XSAVES/XRSTORS and IA32_XSS exist (EAX bit 3).
+    pub(crate) xsaves: bool,
+    /// The IA32_XSS bits the processor lets software set (ECX | EDX << 32).
+    pub(crate) xss_mask: u64,
+}
+
+pub(crate) fn supervisor_state_support() -> SupervisorStateSupport {
+    let leaf = __cpuid_count(0xD, 1);
+    SupervisorStateSupport {
+        xsaves: leaf.eax & (1 << 3) != 0,
+        xss_mask: u64::from(leaf.ecx) | (u64::from(leaf.edx) << 32),
+    }
+}
