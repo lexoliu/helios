@@ -5,6 +5,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use core::task::{Context, Poll};
 use core::time::Duration;
 
 use crossbeam_utils::CachePadded;
@@ -15,6 +16,7 @@ use triomphe::Arc;
 
 use crate::memory::{MemoryOwner, UserMemoryOwnerScope, enter_user_memory_owner};
 use crate::user_mapping_kernel_heap_bytes;
+use crate::{Notify, NotifyWaiter};
 
 /// What the OOM killer is allowed to do with an instance.
 ///
@@ -143,18 +145,20 @@ const fn decode_kill_flag(value: u8) -> Option<KillReason> {
 /// before it will condemn another one to serve the same shortfall.
 ///
 /// Condemning an instance does not free anything by itself: the kill
-/// flag is observed at the victim's next epoch check, and the memory
-/// returns when its store is torn down and its registry entry drops.
+/// flag is observed at the victim's next epoch check, or by the turn of
+/// a victim suspended in a host future, and the memory returns when its
+/// store is torn down and its registry entry drops.
 /// [`InstanceRegistry::request_kill`] bumps the runtime engine epoch,
 /// so a victim executing wasm traps at its next epoch check, and the
 /// scheduler tick that also drives those runs every 100ms
-/// (`SCHEDULER_INTERRUPT_INTERVAL`). Five ticks leaves room for the
-/// trap to unwind and the store to drop.
+/// (`SCHEDULER_INTERRUPT_INTERVAL`); it also wakes the turn of a victim
+/// that is suspended, which drops the call at the executor's next poll
+/// of it. Five ticks leaves room for the call to unwind and the store
+/// to drop.
 ///
-/// A victim parked in a host future that never resolves — a socket
-/// read with no peer, a host-fs request whose reply never comes — never
-/// returns to wasm and so never reaches an epoch check, so the wait has
-/// to be bounded.
+/// The wait is still bounded, because reclaim is the victim's owner
+/// dropping its store after the call ends, and nothing here can make
+/// an owner do that sooner.
 /// When the window expires the condemnation goes stale: it stops
 /// counting as coverage, so the next request condemns a fresh victim,
 /// while the stale condemnation stays on the books and stays out of
@@ -292,6 +296,12 @@ struct InstanceEntry {
     /// and a guest call that completes while it is set reports the
     /// kill instead of its result.
     kill_flag: AtomicU8,
+    /// Broadcast once, when `kill_flag` leaves [`KILL_FLAG_NONE`]. Every
+    /// turn of this instance whose guest is suspended in a host future
+    /// waits on it, armed before it tests the flag, so a condemnation
+    /// ends the call at once rather than when the host future resolves,
+    /// which for a parked or idle guest may be never.
+    condemned: Notify,
     /// Monotonic nanoseconds at which the kill flag was set, and what
     /// the instance held in each pool at that moment. Together they are
     /// this instance's entry in the condemned-memory ledger: what the
@@ -357,6 +367,7 @@ impl InstanceRegistry {
             stores: Mutex::new(StoreClocks::new(started_at)),
             policy,
             kill_flag: AtomicU8::new(KILL_FLAG_NONE),
+            condemned: Notify::new(),
             condemned_at: AtomicU64::new(0),
             condemned_user_bytes: AtomicU64::new(0),
             condemned_kernel_bytes: AtomicU64::new(0),
@@ -478,8 +489,9 @@ impl InstanceRegistry {
     }
 
     /// Mark `id` for termination as of `now_nanos`. The instance's next
-    /// epoch check traps with the recorded `KillReason`, and a guest
-    /// call of it that completes first reports the kill instead of its
+    /// epoch check traps with the recorded `KillReason`, a guest call of
+    /// it that is suspended in a host call ends with the kill at once,
+    /// and one that completes first reports the kill instead of its
     /// result.
     ///
     /// A successful flip puts the instance's memory on the condemned
@@ -491,9 +503,10 @@ impl InstanceRegistry {
     /// next epoch check of every running guest fires its callback, which
     /// reads the kill flag and traps. Without this kick a CPU-bound
     /// victim would run until the next scheduler tick. A guest suspended
-    /// in a host call meets the same check at its first function entry
-    /// or loop back-edge after the call returns. It is also what bounds
-    /// the ledger's wait: see [`OOM_RECLAIM_GRACE`].
+    /// in a host call reaches no epoch check, so the flip also wakes
+    /// every turn of the instance, and a turn whose call is suspended
+    /// drops it (see [`StoreTurns::arm_kill_wait`]). Together they are
+    /// what bounds the ledger's wait: see [`OOM_RECLAIM_GRACE`].
     pub fn request_kill(&self, id: InstanceId, reason: KillReason, now_nanos: u64) -> KillOutcome {
         let entries = self.inner.entries.lock();
         let outcome = if entries.iter().any(|(_, entry)| entry.id == id) {
@@ -734,6 +747,12 @@ fn condemn_entry(
     entry
         .condemned_kernel_bytes
         .store(condemned.kernel, Ordering::Release);
+    // After the flag, so a turn woken here reads it set. Broadcasting
+    // under the registry lock is what keeps the entry alive for the
+    // call: once the lock drops, the victim's last handle may take the
+    // entry with it. `notify_all` is lock-free and allocation-free, and
+    // a waker it runs only queues a task.
+    entry.condemned.notify_all();
     Some(condemned)
 }
 
@@ -1077,6 +1096,22 @@ impl StoreTurns {
     /// The condemnation recorded for this instance, if any.
     pub fn pending_kill(&self) -> Option<KillReason> {
         self.instance.pending_kill()
+    }
+
+    /// Arm a wait for this instance's condemnation.
+    ///
+    /// The wait completes on a condemnation raised from this point on,
+    /// so a caller arms it before it reads [`Self::pending_kill`] and
+    /// cannot lose a kill that lands between the read and the park.
+    pub fn arm_kill_wait(&self) -> NotifyWaiter {
+        self.instance.entry().condemned.waiter()
+    }
+
+    /// Poll a wait armed by [`Self::arm_kill_wait`]. `Ready` means the
+    /// instance may have been condemned since the wait was armed, and
+    /// re-arms the wait; the caller reads [`Self::pending_kill`] again.
+    pub fn poll_kill_wait(&self, cx: &mut Context<'_>, wait: &mut NotifyWaiter) -> Poll<()> {
+        self.instance.entry().condemned.poll_notified(cx, wait)
     }
 
     /// Put the store on the executing processor as of `now_nanos`.

@@ -27,27 +27,52 @@ pub(super) enum WasixSignalDispositionAction {
     Ignore,
 }
 
+/// One WASIX thread's signals: the one pending delivery, the interval
+/// timer's generation, and the broadcast a raise sends to the turn
+/// driving the thread's store.
+///
+/// # Concurrency
+///
+/// Any processor may raise (a parent's `proc_raise`, a sibling's
+/// `thread_signal`, the interval timer task); one turn at a time takes.
+/// Every operation is a single atomic or a lock-free broadcast.
 #[derive(Clone)]
 pub(super) struct WasixSignalState {
-    pub(super) pending: Arc<AtomicU32>,
-    pub(super) interval_generation: Arc<AtomicU64>,
+    shared: Arc<WasixSignals>,
+}
+
+struct WasixSignals {
+    pending: AtomicU32,
+    interval_generation: AtomicU64,
+    /// Broadcast by every raise, after the signal is stored, so a turn
+    /// whose guest is suspended in a host call ends the call with the
+    /// signal instead of waiting for the host call to resolve.
+    raised: crate::Notify,
 }
 
 impl WasixSignalState {
     pub(super) fn new() -> Self {
         Self {
-            pending: Arc::new(AtomicU32::new(WASIX_NO_PENDING_SIGNAL)),
-            interval_generation: Arc::new(AtomicU64::new(0)),
+            shared: Arc::new(WasixSignals {
+                pending: AtomicU32::new(WASIX_NO_PENDING_SIGNAL),
+                interval_generation: AtomicU64::new(0),
+                raised: crate::Notify::new(),
+            }),
         }
     }
 
+    /// Make `signal` pending and bring it to the guest: a running guest
+    /// meets it at its next epoch check, which the bump makes immediate,
+    /// and a suspended one through the turn that waits on `raised`.
     pub(super) fn raise(&self, signal: u32) {
-        self.pending.store(signal, AtomicOrdering::Release);
+        self.shared.pending.store(signal, AtomicOrdering::Release);
+        self.shared.raised.notify_all();
         crate::wasmtime_adapter::bump_user_engine_epoch();
     }
 
     pub(super) fn take_pending(&self) -> Option<u32> {
         match self
+            .shared
             .pending
             .swap(WASIX_NO_PENDING_SIGNAL, AtomicOrdering::AcqRel)
         {
@@ -57,7 +82,8 @@ impl WasixSignalState {
     }
 
     pub(super) fn next_interval_generation(&self) -> u64 {
-        self.interval_generation
+        self.shared
+            .interval_generation
             .fetch_add(1, AtomicOrdering::AcqRel)
             .saturating_add(1)
     }
@@ -67,7 +93,10 @@ impl WasixSignalState {
     }
 
     pub(super) fn interval_generation_is_current(&self, generation: u64) -> bool {
-        self.interval_generation.load(AtomicOrdering::Acquire) == generation
+        self.shared
+            .interval_generation
+            .load(AtomicOrdering::Acquire)
+            == generation
     }
 }
 
@@ -877,16 +906,36 @@ pub(super) fn preview1_exit_status(error: &wasmtime::Error, requested: Option<u3
     }
 }
 
-/// A WASIX store delivers a signal raised while its guest was in its
-/// last host call when the call into the store completes: the guest
-/// went back to the host without meeting the epoch check that would
-/// otherwise have delivered it.
+/// A raise wakes the turn driving the thread's store, so a guest
+/// suspended in a host call is stopped without waiting for the call.
+impl crate::component::StopWake for WasixSignalState {
+    type Wait = crate::NotifyWaiter;
+
+    fn arm_stop_wait(&self) -> crate::NotifyWaiter {
+        self.shared.raised.waiter()
+    }
+
+    fn poll_stop_wait(
+        &self,
+        cx: &mut core::task::Context<'_>,
+        wait: &mut crate::NotifyWaiter,
+    ) -> core::task::Poll<()> {
+        self.shared.raised.poll_notified(cx, wait)
+    }
+}
+
+/// A WASIX store delivers a pending signal wherever its turn reads it:
+/// before the guest is resumed, when a raise wakes a suspended call,
+/// and when the call completes, which is where a signal raised in the
+/// guest's last host call arrives, the guest having gone back to the
+/// host without meeting the epoch check that would otherwise have
+/// delivered it.
 impl<RuntimeStateImpl> crate::component::TurnEpilogue<RuntimeStateImpl, wasmtime::Error>
     for WasixSignalState
 {
     fn end_turn(&self, _: &RuntimeStateImpl) {}
 
-    fn end_call(&self) -> Option<wasmtime::Error> {
+    fn take_stop(&self) -> Option<wasmtime::Error> {
         self.take_pending()
             .map(|signal| wasmtime::Error::new(Preview1SignalExit { signal }))
     }

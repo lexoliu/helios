@@ -339,11 +339,11 @@ where
     ///
     /// Raising a signal and condemning an instance both bump the epoch,
     /// so a guest that is running meets this at its next function entry
-    /// or loop back-edge, and one suspended in a host call meets it at
-    /// the first of those after the call returns; a call that returns
-    /// to the host first meets both where it completes (see
-    /// [`crate::component::TurnEpilogue::end_call`]). A signal is
-    /// delivered ahead of a kill.
+    /// or loop back-edge. One suspended in a host call meets neither
+    /// here: the turn driving the store is woken and ends the call, and
+    /// a call that returns to the host first meets both where it
+    /// completes (see [`crate::component::TurnEpilogue::take_stop`]). A
+    /// signal is delivered ahead of a kill.
     fn on_epoch_deadline(&mut self) -> wasmtime::Result<wasmtime::UpdateDeadline> {
         if let Some(signal) = self.signal_state.take_pending() {
             return Err(wasmtime::Error::new(Preview1SignalExit { signal }));
@@ -5683,18 +5683,11 @@ mod tests {
         let activity = crate::InstanceActivity::new(registry.register("signalled", 0), 0);
         let signal_state = WasixSignalState::new();
         let sender = signal_state.clone();
-        let mut polls = 0;
-        // The last host call suspends; another task signals the program
-        // while it waits; the call returns and so does the export.
-        let call = core::future::poll_fn(move |cx| {
-            polls += 1;
-            if polls == 1 {
-                sender.raise(15);
-                cx.waker().wake_by_ref();
-                core::task::Poll::Pending
-            } else {
-                core::task::Poll::Ready(Ok(()))
-            }
+        // The last host call is where the program is signalled; it
+        // returns without suspending, and so does the export.
+        let call = core::future::poll_fn(move |_| {
+            sender.raise(15);
+            core::task::Poll::Ready(Ok(()))
         });
 
         let error =
@@ -5705,6 +5698,61 @@ mod tests {
             None,
             "the signal is delivered once"
         );
+    }
+
+    /// Counts the wakes a turn receives.
+    #[derive(Default)]
+    struct CountingWaker {
+        wakes: core::sync::atomic::AtomicUsize,
+    }
+
+    impl std::task::Wake for CountingWaker {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.wakes.fetch_add(1, AtomicOrdering::AcqRel);
+        }
+    }
+
+    /// A signal raised while the guest is suspended in a host call that
+    /// never resolves wakes the turn, which ends the call with
+    /// `128 + signal` instead of waiting for the host call; a
+    /// condemnation raised in the same wait comes second.
+    #[test]
+    fn a_signal_ends_a_call_suspended_in_a_host_call_that_never_resolves() {
+        let registry = crate::InstanceRegistry::new();
+        let instance = registry.register("sleeping", 0);
+        let activity = crate::InstanceActivity::new(instance.clone(), 0);
+        let signal_state = WasixSignalState::new();
+        let turns = crate::component::GuestTurns::new(
+            activity.turns(),
+            crate::test_support::ManualClockCpu::new(),
+            crate::test_support::TestRuntimeState::default(),
+            signal_state.clone(),
+        );
+        let call = core::future::pending::<wasmtime::Result<()>>();
+        let wakes = Arc::new(CountingWaker::default());
+        let waker = core::task::Waker::from(wakes.clone());
+        let mut cx = core::task::Context::from_waker(&waker);
+        let mut driven = core::pin::pin!(turns.drive(call));
+
+        assert!(driven.as_mut().poll(&mut cx).is_pending());
+        signal_state.raise(9);
+        assert_eq!(
+            registry.request_kill(instance.id(), crate::KillReason::Operator, 0),
+            crate::KillOutcome::Requested
+        );
+        assert!(
+            wakes.wakes.load(AtomicOrdering::Acquire) >= 1,
+            "the raise wakes the turn"
+        );
+        let core::task::Poll::Ready(Err(error)) = driven.as_mut().poll(&mut cx) else {
+            panic!("the signal ends the suspended call");
+        };
+        assert_eq!(preview1_exit_status(&error, None), Some(137));
+        assert_eq!(signal_state.take_pending(), None, "delivered once");
     }
 
     /// A call that returns with no signal pending keeps its own result.

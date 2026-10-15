@@ -9,6 +9,16 @@
 //! that future's wrapper, so a synchronous host call, which neither
 //! suspends the fiber nor leaves the poll, does no accounting at all.
 //!
+//! It is also where a stop reaches a guest that is not running. A guest
+//! suspended in a host future meets no epoch check, and the future may
+//! never resolve: a sleep, a socket read with no peer, a channel nobody
+//! sends on. So while the call is suspended its turn waits on the
+//! instance's condemnation and on the store's own stop beside the call,
+//! and when either is raised it drops the call, which is how Wasmtime
+//! cancels a suspended fiber: the fiber is resumed only to unwind, its
+//! host future is dropped on the way, and its stack goes back to the
+//! pool.
+//!
 //! The wrapper goes around the outermost call that drives a store, never
 //! around a call a host function makes back into its own guest: the
 //! outer turn already holds the processor for it, and a nested turn of
@@ -22,26 +32,75 @@ use helios_hal::cpu::Cpu;
 use pin_project_lite::pin_project;
 
 use super::{ComponentRuntimeState, InstanceKilled, SocketRetirementQueue};
-use crate::{ProfileScope, StoreTurns};
+use crate::{NotifyWaiter, ProfileScope, StoreTurns};
+
+/// How a store's own stop, one that is not its instance's condemnation,
+/// wakes a turn whose guest is suspended.
+///
+/// # Concurrency
+///
+/// The stop may be raised from any processor while the turn that waits
+/// for it is parked on another, so raising it is a broadcast that stores
+/// nothing. The turn arms its wait before it reads the stop
+/// ([`TurnEpilogue::take_stop`]), so a stop raised between the read and
+/// the park still completes the wait.
+pub trait StopWake {
+    /// One turn's armed wait.
+    type Wait;
+
+    /// Arm a wait that completes on a stop raised from this point on.
+    fn arm_stop_wait(&self) -> Self::Wait;
+
+    /// Poll a wait armed by [`Self::arm_stop_wait`]. `Ready` means a
+    /// stop may have been raised since the wait was armed, and re-arms
+    /// the wait.
+    fn poll_stop_wait(&self, cx: &mut Context<'_>, wait: &mut Self::Wait) -> Poll<()>;
+}
 
 /// What a store does when one of its turns ends, and when the call it
-/// is driving completes, beyond the accounting every store does.
-pub trait TurnEpilogue<RuntimeStateImpl, Error> {
+/// is driving completes or is stopped, beyond the accounting every
+/// store does.
+pub trait TurnEpilogue<RuntimeStateImpl, Error>: StopWake {
     fn end_turn(&self, runtime_state: &RuntimeStateImpl);
 
-    /// The stop the store owes its guest at the moment the call
-    /// completes, if any. It ends the call ahead of a condemnation and
-    /// ahead of whatever the call returned, as an event the guest met
-    /// on its way back to the host would have.
-    fn end_call(&self) -> Option<Error>;
+    /// The stop the store owes its guest, if any, taken so it is
+    /// delivered once. It is read before the call is resumed, after
+    /// each wake of a suspended call, and when the call completes, and
+    /// it ends the call ahead of a condemnation and ahead of whatever
+    /// the call returned, as an event the guest met on its way back to
+    /// the host would have.
+    fn take_stop(&self) -> Option<Error>;
+}
+
+/// A store with no stop of its own: its wait never completes.
+impl StopWake for () {
+    type Wait = ();
+
+    fn arm_stop_wait(&self) {}
+
+    fn poll_stop_wait(&self, _: &mut Context<'_>, (): &mut ()) -> Poll<()> {
+        Poll::Pending
+    }
 }
 
 /// A store with nothing of its own to do at the end of a turn.
 impl<RuntimeStateImpl, Error> TurnEpilogue<RuntimeStateImpl, Error> for () {
     fn end_turn(&self, _: &RuntimeStateImpl) {}
 
-    fn end_call(&self) -> Option<Error> {
+    fn take_stop(&self) -> Option<Error> {
         None
+    }
+}
+
+/// A component store has no stop of its own: only its instance's
+/// condemnation ends a suspended call.
+impl StopWake for SocketRetirementQueue {
+    type Wait = ();
+
+    fn arm_stop_wait(&self) {}
+
+    fn poll_stop_wait(&self, _: &mut Context<'_>, (): &mut ()) -> Poll<()> {
+        Poll::Pending
     }
 }
 
@@ -59,7 +118,7 @@ where
         }
     }
 
-    fn end_call(&self) -> Option<Error> {
+    fn take_stop(&self) -> Option<Error> {
         None
     }
 }
@@ -77,6 +136,7 @@ impl<CpuImpl, RuntimeStateImpl, Epilogue> GuestTurns<CpuImpl, RuntimeStateImpl, 
 where
     CpuImpl: Cpu + Clone,
     RuntimeStateImpl: ComponentRuntimeState,
+    Epilogue: StopWake,
 {
     pub fn new(
         turns: StoreTurns,
@@ -94,12 +154,55 @@ where
 
     /// Drive `call`, the outermost call into the store, one turn per
     /// poll.
+    ///
+    /// The waits for a condemnation and for the store's own stop are
+    /// armed here, before anything reads either, so a stop raised at
+    /// any point after this call reaches the call.
     pub fn drive<Call>(self, call: Call) -> OnProcessor<Call, CpuImpl, RuntimeStateImpl, Epilogue> {
-        OnProcessor { call, turns: self }
+        OnProcessor {
+            kill_wait: self.turns.arm_kill_wait(),
+            stop_wait: self.epilogue.arm_stop_wait(),
+            call: Some(call),
+            turns: self,
+        }
     }
 
     fn now_nanos(&self) -> u64 {
         self.runtime_state.uptime_nanos(self.cpu.now().ticks())
+    }
+
+    /// Run `work` as one turn of the store on the executing processor.
+    fn on_processor<Error, Output>(&self, work: impl FnOnce() -> Output) -> Output
+    where
+        Epilogue: TurnEpilogue<RuntimeStateImpl, Error>,
+    {
+        let turn = self.turns.begin(self.now_nanos());
+        let output = work();
+        let elapsed = turn.end(self.now_nanos());
+        if self.runtime_state.profiling_enabled() {
+            self.runtime_state.record_profile_stack_parts_nanos(
+                ProfileScope::User,
+                "user;",
+                self.turns.instance().name(),
+                elapsed,
+            );
+        }
+        self.epilogue.end_turn(&self.runtime_state);
+        output
+    }
+
+    /// The stop the call owes its guest now, if any: the store's own
+    /// first, then its instance's condemnation.
+    fn stop<Error>(&self) -> Option<Error>
+    where
+        Error: From<InstanceKilled>,
+        Epilogue: TurnEpilogue<RuntimeStateImpl, Error>,
+    {
+        self.epilogue.take_stop().or_else(|| {
+            self.turns
+                .pending_kill()
+                .map(|reason| Error::from(InstanceKilled { reason }))
+        })
     }
 }
 
@@ -107,18 +210,38 @@ pin_project! {
     /// A call into a store's guest, accounted one processor turn per
     /// poll.
     ///
-    /// A completing call first meets the store's own stop
-    /// ([`TurnEpilogue::end_call`], a pending signal, for one),
-    /// then its instance's condemnation, and only then reports its
-    /// result. A guest that is still running meets both at its next
-    /// epoch check, which raising either makes immediate; a call that
-    /// returns to the host before it reaches one, its last host call
-    /// having been where the signal or the kill arrived, would
-    /// otherwise end as if nothing had happened.
-    pub struct OnProcessor<Call, CpuImpl, RuntimeStateImpl, Epilogue> {
+    /// A call ends at the first of three things: its own completion, the
+    /// store's own stop ([`TurnEpilogue::take_stop`], a pending signal,
+    /// for one), and its instance's condemnation. Those two stops are
+    /// read before the call is resumed, after every wake while it is
+    /// suspended, and when it completes, in that precedence, and a stop
+    /// ends the call ahead of its result.
+    ///
+    /// A guest that is running meets both stops at its next epoch check,
+    /// which raising either makes immediate. A guest suspended in a host
+    /// future meets none, so the turn waits for both beside the call,
+    /// and a stop raised while the call is suspended drops the call in a
+    /// turn of its own: Wasmtime resumes the fiber only so it can
+    /// unwind, and the unwinding is the instance's processor time and
+    /// memory. A call that returns to the host before it reaches an
+    /// epoch check, its last host call having been where the stop
+    /// arrived, meets it where it completes.
+    ///
+    /// # Concurrency
+    ///
+    /// One task on one processor polls this at a time. Stops are raised
+    /// from any processor, as broadcasts that store nothing; the waits
+    /// for them are armed in [`GuestTurns::drive`] and re-armed by every
+    /// wake, each time before the stops are read again.
+    pub struct OnProcessor<Call, CpuImpl, RuntimeStateImpl, Epilogue>
+    where
+        Epilogue: StopWake,
+    {
         #[pin]
-        call: Call,
+        call: Option<Call>,
         turns: GuestTurns<CpuImpl, RuntimeStateImpl, Epilogue>,
+        kill_wait: NotifyWaiter,
+        stop_wait: Epilogue::Wait,
     }
 }
 
@@ -134,44 +257,60 @@ where
     type Output = Result<Value, Error>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.project();
+        let mut this = self.project();
         let turns = &*this.turns;
-        let turn = turns.turns.begin(turns.now_nanos());
-        let polled = this.call.poll(cx);
-        let elapsed = turn.end(turns.now_nanos());
-        if turns.runtime_state.profiling_enabled() {
-            turns.runtime_state.record_profile_stack_parts_nanos(
-                ProfileScope::User,
-                "user;",
-                turns.turns.instance().name(),
-                elapsed,
-            );
-        }
-        turns.epilogue.end_turn(&turns.runtime_state);
-        let Poll::Ready(result) = polled else {
-            return Poll::Pending;
-        };
-        if let Some(stop) = turns.epilogue.end_call() {
+        // A stop raised since the last poll ends the call without
+        // resuming it: the guest would only meet it at its next epoch
+        // check, and a host future that has not resolved may never let
+        // it get there.
+        if let Some(stop) = turns.stop() {
+            turns.on_processor::<Error, _>(|| this.call.set(None));
             return Poll::Ready(Err(stop));
         }
-        Poll::Ready(match turns.turns.pending_kill() {
-            Some(reason) => Err(Error::from(InstanceKilled { reason })),
-            None => result,
-        })
+        let call = this
+            .call
+            .as_mut()
+            .as_pin_mut()
+            .expect("a guest call was polled after it ended");
+        let polled = turns.on_processor::<Error, _>(|| call.poll(cx));
+        if let Poll::Ready(result) = polled {
+            this.call.set(None);
+            return Poll::Ready(match turns.stop() {
+                Some(stop) => Err(stop),
+                None => result,
+            });
+        }
+        // Suspended. Both waits were armed before the stops were read
+        // above, so a stop raised since then completes one of them here.
+        loop {
+            let killed = turns.turns.poll_kill_wait(cx, this.kill_wait);
+            let stopped = turns.epilogue.poll_stop_wait(cx, this.stop_wait);
+            if killed.is_pending() && stopped.is_pending() {
+                return Poll::Pending;
+            }
+            if let Some(stop) = turns.stop() {
+                turns.on_processor::<Error, _>(|| this.call.set(None));
+                return Poll::Ready(Err(stop));
+            }
+        }
     }
 }
 
 #[cfg(all(test, feature = "wasmtime-runtime"))]
 mod tests {
+    use alloc::boxed::Box;
     use core::future::{Future, poll_fn};
     use core::pin::pin;
     use core::task::{Context, Poll, Waker};
 
     use helios_hal::cpu::{Cpu, current_processor};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use super::GuestTurns;
     use crate::component::{InstanceKilled, RetiredNetworkHandle, StoreSocketRetirement};
-    use crate::test_support::{ManualClockCpu, TestNetworkService, TestRuntimeState};
+    use crate::test_support::{ManualClockCpu, TestCpu, TestNetworkService, TestRuntimeState};
+    use crate::wasmtime_adapter::engine::build_component_engine_for_platform;
     use crate::{
         InstanceActivity, InstanceRegistry, KillOutcome, KillReason, MemoryOwner,
         configure_user_memory_owner_processors, current_user_memory_owner,
@@ -396,5 +535,196 @@ mod tests {
         assert!(poll_once(driven.as_mut()).is_pending());
         assert_eq!(closed.count(), 1);
         assert_eq!(closed.last(), 11);
+    }
+
+    /// Counts the wakes a turn receives.
+    #[derive(Default)]
+    struct CountingWaker {
+        wakes: AtomicUsize,
+    }
+
+    impl CountingWaker {
+        fn wakes(&self) -> usize {
+            self.wakes.load(Ordering::Acquire)
+        }
+    }
+
+    impl std::task::Wake for CountingWaker {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.wakes.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// Records that the value holding it was dropped.
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    /// A guest suspended in a host future that never resolves is woken
+    /// by its instance's condemnation, and the turn ends the call with
+    /// the kill and drops it, rather than waiting for a completion that
+    /// never comes.
+    #[test]
+    fn a_kill_ends_a_call_suspended_in_a_host_future_that_never_resolves() {
+        let registry = InstanceRegistry::new();
+        let instance = registry.register("parked", 0);
+        let activity = InstanceActivity::new(instance.clone(), 0);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard = DropFlag(dropped.clone());
+        let call = async move {
+            let _guard = guard;
+            core::future::pending::<Result<u32, InstanceKilled>>().await
+        };
+        let cpu = ManualClockCpu::new();
+        let turns = GuestTurns::new(
+            activity.turns(),
+            cpu.clone(),
+            TestRuntimeState::default(),
+            (),
+        );
+        let wakes = Arc::new(CountingWaker::default());
+        let waker = Waker::from(wakes.clone());
+        let mut cx = Context::from_waker(&waker);
+        let mut driven = pin!(turns.drive(call));
+
+        assert!(driven.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(wakes.wakes(), 0);
+        assert!(!dropped.load(Ordering::Acquire));
+
+        assert_eq!(
+            registry.request_kill(instance.id(), KillReason::OutOfMemory, 5),
+            KillOutcome::Requested
+        );
+        assert_eq!(wakes.wakes(), 1, "the condemnation wakes the turn");
+        assert_eq!(
+            driven.as_mut().poll(&mut cx),
+            Poll::Ready(Err(InstanceKilled {
+                reason: KillReason::OutOfMemory
+            }))
+        );
+        assert!(
+            dropped.load(Ordering::Acquire),
+            "the call is dropped when the kill ends it"
+        );
+        assert_eq!(
+            registry.idle_instances(cpu.now().ticks(), 0),
+            [],
+            "the turn that dropped the call left the processor"
+        );
+    }
+
+    /// An instance condemned before its call is first polled never runs
+    /// the call: the turn ends it with the kill and drops it unpolled.
+    #[test]
+    fn a_call_of_a_condemned_instance_ends_before_it_runs() {
+        let registry = InstanceRegistry::new();
+        let instance = registry.register("condemned", 0);
+        let activity = InstanceActivity::new(instance.clone(), 0);
+        assert_eq!(
+            registry.request_kill(instance.id(), KillReason::SupervisorRestart, 0),
+            KillOutcome::Requested
+        );
+        let call = poll_fn(|_| -> Poll<Result<u32, InstanceKilled>> {
+            panic!("a condemned instance's call is not resumed")
+        });
+        let turns = GuestTurns::new(
+            activity.turns(),
+            ManualClockCpu::new(),
+            TestRuntimeState::default(),
+            (),
+        );
+        let mut driven = pin!(turns.drive(call));
+
+        assert_eq!(
+            poll_once(driven.as_mut()),
+            Poll::Ready(Err(InstanceKilled {
+                reason: KillReason::SupervisorRestart
+            }))
+        );
+    }
+
+    /// The same, through Wasmtime: a guest call suspended in an async
+    /// host function whose future never resolves is ended by a kill.
+    /// Dropping the call is Wasmtime's cancellation: the fiber is resumed
+    /// only to unwind, the host future is dropped on it, and the fiber's
+    /// stack, the store and the instance's registry entry all go back
+    /// with their owners.
+    #[test]
+    fn a_kill_unwinds_a_fiber_suspended_in_a_host_future_that_never_resolves() {
+        let engine = build_component_engine_for_platform(&TestCpu::without_entropy())
+            .expect("the component engine builds on the test platform");
+        let live_stacks = || {
+            engine
+                .pooling_allocator_metrics()
+                .expect("the component engine uses the pooling allocator")
+                .stacks()
+        };
+        let registry = InstanceRegistry::new();
+        let instance = registry.register("parked-fiber", 0);
+        let activity = InstanceActivity::new(instance.clone(), 0);
+        let turns = GuestTurns::new(
+            activity.turns(),
+            ManualClockCpu::new(),
+            TestRuntimeState::default(),
+            (),
+        );
+        let mut store = wasmtime::Store::new(&engine, activity);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let flag = dropped.clone();
+        let parked = wasmtime::Func::wrap_async(
+            &mut store,
+            move |_: wasmtime::Caller<'_, InstanceActivity>, (): ()| {
+                let guard = DropFlag(flag.clone());
+                Box::new(async move {
+                    let _guard = guard;
+                    core::future::pending::<()>().await;
+                })
+            },
+        );
+        let wakes = Arc::new(CountingWaker::default());
+        let waker = Waker::from(wakes.clone());
+        let mut cx = Context::from_waker(&waker);
+
+        {
+            let mut driven = pin!(turns.drive(parked.call_async(&mut store, &[], &mut [])));
+            assert!(driven.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(
+                live_stacks(),
+                1,
+                "the suspended guest holds its fiber stack"
+            );
+
+            assert_eq!(
+                registry.request_kill(instance.id(), KillReason::Operator, 0),
+                KillOutcome::Requested
+            );
+            assert_eq!(wakes.wakes(), 1, "the condemnation wakes the turn");
+            match driven.as_mut().poll(&mut cx) {
+                Poll::Ready(Err(error)) => assert_eq!(
+                    error.downcast_ref::<InstanceKilled>(),
+                    Some(&InstanceKilled {
+                        reason: KillReason::Operator
+                    })
+                ),
+                other => panic!("the kill ends the call, got {other:?}"),
+            }
+            assert!(
+                dropped.load(Ordering::Acquire),
+                "the fiber unwound past the host future"
+            );
+        }
+
+        drop(store);
+        assert_eq!(live_stacks(), 0, "the fiber stack is back in the pool");
+        drop(instance);
+        assert_eq!(registry.snapshot(0), [], "the registry entry is reclaimed");
     }
 }
