@@ -24,6 +24,8 @@ use walkdir::WalkDir;
 use wasmparser::Parser as WasmParser;
 use wit_component::ComponentEncoder;
 
+mod boot_kernel;
+
 /// Why a `helios-cli` invocation did not do what it was asked.
 ///
 /// One variant per subcommand: each owns the typed error of the work it
@@ -460,6 +462,8 @@ enum LimineError {
         #[source]
         source: io::Error,
     },
+    #[error(transparent)]
+    BootKernel(#[from] boot_kernel::BootKernelError),
     #[error("failed to write {path}: {source}")]
     WriteFatEntry {
         path: &'static str,
@@ -1213,7 +1217,10 @@ fn build_limine_uefi_image(
     image: &Path,
     baud: u32,
 ) -> Result<(), LimineError> {
-    let image_bytes = limine_image_bytes(kernel, bootfs, &limine.efi_bootloader)?;
+    // The disk carries the image without its DWARF; the host keeps the
+    // full file to symbolize against (`boot_kernel`).
+    let kernel = boot_kernel::without_debuginfo(kernel)?;
+    let image_bytes = limine_image_bytes(&kernel, bootfs, &limine.efi_bootloader)?;
     if let Some(parent) = image.parent().filter(|path| !path.as_os_str().is_empty()) {
         fs::create_dir_all(parent).map_err(|source| LimineError::CreateImageDir {
             path: parent.display().to_string(),
@@ -1237,11 +1244,11 @@ fn build_limine_uefi_image(
             source,
         })?;
     write_limine_mbr(&mut image_file, image_bytes)?;
-    write_limine_fat_volume(&mut image_file, image_bytes, kernel, bootfs, limine, baud)
+    write_limine_fat_volume(&mut image_file, image_bytes, &kernel, bootfs, limine, baud)
 }
 
 fn limine_image_bytes(
-    kernel: &Path,
+    kernel: &[u8],
     bootfs: &Path,
     efi_bootloader: &Path,
 ) -> Result<u64, LimineError> {
@@ -1253,7 +1260,8 @@ fn limine_image_bytes(
                 source,
             })
     };
-    let payload_bytes = inspect(kernel)? + inspect(bootfs)? + inspect(efi_bootloader)?;
+    let kernel = u64::try_from(kernel.len()).expect("a kernel image held in memory fits u64");
+    let payload_bytes = kernel + inspect(bootfs)? + inspect(efi_bootloader)?;
     Ok(LIMINE_IMAGE_BYTES.max(payload_bytes + 128 * 1024 * 1024))
 }
 
@@ -1280,7 +1288,7 @@ fn write_limine_mbr(image: &mut fs::File, image_bytes: u64) -> Result<(), Limine
 fn write_limine_fat_volume(
     image: &mut fs::File,
     image_bytes: u64,
-    kernel: &Path,
+    kernel: &[u8],
     bootfs: &Path,
     limine: &LimineToolchain,
     baud: u32,
@@ -1341,7 +1349,12 @@ fn write_limine_fat_volume(
         file.write_all(config.as_bytes())
             .map_err(|source| LimineError::WriteFatEntry { path, source })?;
     }
-    write_file_to_fat(&boot, "helios", kernel)?;
+    let path = "/boot/helios";
+    let mut file = boot
+        .create_file("helios")
+        .map_err(|source| LimineError::CreateFatEntry { path, source })?;
+    file.write_all(kernel)
+        .map_err(|source| LimineError::WriteFatEntry { path, source })?;
     // The user payload, handed to the kernel as a Limine module — the
     // entry's `module_path` names this path.
     write_file_to_fat(&boot, "helios-bootfs", bootfs)?;

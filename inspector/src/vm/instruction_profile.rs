@@ -9,8 +9,12 @@
 //! at the base the guest reports it was loaded at.
 //!
 //! Each line is one location and its sample count: `wasm;<program>;<function>`,
-//! `wasm;<program>;[trampoline]`, `kernel;<function>`, or `unknown` for an
-//! address in neither.
+//! `wasm;<program>;[trampoline]`, `kernel;<outermost>;…;<innermost>`, or
+//! `unknown` for an address in neither. A kernel location is the chain of
+//! functions inlined at the address, read from the image's DWARF: the
+//! function whose symbol contains it first, the one the instruction
+//! belongs to last. Where no DWARF function covers the address, the chain
+//! is the containing symbol alone.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -20,7 +24,10 @@ use helios_inspector_protocol::system::profiling::{
     self as system_profiling, InstructionProfile, InstructionProfileError, SampledCode,
 };
 
-use super::kernel_image::{KernelSymbols, KernelSymbolsError, LoadedKernelSymbols};
+use super::kernel_image::{
+    KernelDebugInfo, KernelSymbols, KernelSymbolsError, LoadedKernelSymbols, parse_image,
+    read_image,
+};
 use super::{FoldedProfileLine, FoldedProfileTemplate};
 use crate::serial::RpcClient;
 
@@ -121,9 +128,19 @@ fn write(
 ) -> Result<(), InstructionProfileOutputError> {
     use std::io::Write as _;
 
-    let symbols = KernelSymbols::read(kernel)
-        .map_err(|source| InstructionProfileOutputError::Symbols { source })?;
-    let folded = render(profile, &symbols.loaded_at(profile.kernel_image_base));
+    let symbols = |source| InstructionProfileOutputError::Symbols { source };
+    let bytes = read_image(kernel).map_err(symbols)?;
+    let image = parse_image(kernel, &bytes).map_err(symbols)?;
+    let table = KernelSymbols::from_image(kernel, &image).map_err(symbols)?;
+    let debug = KernelDebugInfo::from_image(kernel, &image).map_err(symbols)?;
+    let folded = render(
+        profile,
+        &KernelNames {
+            symbols: table.loaded_at(profile.kernel_image_base),
+            debug: &debug,
+        },
+    )
+    .map_err(symbols)?;
     std::fs::write(output, folded).map_err(|source| InstructionProfileOutputError::Write {
         path: output.display().to_string(),
         source,
@@ -144,11 +161,21 @@ fn write(
     .map_err(|source| InstructionProfileOutputError::Report { source })
 }
 
+/// What the kernel's addresses are named with: its symbols, at the base
+/// the guest reported, and its DWARF.
+struct KernelNames<'table> {
+    symbols: LoadedKernelSymbols<'table>,
+    debug: &'table KernelDebugInfo,
+}
+
 /// The folded text of `profile`, heaviest location first.
-fn render(profile: &InstructionProfile, kernel: &LoadedKernelSymbols<'_>) -> String {
+fn render(
+    profile: &InstructionProfile,
+    kernel: &KernelNames<'_>,
+) -> Result<String, KernelSymbolsError> {
     let mut stacks = BTreeMap::<String, u64>::new();
     for sample in &profile.samples {
-        *stacks.entry(stack(&sample.code, kernel)).or_insert(0) += sample.count;
+        *stacks.entry(stack(&sample.code, kernel)?).or_insert(0) += sample.count;
     }
     let mut lines = stacks
         .into_iter()
@@ -160,13 +187,13 @@ fn render(profile: &InstructionProfile, kernel: &LoadedKernelSymbols<'_>) -> Str
             .cmp(&left.weight)
             .then_with(|| left.stack.cmp(&right.stack))
     });
-    FoldedProfileTemplate { lines }
+    Ok(FoldedProfileTemplate { lines }
         .render()
-        .expect("folded profile template rendering is infallible")
+        .expect("folded profile template rendering is infallible"))
 }
 
-fn stack(code: &SampledCode, kernel: &LoadedKernelSymbols<'_>) -> String {
-    match code {
+fn stack(code: &SampledCode, kernel: &KernelNames<'_>) -> Result<String, KernelSymbolsError> {
+    Ok(match code {
         SampledCode::Wasm(function) => {
             let name = match &function.name {
                 // A Rust program's name section may carry mangled
@@ -177,14 +204,25 @@ fn stack(code: &SampledCode, kernel: &LoadedKernelSymbols<'_>) -> String {
             format!("wasm;{};{name}", frame(&function.module))
         }
         SampledCode::WasmTrampoline(module) => format!("wasm;{};[trampoline]", frame(module)),
-        SampledCode::Native(address) if kernel.contains_text(*address) => {
-            match kernel.symbolize(*address) {
-                Some(symbol) => format!("kernel;{}", frame(&symbol.function)),
-                None => "kernel;[unsymbolized]".to_owned(),
+        SampledCode::Native(address) if kernel.symbols.contains_text(*address) => {
+            let chain = kernel
+                .debug
+                .inline_chain(kernel.symbols.link_address(*address))?;
+            if chain.is_empty() {
+                match kernel.symbols.symbolize(*address) {
+                    Some(symbol) => format!("kernel;{}", frame(&symbol.function)),
+                    None => "kernel;[unsymbolized]".to_owned(),
+                }
+            } else {
+                let frames = chain
+                    .iter()
+                    .map(|function| frame(function))
+                    .collect::<Vec<_>>();
+                format!("kernel;{}", frames.join(";"))
             }
         }
         SampledCode::Native(_) => "unknown".to_owned(),
-    }
+    })
 }
 
 /// One frame of a folded stack: `;` separates frames and a line ends the
@@ -195,23 +233,127 @@ fn frame(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use gimli::write::{Address, AttributeValue, DwarfUnit, EndianVec, Sections, UnitEntryId};
+    use gimli::{Encoding, Format, LittleEndian, RunTimeEndian};
     use helios_inspector_protocol::system::profiling::{
         InstructionProfile, InstructionSample, SampledCode, WasmFunction,
     };
 
-    use super::render;
-    use crate::vm::kernel_image::{Function, KernelSymbols};
+    use super::{KernelNames, render};
+    use crate::vm::kernel_image::{DwarfReader, Function, KernelDebugInfo, KernelSymbols};
+
+    const PARK: u64 = 0xffff_ffff_8000_1000;
+
+    /// A subprogram DIE under `parent` with the given names.
+    fn function(
+        dwarf: &mut DwarfUnit,
+        parent: UnitEntryId,
+        linkage_name: Option<&str>,
+        name: &str,
+    ) -> UnitEntryId {
+        let id = dwarf.unit.add(parent, gimli::DW_TAG_subprogram);
+        let entry = dwarf.unit.get_mut(id);
+        if let Some(linkage_name) = linkage_name {
+            entry.set(
+                gimli::DW_AT_linkage_name,
+                AttributeValue::String(linkage_name.as_bytes().to_vec()),
+            );
+        }
+        entry.set(
+            gimli::DW_AT_name,
+            AttributeValue::String(name.as_bytes().to_vec()),
+        );
+        id
+    }
+
+    /// Gives the DIE `id` the code range `start..start + length`.
+    fn code_range(dwarf: &mut DwarfUnit, id: UnitEntryId, start: u64, length: u64) {
+        let entry = dwarf.unit.get_mut(id);
+        entry.set(
+            gimli::DW_AT_low_pc,
+            AttributeValue::Address(Address::Constant(start)),
+        );
+        entry.set(gimli::DW_AT_high_pc, AttributeValue::Udata(length));
+    }
+
+    /// An inlined call of `origin` under `parent`, over
+    /// `start..start + length`.
+    fn inlined(
+        dwarf: &mut DwarfUnit,
+        parent: UnitEntryId,
+        origin: UnitEntryId,
+        start: u64,
+        length: u64,
+    ) -> UnitEntryId {
+        let id = dwarf.unit.add(parent, gimli::DW_TAG_inlined_subroutine);
+        dwarf.unit.get_mut(id).set(
+            gimli::DW_AT_abstract_origin,
+            AttributeValue::UnitRef(origin),
+        );
+        code_range(dwarf, id, start, length);
+        id
+    }
+
+    /// The DWARF an optimised build gives `park`: `wait` inlined over its
+    /// first eight bytes, and `relax`, which carries only its short name,
+    /// inlined into `wait` over two of them. `rdtsc_now`, past `park`, has
+    /// a symbol and no DWARF, as code assembled without debuginfo does.
+    fn debug_info() -> KernelDebugInfo {
+        let mut dwarf = DwarfUnit::new(Encoding {
+            format: Format::Dwarf32,
+            version: 4,
+            address_size: 8,
+        });
+        let root = dwarf.unit.root();
+        dwarf.unit.get_mut(root).set(
+            gimli::DW_AT_language,
+            AttributeValue::Language(gimli::DW_LANG_Rust),
+        );
+        code_range(&mut dwarf, root, PARK, 0x100);
+        let wait = function(
+            &mut dwarf,
+            root,
+            Some("_RNvNtCs1234_13helios_kernel4exec4wait"),
+            "wait",
+        );
+        let relax = function(&mut dwarf, root, None, "relax");
+        let park = function(
+            &mut dwarf,
+            root,
+            Some("_RNvNtCs1234_13helios_kernel4exec4park"),
+            "park",
+        );
+        code_range(&mut dwarf, park, PARK, 0x100);
+        let waiting = inlined(&mut dwarf, park, wait, PARK, 0x8);
+        inlined(&mut dwarf, waiting, relax, PARK + 0x4, 0x2);
+        let mut sections = Sections::new(EndianVec::new(LittleEndian));
+        dwarf
+            .write(&mut sections)
+            .expect("the test DWARF is well formed");
+        let dwarf = gimli::Dwarf::load(|section| {
+            let bytes: Arc<[u8]> = match sections.get(section) {
+                Some(data) => Arc::from(data.slice()),
+                None => Arc::from([]),
+            };
+            Ok::<_, gimli::Error>(DwarfReader::new(bytes, RunTimeEndian::Little))
+        })
+        .expect("loading in-memory sections cannot fail");
+        KernelDebugInfo::from_dwarf(Path::new("test-kernel"), dwarf).expect("the test DWARF parses")
+    }
 
     #[test]
-    fn samples_fold_into_wasm_kernel_and_unknown_frames() {
-        let text = 0xffff_ffff_8000_1000..0xffff_ffff_8000_2000;
+    fn samples_fold_into_wasm_frames_kernel_inline_chains_and_unknown() {
+        let text = PARK..0xffff_ffff_8000_2000;
         let symbols = KernelSymbols::new(
             0xffff_ffff_8000_0000,
             vec![text],
             vec![
                 Function {
                     name: "_RNvNtCs1234_13helios_kernel4exec4park".to_owned(),
-                    address: 0xffff_ffff_8000_1000,
+                    address: PARK,
                     size: 0x100,
                 },
                 Function {
@@ -221,6 +363,7 @@ mod tests {
                 },
             ],
         );
+        let debug = debug_info();
         let function = |name: Option<&str>, index| {
             SampledCode::Wasm(WasmFunction {
                 module: "python3;bad".to_owned(),
@@ -237,10 +380,21 @@ mod tests {
                     code: function(Some("_PyEval_EvalFrameDefault"), 7),
                     count: 40,
                 },
+                // Inside `relax`, inlined into `wait`, inlined into `park`.
                 InstructionSample {
                     code: SampledCode::Native(0xffff_ffff_8120_1004),
                     count: 12,
                 },
+                InstructionSample {
+                    code: SampledCode::Native(0xffff_ffff_8120_1005),
+                    count: 4,
+                },
+                // Inside `wait`, past `relax`.
+                InstructionSample {
+                    code: SampledCode::Native(0xffff_ffff_8120_1006),
+                    count: 6,
+                },
+                // `park`'s own code, one past the end of `wait`.
                 InstructionSample {
                     code: SampledCode::Native(0xffff_ffff_8120_1008),
                     count: 3,
@@ -248,6 +402,11 @@ mod tests {
                 InstructionSample {
                     code: SampledCode::Native(0xffff_ffff_8120_1104),
                     count: 5,
+                },
+                // Text, but in no symbol and no DWARF function.
+                InstructionSample {
+                    code: SampledCode::Native(0xffff_ffff_8120_1800),
+                    count: 1,
                 },
                 InstructionSample {
                     code: function(None, 9),
@@ -265,15 +424,25 @@ mod tests {
             dropped: 0,
         };
 
-        let folded = render(&profile, &symbols.loaded_at(profile.kernel_image_base));
+        let folded = render(
+            &profile,
+            &KernelNames {
+                symbols: symbols.loaded_at(profile.kernel_image_base),
+                debug: &debug,
+            },
+        )
+        .expect("every address resolves against the test DWARF");
 
         assert_eq!(
             folded,
             "wasm;python3_bad;_PyEval_EvalFrameDefault 40\n\
-             kernel;helios_kernel::exec::park 15\n\
+             kernel;helios_kernel::exec::park;helios_kernel::exec::wait;relax 16\n\
+             kernel;helios_kernel::exec::park;helios_kernel::exec::wait 6\n\
              kernel;rdtsc_now 5\n\
+             kernel;helios_kernel::exec::park 3\n\
              wasm;python3_bad;[trampoline] 2\n\
              wasm;python3_bad;func[1:9] 2\n\
+             kernel;[unsymbolized] 1\n\
              unknown 1\n"
         );
     }
