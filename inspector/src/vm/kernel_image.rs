@@ -38,6 +38,25 @@ pub(crate) fn function_symbols<'data, 'file>(
         })
 }
 
+/// The bytes of the kernel image at `path`.
+pub(crate) fn read_image(path: &Path) -> Result<Vec<u8>, KernelSymbolsError> {
+    std::fs::read(path).map_err(|source| KernelSymbolsError::Read {
+        path: path.display().to_string(),
+        source,
+    })
+}
+
+/// `bytes`, read from `path`, parsed as an object file.
+pub(crate) fn parse_image<'data>(
+    path: &Path,
+    bytes: &'data [u8],
+) -> Result<object::File<'data>, KernelSymbolsError> {
+    object::File::parse(bytes).map_err(|source| KernelSymbolsError::Symbols {
+        path: path.display().to_string(),
+        source,
+    })
+}
+
 /// Why the kernel image could not be turned into a symbol table.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum KernelSymbolsError {
@@ -98,16 +117,21 @@ impl KernelSymbols {
     /// Reads the function symbols and the link base out of the ELF at
     /// `path`.
     pub(crate) fn read(path: &Path) -> Result<Self, KernelSymbolsError> {
+        let bytes = read_image(path)?;
+        Self::from_image(path, &parse_image(path, &bytes)?)
+    }
+
+    /// The function symbols and the link base of an already parsed image;
+    /// `path` names it in errors.
+    pub(crate) fn from_image(
+        path: &Path,
+        image: &object::File<'_>,
+    ) -> Result<Self, KernelSymbolsError> {
         let display = || path.display().to_string();
-        let bytes = std::fs::read(path).map_err(|source| KernelSymbolsError::Read {
-            path: display(),
-            source,
-        })?;
         let symbols = |source| KernelSymbolsError::Symbols {
             path: display(),
             source,
         };
-        let image = object::File::parse(&*bytes).map_err(symbols)?;
         // `object` yields only `PT_LOAD` entries as an ELF's segments.
         let link_base = image
             .segments()
@@ -140,7 +164,7 @@ impl KernelSymbols {
         if text.is_empty() {
             return Err(KernelSymbolsError::NoExecutableSegment { path: display() });
         }
-        let functions = function_symbols(&image)
+        let functions = function_symbols(image)
             .map(|symbol| {
                 symbol.map(|symbol| Function {
                     name: symbol.name.to_owned(),
@@ -162,6 +186,12 @@ impl KernelSymbols {
             text,
             functions,
         }
+    }
+
+    /// The table at the addresses the image was linked to: what a reader of
+    /// the ELF file itself, rather than of a running guest, symbolizes.
+    pub(crate) fn linked(&self) -> LoadedKernelSymbols<'_> {
+        self.loaded_at(self.link_base)
     }
 
     /// The table as seen from a kernel the bootloader placed at

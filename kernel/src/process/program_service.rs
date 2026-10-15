@@ -116,13 +116,14 @@ const RUNTIME_MESSAGE_CAPACITY: usize = 112;
 pub struct RuntimeMessage(ArrayString<RUNTIME_MESSAGE_CAPACITY>);
 
 impl RuntimeMessage {
-    /// Records `message`, truncated at [`RUNTIME_MESSAGE_CAPACITY`].
+    /// Records `message`'s alternate display, which carries Wasmtime's cause
+    /// chain, truncated at [`RUNTIME_MESSAGE_CAPACITY`].
     pub fn of(message: impl fmt::Display) -> Self {
         let mut text = Truncating(ArrayString::new());
         // `Truncating` never fails, so the message is recorded in full or cut
         // at capacity; neither outcome is an error worth propagating out of a
         // diagnostic.
-        let _ = write!(text, "{message}");
+        let _ = write!(text, "{message:#}");
         Self(text.0)
     }
 

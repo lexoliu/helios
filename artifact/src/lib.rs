@@ -43,6 +43,7 @@ pub fn cwasm_target_supports_wasm_simd(target: &str) -> bool {
     !target.starts_with("riscv64")
 }
 
+/// Returns the ISA flags shared by host prebuilds and in-kernel compilation.
 pub fn cwasm_target_cranelift_flags(target: &str) -> &'static [&'static str] {
     if target.starts_with("aarch64-") {
         return &["has_lse", "has_fp16"];
@@ -58,6 +59,17 @@ pub fn cwasm_target_cranelift_flags(target: &str) -> &'static [&'static str] {
             "has_bmi1",
             "has_bmi2",
             "has_lzcnt",
+            // This is x86-64-v3 (AVX2/FMA/BMI/LZCNT), exposed by every x86
+            // cloud KVM instance type. AVX-512 is excluded because artifacts
+            // are compiled once for host prebuild/bootfs and the in-kernel
+            // compiler plugin with this same set, while much of the x86 KVM
+            // fleet lacks AVX-512. Kernel engines call
+            // Config::detect_host_feature(detect_x86_native_feature), and
+            // Wasmtime rejects unavailable enabled ISA flags before mapping
+            // an artifact's code.
+            "has_avx",
+            "has_avx2",
+            "has_fma",
         ];
     }
     &[]

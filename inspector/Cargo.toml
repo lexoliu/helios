@@ -32,6 +32,8 @@ nu-ansi-term = "0.50.3"
 # Reads the kernel image's function symbols: the denominator of the
 # profile-use build's uncovered-function count (#329).
 object = { version = "0.39", default-features = false, features = ["elf", "read", "std"] }
+# Decodes executable x86 kernel sections to enforce legacy encodings.
+iced-x86 = { version = "1.21.0", default-features = false, features = ["std", "decoder", "instr_info"] }
 ratatui = "0.30.0"
 # Names the function each vCPU of a wedged guest was executing.
 rustc-demangle = "0.1.28"
