@@ -1285,9 +1285,11 @@ extern "C" fn wasmtime_init_traps(handler: helios_kernel::KernelNativeTrapHandle
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn wasmtime_parking_wait(_timeout_nanos: u64) {
-    core::hint::spin_loop();
+extern "C" fn wasmtime_parking_wait(timeout_nanos: u64) {
+    helios_kernel::park_wasmtime_waiter(smp::current_runtime().timer(), timeout_nanos);
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn wasmtime_parking_unpark() {}
+extern "C" fn wasmtime_parking_unpark() {
+    helios_kernel::unpark_wasmtime_waiters();
+}

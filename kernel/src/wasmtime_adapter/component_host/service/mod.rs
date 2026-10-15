@@ -113,7 +113,27 @@ const WASIX_STREAM_SECURITY_DOUBLE_ENCRYPTION: u8 = 1 << 3;
 const DEFAULT_WASIX_EXEC_SEARCH_PATHS: &[&str] = &["/usr/local/bin", "/bin", "/usr/bin"];
 type Preview1Iovs = SmallVec<[(u32, u32); 8]>;
 type Preview1IovRanges = SmallVec<[(usize, usize); 8]>;
-type CompilerThreadTasks = SmallVec<[crate::JoinHandle<()>; 8]>;
+type CompilerThreadTasks = SmallVec<[crate::JoinHandle<CompilerThreadReport>; 8]>;
+type CompilerThreadReports = SmallVec<[CompilerThreadReport; 8]>;
+type CompilerPluginHandle<CpuImpl, Net, HostFs> = Arc<CompilerPluginRuntime<CpuImpl, Net, HostFs>>;
+
+#[derive(Clone, Copy, Default)]
+struct CompilerPhaseTimestamps {
+    processor: u16,
+    entered_ns: u64,
+    slot_acquired_ns: u64,
+    plugin_ready_ns: u64,
+    instantiated_ns: u64,
+    input_done_ns: u64,
+    compile_started_ns: u64,
+    compile_returned_ns: u64,
+    diagnostic_done_ns: u64,
+    response_done_ns: u64,
+    tasks_joined_ns: u64,
+    signed_ns: u64,
+    verified_ns: u64,
+    plugin_cached: bool,
+}
 
 const WASIX_PROC_SPAWN_FD_OP_SIZE: u32 = 56;
 const WASIX_PROC_SPAWN_FD_OP_CMD_OFFSET: u32 = 0;
@@ -245,6 +265,14 @@ where
 {
     pub(crate) fn spawner(&self) -> crate::Spawner<CpuImpl> {
         self.spawner.clone()
+    }
+
+    pub(crate) fn cpu(&self) -> CpuImpl {
+        self.cpu.clone()
+    }
+
+    pub(crate) fn write_serial(&self) -> crate::DebugSerialWriter {
+        self.write_serial
     }
 }
 
@@ -1621,15 +1649,53 @@ where
         hint: AotCompileHint,
         profile: bool,
     ) -> Result<Vec<u8>, ProgramExecError> {
+        let mut phases = CompilerPhaseTimestamps {
+            processor: if profile {
+                helios_hal::cpu::current_processor().id()
+            } else {
+                0
+            },
+            entered_ns: if profile {
+                monotonic_nanos(&exec_context.cpu)
+            } else {
+                0
+            },
+            ..CompilerPhaseTimestamps::default()
+        };
         let compiler_artifact = self.read_compiler_plugin_artifact(exec_context)?;
         let compiler_payload = trusted_bootfs_payload(&compiler_artifact)?;
-        let payload = self
-            .invoke_compiler_core_module(exec_context, compiler_payload, wasm, hint, profile)
+        let (payload, thread_reports) = self
+            .invoke_compiler_core_module(
+                exec_context,
+                compiler_payload,
+                wasm,
+                hint,
+                profile,
+                &mut phases,
+            )
             .await?;
         let signed =
             cwasm::sign_trusted_artifact_payload(&payload).map_err(map_artifact_trust_error)?;
+        phases.signed_ns = if profile {
+            monotonic_nanos(&exec_context.cpu)
+        } else {
+            0
+        };
         cwasm::verify_signed_artifact(UntrustedCwasm::new(&signed))
             .map_err(map_artifact_trust_error)?;
+        phases.verified_ns = if profile {
+            monotonic_nanos(&exec_context.cpu)
+        } else {
+            0
+        };
+        if profile {
+            emit_compiler_phase_report(
+                exec_context.write_serial,
+                phases,
+                &thread_reports,
+                signed.len(),
+            );
+        }
         Ok(signed)
     }
 
@@ -1640,11 +1706,23 @@ where
         wasm: &Bytes,
         hint: AotCompileHint,
         profile: bool,
-    ) -> Result<Vec<u8>, ProgramExecError> {
+        phases: &mut CompilerPhaseTimestamps,
+    ) -> Result<(Vec<u8>, CompilerThreadReports), ProgramExecError> {
         let _compile_guard = self.acquire_compiler_compile_slot().await;
-        let result =
-            self.invoke_compiler_inner(exec_context, &compiler_payload, wasm, hint, profile);
-        self.await_compiler_thread_tasks().await;
+        phases.slot_acquired_ns = if profile {
+            monotonic_nanos(&exec_context.cpu)
+        } else {
+            0
+        };
+        let result = self
+            .invoke_compiler_inner(exec_context, &compiler_payload, wasm, hint, profile, phases)
+            .await;
+        let thread_reports = self.await_compiler_thread_tasks().await;
+        phases.tasks_joined_ns = if profile {
+            monotonic_nanos(&exec_context.cpu)
+        } else {
+            0
+        };
         // Plugin supervisor: on a kill or fatal-state error, drop the
         // cached runtime so the next call rebuilds the Module +
         // SharedMemory + InstancePre from scratch. This is the
@@ -1660,7 +1738,7 @@ where
             );
             *self.inner.compiler_plugin.lock() = None;
         }
-        result
+        result.map(|payload| (payload, thread_reports))
     }
 
     async fn acquire_compiler_compile_slot(&self) -> CompilerCompileSlot<'_> {
@@ -1684,7 +1762,8 @@ where
         }
     }
 
-    async fn await_compiler_thread_tasks(&self) {
+    async fn await_compiler_thread_tasks(&self) -> CompilerThreadReports {
+        let mut reports = CompilerThreadReports::new();
         loop {
             let tasks = self
                 .inner
@@ -1704,20 +1783,29 @@ where
                 break;
             }
             for task in tasks {
-                task.await;
+                reports.push(task.await);
             }
         }
+        reports
     }
 
-    fn invoke_compiler_inner(
+    async fn invoke_compiler_inner(
         &self,
         exec_context: &ProgramExecContext<CpuImpl, Net, HostFs>,
         compiler_payload: &Bytes,
         wasm: &Bytes,
         hint: AotCompileHint,
         profile: bool,
+        phases: &mut CompilerPhaseTimestamps,
     ) -> Result<Vec<u8>, ProgramExecError> {
-        let plugin = self.ensure_compiler_plugin(exec_context, compiler_payload)?;
+        let (plugin, plugin_cached) =
+            self.ensure_compiler_plugin(exec_context, compiler_payload)?;
+        phases.plugin_cached = plugin_cached;
+        phases.plugin_ready_ns = if profile {
+            monotonic_nanos(&exec_context.cpu)
+        } else {
+            0
+        };
         let engine = self.inner.engine.raw();
         let started_at = exec_context
             .runtime_state
@@ -1741,13 +1829,16 @@ where
         configure_compiler_core_store(&mut store);
         let instance = plugin
             .instance_pre
-            .instantiate(&mut store)
+            .instantiate_async(&mut store)
+            .await
             .map_err(map_program_runtime_error)?;
-        let tls_base = compiler_tls_base(&mut store, &instance)?;
+        let tls_base = plugin.main_thread_tls_base;
+        set_compiler_tls_base(&mut store, &instance, tls_base)?;
         let pthread_self_offset = instance
             .get_typed_func::<(), i32>(&mut store, HELIOS_COMPILER_PTHREAD_SELF_OFFSET)
             .map_err(map_program_runtime_error)?
-            .call(&mut store, ())
+            .call_async(&mut store, ())
+            .await
             .map_err(map_program_runtime_error)? as u32;
         let thread_pointer = tls_base
             .checked_add(pthread_self_offset)
@@ -1759,7 +1850,8 @@ where
             .get_typed_func::<i32, ()>(&mut store, HELIOS_COMPILER_INITIALIZE)
             .map_err(map_program_runtime_error)?;
         initialize
-            .call(&mut store, thread_pointer as i32)
+            .call_async(&mut store, thread_pointer as i32)
+            .await
             .map_err(map_program_runtime_error)?;
         let alloc = instance
             .get_typed_func::<(i32, i32), i32>(&mut store, HELIOS_COMPILER_ALLOC)
@@ -1767,15 +1859,21 @@ where
         let compile = instance
             .get_typed_func::<(i32, i32), i32>(&mut store, HELIOS_COMPILER_COMPILE)
             .map_err(map_program_runtime_error)?;
+        phases.instantiated_ns = if profile {
+            monotonic_nanos(&exec_context.cpu)
+        } else {
+            0
+        };
         let target = env!("HELIOS_BUILD_TARGET").as_bytes();
-        let wasm_ptr = compiler_alloc(&mut store, &alloc, wasm.len(), 1)?;
-        let target_ptr = compiler_alloc(&mut store, &alloc, target.len(), 1)?;
+        let wasm_ptr = compiler_alloc(&mut store, &alloc, wasm.len(), 1).await?;
+        let target_ptr = compiler_alloc(&mut store, &alloc, target.len(), 1).await?;
         let request_ptr = compiler_alloc(
             &mut store,
             &alloc,
             core::mem::size_of::<CompilerRequestHeader>(),
             core::mem::align_of::<CompilerRequestHeader>(),
-        )?;
+        )
+        .await?;
         write_shared_memory(store.data().memory(), wasm_ptr, wasm)?;
         write_shared_memory(store.data().memory(), target_ptr, target)?;
         let header = CompilerRequestHeader {
@@ -1801,14 +1899,31 @@ where
                 core::mem::size_of::<CompilerRequestHeader>(),
             )
         })?;
+        phases.input_done_ns = if profile {
+            monotonic_nanos(&exec_context.cpu)
+        } else {
+            0
+        };
+        phases.compile_started_ns = if profile {
+            monotonic_nanos(&exec_context.cpu)
+        } else {
+            0
+        };
         let compile_started = store.data().cpu.now().ticks();
-        let response_ptr = compile.call(
-            &mut store,
-            (
-                request_ptr as i32,
-                core::mem::size_of::<CompilerRequestHeader>() as i32,
-            ),
-        );
+        let response_ptr = compile
+            .call_async(
+                &mut store,
+                (
+                    request_ptr as i32,
+                    core::mem::size_of::<CompilerRequestHeader>() as i32,
+                ),
+            )
+            .await;
+        phases.compile_returned_ns = if profile {
+            monotonic_nanos(&exec_context.cpu)
+        } else {
+            0
+        };
         let compile_elapsed = store
             .data()
             .cpu
@@ -1844,11 +1959,22 @@ where
         if !diagnostic.is_empty() {
             store.data().write_serial.emit(&diagnostic);
         }
-        read_shared_memory(
+        phases.diagnostic_done_ns = if profile {
+            monotonic_nanos(&exec_context.cpu)
+        } else {
+            0
+        };
+        let output = read_shared_memory(
             store.data().memory(),
             response.precompiled_ptr,
             response.precompiled_len,
-        )
+        )?;
+        phases.response_done_ns = if profile {
+            monotonic_nanos(&exec_context.cpu)
+        } else {
+            0
+        };
+        Ok(output)
     }
 
     fn read_compiler_plugin_artifact(
@@ -1873,10 +1999,10 @@ where
         &self,
         exec_context: &ProgramExecContext<CpuImpl, Net, HostFs>,
         compiler_payload: &Bytes,
-    ) -> Result<Arc<CompilerPluginRuntime<CpuImpl, Net, HostFs>>, ProgramExecError> {
+    ) -> Result<(CompilerPluginHandle<CpuImpl, Net, HostFs>, bool), ProgramExecError> {
         let mut slot = self.inner.compiler_plugin.lock();
         if let Some(plugin) = slot.as_ref() {
-            return Ok(plugin.clone());
+            return Ok((plugin.clone(), true));
         }
 
         // The compiler plugin is a precompiled core module; a component
@@ -1938,24 +2064,85 @@ where
             write_serial: exec_context.write_serial,
             _marker: core::marker::PhantomData,
         };
-        let scratch_store = wasmtime::Store::new(engine, scratch_store_data);
+        let mut scratch_store = wasmtime::Store::new(engine, scratch_store_data);
         define_compiler_shared_memory(&mut linker, &scratch_store, &module, shared_memory)?;
-        drop(scratch_store);
 
         let instance_pre = Arc::new(
             linker
                 .instantiate_pre(&module)
                 .map_err(map_program_runtime_error)?,
         );
+        configure_compiler_core_store(&mut scratch_store);
+        let scratch_instance = instance_pre
+            .instantiate(&mut scratch_store)
+            .map_err(map_program_runtime_error)?;
+        let main_thread_tls_base = compiler_tls_base(&mut scratch_store, &scratch_instance)?;
+        if main_thread_tls_base == 0 {
+            tracing::error!("compiler plugin start did not publish a static TLS block");
+            return Err(ProgramExecError {
+                kind: ProgramExecErrorKind::InvalidBinary,
+                detail: ProgramExecErrorDetail::CompilerPluginInvalid,
+            });
+        }
+        drop(scratch_store);
         shared.instance_pre.call_once(|| instance_pre.clone());
 
         let _ = module; // InstancePre holds the Module via Arc internally.
         let plugin = Arc::new(CompilerPluginRuntime {
             instance_pre,
             shared,
+            main_thread_tls_base,
         });
         *slot = Some(plugin.clone());
-        Ok(plugin)
+        Ok((plugin, false))
+    }
+}
+
+fn emit_compiler_phase_report(
+    write_serial: crate::DebugSerialWriter,
+    phases: CompilerPhaseTimestamps,
+    thread_reports: &CompilerThreadReports,
+    output_bytes: usize,
+) {
+    write_serial.emit_fmt(format_args!(
+        "aot-phases processor={} plugin_cached={} slot_us={} plugin_us={} instantiate_us={} input_us={} compile_us={} diagnostic_us={} output_copy_us={} join_us={} sign_us={} verify_us={} output_bytes={}\n",
+        phases.processor,
+        phases.plugin_cached,
+        phase_us(phases.entered_ns, phases.slot_acquired_ns),
+        phase_us(phases.slot_acquired_ns, phases.plugin_ready_ns),
+        phase_us(phases.plugin_ready_ns, phases.instantiated_ns),
+        phase_us(phases.instantiated_ns, phases.input_done_ns),
+        phase_us(phases.compile_started_ns, phases.compile_returned_ns),
+        phase_us(phases.compile_returned_ns, phases.diagnostic_done_ns),
+        phase_us(phases.diagnostic_done_ns, phases.response_done_ns),
+        phase_us(phases.response_done_ns, phases.tasks_joined_ns),
+        phase_us(phases.tasks_joined_ns, phases.signed_ns),
+        phase_us(phases.signed_ns, phases.verified_ns),
+        output_bytes,
+    ));
+    for report in thread_reports {
+        write_serial.emit_fmt(format_args!(
+            "aot-thread id={} processor={} queued_us={} instantiate_us={} run_us={} start_after_compile_begin_us={} finish_after_compile_end_us={}\n",
+            report.thread_id,
+            report.processor,
+            phase_us(report.spawned_ns, report.started_ns),
+            phase_us(report.started_ns, report.instantiated_ns),
+            phase_us(report.instantiated_ns, report.finished_ns),
+            signed_phase_us(phases.compile_started_ns, report.started_ns),
+            signed_phase_us(phases.compile_returned_ns, report.finished_ns),
+        ));
+    }
+}
+
+fn phase_us(started_ns: u64, finished_ns: u64) -> u64 {
+    finished_ns.saturating_sub(started_ns) / 1_000
+}
+
+fn signed_phase_us(started_ns: u64, finished_ns: u64) -> i64 {
+    if finished_ns >= started_ns {
+        phase_us(started_ns, finished_ns).min(i64::MAX as u64) as i64
+    } else {
+        -(phase_us(finished_ns, started_ns).min(i64::MAX as u64) as i64)
     }
 }
 

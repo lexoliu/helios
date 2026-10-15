@@ -2243,35 +2243,15 @@ extern "C" fn wasmtime_init_traps(handler: helios_kernel::KernelNativeTrapHandle
 #[cfg(target_os = "none")]
 #[unsafe(no_mangle)]
 extern "C" fn wasmtime_parking_wait(timeout_nanos: u64) {
-    if timeout_nanos == 0 {
-        return;
-    }
-    if timeout_nanos == u64::MAX {
-        unsafe {
-            asm!("wfe", options(nomem, nostack, preserves_flags));
-        }
-        return;
-    }
-
-    let ticks = ((u128::from(timeout_nanos) * u128::from(timer_frequency())) / 1_000_000_000)
-        .clamp(1, u128::from(u64::MAX)) as u64;
-    let deadline = read_counter().saturating_add(ticks);
-    while read_counter() < deadline {
-        unsafe {
-            asm!("wfe", options(nomem, nostack, preserves_flags));
-        }
-    }
-}
-
-#[inline]
-fn signal_waiting_processors() {
-    unsafe {
-        asm!("sev", options(nomem, nostack, preserves_flags));
-    }
+    let timer = current_processor_runtime()
+        .timer
+        .get()
+        .expect("AArch64 processor timer was read before it was installed");
+    helios_kernel::park_wasmtime_waiter(timer, timeout_nanos);
 }
 
 #[cfg(target_os = "none")]
 #[unsafe(no_mangle)]
 extern "C" fn wasmtime_parking_unpark() {
-    signal_waiting_processors();
+    helios_kernel::unpark_wasmtime_waiters();
 }

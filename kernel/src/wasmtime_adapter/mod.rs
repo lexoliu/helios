@@ -16,6 +16,8 @@ pub(crate) mod cwasm;
 pub mod engine;
 #[cfg(all(target_os = "none", feature = "wasmtime-bare-metal"))]
 pub(crate) mod fiber_stack;
+#[cfg(all(target_os = "none", feature = "wasmtime-bare-metal"))]
+pub mod parking;
 pub mod store;
 pub mod swap_fault;
 #[cfg(all(target_os = "none", feature = "wasmtime-bare-metal"))]

@@ -1764,6 +1764,7 @@ dependencies = [
 name = "helios-compiler-support"
 version = "0.1.0"
 dependencies = [
+ "cranelift-codegen",
  "helios-artifact",
  "rayon",
  "thiserror 2.0.20",
@@ -2124,6 +2125,7 @@ name = "helios-x86"
 version = "0.1.0"
 dependencies = [
  "acpi",
+ "bitflags 2.13.1",
  "bytes",
  "critical-section",
  "helios-hal",

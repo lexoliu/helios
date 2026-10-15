@@ -673,11 +673,16 @@ macro_rules! impl_program_bindings {
                             }));
                         }
                     };
+                    let write_cpu = context.cpu();
+                    let write_serial = context.write_serial();
                     match write_program_artifact(
                         accessor,
                         &request.destination_path,
                         &artifact,
                         &caller_authority,
+                        &write_cpu,
+                        write_serial,
+                        request.profile,
                     )
                     .await
                     {
@@ -1292,12 +1297,20 @@ async fn write_program_artifact<T, CpuImpl, Net, HostFs>(
     path: &str,
     bytes: &[u8],
     authority: &ProcessAuthority,
+    cpu: &CpuImpl,
+    write_serial: crate::DebugSerialWriter,
+    profile: bool,
 ) -> wasmtime::Result<Result<(), crate::ProgramExecError>>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
+    let started_ns = if profile {
+        crate::monotonic_nanos(cpu)
+    } else {
+        0
+    };
     let absolute =
         crate::resolve_guest_path("/", path).map_err(map_component_fs_path_error_to_wasmtime)?;
     if !authority.can_create_or_replace_path(&absolute) {
@@ -1344,6 +1357,13 @@ where
                     detail: ProgramExecErrorDetail::FilesystemOperationFailed,
                 }
             })?;
+        if profile {
+            write_serial.emit_fmt(format_args!(
+                "aot-write us={} bytes={}\n",
+                crate::monotonic_nanos(cpu).saturating_sub(started_ns) / 1_000,
+                bytes.len(),
+            ));
+        }
         return Ok(Ok(()));
     }
 
@@ -1354,6 +1374,13 @@ where
             .filesystem_mut()
             .write_program_file(&absolute, bytes, now_nanos)
             .map_err(map_fs_error_to_program_exec)?;
+        if profile {
+            write_serial.emit_fmt(format_args!(
+                "aot-write us={} bytes={}\n",
+                crate::monotonic_nanos(cpu).saturating_sub(started_ns) / 1_000,
+                bytes.len(),
+            ));
+        }
         Ok::<_, wasmtime::Error>(Ok(()))
     })
 }

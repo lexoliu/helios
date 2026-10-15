@@ -5,13 +5,32 @@ at `../wasmtime/crates/wasmtime`.
 
 ## Required revision
 
-The local checkout must be at (branch `helios/pooling-host-stack`):
+The local checkout must be at (branch `helios/parallel-compile-steal`):
 
 ```text
-7a17b5375af44664392d2a550e9724be0f1946c4
+f5a2d7baf50962ae777c29ecc792f0eed501c75d
 ```
 
-That revision is `helios/component-instance-memory` at
+That revision is `helios/pooling-host-stack` at
+`7a17b5375af44664392d2a550e9724be0f1946c4` plus one additive commit, which
+makes every parallel compile input its own stealable job:
+
+- `Engine::run_maybe_parallel` hands Rayon
+  `input.into_par_iter().with_max_len(1)` instead of `into_par_iter()`.
+  An indexed parallel iterator splits its input into a few leaves up front
+  and re-splits a leaf only when another worker steals it, so a leaf that
+  holds one heavy function keeps its worker compiling alone after the
+  others have run dry. With one input per job, an idle worker always has
+  the remaining functions to steal.
+- Results are still collected in input order and the first error is still
+  returned deterministically; `run_maybe_parallel_mut` is unchanged.
+
+Helios needs it because the in-kernel compiler plugin compiles every
+module through this call on a small worker pool: on `curl.wasm` one worker
+held the tail of the compile alone for 53–73 ms of a 245–275 ms compile
+(#430).
+
+The revision it replaces is `helios/component-instance-memory` at
 `39819b1f81f3912dddfdcb25de6d5924aef15783` plus one additive commit, which
 lets the pooling allocator honour `Config::with_host_stack`:
 
@@ -34,7 +53,7 @@ committed, with no guard page. The creator is the one route by which the
 kernel can place fiber stacks in memory it commits on demand
 (`kernel/src/memory/fiber_stack.rs`, #288).
 
-The revision it replaces added
+The revision before that added
 `wasmtime::component::Instance::get_default_memory`, which returns the core
 memory a component instantiated for its own canonical ABI. The kernel's
 device grants (#5) place a device mapping inside a plugin's linear memory
