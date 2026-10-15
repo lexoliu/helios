@@ -11,7 +11,7 @@ use core::num::NonZeroUsize;
 use core::ops::Range;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
-use helios_hal::cpu::{ProcessorId, ticks_to_nanos};
+use helios_hal::cpu::{ProcessorId, Timebase};
 use helios_hal::critical_section::ProcessorIdentity;
 use helios_hal::watchdog::Watchdog;
 use helios_kernel::{Timer, WasmtimeTlsSlots};
@@ -263,7 +263,7 @@ pub(crate) struct BootContext {
 
 pub(crate) struct X86PlatformState {
     tsc_base: u64,
-    tsc_hz: u64,
+    timebase: Timebase,
     physical_memory_offset: usize,
     debug_state: debug_state::RuntimeState,
     watchdog: X86Watchdog,
@@ -288,7 +288,7 @@ struct WakeupPage {
 pub(crate) struct PhysicalOffsetAcpiHandler {
     pub(crate) physical_memory_offset: usize,
     pub(crate) tsc_base: u64,
-    pub(crate) tsc_hz: u64,
+    pub(crate) timebase: Timebase,
 }
 
 pub(crate) fn build_boot_context(
@@ -296,14 +296,15 @@ pub(crate) fn build_boot_context(
     physical_memory_offset: usize,
     wakeup_page: Option<Range<usize>>,
     tsc_base: u64,
-    tsc_hz: u64,
+    timebase: Timebase,
     debug_state: debug_state::RuntimeState,
     xcr0: Xcr0,
 ) -> &'static BootContext {
+    let tsc_hz = timebase.frequency();
     let handler = PhysicalOffsetAcpiHandler {
         physical_memory_offset,
         tsc_base,
-        tsc_hz,
+        timebase,
     };
     let tables = unsafe { AcpiTables::from_rsdp(handler.clone(), rsdp_address) }
         .unwrap_or_else(|error| panic!("failed to parse ACPI tables: {error:?}"));
@@ -402,7 +403,7 @@ pub(crate) fn build_boot_context(
     publish_anchor_identities(&mut processors);
     let platform = Arc::new(X86PlatformState {
         tsc_base,
-        tsc_hz,
+        timebase,
         physical_memory_offset,
         debug_state,
         watchdog,
@@ -650,8 +651,8 @@ impl X86PlatformState {
         self.tsc_base
     }
 
-    pub(crate) fn tsc_hz(&self) -> u64 {
-        self.tsc_hz
+    pub(crate) fn timebase(&self) -> Timebase {
+        self.timebase
     }
 
     pub(crate) fn debug_state(&self) -> debug_state::RuntimeState {
@@ -764,7 +765,7 @@ impl X86PlatformState {
                 slot.apic_id,
                 wakeup_page.physical_start,
                 self.physical_memory_offset,
-                self.tsc_hz,
+                self.timebase.frequency(),
             )
             .unwrap_or_else(|message| {
                 panic!(
@@ -776,7 +777,7 @@ impl X86PlatformState {
         }
 
         let deadline = read_tsc()
-            .checked_add(self.tsc_hz / 2)
+            .checked_add(self.timebase.frequency() / 2)
             .unwrap_or_else(|| panic!("x86 AP startup deadline overflow"));
         while !slot.runtime.started.load(Ordering::Acquire) {
             assert!(
@@ -1398,11 +1399,11 @@ impl Handler for PhysicalOffsetAcpiHandler {
 
     fn nanos_since_boot(&self) -> u64 {
         let ticks = read_tsc().saturating_sub(self.tsc_base);
-        ticks_to_nanos(ticks, self.tsc_hz)
+        self.timebase.ticks_to_nanos(ticks)
     }
 
     fn stall(&self, microseconds: u64) {
-        let ticks = self.tsc_hz.saturating_mul(microseconds) / 1_000_000;
+        let ticks = self.timebase.frequency().saturating_mul(microseconds) / 1_000_000;
         let deadline = read_tsc().saturating_add(ticks);
         while read_tsc() < deadline {
             core::hint::spin_loop();

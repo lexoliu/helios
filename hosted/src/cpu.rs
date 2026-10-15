@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::thread;
 
-use helios_hal::cpu::{Cpu, Instant, ProcessorId};
+use helios_hal::cpu::{Cpu, Instant, ProcessorId, Timebase};
 use helios_hal::entropy::{EntropyQuality, EntropyUnavailable};
 
 use crate::runtime::HostedMachine;
@@ -75,8 +75,8 @@ impl Cpu for HostedCpu {
         self.machine.now()
     }
 
-    fn timer_frequency(&self) -> u64 {
-        self.machine.timer_frequency()
+    fn timebase(&self) -> Timebase {
+        self.machine.timebase()
     }
 
     fn set_deadline(&self, deadline: Instant) {

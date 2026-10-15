@@ -144,7 +144,7 @@ use core::sync::atomic::{AtomicUsize, Ordering, compiler_fence};
 
 use arrayvec::ArrayVec;
 use fdt::Fdt;
-use helios_hal::cpu::{Cpu, Instant, ProcessorId, current_processor};
+use helios_hal::cpu::{Cpu, Instant, ProcessorId, Timebase, current_processor};
 use helios_hal::critical_section::ProcessorIdentity;
 use helios_hal::memory::MemoryRegion;
 use helios_hal::serial::ByteSerial;
@@ -393,7 +393,7 @@ fn kernel_console(
 pub struct RiscvCpu {
     bootstrap_hart: ProcessorId,
     hart_count: usize,
-    timebase_frequency: u64,
+    timebase: Timebase,
     fdt_addr: usize,
 }
 
@@ -401,13 +401,13 @@ impl RiscvCpu {
     pub(crate) fn new(
         bootstrap_hart: ProcessorId,
         hart_count: usize,
-        timebase_frequency: u64,
+        timebase: Timebase,
         fdt_addr: usize,
     ) -> Self {
         Self {
             bootstrap_hart,
             hart_count,
-            timebase_frequency,
+            timebase,
             fdt_addr,
         }
     }
@@ -507,8 +507,8 @@ impl Cpu for RiscvCpu {
         Instant::new(riscv::register::time::read64())
     }
 
-    fn timer_frequency(&self) -> u64 {
-        self.timebase_frequency
+    fn timebase(&self) -> Timebase {
+        self.timebase
     }
 
     fn set_deadline(&self, deadline: Instant) {
@@ -626,7 +626,7 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
         hart_count <= MAX_TRACKED_HARTS,
         "FDT describes {hart_count} harts but this backend tracks at most {MAX_TRACKED_HARTS}"
     );
-    let timebase_frequency = first_cpu.timebase_frequency() as u64;
+    let timebase = Timebase::new(first_cpu.timebase_frequency() as u64);
     // QEMU delivers the user payload through `-initrd` and publishes its
     // physical range in `/chosen`; the bytes stay borrowed for the
     // kernel's lifetime, so the range is carved out of the memory the
@@ -671,7 +671,7 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
         helios_kernel::prime_bootstrap_allocator(memory_regions.iter().copied(), hart_count);
     }
 
-    let debug_state = shared_debug_state(timebase_frequency, hart_count, initrd.clone());
+    let debug_state = shared_debug_state(timebase, hart_count, initrd.clone());
     let has_debug_transport = publish_debug_transport(DebugTransport::discover(&fdt));
     let watchdog = shared_watchdog(&fdt);
     let has_vsock = vsock::has_vsock_device(&fdt);
@@ -685,12 +685,7 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
         debug_state.clone(),
         has_debug_transport && (!debug_state.has_system_component() || has_vsock),
     );
-    let cpu = RiscvCpu::new(
-        bootstrap_processor,
-        hart_count,
-        timebase_frequency,
-        fdt_addr,
-    );
+    let cpu = RiscvCpu::new(bootstrap_processor, hart_count, timebase, fdt_addr);
     let mut devices = DeviceInventory::new();
     if has_debug_transport {
         devices = devices.with_debug_serial();
@@ -734,7 +729,7 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
             ProcessorTopology::start_all_secondaries(bootstrap_processor, hart_count)
                 .with_startup_policy(ProcessorStartupPolicy::BootstrapOnly),
         )
-        .with_timer_frequency_hz(timebase_frequency)
+        .with_timer_frequency_hz(timebase.frequency())
         .with_dma_model(DmaModel::Identity)
         .with_devices(devices),
     );
@@ -890,7 +885,7 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
 }
 
 fn shared_debug_state(
-    timebase_frequency: u64,
+    timebase: Timebase,
     hart_count: usize,
     initrd: Range<usize>,
 ) -> debug_state::RuntimeState {
@@ -904,7 +899,7 @@ fn shared_debug_state(
                 panic!("initrd is not a valid helios-bootfs payload: {error}")
             });
             debug_state::RuntimeState::new(
-                timebase_frequency,
+                timebase,
                 hart_count,
                 riscv::register::time::read64(),
                 payload,

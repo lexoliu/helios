@@ -17,7 +17,7 @@ use helios_hal::boot::{
     BootMemoryRegion, BootModule, BootModules, BootReservedRanges, FirmwareKind,
     usable_region_segments,
 };
-use helios_hal::cpu::{Cpu, HardwarePerfCounters, Instant, ProcessorId};
+use helios_hal::cpu::{Cpu, HardwarePerfCounters, Instant, ProcessorId, Timebase};
 use helios_hal::critical_section::ProcessorIdentity;
 use helios_hal::entropy::{EntropyQuality, EntropyUnavailable};
 use helios_hal::memory::MemoryRegion;
@@ -334,13 +334,13 @@ struct Aarch64ProcessorSlot {
 
 struct Aarch64PlatformState {
     processors: Box<[Aarch64ProcessorSlot]>,
-    timer_frequency: u64,
+    timebase: Timebase,
     debug_state: Once<debug_state::RuntimeState>,
     gic: Once<gic::Gic>,
 }
 
 impl Aarch64PlatformState {
-    fn from_limine_mp(timer_frequency: u64) -> &'static Self {
+    fn from_limine_mp(timebase: Timebase) -> &'static Self {
         let response = MP_REQUEST
             .response()
             .unwrap_or_else(|| panic!("Limine did not provide an AArch64 MP response"));
@@ -379,7 +379,7 @@ impl Aarch64PlatformState {
             .into_boxed_slice();
         Box::leak(Box::new(Self {
             processors,
-            timer_frequency,
+            timebase,
             debug_state: Once::new(),
             gic: Once::new(),
         }))
@@ -458,7 +458,7 @@ impl Aarch64PlatformState {
         slot.mp_info
             .bootstrap(aarch64_secondary_entry, self as *const _ as u64);
         let deadline = read_counter()
-            .checked_add(self.timer_frequency / 2)
+            .checked_add(self.timebase.frequency() / 2)
             .unwrap_or_else(|| panic!("AArch64 secondary startup deadline overflow"));
         while !slot.runtime.started.load(Ordering::Acquire) {
             assert!(
@@ -568,14 +568,14 @@ extern "C" fn aarch64_kernel_main() -> ! {
         .describe(console)
         .unwrap_or_else(|error| panic!("AArch64 platform description failed: {error}"));
     vmm::install_user_address_space(physical_memory_offset);
-    let platform_state = Aarch64PlatformState::from_limine_mp(timer_frequency());
+    let platform_state = Aarch64PlatformState::from_limine_mp(timebase());
     activate_processor_runtime(platform_state.bootstrap_runtime());
 
     let cpu = Aarch64Cpu {
         state: platform_state,
     };
     let debug_state = debug_state::RuntimeState::new(
-        cpu.timer_frequency(),
+        cpu.timebase(),
         cpu.processor_count(),
         cpu.now().ticks(),
         payload,
@@ -626,7 +626,7 @@ extern "C" fn aarch64_kernel_main() -> ! {
                 )
                 .with_startup_policy(ProcessorStartupPolicy::BootstrapOnly),
             )
-            .with_timer_frequency_hz(cpu.timer_frequency())
+            .with_timer_frequency_hz(cpu.timebase().frequency())
             .with_dma_model(DmaModel::Translated)
             .with_devices(devices),
     );
@@ -923,8 +923,8 @@ impl Cpu for Aarch64Cpu {
         Instant::new(read_counter())
     }
 
-    fn timer_frequency(&self) -> u64 {
-        self.state.timer_frequency
+    fn timebase(&self) -> Timebase {
+        self.state.timebase
     }
 
     fn hardware_perf_counters(&self) -> HardwarePerfCounters {
@@ -1190,7 +1190,7 @@ unsafe extern "C" fn aarch64_secondary_main(mp_info: &MpInfo) -> ! {
     );
     let kernel = helios_kernel::init(
         Platform::new(console, core::iter::empty::<MemoryRegion>(), cpu)
-            .with_timer_frequency_hz(cpu.timer_frequency())
+            .with_timer_frequency_hz(cpu.timebase().frequency())
             .with_dma_model(DmaModel::Translated)
             .with_devices(DeviceInventory::new().with_debug_serial()),
     );
@@ -1644,13 +1644,15 @@ fn read_counter() -> u64 {
     value
 }
 
-fn timer_frequency() -> u64 {
+/// The generic timer's timebase, from the frequency firmware programmed
+/// into `CNTFRQ_EL0`.
+fn timebase() -> Timebase {
     let value: u64;
     unsafe {
         asm!("mrs {value}, cntfrq_el0", value = out(reg) value, options(nomem, nostack, preserves_flags));
     }
     assert!(value != 0, "AArch64 CNTFRQ_EL0 reported zero");
-    value
+    Timebase::new(value)
 }
 
 fn cache_line_bytes() -> usize {

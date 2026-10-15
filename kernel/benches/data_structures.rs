@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 use bytes::Bytes;
 use divan::counter::ItemsCount;
 use divan::{AllocProfiler, Bencher, black_box};
-use helios_hal::cpu::{Cpu, HardwarePerfCounters, Instant, ProcessorId};
+use helios_hal::cpu::{Cpu, HardwarePerfCounters, Instant, ProcessorId, Timebase};
 use helios_hal::fs::FileRights;
 use helios_hal::resource::KernelResource;
 use helios_hal::watchdog::ProgressCounter;
@@ -41,7 +41,17 @@ struct OnceNetworkServiceSlot {
 }
 
 #[derive(Clone)]
-struct BenchCpu;
+struct BenchCpu {
+    timebase: Timebase,
+}
+
+impl BenchCpu {
+    fn new() -> Self {
+        Self {
+            timebase: Timebase::new(1_000_000),
+        }
+    }
+}
 
 fn main() {
     divan::main();
@@ -329,7 +339,7 @@ fn futex_prepare_complete_distinct_keys(bencher: Bencher, count: usize) {
 
 #[divan::bench(args = [1usize, 64, 1024])]
 fn timer_sleep_future_create_drop(bencher: Bencher, count: usize) {
-    let timer = Timer::new(BenchCpu);
+    let timer = Timer::new(BenchCpu::new());
     // Created-but-never-polled sleeps model timeout candidates that lose a
     // select/race before the executor parks the task. They must not allocate;
     // pending sleeps still allocate one timer state until the sleep-state pool
@@ -373,7 +383,7 @@ fn notify_coalesced_presignaled_future_wait(bencher: Bencher, count: usize) {
 #[divan::bench(args = [1usize, 64, 1024])]
 fn executor_spawn_detached_run_global(bencher: Bencher, count: usize) {
     let executor = Executor::new(ProgressCounter::new(), 1, ProcessorId::new(0));
-    let spawner = executor.spawner(BenchCpu);
+    let spawner = executor.spawner(BenchCpu::new());
     // Task allocation includes the scheduler capture stored by async-task. This
     // benchmark keeps the per-task byte count visible while we move toward a
     // pooled task/waker design; removing the runtime progress-mode field moved
@@ -391,7 +401,7 @@ fn executor_spawn_detached_run_global(bencher: Bencher, count: usize) {
 #[divan::bench(args = [1usize, 64, 1024])]
 fn executor_spawn_detached_run_local(bencher: Bencher, count: usize) {
     let executor = Executor::new(ProgressCounter::new(), 1, ProcessorId::new(0));
-    let spawner = executor.spawner(BenchCpu);
+    let spawner = executor.spawner(BenchCpu::new());
     // Local tasks still carry owner-processor routing state, so the scheduler
     // capture is slightly larger than the global path: 73 B per no-op task on
     // this host after removing the runtime progress-mode field.
@@ -780,8 +790,8 @@ impl Cpu for BenchCpu {
         Instant::new(0)
     }
 
-    fn timer_frequency(&self) -> u64 {
-        1_000_000
+    fn timebase(&self) -> Timebase {
+        self.timebase
     }
 
     fn hardware_perf_counters(&self) -> HardwarePerfCounters {

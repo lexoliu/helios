@@ -46,7 +46,7 @@ use core::arch::x86_64::{__cpuid, __cpuid_count, _rdrand64_step, _rdtsc};
 use core::ops::Range;
 use core::sync::atomic::{Ordering, compiler_fence};
 use helios_hal::boot::{BootMemoryMap, BootReservedRanges, usable_region_segments};
-use helios_hal::cpu::{Cpu, Instant, ProcessorId, current_processor};
+use helios_hal::cpu::{Cpu, Instant, ProcessorId, Timebase, current_processor};
 use helios_hal::critical_section::ProcessorIdentity;
 use helios_hal::entropy::{EntropyQuality, EntropyUnavailable};
 use helios_hal::memory::MemoryRegion;
@@ -204,16 +204,16 @@ fn x86_kernel_main() -> ! {
         &reserved_ranges,
         wakeup_page.clone(),
     );
-    let tsc_hz = detect_tsc_frequency_hz();
+    let timebase = Timebase::new(detect_tsc_frequency_hz());
     let tsc_base = read_tsc();
     let payload = helios_kernel::BootPayload::from_boot_modules(&handoff.modules);
-    let debug_state = debug_state::RuntimeState::new(tsc_hz, processor_count, 0, payload);
+    let debug_state = debug_state::RuntimeState::new(timebase, processor_count, 0, payload);
     let boot = smp::build_boot_context(
         rsdp_address,
         physical_memory_offset,
         wakeup_page,
         tsc_base,
-        tsc_hz,
+        timebase,
         debug_state.clone(),
         xcr0,
     );
@@ -605,7 +605,7 @@ fn processor_count(rsdp_address: usize, physical_memory_offset: usize) -> usize 
     let handler = smp::PhysicalOffsetAcpiHandler {
         physical_memory_offset,
         tsc_base: 0,
-        tsc_hz: 1,
+        timebase: Timebase::new(1),
     };
     let tables =
         unsafe { acpi::AcpiTables::from_rsdp(handler, rsdp_address) }.unwrap_or_else(|error| {
@@ -864,8 +864,8 @@ impl Cpu for X86Cpu {
         Instant::new(read_tsc().saturating_sub(self.state.tsc_base()))
     }
 
-    fn timer_frequency(&self) -> u64 {
-        self.state.tsc_hz()
+    fn timebase(&self) -> Timebase {
+        self.state.timebase()
     }
 
     fn set_deadline(&self, deadline: Instant) {
