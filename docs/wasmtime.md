@@ -5,13 +5,44 @@ at `../wasmtime/crates/wasmtime`.
 
 ## Required revision
 
-The local checkout must be at (branch `helios/parking-wait-timeout`):
+The local checkout must be at (branch `helios/parking-wait-cancel`):
 
 ```text
-62bf033a53a8132a4d3009534152e2b745144904
+904e03c981d7596bf03ed1d4fd8423ff36381414
 ```
 
-That revision is `helios/stack-limit-interrupt` at
+That revision is `helios/parking-wait-timeout` at
+`62bf033a53a8132a4d3009534152e2b745144904` plus one additive commit,
+which gives a `no_std` `memory.atomic.wait` a cancellation exit (#445):
+
+- The `no_std` parking hook becomes
+  `wasmtime_parking_wait(timeout_nanos: u64) -> bool`. It returns `true`
+  when the embedder cancelled the wait, so the waiting thread must unwind
+  instead of parking again. `park_current_thread` passes that through, and
+  on `std` it is always `false`.
+- `ParkingSpot::wait` takes the table lock back after a cancelled park and
+  returns a new `WaitResult::Cancelled`, never `Ok`. A waiter that no
+  notify reached is removed from its queue, so no later notify counts it;
+  one that a notify already dequeued stays counted by that notify. Either
+  way every notify count names a waiter that really was queued and woken.
+- The `memory_atomic_wait32/64` libcalls turn `Cancelled` into an
+  `Err(wasmtime::AtomicWaitCancelled)`, so the instruction traps and the
+  fiber unwinds through the normal trap path. The error is not a `Trap`,
+  so an embedder can tell it from a guest fault by downcasting. The public
+  `SharedMemory::atomic_wait32/64` keep their signature and return
+  `WaitResult::Cancelled` as a value.
+
+Helios needs it because a kill or a WASIX signal ends a suspended guest by
+dropping its call, and a guest parked in `memory.atomic.wait` is suspended
+inside `block_on_current_fiber` with no way out: that drop resumed the
+fiber with `Cancelled`, and the kernel's hook could only panic. Each
+bare-metal backend's `wasmtime_parking_wait` now returns
+`park_wasmtime_waiter`'s result, which is `true` exactly when the turn
+dropped the call.
+
+The revision it replaces is `helios/parking-wait-timeout` at
+`62bf033a53a8132a4d3009534152e2b745144904`, which is
+`helios/stack-limit-interrupt` at
 `913a5426e627b32c7c096d2dcd7f167fe943c6be` plus one additive commit, which
 makes a timed `memory.atomic.wait` time out on `no_std` (#455):
 

@@ -727,4 +727,83 @@ mod tests {
         drop(instance);
         assert_eq!(registry.snapshot(0), [], "the registry entry is reclaimed");
     }
+    /// A guest parked the way `memory.atomic.wait` parks on bare metal,
+    /// blocked in `wasmtime::block_on_current_fiber` from a synchronous
+    /// host frame, is ended by a kill too. The turn drops the call, the
+    /// blocked frame sees `Cancelled` and unwinds with the error the
+    /// parking hook's cancellation turns into in Wasmtime, and the call
+    /// still reports the kill. The fiber's stack, the store and the
+    /// registry entry are reclaimed as for a host future.
+    #[test]
+    fn a_kill_unwinds_a_fiber_blocked_on_its_own_stack() {
+        let engine = build_component_engine_for_platform(&TestCpu::without_entropy())
+            .expect("the component engine builds on the test platform");
+        let live_stacks = || {
+            engine
+                .pooling_allocator_metrics()
+                .expect("the component engine uses the pooling allocator")
+                .stacks()
+        };
+        let registry = InstanceRegistry::new();
+        let instance = registry.register("parked-waiter", 0);
+        let activity = InstanceActivity::new(instance.clone(), 0);
+        let turns = GuestTurns::new(
+            activity.turns(),
+            ManualClockCpu::new(),
+            TestRuntimeState::default(),
+            (),
+        );
+        let mut store = wasmtime::Store::new(&engine, activity);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let flag = cancelled.clone();
+        let parked = wasmtime::Func::wrap(
+            &mut store,
+            move |_: wasmtime::Caller<'_, InstanceActivity>| -> wasmtime::Result<()> {
+                // SAFETY: this frame runs on the guest call's fiber, holds
+                // no store borrow across the block, and the future borrows
+                // nothing on the fiber.
+                match unsafe { wasmtime::block_on_current_fiber(core::future::pending::<()>()) } {
+                    Err(wasmtime::BlockOnCurrentFiberError::Cancelled(_)) => {
+                        flag.store(true, Ordering::Release);
+                        Err(wasmtime::Error::new(wasmtime::AtomicWaitCancelled))
+                    }
+                    other => panic!("the blocked fiber is only ever cancelled, got {other:?}"),
+                }
+            },
+        );
+        let wakes = Arc::new(CountingWaker::default());
+        let waker = Waker::from(wakes.clone());
+        let mut cx = Context::from_waker(&waker);
+
+        {
+            let mut driven = pin!(turns.drive(parked.call_async(&mut store, &[], &mut [])));
+            assert!(driven.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(live_stacks(), 1, "the blocked guest holds its fiber stack");
+
+            assert_eq!(
+                registry.request_kill(instance.id(), KillReason::Operator, 0),
+                KillOutcome::Requested
+            );
+            assert_eq!(wakes.wakes(), 1, "the condemnation wakes the turn");
+            match driven.as_mut().poll(&mut cx) {
+                Poll::Ready(Err(error)) => assert_eq!(
+                    error.downcast_ref::<InstanceKilled>(),
+                    Some(&InstanceKilled {
+                        reason: KillReason::Operator
+                    }),
+                    "the call reports the kill, not the unwinding wait"
+                ),
+                other => panic!("the kill ends the call, got {other:?}"),
+            }
+            assert!(
+                cancelled.load(Ordering::Acquire),
+                "the blocked frame saw the cancellation and unwound"
+            );
+        }
+
+        drop(store);
+        assert_eq!(live_stacks(), 0, "the fiber stack is back in the pool");
+        drop(instance);
+        assert_eq!(registry.snapshot(0), [], "the registry entry is reclaimed");
+    }
 }
