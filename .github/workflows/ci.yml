@@ -740,6 +740,30 @@ jobs:
           cat atomic-wait-timeout-smoke.out
           grep -Fqx atomic-wait-timeout:ok atomic-wait-timeout-smoke.out
           ! grep -Fq 'Kernel panic' atomic-wait-timeout-smoke.out
+      - name: Kill a thread parked in memory.atomic.wait
+        shell: bash
+        working-directory: helios
+        run: |
+          # Without this the step reports tee's status, not the
+          # command's, and a runner script that fails is invisible.
+          set -o pipefail
+          # A thread parked forever in memory.atomic.wait32 used to panic
+          # the kernel when a kill or signal dropped its call (#445). The
+          # parent signals it and prints its marker only after thread_join
+          # returns, which needs the parked fiber to have unwound.
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/atomic-wait-kill"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+            --accel kvm \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger \
+            --boot-program wasix-atomic-wait-kill --no-compiler-plugin \
+            shell --trace-log "$runtime/guest-tracing.log" \
+            -c '/bin/wasix-atomic-wait-kill' \
+            2>&1 > atomic-wait-kill-smoke.out | tee "$runtime/inspector.log"
+          cat atomic-wait-kill-smoke.out
+          grep -Fqx atomic-wait-kill:ok atomic-wait-kill-smoke.out
+          ! grep -Fq 'Kernel panic' atomic-wait-kill-smoke.out
       - name: Fetch over virtio-net with curl
         shell: bash
         working-directory: helios
