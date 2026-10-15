@@ -309,8 +309,12 @@ impl AddressSpace for HostedAddressSpace {
         let mut reservations = self.reservations.lock().unwrap();
         reservations.precheck_commit(virt)?;
         let flags = device_region_flags(region);
-        let owner = current_user_memory_owner(self.processor);
-        self.orphan(reservations.record_commit(virt, flags, owner)?);
+        // `MemoryOwner::NONE` whoever asked: a device window is the
+        // device's memory, not the instance's, and the swap policy only
+        // ages and evicts owned regions. The claim runs inside the
+        // claiming guest's processor turn, which names that guest as
+        // the processor's owner for its own linear memory.
+        self.orphan(reservations.record_commit(virt, flags, MemoryOwner::NONE)?);
         let mapped = unsafe {
             libc::mmap(
                 virt.start.raw() as *mut _,

@@ -40,10 +40,15 @@
 //! back in. Both eviction phases below take that bar; the difference
 //! between them is how long the instance has to have been off.
 //!
-//! A fiber stopped in the trampoline is covered by that same bar
-//! without needing its own accounting: blocking there crosses no
-//! call-hook boundary, so the instance is still counted as on a
-//! processor for as long as its page is being read back.
+//! "On a processor" is a store's processor turn (`crate::StoreTurns`):
+//! the poll of the future that drives its guest, synchronous host calls
+//! included. A fiber stopped in the trampoline has suspended, so its
+//! instance is off a processor while the page is read back, and that is
+//! safe without accounting of its own: the policy pass does not run
+//! while a fault is queued, the reinstated page comes back hot, and a
+//! retried instruction that meets another evicted page blocks in the
+//! trampoline again — it is running wasm, which holds no blocking
+//! context.
 //!
 //! Two more properties keep a page that has just come back from being
 //! taken straight out again. A reinstated page is mapped with its

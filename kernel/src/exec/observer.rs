@@ -1,14 +1,17 @@
 extern crate alloc;
 
 use alloc::borrow::ToOwned;
-use alloc::collections::VecDeque;
+use alloc::collections::{BinaryHeap, VecDeque};
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
+use core::cmp::Reverse;
+use core::hash::BuildHasher;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use arrayvec::ArrayString;
+use hashbrown::{DefaultHashBuilder, HashTable};
 use helios_hal::cpu::HardwarePerfCounterDelta;
 use spin::Mutex;
 use triomphe::Arc;
@@ -129,7 +132,7 @@ pub struct PerfMetricSample {
     pub total_instructions_retired: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ProfileScope {
     Kernel,
     User,
@@ -230,16 +233,241 @@ impl ProfileSink {
     }
 }
 
+/// Folded stacks aggregated by `(scope, stack)`, at most `capacity` of
+/// them.
+///
+/// A record is O(1) in the number of stacks held: the stack is hashed
+/// once and found through [`KeyedSamples`]. Only a new stack arriving
+/// at a full history pays more, an amortised O(log capacity) to find
+/// the lightest stack; see [`KeyedSamples`] for why that is the same
+/// stack the linear scan this replaced would have found.
 #[derive(Debug)]
 pub struct ProfileHistory {
-    capacity: usize,
-    samples: Vec<FoldedProfileSample>,
+    samples: KeyedSamples<FoldedProfileSample>,
 }
 
+/// Perf metrics aggregated by `(scope, name)`, at most `capacity` of
+/// them, with the same O(1) record path as [`ProfileHistory`].
 #[derive(Debug)]
 pub struct PerfMetricHistory {
+    samples: KeyedSamples<PerfMetricSample>,
+}
+
+/// A sample a [`KeyedSamples`] can hold: named, scoped, and ranked by
+/// the number that decides which sample a full history gives up.
+trait KeyedSample {
+    fn scope(&self) -> ProfileScope;
+
+    fn name(&self) -> &str;
+
+    /// The eviction rank. It only grows while the sample is held, which
+    /// is what lets [`KeyedSamples`] keep stale lower bounds for it.
+    fn rank(&self) -> u64;
+}
+
+impl KeyedSample for FoldedProfileSample {
+    fn scope(&self) -> ProfileScope {
+        self.scope
+    }
+
+    fn name(&self) -> &str {
+        &self.stack
+    }
+
+    fn rank(&self) -> u64 {
+        self.weight
+    }
+}
+
+impl KeyedSample for PerfMetricSample {
+    fn scope(&self) -> ProfileScope {
+        self.scope
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn rank(&self) -> u64 {
+        self.count
+    }
+}
+
+/// A bounded set of samples keyed by `(scope, name)`.
+///
+/// `samples` is laid out exactly as the linear history it replaces laid
+/// it out: appended on insert, `swap_remove`d on eviction. That order is
+/// observable — it breaks ties in [`ProfileHistory::folded`] and decides
+/// which of several equally light samples is evicted — so it is kept
+/// rather than redefined. `index` maps a key to its position in
+/// `samples`, which is what makes a record O(1).
+///
+/// Eviction takes the lightest sample, the first in `samples` order
+/// among equals: the minimum of `(rank, position)`. `lightest` is a
+/// lazy min-heap of `(rank, position, id)` lower bounds for that key.
+/// A hit raises a sample's rank without touching the heap, so the entry
+/// it leaves there is a lower bound rather than the value; a heap top
+/// whose rank is stale is re-pushed with the current one, and a top
+/// whose position no longer holds its `id` (the sample was evicted, or
+/// moved by a `swap_remove`) is dropped. A move pushes a fresh entry for
+/// the moved sample's new position, so every held sample always has an
+/// entry no greater than its true key, and the first fresh top is the
+/// true minimum. The heap is rebuilt from `samples` when stale entries
+/// outnumber held ones, which keeps it O(capacity) and the eviction
+/// path amortised O(log capacity).
+///
+/// Concurrency: none of its own. Each history sits behind the lock of
+/// the [`ProfileSink`] that owns it, held for one record.
+#[derive(Debug)]
+struct KeyedSamples<Sample> {
     capacity: usize,
-    samples: Vec<PerfMetricSample>,
+    samples: Vec<Sample>,
+    /// The identity of the sample at each position, parallel to
+    /// `samples`, so a heap entry can tell whether it still describes
+    /// the sample at its position.
+    ids: Vec<u64>,
+    next_id: u64,
+    index: HashTable<usize>,
+    hasher: DefaultHashBuilder,
+    lightest: BinaryHeap<Reverse<(u64, usize, u64)>>,
+}
+
+impl<Sample> KeyedSamples<Sample>
+where
+    Sample: KeyedSample,
+{
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            samples: Vec::with_capacity(capacity),
+            ids: Vec::with_capacity(capacity),
+            next_id: 0,
+            index: HashTable::with_capacity(capacity),
+            hasher: DefaultHashBuilder::default(),
+            lightest: BinaryHeap::with_capacity(capacity),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.samples.clear();
+        self.ids.clear();
+        self.index.clear();
+        self.lightest.clear();
+    }
+
+    fn is_full(&self) -> bool {
+        self.samples.len() == self.capacity
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &Sample> {
+        self.samples.iter()
+    }
+
+    fn hash(&self, scope: ProfileScope, name: &str) -> u64 {
+        self.hasher.hash_one((scope, name))
+    }
+
+    /// The held sample named `name` in `scope`.
+    fn get_mut(&mut self, scope: ProfileScope, name: &str) -> Option<&mut Sample> {
+        let hash = self.hash(scope, name);
+        let samples = &self.samples;
+        let position = *self.index.find(hash, |&position| {
+            let sample = &samples[position];
+            sample.scope() == scope && sample.name() == name
+        })?;
+        Some(&mut self.samples[position])
+    }
+
+    /// The position of the lightest held sample: least rank, first in
+    /// `samples` order among equals. `None` when nothing is held.
+    fn lightest(&mut self) -> Option<usize> {
+        loop {
+            let Reverse((rank, position, id)) = *self.lightest.peek()?;
+            if self.ids.get(position) != Some(&id) {
+                // Evicted, or moved to a lower position that has its
+                // own entry.
+                self.lightest.pop();
+                continue;
+            }
+            let current = self.samples[position].rank();
+            if current == rank {
+                return Some(position);
+            }
+            self.lightest.pop();
+            self.lightest.push(Reverse((current, position, id)));
+        }
+    }
+
+    /// Removes the sample at `position`, which [`Self::lightest`] has
+    /// just named and therefore sits on top of the heap.
+    fn evict(&mut self, position: usize) {
+        let popped = self.lightest.pop();
+        debug_assert_eq!(
+            popped.map(|Reverse((_, at, _))| at),
+            Some(position),
+            "evicting a sample that is not the lightest"
+        );
+        let evicted = &self.samples[position];
+        let hash = self.hash(evicted.scope(), evicted.name());
+        match self.index.find_entry(hash, |&at| at == position) {
+            Ok(entry) => {
+                entry.remove();
+            }
+            Err(_) => panic!("profile sample at {position} is missing from its index"),
+        }
+        let last = self.samples.len() - 1;
+        self.samples.swap_remove(position);
+        self.ids.swap_remove(position);
+        if position == last {
+            return;
+        }
+        let moved = &self.samples[position];
+        let hash = self.hash(moved.scope(), moved.name());
+        match self.index.find_mut(hash, |&at| at == last) {
+            Some(at) => *at = position,
+            None => panic!("profile sample at {last} is missing from its index"),
+        }
+        let rank = moved.rank();
+        let id = self.ids[position];
+        self.push_bound(rank, position, id);
+    }
+
+    /// Appends `sample`, which must not already be held, to a history
+    /// that has room for it.
+    fn insert(&mut self, sample: Sample) {
+        assert!(!self.is_full(), "profile history inserted past capacity");
+        let position = self.samples.len();
+        let id = self.next_id;
+        self.next_id += 1;
+        let hash = self.hash(sample.scope(), sample.name());
+        let rank = sample.rank();
+        self.samples.push(sample);
+        self.ids.push(id);
+        let Self {
+            index,
+            samples,
+            hasher,
+            ..
+        } = self;
+        index.insert_unique(hash, position, |&at| {
+            let held = &samples[at];
+            hasher.hash_one((held.scope(), held.name()))
+        });
+        self.push_bound(rank, position, id);
+    }
+
+    fn push_bound(&mut self, rank: u64, position: usize, id: u64) {
+        self.lightest.push(Reverse((rank, position, id)));
+        if self.lightest.len() > self.capacity.saturating_mul(2) {
+            self.lightest = self
+                .samples
+                .iter()
+                .zip(self.ids.iter())
+                .enumerate()
+                .map(|(at, (held, &id))| Reverse((held.rank(), at, id)))
+                .collect();
+        }
+    }
 }
 
 struct ProfileStackParts<'a> {
@@ -247,15 +475,18 @@ struct ProfileStackParts<'a> {
     suffix: &'a str,
 }
 
+/// A stack or metric name as a record path receives it.
 trait ProfileStackInput {
-    fn matches(&self, stack: &str) -> bool;
+    /// Runs `with` over the whole name. A name given in parts is joined
+    /// on the stack, so looking one up allocates nothing.
+    fn with_name<R>(&self, with: impl FnOnce(&str) -> R) -> R;
 
     fn into_string(self) -> String;
 }
 
 impl ProfileStackInput for String {
-    fn matches(&self, stack: &str) -> bool {
-        stack == self
+    fn with_name<R>(&self, with: impl FnOnce(&str) -> R) -> R {
+        with(self)
     }
 
     fn into_string(self) -> String {
@@ -264,8 +495,8 @@ impl ProfileStackInput for String {
 }
 
 impl ProfileStackInput for &str {
-    fn matches(&self, stack: &str) -> bool {
-        stack == *self
+    fn with_name<R>(&self, with: impl FnOnce(&str) -> R) -> R {
+        with(self)
     }
 
     fn into_string(self) -> String {
@@ -273,14 +504,8 @@ impl ProfileStackInput for &str {
     }
 }
 
-impl ProfileStackInput for ProfileStackParts<'_> {
-    fn matches(&self, stack: &str) -> bool {
-        stack.len() == self.prefix.len().saturating_add(self.suffix.len())
-            && stack.starts_with(self.prefix)
-            && stack[self.prefix.len()..] == *self.suffix
-    }
-
-    fn into_string(self) -> String {
+impl ProfileStackParts<'_> {
+    fn joined(&self) -> ArrayString<OBSERVER_TEXT_STACK_BYTES> {
         let len = self.prefix.len().saturating_add(self.suffix.len());
         assert!(
             len <= OBSERVER_TEXT_STACK_BYTES,
@@ -289,7 +514,17 @@ impl ProfileStackInput for ProfileStackParts<'_> {
         let mut stack = ArrayString::<OBSERVER_TEXT_STACK_BYTES>::new();
         stack.push_str(self.prefix);
         stack.push_str(self.suffix);
-        stack.as_str().to_owned()
+        stack
+    }
+}
+
+impl ProfileStackInput for ProfileStackParts<'_> {
+    fn with_name<R>(&self, with: impl FnOnce(&str) -> R) -> R {
+        with(self.joined().as_str())
+    }
+
+    fn into_string(self) -> String {
+        self.joined().as_str().to_owned()
     }
 }
 
@@ -346,8 +581,7 @@ impl ProfileHistory {
     pub fn new(capacity: usize) -> Self {
         assert!(capacity != 0, "profile stack capacity must be non-zero");
         Self {
-            capacity,
-            samples: Vec::with_capacity(capacity),
+            samples: KeyedSamples::new(capacity),
         }
     }
 
@@ -375,30 +609,29 @@ impl ProfileHistory {
             return;
         }
 
-        if let Some(sample) = self
-            .samples
-            .iter_mut()
-            .find(|sample| sample.scope == scope && stack.matches(&sample.stack))
-        {
-            sample.weight = sample.weight.saturating_add(weight);
+        let held = stack.with_name(|name| match self.samples.get_mut(scope, name) {
+            Some(sample) => {
+                sample.weight = sample.weight.saturating_add(weight);
+                true
+            }
+            None => false,
+        });
+        if held {
             return;
         }
 
-        if self.samples.len() == self.capacity {
-            let lightest_index = self
+        if self.samples.is_full() {
+            let lightest = self
                 .samples
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, sample)| sample.weight)
-                .map(|(index, _)| index)
-                .expect("non-empty profile samples should have a lightest entry");
-            if self.samples[lightest_index].weight >= weight {
+                .lightest()
+                .expect("a full profile history has a lightest entry");
+            if self.samples.samples[lightest].weight >= weight {
                 return;
             }
-            self.samples.swap_remove(lightest_index);
+            self.samples.evict(lightest);
         }
 
-        self.samples.push(FoldedProfileSample {
+        self.samples.insert(FoldedProfileSample {
             scope,
             stack: stack.into_string(),
             weight,
@@ -463,8 +696,7 @@ impl PerfMetricHistory {
     pub fn new(capacity: usize) -> Self {
         assert!(capacity != 0, "perf metric capacity must be non-zero");
         Self {
-            capacity,
-            samples: Vec::with_capacity(capacity),
+            samples: KeyedSamples::new(capacity),
         }
     }
 
@@ -506,39 +738,39 @@ impl PerfMetricHistory {
             return;
         }
 
-        if let Some(sample) = self
-            .samples
-            .iter_mut()
-            .find(|sample| sample.scope == scope && name.matches(&sample.name))
-        {
-            sample.count = sample.count.saturating_add(1);
-            sample.total_events = sample.total_events.saturating_add(events);
-            sample.total_nanos = sample.total_nanos.saturating_add(elapsed_nanos);
-            sample.min_nanos = sample.min_nanos.min(elapsed_nanos);
-            sample.max_nanos = sample.max_nanos.max(elapsed_nanos);
-            sample.total_bytes = sample.total_bytes.saturating_add(bytes);
-            sample.total_reference_cycles = sample
-                .total_reference_cycles
-                .saturating_add(counters.reference_cycles);
-            sample.total_cpu_cycles = sample.total_cpu_cycles.saturating_add(counters.cpu_cycles);
-            sample.total_instructions_retired = sample
-                .total_instructions_retired
-                .saturating_add(counters.instructions_retired);
+        let held = name.with_name(|key| match self.samples.get_mut(scope, key) {
+            Some(sample) => {
+                sample.count = sample.count.saturating_add(1);
+                sample.total_events = sample.total_events.saturating_add(events);
+                sample.total_nanos = sample.total_nanos.saturating_add(elapsed_nanos);
+                sample.min_nanos = sample.min_nanos.min(elapsed_nanos);
+                sample.max_nanos = sample.max_nanos.max(elapsed_nanos);
+                sample.total_bytes = sample.total_bytes.saturating_add(bytes);
+                sample.total_reference_cycles = sample
+                    .total_reference_cycles
+                    .saturating_add(counters.reference_cycles);
+                sample.total_cpu_cycles =
+                    sample.total_cpu_cycles.saturating_add(counters.cpu_cycles);
+                sample.total_instructions_retired = sample
+                    .total_instructions_retired
+                    .saturating_add(counters.instructions_retired);
+                true
+            }
+            None => false,
+        });
+        if held {
             return;
         }
 
-        if self.samples.len() == self.capacity {
-            let coldest_index = self
+        if self.samples.is_full() {
+            let coldest = self
                 .samples
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, sample)| sample.count)
-                .map(|(index, _)| index)
-                .expect("non-empty perf metric samples should have a coldest entry");
-            self.samples.swap_remove(coldest_index);
+                .lightest()
+                .expect("a full perf metric history has a coldest entry");
+            self.samples.evict(coldest);
         }
 
-        self.samples.push(PerfMetricSample {
+        self.samples.insert(PerfMetricSample {
             scope,
             name: name.into_string(),
             count: 1,
@@ -717,12 +949,14 @@ fn strip_ansi(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use alloc::borrow::ToOwned;
+    use alloc::string::String;
     use alloc::vec;
+    use alloc::vec::Vec;
 
     use super::{
-        PerfMetricFilter, PerfMetricHistory, PerfSample, ProfileFilter, ProfileHistory,
-        ProfileScope, TraceEvent, TraceField, TraceFilter, TraceHistory, TraceLevel, TraceValue,
-        matches_trace_filter, parse_console_text,
+        FoldedProfileSample, PerfMetricFilter, PerfMetricHistory, PerfSample, ProfileFilter,
+        ProfileHistory, ProfileScope, TraceEvent, TraceField, TraceFilter, TraceHistory,
+        TraceLevel, TraceValue, matches_trace_filter, parse_console_text,
     };
     use helios_hal::cpu::HardwarePerfCounterDelta;
 
@@ -816,6 +1050,219 @@ mod tests {
         assert_eq!(samples.len(), 1);
         assert_eq!(samples[0].stack, "user;dash");
         assert_eq!(samples[0].weight, 12);
+    }
+
+    /// The linear history `ProfileHistory` replaced, kept verbatim as
+    /// the reference its folded output has to match.
+    struct LinearProfileHistory {
+        capacity: usize,
+        samples: Vec<FoldedProfileSample>,
+    }
+
+    impl LinearProfileHistory {
+        fn record(&mut self, scope: ProfileScope, stack: &str, weight: u64) {
+            if weight == 0 {
+                return;
+            }
+            if let Some(sample) = self
+                .samples
+                .iter_mut()
+                .find(|sample| sample.scope == scope && sample.stack == stack)
+            {
+                sample.weight = sample.weight.saturating_add(weight);
+                return;
+            }
+            if self.samples.len() == self.capacity {
+                let lightest_index = self
+                    .samples
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, sample)| sample.weight)
+                    .map(|(index, _)| index)
+                    .expect("non-empty profile samples should have a lightest entry");
+                if self.samples[lightest_index].weight >= weight {
+                    return;
+                }
+                self.samples.swap_remove(lightest_index);
+            }
+            self.samples.push(FoldedProfileSample {
+                scope,
+                stack: stack.to_owned(),
+                weight,
+            });
+        }
+
+        fn folded(&self) -> Vec<FoldedProfileSample> {
+            let mut samples = self.samples.clone();
+            samples.sort_by(|left, right| {
+                right
+                    .weight
+                    .cmp(&left.weight)
+                    .then_with(|| left.stack.cmp(&right.stack))
+            });
+            samples
+        }
+    }
+
+    /// The linear perf history `PerfMetricHistory` replaced, reduced to
+    /// the fields its eviction and ordering depend on.
+    struct LinearPerfHistory {
+        capacity: usize,
+        samples: Vec<(ProfileScope, String, u64, u64)>,
+    }
+
+    impl LinearPerfHistory {
+        fn record(&mut self, scope: ProfileScope, name: &str, nanos: u64) {
+            if let Some(sample) = self
+                .samples
+                .iter_mut()
+                .find(|sample| sample.0 == scope && sample.1 == name)
+            {
+                sample.2 += 1;
+                sample.3 += nanos;
+                return;
+            }
+            if self.samples.len() == self.capacity {
+                let coldest_index = self
+                    .samples
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, sample)| sample.2)
+                    .map(|(index, _)| index)
+                    .expect("non-empty perf metric samples should have a coldest entry");
+                self.samples.swap_remove(coldest_index);
+            }
+            self.samples.push((scope, name.to_owned(), 1, nanos));
+        }
+
+        fn recent(&self) -> Vec<(ProfileScope, String, u64, u64)> {
+            let mut samples = self.samples.clone();
+            samples.sort_by(|left, right| {
+                right
+                    .3
+                    .cmp(&left.3)
+                    .then_with(|| right.2.cmp(&left.2))
+                    .then_with(|| left.1.cmp(&right.1))
+            });
+            samples
+        }
+    }
+
+    /// A deterministic stream of records over more stacks than the
+    /// history holds, with small weights so that equal weights — the
+    /// case the eviction order decides — come up constantly.
+    fn record_stream(mut each: impl FnMut(ProfileScope, &str, u64)) {
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        for _ in 0..20_000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let scope = if state & 1 == 0 {
+                ProfileScope::Kernel
+            } else {
+                ProfileScope::User
+            };
+            let stack = alloc::format!("kernel;stack-{}", (state >> 8) % 24);
+            let weight = (state >> 32) % 6;
+            each(scope, &stack, weight);
+        }
+    }
+
+    #[test]
+    fn profile_history_folds_like_the_linear_history_through_evictions() {
+        for capacity in [1, 2, 3, 7, 16, 64] {
+            let mut keyed = ProfileHistory::new(capacity);
+            let mut linear = LinearProfileHistory {
+                capacity,
+                samples: Vec::new(),
+            };
+            let mut step = 0_u32;
+            record_stream(|scope, stack, weight| {
+                // Alternate the three input shapes the record path takes.
+                match step % 3 {
+                    0 => keyed.record(scope, stack.to_owned(), weight),
+                    1 => keyed.record_str(scope, stack, weight),
+                    _ => {
+                        let (prefix, suffix) = stack.split_at(7);
+                        keyed.record_parts(scope, prefix, suffix, weight);
+                    }
+                }
+                linear.record(scope, stack, weight);
+                step += 1;
+                if step.is_multiple_of(97) {
+                    let filter = ProfileFilter {
+                        scope: None,
+                        stack_prefixes: vec![],
+                    };
+                    assert_eq!(
+                        keyed.folded(&filter, [], 0),
+                        linear.folded(),
+                        "capacity {capacity}, record {step}"
+                    );
+                }
+            });
+            let filter = ProfileFilter {
+                scope: None,
+                stack_prefixes: vec![],
+            };
+            assert_eq!(keyed.folded(&filter, [], 0), linear.folded());
+        }
+    }
+
+    #[test]
+    fn profile_history_evicts_the_first_of_equally_light_stacks() {
+        let mut history = ProfileHistory::new(3);
+        history.record_str(ProfileScope::Kernel, "a", 2);
+        history.record_str(ProfileScope::Kernel, "b", 1);
+        history.record_str(ProfileScope::Kernel, "c", 1);
+        // Full: `b` and `c` tie as lightest and `b` comes first.
+        history.record_str(ProfileScope::Kernel, "d", 5);
+        // Not heavier than the lightest (`c`, 1): dropped.
+        history.record_str(ProfileScope::Kernel, "e", 1);
+        let samples = history.folded(
+            &ProfileFilter {
+                scope: None,
+                stack_prefixes: vec![],
+            },
+            [],
+            0,
+        );
+        let stacks = samples
+            .iter()
+            .map(|sample| (sample.stack.as_str(), sample.weight))
+            .collect::<Vec<_>>();
+        assert_eq!(stacks, vec![("d", 5), ("a", 2), ("c", 1)]);
+    }
+
+    #[test]
+    fn perf_metric_history_matches_the_linear_history_through_evictions() {
+        for capacity in [1, 2, 5, 16] {
+            let mut keyed = PerfMetricHistory::new(capacity);
+            let mut linear = LinearPerfHistory {
+                capacity,
+                samples: Vec::new(),
+            };
+            record_stream(|scope, name, nanos| {
+                let nanos = nanos + 1;
+                keyed.record_str(
+                    scope,
+                    name,
+                    PerfSample::timed(nanos, HardwarePerfCounterDelta::default(), 0),
+                );
+                linear.record(scope, name, nanos);
+            });
+            let recent = keyed
+                .recent(
+                    &PerfMetricFilter {
+                        name_prefixes: vec![],
+                    },
+                    0,
+                )
+                .into_iter()
+                .map(|sample| (sample.scope, sample.name, sample.count, sample.total_nanos))
+                .collect::<Vec<_>>();
+            assert_eq!(recent, linear.recent(), "capacity {capacity}");
+        }
     }
 
     #[test]

@@ -128,10 +128,10 @@ pub use input::{
     MAX_REPORT_EVENTS, install_input_devices,
 };
 pub use instance::{
-    ActivityChange, ActivityStep, CondemnedMemory, InstanceActivity, InstanceExecutionTransition,
-    InstanceId, InstanceProfileTotal, InstanceRegistry, InstanceSnapshot, KernelHeapCharge,
-    KillOutcome, KillReason, MemoryPool, OOM_RECLAIM_GRACE, OomKillDecision, OomKillOutcome,
-    OomPolicy, OomVictim, RegisteredInstance, allow_instance_resource_growth,
+    CondemnedMemory, InstanceActivity, InstanceId, InstanceProfileTotal, InstanceRegistry,
+    InstanceSnapshot, KernelHeapCharge, KillOutcome, KillReason, MemoryPool, OOM_RECLAIM_GRACE,
+    OomKillDecision, OomKillOutcome, OomPolicy, OomVictim, ProcessorTurn, RegisteredInstance,
+    StoreTurns, allow_instance_resource_growth,
 };
 pub use io::{
     BlockInstallError, BlockSelfCheckError, BlockService, BlockStats, ByteReadWait, ByteReader,
@@ -166,9 +166,8 @@ pub use memory::{
     fiber_stack_demand_commits_on, install_entropy_device, install_fiber_stack_arena,
     install_fiber_stack_hooks, install_memory_balloon, install_swap, install_swap_hooks,
     installed_swap_handle, installed_swap_hooks, kernel_reserve_for, largest_servable_user_bytes,
-    page_fault_frame_reserve_bytes, resolve_stack_fault, seed_root_entropy, set_user_memory_owner,
-    swapped_token, task_arena_bytes_for, user_heap_stats, user_mapping_kernel_heap_bytes,
-    validate_range,
+    page_fault_frame_reserve_bytes, resolve_stack_fault, seed_root_entropy, swapped_token,
+    task_arena_bytes_for, user_heap_stats, user_mapping_kernel_heap_bytes, validate_range,
 };
 pub use network::{
     HTTP_FORBIDDEN_FIELD_NAMES, HTTP_MAX_FIELD_SECTION_BYTES, HTTP_MAX_FIELD_VALUE_BYTES, HttpBody,

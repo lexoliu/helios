@@ -1644,36 +1644,20 @@ where
 {
     let mut store = Store::new(engine, state);
     store.limiter(|state| state);
-    store.call_hook(
-        |mut caller: StoreContextMut<'_, StoreData<CpuImpl, Net, HostFs>>, hook| {
-            // The kill reason comes back from `record_transition`
-            // itself, with the activation already ended: a hook that
-            // recorded a transition and then returned an error would
-            // cancel the call whose matching hook closes it, and the
-            // `ReturningFromWasm` that unwinds the trap would then
-            // arrive against an activation nobody holds (#114).
-            // Entering a host call is this store's own turn, and the
-            // only moment a `wasi:sockets` resource that died with a
-            // stream can have it closed: the resource type holds ids
-            // and a queue sender, never the service (#219). Every host
-            // call pays one atomic load for it, and a call that finds
-            // something queued closes it before it runs.
-            caller.data().retire_sockets();
-            let transition = crate::wasmtime_adapter::store::translate_call_hook(hook);
-            match caller.data_mut().record_transition(transition) {
-                Some(reason) => Err(wasmtime::Error::from(crate::InstanceKilled { reason })),
-                None => Ok(()),
-            }
-        },
-    );
+    // No call hook. A host call that does not suspend changes nothing
+    // the kernel accounts: the processor turn, the user-memory owner and
+    // the socket retirements all change hands where the fiber does,
+    // which is where `GuestTurns::drive` wraps the call that drives
+    // this store.
     store.set_epoch_deadline(1);
-    // The epoch tick is also the only place a CPU-bound instance can
-    // observe a pending kill: host-call hooks never run during long pure
-    // wasm stretches (e.g. an AOT compile), and cancelling the future
+    // The epoch tick is where a condemned instance traps: a CPU-bound
+    // guest makes no host call at all (an AOT compile, say), and the
+    // kill bumps the epoch so a guest that is running meets this at its
+    // next function entry or loop back-edge. Cancelling the future
     // instead would surface a bare interrupt trap that loses the kill
     // reason (OOM vs supervisor restart).
-    store.epoch_deadline_callback(|mut caller| {
-        if let Some(reason) = caller.data_mut().end_on_pending_kill() {
+    store.epoch_deadline_callback(|caller| {
+        if let Some(reason) = caller.data().pending_kill() {
             return Err(wasmtime::Error::from(crate::InstanceKilled { reason }));
         }
         Ok(wasmtime::UpdateDeadline::Yield(1))

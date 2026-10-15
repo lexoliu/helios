@@ -9,8 +9,8 @@ extern crate alloc;
 use alloc::boxed::Box;
 
 use helios_hal::cpu::Cpu;
+use wasmtime::ResourceLimiter;
 use wasmtime::component::ResourceTable;
-use wasmtime::{CallHook, ResourceLimiter};
 use wasmtime_wasi_io::IoView;
 use wasmtime_wasi_io::bytes::Bytes;
 use wasmtime_wasi_io::poll::Pollable;
@@ -106,8 +106,8 @@ where
     ///
     /// On insufficient user heap or kernel reserve breach, the OOM
     /// killer is asked to mark the largest non-self victim *of the pool
-    /// that ran out* for termination (so the next host-call boundary on
-    /// that instance traps with [`crate::InstanceKilled`] and frees its
+    /// that ran out* for termination (so that instance traps with
+    /// [`crate::InstanceKilled`] at its next epoch check and frees its
     /// memory). The growing request itself still returns
     /// `ProgramOutOfMemory` — reclamation happens asynchronously and the
     /// requester retries on the next allocation attempt or surfaces the
@@ -513,19 +513,6 @@ impl OutputStream for SerialOutputStream {
             return Ok(0);
         }
         Ok(P2_SERIAL_WRITE_PERMIT_BYTES)
-    }
-}
-
-/// Hook adapter that translates `wasmtime::CallHook` into kernel instance
-/// execution transitions.
-pub(crate) fn translate_call_hook(hook: CallHook) -> crate::InstanceExecutionTransition {
-    match hook {
-        CallHook::CallingWasm | CallHook::ReturningFromHost => {
-            crate::InstanceExecutionTransition::Resume
-        }
-        CallHook::ReturningFromWasm | CallHook::CallingHost => {
-            crate::InstanceExecutionTransition::Pause
-        }
     }
 }
 

@@ -88,10 +88,9 @@ impl WasmtimeEngine {
 
 /// Stash of the program-service engine used by the OOM killer to wake
 /// CPU-bound victims. `crate::instance::request_kill` calls
-/// `bump_user_engine_epoch` so the next `epoch_deadline_async_yield`
-/// boundary on any executing wasm fires; that yield forces `call_hook`
-/// to observe the kill flag and trap, even when the victim is in pure
-/// wasm without WASI calls.
+/// `bump_user_engine_epoch` so the next epoch check on any executing
+/// wasm fires the store's epoch callback, which observes the kill flag
+/// and traps, even when the victim is in pure wasm without WASI calls.
 ///
 /// Wasmtime `Engine` is internally an `Arc`, so storing a clone here
 /// is cheap. The static is initialised once, in
@@ -139,9 +138,12 @@ where
 
     async fn run(mut self) -> Result<ComponentRunResult, Self::Error> {
         let run = self.run_func;
-        let raw = self
-            .store
-            .run_concurrent(async move |accessor| run.call_concurrent(accessor, ()).await)
+        let turns = self.store.data().guest_turns();
+        let raw = turns
+            .drive(
+                self.store
+                    .run_concurrent(async move |accessor| run.call_concurrent(accessor, ()).await),
+            )
             .await;
         let (status, exit_code) = interpret_run_result(raw, self.store.data_mut())?;
         let instance_id = self.store.data().instance().id();
@@ -270,8 +272,9 @@ where
             ),
         );
 
-        let instance = linker
-            .instantiate_async(&mut store, &compiled.component)
+        let turns = store.data().guest_turns();
+        let instance = turns
+            .drive(linker.instantiate_async(&mut store, &compiled.component))
             .await?;
 
         let run_func = engine::resolve_wasi_cli_run(&compiled.component, &instance, &mut store)?;

@@ -407,10 +407,10 @@ where
                 "program:instantiate-core-begin",
             );
             let instantiate_started = profile_cpu.now().ticks();
-            let instance = {
-                let _owner = own_committed_memory(instance_id);
-                linker.instantiate_async(&mut store, &compiled.module).await
-            };
+            let turns = store.data().guest_turns();
+            let instance = turns
+                .drive(linker.instantiate_async(&mut store, &compiled.module))
+                .await;
             record_named_program_kernel_profile(
                 &profile_runtime_state,
                 &profile_cpu,
@@ -480,10 +480,10 @@ where
                 "program:instantiate-core-begin",
             );
             let instantiate_started = profile_cpu.now().ticks();
-            let instance = {
-                let _owner = own_committed_memory(instance_id);
-                instance_pre.instantiate_async(&mut store).await
-            };
+            let turns = store.data().guest_turns();
+            let instance = turns
+                .drive(instance_pre.instantiate_async(&mut store))
+                .await;
             record_named_program_kernel_profile(
                 &profile_runtime_state,
                 &profile_cpu,
@@ -530,7 +530,8 @@ where
         let run_phase_started = profile_cpu.now().ticks();
         timeline.record(&run_cpu, LaunchPhase::GuestBegin);
         let result = loop {
-            let result = start.call_async(&mut store, ()).await;
+            let turns = store.data().guest_turns();
+            let result = turns.drive(start.call_async(&mut store, ())).await;
             if handle_wasix_asyncify_completion(&mut store, &instance).await? {
                 continue;
             }
@@ -564,7 +565,7 @@ where
                 if let Some(replacement) = store.data_mut().take_exec_replacement() {
                     CoreModuleRunCompletion::Exec(Box::new(replacement))
                 } else {
-                    CoreModuleRunCompletion::Exit(match store.data_mut().take_requested_exit() {
+                    CoreModuleRunCompletion::Exit(match store.data_mut().take_exit_status(&error) {
                         Some(code) => Ok(ChildExit {
                             instance_id,
                             exit_code: code,
@@ -723,10 +724,10 @@ where
             "program:instantiate-core-begin",
         );
         let instantiate_started = profile_cpu.now().ticks();
-        let instance = {
-            let _owner = own_committed_memory(instance_id);
-            linker.instantiate_async(&mut store, &compiled.module).await
-        };
+        let turns = store.data().guest_turns();
+        let instance = turns
+            .drive(linker.instantiate_async(&mut store, &compiled.module))
+            .await;
         record_named_program_kernel_profile(
             &profile_runtime_state,
             &profile_cpu,
@@ -775,7 +776,8 @@ where
         let run_phase_started = profile_cpu.now().ticks();
         timeline.record(&run_cpu, LaunchPhase::GuestBegin);
         let result = loop {
-            let result = start.call_async(&mut store, ()).await;
+            let turns = store.data().guest_turns();
+            let result = turns.drive(start.call_async(&mut store, ())).await;
             if handle_wasix_asyncify_completion(&mut store, &instance).await? {
                 continue;
             }
@@ -809,7 +811,7 @@ where
                 if let Some(replacement) = store.data_mut().take_exec_replacement() {
                     CoreModuleRunCompletion::Exec(Box::new(replacement))
                 } else {
-                    CoreModuleRunCompletion::Exit(match store.data_mut().take_requested_exit() {
+                    CoreModuleRunCompletion::Exit(match store.data_mut().take_exit_status(&error) {
                         Some(code) => Ok(ChildExit {
                             instance_id,
                             exit_code: code,
@@ -949,10 +951,10 @@ where
         .profiling_enabled()
         .then(|| profile_cpu.now().ticks());
     timeline.record(&run_cpu, LaunchPhase::StorePrepare);
-    let instance = {
-        let _owner = own_committed_memory(instance_id);
-        instance_pre.instantiate_async(&mut store).await
-    };
+    let turns = store.data().guest_turns();
+    let instance = turns
+        .drive(instance_pre.instantiate_async(&mut store))
+        .await;
     timeline.record(&run_cpu, LaunchPhase::Instantiate);
     if let Some(instantiate_instance_started) = instantiate_instance_started {
         record_program_kernel_profile(
@@ -1664,8 +1666,9 @@ where
             kind: ProgramExecErrorKind::InvalidBinary,
             detail: ProgramExecErrorDetail::UnwindExportInvalid,
         })?;
-    function
-        .call_async(&mut *store, ())
+    let turns = store.data().guest_turns();
+    turns
+        .drive(function.call_async(&mut *store, ()))
         .await
         .map_err(map_program_runtime_error)
 }
@@ -1687,8 +1690,9 @@ where
             kind: ProgramExecErrorKind::InvalidBinary,
             detail: ProgramExecErrorDetail::UnwindExportInvalid,
         })?;
-    function
-        .call_async(&mut *store, value as i32)
+    let turns = store.data().guest_turns();
+    turns
+        .drive(function.call_async(&mut *store, value as i32))
         .await
         .map_err(map_program_runtime_error)
 }
@@ -1887,24 +1891,4 @@ pub(super) fn trusted_signed_payload(bytes: &Bytes) -> Result<Bytes, ProgramExec
     let trusted = cwasm::verify_signed_artifact(UntrustedCwasm::new(bytes))
         .map_err(map_artifact_trust_error)?;
     Ok(bytes.slice(..trusted.payload().len()))
-}
-
-/// Charges the linear memory an instantiation commits to the instance
-/// being instantiated.
-///
-/// Instantiation is where an instance's memory actually appears — the
-/// pooling allocator makes its slot accessible here, long before any
-/// guest code runs and therefore before any call hook can name an
-/// owner. The scope is held across the `.await` on purpose: this task
-/// is pinned to its processor, and instantiation is the only thing it
-/// is doing. Work that another task interleaves on the same processor
-/// in that window is charged here too, which costs the swap policy some
-/// precision in choosing a victim and costs correctness nothing — the
-/// pages, their flags and their tokens are the address space's, not the
-/// owner tag's.
-fn own_committed_memory(instance: crate::InstanceId) -> crate::UserMemoryOwnerScope<'static> {
-    crate::enter_user_memory_owner(
-        helios_hal::cpu::current_processor(),
-        crate::MemoryOwner::new(instance.raw()),
-    )
 }

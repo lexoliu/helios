@@ -182,8 +182,9 @@ where
         ),
     );
 
-    let wasm_instance = instance_pre
-        .instantiate_async(&mut store)
+    let turns = store.data().guest_turns();
+    let wasm_instance = turns
+        .drive(instance_pre.instantiate_async(&mut store))
         .await
         .map_err(map_program_runtime_error)?;
     crate::wasmtime_adapter::component_host::record_linear_memory(&mut store, &wasm_instance);
@@ -191,15 +192,16 @@ where
     let guest = handler.wasi_http_handler().clone();
 
     let mut first = Some(first);
-    store
-        .run_concurrent(async move |accessor| {
+    let turns = store.data().guest_turns();
+    turns
+        .drive(store.run_concurrent(async move |accessor| {
             let exchange = first.take().expect("the first exchange is dispatched once");
             dispatch_exchange(accessor, &guest, exchange)?;
             while let Some(exchange) = receiver.recv().await {
                 dispatch_exchange(accessor, &guest, exchange)?;
             }
             Ok::<(), wasmtime::Error>(())
-        })
+        }))
         .await
         .and_then(|result| result)
         .map_err(map_program_runtime_error)
