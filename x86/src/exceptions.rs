@@ -610,7 +610,7 @@ extern "C" fn helios_x86_interrupt_dispatch(frame: &mut ExceptionFrame) {
     runtime.begin_interrupt_dispatch(frame.vector);
     match u8::try_from(frame.vector) {
         Ok(TIMER_INTERRUPT_VECTOR) => {
-            smp::handle_local_timer_interrupt();
+            smp::handle_local_timer_interrupt(frame.rip as usize);
         }
         Ok(WAKE_INTERRUPT_VECTOR) => {
             // The wake IPI exists solely to drag a HLT-ed processor

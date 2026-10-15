@@ -339,9 +339,52 @@ the tag. The same artifact carries, for the run's own image and for a
 paired baseline, every boot's raw records beside its `helios-*.jsonl`:
 the kernel counters the guest reported (`helios-*.perf.json`, the
 `kernel;network;*` rows the report tabulates only the top of) and the
-sampled kernel profile (`helios-*.kernel.folded`), so a diagnosis that
+scoped kernel profile (`helios-*.kernel.folded`), so a diagnosis that
 needs a counter the table cut, or the baseline's counters at all, reads
 them from the artifact instead of re-running the lane.
+
+On request, each x86-64 boot of the run's own image also writes an
+instruction-level profile, `helios-*.pc.folded`. The scoped profile can
+only name the phases the kernel times, so `kernel;program;run-component`
+stays one opaque row; the instruction-level profile splits it.
+
+The instruction-level profile is opt-in and never part of a measurement.
+While instruction sampling runs, each processor's local-APIC timer
+interrupts at 1 kHz instead of its 100 Hz scheduler tick, and each
+interrupt records the instruction it interrupted. The scheduler's own work
+(watchdog, Wasmtime epoch, kernel timer) still runs on every tenth
+interrupt only, so the guest's yield cadence matches an unprofiled run,
+but the extra interrupts (and, under KVM, the extra timer exits) on every
+processor cost time the medians would carry. In a paired run only this
+checkout's image can sample, so sampling in a measured run would also bias
+the comparison toward the baseline. Sampling therefore has its own control
+(`helios:system/profiling.set-instruction-sampling`), separate from the
+scoped profiler every lane boot enables. The inspector starts it only when
+`--instruction-profile-output` is given, for the duration of the workload,
+and stops it before reading the samples. `linux-gap-bench.py` passes the
+option only when `HELIOS_BENCH_INSTRUCTION_PROFILE=1`, and `bench-suite.yml`
+sets that from its `instruction_profile` dispatch input (default off). A
+run with it on is a diagnosis; its timings are not evidence for anything.
+
+The kernel names each wasm address after the program
+and function it lies in. The inspector names every other address against
+the exact kernel ELF it booted. Each line is one location and its sample
+count:
+
+- `wasm;<program>;<function>`, or `func[<module>:<index>]` for a function
+  with no name in its name section;
+- `wasm;<program>;[trampoline]`;
+- `kernel;<function>`;
+- `unknown`.
+
+At the end of each boot, the inspector prints the sample total, the drop
+count and the period on its `instruction_profile_output=` line. A paired
+baseline built from another commit is booted by its own ref's inspector,
+which may predate the option, so that image writes no instruction-level
+profile. The `workload-bench` and `aot-bench` option is
+`--instruction-profile-output`. aarch64 and riscv64 do not sample
+instruction addresses, and their kernels refuse the request rather than
+return an empty profile.
 
 The `kernel;hostfs;*` counters decompose the virtio-9p host share the
 way `kernel;network;*` does the interface:

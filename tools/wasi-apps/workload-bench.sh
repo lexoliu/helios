@@ -214,6 +214,10 @@ if [[ -n "${HELIOS_WORKLOAD_BENCH_KERNEL_PROFILE_OUTPUT:-}" ]]; then
     command+=(--kernel-profile-output "${HELIOS_WORKLOAD_BENCH_KERNEL_PROFILE_OUTPUT}")
 fi
 
+if [[ -n "${HELIOS_WORKLOAD_BENCH_INSTRUCTION_PROFILE_OUTPUT:-}" ]]; then
+    command+=(--instruction-profile-output "${HELIOS_WORKLOAD_BENCH_INSTRUCTION_PROFILE_OUTPUT}")
+fi
+
 if [[ -n "${HELIOS_WORKLOAD_BENCH_USER_PROFILE_OUTPUT:-}" ]]; then
     command+=(--user-profile-output "${HELIOS_WORKLOAD_BENCH_USER_PROFILE_OUTPUT}")
 fi

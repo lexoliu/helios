@@ -2906,6 +2906,33 @@ macro_rules! impl_profiling_bindings {
                         Ok((samples,))
                     },
                 )?;
+                instance.func_wrap("set-instruction-sampling", |caller, (enabled,): (bool,)| {
+                    let result = caller
+                        .data()
+                        .runtime_state
+                        .instruction_sampler()
+                        .set_sampling(enabled)
+                        .map_err(convert_instruction_profile_error);
+                    Ok((result,))
+                })?;
+                instance.func_wrap("instruction-samples", |caller, (): ()| {
+                    let runtime_state = &caller.data().runtime_state;
+                    // Only the program service knows the wasm code that
+                    // can run; a read before it exists is a bring-up
+                    // ordering defect, not an empty profile.
+                    let service = runtime_state.program_service().ok_or_else(|| {
+                        wasmtime::Error::msg(
+                            "instruction samples were read before the program service was \
+                             installed",
+                        )
+                    })?;
+                    let profile = runtime_state
+                        .instruction_sampler()
+                        .profile(service.code_map())
+                        .map(convert_instruction_profile)
+                        .map_err(convert_instruction_profile_error);
+                    Ok((profile,))
+                })?;
                 instance.func_wrap("raw-profile-size", |_caller, (): ()| {
                     Ok((crate::KernelLlvmProfile
                         .size()
@@ -2974,6 +3001,50 @@ macro_rules! impl_profiling_bindings {
                 match scope {
                     $wit::profiling::Scope::Kernel => ProfileScope::Kernel,
                     $wit::profiling::Scope::User => ProfileScope::User,
+                }
+            }
+
+            fn convert_instruction_profile(
+                profile: crate::InstructionProfile,
+            ) -> $wit::profiling::InstructionProfile {
+                $wit::profiling::InstructionProfile {
+                    period_nanos: profile.capture.period_nanos,
+                    kernel_image_base: profile.capture.kernel_image_base,
+                    samples: profile
+                        .samples
+                        .into_iter()
+                        .map(|(code, count)| $wit::profiling::InstructionSample {
+                            code: convert_sampled_code(code),
+                            count,
+                        })
+                        .collect(),
+                    dropped: profile.dropped,
+                }
+            }
+
+            fn convert_sampled_code(code: crate::SampledCode) -> $wit::profiling::SampledCode {
+                use crate::SampledCode as Local;
+                use $wit::profiling::SampledCode as Wit;
+
+                match code {
+                    Local::Wasm(function) => Wit::Wasm($wit::profiling::WasmFunction {
+                        module: String::from(&*function.module),
+                        static_module: function.static_module,
+                        index: function.index,
+                        name: function.name.map(|name| String::from(&*name)),
+                    }),
+                    Local::WasmTrampoline { module } => Wit::WasmTrampoline(String::from(&*module)),
+                    Local::Native(address) => Wit::Native(address),
+                }
+            }
+
+            fn convert_instruction_profile_error(
+                error: crate::InstructionProfileError,
+            ) -> $wit::profiling::InstructionProfileError {
+                match error {
+                    crate::InstructionProfileError::NotCaptured => {
+                        $wit::profiling::InstructionProfileError::NotCaptured
+                    }
                 }
             }
 
