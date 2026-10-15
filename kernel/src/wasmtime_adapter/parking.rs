@@ -20,9 +20,15 @@
 //! Wasmtime dropped its lock and before this hook armed has already moved
 //! the generation past that value, so the wait returns at once instead of
 //! losing the wake.
+//!
+//! A timed wait ends on Wasmtime's side, not here: `ParkingSpot` turns the
+//! guest's timeout into an absolute deadline on `wasmtime_monotonic_nanos`
+//! and parks only for the time that remains until it, so a return that was
+//! neither its notify nor its deadline parks again for the remainder, and a
+//! return at the deadline yields `TimedOut`. That clock is the processor's
+//! `Cpu` timebase, the one every `Timer` reads.
 
 use core::sync::atomic::{AtomicU64, Ordering};
-use core::time::Duration;
 
 use futures::future::select;
 use helios_hal::cpu::Cpu;
@@ -82,7 +88,16 @@ where
         if timeout_nanos == u64::MAX {
             unparked.await;
         } else {
-            let timeout = core::pin::pin!(timer.sleep_for(Duration::from_nanos(timeout_nanos)));
+            // Rounded up to a whole tick: a sleep that ended short of the
+            // deadline Wasmtime measures against would return it to the
+            // loop with a sub-tick remainder, which rounds down to a sleep
+            // that is already due, and the fiber would spin until the clock
+            // caught up.
+            let ticks = timer
+                .cpu()
+                .timebase()
+                .nanos_to_ticks_ceil_saturating(timeout_nanos);
+            let timeout = core::pin::pin!(timer.sleep_until(timer.now().saturating_add(ticks)));
             select(unparked, timeout).await;
         }
     };
@@ -105,4 +120,15 @@ where
         ),
     }
     returned_at.store(parked.generation.load(Ordering::Acquire), Ordering::Relaxed);
+}
+
+/// Body of `wasmtime_monotonic_nanos`: `timer`'s clock in nanoseconds.
+/// `timer` is the calling processor's timer. Every processor's timer reads
+/// the same `Cpu` timebase, so a deadline Wasmtime computes on one
+/// processor holds when the waiting fiber resumes on another.
+pub fn wasmtime_monotonic_nanos<CpuImpl>(timer: &Timer<CpuImpl>) -> u64
+where
+    CpuImpl: Cpu + Clone,
+{
+    timer.cpu().timebase().ticks_to_nanos(timer.now().ticks())
 }

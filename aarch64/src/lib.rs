@@ -2240,18 +2240,29 @@ extern "C" fn wasmtime_init_traps(handler: helios_kernel::KernelNativeTrapHandle
     0
 }
 
+/// The calling processor's timer, for the Wasmtime parking hooks.
+#[cfg(target_os = "none")]
+fn wasmtime_parking_timer() -> &'static Timer<Aarch64Cpu> {
+    current_processor_runtime()
+        .timer
+        .get()
+        .expect("AArch64 processor timer was read before it was installed")
+}
+
 #[cfg(target_os = "none")]
 #[unsafe(no_mangle)]
 extern "C" fn wasmtime_parking_wait(timeout_nanos: u64) {
-    let timer = current_processor_runtime()
-        .timer
-        .get()
-        .expect("AArch64 processor timer was read before it was installed");
-    helios_kernel::park_wasmtime_waiter(timer, timeout_nanos);
+    helios_kernel::park_wasmtime_waiter(wasmtime_parking_timer(), timeout_nanos);
 }
 
 #[cfg(target_os = "none")]
 #[unsafe(no_mangle)]
 extern "C" fn wasmtime_parking_unpark() {
     helios_kernel::unpark_wasmtime_waiters();
+}
+
+#[cfg(target_os = "none")]
+#[unsafe(no_mangle)]
+extern "C" fn wasmtime_monotonic_nanos() -> u64 {
+    helios_kernel::wasmtime_monotonic_nanos(wasmtime_parking_timer())
 }

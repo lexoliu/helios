@@ -33,7 +33,9 @@ mod vsock;
 #[cfg(feature = "wasmtime-runtime")]
 pub(crate) mod wasmtime_adapter;
 #[cfg(all(target_os = "none", feature = "wasmtime-bare-metal"))]
-pub use wasmtime_adapter::parking::{park_wasmtime_waiter, unpark_wasmtime_waiters};
+pub use wasmtime_adapter::parking::{
+    park_wasmtime_waiter, unpark_wasmtime_waiters, wasmtime_monotonic_nanos,
+};
 #[cfg(feature = "wasmtime-runtime")]
 pub use wasmtime_adapter::swap_fault::resolve_swap_fault_blocking;
 pub use wasmtime_adapter::tls::WasmtimeTlsSlots;
