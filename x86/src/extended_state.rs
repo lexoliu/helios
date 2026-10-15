@@ -18,7 +18,7 @@
 //! writes those components, so they survive interrupt entry/exit without
 //! XSAVE.
 //! This is deliberate: #410 measured eager AVX-512 XSAVE on every interrupt
-//! as +15–38% on interrupt/IPI-heavy rows. Timer/epoch, wake, TLB-shootdown,
+//! as +15–38% on interrupt/IPI-heavy rows. Timer/preemption, wake, TLB-shootdown,
 //! and device handlers do not switch context. Wasmtime trap delivery resumes
 //! at a call boundary where SysV vector registers are dead, and the FXSAVE
 //! area remains on the IST stack.
@@ -26,7 +26,7 @@
 //! Fiber switches are cooperative calls; SysV makes vector registers and
 //! k-masks caller-saved, so only callee-saved GPRs switch. MXCSR and the x87
 //! control word are callee-saved but unchanged across a switch. Preemption is
-//! cooperative through a Cranelift epoch check and call boundary; x86 has no
+//! cooperative through a Cranelift stack-limit check and call boundary; x86 has no
 //! asynchronous preemption. The aarch64 swap trampoline does not exist here:
 //! x86 disables swap with `SwapDisabled::NoSwapHooks`. If swap is added (#25),
 //! arbitrary interruption requires full XSAVE of the enabled XCR0 state.

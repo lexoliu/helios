@@ -4,6 +4,9 @@ version = "0.1.0"
 edition.workspace = true
 
 [dependencies]
+# Expands a sampled kernel address into the chain of functions inlined at
+# it, from the DWARF the kernel image carries on the host (#451).
+addr2line = { version = "0.26.1", default-features = false, features = ["std"] }
 askama = "0.15.6"
 async-channel = "2.5.0"
 async-io = "2.6.0"
@@ -24,6 +27,7 @@ tempfile.workspace = true
 futures-io = "0.3.34"
 futures-lite = "2.6.1"
 futures-util = { version = "0.3.31", default-features = false, features = ["io"] }
+gimli = { version = "0.33.0", default-features = false, features = ["read", "endian-reader", "std"] }
 helios-inspector-protocol.workspace = true
 helios-hal.workspace = true
 helios-profdata.workspace = true
@@ -48,6 +52,8 @@ time = { version = "0.3.47", default-features = false, features = ["formatting",
 # Synthesizes an ELF for the function-count test; `write` unifies onto
 # the read-only dependency only when the tests build.
 object = { version = "0.39", default-features = false, features = ["elf", "read", "write", "std"] }
+# Writes the DWARF of the instruction-profile test's synthetic kernel.
+gimli = { version = "0.33.0", default-features = false, features = ["read", "endian-reader", "std", "write"] }
 
 # AF_VSOCK exists only on Linux; the inspector's vsock transport is
 # compiled out elsewhere and reports a typed error instead.

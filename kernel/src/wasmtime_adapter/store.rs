@@ -17,18 +17,18 @@ use wasmtime_wasi_io::poll::Pollable;
 use wasmtime_wasi_io::streams::{InputStream, OutputStream, StreamError, StreamResult};
 
 use crate::io::{ByteReader, ByteWriter};
+use crate::wasmtime_adapter::component_host::{StoreData, deliver_kill};
 use crate::{
-    ComponentRuntimeState, ComponentStoreData, KernelHeapHeadroom, MemoryPool, OomKillOutcome,
-    ProgramOutOfMemory, allow_instance_resource_growth, heap_stats, monotonic_nanos,
-    user_heap_stats,
+    ComponentHostNetwork, ComponentRuntimeState, ComponentStoreData, HostFileSystem,
+    KernelHeapHeadroom, MemoryPool, OomKillOutcome, ProgramOutOfMemory,
+    allow_instance_resource_growth, heap_stats, monotonic_nanos, user_heap_stats,
 };
 
-impl<CpuImpl, RuntimeStateImpl, FileSystem> ResourceLimiter
-    for ComponentStoreData<CpuImpl, RuntimeStateImpl, FileSystem, ResourceTable>
+impl<CpuImpl, Net, HostFs> ResourceLimiter for StoreData<CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
-    RuntimeStateImpl: ComponentRuntimeState,
-    FileSystem: Send,
+    Net: ComponentHostNetwork,
+    HostFs: HostFileSystem,
 {
     fn memory_growing(
         &mut self,
@@ -85,12 +85,11 @@ where
     }
 }
 
-impl<CpuImpl, RuntimeStateImpl, FileSystem>
-    ComponentStoreData<CpuImpl, RuntimeStateImpl, FileSystem, ResourceTable>
+impl<CpuImpl, Net, HostFs> StoreData<CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
-    RuntimeStateImpl: ComponentRuntimeState,
-    FileSystem: Send,
+    Net: ComponentHostNetwork,
+    HostFs: HostFileSystem,
 {
     /// Decide whether `growth` extra bytes of user memory can be granted.
     ///
@@ -106,9 +105,9 @@ where
     ///
     /// On insufficient user heap or kernel reserve breach, the OOM
     /// killer is asked to mark the largest non-self victim *of the pool
-    /// that ran out* for termination (so that instance traps with
-    /// [`crate::InstanceKilled`] at its next epoch check and frees its
-    /// memory). The growing request itself still returns
+    /// that ran out* for termination, and its stores are interrupted, so
+    /// that instance traps with [`crate::InstanceKilled`] at its next
+    /// interrupt check and frees its memory. The growing request itself still returns
     /// `ProgramOutOfMemory` — reclamation happens asynchronously and the
     /// requester retries on the next allocation attempt or surfaces the
     /// error to its caller.
@@ -181,7 +180,9 @@ where
         );
         let condemned = decision.condemned;
         match decision.outcome {
-            OomKillOutcome::Condemned(victim) => tracing::warn!(
+            OomKillOutcome::Condemned(victim) => {
+                deliver_kill(&self.runtime_state, victim.id);
+                tracing::warn!(
                 target: "helios_kernel::oom",
                 requester = ?requester,
                 pool = ?pool,
@@ -195,7 +196,8 @@ where
                 condemned_pending_bytes = condemned.pending_bytes,
                 condemned_stale_bytes = condemned.stale_bytes,
                 "OOM killer condemned victim to free memory"
-            ),
+                );
+            }
             OomKillOutcome::AwaitingReclaim => tracing::debug!(
                 target: "helios_kernel::oom",
                 requester = ?requester,

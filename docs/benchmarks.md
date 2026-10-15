@@ -352,7 +352,7 @@ The instruction-level profile is opt-in and never part of a measurement.
 While instruction sampling runs, each processor's local-APIC timer
 interrupts at 1 kHz instead of its 100 Hz scheduler tick, and each
 interrupt records the instruction it interrupted. The scheduler's own work
-(watchdog, Wasmtime epoch, kernel timer) still runs on every tenth
+(watchdog, guest preemption, kernel timer) still runs on every tenth
 interrupt only, so the guest's yield cadence matches an unprofiled run,
 but the extra interrupts (and, under KVM, the extra timer exits) on every
 processor cost time the medians would carry. In a paired run only this
@@ -374,8 +374,45 @@ count:
 - `wasm;<program>;<function>`, or `func[<module>:<index>]` for a function
   with no name in its name section;
 - `wasm;<program>;[trampoline]`;
-- `kernel;<function>`;
+- `kernel;<outermost>;…;<innermost>`;
 - `unknown`.
+
+A kernel location is the chain of functions inlined at the sampled
+instruction, not only the symbol that contains it: a fat-LTO image folds
+most of the host-call path into a few large symbols, and the chain splits
+them. The first frame is the function whose symbol holds the address, each
+next one is a function inlined into the one before, and the last is the
+function the instruction belongs to. The chain comes from the image's DWARF.
+The inspector builds every optimised kernel (`--release`,
+`--profile-generate`, `--profile-use`) with `-C debuginfo=limited`, the
+level that gives every inlined function its linkage name and so its full
+path. It passes it as a rustflag and not as the cargo profile's `debug`
+key, because cargo folds the profile into each crate's `-C metadata`: that
+renames every symbol, and under fat LTO the renamed functions merge in
+another order and move inlining decisions. As a rustflag the debuginfo
+leaves every function's code as it was: with and without it the image has
+the same program headers and allocated-section sizes, and every
+function's instructions are the same once addresses are abstracted
+(#451). A rustflag can still move where a function lands: rustc merges
+the upstream modules of a fat-LTO link in the order of their object names,
+which carry cargo's per-flags hash, so two crates that share a name (the
+image links two `wasmparser` versions) can merge the other way round, as
+they can under any rustflag, the PGO ones included. The inspector reads
+the DWARF from the ELF on the host, and the boot disk carries the image
+without it: `helios-cli limine-uefi-image` drops every `.debug_*` section
+and refuses to write an image whose program headers or allocated sections
+changed, so the guest loads exactly the bytes the host names, and Limine's
+copy of the file, which the kernel keeps reserved, costs no more memory
+than it did. An address in code with no DWARF, such as an assembly
+routine, is the containing symbol alone, `kernel;<symbol>`; one in no
+symbol either is `kernel;[unsymbolized]`. A kernel image without DWARF,
+such as a `dev`-profile build, is refused with the builds that carry it.
+
+Each line is one instruction's own location; the frames that called into
+the outermost function are not in it. Recovering them would need the
+sampling interrupt to record the interrupted stack as well as the
+instruction, and the host to unwind it, which is new code in the measured
+kernel rather than a change to what the host reads.
 
 At the end of each boot, the inspector prints the sample total, the drop
 count and the period on its `instruction_profile_output=` line. A paired

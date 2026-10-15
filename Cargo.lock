@@ -1732,6 +1732,7 @@ dependencies = [
  "helios-workspace-root",
  "hex",
  "mbrman",
+ "object",
  "rand 0.10.2",
  "serde",
  "serde_json",
@@ -1895,6 +1896,7 @@ dependencies = [
 name = "helios-inspector"
 version = "0.1.0"
 dependencies = [
+ "addr2line",
  "askama",
  "async-channel",
  "async-io",
@@ -1908,6 +1910,7 @@ dependencies = [
  "futures-io",
  "futures-lite",
  "futures-util",
+ "gimli",
  "helios-hal",
  "helios-inspector-protocol",
  "helios-profdata",

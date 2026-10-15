@@ -230,8 +230,8 @@ where
         &phases::Timeline::disabled(),
     )?;
 
-    let mut store = crate::wasmtime_adapter::store_with_state(
-        service.inner.engine.raw(),
+    let (mut store, interrupts) = crate::wasmtime_adapter::store_with_state(
+        &service.inner.engine,
         StoreData::<CpuImpl, Net, HostFs>::new(
             ResourceTable::new(),
             exec_context.cpu.clone(),
@@ -260,8 +260,8 @@ where
     );
 
     let turns = store.data().guest_turns();
-    let wasm_instance = turns
-        .drive(instance_pre.instantiate_async(&mut store))
+    let wasm_instance = interrupts
+        .drive(turns.drive(instance_pre.instantiate_async(&mut store)))
         .await
         .map_err(map_program_runtime_error)?;
     crate::wasmtime_adapter::component_host::record_linear_memory(&mut store, &wasm_instance);
@@ -283,8 +283,8 @@ where
     let serve_registry = registry.clone();
     let serve_guest = guest.clone();
     let turns = store.data().guest_turns();
-    turns
-        .drive(store.run_concurrent(async move |accessor| {
+    interrupts
+        .drive(turns.drive(store.run_concurrent(async move |accessor| {
             // The desktop itself, as a task of this store, so the calls
             // into it are not queued behind it.
             accessor.spawn(RunDesktop {
@@ -300,7 +300,7 @@ where
                 serve_request(accessor, &serve_guest, &serve_registry, request).await?;
             }
             Ok::<(), wasmtime::Error>(())
-        }))
+        })))
         .await
         .and_then(|result| result)
         .map_err(map_program_runtime_error)

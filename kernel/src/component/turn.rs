@@ -10,7 +10,7 @@
 //! suspends the fiber nor leaves the poll, does no accounting at all.
 //!
 //! It is also where a stop reaches a guest that is not running. A guest
-//! suspended in a host future meets no epoch check, and the future may
+//! suspended in a host future meets no interrupt check, and the future may
 //! never resolve: a sleep, a socket read with no peer, a channel nobody
 //! sends on. So while the call is suspended its turn waits on the
 //! instance's condemnation and on the store's own stop beside the call,
@@ -107,7 +107,7 @@ impl StopWake for SocketRetirementQueue {
 /// A component store closes the sockets its guest let go of during the
 /// turn. Draining when the store gives up the processor bounds the
 /// delay between a socket's death and its close by one turn: the next
-/// time the guest blocks, yields at an epoch tick, or finishes.
+/// time the guest blocks, yields at a scheduler tick, or finishes.
 impl<RuntimeStateImpl, Error> TurnEpilogue<RuntimeStateImpl, Error> for SocketRetirementQueue
 where
     RuntimeStateImpl: ComponentRuntimeState,
@@ -217,14 +217,14 @@ pin_project! {
     /// suspended, and when it completes, in that precedence, and a stop
     /// ends the call ahead of its result.
     ///
-    /// A guest that is running meets both stops at its next epoch check,
-    /// which raising either makes immediate. A guest suspended in a host
+    /// A guest that is running meets both stops at its next interrupt
+    /// check, which raising either makes immediate. A guest suspended in a host
     /// future meets none, so the turn waits for both beside the call,
     /// and a stop raised while the call is suspended drops the call in a
     /// turn of its own: Wasmtime resumes the fiber only so it can
     /// unwind, and the unwinding is the instance's processor time and
     /// memory. A call that returns to the host before it reaches an
-    /// epoch check, its last host call having been where the stop
+    /// interrupt check, its last host call having been where the stop
     /// arrived, meets it where it completes.
     ///
     /// # Concurrency
@@ -260,8 +260,8 @@ where
         let mut this = self.project();
         let turns = &*this.turns;
         // A stop raised since the last poll ends the call without
-        // resuming it: the guest would only meet it at its next epoch
-        // check, and a host future that has not resolved may never let
+        // resuming it: the guest would only meet it at its next
+        // interrupt check, and a host future that has not resolved may never let
         // it get there.
         if let Some(stop) = turns.stop() {
             turns.on_processor::<Error, _>(|| this.call.set(None));
@@ -431,7 +431,7 @@ mod tests {
 
     /// A kill that lands while the guest is suspended in a host call is
     /// reported when that call completes, even if the guest returns to
-    /// the host without reaching another epoch check.
+    /// the host without reaching another interrupt check.
     #[test]
     fn a_kill_during_a_suspended_host_call_ends_the_call_killed() {
         let registry = InstanceRegistry::new();
@@ -474,7 +474,7 @@ mod tests {
     }
 
     /// A kill that lands while the guest is in a synchronous host call,
-    /// after which the export returns without another epoch check, ends
+    /// after which the export returns without another interrupt check, ends
     /// the call killed: the turn meets the condemnation where the call
     /// completes, where the call hook used to meet it on the way back
     /// from the host call.

@@ -145,20 +145,19 @@ const fn decode_kill_flag(value: u8) -> Option<KillReason> {
 /// before it will condemn another one to serve the same shortfall.
 ///
 /// Condemning an instance does not free anything by itself: the kill
-/// flag is observed at the victim's next epoch check, or by the turn of
-/// a victim suspended in a host future, and the memory returns when its
-/// store is torn down and its registry entry drops.
-/// [`InstanceRegistry::request_kill`] bumps the runtime engine epoch,
-/// so a victim executing wasm traps at its next epoch check, and the
-/// scheduler tick that also drives those runs every 100ms
-/// (`SCHEDULER_INTERRUPT_INTERVAL`); it also wakes the turn of a victim
-/// that is suspended, which drops the call at the executor's next poll
-/// of it. Five ticks leaves room for the call to unwind and the store
-/// to drop.
+/// flag is observed at the victim's next interrupt check, or by the
+/// turn of a victim suspended in a host future, and the memory returns
+/// when its store is torn down and its registry entry drops.
+/// Whoever condemns the instance also interrupts its stores, so a victim
+/// executing wasm traps at its next function entry or loop header, and
+/// the condemnation wakes the turn of a victim that is suspended, which
+/// drops the call at the executor's next poll of it; five scheduler
+/// ticks (`SCHEDULER_INTERRUPT_INTERVAL`) leave room for the call to
+/// unwind and the store to drop.
 ///
-/// The wait is still bounded, because reclaim is the victim's owner
-/// dropping its store after the call ends, and nothing here can make
-/// an owner do that sooner.
+/// The grace period is still bounded, because reclaim is the victim's
+/// owner dropping its store after the call ends, and nothing here can
+/// make an owner do that sooner.
 /// When the window expires the condemnation goes stale: it stops
 /// counting as coverage, so the next request condemns a fresh victim,
 /// while the stale condemnation stays on the books and stays out of
@@ -271,7 +270,6 @@ struct InstanceRegistryInner {
     next_id: AtomicU64,
     entries: Mutex<Slab<Box<InstanceEntry>>>,
     sampling: Mutex<SamplingState>,
-    kill_notifier: Mutex<fn()>,
 }
 
 struct InstanceEntry {
@@ -291,8 +289,8 @@ struct InstanceEntry {
     stores: Mutex<StoreClocks>,
     /// What the OOM killer may do with this instance.
     policy: OomPolicy,
-    /// Set by the OOM killer / supervisor. The runtime's epoch callback
-    /// reads it and traps the guest with `InstanceKilled { reason }`,
+    /// Set by the OOM killer / supervisor. The runtime's interrupt
+    /// callback reads it and traps the guest with `InstanceKilled { reason }`,
     /// and a guest call that completes while it is set reports the
     /// kill instead of its result.
     kill_flag: AtomicU8,
@@ -336,13 +334,8 @@ impl InstanceRegistry {
                 next_id: AtomicU64::new(1),
                 entries: Mutex::new(Slab::new()),
                 sampling: Mutex::new(SamplingState::default()),
-                kill_notifier: Mutex::new(noop_kill_notifier),
             }),
         }
-    }
-
-    pub fn set_kill_notifier(&self, notifier: fn()) {
-        *self.inner.kill_notifier.lock() = notifier;
     }
 
     pub fn register(&self, name: impl Into<String>, started_at: u64) -> RegisteredInstance {
@@ -421,7 +414,7 @@ impl InstanceRegistry {
     /// before the same request can be admitted.
     ///
     /// Condemning a victim only sets its kill flag; the memory returns
-    /// when that instance traps at its next epoch check and is torn
+    /// when that instance traps at its next interrupt check and is torn
     /// down. Until it does, those bytes are already spoken for, so
     /// a second refused grow that they would satisfy must not condemn a
     /// second live instance — otherwise one 1MiB shortfall walks the
@@ -481,7 +474,6 @@ impl InstanceRegistry {
             .pending_bytes
             .saturating_add(condemned_bytes.of(pool));
         drop(entries);
-        self.notify_kill();
         OomKillDecision {
             outcome: OomKillOutcome::Condemned(victim),
             condemned,
@@ -489,8 +481,8 @@ impl InstanceRegistry {
     }
 
     /// Mark `id` for termination as of `now_nanos`. The instance's next
-    /// epoch check traps with the recorded `KillReason`, a guest call of
-    /// it that is suspended in a host call ends with the kill at once,
+    /// interrupt check traps with the recorded `KillReason`, a guest call
+    /// of it that is suspended in a host call ends with the kill at once,
     /// and one that completes first reports the kill instead of its
     /// result.
     ///
@@ -499,14 +491,14 @@ impl InstanceRegistry {
     /// kill, those bytes are on their way back and the OOM killer must
     /// not condemn a second instance for memory it is already getting.
     ///
-    /// On a successful flip, the runtime engine epoch is bumped so the
-    /// next epoch check of every running guest fires its callback, which
-    /// reads the kill flag and traps. Without this kick a CPU-bound
-    /// victim would run until the next scheduler tick. A guest suspended
-    /// in a host call reaches no epoch check, so the flip also wakes
-    /// every turn of the instance, and a turn whose call is suspended
-    /// drops it (see [`StoreTurns::arm_kill_wait`]). Together they are
-    /// what bounds the ledger's wait: see [`OOM_RECLAIM_GRACE`].
+    /// The registry records the condemnation and wakes every turn of the
+    /// instance, and a turn whose call is suspended drops it (see
+    /// [`StoreTurns::arm_kill_wait`]). The runtime adapter that asked
+    /// for the kill then interrupts every store of the instance, so a
+    /// CPU-bound victim traps at its next function entry or loop header
+    /// instead of running on. The same holds for
+    /// [`Self::condemn_for_oom`], and together they are what bounds the
+    /// ledger's grace period: see [`OOM_RECLAIM_GRACE`].
     pub fn request_kill(&self, id: InstanceId, reason: KillReason, now_nanos: u64) -> KillOutcome {
         let entries = self.inner.entries.lock();
         let outcome = if entries.iter().any(|(_, entry)| entry.id == id) {
@@ -518,15 +510,7 @@ impl InstanceRegistry {
             KillOutcome::NoSuchInstance
         };
         drop(entries);
-        if outcome == KillOutcome::Requested {
-            self.notify_kill();
-        }
         outcome
-    }
-
-    fn notify_kill(&self) {
-        let notify = *self.inner.kill_notifier.lock();
-        notify();
     }
 
     /// Instances that have not run on any processor for at least
@@ -625,8 +609,6 @@ impl Default for InstanceRegistry {
         Self::new()
     }
 }
-
-fn noop_kill_notifier() {}
 
 /// Highest-scoring OOM candidate in `entries` for the pool that ran
 /// out.
@@ -820,7 +802,7 @@ impl RegisteredInstance {
 
     /// Returns `Some(reason)` when the instance has been condemned by
     /// the OOM killer or a supervisor and the runtime should trap at
-    /// the guest's next epoch check.
+    /// the guest's next interrupt check.
     pub fn pending_kill(&self) -> Option<KillReason> {
         decode_kill_flag(self.entry().kill_flag.load(Ordering::Acquire))
     }

@@ -277,8 +277,8 @@ struct ProcessorRuntime {
     /// This processor's kernel timer, published once its own
     /// `helios_kernel::init` has run so the timer PPI can advance it.
     timer: Once<Timer<Aarch64Cpu>>,
-    /// The component-host program service, published on the processor
-    /// that owns it so the timer PPI can drive epoch interruption.
+    /// The component-host program service, published on every processor
+    /// so the timer PPI can preempt the guest running here.
     program_service: Once<debug_state::ProgramService>,
     /// Device interrupt routes, installed on the bootstrap processor
     /// only: every device SPI is routed to it.
@@ -1196,15 +1196,13 @@ unsafe extern "C" fn aarch64_secondary_main(mp_info: &MpInfo) -> ! {
     );
     let runtime = current_processor_runtime();
     runtime.install_timer(kernel.timer());
-    if let Some(program_service) = helios_kernel::install_component_host_program_service(
-        &kernel,
-        &cpu,
-        &debug_state,
-        read_debug_serial,
-        DEBUG_SERIAL_WRITER,
-    ) {
-        runtime.install_program_service(program_service);
-    }
+    // Every processor's timer preempts the guest running on it, so every
+    // processor holds the service the bootstrap processor installed
+    // before it started this one.
+    let program_service = debug_state.program_service().unwrap_or_else(|| {
+        panic!("AArch64 secondary processor started before program service installation")
+    });
+    runtime.install_program_service(program_service);
     // SAFETY: this processor's CPU interface is initialised and its
     // timer is published; device interrupts are routed to the
     // bootstrap processor, so only private interrupts arrive here.
@@ -1415,7 +1413,7 @@ extern "C" fn aarch64_handle_irq() {
             // whole message, and `park_current` owns the flag.
         } else if intid == gic::VIRTUAL_TIMER_PPI {
             if let Some(program_service) = runtime.program_service.get() {
-                program_service.increment_epoch();
+                program_service.preempt_current_guest();
             }
             runtime
                 .timer
@@ -2242,18 +2240,29 @@ extern "C" fn wasmtime_init_traps(handler: helios_kernel::KernelNativeTrapHandle
     0
 }
 
+/// The calling processor's timer, for the Wasmtime parking hooks.
+#[cfg(target_os = "none")]
+fn wasmtime_parking_timer() -> &'static Timer<Aarch64Cpu> {
+    current_processor_runtime()
+        .timer
+        .get()
+        .expect("AArch64 processor timer was read before it was installed")
+}
+
 #[cfg(target_os = "none")]
 #[unsafe(no_mangle)]
 extern "C" fn wasmtime_parking_wait(timeout_nanos: u64) {
-    let timer = current_processor_runtime()
-        .timer
-        .get()
-        .expect("AArch64 processor timer was read before it was installed");
-    helios_kernel::park_wasmtime_waiter(timer, timeout_nanos);
+    helios_kernel::park_wasmtime_waiter(wasmtime_parking_timer(), timeout_nanos);
 }
 
 #[cfg(target_os = "none")]
 #[unsafe(no_mangle)]
 extern "C" fn wasmtime_parking_unpark() {
     helios_kernel::unpark_wasmtime_waiters();
+}
+
+#[cfg(target_os = "none")]
+#[unsafe(no_mangle)]
+extern "C" fn wasmtime_monotonic_nanos() -> u64 {
+    helios_kernel::wasmtime_monotonic_nanos(wasmtime_parking_timer())
 }

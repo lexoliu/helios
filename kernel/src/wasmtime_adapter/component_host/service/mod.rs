@@ -49,6 +49,7 @@ use crate::wasmtime_adapter::artifact_profile::{self, ArtifactProfileError};
 use crate::wasmtime_adapter::code_map::{CodeMap, CodeRegistration};
 use crate::wasmtime_adapter::config::AotCompileHint;
 use crate::wasmtime_adapter::cwasm::{self, ArtifactTrustError, UntrustedCwasm};
+use crate::wasmtime_adapter::preemption::{GuestInterrupts, StoreInterrupts};
 use crate::wasmtime_adapter::{WasmtimeCompiledComponent, WasmtimeCompiledCoreModule};
 use crate::wasmtime_adapter::{
     WasmtimePrecompiledKind,
@@ -486,10 +487,6 @@ where
     let preview1_core_linker = preview1_program_linker(engine.raw())
         .unwrap_or_else(|error| panic!("failed to create preview1 program linker: {error:#}"));
     let compiler_artifact = read_bootfs_artifact(debug_state, COMPILER_PLUGIN_PATH);
-    crate::wasmtime_adapter::register_oom_kick_engine(engine.raw().clone());
-    debug_state
-        .instance_registry()
-        .set_kill_notifier(crate::wasmtime_adapter::bump_user_engine_epoch);
     let service = UserProgramService {
         inner: Arc::new(UserProgramServiceInner {
             runtime,
@@ -1153,8 +1150,18 @@ where
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    pub fn increment_epoch(&self) {
-        self.inner.engine.increment_epoch();
+    /// Preempts the guest running on the executing processor, if one is.
+    ///
+    /// Each backend calls this from its scheduler tick, the processor's
+    /// own timer interrupt: it takes no lock and allocates nothing.
+    pub fn preempt_current_guest(&self) {
+        self.inner.engine.interrupts().preempt_current();
+    }
+
+    /// Interrupts every store of `instance`, so a kill whose flag is set
+    /// reaches the guest wherever it is.
+    pub(crate) fn interrupt_instance(&self, instance: crate::InstanceId) {
+        self.inner.engine.interrupts().interrupt_instance(instance);
     }
 
     /// The wasm images this service has loaded, which name the
@@ -1893,7 +1900,7 @@ where
             _marker: core::marker::PhantomData,
         };
         let mut store = wasmtime::Store::new(engine, store_data);
-        configure_compiler_core_store(&mut store);
+        let _interrupts = configure_compiler_core_store(&mut store);
         let instance = plugin
             .instance_pre
             .instantiate_async(&mut store)
@@ -2107,6 +2114,7 @@ where
             instance_pre: spin::Once::new(),
             next_thread_id: AtomicI32::new(0),
             thread_tasks: Mutex::new(Vec::new()),
+            interrupts: self.inner.engine.interrupts().clone(),
         });
         let mut linker: CoreLinker<CompilerCoreStore<CpuImpl, Net, HostFs>> =
             CoreLinker::new(engine);
@@ -2143,7 +2151,7 @@ where
                 .instantiate_pre(&module)
                 .map_err(map_program_runtime_error)?,
         );
-        configure_compiler_core_store(&mut scratch_store);
+        let scratch_interrupts = configure_compiler_core_store(&mut scratch_store);
         let scratch_instance = instance_pre
             .instantiate(&mut scratch_store)
             .map_err(map_program_runtime_error)?;
@@ -2155,6 +2163,7 @@ where
                 detail: ProgramExecErrorDetail::CompilerPluginInvalid,
             });
         }
+        drop(scratch_interrupts);
         drop(scratch_store);
         shared.instance_pre.call_once(|| instance_pre.clone());
 

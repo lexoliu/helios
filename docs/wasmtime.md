@@ -5,13 +5,68 @@ at `../wasmtime/crates/wasmtime`.
 
 ## Required revision
 
-The local checkout must be at (branch `helios/parallel-compile-steal`):
+The local checkout must be at (branch `helios/parking-wait-timeout`):
 
 ```text
-f5a2d7baf50962ae777c29ecc792f0eed501c75d
+62bf033a53a8132a4d3009534152e2b745144904
 ```
 
-That revision is `helios/pooling-host-stack` at
+That revision is `helios/stack-limit-interrupt` at
+`913a5426e627b32c7c096d2dcd7f167fe943c6be` plus one additive commit, which
+makes a timed `memory.atomic.wait` time out on `no_std` (#455):
+
+- A `no_std` build declares a third parking hook,
+  `wasmtime_monotonic_nanos() -> u64`, next to `wasmtime_parking_wait` and
+  `wasmtime_parking_unpark` and under the same `threads` condition. It reads
+  a monotonic clock that every waiting thread shares.
+- `parking_spot::deadline_after` turns a wait's timeout into an absolute
+  deadline for both builds (`Instant` on `std`, a `MonotonicDeadline` of
+  clock nanoseconds on `no_std`), and `SharedMemory::atomic_wait32/64` use
+  it instead of a cfg split. A deadline that does not fit means no timeout,
+  as before.
+- Every pass of the wait loop parks only for the time left until the
+  deadline, and returns `WaitResult::TimedOut` once the clock reaches it.
+  Before, the `no_std` loop carried the relative timeout and re-parked for
+  all of it after every return, so it never timed out.
+
+Helios needs it because a timed `memory.atomic.wait32/64`, and so every
+futex-backed timed wait in a threaded guest (a condvar `wait_timeout`),
+only ended when notified. Each bare-metal backend exports
+`wasmtime_monotonic_nanos` from its processor timer's `Cpu` timebase.
+
+The revision it replaces is `helios/stack-limit-interrupt` at
+`913a5426e627b32c7c096d2dcd7f167fe943c6be`, which is
+`helios/parallel-compile-steal` at
+`f5a2d7baf50962ae777c29ecc792f0eed501c75d` plus one additive commit, which
+adds resumable stack-limit interruption (#456):
+
+- `Config::stack_limit_interruption(bool)` (a `Tunables` flag that takes part
+  in the cwasm compatibility check) makes Cranelift compare the stack pointer
+  against `VMStoreContext::stack_limit` at every function entry, loop header
+  and bulk-memory chunk, and call the `stack_limit_interrupt` builtin when the
+  compare fails instead of trapping. `Engine::new` refuses it together with
+  epoch interruption, with stack switching and on Pulley.
+- `Store::interrupt_handle()` returns a `Send + Sync` `StoreInterruptHandle`
+  whose `interrupt()` sets a pending flag and raises the limit to a sentinel,
+  with no lock and no allocation, so an interrupt handler may call it. The
+  `VMStoreContext` lives in an `Arc` the handle keeps alive.
+- Every writer of the limit (entering and leaving wasm, fiber switches)
+  re-raises the sentinel while an interrupt is pending, so an interrupt
+  requested in host code or on a suspended fiber is delivered at the next
+  check in wasm.
+- The builtin clears the flag, restores the real limit, runs the store's
+  `Store::interrupt_callback` (`InterruptAction::Continue`, `Yield`, or an
+  error), and then traps with a stack overflow if the stack pointer is
+  really below the limit.
+
+Helios needs it because the epoch checks it replaces cost 10–29% on every
+compute workload (paired run 38745522065): a full check on every function
+entry, a cached check at every loop header, and two variables live across
+every body.
+
+The revision it replaces is `helios/parallel-compile-steal` at
+`f5a2d7baf50962ae777c29ecc792f0eed501c75d`, which is
+`helios/pooling-host-stack` at
 `7a17b5375af44664392d2a550e9724be0f1946c4` plus one additive commit, which
 makes every parallel compile input its own stealable job:
 

@@ -2832,6 +2832,11 @@ fn kernel_build_command(repo_root: &Path, command: &KernelBuildSpec) -> Command 
     if let Some(target_dir) = command.target_dir(repo_root).cargo_argument() {
         cargo.arg("--target-dir").arg(target_dir);
     }
+    if command.kind.optimised() {
+        cargo
+            .arg("--config")
+            .arg(kernel_debuginfo_rustflags(command.profile));
+    }
     if command.kind.instrumented() {
         cargo
             .arg("--config")
@@ -2843,6 +2848,36 @@ fn kernel_build_command(repo_root: &Path, command: &KernelBuildSpec) -> Command 
             .arg(profile_use_rustflags(command.profile, profile.path()));
     }
     cargo
+}
+
+/// The `--config` override that gives an optimised kernel its DWARF, for
+/// the target this profile boots.
+///
+/// The inspector expands each address of an instruction profile into the
+/// chain of functions inlined at it from the image's DWARF
+/// (docs/benchmarks.md). `limited` is the level that gives every inlined
+/// function its linkage name, and so its full path; `line-tables-only`
+/// names each by its bare identifier. `-C strip=none` overrides the
+/// `strip = "debuginfo"` cargo derives from the profile's `debug = 0`.
+///
+/// The flags are rustflags rather than the cargo profile's `debug` key on
+/// purpose. Cargo folds the profile into every crate's `-C metadata`, so a
+/// profile change renames every symbol of the image, and under fat LTO the
+/// renamed functions merge in another order and some inlining decisions
+/// move: built that way the image's code differs from the image without
+/// DWARF (#451). Rustflags stay out of `-C metadata`, and with them every
+/// function's instructions are what they are without DWARF; only the merge
+/// order of same-named upstream crates, which rustc takes from object
+/// names carrying cargo's per-flags hash, can move, as it can under any
+/// rustflag. The DWARF never reaches the guest: `helios-cli
+/// limine-uefi-image` writes the image without it, and QEMU's `-kernel`
+/// loads only `PT_LOAD` segments.
+fn kernel_debuginfo_rustflags(profile: &VmProfile) -> String {
+    let flags = ["-C", "debuginfo=limited", "-C", "strip=none"];
+    let flags = toml::Value::try_from(flags)
+        .expect("a list of strings is a TOML array")
+        .to_string();
+    format!("target.\"{}\".rustflags={flags}", profile.cargo_target)
 }
 
 /// The `--config` override that turns a kernel build into an instrumented
@@ -6842,6 +6877,45 @@ mod tests {
             .get_args()
             .map(|argument| argument.to_string_lossy().into_owned())
             .collect()
+    }
+
+    /// Every optimised kernel carries the DWARF an instruction profile is
+    /// named from, through rustflags so that the build's `-C metadata`,
+    /// and with it the image's code, stays what it is without them; a
+    /// debug kernel is left to its own profile.
+    #[test]
+    fn only_optimised_kernels_take_their_debuginfo_from_rustflags() {
+        let flags = kernel_debuginfo_rustflags(&X86_64_VM_PROFILE);
+        assert_eq!(
+            flags,
+            "target.\"x86_64-unknown-none\".rustflags=\
+             [\"-C\", \"debuginfo=limited\", \"-C\", \"strip=none\"]"
+        );
+        let build = |kind| KernelBuildSpec {
+            profile: &X86_64_VM_PROFILE,
+            kind,
+            profile_use: None,
+            boot_programs: Vec::new(),
+            no_compiler_plugin: true,
+        };
+        let root = Path::new("/checkout");
+        for kind in [
+            KernelBuildProfile::Release,
+            KernelBuildProfile::ProfileGenerate,
+            KernelBuildProfile::ProfileUse,
+        ] {
+            let arguments = cargo_arguments(&kernel_build_command(root, &build(kind)));
+            assert!(
+                arguments
+                    .windows(2)
+                    .any(|pair| pair[0] == "--config" && pair[1] == flags),
+                "{kind:?}: {arguments:?}"
+            );
+        }
+        for kind in [KernelBuildProfile::Debug, KernelBuildProfile::KernelDebug] {
+            let arguments = cargo_arguments(&kernel_build_command(root, &build(kind)));
+            assert!(!arguments.contains(&flags), "{kind:?}: {arguments:?}");
+        }
     }
 
     /// A named profile and the release profile are both `profile-use`

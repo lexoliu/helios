@@ -584,7 +584,7 @@ fn trap_dispatch(tf: &mut TrapFrame) {
     match riscv::register::scause::read().cause().try_into() {
         Ok(Trap::Interrupt(Interrupt::SupervisorTimer)) => {
             if let Some(program_service) = current_hart_runtime().program_service.as_ref() {
-                program_service.increment_epoch();
+                program_service.preempt_current_guest();
             }
             current_hart_runtime().timer.handle_interrupt();
         }
@@ -857,14 +857,22 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
         trap_stack: trap::allocate_trap_stack(),
     };
     hart_runtime.install();
+    // Every hart's timer preempts the guest running on it, so every hart
+    // holds the service: the bootstrap hart installs it, and the others,
+    // which it starts only afterwards, take the installed one.
     let program_service = helios_kernel::install_component_host_program_service(
         &kernel,
         &cpu,
         &debug_state,
         read_debug_serial,
         DEBUG_SERIAL_WRITER,
-    );
-    hart_runtime.program_service = program_service;
+    )
+    .unwrap_or_else(|| {
+        debug_state.program_service().unwrap_or_else(|| {
+            panic!("RISC-V hart {hart_id} started before program service installation")
+        })
+    });
+    hart_runtime.program_service = Some(program_service);
     unsafe {
         configure_interrupts();
     }
@@ -1403,4 +1411,9 @@ extern "C" fn wasmtime_parking_wait(timeout_nanos: u64) {
 #[unsafe(no_mangle)]
 extern "C" fn wasmtime_parking_unpark() {
     helios_kernel::unpark_wasmtime_waiters();
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn wasmtime_monotonic_nanos() -> u64 {
+    helios_kernel::wasmtime_monotonic_nanos(&current_hart_runtime().timer)
 }

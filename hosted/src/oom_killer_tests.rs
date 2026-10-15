@@ -171,7 +171,7 @@ fn kill_supervisor_restart_decodes_correctly() {
 }
 
 /// Issue #100: condemning a victim does not free its memory — the kill
-/// flag is observed at that instance's next epoch check. The
+/// flag is observed at that instance's next interrupt check. The
 /// killer used to pick a fresh live instance on every refused grow, so
 /// one 1MiB shortfall walked a whole workload: ~20 instances condemned
 /// at ~45KB reclaimed each. The condemned-memory ledger is what stops
@@ -261,7 +261,7 @@ fn reclaimed_memory_leaves_the_ledger() {
 }
 
 /// The bound on the ledger's honesty. A victim parked in a host future
-/// may never return to wasm, so no epoch check ever traps it, and its
+/// may never return to wasm, so no interrupt check ever traps it, and its
 /// condemnation stops covering requests after `OOM_RECLAIM_GRACE`.
 /// The next victim is then condemned, while the stale condemnation stays
 /// on the books — and out of victim selection — until it is torn down.
