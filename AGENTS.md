@@ -441,8 +441,8 @@ just test-units
 against `deny.toml`, and `cargo clippy … -D warnings` over the host crates, each
 guest program, and the three bare-metal targets.
 `just test-units` runs the `hal`, `virtio`, `netstack`, `kernel`,
-`inspector-protocol` and `workspace-root` unit tests and the `hal_layering`
-test (`kernel/tests/`) that enforces §1. The recipe names each integration
+`inspector-protocol` and `workspace-root` unit tests, every `hosted` test,
+and the `hal_layering` test (`kernel/tests/`) that enforces §1. The recipe names each integration
 test with `--test <name>`, so a new enforcement test is added to the recipe
 in the same change or it never runs.
 Both recipes run through `cargo nextest run` under `.config/nextest.toml`:
