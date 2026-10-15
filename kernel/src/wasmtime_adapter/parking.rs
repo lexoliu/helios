@@ -14,10 +14,12 @@
 //! parked fiber. Each one returns into Wasmtime's loop, which reads its own
 //! `notified` flag and parks again when the unpark was for another waiter.
 //!
-//! The generation a fiber last returned at is kept in its fiber-stack
-//! slot. An unpark that lands after Wasmtime dropped its lock and before
-//! this hook armed has already moved the generation past that value, so
-//! the wait returns at once instead of losing the wake.
+//! The registry, [`ParkedFibers`], belongs to the fiber-stack arena that
+//! owns every stack a waiter can run on, and the generation a fiber last
+//! returned at is kept in its fiber-stack slot. An unpark that lands after
+//! Wasmtime dropped its lock and before this hook armed has already moved
+//! the generation past that value, so the wait returns at once instead of
+//! losing the wake.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 use core::time::Duration;
@@ -28,14 +30,34 @@ use wasmtime::BlockOnCurrentFiberError;
 
 use crate::{Notify, Timer};
 
-static UNPARK_GENERATION: AtomicU64 = AtomicU64::new(0);
-static UNPARKED: Notify = Notify::new();
+/// The fibers parked in a Wasmtime parking wait, across every processor.
+///
+/// Every operation is lock-free: an unpark bumps `generation` and
+/// broadcasts on `unparked` from whichever processor runs the notifying
+/// wasm thread, and a wait arms on `unparked` before it reads
+/// `generation`.
+pub(crate) struct ParkedFibers {
+    /// How many unparks have happened since boot.
+    generation: AtomicU64,
+    /// Woken by every unpark, for the waits that have already armed.
+    unparked: Notify,
+}
+
+impl ParkedFibers {
+    pub(crate) const fn new() -> Self {
+        Self {
+            generation: AtomicU64::new(0),
+            unparked: Notify::new(),
+        }
+    }
+}
 
 /// Body of `wasmtime_parking_unpark`. Lock-free and allocation-free, as
 /// a call made under Wasmtime's parking-table lock must be.
 pub fn unpark_wasmtime_waiters() {
-    UNPARK_GENERATION.fetch_add(1, Ordering::AcqRel);
-    UNPARKED.notify_all();
+    let parked = crate::memory::parked_fibers();
+    parked.generation.fetch_add(1, Ordering::AcqRel);
+    parked.unparked.notify_all();
 }
 
 /// Body of `wasmtime_parking_wait`: gives the processor back until an
@@ -49,9 +71,9 @@ where
         return;
     }
     let frame = 0u8;
-    let returned_at = crate::memory::fiber_parked_generation(core::ptr::addr_of!(frame) as usize);
-    let unparked = UNPARKED.notified();
-    let generation = UNPARK_GENERATION.load(Ordering::Acquire);
+    let (parked, returned_at) = crate::memory::fiber_parking(core::ptr::addr_of!(frame) as usize);
+    let unparked = parked.unparked.notified();
+    let generation = parked.generation.load(Ordering::Acquire);
     if generation != returned_at.load(Ordering::Relaxed) {
         returned_at.store(generation, Ordering::Relaxed);
         return;
@@ -82,5 +104,5 @@ where
              cancellation exit, so the fiber cannot unwind"
         ),
     }
-    returned_at.store(UNPARK_GENERATION.load(Ordering::Acquire), Ordering::Relaxed);
+    returned_at.store(parked.generation.load(Ordering::Acquire), Ordering::Relaxed);
 }

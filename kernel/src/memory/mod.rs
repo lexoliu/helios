@@ -39,13 +39,13 @@ pub use entropy::{
     NoCryptographicEntropy, NoEntropyDevice, ROOT_ENTROPY_MATERIAL_BYTES, RootEntropy,
     RootEntropyHandle, install_entropy_device, seed_root_entropy,
 };
-#[cfg(all(target_os = "none", feature = "wasmtime-bare-metal"))]
-pub use fiber_stack::fiber_parked_generation;
 pub use fiber_stack::{
     FIBER_STACK_GUARD_BYTES, FiberStack, FiberStackArenaStats, FiberStackError, FiberStackVmHooks,
     StackFault, claim_fiber_stack, fiber_stack_arena_stats, fiber_stack_demand_commits_on,
     install_fiber_stack_arena, install_fiber_stack_hooks, resolve_stack_fault,
 };
+#[cfg(all(target_os = "none", feature = "wasmtime-bare-metal"))]
+pub(crate) use fiber_stack::{fiber_parking, parked_fibers};
 pub use frame_reserve::reserved_bytes as page_fault_frame_reserve_bytes;
 pub(crate) use frame_reserve::{
     configure_processors as configure_frame_reserve_processors, top_up as top_up_frame_reserve,

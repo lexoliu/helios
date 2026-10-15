@@ -92,6 +92,8 @@ use spin::Once;
 use thiserror::Error;
 
 use super::frame_reserve;
+#[cfg(all(target_os = "none", feature = "wasmtime-bare-metal"))]
+use crate::wasmtime_adapter::parking::ParkedFibers;
 
 /// Bytes of unmapped address space below every fiber stack.
 ///
@@ -233,6 +235,11 @@ pub struct FiberStackArena {
     /// the pair sits on its own line rather than beside a per-processor
     /// counter.
     released: CachePadded<ReleasedTotals>,
+    /// The Wasmtime parking registry of the fibers these stacks run.
+    /// Written by every unpark, from whichever processor runs the
+    /// notifying wasm thread, so it sits on its own line.
+    #[cfg(all(target_os = "none", feature = "wasmtime-bare-metal"))]
+    parked: CachePadded<ParkedFibers>,
 }
 
 struct ReleasedTotals {
@@ -362,6 +369,8 @@ pub fn install_fiber_stack_arena(
                 stacks: AtomicU64::new(0),
                 committed_bytes: AtomicU64::new(0),
             }),
+            #[cfg(all(target_os = "none", feature = "wasmtime-bare-metal"))]
+            parked: CachePadded::new(ParkedFibers::new()),
         }
     });
 }
@@ -698,15 +707,26 @@ impl Drop for FiberStack {
     }
 }
 
-/// The unpark generation the fiber running on the stack that holds
-/// `addr` last returned from a Wasmtime parking wait at. Panics when
-/// `addr` is not inside a live fiber stack.
+/// The arena's Wasmtime parking registry, and the unpark generation the
+/// fiber running on the stack that holds `addr` last returned from a
+/// parking wait at. Panics when `addr` is not inside a live fiber stack.
 #[cfg(all(target_os = "none", feature = "wasmtime-bare-metal"))]
-pub fn fiber_parked_generation(addr: usize) -> &'static AtomicU64 {
+pub(crate) fn fiber_parking(addr: usize) -> (&'static ParkedFibers, &'static AtomicU64) {
+    let arena = installed_arena();
+    (&arena.parked, arena.parked_generation(addr))
+}
+
+/// The arena's Wasmtime parking registry.
+#[cfg(all(target_os = "none", feature = "wasmtime-bare-metal"))]
+pub(crate) fn parked_fibers() -> &'static ParkedFibers {
+    &installed_arena().parked
+}
+
+#[cfg(all(target_os = "none", feature = "wasmtime-bare-metal"))]
+fn installed_arena() -> &'static FiberStackArena {
     ARENA
         .get()
-        .expect("Wasmtime parking wait before the fiber-stack arena was installed")
-        .parked_generation(addr)
+        .expect("Wasmtime parking hook before the fiber-stack arena was installed")
 }
 
 /// Takes one stack out of the arena.
