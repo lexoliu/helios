@@ -116,6 +116,13 @@ panic = "abort"
 # profile is worth the most on. The host tools keep `release`: nothing
 # times them, and a fat-LTO link of the inspector on every check would
 # be paid by every lane and every developer loop for no measurement.
+#
+# The image's DWARF does not come from this profile's `debug` key: cargo
+# folds the profile into every crate's `-C metadata`, which renames every
+# symbol and, under fat LTO, changes the image's code (#451). The
+# inspector adds `-C debuginfo=limited` as a rustflag instead
+# (`kernel_debuginfo_rustflags`), which leaves every function's code as it
+# was.
 [profile.kernel-release]
 inherits = "release"
 lto = "fat"

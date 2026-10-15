@@ -6,12 +6,23 @@
 //! list, and a capture of a wedged guest names the function each vCPU
 //! was executing. Both go through [`function_symbols`], so they cannot
 //! disagree about what a function is.
+//!
+//! An optimised image inlines most of its call graph, so the symbol that
+//! contains an address names only the outermost function at it. The
+//! image's DWARF, which every optimised or debug kernel the inspector
+//! builds carries on the host copy and the boot disk strips, names the rest:
+//! [`KernelDebugInfo`] expands an address into its inline chain.
 
 use std::ops::Range;
 use std::path::Path;
+use std::sync::Arc;
 
+use gimli::{EndianArcSlice, RunTimeEndian};
 use object::elf::PF_X;
-use object::{Object as _, ObjectSegment as _, ObjectSymbol as _, SegmentFlags, SymbolKind};
+use object::{
+    Object as _, ObjectSection as _, ObjectSegment as _, ObjectSymbol as _, SegmentFlags,
+    SymbolKind,
+};
 
 /// One function the image defines, as its symbol table records it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,6 +97,25 @@ pub(crate) enum KernelSymbolsError {
         path: String,
         address: u64,
         size: u64,
+    },
+    #[error(
+        "kernel image {path} carries no DWARF (.debug_info), so its addresses cannot be \
+         expanded into inline chains; build it with `helios-inspector vm` and one of \
+         --release, --profile-generate, --profile-use or --kernel-debug, which keep debuginfo"
+    )]
+    NoDebugInfo { path: String },
+    #[error("failed to read DWARF section {section} of kernel image {path}: {source}")]
+    DebugSection {
+        path: String,
+        section: &'static str,
+        #[source]
+        source: object::Error,
+    },
+    #[error("failed to parse the DWARF of kernel image {path}: {source}")]
+    Dwarf {
+        path: String,
+        #[source]
+        source: gimli::Error,
     },
 }
 
@@ -230,11 +260,18 @@ impl core::fmt::Display for SymbolizedAddress {
 }
 
 impl LoadedKernelSymbols<'_> {
+    /// The link-time address the runtime address `address` corresponds
+    /// to: what the image's own tables, symbols and DWARF alike, are keyed
+    /// by.
+    pub(crate) fn link_address(&self, address: u64) -> u64 {
+        address.wrapping_sub(self.slide)
+    }
+
     /// Whether the runtime address `address` lies in one of the image's
     /// executable segments: the only addresses a return address into the
     /// kernel can hold.
     pub(crate) fn contains_text(&self, address: u64) -> bool {
-        let link_address = address.wrapping_sub(self.slide);
+        let link_address = self.link_address(address);
         self.symbols
             .text
             .iter()
@@ -243,7 +280,7 @@ impl LoadedKernelSymbols<'_> {
 
     /// The function whose bytes contain the runtime address `address`.
     pub(crate) fn symbolize(&self, address: u64) -> Option<SymbolizedAddress> {
-        let link_address = address.wrapping_sub(self.slide);
+        let link_address = self.link_address(address);
         let functions = &self.symbols.functions;
         let after = functions.partition_point(|function| function.address <= link_address);
         let function = functions[..after].last()?;
@@ -252,6 +289,106 @@ impl LoadedKernelSymbols<'_> {
             function: format!("{:#}", rustc_demangle::demangle(&function.name)),
             offset,
         })
+    }
+}
+
+/// The reader the kernel's DWARF is parsed through: each section is
+/// owned, so the table outlives the file bytes as [`KernelSymbols`] does.
+pub(crate) type DwarfReader = EndianArcSlice<RunTimeEndian>;
+
+/// The kernel image's DWARF, indexed for the inline chain at an address.
+pub(crate) struct KernelDebugInfo {
+    /// Where the image was read from, for errors raised while walking it.
+    path: String,
+    context: addr2line::Context<DwarfReader>,
+}
+
+impl KernelDebugInfo {
+    /// The DWARF of an already parsed image; `path` names it in errors.
+    ///
+    /// An image without `.debug_info` is refused rather than read as an
+    /// empty table: every address would then fold to its outermost
+    /// symbol, which is the output this table exists to replace.
+    pub(crate) fn from_image(
+        path: &Path,
+        image: &object::File<'_>,
+    ) -> Result<Self, KernelSymbolsError> {
+        let display = || path.display().to_string();
+        if image.section_by_name(".debug_info").is_none() {
+            return Err(KernelSymbolsError::NoDebugInfo { path: display() });
+        }
+        let endian = if image.is_little_endian() {
+            RunTimeEndian::Little
+        } else {
+            RunTimeEndian::Big
+        };
+        let dwarf = gimli::Dwarf::load(|section| {
+            let bytes: Arc<[u8]> = match image.section_by_name(section.name()) {
+                Some(data) => Arc::from(&*data.uncompressed_data().map_err(|source| {
+                    KernelSymbolsError::DebugSection {
+                        path: display(),
+                        section: section.name(),
+                        source,
+                    }
+                })?),
+                None => Arc::from([]),
+            };
+            Ok::<_, KernelSymbolsError>(DwarfReader::new(bytes, endian))
+        })?;
+        Self::from_dwarf(path, dwarf)
+    }
+
+    /// The table over sections already loaded; `path` names the image
+    /// they came from in errors.
+    pub(crate) fn from_dwarf(
+        path: &Path,
+        dwarf: gimli::Dwarf<DwarfReader>,
+    ) -> Result<Self, KernelSymbolsError> {
+        let path = path.display().to_string();
+        match addr2line::Context::from_dwarf(dwarf) {
+            Ok(context) => Ok(Self { path, context }),
+            Err(source) => Err(KernelSymbolsError::Dwarf { path, source }),
+        }
+    }
+
+    /// The demangled functions executing at the link-time address
+    /// `address`, outermost first: the function whose code it is, then
+    /// each function inlined into the one before, down to the one the
+    /// instruction belongs to.
+    ///
+    /// Empty when no DWARF function covers the address, as for code
+    /// assembled or linked in without debuginfo; the caller then has
+    /// only the symbol table to go on. A function whose DIE carries no
+    /// name is `[unnamed]`, so the chain keeps its depth.
+    pub(crate) fn inline_chain(&self, address: u64) -> Result<Vec<String>, KernelSymbolsError> {
+        let dwarf = |source| KernelSymbolsError::Dwarf {
+            path: self.path.clone(),
+            source,
+        };
+        // Split DWARF is never emitted for the kernel, so there is
+        // nothing a lookup could ask to load.
+        let mut frames = self
+            .context
+            .find_frames(address)
+            .skip_all_loads()
+            .map_err(dwarf)?;
+        let mut chain = Vec::new();
+        while let Some(frame) = frames.next().map_err(dwarf)? {
+            // A frame with no DIE is a bare line-table location: no
+            // function covers the address.
+            if frame.dw_die_offset.is_none() {
+                continue;
+            }
+            chain.push(match frame.function {
+                Some(function) => format!(
+                    "{:#}",
+                    rustc_demangle::demangle(&function.raw_name().map_err(dwarf)?)
+                ),
+                None => "[unnamed]".to_owned(),
+            });
+        }
+        chain.reverse();
+        Ok(chain)
     }
 }
 

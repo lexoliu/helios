@@ -213,7 +213,10 @@ two rustflags, in the `profile-use` cargo profile.
 The release build itself is the `kernel-release` cargo profile
 (`Cargo.toml`): `release` plus `lto = "fat"` and `codegen-units = 1`, the
 profile every kernel image is built with and the one `profile-generate`
-and `profile-use` inherit. The image links `hal`, `netstack`, `virtio`,
+and `profile-use` inherit. The inspector adds `-C debuginfo=limited` to
+all three as a rustflag, which changes no code and never reaches the
+guest; it is there to name the inlined functions of an instruction
+profile (`docs/benchmarks.md`). The image links `hal`, `netstack`, `virtio`,
 the backend, `kernel` and the Wasmtime crates, and every hot path crosses
 those crate boundaries; a per-crate build leaves each of those calls out
 of line, which a profile can weight but never inline, so whole-program
