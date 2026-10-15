@@ -88,24 +88,10 @@ impl UserMemoryOwners {
         }
     }
 
-    /// Names `owner` for the work running on `processor` from now until
-    /// something else names a different one, and reports who was named
-    /// before.
-    ///
-    /// This is the form the runtime's call hooks use: they fire on
-    /// entering and leaving guest code, which is not a scope any value
-    /// can own.
-    pub fn set(&self, processor: ProcessorId, owner: MemoryOwner) -> MemoryOwner {
-        match self.cell(processor) {
-            Some(cell) => MemoryOwner::new(cell.swap(owner.raw(), Ordering::Relaxed)),
-            None => MemoryOwner::NONE,
-        }
-    }
-
     /// Names `owner` for the work about to run on `processor`, restoring
-    /// the previous owner when the returned scope drops. Scopes nest:
-    /// a guest call inside an instantiation restores the instantiating
-    /// owner rather than clearing it.
+    /// the previous owner when the returned scope drops. Scopes nest: a
+    /// host call that instantiates a child gets its own instance back as
+    /// the owner when the child's turn ends, rather than no owner.
     pub fn enter(&self, processor: ProcessorId, owner: MemoryOwner) -> UserMemoryOwnerScope<'_> {
         let previous = match self.cell(processor) {
             Some(cell) => MemoryOwner::new(cell.swap(owner.raw(), Ordering::Relaxed)),
@@ -152,12 +138,6 @@ pub fn configure_user_memory_owner_processors(processor_count: usize) {
 /// The owner a page committed on `processor` right now belongs to.
 pub fn current_user_memory_owner(processor: ProcessorId) -> MemoryOwner {
     OWNERS.current(processor)
-}
-
-/// Names `owner` for the work running on `processor` from now on, and
-/// reports who was named before.
-pub fn set_user_memory_owner(processor: ProcessorId, owner: MemoryOwner) -> MemoryOwner {
-    OWNERS.set(processor, owner)
 }
 
 /// Names `owner` for the work about to run on `processor`.

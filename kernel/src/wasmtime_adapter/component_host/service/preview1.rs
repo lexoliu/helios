@@ -290,6 +290,13 @@ where
         self.requested_exit.take()
     }
 
+    /// The exit status of a program whose call ended in `error`: the
+    /// signal that ended it, otherwise the status the guest asked for,
+    /// otherwise none, and the error is a failure.
+    pub(super) fn take_exit_status(&mut self, error: &wasmtime::Error) -> Option<u32> {
+        preview1_exit_status(error, self.requested_exit.take())
+    }
+
     pub(super) fn exec_context(&self) -> ProgramExecContext<CpuImpl, Net, HostFs> {
         ProgramExecContext {
             cpu: self.cpu.clone(),
@@ -309,84 +316,42 @@ where
         self.activity.instance()
     }
 
-    /// The whole call-hook body for this store.
+    /// The handle the code driving this store accounts its processor
+    /// turns through. Taken before the store is borrowed for the call;
+    /// see [`crate::component::GuestTurns::drive`].
+    pub(super) fn guest_turns(
+        &self,
+    ) -> crate::component::GuestTurns<
+        CpuImpl,
+        HostRuntimeState<CpuImpl, Net, HostFs>,
+        WasixSignalState,
+    > {
+        crate::component::GuestTurns::new(
+            self.activity.turns(),
+            self.cpu.clone(),
+            self.runtime_state.clone(),
+            self.signal_state.clone(),
+        )
+    }
+
+    /// The epoch callback for this store: where a pending WASIX signal
+    /// and a condemnation reach a running guest.
     ///
-    /// Every exit that traps goes through [`crate::InstanceActivity`]'s
-    /// terminal state first. Wasmtime pairs its hooks around the call
-    /// it is making, so returning an error from a hook cancels the call
-    /// whose matching hook would have closed the transition just
-    /// recorded — while the `ReturningFromWasm` that unwinds the trap
-    /// still arrives. Ending the activation before the trap is raised
-    /// is what leaves that trailing transition nothing to close (#114).
-    pub(super) fn record_call_hook(
-        &mut self,
-        transition: crate::InstanceExecutionTransition,
-    ) -> wasmtime::Result<()> {
-        let killed = self.record_transition(transition);
+    /// Raising a signal and condemning an instance both bump the epoch,
+    /// so a guest that is running meets this at its next function entry
+    /// or loop back-edge, and one suspended in a host call meets it at
+    /// the first of those after the call returns; a call that returns
+    /// to the host first meets both where it completes (see
+    /// [`crate::component::TurnEpilogue::end_call`]). A signal is
+    /// delivered ahead of a kill.
+    fn on_epoch_deadline(&mut self) -> wasmtime::Result<wasmtime::UpdateDeadline> {
         if let Some(signal) = self.signal_state.take_pending() {
-            self.end_activation();
-            self.request_exit(128u32.saturating_add(signal));
-            return Err(wasmtime::Error::new(Preview1Exit));
+            return Err(wasmtime::Error::new(Preview1SignalExit { signal }));
         }
-        match killed {
-            Some(reason) => Err(wasmtime::Error::from(crate::InstanceKilled { reason })),
-            None => Ok(()),
+        if let Some(reason) = self.activity.pending_kill() {
+            return Err(wasmtime::Error::from(crate::InstanceKilled { reason }));
         }
-    }
-
-    /// Same naming as the component path: while this processor is
-    /// running the program's guest code, pages it commits are the
-    /// program's. See `component::runtime`'s `record_transition`.
-    ///
-    /// Returns the kill reason when the instance has been condemned,
-    /// with the activation already ended.
-    fn record_transition(
-        &mut self,
-        transition: crate::InstanceExecutionTransition,
-    ) -> Option<crate::KillReason> {
-        let now_nanos = self.now_nanos();
-        let step = self.activity.record(transition, now_nanos);
-        self.apply_activity_change(step.change);
-        step.killed
-    }
-
-    /// End this store's activation because a trap the guest never
-    /// returns from is about to be raised.
-    fn end_activation(&mut self) {
-        let now_nanos = self.now_nanos();
-        let change = self.activity.end(now_nanos);
-        self.apply_activity_change(change);
-    }
-
-    /// End the activation and report the condemnation when the instance
-    /// has one, for the epoch callback that traps a CPU-bound guest.
-    pub(super) fn end_on_pending_kill(&mut self) -> Option<crate::KillReason> {
-        let reason = self.activity.pending_kill()?;
-        self.end_activation();
-        Some(reason)
-    }
-
-    fn apply_activity_change(&self, change: crate::ActivityChange) {
-        let owner = match change {
-            crate::ActivityChange::Entered => {
-                crate::MemoryOwner::new(self.activity.instance().id().raw())
-            }
-            crate::ActivityChange::Left { .. } => crate::MemoryOwner::NONE,
-            crate::ActivityChange::Unchanged => return,
-        };
-        crate::set_user_memory_owner(helios_hal::cpu::current_processor(), owner);
-        if let crate::ActivityChange::Left {
-            instance_elapsed: Some(elapsed),
-        } = change
-            && self.runtime_state.profiling_enabled()
-        {
-            self.runtime_state.record_profile_stack_parts_nanos(
-                crate::ProfileScope::User,
-                "user;",
-                self.activity.instance().name(),
-                elapsed,
-            );
-        }
+        Ok(wasmtime::UpdateDeadline::Yield(1))
     }
 
     /// Deliver stdout/stderr bytes to a kernel-served sink, or hand
@@ -1105,21 +1070,11 @@ pub(super) fn configure_preview1_program_store<CpuImpl, Net, HostFs>(
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    store.call_hook(
-        |mut caller: StoreContextMut<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>, hook| {
-            let transition = crate::wasmtime_adapter::store::translate_call_hook(hook);
-            caller.data_mut().record_call_hook(transition)
-        },
-    );
+    // No call hook: see `store_with_state`. Turns are accounted where
+    // the call that drives this store is polled, and signals and kills
+    // reach the guest at its epoch checks.
     store.set_epoch_deadline(1);
-    // Epoch ticks double as the kill observation point for CPU-bound
-    // guests (see `store_with_state`): check the flag, otherwise yield.
-    store.epoch_deadline_callback(|mut caller| {
-        if let Some(reason) = caller.data_mut().end_on_pending_kill() {
-            return Err(wasmtime::Error::from(crate::InstanceKilled { reason }));
-        }
-        Ok(wasmtime::UpdateDeadline::Yield(1))
-    });
+    store.epoch_deadline_callback(|mut caller| caller.data_mut().on_epoch_deadline());
 }
 
 pub(super) fn preview1_program_linker<CpuImpl, Net, HostFs>(
@@ -5698,5 +5653,93 @@ mod tests {
             p1_probe_descriptor(Some(&socket), P1_EVENTTYPE_FD_WRITE),
             Ok(P1Probe::Network(P1NetworkProbe::TcpStream(9)))
         ));
+    }
+
+    /// Drive one call into a WASIX store's guest through its turns, the
+    /// way the program driver does.
+    fn drive_wasix_call(
+        activity: &crate::InstanceActivity,
+        signal_state: &WasixSignalState,
+        call: impl core::future::Future<Output = wasmtime::Result<()>>,
+    ) -> wasmtime::Result<()> {
+        let turns = crate::component::GuestTurns::new(
+            activity.turns(),
+            crate::test_support::ManualClockCpu::new(),
+            crate::test_support::TestRuntimeState::default(),
+            signal_state.clone(),
+        );
+        futures_lite::future::block_on(turns.drive(call))
+    }
+
+    /// A signal raised while the guest is in its last host call ends the
+    /// program with `128 + signal`, although the guest then returns from
+    /// its export without meeting another epoch check. The call meets
+    /// the signal where it completes, and the signal takes precedence
+    /// over the status the guest asked for, as it did when a call hook
+    /// delivered it on the way back from that host call.
+    #[test]
+    fn a_signal_raised_in_the_last_host_call_exits_128_plus_the_signal() {
+        let registry = crate::InstanceRegistry::new();
+        let activity = crate::InstanceActivity::new(registry.register("signalled", 0), 0);
+        let signal_state = WasixSignalState::new();
+        let sender = signal_state.clone();
+        let mut polls = 0;
+        // The last host call suspends; another task signals the program
+        // while it waits; the call returns and so does the export.
+        let call = core::future::poll_fn(move |cx| {
+            polls += 1;
+            if polls == 1 {
+                sender.raise(15);
+                cx.waker().wake_by_ref();
+                core::task::Poll::Pending
+            } else {
+                core::task::Poll::Ready(Ok(()))
+            }
+        });
+
+        let error =
+            drive_wasix_call(&activity, &signal_state, call).expect_err("the signal ends the call");
+        assert_eq!(preview1_exit_status(&error, Some(0)), Some(143));
+        assert_eq!(
+            signal_state.take_pending(),
+            None,
+            "the signal is delivered once"
+        );
+    }
+
+    /// A call that returns with no signal pending keeps its own result.
+    #[test]
+    fn a_call_with_no_signal_pending_keeps_its_result() {
+        let registry = crate::InstanceRegistry::new();
+        let activity = crate::InstanceActivity::new(registry.register("quiet", 0), 0);
+        let signal_state = WasixSignalState::new();
+        let call = core::future::ready(Ok(()));
+
+        assert!(drive_wasix_call(&activity, &signal_state, call).is_ok());
+    }
+
+    /// A signal and a condemnation that both reach the guest in its last
+    /// host call end the call with the signal, the precedence the epoch
+    /// callback gives them.
+    #[test]
+    fn a_signal_met_at_completion_is_delivered_ahead_of_a_kill() {
+        let registry = crate::InstanceRegistry::new();
+        let instance = registry.register("signalled-and-condemned", 0);
+        let activity = crate::InstanceActivity::new(instance.clone(), 0);
+        let signal_state = WasixSignalState::new();
+        let sender = signal_state.clone();
+        let call = core::future::poll_fn(move |_| {
+            sender.raise(2);
+            assert_eq!(
+                registry.request_kill(instance.id(), crate::KillReason::Operator, 0),
+                crate::KillOutcome::Requested
+            );
+            core::task::Poll::Ready(Ok(()))
+        });
+
+        let error =
+            drive_wasix_call(&activity, &signal_state, call).expect_err("the call is stopped");
+        assert!(error.downcast_ref::<crate::InstanceKilled>().is_none());
+        assert_eq!(preview1_exit_status(&error, None), Some(130));
     }
 }

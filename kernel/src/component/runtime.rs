@@ -7,12 +7,12 @@ use bytes::Bytes;
 
 use crate::io::{ByteReader, ByteWriter, TryRead};
 use crate::{
-    ActivityChange, EntropyPool, InstanceActivity, InstanceExecutionTransition, InstanceRegistry,
-    KernelClock, KillReason, ProcessAuthority, RegisteredInstance, SetWallClockCap, Sleep, Timer,
+    EntropyPool, InstanceActivity, InstanceRegistry, KernelClock, KillReason, ProcessAuthority,
+    RegisteredInstance, SetWallClockCap, Sleep, Timer,
 };
-use helios_hal::cpu::{Cpu, Instant, current_processor};
+use helios_hal::cpu::{Cpu, Instant};
 
-use crate::memory::{MemoryOwner, set_user_memory_owner, user_mapping_kernel_heap_bytes};
+use crate::memory::user_mapping_kernel_heap_bytes;
 use thiserror::Error;
 
 /// The stack a component instance runs on: both the guest wasm call
@@ -137,10 +137,12 @@ pub fn store_kernel_heap_bytes(store_bytes: usize) -> u64 {
     u64::try_from(bytes).unwrap_or(u64::MAX)
 }
 
-/// Error returned through the runtime call hook when a kill was
-/// requested for the running instance — by the OOM killer or by a
-/// kernel-plugin supervisor. The runtime adapter turns this into a trap and the
-/// component executor surfaces it as a typed `ProgramExecError`.
+/// Error a guest call ends with when a kill was requested for its
+/// instance — by the OOM killer, a kernel-plugin supervisor or an
+/// operator. The runtime adapter raises it as a trap from the epoch
+/// callback, [`super::OnProcessor`] reports it for a call that completes
+/// while condemned, and the component executor surfaces it as a typed
+/// `ProgramExecError`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
 #[error("instance terminated: {reason:?}")]
 pub struct InstanceKilled {
@@ -552,11 +554,27 @@ where
     /// Retires every network handle a dying socket resource queued
     /// since the last drain.
     ///
-    /// Called at the entry to every host call, and again right after a
-    /// socket resource is deleted so that the common case — a guest
-    /// closing its own connection — retires on that very call.
+    /// Called right after a socket resource is deleted, so that the
+    /// common case — a guest closing its own connection — retires on
+    /// that very call. Everything else a store's dying sockets queue is
+    /// retired when the store's processor turn ends: see
+    /// [`Self::guest_turns`].
     pub fn retire_sockets(&self) {
         self.retirement.drain();
+    }
+
+    /// The handle the code driving this store accounts its processor
+    /// turns through. Taken before the store is borrowed for the call;
+    /// see [`super::GuestTurns::drive`].
+    pub fn guest_turns(
+        &self,
+    ) -> super::GuestTurns<CpuImpl, RuntimeStateImpl, super::SocketRetirementQueue> {
+        super::GuestTurns::new(
+            self.execution_context.activity.turns(),
+            self.cpu.clone(),
+            self.runtime_state.clone(),
+            self.retirement.turn_queue(),
+        )
     }
 
     /// Record the exit code requested by the runtime exit interface so the
@@ -779,60 +797,11 @@ where
         bytes
     }
 
-    /// Report the transition wasmtime's call hook delivered, and name
-    /// the instance whose guest code this processor is running so pages
-    /// the runtime commits while it runs — a `memory.grow`, most of all
-    /// — are charged to it.
-    ///
-    /// A call hook cannot hold a scope guard across the stretch of
-    /// guest code it opens; the guard is the store's own
-    /// [`InstanceActivity`], which owns the pairing between the
-    /// transitions and hands back what changed.
-    ///
-    /// Returns the kill reason when the OOM killer or a supervisor has
-    /// condemned this instance — and in that case the activation has
-    /// already been ended, so the caller's only remaining job is to
-    /// raise the `InstanceKilled` trap. The two cannot be separated:
-    /// see [`InstanceActivity::record`].
-    pub fn record_transition(
-        &mut self,
-        transition: InstanceExecutionTransition,
-    ) -> Option<KillReason> {
-        let now_nanos = self.now_nanos();
-        let step = self
-            .execution_context
-            .activity
-            .record(transition, now_nanos);
-        self.apply_activity_change(step.change);
-        step.killed
-    }
-
-    /// End this store's activation and report the condemnation when the
-    /// instance has one. The epoch callback uses this: a CPU-bound
-    /// guest never reaches a call hook, and the trap raised there
-    /// unwinds through the same hooks a call-hook kill does.
-    pub fn end_on_pending_kill(&mut self) -> Option<KillReason> {
-        let reason = self.execution_context.activity.pending_kill()?;
-        let now_nanos = self.now_nanos();
-        let change = self.execution_context.activity.end(now_nanos);
-        self.apply_activity_change(change);
-        Some(reason)
-    }
-
-    fn apply_activity_change(&self, change: ActivityChange) {
-        name_user_memory_owner(self.instance(), change);
-        if let ActivityChange::Left {
-            instance_elapsed: Some(elapsed),
-        } = change
-            && self.runtime_state.profiling_enabled()
-        {
-            self.runtime_state.record_profile_stack_parts_nanos(
-                crate::ProfileScope::User,
-                "user;",
-                self.instance().name(),
-                elapsed,
-            );
-        }
+    /// The condemnation recorded for this instance, if any. The epoch
+    /// callback reads it: a guest that is running traps with it at its
+    /// next epoch check, which the kill's epoch bump makes immediate.
+    pub fn pending_kill(&self) -> Option<KillReason> {
+        self.execution_context.activity.pending_kill()
     }
 }
 
@@ -899,14 +868,3 @@ pub async fn wait_until_runtime_deadline<CpuImpl, RuntimeStateImpl>(
 }
 
 // Runtime-adapter trait impls live in the concrete adapter module.
-
-/// Charges pages committed on this processor to `instance` while its
-/// guest code runs, and to nobody once this store leaves it.
-fn name_user_memory_owner(instance: &crate::RegisteredInstance, change: ActivityChange) {
-    let owner = match change {
-        ActivityChange::Entered => MemoryOwner::new(instance.id().raw()),
-        ActivityChange::Left { .. } => MemoryOwner::NONE,
-        ActivityChange::Unchanged => return,
-    };
-    set_user_memory_owner(current_processor(), owner);
-}

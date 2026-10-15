@@ -852,6 +852,46 @@ pub(super) struct EventFdState {
 #[error("guest requested wasi preview1 exit")]
 pub(super) struct Preview1Exit;
 
+/// A pending WASIX signal ended the guest. The program exits with
+/// `128 + signal`, whatever the guest asked for before it.
+#[derive(Debug, Error)]
+#[error("guest ended by wasix signal {signal}")]
+pub(super) struct Preview1SignalExit {
+    pub(super) signal: u32,
+}
+
+impl Preview1SignalExit {
+    pub(super) fn exit_code(&self) -> u32 {
+        128u32.saturating_add(self.signal)
+    }
+}
+
+/// The exit status of a program whose call ended in `error`, given the
+/// status the guest `requested` before: the signal that ended it,
+/// otherwise the requested status, otherwise none, and the error is a
+/// failure.
+pub(super) fn preview1_exit_status(error: &wasmtime::Error, requested: Option<u32>) -> Option<u32> {
+    match error.downcast_ref::<Preview1SignalExit>() {
+        Some(exit) => Some(exit.exit_code()),
+        None => requested,
+    }
+}
+
+/// A WASIX store delivers a signal raised while its guest was in its
+/// last host call when the call into the store completes: the guest
+/// went back to the host without meeting the epoch check that would
+/// otherwise have delivered it.
+impl<RuntimeStateImpl> crate::component::TurnEpilogue<RuntimeStateImpl, wasmtime::Error>
+    for WasixSignalState
+{
+    fn end_turn(&self, _: &RuntimeStateImpl) {}
+
+    fn end_call(&self) -> Option<wasmtime::Error> {
+        self.take_pending()
+            .map(|signal| wasmtime::Error::new(Preview1SignalExit { signal }))
+    }
+}
+
 pub(super) fn preview1_cwd_from_authority(authority: &ProcessAuthority) -> Option<Preview1Cwd> {
     authority.cwd().map(|preopen| Preview1Cwd {
         guest_name: preopen.guest_name().to_owned(),

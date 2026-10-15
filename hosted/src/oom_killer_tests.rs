@@ -13,9 +13,9 @@
 
 use helios_hal::vmm::{NoSwap, SwapBackend};
 use helios_kernel::{
-    ActivityChange, InstanceActivity, InstanceExecutionTransition, InstanceRegistry,
-    KernelHeapHeadroom, KillOutcome, KillReason, MemoryPool, OOM_RECLAIM_GRACE, OomKillOutcome,
-    OomPolicy, store_kernel_heap_bytes, user_mapping_kernel_heap_bytes,
+    InstanceActivity, InstanceRegistry, KernelHeapHeadroom, KillOutcome, KillReason, MemoryPool,
+    OOM_RECLAIM_GRACE, OomKillOutcome, OomPolicy, store_kernel_heap_bytes,
+    user_mapping_kernel_heap_bytes,
 };
 
 /// A store value's own size, standing in for the wasmtime store the
@@ -171,7 +171,7 @@ fn kill_supervisor_restart_decodes_correctly() {
 }
 
 /// Issue #100: condemning a victim does not free its memory — the kill
-/// flag is observed at that instance's next call-hook boundary. The
+/// flag is observed at that instance's next epoch check. The
 /// killer used to pick a fresh live instance on every refused grow, so
 /// one 1MiB shortfall walked a whole workload: ~20 instances condemned
 /// at ~45KB reclaimed each. The condemned-memory ledger is what stops
@@ -230,8 +230,8 @@ fn one_shortfall_condemns_only_the_victims_that_cover_it() {
 }
 
 /// The ledger is derived from the live instances, so a victim that
-/// actually reaches its call hook and is torn down stops covering
-/// anything the moment its memory is back.
+/// actually traps and is torn down stops covering anything the moment
+/// its memory is back.
 #[test]
 fn reclaimed_memory_leaves_the_ledger() {
     let registry = InstanceRegistry::new();
@@ -261,8 +261,8 @@ fn reclaimed_memory_leaves_the_ledger() {
 }
 
 /// The bound on the ledger's honesty. A victim parked in a host future
-/// may never reach a call hook, and the epoch bump cannot reach it, so
-/// its condemnation stops covering requests after `OOM_RECLAIM_GRACE`.
+/// may never return to wasm, so no epoch check ever traps it, and its
+/// condemnation stops covering requests after `OOM_RECLAIM_GRACE`.
 /// The next victim is then condemned, while the stale condemnation stays
 /// on the books — and out of victim selection — until it is torn down.
 #[test]
@@ -328,22 +328,16 @@ fn the_requester_is_never_its_own_victim() {
     assert_eq!(small.pending_kill(), None);
 }
 
-/// Issue #114. The spawner holding a hundred children is condemned by
-/// the OOM killer while it is on a processor, and the call hook that
-/// observes the condemnation has already recorded the transition it is
-/// about to abort.
-///
-/// Wasmtime brackets a host call with `CallingHost`/`ReturningFromHost`
-/// and a wasm entry with `CallingWasm`/`ReturningFromWasm`, and it fires
-/// `ReturningFromWasm` even when the guest trapped. A hook that records
-/// the `CallingHost` pause and then returns `Err(InstanceKilled)`
-/// cancels the host call, so `ReturningFromHost` never arrives — while
-/// the trap still unwinds through `ReturningFromWasm`. That second pause
-/// has no resume behind it, and before the activation became an owned
-/// state machine it drove the entry's counter below zero and panicked
-/// the kernel on a user-mode victim.
+/// Issue #114, as the processor-turn boundary meets it. The spawner
+/// holding a hundred children is condemned by the OOM killer while one
+/// of its turns is open. The turn still ends normally — there is no
+/// call hook left to abort half-way, so there is nothing whose matching
+/// half can go missing — and it ends with the instance off the
+/// processor and its condemnation still on the ledger.
 #[test]
-fn a_condemned_spawner_survives_the_hooks_that_unwind_its_kill_trap() {
+fn a_spawner_condemned_mid_turn_ends_its_turn_and_stays_on_the_ledger() {
+    // A turn names its instance on the executing processor.
+    crate::cpu::set_current_processor(helios_hal::cpu::ProcessorId::new(0));
     /// What the spawner held when the bench lane condemned it.
     const SPAWNER_BYTES: u64 = 3_932_160;
     /// The grow each child was refused.
@@ -361,11 +355,9 @@ fn a_condemned_spawner_survives_the_hooks_that_unwind_its_kill_trap() {
         })
         .collect();
 
-    // The spawner is inside guest code: `CallingWasm`.
-    let mut activity = InstanceActivity::new(spawner.clone(), test_store_charge());
-    let step = activity.record(InstanceExecutionTransition::Resume, 10);
-    assert_eq!(step.change, ActivityChange::Entered);
-    assert_eq!(step.killed, None);
+    let activity = InstanceActivity::new(spawner.clone(), test_store_charge());
+    let turns = activity.turns();
+    let turn = turns.begin(10);
 
     // Two children's grows are refused. The first condemns the spawner,
     // the second is covered by the ledger and condemns nothing further.
@@ -376,24 +368,20 @@ fn a_condemned_spawner_survives_the_hooks_that_unwind_its_kill_trap() {
     );
     let second = registry.condemn_for_oom(children[1].id(), MemoryPool::User, REQUESTED_BYTES, 21);
     assert_eq!(second.outcome, OomKillOutcome::AwaitingReclaim);
+    assert_eq!(turns.pending_kill(), Some(KillReason::OutOfMemory));
 
-    // The spawner reaches a host call. The hook records the pause and
-    // gets the condemnation back with the activation already ended, so
-    // the trap it raises cancels the host call safely.
-    let step = activity.record(InstanceExecutionTransition::Pause, 30);
-    assert_eq!(step.killed, Some(KillReason::OutOfMemory));
-    assert_eq!(
-        step.change,
-        ActivityChange::Left {
-            instance_elapsed: Some(20)
-        }
-    );
+    // The trap unwinds and the poll returns: the turn ends.
+    assert_eq!(turn.end(30), 20);
 
-    // The trap unwinds and wasmtime reports the wasm frame leaving too.
-    // There is no activation left for it to close.
-    let step = activity.record(InstanceExecutionTransition::Pause, 31);
-    assert_eq!(step.change, ActivityChange::Unchanged);
-    assert_eq!(step.killed, Some(KillReason::OutOfMemory));
+    // Nothing accrues after the turn: the instance is off the processor.
+    let _ = registry.snapshot(1_000);
+    let busy = registry
+        .snapshot(2_000)
+        .into_iter()
+        .find(|snapshot| snapshot.id == spawner.id())
+        .expect("the victim is still registered")
+        .cpu_busy;
+    assert_eq!(busy, 0, "a killed instance must not keep billing CPU");
 
     // The victim is still a live registry entry on its way out, and the
     // kernel is still running.
@@ -405,63 +393,25 @@ fn a_condemned_spawner_survives_the_hooks_that_unwind_its_kill_trap() {
     );
 }
 
-/// The mirror image of the same defect. When the condemnation is first
-/// seen on a *resume* hook — `CallingWasm`, or `ReturningFromHost` — the
-/// call the hook aborts is the one whose `ReturningFromWasm` would have
-/// closed the activation, so nothing closes it. The instance would read
-/// as permanently on a processor: never idle, never swappable, and
-/// billed for CPU it is not using.
+/// A store dropped between turns — a cancelled task, a future dropped
+/// while its fiber is suspended — has no turn open, so it leaves no
+/// instance on a processor, and the time its turns used stays on the
+/// instance.
 #[test]
-fn a_condemnation_seen_on_a_resume_hook_still_closes_the_activation() {
-    let registry = InstanceRegistry::new();
-    let victim = registry.register("/bin/procbench", 0);
-    victim.set_memory_bytes(4 * 1024 * 1024);
-    let requester = registry.register("procbench-child", 0);
-    requester.set_memory_bytes(64 * 1024);
-
-    assert_eq!(
-        registry.request_kill(victim.id(), KillReason::OutOfMemory, 5),
-        KillOutcome::Requested
-    );
-
-    // The victim was in a host call when it was condemned, and the hook
-    // that sees the flag is the one returning to wasm.
-    let mut activity = InstanceActivity::new(victim.clone(), test_store_charge());
-    let step = activity.record(InstanceExecutionTransition::Resume, 10);
-    assert_eq!(step.killed, Some(KillReason::OutOfMemory));
-    assert_eq!(
-        step.change,
-        ActivityChange::Left {
-            instance_elapsed: Some(0)
-        },
-        "the resume the hook just recorded is closed again before it traps"
-    );
-
-    // Nothing accrues after the trap: the instance is off the processor.
-    let _ = registry.snapshot(1_000);
-    let busy = registry
-        .snapshot(2_000)
-        .into_iter()
-        .find(|snapshot| snapshot.id == victim.id())
-        .expect("the victim is still registered")
-        .cpu_busy;
-    assert_eq!(busy, 0, "a killed instance must not keep billing CPU");
-    drop(requester);
-}
-
-/// The activation is released when its owner is dropped, not only when
-/// wasmtime reports the pause. A store torn down mid-guest — a
-/// cancelled task, a future dropped while its fiber is suspended —
-/// never delivers `ReturningFromWasm`.
-#[test]
-fn dropping_the_owner_releases_its_activation() {
+fn a_store_dropped_while_suspended_bills_nothing_further() {
+    // A turn names its instance on the executing processor.
+    crate::cpu::set_current_processor(helios_hal::cpu::ProcessorId::new(0));
     let registry = InstanceRegistry::new();
     let instance = registry.register("cancelled", 0);
 
-    let mut activity = InstanceActivity::new(instance.clone(), test_store_charge());
-    activity.record(InstanceExecutionTransition::Resume, 100);
+    let activity = InstanceActivity::new(instance.clone(), test_store_charge());
+    let turns = activity.turns();
+    let turn = turns.begin(100);
+    assert_eq!(turn.end(400), 300);
+    drop(turns);
     drop(activity);
 
+    assert_eq!(registry.active_totals(1_000)[0].active_nanos, 300);
     let _ = registry.snapshot(1_000);
     let busy = registry
         .snapshot(2_000)
@@ -470,6 +420,7 @@ fn dropping_the_owner_releases_its_activation() {
         .expect("the instance is still registered")
         .cpu_busy;
     assert_eq!(busy, 0);
+    assert_eq!(registry.idle_instances(2_000, 1_600), vec![instance.id()]);
 }
 
 /// Issue #120, first defect. The kernel-heap branch of the grow

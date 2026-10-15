@@ -3,18 +3,18 @@ extern crate alloc;
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::num::NonZeroU32;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use core::time::Duration;
 
+use crossbeam_utils::CachePadded;
+use helios_hal::cpu::current_processor;
 use slab::Slab;
 use spin::Mutex;
 use triomphe::Arc;
 
+use crate::memory::{MemoryOwner, UserMemoryOwnerScope, enter_user_memory_owner};
 use crate::user_mapping_kernel_heap_bytes;
-
-const INACTIVE_RESUME_AT: u64 = u64::MAX;
 
 /// What the OOM killer is allowed to do with an instance.
 ///
@@ -143,17 +143,18 @@ const fn decode_kill_flag(value: u8) -> Option<KillReason> {
 /// before it will condemn another one to serve the same shortfall.
 ///
 /// Condemning an instance does not free anything by itself: the kill
-/// flag is observed at the victim's next call-hook boundary, and the
-/// memory returns when its store is torn down and its registry entry
-/// drops. [`InstanceRegistry::request_kill`] bumps the runtime engine
-/// epoch, so a victim executing wasm reaches that boundary at its next
-/// epoch check, and the scheduler tick that drives those runs every
-/// 100ms (`SCHEDULER_INTERRUPT_INTERVAL`). Five ticks leaves room for
-/// the trap to unwind and the store to drop.
+/// flag is observed at the victim's next epoch check, and the memory
+/// returns when its store is torn down and its registry entry drops.
+/// [`InstanceRegistry::request_kill`] bumps the runtime engine epoch,
+/// so a victim executing wasm traps at its next epoch check, and the
+/// scheduler tick that also drives those runs every 100ms
+/// (`SCHEDULER_INTERRUPT_INTERVAL`). Five ticks leaves room for the
+/// trap to unwind and the store to drop.
 ///
-/// A victim parked in a host future that the epoch cannot reach — a
-/// socket read with no peer, a host-fs request whose reply never comes
-/// — may never reach a call hook at all, so the wait has to be bounded.
+/// A victim parked in a host future that never resolves — a socket
+/// read with no peer, a host-fs request whose reply never comes — never
+/// returns to wasm and so never reaches an epoch check, so the wait has
+/// to be bounded.
 /// When the window expires the condemnation goes stale: it stops
 /// counting as coverage, so the next request condemns a fresh victim,
 /// while the stale condemnation stays on the books and stays out of
@@ -176,8 +177,8 @@ pub struct CondemnedMemory {
     pub pending_bytes: u64,
     /// Condemned longer ago than [`OOM_RECLAIM_GRACE`]. Still condemned
     /// and still not a candidate for a second condemnation, but no
-    /// longer counted as coverage: the instance may never reach a call
-    /// hook, and a shortfall cannot wait on it forever.
+    /// longer counted as coverage: the instance may never return to
+    /// wasm, and a shortfall cannot wait on it forever.
     pub stale_bytes: u64,
 }
 
@@ -262,12 +263,6 @@ pub struct RegisteredInstance {
     entry: NonNull<InstanceEntry>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum InstanceExecutionTransition {
-    Resume,
-    Pause,
-}
-
 struct InstanceRegistryInner {
     next_id: AtomicU64,
     entries: Mutex<Slab<Box<InstanceEntry>>>,
@@ -286,20 +281,16 @@ struct InstanceEntry {
     /// derived from `memory_bytes` instead of charged, so the two can
     /// never drift apart — see [`InstanceEntry::kernel_heap_bytes`].
     kernel_bytes: AtomicU64,
-    active_nanos: AtomicU64,
-    active_depth: AtomicU32,
-    last_resume_at: AtomicU64,
-    /// When this instance was last on a processor. Set on every pause,
-    /// so an instance that is running right now carries the timestamp of
-    /// its previous stretch and `active_depth` tells the two apart. The
-    /// swap policy reads both to decide whether an instance has been
-    /// idle long enough to evict.
-    last_active_at: AtomicU64,
+    /// The processor time of every store this instance holds. The swap
+    /// policy reads it to decide whether an instance has been idle long
+    /// enough to evict; stats and profiles read the total.
+    stores: Mutex<StoreClocks>,
     /// What the OOM killer may do with this instance.
     policy: OomPolicy,
-    /// Set by the OOM killer / supervisor; checked on each call_hook
-    /// transition. When set, the next host-call boundary returns
-    /// `Killed { reason }` instead of resuming the guest.
+    /// Set by the OOM killer / supervisor. The runtime's epoch callback
+    /// reads it and traps the guest with `InstanceKilled { reason }`,
+    /// and a guest call that completes while it is set reports the
+    /// kill instead of its result.
     kill_flag: AtomicU8,
     /// Monotonic nanoseconds at which the kill flag was set, and what
     /// the instance held in each pool at that moment. Together they are
@@ -363,10 +354,7 @@ impl InstanceRegistry {
             started_at,
             memory_bytes: AtomicU64::new(0),
             kernel_bytes: AtomicU64::new(0),
-            active_nanos: AtomicU64::new(0),
-            active_depth: AtomicU32::new(0),
-            last_resume_at: AtomicU64::new(INACTIVE_RESUME_AT),
-            last_active_at: AtomicU64::new(started_at),
+            stores: Mutex::new(StoreClocks::new(started_at)),
             policy,
             kill_flag: AtomicU8::new(KILL_FLAG_NONE),
             condemned_at: AtomicU64::new(0),
@@ -422,8 +410,8 @@ impl InstanceRegistry {
     /// before the same request can be admitted.
     ///
     /// Condemning a victim only sets its kill flag; the memory returns
-    /// when that instance reaches its next call-hook boundary and is
-    /// torn down. Until it does, those bytes are already spoken for, so
+    /// when that instance traps at its next epoch check and is torn
+    /// down. Until it does, those bytes are already spoken for, so
     /// a second refused grow that they would satisfy must not condemn a
     /// second live instance — otherwise one 1MiB shortfall walks the
     /// whole workload, condemning an instance per attempt while the
@@ -489,24 +477,23 @@ impl InstanceRegistry {
         }
     }
 
-    /// Mark `id` for termination as of `now_nanos`. The next host-call
-    /// boundary in that instance returns the recorded `KillReason`
-    /// instead of resuming the guest. Returns true if the kill flag was
-    /// actually flipped (i.e. the instance existed and was not already
-    /// condemned).
+    /// Mark `id` for termination as of `now_nanos`. The instance's next
+    /// epoch check traps with the recorded `KillReason`, and a guest
+    /// call of it that completes first reports the kill instead of its
+    /// result.
     ///
     /// A successful flip puts the instance's memory on the condemned
     /// ledger, timestamped with `now_nanos`: whatever the reason for the
     /// kill, those bytes are on their way back and the OOM killer must
     /// not condemn a second instance for memory it is already getting.
     ///
-    /// On a successful flip, the runtime engine epoch is bumped so
-    /// any guest currently running without host calls hits its
-    /// next `epoch_deadline_async_yield` boundary quickly and exposes
-    /// the kill flag to `call_hook`. Without this kick a CPU-bound
-    /// victim could run until its next host call, which on adversarial
-    /// workloads is "indefinitely". It is also what bounds the ledger's
-    /// wait: see [`OOM_RECLAIM_GRACE`].
+    /// On a successful flip, the runtime engine epoch is bumped so the
+    /// next epoch check of every running guest fires its callback, which
+    /// reads the kill flag and traps. Without this kick a CPU-bound
+    /// victim would run until the next scheduler tick. A guest suspended
+    /// in a host call meets the same check at its first function entry
+    /// or loop back-edge after the call returns. It is also what bounds
+    /// the ledger's wait: see [`OOM_RECLAIM_GRACE`].
     pub fn request_kill(&self, id: InstanceId, reason: KillReason, now_nanos: u64) -> KillOutcome {
         let entries = self.inner.entries.lock();
         let outcome = if entries.iter().any(|(_, entry)| entry.id == id) {
@@ -542,13 +529,14 @@ impl InstanceRegistry {
         let mut idle: Vec<(u64, InstanceId)> = entries
             .iter()
             .filter_map(|(_, entry)| {
-                if entry.active_depth.load(Ordering::Acquire) != 0 {
-                    return None;
-                }
                 if entry.kill_flag.load(Ordering::Acquire) != KILL_FLAG_NONE {
                     return None;
                 }
-                let last_active = entry.last_active_at.load(Ordering::Acquire);
+                let time = entry.stores.lock().processor_time(now_nanos);
+                if time.on_processor {
+                    return None;
+                }
+                let last_active = time.last_active_at;
                 let idle_for = now_nanos.saturating_sub(last_active);
                 (idle_for >= idle_after_nanos).then_some((last_active, entry.id))
             })
@@ -570,7 +558,7 @@ impl InstanceRegistry {
         let mut next_totals = Vec::with_capacity(entries.len());
 
         for (_, entry) in entries.iter() {
-            let total_active_nanos = entry.total_active_nanos(now_nanos);
+            let total_active_nanos = entry.stores.lock().processor_time(now_nanos).active_nanos;
             let previous_total = sampling
                 .totals
                 .iter()
@@ -611,7 +599,7 @@ impl InstanceRegistry {
             .iter()
             .map(|(_, entry)| InstanceProfileTotal {
                 name: entry.name.clone(),
-                active_nanos: entry.total_active_nanos(now_nanos),
+                active_nanos: entry.stores.lock().processor_time(now_nanos).active_nanos,
             })
             .collect::<Vec<_>>();
         totals.sort_by(|left, right| left.name.cmp(&right.name));
@@ -812,8 +800,8 @@ impl RegisteredInstance {
     }
 
     /// Returns `Some(reason)` when the instance has been condemned by
-    /// the OOM killer or a supervisor and the runtime should trap on
-    /// the next host-call boundary instead of resuming the guest.
+    /// the OOM killer or a supervisor and the runtime should trap at
+    /// the guest's next epoch check.
     pub fn pending_kill(&self) -> Option<KillReason> {
         decode_kill_flag(self.entry().kill_flag.load(Ordering::Acquire))
     }
@@ -897,109 +885,191 @@ impl Drop for RegisteredInstance {
     }
 }
 
-/// What one recorded transition did to the processor the reporting
-/// store is running on.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ActivityChange {
-    /// The store entered the instance's guest code: what this processor
-    /// commits from here on belongs to that instance.
-    Entered,
-    /// The store left the instance's guest code. `instance_elapsed` is
-    /// `Some` when no activation is left anywhere, carrying the
-    /// nanoseconds the instance held a processor.
-    Left { instance_elapsed: Option<u64> },
-    /// Nothing changed hands: a nested transition, or one reported
-    /// after the activation had already ended.
-    Unchanged,
+/// A store's processor time, in the one word its driver writes.
+///
+/// While the store is on a processor the word holds [`ON_PROCESSOR`]
+/// over `resumed_at - accumulated`, so the total at any later `now` is
+/// `now - base` with no second field to keep consistent with the
+/// first; off a processor it holds the accumulated nanoseconds.
+///
+/// # Concurrency
+///
+/// One writer: the turn that holds the store, which is one task on one
+/// processor at a time, because a store is driven through `&mut`. It
+/// writes with plain stores, never a read-modify-write. Readers are the
+/// registry's stats, profile and swap passes on any processor, under the
+/// owning entry's [`StoreClocks`] lock; the word is a single atomic, so
+/// they need no retry loop. The clock is cache-padded, so the line a
+/// store's turns write is that store's alone: guest threads of one
+/// instance, each on its own store and processor, never share it.
+struct StoreClock {
+    word: AtomicU64,
+    /// When the store last left a processor. Stored before the word
+    /// that marks it off-processor, so a reader that sees it off sees
+    /// this stretch's end too.
+    last_active_at: AtomicU64,
 }
 
-impl ActivityChange {
-    /// Fold the change made by ending an activation into the change the
-    /// transition itself made. Releasing the activation always wins:
-    /// once it is gone the processor is not the instance's any more.
-    fn then(self, ending: Self) -> Self {
-        match ending {
-            Self::Left { .. } => ending,
-            Self::Entered | Self::Unchanged => self,
+/// The bit of [`StoreClock::word`] that says the store is on a
+/// processor.
+const ON_PROCESSOR: u64 = 1 << 63;
+
+impl StoreClock {
+    const fn new() -> Self {
+        Self {
+            word: AtomicU64::new(0),
+            last_active_at: AtomicU64::new(0),
+        }
+    }
+
+    /// Processor nanoseconds this store has used as of `now_nanos`, and
+    /// whether it is on a processor right now.
+    fn read(&self, now_nanos: u64) -> (u64, bool) {
+        let word = self.word.load(Ordering::Acquire);
+        if word & ON_PROCESSOR == 0 {
+            (word, false)
+        } else {
+            (now_nanos.saturating_sub(word & !ON_PROCESSOR), true)
         }
     }
 }
 
-/// The result of reporting one call-hook transition to an
-/// [`InstanceActivity`].
+/// The processor time of one instance, summed over its stores.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ActivityStep {
-    /// What the transition did to this processor's ownership.
-    pub change: ActivityChange,
-    /// Set when the instance has been condemned. The activation is
-    /// already ended when this is `Some`, so the caller's only
-    /// remaining job is to raise the trap.
-    pub killed: Option<KillReason>,
+struct ProcessorTime {
+    active_nanos: u64,
+    on_processor: bool,
+    last_active_at: u64,
 }
 
-/// One store's activity accounting for the instance it runs.
+/// The clocks of an instance's live stores, and what its dropped ones
+/// left behind.
+///
+/// Locked when a store is opened or dropped and when the registry reads
+/// an instance's time, never on a turn: a turn writes only its own
+/// [`StoreClock`].
+struct StoreClocks {
+    live: Vec<Arc<CachePadded<StoreClock>>>,
+    retired_active_nanos: u64,
+    retired_last_active_at: u64,
+}
+
+impl StoreClocks {
+    const fn new(started_at: u64) -> Self {
+        Self {
+            live: Vec::new(),
+            retired_active_nanos: 0,
+            retired_last_active_at: started_at,
+        }
+    }
+
+    fn processor_time(&self, now_nanos: u64) -> ProcessorTime {
+        let mut time = ProcessorTime {
+            active_nanos: self.retired_active_nanos,
+            on_processor: false,
+            last_active_at: self.retired_last_active_at,
+        };
+        for clock in &self.live {
+            let (active_nanos, on_processor) = clock.read(now_nanos);
+            time.active_nanos = time.active_nanos.saturating_add(active_nanos);
+            time.on_processor |= on_processor;
+            time.last_active_at = time
+                .last_active_at
+                .max(clock.last_active_at.load(Ordering::Acquire));
+        }
+        time
+    }
+}
+
+/// One store's accounting for the instance it runs: the kernel heap
+/// the store costs, and the processor time its turns use.
 ///
 /// [`RegisteredInstance`] is a handle: cloneable, shared, readable by
-/// anyone. Activity is not. The registry entry counts how many stores
-/// are inside an instance's guest code — a guest thread gets its own
-/// store over the same instance — but the resume/pause
-/// pairing behind each of those counts belongs to exactly one owner.
-/// `InstanceActivity` is that owner: it is not `Clone`, it holds at
-/// most one activation on the entry, and it is the only thing that
-/// opens or closes one.
-///
-/// The kill path is part of the same ownership. Wasmtime pairs its call
-/// hooks around the call it is making, so a hook that records a
-/// transition and *then* returns an error cancels the call whose
-/// matching hook would have closed that transition — while the
-/// `ReturningFromWasm` that unwinds the resulting trap still arrives.
-/// [`Self::record`] therefore looks for the condemnation itself and
-/// ends the activation in the same step. That ended state is
-/// terminal, so the transitions wasmtime reports while the trap unwinds
-/// find no activation to close rather than a counter to drive below
-/// zero.
+/// anyone. A store's clock is not. `InstanceActivity` is created with
+/// the store, registers the store's clock on the instance, and folds
+/// that clock into the instance's retired total when the store drops.
+/// The turns themselves are taken through [`StoreTurns`], the handle
+/// the code driving the store holds while the store is mutably
+/// borrowed.
 pub struct InstanceActivity {
-    instance: RegisteredInstance,
+    turns: StoreTurns,
     /// The kernel heap this store costs, charged to the instance for
     /// exactly as long as the store exists. The activity owner is the
     /// one thing there is precisely one of per store (that is what
     /// makes it the owner), so it is where the per-store charge
     /// belongs.
     _store_charge: KernelHeapCharge,
-    state: ActivityState,
-    /// The last timestamp this owner was given, so a store dropped
-    /// while its guest is suspended — a cancelled task, a future
-    /// dropped on its fiber — still closes its activation instead of
-    /// leaving the instance on a processor forever.
-    last_nanos: u64,
-}
-
-enum ActivityState {
-    /// Not inside guest code; no activation held.
-    Idle,
-    /// Inside guest code, `depth` call-hook levels deep, holding one
-    /// activation on the registry entry.
-    Running(NonZeroU32),
-    /// A call hook raised a trap the guest never returns from — an OOM
-    /// or supervisor kill, or a signal exit. Any activation was
-    /// released then, and this state is terminal.
-    Ended,
 }
 
 impl InstanceActivity {
-    /// Open a store's activity accounting over `instance`, charging it
+    /// Open a store's accounting over `instance`, charging it
     /// `store_kernel_heap_bytes` of kernel heap until this owner drops.
     pub fn new(instance: RegisteredInstance, store_kernel_heap_bytes: u64) -> Self {
-        let last_nanos = instance.started_at();
         let store_charge = instance.charge_kernel_heap(store_kernel_heap_bytes);
+        let clock = Arc::new(CachePadded::new(StoreClock::new()));
+        instance.entry().stores.lock().live.push(clock.clone());
         Self {
-            instance,
+            turns: StoreTurns { instance, clock },
             _store_charge: store_charge,
-            state: ActivityState::Idle,
-            last_nanos,
         }
     }
 
+    pub fn instance(&self) -> &RegisteredInstance {
+        &self.turns.instance
+    }
+
+    /// The condemnation recorded for this instance, if any.
+    pub fn pending_kill(&self) -> Option<KillReason> {
+        self.turns.instance.pending_kill()
+    }
+
+    /// A handle for the code about to drive this store.
+    pub fn turns(&self) -> StoreTurns {
+        self.turns.clone()
+    }
+}
+
+impl Drop for InstanceActivity {
+    fn drop(&mut self) {
+        let clock = &self.turns.clock;
+        let mut stores = self.turns.instance.entry().stores.lock();
+        let position = stores
+            .live
+            .iter()
+            .position(|live| Arc::ptr_eq(live, clock))
+            .expect("a store's clock is registered on its instance until the store drops");
+        stores.live.swap_remove(position);
+        let word = clock.word.load(Ordering::Acquire);
+        // A turn borrows the store, so none can be open while the store
+        // drops. Kernel-owned invariant.
+        assert!(
+            word & ON_PROCESSOR == 0,
+            "store of instance {} dropped during a processor turn",
+            self.turns.instance.name()
+        );
+        stores.retired_active_nanos = stores.retired_active_nanos.saturating_add(word);
+        stores.retired_last_active_at = stores
+            .retired_last_active_at
+            .max(clock.last_active_at.load(Ordering::Acquire));
+    }
+}
+
+/// What the code driving a store needs to account the processor turns
+/// it gives that store.
+///
+/// A turn is one stretch in which the store holds a processor: one poll
+/// of the future that drives its guest code. It begins when the
+/// executor polls that future, inside which the Wasmtime fiber resumes,
+/// and ends when the poll returns, which is when the fiber has
+/// suspended or finished. A synchronous host call that never suspends
+/// happens inside one turn and costs nothing of its own.
+#[derive(Clone)]
+pub struct StoreTurns {
+    instance: RegisteredInstance,
+    clock: Arc<CachePadded<StoreClock>>,
+}
+
+impl StoreTurns {
     pub fn instance(&self) -> &RegisteredInstance {
         &self.instance
     }
@@ -1009,103 +1079,66 @@ impl InstanceActivity {
         self.instance.pending_kill()
     }
 
-    /// Report the transition a call hook just delivered.
+    /// Put the store on the executing processor as of `now_nanos`.
     ///
-    /// The condemnation check lives here rather than in the caller
-    /// because the two cannot be separated safely: a hook that records
-    /// a transition and then refuses to let the guest continue has told
-    /// the registry about an activation whose closing hook will never
-    /// fire. Ending the activation in the same step is what makes the
-    /// trailing unwind transitions harmless.
-    pub fn record(
-        &mut self,
-        transition: InstanceExecutionTransition,
-        now_nanos: u64,
-    ) -> ActivityStep {
-        self.last_nanos = now_nanos;
-        let change = match transition {
-            InstanceExecutionTransition::Resume => self.enter(now_nanos),
-            InstanceExecutionTransition::Pause => self.leave(now_nanos),
-        };
-        match self.instance.pending_kill() {
-            Some(reason) => {
-                let ending = self.end(now_nanos);
-                ActivityStep {
-                    change: change.then(ending),
-                    killed: Some(reason),
-                }
-            }
-            None => ActivityStep {
-                change,
-                killed: None,
-            },
-        }
-    }
-
-    /// End this store's activation because a trap the guest never
-    /// returns from is being raised. Terminal and idempotent.
-    pub fn end(&mut self, now_nanos: u64) -> ActivityChange {
-        self.last_nanos = now_nanos;
-        let change = match self.state {
-            ActivityState::Running(_) => ActivityChange::Left {
-                instance_elapsed: self.instance.entry().close_activation(now_nanos),
-            },
-            ActivityState::Idle | ActivityState::Ended => ActivityChange::Unchanged,
-        };
-        self.state = ActivityState::Ended;
-        change
-    }
-
-    fn enter(&mut self, now_nanos: u64) -> ActivityChange {
-        match self.state {
-            ActivityState::Idle => {
-                self.instance.entry().open_activation(now_nanos);
-                self.state = ActivityState::Running(NonZeroU32::MIN);
-                ActivityChange::Entered
-            }
-            ActivityState::Running(depth) => {
-                self.state = ActivityState::Running(depth.saturating_add(1));
-                ActivityChange::Unchanged
-            }
-            ActivityState::Ended => ActivityChange::Unchanged,
-        }
-    }
-
-    fn leave(&mut self, now_nanos: u64) -> ActivityChange {
-        match self.state {
-            ActivityState::Running(depth) => match NonZeroU32::new(depth.get() - 1) {
-                Some(remaining) => {
-                    self.state = ActivityState::Running(remaining);
-                    ActivityChange::Unchanged
-                }
-                None => {
-                    self.state = ActivityState::Idle;
-                    ActivityChange::Left {
-                        instance_elapsed: self.instance.entry().close_activation(now_nanos),
-                    }
-                }
-            },
-            // A store whose pauses outnumber its resumes while its
-            // activation is still live is a kernel bookkeeping bug: the
-            // owner that would have opened the activation is this one.
-            // Kernel-owned invariant, so it stays fatal.
-            ActivityState::Idle => panic!(
-                "instance {} paused while already inactive",
-                self.instance.name()
-            ),
-            ActivityState::Ended => ActivityChange::Unchanged,
+    /// Until the turn ends, user memory this processor commits is the
+    /// instance's: see [`ProcessorTurn`].
+    pub fn begin(&self, now_nanos: u64) -> ProcessorTurn<'_> {
+        let word = self.clock.word.load(Ordering::Relaxed);
+        // Turns of one store cannot nest: the driver holds the store by
+        // `&mut` for the length of the poll. A nested begin means a
+        // second driver was wrapped around a call already inside one.
+        assert!(
+            word & ON_PROCESSOR == 0,
+            "store of instance {} began a processor turn inside another",
+            self.instance.name()
+        );
+        // The owner scope is entered before the clock is marked, so a
+        // processor without identity fails before the store is on it.
+        let owner = enter_user_memory_owner(
+            current_processor(),
+            MemoryOwner::new(self.instance.id().raw()),
+        );
+        self.clock.word.store(
+            ON_PROCESSOR | now_nanos.saturating_sub(word),
+            Ordering::Release,
+        );
+        ProcessorTurn {
+            turns: self,
+            resumed_at: now_nanos,
+            _owner: owner,
         }
     }
 }
 
-impl Drop for InstanceActivity {
-    fn drop(&mut self) {
-        // A store dropped mid-guest — a cancelled task, a future
-        // dropped while its fiber is suspended — never reports the
-        // pause wasmtime would have. Close the activation at the last
-        // timestamp this owner saw, so the instance does not read as
-        // permanently on a processor.
-        let _ = self.end(self.last_nanos);
+/// One open turn of a store on the executing processor.
+///
+/// It names the instance as the owner of the user memory the processor
+/// commits for as long as it is open, and restores whatever owner was
+/// named before when it ends. That covers the guest's synchronous host
+/// calls too: what such a call commits in the user address space is the
+/// guest's, while what it allocates from the kernel heap is attributed
+/// by [`KernelHeapCharge`] ownership and never by this name. A host
+/// call that commits memory for a different instance — a spawn
+/// instantiating its child — names that owner in its own nested turn.
+#[must_use = "a processor turn is ended with the time it ended"]
+pub struct ProcessorTurn<'a> {
+    turns: &'a StoreTurns,
+    resumed_at: u64,
+    _owner: UserMemoryOwnerScope<'static>,
+}
+
+impl ProcessorTurn<'_> {
+    /// Take the store off the processor as of `now_nanos`, answering
+    /// how long this turn held it.
+    pub fn end(self, now_nanos: u64) -> u64 {
+        let clock = &self.turns.clock;
+        let base = clock.word.load(Ordering::Relaxed) & !ON_PROCESSOR;
+        clock.last_active_at.store(now_nanos, Ordering::Release);
+        clock
+            .word
+            .store(now_nanos.saturating_sub(base), Ordering::Release);
+        now_nanos.saturating_sub(self.resumed_at)
     }
 }
 
@@ -1129,65 +1162,13 @@ impl InstanceEntry {
             .load(Ordering::Acquire)
             .saturating_add(mapping_bytes)
     }
-
-    fn total_active_nanos(&self, now_nanos: u64) -> u64 {
-        let total = self.active_nanos.load(Ordering::Acquire);
-        if self.active_depth.load(Ordering::Acquire) == 0 {
-            return total;
-        }
-
-        let resumed_at = self.last_resume_at.load(Ordering::Acquire);
-        if resumed_at == INACTIVE_RESUME_AT {
-            return total;
-        }
-
-        total.saturating_add(now_nanos.saturating_sub(resumed_at))
-    }
-
-    /// Open one activation on this instance. Called only by the
-    /// [`InstanceActivity`] that opened it, which is the single owner
-    /// of the pairing behind this count.
-    fn open_activation(&self, now_nanos: u64) {
-        if self.active_depth.fetch_add(1, Ordering::AcqRel) == 0 {
-            self.last_resume_at.store(now_nanos, Ordering::Release);
-        }
-    }
-
-    /// Close one activation, returning how long the instance held a
-    /// processor when this was the last one.
-    fn close_activation(&self, now_nanos: u64) -> Option<u64> {
-        let previous_depth = self.active_depth.fetch_sub(1, Ordering::AcqRel);
-        // Every close is made by the owner that made the matching open,
-        // so a count that has already reached zero here is the
-        // registry's own bookkeeping going wrong, not a user-load
-        // condition. Kernel-owned invariant: panic.
-        assert!(
-            previous_depth != 0,
-            "instance {} closed an activation it never opened",
-            self.name
-        );
-
-        if previous_depth == 1 {
-            let resumed_at = self
-                .last_resume_at
-                .swap(INACTIVE_RESUME_AT, Ordering::AcqRel);
-            assert!(
-                resumed_at != INACTIVE_RESUME_AT,
-                "instance {} lost its resume timestamp",
-                self.name
-            );
-            let elapsed = now_nanos.saturating_sub(resumed_at);
-            self.active_nanos.fetch_add(elapsed, Ordering::AcqRel);
-            self.last_active_at.store(now_nanos, Ordering::Release);
-            return Some(elapsed);
-        }
-        None
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{InstanceActivity, InstanceExecutionTransition, InstanceRegistry};
+    use alloc::vec;
+
+    use super::{InstanceActivity, InstanceRegistry};
 
     #[test]
     fn assigns_stable_ids() {
@@ -1210,14 +1191,61 @@ mod tests {
         assert_eq!(first[0].cpu_busy, 0);
         assert_eq!(first[0].memory_bytes, 4096);
 
-        let mut activity = InstanceActivity::new(instance.clone(), 0);
-        activity.record(InstanceExecutionTransition::Resume, 220);
+        let activity = InstanceActivity::new(instance.clone(), 0);
+        let turns = activity.turns();
+        let turn = turns.begin(220);
         let second = registry.snapshot(260);
         assert_eq!(second[0].cpu_busy, 666);
 
-        activity.record(InstanceExecutionTransition::Pause, 280);
+        assert_eq!(turn.end(280), 60);
         let third = registry.snapshot(320);
         assert_eq!(third[0].cpu_busy, 333);
+    }
+
+    /// Guest threads each drive their own store. Their turns overlap,
+    /// and the instance's time is the sum of the processors it held.
+    #[test]
+    fn processor_time_sums_the_turns_of_every_store() {
+        let registry = InstanceRegistry::new();
+        let instance = registry.register("threads", 0);
+        let main = InstanceActivity::new(instance.clone(), 0);
+        let thread = InstanceActivity::new(instance.clone(), 0);
+        let (main_turns, thread_turns) = (main.turns(), thread.turns());
+
+        let main_turn = main_turns.begin(100);
+        let thread_turn = thread_turns.begin(150);
+        assert_eq!(registry.active_totals(200)[0].active_nanos, 150);
+        assert!(registry.idle_instances(200, 0).is_empty());
+        assert_eq!(thread_turn.end(200), 50);
+        assert_eq!(main_turn.end(300), 200);
+        assert_eq!(registry.active_totals(1_000)[0].active_nanos, 250);
+        assert_eq!(registry.idle_instances(1_000, 700), vec![instance.id()]);
+        assert!(registry.idle_instances(1_000, 701).is_empty());
+
+        // A dropped store's time stays on the instance.
+        drop(thread_turns);
+        drop(thread);
+        assert_eq!(registry.active_totals(1_000)[0].active_nanos, 250);
+        let turn = main_turns.begin(2_000);
+        assert_eq!(registry.active_totals(2_010)[0].active_nanos, 260);
+        assert_eq!(turn.end(2_010), 10);
+        drop(main_turns);
+        drop(main);
+        assert_eq!(registry.active_totals(5_000)[0].active_nanos, 260);
+        assert_eq!(registry.idle_instances(5_000, 2_990), vec![instance.id()]);
+    }
+
+    #[test]
+    #[should_panic(expected = "began a processor turn inside another")]
+    fn a_store_cannot_begin_a_turn_inside_another() {
+        let registry = InstanceRegistry::new();
+        let instance = registry.register("nested", 0);
+        let activity = InstanceActivity::new(instance, 0);
+        let turns = activity.turns();
+        // The store would refuse to drop mid-turn while this unwinds.
+        core::mem::forget(activity);
+        let _outer = turns.begin(1);
+        let _inner = turns.begin(2);
     }
 
     #[test]

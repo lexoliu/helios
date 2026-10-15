@@ -157,7 +157,11 @@ where
     {
         return u32::from(p1::errno::IO as u16);
     }
-    let instance = match linker.instantiate_async(&mut store, &compiled.module).await {
+    let turns = store.data().guest_turns();
+    let instance = match turns
+        .drive(linker.instantiate_async(&mut store, &compiled.module))
+        .await
+    {
         Ok(instance) => instance,
         Err(error) => {
             tracing::error!(tid, "wasix thread instantiate failed: {error:#}");
@@ -177,7 +181,10 @@ where
     };
     let args_i32 = i32::from_ne_bytes(args.to_ne_bytes());
     let result = loop {
-        let result = start.call_async(&mut store, (tid_i32, args_i32)).await;
+        let turns = store.data().guest_turns();
+        let result = turns
+            .drive(start.call_async(&mut store, (tid_i32, args_i32)))
+            .await;
         match handle_wasix_asyncify_completion(&mut store, &instance).await {
             Ok(true) => continue,
             Ok(false) => break result,
@@ -189,7 +196,7 @@ where
     };
     match result {
         Ok(()) => store.data_mut().take_requested_exit().unwrap_or(0),
-        Err(error) => match store.data_mut().take_requested_exit() {
+        Err(error) => match store.data_mut().take_exit_status(&error) {
             Some(code) => code,
             None => {
                 tracing::error!(tid, "wasix thread failed: {error:#}");
