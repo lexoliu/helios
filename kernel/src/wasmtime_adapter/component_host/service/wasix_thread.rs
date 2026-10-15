@@ -78,6 +78,7 @@ where
     let timer = caller.data().timer();
     let spawner = caller.data().spawner.clone();
     let runtime_state = caller.data().runtime_state.clone();
+    let interrupts = caller.data().interrupts.clone();
     let instance = caller.data().instance().clone();
     let parent_instance_id = caller.data().parent_instance_id;
     let arguments = caller.data().arguments.clone();
@@ -97,6 +98,7 @@ where
         timer,
         spawner.clone(),
         runtime_state,
+        interrupts,
         instance,
         parent_instance_id,
         arguments,
@@ -146,7 +148,7 @@ where
     HostFs: crate::HostFileSystem,
 {
     let mut store = wasmtime::Store::new(&engine, store_data);
-    configure_preview1_program_store(&mut store);
+    let interrupts = configure_preview1_program_store(&mut store);
 
     let mut linker = CoreLinker::new(&engine);
     if add_preview1_program_imports(&mut linker).is_err() {
@@ -158,8 +160,8 @@ where
         return u32::from(p1::errno::IO as u16);
     }
     let turns = store.data().guest_turns();
-    let instance = match turns
-        .drive(linker.instantiate_async(&mut store, &compiled.module))
+    let instance = match interrupts
+        .drive(turns.drive(linker.instantiate_async(&mut store, &compiled.module)))
         .await
     {
         Ok(instance) => instance,
@@ -182,10 +184,10 @@ where
     let args_i32 = i32::from_ne_bytes(args.to_ne_bytes());
     let result = loop {
         let turns = store.data().guest_turns();
-        let result = turns
-            .drive(start.call_async(&mut store, (tid_i32, args_i32)))
+        let result = interrupts
+            .drive(turns.drive(start.call_async(&mut store, (tid_i32, args_i32))))
             .await;
-        match handle_wasix_asyncify_completion(&mut store, &instance).await {
+        match handle_wasix_asyncify_completion(&mut store, &interrupts, &instance).await {
             Ok(true) => continue,
             Ok(false) => break result,
             Err(error) => {

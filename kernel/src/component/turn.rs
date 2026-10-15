@@ -48,7 +48,7 @@ impl<RuntimeStateImpl, Error> TurnEpilogue<RuntimeStateImpl, Error> for () {
 /// A component store closes the sockets its guest let go of during the
 /// turn. Draining when the store gives up the processor bounds the
 /// delay between a socket's death and its close by one turn: the next
-/// time the guest blocks, yields at an epoch tick, or finishes.
+/// time the guest blocks, yields at a scheduler tick, or finishes.
 impl<RuntimeStateImpl, Error> TurnEpilogue<RuntimeStateImpl, Error> for SocketRetirementQueue
 where
     RuntimeStateImpl: ComponentRuntimeState,
@@ -111,7 +111,7 @@ pin_project! {
     /// ([`TurnEpilogue::end_call`], a pending signal, for one),
     /// then its instance's condemnation, and only then reports its
     /// result. A guest that is still running meets both at its next
-    /// epoch check, which raising either makes immediate; a call that
+    /// interrupt check, which raising either makes immediate; a call that
     /// returns to the host before it reaches one, its last host call
     /// having been where the signal or the kill arrived, would
     /// otherwise end as if nothing had happened.
@@ -292,7 +292,7 @@ mod tests {
 
     /// A kill that lands while the guest is suspended in a host call is
     /// reported when that call completes, even if the guest returns to
-    /// the host without reaching another epoch check.
+    /// the host without reaching another interrupt check.
     #[test]
     fn a_kill_during_a_suspended_host_call_ends_the_call_killed() {
         let registry = InstanceRegistry::new();
@@ -335,7 +335,7 @@ mod tests {
     }
 
     /// A kill that lands while the guest is in a synchronous host call,
-    /// after which the export returns without another epoch check, ends
+    /// after which the export returns without another interrupt check, ends
     /// the call killed: the turn meets the condemnation where the call
     /// completes, where the call hook used to meet it on the way back
     /// from the host call.

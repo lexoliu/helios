@@ -139,8 +139,8 @@ pub fn store_kernel_heap_bytes(store_bytes: usize) -> u64 {
 
 /// Error a guest call ends with when a kill was requested for its
 /// instance — by the OOM killer, a kernel-plugin supervisor or an
-/// operator. The runtime adapter raises it as a trap from the epoch
-/// callback, [`super::OnProcessor`] reports it for a call that completes
+/// operator. The runtime adapter raises it as a trap from the store's
+/// interrupt callback, [`super::OnProcessor`] reports it for a call that completes
 /// while condemned, and the component executor surfaces it as a typed
 /// `ProgramExecError`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
@@ -797,9 +797,10 @@ where
         bytes
     }
 
-    /// The condemnation recorded for this instance, if any. The epoch
-    /// callback reads it: a guest that is running traps with it at its
-    /// next epoch check, which the kill's epoch bump makes immediate.
+    /// The condemnation recorded for this instance, if any. The
+    /// interrupt callback reads it: a guest that is running traps with it
+    /// at its next interrupt check, which the kill's interruption of the
+    /// instance's stores makes immediate.
     pub fn pending_kill(&self) -> Option<KillReason> {
         self.execution_context.activity.pending_kill()
     }

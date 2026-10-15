@@ -10,6 +10,9 @@ where
     pub(super) timer: crate::Timer<CpuImpl>,
     pub(super) spawner: crate::InstanceSpawner<CpuImpl>,
     pub(super) runtime_state: HostRuntimeState<CpuImpl, Net, HostFs>,
+    /// The interrupt routes of the engine this store runs on, which its
+    /// threads' stores register with too.
+    pub(super) interrupts: Arc<GuestInterrupts>,
     activity: crate::InstanceActivity,
     pub(super) parent_instance_id: Option<crate::InstanceId>,
     pub(super) filesystem: DebugFileSystem<HostRuntimeState<CpuImpl, Net, HostFs>, HostFs>,
@@ -61,6 +64,7 @@ where
         timer: crate::Timer<CpuImpl>,
         spawner: crate::InstanceSpawner<CpuImpl>,
         runtime_state: HostRuntimeState<CpuImpl, Net, HostFs>,
+        interrupts: Arc<GuestInterrupts>,
         instance: crate::RegisteredInstance,
         parent_instance_id: Option<crate::InstanceId>,
         arguments: Vec<String>,
@@ -93,6 +97,7 @@ where
             timer,
             spawner,
             runtime_state,
+            interrupts,
             activity: crate::InstanceActivity::new(
                 instance,
                 crate::store_kernel_heap_bytes(size_of::<Self>()),
@@ -334,24 +339,25 @@ where
         )
     }
 
-    /// The epoch callback for this store: where a pending WASIX signal
-    /// and a condemnation reach a running guest.
+    /// The interrupt callback for this store: where a pending WASIX
+    /// signal and a condemnation reach a running guest, and where the
+    /// scheduler tick makes it yield.
     ///
-    /// Raising a signal and condemning an instance both bump the epoch,
-    /// so a guest that is running meets this at its next function entry
-    /// or loop back-edge, and one suspended in a host call meets it at
-    /// the first of those after the call returns; a call that returns
-    /// to the host first meets both where it completes (see
-    /// [`crate::component::TurnEpilogue::end_call`]). A signal is
-    /// delivered ahead of a kill.
-    fn on_epoch_deadline(&mut self) -> wasmtime::Result<wasmtime::UpdateDeadline> {
+    /// Raising a signal and condemning an instance both interrupt every
+    /// store of the instance, so a guest that is running meets this at
+    /// its next function entry or loop header, and one suspended in a
+    /// host call meets it at the first of those after the call returns;
+    /// a call that returns to the host first meets both where it
+    /// completes (see [`crate::component::TurnEpilogue::end_call`]). A
+    /// signal is delivered ahead of a kill.
+    fn on_interrupt(&mut self) -> wasmtime::Result<wasmtime::InterruptAction> {
         if let Some(signal) = self.signal_state.take_pending() {
             return Err(wasmtime::Error::new(Preview1SignalExit { signal }));
         }
         if let Some(reason) = self.activity.pending_kill() {
             return Err(wasmtime::Error::from(crate::InstanceKilled { reason }));
         }
-        Ok(wasmtime::UpdateDeadline::Yield(1))
+        Ok(wasmtime::InterruptAction::Yield)
     }
 
     /// Deliver stdout/stderr bytes to a kernel-served sink, or hand
@@ -1012,7 +1018,7 @@ where
                     let processor = helios_hal::cpu::current_processor().id();
                     let mut store =
                         wasmtime::Store::new(instance_pre.module().engine(), store_data);
-                    configure_compiler_core_store(&mut store);
+                    let _interrupts = configure_compiler_core_store(&mut store);
                     let thread_started_ticks = store.data().cpu.now().ticks();
                     let (result, instantiated_ns) = match instance_pre
                         .instantiate_async(&mut store)
@@ -1063,18 +1069,26 @@ where
     Ok(())
 }
 
+/// Installs the store's interrupt callback, registers the store for
+/// kills and makes it the target of its process's signals, for as long as
+/// the returned registration lives.
 pub(super) fn configure_preview1_program_store<CpuImpl, Net, HostFs>(
     store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, HostFs>>,
-) where
+) -> StoreInterrupts
+where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
     // No call hook: see `store_with_state`. Turns are accounted where
     // the call that drives this store is polled, and signals and kills
-    // reach the guest at its epoch checks.
-    store.set_epoch_deadline(1);
-    store.epoch_deadline_callback(|mut caller| caller.data_mut().on_epoch_deadline());
+    // reach the guest at its interrupt checks.
+    store.interrupt_callback(|mut caller| caller.data_mut().on_interrupt());
+    let interrupts = store.data().interrupts.clone();
+    let instance = store.data().instance().id();
+    let registration = interrupts.register(instance, store);
+    store.data().signal_state.attach(interrupts, instance);
+    registration
 }
 
 pub(super) fn preview1_program_linker<CpuImpl, Net, HostFs>(
@@ -5673,7 +5687,7 @@ mod tests {
 
     /// A signal raised while the guest is in its last host call ends the
     /// program with `128 + signal`, although the guest then returns from
-    /// its export without meeting another epoch check. The call meets
+    /// its export without meeting another interrupt check. The call meets
     /// the signal where it completes, and the signal takes precedence
     /// over the status the guest asked for, as it did when a call hook
     /// delivered it on the way back from that host call.
@@ -5719,8 +5733,8 @@ mod tests {
     }
 
     /// A signal and a condemnation that both reach the guest in its last
-    /// host call end the call with the signal, the precedence the epoch
-    /// callback gives them.
+    /// host call end the call with the signal, the precedence the
+    /// interrupt callback gives them.
     #[test]
     fn a_signal_met_at_completion_is_delivered_ahead_of_a_kill() {
         let registry = crate::InstanceRegistry::new();

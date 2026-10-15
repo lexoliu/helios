@@ -186,8 +186,13 @@ maintainer's decision and the fork's revision moves once, per §1.
 - Typed function references, SIMD, relaxed SIMD and target ISA feature
   probing stay correctly enabled wherever the real target supports them.
 - Every Wasmtime performance opt-in the kernel can support stays enabled:
-  pooling instance allocation, signals-based traps, epoch interruption,
-  SIMD, threads, the component model, `async_stack_zeroing(false)`. With a
+  pooling instance allocation, signals-based traps, stack-limit
+  interruption (`Config::stack_limit_interruption`: a processor's timer
+  tick, a kill and a signal lower the running store's stack limit, and the
+  resumable check at every function entry and loop header takes them;
+  never epoch interruption, whose per-entry and per-loop checks cost
+  10–29% on compute), SIMD, threads, the component model,
+  `async_stack_zeroing(false)`. With a
   real user VM, `memory_reservation` and `memory_guard_size` eliminate wasm32
   bounds checks, with `memory_init_cow(true)` and `memory_may_move(false)`.
   Disabling any of them needs a same-PR justification of the alternative

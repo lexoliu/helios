@@ -5,13 +5,43 @@ at `../wasmtime/crates/wasmtime`.
 
 ## Required revision
 
-The local checkout must be at (branch `helios/parallel-compile-steal`):
+The local checkout must be at (branch `helios/stack-limit-interrupt`):
 
 ```text
-f5a2d7baf50962ae777c29ecc792f0eed501c75d
+913a5426e627b32c7c096d2dcd7f167fe943c6be
 ```
 
-That revision is `helios/pooling-host-stack` at
+That revision is `helios/parallel-compile-steal` at
+`f5a2d7baf50962ae777c29ecc792f0eed501c75d` plus one additive commit, which
+adds resumable stack-limit interruption (#456):
+
+- `Config::stack_limit_interruption(bool)` (a `Tunables` flag that takes part
+  in the cwasm compatibility check) makes Cranelift compare the stack pointer
+  against `VMStoreContext::stack_limit` at every function entry, loop header
+  and bulk-memory chunk, and call the `stack_limit_interrupt` builtin when the
+  compare fails instead of trapping. `Engine::new` refuses it together with
+  epoch interruption, with stack switching and on Pulley.
+- `Store::interrupt_handle()` returns a `Send + Sync` `StoreInterruptHandle`
+  whose `interrupt()` sets a pending flag and raises the limit to a sentinel,
+  with no lock and no allocation, so an interrupt handler may call it. The
+  `VMStoreContext` lives in an `Arc` the handle keeps alive.
+- Every writer of the limit (entering and leaving wasm, fiber switches)
+  re-raises the sentinel while an interrupt is pending, so an interrupt
+  requested in host code or on a suspended fiber is delivered at the next
+  check in wasm.
+- The builtin clears the flag, restores the real limit, runs the store's
+  `Store::interrupt_callback` (`InterruptAction::Continue`, `Yield`, or an
+  error), and then traps with a stack overflow if the stack pointer is
+  really below the limit.
+
+Helios needs it because the epoch checks it replaces cost 10–29% on every
+compute workload (paired run 38745522065): a full check on every function
+entry, a cached check at every loop header, and two variables live across
+every body.
+
+The revision it replaces is `helios/parallel-compile-steal` at
+`f5a2d7baf50962ae777c29ecc792f0eed501c75d`, which is
+`helios/pooling-host-stack` at
 `7a17b5375af44664392d2a550e9724be0f1946c4` plus one additive commit, which
 makes every parallel compile input its own stealable job:
 

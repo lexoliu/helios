@@ -27,10 +27,23 @@ pub(super) enum WasixSignalDispositionAction {
     Ignore,
 }
 
+/// The signals pending for one process, shared by its stores (its
+/// threads' included) and by whoever raises them.
 #[derive(Clone)]
 pub(super) struct WasixSignalState {
     pub(super) pending: Arc<AtomicU32>,
     pub(super) interval_generation: Arc<AtomicU64>,
+    /// The process a raise interrupts, once a store of it exists.
+    ///
+    /// Raises come from host calls and timer tasks, never from an
+    /// interrupt handler, so a spin lock is enough; it is also what orders
+    /// a raise against [`Self::attach`], which see the comment there.
+    target: Arc<Mutex<Option<SignalTarget>>>,
+}
+
+struct SignalTarget {
+    interrupts: Arc<GuestInterrupts>,
+    instance: crate::InstanceId,
 }
 
 impl WasixSignalState {
@@ -38,12 +51,36 @@ impl WasixSignalState {
         Self {
             pending: Arc::new(AtomicU32::new(WASIX_NO_PENDING_SIGNAL)),
             interval_generation: Arc::new(AtomicU64::new(0)),
+            target: Arc::new(Mutex::new(None)),
         }
     }
 
+    /// Marks `signal` pending and interrupts every store of the process,
+    /// so a running guest takes it at its next interrupt check.
     pub(super) fn raise(&self, signal: u32) {
         self.pending.store(signal, AtomicOrdering::Release);
-        crate::wasmtime_adapter::bump_user_engine_epoch();
+        if let Some(target) = &*self.target.lock() {
+            target.interrupts.interrupt_instance(target.instance);
+        }
+    }
+
+    /// Names `instance`, whose stores `interrupts` reaches, as the process
+    /// a raise interrupts. Every store of the process attaches when it is
+    /// created; a replacement image attaches its own instance.
+    ///
+    /// A raise that came before the target was named left its signal
+    /// pending and interrupted nothing, so this interrupts on its behalf.
+    /// The lock orders the two: a raise that takes it after this released
+    /// it finds the target, and one that took it before had already
+    /// stored its signal, which the load below then sees.
+    pub(super) fn attach(&self, interrupts: Arc<GuestInterrupts>, instance: crate::InstanceId) {
+        *self.target.lock() = Some(SignalTarget {
+            interrupts: interrupts.clone(),
+            instance,
+        });
+        if self.pending.load(AtomicOrdering::Acquire) != WASIX_NO_PENDING_SIGNAL {
+            interrupts.interrupt_instance(instance);
+        }
     }
 
     pub(super) fn take_pending(&self) -> Option<u32> {
@@ -879,7 +916,7 @@ pub(super) fn preview1_exit_status(error: &wasmtime::Error, requested: Option<u3
 
 /// A WASIX store delivers a signal raised while its guest was in its
 /// last host call when the call into the store completes: the guest
-/// went back to the host without meeting the epoch check that would
+/// went back to the host without meeting the interrupt check that would
 /// otherwise have delivered it.
 impl<RuntimeStateImpl> crate::component::TurnEpilogue<RuntimeStateImpl, wasmtime::Error>
     for WasixSignalState
