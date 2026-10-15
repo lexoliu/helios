@@ -46,6 +46,7 @@ use wasix_epoll::*;
 use super::*;
 use crate::process::FreeDescriptorSlots;
 use crate::wasmtime_adapter::artifact_profile::{self, ArtifactProfileError};
+use crate::wasmtime_adapter::code_map::{CodeMap, CodeRegistration};
 use crate::wasmtime_adapter::config::AotCompileHint;
 use crate::wasmtime_adapter::cwasm::{self, ArtifactTrustError, UntrustedCwasm};
 use crate::wasmtime_adapter::{WasmtimeCompiledComponent, WasmtimeCompiledCoreModule};
@@ -286,7 +287,7 @@ where
     engine: crate::wasmtime_adapter::WasmtimeEngine,
     preview1_core_linker: CoreLinker<Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     shared_memory_pool: Arc<Mutex<SharedMemoryPool>>,
-    component_cache: Mutex<ComponentCache<WasmtimeCompiledComponent>>,
+    component_cache: Mutex<ComponentCache<ProgramComponent>>,
     component_instance_pre_cache:
         Mutex<ComponentCache<ComponentInstancePre<StoreData<CpuImpl, Net, HostFs>>>>,
     core_module_cache: Mutex<ComponentCache<WasmtimeCompiledCoreModule>>,
@@ -308,8 +309,18 @@ where
     /// worker pool inside the plugin still parallelises a single
     /// compile across all cores.
     compile_in_progress: AtomicBool,
+    /// Every wasm image this service loaded, by address, for the
+    /// instruction sampler to name.
+    code_map: CodeMap,
     clock_cpu: CpuImpl,
     _marker: core::marker::PhantomData<fn() -> HostFs>,
+}
+
+/// A program component as the cache holds it: the compiled artifact and
+/// the entry that names its code to the instruction sampler while it lives.
+struct ProgramComponent {
+    compiled: WasmtimeCompiledComponent,
+    _code: CodeRegistration,
 }
 
 struct ProgramSpawnRequest<Net: ComponentHostNetwork> {
@@ -494,11 +505,13 @@ where
             compiler_artifact,
             compiler_plugin: Mutex::new(None),
             compile_in_progress: AtomicBool::new(false),
+            code_map: CodeMap::new(),
             clock_cpu: cpu.clone(),
             _marker: core::marker::PhantomData,
         }),
     };
     debug_state.install_program_service(service.clone());
+    spawn_instruction_sample_drain(kernel, &service, debug_state);
     let plugin_context = ProgramExecContext {
         cpu: cpu.clone(),
         timer: kernel.timer(),
@@ -512,6 +525,37 @@ where
     install_http_client_plugin(&service, plugin_context.clone());
     install_compositor_plugin(&service, plugin_context);
     service
+}
+
+/// Attributes the instruction sampler's addresses while sampling runs.
+///
+/// A sample can only be named while the code it landed in is loaded, so
+/// the rings are drained every [`crate::SAMPLE_DRAIN_INTERVAL_MILLIS`]
+/// rather than once when the profile is read. Between profiles the task
+/// parks on the sampler's start signal and costs nothing.
+fn spawn_instruction_sample_drain<CpuImpl, Net, HostFs, WatchdogImpl>(
+    kernel: &crate::Kernel<CpuImpl, WatchdogImpl>,
+    service: &UserProgramService<CpuImpl, Net, HostFs>,
+    debug_state: &HostRuntimeState<CpuImpl, Net, HostFs>,
+) where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    HostFs: crate::HostFileSystem,
+    WatchdogImpl: Watchdog + Clone,
+{
+    let sampler = debug_state.instruction_sampler();
+    let code_map = service.code_map().clone();
+    let timer = kernel.timer();
+    let interval = Duration::from_millis(crate::SAMPLE_DRAIN_INTERVAL_MILLIS);
+    kernel.spawn_detached(async move {
+        loop {
+            sampler.sampling_started().await;
+            while sampler.sampling() {
+                timer.sleep_for(interval).await;
+                sampler.drain(&code_map);
+            }
+        }
+    });
 }
 
 pub fn run_embedded_component_forever<CpuImpl, Net, HostFs, WatchdogImpl>(
@@ -1113,6 +1157,12 @@ where
         self.inner.engine.increment_epoch();
     }
 
+    /// The wasm images this service has loaded, which name the
+    /// instruction sampler's addresses.
+    pub(crate) fn code_map(&self) -> &CodeMap {
+        &self.inner.code_map
+    }
+
     /// Spawn a new child program. The returned handle gives the caller
     /// direct access to the child's stdin/stdout/stderr channels and a
     /// future resolving with its exit status.
@@ -1127,6 +1177,7 @@ where
         let executable = self
             .load_executable(
                 &exec_context,
+                launch.argv.program_name(),
                 &source,
                 hint,
                 exec_context.write_serial,
@@ -1154,6 +1205,7 @@ where
         let executable = self
             .load_executable(
                 &exec_context,
+                launch.argv.program_name(),
                 &source,
                 hint,
                 exec_context.write_serial,
@@ -1331,6 +1383,7 @@ where
         let executable = self
             .load_executable(
                 &exec_context,
+                launch.argv.program_name(),
                 &source,
                 hint,
                 exec_context.write_serial,
@@ -1409,6 +1462,7 @@ where
     async fn load_executable(
         &self,
         exec_context: &ProgramExecContext<CpuImpl, Net, HostFs>,
+        program: &str,
         source: &ProgramSource,
         hint: Option<AotCompileHint>,
         write_serial: crate::DebugSerialWriter,
@@ -1447,13 +1501,15 @@ where
             }
         };
         timeline.record(&self.inner.clock_cpu, LaunchPhase::ArtifactTrust);
-        let loaded = self.load_precompiled_executable(payload, write_serial, started_at, timeline);
+        let loaded =
+            self.load_precompiled_executable(program, payload, write_serial, started_at, timeline);
         timeline.record(&self.inner.clock_cpu, LaunchPhase::LoadComplete);
         loaded
     }
 
     fn load_precompiled_executable(
         &self,
+        program: &str,
         payload: Bytes,
         write_serial: crate::DebugSerialWriter,
         started_at: u64,
@@ -1461,10 +1517,10 @@ where
     ) -> Result<ProgramExecutable<CpuImpl, Net, HostFs>, ProgramExecError> {
         match WasmtimePrecompiledKind::detect(&payload) {
             Some(WasmtimePrecompiledKind::Component) => self
-                .load_precompiled_component(payload, write_serial, started_at, timeline)
+                .load_precompiled_component(program, payload, write_serial, started_at, timeline)
                 .map(ProgramExecutable::Component),
             Some(WasmtimePrecompiledKind::CoreModule) => self
-                .load_precompiled_core_module(payload, write_serial, started_at, timeline)
+                .load_precompiled_core_module(program, payload, write_serial, started_at, timeline)
                 .map(ProgramExecutable::CoreModule),
             None => Err(ProgramExecError {
                 kind: ProgramExecErrorKind::InvalidBinary,
@@ -1475,6 +1531,7 @@ where
 
     fn load_precompiled_component(
         &self,
+        program: &str,
         payload: Bytes,
         write_serial: crate::DebugSerialWriter,
         started_at: u64,
@@ -1525,7 +1582,14 @@ where
             let compiled = self.deserialize_component(&payload)?;
             timeline.record(&self.inner.clock_cpu, LaunchPhase::Deserialize);
             super::emit_program_stage_marker(write_serial, "program:deserialize-end");
-            let component = Arc::new(compiled);
+            let code = self
+                .inner
+                .code_map
+                .register_component(program, &compiled.component);
+            let component = Arc::new(ProgramComponent {
+                compiled,
+                _code: code,
+            });
             let now = monotonic_nanos(&self.inner.clock_cpu);
             tracing::debug!(
                 target: "helios_component_host::program_host",
@@ -1551,12 +1615,12 @@ where
             let linker = super::component_linker(
                 self.inner.engine.raw(),
                 ComponentBindingSet::Program,
-                &component.component,
+                &component.compiled.component,
             )
             .map_err(map_program_runtime_error)?;
             let instance_pre = Arc::new(
                 linker
-                    .instantiate_pre(&component.component)
+                    .instantiate_pre(&component.compiled.component)
                     .map_err(map_program_runtime_error)?,
             );
             super::emit_program_stage_marker(write_serial, "program:instantiate-pre-end");
@@ -1571,6 +1635,7 @@ where
 
     fn load_precompiled_core_module(
         &self,
+        program: &str,
         payload: Bytes,
         write_serial: crate::DebugSerialWriter,
         started_at: u64,
@@ -1602,9 +1667,11 @@ where
         validate_preview1_program_module_imports(&module)?;
         super::emit_program_stage_marker(write_serial, "program:deserialize-core-end");
         timeline.record(&self.inner.clock_cpu, LaunchPhase::Deserialize);
+        let code = self.inner.code_map.register_module(program, &module);
         let compiled = Arc::new(WasmtimeCompiledCoreModule {
             cache_key: payload.clone(),
             module,
+            _code: code,
         });
         let now = monotonic_nanos(&self.inner.clock_cpu);
         tracing::debug!(
@@ -2026,6 +2093,10 @@ where
         let engine = self.inner.engine.raw();
         let module = unsafe { Module::deserialize(engine, compiler_payload.as_ref()) }
             .map_err(map_program_runtime_error)?;
+        let code = self
+            .inner
+            .code_map
+            .register_module(COMPILER_PLUGIN_PATH, &module);
         let shared_memory = compiler_shared_memory(engine, &module)?;
         let shared = Arc::new(CompilerCoreShared {
             memory: shared_memory.clone(),
@@ -2092,6 +2163,7 @@ where
             instance_pre,
             shared,
             main_thread_tls_base,
+            _code: code,
         });
         *slot = Some(plugin.clone());
         Ok((plugin, false))

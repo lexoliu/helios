@@ -208,6 +208,12 @@ fn x86_kernel_main() -> ! {
     let tsc_base = read_tsc();
     let payload = helios_kernel::BootPayload::from_boot_modules(&handoff.modules);
     let debug_state = debug_state::RuntimeState::new(tsc_hz, processor_count, 0, payload);
+    // Every processor's periodic timer samples the instruction it
+    // interrupted while instruction sampling runs
+    // (`smp::handle_local_timer_interrupt`).
+    debug_state
+        .instruction_sampler()
+        .install_capture(smp::instruction_sample_capture(handoff.kernel.virtual_base));
     let boot = smp::build_boot_context(
         rsdp_address,
         physical_memory_offset,

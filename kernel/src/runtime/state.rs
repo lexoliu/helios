@@ -9,8 +9,9 @@ use crate::{
     BootPayload, DEFAULT_PERF_METRIC_CAPACITY, DEFAULT_PROFILE_STACK_CAPACITY,
     DEFAULT_TRACE_HISTORY_CAPACITY, EmbeddedBootFs, EmbeddedComponent, FoldedProfileSample,
     FutexKey, FutexTable, FutexWaitRegistration, HEAP_SIZE_CLASS_COUNT, HeapStats,
-    InstanceRegistry, Notify, PerfMetricFilter, PerfMetricHistory, PerfMetricSample, PerfSample,
-    ProfileFilter, ProfileScope, ProfileSink, StatsSample, TraceEvent, TraceFilter, TraceHistory,
+    InstanceRegistry, InstructionSampler, Notify, PerfMetricFilter, PerfMetricHistory,
+    PerfMetricSample, PerfSample, ProfileFilter, ProfileScope, ProfileSink, StatsSample,
+    TraceEvent, TraceFilter, TraceHistory,
 };
 use crate::{RootEntropy, RootEntropyHandle};
 use helios_hal::cpu::HardwarePerfCounterDelta;
@@ -113,6 +114,10 @@ struct RuntimeStateInner<ProgramService, NetworkService, HostFsService> {
     /// fields so a subsystem this state owns can record into them
     /// without naming the state's own type (see [`ProfileSink`]).
     profiles: ProfileSink,
+    /// Instruction-address samples, with their own start and stop. A
+    /// backend whose timer captures them installs its capture here during
+    /// bring-up.
+    instructions: InstructionSampler,
     heap_perf_snapshot: HeapPerfSnapshot,
 }
 
@@ -345,6 +350,7 @@ where
                     DEFAULT_PROFILE_STACK_CAPACITY,
                     DEFAULT_PERF_METRIC_CAPACITY,
                 ),
+                instructions: InstructionSampler::new(processor_count),
                 heap_perf_snapshot: HeapPerfSnapshot::new(),
             }),
         }
@@ -372,6 +378,13 @@ where
             self.inner.heap_perf_snapshot.reset(crate::heap_stats());
         }
         self.inner.profiles.set_enabled(enabled);
+    }
+
+    /// The instruction-address sampler. It has its own start and stop
+    /// (`profiling.set-instruction-sampling`), independent of the scoped
+    /// profiler, because sampling shortens every processor's timer period.
+    pub fn instruction_sampler(&self) -> InstructionSampler {
+        self.inner.instructions.clone()
     }
 
     /// The profile and perf histories this state records into.

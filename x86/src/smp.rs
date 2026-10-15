@@ -10,11 +10,11 @@ use core::num::NonZeroUsize;
 
 use core::ops::Range;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 use helios_hal::cpu::{ProcessorId, ticks_to_nanos};
 use helios_hal::critical_section::ProcessorIdentity;
 use helios_hal::watchdog::Watchdog;
-use helios_kernel::{Timer, WasmtimeTlsSlots};
+use helios_kernel::{InstructionSampler, SampleCapture, Timer, WasmtimeTlsSlots};
 use pci_types::ConfigRegionAccess;
 use spin::Once;
 use x86::apic::x2apic::X2APIC;
@@ -53,7 +53,19 @@ pub(crate) const WAKEUP_PAGE_BYTES: usize = 4096;
 pub(crate) const SIPI_MAX_PHYSICAL_ADDRESS: usize = 0x10_0000;
 const AP_STARTUP_INIT_ASSERT_MICROS: u64 = 10_000;
 const AP_STARTUP_INTER_IPI_MICROS: u64 = 200;
+/// The calibration window, which is also the scheduler tick: the count
+/// the timer runs down in this window is the periodic initial count.
 const APIC_TIMER_CALIBRATION_MICROS: u64 = 10_000;
+/// Timer interrupts per scheduler tick while instruction sampling runs.
+///
+/// The scheduler tick is 10 ms (100 Hz), ten times too coarse to split a
+/// workload's time between functions, and raising it would also raise the
+/// Wasmtime epoch rate and change how often guests yield. Sampling
+/// therefore shortens the period by this factor and runs the scheduler's
+/// work — watchdog, epoch, kernel timer — on every tenth interrupt only,
+/// so a profiled run keeps the scheduling an unprofiled one has and is
+/// sampled at 1 kHz per processor.
+const SAMPLES_PER_SCHEDULER_TICK: u32 = 10;
 const APIC_TIMER_DIVIDE_BY_ONE: u32 = 0b1011;
 const APIC_TIMER_MASKED: u64 = 1 << 16;
 const APIC_TIMER_PERIODIC: u64 = 1 << 17;
@@ -190,6 +202,18 @@ pub(crate) struct ProcessorRuntime {
     program_service: Once<debug_state::ProgramService>,
     device_interrupts: Once<&'static DeviceInterruptRoutes>,
     local_timer_ready: AtomicBool,
+    /// The instruction sampler this processor's timer feeds while
+    /// instruction sampling runs.
+    instruction_sampler: InstructionSampler,
+    /// The periodic count of one scheduler tick, as calibrated when the
+    /// timer was armed. Written by this processor only.
+    scheduler_tick_count: AtomicU32,
+    /// Whether the timer runs at the sampling period. Written by this
+    /// processor only, from its timer interrupt.
+    timer_sampling: AtomicBool,
+    /// Sampling-period interrupts since the last scheduler tick. Written
+    /// by this processor only, from its timer interrupt.
+    samples_since_scheduler_tick: AtomicU32,
     /// Whether this processor has enabled its local APIC — the base
     /// MSR's enable bits and the spurious vector — which happens once,
     /// in [`attach_local_apic`], before the processor sends an IPI or
@@ -343,6 +367,10 @@ pub(crate) fn build_boot_context(
             program_service: Once::new(),
             device_interrupts: Once::new(),
             local_timer_ready: AtomicBool::new(false),
+            instruction_sampler: debug_state.instruction_sampler(),
+            scheduler_tick_count: AtomicU32::new(0),
+            timer_sampling: AtomicBool::new(false),
+            samples_since_scheduler_tick: AtomicU32::new(0),
             local_apic_attached: AtomicBool::new(false),
             started: AtomicBool::new(false),
             wake_pending: AtomicBool::new(false),
@@ -378,6 +406,10 @@ pub(crate) fn build_boot_context(
                 program_service: Once::new(),
                 device_interrupts: Once::new(),
                 local_timer_ready: AtomicBool::new(false),
+                instruction_sampler: debug_state.instruction_sampler(),
+                scheduler_tick_count: AtomicU32::new(0),
+                timer_sampling: AtomicBool::new(false),
+                samples_since_scheduler_tick: AtomicU32::new(0),
                 local_apic_attached: AtomicBool::new(false),
                 started: AtomicBool::new(false),
                 wake_pending: AtomicBool::new(false),
@@ -585,6 +617,59 @@ impl ProcessorRuntime {
             .is_ok()
         {
             enable_local_scheduler_timer(vector);
+        }
+    }
+
+    /// The instruction-sampling half of a timer interrupt. Answers whether
+    /// the interrupt is also a scheduler tick.
+    ///
+    /// Outside sampling every interrupt is a scheduler tick. A scheduler
+    /// tick that finds sampling started shortens the period to
+    /// [`SAMPLES_PER_SCHEDULER_TICK`] interrupts per tick; from then on
+    /// each interrupt records the interrupted address, and every
+    /// [`SAMPLES_PER_SCHEDULER_TICK`]th is the scheduler tick, which
+    /// restores the period once sampling has stopped. The period changes
+    /// only on a scheduler tick, so the scheduler's cadence never shifts.
+    fn sample_timer_tick(&self, interrupted: usize) -> bool {
+        if !self.timer_sampling.load(Ordering::Relaxed) {
+            if self.instruction_sampler.sampling() {
+                self.samples_since_scheduler_tick
+                    .store(0, Ordering::Relaxed);
+                self.timer_sampling.store(true, Ordering::Relaxed);
+                self.set_timer_count(
+                    self.scheduler_tick_count.load(Ordering::Relaxed) / SAMPLES_PER_SCHEDULER_TICK,
+                );
+            }
+            return true;
+        }
+        self.instruction_sampler.record(interrupted);
+        let samples = self.samples_since_scheduler_tick.load(Ordering::Relaxed) + 1;
+        if samples < SAMPLES_PER_SCHEDULER_TICK {
+            self.samples_since_scheduler_tick
+                .store(samples, Ordering::Relaxed);
+            return false;
+        }
+        self.samples_since_scheduler_tick
+            .store(0, Ordering::Relaxed);
+        if !self.instruction_sampler.sampling() {
+            self.timer_sampling.store(false, Ordering::Relaxed);
+            self.set_timer_count(self.scheduler_tick_count.load(Ordering::Relaxed));
+        }
+        true
+    }
+
+    /// Rewrites this processor's periodic initial count, which restarts
+    /// the countdown at `count`.
+    fn set_timer_count(&self, count: u32) {
+        assert!(count != 0, "x86 local APIC timer period would be zero");
+        match self.apic_mode {
+            LocalApicMode::X2Apic => unsafe {
+                wrmsr(IA32_X2APIC_INIT_COUNT, u64::from(count));
+            },
+            LocalApicMode::XApic { physical_base } => {
+                let apic_region = xapic_mmio_region(physical_base, self.physical_memory_offset);
+                write_xapic_register(apic_region, XAPIC_TIMER_INIT_COUNT, count);
+            }
         }
     }
 
@@ -850,8 +935,23 @@ pub(crate) fn ensure_local_scheduler_timer(vector: u8) {
     runtime.ensure_local_timer(vector);
 }
 
-pub(crate) fn handle_local_timer_interrupt() {
+/// What a processor's timer captures, for the kernel's instruction
+/// sampler: one sample per sampling-period interrupt.
+pub(crate) fn instruction_sample_capture(kernel_image_base: u64) -> SampleCapture {
+    SampleCapture {
+        period_nanos: APIC_TIMER_CALIBRATION_MICROS * 1_000 / u64::from(SAMPLES_PER_SCHEDULER_TICK),
+        kernel_image_base,
+    }
+}
+
+/// Handles this processor's timer interrupt, which interrupted the
+/// instruction at `interrupted`.
+pub(crate) fn handle_local_timer_interrupt(interrupted: usize) {
     let runtime = current_runtime();
+    if !runtime.sample_timer_tick(interrupted) {
+        local_apic_eoi();
+        return;
+    }
     runtime.watchdog.pet();
     if let Some(service) = runtime.program_service.get() {
         service.increment_epoch();
@@ -1068,11 +1168,17 @@ fn enable_local_scheduler_timer(vector: u8) {
     match runtime.apic_mode() {
         LocalApicMode::X2Apic => {
             let initial_count = calibrate_x2apic_timer(runtime.platform_tsc_hz());
+            runtime
+                .scheduler_tick_count
+                .store(initial_count, Ordering::Relaxed);
             program_x2apic_periodic_timer(vector, initial_count);
         }
         LocalApicMode::XApic { physical_base } => {
             let apic_region = xapic_mmio_region(physical_base, runtime.physical_memory_offset);
             let initial_count = calibrate_xapic_timer(apic_region, runtime.platform_tsc_hz());
+            runtime
+                .scheduler_tick_count
+                .store(initial_count, Ordering::Relaxed);
             program_xapic_periodic_timer(apic_region, vector, initial_count);
         }
     }

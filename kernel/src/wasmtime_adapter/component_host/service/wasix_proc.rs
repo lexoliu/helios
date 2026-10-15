@@ -1854,6 +1854,7 @@ where
     let executable = service
         .load_executable(
             &exec_context,
+            argv.program_name(),
             &prepared.source,
             None,
             write_serial,

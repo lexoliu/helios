@@ -570,13 +570,18 @@ to dispatch.
 
 ### Sample-based alternative already within reach
 
-rustc also has `-Z profile-sample-use=<file>` (AutoFDO). The kernel already
-has a sampling profiler that exports folded stacks with weights
+rustc also has `-Z profile-sample-use=<file>` (AutoFDO). The kernel has
+two profilers. The scoped one exports folded phase stacks with weights
 (`helios:system/profiling.folded`, `workload-bench --kernel-profile-output`).
-AutoFDO needs a per-source-line sample profile, which the folded output
-does not carry (it is symbol-level), so this path needs either
-instruction-address samples with DWARF line mapping from the kernel's
-profiler or LBR-style data, neither of which the profiler records today.
+The instruction-address sampler records the instruction each processor's
+1 kHz sampling timer interrupted, when a run opts in (`helios:system/profiling.instruction-samples`,
+`--instruction-profile-output`, x86-64 only; see `docs/benchmarks.md`).
+The kernel hands back the raw address of every sample outside wasm code,
+but the inspector folds those addresses to function symbols. AutoFDO needs
+a per-source-line profile, so this path still needs the raw kernel
+addresses mapped through the image's DWARF line table. It also needs
+LBR-style branch data for the edge weights that AutoFDO infers best from.
+Neither exists today.
 
 ## (b) Cranelift-level feedback for the AOT compiler plugin
 

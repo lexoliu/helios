@@ -223,6 +223,7 @@ where
 
     let payload = trusted_bootfs_payload(artifact)?;
     let instance_pre = service.load_precompiled_component(
+        COMPOSITOR_PLUGIN_PATH,
         payload,
         exec_context.write_serial,
         started_at,
