@@ -54,8 +54,16 @@ fn instances_until_refusal(usable_bytes: usize) -> usize {
     let plan = BootMemoryPlan::for_usable_bytes(usable_bytes);
     let pool = UserMemoryPool::empty();
     pool.configure_processors(1);
-    let (start, _end) = leak_machine_memory(usable_bytes);
-    pool.initialize(&[(start + plan.kernel_boot_bytes, start + usable_bytes)]);
+    let (start, end) = leak_machine_memory(usable_bytes);
+    // The same split `prime_bootstrap_allocator` makes: the kernel's
+    // boot share comes off the front and the pool takes the frames the
+    // splitter leaves it, not the bytes after `kernel_boot_bytes`.
+    let user = plan
+        .splitter()
+        .split(start, end)
+        .user
+        .expect("the machine leaves the user pool a share");
+    pool.initialize(&[(user.start, user.end)]);
 
     let mut placed = 0;
     while take(&pool, USER_BYTES_PER_INSTANCE) && take(&pool, KERNEL_BYTES_PER_INSTANCE) {

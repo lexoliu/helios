@@ -17,6 +17,9 @@ where
     /// instance that wins the memory-init flag; every per-compile instance
     /// adopts it because later instances skip that init and see `__tls_base == 0`.
     pub(super) main_thread_tls_base: u32,
+    /// Names the plugin's code to the instruction sampler while the
+    /// plugin is resident.
+    pub(super) _code: crate::wasmtime_adapter::code_map::CodeRegistration,
 }
 
 pub(super) struct CompilerCompileSlot<'a> {

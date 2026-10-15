@@ -60,10 +60,69 @@ interface profiling {
     read-too-large(u32),
   }
 
+  /// A function of a loaded wasm program that a sample landed in.
+  record wasm-function {
+    /// The program the code was loaded for, as it was invoked.
+    module: string,
+    /// The core module of the program's component that defines the
+    /// function; zero for a program that is one core module.
+    static-module: u32,
+    /// The function's index in its core module's function index space.
+    index: u32,
+    /// The function's name from the module's name section, when it has one.
+    name: option<string>,
+  }
+
+  /// What a sampled instruction address was executing.
+  variant sampled-code {
+    /// A function of a loaded wasm program.
+    wasm(wasm-function),
+    /// An address inside the named program's code that belongs to none
+    /// of its functions: the runtime's trampolines.
+    wasm-trampoline(string),
+    /// Any other address, as sampled. The kernel image is the only other
+    /// code that runs; the reader decides whether the address lies in it
+    /// against the image's own symbols, shifted by `kernel-image-base`.
+    native(u64),
+  }
+
+  record instruction-sample {
+    code: sampled-code,
+    count: u64,
+  }
+
+  /// Every instruction address sampled since sampling last started.
+  record instruction-profile {
+    /// Interval between two samples on one processor while sampling ran.
+    period-nanos: mono-nanos,
+    /// Runtime address of the kernel image's lowest loadable segment.
+    kernel-image-base: u64,
+    /// Each distinct location and its sample count, the heaviest first.
+    samples: list<instruction-sample>,
+    /// Samples a processor's full buffer could not hold.
+    dropped: u64,
+  }
+
+  /// Why the kernel could not produce an instruction profile.
+  enum instruction-profile-error {
+    /// The running backend does not sample instruction addresses.
+    not-captured,
+  }
+
   set-enabled: func(enabled: bool);
   clear: func();
   folded: func(filter: filter, limit: u32) -> list<folded-sample>;
   metrics: func(filter: metric-filter, limit: u32) -> list<metric-sample>;
+
+  /// Starts or stops instruction-address sampling, independently of
+  /// `set-enabled`. Sampling shortens every processor's timer period, so
+  /// it perturbs timings and runs only when a reader asked for it.
+  /// Starting discards the samples of any earlier run.
+  set-instruction-sampling: func(enabled: bool) -> result<_, instruction-profile-error>;
+
+  /// The instruction addresses the processors' periodic timer sampled
+  /// since sampling last started, attributed to the code they executed.
+  instruction-samples: func() -> result<instruction-profile, instruction-profile-error>;
 
   /// Length in bytes of the kernel's LLVM raw profile (`.profraw`).
   ///

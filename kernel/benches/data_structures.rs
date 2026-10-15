@@ -57,6 +57,15 @@ fn main() {
     divan::main();
 }
 
+/// The executing processor, which every image supplies (see
+/// `helios_hal::cpu::current_processor`). This bench models a
+/// one-processor machine ([`BenchCpu::processor_count`]) and divan runs
+/// it on one thread, so every code path executes on processor 0.
+#[unsafe(no_mangle)]
+extern "Rust" fn helios_current_processor() -> ProcessorId {
+    ProcessorId::new(0)
+}
+
 #[divan::bench(args = [16usize, 64, 256])]
 fn descriptor_insert_close_reuse(bencher: Bencher, count: usize) {
     descriptor_insert_close_reuse_with_table(bencher, count, DescriptorTable::new);

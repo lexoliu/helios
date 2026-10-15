@@ -38,6 +38,7 @@ use crate::{
 };
 
 mod input;
+mod instruction_profile;
 mod kernel_image;
 mod network;
 mod qemu;
@@ -497,6 +498,8 @@ pub(crate) enum VmSessionError {
     Interrupt(#[from] InterruptError),
     #[error("{0}")]
     Profiling(#[from] ProfilingStepError),
+    #[error("{0}")]
+    InstructionProfile(#[from] instruction_profile::InstructionProfileOutputError),
 }
 
 /// One profiling RPC around a bench run, named by the step it was for.
@@ -1924,6 +1927,13 @@ struct AotBenchCommand {
     #[arg(long)]
     kernel_profile_output: Option<PathBuf>,
 
+    /// Write the instruction addresses the guest's timers sampled during the
+    /// AOT run, as a folded profile of wasm and kernel functions. Sampling
+    /// runs only when this is given: it raises every guest processor's
+    /// timer rate tenfold, so the run's timings are perturbed.
+    #[arg(long)]
+    instruction_profile_output: Option<PathBuf>,
+
     /// Write folded user-only profile samples collected during the AOT run.
     #[arg(long)]
     user_profile_output: Option<PathBuf>,
@@ -3039,7 +3049,9 @@ fn connect_and_run(
         })?;
     }
     match command.command.clone() {
-        Some(ResolvedVmSessionCommand::AotBench(command)) => run_aot_bench(client, command, vcpus),
+        Some(ResolvedVmSessionCommand::AotBench(aot_command)) => {
+            run_aot_bench(client, aot_command, vcpus, command.kernel.clone())
+        }
         Some(ResolvedVmSessionCommand::WorkloadBench(workload_command)) => run_workload_bench(
             client,
             workload_command,
@@ -3053,6 +3065,7 @@ fn connect_and_run(
                 rpc_transport: command.rpc_transport,
             },
             vcpus,
+            command.kernel.clone(),
         ),
         Some(ResolvedVmSessionCommand::Balloon(balloon)) => {
             let socket = qmp_socket.ok_or(VmSessionError::NeedsQmp { action: "balloon" })?;
@@ -3740,6 +3753,7 @@ fn run_workload_bench(
     command: WorkloadBenchCommand,
     provenance: VmProvenance,
     vcpus: VcpuStateCapture,
+    kernel: PathBuf,
 ) -> Result<(), VmSessionError> {
     crate::run_interruptible(async move {
         let profile_filter = system_profiling::Filter {
@@ -3788,6 +3802,13 @@ fn run_workload_bench(
         } else {
             Vec::new()
         };
+        let instruction_profile_output = command.instruction_profile_output();
+        if instruction_profile_output.is_some() {
+            guest_step_under_deadline("the instruction sampling start", seconds, &vcpus, async {
+                Ok::<_, VmSessionError>(instruction_profile::start(&client).await?)
+            })
+            .await?;
+        }
 
         if let Err(error) =
             crate::workload_bench::run_inner(&mut client, &command, &provenance, &vcpus).await
@@ -3796,6 +3817,12 @@ fn run_workload_bench(
             return Err(error.into());
         }
 
+        if instruction_profile_output.is_some() {
+            guest_step_under_deadline("the instruction sampling stop", seconds, &vcpus, async {
+                Ok::<_, VmSessionError>(instruction_profile::stop(&client).await?)
+            })
+            .await?;
+        }
         if collect_profile {
             guest_step_under_deadline("the profiler stop", seconds, &vcpus, async {
                 Ok::<_, VmSessionError>(
@@ -3830,6 +3857,14 @@ fn run_workload_bench(
                 })
                 .await?;
             write_requested_profile_outputs(&command, &before_profile, &after_profile, &metrics)?;
+        }
+        if let Some(output) = instruction_profile_output {
+            guest_step_under_deadline("the instruction profile read", seconds, &vcpus, async {
+                Ok::<_, VmSessionError>(
+                    instruction_profile::collect(&client, &kernel, output).await?,
+                )
+            })
+            .await?;
         }
         if let Some(output) = command.llvm_raw_profile_output() {
             raw_profile::collect_beside(&client, output).await?;
@@ -3885,6 +3920,7 @@ fn run_aot_bench(
     mut client: RpcClient,
     command: AotBenchCommand,
     vcpus: VcpuStateCapture,
+    kernel: PathBuf,
 ) -> Result<(), VmSessionError> {
     crate::run_interruptible(async move {
         let wasm = fs::read(&command.wasm).map_err(|source| AotBenchError::ReadWasm {
@@ -3942,6 +3978,10 @@ fn run_aot_bench(
             )
             .map_err(|source| AotBenchError::Report { source })?;
         }
+        let instruction_profile_output = command.instruction_profile_output();
+        if instruction_profile_output.is_some() {
+            instruction_profile::start(&client).await?;
+        }
         for iteration in 1..=command.iterations {
             let started = Instant::now();
             let outcome = system_programs::aot(
@@ -3985,6 +4025,9 @@ fn run_aot_bench(
             )
             .map_err(|source| AotBenchError::Report { source })?;
         }
+        if instruction_profile_output.is_some() {
+            instruction_profile::stop(&client).await?;
+        }
         if collect_profile {
             profiling_step(
                 "disable remote profiling",
@@ -4003,6 +4046,9 @@ fn run_aot_bench(
             .await?;
             write_requested_profile_outputs(&command, &before_profile, &after_profile, &metrics)?;
         }
+        if let Some(output) = instruction_profile_output {
+            instruction_profile::collect(&client, &kernel, output).await?;
+        }
         if let Some(output) = command.llvm_raw_profile_output() {
             raw_profile::collect_beside(&client, output).await?;
         }
@@ -4015,6 +4061,9 @@ trait ProfileOutputRequest {
     fn kernel_profile_output(&self) -> Option<&Path>;
     fn user_profile_output(&self) -> Option<&Path>;
     fn perf_metrics_output(&self) -> Option<&Path>;
+    /// Where the instruction-address samples are written as a folded
+    /// profile, when the run is collecting them.
+    fn instruction_profile_output(&self) -> Option<&Path>;
     /// Where the guest kernel's own LLVM raw profile is written, when the
     /// run is collecting one.
     fn llvm_raw_profile_output(&self) -> Option<&Path>;
@@ -4040,6 +4089,10 @@ impl ProfileOutputRequest for AotBenchCommand {
     fn perf_metrics_output(&self) -> Option<&Path> {
         self.perf_metrics_output.as_deref()
     }
+
+    fn instruction_profile_output(&self) -> Option<&Path> {
+        self.instruction_profile_output.as_deref()
+    }
 }
 
 impl ProfileOutputRequest for WorkloadBenchCommand {
@@ -4061,6 +4114,10 @@ impl ProfileOutputRequest for WorkloadBenchCommand {
 
     fn perf_metrics_output(&self) -> Option<&Path> {
         self.perf_metrics_output.as_deref()
+    }
+
+    fn instruction_profile_output(&self) -> Option<&Path> {
+        self.instruction_profile_output.as_deref()
     }
 }
 
@@ -6323,6 +6380,7 @@ mod tests {
             compiler_timing: false,
             profile_output: None,
             kernel_profile_output: None,
+            instruction_profile_output: None,
             user_profile_output: None,
             perf_metrics_output: None,
             llvm_raw_profile_output: None,

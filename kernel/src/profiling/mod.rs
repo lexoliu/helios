@@ -1,4 +1,5 @@
-//! The kernel's own LLVM profile runtime.
+//! The profiles the kernel hands the host: its own LLVM profile runtime,
+//! and the instruction-address samples of [`instructions`].
 //!
 //! A kernel built with `-C profile-generate -Z no-profiler-runtime` carries
 //! LLVM's instrumentation — counters in `__llvm_prf_cnts`, per-function
@@ -8,14 +9,15 @@
 //! instrumented object references, and a `.profraw` writer over the linked
 //! sections.
 //!
-//! Nothing here allocates and nothing here is reachable in a kernel that was
-//! not instrumented: the writer, the sections and the runtime symbol are
+//! Nothing of that runtime allocates, and none of it is reachable in a kernel
+//! that was not instrumented: the writer, the sections and the runtime symbol are
 //! compiled only under `--cfg helios_profile_generate`, which the
 //! `profile-generate` build sets in the same rustflags that turn the
 //! instrumentation on (`docs/pgo.md`). A plain kernel still answers the
 //! `helios:system/profiling` export — with [`LlvmProfileError::NotInstrumented`],
 //! never with an empty profile.
 
+mod instructions;
 #[cfg(any(helios_profile_generate, test))]
 mod raw;
 
@@ -123,6 +125,12 @@ pub trait LlvmProfile {
     /// the image is short; `offset == size()` writes nothing.
     fn read(&self, offset: u64, out: &mut [u8]) -> Result<usize, LlvmProfileError>;
 }
+
+pub use instructions::{
+    CodeAttribution, InstructionProfile, InstructionProfileError, InstructionSampler,
+    SAMPLE_DRAIN_INTERVAL_MILLIS, SAMPLE_RING_CAPACITY, SampleCapture, SampledCode,
+    WasmFunctionSample,
+};
 
 #[cfg(helios_profile_generate)]
 pub use instrumented::InstrumentedKernelProfile as KernelLlvmProfile;

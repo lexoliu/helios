@@ -54,6 +54,10 @@ on:
         description: Diagnose paired TCP reconnects with single-queue packet capture; not performance acceptance
         type: boolean
         default: false
+      instruction_profile:
+        description: Sample instruction addresses on the x86-64 Helios image for diagnosis; perturbs timings, not performance acceptance
+        type: boolean
+        default: false
   pull_request:
     types: [opened, synchronize, reopened, labeled]
   push:
@@ -351,6 +355,11 @@ jobs:
       - name: Run the suite
         if: ${{ !inputs.tcp_probe }}
         working-directory: helios/tools/bench
+        env:
+          # Opt-in instruction-address sampling (linux-gap-bench.py).
+          # It raises the guest timer rate tenfold, so only a dispatch
+          # that asks for a diagnosis turns it on.
+          HELIOS_BENCH_INSTRUCTION_PROFILE: ${{ inputs.instruction_profile && '1' || '0' }}
         run: |
           # --job-timeout-minutes is this job's timeout-minutes above (the
           # arm this step runs under): the runner skips the one retry of an
@@ -448,9 +457,11 @@ jobs:
             bench-out/${{ matrix.lane }}/helios/*.md
             bench-out/${{ matrix.lane }}/helios/*.perf.json
             bench-out/${{ matrix.lane }}/helios/*.kernel.folded
+            bench-out/${{ matrix.lane }}/helios/*.pc.folded
             bench-out/${{ matrix.lane }}/helios-baseline/*.jsonl
             bench-out/${{ matrix.lane }}/helios-baseline/*.perf.json
             bench-out/${{ matrix.lane }}/helios-baseline/*.kernel.folded
+            bench-out/${{ matrix.lane }}/helios-baseline/*.pc.folded
             bench-out/${{ matrix.lane }}/linux/*.jsonl
             bench-out/${{ matrix.lane }}/linux/*.md
             bench-out/${{ matrix.lane }}/linux/summary.json
@@ -644,9 +655,11 @@ jobs:
             bench-out/pgo/helios/*.jsonl
             bench-out/pgo/helios/*.perf.json
             bench-out/pgo/helios/*.kernel.folded
+            bench-out/pgo/helios/*.pc.folded
             bench-out/pgo/helios-baseline/*.jsonl
             bench-out/pgo/helios-baseline/*.perf.json
             bench-out/pgo/helios-baseline/*.kernel.folded
+            bench-out/pgo/helios-baseline/*.pc.folded
             pgo-comment.md
           if-no-files-found: warn
           retention-days: 90

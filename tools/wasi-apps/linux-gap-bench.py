@@ -39,6 +39,9 @@ from fedora_qemu_baseline import (
 
 # Helios inspector arch name -> Fedora guest arch name.
 LINUX_GUEST_ARCHES = {"aarch64": "aarch64", "x86-64": "x86_64"}
+# The Helios backends whose timer samples instruction addresses. Any other
+# guest refuses an instruction profile, so it is not asked for one.
+INSTRUCTION_SAMPLING_ARCHES = {"x86-64"}
 from tcp_echo_server import TcpEchoServer, start_tcp_echo_server
 from tcp_throughput_server import DEFAULT_PAYLOAD_BYTES, start_tcp_throughput_server
 
@@ -587,6 +590,23 @@ def helios_cli_bin() -> Path:
     )
 
 
+def instruction_profile_requested() -> bool:
+    """Whether the run asked for instruction-address sampling.
+
+    `HELIOS_BENCH_INSTRUCTION_PROFILE=1` asks for it; unset or `0` does not,
+    and any other value is refused rather than guessed at.
+    """
+    value = os.environ.get("HELIOS_BENCH_INSTRUCTION_PROFILE", "0")
+    if value not in ("0", "1"):
+        raise SystemExit(f"HELIOS_BENCH_INSTRUCTION_PROFILE must be 0 or 1, got {value!r}")
+    return value == "1"
+
+
+def own_checkout(image: HeliosImage) -> bool:
+    """Whether `image` is built and booted by this checkout's tooling."""
+    return image.workspace_root.resolve() == repo_root().resolve()
+
+
 def image_tools(image: HeliosImage) -> tuple[Path, Path]:
     """The `helios-inspector`/`helios-cli` an image is built and booted by.
 
@@ -598,7 +618,7 @@ def image_tools(image: HeliosImage) -> tuple[Path, Path]:
     run 34551261487. The pins a process-level environment sets name
     *this* checkout's tools and so apply to its image only.
     """
-    if image.workspace_root.resolve() == repo_root().resolve():
+    if own_checkout(image):
         return inspector_bin(), helios_cli_bin()
     release = image.workspace_root / "target" / "release"
     return release / "helios-inspector", release / "helios-cli"
@@ -614,7 +634,7 @@ def require_image_tools(image: HeliosImage) -> None:
     Checked once after the builds rather than discovered inside a boot:
     the run has failed, not the workload.
     """
-    if image.workspace_root.resolve() == repo_root().resolve():
+    if own_checkout(image):
         # This checkout's own tools, whose absence the script's own -x
         # check already refuses at the boot that needs them.
         return
@@ -1005,6 +1025,15 @@ def run_helios_once(
     env["HELIOS_WORKLOAD_BENCH_LOG"] = str(log)
     env["HELIOS_WORKLOAD_BENCH_KERNEL_PROFILE_OUTPUT"] = str(log.with_suffix(".kernel.folded"))
     env["HELIOS_WORKLOAD_BENCH_PERF_METRICS_OUTPUT"] = str(log.with_suffix(".perf.json"))
+    if instruction_profile_requested() and arch in INSTRUCTION_SAMPLING_ARCHES and own_checkout(image):
+        # Beside the scoped profile, the functions the processors were
+        # executing, sampled at the instruction level. Opt-in only:
+        # sampling raises every guest processor's timer rate tenfold, so a
+        # sampled run is a diagnosis, never a measurement, and in a paired
+        # run it would bias one side. Asked of this checkout's image only:
+        # a baseline image is booted by its own ref's inspector, which may
+        # predate the option (#356's skew).
+        env["HELIOS_WORKLOAD_BENCH_INSTRUCTION_PROFILE_OUTPUT"] = str(log.with_suffix(".pc.folded"))
     runtime_dir = env.get("HELIOS_WORKLOAD_BENCH_RUNTIME_DIR")
     if runtime_dir:
         # One runtime directory per boot. Each unit is its own VM, and a
@@ -2068,6 +2097,8 @@ def write_report(
     if helios_jsonl:
         for profile_path in sorted(helios_jsonl.parent.glob("helios*.kernel.folded")):
             lines.append(f"- Helios kernel folded profile is in `{profile_path}`.")
+        for profile_path in sorted(helios_jsonl.parent.glob("helios*.pc.folded")):
+            lines.append(f"- Helios instruction-level folded profile is in `{profile_path}`.")
         for flamegraph_path in helios_kernel_flamegraphs:
             lines.append(f"- Helios kernel flamegraph SVG is in `{flamegraph_path}`.")
     if wasmtime_profiles:

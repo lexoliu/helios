@@ -194,7 +194,10 @@ pub use process::{
     ThreadRecord, ThreadState, ThreadTable, ThreadTableError, TtyControlCap, UdpCap,
 };
 pub use profiling::{
+    CodeAttribution, InstructionProfile, InstructionProfileError, InstructionSampler,
     KernelLlvmProfile, LlvmProfile, LlvmProfileError, MAX_PROFILE_READ, ProfileSection,
+    SAMPLE_DRAIN_INTERVAL_MILLIS, SAMPLE_RING_CAPACITY, SampleCapture, SampledCode,
+    WasmFunctionSample,
 };
 pub use runtime::{
     AuthorityDomain, ComponentHostFilesystemState, ComponentHostNetwork, ComponentNetworkService,
