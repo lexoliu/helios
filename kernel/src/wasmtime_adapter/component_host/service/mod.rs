@@ -1714,14 +1714,9 @@ where
         } else {
             0
         };
-        let result = self.invoke_compiler_inner(
-            exec_context,
-            &compiler_payload,
-            wasm,
-            hint,
-            profile,
-            phases,
-        );
+        let result = self
+            .invoke_compiler_inner(exec_context, &compiler_payload, wasm, hint, profile, phases)
+            .await;
         let thread_reports = self.await_compiler_thread_tasks().await;
         phases.tasks_joined_ns = if profile {
             monotonic_nanos(&exec_context.cpu)
@@ -1794,7 +1789,7 @@ where
         reports
     }
 
-    fn invoke_compiler_inner(
+    async fn invoke_compiler_inner(
         &self,
         exec_context: &ProgramExecContext<CpuImpl, Net, HostFs>,
         compiler_payload: &Bytes,
@@ -1834,14 +1829,16 @@ where
         configure_compiler_core_store(&mut store);
         let instance = plugin
             .instance_pre
-            .instantiate(&mut store)
+            .instantiate_async(&mut store)
+            .await
             .map_err(map_program_runtime_error)?;
         let tls_base = plugin.main_thread_tls_base;
         set_compiler_tls_base(&mut store, &instance, tls_base)?;
         let pthread_self_offset = instance
             .get_typed_func::<(), i32>(&mut store, HELIOS_COMPILER_PTHREAD_SELF_OFFSET)
             .map_err(map_program_runtime_error)?
-            .call(&mut store, ())
+            .call_async(&mut store, ())
+            .await
             .map_err(map_program_runtime_error)? as u32;
         let thread_pointer = tls_base
             .checked_add(pthread_self_offset)
@@ -1853,7 +1850,8 @@ where
             .get_typed_func::<i32, ()>(&mut store, HELIOS_COMPILER_INITIALIZE)
             .map_err(map_program_runtime_error)?;
         initialize
-            .call(&mut store, thread_pointer as i32)
+            .call_async(&mut store, thread_pointer as i32)
+            .await
             .map_err(map_program_runtime_error)?;
         let alloc = instance
             .get_typed_func::<(i32, i32), i32>(&mut store, HELIOS_COMPILER_ALLOC)
@@ -1867,14 +1865,15 @@ where
             0
         };
         let target = env!("HELIOS_BUILD_TARGET").as_bytes();
-        let wasm_ptr = compiler_alloc(&mut store, &alloc, wasm.len(), 1)?;
-        let target_ptr = compiler_alloc(&mut store, &alloc, target.len(), 1)?;
+        let wasm_ptr = compiler_alloc(&mut store, &alloc, wasm.len(), 1).await?;
+        let target_ptr = compiler_alloc(&mut store, &alloc, target.len(), 1).await?;
         let request_ptr = compiler_alloc(
             &mut store,
             &alloc,
             core::mem::size_of::<CompilerRequestHeader>(),
             core::mem::align_of::<CompilerRequestHeader>(),
-        )?;
+        )
+        .await?;
         write_shared_memory(store.data().memory(), wasm_ptr, wasm)?;
         write_shared_memory(store.data().memory(), target_ptr, target)?;
         let header = CompilerRequestHeader {
@@ -1911,13 +1910,15 @@ where
             0
         };
         let compile_started = store.data().cpu.now().ticks();
-        let response_ptr = compile.call(
-            &mut store,
-            (
-                request_ptr as i32,
-                core::mem::size_of::<CompilerRequestHeader>() as i32,
-            ),
-        );
+        let response_ptr = compile
+            .call_async(
+                &mut store,
+                (
+                    request_ptr as i32,
+                    core::mem::size_of::<CompilerRequestHeader>() as i32,
+                ),
+            )
+            .await;
         phases.compile_returned_ns = if profile {
             monotonic_nanos(&exec_context.cpu)
         } else {

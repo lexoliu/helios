@@ -292,7 +292,7 @@ where
         .map_err(map_program_runtime_error)
 }
 
-pub(super) fn compiler_alloc<CpuImpl, Net, HostFs>(
+pub(super) async fn compiler_alloc<CpuImpl, Net, HostFs>(
     store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, HostFs>>,
     alloc: &wasmtime::TypedFunc<(i32, i32), i32>,
     len: usize,
@@ -304,7 +304,8 @@ where
     HostFs: crate::HostFileSystem,
 {
     let ptr = alloc
-        .call(&mut *store, (len as i32, align as i32))
+        .call_async(&mut *store, (len as i32, align as i32))
+        .await
         .map_err(map_program_runtime_error)?;
     if ptr == 0 {
         let memory = store.data().memory();
