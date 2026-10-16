@@ -124,6 +124,7 @@ build_wasix_conformance_artifact thread-futex
 build_wasix_conformance_artifact continuation
 build_wasix_conformance_artifact atomic-wait-timeout
 build_wasix_conformance_artifact atomic-wait-kill
+build_wasix_conformance_artifact orphan-threads
 
 run_smoke() {
     local name="$1"
@@ -326,6 +327,19 @@ run_smoke \
     shell \
     -c \
     '/bin/wasix-atomic-wait-kill'
+
+run_smoke \
+    wasix-orphan-threads \
+    orphan-threads:ok \
+    orphan-threads:exit=0 \
+    -- \
+    --boot-program dash \
+    --boot-program debugger \
+    --boot-program wasix-orphan-threads \
+    --no-compiler-plugin \
+    shell \
+    -c \
+    '/bin/wasix-orphan-threads; echo orphan-threads:exit=$?'
 
 run_smoke \
     cpython \

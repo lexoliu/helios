@@ -178,6 +178,14 @@ bootfs_path = "bin/wasix-atomic-wait-kill"
 source = "artifacts/wasix/atomic-wait-kill/atomic-wait-kill.wasm"
 
 [[artifact]]
+command = "wasix-orphan-threads"
+package = "helios-wasix-conformance"
+version = "0.1.0"
+source_url = "tools/wasi-apps/wasix-tests"
+bootfs_path = "bin/wasix-orphan-threads"
+source = "artifacts/wasix/orphan-threads/orphan-threads.wasm"
+
+[[artifact]]
 command = "simd-lanes"
 package = "helios-wasix-conformance"
 version = "0.1.0"
