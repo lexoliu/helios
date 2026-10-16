@@ -350,11 +350,10 @@ stays one opaque row; the instruction-level profile splits it.
 
 The instruction-level profile is opt-in and never part of a measurement.
 While instruction sampling runs, each processor's local-APIC timer
-interrupts at 2 kHz instead of at its 400 Hz guest time slice, and each
-interrupt records the instruction it interrupted. Guest preemption still
-runs on every fifth interrupt only, and the scheduler's own work
-(watchdog, kernel timer) on every twentieth, its 100 Hz tick, so the
-guest's yield cadence matches an unprofiled run,
+interrupts at 1 kHz instead of its 100 Hz scheduler tick, and each
+interrupt records the instruction it interrupted. The scheduler's own work
+(watchdog, guest preemption, kernel timer) still runs on every tenth
+interrupt only, so the guest's yield cadence matches an unprofiled run,
 but the extra interrupts (and, under KVM, the extra timer exits) on every
 processor cost time the medians would carry. In a paired run only this
 checkout's image can sample, so sampling in a measured run would also bias

@@ -1663,7 +1663,7 @@ pub(crate) fn store_with_state<CpuImpl, Net, HostFs>(
     state: StoreData<CpuImpl, Net, HostFs>,
 ) -> (
     Store<StoreData<CpuImpl, Net, HostFs>>,
-    crate::wasmtime_adapter::preemption::StoreInterrupts,
+    crate::wasmtime_adapter::preemption::StoreInterrupts<CpuImpl>,
 )
 where
     CpuImpl: Cpu + Clone,
@@ -1692,7 +1692,9 @@ where
         }
         Ok(wasmtime::InterruptAction::Yield)
     });
-    let interrupts = engine.interrupts().register(instance, &store);
+    let interrupts = engine
+        .interrupts()
+        .register(instance, &store, store.data().cpu.clone());
     (store, interrupts)
 }
 

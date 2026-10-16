@@ -1074,7 +1074,7 @@ where
 /// the returned registration lives.
 pub(super) fn configure_preview1_program_store<CpuImpl, Net, HostFs>(
     store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, HostFs>>,
-) -> StoreInterrupts
+) -> StoreInterrupts<CpuImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
@@ -1086,7 +1086,7 @@ where
     store.interrupt_callback(|mut caller| caller.data_mut().on_interrupt());
     let interrupts = store.data().interrupts.clone();
     let instance = store.data().instance().id();
-    let registration = interrupts.register(instance, store);
+    let registration = interrupts.register(instance, store, store.data().cpu.clone());
     store.data().signal_state.attach(interrupts, instance);
     registration
 }

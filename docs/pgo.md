@@ -577,7 +577,7 @@ rustc also has `-Z profile-sample-use=<file>` (AutoFDO). The kernel has
 two profilers. The scoped one exports folded phase stacks with weights
 (`helios:system/profiling.folded`, `workload-bench --kernel-profile-output`).
 The instruction-address sampler records the instruction each processor's
-2 kHz sampling timer interrupted, when a run opts in (`helios:system/profiling.instruction-samples`,
+1 kHz sampling timer interrupted, when a run opts in (`helios:system/profiling.instruction-samples`,
 `--instruction-profile-output`, x86-64 only; see `docs/benchmarks.md`).
 The kernel hands back the raw address of every sample outside wasm code,
 but the inspector folds those addresses to function symbols. AutoFDO needs

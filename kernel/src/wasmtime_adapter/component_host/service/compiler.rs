@@ -231,13 +231,13 @@ pub(super) fn write_decimal(memory: &SharedMemory, ptr: u32, mut value: u32) -> 
 /// store for kills, for as long as the returned registration lives.
 ///
 /// The compiler is never preempted: its calls are not driven through
-/// [`crate::wasmtime_adapter::preemption::StoreInterrupts::drive`], so the
-/// time-slice interrupt never names it, and what interrupts it is a kill of its
-/// instance. The callback traps that kill, and resumes the compile when it
+/// [`crate::wasmtime_adapter::preemption::StoreInterrupts::drive`], so no
+/// processor's running slot ever names it, and what interrupts it is a kill
+/// of its instance. The callback traps that kill, and resumes the compile when it
 /// finds none.
 pub(super) fn configure_compiler_core_store<CpuImpl, Net, HostFs>(
     store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, HostFs>>,
-) -> crate::wasmtime_adapter::preemption::StoreInterrupts
+) -> crate::wasmtime_adapter::preemption::StoreInterrupts<CpuImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
@@ -250,7 +250,7 @@ where
         Ok(wasmtime::InterruptAction::Continue)
     });
     let interrupts = store.data().shared.interrupts.clone();
-    interrupts.register(store.data().instance.id(), store)
+    interrupts.register(store.data().instance.id(), store, store.data().cpu.clone())
 }
 
 pub(super) fn compiler_tls_base<CpuImpl, Net, HostFs>(

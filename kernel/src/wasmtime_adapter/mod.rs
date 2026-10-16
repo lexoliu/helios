@@ -92,7 +92,7 @@ impl WasmtimeEngine {
         &self.engine
     }
 
-    /// The routes the time-slice interrupt and the kill path take into this
+    /// The routes the time-slice walk and the kill path take into this
     /// engine's stores.
     pub(crate) fn interrupts(&self) -> &Arc<GuestInterrupts> {
         &self.interrupts
@@ -117,7 +117,7 @@ where
     HostFs: HostFileSystem,
 {
     store: wasmtime::Store<StoreData<CpuImpl, Net, HostFs>>,
-    interrupts: StoreInterrupts,
+    interrupts: StoreInterrupts<CpuImpl>,
     run_func: wasmtime::component::TypedFunc<(), (core::result::Result<(), ()>,)>,
 }
 
@@ -215,7 +215,10 @@ where
         let engine = engine::build_component_engine_for_platform(&self.platform)?;
         Ok(WasmtimeEngine {
             engine,
-            interrupts: Arc::new(GuestInterrupts::new(self.platform.processor_count())),
+            interrupts: Arc::new(GuestInterrupts::new(
+                self.platform.processor_count(),
+                self.platform.timebase(),
+            )),
         })
     }
 

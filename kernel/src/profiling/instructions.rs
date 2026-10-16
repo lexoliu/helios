@@ -43,8 +43,8 @@ use crate::Notify;
 
 /// Samples one processor's ring holds before it drops.
 ///
-/// The drain runs every [`SAMPLE_DRAIN_INTERVAL_MILLIS`]; at the 2 kHz the
-/// x86 backend samples at, this is two seconds of samples a drain has not
+/// The drain runs every [`SAMPLE_DRAIN_INTERVAL_MILLIS`]; at the 1 kHz the
+/// x86 backend samples at, this is four seconds of samples a drain has not
 /// reached, so a drain delayed by a busy executor loses nothing.
 pub const SAMPLE_RING_CAPACITY: usize = 4096;
 
