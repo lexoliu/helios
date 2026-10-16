@@ -31,10 +31,17 @@ if [ -n "${HELIOS_WORKLOAD_BENCH_BUILD_ONLY:-}" ]; then
     # And the tooling the image's own checkout would compile, where the
     # driver pinned it — HELIOS_TEST_TOOLS_ABSENT names one a broken
     # build leaves behind, so the refusal that checks it can be seen.
+    # Each tool's help lists the sampling option unless
+    # HELIOS_TEST_SAMPLER_ABSENT names it: a checkout that predates the
+    # sampler.
     for tool in "${HELIOS_INSPECTOR_BIN:-}" "${HELIOS_CLI_BIN:-}"; do
         if [ -n "$tool" ] && [ "$tool" != "${HELIOS_TEST_TOOLS_ABSENT:-}" ]; then
             mkdir -p "$(dirname "$tool")"
-            printf '#!/bin/sh\nexit 0\n' > "$tool"
+            if [ "$tool" = "${HELIOS_TEST_SAMPLER_ABSENT:-}" ]; then
+                printf '#!/bin/sh\necho "      --kernel-profile-output <PATH>"\n' > "$tool"
+            else
+                printf '#!/bin/sh\necho "      --instruction-profile-output <PATH>"\n' > "$tool"
+            fi
             chmod +x "$tool"
         fi
     done
@@ -52,6 +59,18 @@ if [ "$HELIOS_WORKLOAD_BENCH_CLASSES" = "@WEDGED@" ]; then
     sleep 600 &
     echo $! > "$HELIOS_TEST_WEDGE_PID_FILE"
     wait
+fi
+# A sampled boot writes its profile and reports it on stderr the way the
+# inspector does; the period is the guest's, so a checkout can name its
+# own in `sampling-period`.
+if [ -n "${HELIOS_WORKLOAD_BENCH_INSTRUCTION_PROFILE_OUTPUT:-}" ]; then
+    period=1000000
+    if [ -f "$HELIOS_WORKSPACE_ROOT/sampling-period" ]; then
+        period="$(cat "$HELIOS_WORKSPACE_ROOT/sampling-period")"
+    fi
+    printf 'wasm;quickjs;main 7\n' > "$HELIOS_WORKLOAD_BENCH_INSTRUCTION_PROFILE_OUTPUT"
+    printf 'instruction_profile_output=%s samples=7 dropped=1 period_ns=%s\n' \
+        "$HELIOS_WORKLOAD_BENCH_INSTRUCTION_PROFILE_OUTPUT" "$period" >&2
 fi
 for name in $(echo "$HELIOS_WORKLOAD_BENCH_WORKLOADS" | tr ',' ' '); do
     printf '{"type":"summary","workload":"%s","class":"%s","headline":false,\

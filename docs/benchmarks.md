@@ -343,28 +343,58 @@ scoped kernel profile (`helios-*.kernel.folded`), so a diagnosis that
 needs a counter the table cut, or the baseline's counters at all, reads
 them from the artifact instead of re-running the lane.
 
-On request, each x86-64 boot of the run's own image also writes an
-instruction-level profile, `helios-*.pc.folded`. The scoped profile can
+On request, each x86-64 boot also writes an instruction-level profile,
+`helios-*.pc.folded`: every boot of the run's own image and, in a paired
+run, every boot of the baseline image beside it, so the artifact carries
+both columns' profiles and a diagnosis can compare them. The scoped profile can
 only name the phases the kernel times, so `kernel;program;run-component`
 stays one opaque row; the instruction-level profile splits it.
 
-The instruction-level profile is opt-in and never part of a measurement.
+The instruction-level profile is opt-in and never a performance measurement.
 While instruction sampling runs, each processor's local-APIC timer
 interrupts at 1 kHz instead of its 100 Hz scheduler tick, and each
 interrupt records the instruction it interrupted. The scheduler's own work
 (watchdog, guest preemption, kernel timer) still runs on every tenth
 interrupt only, so the guest's yield cadence matches an unprofiled run,
 but the extra interrupts (and, under KVM, the extra timer exits) on every
-processor cost time the medians would carry. In a paired run only this
-checkout's image can sample, so sampling in a measured run would also bias
-the comparison toward the baseline. Sampling therefore has its own control
+processor cost time the medians would carry, as does the kernel task that
+drains the samples every 20 ms. Sampling therefore has its own control
 (`helios:system/profiling.set-instruction-sampling`), separate from the
 scoped profiler every lane boot enables. The inspector starts it only when
 `--instruction-profile-output` is given, for the duration of the workload,
 and stops it before reading the samples. `linux-gap-bench.py` passes the
 option only when `HELIOS_BENCH_INSTRUCTION_PROFILE=1`, and `bench-suite.yml`
 sets that from its `instruction_profile` dispatch input (default off). A
-run with it on is a diagnosis; its timings are not evidence for anything.
+run with it on is a diagnosis: its report carries the deviation, so it is
+never publishable, and a run asked to be publishable with it on is refused.
+
+Sampling is a property of the run, never of one image (#475). When it is
+on, `linux-gap-bench.py` samples every boot of every image, control boots
+included, so both columns of a pairing carry the same timer rate and the
+same drain task, and the comparison between them stays like with like.
+Before the first boot it asks each image's own inspector (`vm
+workload-bench --help`) whether it takes `--instruction-profile-output`;
+a baseline built from a commit that predates the sampler does not, and
+the run is refused naming that image and its inspector rather than
+sampling one side. Each finished boot's `instruction_profile_output=` line
+is read back: a boot that reports no capture, or a period that differs
+from any earlier boot of either image, ends the run. Each image's period,
+boot count, sample total and drop total land in
+`instruction-sampling.json` beside its records and in the report's run
+record (`instruction_sampling`, `baseline_instruction_sampling`).
+
+The report states it in its header: `tables.md` says every Helios timing
+includes the sampler's overhead, on both Helios columns when paired, and
+that a ratio against the unsampled Linux columns is not evidence. The
+gate keeps its verdicts only between columns sampled alike. The paired
+table says both columns carried the sampler and at what period, and
+keeps its verdicts; a report whose two columns disagree is refused. The
+cross-run table compares against a `dev` report that was not sampled, so
+a sampled candidate's cross-run comparison is refused, and so is an
+unsampled candidate's against a sampled `dev` report: the refusal names
+both sides' sampling and neither blocks nor passes, while the paired
+table stands. A sampled run with no paired table has nothing the gate
+can compare and fails naming why.
 
 The kernel names each wasm address after the program
 and function it lies in. The inspector names every other address against
@@ -415,10 +445,8 @@ instruction, and the host to unwind it, which is new code in the measured
 kernel rather than a change to what the host reads.
 
 At the end of each boot, the inspector prints the sample total, the drop
-count and the period on its `instruction_profile_output=` line. A paired
-baseline built from another commit is booted by its own ref's inspector,
-which may predate the option, so that image writes no instruction-level
-profile. The `workload-bench` and `aot-bench` option is
+count and the period on its `instruction_profile_output=` line, which the
+driver reads back as above. The `workload-bench` and `aot-bench` option is
 `--instruction-profile-output`. aarch64 and riscv64 do not sample
 instruction addresses, and their kernels refuse the request rather than
 return an empty profile.

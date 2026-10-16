@@ -6,6 +6,10 @@ Warm series: {{ report.thresholds.iterations - report.thresholds.warmup_discard 
 {% if report.control %}
 Noise floor from `{{ report.control.workload }}` before and after the suite: {{ report.control.noise_floor | percent }}{% if report.run.noise_retry %}{% if report.run.noise_retry.kind == "skipped-for-budget" %} — a first pass measured {{ report.run.noise_retry.first_noise_floor | percent }}, past the bound, and the retry was skipped: the second pass would need {{ report.run.noise_retry.needed_seconds | seconds }} and {{ report.run.noise_retry.remaining_seconds | seconds }} of the job's budget remain{% else %} — a first pass measured {{ report.run.noise_retry.first_noise_floor | percent }}, past the bound, and the suite ran once more{% endif %}{% endif %}.
 {% endif %}
+{% if report.run.instruction_sampling %}
+
+> Instruction sampling was on: every Helios boot was sampled every {{ report.run.instruction_sampling.period_nanos | period }} on each processor{% if report.run.baseline_instruction_sampling %}, both images alike{% endif %}, so every Helios timing here includes the sampler's overhead ({{ "{:,}".format(report.run.instruction_sampling.samples) }} samples over {{ report.run.instruction_sampling.boots }} boots{% if report.run.baseline_instruction_sampling %} on the candidate, {{ "{:,}".format(report.run.baseline_instruction_sampling.samples) }} over {{ report.run.baseline_instruction_sampling.boots }} on the baseline{% endif %}). This is a diagnosis: the Linux columns carry no sampler, so a ratio against them is not evidence{% if report.run.baseline_instruction_sampling %}, and the two Helios columns compare only with each other{% endif %}.
+{% endif %}
 {% if not report.run.publishable %}
 
 > Not publishable: {% if report.run.advisory %}advisory run on a shared runner{% endif %}{% for deviation in report.run.deviations %}; {{ deviation }}{% endfor %}.

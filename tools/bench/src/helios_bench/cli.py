@@ -181,6 +181,13 @@ def command_gate(args: argparse.Namespace) -> int:
     baseline = load_report(args.baseline) if args.baseline else None
     report = gate_report(candidate, baseline)
     if not report.results:
+        if report.cross_run_refused is not None:
+            # The one comparison there was is refused, and an empty gate
+            # would read as a pass.
+            raise SystemExit(
+                f"{args.candidate}: the run was not paired and the cross-run comparison "
+                f"is refused: {report.cross_run_refused.reason}"
+            )
         raise SystemExit(
             f"{args.candidate}: the run was not paired and no --baseline was given, "
             "so there is nothing to compare it against"

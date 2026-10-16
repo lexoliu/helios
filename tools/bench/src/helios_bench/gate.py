@@ -12,6 +12,14 @@ Two comparisons, and the difference between them is the whole point:
   happened to be alike: it enforces when both reports are publishable
   **and** name the same host CPU, and otherwise says what it saw.
 
+Either comparison keeps its verdicts only between columns sampled alike.
+A run that asked for an instruction profile samples its Helios boots, and
+every timing it takes carries the sampler's overhead; two columns that
+carry the same sampler still compare like with like, and two that do not
+would put the sampler inside the shift a verdict attributes to the
+change (#475). The paired comparison refuses such a report outright, and
+the cross-run one is refused while the paired table still stands.
+
 Either comparison judges every measurement a cell carries, not only its
 wall clock: the host-side `elapsed_ms` of the whole round trip, and each
 `bench.<name>` metric the workload printed from inside the guest. A
@@ -29,6 +37,7 @@ from enum import StrEnum
 
 from helios_bench.report import (
     Cell,
+    InstructionSampling,
     NoiseRetry,
     Report,
     SeriesStats,
@@ -176,6 +185,79 @@ def samples_needed(name: str) -> float | None:
     return MIN_SAMPLES_BEYOND_PERCENTILE / beyond
 
 
+def sampling_period(sampling: InstructionSampling | None) -> int | None:
+    """The sampling period a column ran under, or None for an unsampled one."""
+    return sampling.period_nanos if sampling is not None else None
+
+
+def format_period(nanos: int) -> str:
+    """A sampling period, in the unit a reader thinks of it in."""
+    if nanos >= 1_000_000:
+        return f"{nanos / 1_000_000:g} ms"
+    if nanos >= 1_000:
+        return f"{nanos / 1_000:g} µs"
+    return f"{nanos} ns"
+
+
+def describe_sampling(period: int | None) -> str:
+    if period is None:
+        return "not sampled"
+    return f"sampled every {format_period(period)} on each processor"
+
+
+@dataclass(frozen=True)
+class SamplingMismatch:
+    """Two columns a comparison would put side by side, sampled differently.
+
+    Every timing of a sampled column carries the sampler's overhead, so a
+    shift between a sampled column and an unsampled one, or between two
+    sampled at different periods, is partly the sampler: run 38886442613
+    reported a +4.8-8.5% compute regression that was the sampler alone
+    (#475). No verdict is drawn across such a pair.
+    """
+
+    baseline_label: str
+    candidate_label: str
+    baseline_period_nanos: int | None
+    candidate_period_nanos: int | None
+
+    @property
+    def reason(self) -> str:
+        return (
+            f"the baseline {self.baseline_label} was "
+            f"{describe_sampling(self.baseline_period_nanos)} and the candidate "
+            f"{self.candidate_label} was {describe_sampling(self.candidate_period_nanos)}, so "
+            "every shift between them includes the sampler and no verdict can be drawn"
+        )
+
+
+def sampling_mismatch(
+    baseline_label: str,
+    baseline: InstructionSampling | None,
+    candidate_label: str,
+    candidate: InstructionSampling | None,
+) -> SamplingMismatch | None:
+    baseline_period = sampling_period(baseline)
+    candidate_period = sampling_period(candidate)
+    if baseline_period == candidate_period:
+        return None
+    return SamplingMismatch(
+        baseline_label=baseline_label,
+        candidate_label=candidate_label,
+        baseline_period_nanos=baseline_period,
+        candidate_period_nanos=candidate_period,
+    )
+
+
+def cross_run_sampling_mismatch(baseline: Report, candidate: Report) -> SamplingMismatch | None:
+    return sampling_mismatch(
+        f"run {baseline.run.id or 'local'}",
+        baseline.run.instruction_sampling,
+        f"run {candidate.run.id or 'local'}",
+        candidate.run.instruction_sampling,
+    )
+
+
 GATE_TITLES = {
     GateKind.PAIRED: "Paired, one host, one job",
     GateKind.CROSS_RUN: "Cross-run, against the latest `dev` report",
@@ -296,6 +378,10 @@ class GateResult:
     #: commit, so it is not the profiled image the pairing is between and
     #: the comparison is inconclusive (#384).
     underprofiled: list[str]
+    #: The period both columns were sampled at when the run asked for an
+    #: instruction profile, None when neither was. A comparison is only
+    #: built between columns sampled alike, so one value describes both.
+    sampling_period_nanos: int | None
     blocking: bool
     enforced: bool
 
@@ -344,6 +430,10 @@ class GateReport:
 
     paired: GateResult | None
     cross_run: GateResult | None
+    #: Set, with `cross_run` None, when the latest `dev` report and the
+    #: candidate were sampled differently: the cross-run comparison is
+    #: refused and neither blocks nor passes, while the paired one stands.
+    cross_run_refused: SamplingMismatch | None = None
 
     @property
     def results(self) -> list[GateResult]:
@@ -552,6 +642,9 @@ def evaluate(baseline: Report, candidate: Report) -> GateResult:
             "gate compares reports from one lane; "
             f"baseline is {baseline.run.lane}, candidate is {candidate.run.lane}"
         )
+    mismatch = cross_run_sampling_mismatch(baseline, candidate)
+    if mismatch is not None:
+        raise SystemExit(f"the cross-run comparison is refused: {mismatch.reason}")
     floor = noise_floor(baseline, candidate)
     pairs = []
     for workload in candidate.workloads:
@@ -594,6 +687,7 @@ def evaluate(baseline: Report, candidate: Report) -> GateResult:
         # run that was asked to collect a profile per column (#384).
         pgo_uncovered={},
         underprofiled=[],
+        sampling_period_nanos=sampling_period(candidate.run.instruction_sampling),
         blocking=blocks(enforced, floor, bound, [], rows, []),
         enforced=enforced,
     )
@@ -657,6 +751,17 @@ def evaluate_paired(candidate: Report) -> GateResult | None:
             f"the run paired against {short(candidate.run.baseline_git_sha)} but measured no "
             "helios_baseline cell; a paired run without its baseline column is a failed run"
         )
+    # The driver samples both images or neither and refuses a run whose
+    # guests report different periods, so a report that disagrees with
+    # itself was not produced by it — refused rather than read (#475).
+    mismatch = sampling_mismatch(
+        "column",
+        candidate.run.baseline_instruction_sampling,
+        "column",
+        candidate.run.instruction_sampling,
+    )
+    if mismatch is not None:
+        raise SystemExit(f"the paired comparison is refused: {mismatch.reason}")
     floor = noise_floor(candidate)
     pairs = []
     incomplete_headlines = []
@@ -736,13 +841,23 @@ def evaluate_paired(candidate: Report) -> GateResult | None:
         unpaired_metrics=unpaired,
         pgo_uncovered=pgo_uncovered,
         underprofiled=underprofiled,
+        sampling_period_nanos=sampling_period(candidate.run.instruction_sampling),
         blocking=blocks(True, floor, bound, incomplete_headlines, rows, underprofiled),
         enforced=True,
     )
 
 
 def gate_report(candidate: Report, baseline: Report | None) -> GateReport:
+    """Both comparisons the candidate can take part in.
+
+    A `dev` report sampled differently from the candidate — the candidate
+    asked for an instruction profile and `dev`'s run did not, or the other
+    way round — refuses the cross-run comparison and leaves the paired
+    one, whose columns the driver sampled alike, standing.
+    """
+    refused = cross_run_sampling_mismatch(baseline, candidate) if baseline is not None else None
     return GateReport(
         paired=evaluate_paired(candidate),
-        cross_run=evaluate(baseline, candidate) if baseline is not None else None,
+        cross_run=evaluate(baseline, candidate) if baseline is not None and refused is None else None,
+        cross_run_refused=refused,
     )
