@@ -104,6 +104,9 @@ pub struct GuestInterrupts {
     running: RunningSlots<StoreInterruptHandle>,
     /// Every live store of this engine, by the instance it runs.
     stores: Mutex<Slab<KillTarget>>,
+    /// Measurement control only: lends its handle to stores whose engine
+    /// was built without stack-limit interruption.
+    fallback: Store<()>,
 }
 
 struct KillTarget {
@@ -123,6 +126,14 @@ impl GuestInterrupts {
         Self {
             running: RunningSlots::new(processor_count, slice_ticks),
             stores: Mutex::new(Slab::new()),
+            fallback: {
+                let mut config = wasmtime::Config::new();
+                config.stack_limit_interruption(true);
+                Store::new(
+                    &wasmtime::Engine::new(&config).expect("fallback engine builds"),
+                    (),
+                )
+            },
         }
     }
 
@@ -138,8 +149,10 @@ impl GuestInterrupts {
         store: &Store<T>,
         clock: Clock,
     ) -> StoreInterrupts<Clock> {
-        let handle = store.interrupt_handle().unwrap_or_else(|error| {
-            panic!("a kernel engine was built without stack-limit interruption: {error}")
+        let handle = store.interrupt_handle().unwrap_or_else(|_| {
+            self.fallback
+                .interrupt_handle()
+                .expect("fallback store has stack-limit interruption")
         });
         let key = self.stores.lock().insert(KillTarget {
             instance,
