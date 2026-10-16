@@ -19,6 +19,7 @@ pub mod engine;
 pub(crate) mod fiber_stack;
 #[cfg(all(target_os = "none", feature = "wasmtime-bare-metal"))]
 pub mod parking;
+pub(crate) mod preemption;
 pub mod store;
 pub mod swap_fault;
 #[cfg(all(target_os = "none", feature = "wasmtime-bare-metal"))]
@@ -26,6 +27,10 @@ mod sync;
 pub mod tls;
 pub mod wasi;
 pub(crate) mod wasix;
+
+extern crate alloc;
+
+use alloc::sync::Arc;
 
 use bytes::Bytes;
 use helios_hal::cpu::Cpu;
@@ -35,6 +40,7 @@ use wasmtime::{Engine, Module, Precompiled};
 use self::component_host::{
     ComponentBindingSet, HostRuntimeState, StoreData, component_linker, store_with_state,
 };
+use self::preemption::{GuestInterrupts, StoreInterrupts};
 use crate::{
     CompiledComponent, ComponentExecContext, ComponentExecutor, ComponentExitStatus,
     ComponentRunResult, ComponentRuntimeEngine, ComponentRuntimeFactory, ComponentWorld,
@@ -73,40 +79,23 @@ impl WasmtimePrecompiledKind {
     }
 }
 
-/// Wasmtime component runtime engine.
+/// Wasmtime component runtime engine, with the interrupt routes into
+/// every store created from it.
 #[derive(Clone)]
 pub struct WasmtimeEngine {
     engine: Engine,
+    interrupts: Arc<GuestInterrupts>,
 }
 
 impl WasmtimeEngine {
-    pub(crate) fn increment_epoch(&self) {
-        self.engine.increment_epoch();
-    }
-
     pub(crate) fn raw(&self) -> &Engine {
         &self.engine
     }
-}
 
-/// Stash of the program-service engine used by the OOM killer to wake
-/// CPU-bound victims. `crate::instance::request_kill` calls
-/// `bump_user_engine_epoch` so the next epoch check on any executing
-/// wasm fires the store's epoch callback, which observes the kill flag
-/// and traps, even when the victim is in pure wasm without WASI calls.
-///
-/// Wasmtime `Engine` is internally an `Arc`, so storing a clone here
-/// is cheap. The static is initialised once, in
-/// `install_program_service_inner`.
-static OOM_KICK_ENGINE: spin::Once<Engine> = spin::Once::new();
-
-pub(crate) fn register_oom_kick_engine(engine: Engine) {
-    OOM_KICK_ENGINE.call_once(|| engine);
-}
-
-pub(crate) fn bump_user_engine_epoch() {
-    if let Some(engine) = OOM_KICK_ENGINE.get() {
-        engine.increment_epoch();
+    /// The routes the time-slice walk and the kill path take into this
+    /// engine's stores.
+    pub(crate) fn interrupts(&self) -> &Arc<GuestInterrupts> {
+        &self.interrupts
     }
 }
 
@@ -128,6 +117,7 @@ where
     HostFs: HostFileSystem,
 {
     store: wasmtime::Store<StoreData<CpuImpl, Net, HostFs>>,
+    interrupts: StoreInterrupts<CpuImpl>,
     run_func: wasmtime::component::TypedFunc<(), (core::result::Result<(), ()>,)>,
 }
 
@@ -142,12 +132,14 @@ where
     async fn run(mut self) -> Result<ComponentRunResult, Self::Error> {
         let run = self.run_func;
         let turns = self.store.data().guest_turns();
-        let raw = turns
-            .drive(
-                self.store
-                    .run_concurrent(async move |accessor| run.call_concurrent(accessor, ()).await),
-            )
-            .await;
+        let raw =
+            self.interrupts
+                .drive(turns.drive(
+                    self.store.run_concurrent(async move |accessor| {
+                        run.call_concurrent(accessor, ()).await
+                    }),
+                ))
+                .await;
         let (status, exit_code) = interpret_run_result(raw, self.store.data_mut())?;
         let instance_id = self.store.data().instance().id();
         Ok(ComponentRunResult {
@@ -221,7 +213,13 @@ where
 
     fn create_engine(&self) -> Result<Self::Engine, Self::CreateEngineError> {
         let engine = engine::build_component_engine_for_platform(&self.platform)?;
-        Ok(WasmtimeEngine { engine })
+        Ok(WasmtimeEngine {
+            engine,
+            interrupts: Arc::new(GuestInterrupts::new(
+                self.platform.processor_count(),
+                self.platform.timebase(),
+            )),
+        })
     }
 
     async fn instantiate(
@@ -254,8 +252,8 @@ where
             None
         };
 
-        let mut store = store_with_state(
-            &engine.engine,
+        let (mut store, interrupts) = store_with_state(
+            engine,
             StoreData::<CpuImpl, Net, HostFs>::new(
                 wasmtime::component::ResourceTable::new(),
                 context.cpu,
@@ -276,12 +274,16 @@ where
         );
 
         let turns = store.data().guest_turns();
-        let instance = turns
-            .drive(linker.instantiate_async(&mut store, &compiled.component))
+        let instance = interrupts
+            .drive(turns.drive(linker.instantiate_async(&mut store, &compiled.component)))
             .await?;
 
         let run_func = engine::resolve_wasi_cli_run(&compiled.component, &instance, &mut store)?;
 
-        Ok(WasmtimeExecutor { store, run_func })
+        Ok(WasmtimeExecutor {
+            store,
+            interrupts,
+            run_func,
+        })
     }
 }

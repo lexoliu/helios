@@ -92,6 +92,9 @@ pub(super) struct CompilerCoreShared<T> {
     pub(super) instance_pre: spin::Once<Arc<InstancePre<T>>>,
     pub(super) next_thread_id: AtomicI32,
     pub(super) thread_tasks: Mutex<Vec<crate::JoinHandle<CompilerThreadReport>>>,
+    /// The interrupt routes of the engine every compiler store runs on,
+    /// so a kill reaches each of them, the threads' included.
+    pub(super) interrupts: Arc<crate::wasmtime_adapter::preemption::GuestInterrupts>,
 }
 
 #[derive(Clone, Copy)]
@@ -224,27 +227,30 @@ pub(super) fn write_decimal(memory: &SharedMemory, ptr: u32, mut value: u32) -> 
     write_shared_memory(memory, ptr, &digits[..len]).map_or(-1, |_| len as i32)
 }
 
+/// Installs the compiler store's interrupt callback and registers the
+/// store for kills, for as long as the returned registration lives.
+///
+/// The compiler is never preempted: its calls are not driven through
+/// [`crate::wasmtime_adapter::preemption::StoreInterrupts::drive`], so no
+/// processor's running slot ever names it, and what interrupts it is a kill
+/// of its instance. The callback traps that kill, and resumes the compile when it
+/// finds none.
 pub(super) fn configure_compiler_core_store<CpuImpl, Net, HostFs>(
     store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, HostFs>>,
-) where
+) -> crate::wasmtime_adapter::preemption::StoreInterrupts<CpuImpl>
+where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    // The compiler must not be preempted by scheduler epoch ticks, but
-    // epoch bumps are also how the OOM killer wakes a CPU-bound victim,
-    // so extend the deadline tick by tick after checking for a pending
-    // kill. A u64::MAX delta is not "never": wasmtime computes
-    // `deadline = current_epoch + delta`, which wraps into the past as
-    // soon as the engine's epoch has ever advanced and then traps the
-    // very first epoch check with a bare interrupt.
-    store.set_epoch_deadline(1);
-    store.epoch_deadline_callback(|caller| {
+    store.interrupt_callback(|caller| {
         if let Some(reason) = caller.data().instance.pending_kill() {
             return Err(wasmtime::Error::from(crate::InstanceKilled { reason }));
         }
-        Ok(wasmtime::UpdateDeadline::Continue(1))
+        Ok(wasmtime::InterruptAction::Continue)
     });
+    let interrupts = store.data().shared.interrupts.clone();
+    interrupts.register(store.data().instance.id(), store, store.data().cpu.clone())
 }
 
 pub(super) fn compiler_tls_base<CpuImpl, Net, HostFs>(

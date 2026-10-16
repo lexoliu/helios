@@ -155,8 +155,8 @@ where
         &phases::Timeline::disabled(),
     )?;
 
-    let mut store = crate::wasmtime_adapter::store_with_state(
-        service.inner.engine.raw(),
+    let (mut store, interrupts) = crate::wasmtime_adapter::store_with_state(
+        &service.inner.engine,
         StoreData::<CpuImpl, Net, HostFs>::new(
             ResourceTable::new(),
             exec_context.cpu.clone(),
@@ -184,8 +184,8 @@ where
     );
 
     let turns = store.data().guest_turns();
-    let wasm_instance = turns
-        .drive(instance_pre.instantiate_async(&mut store))
+    let wasm_instance = interrupts
+        .drive(turns.drive(instance_pre.instantiate_async(&mut store)))
         .await
         .map_err(map_program_runtime_error)?;
     crate::wasmtime_adapter::component_host::record_linear_memory(&mut store, &wasm_instance);
@@ -194,15 +194,15 @@ where
 
     let mut first = Some(first);
     let turns = store.data().guest_turns();
-    turns
-        .drive(store.run_concurrent(async move |accessor| {
+    interrupts
+        .drive(turns.drive(store.run_concurrent(async move |accessor| {
             let exchange = first.take().expect("the first exchange is dispatched once");
             dispatch_exchange(accessor, &guest, exchange)?;
             while let Some(exchange) = receiver.recv().await {
                 dispatch_exchange(accessor, &guest, exchange)?;
             }
             Ok::<(), wasmtime::Error>(())
-        }))
+        })))
         .await
         .and_then(|result| result)
         .map_err(map_program_runtime_error)

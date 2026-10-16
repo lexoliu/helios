@@ -1633,36 +1633,69 @@ where
     Ok(linker)
 }
 
+/// Interrupts every store of `victim`, whose kill flag was just set, so
+/// a guest that is running meets the condemnation at its next function
+/// entry or loop header, and one in host code or suspended meets it the
+/// moment it is back in wasm.
+///
+/// Programs and kernel plugins run on the program service's engine, and
+/// so does every store a kill can interrupt; before that service is
+/// installed there is none. A system component runs on an engine of its
+/// own, which nothing interrupts: it meets a condemnation where its call
+/// completes.
+pub(crate) fn deliver_kill<CpuImpl, Net, HostFs>(
+    runtime_state: &HostRuntimeState<CpuImpl, Net, HostFs>,
+    victim: InstanceId,
+) where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    HostFs: crate::HostFileSystem,
+{
+    if let Some(service) = runtime_state.program_service() {
+        service.interrupt_instance(victim);
+    }
+}
+
+/// A component store on `engine`, with the interrupt route the
+/// end of a time slice, a kill and the drive of its calls go through.
 pub(crate) fn store_with_state<CpuImpl, Net, HostFs>(
-    engine: &Engine,
+    engine: &crate::wasmtime_adapter::WasmtimeEngine,
     state: StoreData<CpuImpl, Net, HostFs>,
-) -> Store<StoreData<CpuImpl, Net, HostFs>>
+) -> (
+    Store<StoreData<CpuImpl, Net, HostFs>>,
+    crate::wasmtime_adapter::preemption::StoreInterrupts<CpuImpl>,
+)
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    let mut store = Store::new(engine, state);
+    let instance = state.instance().id();
+    let mut store = Store::new(engine.raw(), state);
     store.limiter(|state| state);
     // No call hook. A host call that does not suspend changes nothing
     // the kernel accounts: the processor turn, the user-memory owner and
     // the socket retirements all change hands where the fiber does,
     // which is where `GuestTurns::drive` wraps the call that drives
     // this store.
-    store.set_epoch_deadline(1);
-    // The epoch tick is where a condemned instance traps: a CPU-bound
+    //
+    // An interruption is where a condemned instance traps: a CPU-bound
     // guest makes no host call at all (an AOT compile, say), and the
-    // kill bumps the epoch so a guest that is running meets this at its
-    // next function entry or loop back-edge. Cancelling the future
-    // instead would surface a bare interrupt trap that loses the kill
-    // reason (OOM vs supervisor restart).
-    store.epoch_deadline_callback(|caller| {
+    // kill interrupts every store of its victim, so a guest that is
+    // running meets this at its next function entry or loop header.
+    // Cancelling the future instead would surface a bare interrupt trap
+    // that loses the kill reason (OOM vs supervisor restart). Any other
+    // interruption ends a time slice, and the guest yields.
+    store.interrupt_callback(|caller| {
         if let Some(reason) = caller.data().pending_kill() {
             return Err(wasmtime::Error::from(crate::InstanceKilled { reason }));
         }
-        Ok(wasmtime::UpdateDeadline::Yield(1))
+        Ok(wasmtime::InterruptAction::Yield)
     });
-    store
+    let interrupts = engine
+        .interrupts()
+        .register(instance, &store, store.data().cpu.clone());
+    (store, interrupts)
 }
 
 fn add_system_to_linker<CpuImpl, Net, HostFs>(
@@ -3492,16 +3525,20 @@ where
     })?;
     instance.func_wrap("kill", |caller, (id,): (u64,)| {
         let now = caller.data().now_nanos();
-        // The flag is all this sets: the victim unwinds at its next
-        // yield point, and whoever owns it — a plugin supervisor, or
-        // nobody — decides what happens after.
-        let outcome = caller.data().instance_registry.request_kill(
-            InstanceId::from_raw(id),
-            KillReason::Operator,
-            now,
-        );
+        let victim = InstanceId::from_raw(id);
+        // The flag and the interruption are all this does: the victim
+        // unwinds at its next check, and whoever owns it — a plugin
+        // supervisor, or nobody — decides what happens after.
+        let outcome =
+            caller
+                .data()
+                .instance_registry
+                .request_kill(victim, KillReason::Operator, now);
         Ok((match outcome {
-            KillOutcome::Requested => Ok(()),
+            KillOutcome::Requested => {
+                deliver_kill(&caller.data().runtime_state, victim);
+                Ok(())
+            }
             KillOutcome::AlreadyStopping => {
                 Err(debugger_wit::instances::KillError::AlreadyStopping)
             }

@@ -277,8 +277,8 @@ struct ProcessorRuntime {
     /// This processor's kernel timer, published once its own
     /// `helios_kernel::init` has run so the timer PPI can advance it.
     timer: Once<Timer<Aarch64Cpu>>,
-    /// The component-host program service, published on the processor
-    /// that owns it so the timer PPI can drive epoch interruption.
+    /// The component-host program service, published on every processor
+    /// so the timer PPI can preempt the guest running here.
     program_service: Once<debug_state::ProgramService>,
     /// Device interrupt routes, installed on the bootstrap processor
     /// only: every device SPI is routed to it.
@@ -1196,15 +1196,13 @@ unsafe extern "C" fn aarch64_secondary_main(mp_info: &MpInfo) -> ! {
     );
     let runtime = current_processor_runtime();
     runtime.install_timer(kernel.timer());
-    if let Some(program_service) = helios_kernel::install_component_host_program_service(
-        &kernel,
-        &cpu,
-        &debug_state,
-        read_debug_serial,
-        DEBUG_SERIAL_WRITER,
-    ) {
-        runtime.install_program_service(program_service);
-    }
+    // Every processor's timer preempts the guest running on it, so every
+    // processor holds the service the bootstrap processor installed
+    // before it started this one.
+    let program_service = debug_state.program_service().unwrap_or_else(|| {
+        panic!("AArch64 secondary processor started before program service installation")
+    });
+    runtime.install_program_service(program_service);
     // SAFETY: this processor's CPU interface is initialised and its
     // timer is published; device interrupts are routed to the
     // bootstrap processor, so only private interrupts arrive here.
@@ -1414,8 +1412,10 @@ extern "C" fn aarch64_handle_irq() {
             // The wake carries no payload: returning from `wfi` is the
             // whole message, and `park_current` owns the flag.
         } else if intid == gic::VIRTUAL_TIMER_PPI {
+            // Every processor's timer interrupt ends the slice of every
+            // guest on the machine that has run one.
             if let Some(program_service) = runtime.program_service.get() {
-                program_service.increment_epoch();
+                program_service.preempt_overdue_guests();
             }
             runtime
                 .timer

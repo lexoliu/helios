@@ -5,13 +5,54 @@ at `../wasmtime/crates/wasmtime`.
 
 ## Required revision
 
-The local checkout must be at (branch `helios/parallel-compile-steal`):
+The local checkout must be at (branch `helios/stack-limit-interrupt`):
 
 ```text
-f5a2d7baf50962ae777c29ecc792f0eed501c75d
+9d41e8b3ab259c394c099d62c61600f366ef3017
 ```
 
-That revision is `helios/pooling-host-stack` at
+That revision is `helios/parallel-compile-steal` at
+`f5a2d7baf50962ae777c29ecc792f0eed501c75d` plus two additive commits, which
+add resumable stack-limit interruption (#456):
+
+- `Config::stack_limit_interruption(bool)` (a `Tunables` flag that takes part
+  in the cwasm compatibility check) makes Cranelift compare the stack pointer
+  against `VMStoreContext::stack_limit` at every loop header, every
+  bulk-memory chunk and the entry of every function that can call wasm
+  (`call`, `call_indirect`, `call_ref` and their tail forms, found by a
+  pre-scan of the body), and call the `stack_limit_interrupt` builtin when
+  the compare fails instead of trapping. A function that calls no wasm runs
+  for bounded time outside its loops, so it keeps only the ordinary ISA
+  prologue overflow check, made against `VMStoreContext::real_stack_limit`,
+  which never holds the interrupt sentinel; Cranelift omits that check for a
+  leaf with no frame, so such a leaf compiles exactly as with no interruption
+  at all. `Engine::new` refuses the option together with epoch interruption,
+  with stack switching and on Pulley.
+- `Store::interrupt_handle()` returns a `Send + Sync` `StoreInterruptHandle`
+  whose `interrupt()` sets a pending flag and raises the limit to a sentinel,
+  with no lock and no allocation, so an interrupt handler may call it. The
+  `VMStoreContext` lives in an `Arc` the handle keeps alive.
+- Every writer of the limit (entering and leaving wasm, fiber switches)
+  re-raises the sentinel while an interrupt is pending, so an interrupt
+  requested in host code or on a suspended fiber is delivered at the next
+  check in wasm.
+- The builtin clears the flag, restores the real limit, runs the store's
+  `Store::interrupt_callback` (`InterruptAction::Continue`, `Yield`, or an
+  error), and then traps with a stack overflow if the stack pointer is
+  really below the limit.
+
+Helios needs it because the epoch checks it replaces cost 10–29% on every
+compute workload (paired run 38745522065): a full check on every function
+entry, a cached check at every loop header, and two variables live across
+every body. The second commit keeps call-free functions leaf: the first made
+every function entry an explicit check whose cold path is a call, which
+turned every leaf into a non-leaf and left the guest 6–31% slower than an
+interruption-free build (paired run 38821832333), while the loop-header
+checks cost nothing measurable (paired run 38834037272).
+
+The revision it replaces is `helios/parallel-compile-steal` at
+`f5a2d7baf50962ae777c29ecc792f0eed501c75d`, which is
+`helios/pooling-host-stack` at
 `7a17b5375af44664392d2a550e9724be0f1946c4` plus one additive commit, which
 makes every parallel compile input its own stealable job:
 

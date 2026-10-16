@@ -371,6 +371,7 @@ where
                 exec_context.timer,
                 spawner.clone(),
                 exec_context.runtime_state,
+                engine.interrupts().clone(),
                 launched_instance,
                 exec_context.parent_instance_id,
                 argv,
@@ -388,7 +389,7 @@ where
                 wasix_abi,
             ),
         );
-        configure_preview1_program_store(&mut store);
+        let interrupts = configure_preview1_program_store(&mut store);
         record_program_kernel_profile_sample(store_prepare_profile, "core-store-prepare");
         timeline.record(&run_cpu, LaunchPhase::StorePrepare);
 
@@ -408,8 +409,8 @@ where
             );
             let instantiate_started = profile_cpu.now().ticks();
             let turns = store.data().guest_turns();
-            let instance = turns
-                .drive(linker.instantiate_async(&mut store, &compiled.module))
+            let instance = interrupts
+                .drive(turns.drive(linker.instantiate_async(&mut store, &compiled.module)))
                 .await;
             record_named_program_kernel_profile(
                 &profile_runtime_state,
@@ -481,8 +482,8 @@ where
             );
             let instantiate_started = profile_cpu.now().ticks();
             let turns = store.data().guest_turns();
-            let instance = turns
-                .drive(instance_pre.instantiate_async(&mut store))
+            let instance = interrupts
+                .drive(turns.drive(instance_pre.instantiate_async(&mut store)))
                 .await;
             record_named_program_kernel_profile(
                 &profile_runtime_state,
@@ -531,8 +532,10 @@ where
         timeline.record(&run_cpu, LaunchPhase::GuestBegin);
         let result = loop {
             let turns = store.data().guest_turns();
-            let result = turns.drive(start.call_async(&mut store, ())).await;
-            if handle_wasix_asyncify_completion(&mut store, &instance).await? {
+            let result = interrupts
+                .drive(turns.drive(start.call_async(&mut store, ())))
+                .await;
+            if handle_wasix_asyncify_completion(&mut store, &interrupts, &instance).await? {
                 continue;
             }
             break result;
@@ -683,6 +686,7 @@ where
                 exec_context.timer,
                 spawner.clone(),
                 exec_context.runtime_state,
+                engine.interrupts().clone(),
                 launched_instance,
                 exec_context.parent_instance_id,
                 argv,
@@ -700,7 +704,7 @@ where
                 wasix_abi,
             ),
         );
-        configure_preview1_program_store(&mut store);
+        let interrupts = configure_preview1_program_store(&mut store);
         record_program_kernel_profile_sample(store_prepare_profile, "core-store-prepare-rewind");
         timeline.record(&run_cpu, LaunchPhase::StorePrepare);
 
@@ -725,8 +729,8 @@ where
         );
         let instantiate_started = profile_cpu.now().ticks();
         let turns = store.data().guest_turns();
-        let instance = turns
-            .drive(linker.instantiate_async(&mut store, &compiled.module))
+        let instance = interrupts
+            .drive(turns.drive(linker.instantiate_async(&mut store, &compiled.module)))
             .await;
         record_named_program_kernel_profile(
             &profile_runtime_state,
@@ -746,7 +750,7 @@ where
         super::emit_program_stage_marker(exec_context.write_serial, "program:instantiate-core-ok");
 
         let rewind_profile = start_program_kernel_profile(&profile_runtime_state, &profile_cpu);
-        wasix_begin_rewind(&mut store, &instance, restore.rewind).await?;
+        wasix_begin_rewind(&mut store, &interrupts, &instance, restore.rewind).await?;
         record_program_kernel_profile_sample(rewind_profile, "core-begin-rewind");
 
         let resolve_start_profile =
@@ -777,8 +781,10 @@ where
         timeline.record(&run_cpu, LaunchPhase::GuestBegin);
         let result = loop {
             let turns = store.data().guest_turns();
-            let result = turns.drive(start.call_async(&mut store, ())).await;
-            if handle_wasix_asyncify_completion(&mut store, &instance).await? {
+            let result = interrupts
+                .drive(turns.drive(start.call_async(&mut store, ())))
+                .await;
+            if handle_wasix_asyncify_completion(&mut store, &interrupts, &instance).await? {
                 continue;
             }
             break result;
@@ -919,8 +925,8 @@ where
         }
         None => DebugFileSystem::new(exec_context.runtime_state.clone()),
     };
-    let mut store = crate::wasmtime_adapter::store_with_state(
-        engine.raw(),
+    let (mut store, interrupts) = crate::wasmtime_adapter::store_with_state(
+        engine,
         StoreData::<CpuImpl, Net, HostFs>::new(
             wasmtime::component::ResourceTable::new(),
             exec_context.cpu,
@@ -952,8 +958,8 @@ where
         .then(|| profile_cpu.now().ticks());
     timeline.record(&run_cpu, LaunchPhase::StorePrepare);
     let turns = store.data().guest_turns();
-    let instance = turns
-        .drive(instance_pre.instantiate_async(&mut store))
+    let instance = interrupts
+        .drive(turns.drive(instance_pre.instantiate_async(&mut store)))
         .await;
     timeline.record(&run_cpu, LaunchPhase::Instantiate);
     if let Some(instantiate_instance_started) = instantiate_instance_started {
@@ -987,7 +993,11 @@ where
                 resolve_started,
             );
         }
-        resolved.map(|run_func| crate::wasmtime_adapter::WasmtimeExecutor { store, run_func })
+        resolved.map(|run_func| crate::wasmtime_adapter::WasmtimeExecutor {
+            store,
+            interrupts,
+            run_func,
+        })
     });
     record_program_kernel_profile(
         &profile_runtime_state,
@@ -1036,6 +1046,7 @@ where
 
 pub(super) async fn handle_wasix_asyncify_completion<CpuImpl, Net, HostFs>(
     store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+    interrupts: &StoreInterrupts<CpuImpl>,
     instance: &wasmtime::Instance,
 ) -> Result<bool, ProgramExecError>
 where
@@ -1077,7 +1088,7 @@ where
                     }
                 })?;
             let rewind_stack = preview1_read_memory(memory, unwind_stack_begin, unwind_len)?;
-            wasix_call_instance_func0(store, instance, "asyncify_stop_unwind").await?;
+            wasix_call_instance_func0(store, interrupts, instance, "asyncify_stop_unwind").await?;
 
             let hash = wasix_next_stack_hash(store);
             let snapshot_bytes = wasix_stack_snapshot_bytes(ret_value, hash);
@@ -1118,6 +1129,7 @@ where
                 });
             wasix_begin_rewind(
                 store,
+                interrupts,
                 instance,
                 WasixRewind {
                     stack_lower,
@@ -1136,7 +1148,7 @@ where
             value,
             stack_lower,
         } => {
-            wasix_call_instance_func0(store, instance, "asyncify_stop_unwind").await?;
+            wasix_call_instance_func0(store, interrupts, instance, "asyncify_stop_unwind").await?;
             let snapshot = store
                 .data()
                 .asyncify
@@ -1151,6 +1163,7 @@ where
             let stack_upper = wasix_global_u32_from_instance(store, instance, "__heap_base")?;
             wasix_begin_rewind(
                 store,
+                interrupts,
                 instance,
                 WasixRewind {
                     stack_lower,
@@ -1191,7 +1204,7 @@ where
                     }
                 })?;
             let rewind_stack = preview1_read_memory(memory, unwind_stack_begin, unwind_len)?;
-            wasix_call_instance_func0(store, instance, "asyncify_stop_unwind").await?;
+            wasix_call_instance_func0(store, interrupts, instance, "asyncify_stop_unwind").await?;
             let child_pid = spawn_wasix_fork_child(
                 store,
                 stack_lower,
@@ -1226,6 +1239,7 @@ where
             }
             wasix_begin_rewind(
                 store,
+                interrupts,
                 instance,
                 WasixRewind {
                     stack_lower,
@@ -1265,7 +1279,7 @@ where
                     }
                 })?;
             let rewind_stack = preview1_read_memory(memory, unwind_stack_begin, unwind_len)?;
-            wasix_call_instance_func0(store, instance, "asyncify_stop_unwind").await?;
+            wasix_call_instance_func0(store, interrupts, instance, "asyncify_stop_unwind").await?;
             let snapshot = wasix_capture_process_snapshot(
                 store,
                 stack_lower,
@@ -1282,6 +1296,7 @@ where
             store.data_mut().asyncify.process_snapshot_rewinding = true;
             wasix_begin_rewind(
                 store,
+                interrupts,
                 instance,
                 WasixRewind {
                     stack_lower,
@@ -1300,6 +1315,7 @@ where
 
 pub(super) async fn wasix_begin_rewind<CpuImpl, Net, HostFs>(
     store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+    interrupts: &StoreInterrupts<CpuImpl>,
     instance: &wasmtime::Instance,
     rewind: WasixRewind,
 ) -> Result<(), ProgramExecError>
@@ -1375,7 +1391,14 @@ where
         });
     }
     store.data_mut().asyncify.rewind_value = value;
-    wasix_call_instance_func1(store, instance, "asyncify_start_rewind", stack_lower).await?;
+    wasix_call_instance_func1(
+        store,
+        interrupts,
+        instance,
+        "asyncify_start_rewind",
+        stack_lower,
+    )
+    .await?;
     Ok(())
 }
 
@@ -1652,6 +1675,7 @@ pub(super) fn wasix_stack_snapshot_bytes(user: u32, hash: u128) -> [u8; WASIX_ST
 
 pub(super) async fn wasix_call_instance_func0<CpuImpl, Net, HostFs>(
     store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+    interrupts: &StoreInterrupts<CpuImpl>,
     instance: &wasmtime::Instance,
     name: &str,
 ) -> Result<(), ProgramExecError>
@@ -1667,14 +1691,15 @@ where
             detail: ProgramExecErrorDetail::UnwindExportInvalid,
         })?;
     let turns = store.data().guest_turns();
-    turns
-        .drive(function.call_async(&mut *store, ()))
+    interrupts
+        .drive(turns.drive(function.call_async(&mut *store, ())))
         .await
         .map_err(map_program_runtime_error)
 }
 
 pub(super) async fn wasix_call_instance_func1<CpuImpl, Net, HostFs>(
     store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+    interrupts: &StoreInterrupts<CpuImpl>,
     instance: &wasmtime::Instance,
     name: &str,
     value: u32,
@@ -1691,8 +1716,8 @@ where
             detail: ProgramExecErrorDetail::UnwindExportInvalid,
         })?;
     let turns = store.data().guest_turns();
-    turns
-        .drive(function.call_async(&mut *store, value as i32))
+    interrupts
+        .drive(turns.drive(function.call_async(&mut *store, value as i32)))
         .await
         .map_err(map_program_runtime_error)
 }

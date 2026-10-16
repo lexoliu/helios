@@ -470,7 +470,7 @@ fn build_engine_config(target: &str, hint: AotCompileHint, worker_count: usize) 
     config.wasm_branch_hinting(true);
     config.concurrency_support(true);
     config.parallel_compilation(worker_count > 1);
-    config.epoch_interruption(true);
+    config.stack_limit_interruption(true);
     // Wasmtime validates `max_wasm_stack <= async_stack_size`; keep the async
     // fiber stack comfortably above the wasm stack limit with host headroom.
     config.max_wasm_stack(8 * 1024 * 1024);

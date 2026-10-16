@@ -60,11 +60,11 @@ const APIC_TIMER_CALIBRATION_MICROS: u64 = 10_000;
 ///
 /// The scheduler tick is 10 ms (100 Hz), ten times too coarse to split a
 /// workload's time between functions, and raising it would also raise the
-/// Wasmtime epoch rate and change how often guests yield. Sampling
+/// guest preemption rate and change how often guests yield. Sampling
 /// therefore shortens the period by this factor and runs the scheduler's
-/// work — watchdog, epoch, kernel timer — on every tenth interrupt only,
-/// so a profiled run keeps the scheduling an unprofiled one has and is
-/// sampled at 1 kHz per processor.
+/// work — watchdog, guest preemption, kernel timer — on every tenth
+/// interrupt only, so a profiled run keeps the scheduling an unprofiled
+/// one has and is sampled at 1 kHz per processor.
 const SAMPLES_PER_SCHEDULER_TICK: u32 = 10;
 const APIC_TIMER_DIVIDE_BY_ONE: u32 = 0b1011;
 const APIC_TIMER_MASKED: u64 = 1 << 16;
@@ -954,8 +954,10 @@ pub(crate) fn handle_local_timer_interrupt(interrupted: usize) {
         return;
     }
     runtime.watchdog.pet();
+    // Every processor's tick ends the slice of every guest on the machine
+    // that has run one, so the slice does not need its own interrupt.
     if let Some(service) = runtime.program_service.get() {
-        service.increment_epoch();
+        service.preempt_overdue_guests();
     }
     runtime
         .timer

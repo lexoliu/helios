@@ -17,6 +17,39 @@ use helios_hal::cpu::{Cpu, Instant};
 use objectpool::Pool;
 use triomphe::Arc;
 
+/// How long a guest holds its processor before it is preempted and
+/// yields to the executor.
+///
+/// This is a scheduling policy, the same on every backend and
+/// independent of the processor count. 2.5 ms is the yield interval the
+/// x86-64 bench lane's guests had when each of its four processors'
+/// 100 Hz ticks interrupted every running guest, and sits at Linux's
+/// EEVDF base slice on a four-processor machine (0.75 ms scaled by
+/// `1 + log2(4)`, 2.25 ms; the CFS minimum granularity it replaced
+/// scaled the same way to 3 ms). A longer slice delays every instance
+/// that shares a processor with a CPU-bound one by that much more before
+/// its next turn; a shorter one spends more processor time on yields.
+///
+/// No hardware timer runs at the slice. Every processor's timer
+/// interrupt walks every processor's running guest and interrupts each
+/// one that has run for at least a slice
+/// (`wasmtime_adapter::preemption`), so the slice is enforced by
+/// whichever processor's interrupt comes first after it ends: a guest
+/// yields at the first timer interrupt anywhere on the machine at or
+/// after one slice into its run. The effective slice is this constant
+/// rounded up to that interrupt:
+///
+/// - x86-64, where each processor's local APIC ticks every 10 ms with
+///   an unsynchronised phase: between one slice and one slice plus the
+///   largest gap between consecutive ticks of all processors. On four
+///   processors with evenly staggered ticks that is 2.5–5 ms; on one
+///   processor it is 2.5–12.5 ms, because a run that starts less than a
+///   slice before a tick is not yet due at that tick.
+/// - aarch64 and riscv64, whose timer interrupt is this [`Timer`]'s
+///   deadline: the processor's next sleep, and otherwise the scheduler
+///   interrupt interval (100 ms) after its last executor pass, so a
+///   machine with no sleeps pending checks the slice that rarely.
+pub const GUEST_TIME_SLICE: Duration = Duration::from_micros(2_500);
 const SCHEDULER_INTERRUPT_INTERVAL: Duration = Duration::from_millis(100);
 const TIMER_WHEEL_QUANTUM: Duration = Duration::from_micros(50);
 const TIMER_WHEEL_LEVELS: usize = 4;

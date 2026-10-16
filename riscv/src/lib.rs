@@ -583,8 +583,10 @@ fn trap_dispatch(tf: &mut TrapFrame) {
     }
     match riscv::register::scause::read().cause().try_into() {
         Ok(Trap::Interrupt(Interrupt::SupervisorTimer)) => {
+            // Every hart's timer interrupt ends the slice of every guest
+            // on the machine that has run one.
             if let Some(program_service) = current_hart_runtime().program_service.as_ref() {
-                program_service.increment_epoch();
+                program_service.preempt_overdue_guests();
             }
             current_hart_runtime().timer.handle_interrupt();
         }
@@ -857,14 +859,22 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
         trap_stack: trap::allocate_trap_stack(),
     };
     hart_runtime.install();
+    // Every hart's timer preempts the guest running on it, so every hart
+    // holds the service: the bootstrap hart installs it, and the others,
+    // which it starts only afterwards, take the installed one.
     let program_service = helios_kernel::install_component_host_program_service(
         &kernel,
         &cpu,
         &debug_state,
         read_debug_serial,
         DEBUG_SERIAL_WRITER,
-    );
-    hart_runtime.program_service = program_service;
+    )
+    .unwrap_or_else(|| {
+        debug_state.program_service().unwrap_or_else(|| {
+            panic!("RISC-V hart {hart_id} started before program service installation")
+        })
+    });
+    hart_runtime.program_service = Some(program_service);
     unsafe {
         configure_interrupts();
     }
