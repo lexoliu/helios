@@ -388,6 +388,24 @@ run_smoke \
     -c \
     '/bin/wasix-thread-trap main; echo main-trap:exit=$?; /bin/wasix-thread-trap; echo thread-trap:exit=$?'
 
+# Only bytes from the boot payload load without a signature check; a
+# cwasm a guest writes must verify (#483). CPython copies a bootfs cwasm
+# unchanged to /copy, which still verifies and runs, and with one
+# signature byte flipped to /forged, which must be refused.
+run_smoke \
+    unsigned-cwasm \
+    copy:ran \
+    forged:refused \
+    -- \
+    --boot-program dash \
+    --boot-program debugger \
+    --boot-program python3 \
+    --boot-program wasix-atomic-wait-timeout \
+    --no-compiler-plugin \
+    shell \
+    -c \
+    'python3 -c "import pathlib; b = pathlib.Path(\"/bin/wasix-atomic-wait-timeout\").read_bytes(); pathlib.Path(\"/copy\").write_bytes(b); f = bytearray(b); f[-13] ^= 1; pathlib.Path(\"/forged\").write_bytes(bytes(f))"; /copy && echo copy:ran; /forged && echo forged:ran || echo forged:refused'
+
 run_smoke \
     cpython \
     '{"ok":"a"}' \

@@ -21,4 +21,9 @@ impl EmbeddedComponent {
     pub const fn bytes(&self) -> &'static [u8] {
         self.bytes
     }
+
+    /// The component's bytes, carrying their boot-payload provenance.
+    pub const fn bootfs_bytes(&self) -> crate::BootfsBytes {
+        crate::BootfsBytes::from_image(self.bytes)
+    }
 }

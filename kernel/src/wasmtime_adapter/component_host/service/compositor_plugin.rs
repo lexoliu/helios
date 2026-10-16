@@ -155,7 +155,7 @@ fn desktop_refusal(runtime_state: &impl ComponentRuntimeState) -> Option<Desktop
 async fn run_compositor_supervisor<CpuImpl, Net, HostFs>(
     service: UserProgramService<CpuImpl, Net, HostFs>,
     exec_context: ProgramExecContext<CpuImpl, Net, HostFs>,
-    artifact: Bytes,
+    artifact: BootfsBytes,
     receiver: ProviderReceiver<SurfaceRequest>,
 ) where
     CpuImpl: Cpu + Clone,
@@ -203,7 +203,7 @@ async fn run_compositor_supervisor<CpuImpl, Net, HostFs>(
 async fn run_compositor_once<CpuImpl, Net, HostFs>(
     service: &UserProgramService<CpuImpl, Net, HostFs>,
     exec_context: &ProgramExecContext<CpuImpl, Net, HostFs>,
-    artifact: &Bytes,
+    artifact: &BootfsBytes,
     receiver: &ProviderReceiver<SurfaceRequest>,
 ) -> Result<(), ProgramExecError>
 where

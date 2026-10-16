@@ -57,8 +57,8 @@ pub use audio::{
     PERIODS_IN_FLIGHT, PeriodRing, PeriodWriter, PlaybackFormat, install_audio_device,
 };
 pub use bootfs::{
-    BootDirectory, BootDirectoryEntry, BootDirectoryHandleExt, BootFile, EmbeddedBootDirectory,
-    EmbeddedBootFile, EmbeddedBootFs,
+    BootDirectory, BootDirectoryEntry, BootDirectoryHandleExt, BootFile, BootfsBytes,
+    EmbeddedBootDirectory, EmbeddedBootFile, EmbeddedBootFs,
 };
 pub(crate) use component::ComponentCache;
 pub use component::{
