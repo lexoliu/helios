@@ -828,6 +828,39 @@ jobs:
           grep -Fqx thread-proc-exit:exiting "$runtime/guest.log"
           grep -Fqx thread-proc-exit:exit=7 "$runtime/guest.log"
           ! grep -Fq 'Kernel panic' "$runtime/guest.log"
+      - name: Replace a process from proc_exec on a spawned thread
+        # An exec on a thread that is dropped leaves main parked and
+        # hangs here, not in a later step.
+        timeout-minutes: 5
+        shell: bash
+        working-directory: helios
+        run: |
+          # Without this the step reports tee's status, not the
+          # command's, and a runner script that fails is invisible.
+          set -o pipefail
+          # POSIX execve replaces the whole process from any thread
+          # (#470). Main parks forever in memory.atomic.wait32 and a
+          # spawned thread execs /bin/dash -c 'echo thread-exec:replaced':
+          # every thread must end, the replacement must run in the
+          # process and exit 0, and the shell's echo after it proves the
+          # output closed.
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/thread-exec"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+            --accel kvm \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger \
+            --boot-program wasix-thread-exec --no-compiler-plugin \
+            shell --trace-log "$runtime/guest-tracing.log" \
+            -c '/bin/wasix-thread-exec; echo thread-exec:exit=$?' \
+            2>&1 > "$runtime/guest.log" | tee "$runtime/inspector.log"
+          cat "$runtime/guest.log"
+          grep -Fqx thread-exec:spawned "$runtime/guest.log"
+          grep -Fqx thread-exec:parking "$runtime/guest.log"
+          grep -Fqx thread-exec:exec "$runtime/guest.log"
+          grep -Fqx thread-exec:replaced "$runtime/guest.log"
+          grep -Fqx thread-exec:exit=0 "$runtime/guest.log"
+          ! grep -Fq 'Kernel panic' "$runtime/guest.log"
       - name: Fetch over virtio-net with curl
         shell: bash
         working-directory: helios
