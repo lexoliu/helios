@@ -5,13 +5,71 @@ at `../wasmtime/crates/wasmtime`.
 
 ## Required revision
 
-The local checkout must be at (branch `helios/stack-limit-interrupt`):
+The local checkout must be at (branch `helios/parking-wait-cancel`):
 
 ```text
-9d41e8b3ab259c394c099d62c61600f366ef3017
+2fb47b20c7ff9a91b6dbc03062d1dd4dddab4969
 ```
 
-That revision is `helios/parallel-compile-steal` at
+That revision is `helios/parking-wait-timeout` at
+`3741766da8e691dfa9e642ab9f16cfb30c1fc5a3` plus one additive commit
+(written on that branch's earlier `62bf033a` and merged forward), which
+gives a `no_std` `memory.atomic.wait` a cancellation exit (#445):
+
+- The `no_std` parking hook becomes
+  `wasmtime_parking_wait(timeout_nanos: u64) -> bool`. It returns `true`
+  when the embedder cancelled the wait, so the waiting thread must unwind
+  instead of parking again. `park_current_thread` passes that through, and
+  on `std` it is always `false`.
+- `ParkingSpot::wait` takes the table lock back after a cancelled park and
+  returns a new `WaitResult::Cancelled`, never `Ok`. A waiter that no
+  notify reached is removed from its queue, so no later notify counts it;
+  one that a notify already dequeued stays counted by that notify. Either
+  way every notify count names a waiter that really was queued and woken.
+- The `memory_atomic_wait32/64` libcalls turn `Cancelled` into an
+  `Err(wasmtime::AtomicWaitCancelled)`, so the instruction traps and the
+  fiber unwinds through the normal trap path. The error is not a `Trap`,
+  so an embedder can tell it from a guest fault by downcasting. The public
+  `SharedMemory::atomic_wait32/64` keep their signature and return
+  `WaitResult::Cancelled` as a value.
+
+Helios needs it because a kill or a WASIX signal ends a suspended guest by
+dropping its call, and a guest parked in `memory.atomic.wait` is suspended
+inside `block_on_current_fiber` with no way out: that drop resumed the
+fiber with `Cancelled`, and the kernel's hook could only panic. Each
+bare-metal backend's `wasmtime_parking_wait` now returns
+`park_wasmtime_waiter`'s result, which is `true` exactly when the turn
+dropped the call.
+
+The revision it replaces is `helios/parking-wait-timeout` at
+`3741766da8e691dfa9e642ab9f16cfb30c1fc5a3`, which is
+`helios/stack-limit-interrupt` at
+`9d41e8b3ab259c394c099d62c61600f366ef3017` plus one additive commit
+(written on that branch's earlier `913a5426` and merged forward), which
+makes a timed `memory.atomic.wait` time out on `no_std` (#455):
+
+- A `no_std` build declares a third parking hook,
+  `wasmtime_monotonic_nanos() -> u64`, next to `wasmtime_parking_wait` and
+  `wasmtime_parking_unpark` and under the same `threads` condition. It reads
+  a monotonic clock that every waiting thread shares.
+- `parking_spot::deadline_after` turns a wait's timeout into an absolute
+  deadline for both builds (`Instant` on `std`, a `MonotonicDeadline` of
+  clock nanoseconds on `no_std`), and `SharedMemory::atomic_wait32/64` use
+  it instead of a cfg split. A deadline that does not fit means no timeout,
+  as before.
+- Every pass of the wait loop parks only for the time left until the
+  deadline, and returns `WaitResult::TimedOut` once the clock reaches it.
+  Before, the `no_std` loop carried the relative timeout and re-parked for
+  all of it after every return, so it never timed out.
+
+Helios needs it because a timed `memory.atomic.wait32/64`, and so every
+futex-backed timed wait in a threaded guest (a condvar `wait_timeout`),
+only ended when notified. Each bare-metal backend exports
+`wasmtime_monotonic_nanos` from its processor timer's `Cpu` timebase.
+
+The revision it replaces is `helios/stack-limit-interrupt` at
+`9d41e8b3ab259c394c099d62c61600f366ef3017`, which is
+`helios/parallel-compile-steal` at
 `f5a2d7baf50962ae777c29ecc792f0eed501c75d` plus two additive commits, which
 add resumable stack-limit interruption (#456):
 

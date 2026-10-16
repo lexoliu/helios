@@ -110,12 +110,13 @@ where
         Some(imported_memory.clone()),
         Some(filesystem),
         Some(descriptors),
-        signal_state.clone(),
+        signal_state,
         caller.data().signal_dispositions.clone(),
         Some(compiled.clone()),
         wasix_abi,
     );
     store_data.set_thread_id(tid);
+    let thread_signals = store_data.thread_signals.clone();
     // Spawn before the thread is recorded: a thread the executor has no
     // capacity for must not be left in the table for `thread_join` to
     // wait on forever.
@@ -130,7 +131,9 @@ where
         );
         return p1::errno::NOMEM;
     }
-    caller.data_mut().insert_thread(tid, signal_state, exit_rx);
+    caller
+        .data_mut()
+        .insert_thread(tid, thread_signals, exit_rx);
     p1::errno::SUCCESS
 }
 
@@ -295,7 +298,7 @@ where
     if caller.data().threads[index].completed.is_some() {
         return Ok(p1::errno::SRCH);
     }
-    caller.data().threads[index].signal_state.raise(signal);
+    caller.data().threads[index].signals.raise(signal);
     Ok(p1::errno::SUCCESS)
 }
 

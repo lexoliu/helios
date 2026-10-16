@@ -20,9 +20,29 @@
 //! Wasmtime dropped its lock and before this hook armed has already moved
 //! the generation past that value, so the wait returns at once instead of
 //! losing the wake.
+//!
+//! A timed wait ends on Wasmtime's side, not here: `ParkingSpot` turns the
+//! guest's timeout into an absolute deadline on `wasmtime_monotonic_nanos`
+//! and parks only for the time that remains until it, so a return that was
+//! neither its notify nor its deadline parks again for the remainder, and a
+//! return at the deadline yields `TimedOut`. That clock is the processor's
+//! `Cpu` timebase, the one every `Timer` reads.
+//!
+//! A parked waiter is also where a kill or a signal finds a guest that
+//! cannot run. Its fiber is suspended inside the guest call, so the turn
+//! driving that call ([`crate::component::GuestTurns::drive`]) has armed its
+//! waits on the instance's condemnation and on the store's own stop before
+//! it last tested them, and when either is raised it drops the call. That
+//! is Wasmtime's cancellation: the fiber is resumed only to unwind, and
+//! `block_on_current_fiber` returns `Cancelled` here. The hook reports the
+//! cancellation, `ParkingSpot` ends the wait `Cancelled` and takes the
+//! waiter off its queue unless a notify already dequeued it, and the
+//! `memory.atomic.wait` libcall traps
+//! with `wasmtime::AtomicWaitCancelled`, which unwinds the fiber through
+//! Wasmtime's normal trap path. The turn has already ended the call with
+//! the kill or the signal, so that trap is never what the instance reports.
 
 use core::sync::atomic::{AtomicU64, Ordering};
-use core::time::Duration;
 
 use futures::future::select;
 use helios_hal::cpu::Cpu;
@@ -63,12 +83,17 @@ pub fn unpark_wasmtime_waiters() {
 /// Body of `wasmtime_parking_wait`: gives the processor back until an
 /// unpark or until `timeout_nanos` pass. `timer` is the calling
 /// processor's timer; `u64::MAX` means no timeout.
-pub fn park_wasmtime_waiter<CpuImpl>(timer: &Timer<CpuImpl>, timeout_nanos: u64)
+///
+/// Returns `true` when the waiting fiber was cancelled while it was
+/// parked, the guest call it runs having been dropped by its turn for a
+/// kill or a signal, and `false` for every other return.
+#[must_use = "a cancelled park must reach Wasmtime so the fiber unwinds"]
+pub fn park_wasmtime_waiter<CpuImpl>(timer: &Timer<CpuImpl>, timeout_nanos: u64) -> bool
 where
     CpuImpl: Cpu + Clone + Send + Sync + 'static,
 {
     if timeout_nanos == 0 {
-        return;
+        return false;
     }
     let frame = 0u8;
     let (parked, returned_at) = crate::memory::fiber_parking(core::ptr::addr_of!(frame) as usize);
@@ -76,21 +101,33 @@ where
     let generation = parked.generation.load(Ordering::Acquire);
     if generation != returned_at.load(Ordering::Relaxed) {
         returned_at.store(generation, Ordering::Relaxed);
-        return;
+        return false;
     }
     let wait = async move {
         if timeout_nanos == u64::MAX {
             unparked.await;
         } else {
-            let timeout = core::pin::pin!(timer.sleep_for(Duration::from_nanos(timeout_nanos)));
+            // Rounded up to a whole tick: a sleep that ended short of the
+            // deadline Wasmtime measures against would return it to the
+            // loop with a sub-tick remainder, which rounds down to a sleep
+            // that is already due, and the fiber would spin until the clock
+            // caught up.
+            let ticks = timer
+                .cpu()
+                .timebase()
+                .nanos_to_ticks_ceil_saturating(timeout_nanos);
+            let timeout = core::pin::pin!(timer.sleep_until(timer.now().saturating_add(ticks)));
             select(unparked, timeout).await;
         }
     };
     // SAFETY: Wasmtime calls this hook from host code on the waiting
     // fiber with its parking-table lock released and no store borrow
     // live across the call, and the future borrows nothing on the fiber.
-    match unsafe { wasmtime::block_on_current_fiber(wait) } {
-        Ok(()) => {}
+    let cancelled = match unsafe { wasmtime::block_on_current_fiber(wait) } {
+        Ok(()) => false,
+        // The turn dropped the call; Wasmtime resumed the fiber only so
+        // it can unwind, which reporting the cancellation lets it do.
+        Err(BlockOnCurrentFiberError::Cancelled(_)) => true,
         Err(BlockOnCurrentFiberError::NoFiber) => panic!(
             "Wasmtime parking wait outside a Wasmtime fiber: every wasm thread that can wait \
              must run under call_async"
@@ -99,10 +136,18 @@ where
             "Wasmtime parking wait on a fiber that cannot block: the engine lacks \
              block_on_current_fiber or the fiber's future context is gone"
         ),
-        Err(BlockOnCurrentFiberError::Cancelled(_)) => panic!(
-            "fiber cancelled inside a Wasmtime parking wait: ParkingSpot's wait loop has no \
-             cancellation exit, so the fiber cannot unwind"
-        ),
-    }
+    };
     returned_at.store(parked.generation.load(Ordering::Acquire), Ordering::Relaxed);
+    cancelled
+}
+
+/// Body of `wasmtime_monotonic_nanos`: `timer`'s clock in nanoseconds.
+/// `timer` is the calling processor's timer. Every processor's timer reads
+/// the same `Cpu` timebase, so a deadline Wasmtime computes on one
+/// processor holds when the waiting fiber resumes on another.
+pub fn wasmtime_monotonic_nanos<CpuImpl>(timer: &Timer<CpuImpl>) -> u64
+where
+    CpuImpl: Cpu + Clone,
+{
+    timer.cpu().timebase().ticks_to_nanos(timer.now().ticks())
 }

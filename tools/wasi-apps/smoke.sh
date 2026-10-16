@@ -122,6 +122,8 @@ check_wasm_imports \
 
 build_wasix_conformance_artifact thread-futex
 build_wasix_conformance_artifact continuation
+build_wasix_conformance_artifact atomic-wait-timeout
+build_wasix_conformance_artifact atomic-wait-kill
 
 run_smoke() {
     local name="$1"
@@ -300,6 +302,30 @@ run_smoke \
     shell \
     -c \
     '/bin/wasix-continuation'
+
+run_smoke \
+    wasix-atomic-wait-timeout \
+    atomic-wait-timeout:ok \
+    -- \
+    --boot-program dash \
+    --boot-program debugger \
+    --boot-program wasix-atomic-wait-timeout \
+    --no-compiler-plugin \
+    shell \
+    -c \
+    '/bin/wasix-atomic-wait-timeout'
+
+run_smoke \
+    wasix-atomic-wait-kill \
+    atomic-wait-kill:ok \
+    -- \
+    --boot-program dash \
+    --boot-program debugger \
+    --boot-program wasix-atomic-wait-kill \
+    --no-compiler-plugin \
+    shell \
+    -c \
+    '/bin/wasix-atomic-wait-kill'
 
 run_smoke \
     cpython \

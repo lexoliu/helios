@@ -162,6 +162,22 @@ bootfs_path = "bin/wasix-continuation"
 source = "artifacts/wasix/continuation/continuation.wasm"
 
 [[artifact]]
+command = "wasix-atomic-wait-timeout"
+package = "helios-wasix-conformance"
+version = "0.1.0"
+source_url = "tools/wasi-apps/wasix-tests"
+bootfs_path = "bin/wasix-atomic-wait-timeout"
+source = "artifacts/wasix/atomic-wait-timeout/atomic-wait-timeout.wasm"
+
+[[artifact]]
+command = "wasix-atomic-wait-kill"
+package = "helios-wasix-conformance"
+version = "0.1.0"
+source_url = "tools/wasi-apps/wasix-tests"
+bootfs_path = "bin/wasix-atomic-wait-kill"
+source = "artifacts/wasix/atomic-wait-kill/atomic-wait-kill.wasm"
+
+[[artifact]]
 command = "simd-lanes"
 package = "helios-wasix-conformance"
 version = "0.1.0"

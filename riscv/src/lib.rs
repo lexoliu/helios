@@ -1409,11 +1409,16 @@ fn installed_hart_runtime() -> Option<&'static HartRuntime> {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn wasmtime_parking_wait(timeout_nanos: u64) {
-    helios_kernel::park_wasmtime_waiter(&current_hart_runtime().timer, timeout_nanos);
+extern "C" fn wasmtime_parking_wait(timeout_nanos: u64) -> bool {
+    helios_kernel::park_wasmtime_waiter(&current_hart_runtime().timer, timeout_nanos)
 }
 
 #[unsafe(no_mangle)]
 extern "C" fn wasmtime_parking_unpark() {
     helios_kernel::unpark_wasmtime_waiters();
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn wasmtime_monotonic_nanos() -> u64 {
+    helios_kernel::wasmtime_monotonic_nanos(&current_hart_runtime().timer)
 }
