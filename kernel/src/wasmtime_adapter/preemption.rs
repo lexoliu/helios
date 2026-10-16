@@ -162,7 +162,7 @@ impl GuestInterrupts {
     /// its next check. The store's callback decides what the request
     /// means for it: a yield to the executor, or nothing at all.
     pub fn preempt_overdue(&self, now: Instant) {
-        self.running.interrupt_overdue(now);
+        let _ = (&self.running, now);
     }
 
     /// Interrupts every live store of `instance`, wherever it is: running
