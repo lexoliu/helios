@@ -1150,12 +1150,17 @@ where
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    /// Preempts the guest running on the executing processor, if one is.
+    /// Preempts every guest, on any processor, that has held its
+    /// processor for at least one [`crate::GUEST_TIME_SLICE`].
     ///
-    /// Each backend calls this from its scheduler tick, the processor's
-    /// own timer interrupt: it takes no lock and allocates nothing.
-    pub fn preempt_current_guest(&self) {
-        self.inner.engine.interrupts().preempt_current();
+    /// Each backend calls this from every processor's timer interrupt,
+    /// whatever the interrupt's period: it takes no lock, allocates
+    /// nothing and sends no IPI.
+    pub fn preempt_overdue_guests(&self) {
+        self.inner
+            .engine
+            .interrupts()
+            .preempt_overdue(self.inner.clock_cpu.now());
     }
 
     /// Interrupts every store of `instance`, so a kill whose flag is set

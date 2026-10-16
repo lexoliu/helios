@@ -954,8 +954,10 @@ pub(crate) fn handle_local_timer_interrupt(interrupted: usize) {
         return;
     }
     runtime.watchdog.pet();
+    // Every processor's tick ends the slice of every guest on the machine
+    // that has run one, so the slice does not need its own interrupt.
     if let Some(service) = runtime.program_service.get() {
-        service.preempt_current_guest();
+        service.preempt_overdue_guests();
     }
     runtime
         .timer

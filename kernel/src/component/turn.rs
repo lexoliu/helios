@@ -107,7 +107,7 @@ impl StopWake for SocketRetirementQueue {
 /// A component store closes the sockets its guest let go of during the
 /// turn. Draining when the store gives up the processor bounds the
 /// delay between a socket's death and its close by one turn: the next
-/// time the guest blocks, yields at a scheduler tick, or finishes.
+/// time the guest blocks, yields at the end of a time slice, or finishes.
 impl<RuntimeStateImpl, Error> TurnEpilogue<RuntimeStateImpl, Error> for SocketRetirementQueue
 where
     RuntimeStateImpl: ComponentRuntimeState,

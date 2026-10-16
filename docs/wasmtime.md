@@ -8,12 +8,13 @@ at `../wasmtime/crates/wasmtime`.
 The local checkout must be at (branch `helios/parking-wait-cancel`):
 
 ```text
-904e03c981d7596bf03ed1d4fd8423ff36381414
+2fb47b20c7ff9a91b6dbc03062d1dd4dddab4969
 ```
 
 That revision is `helios/parking-wait-timeout` at
-`62bf033a53a8132a4d3009534152e2b745144904` plus one additive commit,
-which gives a `no_std` `memory.atomic.wait` a cancellation exit (#445):
+`3741766da8e691dfa9e642ab9f16cfb30c1fc5a3` plus one additive commit
+(written on that branch's earlier `62bf033a` and merged forward), which
+gives a `no_std` `memory.atomic.wait` a cancellation exit (#445):
 
 - The `no_std` parking hook becomes
   `wasmtime_parking_wait(timeout_nanos: u64) -> bool`. It returns `true`
@@ -41,9 +42,10 @@ bare-metal backend's `wasmtime_parking_wait` now returns
 dropped the call.
 
 The revision it replaces is `helios/parking-wait-timeout` at
-`62bf033a53a8132a4d3009534152e2b745144904`, which is
+`3741766da8e691dfa9e642ab9f16cfb30c1fc5a3`, which is
 `helios/stack-limit-interrupt` at
-`913a5426e627b32c7c096d2dcd7f167fe943c6be` plus one additive commit, which
+`9d41e8b3ab259c394c099d62c61600f366ef3017` plus one additive commit
+(written on that branch's earlier `913a5426` and merged forward), which
 makes a timed `memory.atomic.wait` time out on `no_std` (#455):
 
 - A `no_std` build declares a third parking hook,
@@ -66,17 +68,24 @@ only ended when notified. Each bare-metal backend exports
 `wasmtime_monotonic_nanos` from its processor timer's `Cpu` timebase.
 
 The revision it replaces is `helios/stack-limit-interrupt` at
-`913a5426e627b32c7c096d2dcd7f167fe943c6be`, which is
+`9d41e8b3ab259c394c099d62c61600f366ef3017`, which is
 `helios/parallel-compile-steal` at
-`f5a2d7baf50962ae777c29ecc792f0eed501c75d` plus one additive commit, which
-adds resumable stack-limit interruption (#456):
+`f5a2d7baf50962ae777c29ecc792f0eed501c75d` plus two additive commits, which
+add resumable stack-limit interruption (#456):
 
 - `Config::stack_limit_interruption(bool)` (a `Tunables` flag that takes part
   in the cwasm compatibility check) makes Cranelift compare the stack pointer
-  against `VMStoreContext::stack_limit` at every function entry, loop header
-  and bulk-memory chunk, and call the `stack_limit_interrupt` builtin when the
-  compare fails instead of trapping. `Engine::new` refuses it together with
-  epoch interruption, with stack switching and on Pulley.
+  against `VMStoreContext::stack_limit` at every loop header, every
+  bulk-memory chunk and the entry of every function that can call wasm
+  (`call`, `call_indirect`, `call_ref` and their tail forms, found by a
+  pre-scan of the body), and call the `stack_limit_interrupt` builtin when
+  the compare fails instead of trapping. A function that calls no wasm runs
+  for bounded time outside its loops, so it keeps only the ordinary ISA
+  prologue overflow check, made against `VMStoreContext::real_stack_limit`,
+  which never holds the interrupt sentinel; Cranelift omits that check for a
+  leaf with no frame, so such a leaf compiles exactly as with no interruption
+  at all. `Engine::new` refuses the option together with epoch interruption,
+  with stack switching and on Pulley.
 - `Store::interrupt_handle()` returns a `Send + Sync` `StoreInterruptHandle`
   whose `interrupt()` sets a pending flag and raises the limit to a sentinel,
   with no lock and no allocation, so an interrupt handler may call it. The
@@ -93,7 +102,11 @@ adds resumable stack-limit interruption (#456):
 Helios needs it because the epoch checks it replaces cost 10–29% on every
 compute workload (paired run 38745522065): a full check on every function
 entry, a cached check at every loop header, and two variables live across
-every body.
+every body. The second commit keeps call-free functions leaf: the first made
+every function entry an explicit check whose cold path is a call, which
+turned every leaf into a non-leaf and left the guest 6–31% slower than an
+interruption-free build (paired run 38821832333), while the loop-header
+checks cost nothing measurable (paired run 38834037272).
 
 The revision it replaces is `helios/parallel-compile-steal` at
 `f5a2d7baf50962ae777c29ecc792f0eed501c75d`, which is
