@@ -172,6 +172,15 @@ def test_profile_columns_resolve_the_pairing_ref_to_its_commit(
     expected = [{"column": "candidate", "ref": head, "artifact": "helios-kernel-profdata-candidate"}]
     if baseline_profile == "true":
         expected.append({"column": "baseline", "ref": base, "artifact": "helios-kernel-profdata-baseline"})
+        # #479: the same commit collected a second time, independently,
+        # for the baseline's rebuild.
+        expected.append(
+            {
+                "column": "baseline-rebuild",
+                "ref": base,
+                "artifact": "helios-kernel-profdata-baseline-rebuild",
+            }
+        )
     assert json.loads(outputs["profile_columns"]) == expected
 
 
@@ -250,11 +259,18 @@ def test_suite_preserves_workloads_and_pairing(
             assert arguments[arguments.index("--baseline-profile-use") + 1] == (
                 f"{tmp_path}/helios/target/pgo-baseline/helios-kernel.profdata"
             )
+            # The baseline's second build, against its second collection
+            # (#479): `helios-bench run` refuses the one without the other.
+            assert arguments[arguments.index("--baseline-rebuild-profile-use") + 1] == (
+                f"{tmp_path}/helios/target/pgo-baseline-rebuild/helios-kernel.profdata"
+            )
         else:
             assert "--baseline-profile-use" not in arguments
+            assert "--baseline-rebuild-profile-use" not in arguments
     else:
         assert "--profile-use" not in arguments
         assert "--baseline-profile-use" not in arguments
+        assert "--baseline-rebuild-profile-use" not in arguments
 
 
 @pytest.mark.parametrize(
@@ -371,6 +387,19 @@ def test_a_paired_run_downloads_each_columns_own_profile(jobs):
     assert "env.BENCH_BASELINE_PROFILE == 'true'" in baseline["if"]
     assert baseline["with"]["name"] == "helios-kernel-profdata-baseline"
     assert baseline["with"]["path"] == "helios/target/pgo-baseline"
+    rebuild = steps["Download the baseline rebuild's kernel profile"]
+    assert rebuild["if"] == baseline["if"], "the rebuild exists exactly when the baseline's profile does"
+    assert rebuild["with"]["name"] == "helios-kernel-profdata-baseline-rebuild"
+    assert rebuild["with"]["path"] == "helios/target/pgo-baseline-rebuild"
+    # The rebuild column's records travel with the report like the others'.
+    report = next(
+        step
+        for step in jobs["suite"]["steps"]
+        if step.get("uses") == "actions/upload-artifact@v4" and "report.json" in step["with"]["path"]
+    )
+    assert (
+        "bench-out/${{ matrix.lane }}/helios-baseline-rebuild/*.jsonl" in report["with"]["path"].splitlines()
+    )
 
 
 def test_kernel_profile_collects_the_ref_it_is_asked_for():
@@ -384,6 +413,11 @@ def test_kernel_profile_collects_the_ref_it_is_asked_for():
     assert inputs["ref"]["default"] == ""
     assert inputs["artifact"]["type"] == "string"
     assert inputs["artifact"]["default"] == "helios-kernel-profdata"
+    # Every call of one run is a concurrency group of its own: one group
+    # per run serialised the column collections (run 38940834451) and
+    # would cancel a third column queued behind a pending second.
+    group = workflow["jobs"]["kernel-profile"]["concurrency"]["group"]
+    assert "inputs.artifact" in group
     steps = workflow["jobs"]["kernel-profile"]["steps"]
     checkout = next(step for step in steps if step.get("uses") == "actions/checkout@v4")
     assert checkout["with"]["ref"] == "${{ inputs.ref || github.sha }}"
