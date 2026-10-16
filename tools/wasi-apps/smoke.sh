@@ -125,6 +125,7 @@ build_wasix_conformance_artifact continuation
 build_wasix_conformance_artifact atomic-wait-timeout
 build_wasix_conformance_artifact atomic-wait-kill
 build_wasix_conformance_artifact orphan-threads
+build_wasix_conformance_artifact thread-proc-exit
 
 run_smoke() {
     local name="$1"
@@ -340,6 +341,19 @@ run_smoke \
     shell \
     -c \
     '/bin/wasix-orphan-threads; echo orphan-threads:exit=$?'
+
+run_smoke \
+    wasix-thread-proc-exit \
+    thread-proc-exit:exiting \
+    thread-proc-exit:exit=7 \
+    -- \
+    --boot-program dash \
+    --boot-program debugger \
+    --boot-program wasix-thread-proc-exit \
+    --no-compiler-plugin \
+    shell \
+    -c \
+    '/bin/wasix-thread-proc-exit; echo thread-proc-exit:exit=$?'
 
 run_smoke \
     cpython \

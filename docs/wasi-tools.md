@@ -85,6 +85,10 @@ Artifacts produced:
   conformance module covering a process whose main returns while one
   thread is parked forever in `memory.atomic.wait32` and another spins:
   the process must end with main's status and its output must close.
+- `artifacts/wasix/thread-proc-exit/thread-proc-exit.wasm` — Helios
+  conformance module covering `proc_exit` on a spawned thread while main
+  is parked forever in `memory.atomic.wait32`: the whole process must end
+  with the thread's status (7) and its output must close.
 - `artifacts/wasi-tools/curl.wasm`
 - `artifacts/wasi-tools/curl-stripped.wasm`
 - `artifacts/wasi-tools/wasi-curl.wasm` — plain-WASI HTTP/1.1 client,
@@ -431,7 +435,7 @@ Expected output contains:
 - Do not remove `tools/wasi-apps/build.sh` or rename output paths
   (`artifacts/python3-root/…`, `artifacts/wasix/dash/…`,
   `artifacts/wasix/thread-futex/…`, `artifacts/wasix/continuation/…`,
-  `artifacts/wasix/atomic-wait-timeout/…`, `artifacts/wasix/atomic-wait-kill/…`, `artifacts/wasix/orphan-threads/…`, `artifacts/wasi-tools/…`) without updating this document and `README.md`.
+  `artifacts/wasix/atomic-wait-timeout/…`, `artifacts/wasix/atomic-wait-kill/…`, `artifacts/wasix/orphan-threads/…`, `artifacts/wasix/thread-proc-exit/…`, `artifacts/wasi-tools/…`) without updating this document and `README.md`.
 - Keep runtime behavior verified with the inspector `vm` commands above.
 - Do not reintroduce repo-local shell, coreutils, or language stubs. The
   boot shells, coreutils, and QuickJS are standard Wasmer artifacts

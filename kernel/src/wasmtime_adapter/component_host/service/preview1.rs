@@ -33,7 +33,9 @@ where
     pub(super) tty_state: WasixTtyState,
     pub(super) signal_callback: Option<String>,
     pub(super) signal_state: WasixSignalState,
-    /// Signals raised on this store's thread alone (`thread_signal`).
+    /// Signals raised on this store's thread alone (`thread_signal`),
+    /// and the end of its process. Main's is its process table's
+    /// [`WasixProcessThreads::main_mailbox`].
     pub(super) thread_signals: WasixSignalState,
     /// The `proc_raise_interval` timer this store asked for, if any.
     ///
@@ -79,6 +81,7 @@ where
         filesystem: Option<DebugFileSystemSnapshot>,
         descriptors: Option<Preview1DescriptorTable<Net>>,
         signal_state: WasixSignalState,
+        thread_signals: WasixSignalState,
         signal_dispositions: Vec<WasixSignalDisposition>,
         current_core_module: Option<Arc<WasmtimeCompiledCoreModule>>,
         wasix_abi: bool,
@@ -124,7 +127,7 @@ where
             tty_state,
             signal_callback: None,
             signal_state,
-            thread_signals: WasixSignalState::new(),
+            thread_signals,
             signal_interval: None,
             signal_dispositions,
             descriptors,
@@ -5792,9 +5795,8 @@ mod tests {
             caller_call.as_mut().poll(&mut caller_cx).is_pending(),
             "the sibling's suspended call goes on"
         );
-        assert_eq!(
-            caller_signals.take_pending(),
-            None,
+        assert!(
+            caller_signals.owed_stop().is_none(),
             "the sibling is owed nothing"
         );
         let core::task::Poll::Ready(Err(error)) = target_call.as_mut().poll(&mut target_cx) else {
@@ -5810,7 +5812,9 @@ mod tests {
     }
 
     /// A store owes its guest a signal raised on its own thread ahead of
-    /// one raised on its process, and the process's after that.
+    /// one raised on its process, and the process's after that. The stop
+    /// says which it was: a thread-directed signal ends the thread alone,
+    /// a process-directed one the whole process.
     #[test]
     fn a_store_takes_its_threads_signal_before_its_processs() {
         let process = WasixSignalState::new();
@@ -5819,9 +5823,19 @@ mod tests {
         process.raise(15);
         thread.raise(9);
 
-        assert_eq!(signals.take_pending(), Some(9));
-        assert_eq!(signals.take_pending(), Some(15));
-        assert_eq!(signals.take_pending(), None);
+        let stop = signals.owed_stop().expect("a raised thread owes a stop");
+        assert_eq!(
+            stop.downcast_ref::<WasixThreadSignalExit>()
+                .map(|exit| exit.signal),
+            Some(9)
+        );
+        let stop = signals.owed_stop().expect("a raised process owes a stop");
+        assert_eq!(
+            stop.downcast_ref::<Preview1SignalExit>()
+                .map(|exit| exit.signal),
+            Some(15)
+        );
+        assert!(signals.owed_stop().is_none());
     }
 
     /// A call that returns with no signal pending keeps its own result.

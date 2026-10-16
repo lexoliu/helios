@@ -798,6 +798,36 @@ jobs:
           grep -Fqx orphan-threads:ok "$runtime/guest.log"
           grep -Fqx orphan-threads:exit=0 "$runtime/guest.log"
           ! grep -Fq 'Kernel panic' "$runtime/guest.log"
+      - name: End a process from proc_exit on a spawned thread
+        # A thread's proc_exit that ends only that thread leaves main
+        # parked and hangs here, not in a later step.
+        timeout-minutes: 5
+        shell: bash
+        working-directory: helios
+        run: |
+          # Without this the step reports tee's status, not the
+          # command's, and a runner script that fails is invisible.
+          set -o pipefail
+          # POSIX exit ends the whole process from any thread (#469).
+          # Main parks forever in memory.atomic.wait32 and a spawned
+          # thread calls proc_exit(7): the process must end with 7, and
+          # the shell's echo after it proves its output closed.
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/thread-proc-exit"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+            --accel kvm \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger \
+            --boot-program wasix-thread-proc-exit --no-compiler-plugin \
+            shell --trace-log "$runtime/guest-tracing.log" \
+            -c '/bin/wasix-thread-proc-exit; echo thread-proc-exit:exit=$?' \
+            2>&1 > "$runtime/guest.log" | tee "$runtime/inspector.log"
+          cat "$runtime/guest.log"
+          grep -Fqx thread-proc-exit:spawned "$runtime/guest.log"
+          grep -Fqx thread-proc-exit:parking "$runtime/guest.log"
+          grep -Fqx thread-proc-exit:exiting "$runtime/guest.log"
+          grep -Fqx thread-proc-exit:exit=7 "$runtime/guest.log"
+          ! grep -Fq 'Kernel panic' "$runtime/guest.log"
       - name: Fetch over virtio-net with curl
         shell: bash
         working-directory: helios

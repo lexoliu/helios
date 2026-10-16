@@ -948,8 +948,25 @@ pub(super) struct EventFdState {
 #[error("guest requested wasi preview1 exit")]
 pub(super) struct Preview1Exit;
 
-/// A pending WASIX signal ended the guest. The program exits with
-/// `128 + signal`, whatever the guest asked for before it.
+/// The guest ended its own thread (`thread_exit`) with the status it
+/// requested. A spawned thread ends alone, as `pthread_exit` does; on
+/// main the image ends with the status, as it does on `proc_exit`.
+/// Every other requested end ([`Preview1Exit`]) ends the whole process,
+/// whichever thread asks for it.
+#[derive(Debug, Error)]
+#[error("guest requested wasix thread exit")]
+pub(super) struct WasixThreadExitRequested;
+
+impl WasixThreadExitRequested {
+    /// Whether `error` is a thread's own exit.
+    pub(super) fn is(error: &wasmtime::Error) -> bool {
+        error.downcast_ref::<Self>().is_some()
+    }
+}
+
+/// A pending WASIX signal raised on the process ended the guest. The
+/// program exits with `128 + signal`, whatever the guest asked for
+/// before it, and on any thread the whole process does.
 #[derive(Debug, Error)]
 #[error("guest ended by wasix signal {signal}")]
 pub(super) struct Preview1SignalExit {
@@ -962,8 +979,26 @@ impl Preview1SignalExit {
     }
 }
 
+/// A WASIX signal raised on one thread alone (`thread_signal`) ended
+/// that thread's call. The thread exits with `128 + signal`, whatever it
+/// asked for before; a spawned thread ends alone, so a joiner sees the
+/// status, and main ends the image with it.
+#[derive(Debug, Error)]
+#[error("wasix thread ended by thread-directed signal {signal}")]
+pub(super) struct WasixThreadSignalExit {
+    pub(super) signal: u32,
+}
+
+impl WasixThreadSignalExit {
+    pub(super) fn exit_code(&self) -> u32 {
+        128u32.saturating_add(self.signal)
+    }
+}
+
 /// The process a WASIX thread belongs to ended, and the thread ends with
-/// it ([`WasixSignalState::end_thread`]).
+/// it ([`WasixSignalState::end_thread`]). On main it means a spawned
+/// thread ended the process ([`WasixProcessThreads::end_from_thread`]),
+/// and main completes the way that thread chose.
 #[derive(Debug, Error)]
 #[error("wasix thread ended with its process")]
 pub(super) struct WasixThreadEnded;
@@ -981,14 +1016,17 @@ impl WasixThreadEnded {
 }
 
 /// The exit status of a program whose call ended in `error`, given the
-/// status the guest `requested` before: the signal that ended it,
-/// otherwise the requested status, otherwise none, and the error is a
-/// failure.
+/// status the guest `requested` before: the signal that ended it, raised
+/// on its process or its thread, otherwise the requested status,
+/// otherwise none, and the error is a failure.
 pub(super) fn preview1_exit_status(error: &wasmtime::Error, requested: Option<u32>) -> Option<u32> {
-    match error.downcast_ref::<Preview1SignalExit>() {
-        Some(exit) => Some(exit.exit_code()),
-        None => requested,
+    if let Some(exit) = error.downcast_ref::<Preview1SignalExit>() {
+        return Some(exit.exit_code());
     }
+    if let Some(exit) = error.downcast_ref::<WasixThreadSignalExit>() {
+        return Some(exit.exit_code());
+    }
+    requested
 }
 
 /// The signals one store answers to: those raised on its own thread and
@@ -1011,13 +1049,6 @@ impl WasixStoreSignals {
         Self { thread, process }
     }
 
-    /// The signal this store owes its guest, its own thread's first.
-    pub(super) fn take_pending(&self) -> Option<u32> {
-        self.thread
-            .take_pending()
-            .or_else(|| self.process.take_pending())
-    }
-
     /// The stop this store owes its guest, if any: the end of its
     /// thread's process, which stays owed, then a pending signal, which
     /// is delivered once. The interrupt callback and the turn both read
@@ -1026,7 +1057,11 @@ impl WasixStoreSignals {
         if self.thread.thread_ended() {
             return Some(wasmtime::Error::new(WasixThreadEnded));
         }
-        self.take_pending()
+        if let Some(signal) = self.thread.take_pending() {
+            return Some(wasmtime::Error::new(WasixThreadSignalExit { signal }));
+        }
+        self.process
+            .take_pending()
             .map(|signal| wasmtime::Error::new(Preview1SignalExit { signal }))
     }
 }

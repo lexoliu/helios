@@ -186,6 +186,14 @@ bootfs_path = "bin/wasix-orphan-threads"
 source = "artifacts/wasix/orphan-threads/orphan-threads.wasm"
 
 [[artifact]]
+command = "wasix-thread-proc-exit"
+package = "helios-wasix-conformance"
+version = "0.1.0"
+source_url = "tools/wasi-apps/wasix-tests"
+bootfs_path = "bin/wasix-thread-proc-exit"
+source = "artifacts/wasix/thread-proc-exit/thread-proc-exit.wasm"
+
+[[artifact]]
 command = "simd-lanes"
 package = "helios-wasix-conformance"
 version = "0.1.0"
