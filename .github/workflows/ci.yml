@@ -716,6 +716,8 @@ jobs:
           grep -Fqx guest-alive oob-load-smoke.out
           ! grep -Fq 'Kernel panic' oob-load-smoke.out
       - name: Time out a memory.atomic.wait nobody notifies
+        # A wait that is never cut short hangs here, not in a later step.
+        timeout-minutes: 5
         shell: bash
         working-directory: helios
         run: |
@@ -741,6 +743,8 @@ jobs:
           grep -Fqx atomic-wait-timeout:ok atomic-wait-timeout-smoke.out
           ! grep -Fq 'Kernel panic' atomic-wait-timeout-smoke.out
       - name: Kill a thread parked in memory.atomic.wait
+        # A wait that is never cut short hangs here, not in a later step.
+        timeout-minutes: 5
         shell: bash
         working-directory: helios
         run: |
