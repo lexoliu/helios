@@ -17,6 +17,29 @@ use helios_hal::cpu::{Cpu, Instant};
 use objectpool::Pool;
 use triomphe::Arc;
 
+/// How long a guest runs on a processor before that processor's timer
+/// interrupt preempts it and it yields to the executor.
+///
+/// This is a scheduling policy, the same on every backend and
+/// independent of the processor count. 2.5 ms keeps the yield rate the
+/// x86-64 bench lane gave every guest when each of its four processors'
+/// 100 Hz ticks interrupted every running guest, and sits at Linux's
+/// EEVDF base slice on a four-processor machine (0.75 ms scaled by
+/// `1 + log2(4)`, 2.25 ms; the CFS minimum granularity it replaced
+/// scaled the same way to 3 ms). A longer slice delays every instance
+/// that shares a processor with a CPU-bound one by that much more before
+/// its next turn; a shorter one spends more processor time on interrupts
+/// and yields.
+///
+/// A backend supplies the mechanism: one whose timer is armed per
+/// deadline gets it from [`Timer`], which keeps the deadline at most one
+/// slice ahead while the processor runs; one with a periodic timer runs
+/// that timer at this period and keeps its slower work on a multiple of
+/// it.
+pub const GUEST_TIME_SLICE: Duration = Duration::from_micros(2_500);
+/// How far ahead a parked processor's timer is armed when no sleep is
+/// due sooner: nothing runs on it that a slice could preempt, so it
+/// wakes only for sleeps and this interval.
 const SCHEDULER_INTERRUPT_INTERVAL: Duration = Duration::from_millis(100);
 const TIMER_WHEEL_QUANTUM: Duration = Duration::from_micros(50);
 const TIMER_WHEEL_LEVELS: usize = 4;
@@ -56,6 +79,16 @@ struct TimerShared {
     inbox: ConcurrentQueue<TimerEntry>,
     next_sleep_deadline: AtomicU64,
     armed_deadline: AtomicU64,
+    /// Whether the owning processor is inside [`Timer::park`]. Written
+    /// by the owner around its park and read by its own timer interrupt;
+    /// a stale read on that one processor only arms one interrupt at the
+    /// other interval.
+    parked: AtomicBool,
+    /// [`GUEST_TIME_SLICE`] in timer ticks: the furthest ahead a running
+    /// processor's interrupt is armed.
+    slice_ticks: u64,
+    /// [`SCHEDULER_INTERRUPT_INTERVAL`] in timer ticks: the furthest
+    /// ahead a parked processor's interrupt is armed.
     interrupt_interval_ticks: u64,
     wheel_quantum_ticks: u64,
     ready_pool: Pool<Vec<TimerEntry>>,
@@ -142,8 +175,13 @@ struct WheelLevel {
 impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
     pub fn new(cpu: CpuImpl) -> Self {
         let timebase = cpu.timebase();
+        let slice_ticks = timebase.duration_to_ticks(GUEST_TIME_SLICE);
         let interrupt_interval_ticks = timebase.duration_to_ticks(SCHEDULER_INTERRUPT_INTERVAL);
         let wheel_quantum_ticks = timebase.duration_to_ticks(TIMER_WHEEL_QUANTUM);
+        assert!(
+            slice_ticks != 0,
+            "guest time slice {GUEST_TIME_SLICE:?} converted to zero timer ticks"
+        );
         assert!(
             interrupt_interval_ticks != 0,
             "scheduler interrupt interval {SCHEDULER_INTERRUPT_INTERVAL:?} converted to zero timer ticks"
@@ -152,7 +190,7 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
             wheel_quantum_ticks != 0,
             "timer wheel quantum {TIMER_WHEEL_QUANTUM:?} converted to zero timer ticks"
         );
-        let initial_deadline = cpu.now().saturating_add(interrupt_interval_ticks);
+        let initial_deadline = cpu.now().saturating_add(slice_ticks);
         cpu.set_deadline(initial_deadline);
         let current_tick = wheel_tick_floor(cpu.now(), wheel_quantum_ticks);
         Self {
@@ -164,6 +202,8 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
                 inbox: ConcurrentQueue::bounded(TIMER_INBOX_CAPACITY),
                 next_sleep_deadline: AtomicU64::new(u64::MAX),
                 armed_deadline: AtomicU64::new(initial_deadline.ticks()),
+                parked: AtomicBool::new(false),
+                slice_ticks,
                 interrupt_interval_ticks,
                 wheel_quantum_ticks,
                 ready_pool: Pool::bounded(
@@ -237,10 +277,29 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
         ready.len()
     }
 
+    /// Re-arms the processor's timer from its interrupt: one guest time
+    /// slice ahead while the processor runs, the parked interval while
+    /// it is inside [`Timer::park`], and sooner when a sleep is due.
     pub fn handle_interrupt(&self) -> usize {
         let next_deadline = self.next_interrupt_deadline_after(self.now());
         self.arm_deadline(next_deadline);
         0
+    }
+
+    /// Parks the owning processor ([`Cpu::park_current`]) until an
+    /// interrupt, with its timer armed for the next sleep or the parked
+    /// interval rather than the next guest time slice.
+    ///
+    /// Only the owning processor parks through its timer. The slice comes
+    /// back with the first [`Timer::fire_expired`] after the park, which
+    /// every executor pass runs before it polls a task, so no guest runs
+    /// under the parked interval. That costs one arm per park and none
+    /// per poll.
+    pub(crate) fn park(&self) {
+        self.shared.parked.store(true, AtomicOrdering::Relaxed);
+        self.arm_deadline(self.next_interrupt_deadline_after(self.now()));
+        self.cpu.park_current();
+        self.shared.parked.store(false, AtomicOrdering::Relaxed);
     }
 
     fn enqueue(&self, deadline: Instant, state: SleepHandle) {
@@ -308,7 +367,12 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
     }
 
     fn next_interrupt_deadline_after(&self, now: Instant) -> Instant {
-        let periodic_deadline = now.saturating_add(self.shared.interrupt_interval_ticks);
+        let interval = if self.shared.parked.load(AtomicOrdering::Relaxed) {
+            self.shared.interrupt_interval_ticks
+        } else {
+            self.shared.slice_ticks
+        };
+        let periodic_deadline = now.saturating_add(interval);
         let next_sleep_deadline = self
             .shared
             .next_sleep_deadline
@@ -814,6 +878,67 @@ mod tests {
             state: state.downgrade(),
         };
         (state, entry)
+    }
+
+    fn armed(timer: &super::Timer<TestCpu>) -> u64 {
+        timer
+            .shared
+            .armed_deadline
+            .load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// A running processor's interrupt is armed one guest time slice
+    /// ahead, a parked one's the parked interval ahead, and a sleep due
+    /// sooner than either wins.
+    #[test]
+    fn the_interrupt_is_a_slice_ahead_while_running_and_the_interval_while_parked() {
+        let timer = test_timer();
+        let slice = timer.shared.slice_ticks;
+        let interval = timer.shared.interrupt_interval_ticks;
+        assert_eq!(slice, 2_500, "2.5 ms at the test timebase's 1 MHz");
+        assert!(interval > slice);
+        assert_eq!(armed(&timer), slice, "a new timer starts a slice ahead");
+
+        timer.handle_interrupt();
+        assert_eq!(armed(&timer), slice);
+
+        timer
+            .shared
+            .parked
+            .store(true, core::sync::atomic::Ordering::Relaxed);
+        timer.handle_interrupt();
+        assert_eq!(armed(&timer), interval);
+        timer.publish_deadline(Instant::new(slice * 2));
+        assert_eq!(
+            armed(&timer),
+            slice * 2,
+            "a due sleep wakes a parked processor"
+        );
+
+        timer
+            .shared
+            .parked
+            .store(false, core::sync::atomic::Ordering::Relaxed);
+        timer.handle_interrupt();
+        assert_eq!(armed(&timer), slice);
+    }
+
+    /// Parking arms the parked interval, and the first expiry pass after
+    /// it, which every executor pass runs before it polls a task, brings
+    /// the slice back.
+    #[test]
+    fn a_park_arms_the_interval_and_the_next_pass_rearms_the_slice() {
+        let timer = test_timer();
+        timer.park();
+        assert!(
+            !timer
+                .shared
+                .parked
+                .load(core::sync::atomic::Ordering::Relaxed)
+        );
+        assert_eq!(armed(&timer), timer.shared.interrupt_interval_ticks);
+        timer.fire_expired();
+        assert_eq!(armed(&timer), timer.shared.slice_ticks);
     }
 
     #[test]

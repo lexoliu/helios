@@ -341,7 +341,7 @@ where
 
     /// The interrupt callback for this store: where a pending WASIX
     /// signal and a condemnation reach a running guest, and where the
-    /// scheduler tick makes it yield.
+    /// end of a time slice makes it yield.
     ///
     /// Raising a signal and condemning an instance both interrupt every
     /// store of the instance, so a guest that is running meets this at

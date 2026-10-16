@@ -910,7 +910,7 @@ impl Executor {
             };
         }
         let parked_at = cpu.now();
-        cpu.park_current();
+        timer.park();
         idle.store(IdleState::Running);
         let parked_ticks = cpu.now().ticks() - parked_at.ticks();
         idle.adapt_poll_limit(

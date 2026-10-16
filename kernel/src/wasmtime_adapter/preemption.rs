@@ -1,5 +1,5 @@
-//! How a running guest is interrupted: the scheduler tick, a kill, a
-//! signal.
+//! How a running guest is interrupted: the end of its time slice, a
+//! kill, a signal.
 //!
 //! Every store of an engine is interruptible through its
 //! [`StoreInterruptHandle`]: a request lowers the store's published stack
@@ -13,8 +13,9 @@
 //! answers two questions, each with its own structure and its own
 //! concurrency contract:
 //!
-//! - *Which store holds this processor?* The scheduler tick preempts that
-//!   store and no other. One slot per processor, indexed by
+//! - *Which store holds this processor?* The timer interrupt that ends
+//!   the processor's guest time slice ([`crate::GUEST_TIME_SLICE`])
+//!   preempts that store and no other. One slot per processor, indexed by
 //!   [`current_processor`] and cache-padded: the processor itself writes
 //!   its slot around every poll of a guest call ([`StoreInterrupts::drive`])
 //!   and its own timer interrupt reads it ([`GuestInterrupts::preempt_current`]).
@@ -155,8 +156,8 @@ pub(crate) struct StoreInterrupts {
 }
 
 impl StoreInterrupts {
-    /// Drive `call`, a call into this store's guest, preemptible by the
-    /// scheduler tick of whichever processor polls it.
+    /// Drive `call`, a call into this store's guest, preemptible at the
+    /// end of each time slice of whichever processor polls it.
     pub(crate) fn drive<Call: Future>(&self, call: Call) -> Preemptible<'_, Call> {
         Preemptible { call, store: self }
     }

@@ -92,7 +92,7 @@ impl WasmtimeEngine {
         &self.engine
     }
 
-    /// The routes the scheduler tick and the kill path take into this
+    /// The routes the time-slice interrupt and the kill path take into this
     /// engine's stores.
     pub(crate) fn interrupts(&self) -> &Arc<GuestInterrupts> {
         &self.interrupts

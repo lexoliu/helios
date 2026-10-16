@@ -1412,6 +1412,10 @@ extern "C" fn aarch64_handle_irq() {
             // The wake carries no payload: returning from `wfi` is the
             // whole message, and `park_current` owns the flag.
         } else if intid == gic::VIRTUAL_TIMER_PPI {
+            // The kernel timer arms this interrupt at most one guest time
+            // slice ahead while the processor runs, so it ends the running
+            // guest's slice; a parked processor's is armed for its next
+            // sleep deadline or the parked interval instead.
             if let Some(program_service) = runtime.program_service.get() {
                 program_service.preempt_current_guest();
             }

@@ -583,6 +583,10 @@ fn trap_dispatch(tf: &mut TrapFrame) {
     }
     match riscv::register::scause::read().cause().try_into() {
         Ok(Trap::Interrupt(Interrupt::SupervisorTimer)) => {
+            // The kernel timer arms this interrupt at most one guest time
+            // slice ahead while the hart runs, so it ends the running
+            // guest's slice; a parked hart's is armed for its next sleep
+            // deadline or the parked interval instead.
             if let Some(program_service) = current_hart_runtime().program_service.as_ref() {
                 program_service.preempt_current_guest();
             }

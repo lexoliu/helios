@@ -1152,8 +1152,9 @@ where
 {
     /// Preempts the guest running on the executing processor, if one is.
     ///
-    /// Each backend calls this from its scheduler tick, the processor's
-    /// own timer interrupt: it takes no lock and allocates nothing.
+    /// Each backend calls this from the processor's own timer interrupt
+    /// at the end of every guest time slice ([`crate::GUEST_TIME_SLICE`]):
+    /// it takes no lock and allocates nothing.
     pub fn preempt_current_guest(&self) {
         self.inner.engine.interrupts().preempt_current();
     }

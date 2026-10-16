@@ -232,7 +232,7 @@ pub(super) fn write_decimal(memory: &SharedMemory, ptr: u32, mut value: u32) -> 
 ///
 /// The compiler is never preempted: its calls are not driven through
 /// [`crate::wasmtime_adapter::preemption::StoreInterrupts::drive`], so the
-/// scheduler tick never names it, and what interrupts it is a kill of its
+/// time-slice interrupt never names it, and what interrupts it is a kill of its
 /// instance. The callback traps that kill, and resumes the compile when it
 /// finds none.
 pub(super) fn configure_compiler_core_store<CpuImpl, Net, HostFs>(
