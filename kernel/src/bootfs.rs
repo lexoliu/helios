@@ -4,11 +4,41 @@ use alloc::borrow::ToOwned;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use bytes::Bytes;
 use helios_hal::fs::{
     Directory, DirectoryEntry, DirectoryHandle, DirectoryRights, File, FileHandle, FileRights,
     FileSystem, IoError, IoResult,
 };
 use helios_hal::resource::KernelResource;
+
+/// File bytes exactly as the boot payload supplied them.
+///
+/// Holding one is the proof that the bytes are a view into the payload
+/// the bootloader handed the kernel and that nothing has written them
+/// since: the only constructor takes a `&'static` slice, which the
+/// boot payload views hand out and guest data never is, and no method
+/// mutates the bytes. Trust that rests on where a program came from (an
+/// unverified bootfs artifact) is granted to this type, never to a
+/// `Bytes` read from wherever a path happened to resolve.
+#[derive(Clone, Debug)]
+pub struct BootfsBytes(Bytes);
+
+impl BootfsBytes {
+    /// Wraps a view into the boot payload. Only the payload views
+    /// ([`EmbeddedBootFile`], [`crate::EmbeddedComponent`]) call this.
+    pub(crate) const fn from_image(bytes: &'static [u8]) -> Self {
+        Self(Bytes::from_static(bytes))
+    }
+
+    pub const fn bytes(&self) -> &Bytes {
+        &self.0
+    }
+
+    /// Gives up the provenance and returns the plain bytes.
+    pub fn into_bytes(self) -> Bytes {
+        self.0
+    }
+}
 
 /// Single immutable file view into the payload the backend hands the kernel.
 #[derive(Clone, Copy)]
@@ -82,6 +112,11 @@ impl EmbeddedBootFile {
         self.contents
     }
 
+    /// The file's contents, carrying their bootfs provenance.
+    pub const fn bootfs_bytes(&self) -> BootfsBytes {
+        BootfsBytes::from_image(self.contents)
+    }
+
     pub const fn modified_nanos(&self) -> u64 {
         self.modified_nanos
     }
@@ -122,6 +157,16 @@ impl EmbeddedBootFs {
 
     pub const fn is_empty(&self) -> bool {
         self.directories.is_empty() && self.files.is_empty()
+    }
+
+    /// The contents of the file at the absolute guest path `path`
+    /// (`/bin/compiler.cwasm`), read straight from the image.
+    pub fn file_bytes(&self, path: &str) -> Option<BootfsBytes> {
+        let relative = path.strip_prefix('/')?;
+        self.files
+            .iter()
+            .find(|file| file.path == relative)
+            .map(EmbeddedBootFile::bootfs_bytes)
     }
 
     /// Creates the root directory capability for this boot filesystem.

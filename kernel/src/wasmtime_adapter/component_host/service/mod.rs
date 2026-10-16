@@ -54,11 +54,11 @@ use crate::wasmtime_adapter::{WasmtimeCompiledComponent, WasmtimeCompiledCoreMod
 use crate::wasmtime_adapter::{
     WasmtimePrecompiledKind,
     wasi::{
-        DebugFileSystem, DebugFileSystemSnapshot, FsDescriptor, FsNodeKind, WasiImportSet,
-        bindings::filesystem::types as fs_types, preview1 as p1,
+        DebugFileSystem, DebugFileSystemSnapshot, FileContents, FsDescriptor, FsNodeKind,
+        WasiImportSet, bindings::filesystem::types as fs_types, preview1 as p1,
     },
 };
-use crate::{ProgramExecErrorDetail, RuntimeMessage};
+use crate::{BootfsBytes, ProgramExecErrorDetail, RuntimeMessage};
 use alloc::borrow::ToOwned;
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -296,7 +296,7 @@ where
     // InstancePre moved the median from 53 ms to 50-51 ms. Cache only modules
     // whose imports are independent of per-process shared-memory binding.
     core_module_instance_pre_cache: CoreModuleInstancePreCache<CpuImpl, Net, HostFs>,
-    compiler_artifact: Option<Bytes>,
+    compiler_artifact: Option<BootfsBytes>,
     /// Lazily-built compiler kernel-plugin runtime. The plugin's
     /// `wasmtime::Module`, `InstancePre`, and 512 MiB `SharedMemory` are
     /// allocated on first compile and reused for every subsequent call,
@@ -334,20 +334,49 @@ struct ProgramSpawnRequest<Net: ComponentHostNetwork> {
     signal_dispositions: Vec<WasixSignalDisposition>,
 }
 
+/// A program's bytes, classified by how far the kernel trusts them.
+///
+/// The trust follows where the bytes came from, never which path or
+/// branch read them: only [`BootfsBytes`] can become a
+/// [`ProgramSource::BootfsArtifact`], which loads without a signature
+/// check. A cwasm from anywhere else, guest-written files and the host
+/// share alike, is a [`ProgramSource::SignedArtifact`] and loads only
+/// if its signature verifies against the kernel's trusted roots.
 pub(crate) enum ProgramSource {
     RawWasm(Bytes),
     SignedArtifact(Bytes),
-    BootfsArtifact(Bytes),
+    BootfsArtifact(BootfsBytes),
 }
 
 impl ProgramSource {
+    /// Classifies a program read from the in-memory filesystem by the
+    /// provenance its node carries.
+    pub(crate) fn from_file(contents: FileContents) -> Self {
+        match contents {
+            FileContents::Bootfs(bytes) if cwasm::is_cwasm(bytes.bytes()) => {
+                Self::BootfsArtifact(bytes)
+            }
+            FileContents::Bootfs(bytes) => Self::RawWasm(bytes.into_bytes()),
+            FileContents::Written(bytes) => Self::from_untrusted(bytes),
+        }
+    }
+
+    /// Classifies bytes no boot payload vouches for: a file a guest
+    /// wrote, or one read from the host share.
+    pub(crate) fn from_untrusted(bytes: Bytes) -> Self {
+        if cwasm::is_cwasm(&bytes) {
+            Self::SignedArtifact(bytes)
+        } else {
+            Self::RawWasm(bytes)
+        }
+    }
+
     /// Byte length of the payload the source carries, whichever
     /// variant it is.
     pub(crate) fn payload_len(&self) -> usize {
         match self {
-            Self::RawWasm(bytes) | Self::SignedArtifact(bytes) | Self::BootfsArtifact(bytes) => {
-                bytes.len()
-            }
+            Self::RawWasm(bytes) | Self::SignedArtifact(bytes) => bytes.len(),
+            Self::BootfsArtifact(bytes) => bytes.bytes().len(),
         }
     }
 }
@@ -2059,7 +2088,7 @@ where
     fn read_compiler_plugin_artifact(
         &self,
         exec_context: &ProgramExecContext<CpuImpl, Net, HostFs>,
-    ) -> Result<Bytes, ProgramExecError> {
+    ) -> Result<BootfsBytes, ProgramExecError> {
         self.inner
             .compiler_artifact
             .clone()

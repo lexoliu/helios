@@ -41,8 +41,13 @@ pub fn is_cwasm(bytes: &[u8]) -> bool {
     parse_signed_artifact(bytes).is_ok()
 }
 
+/// Accepts a boot-payload artifact without checking its signature.
+///
+/// The payload is trusted as a whole because the bootloader loaded it
+/// next to the kernel; [`crate::BootfsBytes`] is what proves the bytes
+/// are part of it. Anything else goes through [`verify_signed_artifact`].
 pub fn trust_bootfs_artifact(
-    bytes: UntrustedCwasm<'_>,
+    bytes: &crate::BootfsBytes,
 ) -> Result<TrustedCwasm<'_>, ArtifactTrustError> {
     let parsed = parse_signed_artifact(bytes.bytes())?;
     Ok(TrustedCwasm {
