@@ -61,7 +61,7 @@ pub fn build_component_engine_config(target: &str) -> Config {
     // store's stack limit: the checks are the stack-limit compares
     // Cranelift already emits, made resumable, and nothing stays live
     // across the body for them.
-    config.stack_limit_interruption(true);
+    config.stack_limit_interruption(false);
     // The stack size is kernel policy, not a runtime knob: see
     // `COMPONENT_ASYNC_STACK_SIZE` for why it is what it is and who
     // pays for it. Both the guest wasm call stack and the host Rust
