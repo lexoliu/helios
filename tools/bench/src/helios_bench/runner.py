@@ -41,6 +41,7 @@ from helios_bench.manifest import (
 from helios_bench.report import (
     Control,
     Hardware,
+    InstructionSampling,
     NoiseRetry,
     Pins,
     Report,
@@ -56,7 +57,7 @@ from helios_bench.sources import (
     read_control,
     read_optional_side,
 )
-from helios_bench.wasi_apps import workload_runner
+from helios_bench.wasi_apps import gap_bench, workload_runner
 from helios_bench.workloads import load_workloads, select_workloads
 
 GAP_BENCH = WASI_APPS_ROOT / "linux-gap-bench.py"
@@ -617,6 +618,36 @@ def github_run() -> tuple[str | None, str | None, int | None]:
     return run_id, f"{server}/{repository}/actions/runs/{run_id}", int(attempt) if attempt else None
 
 
+def samples_instructions(options: RunOptions) -> bool:
+    """Whether the driver samples this run's Helios boots at the instruction level.
+
+    The driver's own answer (`HELIOS_BENCH_INSTRUCTION_PROFILE` on a lane
+    whose backend has a sampler), for a run that boots Helios at all.
+    """
+    return Side.HELIOS in options.sides and gap_bench().samples_instructions(options.lane.helios_arch)
+
+
+def read_instruction_sampling(options: RunOptions, side: Side) -> InstructionSampling | None:
+    """How the driver says one Helios column of the run was sampled.
+
+    The driver writes the record for every image of a sampled run and for
+    none of an unsampled one, so a record missing from a sampled run, or
+    present in an unsampled one, is a column whose sampling the report
+    would misstate.
+    """
+    path = options.out_dir / SIDE_OUT[side] / gap_bench().INSTRUCTION_SAMPLING_RECORD
+    sampled = samples_instructions(options)
+    if sampled != path.is_file():
+        raise SystemExit(
+            f"the run {'samples' if sampled else 'does not sample'} its Helios boots at the "
+            f"instruction level, and the {side} column {'has no' if sampled else 'has a'} "
+            f"sampling record at {path}"
+        )
+    if not sampled:
+        return None
+    return InstructionSampling.model_validate_json(path.read_text(encoding="utf-8"))
+
+
 def thresholds_from(manifest: Manifest, iterations: int | None) -> Thresholds:
     statistics = manifest.statistics
     return Thresholds(
@@ -906,6 +937,11 @@ def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) ->
         deviations.append(
             "shared host listeners requested for reconnect diagnosis; not performance acceptance"
         )
+    if samples_instructions(options):
+        deviations.append(
+            "instruction sampling requested for diagnosis: every Helios timing carries the "
+            "sampler's overhead; not performance acceptance"
+        )
     if deviations and not options.advisory:
         raise SystemExit(
             "this host deviates from lane "
@@ -1019,6 +1055,10 @@ def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) ->
             kernel_pgo_functions=(candidate_uncovered[1] if candidate_uncovered is not None else None),
             baseline_kernel_pgo_uncovered=(baseline_uncovered[0] if baseline_uncovered is not None else None),
             baseline_kernel_pgo_functions=(baseline_uncovered[1] if baseline_uncovered is not None else None),
+            instruction_sampling=read_instruction_sampling(options, Side.HELIOS),
+            baseline_instruction_sampling=(
+                read_instruction_sampling(options, Side.HELIOS_BASELINE) if paired else None
+            ),
             retaken=retaken,
             reconfirmed=reconfirmed,
             noise_retry=noise_retry,

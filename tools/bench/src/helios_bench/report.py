@@ -103,6 +103,25 @@ class RetrySkippedForBudget(BaseModel):
 NoiseRetry = Annotated[RetriedForNoise | RetrySkippedForBudget, Field(discriminator="kind")]
 
 
+class InstructionSampling(BaseModel):
+    """How one Helios column's boots were sampled at the instruction level.
+
+    Sampling is a diagnosis that changes what is timed: every processor's
+    timer interrupts at the sampling period instead of the scheduler tick,
+    and a kernel task drains the samples, so every timing of a sampled
+    column carries the sampler's overhead (docs/benchmarks.md). The driver
+    samples every boot of every image of a run alike or refuses the run
+    (#475); this is what the guests said about it.
+    """
+
+    period_nanos: int = Field(
+        description="the interval between two samples on one processor, as every boot's guest reported it"
+    )
+    boots: int = Field(description="boots whose inspector reported a capture")
+    samples: int = Field(description="samples captured over those boots")
+    dropped: int = Field(description="samples the guest's rings refused over those boots")
+
+
 class RunInfo(BaseModel):
     id: str | None
     url: str | None
@@ -157,6 +176,17 @@ class RunInfo(BaseModel):
     reconfirmed: list[str] = Field(
         default_factory=list,
         description="headline workloads timed again on both images after the first pair of boots regressed",
+    )
+    instruction_sampling: InstructionSampling | None = Field(
+        default=None,
+        description=(
+            "how the `helios` column was sampled at the instruction level; None when it was "
+            "not, which is every run that did not ask for an instruction profile"
+        ),
+    )
+    baseline_instruction_sampling: InstructionSampling | None = Field(
+        default=None,
+        description="how the `helios_baseline` column was sampled, when the run was paired and sampled",
     )
     noise_retry: NoiseRetry | None = Field(
         default=None,

@@ -22,11 +22,12 @@ import pytest
 from bench_stub import fake_checkout, fake_inspector, records, workload
 
 from helios_bench.baseline import Baseline
+from helios_bench.cli import main as cli_main
 from helios_bench.gate import GateKind, evaluate, evaluate_paired, gate_report
 from helios_bench.manifest import load_manifest
 from helios_bench.plots import plot_report
 from helios_bench.render import render_gate, render_pins, render_tables
-from helios_bench.report import Report, Side, load_report, save_report
+from helios_bench.report import InstructionSampling, Report, Side, load_report, save_report
 from helios_bench.runner import (
     GAP_BENCH,
     NetworkOptions,
@@ -34,6 +35,7 @@ from helios_bench.runner import (
     kernel_pgo_uncovered,
     kernel_profiles,
     plan,
+    read_instruction_sampling,
     run_suite,
 )
 from helios_bench.wasi_apps import gap_bench
@@ -1174,3 +1176,182 @@ def test_the_baselines_uncovered_count_reads_its_own_profile_build(tmp_path) -> 
     assert kernel_pgo_uncovered(checkout, lane, profile) == (3, 42)
     # The plain release build beside it kept no list.
     assert kernel_pgo_uncovered(checkout, lane, None) is None
+
+
+# Instruction sampling in a pairing (#475). Run 38886442613 sampled the
+# candidate alone and reported +4.8-8.5% on compute that was the sampler:
+# every candidate boot ran its timer ten times as often and a drain task
+# besides, and the baseline boots ran neither.
+
+
+def sampled_side(driver, tmp_path, monkeypatch) -> list:
+    monkeypatch.setenv("HELIOS_BENCH_INSTRUCTION_PROFILE", "1")
+    images = images_of(driver, tmp_path, paired=True)
+    run_side(driver, tmp_path, images)
+    return images
+
+
+def test_a_sampled_pairing_samples_both_images_alike(driver, tmp_path, monkeypatch) -> None:
+    """Both columns carry the sampler, so the pair still compares like with like."""
+    images = sampled_side(driver, tmp_path, monkeypatch)
+
+    for image in images:
+        profiles = sorted(path.name for path in image.out_dir.glob("*.pc.folded"))
+        assert profiles == [
+            "helios-cpython-json.pc.folded",
+            "helios-hostcall-loop.pc.folded",
+            "helios-quickjs-loop.pc.folded",
+        ], f"every boot of the {image.name} image writes its instruction profile"
+        record = json.loads((image.out_dir / driver.INSTRUCTION_SAMPLING_RECORD).read_text(encoding="utf-8"))
+        assert record == {"period_nanos": 1_000_000, "boots": 3, "samples": 21, "dropped": 3}
+
+
+def test_an_unsampled_run_writes_no_profile_and_no_record(driver, tmp_path) -> None:
+    images = images_of(driver, tmp_path, paired=True)
+    run_side(driver, tmp_path, images)
+
+    for image in images:
+        assert not list(image.out_dir.glob("*.pc.folded"))
+        assert not (image.out_dir / driver.INSTRUCTION_SAMPLING_RECORD).exists()
+
+
+def test_a_baseline_that_predates_the_sampler_is_refused_before_any_boot(
+    driver, tmp_path, monkeypatch
+) -> None:
+    """Sampling one column alone is the bug, so a baseline whose own
+    inspector cannot sample refuses the run, naming why, before either
+    image boots."""
+    inspector = tmp_path / "baseline" / "target" / "release" / "helios-inspector"
+    monkeypatch.setenv("HELIOS_TEST_SAMPLER_ABSENT", str(inspector))
+    with pytest.raises(driver.AsymmetricInstructionSampling) as error:
+        sampled_side(driver, tmp_path, monkeypatch)
+    assert "helios-baseline image cannot be sampled" in str(error.value)
+    assert str(inspector) in str(error.value)
+    assert "--instruction-profile-output" in str(error.value)
+    assert not (tmp_path / "order").exists(), "no boot of either image ran"
+
+
+def test_columns_whose_guests_sample_at_different_periods_are_refused(driver, tmp_path, monkeypatch) -> None:
+    """Asked alike is not sampled alike: the period is the guest's own."""
+    (tmp_path / "baseline" / "sampling-period").write_text("250000", encoding="utf-8")
+    with pytest.raises(driver.AsymmetricInstructionSampling, match="250000 ns"):
+        sampled_side(driver, tmp_path, monkeypatch)
+
+
+def test_a_boot_that_reports_no_capture_ends_the_run(driver, tmp_path) -> None:
+    """Not a lost boot to record and continue past: the column it belongs
+    to is no longer known to carry the sampler."""
+    images = images_of(driver, tmp_path, paired=True)
+    with pytest.raises(driver.AsymmetricInstructionSampling, match="0 capture reports"):
+        driver.sampled_boot(images[1], images[1].out_dir / "helios-x.pc.folded", ["unrelated"])
+
+
+def sampling(period: int = 1_000_000) -> InstructionSampling:
+    return InstructionSampling(period_nanos=period, boots=3, samples=21, dropped=3)
+
+
+def test_a_pairing_sampled_alike_keeps_its_verdicts_and_says_so(
+    paired_regression_report: Report,
+) -> None:
+    paired_regression_report.run.instruction_sampling = sampling()
+    paired_regression_report.run.baseline_instruction_sampling = sampling()
+
+    result = evaluate_paired(paired_regression_report)
+    assert result.sampling_period_nanos == 1_000_000
+    assert result.blocking and result.headline_regressions
+    text = render_gate(gate_report(paired_regression_report, None), "x86-64-kvm")
+    assert "Both columns were sampled at the instruction level, every 1 ms" in text
+    assert "**regression**" in text
+    tables = render_tables(paired_regression_report)
+    assert "Instruction sampling was on" in tables
+    assert "both images alike" in tables
+    assert "includes the sampler's overhead" in tables
+
+
+@pytest.mark.parametrize(
+    ("candidate", "baseline"),
+    [(sampling(), None), (None, sampling()), (sampling(), sampling(250_000))],
+)
+def test_a_pairing_sampled_unalike_is_refused(paired_regression_report: Report, candidate, baseline) -> None:
+    paired_regression_report.run.instruction_sampling = candidate
+    paired_regression_report.run.baseline_instruction_sampling = baseline
+    with pytest.raises(SystemExit, match="the paired comparison is refused"):
+        evaluate_paired(paired_regression_report)
+
+
+def test_a_sampled_candidate_refuses_the_cross_run_table_and_keeps_the_paired_one(
+    paired_regression_report: Report, baseline_report: Report
+) -> None:
+    """`dev` is never sampled, so a sampled candidate's cross-run shift is
+    partly the sampler; the paired table, sampled alike, still stands."""
+    paired_regression_report.run.instruction_sampling = sampling()
+    paired_regression_report.run.baseline_instruction_sampling = sampling()
+
+    report = gate_report(paired_regression_report, baseline_report)
+    assert report.paired is not None and report.cross_run is None
+    assert report.cross_run_refused is not None
+    assert report.blocking, "the paired half still blocks on its own verdicts"
+    text = render_gate(report, "x86-64-kvm")
+    assert "Refused: the baseline run 1001 was not sampled" in text
+    assert "neither blocks nor passes" in text
+    with pytest.raises(SystemExit, match="cross-run comparison is refused"):
+        evaluate(baseline_report, paired_regression_report)
+
+
+def test_an_unpaired_sampled_run_against_dev_is_refused(
+    regressed_report: Report, baseline_report: Report, tmp_path
+) -> None:
+    regressed_report.run.instruction_sampling = sampling()
+    candidate = tmp_path / "candidate.json"
+    dev = tmp_path / "dev.json"
+    save_report(regressed_report, candidate)
+    save_report(baseline_report, dev)
+    with pytest.raises(SystemExit, match="not paired and the cross-run comparison is refused"):
+        cli_main(["gate", "--candidate", str(candidate), "--baseline", str(dev)])
+
+
+def test_a_sampled_dev_report_refuses_an_unsampled_candidate(
+    regressed_report: Report, baseline_report: Report
+) -> None:
+    """The other direction: a sampled dispatch on `dev` is the newest dev
+    report the next run's gate fetches."""
+    baseline_report.run.instruction_sampling = sampling()
+    report = gate_report(regressed_report, baseline_report)
+    assert report.cross_run is None and report.cross_run_refused is not None
+    assert "sampled every 1 ms on each processor" in report.cross_run_refused.reason
+
+
+def test_the_sampling_record_reaches_the_run_record(tmp_path, monkeypatch) -> None:
+    driver = gap_bench()
+    options = RunOptions(
+        lane=load_manifest().lane("x86-64-kvm"),
+        out_dir=tmp_path,
+        advisory=True,
+        sides=frozenset({Side.HELIOS, Side.HELIOS_BASELINE}),
+        baseline=Baseline(ref="merge-base", sha="a" * 40, worktree=tmp_path / "worktree"),
+    )
+    monkeypatch.setenv("HELIOS_BENCH_INSTRUCTION_PROFILE", "1")
+    (tmp_path / "helios").mkdir()
+    (tmp_path / "helios" / driver.INSTRUCTION_SAMPLING_RECORD).write_text(
+        sampling().model_dump_json(), encoding="utf-8"
+    )
+    assert read_instruction_sampling(options, Side.HELIOS) == sampling()
+    with pytest.raises(SystemExit, match="helios_baseline column has no sampling record"):
+        read_instruction_sampling(options, Side.HELIOS_BASELINE)
+    monkeypatch.setenv("HELIOS_BENCH_INSTRUCTION_PROFILE", "0")
+    with pytest.raises(SystemExit, match="does not sample .* helios column has a sampling record"):
+        read_instruction_sampling(options, Side.HELIOS)
+
+
+def test_a_sampled_run_cannot_be_published(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("helios_bench.runner.host_deviations", lambda lane: [])
+    monkeypatch.setenv("HELIOS_BENCH_INSTRUCTION_PROFILE", "1")
+    manifest = load_manifest()
+    options = RunOptions(
+        lane=manifest.lane("x86-64-kvm"),
+        out_dir=tmp_path,
+        advisory=False,
+        sides=frozenset({Side.HELIOS}),
+    )
+    with pytest.raises(SystemExit, match="instruction sampling requested for diagnosis"):
+        run_suite(options, manifest, dry_run=True)
