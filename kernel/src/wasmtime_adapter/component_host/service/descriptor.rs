@@ -10,7 +10,8 @@ pub(super) struct WasixChildProcess {
 
 pub(super) struct WasixThread {
     pub(super) tid: u32,
-    pub(super) signal_state: WasixSignalState,
+    /// The thread's own mailbox, which `thread_signal` raises on.
+    pub(super) signals: WasixSignalState,
     pub(super) exit: Option<futures::channel::oneshot::Receiver<u32>>,
     pub(super) completed: Option<u32>,
 }
@@ -27,11 +28,11 @@ pub(super) enum WasixSignalDispositionAction {
     Ignore,
 }
 
-/// The signals pending for one process, shared by its stores (its
-/// threads' included) and by whoever raises them: the one pending
-/// delivery, the interval timer's generation, the broadcast a raise
-/// sends to the turns driving the process's stores, and the process a
-/// raise interrupts.
+/// One signal mailbox: a process's, shared by every store of the
+/// process (its threads' included), or one thread's, read only by that
+/// thread's store. It holds the one pending delivery, the interval
+/// timer's generation, the broadcast a raise sends to the turns driving
+/// the stores that read it, and the instance a raise interrupts.
 ///
 /// # Concurrency
 ///
@@ -945,21 +946,61 @@ pub(super) fn preview1_exit_status(error: &wasmtime::Error, requested: Option<u3
     }
 }
 
-/// A raise wakes the turns driving the process's stores, so a guest
-/// suspended in a host call is stopped without waiting for the call.
-impl crate::component::StopWake for WasixSignalState {
-    type Wait = crate::NotifyWaiter;
+/// The signals one store answers to: those raised on its own thread and
+/// those raised on its process. A thread-directed raise reaches only this
+/// store's turn; a process-directed one goes to whichever store of the
+/// process takes it first.
+///
+/// # Concurrency
+///
+/// As [`WasixSignalState`]: either mailbox is raised from any processor,
+/// and one turn of this store at a time takes.
+#[derive(Clone)]
+pub(super) struct WasixStoreSignals {
+    thread: WasixSignalState,
+    process: WasixSignalState,
+}
 
-    fn arm_stop_wait(&self) -> crate::NotifyWaiter {
-        self.shared.raised.waiter()
+impl WasixStoreSignals {
+    pub(super) fn new(thread: WasixSignalState, process: WasixSignalState) -> Self {
+        Self { thread, process }
+    }
+
+    /// The signal this store owes its guest, its own thread's first.
+    pub(super) fn take_pending(&self) -> Option<u32> {
+        self.thread
+            .take_pending()
+            .or_else(|| self.process.take_pending())
+    }
+}
+
+/// A raise on either mailbox wakes the turn driving this store, so a
+/// guest suspended in a host call is stopped without waiting for the
+/// call.
+impl crate::component::StopWake for WasixStoreSignals {
+    type Wait = (crate::NotifyWaiter, crate::NotifyWaiter);
+
+    fn arm_stop_wait(&self) -> Self::Wait {
+        (
+            self.thread.shared.raised.waiter(),
+            self.process.shared.raised.waiter(),
+        )
     }
 
     fn poll_stop_wait(
         &self,
         cx: &mut core::task::Context<'_>,
-        wait: &mut crate::NotifyWaiter,
+        (thread, process): &mut Self::Wait,
     ) -> core::task::Poll<()> {
-        self.shared.raised.poll_notified(cx, wait)
+        // Both are polled, so each re-arms on `Ready` as the trait asks
+        // and each registers its listener on `Pending`.
+        let thread = self.thread.shared.raised.poll_notified(cx, thread);
+        let process = self.process.shared.raised.poll_notified(cx, process);
+        if thread.is_ready() || process.is_ready() {
+            core::task::Poll::Ready(())
+        } else {
+            core::task::Poll::Pending
+        }
     }
 }
 
@@ -970,7 +1011,7 @@ impl crate::component::StopWake for WasixSignalState {
 /// host without meeting the interrupt check that would otherwise have
 /// delivered it.
 impl<RuntimeStateImpl> crate::component::TurnEpilogue<RuntimeStateImpl, wasmtime::Error>
-    for WasixSignalState
+    for WasixStoreSignals
 {
     fn end_turn(&self, _: &RuntimeStateImpl) {}
 
