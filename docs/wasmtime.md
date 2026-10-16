@@ -5,13 +5,51 @@ at `../wasmtime/crates/wasmtime`.
 
 ## Required revision
 
-The local checkout must be at (branch `helios/parking-wait-cancel`):
+The local checkout must be at (branch `helios/stack-limit-percpu`):
 
 ```text
-2fb47b20c7ff9a91b6dbc03062d1dd4dddab4969
+3f143bac2df9b6fa5c946a155d97d5f00ded7034
 ```
 
-That revision is `helios/parking-wait-timeout` at
+That revision is `helios/parking-wait-cancel` at
+`2fb47b20c7ff9a91b6dbc03062d1dd4dddab4969` plus four additive commits,
+which make each stack-limit interruption check one compare against the
+executing processor's own word (#465):
+
+- The resumable check's cold call goes through a `preserve_all`
+  trampoline, so it clobbers no register and a call-free function keeps
+  its values in caller-saved registers across its checks.
+- Cranelift gains `load_processor_local.i64 +offset`, a load from the
+  thread-pointer base (`fs` on x86-64, `tpidr_el1` on AArch64, `tp` on
+  RISC-V 64) that is never merged or hoisted. On x86-64 a stack check
+  against it lowers to `cmp rsp, fs:[offset]; jb`. To get there, a
+  branch may now sink a side-effecting single-use input as any other
+  instruction may, and `get_stack_pointer` is rematerialized per block.
+- `memory.copy` and `memory.fill` no longer expand into a chunk loop with
+  a check between chunks under stack-limit interruption: the libcalls
+  chunk the work and deliver a pending interrupt between chunks
+  themselves, through the same callback as the builtin.
+- `Config::stack_limit_location(StackLimitLocation::PerProcessor { offset })`
+  makes every resumable check read the processor's word instead of
+  `VMStoreContext::stack_limit`. It is a tunable, so a cwasm compiled for
+  one location is refused by an engine set to the other. A `no_std` build
+  declares `wasmtime_processor_stack_limit() -> *mut usize`, which returns
+  the executing processor's word. The runtime publishes the store's limit
+  there when its wasm enters or resumes on a processor, and when it leaves
+  the innermost activation left on the thread publishes its own again. An
+  interrupt request stores the pending flag and raises the sentinel in the
+  word the store was last published to: no lock, no allocation, no IPI.
+
+Helios needs it because the store-context check costs 7-8 instructions
+and a register chain per loop iteration (12-31% on compute against no
+interruption). Every bare-metal backend keeps the word at
+`helios_hal::cpu::GUEST_STACK_LIMIT_OFFSET` in its processor anchor
+block and exports `wasmtime_processor_stack_limit`; `hosted` keeps the
+store-context location.
+
+The revision it replaces is `helios/parking-wait-cancel` at
+`2fb47b20c7ff9a91b6dbc03062d1dd4dddab4969`, which is
+`helios/parking-wait-timeout` at
 `3741766da8e691dfa9e642ab9f16cfb30c1fc5a3` plus one additive commit
 (written on that branch's earlier `62bf033a` and merged forward), which
 gives a `no_std` `memory.atomic.wait` a cancellation exit (#445):

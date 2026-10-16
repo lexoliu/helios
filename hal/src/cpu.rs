@@ -226,6 +226,32 @@ pub fn current_processor() -> ProcessorId {
     unsafe { helios_current_processor() }
 }
 
+/// Byte offset of the guest stack-limit word in the executing processor's
+/// local block: the block the backend's processor anchor addresses
+/// (`IA32_FS_BASE` on x86-64, `tpidr_el1` on AArch64, `tp` on RISC-V).
+///
+/// Compiled guest code compares its stack pointer against this word at the
+/// entry of every function that can call wasm and at every loop header —
+/// `cmp rsp, fs:[16]` on x86-64 — so the word must sit at this one offset in
+/// every backend's block. The compiler that emits the compare and the kernel
+/// that runs it agree on it through this constant, and a cwasm built for one
+/// offset is refused by an engine configured for another. It is signed
+/// because it is a displacement from the thread-pointer base, which is how
+/// the compiler takes it.
+///
+/// # Concurrency
+///
+/// The word holds the stack limit of the guest running on its processor, or
+/// a sentinel that makes that guest's next check fail when an interruption
+/// is pending. The owning processor writes the limit whenever a guest starts
+/// or resumes on it (wasm entry, a fiber's resume), and again for the guest
+/// it returns to when one stops (wasm exit, a fiber's suspend); it is the
+/// only reader. Any processor may store the sentinel, which is how a timer
+/// interrupt or a kill on another processor reaches a running guest without
+/// a lock or an IPI. The backend's block keeps the word on the owning
+/// processor's own cache lines.
+pub const GUEST_STACK_LIMIT_OFFSET: i32 = 16;
+
 /// How a processor's timer interrupt is scheduled, which decides what
 /// [`Cpu::set_deadline`] does on it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

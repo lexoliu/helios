@@ -2,10 +2,16 @@
 //! kill, a signal.
 //!
 //! Every store of an engine is interruptible through its
-//! [`StoreInterruptHandle`]: a request lowers the store's published stack
-//! limit to a sentinel, the guest's next function-entry or loop-header
-//! check fails, and the store's interrupt callback runs in its place. A
-//! request made while the guest is in host code or suspended on its fiber
+//! [`StoreInterruptHandle`]: a request raises the stack limit the guest's
+//! checks read to a sentinel, the guest's next function-entry or
+//! loop-header check fails, and the store's interrupt callback runs in its
+//! place. On a bare-metal backend that limit is the guest-stack-limit word
+//! of the processor the store's wasm runs on
+//! ([`helios_hal::cpu::GUEST_STACK_LIMIT_OFFSET`] in its anchor block), so
+//! the request is a flag store, one pointer load and one store into that
+//! word, still with no lock, no allocation and no IPI; under `hosted` it is
+//! the store's own limit. A request made while the guest is in host code or
+//! suspended on its fiber
 //! is kept until the guest is next in wasm, so a requester never has to
 //! know whether its target is running.
 //!

@@ -1,6 +1,6 @@
 use helios_artifact::{
     CWASM_MEMORY_GUARD_SIZE, CWASM_MEMORY_RESERVATION, cwasm_target_cranelift_flags,
-    cwasm_target_supports_wasm_simd,
+    cwasm_target_guest_stack_limit_offset, cwasm_target_supports_wasm_simd,
 };
 use std::cell::{Cell, RefCell};
 use std::env;
@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use thiserror::Error;
 use wasmparser::{Encoding, Parser, Payload};
-use wasmtime::{Config, Engine, OptLevel, Strategy};
+use wasmtime::{Config, Engine, OptLevel, StackLimitLocation, Strategy};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AotCompileHint {
@@ -471,6 +471,12 @@ fn build_engine_config(target: &str, hint: AotCompileHint, worker_count: usize) 
     config.concurrency_support(true);
     config.parallel_compilation(worker_count > 1);
     config.stack_limit_interruption(true);
+    // The kernel engine reads the limit from the same location (see
+    // `cwasm_target_guest_stack_limit_offset`) and refuses a cwasm compiled
+    // for the other one.
+    if let Some(offset) = cwasm_target_guest_stack_limit_offset(target) {
+        config.stack_limit_location(StackLimitLocation::PerProcessor { offset });
+    }
     // Wasmtime validates `max_wasm_stack <= async_stack_size`; keep the async
     // fiber stack comfortably above the wasm stack limit with host headroom.
     config.max_wasm_stack(8 * 1024 * 1024);

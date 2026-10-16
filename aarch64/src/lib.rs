@@ -17,7 +17,10 @@ use helios_hal::boot::{
     BootMemoryRegion, BootModule, BootModules, BootReservedRanges, FirmwareKind,
     usable_region_segments,
 };
-use helios_hal::cpu::{Cpu, HardwarePerfCounters, Instant, ProcessorId, Timebase, TimerInterrupt};
+use helios_hal::cpu::{
+    Cpu, GUEST_STACK_LIMIT_OFFSET, HardwarePerfCounters, Instant, ProcessorId, Timebase,
+    TimerInterrupt,
+};
 use helios_hal::critical_section::ProcessorIdentity;
 use helios_hal::entropy::{EntropyQuality, EntropyUnavailable};
 use helios_hal::memory::MemoryRegion;
@@ -267,13 +270,34 @@ static MMIO_PAGE_TABLE_0: PageTable = PageTable::new();
 static MMIO_PAGE_TABLE_1: PageTable = PageTable::new();
 static MMIO_PAGE_TABLE_2: PageTable = PageTable::new();
 
+/// The processor's local block, addressed by `tpidr_el1`.
+///
+/// The layout is `#[repr(C)]` because compiled guest code reads
+/// `guest_stack_limit` at `tpidr_el1 + GUEST_STACK_LIMIT_OFFSET`; the offset
+/// is asserted below.
 #[repr(C)]
 struct ProcessorRuntime {
-    exception_stack: ExceptionStack,
     logical_id: u16,
     _reserved: u16,
-    wasmtime_tls: WasmtimeTlsSlots,
+    /// Block size in bytes for the `DC ZVA` cache-line zero
+    /// instruction, cached from `DCZID_EL0` at processor bring-up.
+    /// Zero means DC ZVA is prohibited on this PE (`DCZID_EL0.DZP`
+    /// is set) and callers must fall back to a generic memset.
+    dc_zva_block_bytes: AtomicU32,
     started: AtomicBool,
+    /// Set by `wake_processor` before it sends the wake SGI, cleared by
+    /// `park_current` under masked interrupts. It closes the window
+    /// between the run loop finding its queue empty and the `wfi` that
+    /// parks: a wake published in that window is observed instead of
+    /// slept through.
+    wake_pending: AtomicBool,
+    /// The stack limit of the guest running on this processor, under
+    /// [`GUEST_STACK_LIMIT_OFFSET`]'s contract: Wasmtime publishes it through
+    /// `wasmtime_processor_stack_limit`, and any processor may store the
+    /// interrupt sentinel into it.
+    guest_stack_limit: AtomicUsize,
+    exception_stack: ExceptionStack,
+    wasmtime_tls: WasmtimeTlsSlots,
     /// This processor's kernel timer, published once its own
     /// `helios_kernel::init` has run so the timer PPI can advance it.
     timer: Once<Timer<Aarch64Cpu>>,
@@ -283,40 +307,30 @@ struct ProcessorRuntime {
     /// Device interrupt routes, installed on the bootstrap processor
     /// only: every device SPI is routed to it.
     device_interrupts: Once<DeviceInterruptRoutes>,
-    /// Set by `wake_processor` before it sends the wake SGI, cleared by
-    /// `park_current` under masked interrupts. It closes the window
-    /// between the run loop finding its queue empty and the `wfi` that
-    /// parks: a wake published in that window is observed instead of
-    /// slept through.
-    wake_pending: AtomicBool,
-    /// Block size in bytes for the `DC ZVA` cache-line zero
-    /// instruction, cached from `DCZID_EL0` at processor bring-up.
-    /// Zero means DC ZVA is prohibited on this PE (`DCZID_EL0.DZP`
-    /// is set) and callers must fall back to a generic memset.
-    dc_zva_block_bytes: AtomicU32,
 }
 
 impl ProcessorRuntime {
     fn new(logical_id: u16) -> Self {
         Self {
-            exception_stack: ExceptionStack::new(),
             logical_id,
             _reserved: 0,
-            wasmtime_tls: WasmtimeTlsSlots::new(),
+            dc_zva_block_bytes: AtomicU32::new(0),
             started: AtomicBool::new(false),
+            wake_pending: AtomicBool::new(false),
+            guest_stack_limit: AtomicUsize::new(usize::MAX),
+            exception_stack: ExceptionStack::new(),
+            wasmtime_tls: WasmtimeTlsSlots::new(),
             timer: Once::new(),
             program_service: Once::new(),
             device_interrupts: Once::new(),
-            wake_pending: AtomicBool::new(false),
-            dc_zva_block_bytes: AtomicU32::new(0),
         }
     }
 }
 
-/// The exception entries in `entry.S` derive the per-processor
-/// exception stack from `tpidr_el1`, which only holds if the stack is
-/// the first field of the runtime.
-const _: () = assert!(core::mem::offset_of!(ProcessorRuntime, exception_stack) == 0);
+const _: () = assert!(
+    core::mem::offset_of!(ProcessorRuntime, guest_stack_limit) == GUEST_STACK_LIMIT_OFFSET as usize,
+    "compiled guest code would compare its stack pointer against the wrong word"
+);
 
 #[repr(C, align(16))]
 struct ExceptionStack([u8; EXCEPTION_STACK_BYTES]);
@@ -1054,7 +1068,7 @@ impl ProcessorRuntime {
 
 fn activate_processor_runtime(runtime: &'static ProcessorRuntime) {
     let ptr = runtime as *const _ as usize;
-    let exception_stack_top = ptr
+    let exception_stack_top = (&raw const runtime.exception_stack as usize)
         .checked_add(EXCEPTION_STACK_BYTES)
         .unwrap_or_else(|| panic!("AArch64 exception stack top overflow"));
     unsafe {
@@ -2236,6 +2250,15 @@ extern "C" fn wasmtime_tls_get(slot: usize) -> *mut u8 {
 #[unsafe(no_mangle)]
 extern "C" fn wasmtime_tls_set(slot: usize, ptr: *mut u8) {
     current_processor_runtime().wasmtime_tls.set(slot, ptr);
+}
+
+/// The executing processor's guest stack-limit word, the location the
+/// kernel's engines publish stack limits to
+/// (`helios_hal::cpu::GUEST_STACK_LIMIT_OFFSET`).
+#[cfg(target_os = "none")]
+#[unsafe(no_mangle)]
+extern "C" fn wasmtime_processor_stack_limit() -> *mut usize {
+    current_processor_runtime().guest_stack_limit.as_ptr()
 }
 
 #[cfg(target_os = "none")]

@@ -1288,6 +1288,14 @@ extern "C" fn wasmtime_tls_set(slot: usize, ptr: *mut u8) {
     smp::current_runtime().wasmtime_tls.set(slot, ptr);
 }
 
+/// The executing processor's guest stack-limit word, the location the
+/// kernel's engines publish stack limits to
+/// (`helios_hal::cpu::GUEST_STACK_LIMIT_OFFSET`).
+#[unsafe(no_mangle)]
+extern "C" fn wasmtime_processor_stack_limit() -> *mut usize {
+    smp::current_guest_stack_limit().as_ptr()
+}
+
 #[unsafe(no_mangle)]
 extern "C" fn wasmtime_init_traps(handler: helios_kernel::KernelNativeTrapHandler) -> i32 {
     helios_kernel::install_native_trap_handler(handler);
