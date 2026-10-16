@@ -151,8 +151,8 @@ const fn decode_kill_flag(value: u8) -> Option<KillReason> {
 /// Whoever condemns the instance also interrupts its stores, so a victim
 /// executing wasm traps at its next function entry or loop header, and
 /// the condemnation wakes the turn of a victim that is suspended, which
-/// drops the call at the executor's next poll of it; five scheduler
-/// ticks (`SCHEDULER_INTERRUPT_INTERVAL`) leave room for the call to
+/// drops the call at the executor's next poll of it; five idle interrupt
+/// intervals (`IDLE_INTERRUPT_INTERVAL`) leave room for the call to
 /// unwind and the store to drop.
 ///
 /// The grace period is still bounded, because reclaim is the victim's

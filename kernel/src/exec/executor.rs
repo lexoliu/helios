@@ -850,7 +850,17 @@ impl Executor {
         )
     }
 
-    pub fn run_until_stalled_with_stats(&self) -> ExecutorRunStats {
+    /// Runs ready tasks until the queues are empty or a batch has run.
+    ///
+    /// `timer` is this processor's. Before the first task of a pass runs,
+    /// its deadline is pulled to within one scheduler tick
+    /// ([`Timer::arm_scheduler_tick`]): the task may be a guest, which is
+    /// preempted only from a timer interrupt, and a processor that has
+    /// just left a park may have its deadline an idle interval out.
+    pub fn run_until_stalled_with_stats<CpuImpl: Cpu + Clone>(
+        &self,
+        timer: &Timer<CpuImpl>,
+    ) -> ExecutorRunStats {
         let mut stats = ExecutorRunStats::default();
         let local_queue = &self.group.local_queues[self.local_queue_index];
         let local_ready_count = &self.group.local_ready_counts[self.local_queue_index];
@@ -882,6 +892,9 @@ impl Executor {
                 return stats;
             };
 
+            if stats.runnable_count() == 0 {
+                timer.arm_scheduler_tick();
+            }
             runnable.run();
             match source {
                 ReadySource::Local => stats.local_runnable_count += 1,
@@ -1687,12 +1700,13 @@ mod tests {
     fn global_batch_does_not_probe_empty_local_queue_per_task() {
         let _serialized = super::executor_test_guard();
         let executor = Executor::new(ProgressCounter::new(), 1, ProcessorId::new(0));
+        let timer = executor.timer(TestCpu::new());
         let spawner = executor.spawner(TestCpu::new());
         for _ in 0..8 {
             spawner.spawn_detached(async {});
         }
 
-        let stats = executor.run_until_stalled_with_stats();
+        let stats = executor.run_until_stalled_with_stats(&timer);
 
         assert_eq!(stats.global_runnable_count(), 8);
         assert_eq!(stats.local_runnable_count(), 0);
@@ -2069,6 +2083,107 @@ mod tests {
             Some(&(ProcessorId::new(0), now + 400)),
             "the owner arms the earliest published deadline before it parks"
         );
+    }
+
+    /// A processor's deadline is the earlier of its next sleep and, while
+    /// it is running work, the next scheduler tick (10 ms): its timer
+    /// interrupt re-arms a tick on unless it is parked, when it stretches
+    /// to the idle interval (100 ms), and the first executor pass that
+    /// runs work after a park pulls it back within a tick, once, not on
+    /// every pass.
+    #[test]
+    fn a_running_processor_is_interrupted_every_tick_and_a_parked_one_keeps_its_long_deadline() {
+        let _serialized = super::executor_test_guard();
+        let cpu = RecordingSmpCpu::new(0, 1);
+        let executor = Executor::new(ProgressCounter::new(), 1, ProcessorId::new(0));
+        let timer = executor.timer(cpu.clone());
+        let spawner = executor.spawner(cpu.clone());
+        let idle = &executor.group.idle[0];
+        let now = cpu.now().ticks();
+        let tick = cpu
+            .timebase()
+            .duration_to_ticks(core::time::Duration::from_millis(10));
+        let long = cpu
+            .timebase()
+            .duration_to_ticks(core::time::Duration::from_millis(100));
+        let armed = || cpu.deadlines().last().expect("a deadline was armed").1;
+        let programmed = || cpu.deadlines().len();
+
+        assert_eq!(armed(), now + tick, "a processor builds its timer running");
+
+        idle.store(IdleState::Parked);
+        timer.handle_interrupt();
+        assert_eq!(
+            armed(),
+            now + long,
+            "a parked processor stretches to the idle interval"
+        );
+
+        let parked_programs = programmed();
+        assert_eq!(
+            executor
+                .run_until_stalled_with_stats(&timer)
+                .runnable_count(),
+            0
+        );
+        assert_eq!(
+            programmed(),
+            parked_programs,
+            "a pass with no work keeps the long deadline"
+        );
+
+        idle.store(IdleState::Running);
+        spawner.spawn_local_detached(async {});
+        assert_eq!(
+            executor
+                .run_until_stalled_with_stats(&timer)
+                .runnable_count(),
+            1
+        );
+        assert_eq!(
+            armed(),
+            now + tick,
+            "work after a park is interrupted within a tick"
+        );
+        let running_programs = programmed();
+        for _ in 0..4 {
+            spawner.spawn_local_detached(async {});
+            executor.run_until_stalled_with_stats(&timer);
+        }
+        assert_eq!(
+            programmed(),
+            running_programs,
+            "no arm per pass inside a tick"
+        );
+
+        timer.handle_interrupt();
+        assert_eq!(
+            armed(),
+            now + tick,
+            "a running processor's interrupt re-arms a tick on"
+        );
+
+        let mut context = Context::from_waker(Waker::noop());
+        let mut soon = timer.sleep_until(Instant::new(now + tick / 2));
+        assert!(Pin::new(&mut soon).poll(&mut context).is_pending());
+        assert_eq!(
+            armed(),
+            now + tick / 2,
+            "a sleep sooner than the tick is armed"
+        );
+        drop(soon);
+        timer.fire_expired();
+
+        let mut late = timer.sleep_until(Instant::new(now + long / 2));
+        assert!(Pin::new(&mut late).poll(&mut context).is_pending());
+        idle.store(IdleState::Parked);
+        timer.handle_interrupt();
+        assert_eq!(
+            armed(),
+            now + long / 2,
+            "a parked processor wakes for its next sleep inside the idle interval"
+        );
+        idle.store(IdleState::Running);
     }
 
     #[test]

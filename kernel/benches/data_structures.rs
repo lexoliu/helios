@@ -409,6 +409,7 @@ fn notify_coalesced_presignaled_future_wait(bencher: Bencher, count: usize) {
 fn executor_spawn_detached_run_global(bencher: Bencher, count: usize) {
     let executor = Executor::new(ProgressCounter::new(), 1, ProcessorId::new(0));
     let spawner = executor.spawner(BenchCpu::new());
+    let timer = executor.timer(BenchCpu::new());
     // Task allocation includes the scheduler capture stored by async-task. This
     // benchmark keeps the per-task byte count visible while we move toward a
     // pooled task/waker design; removing the runtime progress-mode field moved
@@ -417,7 +418,7 @@ fn executor_spawn_detached_run_global(bencher: Bencher, count: usize) {
         for _ in 0..count {
             spawner.spawn_detached(async {});
         }
-        let stats = executor.run_until_stalled_with_stats();
+        let stats = executor.run_until_stalled_with_stats(&timer);
         assert_eq!(stats.global_runnable_count(), count);
         assert_eq!(stats.local_runnable_count(), 0);
     });
@@ -427,6 +428,7 @@ fn executor_spawn_detached_run_global(bencher: Bencher, count: usize) {
 fn executor_spawn_detached_run_local(bencher: Bencher, count: usize) {
     let executor = Executor::new(ProgressCounter::new(), 1, ProcessorId::new(0));
     let spawner = executor.spawner(BenchCpu::new());
+    let timer = executor.timer(BenchCpu::new());
     // Local tasks still carry owner-processor routing state, so the scheduler
     // capture is slightly larger than the global path: 73 B per no-op task on
     // this host after removing the runtime progress-mode field.
@@ -434,7 +436,7 @@ fn executor_spawn_detached_run_local(bencher: Bencher, count: usize) {
         for _ in 0..count {
             spawner.spawn_local_detached(async {});
         }
-        let stats = executor.run_until_stalled_with_stats();
+        let stats = executor.run_until_stalled_with_stats(&timer);
         assert_eq!(stats.local_runnable_count(), count);
         assert_eq!(stats.global_runnable_count(), 0);
     });
