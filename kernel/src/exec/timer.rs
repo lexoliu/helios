@@ -256,10 +256,7 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
     /// parker half of the wake handshake [`Self::publish_deadline`]
     /// describes.
     pub(crate) fn is_due(&self, now: Instant) -> bool {
-        self.shared
-            .next_sleep_deadline
-            .load(AtomicOrdering::SeqCst)
-            <= now.ticks()
+        self.shared.next_sleep_deadline.load(AtomicOrdering::SeqCst) <= now.ticks()
     }
 
     /// Programs the published sleep deadline into the owner's hardware
@@ -270,10 +267,7 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
     /// looking.
     pub(crate) fn arm_published_deadline(&self) {
         // `SeqCst`: the parker half of the wake handshake.
-        let published = self
-            .shared
-            .next_sleep_deadline
-            .load(AtomicOrdering::SeqCst);
+        let published = self.shared.next_sleep_deadline.load(AtomicOrdering::SeqCst);
         if published < self.shared.armed_deadline.load(AtomicOrdering::Relaxed) {
             self.arm_deadline(Instant::new(published));
         }
@@ -397,10 +391,7 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
     /// owner's next tick finds the sleep.
     fn publish_deadline(&self, deadline: Instant) {
         let deadline = deadline.ticks();
-        let mut published = self
-            .shared
-            .next_sleep_deadline
-            .load(AtomicOrdering::SeqCst);
+        let mut published = self.shared.next_sleep_deadline.load(AtomicOrdering::SeqCst);
         loop {
             if deadline >= published {
                 return;

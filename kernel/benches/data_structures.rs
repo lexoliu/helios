@@ -363,7 +363,8 @@ fn futex_prepare_complete_distinct_keys(bencher: Bencher, count: usize) {
 
 #[divan::bench(args = [1usize, 64, 1024])]
 fn timer_sleep_future_create_drop(bencher: Bencher, count: usize) {
-    let timer = Executor::new(ProgressCounter::new(), 1, ProcessorId::new(0)).timer(BenchCpu::new());
+    let timer =
+        Executor::new(ProgressCounter::new(), 1, ProcessorId::new(0)).timer(BenchCpu::new());
     // Created-but-never-polled sleeps model timeout candidates that lose a
     // select/race before the executor parks the task. They must not allocate;
     // pending sleeps still allocate one timer state until the sleep-state pool

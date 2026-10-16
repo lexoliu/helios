@@ -2037,13 +2037,25 @@ mod tests {
         idle.store(IdleState::Parked);
         let mut while_parked = timer.sleep_until(Instant::new(now + 500));
         assert!(Pin::new(&mut while_parked).poll(&mut context).is_pending());
-        assert_eq!(cpu.deadlines(), built, "a foreign publish programs no comparator");
-        assert_eq!(cpu.woken(), [ProcessorId::new(0)], "the parked owner is woken");
+        assert_eq!(
+            cpu.deadlines(),
+            built,
+            "a foreign publish programs no comparator"
+        );
+        assert_eq!(
+            cpu.woken(),
+            [ProcessorId::new(0)],
+            "the parked owner is woken"
+        );
 
         idle.store(IdleState::Running);
         let mut while_running = timer.sleep_until(Instant::new(now + 400));
         assert!(Pin::new(&mut while_running).poll(&mut context).is_pending());
-        assert_eq!(cpu.deadlines(), built, "a foreign publish programs no comparator");
+        assert_eq!(
+            cpu.deadlines(),
+            built,
+            "a foreign publish programs no comparator"
+        );
         assert_eq!(
             cpu.woken(),
             [ProcessorId::new(0)],
