@@ -26,7 +26,6 @@ use triomphe::Arc;
 
 use crate::component::{ProviderReceiver, provider_channel};
 use crate::device::{DeviceOwnership, DeviceWindow, LinearMemory, test_hooks};
-use crate::exec::Timer;
 use crate::test_support::{ManualClockCpu, TestCpu};
 
 use super::owner::{drain_audio_events, play, serve_playback};
@@ -423,7 +422,7 @@ fn dying_hands_the_stream_back_through_the_playback_task() {
     );
 
     let device = ScriptedDevice::new(topology(&[playback_stream(0)]));
-    let timer = Timer::new(TestCpu::without_entropy());
+    let timer = crate::test_support::test_timer(TestCpu::without_entropy());
     let inbox = &inboxes[0];
     block_on(async {
         // One turn of the task's loop: it takes the release permit,
@@ -461,7 +460,7 @@ fn the_device_holds_no_more_than_the_periods_in_flight() {
     let (ring, params) = audio.negotiate(TONE).expect("the device takes this format");
 
     let device = ScriptedDevice::new(topology(&[playback_stream(0)]));
-    let timer = Timer::new(TestCpu::without_entropy());
+    let timer = crate::test_support::test_timer(TestCpu::without_entropy());
     let periods = 9_usize;
     let tone = alloc::vec![0x5a_u8; params.period_bytes as usize * periods];
 
@@ -515,7 +514,7 @@ fn a_final_part_period_is_played_with_its_tail_zeroed() {
     let (ring, params) = audio.negotiate(TONE).expect("the device takes this format");
 
     let device = ScriptedDevice::new(topology(&[playback_stream(0)]));
-    let timer = Timer::new(TestCpu::without_entropy());
+    let timer = crate::test_support::test_timer(TestCpu::without_entropy());
     let tail = 100_usize;
     let tone = alloc::vec![0x33_u8; params.period_bytes as usize + tail];
 
@@ -602,7 +601,7 @@ fn every_period_the_device_takes_reports_its_latency() {
     // A clock this test moves by hand, because the pump waits out the
     // latency the device reported before it lets the stream be stopped.
     let clock = ManualClockCpu::new();
-    let timer = Timer::new(clock.clone());
+    let timer = crate::test_support::test_timer(clock.clone());
     let tone = alloc::vec![0x01_u8; params.period_bytes as usize * 2];
 
     block_on(async {
@@ -715,7 +714,7 @@ fn a_stop_asked_for_after_the_material_ran_out_is_answered() {
         .sender();
 
     let device = ScriptedDevice::new(topology(&[playback_stream(0)]));
-    let timer = Timer::new(TestCpu::without_entropy());
+    let timer = crate::test_support::test_timer(TestCpu::without_entropy());
     let tone = alloc::vec![0x5a_u8; params.period_bytes as usize * 2];
     let inbox = &inboxes[0];
 
@@ -782,7 +781,7 @@ fn a_players_feedback_ends_when_the_stream_is_torn_down() {
     let mut feedback = claim.feedback();
 
     let device = ScriptedDevice::new(topology(&[playback_stream(0)]));
-    let timer = Timer::new(TestCpu::without_entropy());
+    let timer = crate::test_support::test_timer(TestCpu::without_entropy());
     let tone = alloc::vec![0x5a_u8; params.period_bytes as usize * 2];
     let inbox = &inboxes[0];
 
@@ -849,7 +848,7 @@ fn a_released_claims_reader_ends_and_never_sees_the_next_claims_feedback() {
     audio.release();
 
     let device = ScriptedDevice::new(topology(&[playback_stream(0)]));
-    let timer = Timer::new(TestCpu::without_entropy());
+    let timer = crate::test_support::test_timer(TestCpu::without_entropy());
     let inbox = &inboxes[0];
     block_on(async {
         // One turn of the task's loop takes the release: the claim word
@@ -997,7 +996,7 @@ fn a_device_that_refuses_to_start_ends_its_producer() {
     // promise — the `in_flight` count below is the leak this would
     // leave if the pump dropped them instead.
     device.holds_after = 0;
-    let timer = Timer::new(TestCpu::without_entropy());
+    let timer = crate::test_support::test_timer(TestCpu::without_entropy());
     let period = alloc::vec![0x11_u8; params.period_bytes as usize];
 
     let outcome = block_on(async {
@@ -1056,7 +1055,7 @@ fn a_rejected_period_ends_the_stream_and_its_producer() {
         period_bytes: params.period_bytes,
         actual: params.period_bytes as usize + 1,
     });
-    let timer = Timer::new(TestCpu::without_entropy());
+    let timer = crate::test_support::test_timer(TestCpu::without_entropy());
     let period = alloc::vec![0x22_u8; params.period_bytes as usize];
 
     let outcome = block_on(async {
@@ -1109,7 +1108,7 @@ fn a_rejected_period_mid_stream_collects_the_rest_of_the_ring() {
     device.holds_after = 1;
     device.writes_before_error = PERIODS_IN_FLIGHT as u32;
     device.write_error = Some(AudioError::DeviceIo);
-    let timer = Timer::new(TestCpu::without_entropy());
+    let timer = crate::test_support::test_timer(TestCpu::without_entropy());
     let period = alloc::vec![0x22_u8; params.period_bytes as usize];
 
     let periods_written = block_on(async {
@@ -1166,7 +1165,7 @@ fn a_device_that_refuses_to_release_keeps_its_chains_but_frees_the_claim() {
     device.writes_before_error = 2;
     device.write_error = Some(AudioError::DeviceIo);
     device.release_error = Some(AudioError::DeviceIo);
-    let timer = Timer::new(TestCpu::without_entropy());
+    let timer = crate::test_support::test_timer(TestCpu::without_entropy());
     let period = alloc::vec![0x22_u8; params.period_bytes as usize];
 
     let periods_written = block_on(async {
@@ -1240,7 +1239,7 @@ fn a_write_that_completes_on_its_first_poll_is_settled_the_same() {
 
     let mut device = ScriptedDevice::new(topology(&[playback_stream(0)]));
     device.yield_on_write = false;
-    let timer = Timer::new(TestCpu::without_entropy());
+    let timer = crate::test_support::test_timer(TestCpu::without_entropy());
     let periods = 9;
     let tone = alloc::vec![0x5a_u8; params.period_bytes as usize * periods];
 

@@ -4647,10 +4647,11 @@ mod tests {
             let spawner = executor
                 .spawner(cpu)
                 .instance_spawner(TaskFunding::Instance);
+            let timer = executor.timer(cpu);
             Self {
                 executor,
                 spawner,
-                timer: Timer::new(cpu),
+                timer,
                 progress: ProgressCounter::new(),
                 cpu,
             }

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::thread;
 
-use helios_hal::cpu::{Cpu, Instant, ProcessorId, Timebase};
+use helios_hal::cpu::{Cpu, Instant, ProcessorId, Timebase, TimerInterrupt};
 use helios_hal::entropy::{EntropyQuality, EntropyUnavailable};
 
 use crate::runtime::HostedMachine;
@@ -51,6 +51,9 @@ extern "Rust" fn helios_current_processor() -> ProcessorId {
 }
 
 impl Cpu for HostedCpu {
+    // The timer thread wakes each processor at the deadline last set for it.
+    const TIMER_INTERRUPT: TimerInterrupt = TimerInterrupt::Deadline;
+
     fn processor_count(&self) -> usize {
         self.machine.processor_count()
     }

@@ -708,6 +708,31 @@ pub struct Executor {
     progress_notify: NoWeakArc<Notify>,
 }
 
+/// The processor a [`Timer`] belongs to, and the idle state that
+/// processor's executor publishes.
+///
+/// Only the owner programs the timer's hardware deadline; any other
+/// processor that publishes an earlier deadline asks this whether the
+/// owner has stopped looking ([`IdleState::Parked`]) and wakes it if so.
+#[derive(Clone)]
+pub(crate) struct TimerOwner {
+    group: NoWeakArc<ExecutorGroup>,
+    processor: ProcessorId,
+}
+
+impl TimerOwner {
+    pub(crate) fn processor(&self) -> ProcessorId {
+        self.processor
+    }
+
+    /// Whether the owner has published [`IdleState::Parked`]. `SeqCst`:
+    /// the publisher half of the timer's wake handshake, after the
+    /// publisher has lowered the timer's published deadline.
+    pub(crate) fn is_parked(&self) -> bool {
+        self.group.needs_wake(usize::from(self.processor.id()))
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ExecutorRunStats {
     local_runnable_count: usize,
@@ -807,6 +832,22 @@ impl Executor {
             progress: self.progress.clone(),
             progress_notify: self.progress_notify.clone(),
         }
+    }
+
+    /// This processor's kernel timer, built on the processor that runs
+    /// this executor and owned by it.
+    ///
+    /// The timer reads the owner's idle state, the one this executor
+    /// publishes, to decide whether a deadline published from another
+    /// processor needs a wake to reach the owner's comparator.
+    pub fn timer<CpuImpl: Cpu + Clone>(&self, cpu: CpuImpl) -> Timer<CpuImpl> {
+        Timer::new(
+            cpu,
+            TimerOwner {
+                group: self.group.clone(),
+                processor: self.owner_processor,
+            },
+        )
     }
 
     pub fn run_until_stalled_with_stats(&self) -> ExecutorRunStats {
@@ -909,6 +950,11 @@ impl Executor {
                 polled_ticks: now.ticks() - started.ticks(),
             };
         }
+        // A sleep another processor registered on this timer while this
+        // one was running or polling lowered its published deadline
+        // without a wake; the same handshake covers it (`Timer`'s
+        // `publish_deadline`), and this arms it before the park.
+        timer.arm_published_deadline();
         let parked_at = cpu.now();
         cpu.park_current();
         idle.store(IdleState::Running);
@@ -1434,8 +1480,11 @@ impl<T> Future for LocalJoinHandle<T> {
 
 #[cfg(test)]
 mod tests {
+    use core::future::Future as _;
     use core::mem::size_of;
+    use core::pin::Pin;
     use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use core::task::{Context, Waker};
 
     use alloc::sync::Arc;
     use alloc::vec::Vec;
@@ -1444,11 +1493,13 @@ mod tests {
         Executor, GlobalScheduler, IDLE_POLL_GROW_START, IDLE_POLL_MAX, IdleOutcome, IdleState,
         LocalScheduler, LocalSilentScheduler, READY_QUEUE_CAPACITY, Spawner,
         TASK_ARENA_CLASS_COUNT, TASK_ARENA_KERNEL_RESERVE_BYTES, TASK_ARENA_TOP_BYTES, TaskArena,
-        Timer, pop_ready, ready_queue, should_wake_global_processor, should_wake_owner_processor,
+        pop_ready, ready_queue, should_wake_global_processor, should_wake_owner_processor,
         task_arena_bytes,
     };
     use crate::test_support::RecordingSmpCpu;
-    use helios_hal::cpu::{Cpu, HardwarePerfCounters, Instant, ProcessorId, Timebase};
+    use helios_hal::cpu::{
+        Cpu, HardwarePerfCounters, Instant, ProcessorId, Timebase, TimerInterrupt,
+    };
     use helios_hal::watchdog::ProgressCounter;
 
     #[derive(Clone)]
@@ -1465,6 +1516,8 @@ mod tests {
     }
 
     impl Cpu for TestCpu {
+        const TIMER_INTERRUPT: TimerInterrupt = TimerInterrupt::Deadline;
+
         fn processor_count(&self) -> usize {
             1
         }
@@ -1547,6 +1600,8 @@ mod tests {
     }
 
     impl Cpu for SteppingClockCpu {
+        const TIMER_INTERRUPT: TimerInterrupt = TimerInterrupt::Deadline;
+
         fn processor_count(&self) -> usize {
             2
         }
@@ -1960,6 +2015,62 @@ mod tests {
         assert_eq!(cpu.woken(), [ProcessorId::new(1)]);
     }
 
+    /// A sleep registered on processor 0's timer from processor 1
+    /// programs no comparator on processor 1 — `set_deadline` reaches
+    /// the executing processor, not the timer's owner — and reaches
+    /// processor 0 through the idle handshake: a wake when it is parked,
+    /// and its own arm before it parks when it was running.
+    #[test]
+    fn a_foreign_sleep_wakes_the_parked_owner_and_programs_no_other_comparator() {
+        let _serialized = super::executor_test_guard();
+        let cpu = RecordingSmpCpu::new(0, 2);
+        let executor = Executor::new(ProgressCounter::new(), 2, ProcessorId::new(0));
+        let timer = executor.timer(cpu.clone());
+        let idle = &executor.group.idle[0];
+        let built = cpu.deadlines();
+        assert_eq!(built.len(), 1);
+        assert_eq!(built[0].0, ProcessorId::new(0));
+        let now = cpu.now().ticks();
+        let mut context = Context::from_waker(Waker::noop());
+
+        crate::test_processor_identity::set(ProcessorId::new(1));
+        idle.store(IdleState::Parked);
+        let mut while_parked = timer.sleep_until(Instant::new(now + 500));
+        assert!(Pin::new(&mut while_parked).poll(&mut context).is_pending());
+        assert_eq!(
+            cpu.deadlines(),
+            built,
+            "a foreign publish programs no comparator"
+        );
+        assert_eq!(
+            cpu.woken(),
+            [ProcessorId::new(0)],
+            "the parked owner is woken"
+        );
+
+        idle.store(IdleState::Running);
+        let mut while_running = timer.sleep_until(Instant::new(now + 400));
+        assert!(Pin::new(&mut while_running).poll(&mut context).is_pending());
+        assert_eq!(
+            cpu.deadlines(),
+            built,
+            "a foreign publish programs no comparator"
+        );
+        assert_eq!(
+            cpu.woken(),
+            [ProcessorId::new(0)],
+            "a running owner reads the deadline itself"
+        );
+
+        crate::test_processor_identity::set(ProcessorId::new(0));
+        timer.arm_published_deadline();
+        assert_eq!(
+            cpu.deadlines().last(),
+            Some(&(ProcessorId::new(0), now + 400)),
+            "the owner arms the earliest published deadline before it parks"
+        );
+    }
+
     #[test]
     fn the_poll_window_grows_after_a_short_park_and_shrinks_after_a_long_one() {
         let _serialized = super::executor_test_guard();
@@ -1967,7 +2078,7 @@ mod tests {
         // read, so a poll window of N ticks costs N/1000 loop passes.
         let cpu = SteppingClockCpu::new(1_000);
         let executor = Executor::new(ProgressCounter::new(), 2, ProcessorId::new(0));
-        let timer = Timer::new(cpu.clone());
+        let timer = executor.timer(cpu.clone());
         let idle = &executor.group.idle[0];
         let grow_start = cpu.timebase().duration_to_ticks(IDLE_POLL_GROW_START);
         let max = cpu.timebase().duration_to_ticks(IDLE_POLL_MAX);
@@ -2007,7 +2118,7 @@ mod tests {
         let cpu = SteppingClockCpu::new(1_000);
         cpu.forbid_park();
         let executor = Executor::new(ProgressCounter::new(), 2, ProcessorId::new(0));
-        let timer = Timer::new(cpu.clone());
+        let timer = executor.timer(cpu.clone());
         let root_ready = AtomicBool::new(true);
 
         let outcome = executor.park_until_work(&timer, || root_ready.load(Ordering::SeqCst));
@@ -2026,7 +2137,7 @@ mod tests {
         let cpu = SteppingClockCpu::new(1_000);
         cpu.forbid_park();
         let executor = Executor::new(ProgressCounter::new(), 2, ProcessorId::new(0));
-        let timer = Timer::new(cpu.clone());
+        let timer = executor.timer(cpu.clone());
         executor.spawner(cpu).spawn_local_detached(async {});
 
         let outcome = executor.park_until_work(&timer, || false);

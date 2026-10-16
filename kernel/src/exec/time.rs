@@ -118,7 +118,7 @@ mod tests {
     use alloc::string::String;
     use core::sync::atomic::{AtomicU64, Ordering};
 
-    use helios_hal::cpu::{Instant, ProcessorId};
+    use helios_hal::cpu::{Instant, ProcessorId, TimerInterrupt};
 
     use super::*;
     use crate::{ClockAuthorityRights, ProfileScope};
@@ -143,6 +143,8 @@ mod tests {
     }
 
     impl Cpu for TestCpu {
+        const TIMER_INTERRUPT: TimerInterrupt = TimerInterrupt::Deadline;
+
         fn processor_count(&self) -> usize {
             1
         }

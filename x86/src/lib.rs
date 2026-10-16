@@ -46,7 +46,7 @@ use core::arch::x86_64::{__cpuid, __cpuid_count, _rdrand64_step, _rdtsc};
 use core::ops::Range;
 use core::sync::atomic::{Ordering, compiler_fence};
 use helios_hal::boot::{BootMemoryMap, BootReservedRanges, usable_region_segments};
-use helios_hal::cpu::{Cpu, Instant, ProcessorId, Timebase, current_processor};
+use helios_hal::cpu::{Cpu, Instant, ProcessorId, Timebase, TimerInterrupt, current_processor};
 use helios_hal::critical_section::ProcessorIdentity;
 use helios_hal::entropy::{EntropyQuality, EntropyUnavailable};
 use helios_hal::memory::MemoryRegion;
@@ -810,6 +810,10 @@ extern "Rust" fn helios_current_processor() -> ProcessorId {
 }
 
 impl Cpu for X86Cpu {
+    // The local APIC timer runs in periodic mode at the scheduler tick;
+    // `set_deadline` only starts it.
+    const TIMER_INTERRUPT: TimerInterrupt = TimerInterrupt::Periodic;
+
     fn processor_count(&self) -> usize {
         self.state.processor_count()
     }

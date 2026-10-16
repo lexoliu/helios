@@ -6,7 +6,7 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use helios_hal::cpu::{Cpu, Instant, ProcessorId, Timebase};
+use helios_hal::cpu::{Cpu, Instant, ProcessorId, Timebase, TimerInterrupt};
 
 /// The processor-local interrupt mask for the kernel's own unit tests.
 ///
@@ -62,6 +62,8 @@ impl TestCpu {
 }
 
 impl Cpu for TestCpu {
+    const TIMER_INTERRUPT: TimerInterrupt = TimerInterrupt::Deadline;
+
     fn has_lazy_commit_virtual_memory(&self) -> bool {
         // The unit tests build on a hosted platform, where the operating
         // system commits a reservation lazily on its own. A test platform
@@ -117,6 +119,17 @@ impl Cpu for TestCpu {
     }
 }
 
+/// A timer owned by the processor the calling test thread stands for,
+/// as [`crate::Executor::timer`] builds one on every processor.
+pub(crate) fn test_timer<CpuImpl: Cpu + Clone>(cpu: CpuImpl) -> crate::Timer<CpuImpl> {
+    crate::Executor::new(
+        helios_hal::watchdog::ProgressCounter::new(),
+        cpu.processor_count(),
+        helios_hal::cpu::current_processor(),
+    )
+    .timer(cpu)
+}
+
 /// A CPU whose clock a test moves by hand.
 ///
 /// Its timebase is one tick per nanosecond, so a test that wants to
@@ -143,6 +156,8 @@ impl ManualClockCpu {
 }
 
 impl Cpu for ManualClockCpu {
+    const TIMER_INTERRUPT: TimerInterrupt = TimerInterrupt::Deadline;
+
     fn processor_count(&self) -> usize {
         1
     }
@@ -203,6 +218,9 @@ pub(crate) struct RecordingSmpCpu {
     /// One machine's wake log: a clone is the same CPU, so it shares
     /// the record rather than starting a new one.
     woken: Arc<spin::Mutex<alloc::vec::Vec<ProcessorId>>>,
+    /// Every deadline programmed, with the processor whose comparator
+    /// it reached: the one executing `set_deadline`.
+    deadlines: Arc<spin::Mutex<alloc::vec::Vec<(ProcessorId, u64)>>>,
 }
 
 impl RecordingSmpCpu {
@@ -217,6 +235,7 @@ impl RecordingSmpCpu {
             base: TestCpu::without_entropy(),
             processors,
             woken: Arc::new(spin::Mutex::new(alloc::vec::Vec::new())),
+            deadlines: Arc::new(spin::Mutex::new(alloc::vec::Vec::new())),
         }
     }
 
@@ -224,9 +243,17 @@ impl RecordingSmpCpu {
     pub(crate) fn woken(&self) -> alloc::vec::Vec<ProcessorId> {
         self.woken.lock().clone()
     }
+
+    /// The deadlines programmed so far, in ticks and in order, each
+    /// with the processor whose comparator it reached.
+    pub(crate) fn deadlines(&self) -> alloc::vec::Vec<(ProcessorId, u64)> {
+        self.deadlines.lock().clone()
+    }
 }
 
 impl Cpu for RecordingSmpCpu {
+    const TIMER_INTERRUPT: TimerInterrupt = TimerInterrupt::Deadline;
+
     fn processor_count(&self) -> usize {
         self.processors
     }
@@ -256,7 +283,9 @@ impl Cpu for RecordingSmpCpu {
     }
 
     fn set_deadline(&self, deadline: Instant) {
-        self.base.set_deadline(deadline);
+        self.deadlines
+            .lock()
+            .push((helios_hal::cpu::current_processor(), deadline.ticks()));
     }
 
     fn publish_executable(&self, address: *const u8, len: usize) {

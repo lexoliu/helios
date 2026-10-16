@@ -312,6 +312,8 @@ mod tests {
     }
 
     impl cpu::Cpu for TestCpu {
+        const TIMER_INTERRUPT: cpu::TimerInterrupt = cpu::TimerInterrupt::Deadline;
+
         fn processor_count(&self) -> usize {
             4
         }

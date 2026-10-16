@@ -1164,10 +1164,11 @@ where
     } else {
         ProgressCounter::new()
     };
+    let executor = Executor::new(progress, topology.configured_processors, current_processor);
     let kernel = Kernel {
-        timer: Timer::new(cpu.clone()),
+        timer: executor.timer(cpu.clone()),
         cpu,
-        executor: Executor::new(progress, topology.configured_processors, current_processor),
+        executor,
         watchdog,
         topology,
         dma_model,

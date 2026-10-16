@@ -1040,7 +1040,7 @@ pub(crate) mod test_store {
     use crate::test_support::{TestCpu, TestNetworkService};
     use crate::wasmtime_adapter::wasi::DebugFileSystem;
     use crate::{
-        Executor, InstanceRegistry, ProcessAuthority, TaskFunding, Timer, UnsupportedHostFileSystem,
+        Executor, InstanceRegistry, ProcessAuthority, TaskFunding, UnsupportedHostFileSystem,
     };
 
     use crate::wasmtime_adapter::component_host::{HostRuntimeState, StoreData};
@@ -1116,7 +1116,7 @@ pub(crate) mod test_store {
         ComponentStoreData::new(
             ResourceTable::new(),
             cpu,
-            Timer::new(cpu),
+            executor.timer(cpu),
             executor
                 .spawner(cpu)
                 .instance_spawner(TaskFunding::Instance),
