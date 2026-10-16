@@ -833,14 +833,15 @@ where
             filesystem: Some(store.data().filesystem.snapshot()),
         })),
         // Main's call stopped because a spawned thread ended the process;
-        // the process exits with the status that thread chose.
+        // the process ends the way that thread's call ended it: an exit
+        // status, or the failure a trap on main would have reported.
         Err(error) if WasixThreadEnded::is(&error) => {
-            let code = store.data().threads.take_process_exit().expect(
-                "main's image is ended only by a spawned thread that recorded the process's exit first",
+            let end = store.data().threads.take_process_end().expect(
+                "main's image is ended only by a spawned thread that recorded the process's end first",
             );
-            CoreModuleRunCompletion::Exit(Ok(ChildExit {
+            CoreModuleRunCompletion::Exit(end.map(|exit_code| ChildExit {
                 instance_id: run.instance_id,
-                exit_code: code,
+                exit_code,
                 filesystem: Some(store.data().filesystem.snapshot()),
             }))
         }
@@ -848,14 +849,12 @@ where
             if let Some(replacement) = store.data_mut().take_exec_replacement() {
                 CoreModuleRunCompletion::Exec(Box::new(replacement))
             } else {
-                CoreModuleRunCompletion::Exit(match store.data_mut().take_exit_status(&error) {
-                    Some(code) => Ok(ChildExit {
-                        instance_id: run.instance_id,
-                        exit_code: code,
-                        filesystem: Some(store.data().filesystem.snapshot()),
-                    }),
-                    None => Err(map_program_runtime_error(error)),
-                })
+                let end = store.data_mut().take_process_end(error);
+                CoreModuleRunCompletion::Exit(end.map(|exit_code| ChildExit {
+                    instance_id: run.instance_id,
+                    exit_code,
+                    filesystem: Some(store.data().filesystem.snapshot()),
+                }))
             }
         }
     };

@@ -828,6 +828,44 @@ jobs:
           grep -Fqx thread-proc-exit:exiting "$runtime/guest.log"
           grep -Fqx thread-proc-exit:exit=7 "$runtime/guest.log"
           ! grep -Fq 'Kernel panic' "$runtime/guest.log"
+      - name: End a process from a trap on a spawned thread
+        # A trap that ends only its thread leaves main parked and hangs
+        # here, not in a later step.
+        timeout-minutes: 5
+        shell: bash
+        working-directory: helios
+        run: |
+          # Without this the step reports tee's status, not the
+          # command's, and a runner script that fails is invisible.
+          set -o pipefail
+          # A trap ends the whole process from any thread, as SIGSEGV and
+          # SIGILL do (#473). The first run is the control: main traps on
+          # its own. In the second, main parks forever in
+          # memory.atomic.wait32 and a spawned thread traps: the process
+          # must end with the control's status, and the shell's echo
+          # after it proves its output closed.
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/thread-trap"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+            --accel kvm \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger \
+            --boot-program wasix-thread-trap --no-compiler-plugin \
+            shell --trace-log "$runtime/guest-tracing.log" \
+            -c '/bin/wasix-thread-trap main; echo main-trap:exit=$?; /bin/wasix-thread-trap; echo thread-trap:exit=$?' \
+            2>&1 > "$runtime/guest.log" | tee "$runtime/inspector.log"
+          cat "$runtime/guest.log"
+          grep -Fqx thread-trap:main-trapping "$runtime/guest.log"
+          grep -Fqx thread-trap:spawned "$runtime/guest.log"
+          grep -Fqx thread-trap:parking "$runtime/guest.log"
+          grep -Fqx thread-trap:trapping "$runtime/guest.log"
+          main_status="$(sed -n 's/^main-trap:exit=//p' "$runtime/guest.log")"
+          thread_status="$(sed -n 's/^thread-trap:exit=//p' "$runtime/guest.log")"
+          printf 'main trap exit=%s, thread trap exit=%s\n' "$main_status" "$thread_status"
+          # 0 is no trap at all, and 1 is the module's own setup failure.
+          [[ -n "$main_status" && "$main_status" != 0 && "$main_status" != 1 ]]
+          [[ "$thread_status" == "$main_status" ]]
+          ! grep -Fq 'Kernel panic' "$runtime/guest.log"
       - name: Fetch over virtio-net with curl
         shell: bash
         working-directory: helios

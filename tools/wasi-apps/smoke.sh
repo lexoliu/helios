@@ -126,6 +126,7 @@ build_wasix_conformance_artifact atomic-wait-timeout
 build_wasix_conformance_artifact atomic-wait-kill
 build_wasix_conformance_artifact orphan-threads
 build_wasix_conformance_artifact thread-proc-exit
+build_wasix_conformance_artifact thread-trap
 
 run_smoke() {
     local name="$1"
@@ -354,6 +355,23 @@ run_smoke \
     shell \
     -c \
     '/bin/wasix-thread-proc-exit; echo thread-proc-exit:exit=$?'
+
+# A trap on main fails the process with `IO` (29); the same trap on a
+# spawned thread must end the process with the same status.
+run_smoke \
+    wasix-thread-trap \
+    thread-trap:main-trapping \
+    main-trap:exit=29 \
+    thread-trap:trapping \
+    thread-trap:exit=29 \
+    -- \
+    --boot-program dash \
+    --boot-program debugger \
+    --boot-program wasix-thread-trap \
+    --no-compiler-plugin \
+    shell \
+    -c \
+    '/bin/wasix-thread-trap main; echo main-trap:exit=$?; /bin/wasix-thread-trap; echo thread-trap:exit=$?'
 
 run_smoke \
     cpython \
