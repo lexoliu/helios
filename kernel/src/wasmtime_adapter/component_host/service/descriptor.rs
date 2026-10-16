@@ -1029,6 +1029,22 @@ pub(super) fn preview1_exit_status(error: &wasmtime::Error, requested: Option<u3
     requested
 }
 
+/// How a process ends when one of its calls ended in `error`, given the
+/// status the guest `requested` before: the exit status
+/// [`preview1_exit_status`] finds, otherwise the failure the error is
+/// (a trap, an out-of-memory kill, any other runtime error). Main's own
+/// end and a spawned thread's end of its process both report through
+/// this, so a trap ends the process the same way on any thread.
+pub(super) fn preview1_process_end(
+    error: wasmtime::Error,
+    requested: Option<u32>,
+) -> Result<u32, ProgramExecError> {
+    match preview1_exit_status(&error, requested) {
+        Some(code) => Ok(code),
+        None => Err(map_program_runtime_error(error)),
+    }
+}
+
 /// The signals one store answers to: those raised on its own thread and
 /// those raised on its process. A thread-directed raise reaches only this
 /// store's turn; a process-directed one goes to whichever store of the

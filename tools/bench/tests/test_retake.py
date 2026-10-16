@@ -26,6 +26,8 @@ from helios_bench.runner import (
     RECONFIRM_OUT,
     RETAKE_OUT,
     RunOptions,
+    UnitOrder,
+    boot_orders,
     dispersed_headline_workloads,
     reconfirm,
     regressed_headline_workloads,
@@ -104,7 +106,7 @@ def test_a_clean_run_plans_no_retake(options, monkeypatch) -> None:
     )
 
     assert dispersed_headline_workloads(sides, WORKLOADS, THRESHOLDS) == []
-    assert retake(options, 11, WORKLOADS, sides, THRESHOLDS) == []
+    assert retake(options, 11, WORKLOADS, sides, THRESHOLDS, boot_orders(options, WORKLOADS)) == []
 
 
 def test_only_a_dispersed_headline_cell_is_retaken(options, monkeypatch) -> None:
@@ -123,7 +125,9 @@ def test_only_a_dispersed_headline_cell_is_retaken(options, monkeypatch) -> None
     monkeypatch.setattr(runner, "execute", fake_execute)
 
     assert dispersed_headline_workloads(sides, WORKLOADS, THRESHOLDS) == ["hostcall-loop"]
-    assert retake(options, 11, WORKLOADS, sides, THRESHOLDS) == ["hostcall-loop"]
+    assert retake(options, 11, WORKLOADS, sides, THRESHOLDS, boot_orders(options, WORKLOADS)) == [
+        "hostcall-loop"
+    ]
     assert len(executed) == 1
 
     args = gap_bench().build_parser().parse_args(executed[0].argv[2:])
@@ -148,7 +152,7 @@ def test_a_retake_that_writes_nothing_is_a_failed_run(options, monkeypatch) -> N
     monkeypatch.setattr(runner, "execute", lambda command: None)
 
     with pytest.raises(SystemExit, match="produced no JSONL"):
-        retake(options, 11, WORKLOADS, sides, THRESHOLDS)
+        retake(options, 11, WORKLOADS, sides, THRESHOLDS, boot_orders(options, WORKLOADS))
 
 
 def test_an_unpaired_run_retakes_its_one_image(tmp_path, monkeypatch) -> None:
@@ -165,8 +169,10 @@ def test_an_unpaired_run_retakes_its_one_image(tmp_path, monkeypatch) -> None:
         lambda command: write_retake(options.out_dir, Side.HELIOS, "hostcall-loop", tight(21.0, 7)),
     )
 
-    assert retake(options, 11, WORKLOADS, sides, THRESHOLDS) == ["hostcall-loop"]
-    plan = retake_plan(options, 11, ["hostcall-loop"], RETAKE_OUT, "dispersed")
+    assert retake(options, 11, WORKLOADS, sides, THRESHOLDS, boot_orders(options, WORKLOADS)) == [
+        "hostcall-loop"
+    ]
+    plan = retake_plan(options, 11, ["hostcall-loop"], RETAKE_OUT, "dispersed", {})
     args = gap_bench().build_parser().parse_args(plan.argv[2:])
     assert args.helios_baseline_out_dir is None
 
@@ -187,9 +193,16 @@ def test_the_gate_names_the_retaken_workloads(paired_flat_report: Report) -> Non
     )
 
 
-def paired_report_from(sides, run: RunInfo, template: Report) -> Report:
+def paired_report_from(sides, run: RunInfo, template: Report, first_pass=None) -> Report:
     return assemble_report(
-        REPORT_WORKLOADS, sides, template.control, run, template.hardware, template.pins, THRESHOLDS
+        REPORT_WORKLOADS,
+        sides,
+        template.control,
+        run,
+        template.hardware,
+        template.pins,
+        THRESHOLDS,
+        first_pass=first_pass,
     )
 
 
@@ -199,7 +212,10 @@ def test_a_clean_pair_is_not_measured_again(paired_flat_report: Report, options,
     )
 
     assert regressed_headline_workloads(paired_flat_report) == []
-    assert reconfirm(options, 11, paired_flat_report, {}, THRESHOLDS) == []
+    assert (
+        reconfirm(options, 11, paired_flat_report, {}, THRESHOLDS, boot_orders(options, WORKLOADS)).names
+        == []
+    )
 
 
 def test_a_first_pass_regression_is_measured_again_and_a_drift_clears(
@@ -220,14 +236,25 @@ def test_a_first_pass_regression_is_measured_again_and_a_drift_clears(
 
     monkeypatch.setattr(runner, "execute", fake_execute)
 
-    assert reconfirm(options, 11, first, sides, THRESHOLDS) == ["hostcall-loop"]
+    reconfirmation = reconfirm(options, 11, first, sides, THRESHOLDS, boot_orders(options, WORKLOADS))
+    assert reconfirmation.names == ["hostcall-loop"]
     assert len(executed) == 1
     args = gap_bench().build_parser().parse_args(executed[0].argv[2:])
     assert args.workloads == ["hostcall-loop"] and not args.control
     assert Path(args.out_dir) == options.out_dir / RECONFIRM_OUT / "helios"
+    # The first pass booted `hostcall-loop` candidate first; the replicate
+    # boots it the other way round, so it cannot share that slot's bias.
+    assert boot_orders(options, WORKLOADS)["hostcall-loop"] == UnitOrder.FORWARD
+    assert args.helios_unit_orders == ["hostcall-loop=reversed"]
+    # The first pair is kept, not dropped: the report carries both.
+    assert {side: list(cells) for side, cells in reconfirmation.first_pass.items()} == {
+        Side.HELIOS: ["hostcall-loop"],
+        Side.HELIOS_BASELINE: ["hostcall-loop"],
+    }
+    assert reconfirmation.first_pass[Side.HELIOS]["hostcall-loop"].iterations == tight(30.0, 1)
 
     run = paired_regression_report.run.model_copy(update={"reconfirmed": ["hostcall-loop"]})
-    second = paired_report_from(sides, run, paired_regression_report)
+    second = paired_report_from(sides, run, paired_regression_report, reconfirmation.first_pass)
     result = evaluate_paired(second)
     assert not result.blocking and result.regressions == []
     text = render_gate(gate_report(second, None), "x86-64-kvm")
@@ -247,9 +274,10 @@ def test_a_regression_that_shows_twice_still_blocks(
 
     monkeypatch.setattr(runner, "execute", fake_execute)
 
-    assert reconfirm(options, 11, first, sides, THRESHOLDS) == ["hostcall-loop"]
+    reconfirmation = reconfirm(options, 11, first, sides, THRESHOLDS, boot_orders(options, WORKLOADS))
+    assert reconfirmation.names == ["hostcall-loop"]
     run = paired_regression_report.run.model_copy(update={"reconfirmed": ["hostcall-loop"]})
-    second = paired_report_from(sides, run, paired_regression_report)
+    second = paired_report_from(sides, run, paired_regression_report, reconfirmation.first_pass)
     assert evaluate_paired(second).blocking
     assert "showed twice" in render_gate(gate_report(second, None), "x86-64-kvm")
 
@@ -266,4 +294,6 @@ def test_an_unpaired_run_is_never_reconfirmed(baseline_report: Report, tmp_path,
         "execute",
         lambda command: pytest.fail("an unpaired run has no second column to confirm against"),
     )
-    assert reconfirm(options, 11, baseline_report, {}, THRESHOLDS) == []
+    assert (
+        reconfirm(options, 11, baseline_report, {}, THRESHOLDS, boot_orders(options, WORKLOADS)).names == []
+    )

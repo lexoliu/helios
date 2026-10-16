@@ -86,13 +86,19 @@ jobs:
     # A push collection is superseded by the next push: the newest
     # commit's profile is the one `profile-fetch` should find newest, so
     # the older run is cancelled rather than left to finish last. Every
-    # other event gets a group of its own — a dispatch, or the call from
-    # `bench-suite.yml`, whose own concurrency already governs it.
+    # other event gets a group of its own — a dispatch, or a call from
+    # `bench-suite.yml`, whose own concurrency already governs it. Each
+    # call of one run is its own group too, keyed by the artifact it
+    # uploads: the `profile-columns` matrix calls this workflow once per
+    # column within one run, and one group for all of them ran them one
+    # after another (run 38940834451: the baseline's collection started
+    # when the candidate's finished) and would cancel a third that queued
+    # behind a pending second.
     concurrency:
       group: >-
         ${{ github.event_name == 'push'
             && format('kernel-profile-push-{0}', github.ref)
-            || format('kernel-profile-{0}-{1}', github.run_id, github.job) }}
+            || format('kernel-profile-{0}-{1}-{2}', github.run_id, github.job, inputs.artifact) }}
       cancel-in-progress: ${{ github.event_name == 'push' }}
     timeout-minutes: 240
     permissions:

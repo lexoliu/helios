@@ -32,6 +32,7 @@ from helios_bench.runner import (
     GAP_BENCH,
     NetworkOptions,
     RunOptions,
+    UnitOrder,
     kernel_pgo_uncovered,
     kernel_profiles,
     plan,
@@ -269,6 +270,122 @@ def test_a_paired_side_boots_the_two_images_back_to_back(driver, tmp_path) -> No
             "cpython-json": "summary",
             "hostcall-loop": "summary",
         }
+
+
+def three_images(driver, tmp_path) -> list:
+    """The candidate, the baseline and the baseline's rebuild (#479).
+
+    The rebuild is the baseline commit built against a second profile; a
+    checkout of its own here only so the order log can tell its boots
+    from the baseline's.
+    """
+    fake_checkout(tmp_path / "rebuild")
+    images = images_of(driver, tmp_path, paired=True)
+    rebuild = driver.HeliosImage(
+        name="helios-baseline-rebuild",
+        workspace_root=tmp_path / "rebuild",
+        out_dir=tmp_path / "out" / "helios-baseline-rebuild",
+    )
+    rebuild.out_dir.mkdir(parents=True)
+    return [*images, rebuild]
+
+
+def run_three(driver, tmp_path, images: list, unit_orders: dict[str, str] | None) -> list[str]:
+    driver.run_helios(
+        Path("tools/wasi-apps/workloads.json"),
+        images,
+        1,
+        WORKLOADS,
+        "x86-64",
+        "kvm",
+        driver.HostServices(tmp_path, "10.77.0.1", "10.77.0.1"),
+        timeout_seconds=60,
+        side_timeout_seconds=600,
+        build_timeout_seconds=60,
+        skip_build=False,
+        control_workload=None,
+        keep_going=True,
+        unit_orders=unit_orders,
+    )
+    return [guest for _, guest, _, _ in boot_order(tmp_path / "order")]
+
+
+def test_a_rebuilt_side_boots_three_images_with_the_baseline_in_the_middle(driver, tmp_path) -> None:
+    """Every unit boots all three images back to back, and the order
+    alternates end for end: the baseline is always the middle boot, and
+    the candidate and the rebuild trade the two ends, so whatever a slot
+    does to a boot lands on the candidate's shift and on the build drift
+    alike."""
+    images = three_images(driver, tmp_path)
+    assert run_three(driver, tmp_path, images, None) == [
+        "candidate",
+        "baseline",
+        "rebuild",
+        "rebuild",
+        "baseline",
+        "candidate",
+        "candidate",
+        "baseline",
+        "rebuild",
+    ]
+    for image in images:
+        assert set(records(image.out_dir / "helios.jsonl")) == {
+            "quickjs-loop",
+            "cpython-json",
+            "hostcall-loop",
+        }
+
+
+def test_a_stated_unit_order_is_obeyed(driver, tmp_path) -> None:
+    """A reconfirm states each unit's order — the reverse of the pass it
+    repeats — rather than inheriting whatever the unit's position in its
+    own, smaller selection would give it."""
+    images = three_images(driver, tmp_path)
+    orders = {"quickjs-loop": "reversed", "cpython-json": "reversed", "hostcall-loop": "forward"}
+    assert run_three(driver, tmp_path, images, orders) == [
+        "rebuild",
+        "baseline",
+        "candidate",
+        "rebuild",
+        "baseline",
+        "candidate",
+        "candidate",
+        "baseline",
+        "rebuild",
+    ]
+
+
+def test_a_unit_order_is_stated_for_every_unit_or_none(driver, tmp_path) -> None:
+    images = three_images(driver, tmp_path)
+    with pytest.raises(SystemExit, match="every unit or for none"):
+        run_three(driver, tmp_path, images, {"quickjs-loop": "reversed"})
+    with pytest.raises(SystemExit, match="is not WORKLOAD=forward"):
+        driver.parse_unit_orders(["quickjs-loop=backwards"])
+    with pytest.raises(SystemExit, match="twice"):
+        driver.parse_unit_orders(["quickjs-loop=forward", "quickjs-loop=reversed"])
+    # The runner and the driver spell the two orders the same way.
+    assert {order.value for order in UnitOrder} == {driver.UNIT_ORDER_FORWARD, driver.UNIT_ORDER_REVERSED}
+
+
+def test_the_driver_parses_the_rebuild_flags(tmp_path) -> None:
+    """The rebuild needs the profiled baseline it rebuilds."""
+    parsed = (
+        gap_bench()
+        .build_parser()
+        .parse_args(
+            [
+                "--helios-baseline-rebuild-profile-use",
+                str(tmp_path / "rebuild.profdata"),
+                "--helios-baseline-rebuild-out-dir",
+                str(tmp_path / "out"),
+                "--helios-unit-order",
+                "quickjs-loop=reversed",
+            ]
+        )
+    )
+    assert parsed.helios_baseline_rebuild_profile_use == tmp_path / "rebuild.profdata"
+    assert parsed.helios_baseline_rebuild_out_dir == tmp_path / "out"
+    assert parsed.helios_unit_orders == ["quickjs-loop=reversed"]
 
 
 def test_an_unpaired_side_still_boots_one_guest_per_class(driver, tmp_path) -> None:
@@ -1043,13 +1160,17 @@ def test_a_paired_baseline_can_carry_its_own_profile(tmp_path) -> None:
     """
     profile = tmp_path / "helios-kernel.profdata"
     profile.write_bytes(b"\x00" * 16)
+    rebuild = tmp_path / "rebuild" / "helios-kernel.profdata"
+    rebuild.parent.mkdir()
+    rebuild.write_bytes(b"\x01" * 16)
     options = RunOptions(
         lane=load_manifest().lane("x86-64-kvm"),
         out_dir=tmp_path / "out",
         advisory=True,
-        sides=frozenset({Side.HELIOS, Side.HELIOS_BASELINE}),
+        sides=frozenset({Side.HELIOS, Side.HELIOS_BASELINE, Side.HELIOS_BASELINE_REBUILD}),
         baseline=Baseline(ref="dev", sha="b" * 40, worktree=tmp_path / "worktree"),
         baseline_profile_use=profile,
+        baseline_rebuild_profile_use=rebuild,
     )
     # The named profile makes the second image a profile-use build of its
     # own commit wherever the lane's release build is one.
@@ -1064,6 +1185,38 @@ def test_a_paired_baseline_can_carry_its_own_profile(tmp_path) -> None:
     assert args.helios_baseline_root == tmp_path / "worktree"
     assert args.helios_baseline_profile_use == profile
     assert not args.helios_baseline_without_kernel_profile
+    # The rebuild of #479: the same commit once more, against the second
+    # collection, written beside the other two columns.
+    assert args.helios_baseline_rebuild_profile_use == rebuild
+    assert args.helios_baseline_rebuild_out_dir == tmp_path / "out" / "helios-baseline-rebuild"
+    # Every unit's boot order is the runner's statement, alternating.
+    assert args.helios_unit_orders == [
+        "quickjs-loop=forward",
+        "cpython-json=reversed",
+        "hostcall-loop=forward",
+    ]
+
+
+def test_a_per_run_baseline_profile_needs_its_rebuild(tmp_path) -> None:
+    """#479: run 38940834451 paired one commit against an empty commit on
+    top of it, each built from its own collection, and the gate called
+    `fs-smallfiles` 11.2% faster. A baseline built against a per-run
+    collection is measured against a second build of itself or not at all."""
+    profile = tmp_path / "helios-kernel.profdata"
+    profile.write_bytes(b"\x00" * 16)
+    common = {
+        "lane": load_manifest().lane("x86-64-kvm"),
+        "out_dir": tmp_path / "out",
+        "advisory": True,
+        "sides": frozenset({Side.HELIOS, Side.HELIOS_BASELINE, Side.HELIOS_BASELINE_REBUILD}),
+        "baseline": Baseline(ref="dev", sha="b" * 40, worktree=tmp_path / "worktree"),
+    }
+    with pytest.raises(SystemExit, match="--baseline-rebuild-profile-use"):
+        RunOptions(**common, baseline_profile_use=profile)
+    with pytest.raises(SystemExit, match="second, independent collection"):
+        RunOptions(**common, baseline_profile_use=profile, baseline_rebuild_profile_use=profile)
+    with pytest.raises(SystemExit, match="which is not set"):
+        RunOptions(**common, baseline_rebuild_profile_use=profile)
 
 
 def test_a_baseline_profile_needs_the_pairing_it_profiles(tmp_path) -> None:
@@ -1117,19 +1270,22 @@ def test_a_per_column_baseline_profile_names_itself(tmp_path, monkeypatch) -> No
     profile = tmp_path / "pgo-baseline" / "helios-kernel.profdata"
     profile.parent.mkdir(parents=True)
     profile.write_bytes(b"\x00" * 16)
+    rebuild = tmp_path / "pgo-baseline-rebuild" / "helios-kernel.profdata"
     options = RunOptions(
         lane=load_manifest().lane("x86-64-kvm"),
         out_dir=tmp_path / "out",
         advisory=True,
-        sides=frozenset({Side.HELIOS, Side.HELIOS_BASELINE}),
+        sides=frozenset({Side.HELIOS, Side.HELIOS_BASELINE, Side.HELIOS_BASELINE_REBUILD}),
         baseline=Baseline(ref="dev", sha="b" * 40, worktree=tmp_path / "worktree"),
         profile_use=tmp_path / "pgo-candidate" / "helios-kernel.profdata",
         baseline_profile_use=profile,
+        baseline_rebuild_profile_use=rebuild,
     )
-    candidate_label, baseline_label = kernel_profiles(options)
-    assert baseline_label == str(profile)
-    assert baseline_label != "dev@aaaaaaa run 42", "the fetched record is not this column's profile"
-    assert candidate_label == str(tmp_path / "pgo-candidate" / "helios-kernel.profdata")
+    profiles = kernel_profiles(options)
+    assert profiles.baseline == str(profile)
+    assert profiles.baseline != "dev@aaaaaaa run 42", "the fetched record is not this column's profile"
+    assert profiles.candidate == str(tmp_path / "pgo-candidate" / "helios-kernel.profdata")
+    assert profiles.baseline_rebuild == str(rebuild)
 
 
 def test_the_baselines_uncovered_count_reads_its_own_profile_build(tmp_path) -> None:

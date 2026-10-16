@@ -289,7 +289,7 @@ impl ProgramExecErrorDetail {
     }
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq, Eq)]
 #[error("{kind}: {detail}")]
 pub struct ProgramExecError {
     pub kind: ProgramExecErrorKind,

@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 
 from helios_bench.report import (
@@ -264,6 +264,50 @@ GATE_TITLES = {
 }
 
 
+class FloorSource(StrEnum):
+    """Which measurement of the job set the smallest shift a row must clear.
+
+    A row's floor is the largest movement the job measured for it without
+    the change (#479):
+
+    - `control`: the control workload's drift between the boots before
+      and after the suite, or its dispersion — how far the machine moved;
+    - `page`: one page, for a footprint, which the clock does not move;
+    - `boot`: how far this row moved between two boots of one image, when
+      the reconfirm took a second pair of boots of its workload;
+    - `build`: how far this row moved between the two builds of the
+      baseline commit, each against its own independently collected
+      kernel profile — what a per-run profile collection adds to every
+      shift between the columns.
+    """
+
+    CONTROL = "control"
+    PAGE = "page"
+    BOOT = "boot"
+    BUILD = "build"
+
+
+@dataclass(frozen=True)
+class RowEvidence:
+    """What the job measured about one row beside its two compared series.
+
+    `rebuild` is the rebuild column's series of the row, from the same
+    pair of boots the verdict reads. `build_pairs` are the (baseline,
+    rebuild) series of each pass that timed both builds of the baseline
+    commit; `boot_pairs` are the (first, second) series of each image a
+    reconfirm booted twice.
+    """
+
+    rebuild: SeriesStats | None = None
+    build_pairs: tuple[tuple[SeriesStats, SeriesStats], ...] = ()
+    boot_pairs: tuple[tuple[SeriesStats, SeriesStats], ...] = ()
+
+
+#: A row of a comparison that measured nothing beside its two series —
+#: the cross-run one, or a pass that neither rebuilt nor reconfirmed.
+NO_EVIDENCE = RowEvidence()
+
+
 @dataclass(frozen=True)
 class GateRow:
     workload: str
@@ -275,9 +319,31 @@ class GateRow:
     candidate_median: float
     shift: float
     ci_disjoint: bool
+    #: The shift cleared `floor`: against the baseline, and against the
+    #: rebuild as well when the floor is `build`.
     beyond_noise: bool
     regression: bool
     improvement: bool
+    #: The smallest movement this row had to clear: a fraction of the
+    #: baseline median for a duration or a rate, bytes for a footprint.
+    floor: float
+    floor_source: FloorSource
+    #: Whether `floor` is a fraction (a duration or a rate) rather than
+    #: bytes (a footprint).
+    relative_floor: bool
+    #: The rebuild column's median of this row, when the run built one.
+    rebuild_median: float | None = None
+    #: The largest movement between the two builds of the baseline commit
+    #: over every pass that timed both, in `floor`'s unit.
+    build_drift: float | None = None
+    #: The largest movement of one image between its two boots, in
+    #: `floor`'s unit, when the reconfirm booted the workload twice.
+    boot_drift: float | None = None
+    #: The row would have been significant against the baseline alone, at
+    #: the control or boot floor, and the two builds of the baseline moved
+    #: apart by more than that: the shift is within what a rebuild of one
+    #: commit moves, and takes part in no verdict.
+    within_build_drift: bool = False
     #: Set when either side's warm series is too dispersed to compare. The
     #: row is printed with its reason and takes part in no verdict, the way
     #: a variance-rejected cell does.
@@ -300,6 +366,16 @@ class Column(StrEnum):
 
     BASELINE = "baseline"
     CANDIDATE = "candidate"
+    #: The baseline commit's second build, against a second profile.
+    BASELINE_REBUILD = "baseline_rebuild"
+
+
+#: The report side each column of the paired comparison reads.
+PAIRED_COLUMNS = {
+    Column.BASELINE: Side.HELIOS_BASELINE,
+    Column.CANDIDATE: Side.HELIOS,
+    Column.BASELINE_REBUILD: Side.HELIOS_BASELINE_REBUILD,
+}
 
 
 @dataclass(frozen=True)
@@ -353,6 +429,10 @@ class GateResult:
     candidate_run: str | None
     baseline_label: str
     candidate_label: str
+    #: How the baseline commit's second build names itself, when the run
+    #: built one: the column every row's `build` floor is measured
+    #: against.
+    rebuild_label: str | None
     baseline_host: str
     candidate_host: str
     noise_floor: float
@@ -423,6 +503,12 @@ class GateResult:
     def headline_regressions(self) -> list[GateRow]:
         return [row for row in self.regressions if row.headline]
 
+    @property
+    def within_build_drift_rows(self) -> list[GateRow]:
+        if self.inconclusive:
+            return []
+        return [row for row in self.rows if row.within_build_drift]
+
 
 @dataclass(frozen=True)
 class GateReport:
@@ -444,6 +530,17 @@ class GateReport:
         return any(result.blocking for result in self.results)
 
 
+def movement(unit: Unit, reference: SeriesStats, other: SeriesStats) -> float:
+    """How far `other`'s median sits from `reference`'s, in a floor's unit.
+
+    A fraction of the reference for a duration or a rate, which drift
+    with the host; bytes for a footprint, which moves by pages.
+    """
+    if unit.drifts_with_the_host:
+        return abs(relative_shift(reference.median, other.median))
+    return abs(other.median - reference.median)
+
+
 def compare_series(
     workload: WorkloadResult,
     measurement: str,
@@ -452,14 +549,31 @@ def compare_series(
     floor: float,
     cv_bound: float,
     samples: float | None = None,
+    evidence: RowEvidence = NO_EVIDENCE,
 ) -> GateRow:
     """One row: two warm series of one measurement, judged the same way.
 
     Significant means the two bootstrap intervals of the medians are
     disjoint **and** the median moved by more than the smallest shift
-    that could mean anything. Which sign of movement is the bad one, what
-    that smallest shift is, and whether the row may block at all, all
-    come from what the measurement is.
+    that could mean anything. Which sign of movement is the bad one,
+    whether the row may block at all, and what that smallest shift is,
+    all come from what the measurement is and from what the job measured
+    about it:
+
+    1. The row's floor starts at the control's drift (`floor`), or one
+       page for a footprint, and rises to the row's own boot-to-boot
+       drift when the reconfirm booted its workload twice and one image
+       moved further than that between its two boots.
+    2. When the two builds of the baseline commit moved apart by no more
+       than that floor, the builds agree: the row is judged against the
+       baseline at that floor, exactly as a run without a rebuild column
+       judges it.
+    3. When they moved further apart, the floor is that build-to-build
+       drift, and the candidate has to clear it against **both** builds:
+       disjoint intervals against each, a median past the drift from
+       each, and the same direction from each. A candidate that clears
+       the lower floor against the baseline and not this one is within
+       what a second build of one commit moves, and is labelled so.
     """
     unit = DURATION if measurement == ELAPSED else metric_unit(measurement)
     needed = None if measurement == ELAPSED else samples_needed(measurement)
@@ -469,14 +583,39 @@ def compare_series(
     if unit.drifts_with_the_host:
         # The control's drift bounds how far the machine moved, which is
         # what a duration or a rate of durations is exposed to.
-        beyond = abs(shift) > floor
+        row_floor, source = floor, FloorSource.CONTROL
     else:
         # A footprint is exposed to the page, not to the clock.
-        beyond = abs(after.median - before.median) > PAGE_BYTES
+        row_floor, source = float(PAGE_BYTES), FloorSource.PAGE
+    boot_drift = max((movement(unit, first, second) for first, second in evidence.boot_pairs), default=None)
+    if boot_drift is not None and boot_drift > row_floor:
+        row_floor, source = boot_drift, FloorSource.BOOT
+    build_drift = max(
+        (movement(unit, baseline, rebuild) for baseline, rebuild in evidence.build_pairs), default=None
+    )
     worse = shift > 0 if unit.direction is Direction.LOWER_IS_BETTER else shift < 0
     dispersed = max(before.cv, after.cv)
     rejected = dispersed > cv_bound
-    significant = disjoint and beyond and not rejected and not diagnostic
+    beyond = movement(unit, before, after) > row_floor
+    against_baseline = disjoint and beyond and not rejected and not diagnostic
+    significant = against_baseline
+    within_build_drift = False
+    if build_drift is not None and build_drift > row_floor:
+        rebuild = evidence.rebuild
+        if rebuild is None:
+            raise ValueError(
+                f"{workload.name}/{measurement}: a build drift was measured without the rebuild series"
+            )
+        row_floor, source = build_drift, FloorSource.BUILD
+        rebuild_shift = relative_shift(rebuild.median, after.median)
+        beyond = movement(unit, before, after) > build_drift and movement(unit, rebuild, after) > build_drift
+        significant = (
+            against_baseline
+            and beyond
+            and not intervals_overlap(rebuild, after)
+            and (rebuild_shift > 0) == (shift > 0)
+        )
+        within_build_drift = against_baseline and not significant
     return GateRow(
         workload=workload.name,
         measurement=measurement,
@@ -489,6 +628,13 @@ def compare_series(
         beyond_noise=beyond,
         regression=significant and worse,
         improvement=significant and not worse,
+        floor=row_floor,
+        floor_source=source,
+        relative_floor=unit.drifts_with_the_host,
+        rebuild_median=evidence.rebuild.median if evidence.rebuild is not None else None,
+        build_drift=build_drift,
+        boot_drift=boot_drift,
+        within_build_drift=within_build_drift,
         rejected=rejected,
         diagnostic=diagnostic,
         diagnostic_reason=diagnostic_reason(measurement, samples, needed) if diagnostic else None,
@@ -515,8 +661,80 @@ def diagnostic_reason(measurement: str, samples: float | None, needed: float | N
     )
 
 
+@dataclass(frozen=True)
+class ComparedCells:
+    """One workload's cells as a comparison reads them.
+
+    `rebuild` is the rebuild column's cell, present exactly when the run
+    built the baseline commit twice. `first_pass` holds, by column, the
+    cells of the first pair of boots of a workload the reconfirm measured
+    again; the three cells above are then the second pair.
+    """
+
+    workload: WorkloadResult
+    baseline: Cell
+    candidate: Cell
+    rebuild: Cell | None = None
+    first_pass: dict[Column, Cell] = field(default_factory=dict)
+
+
+def series(cell: Cell, measurement: str) -> SeriesStats | None:
+    """The warm series of one measurement of a cell, if it measured it."""
+    return cell.warm if measurement == ELAPSED else cell.metrics.get(measurement)
+
+
+def row_evidence(compared: ComparedCells, measurement: str, unit: Unit) -> RowEvidence:
+    """What the job measured about one row beside its baseline and candidate.
+
+    A same-commit rebuild that lacks a measurement its baseline has is not
+    a column that measured nothing: both builds run the one workload of
+    one commit, so a missing series is a harness defect, and the gate
+    stops on it rather than judging the row without its build drift.
+    """
+    rebuild = None
+    if compared.rebuild is not None:
+        rebuild = series(compared.rebuild, measurement)
+        if rebuild is None:
+            raise SystemExit(
+                f"the baseline rebuild's {compared.workload.name} cell has no `{measurement}` series "
+                "while the baseline build of the same commit has one; the two builds run one workload"
+            )
+
+    def readable(reference: SeriesStats | None, other: SeriesStats | None) -> bool:
+        # A relative movement needs a positive reference, the way a row
+        # needs a positive baseline median.
+        return (
+            reference is not None
+            and other is not None
+            and (reference.median > 0 or not unit.drifts_with_the_host)
+        )
+
+    build_pairs = []
+    passes = [(series(compared.baseline, measurement), rebuild)]
+    first_baseline = compared.first_pass.get(Column.BASELINE)
+    first_rebuild = compared.first_pass.get(Column.BASELINE_REBUILD)
+    if first_baseline is not None and first_rebuild is not None:
+        passes.append((series(first_baseline, measurement), series(first_rebuild, measurement)))
+    for baseline, rebuilt in passes:
+        if readable(baseline, rebuilt):
+            build_pairs.append((baseline, rebuilt))
+    boot_pairs = []
+    for column, cell in (
+        (Column.BASELINE, compared.baseline),
+        (Column.CANDIDATE, compared.candidate),
+        (Column.BASELINE_REBUILD, compared.rebuild),
+    ):
+        first = compared.first_pass.get(column)
+        if first is None or cell is None:
+            continue
+        first_series, second_series = series(first, measurement), series(cell, measurement)
+        if readable(first_series, second_series):
+            boot_pairs.append((first_series, second_series))
+    return RowEvidence(rebuild=rebuild, build_pairs=tuple(build_pairs), boot_pairs=tuple(boot_pairs))
+
+
 def gate_rows(
-    pairs: Iterable[tuple[WorkloadResult, Cell, Cell]], floor: float, cv_bound: float
+    compared_cells: Iterable[ComparedCells], floor: float, cv_bound: float
 ) -> tuple[list[GateRow], list[UnpairedMetric]]:
     """Every measurement of every comparable cell pair.
 
@@ -526,8 +744,19 @@ def gate_rows(
     """
     rows: list[GateRow] = []
     unpaired: list[UnpairedMetric] = []
-    for workload, base_cell, cand_cell in pairs:
-        rows.append(compare_series(workload, ELAPSED, base_cell.warm, cand_cell.warm, floor, cv_bound))
+    for compared in compared_cells:
+        workload, base_cell, cand_cell = compared.workload, compared.baseline, compared.candidate
+        rows.append(
+            compare_series(
+                workload,
+                ELAPSED,
+                base_cell.warm,
+                cand_cell.warm,
+                floor,
+                cv_bound,
+                evidence=row_evidence(compared, ELAPSED, DURATION),
+            )
+        )
         for metric in sorted(set(base_cell.metrics) | set(cand_cell.metrics)):
             if metric.endswith(SAMPLE_COUNT_SUFFIX):
                 # Context for the percentiles beside it, not a row.
@@ -557,6 +786,7 @@ def gate_rows(
                     floor,
                     cv_bound,
                     samples=sample_count(base_cell, cand_cell, metric),
+                    evidence=row_evidence(compared, metric, metric_unit(metric)),
                 )
             )
     return rows, unpaired
@@ -655,7 +885,9 @@ def evaluate(baseline: Report, candidate: Report) -> GateResult:
         cand_cell = workload.cells.get(Side.HELIOS)
         if not comparable(base_cell, cand_cell):
             continue
-        pairs.append((workload, base_cell, cand_cell))
+        # Two jobs: neither run's rebuild column or reconfirm boots
+        # measured anything about the other run's machine.
+        pairs.append(ComparedCells(workload=workload, baseline=base_cell, candidate=cand_cell))
     bound = candidate.thresholds.cv_bound
     rows, unpaired = gate_rows(pairs, floor, bound)
     # Two runs of one lane are two machines as often as they are one
@@ -672,6 +904,7 @@ def evaluate(baseline: Report, candidate: Report) -> GateResult:
         candidate_run=candidate.run.id,
         baseline_label=f"run {baseline.run.id or 'local'}, Helios `{short(baseline.run.helios_git_sha)}`",
         candidate_label=f"run {candidate.run.id or 'local'}, Helios `{short(candidate.run.helios_git_sha)}`",
+        rebuild_label=None,
         baseline_host=baseline.hardware.cpu,
         candidate_host=candidate.hardware.cpu,
         noise_floor=floor,
@@ -751,30 +984,56 @@ def evaluate_paired(candidate: Report) -> GateResult | None:
             f"the run paired against {short(candidate.run.baseline_git_sha)} but measured no "
             "helios_baseline cell; a paired run without its baseline column is a failed run"
         )
-    # The driver samples both images or neither and refuses a run whose
+    rebuilt = candidate.run.rebuilt
+    rebuild_measured = Side.HELIOS_BASELINE_REBUILD in candidate.measured_sides()
+    if rebuilt != rebuild_measured:
+        raise SystemExit(
+            "the run record names a baseline rebuild profile but the report measured no "
+            "helios_baseline_rebuild cell; the rebuild column is the build drift every row is "
+            "judged against, and a run that asked for it and lost it is a failed run"
+            if rebuilt
+            else "the report carries a helios_baseline_rebuild side but no rebuild profile; its "
+            "run record cannot say what the column was built from"
+        )
+    # The driver samples every image or none and refuses a run whose
     # guests report different periods, so a report that disagrees with
     # itself was not produced by it — refused rather than read (#475).
-    mismatch = sampling_mismatch(
-        "column",
-        candidate.run.baseline_instruction_sampling,
-        "column",
-        candidate.run.instruction_sampling,
-    )
-    if mismatch is not None:
-        raise SystemExit(f"the paired comparison is refused: {mismatch.reason}")
+    columns = [("column", candidate.run.baseline_instruction_sampling)]
+    if rebuilt:
+        columns.append(("rebuild column", candidate.run.baseline_rebuild_instruction_sampling))
+    for label, sampling in columns:
+        mismatch = sampling_mismatch(label, sampling, "column", candidate.run.instruction_sampling)
+        if mismatch is not None:
+            raise SystemExit(f"the paired comparison is refused: {mismatch.reason}")
     floor = noise_floor(candidate)
-    pairs = []
+    compared_cells = []
     incomplete_headlines = []
     for workload in candidate.workloads:
         base_cell = workload.cells.get(Side.HELIOS_BASELINE)
         cand_cell = workload.cells.get(Side.HELIOS)
-        if not comparable(base_cell, cand_cell):
+        rebuild_cell = workload.cells.get(Side.HELIOS_BASELINE_REBUILD)
+        # In a run that built the baseline twice, a workload without a
+        # comparable second build has no build drift to be judged
+        # against, which is a missing column, not a quieter row.
+        if not comparable(base_cell, cand_cell) or (rebuilt and not comparable(base_cell, rebuild_cell)):
             if workload.headline:
                 incomplete_headlines.append(workload.name)
             continue
-        pairs.append((workload, base_cell, cand_cell))
+        compared_cells.append(
+            ComparedCells(
+                workload=workload,
+                baseline=base_cell,
+                candidate=cand_cell,
+                rebuild=rebuild_cell if rebuilt else None,
+                first_pass={
+                    column: workload.first_pass[side]
+                    for column, side in PAIRED_COLUMNS.items()
+                    if side in workload.first_pass
+                },
+            )
+        )
     bound = candidate.thresholds.cv_bound
-    rows, unpaired = gate_rows(pairs, floor, bound)
+    rows, unpaired = gate_rows(compared_cells, floor, bound)
     # What each column's profile covered of its own kernel decides whether
     # the comparison is the one it claims: a column built against a
     # profile collected from another commit is not the profiled image the
@@ -795,6 +1054,11 @@ def evaluate_paired(candidate: Report) -> GateResult | None:
                 Column.CANDIDATE,
                 candidate.run.kernel_pgo_uncovered,
                 candidate.run.kernel_pgo_functions,
+            ),
+            (
+                Column.BASELINE_REBUILD,
+                candidate.run.baseline_rebuild_kernel_pgo_uncovered,
+                candidate.run.baseline_rebuild_kernel_pgo_functions,
             ),
         ]
     )
@@ -827,6 +1091,20 @@ def evaluate_paired(candidate: Report) -> GateResult | None:
             candidate.run.baseline_kernel_profile,
             candidate.run.kernel_pgo_uncovered,
             candidate.run.kernel_pgo_functions,
+        ),
+        rebuild_label=(
+            image_label(
+                candidate.run.baseline_git_sha,
+                None,
+                None,
+                None,
+                candidate.run.baseline_rebuild_kernel_profile,
+                candidate.run.baseline_kernel_profile,
+                candidate.run.baseline_rebuild_kernel_pgo_uncovered,
+                candidate.run.baseline_rebuild_kernel_pgo_functions,
+            )
+            if rebuilt
+            else None
         ),
         baseline_host=candidate.hardware.cpu,
         candidate_host=candidate.hardware.cpu,

@@ -14,6 +14,7 @@ from helios_bench.gate import (
     Direction,
     GateKind,
     GateReport,
+    GateRow,
     format_period,
 )
 from helios_bench.report import CLASS_LABELS, SIDE_LABELS, Report, Side, WorkloadClass
@@ -46,6 +47,12 @@ def format_percent(value: float) -> str:
     return f"{value * 100:+.1f}%"
 
 
+def format_floor(row: GateRow) -> str:
+    """The floor a row was judged against, in its own unit, and its source."""
+    amount = f"{row.floor * 100:.1f}%" if row.relative_floor else f"{row.floor:,.0f} B"
+    return f"{amount} {row.floor_source}"
+
+
 def format_seconds(value: float) -> str:
     """A count of seconds, for the budget the retry was sized against."""
     return f"{value:.0f} s"
@@ -65,6 +72,7 @@ def environment() -> Environment:
     env.filters["speedup"] = format_speedup
     env.filters["percent"] = format_percent
     env.filters["seconds"] = format_seconds
+    env.filters["floor"] = format_floor
     env.filters["period"] = format_period
     env.globals["Side"] = Side
     env.globals["SIDE_LABELS"] = SIDE_LABELS

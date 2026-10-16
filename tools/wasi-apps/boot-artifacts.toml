@@ -202,6 +202,14 @@ bootfs_path = "bin/wasix-thread-exec"
 source = "artifacts/wasix/thread-exec/thread-exec.wasm"
 
 [[artifact]]
+command = "wasix-thread-trap"
+package = "helios-wasix-conformance"
+version = "0.1.0"
+source_url = "tools/wasi-apps/wasix-tests"
+bootfs_path = "bin/wasix-thread-trap"
+source = "artifacts/wasix/thread-trap/thread-trap.wasm"
+
+[[artifact]]
 command = "simd-lanes"
 package = "helios-wasix-conformance"
 version = "0.1.0"

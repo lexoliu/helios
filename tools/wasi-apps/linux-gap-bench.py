@@ -541,6 +541,13 @@ class HeliosImage:
       collected profile, which is what says whether profile-guided
       optimisation of the kernel pays (docs/pgo.md, #211).
 
+    A pairing whose baseline is built against a profile collected in the
+    run adds a third image: the baseline commit built once more, against
+    a second, independent collection. It varies nothing but the
+    collection, so how far it lands from the baseline is how far two
+    builds of one commit move apart — the drift the gate judges every
+    row against (#479).
+
     An image is a guest plus the tooling its own commit compiles. One
     harness times both images — this checkout's `workload-bench.sh`, its
     workload manifest, its budgets — and timing two guests with two
@@ -636,6 +643,26 @@ class SampledBoot:
     period_nanos: int
     samples: int
     dropped: int
+
+
+UNIT_ORDER_FORWARD = "forward"
+UNIT_ORDER_REVERSED = "reversed"
+
+
+def parse_unit_orders(values: list[str]) -> dict[str, str]:
+    """`WORKLOAD=forward|reversed` arguments, by workload."""
+    orders: dict[str, str] = {}
+    for value in values:
+        name, separator, order = value.partition("=")
+        if not separator or order not in (UNIT_ORDER_FORWARD, UNIT_ORDER_REVERSED):
+            raise SystemExit(
+                f"--helios-unit-order {value!r} is not WORKLOAD={UNIT_ORDER_FORWARD} "
+                f"or WORKLOAD={UNIT_ORDER_REVERSED}"
+            )
+        if name in orders:
+            raise SystemExit(f"--helios-unit-order names {name!r} twice")
+        orders[name] = order
+    return orders
 
 
 def helios_units(workloads: list[dict], paired: bool) -> list[HeliosUnit]:
@@ -929,9 +956,20 @@ def run_helios(
     control_workload: dict | None,
     keep_going: bool,
     shared_endpoints: HostEndpoints | None = None,
+    unit_orders: dict[str, str] | None = None,
 ) -> Path:
     paired = len(images) > 1
     units = helios_units(workloads, paired)
+    if unit_orders:
+        # Stated for every unit or for none: a run whose caller ordered
+        # some units and left the rest to the alternation would mix two
+        # orderings whose balance nobody stated.
+        keys = {unit.key for unit in units}
+        if set(unit_orders) != keys:
+            raise SystemExit(
+                f"--helios-unit-order names {sorted(unit_orders)} and the run's units are "
+                f"{sorted(keys)}; an order is given for every unit or for none"
+            )
 
     # Every image is built once, before the budget starts and outside
     # every boot's share of it. A cold cargo cache is minutes of
@@ -1051,8 +1089,14 @@ def run_helios(
         # Which image boots first alternates from unit to unit, so that
         # neither of them systematically holds the earlier slot of the
         # pair and any drift between the two boots cancels over the run
-        # rather than accumulating on one side.
-        ordered = images if index % 2 == 0 else list(reversed(images))
+        # rather than accumulating on one side. A caller that repeats a
+        # unit states its order instead: a reconfirm boots the images in
+        # the reverse of the order the pass it repeats did.
+        if unit_orders:
+            forward = unit_orders[unit.key] == UNIT_ORDER_FORWARD
+        else:
+            forward = index % 2 == 0
+        ordered = images if forward else list(reversed(images))
         for image in ordered:
             log = image.log(unit.key)
             budget = next_budget()
@@ -2504,6 +2548,41 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--helios-baseline-rebuild-profile-use",
+        type=Path,
+        default=None,
+        help=(
+            "A second merged .profdata of the --helios-baseline-root commit, "
+            "collected independently of --helios-baseline-profile-use. The "
+            "baseline commit is built once more against it and timed as a third "
+            "image in every unit, so the run measures how far two builds of one "
+            "commit move apart (#479)."
+        ),
+    )
+    parser.add_argument(
+        "--helios-baseline-rebuild-out-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Where the baseline rebuild's records go; defaults to a "
+            "`helios-baseline-rebuild` directory beside the run's own output."
+        ),
+    )
+    parser.add_argument(
+        "--helios-unit-order",
+        dest="helios_unit_orders",
+        action="append",
+        default=[],
+        metavar="WORKLOAD=forward|reversed",
+        help=(
+            "The order one unit of a paired run boots its images in: `forward` "
+            "boots the candidate first and the baseline images after it, "
+            "`reversed` the other way round. Given for one unit, it has to be "
+            "given for every unit; without it the order alternates from unit to "
+            "unit."
+        ),
+    )
+    parser.add_argument(
         "--helios-skip-build",
         action="store_true",
         help=(
@@ -2594,6 +2673,18 @@ def main() -> None:
         args.helios_baseline_profile_use = args.helios_baseline_profile_use.resolve()
         if not args.helios_baseline_profile_use.is_file():
             raise SystemExit(f"{args.helios_baseline_profile_use} is not a file")
+    if args.helios_baseline_rebuild_out_dir is not None and args.helios_baseline_rebuild_profile_use is None:
+        raise SystemExit("--helios-baseline-rebuild-out-dir needs --helios-baseline-rebuild-profile-use")
+    if args.helios_baseline_rebuild_profile_use is not None:
+        if args.helios_baseline_profile_use is None:
+            raise SystemExit(
+                "--helios-baseline-rebuild-profile-use names the second profile of a "
+                "--helios-baseline-profile-use baseline, which is not set"
+            )
+        args.helios_baseline_rebuild_profile_use = args.helios_baseline_rebuild_profile_use.resolve()
+        if not args.helios_baseline_rebuild_profile_use.is_file():
+            raise SystemExit(f"{args.helios_baseline_rebuild_profile_use} is not a file")
+    args.helios_unit_orders = parse_unit_orders(args.helios_unit_orders)
     if args.linux_vm_smp <= 0:
         raise SystemExit("--linux-vm-smp must be positive")
     if args.linux_vm_setup_timeout_seconds <= 0:
@@ -2709,6 +2800,31 @@ def main() -> None:
                         without_kernel_profile=args.helios_baseline_without_kernel_profile,
                     )
                 )
+            if args.helios_baseline_rebuild_profile_use is not None:
+                # The baseline commit once more, from its own worktree,
+                # against the second collection: the inspector keys a
+                # kernel built against a named profile by that profile's
+                # digest, so the two builds of one checkout do not share a
+                # kernel directory.
+                rebuild_out_dir = (
+                    args.helios_baseline_rebuild_out_dir or out_dir.parent / "helios-baseline-rebuild"
+                )
+                if not rebuild_out_dir.is_absolute():
+                    rebuild_out_dir = repo_root() / rebuild_out_dir
+                rebuild_out_dir = rebuild_out_dir.resolve()
+                rebuild_out_dir.mkdir(parents=True, exist_ok=True)
+                images.append(
+                    HeliosImage(
+                        name="helios-baseline-rebuild",
+                        workspace_root=args.helios_baseline_root,
+                        out_dir=rebuild_out_dir,
+                        profile_use=args.helios_baseline_rebuild_profile_use,
+                    )
+                )
+            if args.helios_unit_orders and not paired:
+                raise SystemExit(
+                    "--helios-unit-order orders the images of a paired run; this run times one image"
+                )
             helios_jsonl = run_helios(
                 args.manifest,
                 images,
@@ -2724,6 +2840,7 @@ def main() -> None:
                 control_workload,
                 args.keep_going,
                 shared_endpoints=endpoints if args.reuse_host_listeners else None,
+                unit_orders=args.helios_unit_orders,
             )
         if not args.skip_linux:
             linux_json, wasmtime_linux_json, linux_provenance = run_linux(

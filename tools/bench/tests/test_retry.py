@@ -161,7 +161,7 @@ def suite(options: RunOptions, manifest, monkeypatch, report: Report) -> Report:
     the production code's."""
     monkeypatch.setattr(runner, "host_deviations", lambda lane: [])
     monkeypatch.setattr(runner, "prepare_baseline", lambda baseline: None)
-    monkeypatch.setattr(runner, "kernel_profiles", lambda options: (None, None))
+    monkeypatch.setattr(runner, "kernel_profiles", lambda options: runner.KernelProfiles(candidate=None))
     monkeypatch.setattr(runner, "kernel_pgo_uncovered", lambda *args: None)
     monkeypatch.setattr(runner, "collect_hardware", lambda lane: report.hardware)
     monkeypatch.setattr(runner, "collect_pins", lambda lane, workloads, kernel_build: report.pins)

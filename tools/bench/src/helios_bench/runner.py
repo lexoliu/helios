@@ -19,6 +19,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 
 from helios_bench import REPO_ROOT, WASI_APPS_ROOT
@@ -53,6 +54,7 @@ from helios_bench.report import (
 )
 from helios_bench.sources import (
     SIDE_CONTROL_JSONL,
+    RawCell,
     RawSide,
     read_control,
     read_optional_side,
@@ -67,6 +69,7 @@ BOOT_ARTIFACTS = WASI_APPS_ROOT / "boot-artifacts.toml"
 CARGO_TARGETS = {"aarch64": "aarch64-unknown-none", "x86-64": "x86_64-unknown-none"}
 HELIOS_OUT = "helios"
 HELIOS_BASELINE_OUT = "helios-baseline"
+HELIOS_BASELINE_REBUILD_OUT = "helios-baseline-rebuild"
 RETAKE_OUT = "retake"
 RECONFIRM_OUT = "reconfirm"
 RETRY_OUT = "retry"
@@ -92,9 +95,46 @@ KERNEL_PROFILE_RECORD = REPO_ROOT / "target" / "profiles" / "fetched.json"
 SIDE_OUT = {
     Side.HELIOS: HELIOS_OUT,
     Side.HELIOS_BASELINE: HELIOS_BASELINE_OUT,
+    Side.HELIOS_BASELINE_REBUILD: HELIOS_BASELINE_REBUILD_OUT,
     Side.LINUX_NATIVE: LINUX_OUT,
     Side.LINUX_WASMTIME: LINUX_OUT,
 }
+
+
+class UnitOrder(StrEnum):
+    """Which way one paired unit boots the run's Helios images.
+
+    `forward` boots them candidate first, then the baseline, then the
+    baseline rebuild; `reversed` the other way round. The driver takes one
+    per unit (`--helios-unit-order`), so the order of every boot is the
+    runner's to state rather than a side effect of where a workload falls
+    in whichever subset one pass of the driver was handed.
+    """
+
+    FORWARD = "forward"
+    REVERSED = "reversed"
+
+    def flipped(self) -> UnitOrder:
+        return UnitOrder.REVERSED if self is UnitOrder.FORWARD else UnitOrder.FORWARD
+
+
+def boot_orders(options: RunOptions, workloads: list[dict]) -> dict[str, UnitOrder]:
+    """The order each workload's boots take in the suite's pass, by name.
+
+    Alternating by the workload's position in the run's selection, so
+    neither end of a unit is systematically held by one image and any
+    drift between adjacent boots cancels over the run. With three images
+    the baseline is always the middle boot and the candidate and the
+    rebuild trade the two ends, so a position effect lands on the
+    candidate's shift and on the build drift alike. An unpaired run boots
+    one guest per class and states no order.
+    """
+    if not options.paired:
+        return {}
+    return {
+        workload["name"]: UnitOrder.FORWARD if index % 2 == 0 else UnitOrder.REVERSED
+        for index, workload in enumerate(workloads)
+    }
 
 
 @dataclass(frozen=True)
@@ -152,6 +192,15 @@ class RunOptions:
     # so a paired run holds each commit's kernel to a profile collected
     # from that commit rather than both to one fetched profile (#384).
     baseline_profile_use: Path | None = None
+    # A second merged `.profdata` of the baseline commit, collected
+    # independently of `baseline_profile_use`: the baseline commit is built
+    # once more against it and timed as a third column, so every row can
+    # be judged against how far two builds of one commit move apart
+    # (#479). A pairing that builds its baseline against a per-run
+    # collection carries that build-to-build variance in every shift, and
+    # this is the only in-job measurement of it, so the one requires the
+    # other.
+    baseline_rebuild_profile_use: Path | None = None
     # The baseline built without the fetched kernel profile: the plain
     # control of a PGO measurement (docs/pgo.md, #322). Alone, it pairs
     # this checkout's profile-guided release kernel against its plain one;
@@ -177,6 +226,30 @@ class RunOptions:
                     "--baseline-profile-use with --baseline-kernel-build release: "
                     "the plain control reads no profile"
                 )
+            if self.baseline_rebuild_profile_use is None:
+                raise SystemExit(
+                    "--baseline-profile-use builds the baseline against a profile collected in "
+                    "this run, and two collections of one commit build kernels that time "
+                    "differently (#479): name a second, independent collection with "
+                    "--baseline-rebuild-profile-use so the gate can measure that drift"
+                )
+        if self.baseline_rebuild_profile_use is not None:
+            if self.baseline_profile_use is None:
+                raise SystemExit(
+                    "--baseline-rebuild-profile-use names the second profile of a baseline "
+                    "built against --baseline-profile-use, which is not set"
+                )
+            if self.baseline_rebuild_profile_use.resolve() == self.baseline_profile_use.resolve():
+                raise SystemExit(
+                    f"--baseline-rebuild-profile-use and --baseline-profile-use both name "
+                    f"{self.baseline_profile_use}: the rebuild is the baseline commit built "
+                    "against a second, independent collection"
+                )
+
+    @property
+    def rebuilt(self) -> bool:
+        """Whether this run builds the baseline commit a second time."""
+        return self.baseline_rebuild_profile_use is not None
 
     @property
     def paired(self) -> bool:
@@ -279,10 +352,15 @@ def helios_command(
     common: list[str],
     out_root: Path,
     description: str,
+    unit_order: dict[str, UnitOrder],
     helios_pass: bool = False,
 ) -> PlannedCommand:
     """The driver invocation that times the Helios image, and the baseline
-    image beside it when the run is paired, under ``out_root``."""
+    images beside it when the run is paired, under ``out_root``.
+
+    ``unit_order`` names the order every unit of a paired invocation boots
+    the images in, and is empty for an unpaired one.
+    """
     lane = options.lane
     env = {
         "HELIOS_WORKLOAD_BENCH_VM_MEMORY": lane.memory,
@@ -312,6 +390,11 @@ def helios_command(
             "--out-dir",
             str(out_root / HELIOS_OUT),
             *baseline_arguments(options, out_root),
+            *[
+                argument
+                for name, order in unit_order.items()
+                for argument in ("--helios-unit-order", f"{name}={order}")
+            ],
         ],
         env=env,
         cwd=REPO_ROOT,
@@ -340,6 +423,7 @@ def plan(options: RunOptions, manifest: Manifest, workloads: list[dict]) -> list
                 common,
                 options.out_dir,
                 "time every workload on Helios",
+                boot_orders(options, workloads),
                 helios_pass=True,
             )
         )
@@ -409,7 +493,16 @@ def profile_label(path: Path) -> str:
         return str(path)
 
 
-def kernel_profiles(options: RunOptions) -> tuple[str | None, str | None]:
+@dataclass(frozen=True)
+class KernelProfiles:
+    """The profile each column's kernel was built against, as labelled."""
+
+    candidate: str | None
+    baseline: str | None = None
+    baseline_rebuild: str | None = None
+
+
+def kernel_profiles(options: RunOptions) -> KernelProfiles:
     """Which profile each column's kernel was built against.
 
     The candidate reads the profile the run named, and otherwise the
@@ -418,16 +511,22 @@ def kernel_profiles(options: RunOptions) -> tuple[str | None, str | None]:
     collection, when a paired run gathers one per column — and otherwise
     the release's or none, which is exactly what a PGO pairing measures
     once every release publishes a profile: the release's counts against
-    a freshly collected set (#226, #384).
+    a freshly collected set (#226, #384). The baseline rebuild reads the
+    second collection `--baseline-rebuild-profile-use` named (#479).
     """
     fetched = fetched_kernel_profile_label() if options.reads_release_profile else None
     candidate = profile_label(options.profile_use) if options.profile_use else fetched
     if not options.paired or options.plain_baseline:
-        return candidate, None
+        return KernelProfiles(candidate=candidate)
     baseline = (
         profile_label(options.baseline_profile_use) if options.baseline_profile_use is not None else fetched
     )
-    return candidate, baseline
+    rebuild = (
+        profile_label(options.baseline_rebuild_profile_use)
+        if options.baseline_rebuild_profile_use is not None
+        else None
+    )
+    return KernelProfiles(candidate=candidate, baseline=baseline, baseline_rebuild=rebuild)
 
 
 def baseline_arguments(options: RunOptions, out_root: Path) -> list[str]:
@@ -448,7 +547,17 @@ def baseline_arguments(options: RunOptions, out_root: Path) -> list[str]:
         arguments.append("--helios-baseline-without-kernel-profile")
     if not arguments:
         return []
-    return [*arguments, "--helios-baseline-out-dir", str(out_root / HELIOS_BASELINE_OUT)]
+    arguments.extend(["--helios-baseline-out-dir", str(out_root / HELIOS_BASELINE_OUT)])
+    if options.baseline_rebuild_profile_use is not None:
+        arguments.extend(
+            [
+                "--helios-baseline-rebuild-profile-use",
+                str(options.baseline_rebuild_profile_use),
+                "--helios-baseline-rebuild-out-dir",
+                str(out_root / HELIOS_BASELINE_REBUILD_OUT),
+            ]
+        )
+    return arguments
 
 
 def execute(command: PlannedCommand) -> None:
@@ -682,7 +791,7 @@ def read_controls(options: RunOptions, thresholds: Thresholds) -> dict[Side, tup
     return controls
 
 
-HELIOS_SIDES = frozenset({Side.HELIOS, Side.HELIOS_BASELINE})
+HELIOS_SIDES = frozenset({Side.HELIOS, Side.HELIOS_BASELINE, Side.HELIOS_BASELINE_REBUILD})
 
 
 def dispersed_headline_workloads(
@@ -706,7 +815,12 @@ def dispersed_headline_workloads(
 
 
 def retake_plan(
-    options: RunOptions, iterations: int, names: list[str], out_name: str, reason: str
+    options: RunOptions,
+    iterations: int,
+    names: list[str],
+    out_name: str,
+    reason: str,
+    unit_order: dict[str, UnitOrder],
 ) -> PlannedCommand:
     """The driver invocation that times the workloads ``names`` again on
     every Helios image the run has, under ``out_name/`` beside the first pass."""
@@ -715,6 +829,7 @@ def retake_plan(
         driver_arguments(options, iterations, [{"name": name} for name in names], control=False),
         options.out_dir / out_name,
         f"measure {', '.join(names)} again on every Helios image: {reason}",
+        unit_order,
     )
 
 
@@ -726,13 +841,16 @@ def retake_workloads(
     thresholds: Thresholds,
     out_name: str,
     reason: str,
-) -> list[str]:
+    unit_order: dict[str, UnitOrder],
+) -> dict[Side, dict[str, RawCell]]:
     """Times the workloads ``names`` again on every Helios image the run has,
     back to back through the same driver, and replaces their cells on every
-    image so the pair stays paired. Returns the names measured again."""
+    image so the columns stay paired. Returns the cells the second pass
+    replaced, per image: the first pass of those workloads."""
     if not names:
-        return []
-    execute(retake_plan(options, iterations, names, out_name, reason))
+        return {}
+    execute(retake_plan(options, iterations, names, out_name, reason, unit_order))
+    replaced: dict[Side, dict[str, RawCell]] = {}
     for side in options.sides & HELIOS_SIDES:
         out_dir = options.out_dir / out_name / SIDE_OUT[side]
         raw = read_optional_side(out_dir, side, thresholds.warmup_discard)
@@ -744,8 +862,11 @@ def retake_workloads(
                 raise SystemExit(
                     f"the second pass of {name} wrote no records for the {side} side under {out_dir}"
                 )
+            first = sides[side].cells.get(name)
+            if first is not None:
+                replaced.setdefault(side, {})[name] = first
             sides[side].cells[name] = cell
-    return list(names)
+    return replaced
 
 
 def retake(
@@ -754,6 +875,7 @@ def retake(
     workloads: list[dict],
     sides: dict[Side, RawSide],
     thresholds: Thresholds,
+    orders: dict[str, UnitOrder],
 ) -> list[str]:
     """Re-measures, once, each headline workload whose cell the gate would
     reject for dispersion.
@@ -763,19 +885,23 @@ def retake(
     (run 34390597958: one baseline cell at CV 0.15012 against 0.150 cost
     the whole hour). A retake that is still dispersed stands: a host that
     cannot produce two clean series in a row is the inconclusive case, not
-    a loop.
+    a loop. The retake replaces the pass it repeats, so it boots each
+    workload's images in the order that pass did (``orders``).
     """
     if Side.HELIOS not in options.sides:
         return []
-    return retake_workloads(
+    names = dispersed_headline_workloads(sides, workloads, thresholds)
+    retake_workloads(
         options,
         iterations,
-        dispersed_headline_workloads(sides, workloads, thresholds),
+        names,
         sides,
         thresholds,
         RETAKE_OUT,
         "the first pass was too dispersed to gate on",
+        {name: orders[name] for name in names} if options.paired else {},
     )
+    return names
 
 
 def regressed_headline_workloads(report: Report) -> list[str]:
@@ -790,33 +916,66 @@ def regressed_headline_workloads(report: Report) -> list[str]:
     return names
 
 
+@dataclass(frozen=True)
+class Reconfirmation:
+    """The workloads the reconfirm measured again, and their first pair.
+
+    `first_pass` holds, per Helios image, the cells the second pair
+    replaced. The report keeps them beside the second pair: how far one
+    image moved between its two boots is part of the row's floor.
+    """
+
+    names: list[str] = field(default_factory=list)
+    first_pass: dict[Side, dict[str, RawCell]] = field(default_factory=dict)
+
+
 def reconfirm(
     options: RunOptions,
     iterations: int,
     report: Report,
     sides: dict[Side, RawSide],
     thresholds: Thresholds,
-) -> list[str]:
+    orders: dict[str, UnitOrder],
+) -> Reconfirmation:
     """Measures, once, every headline workload the paired gate would block on.
 
     A regression that is the change's own reproduces on a second pair of
     boots; a drift between two boots does not (run 34404354482:
     `sched-tasks` +6.9% on a 6.7% floor, identical kernels). The regressed
-    workloads are timed again on both images back to back and the second
-    pair replaces the first, so the gate reads a regression that showed
-    twice. One pass: a host that drifts twice in a row still fails the check.
+    workloads are timed again on every image back to back, and the second
+    pair is what the gate reads, so a regression has to show twice. One
+    pass: a host that drifts twice in a row still fails the check.
+
+    The second pair boots each workload's images in the reverse of the
+    order its first pair did (``orders``): a replicate that put the same
+    image in the same slot as the original would share any bias of that
+    slot with it. The first pair is returned rather than dropped, so the
+    report keeps both and the gate can hold each row to how far one image
+    moved between its two boots — run 38940834451's baseline image put
+    `fs-smallfiles` at 193 ms on one boot and 233 ms on the next.
     """
     if not report.run.paired:
-        return []
-    return retake_workloads(
+        return Reconfirmation()
+    names = regressed_headline_workloads(report)
+    first_pass = retake_workloads(
         options,
         iterations,
-        regressed_headline_workloads(report),
+        names,
         sides,
         thresholds,
         RECONFIRM_OUT,
         "the first pair of boots regressed and a regression has to show twice",
+        {name: orders[name].flipped() for name in names},
     )
+    return Reconfirmation(names=names, first_pass=first_pass)
+
+
+#: What `run_suite`'s report assembly takes: the cells of one pass, its
+#: control, the workloads it retook, its reconfirmation, and the noise
+#: retry record when there is one.
+BuildReport = Callable[
+    [dict[Side, RawSide], Control | None, list[str], Reconfirmation, NoiseRetry | None], Report
+]
 
 
 def retry(
@@ -825,8 +984,9 @@ def retry(
     workloads: list[dict],
     report: Report,
     first_sides: dict[Side, RawSide],
+    first_reconfirmation: Reconfirmation,
     thresholds: Thresholds,
-    build: Callable[[dict[Side, RawSide], Control | None, list[str], list[str], NoiseRetry | None], Report],
+    build: BuildReport,
     helios_seconds: float,
     run_started: float,
 ) -> Report | None:
@@ -845,7 +1005,7 @@ def retry(
     paired verdict to retry and is never re-measured, and neither is a
     first pass whose floor stayed under the bound.
 
-    The second pass re-runs only the Helios pair — the Linux sides'
+    The second pass re-runs only the Helios images — the Linux sides'
     first-pass cells stand — so a retry pass needs a baseline
     (``--baseline-ref`` or ``--profile-use``) to compare, which every paired
     run already has. When the run carries a ``--job-timeout-minutes`` the
@@ -876,7 +1036,7 @@ def retry(
                 first_sides,
                 report.control,
                 report.run.retaken,
-                report.run.reconfirmed,
+                first_reconfirmation,
                 RetrySkippedForBudget(
                     first_noise_floor=result.noise_floor,
                     needed_seconds=helios_seconds,
@@ -888,17 +1048,19 @@ def retry(
         out_dir=options.out_dir / RETRY_OUT,
         sides=options.sides & HELIOS_SIDES,
     )
+    orders = boot_orders(retry_options, workloads)
     execute(
         helios_command(
             retry_options,
             driver_arguments(retry_options, iterations, workloads, control=True),
             retry_options.out_dir,
-            "measure the control pair and every workload on both Helios images once more: "
+            "measure the control pair and every workload on every Helios image once more: "
             f"the first pass's noise floor crossed the {result.floor_bound:.3f} bound",
+            orders,
         )
     )
     second_sides = read_sides(retry_options, thresholds)
-    retaken = retake(retry_options, iterations, workloads, second_sides, thresholds)
+    retaken = retake(retry_options, iterations, workloads, second_sides, thresholds, orders)
     controls = read_controls(retry_options, thresholds)
     for side in sorted(retry_options.sides):
         out_dir = retry_options.out_dir / SIDE_OUT[side]
@@ -923,10 +1085,10 @@ def retry(
         first_noise_floor=result.noise_floor,
         second_noise_floor=control.noise_floor,
     )
-    second = build(second_sides, control, retaken, [], record)
-    reconfirmed = reconfirm(retry_options, iterations, second, second_sides, thresholds)
-    if reconfirmed:
-        second = build(second_sides, control, retaken, reconfirmed, record)
+    second = build(second_sides, control, retaken, Reconfirmation(), record)
+    reconfirmation = reconfirm(retry_options, iterations, second, second_sides, thresholds, orders)
+    if reconfirmation.names:
+        second = build(second_sides, control, retaken, reconfirmation, record)
     return second
 
 
@@ -955,6 +1117,11 @@ def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) ->
     if not paired and Side.HELIOS_BASELINE in options.sides:
         raise SystemExit(
             "the helios_baseline side needs --baseline-ref or --profile-use to say what it is built from"
+        )
+    if options.rebuilt != (Side.HELIOS_BASELINE_REBUILD in options.sides):
+        raise SystemExit(
+            "a run that rebuilds the baseline times it as the helios_baseline_rebuild side, and "
+            "only such a run has that side: --sides and --baseline-rebuild-profile-use disagree"
         )
     workload_manifest = load_workloads()
     workloads = select_workloads(workload_manifest, options.workload_names)
@@ -985,20 +1152,23 @@ def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) ->
         if command.helios_pass:
             helios_seconds = time.monotonic() - before
     thresholds = thresholds_from(manifest, options.iterations)
+    orders = boot_orders(options, workloads)
     sides = read_sides(options, thresholds)
-    retaken = retake(options, thresholds.iterations, workloads, sides, thresholds)
+    retaken = retake(options, thresholds.iterations, workloads, sides, thresholds, orders)
     control = build_control(
         workload_manifest["control_workload"], read_controls(options, thresholds), thresholds
     )
     run_id, run_url, attempt = github_run()
 
-    candidate_profile, baseline_profile = kernel_profiles(options)
+    profiles = kernel_profiles(options)
+    # Both builds of the baseline commit come out of its one worktree.
+    baseline_root = options.baseline.worktree if options.baseline is not None else REPO_ROOT
 
     def build(
         sides: dict[Side, RawSide],
         control: Control | None,
         retaken: list[str],
-        reconfirmed: list[str],
+        reconfirmation: Reconfirmation,
         noise_retry: NoiseRetry | None = None,
     ) -> Report:
         finished = datetime.now(UTC).isoformat(timespec="seconds")
@@ -1011,7 +1181,7 @@ def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) ->
         )
         baseline_uncovered = (
             kernel_pgo_uncovered(
-                options.baseline.worktree if options.baseline is not None else REPO_ROOT,
+                baseline_root,
                 lane,
                 # A per-column profile names the baseline's own
                 # pgo-kernels/<digest> build directory the same way the
@@ -1020,6 +1190,11 @@ def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) ->
                 options.baseline_profile_use,
             )
             if options.baseline_kernel_build == PROFILE_USE_BUILD
+            else None
+        )
+        rebuild_uncovered = (
+            kernel_pgo_uncovered(baseline_root, lane, options.baseline_rebuild_profile_use)
+            if options.baseline_rebuild_profile_use is not None
             else None
         )
         run = RunInfo(
@@ -1049,18 +1224,28 @@ def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) ->
             else (git_sha() if paired else None),
             kernel_build=options.kernel_build,
             baseline_kernel_build=options.baseline_kernel_build,
-            kernel_profile=candidate_profile,
-            baseline_kernel_profile=baseline_profile,
+            kernel_profile=profiles.candidate,
+            baseline_kernel_profile=profiles.baseline,
             kernel_pgo_uncovered=(candidate_uncovered[0] if candidate_uncovered is not None else None),
             kernel_pgo_functions=(candidate_uncovered[1] if candidate_uncovered is not None else None),
             baseline_kernel_pgo_uncovered=(baseline_uncovered[0] if baseline_uncovered is not None else None),
             baseline_kernel_pgo_functions=(baseline_uncovered[1] if baseline_uncovered is not None else None),
+            baseline_rebuild_kernel_profile=profiles.baseline_rebuild,
+            baseline_rebuild_kernel_pgo_uncovered=(
+                rebuild_uncovered[0] if rebuild_uncovered is not None else None
+            ),
+            baseline_rebuild_kernel_pgo_functions=(
+                rebuild_uncovered[1] if rebuild_uncovered is not None else None
+            ),
             instruction_sampling=read_instruction_sampling(options, Side.HELIOS),
             baseline_instruction_sampling=(
                 read_instruction_sampling(options, Side.HELIOS_BASELINE) if paired else None
             ),
+            baseline_rebuild_instruction_sampling=(
+                read_instruction_sampling(options, Side.HELIOS_BASELINE_REBUILD) if options.rebuilt else None
+            ),
             retaken=retaken,
-            reconfirmed=reconfirmed,
+            reconfirmed=reconfirmation.names,
             noise_retry=noise_retry,
         )
         return assemble_report(
@@ -1071,18 +1256,20 @@ def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) ->
             hardware=collect_hardware(lane),
             pins=collect_pins(lane, workloads, options.kernel_build),
             thresholds=thresholds,
+            first_pass=reconfirmation.first_pass,
         )
 
-    report = build(sides, control, retaken, [])
-    reconfirmed = reconfirm(options, thresholds.iterations, report, sides, thresholds)
-    if reconfirmed:
-        report = build(sides, control, retaken, reconfirmed)
+    report = build(sides, control, retaken, Reconfirmation())
+    reconfirmation = reconfirm(options, thresholds.iterations, report, sides, thresholds, orders)
+    if reconfirmation.names:
+        report = build(sides, control, retaken, reconfirmation)
     retried = retry(
         options,
         thresholds.iterations,
         workloads,
         report,
         sides,
+        reconfirmation,
         thresholds,
         build,
         helios_seconds,

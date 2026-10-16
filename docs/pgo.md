@@ -281,7 +281,8 @@ without counting against an image it never entered. The percentage is
 the share uncovered, the parenthesised list is the uncovered count per
 crate, and the path is where every warning line went, header first. The
 bench run record carries both figures per column (`kernel_pgo_uncovered`
-and `kernel_pgo_functions`, plus the `baseline_` pair), the paired
+and `kernel_pgo_functions`, plus the `baseline_` and
+`baseline_rebuild_` pairs), the paired
 gate's labels name them, and the lists ride the runtime-directory upload
 — `bench-runtime-<lane>` on the matrix lanes, `bench-pgo-uncovered` on
 `suite-pgo`, where the failure-only log upload would have left a green
@@ -443,11 +444,18 @@ pairs showed before #384: the candidate at 3,377–4,251 uncovered
 functions against the baseline's 501, the stale profile's cost billed to
 the change. The `profile-columns` job therefore calls
 `kernel-profile.yml` once per column — the candidate's at the run's own
-commit and the baseline's at the ref the suite pairs against, so each
-collection runs the ref's own tooling — and `suite` downloads the two artifacts as
-`helios-kernel-profdata-candidate` and `helios-kernel-profdata-baseline`,
-then passes them to `helios-bench run` as `--profile-use` and
-`--baseline-profile-use`. A `release` baseline collects none: the plain
+commit, and the baseline's and the baseline rebuild's both at the ref
+the suite pairs against, so each collection runs the ref's own tooling —
+and `suite` downloads the three artifacts as
+`helios-kernel-profdata-candidate`, `helios-kernel-profdata-baseline`
+and `helios-kernel-profdata-baseline-rebuild`, then passes them to
+`helios-bench run` as `--profile-use`, `--baseline-profile-use` and
+`--baseline-rebuild-profile-use`. The rebuild is the baseline commit
+built a second time against its own, independently collected profile;
+the gate reads how far the two baseline builds move apart as a per-row
+floor (`docs/benchmarks.md`, #479). The collections run in parallel:
+`kernel-profile.yml`'s concurrency group carries the artifact name, so
+the columns of one run neither queue behind nor cancel each other. A `release` baseline collects none: the plain
 control reads no profile. And the paired gate holds each column's
 uncovered share to `UNDERPROFILED_SHARE`: a column past it was not built
 against a profile of its own commit, so the run is inconclusive for that

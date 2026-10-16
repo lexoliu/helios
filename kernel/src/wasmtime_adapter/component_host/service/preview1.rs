@@ -291,11 +291,14 @@ where
         self.requested_exit.take()
     }
 
-    /// The exit status of a program whose call ended in `error`: the
+    /// How the process ends once this store's call ended in `error`: the
     /// signal that ended it, otherwise the status the guest asked for,
-    /// otherwise none, and the error is a failure.
-    pub(super) fn take_exit_status(&mut self, error: &wasmtime::Error) -> Option<u32> {
-        preview1_exit_status(error, self.requested_exit.take())
+    /// otherwise the failure the error is ([`preview1_process_end`]).
+    pub(super) fn take_process_end(
+        &mut self,
+        error: wasmtime::Error,
+    ) -> Result<u32, ProgramExecError> {
+        preview1_process_end(error, self.requested_exit.take())
     }
 
     pub(super) fn exec_context(&self) -> ProgramExecContext<CpuImpl, Net, HostFs> {

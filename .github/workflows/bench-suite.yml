@@ -162,6 +162,11 @@ jobs:
       # `actions/checkout` reads a `ref` that is not forty hex digits as
       # a branch or tag, so a short SHA or `merge-base` has to be
       # resolved here, where the history is, before it is handed on.
+      # A baseline built against its own collection gets a second,
+      # independent collection of the same commit (`baseline-rebuild`):
+      # the suite builds the baseline once more against it, and how far
+      # the two builds of one commit time apart is the build drift the
+      # gate holds every row to (#479).
       - id: columns
         env:
           CANDIDATE_SHA: ${{ github.sha }}
@@ -178,8 +183,10 @@ jobs:
             fi
             baseline="$(jq -c -n --arg ref "$sha" \
               '{column: "baseline", ref: $ref, artifact: "helios-kernel-profdata-baseline"}')"
+            rebuild="$(jq -c -n --arg ref "$sha" \
+              '{column: "baseline-rebuild", ref: $ref, artifact: "helios-kernel-profdata-baseline-rebuild"}')"
             columns="$(jq -c -n --argjson candidate "$candidate" --argjson baseline "$baseline" \
-              '[$candidate, $baseline]')"
+              --argjson rebuild "$rebuild" '[$candidate, $baseline, $rebuild]')"
           else
             columns="$(jq -c -n --argjson candidate "$candidate" '[$candidate]')"
           fi
@@ -218,7 +225,10 @@ jobs:
   # collection checked out at the ref it profiles so it runs that ref's
   # own tooling, each artifact named for its column. A plain `release`
   # control has no profile to collect, and the non-paired events keep
-  # `profile-generate`'s one collection below.
+  # `profile-generate`'s one collection below. A profiled baseline is
+  # collected twice, independently, so the suite can build it twice
+  # (#479); the entries run side by side, each on its own runner, so the
+  # third adds a runner and no wall time.
   profile-columns:
     name: profile-columns-${{ matrix.column }}
     needs: tooling
@@ -318,6 +328,12 @@ jobs:
         with:
           name: helios-kernel-profdata-baseline
           path: helios/target/pgo-baseline
+      - name: Download the baseline rebuild's kernel profile
+        if: env.BENCH_PER_COLUMN_PROFILES == 'true' && env.BENCH_BASELINE_PROFILE == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: helios-kernel-profdata-baseline-rebuild
+          path: helios/target/pgo-baseline-rebuild
       - name: Report host deviations from the lane
         working-directory: helios/tools/bench
         run: uv run helios-bench host-check --lane ${{ matrix.lane }} || true
@@ -398,11 +414,13 @@ jobs:
           fi
           # Each column's kernel is built against the profile its own
           # collection produced this run, not the fetched one both
-          # would otherwise share (#384).
+          # would otherwise share (#384), and a profiled baseline is
+          # built a second time against its second collection (#479).
           if [ "${BENCH_PER_COLUMN_PROFILES}" = true ]; then
             args+=(--profile-use "$GITHUB_WORKSPACE/helios/target/pgo-candidate/helios-kernel.profdata")
             if [ "${BENCH_BASELINE_PROFILE}" = true ]; then
               args+=(--baseline-profile-use "$GITHUB_WORKSPACE/helios/target/pgo-baseline/helios-kernel.profdata")
+              args+=(--baseline-rebuild-profile-use "$GITHUB_WORKSPACE/helios/target/pgo-baseline-rebuild/helios-kernel.profdata")
             fi
           fi
           if [ "${{ matrix.net-backend }}" = tap ]; then
@@ -462,6 +480,10 @@ jobs:
             bench-out/${{ matrix.lane }}/helios-baseline/*.perf.json
             bench-out/${{ matrix.lane }}/helios-baseline/*.kernel.folded
             bench-out/${{ matrix.lane }}/helios-baseline/*.pc.folded
+            bench-out/${{ matrix.lane }}/helios-baseline-rebuild/*.jsonl
+            bench-out/${{ matrix.lane }}/helios-baseline-rebuild/*.perf.json
+            bench-out/${{ matrix.lane }}/helios-baseline-rebuild/*.kernel.folded
+            bench-out/${{ matrix.lane }}/helios-baseline-rebuild/*.pc.folded
             bench-out/${{ matrix.lane }}/linux/*.jsonl
             bench-out/${{ matrix.lane }}/linux/*.md
             bench-out/${{ matrix.lane }}/linux/summary.json
