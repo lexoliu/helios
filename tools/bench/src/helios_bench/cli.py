@@ -49,6 +49,8 @@ def command_run(args: argparse.Namespace) -> int:
     plain_baseline = args.baseline_kernel_build == RELEASE_BUILD
     if baseline is not None or args.profile_use is not None or plain_baseline:
         sides |= {Side.HELIOS_BASELINE}
+    if args.baseline_rebuild_profile_use is not None:
+        sides |= {Side.HELIOS_BASELINE_REBUILD}
     options = RunOptions(
         lane=lane,
         out_dir=args.out_dir.resolve(),
@@ -72,6 +74,9 @@ def command_run(args: argparse.Namespace) -> int:
         baseline=baseline,
         profile_use=args.profile_use.resolve() if args.profile_use else None,
         baseline_profile_use=(args.baseline_profile_use.resolve() if args.baseline_profile_use else None),
+        baseline_rebuild_profile_use=(
+            args.baseline_rebuild_profile_use.resolve() if args.baseline_rebuild_profile_use else None
+        ),
         plain_baseline=plain_baseline,
     )
     report = run_suite(options, manifest, dry_run=args.dry_run)
@@ -273,6 +278,18 @@ def build_parser() -> argparse.ArgumentParser:
             "each commit's kernel to a profile collected from that commit "
             "(docs/pgo.md, #384); refused with --baseline-kernel-build release, the "
             "plain control that reads no profile"
+        ),
+    )
+    run.add_argument(
+        "--baseline-rebuild-profile-use",
+        type=Path,
+        default=None,
+        help=(
+            "build the baseline commit of a --baseline-profile-use pairing a second time, "
+            "against this second, independently collected .profdata, and time it as a third "
+            "column: how far the two builds of one commit move apart is the build-to-build "
+            "drift every paired row is judged against (#479). Required with "
+            "--baseline-profile-use"
         ),
     )
     run.add_argument(
