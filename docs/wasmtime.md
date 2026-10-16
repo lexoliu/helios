@@ -8,7 +8,7 @@ at `../wasmtime/crates/wasmtime`.
 The local checkout must be at (branch `helios/stack-limit-percpu`):
 
 ```text
-3f143bac2df9b6fa5c946a155d97d5f00ded7034
+1ed7678a8ee4f57cbe4a4e89ade7f7fda6092055
 ```
 
 That revision is `helios/parking-wait-cancel` at
@@ -33,18 +33,26 @@ executing processor's own word (#465):
   makes every resumable check read the processor's word instead of
   `VMStoreContext::stack_limit`. It is a tunable, so a cwasm compiled for
   one location is refused by an engine set to the other. A `no_std` build
-  declares `wasmtime_processor_stack_limit() -> *mut usize`, which returns
-  the executing processor's word. The runtime publishes the store's limit
+  with the `custom-processor-stack-limit` feature declares
+  `wasmtime_processor_stack_limit() -> *mut usize`, which returns the
+  executing processor's word; a build without it neither links the hook
+  nor runs per-processor code, though it still compiles it. The runtime publishes the store's limit
   there when its wasm enters or resumes on a processor, and when it leaves
   the innermost activation left on the thread publishes its own again. An
   interrupt request stores the pending flag and raises the sentinel in the
   word the store was last published to: no lock, no allocation, no IPI.
+- A riscv64 `preserve_all` frame saves the vector registers only when the
+  ISA has V. The builtin trampolines are `preserve_all`, and on a hart
+  without V (QEMU's `rv64imafdch`) their `vsetivli`/`vse8.v` saves were an
+  illegal instruction on the first interrupt.
 
 Helios needs it because the store-context check costs 7-8 instructions
 and a register chain per loop iteration (12-31% on compute against no
 interruption). Every bare-metal backend keeps the word at
 `helios_hal::cpu::GUEST_STACK_LIMIT_OFFSET` in its processor anchor
-block and exports `wasmtime_processor_stack_limit`; `hosted` keeps the
+block and exports `wasmtime_processor_stack_limit`, which the kernel's
+`wasmtime-bare-metal` feature links through `custom-processor-stack-limit`;
+`hosted` keeps the
 store-context location.
 
 The revision it replaces is `helios/parking-wait-cancel` at
