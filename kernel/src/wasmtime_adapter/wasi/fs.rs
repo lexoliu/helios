@@ -68,17 +68,31 @@ pub(crate) enum FileContents {
     Written(Bytes),
 }
 
+// Every instance seeds one node per bootfs entry, so carrying provenance
+// must not make a node larger than the plain `Bytes` it replaced.
+const _: () = assert!(
+    core::mem::size_of::<FileContents>() == core::mem::size_of::<Bytes>(),
+    "FileContents must stay the size of Bytes"
+);
+
 impl FileContents {
-    pub(crate) const fn bytes(&self) -> &Bytes {
+    pub(crate) fn as_slice(&self) -> &[u8] {
         match self {
-            Self::Bootfs(bytes) => bytes.bytes(),
+            Self::Bootfs(bytes) => bytes.as_slice(),
             Self::Written(bytes) => bytes,
+        }
+    }
+
+    fn slice(&self, range: core::ops::Range<usize>) -> Bytes {
+        match self {
+            Self::Bootfs(bytes) => Bytes::from_static(&bytes.as_slice()[range]),
+            Self::Written(bytes) => bytes.slice(range),
         }
     }
 
     fn into_bytes(self) -> Bytes {
         match self {
-            Self::Bootfs(bytes) => bytes.into_bytes(),
+            Self::Bootfs(bytes) => bytes.to_bytes(),
             Self::Written(bytes) => bytes,
         }
     }
@@ -978,7 +992,7 @@ where
     pub(super) fn node_size(node: &FsNode) -> u64 {
         match node.kind {
             FsNodeKind::Directory => 0,
-            FsNodeKind::File | FsNodeKind::Symlink => node.contents.bytes().len() as u64,
+            FsNodeKind::File | FsNodeKind::Symlink => node.contents.as_slice().len() as u64,
         }
     }
 
@@ -1027,7 +1041,7 @@ where
         if node.kind != FsNodeKind::Symlink || !follow_symlink {
             return Ok(absolute.to_owned());
         }
-        let payload = core::str::from_utf8(node.contents.bytes())
+        let payload = core::str::from_utf8(node.contents.as_slice())
             .map_err(|_| fs_types::ErrorCode::IllegalByteSequence)?;
         let target = Self::resolve_symlink_payload(absolute, payload)?;
         self.resolve_open_path(&target, follow_symlink, depth + 1)
@@ -1197,15 +1211,15 @@ where
         let offset: usize = offset
             .try_into()
             .map_err(|_| fs_types::ErrorCode::Overflow)?;
-        let contents = node.contents.bytes();
-        if offset >= contents.len() {
+        let len = node.contents.as_slice().len();
+        if offset >= len {
             return Ok(Bytes::new());
         }
         let end = offset
             .checked_add(max_bytes)
-            .map(|value| value.min(contents.len()))
+            .map(|value| value.min(len))
             .ok_or(fs_types::ErrorCode::Overflow)?;
-        Ok(contents.slice(offset..end))
+        Ok(node.contents.slice(offset..end))
     }
 
     /// The contents of the file at `path` with their provenance, which
@@ -1356,7 +1370,7 @@ where
         let linked_count = node.link_count;
         let offset = match offset {
             FsWriteOffset::At(offset) => offset,
-            FsWriteOffset::Append => node.contents.bytes().len(),
+            FsWriteOffset::Append => node.contents.as_slice().len(),
         };
         let end = offset
             .checked_add(byte_len)
@@ -1866,7 +1880,7 @@ where
         if node.kind != FsNodeKind::Symlink {
             return Err(fs_types::ErrorCode::Invalid);
         }
-        let payload = core::str::from_utf8(node.contents.bytes())
+        let payload = core::str::from_utf8(node.contents.as_slice())
             .map_err(|_| fs_types::ErrorCode::IllegalByteSequence)?;
         Ok(payload.to_owned())
     }

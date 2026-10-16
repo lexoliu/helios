@@ -49,7 +49,7 @@ pub fn is_cwasm(bytes: &[u8]) -> bool {
 pub fn trust_bootfs_artifact(
     bytes: &crate::BootfsBytes,
 ) -> Result<TrustedCwasm<'_>, ArtifactTrustError> {
-    let parsed = parse_signed_artifact(bytes.bytes())?;
+    let parsed = parse_signed_artifact(bytes.as_slice())?;
     Ok(TrustedCwasm {
         payload: parsed.payload(),
     })

@@ -353,10 +353,10 @@ impl ProgramSource {
     /// provenance its node carries.
     pub(crate) fn from_file(contents: FileContents) -> Self {
         match contents {
-            FileContents::Bootfs(bytes) if cwasm::is_cwasm(bytes.bytes()) => {
+            FileContents::Bootfs(bytes) if cwasm::is_cwasm(bytes.as_slice()) => {
                 Self::BootfsArtifact(bytes)
             }
-            FileContents::Bootfs(bytes) => Self::RawWasm(bytes.into_bytes()),
+            FileContents::Bootfs(bytes) => Self::RawWasm(bytes.to_bytes()),
             FileContents::Written(bytes) => Self::from_untrusted(bytes),
         }
     }
@@ -376,7 +376,7 @@ impl ProgramSource {
     pub(crate) fn payload_len(&self) -> usize {
         match self {
             Self::RawWasm(bytes) | Self::SignedArtifact(bytes) => bytes.len(),
-            Self::BootfsArtifact(bytes) => bytes.bytes().len(),
+            Self::BootfsArtifact(bytes) => bytes.as_slice().len(),
         }
     }
 }
@@ -2091,7 +2091,6 @@ where
     ) -> Result<BootfsBytes, ProgramExecError> {
         self.inner
             .compiler_artifact
-            .clone()
             .or_else(|| read_bootfs_artifact(&exec_context.runtime_state, COMPILER_PLUGIN_PATH))
             .ok_or(ProgramExecError {
                 kind: ProgramExecErrorKind::InvalidPath,

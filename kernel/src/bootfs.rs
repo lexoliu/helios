@@ -20,23 +20,27 @@ use helios_hal::resource::KernelResource;
 /// mutates the bytes. Trust that rests on where a program came from (an
 /// unverified bootfs artifact) is granted to this type, never to a
 /// `Bytes` read from wherever a path happened to resolve.
-#[derive(Clone, Debug)]
-pub struct BootfsBytes(Bytes);
+///
+/// It is the bare slice rather than a `Bytes`, so a filesystem node that
+/// holds either this or written `Bytes` is no larger than one holding
+/// `Bytes` alone: every instance seeds one node per bootfs entry.
+#[derive(Clone, Copy, Debug)]
+pub struct BootfsBytes(&'static [u8]);
 
 impl BootfsBytes {
     /// Wraps a view into the boot payload. Only the payload views
     /// ([`EmbeddedBootFile`], [`crate::EmbeddedComponent`]) call this.
     pub(crate) const fn from_image(bytes: &'static [u8]) -> Self {
-        Self(Bytes::from_static(bytes))
+        Self(bytes)
     }
 
-    pub const fn bytes(&self) -> &Bytes {
-        &self.0
-    }
-
-    /// Gives up the provenance and returns the plain bytes.
-    pub fn into_bytes(self) -> Bytes {
+    pub const fn as_slice(&self) -> &'static [u8] {
         self.0
+    }
+
+    /// The bytes as a zero-copy `Bytes` over the image.
+    pub const fn to_bytes(&self) -> Bytes {
+        Bytes::from_static(self.0)
     }
 }
 

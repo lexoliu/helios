@@ -1091,7 +1091,7 @@ mod tests {
         };
         // The signature would not verify, so accepting it proves the
         // bootfs path pays no verification.
-        assert!(cwasm::verify_signed_artifact(UntrustedCwasm::new(bytes.bytes())).is_err());
+        assert!(cwasm::verify_signed_artifact(UntrustedCwasm::new(bytes.as_slice())).is_err());
         let trusted =
             cwasm::trust_bootfs_artifact(&bytes).expect("a bootfs artifact loads unverified");
         assert_eq!(trusted.payload(), b"payload");
@@ -1110,8 +1110,8 @@ mod tests {
         let copied = filesystem
             .read_program_file("/bin/prog")
             .expect("bootfs program must be readable")
-            .bytes()
-            .clone();
+            .as_slice()
+            .to_vec();
         let descriptor = filesystem
             .open_at(
                 &root,
@@ -1233,7 +1233,7 @@ mod tests {
         let length = resized
             .read_program_file("/bin/prog")
             .expect("bootfs program must be readable")
-            .bytes()
+            .as_slice()
             .len() as u64;
         resized
             .set_size(&descriptor, length, 2)
