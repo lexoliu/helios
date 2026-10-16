@@ -341,7 +341,7 @@ echo "coreutils-wasi installed at: $coreutils_root/coreutils-wasi.wasm"
 ls -lh "$coreutils_root/coreutils-wasi.wasm"
 
 echo "Building Helios WASIX conformance artifacts..."
-for test_name in thread-futex continuation atomic-wait-timeout atomic-wait-kill orphan-threads thread-proc-exit simd-lanes; do
+for test_name in thread-futex continuation atomic-wait-timeout atomic-wait-kill orphan-threads thread-proc-exit thread-exec simd-lanes; do
   test_root="$artifacts_root/wasix/$test_name"
   mkdir -p "$test_root"
   wasm-tools parse \
@@ -354,7 +354,7 @@ for test_name in thread-futex continuation atomic-wait-timeout atomic-wait-kill 
 done
 
 echo "WASIX conformance artifacts installed at: $artifacts_root/wasix"
-ls -lh "$artifacts_root"/wasix/{thread-futex,continuation,atomic-wait-timeout,atomic-wait-kill,orphan-threads,thread-proc-exit,simd-lanes}/*.wasm
+ls -lh "$artifacts_root"/wasix/{thread-futex,continuation,atomic-wait-timeout,atomic-wait-kill,orphan-threads,thread-proc-exit,thread-exec,simd-lanes}/*.wasm
 
 build_env=(
   CARGO_PROFILE_RELEASE_OPT_LEVEL=3

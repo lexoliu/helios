@@ -51,7 +51,7 @@ where
     pub(super) children: Vec<WasixChildProcess>,
     pub(super) thread_id: u32,
     /// The threads of this store's process, shared by every store of it.
-    pub(super) threads: WasixProcessThreads,
+    pub(super) threads: WasixImageThreads<CpuImpl, Net, HostFs>,
     pub(super) requested_exit: Option<u32>,
     pub(super) exec_replacement: Option<WasixExecReplacement<CpuImpl, Net, HostFs>>,
 }
@@ -85,7 +85,7 @@ where
         signal_dispositions: Vec<WasixSignalDisposition>,
         current_core_module: Option<Arc<WasmtimeCompiledCoreModule>>,
         wasix_abi: bool,
-        threads: WasixProcessThreads,
+        threads: WasixImageThreads<CpuImpl, Net, HostFs>,
     ) -> Self {
         let filesystem = filesystem.map_or_else(
             || DebugFileSystem::new(runtime_state.clone()),

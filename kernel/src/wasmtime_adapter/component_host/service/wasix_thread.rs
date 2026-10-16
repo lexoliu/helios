@@ -2,15 +2,16 @@ use super::*;
 
 /// The threads of one WASIX process: its main thread's mailbox, every
 /// thread any store of the process spawned and nobody has joined, the
-/// next thread id, and the exit status a spawned thread chose for the
-/// whole process.
+/// next thread id, and the end a spawned thread chose for the whole
+/// process.
 ///
 /// The process owns its threads, not the store that spawned each one,
 /// so any thread joins or signals any other and the process's end
 /// ([`Self::end`]) reaches all of them, those whose spawner has itself
-/// returned included. A spawned thread that exits or takes a fatal
-/// signal ends the process the same way main does
-/// ([`Self::end_from_thread`]).
+/// returned included. A spawned thread that exits, execs or takes a
+/// fatal signal ends the process the same way main does
+/// ([`Self::end_from_thread`]): `Image` is what an exec hands the
+/// process's main thread to run next.
 ///
 /// # Concurrency
 ///
@@ -21,25 +22,44 @@ use super::*;
 /// interrupt handler touches the table. A thread's end is published
 /// lock-free through its own [`WasixThreadExit`], which the joiner and
 /// the process's end wait on outside the lock.
-#[derive(Clone)]
-pub(super) struct WasixProcessThreads {
-    table: Arc<Mutex<WasixThreadTable>>,
+pub(super) struct WasixProcessThreads<Image> {
+    table: Arc<Mutex<WasixThreadTable<Image>>>,
     /// The main thread's own mailbox, through which a spawned thread
     /// that ends the process ends main's image.
     main: WasixSignalState,
 }
 
-struct WasixThreadTable {
+impl<Image> Clone for WasixProcessThreads<Image> {
+    fn clone(&self) -> Self {
+        Self {
+            table: self.table.clone(),
+            main: self.main.clone(),
+        }
+    }
+}
+
+struct WasixThreadTable<Image> {
     next_tid: u32,
     threads: Vec<WasixThread>,
     /// Set by [`WasixProcessThreads::end`] and by
     /// [`WasixProcessThreads::end_from_thread`]; no thread is admitted
     /// after, and no second end is recorded.
     ended: bool,
-    /// The exit status a spawned thread chose for the process,
-    /// recorded before main's image is ended and taken by main once its
-    /// call has stopped.
-    process_exit: Option<u32>,
+    /// The end a spawned thread chose for the process, recorded before
+    /// main's image is ended and taken by main once its call has
+    /// stopped.
+    process_end: Option<WasixProcessEnd<Image>>,
+}
+
+/// How a spawned thread ended its whole process.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum WasixProcessEnd<Image> {
+    /// `proc_exit` or a fatal signal's default action, with the
+    /// process's exit status.
+    Exit(u32),
+    /// `proc_exec*`: the image the process runs next, in place of the
+    /// one every thread of it was running.
+    Exec(Image),
 }
 
 struct WasixThread {
@@ -50,7 +70,7 @@ struct WasixThread {
     exit: Arc<WasixThreadExit>,
 }
 
-impl WasixProcessThreads {
+impl<Image> WasixProcessThreads<Image> {
     /// The table of a new process, whose main thread is thread 0.
     pub(super) fn new() -> Self {
         Self {
@@ -58,7 +78,7 @@ impl WasixProcessThreads {
                 next_tid: 1,
                 threads: Vec::new(),
                 ended: false,
-                process_exit: None,
+                process_end: None,
             })),
             main: WasixSignalState::new(),
         }
@@ -69,13 +89,15 @@ impl WasixProcessThreads {
         self.main.clone()
     }
 
-    /// Ends the whole process with status `code` from spawned thread
-    /// `tid`, whose own call has ended, as POSIX `exit` and a fatal
+    /// Ends the whole process from spawned thread `tid`, whose own call
+    /// has ended with `end`, as POSIX `exit`, `execve` and a fatal
     /// signal do from any thread.
     ///
-    /// The status is recorded first, then main's image is ended through
+    /// The end is recorded first, then main's image is ended through
     /// its mailbox, which stops main's call and makes main's completion
-    /// take the status ([`Self::take_process_exit`]); every other thread is
+    /// take the end ([`Self::take_process_end`]): the exit status it
+    /// reports, or the image it runs next once every thread has ended;
+    /// every other thread is
     /// ended in the same pass, so none runs on after the process's end
     /// and they stop concurrently. Main's completion path then waits for
     /// all of them through [`Self::end`], as for any other end of the
@@ -84,14 +106,14 @@ impl WasixProcessThreads {
     /// The first end wins. One that comes after the process has already
     /// ended, by main's own end or another thread's, is dropped: the
     /// thread raising it is being ended with the rest.
-    pub(super) fn end_from_thread(&self, tid: u32, code: u32) {
+    pub(super) fn end_from_thread(&self, tid: u32, end: WasixProcessEnd<Image>) {
         let others: Vec<WasixSignalState> = {
             let mut table = self.table.lock();
             if table.ended {
                 return;
             }
             table.ended = true;
-            table.process_exit = Some(code);
+            table.process_end = Some(end);
             table
                 .threads
                 .iter()
@@ -107,10 +129,10 @@ impl WasixProcessThreads {
         }
     }
 
-    /// The exit status a spawned thread recorded for the process, taken
-    /// by main once its call has stopped on its mailbox's end.
-    pub(super) fn take_process_exit(&self) -> Option<u32> {
-        self.table.lock().process_exit.take()
+    /// The end a spawned thread recorded for the process, taken by main
+    /// once its call has stopped on its mailbox's end.
+    pub(super) fn take_process_end(&self) -> Option<WasixProcessEnd<Image>> {
+        self.table.lock().process_end.take()
     }
 
     /// Admits a thread whose mailbox is `mailbox` and whose end `exit`
@@ -462,10 +484,17 @@ where
         }
     };
     let requested_exit = store.data_mut().take_requested_exit();
-    match wasix_thread_call_end(result, requested_exit) {
+    let exec_replacement = store.data_mut().take_exec_replacement().map(Box::new);
+    match wasix_thread_call_end(result, requested_exit, exec_replacement) {
         Ok(WasixThreadCallEnd::Thread(code)) => code,
-        Ok(WasixThreadCallEnd::Process(code)) => {
-            store.data().threads.end_from_thread(tid, code);
+        Ok(WasixThreadCallEnd::Process(end)) => {
+            // Nobody joins a thread of an ended process; the status is
+            // only ever seen by the process's own end.
+            let code = match &end {
+                WasixProcessEnd::Exit(code) => *code,
+                WasixProcessEnd::Exec(_) => WasixThreadEnded::EXIT_CODE,
+            };
+            store.data().threads.end_from_thread(tid, end);
             code
         }
         Err(error) => {
@@ -477,28 +506,30 @@ where
 
 /// How a spawned thread's call ends: the thread alone, or its process.
 #[derive(Debug, PartialEq, Eq)]
-pub(super) enum WasixThreadCallEnd {
+pub(super) enum WasixThreadCallEnd<Image> {
     /// The thread ends alone with this status.
     Thread(u32),
-    /// The thread ends its whole process with this status
+    /// The thread ends its whole process
     /// ([`WasixProcessThreads::end_from_thread`]).
-    Process(u32),
+    Process(WasixProcessEnd<Image>),
 }
 
 /// What a spawned thread's call that ended in `result` ends, given the
-/// status the guest `requested`.
+/// status the guest `requested` and the image an exec of its asked for.
 ///
 /// Returning from the start function, `thread_exit`, a signal raised on
 /// this thread alone (`thread_signal`) and the end of the thread's
-/// process end the thread alone. `proc_exit`, `proc_raise` and
-/// a fatal signal's default action end the whole process, as POSIX
-/// `exit` and a signal do from any thread, with the status main would
-/// take from them (`run_core_module_image`): the signal's, then the
-/// requested one. Anything else is the thread's failure, handed back.
-pub(super) fn wasix_thread_call_end(
+/// process end the thread alone. An exec, `proc_exit`,
+/// `proc_raise` and a fatal signal's default action end the whole
+/// process, as POSIX `execve`, `exit` and a signal do from any thread,
+/// decided exactly as main decides them (`run_core_module_image`): the
+/// exec first, then the signal's status, then the requested one.
+/// Anything else is the thread's failure, handed back.
+pub(super) fn wasix_thread_call_end<Image>(
     result: wasmtime::Result<()>,
     requested_exit: Option<u32>,
-) -> wasmtime::Result<WasixThreadCallEnd> {
+    exec_replacement: Option<Image>,
+) -> wasmtime::Result<WasixThreadCallEnd<Image>> {
     let error = match result {
         Ok(()) => return Ok(WasixThreadCallEnd::Thread(requested_exit.unwrap_or(0))),
         Err(error) => error,
@@ -513,8 +544,11 @@ pub(super) fn wasix_thread_call_end(
     if let Some(exit) = error.downcast_ref::<WasixThreadSignalExit>() {
         return Ok(WasixThreadCallEnd::Thread(exit.exit_code()));
     }
+    if let Some(image) = exec_replacement {
+        return Ok(WasixThreadCallEnd::Process(WasixProcessEnd::Exec(image)));
+    }
     match preview1_exit_status(&error, requested_exit) {
-        Some(code) => Ok(WasixThreadCallEnd::Process(code)),
+        Some(code) => Ok(WasixThreadCallEnd::Process(WasixProcessEnd::Exit(code))),
         None => Err(error),
     }
 }
@@ -1007,7 +1041,7 @@ mod tests {
         let registry = InstanceRegistry::new();
         let instance = registry.register("threaded", 0);
         let process = WasixSignalState::new();
-        let threads = WasixProcessThreads::new();
+        let threads = WasixProcessThreads::<()>::new();
 
         let parked_mailbox = WasixSignalState::new();
         let parked_exit = Arc::new(WasixThreadExit::new());
@@ -1137,7 +1171,7 @@ mod tests {
     /// process's end returns at once, and nothing it ends is woken.
     #[test]
     fn a_process_end_does_not_wait_for_a_thread_that_already_ended() {
-        let threads = WasixProcessThreads::new();
+        let threads = WasixProcessThreads::<()>::new();
         let mailbox = WasixSignalState::new();
         let exit = Arc::new(WasixThreadExit::new());
         threads
@@ -1183,7 +1217,7 @@ mod tests {
         let registry = InstanceRegistry::new();
         let instance = registry.register("threaded", 0);
         let process = WasixSignalState::new();
-        let threads = WasixProcessThreads::new();
+        let threads = WasixProcessThreads::<()>::new();
 
         let exiting_mailbox = WasixSignalState::new();
         let exiting_exit = Arc::new(WasixThreadExit::new());
@@ -1223,7 +1257,7 @@ mod tests {
             Box::pin(main_turns.drive(parked.call_async(&mut main_store, &[], &mut [])));
         assert!(main_call.as_mut().poll(&mut main_cx).is_pending());
 
-        threads.end_from_thread(exiting_tid, 7);
+        threads.end_from_thread(exiting_tid, WasixProcessEnd::Exit(7));
         assert!(
             threads.main_mailbox().thread_ended(),
             "the exit ends main's image"
@@ -1244,7 +1278,7 @@ mod tests {
             Some(p1::errno::AGAIN),
             "an exiting process admits no thread"
         );
-        threads.end_from_thread(other_tid, 3);
+        threads.end_from_thread(other_tid, WasixProcessEnd::Exit(3));
 
         match main_call.as_mut().poll(&mut main_cx) {
             Poll::Ready(Err(error)) => assert!(
@@ -1260,11 +1294,11 @@ mod tests {
         drop(main_call);
         drop(main_store);
         assert_eq!(
-            threads.take_process_exit(),
-            Some(7),
+            threads.take_process_end(),
+            Some(WasixProcessEnd::Exit(7)),
             "main takes the first exit's status"
         );
-        assert_eq!(threads.take_process_exit(), None, "and takes it once");
+        assert_eq!(threads.take_process_end(), None, "and takes it once");
 
         let end_wakes = Arc::new(CountingWaker::default());
         let end_waker = Waker::from(end_wakes.clone());
@@ -1284,11 +1318,52 @@ mod tests {
         );
     }
 
+    /// A spawned thread's exec hands main the next image: main's image
+    /// and every other thread are ended exactly as for an exit, and main
+    /// takes the image, which it runs once the process's end has waited
+    /// for every thread.
+    #[test]
+    fn a_threads_exec_hands_main_the_image_and_ends_every_other_thread() {
+        let threads = WasixProcessThreads::<&'static str>::new();
+        let exec_mailbox = WasixSignalState::new();
+        let exec_exit = Arc::new(WasixThreadExit::new());
+        let exec_tid = threads
+            .admit(exec_mailbox.clone(), exec_exit.clone())
+            .expect("a live process admits a thread");
+        let other_mailbox = WasixSignalState::new();
+        let other_exit = Arc::new(WasixThreadExit::new());
+        threads
+            .admit(other_mailbox.clone(), other_exit.clone())
+            .expect("a live process admits a thread");
+
+        threads.end_from_thread(exec_tid, WasixProcessEnd::Exec("next"));
+        assert!(threads.main_mailbox().thread_ended(), "main's image ends");
+        assert!(other_mailbox.thread_ended(), "every other thread ends");
+        assert!(!exec_mailbox.thread_ended());
+        threads.end_from_thread(exec_tid, WasixProcessEnd::Exit(1));
+        assert_eq!(
+            threads.take_process_end(),
+            Some(WasixProcessEnd::Exec("next")),
+            "main takes the image the first end asked for"
+        );
+
+        let mut end = pin!(threads.end());
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(end.as_mut().poll(&mut cx).is_pending());
+        exec_exit.publish(WasixThreadEnded::EXIT_CODE);
+        assert!(
+            end.as_mut().poll(&mut cx).is_pending(),
+            "the image waits for every thread"
+        );
+        other_exit.publish(WasixThreadEnded::EXIT_CODE);
+        assert_eq!(end.as_mut().poll(&mut cx), Poll::Ready(()));
+    }
+
     /// Main's own end comes first: a thread's exit after it is dropped,
     /// and main's status stands.
     #[test]
     fn a_threads_exit_after_mains_end_is_dropped() {
-        let threads = WasixProcessThreads::new();
+        let threads = WasixProcessThreads::<()>::new();
         let mailbox = WasixSignalState::new();
         let exit = Arc::new(WasixThreadExit::new());
         let tid = threads
@@ -1298,12 +1373,12 @@ mod tests {
         let mut cx = Context::from_waker(Waker::noop());
         assert!(end.as_mut().poll(&mut cx).is_pending());
 
-        threads.end_from_thread(tid, 7);
+        threads.end_from_thread(tid, WasixProcessEnd::Exit(7));
         assert!(
             !threads.main_mailbox().thread_ended(),
             "main has already ended on its own"
         );
-        assert_eq!(threads.take_process_exit(), None);
+        assert_eq!(threads.take_process_end(), None);
         exit.publish(7);
         assert_eq!(end.as_mut().poll(&mut cx), Poll::Ready(()));
     }
@@ -1311,12 +1386,12 @@ mod tests {
     /// A spawned thread's call ends the thread alone when it returns,
     /// calls `thread_exit`, takes a signal raised on it alone or is ended
     /// with its process, and ends the
-    /// whole process on `proc_exit`, `proc_raise` and a fatal signal,
-    /// with the status main would take from the same end.
+    /// whole process on an exec, `proc_exit`, `proc_raise` and a fatal
+    /// signal, as main would take the same end.
     #[test]
     fn a_threads_call_end_is_the_threads_or_the_processs() {
         let end = |result: wasmtime::Result<()>, requested| {
-            wasix_thread_call_end(result, requested).expect("the end is a status")
+            wasix_thread_call_end::<()>(result, requested, None).expect("the end is a status")
         };
         assert_eq!(end(Ok(()), None), WasixThreadCallEnd::Thread(0));
         assert_eq!(
@@ -1337,7 +1412,7 @@ mod tests {
         );
         assert_eq!(
             end(Err(wasmtime::Error::new(Preview1Exit)), Some(7)),
-            WasixThreadCallEnd::Process(7),
+            WasixThreadCallEnd::Process(WasixProcessEnd::Exit(7)),
             "proc_exit ends the process"
         );
         assert_eq!(
@@ -1345,12 +1420,18 @@ mod tests {
                 Err(wasmtime::Error::new(Preview1SignalExit { signal: 15 })),
                 Some(7)
             ),
-            WasixThreadCallEnd::Process(128 + 15),
+            WasixThreadCallEnd::Process(WasixProcessEnd::Exit(128 + 15)),
             "a fatal signal ends the process with its status"
         );
         assert!(
-            wasix_thread_call_end(Err(wasmtime::Error::msg("trap")), None).is_err(),
+            wasix_thread_call_end::<()>(Err(wasmtime::Error::msg("trap")), None, None).is_err(),
             "a failure is the thread's own"
+        );
+        assert_eq!(
+            wasix_thread_call_end(Err(wasmtime::Error::new(Preview1Exit)), None, Some("next"))
+                .expect("an exec is an end"),
+            WasixThreadCallEnd::Process(WasixProcessEnd::Exec("next")),
+            "an exec replaces the process"
         );
     }
 
@@ -1358,7 +1439,7 @@ mod tests {
     /// its status; a thread's id leaves the table once it is withdrawn.
     #[test]
     fn a_join_returns_the_status_the_thread_published() {
-        let threads = WasixProcessThreads::new();
+        let threads = WasixProcessThreads::<()>::new();
         let mailbox = WasixSignalState::new();
         let exit = Arc::new(WasixThreadExit::new());
         let tid = threads
