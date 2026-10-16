@@ -382,6 +382,7 @@ where
                 filesystem,
                 descriptors,
                 signal_state,
+                threads.main_mailbox(),
                 signal_dispositions,
                 Some(compiled.clone()),
                 wasix_abi,
@@ -620,6 +621,7 @@ where
                 filesystem,
                 Some(restore.descriptors),
                 signal_state,
+                threads.main_mailbox(),
                 restore.signal_dispositions,
                 Some(compiled.clone()),
                 wasix_abi,
@@ -796,10 +798,20 @@ where
         let result = interrupts
             .drive(turns.drive(start.call_async(&mut *store, ())))
             .await;
-        if handle_wasix_asyncify_completion(store, interrupts, instance).await? {
-            continue;
+        // A spawned thread ended the process: no unwind is completed.
+        if result.as_ref().is_err_and(WasixThreadEnded::is) {
+            break result;
         }
-        break result;
+        match handle_wasix_asyncify_completion(store, interrupts, instance).await {
+            Ok(true) => continue,
+            Ok(false) => break result,
+            // A spawned thread ended the process while main was between
+            // an unwind and its rewind; the rewind's call met the end.
+            Err(_) if store.data().thread_signals.thread_ended() => {
+                break Err(wasmtime::Error::new(WasixThreadEnded));
+            }
+            Err(error) => return Err(error),
+        }
     };
     run.timeline.record(run.cpu, LaunchPhase::GuestEnd);
     record_named_program_kernel_profile(
@@ -820,6 +832,18 @@ where
             exit_code: 0,
             filesystem: Some(store.data().filesystem.snapshot()),
         })),
+        // Main's call stopped because a spawned thread ended the process;
+        // the process exits with the status that thread chose.
+        Err(error) if WasixThreadEnded::is(&error) => {
+            let code = store.data().threads.take_process_exit().expect(
+                "main's image is ended only by a spawned thread that recorded the process's exit first",
+            );
+            CoreModuleRunCompletion::Exit(Ok(ChildExit {
+                instance_id: run.instance_id,
+                exit_code: code,
+                filesystem: Some(store.data().filesystem.snapshot()),
+            }))
+        }
         Err(error) => {
             if let Some(replacement) = store.data_mut().take_exec_replacement() {
                 CoreModuleRunCompletion::Exec(Box::new(replacement))
