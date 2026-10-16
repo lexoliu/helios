@@ -764,10 +764,10 @@ jobs:
             --boot-program wasix-atomic-wait-kill --no-compiler-plugin \
             shell --trace-log "$runtime/guest-tracing.log" \
             -c '/bin/wasix-atomic-wait-kill' \
-            2>&1 > atomic-wait-kill-smoke.out | tee "$runtime/inspector.log"
-          cat atomic-wait-kill-smoke.out
-          grep -Fqx atomic-wait-kill:ok atomic-wait-kill-smoke.out
-          ! grep -Fq 'Kernel panic' atomic-wait-kill-smoke.out
+            2>&1 > "$runtime/guest.log" | tee "$runtime/inspector.log"
+          cat "$runtime/guest.log"
+          grep -Fqx atomic-wait-kill:ok "$runtime/guest.log"
+          ! grep -Fq 'Kernel panic' "$runtime/guest.log"
       - name: Fetch over virtio-net with curl
         shell: bash
         working-directory: helios
