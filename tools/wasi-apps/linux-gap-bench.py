@@ -6,6 +6,7 @@ import http.server
 import json
 import os
 import platform
+import re
 import shlex
 import shutil
 import signal
@@ -42,6 +43,20 @@ LINUX_GUEST_ARCHES = {"aarch64": "aarch64", "x86-64": "x86_64"}
 # The Helios backends whose timer samples instruction addresses. Any other
 # guest refuses an instruction profile, so it is not asked for one.
 INSTRUCTION_SAMPLING_ARCHES = {"x86-64"}
+# The `workload-bench` option an image's own inspector samples under. An
+# inspector whose help does not list it was built from a checkout that
+# predates the sampler, and its guest cannot be sampled at all.
+INSTRUCTION_PROFILE_OPTION = "--instruction-profile-output"
+# The line every inspector that takes the option prints on stderr once it
+# has written a boot's profile (inspector/src/vm/instruction_profile.rs),
+# in this form since the sampler landed. Its period is the guest's own
+# statement of how often each processor was interrupted to take a sample.
+INSTRUCTION_PROFILE_REPORT = re.compile(
+    r"^instruction_profile_output=(?P<path>.+) samples=(?P<samples>\d+) "
+    r"dropped=(?P<dropped>\d+) period_ns=(?P<period>\d+)$"
+)
+# Beside each image's JSONL: how its boots were sampled, for the report.
+INSTRUCTION_SAMPLING_RECORD = "instruction-sampling.json"
 from tcp_echo_server import TcpEchoServer, start_tcp_echo_server
 from tcp_throughput_server import DEFAULT_PAYLOAD_BYTES, start_tcp_throughput_server
 
@@ -158,18 +173,48 @@ def side_boots(units: int, images: int, control_workload: dict | None) -> int:
     return units * images + controls
 
 
+# How long a relayed stderr may stay open once its command's process
+# group has been torn down.
+STDERR_RELAY_DRAIN_SECONDS = 30
+# How long an inspector may take to print its own help.
+INSPECTOR_HELP_TIMEOUT_SECONDS = 60
+
+
+def relay_stderr(stream, lines: list[str]) -> None:
+    for line in stream:
+        sys.stderr.write(line)
+        sys.stderr.flush()
+        lines.append(line.rstrip("\n"))
+
+
 def run_isolated(
     command: list[str],
     env: dict[str, str] | None = None,
     timeout_seconds: int = DEFAULT_HELIOS_TIMEOUT_SECONDS,
     cwd: Path | None = None,
+    stderr_lines: list[str] | None = None,
 ) -> None:
+    """Runs `command` in a process group of its own, torn down on return.
+
+    With `stderr_lines`, the command's stderr is still relayed to this
+    process's as it arrives, and every line of it is also kept there for
+    the caller to read what the command reported.
+    """
     process = subprocess.Popen(
         command,
         cwd=cwd or repo_root(),
         env=env,
         start_new_session=True,
+        stderr=subprocess.PIPE if stderr_lines is not None else None,
+        text=stderr_lines is not None,
+        errors="replace" if stderr_lines is not None else None,
     )
+    relay = None
+    if stderr_lines is not None:
+        relay = threading.Thread(
+            target=relay_stderr, args=(process.stderr, stderr_lines), daemon=True
+        )
+        relay.start()
     try:
         returncode = process.wait(timeout=timeout_seconds)
     except subprocess.TimeoutExpired as error:
@@ -179,6 +224,16 @@ def run_isolated(
     finally:
         terminate_process_group(process.pid)
         process.wait(timeout=timeout_seconds)
+        if relay is not None:
+            # The whole process group is gone, so its end of the pipe is
+            # closed and the relay is at end of file.
+            relay.join(timeout=STDERR_RELAY_DRAIN_SECONDS)
+    if relay is not None and relay.is_alive():
+        raise HeliosRunFailed(
+            f"{shlex.join(command)} exited, and its stderr was still open "
+            f"{STDERR_RELAY_DRAIN_SECONDS}s after its process group was torn down: a "
+            "process outside the group holds it, so what the command reported is incomplete"
+        )
     if returncode != 0:
         raise HeliosRunFailed(f"{shlex.join(command)} exited with status {returncode}")
 
@@ -559,6 +614,30 @@ class IdenticalHeliosImages(RuntimeError):
     """
 
 
+class AsymmetricInstructionSampling(RuntimeError):
+    """A sampled run whose images would not be, or were not, sampled alike.
+
+    Sampling changes what is measured: every sampled boot runs each
+    processor's timer at the sampling rate instead of the scheduler tick,
+    and a kernel task drains the samples on an interval of its own. A
+    paired comparison attributes every shift between its columns to the
+    one thing that varies between them, so a column sampled differently
+    from the other — or not at all — puts the sampler inside that shift:
+    run 38886442613 reported +4.8-8.5% on compute that was the sampler
+    alone (#475). Not a `HeliosRunFailed`, because it is never one lost
+    boot to record and continue past: it is the run's own premise failing.
+    """
+
+
+@dataclass(frozen=True)
+class SampledBoot:
+    """What one sampled boot's inspector reported about its capture."""
+
+    period_nanos: int
+    samples: int
+    dropped: int
+
+
 def helios_units(workloads: list[dict], paired: bool) -> list[HeliosUnit]:
     if paired:
         return [
@@ -600,6 +679,96 @@ def instruction_profile_requested() -> bool:
     if value not in ("0", "1"):
         raise SystemExit(f"HELIOS_BENCH_INSTRUCTION_PROFILE must be 0 or 1, got {value!r}")
     return value == "1"
+
+
+def samples_instructions(arch: str) -> bool:
+    """Whether this run samples every Helios boot at the instruction level.
+
+    Every boot, of every image: a paired run samples both columns or
+    neither (#475).
+    """
+    return instruction_profile_requested() and arch in INSTRUCTION_SAMPLING_ARCHES
+
+
+def require_instruction_sampling(image: HeliosImage, arch: str) -> None:
+    """Refuses an image whose own tooling cannot sample its guest.
+
+    An image is booted by the inspector its own checkout compiled (#356),
+    so whether its guest can be sampled is that inspector's to answer: one
+    built from a checkout that predates the sampler does not take the
+    option, and its guest has no sampler to start. Asked before the first
+    boot, so the refusal names the reason instead of the first boot dying
+    on an option it does not know.
+    """
+    inspector, _ = image_tools(image)
+    env = os.environ.copy()
+    env["HELIOS_WORKSPACE_ROOT"] = str(image.workspace_root)
+    argv = [str(inspector), "vm", "--arch", arch, "workload-bench", "--help"]
+    completed = subprocess.run(
+        argv,
+        cwd=repo_root(),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=INSPECTOR_HELP_TIMEOUT_SECONDS,
+    )
+    if completed.returncode != 0:
+        raise HeliosRunFailed(
+            f"{shlex.join(argv)} for image {image.name!r} exited with status "
+            f"{completed.returncode}: {completed.stderr.strip()}"
+        )
+    if INSTRUCTION_PROFILE_OPTION not in completed.stdout.split():
+        raise AsymmetricInstructionSampling(
+            f"instruction sampling was asked for, and the {image.name} image cannot be "
+            f"sampled: its own inspector {inspector}, built from {image.workspace_root}, "
+            f"does not take {INSTRUCTION_PROFILE_OPTION}, so that checkout predates the "
+            "sampler. Sampling the other image alone would time the sampler as part of "
+            "the change (#475): pair against a ref that carries the sampler, or run "
+            "without instruction sampling"
+        )
+
+
+def sampled_boot(image: HeliosImage, profile: Path, stderr_lines: list[str]) -> SampledBoot:
+    """What the inspector of a finished sampled boot said it captured.
+
+    A boot that finished without saying so was not shown to be sampled,
+    and a column with such a boot cannot stand beside one that was.
+    """
+    reports = [
+        match
+        for match in map(INSTRUCTION_PROFILE_REPORT.match, stderr_lines)
+        if match is not None and match.group("path") == str(profile)
+    ]
+    if len(reports) != 1:
+        raise AsymmetricInstructionSampling(
+            f"a {image.name} boot was asked to sample into {profile} and finished with "
+            f"{len(reports)} capture reports for it on its inspector's stderr instead of one, "
+            "so this column's boots are not known to be sampled the way the other's are"
+        )
+    report = reports[0]
+    return SampledBoot(
+        period_nanos=int(report.group("period")),
+        samples=int(report.group("samples")),
+        dropped=int(report.group("dropped")),
+    )
+
+
+def write_sampling_record(image: HeliosImage, boots: list[SampledBoot]) -> None:
+    """How this image's boots were sampled, beside its JSONL, for the report.
+
+    Every boot of a run shares one period by the time this is written:
+    `run_helios` refuses the first boot that reports another.
+    """
+    record = {
+        "period_nanos": boots[0].period_nanos,
+        "boots": len(boots),
+        "samples": sum(boot.samples for boot in boots),
+        "dropped": sum(boot.dropped for boot in boots),
+    }
+    (image.out_dir / INSTRUCTION_SAMPLING_RECORD).write_text(
+        json.dumps(record, indent=2) + "\n", encoding="utf-8"
+    )
 
 
 def own_checkout(image: HeliosImage) -> bool:
@@ -781,6 +950,32 @@ def run_helios(
         # rather than served by the candidate's (#356).
         require_image_tools(image)
 
+    # Sampling is a property of the run, never of one image: every boot of
+    # every image is sampled, or none is (#475). An image whose tooling
+    # cannot sample is refused here, before any boot of either.
+    sampling = samples_instructions(arch)
+    if sampling:
+        for image in images:
+            require_instruction_sampling(image, arch)
+    sampled: dict[str, list[SampledBoot]] = {image.name: [] for image in images}
+
+    def record_sampled(image: HeliosImage, boot: SampledBoot | None) -> None:
+        # The period is what the guest says its sampler ran at. Two images
+        # whose kernels sample at different periods are not sampled alike
+        # even though both were asked to be, so the first boot that
+        # disagrees with any earlier one ends the run — the control boots
+        # of both images come first, so that is before the suite proper.
+        if boot is None:
+            return
+        for name, boots in sampled.items():
+            if boots and boots[0].period_nanos != boot.period_nanos:
+                raise AsymmetricInstructionSampling(
+                    f"the {name} image's boots were sampled every {boots[0].period_nanos} ns "
+                    f"and a {image.name} boot every {boot.period_nanos} ns: the two columns "
+                    "do not carry the same sampler, so their difference would include it"
+                )
+        sampled[image.name].append(boot)
+
     if paired:
         # Before the first boot, not after the run: two images that turn
         # out to be one build make every number below a measurement of
@@ -813,7 +1008,7 @@ def run_helios(
     def run_boot(image: HeliosImage, log: Path, classes: list[str], names: list[str], budget: int) -> None:
         scope = nullcontext(shared_endpoints) if shared_endpoints is not None else host_services.serve()
         with scope as endpoints:
-            run_helios_once(
+            boot = run_helios_once(
                 image,
                 manifest,
                 log,
@@ -830,6 +1025,7 @@ def run_helios(
                 keep_going=keep_going,
                 paired=paired,
             )
+        record_sampled(image, boot)
 
     def run_control(moment: str) -> None:
         # The control workload measures the machine, not Helios: the same
@@ -908,6 +1104,9 @@ def run_helios(
         run_control("after")
     except HeliosRunFailed as error:
         raise SystemExit(f"the control workload could not be measured: {error}") from error
+    if sampling:
+        for image in images:
+            write_sampling_record(image, sampled[image.name])
     if lost:
         print(
             "helios boots recorded as failed: " + ", ".join(lost),
@@ -1009,7 +1208,8 @@ def run_helios_once(
     timeout_seconds: int,
     keep_going: bool,
     paired: bool,
-) -> None:
+) -> SampledBoot | None:
+    """Boots `image` once for `names`; what its sampler captured, if it ran."""
     env = os.environ.copy()
     env["HELIOS_WORKLOAD_BENCH_ARCH"] = arch
     if accel:
@@ -1025,15 +1225,18 @@ def run_helios_once(
     env["HELIOS_WORKLOAD_BENCH_LOG"] = str(log)
     env["HELIOS_WORKLOAD_BENCH_KERNEL_PROFILE_OUTPUT"] = str(log.with_suffix(".kernel.folded"))
     env["HELIOS_WORKLOAD_BENCH_PERF_METRICS_OUTPUT"] = str(log.with_suffix(".perf.json"))
-    if instruction_profile_requested() and arch in INSTRUCTION_SAMPLING_ARCHES and own_checkout(image):
+    sampling = samples_instructions(arch)
+    profile = log.with_suffix(".pc.folded")
+    if sampling:
         # Beside the scoped profile, the functions the processors were
         # executing, sampled at the instruction level. Opt-in only:
         # sampling raises every guest processor's timer rate tenfold, so a
-        # sampled run is a diagnosis, never a measurement, and in a paired
-        # run it would bias one side. Asked of this checkout's image only:
-        # a baseline image is booted by its own ref's inspector, which may
-        # predate the option (#356's skew).
-        env["HELIOS_WORKLOAD_BENCH_INSTRUCTION_PROFILE_OUTPUT"] = str(log.with_suffix(".pc.folded"))
+        # sampled run is a diagnosis whose timings carry the sampler. Asked
+        # of every image alike, the baseline's included, so that the two
+        # columns of a pairing carry the same sampler and the comparison
+        # between them stays like with like (#475); `run_helios` has
+        # already refused an image whose own tooling cannot sample.
+        env["HELIOS_WORKLOAD_BENCH_INSTRUCTION_PROFILE_OUTPUT"] = str(profile)
     runtime_dir = env.get("HELIOS_WORKLOAD_BENCH_RUNTIME_DIR")
     if runtime_dir:
         # One runtime directory per boot. Each unit is its own VM, and a
@@ -1061,12 +1264,17 @@ def run_helios_once(
     env["HELIOS_WORKLOAD_BENCH_NO_BUILD"] = "1"
     env.pop("HELIOS_WORKLOAD_BENCH_BUILD_ONLY", None)
     env.update(harness_environment(image, paired))
+    stderr_lines: list[str] | None = [] if sampling else None
     run_isolated(
         [str(workload_bench_script())],
         env=env,
         timeout_seconds=timeout_seconds,
         cwd=repo_root(),
+        stderr_lines=stderr_lines,
     )
+    if stderr_lines is None:
+        return None
+    return sampled_boot(image, profile, stderr_lines)
 
 
 def run_linux(
@@ -2575,7 +2783,7 @@ def main() -> None:
 if __name__ == "__main__":
     try:
         main()
-    except (HeliosRunFailed, IdenticalHeliosImages) as error:
+    except (HeliosRunFailed, IdenticalHeliosImages, AsymmetricInstructionSampling) as error:
         # A run that gave up says so in one line; the traceback of a
         # subprocess exit code told the reader nothing.
         raise SystemExit(str(error)) from error

@@ -69,6 +69,11 @@ where
     pub(super) timeline: phases::Timeline,
 }
 
+/// The thread table of a core-module process, whose spawned threads can
+/// hand main the image an exec of theirs asked for.
+pub(super) type WasixImageThreads<CpuImpl, Net, HostFs> =
+    WasixProcessThreads<Box<WasixExecReplacement<CpuImpl, Net, HostFs>>>;
+
 pub(super) struct CoreModuleReplacementState<CpuImpl, Net, HostFs>
 where
     CpuImpl: Cpu + Clone,
@@ -833,17 +838,21 @@ where
             filesystem: Some(store.data().filesystem.snapshot()),
         })),
         // Main's call stopped because a spawned thread ended the process;
-        // the process ends the way that thread's call ended it: an exit
-        // status, or the failure a trap on main would have reported.
+        // the process ends the way that thread's call ended it: it exits
+        // with its status, runs the image its exec asked for, or fails
+        // with the failure a trap on main would have reported.
         Err(error) if WasixThreadEnded::is(&error) => {
-            let end = store.data().threads.take_process_end().expect(
+            match store.data().threads.take_process_end().expect(
                 "main's image is ended only by a spawned thread that recorded the process's end first",
-            );
-            CoreModuleRunCompletion::Exit(end.map(|exit_code| ChildExit {
-                instance_id: run.instance_id,
-                exit_code,
-                filesystem: Some(store.data().filesystem.snapshot()),
-            }))
+            ) {
+                WasixProcessEnd::Exit(code) => CoreModuleRunCompletion::Exit(Ok(ChildExit {
+                    instance_id: run.instance_id,
+                    exit_code: code,
+                    filesystem: Some(store.data().filesystem.snapshot()),
+                })),
+                WasixProcessEnd::Exec(replacement) => CoreModuleRunCompletion::Exec(replacement),
+                WasixProcessEnd::Fail(failure) => CoreModuleRunCompletion::Exit(Err(failure)),
+            }
         }
         Err(error) => {
             if let Some(replacement) = store.data_mut().take_exec_replacement() {
@@ -904,7 +913,7 @@ where
 /// threads are stopped, so their end never changes the process's exit
 /// status.
 async fn finish_core_module_process<CpuImpl, Net, HostFs>(
-    threads: WasixProcessThreads,
+    threads: WasixImageThreads<CpuImpl, Net, HostFs>,
     image: Result<CoreModuleImageEnd<CpuImpl, Net, HostFs>, ProgramExecError>,
     teardown_phase: &'static str,
     recycle: Option<(SharedMemorySpec, SharedMemory)>,

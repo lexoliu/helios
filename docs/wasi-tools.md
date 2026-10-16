@@ -89,6 +89,11 @@ Artifacts produced:
   conformance module covering `proc_exit` on a spawned thread while main
   is parked forever in `memory.atomic.wait32`: the whole process must end
   with the thread's status (7) and its output must close.
+- `artifacts/wasix/thread-exec/thread-exec.wasm` — Helios conformance
+  module covering `proc_exec` on a spawned thread while main is parked
+  forever in `memory.atomic.wait32`: every thread of the process must
+  end and the replacement (`/bin/dash -c 'echo thread-exec:replaced'`)
+  must run in the process, print its line and exit 0.
 - `artifacts/wasix/thread-trap/thread-trap.wasm` — Helios conformance
   module covering a trap on a spawned thread while main is parked forever
   in `memory.atomic.wait32`: the whole process must end with the status a
@@ -440,7 +445,7 @@ Expected output contains:
 - Do not remove `tools/wasi-apps/build.sh` or rename output paths
   (`artifacts/python3-root/…`, `artifacts/wasix/dash/…`,
   `artifacts/wasix/thread-futex/…`, `artifacts/wasix/continuation/…`,
-  `artifacts/wasix/atomic-wait-timeout/…`, `artifacts/wasix/atomic-wait-kill/…`, `artifacts/wasix/orphan-threads/…`, `artifacts/wasix/thread-proc-exit/…`, `artifacts/wasix/thread-trap/…`, `artifacts/wasi-tools/…`) without updating this document and `README.md`.
+  `artifacts/wasix/atomic-wait-timeout/…`, `artifacts/wasix/atomic-wait-kill/…`, `artifacts/wasix/orphan-threads/…`, `artifacts/wasix/thread-proc-exit/…`, `artifacts/wasix/thread-exec/…`, `artifacts/wasix/thread-trap/…`, `artifacts/wasi-tools/…`) without updating this document and `README.md`.
 - Keep runtime behavior verified with the inspector `vm` commands above.
 - Do not reintroduce repo-local shell, coreutils, or language stubs. The
   boot shells, coreutils, and QuickJS are standard Wasmer artifacts

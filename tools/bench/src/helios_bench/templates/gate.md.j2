@@ -3,6 +3,11 @@
 #### {{ GATE_TITLES[result.kind] }}
 
 Baseline {{ result.baseline_label }}, candidate {{ result.candidate_label }}, noise floor {{ result.noise_floor | percent }}{% if result.noise_retry %}{% if result.noise_retry.kind == "skipped-for-budget" %} — the first pass measured {{ result.noise_retry.first_noise_floor | percent }}, past the bound, and the one retry was skipped: a second pass would have outlasted the job's budget{% else %} on the retry pass — the first pass measured {{ result.noise_retry.first_noise_floor | percent }}, past the bound, so the suite ran once more on this host{% endif %}{% endif %}.
+{% if result.sampling_period_nanos %}
+
+Both columns were sampled at the instruction level, every {{ result.sampling_period_nanos | period }} on each processor, so every timing on both sides carries the sampler's timer interrupts and its drain task. The columns carry the same sampler and the verdicts below compare like with like; the absolute numbers are a diagnosis, not a measurement.
+
+{% endif %}
 {% if result.inconclusive %}
 
 **Inconclusive**:{% if result.noise_floor > result.floor_bound %} the noise floor exceeds the {{ result.floor_bound | percent }} bound the gate holds a single row's dispersion to. {% if result.noise_retry %}{% if result.noise_retry.kind == "skipped-for-budget" %}The one retry was skipped — the second pass would need {{ result.noise_retry.needed_seconds | seconds }} and {{ result.noise_retry.remaining_seconds | seconds }} remain of the job's budget — so the first pass's floor stands. {% else %}Twice over — {{ result.noise_retry.first_noise_floor | percent }} on the first pass and {{ result.noise_retry.second_noise_floor | percent }} on the retry — so the host could not produce a clean control two passes in a row. {% endif %}{% endif %}{% if result.control %}The control's median drifted {{ result.control.drift | percent }} between the boots before and after the suite on the `{{ result.control.side }}` side and its coefficient of variation reached {{ result.control.cv | percent }}, so this host hides any effect below the floor.{% else %}No control workload ran, so this host hides any effect below the floor.{% endif %}{% endif %}{% for column in result.underprofiled %} The `{{ column }}` column's kernel was built against a profile that left {{ "{:,}".format(result.pgo_uncovered[column][0]) }} of {{ "{:,}".format(result.pgo_uncovered[column][1]) }} functions uncovered — past the {{ UNDERPROFILED_SHARE | percent }} bound a collection from the column's own commit stays under — so the run is rerun with a profile collected from that commit, not read.{% endfor %} No row below gets a verdict.{% if result.enforced %} The check fails{% if result.noise_floor > result.floor_bound %}; rerun the lane{% endif %}.{% endif %}
@@ -63,6 +68,11 @@ This run was not paired: there is no second image to compare against on this hos
 {% endif %}
 {% if report.cross_run %}
 {{ table(report.cross_run) }}
+{% elif report.cross_run_refused %}
+
+#### {{ GATE_TITLES[GateKind.CROSS_RUN] }}
+
+Refused: {{ report.cross_run_refused.reason }}. This comparison neither blocks nor passes.
 {% else %}
 
 No `dev` report exists for this lane yet, so there is no cross-run table.
