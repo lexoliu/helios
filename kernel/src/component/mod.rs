@@ -55,7 +55,7 @@ pub use runtime_backend::{
     CompiledComponent, ComponentExecContext, ComponentExecutor, ComponentExitStatus,
     ComponentRunResult, ComponentRuntimeEngine, ComponentRuntimeFactory, ComponentWorld,
 };
-pub use turn::{GuestTurns, TurnEpilogue};
+pub use turn::{GuestTurns, StopWake, TurnEpilogue};
 pub use types::{
     RawMutexGuardResource, RawMutexResource, RawRwLockReadGuardResource, RawRwLockResource,
     RawRwLockWriteGuardResource, SerialPortResource, TcpStreamResource, UdpSocketResource,

@@ -33,6 +33,8 @@ where
     pub(super) tty_state: WasixTtyState,
     pub(super) signal_callback: Option<String>,
     pub(super) signal_state: WasixSignalState,
+    /// Signals raised on this store's thread alone (`thread_signal`).
+    pub(super) thread_signals: WasixSignalState,
     /// The `proc_raise_interval` timer this store asked for, if any.
     ///
     /// A repeating interval sleeps between raises, so nothing but its
@@ -121,6 +123,7 @@ where
             tty_state,
             signal_callback: None,
             signal_state,
+            thread_signals: WasixSignalState::new(),
             signal_interval: None,
             signal_dispositions,
             descriptors,
@@ -329,14 +332,20 @@ where
     ) -> crate::component::GuestTurns<
         CpuImpl,
         HostRuntimeState<CpuImpl, Net, HostFs>,
-        WasixSignalState,
+        WasixStoreSignals,
     > {
         crate::component::GuestTurns::new(
             self.activity.turns(),
             self.cpu.clone(),
             self.runtime_state.clone(),
-            self.signal_state.clone(),
+            self.signals(),
         )
+    }
+
+    /// The signals this store answers to: its own thread's, ahead of its
+    /// process's.
+    pub(super) fn signals(&self) -> WasixStoreSignals {
+        WasixStoreSignals::new(self.thread_signals.clone(), self.signal_state.clone())
     }
 
     /// The interrupt callback for this store: where a pending WASIX
@@ -345,13 +354,14 @@ where
     ///
     /// Raising a signal and condemning an instance both interrupt every
     /// store of the instance, so a guest that is running meets this at
-    /// its next function entry or loop header, and one suspended in a
-    /// host call meets it at the first of those after the call returns;
-    /// a call that returns to the host first meets both where it
-    /// completes (see [`crate::component::TurnEpilogue::end_call`]). A
-    /// signal is delivered ahead of a kill.
+    /// its next function entry or loop header. One suspended in a host
+    /// call meets neither here: the turn driving the store is woken and
+    /// ends the call, and a call that returns to the host first meets
+    /// both where it completes (see
+    /// [`crate::component::TurnEpilogue::take_stop`]). A signal is
+    /// delivered ahead of a kill.
     fn on_interrupt(&mut self) -> wasmtime::Result<wasmtime::InterruptAction> {
-        if let Some(signal) = self.signal_state.take_pending() {
+        if let Some(signal) = self.signals().take_pending() {
             return Err(wasmtime::Error::new(Preview1SignalExit { signal }));
         }
         if let Some(reason) = self.activity.pending_kill() {
@@ -468,12 +478,12 @@ where
     pub(super) fn insert_thread(
         &mut self,
         tid: u32,
-        signal_state: WasixSignalState,
+        signals: WasixSignalState,
         exit: futures::channel::oneshot::Receiver<u32>,
     ) {
         self.threads.push(WasixThread {
             tid,
-            signal_state,
+            signals,
             exit: Some(exit),
             completed: None,
         });
@@ -1087,7 +1097,13 @@ where
     let interrupts = store.data().interrupts.clone();
     let instance = store.data().instance().id();
     let registration = interrupts.register(instance, store, store.data().cpu.clone());
-    store.data().signal_state.attach(interrupts, instance);
+    // The thread's mailbox needs a target as well, so a running thread
+    // meets a signal raised on it at its next interrupt check.
+    store
+        .data()
+        .signal_state
+        .attach(interrupts.clone(), instance);
+    store.data().thread_signals.attach(interrupts, instance);
     registration
 }
 
@@ -5676,13 +5692,31 @@ mod tests {
         signal_state: &WasixSignalState,
         call: impl core::future::Future<Output = wasmtime::Result<()>>,
     ) -> wasmtime::Result<()> {
-        let turns = crate::component::GuestTurns::new(
+        let turns = wasix_turns(activity, store_signals(signal_state));
+        futures_lite::future::block_on(turns.drive(call))
+    }
+
+    /// The signals of a store whose process mailbox is `process`, with a
+    /// thread mailbox of its own.
+    fn store_signals(process: &WasixSignalState) -> WasixStoreSignals {
+        WasixStoreSignals::new(WasixSignalState::new(), process.clone())
+    }
+
+    /// The turns of a WASIX store that answers to `signals`.
+    fn wasix_turns(
+        activity: &crate::InstanceActivity,
+        signals: WasixStoreSignals,
+    ) -> crate::component::GuestTurns<
+        crate::test_support::ManualClockCpu,
+        crate::test_support::TestRuntimeState,
+        WasixStoreSignals,
+    > {
+        crate::component::GuestTurns::new(
             activity.turns(),
             crate::test_support::ManualClockCpu::new(),
             crate::test_support::TestRuntimeState::default(),
-            signal_state.clone(),
-        );
-        futures_lite::future::block_on(turns.drive(call))
+            signals,
+        )
     }
 
     /// A signal raised while the guest is in its last host call ends the
@@ -5697,18 +5731,11 @@ mod tests {
         let activity = crate::InstanceActivity::new(registry.register("signalled", 0), 0);
         let signal_state = WasixSignalState::new();
         let sender = signal_state.clone();
-        let mut polls = 0;
-        // The last host call suspends; another task signals the program
-        // while it waits; the call returns and so does the export.
-        let call = core::future::poll_fn(move |cx| {
-            polls += 1;
-            if polls == 1 {
-                sender.raise(15);
-                cx.waker().wake_by_ref();
-                core::task::Poll::Pending
-            } else {
-                core::task::Poll::Ready(Ok(()))
-            }
+        // The last host call is where the program is signalled; it
+        // returns without suspending, and so does the export.
+        let call = core::future::poll_fn(move |_| {
+            sender.raise(15);
+            core::task::Poll::Ready(Ok(()))
         });
 
         let error =
@@ -5719,6 +5746,135 @@ mod tests {
             None,
             "the signal is delivered once"
         );
+    }
+
+    /// Counts the wakes a turn receives.
+    #[derive(Default)]
+    struct CountingWaker {
+        wakes: core::sync::atomic::AtomicUsize,
+    }
+
+    impl std::task::Wake for CountingWaker {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.wakes.fetch_add(1, AtomicOrdering::AcqRel);
+        }
+    }
+
+    /// A signal raised while the guest is suspended in a host call that
+    /// never resolves wakes the turn, which ends the call with
+    /// `128 + signal` instead of waiting for the host call; a
+    /// condemnation raised in the same wait comes second.
+    #[test]
+    fn a_signal_ends_a_call_suspended_in_a_host_call_that_never_resolves() {
+        let registry = crate::InstanceRegistry::new();
+        let instance = registry.register("sleeping", 0);
+        let activity = crate::InstanceActivity::new(instance.clone(), 0);
+        let signal_state = WasixSignalState::new();
+        let turns = wasix_turns(&activity, store_signals(&signal_state));
+        let call = core::future::pending::<wasmtime::Result<()>>();
+        let wakes = Arc::new(CountingWaker::default());
+        let waker = core::task::Waker::from(wakes.clone());
+        let mut cx = core::task::Context::from_waker(&waker);
+        let mut driven = core::pin::pin!(turns.drive(call));
+
+        assert!(driven.as_mut().poll(&mut cx).is_pending());
+        signal_state.raise(9);
+        assert_eq!(
+            registry.request_kill(instance.id(), crate::KillReason::Operator, 0),
+            crate::KillOutcome::Requested
+        );
+        assert!(
+            wakes.wakes.load(AtomicOrdering::Acquire) >= 1,
+            "the raise wakes the turn"
+        );
+        let core::task::Poll::Ready(Err(error)) = driven.as_mut().poll(&mut cx) else {
+            panic!("the signal ends the suspended call");
+        };
+        assert_eq!(preview1_exit_status(&error, None), Some(137));
+        assert_eq!(signal_state.take_pending(), None, "delivered once");
+    }
+
+    /// A signal raised on one thread of a process reaches that thread's
+    /// store alone: it ends the call the thread is suspended in with
+    /// `128 + signal`, and a sibling store of the same process, suspended
+    /// too, is neither woken nor handed the signal.
+    #[test]
+    fn a_thread_signal_ends_only_the_target_threads_suspended_call() {
+        let registry = crate::InstanceRegistry::new();
+        let instance = registry.register("threaded", 0);
+        let process = WasixSignalState::new();
+        let caller_thread = WasixSignalState::new();
+        let target_thread = WasixSignalState::new();
+        let caller_signals = WasixStoreSignals::new(caller_thread.clone(), process.clone());
+        let caller_activity = crate::InstanceActivity::new(instance.clone(), 0);
+        let target_activity = crate::InstanceActivity::new(instance, 0);
+        let caller_turns = wasix_turns(&caller_activity, caller_signals.clone());
+        let target_turns = wasix_turns(
+            &target_activity,
+            WasixStoreSignals::new(target_thread.clone(), process.clone()),
+        );
+        let caller_wakes = Arc::new(CountingWaker::default());
+        let caller_waker = core::task::Waker::from(caller_wakes.clone());
+        let mut caller_cx = core::task::Context::from_waker(&caller_waker);
+        let target_wakes = Arc::new(CountingWaker::default());
+        let target_waker = core::task::Waker::from(target_wakes.clone());
+        let mut target_cx = core::task::Context::from_waker(&target_waker);
+        let mut caller_call =
+            core::pin::pin!(caller_turns.drive(core::future::pending::<wasmtime::Result<()>>()));
+        let mut target_call =
+            core::pin::pin!(target_turns.drive(core::future::pending::<wasmtime::Result<()>>()));
+
+        assert!(caller_call.as_mut().poll(&mut caller_cx).is_pending());
+        assert!(target_call.as_mut().poll(&mut target_cx).is_pending());
+        target_thread.raise(9);
+
+        assert_eq!(
+            caller_wakes.wakes.load(AtomicOrdering::Acquire),
+            0,
+            "the raise does not wake a sibling thread's turn"
+        );
+        assert!(
+            target_wakes.wakes.load(AtomicOrdering::Acquire) >= 1,
+            "the raise wakes the target thread's turn"
+        );
+        assert!(
+            caller_call.as_mut().poll(&mut caller_cx).is_pending(),
+            "the sibling's suspended call goes on"
+        );
+        assert_eq!(
+            caller_signals.take_pending(),
+            None,
+            "the sibling is owed nothing"
+        );
+        let core::task::Poll::Ready(Err(error)) = target_call.as_mut().poll(&mut target_cx) else {
+            panic!("the signal ends the target thread's suspended call");
+        };
+        assert_eq!(preview1_exit_status(&error, None), Some(137));
+        assert_eq!(target_thread.take_pending(), None, "delivered once");
+        assert_eq!(
+            process.take_pending(),
+            None,
+            "the process mailbox is untouched"
+        );
+    }
+
+    /// A store owes its guest a signal raised on its own thread ahead of
+    /// one raised on its process, and the process's after that.
+    #[test]
+    fn a_store_takes_its_threads_signal_before_its_processs() {
+        let process = WasixSignalState::new();
+        let thread = WasixSignalState::new();
+        let signals = WasixStoreSignals::new(thread.clone(), process.clone());
+        process.raise(15);
+        thread.raise(9);
+
+        assert_eq!(signals.take_pending(), Some(9));
+        assert_eq!(signals.take_pending(), Some(15));
+        assert_eq!(signals.take_pending(), None);
     }
 
     /// A call that returns with no signal pending keeps its own result.

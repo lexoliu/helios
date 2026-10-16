@@ -2253,8 +2253,8 @@ fn wasmtime_parking_timer() -> &'static Timer<Aarch64Cpu> {
 
 #[cfg(target_os = "none")]
 #[unsafe(no_mangle)]
-extern "C" fn wasmtime_parking_wait(timeout_nanos: u64) {
-    helios_kernel::park_wasmtime_waiter(wasmtime_parking_timer(), timeout_nanos);
+extern "C" fn wasmtime_parking_wait(timeout_nanos: u64) -> bool {
+    helios_kernel::park_wasmtime_waiter(wasmtime_parking_timer(), timeout_nanos)
 }
 
 #[cfg(target_os = "none")]
