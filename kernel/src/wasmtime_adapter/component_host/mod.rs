@@ -4677,7 +4677,7 @@ mod tests {
         /// heartbeat whose guard has been dropped is cancelled here —
         /// which is where its arena block goes back.
         fn drain(&self) {
-            self.executor.run_until_stalled_with_stats();
+            self.executor.run_until_stalled_with_stats(&self.timer);
         }
 
         /// Moves the timer's inbox into its wheel, which is where a

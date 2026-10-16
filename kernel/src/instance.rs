@@ -147,7 +147,7 @@ const fn decode_kill_flag(value: u8) -> Option<KillReason> {
 /// returns when its store is torn down and its registry entry drops.
 /// Whoever condemns the instance also interrupts its stores, so a victim
 /// executing wasm traps at its next function entry or loop header; five
-/// scheduler ticks (`SCHEDULER_INTERRUPT_INTERVAL`) leave room for the
+/// idle interrupt intervals (`IDLE_INTERRUPT_INTERVAL`) leave room for the
 /// trap to unwind and the store to drop.
 ///
 /// A victim parked in a host future that never resolves — a socket
