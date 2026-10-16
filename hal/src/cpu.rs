@@ -226,7 +226,31 @@ pub fn current_processor() -> ProcessorId {
     unsafe { helios_current_processor() }
 }
 
+/// How a processor's timer interrupt is scheduled, which decides what
+/// [`Cpu::set_deadline`] does on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimerInterrupt {
+    /// A one-shot comparator per processor: the interrupt fires at the
+    /// last deadline [`Cpu::set_deadline`] programmed on that processor
+    /// and at no other time. The AArch64 generic timer and the RISC-V
+    /// supervisor timer work this way.
+    Deadline,
+    /// A periodic interrupt at a period the backend chose: the
+    /// interrupt fires every period whatever deadline is programmed, and
+    /// [`Cpu::set_deadline`] only keeps the period running. A local APIC
+    /// in periodic mode works this way.
+    Periodic,
+}
+
 pub trait Cpu: Send + Sync + 'static {
+    /// How this platform's timer interrupt is scheduled.
+    ///
+    /// A deadline published for another processor has to reach that
+    /// processor's comparator, which the publisher cannot program; a
+    /// periodic interrupt needs no such hand-off, because no deadline
+    /// is ever programmed.
+    const TIMER_INTERRUPT: TimerInterrupt;
+
     /// Returns the number of processors the platform exposes to the kernel.
     ///
     /// The kernel uses this to decide which secondary processors to start during SMP
@@ -288,7 +312,10 @@ pub trait Cpu: Send + Sync + 'static {
     /// Programs the next wakeup deadline for the current processor.
     ///
     /// The deadline is absolute, in the same tick domain as [`Cpu::now`]. Calling
-    /// this again replaces the previous deadline.
+    /// this again replaces the previous deadline. It reaches the executing
+    /// processor's timer only, whichever processor's state the caller is
+    /// working on, and under [`TimerInterrupt::Periodic`] it only keeps
+    /// the periodic interrupt running.
     fn set_deadline(&self, deadline: Instant);
 
     /// Publishes freshly loaded executable code so that it becomes visible to

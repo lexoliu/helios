@@ -1558,7 +1558,7 @@ pub(crate) mod fixture {
                 cpu,
                 crate::test_support::test_profile_sink(),
                 crate::test_support::test_uptime_clock(),
-                Timer::new(cpu),
+                crate::test_support::test_timer(cpu),
                 device,
             );
             let fixture = Self {
@@ -3368,7 +3368,7 @@ mod tests {
             cpu,
             crate::test_support::test_profile_sink(),
             crate::test_support::test_uptime_clock(),
-            crate::Timer::new(cpu),
+            crate::test_support::test_timer(cpu),
             device,
         )
     }
@@ -3651,7 +3651,7 @@ mod tests {
             cpu.clone(),
             crate::test_support::test_profile_sink(),
             crate::test_support::test_uptime_clock(),
-            crate::Timer::new(cpu),
+            crate::test_support::test_timer(cpu),
             device,
         )
     }

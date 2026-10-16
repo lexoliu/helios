@@ -17,7 +17,7 @@ use helios_hal::boot::{
     BootMemoryRegion, BootModule, BootModules, BootReservedRanges, FirmwareKind,
     usable_region_segments,
 };
-use helios_hal::cpu::{Cpu, HardwarePerfCounters, Instant, ProcessorId, Timebase};
+use helios_hal::cpu::{Cpu, HardwarePerfCounters, Instant, ProcessorId, Timebase, TimerInterrupt};
 use helios_hal::critical_section::ProcessorIdentity;
 use helios_hal::entropy::{EntropyQuality, EntropyUnavailable};
 use helios_hal::memory::MemoryRegion;
@@ -878,6 +878,9 @@ extern "Rust" fn helios_current_processor() -> ProcessorId {
 }
 
 impl Cpu for Aarch64Cpu {
+    // `CNTV_CVAL_EL0` is this processor's one-shot comparator.
+    const TIMER_INTERRUPT: TimerInterrupt = TimerInterrupt::Deadline;
+
     fn processor_count(&self) -> usize {
         self.state.processor_count()
     }

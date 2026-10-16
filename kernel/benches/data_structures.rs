@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 use bytes::Bytes;
 use divan::counter::ItemsCount;
 use divan::{AllocProfiler, Bencher, black_box};
-use helios_hal::cpu::{Cpu, HardwarePerfCounters, Instant, ProcessorId, Timebase};
+use helios_hal::cpu::{Cpu, HardwarePerfCounters, Instant, ProcessorId, Timebase, TimerInterrupt};
 use helios_hal::fs::FileRights;
 use helios_hal::resource::KernelResource;
 use helios_hal::watchdog::ProgressCounter;
@@ -16,7 +16,7 @@ use helios_kernel::{
     NetworkAdminBackend, NetworkBridgeRequest, NetworkControlError, NetworkErrorDetail,
     NetworkIpAddress, NetworkPortId, Notify, PingError, PingErrorKind, PingReply,
     ProcessMemoryIdentity, TcpAccepted, TcpError, TcpErrorKind, TcpListener, TcpReadProgress,
-    TcpWriteProgress, Timer, TryRead, TryWrite, UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
+    TcpWriteProgress, TryRead, TryWrite, UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
     byte_channel,
 };
 use spin::{Mutex, Once};
@@ -65,6 +65,21 @@ fn main() {
 extern "Rust" fn helios_current_processor() -> ProcessorId {
     ProcessorId::new(0)
 }
+
+/// The kernel timer masks local interrupts around its deadline record;
+/// a benchmark runs as a host process, where nothing interrupts a
+/// thread, so there is nothing to mask.
+struct BenchInterruptMask;
+
+impl helios_hal::critical_section::LocalInterruptMask for BenchInterruptMask {
+    fn mask() -> bool {
+        false
+    }
+
+    unsafe fn restore(_was_enabled: bool) {}
+}
+
+helios_hal::critical_section::set_local_interrupt_mask_impl!(BenchInterruptMask);
 
 #[divan::bench(args = [16usize, 64, 256])]
 fn descriptor_insert_close_reuse(bencher: Bencher, count: usize) {
@@ -348,7 +363,7 @@ fn futex_prepare_complete_distinct_keys(bencher: Bencher, count: usize) {
 
 #[divan::bench(args = [1usize, 64, 1024])]
 fn timer_sleep_future_create_drop(bencher: Bencher, count: usize) {
-    let timer = Timer::new(BenchCpu::new());
+    let timer = Executor::new(ProgressCounter::new(), 1, ProcessorId::new(0)).timer(BenchCpu::new());
     // Created-but-never-polled sleeps model timeout candidates that lose a
     // select/race before the executor parks the task. They must not allocate;
     // pending sleeps still allocate one timer state until the sleep-state pool
@@ -781,6 +796,8 @@ impl ComponentNetworkService for BenchNetworkService {
 }
 
 impl Cpu for BenchCpu {
+    const TIMER_INTERRUPT: TimerInterrupt = TimerInterrupt::Deadline;
+
     fn processor_count(&self) -> usize {
         1
     }

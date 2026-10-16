@@ -144,7 +144,7 @@ use core::sync::atomic::{AtomicUsize, Ordering, compiler_fence};
 
 use arrayvec::ArrayVec;
 use fdt::Fdt;
-use helios_hal::cpu::{Cpu, Instant, ProcessorId, Timebase, current_processor};
+use helios_hal::cpu::{Cpu, Instant, ProcessorId, Timebase, TimerInterrupt, current_processor};
 use helios_hal::critical_section::ProcessorIdentity;
 use helios_hal::memory::MemoryRegion;
 use helios_hal::serial::ByteSerial;
@@ -435,6 +435,9 @@ extern "Rust" fn helios_current_processor() -> ProcessorId {
 }
 
 impl Cpu for RiscvCpu {
+    // SBI `set_timer` programs this hart's one-shot comparator.
+    const TIMER_INTERRUPT: TimerInterrupt = TimerInterrupt::Deadline;
+
     fn processor_count(&self) -> usize {
         self.hart_count
     }

@@ -13,9 +13,12 @@ use core::time::Duration;
 
 use atomic_waker::AtomicWaker;
 use concurrent_queue::{ConcurrentQueue, PopError, PushError};
-use helios_hal::cpu::{Cpu, Instant};
+use helios_hal::cpu::{Cpu, Instant, TimerInterrupt, current_processor};
+use helios_hal::critical_section::with_local_interrupts_masked;
 use objectpool::Pool;
 use triomphe::Arc;
+
+use super::executor::TimerOwner;
 
 /// How long a guest holds its processor before it is preempted and
 /// yields to the executor.
@@ -80,11 +83,31 @@ struct TimerState {
     wheel: TimingWheel,
 }
 
+/// One processor's timer state.
+///
+/// # Concurrency contract
+///
+/// A `Timer` belongs to the processor that built it, its owner
+/// ([`TimerOwner`]). A `Sleep` may be registered from any processor,
+/// because a task holding a clone of the timer runs wherever it runs.
+///
+/// - `state`, the timing wheel, is the owner's event loop's alone.
+///   Interrupt handlers never touch it.
+/// - `inbox` is a lock-free MPSC queue: any processor pushes a new
+///   sleep, the owner drains it into the wheel.
+/// - `next_sleep_deadline` is the earliest pending sleep. Any processor
+///   lowers it with a compare-and-swap after pushing to `inbox`; the
+///   owner stores the wheel's earliest after draining.
+/// - `armed_deadline` is the deadline programmed into the owner's
+///   hardware. Only the owner writes it, from task context with local
+///   interrupts masked and from its timer interrupt, so the record and
+///   the comparator never disagree. A processor that is not the owner
+///   never programs a deadline: [`Cpu::set_deadline`] reaches the
+///   executing processor's comparator, not the owner's. It wakes the
+///   owner instead, when the owner is parked, and the owner programs
+///   the new deadline before it parks again.
 struct TimerShared {
-    // This timing wheel is owned by the kernel event loop running on the
-    // timer's home processor. Interrupt handlers never touch it; they only
-    // re-arm the next periodic/preemption tick so normal async/task context
-    // can finish the work.
+    owner: TimerOwner,
     state: UnsafeCell<TimerState>,
     inbox: ConcurrentQueue<TimerEntry>,
     next_sleep_deadline: AtomicU64,
@@ -173,7 +196,14 @@ struct WheelLevel {
 }
 
 impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
-    pub fn new(cpu: CpuImpl) -> Self {
+    /// The timer of `owner`, built on `owner` itself: the deadline it
+    /// programs here is the owner's.
+    pub(crate) fn new(cpu: CpuImpl, owner: TimerOwner) -> Self {
+        assert_eq!(
+            current_processor(),
+            owner.processor(),
+            "a timer is built on the processor that owns it"
+        );
         let timebase = cpu.timebase();
         let interrupt_interval_ticks = timebase.duration_to_ticks(SCHEDULER_INTERRUPT_INTERVAL);
         let wheel_quantum_ticks = timebase.duration_to_ticks(TIMER_WHEEL_QUANTUM);
@@ -191,6 +221,7 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
         Self {
             cpu,
             shared: Arc::new(TimerShared {
+                owner,
                 state: UnsafeCell::new(TimerState {
                     wheel: TimingWheel::new(current_tick),
                 }),
@@ -220,11 +251,32 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
 
     /// Whether a sleep deadline is already due as of `now` — the idle
     /// loop's reason to stop polling without parking.
+    ///
+    /// `SeqCst`: after the owner has published `Parked`, this is the
+    /// parker half of the wake handshake [`Self::publish_deadline`]
+    /// describes.
     pub(crate) fn is_due(&self, now: Instant) -> bool {
         self.shared
             .next_sleep_deadline
-            .load(AtomicOrdering::Acquire)
+            .load(AtomicOrdering::SeqCst)
             <= now.ticks()
+    }
+
+    /// Programs the published sleep deadline into the owner's hardware
+    /// if it is earlier than the deadline armed there. The owner calls
+    /// this after publishing `Parked` and before it parks, so a deadline
+    /// another processor lowered while the owner was running or polling,
+    /// and so did not wake it for, is armed before the owner stops
+    /// looking.
+    pub(crate) fn arm_published_deadline(&self) {
+        // `SeqCst`: the parker half of the wake handshake.
+        let published = self
+            .shared
+            .next_sleep_deadline
+            .load(AtomicOrdering::SeqCst);
+        if published < self.shared.armed_deadline.load(AtomicOrdering::Relaxed) {
+            self.arm_deadline(Instant::new(published));
+        }
     }
 
     pub fn sleep_until(&self, deadline: Instant) -> Sleep<CpuImpl> {
@@ -256,17 +308,33 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
         // interrupt handlers only disarm the hardware timer.
         let state = unsafe { &mut *self.shared.state.get() };
         let pool = &self.shared.sleep_pool;
-        self.drain_inbox(state);
-
         let now_tick = wheel_tick_floor(now, self.shared.wheel_quantum_ticks);
-        state.wheel.drain_expired(pool, now_tick, &mut ready);
-        let next_deadline = state.wheel.next_live_deadline(pool);
+
+        loop {
+            self.drain_inbox(state);
+            state.wheel.drain_expired(pool, now_tick, &mut ready);
+            let next_deadline = state.wheel.next_live_deadline(pool);
+            self.shared.next_sleep_deadline.store(
+                next_deadline.map_or(u64::MAX, |deadline| deadline.ticks()),
+                AtomicOrdering::SeqCst,
+            );
+            // A sleep pushed after the drain above may have lowered the
+            // published deadline before the store overwrote it. Its
+            // `enqueue` fences between the push and the lowering, and
+            // this fence sits between the store and the emptiness test,
+            // so either that lowering read this store and stands, or
+            // this test sees the push and the loop drains it.
+            fence(AtomicOrdering::SeqCst);
+            if self.shared.inbox.is_empty() {
+                break;
+            }
+        }
 
         for entry in ready.iter() {
             entry.state.fire(pool);
         }
 
-        self.commit_deadline(next_deadline, now);
+        self.arm_next_interrupt(now);
         ready.len()
     }
 
@@ -284,7 +352,12 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
         };
 
         match self.shared.inbox.push(entry) {
-            Ok(()) => self.publish_deadline(deadline),
+            Ok(()) => {
+                // The push before the lowering in `publish_deadline`; the
+                // owner's side of this fence is in `fire_expired`.
+                fence(AtomicOrdering::SeqCst);
+                self.publish_deadline(deadline);
+            }
             Err(PushError::Full(_)) => {
                 panic!("timer inbox capacity {TIMER_INBOX_CAPACITY} exhausted")
             }
@@ -301,43 +374,62 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
         }
     }
 
+    /// Lowers the published sleep deadline to `deadline` and makes sure
+    /// the owner's hardware will interrupt by then.
+    ///
+    /// On the owner that is a reprogramming of its own comparator. On
+    /// any other processor it is not, because [`Cpu::set_deadline`]
+    /// would program the executing processor's comparator, replacing
+    /// that processor's own deadline with this one. The owner is
+    /// reached through the executor's idle handshake instead:
+    ///
+    /// - this side lowers `next_sleep_deadline`, then reads the owner's
+    ///   idle state, and wakes it only if it has published `Parked`;
+    /// - the owner publishes `Parked`, then reads `next_sleep_deadline`
+    ///   ([`Self::is_due`], [`Self::arm_published_deadline`]) and arms
+    ///   it before it parks.
+    ///
+    /// All four accesses are `SeqCst`, so in their single total order
+    /// either this side sees `Parked` and sends the wake, or the owner's
+    /// read comes after the lowering and arms it. A running owner arms
+    /// it on its next executor pass or before its next park. A periodic
+    /// timer interrupt needs neither: no deadline is programmed, and the
+    /// owner's next tick finds the sleep.
     fn publish_deadline(&self, deadline: Instant) {
         let deadline = deadline.ticks();
+        let mut published = self
+            .shared
+            .next_sleep_deadline
+            .load(AtomicOrdering::SeqCst);
         loop {
-            let published = self
-                .shared
-                .next_sleep_deadline
-                .load(AtomicOrdering::Acquire);
             if deadline >= published {
                 return;
             }
-
-            if self
-                .shared
-                .next_sleep_deadline
-                .compare_exchange_weak(
-                    published,
-                    deadline,
-                    AtomicOrdering::AcqRel,
-                    AtomicOrdering::Acquire,
-                )
-                .is_ok()
-            {
-                break;
+            match self.shared.next_sleep_deadline.compare_exchange_weak(
+                published,
+                deadline,
+                AtomicOrdering::SeqCst,
+                AtomicOrdering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(current) => published = current,
             }
         }
 
-        let candidate = self.next_interrupt_deadline_after(self.now());
-        self.arm_deadline(candidate);
+        let owner = self.shared.owner.processor();
+        if current_processor() == owner {
+            self.arm_next_interrupt(self.now());
+        } else if CpuImpl::TIMER_INTERRUPT == TimerInterrupt::Deadline
+            && self.shared.owner.is_parked()
+        {
+            self.cpu.wake_processor(owner);
+        }
     }
 
-    fn commit_deadline(&self, deadline: Option<Instant>, now: Instant) {
-        let next_sleep_deadline = deadline.map_or(u64::MAX, |deadline| deadline.ticks());
-        self.shared
-            .next_sleep_deadline
-            .store(next_sleep_deadline, AtomicOrdering::Release);
-        let candidate = self.next_interrupt_deadline_after(now);
-        self.arm_deadline(candidate);
+    /// Arms the owner's next interrupt from the published sleep deadline
+    /// as of `now`. Owner only.
+    fn arm_next_interrupt(&self, now: Instant) {
+        self.arm_deadline(self.next_interrupt_deadline_after(now));
     }
 
     fn next_interrupt_deadline_after(&self, now: Instant) -> Instant {
@@ -354,17 +446,29 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
         Instant::new(periodic_deadline.ticks().min(next_sleep_deadline))
     }
 
+    /// Programs `deadline` into the owner's hardware and records it.
+    ///
+    /// Owner only: [`Cpu::set_deadline`] reaches the executing
+    /// processor. Local interrupts are masked across the record and the
+    /// programming, so the owner's timer interrupt, which re-arms
+    /// through here too, cannot land between them and leave the record
+    /// naming a deadline the comparator does not hold.
     fn arm_deadline(&self, deadline: Instant) {
+        assert_eq!(
+            current_processor(),
+            self.shared.owner.processor(),
+            "only the processor that owns a timer programs its deadline"
+        );
         let deadline_ticks = deadline.ticks();
-        let previous = self
-            .shared
-            .armed_deadline
-            .swap(deadline_ticks, AtomicOrdering::AcqRel);
-        if previous == deadline_ticks {
-            return;
-        }
-
-        self.cpu.set_deadline(deadline);
+        with_local_interrupts_masked(|| {
+            let previous = self
+                .shared
+                .armed_deadline
+                .swap(deadline_ticks, AtomicOrdering::Relaxed);
+            if previous != deadline_ticks {
+                self.cpu.set_deadline(deadline);
+            }
+        });
     }
 }
 
@@ -765,7 +869,7 @@ mod tests {
     use core::task::Context;
 
     use futures::task::noop_waker_ref;
-    use helios_hal::cpu::{Cpu, Instant, ProcessorId, Timebase};
+    use helios_hal::cpu::{Cpu, Instant, ProcessorId, Timebase, TimerInterrupt};
 
     use super::{
         TIMER_INBOX_CAPACITY, TIMER_READY_RETAINED_ENTRIES, TimerEntry, TimingWheel,
@@ -788,6 +892,8 @@ mod tests {
     }
 
     impl Cpu for TestCpu {
+        const TIMER_INTERRUPT: TimerInterrupt = TimerInterrupt::Deadline;
+
         fn processor_count(&self) -> usize {
             1
         }
@@ -830,7 +936,7 @@ mod tests {
     }
 
     fn test_timer() -> super::Timer<TestCpu> {
-        super::Timer::new(TestCpu::at(0))
+        crate::test_support::test_timer(TestCpu::at(0))
     }
 
     /// Builds a wheel entry plus the strong ref that keeps its slot
@@ -1000,7 +1106,7 @@ mod tests {
 
     #[test]
     fn elapsed_sleep_does_not_allocate_state() {
-        let timer = super::Timer::new(TestCpu::at(100));
+        let timer = crate::test_support::test_timer(TestCpu::at(100));
         assert!(timer.sleep_until(Instant::new(101)).state.is_none());
         assert!(timer.sleep_until(Instant::new(100)).state.is_none());
         assert!(timer.sleep_until(Instant::new(99)).state.is_none());
@@ -1009,7 +1115,7 @@ mod tests {
 
     #[test]
     fn pending_sleep_allocates_state_on_first_poll() {
-        let timer = super::Timer::new(TestCpu::at(100));
+        let timer = crate::test_support::test_timer(TestCpu::at(100));
         let mut sleep = timer.sleep_until(Instant::new(101));
         assert!(sleep.state.is_none());
 
@@ -1021,7 +1127,7 @@ mod tests {
 
     #[test]
     fn timer_inbox_is_bounded_to_kernel_capacity() {
-        let timer = super::Timer::new(TestCpu::at(100));
+        let timer = crate::test_support::test_timer(TestCpu::at(100));
 
         assert_eq!(timer.shared.inbox.capacity(), Some(TIMER_INBOX_CAPACITY));
     }
