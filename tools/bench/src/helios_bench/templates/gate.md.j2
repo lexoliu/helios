@@ -2,7 +2,7 @@
 
 #### {{ GATE_TITLES[result.kind] }}
 
-Baseline {{ result.baseline_label }}, candidate {{ result.candidate_label }}, noise floor {{ result.noise_floor | percent }}{% if result.noise_retry %}{% if result.noise_retry.kind == "skipped-for-budget" %} — the first pass measured {{ result.noise_retry.first_noise_floor | percent }}, past the bound, and the one retry was skipped: a second pass would have outlasted the job's budget{% else %} on the retry pass — the first pass measured {{ result.noise_retry.first_noise_floor | percent }}, past the bound, so the suite ran once more on this host{% endif %}{% endif %}.
+Baseline {{ result.baseline_label }}, candidate {{ result.candidate_label }}{% if result.rebuild_label %}, baseline rebuild {{ result.rebuild_label }}{% endif %}, noise floor {{ result.noise_floor | percent }}{% if result.noise_retry %}{% if result.noise_retry.kind == "skipped-for-budget" %} — the first pass measured {{ result.noise_retry.first_noise_floor | percent }}, past the bound, and the one retry was skipped: a second pass would have outlasted the job's budget{% else %} on the retry pass — the first pass measured {{ result.noise_retry.first_noise_floor | percent }}, past the bound, so the suite ran once more on this host{% endif %}{% endif %}.
 {% if result.sampling_period_nanos %}
 
 Both columns were sampled at the instruction level, every {{ result.sampling_period_nanos | period }} on each processor, so every timing on both sides carries the sampler's timer interrupts and its drain task. The columns carry the same sampler and the verdicts below compare like with like; the absolute numbers are a diagnosis, not a measurement.
@@ -13,18 +13,31 @@ Both columns were sampled at the instruction level, every {{ result.sampling_per
 **Inconclusive**:{% if result.noise_floor > result.floor_bound %} the noise floor exceeds the {{ result.floor_bound | percent }} bound the gate holds a single row's dispersion to. {% if result.noise_retry %}{% if result.noise_retry.kind == "skipped-for-budget" %}The one retry was skipped — the second pass would need {{ result.noise_retry.needed_seconds | seconds }} and {{ result.noise_retry.remaining_seconds | seconds }} remain of the job's budget — so the first pass's floor stands. {% else %}Twice over — {{ result.noise_retry.first_noise_floor | percent }} on the first pass and {{ result.noise_retry.second_noise_floor | percent }} on the retry — so the host could not produce a clean control two passes in a row. {% endif %}{% endif %}{% if result.control %}The control's median drifted {{ result.control.drift | percent }} between the boots before and after the suite on the `{{ result.control.side }}` side and its coefficient of variation reached {{ result.control.cv | percent }}, so this host hides any effect below the floor.{% else %}No control workload ran, so this host hides any effect below the floor.{% endif %}{% endif %}{% for column in result.underprofiled %} The `{{ column }}` column's kernel was built against a profile that left {{ "{:,}".format(result.pgo_uncovered[column][0]) }} of {{ "{:,}".format(result.pgo_uncovered[column][1]) }} functions uncovered — past the {{ UNDERPROFILED_SHARE | percent }} bound a collection from the column's own commit stays under — so the run is rerun with a profile collected from that commit, not read.{% endfor %} No row below gets a verdict.{% if result.enforced %} The check fails{% if result.noise_floor > result.floor_bound %}; rerun the lane{% endif %}.{% endif %}
 {% endif %}
 {% if result.kind == GateKind.PAIRED %}
-Both columns were measured in this job on {{ result.candidate_host }}, the two images booted back to back for every workload: headline regressions block whether or not the report is publishable.
+{% if result.rebuild_label %}All three columns were measured in this job on {{ result.candidate_host }}, the three images booted back to back for every workload{% else %}Both columns were measured in this job on {{ result.candidate_host }}, the two images booted back to back for every workload{% endif %}: headline regressions block whether or not the report is publishable.
 {% elif result.enforced %}
 Both reports are from dedicated runners on {{ result.candidate_host }}: headline regressions block.
 {% else %}
 Informational only, and nothing here blocks: {% if result.baseline_host != result.candidate_host %}the two runs did not land on the same host ({{ result.baseline_host }} against {{ result.candidate_host }}){% else %}at least one of the two reports is not publishable{% endif %}.
 {% endif %}
 
-| Workload | Measurement | Baseline | Candidate | Shift | CIs disjoint | Beyond noise | Verdict |
-| --- | --- | ---: | ---: | ---: | :---: | :---: | --- |
+{% if result.rebuild_label %}
+Each row is judged against the largest movement this job measured for it without the change, and the Floor column names which one that was. `control` is the noise floor above; `page` is one page, for a footprint; `boot` is how far one image moved between its two boots of the workload, when the reconfirm took a second pair; `build` is how far the two builds of the baseline commit — each against its own, independently collected kernel profile — moved apart. A row whose two baseline builds agree, within its `control` or `boot` floor, is judged against the baseline exactly as a run without a rebuild column judges it. A row whose builds moved further apart has to clear that drift against both builds, with disjoint bootstrap intervals and the same direction against each; one that clears only the lower floor against the baseline is `within build drift`, and blocks nothing.
+
+| Workload | Measurement | Baseline | Rebuild | Candidate | Shift | CIs disjoint | Floor | Beyond floor | Verdict |
+| --- | --- | ---: | ---: | ---: | ---: | :---: | ---: | :---: | --- |
+{% else %}
+Each row is judged against the largest movement this job measured for it without the change, and the Floor column names which one that was: `control` is the noise floor above, `page` is one page for a footprint, and `boot` is how far one image moved between its two boots of the workload, when the reconfirm took a second pair.
+
+| Workload | Measurement | Baseline | Candidate | Shift | CIs disjoint | Floor | Beyond floor | Verdict |
+| --- | --- | ---: | ---: | ---: | :---: | ---: | :---: | --- |
+{% endif %}
 {% for row in result.rows %}
-| `{{ row.workload }}`{% if row.headline %} (headline){% endif %} | `{{ row.measurement }}`{% if row.direction == Direction.HIGHER_IS_BETTER %} (higher is better){% endif %} | {{ row.baseline_median | ms }} | {{ row.candidate_median | ms }} | {{ row.shift | percent }} | {{ "yes" if row.ci_disjoint else "no" }} | {{ "yes" if row.beyond_noise else "no" }} | {% if result.inconclusive %}inconclusive{% elif row.rejected %}rejected: {{ row.rejection_reason }}{% elif row.diagnostic %}diagnostic{% elif row.regression %}**regression**{% elif row.improvement %}improvement{% else %}unchanged{% endif %} |
+| `{{ row.workload }}`{% if row.headline %} (headline){% endif %} | `{{ row.measurement }}`{% if row.direction == Direction.HIGHER_IS_BETTER %} (higher is better){% endif %} | {{ row.baseline_median | ms }} |{% if result.rebuild_label %} {{ row.rebuild_median | ms }} |{% endif %} {{ row.candidate_median | ms }} | {{ row.shift | percent }} | {{ "yes" if row.ci_disjoint else "no" }} | {{ row | floor }} | {{ "yes" if row.beyond_noise else "no" }} | {% if result.inconclusive %}inconclusive{% elif row.rejected %}rejected: {{ row.rejection_reason }}{% elif row.diagnostic %}diagnostic{% elif row.regression %}**regression**{% elif row.improvement %}improvement{% elif row.within_build_drift %}within build drift{% else %}unchanged{% endif %} |
 {% endfor %}
+{% if result.within_build_drift_rows %}
+
+Within build drift, so neither a regression nor an improvement: {% for row in result.within_build_drift_rows %}`{{ row.workload }}`/`{{ row.measurement }}` ({{ row.shift | percent }}, floor {{ row | floor }}){% if not loop.last %}, {% endif %}{% endfor %}.
+{% endif %}
 {% if result.diagnostic_rows %}
 
 `diagnostic` rows are the tail of one iteration's samples — a maximum, or a percentile at p99 or above — and they record the scheduling order of the boot that produced them rather than anything the change did, so they are reported and never block.
@@ -35,7 +48,7 @@ Timed again on every Helios image after a first pass too dispersed to gate on: {
 {% endif %}
 {% if result.reconfirmed %}
 
-Measured again on a second pair of boots after the first pair regressed: {% for name in result.reconfirmed %}`{{ name }}`{% if not loop.last %}, {% endif %}{% endfor %}. The rows above are the second pair, so a regression that shows there showed twice.
+Measured again on a second pair of boots after the first pair regressed: {% for name in result.reconfirmed %}`{{ name }}`{% if not loop.last %}, {% endif %}{% endfor %}. The rows above are the second pair, booted in the reverse order of the first, so a regression that shows there showed twice; the first pair stays in the report, and how far each image moved between its two boots is part of those rows' floor.
 {% endif %}
 {% if result.unpaired_metrics %}
 
@@ -56,7 +69,7 @@ Significant regressions outside the headline set, or on a comparison that does n
 {% elif result.improvements %}
 No significant regression. Significant improvement: {% for row in result.improvements %}`{{ row.workload }}`/`{{ row.measurement }}`{% if not loop.last %}, {% endif %}{% endfor %}.
 {% else %}
-No significant regression or improvement: no row has both disjoint confidence intervals and a shift beyond the noise floor.
+No significant regression or improvement: no row has both disjoint confidence intervals and a shift beyond its floor.
 {% endif %}
 {% endmacro %}
 ### Benchmark gate — lane `{{ lane }}`

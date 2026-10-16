@@ -23,6 +23,13 @@ class Side(StrEnum):
     #: `HELIOS` on the same host in the same job. Present only in a paired
     #: run; see `helios_bench.baseline`.
     HELIOS_BASELINE = "helios_baseline"
+    #: The baseline commit built a second time, from a second profile
+    #: collected independently of the one `HELIOS_BASELINE` was built
+    #: against, and timed beside both other images in the same job. How
+    #: far it lands from `HELIOS_BASELINE` is how far a column moves
+    #: between two builds of one commit, which is what a per-run profile
+    #: collection adds to every shift the paired comparison reads (#479).
+    HELIOS_BASELINE_REBUILD = "helios_baseline_rebuild"
     LINUX_WASMTIME = "linux_wasmtime"
     LINUX_NATIVE = "linux_native"
 
@@ -30,14 +37,24 @@ class Side(StrEnum):
 SIDE_LABELS = {
     Side.HELIOS: "Helios",
     Side.HELIOS_BASELINE: "Helios (baseline)",
+    Side.HELIOS_BASELINE_REBUILD: "Helios (baseline rebuild)",
     Side.LINUX_WASMTIME: "Linux + Wasmtime",
     Side.LINUX_NATIVE: "Native Linux",
 }
 
-#: The order a table and a plot put the sides in. The baseline column is
-#: printed only by a run that produced one, so an unpaired report renders
-#: exactly as it did before the paired mode existed.
-TABLE_SIDE_ORDER = [Side.HELIOS, Side.HELIOS_BASELINE, Side.LINUX_WASMTIME, Side.LINUX_NATIVE]
+#: The order a table and a plot put the sides in. The baseline columns
+#: are printed only by a run that produced them, so an unpaired report
+#: renders exactly as it did before the paired mode existed.
+TABLE_SIDE_ORDER = [
+    Side.HELIOS,
+    Side.HELIOS_BASELINE,
+    Side.HELIOS_BASELINE_REBUILD,
+    Side.LINUX_WASMTIME,
+    Side.LINUX_NATIVE,
+]
+
+#: The sides only a paired run measures.
+PAIRED_SIDES = frozenset({Side.HELIOS_BASELINE, Side.HELIOS_BASELINE_REBUILD})
 
 
 class WorkloadClass(StrEnum):
@@ -233,10 +250,36 @@ class RunInfo(BaseModel):
         default=None,
         description="the denominator for the baseline image, when the run was paired",
     )
+    baseline_rebuild_kernel_profile: str | None = Field(
+        default=None,
+        description=(
+            "the second, independently collected kernel profile the `helios_baseline_rebuild` "
+            "column's kernel was built against: the baseline commit built a second time, so "
+            "the comparison can measure how far two builds of one commit move apart (#479); "
+            "None when the run built no rebuild column"
+        ),
+    )
+    baseline_rebuild_kernel_pgo_uncovered: int | None = Field(
+        default=None,
+        description="the uncovered count for the baseline rebuild image, when the run built one",
+    )
+    baseline_rebuild_kernel_pgo_functions: int | None = Field(
+        default=None,
+        description="the denominator for the baseline rebuild image, when the run built one",
+    )
+    baseline_rebuild_instruction_sampling: InstructionSampling | None = Field(
+        default=None,
+        description="how the `helios_baseline_rebuild` column was sampled, when the run built and sampled it",
+    )
 
     @property
     def paired(self) -> bool:
         return self.baseline_git_sha is not None
+
+    @property
+    def rebuilt(self) -> bool:
+        """Whether the run built the baseline commit twice, from two profiles."""
+        return self.baseline_rebuild_kernel_profile is not None
 
 
 class Hardware(BaseModel):
@@ -342,6 +385,14 @@ class WorkloadResult(BaseModel):
         description="sides the manifest records as uncompared for this workload, with the reason",
     )
     comparisons: list[Comparison]
+    first_pass: dict[Side, Cell] = Field(
+        default_factory=dict,
+        description=(
+            "the first pair of boots of a workload the reconfirm measured again, one cell per "
+            "Helios image; `cells` holds the second pair, which the verdicts read. How far one "
+            "image moved between its two boots is part of that workload's floor"
+        ),
+    )
     parity_bug: bool = Field(
         description="compared workload where Helios is significantly slower than Linux + Wasmtime, "
         "whatever its class"
@@ -381,7 +432,7 @@ class Report(BaseModel):
     def table_sides(self) -> list[Side]:
         """The columns a table and a plot print, in report order."""
         measured = self.measured_sides()
-        return [side for side in TABLE_SIDE_ORDER if side is not Side.HELIOS_BASELINE or side in measured]
+        return [side for side in TABLE_SIDE_ORDER if side not in PAIRED_SIDES or side in measured]
 
     def headline_workloads(self) -> list[WorkloadResult]:
         return [workload for workload in self.workloads if workload.headline]

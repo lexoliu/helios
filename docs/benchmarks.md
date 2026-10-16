@@ -173,18 +173,43 @@ Per cell (workload × side), `iterations` executions (11 by default):
   record names them and the gate table says so (#295).
 - A headline regression has to show twice. When the paired gate would
   block on a workload, the runner times that workload again on both
-  images back to back into `reconfirm/`, and the second pair replaces the
-  first: a regression that is the change's own reproduces, a drift
-  between two boots does not. One pass per run, so a host that drifts
-  twice in a row still fails the check; the run record names the
-  reconfirmed workloads and the gate table says so (#297).
+  images back to back into `reconfirm/`, booted in the reverse order of
+  the first pass, and the second pair is the one the gate judges: a
+  regression that is the change's own reproduces, a drift between two
+  boots does not. The first pair stays in the report (`first_pass` on
+  the workload), and how far each image moved between its two boots of
+  the workload is a floor of its own for that row (`boot`, below). One
+  pass per run, so a host that drifts twice in a row still fails the
+  check; the run record names the reconfirmed workloads and the gate
+  table says so (#297, #479).
 - A comparison between Helios and a Linux side is **significant** when
   the two warm bootstrap intervals do not overlap and the ratio of medians
   moves by more than the noise floor; otherwise it prints "within noise".
 - The regression gate makes the same call twice, against two baselines,
   and the difference between them is which one can be trusted to block.
   A headline workload is regressed when the two warm bootstrap intervals
-  are disjoint and the median moved by more than the noise floor.
+  are disjoint and the median moved by more than the row's floor.
+- A row's floor is the largest movement the job measured for it without
+  the change, and the gate table names which one it was. `control` is
+  the noise floor above; `page` is one page, for a footprint; `boot` is
+  how far either image moved between its two boots of the workload, when
+  the reconfirm took a second pair. A paired run whose baseline is a
+  profile-use build also builds the baseline commit a second time,
+  against a second, independently collected kernel profile, and boots it
+  as a third image (`helios_baseline_rebuild`, the Rebuild column), the
+  baseline always the middle boot of the three. The two baseline builds
+  differ only in their profiles, so how far a row moved between them
+  (`build`, the largest movement over the passes that measured both) is
+  what the build alone does to that row. A row whose two builds agree,
+  within its other floor, is judged against the baseline exactly as a
+  run without the rebuild judges it. A row whose builds moved further
+  apart blocks only when the candidate clears that drift against both
+  builds, with disjoint intervals and the same direction against each;
+  one significant only at the lower floor against the baseline is
+  printed `within build drift` and blocks nothing. One compute control
+  cannot speak for a workload whose own spread is wider, and the A/A
+  pair of identical code in run 38940834451 moved `fs-smallfiles` by
+  11.2% and `sched-tasks` by 2.4% (#479).
 - The gate judges every measurement a cell carries, one row each: the
   host-side `elapsed_ms` of the round trip, and each `bench.<name>`
   metric the workload printed from inside the guest. A workload times
@@ -776,10 +801,13 @@ comparisons or the independent profile-generation/PGO experiment —
 default branch buys, and a comparison between a commit and its baseline
 is not that. But the comparison still costs a profile per column: the
 `profile-columns` job runs `kernel-profile.yml` once at the run's own
-commit and once at the ref the suite pairs against — `baseline_ref`, or
-a labelled pull request's base — and the two artifacts feed the two
-columns' builds, because a candidate held to a profile of the default
-branch's kernel would bill a stale-profile term to the change (#384). A
+commit and twice at the ref the suite pairs against — `baseline_ref`, or
+a labelled pull request's base — and the artifacts feed the columns'
+builds, because a candidate held to a profile of the default branch's
+kernel would bill a stale-profile term to the change (#384). The second
+baseline collection is the rebuild column's: an independent profile of
+the same commit, so the gate can measure what a build alone moves each
+row (#479). The three collections run in parallel. A
 `baseline_kernel_build=release` control collects only the candidate's.
 The paired gate holds each column's uncovered share to a bound and is
 inconclusive for the named reason when either exceeds it, the way it is
