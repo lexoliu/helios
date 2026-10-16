@@ -1,4 +1,4 @@
-use wasmtime::Config;
+use wasmtime::{Config, StackLimitLocation};
 
 pub use crate::component::{
     COMPONENT_ASYNC_STACK_SIZE, MAX_CONCURRENT_INSTANCES, MAX_CORE_INSTANCES_PER_COMPONENT,
@@ -60,8 +60,14 @@ pub fn build_component_engine_config(target: &str) -> Config {
     // Preemption, kills and signals interrupt a guest through its
     // store's stack limit: the checks are the stack-limit compares
     // Cranelift already emits, made resumable, and nothing stays live
-    // across the body for them.
+    // across the body for them. On a bare-metal target the limit is the
+    // processor's own word, which each check reads straight off the
+    // processor anchor; the compiler picks the same location, and a cwasm
+    // compiled for the other one is refused when it is deserialized.
     config.stack_limit_interruption(true);
+    if let Some(offset) = helios_artifact::cwasm_target_guest_stack_limit_offset(target) {
+        config.stack_limit_location(StackLimitLocation::PerProcessor { offset });
+    }
     // The stack size is kernel policy, not a runtime knob: see
     // `COMPONENT_ASYNC_STACK_SIZE` for why it is what it is and who
     // pays for it. Both the guest wasm call stack and the host Rust
