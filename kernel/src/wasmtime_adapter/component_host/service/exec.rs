@@ -838,8 +838,9 @@ where
             filesystem: Some(store.data().filesystem.snapshot()),
         })),
         // Main's call stopped because a spawned thread ended the process;
-        // the process ends the way that thread chose: it exits with its
-        // status, or runs the image its exec asked for.
+        // the process ends the way that thread's call ended it: it exits
+        // with its status, runs the image its exec asked for, or fails
+        // with the failure a trap on main would have reported.
         Err(error) if WasixThreadEnded::is(&error) => {
             match store.data().threads.take_process_end().expect(
                 "main's image is ended only by a spawned thread that recorded the process's end first",
@@ -850,20 +851,19 @@ where
                     filesystem: Some(store.data().filesystem.snapshot()),
                 })),
                 WasixProcessEnd::Exec(replacement) => CoreModuleRunCompletion::Exec(replacement),
+                WasixProcessEnd::Fail(failure) => CoreModuleRunCompletion::Exit(Err(failure)),
             }
         }
         Err(error) => {
             if let Some(replacement) = store.data_mut().take_exec_replacement() {
                 CoreModuleRunCompletion::Exec(Box::new(replacement))
             } else {
-                CoreModuleRunCompletion::Exit(match store.data_mut().take_exit_status(&error) {
-                    Some(code) => Ok(ChildExit {
-                        instance_id: run.instance_id,
-                        exit_code: code,
-                        filesystem: Some(store.data().filesystem.snapshot()),
-                    }),
-                    None => Err(map_program_runtime_error(error)),
-                })
+                let end = store.data_mut().take_process_end(error);
+                CoreModuleRunCompletion::Exit(end.map(|exit_code| ChildExit {
+                    instance_id: run.instance_id,
+                    exit_code,
+                    filesystem: Some(store.data().filesystem.snapshot()),
+                }))
             }
         }
     };

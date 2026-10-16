@@ -8,10 +8,10 @@ use super::*;
 /// The process owns its threads, not the store that spawned each one,
 /// so any thread joins or signals any other and the process's end
 /// ([`Self::end`]) reaches all of them, those whose spawner has itself
-/// returned included. A spawned thread that exits, execs or takes a
-/// fatal signal ends the process the same way main does
-/// ([`Self::end_from_thread`]): `Image` is what an exec hands the
-/// process's main thread to run next.
+/// returned included. A spawned thread that exits, execs, takes a
+/// fatal signal or fails (a trap, an out-of-memory kill) ends the
+/// process the same way main does ([`Self::end_from_thread`]): `Image`
+/// is what an exec hands the process's main thread to run next.
 ///
 /// # Concurrency
 ///
@@ -51,7 +51,8 @@ struct WasixThreadTable<Image> {
     process_end: Option<WasixProcessEnd<Image>>,
 }
 
-/// How a spawned thread ended its whole process.
+/// How a spawned thread ended its whole process: each is the end the
+/// same call would have given main's image (`run_core_module_image`).
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum WasixProcessEnd<Image> {
     /// `proc_exit` or a fatal signal's default action, with the
@@ -60,6 +61,10 @@ pub(super) enum WasixProcessEnd<Image> {
     /// `proc_exec*`: the image the process runs next, in place of the
     /// one every thread of it was running.
     Exec(Image),
+    /// A trap or any other failure, with the failure main reports for
+    /// it, as the default action of `SIGSEGV` and `SIGILL` ends the
+    /// process.
+    Fail(ProgramExecError),
 }
 
 struct WasixThread {
@@ -90,14 +95,14 @@ impl<Image> WasixProcessThreads<Image> {
     }
 
     /// Ends the whole process from spawned thread `tid`, whose own call
-    /// has ended with `end`, as POSIX `exit`, `execve` and a fatal
-    /// signal do from any thread.
+    /// has ended with `end`, as POSIX `exit`, `execve`, a fatal signal
+    /// and a fault's default action do from any thread.
     ///
     /// The end is recorded first, then main's image is ended through
     /// its mailbox, which stops main's call and makes main's completion
-    /// take the end ([`Self::take_process_end`]): the exit status it
-    /// reports, or the image it runs next once every thread has ended;
-    /// every other thread is
+    /// take the end ([`Self::take_process_end`]): the exit status or the
+    /// failure it reports, or the image it runs next once every thread
+    /// has ended; every other thread is
     /// ended in the same pass, so none runs on after the process's end
     /// and they stop concurrently. Main's completion path then waits for
     /// all of them through [`Self::end`], as for any other end of the
@@ -136,7 +141,8 @@ impl<Image> WasixProcessThreads<Image> {
     }
 
     /// Admits a thread whose mailbox is `mailbox` and whose end `exit`
-    /// will publish, and returns its id. A process that has ended admits
+    /// will publish, and returns its id, which fits the `i32` that
+    /// `wasi_thread_start` takes. A process that has ended admits
     /// nothing: the caller is one of its threads, ended already, and it
     /// gets `AGAIN`, `pthread_create`'s answer for a thread it cannot
     /// have.
@@ -150,7 +156,8 @@ impl<Image> WasixProcessThreads<Image> {
             return Err(p1::errno::AGAIN);
         }
         let tid = table.next_tid;
-        table.next_tid = tid.checked_add(1).ok_or(p1::errno::OVERFLOW)?;
+        i32::try_from(tid).map_err(|_| p1::errno::OVERFLOW)?;
+        table.next_tid = tid + 1;
         table.threads.push(WasixThread { tid, mailbox, exit });
         Ok(tid)
     }
@@ -412,6 +419,10 @@ where
     p1::errno::SUCCESS
 }
 
+/// Runs spawned thread `tid` to its end and returns the status it
+/// publishes. A call that ends the process ends it here, while the
+/// thread's store still exists, so the thread's end is published only
+/// after the process's end is recorded.
 pub(super) async fn run_wasix_thread<CpuImpl, Net, HostFs>(
     engine: wasmtime::Engine,
     compiled: Arc<WasmtimeCompiledCoreModule>,
@@ -427,81 +438,105 @@ where
 {
     let mut store = wasmtime::Store::new(&engine, store_data);
     let interrupts = configure_preview1_program_store(&mut store);
-
-    let mut linker = CoreLinker::new(&engine);
-    if add_preview1_program_imports(&mut linker).is_err() {
-        return u32::from(p1::errno::IO as u16);
-    }
-    if define_imported_shared_memory(&mut linker, &store, &compiled.module, imported_memory)
-        .is_err()
+    let end = match call_wasix_thread(
+        &mut store,
+        &interrupts,
+        &compiled,
+        imported_memory,
+        tid,
+        args,
+    )
+    .await
     {
-        return u32::from(p1::errno::IO as u16);
-    }
-    let turns = store.data().guest_turns();
-    let instance = match interrupts
-        .drive(turns.drive(linker.instantiate_async(&mut store, &compiled.module)))
-        .await
-    {
-        Ok(instance) => instance,
-        Err(error) if WasixThreadEnded::is(&error) => return WasixThreadEnded::EXIT_CODE,
-        Err(error) => {
-            tracing::error!(tid, "wasix thread instantiate failed: {error:#}");
-            return u32::from(p1::errno::IO as u16);
-        }
+        Ok(end) => end,
+        // A thread that cannot be brought up fails its process, as the
+        // same failure bringing up main's image does.
+        Err(failure) => WasixThreadCallEnd::Process(WasixProcessEnd::Fail(failure)),
     };
-    let start = match instance.get_typed_func::<(i32, i32), ()>(&mut store, "wasi_thread_start") {
-        Ok(start) => start,
-        Err(error) => {
-            tracing::error!(tid, "wasix thread start export lookup failed: {error:#}");
-            return u32::from(p1::errno::NOTCAPABLE as u16);
-        }
-    };
-    let tid_i32 = match i32::try_from(tid) {
-        Ok(tid) => tid,
-        Err(_) => return u32::from(p1::errno::OVERFLOW as u16),
-    };
-    let args_i32 = i32::from_ne_bytes(args.to_ne_bytes());
-    let result = loop {
-        let turns = store.data().guest_turns();
-        let result = interrupts
-            .drive(turns.drive(start.call_async(&mut store, (tid_i32, args_i32))))
-            .await;
-        if result.as_ref().is_err_and(WasixThreadEnded::is) {
-            break result;
-        }
-        match handle_wasix_asyncify_completion(&mut store, &interrupts, &instance).await {
-            Ok(true) => continue,
-            Ok(false) => break result,
-            // The process ended while the thread was between an unwind
-            // and its rewind; the rewind's call met the end.
-            Err(_) if store.data().thread_signals.thread_ended() => {
-                return WasixThreadEnded::EXIT_CODE;
-            }
-            Err(error) => {
-                tracing::error!(tid, "wasix thread asyncify completion failed: {error}");
-                return u32::from(p1::errno::IO as u16);
-            }
-        }
-    };
-    let requested_exit = store.data_mut().take_requested_exit();
-    let exec_replacement = store.data_mut().take_exec_replacement().map(Box::new);
-    match wasix_thread_call_end(result, requested_exit, exec_replacement) {
-        Ok(WasixThreadCallEnd::Thread(code)) => code,
-        Ok(WasixThreadCallEnd::Process(end)) => {
+    match end {
+        WasixThreadCallEnd::Thread(code) => code,
+        WasixThreadCallEnd::Process(end) => {
             // Nobody joins a thread of an ended process; the status is
             // only ever seen by the process's own end.
             let code = match &end {
                 WasixProcessEnd::Exit(code) => *code,
                 WasixProcessEnd::Exec(_) => WasixThreadEnded::EXIT_CODE,
+                WasixProcessEnd::Fail(failure) => {
+                    tracing::error!(tid, %failure, "wasix thread failed; its process fails with it");
+                    u32::from(p1::errno::IO as u16)
+                }
             };
             store.data().threads.end_from_thread(tid, end);
             code
         }
-        Err(error) => {
-            tracing::error!(tid, "wasix thread failed: {error:#}");
-            u32::from(p1::errno::IO as u16)
-        }
     }
+}
+
+/// Instantiates spawned thread `tid` in `store` and calls its
+/// `wasi_thread_start` through every asyncify unwind and rewind, and
+/// says what the call's end ends. Bringing the thread up fails the way
+/// bringing main's image up does.
+async fn call_wasix_thread<CpuImpl, Net, HostFs>(
+    store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+    interrupts: &StoreInterrupts<CpuImpl>,
+    compiled: &WasmtimeCompiledCoreModule,
+    imported_memory: SharedMemory,
+    tid: u32,
+    args: u32,
+) -> Result<WasixThreadCallEnd<Box<WasixExecReplacement<CpuImpl, Net, HostFs>>>, ProgramExecError>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    HostFs: crate::HostFileSystem,
+{
+    let mut linker = CoreLinker::new(store.engine());
+    add_preview1_program_imports(&mut linker)?;
+    define_imported_shared_memory(&mut linker, store, &compiled.module, imported_memory)?;
+    let turns = store.data().guest_turns();
+    let instance = match interrupts
+        .drive(turns.drive(linker.instantiate_async(&mut *store, &compiled.module)))
+        .await
+    {
+        Ok(instance) => instance,
+        Err(error) if WasixThreadEnded::is(&error) => {
+            return Ok(WasixThreadCallEnd::Thread(WasixThreadEnded::EXIT_CODE));
+        }
+        Err(error) => return Err(map_program_runtime_error(error)),
+    };
+    let start = instance
+        .get_typed_func::<(i32, i32), ()>(&mut *store, "wasi_thread_start")
+        .map_err(|_| ProgramExecError {
+            kind: ProgramExecErrorKind::InvalidBinary,
+            detail: ProgramExecErrorDetail::InvalidEntryPoint,
+        })?;
+    let tid_i32 = i32::try_from(tid).expect("the thread table admits only ids an i32 holds");
+    let args_i32 = i32::from_ne_bytes(args.to_ne_bytes());
+    let result = loop {
+        let turns = store.data().guest_turns();
+        let result = interrupts
+            .drive(turns.drive(start.call_async(&mut *store, (tid_i32, args_i32))))
+            .await;
+        if result.as_ref().is_err_and(WasixThreadEnded::is) {
+            break result;
+        }
+        match handle_wasix_asyncify_completion(store, interrupts, &instance).await {
+            Ok(true) => continue,
+            Ok(false) => break result,
+            // The process ended while the thread was between an unwind
+            // and its rewind; the rewind's call met the end.
+            Err(_) if store.data().thread_signals.thread_ended() => {
+                return Ok(WasixThreadCallEnd::Thread(WasixThreadEnded::EXIT_CODE));
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    let requested_exit = store.data_mut().take_requested_exit();
+    let exec_replacement = store.data_mut().take_exec_replacement().map(Box::new);
+    Ok(wasix_thread_call_end(
+        result,
+        requested_exit,
+        exec_replacement,
+    ))
 }
 
 /// How a spawned thread's call ends: the thread alone, or its process.
@@ -519,38 +554,40 @@ pub(super) enum WasixThreadCallEnd<Image> {
 ///
 /// Returning from the start function, `thread_exit`, a signal raised on
 /// this thread alone (`thread_signal`) and the end of the thread's
-/// process end the thread alone. An exec, `proc_exit`,
-/// `proc_raise` and a fatal signal's default action end the whole
-/// process, as POSIX `execve`, `exit` and a signal do from any thread,
-/// decided exactly as main decides them (`run_core_module_image`): the
-/// exec first, then the signal's status, then the requested one.
-/// Anything else is the thread's failure, handed back.
+/// process end the thread alone. Every other end ends the whole process
+/// exactly as the same end of main's call does
+/// (`run_core_module_image`): an exec first, as POSIX `execve` does from
+/// any thread; then, through [`preview1_process_end`], `proc_exit`,
+/// `proc_raise` and a fatal signal's default action with their status,
+/// as POSIX `exit` and a signal do, and a trap or any other failure with
+/// the failure main would report, as the default action of `SIGSEGV`
+/// and `SIGILL` does.
 pub(super) fn wasix_thread_call_end<Image>(
     result: wasmtime::Result<()>,
     requested_exit: Option<u32>,
     exec_replacement: Option<Image>,
-) -> wasmtime::Result<WasixThreadCallEnd<Image>> {
+) -> WasixThreadCallEnd<Image> {
     let error = match result {
-        Ok(()) => return Ok(WasixThreadCallEnd::Thread(requested_exit.unwrap_or(0))),
+        Ok(()) => return WasixThreadCallEnd::Thread(requested_exit.unwrap_or(0)),
         Err(error) => error,
     };
     if WasixThreadEnded::is(&error) {
-        return Ok(WasixThreadCallEnd::Thread(WasixThreadEnded::EXIT_CODE));
+        return WasixThreadCallEnd::Thread(WasixThreadEnded::EXIT_CODE);
     }
     if WasixThreadExitRequested::is(&error) {
         let code = requested_exit.expect("thread_exit records its status before it unwinds");
-        return Ok(WasixThreadCallEnd::Thread(code));
+        return WasixThreadCallEnd::Thread(code);
     }
     if let Some(exit) = error.downcast_ref::<WasixThreadSignalExit>() {
-        return Ok(WasixThreadCallEnd::Thread(exit.exit_code()));
+        return WasixThreadCallEnd::Thread(exit.exit_code());
     }
     if let Some(image) = exec_replacement {
-        return Ok(WasixThreadCallEnd::Process(WasixProcessEnd::Exec(image)));
+        return WasixThreadCallEnd::Process(WasixProcessEnd::Exec(image));
     }
-    match preview1_exit_status(&error, requested_exit) {
-        Some(code) => Ok(WasixThreadCallEnd::Process(WasixProcessEnd::Exit(code))),
-        None => Err(error),
-    }
+    WasixThreadCallEnd::Process(match preview1_process_end(error, requested_exit) {
+        Ok(code) => WasixProcessEnd::Exit(code),
+        Err(failure) => WasixProcessEnd::Fail(failure),
+    })
 }
 
 pub(super) async fn wasix_thread_join<CpuImpl, Net, HostFs>(
@@ -1385,13 +1422,13 @@ mod tests {
 
     /// A spawned thread's call ends the thread alone when it returns,
     /// calls `thread_exit`, takes a signal raised on it alone or is ended
-    /// with its process, and ends the
-    /// whole process on an exec, `proc_exit`, `proc_raise` and a fatal
-    /// signal, as main would take the same end.
+    /// with its process, and ends the whole process on an exec,
+    /// `proc_exit`, `proc_raise` and a fatal signal, as main would take
+    /// the same end.
     #[test]
     fn a_threads_call_end_is_the_threads_or_the_processs() {
         let end = |result: wasmtime::Result<()>, requested| {
-            wasix_thread_call_end::<()>(result, requested, None).expect("the end is a status")
+            wasix_thread_call_end::<()>(result, requested, None)
         };
         assert_eq!(end(Ok(()), None), WasixThreadCallEnd::Thread(0));
         assert_eq!(
@@ -1423,15 +1460,109 @@ mod tests {
             WasixThreadCallEnd::Process(WasixProcessEnd::Exit(128 + 15)),
             "a fatal signal ends the process with its status"
         );
-        assert!(
-            wasix_thread_call_end::<()>(Err(wasmtime::Error::msg("trap")), None, None).is_err(),
-            "a failure is the thread's own"
-        );
         assert_eq!(
-            wasix_thread_call_end(Err(wasmtime::Error::new(Preview1Exit)), None, Some("next"))
-                .expect("an exec is an end"),
+            wasix_thread_call_end(Err(wasmtime::Error::new(Preview1Exit)), None, Some("next")),
             WasixThreadCallEnd::Process(WasixProcessEnd::Exec("next")),
             "an exec replaces the process"
+        );
+    }
+
+    /// A trap on a spawned thread ends the whole process with the
+    /// failure the same trap on main reports: main's completion maps its
+    /// call's error through `preview1_process_end`, and the thread's end
+    /// carries exactly that, kind and detail alike. An exec the thread
+    /// asked for before it trapped still replaces the process, as on
+    /// main.
+    #[test]
+    fn a_trap_on_a_thread_fails_the_process_as_a_trap_on_main_does() {
+        let trap = || wasmtime::Error::new(wasmtime::Trap::UnreachableCodeReached);
+        let mains = preview1_process_end(trap(), None)
+            .expect_err("a trap on main is the process's failure");
+        assert_eq!(mains.kind, ProgramExecErrorKind::Internal);
+        assert_eq!(
+            wasix_thread_call_end::<()>(Err(trap()), None, None),
+            WasixThreadCallEnd::Process(WasixProcessEnd::Fail(mains)),
+            "a trap on a thread fails its process"
+        );
+
+        // A trap after the guest asked to exit ends the process with the
+        // status it asked for, as on main.
+        assert_eq!(
+            wasix_thread_call_end::<()>(Err(trap()), Some(4), None),
+            WasixThreadCallEnd::Process(WasixProcessEnd::Exit(4))
+        );
+        // An exec comes first, as main's completion takes it first.
+        assert_eq!(
+            wasix_thread_call_end(Err(trap()), Some(4), Some("next")),
+            WasixThreadCallEnd::Process(WasixProcessEnd::Exec("next"))
+        );
+    }
+
+    /// A thread's failure reaches main the way a thread's exit or exec
+    /// does: main is ended, every other thread is ended, and main takes
+    /// the failure as its process's end; a later exit or exec from
+    /// another thread does not replace it, nor does a failure replace an
+    /// earlier exec.
+    #[test]
+    fn a_threads_failure_ends_main_with_the_failure() {
+        let failure = || {
+            preview1_process_end(
+                wasmtime::Error::new(wasmtime::Trap::UnreachableCodeReached),
+                None,
+            )
+            .expect_err("a trap is a failure")
+        };
+
+        let threads = WasixProcessThreads::<&'static str>::new();
+        let failing_tid = threads
+            .admit(WasixSignalState::new(), Arc::new(WasixThreadExit::new()))
+            .expect("a live process admits a thread");
+        let other_mailbox = WasixSignalState::new();
+        let other_tid = threads
+            .admit(other_mailbox.clone(), Arc::new(WasixThreadExit::new()))
+            .expect("a live process admits a thread");
+        threads.end_from_thread(failing_tid, WasixProcessEnd::Fail(failure()));
+        threads.end_from_thread(other_tid, WasixProcessEnd::Exit(3));
+        threads.end_from_thread(other_tid, WasixProcessEnd::Exec("next"));
+        assert!(threads.main_mailbox().thread_ended(), "main is ended");
+        assert!(other_mailbox.thread_ended(), "every other thread is ended");
+        assert_eq!(
+            threads.take_process_end(),
+            Some(WasixProcessEnd::Fail(failure())),
+            "main takes the thread's failure"
+        );
+
+        let threads = WasixProcessThreads::<&'static str>::new();
+        let exec_tid = threads
+            .admit(WasixSignalState::new(), Arc::new(WasixThreadExit::new()))
+            .expect("a live process admits a thread");
+        let failing_tid = threads
+            .admit(WasixSignalState::new(), Arc::new(WasixThreadExit::new()))
+            .expect("a live process admits a thread");
+        threads.end_from_thread(exec_tid, WasixProcessEnd::Exec("next"));
+        threads.end_from_thread(failing_tid, WasixProcessEnd::Fail(failure()));
+        assert_eq!(
+            threads.take_process_end(),
+            Some(WasixProcessEnd::Exec("next")),
+            "an exec recorded first stands against a later failure"
+        );
+    }
+
+    /// Thread ids fit the `i32` that `wasi_thread_start` takes: the table
+    /// refuses the id past `i32::MAX` rather than hand it out.
+    #[test]
+    fn the_thread_table_hands_out_only_ids_an_i32_holds() {
+        let threads = WasixProcessThreads::<()>::new();
+        threads.table.lock().next_tid = i32::MAX as u32;
+        let last = threads
+            .admit(WasixSignalState::new(), Arc::new(WasixThreadExit::new()))
+            .expect("i32::MAX is a thread id");
+        assert_eq!(last, i32::MAX as u32);
+        assert_eq!(
+            threads
+                .admit(WasixSignalState::new(), Arc::new(WasixThreadExit::new()))
+                .err(),
+            Some(p1::errno::OVERFLOW)
         );
     }
 
