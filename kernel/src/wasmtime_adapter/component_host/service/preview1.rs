@@ -48,8 +48,8 @@ where
     pub(super) asyncify: WasixAsyncifyState<Net>,
     pub(super) children: Vec<WasixChildProcess>,
     pub(super) thread_id: u32,
-    pub(super) next_thread_id: u32,
-    pub(super) threads: Vec<WasixThread>,
+    /// The threads of this store's process, shared by every store of it.
+    pub(super) threads: WasixProcessThreads,
     pub(super) requested_exit: Option<u32>,
     pub(super) exec_replacement: Option<WasixExecReplacement<CpuImpl, Net, HostFs>>,
 }
@@ -82,6 +82,7 @@ where
         signal_dispositions: Vec<WasixSignalDisposition>,
         current_core_module: Option<Arc<WasmtimeCompiledCoreModule>>,
         wasix_abi: bool,
+        threads: WasixProcessThreads,
     ) -> Self {
         let filesystem = filesystem.map_or_else(
             || DebugFileSystem::new(runtime_state.clone()),
@@ -130,8 +131,7 @@ where
             asyncify: WasixAsyncifyState::new(),
             children: Vec::new(),
             thread_id: 0,
-            next_thread_id: 1,
-            threads: Vec::new(),
+            threads,
             requested_exit: None,
             exec_replacement: None,
         }
@@ -282,16 +282,6 @@ where
 
     pub(super) fn set_thread_id(&mut self, thread_id: u32) {
         self.thread_id = thread_id;
-        self.next_thread_id = thread_id.saturating_add(1);
-    }
-
-    pub(super) fn allocate_thread_id(&mut self) -> Result<u32, i32> {
-        let tid = self.next_thread_id;
-        self.next_thread_id = self
-            .next_thread_id
-            .checked_add(1)
-            .ok_or(p1::errno::OVERFLOW)?;
-        Ok(tid)
     }
 
     pub(super) fn take_requested_exit(&mut self) -> Option<u32> {
@@ -348,21 +338,21 @@ where
         WasixStoreSignals::new(self.thread_signals.clone(), self.signal_state.clone())
     }
 
-    /// The interrupt callback for this store: where a pending WASIX
-    /// signal and a condemnation reach a running guest, and where the
-    /// end of a time slice makes it yield.
+    /// The interrupt callback for this store: where the end of the
+    /// thread's process, a pending WASIX signal and a condemnation reach
+    /// a running guest, and where the end of a time slice makes it yield.
     ///
-    /// Raising a signal and condemning an instance both interrupt every
-    /// store of the instance, so a guest that is running meets this at
-    /// its next function entry or loop header. One suspended in a host
-    /// call meets neither here: the turn driving the store is woken and
-    /// ends the call, and a call that returns to the host first meets
-    /// both where it completes (see
-    /// [`crate::component::TurnEpilogue::take_stop`]). A signal is
-    /// delivered ahead of a kill.
+    /// Ending a thread, raising a signal and condemning an instance all
+    /// interrupt every store of the instance, so a guest that is running
+    /// meets this at its next function entry or loop header. One
+    /// suspended in a host call meets none of them here: the turn driving
+    /// the store is woken and ends the call, and a call that returns to
+    /// the host first meets them where it completes (see
+    /// [`crate::component::TurnEpilogue::take_stop`]). The thread's end
+    /// comes first, then a signal, then a kill.
     fn on_interrupt(&mut self) -> wasmtime::Result<wasmtime::InterruptAction> {
-        if let Some(signal) = self.signals().take_pending() {
-            return Err(wasmtime::Error::new(Preview1SignalExit { signal }));
+        if let Some(stop) = self.signals().owed_stop() {
+            return Err(stop);
         }
         if let Some(reason) = self.activity.pending_kill() {
             return Err(wasmtime::Error::from(crate::InstanceKilled { reason }));
@@ -473,49 +463,6 @@ where
                 (!self.children.is_empty()).then_some(0)
             }
         }
-    }
-
-    pub(super) fn insert_thread(
-        &mut self,
-        tid: u32,
-        signals: WasixSignalState,
-        exit: futures::channel::oneshot::Receiver<u32>,
-    ) {
-        self.threads.push(WasixThread {
-            tid,
-            signals,
-            exit: Some(exit),
-            completed: None,
-        });
-    }
-
-    pub(super) fn poll_thread_exit(&mut self, index: usize) -> Option<u32> {
-        if let Some(code) = self.threads[index].completed {
-            return Some(code);
-        }
-        let Some(exit) = self.threads[index].exit.as_mut() else {
-            return self.threads[index].completed;
-        };
-        let waker = futures::task::noop_waker_ref();
-        let mut context = Context::from_waker(waker);
-        match Pin::new(exit).poll(&mut context) {
-            Poll::Pending => None,
-            Poll::Ready(Ok(code)) => {
-                self.threads[index].completed = Some(code);
-                self.threads[index].exit = None;
-                Some(code)
-            }
-            Poll::Ready(Err(_)) => {
-                let code = u32::from(p1::errno::IO as u16);
-                self.threads[index].completed = Some(code);
-                self.threads[index].exit = None;
-                Some(code)
-            }
-        }
-    }
-
-    pub(super) fn find_thread_index(&self, tid: u32) -> Option<usize> {
-        self.threads.iter().position(|thread| thread.tid == tid)
     }
 
     pub(super) async fn read_stdin(&mut self, max_bytes: usize) -> Bytes {

@@ -768,6 +768,36 @@ jobs:
           cat "$runtime/guest.log"
           grep -Fqx atomic-wait-kill:ok "$runtime/guest.log"
           ! grep -Fq 'Kernel panic' "$runtime/guest.log"
+      - name: End a process whose threads are still running
+        # A process that leaves its threads running hangs here, not in a
+        # later step.
+        timeout-minutes: 5
+        shell: bash
+        working-directory: helios
+        run: |
+          # Without this the step reports tee's status, not the
+          # command's, and a runner script that fails is invisible.
+          set -o pipefail
+          # A WASIX process whose main returned left its threads running,
+          # and each kept a clone of the session's stdout open, so the
+          # shell reading it never returned (#462). Main returns with one
+          # thread parked forever in memory.atomic.wait32 and one spinning
+          # in pure wasm; the process must end with main's status, and
+          # the shell's echo after it proves its output closed.
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/orphan-threads"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+            --accel kvm \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger \
+            --boot-program wasix-orphan-threads --no-compiler-plugin \
+            shell --trace-log "$runtime/guest-tracing.log" \
+            -c '/bin/wasix-orphan-threads; echo orphan-threads:exit=$?' \
+            2>&1 > "$runtime/guest.log" | tee "$runtime/inspector.log"
+          cat "$runtime/guest.log"
+          grep -Fqx orphan-threads:ok "$runtime/guest.log"
+          grep -Fqx orphan-threads:exit=0 "$runtime/guest.log"
+          ! grep -Fq 'Kernel panic' "$runtime/guest.log"
       - name: Fetch over virtio-net with curl
         shell: bash
         working-directory: helios
