@@ -73,6 +73,10 @@ Artifacts produced:
 - `artifacts/wasix/continuation/continuation.wasm` — Helios WASIX
   conformance module covering `stack_checkpoint`, `stack_restore`, and
   the asyncify unwind/rewind exports expected by the adapter.
+- `artifacts/wasix/atomic-wait-timeout/atomic-wait-timeout.wasm` — Helios
+  conformance module covering a timed `memory.atomic.wait32` with no
+  notifier: it must return 2 (timed out) once its timeout has elapsed on
+  the monotonic clock.
 - `artifacts/wasi-tools/curl.wasm`
 - `artifacts/wasi-tools/curl-stripped.wasm`
 - `artifacts/wasi-tools/wasi-curl.wasm` — plain-WASI HTTP/1.1 client,
@@ -411,14 +415,14 @@ Expected output contains:
 - `tools/wasi-apps/wasix-tests/*.wat` are intentionally small Helios-owned
   conformance modules. They do not replace the real dash/bash/QuickJS/CPython
   smoke tests; they pin adapter execution behavior for WASIX threads,
-  futexes, and stack continuations.
+  futexes, timed atomic waits, and stack continuations.
 
 ## Contract For Future Agents
 
 - Do not remove `tools/wasi-apps/build.sh` or rename output paths
   (`artifacts/python3-root/…`, `artifacts/wasix/dash/…`,
   `artifacts/wasix/thread-futex/…`, `artifacts/wasix/continuation/…`,
-  `artifacts/wasi-tools/…`) without updating this document and `README.md`.
+  `artifacts/wasix/atomic-wait-timeout/…`, `artifacts/wasi-tools/…`) without updating this document and `README.md`.
 - Keep runtime behavior verified with the inspector `vm` commands above.
 - Do not reintroduce repo-local shell, coreutils, or language stubs. The
   boot shells, coreutils, and QuickJS are standard Wasmer artifacts

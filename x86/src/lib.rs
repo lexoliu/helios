@@ -1299,3 +1299,8 @@ extern "C" fn wasmtime_parking_wait(timeout_nanos: u64) {
 extern "C" fn wasmtime_parking_unpark() {
     helios_kernel::unpark_wasmtime_waiters();
 }
+
+#[unsafe(no_mangle)]
+extern "C" fn wasmtime_monotonic_nanos() -> u64 {
+    helios_kernel::wasmtime_monotonic_nanos(smp::current_runtime().timer())
+}

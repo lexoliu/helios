@@ -5,13 +5,39 @@ at `../wasmtime/crates/wasmtime`.
 
 ## Required revision
 
-The local checkout must be at (branch `helios/stack-limit-interrupt`):
+The local checkout must be at (branch `helios/parking-wait-timeout`):
 
 ```text
-9d41e8b3ab259c394c099d62c61600f366ef3017
+3741766da8e691dfa9e642ab9f16cfb30c1fc5a3
 ```
 
-That revision is `helios/parallel-compile-steal` at
+That revision is `helios/stack-limit-interrupt` at
+`9d41e8b3ab259c394c099d62c61600f366ef3017` plus one additive commit
+(written on that branch's earlier `913a5426` and merged forward), which
+makes a timed `memory.atomic.wait` time out on `no_std` (#455):
+
+- A `no_std` build declares a third parking hook,
+  `wasmtime_monotonic_nanos() -> u64`, next to `wasmtime_parking_wait` and
+  `wasmtime_parking_unpark` and under the same `threads` condition. It reads
+  a monotonic clock that every waiting thread shares.
+- `parking_spot::deadline_after` turns a wait's timeout into an absolute
+  deadline for both builds (`Instant` on `std`, a `MonotonicDeadline` of
+  clock nanoseconds on `no_std`), and `SharedMemory::atomic_wait32/64` use
+  it instead of a cfg split. A deadline that does not fit means no timeout,
+  as before.
+- Every pass of the wait loop parks only for the time left until the
+  deadline, and returns `WaitResult::TimedOut` once the clock reaches it.
+  Before, the `no_std` loop carried the relative timeout and re-parked for
+  all of it after every return, so it never timed out.
+
+Helios needs it because a timed `memory.atomic.wait32/64`, and so every
+futex-backed timed wait in a threaded guest (a condvar `wait_timeout`),
+only ended when notified. Each bare-metal backend exports
+`wasmtime_monotonic_nanos` from its processor timer's `Cpu` timebase.
+
+The revision it replaces is `helios/stack-limit-interrupt` at
+`9d41e8b3ab259c394c099d62c61600f366ef3017`, which is
+`helios/parallel-compile-steal` at
 `f5a2d7baf50962ae777c29ecc792f0eed501c75d` plus two additive commits, which
 add resumable stack-limit interruption (#456):
 
