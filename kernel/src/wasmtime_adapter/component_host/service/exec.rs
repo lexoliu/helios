@@ -1046,7 +1046,7 @@ where
 
 pub(super) async fn handle_wasix_asyncify_completion<CpuImpl, Net, HostFs>(
     store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, HostFs>>,
-    interrupts: &StoreInterrupts,
+    interrupts: &StoreInterrupts<CpuImpl>,
     instance: &wasmtime::Instance,
 ) -> Result<bool, ProgramExecError>
 where
@@ -1315,7 +1315,7 @@ where
 
 pub(super) async fn wasix_begin_rewind<CpuImpl, Net, HostFs>(
     store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, HostFs>>,
-    interrupts: &StoreInterrupts,
+    interrupts: &StoreInterrupts<CpuImpl>,
     instance: &wasmtime::Instance,
     rewind: WasixRewind,
 ) -> Result<(), ProgramExecError>
@@ -1675,7 +1675,7 @@ pub(super) fn wasix_stack_snapshot_bytes(user: u32, hash: u128) -> [u8; WASIX_ST
 
 pub(super) async fn wasix_call_instance_func0<CpuImpl, Net, HostFs>(
     store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, HostFs>>,
-    interrupts: &StoreInterrupts,
+    interrupts: &StoreInterrupts<CpuImpl>,
     instance: &wasmtime::Instance,
     name: &str,
 ) -> Result<(), ProgramExecError>
@@ -1699,7 +1699,7 @@ where
 
 pub(super) async fn wasix_call_instance_func1<CpuImpl, Net, HostFs>(
     store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, HostFs>>,
-    interrupts: &StoreInterrupts,
+    interrupts: &StoreInterrupts<CpuImpl>,
     instance: &wasmtime::Instance,
     name: &str,
     value: u32,

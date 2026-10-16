@@ -1657,13 +1657,13 @@ pub(crate) fn deliver_kill<CpuImpl, Net, HostFs>(
 }
 
 /// A component store on `engine`, with the interrupt route the
-/// scheduler tick, a kill and the drive of its calls go through.
+/// end of a time slice, a kill and the drive of its calls go through.
 pub(crate) fn store_with_state<CpuImpl, Net, HostFs>(
     engine: &crate::wasmtime_adapter::WasmtimeEngine,
     state: StoreData<CpuImpl, Net, HostFs>,
 ) -> (
     Store<StoreData<CpuImpl, Net, HostFs>>,
-    crate::wasmtime_adapter::preemption::StoreInterrupts,
+    crate::wasmtime_adapter::preemption::StoreInterrupts<CpuImpl>,
 )
 where
     CpuImpl: Cpu + Clone,
@@ -1685,14 +1685,16 @@ where
     // running meets this at its next function entry or loop header.
     // Cancelling the future instead would surface a bare interrupt trap
     // that loses the kill reason (OOM vs supervisor restart). Any other
-    // interruption is the scheduler tick, and the guest yields.
+    // interruption ends a time slice, and the guest yields.
     store.interrupt_callback(|caller| {
         if let Some(reason) = caller.data().pending_kill() {
             return Err(wasmtime::Error::from(crate::InstanceKilled { reason }));
         }
         Ok(wasmtime::InterruptAction::Yield)
     });
-    let interrupts = engine.interrupts().register(instance, &store);
+    let interrupts = engine
+        .interrupts()
+        .register(instance, &store, store.data().cpu.clone());
     (store, interrupts)
 }
 

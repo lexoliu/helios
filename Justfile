@@ -117,6 +117,10 @@ test-units:
     cargo nextest run -p helios-compositor-render -p helios-desktop-text-check
     cargo nextest run -p helios-inspector-protocol --lib
     cargo nextest run -p helios-kernel --test hal_layering
+    # The hosted backend boots the same kernel on the host OS; its tests
+    # cover the memory-policy density checks and the OOM killer, and
+    # `embedded_debugger_is_provisioned` reads the prebuild payload above.
+    HELIOS_BOOTFS="${out_dir}/helios-bootfs" cargo nextest run -p helios-hosted
     python3 "{{repo_root}}/x86/tests/interrupt_state.py"
 
 # Generate the kernel-prebuild manifest for `target` and run `cargo clippy`

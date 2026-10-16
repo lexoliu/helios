@@ -187,8 +187,8 @@ maintainer's decision and the fork's revision moves once, per §1.
   probing stay correctly enabled wherever the real target supports them.
 - Every Wasmtime performance opt-in the kernel can support stays enabled:
   pooling instance allocation, signals-based traps, stack-limit
-  interruption (`Config::stack_limit_interruption`: a processor's timer
-  tick, a kill and a signal lower the running store's stack limit, and the
+  interruption (`Config::stack_limit_interruption`: the end of a
+  processor's guest time slice (`GUEST_TIME_SLICE`), a kill and a signal lower the running store's stack limit, and the
   resumable check at every function entry and loop header takes them;
   never epoch interruption, whose per-entry and per-loop checks cost
   10–29% on compute), SIMD, threads, the component model,
@@ -446,8 +446,8 @@ just test-units
 against `deny.toml`, and `cargo clippy … -D warnings` over the host crates, each
 guest program, and the three bare-metal targets.
 `just test-units` runs the `hal`, `virtio`, `netstack`, `kernel`,
-`inspector-protocol` and `workspace-root` unit tests and the `hal_layering`
-test (`kernel/tests/`) that enforces §1. The recipe names each integration
+`inspector-protocol` and `workspace-root` unit tests, every `hosted` test,
+and the `hal_layering` test (`kernel/tests/`) that enforces §1. The recipe names each integration
 test with `--test <name>`, so a new enforcement test is added to the recipe
 in the same change or it never runs.
 Both recipes run through `cargo nextest run` under `.config/nextest.toml`:

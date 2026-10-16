@@ -1412,8 +1412,10 @@ extern "C" fn aarch64_handle_irq() {
             // The wake carries no payload: returning from `wfi` is the
             // whole message, and `park_current` owns the flag.
         } else if intid == gic::VIRTUAL_TIMER_PPI {
+            // Every processor's timer interrupt ends the slice of every
+            // guest on the machine that has run one.
             if let Some(program_service) = runtime.program_service.get() {
-                program_service.preempt_current_guest();
+                program_service.preempt_overdue_guests();
             }
             runtime
                 .timer

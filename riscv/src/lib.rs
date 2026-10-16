@@ -583,8 +583,10 @@ fn trap_dispatch(tf: &mut TrapFrame) {
     }
     match riscv::register::scause::read().cause().try_into() {
         Ok(Trap::Interrupt(Interrupt::SupervisorTimer)) => {
+            // Every hart's timer interrupt ends the slice of every guest
+            // on the machine that has run one.
             if let Some(program_service) = current_hart_runtime().program_service.as_ref() {
-                program_service.preempt_current_guest();
+                program_service.preempt_overdue_guests();
             }
             current_hart_runtime().timer.handle_interrupt();
         }

@@ -50,4 +50,4 @@ pub use task::{YieldNow, yield_now};
 pub use time::{
     KernelClock, UptimeClock, elapsed_millis, monotonic_nanos, wall_clock_offset_nanos,
 };
-pub use timer::{Sleep, Timer};
+pub use timer::{GUEST_TIME_SLICE, Sleep, Timer};
