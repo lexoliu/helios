@@ -1562,7 +1562,10 @@ pub(crate) mod fixture {
                     .state
                     .shard_at(DEFAULT_SHARD_IDX)
                     .lock();
-                shard.stack.add_ipv4_address(Ipv4Cidr::new(Self::LOCAL, 24));
+                shard
+                    .stack
+                    .add_ipv4_address(Ipv4Cidr::new(Self::LOCAL, 24))
+                    .expect("test address should be accepted");
                 shard.stack.learn_neighbor(NeighborEntry {
                     ip: IpAddress::Ipv4(Self::PEER),
                     mac: Self::PEER_MAC,
@@ -2040,7 +2043,10 @@ mod tests {
             "a client still looking for an address has no lease to confirm"
         );
 
-        shard.stack.add_ipv4_address(lease);
+        shard
+            .stack
+            .add_ipv4_address(lease)
+            .expect("test address should be accepted");
         shard.dhcp = DhcpClientState::Bound;
         assert_eq!(
             shard.begin_lease_revalidation(9, StackInstant::from_nanos(1)),
@@ -2085,7 +2091,8 @@ mod tests {
         let mut shard = test_network_shard();
         shard
             .stack
-            .add_ipv4_address(Ipv4Cidr::new(Ipv4Address::new([192, 0, 2, 10]), 24));
+            .add_ipv4_address(Ipv4Cidr::new(Ipv4Address::new([192, 0, 2, 10]), 24))
+            .expect("test address should be accepted");
         shard.dhcp = DhcpClientState::Bound;
         shard
             .begin_lease_revalidation(9, StackInstant::from_nanos(0))
@@ -2121,7 +2128,8 @@ mod tests {
         let mut shard = test_network_shard();
         shard
             .stack
-            .add_ipv4_address(Ipv4Cidr::new(Ipv4Address::new([192, 0, 2, 10]), 24));
+            .add_ipv4_address(Ipv4Cidr::new(Ipv4Address::new([192, 0, 2, 10]), 24))
+            .expect("test address should be accepted");
         shard
             .stack
             .routes_mut()
@@ -2232,7 +2240,10 @@ mod tests {
         let local = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         let remote = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
         let mut state = test_network_shard();
-        state.stack.add_ipv6_address(Ipv6Cidr::new(local, 64));
+        state
+            .stack
+            .add_ipv6_address(Ipv6Cidr::new(local, 64))
+            .expect("test address should be accepted");
         state.stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv6(remote),
             mac: [0x02, 0, 0, 0, 0, 2],
@@ -2276,7 +2287,10 @@ mod tests {
         let local = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         let remote = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
         let mut state = test_network_shard();
-        state.stack.add_ipv6_address(Ipv6Cidr::new(local, 64));
+        state
+            .stack
+            .add_ipv6_address(Ipv6Cidr::new(local, 64))
+            .expect("test address should be accepted");
         state.stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv6(remote),
             mac: [0x02, 0, 0, 0, 0, 2],
@@ -2342,7 +2356,10 @@ mod tests {
         let local = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         let remote = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
         let mut state = test_network_shard();
-        state.stack.add_ipv6_address(Ipv6Cidr::new(local, 64));
+        state
+            .stack
+            .add_ipv6_address(Ipv6Cidr::new(local, 64))
+            .expect("test address should be accepted");
         state.stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv6(remote),
             mac: [0x02, 0, 0, 0, 0, 2],
@@ -2459,7 +2476,10 @@ mod tests {
         let local = Ipv4Address::new([10, 0, 2, 15]);
         let remote = Ipv4Address::new([10, 0, 2, 2]);
         let mut state = test_network_shard();
-        state.stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        state
+            .stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
         state.stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv4(remote),
             mac: [0x02, 0, 0, 0, 0, 2],
@@ -2528,7 +2548,10 @@ mod tests {
         let local = Ipv4Address::new([10, 0, 2, 15]);
         let remote = Ipv4Address::new([10, 0, 2, 2]);
         let mut state = test_network_shard();
-        state.stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        state
+            .stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
         state.stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv4(remote),
             mac: [0x02, 0, 0, 0, 0, 2],
@@ -2570,7 +2593,10 @@ mod tests {
         let local = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         let remote = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
         let mut state = test_network_shard();
-        state.stack.add_ipv6_address(Ipv6Cidr::new(local, 64));
+        state
+            .stack
+            .add_ipv6_address(Ipv6Cidr::new(local, 64))
+            .expect("test address should be accepted");
         state.stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv6(remote),
             mac: [0x02, 0, 0, 0, 0, 2],
@@ -2616,7 +2642,10 @@ mod tests {
         let local = Ipv4Address::new([10, 0, 2, 15]);
         let remote = Ipv4Address::new([10, 0, 2, 2]);
         let mut state = test_network_shard();
-        state.stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        state
+            .stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
         let key = IcmpEchoKey {
             destination: IpAddress::Ipv4(remote),
             identifier: 9,
@@ -2642,7 +2671,10 @@ mod tests {
         let local = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         let remote = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
         let mut state = test_network_shard();
-        state.stack.add_ipv6_address(Ipv6Cidr::new(local, 64));
+        state
+            .stack
+            .add_ipv6_address(Ipv6Cidr::new(local, 64))
+            .expect("test address should be accepted");
         state.stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv6(remote),
             mac: [0x02, 0, 0, 0, 0, 2],
@@ -2682,7 +2714,10 @@ mod tests {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let remote = Ipv4Address::new([192, 0, 2, 20]);
         let mut state = test_network_shard();
-        state.stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        state
+            .stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
         state.stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv4(remote),
             mac: [0x02, 0, 0, 0, 0, 2],
@@ -2710,7 +2745,10 @@ mod tests {
         let local = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         let remote = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
         let mut state = test_network_shard();
-        state.stack.add_ipv6_address(Ipv6Cidr::new(local, 64));
+        state
+            .stack
+            .add_ipv6_address(Ipv6Cidr::new(local, 64))
+            .expect("test address should be accepted");
         let socket = bind_udp(&mut state, FIRST_TEST_UDP_SLOT, 4040);
         let (frame, len) = ipv6_udp_frame(remote, 53, local, 4040, b"hello");
 
@@ -2734,7 +2772,10 @@ mod tests {
         let expected_peer = Ipv4Address::new([192, 0, 2, 20]);
         let other_peer = Ipv4Address::new([192, 0, 2, 30]);
         let mut state = test_network_shard();
-        state.stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        state
+            .stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
         let socket = bind_udp(&mut state, FIRST_TEST_UDP_SLOT, 4040);
         state
             .connect_udp_socket(socket, IpAddress::Ipv4(expected_peer), 53)
@@ -2776,7 +2817,10 @@ mod tests {
         let first_peer = Ipv4Address::new([192, 0, 2, 20]);
         let second_peer = Ipv4Address::new([192, 0, 2, 30]);
         let mut state = test_network_shard();
-        state.stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        state
+            .stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
         let socket = bind_udp(&mut state, FIRST_TEST_UDP_SLOT, 4040);
         state
             .connect_udp_socket(socket, IpAddress::Ipv4(first_peer), 53)
@@ -2812,7 +2856,10 @@ mod tests {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
         let mut state = test_network_shard();
-        state.stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        state
+            .stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
         let socket = bind_udp(&mut state, FIRST_TEST_UDP_SLOT, 4040);
         state
             .connect_udp_socket(socket, IpAddress::Ipv4(peer), 53)
@@ -2839,7 +2886,10 @@ mod tests {
         let first_peer = Ipv4Address::new([192, 0, 2, 20]);
         let second_peer = Ipv4Address::new([192, 0, 2, 30]);
         let mut state = test_network_shard();
-        state.stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        state
+            .stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
         let first = bind_udp(&mut state, FIRST_TEST_UDP_SLOT, 4040);
         state
             .connect_udp_socket(first, IpAddress::Ipv4(first_peer), 53)
@@ -2899,7 +2949,10 @@ mod tests {
             .install_replica(
                 FIRST_TEST_UDP_SLOT,
                 |shard, slot| {
-                    shard.stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+                    shard
+                        .stack
+                        .add_ipv4_address(Ipv4Cidr::new(local, 24))
+                        .expect("test address should be accepted");
                     shard.install_udp_bind(slot, 49_153)
                 },
                 NetworkShard::remove_udp_replica,
@@ -3020,7 +3073,10 @@ mod tests {
 
         let stream = {
             let mut shard = state.shard_at(owner).lock();
-            shard.stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+            shard
+                .stack
+                .add_ipv4_address(Ipv4Cidr::new(local, 24))
+                .expect("test address should be accepted");
             let socket = shard
                 .stack
                 .open_tcp_connect(
@@ -3166,7 +3222,10 @@ mod tests {
 
         let socket = {
             let mut shard = state.shard_at(owner).lock();
-            shard.stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+            shard
+                .stack
+                .add_ipv4_address(Ipv4Cidr::new(local, 24))
+                .expect("test address should be accepted");
             shard.stack.learn_neighbor(NeighborEntry {
                 ip: IpAddress::Ipv4(peer),
                 mac: PEER_MAC,
@@ -3221,7 +3280,10 @@ mod tests {
 
         let stream = {
             let mut shard = state.shard_at(owner).lock();
-            shard.stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+            shard
+                .stack
+                .add_ipv4_address(Ipv4Cidr::new(local, 24))
+                .expect("test address should be accepted");
             shard.stack.learn_neighbor(NeighborEntry {
                 ip: IpAddress::Ipv4(peer),
                 mac: PEER_MAC,
@@ -3343,7 +3405,10 @@ mod tests {
 
         let stream = {
             let mut shard = state.shard_at(owner).lock();
-            shard.stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+            shard
+                .stack
+                .add_ipv4_address(Ipv4Cidr::new(local, 24))
+                .expect("test address should be accepted");
             let socket = shard
                 .stack
                 .open_tcp_connect(
@@ -3580,7 +3645,8 @@ mod tests {
             .shard_at(0)
             .lock()
             .stack
-            .add_ipv4_address(Ipv4Cidr::new(local, 24));
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
 
         // Both marks are sampled before the interrupt lands, the way
         // `run_packet_pump` and every operation take theirs before
@@ -4024,7 +4090,10 @@ mod tests {
             .install_replica(
                 FIRST_TEST_LISTENER_SLOT,
                 |shard, slot| {
-                    shard.stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+                    shard
+                        .stack
+                        .add_ipv4_address(Ipv4Cidr::new(local, 24))
+                        .expect("test address should be accepted");
                     shard.stack.learn_neighbor(NeighborEntry {
                         ip: IpAddress::Ipv4(peer),
                         mac: [0x02, 0, 0, 0, 0, 2],
@@ -4204,7 +4273,10 @@ mod tests {
             .install_replica(
                 FIRST_TEST_UDP_SLOT,
                 |shard, slot| {
-                    shard.stack.add_ipv6_address(Ipv6Cidr::new(local, 64));
+                    shard
+                        .stack
+                        .add_ipv6_address(Ipv6Cidr::new(local, 64))
+                        .expect("test address should be accepted");
                     shard.stack.learn_neighbor(NeighborEntry {
                         ip: IpAddress::Ipv6(peer),
                         mac: [0x02, 0, 0, 0, 0, 2],
@@ -4274,7 +4346,10 @@ mod tests {
         let peer = Ipv4Address::new([192, 0, 2, 20]);
         let group = Ipv4Address::new([224, 0, 0, 251]);
         let mut state = test_network_shard();
-        state.stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        state
+            .stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
         let socket = bind_udp(&mut state, FIRST_TEST_UDP_SLOT, 4040);
         let (first, first_len) = ipv4_udp_frame(peer, 5353, group, 4040, b"first");
         let (second, second_len) = ipv4_udp_frame(peer, 5353, group, 4040, b"second");
@@ -4337,7 +4412,10 @@ mod tests {
         let group = Ipv4Address::new([224, 0, 0, 251]);
         let unicast = Ipv4Address::new([192, 0, 2, 20]);
         let mut state = test_network_shard();
-        state.stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        state
+            .stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
 
         let error = state
             .join_multicast_v4(map_ipv4_address(group), map_ipv4_address(other))
@@ -4369,7 +4447,10 @@ mod tests {
         let local = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         let remote = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
         let mut state = test_network_shard();
-        state.stack.add_ipv6_address(Ipv6Cidr::new(local, 64));
+        state
+            .stack
+            .add_ipv6_address(Ipv6Cidr::new(local, 64))
+            .expect("test address should be accepted");
         state.stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv6(remote),
             mac: [0x02, 0, 0, 0, 0, 2],
@@ -4635,7 +4716,10 @@ mod tests {
 
         let stream = {
             let mut shard = state.shard_at(owner).lock();
-            shard.stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+            shard
+                .stack
+                .add_ipv4_address(Ipv4Cidr::new(local, 24))
+                .expect("test address should be accepted");
             // Published, not merely installed: every poll pushes the
             // control plane's configuration back into the shards, so an
             // address only one shard knows about does not survive one.
