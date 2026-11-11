@@ -27,6 +27,7 @@
 use helios_hal::display::DisplayMode;
 
 use crate::device::DeviceWindow;
+use crate::process::DisplayClaimCap;
 
 use super::DisplayServiceError;
 use super::service::{DisplayClaim, DisplayService};
@@ -77,11 +78,12 @@ impl DisplayOwnership {
         &mut self,
         service: &DisplayService,
         window: DeviceWindow,
+        cap: DisplayClaimCap,
     ) -> Result<(), DisplayServiceError> {
         if self.claim.is_some() {
             return Err(DisplayServiceError::AlreadyClaimed);
         }
-        let claim = service.claim()?;
+        let claim = service.claim(cap)?;
         self.pins = Some(DisplayPins::new(window));
         self.claim = Some(claim);
         Ok(())

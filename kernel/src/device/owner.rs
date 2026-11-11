@@ -19,6 +19,7 @@ use helios_hal::vmm::VirtAddr;
 use crate::audio::{AudioOwnership, AudioService, AudioServiceError};
 use crate::display::{DisplayOwnership, DisplayService, DisplayServiceError};
 use crate::gpu::{Gpu3dOwnership, Gpu3dService, Gpu3dServiceError};
+use crate::process::{AudioClaimCap, DeviceGrantClaimCap, DisplayClaimCap, GpuClaimCap};
 use crate::surface::{SurfaceOwnership, SurfaceServiceError};
 
 use super::grant::{DeviceName, GrantError};
@@ -236,14 +237,18 @@ impl DeviceOwnership {
     /// window its command buffers and its mapped blobs would go in, for
     /// the same reason a display claim is: they would land on memory it
     /// is using.
-    pub fn claim_gpu(&mut self, service: &Gpu3dService) -> Result<(), Gpu3dServiceError> {
+    pub fn claim_gpu(
+        &mut self,
+        service: &Gpu3dService,
+        cap: GpuClaimCap,
+    ) -> Result<(), Gpu3dServiceError> {
         let window = self
             .gpu_window()
             .ok_or(Gpu3dServiceError::WindowExhausted)?;
         if self.high_water_bytes > window.offset() {
             return Err(Gpu3dServiceError::WindowExhausted);
         }
-        self.gpu.claim(service, window)
+        self.gpu.claim(service, window, cap)
     }
 
     /// This instance's side of the surface path.
@@ -302,6 +307,7 @@ impl DeviceOwnership {
         &mut self,
         service: &AudioService,
         id: u32,
+        cap: AudioClaimCap,
     ) -> Result<(), AudioServiceError> {
         let window = self
             .audio_window()
@@ -309,7 +315,7 @@ impl DeviceOwnership {
         if self.high_water_bytes > window.offset() {
             return Err(AudioServiceError::WindowExhausted);
         }
-        self.audio.claim(service, id, window)
+        self.audio.claim(service, id, window, cap)
     }
 
     /// This instance's side of the display path.
@@ -327,14 +333,18 @@ impl DeviceOwnership {
     /// Refused when the instance's memory has already grown over the
     /// window its frame buffers would be pinned in, for the same reason
     /// a device claim is: the pages would land on memory it is using.
-    pub fn claim_display(&mut self, service: &DisplayService) -> Result<(), DisplayServiceError> {
+    pub fn claim_display(
+        &mut self,
+        service: &DisplayService,
+        cap: DisplayClaimCap,
+    ) -> Result<(), DisplayServiceError> {
         let window = self
             .display_window()
             .ok_or(DisplayServiceError::WindowExhausted)?;
         if self.high_water_bytes > window.offset() {
             return Err(DisplayServiceError::WindowExhausted);
         }
-        self.display.claim(service, window)
+        self.display.claim(service, window, cap)
     }
 
     /// Whether this instance holds a device.
@@ -342,13 +352,17 @@ impl DeviceOwnership {
         self.lease.is_some()
     }
 
-    /// Take exclusive ownership of the device `name` names.
+    /// Take exclusive ownership of the device `cap` names.
     ///
     /// Refused when this instance already holds one — a driver drives
     /// one device, and a second claim would make reclaim ambiguous —
     /// and when the instance's memory has already grown over the window
     /// the device would be mapped into.
-    pub fn claim(&mut self, registry: &DeviceGrantRegistry, name: &str) -> Result<(), GrantError> {
+    pub fn claim(
+        &mut self,
+        registry: &DeviceGrantRegistry,
+        cap: DeviceGrantClaimCap,
+    ) -> Result<(), GrantError> {
         if self.lease.is_some() {
             return Err(GrantError::AlreadyClaimed);
         }
@@ -356,7 +370,7 @@ impl DeviceOwnership {
         if self.high_water_bytes > window.offset() {
             return Err(GrantError::WindowExhausted);
         }
-        self.lease = Some(registry.claim(name, window)?);
+        self.lease = Some(registry.claim(cap, window)?);
         Ok(())
     }
 

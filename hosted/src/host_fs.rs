@@ -7,7 +7,8 @@ use std::path::{Component, Path, PathBuf};
 
 use helios_hal::io::IoError;
 use helios_kernel::{
-    AuthorityDomain, HostDirEntry, HostFileSystem, HostFsError, HostMetadata, ObjectIdentity,
+    AuthorityDomain, HostDirEntry, HostDirLimit, HostFileSystem, HostFsError, HostMetadata,
+    ObjectIdentity,
 };
 
 /// Host-OS backed filesystem for the hosted backend.
@@ -101,9 +102,10 @@ impl HostFileSystem for HostedFileSystem {
     fn read_dir(
         &self,
         path: &str,
+        limit: HostDirLimit,
     ) -> impl core::future::Future<Output = Result<Vec<HostDirEntry>, HostFsError>> + Send + '_
     {
-        blocking_path(self.resolve(path), |path| read_dir_impl(&path))
+        blocking_path(self.resolve(path), move |path| read_dir_impl(&path, limit))
     }
 
     fn read_file(
@@ -287,9 +289,10 @@ fn unix_timestamp_nanos(seconds: i64, subnanoseconds: i64) -> u64 {
         .saturating_add(u64::try_from(subnanoseconds).unwrap_or(0))
 }
 
-fn read_dir_impl(path: &Path) -> Result<Vec<HostDirEntry>, HostFsError> {
+fn read_dir_impl(path: &Path, limit: HostDirLimit) -> Result<Vec<HostDirEntry>, HostFsError> {
     let entries = fs::read_dir(path).map_err(map_io_error)?;
     let mut result = Vec::new();
+    let mut name_bytes = 0_usize;
     for entry in entries {
         let entry = entry.map_err(map_io_error)?;
         let name = entry
@@ -297,6 +300,8 @@ fn read_dir_impl(path: &Path) -> Result<Vec<HostDirEntry>, HostFsError> {
             .into_string()
             .unwrap_or_else(|os| os.to_string_lossy().into_owned());
         let is_directory = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+        name_bytes = name_bytes.saturating_add(name.len());
+        limit.check(result.len() + 1, name_bytes)?;
         result.push(HostDirEntry { name, is_directory });
     }
     Ok(result)
