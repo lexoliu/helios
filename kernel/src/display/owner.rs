@@ -395,10 +395,7 @@ async fn create_surface<Device: DisplayDevice>(
     if held.surfaces.is_full() {
         return Err(DisplayServiceError::TooManySurfaces);
     }
-    let framebuffer = device
-        .create_framebuffer(mode, format, &[backing.frames()])
-        .await
-        .map_err(DisplayServiceError::from)?;
+    let (framebuffer, backing) = create_framebuffer(device, mode, format, backing).await?;
     if let Err(error) = device
         .set_scanout(scanout, framebuffer, Rect::of(mode))
         .await
@@ -430,14 +427,13 @@ async fn create_cursor<Device: DisplayDevice>(
     if held.surfaces.is_full() {
         return Err(DisplayServiceError::TooManySurfaces);
     }
-    let framebuffer = device
-        .create_framebuffer(
-            helios_hal::display::CursorImage::MODE,
-            format,
-            &[backing.frames()],
-        )
-        .await
-        .map_err(DisplayServiceError::from)?;
+    let (framebuffer, backing) = create_framebuffer(
+        device,
+        helios_hal::display::CursorImage::MODE,
+        format,
+        backing,
+    )
+    .await?;
     held.surfaces.push(SurfaceRecord {
         framebuffer,
         backing,
@@ -445,6 +441,41 @@ async fn create_cursor<Device: DisplayDevice>(
         sequence: 0,
     });
     Ok(framebuffer)
+}
+
+/// Create a frame buffer over `backing`, and let the run go on a failure
+/// only if the display engine answered.
+///
+/// A refusal the engine answered leaves it holding nothing, so the run
+/// goes back with the error. A transport error is not an answer: the
+/// request that names the run may still be with the device, which may
+/// read those pages at any later time, so the run never goes back to the
+/// pool, for the reason [`release_framebuffer`] keeps one the engine
+/// would not destroy.
+async fn create_framebuffer<Device: DisplayDevice>(
+    device: &Device,
+    mode: helios_hal::display::DisplayMode,
+    format: helios_hal::display::PixelFormat,
+    backing: Buffer,
+) -> Result<(FramebufferId, Buffer), DisplayServiceError> {
+    match device
+        .create_framebuffer(mode, format, &[backing.frames()])
+        .await
+    {
+        Ok(framebuffer) => Ok((framebuffer, backing)),
+        Err(error) => {
+            if let DisplayError::Transport(_) = &error {
+                tracing::error!(
+                    %error,
+                    bytes = backing.bytes(),
+                    "the display engine did not answer a frame buffer create; its run is kept \
+                     out of the pool for good, because the engine may still be reading it"
+                );
+                backing.leak();
+            }
+            Err(DisplayServiceError::from(error))
+        }
+    }
 }
 
 async fn destroy_surface<Device: DisplayDevice>(
