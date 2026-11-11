@@ -91,6 +91,8 @@ pub(crate) mod errno {
     pub(crate) const IO: i32 = 29;
     pub(crate) const ISDIR: i32 = 31;
     pub(crate) const LOOP: i32 = 32;
+    /// `__WASI_ERRNO_NAMETOOLONG`: filename too long.
+    pub(crate) const NAMETOOLONG: i32 = 37;
     pub(crate) const NETDOWN: i32 = 38;
     pub(crate) const HOSTUNREACH: i32 = 23;
     pub(crate) const NOMEM: i32 = 48;
