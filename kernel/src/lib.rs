@@ -1130,6 +1130,7 @@ where
         timer_frequency_hz,
         dma_model,
         devices,
+        measured_boot: None,
     } = platform;
     let current_processor = current_processor();
     assert!(

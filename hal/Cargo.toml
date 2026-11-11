@@ -10,6 +10,7 @@ fdt = { version = "0.1.5", default-features = false }
 strength_reduce = "0.2.4"
 thiserror = { version = "2.0.20", default-features = false }
 triomphe = { version = "0.1.16", default-features = false }
+zeroize = { version = "1.9.1", default-features = false }
 
 [lints]
 workspace = true

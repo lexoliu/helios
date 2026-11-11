@@ -18,7 +18,7 @@ never depends on anything above it.
 | Layer | Crates | Contents |
 | --- | --- | --- |
 | Hardware contracts | `hal/` | Traits, capability types and value types only. `#![no_std]`. |
-| Device and protocol libraries | `netstack/`, `virtio/`, `i6300esb/` | `#![no_std]` protocol engines and drivers. `virtio/` builds on `netstack/`; all three depend on `hal/` and none on the kernel. |
+| Device and protocol libraries | `netstack/`, `virtio/`, `i6300esb/`, `tpm/` | `#![no_std]` protocol engines and drivers. `virtio/` builds on `netstack/`; `tpm/` drives a TPM 2.0 over the FIFO and CRB interfaces for measured boot and sealing only; all four depend on `hal/` and none on the kernel. |
 | Shared ABIs | `compiler-abi/`, `artifact/` | `#![no_std]` wire formats shared by the kernel and host tools: the compiler plugin's request and response headers, `cwasm` target flags, the signature trailer, and the `helios-bootfs` payload image the kernel reads at bring-up. |
 | Kernel | `kernel/` | Every piece of hardware-independent runtime logic: executor, timer, memory and OOM, instance registry, component host, Wasmtime adapter, network service, host-fs client, every WIT service. `#![no_std]`, generic over `Cpu`. The user payload is not linked into the kernel: it arrives as a boot module (`docs/boot.md`). |
 | Backends | `aarch64/`, `riscv/`, `x86/`, `hosted/` | Boot, trap, IRQ, timer, MMIO, UART, virtio transport and SMP wiring, and nothing else. `hosted/` runs the same kernel on the host OS under the same restriction. |

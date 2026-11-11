@@ -110,6 +110,10 @@ test-units:
     export HELIOS_KERNEL_ROOT_SECRET_KEY="${out_dir}/helios-root-secret.key"
     cargo nextest run -p helios-hal -p helios-virtio -p helios-netstack -p helios-artifact -p helios-kernel --lib
     cargo nextest run -p helios-workspace-root --lib
+    # The TPM driver: both interfaces against register models that
+    # enforce their state machines, and the sealing scenario replayed
+    # from its committed swtpm recording.
+    cargo nextest run -p helios-tpm
     # What the desktop draws with — damage tracking, focus routing, the
     # terminal grid — is a plain library (`programs/compositor/render`)
     # and is tested here rather than only inside a boot, alongside the
