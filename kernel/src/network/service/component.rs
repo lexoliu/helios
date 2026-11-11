@@ -18,6 +18,35 @@ pub(super) enum DhcpClientState {
     Bound,
 }
 
+impl DhcpClientState {
+    /// Whether `message` is a reply to the request this client has
+    /// outstanding.
+    ///
+    /// RFC 2131 §4.3.2 and §4.4.1 (table 4) make DHCPACK and DHCPNAK
+    /// meaningful only in REQUESTING, RENEWING, REBINDING and REBOOTING,
+    /// and require a client to discard a message whose `xid` is not its
+    /// own; §3.1 has the selected server alone answer the REQUEST, and a
+    /// server's NAK carries its server identifier (§4.3.2, table 3).
+    /// This client has no RENEWING, REBINDING or REBOOTING state (a
+    /// lease is never renewed), so `Requesting` is the only state that
+    /// accepts a reply; `Bound` never does. REBINDING would be the one
+    /// state where a server other than the selected one may answer
+    /// (§4.4.4), and would need its own arm here.
+    pub(super) fn accepts_reply(&self, message: &DhcpServerMessage) -> bool {
+        match *self {
+            Self::Requesting {
+                transaction_id,
+                server_identifier,
+                ..
+            } => {
+                message.transaction_id == transaction_id
+                    && message.server_identifier == Some(server_identifier)
+            }
+            Self::Init { .. } | Self::Selecting { .. } | Self::Bound => false,
+        }
+    }
+}
+
 impl<CpuImpl, DeviceImpl> NetworkService<CpuImpl, DeviceImpl>
 where
     CpuImpl: Cpu + Clone,
@@ -812,8 +841,8 @@ impl NetworkShard {
                         last_sent: now,
                     };
                 }
-                (DhcpClientState::Requesting { transaction_id, .. }, DhcpMessageType::Ack)
-                    if message.transaction_id == transaction_id =>
+                (DhcpClientState::Requesting { .. }, DhcpMessageType::Ack)
+                    if self.dhcp.accepts_reply(&message) =>
                 {
                     let prefix_len = message
                         .subnet_mask
@@ -829,13 +858,22 @@ impl NetworkShard {
                     self.dns_servers.extend(message.dns_servers);
                     self.dhcp = DhcpClientState::Bound;
                 }
-                (_, DhcpMessageType::Nak) => {
+                (DhcpClientState::Requesting { .. }, DhcpMessageType::Nak)
+                    if self.dhcp.accepts_reply(&message) =>
+                {
                     self.stack.clear_ipv4_addresses();
                     self.dhcp = DhcpClientState::Init {
                         transaction_id: next_transaction_id(message.transaction_id),
                     };
                 }
-                _ => {}
+                (state, message_type) => {
+                    tracing::debug!(
+                        ?state,
+                        ?message_type,
+                        transaction_id = message.transaction_id,
+                        "dropped DHCP message that is not a reply to the outstanding exchange"
+                    );
+                }
             }
         }
 

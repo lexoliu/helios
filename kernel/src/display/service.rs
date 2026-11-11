@@ -45,6 +45,7 @@ use concurrent_queue::ConcurrentQueue;
 
 use crate::component::{ProviderError, ProviderSender};
 use crate::exec::{Notify, NotifyWaiter};
+use crate::process::DisplayClaimCap;
 
 use super::DisplayPins;
 use super::DisplayServiceError;
@@ -312,7 +313,10 @@ impl DisplayService {
     /// still being handed back: the display is not free until the
     /// display engine says it is, and answering otherwise would hand out
     /// a screen with somebody else's pixels still on it.
-    pub fn claim(&self) -> Result<DisplayClaim, DisplayServiceError> {
+    ///
+    /// `_cap` is the proof that the caller's authority names the display
+    /// class; the check happened where the cap was derived.
+    pub fn claim(&self, _cap: DisplayClaimCap) -> Result<DisplayClaim, DisplayServiceError> {
         self.shared
             .claim
             .compare_exchange(

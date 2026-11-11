@@ -1684,6 +1684,7 @@ name = "helios-artifact"
 version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
+ "helios-hal",
  "postcard",
  "serde",
  "serde-big-array",
@@ -1736,6 +1737,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
  "thiserror 2.0.20",
  "toml",
  "walkdir",

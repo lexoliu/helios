@@ -36,7 +36,7 @@ from helios_bench.manifest import (
     host_deviations,
     host_memory_bytes,
     qemu_version,
-    vendored_wasmtime_revision,
+    vendored_wasmtime_pin,
     wasmtime_linux_release,
 )
 from helios_bench.report import (
@@ -686,10 +686,11 @@ def bootfs_cwasm_digests(lane: Lane, kernel_build: str) -> dict[str, str]:
     return {path.name: sha256_of(path) for path in sorted(prebuild.glob("*.cwasm"))}
 
 
-def collect_pins(lane: Lane, workloads: list[dict], kernel_build: str) -> Pins:
+def collect_pins(lane: Lane, workloads: list[dict], kernel_build: str, baseline: Baseline | None) -> Pins:
     image_url, image_sha256 = fedora_image(lane.guest_arch)
     return Pins(
-        wasmtime_revision=vendored_wasmtime_revision(),
+        wasmtime_revision=vendored_wasmtime_pin().revision,
+        baseline_wasmtime_revision=baseline.wasmtime.revision if baseline is not None else None,
         wasmtime_linux_release=wasmtime_linux_release(lane.guest_arch),
         fedora_image_url=image_url,
         fedora_image_sha256=image_sha256,
@@ -1254,7 +1255,7 @@ def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) ->
             control=control,
             run=run,
             hardware=collect_hardware(lane),
-            pins=collect_pins(lane, workloads, options.kernel_build),
+            pins=collect_pins(lane, workloads, options.kernel_build, options.baseline),
             thresholds=thresholds,
             first_pass=reconfirmation.first_pass,
         )

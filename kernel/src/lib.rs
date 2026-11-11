@@ -20,6 +20,7 @@ mod instance;
 mod io;
 mod kernel_exception;
 mod log;
+mod machine;
 mod memory;
 mod network;
 mod pins;
@@ -149,6 +150,7 @@ pub use kernel_exception::{
     KernelException, KernelExceptionCause, KernelExceptionDispatch, KernelNativeTrapHandler,
     dispatch_native_trap, install_native_trap_handler,
 };
+pub use machine::{AdvanceCause, Generation, MachineGeneration, MachineGenerationHandle};
 pub use memory::{
     AccessibilityPlan, BalloonHandle, BalloonStats, BootMemoryPlan, BootRegionSplitter,
     CommittedRegion, ENTROPY_RESEED_INTERVAL, EntropyPool, EntropySources, FIBER_STACK_GUARD_BYTES,
@@ -184,16 +186,18 @@ pub use network::{
 };
 pub use pins::{BYTES_PER_PIXEL, PinError, PinnedArena, PinnedRun};
 pub use process::{
-    ClockAuthorityRights, DescriptorEntry, DescriptorId, DescriptorTable, DescriptorTableError,
-    DirectoryAuthorityRights, DirectoryCap, DirectoryPreopen, DnsCap, ExecAuthority, ForkAuthority,
-    FutexKey, FutexTable, FutexWaitRegistration, GuestAddress, JoinAuthority, LinkAuthorityRights,
-    LinkSourceCap, LinkTargetDirectoryCap, MulticastCap, NetworkAdminCap, NetworkAuthorityRights,
-    NetworkCap, PrivilegedBindCap, ProcessAuthority, ProcessAuthorityError, ProcessAuthorityRights,
-    ProcessId, ProcessMemoryIdentity, ProcessRecord, ProcessState, ProcessTable, ProcessTableError,
-    ProgramExecError, ProgramExecErrorDetail, ProgramExecErrorKind, ProgramOutOfMemory,
-    RuntimeMessage, SetWallClockCap, SignalAuthority, SpawnAuthority, SymlinkCreateCap,
-    SymlinkReadCap, TcpCap, TerminalAuthorityRights, TerminalInputCap, TerminalOutputCap, ThreadId,
-    ThreadRecord, ThreadState, ThreadTable, ThreadTableError, TtyControlCap, UdpCap,
+    AudioClaimCap, ClockAuthorityRights, DescriptorEntry, DescriptorId, DescriptorTable,
+    DescriptorTableError, DeviceClassRights, DeviceGrantClaimCap, DirectoryAuthorityRights,
+    DirectoryCap, DirectoryPreopen, DisplayClaimCap, DnsCap, ExecAuthority, ForkAuthority,
+    FutexKey, FutexTable, FutexWaitRegistration, GpuClaimCap, GuestAddress, InputClaimCap,
+    JoinAuthority, LinkAuthorityRights, LinkSourceCap, LinkTargetDirectoryCap, MulticastCap,
+    NetworkAdminCap, NetworkAuthorityRights, NetworkCap, PrivilegedBindCap, ProcessAuthority,
+    ProcessAuthorityError, ProcessAuthorityRights, ProcessId, ProcessMemoryIdentity, ProcessRecord,
+    ProcessState, ProcessTable, ProcessTableError, ProgramExecError, ProgramExecErrorDetail,
+    ProgramExecErrorKind, ProgramOutOfMemory, RuntimeMessage, SetWallClockCap, SignalAuthority,
+    SpawnAuthority, SymlinkCreateCap, SymlinkReadCap, TcpCap, TerminalAuthorityRights,
+    TerminalInputCap, TerminalOutputCap, ThreadId, ThreadRecord, ThreadState, ThreadTable,
+    ThreadTableError, TtyControlCap, UdpCap,
 };
 pub use profiling::{
     CodeAttribution, InstructionProfile, InstructionProfileError, InstructionSampler,
