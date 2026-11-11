@@ -446,8 +446,10 @@ just test-units
 against `deny.toml`, and `cargo clippy … -D warnings` over the host crates, each
 guest program, and the three bare-metal targets.
 `just test-units` runs the `hal`, `virtio`, `netstack`, `kernel`,
-`inspector-protocol` and `workspace-root` unit tests, every `hosted` test,
-and the `hal_layering` test (`kernel/tests/`) that enforces §1. The recipe names each integration
+`inspector-protocol` and `workspace-root` unit tests, every `btrfs` and
+`hosted` test, and the `hal_layering` test (`kernel/tests/`) that enforces §1.
+`just test-btrfs-mkfs` mounts the images `mkfs.btrfs` builds; the
+`test-units` lane installs btrfs-progs and runs it. The recipe names each integration
 test with `--test <name>`, so a new enforcement test is added to the recipe
 in the same change or it never runs.
 Both recipes run through `cargo nextest run` under `.config/nextest.toml`:
@@ -461,7 +463,7 @@ red lane names the surface that broke:
 | --- | --- | --- |
 | `check-host`, `check-aarch64`, `check-riscv`, `check-x86` | `ubuntu-24.04` | Every surface compiles. |
 | `lint-fmt`, `lint-host`, `lint-aarch64`, `lint-riscv`, `lint-x86` | `ubuntu-24.04` | Formatting, the `deny.toml` bans, and clippy at `-D warnings`. |
-| `test-units`, `test-embedded-debugger` | `ubuntu-24.04` | Unit tests and the embedded debugger. |
+| `test-units`, `test-embedded-debugger` | `ubuntu-24.04` | Unit tests, the btrfs reader against `mkfs.btrfs` images, and the embedded debugger. |
 | `smoke-x86-64` | `ubuntu-24.04`, `--accel kvm` | Boot, shell, CPython, the in-kernel compiler, a trapped OOB load, curl over virtio-net, the raw serial captures. |
 | `smoke-riscv64` | `ubuntu-24.04`, `--accel tcg` | Boot, shell, CPython, a trapped OOB load, the inspector RPC over vsock, curl over virtio-net. |
 | `smoke-aarch64` | `ubuntu-24.04-arm`, `--accel tcg` | Boot from the device tree and from ACPI, against a pinned upstream QEMU the lane builds and caches, because Ubuntu 24.04's QEMU asserts in its emulated GICv3 under multi-threaded TCG. |

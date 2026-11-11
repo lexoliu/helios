@@ -116,12 +116,21 @@ test-units:
     # capture check that links it.
     cargo nextest run -p helios-compositor-render -p helios-desktop-text-check
     cargo nextest run -p helios-inspector-protocol --lib
+    # The btrfs reader mounts images two pure-Rust writers build, intact
+    # and damaged. Images from `mkfs.btrfs` need btrfs-progs and run in
+    # `test-btrfs-mkfs`.
+    cargo nextest run -p helios-btrfs
     cargo nextest run -p helios-kernel --test hal_layering
     # The hosted backend boots the same kernel on the host OS; its tests
     # cover the memory-policy density checks and the OOM killer, and
     # `embedded_debugger_is_provisioned` reads the prebuild payload above.
     HELIOS_BOOTFS="${out_dir}/helios-bootfs" cargo nextest run -p helios-hosted
     python3 "{{repo_root}}/x86/tests/interrupt_state.py"
+
+# Mount the images `mkfs.btrfs --rootdir` builds, one per checksum type and
+# node size. Needs btrfs-progs on PATH; CI's test-units lane installs it.
+test-btrfs-mkfs:
+    cargo nextest run -p helios-btrfs --run-ignored ignored-only
 
 # Generate the kernel-prebuild manifest for `target` and run `cargo clippy`
 # against it, denying warnings.
