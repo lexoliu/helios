@@ -499,6 +499,56 @@ fn a_request_that_outlived_its_claim_is_not_served() {
     );
 }
 
+/// A request sitting in the inbox when its claim is let go is dropped
+/// rather than served, however long the display then sits unclaimed: the
+/// generation advances on release, not only on the next claim.
+#[test]
+fn a_request_queued_before_release_is_dropped() {
+    test_hooks::install();
+    let (shared, control, _cursor) = display_channels();
+    let device = FakeDisplay::new();
+    let mut ownership = claimed(&shared);
+    let claim = ownership.claim_ref().expect("the claim is held");
+    let (generation, sender) = (claim.generation(), claim.sender());
+    let runs = test_hooks::live_runs();
+
+    // The request lands in the inbox before the server runs and before
+    // the claim is let go; the reply stays open, so only the generation
+    // can refuse it.
+    let (reply, _answer) = oneshot::channel();
+    block_on(sender.control_oneway(ControlRequest::CreateSurface {
+        generation,
+        scanout: ScanoutId::new(0),
+        mode: SMALL,
+        format: PixelFormat::Bgrx8888,
+        backing: small_frame(),
+        reply,
+    }))
+    .expect("the inbox has room");
+    ownership.release();
+
+    // No second claim: nothing moves the generation but the release.
+    with_server(&device, &shared, &control, async {
+        for _ in 0..3 {
+            crate::yield_now().await;
+        }
+    });
+
+    assert!(
+        !device
+            .calls()
+            .iter()
+            .any(|call| matches!(call, Call::Create(_, _) | Call::SetScanout(_, _))),
+        "nothing was created or scanned out for a claim that had ended: {:?}",
+        device.calls()
+    );
+    assert_eq!(
+        test_hooks::live_runs(),
+        runs,
+        "the dropped request's frame goes back"
+    );
+}
+
 /// A `create` its compositor stopped waiting for closes its end of the
 /// reply as it goes. One that went before its request was served is
 /// owed nothing and gets nothing made; one that went while the engine
