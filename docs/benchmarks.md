@@ -675,16 +675,30 @@ uv run helios-bench run --lane x86-64-kvm --out-dir … --baseline-ref
 
 Given a ref, `--baseline-ref` resolves it; given none, it means the merge
 base with `dev`, the commit the branch is a change to. The suite checks
-that commit out as a git worktree beside the candidate checkout,
-`<candidate dir>-baseline-<sha12>`, and times its guest against the
-candidate's. The checkout is the candidate's sibling so that the kernel's
-`../wasmtime/crates/wasmtime` path dependency resolves to the same
-absolute directory for both images: cargo hashes a path dependency
-outside the workspace by its absolute path, and a baseline that reached
-the vendored checkout through a link of its own compiled every Wasmtime
-crate under another crate hash, so the kernel profile matched none of
-the symbols named through Wasmtime and the pair timed a profile-guided
-candidate against an unprofiled baseline (#359). The baseline's warm
+that commit out as a git worktree, `<candidate dir>-baseline-<sha12>`,
+and times its guest against the candidate's.
+
+Each image builds against the Wasmtime fork its own commit pins in
+`.github/actions/checkout-wasmtime/action.yml`: a pairing across a pin
+bump compares the old fork with the new one, and a baseline built
+against the candidate's fork either hides what the bump changed or does
+not link (run 38968194856, #486). Where the fork lives is constrained by
+the kernel profile: the kernel reaches it through the
+`../wasmtime/crates/wasmtime` path dependency, and cargo hashes a path
+dependency outside the workspace by its absolute path, into the crate
+hash of every crate that depends on it. A baseline that reached its
+fork through a link of its own compiled every crate under another hash,
+so the kernel profile matched none of its symbols and the pair timed a
+profile-guided candidate against an unprofiled baseline (#359). So a
+baseline that pins the candidate's revision is the candidate's sibling
+and shares its `../wasmtime`; one that pins another revision is laid
+out in `wasmtime-fork-<revision12>/` beside the candidate, its checkout
+beside that revision's `wasmtime/`, which the workflow checks out and
+the suite refuses to build without. `helios-bench baseline-fork --sha`
+prints that layout, and `kernel-profile.yml` collects the baseline's
+profiles under the same `root`, so build and profile name one fork
+path. The report names each column's fork: `wasmtime_revision` and
+`baseline_wasmtime_revision` under `pins`. The baseline's warm
 build directory is `target/perf-baselines/worktrees/<sha>/target` under
 the candidate's `target/`, where the runner cache restores it; the
 checkout reaches it through its `target/` link.
@@ -725,8 +739,8 @@ boot.
 | Host | CPU, load, thermal state, QEMU release, accelerator, vCPUs, memory, network backend and its host servers | — |
 | Harness | `workload-bench.sh`, the workload manifest, the run's iteration count and budgets | — |
 | Tooling | — | `helios-inspector` and `helios-cli`, built from each side's own commit under its own `target/release` |
-| Guest inputs | everything `tools/wasi-apps/build.sh` stages under `artifacts/`, linked into the baseline worktree entry by entry; the vendored Wasmtime checkout, `../wasmtime` of both checkouts at the one absolute path (#359) | — |
-| Guest | — | the kernel image, the bootfs it carries, the compiler plugin, the guest programs the prebuild signs |
+| Guest inputs | everything `tools/wasi-apps/build.sh` stages under `artifacts/`, linked into the baseline worktree entry by entry | — |
+| Guest | — | the kernel image, the bootfs it carries, the compiler plugin, the guest programs the prebuild signs, and the Wasmtime fork its commit pins, at one absolute path per revision (#359, #486) |
 
 Two checkouts that turn out to be one build are refused before the first
 boot: the suite asks the inspector for each image's guest artifact
@@ -751,13 +765,11 @@ QEMU release, the accelerator, the vCPUs and the memory; the network
 backend and the host HTTP, TCP and echo servers on it; the workload
 manifest, read from the candidate checkout for both; everything under
 `artifacts/` that `tools/wasi-apps/build.sh` stages, linked into the
-baseline worktree entry by entry rather than copied; and the vendored
-Wasmtime checkout, which both checkouts reach as `../wasmtime` at the
-one absolute path, so both kernels compile against one revision under
-the same cargo crate hashes (#359). What differs is the kernel image, the
-bootfs it carries (the compiler plugin included) and the
-`helios-inspector`/`helios-cli` that build and boot it — each side's own,
-compiled from the side's own commit.
+baseline worktree entry by entry rather than copied. What differs is the
+kernel image, the bootfs it carries (the compiler plugin included), the
+`helios-inspector`/`helios-cli` that build and boot it and the Wasmtime
+fork they compile against — each side's own, from the side's own
+commit.
 
 The report carries the second column as the `helios_baseline` side, and
 its run record carries both commits (`helios_git_sha` for the candidate,

@@ -2906,6 +2906,9 @@ mod tests {
         parent.grant_terminal_rights(crate::TerminalAuthorityRights::OUTPUT);
         parent.grant_process_rights(crate::ProcessAuthorityRights::SPAWN);
         parent.grant_link_rights(crate::LinkAuthorityRights::SYMLINK_READ);
+        parent.grant_device_classes(
+            crate::DeviceClassRights::DISPLAY | crate::DeviceClassRights::AUDIO,
+        );
 
         let child = wasix_proc_spawn_inherited_non_directory_authority(&parent);
 
@@ -2924,6 +2927,27 @@ mod tests {
             child.link_rights(),
             crate::LinkAuthorityRights::SYMLINK_READ
         );
+        assert_eq!(
+            child.device_class_rights(),
+            crate::DeviceClassRights::DISPLAY | crate::DeviceClassRights::AUDIO
+        );
+        assert!(parent.contains_authority(&child));
+    }
+
+    #[test]
+    fn proc_spawn_inherits_device_classes_but_not_named_devices() {
+        let mut parent = ProcessAuthority::empty();
+        parent.grant_device_classes(crate::DeviceClassRights::all());
+        parent
+            .grant_device(
+                crate::DeviceName::new("pci:0000:00:04.0").expect("the test name is short"),
+            )
+            .expect("one named device fits");
+
+        let child = wasix_proc_spawn_inherited_non_directory_authority(&parent);
+
+        assert_eq!(child.device_class_rights(), crate::DeviceClassRights::all());
+        assert!(child.granted_devices().is_empty());
         assert!(parent.contains_authority(&child));
     }
 
