@@ -56,7 +56,7 @@ use crate::wasmtime_adapter::{WasmtimeCompiledComponent, WasmtimeCompiledCoreMod
 use crate::wasmtime_adapter::{
     WasmtimePrecompiledKind,
     wasi::{
-        self as wasi_fs, FileWriteMode, FsDescriptor, FsNodeKind, WasiImportSet,
+        self as wasi_fs, FsDescriptor, FsNodeKind, WasiImportSet,
         bindings::filesystem::types as fs_types, preview1 as p1,
     },
 };
@@ -78,6 +78,7 @@ use helios_compiler_abi::{
     HELIOS_COMPILER_ABI_VERSION, HELIOS_COMPILER_ALLOC, HELIOS_COMPILER_COMPILE,
     HELIOS_COMPILER_INITIALIZE, HELIOS_COMPILER_PTHREAD_SELF_OFFSET,
 };
+use helios_hal::fs::WritePosition;
 use helios_hal::watchdog::Watchdog;
 use smallvec::SmallVec;
 use thiserror::Error;

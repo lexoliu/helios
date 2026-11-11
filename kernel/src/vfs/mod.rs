@@ -52,14 +52,17 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::cmp::Ordering;
+use core::future::Future;
+use core::pin::Pin;
 use core::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
+use core::task::{Context, Poll};
 
 use bytes::{Bytes, BytesMut};
 use crossbeam_utils::CachePadded;
 use helios_hal::cpu::current_processor;
 use helios_hal::fs::{
     DeviceId, DirCookie, DirEntry, FileSystem, FileSystemRights, FsError, FsPath, FsResult,
-    Metadata, NodeKind, OpenFlags,
+    Metadata, NodeKind, OpenFlags, WritePosition,
 };
 use thiserror::Error;
 use triomphe::Arc;
@@ -116,18 +119,25 @@ macro_rules! mount_kinds {
                 match self { $(Self::$kind(fs) => fs.read_at(path, offset, max_bytes).await,)+ }
             }
 
-            async fn write_at(
-                &self,
-                path: FsPath<'_>,
-                offset: u64,
-                data: &[u8],
+            fn write_with<'a, F>(
+                &'a self,
+                path: FsPath<'a>,
+                position: WritePosition,
+                len: usize,
                 now: u64,
-            ) -> FsResult<()> {
-                match self { $(Self::$kind(fs) => fs.write_at(path, offset, data, now).await,)+ }
-            }
-
-            async fn append(&self, path: FsPath<'_>, data: &[u8], now: u64) -> FsResult<u64> {
-                match self { $(Self::$kind(fs) => fs.append(path, data, now).await,)+ }
+                fill: F,
+            ) -> impl Future<Output = FsResult<u64>> + Send + 'a
+            where
+                F: FnOnce(&mut [u8]),
+            {
+                // Each kind runs `fill` in this call, so the dispatch must
+                // too: the arms' futures are carried in one enum rather
+                // than awaited in an async body that would hold `fill`.
+                match self {
+                    $(Self::$kind(fs) => MountedWrite::$kind {
+                        future: fs.write_with(path, position, len, now, fill),
+                    },)+
+                }
             }
 
             async fn set_size(&self, path: FsPath<'_>, size: u64, now: u64) -> FsResult<()> {
@@ -198,7 +208,41 @@ macro_rules! mount_kinds {
                 match self { $(Self::$kind(fs) => fs.sync_data(path).await,)+ }
             }
         }
+
+        pin_project_lite::pin_project! {
+            /// The write future of whichever kind a [`MountedFs`] holds.
+            #[project = MountedWriteProjection]
+            enum MountedWrite<$($kind),+> {
+                $($kind { #[pin] future: $kind },)+
+            }
+        }
+
+        impl<$($kind: Future<Output = FsResult<u64>>),+> Future for MountedWrite<$($kind),+> {
+            type Output = FsResult<u64>;
+
+            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+                match self.project() {
+                    $(MountedWriteProjection::$kind { future } => future.poll(cx),)+
+                }
+            }
+        }
     };
+}
+
+/// Writes `data` at `position` through [`FileSystem::write_with`], and
+/// resolves with the offset it landed at: the filesystem tests' write.
+#[cfg(test)]
+pub(crate) async fn write_bytes<F: FileSystem>(
+    fs: &F,
+    path: FsPath<'_>,
+    position: WritePosition,
+    data: &[u8],
+    now: u64,
+) -> FsResult<u64> {
+    fs.write_with(path, position, data.len(), now, |destination| {
+        destination.copy_from_slice(data)
+    })
+    .await
 }
 
 mount_kinds! {

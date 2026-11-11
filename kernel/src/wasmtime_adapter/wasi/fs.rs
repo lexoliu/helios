@@ -8,7 +8,9 @@
 //! preview2 (`preview2.rs`) and preview1 (`component_host::service`) call
 //! them and only translate types.
 
-use helios_hal::fs::{FileSystem, FsError as VfsError, Metadata, NodeKind, OpenFlags};
+use helios_hal::fs::{
+    FileSystem, FsError as VfsError, Metadata, NodeKind, OpenFlags, WritePosition,
+};
 use pin_project_lite::pin_project;
 
 use crate::{
@@ -409,23 +411,27 @@ where
     read_resolved(&held.resolved(), offset, max_bytes).await
 }
 
-/// Where a write lands: at an offset, or at the end of the file as the
-/// filesystem sees it when the write arrives.
-#[derive(Clone, Copy)]
-pub(crate) enum FileWriteMode {
-    At(u64),
-    Append,
-}
-
 /// Writes `bytes` to the file `descriptor` names, and resolves with the
 /// offset just past them: where a sequential writer continues.
 pub(crate) async fn write<HostFs>(
     namespace: &Namespace<HostFs>,
     descriptor: &FsDescriptor,
-    mode: FileWriteMode,
+    position: WritePosition,
     bytes: &[u8],
     now: u64,
 ) -> FsOpResult<u64>
+where
+    HostFs: crate::HostFileSystem,
+{
+    write_resolved(&writable_file(namespace, descriptor)?, position, bytes, now).await
+}
+
+/// The file `descriptor` names, resolved for a write: it must be a
+/// regular file opened with `write`.
+pub(crate) fn writable_file<'a, HostFs>(
+    namespace: &'a Namespace<HostFs>,
+    descriptor: &'a FsDescriptor,
+) -> FsOpResult<Resolved<'a, HostFs>>
 where
     HostFs: crate::HostFileSystem,
 {
@@ -434,34 +440,54 @@ where
         fs_types::DescriptorFlags::WRITE,
         fs_types::ErrorCode::ReadOnly,
     )?;
-    write_resolved(&resolve(namespace, &descriptor.path)?, mode, bytes, now).await
+    resolve(namespace, &descriptor.path)
 }
 
 /// Writes `bytes` through `resolved`, and resolves with the offset just
-/// past them. An append lands at the end of the file as the filesystem
-/// sees it when the write arrives, so its end is the filesystem's answer,
-/// never the caller's idea of where the file ended.
+/// past them.
 pub(crate) async fn write_resolved<HostFs>(
     resolved: &Resolved<'_, HostFs>,
-    mode: FileWriteMode,
+    position: WritePosition,
     bytes: &[u8],
     now: u64,
 ) -> FsOpResult<u64>
 where
     HostFs: crate::HostFileSystem,
 {
-    let fs = resolved.writable().map_err(fs_error_code)?;
-    let landed = match mode {
-        FileWriteMode::At(offset) => fs
-            .write_at(resolved.path(), offset, bytes, now)
-            .await
-            .map(|()| offset),
-        FileWriteMode::Append => fs.append(resolved.path(), bytes, now).await,
+    write_resolved_with(resolved, position, bytes.len(), now, |destination| {
+        destination.copy_from_slice(bytes)
+    })
+    .await
+}
+
+/// Writes `len` bytes that `fill` puts straight into the filesystem's
+/// destination ([`FileSystem::write_with`]), and resolves with the offset
+/// just past them. An append lands at the end of the file as the
+/// filesystem sees it when the write arrives, so its end is the
+/// filesystem's answer, never the caller's idea of where the file ended.
+///
+/// `fill` runs before this returns, so it may read guest memory; the
+/// future holds nothing of it.
+pub(crate) fn write_resolved_with<'r, HostFs, F>(
+    resolved: &'r Resolved<'_, HostFs>,
+    position: WritePosition,
+    len: usize,
+    now: u64,
+    fill: F,
+) -> impl Future<Output = FsOpResult<u64>> + Send + 'r
+where
+    HostFs: crate::HostFileSystem,
+    F: FnOnce(&mut [u8]),
+{
+    let write = resolved
+        .writable()
+        .map(|fs| fs.write_with(resolved.path(), position, len, now, fill));
+    async move {
+        let landed = write.map_err(fs_error_code)?.await.map_err(fs_error_code)?;
+        landed
+            .checked_add(len as u64)
+            .ok_or(fs_types::ErrorCode::Overflow)
     }
-    .map_err(fs_error_code)?;
-    landed
-        .checked_add(bytes.len() as u64)
-        .ok_or(fs_types::ErrorCode::Overflow)
 }
 
 pub(crate) async fn set_size<HostFs>(
@@ -752,9 +778,9 @@ where
     )
     .await
     .map_err(fs_error_code)?;
-    fs.write_at(resolved.path(), 0, bytes, now)
+    write_resolved(&resolved, WritePosition::At(0), bytes, now)
         .await
-        .map_err(fs_error_code)
+        .map(drop)
 }
 
 /// What one bounded read resolves with.
@@ -766,7 +792,7 @@ type ChunkWriteResult = FsOpResult<usize>;
 /// One write of a stream's batch, as a future the consumer owns by value.
 async fn write_chunk<HostFs>(
     held: HeldPath<HostFs>,
-    mode: FileWriteMode,
+    mode: WritePosition,
     bytes: Vec<u8>,
     now: u64,
 ) -> ChunkWriteResult
@@ -907,8 +933,8 @@ pin_project! {
     {
         pub(super) getter: fn(&mut T) -> &mut StoreData<CpuImpl, Net, HostFs>,
         pub(super) held: HeldPath<HostFs>,
-        pub(super) mode: FileWriteMode,
-        pub(super) start: fn(HeldPath<HostFs>, FileWriteMode, Vec<u8>, u64) -> Fut,
+        pub(super) mode: WritePosition,
+        pub(super) start: fn(HeldPath<HostFs>, WritePosition, Vec<u8>, u64) -> Fut,
         #[pin]
         pub(super) pending: Option<Fut>,
         pub(super) result: Option<oneshot::Sender<FsOpResult<()>>>,
@@ -932,7 +958,7 @@ pin_project! {
 pub(super) fn file_write_consumer<T, CpuImpl, Net, HostFs>(
     getter: fn(&mut T) -> &mut StoreData<CpuImpl, Net, HostFs>,
     held: HeldPath<HostFs>,
-    mode: FileWriteMode,
+    mode: WritePosition,
     result: oneshot::Sender<FsOpResult<()>>,
 ) -> FileWriteConsumer<
     T,
@@ -996,7 +1022,7 @@ where
         this.pending.set(None);
         match written {
             Ok(written) => {
-                if let FileWriteMode::At(offset) = this.mode {
+                if let WritePosition::At(offset) = this.mode {
                     *offset = offset.checked_add(written as u64).ok_or_else(|| {
                         wasmtime::Error::new(WasiAdapterTrap::FileWriteOffsetOverflow)
                     })?;
@@ -1284,7 +1310,7 @@ where
         data: StreamReader<u8>,
         offset: u64,
     ) -> Result<FutureReader<FsOpResult<()>>> {
-        pipe_into_file(accessor, descriptor, data, FileWriteMode::At(offset))
+        pipe_into_file(accessor, descriptor, data, WritePosition::At(offset))
     }
 
     fn append_via_stream(
@@ -1292,7 +1318,7 @@ where
         descriptor: Resource<FsDescriptor>,
         data: StreamReader<u8>,
     ) -> Result<FutureReader<FsOpResult<()>>> {
-        pipe_into_file(accessor, descriptor, data, FileWriteMode::Append)
+        pipe_into_file(accessor, descriptor, data, WritePosition::End)
     }
 
     async fn advise(
@@ -1670,7 +1696,7 @@ fn pipe_into_file<U, CpuImpl, Net, HostFs>(
     mut accessor: Access<'_, U, HasSelf<StoreData<CpuImpl, Net, HostFs>>>,
     descriptor: Resource<FsDescriptor>,
     mut data: StreamReader<u8>,
-    mode: FileWriteMode,
+    mode: WritePosition,
 ) -> Result<FutureReader<FsOpResult<()>>>
 where
     CpuImpl: Cpu + Clone,

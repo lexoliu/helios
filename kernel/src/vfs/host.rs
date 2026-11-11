@@ -11,12 +11,14 @@
 extern crate alloc;
 
 use alloc::string::String;
+use alloc::vec;
 use alloc::vec::Vec;
+use core::future::Future;
 
 use bytes::Bytes;
 use helios_hal::fs::{
     DeviceId, DirCookie, DirEntry, FileSystem, FsError, FsPath, FsResult, Metadata, NodeId,
-    NodeKind, OpenFlags,
+    NodeKind, OpenFlags, WritePosition,
 };
 
 use crate::{HostDirLimit, HostFileSystem, HostFsError, HostFsErrorKind, HostMetadata};
@@ -147,24 +149,33 @@ impl<H: HostFileSystem> FileSystem for HostShare<H> {
             .map_err(fs_error_from_host)
     }
 
-    async fn write_at(
-        &self,
-        path: FsPath<'_>,
-        offset: u64,
-        data: &[u8],
+    fn write_with<'a, F>(
+        &'a self,
+        path: FsPath<'a>,
+        position: WritePosition,
+        len: usize,
         _now: u64,
-    ) -> FsResult<()> {
-        self.client
-            .write_file(host_path(path), offset, data)
-            .await
-            .map_err(fs_error_from_host)
-    }
-
-    async fn append(&self, path: FsPath<'_>, data: &[u8], _now: u64) -> FsResult<u64> {
-        self.client
-            .append_file(host_path(path), data)
-            .await
-            .map_err(fs_error_from_host)
+        fill: F,
+    ) -> impl Future<Output = FsResult<u64>> + Send + 'a
+    where
+        F: FnOnce(&mut [u8]),
+    {
+        // The bytes leave for the host after awaits `fill` may not live
+        // across, so they are gathered into the buffer the request sends.
+        let mut data = vec![0; len];
+        fill(&mut data);
+        async move {
+            let host = host_path(path);
+            let landed = match position {
+                WritePosition::At(offset) => self
+                    .client
+                    .write_file(host, offset, &data)
+                    .await
+                    .map(|()| offset),
+                WritePosition::End => self.client.append_file(host, &data).await,
+            };
+            landed.map_err(fs_error_from_host)
+        }
     }
 
     async fn set_size(&self, path: FsPath<'_>, size: u64, _now: u64) -> FsResult<()> {

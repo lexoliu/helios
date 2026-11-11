@@ -2031,11 +2031,11 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    let bytes = match p1_read_iovs_to_bytes(caller, memory, iovs, iovs_len) {
-        Ok(bytes) => bytes,
+    let layout = match p1_read_iovs_with_byte_len(caller, memory, iovs, iovs_len) {
+        Ok(layout) => layout,
         Err(errno) => return errno,
     };
-    let written = match p1_write_descriptor(caller, fd, &bytes).await {
+    let written = match p1_write_descriptor(caller, fd, memory, &layout).await {
         Ok(written) => written,
         Err(errno) => return errno,
     };
@@ -2598,33 +2598,66 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    let bytes = match p1_read_iovs_to_bytes(caller, memory, iovs, iovs_len) {
-        Ok(bytes) => bytes,
+    let layout = match p1_read_iovs_with_byte_len(caller, memory, iovs, iovs_len) {
+        Ok(layout) => layout,
         Err(errno) => return errno,
     };
-    let Some(Preview1Descriptor::File { descriptor, .. }) = caller.data().descriptors.get(fd)
+    let written = match p1_write_file(caller, fd, memory, &layout, Some(offset)).await {
+        Ok(written) => written,
+        Err(errno) => return errno,
+    };
+    p1_write_u32(caller, memory, nwritten, written)
+}
+
+/// Writes the bytes `layout` names in guest memory to the file `fd`,
+/// gathered straight into the filesystem's destination: at `at` when
+/// given (`fd_pwrite`, which leaves the offset alone), else at the
+/// descriptor's offset or, in append mode, at the end of the file, moving
+/// the offset past them.
+async fn p1_write_file<CpuImpl, Net, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+    fd: i32,
+    memory: Preview1Memory,
+    layout: &Preview1IovLayout,
+    at: Option<u64>,
+) -> Result<u32, i32>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    HostFs: crate::HostFileSystem,
+{
+    let Some(Preview1Descriptor::File {
+        descriptor,
+        offset,
+        fdflags,
+    }) = caller.data().descriptors.get(fd)
     else {
-        return p1::errno::BADF;
+        return Err(p1::errno::BADF);
+    };
+    let position = match at {
+        Some(at) => WritePosition::At(at),
+        None if fdflags & P1_FDFLAG_APPEND != 0 => WritePosition::End,
+        None => WritePosition::At(*offset),
     };
     let descriptor = descriptor.clone();
-    let written = match u32::try_from(bytes.len()) {
-        Ok(written) => written,
-        Err(_) => return p1::errno::OVERFLOW,
-    };
+    let written = layout.byte_len_u32()?;
+    let ranges = p1_iovs_memory_ranges(memory, &layout.iovs)?;
     let namespace = p1_namespace(caller);
     let now_nanos = caller.data().now_nanos();
-    if let Err(error) = wasi_fs::write(
-        &namespace,
-        &descriptor,
-        FileWriteMode::At(offset),
-        &bytes,
-        now_nanos,
-    )
-    .await
-    {
-        return p1_errno_from_fs(error);
+    let end = {
+        let file = wasi_fs::writable_file(&namespace, &descriptor).map_err(p1_errno_from_fs)?;
+        wasi_fs::write_resolved_with(&file, position, layout.byte_len, now_nanos, |destination| {
+            p1_gather_into(memory, &ranges, destination)
+        })
+        .await
+        .map_err(p1_errno_from_fs)?
+    };
+    if at.is_none() {
+        // After an append the offset is the end of the file the write
+        // reached, which another writer may have moved meanwhile.
+        p1_set_file_offset(caller, fd, end);
     }
-    p1_write_u32(caller, memory, nwritten, written)
+    Ok(written)
 }
 
 pub(super) async fn p1_fd_readdir<CpuImpl, Net, HostFs>(
@@ -4223,13 +4256,20 @@ pub(super) enum RoutedOutput {
 pub(super) async fn p1_write_descriptor<CpuImpl, Net, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     fd: i32,
-    bytes: &[u8],
+    memory: Preview1Memory,
+    layout: &Preview1IovLayout,
 ) -> Result<u32, i32>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
+    // A file takes the guest's bytes straight into its own destination;
+    // every other sink takes them gathered.
+    if let Some(Preview1Descriptor::File { .. }) = caller.data().descriptors.get(fd) {
+        return p1_write_file(caller, fd, memory, layout, None).await;
+    }
+    let bytes = &p1_iov_bytes(memory, layout)?[..];
     // A descriptor whose sink is a bounded channel blocks the guest while
     // that channel is full, unless the guest asked for non-blocking IO —
     // then it gets `EAGAIN` and keeps its bytes, as POSIX requires.
@@ -4287,33 +4327,6 @@ where
         }
         Some(Preview1Descriptor::NullDevice) => {
             u32::try_from(bytes.len()).map_err(|_| p1::errno::OVERFLOW)
-        }
-        Some(Preview1Descriptor::File { .. }) => {
-            let Some(Preview1Descriptor::File {
-                descriptor,
-                offset,
-                fdflags,
-            }) = caller.data().descriptors.get(fd)
-            else {
-                return Err(p1::errno::BADF);
-            };
-            let current_offset = *offset;
-            let mode = if fdflags & P1_FDFLAG_APPEND != 0 {
-                FileWriteMode::Append
-            } else {
-                FileWriteMode::At(current_offset)
-            };
-            let descriptor = descriptor.clone();
-            let written = u32::try_from(bytes.len()).map_err(|_| p1::errno::OVERFLOW)?;
-            let namespace = p1_namespace(caller);
-            let now_nanos = caller.data().now_nanos();
-            // After an append the offset is the end of the file the write
-            // reached, which another writer may have moved meanwhile.
-            let end = wasi_fs::write(&namespace, &descriptor, mode, bytes, now_nanos)
-                .await
-                .map_err(p1_errno_from_fs)?;
-            p1_set_file_offset(caller, fd, end);
-            Ok(written)
         }
         Some(_) => Err(p1::errno::BADF),
         None => Err(p1::errno::BADF),
@@ -4617,7 +4630,7 @@ mod tests {
         block_on(wasi_fs::write(
             &namespace,
             &file,
-            wasi_fs::FileWriteMode::At(0),
+            helios_hal::fs::WritePosition::At(0),
             "日本語 한국어".as_bytes(),
             2,
         ))

@@ -24,13 +24,14 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::cmp::Ordering;
+use core::future::Future;
 use core::ops::Bound;
 
 use bytes::{Bytes, BytesMut};
 use hashbrown::{HashMap, HashSet};
 use helios_hal::fs::{
     DeviceId, DirCookie, DirEntry, FileSystem, FsError, FsPath, FsResult, Metadata, NodeId,
-    NodeKind, OpenFlags,
+    NodeKind, OpenFlags, WritePosition,
 };
 use spin::Mutex;
 use triomphe::Arc;
@@ -465,14 +466,35 @@ impl MemoryState {
     }
 }
 
-fn write_into(contents: &mut BytesMut, offset: u64, data: &[u8]) -> FsResult<()> {
-    let offset = usize::try_from(offset).map_err(|_| FsError::Overflow)?;
-    let end = offset.checked_add(data.len()).ok_or(FsError::Overflow)?;
-    if contents.len() < end {
-        contents.resize(end, 0);
+impl MemoryFs {
+    /// [`FileSystem::write_with`], done at once: `fill` writes straight
+    /// into the file's storage.
+    pub(super) fn write_now(
+        &self,
+        path: FsPath<'_>,
+        position: WritePosition,
+        len: usize,
+        now: u64,
+        fill: impl FnOnce(&mut [u8]),
+    ) -> FsResult<u64> {
+        let mut landed = 0;
+        self.state.lock().edit_contents(path, now, |contents| {
+            let at = match position {
+                WritePosition::At(offset) => {
+                    usize::try_from(offset).map_err(|_| FsError::Overflow)?
+                }
+                WritePosition::End => contents.len(),
+            };
+            let end = at.checked_add(len).ok_or(FsError::Overflow)?;
+            if contents.len() < end {
+                contents.resize(end, 0);
+            }
+            fill(&mut contents[at..end]);
+            landed = at as u64;
+            Ok(())
+        })?;
+        Ok(landed)
     }
-    contents[offset..end].copy_from_slice(data);
-    Ok(())
 }
 
 impl FileSystem for MemoryFs {
@@ -525,20 +547,20 @@ impl FileSystem for MemoryFs {
         Ok(inode.contents.slice(offset..end))
     }
 
-    async fn write_at(&self, path: FsPath<'_>, offset: u64, data: &[u8], now: u64) -> FsResult<()> {
-        self.state
-            .lock()
-            .edit_contents(path, now, |contents| write_into(contents, offset, data))
-    }
-
-    async fn append(&self, path: FsPath<'_>, data: &[u8], now: u64) -> FsResult<u64> {
-        let mut at = 0;
-        self.state.lock().edit_contents(path, now, |contents| {
-            at = contents.len() as u64;
-            contents.extend_from_slice(data);
-            Ok(())
-        })?;
-        Ok(at)
+    fn write_with<'a, F>(
+        &'a self,
+        path: FsPath<'a>,
+        position: WritePosition,
+        len: usize,
+        now: u64,
+        fill: F,
+    ) -> impl Future<Output = FsResult<u64>> + Send + 'a
+    where
+        F: FnOnce(&mut [u8]),
+    {
+        // The write is done here, under the lock; the future only reports
+        // it, so it holds nothing of `fill`.
+        core::future::ready(self.write_now(path, position, len, now, fill))
     }
 
     async fn set_size(&self, path: FsPath<'_>, size: u64, now: u64) -> FsResult<()> {
@@ -672,9 +694,12 @@ mod tests {
     use alloc::vec::Vec;
 
     use futures_lite::future::block_on;
-    use helios_hal::fs::{DeviceId, DirCookie, FileSystem, FsError, FsPath, NodeKind, OpenFlags};
+    use helios_hal::fs::{
+        DeviceId, DirCookie, FileSystem, FsError, FsPath, NodeKind, OpenFlags, WritePosition,
+    };
 
     use super::MemoryFs;
+    use crate::vfs::write_bytes;
 
     fn path(path: &str) -> FsPath<'_> {
         FsPath::new(path).expect("test paths are valid")
@@ -696,8 +721,21 @@ mod tests {
     fn creates_writes_and_reads_back_positionally() {
         let fs = tree();
         block_on(fs.open(path("f"), OpenFlags::CREATE, 5)).expect("creates");
-        block_on(fs.write_at(path("f"), 2, b"cd", 6)).expect("writes past the end");
-        assert_eq!(block_on(fs.append(path("f"), b"ef", 7)), Ok(4));
+        assert_eq!(
+            block_on(write_bytes(&fs, path("f"), WritePosition::At(2), b"cd", 6)),
+            Ok(2),
+            "writes past the end"
+        );
+        // The filesystem hands its own storage to the filler.
+        assert_eq!(
+            block_on(
+                fs.write_with(path("f"), WritePosition::End, 2, 7, |destination| {
+                    assert_eq!(destination, [0, 0]);
+                    destination.copy_from_slice(b"ef");
+                })
+            ),
+            Ok(4)
+        );
         let read = block_on(fs.read_at(path("f"), 0, 64)).expect("reads");
         assert_eq!(read.as_ref(), b"\0\0cdef");
         let stat = block_on(fs.stat(path("f"))).expect("stats");
@@ -711,7 +749,14 @@ mod tests {
         let fs = tree();
         block_on(fs.open(path("a"), OpenFlags::CREATE, 0)).expect("creates");
         block_on(fs.link(path("a"), path("b"), 1)).expect("links");
-        block_on(fs.write_at(path("b"), 0, b"shared", 2)).expect("writes");
+        block_on(write_bytes(
+            &fs,
+            path("b"),
+            WritePosition::At(0),
+            b"shared",
+            2,
+        ))
+        .expect("writes");
         assert_eq!(
             block_on(fs.read_at(path("a"), 0, 64))
                 .expect("reads")

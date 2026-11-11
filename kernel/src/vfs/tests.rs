@@ -3,7 +3,7 @@ use alloc::vec::Vec;
 
 use futures_lite::future::block_on;
 use helios_hal::cpu::ProcessorId;
-use helios_hal::fs::{FileSystem, FileSystemRights, FsError, FsPath, OpenFlags};
+use helios_hal::fs::{FileSystem, FileSystemRights, FsError, FsPath, OpenFlags, WritePosition};
 
 use super::{
     BOOT_DEVICE, Follow, MAX_MOUNTS, MemoryFs, MountError, MountTable, MountedFs, Namespace,
@@ -52,7 +52,14 @@ fn create(namespace: &TestNamespace, absolute: &str, bytes: &[u8]) {
     let resolved = namespace.resolve(absolute).expect("resolves");
     let fs = resolved.writable().expect("writable mount");
     block_on(fs.open(resolved.path(), OpenFlags::CREATE, 1)).expect("creates");
-    block_on(fs.write_at(resolved.path(), 0, bytes, 1)).expect("writes");
+    block_on(super::write_bytes(
+        fs,
+        resolved.path(),
+        WritePosition::At(0),
+        bytes,
+        1,
+    ))
+    .expect("writes");
 }
 
 fn read(namespace: &TestNamespace, absolute: &str) -> Vec<u8> {

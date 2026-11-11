@@ -6,6 +6,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use helios_hal::cpu::Cpu;
+use helios_hal::fs::WritePosition;
 use helios_netstack::Ipv6Address;
 use thiserror::Error;
 use wasmtime::component::{HasSelf, Linker, Resource};
@@ -21,9 +22,9 @@ use super::bindings::clocks::system_clock::Instant as P3SystemInstant;
 use super::bindings::filesystem::types as p3fs;
 use super::net::{TcpSocketInputStream, TcpSocketOutputStream};
 use super::{
-    FileWriteMode, FsDescriptor, FsNodeKind, P2IncomingDatagramStream, P2Network,
-    P2OutgoingDatagramStream, P2ResolveAddressStream, PendingAccept, Preview2GuestExit, TcpSocket,
-    UdpSocket, WasiAdapterTrap, WasiImportSet, WasiTcpSocketAddress, WasiTcpSocketFamily,
+    FsDescriptor, FsNodeKind, P2IncomingDatagramStream, P2Network, P2OutgoingDatagramStream,
+    P2ResolveAddressStream, PendingAccept, Preview2GuestExit, TcpSocket, UdpSocket,
+    WasiAdapterTrap, WasiImportSet, WasiTcpSocketAddress, WasiTcpSocketFamily,
     WasiUdpSocketAddress, WasiUdpSocketError, WasiUdpSocketFamily, has_wasi_network_rights,
     output_is_terminal, stdin_is_terminal, wasi_tcp_bind_rights, wasi_udp_bind_rights,
 };
@@ -340,7 +341,7 @@ where
     cpu: CpuImpl,
     runtime_state: HostRuntimeState<CpuImpl, Net, HostFs>,
     file: HeldPath<HostFs>,
-    mode: FileWriteMode,
+    mode: WritePosition,
     pending: Option<Bytes>,
     failure: Option<p2fs::ErrorCode>,
 }
@@ -399,7 +400,7 @@ where
         cpu: CpuImpl,
         runtime_state: HostRuntimeState<CpuImpl, Net, HostFs>,
         file: HeldPath<HostFs>,
-        mode: FileWriteMode,
+        mode: WritePosition,
     ) -> Self {
         Self {
             cpu,
@@ -428,7 +429,7 @@ where
         let now = self.now_nanos();
         match super::write_resolved(&self.file.resolved(), self.mode, &bytes, now).await {
             Ok(end) => {
-                if let FileWriteMode::At(offset) = &mut self.mode {
+                if let WritePosition::At(offset) = &mut self.mode {
                     *offset = end;
                 }
             }
@@ -467,7 +468,7 @@ where
     fn p2_output_stream(
         &mut self,
         resource: &Resource<FsDescriptor>,
-        mode: FileWriteMode,
+        mode: WritePosition,
     ) -> Result<core::result::Result<Resource<DynOutputStream>, p2fs::ErrorCode>> {
         let file = match self.p2_stream_target(
             resource,
@@ -1190,14 +1191,14 @@ where
         descriptor: Resource<FsDescriptor>,
         offset: u64,
     ) -> Result<core::result::Result<Resource<DynOutputStream>, p2fs::ErrorCode>> {
-        self.p2_output_stream(&descriptor, FileWriteMode::At(offset))
+        self.p2_output_stream(&descriptor, WritePosition::At(offset))
     }
 
     fn append_via_stream(
         &mut self,
         descriptor: Resource<FsDescriptor>,
     ) -> Result<core::result::Result<Resource<DynOutputStream>, p2fs::ErrorCode>> {
-        self.p2_output_stream(&descriptor, FileWriteMode::Append)
+        self.p2_output_stream(&descriptor, WritePosition::End)
     }
 
     fn advise(
@@ -1310,7 +1311,7 @@ where
             super::write(
                 &namespace,
                 &descriptor,
-                FileWriteMode::At(offset),
+                WritePosition::At(offset),
                 &buffer,
                 now,
             )

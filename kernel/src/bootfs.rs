@@ -15,11 +15,12 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::cmp::Ordering;
+use core::future::Future;
 
 use bytes::Bytes;
 use helios_hal::fs::{
     DeviceId, DirCookie, DirEntry, FileSystem, FsError, FsPath, FsResult, Metadata, NodeId,
-    NodeKind, OpenFlags,
+    NodeKind, OpenFlags, WritePosition,
 };
 use triomphe::Arc;
 
@@ -235,6 +236,20 @@ impl BootFs {
         self.index.device
     }
 
+    /// Describes the object at `path`: [`FileSystem::stat`], answered at
+    /// once, since the image is in memory.
+    pub fn metadata(&self, path: FsPath<'_>) -> FsResult<Metadata> {
+        self.index.metadata(path)
+    }
+
+    /// The target of the symbolic link at `path`: [`FileSystem::read_link`],
+    /// answered at once.
+    pub fn link_target(&self, path: FsPath<'_>) -> FsResult<String> {
+        // The image format carries no symbolic links.
+        self.index.metadata(path)?;
+        Err(FsError::Invalid)
+    }
+
     /// The bytes of the file at `path`, borrowed from the payload and
     /// carrying its provenance.
     pub fn file_contents(&self, path: FsPath<'_>) -> FsResult<BootfsBytes> {
@@ -387,12 +402,18 @@ impl FileSystem for BootFs {
         Ok(Bytes::from_static(&contents[offset..end]))
     }
 
-    async fn write_at(&self, _: FsPath<'_>, _: u64, _: &[u8], _: u64) -> FsResult<()> {
-        Err(FsError::ReadOnly)
-    }
-
-    async fn append(&self, _: FsPath<'_>, _: &[u8], _: u64) -> FsResult<u64> {
-        Err(FsError::ReadOnly)
+    fn write_with<'a, F>(
+        &'a self,
+        _: FsPath<'a>,
+        _: WritePosition,
+        _: usize,
+        _: u64,
+        _: F,
+    ) -> impl Future<Output = FsResult<u64>> + Send + 'a
+    where
+        F: FnOnce(&mut [u8]),
+    {
+        core::future::ready(Err(FsError::ReadOnly))
     }
 
     async fn set_size(&self, _: FsPath<'_>, _: u64, _: u64) -> FsResult<()> {
@@ -443,9 +464,7 @@ impl FileSystem for BootFs {
     }
 
     async fn read_link(&self, path: FsPath<'_>) -> FsResult<String> {
-        // The image format carries no symbolic links.
-        self.index.metadata(path)?;
-        Err(FsError::Invalid)
+        self.link_target(path)
     }
 
     async fn sync(&self, path: FsPath<'_>) -> FsResult<()> {
@@ -468,7 +487,9 @@ mod tests {
 
     use futures_lite::future::block_on;
     use helios_artifact::bootfs::{EntryKind, WriteEntry, write_image};
-    use helios_hal::fs::{DeviceId, DirCookie, FileSystem, FsError, FsPath, NodeKind, OpenFlags};
+    use helios_hal::fs::{
+        DeviceId, DirCookie, FileSystem, FsError, FsPath, NodeKind, OpenFlags, WritePosition,
+    };
 
     use super::{BootFs, EmbeddedBootDirectory, EmbeddedBootFile, EmbeddedBootFs};
 
@@ -597,7 +618,13 @@ mod tests {
         let past_end = block_on(fs.read_at(path("lib/runtime.component"), 99, 3)).expect("reads");
         assert!(past_end.is_empty());
         assert_eq!(
-            block_on(fs.write_at(path("etc/config.txt"), 0, b"x", 0)),
+            block_on(fs.write_with(
+                path("etc/config.txt"),
+                WritePosition::At(0),
+                1,
+                0,
+                |_| panic!("a refused write needs no bytes"),
+            )),
             Err(FsError::ReadOnly)
         );
         assert_eq!(

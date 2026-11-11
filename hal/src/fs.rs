@@ -210,6 +210,16 @@ bitflags! {
     }
 }
 
+/// Where [`FileSystem::write_with`] puts its bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WritePosition {
+    /// At this offset, zero-filling any gap past the end of the file.
+    At(u64),
+    /// At the end of the file as the filesystem sees it when the write
+    /// arrives.
+    End,
+}
+
 /// Where a directory listing resumes.
 ///
 /// Opaque to the caller: it is [`DirCookie::START`] or a value a previous
@@ -326,24 +336,27 @@ pub trait FileSystem: Clone + Send + Sync + 'static {
         max_bytes: usize,
     ) -> impl Future<Output = FsResult<Bytes>> + Send + 'a;
 
-    /// Writes all of `data` at `offset`, zero-filling any gap past the end.
-    fn write_at<'a>(
+    /// Writes `len` bytes at `position` and resolves with the offset they
+    /// landed at.
+    ///
+    /// The filesystem supplies the destination and `fill` writes the bytes
+    /// into it, so a write copies its bytes once: a filesystem that keeps
+    /// them in memory hands `fill` the file's own storage, and one that
+    /// sends them elsewhere hands it the buffer it sends. `fill` runs at
+    /// most once and before this returns, never from the future, so it may
+    /// read memory that is valid only for this call (a guest's) and need
+    /// not be `Send`. A write refused before its bytes are needed does not
+    /// run it.
+    fn write_with<'a, F>(
         &'a self,
         path: FsPath<'a>,
-        offset: u64,
-        data: &'a [u8],
+        position: WritePosition,
+        len: usize,
         now: u64,
-    ) -> impl Future<Output = FsResult<()>> + Send + 'a;
-
-    /// Writes all of `data` at the end of the file as the filesystem sees
-    /// it at the time of the write, and resolves with the offset it landed
-    /// at.
-    fn append<'a>(
-        &'a self,
-        path: FsPath<'a>,
-        data: &'a [u8],
-        now: u64,
-    ) -> impl Future<Output = FsResult<u64>> + Send + 'a;
+        fill: F,
+    ) -> impl Future<Output = FsResult<u64>> + Send + 'a
+    where
+        F: FnOnce(&mut [u8]);
 
     /// Truncates or zero-extends a regular file to `size` bytes.
     fn set_size<'a>(

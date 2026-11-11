@@ -4,12 +4,12 @@
 use alloc::string::String;
 
 use futures_lite::future::block_on;
-use helios_hal::fs::{FileSystemRights, NodeKind};
+use helios_hal::fs::{FileSystemRights, NodeKind, WritePosition};
 
 use super::{
-    FileWriteMode, FsDescriptor, FsNodeKind, create_directory_at, fs_types, link_at, metadata_hash,
-    open_at, read, read_program_file, readlink_at, remove_directory_at, rename_at, set_size,
-    set_times, stat_at, stat_path, symlink_at, unlink_file_at, write_program_file,
+    FsDescriptor, FsNodeKind, create_directory_at, fs_types, link_at, metadata_hash, open_at, read,
+    read_program_file, readlink_at, remove_directory_at, rename_at, set_size, set_times, stat_at,
+    stat_path, symlink_at, unlink_file_at, write_program_file,
 };
 use crate::wasmtime_adapter::component_host::ProgramSource;
 use crate::wasmtime_adapter::cwasm::{self, UntrustedCwasm};
@@ -82,7 +82,7 @@ fn create_file(namespace: &TestNamespace, path: &str, bytes: &[u8]) -> FsDescrip
     block_on(super::write(
         namespace,
         &descriptor,
-        FileWriteMode::At(0),
+        WritePosition::At(0),
         bytes,
         1,
     ))
@@ -160,7 +160,7 @@ fn writing_a_boot_image_file_writes_the_trees_own_copy() {
     let end = block_on(super::write(
         &namespace,
         &descriptor,
-        FileWriteMode::At(0),
+        WritePosition::At(0),
         b"T",
         1,
     ))
@@ -307,7 +307,7 @@ fn hardlink_preserves_identity_and_shared_contents() {
     block_on(super::write(
         &namespace,
         &original,
-        FileWriteMode::At(0),
+        WritePosition::At(0),
         b"bolt",
         3,
     ))
@@ -589,7 +589,7 @@ fn writing_a_bootfs_node_drops_its_provenance() {
             block_on(super::write(
                 namespace,
                 descriptor,
-                FileWriteMode::At(0),
+                WritePosition::At(0),
                 b"p",
                 2,
             ))
@@ -751,7 +751,7 @@ fn an_append_resolves_with_the_end_of_file_it_reached() {
     let end = block_on(super::write(
         &namespace,
         &other,
-        FileWriteMode::At(3),
+        WritePosition::At(3),
         "日本語".as_bytes(),
         2,
     ))
@@ -761,7 +761,7 @@ fn an_append_resolves_with_the_end_of_file_it_reached() {
     let end = block_on(super::write(
         &namespace,
         &appender,
-        FileWriteMode::Append,
+        WritePosition::End,
         "한국어".as_bytes(),
         3,
     ))
