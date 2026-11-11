@@ -59,7 +59,7 @@ use helios_kernel::DebugSerialAccess;
 // Keep the unified kernel libm dependency's soft-float feature active.
 use libm as _;
 use x86_64::instructions::port::{Port, PortReadOnly, PortWriteOnly};
-use x86_64::registers::control::{Cr0Flags, Cr4Flags};
+use x86_64::registers::control::{Cr0, Cr0Flags, Cr4Flags};
 
 const COM1_BASE: u16 = 0x3f8;
 const COM1_DATA: u16 = COM1_BASE;
@@ -84,7 +84,26 @@ pub(crate) const KERNEL_STACK_BYTES: usize = 4 * 1024 * 1024;
 static CRITICAL_SECTION_STATE: helios_hal::critical_section::CriticalSectionState =
     helios_hal::critical_section::CriticalSectionState::new();
 
-global_asm!(include_str!("secondary_wakeup.S"));
+/// CR0 bits every processor runs with, set by `_start` on the bootstrap
+/// processor and by the secondary wakeup trampoline: MP (Intel SDM Vol. 3A
+/// §2.5), and WP, so supervisor writes honour read-only mappings (§2.5, and
+/// §4.6.1 for the access rights it enforces).
+const CR0_SET: Cr0Flags = Cr0Flags::MONITOR_COPROCESSOR.union(Cr0Flags::WRITE_PROTECT);
+/// CR0 bits every processor runs with clear: EM and TS (Vol. 3A §2.5, so SSE
+/// does not fault), and CD and NW, because INIT leaves both set (Vol. 3A
+/// Table 10-1) and Helios never runs with caching disabled.
+const CR0_CLEAR: Cr0Flags = Cr0Flags::EMULATE_COPROCESSOR
+    .union(Cr0Flags::TASK_SWITCHED)
+    .union(Cr0Flags::CACHE_DISABLE)
+    .union(Cr0Flags::NOT_WRITE_THROUGH);
+
+// `cr0_set` and `cr0_clear` are the trampoline's mask operands; paging and
+// protected mode are the mode switch itself and stay in the file.
+global_asm!(
+    include_str!("secondary_wakeup.S"),
+    cr0_set = const CR0_SET.bits() as u32,
+    cr0_clear = const !(CR0_CLEAR.bits() as u32),
+);
 
 mod vmm;
 pub use vmm::X86UserAddressSpace;
@@ -148,10 +167,8 @@ extern "C" fn _start() -> ! {
         "mov cr4, rax",
         "fninit",
         "jmp {main}",
-        // Clear EM and TS, set MP.
-        cr0_clear = const !(Cr0Flags::EMULATE_COPROCESSOR.bits() as u32
-            | Cr0Flags::TASK_SWITCHED.bits() as u32),
-        cr0_set = const Cr0Flags::MONITOR_COPROCESSOR.bits() as u32,
+        cr0_clear = const !(CR0_CLEAR.bits() as u32),
+        cr0_set = const CR0_SET.bits() as u32,
         cr4_set = const (Cr4Flags::OSFXSR.bits() as u32
             | Cr4Flags::OSXMMEXCPT_ENABLE.bits() as u32),
         main = sym x86_kernel_main,
@@ -983,7 +1000,14 @@ extern "C" fn secondary_start_rust(
     runtime: *const smp::ProcessorRuntime,
 ) -> ! {
     let boot = unsafe { &*boot };
-    // FPU/SSE control bits are set by the secondary wakeup trampoline;
+    // CR0 and the FPU/SSE control bits are set by the secondary wakeup
+    // trampoline; this checks the CR0 it left.
+    let cr0 = Cr0::read();
+    assert!(
+        cr0.contains(CR0_SET) && !cr0.intersects(CR0_CLEAR),
+        "x86 secondary processor entered Rust with CR0 {cr0:?}; Helios requires every \
+         processor to run with {CR0_SET:?} set and {CR0_CLEAR:?} clear"
+    );
     // OSXSAVE and the bootstrap processor's XCR0 are set here, before any
     // guest code can run on this processor.
     //
