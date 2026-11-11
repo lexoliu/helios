@@ -1173,7 +1173,7 @@ where
                 kind: ProgramExecErrorKind::InvalidBinary,
                 detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
             })?;
-            let unwind_stack_finish = preview1_read_u32(memory, stack_lower)?;
+            let unwind_stack_finish = preview1_read_u32(memory, GuestAddress::wasm32(stack_lower))?;
             if unwind_stack_finish < unwind_stack_begin || unwind_stack_finish > stack_pointer {
                 return Err(ProgramExecError {
                     kind: ProgramExecErrorKind::InvalidBinary,
@@ -1187,7 +1187,8 @@ where
                         detail: ProgramExecErrorDetail::StackBoundsInvalid,
                     }
                 })?;
-            let rewind_stack = preview1_read_memory(memory, unwind_stack_begin, unwind_len)?;
+            let rewind_stack =
+                preview1_read_memory(memory, GuestAddress::wasm32(unwind_stack_begin), unwind_len)?;
             wasix_call_instance_func0(store, interrupts, instance, "asyncify_stop_unwind").await?;
 
             let hash = wasix_next_stack_hash(store);
@@ -1209,7 +1210,9 @@ where
                     kind: ProgramExecErrorKind::InvalidBinary,
                     detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
                 })?;
-                if preview1_write_memory(memory, snapshot, &snapshot_bytes) != p1::errno::SUCCESS {
+                if preview1_write_memory(memory, GuestAddress::wasm32(snapshot), &snapshot_bytes)
+                    != p1::errno::SUCCESS
+                {
                     return Err(ProgramExecError {
                         kind: ProgramExecErrorKind::InvalidBinary,
                         detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
@@ -1289,7 +1292,7 @@ where
                 kind: ProgramExecErrorKind::InvalidBinary,
                 detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
             })?;
-            let unwind_stack_finish = preview1_read_u32(memory, stack_lower)?;
+            let unwind_stack_finish = preview1_read_u32(memory, GuestAddress::wasm32(stack_lower))?;
             if unwind_stack_finish < unwind_stack_begin || unwind_stack_finish > stack_pointer {
                 return Err(ProgramExecError {
                     kind: ProgramExecErrorKind::InvalidBinary,
@@ -1303,7 +1306,8 @@ where
                         detail: ProgramExecErrorDetail::StackBoundsInvalid,
                     }
                 })?;
-            let rewind_stack = preview1_read_memory(memory, unwind_stack_begin, unwind_len)?;
+            let rewind_stack =
+                preview1_read_memory(memory, GuestAddress::wasm32(unwind_stack_begin), unwind_len)?;
             wasix_call_instance_func0(store, interrupts, instance, "asyncify_stop_unwind").await?;
             let child_pid = spawn_wasix_fork_child(
                 store,
@@ -1330,7 +1334,9 @@ where
                     kind: ProgramExecErrorKind::InvalidBinary,
                     detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
                 })?;
-                if preview1_write_memory(memory, ret_pid, &snapshot_bytes) != p1::errno::SUCCESS {
+                if preview1_write_memory(memory, GuestAddress::wasm32(ret_pid), &snapshot_bytes)
+                    != p1::errno::SUCCESS
+                {
                     return Err(ProgramExecError {
                         kind: ProgramExecErrorKind::InvalidBinary,
                         detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
@@ -1364,7 +1370,7 @@ where
                 kind: ProgramExecErrorKind::InvalidBinary,
                 detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
             })?;
-            let unwind_stack_finish = preview1_read_u32(memory, stack_lower)?;
+            let unwind_stack_finish = preview1_read_u32(memory, GuestAddress::wasm32(stack_lower))?;
             if unwind_stack_finish < unwind_stack_begin || unwind_stack_finish > stack_pointer {
                 return Err(ProgramExecError {
                     kind: ProgramExecErrorKind::InvalidBinary,
@@ -1378,7 +1384,8 @@ where
                         detail: ProgramExecErrorDetail::StackBoundsInvalid,
                     }
                 })?;
-            let rewind_stack = preview1_read_memory(memory, unwind_stack_begin, unwind_len)?;
+            let rewind_stack =
+                preview1_read_memory(memory, GuestAddress::wasm32(unwind_stack_begin), unwind_len)?;
             wasix_call_instance_func0(store, interrupts, instance, "asyncify_stop_unwind").await?;
             let snapshot = wasix_capture_process_snapshot(
                 store,
@@ -1442,7 +1449,9 @@ where
         kind: ProgramExecErrorKind::InvalidBinary,
         detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
     })?;
-    if preview1_write_memory(memory, stack_pointer, &memory_stack) != p1::errno::SUCCESS {
+    if preview1_write_memory(memory, GuestAddress::wasm32(stack_pointer), &memory_stack)
+        != p1::errno::SUCCESS
+    {
         return Err(ProgramExecError {
             kind: ProgramExecErrorKind::InvalidBinary,
             detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
@@ -1477,11 +1486,16 @@ where
         kind: ProgramExecErrorKind::InvalidBinary,
         detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
     })?;
-    let status = preview1_write_u32(memory, stack_lower, rewind_stack_end)
-        .max(preview1_write_u32(memory, stack_lower + 4, stack_upper))
+    let stack_lower_address = GuestAddress::wasm32(stack_lower);
+    let status = preview1_write_u32(memory, stack_lower_address, rewind_stack_end)
+        .max(preview1_write_u32(
+            memory,
+            stack_lower_address.offset(4),
+            stack_upper,
+        ))
         .max(preview1_write_memory(
             memory,
-            rewind_stack_begin,
+            GuestAddress::wasm32(rewind_stack_begin),
             &rewind_stack,
         ));
     if status != p1::errno::SUCCESS {
