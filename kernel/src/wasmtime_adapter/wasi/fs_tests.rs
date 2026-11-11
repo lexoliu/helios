@@ -145,26 +145,29 @@ fn boot_image_programs_are_visible() {
 }
 
 #[test]
-fn boot_image_file_rejects_writes() {
+fn writing_a_boot_image_file_writes_the_trees_own_copy() {
     let namespace = namespace();
+    let other_tree = namespace.descend();
     let descriptor = open(
         &namespace,
         &root(),
         "bin/tool",
         fs_types::OpenFlags::empty(),
-        fs_types::DescriptorFlags::WRITE,
+        fs_types::DescriptorFlags::READ | fs_types::DescriptorFlags::WRITE,
     )
-    .expect("a boot image file opens for writing; the write is what fails");
+    .expect("a boot image file opens for writing");
 
-    let error = block_on(super::write(
+    let end = block_on(super::write(
         &namespace,
         &descriptor,
         FileWriteMode::At(0),
-        b"x",
+        b"T",
         1,
     ))
-    .expect_err("a boot image file must reject writes");
-    assert!(matches!(error, fs_types::ErrorCode::ReadOnly));
+    .expect("the write lands in the tree's copy");
+    assert_eq!(end, 1);
+    assert_eq!(read_all(&namespace, &descriptor), b"Tool");
+    assert_eq!(read_all(&other_tree, &descriptor), b"tool");
 }
 
 #[test]
@@ -579,41 +582,44 @@ fn guest_written_cwasm_must_verify() {
 
 #[test]
 fn writing_a_bootfs_node_drops_its_provenance() {
-    let namespace = namespace_with_bootfs_cwasm();
-    assert!(boot_provenance(&namespace, "/bin/prog"));
-    let descriptor = open(
-        &namespace,
-        &root(),
-        "bin/prog",
-        fs_types::OpenFlags::empty(),
-        fs_types::DescriptorFlags::READ | fs_types::DescriptorFlags::WRITE,
-    )
-    .expect("opening the node for writing must succeed");
-
-    // The boot image is never written in place: every write path either
-    // leaves the boot bytes as they were or stores written bytes.
-    let write = block_on(super::write(
-        &namespace,
-        &descriptor,
-        FileWriteMode::At(0),
-        b"p",
-        2,
-    ));
-    let resize = block_on(set_size(&namespace, &descriptor, 1, 3));
-    let replace = block_on(write_program_file(
-        &namespace,
-        "/bin/prog",
-        foreign_signed_cwasm(),
-        4,
-    ));
-    for outcome in [write.map(drop), resize, replace] {
-        match outcome {
-            Ok(()) => assert!(!boot_provenance(&namespace, "/bin/prog")),
-            Err(error) => {
-                assert!(matches!(error, fs_types::ErrorCode::ReadOnly));
-                assert!(boot_provenance(&namespace, "/bin/prog"));
-            }
-        }
+    // The boot image is never written in place: each write path copies
+    // the file up first, and the copy's bytes are written bytes.
+    let changes: [fn(&TestNamespace, &FsDescriptor) -> super::FsOpResult<()>; 3] = [
+        |namespace, descriptor| {
+            block_on(super::write(
+                namespace,
+                descriptor,
+                FileWriteMode::At(0),
+                b"p",
+                2,
+            ))
+            .map(drop)
+        },
+        |namespace, descriptor| block_on(set_size(namespace, descriptor, 1, 3)),
+        |namespace, _| {
+            block_on(write_program_file(
+                namespace,
+                "/bin/prog",
+                foreign_signed_cwasm(),
+                4,
+            ))
+        },
+    ];
+    for change in changes {
+        let namespace = namespace_with_bootfs_cwasm();
+        let untouched = namespace.descend();
+        assert!(boot_provenance(&namespace, "/bin/prog"));
+        let descriptor = open(
+            &namespace,
+            &root(),
+            "bin/prog",
+            fs_types::OpenFlags::empty(),
+            fs_types::DescriptorFlags::READ | fs_types::DescriptorFlags::WRITE,
+        )
+        .expect("opening the node for writing must succeed");
+        change(&namespace, &descriptor).expect("the change lands in a copy");
+        assert!(!boot_provenance(&namespace, "/bin/prog"));
+        assert!(boot_provenance(&untouched, "/bin/prog"));
     }
 }
 

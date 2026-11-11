@@ -9,17 +9,25 @@
 //! another processor could be waiting for more than the copy of the bytes
 //! it writes, and no lock is held across an `.await`. No interrupt handler
 //! reaches a tree, so the lock does not mask interrupts.
+//!
+//! A tree may be the upper layer of an overlay ([`super::RootFs`]). It
+//! then also records what the overlay hid of the layer below: whiteouts,
+//! names removed from that layer, and opaque directories, which show
+//! nothing of it. A tree nothing overlays holds neither, and every
+//! operation on it behaves as if they did not exist. Both live under the
+//! tree's one lock, so an overlay changes an object and what it hides in
+//! one step.
 
 extern crate alloc;
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::cmp::Ordering;
 use core::ops::Bound;
 
 use bytes::{Bytes, BytesMut};
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 use helios_hal::fs::{
     DeviceId, DirCookie, DirEntry, FileSystem, FsError, FsPath, FsResult, Metadata, NodeId,
     NodeKind, OpenFlags,
@@ -62,6 +70,24 @@ struct MemoryState {
     names: BTreeMap<String, u64>,
     inodes: HashMap<u64, Inode>,
     next_inode: u64,
+    /// Names an overlay removed from the layer below. Each lies inside a
+    /// directory of this tree and names nothing in it.
+    whiteouts: BTreeSet<String>,
+    /// Directories an overlay shows without the layer below merged in.
+    opaque: HashSet<u64>,
+}
+
+/// What a tree that is an overlay's upper layer holds at one path.
+pub(super) struct UpperView {
+    /// The tree's own object there.
+    pub(super) object: Option<Metadata>,
+    /// Whether that object is a directory showing nothing of the layer
+    /// below.
+    pub(super) opaque: bool,
+    /// Whether the layer below shows at this path once the tree's own
+    /// object is out of the way: no whiteout at it or above it, and every
+    /// directory of the tree above it is a merging one.
+    pub(super) beneath: bool,
 }
 
 impl MemoryFs {
@@ -85,6 +111,8 @@ impl MemoryFs {
                 names: BTreeMap::new(),
                 inodes,
                 next_inode: ROOT_INODE + 1,
+                whiteouts: BTreeSet::new(),
+                opaque: HashSet::new(),
             })),
         }
     }
@@ -96,6 +124,152 @@ impl MemoryFs {
     /// Whether `other` is the same tree, not merely an equal one.
     pub fn same_tree(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.state, &other.state)
+    }
+
+    /// What this tree, as an overlay's upper layer, holds at `path`.
+    pub(super) fn view(&self, path: FsPath<'_>) -> FsResult<UpperView> {
+        let state = self.state.lock();
+        let object = match state.metadata(self.device, path) {
+            Ok(metadata) => Some(metadata),
+            Err(FsError::NoEntry) => None,
+            Err(error) => return Err(error),
+        };
+        let opaque = object.is_some()
+            && state
+                .inode_of(path)
+                .is_ok_and(|number| state.opaque.contains(&number));
+        Ok(UpperView {
+            object,
+            opaque,
+            beneath: state.beneath(path),
+        })
+    }
+
+    /// Copies an object of the layer below up to `path`, keeping its
+    /// times: `contents` is a file's bytes or a link's target, and empty
+    /// for a directory, which stays merging. When the tree has an object
+    /// there already, another copy-up won and this one does nothing; when
+    /// the layer below no longer shows there, the object was removed
+    /// meanwhile: [`FsError::NoEntry`].
+    pub(super) fn copy_up(
+        &self,
+        path: FsPath<'_>,
+        kind: NodeKind,
+        contents: Bytes,
+        original: &Metadata,
+    ) -> FsResult<()> {
+        let mut state = self.state.lock();
+        if state.inode_of(path).is_ok() {
+            return Ok(());
+        }
+        if !state.beneath(path) {
+            return Err(FsError::NoEntry);
+        }
+        state.require_new_name(path)?;
+        let number = state.insert(path, kind, contents, original.modified_nanos);
+        let inode = state
+            .inodes
+            .get_mut(&number)
+            .expect("the inode was just inserted");
+        inode.access_nanos = original.access_nanos;
+        inode.status_nanos = original.status_nanos;
+        Ok(())
+    }
+
+    /// Removes the object at `path` (a directory when `directory`, which
+    /// must hold no names) and, when `whiteout`, records a whiteout there
+    /// so the layer below stays hidden. With `whiteout`, a path the tree
+    /// has no object at is the layer below's alone, and only the whiteout
+    /// is recorded.
+    pub(super) fn remove(&self, path: FsPath<'_>, directory: bool, whiteout: bool) -> FsResult<()> {
+        if path.is_root() {
+            return Err(if directory {
+                FsError::NotPermitted
+            } else {
+                FsError::IsDirectory
+            });
+        }
+        let mut state = self.state.lock();
+        match state.inode(path) {
+            Ok((_, inode)) => {
+                match (directory, inode.kind == NodeKind::Directory) {
+                    (true, false) => return Err(FsError::NotDirectory),
+                    (false, true) => return Err(FsError::IsDirectory),
+                    (true, true) if state.children(path).next().is_some() => {
+                        return Err(FsError::NotEmpty);
+                    }
+                    _ => {}
+                }
+                state.remove_name(path);
+            }
+            Err(FsError::NoEntry) if whiteout && state.beneath(path) => {}
+            Err(error) => return Err(error),
+        }
+        if directory {
+            state.drop_whiteouts_below(path);
+        }
+        if whiteout {
+            state.whiteouts.insert(path.as_str().to_string());
+        }
+        Ok(())
+    }
+
+    /// Renames as [`FileSystem::rename`] does, then records a whiteout at
+    /// `source` when `whiteout`, so the layer below stays hidden there.
+    pub(super) fn rename_over(
+        &self,
+        source: FsPath<'_>,
+        destination: FsPath<'_>,
+        now: u64,
+        whiteout: bool,
+    ) -> FsResult<()> {
+        if source.is_root() || destination.is_root() {
+            return Err(FsError::NotPermitted);
+        }
+        let mut state = self.state.lock();
+        let (_, inode) = state.inode(source)?;
+        if source == destination {
+            return Ok(());
+        }
+        if inode.kind == NodeKind::Directory && destination.starts_with(source) {
+            return Err(FsError::NotPermitted);
+        }
+        state.require_new_name(destination)?;
+        let source_inode = state.inode_of(source)?;
+        let moved: Vec<(String, u64)> =
+            core::iter::once((source.as_str().to_string(), source_inode))
+                .chain(
+                    state
+                        .descendants(source)
+                        .map(|(name, number)| (name.clone(), *number)),
+                )
+                .collect();
+        let renamed = |name: &str| {
+            let mut renamed = String::with_capacity(
+                destination.as_str().len() + name.len() - source.as_str().len(),
+            );
+            renamed.push_str(destination.as_str());
+            renamed.push_str(&name[source.as_str().len()..]);
+            renamed
+        };
+        for (name, number) in moved {
+            state.names.remove(&name);
+            state.names.insert(renamed(&name), number);
+            state
+                .inodes
+                .get_mut(&number)
+                .expect("every name refers to a live inode")
+                .status_nanos = now;
+        }
+        for name in state.whiteouts_below(source) {
+            state.whiteouts.remove(&name);
+            state.whiteouts.insert(renamed(&name));
+        }
+        state.take_whiteout(destination, source_inode);
+        if whiteout {
+            state.whiteouts.insert(source.as_str().to_string());
+        }
+        Ok(())
     }
 }
 
@@ -153,7 +327,7 @@ impl MemoryState {
         }
     }
 
-    fn insert(&mut self, path: FsPath<'_>, kind: NodeKind, contents: Bytes, now: u64) {
+    fn insert(&mut self, path: FsPath<'_>, kind: NodeKind, contents: Bytes, now: u64) -> u64 {
         let number = self.next_inode;
         self.next_inode += 1;
         self.inodes.insert(
@@ -168,6 +342,58 @@ impl MemoryState {
             },
         );
         self.names.insert(path.as_str().to_string(), number);
+        self.take_whiteout(path, number);
+        number
+    }
+
+    /// A new name at `path` for inode `number` replaces any whiteout
+    /// there. A directory that does is opaque: what the layer below had
+    /// at that path stays removed, its contents included.
+    fn take_whiteout(&mut self, path: FsPath<'_>, number: u64) {
+        if self.whiteouts.remove(path.as_str()) && self.inodes[&number].kind == NodeKind::Directory
+        {
+            self.opaque.insert(number);
+        }
+    }
+
+    /// Whether the layer below an overlay shows at `path` once this tree's
+    /// own object there is out of the way: no whiteout at `path` or above
+    /// it, and every name of this tree above it a merging directory.
+    fn beneath(&self, path: FsPath<'_>) -> bool {
+        let path = path.as_str();
+        if self.whiteouts.is_empty() && self.opaque.is_empty() {
+            return true;
+        }
+        let ancestors = path.match_indices('/').map(|(end, _)| &path[..end]);
+        for ancestor in ancestors {
+            if self.whiteouts.contains(ancestor) {
+                return false;
+            }
+            if let Some(number) = self.names.get(ancestor)
+                && (self.inodes[number].kind != NodeKind::Directory || self.opaque.contains(number))
+            {
+                return false;
+            }
+        }
+        !self.whiteouts.contains(path)
+    }
+
+    /// The whiteouts below the directory at `path`.
+    fn whiteouts_below(&self, path: FsPath<'_>) -> Vec<String> {
+        let directory = path.as_str();
+        self.whiteouts
+            .range::<str, _>((Bound::Excluded(directory), Bound::Unbounded))
+            .skip_while(|name| cmp_to_children(name, directory) == Ordering::Less)
+            .take_while(|name| cmp_to_children(name, directory) == Ordering::Equal)
+            .cloned()
+            .collect()
+    }
+
+    /// Forgets the whiteouts below a directory that is gone.
+    fn drop_whiteouts_below(&mut self, path: FsPath<'_>) {
+        for name in self.whiteouts_below(path) {
+            self.whiteouts.remove(&name);
+        }
     }
 
     /// Drops the name at `path`, and the inode with its last name.
@@ -183,6 +409,7 @@ impl MemoryState {
         inode.link_count -= 1;
         if inode.link_count == 0 {
             self.inodes.remove(&number);
+            self.opaque.remove(&number);
         }
     }
 
@@ -376,66 +603,15 @@ impl FileSystem for MemoryFs {
     }
 
     async fn remove_directory(&self, path: FsPath<'_>) -> FsResult<()> {
-        if path.is_root() {
-            return Err(FsError::NotPermitted);
-        }
-        let mut state = self.state.lock();
-        if state.inode(path)?.1.kind != NodeKind::Directory {
-            return Err(FsError::NotDirectory);
-        }
-        if state.children(path).next().is_some() {
-            return Err(FsError::NotEmpty);
-        }
-        state.remove_name(path);
-        Ok(())
+        self.remove(path, true, false)
     }
 
     async fn unlink(&self, path: FsPath<'_>) -> FsResult<()> {
-        let mut state = self.state.lock();
-        if path.is_root() || state.inode(path)?.1.kind == NodeKind::Directory {
-            return Err(FsError::IsDirectory);
-        }
-        state.remove_name(path);
-        Ok(())
+        self.remove(path, false, false)
     }
 
     async fn rename(&self, source: FsPath<'_>, destination: FsPath<'_>, now: u64) -> FsResult<()> {
-        if source.is_root() || destination.is_root() {
-            return Err(FsError::NotPermitted);
-        }
-        let mut state = self.state.lock();
-        let (_, inode) = state.inode(source)?;
-        if source == destination {
-            return Ok(());
-        }
-        if inode.kind == NodeKind::Directory && destination.starts_with(source) {
-            return Err(FsError::NotPermitted);
-        }
-        state.require_new_name(destination)?;
-        let source_inode = state.inode_of(source)?;
-        let moved: Vec<(String, u64)> =
-            core::iter::once((source.as_str().to_string(), source_inode))
-                .chain(
-                    state
-                        .descendants(source)
-                        .map(|(name, number)| (name.clone(), *number)),
-                )
-                .collect();
-        for (name, number) in moved {
-            state.names.remove(&name);
-            let mut renamed = String::with_capacity(
-                destination.as_str().len() + name.len() - source.as_str().len(),
-            );
-            renamed.push_str(destination.as_str());
-            renamed.push_str(&name[source.as_str().len()..]);
-            state.names.insert(renamed, number);
-            state
-                .inodes
-                .get_mut(&number)
-                .expect("every name refers to a live inode")
-                .status_nanos = now;
-        }
-        Ok(())
+        self.rename_over(source, destination, now, false)
     }
 
     async fn link(&self, existing: FsPath<'_>, link: FsPath<'_>, now: u64) -> FsResult<()> {
@@ -446,6 +622,7 @@ impl FileSystem for MemoryFs {
         }
         state.require_new_name(link)?;
         state.names.insert(link.as_str().to_string(), number);
+        state.take_whiteout(link, number);
         let inode = state
             .inodes
             .get_mut(&number)
