@@ -108,7 +108,7 @@ test-units:
         --cargo cargo
     export HELIOS_KERNEL_ROOT_PUBLIC_KEY="${out_dir}/helios-root-public.key"
     export HELIOS_KERNEL_ROOT_SECRET_KEY="${out_dir}/helios-root-secret.key"
-    cargo nextest run -p helios-hal -p helios-virtio -p helios-netstack -p helios-kernel --lib
+    cargo nextest run -p helios-hal -p helios-virtio -p helios-netstack -p helios-artifact -p helios-kernel --lib
     cargo nextest run -p helios-workspace-root --lib
     # What the desktop draws with — damage tracking, focus routing, the
     # terminal grid — is a plain library (`programs/compositor/render`)
