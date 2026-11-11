@@ -58,6 +58,10 @@ on:
         description: Sample instruction addresses on the x86-64 Helios image for diagnosis; perturbs timings, not performance acceptance
         type: boolean
         default: false
+      require_avx512:
+        description: Refuse a suite runner whose processor has no AVX-512, before anything is built; for measuring guest code compiled at x86-64-v4
+        type: boolean
+        default: false
   pull_request:
     types: [opened, synchronize, reopened, labeled]
   push:
@@ -311,6 +315,17 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.tooling.outputs.matrix) }}
     steps:
+      # The shared pool hands out processors with and without AVX-512, and
+      # a run that set out to measure x86-64-v4 guest code measures nothing
+      # on one without. Refusing here costs seconds instead of the run.
+      - name: Require an AVX-512 host
+        if: inputs.require_avx512
+        run: |
+          if ! grep -qw avx512f /proc/cpuinfo; then
+            model=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | xargs)
+            echo "::error::require_avx512 is set and this runner's processor ($model) reports no avx512f in /proc/cpuinfo"
+            exit 1
+          fi
       - uses: actions/checkout@v4
         with:
           path: helios
