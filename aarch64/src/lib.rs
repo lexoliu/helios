@@ -12,6 +12,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use arm_gic::IntId;
+use helios_artifact::{ProbeAnswers, cwasm_target_isa_levels};
 use helios_hal::boot::{
     BootFirmwareTables, BootHandoff, BootKernelImage, BootMemoryKind, BootMemoryMap,
     BootMemoryRegion, BootModule, BootModules, BootReservedRanges, FirmwareKind,
@@ -351,6 +352,17 @@ struct Aarch64PlatformState {
     timebase: Timebase,
     debug_state: Once<debug_state::RuntimeState>,
     gic: Once<gic::Gic>,
+    /// The bootstrap processor's answer to every ISA level feature. Written
+    /// once before any secondary starts; each secondary compares its own.
+    isa_answers: ProbeAnswers,
+}
+
+/// What `detect_aarch64_native_feature` answers for every ISA level feature
+/// on the executing processor.
+fn probe_isa_answers() -> ProbeAnswers {
+    cwasm_target_isa_levels("aarch64-unknown-none")
+        .probe_answers(detect_aarch64_native_feature)
+        .unwrap_or_else(|error| panic!("AArch64 native feature probe is incomplete: {error}"))
 }
 
 impl Aarch64PlatformState {
@@ -396,6 +408,7 @@ impl Aarch64PlatformState {
             timebase,
             debug_state: Once::new(),
             gic: Once::new(),
+            isa_answers: probe_isa_answers(),
         }))
     }
 
@@ -1200,6 +1213,16 @@ unsafe extern "C" fn aarch64_secondary_main(mp_info: &MpInfo) -> ! {
     );
     let state = unsafe { &*state };
     let slot = state.processor_slot_by_mpidr(mp_info.mpidr);
+    // Guest code is compiled once for the ISA level the bootstrap processor
+    // satisfies and runs on any processor, so every processor must answer
+    // every level feature the same way.
+    let isa_answers = probe_isa_answers();
+    assert_eq!(
+        isa_answers, state.isa_answers,
+        "AArch64 processor with MPIDR {:#x} answers the ISA level features differently from the \
+         bootstrap processor; Helios requires every processor to offer the same features",
+        mp_info.mpidr
+    );
     activate_processor_runtime(&slot.runtime);
     state.gic().attach_current_processor(mp_info.mpidr);
 
@@ -1563,7 +1586,15 @@ fn current_processor_runtime() -> &'static ProcessorRuntime {
 fn detect_aarch64_native_feature(feature: &str) -> Option<bool> {
     match feature {
         "lse" => Some(read_id_aa64isar0_el1() & 0xf00_000 != 0),
-        "fp16" => Some(aarch64_id_field(read_id_aa64pfr0_el1(), 16) == 1),
+        // Scalar and vector half-precision arithmetic: ID_AA64PFR0_EL1.FP
+        // (bits 19:16) and .AdvSIMD (bits 23:20) both 0b0001, Linux's FPHP
+        // and ASIMDHP together. Cranelift's `has_fp16` lowers vector ops.
+        "fp16" => {
+            let pfr0 = read_id_aa64pfr0_el1();
+            Some(aarch64_id_field(pfr0, 16) == 1 && aarch64_id_field(pfr0, 20) == 1)
+        }
+        // ID_AA64ISAR0_EL1.DP (bits 47:44): SDOT and UDOT.
+        "dotprod" => Some(aarch64_id_field(read_id_aa64isar0_el1(), 44) >= 1),
         "neon" => Some(true),
         _ => None,
     }

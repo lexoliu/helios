@@ -9,6 +9,7 @@ embedded-debugger = ["helios-kernel/embedded-debugger"]
 
 [dependencies]
 acpi = "6.1.1"
+helios-artifact.workspace = true
 bitflags = "2.11.0"
 critical-section = { version = "1.2.0", features = ["restore-state-usize"] }
 helios-hal.workspace = true
