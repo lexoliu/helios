@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle, Thread};
 use std::time::{Duration, Instant as StdInstant};
 
@@ -132,6 +132,10 @@ const DEBUG_SERIAL_WRITER: helios_kernel::DebugSerialWriter =
 pub struct HostedRuntime {
     machine: Arc<HostedMachine>,
     config: HostedConfig,
+    /// The user payload `--bootfs` named, parsed once at start-up and
+    /// shared by every processor thread — the hosted backend's boot
+    /// module.
+    payload: helios_kernel::BootPayload,
 }
 
 pub(crate) struct HostedMachine {
@@ -142,10 +146,6 @@ pub(crate) struct HostedMachine {
     /// nanosecond.
     timebase: Timebase,
     heap: HeapReservation,
-    /// The user payload `--bootfs` named, parsed once at start-up and
-    /// shared by every processor thread — the hosted backend's boot
-    /// module.
-    payload: helios_kernel::BootPayload,
     slots: Box<[ProcessorSlot]>,
     timer_tx: Sender<TimerCommand>,
 }
@@ -153,6 +153,23 @@ pub(crate) struct HostedMachine {
 struct ProcessorSlot {
     thread: OnceLock<Thread>,
     started: AtomicBool,
+    /// Whether the processor is in service. A hosted processor taken out
+    /// of service waits on `restarted` rather than parking, so neither a
+    /// wake nor its timer thread's deadline can bring it back: only
+    /// `restart_processor` does.
+    run: Mutex<SlotRun>,
+    restarted: Condvar,
+}
+
+/// Where a hosted processor's thread stands between a stop and a restart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SlotRun {
+    Running,
+    Stopped,
+    /// The restart arrived before the processor reached its stop: the
+    /// window between the kernel publishing that it is stopping and the
+    /// thread getting here. The stop consumes it and returns at once.
+    RestartPending,
 }
 
 struct HeapReservation {
@@ -167,7 +184,12 @@ struct TimerCommand {
 impl HostedRuntime {
     pub fn new(config: HostedConfig) -> Self {
         Self {
-            machine: HostedMachine::new(&config),
+            machine: HostedMachine::new(
+                config.processor_count(),
+                config.bootstrap_processor(),
+                config.heap_bytes(),
+            ),
+            payload: load_payload(config.bootfs()),
             config,
         }
     }
@@ -181,6 +203,7 @@ impl HostedRuntime {
             let handle = spawn_processor_thread(
                 self.machine.clone(),
                 self.config.clone(),
+                self.payload,
                 processor,
                 ready_tx.clone(),
             );
@@ -206,20 +229,20 @@ impl HostedRuntime {
 }
 
 impl HostedMachine {
-    pub(crate) fn new(config: &HostedConfig) -> Arc<Self> {
+    pub(crate) fn new(
+        processor_count: usize,
+        bootstrap_processor: ProcessorId,
+        heap_bytes: usize,
+    ) -> Arc<Self> {
         let (timer_tx, timer_rx) = crossbeam_channel::unbounded();
         let started_at = StdInstant::now();
-        let payload = load_payload(config.bootfs());
         let machine = Arc::new(Self {
-            processor_count: config.processor_count(),
-            bootstrap_processor: config.bootstrap_processor(),
+            processor_count,
+            bootstrap_processor,
             started_at,
             timebase: Timebase::new(NANOS_PER_SECOND),
-            heap: HeapReservation::new(config.heap_bytes()),
-            payload,
-            slots: (0..config.processor_count())
-                .map(|_| ProcessorSlot::new())
-                .collect(),
+            heap: HeapReservation::new(heap_bytes),
+            slots: (0..processor_count).map(|_| ProcessorSlot::new()).collect(),
             timer_tx,
         });
         spawn_timer_thread(machine.clone(), timer_rx);
@@ -265,10 +288,64 @@ impl HostedMachine {
             .unpark();
     }
 
+    /// Whether `start_processor` has been called for `processor`; a
+    /// test's processor thread parks until it has, and a park can
+    /// return spuriously.
+    #[cfg(test)]
+    pub(crate) fn is_started(&self, processor: ProcessorId) -> bool {
+        self.slot(processor).started.load(Ordering::Acquire)
+    }
+
     pub(crate) fn wake_processor(&self, processor: ProcessorId) {
         let slot = self.slot(processor);
         if let Some(thread) = slot.thread.get() {
             thread.unpark();
+        }
+    }
+
+    /// Takes the calling processor's thread out of service until
+    /// [`Self::restart_processor`] names it.
+    ///
+    /// Its timer deadline is withdrawn first, so the timer thread does
+    /// not keep firing for a processor that runs nothing; bringing the
+    /// timer base back online programs a fresh one.
+    pub(crate) fn stop_current(&self, processor: ProcessorId) {
+        let _ = self.timer_tx.send(TimerCommand {
+            processor,
+            deadline: None,
+        });
+        let slot = self.slot(processor);
+        let mut run = slot.run.lock().unwrap();
+        match *run {
+            SlotRun::Running => *run = SlotRun::Stopped,
+            SlotRun::RestartPending => {
+                *run = SlotRun::Running;
+                return;
+            }
+            SlotRun::Stopped => {
+                panic!("processor {} stopped while already stopped", processor.id())
+            }
+        }
+        while *run == SlotRun::Stopped {
+            run = slot.restarted.wait(run).unwrap();
+        }
+    }
+
+    /// Puts a stopped processor's thread back in service; one that has
+    /// not reached its stop yet returns from it at once.
+    pub(crate) fn restart_processor(&self, processor: ProcessorId) {
+        let slot = self.slot(processor);
+        let mut run = slot.run.lock().unwrap();
+        match *run {
+            SlotRun::Stopped => {
+                *run = SlotRun::Running;
+                slot.restarted.notify_one();
+            }
+            SlotRun::Running => *run = SlotRun::RestartPending,
+            SlotRun::RestartPending => panic!(
+                "processor {} was restarted twice for one stop",
+                processor.id()
+            ),
         }
     }
 
@@ -310,6 +387,7 @@ impl HostedMachine {
 fn spawn_processor_thread(
     machine: Arc<HostedMachine>,
     config: HostedConfig,
+    payload: helios_kernel::BootPayload,
     processor: ProcessorId,
     ready_tx: Sender<ProcessorId>,
 ) -> JoinHandle<()> {
@@ -341,7 +419,7 @@ fn spawn_processor_thread(
                 .with_dma_model(DmaModel::Translated)
                 .with_devices(devices);
             let kernel = helios_kernel::init(platform);
-            let debug_state = shared_debug_state(&machine);
+            let debug_state = shared_debug_state(&machine, payload);
             if processor == machine.bootstrap_processor() {
                 init_serial();
 
@@ -408,14 +486,17 @@ fn load_payload(path: &std::path::Path) -> helios_kernel::BootPayload {
     })
 }
 
-fn shared_debug_state(machine: &HostedMachine) -> HostedRuntimeState {
+fn shared_debug_state(
+    machine: &HostedMachine,
+    payload: helios_kernel::BootPayload,
+) -> HostedRuntimeState {
     DEBUG_STATE
         .get_or_init(|| {
             helios_kernel::RuntimeState::new(
                 machine.timebase(),
                 machine.processor_count(),
                 machine.now_ticks(),
-                machine.payload,
+                payload,
             )
         })
         .clone()
@@ -438,6 +519,8 @@ impl ProcessorSlot {
         Self {
             thread: OnceLock::new(),
             started: AtomicBool::new(false),
+            run: Mutex::new(SlotRun::Running),
+            restarted: Condvar::new(),
         }
     }
 }

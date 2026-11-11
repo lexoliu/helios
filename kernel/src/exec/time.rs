@@ -159,6 +159,14 @@ mod tests {
 
         fn wake_processor(&self, _: ProcessorId) {}
 
+        fn stop_current(&self) {
+            panic!("test CPU never stops a processor")
+        }
+
+        fn restart_processor(&self, _: ProcessorId) {
+            panic!("test CPU never restarts a processor")
+        }
+
         fn now(&self) -> Instant {
             Instant::new(self.ticks.load(Ordering::Acquire))
         }

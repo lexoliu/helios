@@ -171,6 +171,7 @@ mod gic;
 mod gpu;
 mod host_fs;
 mod input;
+mod lifecycle;
 mod net;
 mod platform;
 mod rtc;
@@ -330,17 +331,22 @@ impl ExceptionStack {
 struct Aarch64ProcessorSlot {
     mp_info: &'static MpInfo,
     runtime: ProcessorRuntime,
+    /// Whether the processor is in service, and what it resumes from.
+    power: lifecycle::ProcessorPower,
 }
 
 struct Aarch64PlatformState {
     processors: Box<[Aarch64ProcessorSlot]>,
+    /// The PSCI service that stops and restarts processors, when the
+    /// platform describes one.
+    psci: Option<lifecycle::Psci>,
     timebase: Timebase,
     debug_state: Once<debug_state::RuntimeState>,
     gic: Once<gic::Gic>,
 }
 
 impl Aarch64PlatformState {
-    fn from_limine_mp(timebase: Timebase) -> &'static Self {
+    fn from_limine_mp(timebase: Timebase, psci: Option<platform::PsciConduit>) -> &'static Self {
         let response = MP_REQUEST
             .response()
             .unwrap_or_else(|| panic!("Limine did not provide an AArch64 MP response"));
@@ -373,12 +379,14 @@ impl Aarch64PlatformState {
                 Aarch64ProcessorSlot {
                     mp_info,
                     runtime: ProcessorRuntime::new(logical_id),
+                    power: lifecycle::ProcessorPower::new(),
                 }
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
         Box::leak(Box::new(Self {
             processors,
+            psci: psci.map(lifecycle::Psci::new),
             timebase,
             debug_state: Once::new(),
             gic: Once::new(),
@@ -412,6 +420,16 @@ impl Aarch64PlatformState {
         self.gic
             .get()
             .unwrap_or_else(|| panic!("AArch64 processor ran before the interrupt controller"))
+    }
+
+    /// The PSCI service a processor is stopped and restarted through.
+    fn psci(&self) -> lifecycle::Psci {
+        self.psci.unwrap_or_else(|| {
+            panic!(
+                "the platform describes no PSCI service (a device tree psci node, or the FADT's \
+                 PSCI_COMPLIANT flag), so a processor cannot be stopped or restarted"
+            )
+        })
     }
 
     fn bootstrap_mpidr(&self) -> u64 {
@@ -568,7 +586,7 @@ extern "C" fn aarch64_kernel_main() -> ! {
         .describe(console)
         .unwrap_or_else(|error| panic!("AArch64 platform description failed: {error}"));
     vmm::install_user_address_space(physical_memory_offset);
-    let platform_state = Aarch64PlatformState::from_limine_mp(timebase());
+    let platform_state = Aarch64PlatformState::from_limine_mp(timebase(), platform.psci);
     activate_processor_runtime(platform_state.bootstrap_runtime());
 
     let cpu = Aarch64Cpu {
@@ -911,6 +929,23 @@ impl Cpu for Aarch64Cpu {
 
     fn start_processor(&self, processor: ProcessorId) {
         self.state.start_processor(processor);
+    }
+
+    fn stop_current(&self) {
+        let runtime = current_processor_runtime();
+        let slot = self.state.processor_slot(runtime.logical_id());
+        slot.power.stop(
+            self.state.psci(),
+            slot.mp_info.mpidr,
+            self.state.gic(),
+            &runtime.wake_pending,
+        );
+    }
+
+    fn restart_processor(&self, processor: ProcessorId) {
+        let slot = self.state.processor_slot(processor);
+        slot.power
+            .restart(self.state.psci(), slot.mp_info.mpidr, self.state.timebase);
     }
 
     fn wake_processor(&self, processor: ProcessorId) {

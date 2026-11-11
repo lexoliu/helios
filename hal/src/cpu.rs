@@ -251,10 +251,22 @@ pub trait Cpu: Send + Sync + 'static {
     /// is ever programmed.
     const TIMER_INTERRUPT: TimerInterrupt;
 
-    /// Returns the number of processors the platform exposes to the kernel.
+    /// The size of the possible set: every processor this machine can
+    /// ever run, whether or not it is running now.
     ///
-    /// The kernel uses this to decide which secondary processors to start during SMP
-    /// bootstrap. This is a platform capability, not a scheduler state query.
+    /// Processor identifiers are dense: `ProcessorId::new(0)` up to
+    /// `processor_count() - 1` each name a slot the platform can bring
+    /// online, and nothing outside that range ever runs. The value is
+    /// fixed for the life of the machine — the firmware's maximum (the
+    /// MADT's online-capable entries, the device tree's CPU nodes, the
+    /// hypervisor's `maxcpus`), not the processors started at boot — so
+    /// a per-processor structure sized to it never has to grow when a
+    /// processor comes online.
+    ///
+    /// Which of these processors is running is the kernel's online set,
+    /// not a platform fact: a processor joins it when it has brought its
+    /// own per-processor state up and leaves it before
+    /// [`Cpu::stop_current`].
     fn processor_count(&self) -> usize;
 
     /// Returns the processor designated as the bootstrap processor.
@@ -284,7 +296,50 @@ pub trait Cpu: Send + Sync + 'static {
     /// This is the wakeup primitive used for cross-processor scheduling. On RISC-V
     /// this maps naturally to an IPI; in hosted mode it maps to unparking the
     /// backing thread.
+    ///
+    /// The kernel addresses only processors in its online set: a stopped
+    /// processor is never sent a wake.
     fn wake_processor(&self, processor: ProcessorId);
+
+    /// Takes the executing processor out of service until another
+    /// processor restarts it, and returns on this same processor once
+    /// it has been restarted.
+    ///
+    /// # Contract
+    ///
+    /// - The kernel calls this on the departing processor only, after
+    ///   it has removed the processor from its online set and torn down
+    ///   every per-processor owner, holding no lock and with no task
+    ///   mid-poll. Nothing the kernel does reaches the processor while
+    ///   it is stopped: no wake, no timer deadline, no work.
+    /// - While stopped the processor executes nothing and answers no
+    ///   interrupt. Its hardware thread is released to the firmware or
+    ///   hypervisor (`PSCI CPU_OFF`, SBI `hart_stop`, an x86 INIT-wait,
+    ///   a parked host thread), which is what makes the processor
+    ///   available to be removed.
+    /// - On return the processor's backend state — trap vectors, the
+    ///   processor identity register, its timer and interrupt
+    ///   controller — is re-established, and kernel memory is as the
+    ///   processor left it, so the kernel resumes on the stack it
+    ///   stopped on and brings its per-processor owners back up.
+    fn stop_current(&self);
+
+    /// Restarts a processor that [`Cpu::stop_current`] took out of
+    /// service, so that its `stop_current` returns.
+    ///
+    /// # Contract
+    ///
+    /// - The kernel calls this from another online processor, at most
+    ///   once per stop, and only after the departing processor has
+    ///   published that it is stopping. The processor may still be
+    ///   between that publication and the hardware stop; the backend
+    ///   owns that window (a stop flag, `PSCI AFFINITY_INFO`, a host
+    ///   thread's park token) and a restart sent inside it still
+    ///   restarts the processor exactly once.
+    /// - It returns once the restart has been handed to the platform,
+    ///   not when the processor is running kernel code again: the
+    ///   kernel learns that from the processor rejoining its online set.
+    fn restart_processor(&self, processor: ProcessorId);
 
     /// Returns the current monotonic time in platform timer ticks.
     fn now(&self) -> Instant;

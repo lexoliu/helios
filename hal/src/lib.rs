@@ -334,6 +334,14 @@ mod tests {
             panic!("test CPU should not wake processors")
         }
 
+        fn stop_current(&self) {
+            panic!("test CPU should not stop processors")
+        }
+
+        fn restart_processor(&self, _processor: ProcessorId) {
+            panic!("test CPU should not restart processors")
+        }
+
         fn now(&self) -> cpu::Instant {
             cpu::Instant::new(0)
         }

@@ -1060,7 +1060,8 @@ where
             uptime,
             wall_clock: self.wall_clock_nanos(current_ticks),
             configured_processors: self.inner.processor_count,
-            online_processors: self.inner.processor_count,
+            online_processors: u32::try_from(crate::online_processor_count())
+                .unwrap_or_else(|_| panic!("the online processor count does not fit a u32")),
             block: self.inner.block_service.get().map(BlockService::stats),
             iommu: self
                 .inner

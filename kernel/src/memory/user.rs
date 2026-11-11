@@ -282,6 +282,17 @@ impl UserMemoryPool {
         self.deallocate_with_processor(ptr, layout, None);
     }
 
+    /// Returns the frames `processor`'s slab shard caches to the buddy
+    /// heap, for a processor going offline: nothing allocates from that
+    /// shard while the processor is stopped.
+    pub(crate) fn release_processor_frames(&self, processor: ProcessorId) {
+        self.heap.with(|heap| {
+            self.frame_slab.drain_processor(processor, |ptr| unsafe {
+                heap.deallocate(ptr, PhysFrame::SIZE);
+            });
+        });
+    }
+
     pub fn deallocate_bytes_on(&self, processor: ProcessorId, ptr: NonNull<u8>, layout: Layout) {
         self.deallocate_with_processor(ptr, layout, Some(processor));
     }
@@ -466,6 +477,16 @@ pub(crate) fn installed_user_memory_pool() -> Option<&'static UserMemoryPool> {
         None
     } else {
         Some(unsafe { &*ptr })
+    }
+}
+
+/// The memory step of a processor going offline: every frame it holds
+/// for itself — its page-fault reserve and its slab shard — goes back
+/// to the pool. Run on the departing processor.
+pub(crate) fn release_processor_frames(processor: ProcessorId) {
+    super::frame_reserve::release(processor);
+    if let Some(pool) = installed_user_memory_pool() {
+        pool.release_processor_frames(processor);
     }
 }
 

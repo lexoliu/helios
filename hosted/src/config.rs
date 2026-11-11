@@ -4,7 +4,7 @@ use std::thread;
 
 use helios_hal::cpu::ProcessorId;
 
-const DEFAULT_HEAP_BYTES: usize = 128 * 1024 * 1024;
+pub(crate) const DEFAULT_HEAP_BYTES: usize = 128 * 1024 * 1024;
 
 /// Hosted runtime configuration sourced from the process environment.
 ///

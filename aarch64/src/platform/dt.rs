@@ -13,11 +13,14 @@ use helios_virtio::{InterruptTrigger, MmioInterrupt};
 
 use super::{
     ConsoleDescription, GicDescription, GrantableDevice, MAX_GRANTABLE_DEVICES, MmioRegion,
-    PlatformDescription, PlatformError, PlatformSource, Slots, SpiInterrupt, VirtioMmioSlot,
+    PlatformDescription, PlatformError, PlatformSource, PsciConduit, Slots, SpiInterrupt,
+    VirtioMmioSlot,
 };
 
 /// `compatible` string of the interrupt controller this backend drives.
 const GIC_V3: &str = "arm,gic-v3";
+/// `compatible` strings of the PSCI service node, 0.2 and later.
+const PSCI: [&str; 2] = ["arm,psci-1.0", "arm,psci-0.2"];
 /// `compatible` string of the console UART.
 const PL011: &str = "arm,pl011";
 /// `compatible` string of the real-time clock.
@@ -75,6 +78,7 @@ pub(super) fn describe(
         source: PlatformSource::DeviceTree,
         console,
         gic: gic(fdt)?,
+        psci: psci(fdt)?,
         rtc: find_compatible(fdt, PL031)
             .map(|node| first_region(&node, PL031))
             .transpose()?,
@@ -196,6 +200,35 @@ fn gic(fdt: &Fdt<'_>) -> Result<GicDescription, PlatformError> {
         // each frame by the affinity it reports for itself.
         redistributors: Slots::new(),
     })
+}
+
+/// The conduit of the `psci` node, when the tree has one this backend
+/// can call.
+///
+/// Only the PSCI 0.2 and later bindings are taken: they fix the function
+/// identifiers, where the original `arm,psci` binding names them in
+/// properties of the node and is not something any platform this backend
+/// runs on publishes.
+fn psci(fdt: &Fdt<'_>) -> Result<Option<PsciConduit>, PlatformError> {
+    let Some(node) = fdt.all_nodes().find(|node| {
+        node.compatible()
+            .is_some_and(|entries| entries.all().any(|entry| PSCI.contains(&entry)))
+    }) else {
+        return Ok(None);
+    };
+    let method = node
+        .property("method")
+        .and_then(|method| method.as_str())
+        .ok_or(PlatformError::DeviceTree(
+            "the psci node has no method property",
+        ))?;
+    match method {
+        "hvc" => Ok(Some(PsciConduit::Hvc)),
+        "smc" => Ok(Some(PsciConduit::Smc)),
+        _ => Err(PlatformError::DeviceTree(
+            "the psci node's method is neither hvc nor smc",
+        )),
+    }
 }
 
 fn spi(interrupt: MmioInterrupt) -> Result<SpiInterrupt, PlatformError> {

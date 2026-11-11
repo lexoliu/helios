@@ -133,6 +133,35 @@ impl Gic {
         tracing::debug!("GICv3 cpu interface online mpidr={mpidr:#x} redistributor={index}");
     }
 
+    /// Quiesces the calling processor's CPU interface and redistributor
+    /// for a PSCI power-down, the inverse of [`Gic::attach_current_processor`].
+    ///
+    /// The CPU interface stops signalling first, then the private
+    /// interrupts this backend enabled are disabled, and last the
+    /// redistributor is told the processor is asleep and the call waits for
+    /// it to say that nothing is left in flight, which the GIC requires
+    /// before the processor loses power.
+    pub(crate) fn detach_current_processor(&self, mpidr: u64) {
+        let index = self.with_registers(|gic| {
+            let index = redistributor_index(gic, mpidr, self.processor_count);
+            GicCpuInterface::enable_group1(false);
+            for intid in [VIRTUAL_TIMER_PPI, WAKE_SGI] {
+                gic.enable_interrupt(intid, Some(index), false)
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "AArch64 GIC could not disable {intid:?} on redistributor {index}: {error}"
+                        )
+                    });
+            }
+            gic.redistributor_mark_core_asleep(index)
+                .unwrap_or_else(|error| {
+                    panic!("AArch64 GIC redistributor {index} could not be put to sleep: {error}")
+                });
+            index
+        });
+        tracing::debug!("GICv3 cpu interface offline mpidr={mpidr:#x} redistributor={index}");
+    }
+
     /// Routes a device interrupt to the processor with `mpidr` and
     /// enables it with the trigger mode the device tree declared.
     pub(crate) fn enable_device_interrupt(&self, intid: IntId, trigger: Trigger, mpidr: u64) {

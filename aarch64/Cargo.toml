@@ -17,6 +17,7 @@ helios-hal.workspace = true
 helios-kernel = { workspace = true, default-features = false, features = ["wasmtime-bare-metal"] }
 helios-virtio.workspace = true
 limine = "0.6.5"
+smccc = "0.2.3"
 spin = "0.12.3"
 thiserror = { version = "2.0.20", default-features = false }
 triomphe = { version = "0.1.16", default-features = false }

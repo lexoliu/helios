@@ -79,5 +79,5 @@ pub use user::{
 };
 pub(crate) use user::{
     allocate_user_memory_pool, install_user_memory_pool, lend_user_memory_to_kernel_heap,
-    user_pool_available_bytes,
+    release_processor_frames, user_pool_available_bytes,
 };

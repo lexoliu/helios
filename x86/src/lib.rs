@@ -861,6 +861,23 @@ impl Cpu for X86Cpu {
             .start_processor(processor, secondary_start_rust as *const () as usize);
     }
 
+    /// Saves the callee-saved context, leaves the shootdown set, masks the
+    /// local APIC timer and halts with interrupts masked until
+    /// [`Cpu::restart_processor`] sends INIT/SIPI; the handshake and what
+    /// is re-seeded on the way back are in `smp::stop_current_processor`.
+    fn stop_current(&self) {
+        smp::stop_current_processor();
+    }
+
+    /// May land at any point after the kernel published the stop: the
+    /// restart waits for the processor to reach its halt, then claims the
+    /// stop with a compare-exchange, so it restarts the processor exactly
+    /// once (`smp::X86PlatformState::restart_processor`).
+    fn restart_processor(&self, processor: ProcessorId) {
+        self.state
+            .restart_processor(processor, smp::resume_current_rust as *const () as usize);
+    }
+
     fn wake_processor(&self, processor: ProcessorId) {
         // Publish before signalling: `park_current` masks interrupts
         // around its own test, so a target on its way into HLT either

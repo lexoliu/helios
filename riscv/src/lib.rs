@@ -158,6 +158,7 @@ use riscv::interrupt::supervisor::{Exception, Interrupt};
 use riscv_rt::entry;
 use spin::Once;
 
+mod lifecycle;
 mod trap;
 
 pub use trap::{GeneralRegs, TrapFrame};
@@ -456,6 +457,7 @@ impl Cpu for RiscvCpu {
                 self.wake_processor(hart);
             }
             sbi_spec::hsm::hart_state::STOPPED => {
+                lifecycle::assert_never_stopped(hart);
                 let ret = sbi_rt::hart_start(
                     hart.id() as usize,
                     core::ptr::addr_of!(_secondary_start).addr(),
@@ -478,6 +480,14 @@ impl Cpu for RiscvCpu {
                 state
             ),
         }
+    }
+
+    fn stop_current(&self) {
+        lifecycle::stop_current();
+    }
+
+    fn restart_processor(&self, hart: ProcessorId) {
+        lifecycle::restart_processor(hart);
     }
 
     fn wake_processor(&self, hart: ProcessorId) {
@@ -624,9 +634,21 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
     write_hart_identity(ProcessorIdentity::bootstrapping(hart_id));
     let fdt = unsafe { Fdt::from_ptr(fdt_addr as *const u8) }
         .expect("OpenSBI did not provide a valid FDT");
-    let mut cpus = fdt.cpus();
-    let first_cpu = cpus.next().expect("FDT does not describe any CPU");
+    let mut cpus = fdt.cpus().filter(|cpu| cpu_is_usable(*cpu));
+    let first_cpu = cpus.next().expect("FDT does not describe any usable CPU");
     let hart_count = 1 + cpus.count();
+    // Processor ids are the hart ids and the possible set is dense, so the
+    // usable harts must be exactly `0..hart_count`: a gap would name a
+    // processor the machine cannot start, and an id past the count one
+    // the kernel never sizes for.
+    for cpu in fdt.cpus().filter(|cpu| cpu_is_usable(*cpu)) {
+        let id = cpu.ids().first();
+        assert!(
+            id < hart_count,
+            "FDT describes usable hart {id} but only {hart_count} harts are usable; \
+             processor ids are hart ids and must be dense"
+        );
+    }
     assert!(
         hart_count <= MAX_TRACKED_HARTS,
         "FDT describes {hart_count} harts but this backend tracks at most {MAX_TRACKED_HARTS}"
@@ -921,6 +943,21 @@ fn shared_debug_state(
         .clone()
 }
 
+/// Whether a `/cpus/cpu*` node describes a hart the machine can run.
+///
+/// The device tree specification defaults `status` to `okay` when absent;
+/// `disabled` is a hart that is present but not started (it may be brought
+/// up later), and `reserved` and `fail` are not usable at all. None of the
+/// three is a processor this kernel's possible set holds.
+fn cpu_is_usable(cpu: fdt::standard_nodes::Cpu<'_, '_>) -> bool {
+    cpu.property("status").is_none_or(|status| {
+        status
+            .as_str()
+            .unwrap_or_else(|| panic!("a cpu node's status is not a string"))
+            == "okay"
+    })
+}
+
 fn shared_watchdog(fdt: &Fdt<'_>) -> watchdog::RiscvWatchdog {
     WATCHDOG_STATE.call_once(|| watchdog::discover(fdt)).clone()
 }
@@ -929,6 +966,7 @@ unsafe extern "C" {
     static __ebss: u8;
     static _stack_start: u8;
     static _secondary_start: u8;
+    static _hart_restart: u8;
     fn _release_mp_harts();
 }
 

@@ -13,6 +13,7 @@ mod compaction;
 mod executor;
 mod idle;
 mod in_flight;
+mod lifecycle;
 mod observer;
 pub(crate) mod phases;
 mod sync;
@@ -28,11 +29,14 @@ pub use compaction::{
 pub(crate) use executor::executor_test_guard;
 pub(crate) use executor::task_arena_bytes;
 pub use executor::{
-    Executor, ExecutorRunStats, InstanceSpawner, JoinHandle, LocalJoinHandle, READY_BATCH_TASKS,
-    Spawner, TaskCapacityError, TaskFunding,
+    Executor, ExecutorRunStats, InstanceSpawner, JoinHandle, LocalJoinHandle, PinnedTasks,
+    READY_BATCH_TASKS, Spawner, TaskCapacityError, TaskFunding,
 };
 pub use idle::IdleOutcome;
 pub use in_flight::InFlight;
+pub use lifecycle::{
+    OfflineError, OfflineRefusal, OnlineError, OnlineSet, ProcessorControl, online_processor_count,
+};
 pub use observer::{
     DEFAULT_PERF_METRIC_CAPACITY, DEFAULT_PROFILE_STACK_CAPACITY, DEFAULT_TRACE_HISTORY_CAPACITY,
     FoldedProfileSample, PerfMetricFilter, PerfMetricHistory, PerfMetricSample, PerfSample,

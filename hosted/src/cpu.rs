@@ -1,25 +1,27 @@
 use std::sync::Arc;
 use std::thread;
 
-use helios_hal::cpu::{Cpu, Instant, ProcessorId, Timebase, TimerInterrupt};
+use helios_hal::cpu::{Cpu, Instant, ProcessorId, Timebase, TimerInterrupt, current_processor};
 use helios_hal::entropy::{EntropyQuality, EntropyUnavailable};
 
 use crate::runtime::HostedMachine;
 
 /// Hosted CPU adapter that exposes one OS thread as one logical processor.
 ///
-/// The processor id is fixed when the thread starts, which makes
-/// `current_processor()` trivial and avoids any TLS lookup in the hot path.
+/// A handle names the machine, not a processor: like a register read on
+/// bare metal, every per-processor operation acts on the thread that
+/// calls it, whose identity [`HostedCpu::new`] seeded.
 #[derive(Clone)]
 pub struct HostedCpu {
-    processor: ProcessorId,
     machine: Arc<HostedMachine>,
 }
 
 impl HostedCpu {
+    /// The handle for the calling thread, which stands for `processor`
+    /// from here on.
     pub fn new(processor: ProcessorId, machine: Arc<HostedMachine>) -> Self {
         set_current_processor(processor);
-        Self { processor, machine }
+        Self { machine }
     }
 }
 
@@ -74,6 +76,14 @@ impl Cpu for HostedCpu {
         self.machine.wake_processor(processor);
     }
 
+    fn stop_current(&self) {
+        self.machine.stop_current(current_processor());
+    }
+
+    fn restart_processor(&self, processor: ProcessorId) {
+        self.machine.restart_processor(processor);
+    }
+
     fn now(&self) -> Instant {
         self.machine.now()
     }
@@ -83,7 +93,7 @@ impl Cpu for HostedCpu {
     }
 
     fn set_deadline(&self, deadline: Instant) {
-        self.machine.set_deadline(self.processor, deadline);
+        self.machine.set_deadline(current_processor(), deadline);
     }
 
     fn publish_executable(&self, _ptr: *const u8, _len: usize) {}
