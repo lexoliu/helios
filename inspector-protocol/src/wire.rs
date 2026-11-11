@@ -3,11 +3,29 @@ use std::pin::Pin;
 
 use futures_io::{AsyncRead, AsyncWrite};
 
+use crate::error::WireError;
+
 #[cfg(feature = "host")]
 use std::io::Write as _;
 
 pub(crate) const FRAME_MAGIC: [u8; 8] = [0xff, 0x00, b'H', b'R', b'P', b'C', 0xaa, 0x55];
-const MAX_FRAME_SIZE: usize = 1 << 20;
+
+/// Largest frame payload the reader accepts, in bytes.
+///
+/// The largest legitimate payload is one raw-transfer chunk plus its
+/// fixed fields, well under this; the bound exists so the length in a
+/// frame header, which the guest controls, never sizes an allocation
+/// beyond it.
+pub(crate) const MAX_FRAME_SIZE: usize = 1 << 20;
+
+/// Longest run of guest console bytes the frame scanner holds while it
+/// waits for a newline or a frame header, in bytes.
+///
+/// Kernel log and panic lines are a few hundred bytes; the bound exists
+/// so a guest that never terminates a line cannot grow the host's
+/// buffer without limit.
+#[cfg(feature = "host")]
+pub(crate) const MAX_CONSOLE_LINE_BYTES: usize = 64 * 1024;
 
 /// The line the kernel's panic path always writes to the console,
 /// carrying the message and the source location on one line.
@@ -80,10 +98,11 @@ where
     read_exact(io, &mut len).await?;
     let len = u32::from_le_bytes(len) as usize;
     if len > MAX_FRAME_SIZE {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("frame payload {len} exceeds the maximum supported size"),
-        ));
+        return Err(WireError::FrameTooLarge {
+            len,
+            max: MAX_FRAME_SIZE,
+        }
+        .into());
     }
 
     let mut payload = vec![0_u8; len];
@@ -135,6 +154,12 @@ where
                 }
                 stray.push(byte[0]);
                 flush_stray_bytes_on_newline(&mut stray, &mut console)?;
+                if stray.len() > MAX_CONSOLE_LINE_BYTES {
+                    return Err(WireError::ConsoleLineTooLong {
+                        max: MAX_CONSOLE_LINE_BYTES,
+                    }
+                    .into());
+                }
             }
             matched = usize::from(byte[0] == FRAME_MAGIC[0]);
         }
@@ -405,14 +430,7 @@ fn encode_bytes(buffer: &mut Vec<u8>, value: &[u8]) -> io::Result<()> {
 }
 
 fn decode_bytes(payload: &mut &[u8]) -> io::Result<Vec<u8>> {
-    let len = usize::try_from(decode_u32(payload)?)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    if payload.len() < len {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "truncated byte slice field",
-        ));
-    }
+    let len = checked_len(payload, "byte slice", 1)?;
     let (bytes, rest) = payload.split_at(len);
     *payload = rest;
     Ok(bytes.to_vec())
@@ -429,13 +447,38 @@ fn encode_u32_vec(buffer: &mut Vec<u8>, values: &[u32]) -> io::Result<()> {
 }
 
 fn decode_u32_vec(payload: &mut &[u8]) -> io::Result<Vec<u32>> {
-    let len = usize::try_from(decode_u32(payload)?)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let len = checked_len(payload, "u32 vector", core::mem::size_of::<u32>())?;
     let mut values = Vec::with_capacity(len);
     for _ in 0..len {
         values.push(decode_u32(payload)?);
     }
     Ok(values)
+}
+
+/// Reads a `u32` element count and returns it once `payload` is known
+/// to hold `count * element_size` more bytes.
+///
+/// Every length-prefixed field is sized through this, so nothing is
+/// allocated from a count the remaining input cannot back.
+fn checked_len(payload: &mut &[u8], field: &'static str, element_size: usize) -> io::Result<usize> {
+    let count = decode_u32(payload)?;
+    let remaining = payload.len();
+    // A count that overflows `usize` cannot fit in any input either.
+    let needed = usize::try_from(count)
+        .ok()
+        .and_then(|count| count.checked_mul(element_size))
+        .unwrap_or(usize::MAX);
+    if needed > remaining {
+        return Err(WireError::LengthExceedsInput {
+            field,
+            len: count,
+            needed,
+            remaining,
+        }
+        .into());
+    }
+    // `needed <= remaining` implies `count <= remaining`.
+    Ok(count as usize)
 }
 
 #[cfg(all(test, feature = "host"))]
@@ -525,6 +568,91 @@ unhandled x86 kernel exception after Wasmtime dispatch: fault details / Kernel p
                 .is_some_and(|report| report.contains("instance terminated: OutOfMemory")),
             "the fault names what the guest died of: {transport}"
         );
+    }
+
+    fn wire_error(error: &io::Error) -> &WireError {
+        WireError::from_io(error).expect("the error carries the typed wire fault")
+    }
+
+    #[test]
+    fn a_vector_length_the_input_cannot_back_is_refused_before_allocating() {
+        // u32::MAX elements would be a 16 GiB reservation; only 4 bytes follow.
+        let mut input = Vec::new();
+        encode_u32(&mut input, u32::MAX);
+        encode_u32(&mut input, 7);
+        let error = decode_u32_vec(&mut input.as_slice()).expect_err("length exceeds input");
+        assert_eq!(
+            wire_error(&error),
+            &WireError::LengthExceedsInput {
+                field: "u32 vector",
+                len: u32::MAX,
+                needed: u32::MAX as usize * 4,
+                remaining: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn a_vector_exactly_filling_the_input_decodes() {
+        let mut input = Vec::new();
+        encode_u32_vec(&mut input, &[1, 2, 3]).expect("encodes");
+        assert_eq!(
+            decode_u32_vec(&mut input.as_slice()).expect("decodes"),
+            [1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn a_byte_length_the_input_cannot_back_is_refused() {
+        let mut input = Vec::new();
+        encode_u32(&mut input, u32::MAX);
+        input.extend_from_slice(b"abc");
+        let error = decode_bytes(&mut input.as_slice()).expect_err("length exceeds input");
+        assert!(matches!(
+            wire_error(&error),
+            WireError::LengthExceedsInput {
+                len: u32::MAX,
+                remaining: 3,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn an_oversized_frame_header_is_refused() {
+        let mut input = FRAME_MAGIC.to_vec();
+        input.extend_from_slice(&u32::MAX.to_le_bytes());
+        let error = futures_lite::future::block_on(read_frame(&mut input.as_slice()))
+            .expect_err("frame exceeds maximum");
+        assert_eq!(
+            wire_error(&error),
+            &WireError::FrameTooLarge {
+                len: u32::MAX as usize,
+                max: MAX_FRAME_SIZE,
+            }
+        );
+    }
+
+    #[test]
+    fn an_unterminated_console_line_is_refused() {
+        let input = vec![b'x'; MAX_CONSOLE_LINE_BYTES + 1];
+        let error = futures_lite::future::block_on(sync_to_frame(&mut input.as_slice()))
+            .expect_err("the line never ends");
+        assert_eq!(
+            wire_error(&error),
+            &WireError::ConsoleLineTooLong {
+                max: MAX_CONSOLE_LINE_BYTES
+            }
+        );
+    }
+
+    #[test]
+    fn a_console_line_at_the_maximum_is_accepted() {
+        let mut input = vec![b'x'; MAX_CONSOLE_LINE_BYTES - 1];
+        input.push(b'\n');
+        let found = futures_lite::future::block_on(sync_to_frame(&mut input.as_slice()))
+            .expect("a line within the bound is console output");
+        assert!(!found, "no frame header was present");
     }
 
     #[test]
