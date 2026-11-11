@@ -80,9 +80,13 @@ fn lower_bytes_to_vec(bytes: Bytes) -> Vec<u8> {
 mod device;
 mod mounts;
 pub(crate) use device::record_linear_memory;
+mod pending;
+pub(crate) use pending::PendingReply;
 pub mod service;
 mod topology;
+mod views;
 mod vsock;
+pub(crate) use views::{guest_memory, view_trap};
 
 pub use service::{
     BlobHandle, ChildExit, ChildHandle, ClientSurfaceHandle, CommandBufferHandle, ContextHandle,
@@ -113,6 +117,7 @@ pub type StoreData<CpuImpl, Net, HostFs> = ComponentStoreData<
     HostRuntimeState<CpuImpl, Net, HostFs>,
     crate::Namespace<HostFs>,
     ResourceTable,
+    wasmtime::Memory,
 >;
 pub type OutputMode = ComponentOutputMode;
 pub type OutputRoute = ComponentOutputRoute;
