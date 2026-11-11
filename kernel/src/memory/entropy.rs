@@ -431,13 +431,14 @@ pub const ENTROPY_RESEED_INTERVAL: Duration = Duration::from_secs(60);
 /// completions are: a backend routes the entropy interrupt to the
 /// processor that brought the device up, so its sole reader belongs on
 /// that processor's run queue rather than on the work-stealing one.
-pub fn install_entropy_device<CpuImpl, WatchdogImpl, Device>(
-    kernel: &Kernel<CpuImpl, WatchdogImpl>,
+pub fn install_entropy_device<CpuImpl, WatchdogImpl, MeasuredBootImpl, Device>(
+    kernel: &Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
     root: RootEntropyHandle,
     device: Device,
 ) where
     CpuImpl: Cpu + Clone + Send + Sync + 'static,
     WatchdogImpl: Watchdog + Clone,
+    MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
     Device: HardwareEntropySource,
 {
     let timer = kernel.timer();

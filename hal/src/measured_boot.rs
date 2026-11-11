@@ -20,6 +20,11 @@
 //! yields to the executor on every not-ready read, so a slow device
 //! never pins a processor and needs no interrupt-masking lock.
 //!
+//! An operation's future waits on nothing but the device: no timer, no
+//! interrupt, no other task. Every poll reads the device again, so the
+//! future completes under any poller, the kernel's bring-up included,
+//! which drives it before the executor runs.
+//!
 //! Every value type here is a plain value and may cross processors
 //! freely; [`SealedSecret`] is the one that is neither `Copy` nor
 //! `Clone`, and it erases its bytes when dropped.
@@ -157,6 +162,14 @@ impl SealedSecret {
 
     pub const fn new(bytes: [u8; Self::LEN]) -> Self {
         Self(bytes)
+    }
+
+    /// A secret whose bytes `fill` writes in place, so the caller never
+    /// holds a copy of them outside the secret.
+    pub fn filled_by(fill: impl FnOnce(&mut [u8; Self::LEN])) -> Self {
+        let mut secret = Self([0; Self::LEN]);
+        fill(&mut secret.0);
+        secret
     }
 
     /// The secret's bytes.
@@ -323,5 +336,16 @@ mod tests {
     fn a_sealed_secret_never_prints_its_bytes() {
         let secret = SealedSecret::new([0x5a; SealedSecret::LEN]);
         assert_eq!(alloc::format!("{secret:?}"), "SealedSecret(..)");
+    }
+
+    #[test]
+    fn a_secret_filled_in_place_holds_what_was_written() {
+        let secret = SealedSecret::filled_by(|bytes| {
+            for (index, byte) in bytes.iter_mut().enumerate() {
+                *byte = index as u8;
+            }
+        });
+        assert_eq!(secret.expose()[0], 0);
+        assert_eq!(secret.expose()[31], 31);
     }
 }

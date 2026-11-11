@@ -56,13 +56,14 @@ use super::{InputService, InputServiceError, MAX_CLAIMED_DEVICES};
 /// devices, which is more than the kernel can route interrupts for: a
 /// device past that bound is one whose events would never arrive, and
 /// bringing it up silently would leave a keyboard that never reports.
-pub fn install_input_devices<CpuImpl, WatchdogImpl, Device, Devices>(
-    kernel: &Kernel<CpuImpl, WatchdogImpl>,
+pub fn install_input_devices<CpuImpl, WatchdogImpl, MeasuredBootImpl, Device, Devices>(
+    kernel: &Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
     devices: Devices,
 ) -> InputService
 where
     CpuImpl: Cpu + Clone + Send + Sync + 'static,
     WatchdogImpl: Watchdog + Clone,
+    MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
     Device: InputDevice + Clone,
     Devices: IntoIterator<Item = Device>,
 {

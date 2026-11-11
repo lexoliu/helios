@@ -196,13 +196,14 @@ impl BalloonHandle {
 /// The tasks are local to the calling processor because the device's
 /// completions are: a backend routes the balloon interrupt to the
 /// processor that brought the device up.
-pub fn install_memory_balloon<CpuImpl, WatchdogImpl, Device>(
-    kernel: &Kernel<CpuImpl, WatchdogImpl>,
+pub fn install_memory_balloon<CpuImpl, WatchdogImpl, MeasuredBootImpl, Device>(
+    kernel: &Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
     device: Device,
 ) -> BalloonHandle
 where
     CpuImpl: Cpu + Clone + Send + Sync + 'static,
     WatchdogImpl: Watchdog + Clone,
+    MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
     Device: MemoryBalloon + Clone,
 {
     let pool = installed_user_memory_pool()

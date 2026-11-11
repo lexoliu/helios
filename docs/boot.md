@@ -40,7 +40,8 @@ shape error, and each backend's panic message carries it. A bootfs file
 is classified as a precompiled artifact by Wasmtime's own header check,
 not by a trailer. A cwasm outside the payload (a file a guest wrote, one
 on the host share) still carries the signature trailer and is verified
-against the trusted roots when it loads.
+when it loads against the kernel's compiler-signing key, never against
+the trusted roots (`kernel/src/signing_key.rs`).
 
 ## How each backend hands it over
 

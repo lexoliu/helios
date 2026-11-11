@@ -59,14 +59,15 @@ use super::{DisplayServiceError, MAX_PINNED_FRAMES};
 /// The device is never handed anywhere else. What callers get back is a
 /// handle to the tasks this spawns, which is what a claim and every
 /// frame after it travels through.
-pub fn install_display_device<CpuImpl, WatchdogImpl, Device>(
-    kernel: &Kernel<CpuImpl, WatchdogImpl>,
+pub fn install_display_device<CpuImpl, WatchdogImpl, MeasuredBootImpl, Device>(
+    kernel: &Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
     cpu: &CpuImpl,
     device: Device,
 ) -> DisplayService
 where
     CpuImpl: Cpu + Clone + Send + Sync + 'static,
     WatchdogImpl: Watchdog + Clone,
+    MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
     Device: DisplayDevice + Clone,
 {
     let (shared, control_rx, cursor_rx) = display_channels();

@@ -319,14 +319,15 @@ impl BlockDevice for BlockService {
 /// `install` receives the service; it is the backend's runtime state
 /// slot. The task runs on the calling processor because that is where
 /// the devices' completions are delivered.
-pub fn install_block_devices<CpuImpl, WatchdogImpl, Device, Install>(
-    kernel: &Kernel<CpuImpl, WatchdogImpl>,
+pub fn install_block_devices<CpuImpl, WatchdogImpl, MeasuredBootImpl, Device, Install>(
+    kernel: &Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
     root: RootEntropyHandle,
     devices: Vec<Device>,
     install: Install,
 ) where
     CpuImpl: Cpu + Clone + Send + Sync + 'static,
     WatchdogImpl: Watchdog + Clone,
+    MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
     Device: BlockDevice + 'static,
     Install: FnOnce(BlockService) + 'static,
 {

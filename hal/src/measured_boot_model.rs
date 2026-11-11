@@ -14,6 +14,11 @@
 //! when their folds are (up to a SHA-256 collision), so the model's
 //! answers are the device's answers without a hash in this crate.
 //!
+//! A consumer's tests also need to see what it asked of the device and
+//! how it reacts when the device fails, so the model journals every
+//! operation it is asked for since the last power cycle and fails the
+//! next operation of a kind with an error the test chooses.
+//!
 //! Like [`crate::vmm_test_harness`], the model lives in `hal` so every
 //! consumer's tests share it instead of each writing its own.
 
@@ -42,11 +47,64 @@ enum Slot {
     },
 }
 
+/// One operation a consumer asked the device for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Operation {
+    Extend {
+        register: MeasurementRegister,
+        digest: Sha256Digest,
+    },
+    LoadSealed {
+        bound_to: MeasurementSet,
+    },
+    StoreSealed {
+        bound_to: MeasurementSet,
+    },
+}
+
+impl Operation {
+    pub const fn kind(&self) -> OperationKind {
+        match self {
+            Self::Extend { .. } => OperationKind::Extend,
+            Self::LoadSealed { .. } => OperationKind::LoadSealed,
+            Self::StoreSealed { .. } => OperationKind::StoreSealed,
+        }
+    }
+}
+
+/// Which of the contract's operations an [`Operation`] is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OperationKind {
+    Extend,
+    LoadSealed,
+    StoreSealed,
+}
+
+/// The errors the next operation of each kind fails with.
+#[derive(Default)]
+struct Faults {
+    extend: Option<MeasuredBootError>,
+    load_sealed: Option<MeasuredBootError>,
+    store_sealed: Option<MeasuredBootError>,
+}
+
+impl Faults {
+    fn slot(&mut self, kind: OperationKind) -> &mut Option<MeasuredBootError> {
+        match kind {
+            OperationKind::Extend => &mut self.extend,
+            OperationKind::LoadSealed => &mut self.load_sealed,
+            OperationKind::StoreSealed => &mut self.store_sealed,
+        }
+    }
+}
+
 /// A measurement device whose registers and slot live in memory.
 pub struct MeasuredBootModel {
     kernel_image_registers: MeasurementSet,
     registers: [RegisterHistory; MeasurementSet::CAPACITY as usize],
     slot: Slot,
+    journal: Vec<Operation>,
+    faults: Faults,
 }
 
 impl MeasuredBootModel {
@@ -58,14 +116,39 @@ impl MeasuredBootModel {
             kernel_image_registers,
             registers: core::array::from_fn(|_| Vec::new()),
             slot: Slot::Absent,
+            journal: Vec::new(),
+            faults: Faults::default(),
         }
     }
 
-    /// Returns every register to its reset value, as a power cycle does.
-    /// The slot is non-volatile and keeps what it holds.
+    /// Returns every register to its reset value, as a power cycle does,
+    /// and starts a new journal. The slot is non-volatile and keeps what
+    /// it holds.
     pub fn power_cycle(&mut self) {
         for register in &mut self.registers {
             register.clear();
+        }
+        self.journal.clear();
+    }
+
+    /// Every operation asked for since the last power cycle, oldest
+    /// first, the failed ones included.
+    pub fn journal(&self) -> &[Operation] {
+        &self.journal
+    }
+
+    /// Makes the next operation of `kind` fail with `error` and change
+    /// nothing, as a device whose interface broke mid-command would.
+    pub fn fail_next(&mut self, kind: OperationKind, error: MeasuredBootError) {
+        *self.faults.slot(kind) = Some(error);
+    }
+
+    /// Journals `operation` and answers the fault armed for its kind.
+    fn begin(&mut self, operation: Operation) -> Result<(), MeasuredBootError> {
+        self.journal.push(operation);
+        match self.faults.slot(operation.kind()).take() {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
     }
 
@@ -93,6 +176,10 @@ impl MeasuredBoot for MeasuredBootModel {
         register: MeasurementRegister,
         digest: &Sha256Digest,
     ) -> Result<(), MeasuredBootError> {
+        self.begin(Operation::Extend {
+            register,
+            digest: *digest,
+        })?;
         self.registers[usize::from(register.index())].push(*digest);
         Ok(())
     }
@@ -101,6 +188,7 @@ impl MeasuredBoot for MeasuredBootModel {
         &mut self,
         bound_to: MeasurementSet,
     ) -> Result<SealedSecret, UnsealRefused> {
+        self.begin(Operation::LoadSealed { bound_to })?;
         let current = self.snapshot(bound_to);
         match &self.slot {
             Slot::Absent => Err(UnsealRefused::Empty),
@@ -124,6 +212,7 @@ impl MeasuredBoot for MeasuredBootModel {
         bound_to: MeasurementSet,
         secret: &SealedSecret,
     ) -> Result<(), MeasuredBootError> {
+        self.begin(Operation::StoreSealed { bound_to })?;
         self.slot = Slot::Sealed {
             bound_to,
             state: self.snapshot(bound_to),
@@ -270,6 +359,76 @@ mod tests {
             complete(model.load_sealed(BOUND)).unwrap_err(),
             UnsealRefused::StateChanged
         );
+    }
+
+    #[test]
+    fn the_journal_records_this_boots_operations_in_order() {
+        let mut model = MeasuredBootModel::new(BOUND);
+        boot(&mut model, 0x09);
+        complete(model.store_sealed(BOUND, &secret(0xa5))).unwrap();
+
+        model.power_cycle();
+        assert!(model.journal().is_empty());
+        boot(&mut model, 0x09);
+        complete(model.load_sealed(BOUND)).unwrap();
+        assert_eq!(
+            model.journal(),
+            [
+                Operation::Extend {
+                    register: PCR4,
+                    digest: digest(0x04),
+                },
+                Operation::Extend {
+                    register: PCR9,
+                    digest: digest(0x09),
+                },
+                Operation::LoadSealed { bound_to: BOUND },
+            ]
+        );
+    }
+
+    #[test]
+    fn an_armed_fault_fails_the_next_operation_of_its_kind_once() {
+        let fault = MeasuredBootError::Interface {
+            what: "a status register that never settles",
+        };
+        let mut model = MeasuredBootModel::new(BOUND);
+        model.fail_next(OperationKind::Extend, fault);
+
+        assert_eq!(complete(model.extend(PCR9, &digest(0x09))), Err(fault));
+        complete(model.extend(PCR9, &digest(0x09))).unwrap();
+        complete(model.store_sealed(BOUND, &secret(0xa5))).unwrap();
+
+        // The failed extend changed nothing: one extend is in the state.
+        model.power_cycle();
+        complete(model.extend(PCR9, &digest(0x09))).unwrap();
+        assert!(complete(model.load_sealed(BOUND)).is_ok());
+        assert_eq!(model.journal().len(), 2);
+    }
+
+    #[test]
+    fn a_failed_load_is_a_device_error_and_a_failed_store_keeps_the_slot() {
+        let fault = MeasuredBootError::Timeout {
+            state: "command ready",
+            waited_ms: 750,
+        };
+        let mut model = MeasuredBootModel::new(BOUND);
+        boot(&mut model, 0x09);
+        complete(model.store_sealed(BOUND, &secret(0xa5))).unwrap();
+
+        model.fail_next(OperationKind::LoadSealed, fault);
+        assert_eq!(
+            complete(model.load_sealed(BOUND)).unwrap_err(),
+            UnsealRefused::Device(fault)
+        );
+
+        model.fail_next(OperationKind::StoreSealed, fault);
+        assert_eq!(
+            complete(model.store_sealed(BOUND, &secret(0x5a))),
+            Err(fault)
+        );
+        let loaded = complete(model.load_sealed(BOUND)).unwrap();
+        assert_eq!(loaded.expose(), secret(0xa5).expose());
     }
 
     #[test]
