@@ -749,10 +749,15 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
         .then(|| entropy::bring_up(&fdt))
         .flatten();
     let root_entropy = (current_hart == bootstrap_processor).then(|| {
+        // No VM generation ID window is discovered on this platform yet,
+        // so the machine generation moves only through `advance`.
+        let generation = helios_kernel::MachineGeneration::new(None);
+        debug_state.install_machine_generation(generation.clone());
         let root = helios_kernel::seed_root_entropy(
             &cpu,
             helios_hal::entropy::device_tree_seed(&fdt),
             entropy_device.as_ref().map(|entropy| &entropy.device),
+            generation,
         );
         debug_state.install_root_entropy(root.clone());
         // The calendar is read once, on the bootstrap hart, before any
