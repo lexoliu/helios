@@ -308,7 +308,12 @@ jobs:
           # The same fetch through the plugin's TLS transport: the
           # handshake, the certificate chain against the compiled-in
           # roots, and the validity window against the wall clock the
-          # platform RTC seeded.
+          # platform RTC seeded. The same boot then fetches from three
+          # origins that each present a bad certificate (expired, issued
+          # for another name, self-signed), which must each fail as
+          # `tls-certificate-error`; the trailing `true` keeps the last
+          # failed fetch's exit status from failing the step before the
+          # log is read.
           runtime="$GITHUB_WORKSPACE/smoke-runtime/curl-https"
           mkdir -p "$runtime"
           ./target/release/helios-inspector vm --arch riscv64 --release --memory 2G \
@@ -316,9 +321,10 @@ jobs:
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program debugger \
             --boot-program curl --boot-program http-client --no-compiler-plugin \
-            shell -c 'curl https://detectportal.firefox.com/success.txt' 2>&1 > curl-https-smoke.out | tee "$runtime/inspector.log"
+            shell -c 'curl https://detectportal.firefox.com/success.txt; curl https://expired.badssl.com/; curl https://wrong.host.badssl.com/; curl https://self-signed.badssl.com/; true' 2>&1 > curl-https-smoke.out | tee "$runtime/inspector.log"
           cat curl-https-smoke.out
           grep -Fqx success curl-https-smoke.out
+          test "$(grep -c 'http request failed: TlsCertificateError' "$runtime/inspector.log")" -eq 3
       - name: Upload the inspector runtime directories
         if: failure()
         uses: actions/upload-artifact@v4
@@ -1045,7 +1051,8 @@ jobs:
           # Without this the step reports tee's status, not the
           # command's, and a runner script that fails is invisible.
           set -o pipefail
-          # The counterpart of smoke-riscv64's TLS step, under KVM.
+          # The counterpart of smoke-riscv64's TLS step, under KVM, with the
+          # same three bad-certificate fetches.
           runtime="$GITHUB_WORKSPACE/smoke-runtime/curl-https"
           mkdir -p "$runtime"
           ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
@@ -1053,10 +1060,11 @@ jobs:
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program debugger \
             --boot-program curl --boot-program http-client --no-compiler-plugin \
-            shell -c 'curl https://detectportal.firefox.com/success.txt' \
+            shell -c 'curl https://detectportal.firefox.com/success.txt; curl https://expired.badssl.com/; curl https://wrong.host.badssl.com/; curl https://self-signed.badssl.com/; true' \
             2>&1 > curl-https-smoke.out | tee "$runtime/inspector.log"
           cat curl-https-smoke.out
           grep -Fqx success curl-https-smoke.out
+          test "$(grep -c 'http request failed: TlsCertificateError' "$runtime/inspector.log")" -eq 3
       - name: Draw on the display and capture the scanout
         shell: bash
         working-directory: helios
