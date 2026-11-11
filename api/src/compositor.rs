@@ -7,9 +7,14 @@
 //! `destroy` whenever a client asks for a window, publishes pixels in
 //! one, or lets one go — all of them concurrently with `run`.
 //!
+//! `create` answers with the [`Span`] of the compositor's own memory
+//! the client's pixels are to appear in: the compositor allocates a
+//! [`Block`], returns its span, keeps the block while the surface
+//! lives and frees it in `destroy`, by which time the kernel has made
+//! the pages ordinary memory again.
+//!
 //! The mirror of [`crate::http::handler`]: `helios:system/surface` in
 //! the kernel is a forwarder, and this is what it forwards to.
 
-pub use crate::bindings::exports::helios::system::compositor::{
-    Error, Guest, Placement, Rect, SurfaceId,
-};
+pub use crate::bindings::exports::helios::system::compositor::{Error, Guest, Rect, SurfaceId};
+pub use crate::memory::{Block, BlockError, Span};

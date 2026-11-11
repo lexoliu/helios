@@ -92,36 +92,32 @@ fn source(raw: u32) -> InterruptSourceId {
     )
 }
 
-fn map_device(virt: VirtRange, region: DeviceRegion) -> Result<(), AddressSpaceError> {
-    crate::vmm::user_address_space_or_panic().map_device(virt, region)
+fn allocate_run(bytes: usize, placement: DmaPlacement) -> Result<PhysicalRange, AddressSpaceError> {
+    crate::vmm::user_address_space_or_panic().allocate_run(bytes, placement)
 }
 
-fn unmap_device(virt: VirtRange) -> Result<(), AddressSpaceError> {
-    crate::vmm::user_address_space_or_panic().unmap_device(virt)
+fn free_run(run: PhysicalRange, align: u64) -> Result<(), AddressSpaceError> {
+    crate::vmm::user_address_space_or_panic().free_run(run, align)
 }
 
-fn map_shared(
+fn substitute_memory(
     virt: VirtRange,
     physical: PhysicalRange,
     flags: PageFlags,
 ) -> Result<(), AddressSpaceError> {
-    crate::vmm::user_address_space_or_panic().map_shared(virt, physical, flags)
+    crate::vmm::user_address_space_or_panic().substitute_memory(virt, physical, flags)
 }
 
-fn unmap_shared(virt: VirtRange) -> Result<(), AddressSpaceError> {
-    crate::vmm::user_address_space_or_panic().unmap_shared(virt)
+fn substitute_device(virt: VirtRange, region: DeviceRegion) -> Result<(), AddressSpaceError> {
+    crate::vmm::user_address_space_or_panic().substitute_device(virt, region)
 }
 
-fn commit_contiguous(
-    virt: VirtRange,
-    flags: PageFlags,
-    placement: DmaPlacement,
-) -> Result<PhysFrame, AddressSpaceError> {
-    crate::vmm::user_address_space_or_panic().commit_contiguous(virt, flags, placement)
+fn restore(virt: VirtRange) -> Result<(), AddressSpaceError> {
+    crate::vmm::user_address_space_or_panic().restore(virt)
 }
 
-fn release_contiguous(virt: VirtRange, align: u64) -> Result<(), AddressSpaceError> {
-    crate::vmm::user_address_space_or_panic().release_contiguous(virt, align)
+fn withdraw(virt: VirtRange) -> Result<(), AddressSpaceError> {
+    crate::vmm::user_address_space_or_panic().withdraw(virt)
 }
 
 /// Sv48 leaves map 4 KiB, which is also the granularity the kernel's
@@ -137,12 +133,12 @@ fn kernel_alias(frame: PhysFrame) -> VirtAddr {
 }
 
 static VM_HOOKS: DeviceVmHooks = DeviceVmHooks {
-    map_device,
-    unmap_device,
-    map_shared,
-    unmap_shared,
-    commit_contiguous,
-    release_contiguous,
+    allocate_run,
+    free_run,
+    substitute_memory,
+    substitute_device,
+    restore,
+    withdraw,
     mapping_granule,
     kernel_alias,
 };
