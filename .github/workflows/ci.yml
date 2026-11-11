@@ -728,7 +728,8 @@ jobs:
           # cwasm to /copy unchanged and to /forged with the last byte
           # of its payload signature flipped. The copy is still signed
           # by the trusted root and runs; the forged one must be refused,
-          # so its marker line must not print a second time.
+          # so its marker line must not print a second time. A missing
+          # /forged is refused too, so the writes must report success.
           runtime="$GITHUB_WORKSPACE/smoke-runtime/unsigned-cwasm"
           mkdir -p "$runtime"
           ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
@@ -737,9 +738,10 @@ jobs:
             --boot-program dash --boot-program debugger --boot-program python3 \
             --boot-program wasix-atomic-wait-timeout --no-compiler-plugin \
             shell --trace-log "$runtime/guest-tracing.log" \
-            -c 'python3 -c "import pathlib; b = pathlib.Path(\"/bin/wasix-atomic-wait-timeout\").read_bytes(); pathlib.Path(\"/copy\").write_bytes(b); f = bytearray(b); f[-13] ^= 1; pathlib.Path(\"/forged\").write_bytes(bytes(f))"; /copy && echo copy:ran; /forged && echo forged:ran || echo forged:refused' \
+            -c 'python3 -c "import pathlib; b = pathlib.Path(\"/bin/wasix-atomic-wait-timeout\").read_bytes(); pathlib.Path(\"/copy\").write_bytes(b); f = bytearray(b); f[-13] ^= 1; pathlib.Path(\"/forged\").write_bytes(bytes(f))" && echo cwasm:written; /copy && echo copy:ran; /forged && echo forged:ran || echo forged:refused' \
             2>&1 > unsigned-cwasm-smoke.out | tee "$runtime/inspector.log"
           cat unsigned-cwasm-smoke.out
+          grep -Fqx cwasm:written unsigned-cwasm-smoke.out
           grep -Fqx copy:ran unsigned-cwasm-smoke.out
           grep -Fqx forged:refused unsigned-cwasm-smoke.out
           test "$(grep -cF forged:ran unsigned-cwasm-smoke.out)" -eq 0
