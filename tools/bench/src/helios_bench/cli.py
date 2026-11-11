@@ -79,6 +79,7 @@ def command_run(args: argparse.Namespace) -> int:
             args.baseline_rebuild_profile_use.resolve() if args.baseline_rebuild_profile_use else None
         ),
         plain_baseline=plain_baseline,
+        profile_boot=not args.no_profile_boot,
     )
     report = run_suite(options, manifest, dry_run=args.dry_run)
     if report is None:
@@ -244,6 +245,15 @@ def build_parser() -> argparse.ArgumentParser:
             "build nothing on this host: the inspector, helios-cli, the kernel image, its "
             "helios-bootfs and the native counterparts must already be in place, and the run "
             "lists every one that is missing before it starts a guest"
+        ),
+    )
+    run.add_argument(
+        "--no-profile-boot",
+        action="store_true",
+        help=(
+            "skip the untimed second boot of every Helios unit that produces the kernel "
+            "profile, flamegraph and perf metrics (docs/benchmarks.md): for a run that only "
+            "wants timings. Timed boots run with no profiler either way"
         ),
     )
     run.add_argument("--helios-timeout-seconds", type=int, default=9000)

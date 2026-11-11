@@ -82,7 +82,9 @@ def driver(tmp_path, monkeypatch):
     return module
 
 
-def run_side(driver, tmp_path, images: list, services=None, shared_endpoints=None) -> Path:
+def run_side(
+    driver, tmp_path, images: list, services=None, shared_endpoints=None, profile_boot=False
+) -> Path:
     driver.run_helios(
         Path("tools/wasi-apps/workloads.json"),
         images,
@@ -98,6 +100,7 @@ def run_side(driver, tmp_path, images: list, services=None, shared_endpoints=Non
         skip_build=False,
         control_workload=None,
         keep_going=True,
+        profile_boot=profile_boot,
     )
     return tmp_path / "order"
 
@@ -308,6 +311,7 @@ def run_three(driver, tmp_path, images: list, unit_orders: dict[str, str] | None
         control_workload=None,
         keep_going=True,
         unit_orders=unit_orders,
+        profile_boot=False,
     )
     return [guest for _, guest, _, _ in boot_order(tmp_path / "order")]
 
@@ -540,6 +544,7 @@ def granted_budgets(
         skip_build=False,
         control_workload=control,
         keep_going=True,
+        profile_boot=False,
     )
     return granted
 
@@ -558,7 +563,7 @@ def test_the_paired_budget_charges_nothing_before_the_first_unit(driver, tmp_pat
     side = 60
     granted = granted_budgets(driver, tmp_path, monkeypatch, None, side=side, build_seconds=7)
 
-    boots = driver.side_boots(len(WORKLOADS), 2, None)
+    boots = driver.side_boots(len(WORKLOADS), 2, None, False)
     assert boots == len(granted) == 6
     expected = driver.class_budget(side, boots, PER_UNIT_CAP)
     # Only the clock ticking through the assertion itself separates the
@@ -583,7 +588,7 @@ def test_the_control_boots_take_a_share_and_not_a_cap(driver, tmp_path, monkeypa
     control = workload("quickjs-loop", "compute")
     granted = granted_budgets(driver, tmp_path, monkeypatch, control, side=side, build_seconds=0)
 
-    boots = driver.side_boots(len(WORKLOADS), 2, control)
+    boots = driver.side_boots(len(WORKLOADS), 2, control, False)
     assert boots == len(granted) == 10, "three workloads and a control, before and after, per image"
     expected = driver.class_budget(side, boots, PER_UNIT_CAP)
     assert expected - granted[0] <= 1
@@ -1562,3 +1567,177 @@ def test_a_sampled_run_cannot_be_published(tmp_path, monkeypatch) -> None:
     )
     with pytest.raises(SystemExit, match="instruction sampling requested for diagnosis"):
         run_suite(options, manifest, dry_run=True)
+
+
+# The profile boot (#747). The span profiler and the kernel counters sit
+# inside every iteration they time, and the Linux columns carry nothing
+# like them, so no timed boot runs with them: the kernel profile and the
+# perf metrics come from a second boot of each unit that nothing times.
+
+
+def profile_requests(tmp_path) -> list[dict]:
+    """What every boot of the side was handed, in order, as the stand-in saw it."""
+    boots = []
+    for line in (tmp_path / "profiles").read_text(encoding="utf-8").splitlines():
+        guest, log, kernel, perf, wasm, user = line.split("|")
+        boots.append({"guest": guest, "log": log, "kernel": kernel, "perf": perf, "wasm": wasm, "user": user})
+    return boots
+
+
+@pytest.fixture
+def profiled(driver, tmp_path, monkeypatch):
+    monkeypatch.setenv("HELIOS_TEST_PROFILE_LOG", str(tmp_path / "profiles"))
+    # A caller who exported the variables must not turn a timed boot into
+    # a profiled one.
+    for variable in driver.TIMED_BOOT_PROFILE_VARIABLES:
+        monkeypatch.setenv(variable, "/inherited/from/the/caller")
+
+
+def test_no_timed_boot_is_asked_for_a_profile_and_every_profile_boot_is(driver, tmp_path, profiled) -> None:
+    images = images_of(driver, tmp_path, paired=True)
+    run_side(driver, tmp_path, images, profile_boot=True)
+
+    boots = profile_requests(tmp_path)
+    timed, profile = boots[:6], boots[6:]
+    # Both images boot each of the three units, then both boot each again.
+    assert len(boots) == 12
+    for boot in timed:
+        assert (boot["kernel"], boot["perf"], boot["wasm"], boot["user"]) == ("", "", "", "")
+    for boot in profile:
+        assert boot["kernel"].endswith(".kernel.folded")
+        assert boot["perf"].endswith(".perf.json")
+    assert {(boot["guest"], boot["log"]) for boot in timed} == {
+        (guest, f"helios-{unit}.jsonl")
+        for guest in ("candidate", "baseline")
+        for unit in ("quickjs-loop", "cpython-json", "hostcall-loop")
+    }
+    assert {(boot["guest"], boot["log"]) for boot in profile} == {
+        (guest, f"helios-{unit}.jsonl")
+        for guest in ("candidate", "baseline")
+        for unit in ("quickjs-loop", "cpython-json", "hostcall-loop")
+    }, "the profile boot is the same image and the same workloads"
+
+
+def test_the_artifacts_keep_their_names_and_no_timing_comes_from_the_profile_boot(
+    driver, tmp_path, profiled
+) -> None:
+    images = images_of(driver, tmp_path, paired=True)
+    run_side(driver, tmp_path, images, profile_boot=True)
+
+    for image in images:
+        names = sorted(path.name for path in image.out_dir.iterdir() if path.is_file())
+        for unit in ("quickjs-loop", "cpython-json", "hostcall-loop"):
+            assert f"helios-{unit}.kernel.folded" in names
+            assert f"helios-{unit}.perf.json" in names
+        # The timed records: one summary per workload, none from the
+        # profile boot, whose own JSONL is kept apart where no reader looks.
+        merged = (image.out_dir / "helios.jsonl").read_text(encoding="utf-8").splitlines()
+        assert len(merged) == 3
+        kept = sorted(path.name for path in (image.out_dir / driver.PROFILE_BOOT_DIR).iterdir())
+        assert kept == [
+            f"helios-{unit}.jsonl" for unit in sorted(("quickjs-loop", "cpython-json", "hostcall-loop"))
+        ]
+        record = json.loads((image.out_dir / driver.PROFILE_BOOT_RECORD).read_text(encoding="utf-8"))
+        assert record == {
+            "timed": False,
+            "iterations": 1,
+            "units": ["quickjs-loop", "cpython-json", "hostcall-loop"],
+            "failed": [],
+        }
+
+
+def test_the_profile_boots_follow_every_timed_boot(driver, tmp_path, profiled) -> None:
+    """Nothing timed sits behind a profiled boot, and the report says
+    which boot its profile came from."""
+    run_side(driver, tmp_path, images_of(driver, tmp_path, paired=True), profile_boot=True)
+
+    boots = profile_requests(tmp_path)
+    requested = [bool(boot["kernel"]) for boot in boots]
+    assert requested == [False] * 6 + [True] * 6
+
+
+def test_skipping_the_profile_boot_removes_the_second_boot(driver, tmp_path, profiled) -> None:
+    images = images_of(driver, tmp_path, paired=True)
+    stale = images[0].out_dir / driver.PROFILE_BOOT_RECORD
+    stale.write_text("{}", encoding="utf-8")
+    run_side(driver, tmp_path, images, profile_boot=False)
+
+    boots = profile_requests(tmp_path)
+    assert len(boots) == 6
+    assert not any(boot["kernel"] or boot["perf"] for boot in boots)
+    for image in images:
+        assert not list(image.out_dir.glob("*.kernel.folded"))
+        assert not list(image.out_dir.glob("*.perf.json"))
+        assert not (image.out_dir / driver.PROFILE_BOOT_DIR).exists()
+        assert not (image.out_dir / driver.PROFILE_BOOT_RECORD).exists(), "a stale record is removed"
+
+
+def test_a_failed_profile_boot_fails_the_run_and_keeps_every_timed_record(
+    driver, tmp_path, profiled, monkeypatch
+) -> None:
+    monkeypatch.setenv("HELIOS_TEST_PROFILE_FAIL", "1")
+    images = images_of(driver, tmp_path, paired=True)
+    with pytest.raises(driver.ProfileBootFailed, match="every timed record of the run is complete") as raised:
+        run_side(driver, tmp_path, images, profile_boot=True)
+
+    assert raised.value.log == images[0].log()
+    # keep_going: every unit of every image still got its profile boot.
+    assert len(profile_requests(tmp_path)) == 12
+    for image in images:
+        merged = (image.out_dir / "helios.jsonl").read_text(encoding="utf-8").splitlines()
+        assert len(merged) == 3, "the timed records are whole"
+        record = json.loads((image.out_dir / driver.PROFILE_BOOT_RECORD).read_text(encoding="utf-8"))
+        assert record["units"] == []
+        assert record["failed"] == ["cpython-json", "hostcall-loop", "quickjs-loop"]
+
+
+def test_a_failed_profile_boot_ends_a_run_that_does_not_keep_going(
+    driver, tmp_path, profiled, monkeypatch
+) -> None:
+    monkeypatch.setenv("HELIOS_TEST_PROFILE_FAIL", "1")
+    images = images_of(driver, tmp_path, paired=True)
+    run_once = driver.run_helios
+
+    def strict(*args, **kwargs):
+        return run_once(*args, **{**kwargs, "keep_going": False})
+
+    monkeypatch.setattr(driver, "run_helios", strict)
+    with pytest.raises(driver.ProfileBootFailed):
+        run_side(driver, tmp_path, images, profile_boot=True)
+
+    assert len(profile_requests(tmp_path)) == 7, "six timed boots and the first profile boot"
+
+
+def test_a_unit_whose_timed_boot_was_lost_is_not_profiled(driver, tmp_path, profiled, monkeypatch) -> None:
+    images = images_of(driver, tmp_path, paired=False)
+    real = driver.run_helios_once
+
+    def refuse_hostcall(image, manifest, log, *args, **kwargs):
+        if kwargs.get("profile_for") is None and log.name == "helios-hostcall.jsonl":
+            raise driver.HeliosRunFailed("the guest died")
+        return real(image, manifest, log, *args, **kwargs)
+
+    monkeypatch.setattr(driver, "run_helios_once", refuse_hostcall)
+    run_side(driver, tmp_path, images, profile_boot=True)
+
+    profile = [boot for boot in profile_requests(tmp_path) if boot["kernel"]]
+    assert [boot["log"] for boot in profile] == ["helios-compute.jsonl"]
+
+
+def test_the_sampler_stays_on_the_timed_boots(driver, tmp_path, profiled, monkeypatch) -> None:
+    """The opt-in sampler keeps its meaning: a sampled run is a diagnosis
+    whose timings carry the sampler, so the second boot does not sample."""
+    monkeypatch.setenv("HELIOS_BENCH_INSTRUCTION_PROFILE", "1")
+    images = images_of(driver, tmp_path, paired=True)
+    run_side(driver, tmp_path, images, profile_boot=True)
+
+    for image in images:
+        assert len(list(image.out_dir.glob("*.pc.folded"))) == 3
+        record = json.loads((image.out_dir / driver.INSTRUCTION_SAMPLING_RECORD).read_text(encoding="utf-8"))
+        assert record["boots"] == 3
+
+
+def test_a_profile_boot_is_inside_the_sides_budget(driver) -> None:
+    assert driver.side_boots(3, 2, None, True) == 12
+    assert driver.side_boots(3, 2, {"name": "control"}, True) == 16
+    assert driver.side_boots(3, 2, None, False) == 6

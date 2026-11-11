@@ -212,6 +212,13 @@ class RunOptions:
     # this checkout's profile-guided release kernel against its plain one;
     # with a baseline commit, that commit's plain kernel.
     plain_baseline: bool = False
+    # Whether the first Helios pass ends with an untimed second boot of
+    # every unit that takes the kernel profile, the flamegraph and the perf
+    # metrics the report publishes (#747). No timed boot ever runs with the
+    # profiler on; false is a run that only wants timings. The passes that
+    # repeat a measurement (retake, reconfirm, retry) never take one: the
+    # artifacts are the first pass's.
+    profile_boot: bool = True
 
     def __post_init__(self) -> None:
         if self.plain_baseline and not self.reads_release_profile:
@@ -359,13 +366,16 @@ def helios_command(
     out_root: Path,
     description: str,
     unit_order: dict[str, UnitOrder],
+    profile_boot: bool,
     helios_pass: bool = False,
 ) -> PlannedCommand:
     """The driver invocation that times the Helios image, and the baseline
     images beside it when the run is paired, under ``out_root``.
 
     ``unit_order`` names the order every unit of a paired invocation boots
-    the images in, and is empty for an unpaired one.
+    the images in, and is empty for an unpaired one. ``profile_boot`` asks
+    the driver for the untimed second boot that produces the kernel
+    profile; without it the invocation takes none.
     """
     lane = options.lane
     env = {
@@ -392,6 +402,7 @@ def helios_command(
             # The driver's boots never build; this is also the build it
             # does before them, which a prebuilt run has no host for.
             *(["--helios-skip-build"] if options.prebuilt else []),
+            *([] if profile_boot else ["--helios-no-profile-boot"]),
             "--helios-timeout-seconds",
             str(options.helios_timeout_seconds),
             "--helios-side-timeout-seconds",
@@ -433,6 +444,7 @@ def plan(options: RunOptions, manifest: Manifest, workloads: list[dict]) -> list
                 options.out_dir,
                 "time every workload on Helios",
                 boot_orders(options, workloads),
+                options.profile_boot,
                 helios_pass=True,
             )
         )
@@ -921,6 +933,7 @@ def retake_plan(
         options.out_dir / out_name,
         f"measure {', '.join(names)} again on every Helios image: {reason}",
         unit_order,
+        profile_boot=False,
     )
 
 
@@ -1148,6 +1161,7 @@ def retry(
             "measure the control pair and every workload on every Helios image once more: "
             f"the first pass's noise floor crossed the {result.floor_bound:.3f} bound",
             orders,
+            profile_boot=False,
         )
     )
     second_sides = read_sides(retry_options, thresholds)
