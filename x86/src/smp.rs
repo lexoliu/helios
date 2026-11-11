@@ -581,7 +581,7 @@ unsafe extern "C" {
     /// Saves the callee-saved context, stores its stack pointer through
     /// the first argument and halts through [`helios_x86_halt_stopped`];
     /// returns when [`helios_x86_resume_current`] resumes it.
-    fn helios_x86_stop_current(saved_stack: *mut usize, runtime: *const ProcessorRuntime);
+    fn helios_x86_stop_current(saved_stack: *mut usize, stop_state: *const AtomicU8);
     /// Pops the context saved at the given stack pointer and returns into
     /// the caller of [`helios_x86_stop_current`].
     fn helios_x86_resume_current(saved_stack: usize) -> !;
@@ -617,7 +617,7 @@ pub(crate) fn stop_current_processor() {
     // this same processor, on this same stack, which nothing else touches
     // while the processor is stopped.
     unsafe {
-        helios_x86_stop_current(runtime.saved_stack.as_ptr(), runtime);
+        helios_x86_stop_current(runtime.saved_stack.as_ptr(), &runtime.stop_state);
     }
     x86_64::instructions::interrupts::enable();
 }
@@ -626,9 +626,11 @@ pub(crate) fn stop_current_processor() {
 /// Never returns: a restart resets the processor and enters
 /// [`resume_current_rust`] instead.
 #[unsafe(no_mangle)]
-extern "C" fn helios_x86_halt_stopped(runtime: *const ProcessorRuntime) -> ! {
-    let runtime = unsafe { &*runtime };
-    runtime.stop_state.store(STOP_STOPPED, Ordering::Release);
+extern "C" fn helios_x86_halt_stopped(stop_state: *const AtomicU8) -> ! {
+    // SAFETY: `stop_current_processor` passes its own runtime's stop word,
+    // which lives as long as the processor table.
+    let stop_state = unsafe { &*stop_state };
+    stop_state.store(STOP_STOPPED, Ordering::Release);
     loop {
         // SAFETY: interrupts are masked, so only NMI, SMI and INIT end the
         // halt, and INIT is the restart.
@@ -1116,7 +1118,7 @@ impl X86PlatformState {
         // its `call` is aligned and every saved word stays untouched.
         let stack_top = slot.runtime.saved_stack.load(Ordering::Acquire);
         assert!(
-            stack_top % 16 == 0,
+            stack_top.is_multiple_of(16),
             "x86 processor {} saved its stop context at {stack_top:#x}, not 16-aligned",
             processor.id()
         );

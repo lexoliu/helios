@@ -2,8 +2,8 @@
 # until `helios_x86_resume_current` returns into the caller.
 #
 #   rdi: where to store the stack pointer the context was saved at
-#   rsi: the processor's `smp::ProcessorRuntime`, handed to
-#        `helios_x86_halt_stopped`, which never returns
+#   rsi: the processor's stop word (`ProcessorRuntime::stop_state`), handed
+#        to `helios_x86_halt_stopped`, which never returns
 #
 # The context is what the SysV ABI makes callee-saved: the six
 # general-purpose registers pushed here, and the control bits of MXCSR and
