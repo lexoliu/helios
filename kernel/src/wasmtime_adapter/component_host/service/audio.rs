@@ -97,12 +97,7 @@ const fn to_wit_error(error: AudioServiceError) -> audio_wit::Error {
         AudioServiceError::AlreadyNegotiated => audio_wit::Error::AlreadyNegotiated,
         AudioServiceError::NotNegotiated => audio_wit::Error::NotNegotiated,
         AudioServiceError::UnsupportedFormat => audio_wit::Error::UnsupportedFormat,
-        // A window with no room left and a machine with no contiguous
-        // run left are the same answer to a player: the period buffers
-        // this format needs could not be pinned.
-        AudioServiceError::OutOfMemory | AudioServiceError::WindowExhausted => {
-            audio_wit::Error::OutOfMemory
-        }
+        AudioServiceError::OutOfMemory => audio_wit::Error::OutOfMemory,
         // An owner task that has stopped serving is a machine on its way
         // down. There is nothing a player can do about it that it would
         // not also do about a device fault.

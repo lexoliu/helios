@@ -27,6 +27,7 @@ use std::vec::Vec;
 use helios_api::display::{
     CURSOR_BYTES, CURSOR_HEIGHT, CURSOR_WIDTH, DisplayError, Mode, Point, Rect, Surface,
 };
+use helios_api::memory::{Block, BlockError, Span};
 
 use crate::damage::{Damage, Region};
 use crate::font::{CELL_HEIGHT, CELL_WIDTH};
@@ -71,30 +72,12 @@ pub enum Focus {
 pub struct ClientWindow {
     id: u64,
     region: Region,
-    /// Where the client's frame buffer sits in *this* program's linear
-    /// memory. The kernel mapped the client's pinned run a second time,
-    /// so these bytes and the client's are the same bytes.
-    offset: usize,
-    length: usize,
-}
-
-impl ClientWindow {
-    /// The client's pixels.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the kernel placed the run somewhere this program
-    /// cannot address, which would mean the two disagree about the size
-    /// of a pointer.
-    fn pixels(&self) -> &[u8] {
-        // SAFETY: the kernel mapped `length` bytes of the client's
-        // pinned run at `offset` in this program's linear memory and
-        // keeps them mapped until it calls `destroy` for this window.
-        // Nothing else in this program can reach them: the offset is
-        // above everything the allocator can ever hand out, because the
-        // kernel caps this program's memory growth below it.
-        unsafe { core::slice::from_raw_parts(self.offset as *const u8, self.length) }
-    }
+    /// This program's own pages that the kernel shows the client's
+    /// pinned run at, between answering `create` and calling `destroy`.
+    /// Those bytes and the client's are the same bytes, and the kernel
+    /// makes them ordinary zeroed memory again before `destroy`, which
+    /// is when [`Desktop::remove_client`] frees them.
+    view: Block,
 }
 
 /// Everything on the screen.
@@ -179,22 +162,23 @@ impl Desktop {
     }
 
     /// Take a client's window onto the desktop.
-    pub fn add_client(&mut self, id: u64, width: u32, height: u32, offset: u64, length: u64) {
+    ///
+    /// Allocates the pages the client's pixels are to be shown at and
+    /// returns the span the kernel is to show them at. The pages are
+    /// kept until [`Desktop::remove_client`].
+    pub fn add_client(&mut self, id: u64, width: u32, height: u32) -> Result<Span, BlockError> {
+        let view = Block::for_pixels(width, height)?;
+        let span = view.span();
         let region = self.place_client(width, height);
-        let offset = usize::try_from(offset)
-            .expect("the kernel maps a window inside this program's address space");
-        let length = usize::try_from(length)
-            .expect("the kernel maps a window inside this program's address space");
-        self.clients.push(ClientWindow {
-            id,
-            region,
-            offset,
-            length,
-        });
+        self.clients.push(ClientWindow { id, region, view });
         self.damage.add(bordered(region));
+        Ok(span)
     }
 
-    /// Take a client's window off the desktop.
+    /// Take a client's window off the desktop, and free its pages.
+    ///
+    /// Called from `destroy`, after the kernel has made the pages
+    /// ordinary memory again.
     pub fn remove_client(&mut self, id: u64) {
         let Some(index) = self.clients.iter().position(|client| client.id == id) else {
             return;
@@ -371,23 +355,14 @@ impl Desktop {
         }
 
         // The client windows, oldest first, so the newest is in front.
-        for index in 0..self.clients.len() {
-            let (client_region, offset, length, id) = {
-                let client = &self.clients[index];
-                (client.region, client.offset, client.length, client.id)
-            };
+        for client in &self.clients {
+            let (client_region, id) = (client.region, client.id);
             if client_region.intersection(bordered(region)).is_empty() {
                 continue;
             }
-            let source = ClientWindow {
-                id,
-                region: client_region,
-                offset,
-                length,
-            };
             let visible = client_region.intersection(region);
             let pixels = self.surface.pixels();
-            blit(pixels, stride, &source, visible);
+            blit(pixels, stride, client, visible);
             draw_border(
                 pixels,
                 stride,
@@ -522,8 +497,17 @@ fn fill(pixels: &mut [u8], stride: usize, region: Region, colour: Colour) {
         let Some(strip) = pixels.get_mut(start..start + width) else {
             return;
         };
-        for pixel in strip.chunks_exact_mut(BYTES_PER_PIXEL) {
-            colour.write(pixel);
+        let Some(first) = strip.get_mut(..BYTES_PER_PIXEL) else {
+            continue;
+        };
+        colour.write(first);
+        // Double the painted run until it covers the strip: each step is
+        // one bulk `memory.copy` within the frame buffer.
+        let mut painted = BYTES_PER_PIXEL;
+        while painted < strip.len() {
+            let step = painted.min(strip.len() - painted);
+            strip.copy_within(..step, painted);
+            painted += step;
         }
     }
 }
@@ -547,7 +531,7 @@ fn blit(pixels: &mut [u8], stride: usize, client: &ClientWindow, visible: Region
     if visible.is_empty() {
         return;
     }
-    let source = client.pixels();
+    let source = client.view.bytes();
     let source_stride = (client.region.width as usize) * BYTES_PER_PIXEL;
     for y in visible.y..visible.bottom() {
         let source_row = ((y - client.region.y) as usize) * source_stride

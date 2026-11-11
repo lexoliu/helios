@@ -24,8 +24,8 @@
 //!   pops counts against the claim's in-flight tally until the device
 //!   has answered it, and a release waits that tally out before it
 //!   destroys anything — a chain still parked for ring room publishes
-//!   after `CTX_DESTROY` otherwise, onto command pages the release is
-//!   about to free.
+//!   after `CTX_DESTROY` otherwise, naming a context the device has
+//!   already forgotten.
 //!
 //! Both hold the same device handle. The trait's own contract says every
 //! method takes `&self`, may be called from several tasks at once, and
@@ -45,6 +45,7 @@ use helios_hal::watchdog::Watchdog;
 use triomphe::Arc;
 
 use crate::Kernel;
+use crate::buffer::Buffer;
 use crate::component::{ProviderReceiver, provider_channel};
 use crate::exec::monotonic_nanos;
 
@@ -127,7 +128,6 @@ pub(super) fn gpu3d_channels(
         submits_in_flight: AtomicU64::new(0),
         submits_drained: crate::exec::ProgressSignal::new(),
         renders,
-        returned: concurrent_queue::ConcurrentQueue::bounded(1),
     });
     (shared, control_rx, submit_rx)
 }
@@ -141,6 +141,10 @@ struct HeldBlob {
     /// while it is placed would leave the engine decoding a span that
     /// no longer names anything.
     mapped: bool,
+    /// The instance's buffer behind a guest-backed blob, held until the
+    /// device has destroyed the blob: the run cannot go back to the pool
+    /// while the renderer may still read it.
+    _backing: Option<Buffer>,
 }
 
 /// Everything the current claim has the renderer holding.
@@ -187,13 +191,9 @@ pub(super) async fn serve_control<Device>(
         let next = pin!(inbox.recv());
         match select(released, next).await {
             Either::Left(((), _)) => {
+                // The records' references to the blobs' buffers go as
+                // the blobs do, after the renderer has let them go.
                 release_claim(device, shared, &mut held).await;
-                // Only now: the renderer has stopped reading, so
-                // dropping the arena hands the pages back to a pool
-                // nothing is decoding.
-                while let Ok(pins) = shared.returned.pop() {
-                    drop(pins);
-                }
                 shared.claim.store(ClaimState::FREE, Ordering::Release);
             }
             Either::Right((Some(request), _)) => {
@@ -262,14 +262,28 @@ async fn serve_request<Device>(
         Gpu3dRequest::DestroyContext { context, .. } => {
             destroy_context(device, held, context).await;
         }
+        // A host call that stopped waiting closes its end before it
+        // goes. One that went before its request was served is owed
+        // nothing, and one that went while the device was working can
+        // never learn what was made to undo it, so it is undone here.
         Gpu3dRequest::CreateBlob { spec, reply, .. } => {
-            let _ = reply.send(create_blob(device, held, spec).await);
+            if reply.is_canceled() {
+                return;
+            }
+            if let Err(Ok(blob)) = reply.send(create_blob(device, held, spec).await) {
+                destroy_blob(device, held, blob).await;
+            }
         }
         Gpu3dRequest::DestroyBlob { blob, .. } => {
             destroy_blob(device, held, blob).await;
         }
         Gpu3dRequest::MapBlob { blob, reply, .. } => {
-            let _ = reply.send(map_blob(device, held, blob).await);
+            if reply.is_canceled() {
+                return;
+            }
+            if let Err(Ok(_)) = reply.send(map_blob(device, held, blob).await) {
+                let _ = unmap_blob(device, held, blob).await;
+            }
         }
         Gpu3dRequest::UnmapBlob { blob, reply, .. } => {
             let _ = reply.send(unmap_blob(device, held, blob).await);
@@ -380,7 +394,8 @@ async fn create_blob<Device: Gpu3d>(
     if held.blobs.is_full() {
         return Err(Gpu3dServiceError::TooManyBlobs);
     }
-    let pages: &[PhysFrameRange] = match &spec.backing {
+    let frames = spec.backing.as_ref().map(Buffer::frames);
+    let pages: &[PhysFrameRange] = match &frames {
         Some(range) => core::slice::from_ref(range),
         None => &[],
     };
@@ -398,6 +413,7 @@ async fn create_blob<Device: Gpu3d>(
     held.blobs.push(HeldBlob {
         id: blob,
         mapped: false,
+        _backing: spec.backing,
     });
     Ok(blob)
 }
@@ -438,6 +454,12 @@ async fn map_blob<Device: Gpu3d>(
     let Some(index) = held.blobs.iter().position(|held| held.id == blob) else {
         return Err(Gpu3dServiceError::InvalidBlob);
     };
+    // Checked here as well as in the store: two `map-blob` calls on one
+    // blob can both be in flight, and this record is the one place they
+    // meet.
+    if held.blobs[index].mapped {
+        return Err(Gpu3dServiceError::AlreadyMapped);
+    }
     let region = device
         .map_blob(blob)
         .await
@@ -455,6 +477,9 @@ async fn unmap_blob<Device: Gpu3d>(
     let Some(index) = held.blobs.iter().position(|held| held.id == blob) else {
         return Err(Gpu3dServiceError::InvalidBlob);
     };
+    if !held.blobs[index].mapped {
+        return Err(Gpu3dServiceError::NotMapped);
+    }
     device
         .unmap_blob(blob)
         .await
@@ -493,8 +518,8 @@ async fn attach<Device: Gpu3d>(
 /// the tally reads zero; the mark is sampled before the count so a
 /// drain between the two is not missed.
 ///
-/// The order after that is what makes it safe to release the caller's
-/// pages: every mapped blob leaves the aperture, every blob is
+/// The order after that is what makes it safe to drop the records'
+/// buffers: every mapped blob leaves the aperture, every blob is
 /// destroyed, and only then is a context let go — a renderer still
 /// holding a context that names dead resources would be reading guest
 /// pages on their way back to a pool.
@@ -549,7 +574,10 @@ async fn release_claim<Device: Gpu3d>(
 /// window between the two. The tally, not the check, is what a release
 /// waits out: a chain parked for ring room publishes whenever the
 /// device takes it, and destroying the context underneath it would
-/// leave the engine reading command pages the release has freed.
+/// leave the engine running a command stream against a context it has
+/// torn down. The request's own reference to the command buffer is what
+/// keeps the pages from going back to the pool while the device reads
+/// them; it is dropped once the device has answered.
 ///
 /// The fence a submission carries is published to the signal the
 /// request brought with it the moment the device has taken the buffer,
@@ -574,6 +602,7 @@ pub(super) async fn serve_submit<Device, CpuImpl>(
         let SubmitRequest::Submit {
             generation,
             context,
+            buffer: _buffer,
             commands,
             fence,
             fences,

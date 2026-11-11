@@ -52,36 +52,32 @@ fn controller() -> &'static Gic {
         .expect("a granted device's interrupt was masked before the controller was published")
 }
 
-fn map_device(virt: VirtRange, region: DeviceRegion) -> Result<(), AddressSpaceError> {
-    crate::vmm::user_address_space().map_device(virt, region)
+fn allocate_run(bytes: usize, placement: DmaPlacement) -> Result<PhysicalRange, AddressSpaceError> {
+    crate::vmm::user_address_space().allocate_run(bytes, placement)
 }
 
-fn unmap_device(virt: VirtRange) -> Result<(), AddressSpaceError> {
-    crate::vmm::user_address_space().unmap_device(virt)
+fn free_run(run: PhysicalRange, align: u64) -> Result<(), AddressSpaceError> {
+    crate::vmm::user_address_space().free_run(run, align)
 }
 
-fn map_shared(
+fn substitute_memory(
     virt: VirtRange,
     physical: PhysicalRange,
     flags: PageFlags,
 ) -> Result<(), AddressSpaceError> {
-    crate::vmm::user_address_space().map_shared(virt, physical, flags)
+    crate::vmm::user_address_space().substitute_memory(virt, physical, flags)
 }
 
-fn unmap_shared(virt: VirtRange) -> Result<(), AddressSpaceError> {
-    crate::vmm::user_address_space().unmap_shared(virt)
+fn substitute_device(virt: VirtRange, region: DeviceRegion) -> Result<(), AddressSpaceError> {
+    crate::vmm::user_address_space().substitute_device(virt, region)
 }
 
-fn commit_contiguous(
-    virt: VirtRange,
-    flags: PageFlags,
-    placement: DmaPlacement,
-) -> Result<PhysFrame, AddressSpaceError> {
-    crate::vmm::user_address_space().commit_contiguous(virt, flags, placement)
+fn restore(virt: VirtRange) -> Result<(), AddressSpaceError> {
+    crate::vmm::user_address_space().restore(virt)
 }
 
-fn release_contiguous(virt: VirtRange, align: u64) -> Result<(), AddressSpaceError> {
-    crate::vmm::user_address_space().release_contiguous(virt, align)
+fn withdraw(virt: VirtRange) -> Result<(), AddressSpaceError> {
+    crate::vmm::user_address_space().withdraw(virt)
 }
 
 /// This backend maps at 4 KiB, the architecture's smallest granule and
@@ -95,12 +91,12 @@ fn kernel_alias(frame: PhysFrame) -> VirtAddr {
 }
 
 static VM_HOOKS: DeviceVmHooks = DeviceVmHooks {
-    map_device,
-    unmap_device,
-    map_shared,
-    unmap_shared,
-    commit_contiguous,
-    release_contiguous,
+    allocate_run,
+    free_run,
+    substitute_memory,
+    substitute_device,
+    restore,
+    withdraw,
     mapping_granule,
     kernel_alias,
 };

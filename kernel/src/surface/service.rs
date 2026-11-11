@@ -3,7 +3,8 @@
 //! A surface has two sides that never meet: a resource in the client's
 //! table, and a number the compositor was given. This is what holds them
 //! together — the identity, the geometry, the queue of input the
-//! compositor routed to it, and the arena a dying client handed back.
+//! compositor routed to it, and the identities a dying client handed
+//! back.
 //!
 //! # Concurrency contract
 //!
@@ -21,9 +22,11 @@
 //! looks at the queue, so a report published between the look and the
 //! park wakes it.
 //!
-//! What a client hands back on death is not a message either: a drop
-//! cannot await room in a queue, so the arena goes on an unbounded
-//! return queue and the supervisor is signalled.
+//! What a client hands back is not a message either — its windows when
+//! it dies, one window when it drops the resource, one window when it
+//! cancels a `create` the compositor was told about: each is a drop, a
+//! drop cannot await room in a queue, so the identities go on an
+//! unbounded return queue and the supervisor is signalled.
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::task::{Context, Poll};
@@ -33,28 +36,26 @@ use arrayvec::ArrayVec;
 use concurrent_queue::ConcurrentQueue;
 use futures::channel::oneshot;
 use helios_hal::input::InputEvent;
-use helios_hal::iommu::PhysicalRange;
 use spin::Mutex;
 use triomphe::Arc;
 
 use crate::InstanceId;
+use crate::buffer::{BYTES_PER_PIXEL, Buffer};
 use crate::exec::{Notify, NotifyWaiter};
-use crate::pins::PinnedArena;
 
 use super::SurfaceServiceError;
 
 /// Surfaces one instance may hold at once.
 ///
 /// A program with eight windows open is a program, not a compositor; the
-/// bound is what keeps a client's arena a value on its store's own stack
-/// rather than an allocation whose size a guest chooses.
+/// bound is what keeps a client's record of them a value on its store's
+/// own stack rather than an allocation whose size a guest chooses.
 pub const MAX_INSTANCE_SURFACES: usize = 8;
 
 /// Surfaces the machine may have on the desktop at once.
 ///
-/// Every one of them costs the compositor a mapped view inside its own
-/// surface window, so the bound is the compositor's arena as much as the
-/// registry's.
+/// Every one of them costs the compositor a view in its own memory, so
+/// the bound is the compositor's view budget as much as the registry's.
 pub const MAX_LIVE_SURFACES: usize = 64;
 
 /// Events one surface's queue holds before a report is lost.
@@ -108,7 +109,7 @@ impl SurfaceGeometry {
         let Some(pixels) = (self.width as u64).checked_mul(self.height as u64) else {
             return None;
         };
-        pixels.checked_mul(crate::pins::BYTES_PER_PIXEL as u64)
+        pixels.checked_mul(BYTES_PER_PIXEL as u64)
     }
 }
 
@@ -259,27 +260,35 @@ impl SurfaceEvents {
     }
 }
 
-/// What one client handed back when it died.
+/// What one client handed back: every window it held when it died, or
+/// one window it let go of, or one whose create it did not finish.
 ///
-/// The arena is in here rather than freed by the drop that produced it,
-/// because the compositor may still be composing from those pages: the
-/// supervisor takes the windows off the desktop and drops its views
-/// first, and the arena's own drop is what gives the pages back.
+/// Only the identities: the frame buffers are held by the compositor's
+/// views of them for as long as those last, so the supervisor ends each
+/// view and tells the compositor, and the runs go back to the client's
+/// pool with the views' references.
 pub struct ReturnedSurfaces {
     /// The windows this client held, in no particular order.
     pub ids: ArrayVec<SurfaceId, MAX_INSTANCE_SURFACES>,
-    /// The pages they lived in.
-    pub pins: PinnedArena<MAX_LIVE_SURFACES>,
+}
+
+impl ReturnedSurfaces {
+    /// One window handed back on its own.
+    pub fn one(id: SurfaceId) -> Self {
+        let mut ids = ArrayVec::new();
+        ids.push(id);
+        Self { ids }
+    }
 }
 
 /// One `create` the kernel forwards to the compositor.
 pub struct SurfaceCreate {
     pub id: SurfaceId,
     pub geometry: SurfaceGeometry,
-    /// The client's pinned run, which the supervisor maps a second time
-    /// into the compositor's own linear memory before it calls the
-    /// guest.
-    pub physical: PhysicalRange,
+    /// The client's frame buffer, which the supervisor shows a second
+    /// time at the span of the compositor's own memory the compositor
+    /// answers with.
+    pub buffer: Buffer,
     pub reply: oneshot::Sender<Result<(), SurfaceServiceError>>,
 }
 
@@ -293,10 +302,6 @@ pub enum SurfaceRequest {
         region: SurfaceRect,
         reply: oneshot::Sender<Result<(), SurfaceServiceError>>,
     },
-    /// A client dropped one window while staying alive. Its pages stay
-    /// pinned in the client's arena until that arena ends, so the
-    /// supervisor drops only its own view.
-    Destroy { id: SurfaceId },
 }
 
 /// The registry every side of the surface path shares.
@@ -307,9 +312,9 @@ struct SurfaceRegistry {
     /// until the supervisor has one, which is also what makes `deliver`
     /// refuse everybody before there is a desktop.
     compositor: AtomicU64,
-    /// Arenas dying clients handed back, waiting for the supervisor.
+    /// Windows dying clients handed back, waiting for the supervisor.
     returned: ConcurrentQueue<ReturnedSurfaces>,
-    /// Raised once per arena handed back.
+    /// Raised once per client handed back.
     returns: Notify,
     /// Windows the machine has had since boot.
     created: AtomicU64,
@@ -355,9 +360,9 @@ impl SurfaceService {
 
     /// Forget the compositor and take every window off the desktop.
     ///
-    /// Called when the plugin dies. The clients keep their pages — those
-    /// are theirs — and learn the surface is `gone` from the next call
-    /// they make on it.
+    /// Called when the plugin dies. The clients keep their frame buffers
+    /// and the views of them — those are theirs — and learn the surface
+    /// is `gone` from the next call they make on it.
     pub fn retire_compositor(&self) {
         self.inner.compositor.store(0, Ordering::Release);
         let live = core::mem::take(&mut *self.inner.live.lock());
@@ -426,10 +431,15 @@ impl SurfaceService {
             .cloned()
     }
 
-    /// Hand a dead client's arena to the supervisor.
+    /// Take windows off the desktop and hand them to the supervisor,
+    /// which ends the compositor's view of each and tells the compositor
+    /// it is gone.
     ///
     /// Never waits and never fails: the queue is unbounded because the
-    /// alternative is a drop that has to park, and a drop cannot.
+    /// alternative is a drop that has to park, and a drop cannot. A
+    /// window the compositor was never told about, or has already been
+    /// told is gone, costs it one `destroy` of an identity it does not
+    /// hold, which it ignores.
     pub fn return_surfaces(&self, returned: ReturnedSurfaces) {
         for id in &returned.ids {
             self.unregister(*id);
