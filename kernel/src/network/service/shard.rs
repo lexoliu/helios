@@ -1081,7 +1081,7 @@ impl NetworkShard {
         while let Some(event) = self.stack.take_event() {
             match event {
                 StackEvent::NeighborUpdated(entry) => {
-                    control.update_neighbors(|neighbors| neighbors.learn(entry));
+                    control.learn_neighbor(entry);
                 }
                 StackEvent::DhcpConfigured(_) | StackEvent::Ipv6Autoconfigured(_) => {
                     control.publish_from_shard(self)

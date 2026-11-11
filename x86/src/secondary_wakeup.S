@@ -10,9 +10,6 @@
 .equ HELIOS_X86_DATA_SELECTOR, 0x10
 .equ HELIOS_X86_LONG_MODE_CODE_SELECTOR, 0x18
 .equ HELIOS_X86_CR0_PROTECTED_MODE_ENABLE, 0x00000001
-.equ HELIOS_X86_CR0_MONITOR_COPROCESSOR, 0x00000002
-.equ HELIOS_X86_CR0_EMULATE_COPROCESSOR, 0x00000004
-.equ HELIOS_X86_CR0_TASK_SWITCHED, 0x00000008
 .equ HELIOS_X86_CR0_ENABLE_PAGING, 0x80000000
 .equ HELIOS_X86_CR4_ENABLE_PAE, 0x00000020
 # OSFXSR | OSXMMEXCPT: the kernel is compiled with SSE, so it must be
@@ -106,8 +103,10 @@ helios_x86_secondary_wakeup_protected_mode_start:
     wrmsr
 
     mov eax, cr0
-    and eax, ~(HELIOS_X86_CR0_EMULATE_COPROCESSOR | HELIOS_X86_CR0_TASK_SWITCHED)
-    or eax, HELIOS_X86_CR0_ENABLE_PAGING | HELIOS_X86_CR0_MONITOR_COPROCESSOR
+    # The two masks are operands from `CR0_CLEAR` and `CR0_SET` in `lib.rs`,
+    # the definition `_start` shares.
+    and eax, {cr0_clear}
+    or eax, {cr0_set} | HELIOS_X86_CR0_ENABLE_PAGING
     mov cr0, eax
 helios_x86_secondary_wakeup_long_mode_jump:
     .byte 0xea

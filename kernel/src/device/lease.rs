@@ -373,7 +373,13 @@ impl GrantLease {
         let bytes = bytes
             .checked_next_multiple_of(granule)
             .ok_or(GrantError::WindowExhausted)?;
-        if self.pinned_bytes + bytes > budget.byte_budget {
+        // The sum is checked for the same reason: with something already
+        // pinned, a request near the top of the range overflows it.
+        if self
+            .pinned_bytes
+            .checked_add(bytes)
+            .is_none_or(|pinned| pinned > budget.byte_budget)
+        {
             return Err(GrantError::BudgetExhausted);
         }
         let align = align.max(granule);

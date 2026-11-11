@@ -26,6 +26,10 @@ wasmtime-bare-metal = [
     # Only compiles alongside `custom-virtual-memory` on a bare-metal target:
     # the pooling allocator is written against wasmtime's `Mmap`.
     "wasmtime/pooling-allocator",
+    # Every bare-metal engine keeps the stack-limit interruption word in the
+    # processor's anchor block (`hal::cpu::GUEST_STACK_LIMIT_OFFSET`); the
+    # backends answer the `wasmtime_processor_stack_limit` hook this links.
+    "wasmtime/custom-processor-stack-limit",
 ]
 
 [dependencies]

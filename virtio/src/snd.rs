@@ -494,7 +494,7 @@ impl<T: VirtioTransport> VirtioSndDevice<T> {
             await_completion(&self.control_inflight, &self.control, token, || {
                 self.completions.notified()
             })
-            .await
+            .await?
         };
         if (written as usize) < HEADER_BYTES {
             return Err(IoError::DeviceFault.into());
@@ -545,7 +545,7 @@ impl<T: VirtioTransport> VirtioSndDevice<T> {
             slots,
             slot_for_token,
         } = state;
-        let Some((token, used_len)) = queue.pop_used_with_len() else {
+        let Some((token, used_len)) = queue.pop_used_with_len()? else {
             return Ok(None);
         };
         let index = usize::from(
@@ -659,7 +659,7 @@ impl<T: VirtioTransport> PlaybackDevice for VirtioSndDevice<T> {
             await_completion(&self.tx_inflight, &self.tx, token, || {
                 self.completions.notified()
             })
-            .await
+            .await?
         };
         if (written as usize) < XFER_STATUS_BYTES {
             // The device returned the chain without saying what it did
@@ -874,7 +874,7 @@ fn query_blocking<T: VirtioTransport>(
         &mut [response.as_mut_slice()],
     )?;
     queue.notify(transport);
-    let written = queue.reap_blocking(transport, token);
+    let written = queue.reap_blocking(transport, token)?;
     if (written as usize) < HEADER_BYTES {
         return Err(IoError::DeviceFault.into());
     }

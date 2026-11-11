@@ -42,9 +42,10 @@ use super::super::StoreData;
 /// Register `helios:system/input` in a linker.
 ///
 /// Every program linker gets it, for the reason the display interface
-/// does: the claim is the capability, not the import. A program that
-/// never claims a device learns nothing from having the import, and one
-/// that claims on a machine with no input device is told `unavailable`.
+/// does: linkage is cached per binary while authority belongs to the
+/// instance. `available` and `claim` check the instance's input device
+/// class, and an instance without it is told what a machine with no
+/// input device tells every program: no devices, and `unavailable`.
 pub(in crate::wasmtime_adapter::component_host) fn add_input_to_linker<CpuImpl, Net, HostFs>(
     linker: &mut Linker<StoreData<CpuImpl, Net, HostFs>>,
 ) -> wasmtime::Result<()>
@@ -153,6 +154,11 @@ where
     HostFs: crate::HostFileSystem,
 {
     fn available(&mut self) -> wasmtime::Result<Vec<input_wit::Capabilities>> {
+        // Without the input class the list is the one a machine with no
+        // input device gives.
+        if self.process_authority().derive_input_claim_cap().is_err() {
+            return Ok(Vec::new());
+        }
         let Some(service) = self.runtime_state.input_service() else {
             return Ok(Vec::new());
         };
@@ -166,7 +172,10 @@ where
         let Some(service) = self.runtime_state.input_service() else {
             return Ok(Err(input_wit::Error::Unavailable));
         };
-        let (index, generation) = match self.input.claim(&service, &name) {
+        let Ok(cap) = self.process_authority().derive_input_claim_cap() else {
+            return Ok(Err(input_wit::Error::Unavailable));
+        };
+        let (index, generation) = match self.input.claim(&service, &name, cap) {
             Ok(claim) => (claim.index(), claim.generation()),
             Err(error) => {
                 tracing::warn!(
