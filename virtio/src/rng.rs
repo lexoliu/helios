@@ -100,7 +100,7 @@ impl<T: VirtioTransport> VirtioRngDevice<T> {
         let len = await_completion(&self.inflight, &self.queue, token, || {
             self.interrupts.notified()
         })
-        .await;
+        .await?;
         let len = usize::try_from(len).map_err(|_| IoError::DeviceFault)?;
         if len > capacity {
             return Err(IoError::DeviceFault);

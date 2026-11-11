@@ -28,6 +28,8 @@
 
 use arrayvec::ArrayVec;
 
+use crate::process::InputClaimCap;
+
 use super::service::{DeviceIndex, InputClaim, InputService};
 use super::{InputServiceError, MAX_CLAIMED_DEVICES};
 
@@ -59,11 +61,12 @@ impl InputOwnership {
         &mut self,
         service: &InputService,
         name: &str,
+        cap: InputClaimCap,
     ) -> Result<&InputClaim, InputServiceError> {
         if self.claims.is_full() {
             return Err(InputServiceError::TooManyDevices);
         }
-        let claim = service.claim(name)?;
+        let claim = service.claim(name, cap)?;
         self.claims.push(claim);
         Ok(self
             .claims

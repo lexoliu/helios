@@ -49,10 +49,10 @@ use super::super::StoreData;
 /// Register `helios:system/display` in a linker.
 ///
 /// Every program linker gets it, for the reason the device interface
-/// does: the claim is the capability, not the import. A program that
-/// never claims the display learns nothing from having the import, and
-/// one that claims it on a machine with no display device is told
-/// `unavailable`.
+/// does: linkage is cached per binary while authority belongs to the
+/// instance. The claim checks the instance's display device class, and
+/// an instance without it is told `unavailable`, which is what a
+/// machine with no display device tells every program.
 pub(in crate::wasmtime_adapter::component_host) fn add_display_to_linker<CpuImpl, Net, HostFs>(
     linker: &mut Linker<StoreData<CpuImpl, Net, HostFs>>,
 ) -> wasmtime::Result<()>
@@ -225,7 +225,12 @@ where
         let Some(service) = self.runtime_state.display_service() else {
             return Ok(Err(display_wit::Error::Unavailable));
         };
-        if let Err(error) = self.device.claim_display(&service) {
+        // Without the display class the answer is the one a machine with
+        // no display gives, so a refusal reveals nothing about hardware.
+        let Ok(cap) = self.process_authority().derive_display_claim_cap() else {
+            return Ok(Err(display_wit::Error::Unavailable));
+        };
+        if let Err(error) = self.device.claim_display(&service, cap) {
             tracing::warn!(
                 target: "helios_kernel::display",
                 ?error,

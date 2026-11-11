@@ -29,16 +29,16 @@ use helios_hal::cpu::{Cpu, HardwarePerfCounters, current_processor};
 use helios_hal::io::IoError;
 use helios_netstack::{
     DEFAULT_HOP_LIMIT, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DNS_PORT, DhcpClientMessage,
-    DhcpDnsServers, DhcpMessageType, DhcpPacket, DnsQuestionWriter, DnsRecordType, DnsResponse,
-    EthernetFrame, EthernetProtocol, FlowTuple, IcmpEchoKey, IcmpEchoReply, Icmpv4Packet,
-    Icmpv6Packet, InterfaceEventMark, IpAddress, IpCidr, IpProtocol, Ipv4Address, Ipv4Cidr,
-    Ipv4Packet, Ipv6Address, Ipv6AddressEntry, Ipv6Cidr, Ipv6Packet, MAX_OUTBOUND_FRAMES,
-    NeighborCache, NeighborEntry, NetworkInterface as NetworkDevice, OutboundBatchStatus, Route,
-    RouteTable, RxChecksumOffload, RxDrain, RxFrame, SegmentationOffload, Stack, StackConfig,
-    StackError, StackEvent, StackInstant, TcpCloseKind, TcpConnectState, TcpConnectTerminalError,
-    TcpEndpoint, TcpListenBacklog, TcpPacket, TcpReadIntoState, TcpReadState,
-    TcpReceiveDiagnostics, TcpSendState, TcpStackCounters, UdpEgress, UdpEndpoint, UdpPacket,
-    UdpPayload, UdpSocketBinding, UdpSocketError, flow_hash,
+    DhcpDnsServers, DhcpMessageType, DhcpPacket, DhcpServerMessage, DnsQuestionWriter,
+    DnsRecordType, DnsResponse, EthernetFrame, EthernetProtocol, FlowTuple, IcmpEchoKey,
+    IcmpEchoReply, Icmpv4Packet, Icmpv6Packet, InterfaceEventMark, IpAddress, IpCidr, IpProtocol,
+    Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6AddressEntry, Ipv6Cidr, Ipv6Packet,
+    MAX_OUTBOUND_FRAMES, NeighborCache, NeighborEntry, NetworkInterface as NetworkDevice,
+    OutboundBatchStatus, Route, RouteTable, RxChecksumOffload, RxDrain, RxFrame,
+    SegmentationOffload, Stack, StackConfig, StackError, StackEvent, StackInstant, TcpCloseKind,
+    TcpConnectState, TcpConnectTerminalError, TcpEndpoint, TcpListenBacklog, TcpPacket,
+    TcpReadIntoState, TcpReadState, TcpReceiveDiagnostics, TcpSendState, TcpStackCounters,
+    UdpEgress, UdpEndpoint, UdpPacket, UdpPayload, UdpSocketBinding, UdpSocketError, flow_hash,
 };
 use spin::{Mutex as SpinMutex, RwLock as SpinRwLock};
 
@@ -1759,12 +1759,12 @@ mod tests {
     use crate::test_support::{RecordingNetworkInterface, RecordingSmpCpu, TestCpu};
 
     use super::{
-        AddressAttemptError, DhcpClientState, HandleSlab, NETWORK_BUSY_POLL_ROUNDS,
-        NETWORK_TX_BATCH_FRAMES, NetworkIpAddress, NetworkPollBudget, NetworkPollProgress,
-        NetworkPollScope, NetworkPollSource, NetworkPollState, NetworkPumpAction,
-        NetworkPumpCadence, NetworkShard, ReplicaHandle, TcpListenerId, TcpReadProgress,
-        UdpSocketId, icmp_echo_payload, limit_udp_datagram_bytes, map_ipv4_address, parse_ipv6,
-        receive_pair_order,
+        AddressAttemptError, DhcpClientState, DhcpDnsServers, DhcpMessageType, DhcpServerMessage,
+        HandleSlab, NETWORK_BUSY_POLL_ROUNDS, NETWORK_TX_BATCH_FRAMES, NetworkIpAddress,
+        NetworkPollBudget, NetworkPollProgress, NetworkPollScope, NetworkPollSource,
+        NetworkPollState, NetworkPumpAction, NetworkPumpCadence, NetworkShard, ReplicaHandle,
+        TcpListenerId, TcpReadProgress, UdpSocketId, icmp_echo_payload, limit_udp_datagram_bytes,
+        map_ipv4_address, parse_ipv6, receive_pair_order,
     };
 
     fn ipv6_tcp_frame(
@@ -2080,6 +2080,57 @@ mod tests {
         let ipv4 = Ipv4Packet::parse(ethernet.payload).expect("IPv4 packet should parse");
         let udp = UdpPacket::parse(ipv4.payload).expect("UDP datagram should parse");
         assert_eq!(udp.destination_port, helios_netstack::DHCP_SERVER_PORT);
+    }
+
+    fn dhcp_reply(
+        message_type: DhcpMessageType,
+        transaction_id: u32,
+        server_identifier: Option<Ipv4Address>,
+    ) -> DhcpServerMessage {
+        DhcpServerMessage {
+            message_type,
+            transaction_id,
+            your_ip: Ipv4Address::UNSPECIFIED,
+            server_identifier,
+            subnet_mask: None,
+            router: None,
+            dns_servers: DhcpDnsServers::new(),
+            lease_seconds: None,
+        }
+    }
+
+    /// RFC 2131 §4.4.1: only a client waiting on a REQUEST takes a
+    /// DHCPNAK, and only one for its own exchange from the server it
+    /// selected.
+    #[test]
+    fn dhcp_nak_is_accepted_only_from_the_selected_server_while_requesting() {
+        let server = Ipv4Address::new([192, 0, 2, 1]);
+        let stranger = Ipv4Address::new([192, 0, 2, 66]);
+        let requesting = DhcpClientState::Requesting {
+            transaction_id: 7,
+            requested_ip: Ipv4Address::new([192, 0, 2, 10]),
+            server_identifier: server,
+            last_sent: StackInstant::from_nanos(0),
+        };
+
+        let nak = |transaction_id, server_identifier| {
+            dhcp_reply(DhcpMessageType::Nak, transaction_id, server_identifier)
+        };
+        assert!(requesting.accepts_reply(&nak(7, Some(server))));
+        assert!(!requesting.accepts_reply(&nak(8, Some(server))));
+        assert!(!requesting.accepts_reply(&nak(7, Some(stranger))));
+        assert!(!requesting.accepts_reply(&nak(7, None)));
+
+        for state in [
+            DhcpClientState::Bound,
+            DhcpClientState::Init { transaction_id: 7 },
+            DhcpClientState::Selecting {
+                transaction_id: 7,
+                last_sent: StackInstant::from_nanos(0),
+            },
+        ] {
+            assert!(!state.accepts_reply(&nak(7, Some(server))));
+        }
     }
 
     #[test]

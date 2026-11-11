@@ -1710,8 +1710,7 @@ where
         kind: ProgramExecErrorKind::InvalidBinary,
         detail: ProgramExecErrorDetail::InvalidEntryPoint,
     })?;
-    let mut environment = store.data().environment.clone();
-    environment.retain(|(name, _)| name.as_str() != HELIOS_PROCESS_ID_ENV);
+    let environment = store.data().environment.clone();
     let (_, stdin_reader) = crate::byte_channel();
     let output_mode = OutputMode::RoutedChild {
         stdin_rx: stdin_reader,
@@ -1759,8 +1758,9 @@ where
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    let lower = store.data_mut().entropy.insecure_u64();
-    let upper = store.data_mut().entropy.insecure_u64();
+    let data = store.data_mut();
+    let lower = data.entropy.insecure_u64(data.runtime_state.root_entropy());
+    let upper = data.entropy.insecure_u64(data.runtime_state.root_entropy());
     let hash = (u128::from(upper) << 64) | u128::from(lower);
     if hash == 0 { 1 } else { hash }
 }

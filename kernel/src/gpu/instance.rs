@@ -29,6 +29,7 @@ use helios_hal::device::DeviceRegion;
 
 use crate::device::DeviceWindow;
 use crate::pins::PinnedRun;
+use crate::process::GpuClaimCap;
 
 use super::service::{Gpu3dClaim, Gpu3dService};
 use super::{Gpu3dServiceError, GpuPins};
@@ -80,11 +81,12 @@ impl Gpu3dOwnership {
         &mut self,
         service: &Gpu3dService,
         window: DeviceWindow,
+        cap: GpuClaimCap,
     ) -> Result<(), Gpu3dServiceError> {
         if self.claim.is_some() {
             return Err(Gpu3dServiceError::AlreadyClaimed);
         }
-        let claim = service.claim()?;
+        let claim = service.claim(cap)?;
         self.pins = Some(GpuPins::new(window));
         self.claim = Some(claim);
         Ok(())
