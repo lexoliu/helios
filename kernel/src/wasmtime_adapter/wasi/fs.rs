@@ -191,9 +191,11 @@ fn require_file(
 ///
 /// A descriptor may be opened with any rights `base` holds, whatever the
 /// filesystem would let it do: a file on a read-only filesystem opens for
-/// writing, and the write itself is what fails. Creating and truncating
-/// change the directory, so they need `base`'s `mutate-directory` and a
-/// writable mount.
+/// writing, and the write itself is what fails. Creating changes the
+/// directory, so it needs `base`'s `mutate-directory` and a writable
+/// mount; truncating also changes the file's data, so it needs `base`'s
+/// `write` as well. Every right is checked before anything changes: a
+/// refused open leaves the filesystem as it was.
 pub(crate) async fn open_at<HostFs>(
     namespace: &Namespace<HostFs>,
     base: &FsDescriptor,
@@ -213,7 +215,7 @@ where
         .await
         .map_err(fs_error_code)?;
     let fs = resolved.fs();
-    let metadata = match fs.stat(resolved.path()).await {
+    let (metadata, flags) = match fs.stat(resolved.path()).await {
         Ok(existing) => {
             if open_flags.contains(fs_types::OpenFlags::EXCLUSIVE)
                 && open_flags.contains(fs_types::OpenFlags::CREATE)
@@ -227,19 +229,26 @@ where
             if !open_flags.contains(fs_types::OpenFlags::DIRECTORY) && directory {
                 return Err(fs_types::ErrorCode::IsDirectory);
             }
-            if open_flags.contains(fs_types::OpenFlags::TRUNCATE) {
+            let flags =
+                effective_open_descriptor_flags(base.flags, requested, node_kind(existing.kind))?;
+            if !open_flags.contains(fs_types::OpenFlags::TRUNCATE) {
+                (existing, flags)
+            } else {
                 if existing.kind != NodeKind::File {
                     return Err(fs_types::ErrorCode::IsDirectory);
                 }
                 require_mutate_directory(base)?;
-                resolved
+                validate_descriptor_flags_within_base(
+                    base.flags,
+                    fs_types::DescriptorFlags::WRITE,
+                )?;
+                let truncated = resolved
                     .writable()
                     .map_err(fs_error_code)?
                     .open(resolved.path(), OpenFlags::TRUNCATE, now)
                     .await
-                    .map_err(fs_error_code)?
-            } else {
-                existing
+                    .map_err(fs_error_code)?;
+                (truncated, flags)
             }
         }
         Err(VfsError::NoEntry) => {
@@ -250,17 +259,18 @@ where
                 return Err(fs_types::ErrorCode::Unsupported);
             }
             require_mutate_directory(base)?;
-            resolved
+            let flags = effective_open_descriptor_flags(base.flags, requested, FsNodeKind::File)?;
+            let created = resolved
                 .writable()
                 .map_err(fs_error_code)?
                 .open(resolved.path(), OpenFlags::CREATE, now)
                 .await
-                .map_err(fs_error_code)?
+                .map_err(fs_error_code)?;
+            (created, flags)
         }
         Err(error) => return Err(fs_error_code(error)),
     };
     let kind = node_kind(metadata.kind);
-    let flags = effective_open_descriptor_flags(base.flags, requested, kind)?;
     Ok(FsDescriptor {
         path: String::from(resolved.absolute()),
         kind,

@@ -4586,6 +4586,66 @@ mod tests {
         }
     }
 
+    /// `path_open(O_TRUNC)` against a preopen that may read and change its
+    /// directory but not write file data is refused, whatever rights the
+    /// guest asks for, and leaves the file as it was.
+    #[test]
+    fn path_open_truncate_without_write_authority_leaves_the_file_untouched() {
+        use futures_lite::future::block_on;
+
+        let namespace: crate::Namespace<crate::UnsupportedHostFileSystem> =
+            crate::Namespace::new(crate::MountTable::new(crate::BootFs::new(
+                crate::EmbeddedBootFs::new(&[], &[]),
+                crate::BOOT_DEVICE,
+            )));
+        let owner = FsDescriptor {
+            path: "/".into(),
+            kind: FsNodeKind::Directory,
+            flags: fs_types::DescriptorFlags::READ
+                | fs_types::DescriptorFlags::WRITE
+                | fs_types::DescriptorFlags::MUTATE_DIRECTORY,
+            identity: None,
+        };
+        let file = block_on(wasi_fs::open_at(
+            &namespace,
+            &owner,
+            fs_types::PathFlags::empty(),
+            "notes.txt",
+            fs_types::OpenFlags::CREATE,
+            fs_types::DescriptorFlags::READ | fs_types::DescriptorFlags::WRITE,
+            1,
+        ))
+        .expect("the owner creates the file");
+        block_on(wasi_fs::write(
+            &namespace,
+            &file,
+            wasi_fs::FileWriteMode::At(0),
+            "日本語 한국어".as_bytes(),
+            2,
+        ))
+        .expect("the owner writes the file");
+
+        let preopen = FsDescriptor {
+            flags: fs_types::DescriptorFlags::READ | fs_types::DescriptorFlags::MUTATE_DIRECTORY,
+            ..owner
+        };
+        for rights in [P1_RIGHT_FD_READ | P1_RIGHT_FD_WRITE, P1_RIGHT_FD_READ] {
+            let opened = block_on(wasi_fs::open_at(
+                &namespace,
+                &preopen,
+                fs_types::PathFlags::empty(),
+                "notes.txt",
+                p1_open_flags(8),
+                p1_descriptor_flags(rights, 0),
+                3,
+            ));
+            assert!(matches!(opened, Err(fs_types::ErrorCode::ReadOnly)));
+            let contents =
+                block_on(wasi_fs::read(&namespace, &file, 0, 64)).expect("the owner reads back");
+            assert_eq!(contents.as_ref(), "日本語 한국어".as_bytes());
+        }
+    }
+
     fn connected_socket_entry<Net: ComponentHostNetwork>(
         service: Net,
         stream: Net::TcpStream,
