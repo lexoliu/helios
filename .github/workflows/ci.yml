@@ -724,12 +724,14 @@ jobs:
           set -o pipefail
           # Only bytes that came from the boot payload load without a
           # signature check; a cwasm a guest writes must verify against
-          # the kernel's trusted roots (#483). CPython copies a bootfs
-          # cwasm to /copy unchanged and to /forged with the last byte
-          # of its payload signature flipped. The copy is still signed
-          # by the trusted root and runs; the forged one must be refused,
-          # so its marker line must not print a second time. A missing
-          # /forged is refused too, so the writes must report success.
+          # the kernel's trusted roots (#483). The build root signs the
+          # payload image once, not each cwasm in it (#602), so a bootfs
+          # cwasm carries no signature of its own and a guest's copy of
+          # it inherits nothing. CPython copies one to /copy unchanged
+          # and to /forged with one byte flipped: the original runs from
+          # the boot payload, and both copies must be refused, so the
+          # program's marker line prints exactly once. A missing file is
+          # refused too, so the writes must report success.
           runtime="$GITHUB_WORKSPACE/smoke-runtime/unsigned-cwasm"
           mkdir -p "$runtime"
           ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
@@ -738,11 +740,13 @@ jobs:
             --boot-program dash --boot-program debugger --boot-program python3 \
             --boot-program wasix-atomic-wait-timeout --no-compiler-plugin \
             shell --trace-log "$runtime/guest-tracing.log" \
-            -c 'python3 -c "import pathlib; b = pathlib.Path(\"/bin/wasix-atomic-wait-timeout\").read_bytes(); pathlib.Path(\"/copy\").write_bytes(b); f = bytearray(b); f[-13] ^= 1; pathlib.Path(\"/forged\").write_bytes(bytes(f))" && echo cwasm:written; /copy && echo copy:ran; /forged && echo forged:ran || echo forged:refused' \
+            -c 'python3 -c "import pathlib; b = pathlib.Path(\"/bin/wasix-atomic-wait-timeout\").read_bytes(); pathlib.Path(\"/copy\").write_bytes(b); f = bytearray(b); f[-13] ^= 1; pathlib.Path(\"/forged\").write_bytes(bytes(f))" && echo cwasm:written; /bin/wasix-atomic-wait-timeout && echo original:ran; /copy && echo copy:ran || echo copy:refused; /forged && echo forged:ran || echo forged:refused' \
             2>&1 > unsigned-cwasm-smoke.out | tee "$runtime/inspector.log"
           cat unsigned-cwasm-smoke.out
           grep -Fqx cwasm:written unsigned-cwasm-smoke.out
-          grep -Fqx copy:ran unsigned-cwasm-smoke.out
+          grep -Fqx original:ran unsigned-cwasm-smoke.out
+          grep -Fqx copy:refused unsigned-cwasm-smoke.out
+          test "$(grep -cF copy:ran unsigned-cwasm-smoke.out)" -eq 0
           grep -Fqx forged:refused unsigned-cwasm-smoke.out
           test "$(grep -cF forged:ran unsigned-cwasm-smoke.out)" -eq 0
           test "$(grep -cFx atomic-wait-timeout:ok unsigned-cwasm-smoke.out)" -eq 1
