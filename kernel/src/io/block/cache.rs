@@ -136,10 +136,12 @@
 //! device answers. A read dropped in flight still leaves its blocks
 //! valid, so a later reader is served without a second device read; a
 //! write-back dropped in flight still leaves its blocks clean, or dirty
-//! again with the failure recorded for the next sync. Only a commit's
-//! task decides about the disk: a commit dropped before it finished
-//! aborts it. A request dropped before the device took it never reached
-//! the device, and gives its blocks back as they were: unread, or dirty.
+//! again with the failure recorded for the next sync. A sync dropped
+//! part-way puts back into the dirty set every block it took out and did
+//! not start, so the next sync still covers them. Only a commit's task
+//! decides about the disk: a commit dropped before it finished aborts
+//! it. A request dropped before the device took it never reached the
+//! device, and gives its blocks back as they were: unread, or dirty.
 //!
 //! # Memory
 //!
@@ -802,34 +804,78 @@ impl DirtySet {
 }
 
 /// A walk that takes every id out of a [`DirtySet`] as it reaches it.
-#[derive(Default)]
-struct Drain {
+///
+/// It takes a word of ids, and a summary word of words, at a time, so
+/// until it hands them out it holds ids the set no longer shows. Dropped
+/// part-way — its sync dropped at an `.await` — it puts back every id it
+/// took and has not handed out, and the id it handed out last, whose
+/// caller may not have finished with it: the set always covers every
+/// dirty entry, and an id put back for a block already clean is skipped
+/// by the next walk.
+struct Drain<'a> {
+    set: &'a DirtySet,
     next_summary: usize,
     words: u64,
     summary: usize,
     word: usize,
     bits: u64,
+    /// The id handed out last, until the next one is asked for.
+    current: Option<u32>,
 }
 
-impl Drain {
-    fn next(&mut self, set: &DirtySet) -> Option<u32> {
+impl<'a> Drain<'a> {
+    fn new(set: &'a DirtySet) -> Self {
+        Self {
+            set,
+            next_summary: 0,
+            words: 0,
+            summary: 0,
+            word: 0,
+            bits: 0,
+            current: None,
+        }
+    }
+
+    fn next(&mut self) -> Option<u32> {
+        self.current = None;
         loop {
             if self.bits != 0 {
                 let bit = self.bits.trailing_zeros() as usize;
                 self.bits &= self.bits - 1;
-                return Some((self.word * 64 + bit) as u32);
+                let id = (self.word * 64 + bit) as u32;
+                self.current = Some(id);
+                return Some(id);
             }
             if self.words != 0 {
                 let word = self.words.trailing_zeros() as usize;
                 self.words &= self.words - 1;
                 self.word = self.summary * 64 + word;
-                self.bits = set.words[self.word].swap(0, Ordering::SeqCst);
+                self.bits = self.set.words[self.word].swap(0, Ordering::SeqCst);
                 continue;
             }
             self.summary = self.next_summary;
-            let summary = set.summary.get(self.summary)?;
+            let summary = self.set.summary.get(self.summary)?;
             self.next_summary += 1;
             self.words = summary.swap(0, Ordering::SeqCst);
+        }
+    }
+}
+
+impl Drop for Drain<'_> {
+    fn drop(&mut self) {
+        if let Some(id) = self.current {
+            self.set.insert(id);
+        }
+        // Word bits before summary bits, as `DirtySet::insert` orders
+        // them, so a concurrent walk that sees the summary sees the ids.
+        if self.bits != 0 {
+            self.set.words[self.word].fetch_or(self.bits, Ordering::SeqCst);
+            self.set.summary[self.word / 64].fetch_or(1 << (self.word % 64), Ordering::SeqCst);
+        }
+        // Words whose summary bit this walk cleared but which it has not
+        // taken still hold their ids.
+        if self.words != 0 {
+            self.set.summary[self.summary].fetch_or(self.words, Ordering::SeqCst);
         }
     }
 }
@@ -2154,8 +2200,8 @@ where
         // keeping a bounded number of requests in flight.
         {
             let mut runs = pin!(InFlight::<_, SYNC_RUNS_IN_FLIGHT>::new());
-            let mut drain = Drain::default();
-            while let Some(id) = drain.next(set) {
+            let mut drain = Drain::new(set);
+            while let Some(id) = drain.next() {
                 match self.sync_candidate(disk, id) {
                     Err(Skip::Clean) => {}
                     Err(Skip::Busy) => set.insert(id),
@@ -2179,8 +2225,8 @@ where
         }
         // Second pass: whatever was held, in flight elsewhere, or failed
         // is waited for and written.
-        let mut drain = Drain::default();
-        while let Some(id) = drain.next(set) {
+        let mut drain = Drain::new(set);
+        while let Some(id) = drain.next() {
             self.settle(disk, id).await;
         }
         self.flush_device(disk).await

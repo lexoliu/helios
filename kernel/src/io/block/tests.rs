@@ -205,6 +205,15 @@ impl MemoryDisk {
         }
     }
 
+    /// Answers every request held so far and stays paused: the device's
+    /// completion path, running beside the tasks that submit.
+    fn answer_accepted(&self) {
+        let accepted = core::mem::take(&mut self.state.queue.lock().accepted);
+        for request in accepted {
+            self.carry_out(request);
+        }
+    }
+
     /// Requests accepted and not answered yet.
     fn accepted(&self) -> usize {
         self.state.queue.lock().accepted.len()
@@ -1244,6 +1253,39 @@ fn a_failed_write_back_dropped_in_flight_stays_dirty_with_its_error_recorded() {
 }
 
 #[test]
+fn a_sync_dropped_part_way_leaves_every_block_it_did_not_write_for_the_next_sync() {
+    let disk = MemoryDisk::with_blocks("images", CACHE_BLOCK_BYTES, 32);
+    let cache = cache_over(&disk, 32, 1);
+    let view = cache.disk(0);
+    // Ten blocks with a gap between each: ten runs, more than one sync
+    // keeps in flight, so the sync parks with blocks it has not started.
+    let blocks: Vec<u64> = (0..10).map(|index| index * 2).collect();
+    block_on(async {
+        for &block in &blocks {
+            view.overwrite(block)
+                .await
+                .expect("the block")
+                .fill(0x80 | block as u8);
+        }
+    });
+
+    disk.pause();
+    assert!(poll_up_to(view.sync(), 1).is_none());
+    assert!(disk.accepted() < blocks.len());
+    disk.resume();
+    block_on(view.sync()).expect("the next sync succeeds");
+
+    assert!(dirty_blocks(&cache).is_empty());
+    for &block in &blocks {
+        assert_eq!(
+            disk.bytes_at(block as usize * CACHE_BLOCK_BYTES, 4),
+            [0x80 | block as u8; 4],
+            "block {block} reached the disk"
+        );
+    }
+}
+
+#[test]
 fn dropped_requests_leave_no_entry_or_page_behind() {
     const BLOCKS: u64 = 64;
     let disk = MemoryDisk::with_blocks("images", CACHE_BLOCK_BYTES, BLOCKS as usize);
@@ -1418,13 +1460,30 @@ fn is_stress_pattern(block: u64, bytes: &[u8; CACHE_BLOCK_BYTES]) -> bool {
     bytes[..8] == block.to_le_bytes() && bytes[8..].iter().all(|byte| *byte == bytes[8])
 }
 
+/// Whether a stress task drops its next request part-way, and after how
+/// many polls: about one request in four, after one to four polls.
+fn abandon_after(seed: u64) -> Option<u64> {
+    (seed & 3 == 0).then_some(1 + (seed >> 40) % 4)
+}
+
+/// Runs `future` to its end, or drops it after `abandon` polls.
+fn run_or_abandon<F: Future>(future: F, abandon: Option<u64>) -> Option<F::Output> {
+    match abandon {
+        Some(polls) => poll_up_to(future, polls),
+        None => Some(block_on(future)),
+    }
+}
+
 /// Real threads, one processor each, against a cache far smaller than the
 /// disk: readers check every block they get is whole and the right one,
 /// writers own disjoint blocks and rewrite them whole, and a reclaimer
 /// compresses, decompresses, evicts and syncs under them. Misses
 /// coalesce, the clock evicts against hits, and blocks move between
-/// tiers while readers and writers want them. The disk ends up holding
-/// each writer's last version.
+/// tiers while readers and writers want them. A device thread answers
+/// every request on its own processor, and every task drops some of its
+/// requests part-way, so answers keep landing for submitters that are
+/// gone. The disk ends up holding each writer's last version, and
+/// nothing is left held.
 #[test]
 fn the_cache_stays_coherent_under_real_threads() {
     const BLOCKS: u64 = 48;
@@ -1439,11 +1498,26 @@ fn the_cache_stays_coherent_under_real_threads() {
             bytes[start..start + CACHE_BLOCK_BYTES].copy_from_slice(&stress_pattern(block, 0));
         }
     }
-    let processors = usize::from(READERS) + WRITERS as usize + 1;
+    let reclaimer = WRITERS as u16 + READERS;
+    let device = reclaimer + 1;
+    let processors = usize::from(device) + 1;
     let cache = cache_over(&disk, 12, processors);
     let done = Arc::new(AtomicBool::new(false));
+    let unplugged = Arc::new(AtomicBool::new(false));
+    disk.pause();
 
     std::thread::scope(|scope| {
+        {
+            let disk = disk.clone();
+            let unplugged = Arc::clone(&unplugged);
+            scope.spawn(move || {
+                on_processor(device);
+                while !unplugged.load(Ordering::SeqCst) {
+                    disk.answer_accepted();
+                    std::thread::yield_now();
+                }
+            });
+        }
         let mut writers = Vec::new();
         for writer in 0..WRITERS {
             let view = cache.disk(0);
@@ -1455,72 +1529,92 @@ fn the_cache_stays_coherent_under_real_threads() {
                     seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
                     let block = (seed >> 33) % (BLOCKS / WRITERS) * WRITERS + writer;
                     let version = versions[block as usize].wrapping_add(1).max(1);
-                    block_on(async {
-                        let mut guard = if round % 2 == 0 {
-                            view.overwrite(block).await.expect("overwrite")
-                        } else {
-                            let guard = view.write(block).await.expect("write");
+                    let abandon = abandon_after(seed);
+                    let guard = if round % 2 == 0 {
+                        run_or_abandon(view.overwrite(block), abandon)
+                            .map(|guard| guard.expect("overwrite"))
+                    } else {
+                        run_or_abandon(view.write(block), abandon).map(|guard| {
+                            let guard = guard.expect("write");
                             assert!(
                                 is_stress_pattern(block, &guard),
                                 "write of {block} saw torn bytes"
                             );
                             guard
-                        };
+                        })
+                    };
+                    // A write dropped before it had the block changed
+                    // nothing.
+                    if let Some(mut guard) = guard {
                         guard.copy_from_slice(&stress_pattern(block, version));
-                    });
-                    versions[block as usize] = version;
+                        versions[block as usize] = version;
+                    }
                 }
                 versions
             }));
         }
+        let mut others = Vec::new();
         for reader in 0..READERS {
             let view = cache.disk(0);
             let done = Arc::clone(&done);
-            scope.spawn(move || {
+            others.push(scope.spawn(move || {
                 on_processor(WRITERS as u16 + reader);
                 let mut seed = 0x51ed_270b_u64 + u64::from(reader);
                 while !done.load(Ordering::SeqCst) {
                     seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
                     let block = (seed >> 33) % BLOCKS;
-                    block_on(async {
-                        let bytes = view.read(block).await.expect("read");
+                    if let Some(bytes) = run_or_abandon(view.read(block), abandon_after(seed)) {
+                        let bytes = bytes.expect("read");
                         assert!(
                             is_stress_pattern(block, &bytes),
                             "read of {block} saw torn or foreign bytes"
                         );
-                    });
+                    }
                 }
-            });
+            }));
         }
         {
             let cache = cache.clone();
             let done = Arc::clone(&done);
-            scope.spawn(move || {
-                on_processor(WRITERS as u16 + READERS);
+            others.push(scope.spawn(move || {
+                on_processor(reclaimer);
                 let view = cache.disk(0);
-                let mut pass = 0_usize;
+                let mut pass = 0_u64;
+                let mut seed = 0x2545_f491_u64;
                 while !done.load(Ordering::SeqCst) {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
                     let level = match pass % 4 {
                         0 | 1 => PressureLevel::Yellow,
                         2 => PressureLevel::Red,
                         _ => PressureLevel::Green,
                     };
-                    shrink(&cache, level);
-                    if pass.is_multiple_of(3) {
-                        block_on(view.sync()).expect("sync");
+                    cache.set_pressure(level);
+                    run_or_abandon(cache.shrink(level), abandon_after(seed));
+                    if pass.is_multiple_of(3)
+                        && let Some(synced) = run_or_abandon(view.sync(), abandon_after(seed >> 2))
+                    {
+                        synced.expect("sync");
                     }
                     pass += 1;
                 }
                 cache.set_pressure(PressureLevel::Green);
-            });
+            }));
         }
         let versions: Vec<[u8; BLOCKS as usize]> = writers
             .into_iter()
             .map(|writer| writer.join().expect("writer"))
             .collect();
         done.store(true, Ordering::SeqCst);
+        for other in others {
+            other.join().expect("reader or reclaimer");
+        }
+        unplugged.store(true, Ordering::SeqCst);
+        // Whatever the device thread left is answered here, and from now
+        // on every request is answered as it arrives.
+        disk.resume();
 
         on_processor(0);
+        assert!(!cache.disk(0).is_aborted());
         block_on(cache.disk(0).sync()).expect("final sync");
         for (writer, versions) in versions.iter().enumerate() {
             for block in (writer as u64..BLOCKS).step_by(WRITERS as usize) {
@@ -1535,4 +1629,15 @@ fn the_cache_stays_coherent_under_real_threads() {
         }
     });
     assert!(dirty_blocks(&cache).is_empty());
+    assert_eq!(disk.accepted(), 0);
+    assert_eq!(cache.disk(0).stats().write_errors, 0);
+    assert_eq!(
+        idle_blocks(&cache),
+        cache.resident_blocks(),
+        "every resident entry is free of requests, pins and locks"
+    );
+    assert_eq!(
+        cache.page_buffers(),
+        cache.resident_blocks() - cache.compressed_blocks()
+    );
 }
