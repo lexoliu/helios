@@ -48,12 +48,6 @@ impl GuestIsa {
         })
     }
 
-    /// The level the processor satisfies, which the in-kernel compiler
-    /// emits.
-    pub(crate) const fn processor(&self) -> &'static IsaLevel {
-        self.processor
-    }
-
     /// The compile target: the build target at the processor's level.
     pub(crate) fn compile_target(&self) -> CwasmTarget<'static> {
         CwasmTarget::new(self.triple, self.processor.name())
