@@ -8,6 +8,7 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use helios_hal::cpu::GUEST_STACK_LIMIT_OFFSET;
 use serde::{Deserialize, Serialize};
 use serde_big_array::BigArray;
 use thiserror::Error;
@@ -41,6 +42,22 @@ pub const CWASM_MEMORY_GUARD_SIZE: u64 = 32 << 20;
 /// Cranelift instead of returning an error.
 pub fn cwasm_target_supports_wasm_simd(target: &str) -> bool {
     !target.starts_with("riscv64")
+}
+
+/// Where code compiled for `target` finds the stack limit its interruption
+/// checks compare against: `Some(offset)` when it is the word at `offset` in
+/// the executing processor's local block, `None` when it is the store's own
+/// runtime context.
+///
+/// A bare-metal Helios kernel keeps the word in every processor's block at
+/// [`GUEST_STACK_LIMIT_OFFSET`], which makes each check one compare against
+/// a processor-relative address with no register held for it. The hosted
+/// backend runs guests as threads of a host process and keeps the limit in
+/// the store. The compiler and the kernel engine both take the location from
+/// here, and the engine refuses a cwasm compiled for the other one.
+pub fn cwasm_target_guest_stack_limit_offset(target: &str) -> Option<i32> {
+    let os = target.split('-').nth(2);
+    (os == Some("none")).then_some(GUEST_STACK_LIMIT_OFFSET)
 }
 
 /// Returns the ISA flags shared by host prebuilds and in-kernel compilation.
@@ -273,6 +290,39 @@ impl fmt::Display for SignatureAlgorithm {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SignatureAlgorithm::Ed25519 => f.write_str("ed25519"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GUEST_STACK_LIMIT_OFFSET, cwasm_target_guest_stack_limit_offset};
+
+    /// Every bare-metal kernel target reads the processor's word; a hosted
+    /// target keeps the limit in the store.
+    #[test]
+    fn only_bare_metal_targets_read_the_processor_word() {
+        for target in [
+            "x86_64-unknown-none",
+            "aarch64-unknown-none",
+            "riscv64gc-unknown-none-elf",
+        ] {
+            assert_eq!(
+                cwasm_target_guest_stack_limit_offset(target),
+                Some(GUEST_STACK_LIMIT_OFFSET),
+                "{target}"
+            );
+        }
+        for target in [
+            "x86_64-unknown-linux-gnu",
+            "aarch64-apple-darwin",
+            "aarch64-unknown-linux-gnu",
+        ] {
+            assert_eq!(
+                cwasm_target_guest_stack_limit_offset(target),
+                None,
+                "{target}"
+            );
         }
     }
 }

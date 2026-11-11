@@ -23,7 +23,7 @@ from pydantic import TypeAdapter, ValidationError
 from helios_bench import runner
 from helios_bench.baseline import Baseline
 from helios_bench.gate import evaluate_paired, gate_report
-from helios_bench.manifest import load_manifest
+from helios_bench.manifest import WasmtimePin, load_manifest
 from helios_bench.render import format_percent, render_gate, render_tables
 from helios_bench.report import (
     NoiseRetry,
@@ -39,6 +39,8 @@ from helios_bench.wasi_apps import gap_bench
 
 CONTROL = "quickjs-loop"
 NAMES = ["hostcall-loop", "quickjs-loop", "fs-smallfiles"]
+
+BASELINE_FORK = WasmtimePin(repository="lexoliu/wasmtime", revision="2fb47b20" + "0" * 32)
 
 
 def tight(center: float, seed: int):
@@ -164,7 +166,7 @@ def suite(options: RunOptions, manifest, monkeypatch, report: Report) -> Report:
     monkeypatch.setattr(runner, "kernel_profiles", lambda options: runner.KernelProfiles(candidate=None))
     monkeypatch.setattr(runner, "kernel_pgo_uncovered", lambda *args: None)
     monkeypatch.setattr(runner, "collect_hardware", lambda lane: report.hardware)
-    monkeypatch.setattr(runner, "collect_pins", lambda lane, workloads, kernel_build: report.pins)
+    monkeypatch.setattr(runner, "collect_pins", lambda lane, workloads, kernel_build, baseline: report.pins)
     return run_suite(options, manifest)
 
 
@@ -177,7 +179,13 @@ def options(tmp_path) -> RunOptions:
         sides=frozenset({Side.HELIOS, Side.HELIOS_BASELINE, Side.LINUX_NATIVE}),
         workload_names=NAMES,
         iterations=11,
-        baseline=Baseline(ref="merge-base", sha="a" * 40, worktree=tmp_path / "worktree"),
+        baseline=Baseline(
+            ref="merge-base",
+            sha="a" * 40,
+            worktree=tmp_path / "worktree",
+            wasmtime=BASELINE_FORK,
+            fork_root="",
+        ),
     )
 
 

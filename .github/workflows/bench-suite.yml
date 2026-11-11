@@ -96,6 +96,12 @@ jobs:
       per_column_profiles: ${{ steps.mode.outputs.per_column_profiles }}
       profile_columns: ${{ steps.columns.outputs.profile_columns }}
       baseline_profile: ${{ steps.mode.outputs.baseline_profile }}
+      # The Wasmtime fork the paired baseline commit pins, and the
+      # directory beside the candidate its checkout is laid out in: empty
+      # when it pins the candidate's own fork (#486).
+      baseline_fork_root: ${{ steps.columns.outputs.baseline_fork_root }}
+      baseline_wasmtime_repository: ${{ steps.columns.outputs.baseline_wasmtime_repository }}
+      baseline_wasmtime_revision: ${{ steps.columns.outputs.baseline_wasmtime_revision }}
       # The suite's matrix, from tools/bench/manifest.toml: the lanes have
       # one definition.
       matrix: ${{ steps.lanes.outputs.matrix }}
@@ -158,6 +164,7 @@ jobs:
         with:
           # The matrix below resolves the pairing ref against history.
           fetch-depth: 0
+      - uses: astral-sh/setup-uv@v6
       # The collections' matrix, with every ref resolved to its commit:
       # `actions/checkout` reads a `ref` that is not forty hex digits as
       # a branch or tag, so a short SHA or `merge-base` has to be
@@ -167,6 +174,13 @@ jobs:
       # the suite builds the baseline once more against it, and how far
       # the two builds of one commit time apart is the build drift the
       # gate holds every row to (#479).
+      # Each column builds against the Wasmtime fork its own commit pins
+      # (#486), and the kernel profile names Wasmtime's crates by the
+      # fork's absolute path (#359): a baseline pinning another fork than
+      # the candidate's is laid out in a directory of its own, and its
+      # collections get the same `root` so they compile against the fork
+      # at the path the suite will build it from. `helios-bench
+      # baseline-fork` reads the pin from the baseline commit.
       - id: columns
         env:
           CANDIDATE_SHA: ${{ github.sha }}
@@ -174,24 +188,37 @@ jobs:
           BASELINE_PROFILE: ${{ steps.mode.outputs.baseline_profile }}
         run: |
           candidate="$(jq -c -n --arg ref "$CANDIDATE_SHA" \
-            '{column: "candidate", ref: $ref, artifact: "helios-kernel-profdata-candidate"}')"
-          if [ "$BASELINE_PROFILE" = true ]; then
+            '{column: "candidate", ref: $ref, artifact: "helios-kernel-profdata-candidate", root: ""}')"
+          root=""
+          repository=""
+          revision=""
+          if [ -n "$PAIRING_REF" ]; then
             if [ "$PAIRING_REF" = merge-base ]; then
               sha="$(git merge-base HEAD origin/dev)"
             else
               sha="$(git rev-parse --verify "$PAIRING_REF^{commit}")"
             fi
-            baseline="$(jq -c -n --arg ref "$sha" \
-              '{column: "baseline", ref: $ref, artifact: "helios-kernel-profdata-baseline"}')"
-            rebuild="$(jq -c -n --arg ref "$sha" \
-              '{column: "baseline-rebuild", ref: $ref, artifact: "helios-kernel-profdata-baseline-rebuild"}')"
+            fork="$(uv run --project tools/bench --quiet helios-bench baseline-fork --sha "$sha")"
+            root="$(printf '%s' "$fork" | jq -r .root)"
+            repository="$(printf '%s' "$fork" | jq -r .repository)"
+            revision="$(printf '%s' "$fork" | jq -r .revision)"
+          fi
+          {
+            echo "baseline_fork_root=$root"
+            echo "baseline_wasmtime_repository=$repository"
+            echo "baseline_wasmtime_revision=$revision"
+          } >> "$GITHUB_OUTPUT"
+          if [ "$BASELINE_PROFILE" = true ]; then
+            baseline="$(jq -c -n --arg ref "$sha" --arg root "$root" \
+              '{column: "baseline", ref: $ref, artifact: "helios-kernel-profdata-baseline", root: $root}')"
+            rebuild="$(jq -c -n --arg ref "$sha" --arg root "$root" \
+              '{column: "baseline-rebuild", ref: $ref, artifact: "helios-kernel-profdata-baseline-rebuild", root: $root}')"
             columns="$(jq -c -n --argjson candidate "$candidate" --argjson baseline "$baseline" \
               --argjson rebuild "$rebuild" '[$candidate, $baseline, $rebuild]')"
           else
             columns="$(jq -c -n --argjson candidate "$candidate" '[$candidate]')"
           fi
           echo "profile_columns=$columns" >> "$GITHUB_OUTPUT"
-      - uses: astral-sh/setup-uv@v6
       - name: Lint and test tools/bench
         working-directory: tools/bench
         run: |
@@ -241,6 +268,7 @@ jobs:
     with:
       ref: ${{ matrix.ref }}
       artifact: ${{ matrix.artifact }}
+      root: ${{ matrix.root }}
 
   suite:
     name: suite-${{ matrix.lane }}
@@ -291,6 +319,16 @@ jobs:
           # rather than the single commit a default checkout fetches.
           fetch-depth: 0
       - uses: ./helios/.github/actions/checkout-wasmtime
+      # The fork the baseline commit pins, when it is not the candidate's:
+      # its checkout is laid out beside it, at the path its profile was
+      # collected against (#486, tools/bench/src/helios_bench/baseline.py).
+      - name: Check out the baseline's Wasmtime fork
+        if: needs.tooling.outputs.baseline_fork_root != ''
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ needs.tooling.outputs.baseline_wasmtime_repository }}
+          ref: ${{ needs.tooling.outputs.baseline_wasmtime_revision }}
+          path: ${{ needs.tooling.outputs.baseline_fork_root }}/wasmtime
       - uses: ./helios/.github/actions/bench-host
         with:
           rust-cache-key: bench-suite-${{ matrix.lane }}

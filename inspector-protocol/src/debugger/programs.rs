@@ -110,6 +110,7 @@ mod guest {
                         ]),
                         host_programs::root_terminal_grant(),
                         host_programs::root_process_grant(),
+                        host_programs::all_device_classes_grant(),
                     ],
                 })
                 .await
