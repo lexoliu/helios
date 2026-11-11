@@ -71,9 +71,10 @@ use core::task::{Context, Poll};
 use core::time::Duration;
 use hashbrown::HashMap;
 use helios_compiler_abi::{
-    CompileHint as CompilerAbiHint, CompilerRequestHeader, CompilerResponseHeader, CompilerStatus,
+    CompileHint as CompilerAbiHint, CompilerRequestHeader, CompilerResponseHeader,
     HELIOS_COMPILER_ABI_VERSION, HELIOS_COMPILER_ALLOC, HELIOS_COMPILER_COMPILE,
-    HELIOS_COMPILER_INITIALIZE, HELIOS_COMPILER_PTHREAD_SELF_OFFSET,
+    HELIOS_COMPILER_FREE, HELIOS_COMPILER_INITIALIZE, HELIOS_COMPILER_OUTSTANDING_BYTES,
+    HELIOS_COMPILER_PTHREAD_SELF_OFFSET,
 };
 use helios_hal::watchdog::Watchdog;
 use smallvec::SmallVec;
@@ -306,10 +307,10 @@ where
     /// Serialises compile calls. The cached `SharedMemory` is the
     /// plugin's only scratch surface; concurrent calls would race on
     /// the bump allocator and corrupt each other's request/response
-    /// buffers. The lock is held only on the kernel side; the rayon
+    /// buffers. The slot is held only on the kernel side; the rayon
     /// worker pool inside the plugin still parallelises a single
     /// compile across all cores.
-    compile_in_progress: AtomicBool,
+    compile_slot: CompilerCompileSlot,
     /// Every wasm image this service loaded, by address, for the
     /// instruction sampler to name.
     code_map: CodeMap,
@@ -530,7 +531,7 @@ where
             core_module_instance_pre_cache: Arc::new(Mutex::new(ComponentCache::new(cache_budget))),
             compiler_artifact,
             compiler_plugin: Mutex::new(None),
-            compile_in_progress: AtomicBool::new(false),
+            compile_slot: CompilerCompileSlot::new(),
             code_map: CodeMap::new(),
             clock_cpu: cpu.clone(),
             _marker: core::marker::PhantomData,
@@ -1816,7 +1817,7 @@ where
         profile: bool,
         phases: &mut CompilerPhaseTimestamps,
     ) -> Result<(Vec<u8>, CompilerThreadReports), ProgramExecError> {
-        let _compile_guard = self.acquire_compiler_compile_slot().await;
+        let _compile_slot = self.inner.compile_slot.acquire().await;
         phases.slot_acquired_ns = if profile {
             monotonic_nanos(&exec_context.cpu)
         } else {
@@ -1847,27 +1848,6 @@ where
             *self.inner.compiler_plugin.lock() = None;
         }
         result.map(|payload| (payload, thread_reports))
-    }
-
-    async fn acquire_compiler_compile_slot(&self) -> CompilerCompileSlot<'_> {
-        loop {
-            if self
-                .inner
-                .compile_in_progress
-                .compare_exchange(
-                    false,
-                    true,
-                    AtomicOrdering::Acquire,
-                    AtomicOrdering::Relaxed,
-                )
-                .is_ok()
-            {
-                return CompilerCompileSlot {
-                    occupied: &self.inner.compile_in_progress,
-                };
-            }
-            crate::yield_now().await;
-        }
     }
 
     async fn await_compiler_thread_tasks(&self) -> CompilerThreadReports {
@@ -1961,40 +1941,89 @@ where
             .call_async(&mut store, thread_pointer as i32)
             .await
             .map_err(map_program_runtime_error)?;
-        let alloc = instance
-            .get_typed_func::<(i32, i32), i32>(&mut store, HELIOS_COMPILER_ALLOC)
-            .map_err(map_program_runtime_error)?;
-        let compile = instance
-            .get_typed_func::<(i32, i32), i32>(&mut store, HELIOS_COMPILER_COMPILE)
-            .map_err(map_program_runtime_error)?;
+        let exports = CompilerExports {
+            alloc: instance
+                .get_typed_func::<(i32, i32), i32>(&mut store, HELIOS_COMPILER_ALLOC)
+                .map_err(map_program_runtime_error)?,
+            free: instance
+                .get_typed_func::<(i32, i32, i32), ()>(&mut store, HELIOS_COMPILER_FREE)
+                .map_err(map_program_runtime_error)?,
+            compile: instance
+                .get_typed_func::<(i32, i32), i32>(&mut store, HELIOS_COMPILER_COMPILE)
+                .map_err(map_program_runtime_error)?,
+            outstanding: instance
+                .get_typed_func::<(), i32>(&mut store, HELIOS_COMPILER_OUTSTANDING_BYTES)
+                .map_err(map_program_runtime_error)?,
+        };
         phases.instantiated_ns = if profile {
             monotonic_nanos(&exec_context.cpu)
         } else {
             0
         };
-        let target = env!("HELIOS_BUILD_TARGET").as_bytes();
-        let wasm_ptr = compiler_alloc(&mut store, &alloc, wasm.len(), 1).await?;
-        let target_ptr = compiler_alloc(&mut store, &alloc, target.len(), 1).await?;
-        let request_ptr = compiler_alloc(
+        let outstanding_before =
+            compiler_outstanding_bytes(&mut store, &exports.outstanding).await?;
+        let mut allocations = CompilerAllocations::new();
+        let outcome = Self::call_compiler(
             &mut store,
-            &alloc,
-            core::mem::size_of::<CompilerRequestHeader>(),
-            core::mem::align_of::<CompilerRequestHeader>(),
+            &exports,
+            &mut allocations,
+            wasm,
+            hint,
+            profile,
+            phases,
         )
-        .await?;
-        write_shared_memory(store.data().memory(), GuestAddress::wasm32(wasm_ptr), wasm)?;
-        write_shared_memory(
-            store.data().memory(),
-            GuestAddress::wasm32(target_ptr),
-            target,
-        )?;
+        .await;
+        // A call into the plugin that failed leaves its allocator in an
+        // unknown state, so nothing is freed and the memory dies with the
+        // runtime; every other end returns the call's allocations. A release
+        // that fails, or leaves the plugin's count off its starting level,
+        // comes before the compile's own result: it says the plugin's memory
+        // can no longer be trusted, which is what discards the runtime.
+        let result = outcome?;
+        allocations.release(&mut store, &exports.free).await?;
+        let outstanding_after =
+            compiler_outstanding_bytes(&mut store, &exports.outstanding).await?;
+        ensure_compiler_buffers_returned(outstanding_before, outstanding_after)?;
+        result
+    }
+
+    /// Runs one compile against the plugin instance: allocates the request,
+    /// calls `compile`, and copies the response out. The caller owns
+    /// `allocations` and releases them according to the returned
+    /// [`CompilerCallOutcome`].
+    async fn call_compiler(
+        store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, HostFs>>,
+        exports: &CompilerExports,
+        allocations: &mut CompilerAllocations,
+        wasm: &Bytes,
+        hint: AotCompileHint,
+        profile: bool,
+        phases: &mut CompilerPhaseTimestamps,
+    ) -> Result<Result<Vec<u8>, ProgramExecError>, ProgramExecError> {
+        let target = env!("HELIOS_BUILD_TARGET").as_bytes();
+        let wasm_ptr = allocations
+            .alloc(&mut *store, &exports.alloc, wasm.len(), 1)
+            .await?;
+        let target_ptr = allocations
+            .alloc(&mut *store, &exports.alloc, target.len(), 1)
+            .await?;
+        let request_ptr = allocations
+            .alloc(
+                &mut *store,
+                &exports.alloc,
+                CompilerRequestHeader::SIZE,
+                CompilerRequestHeader::ALIGN,
+            )
+            .await?;
+        // From here to the response, only host-side work can fail apart from
+        // the `compile` call itself, so a failure is the inner `Err`.
         let header = CompilerRequestHeader {
             abi_version: HELIOS_COMPILER_ABI_VERSION,
-            hint: match hint {
+            hint: u32::from(match hint {
                 AotCompileHint::Fast => CompilerAbiHint::Fast,
                 AotCompileHint::Balanced => CompilerAbiHint::Balanced,
                 AotCompileHint::Performance => CompilerAbiHint::Performance,
-            },
+            }),
             wasm_ptr,
             wasm_len: wasm.len() as u32,
             target_ptr,
@@ -2005,38 +2034,39 @@ where
                 0
             },
         };
-        write_shared_memory(
-            store.data().memory(),
-            GuestAddress::wasm32(request_ptr),
-            unsafe {
-                core::slice::from_raw_parts(
-                    core::ptr::addr_of!(header).cast::<u8>(),
-                    core::mem::size_of::<CompilerRequestHeader>(),
+        let memory = store.data().memory();
+        let written = write_shared_memory(memory, GuestAddress::wasm32(wasm_ptr), wasm)
+            .and_then(|()| write_shared_memory(memory, GuestAddress::wasm32(target_ptr), target))
+            .and_then(|()| {
+                write_shared_memory(
+                    memory,
+                    GuestAddress::wasm32(request_ptr),
+                    &header.to_bytes(),
                 )
-            },
-        )?;
+            });
+        if let Err(error) = written {
+            return Ok(Err(error));
+        }
         phases.input_done_ns = if profile {
-            monotonic_nanos(&exec_context.cpu)
+            monotonic_nanos(&store.data().cpu)
         } else {
             0
         };
         phases.compile_started_ns = if profile {
-            monotonic_nanos(&exec_context.cpu)
+            monotonic_nanos(&store.data().cpu)
         } else {
             0
         };
         let compile_started = store.data().cpu.now().ticks();
-        let response_ptr = compile
+        let response_ptr = exports
+            .compile
             .call_async(
-                &mut store,
-                (
-                    request_ptr as i32,
-                    core::mem::size_of::<CompilerRequestHeader>() as i32,
-                ),
+                &mut *store,
+                (request_ptr as i32, CompilerRequestHeader::SIZE as i32),
             )
             .await;
         phases.compile_returned_ns = if profile {
-            monotonic_nanos(&exec_context.cpu)
+            monotonic_nanos(&store.data().cpu)
         } else {
             0
         };
@@ -2048,50 +2078,13 @@ where
             .saturating_sub(compile_started);
         store.data().record_user_ticks(compile_elapsed);
         let response_ptr = response_ptr.map_err(map_program_runtime_error)? as u32;
-        let response =
-            read_compiler_response(store.data().memory(), GuestAddress::wasm32(response_ptr))?;
-        if response.abi_version != HELIOS_COMPILER_ABI_VERSION {
-            return Err(ProgramExecError {
-                kind: ProgramExecErrorKind::InvalidBinary,
-                detail: ProgramExecErrorDetail::CompilerAbiMismatch,
-            });
-        }
-        let diagnostic = read_shared_memory(
-            store.data().memory(),
-            GuestAddress::wasm32(response.diagnostic_ptr),
-            response.diagnostic_len,
-        )?;
-        if response.status != CompilerStatus::Ok {
-            if !diagnostic.is_empty() {
-                tracing::error!(
-                    diagnostic = %core::str::from_utf8(&diagnostic).unwrap_or("<non-utf8 compiler diagnostic>"),
-                    "compiler plugin rejected input"
-                );
-            }
-            return Err(ProgramExecError {
-                kind: ProgramExecErrorKind::InvalidBinary,
-                detail: ProgramExecErrorDetail::CompilerRejectedInput,
-            });
-        }
-        if !diagnostic.is_empty() {
-            store.data().write_serial.emit(&diagnostic);
-        }
-        phases.diagnostic_done_ns = if profile {
-            monotonic_nanos(&exec_context.cpu)
-        } else {
-            0
-        };
-        let output = read_shared_memory(
-            store.data().memory(),
-            GuestAddress::wasm32(response.precompiled_ptr),
-            response.precompiled_len,
-        )?;
-        phases.response_done_ns = if profile {
-            monotonic_nanos(&exec_context.cpu)
-        } else {
-            0
-        };
-        Ok(output)
+        Ok(accept_compiler_response(
+            store.data(),
+            allocations,
+            response_ptr,
+            profile,
+            phases,
+        ))
     }
 
     fn read_compiler_plugin_artifact(
