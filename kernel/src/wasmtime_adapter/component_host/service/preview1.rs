@@ -2804,7 +2804,14 @@ where
             Ok(service) => service,
             Err(error) => return p1_errno_from_fs(error),
         };
-        let entries = match service.read_dir(&host_path).await {
+        // The whole listing is mirrored, so the bound is the mirror's.
+        let entries = match service
+            .read_dir(
+                &host_path,
+                crate::wasmtime_adapter::wasi::GUEST_DIRECTORY_MIRROR_LIMIT,
+            )
+            .await
+        {
             Ok(entries) => entries,
             Err(error) => {
                 return p1_errno_from_fs(crate::wasmtime_adapter::wasi::map_host_fs_error(error));
@@ -3255,8 +3262,12 @@ where
                     .map_err(p1_errno_from_fs)?;
             }
             if kind != FsNodeKind::File {
+                // The whole listing is mirrored, so the bound is the mirror's.
                 let entries = service
-                    .read_dir(&host_path)
+                    .read_dir(
+                        &host_path,
+                        crate::wasmtime_adapter::wasi::GUEST_DIRECTORY_MIRROR_LIMIT,
+                    )
                     .await
                     .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
                     .map_err(p1_errno_from_fs)?;
