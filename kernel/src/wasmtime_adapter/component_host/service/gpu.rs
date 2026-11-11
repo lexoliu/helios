@@ -1099,6 +1099,16 @@ pub(crate) mod test_store {
     /// A store on a runtime state that publishes `service`, holding no
     /// claim yet.
     pub(crate) fn store_data(service: &Gpu3dService) -> TestStoreData {
+        store_data_with(|runtime_state| runtime_state.install_gpu3d_service(service.clone()))
+    }
+
+    /// A store on a runtime state that `configure` has set up, over a
+    /// fresh debug filesystem of its own.
+    pub(crate) fn store_data_with(
+        configure: impl FnOnce(
+            &HostRuntimeState<TestCpu, TestNetworkService, UnsupportedHostFileSystem>,
+        ),
+    ) -> TestStoreData {
         let cpu = TestCpu::with_entropy(0x5a);
         let runtime_state: HostRuntimeState<
             TestCpu,
@@ -1109,7 +1119,7 @@ pub(crate) mod test_store {
             crate::RootEntropy::from_platform(&cpu, None, None)
                 .expect("the fixture CPU has an entropy source"),
         ));
-        runtime_state.install_gpu3d_service(service.clone());
+        configure(&runtime_state);
         let executor = Executor::new(ProgressCounter::new(), 1, ProcessorId::new(0));
         let registry = InstanceRegistry::new();
         let instance = registry.register("gpu-store", 0);
