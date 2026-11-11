@@ -8,9 +8,11 @@ mod congestion;
 mod dhcp;
 mod dns;
 mod hash;
+mod index;
 mod isn;
 mod ndp;
 mod packet;
+mod secret;
 mod stack;
 mod tcp;
 mod types;
@@ -45,7 +47,7 @@ pub use hash::{
     FlowHash, FlowTuple, RSS_INDIRECTION_ENTRIES, RSS_KEY_BYTES, STANDARD_RSS_KEY, flow_hash,
     rss_indirection_entry, toeplitz,
 };
-pub use isn::{IsnSecret, initial_sequence_number};
+pub use isn::initial_sequence_number;
 pub use ndp::{
     AdvertisedAddress, Ipv6DnsServers, Ipv6RouterConfiguration, MAX_ADVERTISED_PREFIXES,
     MAX_IPV6_DNS_SERVERS, MAX_ROUTER_SOLICITATIONS, NeighborDiscovery, OnLinkPrefix,
@@ -59,6 +61,7 @@ pub use packet::{
     NdpRecursiveDnsServers, TcpFlags, TcpHeader, TcpHeaderOptions, TcpOptions, TcpPacket,
     TcpSackBlock, TcpSackBlocks, TcpTimestampOption, TransportChecksum, TransportPorts, UdpPacket,
 };
+pub use secret::StackSecret;
 pub use stack::{
     DEFAULT_TCP_LISTEN_BACKLOG, DhcpLease, DnsQueryId, IcmpEchoKey, IcmpEchoReply,
     Ipv4MulticastMembership, MAX_ICMP_ECHO_REPLIES, MAX_IPV4_MULTICAST_MEMBERSHIPS,

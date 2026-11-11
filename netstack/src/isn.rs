@@ -14,49 +14,29 @@
 //! Concurrency contract: pure functions over copied values; no state, no
 //! locking.
 
-use core::fmt;
 use core::hash::Hasher;
 
 use siphasher::sip::SipHasher24;
 
-use crate::{IpAddress, StackInstant, TcpEndpoint};
+use crate::secret::{KeyDomain, StackSecret, write_endpoint};
+use crate::{StackInstant, TcpEndpoint};
 
 /// RFC 6528 §3: `M` is a 4 microsecond timer.
 const CLOCK_TICK_NANOS: u64 = 4_000;
 
-/// The per-boot key of `F` in RFC 6528 §3.
-///
-/// The embedding kernel draws it once from its root entropy generator and
-/// hands every stack the same value, so a four-tuple hashes identically
-/// whichever stack opens the connection. It has no default: a stack cannot
-/// be built without one.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub struct IsnSecret([u8; Self::BYTES]);
-
-impl IsnSecret {
-    /// SipHash-2-4 takes a 128-bit key.
-    pub const BYTES: usize = 16;
-
-    pub const fn from_bytes(bytes: [u8; Self::BYTES]) -> Self {
-        Self(bytes)
-    }
-}
-
-impl fmt::Debug for IsnSecret {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("IsnSecret(..)")
-    }
-}
-
 /// The initial send sequence number for a connection between `local` and
 /// `remote` opened at `now`.
+///
+/// `F` is keyed by the key `secret` derives for this function alone, so it
+/// shares no key with the socket indexes' hash.
 pub fn initial_sequence_number(
-    secret: &IsnSecret,
+    secret: &StackSecret,
     local: TcpEndpoint,
     remote: TcpEndpoint,
     now: StackInstant,
 ) -> u32 {
-    let mut hasher = SipHasher24::new_with_key(&secret.0);
+    let key = secret.derive(KeyDomain::InitialSequenceNumber);
+    let mut hasher = SipHasher24::new_with_keys(key.k0, key.k1);
     write_endpoint(&mut hasher, local);
     write_endpoint(&mut hasher, remote);
     let flow = hasher.finish() as u32;
@@ -64,29 +44,13 @@ pub fn initial_sequence_number(
     clock.wrapping_add(flow)
 }
 
-/// Feeds one endpoint as a family tag, the address octets and the port,
-/// so an IPv4 and an IPv6 endpoint can never produce the same input.
-fn write_endpoint(hasher: &mut SipHasher24, endpoint: TcpEndpoint) {
-    match endpoint.address {
-        IpAddress::Ipv4(address) => {
-            hasher.write_u8(4);
-            hasher.write(&address.octets());
-        }
-        IpAddress::Ipv6(address) => {
-            hasher.write_u8(6);
-            hasher.write(&address.octets());
-        }
-    }
-    hasher.write_u16(endpoint.port);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Ipv4Address, Ipv6Address};
+    use crate::{IpAddress, Ipv4Address, Ipv6Address};
 
-    const SECRET_A: IsnSecret = IsnSecret::from_bytes([0x11; IsnSecret::BYTES]);
-    const SECRET_B: IsnSecret = IsnSecret::from_bytes([0x22; IsnSecret::BYTES]);
+    const SECRET_A: StackSecret = StackSecret::from_bytes([0x11; StackSecret::BYTES]);
+    const SECRET_B: StackSecret = StackSecret::from_bytes([0x22; StackSecret::BYTES]);
 
     fn endpoint(octets: [u8; 4], port: u16) -> TcpEndpoint {
         TcpEndpoint {
@@ -165,10 +129,5 @@ mod tests {
         assert_eq!(at(3_999), origin, "M ticks once per four microseconds");
         assert_eq!(at(4_000_000), origin.wrapping_add(1_000));
         assert_eq!(at(1_000_000_000), origin.wrapping_add(250_000));
-    }
-
-    #[test]
-    fn the_secret_is_not_printed() {
-        assert_eq!(alloc::format!("{SECRET_A:?}"), "IsnSecret(..)");
     }
 }
