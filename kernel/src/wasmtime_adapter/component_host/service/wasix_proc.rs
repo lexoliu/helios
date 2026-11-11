@@ -1828,15 +1828,15 @@ where
         .map_err(wasmtime::Error::new)
         .inspect_err(|error| launch_exit_error(&trace, error))?;
     let argv = ProgramArgv::from_caller(&prepared.guest_name, argv);
-    let mut environment = match env {
+    let environment = match env {
         Some((ptr, len)) => wasix_read_exec_string(caller, memory, ptr, len)
             .map(|value| wasix_split_environment(&value))
             .unwrap_or_default(),
         None => caller.data().environment.clone(),
     };
-    let process_id = caller.data().instance().id().raw().to_string();
-    environment.retain(|(name, _)| name.as_str() != HELIOS_PROCESS_ID_ENV);
-    environment.push((HELIOS_PROCESS_ID_ENV.into(), process_id));
+    // The replacement keeps this instance, so it keeps this instance's id.
+    let environment =
+        LaunchEnvironment::from_guest(environment).into_process_env(caller.data().instance().id());
     let service = caller
         .data()
         .runtime_state
@@ -2226,6 +2226,10 @@ pub(super) fn wasix_proc_spawn_inherited_non_directory_authority(
     authority.grant_process_rights(parent.process_rights());
     authority.grant_link_rights(parent.link_rights());
     authority.grant_mount_rights(parent.mount_rights());
+    // Device classes follow the shell to the programs it runs. A named
+    // device does not: it belongs to the driver instance it was granted
+    // to, not to that instance's children.
+    authority.grant_device_classes(parent.device_class_rights());
     authority
 }
 
@@ -3288,26 +3292,17 @@ where
     HostFs: crate::HostFileSystem,
 {
     let namespace = p1_namespace(caller);
-    let file = wasi_fs::read_program_file(&namespace, source_path)
+    // Trust follows the layer that produced the bytes, never the path or
+    // the mount: only boot-image bytes skip verification (#483).
+    wasi_fs::read_program_file(&namespace, source_path)
         .await
+        .map(ProgramSource::from_file)
         .map_err(|_| {
             wasmtime::Error::new(ProgramExecError {
                 kind: ProgramExecErrorKind::PermissionDenied,
                 detail: ProgramExecErrorDetail::ProgramSourceNotGranted,
             })
-        })?;
-    let source_is_host = file.from_host_share;
-    let source = file.bytes;
-    let source = if cwasm::is_cwasm(&source) {
-        if source_is_host {
-            ProgramSource::SignedArtifact(source)
-        } else {
-            ProgramSource::BootfsArtifact(source)
-        }
-    } else {
-        ProgramSource::RawWasm(source)
-    };
-    Ok(source)
+        })
 }
 
 pub(super) fn wasix_resolve_exec_guest_name<CpuImpl, Net, HostFs>(
@@ -3409,8 +3404,7 @@ where
         launch_exit_errno(trace, *errno);
     })?;
     let argv = ProgramArgv::from_caller(&prepared.guest_name, argv);
-    let mut environment = environment.unwrap_or_else(|| caller.data().environment.clone());
-    environment.retain(|(name, _)| name.as_str() != HELIOS_PROCESS_ID_ENV);
+    let environment = environment.unwrap_or_else(|| caller.data().environment.clone());
     let runtime_state = caller.data().runtime_state.clone();
     let service = runtime_state.wait_for_program_service().await;
     let exec_context = caller.data().exec_context();
@@ -3424,7 +3418,7 @@ where
             None,
             ProgramLaunch {
                 argv,
-                env: environment,
+                env: LaunchEnvironment::from_guest(environment),
                 authority,
                 filesystem,
                 descriptors,

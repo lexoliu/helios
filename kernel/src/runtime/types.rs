@@ -975,6 +975,33 @@ pub struct HostDirEntry {
     pub is_directory: bool,
 }
 
+/// How much of one directory the caller of [`HostFileSystem::read_dir`] is
+/// prepared to hold. The host is the source of the listing and decides how
+/// long it is, so the caller states what it can afford; a listing that goes
+/// past either bound fails with [`HostFsError::DirectoryTooLarge`] instead
+/// of being cut short.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostDirLimit {
+    /// Most entries one listing may hold.
+    pub max_entries: usize,
+    /// Most bytes of entry names one listing may hold in total.
+    pub max_name_bytes: usize,
+}
+
+impl HostDirLimit {
+    /// Fails when a listing of `entries` entries whose names total
+    /// `name_bytes` bytes is past either bound.
+    pub fn check(self, entries: usize, name_bytes: usize) -> Result<(), HostFsError> {
+        if entries > self.max_entries || name_bytes > self.max_name_bytes {
+            return Err(HostFsError::DirectoryTooLarge {
+                max_entries: self.max_entries,
+                max_name_bytes: self.max_name_bytes,
+            });
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct AuthorityDomain(u64);
 
@@ -1054,6 +1081,14 @@ pub enum HostFsError {
     Server(u32),
     #[error("invalid utf-8")]
     Utf8,
+    #[error(
+        "directory listing exceeds the caller's limit of {max_entries} entries or \
+         {max_name_bytes} name bytes"
+    )]
+    DirectoryTooLarge {
+        max_entries: usize,
+        max_name_bytes: usize,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1084,7 +1119,8 @@ impl HostFsError {
             | HostFsError::Transport(IoError::OutOfBounds)
             | HostFsError::Transport(IoError::DeviceFault)
             | HostFsError::Protocol(_)
-            | HostFsError::Utf8 => HostFsErrorKind::Io,
+            | HostFsError::Utf8
+            | HostFsError::DirectoryTooLarge { .. } => HostFsErrorKind::Io,
             HostFsError::Server(code) => match code {
                 2 => HostFsErrorKind::NoEntry,
                 17 => HostFsErrorKind::Exist,
@@ -1106,9 +1142,12 @@ pub trait HostFileSystem: Clone + Send + Sync + 'static {
         &'a self,
         path: &'a str,
     ) -> impl Future<Output = Result<HostMetadata, HostFsError>> + Send + 'a;
+    /// Lists `path`, failing with [`HostFsError::DirectoryTooLarge`] when the
+    /// directory is past `limit`.
     fn read_dir<'a>(
         &'a self,
         path: &'a str,
+        limit: HostDirLimit,
     ) -> impl Future<Output = Result<Vec<HostDirEntry>, HostFsError>> + Send + 'a;
     fn read_file<'a>(
         &'a self,

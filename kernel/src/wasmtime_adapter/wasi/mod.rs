@@ -33,7 +33,7 @@ use core::pin::Pin;
 use core::task::{Context, Poll};
 
 use crate::{ComponentOutputMode, ComponentOutputRoute, ComponentOutputStreamKind, ObjectIdentity};
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use futures::channel::oneshot;
 use helios_hal::cpu::Cpu;
 use helios_netstack::Ipv6Address;

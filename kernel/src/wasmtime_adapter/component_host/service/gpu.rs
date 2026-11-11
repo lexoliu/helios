@@ -52,10 +52,10 @@ use super::super::StoreData;
 /// Register `helios:system/gpu` in a linker.
 ///
 /// Every program linker gets it, for the reason the display interface
-/// does: the claim is the capability, not the import. A program that
-/// never claims the engine learns nothing from having the import, and
-/// one that claims it on a machine with no renderer is told
-/// `no-renderer`.
+/// does: linkage is cached per binary while authority belongs to the
+/// instance. The claim checks the instance's GPU device class, and an
+/// instance without it is told `unavailable`, which is what a machine
+/// with no 3D service tells every program.
 pub(in crate::wasmtime_adapter::component_host) fn add_gpu_to_linker<CpuImpl, Net, HostFs>(
     linker: &mut Linker<StoreData<CpuImpl, Net, HostFs>>,
 ) -> wasmtime::Result<()>
@@ -234,7 +234,13 @@ where
         let Some(service) = self.runtime_state.gpu3d_service() else {
             return Ok(Err(gpu_wit::Error::Unavailable));
         };
-        if let Err(error) = self.device.claim_gpu(&service) {
+        // Without the GPU class the answer is the one a machine with no
+        // 3D service gives, not `no-renderer`, which would say the
+        // machine has a device that renders nothing.
+        let Ok(cap) = self.process_authority().derive_gpu_claim_cap() else {
+            return Ok(Err(gpu_wit::Error::Unavailable));
+        };
+        if let Err(error) = self.device.claim_gpu(&service, cap) {
             return Ok(Err(to_wit_error(error)));
         }
         let generation = self
@@ -1099,6 +1105,28 @@ pub(crate) mod test_store {
     /// A store on a runtime state that publishes `service`, holding no
     /// claim yet.
     pub(crate) fn store_data(service: &Gpu3dService) -> TestStoreData {
+        store_data_with(|runtime_state| runtime_state.install_gpu3d_service(service.clone()))
+    }
+
+    /// A store on a runtime state that `configure` has set up, over a
+    /// fresh debug filesystem of its own.
+    pub(crate) fn store_data_with(
+        configure: impl FnOnce(
+            &HostRuntimeState<TestCpu, TestNetworkService, UnsupportedHostFileSystem>,
+        ),
+    ) -> TestStoreData {
+        store_data_authorized(ProcessAuthority::empty(), configure)
+    }
+
+    /// As [`store_data_with`], for an instance running under
+    /// `authority`: what a claim test needs to tell the provisioned
+    /// owner from an ordinary program.
+    pub(crate) fn store_data_authorized(
+        authority: ProcessAuthority,
+        configure: impl FnOnce(
+            &HostRuntimeState<TestCpu, TestNetworkService, UnsupportedHostFileSystem>,
+        ),
+    ) -> TestStoreData {
         let cpu = TestCpu::with_entropy(0x5a);
         let runtime_state: HostRuntimeState<
             TestCpu,
@@ -1106,10 +1134,15 @@ pub(crate) mod test_store {
             UnsupportedHostFileSystem,
         > = crate::RuntimeState::new(cpu.timebase(), 1, 0, crate::BootPayload::for_tests());
         runtime_state.install_root_entropy(Arc::new(
-            crate::RootEntropy::from_platform(&cpu, None, None)
-                .expect("the fixture CPU has an entropy source"),
+            crate::RootEntropy::from_platform(
+                &cpu,
+                None,
+                None,
+                crate::MachineGeneration::new(None),
+            )
+            .expect("the fixture CPU has an entropy source"),
         ));
-        runtime_state.install_gpu3d_service(service.clone());
+        configure(&runtime_state);
         let executor = Executor::new(ProgressCounter::new(), 1, ProcessorId::new(0));
         let registry = InstanceRegistry::new();
         let instance = registry.register("gpu-store", 0);
@@ -1127,7 +1160,7 @@ pub(crate) mod test_store {
             Namespace::new(runtime_state.mounts()),
             Vec::new(),
             Vec::new(),
-            ProcessAuthority::empty(),
+            authority,
             ComponentOutputMode::Serial,
             read_nothing,
             crate::DebugSerialWriter::of::<DiscardPort>(),

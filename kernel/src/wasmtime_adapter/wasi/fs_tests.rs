@@ -8,11 +8,15 @@ use helios_hal::fs::{FileSystemRights, NodeKind};
 
 use super::{
     FileWriteMode, FsDescriptor, FsNodeKind, create_directory_at, fs_types, link_at, metadata_hash,
-    open_at, read, readlink_at, rename_at, set_size, set_times, stat_path, symlink_at,
+    open_at, read, read_program_file, readlink_at, rename_at, set_size, set_times, stat_path,
+    symlink_at, write_program_file,
 };
+use crate::wasmtime_adapter::component_host::ProgramSource;
+use crate::wasmtime_adapter::cwasm::{self, UntrustedCwasm};
 use crate::{
     AuthorityDomain, BOOT_DEVICE, BootFs, EmbeddedBootDirectory, EmbeddedBootFile, EmbeddedBootFs,
-    MemoryFs, MountTable, MountedFs, Namespace, UnsupportedHostFileSystem, object_identity,
+    FileContents, MemoryFs, MountTable, MountedFs, Namespace, UnsupportedHostFileSystem,
+    object_identity,
 };
 
 type TestNamespace = Namespace<UnsupportedHostFileSystem>;
@@ -451,4 +455,159 @@ fn symlink_follow_is_confined_and_loop_limited() {
     .err()
     .expect("a symlink loop must be rejected");
     assert!(matches!(error, fs_types::ErrorCode::Loop));
+}
+
+/// A cwasm signed by a key the kernel does not trust: it parses as an
+/// artifact, and only a signature check tells it apart.
+fn foreign_signed_cwasm() -> &'static [u8] {
+    let signed = helios_artifact::sign_payload_with_secret_key_bytes(b"payload", &[7; 32])
+        .expect("signing a test payload must succeed");
+    alloc::boxed::Box::leak(signed.into_boxed_slice())
+}
+
+/// A namespace whose boot image carries `foreign_signed_cwasm` at
+/// `/bin/prog`.
+fn namespace_with_bootfs_cwasm() -> TestNamespace {
+    let files = alloc::boxed::Box::leak(alloc::boxed::Box::new([EmbeddedBootFile::new(
+        "bin/prog",
+        foreign_signed_cwasm(),
+        42,
+    )]));
+    const DIRECTORIES: &[EmbeddedBootDirectory] = &[EmbeddedBootDirectory::new("mnt", 0)];
+    let image = EmbeddedBootFs::new(DIRECTORIES, files);
+    Namespace::new(MountTable::new(BootFs::new(image, BOOT_DEVICE)))
+}
+
+fn program_source(namespace: &TestNamespace, absolute: &str) -> ProgramSource {
+    ProgramSource::from_file(
+        block_on(read_program_file(namespace, absolute)).expect("program file must be readable"),
+    )
+}
+
+fn boot_provenance(namespace: &TestNamespace, absolute: &str) -> bool {
+    matches!(
+        block_on(read_program_file(namespace, absolute)),
+        Ok(FileContents::Boot(_))
+    )
+}
+
+#[test]
+fn bootfs_cwasm_loads_without_signature_verification() {
+    let namespace = namespace_with_bootfs_cwasm();
+
+    let ProgramSource::BootfsArtifact(bytes) = program_source(&namespace, "/bin/prog") else {
+        panic!("a bootfs cwasm must classify as a bootfs artifact");
+    };
+    // The signature would not verify, so accepting it proves the bootfs
+    // path pays no verification.
+    assert!(cwasm::verify_signed_artifact(UntrustedCwasm::new(bytes.as_slice())).is_err());
+    let trusted = cwasm::trust_bootfs_artifact(&bytes).expect("a bootfs artifact loads unverified");
+    assert_eq!(trusted.payload(), b"payload");
+}
+
+#[test]
+fn guest_written_cwasm_must_verify() {
+    let namespace = namespace_with_bootfs_cwasm();
+    block_on(create_directory_at(&namespace, &root(), "tmp", 1))
+        .expect("creating /tmp must succeed");
+    mount_memory(&namespace, "/mnt");
+
+    // The bytes of a bootfs artifact, copied by a guest through an
+    // ordinary WASI write, into the root layer and onto a mounted tree:
+    // neither copy has bootfs provenance.
+    let FileContents::Boot(copied) =
+        block_on(read_program_file(&namespace, "/bin/prog")).expect("bootfs program is readable")
+    else {
+        panic!("a boot image file must carry boot provenance");
+    };
+    for copy in ["tmp/copy", "mnt/copy"] {
+        create_file(&namespace, copy, copied.as_slice());
+        let ProgramSource::SignedArtifact(bytes) =
+            program_source(&namespace, &alloc::format!("/{copy}"))
+        else {
+            panic!("a guest-written cwasm at /{copy} must classify as a signed artifact");
+        };
+        assert!(matches!(
+            cwasm::verify_signed_artifact(UntrustedCwasm::new(&bytes)),
+            Err(cwasm::ArtifactTrustError::Trailer(
+                helios_artifact::TrailerError::UntrustedSigner
+            ))
+        ));
+    }
+
+    // A kernel-signed artifact with one signature byte flipped, as
+    // `write_program_file` would store it, is refused too.
+    let mut tampered = cwasm::sign_trusted_artifact_payload(b"payload")
+        .expect("signing with the trusted root must succeed");
+    let last_signature_byte = tampered.len() - 13;
+    tampered[last_signature_byte] ^= 1;
+    block_on(write_program_file(
+        &namespace,
+        "/tmp/tampered",
+        &tampered,
+        4,
+    ))
+    .expect("writing a program file must succeed");
+    let ProgramSource::SignedArtifact(bytes) = program_source(&namespace, "/tmp/tampered") else {
+        panic!("a guest-written cwasm must classify as a signed artifact");
+    };
+    assert!(matches!(
+        cwasm::verify_signed_artifact(UntrustedCwasm::new(&bytes)),
+        Err(cwasm::ArtifactTrustError::Trailer(
+            helios_artifact::TrailerError::InvalidPayloadSignature
+        ))
+    ));
+
+    // What the in-kernel compiler writes is signed by the trusted root,
+    // and that is what lets a guest exec it from anywhere.
+    let signed = cwasm::sign_trusted_artifact_payload(b"payload")
+        .expect("signing with the trusted root must succeed");
+    block_on(write_program_file(&namespace, "/tmp/compiled", &signed, 5))
+        .expect("writing a program file must succeed");
+    let ProgramSource::SignedArtifact(bytes) = program_source(&namespace, "/tmp/compiled") else {
+        panic!("a guest-written cwasm must classify as a signed artifact");
+    };
+    let trusted = cwasm::verify_signed_artifact(UntrustedCwasm::new(&bytes))
+        .expect("a kernel-signed artifact must verify");
+    assert_eq!(trusted.payload(), b"payload");
+}
+
+#[test]
+fn writing_a_bootfs_node_drops_its_provenance() {
+    let namespace = namespace_with_bootfs_cwasm();
+    assert!(boot_provenance(&namespace, "/bin/prog"));
+    let descriptor = open(
+        &namespace,
+        &root(),
+        "bin/prog",
+        fs_types::OpenFlags::empty(),
+        fs_types::DescriptorFlags::READ | fs_types::DescriptorFlags::WRITE,
+    )
+    .expect("opening the node for writing must succeed");
+
+    // The boot image is never written in place: every write path either
+    // leaves the boot bytes as they were or stores written bytes.
+    let write = block_on(super::write(
+        &namespace,
+        &descriptor,
+        FileWriteMode::At(0),
+        b"p",
+        2,
+    ));
+    let resize = block_on(set_size(&namespace, &descriptor, 1, 3));
+    let replace = block_on(write_program_file(
+        &namespace,
+        "/bin/prog",
+        foreign_signed_cwasm(),
+        4,
+    ));
+    for outcome in [write, resize, replace] {
+        match outcome {
+            Ok(()) => assert!(!boot_provenance(&namespace, "/bin/prog")),
+            Err(error) => {
+                assert!(matches!(error, fs_types::ErrorCode::ReadOnly));
+                assert!(boot_provenance(&namespace, "/bin/prog"));
+            }
+        }
+    }
 }

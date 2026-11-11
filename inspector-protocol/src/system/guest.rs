@@ -399,6 +399,15 @@ fn map_capability_grants_to_host(
                         .collect(),
                 })
             }
+            programs::CapabilityGrant::Device(grant) => {
+                host_programs::CapabilityGrant::Device(host_programs::DeviceGrant {
+                    classes: grant
+                        .classes
+                        .into_iter()
+                        .map(map_device_class_to_host)
+                        .collect(),
+                })
+            }
         })
         .collect()
 }
@@ -464,6 +473,15 @@ fn map_mount_right_to_host(right: programs::MountRight) -> host_programs::MountR
     match right {
         programs::MountRight::Mount => host_programs::MountRight::Mount,
         programs::MountRight::Unmount => host_programs::MountRight::Unmount,
+    }
+}
+
+fn map_device_class_to_host(class: programs::DeviceClass) -> host_programs::DeviceClass {
+    match class {
+        programs::DeviceClass::Display => host_programs::DeviceClass::Display,
+        programs::DeviceClass::Input => host_programs::DeviceClass::Input,
+        programs::DeviceClass::Gpu => host_programs::DeviceClass::Gpu,
+        programs::DeviceClass::Audio => host_programs::DeviceClass::Audio,
     }
 }
 

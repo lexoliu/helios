@@ -1465,7 +1465,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         // because the control queue is consulted only at startup
         // and infrequent runtime tweaks.
         loop {
-            if queue.pop_used().is_some() {
+            if queue.pop_used()?.is_some() {
                 break;
             }
             core::hint::spin_loop();
@@ -1842,7 +1842,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
                 .fetch_add(1, Ordering::Relaxed);
             return Ok(None);
         }
-        let Some((token, used_len)) = state.rx_queue.pop_used_with_len() else {
+        let Some((token, used_len)) = state.rx_queue.pop_used_with_len()? else {
             return Ok(None);
         };
         let (slot_index, position) = Self::complete_rx_slot(state, token);
@@ -1938,7 +1938,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         let mut expected_position = head.position;
         for index in 1..buffers {
             expected_position += 1;
-            let Some((token, used_len)) = state.rx_queue.pop_used_with_len() else {
+            let Some((token, used_len)) = state.rx_queue.pop_used_with_len()? else {
                 state.rx_queue.publish();
                 state.rx_queue.notify(&self.transport);
                 return Err(IoError::DeviceFault);
@@ -1999,7 +1999,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
     ) -> IoResult<()> {
         self.repost_rx_buffer_deferred(pair_idx, state, refused_slot)?;
         for _ in 0..tails {
-            let Some((token, _)) = state.rx_queue.pop_used_with_len() else {
+            let Some((token, _)) = state.rx_queue.pop_used_with_len()? else {
                 break;
             };
             let (slot_index, _) = Self::complete_rx_slot(state, token);
@@ -2100,7 +2100,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         let Some(mut state) = self.queue_pairs[pair_idx].tx_state.try_lock() else {
             return Ok(None);
         };
-        Ok(Some(Self::drain_tx_completions(&mut state, budget)))
+        Ok(Some(Self::drain_tx_completions(&mut state, budget)?))
     }
 
     /// Immediate zero-copy TX: headers are copied into the descriptor
@@ -2121,7 +2121,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         // Only when the ring has run dry: a sweep of the used ring costs
         // more than the descriptors it reclaims while any are still free.
         if state.tx_queue.available_descriptors() == 0 {
-            Self::drain_tx_completions(&mut state, frames.len().max(1));
+            Self::drain_tx_completions(&mut state, frames.len().max(1))?;
         }
         let NetTxState {
             tx_queue,
@@ -2330,10 +2330,10 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         (slot_index, position)
     }
 
-    fn drain_tx_completions(state: &mut NetTxState<T>, budget: usize) -> usize {
+    fn drain_tx_completions(state: &mut NetTxState<T>, budget: usize) -> IoResult<usize> {
         let mut completed = 0usize;
         while completed < budget {
-            let Some(token) = state.tx_queue.pop_used() else {
+            let Some(token) = state.tx_queue.pop_used()? else {
                 break;
             };
             let token_index = usize::from(token);
@@ -2347,7 +2347,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             state.tx_payloads[token_index] = None;
             completed += 1;
         }
-        completed
+        Ok(completed)
     }
 }
 

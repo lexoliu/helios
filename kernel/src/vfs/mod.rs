@@ -49,7 +49,7 @@ use core::cell::UnsafeCell;
 use core::cmp::Ordering;
 use core::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use crossbeam_utils::CachePadded;
 use helios_hal::fs::{
     DeviceId, DirCookie, DirEntry, FileSystem, FileSystemRights, FsError, FsPath, FsResult,
@@ -58,7 +58,9 @@ use helios_hal::fs::{
 use thiserror::Error;
 use triomphe::Arc;
 
-use crate::{AuthorityDomain, BootFs, HostFileSystem, MountCap, ObjectIdentity, UnmountCap};
+use crate::{
+    AuthorityDomain, BootFs, BootfsBytes, HostFileSystem, MountCap, ObjectIdentity, UnmountCap,
+};
 
 /// Mounts one table holds besides its root.
 ///
@@ -513,25 +515,67 @@ impl<H: HostFileSystem> Resolved<H> {
         self.mount_point() == other.mount_point()
     }
 
-    /// Whether this is the host share.
-    pub fn is_host_share(&self) -> bool {
-        matches!(self.fs, MountedFs::Host(_))
-    }
-
     /// Whether the path names the root of its mount.
     pub fn is_mount_root(&self) -> bool {
         self.path().is_root()
     }
 
-    /// Whether the boot image serves this path: the kernel's own payload,
-    /// rather than anything written since boot or brought in from a host.
-    pub async fn served_by_boot_image(&self) -> FsResult<bool> {
+    /// The whole of the regular file at this path, with the provenance of
+    /// the layer that produced the bytes.
+    pub async fn read_whole(&self) -> FsResult<FileContents> {
+        let path = self.path();
         match &self.fs {
-            MountedFs::Root(root) => root.served_by_boot_image(self.path()).await,
-            MountedFs::Boot(_) => Ok(true),
-            MountedFs::Memory(_) | MountedFs::Host(_) => Ok(false),
+            MountedFs::Root(root) => root.read_whole(path).await,
+            MountedFs::Boot(boot) => boot.file_contents(path).map(FileContents::Boot),
+            MountedFs::Memory(fs) => read_all(fs, path).await.map(FileContents::Written),
+            MountedFs::Host(fs) => read_all(fs, path).await.map(FileContents::Written),
         }
     }
+}
+
+/// A file's whole contents, typed by the layer that produced them.
+///
+/// Provenance is decided by which filesystem returned the bytes, in the
+/// same call that returned them, never by a path or a separate check a
+/// concurrent change could invalidate. Only the boot image constructs
+/// [`FileContents::Boot`]; every other layer (a namespace's own tree, a
+/// tree in kernel memory, a host share, bytes copied up from the boot
+/// image) yields [`FileContents::Written`].
+#[derive(Clone, Debug)]
+pub enum FileContents {
+    /// Bytes exactly as the boot payload supplied them.
+    Boot(BootfsBytes),
+    /// Bytes any other filesystem holds.
+    Written(Bytes),
+}
+
+/// The whole of the regular file at `path` on `fs`.
+pub(crate) async fn read_all<F: FileSystem>(fs: &F, path: FsPath<'_>) -> FsResult<Bytes> {
+    let metadata = fs.stat(path).await?;
+    match metadata.kind {
+        NodeKind::File => {}
+        NodeKind::Directory => return Err(FsError::IsDirectory),
+        NodeKind::Symlink => return Err(FsError::Invalid),
+    }
+    let size = usize::try_from(metadata.size).map_err(|_| FsError::Overflow)?;
+    let first = fs.read_at(path, 0, size).await?;
+    if first.len() == size {
+        return Ok(first);
+    }
+    // A filesystem may answer in pieces (9p bounds one read by its
+    // message size): gather the rest.
+    let mut gathered = BytesMut::with_capacity(size);
+    gathered.extend_from_slice(&first);
+    loop {
+        let chunk = fs
+            .read_at(path, gathered.len() as u64, size - gathered.len())
+            .await?;
+        if chunk.is_empty() {
+            break;
+        }
+        gathered.extend_from_slice(&chunk);
+    }
+    Ok(gathered.freeze())
 }
 
 /// The kernel's identity for a filesystem object.

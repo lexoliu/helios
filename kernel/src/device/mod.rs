@@ -82,6 +82,8 @@ mod tests {
     use helios_hal::iommu::{DmaTranslation, PhysicalRange};
     use helios_hal::vmm::VirtAddr;
 
+    use crate::process::test_caps;
+
     const RESERVATION_BYTES: u64 = 1 << 32;
     const WINDOW_BASE: usize = 0x1_0000_0000;
 
@@ -157,11 +159,13 @@ mod tests {
     fn a_second_owner_is_refused_the_device_the_first_holds() {
         let registry = registry(&["test:alpha"]);
         let first = registry
-            .claim("test:alpha", window())
+            .claim(test_caps::device("test:alpha"), window())
             .expect("the first owner gets the device");
 
         assert_eq!(
-            registry.claim("test:alpha", window()).err(),
+            registry
+                .claim(test_caps::device("test:alpha"), window())
+                .err(),
             Some(GrantError::AlreadyClaimed)
         );
 
@@ -169,7 +173,42 @@ mod tests {
         // supervisor restarting a dead driver is not blocked by the
         // instance it just killed.
         drop(first);
-        assert!(registry.claim("test:alpha", window()).is_ok());
+        assert!(
+            registry
+                .claim(test_caps::device("test:alpha"), window())
+                .is_ok()
+        );
+    }
+
+    /// The only route to a cap is an authority that names the device, so
+    /// the owner the kernel provisioned claims it and an instance
+    /// granted a different device never holds a cap for this one.
+    #[test]
+    fn the_named_owner_claims_its_device() {
+        let registry = registry(&["test:alpha", "test:beta"]);
+        let mut owner = crate::ProcessAuthority::empty();
+        owner
+            .grant_device(DeviceName::new("test:alpha").expect("the test names are short"))
+            .expect("one named device fits");
+
+        let cap = owner
+            .derive_device_grant_cap("test:alpha")
+            .expect("the owner is granted its device");
+        let lease = registry
+            .claim(cap, window())
+            .expect("the named owner gets the device");
+        assert_eq!(lease.grant().name().as_str(), "test:alpha");
+
+        assert!(
+            owner.derive_device_grant_cap("test:beta").is_err(),
+            "a grant for one device is no cap for another"
+        );
+        assert!(
+            crate::ProcessAuthority::empty()
+                .derive_device_grant_cap("test:alpha")
+                .is_err(),
+            "an ordinary instance holds no cap for any device"
+        );
     }
 
     #[test]
@@ -177,7 +216,9 @@ mod tests {
         let registry = registry(&["test:alpha"]);
 
         assert_eq!(
-            registry.claim("test:missing", window()).err(),
+            registry
+                .claim(test_caps::device("test:missing"), window())
+                .err(),
             Some(GrantError::NotFound)
         );
     }
@@ -189,7 +230,7 @@ mod tests {
     fn mapping_a_region_and_reclaiming_it_shoots_down_both_times() {
         let registry = registry(&["test:alpha"]);
         let mut lease = registry
-            .claim("test:alpha", window())
+            .claim(test_caps::device("test:alpha"), window())
             .expect("the device is free");
         let before = test_hooks::shootdowns();
 
@@ -224,7 +265,7 @@ mod tests {
     fn a_region_the_device_does_not_have_is_refused() {
         let registry = registry(&["test:alpha"]);
         let mut lease = registry
-            .claim("test:alpha", window())
+            .claim(test_caps::device("test:alpha"), window())
             .expect("the device is free");
 
         assert_eq!(lease.map_region(7).err(), Some(GrantError::NoSuchRegion));
@@ -234,7 +275,7 @@ mod tests {
     fn a_pinned_buffer_is_contiguous_addressable_and_released_on_death() {
         let registry = registry(&["test:alpha"]);
         let mut lease = registry
-            .claim("test:alpha", window())
+            .claim(test_caps::device("test:alpha"), window())
             .expect("the device is free");
         let before = test_hooks::shootdowns();
 
@@ -270,7 +311,7 @@ mod tests {
             )])
             .expect("discovery publishes once");
         let mut lease = registry
-            .claim("test:small", window())
+            .claim(test_caps::device("test:small"), window())
             .expect("the device is free");
 
         lease.dma_alloc(4096, 4096).expect("the first ring fits");
@@ -282,6 +323,27 @@ mod tests {
         );
     }
 
+    /// With a buffer already pinned, a request sized so that the two
+    /// together pass `u64::MAX` must be refused by the budget rather
+    /// than overflow the sum the budget is tested with.
+    #[test]
+    fn a_request_that_overflows_the_pinned_total_is_over_budget() {
+        const PINNED: u64 = 1 << 16;
+        let registry = registry(&["test:alpha"]);
+        let mut lease = registry
+            .claim(test_caps::device("test:alpha"), window())
+            .expect("the device is free");
+
+        lease
+            .dma_alloc(PINNED, 4096)
+            .expect("the first buffer fits");
+
+        assert_eq!(
+            lease.dma_alloc(u64::MAX - (PINNED - 1), 4096).err(),
+            Some(GrantError::BudgetExhausted)
+        );
+    }
+
     /// Nothing was refused, so saying the budget was exhausted would
     /// name the wrong fact and send a driver looking at a limit that
     /// had nothing to do with it.
@@ -289,7 +351,7 @@ mod tests {
     fn a_buffer_of_no_bytes_is_refused_as_empty_rather_than_over_budget() {
         let registry = registry(&["test:alpha"]);
         let mut lease = registry
-            .claim("test:alpha", window())
+            .claim(test_caps::device("test:alpha"), window())
             .expect("the device is free");
 
         assert_eq!(
@@ -307,7 +369,7 @@ mod tests {
     fn a_request_too_large_to_round_up_is_refused_rather_than_wrapped() {
         let registry = registry(&["test:alpha"]);
         let mut lease = registry
-            .claim("test:alpha", window())
+            .claim(test_caps::device("test:alpha"), window())
             .expect("the device is free");
 
         assert_eq!(
@@ -320,7 +382,7 @@ mod tests {
     fn an_alignment_that_is_not_a_power_of_two_is_refused() {
         let registry = registry(&["test:alpha"]);
         let mut lease = registry
-            .claim("test:alpha", window())
+            .claim(test_caps::device("test:alpha"), window())
             .expect("the device is free");
 
         assert_eq!(
@@ -353,7 +415,7 @@ mod tests {
     fn an_interrupt_reaches_an_owner_parked_on_another_processor() {
         let registry = registry(&["test:alpha"]);
         let lease = registry
-            .claim("test:alpha", window())
+            .claim(test_caps::device("test:alpha"), window())
             .expect("the device is free");
         lease.relay().unmask(0).expect("the source exists");
 
@@ -416,7 +478,7 @@ mod tests {
         });
 
         ownership
-            .claim(&registry, "test:alpha")
+            .claim(&registry, test_caps::device("test:alpha"))
             .expect("the device is free");
 
         assert_eq!(
@@ -428,7 +490,9 @@ mod tests {
         ownership.release();
         assert!(ownership.growth_limit().is_none());
         assert!(
-            registry.claim("test:alpha", window()).is_ok(),
+            registry
+                .claim(test_caps::device("test:alpha"), window())
+                .is_ok(),
             "releasing gives the device back"
         );
     }
@@ -446,7 +510,7 @@ mod tests {
         ownership.note_growth(RESERVATION_BYTES - super::DEVICE_WINDOW_BYTES + 1);
 
         assert_eq!(
-            ownership.claim(&registry, "test:alpha"),
+            ownership.claim(&registry, test_caps::device("test:alpha")),
             Err(GrantError::WindowExhausted)
         );
     }
@@ -462,11 +526,11 @@ mod tests {
             reservation_bytes: RESERVATION_BYTES,
         });
         ownership
-            .claim(&registry, "test:alpha")
+            .claim(&registry, test_caps::device("test:alpha"))
             .expect("the first device is free");
 
         assert_eq!(
-            ownership.claim(&registry, "test:beta"),
+            ownership.claim(&registry, test_caps::device("test:beta")),
             Err(GrantError::AlreadyClaimed)
         );
     }

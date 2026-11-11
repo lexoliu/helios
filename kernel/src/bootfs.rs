@@ -25,6 +25,39 @@ use triomphe::Arc;
 
 use crate::vfs::cmp_to_children;
 
+/// File bytes exactly as the boot payload supplied them.
+///
+/// Holding one is the proof that the bytes are a view into the payload
+/// the bootloader handed the kernel and that nothing has written them
+/// since: the only constructor takes a `&'static` slice, which the
+/// boot payload views hand out and guest data never is, and no method
+/// mutates the bytes. Trust that rests on where a program came from (an
+/// unverified bootfs artifact) is granted to this type, never to a
+/// `Bytes` read from wherever a path happened to resolve.
+///
+/// It is the bare slice rather than a `Bytes`, so a filesystem node that
+/// holds either this or written `Bytes` is no larger than one holding
+/// `Bytes` alone: every instance seeds one node per bootfs entry.
+#[derive(Clone, Copy, Debug)]
+pub struct BootfsBytes(&'static [u8]);
+
+impl BootfsBytes {
+    /// Wraps a view into the boot payload. Only the payload views
+    /// ([`EmbeddedBootFile`], [`crate::EmbeddedComponent`]) call this.
+    pub(crate) const fn from_image(bytes: &'static [u8]) -> Self {
+        Self(bytes)
+    }
+
+    pub const fn as_slice(&self) -> &'static [u8] {
+        self.0
+    }
+
+    /// The bytes as a zero-copy `Bytes` over the image.
+    pub const fn to_bytes(&self) -> Bytes {
+        Bytes::from_static(self.0)
+    }
+}
+
 /// Single immutable file view into the payload the backend hands the kernel.
 #[derive(Clone, Copy)]
 pub struct EmbeddedBootFile {
@@ -63,6 +96,11 @@ impl EmbeddedBootFile {
 
     pub const fn contents(&self) -> &'static [u8] {
         self.contents
+    }
+
+    /// The file's contents, carrying their bootfs provenance.
+    pub const fn bootfs_bytes(&self) -> BootfsBytes {
+        BootfsBytes::from_image(self.contents)
     }
 
     pub const fn modified_nanos(&self) -> u64 {
@@ -197,11 +235,12 @@ impl BootFs {
         self.index.device
     }
 
-    /// The bytes of the file at `path`, borrowed from the payload.
-    pub fn file_contents(&self, path: FsPath<'_>) -> FsResult<&'static [u8]> {
+    /// The bytes of the file at `path`, borrowed from the payload and
+    /// carrying its provenance.
+    pub fn file_contents(&self, path: FsPath<'_>) -> FsResult<BootfsBytes> {
         let node = self.index.lookup(path)?;
         match node.map(|(_, node)| node) {
-            Some(node) if node.kind == NodeKind::File => Ok(node.contents),
+            Some(node) if node.kind == NodeKind::File => Ok(BootfsBytes::from_image(node.contents)),
             Some(_) | None => Err(FsError::IsDirectory),
         }
     }
@@ -339,7 +378,7 @@ impl FileSystem for BootFs {
     }
 
     async fn read_at(&self, path: FsPath<'_>, offset: u64, max_bytes: usize) -> FsResult<Bytes> {
-        let contents = self.file_contents(path)?;
+        let contents = self.file_contents(path)?.as_slice();
         let offset = usize::try_from(offset).map_err(|_| FsError::Overflow)?;
         if offset >= contents.len() {
             return Ok(Bytes::new());

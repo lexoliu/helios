@@ -3,9 +3,11 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use arrayvec::ArrayVec;
 use bitflags::bitflags;
 use thiserror::Error;
 
+use crate::device::{DeviceName, MAX_GRANTS};
 use crate::{ComponentFsPathError, resolve_absolute_path};
 
 bitflags! {
@@ -78,6 +80,21 @@ bitflags! {
     }
 }
 
+bitflags! {
+    /// The machine-wide device classes an instance may claim.
+    ///
+    /// Each class is one resource with one owner role, so authority names
+    /// the class. A raw device is named individually instead, in
+    /// [`ProcessAuthority::granted_devices`].
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct DeviceClassRights: u8 {
+        const DISPLAY = 1 << 0;
+        const INPUT = 1 << 1;
+        const GPU = 1 << 2;
+        const AUDIO = 1 << 3;
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DirectoryPreopen {
     source_path: String,
@@ -121,6 +138,41 @@ typed_network_cap!(NetworkAdminCap, NetworkAuthorityRights::ADMIN);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SetWallClockCap(ClockAuthorityRights);
+
+macro_rules! typed_device_class_cap {
+    ($name:ident, $rights:expr) => {
+        /// Proof, checked on the owning task, that the instance holds
+        /// this device class.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub struct $name(DeviceClassRights);
+
+        impl $name {
+            pub const fn required_rights() -> DeviceClassRights {
+                $rights
+            }
+
+            pub const fn rights(self) -> DeviceClassRights {
+                self.0
+            }
+        }
+    };
+}
+
+typed_device_class_cap!(DisplayClaimCap, DeviceClassRights::DISPLAY);
+typed_device_class_cap!(InputClaimCap, DeviceClassRights::INPUT);
+typed_device_class_cap!(GpuClaimCap, DeviceClassRights::GPU);
+typed_device_class_cap!(AudioClaimCap, DeviceClassRights::AUDIO);
+
+/// Proof that the instance was granted one named device. The name is
+/// the proof: a registry claim looks the device up by it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeviceGrantClaimCap(DeviceName);
+
+impl DeviceGrantClaimCap {
+    pub const fn name(&self) -> &DeviceName {
+        &self.0
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TerminalInputCap(TerminalAuthorityRights);
@@ -181,6 +233,10 @@ pub struct ProcessAuthority {
     process: ProcessAuthorityRights,
     link: LinkAuthorityRights,
     mount: MountAuthorityRights,
+    device_classes: DeviceClassRights,
+    /// Raw devices this instance may claim by name. Bounded by the
+    /// registry's own capacity, because the registry cannot publish more.
+    devices: ArrayVec<DeviceName, MAX_GRANTS>,
 }
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -217,6 +273,16 @@ pub enum ProcessAuthorityError {
     MountGrantExceedsAuthority(MountAuthorityRights),
     #[error("mount point {0} is outside the caller's mutate-directory authority")]
     MountPointOutsideAuthority(String),
+    #[error("device class grant rights must not be empty")]
+    EmptyDeviceClassRights,
+    #[error("device class grant exceeds caller authority: {0:?}")]
+    DeviceClassGrantExceedsAuthority(DeviceClassRights),
+    #[error("device grant exceeds caller authority: {0}")]
+    DeviceGrantExceedsAuthority(DeviceName),
+    #[error("device name is longer than the registry stores")]
+    DeviceNameTooLong,
+    #[error("an instance holds at most {} named devices", MAX_GRANTS)]
+    TooManyDeviceGrants,
 }
 
 impl DirectoryPreopen {
@@ -356,9 +422,14 @@ impl ProcessAuthority {
             process: ProcessAuthorityRights::empty(),
             link: LinkAuthorityRights::empty(),
             mount: MountAuthorityRights::empty(),
+            device_classes: DeviceClassRights::empty(),
+            devices: ArrayVec::new_const(),
         }
     }
 
+    /// Every right except the device ones. The kernel adds the device
+    /// classes and named devices a component needs where it starts that
+    /// component, so no program inherits a claim through this value.
     pub fn root() -> Self {
         let mut authority = Self::empty();
         authority.insert_directory_preopen(
@@ -454,6 +525,29 @@ impl ProcessAuthority {
 
     pub fn mount_rights(&self) -> MountAuthorityRights {
         self.mount
+    }
+
+    pub fn device_class_rights(&self) -> DeviceClassRights {
+        self.device_classes
+    }
+
+    pub fn granted_devices(&self) -> &[DeviceName] {
+        &self.devices
+    }
+
+    pub fn grant_device_classes(&mut self, rights: DeviceClassRights) {
+        self.device_classes |= rights;
+    }
+
+    /// Name `name` as a device this instance may claim. Granting a name
+    /// twice is the same grant.
+    pub fn grant_device(&mut self, name: DeviceName) -> Result<(), ProcessAuthorityError> {
+        if self.devices.contains(&name) {
+            return Ok(());
+        }
+        self.devices
+            .try_push(name)
+            .map_err(|_| ProcessAuthorityError::TooManyDeviceGrants)
     }
 
     pub fn grant_network_rights(&mut self, rights: NetworkAuthorityRights) {
@@ -691,6 +785,21 @@ impl ProcessAuthority {
         Ok(rights)
     }
 
+    pub fn derive_device_class_rights(
+        &self,
+        rights: DeviceClassRights,
+    ) -> Result<DeviceClassRights, ProcessAuthorityError> {
+        if rights.is_empty() {
+            return Err(ProcessAuthorityError::EmptyDeviceClassRights);
+        }
+        if !self.device_classes.contains(rights) {
+            return Err(ProcessAuthorityError::DeviceClassGrantExceedsAuthority(
+                rights,
+            ));
+        }
+        Ok(rights)
+    }
+
     /// Authority to attach a filesystem at `point`: the mount right, and
     /// mutate-directory authority over the point, since a mount replaces
     /// what the directory shows.
@@ -716,6 +825,39 @@ impl ProcessAuthority {
             return Err(ProcessAuthorityError::MountPointOutsideAuthority(point));
         }
         Ok(point)
+    }
+
+    pub fn derive_display_claim_cap(&self) -> Result<DisplayClaimCap, ProcessAuthorityError> {
+        self.derive_device_class_rights(DisplayClaimCap::required_rights())
+            .map(DisplayClaimCap)
+    }
+
+    pub fn derive_input_claim_cap(&self) -> Result<InputClaimCap, ProcessAuthorityError> {
+        self.derive_device_class_rights(InputClaimCap::required_rights())
+            .map(InputClaimCap)
+    }
+
+    pub fn derive_gpu_claim_cap(&self) -> Result<GpuClaimCap, ProcessAuthorityError> {
+        self.derive_device_class_rights(GpuClaimCap::required_rights())
+            .map(GpuClaimCap)
+    }
+
+    pub fn derive_audio_claim_cap(&self) -> Result<AudioClaimCap, ProcessAuthorityError> {
+        self.derive_device_class_rights(AudioClaimCap::required_rights())
+            .map(AudioClaimCap)
+    }
+
+    /// The device `name` is granted to this instance. A name the registry
+    /// could not store is as ungranted as one nobody published.
+    pub fn derive_device_grant_cap(
+        &self,
+        name: &str,
+    ) -> Result<DeviceGrantClaimCap, ProcessAuthorityError> {
+        let name = DeviceName::new(name).map_err(|_| ProcessAuthorityError::DeviceNameTooLong)?;
+        if !self.devices.contains(&name) {
+            return Err(ProcessAuthorityError::DeviceGrantExceedsAuthority(name));
+        }
+        Ok(DeviceGrantClaimCap(name))
     }
 
     pub fn can_load_program(&self, path: &str) -> bool {
@@ -749,6 +891,11 @@ impl ProcessAuthority {
             && self.process.contains(child.process)
             && self.link.contains(child.link)
             && self.mount.contains(child.mount)
+            && self.device_classes.contains(child.device_classes)
+            && child
+                .devices
+                .iter()
+                .all(|device| self.devices.contains(device))
     }
 
     fn has_directory_authority(&self, path: &str, rights: DirectoryAuthorityRights) -> bool {
@@ -757,6 +904,57 @@ impl ProcessAuthority {
         }) || self.cwd.as_ref().is_some_and(|cwd| {
             directory_contains(cwd.source_path(), path) && cwd.rights().contains(rights)
         })
+    }
+}
+
+/// Caps for tests that exercise a claim below the authority check, where
+/// the check itself is not the thing under test.
+#[cfg(test)]
+pub(crate) mod test_caps {
+    use super::{
+        AudioClaimCap, DeviceClassRights, DeviceGrantClaimCap, DisplayClaimCap, GpuClaimCap,
+        InputClaimCap, ProcessAuthority,
+    };
+    use crate::device::DeviceName;
+
+    fn holding(classes: DeviceClassRights) -> ProcessAuthority {
+        let mut authority = ProcessAuthority::empty();
+        authority.grant_device_classes(classes);
+        authority
+    }
+
+    pub(crate) fn display() -> DisplayClaimCap {
+        holding(DeviceClassRights::DISPLAY)
+            .derive_display_claim_cap()
+            .expect("the authority holds the display class")
+    }
+
+    pub(crate) fn input() -> InputClaimCap {
+        holding(DeviceClassRights::INPUT)
+            .derive_input_claim_cap()
+            .expect("the authority holds the input class")
+    }
+
+    pub(crate) fn gpu() -> GpuClaimCap {
+        holding(DeviceClassRights::GPU)
+            .derive_gpu_claim_cap()
+            .expect("the authority holds the GPU class")
+    }
+
+    pub(crate) fn audio() -> AudioClaimCap {
+        holding(DeviceClassRights::AUDIO)
+            .derive_audio_claim_cap()
+            .expect("the authority holds the audio class")
+    }
+
+    pub(crate) fn device(name: &str) -> DeviceGrantClaimCap {
+        let mut authority = ProcessAuthority::empty();
+        authority
+            .grant_device(DeviceName::new(name).expect("the test names are short"))
+            .expect("one named device fits");
+        authority
+            .derive_device_grant_cap(name)
+            .expect("the authority names the device")
     }
 }
 
@@ -776,10 +974,15 @@ fn directory_contains(directory: &str, path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClockAuthorityRights, DirectoryAuthorityRights, LinkAuthorityRights, MountAuthorityRights,
-        NetworkAuthorityRights, ProcessAuthority, ProcessAuthorityError, ProcessAuthorityRights,
-        TerminalAuthorityRights,
+        ClockAuthorityRights, DeviceClassRights, DirectoryAuthorityRights, LinkAuthorityRights,
+        MountAuthorityRights, NetworkAuthorityRights, ProcessAuthority, ProcessAuthorityError,
+        ProcessAuthorityRights, TerminalAuthorityRights,
     };
+    use crate::device::{DeviceName, MAX_GRANTS};
+
+    fn device_name(text: &str) -> DeviceName {
+        DeviceName::new(text).expect("the test names are short")
+    }
 
     #[test]
     fn child_grant_must_be_subset_of_caller_authority() {
@@ -1165,7 +1368,16 @@ mod tests {
         child.grant_terminal_rights(TerminalAuthorityRights::OUTPUT);
         child.grant_process_rights(ProcessAuthorityRights::SPAWN);
         child.grant_link_rights(LinkAuthorityRights::SOURCE);
+        child.grant_device_classes(DeviceClassRights::DISPLAY);
+        child
+            .grant_device(device_name("pci:0000:00:04.0"))
+            .expect("one named device fits");
 
+        let mut parent = parent;
+        parent.grant_device_classes(DeviceClassRights::all());
+        parent
+            .grant_device(device_name("pci:0000:00:04.0"))
+            .expect("one named device fits");
         assert!(parent.contains_authority(&child));
 
         let mut overgrant = child.clone();
@@ -1175,5 +1387,112 @@ mod tests {
         let mut narrow_parent = ProcessAuthority::empty();
         narrow_parent.grant_link_rights(LinkAuthorityRights::SOURCE);
         assert!(!narrow_parent.contains_authority(&child));
+
+        let mut class_only_parent = ProcessAuthority::root();
+        class_only_parent.grant_device_classes(DeviceClassRights::DISPLAY);
+        assert!(!class_only_parent.contains_authority(&child));
+
+        let mut device_only_parent = ProcessAuthority::root();
+        device_only_parent
+            .grant_device(device_name("pci:0000:00:04.0"))
+            .expect("one named device fits");
+        assert!(!device_only_parent.contains_authority(&child));
+    }
+
+    #[test]
+    fn device_class_grant_must_be_subset_of_caller_authority() {
+        let mut parent = ProcessAuthority::empty();
+        parent.grant_device_classes(DeviceClassRights::DISPLAY | DeviceClassRights::INPUT);
+
+        assert_eq!(
+            parent
+                .derive_device_class_rights(DeviceClassRights::INPUT)
+                .expect("caller may derive a subset of device classes"),
+            DeviceClassRights::INPUT
+        );
+        assert_eq!(
+            parent
+                .derive_device_class_rights(DeviceClassRights::empty())
+                .expect_err("an empty class grant is a mistake"),
+            ProcessAuthorityError::EmptyDeviceClassRights
+        );
+        assert_eq!(
+            parent
+                .derive_device_class_rights(DeviceClassRights::DISPLAY | DeviceClassRights::GPU)
+                .expect_err("GPU must not be created from display and input authority"),
+            ProcessAuthorityError::DeviceClassGrantExceedsAuthority(
+                DeviceClassRights::DISPLAY | DeviceClassRights::GPU
+            )
+        );
+
+        assert!(parent.derive_display_claim_cap().is_ok());
+        assert!(parent.derive_input_claim_cap().is_ok());
+        assert!(matches!(
+            parent.derive_gpu_claim_cap(),
+            Err(ProcessAuthorityError::DeviceClassGrantExceedsAuthority(_))
+        ));
+        assert!(matches!(
+            parent.derive_audio_claim_cap(),
+            Err(ProcessAuthorityError::DeviceClassGrantExceedsAuthority(_))
+        ));
+    }
+
+    #[test]
+    fn named_device_cap_derives_only_for_a_granted_name() {
+        let granted = device_name("pci:0000:00:04.0");
+        let mut authority = ProcessAuthority::empty();
+        authority
+            .grant_device(granted)
+            .expect("one named device fits");
+        authority
+            .grant_device(granted)
+            .expect("granting a name twice is the same grant");
+        assert_eq!(authority.granted_devices(), &[granted]);
+
+        let cap = authority
+            .derive_device_grant_cap("pci:0000:00:04.0")
+            .expect("the granted name derives a cap");
+        assert_eq!(cap.name(), &granted);
+
+        assert_eq!(
+            authority
+                .derive_device_grant_cap("pci:0000:00:05.0")
+                .expect_err("an ungranted name must not derive a cap"),
+            ProcessAuthorityError::DeviceGrantExceedsAuthority(device_name("pci:0000:00:05.0"))
+        );
+        let too_long = "x".repeat(crate::device::MAX_DEVICE_NAME + 1);
+        assert_eq!(
+            authority
+                .derive_device_grant_cap(&too_long)
+                .expect_err("a name the registry cannot store is not granted"),
+            ProcessAuthorityError::DeviceNameTooLong
+        );
+    }
+
+    #[test]
+    fn named_device_grants_are_bounded_by_the_registry() {
+        let mut authority = ProcessAuthority::empty();
+        for index in 0..MAX_GRANTS {
+            authority
+                .grant_device(device_name(&alloc::format!("dev{index}")))
+                .expect("the registry's capacity fits");
+        }
+        assert_eq!(
+            authority
+                .grant_device(device_name("one-too-many"))
+                .expect_err("a ninth named device has no registry slot"),
+            ProcessAuthorityError::TooManyDeviceGrants
+        );
+    }
+
+    #[test]
+    fn root_authority_holds_no_device_rights() {
+        let root = ProcessAuthority::root();
+        assert_eq!(root.device_class_rights(), DeviceClassRights::empty());
+        assert!(root.granted_devices().is_empty());
+        assert!(root.derive_display_claim_cap().is_err());
+        assert!(root.derive_input_claim_cap().is_err());
+        assert!(root.derive_gpu_claim_cap().is_err());
+        assert!(root.derive_audio_claim_cap().is_err());
     }
 }

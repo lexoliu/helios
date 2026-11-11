@@ -3330,9 +3330,14 @@ mod tests {
     use alloc::string::String;
 
     use futures_lite::future::block_on;
+    use wasmtime::component::Resource;
+    use wasmtime_wasi_io::bytes::Bytes;
     use wasmtime_wasi_io::poll::Pollable;
-    use wasmtime_wasi_io::streams::{InputStream, StreamError};
+    use wasmtime_wasi_io::streams::{DynOutputStream, InputStream, StreamError};
 
+    use crate::wasmtime_adapter::component_host::service::test_store;
+
+    use super::filesystem_bindings::filesystem::types::HostDescriptor;
     use super::{
         EmptyInputStream, PREVIEW2_WIT_PACKAGES, WasiTcpSocketFamily, WasiUdpSocketError,
         WasiUdpSocketFamily, format_p2_tcp_socket_address, format_p2_udp_family,
@@ -3340,6 +3345,7 @@ mod tests {
         map_p2_tcp_socket_error, p2net, p2tcp, p2tcp_create, p2udp, parse_p2_tcp_socket_address,
         parse_p2_udp_socket_address,
     };
+    use super::{FsDescriptor, FsNodeKind, p3fs};
 
     #[test]
     fn p2_empty_stdin_signals_eof_instead_of_starving_blocking_read() {
@@ -3358,6 +3364,81 @@ mod tests {
                 Err(error) => panic!("empty stdin read failed unexpectedly: {error:?}"),
             }
         }
+    }
+
+    /// What `write-via-stream` and `append-via-stream` write lands in the
+    /// filesystem of the store that opened the descriptor, where the
+    /// next open, read or exec of the path finds it (#487).
+    #[test]
+    fn p2_file_output_stream_writes_into_the_opening_store_filesystem() {
+        let mut store = test_store::store_data_with(|_| {});
+        let root = FsDescriptor {
+            path: String::from("/"),
+            kind: FsNodeKind::Directory,
+            flags: p3fs::DescriptorFlags::READ
+                | p3fs::DescriptorFlags::WRITE
+                | p3fs::DescriptorFlags::MUTATE_DIRECTORY,
+            identity: None,
+        };
+        let descriptor = block_on(crate::wasmtime_adapter::wasi::open_at(
+            store.filesystem(),
+            &root,
+            p3fs::PathFlags::empty(),
+            "copy",
+            p3fs::OpenFlags::CREATE | p3fs::OpenFlags::TRUNCATE,
+            p3fs::DescriptorFlags::READ | p3fs::DescriptorFlags::WRITE,
+            1,
+        ))
+        .expect("creating a file at the root must succeed");
+        let write = |store: &mut test_store::TestStoreData,
+                     stream: Resource<DynOutputStream>,
+                     bytes: &'static [u8]| {
+            let stream = store
+                .table
+                .get_mut::<DynOutputStream>(&stream)
+                .expect("the stream resource must be live");
+            assert!(
+                stream
+                    .check_write()
+                    .expect("a stream on a writable file must grant a permit")
+                    >= bytes.len()
+            );
+            stream
+                .write(Bytes::from_static(bytes))
+                .expect("writing a file the store holds must succeed");
+            stream
+                .flush()
+                .expect("flushing an embedded file must succeed");
+            // The parked batch reaches the filesystem when the stream is
+            // next ready, as a guest's `blocking-flush` waits for it.
+            block_on(stream.ready());
+        };
+
+        let resource = store
+            .table
+            .push(descriptor.clone())
+            .expect("the descriptor must fit in the table");
+        let stream = HostDescriptor::write_via_stream(&mut store, resource, 0)
+            .expect("write-via-stream must not trap")
+            .expect("write-via-stream must open on a writable file");
+        write(&mut store, stream, b"helios ");
+        let resource = store
+            .table
+            .push(descriptor.clone())
+            .expect("the descriptor must fit in the table");
+        let stream = HostDescriptor::append_via_stream(&mut store, resource)
+            .expect("append-via-stream must not trap")
+            .expect("append-via-stream must open on a writable file");
+        write(&mut store, stream, "日本語 한국어".as_bytes());
+
+        let written = block_on(crate::wasmtime_adapter::wasi::read(
+            store.filesystem(),
+            &descriptor,
+            0,
+            64,
+        ))
+        .expect("the written file must be readable");
+        assert_eq!(written.as_ref(), "helios 日本語 한국어".as_bytes());
     }
 
     #[test]

@@ -19,10 +19,22 @@ use helios_hal::fs::{
     NodeKind, OpenFlags,
 };
 
-use crate::{HostFileSystem, HostFsError, HostFsErrorKind, HostMetadata};
+use crate::{HostDirLimit, HostFileSystem, HostFsError, HostFsErrorKind, HostMetadata};
 
 /// 9p `QTDIR`: the qid type bit that marks a directory.
 const P9_QID_TYPE_DIRECTORY: u8 = 0x80;
+
+/// The most of one host directory a listing holds in kernel memory.
+///
+/// The share lists a whole directory per request and pages the guest's
+/// cookie over it, so the guest's buffer bounds nothing. This is a policy
+/// bound, not one derived from a stated budget: it keeps a host that never
+/// ends a listing from growing kernel memory without limit, while a real
+/// directory of tens of thousands of names still lists.
+const HOST_DIRECTORY_LIMIT: HostDirLimit = HostDirLimit {
+    max_entries: 65_536,
+    max_name_bytes: 4 * 1024 * 1024,
+};
 
 /// The host share, mounted.
 #[derive(Clone)]
@@ -186,7 +198,7 @@ impl<H: HostFileSystem> FileSystem for HostShare<H> {
         let skip = usize::try_from(cookie.raw()).map_err(|_| FsError::Invalid)?;
         let entries = self
             .client
-            .read_dir(host_path(path))
+            .read_dir(host_path(path), HOST_DIRECTORY_LIMIT)
             .await
             .map_err(fs_error_from_host)?;
         Ok(entries

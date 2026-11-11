@@ -9,7 +9,8 @@
 
 use helios_hal::vmm::{AddressSpace, Translation, VirtAddr, VirtRange};
 use helios_kernel::{
-    DEVICE_WINDOW_BYTES, DeviceGrantRegistry, DeviceWindow, GrantError, GrantInterrupt, GrantLease,
+    DEVICE_WINDOW_BYTES, DeviceGrantClaimCap, DeviceGrantRegistry, DeviceName, DeviceWindow,
+    GrantError, GrantInterrupt, GrantLease, ProcessAuthority, ProcessAuthorityError,
 };
 
 use crate::device::{
@@ -60,6 +61,45 @@ fn registry() -> DeviceGrantRegistry {
     registry
 }
 
+/// The cap an owner the kernel granted the hosted device to holds.
+fn device_cap() -> DeviceGrantClaimCap {
+    let mut authority = ProcessAuthority::empty();
+    authority
+        .grant_device(DeviceName::new(HOSTED_DEVICE_NAME).expect("the hosted name fits"))
+        .expect("one named device fits");
+    authority
+        .derive_device_grant_cap(HOSTED_DEVICE_NAME)
+        .expect("the authority names the hosted device")
+}
+
+/// An instance the kernel did not grant the device to has no way to ask
+/// for it, and what it is told about the real device is what it is told
+/// about one the machine never published.
+#[test]
+fn a_claim_without_the_device_cap_is_answered_as_missing() {
+    let registry = registry();
+    assert!(
+        registry.device(HOSTED_DEVICE_NAME).is_some(),
+        "the machine publishes the device"
+    );
+
+    let ordinary = ProcessAuthority::empty();
+    let published = ordinary
+        .derive_device_grant_cap(HOSTED_DEVICE_NAME)
+        .expect_err("an ordinary instance holds no cap for a published device");
+    let unpublished = ordinary
+        .derive_device_grant_cap("hosted:not-a-device")
+        .expect_err("an ordinary instance holds no cap for any device");
+
+    assert!(matches!(
+        (published, unpublished),
+        (
+            ProcessAuthorityError::DeviceGrantExceedsAuthority(_),
+            ProcessAuthorityError::DeviceGrantExceedsAuthority(_)
+        )
+    ));
+}
+
 /// The bytes an owner sees at `offset`, through its own mapping.
 fn owner_read(memory: &OwnerMemory, offset: u64, len: usize) -> Vec<u8> {
     // SAFETY: the caller has mapped `offset` and the range is inside the
@@ -87,7 +127,7 @@ fn a_mapped_region_is_the_device_itself_and_not_a_copy() {
     let registry = registry();
     let memory = OwnerMemory::new();
     let mut lease = registry
-        .claim(HOSTED_DEVICE_NAME, memory.window())
+        .claim(device_cap(), memory.window())
         .expect("the device is free");
 
     let placement = lease.map_region(0).expect("the register file maps");
@@ -107,7 +147,7 @@ fn reclaim_takes_the_owner_s_path_to_the_device_away() {
     let registry = registry();
     let memory = OwnerMemory::new();
     let mut lease = registry
-        .claim(HOSTED_DEVICE_NAME, memory.window())
+        .claim(device_cap(), memory.window())
         .expect("the device is free");
     let placement = lease.map_region(0).expect("the register file maps");
     let mapped = VirtAddr::new(memory.address(placement.offset));
@@ -136,19 +176,17 @@ fn the_device_goes_to_one_owner_at_a_time() {
     let first_memory = OwnerMemory::new();
     let second_memory = OwnerMemory::new();
     let first = registry
-        .claim(HOSTED_DEVICE_NAME, first_memory.window())
+        .claim(device_cap(), first_memory.window())
         .expect("the first owner gets the device");
 
     assert_eq!(
-        registry
-            .claim(HOSTED_DEVICE_NAME, second_memory.window())
-            .err(),
+        registry.claim(device_cap(), second_memory.window()).err(),
         Some(GrantError::AlreadyClaimed)
     );
 
     drop(first);
     let second = registry
-        .claim(HOSTED_DEVICE_NAME, second_memory.window())
+        .claim(device_cap(), second_memory.window())
         .expect("the device comes back when its owner lets go");
     drop(second);
 }
@@ -161,7 +199,7 @@ fn a_pinned_buffer_is_addressable_from_both_ends_and_released_on_death() {
     let registry = registry();
     let memory = OwnerMemory::new();
     let mut lease = registry
-        .claim(HOSTED_DEVICE_NAME, memory.window())
+        .claim(device_cap(), memory.window())
         .expect("the device is free");
 
     let buffer = lease
@@ -200,7 +238,7 @@ fn a_driver_cannot_pin_more_than_the_kernel_budgeted() {
     let registry = registry();
     let memory = OwnerMemory::new();
     let mut lease = registry
-        .claim(HOSTED_DEVICE_NAME, memory.window())
+        .claim(device_cap(), memory.window())
         .expect("the device is free");
     let budget = lease.grant().dma().byte_budget;
 
@@ -224,7 +262,7 @@ fn an_interrupt_reaches_an_owner_that_is_already_parked() {
     let registry = registry();
     let memory = OwnerMemory::new();
     let lease: GrantLease = registry
-        .claim(HOSTED_DEVICE_NAME, memory.window())
+        .claim(device_cap(), memory.window())
         .expect("the device is free");
     let (masked_before, unmasked_before) = interrupt_controller_counts();
 

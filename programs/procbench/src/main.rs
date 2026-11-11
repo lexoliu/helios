@@ -15,6 +15,12 @@
 //! - `stream <total> <child> [args..]` pushes `total` bytes through the child
 //!   and drains them from its stdout concurrently.
 //!
+//! - `swap-cycle [--mib <n>] [--seed <n>] [--corrupt-page <index>] <procbench>`
+//!   has a child of this same program (the `swap-child` role, started by the
+//!   command itself) fill a patterned region and idle, evicts it by holding
+//!   the machine under a busy allocation, and requires every byte back and
+//!   the swap-in counter to cover them (`swap_cycle.rs`).
+//!
 //! `tools/bench/native/procbench.c` is the Linux counterpart with the same
 //! subcommands and the same output lines.
 
@@ -29,13 +35,15 @@ use helios_api::{stats, task};
 use helios_bench_metrics::{LatencySamples, mib_per_second, report_metric};
 use thiserror::Error;
 
+mod swap_cycle;
+
 const STREAM_CHUNK_BYTES: usize = 64 * 1024;
 const READ_CHUNK_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Error)]
 enum ProcbenchError {
     #[error(
-        "usage: procbench startup <n> <child> [args..] | spawn-wait <n> <child> [args..] | pingpong <rounds> <bytes> <child> [args..] | stream <total-bytes> <child> [args..]"
+        "usage: procbench startup <n> <child> [args..] | spawn-wait <n> <child> [args..] | pingpong <rounds> <bytes> <child> [args..] | stream <total-bytes> <child> [args..] | swap-cycle [--mib <n>] [--seed <n>] [--corrupt-page <index>] <procbench>"
     )]
     Usage,
     #[error("unknown subcommand `{0}`")]
@@ -76,6 +84,52 @@ enum ProcbenchError {
     ShortStream { echoed: u64, expected: u64 },
     #[error("a worker task ended without reporting its result")]
     WorkerLost,
+    #[error("the machine reports no swap: `Sample.swap` is absent")]
+    SwapUnavailable,
+    #[error("--corrupt-page {page} is outside the child's {pages} pages")]
+    CorruptPageOutOfRange { page: u64, pages: u64 },
+    #[error("allocating {bytes} bytes failed")]
+    HogAllocation { bytes: usize },
+    #[error(
+        "available memory fell to {available_bytes} of {total_bytes} bytes before swap moved a page (pages_out {pages_out}, baseline {baseline_pages_out})"
+    )]
+    MemoryFloor {
+        available_bytes: u64,
+        total_bytes: u64,
+        pages_out: u64,
+        baseline_pages_out: u64,
+    },
+    #[error(
+        "swap moved {} of the child's {child_pages} pages out in {waited:?} (pages_out {pages_out}, baseline {baseline_pages_out}, hog {hog_bytes} bytes)",
+        pages_out.saturating_sub(*baseline_pages_out)
+    )]
+    SwapOutDeadline {
+        waited: std::time::Duration,
+        pages_out: u64,
+        baseline_pages_out: u64,
+        child_pages: u64,
+        hog_bytes: usize,
+    },
+    #[error("swap read {pages_in} pages back in, fewer than the child's {child_pages}")]
+    SwapInShort { pages_in: u64, child_pages: u64 },
+    #[error("the child was expected to report `{expected}` but its output was `{output}`")]
+    ChildReport { expected: String, output: String },
+    #[error(
+        "page {page} differs at offset {offset}: expected {expected:#04x}, found {actual:#04x}"
+    )]
+    PageMismatch {
+        page: u64,
+        offset: usize,
+        expected: u8,
+        actual: u8,
+    },
+    #[error("the child's standard I/O failed: {source}")]
+    ChildIo {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("the parent closed the child's stdin without waking it")]
+    NeverWoken,
 }
 
 #[derive(Clone)]
@@ -144,6 +198,12 @@ async fn main() -> Result<(), ProcbenchError> {
             let total = parse_number(args.next())?;
             stream(total, ChildSpec::parse(args)?).await
         }
+        "swap-cycle" => {
+            let mut args = args.peekable();
+            let options = swap_cycle::Options::parse(&mut args)?;
+            swap_cycle::swap_cycle(options, ChildSpec::parse(args)?).await
+        }
+        "swap-child" => swap_cycle::swap_child(args).await,
         other => Err(ProcbenchError::UnknownCommand(other.to_owned())),
     }
 }

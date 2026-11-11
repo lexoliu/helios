@@ -25,7 +25,7 @@ use helios_hal::fs::{
     DirCookie, DirEntry, FileSystem, FsError, FsPath, FsResult, Metadata, NodeKind, OpenFlags,
 };
 
-use super::MemoryFs;
+use super::{FileContents, MemoryFs, read_all};
 use crate::BootFs;
 
 /// A namespace's root: its own writable tree over the shared boot image.
@@ -58,10 +58,14 @@ impl RootFs {
         &self.lower
     }
 
-    /// Whether the boot image, rather than this tree's own layer, serves
-    /// `path`.
-    pub async fn served_by_boot_image(&self, path: FsPath<'_>) -> FsResult<bool> {
-        Ok(self.layer(path).await? == Layer::Lower)
+    /// The whole of the file at `path`, typed by the layer that served it:
+    /// the boot image's own bytes, or this tree's.
+    pub async fn read_whole(&self, path: FsPath<'_>) -> FsResult<FileContents> {
+        match self.upper.stat(path).await {
+            Ok(_) => read_all(&self.upper, path).await.map(FileContents::Written),
+            Err(FsError::NoEntry) => self.lower.file_contents(path).map(FileContents::Boot),
+            Err(error) => Err(error),
+        }
     }
 
     /// Which layer serves `path`.

@@ -12,8 +12,8 @@ mod types;
 pub use state::RuntimeState;
 pub use types::{
     AuthorityDomain, ComponentHostNetwork, ComponentNetworkService, ComponentNetworkState,
-    DnsError, DnsErrorKind, ExecOutput, ExecResult, HostDirEntry, HostFileSystem, HostFsError,
-    HostFsErrorKind, HostMetadata, Ipv4Address, NetworkErrorDetail, NetworkHandle,
+    DnsError, DnsErrorKind, ExecOutput, ExecResult, HostDirEntry, HostDirLimit, HostFileSystem,
+    HostFsError, HostFsErrorKind, HostMetadata, Ipv4Address, NetworkErrorDetail, NetworkHandle,
     NetworkIpAddress, NetworkPacketPump, ObjectIdentity, PingError, PingErrorKind, PingReply,
     RegisteredTcpReadBuffer, SocketReadiness, TcpAccepted, TcpError, TcpErrorKind, TcpListener,
     TcpReadProgress, TcpWriteProgress, UdpBinding, UdpDatagram, UdpError, UdpErrorKind,

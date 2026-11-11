@@ -11,7 +11,7 @@
 use helios_hal::fs::{FileSystem, FsError as VfsError, Metadata, NodeKind, OpenFlags};
 use pin_project_lite::pin_project;
 
-use crate::{ComponentHostNetwork, Namespace, Resolved, object_identity};
+use crate::{ComponentHostNetwork, FileContents, Namespace, Resolved, object_identity};
 
 use super::*;
 
@@ -650,20 +650,13 @@ where
     .map_err(fs_error_code)
 }
 
-/// A program file's bytes and where they came from.
-pub(crate) struct ProgramFile {
-    pub(crate) bytes: Bytes,
-    /// The boot image served them: the kernel's own payload.
-    pub(crate) from_boot_image: bool,
-    /// The host share served them.
-    pub(crate) from_host_share: bool,
-}
-
-/// Reads the whole of the program file `absolute` names.
+/// Reads the whole of the program file `absolute` names, typed by the
+/// layer that produced its bytes: only the boot image's own bytes may
+/// skip signature verification (#483).
 pub(crate) async fn read_program_file<HostFs>(
     namespace: &Namespace<HostFs>,
     absolute: &str,
-) -> FsOpResult<ProgramFile>
+) -> FsOpResult<FileContents>
 where
     HostFs: crate::HostFileSystem,
 {
@@ -671,47 +664,7 @@ where
         .resolve_following(absolute, true)
         .await
         .map_err(fs_error_code)?;
-    let fs = resolved.fs();
-    let metadata = fs.stat(resolved.path()).await.map_err(fs_error_code)?;
-    if metadata.kind != NodeKind::File {
-        return Err(fs_types::ErrorCode::IsDirectory);
-    }
-    let size = usize::try_from(metadata.size).map_err(|_| fs_types::ErrorCode::Overflow)?;
-    let first = fs
-        .read_at(resolved.path(), 0, size)
-        .await
-        .map_err(fs_error_code)?;
-    let bytes = if first.len() == size {
-        first
-    } else {
-        // A filesystem may answer in pieces (9p bounds one read by its
-        // message size): gather the rest.
-        let mut gathered = BytesMut::with_capacity(size);
-        gathered.extend_from_slice(&first);
-        loop {
-            let chunk = fs
-                .read_at(
-                    resolved.path(),
-                    gathered.len() as u64,
-                    size - gathered.len(),
-                )
-                .await
-                .map_err(fs_error_code)?;
-            if chunk.is_empty() {
-                break;
-            }
-            gathered.extend_from_slice(&chunk);
-        }
-        gathered.freeze()
-    };
-    Ok(ProgramFile {
-        bytes,
-        from_boot_image: resolved
-            .served_by_boot_image()
-            .await
-            .map_err(fs_error_code)?,
-        from_host_share: resolved.is_host_share(),
-    })
+    resolved.read_whole().await.map_err(fs_error_code)
 }
 
 /// Creates or replaces the file `absolute` names with `bytes`.

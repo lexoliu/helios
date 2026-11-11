@@ -89,7 +89,7 @@ pub(super) fn install_http_client_plugin<CpuImpl, Net, HostFs>(
 async fn run_http_plugin_supervisor<CpuImpl, Net, HostFs>(
     service: UserProgramService<CpuImpl, Net, HostFs>,
     exec_context: ProgramExecContext<CpuImpl, Net, HostFs>,
-    artifact: Bytes,
+    artifact: BootfsBytes,
     receiver: ProviderReceiver<HttpExchange>,
 ) where
     CpuImpl: Cpu + Clone,
@@ -128,7 +128,7 @@ async fn run_http_plugin_supervisor<CpuImpl, Net, HostFs>(
 async fn run_http_plugin_once<CpuImpl, Net, HostFs>(
     service: &UserProgramService<CpuImpl, Net, HostFs>,
     exec_context: &ProgramExecContext<CpuImpl, Net, HostFs>,
-    artifact: &Bytes,
+    artifact: &BootfsBytes,
     first: HttpExchange,
     receiver: &ProviderReceiver<HttpExchange>,
 ) -> Result<(), ProgramExecError>
