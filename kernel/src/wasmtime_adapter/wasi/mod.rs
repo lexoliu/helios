@@ -32,7 +32,7 @@ use core::task::{Context, Poll};
 
 use crate::{
     AuthorityDomain, ComponentOutputMode, ComponentOutputRoute, ComponentOutputStreamKind,
-    EmbeddedBootFs, HostFsErrorKind, ObjectIdentity,
+    HostFsErrorKind, ObjectIdentity,
 };
 use bytes::{Bytes, BytesMut};
 use futures::channel::oneshot;
@@ -258,8 +258,8 @@ mod tests {
     use alloc::vec;
 
     use crate::{
-        AuthorityDomain, ComponentHostFilesystemState, EmbeddedBootDirectory, EmbeddedBootFile,
-        EmbeddedBootFs, ObjectIdentity, UnsupportedHostFileSystem,
+        AuthorityDomain, BootfsTree, ComponentHostFilesystemState, EmbeddedBootDirectory,
+        EmbeddedBootFile, EmbeddedBootFs, FileContents, ObjectIdentity, UnsupportedHostFileSystem,
     };
     use bytes::Bytes;
     use futures_lite::future::block_on;
@@ -270,7 +270,7 @@ mod tests {
     use super::{
         DEFAULT_WASI_TCP_HOP_LIMIT, DEFAULT_WASI_TCP_KEEP_ALIVE_COUNT,
         DEFAULT_WASI_TCP_KEEP_ALIVE_IDLE_NANOS, DEFAULT_WASI_TCP_KEEP_ALIVE_INTERVAL_NANOS,
-        DEFAULT_WASI_TCP_LISTEN_BACKLOG, DebugFileSystem, FileContents, FsDescriptor, FsNodeKind,
+        DEFAULT_WASI_TCP_LISTEN_BACKLOG, DebugFileSystem, FsDescriptor, FsNodeKind,
         P2ResolveAddressStream, TcpSocket, UdpSocket, WasiTcpIpAddress, WasiTcpSocketAddress,
         WasiTcpSocketFamily, WasiUdpSocketAddress, WasiUdpSocketError, WasiUdpSocketFamily,
         format_p3_tcp_socket_address, format_p3_udp_socket_address, fs_types,
@@ -295,22 +295,33 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct TestRuntimeState;
+    struct TestRuntimeState {
+        bootfs: BootfsTree,
+    }
 
     impl ComponentHostFilesystemState<UnsupportedHostFileSystem> for TestRuntimeState {
         fn host_filesystem_service(&self) -> Option<UnsupportedHostFileSystem> {
             None
         }
 
-        fn bootfs(&self) -> Option<EmbeddedBootFs> {
-            None
+        fn bootfs_tree(&self) -> BootfsTree {
+            self.bootfs.clone()
         }
     }
 
     type TestFileSystem = DebugFileSystem<TestRuntimeState, UnsupportedHostFileSystem>;
 
     fn test_filesystem() -> TestFileSystem {
-        DebugFileSystem::new(TestRuntimeState)
+        filesystem_over(BootfsTree::new(EmbeddedBootFs::new(&[], &[])))
+    }
+
+    /// A fresh filesystem whose base is `bootfs`, as every spawn opens one.
+    fn filesystem_over(bootfs: BootfsTree) -> TestFileSystem {
+        DebugFileSystem::new(TestRuntimeState { bootfs })
+    }
+
+    fn filesystem_with_test_bootfs() -> TestFileSystem {
+        filesystem_over(BootfsTree::new(test_bootfs()))
     }
 
     fn test_bootfs() -> EmbeddedBootFs {
@@ -1006,8 +1017,7 @@ mod tests {
 
     #[test]
     fn bootfs_seed_adds_readonly_programs() {
-        let mut filesystem = test_filesystem();
-        filesystem.seed_bootfs(test_bootfs());
+        let filesystem = filesystem_with_test_bootfs();
 
         let program = filesystem
             .get_node("/bin/tool")
@@ -1032,8 +1042,7 @@ mod tests {
 
     #[test]
     fn readonly_bootfs_file_rejects_writes() {
-        let mut filesystem = test_filesystem();
-        filesystem.seed_bootfs(test_bootfs());
+        let mut filesystem = filesystem_with_test_bootfs();
         let root = filesystem.root_descriptor();
 
         let descriptor = filesystem
@@ -1064,14 +1073,17 @@ mod tests {
     /// A filesystem whose bootfs carries `foreign_signed_cwasm` at
     /// `/bin/prog`.
     fn filesystem_with_bootfs_cwasm() -> TestFileSystem {
-        let mut filesystem = test_filesystem();
+        filesystem_over(bootfs_cwasm_tree())
+    }
+
+    /// A bootfs tree carrying `foreign_signed_cwasm` at `/bin/prog`.
+    fn bootfs_cwasm_tree() -> BootfsTree {
         let files = Box::leak(Box::new([EmbeddedBootFile::new(
             "bin/prog",
             foreign_signed_cwasm(),
             42,
         )]));
-        filesystem.seed_bootfs(EmbeddedBootFs::new(&[], files));
-        filesystem
+        BootfsTree::new(EmbeddedBootFs::new(&[], files))
     }
 
     fn program_source(filesystem: &TestFileSystem, path: &str) -> ProgramSource {
@@ -1241,10 +1253,240 @@ mod tests {
         assert!(!bootfs_bytes(&resized));
     }
 
+    /// A write in one instance drops provenance there only: the shared
+    /// tree, and every other instance reading it, keep the payload's bytes.
+    #[test]
+    fn writing_a_bootfs_node_leaves_other_instances_their_provenance() {
+        let bootfs = bootfs_cwasm_tree();
+        let mut first = filesystem_over(bootfs.clone());
+        let second = filesystem_over(bootfs);
+        first
+            .snapshot
+            .inner
+            .lock()
+            .node_mut("/bin/prog")
+            .expect("bootfs node must exist")
+            .readonly = false;
+        assert!(
+            matches!(
+                first.read_program_file("/bin/prog"),
+                Ok(FileContents::Bootfs(_))
+            ),
+            "copying a node into its instance keeps the payload's bytes"
+        );
+
+        first
+            .write_program_file("/bin/prog", foreign_signed_cwasm(), 1)
+            .expect("replacing the node must succeed");
+
+        assert!(matches!(
+            first.read_program_file("/bin/prog"),
+            Ok(FileContents::Written(_))
+        ));
+        assert!(matches!(
+            program_source(&first, "/bin/prog"),
+            ProgramSource::SignedArtifact(_)
+        ));
+        assert!(matches!(
+            second.read_program_file("/bin/prog"),
+            Ok(FileContents::Bootfs(_))
+        ));
+        assert!(matches!(
+            program_source(&second, "/bin/prog"),
+            ProgramSource::BootfsArtifact(_)
+        ));
+    }
+
+    /// A spawn opens its filesystem over the tree bring-up built: it
+    /// shares the index and holds no storage for any bootfs entry.
+    #[test]
+    fn fresh_filesystems_share_the_bootfs_tree_and_own_nothing() {
+        let bootfs = BootfsTree::new(test_bootfs());
+        // The root, `/bin`, `/bin/empty` and `/bin/tool`.
+        assert_eq!(bootfs.nodes().len(), 4);
+        let first = filesystem_over(bootfs.clone());
+        let second = filesystem_over(bootfs.clone());
+
+        for filesystem in [&first, &second] {
+            let state = filesystem.snapshot.inner.lock();
+            assert!(state.base().ptr_eq(&bootfs));
+            assert_eq!(state.own_capacity(), 0);
+            drop(state);
+            assert_eq!(
+                filesystem
+                    .get_node("/bin/tool")
+                    .expect("bootfs program must be present")
+                    .contents
+                    .as_slice(),
+                b"tool"
+            );
+        }
+    }
+
+    /// Inode numbers are the ones seeding each instance used to hand out:
+    /// the root is 1, bootfs entries follow in payload order, and what an
+    /// instance creates is numbered after them.
+    #[test]
+    fn bootfs_and_created_nodes_keep_their_inode_numbers() {
+        let mut filesystem = filesystem_with_test_bootfs();
+        let root = filesystem.root_descriptor();
+        filesystem
+            .create_directory_at(&root, "tmp", 1)
+            .expect("creating /tmp must succeed");
+
+        let inode = |path: &str| {
+            filesystem
+                .identity_at_path(path)
+                .expect("the node must resolve")
+                .local()
+        };
+        assert_eq!(
+            ["/", "/bin", "/bin/empty", "/bin/tool", "/tmp"].map(inode),
+            [1, 2, 3, 4, 5]
+        );
+    }
+
+    /// What an instance creates, links, renames or removes over bootfs
+    /// entries behaves as it did when each instance held its own copy,
+    /// and no other instance sees it.
+    #[test]
+    fn changes_over_bootfs_entries_stay_in_their_instance() {
+        let bootfs = BootfsTree::new(test_bootfs());
+        let mut first = filesystem_over(bootfs.clone());
+        let second = filesystem_over(bootfs.clone());
+        let root = first.root_descriptor();
+        let tool = second
+            .get_node("/bin/tool")
+            .expect("bootfs program must be present");
+
+        // The read-only flag refuses these before anything is copied.
+        let descriptor = first
+            .open_at(
+                &root,
+                fs_types::PathFlags::empty(),
+                "bin/tool",
+                fs_types::OpenFlags::empty(),
+                fs_types::DescriptorFlags::READ | fs_types::DescriptorFlags::WRITE,
+                1,
+            )
+            .expect("opening a bootfs file must succeed for lookup");
+        assert!(matches!(
+            first.write_at(&descriptor, 0, b"x", 2),
+            Err(fs_types::ErrorCode::ReadOnly)
+        ));
+        assert!(matches!(
+            first.set_size(&descriptor, 0, 2),
+            Err(fs_types::ErrorCode::ReadOnly)
+        ));
+        assert!(matches!(
+            first.unlink_file_at(&root, "bin/tool"),
+            Err(fs_types::ErrorCode::ReadOnly)
+        ));
+        assert!(matches!(
+            first.remove_directory_at(&root, "bin/empty"),
+            Err(fs_types::ErrorCode::ReadOnly)
+        ));
+        assert!(matches!(
+            first.rename_at(&root, "bin/tool", &root, "moved", 2),
+            Err(fs_types::ErrorCode::ReadOnly)
+        ));
+        assert_eq!(first.snapshot.inner.lock().own_nodes(), 0);
+
+        // A file created inside a bootfs directory, and a second name for
+        // a bootfs file, which raises the link count on both names.
+        first
+            .open_at(
+                &root,
+                fs_types::PathFlags::empty(),
+                "bin/new",
+                fs_types::OpenFlags::CREATE,
+                fs_types::DescriptorFlags::READ | fs_types::DescriptorFlags::WRITE,
+                3,
+            )
+            .expect("creating a file in a bootfs directory must succeed");
+        first
+            .link_at(&root, "bin/tool", &root, "tool-link", 4)
+            .expect("linking a bootfs file must succeed");
+        let linked = first
+            .get_node("/tool-link")
+            .expect("the new name must resolve");
+        assert_eq!(linked.identity, tool.identity);
+        assert_eq!(linked.link_count, 2);
+        let original = first
+            .get_node("/bin/tool")
+            .expect("the bootfs name must still resolve");
+        assert_eq!((original.link_count, original.status_nanos), (2, 4));
+        // `/bin/new`, `/tool-link`, and this instance's copy of `/bin/tool`.
+        assert_eq!(first.snapshot.inner.lock().own_nodes(), 3);
+
+        // No guest can lift the read-only flag; lifting it here shows a
+        // bootfs entry renamed or removed is gone from this instance only.
+        for path in ["/bin/tool", "/bin/empty"] {
+            first
+                .snapshot
+                .inner
+                .lock()
+                .node_mut(path)
+                .expect("bootfs node must exist")
+                .readonly = false;
+        }
+        first
+            .rename_at(&root, "bin/tool", &root, "moved", 5)
+            .expect("renaming the node must succeed");
+        first
+            .remove_directory_at(&root, "bin/empty")
+            .expect("removing the empty directory must succeed");
+        assert!(matches!(
+            first.get_node("/bin/tool"),
+            Err(fs_types::ErrorCode::NoEntry)
+        ));
+        assert!(matches!(
+            first.get_node("/bin/empty"),
+            Err(fs_types::ErrorCode::NoEntry)
+        ));
+        let moved = first.get_node("/moved").expect("the new path must resolve");
+        assert_eq!(
+            (moved.identity, moved.link_count, moved.status_nanos),
+            (tool.identity, 2, 5)
+        );
+
+        let names = |filesystem: &TestFileSystem, path: &str| {
+            filesystem
+                .read_directory(path)
+                .expect("the directory must list")
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&first, "/bin"), ["new"]);
+        assert_eq!(names(&first, "/"), ["bin", "moved", "tool-link"]);
+
+        // A snapshot shares the instance's changes, as it did before.
+        let restored = TestFileSystem::from_snapshot(
+            TestRuntimeState {
+                bootfs: bootfs.clone(),
+            },
+            first.snapshot(),
+        );
+        assert_eq!(names(&restored, "/bin"), ["new"]);
+
+        // The other instance sees the tree exactly as the payload built it.
+        assert_eq!(names(&second, "/bin"), ["empty", "tool"]);
+        assert_eq!(names(&second, "/"), ["bin"]);
+        let untouched = second
+            .get_node("/bin/tool")
+            .expect("bootfs program must be present");
+        assert_eq!((untouched.link_count, untouched.readonly), (1, true));
+        assert_eq!(second.snapshot.inner.lock().own_nodes(), 0);
+        assert_eq!(
+            bootfs.nodes()[tool.identity.local() as usize - 1].link_count,
+            1
+        );
+    }
+
     #[test]
     fn open_at_rejects_descriptor_right_widening() {
-        let mut filesystem = test_filesystem();
-        filesystem.seed_bootfs(test_bootfs());
+        let mut filesystem = filesystem_with_test_bootfs();
         let root = readonly_root_descriptor();
 
         let error = match filesystem.open_at(
@@ -1357,8 +1599,7 @@ mod tests {
     /// object within one device.
     #[test]
     fn embedded_nodes_report_nonzero_distinct_inodes() {
-        let mut filesystem = test_filesystem();
-        filesystem.seed_bootfs(test_bootfs());
+        let filesystem = filesystem_with_test_bootfs();
 
         let root = filesystem
             .identity_at_path("/")
@@ -1376,8 +1617,7 @@ mod tests {
 
     #[test]
     fn descriptors_carry_stable_object_identity() {
-        let mut filesystem = test_filesystem();
-        filesystem.seed_bootfs(test_bootfs());
+        let mut filesystem = filesystem_with_test_bootfs();
         let root = filesystem.root_descriptor();
 
         let first = filesystem
@@ -1817,8 +2057,7 @@ mod tests {
 
     #[test]
     fn symlink_follow_is_confined_and_loop_limited() {
-        let mut filesystem = test_filesystem();
-        filesystem.seed_bootfs(test_bootfs());
+        let mut filesystem = filesystem_with_test_bootfs();
         let root = filesystem.root_descriptor();
         filesystem
             .symlink_at(&root, "tool-link", "bin/tool", 1)

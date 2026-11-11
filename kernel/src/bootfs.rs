@@ -23,7 +23,7 @@ use helios_hal::resource::KernelResource;
 ///
 /// It is the bare slice rather than a `Bytes`, so a filesystem node that
 /// holds either this or written `Bytes` is no larger than one holding
-/// `Bytes` alone: every instance seeds one node per bootfs entry.
+/// `Bytes` alone: every node an instance creates or changes is its own.
 #[derive(Clone, Copy, Debug)]
 pub struct BootfsBytes(&'static [u8]);
 

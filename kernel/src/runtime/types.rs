@@ -1226,7 +1226,9 @@ where
     Service: HostFileSystem,
 {
     fn host_filesystem_service(&self) -> Option<Service>;
-    fn bootfs(&self) -> Option<crate::EmbeddedBootFs>;
+    /// The boot payload's tree, shared read-only as the base of every
+    /// guest filesystem this state opens.
+    fn bootfs_tree(&self) -> crate::BootfsTree;
 }
 
 #[cfg(test)]

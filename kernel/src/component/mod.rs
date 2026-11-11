@@ -2,7 +2,8 @@
 //!
 //! Submodules carve up the component runtime concerns: `cache`
 //! holds compiled-component reuse logic, `fs` and `fs_path` model the
-//! component-visible filesystem and its path semantics, `resources`
+//! component-visible filesystem and its path semantics, `fs_tree` holds
+//! its node and the boot payload's tree every instance shares, `resources`
 //! lists kernel-side resource handles surfaced to wasm, `provider` holds
 //! the hand-off slots for interfaces served by kernel plugins, `runtime`
 //! and `runtime_backend` host the component lifecycle and per-call state,
@@ -14,6 +15,7 @@
 mod cache;
 mod fs;
 mod fs_path;
+mod fs_tree;
 mod provider;
 mod resources;
 mod retire;
@@ -31,6 +33,8 @@ pub use fs_path::{
     ComponentFsPathError, directory_prefix, parent_path, path_is_within_directory,
     resolve_absolute_path, resolve_child_path, resolve_guest_path, strip_directory_prefix,
 };
+pub use fs_tree::BootfsTree;
+pub(crate) use fs_tree::{FileContents, FsNode};
 pub use provider::{
     ProviderAlreadyInstalled, ProviderError, ProviderReceiver, ProviderSender, ProviderSlot,
     provider_channel,

@@ -6,7 +6,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use triomphe::Arc;
 
 use crate::{
-    BootPayload, DEFAULT_PERF_METRIC_CAPACITY, DEFAULT_PROFILE_STACK_CAPACITY,
+    BootPayload, BootfsTree, DEFAULT_PERF_METRIC_CAPACITY, DEFAULT_PROFILE_STACK_CAPACITY,
     DEFAULT_TRACE_HISTORY_CAPACITY, EmbeddedBootFs, EmbeddedComponent, FoldedProfileSample,
     FutexKey, FutexTable, FutexWaitRegistration, HEAP_SIZE_CLASS_COUNT, HeapStats,
     InstanceRegistry, InstructionSampler, Notify, PerfMetricFilter, PerfMetricHistory,
@@ -112,7 +112,9 @@ struct RuntimeStateInner<ProgramService, NetworkService, HostFsService> {
     /// `argv0`, and the boot filesystem it carries — parsed from the
     /// boot module at bring-up.
     payload: BootPayload,
-    bootfs: Mutex<Option<EmbeddedBootFs>>,
+    /// The payload's boot filesystem, indexed once here; every guest
+    /// filesystem reads it as its shared, read-only base.
+    bootfs_tree: BootfsTree,
     tracing: Mutex<TraceHistory>,
     /// The profile and perf histories, held as a handle rather than as
     /// fields so a subsystem this state owns can record into them
@@ -349,7 +351,7 @@ where
                 vsock_service: Once::new(),
                 futex_table: Mutex::new(FutexTable::new()),
                 payload,
-                bootfs: Mutex::new(Some(payload.bootfs())),
+                bootfs_tree: BootfsTree::new(payload.bootfs()),
                 tracing: Mutex::new(TraceHistory::new(DEFAULT_TRACE_HISTORY_CAPACITY)),
                 profiles: ProfileSink::new(
                     DEFAULT_PROFILE_STACK_CAPACITY,
@@ -1046,8 +1048,8 @@ where
         self.inner.futex_table.lock().wake_all(key)
     }
 
-    pub fn bootfs(&self) -> Option<EmbeddedBootFs> {
-        *self.inner.bootfs.lock()
+    pub fn bootfs(&self) -> EmbeddedBootFs {
+        self.inner.payload.bootfs()
     }
 
     /// The system component this payload carries, when this build would
@@ -1060,10 +1062,6 @@ where
     /// autostart.
     pub fn has_system_component(&self) -> bool {
         self.inner.payload.has_system_component()
-    }
-
-    pub fn retire_bootfs(&self) {
-        *self.inner.bootfs.lock() = None;
     }
 }
 
@@ -1224,8 +1222,8 @@ where
         self.host_fs_service()
     }
 
-    fn bootfs(&self) -> Option<EmbeddedBootFs> {
-        RuntimeState::bootfs(self)
+    fn bootfs_tree(&self) -> BootfsTree {
+        self.inner.bootfs_tree.clone()
     }
 }
 

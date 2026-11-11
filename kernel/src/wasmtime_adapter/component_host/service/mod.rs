@@ -56,11 +56,11 @@ use crate::wasmtime_adapter::{WasmtimeCompiledComponent, WasmtimeCompiledCoreMod
 use crate::wasmtime_adapter::{
     WasmtimePrecompiledKind,
     wasi::{
-        DebugFileSystem, DebugFileSystemSnapshot, FileContents, FsDescriptor, FsNodeKind,
-        WasiImportSet, bindings::filesystem::types as fs_types, preview1 as p1,
+        DebugFileSystem, DebugFileSystemSnapshot, FsDescriptor, FsNodeKind, WasiImportSet,
+        bindings::filesystem::types as fs_types, preview1 as p1,
     },
 };
-use crate::{BootfsBytes, ProgramExecErrorDetail, RuntimeMessage};
+use crate::{BootfsBytes, FileContents, ProgramExecErrorDetail, RuntimeMessage};
 use alloc::borrow::ToOwned;
 use alloc::boxed::Box;
 use alloc::string::String;

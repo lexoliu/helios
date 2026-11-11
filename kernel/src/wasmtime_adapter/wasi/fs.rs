@@ -1,6 +1,6 @@
 use pin_project_lite::pin_project;
 
-use crate::ComponentHostNetwork;
+use crate::{BootfsTree, ComponentHostNetwork, FileContents, FsNode};
 
 use super::*;
 
@@ -55,71 +55,26 @@ pub(super) fn record_component_fs_profile<CpuImpl, Net, HostFs>(
     }
 }
 
-/// What a node holds, and where it came from.
+/// One instance's guest filesystem: the shared boot tree, with this
+/// instance's changes laid over it.
 ///
-/// A file seeded from the boot payload holds [`crate::BootfsBytes`]; every
-/// write, truncate or creation stores [`FileContents::Written`], so a
-/// node that anyone has modified can no longer claim the payload's trust.
-/// Directories and symlinks hold `Written` bytes (empty, or the link
-/// target).
-#[derive(Clone, Debug)]
-pub(crate) enum FileContents {
-    Bootfs(crate::BootfsBytes),
-    Written(Bytes),
-}
-
-// Every instance seeds one node per bootfs entry, so carrying provenance
-// must not make a node larger than the plain `Bytes` it replaced.
-const _: () = assert!(
-    core::mem::size_of::<FileContents>() == core::mem::size_of::<Bytes>(),
-    "FileContents must stay the size of Bytes"
-);
-
-impl FileContents {
-    pub(crate) fn as_slice(&self) -> &[u8] {
-        match self {
-            Self::Bootfs(bytes) => bytes.as_slice(),
-            Self::Written(bytes) => bytes,
-        }
-    }
-
-    fn slice(&self, range: core::ops::Range<usize>) -> Bytes {
-        match self {
-            Self::Bootfs(bytes) => Bytes::from_static(&bytes.as_slice()[range]),
-            Self::Written(bytes) => bytes.slice(range),
-        }
-    }
-
-    fn into_bytes(self) -> Bytes {
-        match self {
-            Self::Bootfs(bytes) => bytes.to_bytes(),
-            Self::Written(bytes) => bytes,
-        }
-    }
-
-    const fn empty() -> Self {
-        Self::Written(Bytes::new())
-    }
-}
-
-#[derive(Clone, Debug)]
-pub(super) struct FsNode {
-    pub(super) path: String,
-    pub(super) kind: FsNodeKind,
-    pub(super) contents: FileContents,
-    pub(super) identity: ObjectIdentity,
-    pub(super) access_nanos: u64,
-    pub(super) modified_nanos: u64,
-    pub(super) status_nanos: u64,
-    pub(super) readonly: bool,
-    pub(super) link_count: u64,
-}
-
+/// The base is never written. A node the instance creates lives in
+/// `nodes`. A base node it changes is copied into `shadowed`, under its
+/// base index, the first time it changes; one it removes is shadowed by
+/// `None`. A path resolves through `path_index` first and through the base
+/// only when `nodes` does not hold it, and `nodes` holds a base path only
+/// once that base node is shadowed by `None`, so the two never disagree.
+/// A fresh instance therefore holds nothing per bootfs entry.
+///
+/// Concurrency: owned by one filesystem (and the snapshots that share it)
+/// behind the snapshot's lock; the base is immutable and read lock-free.
 #[derive(Debug)]
 pub(super) struct DebugFileSystemState {
-    pub(super) nodes: Vec<FsNode>,
-    pub(super) path_index: HashMap<String, usize>,
-    pub(super) next_inode: u64,
+    base: BootfsTree,
+    shadowed: HashMap<usize, Option<FsNode>>,
+    nodes: Vec<FsNode>,
+    path_index: HashMap<String, usize>,
+    next_inode: u64,
 }
 
 #[derive(Clone)]
@@ -134,98 +89,134 @@ impl core::fmt::Debug for DebugFileSystemSnapshot {
     }
 }
 
-impl FsNode {
-    pub(super) fn new(
-        path: String,
-        kind: FsNodeKind,
-        contents: FileContents,
-        identity: ObjectIdentity,
-        timestamp_nanos: u64,
-        readonly: bool,
-    ) -> Self {
-        Self {
-            path,
-            kind,
-            contents,
-            identity,
-            access_nanos: timestamp_nanos,
-            modified_nanos: timestamp_nanos,
-            status_nanos: timestamp_nanos,
-            readonly,
-            link_count: 1,
-        }
-    }
-
-    pub(super) fn touch_status(&mut self, now_nanos: u64) {
-        self.status_nanos = now_nanos;
-    }
-
-    pub(super) fn touch_modified(&mut self, now_nanos: u64) {
-        self.modified_nanos = now_nanos;
-        self.status_nanos = now_nanos;
-    }
-
-    pub(super) fn set_times(
-        &mut self,
-        access_nanos: Option<u64>,
-        modified_nanos: Option<u64>,
-        status_nanos: u64,
-    ) {
-        if let Some(access_nanos) = access_nanos {
-            self.access_nanos = access_nanos;
-        }
-        if let Some(modified_nanos) = modified_nanos {
-            self.modified_nanos = modified_nanos;
-        }
-        if access_nanos.is_some() || modified_nanos.is_some() {
-            self.status_nanos = status_nanos;
-        }
-    }
-}
-
 impl DebugFileSystemState {
-    pub(super) fn with_root() -> Self {
-        let mut state = Self {
+    pub(super) fn over(base: BootfsTree) -> Self {
+        Self {
+            next_inode: base.next_inode(),
+            base,
+            shadowed: HashMap::new(),
             nodes: Vec::new(),
             path_index: HashMap::new(),
-            next_inode: 2,
-        };
-        state.insert_node(FsNode::new(
-            String::from("/"),
-            FsNodeKind::Directory,
-            FileContents::empty(),
-            ObjectIdentity::new(AuthorityDomain::GUEST_BOOTFS, 1),
-            0,
-            false,
-        ));
-        state
+        }
     }
 
-    pub(super) fn insert_node(&mut self, node: FsNode) {
-        let path = node.path.clone();
-        let index = self.nodes.len();
-        assert!(
-            self.path_index.insert(path.clone(), index).is_none(),
-            "debug filesystem path {path} already exists"
-        );
-        self.nodes.push(node);
+    pub(super) fn allocate_identity(&mut self) -> ObjectIdentity {
+        let local = self.next_inode;
+        self.next_inode += 1;
+        ObjectIdentity::new(AuthorityDomain::GUEST_BOOTFS, local)
     }
 
-    pub(super) fn node_index(&self, path: &str) -> Option<usize> {
-        self.path_index.get(path).copied()
+    /// Every node, base nodes first in base order, then the ones this
+    /// instance created in the order `nodes` holds them.
+    pub(super) fn nodes(&self) -> impl Iterator<Item = &FsNode> {
+        self.base
+            .nodes()
+            .iter()
+            .enumerate()
+            .filter_map(move |(index, node)| match self.shadowed.get(&index) {
+                Some(shadow) => shadow.as_ref(),
+                None => Some(node),
+            })
+            .chain(self.nodes.iter())
     }
 
     pub(super) fn node(&self, path: &str) -> Option<&FsNode> {
-        self.node_index(path).map(|index| &self.nodes[index])
+        if let Some(&index) = self.path_index.get(path) {
+            return Some(&self.nodes[index]);
+        }
+        let index = self.base.index(path)?;
+        match self.shadowed.get(&index) {
+            Some(shadow) => shadow.as_ref(),
+            None => Some(&self.base.nodes()[index]),
+        }
     }
 
+    /// The node at `path`, as this instance's own copy: a base node is
+    /// copied up the first time it is asked for, so call this only to
+    /// change the node.
     pub(super) fn node_mut(&mut self, path: &str) -> Option<&mut FsNode> {
-        let index = self.node_index(path)?;
-        Some(&mut self.nodes[index])
+        if let Some(&index) = self.path_index.get(path) {
+            return Some(&mut self.nodes[index]);
+        }
+        let index = self.base.index(path)?;
+        self.copy_up(index).as_mut()
+    }
+
+    /// This instance's shadow of base node `index`, a copy of the base
+    /// node unless the instance already changed or removed it.
+    fn copy_up(&mut self, index: usize) -> &mut Option<FsNode> {
+        let base = &self.base;
+        self.shadowed
+            .entry(index)
+            .or_insert_with(|| Some(base.nodes()[index].clone()))
+    }
+
+    /// Applies `change` to every name of the object `identity`.
+    pub(super) fn update_linked(
+        &mut self,
+        identity: ObjectIdentity,
+        mut change: impl FnMut(&mut FsNode),
+    ) {
+        // A base node holds its own identity, and only an unshadowed one
+        // is missing from the scan below.
+        if let Some(index) = self.base.index_of_identity(identity) {
+            self.copy_up(index);
+        }
+        for node in self
+            .shadowed
+            .values_mut()
+            .flatten()
+            .chain(self.nodes.iter_mut())
+            .filter(|node| node.identity == identity)
+        {
+            change(node);
+        }
+    }
+
+    /// Takes the bytes of the file at `path` to rewrite them, without a
+    /// copy when no other name shares them. The caller found the node.
+    fn take_contents(&mut self, path: &str) -> BytesMut {
+        let node = self
+            .node_mut(path)
+            .expect("the file being rewritten was found by its caller");
+        let unshared = node.link_count == 1;
+        let contents = core::mem::replace(&mut node.contents, FileContents::empty()).into_bytes();
+        if unshared {
+            match contents.try_into_mut() {
+                Ok(contents) => contents,
+                Err(contents) => BytesMut::from(contents.as_ref()),
+            }
+        } else {
+            BytesMut::from(contents.as_ref())
+        }
+    }
+
+    /// Stores `contents` as what every name of the file `identity` holds.
+    fn store_contents(&mut self, identity: ObjectIdentity, contents: Bytes, now_nanos: u64) {
+        self.update_linked(identity, |linked| {
+            linked.contents = FileContents::Written(contents.clone());
+            linked.touch_modified(now_nanos);
+        });
+    }
+
+    pub(super) fn insert_node(&mut self, node: FsNode) {
+        assert!(
+            self.node(&node.path).is_none(),
+            "debug filesystem path {} already exists",
+            node.path
+        );
+        self.path_index.insert(node.path.clone(), self.nodes.len());
+        self.nodes.push(node);
     }
 
     pub(super) fn remove_node(&mut self, path: &str) -> Option<FsNode> {
-        let index = self.path_index.remove(path)?;
+        let Some(index) = self.path_index.remove(path) else {
+            let index = self.base.index(path)?;
+            return match self.shadowed.insert(index, None) {
+                Some(shadow) => shadow,
+                None => Some(self.base.nodes()[index].clone()),
+            };
+        };
         let removed = self.nodes.swap_remove(index);
         if index < self.nodes.len() {
             let moved_path = self.nodes[index].path.clone();
@@ -239,15 +230,98 @@ impl DebugFileSystemState {
     }
 
     pub(super) fn retain_nodes(&mut self, mut keep: impl FnMut(&FsNode) -> bool) {
+        for (index, node) in self.base.nodes().iter().enumerate() {
+            if !self.shadowed.contains_key(&index) && !keep(node) {
+                self.shadowed.insert(index, None);
+            }
+        }
+        for shadow in self.shadowed.values_mut() {
+            if shadow.as_ref().is_some_and(|node| !keep(node)) {
+                *shadow = None;
+            }
+        }
         self.nodes.retain(|node| keep(node));
         self.rebuild_path_index();
     }
 
-    pub(super) fn rebuild_path_index(&mut self) {
+    /// Moves the node at `source`, and with `subtree` every node under
+    /// it, to the same place under `destination`, stamping each moved
+    /// node's status time.
+    pub(super) fn rename(
+        &mut self,
+        source: &str,
+        destination: &str,
+        subtree: bool,
+        now_nanos: u64,
+    ) {
+        let moves = |path: &str| {
+            path == source || (subtree && crate::path_is_within_directory(path, source))
+        };
+        let move_node = |node: &mut FsNode| {
+            node.path = if node.path == source {
+                destination.to_owned()
+            } else {
+                append_path_suffix(destination, &node.path[source.len()..])
+            };
+            node.touch_status(now_nanos);
+        };
+
+        // A base node cannot move in place: its path is the base's. It is
+        // shadowed by `None` and re-created at its new path.
+        let mut relocated = Vec::new();
+        for (index, node) in self.base.nodes().iter().enumerate() {
+            let shadow = self.shadowed.get(&index);
+            let current = match shadow {
+                Some(shadow) => shadow.as_ref(),
+                None => Some(node),
+            };
+            if current.is_some_and(|current| moves(&current.path)) {
+                let mut moved = match self.shadowed.insert(index, None) {
+                    Some(Some(shadow)) => shadow,
+                    _ => node.clone(),
+                };
+                move_node(&mut moved);
+                relocated.push(moved);
+            }
+        }
+        for node in &mut self.nodes {
+            if moves(&node.path) {
+                move_node(node);
+            }
+        }
+        self.rebuild_path_index();
+        for node in relocated {
+            self.insert_node(node);
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn base(&self) -> &BootfsTree {
+        &self.base
+    }
+
+    /// How many nodes this instance holds of its own: created, changed
+    /// or removed.
+    #[cfg(test)]
+    pub(super) fn own_nodes(&self) -> usize {
+        self.shadowed.len() + self.nodes.len()
+    }
+
+    /// The node slots this instance has allocated, used or not.
+    #[cfg(test)]
+    pub(super) fn own_capacity(&self) -> usize {
+        self.shadowed.capacity() + self.nodes.capacity() + self.path_index.capacity()
+    }
+
+    fn rebuild_path_index(&mut self) {
         self.path_index.clear();
         for (index, node) in self.nodes.iter().enumerate() {
+            let base_removed = self
+                .base
+                .index(&node.path)
+                .is_none_or(|base_index| matches!(self.shadowed.get(&base_index), Some(None)));
             assert!(
-                self.path_index.insert(node.path.clone(), index).is_none(),
+                base_removed && self.path_index.insert(node.path.clone(), index).is_none(),
                 "debug filesystem duplicate path {}",
                 node.path
             );
@@ -261,24 +335,6 @@ pub struct FsDescriptor {
     pub(crate) kind: FsNodeKind,
     pub(crate) flags: fs_types::DescriptorFlags,
     pub(crate) identity: Option<ObjectIdentity>,
-}
-
-pub(super) fn embedded_absolute_path(relative: &str) -> String {
-    let mut path = String::with_capacity(relative.len() + 1);
-    path.push('/');
-    path.push_str(relative);
-    path
-}
-
-pub(super) fn join_embedded_child(parent: &str, child: &str) -> String {
-    let slash = usize::from(parent != "/");
-    let mut path = String::with_capacity(parent.len() + slash + child.len());
-    path.push_str(parent);
-    if parent != "/" {
-        path.push('/');
-    }
-    path.push_str(child);
-    path
 }
 
 pub(super) fn append_path_suffix(path: &str, suffix: &str) -> String {
@@ -798,17 +854,15 @@ where
     HostFsService: crate::HostFileSystem,
 {
     pub(crate) fn new(runtime_state: State) -> Self {
+        let state = DebugFileSystemState::over(runtime_state.bootfs_tree());
         let mut filesystem = Self {
             snapshot: DebugFileSystemSnapshot {
-                inner: Arc::new(Mutex::new(DebugFileSystemState::with_root())),
+                inner: Arc::new(Mutex::new(state)),
             },
             runtime_state,
             _host_fs: PhantomData,
         };
 
-        if let Some(bootfs) = filesystem.runtime_state.bootfs() {
-            filesystem.seed_bootfs(bootfs);
-        }
         if filesystem.runtime_state.host_filesystem_service().is_some() {
             filesystem.ensure_directory(crate::HOST_SHARE_GUEST_MOUNT_PATH, true);
         }
@@ -830,67 +884,6 @@ where
 
     pub(crate) fn replace_with_snapshot(&mut self, snapshot: DebugFileSystemSnapshot) {
         self.snapshot = snapshot;
-    }
-
-    pub(super) fn seed_bootfs(&mut self, image: EmbeddedBootFs) {
-        for directory in image.directories() {
-            self.insert_bootfs_directory(directory);
-        }
-        for file in image.files() {
-            self.insert_bootfs_file(file);
-        }
-    }
-
-    pub(super) fn insert_bootfs_directory(&mut self, directory: &crate::EmbeddedBootDirectory) {
-        let absolute = embedded_absolute_path(directory.path());
-        let mut current = String::from("/");
-
-        for segment in directory
-            .path()
-            .split('/')
-            .filter(|segment| !segment.is_empty())
-        {
-            let next = join_embedded_child(&current, segment);
-            if next == absolute {
-                break;
-            }
-
-            self.ensure_directory(&next, true);
-            current = next;
-        }
-
-        self.ensure_bootfs_directory(&absolute, directory.modified_nanos());
-    }
-
-    pub(super) fn insert_bootfs_file(&mut self, file: &crate::EmbeddedBootFile) {
-        let absolute = embedded_absolute_path(file.path());
-        let mut current = String::from("/");
-
-        for segment in file.path().split('/').filter(|segment| !segment.is_empty()) {
-            let next = join_embedded_child(&current, segment);
-
-            if next == absolute {
-                break;
-            }
-
-            self.ensure_directory(&next, true);
-            current = next;
-        }
-
-        if self.get_node(&absolute).is_ok() {
-            return;
-        }
-
-        let identity = self.allocate_identity();
-        let modified_nanos = file.modified_nanos();
-        self.snapshot.inner.lock().insert_node(FsNode::new(
-            absolute,
-            FsNodeKind::File,
-            FileContents::Bootfs(file.bootfs_bytes()),
-            identity,
-            modified_nanos,
-            true,
-        ));
     }
 
     /// Drops the embedded nodes mirroring a host subtree.
@@ -936,57 +929,39 @@ where
     }
 
     pub(super) fn ensure_directory(&mut self, path: &str, readonly: bool) {
-        self.ensure_directory_with_timestamp(path, readonly, 0);
-    }
-
-    pub(super) fn ensure_bootfs_directory(&mut self, path: &str, modified_nanos: u64) {
-        self.ensure_directory_with_timestamp(path, true, modified_nanos);
-    }
-
-    pub(super) fn ensure_directory_with_timestamp(
-        &mut self,
-        path: &str,
-        readonly: bool,
-        timestamp_nanos: u64,
-    ) {
         if path == "/" {
             return;
         }
 
         let mut state = self.snapshot.inner.lock();
-        if let Some(existing) = state.node_mut(path) {
+        if let Some(existing) = state.node(path) {
             assert!(
                 existing.kind == FsNodeKind::Directory,
-                "bootfs directory path {} collided with an existing file",
-                path
+                "directory path {path} collided with an existing file"
             );
-            existing.readonly |= readonly;
-            if timestamp_nanos != 0 {
-                existing.access_nanos = timestamp_nanos;
-                existing.modified_nanos = timestamp_nanos;
-                existing.status_nanos = timestamp_nanos;
+            // Only a change takes this instance's own copy of a base node.
+            if readonly && !existing.readonly {
+                state
+                    .node_mut(path)
+                    .expect("the directory was found above")
+                    .readonly = true;
             }
             return;
         }
 
-        let local = state.next_inode;
-        state.next_inode += 1;
-        let identity = ObjectIdentity::new(AuthorityDomain::GUEST_BOOTFS, local);
+        let identity = state.allocate_identity();
         state.insert_node(FsNode::new(
             path.to_owned(),
             FsNodeKind::Directory,
             FileContents::empty(),
             identity,
-            timestamp_nanos,
+            0,
             readonly,
         ));
     }
 
     pub(super) fn allocate_identity(&self) -> ObjectIdentity {
-        let mut state = self.snapshot.inner.lock();
-        let local = state.next_inode;
-        state.next_inode += 1;
-        ObjectIdentity::new(AuthorityDomain::GUEST_BOOTFS, local)
+        self.snapshot.inner.lock().allocate_identity()
     }
 
     pub(super) fn node_size(node: &FsNode) -> u64 {
@@ -1150,7 +1125,7 @@ where
 
         let mut entries = Vec::new();
         let state = self.snapshot.inner.lock();
-        for child in &state.nodes {
+        for child in state.nodes() {
             if child.path == path {
                 continue;
             }
@@ -1246,7 +1221,7 @@ where
         }
 
         let mut state = self.snapshot.inner.lock();
-        match state.node(path).cloned() {
+        match state.node(path) {
             Some(node) => {
                 if node.kind != FsNodeKind::File {
                     return Err(fs_types::ErrorCode::IsDirectory);
@@ -1254,15 +1229,8 @@ where
                 if node.readonly {
                     return Err(fs_types::ErrorCode::ReadOnly);
                 }
-                let contents = Bytes::copy_from_slice(bytes);
-                for linked in state
-                    .nodes
-                    .iter_mut()
-                    .filter(|linked| linked.identity == node.identity)
-                {
-                    linked.contents = FileContents::Written(contents.clone());
-                    linked.touch_modified(now_nanos);
-                }
+                let identity = node.identity;
+                state.store_contents(identity, Bytes::copy_from_slice(bytes), now_nanos);
                 Ok(())
             }
             None => {
@@ -1274,9 +1242,7 @@ where
                 if parent_node.readonly {
                     return Err(fs_types::ErrorCode::ReadOnly);
                 }
-                let local = state.next_inode;
-                state.next_inode += 1;
-                let identity = ObjectIdentity::new(AuthorityDomain::GUEST_BOOTFS, local);
+                let identity = state.allocate_identity();
                 state.insert_node(FsNode::new(
                     path.to_owned(),
                     FsNodeKind::File,
@@ -1353,10 +1319,9 @@ where
         }
 
         let mut state = self.snapshot.inner.lock();
-        let Some(index) = state.node_index(&descriptor.path) else {
+        let Some(node) = state.node(&descriptor.path) else {
             return Err(fs_types::ErrorCode::NoEntry);
         };
-        let node = &state.nodes[index];
         if node.kind != FsNodeKind::File {
             return Err(fs_types::ErrorCode::IsDirectory);
         }
@@ -1367,7 +1332,6 @@ where
             return Err(fs_types::ErrorCode::ReadOnly);
         }
         let identity = node.identity;
-        let linked_count = node.link_count;
         let offset = match offset {
             FsWriteOffset::At(offset) => offset,
             FsWriteOffset::Append => node.contents.as_slice().len(),
@@ -1375,16 +1339,7 @@ where
         let end = offset
             .checked_add(byte_len)
             .ok_or(fs_types::ErrorCode::Overflow)?;
-        let contents = core::mem::replace(&mut state.nodes[index].contents, FileContents::empty())
-            .into_bytes();
-        let mut contents = if linked_count == 1 {
-            match contents.try_into_mut() {
-                Ok(contents) => contents,
-                Err(contents) => BytesMut::from(contents.as_ref()),
-            }
-        } else {
-            BytesMut::from(contents.as_ref())
-        };
+        let mut contents = state.take_contents(&descriptor.path);
         if contents.len() < offset {
             contents.resize(offset, 0);
         }
@@ -1392,15 +1347,7 @@ where
             contents.resize(end, 0);
         }
         fill(&mut contents[offset..end]);
-        let contents = contents.freeze();
-        for linked in state
-            .nodes
-            .iter_mut()
-            .filter(|node| node.identity == identity)
-        {
-            linked.contents = FileContents::Written(contents.clone());
-            linked.touch_modified(now_nanos);
-        }
+        state.store_contents(identity, contents.freeze(), now_nanos);
         Ok(())
     }
 
@@ -1441,10 +1388,9 @@ where
 
         let size: usize = size.try_into().map_err(|_| fs_types::ErrorCode::Overflow)?;
         let mut state = self.snapshot.inner.lock();
-        let Some(index) = state.node_index(&descriptor.path) else {
+        let Some(node) = state.node(&descriptor.path) else {
             return Err(fs_types::ErrorCode::NoEntry);
         };
-        let node = &state.nodes[index];
         if node.kind != FsNodeKind::File {
             return Err(fs_types::ErrorCode::IsDirectory);
         }
@@ -1452,27 +1398,9 @@ where
             return Err(fs_types::ErrorCode::ReadOnly);
         }
         let identity = node.identity;
-        let linked_count = node.link_count;
-        let contents = core::mem::replace(&mut state.nodes[index].contents, FileContents::empty())
-            .into_bytes();
-        let mut contents = if linked_count == 1 {
-            match contents.try_into_mut() {
-                Ok(contents) => contents,
-                Err(contents) => BytesMut::from(contents.as_ref()),
-            }
-        } else {
-            BytesMut::from(contents.as_ref())
-        };
+        let mut contents = state.take_contents(&descriptor.path);
         contents.resize(size, 0);
-        let contents = contents.freeze();
-        for linked in state
-            .nodes
-            .iter_mut()
-            .filter(|node| node.identity == identity)
-        {
-            linked.contents = FileContents::Written(contents.clone());
-            linked.touch_modified(now_nanos);
-        }
+        state.store_contents(identity, contents.freeze(), now_nanos);
         Ok(())
     }
 
@@ -1490,17 +1418,12 @@ where
         if node.readonly {
             return Err(fs_types::ErrorCode::ReadOnly);
         }
-        let identity = node.identity;
-        for linked in self
-            .snapshot
+        self.snapshot
             .inner
             .lock()
-            .nodes
-            .iter_mut()
-            .filter(|node| node.identity == identity)
-        {
-            linked.set_times(access_nanos, modified_nanos, status_nanos);
-        }
+            .update_linked(node.identity, |linked| {
+                linked.set_times(access_nanos, modified_nanos, status_nanos);
+            });
         Ok(())
     }
 
@@ -1573,18 +1496,11 @@ where
                 {
                     return Err(fs_types::ErrorCode::ReadOnly);
                 }
-                let identity = existing.identity;
-                for linked in self
-                    .snapshot
-                    .inner
-                    .lock()
-                    .nodes
-                    .iter_mut()
-                    .filter(|node| node.identity == identity)
-                {
-                    linked.contents = FileContents::empty();
-                    linked.touch_modified(now_nanos);
-                }
+                self.snapshot.inner.lock().store_contents(
+                    existing.identity,
+                    Bytes::new(),
+                    now_nanos,
+                );
             }
             return Ok(FsDescriptor {
                 path: absolute,
@@ -1659,29 +1575,20 @@ where
         if node.kind != FsNodeKind::Directory {
             return Err(fs_types::ErrorCode::NotDirectory);
         }
-        if self
-            .snapshot
-            .inner
-            .lock()
-            .nodes
-            .iter()
+        let mut state = self.snapshot.inner.lock();
+        if state
+            .nodes()
             .any(|child| crate::path_is_within_directory(&child.path, &absolute))
         {
             return Err(fs_types::ErrorCode::NotEmpty);
         }
-        let identity = node.identity;
-        let mut state = self.snapshot.inner.lock();
         if state.remove_node(&absolute).is_some() {
-            for linked in state
-                .nodes
-                .iter_mut()
-                .filter(|node| node.identity == identity)
-            {
+            state.update_linked(node.identity, |linked| {
                 linked.link_count = linked
                     .link_count
                     .checked_sub(1)
                     .expect("filesystem hardlink count underflow");
-            }
+            });
         }
         Ok(())
     }
@@ -1812,14 +1719,10 @@ where
         linked.link_count = link_count;
         linked.touch_status(now_nanos);
         let mut state = self.snapshot.inner.lock();
-        for node in state
-            .nodes
-            .iter_mut()
-            .filter(|node| node.identity == identity)
-        {
+        state.update_linked(identity, |node| {
             node.link_count = link_count;
             node.touch_status(now_nanos);
-        }
+        });
         state.insert_node(linked);
         Ok(())
     }
@@ -1950,23 +1853,12 @@ where
             return Err(fs_types::ErrorCode::NotPermitted);
         }
 
-        let mut state = self.snapshot.inner.lock();
-        for node in &mut state.nodes {
-            if node.path == source_absolute {
-                node.path = destination_absolute.clone();
-                node.touch_status(now_nanos);
-                continue;
-            }
-
-            if source_node.kind == FsNodeKind::Directory
-                && crate::path_is_within_directory(&node.path, &source_absolute)
-            {
-                node.path =
-                    append_path_suffix(&destination_absolute, &node.path[source_absolute.len()..]);
-                node.touch_status(now_nanos);
-            }
-        }
-        state.rebuild_path_index();
+        self.snapshot.inner.lock().rename(
+            &source_absolute,
+            &destination_absolute,
+            source_node.kind == FsNodeKind::Directory,
+            now_nanos,
+        );
 
         Ok(())
     }

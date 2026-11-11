@@ -176,7 +176,7 @@ where
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    runtime_state.bootfs()?.file_bytes(path)
+    runtime_state.bootfs().file_bytes(path)
 }
 
 impl<Net: ComponentHostNetwork> WasixAsyncifyState<Net> {
