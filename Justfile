@@ -68,6 +68,9 @@ clippy-host:
         --cargo cargo
     export HELIOS_KERNEL_ROOT_PUBLIC_KEY="${out_dir}/helios-root-public.key"
     export HELIOS_KERNEL_ROOT_SECRET_KEY="${out_dir}/helios-root-secret.key"
+    # `helios-venus` generates its protocol module from the pinned
+    # venus-protocol inputs when it builds.
+    cargo run -p helios-cli --quiet -- venus-protocol-fetch
     cargo clippy \
         --workspace --all-targets \
         --exclude helios \
@@ -116,6 +119,11 @@ test-units:
     # capture check that links it.
     cargo nextest run -p helios-compositor-render -p helios-desktop-text-check
     cargo nextest run -p helios-inspector-protocol --lib
+    # The Venus protocol is generated from pinned venus-protocol inputs that
+    # the CLI fetches and hash-verifies; the parity test then compares the
+    # generated encoders with the pinned Mesa generator's output.
+    cargo run -p helios-cli --quiet -- venus-protocol-fetch
+    cargo nextest run -p helios-venus -p helios-venus-gen
     cargo nextest run -p helios-kernel --test hal_layering
     # The hosted backend boots the same kernel on the host OS; its tests
     # cover the memory-policy density checks and the OOM killer, and

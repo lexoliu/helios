@@ -11,6 +11,7 @@ fatfs = "0.3.6"
 helios-artifact.workspace = true
 helios-compiler-support.workspace = true
 helios-profdata.workspace = true
+helios-venus-gen.workspace = true
 helios-workspace-root.workspace = true
 hex = "0.4.3"
 mbrman = "0.5.4"
