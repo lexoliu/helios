@@ -811,6 +811,57 @@ impl ProcessAuthority {
     }
 }
 
+/// Caps for tests that exercise a claim below the authority check, where
+/// the check itself is not the thing under test.
+#[cfg(test)]
+pub(crate) mod test_caps {
+    use super::{
+        AudioClaimCap, DeviceClassRights, DeviceGrantClaimCap, DisplayClaimCap, GpuClaimCap,
+        InputClaimCap, ProcessAuthority,
+    };
+    use crate::device::DeviceName;
+
+    fn holding(classes: DeviceClassRights) -> ProcessAuthority {
+        let mut authority = ProcessAuthority::empty();
+        authority.grant_device_classes(classes);
+        authority
+    }
+
+    pub(crate) fn display() -> DisplayClaimCap {
+        holding(DeviceClassRights::DISPLAY)
+            .derive_display_claim_cap()
+            .expect("the authority holds the display class")
+    }
+
+    pub(crate) fn input() -> InputClaimCap {
+        holding(DeviceClassRights::INPUT)
+            .derive_input_claim_cap()
+            .expect("the authority holds the input class")
+    }
+
+    pub(crate) fn gpu() -> GpuClaimCap {
+        holding(DeviceClassRights::GPU)
+            .derive_gpu_claim_cap()
+            .expect("the authority holds the GPU class")
+    }
+
+    pub(crate) fn audio() -> AudioClaimCap {
+        holding(DeviceClassRights::AUDIO)
+            .derive_audio_claim_cap()
+            .expect("the authority holds the audio class")
+    }
+
+    pub(crate) fn device(name: &str) -> DeviceGrantClaimCap {
+        let mut authority = ProcessAuthority::empty();
+        authority
+            .grant_device(DeviceName::new(name).expect("the test names are short"))
+            .expect("one named device fits");
+        authority
+            .derive_device_grant_cap(name)
+            .expect("the authority names the device")
+    }
+}
+
 fn normalize_authority_path(path: &str) -> Result<String, ProcessAuthorityError> {
     resolve_absolute_path(path).map_err(ProcessAuthorityError::InvalidPath)
 }

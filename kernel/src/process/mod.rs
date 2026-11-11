@@ -14,6 +14,8 @@ mod program_service;
 mod table;
 mod thread;
 
+#[cfg(test)]
+pub(crate) use authority::test_caps;
 pub use authority::{
     AudioClaimCap, ClockAuthorityRights, DeviceClassRights, DeviceGrantClaimCap,
     DirectoryAuthorityRights, DirectoryCap, DirectoryPreopen, DisplayClaimCap, DnsCap,
