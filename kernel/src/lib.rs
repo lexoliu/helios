@@ -18,6 +18,8 @@ mod host_fs;
 mod input;
 mod instance;
 mod io;
+#[cfg(feature = "wasmtime-runtime")]
+mod isa;
 mod kernel_exception;
 mod log;
 mod machine;

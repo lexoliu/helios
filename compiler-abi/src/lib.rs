@@ -1,6 +1,6 @@
 #![no_std]
 
-pub const HELIOS_COMPILER_ABI_VERSION: u32 = 1;
+pub const HELIOS_COMPILER_ABI_VERSION: u32 = 2;
 
 pub const HELIOS_COMPILER_ALLOC: &str = "helios_compiler_alloc";
 pub const HELIOS_COMPILER_FREE: &str = "helios_compiler_free";
@@ -42,6 +42,10 @@ pub struct CompilerRequestHeader {
     pub wasm_len: u32,
     pub target_ptr: u32,
     pub target_len: u32,
+    /// The name of the target's ISA level (`helios_artifact::IsaLevel::name`)
+    /// the artifact is compiled for.
+    pub isa_level_ptr: u32,
+    pub isa_level_len: u32,
     pub flags: u32,
 }
 

@@ -46,6 +46,7 @@ mod wasix_epoll;
 use wasix_epoll::*;
 
 use super::*;
+use crate::isa::GuestIsa;
 use crate::process::FreeDescriptorSlots;
 use crate::wasmtime_adapter::artifact_profile::{self, ArtifactProfileError};
 use crate::wasmtime_adapter::code_map::{CodeMap, CodeRegistration};
@@ -300,6 +301,8 @@ where
     // whose imports are independent of per-process shared-memory binding.
     core_module_instance_pre_cache: CoreModuleInstancePreCache<CpuImpl, Net, HostFs>,
     compiler_artifact: Option<BootfsBytes>,
+    /// The level the in-kernel compiler emits, selected once at install.
+    guest_isa: GuestIsa,
     /// Lazily-built compiler kernel-plugin runtime. The plugin's
     /// `wasmtime::Module`, `InstancePre`, and 512 MiB `SharedMemory` are
     /// allocated on first compile and reused for every subsequent call,
@@ -510,6 +513,11 @@ where
         return service;
     }
 
+    // Selected here, on the bootstrap processor before any secondary runs
+    // guest code, and logged once: this is the single place every backend's
+    // program service passes through, after the logger is up.
+    let guest_isa = GuestIsa::for_build_target(cpu.native_feature_probe());
+    guest_isa.log();
     let cache_budget = machine_memory().free_bytes / COMPONENT_CACHE_FRACTION;
     let shared_memory_pool_budget =
         user_heap_stats().available_bytes() / SHARED_MEMORY_POOL_FRACTION;
@@ -532,6 +540,7 @@ where
             core_module_cache: Mutex::new(ComponentCache::new(cache_budget)),
             core_module_instance_pre_cache: Arc::new(Mutex::new(ComponentCache::new(cache_budget))),
             compiler_artifact,
+            guest_isa,
             compiler_plugin: Mutex::new(None),
             compile_in_progress: AtomicBool::new(false),
             code_map: CodeMap::new(),
@@ -1970,9 +1979,13 @@ where
         } else {
             0
         };
-        let target = env!("HELIOS_BUILD_TARGET").as_bytes();
+        let guest_isa = self.inner.guest_isa;
+        let target = guest_isa.compile_target();
+        let isa_level = target.level().name().as_bytes();
+        let target = target.triple().as_bytes();
         let wasm_ptr = compiler_alloc(&mut store, &alloc, wasm.len(), 1).await?;
         let target_ptr = compiler_alloc(&mut store, &alloc, target.len(), 1).await?;
+        let isa_level_ptr = compiler_alloc(&mut store, &alloc, isa_level.len(), 1).await?;
         let request_ptr = compiler_alloc(
             &mut store,
             &alloc,
@@ -1982,6 +1995,7 @@ where
         .await?;
         write_shared_memory(store.data().memory(), wasm_ptr, wasm)?;
         write_shared_memory(store.data().memory(), target_ptr, target)?;
+        write_shared_memory(store.data().memory(), isa_level_ptr, isa_level)?;
         let header = CompilerRequestHeader {
             abi_version: HELIOS_COMPILER_ABI_VERSION,
             hint: match hint {
@@ -1993,6 +2007,8 @@ where
             wasm_len: wasm.len() as u32,
             target_ptr,
             target_len: target.len() as u32,
+            isa_level_ptr,
+            isa_level_len: isa_level.len() as u32,
             flags: if profile {
                 helios_compiler_abi::HELIOS_COMPILER_REQUEST_PROFILE
             } else {

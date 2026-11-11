@@ -397,7 +397,6 @@ mod tests {
     use alloc::vec::Vec;
 
     use super::*;
-    use crate::cwasm_target_cranelift_flags;
 
     const X86: &str = "x86_64-unknown-none";
     const AARCH64: &str = "aarch64-unknown-none";
@@ -451,12 +450,32 @@ mod tests {
 
     #[test]
     fn floors_carry_the_flags_compilation_has_always_used() {
-        for target in [X86, AARCH64, RISCV, "x86_64-unknown-linux-gnu"] {
+        const X86_FLOOR: &[&str] = &[
+            "has_cmpxchg16b",
+            "has_sse3",
+            "has_ssse3",
+            "has_sse41",
+            "has_sse42",
+            "has_popcnt",
+            "has_bmi1",
+            "has_bmi2",
+            "has_lzcnt",
+            "has_avx",
+            "has_avx2",
+            "has_fma",
+        ];
+        let expected: [(&str, &[&str]); 4] = [
+            (X86, X86_FLOOR),
+            ("x86_64-unknown-linux-gnu", X86_FLOOR),
+            (AARCH64, &["has_lse", "has_fp16"]),
+            (RISCV, &[]),
+        ];
+        for (target, flags) in expected {
             let floor = CwasmTarget::new(target, cwasm_target_isa_levels(target).floor().name())
                 .expect("a floor belongs to its own target");
             assert_eq!(
                 floor.cranelift_flags().collect::<Vec<_>>(),
-                cwasm_target_cranelift_flags(target),
+                flags,
                 "{target}"
             );
         }
