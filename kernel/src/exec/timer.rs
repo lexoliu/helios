@@ -756,7 +756,7 @@ mod tests {
         drop(unpolled);
     }
 
-    /// The shape of `wasi:io/poll`'s `ready` on a timer pollable: a sleep
+    /// The shape of a guest's readiness check on a timer pollable: a sleep
     /// polled once and dropped. Before #705 each left an inbox entry that
     /// only `fire_expired` drained, and the 4097th panicked.
     #[test]
