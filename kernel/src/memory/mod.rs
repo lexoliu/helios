@@ -23,6 +23,7 @@ mod frame_pool;
 mod frame_reserve;
 mod frame_slab;
 mod irq_safe;
+mod locality;
 mod mapping_cost;
 mod owner;
 mod policy;
@@ -49,6 +50,8 @@ pub(crate) use frame_reserve::{
     configure_processors as configure_frame_reserve_processors, top_up as top_up_frame_reserve,
 };
 pub(crate) use irq_safe::IrqSafeMutex;
+pub use locality::Locality;
+pub(crate) use locality::NodeRun;
 pub use mapping_cost::user_mapping_kernel_heap_bytes;
 pub use owner::{
     MemoryOwner, UserMemoryOwnerScope, UserMemoryOwners, configure_user_memory_owner_processors,
@@ -72,7 +75,8 @@ pub use swap::{
 pub use user::{
     UserHeapStats, UserMemoryPool, allocate_user_frame_uninit_on, allocate_user_frame_zeroed,
     allocate_user_frame_zeroed_on, allocate_user_run_zeroed_on, deallocate_user_frame,
-    deallocate_user_frame_on, deallocate_user_run_on, largest_servable_user_bytes, user_heap_stats,
+    deallocate_user_frame_on, deallocate_user_run_on, largest_servable_user_bytes, locality,
+    user_heap_stats,
 };
 pub(crate) use user::{
     allocate_user_memory_pool, install_user_memory_pool, lend_user_memory_to_kernel_heap,

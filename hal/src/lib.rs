@@ -3,7 +3,6 @@ extern crate alloc;
 use core::fmt::Write;
 
 use crate::cpu::ProcessorId;
-use crate::memory::MemoryRegion;
 
 pub mod audio;
 pub mod balloon;
@@ -21,6 +20,7 @@ pub mod io;
 pub mod iommu;
 pub mod memory;
 pub mod mmio;
+pub mod numa;
 pub mod pmm;
 pub mod resource;
 pub mod rtc;
@@ -192,15 +192,12 @@ impl DeviceInventory {
 pub struct Platform<
     Console: Write + Send + 'static,
     Cpu: cpu::Cpu,
-    Regions,
     WatchdogImpl = watchdog::NoWatchdog,
 > where
-    Regions: IntoIterator<Item = MemoryRegion>,
     WatchdogImpl: watchdog::Watchdog,
 {
     pub console: Console,
     pub cpu: Cpu,
-    pub memory_regions: Regions,
     pub topology: ProcessorTopology,
     pub timer_frequency_hz: u64,
     pub dma_model: DmaModel,
@@ -208,27 +205,18 @@ pub struct Platform<
     pub watchdog: WatchdogImpl,
 }
 
-impl<Console: Write + Send + 'static, Cpu: cpu::Cpu, Regions> Platform<Console, Cpu, Regions>
-where
-    Regions: IntoIterator<Item = MemoryRegion>,
-{
-    pub fn new(console: Console, memory_regions: Regions, cpu: Cpu) -> Self {
-        Self::with_watchdog(console, memory_regions, cpu, watchdog::NoWatchdog)
+impl<Console: Write + Send + 'static, Cpu: cpu::Cpu> Platform<Console, Cpu> {
+    pub fn new(console: Console, cpu: Cpu) -> Self {
+        Self::with_watchdog(console, cpu, watchdog::NoWatchdog)
     }
 }
 
-impl<Console: Write + Send + 'static, Cpu: cpu::Cpu, Regions, WatchdogImpl>
-    Platform<Console, Cpu, Regions, WatchdogImpl>
+impl<Console: Write + Send + 'static, Cpu: cpu::Cpu, WatchdogImpl>
+    Platform<Console, Cpu, WatchdogImpl>
 where
-    Regions: IntoIterator<Item = MemoryRegion>,
     WatchdogImpl: watchdog::Watchdog,
 {
-    pub fn with_watchdog(
-        console: Console,
-        memory_regions: Regions,
-        cpu: Cpu,
-        watchdog: WatchdogImpl,
-    ) -> Self {
+    pub fn with_watchdog(console: Console, cpu: Cpu, watchdog: WatchdogImpl) -> Self {
         let topology = ProcessorTopology::start_all_secondaries(
             cpu.bootstrap_processor(),
             cpu.processor_count(),
@@ -236,7 +224,6 @@ where
         let timer_frequency_hz = cpu.timebase().frequency();
         Self {
             console,
-            memory_regions,
             cpu,
             topology,
             timer_frequency_hz,
@@ -364,13 +351,9 @@ mod tests {
         }
     }
 
-    fn empty_regions() -> [MemoryRegion; 0] {
-        []
-    }
-
     #[test]
     fn platform_new_captures_cpu_defaults() {
-        let platform = Platform::new(TestConsole, empty_regions(), TestCpu::new());
+        let platform = Platform::new(TestConsole, TestCpu::new());
 
         assert_eq!(
             platform.topology,
@@ -383,7 +366,7 @@ mod tests {
 
     #[test]
     fn platform_builders_override_platform_facts() {
-        let platform = Platform::new(TestConsole, empty_regions(), TestCpu::new())
+        let platform = Platform::new(TestConsole, TestCpu::new())
             .with_topology(
                 ProcessorTopology::start_all_secondaries(ProcessorId::new(1), 4)
                     .with_startup_policy(ProcessorStartupPolicy::BootstrapOnly),

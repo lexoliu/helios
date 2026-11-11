@@ -248,6 +248,7 @@ use core::time::Duration;
 use arrayvec::ArrayVec;
 use helios_hal::cpu::{Cpu, Instant, ProcessorId, current_processor};
 use helios_hal::memory::MemoryRegion;
+use helios_hal::numa::{NodeId, NumaTopology};
 use helios_hal::watchdog::{NoWatchdog, ProgressCounter, Watchdog};
 use helios_hal::{DeviceInventory, DmaModel, ProcessorStartupPolicy, ProcessorTopology};
 use talc::DefaultBinning;
@@ -1101,30 +1102,30 @@ impl<CpuImpl: Cpu + Clone> Wake for LocalFutureParker<CpuImpl> {
     }
 }
 
-pub fn init<Console, CpuImpl, Regions>(
-    platform: Platform<Console, CpuImpl, Regions>,
-) -> Kernel<CpuImpl>
+/// Brings the kernel up on the executing processor.
+///
+/// The bootstrap processor must have called
+/// [`prime_bootstrap_allocator`] first: memory enters the kernel through
+/// that one call, not through the platform.
+pub fn init<Console, CpuImpl>(platform: Platform<Console, CpuImpl>) -> Kernel<CpuImpl>
 where
     Console: core::fmt::Write + Send + 'static,
     CpuImpl: Cpu + Clone,
-    Regions: IntoIterator<Item = MemoryRegion>,
 {
     init_with_watchdog(platform)
 }
 
-pub fn init_with_watchdog<Console, CpuImpl, Regions, WatchdogImpl>(
-    platform: Platform<Console, CpuImpl, Regions, WatchdogImpl>,
+pub fn init_with_watchdog<Console, CpuImpl, WatchdogImpl>(
+    platform: Platform<Console, CpuImpl, WatchdogImpl>,
 ) -> Kernel<CpuImpl, WatchdogImpl>
 where
     Console: core::fmt::Write + Send + 'static,
     CpuImpl: Cpu + Clone,
-    Regions: IntoIterator<Item = MemoryRegion>,
     WatchdogImpl: Watchdog + Clone,
 {
     let Platform {
         console,
         cpu,
-        memory_regions,
         watchdog,
         topology,
         timer_frequency_hz,
@@ -1153,10 +1154,15 @@ where
 
     if current_processor == topology.bootstrap_processor {
         match BOOT_STATE.load(Ordering::Acquire) {
-            BOOT_UNINITIALIZED => {
-                bootstrap_init(console, memory_regions, &cpu, topology, dma_model, devices)
+            BOOT_INITIALIZING => {
+                assert!(
+                    memory::locality().processor_count() == topology.configured_processors,
+                    "NUMA description names {} processors but the platform topology has {}",
+                    memory::locality().processor_count(),
+                    topology.configured_processors
+                );
+                finish_bootstrap(console, &cpu, topology, dma_model, devices)
             }
-            BOOT_INITIALIZING => finish_bootstrap(console, &cpu, topology, dma_model, devices),
             state => panic!("bootstrap processor observed invalid boot state {state}"),
         }
     } else {
@@ -1204,19 +1210,23 @@ where
 /// that into the kernel's boot share and its reserve, and the second
 /// pass hands the regions out. See [`memory::policy`] for the policy
 /// itself and the evidence behind it.
-fn init_allocator<Regions>(
+fn init_allocator<Regions, Numa>(
     memory_regions: Regions,
-    processor_count: usize,
+    numa: &Numa,
 ) -> &'static memory::UserMemoryPool
 where
     Regions: IntoIterator<Item = MemoryRegion>,
+    Numa: NumaTopology,
 {
-    let mut regions: ArrayVec<(usize, usize), MAX_BOOT_MEMORY_REGIONS> = ArrayVec::new();
-    for mut region in memory_regions {
-        let region = unsafe { region.as_mut() };
-        let start = region.as_mut_ptr() as usize;
+    let processor_count = numa.processor_count();
+    let mut regions: ArrayVec<memory::NodeRun, MAX_BOOT_MEMORY_REGIONS> = ArrayVec::new();
+    for region in memory_regions {
         regions
-            .try_push((start, start + region.len()))
+            .try_push(memory::NodeRun {
+                start: region.start(),
+                end: region.end(),
+                node: region.node(),
+            })
             .unwrap_or_else(|_| {
                 panic!(
                     "boot memory map described more than {MAX_BOOT_MEMORY_REGIONS} usable regions"
@@ -1226,16 +1236,16 @@ where
 
     let usable_bytes = regions
         .iter()
-        .map(|(start, end)| end.saturating_sub(*start))
+        .map(|region| region.end.saturating_sub(region.start))
         .sum();
     let plan = memory::BootMemoryPlan::for_usable_bytes(usable_bytes);
     ALLOCATOR.install_plan(plan);
     let mut splitter = plan.splitter();
 
     let mut user_pool = None;
-    let mut user_regions: ArrayVec<(usize, usize), MAX_BOOT_MEMORY_REGIONS> = ArrayVec::new();
-    for (start, end) in regions {
-        let shares = splitter.split(start, end);
+    let mut user_runs: ArrayVec<memory::NodeRun, MAX_BOOT_MEMORY_REGIONS> = ArrayVec::new();
+    for region in regions {
+        let shares = splitter.split(region.start, region.end);
         if let Some(kernel) = shares.kernel {
             unsafe {
                 ALLOCATOR.add_to_heap(kernel.start, kernel.end);
@@ -1261,7 +1271,11 @@ where
             memory::configure_frame_reserve_processors(processor_count);
             pool
         });
-        user_regions.push((user.start, user.end));
+        user_runs.push(memory::NodeRun {
+            start: user.start,
+            end: user.end,
+            node: region.node,
+        });
     }
 
     assert_eq!(
@@ -1272,16 +1286,35 @@ where
     );
     let pool =
         user_pool.unwrap_or_else(|| panic!("bootstrap did not provide memory for user pool"));
+    // The kernel heap now exists, which is what the locality's tables
+    // are allocated from.
+    let locality = memory::Locality::new(numa, &user_runs);
+    assert!(
+        locality.node_count() == 1,
+        "the platform describes {} NUMA nodes but the user pool is one pool over every node",
+        locality.node_count()
+    );
+    pool.install_locality(locality);
+    let user_regions: ArrayVec<(usize, usize), MAX_BOOT_MEMORY_REGIONS> = user_runs
+        .iter()
+        .map(|run| (run.start, run.end))
+        .collect();
     pool.initialize(&user_regions);
     pool
 }
 
-pub fn prime_bootstrap_allocator<Regions>(
+/// Hands the kernel the machine's usable memory and its locality, on the
+/// bootstrap processor before anything else runs.
+///
+/// This is the one way memory enters the kernel. `numa` is read here,
+/// once, and the kernel keeps its own copy of the answers.
+pub fn prime_bootstrap_allocator<Regions, Numa>(
     memory_regions: Regions,
-    processor_count: usize,
+    numa: &Numa,
 ) -> &'static memory::UserMemoryPool
 where
     Regions: IntoIterator<Item = MemoryRegion>,
+    Numa: NumaTopology,
 {
     match BOOT_STATE.compare_exchange(
         BOOT_UNINITIALIZED,
@@ -1289,25 +1322,9 @@ where
         Ordering::AcqRel,
         Ordering::Acquire,
     ) {
-        Ok(_) => init_allocator(memory_regions, processor_count),
+        Ok(_) => init_allocator(memory_regions, numa),
         Err(state) => panic!("bootstrap allocator observed invalid boot state {state}"),
     }
-}
-
-fn bootstrap_init<Console, CpuImpl, Regions>(
-    console: Console,
-    memory_regions: Regions,
-    cpu: &CpuImpl,
-    topology: ProcessorTopology,
-    dma_model: DmaModel,
-    devices: DeviceInventory,
-) where
-    Console: core::fmt::Write + Send + 'static,
-    CpuImpl: Cpu,
-    Regions: IntoIterator<Item = MemoryRegion>,
-{
-    prime_bootstrap_allocator(memory_regions, topology.configured_processors);
-    finish_bootstrap(console, cpu, topology, dma_model, devices);
 }
 
 fn finish_bootstrap<Console, CpuImpl>(
@@ -1330,6 +1347,21 @@ fn finish_bootstrap<Console, CpuImpl>(
         topology.configured_processors,
         topology.startup_policy
     );
+    let locality = memory::locality();
+    tracing::info!(
+        "NUMA topology nodes={} distances={}",
+        locality.node_count(),
+        locality.distances_display()
+    );
+    for node in 0..locality.node_count() {
+        let node = NodeId::new(node);
+        tracing::info!(
+            "NUMA node node={} memory_bytes={} processors={}",
+            node.index(),
+            locality.memory_bytes(node),
+            locality.processors_display(node)
+        );
+    }
     let user_heap = memory::user_heap_stats();
     let machine = machine_memory();
     tracing::info!(

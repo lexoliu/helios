@@ -7,14 +7,17 @@ use core::ptr::NonNull;
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 use helios_hal::cpu::ProcessorId;
+use helios_hal::numa::NodeId;
 use helios_hal::pmm::{
     FrameAllocError, FrameAllocStats, PhysFrame, PhysFrameAllocator, PhysFrameRange,
 };
+use spin::Once;
 
 use crate::ProgramOutOfMemory;
 use crate::memory::frame_pool::FramePool;
 use crate::memory::frame_slab::FrameSlabCache;
 use crate::memory::irq_safe::IrqSafeMutex;
+use crate::memory::locality::Locality;
 use crate::memory::reported::{ReportedFrames, visit_free_runs};
 
 pub struct UserMemoryPool {
@@ -29,6 +32,9 @@ pub struct UserMemoryPool {
     /// Frames shown to a free-page consumer. The memory is still the
     /// pool's to hand out; its contents are not.
     reported: ReportedFrames,
+    /// Where each processor and each byte of the pool sits. Installed
+    /// once, on the bootstrap processor, before the pool is shared.
+    locality: Once<Locality>,
 }
 
 impl UserMemoryPool {
@@ -38,7 +44,23 @@ impl UserMemoryPool {
             frame_slab: FrameSlabCache::new(),
             total_bytes: AtomicUsize::new(0),
             reported: ReportedFrames::new(),
+            locality: Once::new(),
         }
+    }
+
+    pub(crate) fn install_locality(&self, locality: Locality) {
+        assert!(
+            !self.locality.is_completed(),
+            "user memory pool locality was installed more than once"
+        );
+        self.locality.call_once(|| locality);
+    }
+
+    /// The machine's memory locality. Panics before it is installed.
+    pub fn locality(&self) -> &Locality {
+        self.locality
+            .get()
+            .unwrap_or_else(|| panic!("user memory pool locality read before installation"))
     }
 
     pub fn initialize(&self, regions: &[(usize, usize)]) {
@@ -316,11 +338,19 @@ impl UserMemoryPool {
 /// balloon draws from — the kernel heap's exhaustion is fatal, so it is
 /// not something a host may ask the guest to give away.
 impl PhysFrameAllocator for UserMemoryPool {
+    /// The pool is one buddy over every node's memory until per-node pools
+    /// replace it, so it names one node.
+    fn node_count(&self) -> usize {
+        1
+    }
+
     fn allocate(
         &self,
+        node: NodeId,
         count: usize,
         zero_first_use: bool,
     ) -> Result<PhysFrameRange, FrameAllocError> {
+        assert_single_node(node);
         if count == 0 {
             return Err(FrameAllocError::OutOfFrames {
                 requested: 0,
@@ -346,6 +376,7 @@ impl PhysFrameAllocator for UserMemoryPool {
 
     fn free_runs<Visit, Visited>(
         &self,
+        node: NodeId,
         min_frames: usize,
         max_runs: usize,
         visit: Visit,
@@ -354,6 +385,7 @@ impl PhysFrameAllocator for UserMemoryPool {
         Visit: FnMut(PhysFrameRange) -> Visited + Send,
         Visited: Future<Output = ()> + Send,
     {
+        assert_single_node(node);
         visit_free_runs(
             &self.reported,
             min_frames,
@@ -382,7 +414,8 @@ impl PhysFrameAllocator for UserMemoryPool {
         self.deallocate_with_processor(ptr, frame_layout(range.frame_count), None);
     }
 
-    fn stats(&self) -> FrameAllocStats {
+    fn stats(&self, node: NodeId) -> FrameAllocStats {
+        assert_single_node(node);
         let heap = UserMemoryPool::stats(self);
         FrameAllocStats {
             total_frames: heap.total_bytes / PhysFrame::SIZE,
@@ -394,6 +427,16 @@ impl PhysFrameAllocator for UserMemoryPool {
             reported_frames: self.reported.count(),
         }
     }
+}
+
+/// The pool has one buddy until per-node pools land, so a node other
+/// than the first names memory it does not have.
+fn assert_single_node(node: NodeId) {
+    assert!(
+        node == NodeId::FIRST,
+        "user memory pool has no node {}: it pools one node",
+        node.index()
+    );
 }
 
 fn frame_layout(frames: usize) -> Layout {
@@ -472,6 +515,11 @@ pub(crate) fn installed_user_memory_pool() -> Option<&'static UserMemoryPool> {
 fn user_memory_pool() -> &'static UserMemoryPool {
     installed_user_memory_pool()
         .unwrap_or_else(|| panic!("user memory pool accessed before bootstrap installation"))
+}
+
+/// The machine's memory locality, installed with the user pool.
+pub fn locality() -> &'static Locality {
+    user_memory_pool().locality()
 }
 
 pub fn user_heap_stats() -> UserHeapStats {
@@ -817,15 +865,15 @@ mod tests {
     #[test]
     fn the_pool_hands_out_and_takes_back_contiguous_frames() {
         let pool = pool(8 * 1024 * 1024);
-        let free_before = PhysFrameAllocator::stats(&pool).free_frames();
+        let free_before = PhysFrameAllocator::stats(&pool, NodeId::FIRST).free_frames();
 
         let range = pool.allocate(64, false).expect("64 frames");
         assert_eq!(range.frame_count, 64);
-        assert!(PhysFrameAllocator::stats(&pool).free_frames() < free_before);
+        assert!(PhysFrameAllocator::stats(&pool, NodeId::FIRST).free_frames() < free_before);
 
         PhysFrameAllocator::deallocate(&pool, range);
         assert_eq!(
-            PhysFrameAllocator::stats(&pool).free_frames(),
+            PhysFrameAllocator::stats(&pool, NodeId::FIRST).free_frames(),
             free_before,
             "a returned run is free again"
         );
@@ -838,7 +886,7 @@ mod tests {
     #[test]
     fn a_pass_names_as_many_runs_as_the_pool_can_spare() {
         let pool = pool(64 * 1024 * 1024);
-        let free_before = PhysFrameAllocator::stats(&pool).free_frames();
+        let free_before = PhysFrameAllocator::stats(&pool, NodeId::FIRST).free_frames();
 
         let mut runs = 0usize;
         let named = block_on(pool.free_runs(512, 256, |run| {
@@ -853,11 +901,14 @@ mod tests {
             "a 64 MiB pool has more than {runs} spare 2 MiB runs"
         );
         assert_eq!(
-            PhysFrameAllocator::stats(&pool).free_frames(),
+            PhysFrameAllocator::stats(&pool, NodeId::FIRST).free_frames(),
             free_before,
             "a pass leaves the pool as it found it"
         );
-        assert_eq!(PhysFrameAllocator::stats(&pool).reported_frames, runs * 512);
+        assert_eq!(
+            PhysFrameAllocator::stats(&pool, NodeId::FIRST).reported_frames,
+            runs * 512
+        );
     }
 
     /// Reporting user memory to a host that may discard it means the
@@ -880,7 +931,7 @@ mod tests {
         );
         let reported = reported.expect("one run was reported");
         assert_eq!(
-            PhysFrameAllocator::stats(&pool).reported_frames,
+            PhysFrameAllocator::stats(&pool, NodeId::FIRST).reported_frames,
             reported.frame_count
         );
 
@@ -895,6 +946,9 @@ mod tests {
             0,
             "user memory the host may have discarded is zeroed on reuse"
         );
-        assert_eq!(PhysFrameAllocator::stats(&pool).reported_frames, 0);
+        assert_eq!(
+            PhysFrameAllocator::stats(&pool, NodeId::FIRST).reported_frames,
+            0
+        );
     }
 }

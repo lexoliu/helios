@@ -2,6 +2,9 @@ use core::ops::Range;
 
 use arrayvec::ArrayVec;
 
+use crate::memory::MemoryRegion;
+use crate::numa::{MemoryAffinity, NumaTopology};
+
 /// How many bootloader-owned ranges a machine may hold back from the
 /// usable memory map.
 pub const MAX_BOOT_RESERVED_RANGES: usize = 4;
@@ -162,6 +165,99 @@ pub fn usable_region_segments(
     segments
 }
 
+/// The usable pieces of `region`, reserved ranges removed and each piece
+/// split at node boundaries, as kernel-owned regions.
+///
+/// Panics naming the physical range when a usable byte lies in no
+/// affinity range: memory the kernel cannot place is memory it does not
+/// understand. (Linux tolerates <1 MiB uncovered and otherwise discards
+/// NUMA altogether; neither is a correct answer here.)
+///
+/// # Safety
+///
+/// Every usable byte of `region` that is not reserved is memory nothing
+/// else owns, it is reachable at its physical address plus
+/// `physical_memory_offset`, and it outlives the kernel.
+pub unsafe fn usable_node_regions<'n, Numa: NumaTopology>(
+    region: BootMemoryRegion,
+    reserved: &BootReservedRanges,
+    physical_memory_offset: usize,
+    numa: &'n Numa,
+) -> impl Iterator<Item = MemoryRegion> + use<'n, Numa> {
+    NodeRegions {
+        segments: usable_region_segments(region, reserved)
+            .into_iter()
+            .flatten(),
+        numa,
+        physical_memory_offset,
+        current: None,
+    }
+}
+
+/// The segment being split, the affinity ranges still to intersect with
+/// it, and how many of its bytes they have covered so far.
+struct SegmentCursor<'n, Numa: NumaTopology + 'n> {
+    segment: Range<u64>,
+    affinities: Numa::MemoryAffinities<'n>,
+    covered: u64,
+}
+
+struct NodeRegions<'n, Numa: NumaTopology + 'n> {
+    segments: core::iter::Flatten<
+        core::array::IntoIter<Option<Range<usize>>, MAX_USABLE_REGION_SEGMENTS>,
+    >,
+    numa: &'n Numa,
+    physical_memory_offset: usize,
+    current: Option<SegmentCursor<'n, Numa>>,
+}
+
+impl<'n, Numa: NumaTopology + 'n> Iterator for NodeRegions<'n, Numa> {
+    type Item = MemoryRegion;
+
+    fn next(&mut self) -> Option<MemoryRegion> {
+        loop {
+            let cursor = match &mut self.current {
+                Some(cursor) => cursor,
+                None => {
+                    let segment = self.segments.next()?;
+                    self.current.insert(SegmentCursor {
+                        segment: segment.start as u64..segment.end as u64,
+                        affinities: self.numa.memory_affinity(),
+                        covered: 0,
+                    })
+                }
+            };
+            let Some(MemoryAffinity { physical, node }) = cursor.affinities.next() else {
+                assert!(
+                    cursor.covered == cursor.segment.end - cursor.segment.start,
+                    "usable memory {:#x?} is only partly covered by the NUMA memory affinity \
+                     ({:#x} of {:#x} bytes)",
+                    cursor.segment,
+                    cursor.covered,
+                    cursor.segment.end - cursor.segment.start
+                );
+                self.current = None;
+                continue;
+            };
+            let start = physical.start.max(cursor.segment.start);
+            let end = physical.end.min(cursor.segment.end);
+            if start >= end {
+                continue;
+            }
+            cursor.covered += end - start;
+            let pointer = core::ptr::slice_from_raw_parts_mut(
+                (start as usize + self.physical_memory_offset) as *mut u8,
+                (end - start) as usize,
+            );
+            let span = core::ptr::NonNull::new(pointer)
+                .unwrap_or_else(|| panic!("usable memory piece {start:#x}..{end:#x} is null"));
+            // SAFETY: the caller of `usable_node_regions` promised every
+            // usable, unreserved byte, and this piece is one of them.
+            return Some(unsafe { MemoryRegion::new(span, node) });
+        }
+    }
+}
+
 fn subtract_reserved_range(
     segments: [Option<Range<usize>>; MAX_USABLE_REGION_SEGMENTS],
     reserved: &Range<usize>,
@@ -196,7 +292,12 @@ fn split_segment(segment: Range<usize>, reserved: &Range<usize>) -> [Option<Rang
 mod tests {
     use alloc::vec::Vec;
 
-    use super::{BootMemoryKind, BootMemoryRegion, BootReservedRanges, usable_region_segments};
+    use super::{
+        BootMemoryKind, BootMemoryRegion, BootReservedRanges, usable_node_regions,
+        usable_region_segments,
+    };
+    use crate::cpu::ProcessorId;
+    use crate::numa::{MemoryAffinity, NodeDistance, NodeId, NumaTopology};
     use core::ops::Range;
 
     #[test]
@@ -243,6 +344,80 @@ mod tests {
                 .collect::<Vec<_>>(),
             alloc::vec![0x1000..0x2000, 0x3000..0x6000, 0x7000..0x9000]
         );
+    }
+
+    struct TwoNodes;
+
+    impl NumaTopology for TwoNodes {
+        type MemoryAffinities<'a> = core::array::IntoIter<MemoryAffinity, 2>;
+
+        fn node_count(&self) -> usize {
+            2
+        }
+
+        fn processor_count(&self) -> usize {
+            2
+        }
+
+        fn processor_node(&self, processor: ProcessorId) -> NodeId {
+            NodeId::new(usize::from(processor.id()))
+        }
+
+        fn distance(&self, from: NodeId, to: NodeId) -> NodeDistance {
+            if from == to {
+                NodeDistance::LOCAL
+            } else {
+                NodeDistance::UNIFORM_REMOTE
+            }
+        }
+
+        fn memory_affinity(&self) -> Self::MemoryAffinities<'_> {
+            [
+                MemoryAffinity {
+                    physical: 0x1000..0x3000,
+                    node: NodeId::new(0),
+                },
+                MemoryAffinity {
+                    physical: 0x3000..0x6000,
+                    node: NodeId::new(1),
+                },
+            ]
+            .into_iter()
+        }
+    }
+
+    fn tagged(
+        region: BootMemoryRegion,
+        reserved: &BootReservedRanges,
+    ) -> Vec<(usize, usize, usize)> {
+        // SAFETY: the pieces are only inspected, never dereferenced.
+        unsafe { usable_node_regions(region, reserved, 0, &TwoNodes) }
+            .map(|piece| (piece.start(), piece.end(), piece.node().index()))
+            .collect()
+    }
+
+    #[test]
+    fn a_segment_crossing_a_node_boundary_splits_in_two() {
+        assert_eq!(
+            tagged(region(0x2000..0x5000), &BootReservedRanges::new()),
+            alloc::vec![(0x2000, 0x3000, 0), (0x3000, 0x5000, 1)]
+        );
+    }
+
+    #[test]
+    fn reserved_ranges_are_removed_before_tagging() {
+        let mut reserved = BootReservedRanges::new();
+        reserved.reserve(0x2800..0x3800);
+        assert_eq!(
+            tagged(region(0x1000..0x6000), &reserved),
+            alloc::vec![(0x1000, 0x2800, 0), (0x3800, 0x6000, 1)]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "0x5000..0x7000")]
+    fn a_byte_outside_every_affinity_range_panics_naming_the_range() {
+        tagged(region(0x5000..0x7000), &BootReservedRanges::new());
     }
 
     fn collect_segments(

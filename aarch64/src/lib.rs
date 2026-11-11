@@ -15,7 +15,7 @@ use arm_gic::IntId;
 use helios_hal::boot::{
     BootFirmwareTables, BootHandoff, BootKernelImage, BootMemoryKind, BootMemoryMap,
     BootMemoryRegion, BootModule, BootModules, BootReservedRanges, FirmwareKind,
-    usable_region_segments,
+    usable_node_regions,
 };
 use helios_hal::cpu::{
     Cpu, GUEST_STACK_LIMIT_OFFSET, HardwarePerfCounters, Instant, ProcessorId, Timebase,
@@ -23,7 +23,7 @@ use helios_hal::cpu::{
 };
 use helios_hal::critical_section::ProcessorIdentity;
 use helios_hal::entropy::{EntropyQuality, EntropyUnavailable};
-use helios_hal::memory::MemoryRegion;
+use helios_hal::numa::SingleNode;
 use helios_hal::serial::ByteSerial;
 use helios_hal::{
     DeviceInventory, DmaModel, Platform, ProcessorStartupPolicy, ProcessorTopology, align_up,
@@ -573,8 +573,16 @@ extern "C" fn aarch64_kernel_main() -> ! {
     DEBUG_SERIAL_BASE.store(debug_serial.base, Ordering::Release);
     let processor_count = aarch64_processor_count();
     let reserved_ranges = boot_reserved_ranges(&handoff);
-    let memory_regions = boot_memory_regions(&handoff, physical_memory_offset, &reserved_ranges);
-    helios_kernel::prime_bootstrap_allocator(memory_regions, processor_count);
+    // No firmware NUMA description is read yet: every processor and all
+    // of memory sit on one node.
+    let numa = SingleNode::new(processor_count);
+    let memory_regions = handoff.memory_map.regions().flat_map(|region| {
+        // SAFETY: Limine's usable entries are RAM nothing else owns,
+        // mapped in the higher-half direct map at `physical_memory_offset`,
+        // and the kernel image is reserved out.
+        unsafe { usable_node_regions(region, &reserved_ranges, physical_memory_offset, &numa) }
+    });
+    helios_kernel::prime_bootstrap_allocator(memory_regions, &numa);
     let payload = helios_kernel::BootPayload::from_boot_modules(&handoff.modules);
     // The rest of the description needs the heap: the ACPI path has to
     // interpret AML to reach a device's `_CRS`.
@@ -632,7 +640,7 @@ extern "C" fn aarch64_kernel_main() -> ! {
         devices = devices.with_block_devices(block_device_count);
     }
     let kernel = helios_kernel::init(
-        Platform::new(console, core::iter::empty::<MemoryRegion>(), cpu)
+        Platform::new(console, cpu)
             .with_topology(
                 ProcessorTopology::start_all_secondaries(
                     cpu.bootstrap_processor(),
@@ -1211,7 +1219,7 @@ unsafe extern "C" fn aarch64_secondary_main(mp_info: &MpInfo) -> ! {
         Some(DEBUG_SERIAL_WRITER),
     );
     let kernel = helios_kernel::init(
-        Platform::new(console, core::iter::empty::<MemoryRegion>(), cpu)
+        Platform::new(console, cpu)
             .with_timer_frequency_hz(cpu.timebase().frequency())
             .with_dma_model(DmaModel::Translated)
             .with_devices(DeviceInventory::new().with_debug_serial()),
@@ -2203,26 +2211,6 @@ fn boot_reserved_ranges(handoff: &LimineBootHandoff) -> BootReservedRanges {
     reserved.reserve(loaded_executable_start..loaded_executable_end);
     reserved.reserve(file_start..file_end);
     reserved
-}
-
-fn boot_memory_regions(
-    handoff: &LimineBootHandoff,
-    physical_memory_offset: usize,
-    reserved_ranges: &BootReservedRanges,
-) -> impl IntoIterator<Item = MemoryRegion> {
-    handoff.memory_map.regions().flat_map(move |region| {
-        usable_region_segments(region, reserved_ranges)
-            .into_iter()
-            .flatten()
-            .map(move |segment| {
-                let start = segment.start + physical_memory_offset;
-                let len = segment.end - segment.start;
-                let slice = core::ptr::slice_from_raw_parts_mut(start as *mut u8, len);
-                core::ptr::NonNull::new(slice).unwrap_or_else(|| {
-                    panic!("usable memory segment had a null start: {segment:?}")
-                })
-            })
-    })
 }
 
 #[cfg(target_os = "none")]

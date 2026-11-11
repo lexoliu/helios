@@ -10,8 +10,9 @@ what that division means for how many instances a guest can hold.
 The policy itself lives in one place, `kernel/src/memory/policy.rs`, and
 every backend reaches it through the same call. `riscv/`, `x86/`,
 `aarch64/` and `hosted/` each hand `helios_kernel::prime_bootstrap_allocator`
-the usable regions of their boot memory map and nothing else; no backend
-decides how much memory either domain gets.
+the usable regions of their boot memory map, each tagged with its NUMA
+node, and the platform's NUMA description; no backend decides how much
+memory either domain gets.
 
 ## The policy
 

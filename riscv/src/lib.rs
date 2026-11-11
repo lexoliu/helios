@@ -148,8 +148,10 @@ use helios_hal::cpu::{
     Cpu, GUEST_STACK_LIMIT_OFFSET, Instant, ProcessorId, Timebase, TimerInterrupt,
     current_processor,
 };
+use helios_hal::boot::{BootMemoryKind, BootMemoryRegion, BootReservedRanges, usable_node_regions};
 use helios_hal::critical_section::ProcessorIdentity;
 use helios_hal::memory::MemoryRegion;
+use helios_hal::numa::{NumaTopology, SingleNode};
 use helios_hal::serial::ByteSerial;
 use helios_hal::{DeviceInventory, DmaModel, ProcessorStartupPolicy, ProcessorTopology};
 use helios_kernel::{
@@ -653,7 +655,10 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
     // allocator is primed with below.
     let initrd = initrd_range(&fdt);
     let allocator_window = allocator_window();
-    let memory_regions = collect_memory_regions(&fdt, allocator_window.clone(), &initrd);
+    // No devicetree NUMA description is read yet: every hart and all of
+    // memory sit on one node.
+    let numa = SingleNode::new(hart_count);
+    let memory_regions = collect_memory_regions(&fdt, allocator_window.clone(), &initrd, &numa);
     let current_hart = ProcessorId::new(hart_id as u16);
     let bootstrap_processor = remember_bootstrap_hart(hart_id);
     mark_hart_online(current_hart);
@@ -666,8 +671,7 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
     // the identity map is owned by `RiscvUserAddressSpace`, which is
     // where the runtime's linear-memory reservations live.
     for region in &memory_regions {
-        let start = region.as_ptr().cast::<u8>() as usize;
-        let end = start + region.len();
+        let (start, end) = (region.start(), region.end());
         assert!(
             end <= vmm::KERNEL_IDENTITY_LIMIT,
             "firmware reports physical memory at {start:#x}..{end:#x}, past the {:#x} the Sv48 \
@@ -688,7 +692,7 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
         release_early_boot_harts();
     }
     if current_hart == bootstrap_processor {
-        helios_kernel::prime_bootstrap_allocator(memory_regions.iter().copied(), hart_count);
+        helios_kernel::prime_bootstrap_allocator(memory_regions.iter().copied(), &numa);
     }
 
     let debug_state = shared_debug_state(timebase, hart_count, initrd.clone());
@@ -739,12 +743,7 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
         tracing::info!("no virtio-snd node in the device tree; this machine has no sound device");
     }
     let kernel = helios_kernel::init_with_watchdog(
-        helios_kernel::Platform::with_watchdog(
-            console,
-            memory_regions.into_iter(),
-            cpu.clone(),
-            watchdog,
-        )
+        helios_kernel::Platform::with_watchdog(console, cpu.clone(), watchdog)
         .with_topology(
             ProcessorTopology::start_all_secondaries(bootstrap_processor, hart_count)
                 .with_startup_policy(ProcessorStartupPolicy::BootstrapOnly),
@@ -1001,12 +1000,15 @@ const MAX_MEMORY_REGIONS: usize = 16;
 
 /// Every `reg` range of every node whose `device_type` is `memory`, clipped
 /// to the allocator window with the initrd taken out.
-fn collect_memory_regions(
+fn collect_memory_regions<Numa: NumaTopology>(
     fdt: &Fdt<'_>,
     allocator_window: Range<usize>,
     initrd: &Range<usize>,
+    numa: &Numa,
 ) -> ArrayVec<MemoryRegion, MAX_MEMORY_REGIONS> {
     let mut regions = ArrayVec::new();
+    let mut reserved = BootReservedRanges::new();
+    reserved.reserve(initrd.clone());
 
     for region in fdt
         .all_nodes()
@@ -1028,9 +1030,15 @@ fn collect_memory_regions(
             start..end
         })
         .filter_map(|region| intersect(region, allocator_window.clone()))
-        .flat_map(|region| subtract(region, initrd))
-        .flatten()
-        .map(range_to_memory_region)
+        .map(|region| BootMemoryRegion {
+            start: region.start as u64,
+            end: region.end as u64,
+            kind: BootMemoryKind::Usable,
+        })
+        // SAFETY: the memory nodes are RAM nothing else owns, reachable at
+        // its physical address through the kernel identity map, and the
+        // initrd is reserved out.
+        .flat_map(|region| unsafe { usable_node_regions(region, &reserved, 0, numa) })
     {
         regions.try_push(region).unwrap_or_else(|_| {
             panic!("FDT described more memory regions than the kernel supports")
@@ -1040,30 +1048,11 @@ fn collect_memory_regions(
     regions
 }
 
-/// `region` with `reserved` taken out of it: up to two pieces, either of
-/// which may be empty. The riscv backend's only reservation is the
-/// initrd, a single contiguous range, so a region never splits further.
-fn subtract(region: Range<usize>, reserved: &Range<usize>) -> [Option<Range<usize>>; 2] {
-    if reserved.end <= region.start || reserved.start >= region.end {
-        return [Some(region), None];
-    }
-    let below = (reserved.start > region.start).then_some(region.start..reserved.start);
-    let above = (reserved.end < region.end).then_some(reserved.end..region.end);
-    [below, above]
-}
-
 fn intersect(left: Range<usize>, right: Range<usize>) -> Option<Range<usize>> {
     let start = left.start.max(right.start);
     let end = left.end.min(right.end);
 
     (start < end).then_some(start..end)
-}
-
-fn range_to_memory_region(range: Range<usize>) -> MemoryRegion {
-    let len = range.end - range.start;
-    let slice = core::ptr::slice_from_raw_parts_mut(range.start as *mut u8, len);
-
-    unsafe { MemoryRegion::new_unchecked(slice) }
 }
 
 use helios_hal::align_up;
