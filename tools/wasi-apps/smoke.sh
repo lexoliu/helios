@@ -457,4 +457,40 @@ if [[ "${HELIOS_WASI_SMOKE_CURL:-0}" == "1" ]]; then
         shell \
         -c \
         'curl http://detectportal.firefox.com/success.txt'
+
+    # The same fetch through the http-client plugin's TLS transport: the
+    # handshake, the chain against the compiled-in roots, and the validity
+    # window against the RTC-seeded wall clock.
+    run_smoke \
+        curl-https \
+        'success' \
+        -- \
+        --boot-program dash \
+        --boot-program debugger \
+        --boot-program curl \
+        --boot-program http-client \
+        --no-compiler-plugin \
+        shell \
+        -c \
+        'curl https://detectportal.firefox.com/success.txt'
+
+    # A failed verification must surface as `tls-certificate-error`. The
+    # inspector exits non-zero when the guest command does, and `run_smoke`
+    # treats that as a failed smoke, so the guest shell swallows curl's
+    # status and the check is on curl's own error text (`ErrorCode`'s
+    # `Display` is its variant name).
+    for host in expired wrong.host self-signed; do
+        run_smoke \
+            "curl-https-${host}" \
+            'TlsCertificateError' \
+            -- \
+            --boot-program dash \
+            --boot-program debugger \
+            --boot-program curl \
+            --boot-program http-client \
+            --no-compiler-plugin \
+            shell \
+            -c \
+            "curl https://${host}.badssl.com/ 2>&1 || true"
+    done
 fi

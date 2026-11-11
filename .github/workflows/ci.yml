@@ -295,6 +295,29 @@ jobs:
             shell -c 'curl http://detectportal.firefox.com/success.txt' 2>&1 > curl-smoke.out | tee "$runtime/inspector.log"
           cat curl-smoke.out
           grep -Fqx success curl-smoke.out
+      - name: Fetch over TLS with curl
+        shell: bash
+        working-directory: helios
+        env:
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+        run: |
+          # Without this the step reports tee's status, not the
+          # command's, and a runner script that fails is invisible.
+          set -o pipefail
+          # The same fetch through the plugin's TLS transport: the
+          # handshake, the certificate chain against the compiled-in
+          # roots, and the validity window against the wall clock the
+          # platform RTC seeded.
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/curl-https"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch riscv64 --release --memory 2G \
+            --accel tcg \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger \
+            --boot-program curl --boot-program http-client --no-compiler-plugin \
+            shell -c 'curl https://detectportal.firefox.com/success.txt' 2>&1 > curl-https-smoke.out | tee "$runtime/inspector.log"
+          cat curl-https-smoke.out
+          grep -Fqx success curl-https-smoke.out
       - name: Upload the inspector runtime directories
         if: failure()
         uses: actions/upload-artifact@v4
@@ -924,6 +947,25 @@ jobs:
             2>&1 > curl-smoke.out | tee "$runtime/inspector.log"
           cat curl-smoke.out
           grep -Fqx success curl-smoke.out
+      - name: Fetch over TLS with curl
+        shell: bash
+        working-directory: helios
+        run: |
+          # Without this the step reports tee's status, not the
+          # command's, and a runner script that fails is invisible.
+          set -o pipefail
+          # The counterpart of smoke-riscv64's TLS step, under KVM.
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/curl-https"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+            --accel kvm \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger \
+            --boot-program curl --boot-program http-client --no-compiler-plugin \
+            shell -c 'curl https://detectportal.firefox.com/success.txt' \
+            2>&1 > curl-https-smoke.out | tee "$runtime/inspector.log"
+          cat curl-https-smoke.out
+          grep -Fqx success curl-https-smoke.out
       - name: Draw on the display and capture the scanout
         shell: bash
         working-directory: helios
