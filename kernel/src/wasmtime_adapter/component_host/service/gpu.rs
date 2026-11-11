@@ -1106,8 +1106,13 @@ pub(crate) mod test_store {
             UnsupportedHostFileSystem,
         > = crate::RuntimeState::new(cpu.timebase(), 1, 0, crate::BootPayload::for_tests());
         runtime_state.install_root_entropy(Arc::new(
-            crate::RootEntropy::from_platform(&cpu, None, None)
-                .expect("the fixture CPU has an entropy source"),
+            crate::RootEntropy::from_platform(
+                &cpu,
+                None,
+                None,
+                crate::MachineGeneration::new(None),
+            )
+            .expect("the fixture CPU has an entropy source"),
         ));
         runtime_state.install_gpu3d_service(service.clone());
         let executor = Executor::new(ProgressCounter::new(), 1, ProcessorId::new(0));

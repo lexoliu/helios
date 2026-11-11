@@ -654,23 +654,26 @@ where
     }
 
     pub(crate) fn fill_secure_random(&mut self, buffer: &mut [u8]) {
-        self.entropy.fill_secure(buffer);
+        self.entropy
+            .fill_secure(self.runtime_state.root_entropy(), buffer);
     }
 
     pub(crate) fn secure_random_u64(&mut self) -> u64 {
-        self.entropy.secure_u64()
+        self.entropy.secure_u64(self.runtime_state.root_entropy())
     }
 
     pub(crate) fn insecure_random_bytes(&mut self, len: usize) -> Vec<u8> {
-        self.entropy.insecure_bytes(len)
+        self.entropy
+            .insecure_bytes(self.runtime_state.root_entropy(), len)
     }
 
     pub(crate) fn insecure_random_u64(&mut self) -> u64 {
-        self.entropy.insecure_u64()
+        self.entropy.insecure_u64(self.runtime_state.root_entropy())
     }
 
     pub(crate) fn insecure_seed(&mut self) -> (u64, u64) {
-        self.entropy.insecure_seed()
+        self.entropy
+            .insecure_seed(self.runtime_state.root_entropy())
     }
 
     /// Deliver an owned stdout/stderr chunk from a synchronous poll

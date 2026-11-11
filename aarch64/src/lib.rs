@@ -651,10 +651,15 @@ extern "C" fn aarch64_kernel_main() -> ! {
     // the bootloader left behind, and a read of the entropy device.
     // None is a fallback for another. This follows `init` so the source
     // line reaches the log the kernel just installed.
+    // No VM generation ID window is discovered on this platform yet, so
+    // the machine generation moves only through `advance`.
+    let machine_generation = helios_kernel::MachineGeneration::new(None);
+    debug_state.install_machine_generation(machine_generation.clone());
     let root_entropy = helios_kernel::seed_root_entropy(
         &cpu,
         platform.boot_entropy_seed,
         entropy_device.as_ref().map(|entropy| &entropy.device),
+        machine_generation,
     );
     debug_state.install_root_entropy(root_entropy.clone());
     // The calendar is read once, here, before any component can ask
