@@ -1,6 +1,6 @@
 [toolchain]
 channel = "nightly-2026-06-15"
-components = ["rust-src", "clippy", "rustfmt"]
+components = ["rust-src", "clippy", "rustfmt", "llvm-tools"]
 targets = [
     "aarch64-unknown-none",
     "riscv64gc-unknown-none-elf",
