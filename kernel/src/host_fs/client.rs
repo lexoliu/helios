@@ -2610,7 +2610,7 @@ mod tests {
 
         let log = transport.log();
         let target = log.walk_requests[0].1;
-        assert_eq!(log.walk_requests.len(), 2);
+        assert_eq!(log.walks, 2, "the refused Twalk was the second one sent");
         assert_eq!(
             log.clunked,
             [target],
