@@ -763,3 +763,31 @@ fn an_append_resolves_with_the_end_of_file_it_reached() {
     assert_eq!(end, contents.len() as u64);
     assert_eq!(contents, "abc日本語한국어".as_bytes());
 }
+
+#[test]
+fn a_directory_holding_a_mount_point_is_busy() {
+    let namespace = namespace();
+    for directory in ["a", "a/b"] {
+        block_on(create_directory_at(&namespace, &root(), directory, 1)).expect("creates");
+    }
+    mount_memory(&namespace, "/a/b");
+
+    for (source, path) in [("the holder", "a"), ("the mount point", "a/b")] {
+        assert!(
+            matches!(
+                block_on(remove_directory_at(&namespace, &root(), path)),
+                Err(fs_types::ErrorCode::Busy)
+            ),
+            "removing {source} must be refused as busy"
+        );
+        assert!(
+            matches!(
+                block_on(rename_at(&namespace, &root(), path, &root(), "z", 1)),
+                Err(fs_types::ErrorCode::Busy)
+            ),
+            "renaming {source} must be refused as busy"
+        );
+    }
+    let mounted = block_on(stat_path(&namespace, "/a/b", Follow::No)).expect("still mounted");
+    assert_eq!(mounted.kind, NodeKind::Directory);
+}

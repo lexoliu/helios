@@ -89,6 +89,7 @@ pub(crate) fn fs_error_code(error: VfsError) -> fs_types::ErrorCode {
         VfsError::ReadOnly => fs_types::ErrorCode::ReadOnly,
         VfsError::NotPermitted => fs_types::ErrorCode::NotPermitted,
         VfsError::CrossDevice => fs_types::ErrorCode::CrossDevice,
+        VfsError::Busy => fs_types::ErrorCode::Busy,
         VfsError::Loop => fs_types::ErrorCode::Loop,
         VfsError::Invalid => fs_types::ErrorCode::Invalid,
         VfsError::Overflow => fs_types::ErrorCode::Overflow,
@@ -539,14 +540,8 @@ where
 {
     require_mutate_directory(base)?;
     let absolute = child_below(base, path)?;
-    let resolved = resolve(namespace, &absolute)?;
-    if resolved.is_mount_root() {
-        return Err(fs_types::ErrorCode::Busy);
-    }
-    resolved
-        .writable()
-        .map_err(fs_error_code)?
-        .remove_directory(resolved.path())
+    namespace
+        .remove_directory(&absolute)
         .await
         .map_err(fs_error_code)
 }

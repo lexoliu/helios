@@ -118,6 +118,10 @@ pub enum FsError {
     NotPermitted,
     #[error("link or rename across filesystems")]
     CrossDevice,
+    /// The object is in use in a way that forbids the change: a mount
+    /// point, a directory holding one, or a mount something still holds.
+    #[error("resource busy")]
+    Busy,
     #[error("too many levels of symbolic links")]
     Loop,
     #[error("invalid argument")]

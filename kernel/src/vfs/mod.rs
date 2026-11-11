@@ -446,6 +446,14 @@ impl<H: Clone> MountTable<H> {
         best
     }
 
+    /// Whether a mount point lies strictly below `directory`.
+    fn points_below(&self, directory: &str) -> bool {
+        self.inner.slots.iter().any(|slot| {
+            slot.read(|mount| mount.point != directory && within_directory(directory, &mount.point))
+                == Some(true)
+        })
+    }
+
     /// Names of the mount points directly inside the directory
     /// `directory`.
     fn points_inside(&self, directory: &str) -> Vec<String> {
@@ -729,15 +737,36 @@ impl<H: HostFileSystem> Namespace<H> {
         Ok(entries)
     }
 
-    /// Renames within one mount; across two, [`FsError::CrossDevice`].
+    /// Whether a mount point lies strictly below `absolute`.
+    fn holds_mounts(&self, absolute: &str) -> bool {
+        self.table.points_below(absolute)
+    }
+
+    /// Removes the empty directory `absolute`. A mount point, or a
+    /// directory with a mount point below it, is in use:
+    /// [`FsError::Busy`].
+    pub async fn remove_directory(&self, absolute: &str) -> FsResult<()> {
+        let resolved = self.resolve(absolute)?;
+        if resolved.is_mount_root() || self.holds_mounts(absolute) {
+            return Err(FsError::Busy);
+        }
+        resolved.writable()?.remove_directory(resolved.path()).await
+    }
+
+    /// Renames within one mount; across two, [`FsError::CrossDevice`]. A
+    /// directory with a mount point below it stays where it is:
+    /// [`FsError::Busy`].
     pub async fn rename(&self, source: &str, destination: &str, now: u64) -> FsResult<()> {
+        if self.holds_mounts(source) {
+            return Err(FsError::Busy);
+        }
         let source = self.resolve(source)?;
         let destination = self.resolve(destination)?;
+        if source.is_mount_root() || destination.is_mount_root() {
+            return Err(FsError::Busy);
+        }
         if !source.same_mount(&destination) {
             return Err(FsError::CrossDevice);
-        }
-        if source.is_mount_root() || destination.is_mount_root() {
-            return Err(FsError::NotPermitted);
         }
         source
             .writable()?
