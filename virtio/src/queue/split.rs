@@ -12,7 +12,9 @@ use core::sync::atomic::{Ordering, fence};
 
 use alloc::boxed::Box;
 
-use crate::bus::{DeviceBus, DmaBuffer, DmaPool};
+use helios_hal::dma::{DmaBuffer, DmaMemory};
+
+use crate::bus::DeviceBus;
 use crate::features::NegotiatedFeatures;
 use crate::transport::VirtioTransport;
 
@@ -187,9 +189,9 @@ impl<T: VirtioTransport> SplitRing<T> {
         transport.set_queue(
             index,
             self.core.size,
-            self.descriptors.phys_addr(),
-            self.driver_area.phys_addr(),
-            self.device_area.phys_addr(),
+            self.descriptors.device_address().get(),
+            self.driver_area.device_address().get(),
+            self.device_area.device_address().get(),
         );
     }
 

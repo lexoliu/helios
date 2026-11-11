@@ -27,7 +27,9 @@ use alloc::boxed::Box;
 use helios_hal::io::{IoError, IoResult};
 use helios_hal::iommu::PhysicalRange;
 
-use crate::bus::{DeviceBus, DmaBuffer, DmaPool};
+use helios_hal::dma::{DmaBuffer, DmaError, DmaMemory};
+
+use crate::bus::DeviceBus;
 use crate::features::NegotiatedFeatures;
 use crate::transport::VirtioTransport;
 
@@ -36,7 +38,7 @@ use split::SplitRing;
 
 /// The DMA buffer type a transport's bus hands out.
 pub(crate) type TransportBuffer<T> =
-    <<<T as VirtioTransport>::Bus as DeviceBus>::DmaPool as DmaPool>::Buffer;
+    <<<T as VirtioTransport>::Bus as DeviceBus>::DmaPool as DmaMemory>::Buffer;
 
 /// Both ring layouts use 16-byte descriptors, so one indirect table
 /// stride covers both.
@@ -306,7 +308,7 @@ impl<B: DmaBuffer> IndirectTables<B> {
     }
 
     fn table_addr(&self, id: u16) -> u64 {
-        self.memory.phys_addr() + (usize::from(id) * self.stride) as u64
+        self.memory.device_address().get() + (usize::from(id) * self.stride) as u64
     }
 
     fn entries(&self) -> usize {
@@ -354,7 +356,7 @@ impl<B: DmaBuffer> RingCore<B> {
         features: NegotiatedFeatures,
     ) -> Result<Self, VirtqueueError>
     where
-        P: DmaPool<Buffer = B>,
+        P: DmaMemory<Buffer = B>,
     {
         let chain_limit = usize::from(chain_limit);
         let indirect = if features.indirect() && chain_limit >= INDIRECT_MIN_CHAIN {
@@ -1095,7 +1097,7 @@ fn build_chain<T: VirtioTransport>(
 }
 
 /// One read-only descriptor over memory the driver never mapped.
-fn foreign_entry<P: DmaPool>(
+fn foreign_entry<P: DmaMemory>(
     dma: &P,
     payload: PhysicalRange,
 ) -> Result<ChainEntry, VirtqueueError> {
@@ -1108,7 +1110,7 @@ fn foreign_entry<P: DmaPool>(
     })?;
     Ok(ChainEntry {
         addr: dma
-            .device_range(payload.start, payload.bytes)
+            .foreign_range(payload.start, payload.bytes)
             .map_err(|_| VirtqueueError::Unreachable {
                 address: payload.start as usize,
                 bytes: len as usize,
@@ -1118,17 +1120,24 @@ fn foreign_entry<P: DmaPool>(
     })
 }
 
-fn entry<P: DmaPool>(dma: &P, buffer: &[u8], writable: bool) -> Result<ChainEntry, VirtqueueError> {
+fn entry<P: DmaMemory>(
+    dma: &P,
+    buffer: &[u8],
+    writable: bool,
+) -> Result<ChainEntry, VirtqueueError> {
     if buffer.is_empty() {
         return Err(VirtqueueError::EmptyChain);
     }
     Ok(ChainEntry {
         addr: dma
-            .dma_range(buffer)
-            .map_err(|refused| VirtqueueError::Unreachable {
-                address: refused.address,
-                bytes: refused.bytes,
-            })?,
+            .device_range(buffer)
+            .map_err(
+                |DmaError::Unreachable { address, bytes }| VirtqueueError::Unreachable {
+                    address,
+                    bytes,
+                },
+            )?
+            .get(),
         len: u32::try_from(buffer.len()).map_err(|_| VirtqueueError::ChainTooLong {
             actual: buffer.len(),
             limit: u32::MAX as usize,

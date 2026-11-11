@@ -2,12 +2,13 @@ use alloc::alloc::{alloc_zeroed, dealloc};
 use core::alloc::Layout;
 use core::ptr::NonNull;
 
+use helios_hal::dma::{DeviceAddress, DmaAddressing, DmaBuffer, DmaError, DmaMemory};
 use helios_hal::io::{IoError, IoResult};
 use helios_hal::iommu::DmaTranslation;
 use helios_hal::mmio;
 
 pub trait DeviceBus: Send + Sync + 'static {
-    type DmaPool: DmaPool;
+    type DmaPool: DmaMemory;
 
     fn read_u8(&self, offset: usize) -> u8 {
         let word_offset = offset & !0x3;
@@ -34,83 +35,6 @@ pub trait DeviceBus: Send + Sync + 'static {
     fn write_u8(&self, offset: usize, value: u8);
     fn write_u32(&self, offset: usize, value: u32);
     fn dma(&self) -> &Self::DmaPool;
-}
-
-/// What kind of address a [`DmaPool`] hands to a device.
-///
-/// This is what decides whether a driver has to negotiate
-/// VIRTIO_F_ACCESS_PLATFORM: a device that is given platform addresses
-/// must be told so, or it would read the descriptor rings as physical
-/// addresses and translate nothing.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DmaAddressing {
-    /// The device sees physical addresses.
-    Physical,
-    /// The device sees addresses the platform translates on its behalf.
-    Platform,
-}
-
-/// A range of memory a device cannot reach.
-///
-/// Names the buffer that was refused, so a driver bug that submits memory
-/// outside the device's windows is reported with the address instead of as
-/// a generic device fault.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("{bytes} bytes at {address:#x} are not reachable by the device")]
-pub struct DmaUnreachable {
-    /// The host address of the first byte of the refused buffer, or the
-    /// physical address of a run named by one.
-    pub address: usize,
-    pub bytes: usize,
-}
-
-impl From<DmaUnreachable> for IoError {
-    fn from(_: DmaUnreachable) -> Self {
-        Self::DeviceFault
-    }
-}
-
-pub trait DmaPool: Send + Sync + 'static {
-    type Buffer: DmaBuffer;
-
-    fn allocate_zeroed(&self, layout: Layout) -> IoResult<Self::Buffer>;
-
-    /// The address a device has to issue to reach `buffer`.
-    ///
-    /// The whole slice has to be device-reachable and contiguous in the
-    /// device's address space: a buffer that starts inside what the device
-    /// can reach and runs past its end is refused, not translated by its
-    /// first byte.
-    fn dma_range(&self, buffer: &[u8]) -> Result<u64, DmaUnreachable>;
-
-    /// The address a device has to issue to reach `bytes` of physical
-    /// memory at `physical`, which this pool did not allocate.
-    ///
-    /// [`DmaPool::dma_addr`] answers for a buffer the driver holds a
-    /// pointer to, which is a buffer in whatever mapping the driver
-    /// allocates out of. This one answers for memory that is somebody
-    /// else's and is named by its physical address alone — a guest's
-    /// own pinned pages, handed to the device by address instead of
-    /// copied — and it is the only way such a run reaches a descriptor.
-    /// A pool whose device sees physical addresses answers with the
-    /// address it was given; one behind a translation answers with the
-    /// address inside the device's domain, and refuses a run the domain
-    /// does not map contiguously rather than handing over one the
-    /// device would read the wrong half of.
-    fn device_range(&self, physical: u64, bytes: u64) -> IoResult<u64>;
-
-    /// What kind of address this pool hands out.
-    fn addressing(&self) -> DmaAddressing;
-}
-
-pub trait DmaBuffer: Send + Sync + 'static {
-    fn phys_addr(&self) -> u64;
-    fn as_ptr(&self) -> *mut u8;
-    fn len(&self) -> usize;
-
-    fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -202,7 +126,7 @@ impl<P> MmioBus<P> {
     }
 }
 
-impl DmaPool for IdentityDmaPool {
+impl DmaMemory for IdentityDmaPool {
     type Buffer = IdentityDmaBuffer;
 
     fn allocate_zeroed(&self, layout: Layout) -> IoResult<Self::Buffer> {
@@ -211,13 +135,13 @@ impl DmaPool for IdentityDmaPool {
         Ok(IdentityDmaBuffer { ptr, layout })
     }
 
-    fn dma_range(&self, buffer: &[u8]) -> Result<u64, DmaUnreachable> {
-        Ok(buffer.as_ptr() as usize as u64)
+    fn device_range(&self, bytes: &[u8]) -> Result<DeviceAddress, DmaError> {
+        Ok(DeviceAddress::new(bytes.as_ptr() as usize as u64))
     }
 
     /// Physical addresses and host addresses are the same thing in this
     /// pool, so a run of somebody else's memory is reached where it is.
-    fn device_range(&self, physical: u64, _bytes: u64) -> IoResult<u64> {
+    fn foreign_range(&self, physical: u64, _bytes: u64) -> IoResult<u64> {
         Ok(physical)
     }
 
@@ -226,7 +150,7 @@ impl DmaPool for IdentityDmaPool {
     }
 }
 
-impl DmaPool for OffsetDmaPool {
+impl DmaMemory for OffsetDmaPool {
     type Buffer = OffsetDmaBuffer;
 
     fn allocate_zeroed(&self, layout: Layout) -> IoResult<Self::Buffer> {
@@ -244,17 +168,19 @@ impl DmaPool for OffsetDmaPool {
     /// already the address it has to issue. The offset this pool holds
     /// turns a kernel pointer into a physical address and has nothing
     /// to say about memory that arrived as one.
-    fn device_range(&self, physical: u64, _bytes: u64) -> IoResult<u64> {
+    fn foreign_range(&self, physical: u64, _bytes: u64) -> IoResult<u64> {
         Ok(physical)
     }
 
     /// The offset is linear, so a buffer is contiguous in physical memory
     /// exactly when it is in the kernel's address space.
-    fn dma_range(&self, buffer: &[u8]) -> Result<u64, DmaUnreachable> {
-        self.translate(buffer.as_ptr()).map_err(|_| DmaUnreachable {
-            address: buffer.as_ptr() as usize,
-            bytes: buffer.len(),
-        })
+    fn device_range(&self, bytes: &[u8]) -> Result<DeviceAddress, DmaError> {
+        self.translate(bytes.as_ptr())
+            .map(DeviceAddress::new)
+            .map_err(|_| DmaError::Unreachable {
+                address: bytes.as_ptr() as usize,
+                bytes: bytes.len(),
+            })
     }
 
     fn addressing(&self) -> DmaAddressing {
@@ -284,7 +210,7 @@ pub struct PlatformDmaPool<P> {
 /// device has to issue rather than its physical address.
 pub struct PlatformDmaBuffer<B> {
     inner: B,
-    device_address: u64,
+    device_address: DeviceAddress,
 }
 
 impl<P> PlatformDmaPool<P> {
@@ -309,33 +235,36 @@ impl<P: Clone> Clone for PlatformDmaPool<P> {
 
 impl<P: Copy> Copy for PlatformDmaPool<P> {}
 
-impl<P: DmaPool> DmaPool for PlatformDmaPool<P> {
+impl<P: DmaMemory> DmaMemory for PlatformDmaPool<P> {
     type Buffer = PlatformDmaBuffer<P::Buffer>;
 
     fn allocate_zeroed(&self, layout: Layout) -> IoResult<Self::Buffer> {
         let inner = self.inner.allocate_zeroed(layout)?;
         let bytes = u64::try_from(inner.len()).map_err(|_| IoError::OutOfBounds)?;
-        let device_address = self.translation.device_range(inner.phys_addr(), bytes)?;
+        let device_address = self
+            .translation
+            .device_range(inner.device_address().get(), bytes)?;
         Ok(PlatformDmaBuffer {
             inner,
-            device_address,
+            device_address: DeviceAddress::new(device_address),
         })
     }
 
     /// The whole slice has to sit inside one window of the translation.
-    fn dma_range(&self, buffer: &[u8]) -> Result<u64, DmaUnreachable> {
-        let unreachable = DmaUnreachable {
-            address: buffer.as_ptr() as usize,
-            bytes: buffer.len(),
+    fn device_range(&self, bytes: &[u8]) -> Result<DeviceAddress, DmaError> {
+        let unreachable = DmaError::Unreachable {
+            address: bytes.as_ptr() as usize,
+            bytes: bytes.len(),
         };
-        let physical = self.inner.dma_range(buffer)?;
-        let bytes = u64::try_from(buffer.len()).map_err(|_| unreachable)?;
+        let physical = self.inner.device_range(bytes)?.get();
+        let length = u64::try_from(bytes.len()).map_err(|_| unreachable)?;
         self.translation
-            .device_range(physical, bytes)
+            .device_range(physical, length)
+            .map(DeviceAddress::new)
             .map_err(|_| unreachable)
     }
 
-    fn device_range(&self, physical: u64, bytes: u64) -> IoResult<u64> {
+    fn foreign_range(&self, physical: u64, bytes: u64) -> IoResult<u64> {
         Ok(self.translation.device_range(physical, bytes)?)
     }
 
@@ -349,7 +278,7 @@ impl<P: DmaPool> DmaPool for PlatformDmaPool<P> {
 }
 
 impl<B: DmaBuffer> DmaBuffer for PlatformDmaBuffer<B> {
-    fn phys_addr(&self) -> u64 {
+    fn device_address(&self) -> DeviceAddress {
         self.device_address
     }
 
@@ -363,8 +292,8 @@ impl<B: DmaBuffer> DmaBuffer for PlatformDmaBuffer<B> {
 }
 
 impl DmaBuffer for IdentityDmaBuffer {
-    fn phys_addr(&self) -> u64 {
-        self.ptr.as_ptr() as usize as u64
+    fn device_address(&self) -> DeviceAddress {
+        DeviceAddress::new(self.ptr.as_ptr() as usize as u64)
     }
 
     fn as_ptr(&self) -> *mut u8 {
@@ -377,8 +306,8 @@ impl DmaBuffer for IdentityDmaBuffer {
 }
 
 impl DmaBuffer for OffsetDmaBuffer {
-    fn phys_addr(&self) -> u64 {
-        self.physical_address
+    fn device_address(&self) -> DeviceAddress {
+        DeviceAddress::new(self.physical_address)
     }
 
     fn as_ptr(&self) -> *mut u8 {
@@ -406,7 +335,7 @@ impl Drop for OffsetDmaBuffer {
     }
 }
 
-impl<P: DmaPool> DeviceBus for MmioBus<P> {
+impl<P: DmaMemory> DeviceBus for MmioBus<P> {
     type DmaPool = P;
 
     fn read_u8(&self, offset: usize) -> u8 {
@@ -450,12 +379,11 @@ unsafe impl<P: Sync> Sync for MmioBus<P> {}
 mod tests {
     use core::alloc::Layout;
 
+    use helios_hal::dma::{DeviceAddress, DmaAddressing, DmaBuffer, DmaError, DmaMemory};
     use helios_hal::io::IoError;
     use helios_hal::iommu::{DmaTranslation, DmaWindow, IoVirtAddr};
 
-    use super::{
-        DmaAddressing, DmaBuffer, DmaPool, DmaUnreachable, IdentityDmaPool, PlatformDmaPool,
-    };
+    use super::{IdentityDmaPool, PlatformDmaPool};
 
     /// A platform with no translation unit hands the device physical
     /// addresses and must not ask it to negotiate anything.
@@ -466,11 +394,14 @@ mod tests {
         let buffer = pool.allocate_zeroed(layout).expect("allocation succeeds");
 
         assert_eq!(pool.addressing(), DmaAddressing::Physical);
-        assert_eq!(buffer.phys_addr(), buffer.as_ptr() as usize as u64);
         assert_eq!(
-            pool.dma_range(buffer_bytes(&buffer, 0, 256))
+            buffer.device_address(),
+            DeviceAddress::new(buffer.as_ptr() as usize as u64)
+        );
+        assert_eq!(
+            pool.device_range(buffer_bytes(&buffer, 0, 256))
                 .expect("translation"),
-            buffer.as_ptr() as usize as u64
+            DeviceAddress::new(buffer.as_ptr() as usize as u64)
         );
     }
 
@@ -488,7 +419,7 @@ mod tests {
         let reference = IdentityDmaPool
             .allocate_zeroed(layout)
             .expect("allocation succeeds");
-        let physical = reference.phys_addr();
+        let physical = reference.device_address().get();
         let translation = DmaTranslation::confined()
             .with_window(DmaWindow {
                 physical_start: physical,
@@ -500,19 +431,19 @@ mod tests {
 
         assert_eq!(pool.addressing(), DmaAddressing::Platform);
         assert_eq!(
-            pool.dma_range(buffer_bytes(&reference, 0, 16))
+            pool.device_range(buffer_bytes(&reference, 0, 16))
                 .expect("translation"),
-            0x10_0000_0000
+            DeviceAddress::new(0x10_0000_0000)
         );
         assert_eq!(
-            pool.dma_range(buffer_bytes(&reference, 0x40, 16))
+            pool.device_range(buffer_bytes(&reference, 0x40, 16))
                 .expect("translation"),
-            0x10_0000_0040
+            DeviceAddress::new(0x10_0000_0040)
         );
         assert_eq!(
-            pool.dma_range(buffer_bytes(&reference, 0, 4096))
+            pool.device_range(buffer_bytes(&reference, 0, 4096))
                 .expect("a slice that fills the window translates"),
-            0x10_0000_0000
+            DeviceAddress::new(0x10_0000_0000)
         );
     }
 
@@ -526,7 +457,7 @@ mod tests {
             .expect("allocation succeeds");
         let translation = DmaTranslation::confined()
             .with_window(DmaWindow {
-                physical_start: reference.phys_addr(),
+                physical_start: reference.device_address().get(),
                 bytes: 4096,
                 iova_start: IoVirtAddr::new(0x10_0000_0000),
             })
@@ -535,8 +466,8 @@ mod tests {
 
         let straddling = buffer_bytes(&reference, 4096 - 16, 32);
         assert_eq!(
-            pool.dma_range(straddling),
-            Err(DmaUnreachable {
+            pool.device_range(straddling),
+            Err(DmaError::Unreachable {
                 address: straddling.as_ptr() as usize,
                 bytes: 32,
             })

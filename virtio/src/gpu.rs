@@ -61,7 +61,9 @@ use helios_hal::io::{IoError, IoResult};
 use helios_hal::iommu::PhysicalRange;
 use helios_hal::pmm::PhysFrameRange;
 
-use crate::bus::{DeviceBus, DmaAddressing, DmaPool};
+use helios_hal::dma::{DmaAddressing, DmaMemory};
+
+use crate::bus::DeviceBus;
 use crate::features::{NegotiatedFeatures, RING_FEATURES, negotiate_with};
 use crate::inflight::{InFlight, await_completion, submit_chain, submit_chain_with_payload};
 use crate::notify::Notify;

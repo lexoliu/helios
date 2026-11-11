@@ -15,10 +15,11 @@ use core::cell::UnsafeCell;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+use helios_hal::dma::{DeviceAddress, DmaAddressing, DmaBuffer, DmaError, DmaMemory};
 use helios_hal::io::{IoError, IoResult};
 use spin::Mutex;
 
-use crate::bus::{DeviceBus, DmaAddressing, DmaBuffer, DmaPool, DmaUnreachable, IdentityDmaPool};
+use crate::bus::{DeviceBus, IdentityDmaPool};
 use crate::transport::{DeviceStatus, DeviceType, InterruptStatus, VirtioTransport};
 
 const REG_MAGIC_VALUE: usize = 0x000;
@@ -129,7 +130,7 @@ impl<P> HeapBus<P> {
     }
 }
 
-impl<P: DmaPool> DeviceBus for HeapBus<P> {
+impl<P: DmaMemory> DeviceBus for HeapBus<P> {
     fn read_u16(&self, offset: usize) -> u16 {
         let word = self.read_u32(offset & !0x3);
         (word >> ((offset & 0x3) * 8)) as u16
@@ -263,7 +264,7 @@ impl FakeTransport {
     }
 }
 
-impl<P: DmaPool> FakeTransport<P> {
+impl<P: DmaMemory> FakeTransport<P> {
     /// A transport whose driver publishes addresses from `dma`.
     ///
     /// This is what a test uses to put a device behind a platform
@@ -408,7 +409,7 @@ impl<P: DmaPool> FakeTransport<P> {
     }
 }
 
-impl<P: DmaPool> VirtioTransport for FakeTransport<P> {
+impl<P: DmaMemory> VirtioTransport for FakeTransport<P> {
     type Bus = HeapBus<P>;
 
     fn bus(&self) -> &Self::Bus {
@@ -570,7 +571,7 @@ pub(crate) struct WindowDmaPool {
 pub(crate) struct WindowDmaBuffer {
     ptr: NonNull<u8>,
     len: usize,
-    device_address: u64,
+    device_address: DeviceAddress,
 }
 
 unsafe impl Send for WindowDmaBuffer {}
@@ -624,7 +625,7 @@ impl WindowDmaPool {
 
 const PAGE_ALIGNMENT: usize = 4096;
 
-impl DmaPool for WindowDmaPool {
+impl DmaMemory for WindowDmaPool {
     type Buffer = WindowDmaBuffer;
 
     fn allocate_zeroed(&self, layout: Layout) -> IoResult<Self::Buffer> {
@@ -644,7 +645,7 @@ impl DmaPool for WindowDmaPool {
         Ok(WindowDmaBuffer {
             ptr,
             len: layout.size(),
-            device_address: DEVICE_WINDOW_BASE + offset as u64,
+            device_address: DeviceAddress::new(DEVICE_WINDOW_BASE + offset as u64),
         })
     }
 
@@ -652,25 +653,25 @@ impl DmaPool for WindowDmaPool {
     /// in the window has to end in it. Everything that starts outside —
     /// a request header a driver builds on its stack, say — keeps its
     /// host address, the way a kernel's linear map would.
-    fn dma_range(&self, buffer: &[u8]) -> Result<u64, DmaUnreachable> {
-        let host = buffer.as_ptr() as usize;
+    fn device_range(&self, bytes: &[u8]) -> Result<DeviceAddress, DmaError> {
+        let host = bytes.as_ptr() as usize;
         match host.checked_sub(self.arena_base()) {
             Some(offset) if offset < self.arena_len() => {
-                if buffer.len() > self.arena_len() - offset {
-                    return Err(DmaUnreachable {
+                if bytes.len() > self.arena_len() - offset {
+                    return Err(DmaError::Unreachable {
                         address: host,
-                        bytes: buffer.len(),
+                        bytes: bytes.len(),
                     });
                 }
-                Ok(DEVICE_WINDOW_BASE + offset as u64)
+                Ok(DeviceAddress::new(DEVICE_WINDOW_BASE + offset as u64))
             }
-            _ => Ok(host as u64),
+            _ => Ok(DeviceAddress::new(host as u64)),
         }
     }
 
     /// A run named by its address is already in the window, the way a
     /// guest's own pinned pages reach a real device.
-    fn device_range(&self, physical: u64, _bytes: u64) -> IoResult<u64> {
+    fn foreign_range(&self, physical: u64, _bytes: u64) -> IoResult<u64> {
         Ok(physical)
     }
 
@@ -680,7 +681,7 @@ impl DmaPool for WindowDmaPool {
 }
 
 impl DmaBuffer for WindowDmaBuffer {
-    fn phys_addr(&self) -> u64 {
+    fn device_address(&self) -> DeviceAddress {
         self.device_address
     }
 

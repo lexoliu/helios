@@ -33,8 +33,8 @@ pub use block::{
     VirtioBlockSwapBackend, VirtioBlockSwapError, VirtioBlockSwapToken,
 };
 pub use bus::{
-    DeviceBus, DmaAddressing, DmaBuffer, DmaPool, IdentityDmaBuffer, IdentityDmaPool, MmioBus,
-    OffsetDmaBuffer, OffsetDmaPool, PlatformDmaBuffer, PlatformDmaPool,
+    DeviceBus, IdentityDmaBuffer, IdentityDmaPool, MmioBus, OffsetDmaBuffer, OffsetDmaPool,
+    PlatformDmaBuffer, PlatformDmaPool,
 };
 pub use discovery::{
     InterruptTrigger, MmioCandidate, MmioInterrupt, NodeInterrupt, mmio_candidates,

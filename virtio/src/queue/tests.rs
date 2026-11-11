@@ -4,7 +4,8 @@
 use super::packed::PackedRing;
 use super::split::SplitRing;
 use super::{ChainEntry, MAX_CHAIN_BUFFERS, Ring, VirtQueue, VirtqueueError, build_chain};
-use crate::bus::DmaBuffer;
+use helios_hal::dma::DmaBuffer;
+
 use crate::features::NegotiatedFeatures;
 use crate::testing::{FakeTransport, FakeTransportConfig, WindowDmaPool};
 use crate::transport::VirtioFeatures;
@@ -957,7 +958,7 @@ fn a_buffer_wholly_inside_the_window_translates_as_before() {
     let used = build_chain(&transport, &[bytes], None, &mut [], &mut chain)
         .expect("a page inside the window translates");
     assert_eq!(used, 1);
-    assert_eq!(chain[0].addr, page.phys_addr());
+    assert_eq!(chain[0].addr, page.device_address().get());
     assert_eq!(chain[0].len, 4096);
     assert!(!chain[0].writable);
 

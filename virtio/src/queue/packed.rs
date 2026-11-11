@@ -13,7 +13,9 @@ use core::sync::atomic::{Ordering, fence};
 
 use alloc::boxed::Box;
 
-use crate::bus::{DeviceBus, DmaBuffer, DmaPool};
+use helios_hal::dma::{DmaBuffer, DmaMemory};
+
+use crate::bus::DeviceBus;
 use crate::features::NegotiatedFeatures;
 use crate::transport::VirtioTransport;
 
@@ -268,9 +270,9 @@ impl<T: VirtioTransport> PackedRing<T> {
         transport.set_queue(
             index,
             self.core.size,
-            self.descriptors.phys_addr(),
-            self.driver_event.phys_addr(),
-            self.device_event.phys_addr(),
+            self.descriptors.device_address().get(),
+            self.driver_event.device_address().get(),
+            self.device_event.device_address().get(),
         );
     }
 

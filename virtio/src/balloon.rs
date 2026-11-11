@@ -37,7 +37,9 @@ use async_lock::Mutex;
 use helios_hal::balloon::{MemoryBalloon, MemoryStat, MemoryStatTag};
 use helios_hal::io::{IoError, IoResult};
 
-use crate::bus::{DeviceBus, DmaPool};
+use helios_hal::dma::DmaMemory;
+
+use crate::bus::DeviceBus;
 use crate::features::{NegotiatedFeatures, RING_FEATURES, negotiate_with};
 use crate::inflight::{InFlight, await_completion, submit_chain};
 use crate::notify::Notify;
@@ -476,7 +478,7 @@ impl<T: VirtioTransport> VirtioBalloonDevice<T> {
                 return Err(IoError::OutOfBounds);
             }
             for page in range.chunks(BALLOON_PAGE_SIZE) {
-                let address = dma.dma_range(page)?;
+                let address = dma.device_range(page)?.get();
                 if !address.is_multiple_of(BALLOON_PAGE_SIZE as u64) {
                     return Err(IoError::OutOfBounds);
                 }
@@ -635,7 +637,8 @@ mod tests {
         CONFIG_NUM_PAGES, F_DEFLATE_ON_OOM, F_FREE_PAGE_HINT, F_MUST_TELL_HOST, F_PAGE_REPORTING,
         F_STATS_VQ, FREE_PAGE_CMD_ID_STOP, QueueLayout, VirtioBalloonDevice,
     };
-    use crate::bus::DmaBuffer;
+    use helios_hal::dma::DmaBuffer;
+
     use crate::testing::{FakeTransport, FakeTransportConfig, WindowDmaBuffer, WindowDmaPool};
     use crate::transport::{DeviceType, VirtioFeatures, VirtioTransport};
     use alloc::vec::Vec;
@@ -699,7 +702,7 @@ mod tests {
 
         /// The address the device sees for the first page.
         fn device_base(&self) -> u64 {
-            self.0.phys_addr()
+            self.0.device_address().get()
         }
     }
 
