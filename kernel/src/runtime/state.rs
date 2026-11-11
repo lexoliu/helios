@@ -1231,8 +1231,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use alloc::vec;
-
     use super::*;
 
     #[test]
@@ -1265,7 +1263,8 @@ mod tests {
 
         let samples = state.perf_metrics(
             &PerfMetricFilter {
-                name_prefixes: vec!["kernel;heap;".into()],
+                name_prefixes: crate::PrefixSet::from_prefixes(["kernel;heap;"])
+                    .expect("one short prefix fits the filter bounds"),
             },
             8,
         );

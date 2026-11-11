@@ -1,6 +1,8 @@
 package helios:system@0.1.0;
 
 interface profiling {
+  use filters.{filter-error};
+
   type mono-nanos = u64;
 
   enum scope {
@@ -10,6 +12,8 @@ interface profiling {
 
   record filter {
     scope: option<scope>,
+    /// At most 8 prefixes of at most 128 bytes each; a larger list is
+    /// refused with `filter-error`.
     stack-prefixes: list<string>,
   }
 
@@ -20,6 +24,8 @@ interface profiling {
   }
 
   record metric-filter {
+    /// At most 8 prefixes of at most 128 bytes each; a larger list is
+    /// refused with `filter-error`.
     name-prefixes: list<string>,
   }
 
@@ -111,8 +117,8 @@ interface profiling {
 
   set-enabled: func(enabled: bool);
   clear: func();
-  folded: func(filter: filter, limit: u32) -> list<folded-sample>;
-  metrics: func(filter: metric-filter, limit: u32) -> list<metric-sample>;
+  folded: func(filter: filter, limit: u32) -> result<list<folded-sample>, filter-error>;
+  metrics: func(filter: metric-filter, limit: u32) -> result<list<metric-sample>, filter-error>;
 
   /// Starts or stops instruction-address sampling, independently of
   /// `set-enabled`. Sampling shortens every processor's timer period, so

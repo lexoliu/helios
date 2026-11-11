@@ -1,3 +1,4 @@
+pub use super::bindings::helios::system::filters::FilterError;
 pub use super::bindings::helios::system::profiling::{
     Filter, FoldedSample, InstructionProfile, InstructionProfileError, InstructionSample,
     MetricFilter, MetricSample, MonoNanos, ProfileSection, RawProfileError, SampledCode, Scope,
@@ -53,11 +54,13 @@ mod host {
         Ok(())
     }
 
+    /// The folded stacks matching `filter`. `Ok(Err(..))` is the guest
+    /// refusing a filter that exceeds its prefix bounds.
     pub async fn folded<R, W>(
         client: &Client<R, W>,
         filter: &Filter,
         limit: u32,
-    ) -> Result<Vec<FoldedSample>, RpcError>
+    ) -> Result<Result<Vec<FoldedSample>, FilterError>, RpcError>
     where
         R: AsyncRead + Send + Unpin + 'static,
         W: AsyncWrite + Send + Unpin + 'static,
@@ -83,11 +86,13 @@ mod host {
         })
     }
 
+    /// The metrics matching `filter`. `Ok(Err(..))` is the guest refusing a
+    /// filter that exceeds its prefix bounds.
     pub async fn metrics<R, W>(
         client: &Client<R, W>,
         filter: &MetricFilter,
         limit: u32,
-    ) -> Result<Vec<MetricSample>, RpcError>
+    ) -> Result<Result<Vec<MetricSample>, FilterError>, RpcError>
     where
         R: AsyncRead + Send + Unpin + 'static,
         W: AsyncWrite + Send + Unpin + 'static,

@@ -2,7 +2,7 @@ use std::env;
 use std::fmt::{self, Write as _};
 use std::io::{self, Write as _};
 
-use helios_api::profiling::{self, Filter, MetricFilter, Scope};
+use helios_api::profiling::{self, Filter, FilterError, MetricFilter, Scope};
 
 const DEFAULT_LIMIT: u32 = 40;
 
@@ -40,6 +40,7 @@ enum PerfError {
     InvalidScope(String),
     InvalidLimit(String),
     FoldedMetrics,
+    FilterRefused(FilterError),
     Io(io::Error),
     Fmt(fmt::Error),
 }
@@ -55,6 +56,12 @@ impl fmt::Display for PerfError {
             Self::InvalidScope(scope) => write!(f, "invalid perf scope: {scope}"),
             Self::InvalidLimit(limit) => write!(f, "invalid perf limit: {limit}"),
             Self::FoldedMetrics => f.write_str("metrics output does not support folded format"),
+            Self::FilterRefused(FilterError::TooManyPrefixes(limit)) => {
+                write!(f, "perf takes at most {limit} --prefix flags")
+            }
+            Self::FilterRefused(FilterError::PrefixTooLong(limit)) => {
+                write!(f, "a perf --prefix is at most {limit} bytes")
+            }
             Self::Io(error) => write!(f, "{error}"),
             Self::Fmt(error) => write!(f, "{error}"),
         }
@@ -175,7 +182,8 @@ fn write_folded(options: &Options) -> Result<(), PerfError> {
             stack_prefixes: options.prefixes.clone(),
         },
         options.limit,
-    );
+    )
+    .map_err(PerfError::FilterRefused)?;
     let mut output = String::new();
     match options.format {
         OutputFormat::Text => {
@@ -225,7 +233,8 @@ fn write_metrics(options: &Options) -> Result<(), PerfError> {
             name_prefixes: options.prefixes.clone(),
         },
         options.limit,
-    );
+    )
+    .map_err(PerfError::FilterRefused)?;
     let mut output = String::new();
     match options.format {
         OutputFormat::Text => {

@@ -37,6 +37,13 @@ pub enum SystemError {
     KillRefused { id: u64, reason: &'static str },
     #[error("the guest refused to enable the tracing target {target}: {detail}")]
     TargetRefused { target: String, detail: String },
+    #[error("the guest refused the filter for {what}: {source}")]
+    FilterRefused {
+        /// What was being read, spelled the way the message reads it.
+        what: &'static str,
+        #[source]
+        source: tracing::FilterError,
+    },
     #[error("failed to render a guest tracing event: {source}")]
     Render {
         #[from]
@@ -64,6 +71,7 @@ impl SystemError {
             | Self::NoInstanceNamed { .. }
             | Self::KillRefused { .. }
             | Self::TargetRefused { .. }
+            | Self::FilterRefused { .. }
             | Self::Render { .. }
             | Self::Signals { .. }
             | Self::Write { .. } => None,
@@ -202,6 +210,10 @@ pub async fn fetch_tracing(
     )
     .await
     .map_err(|source| SystemError::Fetch {
+        what: "remote tracing events",
+        source,
+    })?
+    .map_err(|source| SystemError::FilterRefused {
         what: "remote tracing events",
         source,
     })

@@ -1,5 +1,6 @@
 //! Profiling syscalls.
 
+pub use crate::bindings::helios::system::filters::FilterError;
 use crate::bindings::helios::system::profiling as raw;
 pub use crate::bindings::helios::system::profiling::{
     Filter, FoldedSample, InstructionProfile, InstructionProfileError, InstructionSample,
@@ -19,12 +20,17 @@ pub fn clear() {
 
 /// Returns up to `limit` folded stack samples matching `filter`,
 /// suitable for flamegraph rendering.
-pub fn folded(filter: &Filter, limit: u32) -> Vec<FoldedSample> {
+///
+/// A filter of more than 8 prefixes, or with a prefix longer than 128
+/// bytes, is refused with the limit it exceeded.
+pub fn folded(filter: &Filter, limit: u32) -> Result<Vec<FoldedSample>, FilterError> {
     raw::folded(filter, limit)
 }
 
 /// Returns up to `limit` performance-metric samples matching `filter`.
-pub fn metrics(filter: &MetricFilter, limit: u32) -> Vec<MetricSample> {
+///
+/// The filter is bounded as in [`folded`].
+pub fn metrics(filter: &MetricFilter, limit: u32) -> Result<Vec<MetricSample>, FilterError> {
     raw::metrics(filter, limit)
 }
 

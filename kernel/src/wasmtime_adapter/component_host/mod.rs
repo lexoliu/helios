@@ -47,9 +47,10 @@ use crate::wasmtime_adapter::cwasm::{self, ArtifactTrustError};
 use crate::wasmtime_adapter::wasi::ChannelStreamProducer;
 use crate::wasmtime_adapter::wasi::bindings::filesystem::types::ErrorCode as FsErrorCode;
 use crate::{
-    HeapStats, LlvmProfile, PerfMetricFilter, PerfSample, ProfileFilter, ProfileScope, StatsSample,
-    TraceEvent, TraceField, TraceFilter, TraceLevel, TraceValue,
+    HeapStats, LlvmProfile, PerfSample, ProfileScope, StatsSample, TraceEvent, TraceField,
+    TraceFilter, TraceLevel, TraceValue,
 };
+use filters::{MetricFilterView, ProfileFilterView, TraceFilterView};
 // The two generated worlds spell every shared type identically, so each keeps
 // its own short alias rather than importing the names themselves.
 use debugger_bindings::helios::system as debugger_wit;
@@ -81,6 +82,7 @@ fn lower_bytes_to_vec(bytes: Bytes) -> Vec<u8> {
 
 mod device;
 pub(crate) use device::record_linear_memory;
+mod filters;
 pub mod service;
 mod topology;
 mod vsock;
@@ -3003,28 +3005,32 @@ where
     )?;
     instance.func_wrap(
         "recent",
-        |caller, (filter, limit): (debugger_wit::tracing::Filter, u32)| {
-            let filter = convert_filter(filter);
-            let events = caller
-                .data()
-                .runtime_state
-                .recent(&filter, limit)
-                .into_iter()
-                .map(convert_event)
-                .collect::<Vec<_>>();
+        |mut caller, (filter, limit): (TraceFilterView, u32)| {
+            let events = filter
+                .lift(&mut caller)?
+                .map(|filter| {
+                    caller
+                        .data()
+                        .runtime_state
+                        .recent(&filter, limit)
+                        .into_iter()
+                        .map(convert_event)
+                        .collect::<Vec<_>>()
+                })
+                .map_err(debugger_wit::filters::FilterError::from);
             Ok((events,))
         },
     )?;
-    instance.func_wrap(
-        "subscribe",
-        |mut caller, (filter,): (debugger_wit::tracing::Filter,)| {
-            let reader = StreamReader::new(
-                &mut caller,
-                TracingStreamProducer::new(convert_filter(filter)),
-            )?;
-            Ok((reader,))
-        },
-    )?;
+    instance.func_wrap("subscribe", |mut caller, (filter,): (TraceFilterView,)| {
+        let filter = match filter.lift(&mut caller)? {
+            Ok(filter) => filter,
+            Err(refusal) => {
+                return Ok((Err(debugger_wit::filters::FilterError::from(refusal)),));
+            }
+        };
+        let reader = StreamReader::new(&mut caller, TracingStreamProducer::new(filter))?;
+        Ok((Ok(reader),))
+    })?;
     Ok(())
 }
 
@@ -3064,29 +3070,37 @@ macro_rules! impl_profiling_bindings {
                 })?;
                 instance.func_wrap(
                     "folded",
-                    |caller, (filter, limit): ($wit::profiling::Filter, u32)| {
-                        let filter = convert_profile_filter(filter);
-                        let samples = caller
-                            .data()
-                            .runtime_state
-                            .folded_profile(caller.data().cpu.now().ticks(), &filter, limit)
-                            .into_iter()
-                            .map(convert_profile_sample)
-                            .collect::<Vec<_>>();
+                    |mut caller, (filter, limit): (ProfileFilterView, u32)| {
+                        let samples = filter
+                            .lift(&mut caller)?
+                            .map(|filter| {
+                                caller
+                                    .data()
+                                    .runtime_state
+                                    .folded_profile(caller.data().cpu.now().ticks(), &filter, limit)
+                                    .into_iter()
+                                    .map(convert_profile_sample)
+                                    .collect::<Vec<_>>()
+                            })
+                            .map_err($wit::filters::FilterError::from);
                         Ok((samples,))
                     },
                 )?;
                 instance.func_wrap(
                     "metrics",
-                    |caller, (filter, limit): ($wit::profiling::MetricFilter, u32)| {
-                        let filter = convert_perf_metric_filter(filter);
-                        let samples = caller
-                            .data()
-                            .runtime_state
-                            .perf_metrics(&filter, limit)
-                            .into_iter()
-                            .map(convert_perf_metric_sample)
-                            .collect::<Vec<_>>();
+                    |mut caller, (filter, limit): (MetricFilterView, u32)| {
+                        let samples = filter
+                            .lift(&mut caller)?
+                            .map(|filter| {
+                                caller
+                                    .data()
+                                    .runtime_state
+                                    .perf_metrics(&filter, limit)
+                                    .into_iter()
+                                    .map(convert_perf_metric_sample)
+                                    .collect::<Vec<_>>()
+                            })
+                            .map_err($wit::filters::FilterError::from);
                         Ok((samples,))
                     },
                 )?;
@@ -3131,13 +3145,6 @@ macro_rules! impl_profiling_bindings {
                 Ok(())
             }
 
-            fn convert_profile_filter(filter: $wit::profiling::Filter) -> ProfileFilter {
-                ProfileFilter {
-                    scope: filter.scope.map(convert_profile_scope_to_local),
-                    stack_prefixes: filter.stack_prefixes,
-                }
-            }
-
             fn convert_profile_sample(
                 sample: crate::FoldedProfileSample,
             ) -> $wit::profiling::FoldedSample {
@@ -3145,14 +3152,6 @@ macro_rules! impl_profiling_bindings {
                     scope: convert_profile_scope_from_local(sample.scope),
                     stack: sample.stack,
                     weight: sample.weight,
-                }
-            }
-
-            fn convert_perf_metric_filter(
-                filter: $wit::profiling::MetricFilter,
-            ) -> PerfMetricFilter {
-                PerfMetricFilter {
-                    name_prefixes: filter.name_prefixes,
                 }
             }
 
@@ -3178,13 +3177,6 @@ macro_rules! impl_profiling_bindings {
                 match scope {
                     ProfileScope::Kernel => $wit::profiling::Scope::Kernel,
                     ProfileScope::User => $wit::profiling::Scope::User,
-                }
-            }
-
-            fn convert_profile_scope_to_local(scope: $wit::profiling::Scope) -> ProfileScope {
-                match scope {
-                    $wit::profiling::Scope::Kernel => ProfileScope::Kernel,
-                    $wit::profiling::Scope::User => ProfileScope::User,
                 }
             }
 
@@ -3330,28 +3322,32 @@ where
     )?;
     instance.func_wrap(
         "recent",
-        |caller, (filter, limit): (program_wit::tracing::Filter, u32)| {
-            let filter = convert_program_filter(filter);
-            let events = caller
-                .data()
-                .runtime_state
-                .recent(&filter, limit)
-                .into_iter()
-                .map(convert_program_event)
-                .collect::<Vec<_>>();
+        |mut caller, (filter, limit): (TraceFilterView, u32)| {
+            let events = filter
+                .lift(&mut caller)?
+                .map(|filter| {
+                    caller
+                        .data()
+                        .runtime_state
+                        .recent(&filter, limit)
+                        .into_iter()
+                        .map(convert_program_event)
+                        .collect::<Vec<_>>()
+                })
+                .map_err(program_wit::filters::FilterError::from);
             Ok((events,))
         },
     )?;
-    instance.func_wrap(
-        "subscribe",
-        |mut caller, (filter,): (program_wit::tracing::Filter,)| {
-            let reader = StreamReader::new(
-                &mut caller,
-                ProgramTracingStreamProducer::new(convert_program_filter(filter)),
-            )?;
-            Ok((reader,))
-        },
-    )?;
+    instance.func_wrap("subscribe", |mut caller, (filter,): (TraceFilterView,)| {
+        let filter = match filter.lift(&mut caller)? {
+            Ok(filter) => filter,
+            Err(refusal) => {
+                return Ok((Err(program_wit::filters::FilterError::from(refusal)),));
+            }
+        };
+        let reader = StreamReader::new(&mut caller, ProgramTracingStreamProducer::new(filter))?;
+        Ok((Ok(reader),))
+    })?;
     Ok(())
 }
 
@@ -4622,20 +4618,6 @@ fn convert_program_memory_pressure(
     }
 }
 
-fn convert_filter(filter: debugger_wit::tracing::Filter) -> TraceFilter {
-    TraceFilter {
-        min_level: filter.min_level.map(convert_level_to_local),
-        target_prefixes: filter.target_prefixes,
-    }
-}
-
-fn convert_program_filter(filter: program_wit::tracing::Filter) -> TraceFilter {
-    TraceFilter {
-        min_level: filter.min_level.map(convert_program_level_to_local),
-        target_prefixes: filter.target_prefixes,
-    }
-}
-
 fn convert_event(event: TraceEvent) -> debugger_wit::tracing::Event {
     debugger_wit::tracing::Event {
         timestamp: event.timestamp,
@@ -4704,16 +4686,6 @@ fn convert_level_from_local(level: TraceLevel) -> debugger_wit::tracing::Level {
     }
 }
 
-fn convert_level_to_local(level: debugger_wit::tracing::Level) -> TraceLevel {
-    match level {
-        debugger_wit::tracing::Level::Error => TraceLevel::Error,
-        debugger_wit::tracing::Level::Warn => TraceLevel::Warn,
-        debugger_wit::tracing::Level::Info => TraceLevel::Info,
-        debugger_wit::tracing::Level::Debug => TraceLevel::Debug,
-        debugger_wit::tracing::Level::Trace => TraceLevel::Trace,
-    }
-}
-
 fn convert_program_level_from_local(level: TraceLevel) -> program_wit::tracing::Level {
     match level {
         TraceLevel::Error => program_wit::tracing::Level::Error,
@@ -4721,16 +4693,6 @@ fn convert_program_level_from_local(level: TraceLevel) -> program_wit::tracing::
         TraceLevel::Info => program_wit::tracing::Level::Info,
         TraceLevel::Debug => program_wit::tracing::Level::Debug,
         TraceLevel::Trace => program_wit::tracing::Level::Trace,
-    }
-}
-
-fn convert_program_level_to_local(level: program_wit::tracing::Level) -> TraceLevel {
-    match level {
-        program_wit::tracing::Level::Error => TraceLevel::Error,
-        program_wit::tracing::Level::Warn => TraceLevel::Warn,
-        program_wit::tracing::Level::Info => TraceLevel::Info,
-        program_wit::tracing::Level::Debug => TraceLevel::Debug,
-        program_wit::tracing::Level::Trace => TraceLevel::Trace,
     }
 }
 

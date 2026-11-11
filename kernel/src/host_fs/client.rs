@@ -2512,7 +2512,8 @@ mod tests {
             .lock()
             .recent(
                 &crate::PerfMetricFilter {
-                    name_prefixes: alloc::vec!["kernel;hostfs;".to_owned()],
+                    name_prefixes: crate::PrefixSet::from_prefixes(["kernel;hostfs;"])
+                        .expect("one short prefix fits the filter bounds"),
                 },
                 u32::MAX,
             )

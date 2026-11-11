@@ -7,7 +7,7 @@ use helios_api::{
 use crate::error::DispatchError;
 use crate::system::server::{self, Dispatcher};
 
-use super::bindings::helios::system::{instances, profiling, programs, stats, tracing};
+use super::bindings::helios::system::{filters, instances, profiling, programs, stats, tracing};
 use super::methods::{
     INSTANCES_INSTANCE, INSTANCES_KILL, INSTANCES_SNAPSHOT, PROFILING_CLEAR, PROFILING_FOLDED,
     PROFILING_INSTANCE, PROFILING_INSTRUCTION_SAMPLES, PROFILING_METRICS,
@@ -198,9 +198,8 @@ async fn dispatch(instance: &str, func: &str, payload: &[u8]) -> Result<Vec<u8>,
                     source,
                 })?;
             let events = host_tracing::recent(&convert_filter(filter), limit)
-                .into_iter()
-                .map(convert_event)
-                .collect::<Vec<_>>();
+                .map(|events| events.into_iter().map(convert_event).collect::<Vec<_>>())
+                .map_err(convert_filter_error);
             postcard::to_allocvec(&events).map_err(|source| DispatchError::Encode {
                 operation: "tracing.recent",
                 source,
@@ -237,9 +236,13 @@ async fn dispatch(instance: &str, func: &str, payload: &[u8]) -> Result<Vec<u8>,
                     source,
                 })?;
             let samples = host_profiling::folded(&convert_profile_filter(filter), limit)
-                .into_iter()
-                .map(convert_profile_sample)
-                .collect::<Vec<_>>();
+                .map(|samples| {
+                    samples
+                        .into_iter()
+                        .map(convert_profile_sample)
+                        .collect::<Vec<_>>()
+                })
+                .map_err(convert_filter_error);
             postcard::to_allocvec(&samples).map_err(|source| DispatchError::Encode {
                 operation: "profiling.folded",
                 source,
@@ -252,9 +255,13 @@ async fn dispatch(instance: &str, func: &str, payload: &[u8]) -> Result<Vec<u8>,
                     source,
                 })?;
             let samples = host_profiling::metrics(&convert_metric_filter(filter), limit)
-                .into_iter()
-                .map(convert_metric_sample)
-                .collect::<Vec<_>>();
+                .map(|samples| {
+                    samples
+                        .into_iter()
+                        .map(convert_metric_sample)
+                        .collect::<Vec<_>>()
+                })
+                .map_err(convert_filter_error);
             postcard::to_allocvec(&samples).map_err(|source| DispatchError::Encode {
                 operation: "profiling.metrics",
                 source,
@@ -707,6 +714,16 @@ fn convert_filter(filter: tracing::Filter) -> host_tracing::Filter {
     host_tracing::Filter {
         min_level: filter.min_level.map(convert_level_to_local),
         target_prefixes: filter.target_prefixes,
+    }
+}
+
+fn convert_filter_error(error: host_tracing::FilterError) -> filters::FilterError {
+    use filters::FilterError as Wire;
+    use host_tracing::FilterError as Host;
+
+    match error {
+        Host::TooManyPrefixes(limit) => Wire::TooManyPrefixes(limit),
+        Host::PrefixTooLong(limit) => Wire::PrefixTooLong(limit),
     }
 }
 

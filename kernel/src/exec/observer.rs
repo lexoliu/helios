@@ -10,7 +10,7 @@ use core::cmp::Reverse;
 use core::hash::BuildHasher;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use arrayvec::ArrayString;
+use arrayvec::{ArrayString, ArrayVec};
 use hashbrown::{DefaultHashBuilder, HashTable};
 use helios_hal::cpu::HardwarePerfCounterDelta;
 use spin::Mutex;
@@ -21,10 +21,107 @@ pub const DEFAULT_PROFILE_STACK_CAPACITY: usize = 1024;
 pub const DEFAULT_PERF_METRIC_CAPACITY: usize = 512;
 const OBSERVER_TEXT_STACK_BYTES: usize = 256;
 
+/// Most prefixes one filter holds, in each of the three filter types.
+///
+/// The bound is fixed by the interface, not by the caller, as
+/// [`crate::MAX_PROFILE_READ`] is: a filter arrives from a guest, and what
+/// the kernel keeps and matches against every event has to be bounded
+/// before the guest sends it. Every producer in the tree stays inside it:
+/// the kernel's own filters carry one prefix, and the inspector and `perf`
+/// take one repeated flag per prefix, a handful at most. The outside
+/// precedent is Linux's fixed limits on caller-supplied filter programs
+/// (`BPF_MAXINSNS`, the seccomp program length).
+pub const MAX_FILTER_PREFIXES: usize = 8;
+
+/// Longest prefix, in bytes, a filter holds.
+///
+/// The prefixes match a tracing target (a Rust module path, for one
+/// `helios_kernel::exec::phases`) or a profile stack or metric name built
+/// from `;`-separated segments. The longest of those in the tree is well
+/// under 128 bytes, and one prefix is stored inline, so the filter is a
+/// fixed value of about 1 KiB that a stream keeps for its life with no
+/// heap of its own.
+pub const MAX_FILTER_PREFIX_BYTES: usize = 128;
+
+/// Why a prefix list does not fit a filter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrefixSetError {
+    /// More than [`MAX_FILTER_PREFIXES`] prefixes.
+    TooManyPrefixes,
+    /// A prefix longer than [`MAX_FILTER_PREFIX_BYTES`] bytes.
+    PrefixTooLong,
+}
+
+/// The prefixes of one filter: a name matches when it starts with any of
+/// them, and an empty set matches every name.
+///
+/// Holding the bounds in the type means a filter that exists fits them,
+/// and a stream that keeps one owns no per-prefix allocation.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PrefixSet(ArrayVec<ArrayString<MAX_FILTER_PREFIX_BYTES>, MAX_FILTER_PREFIXES>);
+
+impl PrefixSet {
+    /// Whether a list of `count` prefixes fits, decided from the count
+    /// alone so a caller can refuse before it reads any prefix.
+    pub const fn admit_count(count: usize) -> Result<(), PrefixSetError> {
+        if count > MAX_FILTER_PREFIXES {
+            return Err(PrefixSetError::TooManyPrefixes);
+        }
+        Ok(())
+    }
+
+    /// Whether a prefix of `bytes` bytes fits, decided from the length
+    /// alone so a caller can refuse before it copies the prefix.
+    pub const fn admit_prefix_len(bytes: usize) -> Result<(), PrefixSetError> {
+        if bytes > MAX_FILTER_PREFIX_BYTES {
+            return Err(PrefixSetError::PrefixTooLong);
+        }
+        Ok(())
+    }
+
+    /// Adds `prefix`, copying it only once it is known to fit.
+    pub fn push(&mut self, prefix: &str) -> Result<(), PrefixSetError> {
+        Self::admit_prefix_len(prefix.len())?;
+        let prefix = ArrayString::from(prefix).map_err(|_| PrefixSetError::PrefixTooLong)?;
+        self.0
+            .try_push(prefix)
+            .map_err(|_| PrefixSetError::TooManyPrefixes)
+    }
+
+    /// The set of `prefixes`, refused whole when they do not fit.
+    pub fn from_prefixes<'a>(
+        prefixes: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Self, PrefixSetError> {
+        let mut set = Self::default();
+        for prefix in prefixes {
+            set.push(prefix)?;
+        }
+        Ok(set)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether `name` starts with one of the prefixes, or the set is
+    /// empty and so restricts nothing.
+    pub fn admits(&self, name: &str) -> bool {
+        self.0.is_empty()
+            || self
+                .0
+                .iter()
+                .any(|prefix| name.starts_with(prefix.as_str()))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct TraceFilter {
     pub min_level: Option<TraceLevel>,
-    pub target_prefixes: Vec<String>,
+    pub target_prefixes: PrefixSet,
 }
 
 #[derive(Clone, Debug)]
@@ -121,7 +218,7 @@ impl StatsSample {
 #[derive(Clone, Debug)]
 pub struct ProfileFilter {
     pub scope: Option<ProfileScope>,
-    pub stack_prefixes: Vec<String>,
+    pub stack_prefixes: PrefixSet,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -133,7 +230,7 @@ pub struct FoldedProfileSample {
 
 #[derive(Clone, Debug)]
 pub struct PerfMetricFilter {
-    pub name_prefixes: Vec<String>,
+    pub name_prefixes: PrefixSet,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -844,14 +941,7 @@ pub fn matches_trace_filter(event: &TraceEvent, filter: &TraceFilter) -> bool {
         return false;
     }
 
-    if filter.target_prefixes.is_empty() {
-        return true;
-    }
-
-    filter
-        .target_prefixes
-        .iter()
-        .any(|prefix| event.target.starts_with(prefix))
+    filter.target_prefixes.admits(&event.target)
 }
 
 pub fn matches_profile_filter(sample: &FoldedProfileSample, filter: &ProfileFilter) -> bool {
@@ -859,25 +949,11 @@ pub fn matches_profile_filter(sample: &FoldedProfileSample, filter: &ProfileFilt
         return false;
     }
 
-    if filter.stack_prefixes.is_empty() {
-        return true;
-    }
-
-    filter
-        .stack_prefixes
-        .iter()
-        .any(|prefix| sample.stack.starts_with(prefix))
+    filter.stack_prefixes.admits(&sample.stack)
 }
 
 pub fn matches_perf_metric_filter(sample: &PerfMetricSample, filter: &PerfMetricFilter) -> bool {
-    if filter.name_prefixes.is_empty() {
-        return true;
-    }
-
-    filter
-        .name_prefixes
-        .iter()
-        .any(|prefix| sample.name.starts_with(prefix))
+    filter.name_prefixes.admits(&sample.name)
 }
 
 fn parse_console_line(timestamp: u64, line: &str) -> TraceEvent {
@@ -973,11 +1049,16 @@ mod tests {
     use alloc::vec::Vec;
 
     use super::{
-        FoldedProfileSample, PerfMetricFilter, PerfMetricHistory, PerfSample, ProfileFilter,
-        ProfileHistory, ProfileScope, TraceEvent, TraceField, TraceFilter, TraceHistory,
-        TraceLevel, TraceValue, matches_trace_filter, parse_console_text,
+        FoldedProfileSample, MAX_FILTER_PREFIX_BYTES, MAX_FILTER_PREFIXES, PerfMetricFilter,
+        PerfMetricHistory, PerfSample, PrefixSet, PrefixSetError, ProfileFilter, ProfileHistory,
+        ProfileScope, TraceEvent, TraceField, TraceFilter, TraceHistory, TraceLevel, TraceValue,
+        matches_trace_filter, parse_console_text,
     };
     use helios_hal::cpu::HardwarePerfCounterDelta;
+
+    fn prefixes<const N: usize>(list: [&str; N]) -> PrefixSet {
+        PrefixSet::from_prefixes(list).expect("the test prefixes fit the filter bounds")
+    }
 
     #[test]
     fn parses_kernel_console_prefixes() {
@@ -1003,7 +1084,7 @@ mod tests {
 
         let filter = TraceFilter {
             min_level: Some(TraceLevel::Warn),
-            target_prefixes: vec!["helios_shell".to_owned()],
+            target_prefixes: prefixes(["helios_shell"]),
         };
         let events = history.recent(&filter, 8);
 
@@ -1025,7 +1106,7 @@ mod tests {
         };
         let filter = TraceFilter {
             min_level: Some(TraceLevel::Warn),
-            target_prefixes: vec!["helios_".to_owned()],
+            target_prefixes: prefixes(["helios_"]),
         };
 
         assert!(matches_trace_filter(&event, &filter));
@@ -1040,7 +1121,7 @@ mod tests {
         let samples = history.folded(
             &ProfileFilter {
                 scope: Some(ProfileScope::Kernel),
-                stack_prefixes: vec![],
+                stack_prefixes: PrefixSet::default(),
             },
             [],
             4,
@@ -1060,7 +1141,7 @@ mod tests {
         let samples = history.folded(
             &ProfileFilter {
                 scope: Some(ProfileScope::User),
-                stack_prefixes: vec!["user;".to_owned()],
+                stack_prefixes: prefixes(["user;"]),
             },
             [],
             4,
@@ -1211,7 +1292,7 @@ mod tests {
                 if step.is_multiple_of(97) {
                     let filter = ProfileFilter {
                         scope: None,
-                        stack_prefixes: vec![],
+                        stack_prefixes: PrefixSet::default(),
                     };
                     assert_eq!(
                         keyed.folded(&filter, [], 0),
@@ -1222,7 +1303,7 @@ mod tests {
             });
             let filter = ProfileFilter {
                 scope: None,
-                stack_prefixes: vec![],
+                stack_prefixes: PrefixSet::default(),
             };
             assert_eq!(keyed.folded(&filter, [], 0), linear.folded());
         }
@@ -1241,7 +1322,7 @@ mod tests {
         let samples = history.folded(
             &ProfileFilter {
                 scope: None,
-                stack_prefixes: vec![],
+                stack_prefixes: PrefixSet::default(),
             },
             [],
             0,
@@ -1273,7 +1354,7 @@ mod tests {
             let recent = keyed
                 .recent(
                     &PerfMetricFilter {
-                        name_prefixes: vec![],
+                        name_prefixes: PrefixSet::default(),
                     },
                     0,
                 )
@@ -1320,7 +1401,7 @@ mod tests {
 
         let samples = history.recent(
             &PerfMetricFilter {
-                name_prefixes: vec!["kernel;network;".to_owned()],
+                name_prefixes: prefixes(["kernel;network;"]),
             },
             4,
         );
@@ -1367,7 +1448,7 @@ mod tests {
 
         let samples = history.recent(
             &PerfMetricFilter {
-                name_prefixes: vec!["kernel;executor;".to_owned()],
+                name_prefixes: prefixes(["kernel;executor;"]),
             },
             4,
         );
@@ -1377,5 +1458,69 @@ mod tests {
         assert_eq!(samples[0].count, 2);
         assert_eq!(samples[0].total_events, 18);
         assert_eq!(samples[0].total_nanos, 0);
+    }
+
+    #[test]
+    fn prefix_set_refuses_a_ninth_prefix() {
+        let at_the_bound = (0..MAX_FILTER_PREFIXES)
+            .map(|_| "helios_")
+            .collect::<Vec<_>>();
+        let set = PrefixSet::from_prefixes(at_the_bound.iter().copied())
+            .expect("a filter at the prefix bound is accepted");
+        assert_eq!(set.len(), MAX_FILTER_PREFIXES);
+
+        let over = (0..=MAX_FILTER_PREFIXES)
+            .map(|_| "helios_")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            PrefixSet::from_prefixes(over.iter().copied()),
+            Err(PrefixSetError::TooManyPrefixes)
+        );
+        assert_eq!(
+            PrefixSet::admit_count(MAX_FILTER_PREFIXES + 1),
+            Err(PrefixSetError::TooManyPrefixes)
+        );
+        assert_eq!(PrefixSet::admit_count(MAX_FILTER_PREFIXES), Ok(()));
+    }
+
+    #[test]
+    fn prefix_set_refuses_a_prefix_longer_than_128_bytes() {
+        let at_the_bound = "a".repeat(MAX_FILTER_PREFIX_BYTES);
+        let set = PrefixSet::from_prefixes([at_the_bound.as_str()])
+            .expect("a prefix at the byte bound is accepted");
+        assert!(set.admits(&at_the_bound));
+
+        let over = "a".repeat(MAX_FILTER_PREFIX_BYTES + 1);
+        assert_eq!(
+            PrefixSet::from_prefixes([over.as_str()]),
+            Err(PrefixSetError::PrefixTooLong)
+        );
+        assert_eq!(
+            PrefixSet::admit_prefix_len(MAX_FILTER_PREFIX_BYTES + 1),
+            Err(PrefixSetError::PrefixTooLong)
+        );
+        assert_eq!(PrefixSet::admit_prefix_len(MAX_FILTER_PREFIX_BYTES), Ok(()));
+    }
+
+    #[test]
+    fn prefix_set_counts_bytes_not_characters() {
+        // CJK text: each of these characters is three UTF-8 bytes, so 43
+        // of them are 129 bytes, and the bound is in bytes.
+        let japanese = "計".repeat(MAX_FILTER_PREFIX_BYTES / 3 + 1);
+        assert_eq!(
+            PrefixSet::from_prefixes([japanese.as_str()]),
+            Err(PrefixSetError::PrefixTooLong)
+        );
+        let korean = "한".repeat(MAX_FILTER_PREFIX_BYTES / 3);
+        assert!(PrefixSet::from_prefixes([korean.as_str()]).is_ok());
+    }
+
+    #[test]
+    fn an_empty_prefix_set_admits_every_name() {
+        assert!(PrefixSet::default().admits("anything"));
+        let set = prefixes(["kernel;", "user;"]);
+        assert!(set.admits("kernel;executor"));
+        assert!(set.admits("user;dash"));
+        assert!(!set.admits("other;dash"));
     }
 }

@@ -1,6 +1,8 @@
 package helios:system@0.1.0;
 
 interface tracing {
+  use filters.{filter-error};
+
   /// Monotonic nanoseconds since system boot.
   type mono-nanos = u64;
 
@@ -42,6 +44,8 @@ interface tracing {
     /// Minimum included level. `none` means no level filter.
     min-level: option<level>,
     /// Prefix matches on tracing target. Empty means no target restriction.
+    /// At most 8 prefixes of at most 128 bytes each; a larger list is
+    /// refused with `filter-error`.
     target-prefixes: list<string>,
   }
 
@@ -62,8 +66,8 @@ interface tracing {
   set-target-enabled: func(target: string, enabled: bool) -> result<_, target-error>;
 
   /// Returns at most `limit` newest matching events, ordered oldest to newest.
-  recent: func(filter: filter, limit: u32) -> list<event>;
+  recent: func(filter: filter, limit: u32) -> result<list<event>, filter-error>;
 
   /// Subscribes to future matching events.
-  subscribe: func(filter: filter) -> stream<event>;
+  subscribe: func(filter: filter) -> result<stream<event>, filter-error>;
 }
