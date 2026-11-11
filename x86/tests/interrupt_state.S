@@ -18,6 +18,18 @@
 1:
 .endm
 
+// Called with `rdi` the saved-register frame; the SysV ABI requires DF
+// clear here. A set DF marks the saved r14 with 2, which the test reads
+// back as a nonzero r14 once the stub has returned.
+.macro direction_flag_check
+    pushfq
+    pop rax
+    test eax, 0x400
+    jz 1f
+    mov qword ptr [rdi + 8], 2
+1:
+.endm
+
 .global main
 .global _main
 main:
@@ -195,6 +207,33 @@ extended_state_checked:
     jne failed
     test r14, r14
     jne failed
+    // Each common stub is entered with DF set. The Rust side must see it
+    // clear (dispatch marks r14 = 2 otherwise) and the interrupted context
+    // must get it back set from the RFLAGS the frame carried.
+    mov r13d, 0
+    mov r14d, 0
+    mov r15d, 9
+    std
+    interrupt helios_x86_interrupt_timer
+    pushfq
+    pop rax
+    cld
+    test r14, r14
+    jne failed
+    mov r15d, 10
+    test eax, 0x400
+    jz failed
+    mov r15d, 11
+    std
+    interrupt helios_x86_exception_breakpoint
+    pushfq
+    pop rax
+    cld
+    test r14, r14
+    jne failed
+    mov r15d, 12
+    test eax, 0x400
+    jz failed
     xor r15d, r15d
 failed:
     fxrstor64 [rbx]
@@ -238,6 +277,7 @@ helios_x86_interrupt_dispatch:
 invalid_environment:
     mov qword ptr [rdi + 8], 1
 environment_checked:
+    direction_flag_check
     fninit
     mov dword ptr [rsp], 0x5f80
     ldmxcsr [rsp]
@@ -256,7 +296,8 @@ nested:
 
 .global helios_x86_exception_dispatch
 helios_x86_exception_dispatch:
-    ud2
+    direction_flag_check
+    ret
 
 #ifndef __APPLE__
 .section .note.GNU-stack,"",@progbits
