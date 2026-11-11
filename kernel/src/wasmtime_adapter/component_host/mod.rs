@@ -4180,7 +4180,12 @@ where
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    convert_program_sample(store.runtime_state.snapshot(store.cpu.now().ticks()))
+    // A program sees only the hardware it could claim: `claim` answers
+    // as if the device were absent, and a listed device would say
+    // otherwise.
+    let mut sample = store.runtime_state.snapshot(store.cpu.now().ticks());
+    sample.restrict_to(store.process_authority());
+    convert_program_sample(sample)
 }
 
 /// Maps the kernel's block-device snapshot onto one binding set's
