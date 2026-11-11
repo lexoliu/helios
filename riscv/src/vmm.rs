@@ -254,47 +254,10 @@ pub fn user_address_space() -> Option<&'static RiscvUserAddressSpace> {
 /// table; commit/decommit/protect mutate live page-table entries
 /// hanging off the kernel root table at the root indices that fall
 /// inside [`USER_VA_BASE`..`USER_VA_END`].
-/// What backs one device mapping, and therefore what releasing it owes.
-#[derive(Clone, Copy)]
-enum DeviceBacking {
-    /// A physical register window. It was never allocated, so tearing
-    /// the mapping down frees nothing.
-    Registers,
-    /// A pinned run from the user pool: one buddy allocation at `phys`,
-    /// made with `align`.
-    Pinned { phys: usize, align: usize },
-    /// A second view of a run another reservation committed. The bytes
-    /// belong to that reservation, so tearing this mapping down frees
-    /// nothing.
-    Shared,
-}
-
-/// One device mapping inside a user reservation.
-#[derive(Clone, Copy)]
-struct DeviceMapping {
-    range: VirtRange,
-    backing: DeviceBacking,
-}
-
 pub struct RiscvUserAddressSpace {
     root_phys: usize,
     va_cursor: VaCursor,
     state: Mutex<ReservationTracker>,
-    /// Mappings the device path installed inside a user reservation.
-    ///
-    /// The reservation tracker deliberately does not know about these.
-    /// Its job is to hand frames back to the user pool when a
-    /// reservation is released, and neither kind of device mapping may
-    /// go there: a register window was never taken from the pool at
-    /// all, and a pinned run is one buddy allocation that has to be
-    /// released with the layout it was made with. Keeping them in their
-    /// own list is also what makes `release` total, so a reservation
-    /// torn down while a driver still holds it leaves no live
-    /// translation to the hardware behind.
-    ///
-    /// Lock order is `state` then `devices`; nothing takes `devices`
-    /// and then `state`.
-    devices: Mutex<Vec<DeviceMapping>>,
 }
 
 #[derive(Clone, Copy)]
@@ -311,7 +274,6 @@ impl RiscvUserAddressSpace {
             root_phys,
             va_cursor: VaCursor::new(USER_VA_BASE, USER_VA_END),
             state: Mutex::new(ReservationTracker::new()),
-            devices: Mutex::new(Vec::new()),
         }
     }
 
@@ -331,49 +293,6 @@ impl RiscvUserAddressSpace {
             PTE_READ | PTE_WRITE
         } else {
             PTE_READ
-        }
-    }
-
-    /// Undo a device mapping's leaves, without freeing anything. The
-    /// shootdown goes out to every hart through SBI before returning.
-    fn tear_down_device_range(&self, range: VirtRange) -> Result<(), AddressSpaceError> {
-        let pages = range.byte_len / PAGE_SIZE;
-        for page in 0..pages {
-            self.unmap_4k_no_flush(range.start.raw() + page * PAGE_SIZE)?;
-        }
-        flush_tlb_pages(range.start.raw(), pages);
-        Ok(())
-    }
-
-    /// Remove every device mapping that falls inside `virt`.
-    ///
-    /// A reservation can be released while a driver still holds its
-    /// device — a store torn down by an OOM kill does exactly that —
-    /// and the address space is the last place that can guarantee the
-    /// hardware is unreachable afterwards.
-    fn sweep_device_mappings(&self, virt: VirtRange) {
-        let mut devices = self.devices.lock();
-        let mut index = 0;
-        while index < devices.len() {
-            let mapping = devices[index];
-            if mapping.range.start.raw() < virt.start.raw()
-                || mapping.range.start.raw() + mapping.range.byte_len
-                    > virt.start.raw() + virt.byte_len
-            {
-                index += 1;
-                continue;
-            }
-            devices.swap_remove(index);
-            self.tear_down_device_range(mapping.range)
-                .unwrap_or_else(|error| {
-                    panic!(
-                        "RISC-V release could not tear down the device mapping at {:#x}: {error}",
-                        mapping.range.start.raw()
-                    )
-                });
-            if let DeviceBacking::Pinned { phys, align } = mapping.backing {
-                self.free_pinned_run(phys, mapping.range.byte_len, align);
-            }
         }
     }
 
@@ -927,10 +846,6 @@ impl AddressSpace for RiscvUserAddressSpace {
     }
 
     fn release(&self, virt: VirtRange) -> Result<(), AddressSpaceError> {
-        // Before anything is given back: a driver whose store died
-        // still has its device mapped here, and the frames under a
-        // pinned run are the pool's, not this reservation's.
-        self.sweep_device_mappings(virt);
         let mut state = self.state.lock();
         let released = state.release(virt)?;
         // This backend has no swap, so a released reservation never holds
@@ -965,186 +880,12 @@ impl AddressSpace for RiscvUserAddressSpace {
         self.decommit_mapped_outside(virt, &removed.substituted)
     }
 
-    fn map_device(&self, virt: VirtRange, region: DeviceRegion) -> Result<(), AddressSpaceError> {
-        validate_range(virt)?;
-        if !region.is_frame_aligned() || region.physical.bytes as usize != virt.byte_len {
-            return Err(AddressSpaceError::Misaligned);
-        }
-        let pte_flags = self.device_pte(region.attributes);
-        let phys_base = region.physical.start as usize;
-        let pages = virt.byte_len / PAGE_SIZE;
-        // The window is claimed before a single leaf is written, so two
-        // grants naming overlapping physical space cannot both believe
-        // they own it.
-        let mut devices = self.devices.lock();
-        if devices
-            .iter()
-            .any(|mapping| ranges_overlap(mapping.range, virt))
-        {
-            return Err(AddressSpaceError::DeviceMapped);
-        }
-        for page in 0..pages {
-            let virt_addr = virt.start.raw() + page * PAGE_SIZE;
-            if let Err(error) =
-                self.map_4k_no_flush(virt_addr, phys_base + page * PAGE_SIZE, pte_flags)
-            {
-                for undone in 0..page {
-                    let _ = self.unmap_4k_no_flush(virt.start.raw() + undone * PAGE_SIZE);
-                }
-                flush_tlb_pages(virt.start.raw(), page);
-                return Err(error);
-            }
-        }
-        flush_tlb_pages(virt.start.raw(), pages);
-        devices.push(DeviceMapping {
-            range: virt,
-            backing: DeviceBacking::Registers,
-        });
-        Ok(())
-    }
-
-    fn unmap_device(&self, virt: VirtRange) -> Result<(), AddressSpaceError> {
-        validate_range(virt)?;
-        let mut devices = self.devices.lock();
-        let index = devices
-            .iter()
-            .position(|mapping| mapping.range.start.raw() == virt.start.raw())
-            .ok_or(AddressSpaceError::NotCommitted)?;
-        let mapping = devices.swap_remove(index);
-        drop(devices);
-        self.tear_down_device_range(mapping.range)?;
-        if let DeviceBacking::Pinned { phys, align } = mapping.backing {
-            self.free_pinned_run(phys, mapping.range.byte_len, align);
-        }
-        Ok(())
-    }
-
-    fn map_shared(
-        &self,
-        virt: VirtRange,
-        physical: PhysicalRange,
-        flags: PageFlags,
-    ) -> Result<(), AddressSpaceError> {
-        validate_range(virt)?;
-        if physical.bytes as usize != virt.byte_len
-            || !(physical.start as usize).is_multiple_of(PAGE_SIZE)
-        {
-            return Err(AddressSpaceError::Misaligned);
-        }
-        // Ordinary memory attributes, not the device ones `map_device`
-        // computes: these bytes are somebody's frame buffer, and a
-        // second holder that reached them uncached would see a picture
-        // the first holder's stores had not reached yet.
-        let pte_flags = page_flags_to_pte(flags)?;
-        let phys_base = physical.start as usize;
-        let pages = virt.byte_len / PAGE_SIZE;
-        // The span is claimed before a single leaf is written, so two
-        // views cannot both believe they own the same window.
-        let mut devices = self.devices.lock();
-        if devices
-            .iter()
-            .any(|mapping| ranges_overlap(mapping.range, virt))
-        {
-            return Err(AddressSpaceError::DeviceMapped);
-        }
-        for page in 0..pages {
-            let virt_addr = virt.start.raw() + page * PAGE_SIZE;
-            if let Err(error) =
-                self.map_4k_no_flush(virt_addr, phys_base + page * PAGE_SIZE, pte_flags)
-            {
-                for undone in 0..page {
-                    let _ = self.unmap_4k_no_flush(virt.start.raw() + undone * PAGE_SIZE);
-                }
-                flush_tlb_pages(virt.start.raw(), page);
-                return Err(error);
-            }
-        }
-        flush_tlb_pages(virt.start.raw(), pages);
-        devices.push(DeviceMapping {
-            range: virt,
-            backing: DeviceBacking::Shared,
-        });
-        Ok(())
-    }
-
-    fn unmap_shared(&self, virt: VirtRange) -> Result<(), AddressSpaceError> {
-        validate_range(virt)?;
-        let mut devices = self.devices.lock();
-        let index = devices
-            .iter()
-            .position(|mapping| {
-                mapping.range.start.raw() == virt.start.raw()
-                    && matches!(mapping.backing, DeviceBacking::Shared)
-            })
-            .ok_or(AddressSpaceError::NotCommitted)?;
-        let mapping = devices.swap_remove(index);
-        drop(devices);
-        self.tear_down_device_range(mapping.range)
-    }
-
-    fn commit_contiguous(
-        &self,
-        virt: VirtRange,
-        flags: PageFlags,
-        placement: DmaPlacement,
-    ) -> Result<PhysFrame, AddressSpaceError> {
-        validate_range(virt)?;
-        let align = usize::try_from(placement.align)
-            .ok()
-            .filter(|align| align.is_power_of_two() && *align >= PAGE_SIZE)
-            .ok_or(AddressSpaceError::Misaligned)?;
-        let pte_flags = page_flags_to_pte(flags)?;
-        let layout = Layout::from_size_align(virt.byte_len, align)
-            .map_err(|_| AddressSpaceError::Misaligned)?;
-        // One allocation, so the run is contiguous by construction: the
-        // buddy allocator has no way to answer a single request with two
-        // blocks. Zeroed, because the device sees this memory before the
-        // driver writes a descriptor into it. The kernel identity-maps
-        // physical memory on this backend, so the pointer is the
-        // physical address.
-        let raw = allocate_user_run_zeroed_on(crate::current_hart_id(), layout)
-            .map_err(|_| AddressSpaceError::OutOfFrames)?;
-        let phys = raw.as_ptr() as usize;
-        if !placement.accepts(phys as u64, virt.byte_len as u64) {
-            // The pool answered from above the device's address lines.
-            // Truncation would show up as corruption inside the device,
-            // so refuse rather than hand it over.
-            self.free_pinned_run(phys, virt.byte_len, align);
-            return Err(AddressSpaceError::OutOfFrames);
-        }
-        let pages = virt.byte_len / PAGE_SIZE;
-        let mut devices = self.devices.lock();
-        for page in 0..pages {
-            let virt_addr = virt.start.raw() + page * PAGE_SIZE;
-            if let Err(error) = self.map_4k_no_flush(virt_addr, phys + page * PAGE_SIZE, pte_flags)
-            {
-                for undone in 0..page {
-                    let _ = self.unmap_4k_no_flush(virt.start.raw() + undone * PAGE_SIZE);
-                }
-                flush_tlb_pages(virt.start.raw(), page);
-                drop(devices);
-                self.free_pinned_run(phys, virt.byte_len, align);
-                return Err(error);
-            }
-        }
-        flush_tlb_pages(virt.start.raw(), pages);
-        devices.push(DeviceMapping {
-            range: virt,
-            backing: DeviceBacking::Pinned { phys, align },
-        });
-        Ok(PhysFrame::from_phys_addr(phys))
-    }
-
-    fn release_contiguous(&self, virt: VirtRange, _align: u64) -> Result<(), AddressSpaceError> {
-        // The alignment the run was made with was recorded at commit
-        // time, so it is read back from there rather than trusted from
-        // the caller: the allocator is owed the layout it produced.
-        self.unmap_device(virt)
-    }
-
-    /// One allocation out of the user pool, taken on the executing hart
-    /// and charged exactly as `commit_contiguous` charges its run. No
-    /// translation changes, so no lock and no shootdown.
+    /// One allocation out of the user pool, taken on the executing hart.
+    /// One allocation, so the run is contiguous by construction: the
+    /// buddy allocator has no way to answer a single request with two
+    /// blocks. Zeroed, because a device sees this memory before its
+    /// driver writes a descriptor into it. No translation changes, so no
+    /// lock and no shootdown.
     fn allocate_run(
         &self,
         bytes: usize,
@@ -1188,8 +929,9 @@ impl AddressSpace for RiscvUserAddressSpace {
         Ok(())
     }
 
-    /// Ordinary memory attributes, as in `map_shared`. The reservation
-    /// lock is held across the rewrite: see [`Self::substitute_leaves`].
+    /// Ordinary memory attributes from `flags`. The
+    /// reservation lock is held across the rewrite: see
+    /// [`Self::substitute_leaves`].
     fn substitute_memory(
         &self,
         virt: VirtRange,
@@ -1206,7 +948,7 @@ impl AddressSpace for RiscvUserAddressSpace {
         self.substitute_leaves(virt, physical.start as usize, pte_flags)
     }
 
-    /// The region's own attributes, as in `map_device`: on this backend
+    /// The region's own attributes, from [`Self::device_pte`]: on this backend
     /// that is only its permissions, the memory type being a property of
     /// the physical address. The reservation lock is held across the
     /// rewrite: see [`Self::substitute_leaves`].
@@ -1710,14 +1452,3 @@ const _: () = {
     let _: extern "C" fn(*const u8, usize, &mut *mut runtime_memory::RuntimeMemoryImage) -> c_int =
         default_memory_image_new;
 };
-
-/// Whether two ranges share any byte.
-///
-/// A device mapping is claimed by range rather than by start address:
-/// two windows that overlap without starting at the same place are
-/// still the same registers reached twice, and the second claim would
-/// silently take the first one's page-table entries.
-fn ranges_overlap(left: VirtRange, right: VirtRange) -> bool {
-    left.start.raw() < right.start.raw() + right.byte_len
-        && right.start.raw() < left.start.raw() + left.byte_len
-}

@@ -8,6 +8,7 @@ extern crate std;
 
 mod audio;
 mod bootfs;
+mod buffer;
 mod component;
 mod device;
 mod display;
@@ -22,7 +23,6 @@ mod kernel_exception;
 mod log;
 mod memory;
 mod network;
-mod pins;
 mod process;
 mod profiling;
 mod runtime;
@@ -60,6 +60,10 @@ pub use bootfs::{
     BootDirectory, BootDirectoryEntry, BootDirectoryHandleExt, BootFile, BootfsBytes,
     EmbeddedBootDirectory, EmbeddedBootFile, EmbeddedBootFs,
 };
+pub use buffer::{
+    BYTES_PER_PIXEL, Buffer, BufferError, GuestMemory, MAX_VIEWS, Span, ViewError, ViewGroup,
+    ViewId, ViewTable, WASM_PAGE_BYTES,
+};
 pub(crate) use component::ComponentCache;
 pub use component::{
     COMPONENT_ASYNC_STACK_SIZE, CompiledComponent, ComponentExecContext, ComponentExecutor,
@@ -80,19 +84,17 @@ pub use component::{
     wait_until_runtime_deadline,
 };
 pub use device::{
-    AUDIO_WINDOW_BYTES, DEFAULT_DMA_BUDGET_BYTES, DEVICE_WINDOW_BYTES, DISPLAY_WINDOW_BYTES,
-    DeviceGrant, DeviceGrantRegistry, DeviceInterruptHooks, DeviceInterruptRoute, DeviceName,
-    DeviceOwnership, DeviceVmHooks, DeviceWindow, DmaBudget, DmaBuffer, DmaBufferHandle,
-    GPU_WINDOW_BYTES, GrantError, GrantHandle, GrantInterrupt, GrantLease, GrantStats,
-    GrantedDeviceSnapshot, InterruptEvent, InterruptRelay, InterruptStats, LinearMemory,
-    MAX_DEVICE_NAME, MAX_DMA_BUFFERS, MAX_GRANT_INTERRUPTS, MAX_GRANT_REGIONS, MAX_GRANTS,
-    MappedRegion, PublishedDevice, SURFACE_WINDOW_BYTES, install_device_interrupt_hooks,
-    install_device_vm_hooks,
+    DEFAULT_DMA_BUDGET_BYTES, DeviceGrant, DeviceGrantRegistry, DeviceInterruptHooks,
+    DeviceInterruptRoute, DeviceName, DeviceOwnership, DeviceVmHooks, DmaBudget, DmaBuffer,
+    DmaBufferHandle, GrantError, GrantHandle, GrantInterrupt, GrantLease, GrantStats,
+    GrantedDeviceSnapshot, InterruptEvent, InterruptRelay, InterruptStats, MAX_DEVICE_NAME,
+    MAX_DMA_BUFFERS, MAX_GRANT_INTERRUPTS, MAX_GRANT_REGIONS, MAX_GRANTS, PublishedDevice,
+    install_device_interrupt_hooks, install_device_vm_hooks,
 };
 pub use display::{
-    DisplayClaim, DisplayOwnership, DisplayPins, DisplaySender, DisplayService,
-    DisplayServiceError, FrameToken, MAX_CLAIMED_SCANOUTS, MAX_PINNED_FRAMES, PinnedFrame,
-    REQUEST_QUEUE_DEPTH, SequenceSignal, install_display_device,
+    DisplayClaim, DisplayOwnership, DisplaySender, DisplayService, DisplayServiceError, FrameToken,
+    MAX_CLAIMED_SCANOUTS, MAX_PINNED_FRAMES, REQUEST_QUEUE_DEPTH, SequenceSignal,
+    install_display_device,
 };
 pub use embedded::{BootPayload, EmbeddedComponent, EmbeddedInit};
 pub use exec::{
@@ -111,7 +113,7 @@ pub use exec::{
 };
 pub use gpu::{
     ContextRecord, Gpu3dClaim, Gpu3dOwnership, Gpu3dSender, Gpu3dService, Gpu3dServiceError,
-    GpuPins, MAX_GPU_BLOBS, MAX_GPU_CONTEXTS, MAX_GPU_PINS, install_gpu3d_device,
+    MAX_GPU_BLOBS, MAX_GPU_CONTEXTS, MAX_GPU_VIEWS, install_gpu3d_device,
 };
 pub use helios_hal::Platform;
 pub use helios_netstack::{
@@ -183,7 +185,6 @@ pub use network::{
     SocketStack, TcpListenerId, TcpStreamId, UdpSocketId, validate_http_authority,
     validate_http_path_with_query, validate_http_status_code,
 };
-pub use pins::{BYTES_PER_PIXEL, PinError, PinnedArena, PinnedRun};
 pub use process::{
     ClockAuthorityRights, DescriptorEntry, DescriptorId, DescriptorTable, DescriptorTableError,
     DirectoryAuthorityRights, DirectoryCap, DirectoryPreopen, DnsCap, ExecAuthority, ForkAuthority,

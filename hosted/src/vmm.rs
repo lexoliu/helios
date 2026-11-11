@@ -394,107 +394,13 @@ impl AddressSpace for HostedAddressSpace {
         self.apply_host_protection(&reservations, hull, false)
     }
 
-    /// On this backend a "physical" address is a host virtual address,
-    /// so a device region is a second view of memory the host already
-    /// owns. The device's own pages are file-backed and shared, which is
-    /// what lets them appear at a second address; mapping is therefore
-    /// `MAP_FIXED` over the reservation rather than a page-table walk.
-    ///
-    /// There is no other processor to shoot down: the hosted kernel runs
-    /// on one, and the host's own `mmap` has published the change to
-    /// every thread by the time it returns.
-    fn map_device(&self, virt: VirtRange, region: DeviceRegion) -> Result<(), AddressSpaceError> {
-        validate_range(virt)?;
-        if !virt.start.raw().is_multiple_of(self.host_page)
-            || !virt.byte_len.is_multiple_of(self.host_page)
-        {
-            return Err(AddressSpaceError::Misaligned);
-        }
-        let backing = crate::device::backing_for(&region).ok_or(
-            // A region no hosted device published cannot be mapped:
-            // there is no host memory behind the address, and mapping
-            // anonymous pages there would hand the owner a device that
-            // silently is not one.
-            AddressSpaceError::DeviceMappingUnsupported,
-        )?;
-        let mut reservations = self.reservations.lock().unwrap();
-        reservations.precheck_commit(virt)?;
-        let flags = device_region_flags(region);
-        // `MemoryOwner::NONE` whoever asked: a device window is the
-        // device's memory, not the instance's, and the swap policy only
-        // ages and evicts owned regions. The claim runs inside the
-        // claiming guest's processor turn, which names that guest as
-        // the processor's owner for its own linear memory.
-        self.orphan(reservations.record_commit(virt, flags, MemoryOwner::NONE)?);
-        let mapped = unsafe {
-            libc::mmap(
-                virt.start.raw() as *mut _,
-                virt.byte_len,
-                page_flags_to_prot(flags),
-                libc::MAP_FIXED | libc::MAP_SHARED,
-                backing.descriptor,
-                backing.offset,
-            )
-        };
-        if mapped == libc::MAP_FAILED {
-            let _ = reservations.record_decommit(virt)?;
-            return Err(AddressSpaceError::DeviceMappingUnsupported);
-        }
-        Ok(())
-    }
-
-    fn unmap_device(&self, virt: VirtRange) -> Result<(), AddressSpaceError> {
-        validate_range(virt)?;
-        let mut reservations = self.reservations.lock().unwrap();
-        reservations.ensure_committed(virt)?;
-        let removed = reservations.record_decommit(virt)?;
-        self.orphan(removed.swapped);
-        // Anonymous `PROT_NONE` restores what a reservation is: address
-        // space nothing is behind. Dropping the shared mapping here is
-        // what makes the device provably unreachable.
-        let restored = unsafe {
-            libc::mmap(
-                virt.start.raw() as *mut _,
-                virt.byte_len,
-                libc::PROT_NONE,
-                libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
-        };
-        if restored == libc::MAP_FAILED {
-            return Err(AddressSpaceError::DeviceMappingUnsupported);
-        }
-        Ok(())
-    }
-
-    /// Physical contiguity is free here: a "physical" address is the
-    /// host virtual address, so a range that is contiguous in this
-    /// address space is contiguous to the device by construction.
-    fn commit_contiguous(
-        &self,
-        virt: VirtRange,
-        flags: PageFlags,
-        placement: DmaPlacement,
-    ) -> Result<PhysFrame, AddressSpaceError> {
-        validate_range(virt)?;
-        if !placement.accepts(virt.start.raw() as u64, virt.byte_len as u64) {
-            return Err(AddressSpaceError::OutOfFrames);
-        }
-        self.commit(virt, flags)?;
-        Ok(PhysFrame::from_phys_addr(virt.start.raw()))
-    }
-
-    /// Symmetric with the commit above: the host allocator placed the
-    /// pages, so the alignment it was given is not owed back to it.
-    fn release_contiguous(&self, virt: VirtRange, _align: u64) -> Result<(), AddressSpaceError> {
-        self.decommit(virt)
-    }
-
-    /// One shared, file-backed mapping the host places, charged to the
-    /// owner `commit_contiguous` charges (whoever the processor is
-    /// committing for) in [`Self::owned_resident_bytes`]. The pages are
-    /// zero because the file is fresh. No translation changes, so no
+    /// One shared, file-backed mapping the host places, charged to
+    /// whoever the processor is committing for in
+    /// [`Self::owned_resident_bytes`]. Physical contiguity is free here:
+    /// a "physical" address is the host virtual address, so the mapping
+    /// is contiguous to a device by construction, and being file-backed
+    /// is what lets it appear at a second address. The pages are zero
+    /// because the file is fresh. No translation changes, so no
     /// reservation lock.
     fn allocate_run(
         &self,
@@ -590,8 +496,14 @@ impl AddressSpace for HostedAddressSpace {
     }
 
     /// The device's pages are file-backed and shared, which is what lets
-    /// them appear at a second address; a region no hosted device
-    /// published cannot be shown, as in `map_device`.
+    /// them appear at a second address. A region no hosted device
+    /// published cannot be shown: there is no host memory behind the
+    /// address, and showing anonymous pages there would hand the owner a
+    /// device that silently is not one.
+    ///
+    /// There is no other processor to shoot down: the hosted kernel runs
+    /// on one, and the host's own `mmap` has published the change to
+    /// every thread by the time it returns.
     fn substitute_device(
         &self,
         virt: VirtRange,

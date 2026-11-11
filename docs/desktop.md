@@ -220,9 +220,10 @@ A claim is one agreement and then one byte stream. `negotiate(format)`
 fixes the rate, the channel count and the sample layout — a format the
 device did not list is refused, never answered with the nearest one it
 does have, because the samples were generated for what was asked for —
-and it is where the stream's period buffers are pinned, in the claiming
-instance's own memory pool and accounted to it, through the same arena
-the display's frame buffers come from. `samples()` then hands back the
+and it is where the stream's period buffers are pinned, from the claiming
+instance's own memory pool and accounted to it, the way the display's
+frame buffers are. They are shown in no instance's memory: the program
+never touches the period ring. `samples()` then hands back the
 writer every frame goes into: bytes in the negotiated format,
 interleaved, with no framing of any kind.
 
@@ -438,14 +439,16 @@ output.
 pixels on the screen:
 
 ```wit
-create: async func(width: u32, height: u32) -> result<surface, error>;
+create: async func(width: u32, height: u32, buffer: span) -> result<surface, error>;
 
 resource surface {
-  buffer: func() -> placement;
   commit: async func(region: rect) -> result<_, error>;
   events: func() -> stream<input-event>;
 }
 ```
+
+`span` is `helios:system/memory`'s one record, `offset` and `length`
+over whole 64 KiB pages of the caller's own linear memory.
 
 The kernel implements the client-facing half and the compositor exports
 `helios:system/compositor`, which the kernel forwards to through a typed
@@ -454,22 +457,41 @@ the `http-client` plugin's `wasi:http/handler`, generalised rather than
 copied: the slot is a write-once typed hand-off, and a call that arrives
 before a plugin has claimed it is refused rather than queued.
 
-Pixels never travel through the kernel. `create` commits one physically
-contiguous run in the client's own surface window — charged to the
-client's pool, above its growth limit, so nothing the allocator hands out
-can reach it — and maps that same run a second time into the
-compositor's surface window with ordinary cacheable attributes. The two
-components address the same pages: what the client writes is what the
-compositor blits, and `commit` carries a rectangle rather than bytes.
+Pixels never travel through the kernel. A window's pixels are one
+**buffer**: a physically contiguous run of frames charged to the
+client's pool, with no address of its own. Two **views** show it, each
+at whole pages of its holder's own linear memory, below that memory's
+size, so every access either side makes, scalar or bulk, is bounded by
+the memory it is made in.
 
-A surface's pages come back when the client's arena ends, not when one
-surface is dropped. Dropping a surface retires its identity and tells the
-compositor to forget the window; the pages stay pinned until the whole
-instance goes, at which point the kernel hands the arena to the
-supervisor, which calls the compositor's `destroy` for each window,
-unmaps the compositor's views, and only then drops the arena. Freeing
-pages the compositor still had mapped would be a use-after-free across an
-isolation boundary, and the ordering is what rules it out.
+- The client chooses its view. `helios-api` takes a page-aligned block
+  from the program's heap, `width * height * 4` bytes rounded up to
+  whole pages, and passes its span as `buffer`; `Surface::pixels` is a
+  slice of that block, and the block is freed only after the surface.
+- The compositor chooses its own. The kernel's `compositor.create(id,
+  dimensions)` answers with a span: the compositor allocates a block the
+  same size for its view of the client's pixels, keeps it keyed by the
+  surface's identity and returns the span. When the call returns the
+  kernel shows the client's buffer there, and no `commit` for that
+  identity arrives before then. A span that is not whole pages, is the
+  wrong length or overlaps a view already shown fails the client's
+  `create` with `bad-span`; a compositor that cannot allocate answers
+  `out-of-memory`.
+
+The two components address the same frames: what the client writes is
+what the compositor blits, and `commit` carries a rectangle rather than
+bytes. The compositor composes with `copy_from_slice` straight from its
+view into the scanout surface's own.
+
+Dropping a surface retires its identity and ends both views. The
+client's view ends with the drop, and the compositor's before the kernel
+calls `destroy`: when the compositor is told the window is gone, the span
+it answered `create` with is ordinary zeroed memory again, so it frees
+its block there and reads nothing from it. A client that dies has its
+surfaces dropped by the supervisor in the same order. The buffer itself
+lives until its last holder lets go, and the compositor's view never
+outlives the buffer behind it, so nothing reads frames after they are
+freed.
 
 `events` carries the input the focused surface is entitled to, in the
 same evdev vocabulary `helios:system/input` uses, with pointer positions

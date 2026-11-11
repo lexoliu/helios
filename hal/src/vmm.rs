@@ -193,10 +193,6 @@ pub enum AddressSpaceError {
     BadPageBuffer,
     #[error("this address space cannot map device memory")]
     DeviceMappingUnsupported,
-    #[error("this address space cannot map memory another owner holds")]
-    SharedMappingUnsupported,
-    #[error("the range is a device mapping, not ordinary memory")]
-    DeviceMapped,
     #[error("this address space cannot substitute the backing of committed memory")]
     SubstitutionUnsupported,
     #[error("the range already shows a run or a device region")]
@@ -344,124 +340,6 @@ pub trait AddressSpace: Send + Sync + 'static {
 
     /// Change permissions on already-committed pages. No frame churn.
     fn protect(&self, virt: VirtRange, flags: PageFlags) -> Result<(), AddressSpaceError>;
-
-    /// Map `region`'s physical bytes at `virt`, which must be a
-    /// sub-range of an existing reservation exactly as long as the
-    /// region.
-    ///
-    /// No frame comes from this address space's pool: the bytes belong
-    /// to a device and were never anyone's to allocate. The leaf entries
-    /// carry the region's own attributes — a
-    /// [`MemoryKind::Device`](crate::device::MemoryKind::Device) range
-    /// is mapped so that accesses reach the device unmerged,
-    /// unspeculated and in program order, and a region that is not
-    /// writable is mapped read-only whatever `flags` ask for.
-    ///
-    /// Per the SMP contract the call invalidates the local TLB and
-    /// shoots down every other processor that has run in this space
-    /// before it returns, so no processor can reach the range through a
-    /// stale translation.
-    ///
-    /// A backend that cannot express device memory in its page tables
-    /// reports [`AddressSpaceError::DeviceMappingUnsupported`] rather
-    /// than mapping the range as ordinary memory, because a register
-    /// file behind a cacheable mapping is a silent corruption rather
-    /// than a slower one.
-    fn map_device(&self, _virt: VirtRange, _region: DeviceRegion) -> Result<(), AddressSpaceError> {
-        Err(AddressSpaceError::DeviceMappingUnsupported)
-    }
-
-    /// Remove a mapping [`Self::map_device`] installed, leaving the
-    /// range reserved and faulting.
-    ///
-    /// Nothing is returned to the frame pool — the frames were never
-    /// taken from it — and the shootdown happens before the call
-    /// returns, so the owner has provably lost its last path to the
-    /// device's registers by the time the kernel reports the device
-    /// free.
-    fn unmap_device(&self, _virt: VirtRange) -> Result<(), AddressSpaceError> {
-        Err(AddressSpaceError::DeviceMappingUnsupported)
-    }
-
-    /// Materialise physically contiguous backing for `virt` and report
-    /// where it landed.
-    ///
-    /// [`Self::commit`] is free to satisfy a range out of whatever
-    /// frames the pool has; a buffer a device reads by physical address
-    /// is not, because the device walks it linearly and knows nothing
-    /// about page tables. The returned frame is the first of
-    /// `virt.frame_count()` consecutive ones, so the caller can hand the
-    /// device one address and a length.
-    ///
-    /// `placement` bounds the allocation: the run starts on the
-    /// device's required alignment and no byte of it sits above the
-    /// device's highest reachable address. A device that drives fewer
-    /// than 64 address lines says so here rather than discovering the
-    /// truncation as corruption.
-    fn commit_contiguous(
-        &self,
-        _virt: VirtRange,
-        _flags: PageFlags,
-        _placement: DmaPlacement,
-    ) -> Result<PhysFrame, AddressSpaceError> {
-        Err(AddressSpaceError::DeviceMappingUnsupported)
-    }
-
-    /// Map `physical` — ordinary memory that already belongs to
-    /// somebody — at `virt`, which must be a sub-range of an existing
-    /// reservation exactly as long as the range.
-    ///
-    /// This is the one way two owners come to hold the same bytes. The
-    /// run was produced by [`Self::commit_contiguous`] in one owner's
-    /// reservation and is charged to that owner; mapping it a second
-    /// time neither allocates nor accounts for anything, so the second
-    /// holder sees the pixels without a copy and pays for none of them.
-    /// The leaf entries carry ordinary memory attributes — cacheable,
-    /// coherent between processors — because the bytes are memory and
-    /// not a register file, which is exactly the reason this is not
-    /// [`Self::map_device`].
-    ///
-    /// Per the SMP contract the call invalidates the local TLB and
-    /// shoots down every other processor that has run in this space
-    /// before it returns.
-    ///
-    /// A backend that cannot express a second mapping of memory it did
-    /// not allocate reports
-    /// [`AddressSpaceError::SharedMappingUnsupported`] rather than
-    /// copying, because a copy would answer a request for shared bytes
-    /// with two divergent ones.
-    fn map_shared(
-        &self,
-        _virt: VirtRange,
-        _physical: PhysicalRange,
-        _flags: PageFlags,
-    ) -> Result<(), AddressSpaceError> {
-        Err(AddressSpaceError::SharedMappingUnsupported)
-    }
-
-    /// Remove a mapping [`Self::map_shared`] installed, leaving the
-    /// range reserved and faulting.
-    ///
-    /// Nothing goes back to the frame pool: the run belongs to the owner
-    /// that committed it and is freed by that owner's
-    /// [`Self::release_contiguous`], never by a second holder letting go
-    /// of its view. The shootdown happens before the call returns, so
-    /// the second holder has provably lost its last path to the bytes by
-    /// the time the kernel reports the surface gone.
-    fn unmap_shared(&self, _virt: VirtRange) -> Result<(), AddressSpaceError> {
-        Err(AddressSpaceError::SharedMappingUnsupported)
-    }
-
-    /// Give back the run [`Self::commit_contiguous`] produced.
-    ///
-    /// `align` is the placement alignment the commit was made with. A
-    /// contiguous run is a single allocation rather than a pile of
-    /// frames, so an allocator that was handed a size and an alignment
-    /// has to be handed both of them back; releasing it as ordinary
-    /// frames would put it on the wrong free list.
-    fn release_contiguous(&self, _virt: VirtRange, _align: u64) -> Result<(), AddressSpaceError> {
-        Err(AddressSpaceError::DeviceMappingUnsupported)
-    }
 
     /// Take a physically contiguous run of `bytes` from this address
     /// space's frame source, zeroed, and map it nowhere.

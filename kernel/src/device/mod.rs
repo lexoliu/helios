@@ -10,21 +10,22 @@
 //!
 //! Four things make that possible, and this module owns all four:
 //!
-//! * **Registers.** [`GrantLease::map_region`] maps the device's own
-//!   frames inside the owner's linear-memory reservation, so a register
-//!   access is an ordinary load or store rather than a call per
-//!   register.
+//! * **Registers.** [`GrantLease::map_region`] shows the device's own
+//!   frames at a span of the owner's linear memory the owner chose, so
+//!   a register access is an ordinary load or store rather than a call
+//!   per register.
 //! * **Interrupts.** [`InterruptRelay`] holds a source off at the
 //!   controller the moment it fires and hands the delivery to the
 //!   owner; every decision about what the device meant runs in user
 //!   memory.
 //! * **Bus mastering.** [`GrantLease::dma_alloc`] pins a physically
-//!   contiguous buffer inside the owner's memory, from the owner's own
-//!   pool, and tells the owner the address the device has to issue to
-//!   reach it.
-//! * **Reclaim.** Dropping the lease masks every source, unmaps every
-//!   region and releases every buffer before the device is offered to
-//!   anyone else, so an owner that was killed leaves nothing behind.
+//!   contiguous buffer from the owner's own pool, shows it at a span the
+//!   owner chose, and tells the owner the address the device has to
+//!   issue to reach it.
+//! * **Reclaim.** Letting the lease go ends every view of the device,
+//!   masks every source and releases every buffer before the device is
+//!   offered to anyone else, so an owner that was killed leaves nothing
+//!   behind.
 //!
 //! # What the sandbox does and does not buy
 //!
@@ -57,12 +58,8 @@ pub use grant::{
 };
 pub use handle::{DmaBufferHandle, GrantHandle};
 pub use interrupt::{InterruptEvent, InterruptRelay, InterruptStats};
-pub use lease::{
-    AUDIO_WINDOW_BYTES, DEVICE_WINDOW_BYTES, DISPLAY_WINDOW_BYTES, DeviceWindow, DmaBuffer,
-    GPU_WINDOW_BYTES, GrantLease, GrantStats, MAX_DMA_BUFFERS, MappedRegion, PublishedDevice,
-    SURFACE_WINDOW_BYTES,
-};
-pub use owner::{DeviceOwnership, LinearMemory};
+pub use lease::{DmaBuffer, GrantLease, GrantStats, MAX_DMA_BUFFERS, PublishedDevice};
+pub use owner::DeviceOwnership;
 pub(crate) use platform::device_vm_hooks;
 #[cfg(test)]
 pub(crate) use platform::test_hooks;
@@ -75,18 +72,25 @@ pub use registry::{DeviceGrantRegistry, DeviceInterruptRoute, GrantedDeviceSnaps
 mod tests {
     use super::platform::test_hooks::{self, MappingChange};
     use super::{
-        DeviceGrant, DeviceGrantRegistry, DeviceName, DeviceWindow, DmaBudget, GrantError,
-        GrantInterrupt,
+        DeviceGrant, DeviceGrantRegistry, DeviceName, DmaBudget, GrantError, GrantInterrupt,
     };
+    use crate::buffer::{GuestMemory, Span, ViewError, ViewTable, WASM_PAGE_BYTES};
     use helios_hal::device::{DeviceRegion, DeviceRegionAttributes, DmaCapability};
     use helios_hal::iommu::{DmaTranslation, PhysicalRange};
     use helios_hal::vmm::VirtAddr;
 
-    const RESERVATION_BYTES: u64 = 1 << 32;
-    const WINDOW_BASE: usize = 0x1_0000_0000;
+    /// Where the tests pretend the owner's linear memory sits, and how
+    /// far it has grown.
+    const MEMORY_BASE: usize = 0x1_0000_0000;
+    const MEMORY_BYTES: u64 = 64 * WASM_PAGE_BYTES;
 
-    fn window() -> DeviceWindow {
-        DeviceWindow::top_of(VirtAddr::new(WINDOW_BASE), RESERVATION_BYTES)
+    fn memory() -> GuestMemory {
+        GuestMemory::new(VirtAddr::new(MEMORY_BASE), MEMORY_BYTES)
+    }
+
+    /// `pages` wasm pages of the owner's memory starting at page `first`.
+    const fn pages(first: u64, pages: u64) -> Span {
+        Span::new(first * WASM_PAGE_BYTES, pages * WASM_PAGE_BYTES)
     }
 
     fn budget(address_bits: u32, byte_budget: u64) -> DmaBudget {
@@ -156,12 +160,13 @@ mod tests {
     #[test]
     fn a_second_owner_is_refused_the_device_the_first_holds() {
         let registry = registry(&["test:alpha"]);
+        let mut views = ViewTable::new();
         let first = registry
-            .claim("test:alpha", window())
+            .claim("test:alpha", views.group())
             .expect("the first owner gets the device");
 
         assert_eq!(
-            registry.claim("test:alpha", window()).err(),
+            registry.claim("test:alpha", views.group()).err(),
             Some(GrantError::AlreadyClaimed)
         );
 
@@ -169,94 +174,187 @@ mod tests {
         // supervisor restarting a dead driver is not blocked by the
         // instance it just killed.
         drop(first);
-        assert!(registry.claim("test:alpha", window()).is_ok());
+        assert!(registry.claim("test:alpha", views.group()).is_ok());
     }
 
     #[test]
     fn a_device_nobody_discovered_cannot_be_claimed() {
         let registry = registry(&["test:alpha"]);
+        let mut views = ViewTable::new();
 
         assert_eq!(
-            registry.claim("test:missing", window()).err(),
+            registry.claim("test:missing", views.group()).err(),
             Some(GrantError::NotFound)
         );
     }
 
-    /// Every mapping change ends in a translation-cache shootdown, so
-    /// the count of them is what proves a region became reachable and
-    /// then provably unreachable again.
+    /// Every substitution ends in a translation-cache shootdown, so the
+    /// count of them is what proves a region became reachable at the
+    /// span the owner named and then provably unreachable again.
     #[test]
-    fn mapping_a_region_and_reclaiming_it_shoots_down_both_times() {
+    fn a_region_is_shown_where_the_owner_said_and_reclaim_ends_it() {
         let registry = registry(&["test:alpha"]);
+        let mut views = ViewTable::new();
         let mut lease = registry
-            .claim("test:alpha", window())
+            .claim("test:alpha", views.group())
             .expect("the device is free");
         let before = test_hooks::shootdowns();
 
-        let first = lease.map_region(0).expect("the register region maps");
-        let second = lease.map_region(1).expect("the aperture maps");
+        lease
+            .map_region(0, &mut views, memory(), pages(4, 1))
+            .expect("the register region is shown");
+        lease
+            .map_region(1, &mut views, memory(), pages(9, 1))
+            .expect("the aperture is shown");
 
-        assert_eq!(first.offset, window().offset());
-        assert_eq!(first.bytes, 0x2000);
-        assert_eq!(second.offset, window().offset() + 0x2000);
-        assert_eq!(second.bytes, 0x1000);
+        let changes = test_hooks::changes();
+        let shown: alloc::vec::Vec<_> = changes
+            .iter()
+            .filter_map(|change| match change {
+                MappingChange::SubstituteDevice(virt) => Some(*virt),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            shown[shown.len() - 2..],
+            [
+                helios_hal::vmm::VirtRange::new(
+                    VirtAddr::new(MEMORY_BASE + 4 * WASM_PAGE_BYTES as usize),
+                    0x2000
+                ),
+                helios_hal::vmm::VirtRange::new(
+                    VirtAddr::new(MEMORY_BASE + 9 * WASM_PAGE_BYTES as usize),
+                    0x1000
+                ),
+            ],
+            "only the region's own pages are substituted, at the start of the span"
+        );
         assert_eq!(test_hooks::shootdowns() - before, 2);
+        assert_eq!(lease.stats().mapped_regions, 2);
 
-        // Asking again answers rather than mapping twice.
-        assert_eq!(lease.map_region(0).expect("already mapped"), first);
-        assert_eq!(test_hooks::shootdowns() - before, 2);
-
+        lease
+            .end_views(&mut views)
+            .unwrap_or_else(|error| panic!("the views end: {error}"));
         drop(lease);
         assert_eq!(
             test_hooks::shootdowns() - before,
             4,
-            "both regions are unmapped, each with its own shootdown"
+            "both regions are restored, each with its own shootdown"
         );
         let tail = &test_hooks::changes()[test_hooks::changes().len() - 2..];
         assert!(
             tail.iter()
-                .all(|change| matches!(change, MappingChange::UnmapDevice(_))),
-            "reclaim ends in unmaps, not in anything else"
+                .all(|change| matches!(change, MappingChange::Restore(_))),
+            "reclaim ends in zeroed memory put back, not in anything else"
         );
+        assert!(views.is_empty());
+    }
+
+    /// A region is shown once. A second span would be a second path to
+    /// the same registers in memory the owner's allocator thinks is free.
+    #[test]
+    fn a_region_already_shown_is_refused_a_second_span() {
+        let registry = registry(&["test:alpha"]);
+        let mut views = ViewTable::new();
+        let mut lease = registry
+            .claim("test:alpha", views.group())
+            .expect("the device is free");
+        lease
+            .map_region(0, &mut views, memory(), pages(0, 1))
+            .expect("the register region is shown");
+
+        assert_eq!(
+            lease.map_region(0, &mut views, memory(), pages(2, 1)),
+            Err(GrantError::RegionAlreadyMapped)
+        );
+        assert_eq!(views.len(), 1);
+    }
+
+    /// Every way a span can be wrong is refused before anything changes
+    /// in the owner's memory.
+    #[test]
+    fn a_region_at_a_bad_span_is_refused() {
+        let registry = registry(&["test:alpha"]);
+        let mut views = ViewTable::new();
+        let mut lease = registry
+            .claim("test:alpha", views.group())
+            .expect("the device is free");
+        let before = test_hooks::shootdowns();
+
+        assert_eq!(
+            lease.map_region(0, &mut views, memory(), Span::new(4096, WASM_PAGE_BYTES)),
+            Err(GrantError::View(ViewError::Misaligned))
+        );
+        assert_eq!(
+            lease.map_region(0, &mut views, memory(), pages(0, 2)),
+            Err(GrantError::View(ViewError::WrongLength {
+                expected: WASM_PAGE_BYTES,
+                given: 2 * WASM_PAGE_BYTES,
+            }))
+        );
+        assert_eq!(
+            lease.map_region(0, &mut views, memory(), pages(64, 1)),
+            Err(GrantError::View(ViewError::OutOfBounds {
+                memory_bytes: MEMORY_BYTES
+            }))
+        );
+        assert_eq!(test_hooks::shootdowns(), before, "nothing was substituted");
     }
 
     #[test]
     fn a_region_the_device_does_not_have_is_refused() {
         let registry = registry(&["test:alpha"]);
+        let mut views = ViewTable::new();
         let mut lease = registry
-            .claim("test:alpha", window())
+            .claim("test:alpha", views.group())
             .expect("the device is free");
 
-        assert_eq!(lease.map_region(7).err(), Some(GrantError::NoSuchRegion));
+        assert_eq!(
+            lease.map_region(7, &mut views, memory(), pages(0, 1)),
+            Err(GrantError::NoSuchRegion)
+        );
     }
 
+    /// The ring is the owner's memory and the device's at once, and its
+    /// frames go back only after the owner's view of them has ended.
     #[test]
-    fn a_pinned_buffer_is_contiguous_addressable_and_released_on_death() {
+    fn a_pinned_buffer_is_shown_where_the_owner_said_and_freed_after_its_view() {
         let registry = registry(&["test:alpha"]);
+        let mut views = ViewTable::new();
         let mut lease = registry
-            .claim("test:alpha", window())
+            .claim("test:alpha", views.group())
             .expect("the device is free");
         let before = test_hooks::shootdowns();
 
         let buffer = lease
-            .dma_alloc(4096, 4096)
+            .dma_alloc(4096, &mut views, memory(), pages(3, 1))
             .expect("the ring fits the budget");
 
-        assert_eq!(buffer.bytes, 4096);
-        assert!(buffer.offset >= window().offset());
-        assert_eq!(lease.stats().pinned_bytes, 4096);
+        assert_eq!(buffer.bytes, WASM_PAGE_BYTES);
+        assert_eq!(lease.stats().pinned_bytes, WASM_PAGE_BYTES);
         assert_eq!(test_hooks::shootdowns() - before, 1);
-
-        drop(lease);
-        assert_eq!(
-            test_hooks::shootdowns() - before,
-            2,
-            "the pin is released when the owner dies"
-        );
         assert!(matches!(
             test_hooks::changes().last(),
-            Some(MappingChange::Released(_))
+            Some(MappingChange::SubstituteMemory(virt, physical))
+                if virt.start.raw() == MEMORY_BASE + 3 * WASM_PAGE_BYTES as usize
+                    && physical.start == buffer.device_address
         ));
+
+        let mark = test_hooks::changes().len();
+        lease
+            .end_views(&mut views)
+            .unwrap_or_else(|error| panic!("the views end: {error}"));
+        drop(lease);
+        let after = &test_hooks::changes()[mark..];
+        let restored = after
+            .iter()
+            .position(|change| matches!(change, MappingChange::Restore(_)))
+            .expect("the owner's view ends");
+        let freed = after
+            .iter()
+            .position(|change| matches!(change, MappingChange::Freed(_)))
+            .expect("the ring is freed");
+        assert!(restored < freed, "the view ends before the frames go back");
     }
 
     #[test]
@@ -266,18 +364,25 @@ mod tests {
         registry
             .publish([DeviceGrant::new(
                 DeviceName::new("test:small").expect("short"),
-                budget(64, 8192),
+                budget(64, 2 * WASM_PAGE_BYTES),
             )])
             .expect("discovery publishes once");
+        let mut views = ViewTable::new();
         let mut lease = registry
-            .claim("test:small", window())
+            .claim("test:small", views.group())
             .expect("the device is free");
 
-        lease.dma_alloc(4096, 4096).expect("the first ring fits");
-        lease.dma_alloc(4096, 4096).expect("the second ring fits");
+        lease
+            .dma_alloc(4096, &mut views, memory(), pages(0, 1))
+            .expect("the first ring fits");
+        lease
+            .dma_alloc(4096, &mut views, memory(), pages(1, 1))
+            .expect("the second ring fits");
 
         assert_eq!(
-            lease.dma_alloc(4096, 4096).err(),
+            lease
+                .dma_alloc(4096, &mut views, memory(), pages(2, 1))
+                .err(),
             Some(GrantError::BudgetExhausted)
         );
     }
@@ -287,18 +392,25 @@ mod tests {
     /// than overflow the sum the budget is tested with.
     #[test]
     fn a_request_that_overflows_the_pinned_total_is_over_budget() {
-        const PINNED: u64 = 1 << 16;
         let registry = registry(&["test:alpha"]);
+        let mut views = ViewTable::new();
         let mut lease = registry
-            .claim("test:alpha", window())
+            .claim("test:alpha", views.group())
             .expect("the device is free");
 
         lease
-            .dma_alloc(PINNED, 4096)
+            .dma_alloc(4096, &mut views, memory(), pages(0, 1))
             .expect("the first buffer fits");
 
         assert_eq!(
-            lease.dma_alloc(u64::MAX - (PINNED - 1), 4096).err(),
+            lease
+                .dma_alloc(
+                    4096,
+                    &mut views,
+                    memory(),
+                    Span::new(WASM_PAGE_BYTES, u64::MAX - (WASM_PAGE_BYTES - 1)),
+                )
+                .err(),
             Some(GrantError::BudgetExhausted)
         );
     }
@@ -309,43 +421,55 @@ mod tests {
     #[test]
     fn a_buffer_of_no_bytes_is_refused_as_empty_rather_than_over_budget() {
         let registry = registry(&["test:alpha"]);
+        let mut views = ViewTable::new();
         let mut lease = registry
-            .claim("test:alpha", window())
+            .claim("test:alpha", views.group())
             .expect("the device is free");
 
         assert_eq!(
-            lease.dma_alloc(0, 4096).err(),
+            lease
+                .dma_alloc(4096, &mut views, memory(), Span::new(0, 0))
+                .err(),
             Some(GrantError::EmptyRequest)
         );
     }
 
-    /// The size comes from the driver, and rounding it up to the
-    /// mapping granule is where a hostile one reaches for the wrap: an
-    /// unchecked `next_multiple_of` turns a request for most of the
-    /// address space into a handful of bytes in a release build, and
-    /// the driver then hands that to hardware as a ring.
+    /// A ring at a span overlapping a region already shown is refused
+    /// before anything is pinned for it.
     #[test]
-    fn a_request_too_large_to_round_up_is_refused_rather_than_wrapped() {
+    fn a_ring_overlapping_a_shown_region_is_refused_before_it_is_pinned() {
         let registry = registry(&["test:alpha"]);
+        let mut views = ViewTable::new();
         let mut lease = registry
-            .claim("test:alpha", window())
+            .claim("test:alpha", views.group())
             .expect("the device is free");
+        lease
+            .map_region(0, &mut views, memory(), pages(5, 1))
+            .expect("the register region is shown");
+        let mark = test_hooks::changes().len();
 
         assert_eq!(
-            lease.dma_alloc(u64::MAX, 4096).err(),
-            Some(GrantError::WindowExhausted)
+            lease
+                .dma_alloc(4096, &mut views, memory(), pages(4, 2))
+                .err(),
+            Some(GrantError::View(ViewError::Overlap))
         );
+        assert_eq!(test_hooks::changes().len(), mark, "nothing was allocated");
+        assert_eq!(lease.stats().pinned_bytes, 0);
     }
 
     #[test]
     fn an_alignment_that_is_not_a_power_of_two_is_refused() {
         let registry = registry(&["test:alpha"]);
+        let mut views = ViewTable::new();
         let mut lease = registry
-            .claim("test:alpha", window())
+            .claim("test:alpha", views.group())
             .expect("the device is free");
 
         assert_eq!(
-            lease.dma_alloc(4096, 3072).err(),
+            lease
+                .dma_alloc(3072, &mut views, memory(), pages(0, 1))
+                .err(),
             Some(GrantError::BadAlignment)
         );
     }
@@ -373,8 +497,9 @@ mod tests {
     #[test]
     fn an_interrupt_reaches_an_owner_parked_on_another_processor() {
         let registry = registry(&["test:alpha"]);
+        let mut views = ViewTable::new();
         let lease = registry
-            .claim("test:alpha", window())
+            .claim("test:alpha", views.group())
             .expect("the device is free");
         lease.relay().unmask(0).expect("the source exists");
 
@@ -396,79 +521,30 @@ mod tests {
         );
     }
 
-    /// An instance's window sits at the top of the reservation the
-    /// kernel gives every linear memory, so the memory it displaces is
-    /// memory a 32-bit instance could never address.
+    /// Releasing ends the owner's views of the device and gives the
+    /// device back, in that order.
     #[test]
-    fn the_window_sits_above_everything_the_instance_can_address() {
-        let mut ownership = super::DeviceOwnership::new();
-        assert!(
-            ownership.window().is_none(),
-            "an instance whose memory the runtime has not resolved has nowhere to put a device"
-        );
-
-        ownership.set_memory(super::LinearMemory {
-            base: VirtAddr::new(WINDOW_BASE),
-            reservation_bytes: RESERVATION_BYTES,
-        });
-
-        let window = ownership.window().expect("a resolved memory has a window");
-        assert_eq!(
-            window.offset(),
-            RESERVATION_BYTES - super::DEVICE_WINDOW_BYTES
-        );
-        assert_eq!(window.bytes(), super::DEVICE_WINDOW_BYTES);
-        assert!(
-            ownership.growth_limit().is_none(),
-            "an instance holding no device pays nothing for the path existing"
-        );
-    }
-
-    /// The cap exists so a `memory.grow` cannot land on a register
-    /// file, and it exists only while there is a register file to land
-    /// on.
-    #[test]
-    fn holding_a_device_caps_the_instance_s_growth_at_the_window() {
+    fn releasing_a_device_ends_its_views_and_gives_it_back() {
         let registry = registry(&["test:alpha"]);
+        let mut views = ViewTable::new();
         let mut ownership = super::DeviceOwnership::new();
-        ownership.set_memory(super::LinearMemory {
-            base: VirtAddr::new(WINDOW_BASE),
-            reservation_bytes: RESERVATION_BYTES,
-        });
-
         ownership
-            .claim(&registry, "test:alpha")
+            .claim(&registry, "test:alpha", &mut views)
             .expect("the device is free");
-
-        assert_eq!(
-            ownership.growth_limit(),
-            Some(RESERVATION_BYTES - super::DEVICE_WINDOW_BYTES)
-        );
+        ownership
+            .lease_mut()
+            .expect("a claim leaves a lease")
+            .map_region(0, &mut views, memory(), pages(0, 1))
+            .expect("the register region is shown");
         assert!(ownership.holds_device());
 
-        ownership.release();
-        assert!(ownership.growth_limit().is_none());
+        ownership.release(&mut views).expect("the view ends");
+
+        assert!(views.is_empty(), "no view of the device outlives the grant");
+        assert!(!ownership.holds_device());
         assert!(
-            registry.claim("test:alpha", window()).is_ok(),
+            registry.claim("test:alpha", views.group()).is_ok(),
             "releasing gives the device back"
-        );
-    }
-
-    /// An instance that has already grown over the window cannot be
-    /// given a device: the mapping would land on memory it is using.
-    #[test]
-    fn an_instance_that_grew_over_the_window_cannot_be_given_a_device() {
-        let registry = registry(&["test:alpha"]);
-        let mut ownership = super::DeviceOwnership::new();
-        ownership.set_memory(super::LinearMemory {
-            base: VirtAddr::new(WINDOW_BASE),
-            reservation_bytes: RESERVATION_BYTES,
-        });
-        ownership.note_growth(RESERVATION_BYTES - super::DEVICE_WINDOW_BYTES + 1);
-
-        assert_eq!(
-            ownership.claim(&registry, "test:alpha"),
-            Err(GrantError::WindowExhausted)
         );
     }
 
@@ -477,17 +553,14 @@ mod tests {
     #[test]
     fn an_instance_holds_one_device_at_a_time() {
         let registry = registry(&["test:alpha", "test:beta"]);
+        let mut views = ViewTable::new();
         let mut ownership = super::DeviceOwnership::new();
-        ownership.set_memory(super::LinearMemory {
-            base: VirtAddr::new(WINDOW_BASE),
-            reservation_bytes: RESERVATION_BYTES,
-        });
         ownership
-            .claim(&registry, "test:alpha")
+            .claim(&registry, "test:alpha", &mut views)
             .expect("the first device is free");
 
         assert_eq!(
-            ownership.claim(&registry, "test:beta"),
+            ownership.claim(&registry, "test:beta", &mut views),
             Err(GrantError::AlreadyClaimed)
         );
     }

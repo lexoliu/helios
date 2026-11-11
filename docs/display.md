@@ -23,41 +23,42 @@ shortage.
 
 Nowhere the kernel owns.
 
-A surface's frame buffer is pinned, physically contiguous memory
-committed from the claiming instance's own pool and placed at a fixed
-offset inside that instance's linear memory. Those same pages are what
-the display engine is told to read. So:
+A surface's frame buffer is two objects. The **buffer** is a pinned,
+physically contiguous run of frames charged to the claiming instance's
+own pool; it has no address of its own, and it is what the display
+engine is told to read. The **view** is that buffer appearing in the
+instance's linear memory, at pages the instance chose, below
+`memory.size`. So:
 
-- A compositor draws a frame with ordinary stores into
-  `surface.buffer()`. No call, no copy, no staging buffer.
+- A compositor draws a frame with ordinary stores, `memory.copy` and
+  `memory.fill` into the view. No call, no copy, no staging buffer.
+  Every byte it touches is inside its own memory by the runtime's own
+  account, so a scalar access and a bulk one are bounded identically.
 - `surface.present(region)` is one `TRANSFER_TO_HOST_2D` of the
   rectangle that changed and one `RESOURCE_FLUSH`. The kernel never
   touches a pixel.
 - A compositor that asks for a larger surface grows its *own* memory
   accounting. The kernel's does not move.
 
-The pages go in the **display window** — the span immediately below the
-device window `docs/device-grants.md` describes, at the top of the
-instance's linear-memory reservation, above everything it can grow into.
-The instance's growth is capped below the window for as long as it holds
-the display, so a `memory.grow` can never land on a frame buffer the
-display engine is scanning out. That is the same mechanism a granted
-device's registers use, instantiated a second time rather than sharing
-one arena, so neither can run into the other.
+The instance picks the pages. `display.create(scanout, mode, format,
+buffer)` takes a `span` — `offset` and `length`, both whole 64 KiB wasm
+pages of the caller's own memory — and the length it needs is
+`width * height * 4` rounded up to whole pages. The guest's allocator is
+the only party that knows which of its pages are free, so
+`helios-api` takes a page-aligned block from the program's heap, passes
+its span, and holds the block and the kernel's surface in one value:
+`Surface::pixels` is a slice of the program's own heap, and the block is
+freed only after the surface has been released. A span that is not whole
+pages, reaches past `memory.size`, has the wrong length or overlaps a
+view already shown is refused with `bad-span`.
 
-| Window | Size | What lives there |
-| --- | --- | --- |
-| Device | `DEVICE_WINDOW_BYTES` (64 MiB) | a granted device's register mappings and DMA rings |
-| Display | `DISPLAY_WINDOW_BYTES` (256 MiB) | a claim's frame buffers and its cursor plane |
-
-The display window is sized for the large end of what a compositor asks
-a single machine's display engine for: a handful of surfaces at 4K in a
-32-bit format, whose frames are 33 MiB each. Reaching the end of it is
-answered with `window-exhausted` rather than quietly reusing memory the
-display engine may still be reading. A surface's span comes back to the
-arena when it is the most recent one — which is what changing mode does
-— and otherwise stays held until the claim ends, exactly as a granted
-device's pinned rings are held for as long as the grant.
+The kernel substitutes the backing of the span in one step, from the
+task that runs the instance, and only for an unshared memory, so nothing
+else reads the span while it changes. What the pages held before is
+discarded and the frame starts zeroed. When the view ends the span is
+ordinary zeroed memory again. There is no per-instance reservation, no
+fixed region to run out of and no growth cap: a surface costs the pages
+the program's allocator gave it and the frames charged to its pool.
 
 ## The pointer is the display engine's
 
@@ -98,15 +99,19 @@ display path needs.
 ## Letting go
 
 A claim is let go by a *drop* — the store's, when whatever killed the
-instance drops it — and a drop cannot await anything. So the release
-does neither of the two obvious things:
+instance drops it — and a drop cannot await anything. The view and the
+buffer behind it end at different moments, because they have different
+holders:
 
-1. It does not tell the device. That is asynchronous, and the drop
-   raises a signal the control server races against its inbox instead.
-2. It does not free the pages. The display engine may still be scanning
-   them out. The arena is handed to the control server, which blanks
+1. The view belongs to the store and ends with it, synchronously,
+   before the runtime resets the instance's memory slot. The span is
+   ordinary zeroed memory again, and the slot is reusable at once.
+2. The buffer does not end there. The display engine may still be
+   scanning it out, so the drop does not tell the device — that is
+   asynchronous — and does not free the frames. It raises a signal the
+   control server races against its inbox. The control server blanks
    every output, takes the pointer off, drops every resource, and only
-   then lets the arena go — the point at which the pages are the
+   then lets the buffer go — the point at which the frames are the
    instance's pool's again.
 
 Between those two moments the display is neither held nor free: the

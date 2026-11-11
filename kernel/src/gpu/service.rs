@@ -38,28 +38,26 @@
 //! resources back. The submit server may still be holding one: a
 //! request it already popped is in flight until the device answers it,
 //! and the release waits that count out — a chain parked for ring room
-//! otherwise publishes after `CTX_DESTROY`, onto command pages the
-//! release is about to free.
+//! otherwise publishes after `CTX_DESTROY`, naming a context the device
+//! has already forgotten.
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
-use concurrent_queue::ConcurrentQueue;
 use futures::channel::oneshot;
 use helios_hal::device::DeviceRegion;
 use helios_hal::display::{
     BlobId, BlobMemory, BlobUsage, CapsetId, CapsetList, ContextId, ContextName, FenceId,
 };
 use helios_hal::iommu::PhysicalRange;
-use helios_hal::pmm::PhysFrameRange;
 use triomphe::Arc;
 
+use crate::buffer::Buffer;
 use crate::component::{ProviderError, ProviderSender};
 use crate::display::SequenceSignal;
 use crate::exec::Notify;
 
 use super::Gpu3dServiceError;
-use super::GpuPins;
 
 /// Requests one claim may have in flight on each queue before its next
 /// one waits for room.
@@ -152,10 +150,10 @@ pub(crate) enum Gpu3dRequest {
 
 /// What one `CreateBlob` request describes.
 ///
-/// `backing` carries the claiming instance's own pinned run for the
+/// `backing` carries the claiming instance's own buffer for the
 /// guest-backed kinds and is absent for a host-3D blob, whose storage
-/// is the renderer's.
-#[derive(Clone, Copy)]
+/// is the renderer's. The owner task's record of the blob keeps it for
+/// as long as the device does.
 pub(crate) struct BlobSpec {
     /// The renderer context the resource belongs to.
     pub(crate) context: ContextId,
@@ -167,9 +165,8 @@ pub(crate) struct BlobSpec {
     pub(crate) size: u64,
     /// The host-side identifier the resource is shared under, or 0.
     pub(crate) host_id: u64,
-    /// The claiming instance's own pinned run, for the guest-backed
-    /// kinds.
-    pub(crate) backing: Option<PhysFrameRange>,
+    /// The claiming instance's own buffer, for the guest-backed kinds.
+    pub(crate) backing: Option<Buffer>,
 }
 
 impl Gpu3dRequest {
@@ -200,8 +197,12 @@ pub(crate) enum SubmitRequest {
     Submit {
         generation: u64,
         context: ContextId,
-        /// The guest's own pinned pages the device is to read the
-        /// command stream out of, by physical run.
+        /// The command buffer the run below lies in, held until the
+        /// device has answered so its pages cannot go back to the pool
+        /// while the device may still be reading them.
+        buffer: Buffer,
+        /// The run of `buffer` the device is to read the command stream
+        /// out of.
         commands: PhysicalRange,
         fence: FenceId,
         fences: Arc<SequenceSignal>,
@@ -260,13 +261,6 @@ pub(super) struct Gpu3dShared {
     /// never again: a renderer is a property of the host's build, not
     /// of anything the machine does while it runs.
     pub(super) renders: bool,
-    /// The pinned pages of a claim that has been let go, waiting for
-    /// the owner task to stop the renderer reading them.
-    ///
-    /// One slot, and one is provably enough: there is at most one claim
-    /// at a time, and the claim word does not return to
-    /// [`ClaimState::FREE`] until this has been drained.
-    pub(super) returned: ConcurrentQueue<GpuPins>,
 }
 
 /// One submission the submit server has taken out of the queue and the
@@ -274,10 +268,10 @@ pub(super) struct Gpu3dShared {
 ///
 /// Held from the pop — before the generation check — until the device
 /// has answered, because the release path drains this count before it
-/// destroys a context or frees a page: a submission still parked for
-/// ring room publishes onto the control ring whenever the device takes
-/// it, and a context destroyed underneath one leaves the engine
-/// reading command memory the release already handed back to the pool.
+/// destroys a context: a submission still parked for ring room
+/// publishes onto the control ring whenever the device takes it, and a
+/// context destroyed underneath one leaves the engine running a command
+/// stream against a context it has already torn down.
 /// A request the check drops still counted: between the pop and the
 /// check it was in flight like any other, and a release that noticed
 /// the claim's end in that window must still be able to wait it out.
@@ -378,25 +372,6 @@ impl Gpu3dClaim {
             shared: self.shared.clone(),
             generation: self.generation,
         }
-    }
-
-    /// Hand this claim's pinned pages to the owner task.
-    ///
-    /// The pages are not freed here: the renderer may still be reading
-    /// a guest blob, and the owner task is what knows when it has
-    /// stopped. Called by the store's own drop, so it neither allocates
-    /// nor waits.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the slot is already occupied, which would mean two
-    /// claims existed at once — the one invariant the claim word is
-    /// there to keep.
-    pub(super) fn return_pins(&self, pins: GpuPins) {
-        self.shared
-            .returned
-            .push(pins)
-            .unwrap_or_else(|_| panic!("two 3D claims returned their pages at once"));
     }
 }
 

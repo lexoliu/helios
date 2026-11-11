@@ -6,7 +6,8 @@
 //! blob back.
 //!
 //! Nothing the renderer speaks goes through a call. A command buffer is
-//! memory the kernel pinned inside this program's own linear memory, so
+//! whole pages of this program's own heap that the kernel backs with
+//! pinned frames for as long as the buffer lives, so
 //! [`CommandBuffer::bytes`] is an ordinary mutable slice and filling it
 //! is writing to it. [`Context::submit`] then costs one round trip and
 //! copies nothing: the display engine reads the same bytes, and the
@@ -22,9 +23,11 @@ use std::vec::Vec;
 use thiserror::Error;
 
 use crate::bindings::helios::system::gpu as raw;
+use crate::memory::{Backed, Block, BlockError};
 use crate::wit_bindgen::StreamReader;
 
-pub use crate::bindings::helios::system::gpu::{BlobMemory, BlobUsage, CapsetInfo, Placement};
+pub use crate::bindings::helios::system::gpu::{BlobMemory, BlobUsage, CapsetInfo};
+pub use crate::memory::Span;
 
 /// Why a 3D request was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
@@ -45,6 +48,8 @@ pub enum GpuError {
     TooManyContexts,
     #[error("this claim already holds as many blobs as it may")]
     TooManyBlobs,
+    #[error("this claim already shows as many buffers in this instance's memory as it may")]
+    TooManyViews,
     #[error("the blob request does not describe a resource this engine can create")]
     InvalidBlob,
     #[error("the display engine's host-visible aperture has no room left")]
@@ -53,12 +58,18 @@ pub enum GpuError {
     OutOfBounds,
     #[error("a fence must come after every fence this context has already submitted")]
     StaleFence,
-    #[error("this program's 3D window has no room left")]
-    WindowExhausted,
+    #[error("the pages are not a whole-page run of this program's memory, or do not suit the blob")]
+    BadSpan,
+    #[error("the blob's host storage is already shown in this program's memory")]
+    AlreadyMapped,
+    #[error("the blob's host storage is not shown in this program's memory")]
+    NotMapped,
     #[error("no contiguous run of memory left for a command buffer")]
     OutOfMemory,
     #[error("the display engine faulted")]
     DeviceFault,
+    #[error("this program's heap cannot supply the pages: {0}")]
+    Heap(#[from] BlockError),
 }
 
 impl From<raw::Error> for GpuError {
@@ -72,11 +83,14 @@ impl From<raw::Error> for GpuError {
             raw::Error::UnsupportedContext => Self::UnsupportedContext,
             raw::Error::TooManyContexts => Self::TooManyContexts,
             raw::Error::TooManyBlobs => Self::TooManyBlobs,
+            raw::Error::TooManyViews => Self::TooManyViews,
             raw::Error::InvalidBlob => Self::InvalidBlob,
             raw::Error::ApertureExhausted => Self::ApertureExhausted,
             raw::Error::OutOfBounds => Self::OutOfBounds,
             raw::Error::StaleFence => Self::StaleFence,
-            raw::Error::WindowExhausted => Self::WindowExhausted,
+            raw::Error::BadSpan => Self::BadSpan,
+            raw::Error::AlreadyMapped => Self::AlreadyMapped,
+            raw::Error::NotMapped => Self::NotMapped,
             raw::Error::OutOfMemory => Self::OutOfMemory,
             raw::Error::DeviceFault => Self::DeviceFault,
         }
@@ -131,6 +145,10 @@ impl Gpu {
     /// `memory` says where its storage lives and `usage` what it may be
     /// used for; `host_id` lets the host share the resource with other
     /// guests and is `0` when it does not.
+    ///
+    /// A blob with pages of its own ([`BlobMemory::Guest`],
+    /// [`BlobMemory::Host3dGuest`]) takes them from this program's heap,
+    /// sized to `size`, and they start zeroed.
     pub async fn create_blob(
         &self,
         context: &Context,
@@ -139,11 +157,28 @@ impl Gpu {
         size: u64,
         host_id: u64,
     ) -> Result<Blob, GpuError> {
-        self.raw
-            .create_blob(&context.raw, memory, usage, size, host_id)
+        let pages = match memory {
+            BlobMemory::Guest | BlobMemory::Host3dGuest => Some(Block::zeroed(size)?),
+            BlobMemory::Host3d => None,
+        };
+        let raw = self
+            .raw
+            .create_blob(
+                &context.raw,
+                memory,
+                usage,
+                size,
+                host_id,
+                pages.as_ref().map(Block::span),
+            )
             .await
-            .map(|raw| Blob { raw })
-            .map_err(GpuError::from)
+            .map_err(GpuError::from)?;
+        Ok(Blob {
+            raw,
+            mapping: None,
+            pages,
+            size,
+        })
     }
 }
 
@@ -154,12 +189,20 @@ pub struct Context {
 
 impl Context {
     /// Pin `bytes` of this program's memory as a command buffer.
+    ///
+    /// The kernel pins every page of the span, so the buffer is `bytes`
+    /// rounded up to whole wasm pages ([`CommandBuffer::len`]); its
+    /// pages come from this program's heap and start zeroed.
     pub async fn commands(&self, bytes: u64) -> Result<CommandBuffer, GpuError> {
-        self.raw
-            .commands(bytes)
+        let block = Block::whole_pages(bytes)?;
+        let raw = self
+            .raw
+            .commands(block.span())
             .await
-            .map(|raw| CommandBuffer { raw })
-            .map_err(GpuError::from)
+            .map_err(GpuError::from)?;
+        Ok(CommandBuffer {
+            pages: Backed::new(raw, block),
+        })
     }
 
     /// Hand the device `length` bytes of `commands` starting at
@@ -177,7 +220,7 @@ impl Context {
         fence: u64,
     ) -> Result<(), GpuError> {
         self.raw
-            .submit(&commands.raw, offset, length, fence)
+            .submit(commands.pages.resource(), offset, length, fence)
             .await
             .map_err(GpuError::from)
     }
@@ -208,97 +251,104 @@ impl Context {
 /// stream, written with ordinary stores. The buffer is reusable: write
 /// the commands, submit a run, and write the next over the same pages
 /// once their fence has retired.
+///
+/// The kernel resource and the heap pages the buffer is shown in are one
+/// value (see [`Backed`]): dropping the buffer makes the pages ordinary
+/// memory again, and only then gives them back to the allocator.
 pub struct CommandBuffer {
-    raw: raw::CommandBuffer,
+    pages: Backed<raw::CommandBuffer>,
 }
 
 impl CommandBuffer {
-    /// Where this buffer sits in this program's linear memory.
-    pub fn placement(&self) -> Placement {
-        self.raw.buffer()
+    /// The pages of this program's memory the buffer is shown at.
+    pub fn span(&self) -> Span {
+        self.pages.span()
+    }
+
+    /// How many bytes the buffer holds.
+    pub const fn len(&self) -> usize {
+        self.pages.len()
+    }
+
+    /// Whether the buffer holds no bytes, which it never does.
+    pub const fn is_empty(&self) -> bool {
+        self.pages.is_empty()
     }
 
     /// The buffer itself.
     ///
     /// What is written here is what the display engine reads when
     /// [`Context::submit`] names it — there is no staging copy
-    /// anywhere.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the kernel placed the buffer somewhere this program
-    /// cannot address, which would mean the two disagree about the size
-    /// of a pointer.
+    /// anywhere. The slice is this program's own heap, valid for as long
+    /// as the borrow of the buffer.
     pub fn bytes(&mut self) -> &mut [u8] {
-        let placement = self.raw.buffer();
-        let offset = usize::try_from(placement.offset)
-            .expect("the kernel places a command buffer inside this program's address space");
-        let length = usize::try_from(placement.length)
-            .expect("the kernel places a command buffer inside this program's address space");
-        // SAFETY: the kernel pinned `length` bytes of physically
-        // contiguous memory at `offset` in this program's linear memory
-        // and mapped them readable and writable for as long as this
-        // buffer exists. Nothing else in this program can reach them:
-        // the offset is above everything the allocator can ever hand
-        // out, because the kernel caps this program's memory growth
-        // below it while it holds the 3D engine.
-        unsafe { core::slice::from_raw_parts_mut(offset as *mut u8, length) }
+        self.pages.bytes_mut()
     }
 }
 
 /// One blob resource.
 ///
 /// Where its bytes live depends on its memory kind: a guest-backed
-/// blob's are this program's pinned pages at [`Blob::pages`]; a host-3D
-/// blob's are the renderer's, reached through [`Blob::map`].
+/// blob's are this program's pinned pages, reached through
+/// [`Blob::bytes`]; a host-3D blob's are the renderer's, reached through
+/// [`Blob::map`]. A host-3D-guest blob has both.
+///
+/// The kernel resource comes first and the heap pages it is shown in
+/// after it, for the reason [`Backed`] gives: dropping the blob
+/// destroys it, which makes every span it was shown at ordinary memory
+/// again, and only then are the pages freed. The pages are private and
+/// never handed out except as a borrow of the blob.
 pub struct Blob {
     raw: raw::Blob,
+    /// Where the aperture storage is shown, while it is.
+    mapping: Option<Block>,
+    /// The blob's own pinned pages, for the guest-backed kinds.
+    pages: Option<Block>,
+    size: u64,
 }
 
 impl Blob {
-    /// Where this blob's own pages sit in linear memory, for the
-    /// guest-backed kinds; `None` for a host-3D blob, which has none.
-    pub fn pages(&self) -> Option<Placement> {
-        self.raw.buffer()
+    /// The pages of this program's memory the blob's own pages are shown
+    /// at, for the guest-backed kinds; `None` for a host-3D blob, which
+    /// has none.
+    pub fn span(&self) -> Option<Span> {
+        self.pages.as_ref().map(Block::span)
     }
 
-    /// The guest-backed pages themselves, for the kinds that have them.
-    ///
-    /// # Panics
-    ///
-    /// Panics when this blob has no guest backing — a host-3D blob —
-    /// or when the kernel placed it somewhere this program cannot
-    /// address.
-    pub fn bytes(&mut self) -> &mut [u8] {
-        let placement = self
-            .raw
-            .buffer()
-            .expect("a host-3D blob has no guest pages of its own");
-        let offset = usize::try_from(placement.offset)
-            .expect("the kernel places a blob inside this program's address space");
-        let length = usize::try_from(placement.length)
-            .expect("the kernel places a blob inside this program's address space");
-        // SAFETY: the kernel pinned `length` bytes of physically
-        // contiguous memory at `offset` in this program's linear memory
-        // and mapped them readable and writable for as long as this
-        // blob exists.
-        unsafe { core::slice::from_raw_parts_mut(offset as *mut u8, length) }
+    /// The guest-backed pages themselves; `None` for a host-3D blob.
+    pub fn bytes(&mut self) -> Option<&mut [u8]> {
+        self.pages.as_mut().map(Block::bytes_mut)
+    }
+
+    /// The bytes of this blob's host storage, while it is mapped.
+    pub fn mapped(&mut self) -> Option<&mut [u8]> {
+        self.mapping.as_mut().map(Block::bytes_mut)
     }
 
     /// Place this blob's host storage in the engine's host-visible
-    /// aperture and report where it landed in this program's linear
-    /// memory.
+    /// aperture and show it in this program's memory.
     ///
-    /// The placement is a window onto memory the machine does not own:
-    /// the bytes behind it are the renderer's, and this program's
-    /// writes to them are the host's without a copy through either
-    /// side.
-    pub async fn map(&self) -> Result<Placement, GpuError> {
-        self.raw.map_blob().await.map_err(GpuError::from)
+    /// The pages are taken from this program's heap, sized to the blob.
+    /// The bytes shown are a window onto memory the machine does not
+    /// own: they are the renderer's, and this program's writes to them
+    /// are the host's without a copy through either side. They stay
+    /// until [`Blob::unmap`] or until the blob is dropped.
+    pub async fn map(&mut self) -> Result<&mut [u8], GpuError> {
+        let block = Block::zeroed(self.size)?;
+        self.raw
+            .map_blob(block.span())
+            .await
+            .map_err(GpuError::from)?;
+        Ok(self.mapping.insert(block).bytes_mut())
     }
 
     /// Take this blob back out of the aperture.
-    pub async fn unmap(&self) -> Result<(), GpuError> {
-        self.raw.unmap_blob().await.map_err(GpuError::from)
+    ///
+    /// The pages it was shown at are this program's ordinary memory
+    /// again, and are given back to the allocator.
+    pub async fn unmap(&mut self) -> Result<(), GpuError> {
+        self.raw.unmap_blob().await.map_err(GpuError::from)?;
+        self.mapping = None;
+        Ok(())
     }
 }

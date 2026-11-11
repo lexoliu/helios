@@ -28,8 +28,9 @@ use alloc::vec::Vec;
 
 use super::grant::{DeviceGrant, DeviceName, GrantError, GrantInterrupt};
 use super::interrupt::InterruptRelay;
-use super::lease::{DeviceWindow, GrantLease, PublishedDevice};
+use super::lease::{GrantLease, PublishedDevice};
 use super::platform::device_hooks_installed;
+use crate::buffer::ViewGroup;
 use crate::io::ExternalInterruptHandler;
 
 /// Devices one machine may grant away.
@@ -146,14 +147,15 @@ impl DeviceGrantRegistry {
             .find(|device| device.grant.name().as_str() == name)
     }
 
-    /// Take exclusive ownership of `name`, mapping its regions into the
-    /// linear memory `window` describes.
+    /// Take exclusive ownership of `name`. Every view the owner is later
+    /// given of the device — a region, a ring — goes in `views`, the set
+    /// that ends when the lease does.
     ///
     /// The second caller for a device that already has an owner gets
     /// [`GrantError::AlreadyClaimed`]; there is no queue, because a
     /// driver waiting for hardware another driver holds is a
     /// provisioning mistake rather than a transient shortage.
-    pub fn claim(&self, name: &str, window: DeviceWindow) -> Result<GrantLease, GrantError> {
+    pub fn claim(&self, name: &str, views: ViewGroup) -> Result<GrantLease, GrantError> {
         let device = self.device(name).ok_or(GrantError::NotFound)?;
         device
             .claimed
@@ -162,11 +164,9 @@ impl DeviceGrantRegistry {
         tracing::info!(
             target: "helios_kernel::device",
             device = name,
-            window_offset = window.offset(),
-            window_bytes = window.bytes(),
             "device grant claimed"
         );
-        Ok(GrantLease::new(device.clone(), window))
+        Ok(GrantLease::new(device.clone(), views))
     }
 
     /// Hand `source` to whichever published device raises it.

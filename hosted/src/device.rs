@@ -187,49 +187,6 @@ pub fn interrupt_controller_counts() -> (u64, u64) {
     )
 }
 
-fn map_device(virt: VirtRange, region: DeviceRegion) -> Result<(), AddressSpaceError> {
-    platform().address_space.map_device(virt, region)
-}
-
-fn unmap_device(virt: VirtRange) -> Result<(), AddressSpaceError> {
-    platform().address_space.unmap_device(virt)
-}
-
-/// The hosted machine cannot hand two owners the same bytes: its
-/// "physical" addresses are host virtual addresses inside one anonymous
-/// mapping, so there is nothing to map a second time. The address space
-/// says so — this backend has no display device either, and a compositor
-/// is what asks for a shared surface.
-fn map_shared(
-    virt: VirtRange,
-    physical: PhysicalRange,
-    flags: PageFlags,
-) -> Result<(), AddressSpaceError> {
-    platform().address_space.map_shared(virt, physical, flags)
-}
-
-fn unmap_shared(virt: VirtRange) -> Result<(), AddressSpaceError> {
-    platform().address_space.unmap_shared(virt)
-}
-
-fn commit_contiguous(
-    virt: VirtRange,
-    flags: PageFlags,
-    placement: DmaPlacement,
-) -> Result<PhysFrame, AddressSpaceError> {
-    platform()
-        .address_space
-        .commit_contiguous(virt, flags, placement)
-}
-
-fn release_contiguous(virt: VirtRange, _align: u64) -> Result<(), AddressSpaceError> {
-    // The host owns page-level placement under this backend's `mmap`,
-    // so a contiguous run is released the same way any other committed
-    // range is: there is no allocator here that was handed a size and
-    // an alignment to give back.
-    platform().address_space.decommit(virt)
-}
-
 fn allocate_run(bytes: usize, placement: DmaPlacement) -> Result<PhysicalRange, AddressSpaceError> {
     platform().address_space.allocate_run(bytes, placement)
 }
@@ -274,20 +231,14 @@ fn unmask(source: u32) {
     platform().unmasked.fetch_add(1, Ordering::Relaxed);
 }
 
-/// There is no physical memory under this backend: a commit's "frame"
-/// is the host address the mapping already lives at, so the kernel's
-/// alias for it is itself.
+/// There is no physical memory under this backend: a run's "frame" is
+/// the host address its backing already lives at, so the kernel's alias
+/// for it is itself.
 fn kernel_alias(frame: PhysFrame) -> VirtAddr {
     VirtAddr::new(frame.phys_addr())
 }
 
 static VM_HOOKS: DeviceVmHooks = DeviceVmHooks {
-    map_device,
-    unmap_device,
-    map_shared,
-    unmap_shared,
-    commit_contiguous,
-    release_contiguous,
     allocate_run,
     free_run,
     substitute_memory,
