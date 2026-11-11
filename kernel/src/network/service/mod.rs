@@ -32,10 +32,10 @@ use helios_netstack::{
     DhcpDnsServers, DhcpMessageType, DhcpPacket, DnsQuestionWriter, DnsRecordType, DnsResponse,
     EthernetFrame, EthernetProtocol, FlowTuple, IcmpEchoKey, IcmpEchoReply, Icmpv4Packet,
     Icmpv6Packet, InterfaceEventMark, IpAddress, IpCidr, IpProtocol, Ipv4Address, Ipv4Cidr,
-    Ipv4Packet, Ipv6Address, Ipv6Cidr, Ipv6Packet, MAX_OUTBOUND_FRAMES, NeighborEntry,
-    NetworkInterface as NetworkDevice, OutboundBatchStatus, Route, RouteTable, RxChecksumOffload,
-    RxDrain, RxFrame, SegmentationOffload, Stack, StackConfig, StackError, StackEvent,
-    StackInstant, TcpCloseKind, TcpConnectState, TcpConnectTerminalError, TcpEndpoint,
+    Ipv4Packet, Ipv6Address, Ipv6Cidr, Ipv6Packet, MAX_OUTBOUND_FRAMES, NeighborCache,
+    NeighborEntry, NetworkInterface as NetworkDevice, OutboundBatchStatus, Route, RouteTable,
+    RxChecksumOffload, RxDrain, RxFrame, SegmentationOffload, Stack, StackConfig, StackError,
+    StackEvent, StackInstant, TcpCloseKind, TcpConnectState, TcpConnectTerminalError, TcpEndpoint,
     TcpListenBacklog, TcpPacket, TcpReadIntoState, TcpReadState, TcpReceiveDiagnostics,
     TcpSendState, TcpStackCounters, UdpEgress, UdpEndpoint, UdpPacket, UdpPayload,
     UdpSocketBinding, UdpSocketError, flow_hash,
@@ -166,7 +166,7 @@ struct NetworkControlPlane {
     /// on the shard that received the Router Advertisement.
     ipv6_addresses: SnapshotCell<NetworkIpv6AddressTable>,
     routes: SnapshotCell<RouteTable>,
-    neighbors: SnapshotCell<NetworkNeighborTable>,
+    neighbors: SnapshotCell<NeighborCache>,
     dns_servers: SnapshotCell<DhcpDnsServers>,
     /// Recursive resolvers learned from a Router Advertisement's RDNSS
     /// option, the IPv6 counterpart of the DHCPv4 resolver list.
@@ -190,11 +190,6 @@ struct NetworkIpv6AddressTable {
 #[derive(Clone, Debug, Default)]
 struct NetworkIpv6DnsServers {
     entries: Vec<Ipv6Address>,
-}
-
-#[derive(Clone, Debug)]
-struct NetworkNeighborTable {
-    entries: Vec<NeighborEntry>,
 }
 
 /// What one queue pair's shard has moved, and how often its processor
@@ -364,7 +359,7 @@ impl NetworkControlPlane {
             ipv4_addresses: SnapshotCell::new(NetworkIpv4AddressTable::new()),
             ipv6_addresses: SnapshotCell::new(NetworkIpv6AddressTable::new()),
             routes: SnapshotCell::new(RouteTable::new()),
-            neighbors: SnapshotCell::new(NetworkNeighborTable::new()),
+            neighbors: SnapshotCell::new(NeighborCache::new()),
             dns_servers: SnapshotCell::new(DhcpDnsServers::new()),
             ipv6_dns_servers: SnapshotCell::new(NetworkIpv6DnsServers::default()),
         }
@@ -385,7 +380,7 @@ impl NetworkControlPlane {
             .replace_routes(self.routes.load_full().as_ref().clone());
         shard
             .stack
-            .replace_neighbors(self.neighbors.load_full().entries.iter().copied());
+            .replace_neighbors(self.neighbors.load_full().iter());
         shard.dns_servers = self.dns_servers.load_full().as_ref().clone();
     }
 
@@ -401,8 +396,7 @@ impl NetworkControlPlane {
         self.ipv6_dns_servers
             .store(StdArc::new(NetworkIpv6DnsServers::default()));
         self.routes.store(StdArc::new(RouteTable::new()));
-        self.neighbors
-            .store(StdArc::new(NetworkNeighborTable::new()));
+        self.neighbors.store(StdArc::new(NeighborCache::new()));
         self.dns_servers.store(StdArc::new(DhcpDnsServers::new()));
     }
 
@@ -420,9 +414,11 @@ impl NetworkControlPlane {
                 entries: shard.stack.ipv6_dns_servers().collect(),
             }));
         self.routes.store(StdArc::new(shard.stack.routes().clone()));
-        self.neighbors.store(StdArc::new(NetworkNeighborTable {
-            entries: shard.stack.neighbors().collect(),
-        }));
+        let mut neighbors = NeighborCache::new();
+        for entry in shard.stack.neighbors() {
+            neighbors.learn(entry, |address| shard.stack.routes().is_gateway(address));
+        }
+        self.neighbors.store(StdArc::new(neighbors));
         self.dns_servers
             .store(StdArc::new(shard.dns_servers.clone()));
     }
@@ -447,9 +443,13 @@ impl NetworkControlPlane {
         Ok(())
     }
 
-    fn update_neighbors(&self, update: impl FnOnce(&mut NetworkNeighborTable)) {
+    /// Records a neighbor a shard learned. The table is bounded like the
+    /// stacks' own and evicts by the same policy, keeping the routes'
+    /// gateways, so a flood of learned addresses cannot grow it.
+    fn learn_neighbor(&self, entry: NeighborEntry) {
+        let routes = self.routes.load_full();
         let mut neighbors = self.neighbors.load_full().as_ref().clone();
-        update(&mut neighbors);
+        neighbors.learn(entry, |address| routes.is_gateway(address));
         self.neighbors.store(StdArc::new(neighbors));
     }
 
@@ -534,26 +534,6 @@ impl NetworkIpv6AddressTable {
     fn new() -> Self {
         Self {
             entries: Vec::new(),
-        }
-    }
-}
-
-impl NetworkNeighborTable {
-    fn new() -> Self {
-        Self {
-            entries: Vec::new(),
-        }
-    }
-
-    fn learn(&mut self, entry: NeighborEntry) {
-        if let Some(existing) = self
-            .entries
-            .iter_mut()
-            .find(|existing| existing.ip == entry.ip)
-        {
-            *existing = entry;
-        } else {
-            self.entries.push(entry);
         }
     }
 }
