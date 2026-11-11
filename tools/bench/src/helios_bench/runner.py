@@ -41,6 +41,7 @@ from helios_bench.manifest import (
 )
 from helios_bench.report import (
     Control,
+    GuestIsa,
     Hardware,
     InstructionSampling,
     NoiseRetry,
@@ -686,9 +687,50 @@ def bootfs_cwasm_digests(lane: Lane, kernel_build: str) -> dict[str, str]:
     return {path.name: sha256_of(path) for path in sorted(prebuild.glob("*.cwasm"))}
 
 
-def collect_pins(lane: Lane, workloads: list[dict], kernel_build: str, baseline: Baseline | None) -> Pins:
+def guest_isa_of(run: dict, side: Side, *, required: bool) -> GuestIsa | None:
+    """The ISA level a Helios side's `run` record says its guest compiled for.
+
+    The `helios` side is the candidate, built from this commit, so its guest
+    always reports one and a record without it is a broken run. The baseline
+    image is an older commit that may predate the report.
+    """
+    raw = run.get("guest_isa")
+    if raw is None:
+        if required:
+            raise SystemExit(f"the {side} side's run record carries no `guest_isa`")
+        return None
+    return GuestIsa.model_validate(raw)
+
+
+def linux_wasmtime_isa_flags(run: dict) -> list[str]:
+    """The ISA flags the Linux guest's Wasmtime inferred, from its `run` record."""
+    flags = run.get("inferred_isa_flags")
+    if flags is None:
+        raise SystemExit("the linux_wasmtime side's run record carries no `inferred_isa_flags`")
+    return list(flags)
+
+
+def collect_pins(
+    lane: Lane,
+    workloads: list[dict],
+    kernel_build: str,
+    baseline: Baseline | None,
+    sides: dict[Side, RawSide],
+) -> Pins:
     image_url, image_sha256 = fedora_image(lane.guest_arch)
+    helios = sides.get(Side.HELIOS)
+    helios_baseline = sides.get(Side.HELIOS_BASELINE)
+    linux_wasmtime = sides.get(Side.LINUX_WASMTIME)
     return Pins(
+        guest_isa=guest_isa_of(helios.run, Side.HELIOS, required=True) if helios is not None else None,
+        baseline_guest_isa=(
+            guest_isa_of(helios_baseline.run, Side.HELIOS_BASELINE, required=False)
+            if helios_baseline is not None
+            else None
+        ),
+        linux_wasmtime_inferred_isa_flags=(
+            linux_wasmtime_isa_flags(linux_wasmtime.run) if linux_wasmtime is not None else None
+        ),
         wasmtime_revision=vendored_wasmtime_pin().revision,
         baseline_wasmtime_revision=baseline.wasmtime.revision if baseline is not None else None,
         wasmtime_linux_release=wasmtime_linux_release(lane.guest_arch),
@@ -1255,7 +1297,7 @@ def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) ->
             control=control,
             run=run,
             hardware=collect_hardware(lane),
-            pins=collect_pins(lane, workloads, options.kernel_build, options.baseline),
+            pins=collect_pins(lane, workloads, options.kernel_build, options.baseline, sides),
             thresholds=thresholds,
             first_pass=reconfirmation.first_pass,
         )

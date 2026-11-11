@@ -97,6 +97,9 @@ struct RuntimeStateInner<ProgramService, NetworkService, HostFsService> {
     /// What the platform's IOMMU confines, once the backend has built
     /// the domains. Empty on a machine whose devices are not behind one.
     iommu_report: Once<alloc::sync::Arc<crate::IommuReport>>,
+    /// The ISA level the program service compiles guest code for, set once
+    /// when the service is installed and reported through the statistics.
+    guest_isa: Once<crate::isa::GuestIsa>,
     /// The memory balloon the host resizes this guest through. Empty on
     /// a machine that gave the kernel none.
     balloon: Once<BalloonHandle>,
@@ -338,6 +341,7 @@ where
                 block_service: Once::new(),
                 device_grants: DeviceGrantRegistry::new(),
                 iommu_report: Once::new(),
+                guest_isa: Once::new(),
                 balloon: Once::new(),
                 swap: Once::new(),
                 display_service: Once::new(),
@@ -978,6 +982,18 @@ where
         self.inner.block_service.get().cloned()
     }
 
+    /// Publishes the ISA level the program service compiles guest code for.
+    ///
+    /// Called once, when the program service is installed.
+    pub(crate) fn install_guest_isa(&self, guest_isa: crate::isa::GuestIsa) {
+        let mut installed = false;
+        self.inner.guest_isa.call_once(|| {
+            installed = true;
+            guest_isa
+        });
+        assert!(installed, "guest ISA was installed more than once");
+    }
+
     /// Publishes what the platform's IOMMU confines.
     ///
     /// Called from the backend once every device it protects has been
@@ -1081,12 +1097,20 @@ where
 {
     pub fn snapshot(&self, current_ticks: u64) -> StatsSample {
         let uptime = self.ticks_to_nanos(current_ticks.saturating_sub(self.inner.boot_ticks));
+        // Every sample is read by a program or the debugger, which the
+        // program service runs, and the service installs this first.
+        let guest_isa =
+            self.inner.guest_isa.get().expect(
+                "statistics were sampled before the program service selected the guest ISA",
+            );
         StatsSample {
             timestamp: uptime,
             uptime,
             wall_clock: self.wall_clock_nanos(current_ticks),
             configured_processors: self.inner.processor_count,
             online_processors: self.inner.processor_count,
+            guest_isa_level: guest_isa.processor().base_name(),
+            guest_isa_extras: guest_isa.processor().extras().collect(),
             block: self.inner.block_service.get().map(BlockService::stats),
             iommu: self
                 .inner

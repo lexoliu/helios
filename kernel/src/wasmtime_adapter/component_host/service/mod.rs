@@ -548,6 +548,7 @@ where
             _marker: core::marker::PhantomData,
         }),
     };
+    debug_state.install_guest_isa(guest_isa);
     debug_state.install_program_service(service.clone());
     spawn_instruction_sample_drain(kernel, &service, debug_state);
     let plugin_context = ProgramExecContext {

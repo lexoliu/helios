@@ -70,6 +70,11 @@ pub struct StatsSample {
     pub wall_clock: u64,
     pub configured_processors: u32,
     pub online_processors: u32,
+    /// The ISA level guest code is compiled for, without the extras its
+    /// name appends (`x86-64-v4` for `x86-64-v4+vbmi+bitalg`).
+    pub guest_isa_level: &'static str,
+    /// The features guest code uses beyond `guest_isa_level`.
+    pub guest_isa_extras: Vec<&'static str>,
     /// The block device the kernel owns, absent on a machine that gave
     /// it none.
     pub block: Option<crate::BlockStats>,

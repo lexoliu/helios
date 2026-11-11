@@ -500,6 +500,8 @@ fn convert_sample(sample: host_stats::Sample) -> stats::Sample {
                 .into_iter()
                 .map(convert_processor)
                 .collect(),
+            guest_isa_level: sample.processors.guest_isa_level,
+            guest_isa_extras: sample.processors.guest_isa_extras,
         },
         memory: stats::Memory {
             total_bytes: sample.memory.total_bytes,

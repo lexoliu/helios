@@ -292,7 +292,42 @@ class Hardware(BaseModel):
     qemu_version: str | None
 
 
+class GuestIsa(BaseModel):
+    """The instruction-set level a Helios guest compiled guest code for."""
+
+    level: str = Field(description="the level name the guest reports, such as `x86-64-v4`")
+    extras: list[str] = Field(
+        description="the features the compiled code uses beyond `level`; empty when there are none"
+    )
+
+    def describe(self) -> str:
+        return "+".join([self.level, *self.extras])
+
+
 class Pins(BaseModel):
+    guest_isa: GuestIsa | None = Field(
+        default=None,
+        description=(
+            "the ISA level the `helios` side's guest compiled guest code for, as the guest "
+            "reported it over the inspector RPC; None for a report written before the "
+            "field existed, or one whose run did not boot the `helios` side"
+        ),
+    )
+    baseline_guest_isa: GuestIsa | None = Field(
+        default=None,
+        description=(
+            "the same for the `helios_baseline` side; None when the run was not paired or "
+            "the baseline commit's guest does not report it"
+        ),
+    )
+    linux_wasmtime_inferred_isa_flags: list[str] | None = Field(
+        default=None,
+        description=(
+            "the Cranelift ISA flags the Linux column's Wasmtime enabled on the Linux guest "
+            "(`wasmtime settings --json`, `inferred`), sorted; None for a report written "
+            "before the field existed, or one whose run did not time the `linux_wasmtime` side"
+        ),
+    )
     wasmtime_revision: str = Field(
         description="the Wasmtime fork revision the `helios` side was built against"
     )

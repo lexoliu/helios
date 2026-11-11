@@ -374,6 +374,27 @@ def median(values: list[float]) -> float:
     return (ordered[lower] + ordered[upper]) / 2
 
 
+def inferred_isa_flags(wasmtime_bin: str) -> list[str]:
+    """The Cranelift ISA flags Wasmtime enables on this machine, sorted.
+
+    `wasmtime settings --json` prints, under `inferred`, every boolean ISA
+    flag its own host detection turned on: what `wasmtime compile` and
+    `wasmtime run` compile this guest's wasm with. The benchmark report pins
+    it, because the Helios side compiles for the ISA level its own
+    processor probe selects and the two columns are comparable only while
+    the two sets are known.
+    """
+    completed = subprocess.run(
+        [wasmtime_bin, "settings", "--json"], capture_output=True, text=True, check=True
+    )
+    inferred = json.loads(completed.stdout).get("inferred")
+    if not isinstance(inferred, list):
+        raise SystemExit(
+            f"`{wasmtime_bin} settings --json` reported no `inferred` flag list: {completed.stdout[:200]!r}"
+        )
+    return sorted(inferred)
+
+
 def run_workloads(
     manifest_path: Path,
     names: list[str],
@@ -386,21 +407,19 @@ def run_workloads(
 ) -> None:
     manifest = load_manifest(manifest_path)
     env = os.environ.copy()
+    run_record = {
+        "type": "run",
+        "schema_version": SCHEMA_VERSION,
+        "side": side,
+        "manifest": str(manifest_path),
+        "iterations": iterations,
+        "selected_workloads": names,
+        "wasmtime_bin": context.wasmtime_bin,
+    }
+    if side == "linux_wasmtime":
+        run_record["inferred_isa_flags"] = inferred_isa_flags(context.wasmtime_bin)
     with output.open("w", encoding="utf-8") as handle:
-        handle.write(
-            json.dumps(
-                {
-                    "type": "run",
-                    "schema_version": SCHEMA_VERSION,
-                    "side": side,
-                    "manifest": str(manifest_path),
-                    "iterations": iterations,
-                    "selected_workloads": names,
-                    "wasmtime_bin": context.wasmtime_bin,
-                }
-            )
-            + "\n"
-        )
+        handle.write(json.dumps(run_record) + "\n")
         # Every workload gets an equal share of the budget the caller gave
         # this side, so no single cell can spend the whole of it.
         share = side_timeout_seconds / len(names) if side_timeout_seconds else None

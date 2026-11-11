@@ -83,6 +83,20 @@ impl IsaLevel {
         self.name
     }
 
+    /// The level's name up to its first `+`: the named level without the
+    /// extra features this level adds in its own name.
+    ///
+    /// A level name is `<base>` or `<base>+<extra>[+<extra>...]`.
+    pub fn base_name(&self) -> &'static str {
+        self.name.split('+').next().unwrap_or(self.name)
+    }
+
+    /// The extra features the level's name appends to its base, in name
+    /// order. Empty for a level named by its base alone.
+    pub fn extras(&self) -> impl Iterator<Item = &'static str> + use<> {
+        self.name.split('+').skip(1)
+    }
+
     /// The number of levels below this one: 0 for a floor.
     pub fn rank(&self) -> usize {
         let mut rank = 0;
@@ -426,6 +440,22 @@ mod tests {
                 .name(),
             "x86-64-v3"
         );
+    }
+
+    #[test]
+    fn a_level_name_splits_into_base_and_extras() {
+        let levels = cwasm_target_isa_levels(X86);
+        let top = levels.by_name("x86-64-v4+vbmi+bitalg").unwrap();
+        assert_eq!(top.base_name(), "x86-64-v4");
+        assert_eq!(top.extras().collect::<Vec<_>>(), ["vbmi", "bitalg"]);
+        let plain = levels.by_name("x86-64-v4").unwrap();
+        assert_eq!(plain.base_name(), "x86-64-v4");
+        assert_eq!(plain.extras().count(), 0);
+        let dotprod = cwasm_target_isa_levels(AARCH64)
+            .by_name("aarch64-lse-fp16-dotprod")
+            .unwrap();
+        assert_eq!(dotprod.base_name(), "aarch64-lse-fp16-dotprod");
+        assert_eq!(dotprod.extras().count(), 0);
     }
 
     #[test]
