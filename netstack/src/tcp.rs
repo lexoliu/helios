@@ -3068,6 +3068,16 @@ where
             || (matches!(self.state, TcpState::FinWait1 | TcpState::LastAck) && !self.fin_queued)
     }
 
+    /// Whether the socket holds bytes, or a FIN, that
+    /// [`TcpSocket::take_transmit_segment`] could still put on the wire.
+    ///
+    /// Taking a segment moves it into flight, so a caller that has to
+    /// secure somewhere to send it first asks this before taking: a
+    /// `false` answer means a take cannot produce a segment.
+    pub fn has_pending_transmit(&self) -> bool {
+        self.has_persist_pending_data()
+    }
+
     fn arm_persist_timer_if_needed(&mut self, now_nanos: u64) {
         if self.peer_receive_window != 0 || !self.has_persist_pending_data() {
             self.persist_timer = None;

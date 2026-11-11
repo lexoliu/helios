@@ -302,9 +302,11 @@ where
             // What was queued becomes a segment on this shard's egress
             // while the lock is already held; nothing else has to run
             // for the write to reach the wire.
-            state.stack.drive_tcp(now).unwrap_or_else(|error| {
-                tracing::debug!(?error, "failed to drive TCP after stream write")
-            });
+            state
+                .drive_tcp(now, &self.inner.control)
+                .unwrap_or_else(|error| {
+                    tracing::debug!(?error, "failed to drive TCP after stream write")
+                });
             Ok(progress)
         })?;
         let (transmitted, _) = self
@@ -1443,8 +1445,7 @@ where
         // the pump's pair for a pump.
         let drive_tcp = |state: &mut NetworkShard| {
             state
-                .stack
-                .drive_tcp(now)
+                .drive_tcp(now, &self.inner.control)
                 .unwrap_or_else(|error| tracing::debug!(?error, "failed to drive TCP control"));
         };
         match scope {

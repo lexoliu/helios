@@ -1074,6 +1074,25 @@ impl NetworkShard {
         self.stack.primary_ipv4_address().is_some()
     }
 
+    /// Drives the shard's TCP timers and hands the control plane what
+    /// the drive told it.
+    ///
+    /// Driving queues ARP and neighbor-discovery requests, and a
+    /// connection that closed on a timer leaves its closure behind, so a
+    /// shard that sends without ever receiving still owes the control
+    /// plane its events. Every place that drives a shard's stack goes
+    /// through here, the way a receive goes through
+    /// [`NetworkShardSet::dispatch_rx_frame`].
+    pub(super) fn drive_tcp(
+        &mut self,
+        now: StackInstant,
+        control: &NetworkControlPlane,
+    ) -> Result<(), StackError> {
+        let driven = self.stack.drive_tcp(now);
+        self.drain_control_events(control);
+        driven
+    }
+
     pub(super) fn drain_control_events(&mut self, control: &NetworkControlPlane) {
         while let Some(event) = self.stack.take_event() {
             match event {
