@@ -76,14 +76,9 @@ impl ReportedFrames {
         });
     }
 
-    /// Clears `range` and reports whether any of it had been shown to a
-    /// consumer, and therefore has to be zeroed before it is used again.
-    #[must_use]
-    pub(crate) fn take(&self, range: PhysFrameRange) -> bool {
-        self.take_bytes(range.start.phys_addr(), range.byte_size())
-    }
-
-    /// The byte-granular form of [`ReportedFrames::take`].
+    /// Clears the bytes `[start, start + len)` and reports whether any
+    /// of them had been shown to a consumer, and therefore have to be
+    /// zeroed before they are used again.
     ///
     /// A pool that serves sub-frame allocations can hand out part of a
     /// frame that was reported. Only the frames the allocation covers
