@@ -256,6 +256,7 @@ mod tests {
     use alloc::collections::BTreeSet;
     use alloc::string::String;
     use alloc::vec;
+    use alloc::vec::Vec;
 
     use crate::{
         AuthorityDomain, BootfsTree, ComponentHostFilesystemState, EmbeddedBootDirectory,
