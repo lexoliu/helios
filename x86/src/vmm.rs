@@ -87,6 +87,38 @@ struct PinnedRun {
     owned: bool,
 }
 
+/// # Concurrency contract
+///
+/// `state` is the one lock that serialises every mutation of this
+/// address space's page-table structure, and the reservation records it
+/// guards. A path that can build an intermediate table (`commit`,
+/// `commit_contiguous`, `map_shared`, `prepare_demand_commit` and
+/// `ensure_accessible_subranges`, through `OffsetPageTable::map_to` or
+/// `ensure_table`), rewrite a leaf of a committed range (`protect`,
+/// `relocate`, `ensure_accessible_subranges`) or move a range between
+/// committed and uncommitted takes `state` before its first table
+/// access and holds it through the matching tracker record. The shape
+/// is "build under the lock", not "publish by compare-exchange": the
+/// lock already orders the tracker against the tables, so the
+/// precheck, the walk and the record are one critical section and
+/// there is no loser table to free, and a later swap detach or ageing
+/// walk, which takes `state` too, sees tables and tracker agree.
+///
+/// `state` is a plain spin lock taken from task context with interrupts
+/// enabled and never from an interrupt or trap handler, so a processor
+/// spinning on it still acknowledges TLB shootdowns. Holding it across
+/// a shootdown is the existing order (`state` then the broadcast lock).
+/// Nothing awaits or blocks while holding it: the frame and table
+/// allocations under it take the user pool's and the kernel heap's
+/// interrupt-masking locks, which nothing holds across `state`. Lock
+/// order is `state` then `pinned`.
+///
+/// Not under `state`: `commit_demand_page` and `leaf_entry` read tables
+/// lock-free, which is sound because no table below a prepared
+/// demand-commit region is freed while the address space lives, and
+/// `unmap_range` and `unmap_run_pages`, which only clear leaves of a
+/// range the caller owns (taken out of the tracker, or claimed in
+/// `pinned`) and never touch an intermediate entry.
 pub struct X86UserAddressSpace {
     physical_memory_offset: usize,
     processor_count: usize,
@@ -404,8 +436,8 @@ impl X86UserAddressSpace {
     /// The table `table[index]` points at, building it when the entry
     /// is unused.
     ///
-    /// The caller holds the reservation lock, so no other processor is
-    /// editing this walk. Intermediate entries are present and writable
+    /// The caller holds `state` (see the type's concurrency contract),
+    /// so no other processor is editing this walk. Intermediate entries are present and writable
     /// and never carry `NO_EXECUTE`: the permission that matters is the
     /// leaf's, and clearing execute on a parent would take it away from
     /// every mapping below it, compiled code included.
@@ -717,7 +749,10 @@ impl AddressSpace for X86UserAddressSpace {
         validate_range(virt)?;
         let pt_flags = page_flags_to_pt(flags)?;
 
-        self.state.lock().precheck_commit(virt)?;
+        // One critical section from precheck to record: two commits
+        // that share a missing intermediate table cannot both build it.
+        let mut state = self.state.lock();
+        state.precheck_commit(virt)?;
 
         let mut mapper = unsafe { smp::current_mapper(self.physical_memory_offset) };
         let mut frame_allocator = DirectMappedFrameAllocator {
@@ -725,9 +760,9 @@ impl AddressSpace for X86UserAddressSpace {
         };
         self.map_pages(&mut mapper, &mut frame_allocator, virt, pt_flags)?;
 
-        self.state
-            .lock()
-            .record_commit(virt, flags, MemoryOwner::NONE)?;
+        let orphaned = state.record_commit(virt, flags, MemoryOwner::NONE)?;
+        // This backend has no swap, see `ensure_accessible_subranges`.
+        debug_assert!(orphaned.is_empty());
         Ok(())
     }
 
@@ -759,20 +794,24 @@ impl AddressSpace for X86UserAddressSpace {
         let mut frame_allocator = DirectMappedFrameAllocator {
             physical_memory_offset: self.physical_memory_offset,
         };
-        // The range is claimed before a single leaf is written, so two
-        // callers naming overlapping ranges cannot both believe they own
-        // it.
+        // `state` first: `map_run` can build intermediate tables, which
+        // only the holder of `state` may do. Then the range is claimed
+        // before a single leaf is written, so two callers naming
+        // overlapping ranges cannot both believe they own it.
+        let state = self.state.lock();
         let mut pinned = self.pinned.lock();
         if pinned.iter().any(|run| {
             run.range.start.raw() < virt.start.raw() + virt.byte_len
                 && virt.start.raw() < run.range.start.raw() + run.range.byte_len
         }) {
             drop(pinned);
+            drop(state);
             self.free_pinned_run(phys, virt.byte_len, align);
             return Err(AddressSpaceError::DeviceMapped);
         }
         if let Err(error) = self.map_run(&mut mapper, &mut frame_allocator, virt, phys, pt_flags) {
             drop(pinned);
+            drop(state);
             self.free_pinned_run(phys, virt.byte_len, align);
             return Err(error);
         }
@@ -808,8 +847,10 @@ impl AddressSpace for X86UserAddressSpace {
         let mut frame_allocator = DirectMappedFrameAllocator {
             physical_memory_offset: self.physical_memory_offset,
         };
-        // The span is claimed before a single leaf is written, so two
-        // views cannot both believe they own the same window.
+        // `state` first, as in `commit_contiguous`. The span is claimed
+        // before a single leaf is written, so two views cannot both
+        // believe they own the same window.
+        let _state = self.state.lock();
         let mut pinned = self.pinned.lock();
         if pinned.iter().any(|run| {
             run.range.start.raw() < virt.start.raw() + virt.byte_len
@@ -882,11 +923,15 @@ impl AddressSpace for X86UserAddressSpace {
         self.assert_smp_safe();
         validate_range(virt)?;
         let pt_flags = page_flags_to_pt(flags)?;
-        self.state.lock().ensure_committed(virt)?;
+        // The check, the leaf rewrite and the record are one critical
+        // section, as in `ensure_accessible_subranges`: a concurrent
+        // decommit or commit of the range cannot slip between them.
+        let mut state = self.state.lock();
+        state.ensure_committed(virt)?;
         let mut mapper = unsafe { smp::current_mapper(self.physical_memory_offset) };
         self.protect_pages(&mut mapper, virt, pt_flags)?;
         self.shootdown_range(virt);
-        self.state.lock().record_protect(virt, flags)?;
+        state.record_protect(virt, flags)?;
         Ok(())
     }
 
@@ -1003,7 +1048,10 @@ impl AddressSpace for X86UserAddressSpace {
     fn relocate(&self, virt: VirtRange) -> Result<(), AddressSpaceError> {
         self.assert_smp_safe();
         validate_range(virt)?;
-        self.state.lock().ensure_committed(virt)?;
+        // Held through the remap: `remap_page` unmaps and re-maps leaves
+        // of a committed range and `map_to` may build a table.
+        let state = self.state.lock();
+        state.ensure_committed(virt)?;
 
         let mut mapper = unsafe { smp::current_mapper(self.physical_memory_offset) };
         let mut frame_allocator = DirectMappedFrameAllocator {
