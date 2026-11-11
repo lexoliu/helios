@@ -15,9 +15,32 @@ entry table (kind, path offset/length, data offset/length,
 `modified_nanos`), a string table, then the file bytes, every offset
 16-byte aligned. The entry table holds every bootfs file and empty
 directory plus two distinguished entries: the init component and its
-`argv0`. The kernel parses it with `bootfs::Image::parse`, a zero-copy
-reader that validates every offset against the slice and fails with a
-typed error naming the field that was wrong.
+`argv0`. The data section ends exactly where that body ends; a version-2
+image is the body followed by a fixed 128-byte signature footer.
+
+The footer holds the magic `HLBFSSIG`, a footer version, the algorithm
+(Ed25519), the signer's public key, a 64-byte signature and reserved
+zeros. The signature covers `b"helios-bootfs-signature-v1"` followed by
+the SHA-256 of the body, so the header is covered too.
+`helios-cli kernel-prebuild` signs the finished image once with the
+prebuild root key. The init component, the compiler plugin and every
+boot program inside it are bare Wasmtime artifacts with no per-artifact
+signature trailer: the footer vouches for them as a whole.
+
+The kernel reads it with `BootPayload::parse`, the single entry on every
+backend. It hashes the body once, verifies the footer against the
+trusted root public keys embedded in the kernel image, and only then
+parses the shape with `bootfs::Image::parse_signed`, a zero-copy reader
+that validates every offset against the slice. The digest stays on the
+`BootPayload` for a measurement register to extend. A refusal is a typed
+`BootfsError` naming what was wrong: `MissingSignature`,
+`UnsupportedSignature`, `UntrustedSigner` (with the signer's and the
+trusted keys' fingerprints), `SignatureMismatch`, `TrailingBytes` or a
+shape error, and each backend's panic message carries it. A bootfs file
+is classified as a precompiled artifact by Wasmtime's own header check,
+not by a trailer. A cwasm outside the payload (a file a guest wrote, one
+on the host share) still carries the signature trailer and is verified
+against the trusted roots when it loads.
 
 ## How each backend hands it over
 

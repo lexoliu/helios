@@ -589,7 +589,8 @@ mod tests {
                 modified_nanos: 0,
             },
         ]);
-        crate::BootPayload::parse(Box::leak(bytes.into_boxed_slice()))
+        let signed = crate::wasmtime_adapter::cwasm::sign_bootfs_image_for_tests(bytes);
+        crate::BootPayload::parse(Box::leak(signed.into_boxed_slice()))
             .expect("payload image must parse")
             .bootfs()
     }

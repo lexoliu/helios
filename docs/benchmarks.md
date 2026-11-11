@@ -280,7 +280,7 @@ nanoseconds from `rpc-arrival`:
 | --- | --- |
 | `rpc_arrival_ns` | the launch call entered the kernel; always `0`, the epoch |
 | `source_read_ns` | the program's bytes are read out of their source (`source_bytes` carries the size) |
-| `trust_ns` | artifact trust established — the bootfs trailer parse, the signature check for a signed artifact, or — on a raw-wasm source — the whole in-kernel compile+sign between `load_begin` and here |
+| `trust_ns` | artifact trust established — the bootfs artifact hand-off, the signature check for a signed artifact, or — on a raw-wasm source — the whole in-kernel compile+sign between `load_begin` and here |
 | `cache_lookup_ns` | the deserialize cache answered (`cache_hit` carries its answer) |
 | `deserialize_ns` | the `cwasm` payload deserialized; present only on a cache miss |
 | `instantiate_pre_ns` | the `InstancePre` cache answered or `instantiate_pre` built (`instantiate_pre_hit`) |

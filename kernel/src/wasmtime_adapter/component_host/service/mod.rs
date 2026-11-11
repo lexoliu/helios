@@ -353,7 +353,9 @@ impl ProgramSource {
     /// provenance its node carries.
     pub(crate) fn from_file(contents: FileContents) -> Self {
         match contents {
-            FileContents::Bootfs(bytes) if cwasm::is_cwasm(bytes.as_slice()) => {
+            FileContents::Bootfs(bytes)
+                if WasmtimePrecompiledKind::detect(bytes.as_slice()).is_some() =>
+            {
                 Self::BootfsArtifact(bytes)
             }
             FileContents::Bootfs(bytes) => Self::RawWasm(bytes.to_bytes()),
@@ -1528,7 +1530,7 @@ where
                         detail: ProgramExecErrorDetail::HintNotAllowedForPrecompiledArtifact,
                     });
                 }
-                trusted_bootfs_payload(bytes)?
+                trusted_bootfs_payload(bytes)
             }
             ProgramSource::RawWasm(wasm) => {
                 let _profile = artifact_profile::classify_raw_wasm(wasm)
@@ -1771,7 +1773,7 @@ where
             ..CompilerPhaseTimestamps::default()
         };
         let compiler_artifact = self.read_compiler_plugin_artifact(exec_context)?;
-        let compiler_payload = trusted_bootfs_payload(&compiler_artifact)?;
+        let compiler_payload = trusted_bootfs_payload(&compiler_artifact);
         let (payload, thread_reports) = self
             .invoke_compiler_core_module(
                 exec_context,

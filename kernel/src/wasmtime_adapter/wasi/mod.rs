@@ -1053,21 +1053,41 @@ mod tests {
         assert!(matches!(error, fs_types::ErrorCode::ReadOnly));
     }
 
-    /// A cwasm signed by a key the kernel does not trust: it parses as
-    /// an artifact, and only a signature check tells it apart.
-    fn foreign_signed_cwasm() -> &'static [u8] {
-        let signed = helios_artifact::sign_payload_with_secret_key_bytes(b"payload", &[7; 32])
-            .expect("signing a test payload must succeed");
-        Box::leak(signed.into_boxed_slice())
+    /// A bare Wasmtime component artifact, the form a bootfs file has:
+    /// the payload's footer vouches for it, it carries no signature.
+    ///
+    /// Wasmtime recognises one by its ELF header alone (`OSABI` 200 and
+    /// the component flag), so the fixture is that header with no
+    /// sections: the kernel's Wasmtime has no compiler to build a real
+    /// one, and classification reads nothing else.
+    fn bootfs_cwasm() -> &'static [u8] {
+        let mut header = [0_u8; 64];
+        header[..4].copy_from_slice(b"\x7fELF");
+        header[4] = 2; // ELFCLASS64
+        header[5] = 1; // little-endian
+        header[6] = 1; // EV_CURRENT
+        header[7] = 200; // ELFOSABI_WASMTIME
+        header[16..18].copy_from_slice(&1_u16.to_le_bytes()); // ET_REL
+        header[20..24].copy_from_slice(&1_u32.to_le_bytes()); // e_version
+        header[48..52].copy_from_slice(&2_u32.to_le_bytes()); // EF_WASMTIME_COMPONENT
+        header[52..54].copy_from_slice(&64_u16.to_le_bytes()); // e_ehsize
+        header[58..60].copy_from_slice(&64_u16.to_le_bytes()); // e_shentsize
+        Box::leak(Box::new(header))
     }
 
-    /// A filesystem whose bootfs carries `foreign_signed_cwasm` at
-    /// `/bin/prog`.
+    /// A cwasm signed by a key the kernel does not trust: it parses as
+    /// an artifact, and only a signature check tells it apart.
+    fn foreign_signed_cwasm() -> alloc::vec::Vec<u8> {
+        helios_artifact::sign_payload_with_secret_key_bytes(b"payload", &[7; 32])
+            .expect("signing a test payload must succeed")
+    }
+
+    /// A filesystem whose bootfs carries `bootfs_cwasm` at `/bin/prog`.
     fn filesystem_with_bootfs_cwasm() -> TestFileSystem {
         let mut filesystem = test_filesystem();
         let files = Box::leak(Box::new([EmbeddedBootFile::new(
             "bin/prog",
-            foreign_signed_cwasm(),
+            bootfs_cwasm(),
             42,
         )]));
         filesystem.seed_bootfs(EmbeddedBootFs::new(&[], files));
@@ -1089,12 +1109,11 @@ mod tests {
         let ProgramSource::BootfsArtifact(bytes) = program_source(&filesystem, "/bin/prog") else {
             panic!("a bootfs cwasm must classify as a bootfs artifact");
         };
-        // The signature would not verify, so accepting it proves the
-        // bootfs path pays no verification.
+        // It carries no signature trailer, so accepting it proves the
+        // bootfs path pays no per-artifact verification.
         assert!(cwasm::verify_signed_artifact(UntrustedCwasm::new(bytes.as_slice())).is_err());
-        let trusted =
-            cwasm::trust_bootfs_artifact(&bytes).expect("a bootfs artifact loads unverified");
-        assert_eq!(trusted.payload(), b"payload");
+        let trusted = cwasm::trust_bootfs_artifact(&bytes);
+        assert_eq!(trusted.payload(), bytes.as_slice());
     }
 
     #[test]
@@ -1125,7 +1144,19 @@ mod tests {
         filesystem
             .write_at(&descriptor, 0, &copied, 3)
             .expect("writing a guest file must succeed");
-        let ProgramSource::SignedArtifact(bytes) = program_source(&filesystem, "/tmp/copy") else {
+        // A bare cwasm has no signature to verify, so the copy is never
+        // a bootfs or signed artifact; it is raw bytes the wasm
+        // validator then refuses.
+        assert!(matches!(
+            program_source(&filesystem, "/tmp/copy"),
+            ProgramSource::RawWasm(_)
+        ));
+
+        filesystem
+            .write_program_file("/tmp/foreign", &foreign_signed_cwasm(), 3)
+            .expect("writing a program file must succeed");
+        let ProgramSource::SignedArtifact(bytes) = program_source(&filesystem, "/tmp/foreign")
+        else {
             panic!("a guest-written cwasm must classify as a signed artifact");
         };
         assert!(matches!(
@@ -1207,13 +1238,13 @@ mod tests {
         assert!(!bootfs_bytes(&filesystem));
         assert!(matches!(
             program_source(&filesystem, "/bin/prog"),
-            ProgramSource::SignedArtifact(_)
+            ProgramSource::RawWasm(_)
         ));
 
         let mut replaced = filesystem_with_bootfs_cwasm();
         make_writable(&replaced);
         replaced
-            .write_program_file("/bin/prog", foreign_signed_cwasm(), 2)
+            .write_program_file("/bin/prog", &foreign_signed_cwasm(), 2)
             .expect("replacing the node must succeed");
         assert!(!bootfs_bytes(&replaced));
 
