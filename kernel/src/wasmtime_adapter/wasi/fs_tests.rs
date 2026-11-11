@@ -8,14 +8,14 @@ use helios_hal::fs::{FileSystemRights, NodeKind};
 
 use super::{
     FileWriteMode, FsDescriptor, FsNodeKind, create_directory_at, fs_types, link_at, metadata_hash,
-    open_at, read, read_program_file, readlink_at, rename_at, set_size, set_times, stat_path,
-    symlink_at, write_program_file,
+    open_at, read, read_program_file, readlink_at, remove_directory_at, rename_at, set_size,
+    set_times, stat_at, stat_path, symlink_at, unlink_file_at, write_program_file,
 };
 use crate::wasmtime_adapter::component_host::ProgramSource;
 use crate::wasmtime_adapter::cwasm::{self, UntrustedCwasm};
 use crate::{
     AuthorityDomain, BOOT_DEVICE, BootFs, EmbeddedBootDirectory, EmbeddedBootFile, EmbeddedBootFs,
-    FileContents, MemoryFs, MountTable, MountedFs, Namespace, UnsupportedHostFileSystem,
+    FileContents, Follow, MemoryFs, MountTable, MountedFs, Namespace, UnsupportedHostFileSystem,
     object_identity,
 };
 
@@ -110,7 +110,8 @@ fn create_directory_adds_node() {
     block_on(create_directory_at(&namespace, &root(), "tmp", 7))
         .expect("directory creation must succeed");
 
-    let metadata = block_on(stat_path(&namespace, "/tmp", false)).expect("directory must exist");
+    let metadata =
+        block_on(stat_path(&namespace, "/tmp", Follow::No)).expect("directory must exist");
     assert_eq!(metadata.kind, NodeKind::Directory);
     assert_eq!(metadata.modified_nanos, 7);
 }
@@ -130,14 +131,14 @@ fn create_directory_rejects_existing_path() {
 fn boot_image_programs_are_visible() {
     let namespace = namespace();
 
-    let program = block_on(stat_path(&namespace, "/bin/tool", false)).expect("program exists");
+    let program = block_on(stat_path(&namespace, "/bin/tool", Follow::No)).expect("program exists");
     assert_eq!(program.kind, NodeKind::File);
     assert_eq!(program.modified_nanos, 42);
 
-    let directory = block_on(stat_path(&namespace, "/bin", false)).expect("directory exists");
+    let directory = block_on(stat_path(&namespace, "/bin", Follow::No)).expect("directory exists");
     assert_eq!(directory.kind, NodeKind::Directory);
 
-    let empty = block_on(stat_path(&namespace, "/bin/empty", false)).expect("empty exists");
+    let empty = block_on(stat_path(&namespace, "/bin/empty", Follow::No)).expect("empty exists");
     assert_eq!(empty.kind, NodeKind::Directory);
     assert_eq!(empty.modified_nanos, 43);
 }
@@ -203,10 +204,11 @@ fn opening_existing_directory_without_directory_flag_fails() {
 #[test]
 fn boot_image_objects_report_nonzero_distinct_inodes() {
     let namespace = namespace();
-    let directory =
-        object_identity(&block_on(stat_path(&namespace, "/bin", false)).expect("directory stat"));
+    let directory = object_identity(
+        &block_on(stat_path(&namespace, "/bin", Follow::No)).expect("directory stat"),
+    );
     let program = object_identity(
-        &block_on(stat_path(&namespace, "/bin/tool", false)).expect("program stat"),
+        &block_on(stat_path(&namespace, "/bin/tool", Follow::No)).expect("program stat"),
     );
 
     assert_eq!(program.domain(), AuthorityDomain::GUEST_BOOTFS);
@@ -237,11 +239,12 @@ fn descriptors_carry_stable_object_identity() {
 fn rename_preserves_object_identity_local_part() {
     let namespace = namespace();
     create_file(&namespace, "tmp", b"data");
-    let before = metadata_hash(&block_on(stat_path(&namespace, "/tmp", false)).expect("stat"));
+    let before = metadata_hash(&block_on(stat_path(&namespace, "/tmp", Follow::No)).expect("stat"));
 
     block_on(rename_at(&namespace, &root(), "tmp", &root(), "renamed", 2))
         .expect("rename must succeed");
-    let after = metadata_hash(&block_on(stat_path(&namespace, "/renamed", false)).expect("stat"));
+    let after =
+        metadata_hash(&block_on(stat_path(&namespace, "/renamed", Follow::No)).expect("stat"));
 
     assert_eq!(before.lower, after.lower);
 }
@@ -291,7 +294,7 @@ fn hardlink_preserves_identity_and_shared_contents() {
     assert_eq!(original.identity, alias.identity);
     assert!(!alias.flags.contains(fs_types::DescriptorFlags::WRITE));
     assert_eq!(
-        block_on(stat_path(&namespace, "/tmp", false))
+        block_on(stat_path(&namespace, "/tmp", Follow::No))
             .expect("stat must succeed")
             .link_count,
         2
@@ -326,7 +329,7 @@ fn set_size_resizes_all_links_without_widening_descriptor_rights() {
     .expect("alias open must succeed");
     assert_eq!(read_all(&namespace, &alias), b"data\0\0");
     assert_eq!(
-        block_on(stat_path(&namespace, "/tmp", false))
+        block_on(stat_path(&namespace, "/tmp", Follow::No))
             .expect("stat must succeed")
             .size,
         6
@@ -345,11 +348,11 @@ fn set_size_resizes_all_links_without_widening_descriptor_rights() {
 fn set_times_updates_stat_and_metadata_hash() {
     let namespace = namespace();
     create_file(&namespace, "tmp", b"");
-    let before = metadata_hash(&block_on(stat_path(&namespace, "/tmp", false)).expect("stat"));
+    let before = metadata_hash(&block_on(stat_path(&namespace, "/tmp", Follow::No)).expect("stat"));
 
     block_on(set_times(&namespace, "/tmp", Some(11), Some(17), 19))
         .expect("set-times must succeed");
-    let metadata = block_on(stat_path(&namespace, "/tmp", false)).expect("stat must succeed");
+    let metadata = block_on(stat_path(&namespace, "/tmp", Follow::No)).expect("stat must succeed");
     assert_eq!(metadata.access_nanos, 11);
     assert_eq!(metadata.modified_nanos, 17);
     assert_eq!(metadata.status_nanos, 19);
@@ -385,7 +388,7 @@ fn symlink_target_is_read_without_normalization() {
         "bin/tool"
     );
     assert_eq!(
-        block_on(stat_path(&namespace, "/tool-link", false))
+        block_on(stat_path(&namespace, "/tool-link", Follow::No))
             .expect("symlink stat must succeed")
             .kind,
         NodeKind::Symlink
@@ -480,13 +483,14 @@ fn namespace_with_bootfs_cwasm() -> TestNamespace {
 
 fn program_source(namespace: &TestNamespace, absolute: &str) -> ProgramSource {
     ProgramSource::from_file(
-        block_on(read_program_file(namespace, absolute)).expect("program file must be readable"),
+        block_on(read_program_file(namespace, absolute, "/"))
+            .expect("program file must be readable"),
     )
 }
 
 fn boot_provenance(namespace: &TestNamespace, absolute: &str) -> bool {
     matches!(
-        block_on(read_program_file(namespace, absolute)),
+        block_on(read_program_file(namespace, absolute, "/")),
         Ok(FileContents::Boot(_))
     )
 }
@@ -515,8 +519,8 @@ fn guest_written_cwasm_must_verify() {
     // The bytes of a bootfs artifact, copied by a guest through an
     // ordinary WASI write, into the root layer and onto a mounted tree:
     // neither copy has bootfs provenance.
-    let FileContents::Boot(copied) =
-        block_on(read_program_file(&namespace, "/bin/prog")).expect("bootfs program is readable")
+    let FileContents::Boot(copied) = block_on(read_program_file(&namespace, "/bin/prog", "/"))
+        .expect("bootfs program is readable")
     else {
         panic!("a boot image file must carry boot provenance");
     };
@@ -610,4 +614,116 @@ fn writing_a_bootfs_node_drops_its_provenance() {
             }
         }
     }
+}
+
+/// A preopen of `/work`, with every right a directory grant carries.
+fn work() -> FsDescriptor {
+    FsDescriptor {
+        path: String::from("/work"),
+        ..root()
+    }
+}
+
+#[test]
+fn the_base_itself_is_never_removed_renamed_or_replaced_through_it() {
+    let namespace = namespace();
+    block_on(create_directory_at(&namespace, &root(), "work", 1)).expect("creates /work");
+    block_on(create_directory_at(&namespace, &root(), "bob", 1)).expect("creates /bob");
+
+    for path in ["", ".", "sub/.."] {
+        assert!(matches!(
+            block_on(remove_directory_at(&namespace, &work(), path)),
+            Err(fs_types::ErrorCode::Invalid)
+        ));
+        assert!(matches!(
+            block_on(unlink_file_at(&namespace, &work(), path)),
+            Err(fs_types::ErrorCode::Invalid)
+        ));
+        assert!(matches!(
+            block_on(symlink_at(&namespace, &work(), "bob", path, 1)),
+            Err(fs_types::ErrorCode::Invalid)
+        ));
+        assert!(matches!(
+            block_on(rename_at(&namespace, &work(), path, &root(), "moved", 1)),
+            Err(fs_types::ErrorCode::Invalid)
+        ));
+        assert!(matches!(
+            block_on(rename_at(&namespace, &root(), "bob", &work(), path, 1)),
+            Err(fs_types::ErrorCode::Invalid)
+        ));
+    }
+    let work = block_on(stat_path(&namespace, "/work", Follow::No)).expect("/work stays");
+    assert_eq!(work.kind, NodeKind::Directory);
+}
+
+#[test]
+fn a_link_at_the_base_does_not_lead_out_of_it() {
+    let namespace = namespace();
+    block_on(create_directory_at(&namespace, &root(), "bob", 1)).expect("creates /bob");
+    create_file(&namespace, "bob/secret", b"bob's");
+    // Whoever holds the parent replaces the preopen's directory with a
+    // link to its sibling: `work`'s holder still names `/work`.
+    block_on(symlink_at(&namespace, &root(), "bob", "work", 1)).expect("links /work");
+
+    for path in [".", ""] {
+        let opened = block_on(open_at(
+            &namespace,
+            &work(),
+            fs_types::PathFlags::SYMLINK_FOLLOW,
+            path,
+            fs_types::OpenFlags::DIRECTORY,
+            fs_types::DescriptorFlags::READ,
+            1,
+        ));
+        assert!(matches!(opened, Err(fs_types::ErrorCode::NotPermitted)));
+        assert!(matches!(
+            block_on(stat_at(
+                &namespace,
+                &work(),
+                fs_types::PathFlags::SYMLINK_FOLLOW,
+                path
+            )),
+            Err(fs_types::ErrorCode::NotPermitted)
+        ));
+    }
+    // A load granted at `/work` reads nothing through the link either.
+    assert!(matches!(
+        block_on(read_program_file(&namespace, "/work", "/work")),
+        Err(fs_types::ErrorCode::NotPermitted)
+    ));
+    // The parent, whose floor holds both, still follows it.
+    let followed = block_on(open_at(
+        &namespace,
+        &root(),
+        fs_types::PathFlags::SYMLINK_FOLLOW,
+        "work",
+        fs_types::OpenFlags::DIRECTORY,
+        fs_types::DescriptorFlags::READ,
+        1,
+    ))
+    .expect("the root's descriptor follows a link inside the root");
+    assert_eq!(followed.path, "/bob");
+}
+
+#[test]
+fn a_program_load_floor_is_the_widest_grant_that_loads() {
+    let mut authority = crate::ProcessAuthority::empty();
+    for (source, guest, rights) in [
+        ("/work", "/work", crate::DirectoryAuthorityRights::READ),
+        (
+            "/work/bin",
+            "/bin",
+            crate::DirectoryAuthorityRights::EXECUTE,
+        ),
+    ] {
+        authority.insert_directory_preopen(
+            crate::DirectoryPreopen::new(source, guest, rights).expect("a valid grant"),
+        );
+    }
+    assert_eq!(
+        authority.program_load_floor("/work/bin/tool"),
+        Some("/work")
+    );
+    assert_eq!(authority.program_load_floor("/work"), Some("/work"));
+    assert_eq!(authority.program_load_floor("/workshop/tool"), None);
 }

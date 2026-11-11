@@ -861,8 +861,23 @@ impl ProcessAuthority {
     }
 
     pub fn can_load_program(&self, path: &str) -> bool {
-        self.has_directory_authority(path, DirectoryAuthorityRights::READ)
-            || self.has_directory_authority(path, DirectoryAuthorityRights::EXECUTE)
+        self.program_load_floor(path).is_some()
+    }
+
+    /// The directory whose grant lets `path` be loaded as a program: the
+    /// widest such grant, which is the floor a symbolic link the load
+    /// follows may not leave.
+    pub fn program_load_floor(&self, path: &str) -> Option<&str> {
+        let loads = |rights: DirectoryAuthorityRights| {
+            rights.intersects(DirectoryAuthorityRights::READ | DirectoryAuthorityRights::EXECUTE)
+        };
+        self.directory_preopens
+            .iter()
+            .map(|preopen| (preopen.source_path(), preopen.rights()))
+            .chain(self.cwd.iter().map(|cwd| (cwd.source_path(), cwd.rights())))
+            .filter(|(directory, rights)| directory_contains(directory, path) && loads(*rights))
+            .map(|(directory, _)| directory)
+            .min_by_key(|directory| directory.len())
     }
 
     pub fn can_write_path(&self, path: &str) -> bool {

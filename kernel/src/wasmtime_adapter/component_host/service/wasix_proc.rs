@@ -1047,7 +1047,7 @@ where
             p1_null_device_stat(),
         );
     }
-    let follow = p1_path_flags(flags).contains(fs_types::PathFlags::SYMLINK_FOLLOW);
+    let follow = wasi_fs::follow_within(&base, p1_path_flags(flags));
     let (identity, stat_value) = match p1_stat_absolute_path(caller, &absolute, follow).await {
         Ok(stat) => stat,
         Err(errno) => return errno,
@@ -2155,7 +2155,7 @@ pub(super) async fn wasix_require_directory<HostFs>(
 where
     HostFs: crate::HostFileSystem,
 {
-    let metadata = wasi_fs::stat_path(namespace, path, false)
+    let metadata = wasi_fs::stat_path(namespace, path, crate::Follow::No)
         .await
         .map_err(p1_errno_from_fs)?;
     if metadata.kind != helios_hal::fs::NodeKind::Directory {
@@ -3292,17 +3292,24 @@ where
     HostFs: crate::HostFileSystem,
 {
     let namespace = p1_namespace(caller);
+    let not_granted = || {
+        wasmtime::Error::new(ProgramExecError {
+            kind: ProgramExecErrorKind::PermissionDenied,
+            detail: ProgramExecErrorDetail::ProgramSourceNotGranted,
+        })
+    };
+    let floor = caller
+        .data()
+        .authority
+        .program_load_floor(source_path)
+        .ok_or_else(not_granted)?
+        .to_owned();
     // Trust follows the layer that produced the bytes, never the path or
     // the mount: only boot-image bytes skip verification (#483).
-    wasi_fs::read_program_file(&namespace, source_path)
+    wasi_fs::read_program_file(&namespace, source_path, &floor)
         .await
         .map(ProgramSource::from_file)
-        .map_err(|_| {
-            wasmtime::Error::new(ProgramExecError {
-                kind: ProgramExecErrorKind::PermissionDenied,
-                detail: ProgramExecErrorDetail::ProgramSourceNotGranted,
-            })
-        })
+        .map_err(|_| not_granted())
 }
 
 pub(super) fn wasix_resolve_exec_guest_name<CpuImpl, Net, HostFs>(

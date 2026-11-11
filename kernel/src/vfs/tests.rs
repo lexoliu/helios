@@ -4,7 +4,9 @@ use alloc::vec::Vec;
 use futures_lite::future::block_on;
 use helios_hal::fs::{FileSystem, FileSystemRights, FsError, FsPath, OpenFlags};
 
-use super::{BOOT_DEVICE, MAX_MOUNTS, MemoryFs, MountError, MountTable, MountedFs, Namespace};
+use super::{
+    BOOT_DEVICE, Follow, MAX_MOUNTS, MemoryFs, MountError, MountTable, MountedFs, Namespace,
+};
 use crate::{
     BootFs, ComponentFsPathError, EmbeddedBootDirectory, EmbeddedBootFile, EmbeddedBootFs,
     MountCap, ProcessAuthority, UnsupportedHostFileSystem, resolve_child_path,
@@ -139,7 +141,7 @@ fn rename_and_link_across_mounts_are_refused_with_exdev() {
     // Nothing moved.
     assert_eq!(read(&namespace, "/mnt/file"), b"payload");
     assert_eq!(
-        block_on(namespace.stat("/file", false)).map(drop),
+        block_on(namespace.stat("/file", Follow::No)).map(drop),
         Err(FsError::NoEntry)
     );
     // Within the mount, both work.
@@ -167,7 +169,7 @@ fn a_mount_point_is_listed_in_its_parent_and_unmount_uncovers_it() {
         ("/".into(), "scratch/f".into())
     );
     assert_eq!(
-        block_on(namespace.stat("/scratch/f", false)).map(drop),
+        block_on(namespace.stat("/scratch/f", Follow::No)).map(drop),
         Err(FsError::NoEntry)
     );
 }
@@ -272,7 +274,7 @@ fn namespaces_share_mounts_but_not_root_layers() {
 
     assert_eq!(read(&second, "/mnt/shared"), b"everyone");
     assert_eq!(
-        block_on(second.stat("/private", false)).map(drop),
+        block_on(second.stat("/private", Follow::No)).map(drop),
         Err(FsError::NoEntry)
     );
     assert_eq!(read(&child, "/private"), b"one tree");
@@ -291,9 +293,11 @@ fn a_symbolic_link_is_followed_across_mounts_only_when_asked() {
             .symlink("target", resolved.path(), 1),
     )
     .expect("links");
-    let followed = block_on(namespace.resolve_following("/mnt/link", true)).expect("follows");
+    let followed =
+        block_on(namespace.resolve_following("/mnt/link", Follow::Within("/"))).expect("follows");
     assert_eq!(followed.absolute(), "/mnt/target");
-    let unfollowed = block_on(namespace.resolve_following("/mnt/link", false)).expect("resolves");
+    let unfollowed =
+        block_on(namespace.resolve_following("/mnt/link", Follow::No)).expect("resolves");
     assert_eq!(unfollowed.absolute(), "/mnt/link");
 }
 

@@ -658,27 +658,33 @@ where
     }
 
     pub(super) async fn resolve_cwd_target(&self, path: &str) -> Result<Preview1Cwd, i32> {
-        let (guest_name, source_path, flags) = if path.starts_with('/') {
+        let (guest_name, base, suffix) = if path.starts_with('/') {
             let guest_name =
                 crate::resolve_absolute_path(path).map_err(p1_errno_from_component_path)?;
-            let (source_path, flags) = self.resolve_absolute_guest_path(&guest_name)?;
-            (guest_name, source_path, flags)
+            let (base, suffix) = self.resolve_absolute_guest_base(&guest_name)?;
+            (guest_name, base, suffix)
         } else {
             let cwd = self.cwd.as_ref().ok_or(p1::errno::NOTCAPABLE)?;
             let guest_name = crate::resolve_child_path(&cwd.guest_name, path)
                 .map_err(p1_errno_from_component_path)?;
-            let source_path = crate::resolve_child_path(&cwd.descriptor.path, path)
-                .map_err(p1_errno_from_component_path)?;
-            (guest_name, source_path, cwd.descriptor.flags)
+            (guest_name, cwd.descriptor.clone(), path.to_owned())
         };
+        let source_path =
+            crate::resolve_child_path(&base.path, &suffix).map_err(p1_errno_from_component_path)?;
+        let flags = base.flags;
 
         if !flags.contains(fs_types::DescriptorFlags::READ) {
             return Err(p1::errno::NOTCAPABLE);
         }
-        // chdir follows a symbolic link to the directory it names.
-        let metadata = wasi_fs::stat_path(&self.filesystem, &source_path, true)
-            .await
-            .map_err(p1_errno_from_fs)?;
+        // chdir follows a symbolic link to the directory it names, inside
+        // the directory the path was resolved against.
+        let metadata = wasi_fs::stat_path(
+            &self.filesystem,
+            &source_path,
+            crate::Follow::Within(&base.path),
+        )
+        .await
+        .map_err(p1_errno_from_fs)?;
         if metadata.kind != helios_hal::fs::NodeKind::Directory {
             return Err(p1::errno::NOTDIR);
         }
@@ -2296,7 +2302,8 @@ where
     else {
         return p1::errno::BADF;
     };
-    let (identity, stat_value) = match p1_stat_absolute_path(caller, &path, false).await {
+    let (identity, stat_value) = match p1_stat_absolute_path(caller, &path, crate::Follow::No).await
+    {
         Ok(stat) => stat,
         Err(errno) => return errno,
     };
@@ -2309,7 +2316,7 @@ where
 pub(super) async fn p1_stat_absolute_path<CpuImpl, Net, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     path: &str,
-    follow: bool,
+    follow: crate::Follow<'_>,
 ) -> Result<(crate::ObjectIdentity, fs_types::DescriptorStat), i32>
 where
     CpuImpl: Cpu + Clone,
@@ -2481,7 +2488,7 @@ where
     };
     let descriptor = descriptor.clone();
     let namespace = p1_namespace(caller);
-    let current = match wasi_fs::stat_path(&namespace, &descriptor.path, false).await {
+    let current = match wasi_fs::stat_path(&namespace, &descriptor.path, crate::Follow::No).await {
         Ok(metadata) => metadata.size,
         Err(error) => return p1_errno_from_fs(error),
     };
@@ -2762,7 +2769,7 @@ where
         1 => current,
         2 => {
             let namespace = p1_namespace(caller);
-            match wasi_fs::stat_path(&namespace, &descriptor.path, false).await {
+            match wasi_fs::stat_path(&namespace, &descriptor.path, crate::Follow::No).await {
                 Ok(metadata) => metadata.size,
                 Err(error) => return p1_errno_from_fs(error),
             }
@@ -3031,7 +3038,7 @@ where
         Ok(path) => path,
         Err(_) => return p1::errno::FAULT,
     };
-    let (_, _, absolute) = match caller.data().resolve_preview1_path(fd, &path) {
+    let (base, _, absolute) = match caller.data().resolve_preview1_path(fd, &path) {
         Ok(resolved) => resolved,
         Err(errno) => return errno,
     };
@@ -3043,7 +3050,7 @@ where
             p1_null_device_stat(),
         );
     }
-    let follow = p1_path_flags(flags).contains(fs_types::PathFlags::SYMLINK_FOLLOW);
+    let follow = wasi_fs::follow_within(&base, p1_path_flags(flags));
     let (identity, stat_value) = match p1_stat_absolute_path(caller, &absolute, follow).await {
         Ok(stat) => stat,
         Err(errno) => return errno,

@@ -1378,7 +1378,7 @@ where
         let target = self.p2_descriptor(&descriptor);
         Ok(async {
             let (descriptor, namespace) = target?;
-            let metadata = super::stat_path(&namespace, &descriptor.path, false)
+            let metadata = super::stat_path(&namespace, &descriptor.path, crate::Follow::No)
                 .await
                 .map_err(error_code_from_p3)?;
             Ok(descriptor_stat_from_p3(super::descriptor_stat(&metadata)))
@@ -1614,7 +1614,7 @@ where
         let target = self.p2_descriptor(&descriptor);
         Ok(async {
             let (descriptor, namespace) = target?;
-            let metadata = super::stat_path(&namespace, &descriptor.path, false)
+            let metadata = super::stat_path(&namespace, &descriptor.path, crate::Follow::No)
                 .await
                 .map_err(error_code_from_p3)?;
             Ok(metadata_hash_from_p3(super::metadata_hash(&metadata)))

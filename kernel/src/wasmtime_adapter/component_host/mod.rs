@@ -1351,14 +1351,14 @@ where
 {
     let absolute =
         crate::resolve_guest_path("/", path).map_err(map_component_fs_path_error_to_wasmtime)?;
-    if !authority.can_load_program(&absolute) {
+    let Some(floor) = authority.program_load_floor(&absolute) else {
         return Ok(Err(ProgramExecError {
             kind: ProgramExecErrorKind::PermissionDenied,
             detail: ProgramExecErrorDetail::ProgramSourceNotGranted,
         }));
-    }
+    };
     let namespace = accessor.with(|mut access| access.get().filesystem().clone());
-    let contents = crate::wasmtime_adapter::wasi::read_program_file(&namespace, &absolute)
+    let contents = crate::wasmtime_adapter::wasi::read_program_file(&namespace, &absolute, floor)
         .await
         .map_err(map_fs_error_to_program_exec)?;
     Ok(Ok(ProgramSource::from_file(contents)))

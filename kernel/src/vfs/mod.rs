@@ -652,12 +652,23 @@ impl<H: HostFileSystem> Namespace<H> {
         Ok(resolved)
     }
 
-    /// Resolves `absolute`, following a final symbolic link when `follow`
-    /// is set, through as many mounts as the links lead to.
-    pub async fn resolve_following(&self, absolute: &str, follow: bool) -> FsResult<Resolved<H>> {
+    /// Resolves `absolute`, following a final symbolic link as `follow`
+    /// says, through as many mounts as the links lead to.
+    ///
+    /// A followed resolution starts inside its floor and never leaves it:
+    /// a link that leads out, a link placed at the floor itself included,
+    /// is refused with [`FsError::NotPermitted`].
+    pub async fn resolve_following(
+        &self,
+        absolute: &str,
+        follow: Follow<'_>,
+    ) -> FsResult<Resolved<H>> {
         let mut resolved = self.resolve(absolute)?;
-        if !follow {
+        let Follow::Within(floor) = follow else {
             return Ok(resolved);
+        };
+        if !within_directory(floor, absolute) {
+            return Err(FsError::NotPermitted);
         }
         for _ in 0..MAX_SYMLINK_DEPTH {
             match resolved.fs().stat(resolved.path()).await {
@@ -668,14 +679,17 @@ impl<H: HostFileSystem> Namespace<H> {
             }
             let target = resolved.fs().read_link(resolved.path()).await?;
             let followed = symlink_target(resolved.absolute(), &target)?;
+            if !within_directory(floor, &followed) {
+                return Err(FsError::NotPermitted);
+            }
             resolved = self.resolve(&followed)?;
         }
         Err(FsError::Loop)
     }
 
-    /// Describes `absolute`, following a final symbolic link when `follow`
-    /// is set.
-    pub async fn stat(&self, absolute: &str, follow: bool) -> FsResult<Metadata> {
+    /// Describes `absolute`, following a final symbolic link as `follow`
+    /// says.
+    pub async fn stat(&self, absolute: &str, follow: Follow<'_>) -> FsResult<Metadata> {
         let resolved = self.resolve_following(absolute, follow).await?;
         resolved.fs().stat(resolved.path()).await
     }
@@ -765,11 +779,18 @@ impl<H: HostFileSystem> Namespace<H> {
             error,
         };
         let parent = crate::parent_path(point);
-        match self.stat(parent, true).await.map_err(refuse)?.kind {
+        // The cap is the authority over where a mount goes, so the parent's
+        // links are followed anywhere in the namespace.
+        match self
+            .stat(parent, Follow::Within("/"))
+            .await
+            .map_err(refuse)?
+            .kind
+        {
             NodeKind::Directory => {}
             NodeKind::File | NodeKind::Symlink => return Err(refuse(FsError::NotDirectory)),
         }
-        match self.stat(point, false).await {
+        match self.stat(point, Follow::No).await {
             Ok(metadata) if metadata.kind != NodeKind::Directory => {
                 return Err(refuse(FsError::NotDirectory));
             }
@@ -784,6 +805,22 @@ impl<H: HostFileSystem> Namespace<H> {
     pub async fn unmount(&self, cap: &UnmountCap) -> Result<(), MountError> {
         self.table.unmount(cap.point()).await
     }
+}
+
+/// Whether a resolution follows a final symbolic link.
+#[derive(Clone, Copy, Debug)]
+pub enum Follow<'a> {
+    /// The path names the link itself.
+    No,
+    /// The path names what the link leads to, which must lie inside the
+    /// directory given: the descriptor or grant the path was resolved
+    /// against.
+    Within(&'a str),
+}
+
+/// Whether `path` is the directory `directory` or lies below it.
+pub fn within_directory(directory: &str, path: &str) -> bool {
+    directory == "/" && path.starts_with('/') || point_covers(directory, path)
 }
 
 /// The guest path a symbolic link at `link` with target text `target`

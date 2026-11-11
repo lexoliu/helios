@@ -11,7 +11,7 @@
 use helios_hal::fs::{FileSystem, FsError as VfsError, Metadata, NodeKind, OpenFlags};
 use pin_project_lite::pin_project;
 
-use crate::{ComponentHostNetwork, FileContents, Namespace, Resolved, object_identity};
+use crate::{ComponentHostNetwork, FileContents, Follow, Namespace, Resolved, object_identity};
 
 use super::*;
 
@@ -208,9 +208,8 @@ where
 {
     require_directory(base)?;
     let absolute = child_path(base, path)?;
-    let follow = path_flags.contains(fs_types::PathFlags::SYMLINK_FOLLOW);
     let resolved = namespace
-        .resolve_following(&absolute, follow)
+        .resolve_following(&absolute, follow_within(base, path_flags))
         .await
         .map_err(fs_error_code)?;
     let fs = resolved.fs();
@@ -270,12 +269,22 @@ where
     })
 }
 
+/// How a path below `base` follows a final symbolic link: when the guest
+/// asks it to, and then never out of `base`.
+pub(crate) fn follow_within(base: &FsDescriptor, path_flags: fs_types::PathFlags) -> Follow<'_> {
+    if path_flags.contains(fs_types::PathFlags::SYMLINK_FOLLOW) {
+        Follow::Within(&base.path)
+    } else {
+        Follow::No
+    }
+}
+
 /// Describes the object `absolute` names, following a final symbolic link
-/// when `follow` is set.
+/// as `follow` says.
 pub(crate) async fn stat_path<HostFs>(
     namespace: &Namespace<HostFs>,
     absolute: &str,
-    follow: bool,
+    follow: Follow<'_>,
 ) -> FsOpResult<Metadata>
 where
     HostFs: crate::HostFileSystem,
@@ -296,12 +305,19 @@ where
     HostFs: crate::HostFileSystem,
 {
     let absolute = child_path(base, path)?;
-    stat_path(
-        namespace,
-        &absolute,
-        path_flags.contains(fs_types::PathFlags::SYMLINK_FOLLOW),
-    )
-    .await
+    stat_path(namespace, &absolute, follow_within(base, path_flags)).await
+}
+
+/// The path below `base` that `path` names, refused when it names `base`
+/// itself (an empty path, `.`, or one that climbs back to it): the
+/// directory a descriptor stands for is never removed, renamed, or
+/// replaced through that descriptor.
+fn child_below(base: &FsDescriptor, path: &str) -> FsOpResult<String> {
+    let absolute = child_path(base, path)?;
+    if absolute == base.path {
+        return Err(fs_types::ErrorCode::Invalid);
+    }
+    Ok(absolute)
 }
 
 /// Reads at most `max_bytes` at `offset`; an empty result is end of file.
@@ -500,10 +516,7 @@ where
     HostFs: crate::HostFileSystem,
 {
     require_mutate_directory(base)?;
-    let absolute = child_path(base, path)?;
-    if absolute == "/" {
-        return Err(fs_types::ErrorCode::NotPermitted);
-    }
+    let absolute = child_below(base, path)?;
     let resolved = resolve(namespace, &absolute)?;
     if resolved.is_mount_root() {
         return Err(fs_types::ErrorCode::Busy);
@@ -525,7 +538,7 @@ where
     HostFs: crate::HostFileSystem,
 {
     require_mutate_directory(base)?;
-    let resolved = resolve(namespace, &child_path(base, path)?)?;
+    let resolved = resolve(namespace, &child_below(base, path)?)?;
     if resolved.is_mount_root() {
         return Err(fs_types::ErrorCode::IsDirectory);
     }
@@ -553,8 +566,8 @@ where
     require_directory(destination_base)?;
     require_mutate_directory(source_base)?;
     require_mutate_directory(destination_base)?;
-    let source = child_path(source_base, source_path)?;
-    let destination = child_path(destination_base, destination_path)?;
+    let source = child_below(source_base, source_path)?;
+    let destination = child_below(destination_base, destination_path)?;
     namespace
         .rename(&source, &destination, now)
         .await
@@ -598,7 +611,7 @@ where
 {
     require_directory(base)?;
     require_mutate_directory(base)?;
-    let absolute = child_path(base, path)?;
+    let absolute = child_below(base, path)?;
     crate::symlink_target(&absolute, target).map_err(fs_error_code)?;
     let resolved = resolve(namespace, &absolute)?;
     resolved
@@ -653,15 +666,20 @@ where
 /// Reads the whole of the program file `absolute` names, typed by the
 /// layer that produced its bytes: only the boot image's own bytes may
 /// skip signature verification (#483).
+///
+/// `floor` is the directory whose grant admits the load
+/// ([`crate::ProcessAuthority::program_load_floor`]); a symbolic link
+/// that leads out of it is refused.
 pub(crate) async fn read_program_file<HostFs>(
     namespace: &Namespace<HostFs>,
     absolute: &str,
+    floor: &str,
 ) -> FsOpResult<FileContents>
 where
     HostFs: crate::HostFileSystem,
 {
     let resolved = namespace
-        .resolve_following(absolute, true)
+        .resolve_following(absolute, Follow::Within(floor))
         .await
         .map_err(fs_error_code)?;
     resolved.read_whole().await.map_err(fs_error_code)
@@ -1367,7 +1385,7 @@ where
         let profile = accessor.with(|mut access| component_fs_profile(access.get()));
         let (descriptor, namespace) =
             accessor.with(|mut access| descriptor_in(access.get(), &descriptor))?;
-        let result = stat_path(&namespace, &descriptor.path, false)
+        let result = stat_path(&namespace, &descriptor.path, Follow::No)
             .await
             .map(|metadata| descriptor_stat(&metadata));
         record_component_fs_profile(profile, "stat");
@@ -1573,7 +1591,7 @@ where
         let profile = accessor.with(|mut access| component_fs_profile(access.get()));
         let (descriptor, namespace) =
             accessor.with(|mut access| descriptor_in(access.get(), &descriptor))?;
-        let result = stat_path(&namespace, &descriptor.path, false)
+        let result = stat_path(&namespace, &descriptor.path, Follow::No)
             .await
             .map(|metadata| self::metadata_hash(&metadata));
         record_component_fs_profile(profile, "metadata-hash");
