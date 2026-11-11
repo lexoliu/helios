@@ -368,7 +368,7 @@ impl DiskLayout {
         let logical_block_bytes = geometry.logical_block_bytes;
         if logical_block_bytes == 0
             || logical_block_bytes > CACHE_BLOCK_BYTES
-            || CACHE_BLOCK_BYTES % logical_block_bytes != 0
+            || !CACHE_BLOCK_BYTES.is_multiple_of(logical_block_bytes)
         {
             return Err(CacheLayoutError::UnsupportedBlockSize {
                 logical_block_bytes,
@@ -812,7 +812,7 @@ impl<Device> DiskState<Device> {
                 self.counters.len()
             )
         });
-        counter(&**row).fetch_add(amount, Ordering::Relaxed);
+        counter(row).fetch_add(amount, Ordering::Relaxed);
     }
 
     fn record_error(&self, error: IoError) {
@@ -959,8 +959,11 @@ impl<Device> Drop for Committing<'_, Device> {
     }
 }
 
+/// A run of entries allocated together the first time an id in it is named.
+type Segment = Once<Box<[CachePadded<Entry>]>>;
+
 pub(super) struct CacheShared<Device> {
-    segments: Box<[Once<Box<[CachePadded<Entry>]>>]>,
+    segments: Box<[Segment]>,
     max_entries: u32,
     /// Entries ever created; ids below it name a live segment.
     allocated: CachePadded<AtomicU32>,

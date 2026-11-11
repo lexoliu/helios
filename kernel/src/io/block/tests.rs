@@ -1224,7 +1224,7 @@ fn the_cache_stays_coherent_under_real_threads() {
                         _ => PressureLevel::Green,
                     };
                     shrink(&cache, level);
-                    if pass % 3 == 0 {
+                    if pass.is_multiple_of(3) {
                         block_on(view.sync()).expect("sync");
                     }
                     pass += 1;
