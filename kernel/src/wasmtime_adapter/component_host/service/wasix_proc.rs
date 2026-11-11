@@ -1825,15 +1825,15 @@ where
         .map_err(wasmtime::Error::new)
         .inspect_err(|error| launch_exit_error(&trace, error))?;
     let argv = ProgramArgv::from_caller(&prepared.guest_name, argv);
-    let mut environment = match env {
+    let environment = match env {
         Some((ptr, len)) => wasix_read_exec_string(caller, memory, ptr, len)
             .map(|value| wasix_split_environment(&value))
             .unwrap_or_default(),
         None => caller.data().environment.clone(),
     };
-    let process_id = caller.data().instance().id().raw().to_string();
-    environment.retain(|(name, _)| name.as_str() != HELIOS_PROCESS_ID_ENV);
-    environment.push((HELIOS_PROCESS_ID_ENV.into(), process_id));
+    // The replacement keeps this instance, so it keeps this instance's id.
+    let environment =
+        LaunchEnvironment::from_guest(environment).into_process_env(caller.data().instance().id());
     let service = caller
         .data()
         .runtime_state
@@ -3423,8 +3423,7 @@ where
         launch_exit_errno(trace, *errno);
     })?;
     let argv = ProgramArgv::from_caller(&prepared.guest_name, argv);
-    let mut environment = environment.unwrap_or_else(|| caller.data().environment.clone());
-    environment.retain(|(name, _)| name.as_str() != HELIOS_PROCESS_ID_ENV);
+    let environment = environment.unwrap_or_else(|| caller.data().environment.clone());
     let runtime_state = caller.data().runtime_state.clone();
     let service = runtime_state.wait_for_program_service().await;
     let exec_context = caller.data().exec_context();
@@ -3438,7 +3437,7 @@ where
             None,
             ProgramLaunch {
                 argv,
-                env: environment,
+                env: LaunchEnvironment::from_guest(environment),
                 authority,
                 filesystem,
                 descriptors,
