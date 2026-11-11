@@ -961,7 +961,9 @@ fn the_bring_up_round_trip_clears_the_interrupt_it_raised() {
         .control
         .try_lock()
         .expect("nothing else holds the control queue at bring-up");
-    let written = queue.reap_blocking(&device.transport, token);
+    let written = queue
+        .reap_blocking(&device.transport, token)
+        .expect("the bring-up request completes");
     drop(queue);
 
     assert_eq!(written, CTRL_HEADER_BYTES as u32);

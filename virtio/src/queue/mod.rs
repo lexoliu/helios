@@ -70,6 +70,12 @@ pub enum VirtqueueError {
     RingAllocation,
     #[error("this queue did not negotiate VIRTIO_F_RING_RESET")]
     ResetUnsupported,
+    #[error("the device completed descriptor {id}, which is not a chain in flight on this queue")]
+    UnexpectedUsedId { id: u32 },
+    #[error("the device published a completion while no chain was in flight")]
+    SpuriousCompletion,
+    #[error("the queue stopped after the device broke the used-ring contract")]
+    Faulted,
 }
 
 impl From<VirtqueueError> for IoError {
@@ -83,6 +89,9 @@ impl From<VirtqueueError> for IoError {
             VirtqueueError::Full { .. } => Self::DeviceFault,
             VirtqueueError::RingAllocation => Self::DeviceFault,
             VirtqueueError::ResetUnsupported => Self::Unsupported,
+            VirtqueueError::UnexpectedUsedId { .. }
+            | VirtqueueError::SpuriousCompletion
+            | VirtqueueError::Faulted => Self::DeviceFault,
         }
     }
 }
@@ -168,6 +177,48 @@ impl IdPool {
         }
         self.tail = id;
         self.free += 1;
+    }
+}
+
+/// Which chain heads the device currently owns, one bit per identifier.
+///
+/// The used ring is device-writable memory, so an identifier read from
+/// it is a claim, not a fact. Every completion is checked against this
+/// set before the identifier pool or a ring's shadow state is touched.
+struct InFlightHeads {
+    bits: Box<[u64]>,
+}
+
+impl InFlightHeads {
+    fn new(size: u16) -> Self {
+        Self {
+            bits: alloc::vec![0_u64; usize::from(size).div_ceil(64)].into_boxed_slice(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.bits.fill(0);
+    }
+
+    fn insert(&mut self, id: u16) {
+        let word = &mut self.bits[usize::from(id) / 64];
+        assert!(
+            *word & (1 << (id % 64)) == 0,
+            "virtqueue handed out descriptor {id} while it is still in flight"
+        );
+        *word |= 1 << (id % 64);
+    }
+
+    /// Removes `id` from the set, reporting whether it was a member.
+    fn remove(&mut self, id: u32, size: u16) -> bool {
+        if id >= u32::from(size) {
+            return false;
+        }
+        let word = &mut self.bits[(id / 64) as usize];
+        let bit = 1_u64 << (id % 64);
+        let present = *word & bit != 0;
+        *word &= !bit;
+        present
     }
 }
 
@@ -273,6 +324,8 @@ struct RingCore<B: DmaBuffer> {
     chain_limit: usize,
     features: NegotiatedFeatures,
     ids: IdPool,
+    /// The chain heads the device owns right now.
+    in_flight: InFlightHeads,
     /// Total writable bytes of each in-flight chain. VIRTIO_F_IN_ORDER
     /// lets a device report a batch of completions with a single used
     /// entry, in which case the spec defines the skipped buffers as
@@ -323,6 +376,7 @@ impl<B: DmaBuffer> RingCore<B> {
             chain_limit,
             features,
             ids: IdPool::new(size),
+            in_flight: InFlightHeads::new(size),
             writable_len: alloc::vec![0_u32; usize::from(order_capacity)].into_boxed_slice(),
             order: OrderFifo::new(order_capacity),
             batch: InOrderBatch::default(),
@@ -333,6 +387,7 @@ impl<B: DmaBuffer> RingCore<B> {
 
     fn clear(&mut self) {
         self.ids.reset();
+        self.in_flight.clear();
         self.order.clear();
         self.batch = InOrderBatch::default();
         self.num_added = 0;
@@ -368,7 +423,21 @@ impl<B: DmaBuffer> RingCore<B> {
         Ok(())
     }
 
+    /// Takes the head the device named in a used element out of the
+    /// in-flight set, before any other queue state changes.
+    ///
+    /// `id` is the raw value the device wrote: a split used element
+    /// carries 32 bits, so narrowing it first would let an out-of-range
+    /// identifier alias a live one.
+    fn complete_head(&mut self, id: u32) -> Result<u16, VirtqueueError> {
+        if !self.in_flight.remove(id, self.size) {
+            return Err(VirtqueueError::UnexpectedUsedId { id });
+        }
+        Ok(id as u16)
+    }
+
     fn record_chain(&mut self, id: u16, chain: &[ChainEntry]) {
+        self.in_flight.insert(id);
         if !self.features.in_order() {
             return;
         }
@@ -382,16 +451,20 @@ impl<B: DmaBuffer> RingCore<B> {
 
     /// Opens an in-order completion batch that the device reported with a
     /// single used entry naming `final_id`.
-    fn begin_in_order_batch(&mut self, final_id: u16, final_len: u32) {
-        let chains = self.order.position(final_id).unwrap_or_else(|| {
-            panic!(
-                "virtqueue in-order completion named descriptor {final_id}, which is not in flight"
-            )
-        });
+    fn begin_in_order_batch(
+        &mut self,
+        final_id: u32,
+        final_len: u32,
+    ) -> Result<(), VirtqueueError> {
+        let chains = u16::try_from(final_id)
+            .ok()
+            .and_then(|id| self.order.position(id))
+            .ok_or(VirtqueueError::UnexpectedUsedId { id: final_id })?;
         self.batch = InOrderBatch {
             remaining: u16::try_from(chains + 1).unwrap_or(u16::MAX),
             final_len,
         };
+        Ok(())
     }
 
     /// Hands out the next chain of the open in-order batch.
@@ -431,7 +504,10 @@ trait RingOps<T: VirtioTransport>: Sized {
     /// Makes every chain submitted since the last publication visible.
     fn publish(&mut self);
 
-    fn pop_used(&mut self) -> Option<(u16, u32)>;
+    /// Reaps the next completion. A used element that does not name a chain
+    /// in flight is a device fault, reported before any queue state
+    /// changes.
+    fn pop_used(&mut self) -> Result<Option<(u16, u32)>, VirtqueueError>;
 
     /// Whether the device has published a completion the driver has not
     /// taken yet.
@@ -481,7 +557,7 @@ impl<T: VirtioTransport> Ring<T> {
         }
     }
 
-    fn pop_used(&mut self) -> Option<(u16, u32)> {
+    fn pop_used(&mut self) -> Result<Option<(u16, u32)>, VirtqueueError> {
         match self {
             Self::Split(ring) => ring.pop_used(),
             Self::Packed(ring) => ring.pop_used(),
@@ -569,6 +645,10 @@ pub struct VirtQueue<T: VirtioTransport> {
     index: u16,
     features: NegotiatedFeatures,
     ring: Ring<T>,
+    /// Set when the device broke the used-ring contract. A faulted queue
+    /// reaps and accepts nothing more until it is reset: the ring state
+    /// can no longer be trusted to match what the device owns.
+    faulted: bool,
 }
 
 impl<T: VirtioTransport> VirtQueue<T> {
@@ -597,9 +677,15 @@ impl<T: VirtioTransport> VirtQueue<T> {
     /// When the device completes a token other than `token`: on a
     /// bring-up path the driver has exactly one request outstanding, so
     /// any other completion is a device answering a request nobody made.
-    pub fn reap_blocking(&mut self, transport: &T, token: u16) -> u32 {
+    ///
+    /// # Errors
+    ///
+    /// [`IoError::DeviceFault`] when the device completes an identifier
+    /// that is not in flight, which includes every identifier but `token`
+    /// that the single outstanding request could be confused with.
+    pub fn reap_blocking(&mut self, transport: &T, token: u16) -> IoResult<u32> {
         let written = loop {
-            match self.pop_used_with_len() {
+            match self.pop_used_with_len()? {
                 Some((completed, written)) => {
                     assert_eq!(
                         completed, token,
@@ -611,7 +697,7 @@ impl<T: VirtioTransport> VirtQueue<T> {
             }
         };
         transport.ack_interrupt();
-        written
+        Ok(written)
     }
 
     /// Allocates and programs one virtqueue.
@@ -657,6 +743,7 @@ impl<T: VirtioTransport> VirtQueue<T> {
             index,
             features,
             ring,
+            faulted: false,
         })
     }
 
@@ -697,6 +784,7 @@ impl<T: VirtioTransport> VirtQueue<T> {
             writable: false,
         }; MAX_CHAIN_BUFFERS];
         let used = build_chain(transport, inputs, payload, outputs, &mut chain)?;
+        self.ensure_driven()?;
         Ok(self.ring.submit(&chain[..used], true)?)
     }
 
@@ -739,6 +827,7 @@ impl<T: VirtioTransport> VirtQueue<T> {
             writable: false,
         }; MAX_CHAIN_BUFFERS];
         let used = build_chain(transport, inputs, None, outputs, &mut chain)?;
+        self.ensure_driven()?;
         Ok(self.ring.submit(&chain[..used], false)?)
     }
 
@@ -757,14 +846,26 @@ impl<T: VirtioTransport> VirtQueue<T> {
         self.ring.has_pending_used()
     }
 
-    pub fn pop_used(&mut self) -> Option<u16> {
-        self.pop_used_with_len().map(|(id, _)| id)
+    /// Reaps the next completed chain.
+    ///
+    /// A completion naming an identifier that is out of range or not a
+    /// chain in flight is a device fault: it is reported before any queue
+    /// state changes, and the queue then refuses every further submission
+    /// and completion until [`VirtQueue::reset`].
+    pub fn pop_used(&mut self) -> IoResult<Option<u16>> {
+        Ok(self.pop_used_with_len()?.map(|(id, _)| id))
     }
 
     /// Reaps the next completed chain together with the number of bytes
     /// the device wrote into it.
-    pub fn pop_used_with_len(&mut self) -> Option<(u16, u32)> {
-        self.ring.pop_used()
+    ///
+    /// Faults as [`VirtQueue::pop_used`] does.
+    pub fn pop_used_with_len(&mut self) -> IoResult<Option<(u16, u32)>> {
+        self.ensure_driven()?;
+        self.ring.pop_used().map_err(|error| {
+            self.faulted = true;
+            error.into()
+        })
     }
 
     /// Reaps every completed chain, handing each to `complete`.
@@ -772,13 +873,29 @@ impl<T: VirtioTransport> VirtQueue<T> {
     /// This is the entry point a task uses when it may be reaping work
     /// another task submitted: completions arrive in whatever order the
     /// device chose, and the caller routes each one by its identifier.
-    pub fn drain_used(&mut self, mut complete: impl FnMut(u16, u32)) -> usize {
+    ///
+    /// Faults as [`VirtQueue::pop_used`] does; completions handed to
+    /// `complete` before the fault stand.
+    pub fn drain_used(&mut self, mut complete: impl FnMut(u16, u32)) -> IoResult<usize> {
         let mut drained = 0;
-        while let Some((id, len)) = self.ring.pop_used() {
+        while let Some((id, len)) = self.pop_used_with_len()? {
             complete(id, len);
             drained += 1;
         }
-        drained
+        Ok(drained)
+    }
+
+    /// Whether the device broke the used-ring contract and the queue
+    /// stopped.
+    pub fn is_faulted(&self) -> bool {
+        self.faulted
+    }
+
+    fn ensure_driven(&self) -> Result<(), VirtqueueError> {
+        if self.faulted {
+            return Err(VirtqueueError::Faulted);
+        }
+        Ok(())
     }
 
     /// Kicks the device if it has not suppressed notifications.
@@ -843,6 +960,7 @@ impl<T: VirtioTransport> VirtQueue<T> {
         }
         transport.reset_queue(self.index)?;
         self.ring.reprogram(transport, self.index);
+        self.faulted = false;
         Ok(())
     }
 
