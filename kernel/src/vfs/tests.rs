@@ -1,5 +1,6 @@
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::sync::atomic::Ordering as AtomicOrdering;
 
 use futures_lite::future::block_on;
 use helios_hal::fs::{FileSystem, FileSystemRights, FsError, FsPath, OpenFlags};
@@ -172,6 +173,40 @@ fn a_mount_point_is_listed_in_its_parent_and_unmount_uncovers_it() {
         block_on(namespace.stat("/scratch/f", Follow::No)).map(drop),
         Err(FsError::NoEntry)
     );
+}
+
+#[test]
+fn a_cancelled_unmount_leaves_the_mount_live() {
+    let namespace = namespace();
+    mount_memory(&namespace, "/scratch");
+    create(&namespace, "/scratch/f", b"kept");
+    let slot = namespace
+        .table()
+        .inner
+        .slots
+        .iter()
+        .find(|slot| slot.read(|mount| mount.point == "/scratch") == Some(true))
+        .expect("the mount has a slot");
+
+    // A resolution that has not let go keeps the unmount waiting; the
+    // unmount is dropped while it waits.
+    slot.pins.fetch_add(1, AtomicOrdering::SeqCst);
+    {
+        let mut unmount = core::pin::pin!(namespace.table().unmount("/scratch"));
+        assert_eq!(
+            block_on(futures_lite::future::poll_once(&mut unmount)),
+            None
+        );
+        assert_eq!(owner(&namespace, "/scratch/f").0, "/");
+    }
+    slot.pins.fetch_sub(1, AtomicOrdering::SeqCst);
+
+    assert_eq!(
+        owner(&namespace, "/scratch/f"),
+        ("/scratch".into(), "f".into())
+    );
+    assert_eq!(read(&namespace, "/scratch/f"), b"kept");
+    block_on(namespace.table().unmount("/scratch")).expect("a later unmount completes");
 }
 
 #[test]

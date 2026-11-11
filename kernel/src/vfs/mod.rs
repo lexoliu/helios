@@ -285,6 +285,39 @@ impl<H> Slot<H> {
     }
 }
 
+/// An unmount's hold on a slot it marked retiring.
+///
+/// [`Retiring::retire`] empties the slot once nothing pins it. Dropped
+/// without that, because the unmount was cancelled while it waited for
+/// resolutions to let go, the guard puts the slot back to live: the mount
+/// is still in place, and a retiring slot that nothing will ever empty
+/// would hide it from every resolution and refuse every later unmount.
+struct Retiring<'a, H> {
+    writer: &'a spin::Mutex<()>,
+    slot: &'a Slot<H>,
+}
+
+impl<H> Retiring<'_, H> {
+    /// Takes the mount out of the slot and leaves the slot empty.
+    fn retire(self) -> Option<Mount<H>> {
+        let this = core::mem::ManuallyDrop::new(self);
+        let _writer = this.writer.lock();
+        // SAFETY: the slot is retiring with no pins and the writer lock is
+        // held; every resolution that pins it from here on sees it
+        // retiring and leaves the mount alone.
+        let retired = unsafe { (*this.slot.mount.get()).take() };
+        this.slot.state.store(SLOT_EMPTY, AtomicOrdering::Release);
+        retired
+    }
+}
+
+impl<H> Drop for Retiring<'_, H> {
+    fn drop(&mut self) {
+        let _writer = self.writer.lock();
+        self.slot.state.store(SLOT_LIVE, AtomicOrdering::SeqCst);
+    }
+}
+
 struct TableInner<H> {
     boot: BootFs,
     slots: [Slot<H>; MAX_MOUNTS],
@@ -414,19 +447,16 @@ impl<H: Clone> MountTable<H> {
             slot.state.store(SLOT_RETIRING, AtomicOrdering::SeqCst);
             slot
         };
+        // From here the slot is retiring; whatever ends this call, the
+        // guard leaves it live or empty, never retiring.
+        let retiring = Retiring {
+            writer: &self.inner.writer,
+            slot,
+        };
         while slot.pins.load(AtomicOrdering::SeqCst) != 0 {
             crate::yield_now().await;
         }
-        let retired = {
-            let _writer = self.inner.writer.lock();
-            // SAFETY: the slot is retiring with no pins and the writer lock
-            // is held; every resolution that pins it from here on sees it
-            // retiring and leaves the mount alone.
-            let retired = unsafe { (*slot.mount.get()).take() };
-            slot.state.store(SLOT_EMPTY, AtomicOrdering::Release);
-            retired
-        };
-        drop(retired);
+        drop(retiring.retire());
         Ok(())
     }
 
