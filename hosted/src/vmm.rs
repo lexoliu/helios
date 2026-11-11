@@ -24,9 +24,10 @@
 //! so it does not violate AGENTS §4 even though the embedding kernel
 //! runs an async executor.
 
-use std::ptr;
+use std::ptr::{self, NonNull};
 use std::sync::Mutex;
 
+use helios_hal::cpu::current_processor;
 use helios_hal::device::{DeviceRegion, DmaPlacement};
 use helios_hal::pmm::PhysFrame;
 use helios_hal::vmm::{
@@ -35,8 +36,9 @@ use helios_hal::vmm::{
 };
 use helios_hal::{align_down, align_up};
 use helios_kernel::{
-    CommittedRegion, MemoryOwner, ReservationLookup, ReservationTracker, SwapEntry,
-    current_user_memory_owner, validate_range,
+    CommittedRegion, MemoryOwner, ReservationLookup, ReservationTracker, SwapLeafFormat, SwapSpace,
+    allocate_user_frame_uninit_on, current_user_memory_owner, deallocate_user_frame_on,
+    validate_range,
 };
 
 const PAGE_SIZE: usize = PhysFrame::SIZE;
@@ -44,10 +46,11 @@ const PAGE_SIZE: usize = PhysFrame::SIZE;
 pub struct HostedAddressSpace {
     reservations: Mutex<ReservationTracker>,
     host_page: usize,
-    /// Swap tokens whose pages went away underneath them. Same reason
-    /// as the bare-metal backends: releasing an extent is asynchronous
-    /// and this runs under the reservation lock.
-    orphans: Mutex<Vec<SwapToken>>,
+    /// The part of swapping a page that is not host protection: the
+    /// order of a swap-out, the frame, the bookkeeping rollback, the
+    /// orphan queue and the ageing walk. This backend supplies the leaf
+    /// through [`SwapLeafFormat`].
+    swap: SwapSpace,
     /// The processor commits are attributed to. The hosted backend runs
     /// the kernel on one processor, so there is one.
     processor: helios_hal::cpu::ProcessorId,
@@ -58,19 +61,9 @@ impl HostedAddressSpace {
         Self {
             reservations: Mutex::new(ReservationTracker::new()),
             host_page: host_page_size(),
-            orphans: Mutex::new(Vec::new()),
+            swap: SwapSpace::new(),
             processor: helios_hal::cpu::ProcessorId::new(0),
         }
-    }
-
-    fn orphan(&self, entries: Vec<SwapEntry>) {
-        if entries.is_empty() {
-            return;
-        }
-        self.orphans
-            .lock()
-            .unwrap()
-            .extend(entries.into_iter().map(|entry| entry.token));
     }
 
     /// Makes the host pages covering `virt` readable and writable so the
@@ -83,6 +76,27 @@ impl HostedAddressSpace {
     ) -> Result<(), AddressSpaceError> {
         let hull = self.host_hull(tracker, virt)?;
         set_protection(hull, libc::PROT_READ | libc::PROT_WRITE)
+    }
+
+    /// Copies the committed page `page` into `frame` and takes its
+    /// protection away: read-only first, so a store racing the copy
+    /// faults instead of landing after it, then whatever the tracker,
+    /// which no longer holds the page committed, leaves it.
+    fn copy_out(
+        &self,
+        tracker: &ReservationTracker,
+        page: VirtRange,
+        frame: NonNull<u8>,
+    ) -> Result<(), AddressSpaceError> {
+        set_protection(self.host_hull(tracker, page)?, libc::PROT_READ)?;
+        // SAFETY: the host pages covering `page` are readable, the frame
+        // is one whole frame the caller owns, and they cannot overlap.
+        unsafe {
+            ptr::copy_nonoverlapping(page.start.raw() as *const u8, frame.as_ptr(), PAGE_SIZE);
+        }
+        // This drops the host page to `PROT_NONE` and hands the host the
+        // memory back unless a neighbour shares it.
+        self.apply_host_protection(tracker, page, true)
     }
 
     /// Host-page hull of `virt`, clipped to its reservation. `mmap`
@@ -192,7 +206,7 @@ impl AddressSpace for HostedAddressSpace {
 
     fn release(&self, virt: VirtRange) -> Result<(), AddressSpaceError> {
         let released = self.reservations.lock().unwrap().release(virt)?;
-        self.orphan(released.swapped);
+        self.swap.discard(self, released.swapped);
         let result = unsafe { libc::munmap(virt.start.raw() as *mut _, virt.byte_len) };
         if result != 0 {
             return Err(AddressSpaceError::NotReserved);
@@ -207,7 +221,8 @@ impl AddressSpace for HostedAddressSpace {
         let owner = current_user_memory_owner(self.processor);
         // Committing over a swapped-out page throws its contents away;
         // the extent behind the token still has to be given back.
-        self.orphan(reservations.record_commit(virt, flags, owner)?);
+        self.swap
+            .discard(self, reservations.record_commit(virt, flags, owner)?);
         if let Err(error) = self.apply_host_protection(&reservations, virt, false) {
             let _ = reservations.record_decommit(virt)?;
             return Err(error);
@@ -219,8 +234,7 @@ impl AddressSpace for HostedAddressSpace {
         validate_range(virt)?;
         let mut reservations = self.reservations.lock().unwrap();
         reservations.ensure_committed(virt)?;
-        let swapped = reservations.record_decommit(virt)?;
-        self.orphan(swapped);
+        self.swap.discard(self, reservations.record_decommit(virt)?);
         self.apply_host_protection(&reservations, virt, true)
     }
 
@@ -314,7 +328,10 @@ impl AddressSpace for HostedAddressSpace {
         // ages and evicts owned regions. The claim runs inside the
         // claiming guest's processor turn, which names that guest as
         // the processor's owner for its own linear memory.
-        self.orphan(reservations.record_commit(virt, flags, MemoryOwner::NONE)?);
+        self.swap.discard(
+            self,
+            reservations.record_commit(virt, flags, MemoryOwner::NONE)?,
+        );
         let mapped = unsafe {
             libc::mmap(
                 virt.start.raw() as *mut _,
@@ -336,8 +353,7 @@ impl AddressSpace for HostedAddressSpace {
         validate_range(virt)?;
         let mut reservations = self.reservations.lock().unwrap();
         reservations.ensure_committed(virt)?;
-        let swapped = reservations.record_decommit(virt)?;
-        self.orphan(swapped);
+        self.swap.discard(self, reservations.record_decommit(virt)?);
         // Anonymous `PROT_NONE` restores what a reservation is: address
         // space nothing is behind. Dropping the shared mapping here is
         // what makes the device provably unreachable.
@@ -397,90 +413,30 @@ impl AddressSpace for HostedAddressSpace {
         token: SwapToken,
         out: &mut [u8],
     ) -> Result<PageFlags, AddressSpaceError> {
-        if out.len() != PAGE_SIZE {
-            return Err(AddressSpaceError::BadPageBuffer);
-        }
-        if !addr.is_page_aligned() {
-            return Err(AddressSpaceError::Misaligned);
-        }
-        let page = VirtRange::new(addr, PAGE_SIZE);
-        let mut reservations = self.reservations.lock().unwrap();
-        self.open_for_transfer(&reservations, page)?;
-        // SAFETY: the range is committed (`record_swap_out` below
-        // rejects it otherwise) and the host pages covering it were just
-        // made readable.
-        unsafe {
-            ptr::copy_nonoverlapping(addr.raw() as *const u8, out.as_mut_ptr(), PAGE_SIZE);
-        }
-        let flags = match reservations.record_swap_out(addr, token) {
-            Ok(flags) => flags,
-            Err(error) => {
-                self.apply_host_protection(&reservations, page, false)?;
-                return Err(error);
-            }
-        };
-        // The page is no longer committed, so this drops it to PROT_NONE
-        // and hands the host its memory back.
-        self.apply_host_protection(&reservations, page, true)?;
-        Ok(flags)
+        self.swap.swap_out_page(
+            &mut self.reservations.lock().unwrap(),
+            self,
+            addr,
+            token,
+            out,
+        )
     }
 
     fn swap_in_page(&self, addr: VirtAddr, bytes: &[u8]) -> Result<SwapToken, AddressSpaceError> {
-        if bytes.len() != PAGE_SIZE {
-            return Err(AddressSpaceError::BadPageBuffer);
-        }
-        if !addr.is_page_aligned() {
-            return Err(AddressSpaceError::Misaligned);
-        }
-        let page = VirtRange::new(addr, PAGE_SIZE);
-        let mut reservations = self.reservations.lock().unwrap();
-        let entry = reservations.take_swap_entry(addr)?;
-        self.open_for_transfer(&reservations, page)?;
-        // SAFETY: the host pages covering `page` were just made
-        // writable, and only this 4 KiB of them is written.
-        unsafe {
-            ptr::copy_nonoverlapping(bytes.as_ptr(), addr.raw() as *mut u8, PAGE_SIZE);
-        }
-        self.apply_host_protection(&reservations, page, false)?;
-        Ok(entry.token)
+        self.swap
+            .swap_in_page(&mut self.reservations.lock().unwrap(), self, addr, bytes)
     }
 
     fn swapped_token(&self, addr: VirtAddr) -> Option<SwapToken> {
-        self.reservations
-            .lock()
-            .unwrap()
-            .swap_entry(addr.page_floor())
-            .map(|entry| entry.token)
+        SwapLeafFormat::swapped_token(self, addr)
     }
 
-    /// The host kernel does not show a process its pages' access flags,
-    /// so every committed page reports [`PageAge::Hot`]. Aging therefore
-    /// frees nothing here, which is the honest answer: `hosted` cannot
-    /// rank pages it cannot measure, and a pass that frees nothing is
-    /// what hands the decision to the OOM killer.
-    fn scan_committed_pages<Visit>(&self, owner: u64, mut visit: Visit) -> usize
+    fn scan_committed_pages<Visit>(&self, owner: u64, visit: Visit) -> usize
     where
         Visit: FnMut(VirtAddr, PageFlags, PageAge) -> bool,
     {
-        let reservations = self.reservations.lock().unwrap();
-        let mut visited = 0_usize;
-        let mut keep_going = true;
-        reservations.owned_committed_regions(MemoryOwner::new(owner), |region| {
-            for offset in (0..region.range.byte_len).step_by(PAGE_SIZE) {
-                visited += 1;
-                if !visit(
-                    VirtAddr::new(region.range.start.raw() + offset),
-                    region.flags,
-                    PageAge::Hot,
-                ) {
-                    keep_going = false;
-                    return false;
-                }
-            }
-            true
-        });
-        let _ = keep_going;
-        visited
+        self.swap
+            .scan_committed_pages(&self.reservations.lock().unwrap(), self, owner, visit)
     }
 
     fn owned_resident_bytes(&self, owner: u64) -> u64 {
@@ -490,17 +446,92 @@ impl AddressSpace for HostedAddressSpace {
             .owned_resident_bytes(MemoryOwner::new(owner))
     }
 
-    fn drain_orphaned_swap_tokens<Visit>(&self, mut visit: Visit) -> usize
+    fn drain_orphaned_swap_tokens<Visit>(&self, visit: Visit) -> usize
     where
         Visit: FnMut(SwapToken),
     {
-        let drained: Vec<SwapToken> = core::mem::take(&mut *self.orphans.lock().unwrap());
-        let count = drained.len();
-        for token in drained {
-            visit(token);
-        }
-        count
+        self.swap.drain_orphaned_swap_tokens(visit)
     }
+}
+
+/// The host's page protection as a swap leaf.
+///
+/// There is no page table to hold a swap entry here: the reservation
+/// bookkeeping is the leaf, a swapped page is one the tracker holds as a
+/// swap entry, and its host page is `PROT_NONE` (and returned to the host
+/// with `madvise`) once no committed region shares it. The hosted kernel
+/// has no trap context and no other processor that translates through a
+/// page table, so there is nothing to shoot down and no fault to
+/// classify: `swapped_token` is a plain tracker lookup and takes the
+/// reservation lock, which is why it must not be called with that lock
+/// held.
+impl SwapLeafFormat for HostedAddressSpace {
+    fn swapped_token(&self, addr: VirtAddr) -> Option<SwapToken> {
+        self.reservations
+            .lock()
+            .unwrap()
+            .swap_entry(addr.page_floor())
+            .map(|entry| entry.token)
+    }
+
+    /// Copies the host page into a pool frame, with a store racing the
+    /// copy faulting rather than landing after it, and removes the page's
+    /// protection.
+    fn detach(
+        &self,
+        tracker: &ReservationTracker,
+        addr: VirtAddr,
+        _token: SwapToken,
+    ) -> Result<NonNull<u8>, AddressSpaceError> {
+        let frame = allocate_user_frame_uninit_on(current_processor())
+            .map_err(|_| AddressSpaceError::OutOfFrames)?;
+        match self.copy_out(tracker, VirtRange::new(addr, PAGE_SIZE), frame) {
+            Ok(()) => Ok(frame),
+            Err(error) => {
+                deallocate_user_frame_on(current_processor(), frame);
+                Err(error)
+            }
+        }
+    }
+
+    /// Copies the frame into the page and returns the frame to the pool:
+    /// the host's page is the leaf and keeps its own backing.
+    fn attach(
+        &self,
+        tracker: &ReservationTracker,
+        addr: VirtAddr,
+        _expected: SwapToken,
+        frame: NonNull<u8>,
+        _flags: PageFlags,
+    ) -> Result<(), AddressSpaceError> {
+        let page = VirtRange::new(addr, PAGE_SIZE);
+        self.open_for_transfer(tracker, page)?;
+        // SAFETY: the host pages covering `page` were just made writable,
+        // only this 4 KiB of them is written, the frame is one whole
+        // frame, and they cannot overlap.
+        unsafe {
+            ptr::copy_nonoverlapping(frame.as_ptr(), addr.raw() as *mut u8, PAGE_SIZE);
+        }
+        // The tracker holds the page committed again, so the protection
+        // it is given is the union with its host-page neighbours.
+        self.apply_host_protection(tracker, page, false)?;
+        deallocate_user_frame_on(current_processor(), frame);
+        Ok(())
+    }
+
+    /// The bookkeeping no longer holds the entry, and it was the leaf.
+    fn clear_swapped(&self, _addr: VirtAddr) {}
+
+    /// The host kernel does not show a process its pages' access flags,
+    /// so every committed page reports [`PageAge::Hot`]. Ageing therefore
+    /// frees nothing here, which is the honest answer: `hosted` cannot
+    /// rank pages it cannot measure, and a pass that frees nothing is
+    /// what hands the decision to the OOM killer.
+    fn test_and_clear_accessed(&self, _addr: VirtAddr) -> Option<PageAge> {
+        Some(PageAge::Hot)
+    }
+
+    fn accessed_cleared(&self, _start: VirtAddr, _pages: usize) {}
 }
 
 /// Restores the pre-protect committed regions after a failed protect.
