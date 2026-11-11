@@ -20,6 +20,7 @@ mod pci;
 mod rtc;
 mod smp;
 mod snd;
+mod vmgenid;
 mod vsock;
 mod watchdog;
 
@@ -331,10 +332,38 @@ fn x86_kernel_main() -> ! {
     // before it is programmed, and that pass also programs the block
     // device, which needs the root DRBG this call produces. It joins
     // through the reseed task once the executor runs.
-    // No VM generation ID window is discovered on this platform yet, so
-    // the machine generation moves only through `advance`.
-    let machine_generation = helios_kernel::MachineGeneration::new(None);
+    // QEMU's `vmgenid` device publishes the VM generation ID window
+    // through an ACPI SSDT. It is found before the root DRBG is seeded so
+    // that the identifier the machine boots with is the one every later
+    // observation is compared against.
+    let vmgenid_window = vmgenid::discover(
+        smp::PhysicalOffsetAcpiHandler {
+            physical_memory_offset,
+            tsc_base,
+            timebase,
+        },
+        rsdp_address,
+    );
+    let machine_generation =
+        helios_kernel::MachineGeneration::new(vmgenid_window.map(|found| found.window));
+    match vmgenid_window {
+        Some(found) => tracing::info!(
+            address = format_args!("{:#x}", found.address.get()),
+            // The 16 bytes in the order they sit in the window.
+            generation = format_args!(
+                "{:032x}",
+                u128::from_be_bytes(*found.window.read().as_bytes())
+            ),
+            "vmgenid online"
+        ),
+        None => tracing::info!(
+            "no VM generation ID device; restores of this machine are invisible to it"
+        ),
+    }
     debug_state.install_machine_generation(machine_generation.clone());
+    // Entropy observes the generation on every draw; this task bounds how
+    // late the other reactions to a restore notice it.
+    helios_kernel::spawn_generation_probe(&kernel, &machine_generation);
     let root_entropy = helios_kernel::seed_root_entropy(
         &cpu,
         None,
