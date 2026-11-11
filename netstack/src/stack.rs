@@ -10,18 +10,19 @@ use bytes::{Bytes, BytesMut};
 use heapless::Deque;
 use heapless::binary_heap::{BinaryHeap, Min};
 
+use crate::address::lifetime_deadline;
 use crate::{
-    ArpOperation, ArpPacket, BbrV3, CongestionControl, DEFAULT_POLL_BUDGET, DhcpDnsServers,
-    EthernetAddress, EthernetFrame, EthernetProtocol, Icmpv4DestinationUnreachableCode,
-    Icmpv4Packet, Icmpv6DestinationUnreachableCode, Icmpv6Packet, IpAddress, IpCidr, Ipv4Address,
-    Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6Cidr, Ipv6DnsServers, Ipv6Packet,
-    Ipv6RouterConfiguration, Ipv6Scope, NeighborDiscovery, PacketBuffer, RxChecksumReport, RxFrame,
-    RxFrameOffload, SegmentationOffload, StackError, TcpCloseAction, TcpCloseKind, TcpEndpoint,
-    TcpFlags, TcpHeader, TcpHeaderOptions, TcpPacket, TcpReceiveBuffer, TcpReceiveCounters,
-    TcpReceiveDiagnostics, TcpSegmentBudget, TcpSocket, TcpTransmitSegment, TransportChecksum,
-    TxChecksum, TxFrameRef, TxSegmentation, UdpPacket, icmpv6_checksum_valid,
-    interpret_router_advertisement, ipv4_checksum, partial_transport_checksum_completes,
-    tcp_checksum_valid, udp_checksum_valid,
+    AddressLifetimes, AdvertisedAddress, ArpOperation, ArpPacket, BbrV3, CongestionControl,
+    DEFAULT_POLL_BUDGET, DhcpDnsServers, EthernetAddress, EthernetFrame, EthernetProtocol,
+    Icmpv4DestinationUnreachableCode, Icmpv4Packet, Icmpv6DestinationUnreachableCode, Icmpv6Packet,
+    IpAddress, IpCidr, Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6AddressEntry, Ipv6Cidr,
+    Ipv6DnsServers, Ipv6Packet, Ipv6RouterConfiguration, Ipv6Scope, NeighborDiscovery,
+    PacketBuffer, RxChecksumReport, RxFrame, RxFrameOffload, SegmentationOffload, StackError,
+    TcpCloseAction, TcpCloseKind, TcpEndpoint, TcpFlags, TcpHeader, TcpHeaderOptions, TcpPacket,
+    TcpReceiveBuffer, TcpReceiveCounters, TcpReceiveDiagnostics, TcpSegmentBudget, TcpSocket,
+    TcpTransmitSegment, TransportChecksum, TxChecksum, TxFrameRef, TxSegmentation, UdpPacket,
+    icmpv6_checksum_valid, interpret_router_advertisement, ipv4_checksum,
+    partial_transport_checksum_completes, tcp_checksum_valid, udp_checksum_valid,
 };
 
 pub const MAX_ROUTES: usize = 32;
@@ -457,18 +458,6 @@ pub struct Route {
     pub destination: IpCidr,
     pub gateway: Option<IpAddress>,
     pub expires_at: Option<StackInstant>,
-}
-
-/// The instant a lifetime advertised in seconds runs out, or `None` for
-/// the infinite lifetime `0xffff_ffff` (RFC 4861 §4.6.2).
-fn lifetime_deadline(now: StackInstant, seconds: u32) -> Option<StackInstant> {
-    const NANOS_PER_SECOND: u64 = 1_000_000_000;
-    (seconds != u32::MAX).then(|| {
-        StackInstant::from_nanos(
-            now.nanos()
-                .saturating_add(u64::from(seconds) * NANOS_PER_SECOND),
-        )
-    })
 }
 
 /// Routes a Router Advertisement may hold at once. RFC 4861 §6.3.4 lets a
@@ -2370,7 +2359,11 @@ where
     path_mtu: PathMtuTable,
     ipv4_reassembly: Ipv4ReassemblyCache,
     ipv4_addresses: ArrayVec<Ipv4Cidr, 8>,
-    ipv6_addresses: ArrayVec<Ipv6Cidr, 16>,
+    /// Interface addresses. An autoconfigured entry carries its
+    /// lifetimes and leaves the table, with its connected route, when its
+    /// valid lifetime ends; [`Stack::drive_ipv6_autoconfig`] and every
+    /// Router Advertisement advance them.
+    ipv6_addresses: ArrayVec<Ipv6AddressEntry, 16>,
     /// Router-solicitation scheduling for stateless autoconfiguration.
     /// Owned by this stack, therefore by exactly one network shard; see
     /// the concurrency contract on [`crate::NeighborDiscovery`].
@@ -3002,10 +2995,20 @@ where
         self.ipv4_multicast_memberships.iter().copied()
     }
 
-    /// Adds an address and its connected route, or fails without changing
-    /// either table when one is full.
+    /// Adds an address with no lifetime (a manual or link-local one) and
+    /// its connected route, or fails without changing either table when
+    /// one is full.
     pub fn add_ipv6_address(&mut self, address: Ipv6Cidr) -> Result<(), StackError> {
-        if self.ipv6_addresses.contains(&address) {
+        self.insert_ipv6_address(Ipv6AddressEntry::configured(address))
+    }
+
+    fn insert_ipv6_address(&mut self, entry: Ipv6AddressEntry) -> Result<(), StackError> {
+        let address = entry.cidr();
+        if self
+            .ipv6_addresses
+            .iter()
+            .any(|existing| existing.cidr() == address)
+        {
             return Ok(());
         }
         if self.ipv6_addresses.is_full() {
@@ -3017,7 +3020,7 @@ where
             expires_at: None,
         })?;
         self.ipv6_addresses
-            .try_push(address)
+            .try_push(entry)
             .map_err(|_| StackError::AddressTableFull)
     }
 
@@ -3025,7 +3028,7 @@ where
         if let Some(index) = self
             .ipv6_addresses
             .iter()
-            .position(|existing| *existing == address)
+            .position(|existing| existing.cidr() == address)
         {
             self.ipv6_addresses.remove(index);
             self.remove_connected_route(IpCidr::Ipv6(address));
@@ -3033,10 +3036,66 @@ where
     }
 
     pub fn clear_ipv6_addresses(&mut self) {
-        for address in self.ipv6_addresses.clone() {
-            self.remove_connected_route(IpCidr::Ipv6(address));
+        for entry in self.ipv6_addresses.clone() {
+            self.remove_connected_route(IpCidr::Ipv6(entry.cidr()));
         }
         self.ipv6_addresses.clear();
+    }
+
+    /// Advances every autoconfigured address to `now`: one whose
+    /// preferred lifetime has ended becomes deprecated, and one whose
+    /// valid lifetime has ended is removed with its connected route
+    /// (RFC 4862 §5.5.4).
+    fn expire_ipv6_addresses(&mut self, now: StackInstant) {
+        let routes = &mut self.routes;
+        self.ipv6_addresses.retain(|entry| {
+            let valid = entry.advance(now);
+            if !valid {
+                routes.remove(Route {
+                    destination: IpCidr::Ipv6(entry.cidr()),
+                    gateway: None,
+                    expires_at: None,
+                });
+            }
+            valid
+        });
+    }
+
+    /// Applies the Prefix Information option an address was derived from
+    /// (RFC 4862 §5.5.3 (d), (e)). An address already autoconfigured has
+    /// its lifetimes updated under the two-hour rule; a new one is added
+    /// unless its valid lifetime is zero. An address the kernel configured
+    /// is not the network's to change.
+    fn apply_advertised_ipv6_address(
+        &mut self,
+        advertised: AdvertisedAddress,
+        now: StackInstant,
+    ) -> Result<(), StackError> {
+        if let Some(existing) = self
+            .ipv6_addresses
+            .iter_mut()
+            .find(|entry| entry.cidr() == advertised.address)
+        {
+            if let Some(lifetimes) = existing.lifetimes_mut() {
+                lifetimes.refresh(
+                    now,
+                    advertised.preferred_lifetime_seconds,
+                    advertised.valid_lifetime_seconds,
+                );
+            }
+            return Ok(());
+        }
+        if advertised.valid_lifetime_seconds == 0 {
+            return Ok(());
+        }
+        self.insert_ipv6_address(Ipv6AddressEntry::autoconfigured(
+            advertised.address,
+            AddressLifetimes::from_advertised(
+                now,
+                advertised.preferred_lifetime_seconds,
+                advertised.valid_lifetime_seconds,
+            ),
+        ))
     }
 
     pub fn primary_ipv4_address(&self) -> Option<Ipv4Cidr> {
@@ -3062,14 +3121,26 @@ where
     }
 
     pub fn primary_ipv6_address(&self) -> Option<Ipv6Cidr> {
-        self.ipv6_addresses.first().copied()
+        self.ipv6_addresses.first().map(Ipv6AddressEntry::cidr)
     }
 
+    /// The interface's addresses, deprecated ones included.
     pub fn ipv6_addresses(&self) -> impl Iterator<Item = Ipv6Cidr> + '_ {
+        self.ipv6_addresses.iter().map(Ipv6AddressEntry::cidr)
+    }
+
+    /// The interface's addresses with the lifetimes of the autoconfigured
+    /// ones.
+    pub fn ipv6_address_entries(&self) -> impl Iterator<Item = Ipv6AddressEntry> + '_ {
         self.ipv6_addresses.iter().copied()
     }
 
-    pub fn replace_ipv6_addresses(&mut self, addresses: impl IntoIterator<Item = Ipv6Cidr>) {
+    /// Replaces the address table with `entries`, lifetimes included. The
+    /// connected routes travel with [`Self::replace_routes`].
+    pub fn replace_ipv6_address_entries(
+        &mut self,
+        addresses: impl IntoIterator<Item = Ipv6AddressEntry>,
+    ) {
         self.ipv6_addresses.clear();
         for address in addresses {
             self.ipv6_addresses
@@ -3097,7 +3168,7 @@ where
     pub fn ipv6_link_local_address(&self) -> Option<Ipv6Address> {
         self.ipv6_addresses
             .iter()
-            .map(|cidr| cidr.address())
+            .map(|entry| entry.cidr().address())
             .find(|address| address.is_link_local())
     }
 
@@ -3140,6 +3211,7 @@ where
     /// calls are free.
     pub fn drive_ipv6_autoconfig(&mut self, now: StackInstant) -> Result<(), StackError> {
         self.routes.expire_learned(now);
+        self.expire_ipv6_addresses(now);
         if !self.ipv6_discovery.poll_solicitation(now) {
             return Ok(());
         }
@@ -3210,6 +3282,7 @@ where
         }
 
         self.routes.expire_learned(now);
+        self.expire_ipv6_addresses(now);
 
         for prefix in configuration.on_link_prefixes.iter().copied() {
             // A connected route: on-link destinations resolve through
@@ -3225,12 +3298,13 @@ where
             }
         }
 
-        for address in configuration.addresses.iter().copied() {
-            // A router that keeps advertising fresh prefixes must not be
+        for advertised in configuration.addresses.iter().copied() {
+            // A host that keeps advertising fresh prefixes must not be
             // able to overflow a fixed table, so a full table drops the
-            // new address instead of asserting.
-            if let Err(error) = self.add_ipv6_address(address) {
-                tracing::debug!(?address, ?error, "advertised address not configured");
+            // new address instead of asserting. What it did fill leaves
+            // with the lifetimes the advertisements carried.
+            if let Err(error) = self.apply_advertised_ipv6_address(advertised, now) {
+                tracing::debug!(?advertised, ?error, "advertised address not configured");
             }
         }
 
@@ -4974,35 +5048,49 @@ where
     /// answered from a link-local source, which would be unroutable off
     /// the link. Only when nothing else applies does the first
     /// configured address stand in.
+    ///
+    /// A deprecated address is passed over while any other address
+    /// qualifies (RFC 6724 §5 rule 3, RFC 4862 §5.5.4), so it still
+    /// serves a destination nothing else can reach.
     fn source_ipv6_for(&self, destination: Ipv6Address) -> Option<Ipv6Address> {
-        if let Some(cidr) = self
-            .ipv6_addresses
-            .iter()
-            .copied()
-            .find(|cidr| cidr.contains(destination))
+        self.source_ipv6_among(destination, |entry| !entry.is_deprecated())
+            .or_else(|| self.source_ipv6_among(destination, |_| true))
+            .or_else(|| {
+                self.ipv6_addresses
+                    .first()
+                    .map(|entry| entry.cidr().address())
+            })
+    }
+
+    /// The source address among the entries `usable` accepts that the
+    /// rules of [`Self::source_ipv6_for`] pick, without the fallback to
+    /// the first configured address.
+    fn source_ipv6_among(
+        &self,
+        destination: Ipv6Address,
+        usable: impl Fn(&Ipv6AddressEntry) -> bool,
+    ) -> Option<Ipv6Address> {
+        let mut candidates = self.ipv6_addresses.iter().filter(|entry| usable(entry));
+        if let Some(entry) = candidates
+            .clone()
+            .find(|entry| entry.cidr().contains(destination))
         {
-            return Some(cidr.address());
+            return Some(entry.cidr().address());
         }
         let destination_scope = destination.scope();
-        let same_scope = self
-            .ipv6_addresses
-            .iter()
-            .copied()
-            .find(|cidr| cidr.address().scope() == destination_scope);
+        let same_scope = candidates
+            .clone()
+            .find(|entry| entry.cidr().address().scope() == destination_scope);
         let wider_scope = if destination_scope == Ipv6Scope::LinkLocal {
             // Nothing but a link-local source can reach a link-local
             // destination, so there is no wider-scope substitute.
             None
         } else {
-            self.ipv6_addresses
-                .iter()
-                .copied()
-                .find(|cidr| !cidr.address().is_link_local())
+            candidates.find(|entry| !entry.cidr().address().is_link_local())
         };
         same_scope
             .or(wider_scope)
-            .or_else(|| self.ipv6_addresses.first().copied())
-            .map(Ipv6Cidr::address)
+            .map(|entry| entry.cidr().address())
     }
 
     fn queue_ndp_solicitation(
@@ -5595,7 +5683,7 @@ where
                 if self
                     .ipv6_addresses
                     .iter()
-                    .any(|address| address.address() == target)
+                    .any(|entry| entry.cidr().address() == target)
                 {
                     self.queue_icmpv6_neighbor_advertisement(
                         target,
@@ -6165,7 +6253,7 @@ where
             IpAddress::Ipv6(address) => self
                 .ipv6_addresses
                 .iter()
-                .any(|local| local.address() == address),
+                .any(|local| local.cidr().address() == address),
         }
     }
 
@@ -7045,6 +7133,7 @@ mod tests {
     use super::*;
     use crate::NewReno;
     use crate::TcpFlags;
+    use crate::{Ipv6AddressOrigin, Lifetime, TWO_HOURS_SECONDS};
     use alloc::vec;
 
     const LOCAL_MAC: EthernetAddress = [0x02, 0, 0, 0, 0, 1];
@@ -13666,36 +13755,288 @@ mod tests {
             dns_servers: Default::default(),
         };
         if let Some((index, valid_lifetime_seconds)) = prefix {
-            let network = Ipv6Address::new([
-                0x20,
-                0x01,
-                0x0d,
-                0xb8,
-                (index >> 8) as u8,
-                index as u8,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-            ]);
             configuration.on_link_prefixes.push(crate::OnLinkPrefix {
-                prefix: Ipv6Cidr::new(network, 64),
+                prefix: Ipv6Cidr::new(prefix_network(index), 64),
                 valid_lifetime_seconds,
             });
             if autonomous {
-                configuration.addresses.push(Ipv6Cidr::new(
-                    Ipv6Address::from_prefix_and_eui64(network, LOCAL_MAC),
-                    64,
+                configuration.addresses.push(advertised_address(
+                    index,
+                    valid_lifetime_seconds,
+                    valid_lifetime_seconds,
                 ));
             }
         }
         configuration
+    }
+
+    /// The `2001:db8:<index>::/64` prefix the SLAAC tests advertise.
+    fn prefix_network(index: u16) -> Ipv6Address {
+        Ipv6Address::new([
+            0x20,
+            0x01,
+            0x0d,
+            0xb8,
+            (index >> 8) as u8,
+            index as u8,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ])
+    }
+
+    fn advertised_address(
+        index: u16,
+        preferred_lifetime_seconds: u32,
+        valid_lifetime_seconds: u32,
+    ) -> AdvertisedAddress {
+        AdvertisedAddress {
+            address: Ipv6Cidr::new(
+                Ipv6Address::from_prefix_and_eui64(prefix_network(index), LOCAL_MAC),
+                64,
+            ),
+            preferred_lifetime_seconds,
+            valid_lifetime_seconds,
+        }
+    }
+
+    /// An advertisement from a router that offers no route and one
+    /// autonomous prefix, so only the address table reacts to it.
+    fn address_advertisement(address: AdvertisedAddress) -> Ipv6RouterConfiguration {
+        let mut configuration = advertisement(0, None, false);
+        configuration.addresses.push(address);
+        configuration
+    }
+
+    fn address_entry(stack: &Stack, address: AdvertisedAddress) -> Option<Ipv6AddressEntry> {
+        stack
+            .ipv6_address_entries()
+            .find(|entry| entry.cidr() == address.address)
+    }
+
+    fn has_connected_route(stack: &Stack, address: AdvertisedAddress) -> bool {
+        stack
+            .routes()
+            .iter()
+            .any(|route| route.destination == IpCidr::Ipv6(address.address))
+    }
+
+    fn valid_lifetime(stack: &Stack, address: AdvertisedAddress) -> Lifetime {
+        let Some(Ipv6AddressOrigin::Autoconfigured(lifetimes)) =
+            address_entry(stack, address).map(|entry| entry.origin())
+        else {
+            panic!("the address should be autoconfigured");
+        };
+        lifetimes.valid()
+    }
+
+    fn seconds(seconds: u64) -> StackInstant {
+        StackInstant::from_nanos(seconds * SECOND)
+    }
+
+    #[test]
+    fn an_autoconfigured_address_is_removed_with_its_route_when_its_valid_lifetime_ends() {
+        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        stack
+            .configure_ipv6_link_local()
+            .expect("link-local address should be accepted");
+        let address = advertised_address(7, 50, 100);
+        stack.apply_ipv6_router_configuration(address_advertisement(address), seconds(10));
+        assert!(address_entry(&stack, address).is_some());
+        assert!(has_connected_route(&stack, address));
+
+        stack
+            .drive_ipv6_autoconfig(seconds(109))
+            .expect("autoconfig poll should succeed");
+        assert!(
+            address_entry(&stack, address).is_some(),
+            "the address lives until its valid lifetime has run out"
+        );
+
+        stack
+            .drive_ipv6_autoconfig(seconds(110))
+            .expect("autoconfig poll should succeed");
+        assert!(address_entry(&stack, address).is_none());
+        assert!(!has_connected_route(&stack, address));
+        assert!(
+            stack.ipv6_link_local_address().is_some(),
+            "an address with no lifetime never expires"
+        );
+    }
+
+    #[test]
+    fn a_deprecated_address_is_not_chosen_as_a_source_while_another_qualifies() {
+        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        stack
+            .configure_ipv6_link_local()
+            .expect("link-local address should be accepted");
+        let short = advertised_address(1, 50, 1000);
+        let long = advertised_address(2, 500, 1000);
+        stack.apply_ipv6_router_configuration(address_advertisement(short), seconds(0));
+        stack.apply_ipv6_router_configuration(address_advertisement(long), seconds(0));
+        let off_link =
+            Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        let on_short_prefix =
+            Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5]);
+        assert_eq!(
+            stack.source_ipv6_address_for(on_short_prefix),
+            Some(short.address.address())
+        );
+        assert_eq!(
+            stack.source_ipv6_address_for(off_link),
+            Some(short.address.address())
+        );
+
+        stack
+            .drive_ipv6_autoconfig(seconds(50))
+            .expect("autoconfig poll should succeed");
+        assert!(address_entry(&stack, short).is_some_and(|entry| entry.is_deprecated()));
+        assert!(address_entry(&stack, long).is_some_and(|entry| !entry.is_deprecated()));
+        // Rule 3 (avoid deprecated) outranks rule 8 (longest prefix).
+        assert_eq!(
+            stack.source_ipv6_address_for(on_short_prefix),
+            Some(long.address.address())
+        );
+        assert_eq!(
+            stack.source_ipv6_address_for(off_link),
+            Some(long.address.address())
+        );
+
+        // With every global address deprecated, one still serves a
+        // global destination rather than the link-local address.
+        stack
+            .drive_ipv6_autoconfig(seconds(500))
+            .expect("autoconfig poll should succeed");
+        assert!(address_entry(&stack, long).is_some_and(|entry| entry.is_deprecated()));
+        let source = stack
+            .source_ipv6_address_for(off_link)
+            .expect("a deprecated address still serves");
+        assert!(!source.is_link_local());
+        // A deprecated address is still valid: it keeps answering.
+        assert!(stack.owns_ip_address(IpAddress::Ipv6(source)));
+    }
+
+    #[test]
+    fn an_advertisement_updates_a_configured_address_under_the_two_hour_rule() {
+        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let address = advertised_address(3, 3600, 86_400);
+        stack.apply_ipv6_router_configuration(address_advertisement(address), seconds(0));
+        assert_eq!(
+            valid_lifetime(&stack, address),
+            Lifetime::Until(seconds(86_400))
+        );
+
+        // A valid lifetime above two hours replaces the remaining one.
+        let longer = advertised_address(3, 3600, 200_000);
+        stack.apply_ipv6_router_configuration(address_advertisement(longer), seconds(10));
+        assert_eq!(
+            valid_lifetime(&stack, address),
+            Lifetime::Until(seconds(200_010))
+        );
+
+        // A short one against a long remaining lifetime is cut to two
+        // hours, never applied as announced.
+        let forged = advertised_address(3, 0, 5);
+        stack.apply_ipv6_router_configuration(address_advertisement(forged), seconds(100));
+        assert_eq!(
+            valid_lifetime(&stack, address),
+            Lifetime::Until(seconds(100 + u64::from(TWO_HOURS_SECONDS)))
+        );
+        stack
+            .drive_ipv6_autoconfig(seconds(200))
+            .expect("autoconfig poll should succeed");
+        assert!(
+            address_entry(&stack, address).is_some(),
+            "a forged short lifetime has not expired the address"
+        );
+        // The preferred lifetime is reset regardless.
+        assert!(address_entry(&stack, address).is_some_and(|entry| entry.is_deprecated()));
+
+        // With two hours or less remaining a shorter one is ignored.
+        let ignored = advertised_address(3, 3600, 30);
+        stack.apply_ipv6_router_configuration(address_advertisement(ignored), seconds(300));
+        assert_eq!(
+            valid_lifetime(&stack, address),
+            Lifetime::Until(seconds(100 + u64::from(TWO_HOURS_SECONDS)))
+        );
+        assert!(address_entry(&stack, address).is_some_and(|entry| !entry.is_deprecated()));
+
+        // One that outlasts what remains replaces it.
+        let extended = advertised_address(3, 3600, 7_000);
+        stack.apply_ipv6_router_configuration(address_advertisement(extended), seconds(5_000));
+        assert_eq!(
+            valid_lifetime(&stack, address),
+            Lifetime::Until(seconds(12_000))
+        );
+    }
+
+    #[test]
+    fn a_zero_valid_lifetime_follows_the_two_hour_rule_for_an_existing_address() {
+        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let address = advertised_address(4, 3600, 86_400);
+        stack.apply_ipv6_router_configuration(address_advertisement(address), seconds(0));
+
+        let withdrawn = advertised_address(4, 0, 0);
+        stack.apply_ipv6_router_configuration(address_advertisement(withdrawn), seconds(10));
+        assert!(
+            address_entry(&stack, address).is_some_and(|entry| entry.is_deprecated()),
+            "a zero preferred lifetime deprecates the address at once"
+        );
+        let two_hours = Lifetime::Until(seconds(10 + u64::from(TWO_HOURS_SECONDS)));
+        assert_eq!(valid_lifetime(&stack, address), two_hours);
+
+        stack
+            .drive_ipv6_autoconfig(seconds(10 + u64::from(TWO_HOURS_SECONDS)))
+            .expect("autoconfig poll should succeed");
+        assert!(address_entry(&stack, address).is_none());
+        assert!(!has_connected_route(&stack, address));
+
+        // A prefix never configured is not created by a zero lifetime.
+        let unknown = advertised_address(5, 0, 0);
+        stack.apply_ipv6_router_configuration(address_advertisement(unknown), seconds(20_000));
+        assert!(address_entry(&stack, unknown).is_none());
+        assert!(!has_connected_route(&stack, unknown));
+    }
+
+    #[test]
+    fn a_flood_of_fresh_prefixes_leaves_the_table_when_their_lifetimes_end() {
+        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        stack
+            .configure_ipv6_link_local()
+            .expect("link-local address should be accepted");
+        for index in 0..64 {
+            stack.apply_ipv6_router_configuration(
+                address_advertisement(advertised_address(index, 500, 1000)),
+                seconds(0),
+            );
+            while stack.take_event().is_some() {}
+        }
+        let flooded = stack.ipv6_addresses().count();
+        assert_eq!(flooded, 16, "the flood fills the address table");
+
+        // The router's own prefix finds the table full.
+        let legitimate = advertised_address(500, 3600, 7200);
+        stack.apply_ipv6_router_configuration(address_advertisement(legitimate), seconds(1));
+        assert!(address_entry(&stack, legitimate).is_none());
+
+        // The flood leaves with the lifetimes it carried, routes included.
+        stack
+            .drive_ipv6_autoconfig(seconds(1000))
+            .expect("autoconfig poll should succeed");
+        assert_eq!(stack.ipv6_addresses().count(), 1);
+        assert!(stack.ipv6_link_local_address().is_some());
+        assert_eq!(stack.routes().len(), 1);
+
+        stack.apply_ipv6_router_configuration(address_advertisement(legitimate), seconds(1001));
+        assert!(address_entry(&stack, legitimate).is_some());
+        assert!(has_connected_route(&stack, legitimate));
     }
 
     fn learned_route_count(stack: &Stack) -> usize {
