@@ -38,7 +38,9 @@ pub use wasmtime_adapter::parking::{
     park_wasmtime_waiter, unpark_wasmtime_waiters, wasmtime_monotonic_nanos,
 };
 #[cfg(feature = "wasmtime-runtime")]
-pub use wasmtime_adapter::swap_fault::resolve_swap_fault_blocking;
+pub use wasmtime_adapter::swap_fault::{
+    UserPageFault, classify_user_page_fault, resolve_swap_fault_blocking, run_swap_fault_trampoline,
+};
 pub use wasmtime_adapter::tls::WasmtimeTlsSlots;
 
 #[cfg(all(target_os = "none", feature = "wasmtime-bare-metal"))]
@@ -143,7 +145,8 @@ pub use io::{
     MAX_INPUT_DEVICES, MAX_IOMMU_ENDPOINTS, MAX_NETWORK_INTERRUPTS, PanicSerial, PollKey,
     PollRegistration, PollRegistry, PollRegistryError, PollSourceKind, RecordingConsole,
     SCRATCH_DISK_SERIAL, SerialReader, TryRead, TryWrite, byte_channel, emit_panic_report,
-    install_block_devices, read_debug_serial, read_serial, try_read_serial, wake_queue_owners,
+    install_block_devices, install_scratch_swap, read_debug_serial, read_serial, try_read_serial,
+    wake_queue_owners,
 };
 pub use kernel_exception::{
     KernelException, KernelExceptionCause, KernelExceptionDispatch, KernelNativeTrapHandler,
@@ -151,26 +154,28 @@ pub use kernel_exception::{
 };
 pub use machine::{AdvanceCause, Generation, MachineGeneration, MachineGenerationHandle};
 pub use memory::{
-    AccessibilityPlan, BalloonHandle, BalloonStats, BootMemoryPlan, BootRegionSplitter,
-    CommittedRegion, ENTROPY_RESEED_INTERVAL, EntropyPool, EntropySources, FIBER_STACK_GUARD_BYTES,
-    FREE_PAGE_REPORT_INTERVAL, FiberStack, FiberStackArenaStats, FiberStackError,
-    FiberStackVmHooks, HardwareEntropySource, IDLE_SWAP_AFTER, KERNEL_HEAP_BOOTSTRAP_BYTES,
-    KERNEL_HEAP_GROWTH_CHUNK_BYTES, KERNEL_HEAP_MAX_BOOT_FRACTION, KERNEL_HEAP_MIN_RESERVE_BYTES,
-    KERNEL_HEAP_RESERVE_FRACTION, KernelPhysFrameAllocator, MemoryOwner, NoCryptographicEntropy,
-    NoEntropyDevice, ROOT_ENTROPY_MATERIAL_BYTES, RegionShares, ReleasedReservation,
-    ReservationLookup, ReservationTracker, RootEntropy, RootEntropyHandle, SWAP_BATCH_BYTES,
-    SWAP_TICK, StackFault, SwapDisabled, SwapEntry, SwapFaultError, SwapHandle, SwapStats,
+    AGE_BATCH_PAGES, AccessibilityPlan, BalloonHandle, BalloonStats, BootMemoryPlan,
+    BootRegionSplitter, CommittedRegion, ENTROPY_RESEED_INTERVAL, EntropyPool, EntropySources,
+    FIBER_STACK_GUARD_BYTES, FREE_PAGE_REPORT_INTERVAL, FiberStack, FiberStackArenaStats,
+    FiberStackError, FiberStackVmHooks, HardwareEntropySource, IDLE_SWAP_AFTER,
+    InstalledAddressSpace, KERNEL_HEAP_BOOTSTRAP_BYTES, KERNEL_HEAP_GROWTH_CHUNK_BYTES,
+    KERNEL_HEAP_MAX_BOOT_FRACTION, KERNEL_HEAP_MIN_RESERVE_BYTES, KERNEL_HEAP_RESERVE_FRACTION,
+    KernelPhysFrameAllocator, MemoryOwner, NoCryptographicEntropy, NoEntropyDevice,
+    ROOT_ENTROPY_MATERIAL_BYTES, RegionShares, ReleasedReservation, ReservationLookup,
+    ReservationTracker, RootEntropy, RootEntropyHandle, SWAP_BATCH_BYTES, SWAP_TICK, StackFault,
+    SwapDisabled, SwapEntry, SwapFaultError, SwapHandle, SwapLeafFormat, SwapSpace, SwapStats,
     SwapVmHooks, TASK_ARENA_FRACTION, TASK_ARENA_MIN_BYTES, USER_POOL_MIN_REGION_BYTES,
     UserHeapStats, UserMemoryOwnerScope, UserMemoryOwners, UserMemoryPool, VaCursor,
     allocate_user_frame_uninit_on, allocate_user_frame_zeroed, allocate_user_frame_zeroed_on,
-    allocate_user_run_zeroed_on, claim_fiber_stack, configure_user_memory_owner_processors,
-    current_user_memory_owner, deallocate_user_frame, deallocate_user_frame_on,
-    deallocate_user_run_on, disable_swap, enter_user_memory_owner, fiber_stack_arena_stats,
-    fiber_stack_demand_commits_on, install_entropy_device, install_fiber_stack_arena,
-    install_fiber_stack_hooks, install_memory_balloon, install_swap, install_swap_hooks,
-    installed_swap_handle, installed_swap_hooks, kernel_reserve_for, largest_servable_user_bytes,
-    page_fault_frame_reserve_bytes, resolve_stack_fault, seed_root_entropy, swapped_token,
-    task_arena_bytes_for, user_heap_stats, user_mapping_kernel_heap_bytes, validate_range,
+    allocate_user_memory_pool, allocate_user_run_zeroed_on, claim_fiber_stack,
+    configure_user_memory_owner_processors, current_user_memory_owner, deallocate_user_frame,
+    deallocate_user_frame_on, deallocate_user_run_on, disable_swap, enter_user_memory_owner,
+    fiber_stack_arena_stats, fiber_stack_demand_commits_on, install_entropy_device,
+    install_fiber_stack_arena, install_fiber_stack_hooks, install_memory_balloon, install_swap,
+    install_swap_hooks, install_user_memory_pool, installed_swap_handle, installed_swap_hooks,
+    kernel_reserve_for, largest_servable_user_bytes, page_fault_frame_reserve_bytes,
+    resolve_stack_fault, seed_root_entropy, swap_vm_hooks, swapped_token, task_arena_bytes_for,
+    user_heap_stats, user_mapping_kernel_heap_bytes, validate_range,
 };
 pub use network::{
     HTTP_FORBIDDEN_FIELD_NAMES, HTTP_MAX_FIELD_SECTION_BYTES, HTTP_MAX_FIELD_VALUE_BYTES, HttpBody,

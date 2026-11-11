@@ -16,7 +16,7 @@ mod serial;
 
 pub use block::{
     BlockInstallError, BlockSelfCheckError, BlockService, BlockStats, SCRATCH_DISK_SERIAL,
-    install_block_devices,
+    install_block_devices, install_scratch_swap,
 };
 pub use child::{
     ByteReadWait, ByteReader, ByteWriteWait, ByteWriter, ClosedPeer, TryRead, TryWrite,
