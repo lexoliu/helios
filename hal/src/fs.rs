@@ -4,6 +4,7 @@ use crate::resource::{KernelResource, ResourceRights};
 use alloc::vec::Vec;
 use bitflags::bitflags;
 use core::future::Future;
+use core::ptr::NonNull;
 
 bitflags! {
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -301,39 +302,144 @@ pub struct BlockQueueTopology {
     pub depth: usize,
 }
 
-pub trait BlockDevice: Send + Sync {
-    fn read_block(
-        &self,
-        block_id: usize,
-        buf: &mut [u8],
-    ) -> impl Future<Output = IoResult<()>> + Send;
-
-    fn write_block(&self, block_id: usize, buf: &[u8])
-    -> impl Future<Output = IoResult<()>> + Send;
-
-    /// Reads the run of logical blocks that starts at `block_id` into
-    /// `bufs`, laid end to end: the first buffer receives the first
-    /// blocks, the next one the blocks after them. Every buffer is a
-    /// whole number of logical blocks.
+/// The memory one block request carries to or from the device.
+///
+/// A request owns its buffer from the moment the device accepts it until
+/// the device answers: the driver keeps the buffer with the request in
+/// its in-flight table, and the context that drains the answer calls
+/// [`BlockBuffer::complete`] exactly once, before the buffer goes back to
+/// its waiter or, when nobody waits any more, is dropped. Dropping the
+/// future that submitted a request therefore never frees memory the
+/// device may still read or write, and never leaves the buffer's owner
+/// without the answer. This is Linux's bio, which holds its pages and
+/// whose `bi_end_io` runs from the completion path, and io_uring's owned
+/// buffers as tokio-uring and monoio hand them to the kernel.
+///
+/// A driver refuses a request it cannot issue (a missing right, a range
+/// past the end, a shape the device cannot carry) by calling `complete`
+/// with the error, so every buffer a submission took is completed once.
+/// A buffer is dropped uncompleted only when the submission future is
+/// dropped before the device accepted the request: then the device never
+/// saw it.
+///
+/// Concurrency contract: `complete` runs on any processor, either in the
+/// device's interrupt handler or in whichever task drained the device's
+/// answer, and with no lock of the driver held. It must not block, must
+/// not take a lock an interrupt handler cannot take, and must not wait on
+/// another processor. Dropping a buffer the driver no longer needs runs
+/// in the same contexts.
+pub trait BlockBuffer: Send + 'static {
+    /// The memory the request transfers, as runs laid end to end: the
+    /// first run holds the request's first bytes. Their total is a whole
+    /// number of logical blocks.
     ///
-    /// The run travels as one scattered request as far as
-    /// [`BlockGeometry::max_segments`] and
-    /// [`BlockGeometry::max_segment_bytes`] allow, and as consecutive
-    /// requests past that.
-    fn read_vectored(
-        &self,
-        block_id: usize,
-        bufs: &mut [&mut [u8]],
-    ) -> impl Future<Output = IoResult<()>> + Send;
+    /// Until `complete` runs, the runs stay where they are, nobody but
+    /// the device writes them, and for a read nobody reads them either.
+    fn segments(&self) -> impl Iterator<Item = NonNull<[u8]>> + '_;
 
-    /// Writes `bufs`, laid end to end, over the run of logical blocks
-    /// that starts at `block_id`, with the request shapes
-    /// [`BlockDevice::read_vectored`] describes.
-    fn write_vectored(
+    /// The device's answer to the request this buffer carried, or the
+    /// driver's refusal of it.
+    fn complete(&mut self, result: IoResult<()>);
+}
+
+/// A [`BlockBuffer`] whose bytes belong to the buffer itself, so its
+/// holder fills and reads them: a scratch page, as opposed to a cache's
+/// own blocks.
+pub trait OwnedBlockBuffer: BlockBuffer + Sized {
+    /// A buffer of `len` zero bytes, or `None` when one buffer cannot
+    /// carry that many.
+    fn zeroed(len: usize) -> Option<Self>;
+
+    /// Bytes the buffer holds.
+    fn len(&self) -> usize;
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Copies `src` over the buffer's first `src.len()` bytes.
+    ///
+    /// # Panics
+    ///
+    /// When `src` is longer than the buffer.
+    fn copy_from(&mut self, src: &[u8]);
+
+    /// Copies the buffer's first `dst.len()` bytes into `dst`.
+    ///
+    /// # Panics
+    ///
+    /// When `dst` is longer than the buffer.
+    fn copy_to(&self, dst: &mut [u8]);
+}
+
+/// A finished request: the device's answer, and the buffer the request
+/// carried, handed back to the waiter.
+#[derive(Debug)]
+pub struct BlockCompletion<Buffer> {
+    pub result: IoResult<()>,
+    pub buffer: Buffer,
+}
+
+/// A block device.
+///
+/// Concurrency contract: every operation may be called from any task on
+/// any processor, concurrently. A data request is submitted in two
+/// steps. Submission takes the buffer, waits only for room in the
+/// device's queue, and resolves to a waiter once the device has the
+/// request; the waiter resolves to the answer. Dropping the waiter
+/// detaches it and changes nothing about the request: the device still
+/// carries it out, the driver still completes the buffer (see
+/// [`BlockBuffer`]) and then drops it. The operations that carry no
+/// caller memory — flush, discard, write-zeroes, identification — are
+/// one future each, and dropping one in flight detaches it the same way.
+pub trait BlockDevice: Send + Sync {
+    /// The buffers this device's data requests carry.
+    type Buffer: BlockBuffer;
+
+    /// A request the device has accepted, until its answer is collected.
+    type Waiter<'a>: Future<Output = BlockCompletion<Self::Buffer>> + Send + 'a
+    where
+        Self: 'a;
+
+    /// Submits a read of the run of logical blocks that starts at
+    /// `block_id` into `buffer`.
+    ///
+    /// The run travels as one request, so `buffer` fits one:
+    /// [`BlockGeometry::max_segments`] runs of at most
+    /// [`BlockGeometry::max_segment_bytes`] each once its segments are
+    /// cut at that size. A buffer that does not is refused.
+    fn submit_read(
         &self,
         block_id: usize,
-        bufs: &[&[u8]],
-    ) -> impl Future<Output = IoResult<()>> + Send;
+        buffer: Self::Buffer,
+    ) -> impl Future<Output = Self::Waiter<'_>> + Send + '_;
+
+    /// Submits a write of `buffer` over the run of logical blocks that
+    /// starts at `block_id`, with the request shape
+    /// [`BlockDevice::submit_read`] describes.
+    fn submit_write(
+        &self,
+        block_id: usize,
+        buffer: Self::Buffer,
+    ) -> impl Future<Output = Self::Waiter<'_>> + Send + '_;
+
+    /// [`BlockDevice::submit_read`] and its waiter, as one future.
+    fn read(
+        &self,
+        block_id: usize,
+        buffer: Self::Buffer,
+    ) -> impl Future<Output = BlockCompletion<Self::Buffer>> + Send + '_ {
+        async move { self.submit_read(block_id, buffer).await.await }
+    }
+
+    /// [`BlockDevice::submit_write`] and its waiter, as one future.
+    fn write(
+        &self,
+        block_id: usize,
+        buffer: Self::Buffer,
+    ) -> impl Future<Output = BlockCompletion<Self::Buffer>> + Send + '_ {
+        async move { self.submit_write(block_id, buffer).await.await }
+    }
 
     /// Commits the device's volatile write cache.
     ///

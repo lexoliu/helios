@@ -23,7 +23,8 @@ use crate::RiscvCpu;
 use crate::debug_state::RuntimeState;
 use crate::net::InterruptSourceId;
 
-type RiscvVirtioBlockDevice = helios_virtio::VirtioMmioBlockDevice<RiscvCpu>;
+type RiscvVirtioBlockDevice =
+    helios_virtio::VirtioMmioBlockDevice<RiscvCpu, helios_kernel::BlockPages>;
 
 #[derive(Clone)]
 pub(crate) struct VirtioBlockDevice {

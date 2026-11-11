@@ -24,6 +24,7 @@ use crate::debug_state::RuntimeState;
 type Aarch64VirtioBlockDevice = helios_virtio::VirtioBlockResource<
     helios_virtio::VirtioMmioTransport<helios_virtio::MmioBus<helios_virtio::OffsetDmaPool>>,
     Aarch64Cpu,
+    helios_kernel::BlockPages,
 >;
 
 #[derive(Clone)]

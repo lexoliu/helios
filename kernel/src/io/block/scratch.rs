@@ -19,7 +19,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use helios_hal::fs::{
     BlockDevice, BlockDeviceCapabilities, BlockGeometry, BlockQueueTopology, BlockRange,
-    BlockSerial, IoError, IoResult,
+    BlockSerial, IoError, IoResult, OwnedBlockBuffer,
 };
 
 use crate::memory::RootEntropyHandle;
@@ -37,6 +37,8 @@ pub enum BlockSelfCheckError {
         capacity_blocks: usize,
         block_bytes: usize,
     },
+    #[error("a {bytes}-byte self check does not fit one block request buffer")]
+    Buffer { bytes: usize },
     #[error("scratch disk write failed: {0}")]
     Write(IoError),
     #[error("scratch disk cache flush failed: {0}")]
@@ -155,6 +157,14 @@ where
             .saturating_sub(self.self_check_blocks())
     }
 
+    /// A zeroed request buffer for `bytes` of the self-check.
+    fn check_buffer(bytes: usize) -> Result<Device::Buffer, BlockSelfCheckError>
+    where
+        Device::Buffer: OwnedBlockBuffer,
+    {
+        Device::Buffer::zeroed(bytes).ok_or(BlockSelfCheckError::Buffer { bytes })
+    }
+
     /// Proves the disk round-trips before anything depends on it.
     ///
     /// The pattern is random so a device that answers with a stale or
@@ -162,7 +172,10 @@ where
     /// device where nothing else is placed, and it is committed before
     /// the read so a volatile cache cannot answer from memory it never
     /// wrote through.
-    pub async fn self_check(&self, root: &RootEntropyHandle) -> Result<(), BlockSelfCheckError> {
+    pub async fn self_check(&self, root: &RootEntropyHandle) -> Result<(), BlockSelfCheckError>
+    where
+        Device::Buffer: OwnedBlockBuffer,
+    {
         let geometry = self.stats.geometry;
         let block_bytes = geometry.logical_block_bytes;
         let blocks = SELF_CHECK_BYTES.div_ceil(block_bytes);
@@ -179,16 +192,19 @@ where
         let pattern = &mut pattern[..bytes];
         root.fill(pattern);
 
-        self.write_block(start_block, pattern)
+        let mut written = Self::check_buffer(bytes)?;
+        written.copy_from(pattern);
+        self.write(start_block, written)
             .await
+            .result
             .map_err(BlockSelfCheckError::Write)?;
         self.flush().await.map_err(BlockSelfCheckError::Flush)?;
 
+        let read = self.read(start_block, Self::check_buffer(bytes)?).await;
+        read.result.map_err(BlockSelfCheckError::Read)?;
         let mut readback = [0_u8; SELF_CHECK_BYTES];
         let readback = &mut readback[..bytes];
-        self.read_block(start_block, readback)
-            .await
-            .map_err(BlockSelfCheckError::Read)?;
+        read.buffer.copy_to(readback);
         if readback != pattern {
             let block = readback
                 .chunks(block_bytes)
@@ -221,24 +237,20 @@ impl<Device> BlockDevice for ScratchDisk<Device>
 where
     Device: BlockDevice,
 {
-    async fn read_block(&self, block_id: usize, buf: &mut [u8]) -> IoResult<()> {
+    type Buffer = Device::Buffer;
+    type Waiter<'a>
+        = Device::Waiter<'a>
+    where
+        Self: 'a;
+
+    async fn submit_read(&self, block_id: usize, buffer: Device::Buffer) -> Device::Waiter<'_> {
         self.stats.counters.reads.fetch_add(1, Ordering::Relaxed);
-        self.device.read_block(block_id, buf).await
+        self.device.submit_read(block_id, buffer).await
     }
 
-    async fn write_block(&self, block_id: usize, buf: &[u8]) -> IoResult<()> {
+    async fn submit_write(&self, block_id: usize, buffer: Device::Buffer) -> Device::Waiter<'_> {
         self.stats.counters.writes.fetch_add(1, Ordering::Relaxed);
-        self.device.write_block(block_id, buf).await
-    }
-
-    async fn read_vectored(&self, block_id: usize, bufs: &mut [&mut [u8]]) -> IoResult<()> {
-        self.stats.counters.reads.fetch_add(1, Ordering::Relaxed);
-        self.device.read_vectored(block_id, bufs).await
-    }
-
-    async fn write_vectored(&self, block_id: usize, bufs: &[&[u8]]) -> IoResult<()> {
-        self.stats.counters.writes.fetch_add(1, Ordering::Relaxed);
-        self.device.write_vectored(block_id, bufs).await
+        self.device.submit_write(block_id, buffer).await
     }
 
     async fn flush(&self) -> IoResult<()> {

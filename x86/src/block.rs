@@ -25,7 +25,8 @@ use crate::exceptions::BLOCK_INTERRUPT_VECTORS;
 use crate::iommu::X86DmaPool;
 use crate::pci::PciRoot;
 
-type X86VirtioBlockDevice = VirtioBlockResource<VirtioPciTransport<X86DmaPool>, X86Cpu>;
+type X86VirtioBlockDevice =
+    VirtioBlockResource<VirtioPciTransport<X86DmaPool>, X86Cpu, helios_kernel::BlockPages>;
 
 #[derive(Clone)]
 pub(crate) struct VirtioBlockDevice {

@@ -4,20 +4,20 @@ use alloc::boxed::Box;
 use alloc::string::ToString;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::future::{Future, poll_fn};
-use core::pin::pin;
+use core::future::Future;
+use core::pin::{Pin, pin};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::task::{Context, Poll, Waker};
 
 use futures_lite::future::block_on;
 use helios_hal::cpu::ProcessorId;
 use helios_hal::fs::{
-    BlockDevice, BlockDeviceCapabilities, BlockGeometry, BlockQueueTopology, BlockRange,
-    BlockSerial, IoError, IoResult,
+    BlockBuffer, BlockCompletion, BlockDevice, BlockDeviceCapabilities, BlockGeometry,
+    BlockQueueTopology, BlockRange, BlockSerial, IoError, IoResult,
 };
 use spin::Mutex;
 
-use super::cache::{CacheDisk, DiskLayout, dirty_blocks};
+use super::cache::{CacheDisk, DiskLayout, dirty_blocks, idle_blocks};
 use super::*;
 use crate::memory::{CompressedPool, RootEntropy};
 use crate::test_support::TestCpu;
@@ -35,6 +35,70 @@ enum Op {
 /// while the request is in flight.
 type WriteProbe = Box<dyn Fn() + Send + Sync>;
 
+/// Which way a [`MemoryDisk`] data request moves bytes.
+#[derive(Clone, Copy)]
+enum Direction {
+    Read,
+    Write,
+}
+
+/// Where a request's answer meets its waiter.
+#[derive(Default)]
+struct Answer {
+    completion: Option<BlockCompletion<BlockPages>>,
+    waker: Option<Waker>,
+    /// The waiter was dropped: the answer goes nowhere.
+    detached: bool,
+}
+
+/// A data request the disk accepted and has not answered: it owns the
+/// buffer until it does, whatever happens to its waiter.
+struct Accepted {
+    direction: Direction,
+    block_id: usize,
+    buffer: BlockPages,
+    answer: Arc<Mutex<Answer>>,
+}
+
+/// The data requests a paused disk holds.
+#[derive(Default)]
+struct Queue {
+    paused: bool,
+    accepted: Vec<Accepted>,
+}
+
+/// The waiter of one [`MemoryDisk`] data request. Dropping it detaches
+/// it; the request is still answered and its buffer completed.
+struct MemoryWaiter {
+    answer: Arc<Mutex<Answer>>,
+}
+
+impl Future for MemoryWaiter {
+    type Output = BlockCompletion<BlockPages>;
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut answer = self.answer.lock();
+        match answer.completion.take() {
+            Some(completion) => Poll::Ready(completion),
+            None => {
+                answer.waker = Some(context.waker().clone());
+                Poll::Pending
+            }
+        }
+    }
+}
+
+impl Drop for MemoryWaiter {
+    fn drop(&mut self) {
+        let completion = {
+            let mut answer = self.answer.lock();
+            answer.detached = true;
+            answer.completion.take()
+        };
+        drop(completion);
+    }
+}
+
 struct DiskState {
     bytes: Mutex<Vec<u8>>,
     log: Mutex<Vec<Op>>,
@@ -49,9 +113,9 @@ struct DiskState {
     /// Mirrors a device whose write cache is never committed: reads
     /// answer something other than the last write.
     corrupt_readback: bool,
-    /// While set, requests stay pending, as a device that has not
-    /// answered yet.
-    paused: AtomicBool,
+    /// While paused, the disk holds the data requests it accepts until
+    /// something answers them, as a device that has not answered yet.
+    queue: Mutex<Queue>,
     on_write: Mutex<Option<WriteProbe>>,
 }
 
@@ -81,7 +145,7 @@ impl MemoryDisk {
             fail_reads: false,
             fail_writes_at: None,
             corrupt_readback: false,
-            paused: AtomicBool::new(false),
+            queue: Mutex::new(Queue::default()),
             on_write: Mutex::new(None),
         }
     }
@@ -122,23 +186,90 @@ impl MemoryDisk {
         self.state.bytes.lock()[offset..offset + len].to_vec()
     }
 
+    /// Holds every data request accepted from now on until it is
+    /// answered.
     fn pause(&self) {
-        self.state.paused.store(true, Ordering::SeqCst);
+        self.state.queue.lock().paused = true;
     }
 
+    /// Answers every held request, and answers the next ones as they
+    /// arrive.
     fn resume(&self) {
-        self.state.paused.store(false, Ordering::SeqCst);
+        let accepted = {
+            let mut queue = self.state.queue.lock();
+            queue.paused = false;
+            core::mem::take(&mut queue.accepted)
+        };
+        for request in accepted {
+            self.carry_out(request);
+        }
     }
 
-    async fn answer(&self) {
-        poll_fn(|_| {
-            if self.state.paused.load(Ordering::SeqCst) {
-                Poll::Pending
-            } else {
-                Poll::Ready(())
+    /// Requests accepted and not answered yet.
+    fn accepted(&self) -> usize {
+        self.state.queue.lock().accepted.len()
+    }
+
+    fn submit(&self, direction: Direction, block_id: usize, buffer: BlockPages) -> MemoryWaiter {
+        let answer = Arc::new(Mutex::new(Answer::default()));
+        let request = Accepted {
+            direction,
+            block_id,
+            buffer,
+            answer: Arc::clone(&answer),
+        };
+        let mut queue = self.state.queue.lock();
+        if queue.paused {
+            queue.accepted.push(request);
+        } else {
+            drop(queue);
+            self.carry_out(request);
+        }
+        MemoryWaiter { answer }
+    }
+
+    /// Answers one request: moves its bytes, completes its buffer, and
+    /// hands both to its waiter, or drops the buffer when nobody waits.
+    fn carry_out(&self, request: Accepted) {
+        let Accepted {
+            direction,
+            block_id,
+            mut buffer,
+            answer,
+        } = request;
+        let result = match direction {
+            Direction::Read => {
+                let mut runs: Vec<&mut [u8]> = buffer
+                    .segments()
+                    // SAFETY: the disk holds the request, and with it the
+                    // only right to touch the buffer's runs until it
+                    // completes the buffer.
+                    .map(|run| unsafe { &mut *run.as_ptr() })
+                    .collect();
+                self.read_into(block_id, &mut runs)
             }
-        })
-        .await;
+            Direction::Write => {
+                let runs: Vec<&[u8]> = buffer
+                    .segments()
+                    // SAFETY: as above; a write only reads the runs.
+                    .map(|run| unsafe { &*run.as_ptr() })
+                    .collect();
+                self.write_from(block_id, &runs)
+            }
+        };
+        buffer.complete(result);
+        let mut slot = answer.lock();
+        if slot.detached {
+            drop(slot);
+            drop(buffer);
+            return;
+        }
+        slot.completion = Some(BlockCompletion { result, buffer });
+        let waker = slot.waker.take();
+        drop(slot);
+        if let Some(waker) = waker {
+            waker.wake();
+        }
     }
 
     fn read_into(&self, block_id: usize, bufs: &mut [&mut [u8]]) -> IoResult<()> {
@@ -188,28 +319,23 @@ impl MemoryDisk {
 }
 
 impl BlockDevice for MemoryDisk {
-    async fn read_block(&self, block_id: usize, buf: &mut [u8]) -> IoResult<()> {
-        self.answer().await;
-        self.read_into(block_id, &mut [buf])
+    type Buffer = BlockPages;
+    type Waiter<'a>
+        = MemoryWaiter
+    where
+        Self: 'a;
+
+    async fn submit_read(&self, block_id: usize, buffer: BlockPages) -> MemoryWaiter {
+        self.submit(Direction::Read, block_id, buffer)
     }
 
-    async fn write_block(&self, block_id: usize, buf: &[u8]) -> IoResult<()> {
-        self.answer().await;
-        self.write_from(block_id, &[buf])
+    async fn submit_write(&self, block_id: usize, buffer: BlockPages) -> MemoryWaiter {
+        self.submit(Direction::Write, block_id, buffer)
     }
 
-    async fn read_vectored(&self, block_id: usize, bufs: &mut [&mut [u8]]) -> IoResult<()> {
-        self.answer().await;
-        self.read_into(block_id, bufs)
-    }
-
-    async fn write_vectored(&self, block_id: usize, bufs: &[&[u8]]) -> IoResult<()> {
-        self.answer().await;
-        self.write_from(block_id, bufs)
-    }
-
+    /// Answered at once, paused or not: a flush carries no memory, so
+    /// holding it shows nothing about who owns a request's buffer.
     async fn flush(&self) -> IoResult<()> {
-        self.answer().await;
         self.state.log.lock().push(Op::Flush);
         Ok(())
     }
@@ -995,15 +1121,171 @@ fn a_commit_dropped_in_flight_aborts_the_disk() {
         let mut commit = pin!(view.commit(0, |superblock| superblock[0] = 1));
         assert!(commit.as_mut().poll(&mut context).is_pending());
     }
+    // The commit's data write is still the device's.
+    assert_eq!(disk.accepted(), 1);
+    assert!(view.is_aborted());
     disk.resume();
 
-    assert!(view.is_aborted());
     block_on(async {
         assert_eq!(view.sync().await, Err(BlockCacheError::Aborted));
     });
-    // The write the device never answered left its block out of service
-    // rather than handing its buffer to anyone else.
+    // The data write finished on its own and left its block clean; the
+    // commit block was never written.
     assert!(dirty_blocks(&cache).is_empty());
+    assert_eq!(disk.writes(), [Op::Write(5, 1)]);
+    assert_eq!(disk.bytes_at(5 * CACHE_BLOCK_BYTES, 4), [0x55; 4]);
+    assert_eq!(idle_blocks(&cache), cache.resident_blocks());
+}
+
+/// Polls `future` up to `polls` times without waiting, and answers its
+/// output if it finished; otherwise drops it where it stands.
+fn poll_up_to<F: Future>(future: F, polls: u64) -> Option<F::Output> {
+    let mut future = pin!(future);
+    let mut context = Context::from_waker(Waker::noop());
+    for _ in 0..polls {
+        if let Poll::Ready(output) = future.as_mut().poll(&mut context) {
+            return Some(output);
+        }
+        std::thread::yield_now();
+    }
+    None
+}
+
+#[test]
+fn a_read_dropped_in_flight_still_fills_its_block_for_the_next_reader() {
+    let disk = MemoryDisk::with_blocks("images", CACHE_BLOCK_BYTES, 16);
+    let cache = cache_over(&disk, 16, 1);
+    let view = cache.disk(0);
+    let mut context = Context::from_waker(Waker::noop());
+
+    disk.pause();
+    assert!(poll_up_to(view.read(7), 1).is_none());
+    // The dropped miss's request is still the device's.
+    assert_eq!(disk.accepted(), 1);
+    // A second reader finds the entry the dropped miss inserted and parks
+    // on it rather than asking the device again.
+    let mut second = pin!(view.read(7));
+    assert!(second.as_mut().poll(&mut context).is_pending());
+    assert_eq!(disk.accepted(), 1);
+    disk.resume();
+
+    let Poll::Ready(Ok(block)) = second.as_mut().poll(&mut context) else {
+        panic!("the parked reader should be answered by the dropped miss's read");
+    };
+    assert!(block.iter().all(|byte| *byte == 7));
+    drop(block);
+    block_on(async {
+        let block = view.read(7).await.expect("block 7 is cached");
+        assert!(block.iter().all(|byte| *byte == 7));
+    });
+
+    assert_eq!(disk.log(), [Op::Read(7, 1)]);
+    assert_eq!(view.stats().device_reads, 1);
+    assert_eq!(idle_blocks(&cache), cache.resident_blocks());
+}
+
+#[test]
+fn a_write_back_dropped_in_flight_leaves_its_block_clean_and_the_disk_open() {
+    let disk = MemoryDisk::with_blocks("images", CACHE_BLOCK_BYTES, 16);
+    let cache = cache_over(&disk, 16, 1);
+    let view = cache.disk(0);
+
+    block_on(async {
+        view.overwrite(5).await.expect("block 5").fill(0x55);
+    });
+    disk.pause();
+    assert!(poll_up_to(view.sync(), 1).is_none());
+    assert_eq!(disk.accepted(), 1);
+    assert!(disk.writes().is_empty());
+    disk.resume();
+
+    assert!(!view.is_aborted());
+    assert!(dirty_blocks(&cache).is_empty());
+    assert_eq!(disk.writes(), [Op::Write(5, 1)]);
+    assert_eq!(
+        disk.bytes_at(5 * CACHE_BLOCK_BYTES, CACHE_BLOCK_BYTES),
+        [0x55; CACHE_BLOCK_BYTES]
+    );
+    assert_eq!(view.stats().write_errors, 0);
+    // Nothing is left to write: the next sync only flushes.
+    block_on(view.sync()).expect("a later sync succeeds");
+    assert_eq!(disk.writes(), [Op::Write(5, 1)]);
+    assert_eq!(idle_blocks(&cache), cache.resident_blocks());
+}
+
+#[test]
+fn a_failed_write_back_dropped_in_flight_stays_dirty_with_its_error_recorded() {
+    let mut state = MemoryDisk::build("images", CACHE_BLOCK_BYTES, 16);
+    state.fail_writes_at = Some(5);
+    let disk = MemoryDisk::from(state);
+    let cache = cache_over(&disk, 16, 1);
+    let view = cache.disk(0);
+
+    block_on(async {
+        view.overwrite(5).await.expect("block 5").fill(0x55);
+    });
+    disk.pause();
+    assert!(poll_up_to(view.sync(), 1).is_none());
+    assert_eq!(disk.accepted(), 1);
+    disk.resume();
+
+    assert!(!view.is_aborted());
+    assert_eq!(dirty_blocks(&cache), [5]);
+    assert_eq!(view.stats().write_errors, 1);
+    // The next sync writes the block again and reports the device's
+    // answer; the disk stays open.
+    assert_eq!(
+        block_on(view.sync()),
+        Err(BlockCacheError::Device(IoError::DeviceFault))
+    );
+    assert!(!view.is_aborted());
+    assert_eq!(dirty_blocks(&cache), [5]);
+    assert_eq!(idle_blocks(&cache), cache.resident_blocks());
+}
+
+#[test]
+fn dropped_requests_leave_no_entry_or_page_behind() {
+    const BLOCKS: u64 = 64;
+    let disk = MemoryDisk::with_blocks("images", CACHE_BLOCK_BYTES, BLOCKS as usize);
+    let cache = cache_over(&disk, 16, 1);
+    let view = cache.disk(0);
+
+    for round in 0..300_u64 {
+        let block = round * 7 % BLOCKS;
+        // Dropped after no poll, after the one that hands the request to
+        // the device, or after a second one while the device holds it. A
+        // miss in a full cache may itself be writing a dirty block back
+        // when it is dropped.
+        disk.pause();
+        let _ = poll_up_to(view.read(block), round % 3);
+        disk.resume();
+        block_on(async {
+            view.overwrite((block + 1) % BLOCKS)
+                .await
+                .expect("the block")
+                .fill(round as u8);
+        });
+        disk.pause();
+        let _ = poll_up_to(view.sync(), (round / 3) % 3);
+        disk.resume();
+    }
+
+    assert_eq!(disk.accepted(), 0);
+    assert!(!view.is_aborted());
+    assert_eq!(
+        idle_blocks(&cache),
+        cache.resident_blocks(),
+        "every resident entry is free of requests, pins and locks"
+    );
+    assert_eq!(
+        cache.page_buffers(),
+        cache.resident_blocks() - cache.compressed_blocks()
+    );
+    block_on(view.sync()).expect("sync");
+    assert!(dirty_blocks(&cache).is_empty());
+    shrink(&cache, PressureLevel::Red);
+    assert_eq!(cache.resident_blocks(), 0);
+    assert_eq!(cache.page_buffers(), 0);
 }
 
 #[test]

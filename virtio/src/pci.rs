@@ -18,7 +18,7 @@ use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU16, Ordering};
 
 use arrayvec::ArrayVec;
-use helios_hal::fs::BlockDeviceRights;
+use helios_hal::fs::{BlockBuffer, BlockDeviceRights};
 use helios_hal::io::{IoError, IoResult};
 use helios_hal::iommu::PhysicalRange;
 use helios_hal::mmio;
@@ -916,7 +916,7 @@ where
 }
 
 /// Builds a virtio-blk driver on top of a modern virtio-PCI function.
-pub fn block_from_pci<A, M, P, C>(
+pub fn block_from_pci<A, M, P, C, B>(
     access: &A,
     address: PciAddress,
     mapper: &M,
@@ -924,12 +924,13 @@ pub fn block_from_pci<A, M, P, C>(
     msix: Option<MsixBinding>,
     cpu: C,
     rights: BlockDeviceRights,
-) -> IoResult<VirtioBlockResource<VirtioPciTransport<P>, C>>
+) -> IoResult<VirtioBlockResource<VirtioPciTransport<P>, C, B>>
 where
     A: ConfigRegionAccess,
     M: PciMmioMapper,
     P: DmaPool,
     C: QueueAffinity,
+    B: BlockBuffer,
 {
     let transport = VirtioPciTransport::new(access, address, mapper, dma, msix)?;
     VirtioBlockDevice::new_resource(transport, cpu, rights)
