@@ -17,13 +17,12 @@
 //! # Concurrency contract
 //!
 //! - **Compression and decompression run on the caller's processor** and
-//!   take no lock shared with another processor. Decompression reuses
-//!   the executing processor's decoder workspace, built the first time
-//!   that processor decompresses, behind a spin lock that only tasks on
-//!   that processor take; nothing an interrupt handler runs reaches it.
-//!   Compression goes through zrip's one-shot encoder, which builds its
-//!   match state per call: zrip keeps a reusable encoder context only in
-//!   its `std` build.
+//!   take no lock shared with another processor. Both reuse the executing
+//!   processor's workspace: an encoder built the first time that
+//!   processor compresses, and rebuilt only when the level changes, and a
+//!   decoder built the first time it decompresses. The workspace sits
+//!   behind a spin lock that only tasks on that processor take; nothing
+//!   an interrupt handler runs reaches it.
 //! - **Accounting is lock-free.** Storing a page reserves its bytes
 //!   against the limit with one compare-and-swap loop on the pool's
 //!   stored-bytes word; dropping a page gives them back with one
@@ -62,7 +61,7 @@ use crossbeam_utils::CachePadded;
 use helios_hal::cpu::current_processor;
 use helios_hal::pmm::PhysFrame;
 use spin::Mutex;
-use zrip::{CompressError, DecompressContext};
+use zrip::{CompressContext, CompressError, DecompressContext};
 
 /// Bytes in the pages the pool compresses.
 pub const COMPRESSED_PAGE_BYTES: usize = PhysFrame::SIZE;
@@ -144,7 +143,26 @@ struct Settings {
 /// One processor's zstd state.
 #[derive(Default)]
 struct Workspace {
+    /// The encoder and the level it was built for.
+    encoder: Option<(i32, CompressContext)>,
     decoder: Option<DecompressContext>,
+}
+
+impl Workspace {
+    /// The encoder for `level`, rebuilt only when the level changed.
+    fn encoder(&mut self, level: i32) -> &mut CompressContext {
+        if self
+            .encoder
+            .as_ref()
+            .is_none_or(|&(built, _)| built != level)
+        {
+            let context = CompressContext::new(level).unwrap_or_else(|error| {
+                panic!("zstd refused level {level}, which the pool accepted: {error:?}")
+            });
+            self.encoder = Some((level, context));
+        }
+        &mut self.encoder.as_mut().expect("the encoder was just built").1
+    }
 }
 
 /// What one processor's tasks have asked of the pool.
@@ -296,7 +314,12 @@ impl CompressedPool {
         // the encoder stops as soon as it runs out of room.
         let mut frame = [0u8; INCOMPRESSIBLE_BYTES - 1];
         let level = shared.settings.level.load(Ordering::Relaxed);
-        let len = match zrip::compress_into(page, &mut frame, level) {
+        let compressed = row
+            .workspace
+            .lock()
+            .encoder(level)
+            .compress_into(page, &mut frame);
+        let len = match compressed {
             Ok(len) => len,
             Err(CompressError::OutputTooSmall) => {
                 row.counters.incompressible.fetch_add(1, Ordering::Relaxed);
