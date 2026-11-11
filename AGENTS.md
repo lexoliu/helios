@@ -18,7 +18,7 @@ never depends on anything above it.
 | Layer | Crates | Contents |
 | --- | --- | --- |
 | Hardware contracts | `hal/` | Traits, capability types and value types only. `#![no_std]`. |
-| Device and protocol libraries | `netstack/`, `virtio/`, `i6300esb/` | `#![no_std]` protocol engines and drivers. `virtio/` builds on `netstack/`; all three depend on `hal/` and none on the kernel. |
+| Device and protocol libraries | `netstack/`, `virtio/`, `i6300esb/`, `firmware/` | `#![no_std]` protocol engines and drivers. `virtio/` builds on `netstack/`; `firmware/` turns the platform description a backend hands it (the device tree's NUMA properties) into `hal/` values; all four depend on `hal/` and none on the kernel. |
 | Shared ABIs | `compiler-abi/`, `artifact/` | `#![no_std]` wire formats shared by the kernel and host tools: the compiler plugin's request and response headers, `cwasm` target flags, the signature trailer, and the `helios-bootfs` payload image the kernel reads at bring-up. |
 | Kernel | `kernel/` | Every piece of hardware-independent runtime logic: executor, timer, memory and OOM, instance registry, component host, Wasmtime adapter, network service, host-fs client, every WIT service. `#![no_std]`, generic over `Cpu`. The user payload is not linked into the kernel: it arrives as a boot module (`docs/boot.md`). |
 | Backends | `aarch64/`, `riscv/`, `x86/`, `hosted/` | Boot, trap, IRQ, timer, MMIO, UART, virtio transport and SMP wiring, and nothing else. `hosted/` runs the same kernel on the host OS under the same restriction. |
@@ -445,7 +445,7 @@ just test-units
 `just lint` is `tools/fmt.sh --check`, `cargo deny --workspace check bans`
 against `deny.toml`, and `cargo clippy … -D warnings` over the host crates, each
 guest program, and the three bare-metal targets.
-`just test-units` runs the `hal`, `virtio`, `netstack`, `kernel`,
+`just test-units` runs the `hal`, `virtio`, `netstack`, `firmware`, `kernel`,
 `inspector-protocol` and `workspace-root` unit tests, every `hosted` test,
 and the `hal_layering` test (`kernel/tests/`) that enforces §1. The recipe names each integration
 test with `--test <name>`, so a new enforcement test is added to the recipe
