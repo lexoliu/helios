@@ -73,10 +73,17 @@ where
     let spawner = kernel.spawner();
     let timer = kernel.timer();
     let swap_cpu = *cpu;
-    helios_kernel::install_block_devices(kernel, root, devices, move |service, scratch| {
-        state.install_block_service(service);
-        install_swap(&state, scratch, spawner, timer, swap_cpu);
-    });
+    // Nothing mounts a disk yet, so the mount sources' cache is held by
+    // its reclaim task alone.
+    helios_kernel::install_block_devices(
+        kernel,
+        root,
+        devices,
+        move |service, scratch, _mount_sources| {
+            state.install_block_service(service);
+            install_swap(&state, scratch, spawner, timer, swap_cpu);
+        },
+    );
     for interrupt in &discovered {
         tracing::info!(interrupt = ?interrupt.interrupt, "virtio block online");
     }

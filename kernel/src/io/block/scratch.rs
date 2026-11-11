@@ -231,6 +231,16 @@ where
         self.device.write_block(block_id, buf).await
     }
 
+    async fn read_vectored(&self, block_id: usize, bufs: &mut [&mut [u8]]) -> IoResult<()> {
+        self.stats.counters.reads.fetch_add(1, Ordering::Relaxed);
+        self.device.read_vectored(block_id, bufs).await
+    }
+
+    async fn write_vectored(&self, block_id: usize, bufs: &[&[u8]]) -> IoResult<()> {
+        self.stats.counters.writes.fetch_add(1, Ordering::Relaxed);
+        self.device.write_vectored(block_id, bufs).await
+    }
+
     async fn flush(&self) -> IoResult<()> {
         self.stats.counters.flushes.fetch_add(1, Ordering::Relaxed);
         self.device.flush().await

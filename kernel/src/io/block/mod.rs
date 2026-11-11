@@ -16,22 +16,23 @@
 //! - a disk that reports no serial — the boot image — is left alone.
 //!
 //! Requests reach a device by static dispatch only. The scratch disk is
-//! a [`ScratchDisk`] over the backend's device type; a mount source is
-//! served by worker tasks monomorphized over it (`worker.rs`), and the
-//! cache the rest of the kernel holds names no device at all, so
-//! [`crate::RuntimeState`] stays free of the device's type.
+//! a [`ScratchDisk`] and the mount sources a [`BlockCache`], both over
+//! the backend's device type, and both go back to the backend, which
+//! names that type; a task that uses either talks to the device itself.
+//! [`BlockService`], which the runtime state publishes, carries what
+//! needs no device: the scratch disk's counters and the compressed
+//! pool's settings.
 //!
 //! Concurrency contract: identification and the self-check run as one
 //! task on the processor the devices' interrupts are routed to, before
 //! anything is published. The scratch disk and the cache then follow
 //! their own contracts (`scratch.rs`, `cache.rs`); [`BlockService`] is
-//! an immutable, cloneable directory of them.
+//! an immutable, cloneable handle.
 
 extern crate alloc;
 
 mod cache;
 mod scratch;
-mod worker;
 
 use alloc::vec::Vec;
 use core::time::Duration;
@@ -142,12 +143,13 @@ pub fn admit_block_devices<Candidate>(candidates: Vec<Candidate>) -> Vec<Candida
     admitted
 }
 
-/// The kernel's disks, once identified: the scratch disk's counters and
-/// the cache every mount source is read through.
+/// What the kernel publishes about its disks that names no device: the
+/// scratch disk's counters and the pool the block cache compresses
+/// into, whose limit and level are operator settings.
 #[derive(Clone)]
 pub struct BlockService {
     scratch: ScratchDiskStats,
-    cache: Option<BlockCache>,
+    pool: CompressedPool,
 }
 
 impl BlockService {
@@ -157,20 +159,9 @@ impl BlockService {
         self.scratch.snapshot()
     }
 
-    /// The mount-source disk that reported `serial`.
-    pub fn mount_source(&self, serial: &[u8]) -> Option<CachedDisk> {
-        self.mount_sources()
-            .find(|disk| disk.serial().as_bytes() == serial)
-    }
-
-    /// Every mount-source disk, in bus order.
-    pub fn mount_sources(&self) -> impl Iterator<Item = CachedDisk> + '_ {
-        self.cache.iter().flat_map(BlockCache::disks)
-    }
-
-    /// The block cache, on a machine with at least one mount source.
-    pub fn cache(&self) -> Option<&BlockCache> {
-        self.cache.as_ref()
+    /// The pool the block cache compresses cold blocks into.
+    pub fn compressed_pool(&self) -> &CompressedPool {
+        &self.pool
     }
 }
 
@@ -237,19 +228,18 @@ where
     })
 }
 
-/// Puts every mount source the cache can serve behind one cache, and
-/// returns it with their devices in the cache's disk order.
+/// Puts every mount source the cache can serve behind one cache, in bus
+/// order.
 fn open_mount_sources<Device>(
     mount_sources: ArrayVec<(BlockSerial, Device), MAX_BLOCK_DEVICES>,
     limits: BlockCacheLimits,
     processors: usize,
     pool: CompressedPool,
-) -> Option<(BlockCache, ArrayVec<Device, MAX_BLOCK_DEVICES>)>
+) -> Option<BlockCache<Device>>
 where
     Device: BlockDevice,
 {
-    let mut disks = ArrayVec::<CacheDisk, MAX_BLOCK_DEVICES>::new();
-    let mut devices = ArrayVec::new();
+    let mut disks = ArrayVec::<CacheDisk<Device>, MAX_BLOCK_DEVICES>::new();
     for (serial, device) in mount_sources {
         let layout = match DiskLayout::new(device.geometry()) {
             Ok(layout) => layout,
@@ -263,20 +253,13 @@ where
             serial,
             layout,
             read_only: device.is_read_only(),
-            queue_capacity: io_workers(&device) * 2,
+            device,
         });
-        devices.push(device);
     }
-    if devices.is_empty() {
+    if disks.is_empty() {
         return None;
     }
-    Some((BlockCache::new(limits, processors, pool, disks), devices))
-}
-
-/// Worker tasks one disk gets: as many as the device keeps requests in
-/// flight on one queue, which is the queue its workers submit to.
-fn io_workers<Device: BlockDevice>(device: &Device) -> usize {
-    device.queue_topology().depth.max(1)
+    Some(BlockCache::new(limits, processors, pool, disks))
 }
 
 /// The machine's memory pressure, as the block cache answers it: free
@@ -291,16 +274,20 @@ fn machine_pressure() -> PressureLevel {
 }
 
 /// Re-reads memory pressure every [`RECLAIM_TICK`] and shrinks the cache
-/// while it is above green.
-async fn reclaim_under_pressure<CpuImpl>(cache: BlockCache, timer: Timer<CpuImpl>) -> !
+/// while it is above green, writing back what it evicts dirty itself.
+async fn reclaim_under_pressure<CpuImpl, Device>(
+    cache: BlockCache<Device>,
+    timer: Timer<CpuImpl>,
+) -> !
 where
     CpuImpl: Cpu + Clone,
+    Device: BlockDevice,
 {
     loop {
         timer.sleep_for(RECLAIM_TICK).await;
         let level = machine_pressure();
         cache.set_pressure(level);
-        let released = cache.shrink(level);
+        let released = cache.shrink(level).await;
         if released != 0 {
             tracing::debug!(
                 released,
@@ -315,10 +302,11 @@ where
 /// Identifies the devices a backend brought up, proves the scratch disk,
 /// puts the mount sources behind the block cache and publishes both.
 ///
-/// `install` receives the service and the scratch disk, typed as the
-/// backend's device for swap. The task, the mount sources' I/O workers
-/// and the cache's reclaim task run on the calling processor because
-/// that is where the devices' completions are delivered.
+/// `install` receives the service, the scratch disk for swap, and the
+/// block cache over the mount sources when there are any, both typed as
+/// the backend's device. The identification task and the cache's
+/// reclaim task run on the calling processor; every other request a
+/// disk sees is issued by the task that needs it, on its own processor.
 pub fn install_block_devices<CpuImpl, WatchdogImpl, Device, Install>(
     kernel: &Kernel<CpuImpl, WatchdogImpl>,
     root: RootEntropyHandle,
@@ -327,8 +315,8 @@ pub fn install_block_devices<CpuImpl, WatchdogImpl, Device, Install>(
 ) where
     CpuImpl: Cpu + Clone + Send + Sync + 'static,
     WatchdogImpl: Watchdog + Clone,
-    Device: BlockDevice + Clone + 'static,
-    Install: FnOnce(BlockService, ScratchDisk<Device>) + 'static,
+    Device: BlockDevice + 'static,
+    Install: FnOnce(BlockService, ScratchDisk<Device>, Option<BlockCache<Device>>) + 'static,
 {
     if devices.is_empty() {
         tracing::warn!("no block device was discovered on the platform bus");
@@ -351,36 +339,24 @@ pub fn install_block_devices<CpuImpl, WatchdogImpl, Device, Install>(
         let usable_bytes = crate::machine_memory().usable_bytes;
         let limits = BlockCacheLimits::for_machine(usable_bytes);
         let pool = CompressedPool::for_machine(usable_bytes, processors);
-        let cache = open_mount_sources(identified.mount_sources, limits, processors, pool).map(
-            |(cache, devices)| {
-                for (index, device) in devices.into_iter().enumerate() {
-                    let disk = cache.disk(index);
-                    let workers = io_workers(&device);
-                    tracing::info!(
-                        serial = ?disk.serial(),
-                        capacity_blocks = disk.capacity_blocks(),
-                        block_bytes = CACHE_BLOCK_BYTES,
-                        read_only = disk.is_read_only(),
-                        workers,
-                        "mount source online"
-                    );
-                    for _ in 0..workers {
-                        spawner.spawn_local_detached(worker::serve(
-                            cache.clone(),
-                            index,
-                            device.clone(),
-                        ));
-                    }
-                }
-                spawner.spawn_local_detached(reclaim_under_pressure(cache.clone(), timer));
-                cache
-            },
-        );
+        let cache = open_mount_sources(identified.mount_sources, limits, processors, pool.clone());
+        if let Some(cache) = &cache {
+            for disk in cache.disks() {
+                tracing::info!(
+                    serial = ?disk.serial(),
+                    capacity_blocks = disk.capacity_blocks(),
+                    block_bytes = CACHE_BLOCK_BYTES,
+                    read_only = disk.is_read_only(),
+                    "mount source online"
+                );
+            }
+            spawner.spawn_local_detached(reclaim_under_pressure(cache.clone(), timer));
+        }
         let service = BlockService {
             scratch: scratch.stats_handle(),
-            cache,
+            pool,
         };
-        install(service, scratch);
+        install(service, scratch, cache);
     });
 }
 

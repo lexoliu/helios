@@ -433,9 +433,12 @@ not use natively:
 Requests are pipelined: each queue keeps up to 128 chains in flight, each
 with its own `InFlight` slot, and a submitter that finds the ring full
 drains what the device published and parks on the device notification
-rather than failing. Transfers longer than `SEG_MAX × SIZE_MAX` are split
-into whole-block requests, and every read checks the used length against
-what it asked for.
+rather than failing. A request may be scattered across several of the
+caller's buffers (`read_vectored`, `write_vectored`), one segment each up
+to `SIZE_MAX`; transfers longer than `SEG_MAX × SIZE_MAX`, or than the
+chain bound the driver reports as `max_segments`, are split into
+whole-block requests, and every read checks the used length against what
+it asked for.
 
 `VIRTIO_BLK_T_GET_ID` is what tells disks apart. A VM hands the guest the
 image its firmware booted from, the scratch disk the kernel owns and any
@@ -445,7 +448,8 @@ so the kernel gives each disk a role by the serial it reports
 
 - `helios-data` is the scratch disk, the kernel's own, which backs swap;
 - any other serial names a mount source, which the kernel puts behind its
-  block cache and publishes under that serial for the mount layer;
+  block cache, handed back to the backend typed as its device, where the
+  mount layer finds it by serial;
 - a disk with no serial — the boot image — is left untouched.
 
 A backend routes interrupts for at most `MAX_BLOCK_DEVICES` disks;
@@ -478,18 +482,25 @@ be `helios-data` or repeat another disk's. The guest logs each one as a
 `mount source online` line with its serial and size in cache blocks.
 
 The block cache in front of the mount sources reads and writes 4 KiB
-blocks, reads the device's optimal transfer (`opt_io_size`) ahead on a
-miss, and is written back in the order a filesystem's commit needs:
-blocks dirtied before a commit, a flush, the commit block, a flush. Under
-yellow memory pressure its coldest blocks are compressed with zstd into
-the kernel's compressed page pool (`kernel/src/memory/compressed.rs`,
-bounded at 20% of memory as zswap is), so a later hit costs a
-decompression instead of a device read; a block that compresses to
-88.5% of a page or more — the size zram calls incompressible — skips the
-pool and is dropped or written back. Under red pressure the pool gives clean blocks up and
-writes dirty ones back. Dirty blocks always reach the disk uncompressed.
-Its concurrency contract and the prior art it follows are in
-`kernel/src/io/block/cache.rs`.
+blocks. The task that needs a block issues the request itself, on its own
+processor's queue. A miss reads the device's optimal transfer
+(`opt_io_size`) ahead in the same scattered request, bounded by the
+segments one request carries and by Linux's 128 KiB default readahead
+window whatever the device claims, and contiguous dirty blocks are written
+back as one request. Write-back follows the order a filesystem's commit
+needs: blocks dirtied before a commit, a flush, the commit block, a flush;
+a commit that fails or is abandoned aborts the disk, which then refuses
+every write. Under yellow memory pressure its coldest blocks are
+compressed with zstd into the kernel's compressed page pool
+(`kernel/src/memory/compressed.rs`, bounded at 20% of memory as zswap
+is), so a later hit costs a decompression instead of a device read; a
+block that compresses to 88.5% of a page or more — the size zram calls
+incompressible — skips the pool and is dropped, written back first when
+dirty. A full pool evicts its coldest pages to make room, dropping clean
+ones and writing dirty ones back. Under red pressure every block nobody
+holds leaves the cache, dirty ones once written. Dirty blocks always
+reach the disk uncompressed. Its concurrency contract and the prior art
+it follows are in `kernel/src/io/block/cache.rs`.
 
 ## Confined DMA: virtio-iommu and `VIRTIO_F_ACCESS_PLATFORM`
 

@@ -467,7 +467,9 @@ impl<T: VirtioTransport, C: QueueAffinity> VirtioBlockDevice<T, C> {
             physical_block_exp,
             min_io_blocks,
             opt_io_blocks,
-            max_segments: device_segments,
+            // What one request this driver builds can carry, which is
+            // fewer than the device allows once the chain bound applies.
+            max_segments: u32::try_from(data_segments).unwrap_or(u32::MAX),
             max_segment_bytes: u32::try_from(segment_bytes).unwrap_or(u32::MAX),
             capacity_blocks,
         };
@@ -582,65 +584,122 @@ impl<T: VirtioTransport, C: QueueAffinity> VirtioBlockDevice<T, C> {
         (block_id as u64) * self.limits.sectors_per_block as u64
     }
 
-    async fn read_blocks(&self, block_id: usize, buf: &mut [u8]) -> IoResult<()> {
+    /// Bytes one data segment carries: the device's segment limit,
+    /// rounded down to whole logical blocks so that a request cut at a
+    /// segment boundary still ends on a block.
+    fn segment_stride(&self) -> usize {
+        let block_bytes = self.geometry.logical_block_bytes;
+        self.limits.segment_bytes / block_bytes * block_bytes
+    }
+
+    /// Reads the run that starts at `block_id` into `bufs`, laid end to
+    /// end, in as few requests as the device's segment and transfer
+    /// limits allow.
+    async fn read_blocks(&self, block_id: usize, bufs: &mut [&mut [u8]]) -> IoResult<()> {
         let block_bytes = self.geometry.logical_block_bytes;
         let stride = self.limits.max_transfer_bytes(block_bytes);
-        let mut offset = 0;
-        while offset < buf.len() {
-            let len = cmp::min(stride, buf.len() - offset);
-            let sector = self.sector_of(block_id + offset / block_bytes);
-            let request = BlkReq::new(ReqType::In, sector);
-            let mut status = 0_u8;
-            let mut segments: ArrayVec<&mut [u8], MAX_CHAIN_BUFFERS> = ArrayVec::new();
-            for segment in buf[offset..offset + len].chunks_mut(self.limits.segment_bytes) {
+        let segment_stride = self.segment_stride();
+        let mut done = 0;
+        let mut len = 0;
+        let mut segments: ArrayVec<&mut [u8], MAX_CHAIN_BUFFERS> = ArrayVec::new();
+        for buf in bufs.iter_mut() {
+            let mut rest: &mut [u8] = buf;
+            while !rest.is_empty() {
+                let take = segment_stride.min(stride - len).min(rest.len());
+                let (segment, tail) = rest.split_at_mut(take);
+                rest = tail;
                 segments.push(segment);
+                len += take;
+                if len == stride || segments.len() == self.limits.data_segments {
+                    self.read_request(block_id + done / block_bytes, &mut segments, len)
+                        .await?;
+                    segments.clear();
+                    done += len;
+                    len = 0;
+                }
             }
-            let used = self
-                .execute(ReqType::In, &request, &[], &mut segments, &mut status)
+        }
+        if !segments.is_empty() {
+            self.read_request(block_id + done / block_bytes, &mut segments, len)
                 .await?;
-            map_block_status(status)?;
-            // The used length counts everything the device wrote into the
-            // chain, which is the payload plus the status byte. A short
-            // read is a device fault rather than a partial success: the
-            // caller asked for whole blocks and the tail would otherwise
-            // silently keep whatever was in the buffer.
-            let written = usize::try_from(used)
-                .map_err(|_| IoError::DeviceFault)?
-                .checked_sub(size_of::<u8>())
-                .ok_or(IoError::DeviceFault)?;
-            if written != len {
-                return Err(IoError::DeviceFault);
-            }
-            offset += len;
         }
         Ok(())
     }
 
-    async fn write_blocks(&self, block_id: usize, buf: &[u8]) -> IoResult<()> {
-        let block_bytes = self.geometry.logical_block_bytes;
-        let stride = self.limits.max_transfer_bytes(block_bytes);
-        let mut offset = 0;
-        while offset < buf.len() {
-            let len = cmp::min(stride, buf.len() - offset);
-            let sector = self.sector_of(block_id + offset / block_bytes);
-            let request = BlkReq::new(ReqType::Out, sector);
-            let mut status = 0_u8;
-            let mut segments: ArrayVec<&[u8], MAX_CHAIN_BUFFERS> = ArrayVec::new();
-            for segment in buf[offset..offset + len].chunks(self.limits.segment_bytes) {
-                segments.push(segment);
-            }
-            self.execute(
-                ReqType::Out,
-                &request,
-                &segments,
-                &mut ArrayVec::new(),
-                &mut status,
-            )
+    /// One read request of `len` bytes scattered across `segments`.
+    async fn read_request(
+        &self,
+        block_id: usize,
+        segments: &mut ArrayVec<&mut [u8], MAX_CHAIN_BUFFERS>,
+        len: usize,
+    ) -> IoResult<()> {
+        let request = BlkReq::new(ReqType::In, self.sector_of(block_id));
+        let mut status = 0_u8;
+        let used = self
+            .execute(ReqType::In, &request, &[], segments, &mut status)
             .await?;
-            map_block_status(status)?;
-            offset += len;
+        map_block_status(status)?;
+        // The used length counts everything the device wrote into the
+        // chain, which is the payload plus the status byte. A short read
+        // is a device fault rather than a partial success: the caller
+        // asked for whole blocks and the tail would otherwise silently
+        // keep whatever was in the buffer.
+        let written = usize::try_from(used)
+            .map_err(|_| IoError::DeviceFault)?
+            .checked_sub(size_of::<u8>())
+            .ok_or(IoError::DeviceFault)?;
+        if written != len {
+            return Err(IoError::DeviceFault);
         }
         Ok(())
+    }
+
+    /// Writes `bufs`, laid end to end, over the run that starts at
+    /// `block_id`, in as few requests as the device's limits allow.
+    async fn write_blocks(&self, block_id: usize, bufs: &[&[u8]]) -> IoResult<()> {
+        let block_bytes = self.geometry.logical_block_bytes;
+        let stride = self.limits.max_transfer_bytes(block_bytes);
+        let segment_stride = self.segment_stride();
+        let mut done = 0;
+        let mut len = 0;
+        let mut segments: ArrayVec<&[u8], MAX_CHAIN_BUFFERS> = ArrayVec::new();
+        for buf in bufs {
+            let mut rest: &[u8] = buf;
+            while !rest.is_empty() {
+                let take = segment_stride.min(stride - len).min(rest.len());
+                let (segment, tail) = rest.split_at(take);
+                rest = tail;
+                segments.push(segment);
+                len += take;
+                if len == stride || segments.len() == self.limits.data_segments {
+                    self.write_request(block_id + done / block_bytes, &segments)
+                        .await?;
+                    segments.clear();
+                    done += len;
+                    len = 0;
+                }
+            }
+        }
+        if !segments.is_empty() {
+            self.write_request(block_id + done / block_bytes, &segments)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// One write request carrying `segments`.
+    async fn write_request(&self, block_id: usize, segments: &[&[u8]]) -> IoResult<()> {
+        let request = BlkReq::new(ReqType::Out, self.sector_of(block_id));
+        let mut status = 0_u8;
+        self.execute(
+            ReqType::Out,
+            &request,
+            segments,
+            &mut ArrayVec::new(),
+            &mut status,
+        )
+        .await?;
+        map_block_status(status)
     }
 
     async fn flush_cache(&self) -> IoResult<()> {
@@ -1032,7 +1091,7 @@ impl<T: VirtioTransport, C: QueueAffinity> BlockDevice for VirtioBlockResource<T
             BlockDeviceRights::READ,
         )?;
 
-        self.object().read_blocks(block_id, buf).await
+        self.object().read_blocks(block_id, &mut [buf]).await
     }
 
     async fn write_block(&self, block_id: usize, buf: &[u8]) -> IoResult<()> {
@@ -1048,7 +1107,39 @@ impl<T: VirtioTransport, C: QueueAffinity> BlockDevice for VirtioBlockResource<T
             return Err(IoError::ReadOnly);
         }
 
-        self.object().write_blocks(block_id, buf).await
+        self.object().write_blocks(block_id, &[buf]).await
+    }
+
+    async fn read_vectored(&self, block_id: usize, bufs: &mut [&mut [u8]]) -> IoResult<()> {
+        let geometry = self.object().geometry;
+        let len = run_length(geometry, bufs.iter().map(|buf| buf.len()))?;
+        validate_request(
+            self.rights(),
+            geometry,
+            block_id,
+            len,
+            BlockDeviceRights::READ,
+        )?;
+
+        self.object().read_blocks(block_id, bufs).await
+    }
+
+    async fn write_vectored(&self, block_id: usize, bufs: &[&[u8]]) -> IoResult<()> {
+        let geometry = self.object().geometry;
+        let len = run_length(geometry, bufs.iter().map(|buf| buf.len()))?;
+        validate_request(
+            self.rights(),
+            geometry,
+            block_id,
+            len,
+            BlockDeviceRights::WRITE,
+        )?;
+
+        if self.object().readonly {
+            return Err(IoError::ReadOnly);
+        }
+
+        self.object().write_blocks(block_id, bufs).await
     }
 
     async fn flush(&self) -> IoResult<()> {
@@ -1219,6 +1310,23 @@ fn validate_request(
     }
 
     Ok(())
+}
+
+/// Bytes a scattered request covers, once every buffer is known to hold
+/// whole logical blocks.
+fn run_length(geometry: BlockGeometry, lens: impl Iterator<Item = usize>) -> IoResult<usize> {
+    let block_bytes = geometry.logical_block_bytes;
+    let mut total = 0_usize;
+    for len in lens {
+        if len == 0 || !len.is_multiple_of(block_bytes) {
+            return Err(IoError::InvalidBufferLength {
+                required_multiple: block_bytes,
+                actual: len,
+            });
+        }
+        total = total.checked_add(len).ok_or(IoError::OutOfBounds)?;
+    }
+    Ok(total)
 }
 
 fn map_block_status(status: u8) -> IoResult<()> {
@@ -1859,6 +1967,29 @@ mod tests {
         async fn write_block(&self, block_id: usize, buf: &[u8]) -> IoResult<()> {
             let offset = block_id * self.block_size;
             self.blocks.lock()[offset..offset + buf.len()].copy_from_slice(buf);
+            Ok(())
+        }
+
+        async fn read_vectored(&self, block_id: usize, bufs: &mut [&mut [u8]]) -> IoResult<()> {
+            if self.fail_reads {
+                return Err(IoError::DeviceFault);
+            }
+            let blocks = self.blocks.lock();
+            let mut offset = block_id * self.block_size;
+            for buf in bufs.iter_mut() {
+                buf.copy_from_slice(&blocks[offset..offset + buf.len()]);
+                offset += buf.len();
+            }
+            Ok(())
+        }
+
+        async fn write_vectored(&self, block_id: usize, bufs: &[&[u8]]) -> IoResult<()> {
+            let mut blocks = self.blocks.lock();
+            let mut offset = block_id * self.block_size;
+            for buf in bufs {
+                blocks[offset..offset + buf.len()].copy_from_slice(buf);
+                offset += buf.len();
+            }
             Ok(())
         }
 

@@ -66,10 +66,17 @@ where
         .collect();
     let state = debug_state.clone();
     // Swap is not wired on this backend, so the scratch disk is proved
-    // and counted but nothing writes to it yet.
-    helios_kernel::install_block_devices(kernel, root, devices, move |service, _scratch| {
-        state.install_block_service(service);
-    });
+    // and counted but nothing writes to it yet. Nothing mounts a disk
+    // yet either, so the mount sources' cache is held by its reclaim
+    // task alone.
+    helios_kernel::install_block_devices(
+        kernel,
+        root,
+        devices,
+        move |service, _scratch, _mount_sources| {
+            state.install_block_service(service);
+        },
+    );
     for interrupt in &discovered {
         tracing::info!(irq = interrupt.source.0.get(), "virtio block online");
     }

@@ -269,7 +269,8 @@ pub struct BlockGeometry {
     /// Transfer size the device performs best at, in logical blocks.
     /// Zero when the device states no preference.
     pub opt_io_blocks: u32,
-    /// Most buffers one request may be scattered across.
+    /// Most buffers one request may be scattered across: the device's
+    /// limit, or the driver's when the driver carries fewer.
     pub max_segments: u32,
     /// Most bytes one buffer of a request may carry.
     pub max_segment_bytes: u32,
@@ -309,6 +310,30 @@ pub trait BlockDevice: Send + Sync {
 
     fn write_block(&self, block_id: usize, buf: &[u8])
     -> impl Future<Output = IoResult<()>> + Send;
+
+    /// Reads the run of logical blocks that starts at `block_id` into
+    /// `bufs`, laid end to end: the first buffer receives the first
+    /// blocks, the next one the blocks after them. Every buffer is a
+    /// whole number of logical blocks.
+    ///
+    /// The run travels as one scattered request as far as
+    /// [`BlockGeometry::max_segments`] and
+    /// [`BlockGeometry::max_segment_bytes`] allow, and as consecutive
+    /// requests past that.
+    fn read_vectored(
+        &self,
+        block_id: usize,
+        bufs: &mut [&mut [u8]],
+    ) -> impl Future<Output = IoResult<()>> + Send;
+
+    /// Writes `bufs`, laid end to end, over the run of logical blocks
+    /// that starts at `block_id`, with the request shapes
+    /// [`BlockDevice::read_vectored`] describes.
+    fn write_vectored(
+        &self,
+        block_id: usize,
+        bufs: &[&[u8]],
+    ) -> impl Future<Output = IoResult<()>> + Send;
 
     /// Commits the device's volatile write cache.
     ///

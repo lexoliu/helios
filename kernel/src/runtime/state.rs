@@ -56,9 +56,10 @@ struct RuntimeStateInner<ProgramService, NetworkService, HostFsService> {
     /// answers a configuration error rather than trapping.
     http_client: ProviderSlot<HttpExchange>,
     host_fs_service: Mutex<Option<HostFsService>>,
-    /// The machine's disks, once identified: the scratch disk proved,
-    /// every mount source behind the block cache. Empty on a machine
-    /// with no block device.
+    /// What the kernel publishes about its disks once it identified them
+    /// and proved the scratch disk: the scratch disk's counters and the
+    /// compressed pool's settings. Empty on a machine with no block
+    /// device.
     block_service: Once<BlockService>,
     /// The devices the machine is willing to hand to user-mode drivers,
     /// as discovery published them. Empty on a machine whose backend
@@ -935,7 +936,7 @@ where
         self.inner.host_fs_service.lock().clone()
     }
 
-    /// Publishes the machine's disks.
+    /// Publishes what the kernel knows about the machine's disks.
     ///
     /// Called from the task that identified every disk and proved the
     /// scratch disk round trips, so a service that is visible here is one
