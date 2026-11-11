@@ -1421,7 +1421,12 @@ fn map_process_authority_error(error: ProcessAuthorityError) -> crate::ProgramEx
         | ProcessAuthorityError::TerminalGrantExceedsAuthority(_)
         | ProcessAuthorityError::ProcessGrantExceedsAuthority(_)
         | ProcessAuthorityError::EmptyLinkRights
-        | ProcessAuthorityError::LinkGrantExceedsAuthority(_) => {
+        | ProcessAuthorityError::LinkGrantExceedsAuthority(_)
+        | ProcessAuthorityError::EmptyDeviceClassRights
+        | ProcessAuthorityError::DeviceClassGrantExceedsAuthority(_)
+        | ProcessAuthorityError::DeviceGrantExceedsAuthority(_)
+        | ProcessAuthorityError::DeviceNameTooLong
+        | ProcessAuthorityError::TooManyDeviceGrants => {
             crate::ProgramExecErrorKind::PermissionDenied
         }
     };
