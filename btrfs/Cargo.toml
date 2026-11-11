@@ -1,0 +1,31 @@
+[package]
+name = "helios-btrfs"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+arrayvec = { version = "0.7.6", default-features = false }
+blake2 = { version = "0.11.0", default-features = false }
+crc = { version = "3.4.0", default-features = false }
+helios-hal.workspace = true
+lzokay = { version = "2.0.1", default-features = false, features = ["decompress"] }
+miniz_oxide = { version = "0.9.1", default-features = false, features = ["with-alloc"] }
+sha2 = { version = "0.11.0", default-features = false }
+thiserror = { version = "2.0.20", default-features = false }
+tracing.workspace = true
+zerocopy = { version = "0.8.57", default-features = false, features = ["derive"] }
+# The tree's one zstd implementation. `std` and `simd` stay off: both
+# probe the processor at run time, which the kernel does through its `Cpu`.
+zrip-core = { version = "0.11.1", default-features = false, features = ["alloc"] }
+zrip-decode = { version = "0.8.13", default-features = false, features = ["alloc"] }
+
+[dev-dependencies]
+btrfs-disk = { version = "0.13.0", default-features = false }
+btrfs-transaction = { version = "0.13.0", default-features = false }
+ferrosys = { version = "0.8.0", default-features = false, features = ["btrfs"] }
+futures-lite = { version = "2.6.1", default-features = false, features = ["std"] }
+lzokay = { version = "2.0.1", default-features = false, features = ["compress", "alloc"] }
+tempfile.workspace = true
+
+[lints]
+workspace = true
