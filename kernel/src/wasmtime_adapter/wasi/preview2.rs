@@ -422,13 +422,9 @@ where
         };
         let now = self.now_nanos();
         match super::write_resolved(&self.file, self.mode, &bytes, now).await {
-            Ok(()) => {
+            Ok(end) => {
                 if let FileWriteMode::At(offset) = &mut self.mode {
-                    *offset = offset
-                        .checked_add(
-                            u64::try_from(bytes.len()).expect("write length overflowed u64"),
-                        )
-                        .expect("file stream offset overflowed u64");
+                    *offset = end;
                 }
             }
             Err(error) => self.failure = Some(error_code_from_p3(error)),

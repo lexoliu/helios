@@ -4309,14 +4309,12 @@ where
             let written = u32::try_from(bytes.len()).map_err(|_| p1::errno::OVERFLOW)?;
             let namespace = p1_namespace(caller);
             let now_nanos = caller.data().now_nanos();
-            wasi_fs::write(&namespace, &descriptor, mode, bytes, now_nanos)
+            // After an append the offset is the end of the file the write
+            // reached, which another writer may have moved meanwhile.
+            let end = wasi_fs::write(&namespace, &descriptor, mode, bytes, now_nanos)
                 .await
                 .map_err(p1_errno_from_fs)?;
-            p1_set_file_offset(
-                caller,
-                fd,
-                current_offset.saturating_add(bytes.len() as u64),
-            );
+            p1_set_file_offset(caller, fd, end);
             Ok(written)
         }
         Some(_) => Err(p1::errno::BADF),

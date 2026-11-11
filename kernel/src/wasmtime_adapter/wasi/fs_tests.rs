@@ -605,7 +605,7 @@ fn writing_a_bootfs_node_drops_its_provenance() {
         foreign_signed_cwasm(),
         4,
     ));
-    for outcome in [write, resize, replace] {
+    for outcome in [write.map(drop), resize, replace] {
         match outcome {
             Ok(()) => assert!(!boot_provenance(&namespace, "/bin/prog")),
             Err(error) => {
@@ -726,4 +726,40 @@ fn a_program_load_floor_is_the_widest_grant_that_loads() {
     );
     assert_eq!(authority.program_load_floor("/work"), Some("/work"));
     assert_eq!(authority.program_load_floor("/workshop/tool"), None);
+}
+
+#[test]
+fn an_append_resolves_with_the_end_of_file_it_reached() {
+    let namespace = namespace();
+    let appender = create_file(&namespace, "log", b"abc");
+    // Another writer grows the file behind the appender's back.
+    let other = open(
+        &namespace,
+        &root(),
+        "log",
+        fs_types::OpenFlags::empty(),
+        fs_types::DescriptorFlags::WRITE,
+    )
+    .expect("a second writer opens the file");
+    let end = block_on(super::write(
+        &namespace,
+        &other,
+        FileWriteMode::At(3),
+        "日本語".as_bytes(),
+        2,
+    ))
+    .expect("the second writer extends the file");
+    assert_eq!(end, 3 + "日本語".len() as u64);
+
+    let end = block_on(super::write(
+        &namespace,
+        &appender,
+        FileWriteMode::Append,
+        "한국어".as_bytes(),
+        3,
+    ))
+    .expect("the append lands");
+    let contents = read_all(&namespace, &appender);
+    assert_eq!(end, contents.len() as u64);
+    assert_eq!(contents, "abc日本語한국어".as_bytes());
 }

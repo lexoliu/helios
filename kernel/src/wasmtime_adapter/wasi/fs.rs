@@ -388,13 +388,15 @@ pub(crate) enum FileWriteMode {
     Append,
 }
 
+/// Writes `bytes` to the file `descriptor` names, and resolves with the
+/// offset just past them: where a sequential writer continues.
 pub(crate) async fn write<HostFs>(
     namespace: &Namespace<HostFs>,
     descriptor: &FsDescriptor,
     mode: FileWriteMode,
     bytes: &[u8],
     now: u64,
-) -> FsOpResult<()>
+) -> FsOpResult<u64>
 where
     HostFs: crate::HostFileSystem,
 {
@@ -406,21 +408,31 @@ where
     write_resolved(&resolve(namespace, &descriptor.path)?, mode, bytes, now).await
 }
 
+/// Writes `bytes` through `resolved`, and resolves with the offset just
+/// past them. An append lands at the end of the file as the filesystem
+/// sees it when the write arrives, so its end is the filesystem's answer,
+/// never the caller's idea of where the file ended.
 pub(crate) async fn write_resolved<HostFs>(
     resolved: &Resolved<HostFs>,
     mode: FileWriteMode,
     bytes: &[u8],
     now: u64,
-) -> FsOpResult<()>
+) -> FsOpResult<u64>
 where
     HostFs: crate::HostFileSystem,
 {
     let fs = resolved.writable().map_err(fs_error_code)?;
-    match mode {
-        FileWriteMode::At(offset) => fs.write_at(resolved.path(), offset, bytes, now).await,
-        FileWriteMode::Append => fs.append(resolved.path(), bytes, now).await.map(drop),
+    let landed = match mode {
+        FileWriteMode::At(offset) => fs
+            .write_at(resolved.path(), offset, bytes, now)
+            .await
+            .map(|()| offset),
+        FileWriteMode::Append => fs.append(resolved.path(), bytes, now).await,
     }
-    .map_err(fs_error_code)
+    .map_err(fs_error_code)?;
+    landed
+        .checked_add(bytes.len() as u64)
+        .ok_or(fs_types::ErrorCode::Overflow)
 }
 
 pub(crate) async fn set_size<HostFs>(
