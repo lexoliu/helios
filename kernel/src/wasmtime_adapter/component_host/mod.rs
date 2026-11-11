@@ -41,7 +41,7 @@ use crate::runtime::ComponentHostFilesystemState;
 use crate::wasmtime_adapter::bindings::debugger::bindings as debugger_bindings;
 use crate::wasmtime_adapter::bindings::program::bindings as program_bindings;
 use crate::wasmtime_adapter::config::AotCompileHint;
-use crate::wasmtime_adapter::cwasm::{self, ArtifactTrustError, UntrustedCwasm};
+use crate::wasmtime_adapter::cwasm::{self, ArtifactTrustError};
 use crate::wasmtime_adapter::wasi::ChannelStreamProducer;
 use crate::wasmtime_adapter::wasi::bindings::filesystem::types::ErrorCode as FsErrorCode;
 use crate::{
@@ -1239,7 +1239,7 @@ async fn read_program_source<T, CpuImpl, Net, HostFs>(
     accessor: &Accessor<T, HasSelf<StoreData<CpuImpl, Net, HostFs>>>,
     path: &str,
     authority: &ProcessAuthority,
-) -> wasmtime::Result<Result<service::ProgramSource, crate::ProgramExecError>>
+) -> wasmtime::Result<Result<ProgramSource, crate::ProgramExecError>>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
@@ -1267,7 +1267,7 @@ where
         return Ok(host_service
             .read_file(&host_path)
             .await
-            .map(|bytes| classify_program_source(bytes::Bytes::from(bytes), false))
+            .map(|bytes| ProgramSource::from_untrusted(bytes::Bytes::from(bytes)))
             .map_err(|error| {
                 tracing::error!(path = %absolute, ?error, "failed to read program source");
                 ProgramExecError {
@@ -1278,17 +1278,12 @@ where
     }
 
     accessor.with(|mut access| {
-        let readonly = access
+        let contents = access
             .get()
             .filesystem()
-            .is_readonly_path(&absolute)
+            .read_program_file(&absolute)
             .map_err(map_fs_error_to_program_exec)?;
-        let bytes = access
-            .get()
-            .filesystem()
-            .read_program_file_bytes(&absolute)
-            .map_err(map_fs_error_to_program_exec)?;
-        Ok::<_, wasmtime::Error>(Ok(classify_program_source(bytes, readonly)))
+        Ok::<_, wasmtime::Error>(Ok(ProgramSource::from_file(contents)))
     })
 }
 
@@ -1383,17 +1378,6 @@ where
         }
         Ok::<_, wasmtime::Error>(Ok(()))
     })
-}
-
-fn classify_program_source(bytes: bytes::Bytes, readonly: bool) -> ProgramSource {
-    let is_cwasm = cwasm::is_cwasm(&bytes);
-    if is_cwasm {
-        if readonly {
-            return ProgramSource::BootfsArtifact(bytes);
-        }
-        return ProgramSource::SignedArtifact(bytes);
-    }
-    ProgramSource::RawWasm(bytes)
 }
 
 fn map_fs_error_to_program_exec(error: FsErrorCode) -> crate::ProgramExecError {
@@ -1526,8 +1510,8 @@ where
         component = component_name,
         "loading embedded system component artifact"
     );
-    let trusted = cwasm::trust_bootfs_artifact(UntrustedCwasm::new(component.bytes()))
-        .map_err(DebuggerError::TrustComponent)?;
+    let artifact = component.bootfs_bytes();
+    let trusted = cwasm::trust_bootfs_artifact(&artifact).map_err(DebuggerError::TrustComponent)?;
     let compiled = crate::wasmtime_adapter::WasmtimeCompiledComponent {
         component: unsafe {
             wasmtime::component::Component::deserialize(engine.raw(), trusted.payload())

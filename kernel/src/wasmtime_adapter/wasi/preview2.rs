@@ -411,18 +411,25 @@ where
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
+    /// A stream over `descriptor`, opened by `store`.
+    ///
+    /// The stream writes into `store`'s own tree, shared rather than
+    /// copied, so whatever reads the path next through that store, or
+    /// through a process that shares its filesystem, sees the bytes.
     fn new(
-        cpu: CpuImpl,
-        runtime_state: HostRuntimeState<CpuImpl, Net, HostFs>,
+        store: &StoreData<CpuImpl, Net, HostFs>,
         descriptor: FsDescriptor,
         offset: u64,
         append: bool,
         host: Option<HostFileStreamTarget<HostFs>>,
     ) -> Self {
         Self {
-            cpu,
-            runtime_state: runtime_state.clone(),
-            filesystem: DebugFileSystem::new(runtime_state),
+            cpu: store.cpu.clone(),
+            runtime_state: store.runtime_state.clone(),
+            filesystem: DebugFileSystem::from_snapshot(
+                store.runtime_state.clone(),
+                store.filesystem().snapshot(),
+            ),
             descriptor,
             offset,
             append,
@@ -1328,14 +1335,7 @@ where
             Ok(host) => host,
             Err(error) => return Ok(Err(error_code_from_p3(error))),
         };
-        let stream = FileOutputStream::new(
-            self.cpu.clone(),
-            self.runtime_state.clone(),
-            descriptor,
-            offset,
-            false,
-            host,
-        );
+        let stream = FileOutputStream::new(self, descriptor, offset, false, host);
         Ok(Ok(self.table.push(Box::new(stream) as DynOutputStream)?))
     }
 
@@ -1354,14 +1354,7 @@ where
             Ok(host) => host,
             Err(error) => return Ok(Err(error_code_from_p3(error))),
         };
-        let stream = FileOutputStream::new(
-            self.cpu.clone(),
-            self.runtime_state.clone(),
-            descriptor,
-            0,
-            true,
-            host,
-        );
+        let stream = FileOutputStream::new(self, descriptor, 0, true, host);
         Ok(Ok(self.table.push(Box::new(stream) as DynOutputStream)?))
     }
 
@@ -3928,15 +3921,20 @@ mod tests {
     use alloc::string::String;
 
     use futures_lite::future::block_on;
+    use wasmtime::component::Resource;
+    use wasmtime_wasi_io::bytes::Bytes;
     use wasmtime_wasi_io::poll::Pollable;
-    use wasmtime_wasi_io::streams::{InputStream, StreamError};
+    use wasmtime_wasi_io::streams::{DynOutputStream, InputStream, StreamError};
 
+    use crate::wasmtime_adapter::component_host::service::test_store;
+
+    use super::filesystem_bindings::filesystem::types::HostDescriptor;
     use super::{
         EmptyInputStream, PREVIEW2_WIT_PACKAGES, WasiTcpSocketFamily, WasiUdpSocketError,
         WasiUdpSocketFamily, format_p2_tcp_socket_address, format_p2_udp_family,
         format_p2_udp_socket_address, map_p2_tcp_core_error, map_p2_tcp_family,
-        map_p2_tcp_socket_error, p2net, p2tcp, p2tcp_create, p2udp, parse_p2_tcp_socket_address,
-        parse_p2_udp_socket_address,
+        map_p2_tcp_socket_error, p2net, p2tcp, p2tcp_create, p2udp, p3fs,
+        parse_p2_tcp_socket_address, parse_p2_udp_socket_address,
     };
 
     #[test]
@@ -3956,6 +3954,69 @@ mod tests {
                 Err(error) => panic!("empty stdin read failed unexpectedly: {error:?}"),
             }
         }
+    }
+
+    /// What `write-via-stream` and `append-via-stream` write lands in the
+    /// filesystem of the store that opened the descriptor, where the
+    /// next open, read or exec of the path finds it (#487).
+    #[test]
+    fn p2_file_output_stream_writes_into_the_opening_store_filesystem() {
+        let mut store = test_store::store_data_with(|_| {});
+        let root = store.filesystem().root_descriptor();
+        let descriptor = store
+            .filesystem_mut()
+            .open_at(
+                &root,
+                p3fs::PathFlags::empty(),
+                "copy",
+                p3fs::OpenFlags::CREATE | p3fs::OpenFlags::TRUNCATE,
+                p3fs::DescriptorFlags::READ | p3fs::DescriptorFlags::WRITE,
+                1,
+            )
+            .expect("creating a file at the root must succeed");
+        let write = |store: &mut test_store::TestStoreData,
+                     stream: Resource<DynOutputStream>,
+                     bytes: &'static [u8]| {
+            let stream = store
+                .table
+                .get_mut::<DynOutputStream>(&stream)
+                .expect("the stream resource must be live");
+            assert!(
+                stream
+                    .check_write()
+                    .expect("a stream on a writable file must grant a permit")
+                    >= bytes.len()
+            );
+            stream
+                .write(Bytes::from_static(bytes))
+                .expect("writing a file the store holds must succeed");
+            stream
+                .flush()
+                .expect("flushing an embedded file must succeed");
+        };
+
+        let resource = store
+            .table
+            .push(descriptor.clone())
+            .expect("the descriptor must fit in the table");
+        let stream = HostDescriptor::write_via_stream(&mut store, resource, 0)
+            .expect("write-via-stream must not trap")
+            .expect("write-via-stream must open on a writable file");
+        write(&mut store, stream, b"helios ");
+        let resource = store
+            .table
+            .push(descriptor.clone())
+            .expect("the descriptor must fit in the table");
+        let stream = HostDescriptor::append_via_stream(&mut store, resource)
+            .expect("append-via-stream must not trap")
+            .expect("append-via-stream must open on a writable file");
+        write(&mut store, stream, "日本語 한국어".as_bytes());
+
+        let written = store
+            .filesystem()
+            .read_file_chunk(&descriptor, 0, 64)
+            .expect("the written file must be readable");
+        assert_eq!(written.as_ref(), "helios 日本語 한국어".as_bytes());
     }
 
     #[test]

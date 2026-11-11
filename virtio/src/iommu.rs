@@ -307,7 +307,7 @@ impl<T: VirtioTransport> VirtioIommuDevice<T> {
         } = &mut *state;
         let mut returned = [0_u16; EVENT_QUEUE_SIZE as usize];
         let mut drained = 0;
-        queue.drain_used(|token, _len| {
+        let drain = queue.drain_used(|token, _len| {
             let slot = slot_for_token[usize::from(token)];
             let fault = decode_fault(fault_slot(buffers, slot));
             tracing::error!(
@@ -320,10 +320,20 @@ impl<T: VirtioTransport> VirtioIommuDevice<T> {
             returned[drained] = slot;
             drained += 1;
         });
+        self.faults.fetch_add(drained as u64, Ordering::Relaxed);
+        if let Err(error) = drain {
+            // An interrupt handler has nobody to return this to. The queue
+            // is stopped for good, so there is nothing to re-arm; the
+            // fault is on the record and `fault_count` stops moving.
+            tracing::error!(
+                ?error,
+                "virtio-iommu event queue stopped: the device broke the used-ring contract"
+            );
+            return;
+        }
         if drained == 0 {
             return;
         }
-        self.faults.fetch_add(drained as u64, Ordering::Relaxed);
         for slot in returned[..drained].iter().copied() {
             state.arm(&self.transport, slot).unwrap_or_else(|error| {
                 panic!("virtio-iommu event buffer could not be re-armed: {error}")
@@ -381,7 +391,7 @@ impl<T: VirtioTransport> VirtioIommuDevice<T> {
         loop {
             let completed = {
                 let mut queue = self.request_queue.lock();
-                queue.pop_used()
+                queue.pop_used().map_err(|_| IommuError::DeviceFault)?
             };
             match completed {
                 Some(completed) => {

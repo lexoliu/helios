@@ -7,6 +7,7 @@ use super::{Ring, VirtQueue};
 use crate::features::NegotiatedFeatures;
 use crate::testing::{FakeTransport, FakeTransportConfig};
 use crate::transport::VirtioFeatures;
+use helios_hal::io::IoError;
 
 const DESC_F_NEXT: u16 = 1;
 const DESC_F_WRITE: u16 = 2;
@@ -63,7 +64,7 @@ fn split_submission_links_a_chain_and_completion_recycles_it() {
     assert_eq!(queue.available_descriptors(), 6);
 
     split(&queue).device_complete(token, 16);
-    assert_eq!(queue.pop_used_with_len(), Some((token, 16)));
+    assert_eq!(queue.pop_used_with_len(), Ok(Some((token, 16))));
     assert_eq!(
         queue.available_descriptors(),
         8,
@@ -128,7 +129,7 @@ fn split_indirect_chains_live_in_the_head_table() {
     assert_eq!(second.flags, DESC_F_WRITE);
 
     split(&queue).device_complete(token, 32);
-    assert_eq!(queue.pop_used_with_len(), Some((token, 32)));
+    assert_eq!(queue.pop_used_with_len(), Ok(Some((token, 32))));
     assert_eq!(queue.available_descriptors(), 8);
 }
 
@@ -151,9 +152,9 @@ fn split_completions_are_delivered_out_of_order() {
     split(&queue).device_complete(second_token, 8);
     split(&queue).device_complete(first_token, 4);
 
-    assert_eq!(queue.pop_used_with_len(), Some((second_token, 8)));
-    assert_eq!(queue.pop_used_with_len(), Some((first_token, 4)));
-    assert_eq!(queue.pop_used(), None);
+    assert_eq!(queue.pop_used_with_len(), Ok(Some((second_token, 8))));
+    assert_eq!(queue.pop_used_with_len(), Ok(Some((first_token, 4))));
+    assert_eq!(queue.pop_used(), Ok(None));
 }
 
 #[test]
@@ -175,7 +176,10 @@ fn split_publishes_the_used_event_as_completions_are_consumed() {
     assert_eq!(split(&queue).published_used_event(), 0);
 
     split(&queue).device_complete(token, 0);
-    queue.pop_used().expect("completion should be visible");
+    queue
+        .pop_used()
+        .expect("the used ring is intact")
+        .expect("completion should be visible");
     assert_eq!(
         split(&queue).published_used_event(),
         1,
@@ -249,7 +253,7 @@ fn split_available_index_keeps_working_past_a_u16_wrap() {
             .submit(&transport, &[&buffer], &mut [])
             .unwrap_or_else(|error| panic!("submission {round} should succeed: {error:?}"));
         split(&queue).device_complete(token, 8);
-        assert_eq!(queue.pop_used_with_len(), Some((token, 8)));
+        assert_eq!(queue.pop_used_with_len(), Ok(Some((token, 8))));
     }
 
     assert_eq!(
@@ -352,20 +356,20 @@ fn split_in_order_batch_completion_expands_to_every_chain() {
 
     assert_eq!(
         queue.pop_used_with_len(),
-        Some((first, 0)),
+        Ok(Some((first, 0))),
         "a read-only chain the device skipped over wrote nothing"
     );
     assert_eq!(
         queue.pop_used_with_len(),
-        Some((second, 64)),
+        Ok(Some((second, 64))),
         "a skipped writable chain counts as used completely"
     );
     assert_eq!(
         queue.pop_used_with_len(),
-        Some((third, 8)),
+        Ok(Some((third, 8))),
         "the entry the device wrote carries the real length"
     );
-    assert_eq!(queue.pop_used(), None);
+    assert_eq!(queue.pop_used(), Ok(None));
     assert_eq!(queue.available_descriptors(), 8);
 }
 
@@ -387,8 +391,8 @@ fn split_in_order_single_completions_use_the_reported_length() {
     split(&queue).device_complete(first_token, 5);
     split(&queue).device_complete(second_token, 9);
 
-    assert_eq!(queue.pop_used_with_len(), Some((first_token, 5)));
-    assert_eq!(queue.pop_used_with_len(), Some((second_token, 9)));
+    assert_eq!(queue.pop_used_with_len(), Ok(Some((first_token, 5))));
+    assert_eq!(queue.pop_used_with_len(), Ok(Some((second_token, 9))));
 }
 
 #[test]
@@ -419,7 +423,7 @@ fn packed_submission_marks_the_head_available_last() {
     assert_eq!(queue.available_descriptors(), 6);
 
     packed(&queue).device_complete(0, true, id, 16);
-    assert_eq!(queue.pop_used_with_len(), Some((id, 16)));
+    assert_eq!(queue.pop_used_with_len(), Ok(Some((id, 16))));
     assert_eq!(
         queue.available_descriptors(),
         8,
@@ -455,7 +459,7 @@ fn packed_wrap_counter_flips_when_the_ring_turns_over() {
 
     for (position, id) in ids.iter().copied().enumerate() {
         packed(&queue).device_complete(position as u16, true, id, 8);
-        assert_eq!(queue.pop_used_with_len(), Some((id, 8)));
+        assert_eq!(queue.pop_used_with_len(), Ok(Some((id, 8))));
     }
 
     // The second lap writes the opposite availability pattern.
@@ -466,7 +470,7 @@ fn packed_wrap_counter_flips_when_the_ring_turns_over() {
     assert_eq!(descriptor.flags & PACKED_F_AVAIL, 0);
     assert_eq!(descriptor.flags & PACKED_F_USED, PACKED_F_USED);
     packed(&queue).device_complete(0, false, id, 8);
-    assert_eq!(queue.pop_used_with_len(), Some((id, 8)));
+    assert_eq!(queue.pop_used_with_len(), Ok(Some((id, 8))));
 }
 
 #[test]
@@ -526,9 +530,9 @@ fn packed_completions_are_delivered_out_of_order() {
     packed(&queue).device_complete(0, true, second, 3);
     packed(&queue).device_complete(1, true, first, 5);
 
-    assert_eq!(queue.pop_used_with_len(), Some((second, 3)));
-    assert_eq!(queue.pop_used_with_len(), Some((first, 5)));
-    assert_eq!(queue.pop_used(), None);
+    assert_eq!(queue.pop_used_with_len(), Ok(Some((second, 3))));
+    assert_eq!(queue.pop_used_with_len(), Ok(Some((first, 5))));
+    assert_eq!(queue.pop_used(), Ok(None));
 }
 
 #[test]
@@ -559,10 +563,10 @@ fn packed_in_order_batch_completion_expands_to_every_chain() {
     // descriptor, naming the batch's last buffer id.
     packed(&queue).device_complete(0, true, third, 8);
 
-    assert_eq!(queue.pop_used_with_len(), Some((first, 0)));
-    assert_eq!(queue.pop_used_with_len(), Some((second, 48)));
-    assert_eq!(queue.pop_used_with_len(), Some((third, 8)));
-    assert_eq!(queue.pop_used(), None);
+    assert_eq!(queue.pop_used_with_len(), Ok(Some((first, 0))));
+    assert_eq!(queue.pop_used_with_len(), Ok(Some((second, 48))));
+    assert_eq!(queue.pop_used_with_len(), Ok(Some((third, 8))));
+    assert_eq!(queue.pop_used(), Ok(None));
     assert_eq!(queue.available_descriptors(), 8);
 }
 
@@ -619,7 +623,10 @@ fn packed_publishes_used_event_with_its_wrap_counter() {
         .submit(&transport, &[&buffer], &mut [])
         .expect("submission should succeed");
     packed(&queue).device_complete(0, true, id, 8);
-    queue.pop_used().expect("completion should be visible");
+    queue
+        .pop_used()
+        .expect("the used ring is intact")
+        .expect("completion should be visible");
 
     assert_eq!(
         packed(&queue).driver_event(),
@@ -705,4 +712,192 @@ fn a_queue_without_the_reset_feature_refuses_to_reset() {
         .reset(&transport)
         .expect_err("VIRTIO_F_RING_RESET was not negotiated");
     assert!(transport.queue_resets().is_empty());
+}
+
+/// A device that completes an identifier the driver does not own must
+/// fault the queue without touching the identifier pool, and the queue
+/// must then refuse further work until it is reset.
+fn assert_faulted_without_touching_the_pool(
+    transport: &FakeTransport,
+    queue: &mut VirtQueue<FakeTransport>,
+    free_before: usize,
+) {
+    assert_eq!(queue.pop_used_with_len(), Err(IoError::DeviceFault));
+    assert!(queue.is_faulted());
+    assert_eq!(
+        queue.available_descriptors(),
+        free_before,
+        "a rejected completion must not release anything"
+    );
+    let buffer = [1_u8; 8];
+    assert_eq!(
+        queue.submit(transport, &[&buffer], &mut []),
+        Err(IoError::DeviceFault),
+        "a faulted queue is not driven further"
+    );
+    assert_eq!(queue.pop_used_with_len(), Err(IoError::DeviceFault));
+}
+
+#[test]
+fn split_a_repeated_used_id_is_a_device_fault() {
+    let transport = transport();
+    let mut queue = VirtQueue::new(&transport, 0, 8, 2, features(VirtioFeatures::empty()))
+        .expect("queue should initialize");
+    let input = [1_u8; 16];
+    let mut output = [0_u8; 16];
+    let token = queue
+        .submit(&transport, &[&input], &mut [&mut output])
+        .expect("submission should succeed");
+
+    split(&queue).device_complete(token, 16);
+    assert_eq!(queue.pop_used_with_len(), Ok(Some((token, 16))));
+    assert_eq!(queue.available_descriptors(), 8);
+
+    split(&queue).device_complete(token, 16);
+    assert_faulted_without_touching_the_pool(&transport, &mut queue, 8);
+}
+
+#[test]
+fn split_an_unsubmitted_used_id_is_a_device_fault() {
+    let transport = transport();
+    let mut queue = VirtQueue::new(&transport, 0, 8, 2, features(VirtioFeatures::empty()))
+        .expect("queue should initialize");
+    let input = [1_u8; 16];
+    let mut output = [0_u8; 16];
+    queue
+        .submit(&transport, &[&input], &mut [&mut output])
+        .expect("submission should succeed");
+    let in_flight = queue.available_descriptors();
+
+    // Descriptor 1 is the tail of the chain in flight, not a chain head.
+    split(&queue).device_complete(1, 16);
+    assert_faulted_without_touching_the_pool(&transport, &mut queue, in_flight);
+}
+
+#[test]
+fn split_an_out_of_range_used_id_is_a_device_fault() {
+    let transport = transport();
+    let mut queue = VirtQueue::new(&transport, 0, 8, 1, features(VirtioFeatures::empty()))
+        .expect("queue should initialize");
+    let buffer = [1_u8; 8];
+    queue
+        .submit(&transport, &[&buffer], &mut [])
+        .expect("submission should succeed");
+    let in_flight = queue.available_descriptors();
+
+    // 0x1_0000 truncates to descriptor 0, which is in flight: the id
+    // is judged at the width the device wrote it.
+    split(&queue).device_complete_raw(0x1_0000, 8);
+    assert_faulted_without_touching_the_pool(&transport, &mut queue, in_flight);
+}
+
+#[test]
+fn split_an_id_past_the_ring_is_a_device_fault() {
+    let transport = transport();
+    let mut queue = VirtQueue::new(&transport, 0, 8, 1, features(VirtioFeatures::empty()))
+        .expect("queue should initialize");
+
+    split(&queue).device_complete_raw(8, 0);
+    assert_faulted_without_touching_the_pool(&transport, &mut queue, 8);
+}
+
+#[test]
+fn split_in_order_a_completion_naming_an_unsubmitted_id_is_a_device_fault() {
+    let transport = transport();
+    let mut queue = VirtQueue::new(&transport, 0, 8, 1, features(VirtioFeatures::IN_ORDER))
+        .expect("queue should initialize");
+    let buffer = [1_u8; 8];
+    for _ in 0..2 {
+        queue
+            .submit(&transport, &[&buffer], &mut [])
+            .expect("the ring has room");
+    }
+    let in_flight = queue.available_descriptors();
+
+    split(&queue).device_complete(6, 8);
+    assert_faulted_without_touching_the_pool(&transport, &mut queue, in_flight);
+}
+
+#[test]
+fn split_in_order_a_completion_with_nothing_in_flight_is_a_device_fault() {
+    let transport = transport();
+    let mut queue = VirtQueue::new(&transport, 0, 8, 1, features(VirtioFeatures::IN_ORDER))
+        .expect("queue should initialize");
+
+    split(&queue).device_complete(0, 8);
+    assert_faulted_without_touching_the_pool(&transport, &mut queue, 8);
+}
+
+#[test]
+fn packed_a_repeated_used_id_is_a_device_fault() {
+    let transport = transport();
+    let mut queue = VirtQueue::new(&transport, 0, 8, 1, features(VirtioFeatures::RING_PACKED))
+        .expect("queue should initialize");
+    let buffer = [1_u8; 8];
+    let id = queue
+        .submit(&transport, &[&buffer], &mut [])
+        .expect("submission should succeed");
+
+    packed(&queue).device_complete(0, true, id, 8);
+    assert_eq!(queue.pop_used_with_len(), Ok(Some((id, 8))));
+    assert_eq!(queue.available_descriptors(), 8);
+
+    packed(&queue).device_complete(1, true, id, 8);
+    assert_faulted_without_touching_the_pool(&transport, &mut queue, 8);
+}
+
+#[test]
+fn packed_an_unsubmitted_or_out_of_range_used_id_is_a_device_fault() {
+    for bogus in [5_u16, 8, u16::MAX] {
+        let transport = transport();
+        let mut queue = VirtQueue::new(&transport, 0, 8, 1, features(VirtioFeatures::RING_PACKED))
+            .expect("queue should initialize");
+        let buffer = [1_u8; 8];
+        queue
+            .submit(&transport, &[&buffer], &mut [])
+            .expect("submission should succeed");
+        let in_flight = queue.available_descriptors();
+
+        packed(&queue).device_complete(0, true, bogus, 8);
+        assert_faulted_without_touching_the_pool(&transport, &mut queue, in_flight);
+    }
+}
+
+#[test]
+fn packed_in_order_a_batch_naming_an_unsubmitted_id_is_a_device_fault() {
+    let transport = transport();
+    let mut queue = VirtQueue::new(
+        &transport,
+        0,
+        8,
+        1,
+        features(VirtioFeatures::RING_PACKED | VirtioFeatures::IN_ORDER),
+    )
+    .expect("queue should initialize");
+    let buffer = [1_u8; 8];
+    queue
+        .submit(&transport, &[&buffer], &mut [])
+        .expect("submission should succeed");
+    let in_flight = queue.available_descriptors();
+
+    packed(&queue).device_complete(0, true, 6, 8);
+    assert_faulted_without_touching_the_pool(&transport, &mut queue, in_flight);
+}
+
+#[test]
+fn a_reset_lets_a_faulted_queue_run_again() {
+    let transport = transport();
+    let mut queue = VirtQueue::new(&transport, 0, 8, 1, features(VirtioFeatures::RING_RESET))
+        .expect("queue should initialize");
+    split(&queue).device_complete_raw(8, 0);
+    assert_eq!(queue.pop_used(), Err(IoError::DeviceFault));
+
+    queue.reset(&transport).expect("the queue can be reset");
+    assert!(!queue.is_faulted());
+    let buffer = [1_u8; 8];
+    let token = queue
+        .submit(&transport, &[&buffer], &mut [])
+        .expect("the queue works after a reset");
+    split(&queue).device_complete(token, 8);
+    assert_eq!(queue.pop_used_with_len(), Ok(Some((token, 8))));
 }
