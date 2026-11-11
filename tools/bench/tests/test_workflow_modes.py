@@ -156,12 +156,26 @@ def test_profile_columns_resolve_the_pairing_ref_to_its_commit(
     repo, base, head = history
     columns = next(step for step in jobs["tooling"]["steps"] if step.get("id") == "columns")
     output = tmp_path / "outputs"
+    # `helios-bench baseline-fork` reads the pin from the baseline commit
+    # (tests/test_baseline.py); here it answers for a baseline pinning
+    # another fork than the candidate's, and records what it was asked.
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    asked = tmp_path / "asked"
+    fork = {
+        "root": "wasmtime-fork-2fb47b20aaaa",
+        "repository": "lexoliu/wasmtime",
+        "revision": "2fb47b20" + "a" * 32,
+    }
+    (bin_dir / "uv").write_text(f"#!/bin/sh\necho \"$*\" >> {asked}\necho '{json.dumps(fork)}'\n")
+    (bin_dir / "uv").chmod(0o755)
     subprocess.run(
         ["bash", "-eu", "-c", columns["run"]],
         check=True,
         cwd=repo,
         env=os.environ
         | {
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
             "CANDIDATE_SHA": head,
             "PAIRING_REF": base[:8] if pairing_ref == "short" else pairing_ref,
             "BASELINE_PROFILE": baseline_profile,
@@ -169,9 +183,20 @@ def test_profile_columns_resolve_the_pairing_ref_to_its_commit(
         },
     )
     outputs = dict(line.split("=", 1) for line in output.read_text().splitlines())
-    expected = [{"column": "candidate", "ref": head, "artifact": "helios-kernel-profdata-candidate"}]
+    expected = [
+        {"column": "candidate", "ref": head, "artifact": "helios-kernel-profdata-candidate", "root": ""}
+    ]
     if baseline_profile == "true":
-        expected.append({"column": "baseline", "ref": base, "artifact": "helios-kernel-profdata-baseline"})
+        # #486: each baseline collection is laid out beside the fork its
+        # commit pins, at the root the suite builds it in.
+        expected.append(
+            {
+                "column": "baseline",
+                "ref": base,
+                "artifact": "helios-kernel-profdata-baseline",
+                "root": fork["root"],
+            }
+        )
         # #479: the same commit collected a second time, independently,
         # for the baseline's rebuild.
         expected.append(
@@ -179,9 +204,27 @@ def test_profile_columns_resolve_the_pairing_ref_to_its_commit(
                 "column": "baseline-rebuild",
                 "ref": base,
                 "artifact": "helios-kernel-profdata-baseline-rebuild",
+                "root": fork["root"],
             }
         )
     assert json.loads(outputs["profile_columns"]) == expected
+    if pairing_ref:
+        assert asked.read_text().split() == [
+            "run",
+            "--project",
+            "tools/bench",
+            "--quiet",
+            "helios-bench",
+            "baseline-fork",
+            "--sha",
+            base,
+        ]
+        assert outputs["baseline_fork_root"] == fork["root"]
+        assert outputs["baseline_wasmtime_repository"] == fork["repository"]
+        assert outputs["baseline_wasmtime_revision"] == fork["revision"]
+    else:
+        assert not asked.exists()
+        assert outputs["baseline_fork_root"] == ""
 
 
 def run_arguments(
@@ -358,6 +401,7 @@ def test_profile_jobs_follow_the_mode_output(jobs):
     assert profile_columns["with"] == {
         "ref": "${{ matrix.ref }}",
         "artifact": "${{ matrix.artifact }}",
+        "root": "${{ matrix.root }}",
     }
     # A non-paired run is not held to a skipped collection job; a paired
     # one fails here rather than comparing a column on a stale profile.
@@ -595,3 +639,46 @@ def test_every_vsock_boot_is_preceded_by_the_device_provisioning():
     boots = [step["run"] for step in collect["runs"]["steps"] if "workload-bench" in step.get("run", "")]
     assert boots
     assert all('--rpc-transport "${{ steps.lane.outputs.rpc-transport }}"' in run for run in boots)
+
+
+def test_the_baseline_builds_against_the_fork_its_commit_pins(jobs):
+    """#486: the suite checks the baseline commit's own fork out where
+    tools/bench lays the baseline checkout out, and only when it is not
+    the candidate's; `kernel-profile.yml` collects each column under the
+    root it is handed, so the profile and the build see one fork path."""
+    outputs = jobs["tooling"]["outputs"]
+    for name in ("baseline_fork_root", "baseline_wasmtime_repository", "baseline_wasmtime_revision"):
+        assert outputs[name] == f"${{{{ steps.columns.outputs.{name} }}}}"
+    steps = jobs["suite"]["steps"]
+    names = [step.get("name") or step.get("uses") for step in steps]
+    fork = steps[names.index("Check out the baseline's Wasmtime fork")]
+    assert names.index("./helios/.github/actions/checkout-wasmtime") < names.index(
+        "Check out the baseline's Wasmtime fork"
+    )
+    assert fork["if"] == "needs.tooling.outputs.baseline_fork_root != ''"
+    assert fork["with"] == {
+        "repository": "${{ needs.tooling.outputs.baseline_wasmtime_repository }}",
+        "ref": "${{ needs.tooling.outputs.baseline_wasmtime_revision }}",
+        "path": "${{ needs.tooling.outputs.baseline_fork_root }}/wasmtime",
+    }
+    profile = yaml.load(
+        (REPO_ROOT / ".github/workflows/kernel-profile.yml").read_text(), Loader=yaml.BaseLoader
+    )
+    assert "root" in profile["on"]["workflow_call"]["inputs"]
+    job = profile["jobs"]["kernel-profile"]
+    assert (
+        job["env"]["CHECKOUT_PATH"] == "${{ inputs.root && format('{0}/helios', inputs.root) || 'helios' }}"
+    )
+    assert (
+        job["env"]["WASMTIME_PATH"]
+        == "${{ inputs.root && format('{0}/wasmtime', inputs.root) || 'wasmtime' }}"
+    )
+    by_uses = {step.get("uses"): step for step in job["steps"]}
+    assert by_uses["./helios/.github/actions/checkout-wasmtime"]["with"]["path"] == "${{ env.WASMTIME_PATH }}"
+    assert (
+        by_uses["./helios/.github/actions/bench-host"]["with"]["checkout-path"] == "${{ env.CHECKOUT_PATH }}"
+    )
+    assert (
+        by_uses["./helios/.github/actions/collect-kernel-profile"]["with"]["checkout-path"]
+        == "${{ env.CHECKOUT_PATH }}"
+    )
