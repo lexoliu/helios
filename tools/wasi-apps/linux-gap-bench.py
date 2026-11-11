@@ -76,7 +76,11 @@ TIMED_BOOT_PROFILE_VARIABLES = (
     "HELIOS_WORKLOAD_BENCH_USER_PROFILE_OUTPUT",
 )
 from tcp_echo_server import TcpEchoServer, start_tcp_echo_server
-from tcp_throughput_server import DEFAULT_PAYLOAD_BYTES, start_tcp_throughput_server
+from tcp_throughput_server import (
+    DEFAULT_PAYLOAD_BYTES,
+    start_tcp_download_server,
+    start_tcp_upload_server,
+)
 
 # Workload classes in the order the report lists them; each names the design
 # claim its workloads isolate (see docs/benchmarks.md).
@@ -504,6 +508,7 @@ class HostEndpoints:
     local_http_url: str | None = None
     tcp_host: str | None = None
     tcp_port: int | None = None
+    tcp_upload_port: int | None = None
     tcp_echo_port: int | None = None
 
 
@@ -533,16 +538,19 @@ class HostServices:
                 http_url = f"http://{self.http_host}:{port}/{HTTP_PAYLOAD_FILE}"
                 local_http_url = f"http://127.0.0.1:{port}/{HTTP_PAYLOAD_FILE}"
             tcp_port = None
+            tcp_upload_port = None
             if self.tcp:
                 tcp_port = retain(
-                    start_tcp_throughput_server(HOST_SERVER_BIND_ADDRESS, 0, HTTP_LARGE_PAYLOAD_BYTES)
+                    start_tcp_download_server(HOST_SERVER_BIND_ADDRESS, 0, HTTP_LARGE_PAYLOAD_BYTES)
                 )
+                tcp_upload_port = retain(start_tcp_upload_server(HOST_SERVER_BIND_ADDRESS, 0))
             echo_port = retain(start_host_tcp_echo()) if self.tcp_echo else None
             yield HostEndpoints(
                 http_url=http_url,
                 local_http_url=local_http_url,
                 tcp_host=self.tcp_host if self.tcp or self.tcp_echo else None,
                 tcp_port=tcp_port,
+                tcp_upload_port=tcp_upload_port,
                 tcp_echo_port=echo_port,
             )
 
@@ -1114,6 +1122,7 @@ def run_helios(
                 endpoints.http_url,
                 endpoints.tcp_host,
                 endpoints.tcp_port,
+                endpoints.tcp_upload_port,
                 endpoints.tcp_echo_port,
                 timeout_seconds=budget,
                 keep_going=keep_going,
@@ -1377,6 +1386,7 @@ def run_helios_once(
     host_http_url: str | None,
     host_tcp_host: str | None,
     host_tcp_port: int | None,
+    host_tcp_upload_port: int | None,
     host_tcp_echo_port: int | None,
     timeout_seconds: int,
     keep_going: bool,
@@ -1449,6 +1459,8 @@ def run_helios_once(
         env["HELIOS_WORKLOAD_BENCH_HOST_TCP_HOST"] = host_tcp_host
     if host_tcp_port is not None:
         env["HELIOS_WORKLOAD_BENCH_HOST_TCP_PORT"] = str(host_tcp_port)
+    if host_tcp_upload_port is not None:
+        env["HELIOS_WORKLOAD_BENCH_HOST_TCP_UPLOAD_PORT"] = str(host_tcp_upload_port)
     if host_tcp_echo_port is not None:
         env["HELIOS_WORKLOAD_BENCH_HOST_TCP_ECHO_PORT"] = str(host_tcp_echo_port)
     if keep_going:
@@ -1487,6 +1499,7 @@ def run_linux(
     host_http_url: str | None,
     host_tcp_host: str | None,
     linux_tcp_port: int | None,
+    linux_tcp_upload_port: int | None,
     linux_tcp_echo_port: int | None,
     quickjs_source_archive: Path | None,
     wasmtime_linux_bin: Path | None,
@@ -1514,6 +1527,7 @@ def run_linux(
         host_http_url,
         host_tcp_host,
         linux_tcp_port,
+        linux_tcp_upload_port,
         linux_tcp_echo_port,
         quickjs_source_archive,
         wasmtime_linux_bin,
@@ -3055,6 +3069,7 @@ def main() -> None:
                 endpoints.http_url,
                 endpoints.tcp_host,
                 endpoints.tcp_port,
+                endpoints.tcp_upload_port,
                 endpoints.tcp_echo_port,
                 args.quickjs_source_archive,
                 args.wasmtime_linux_bin,

@@ -147,7 +147,8 @@ def host_services(driver, tmp_path, monkeypatch):
         return Server(port), port
 
     monkeypatch.setattr(driver, "start_host_http", start)
-    monkeypatch.setattr(driver, "start_tcp_throughput_server", start)
+    monkeypatch.setattr(driver, "start_tcp_download_server", start)
+    monkeypatch.setattr(driver, "start_tcp_upload_server", start)
     monkeypatch.setattr(driver, "start_host_tcp_echo", start)
     services = driver.HostServices(tmp_path, "10.77.0.1", "10.77.0.1", http=True, tcp=True, tcp_echo=True)
     return services, events
@@ -162,7 +163,7 @@ def test_guest_boots_isolate_listeners_unless_reuse_is_explicit(
     run_once = driver.run_helios_once
 
     def record(*args, **kwargs):
-        endpoints.append(args[8:12])
+        endpoints.append(args[8:13])
         return run_once(*args, **kwargs)
 
     monkeypatch.setattr(driver, "run_helios_once", record)
@@ -173,9 +174,10 @@ def test_guest_boots_isolate_listeners_unless_reuse_is_explicit(
     assert len({endpoint[0] for endpoint in endpoints}) == expected
     assert len({endpoint[2] for endpoint in endpoints}) == expected
     assert len({endpoint[3] for endpoint in endpoints}) == expected
+    assert len({endpoint[4] for endpoint in endpoints}) == expected
     assert all(endpoint[1] == "10.77.0.1" for endpoint in endpoints)
     started = [port for event, port in events if event == "start"]
-    assert len(started) == expected * 3
+    assert len(started) == expected * 4
     for port in started:
         assert [event for event, value in events if value == port] == ["start", "shutdown", "close"]
 
@@ -185,7 +187,7 @@ def test_host_listeners_close_when_the_guest_scope_fails(host_services):
     with pytest.raises(RuntimeError, match="guest failed"):
         with services.serve():
             raise RuntimeError("guest failed")
-    assert [event for event, _ in events].count("close") == 3
+    assert [event for event, _ in events].count("close") == 4
 
 
 def test_host_listeners_close_after_partial_startup(driver, monkeypatch, host_services):
@@ -194,7 +196,7 @@ def test_host_listeners_close_after_partial_startup(driver, monkeypatch, host_se
     def refuse(*args):
         raise RuntimeError("bind failed")
 
-    monkeypatch.setattr(driver, "start_tcp_throughput_server", refuse)
+    monkeypatch.setattr(driver, "start_tcp_download_server", refuse)
     with pytest.raises(RuntimeError, match="bind failed"):
         with services.serve():
             pytest.fail("startup should fail")
