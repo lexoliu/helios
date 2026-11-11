@@ -15,6 +15,16 @@ pub(super) enum DhcpClientState {
         server_identifier: Ipv4Address,
         last_sent: StackInstant,
     },
+    /// INIT-REBOOT (RFC 2131 section 3.2): the interface holds an
+    /// address from before a machine restore and has asked any server
+    /// on the link to confirm it.
+    Rebooting {
+        transaction_id: u32,
+        requested_ip: Ipv4Address,
+        /// REQUESTs sent so far, the first included.
+        attempts: u32,
+        last_sent: StackInstant,
+    },
     Bound,
 }
 
@@ -252,6 +262,36 @@ where
         })
     }
 
+    /// Asks the DHCP server whether the lease the interface holds is
+    /// still good, once the machine has been restored.
+    ///
+    /// The DHCP client lives on the default shard, so that is the one
+    /// state this touches, under its own lock for the length of one
+    /// message. Live TCP is left alone: a connection keeps working if
+    /// the lease is confirmed. Resolves once the REQUEST has
+    /// been handed to the device; the packet pumps carry the exchange
+    /// on from there.
+    pub(super) async fn revalidate_lease(&self) {
+        let now_nanos = self.now_nanos();
+        let transaction_id = next_transaction_id(now_nanos as u32);
+        let sent = self
+            .inner
+            .state
+            .shard_for_default()
+            .lock()
+            .begin_lease_revalidation(transaction_id, StackInstant::from_nanos(now_nanos));
+        match sent {
+            Ok(true) => {
+                tracing::info!("machine restored: re-validating the DHCP lease");
+                if let Err(error) = self.drive_network(NetworkPollSource::Configuration).await {
+                    tracing::warn!(?error, "the lease re-validation could not be sent");
+                }
+            }
+            Ok(false) => {}
+            Err(error) => tracing::warn!(?error, "the lease re-validation could not be built"),
+        }
+    }
+
     pub(super) async fn drive_dns(&self) -> Result<(), DnsError> {
         self.drive_network(NetworkPollSource::Dns)
             .await
@@ -305,6 +345,10 @@ where
 
     fn hardware_address(&self) -> [u8; 6] {
         NetworkService::hardware_address(self)
+    }
+
+    async fn revalidate_lease(&self) {
+        NetworkService::revalidate_lease(self).await;
     }
 
     async fn ipv4_cidr(&self) -> Option<crate::Ipv4Cidr> {
@@ -807,19 +851,22 @@ impl NetworkShard {
                 (DhcpClientState::Requesting { transaction_id, .. }, DhcpMessageType::Ack)
                     if message.transaction_id == transaction_id =>
                 {
-                    let prefix_len = message
-                        .subnet_mask
-                        .map(ipv4_mask_prefix_len)
-                        .transpose()?
-                        .ok_or(NetworkControlError::InvalidAddress)?;
-                    self.stack
-                        .add_ipv4_address(Ipv4Cidr::new(message.your_ip, prefix_len));
-                    if let Some(router) = message.router {
-                        self.set_default_ipv4_gateway(map_ipv4_address(router))?;
+                    self.bind_lease(message)?;
+                }
+                (
+                    DhcpClientState::Rebooting {
+                        transaction_id,
+                        requested_ip,
+                        ..
+                    },
+                    DhcpMessageType::Ack,
+                ) if message.transaction_id == transaction_id => {
+                    if message.your_ip != requested_ip {
+                        // The server granted another address: the one
+                        // held from before the restore is not ours.
+                        self.stack.clear_ipv4_addresses();
                     }
-                    self.dns_servers.clear();
-                    self.dns_servers.extend(message.dns_servers);
-                    self.dhcp = DhcpClientState::Bound;
+                    self.bind_lease(message)?;
                 }
                 (_, DhcpMessageType::Nak) => {
                     self.stack.clear_ipv4_addresses();
@@ -841,6 +888,66 @@ impl NetworkShard {
             self.retransmit_dhcp(now)?;
         }
         Ok(())
+    }
+
+    /// Applies an ACK: the address, gateway and resolvers it carries
+    /// become the interface's configuration, and the client is bound.
+    fn bind_lease(&mut self, message: DhcpServerMessage) -> Result<(), NetworkControlError> {
+        let prefix_len = message
+            .subnet_mask
+            .map(ipv4_mask_prefix_len)
+            .transpose()?
+            .ok_or(NetworkControlError::InvalidAddress)?;
+        self.stack
+            .add_ipv4_address(Ipv4Cidr::new(message.your_ip, prefix_len));
+        if let Some(router) = message.router {
+            self.set_default_ipv4_gateway(map_ipv4_address(router))?;
+        }
+        self.dns_servers.clear();
+        self.dns_servers.extend(message.dns_servers);
+        self.dhcp = DhcpClientState::Bound;
+        Ok(())
+    }
+
+    /// Starts INIT-REBOOT for the lease the interface holds, after a
+    /// machine restore that may have moved it to another network.
+    ///
+    /// Returns whether a question was sent: only a client that is bound
+    /// holds a lease to ask about, and one that is not has an exchange
+    /// of its own under way, which already asks the link for an address.
+    /// The address stays in use until the server answers or the retries
+    /// run out ([`DHCP_REBOOT_ATTEMPTS`]).
+    pub(super) fn begin_lease_revalidation(
+        &mut self,
+        transaction_id: u32,
+        now: StackInstant,
+    ) -> Result<bool, NetworkControlError> {
+        if self.dhcp != DhcpClientState::Bound {
+            return Ok(false);
+        }
+        let Some(lease) = self.stack.primary_ipv4_address() else {
+            return Ok(false);
+        };
+        let requested_ip = lease.address();
+        self.send_dhcp_init_reboot(transaction_id, requested_ip, now)?;
+        self.dhcp = DhcpClientState::Rebooting {
+            transaction_id,
+            requested_ip,
+            attempts: 1,
+            last_sent: now,
+        };
+        Ok(true)
+    }
+
+    pub(super) fn send_dhcp_init_reboot(
+        &mut self,
+        transaction_id: u32,
+        requested_ip: Ipv4Address,
+        now: StackInstant,
+    ) -> Result<(), NetworkControlError> {
+        let message =
+            DhcpClientMessage::init_reboot(transaction_id, self.stack.config().mac, requested_ip);
+        self.send_dhcp_message(message, transaction_id as u16, now)
     }
 
     pub(super) fn send_dhcp_discover(

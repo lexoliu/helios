@@ -29,16 +29,16 @@ use helios_hal::cpu::{Cpu, HardwarePerfCounters, current_processor};
 use helios_hal::io::IoError;
 use helios_netstack::{
     DEFAULT_HOP_LIMIT, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DNS_PORT, DhcpClientMessage,
-    DhcpDnsServers, DhcpMessageType, DhcpPacket, DnsQuestionWriter, DnsRecordType, DnsResponse,
-    EthernetFrame, EthernetProtocol, FlowTuple, IcmpEchoKey, IcmpEchoReply, Icmpv4Packet,
-    Icmpv6Packet, InterfaceEventMark, IpAddress, IpCidr, IpProtocol, Ipv4Address, Ipv4Cidr,
-    Ipv4Packet, Ipv6Address, Ipv6Cidr, Ipv6Packet, MAX_OUTBOUND_FRAMES, NeighborCache,
-    NeighborEntry, NetworkInterface as NetworkDevice, OutboundBatchStatus, Route, RouteTable,
-    RxChecksumOffload, RxDrain, RxFrame, SegmentationOffload, Stack, StackConfig, StackError,
-    StackEvent, StackInstant, TcpCloseKind, TcpConnectState, TcpConnectTerminalError, TcpEndpoint,
-    TcpListenBacklog, TcpPacket, TcpReadIntoState, TcpReadState, TcpReceiveDiagnostics,
-    TcpSendState, TcpStackCounters, UdpEgress, UdpEndpoint, UdpPacket, UdpPayload,
-    UdpSocketBinding, UdpSocketError, flow_hash,
+    DhcpDnsServers, DhcpMessageType, DhcpPacket, DhcpServerMessage, DnsQuestionWriter,
+    DnsRecordType, DnsResponse, EthernetFrame, EthernetProtocol, FlowTuple, IcmpEchoKey,
+    IcmpEchoReply, Icmpv4Packet, Icmpv6Packet, InterfaceEventMark, IpAddress, IpCidr, IpProtocol,
+    Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6Cidr, Ipv6Packet, MAX_OUTBOUND_FRAMES,
+    NeighborCache, NeighborEntry, NetworkInterface as NetworkDevice, OutboundBatchStatus, Route,
+    RouteTable, RxChecksumOffload, RxDrain, RxFrame, SegmentationOffload, Stack, StackConfig,
+    StackError, StackEvent, StackInstant, TcpCloseKind, TcpConnectState, TcpConnectTerminalError,
+    TcpEndpoint, TcpListenBacklog, TcpPacket, TcpReadIntoState, TcpReadState,
+    TcpReceiveDiagnostics, TcpSendState, TcpStackCounters, UdpEgress, UdpEndpoint, UdpPacket,
+    UdpPayload, UdpSocketBinding, UdpSocketError, flow_hash,
 };
 use spin::{Mutex as SpinMutex, RwLock as SpinRwLock};
 
@@ -72,6 +72,11 @@ const INTERNAL_DHCP_SOCKET_INDEX: usize = 0;
 const INTERNAL_UDP_RESERVED_SLOTS: usize = 1;
 const LOCAL_NETWORK_PORT: NetworkPortId = NetworkPortId::new(0);
 const DHCP_RETRANSMIT_NANOS: u64 = 1_000_000_000;
+/// REQUESTs an INIT-REBOOT client sends before giving the lease up and
+/// starting over from DISCOVER. RFC 2131 section 3.2 leaves the count
+/// to the client; with the retransmission interval above, four tries
+/// is the few seconds a server on the same link needs to answer.
+const DHCP_REBOOT_ATTEMPTS: u32 = 4;
 const MAX_TCP_STREAM_HANDLES: usize = 256;
 const MAX_TCP_LISTENER_HANDLES: usize = 64;
 const MAX_UDP_SOCKET_HANDLES: usize = 256;
@@ -2018,6 +2023,93 @@ mod tests {
             )
             .expect("test TCP listener should bind");
         TcpListenerId(ReplicaHandle::new(slot).get())
+    }
+
+    /// A restored machine may be on another network, so a bound client
+    /// asks the link to confirm its lease (INIT-REBOOT) and keeps the
+    /// address while it waits; a client with no lease has nothing to ask
+    /// about.
+    #[test]
+    fn a_restored_machine_asks_the_link_to_confirm_its_lease() {
+        let mut shard = test_network_shard();
+        let lease = Ipv4Cidr::new(Ipv4Address::new([192, 0, 2, 10]), 24);
+
+        assert_eq!(
+            shard.begin_lease_revalidation(9, StackInstant::from_nanos(1)),
+            Ok(false),
+            "a client still looking for an address has no lease to confirm"
+        );
+
+        shard.stack.add_ipv4_address(lease);
+        shard.dhcp = DhcpClientState::Bound;
+        assert_eq!(
+            shard.begin_lease_revalidation(9, StackInstant::from_nanos(1)),
+            Ok(true)
+        );
+        assert_eq!(
+            shard.dhcp,
+            DhcpClientState::Rebooting {
+                transaction_id: 9,
+                requested_ip: lease.address(),
+                attempts: 1,
+                last_sent: StackInstant::from_nanos(1),
+            }
+        );
+        assert_eq!(
+            shard.stack.ipv4_addresses().count(),
+            1,
+            "the address stays in use until the link answers"
+        );
+        let frame = shard
+            .stack
+            .take_outbound()
+            .expect("a DHCP REQUEST frame should be queued");
+        let ethernet = EthernetFrame::parse(frame.as_slice()).expect("Ethernet frame should parse");
+        let ipv4 = Ipv4Packet::parse(ethernet.payload).expect("IPv4 packet should parse");
+        let udp = UdpPacket::parse(ipv4.payload).expect("UDP datagram should parse");
+        assert_eq!(udp.destination_port, helios_netstack::DHCP_SERVER_PORT);
+        // The requested-IP option (50) names the old lease, and the
+        // server-identifier option (54) is absent: any server may answer.
+        assert!(
+            udp.payload
+                .windows(6)
+                .any(|option| option == [50, 4, 192, 0, 2, 10])
+        );
+        assert!(!udp.payload.windows(2).any(|option| option == [54, 4]));
+    }
+
+    /// A link that never confirms the lease leaves the client no reason
+    /// to trust it: after the retries it starts over as a NAK would.
+    #[test]
+    fn an_unconfirmed_lease_is_given_up_after_the_retries() {
+        let mut shard = test_network_shard();
+        shard
+            .stack
+            .add_ipv4_address(Ipv4Cidr::new(Ipv4Address::new([192, 0, 2, 10]), 24));
+        shard.dhcp = DhcpClientState::Bound;
+        shard
+            .begin_lease_revalidation(9, StackInstant::from_nanos(0))
+            .expect("the first REQUEST is built");
+
+        for attempt in 2..=DHCP_REBOOT_ATTEMPTS {
+            let now = StackInstant::from_nanos(u64::from(attempt) * DHCP_RETRANSMIT_NANOS);
+            shard.retransmit_dhcp(now).expect("a retry is sent");
+            assert!(
+                matches!(
+                    shard.dhcp,
+                    DhcpClientState::Rebooting { attempts, .. } if attempts == attempt
+                ),
+                "attempt {attempt}: {:?}",
+                shard.dhcp
+            );
+        }
+        assert_eq!(shard.stack.ipv4_addresses().count(), 1);
+
+        let now =
+            StackInstant::from_nanos(u64::from(DHCP_REBOOT_ATTEMPTS + 1) * DHCP_RETRANSMIT_NANOS);
+        shard.retransmit_dhcp(now).expect("the exchange ends");
+        assert_eq!(shard.dhcp, DhcpClientState::Init { transaction_id: 10 });
+        assert_eq!(shard.stack.ipv4_addresses().count(), 0);
     }
 
     /// A link that comes back is not the link that went away: the lease,

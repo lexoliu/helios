@@ -26,6 +26,14 @@ impl HostFileSystem for UnsupportedHostFileSystem {
         None
     }
 
+    /// No session and no cache, so a restore leaves nothing to drop.
+    fn after_machine_restore(
+        &self,
+        _restore: crate::HostShareRestore,
+    ) -> impl core::future::Future<Output = ()> + Send + '_ {
+        core::future::ready(())
+    }
+
     fn stat_path(
         &self,
         _path: &str,

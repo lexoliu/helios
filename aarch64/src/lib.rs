@@ -664,16 +664,20 @@ extern "C" fn aarch64_kernel_main() -> ! {
     debug_state.install_root_entropy(root_entropy.clone());
     // The calendar is read once, here, before any component can ask
     // what time it is. The processor's timer carries wall time forward
-    // from that reading; nothing re-synchronises it afterwards.
-    match platform.rtc {
-        Some(region) => {
-            let rtc = rtc::map(region, physical_memory_offset, &handoff);
-            debug_state.seed_wall_clock(cpu.now().ticks(), &rtc);
+    // from that reading; only a machine restore re-reads it, which the
+    // reactions task does with the same clock.
+    let rtc = platform
+        .rtc
+        .map(|region| rtc::map(region, physical_memory_offset, &handoff));
+    match &rtc {
+        Some(rtc) => {
+            debug_state.seed_wall_clock(cpu.now().ticks(), rtc);
         }
         None => {
             tracing::warn!("the platform describes no PL031; the wall clock reads as uptime");
         }
     }
+    helios_kernel::install_generation_reactions(&kernel, debug_state.clone(), rtc);
     let gic = platform_state.install_gic(gic::Gic::new(
         &platform.gic,
         platform_state.processor_mpidrs(),
