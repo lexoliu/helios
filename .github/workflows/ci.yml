@@ -324,7 +324,10 @@ jobs:
             shell -c 'curl https://detectportal.firefox.com/success.txt; curl https://expired.badssl.com/; curl https://wrong.host.badssl.com/; curl https://self-signed.badssl.com/; true' 2>&1 > curl-https-smoke.out | tee "$runtime/inspector.log"
           cat curl-https-smoke.out
           grep -Fqx success curl-https-smoke.out
-          test "$(grep -c 'http request failed: TlsCertificateError' "$runtime/inspector.log")" -eq 3
+          # curl prints the error code through its Debug form
+          # (`ErrorCode::TlsCertificateError`), on whichever stream the
+          # inspector relays the guest's stderr to.
+          test "$(cat curl-https-smoke.out "$runtime/inspector.log" | grep -Fc 'http request failed: ErrorCode::TlsCertificateError')" -eq 3
       - name: Upload the inspector runtime directories
         if: failure()
         uses: actions/upload-artifact@v4
@@ -1064,7 +1067,10 @@ jobs:
             2>&1 > curl-https-smoke.out | tee "$runtime/inspector.log"
           cat curl-https-smoke.out
           grep -Fqx success curl-https-smoke.out
-          test "$(grep -c 'http request failed: TlsCertificateError' "$runtime/inspector.log")" -eq 3
+          # curl prints the error code through its Debug form
+          # (`ErrorCode::TlsCertificateError`), on whichever stream the
+          # inspector relays the guest's stderr to.
+          test "$(cat curl-https-smoke.out "$runtime/inspector.log" | grep -Fc 'http request failed: ErrorCode::TlsCertificateError')" -eq 3
       - name: Draw on the display and capture the scanout
         shell: bash
         working-directory: helios
