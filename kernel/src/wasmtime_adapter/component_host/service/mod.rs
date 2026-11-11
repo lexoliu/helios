@@ -1,6 +1,8 @@
 use crate::ComponentHostNetwork;
 mod argv;
 pub(crate) use argv::ProgramArgv;
+mod environment;
+use environment::LaunchEnvironment;
 mod shared_memory;
 use shared_memory::*;
 mod memory;
@@ -85,7 +87,6 @@ use wasmtime::{
 };
 
 const COMPILER_PLUGIN_PATH: &str = "/bin/compiler.cwasm";
-const HELIOS_PROCESS_ID_ENV: &str = "HELIOS_PROCESS_ID";
 const RAYON_NUM_THREADS_ENV: &[u8] = b"RAYON_NUM_THREADS=";
 const WASM_PAGE_SIZE: usize = 64 * 1024;
 const PROGRAM_SHARED_MEMORY_MAX_PAGES: u32 = 8192;
@@ -193,7 +194,7 @@ where
 /// it once it is running.
 pub(super) struct ProgramLaunch<Net: ComponentHostNetwork> {
     argv: ProgramArgv,
-    env: Vec<(String, String)>,
+    env: LaunchEnvironment,
     authority: ProcessAuthority,
     filesystem: Option<DebugFileSystemSnapshot>,
     /// Inherited preview1 descriptors. Only core modules have a
@@ -208,7 +209,9 @@ pub(super) struct ProgramLaunch<Net: ComponentHostNetwork> {
 
 impl<Net: ComponentHostNetwork> ProgramLaunch<Net> {
     /// A launch that inherits nothing: no descriptors, no signal
-    /// dispositions.
+    /// dispositions. `env` is the caller's environment; the kernel owns
+    /// `HELIOS_PROCESS_ID` and replaces any entry for it (see
+    /// [`LaunchEnvironment`]).
     pub(super) fn new(
         argv: ProgramArgv,
         env: Vec<(String, String)>,
@@ -217,7 +220,7 @@ impl<Net: ComponentHostNetwork> ProgramLaunch<Net> {
     ) -> Self {
         Self {
             argv,
-            env,
+            env: LaunchEnvironment::from_guest(env),
             authority,
             filesystem,
             descriptors: None,
@@ -1296,7 +1299,7 @@ where
     ) -> Result<ChildHandle, ProgramExecError> {
         let ProgramLaunch {
             argv,
-            mut env,
+            env,
             authority,
             filesystem,
             descriptors,
@@ -1310,12 +1313,7 @@ where
             .instance_registry
             .register(argv.program_name().to_owned(), started_at);
         let instance_id = launched_instance.id();
-        assert!(
-            !env.iter()
-                .any(|(name, _)| name.as_str() == HELIOS_PROCESS_ID_ENV),
-            "{HELIOS_PROCESS_ID_ENV} is reserved for the kernel program launcher"
-        );
-        env.push((HELIOS_PROCESS_ID_ENV.into(), instance_id.raw().to_string()));
+        let env = env.into_process_env(instance_id);
         let signal_state = WasixSignalState::new();
         let request = ProgramSpawnRequest {
             argv,

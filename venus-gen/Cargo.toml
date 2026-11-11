@@ -1,0 +1,29 @@
+[package]
+name = "helios-venus-gen"
+version = "0.1.0"
+edition.workspace = true
+
+[features]
+default = ["generate"]
+# The registry model and the Rust emitters. The input manifest and its
+# verification (what `helios-cli` fetches with) stay available without it, so
+# the CLI does not build a Vulkan parser.
+generate = ["dep:vk-parse", "dep:quote", "dep:proc-macro2", "dep:prettyplease", "dep:syn"]
+
+[dependencies]
+hex = "0.4.3"
+serde = { version = "1.0.228", features = ["derive"] }
+sha2 = "0.10.9"
+thiserror = { version = "2.0.21", default-features = false, features = ["std"] }
+toml = "0.8.23"
+prettyplease = { version = "0.3.0", optional = true }
+proc-macro2 = { version = "1.0.107", default-features = false, optional = true }
+quote = { version = "1.0.47", default-features = false, optional = true }
+syn = { version = "3.0.10", default-features = false, features = ["full", "parsing", "printing"], optional = true }
+vk-parse = { version = "0.22.0", default-features = false, optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

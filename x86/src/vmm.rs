@@ -72,21 +72,6 @@ const RETIRED: PageTableFlags = PageTableFlags::BIT_9;
 
 /// Owned x86 user address space. Built once at boot, accessed through
 /// `&'static`.
-/// One physically contiguous run pinned under a reservation for a
-/// device to read by physical address, with the layout the pool gave
-/// it, so that it can be given back as the one allocation it is.
-#[derive(Clone, Copy)]
-struct PinnedRun {
-    range: VirtRange,
-    phys: usize,
-    align: usize,
-    /// Whether this reservation owns the run. A shared view of a run
-    /// another reservation committed does not: its mapping is torn down
-    /// with the reservation, and the allocation goes back only when the
-    /// owner releases it.
-    owned: bool,
-}
-
 pub struct X86UserAddressSpace {
     physical_memory_offset: usize,
     processor_count: usize,
@@ -98,11 +83,6 @@ pub struct X86UserAddressSpace {
     /// tight reservation churn.
     va_cursor: VaCursor,
     state: Mutex<ReservationTracker>,
-    /// Runs [`AddressSpace::commit_contiguous`] pinned. They are not
-    /// the reservation tracker's: the tracker hands frames back one at
-    /// a time and a run is one allocation. Lock order is `state` then
-    /// `pinned`; nothing takes `pinned` and then `state`.
-    pinned: Mutex<Vec<PinnedRun>>,
 }
 
 #[derive(Clone, Copy)]
@@ -118,7 +98,7 @@ impl X86UserAddressSpace {
     /// Where `frame` appears in the kernel's own map.
     ///
     /// This backend maps every byte of physical memory at a fixed
-    /// offset, and the pinned runs `commit_contiguous` hands out come
+    /// offset, and the pinned runs `allocate_run` hands out come
     /// out of that map, so the alias is the offset applied again.
     pub fn kernel_alias(&self, frame: PhysFrame) -> VirtAddr {
         VirtAddr::new(
@@ -135,7 +115,6 @@ impl X86UserAddressSpace {
             processor_count,
             va_cursor: VaCursor::new(USER_VA_BASE, USER_VA_END),
             state: Mutex::new(ReservationTracker::new()),
-            pinned: Mutex::new(Vec::new()),
         }
     }
 
@@ -162,90 +141,6 @@ impl X86UserAddressSpace {
         let ptr = NonNull::new((phys + self.physical_memory_offset) as *mut u8)
             .unwrap_or_else(|| panic!("x86 pinned run has a null pointer"));
         deallocate_user_run_on(smp::current_processor(), ptr, layout);
-    }
-
-    /// Map `virt` onto the consecutive frames starting at `phys`, one
-    /// leaf per page, undoing every leaf written so far when one cannot
-    /// be. The frames are the caller's: nothing here allocates or frees
-    /// one.
-    fn map_run(
-        &self,
-        mapper: &mut OffsetPageTable<'static>,
-        frame_allocator: &mut DirectMappedFrameAllocator,
-        virt: VirtRange,
-        phys: usize,
-        flags: PageTableFlags,
-    ) -> Result<(), AddressSpaceError> {
-        for (index, offset) in (0..virt.byte_len).step_by(PAGE).enumerate() {
-            let virt_addr = virt.start.raw() + offset;
-            let mapped = Page::<Size4KiB>::from_start_address(X86VirtAddr::new(virt_addr as u64))
-                .map_err(|_| AddressSpaceError::Misaligned)
-                .and_then(|page| {
-                    x86_64::structures::paging::PhysFrame::from_start_address(PhysAddr::new(
-                        (phys + offset) as u64,
-                    ))
-                    .map(|frame| (page, frame))
-                    .map_err(|_| AddressSpaceError::Misaligned)
-                })
-                .and_then(|(page, frame)| {
-                    unsafe { mapper.map_to(page, frame, flags, frame_allocator) }
-                        .map(|flush| flush.flush())
-                        .map_err(|_| AddressSpaceError::PageTableExhausted)
-                });
-            if let Err(error) = mapped {
-                self.unmap_run_pages(mapper, virt.start.raw(), index);
-                return Err(error);
-            }
-        }
-        Ok(())
-    }
-
-    /// Drop the leaves under `mapped_pages` pages from `start` and shoot
-    /// the range down on every processor, leaving the frames where they
-    /// are: they are one run the pool takes back as a whole.
-    fn unmap_run_pages(
-        &self,
-        mapper: &mut OffsetPageTable<'static>,
-        start: usize,
-        mapped_pages: usize,
-    ) {
-        for index in 0..mapped_pages {
-            let virt = start + index * PAGE;
-            let page = Page::<Size4KiB>::from_start_address(X86VirtAddr::new(virt as u64))
-                .unwrap_or_else(|error| {
-                    panic!("x86 pinned run unmap got invalid page {virt:#x}: {error}")
-                });
-            match mapper.unmap(page) {
-                Ok((_, flush)) => flush.flush(),
-                Err(error) => panic!("x86 pinned run page {virt:#x} was not mapped: {error:?}"),
-            }
-        }
-        smp::shootdown_tlb_range(start, mapped_pages * PAGE);
-    }
-
-    /// Remove every pinned run that falls inside `virt`.
-    ///
-    /// A reservation can be released while an instance still holds its
-    /// frame buffers — a store torn down by an OOM kill does exactly
-    /// that — and the address space is the last place that can give
-    /// each run back as the one allocation it was.
-    fn sweep_pinned_runs(&self, mapper: &mut OffsetPageTable<'static>, virt: VirtRange) {
-        let mut pinned = self.pinned.lock();
-        let mut index = 0;
-        while index < pinned.len() {
-            let run = pinned[index];
-            if run.range.start.raw() < virt.start.raw()
-                || run.range.start.raw() + run.range.byte_len > virt.start.raw() + virt.byte_len
-            {
-                index += 1;
-                continue;
-            }
-            pinned.swap_remove(index);
-            self.unmap_run_pages(mapper, run.range.start.raw(), run.range.byte_len / PAGE);
-            if run.owned {
-                self.free_pinned_run(run.phys, run.range.byte_len, run.align);
-            }
-        }
     }
 
     fn carve_reservation(&self, byte_len: usize) -> Option<VirtRange> {
@@ -615,17 +510,75 @@ impl X86UserAddressSpace {
         self.unmap_range(VirtRange::new(VirtAddr::new(start), mapped_pages * PAGE));
     }
 
+    /// The leaf entry of every page of `virt`, when every one of them is
+    /// present. Nothing is changed.
+    fn present_leaves(
+        &self,
+        virt: VirtRange,
+    ) -> Result<Vec<*mut PageTableEntry>, AddressSpaceError> {
+        let mut leaves = Vec::with_capacity(virt.byte_len / PAGE);
+        for offset in (0..virt.byte_len).step_by(PAGE) {
+            let leaf = self
+                .leaf_entry(virt.start.raw() + offset)
+                .ok_or(AddressSpaceError::NotCommitted)?;
+            // SAFETY: the pointer came from a completed walk of live
+            // tables, and the caller holds the reservation lock.
+            if !unsafe { &*leaf }.flags().contains(PageTableFlags::PRESENT) {
+                return Err(AddressSpaceError::NotCommitted);
+            }
+            leaves.push(leaf);
+        }
+        Ok(leaves)
+    }
+
+    /// Drop the leaves of a substituted range, freeing no frame, and
+    /// shoot the range down on every processor before returning.
+    ///
+    /// The frames behind a substitution belong to the run's owner, so
+    /// this is the unmap [`Self::unmap_range`] must never be allowed to
+    /// do to them. Pages with no leaf are left alone.
+    fn drop_substituted_leaves(&self, virt: VirtRange) {
+        let mut dropped = false;
+        for offset in (0..virt.byte_len).step_by(PAGE) {
+            let Some(leaf) = self.leaf_entry(virt.start.raw() + offset) else {
+                continue;
+            };
+            // SAFETY: as in `unmap_range`: the caller owns the range,
+            // under the reservation lock or after taking the range out
+            // of the reservation tracker.
+            let entry = unsafe { &mut *leaf };
+            if !entry.is_unused() {
+                entry.set_unused();
+                dropped = true;
+            }
+        }
+        if dropped {
+            smp::flush_tlb_range_local(virt.start.raw(), virt.byte_len);
+            smp::shootdown_tlb_range(virt.start.raw(), virt.byte_len);
+        }
+    }
+
+    /// [`Self::drop_substituted_leaves`] for each part a tracker
+    /// reported, to run before the rest of the range is unmapped.
+    fn drop_substituted_parts(&self, parts: &[VirtRange]) {
+        for part in parts {
+            self.drop_substituted_leaves(*part);
+        }
+    }
+
     /// Decommit only the parts of `range` that are actually committed.
     ///
     /// The runtime resets a pooled slot by asking for a range whose committed
     /// extent it does not track precisely, so a whole-range decommit would
-    /// fail on the first uncommitted page.
+    /// fail on the first uncommitted page. A substitution inside the range
+    /// is dropped without freeing the run's frames, as a withdraw would.
     fn decommit_committed_subranges(&self, range: VirtRange) -> Result<(), AddressSpaceError> {
         self.assert_smp_safe();
         validate_range(range)?;
         let mut state = self.state.lock();
-        let subranges = state.take_committed_intersections(range)?;
-        for subrange in subranges {
+        let removal = state.take_committed_intersections(range)?;
+        self.drop_substituted_parts(&removal.substituted);
+        for subrange in removal.ranges {
             self.unmap_range(subrange);
         }
         Ok(())
@@ -684,18 +637,17 @@ impl AddressSpace for X86UserAddressSpace {
 
     fn release(&self, virt: VirtRange) -> Result<(), AddressSpaceError> {
         self.assert_smp_safe();
-        let mut mapper = unsafe { smp::current_mapper(self.physical_memory_offset) };
-        // Before anything is given back: the frames under a pinned run
-        // are the pool's as one allocation, not this reservation's one
-        // page at a time.
-        self.sweep_pinned_runs(&mut mapper, virt);
         let released = self.state.lock().release(virt)?;
         // This backend has no swap, so a released reservation never holds a
         // swap token; the assertion keeps that true if swap ever reaches
         // this architecture (#25).
         debug_assert!(released.swapped.is_empty());
         for region in &released.committed {
-            self.unmap_range(region.range);
+            if region.substituted {
+                self.drop_substituted_leaves(region.range);
+            } else {
+                self.unmap_range(region.range);
+            }
         }
 
         self.state.lock().push_free_range(virt);
@@ -731,62 +683,59 @@ impl AddressSpace for X86UserAddressSpace {
         Ok(())
     }
 
-    fn commit_contiguous(
+    /// One allocation out of the user pool, taken on the executing
+    /// processor: the run comes out of the user pool's direct map, and
+    /// what a device is told is where it sits in physical memory. No
+    /// translation changes, so no lock and no shootdown.
+    fn allocate_run(
         &self,
-        virt: VirtRange,
-        flags: PageFlags,
+        bytes: usize,
         placement: DmaPlacement,
-    ) -> Result<PhysFrame, AddressSpaceError> {
-        self.assert_smp_safe();
-        validate_range(virt)?;
+    ) -> Result<PhysicalRange, AddressSpaceError> {
+        if bytes == 0 {
+            return Err(AddressSpaceError::EmptyRange);
+        }
+        if !bytes.is_multiple_of(PAGE) {
+            return Err(AddressSpaceError::Misaligned);
+        }
         let align = usize::try_from(placement.align)
             .ok()
             .filter(|align| align.is_power_of_two() && *align >= PAGE)
             .ok_or(AddressSpaceError::Misaligned)?;
-        let pt_flags = page_flags_to_pt(flags)?;
-        let layout = Layout::from_size_align(virt.byte_len, align)
-            .map_err(|_| AddressSpaceError::Misaligned)?;
-        // The run comes out of the user pool's direct map; what the
-        // device is told is where it sits in physical memory.
+        let layout =
+            Layout::from_size_align(bytes, align).map_err(|_| AddressSpaceError::Misaligned)?;
         let raw = allocate_user_run_zeroed_on(smp::current_processor(), layout)
             .map_err(|_| AddressSpaceError::OutOfFrames)?;
         let phys = raw.as_ptr() as usize - self.physical_memory_offset;
-        if !placement.accepts(phys as u64, virt.byte_len as u64) {
-            self.free_pinned_run(phys, virt.byte_len, align);
+        if !placement.accepts(phys as u64, bytes as u64) {
+            self.free_pinned_run(phys, bytes, align);
             return Err(AddressSpaceError::OutOfFrames);
         }
-        let mut mapper = unsafe { smp::current_mapper(self.physical_memory_offset) };
-        let mut frame_allocator = DirectMappedFrameAllocator {
-            physical_memory_offset: self.physical_memory_offset,
-        };
-        // The range is claimed before a single leaf is written, so two
-        // callers naming overlapping ranges cannot both believe they own
-        // it.
-        let mut pinned = self.pinned.lock();
-        if pinned.iter().any(|run| {
-            run.range.start.raw() < virt.start.raw() + virt.byte_len
-                && virt.start.raw() < run.range.start.raw() + run.range.byte_len
-        }) {
-            drop(pinned);
-            self.free_pinned_run(phys, virt.byte_len, align);
-            return Err(AddressSpaceError::DeviceMapped);
-        }
-        if let Err(error) = self.map_run(&mut mapper, &mut frame_allocator, virt, phys, pt_flags) {
-            drop(pinned);
-            self.free_pinned_run(phys, virt.byte_len, align);
-            return Err(error);
-        }
-        // No shootdown: a fresh mapping, see `commit`.
-        pinned.push(PinnedRun {
-            range: virt,
-            phys,
-            align,
-            owned: true,
-        });
-        Ok(PhysFrame::from_phys_addr(phys))
+        Ok(PhysicalRange::new(phys as u64, bytes as u64))
     }
 
-    fn map_shared(
+    fn free_run(&self, run: PhysicalRange, align: u64) -> Result<(), AddressSpaceError> {
+        let align = usize::try_from(align)
+            .ok()
+            .filter(|align| align.is_power_of_two() && *align >= PAGE)
+            .ok_or(AddressSpaceError::Misaligned)?;
+        let bytes = usize::try_from(run.bytes).map_err(|_| AddressSpaceError::Misaligned)?;
+        let start = usize::try_from(run.start).map_err(|_| AddressSpaceError::Misaligned)?;
+        if bytes == 0 || !bytes.is_multiple_of(PAGE) || !start.is_multiple_of(align) {
+            return Err(AddressSpaceError::Misaligned);
+        }
+        self.free_pinned_run(start, bytes, align);
+        Ok(())
+    }
+
+    /// The reservation lock is held from the check that `virt` is
+    /// committed (this backend never swaps) and unsubstituted, across
+    /// every leaf rewrite and the
+    /// shootdown, to the bookkeeping that marks it. Each leaf goes from
+    /// one present entry to another in a single store, so a processor
+    /// racing the call reads the old page or the new one, and the old
+    /// frames are freed only after the shootdown has been acknowledged.
+    fn substitute_memory(
         &self,
         virt: VirtRange,
         physical: PhysicalRange,
@@ -799,81 +748,100 @@ impl AddressSpace for X86UserAddressSpace {
         {
             return Err(AddressSpaceError::Misaligned);
         }
-        // Ordinary memory attributes: these bytes are somebody's frame
+        // Ordinary memory attributes: these bytes are somebody's
         // buffer, and a second holder that reached them uncached would
         // see a picture the first holder's stores had not reached yet.
         let pt_flags = page_flags_to_pt(flags)?;
         let phys = physical.start as usize;
-        let mut mapper = unsafe { smp::current_mapper(self.physical_memory_offset) };
-        let mut frame_allocator = DirectMappedFrameAllocator {
-            physical_memory_offset: self.physical_memory_offset,
-        };
-        // The span is claimed before a single leaf is written, so two
-        // views cannot both believe they own the same window.
-        let mut pinned = self.pinned.lock();
-        if pinned.iter().any(|run| {
-            run.range.start.raw() < virt.start.raw() + virt.byte_len
-                && virt.start.raw() < run.range.start.raw() + run.range.byte_len
-        }) {
-            return Err(AddressSpaceError::DeviceMapped);
+        let mut state = self.state.lock();
+        state.check_substitutable(virt)?;
+        let leaves = self.present_leaves(virt)?;
+        let mut replaced = Vec::with_capacity(leaves.len());
+        for (index, leaf) in leaves.into_iter().enumerate() {
+            // SAFETY: `present_leaves` walked live tables for this
+            // range, and the reservation lock is held.
+            let entry = unsafe { &mut *leaf };
+            replaced.push(entry.addr().as_u64() as usize);
+            entry.set_addr(PhysAddr::new((phys + index * PAGE) as u64), pt_flags);
         }
-        self.map_run(&mut mapper, &mut frame_allocator, virt, phys, pt_flags)?;
-        // No shootdown: a fresh mapping, see `commit`.
-        pinned.push(PinnedRun {
-            range: virt,
-            phys,
-            align: PAGE,
-            owned: false,
-        });
+        smp::flush_tlb_range_local(virt.start.raw(), virt.byte_len);
+        smp::shootdown_tlb_range(virt.start.raw(), virt.byte_len);
+        for old in replaced {
+            self.dealloc_user_phys(old);
+        }
+        // This backend never swaps, so every page was committed and no
+        // swap extent is orphaned.
+        let orphaned = state.record_substitute(virt)?;
+        debug_assert!(orphaned.is_empty());
         Ok(())
     }
 
-    fn unmap_shared(&self, virt: VirtRange) -> Result<(), AddressSpaceError> {
-        self.assert_smp_safe();
-        validate_range(virt)?;
-        let mut pinned = self.pinned.lock();
-        let index = pinned
-            .iter()
-            .position(|run| run.range.start.raw() == virt.start.raw() && !run.owned)
-            .ok_or(AddressSpaceError::NotCommitted)?;
-        let run = pinned.swap_remove(index);
-        drop(pinned);
-        let mut mapper = unsafe { smp::current_mapper(self.physical_memory_offset) };
-        self.unmap_run_pages(
-            &mut mapper,
-            run.range.start.raw(),
-            run.range.byte_len / PAGE,
-        );
-        Ok(())
+    /// This backend publishes no device grants, so there is nothing to
+    /// substitute a device region with (#504).
+    fn substitute_device(
+        &self,
+        _virt: VirtRange,
+        _region: helios_hal::device::DeviceRegion,
+    ) -> Result<(), AddressSpaceError> {
+        Err(AddressSpaceError::DeviceMappingUnsupported)
     }
 
-    fn release_contiguous(&self, virt: VirtRange, _align: u64) -> Result<(), AddressSpaceError> {
+    /// The reservation lock is held from the check that `virt` is
+    /// substituted, across the allocation of every fresh frame and every
+    /// leaf rewrite, to the bookkeeping. Frames are all allocated
+    /// before the first leaf changes, so running out leaves the
+    /// substitution in place.
+    fn restore(&self, virt: VirtRange) -> Result<(), AddressSpaceError> {
         self.assert_smp_safe();
         validate_range(virt)?;
-        // The alignment the run was made with was recorded at commit
-        // time, so it is read back from there rather than trusted from
-        // the caller: the allocator is owed the layout it produced.
-        let mut pinned = self.pinned.lock();
-        let index = pinned
-            .iter()
-            .position(|run| run.range.start.raw() == virt.start.raw() && run.owned)
-            .ok_or(AddressSpaceError::NotCommitted)?;
-        let run = pinned.swap_remove(index);
-        drop(pinned);
-        let mut mapper = unsafe { smp::current_mapper(self.physical_memory_offset) };
-        self.unmap_run_pages(
-            &mut mapper,
-            run.range.start.raw(),
-            run.range.byte_len / PAGE,
-        );
-        self.free_pinned_run(run.phys, run.range.byte_len, run.align);
-        Ok(())
+        let mut state = self.state.lock();
+        let regions = state.substituted_regions(virt)?;
+        let mut page_flags = Vec::with_capacity(virt.byte_len / PAGE);
+        for region in &regions {
+            let pt_flags = page_flags_to_pt(region.flags)?;
+            page_flags.extend(core::iter::repeat_n(pt_flags, region.range.byte_len / PAGE));
+        }
+        let leaves = self.present_leaves(virt)?;
+        let mut fresh = Vec::with_capacity(leaves.len());
+        for _ in &leaves {
+            match self.alloc_user_frame() {
+                Ok(phys) => fresh.push(phys),
+                Err(error) => {
+                    for phys in fresh {
+                        self.dealloc_user_phys(phys);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        for ((leaf, phys), pt_flags) in leaves.into_iter().zip(fresh).zip(page_flags) {
+            // SAFETY: as in `substitute_memory`.
+            let entry = unsafe { &mut *leaf };
+            entry.set_addr(PhysAddr::new(phys as u64), pt_flags);
+        }
+        // What was shown here is not ours to free; the shootdown is so
+        // that no processor keeps reading it through the old leaf.
+        smp::flush_tlb_range_local(virt.start.raw(), virt.byte_len);
+        smp::shootdown_tlb_range(virt.start.raw(), virt.byte_len);
+        state.record_restore(virt)
+    }
+
+    /// The reservation lock is held across the leaf removal, the
+    /// shootdown and the bookkeeping. Nothing is allocated.
+    fn withdraw(&self, virt: VirtRange) -> Result<(), AddressSpaceError> {
+        self.assert_smp_safe();
+        validate_range(virt)?;
+        let mut state = self.state.lock();
+        state.substituted_regions(virt)?;
+        self.drop_substituted_leaves(virt);
+        state.record_withdraw(virt)
     }
 
     fn decommit(&self, virt: VirtRange) -> Result<(), AddressSpaceError> {
         self.assert_smp_safe();
         validate_range(virt)?;
-        let _ = self.state.lock().record_decommit(virt)?;
+        let removed = self.state.lock().record_decommit(virt)?;
+        self.drop_substituted_parts(&removed.substituted);
         self.unmap_range(virt);
         Ok(())
     }
@@ -1003,7 +971,12 @@ impl AddressSpace for X86UserAddressSpace {
     fn relocate(&self, virt: VirtRange) -> Result<(), AddressSpaceError> {
         self.assert_smp_safe();
         validate_range(virt)?;
-        self.state.lock().ensure_committed(virt)?;
+        {
+            let state = self.state.lock();
+            state.ensure_committed(virt)?;
+            // A substitution has no pool frames to copy and free.
+            state.ensure_unsubstituted(virt)?;
+        }
 
         let mut mapper = unsafe { smp::current_mapper(self.physical_memory_offset) };
         let mut frame_allocator = DirectMappedFrameAllocator {

@@ -2,6 +2,7 @@
 
 extern crate alloc;
 
+mod address;
 mod checksum;
 mod congestion;
 mod dhcp;
@@ -19,6 +20,9 @@ use bytes::Bytes;
 use helios_hal::io::IoResult;
 use thiserror::Error;
 
+pub use address::{
+    AddressLifetimes, Ipv6AddressEntry, Ipv6AddressOrigin, Lifetime, Preference, TWO_HOURS_SECONDS,
+};
 pub use checksum::{
     icmpv6_checksum, icmpv6_checksum_valid, internet_checksum, ipv4_checksum,
     partial_transport_checksum_completes, tcp_checksum_valid, tcp_pseudo_header_checksum,
@@ -40,9 +44,9 @@ pub use hash::{
     rss_indirection_entry, toeplitz,
 };
 pub use ndp::{
-    Ipv6DnsServers, Ipv6RouterConfiguration, MAX_ADVERTISED_PREFIXES, MAX_IPV6_DNS_SERVERS,
-    MAX_ROUTER_SOLICITATIONS, NeighborDiscovery, ROUTER_SOLICITATION_INTERVAL_NANOS,
-    SLAAC_PREFIX_LEN, interpret_router_advertisement,
+    AdvertisedAddress, Ipv6DnsServers, Ipv6RouterConfiguration, MAX_ADVERTISED_PREFIXES,
+    MAX_IPV6_DNS_SERVERS, MAX_ROUTER_SOLICITATIONS, NeighborDiscovery, OnLinkPrefix,
+    ROUTER_SOLICITATION_INTERVAL_NANOS, SLAAC_PREFIX_LEN, interpret_router_advertisement,
 };
 pub use packet::{
     ArpOperation, ArpPacket, EthernetFrame, EthernetProtocol, Icmpv4DestinationUnreachableCode,
@@ -866,4 +870,10 @@ pub enum StackError {
     /// Multicast membership storage was exhausted.
     #[error("network multicast membership table is full")]
     MulticastMembershipTableFull,
+    /// Route storage was exhausted and nothing could be displaced.
+    #[error("network route table is full")]
+    RouteTableFull,
+    /// Interface address storage was exhausted.
+    #[error("network address table is full")]
+    AddressTableFull,
 }

@@ -93,25 +93,33 @@ fn parse_options() -> Result<Options, DisplayTestError> {
 }
 
 /// Fill `surface` with the gradient.
+///
+/// The frame buffer is cleared with one `fill` and then written a row at
+/// a time with `copy_from_slice`, so the whole picture reaches the
+/// device's pages through bulk `memory.fill` and `memory.copy`: they are
+/// bounded by the instance's own memory like every other access.
 fn draw_gradient(surface: &mut Surface, mode: Mode) {
     let stride = surface.stride();
     let pixels = surface.pixels();
+    pixels.fill(0);
+    let mut row = vec![0_u8; stride];
     for y in 0..mode.height {
-        let row = (y as usize) * stride;
         // Integer arithmetic on purpose: the same input has to produce
         // the same byte on every target, so a host checking the capture
         // can compute the expected value itself.
         let green = ((y * 255) / mode.height.max(1)) as u8;
         for x in 0..mode.width {
-            let offset = row + (x as usize) * 4;
+            let offset = (x as usize) * 4;
             let red = ((x * 255) / mode.width.max(1)) as u8;
             // `bgrx8888`: blue, green, red, then the byte the display
             // engine ignores.
-            pixels[offset] = GRADIENT_BLUE;
-            pixels[offset + 1] = green;
-            pixels[offset + 2] = red;
-            pixels[offset + 3] = 0xff;
+            row[offset] = GRADIENT_BLUE;
+            row[offset + 1] = green;
+            row[offset + 2] = red;
+            row[offset + 3] = 0xff;
         }
+        let start = (y as usize) * stride;
+        pixels[start..start + stride].copy_from_slice(&row);
     }
 }
 
@@ -190,10 +198,10 @@ async fn main() -> Result<(), DisplayTestError> {
     let mut surface = display
         .create(options.scanout, mode, PixelFormat::Bgrx8888)
         .await?;
-    let placement = surface.placement();
+    let span = surface.span();
     println!(
         "display-test:surface scanout={} width={} height={} offset={} length={}",
-        options.scanout, mode.width, mode.height, placement.offset, placement.length
+        options.scanout, mode.width, mode.height, span.offset, span.length
     );
 
     draw_gradient(&mut surface, mode);

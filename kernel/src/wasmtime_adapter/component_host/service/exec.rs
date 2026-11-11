@@ -1071,9 +1071,9 @@ where
         );
     }
     let instance = instance.inspect(|instance| {
-        // The device path needs to know where this instance's linear
-        // memory landed before it can place a device window in it, and
-        // this is the first moment the runtime can say.
+        // Every call that shows a view checks its span against this
+        // instance's linear memory, so the store records the memory's
+        // handle here, the first moment the runtime can name it.
         crate::wasmtime_adapter::component_host::record_linear_memory(&mut store, instance);
     });
     let executor = instance.and_then(|instance| {
@@ -1724,8 +1724,7 @@ where
         kind: ProgramExecErrorKind::InvalidBinary,
         detail: ProgramExecErrorDetail::InvalidEntryPoint,
     })?;
-    let mut environment = store.data().environment.clone();
-    environment.retain(|(name, _)| name.as_str() != HELIOS_PROCESS_ID_ENV);
+    let environment = store.data().environment.clone();
     let (_, stdin_reader) = crate::byte_channel();
     let output_mode = OutputMode::RoutedChild {
         stdin_rx: stdin_reader,
