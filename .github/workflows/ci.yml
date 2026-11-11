@@ -315,7 +315,9 @@ jobs:
       # workload class boots from; the kernel is not relinked.
       - name: Build the full guest image
         id: guest-image
-        if: always()
+        # A lane that failed before it built the inspector has nothing
+        # to build an image with.
+        if: always() && hashFiles('helios/target/release/helios-inspector') != ''
         working-directory: helios
         run: ./target/release/helios-inspector vm --arch riscv64 --release build
       # The image a `--no-build` boot needs on another host, laid out as
@@ -526,7 +528,9 @@ jobs:
       # workload class boots from; the kernel is not relinked.
       - name: Build the full guest image
         id: guest-image
-        if: always()
+        # A lane that failed before it built the inspector has nothing
+        # to build an image with.
+        if: always() && hashFiles('helios/target/release/helios-inspector') != ''
         working-directory: helios
         run: ./target/release/helios-inspector vm --arch aarch64 --release build
       # The image a `--no-build` boot needs on another host, laid out as
@@ -1379,7 +1383,9 @@ jobs:
       # profile, is not relinked.
       - name: Build the full guest image
         id: guest-image
-        if: always()
+        # A lane that failed before it built the inspector has nothing
+        # to build an image with.
+        if: always() && hashFiles('helios/target/release/helios-inspector') != ''
         working-directory: helios
         run: ./target/release/helios-inspector vm --arch x86-64 --release build
       # The image a `--no-build` boot needs on another host, laid out as
