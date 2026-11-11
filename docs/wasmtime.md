@@ -5,13 +5,25 @@ at `../wasmtime/crates/wasmtime`.
 
 ## Required revision
 
-The local checkout must be at (branch `helios/parking-wait-cancel`):
+The local checkout must be at (branch `helios/release-48.0.8`):
 
 ```text
-2fb47b20c7ff9a91b6dbc03062d1dd4dddab4969
+273c1fcfc038ba477f6a1ebdd1ce25b98c255f80
 ```
 
-That revision is `helios/parking-wait-timeout` at
+That revision is `helios/parking-wait-cancel` at
+`2fb47b20c7ff9a91b6dbc03062d1dd4dddab4969` merged with upstream's `v48.0.8`
+tag (`7b6c29ec3e9a49c97da231665cbd8eead9ccbda0`), which brings in the 48.0.x
+point releases and their security fixes (#503). The fork's patches keep
+their behaviour with one exception that comes from upstream: a bulk-memory
+operation is no longer split into chunks, so the fuel, epoch and stack-limit
+checks run once before the operation (`pre_translate_bulk_op`) instead of
+between its chunks. A pending interruption is taken before a `memory.copy`
+or `memory.fill` starts, and the operation itself runs to its end.
+
+The revision it replaces is `helios/parking-wait-cancel` at
+`2fb47b20c7ff9a91b6dbc03062d1dd4dddab4969`, which is
+`helios/parking-wait-timeout` at
 `3741766da8e691dfa9e642ab9f16cfb30c1fc5a3` plus one additive commit
 (written on that branch's earlier `62bf033a` and merged forward), which
 gives a `no_std` `memory.atomic.wait` a cancellation exit (#445):
@@ -166,13 +178,13 @@ lives in one place, `.github/actions/checkout-wasmtime/action.yml`, and every
 workflow that needs the workspace to resolve uses that action. Update the pin
 there and the revision here in the same change.
 
-This revision is based on upstream Wasmtime commit:
+This revision is based on upstream Wasmtime `v48.0.8`:
 
 ```text
-2fb59986ce75a005e0d12fd4637f2e772bb659fd
+7b6c29ec3e9a49c97da231665cbd8eead9ccbda0
 ```
 
-It corresponds to Wasmtime 48.0.0-dev and requires Rust 1.95 or newer. Helios
+It corresponds to Wasmtime 48.0.8 and requires Rust 1.95 or newer. Helios
 pins `nightly-2026-06-15` in `rust-toolchain.toml` for Rust 1.98 and installs all
 host, bare-metal, and WASI targets used by the workspace.
 
