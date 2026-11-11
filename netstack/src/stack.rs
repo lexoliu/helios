@@ -3993,12 +3993,20 @@ where
         let socket = self.active_tcp_socket_mut(index);
         let previous_state = socket.state();
         socket.expire_timers(now.nanos());
-        let closed = socket.state() == crate::TcpState::Closed;
+        let closed_by_timers = socket.state() == crate::TcpState::Closed;
+        let turn = match segment_budget {
+            Some(budget) if emit && !closed_by_timers => self.emit_tcp_turn(index, budget, now),
+            _ => Ok(()),
+        };
         // Retirement is a transition, not a condition: a closed socket
         // stays in the active set until its owner drops it, and
         // repeating the retirement every drive would repeat its close
-        // event too.
-        if closed && previous_state != crate::TcpState::Closed {
+        // event too. It is judged once the turn is over because the
+        // turn can close the socket as well: the retransmission limit
+        // closes it when the retransmission is queued.
+        if self.active_tcp_socket(index).state() == crate::TcpState::Closed
+            && previous_state != crate::TcpState::Closed
+        {
             if self.tcp.terminal_error(index).is_none() {
                 self.retire_closed_tcp_socket(index);
             }
@@ -4012,10 +4020,6 @@ where
                 });
             }
         }
-        let turn = match segment_budget {
-            Some(budget) if emit && !closed => self.emit_tcp_turn(index, budget, now),
-            _ => Ok(()),
-        };
         self.schedule_tcp_timer(index);
         turn
     }
@@ -13786,6 +13790,236 @@ mod tests {
             0,
             "the backpressure bookkeeping must agree with the predicate"
         );
+    }
+
+    /// A stack with one wildcard listener on 8080 and the peer's
+    /// neighbour resolved, for the tests that need a passive open.
+    fn listening_tcp_stack(
+        local: Ipv4Address,
+        peer: Ipv4Address,
+        backlog: TcpListenBacklog,
+    ) -> (Stack, SocketId) {
+        let mut stack = Stack::new(StackConfig::new(
+            LOCAL_MAC,
+            crate::ETHERNET_FRAME_BYTES,
+            TEST_ISN_SECRET,
+        ));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
+        stack.learn_neighbor(NeighborEntry {
+            ip: IpAddress::Ipv4(peer),
+            mac: PEER_MAC,
+            state: NeighborState::Reachable,
+            updated_at: StackInstant::from_nanos(0),
+        });
+        let listener = stack
+            .open_tcp_listen(
+                TcpEndpoint {
+                    address: IpAddress::Ipv4(Ipv4Address::UNSPECIFIED),
+                    port: 8080,
+                },
+                backlog,
+            )
+            .expect("wildcard TCP listener should bind");
+        (stack, listener)
+    }
+
+    /// Delivers one segment from `peer`'s `remote_port` to the
+    /// listener's port 8080.
+    fn deliver_to_listener(
+        stack: &mut Stack,
+        local: Ipv4Address,
+        peer: Ipv4Address,
+        remote_port: u16,
+        header: TcpHeader,
+        payload: &[u8],
+        now: u64,
+    ) {
+        let (segment, segment_len) = tcp_segment_with_payload(
+            peer,
+            local,
+            TcpHeader {
+                source_port: remote_port,
+                destination_port: 8080,
+                ..header
+            },
+            payload,
+        );
+        stack
+            .receive_tcp(
+                IpAddress::Ipv4(peer),
+                IpAddress::Ipv4(local),
+                &Bytes::copy_from_slice(&segment[..segment_len]),
+                RxFrameOffload::none(),
+                StackInstant::from_nanos(now),
+            )
+            .expect("segment for the listener's connection should be handled");
+    }
+
+    /// Drives the stack at `now` and counts the `TcpClosed` events for
+    /// `socket` that it raised, discarding the frames it queued.
+    fn drive_counting_closes(stack: &mut Stack, socket: SocketId, now: u64) -> usize {
+        stack
+            .drive_tcp(StackInstant::from_nanos(now))
+            .expect("drive should not fail");
+        while stack.take_outbound().is_some() {}
+        let mut closes = 0;
+        while let Some(event) = stack.take_event() {
+            if event == (StackEvent::TcpClosed { socket }) {
+                closes += 1;
+            }
+        }
+        closes
+    }
+
+    /// #725. The retransmission limit closes a connection inside the
+    /// turn that queues its retransmission, after the drive has looked
+    /// for a close, and the next drive finds the socket already closed.
+    /// The retirement has to happen in the drive that closes it: the
+    /// four-tuple leaves the endpoint index, the receive window is
+    /// surrendered and the close is announced once.
+    #[test]
+    fn a_connection_the_retransmission_limit_closes_is_retired() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let (mut stack, listener) = listening_tcp_stack(local, peer, DEFAULT_TCP_LISTEN_BACKLOG);
+        let syn_ack = drive_passive_open_to_syn_ack(&mut stack, peer, local, 49152, 1);
+        deliver_to_listener(
+            &mut stack,
+            local,
+            peer,
+            49152,
+            TcpHeader {
+                source_port: 0,
+                destination_port: 0,
+                sequence: 11,
+                acknowledgement: syn_ack.sequence.wrapping_add(1),
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+            },
+            &[],
+            2,
+        );
+        let accepted = stack
+            .take_tcp_accept(listener)
+            .expect("listener should be live")
+            .expect("the handshake ACK should complete the connection");
+        let socket = accepted.socket;
+
+        // The peer fills the receive queue and the application never
+        // reads it back.
+        let payload = [0u8; crate::tcp::TCP_RECEIVE_SEGMENT_BYTES];
+        let mut sequence = 11u32;
+        for index in 0..crate::tcp::TCP_RECEIVE_BACKPRESSURE_SEGMENTS {
+            deliver_to_listener(
+                &mut stack,
+                local,
+                peer,
+                49152,
+                TcpHeader {
+                    source_port: 0,
+                    destination_port: 0,
+                    sequence,
+                    acknowledgement: syn_ack.sequence.wrapping_add(1),
+                    flags: TcpFlags::ACK,
+                    window_size: u16::MAX,
+                },
+                &payload,
+                index as u64 + 3,
+            );
+            sequence = sequence.wrapping_add(crate::tcp::TCP_RECEIVE_SEGMENT_BYTES as u32);
+        }
+        assert!(stack.receive_backpressured());
+
+        // Data in flight to a peer that never answers again.
+        assert_eq!(stack.tcp_send(socket, b"unanswered"), Ok(10));
+        while stack.take_event().is_some() {}
+        let mut closes = 0;
+        let mut now = 1_000_000_000u64;
+        for _ in 0..=u32::from(crate::tcp::TCP_MAX_RETRANSMISSIONS) + 2 {
+            closes += drive_counting_closes(&mut stack, socket, now);
+            // Far past any backed-off retransmission timeout.
+            now += 600_000_000_000;
+        }
+        assert_eq!(
+            stack.tcp_connect_state(socket),
+            Ok(TcpConnectState::Closed(TcpConnectTerminalError::Closed))
+        );
+        assert_eq!(
+            closes, 1,
+            "the close is announced once, in the drive that made it"
+        );
+        assert!(
+            !stack.receive_backpressured(),
+            "a closed socket cannot be relieved and must not refuse frames for the stack"
+        );
+        assert_eq!(stack.tcp_counters().receive_backpressured_sockets, 0);
+
+        // The four-tuple is free: the same remote endpoint opens a new
+        // connection with the listener instead of reaching the dead one.
+        let syn_ack = drive_passive_open_to_syn_ack(&mut stack, peer, local, 49152, now);
+        assert_eq!(
+            syn_ack.flags,
+            TcpFlags::SYN.union(TcpFlags::ACK),
+            "the listener should answer the new SYN"
+        );
+        deliver_to_listener(
+            &mut stack,
+            local,
+            peer,
+            49152,
+            TcpHeader {
+                source_port: 0,
+                destination_port: 0,
+                sequence: 11,
+                acknowledgement: syn_ack.sequence.wrapping_add(1),
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+            },
+            &[],
+            now + 1,
+        );
+        let fresh = stack
+            .take_tcp_accept(listener)
+            .expect("listener should be live")
+            .expect("the new connection should be accepted");
+        assert_ne!(fresh.socket, socket);
+
+        // Nothing announces the old socket again.
+        for _ in 0..3 {
+            now += 600_000_000_000;
+            assert_eq!(drive_counting_closes(&mut stack, socket, now), 0);
+        }
+    }
+
+    /// #725. A child still waiting in the listener's backlog that the
+    /// retransmission limit closes gives its place back and leaves the
+    /// accept queue clean.
+    #[test]
+    fn an_unaccepted_child_the_retransmission_limit_closes_gives_back_its_backlog_place() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let (mut stack, listener) = listening_tcp_stack(local, peer, TcpListenBacklog::new(1));
+        // The SYN-ACK is never answered, so the child in SYN-RECEIVED
+        // retransmits it until the limit.
+        let syn_ack = drive_passive_open_to_syn_ack(&mut stack, peer, local, 49152, 1);
+        assert_eq!(syn_ack.flags, TcpFlags::SYN.union(TcpFlags::ACK));
+        let mut now = 1_000_000_000u64;
+        for _ in 0..=u32::from(crate::tcp::TCP_MAX_RETRANSMISSIONS) + 2 {
+            stack
+                .drive_tcp(StackInstant::from_nanos(now))
+                .expect("drive should not fail");
+            while stack.take_outbound().is_some() {}
+            now += 600_000_000_000;
+        }
+        assert_eq!(stack.tcp_accept_pending(listener), Ok(false));
+        assert_eq!(stack.take_tcp_accept(listener), Ok(None));
+
+        // The only backlog place is free again: another remote's SYN is
+        // answered rather than dropped.
+        let syn_ack = drive_passive_open_to_syn_ack(&mut stack, peer, local, 49153, now);
+        assert_eq!(syn_ack.flags, TcpFlags::SYN.union(TcpFlags::ACK));
     }
 
     /// A bulk receiver with a reader that lags behind the wire: the
