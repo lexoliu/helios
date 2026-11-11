@@ -348,11 +348,12 @@ pub(super) fn define_imported_shared_memory<T>(
 pub(super) fn fill_random(
     memory: &SharedMemory,
     entropy: &Mutex<crate::EntropyPool>,
+    root: &crate::RootEntropy,
     ptr: u32,
     len: u32,
 ) -> i32 {
     let mut bytes = alloc::vec![0_u8; len as usize];
-    entropy.lock().fill_secure(&mut bytes);
+    entropy.lock().fill_secure(root, &mut bytes);
     write_shared_memory(memory, ptr, &bytes).map_or(p1::errno::FAULT, |_| p1::errno::SUCCESS)
 }
 

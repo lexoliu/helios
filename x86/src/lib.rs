@@ -331,8 +331,16 @@ fn x86_kernel_main() -> ! {
     // before it is programmed, and that pass also programs the block
     // device, which needs the root DRBG this call produces. It joins
     // through the reseed task once the executor runs.
-    let root_entropy =
-        helios_kernel::seed_root_entropy(&cpu, None, None::<&helios_kernel::NoEntropyDevice>);
+    // No VM generation ID window is discovered on this platform yet, so
+    // the machine generation moves only through `advance`.
+    let machine_generation = helios_kernel::MachineGeneration::new(None);
+    debug_state.install_machine_generation(machine_generation.clone());
+    let root_entropy = helios_kernel::seed_root_entropy(
+        &cpu,
+        None,
+        None::<&helios_kernel::NoEntropyDevice>,
+        machine_generation,
+    );
     debug_state.install_root_entropy(root_entropy.clone());
     // The calendar is read once, here, before any component can ask
     // what time it is. The TSC carries wall time forward from that
