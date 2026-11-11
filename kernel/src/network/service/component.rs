@@ -37,11 +37,12 @@ impl DhcpClientState {
     /// and require a client to discard a message whose `xid` is not its
     /// own; §3.1 has the selected server alone answer the REQUEST, and a
     /// server's NAK carries its server identifier (§4.3.2, table 3).
-    /// This client has no RENEWING, REBINDING or REBOOTING state (a
-    /// lease is never renewed), so `Requesting` is the only state that
-    /// accepts a reply; `Bound` never does. REBINDING would be the one
-    /// state where a server other than the selected one may answer
-    /// (§4.4.4), and would need its own arm here.
+    /// This client has no RENEWING or REBINDING state (a lease is never
+    /// renewed). `Requesting` accepts a reply from the server it
+    /// selected. `Rebooting` selected none: its INIT-REBOOT REQUEST
+    /// carries no server identifier and any server on the link may
+    /// confirm or refuse the address (§3.2, §4.3.2), so the `xid` alone
+    /// decides. `Bound` never accepts one.
     pub(super) fn accepts_reply(&self, message: &DhcpServerMessage) -> bool {
         match *self {
             Self::Requesting {
@@ -52,6 +53,7 @@ impl DhcpClientState {
                 message.transaction_id == transaction_id
                     && message.server_identifier == Some(server_identifier)
             }
+            Self::Rebooting { transaction_id, .. } => message.transaction_id == transaction_id,
             Self::Init { .. } | Self::Selecting { .. } | Self::Bound => false,
         }
     }
@@ -882,14 +884,9 @@ impl NetworkShard {
                 {
                     self.bind_lease(message)?;
                 }
-                (
-                    DhcpClientState::Rebooting {
-                        transaction_id,
-                        requested_ip,
-                        ..
-                    },
-                    DhcpMessageType::Ack,
-                ) if message.transaction_id == transaction_id => {
+                (DhcpClientState::Rebooting { requested_ip, .. }, DhcpMessageType::Ack)
+                    if self.dhcp.accepts_reply(&message) =>
+                {
                     if message.your_ip != requested_ip {
                         // The server granted another address: the one
                         // held from before the restore is not ours.
@@ -897,9 +894,12 @@ impl NetworkShard {
                     }
                     self.bind_lease(message)?;
                 }
-                (DhcpClientState::Requesting { .. }, DhcpMessageType::Nak)
-                    if self.dhcp.accepts_reply(&message) =>
-                {
+                // A refused INIT-REBOOT means the address held from
+                // before the restore is not ours (RFC 2131 §3.2, step 3).
+                (
+                    DhcpClientState::Requesting { .. } | DhcpClientState::Rebooting { .. },
+                    DhcpMessageType::Nak,
+                ) if self.dhcp.accepts_reply(&message) => {
                     self.stack.clear_ipv4_addresses();
                     self.dhcp = DhcpClientState::Init {
                         transaction_id: next_transaction_id(message.transaction_id),

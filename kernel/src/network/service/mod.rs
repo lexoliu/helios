@@ -1759,12 +1759,13 @@ mod tests {
     use crate::test_support::{RecordingNetworkInterface, RecordingSmpCpu, TestCpu};
 
     use super::{
-        AddressAttemptError, DhcpClientState, DhcpDnsServers, DhcpMessageType, DhcpServerMessage,
-        HandleSlab, NETWORK_BUSY_POLL_ROUNDS, NETWORK_TX_BATCH_FRAMES, NetworkIpAddress,
-        NetworkPollBudget, NetworkPollProgress, NetworkPollScope, NetworkPollSource,
-        NetworkPollState, NetworkPumpAction, NetworkPumpCadence, NetworkShard, ReplicaHandle,
-        TcpListenerId, TcpReadProgress, UdpSocketId, icmp_echo_payload, limit_udp_datagram_bytes,
-        map_ipv4_address, parse_ipv6, receive_pair_order,
+        AddressAttemptError, DHCP_REBOOT_ATTEMPTS, DHCP_RETRANSMIT_NANOS, DhcpClientState,
+        DhcpDnsServers, DhcpMessageType, DhcpServerMessage, HandleSlab, NETWORK_BUSY_POLL_ROUNDS,
+        NETWORK_TX_BATCH_FRAMES, NetworkIpAddress, NetworkPollBudget, NetworkPollProgress,
+        NetworkPollScope, NetworkPollSource, NetworkPollState, NetworkPumpAction,
+        NetworkPumpCadence, NetworkShard, ReplicaHandle, TcpListenerId, TcpReadProgress,
+        UdpSocketId, icmp_echo_payload, limit_udp_datagram_bytes, map_ipv4_address, parse_ipv6,
+        receive_pair_order,
     };
 
     fn ipv6_tcp_frame(
@@ -2221,6 +2222,25 @@ mod tests {
             },
         ] {
             assert!(!state.accepts_reply(&nak(7, Some(server))));
+        }
+    }
+
+    /// RFC 2131 §3.2: an INIT-REBOOT REQUEST names no server, so any
+    /// server on the link may answer it, and only the `xid` ties the
+    /// answer to the exchange.
+    #[test]
+    fn a_rebooting_client_takes_a_reply_to_its_exchange_from_any_server() {
+        let server = Ipv4Address::new([192, 0, 2, 1]);
+        let rebooting = DhcpClientState::Rebooting {
+            transaction_id: 7,
+            requested_ip: Ipv4Address::new([192, 0, 2, 10]),
+            attempts: 1,
+            last_sent: StackInstant::from_nanos(0),
+        };
+        for message_type in [DhcpMessageType::Ack, DhcpMessageType::Nak] {
+            assert!(rebooting.accepts_reply(&dhcp_reply(message_type, 7, Some(server))));
+            assert!(rebooting.accepts_reply(&dhcp_reply(message_type, 7, None)));
+            assert!(!rebooting.accepts_reply(&dhcp_reply(message_type, 8, Some(server))));
         }
     }
 
