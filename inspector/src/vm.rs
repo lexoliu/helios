@@ -960,6 +960,10 @@ struct VmProfile {
     host_share: Option<VmHostShareProfile>,
     watchdog: Option<VmWatchdogProfile>,
     entropy: VmEntropyProfile,
+    /// Whether this machine can carry QEMU's `vmgenid` device, which
+    /// publishes the VM Generation ID through an ACPI SSDT. Only the x86
+    /// machines build that table; `virt` on aarch64 and riscv64 has none.
+    vm_generation_id: bool,
     /// The `-machine` option list that makes this machine publish ACPI
     /// tables instead of a device tree, when it can publish both.
     acpi_machine: Option<&'static str>,
@@ -1029,6 +1033,7 @@ const AARCH64_VIRT_HVF_PROFILE: VmProfile = VmProfile {
     host_share: Some(VmHostShareProfile::Virtio9pMmio),
     watchdog: Some(VmWatchdogProfile::I6300Esb),
     entropy: VmEntropyProfile::VirtioRngMmio,
+    vm_generation_id: false,
     // The virtio devices of the `virt` machines are memory-mapped, and
     // virtio-iommu translates PCI endpoints only, so there is nothing
     // here it could confine.
@@ -1063,6 +1068,7 @@ const AARCH64_VIRT_TCG_PROFILE: VmProfile = VmProfile {
     host_share: Some(VmHostShareProfile::Virtio9pMmio),
     watchdog: Some(VmWatchdogProfile::I6300Esb),
     entropy: VmEntropyProfile::VirtioRngMmio,
+    vm_generation_id: false,
     // The virtio devices of the `virt` machines are memory-mapped, and
     // virtio-iommu translates PCI endpoints only, so there is nothing
     // here it could confine.
@@ -1096,6 +1102,7 @@ const RISCV64_VM_PROFILE: VmProfile = VmProfile {
     host_share: Some(VmHostShareProfile::Virtio9pMmio),
     watchdog: Some(VmWatchdogProfile::I6300Esb),
     entropy: VmEntropyProfile::VirtioRngMmio,
+    vm_generation_id: false,
     // The virtio devices of the `virt` machines are memory-mapped, and
     // virtio-iommu translates PCI endpoints only, so there is nothing
     // here it could confine.
@@ -1129,6 +1136,7 @@ const X86_64_VM_PROFILE: VmProfile = VmProfile {
     host_share: Some(VmHostShareProfile::Virtio9pPci),
     watchdog: Some(VmWatchdogProfile::I6300Esb),
     entropy: VmEntropyProfile::VirtioRngPci,
+    vm_generation_id: true,
     acpi_machine: None,
     iommu: Some(VmIommuProfile::VirtioIommuPci),
     balloon: VmBalloonProfile::VirtioBalloonPci,
@@ -5122,6 +5130,9 @@ impl VmRuntime {
             configure_watchdog(&mut qemu, watchdog);
         }
         configure_entropy_device(&mut qemu, command.profile.entropy, command.virtio_devices);
+        if command.profile.vm_generation_id {
+            configure_vm_generation_id(&mut qemu);
+        }
         configure_balloon(&mut qemu, command.profile.balloon, command.virtio_devices);
         if command.desktop {
             let display = match command.renderer {
@@ -5864,6 +5875,13 @@ fn configure_sound(
     device.set("audiodev", VmAudioDev::ID);
     apply_transport(sound == VmSoundProfile::VirtioSoundPci, queues, &mut device);
     qemu.arg("-device").arg(device.to_string());
+}
+
+/// Attaches the VM Generation ID device. `guid=auto` has QEMU draw a
+/// fresh identifier at start and write a new one on every snapshot
+/// restore, which is what the guest compares against.
+fn configure_vm_generation_id(qemu: &mut Command) {
+    qemu.arg("-device").arg("vmgenid,guid=auto");
 }
 
 fn configure_watchdog(qemu: &mut Command, watchdog: VmWatchdogProfile) {
@@ -6804,6 +6822,20 @@ mod tests {
             Some(VmWatchdogProfile::I6300Esb)
         );
         assert_eq!(X86_64_VM_PROFILE.entropy, VmEntropyProfile::VirtioRngPci);
+    }
+
+    /// Only the x86 machines build the ACPI table the device publishes
+    /// through, so only the x86 profile attaches it.
+    #[test]
+    fn only_the_x86_profile_attaches_the_vm_generation_id() {
+        assert!(X86_64_VM_PROFILE.vm_generation_id);
+        assert!(!AARCH64_VIRT_HVF_PROFILE.vm_generation_id);
+        assert!(!AARCH64_VIRT_TCG_PROFILE.vm_generation_id);
+        assert!(!RISCV64_VM_PROFILE.vm_generation_id);
+        assert_eq!(
+            rendered(configure_vm_generation_id),
+            ["-device", "vmgenid,guid=auto"]
+        );
     }
 
     /// A `vm` invocation with nothing but its defaults, for tests that

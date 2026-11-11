@@ -601,6 +601,9 @@ jobs:
           # has, and `debug-serial.log` is the host's raw copy of it.
           grep -F 'virtio-input online' "$runtime/debug-serial.log"
           test "$(grep -cF 'virtio-input online' "$runtime/debug-serial.log")" -eq 3
+          # The inspector attaches `vmgenid` on the x86 profile, so the
+          # guest has to have found its generation ID window (#572).
+          grep -F 'vmgenid online' "$runtime/debug-serial.log"
       - name: Run the coreutils applets through dash
         shell: bash
         working-directory: helios
