@@ -1202,8 +1202,7 @@ def run_suite(options: RunOptions, manifest: Manifest, dry_run: bool = False) ->
             url=run_url,
             attempt=attempt,
             lane=lane.name,
-            runner_label=options.runner_label
-            or (lane.shared_runner if options.advisory else lane.runner_label),
+            runner_label=options.runner_label or lane.runs_on(options.advisory),
             advisory=options.advisory,
             publishable=not options.advisory and not deviations,
             deviations=deviations,

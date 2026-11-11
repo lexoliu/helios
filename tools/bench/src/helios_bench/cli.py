@@ -94,6 +94,10 @@ def command_lanes(args: argparse.Namespace) -> int:
     manifest = load_manifest()
     lanes = manifest.lanes if args.select == "all" else [manifest.lane(args.select)]
     if args.format == "github-matrix":
+        if args.select == "all":
+            # `all` is every lane a workflow can schedule; a lane without a
+            # hosted runner is run by hand and named explicitly.
+            lanes = [lane for lane in lanes if lane.shared_runner is not None]
         print(json.dumps([lane.github_matrix_entry() for lane in lanes]))
     else:
         for lane in lanes:

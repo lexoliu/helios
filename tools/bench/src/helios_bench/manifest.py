@@ -39,7 +39,10 @@ class Lane(BaseModel):
     accelerator: str
     rpc_transport: Literal["serial", "vsock"]
     runner_label: str
-    shared_runner: str
+    # The hosted runner the lane's job takes in advisory mode. A lane no
+    # hosted runner can carry has none: it is run by hand on its dedicated
+    # host and is not part of the workflow matrix.
+    shared_runner: str | None = None
     qemu_version: str
     boot_timeout_seconds: int = Field(ge=1)
     vcpus: int = Field(ge=1)
@@ -54,11 +57,22 @@ class Lane(BaseModel):
         return f"qemu-system-{self.guest_arch}"
 
     def runs_on(self, advisory: bool) -> str:
-        """The runner this lane runs on in the given mode."""
-        return self.shared_runner if advisory else self.runner_label
+        """The runner this lane runs on in the given mode.
+
+        An advisory run of a lane with no hosted runner is still taken on
+        its dedicated host: there is nowhere else it can run.
+        """
+        if advisory and self.shared_runner is not None:
+            return self.shared_runner
+        return self.runner_label
 
     def github_matrix_entry(self) -> dict[str, str]:
         """One `include` entry of the bench-suite workflow matrix."""
+        if self.shared_runner is None:
+            raise SystemExit(
+                f"lane {self.name!r} has no hosted runner and is not part of the workflow matrix; "
+                f"run it on its dedicated host with `helios-bench run --lane {self.name}`"
+            )
         return {
             "lane": self.name,
             "shared-runner": self.shared_runner,
