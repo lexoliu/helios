@@ -2000,6 +2000,7 @@ dependencies = [
  "wasmparser 0.245.1",
  "wasmtime",
  "wasmtime-wasi-io",
+ "zrip",
 ]
 
 [[package]]
@@ -5376,4 +5377,39 @@ dependencies = [
  "crc32fast",
  "log",
  "simd-adler32",
+]
+
+[[package]]
+name = "zrip"
+version = "0.8.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0e7c1117cf6f78d4fbb2078222ba36e6ebd436cf8854f4863ad84c4446518b6c"
+dependencies = [
+ "zrip-core",
+ "zrip-decode",
+ "zrip-encode",
+]
+
+[[package]]
+name = "zrip-core"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "80f6de2d9ed313cfb14a113e6da994e6ddd7891c3c6af2eed5ccb887e40178ec"
+
+[[package]]
+name = "zrip-decode"
+version = "0.8.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "94ebe0e933f1ae28cd83f7ba83bcff5060663928fcfa9aeb13562bcb8bfb8ff7"
+dependencies = [
+ "zrip-core",
+]
+
+[[package]]
+name = "zrip-encode"
+version = "0.9.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ee3a9230911c8b514240431526790abf93116443e359fe52d2907640e486dd3d"
+dependencies = [
+ "zrip-core",
 ]
