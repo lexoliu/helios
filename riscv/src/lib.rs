@@ -638,7 +638,7 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
     // allocator is primed with below.
     let initrd = initrd_range(&fdt);
     let allocator_window = allocator_window();
-    let memory_regions = collect_memory_regions(fdt.memory(), allocator_window.clone(), &initrd);
+    let memory_regions = collect_memory_regions(&fdt, allocator_window.clone(), &initrd);
     let current_hart = ProcessorId::new(hart_id as u16);
     let bootstrap_processor = remember_bootstrap_hart(hart_id);
     mark_hart_online(current_hart);
@@ -973,15 +973,31 @@ fn initrd_range(fdt: &Fdt<'_>) -> Range<usize> {
     start..end
 }
 
-fn collect_memory_regions<'fdt>(
-    memory: fdt::standard_nodes::Memory<'fdt, 'fdt>,
+/// Capacity for the allocator regions: a devicetree carries one `memory`
+/// node per range, and the initrd carve-out splits one of them in two. A
+/// tree that describes more is refused by name below.
+const MAX_MEMORY_REGIONS: usize = 16;
+
+/// Every `reg` range of every node whose `device_type` is `memory`, clipped
+/// to the allocator window with the initrd taken out.
+fn collect_memory_regions(
+    fdt: &Fdt<'_>,
     allocator_window: Range<usize>,
     initrd: &Range<usize>,
-) -> ArrayVec<MemoryRegion, 8> {
+) -> ArrayVec<MemoryRegion, MAX_MEMORY_REGIONS> {
     let mut regions = ArrayVec::new();
 
-    for region in memory
-        .regions()
+    for region in fdt
+        .all_nodes()
+        .filter(|node| {
+            node.property("device_type")
+                .is_some_and(|property| property.value == b"memory\0")
+        })
+        .flat_map(|node| {
+            node.reg().unwrap_or_else(|| {
+                panic!("FDT memory node {} has no usable reg property", node.name)
+            })
+        })
         .map(|region| {
             let start = region.starting_address as usize;
             let end = start
