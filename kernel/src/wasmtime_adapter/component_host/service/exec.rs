@@ -1710,8 +1710,7 @@ where
         kind: ProgramExecErrorKind::InvalidBinary,
         detail: ProgramExecErrorDetail::InvalidEntryPoint,
     })?;
-    let mut environment = store.data().environment.clone();
-    environment.retain(|(name, _)| name.as_str() != HELIOS_PROCESS_ID_ENV);
+    let environment = store.data().environment.clone();
     let (_, stdin_reader) = crate::byte_channel();
     let output_mode = OutputMode::RoutedChild {
         stdin_rx: stdin_reader,
