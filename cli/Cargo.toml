@@ -11,6 +11,7 @@ fatfs = "0.3.6"
 helios-artifact.workspace = true
 helios-compiler-support.workspace = true
 helios-profdata.workspace = true
+helios-venus-gen.workspace = true
 helios-workspace-root.workspace = true
 hex = "0.4.3"
 mbrman = "0.5.4"
@@ -26,6 +27,9 @@ walkdir = "2.5.0"
 wasmparser = "0.245.0"
 wit-component = "0.245.0"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

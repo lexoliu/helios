@@ -150,7 +150,7 @@ dependencies = [
  "arm-sysregs",
  "bitflags 2.13.1",
  "safe-mmio",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "zerocopy",
 ]
 
@@ -350,7 +350,7 @@ checksum = "82f6aeea286b8eb4dd3431a1be1b59d290ace00f5bfd8e2a159bc2a05e2c1667"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.5",
+ "syn 3.0.10",
 ]
 
 [[package]]
@@ -542,9 +542,9 @@ dependencies = [
 
 [[package]]
 name = "cc"
-version = "1.4.5"
+version = "1.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "005ec2760ca554fae18df7a11195552ec576cd665632a881bc011d5bb2fd4d80"
+checksum = "4ff2a8126fff0f8c839080d619675a585e61720bb12d2baceae45769fd66f155"
 dependencies = [
  "find-msvc-tools",
  "shlex",
@@ -624,7 +624,7 @@ dependencies = [
  "heck",
  "proc-macro2",
  "quote",
- "syn 3.0.5",
+ "syn 3.0.10",
 ]
 
 [[package]]
@@ -648,7 +648,7 @@ version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0fa961b519f0b462e3a3b4a34b64d119eeaca1d59af726fe450bbba07a9fc0a1"
 dependencies = [
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1051,7 +1051,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "strsim",
- "syn 3.0.5",
+ "syn 3.0.10",
 ]
 
 [[package]]
@@ -1062,7 +1062,7 @@ checksum = "2ac7135c3ef02b2f7833bbeb1be5ba7f966dcde8a87c6b87f65a778d71a02785"
 dependencies = [
  "darling_core",
  "quote",
- "syn 3.0.5",
+ "syn 3.0.10",
 ]
 
 [[package]]
@@ -1386,9 +1386,9 @@ dependencies = [
 
 [[package]]
 name = "find-msvc-tools"
-version = "0.1.12"
+version = "0.1.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3e0f1c7c3a72c66fd80abe965175f7523475c0489a87d3ff9d6e8c87d87a9d2d"
+checksum = "1c66915cc5391097de7a2b0b972e8505aa33c0df401fd3a6811dbdb32881ba48"
 
 [[package]]
 name = "finl_unicode"
@@ -1652,7 +1652,7 @@ dependencies = [
  "helios-virtio",
  "limine 0.6.5",
  "spin 0.12.3",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tracing",
  "triomphe",
 ]
@@ -1667,7 +1667,7 @@ dependencies = [
  "helios-api-macro",
  "helios-hal",
  "http",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "wit-bindgen 0.61.1",
 ]
 
@@ -1677,7 +1677,7 @@ version = "0.1.0"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.5",
+ "syn 3.0.10",
 ]
 
 [[package]]
@@ -1685,10 +1685,11 @@ name = "helios-artifact"
 version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
+ "helios-hal",
  "postcard",
  "serde",
  "serde-big-array",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1696,7 +1697,7 @@ name = "helios-audio-test"
 version = "0.1.0"
 dependencies = [
  "helios-api",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1711,7 +1712,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "wasm-encoder 0.245.1",
  "wasmparser 0.245.1",
  "wasmtime",
@@ -1729,6 +1730,7 @@ dependencies = [
  "helios-artifact",
  "helios-compiler-support",
  "helios-profdata",
+ "helios-venus-gen",
  "helios-workspace-root",
  "hex",
  "mbrman",
@@ -1737,7 +1739,8 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "thiserror 2.0.20",
+ "tempfile",
+ "thiserror 2.0.21",
  "toml",
  "walkdir",
  "wasmparser 0.245.1",
@@ -1768,7 +1771,7 @@ dependencies = [
  "cranelift-codegen",
  "helios-artifact",
  "rayon",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "wasmparser 0.245.1",
  "wasmtime",
 ]
@@ -1779,7 +1782,7 @@ version = "0.1.0"
 dependencies = [
  "helios-api",
  "helios-compositor-render",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1795,7 +1798,7 @@ name = "helios-date"
 version = "0.1.0"
 dependencies = [
  "helios-api",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1805,7 +1808,7 @@ dependencies = [
  "futures-io",
  "helios-api",
  "helios-inspector-protocol",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1815,7 +1818,7 @@ dependencies = [
  "clap",
  "helios-compositor-render",
  "png",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1823,7 +1826,7 @@ name = "helios-display-test"
 version = "0.1.0"
 dependencies = [
  "helios-api",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1831,7 +1834,7 @@ name = "helios-gpu-test"
 version = "0.1.0"
 dependencies = [
  "helios-api",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1842,7 +1845,7 @@ dependencies = [
  "bitflags 2.13.1",
  "fdt",
  "strength_reduce",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "triomphe",
 ]
 
@@ -1861,7 +1864,7 @@ dependencies = [
  "libc",
  "mimalloc",
  "tempfile",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tokio",
  "tokio-util",
  "tracing",
@@ -1889,7 +1892,7 @@ name = "helios-input-test"
 version = "0.1.0"
 dependencies = [
  "helios-api",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1929,7 +1932,7 @@ dependencies = [
  "serialport",
  "shell-words",
  "tempfile",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "time",
  "toml",
  "vsock",
@@ -1948,7 +1951,7 @@ dependencies = [
  "postcard",
  "serde",
  "strip-ansi-escapes",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tokio",
  "tokio-util",
  "wit-bindgen 0.61.1",
@@ -1992,7 +1995,7 @@ dependencies = [
  "smallvec",
  "spin 0.9.9",
  "talc",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tracing",
  "triomphe",
  "unsize",
@@ -2011,7 +2014,7 @@ dependencies = [
  "divan",
  "heapless",
  "helios-hal",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tracing",
  "wide",
 ]
@@ -2021,7 +2024,7 @@ name = "helios-oob-load"
 version = "0.1.0"
 dependencies = [
  "helios-api",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -2036,7 +2039,7 @@ name = "helios-ping"
 version = "0.1.0"
 dependencies = [
  "helios-api",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -2045,7 +2048,7 @@ version = "0.1.0"
 dependencies = [
  "helios-api",
  "helios-bench-metrics",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -2057,7 +2060,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -2089,7 +2092,36 @@ version = "0.1.0"
 dependencies = [
  "helios-api",
  "helios-bench-metrics",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "helios-venus"
+version = "0.1.0"
+dependencies = [
+ "askama",
+ "cc",
+ "helios-venus-gen",
+ "libloading",
+ "tempfile",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "helios-venus-gen"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "prettyplease 0.3.0",
+ "proc-macro2",
+ "quote",
+ "serde",
+ "sha2 0.10.9",
+ "syn 3.0.10",
+ "tempfile",
+ "thiserror 2.0.21",
+ "toml",
+ "vk-parse",
 ]
 
 [[package]]
@@ -2110,7 +2142,7 @@ dependencies = [
  "helios-netstack",
  "pci_types",
  "spin 0.9.9",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tracing",
  "zerocopy",
 ]
@@ -2120,7 +2152,7 @@ name = "helios-workspace-root"
 version = "0.1.0"
 dependencies = [
  "tempfile",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "toml",
 ]
 
@@ -2289,7 +2321,7 @@ dependencies = [
  "indoc",
  "proc-macro2",
  "quote",
- "syn 3.0.5",
+ "syn 3.0.10",
 ]
 
 [[package]]
@@ -2348,7 +2380,7 @@ checksum = "bde5057d6143cc94e861d90f591b9303d6716c6b9602309150bd068853c10899"
 dependencies = [
  "hashbrown 0.16.1",
  "portable-atomic",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -2374,6 +2406,16 @@ name = "libc"
 version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
+
+[[package]]
+name = "libloading"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "754ca22de805bb5744484a5b151a9e1a8e837d5dc232c2d7d8c2e3492edc8b60"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
 
 [[package]]
 name = "libm"
@@ -2621,7 +2663,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "rustversion",
- "syn 3.0.5",
+ "syn 3.0.10",
 ]
 
 [[package]]
@@ -3118,6 +3160,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "prettyplease"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2bfe0f4c752e450fc2faf62654f1c134747922825d5b04ca717b8874f41a40c0"
+dependencies = [
+ "proc-macro2",
+ "syn 3.0.10",
+]
+
+[[package]]
 name = "proc-macro2"
 version = "1.0.107"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3256,7 +3308,7 @@ dependencies = [
  "palette",
  "serde",
  "strum",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "unicode-segmentation",
  "unicode-truncate",
  "unicode-width 0.2.2",
@@ -3371,7 +3423,7 @@ checksum = "a4e608c6638b9c18977b00b475ac1f28d14e84b27d8d42f70e0bf1e3dec127ac"
 dependencies = [
  "getrandom 0.2.17",
  "libredox",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -3645,7 +3697,7 @@ checksum = "e7a5d71263a5a7d47b41f6b3f06ba276f10cc18b0931f1799f710578e2309348"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.5",
+ "syn 3.0.10",
 ]
 
 [[package]]
@@ -3932,9 +3984,9 @@ dependencies = [
 
 [[package]]
 name = "syn"
-version = "3.0.5"
+version = "3.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "12df2e0110f65b775f769bb17ef989067a1d931b2eb822bd4346631eeada89f9"
+checksum = "4ae9ccbea3a7b0b09443036490c8f34a8b1b760fd345e5c0dae0aac718faea79"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4082,11 +4134,11 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
-version = "2.0.20"
+version = "2.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec86235f5fcc2a73650310756d2ac5b138a5780bbbdfae3eeccec992c435ba4f"
+checksum = "09e52cb86a36cede5cb101bf8908837b3e4c6e5e59fe7fd85c23fb56200d189e"
 dependencies = [
- "thiserror-impl 2.0.20",
+ "thiserror-impl 2.0.21",
 ]
 
 [[package]]
@@ -4102,13 +4154,13 @@ dependencies = [
 
 [[package]]
 name = "thiserror-impl"
-version = "2.0.20"
+version = "2.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc04cd3e1236dd4a98afca4569f2deb3f120e5422a4023be2cb683f8486292af"
+checksum = "fe5197923287db20a58125f0bc85c062f7f2c892de97b18c356f9efb14b28524"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.5",
+ "syn 3.0.10",
 ]
 
 [[package]]
@@ -4292,7 +4344,7 @@ version = "0.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7285e83a80ce76f5e7bce79fa41f68d78ba62d1003cf27bf748ab24413808cf4"
 dependencies = [
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -4380,6 +4432,15 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "vk-parse"
+version = "0.22.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f1840b0acd2ffbeee7d732177d235901d9ff7af369ed3f964055a97eff2b7bd"
+dependencies = [
+ "xml-rs",
+]
 
 [[package]]
 name = "volatile"
@@ -4472,7 +4533,7 @@ dependencies = [
  "bumpalo",
  "proc-macro2",
  "quote",
- "syn 3.0.5",
+ "syn 3.0.10",
  "wasm-bindgen-shared",
 ]
 
@@ -4702,7 +4763,7 @@ dependencies = [
  "pulley-interpreter",
  "smallvec",
  "target-lexicon",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "wasmparser 0.253.0",
  "wasmtime-environ",
  "wasmtime-internal-core",
@@ -4953,7 +5014,7 @@ dependencies = [
  "regalloc2",
  "smallvec",
  "target-lexicon",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "wasmparser 0.253.0",
  "wasmtime-environ",
  "wasmtime-internal-core",
@@ -5164,7 +5225,7 @@ dependencies = [
  "anyhow",
  "heck",
  "indexmap",
- "prettyplease",
+ "prettyplease 0.2.37",
  "syn 2.0.119",
  "wasm-metadata 0.258.0",
  "wit-bindgen-core",
@@ -5178,7 +5239,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "59283a01aec94f60f92ada22ffe182a5cea8acfce43be3be688de8d52df55312"
 dependencies = [
  "anyhow",
- "prettyplease",
+ "prettyplease 0.2.37",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -5313,6 +5374,12 @@ dependencies = [
  "rustversion",
  "volatile",
 ]
+
+[[package]]
+name = "xml-rs"
+version = "0.8.29"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e450f9b2ed1dff33c94c12589a87338689467b9c4f5d8a5710bd09a847d2c8a7"
 
 [[package]]
 name = "zerocopy"

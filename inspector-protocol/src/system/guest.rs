@@ -5,6 +5,7 @@ use helios_api::{
 };
 
 use crate::error::DispatchError;
+use crate::system::accept;
 use crate::system::server::{self, Dispatcher};
 
 use super::bindings::helios::system::{instances, profiling, programs, stats, tracing};
@@ -19,6 +20,7 @@ use crate::debugger::{filesystem, programs as debugger_programs};
 
 /// The embedded debugger's dispatcher: every method it exposes,
 /// answered out of the guest's own system interfaces.
+#[derive(Clone, Copy)]
 struct SystemDispatcher;
 
 impl Dispatcher for SystemDispatcher {
@@ -44,6 +46,19 @@ where
     W: AsyncWrite + Unpin,
 {
     server::serve(read, write, SystemDispatcher).await
+}
+
+/// Accepts connections from `listener` and serves each one with the
+/// embedded debugger's dispatcher, ending only when the listener fails.
+/// See [`accept::serve_sessions`].
+pub async fn serve_listener<L>(
+    listener: L,
+    report: impl FnMut(accept::SessionFault),
+) -> Result<core::convert::Infallible, L::Error>
+where
+    L: accept::Listener,
+{
+    accept::serve_sessions(listener, SystemDispatcher, report).await
 }
 
 fn supports_request(instance: &str, func: &str) -> bool {
@@ -390,6 +405,15 @@ fn map_capability_grants_to_host(
                         .collect(),
                 })
             }
+            programs::CapabilityGrant::Device(grant) => {
+                host_programs::CapabilityGrant::Device(host_programs::DeviceGrant {
+                    classes: grant
+                        .classes
+                        .into_iter()
+                        .map(map_device_class_to_host)
+                        .collect(),
+                })
+            }
         })
         .collect()
 }
@@ -448,6 +472,15 @@ fn map_link_right_to_host(right: programs::LinkRight) -> host_programs::LinkRigh
         programs::LinkRight::TargetDirectory => host_programs::LinkRight::TargetDirectory,
         programs::LinkRight::SymlinkCreate => host_programs::LinkRight::SymlinkCreate,
         programs::LinkRight::SymlinkRead => host_programs::LinkRight::SymlinkRead,
+    }
+}
+
+fn map_device_class_to_host(class: programs::DeviceClass) -> host_programs::DeviceClass {
+    match class {
+        programs::DeviceClass::Display => host_programs::DeviceClass::Display,
+        programs::DeviceClass::Input => host_programs::DeviceClass::Input,
+        programs::DeviceClass::Gpu => host_programs::DeviceClass::Gpu,
+        programs::DeviceClass::Audio => host_programs::DeviceClass::Audio,
     }
 }
 

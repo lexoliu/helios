@@ -99,6 +99,25 @@ pub struct StatsSample {
     pub audio: Vec<crate::AudioStreamSnapshot>,
 }
 
+impl StatsSample {
+    /// Drop the device, input and audio entries `authority` could not
+    /// claim.
+    ///
+    /// A claim an instance may not make is answered as if the hardware
+    /// were absent, so the inventory it can read has to agree: a listed
+    /// device would answer the existence question the claim hides.
+    pub(crate) fn restrict_to(&mut self, authority: &crate::ProcessAuthority) {
+        let granted = authority.granted_devices();
+        self.devices.retain(|device| granted.contains(&device.name));
+        if authority.derive_input_claim_cap().is_err() {
+            self.inputs.clear();
+        }
+        if authority.derive_audio_claim_cap().is_err() {
+            self.audio.clear();
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ProfileFilter {
     pub scope: Option<ProfileScope>,

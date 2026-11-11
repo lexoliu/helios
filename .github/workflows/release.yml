@@ -14,10 +14,9 @@ on:
         type: string
         required: true
 
+# Read-only by default; each job names what it writes.
 permissions:
-  contents: write
-  pull-requests: write
-  id-token: write
+  contents: read
 
 jobs:
   release-plz:
@@ -26,6 +25,12 @@ jobs:
     # that release and never cuts one.
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
+    # Tags and releases, the release pull request, and the OIDC identity
+    # crates.io trades for a publishing token.
+    permissions:
+      contents: write
+      pull-requests: write
+      id-token: write
     outputs:
       # What release-plz released, as it reports it: a JSON array of
       # `{package_name, prs, tag, version}` and a flag saying whether that
@@ -116,6 +121,9 @@ jobs:
     if: needs.kernel-release-tag.outputs.tag != ''
     runs-on: ubuntu-24.04
     timeout-minutes: 240
+    # The release's assets are the one thing this job writes.
+    permissions:
+      contents: write
     env:
       RELEASE_TAG: ${{ needs.kernel-release-tag.outputs.tag }}
     steps:

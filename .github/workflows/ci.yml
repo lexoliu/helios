@@ -84,6 +84,7 @@ jobs:
         with:
           workspaces: helios
           key: ${{ matrix.name }}
+      - uses: astral-sh/setup-uv@v6
       - name: ${{ matrix.name }}
         working-directory: helios
         run: ${{ matrix.command }}
@@ -332,6 +333,35 @@ jobs:
             smoke-runtime/*/*.log
           if-no-files-found: warn
           retention-days: 7
+      # Each boot above rebuilds the bootfs for its own `--boot-program`
+      # selection, so what the target directory holds now is the last
+      # boot's subset. A build with no selection is the superset every
+      # workload class boots from; the kernel is not relinked.
+      - name: Build the full guest image
+        id: guest-image
+        # A lane that failed before it built the inspector has nothing
+        # to build an image with.
+        if: always() && hashFiles('helios/target/release/helios-inspector') != ''
+        working-directory: helios
+        run: ./target/release/helios-inspector vm --arch riscv64 --release build
+      # The image a `--no-build` boot needs on another host, laid out as
+      # the paths under `target/` the inspector reads: unpacked into
+      # `target/`, it is the whole installation (docs/boot.md). The
+      # manifest and the key files are not part of it: nothing on the
+      # `--no-build` path reads them, and the manifest records this
+      # runner's absolute paths. The root key pair is generated per
+      # build, so the signing key the kernel carries belongs to this
+      # image alone.
+      - name: Upload the guest image
+        if: always() && steps.guest-image.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: helios-guest-riscv64
+          path: |
+            helios/target/riscv64gc-unknown-none-elf/kernel-release/helios
+            helios/target/kernel-prebuild/riscv64gc-unknown-none-elf/kernel-release/helios-bootfs
+          if-no-files-found: error
+          retention-days: 90
 
   # A native Arm Linux runner under multi-threaded TCG. This lane is a
   # functional check, not a performance surface: `ubuntu-24.04-arm`
@@ -516,6 +546,35 @@ jobs:
             smoke-runtime/*/*.log
           if-no-files-found: warn
           retention-days: 7
+      # Each boot above rebuilds the bootfs for its own `--boot-program`
+      # selection, so what the target directory holds now is the last
+      # boot's subset. A build with no selection is the superset every
+      # workload class boots from; the kernel is not relinked.
+      - name: Build the full guest image
+        id: guest-image
+        # A lane that failed before it built the inspector has nothing
+        # to build an image with.
+        if: always() && hashFiles('helios/target/release/helios-inspector') != ''
+        working-directory: helios
+        run: ./target/release/helios-inspector vm --arch aarch64 --release build
+      # The image a `--no-build` boot needs on another host, laid out as
+      # the paths under `target/` the inspector reads: unpacked into
+      # `target/`, it is the whole installation (docs/boot.md). The
+      # manifest and the key files are not part of it: nothing on the
+      # `--no-build` path reads them, and the manifest records this
+      # runner's absolute paths. The root key pair is generated per
+      # build, so the signing key the kernel carries belongs to this
+      # image alone.
+      - name: Upload the guest image
+        if: always() && steps.guest-image.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: helios-guest-aarch64
+          path: |
+            helios/target/aarch64-unknown-none/kernel-release/helios
+            helios/target/kernel-prebuild/aarch64-unknown-none/kernel-release/helios-bootfs
+          if-no-files-found: error
+          retention-days: 90
 
   smoke-x86-64:
     name: smoke-x86-64
@@ -738,6 +797,38 @@ jobs:
           grep -Fqx oob-load:before-fault oob-load-smoke.out
           grep -Fqx guest-alive oob-load-smoke.out
           ! grep -Fq 'Kernel panic' oob-load-smoke.out
+      - name: Refuse a guest-written cwasm whose signature does not verify
+        shell: bash
+        working-directory: helios
+        run: |
+          # Without this the step reports tee's status, not the
+          # command's, and a runner script that fails is invisible.
+          set -o pipefail
+          # Only bytes that came from the boot payload load without a
+          # signature check; a cwasm a guest writes must verify against
+          # the kernel's trusted roots (#483). CPython copies a bootfs
+          # cwasm to /copy unchanged and to /forged with the last byte
+          # of its payload signature flipped. The copy is still signed
+          # by the trusted root and runs; the forged one must be refused,
+          # so its marker line must not print a second time. A missing
+          # /forged is refused too, so the writes must report success.
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/unsigned-cwasm"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+            --accel kvm \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger --boot-program python3 \
+            --boot-program wasix-atomic-wait-timeout --no-compiler-plugin \
+            shell --trace-log "$runtime/guest-tracing.log" \
+            -c 'python3 -c "import pathlib; b = pathlib.Path(\"/bin/wasix-atomic-wait-timeout\").read_bytes(); pathlib.Path(\"/copy\").write_bytes(b); f = bytearray(b); f[-13] ^= 1; pathlib.Path(\"/forged\").write_bytes(bytes(f))" && echo cwasm:written; /copy && echo copy:ran; /forged && echo forged:ran || echo forged:refused' \
+            2>&1 > unsigned-cwasm-smoke.out | tee "$runtime/inspector.log"
+          cat unsigned-cwasm-smoke.out
+          grep -Fqx cwasm:written unsigned-cwasm-smoke.out
+          grep -Fqx copy:ran unsigned-cwasm-smoke.out
+          grep -Fqx forged:refused unsigned-cwasm-smoke.out
+          test "$(grep -cF forged:ran unsigned-cwasm-smoke.out)" -eq 0
+          test "$(grep -cFx atomic-wait-timeout:ok unsigned-cwasm-smoke.out)" -eq 1
+          ! grep -Fq 'Kernel panic' unsigned-cwasm-smoke.out
       - name: Time out a memory.atomic.wait nobody notifies
         # A wait that is never cut short hangs here, not in a later step.
         timeout-minutes: 5
@@ -1328,6 +1419,36 @@ jobs:
             smoke-runtime/*/*.log
           if-no-files-found: warn
           retention-days: 7
+      # Each boot above rebuilds the bootfs for its own `--boot-program`
+      # selection, so what the target directory holds now is the last
+      # boot's subset. A build with no selection is the superset every
+      # workload class boots from; the kernel, built against the fetched
+      # profile, is not relinked.
+      - name: Build the full guest image
+        id: guest-image
+        # A lane that failed before it built the inspector has nothing
+        # to build an image with.
+        if: always() && hashFiles('helios/target/release/helios-inspector') != ''
+        working-directory: helios
+        run: ./target/release/helios-inspector vm --arch x86-64 --release build
+      # The image a `--no-build` boot needs on another host, laid out as
+      # the paths under `target/` the inspector reads: unpacked into
+      # `target/`, it is the whole installation (docs/boot.md). The
+      # manifest and the key files are not part of it: nothing on the
+      # `--no-build` path reads them, and the manifest records this
+      # runner's absolute paths. The root key pair is generated per
+      # build, so the signing key the kernel carries belongs to this
+      # image alone.
+      - name: Upload the guest image
+        if: always() && steps.guest-image.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: helios-guest-x86-64
+          path: |
+            helios/target/x86_64-unknown-none/profile-use/helios
+            helios/target/kernel-prebuild/x86_64-unknown-none/profile-use/helios-bootfs
+          if-no-files-found: error
+          retention-days: 90
 
   bench:
     name: bench-${{ matrix.name }}

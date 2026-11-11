@@ -302,7 +302,7 @@ impl<T: VirtioTransport> VirtioVsockDevice<T> {
         transport: &T,
         payload: &mut [u8],
     ) -> IoResult<Option<VsockReceived>> {
-        let Some((token, used_len)) = state.queue.pop_used_with_len() else {
+        let Some((token, used_len)) = state.queue.pop_used_with_len()? else {
             return Ok(None);
         };
         let slot_index = usize::from(
@@ -348,7 +348,7 @@ impl<T: VirtioTransport> VirtioVsockDevice<T> {
     fn drain_events(state: &mut VsockEventState<T>, transport: &T) -> IoResult<bool> {
         let mut reset = false;
         let mut drained = false;
-        while let Some((token, used_len)) = state.queue.pop_used_with_len() {
+        while let Some((token, used_len)) = state.queue.pop_used_with_len()? {
             drained = true;
             let index = usize::from(
                 *state
@@ -420,7 +420,7 @@ impl<T: VirtioTransport> VsockDevice for VirtioVsockDevice<T> {
         await_completion(&self.tx_inflight, &self.tx_queue, token, || {
             self.interrupts.notified()
         })
-        .await;
+        .await?;
         Ok(())
     }
 
