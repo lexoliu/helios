@@ -818,6 +818,7 @@ where
                 fill_random(
                     caller.data().memory(),
                     &caller.data().shared.entropy,
+                    caller.data().runtime_state.root_entropy(),
                     ptr as u32,
                     len as u32,
                 )
@@ -1936,7 +1937,10 @@ where
     HostFs: crate::HostFileSystem,
 {
     let mut bytes = vec![0; len as usize];
-    caller.data_mut().entropy.fill_secure(&mut bytes);
+    let store = caller.data_mut();
+    store
+        .entropy
+        .fill_secure(store.runtime_state.root_entropy(), &mut bytes);
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
@@ -2804,7 +2808,14 @@ where
             Ok(service) => service,
             Err(error) => return p1_errno_from_fs(error),
         };
-        let entries = match service.read_dir(&host_path).await {
+        // The whole listing is mirrored, so the bound is the mirror's.
+        let entries = match service
+            .read_dir(
+                &host_path,
+                crate::wasmtime_adapter::wasi::GUEST_DIRECTORY_MIRROR_LIMIT,
+            )
+            .await
+        {
             Ok(entries) => entries,
             Err(error) => {
                 return p1_errno_from_fs(crate::wasmtime_adapter::wasi::map_host_fs_error(error));
@@ -3255,8 +3266,12 @@ where
                     .map_err(p1_errno_from_fs)?;
             }
             if kind != FsNodeKind::File {
+                // The whole listing is mirrored, so the bound is the mirror's.
                 let entries = service
-                    .read_dir(&host_path)
+                    .read_dir(
+                        &host_path,
+                        crate::wasmtime_adapter::wasi::GUEST_DIRECTORY_MIRROR_LIMIT,
+                    )
                     .await
                     .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
                     .map_err(p1_errno_from_fs)?;

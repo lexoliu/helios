@@ -41,7 +41,7 @@ pub use hash::{
 };
 pub use ndp::{
     Ipv6DnsServers, Ipv6RouterConfiguration, MAX_ADVERTISED_PREFIXES, MAX_IPV6_DNS_SERVERS,
-    MAX_ROUTER_SOLICITATIONS, NeighborDiscovery, ROUTER_SOLICITATION_INTERVAL_NANOS,
+    MAX_ROUTER_SOLICITATIONS, NeighborDiscovery, OnLinkPrefix, ROUTER_SOLICITATION_INTERVAL_NANOS,
     SLAAC_PREFIX_LEN, interpret_router_advertisement,
 };
 pub use packet::{
@@ -866,4 +866,10 @@ pub enum StackError {
     /// Multicast membership storage was exhausted.
     #[error("network multicast membership table is full")]
     MulticastMembershipTableFull,
+    /// Route storage was exhausted and nothing could be displaced.
+    #[error("network route table is full")]
+    RouteTableFull,
+    /// Interface address storage was exhausted.
+    #[error("network address table is full")]
+    AddressTableFull,
 }
