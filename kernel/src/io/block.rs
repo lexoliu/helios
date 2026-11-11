@@ -565,8 +565,13 @@ mod tests {
 
     fn root() -> RootEntropyHandle {
         RootEntropyHandle::new(
-            RootEntropy::from_platform(&TestCpu::with_entropy(0x5a), None, None)
-                .expect("the test CPU has an entropy source"),
+            RootEntropy::from_platform(
+                &TestCpu::with_entropy(0x5a),
+                None,
+                None,
+                crate::MachineGeneration::new(None),
+            )
+            .expect("the test CPU has an entropy source"),
         )
     }
 

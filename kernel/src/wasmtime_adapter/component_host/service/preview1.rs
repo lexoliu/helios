@@ -818,6 +818,7 @@ where
                 fill_random(
                     caller.data().memory(),
                     &caller.data().shared.entropy,
+                    caller.data().runtime_state.root_entropy(),
                     GuestAddress::wasm32(ptr as u32),
                     len as u32,
                 )
@@ -1956,7 +1957,10 @@ where
     HostFs: crate::HostFileSystem,
 {
     let mut bytes = vec![0; len as usize];
-    caller.data_mut().entropy.fill_secure(&mut bytes);
+    let store = caller.data_mut();
+    store
+        .entropy
+        .fill_secure(store.runtime_state.root_entropy(), &mut bytes);
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };

@@ -24,7 +24,7 @@ from bench_stub import fake_checkout, fake_inspector, records, workload
 from helios_bench.baseline import Baseline
 from helios_bench.cli import main as cli_main
 from helios_bench.gate import GateKind, evaluate, evaluate_paired, gate_report
-from helios_bench.manifest import load_manifest
+from helios_bench.manifest import WasmtimePin, load_manifest
 from helios_bench.plots import plot_report
 from helios_bench.render import render_gate, render_pins, render_tables
 from helios_bench.report import InstructionSampling, Report, Side, load_report, save_report
@@ -49,6 +49,8 @@ WORKLOADS = [
     workload("cpython-json", "compute"),
     workload("hostcall-loop", "hostcall"),
 ]
+
+BASELINE_FORK = WasmtimePin(repository="lexoliu/wasmtime", revision="2fb47b20" + "0" * 32)
 
 
 def boot_order(order_log: Path) -> list[tuple[str, str, str, str]]:
@@ -481,7 +483,13 @@ def test_the_driver_parses_the_baseline_flags_the_plan_emits(tmp_path, reuse) ->
         out_dir=tmp_path,
         advisory=True,
         sides=frozenset({Side.HELIOS, Side.HELIOS_BASELINE}),
-        baseline=Baseline(ref="merge-base", sha="a" * 40, worktree=tmp_path / "worktree"),
+        baseline=Baseline(
+            ref="merge-base",
+            sha="a" * 40,
+            worktree=tmp_path / "worktree",
+            wasmtime=BASELINE_FORK,
+            fork_root="",
+        ),
         network=NetworkOptions(reuse_host_listeners=reuse),
     )
     commands = [
@@ -635,6 +643,35 @@ def test_a_paired_report_names_each_side_tooling_revision(paired_regression_repo
     pins = render_pins(paired_regression_report)
     assert f"| `helios-inspector`/`helios-cli` | `{run.inspector_git_sha}` |" in pins
     assert f"| `helios-inspector`/`helios-cli`, baseline | `{run.baseline_inspector_git_sha}` |" in pins
+
+
+def test_a_paired_report_names_each_columns_wasmtime_fork(paired_regression_report: Report) -> None:
+    """#486: each column is built against the fork its own commit pins,
+    and the header, the pins table and the gate's column labels name it."""
+    candidate_fork = paired_regression_report.pins.wasmtime_revision
+    baseline_fork = "2fb47b20" + "c" * 32
+    report = paired_regression_report.model_copy(
+        update={
+            "pins": paired_regression_report.pins.model_copy(
+                update={"baseline_wasmtime_revision": baseline_fork}
+            )
+        }
+    )
+    tables = render_tables(report)
+    header = next(line for line in tables.splitlines() if line.startswith("Helios `"))
+    assert f"Wasmtime `{candidate_fork[:12]}`" in header
+    assert f"Wasmtime `{baseline_fork[:12]}`" in header
+    pins = render_pins(report)
+    assert f"| Vendored Wasmtime | `{candidate_fork}` |" in pins
+    assert f"| Vendored Wasmtime, baseline | `{baseline_fork}` |" in pins
+    result = evaluate_paired(report)
+    assert result is not None
+    assert f"Wasmtime `{candidate_fork[:12]}`" in result.candidate_label
+    assert f"Wasmtime `{baseline_fork[:12]}`" in result.baseline_label
+    # A report from before the field names no column's fork rather than
+    # the candidate's for both.
+    legacy = evaluate_paired(paired_regression_report)
+    assert legacy is not None and "Wasmtime" not in legacy.baseline_label + legacy.candidate_label
 
 
 def test_an_unpaired_report_keeps_its_three_columns(baseline_report: Report) -> None:
@@ -1168,7 +1205,9 @@ def test_a_paired_baseline_can_carry_its_own_profile(tmp_path) -> None:
         out_dir=tmp_path / "out",
         advisory=True,
         sides=frozenset({Side.HELIOS, Side.HELIOS_BASELINE, Side.HELIOS_BASELINE_REBUILD}),
-        baseline=Baseline(ref="dev", sha="b" * 40, worktree=tmp_path / "worktree"),
+        baseline=Baseline(
+            ref="dev", sha="b" * 40, worktree=tmp_path / "worktree", wasmtime=BASELINE_FORK, fork_root=""
+        ),
         baseline_profile_use=profile,
         baseline_rebuild_profile_use=rebuild,
     )
@@ -1209,7 +1248,9 @@ def test_a_per_run_baseline_profile_needs_its_rebuild(tmp_path) -> None:
         "out_dir": tmp_path / "out",
         "advisory": True,
         "sides": frozenset({Side.HELIOS, Side.HELIOS_BASELINE, Side.HELIOS_BASELINE_REBUILD}),
-        "baseline": Baseline(ref="dev", sha="b" * 40, worktree=tmp_path / "worktree"),
+        "baseline": Baseline(
+            ref="dev", sha="b" * 40, worktree=tmp_path / "worktree", wasmtime=BASELINE_FORK, fork_root=""
+        ),
     }
     with pytest.raises(SystemExit, match="--baseline-rebuild-profile-use"):
         RunOptions(**common, baseline_profile_use=profile)
@@ -1245,7 +1286,9 @@ def test_the_plain_control_reads_no_profile(tmp_path) -> None:
             out_dir=tmp_path / "out",
             advisory=True,
             sides=frozenset({Side.HELIOS, Side.HELIOS_BASELINE}),
-            baseline=Baseline(ref="dev", sha="b" * 40, worktree=tmp_path / "worktree"),
+            baseline=Baseline(
+                ref="dev", sha="b" * 40, worktree=tmp_path / "worktree", wasmtime=BASELINE_FORK, fork_root=""
+            ),
             baseline_profile_use=profile,
             plain_baseline=True,
         )
@@ -1276,7 +1319,9 @@ def test_a_per_column_baseline_profile_names_itself(tmp_path, monkeypatch) -> No
         out_dir=tmp_path / "out",
         advisory=True,
         sides=frozenset({Side.HELIOS, Side.HELIOS_BASELINE, Side.HELIOS_BASELINE_REBUILD}),
-        baseline=Baseline(ref="dev", sha="b" * 40, worktree=tmp_path / "worktree"),
+        baseline=Baseline(
+            ref="dev", sha="b" * 40, worktree=tmp_path / "worktree", wasmtime=BASELINE_FORK, fork_root=""
+        ),
         profile_use=tmp_path / "pgo-candidate" / "helios-kernel.profdata",
         baseline_profile_use=profile,
         baseline_rebuild_profile_use=rebuild,
@@ -1484,7 +1529,13 @@ def test_the_sampling_record_reaches_the_run_record(tmp_path, monkeypatch) -> No
         out_dir=tmp_path,
         advisory=True,
         sides=frozenset({Side.HELIOS, Side.HELIOS_BASELINE}),
-        baseline=Baseline(ref="merge-base", sha="a" * 40, worktree=tmp_path / "worktree"),
+        baseline=Baseline(
+            ref="merge-base",
+            sha="a" * 40,
+            worktree=tmp_path / "worktree",
+            wasmtime=BASELINE_FORK,
+            fork_root="",
+        ),
     )
     monkeypatch.setenv("HELIOS_BENCH_INSTRUCTION_PROFILE", "1")
     (tmp_path / "helios").mkdir()

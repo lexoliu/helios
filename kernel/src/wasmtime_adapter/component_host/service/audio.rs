@@ -48,10 +48,10 @@ use super::super::StoreData;
 /// Register `helios:system/audio` in a linker.
 ///
 /// Every program linker gets it, for the reason the display and input
-/// interfaces do: the claim is the capability, not the import. A program
-/// that never claims a stream learns nothing from having the import, and
-/// one that claims on a machine with no sound device is told
-/// `unavailable`.
+/// interfaces do: linkage is cached per binary while authority belongs
+/// to the instance. `available` and `claim` check the instance's audio
+/// device class, and an instance without it is told what a machine with
+/// no sound device tells every program: no streams, and `unavailable`.
 pub(in crate::wasmtime_adapter::component_host) fn add_audio_to_linker<CpuImpl, Net, HostFs>(
     linker: &mut Linker<StoreData<CpuImpl, Net, HostFs>>,
 ) -> wasmtime::Result<()>
@@ -201,6 +201,11 @@ where
     HostFs: crate::HostFileSystem,
 {
     fn available(&mut self) -> wasmtime::Result<Vec<audio_wit::StreamInfo>> {
+        // Without the audio class the list is the one a machine with no
+        // sound device gives.
+        if self.process_authority().derive_audio_claim_cap().is_err() {
+            return Ok(Vec::new());
+        }
         let Some(service) = self.runtime_state.audio_service() else {
             return Ok(Vec::new());
         };
@@ -214,7 +219,10 @@ where
         let Some(service) = self.runtime_state.audio_service() else {
             return Ok(Err(audio_wit::Error::Unavailable));
         };
-        if let Err(error) = self.device.claim_audio(&service, stream) {
+        let Ok(cap) = self.process_authority().derive_audio_claim_cap() else {
+            return Ok(Err(audio_wit::Error::Unavailable));
+        };
+        if let Err(error) = self.device.claim_audio(&service, stream, cap) {
             tracing::warn!(
                 target: "helios_kernel::audio",
                 ?error,
