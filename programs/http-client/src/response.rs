@@ -19,18 +19,14 @@ use zenwave::{Body, BodyFrame, Response};
 use crate::error::body_code;
 use crate::fields::{Section, build_fields};
 
+/// Where a response's trailers, or the failure that ended its body, go.
+pub type TrailersWriter = FutureWriter<Result<Option<Fields>, ErrorCode>>;
+
 /// The `wasi:http` response for `response`'s head, and the two writers its
 /// body and trailers are delivered through.
 pub fn to_wasi(
     response: &Response,
-) -> Result<
-    (
-        types::Response,
-        StreamWriter<u8>,
-        FutureWriter<Result<Option<Fields>, ErrorCode>>,
-    ),
-    ErrorCode,
-> {
+) -> Result<(types::Response, StreamWriter<u8>, TrailersWriter), ErrorCode> {
     let fields = build_fields(wire_fields(response.headers()), Section::Headers)?;
     let (contents_writer, contents) = wit_stream::new::<u8>();
     let (trailers_writer, trailers) =
@@ -57,7 +53,7 @@ pub async fn pump(
     mut body: Body,
     scheme: Scheme,
     mut writer: StreamWriter<u8>,
-    trailers_writer: FutureWriter<Result<Option<Fields>, ErrorCode>>,
+    trailers_writer: TrailersWriter,
 ) {
     let outcome = copy(&mut body, matches!(scheme, Scheme::Https), &mut writer).await;
     // `wasi:http` requires the content stream to be closed before the trailers

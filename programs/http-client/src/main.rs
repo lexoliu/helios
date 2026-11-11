@@ -27,17 +27,19 @@ mod response;
 
 use std::time::Duration;
 
+use futures_channel::oneshot;
 use helios_api::http::handler::Guest;
 use helios_api::http::types;
-use helios_api::http::{ErrorCode, RequestOptions};
+use helios_api::http::{ErrorCode, RequestOptions, Scheme};
 use helios_api::http_kit::{HeliosExecutor, HeliosNet};
 use helios_api::task::spawn;
 use http::StatusCode;
 use zenwave::backend::NativeBackend;
 use zenwave::transport::Proxy;
-use zenwave::{Endpoint, Timeouts, Transport};
+use zenwave::{Body, Endpoint, Timeouts, Transport};
 
 use crate::error::code;
+use crate::request::BodyOutcome;
 
 mod bindings {
     pub use ::helios_api::bindings::*;
@@ -85,20 +87,39 @@ async fn handle(request: types::Request) -> Result<types::Response, ErrorCode> {
         let options = request.get_options();
         timeouts(options.as_ref())
     };
-    let (mut http, scheme, outcome) = request::into_http(request)?;
+    let (mut http, scheme, outcome, verdict) = request::into_http(request)?;
     http.extensions_mut().insert(timeouts);
+    // The caller's verdict on its body settles from the body or from the
+    // exchange, whichever ends first, so it waits on both in a task of its
+    // own.
+    let (failed, failure) = oneshot::channel();
+    spawn(verdict.settle(failure));
+    let exchanged = exchange(http, scheme, &outcome).await;
+    if let Err(code) = &exchanged {
+        // An error here means the body already decided the verdict.
+        let _ = failed.send(code.clone());
+    }
+    exchanged
+}
 
+/// Send the request and turn the response head into the caller's response,
+/// leaving its body to stream in a task of its own.
+async fn exchange(
+    mut http: http::Request<Body>,
+    scheme: Scheme,
+    outcome: &BodyOutcome,
+) -> Result<types::Response, ErrorCode> {
     // No proxy: a guest reaches the network directly.
     let transport = Transport::builder()
         .proxy(Proxy::none())
         .build()
-        .map_err(|error| code(&error, &outcome))?;
+        .map_err(|error| code(&error, outcome))?;
     let mut backend =
         NativeBackend::on_current_thread(transport, HeliosNet, HeliosNet, &HeliosExecutor);
     let response = backend
         .respond(&mut http)
         .await
-        .map_err(|error| code(&error, &outcome))?;
+        .map_err(|error| code(&error, outcome))?;
     if response.status() == StatusCode::SWITCHING_PROTOCOLS {
         // Nothing in this client asks for an upgrade, so a switch leaves the
         // connection speaking a protocol it cannot read.
