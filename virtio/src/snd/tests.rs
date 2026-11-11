@@ -270,7 +270,7 @@ fn report(device: &VirtioSndDevice<FakeTransport>, token: u16, code: u32, data: 
         .try_lock()
         .expect("a parked driver does not hold the event queue lock");
     let index = usize::from(state.slot_for_token[usize::from(token)]);
-    let slot = &mut state.slots[index * EVENT_BYTES..(index + 1) * EVENT_BYTES];
+    let slot = state.slots.slot_mut(index);
     slot[0..4].copy_from_slice(&code.to_le_bytes());
     slot[4..8].copy_from_slice(&data.to_le_bytes());
     state.queue.device_complete(token, EVENT_BYTES as u32);
@@ -747,6 +747,31 @@ fn a_park_leaves_no_interrupt_outstanding() {
         !device.transport.ack_interrupt().used_buffer,
         "the park cleared the interrupt the device had raised"
     );
+}
+
+/// A command dropped while the device holds it keeps its slot, so the
+/// bytes the device reads are still the command's and the next command
+/// gets a slot of its own.
+#[test]
+fn a_dropped_control_command_keeps_its_slot_until_the_device_completes_it() {
+    let device = device();
+    let token = {
+        let mut dropped = pin!(device.set_params(STREAM, params()));
+        pending_control(&device, dropped.as_mut())
+    };
+    let request = control_request(&device, token);
+    assert_eq!(command_of(&request), R_PCM_SET_PARAMS);
+    assert!(!device.control_inflight.is_idle(token));
+
+    let mut next = pin!(device.set_params(STREAM, params()));
+    let second = pending_control(&device, next.as_mut());
+    assert_ne!(token, second, "the held slot is not handed out again");
+    assert_eq!(control_request(&device, token), request);
+
+    answer_control(&device, token, &S_OK.to_le_bytes());
+    // Whichever waiter drains the used ring routes the late completion.
+    assert!(block_on(poll_once(next.as_mut())).is_none());
+    assert!(device.control_inflight.is_idle(token));
 }
 
 /// The same obligation on the bring-up path, where nothing waits on an

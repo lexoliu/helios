@@ -37,7 +37,7 @@
 //!
 //! Every entry point takes `&self` and may be called from any
 //! processor. Commands go up the same shared control queue the 2D half
-//! uses, through the same `submit_chain` / `await_completion` pair, so
+//! uses, through the same `submit_control` / `await_completion` pair, so
 //! the queue lock is held only long enough to publish a chain and never
 //! across an await. The context table and the blob table are spin
 //! mutexes over fixed arrays, taken for a lookup or an insertion and
@@ -165,7 +165,7 @@ const SUBMIT_3D_BYTES: usize = CTRL_HEADER_BYTES + 8;
 /// `struct virtio_gpu_resource_create_blob`: a resource id, the memory
 /// kind, the usage flags, the entry count, the renderer's own handle
 /// and the size.
-const CREATE_BLOB_BYTES: usize = CTRL_HEADER_BYTES + 16 + 16;
+pub(super) const CREATE_BLOB_BYTES: usize = CTRL_HEADER_BYTES + 16 + 16;
 /// `struct virtio_gpu_resource_map_blob`: a resource id, its padding
 /// and the aperture offset.
 const MAP_BLOB_BYTES: usize = CTRL_HEADER_BYTES + 8 + 8;
@@ -221,7 +221,9 @@ impl<T: VirtioTransport> VirtioGpuDevice<T> {
         expected: u32,
         subject: RenderSubject,
     ) -> Gpu3dResult<u32> {
-        let written = self.control_exchange(inputs, &mut [response]).await?;
+        let written = self
+            .control_exchange(inputs, None, response, &mut [])
+            .await?;
         if (written as usize) < CTRL_HEADER_BYTES {
             return Err(IoError::DeviceFault.into());
         }
@@ -407,13 +409,14 @@ impl<T: VirtioTransport> Gpu3d for VirtioGpuDevice<T> {
             return Err(Gpu3dError::Unsupported);
         }
         let request = encode_get_capset(id, version);
-        // The reply is a header followed by the bytes themselves, and
-        // the bytes land in the caller's buffer rather than in one of
-        // this driver's: a capability set runs to tens of kilobytes and
-        // copying it twice would be the largest thing this driver did.
+        // The reply is a header followed by the bytes themselves. The
+        // header lands in the command's control slot, and the bytes in
+        // the caller's buffer rather than in one of this driver's: a
+        // capability set runs to tens of kilobytes and copying it twice
+        // would be the largest thing this driver did.
         let mut header = [0_u8; CTRL_HEADER_BYTES];
         let written = self
-            .control_exchange(&[&request], &mut [&mut header, out])
+            .control_exchange(&[&request], None, &mut header, &mut [out])
             .await?;
         if (written as usize) < CTRL_HEADER_BYTES {
             return Err(IoError::DeviceFault.into());
@@ -664,7 +667,7 @@ impl<T: VirtioTransport> Gpu3d for VirtioGpuDevice<T> {
         // the buffer where the guest wrote it, and this driver never
         // holds a copy of a command stream.
         let taken = self
-            .control_exchange_with_payload(&[&request], Some(commands), &mut [&mut response])
+            .control_exchange(&[&request], Some(commands), &mut response, &mut [])
             .await;
         // The fence is retired before the answer is read, and whatever
         // the answer is: a fenced command is completed only once its

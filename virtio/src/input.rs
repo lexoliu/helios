@@ -33,7 +33,7 @@
 //! `next_event` serialises on the event ring's own async mutex, parks
 //! on the device interrupt when the ring is empty, and never holds the
 //! lock across an await. `set_led` goes the other way on the status
-//! queue, through the shared `submit_chain`/`await_completion` pair, so
+//! queue, through the shared `submit_control`/`await_completion` pair, so
 //! several tasks may have a status event in flight at once and neither
 //! direction waits behind the other. Both are safe to call from any
 //! processor. `handle_interrupt` runs in interrupt context: it
@@ -48,10 +48,13 @@ use helios_hal::input::{
 };
 use helios_hal::io::{IoError, IoResult};
 
+use crate::bus::DeviceBus;
 use crate::features::{NegotiatedFeatures, RING_FEATURES, negotiate};
-use crate::inflight::{InFlight, await_completion, submit_chain};
+use crate::inflight::{InFlight, await_completion, submit_control};
 use crate::notify::Notify;
-use crate::queue::{VirtQueue, negotiated_queue_size};
+use crate::queue::{
+    ControlSlots, Part, SlotPool, TransportBuffer, VirtQueue, control_slots, negotiated_queue_size,
+};
 use crate::transport::{DeviceStatus, DeviceType, VirtioTransport};
 
 /// The queue the device reports events on (virtio 1.2 §5.8.2).
@@ -119,10 +122,11 @@ const ABSINFO_BYTES: usize = 20;
 /// reposted before the lock is released.
 struct EventRing<T: VirtioTransport> {
     queue: VirtQueue<T>,
-    /// One `EVENT_BYTES` slot per descriptor, in one allocation:
-    /// the pool is fixed at bring-up and every slot has the same size,
-    /// so there is nothing for a per-slot allocation to express.
-    slots: Box<[u8]>,
+    /// One `EVENT_BYTES` slot per descriptor, in one device-reachable
+    /// allocation: the pool is fixed at bring-up and every slot has the
+    /// same size, so there is nothing for a per-slot allocation to
+    /// express.
+    slots: SlotPool<TransportBuffer<T>>,
     /// Which slot each outstanding descriptor identifier carries.
     slot_for_token: Box<[u16]>,
 }
@@ -133,6 +137,8 @@ pub struct VirtioInputDevice<T: VirtioTransport> {
     events: AsyncMutex<EventRing<T>>,
     status_queue: AsyncMutex<VirtQueue<T>>,
     status_inflight: InFlight<{ STATUS_QUEUE_SIZE as usize }>,
+    /// The indicator event the device reads, one slot per descriptor.
+    status_slots: ControlSlots<TransportBuffer<T>>,
     interrupts: Notify,
     features: NegotiatedFeatures,
 }
@@ -163,10 +169,12 @@ impl<T: VirtioTransport> VirtioInputDevice<T> {
             features,
         )?;
 
-        let mut slots = vec![0_u8; usize::from(event_size) * EVENT_BYTES].into_boxed_slice();
+        let status_slots = control_slots(&transport, &status_queue, EVENT_BYTES, 0)?;
+
+        let mut slots = SlotPool::new(transport.bus().dma(), usize::from(event_size), EVENT_BYTES)?;
         let mut slot_for_token = vec![0_u16; usize::from(event_size)].into_boxed_slice();
         for index in 0..usize::from(event_size) {
-            let slot = &mut slots[index * EVENT_BYTES..(index + 1) * EVENT_BYTES];
+            let slot = slots.slot_mut(index);
             let token = event_queue.submit_output_deferred(&transport, slot)?;
             slot_for_token[usize::from(token)] =
                 u16::try_from(index).map_err(|_| IoError::DeviceFault)?;
@@ -196,6 +204,7 @@ impl<T: VirtioTransport> VirtioInputDevice<T> {
             }),
             status_queue: AsyncMutex::new(status_queue),
             status_inflight: InFlight::new(),
+            status_slots,
             interrupts: Notify::new(),
             features,
         })
@@ -229,9 +238,7 @@ impl<T: VirtioTransport> VirtioInputDevice<T> {
                 .get(usize::from(token))
                 .ok_or(IoError::DeviceFault)?,
         );
-        let slot = slots
-            .get_mut(index * EVENT_BYTES..(index + 1) * EVENT_BYTES)
-            .ok_or(IoError::DeviceFault)?;
+        let slot = slots.slot_mut(index);
         // The slot goes back to the device whatever the event turns out
         // to be: a fault that also leaked a buffer would shrink the ring
         // on top of dropping the event.
@@ -293,18 +300,16 @@ impl<T: VirtioTransport> InputDevice for VirtioInputDevice<T> {
             return Err(IoError::Unsupported);
         }
         let event = encode_event(InputEvent::new(codes::EV_LED, code, i32::from(on)));
-        let token = submit_chain(
+        let ticket = submit_control(
             &self.status_inflight,
             &self.status_queue,
             &self.transport,
-            &[&event],
-            &mut [],
+            &self.status_slots,
+            &[Part::Request(&event)],
         )
         .await?;
-        await_completion(&self.status_inflight, &self.status_queue, token, || {
-            self.interrupts.notified()
-        })
-        .await?;
+        let _reply =
+            await_completion(&self.status_queue, ticket, || self.interrupts.notified()).await?;
         Ok(())
     }
 }
@@ -499,7 +504,7 @@ mod tests {
         CFG_ABS_INFO, CFG_ID_DEVIDS, CFG_ID_NAME, CFG_ID_SERIAL, CFG_PROP_BITS, DeviceType,
         EVENT_BYTES, IoError, VirtioInputDevice, encode_event,
     };
-    use crate::testing::{FakeTransport, FakeTransportConfig};
+    use crate::testing::{ConfinedTransport, FakeTransport, FakeTransportConfig};
     use crate::transport::VirtioFeatures;
     use alloc::format;
     use alloc::vec::Vec;
@@ -515,7 +520,7 @@ mod tests {
     /// presents: a name, the device ids it shares with the other HID
     /// devices, autorepeat declared with no codes at all, the three
     /// keyboard indicators, and a key bitmap.
-    fn keyboard() -> FakeTransport {
+    fn keyboard() -> ConfinedTransport {
         let transport = transport();
         transport.set_config_block(CFG_ID_NAME, 0, b"QEMU Virtio Keyboard\0");
         transport.set_config_block(CFG_ID_DEVIDS, 0, &devids(0x0006, 0x0627, 0x0001, 0x0001));
@@ -535,7 +540,7 @@ mod tests {
 
     /// QEMU's `virtio-tablet`: pointer buttons, a wheel, and the two
     /// absolute axes whose ranges are what make it a tablet.
-    fn tablet() -> FakeTransport {
+    fn tablet() -> ConfinedTransport {
         let transport = transport();
         transport.set_config_block(CFG_ID_NAME, 0, b"QEMU Virtio Tablet\0");
         transport.set_config_block(CFG_ID_DEVIDS, 0, &devids(0x0006, 0x0627, 0x0003, 0x0002));
@@ -558,7 +563,7 @@ mod tests {
 
     /// QEMU's `virtio-mouse`: the same buttons, relative axes, and no
     /// absolute axis at all.
-    fn mouse() -> FakeTransport {
+    fn mouse() -> ConfinedTransport {
         let transport = transport();
         transport.set_config_block(CFG_ID_NAME, 0, b"QEMU Virtio Mouse\0");
         transport.set_config_block(CFG_ID_SERIAL, 0, b"mouse-0\0");
@@ -576,8 +581,10 @@ mod tests {
         transport
     }
 
-    fn transport() -> FakeTransport {
-        FakeTransport::new(FakeTransportConfig {
+    /// A transport whose device reaches only memory its own pool handed
+    /// out: a slot or a ring, never a driver's local.
+    fn transport() -> ConfinedTransport {
+        FakeTransport::confined(FakeTransportConfig {
             device_type: DeviceType::Input,
             offered_features: VirtioFeatures::VERSION_1.bits(),
             queue_size: 8,
@@ -615,13 +622,15 @@ mod tests {
 
     /// Plays the device: writes `event` into the slot descriptor `token`
     /// carries, publishes the completion, and raises the interrupt.
-    fn report(device: &VirtioInputDevice<FakeTransport>, token: u16, event: InputEvent) {
+    fn report(device: &VirtioInputDevice<ConfinedTransport>, token: u16, event: InputEvent) {
         let mut state = device
             .events
             .try_lock()
             .expect("a parked driver does not hold the event queue lock");
         let index = usize::from(state.slot_for_token[usize::from(token)]);
-        state.slots[index * EVENT_BYTES..(index + 1) * EVENT_BYTES]
+        state
+            .slots
+            .slot_mut(index)
             .copy_from_slice(&encode_event(event));
         state.queue.device_complete(token, EVENT_BYTES as u32);
         drop(state);
@@ -828,6 +837,48 @@ mod tests {
         assert_eq!(
             block_on(poll_once(pin!(device.set_led(codes::LED_KANA, true)))),
             Some(Err(IoError::Unsupported))
+        );
+    }
+
+    /// The indicator event is copied into the request's slot, so the
+    /// device still finds it intact after the request that sent it has
+    /// been dropped, and the slot is released by the device's answer.
+    #[test]
+    fn an_indicator_event_survives_its_dropped_request() {
+        let device = VirtioInputDevice::new(keyboard()).expect("a keyboard initializes");
+        let lit = InputEvent::new(codes::EV_LED, codes::LED_CAPSL, 1);
+        {
+            let mut set = pin!(device.set_led(codes::LED_CAPSL, true));
+            assert!(block_on(poll_once(set.as_mut())).is_none());
+        }
+        assert_eq!(
+            device
+                .status_queue
+                .try_lock()
+                .expect("nothing holds the status queue")
+                .device_request(0),
+            encode_event(lit)
+        );
+        assert!(
+            !device.status_inflight.is_idle(0),
+            "the device has not answered, so the slot is still its"
+        );
+
+        device
+            .status_queue
+            .try_lock()
+            .expect("nothing holds the status queue")
+            .device_complete(0, 0);
+        device.handle_interrupt();
+        let mut next = pin!(device.set_led(codes::LED_CAPSL, false));
+        assert!(block_on(poll_once(next.as_mut())).is_none());
+        assert!(
+            block_on(poll_once(next.as_mut())).is_none(),
+            "the second request is its own"
+        );
+        assert!(
+            device.status_inflight.is_idle(0),
+            "the answer to the dropped request released its slot"
         );
     }
 

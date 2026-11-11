@@ -35,9 +35,11 @@ use helios_hal::resource::KernelResource;
 use helios_hal::vmm::SwapBackend;
 
 use crate::features::{NegotiatedFeatures, RING_FEATURES, negotiate};
-use crate::inflight::{InFlight, await_completion, submit_chain};
+use crate::inflight::{InFlight, Reply, await_completion, submit_control};
 use crate::notify::Notify;
-use crate::queue::{MAX_CHAIN_BUFFERS, VirtQueue};
+use crate::queue::{
+    ControlSlots, MAX_CHAIN_BUFFERS, Part, TransportBuffer, VirtQueue, control_slots,
+};
 use crate::transport::{DeviceStatus, DeviceType, VirtioTransport};
 
 /// virtio-blk addresses every request in 512-byte sectors regardless of
@@ -145,7 +147,23 @@ enum ReqType {
 struct BlockQueue<T: VirtioTransport> {
     queue: Mutex<VirtQueue<T>>,
     inflight: InFlight<BLOCK_QUEUE_SLOTS>,
+    /// The request header, the discard and write-zeroes segment list and
+    /// the status byte (and the identifier a `GET_ID` fills in) of every
+    /// request in flight, one slot per descriptor.
+    slots: ControlSlots<TransportBuffer<T>>,
 }
+
+/// The bytes of a request the device reads from its control slot: the
+/// header, and for discard and write-zeroes the segment list after it.
+const REQUEST_SLOT_BYTES: usize =
+    size_of::<BlkReq>() + DEALLOCATE_SEGMENTS * size_of::<BlkDeallocate>();
+
+/// The bytes the device writes to a control slot: the identifier a
+/// `GET_ID` reports, then the one status byte every request ends with.
+const RESPONSE_SLOT_BYTES: usize = BLOCK_ID_BYTES + size_of::<u8>();
+
+/// The response area of a request that reports nothing but its status.
+const STATUS_ONLY: &[usize] = &[size_of::<u8>()];
 
 /// Requests the device has completed, by kind.
 #[derive(Debug, Default)]
@@ -443,15 +461,12 @@ impl<T: VirtioTransport, C: QueueAffinity> VirtioBlockDevice<T, C> {
                     "virtio-blk queue is too small to carry one request chain",
                 ));
             }
+            let queue = VirtQueue::new(&transport, index, queue_size, chain_limit, features)?;
+            let slots = control_slots(&transport, &queue, REQUEST_SLOT_BYTES, RESPONSE_SLOT_BYTES)?;
             queues.push(BlockQueue {
-                queue: Mutex::new(VirtQueue::new(
-                    &transport,
-                    index,
-                    queue_size,
-                    chain_limit,
-                    features,
-                )?),
+                queue: Mutex::new(queue),
                 inflight: InFlight::new(),
+                slots,
             });
         }
 
@@ -590,15 +605,21 @@ impl<T: VirtioTransport, C: QueueAffinity> VirtioBlockDevice<T, C> {
             let len = cmp::min(stride, buf.len() - offset);
             let sector = self.sector_of(block_id + offset / block_bytes);
             let request = BlkReq::new(ReqType::In, sector);
-            let mut status = 0_u8;
             let mut segments: ArrayVec<&mut [u8], MAX_CHAIN_BUFFERS> = ArrayVec::new();
             for segment in buf[offset..offset + len].chunks_mut(self.limits.segment_bytes) {
                 segments.push(segment);
             }
-            let used = self
-                .execute(ReqType::In, &request, &[], &mut segments, &mut status)
+            let reply = self
+                .execute(
+                    ReqType::In,
+                    &[as_bytes(&request)],
+                    &[],
+                    &mut segments,
+                    STATUS_ONLY,
+                )
                 .await?;
-            map_block_status(status)?;
+            map_block_status(status_of(&reply)?)?;
+            let used = reply.written();
             // The used length counts everything the device wrote into the
             // chain, which is the payload plus the status byte. A short
             // read is a device fault rather than a partial success: the
@@ -624,20 +645,20 @@ impl<T: VirtioTransport, C: QueueAffinity> VirtioBlockDevice<T, C> {
             let len = cmp::min(stride, buf.len() - offset);
             let sector = self.sector_of(block_id + offset / block_bytes);
             let request = BlkReq::new(ReqType::Out, sector);
-            let mut status = 0_u8;
             let mut segments: ArrayVec<&[u8], MAX_CHAIN_BUFFERS> = ArrayVec::new();
             for segment in buf[offset..offset + len].chunks(self.limits.segment_bytes) {
                 segments.push(segment);
             }
-            self.execute(
-                ReqType::Out,
-                &request,
-                &segments,
-                &mut ArrayVec::new(),
-                &mut status,
-            )
-            .await?;
-            map_block_status(status)?;
+            let reply = self
+                .execute(
+                    ReqType::Out,
+                    &[as_bytes(&request)],
+                    &segments,
+                    &mut [],
+                    STATUS_ONLY,
+                )
+                .await?;
+            map_block_status(status_of(&reply)?)?;
             offset += len;
         }
         Ok(())
@@ -651,36 +672,37 @@ impl<T: VirtioTransport, C: QueueAffinity> VirtioBlockDevice<T, C> {
             return Ok(());
         }
         let request = BlkReq::new(ReqType::Flush, 0);
-        let mut status = 0_u8;
-        self.execute(
-            ReqType::Flush,
-            &request,
-            &[],
-            &mut ArrayVec::new(),
-            &mut status,
-        )
-        .await?;
-        map_block_status(status)
+        let reply = self
+            .execute(
+                ReqType::Flush,
+                &[as_bytes(&request)],
+                &[],
+                &mut [],
+                STATUS_ONLY,
+            )
+            .await?;
+        map_block_status(status_of(&reply)?)
     }
 
     async fn read_serial(&self) -> IoResult<BlockSerial> {
         let request = BlkReq::new(ReqType::GetId, 0);
-        let mut id = [0_u8; BLOCK_ID_BYTES];
-        let mut status = 0_u8;
-        let mut segments: ArrayVec<&mut [u8], MAX_CHAIN_BUFFERS> = ArrayVec::new();
-        segments.push(&mut id);
-        let used = self
-            .execute(ReqType::GetId, &request, &[], &mut segments, &mut status)
+        // The identifier and the status are both device-written slot
+        // bytes: two descriptors, laid out one after the other.
+        let reply = self
+            .execute(
+                ReqType::GetId,
+                &[as_bytes(&request)],
+                &[],
+                &mut [],
+                &[BLOCK_ID_BYTES, size_of::<u8>()],
+            )
             .await?;
-        // The chain no longer names the buffer, so the identifier bytes
-        // can be read back.
-        drop(segments);
-        map_block_status(status)?;
-        let reported = usize::try_from(used)
+        map_block_status(status_of(&reply)?)?;
+        let reported = usize::try_from(reply.written())
             .map_err(|_| IoError::DeviceFault)?
             .saturating_sub(size_of::<u8>())
             .min(BLOCK_ID_BYTES);
-        BlockSerial::new(&id[..reported]).ok_or(IoError::DeviceFault)
+        BlockSerial::new(&reply.response()[..reported]).ok_or(IoError::DeviceFault)
     }
 
     /// Issues one deallocation request kind over `range`.
@@ -721,22 +743,27 @@ impl<T: VirtioTransport, C: QueueAffinity> VirtioBlockDevice<T, C> {
                 remaining -= u64::from(run);
             }
             let header = BlkReq::new(request, 0);
-            let mut status = 0_u8;
-            self.execute(
-                request,
-                &header,
-                &[as_bytes_slice(&segments)],
-                &mut ArrayVec::new(),
-                &mut status,
-            )
-            .await?;
-            map_block_status(status)?;
+            let reply = self
+                .execute(
+                    request,
+                    &[as_bytes(&header), as_bytes_slice(&segments)],
+                    &[],
+                    &mut [],
+                    STATUS_ONLY,
+                )
+                .await?;
+            map_block_status(status_of(&reply)?)?;
         }
         Ok(())
     }
 
     /// Writes one request chain onto this processor's queue and waits for
-    /// its completion, returning the bytes the device wrote.
+    /// its completion, returning the reply the device wrote.
+    ///
+    /// `request` is copied into the control slot of the chain's head
+    /// descriptor, and `response` sizes the device-written slot bytes
+    /// that follow the caller's data buffers. Nothing the device reads or
+    /// writes at the end of the chain lives in this future.
     ///
     /// The completion is routed by descriptor identifier: whichever task
     /// wins the queue lock after an interrupt drains everything the
@@ -746,37 +773,37 @@ impl<T: VirtioTransport, C: QueueAffinity> VirtioBlockDevice<T, C> {
     async fn execute(
         &self,
         kind: ReqType,
-        header: &BlkReq,
+        request: &[&[u8]],
         data_in: &[&[u8]],
-        data_out: &mut ArrayVec<&mut [u8], MAX_CHAIN_BUFFERS>,
-        status: &mut u8,
-    ) -> IoResult<u32> {
-        let mut inputs: ArrayVec<&[u8], MAX_CHAIN_BUFFERS> = ArrayVec::new();
-        inputs.push(as_bytes(header));
-        for input in data_in {
-            inputs.push(input);
+        data_out: &mut [&mut [u8]],
+        response: &[usize],
+    ) -> IoResult<Reply<'_, BLOCK_QUEUE_SLOTS>> {
+        let mut parts: ArrayVec<Part<'_>, MAX_CHAIN_BUFFERS> = ArrayVec::new();
+        for bytes in request {
+            parts.push(Part::Request(bytes));
         }
-        let mut outputs: ArrayVec<&mut [u8], MAX_CHAIN_BUFFERS> = ArrayVec::new();
-        for output in data_out.iter_mut() {
-            outputs.push(&mut **output);
+        for bytes in data_in {
+            parts.push(Part::Read(bytes));
         }
-        outputs.push(core::slice::from_mut(status));
+        for bytes in data_out.iter_mut() {
+            parts.push(Part::Write(bytes));
+        }
+        for len in response {
+            parts.push(Part::Response(*len));
+        }
 
         let queue = self.queue_for_current_processor();
-        let token = submit_chain(
+        let ticket = submit_control(
             &queue.inflight,
             &queue.queue,
             &self.transport,
-            &inputs,
-            &mut outputs,
+            &queue.slots,
+            &parts,
         )
         .await?;
-        let used = await_completion(&queue.inflight, &queue.queue, token, || {
-            self.interrupts.notified()
-        })
-        .await?;
+        let reply = await_completion(&queue.queue, ticket, || self.interrupts.notified()).await?;
         self.counters.count(kind);
-        Ok(used)
+        Ok(reply)
     }
 
     fn queue_for_current_processor(&self) -> &BlockQueue<T> {
@@ -1214,6 +1241,12 @@ fn validate_request(
     Ok(())
 }
 
+/// The status byte a request ends with: the last byte the device wrote
+/// to the slot.
+fn status_of(reply: &Reply<'_, BLOCK_QUEUE_SLOTS>) -> IoResult<u8> {
+    reply.response().last().copied().ok_or(IoError::DeviceFault)
+}
+
 fn map_block_status(status: u8) -> IoResult<()> {
     match status {
         0 => Ok(()),
@@ -1235,7 +1268,9 @@ fn as_bytes_slice<T>(values: &[T]) -> &[u8] {
 mod tests {
     use super::*;
 
-    use crate::testing::{FakeAffinity, FakeTransport, FakeTransportConfig};
+    use crate::testing::{
+        ConfinedDmaBuffer, ConfinedTransport, FakeAffinity, FakeTransport, FakeTransportConfig,
+    };
     use crate::transport::VirtioFeatures;
     use core::pin::pin;
     use futures_lite::future::{block_on, poll_once};
@@ -1244,10 +1279,26 @@ mod tests {
     /// A device with 2 MiB of capacity in 512-byte sectors.
     const TEST_CAPACITY_SECTORS: u32 = 4096;
 
-    type TestDevice = VirtioBlockResource<FakeTransport, FakeAffinity<1>>;
+    /// A device whose DMA reaches only memory its pool handed out: the
+    /// rings, the control slots and the data buffers a test takes from
+    /// [`data`].
+    type TestDevice = VirtioBlockResource<ConfinedTransport, FakeAffinity<1>>;
 
-    fn device_with(features: u64, setup: impl FnOnce(&FakeTransport)) -> TestDevice {
-        let transport = FakeTransport::new(FakeTransportConfig {
+    /// A buffer of `bytes` bytes the device can reach, for a read or
+    /// write payload.
+    fn data(device: &TestDevice, bytes: usize) -> ConfinedDmaBuffer {
+        device.object().transport.pool().buffer(bytes)
+    }
+
+    /// A payload buffer of `bytes` bytes of `fill`.
+    fn payload(device: &TestDevice, bytes: usize, fill: u8) -> ConfinedDmaBuffer {
+        let mut buffer = data(device, bytes);
+        buffer.as_mut_slice().fill(fill);
+        buffer
+    }
+
+    fn device_with(features: u64, setup: impl FnOnce(&ConfinedTransport)) -> TestDevice {
+        let transport = FakeTransport::confined(FakeTransportConfig {
             device_type: DeviceType::Block,
             offered_features: VirtioFeatures::VERSION_1.bits() | features,
             queue_size: 8,
@@ -1379,8 +1430,8 @@ mod tests {
             transport.set_config_u32(CFG_BLK_SIZE, 4096);
         });
 
-        let mut buffer = [0_u8; 4096];
-        let mut read = pin!(device.read_block(3, &mut buffer));
+        let mut buffer = data(&device, 4096);
+        let mut read = pin!(device.read_block(3, buffer.as_mut_slice()));
         assert!(block_on(poll_once(read.as_mut())).is_none());
 
         // Block 3 of a 4 KiB device is sector 24: virtio-blk addresses
@@ -1391,9 +1442,9 @@ mod tests {
     #[test]
     fn a_read_carries_the_payload_and_checks_the_used_length() {
         let device = device();
-        let mut buffer = [0_u8; 512];
+        let mut buffer = data(&device, 512);
         {
-            let mut read = pin!(device.read_block(2, &mut buffer));
+            let mut read = pin!(device.read_block(2, buffer.as_mut_slice()));
 
             assert!(block_on(poll_once(read.as_mut())).is_none());
             assert_eq!(request_of(&device, 0), header(ReqType::In, 2));
@@ -1403,15 +1454,15 @@ mod tests {
             complete(&device, 0, &response);
             assert_eq!(block_on(poll_once(read.as_mut())), Some(Ok(())));
         }
-        assert_eq!(buffer, [0xa5_u8; 512]);
+        assert_eq!(buffer.as_mut_slice(), [0xa5_u8; 512]);
         assert_eq!(device.request_counts().reads, 1);
     }
 
     #[test]
     fn a_short_read_is_a_device_fault() {
         let device = device();
-        let mut buffer = [0_u8; 1024];
-        let mut read = pin!(device.read_block(0, &mut buffer));
+        let mut buffer = data(&device, 1024);
+        let mut read = pin!(device.read_block(0, buffer.as_mut_slice()));
 
         assert!(block_on(poll_once(read.as_mut())).is_none());
         // The device claims success but only filled half the chain.
@@ -1434,12 +1485,12 @@ mod tests {
     #[test]
     fn a_write_puts_the_payload_after_the_header() {
         let device = device();
-        let payload = [0x5a_u8; 512];
-        let mut write = pin!(device.write_block(7, &payload));
+        let mut payload = payload(&device, 512, 0x5a);
+        let mut write = pin!(device.write_block(7, payload.as_mut_slice()));
 
         assert!(block_on(poll_once(write.as_mut())).is_none());
         let mut expected = header(ReqType::Out, 7);
-        expected.extend_from_slice(&payload);
+        expected.extend_from_slice(&[0x5a_u8; 512]);
         assert_eq!(request_of(&device, 0), expected);
 
         complete(&device, 0, &[0]);
@@ -1450,8 +1501,8 @@ mod tests {
     #[test]
     fn a_device_error_status_becomes_a_device_fault() {
         let device = device();
-        let payload = [0_u8; 512];
-        let mut write = pin!(device.write_block(0, &payload));
+        let mut payload = payload(&device, 512, 0);
+        let mut write = pin!(device.write_block(0, payload.as_mut_slice()));
 
         assert!(block_on(poll_once(write.as_mut())).is_none());
         complete(&device, 0, &[1]);
@@ -1621,21 +1672,21 @@ mod tests {
             transport.set_config_u32(CFG_SEG_MAX, 2);
             transport.set_config_u32(CFG_SIZE_MAX, 1024);
         });
-        let payload = [0x11_u8; 4096];
-        let mut write = pin!(device.write_block(0, &payload));
+        let mut payload = payload(&device, 4096, 0x11);
+        let mut write = pin!(device.write_block(0, payload.as_mut_slice()));
 
         assert!(block_on(poll_once(write.as_mut())).is_none());
         // Two segments of 1024 bytes each is 2048 bytes per request, so
         // the first request covers sectors 0..4 and the second 4..8.
         let mut expected = header(ReqType::Out, 0);
-        expected.extend_from_slice(&payload[..2048]);
+        expected.extend_from_slice(&[0x11_u8; 2048]);
         assert_eq!(request_of(&device, 0), expected);
 
         complete(&device, 0, &[0]);
         let second = next_token(&device);
         assert!(block_on(poll_once(write.as_mut())).is_none());
         let mut expected = header(ReqType::Out, 4);
-        expected.extend_from_slice(&payload[2048..]);
+        expected.extend_from_slice(&[0x11_u8; 2048]);
         assert_eq!(request_of(&device, second), expected);
 
         complete(&device, second, &[0]);
@@ -1646,14 +1697,14 @@ mod tests {
     #[test]
     fn requests_are_pipelined_and_completed_out_of_order() {
         let device = device();
-        let mut first = [0_u8; 512];
-        let mut second = [0_u8; 512];
+        let mut first = data(&device, 512);
+        let mut second = data(&device, 512);
         {
             let first_token = next_token(&device);
-            let mut read_first = pin!(device.read_block(0, &mut first));
+            let mut read_first = pin!(device.read_block(0, first.as_mut_slice()));
             assert!(block_on(poll_once(read_first.as_mut())).is_none());
             let second_token = next_token(&device);
-            let mut read_second = pin!(device.read_block(1, &mut second));
+            let mut read_second = pin!(device.read_block(1, second.as_mut_slice()));
             assert!(block_on(poll_once(read_second.as_mut())).is_none());
             assert_eq!(request_of(&device, first_token), header(ReqType::In, 0));
             assert_eq!(request_of(&device, second_token), header(ReqType::In, 1));
@@ -1675,17 +1726,136 @@ mod tests {
             complete(&device, first_token, &response);
             assert_eq!(block_on(poll_once(read_first.as_mut())), Some(Ok(())));
         }
-        assert_eq!(first, [0x33_u8; 512]);
-        assert_eq!(second, [0x22_u8; 512]);
+        assert_eq!(first.as_mut_slice(), [0x33_u8; 512]);
+        assert_eq!(second.as_mut_slice(), [0x22_u8; 512]);
+    }
+
+    /// The device address of the first descriptor of chain `token`, which
+    /// is where the request header was put.
+    fn header_address(device: &TestDevice, token: u16) -> u64 {
+        device.object().queues[0]
+            .queue
+            .try_lock()
+            .expect("a parked driver does not hold the queue lock")
+            .device_chain(token)[0]
+            .0
+    }
+
+    #[test]
+    fn the_header_and_the_status_travel_in_the_requests_own_slot() {
+        let device = device();
+        let request = header(ReqType::In, 0);
+        let mut buffer = data(&device, 512);
+        let mut read = pin!(device.read_block(0, buffer.as_mut_slice()));
+        assert!(block_on(poll_once(read.as_mut())).is_none());
+
+        let chain = device.object().queues[0]
+            .queue
+            .try_lock()
+            .expect("a parked driver does not hold the queue lock")
+            .device_chain(0);
+        assert_eq!(chain.len(), 3, "header, data, status");
+        let slots = &device.object().queues[0].slots;
+        for (address, _, _) in [chain[0], chain[2]] {
+            assert!(
+                slots.contains(address),
+                "descriptor at {address:#x} is outside the control slots"
+            );
+        }
+        assert_eq!(request_of(&device, 0)[..request.len()], request[..]);
+    }
+
+    #[test]
+    fn a_header_in_the_future_would_be_refused() {
+        // A caller buffer the device cannot reach is refused before any
+        // descriptor is written, which is what a header in this
+        // future's frame would have been.
+        let device = device();
+        let mut buffer = [0_u8; 512];
+        assert_eq!(
+            block_on(device.read_block(0, &mut buffer)),
+            Err(IoError::DeviceFault)
+        );
+    }
+
+    #[test]
+    fn a_dropped_request_keeps_its_slot_until_the_device_completes_it() {
+        let device = device();
+        let mut abandoned = data(&device, 512);
+        {
+            let mut read = pin!(device.read_block(0, abandoned.as_mut_slice()));
+            assert!(block_on(poll_once(read.as_mut())).is_none());
+        }
+        let first_header = header_address(&device, 0);
+        let inflight = &device.object().queues[0].inflight;
+        assert!(
+            !inflight.is_idle(0),
+            "the chain is still with the device, so its slot stays held"
+        );
+
+        // A request submitted meanwhile gets a slot of its own.
+        let second_token = next_token(&device);
+        let mut buffer = data(&device, 512);
+        {
+            let mut read = pin!(device.read_block(1, buffer.as_mut_slice()));
+            assert!(block_on(poll_once(read.as_mut())).is_none());
+            assert_ne!(first_header, header_address(&device, second_token));
+
+            // The late answer to the dropped request frees its
+            // identifier without disturbing the live one.
+            let mut response = vec![0x11_u8; 512];
+            response.push(0);
+            complete(&device, 0, &response);
+            assert!(block_on(poll_once(read.as_mut())).is_none());
+            assert!(inflight.is_idle(0));
+
+            let mut response = vec![0x22_u8; 512];
+            response.push(0);
+            complete(&device, second_token, &response);
+            assert_eq!(block_on(poll_once(read.as_mut())), Some(Ok(())));
+        }
+        assert_eq!(buffer.as_mut_slice(), [0x22_u8; 512]);
+
+        // The queue is not stalled: the next request goes through.
+        let third_token = next_token(&device);
+        let mut third = data(&device, 512);
+        let mut read = pin!(device.read_block(2, third.as_mut_slice()));
+        assert!(block_on(poll_once(read.as_mut())).is_none());
+        let mut response = vec![0x33_u8; 512];
+        response.push(0);
+        complete(&device, third_token, &response);
+        assert_eq!(block_on(poll_once(read.as_mut())), Some(Ok(())));
+    }
+
+    #[test]
+    fn a_dropped_deallocation_is_dropped_whole_not_half_written() {
+        let device = device_with(BLK_F_DISCARD, |transport| {
+            transport.set_config_u32(CFG_MAX_DISCARD_SECTORS, 8);
+            transport.set_config_u32(CFG_MAX_DISCARD_SEG, 4);
+        });
+        {
+            let mut discard = pin!(device.discard(BlockRange::new(16, 12)));
+            assert!(block_on(poll_once(discard.as_mut())).is_none());
+        }
+        // The segment list is in the slot the device still owns, so the
+        // request is still intact on the wire after its future is gone.
+        let mut expected = header(ReqType::Discard, 0);
+        expected.extend_from_slice(&16_u64.to_le_bytes());
+        expected.extend_from_slice(&8_u32.to_le_bytes());
+        expected.extend_from_slice(&0_u32.to_le_bytes());
+        expected.extend_from_slice(&24_u64.to_le_bytes());
+        expected.extend_from_slice(&4_u32.to_le_bytes());
+        expected.extend_from_slice(&0_u32.to_le_bytes());
+        assert_eq!(request_of(&device, 0), expected);
     }
 
     #[test]
     fn a_readonly_device_refuses_writes() {
         let device = device_with(BLK_F_RO, |_| {});
-        let payload = [0_u8; 512];
+        let mut payload = payload(&device, 512, 0);
 
         assert_eq!(
-            block_on(device.write_block(0, &payload)),
+            block_on(device.write_block(0, payload.as_mut_slice())),
             Err(IoError::ReadOnly)
         );
     }

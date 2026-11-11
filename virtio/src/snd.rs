@@ -48,7 +48,7 @@
 //!
 //! Every entry point takes `&self` and may be called from any processor.
 //! Control commands and transmits go through the shared
-//! `submit_chain`/`await_completion` pair on their own queues, so a
+//! `submit_control`/`await_completion` pair on their own queues, so a
 //! queue lock is held only long enough to publish a chain and never
 //! across an await: several commands and several periods are in flight
 //! at once and completions are routed back by descriptor identifier.
@@ -76,10 +76,14 @@ use helios_hal::audio::{
 };
 use helios_hal::io::{IoError, IoResult};
 
+use crate::bus::DeviceBus;
 use crate::features::{NegotiatedFeatures, RING_FEATURES, negotiate};
-use crate::inflight::{InFlight, await_completion, submit_chain};
+use crate::inflight::{InFlight, await_completion, submit_control};
 use crate::notify::Notify;
-use crate::queue::{VirtQueue, negotiated_queue_size};
+use crate::queue::{
+    ControlSlots, Part, SlotPool, TransportBuffer, VirtQueue, control_slots, exchange_blocking,
+    negotiated_queue_size,
+};
 use crate::transport::{DeviceStatus, DeviceType, VirtioTransport};
 
 /// The control queue: every question and every state change.
@@ -174,6 +178,22 @@ const XFER_STATUS_BYTES: usize = 8;
 /// The largest reply either query in this driver asks for.
 const MAX_JACK_INFO_REPLY: usize = HEADER_BYTES + MAX_JACKS * JACK_INFO_BYTES;
 const MAX_CHMAP_INFO_REPLY: usize = HEADER_BYTES + MAX_CHANNEL_MAPS * CHMAP_INFO_BYTES;
+const MAX_PCM_INFO_REPLY: usize = HEADER_BYTES + MAX_STREAMS * PCM_INFO_BYTES;
+
+/// The largest control request: `PCM_SET_PARAMS`, which every other
+/// request is shorter than. A control slot's request area holds it.
+const CONTROL_REQUEST_BYTES: usize = SET_PARAMS_BYTES;
+/// The largest control reply, which a control slot's response area holds.
+const CONTROL_RESPONSE_BYTES: usize = {
+    let mut largest = MAX_PCM_INFO_REPLY;
+    if MAX_JACK_INFO_REPLY > largest {
+        largest = MAX_JACK_INFO_REPLY;
+    }
+    if MAX_CHMAP_INFO_REPLY > largest {
+        largest = MAX_CHMAP_INFO_REPLY;
+    }
+    largest
+};
 
 /// `VIRTIO_SND_D_OUTPUT` and `VIRTIO_SND_D_INPUT`.
 const D_OUTPUT: u8 = 0;
@@ -265,10 +285,11 @@ impl SoundTopology {
 /// reposted before the lock is released.
 struct EventRing<T: VirtioTransport> {
     queue: VirtQueue<T>,
-    /// One `EVENT_BYTES` slot per descriptor, in one allocation: the
-    /// pool is fixed at bring-up and every slot has the same size, so
-    /// there is nothing for a per-slot allocation to express.
-    slots: Box<[u8]>,
+    /// One `EVENT_BYTES` slot per descriptor, in one device-reachable
+    /// allocation: the pool is fixed at bring-up and every slot has the
+    /// same size, so there is nothing for a per-slot allocation to
+    /// express.
+    slots: SlotPool<TransportBuffer<T>>,
     /// Which slot each outstanding descriptor identifier carries.
     slot_for_token: Box<[u16]>,
 }
@@ -277,8 +298,13 @@ pub struct VirtioSndDevice<T: VirtioTransport> {
     transport: T,
     control: AsyncMutex<VirtQueue<T>>,
     control_inflight: InFlight<{ CONTROL_QUEUE_SIZE as usize }>,
+    /// Control requests and their replies, one slot per descriptor.
+    control_slots: ControlSlots<TransportBuffer<T>>,
     tx: AsyncMutex<VirtQueue<T>>,
     tx_inflight: InFlight<{ TX_QUEUE_SIZE as usize }>,
+    /// The transfer header and the status the device answers with, one
+    /// slot per descriptor. The period itself is the caller's memory.
+    tx_slots: ControlSlots<TransportBuffer<T>>,
     /// Programmed so the device sees four queues, and never posted: this
     /// driver plays and does not record.
     rx: AsyncMutex<VirtQueue<T>>,
@@ -323,8 +349,14 @@ impl<T: VirtioTransport> VirtioSndDevice<T> {
     pub fn new(transport: T) -> IoResult<Self> {
         let (mut device, counts) = Self::program(transport)?;
         let transport = &device.transport;
-        device.topology =
-            read_topology(transport, device.control.get_mut(), counts).map_err(topology_fault)?;
+        device.topology = read_topology(
+            transport,
+            device.control.get_mut(),
+            &device.control_inflight,
+            &device.control_slots,
+            counts,
+        )
+        .map_err(topology_fault)?;
         device.check_playable()?;
         Ok(device)
     }
@@ -399,10 +431,18 @@ impl<T: VirtioTransport> VirtioSndDevice<T> {
             ));
         }
 
-        let mut slots = vec![0_u8; usize::from(event_size) * EVENT_BYTES].into_boxed_slice();
+        let control_table = control_slots(
+            &transport,
+            &control,
+            CONTROL_REQUEST_BYTES,
+            CONTROL_RESPONSE_BYTES,
+        )?;
+        let tx_table = control_slots(&transport, &tx, XFER_HEADER_BYTES, XFER_STATUS_BYTES)?;
+
+        let mut slots = SlotPool::new(transport.bus().dma(), usize::from(event_size), EVENT_BYTES)?;
         let mut slot_for_token = vec![0_u16; usize::from(event_size)].into_boxed_slice();
         for index in 0..usize::from(event_size) {
-            let slot = &mut slots[index * EVENT_BYTES..(index + 1) * EVENT_BYTES];
+            let slot = slots.slot_mut(index);
             let token = event_queue.submit_output_deferred(&transport, slot)?;
             slot_for_token[usize::from(token)] =
                 u16::try_from(index).map_err(|_| IoError::DeviceFault)?;
@@ -421,8 +461,10 @@ impl<T: VirtioTransport> VirtioSndDevice<T> {
             transport,
             control: AsyncMutex::new(control),
             control_inflight: InFlight::new(),
+            control_slots: control_table,
             tx: AsyncMutex::new(tx),
             tx_inflight: InFlight::new(),
+            tx_slots: tx_table,
             rx: AsyncMutex::new(rx),
             events: AsyncMutex::new(EventRing {
                 queue: event_queue,
@@ -483,18 +525,18 @@ impl<T: VirtioTransport> VirtioSndDevice<T> {
     /// Runs one control command and checks the status it answers with.
     async fn control_command(&self, request: &[u8], response: &mut [u8]) -> AudioResult<u32> {
         let written = {
-            let token = submit_chain(
+            let ticket = submit_control(
                 &self.control_inflight,
                 &self.control,
                 &self.transport,
-                &[request],
-                &mut [&mut *response],
+                &self.control_slots,
+                &[Part::Request(request), Part::Response(response.len())],
             )
             .await?;
-            await_completion(&self.control_inflight, &self.control, token, || {
-                self.completions.notified()
-            })
-            .await?
+            let reply =
+                await_completion(&self.control, ticket, || self.completions.notified()).await?;
+            response.copy_from_slice(reply.response());
+            reply.written()
         };
         if (written as usize) < HEADER_BYTES {
             return Err(IoError::DeviceFault.into());
@@ -553,9 +595,7 @@ impl<T: VirtioTransport> VirtioSndDevice<T> {
                 .get(usize::from(token))
                 .ok_or(IoError::DeviceFault)?,
         );
-        let slot = slots
-            .get_mut(index * EVENT_BYTES..(index + 1) * EVENT_BYTES)
-            .ok_or(IoError::DeviceFault)?;
+        let slot = slots.slot_mut(index);
         // The slot goes back to the device whatever the event turns out
         // to be: a fault that also leaked a buffer would shrink the ring
         // on top of dropping the report.
@@ -648,18 +688,24 @@ impl<T: VirtioTransport> PlaybackDevice for VirtioSndDevice<T> {
         let header: [u8; XFER_HEADER_BYTES] = stream.index().to_le_bytes();
         let mut status = [0_u8; XFER_STATUS_BYTES];
         let written = {
-            let token = submit_chain(
+            // The header and the status are in the period's control slot.
+            // The period is the caller's own memory, pinned for the
+            // device by whoever owns it.
+            let ticket = submit_control(
                 &self.tx_inflight,
                 &self.tx,
                 &self.transport,
-                &[&header, period],
-                &mut [&mut status],
+                &self.tx_slots,
+                &[
+                    Part::Request(&header),
+                    Part::Read(period),
+                    Part::Response(XFER_STATUS_BYTES),
+                ],
             )
             .await?;
-            await_completion(&self.tx_inflight, &self.tx, token, || {
-                self.completions.notified()
-            })
-            .await?
+            let reply = await_completion(&self.tx, ticket, || self.completions.notified()).await?;
+            status.copy_from_slice(reply.response());
+            reply.written()
         };
         if (written as usize) < XFER_STATUS_BYTES {
             // The device returned the chain without saying what it did
@@ -804,6 +850,8 @@ fn topology_fault(error: AudioError) -> IoError {
 fn read_topology<T: VirtioTransport>(
     transport: &T,
     control: &mut VirtQueue<T>,
+    inflight: &InFlight<{ CONTROL_QUEUE_SIZE as usize }>,
+    slots: &ControlSlots<TransportBuffer<T>>,
     counts: ItemCounts,
 ) -> AudioResult<SoundTopology> {
     let ItemCounts {
@@ -811,9 +859,10 @@ fn read_topology<T: VirtioTransport>(
         jacks,
         chmaps,
     } = counts;
-    let reply = query_blocking(
-        transport,
-        control,
+    let mut ask = |request: &[u8], response_bytes: usize| {
+        query_blocking(transport, control, inflight, slots, request, response_bytes)
+    };
+    let reply = ask(
         &encode_query_info(R_PCM_INFO, streams, PCM_INFO_BYTES),
         HEADER_BYTES + streams * PCM_INFO_BYTES,
     )?;
@@ -822,9 +871,7 @@ fn read_topology<T: VirtioTransport>(
     let jacks = if jacks == 0 {
         JackList::new()
     } else {
-        let reply = query_blocking(
-            transport,
-            control,
+        let reply = ask(
             &encode_query_info(R_JACK_INFO, jacks, JACK_INFO_BYTES),
             HEADER_BYTES + jacks * JACK_INFO_BYTES,
         )?;
@@ -834,9 +881,7 @@ fn read_topology<T: VirtioTransport>(
     let chmaps = if chmaps == 0 {
         ChannelMapList::new()
     } else {
-        let reply = query_blocking(
-            transport,
-            control,
+        let reply = ask(
             &encode_query_info(R_CHMAP_INFO, chmaps, CHMAP_INFO_BYTES),
             HEADER_BYTES + chmaps * CHMAP_INFO_BYTES,
         )?;
@@ -853,28 +898,28 @@ fn read_topology<T: VirtioTransport>(
 /// One control round trip on the bring-up path, polled rather than
 /// awaited.
 ///
-/// Both buffers are kernel-heap allocations rather than locals, and that
-/// is not a style choice: this runs on the boot stack, which the
-/// platform maps outside the window the device's DMA pool translates, so
-/// a device handed a stack address reads and writes memory that is not
-/// this buffer and answers with a completion whose reply never arrives.
-/// Every later command builds its buffers inside a task future, which
-/// lives in the kernel's task arena and translates correctly.
+/// The request and the reply travel in the control slot of the chain's
+/// head descriptor, the memory the device owns, and the reply is copied
+/// out of it into `response`. Nothing the device reads or writes is on
+/// the boot stack, which the platform maps outside what the device's DMA
+/// pool translates.
 fn query_blocking<T: VirtioTransport>(
     transport: &T,
     queue: &mut VirtQueue<T>,
+    inflight: &InFlight<{ CONTROL_QUEUE_SIZE as usize }>,
+    slots: &ControlSlots<TransportBuffer<T>>,
     request: &[u8],
     response_bytes: usize,
 ) -> AudioResult<Vec<u8>> {
-    let request = request.to_vec();
     let mut response = vec![0_u8; response_bytes];
-    let token = queue.submit(
+    let written = exchange_blocking(
+        inflight,
+        queue,
         transport,
-        &[request.as_slice()],
-        &mut [response.as_mut_slice()],
+        slots,
+        &[Part::Request(request), Part::Response(response_bytes)],
+        &mut response,
     )?;
-    queue.notify(transport);
-    let written = queue.reap_blocking(transport, token)?;
     if (written as usize) < HEADER_BYTES {
         return Err(IoError::DeviceFault.into());
     }

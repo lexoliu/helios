@@ -34,10 +34,13 @@ use helios_hal::vsock::{
     VsockShutdown,
 };
 
+use crate::bus::DeviceBus;
 use crate::features::{NegotiatedFeatures, RING_FEATURES, negotiate};
-use crate::inflight::{InFlight, await_completion, submit_chain};
+use crate::inflight::{InFlight, await_completion, submit_control};
 use crate::notify::Notify;
-use crate::queue::{VirtQueue, negotiated_queue_size};
+use crate::queue::{
+    ControlSlots, Part, SlotPool, TransportBuffer, VirtQueue, control_slots, negotiated_queue_size,
+};
 use crate::transport::{DeviceStatus, DeviceType, VirtioTransport};
 
 const RX_QUEUE_INDEX: u16 = 0;
@@ -150,7 +153,7 @@ fn decode_header(bytes: &[u8]) -> IoResult<VsockPacketHeader> {
 struct VsockRxState<T: VirtioTransport> {
     queue: VirtQueue<T>,
     /// One page per descriptor, allocated at bring-up and recycled.
-    slots: Box<[Box<[u8]>]>,
+    slots: SlotPool<TransportBuffer<T>>,
     /// Which slot each outstanding descriptor identifier carries.
     slot_for_token: Box<[u16]>,
 }
@@ -158,7 +161,7 @@ struct VsockRxState<T: VirtioTransport> {
 /// The event ring and its buffers.
 struct VsockEventState<T: VirtioTransport> {
     queue: VirtQueue<T>,
-    buffers: Box<[Box<[u8]>]>,
+    buffers: SlotPool<TransportBuffer<T>>,
     buffer_for_token: Box<[u16]>,
 }
 
@@ -168,6 +171,10 @@ pub struct VirtioVsockDevice<T: VirtioTransport> {
     rx: AsyncMutex<VsockRxState<T>>,
     tx_queue: AsyncMutex<VirtQueue<T>>,
     tx_inflight: InFlight<{ DATA_QUEUE_SIZE as usize }>,
+    /// The packet header and its payload, copied in before the chain is
+    /// published: one slot per descriptor, each as large as the largest
+    /// packet.
+    tx_slots: ControlSlots<TransportBuffer<T>>,
     event: AsyncMutex<VsockEventState<T>>,
     interrupts: Notify,
     features: NegotiatedFeatures,
@@ -210,23 +217,27 @@ impl<T: VirtioTransport> VirtioVsockDevice<T> {
             features,
         )?;
 
-        let mut slots: Box<[Box<[u8]>]> = (0..usize::from(rx_size))
-            .map(|_| vec![0_u8; RX_SLOT_BYTES].into_boxed_slice())
-            .collect();
+        let tx_slots = control_slots(
+            &transport,
+            &tx_queue,
+            HEADER_BYTES + VSOCK_MAX_PAYLOAD_BYTES,
+            0,
+        )?;
+
+        let mut slots = SlotPool::new(transport.bus().dma(), usize::from(rx_size), RX_SLOT_BYTES)?;
         let mut slot_for_token = vec![0_u16; usize::from(rx_size)].into_boxed_slice();
-        for index in 0..slots.len() {
-            let token = rx_queue.submit_output_deferred(&transport, &mut slots[index])?;
+        for index in 0..usize::from(rx_size) {
+            let token = rx_queue.submit_output_deferred(&transport, slots.slot_mut(index))?;
             slot_for_token[usize::from(token)] =
                 u16::try_from(index).map_err(|_| IoError::DeviceFault)?;
         }
         rx_queue.publish();
 
-        let mut buffers: Box<[Box<[u8]>]> = (0..usize::from(event_size))
-            .map(|_| vec![0_u8; EVENT_BYTES].into_boxed_slice())
-            .collect();
+        let mut buffers =
+            SlotPool::new(transport.bus().dma(), usize::from(event_size), EVENT_BYTES)?;
         let mut buffer_for_token = vec![0_u16; usize::from(event_size)].into_boxed_slice();
-        for index in 0..buffers.len() {
-            let token = event_queue.submit_output_deferred(&transport, &mut buffers[index])?;
+        for index in 0..usize::from(event_size) {
+            let token = event_queue.submit_output_deferred(&transport, buffers.slot_mut(index))?;
             buffer_for_token[usize::from(token)] =
                 u16::try_from(index).map_err(|_| IoError::DeviceFault)?;
         }
@@ -261,6 +272,7 @@ impl<T: VirtioTransport> VirtioVsockDevice<T> {
             }),
             tx_queue: AsyncMutex::new(tx_queue),
             tx_inflight: InFlight::new(),
+            tx_slots,
             event: AsyncMutex::new(VsockEventState {
                 queue: event_queue,
                 buffers,
@@ -315,10 +327,10 @@ impl<T: VirtioTransport> VirtioVsockDevice<T> {
         // The slot returns to the device whatever the packet turns out
         // to be: a fault that also leaked a receive buffer would starve
         // the ring on top of dropping the packet.
-        let decoded = Self::decode_slot(&state.slots[slot_index], used_len, payload);
+        let decoded = Self::decode_slot(state.slots.slot_mut(slot_index), used_len, payload);
         let token = state
             .queue
-            .submit_output_deferred(transport, &mut state.slots[slot_index])?;
+            .submit_output_deferred(transport, state.slots.slot_mut(slot_index))?;
         state.slot_for_token[usize::from(token)] =
             u16::try_from(slot_index).map_err(|_| IoError::DeviceFault)?;
         state.queue.publish();
@@ -357,7 +369,7 @@ impl<T: VirtioTransport> VirtioVsockDevice<T> {
                     .ok_or(IoError::DeviceFault)?,
             );
             if used_len as usize >= EVENT_BYTES {
-                let buffer = &state.buffers[index];
+                let buffer = state.buffers.slot_mut(index);
                 let id = u32::from_le_bytes(buffer[..EVENT_BYTES].try_into().expect("four bytes"));
                 if id == EVENT_TRANSPORT_RESET {
                     reset = true;
@@ -365,7 +377,7 @@ impl<T: VirtioTransport> VirtioVsockDevice<T> {
             }
             let token = state
                 .queue
-                .submit_output_deferred(transport, &mut state.buffers[index])?;
+                .submit_output_deferred(transport, state.buffers.slot_mut(index))?;
             state.buffer_for_token[usize::from(token)] =
                 u16::try_from(index).map_err(|_| IoError::DeviceFault)?;
         }
@@ -402,25 +414,27 @@ impl<T: VirtioTransport> VsockDevice for VirtioVsockDevice<T> {
                 "vsock packet header announces a payload length its buffer does not match",
             ));
         }
+        // Both go into the packet's control slot under the queue lock,
+        // so the device never reads this future's frame or the caller's
+        // buffer: a send dropped mid-flight leaves a complete packet
+        // behind in memory the device owns.
         let encoded = encode_header(&header);
-        let inputs: [&[u8]; 2] = [&encoded, payload];
-        let inputs = if payload.is_empty() {
-            &inputs[..1]
+        let parts = [Part::Request(&encoded), Part::Request(payload)];
+        let parts = if payload.is_empty() {
+            &parts[..1]
         } else {
-            &inputs[..]
+            &parts[..]
         };
-        let token = submit_chain(
+        let ticket = submit_control(
             &self.tx_inflight,
             &self.tx_queue,
             &self.transport,
-            inputs,
-            &mut [],
+            &self.tx_slots,
+            parts,
         )
         .await?;
-        await_completion(&self.tx_inflight, &self.tx_queue, token, || {
-            self.interrupts.notified()
-        })
-        .await?;
+        let _reply =
+            await_completion(&self.tx_queue, ticket, || self.interrupts.notified()).await?;
         Ok(())
     }
 
@@ -489,7 +503,7 @@ mod tests {
         DeviceType, HEADER_BYTES, IoError, PACKET_TYPE_STREAM, VSOCK_MAX_PAYLOAD_BYTES,
         VirtioVsockDevice, decode_header, encode_header,
     };
-    use crate::testing::{FakeTransport, FakeTransportConfig};
+    use crate::testing::{ConfinedTransport, FakeTransport, FakeTransportConfig};
     use crate::transport::VirtioFeatures;
     use alloc::vec;
     use core::pin::pin;
@@ -500,8 +514,11 @@ mod tests {
 
     const GUEST_CID: u64 = 42;
 
-    fn device() -> VirtioVsockDevice<FakeTransport> {
-        let transport = FakeTransport::new(FakeTransportConfig {
+    /// A device whose DMA reaches only memory its own pool handed out,
+    /// so a header or payload named from a send's own frame or the
+    /// caller's buffer is refused.
+    fn device() -> VirtioVsockDevice<ConfinedTransport> {
+        let transport = FakeTransport::confined(FakeTransportConfig {
             device_type: DeviceType::Vsock,
             offered_features: VirtioFeatures::VERSION_1.bits(),
             queue_size: 8,
@@ -527,7 +544,7 @@ mod tests {
 
     /// Plays the device: writes `packet` into the receive slot the
     /// driver posted under `token` and raises the interrupt.
-    fn deliver(device: &VirtioVsockDevice<FakeTransport>, token: u16, packet: &[u8]) {
+    fn deliver(device: &VirtioVsockDevice<ConfinedTransport>, token: u16, packet: &[u8]) {
         let state = device
             .rx
             .try_lock()
@@ -723,6 +740,55 @@ mod tests {
         drop(queue);
         device.handle_interrupt();
         assert_eq!(block_on(poll_once(send.as_mut())), Some(Ok(())));
+    }
+
+    #[test]
+    fn a_dropped_send_leaves_its_whole_packet_with_the_device() {
+        let device = device();
+        let mut caller = vec![0xab_u8; 64];
+        let wire_header = header(VsockOp::Data, 64);
+        {
+            let mut send = pin!(device.send(wire_header, &caller));
+            assert!(block_on(poll_once(send.as_mut())).is_none());
+        }
+        // The caller's buffer is reused the moment its send is dropped.
+        caller.fill(0);
+
+        let queue = device
+            .tx_queue
+            .try_lock()
+            .expect("a dropped sender does not hold the transmit lock");
+        let request = queue.device_request(0);
+        assert_eq!(request.len(), HEADER_BYTES + 64);
+        assert_eq!(
+            decode_header(&request).expect("a decodable header"),
+            wire_header,
+            "the header the device reads is not the dropped future's frame"
+        );
+        assert_eq!(
+            &request[HEADER_BYTES..],
+            &[0xab_u8; 64],
+            "the payload the device reads is the copy in the slot, not the caller's buffer"
+        );
+        drop(queue);
+        assert!(
+            !device.tx_inflight.is_idle(0),
+            "the chain is still with the device, so its slot stays held"
+        );
+
+        // A later send gets a slot of its own.
+        let mut second = pin!(device.send(header(VsockOp::Reset, 0), &[]));
+        assert!(block_on(poll_once(second.as_mut())).is_none());
+        let queue = device.tx_queue.try_lock().expect("the sender is parked");
+        assert_ne!(queue.device_chain(0)[0].0, queue.device_chain(1)[0].0);
+
+        // The device finishing the dropped packet releases its slot and
+        // leaves the second request waiting.
+        queue.device_complete(0, 0);
+        drop(queue);
+        device.handle_interrupt();
+        assert!(block_on(poll_once(second.as_mut())).is_none());
+        assert!(device.tx_inflight.is_idle(0));
     }
 
     #[test]

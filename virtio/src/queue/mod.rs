@@ -17,9 +17,14 @@
 //! submitted a chain is the task that reaps it.
 
 mod packed;
+mod slots;
 mod split;
 #[cfg(test)]
 mod tests;
+
+pub(crate) use slots::{
+    ControlSlots, Part, ResponseSpan, ResponseWindow, SlotPool, control_slots, exchange_blocking,
+};
 
 use core::alloc::Layout;
 
@@ -72,6 +77,10 @@ pub enum VirtqueueError {
     RingAllocation,
     #[error("{bytes} bytes at {address:#x} are not reachable by the device")]
     Unreachable { address: usize, bytes: usize },
+    #[error("a control slot holds {capacity} bytes and the request needs {needed}")]
+    ControlSlotOverflow { needed: usize, capacity: usize },
+    #[error("a descriptor chain lists a readable buffer after a writable one")]
+    ReadableAfterWritable,
     #[error("this queue did not negotiate VIRTIO_F_RING_RESET")]
     ResetUnsupported,
     #[error("the device completed descriptor {id}, which is not a chain in flight on this queue")]
@@ -89,7 +98,10 @@ impl From<VirtqueueError> for IoError {
                 Self::Unsupported
             }
             VirtqueueError::EmptyChain => Self::DeviceFault,
-            VirtqueueError::ChainTooLong { .. } => Self::OutOfBounds,
+            VirtqueueError::ChainTooLong { .. } | VirtqueueError::ControlSlotOverflow { .. } => {
+                Self::OutOfBounds
+            }
+            VirtqueueError::ReadableAfterWritable => Self::DeviceFault,
             VirtqueueError::Full { .. } => Self::DeviceFault,
             VirtqueueError::RingAllocation | VirtqueueError::Unreachable { .. } => {
                 Self::DeviceFault
@@ -649,6 +661,8 @@ pub(crate) fn negotiated_queue_size<T: VirtioTransport>(
 /// A virtqueue in whichever layout the device and driver agreed on.
 pub struct VirtQueue<T: VirtioTransport> {
     index: u16,
+    /// Descriptors, and so the identifiers a chain can be headed by.
+    size: u16,
     features: NegotiatedFeatures,
     ring: Ring<T>,
     /// Set when the device broke the used-ring contract. A faulted queue
@@ -747,10 +761,53 @@ impl<T: VirtioTransport> VirtQueue<T> {
 
         Ok(Self {
             index,
+            size,
             features,
             ring,
             faulted: false,
         })
+    }
+
+    /// Descriptors in the ring, which is how many chains it holds at
+    /// once and how many identifiers a chain can be headed by.
+    pub fn size(&self) -> u16 {
+        self.size
+    }
+
+    /// Submits the chain `parts` describes, staging its control bytes in
+    /// the slot of the identifier it will be headed by, and makes it
+    /// available to the device immediately.
+    ///
+    /// Returns the identifier and where the response bytes will be.
+    ///
+    /// # Safety
+    ///
+    /// The caller owns the slot of [`VirtQueue::next_free_descriptor`]:
+    /// no chain headed by it is in flight and no reply of an earlier chain
+    /// headed by it is still being read. Under the queue lock that is the
+    /// completion table reporting the identifier idle.
+    pub(crate) unsafe fn submit_parts(
+        &mut self,
+        transport: &T,
+        slots: &ControlSlots<TransportBuffer<T>>,
+        parts: &[Part<'_>],
+    ) -> IoResult<(u16, ResponseSpan)> {
+        let mut chain = [ChainEntry {
+            addr: 0,
+            len: 0,
+            writable: false,
+        }; MAX_CHAIN_BUFFERS];
+        self.ensure_driven()?;
+        let head = self.ring.next_id();
+        // SAFETY: the caller owns the slot of the next identifier, which
+        // is `head`.
+        let (used, span) = unsafe { slots.stage(transport.bus().dma(), head, parts, &mut chain)? };
+        let token = self.ring.submit(&chain[..used], true)?;
+        assert_eq!(
+            token, head,
+            "the ring headed a chain by a different identifier than it announced"
+        );
+        Ok((token, span))
     }
 
     /// The features this queue was built with.

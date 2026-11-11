@@ -34,8 +34,9 @@
 //! # Concurrency contract
 //!
 //! Every entry point takes `&self` and may be called from any processor.
-//! Control commands go through the shared `submit_chain` /
-//! `await_completion` pair, so the control queue lock is held only long
+//! Control commands go through the shared `submit_control` /
+//! `await_completion` pair, with their bytes in per-descriptor control
+//! slots, so the control queue lock is held only long
 //! enough to publish a chain and is never held across an await: several
 //! tasks have commands in flight at once and completions are routed back
 //! by descriptor identifier. The cursor queue works the same way on its
@@ -65,9 +66,12 @@ use helios_hal::dma::{DmaAddressing, DmaMemory};
 
 use crate::bus::DeviceBus;
 use crate::features::{NegotiatedFeatures, RING_FEATURES, negotiate_with};
-use crate::inflight::{InFlight, await_completion, submit_chain, submit_chain_with_payload};
+use crate::inflight::{InFlight, await_completion, submit_control};
 use crate::notify::Notify;
-use crate::queue::{VirtQueue, negotiated_queue_size};
+use crate::queue::{
+    ControlSlots, MAX_CHAIN_BUFFERS, Part, TransportBuffer, VirtQueue, control_slots,
+    exchange_blocking, negotiated_queue_size,
+};
 use crate::transport::{DeviceStatus, DeviceType, VirtioTransport};
 
 /// The control queue (virtio 1.2 §5.7.2): every command that touches the
@@ -87,6 +91,15 @@ const CURSOR_QUEUE_SIZE: u16 = 16;
 /// A control chain is the request, the memory-entry table that only
 /// `RESOURCE_ATTACH_BACKING` carries, and the writable response.
 const CONTROL_CHAIN_LIMIT: u16 = 3;
+
+/// The largest control request a slot holds: a command header followed by
+/// the memory-entry table of a full backing, which `RESOURCE_CREATE_BLOB`
+/// carries with the longer command of the two that take one.
+const CONTROL_REQUEST_BYTES: usize =
+    render::CREATE_BLOB_BYTES + MAX_BACKING_RANGES * MEM_ENTRY_BYTES;
+/// The largest control response a slot holds: the EDID block, which is
+/// longer than every other reply.
+const CONTROL_RESPONSE_BYTES: usize = EDID_RESPONSE_BYTES;
 /// A cursor command is a single readable buffer: the device answers by
 /// returning the descriptor, not by writing a reply.
 const CURSOR_CHAIN_LIMIT: u16 = 1;
@@ -250,8 +263,12 @@ pub struct VirtioGpuDevice<T: VirtioTransport> {
     transport: T,
     control: AsyncMutex<VirtQueue<T>>,
     control_inflight: InFlight<{ CONTROL_QUEUE_SIZE as usize }>,
+    /// Every control command and its response, one slot per descriptor.
+    control_slots: ControlSlots<TransportBuffer<T>>,
     cursor: AsyncMutex<VirtQueue<T>>,
     cursor_inflight: InFlight<{ CURSOR_QUEUE_SIZE as usize }>,
+    /// Every cursor command, one slot per descriptor.
+    cursor_slots: ControlSlots<TransportBuffer<T>>,
     /// Raised by every device interrupt: a completion may be waiting on
     /// either queue.
     completions: Notify,
@@ -329,6 +346,13 @@ impl<T: VirtioTransport> VirtioGpuDevice<T> {
             CURSOR_CHAIN_LIMIT,
             features,
         )?;
+        let control_table = control_slots(
+            &transport,
+            &control,
+            CONTROL_REQUEST_BYTES,
+            CONTROL_RESPONSE_BYTES,
+        )?;
+        let cursor_table = control_slots(&transport, &cursor, UPDATE_CURSOR_BYTES, 0)?;
 
         let scanout_count = transport.read_config_u32(CONFIG_NUM_SCANOUTS);
         if scanout_count == 0 || scanout_count as usize > MAX_SCANOUTS {
@@ -355,8 +379,10 @@ impl<T: VirtioTransport> VirtioGpuDevice<T> {
             transport,
             control: AsyncMutex::new(control),
             control_inflight: InFlight::new(),
+            control_slots: control_table,
             cursor: AsyncMutex::new(cursor),
             cursor_inflight: InFlight::new(),
+            cursor_slots: cursor_table,
             completions: Notify::new(),
             display_events: Notify::new(),
             framebuffers: Mutex::new(ArrayVec::new()),
@@ -455,40 +481,44 @@ impl<T: VirtioTransport> VirtioGpuDevice<T> {
     /// only long enough to publish the chain and is never held across
     /// an await, so several commands are in flight at once and
     /// completions are routed back by descriptor identifier.
+    ///
+    /// `request` is copied into the command's control slot, and the
+    /// device's response header is copied back out into `response`.
+    /// `payload` is a run of memory this driver holds no pointer to,
+    /// carried between the request and the response: the one command that
+    /// has such a body is `SUBMIT_3D`, whose command buffer is the
+    /// guest's own pinned pages, which the device reads where the guest
+    /// wrote them. `tail` is caller memory the device writes after the
+    /// response, which is where a capability set lands.
     pub(crate) async fn control_exchange(
         &self,
-        inputs: &[&[u8]],
-        outputs: &mut [&mut [u8]],
-    ) -> IoResult<u32> {
-        self.control_exchange_with_payload(inputs, None, outputs)
-            .await
-    }
-
-    /// [`Self::control_exchange`], with a run of memory this driver
-    /// holds no pointer to carried between the request and the reply.
-    ///
-    /// The one command that has such a body is `SUBMIT_3D`, whose
-    /// command buffer is the guest's own pinned pages: the device reads
-    /// them where the guest wrote them.
-    pub(crate) async fn control_exchange_with_payload(
-        &self,
-        inputs: &[&[u8]],
+        request: &[&[u8]],
         payload: Option<PhysicalRange>,
-        outputs: &mut [&mut [u8]],
+        response: &mut [u8],
+        tail: &mut [&mut [u8]],
     ) -> IoResult<u32> {
-        let token = submit_chain_with_payload(
+        let mut parts: ArrayVec<Part<'_>, MAX_CHAIN_BUFFERS> = ArrayVec::new();
+        for bytes in request {
+            parts.push(Part::Request(bytes));
+        }
+        if let Some(payload) = payload {
+            parts.push(Part::Payload(payload));
+        }
+        parts.push(Part::Response(response.len()));
+        for bytes in tail.iter_mut() {
+            parts.push(Part::Write(bytes));
+        }
+        let ticket = submit_control(
             &self.control_inflight,
             &self.control,
             &self.transport,
-            inputs,
-            payload,
-            outputs,
+            &self.control_slots,
+            &parts,
         )
         .await?;
-        await_completion(&self.control_inflight, &self.control, token, || {
-            self.completions.notified()
-        })
-        .await
+        let reply = await_completion(&self.control, ticket, || self.completions.notified()).await?;
+        response.copy_from_slice(reply.response());
+        Ok(reply.written())
     }
 
     /// Runs one 2D control command and checks the response header.
@@ -506,7 +536,9 @@ impl<T: VirtioTransport> VirtioGpuDevice<T> {
         } else {
             &all_inputs[..]
         };
-        let written = self.control_exchange(inputs, &mut [&mut *response]).await?;
+        let written = self
+            .control_exchange(inputs, None, response, &mut [])
+            .await?;
         if (written as usize) < CTRL_HEADER_BYTES {
             return Err(IoError::DeviceFault.into());
         }
@@ -519,52 +551,45 @@ impl<T: VirtioTransport> VirtioGpuDevice<T> {
     /// command and returns the descriptor, so the completion is the
     /// whole answer.
     async fn cursor_command(&self, request: &[u8]) -> DisplayResult<()> {
-        let mut outputs: [&mut [u8]; 0] = [];
-        let token = submit_chain(
+        let ticket = submit_control(
             &self.cursor_inflight,
             &self.cursor,
             &self.transport,
-            &[request],
-            &mut outputs,
+            &self.cursor_slots,
+            &[Part::Request(request)],
         )
         .await?;
-        await_completion(&self.cursor_inflight, &self.cursor, token, || {
-            self.completions.notified()
-        })
-        .await?;
+        let _reply = await_completion(&self.cursor, ticket, || self.completions.notified()).await?;
         Ok(())
     }
 
     /// One control round trip on the bring-up path, polled rather than
     /// awaited. See [`VirtioGpuDevice::read_topology`].
     ///
-    /// Both buffers are kernel-heap allocations rather than locals, and
-    /// that is not a style choice: this runs on the boot stack, which
-    /// the platform maps outside the window the device's DMA pool
-    /// translates, so a device handed a stack address reads and writes
-    /// memory that is not this buffer and answers with a completion
-    /// whose reply never arrives. Every later command builds its buffers
-    /// inside a task future, which lives in the kernel's task arena and
-    /// translates correctly.
+    /// The command and its reply travel in the control slot of the
+    /// chain's head descriptor, memory the device owns, and the reply is
+    /// copied out of it. Nothing the device reads or writes is on the
+    /// boot stack, which the platform maps outside what the device's DMA
+    /// pool translates.
     fn blocking_command(
         &self,
         request: &[u8],
         response_bytes: usize,
         expected: u32,
     ) -> DisplayResult<Vec<u8>> {
-        let request = request.to_vec();
         let mut response = vec![0_u8; response_bytes];
         let mut queue = self
             .control
             .try_lock()
             .expect("virtio-gpu bring-up runs alone on the bootstrap processor");
-        let token = queue.submit(
+        let written = exchange_blocking(
+            &self.control_inflight,
+            &mut queue,
             &self.transport,
-            &[request.as_slice()],
-            &mut [response.as_mut_slice()],
+            &self.control_slots,
+            &[Part::Request(request), Part::Response(response_bytes)],
+            &mut response,
         )?;
-        queue.notify(&self.transport);
-        let written = queue.reap_blocking(&self.transport, token)?;
         drop(queue);
         if (written as usize) < CTRL_HEADER_BYTES {
             return Err(IoError::DeviceFault.into());
