@@ -84,6 +84,7 @@ jobs:
         with:
           workspaces: helios
           key: ${{ matrix.name }}
+      - uses: astral-sh/setup-uv@v6
       - name: ${{ matrix.name }}
         working-directory: helios
         run: ${{ matrix.command }}
