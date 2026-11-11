@@ -189,22 +189,27 @@ where
 {
     let thread_count = compiler_plugin_worker_threads(&caller.data().cpu);
     let memory = caller.data().memory();
+    let environ = GuestAddress::wasm32(environ);
     let pointer_status = write_u32(memory, environ, buf);
-    let bytes_status = write_rayon_threads_env(memory, buf, thread_count);
+    let bytes_status = write_rayon_threads_env(memory, GuestAddress::wasm32(buf), thread_count);
     pointer_status.max(bytes_status)
 }
 
-pub(super) fn write_rayon_threads_env(memory: &SharedMemory, ptr: u32, thread_count: u32) -> i32 {
+pub(super) fn write_rayon_threads_env(
+    memory: &SharedMemory,
+    ptr: GuestAddress,
+    thread_count: u32,
+) -> i32 {
     let prefix_status = write_shared_memory(memory, ptr, RAYON_NUM_THREADS_ENV).map_or(28, |_| 0);
     if prefix_status != 0 {
         return prefix_status;
     }
-    let digits_start = ptr + RAYON_NUM_THREADS_ENV.len() as u32;
+    let digits_start = ptr.offset(RAYON_NUM_THREADS_ENV.len() as u64);
     let digits_len = write_decimal(memory, digits_start, thread_count);
     if digits_len < 0 {
         return 28;
     }
-    let nul_ptr = digits_start + digits_len as u32;
+    let nul_ptr = digits_start.offset(digits_len as u64);
     write_shared_memory(memory, nul_ptr, &[0]).map_or(28, |_| 0)
 }
 
@@ -217,7 +222,7 @@ pub(super) fn decimal_len(mut value: u32) -> u32 {
     len
 }
 
-pub(super) fn write_decimal(memory: &SharedMemory, ptr: u32, mut value: u32) -> i32 {
+pub(super) fn write_decimal(memory: &SharedMemory, ptr: GuestAddress, mut value: u32) -> i32 {
     let mut digits = [0_u8; 10];
     let len = decimal_len(value) as usize;
     for index in (0..len).rev() {
@@ -334,7 +339,7 @@ where
 
 pub(super) fn read_compiler_response(
     memory: &SharedMemory,
-    ptr: u32,
+    ptr: GuestAddress,
 ) -> Result<CompilerResponseHeader, ProgramExecError> {
     let bytes = read_shared_memory(
         memory,
@@ -360,7 +365,7 @@ where
         _ => return p1::errno::BADF,
     };
     let bytes = p1_fdstat_bytes(2, 0, p1_descriptor_rights(&descriptor));
-    write_shared_memory(caller.data().memory(), stat, &bytes)
+    write_shared_memory(caller.data().memory(), GuestAddress::wasm32(stat), &bytes)
         .map_or(p1::errno::FAULT, |_| p1::errno::SUCCESS)
 }
 
@@ -380,16 +385,17 @@ where
         return p1::errno::BADF;
     }
     let memory = caller.data().memory();
+    let iovs = GuestAddress::wasm32(iovs);
     let mut written = 0u32;
     for index in 0..iovs_len {
-        let iov = iovs + index * 8;
+        let iov = iovs.offset(u64::from(index) * 8);
         let Ok(ptr) = try_read_u32(memory, iov) else {
             return p1::errno::FAULT;
         };
-        let Ok(len) = try_read_u32(memory, iov + 4) else {
+        let Ok(len) = try_read_u32(memory, iov.offset(4)) else {
             return p1::errno::FAULT;
         };
-        let Ok(bytes) = read_shared_memory(memory, ptr, len) else {
+        let Ok(bytes) = read_shared_memory(memory, GuestAddress::wasm32(ptr), len) else {
             return p1::errno::FAULT;
         };
         // The compiler plugin is bootfs-provisioned and trusted (§3.3),
@@ -399,5 +405,5 @@ where
         caller.data().write_serial.emit(&bytes);
         written = written.saturating_add(len);
     }
-    write_u32(memory, nwritten, written)
+    write_u32(memory, GuestAddress::wasm32(nwritten), written)
 }
