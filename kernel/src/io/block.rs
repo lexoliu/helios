@@ -471,8 +471,7 @@ where
 mod tests {
     use super::*;
 
-    use crate::memory::RootEntropy;
-    use crate::test_support::TestCpu;
+    use crate::test_support::test_root_entropy;
     use futures_lite::future::block_on;
     use spin::Mutex;
 
@@ -563,18 +562,6 @@ mod tests {
         }
     }
 
-    fn root() -> RootEntropyHandle {
-        RootEntropyHandle::new(
-            RootEntropy::from_platform(
-                &TestCpu::with_entropy(0x5a),
-                None,
-                None,
-                crate::MachineGeneration::new(None),
-            )
-            .expect("the test CPU has an entropy source"),
-        )
-    }
-
     #[test]
     fn the_scratch_disk_is_chosen_by_serial_and_the_others_are_left_alone() {
         let disks = alloc::vec![
@@ -582,7 +569,8 @@ mod tests {
             MemoryDisk::new(SCRATCH_DISK_SERIAL),
         ];
 
-        let service = block_on(open_scratch_disk(disks, &root())).expect("scratch disk is present");
+        let service = block_on(open_scratch_disk(disks, &test_root_entropy()))
+            .expect("scratch disk is present");
 
         assert_eq!(
             block_on(service.serial()).expect("serial").as_str(),
@@ -595,7 +583,7 @@ mod tests {
         let disks = alloc::vec![MemoryDisk::new("boot-image")];
 
         assert_eq!(
-            block_on(open_scratch_disk(disks, &root())).err(),
+            block_on(open_scratch_disk(disks, &test_root_entropy())).err(),
             Some(BlockInstallError::NoScratchDisk)
         );
     }
@@ -605,7 +593,7 @@ mod tests {
         let disks = alloc::vec![MemoryDisk::corrupting(SCRATCH_DISK_SERIAL)];
 
         assert_eq!(
-            block_on(open_scratch_disk(disks, &root())).err(),
+            block_on(open_scratch_disk(disks, &test_root_entropy())).err(),
             Some(BlockInstallError::SelfCheck(
                 BlockSelfCheckError::Mismatch { block: 0 }
             ))
@@ -617,7 +605,7 @@ mod tests {
         let disk = MemoryDisk::new(SCRATCH_DISK_SERIAL);
         let service = BlockService::new(disk);
 
-        block_on(service.self_check(&root())).expect("self check should pass");
+        block_on(service.self_check(&test_root_entropy())).expect("self check should pass");
 
         let stats = service.stats();
         assert_eq!(stats.writes, 1);

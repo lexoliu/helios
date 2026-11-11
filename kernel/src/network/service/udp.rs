@@ -625,9 +625,7 @@ impl NetworkShard {
             .map_err(map_udp_connect_error)?
             .address;
         let mut fallback = None;
-        for _ in 0..self.ephemeral_port_attempts() {
-            let candidate = self.next_udp_local_port;
-            self.next_udp_local_port = self.advance_ephemeral_port(self.next_udp_local_port);
+        for candidate in self.ephemeral_walk() {
             if !self.is_udp_local_port_free(candidate) {
                 continue;
             }
@@ -645,9 +643,7 @@ impl NetworkShard {
     }
 
     pub(super) fn allocate_udp_local_port(&mut self) -> Result<u16, UdpError> {
-        for _ in 0..self.ephemeral_port_attempts() {
-            let candidate = self.next_udp_local_port;
-            self.next_udp_local_port = self.advance_ephemeral_port(self.next_udp_local_port);
+        for candidate in self.ephemeral_walk() {
             if self.is_udp_local_port_free(candidate) {
                 return Ok(candidate);
             }
