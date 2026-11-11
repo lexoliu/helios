@@ -241,21 +241,6 @@ pub(super) fn require_local_network_port(port: NetworkPortId) -> Result<(), Netw
     }
 }
 
-pub(super) fn ipv4_mask_prefix_len(mask: Ipv4Address) -> Result<u8, NetworkControlError> {
-    let raw = u32::from_be_bytes(mask.octets());
-    let prefix_len = raw.leading_ones() as u8;
-    let expected = if prefix_len == 0 {
-        0
-    } else {
-        u32::MAX << (32 - prefix_len)
-    };
-    if raw == expected {
-        Ok(prefix_len)
-    } else {
-        Err(NetworkControlError::InvalidAddress)
-    }
-}
-
 pub(super) fn ping_configuration_timeout() -> PingError {
     PingError {
         kind: PingErrorKind::Timeout,

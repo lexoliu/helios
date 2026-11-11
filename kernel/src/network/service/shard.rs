@@ -195,7 +195,10 @@ pub(super) struct NetworkShard {
     pub(super) tcp_streams: HandleSlab<helios_netstack::SocketId, MAX_TCP_STREAM_HANDLES>,
     pub(super) tcp_listeners: HandleSlab<TcpListenerState, MAX_TCP_LISTENER_HANDLES>,
     pub(super) udp_sockets: HandleSlab<UdpSocketState, MAX_UDP_SOCKET_HANDLES>,
-    pub(super) dhcp: DhcpClientState,
+    /// The DHCP client. Only the default shard's is ever driven: the
+    /// exchange is broadcast at a moment when the interface has no
+    /// address to hash a flow with, so it demuxes there.
+    pub(super) dhcp: DhcpClient,
     pub(super) dns_servers: DhcpDnsServers,
     /// Identifier stamped on the next ICMP echo request. ICMP frames
     /// carry no port, so every one of them is demultiplexed onto shard
@@ -1035,6 +1038,7 @@ impl NetworkShard {
             slot, INTERNAL_DHCP_SOCKET_INDEX,
             "DHCP internal UDP socket slot changed"
         );
+        let dhcp = DhcpClient::new(stack.config().mac, transaction_id);
         Self {
             stack,
             shard_idx,
@@ -1043,7 +1047,7 @@ impl NetworkShard {
             tcp_streams: HandleSlab::new(),
             tcp_listeners: HandleSlab::new(),
             udp_sockets,
-            dhcp: DhcpClientState::Init { transaction_id },
+            dhcp,
             dns_servers: DhcpDnsServers::new(),
             next_icmp_echo_identifier: 1,
         }
@@ -1195,6 +1199,6 @@ impl NetworkShard {
         self.clear_ipv4_routes();
         self.stack.restart_ipv6_autoconfig();
         self.dns_servers.clear();
-        self.dhcp = DhcpClientState::Init { transaction_id };
+        self.dhcp.restart(transaction_id);
     }
 }

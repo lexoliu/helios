@@ -441,14 +441,14 @@ where
                     NetworkPumpAction::Continue => {}
                     NetworkPumpAction::Yield => crate::yield_now().await,
                     NetworkPumpAction::Wait => {
-                        self.wait_for_shard_progress(wait, self.pump_wait(pair))
+                        self.wait_for_shard_progress(wait, self.pump_wait(pair, interface_wide))
                             .await;
                     }
                 },
                 Err(error) => {
                     cadence.reset();
                     tracing::debug!(?error, "network packet pump failed to drive device");
-                    self.wait_for_shard_progress(wait, self.pump_wait(pair))
+                    self.wait_for_shard_progress(wait, self.pump_wait(pair, interface_wide))
                         .await;
                 }
             }
@@ -610,39 +610,6 @@ where
             return;
         };
         self.run_packet_pump(assignment).await;
-    }
-}
-
-impl NetworkShard {
-    pub(super) fn retransmit_dhcp(&mut self, now: StackInstant) -> Result<(), NetworkControlError> {
-        match self.dhcp {
-            DhcpClientState::Selecting {
-                transaction_id,
-                last_sent,
-            } if now.nanos().saturating_sub(last_sent.nanos()) >= DHCP_RETRANSMIT_NANOS => {
-                self.send_dhcp_discover(transaction_id, now)?;
-                self.dhcp = DhcpClientState::Selecting {
-                    transaction_id,
-                    last_sent: now,
-                };
-            }
-            DhcpClientState::Requesting {
-                transaction_id,
-                requested_ip,
-                server_identifier,
-                last_sent,
-            } if now.nanos().saturating_sub(last_sent.nanos()) >= DHCP_RETRANSMIT_NANOS => {
-                self.send_dhcp_request(transaction_id, requested_ip, server_identifier, now)?;
-                self.dhcp = DhcpClientState::Requesting {
-                    transaction_id,
-                    requested_ip,
-                    server_identifier,
-                    last_sent: now,
-                };
-            }
-            _ => {}
-        }
-        Ok(())
     }
 }
 
