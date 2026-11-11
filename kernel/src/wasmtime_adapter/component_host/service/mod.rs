@@ -44,7 +44,7 @@ mod wasix_epoll;
 use wasix_epoll::*;
 
 use super::*;
-use crate::process::FreeDescriptorSlots;
+use crate::process::{DescriptorLimit, FreeDescriptorSlots};
 use crate::wasmtime_adapter::artifact_profile::{self, ArtifactProfileError};
 use crate::wasmtime_adapter::code_map::{CodeMap, CodeRegistration};
 use crate::wasmtime_adapter::config::AotCompileHint;
@@ -2667,6 +2667,89 @@ mod tests {
         }
         assert_eq!(table.close_on_exec(1), Ok(false));
         assert!(table.get(3).is_none());
+    }
+
+    fn stdio_table() -> TestDescriptorTable {
+        Preview1DescriptorTable::from_entries(vec![
+            Some(Preview1DescriptorEntry::new(
+                Preview1Descriptor::Stdin {
+                    carry: Bytes::new(),
+                },
+                false,
+            )),
+            Some(Preview1DescriptorEntry::new(
+                Preview1Descriptor::Stdout,
+                false,
+            )),
+            Some(Preview1DescriptorEntry::new(
+                Preview1Descriptor::Stderr,
+                false,
+            )),
+        ])
+    }
+
+    #[test]
+    fn fd_renumber_past_the_descriptor_limit_is_badf_and_allocates_nothing() {
+        let mut table = stdio_table();
+
+        // `fd_renumber` takes an `i32`, so `i32::MAX - 1` is the highest
+        // number a guest can name; it used to resize the table to match.
+        assert_eq!(table.renumber(1, i32::MAX - 1), p1::errno::BADF);
+        assert_eq!(table.renumber(1, -2), p1::errno::BADF);
+        assert_eq!(table.renumber(1, 1024), p1::errno::BADF);
+        assert_eq!(table.entries.len(), 3);
+        assert!(table.get(1).is_some());
+
+        assert_eq!(table.renumber(1, 1023), p1::errno::SUCCESS);
+        assert!(table.get(1023).is_some());
+    }
+
+    #[test]
+    fn fd_dup2_past_the_descriptor_limit_is_badf_and_allocates_nothing() {
+        let mut table = stdio_table();
+        table.limit = DescriptorLimit::new(8);
+
+        assert_eq!(table.dup_to(0, i32::MAX - 1, false), Err(p1::errno::BADF));
+        assert_eq!(table.dup_to(0, 8, false), Err(p1::errno::BADF));
+        assert_eq!(table.entries.len(), 3);
+        assert_eq!(table.dup_to(0, 7, false), Ok(7));
+    }
+
+    #[test]
+    fn spawn_dup2_action_inherits_the_descriptor_limit() {
+        let mut table = stdio_table();
+        table.limit = DescriptorLimit::new(8);
+        let mut snapshot = table.clone_for_exec();
+
+        // The spawn-time dup2 action applies `dup_to` to this table.
+        assert_eq!(snapshot.limit, DescriptorLimit::new(8));
+        assert_eq!(
+            snapshot.dup_to(0, i32::MAX - 1, false),
+            Err(p1::errno::BADF)
+        );
+        assert_eq!(
+            snapshot.insert_at(i32::MAX - 1, Preview1Descriptor::NullDevice, false),
+            Err(p1::errno::BADF)
+        );
+        assert_eq!(snapshot.target_index(i32::MAX - 1), Err(p1::errno::BADF));
+        assert_eq!(snapshot.entries.len(), 3);
+    }
+
+    #[test]
+    fn lowest_free_allocation_at_the_descriptor_limit_is_mfile() {
+        let mut table = stdio_table();
+        table.limit = DescriptorLimit::new(4);
+
+        assert_eq!(table.insert(Preview1Descriptor::NullDevice), Ok(3));
+        assert_eq!(
+            table.insert(Preview1Descriptor::NullDevice),
+            Err(p1::errno::MFILE)
+        );
+        assert_eq!(table.dup(0), Err(p1::errno::MFILE));
+        assert_eq!(table.entries.len(), 4);
+
+        assert_eq!(table.close(1), p1::errno::SUCCESS);
+        assert_eq!(table.dup(0), Ok(1));
     }
 
     #[test]

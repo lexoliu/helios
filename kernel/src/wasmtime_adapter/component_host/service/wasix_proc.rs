@@ -2993,6 +2993,8 @@ where
     if !p1_file_fdflags_supported(fdflags) {
         return Err(p1::errno::INVAL);
     }
+    // Refuse a target past the descriptor limit before the file is opened.
+    snapshot.descriptors.target_index(fd)?;
     let (base, relative_path) = wasix_spawn_resolve_open_base(snapshot, source_fd, path)?;
     let descriptor = p1_open_descriptor_resolved(
         caller,

@@ -60,14 +60,51 @@ where
     }
 }
 
+/// How many descriptor numbers a table hands out: a descriptor number is
+/// valid only below the limit, which is what bounds the table's storage.
+/// It is an operator setting; the table's owner sets it, and nothing here
+/// caps the value it is given.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DescriptorLimit(usize);
+
+impl DescriptorLimit {
+    /// 1024 is the soft `RLIMIT_NOFILE` a new process starts with on Linux,
+    /// the host ABI the WASIX guests are written against.
+    pub const DEFAULT: Self = Self(1024);
+
+    pub const fn new(limit: usize) -> Self {
+        Self(limit)
+    }
+
+    pub const fn get(self) -> usize {
+        self.0
+    }
+
+    /// Whether the descriptor number `index` lies below the limit.
+    pub const fn admits(self, index: usize) -> bool {
+        index < self.0
+    }
+}
+
+impl Default for DescriptorLimit {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum DescriptorTableError {
+    /// The descriptor is not open, or its number is at or past the limit
+    /// (`EBADF`).
     #[error("bad descriptor {0}")]
     BadDescriptor(u32),
     #[error("descriptor rights cannot be widened")]
     RightsWidening,
     #[error("descriptor index overflows usize")]
     IndexOverflow,
+    /// No descriptor number below the limit is free (`EMFILE`).
+    #[error("no free descriptor below the limit of {limit}")]
+    TooManyDescriptors { limit: usize },
 }
 
 #[derive(Clone)]
@@ -77,6 +114,7 @@ where
 {
     entries: Vec<Option<DescriptorEntry<T, Rights>>>,
     free: FreeDescriptorSlots,
+    limit: DescriptorLimit,
 }
 
 impl<T, Rights> Default for DescriptorTable<T, Rights>
@@ -96,6 +134,7 @@ where
         Self {
             entries: Vec::new(),
             free: FreeDescriptorSlots::new(),
+            limit: DescriptorLimit::DEFAULT,
         }
     }
 
@@ -103,7 +142,18 @@ where
         Self {
             entries: Vec::with_capacity(capacity),
             free: FreeDescriptorSlots::with_capacity(capacity),
+            limit: DescriptorLimit::DEFAULT,
         }
+    }
+
+    pub const fn limit(&self) -> DescriptorLimit {
+        self.limit
+    }
+
+    /// Sets the descriptor limit. Descriptors already open at or past a
+    /// lowered limit stay open; no new number at or past it is handed out.
+    pub fn set_limit(&mut self, limit: DescriptorLimit) {
+        self.limit = limit;
     }
 
     pub fn insert(
@@ -111,7 +161,7 @@ where
         resource: KernelResource<T, Rights>,
         close_on_exec: bool,
     ) -> Result<DescriptorId, DescriptorTableError> {
-        let index = self.allocate_slot_index();
+        let index = self.allocate_slot_index()?;
         let id = u32::try_from(index).map_err(|_| DescriptorTableError::IndexOverflow)?;
         self.entries[index] = Some(DescriptorEntry::new(resource, close_on_exec));
         Ok(DescriptorId::new(id))
@@ -177,6 +227,9 @@ where
 
         let source_index = descriptor_index(source)?;
         let target_index = descriptor_index(target)?;
+        if !self.limit.admits(target_index) {
+            return Err(DescriptorTableError::BadDescriptor(target.raw()));
+        }
         let entry = self
             .entries
             .get_mut(source_index)
@@ -202,15 +255,29 @@ where
         }
     }
 
-    fn allocate_slot_index(&mut self) -> usize {
+    /// The lowest free descriptor number below the limit, or
+    /// `TooManyDescriptors`; nothing is allocated on failure.
+    fn allocate_slot_index(&mut self) -> Result<usize, DescriptorTableError> {
         while let Some(index) = self.free.allocate() {
+            if !self.limit.admits(index) {
+                // The heap pops the lowest number, so every other free
+                // number is at or past the limit too. Keep this one free
+                // for when the limit is raised.
+                self.free.release(index);
+                break;
+            }
             if self.entries.get(index).is_some_and(Option::is_none) {
-                return index;
+                return Ok(index);
             }
         }
         let index = self.entries.len();
+        if !self.limit.admits(index) {
+            return Err(DescriptorTableError::TooManyDescriptors {
+                limit: self.limit.get(),
+            });
+        }
         self.entries.push(None);
-        index
+        Ok(index)
     }
 }
 
@@ -274,7 +341,7 @@ fn descriptor_index(descriptor: DescriptorId) -> Result<usize, DescriptorTableEr
 
 #[cfg(test)]
 mod tests {
-    use super::{DescriptorId, DescriptorTable, DescriptorTableError};
+    use super::{DescriptorId, DescriptorLimit, DescriptorTable, DescriptorTableError};
     use helios_hal::fs::FileRights;
     use helios_hal::resource::KernelResource;
 
@@ -398,5 +465,90 @@ mod tests {
 
         assert_eq!(reused.raw(), source.raw());
         assert!(table.get(target).unwrap().resource().rights() == FileRights::READ);
+    }
+
+    #[test]
+    fn renumber_past_the_limit_is_bad_descriptor_and_allocates_nothing() {
+        let mut table = DescriptorTable::new();
+        let source = table
+            .insert(file(FileRights::READ), false)
+            .expect("source insert must succeed");
+        let target = DescriptorId::new(u32::MAX - 1);
+
+        assert_eq!(
+            table.renumber(source, target),
+            Err(DescriptorTableError::BadDescriptor(target.raw()))
+        );
+        assert!(table.get(source).is_ok());
+        assert_eq!(table.entries.len(), 1);
+    }
+
+    #[test]
+    fn renumber_to_the_last_slot_below_the_limit_succeeds() {
+        let mut table = DescriptorTable::new();
+        table.set_limit(DescriptorLimit::new(16));
+        let source = table
+            .insert(file(FileRights::READ), false)
+            .expect("source insert must succeed");
+
+        table
+            .renumber(source, DescriptorId::new(15))
+            .expect("the last number below the limit is valid");
+        assert_eq!(
+            table.renumber(DescriptorId::new(15), DescriptorId::new(16)),
+            Err(DescriptorTableError::BadDescriptor(16))
+        );
+    }
+
+    #[test]
+    fn insert_at_the_limit_is_too_many_descriptors() {
+        let mut table = DescriptorTable::new();
+        table.set_limit(DescriptorLimit::new(2));
+        let first = table
+            .insert(file(FileRights::READ), false)
+            .expect("first insert must succeed");
+        table
+            .insert(file(FileRights::READ), false)
+            .expect("second insert must succeed");
+
+        let full = DescriptorTableError::TooManyDescriptors { limit: 2 };
+        assert_eq!(
+            table.insert(file(FileRights::READ), false).unwrap_err(),
+            full.clone()
+        );
+        assert_eq!(table.dup(first, FileRights::READ, false).unwrap_err(), full);
+        assert_eq!(table.entries.len(), 2);
+
+        table.close(first).expect("close must succeed");
+        let reused = table
+            .insert(file(FileRights::READ), false)
+            .expect("a closed number below the limit is free again");
+        assert_eq!(reused.raw(), first.raw());
+    }
+
+    #[test]
+    fn lowered_limit_keeps_open_descriptors_and_hands_out_no_number_past_it() {
+        let mut table = DescriptorTable::new();
+        for _ in 0..4 {
+            table
+                .insert(file(FileRights::READ), false)
+                .expect("insert must succeed");
+        }
+        table
+            .close(DescriptorId::new(3))
+            .expect("close must succeed");
+        table.set_limit(DescriptorLimit::new(2));
+
+        assert!(table.get(DescriptorId::new(2)).is_ok());
+        assert_eq!(
+            table.insert(file(FileRights::READ), false).unwrap_err(),
+            DescriptorTableError::TooManyDescriptors { limit: 2 }
+        );
+
+        table.set_limit(DescriptorLimit::new(8));
+        let reused = table
+            .insert(file(FileRights::READ), false)
+            .expect("raising the limit frees the number again");
+        assert_eq!(reused.raw(), 3);
     }
 }
