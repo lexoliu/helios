@@ -842,7 +842,8 @@ impl NetworkShard {
                         .transpose()?
                         .ok_or(NetworkControlError::InvalidAddress)?;
                     self.stack
-                        .add_ipv4_address(Ipv4Cidr::new(message.your_ip, prefix_len));
+                        .add_ipv4_address(Ipv4Cidr::new(message.your_ip, prefix_len))
+                        .map_err(|_| NetworkControlError::InvalidAddress)?;
                     if let Some(router) = message.router {
                         self.set_default_ipv4_gateway(map_ipv4_address(router))?;
                     }
@@ -1087,7 +1088,9 @@ impl NetworkShard {
         now: StackInstant,
     ) -> Result<(), NetworkControlError> {
         if self.stack.ipv6_link_local_address().is_none() {
-            self.stack.configure_ipv6_link_local();
+            self.stack
+                .configure_ipv6_link_local()
+                .map_err(|_| NetworkControlError::BackendFault)?;
         }
         self.stack
             .drive_ipv6_autoconfig(now)

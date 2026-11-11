@@ -23,7 +23,7 @@ use helios_hal::vmm::{AddressSpaceError, PageAge, PageFlags, SwapToken, VirtAddr
 use super::{AGE_BATCH_PAGES, SwapLeafFormat, SwapSpace};
 use crate::memory::{
     MemoryOwner, ReservationTracker, allocate_user_frame_zeroed_on, allocate_user_memory_pool,
-    install_user_memory_pool, user_heap_stats,
+    deallocate_user_frame_on, install_user_memory_pool, user_heap_stats,
 };
 
 const PAGE: usize = PhysFrame::SIZE;
@@ -670,5 +670,95 @@ fn a_visitor_that_stops_ends_the_scan_and_reports_what_it_cleared() {
         format.leaf(3) & ACCESSED,
         ACCESSED,
         "later pages are left alone"
+    );
+}
+
+#[test]
+fn a_substituted_page_is_never_detached_or_freed() {
+    let _turn = serialise();
+    let (mut tracker, _) = reservation();
+    let format = ModelFormat::new();
+    let space = SwapSpace::new();
+    commit(&mut tracker, 0, 1);
+    // The frame stands for memory a substitution shows here: someone
+    // else's, which the swap path must neither take nor free.
+    let shown = format.map_frame(0, 0xC3);
+    tracker
+        .record_substitute(VirtRange::new(page_addr(0), PAGE))
+        .expect("substitute");
+    let held = allocated_bytes();
+    let leaf = format.leaf(0);
+
+    let mut out = vec![0_u8; PAGE];
+    assert_eq!(
+        space.swap_out_page(&mut tracker, &format, page_addr(0), token(1), &mut out),
+        Err(AddressSpaceError::Substituted)
+    );
+
+    assert_eq!(
+        format.leaf(0),
+        leaf,
+        "the leaf still shows the substitution"
+    );
+    assert_eq!(allocated_bytes(), held, "nothing was freed");
+    assert!(tracker.swap_entry(page_addr(0)).is_none());
+    assert!(out.iter().all(|&byte| byte == 0), "nothing was copied out");
+    deallocate_user_frame_on(ProcessorId::new(0), shown);
+}
+
+#[test]
+fn a_scan_neither_ages_nor_offers_substituted_pages() {
+    let _turn = serialise();
+    let (mut tracker, _) = reservation();
+    let format = ModelFormat::new();
+    let space = SwapSpace::new();
+    commit(&mut tracker, 0, 3);
+    (0..3).for_each(|page| format.map_flag_only(page));
+    tracker
+        .record_substitute(VirtRange::new(page_addr(1), PAGE))
+        .expect("substitute");
+    let mut seen = Vec::new();
+
+    let visited = space.scan_committed_pages(&tracker, &format, OWNER.raw(), |addr, _, _| {
+        seen.push(addr);
+        true
+    });
+
+    assert_eq!(visited, 2);
+    assert_eq!(seen, [page_addr(0), page_addr(2)]);
+    assert_eq!(
+        format.leaf(1) & ACCESSED,
+        ACCESSED,
+        "the substituted leaf's accessed flag is not the scan's to clear"
+    );
+}
+
+#[test]
+fn substituting_a_swapped_page_queues_its_token_and_keeps_the_new_leaf() {
+    let _turn = serialise();
+    let (mut tracker, _) = reservation();
+    let format = ModelFormat::new();
+    let space = SwapSpace::new();
+    commit(&mut tracker, 0, 2);
+    swapped_out_pages(&space, &mut tracker, &format, 2);
+    // What a backend does before the bookkeeping: both leaves now show
+    // the substituted memory.
+    (0..2).for_each(|page| format.map_flag_only(page));
+    let substituted = VirtRange::new(page_addr(0), 2 * PAGE);
+
+    space.discard(
+        &format,
+        tracker.record_substitute(substituted).expect("substitute"),
+    );
+
+    assert!(
+        (0..2).all(|page| format.leaf(page) == VALID | ACCESSED),
+        "discard leaves a leaf that is no longer a swap entry alone"
+    );
+    assert_eq!(drained(&space), [token(1), token(2)]);
+    assert_eq!(
+        space.swap_in_page(&mut tracker, &format, page_addr(0), &[0_u8; PAGE]),
+        Err(AddressSpaceError::NotSwapped),
+        "a substituted page has nothing to swap back in"
     );
 }

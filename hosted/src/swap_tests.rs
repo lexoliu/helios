@@ -32,8 +32,9 @@ const POOL_BYTES: usize = 1 << 20;
 /// its frames from.
 ///
 /// The pool is process-global and installed once, so the first test in a
-/// process builds it and the rest share it.
-fn machine() {
+/// process builds it and the rest share it. Any test that swaps a page
+/// out, wherever it lives, runs on this machine.
+pub(crate) fn machine() {
     static POOL: Once = Once::new();
     crate::cpu::set_current_processor(ProcessorId::new(0));
     helios_kernel::configure_user_memory_owner_processors(1);

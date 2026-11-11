@@ -20,17 +20,23 @@ package helios:system@0.1.0;
 /// a translation unit, a driver that programs a bad descriptor reaches
 /// all of memory. `confined` says which of the two this grant is.
 interface device {
+  use memory.{span};
+
   /// Why a request was refused.
   enum error {
-    /// No device with this name was discovered.
+    /// No device with this name was discovered, or the kernel did not
+    /// grant this instance the device. The two are not distinguished.
     not-found,
     /// Another instance already holds the device.
     already-claimed,
     /// The grant has no region or interrupt with this index.
     no-such-index,
-    /// The window this instance's device mappings live in has no room
-    /// left.
-    window-exhausted,
+    /// The span is not whole pages inside this instance's memory, is not
+    /// the length the request needs, or overlaps something already
+    /// shown.
+    bad-span,
+    /// The region is already shown in this instance's memory.
+    already-mapped,
     /// The request exceeds the pinned-memory budget the kernel set for
     /// this device.
     budget-exhausted,
@@ -74,15 +80,6 @@ interface device {
     prefetchable: bool,
   }
 
-  /// Where a region ended up in this instance's linear memory.
-  record placement {
-    /// Byte offset of the mapping.
-    offset: u64,
-    /// How many bytes of linear memory the mapping covers, which is the
-    /// region rounded up to whole pages.
-    length: u64,
-  }
-
   /// One delivery of one of the device's interrupts.
   record interrupt-event {
     /// Which of the grant's interrupts fired, as an index into the list
@@ -102,13 +99,10 @@ interface device {
   /// The pages come from this instance's own memory pool and count
   /// against its accounting, so a driver that pins more than the machine
   /// can spare is killed like any other instance that asked for too
-  /// much. A buffer lives as long as the grant does: a driver builds its
-  /// rings once, during its own bring-up.
+  /// much. It is shown at the span it was allocated with for as long as
+  /// the grant lives: a driver builds its rings once, during its own
+  /// bring-up.
   resource dma-buffer {
-    /// Byte offset of the buffer in this instance's linear memory.
-    offset: func() -> u64;
-    /// How long the buffer is, rounded up to whole pages.
-    length: func() -> u64;
     /// The address the device has to issue to reach the buffer. A
     /// physical address on a machine with no translation unit in the
     /// path, and an I/O virtual address on one that confines the device.
@@ -127,12 +121,12 @@ interface device {
     /// Every physical range the device answers on.
     regions: func() -> list<region>;
 
-    /// Map the `index`-th region into this instance's linear memory, or
-    /// report where it already is.
+    /// Show the `index`-th region at `at`, for as long as the grant
+    /// lives.
     ///
-    /// Asking twice is answered rather than refused: a driver that lost
-    /// track of an offset has not corrupted anything.
-    map-region: func(index: u32) -> result<placement, error>;
+    /// `at` is the region's size rounded up to whole wasm pages. A
+    /// region is shown once; asking again is refused `already-mapped`.
+    map-region: func(index: u32, at: span) -> result<_, error>;
 
     /// How many interrupts the device raises.
     interrupt-count: func() -> u32;
@@ -157,8 +151,9 @@ interface device {
     /// Let the controller deliver `index` again.
     unmask: func(index: u32) -> result<_, error>;
 
-    /// Pin a physically contiguous buffer the device can reach.
-    dma-alloc: func(bytes: u64, align: u64) -> result<dma-buffer, error>;
+    /// Pin a physically contiguous buffer the device can reach, as long
+    /// as `at` and aligned to `align`, and show it there, zeroed.
+    dma-alloc: func(align: u64, at: span) -> result<dma-buffer, error>;
 
     /// Whether the platform put this device behind a translation unit.
     /// When it did not, the device reaches all of memory and a bad

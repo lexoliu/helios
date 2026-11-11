@@ -225,8 +225,9 @@ impl SwapSpace {
     }
 
     /// Drops swap entries the tracker handed back from a release, a
-    /// decommit or a commit over them: clears each leaf and queues its
-    /// token for the swap task.
+    /// decommit, a commit or a substitution over them: clears each leaf
+    /// that still carries a swap entry and queues its token for the swap
+    /// task.
     ///
     /// Only the entries it is given are touched: a page of the range that
     /// was never swapped out has its own leaf and is not this method's.

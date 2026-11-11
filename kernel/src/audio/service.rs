@@ -58,12 +58,12 @@ use helios_hal::audio::{
 use helios_hal::vmm::VirtAddr;
 use triomphe::Arc;
 
+use crate::buffer::Buffer;
 use crate::component::{ProviderError, ProviderSender};
 use crate::exec::{Notify, NotifyWaiter};
-use crate::pins::PinnedRun;
+use crate::process::AudioClaimCap;
 
 use super::AudioServiceError;
-use super::instance::AudioPins;
 
 /// Periods the kernel keeps in the device's hands at once.
 ///
@@ -223,13 +223,16 @@ pub(super) enum PlaybackRequest {
 /// slices only through the `unsafe` accessors, whose contract is that
 /// ownership.
 pub struct PeriodRing {
-    /// How many bytes of each period the device plays. The pages behind
-    /// a period are the rounded-up whole granules the arena pinned; the
-    /// device is told this many.
+    /// How many bytes of each period the device plays. The run behind a
+    /// period is the request rounded up to whole granules; the device
+    /// is told this many.
     period_bytes: usize,
     /// Where each period appears in the kernel's own address space, in
     /// the order they were pinned.
     periods: ArrayVec<VirtAddr, PERIODS_IN_FLIGHT>,
+    /// The runs behind `periods`, held for as long as the ring is: the
+    /// playback task holds the ring while the device may read them.
+    _buffers: ArrayVec<Buffer, PERIODS_IN_FLIGHT>,
     /// Periods the producer has written and committed, oldest first.
     filled: ConcurrentQueue<u8>,
     /// Periods the producer may write next.
@@ -262,22 +265,22 @@ pub struct PeriodRing {
 }
 
 impl PeriodRing {
-    /// A ring over `runs`, playing `period_bytes` of each.
+    /// A ring over `buffers`, playing `period_bytes` of each.
     ///
     /// # Panics
     ///
-    /// Panics when a run is shorter than the period it is to carry,
-    /// which would have the device read past pages the instance owns.
-    pub(super) fn new(runs: &[PinnedRun], period_bytes: u32) -> Self {
+    /// Panics when a buffer is shorter than the period it is to carry,
+    /// which would have the device read past memory the instance owns.
+    pub(super) fn new(buffers: ArrayVec<Buffer, PERIODS_IN_FLIGHT>, period_bytes: u32) -> Self {
         let period_bytes = period_bytes as usize;
         let mut periods = ArrayVec::new();
-        for run in runs {
+        for buffer in &buffers {
             assert!(
-                run.bytes >= period_bytes as u64,
-                "a {} byte pinned run cannot carry a {period_bytes} byte period",
-                run.bytes
+                buffer.bytes() >= period_bytes as u64,
+                "a {} byte buffer cannot carry a {period_bytes} byte period",
+                buffer.bytes()
             );
-            periods.push(run.kernel_alias());
+            periods.push(buffer.kernel_alias());
         }
         let free = ConcurrentQueue::bounded(periods.len().max(1));
         for index in 0..periods.len() {
@@ -289,6 +292,7 @@ impl PeriodRing {
             filled: ConcurrentQueue::bounded(periods.len().max(1)),
             free,
             periods,
+            _buffers: buffers,
             committed: Notify::new(),
             reclaimed: Notify::new(),
             closed: AtomicBool::new(false),
@@ -435,9 +439,10 @@ impl PeriodRing {
     /// mean the two lists carry something they were never given.
     pub unsafe fn period(&self, index: u8) -> &[u8] {
         let base = self.address_of(index);
-        // SAFETY: the arena pinned at least `period_bytes` readable,
-        // writable bytes at this address and holds them for as long as
-        // this ring exists, and the caller owns the period.
+        // SAFETY: the buffer behind this address covers at least
+        // `period_bytes` readable, writable bytes of its kernel alias,
+        // this ring holds it for as long as the ring exists, and the
+        // caller owns the period.
         unsafe { core::slice::from_raw_parts(base.raw() as *const u8, self.period_bytes) }
     }
 
@@ -758,8 +763,8 @@ impl Extend<u8> for PeriodCursor {
 /// ever locks or blocks the other: the fields are either single atomic
 /// words read and written with `Acquire`/`Release` (`claim`,
 /// `generation`, `played_bytes`, `xruns`, `lost_feedback`,
-/// `feedback_open`), bounded wait-free queues (`requests`, `returned`,
-/// `feedback`), or notifications (`release`, `published`) armed before
+/// `feedback_open`), bounded wait-free queues (`requests`, `feedback`),
+/// or notifications (`release`, `published`) armed before
 /// the state they report is read. The two-party ownership of the period
 /// ring itself is documented on [`PeriodRing`].
 pub(super) struct StreamShared {
@@ -772,13 +777,6 @@ pub(super) struct StreamShared {
     pub(super) generation: AtomicU64,
     /// One permit per claim that has been let go.
     pub(super) release: Notify,
-    /// The period buffers of a claim that has been let go, waiting for
-    /// the playback task to stop the device reading them.
-    ///
-    /// One slot, and one is provably enough: there is at most one claim
-    /// at a time on a stream, and the claim word does not return to
-    /// [`ClaimState::FREE`] until this has been drained.
-    pub(super) returned: ConcurrentQueue<AudioPins>,
     /// What the kernel has to say about the stream that is playing.
     feedback: ConcurrentQueue<Feedback>,
     /// Raised once per feedback item published, and once when the
@@ -808,7 +806,6 @@ impl StreamShared {
             claim: AtomicU8::new(ClaimState::FREE),
             generation: AtomicU64::new(0),
             release: Notify::new(),
-            returned: ConcurrentQueue::bounded(1),
             feedback: ConcurrentQueue::bounded(FEEDBACK_QUEUE_DEPTH),
             published: Notify::new(),
             feedback_open: AtomicBool::new(true),
@@ -963,7 +960,10 @@ impl AudioService {
     ///
     /// The feedback queue is emptied before the claim is handed back, so
     /// the new owner's stream starts from what happens after it.
-    pub fn claim(&self, id: u32) -> Result<AudioClaim, AudioServiceError> {
+    ///
+    /// `_cap` is the proof that the caller's authority names the audio
+    /// class; the check happened where the cap was derived.
+    pub fn claim(&self, id: u32, _cap: AudioClaimCap) -> Result<AudioClaim, AudioServiceError> {
         if self.shared.playback.is_empty() && self.shared.capture.is_empty() {
             return Err(AudioServiceError::Unavailable);
         }
@@ -1046,25 +1046,6 @@ impl AudioClaim {
             shared: self.shared.clone(),
             generation: self.generation,
         }
-    }
-
-    /// Hand this claim's period buffers to the playback task.
-    ///
-    /// The pages are not freed here: the device may still be reading
-    /// them, and the playback task is what knows when it has stopped.
-    /// Called by the store's own drop, so it neither allocates nor
-    /// waits.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the slot is already occupied, which would mean two
-    /// claims existed at once — the one invariant the claim word is
-    /// there to keep.
-    pub(super) fn return_pins(&self, pins: AudioPins) {
-        self.shared
-            .returned
-            .push(pins)
-            .unwrap_or_else(|_| panic!("two audio claims returned their period buffers at once"));
     }
 }
 

@@ -85,9 +85,11 @@ pub trait SwapLeafFormat {
     /// swap entry is left as it is.
     ///
     /// The reservation bookkeeping no longer holds the entry by the time
-    /// this is called: it came back from the tracker's release, decommit
-    /// or commit, which is why a format whose leaf is the bookkeeping
-    /// itself has nothing left to clear.
+    /// this is called: it came back from the tracker's release, decommit,
+    /// commit or substitution, which is why a format whose leaf is the
+    /// bookkeeping itself has nothing left to clear. After a substitution
+    /// the leaf already shows the substituted memory and is left as it
+    /// is.
     fn clear_swapped(&self, addr: VirtAddr);
 
     /// Clears the accessed flag of a present leaf and reports what it
