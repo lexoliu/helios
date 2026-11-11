@@ -31,6 +31,8 @@ pub mod input;
 pub mod instances;
 #[cfg(feature = "io")]
 pub mod io;
+#[cfg(any(feature = "display", feature = "gpu", feature = "surface"))]
+pub mod memory;
 #[cfg(feature = "net")]
 pub mod net;
 pub mod prelude;

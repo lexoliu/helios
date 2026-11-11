@@ -38,16 +38,13 @@ use futures::channel::oneshot;
 use helios_hal::display::{
     CursorImage, DisplayMode, FramebufferId, PixelFormat, Point, Rect, ScanoutId, ScanoutList,
 };
-use helios_hal::pmm::PhysFrameRange;
 use triomphe::Arc;
 
-use concurrent_queue::ConcurrentQueue;
-
+use crate::buffer::Buffer;
 use crate::component::{ProviderError, ProviderSender};
 use crate::exec::{Notify, NotifyWaiter};
 use crate::process::DisplayClaimCap;
 
-use super::DisplayPins;
 use super::DisplayServiceError;
 
 /// Requests one claim may have in flight on each queue before its next
@@ -178,12 +175,15 @@ pub(crate) enum ControlRequest {
         scanout: ScanoutId,
         reply: oneshot::Sender<Result<DisplayMode, DisplayServiceError>>,
     },
+    /// The frame buffer travels with the request, and the owner task's
+    /// record of the resource keeps it until the display engine has
+    /// destroyed the resource.
     CreateSurface {
         generation: u64,
         scanout: ScanoutId,
         mode: DisplayMode,
         format: PixelFormat,
-        backing: PhysFrameRange,
+        backing: Buffer,
         reply: oneshot::Sender<Result<FramebufferId, DisplayServiceError>>,
     },
     DestroySurface {
@@ -200,7 +200,7 @@ pub(crate) enum ControlRequest {
     CreateCursor {
         generation: u64,
         format: PixelFormat,
-        backing: PhysFrameRange,
+        backing: Buffer,
         reply: oneshot::Sender<Result<FramebufferId, DisplayServiceError>>,
     },
     SetCursor {
@@ -271,13 +271,6 @@ pub(super) struct DisplayShared {
     /// some instance's store outlives the host call that built it and
     /// holds the signal directly.
     pub(super) changes: Arc<SequenceSignal>,
-    /// The frame buffers of a claim that has been let go, waiting for
-    /// the owner task to stop the display engine reading them.
-    ///
-    /// One slot, and one is provably enough: there is at most one claim
-    /// at a time, and the claim word does not return to
-    /// [`ClaimState::FREE`] until this has been drained.
-    pub(super) returned: ConcurrentQueue<DisplayPins>,
 }
 
 /// The kernel's display, as everything outside the owner tasks sees it.
@@ -368,25 +361,6 @@ impl DisplayClaim {
     /// The signal every change to the set of outputs is published on.
     pub fn changes(&self) -> Arc<SequenceSignal> {
         self.shared.changes.clone()
-    }
-
-    /// Hand this claim's frame buffers to the owner task.
-    ///
-    /// The pages are not freed here: the display engine may still be
-    /// scanning them out, and the owner task is what knows when it has
-    /// stopped. Called by the store's own drop, so it neither allocates
-    /// nor waits.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the slot is already occupied, which would mean two
-    /// claims existed at once — the one invariant the claim word is
-    /// there to keep.
-    pub(super) fn return_pins(&self, pins: DisplayPins) {
-        self.shared
-            .returned
-            .push(pins)
-            .unwrap_or_else(|_| panic!("two display claims returned their frame buffers at once"));
     }
 }
 
