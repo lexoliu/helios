@@ -30,6 +30,23 @@ impl GuestAddress {
         Self(raw)
     }
 
+    /// The address a wasm32 guest passed as a pointer.
+    pub const fn wasm32(raw: u32) -> Self {
+        Self(raw as u64)
+    }
+
+    /// The address `bytes` past this one, for a field of a guest structure or
+    /// an element of a guest array.
+    ///
+    /// The sum is computed in 64 bits and saturates, so it never wraps back
+    /// into low guest memory. An address beyond the 32-bit guest space is
+    /// representable and lies outside every guest memory, so the access that
+    /// uses it fails with `EFAULT` at the host-call memory helpers.
+    #[must_use]
+    pub const fn offset(self, bytes: u64) -> Self {
+        Self(self.0.saturating_add(bytes))
+    }
+
     pub const fn raw(self) -> u64 {
         self.0
     }
@@ -164,6 +181,14 @@ mod tests {
             ProcessMemoryIdentity::new(memory),
             GuestAddress::new(address),
         )
+    }
+
+    #[test]
+    fn guest_address_offset_does_not_wrap_the_32_bit_guest_space() {
+        let top = GuestAddress::wasm32(u32::MAX - 2);
+
+        assert_eq!(top.offset(4).raw(), u64::from(u32::MAX) + 2);
+        assert_eq!(GuestAddress::new(u64::MAX).offset(1).raw(), u64::MAX);
     }
 
     #[test]
