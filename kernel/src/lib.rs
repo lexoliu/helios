@@ -1295,10 +1295,8 @@ where
         locality.node_count()
     );
     pool.install_locality(locality);
-    let user_regions: ArrayVec<(usize, usize), MAX_BOOT_MEMORY_REGIONS> = user_runs
-        .iter()
-        .map(|run| (run.start, run.end))
-        .collect();
+    let user_regions: ArrayVec<(usize, usize), MAX_BOOT_MEMORY_REGIONS> =
+        user_runs.iter().map(|run| (run.start, run.end)).collect();
     pool.initialize(&user_regions);
     pool
 }

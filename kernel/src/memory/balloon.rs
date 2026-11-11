@@ -475,19 +475,29 @@ impl<Pool: PhysFrameAllocator, Device: MemoryBalloon + Clone> BalloonService<Poo
             );
             return;
         }
-        let device = self.device.clone();
-        let named = self
-            .pool
-            .free_runs(MIN_REPORT_RUN_FRAMES, REPORT_RUNS_PER_PASS, move |run| {
-                let device = device.clone();
-                async move {
-                    let mut ranges = [unsafe { range_bytes(run) }];
-                    if let Err(error) = device.hint_free_pages(&mut ranges).await {
-                        tracing::warn!(?error, "memory balloon free-page hint failed");
-                    }
-                }
-            })
-            .await;
+        // A hint covers the machine, so every node is walked, each under
+        // the same per-pass bound.
+        let mut named = 0usize;
+        for node in node_ids(self.pool) {
+            let device = self.device.clone();
+            named += self
+                .pool
+                .free_runs(
+                    node,
+                    MIN_REPORT_RUN_FRAMES,
+                    REPORT_RUNS_PER_PASS,
+                    move |run| {
+                        let device = device.clone();
+                        async move {
+                            let mut ranges = [unsafe { range_bytes(run) }];
+                            if let Err(error) = device.hint_free_pages(&mut ranges).await {
+                                tracing::warn!(?error, "memory balloon free-page hint failed");
+                            }
+                        }
+                    },
+                )
+                .await;
+        }
         if let Err(error) = self.device.end_free_page_hint().await {
             tracing::warn!(
                 ?error,

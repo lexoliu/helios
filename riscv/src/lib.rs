@@ -144,11 +144,11 @@ use core::sync::atomic::{AtomicUsize, Ordering, compiler_fence};
 
 use arrayvec::ArrayVec;
 use fdt::Fdt;
+use helios_hal::boot::{BootMemoryKind, BootMemoryRegion, BootReservedRanges, usable_node_regions};
 use helios_hal::cpu::{
     Cpu, GUEST_STACK_LIMIT_OFFSET, Instant, ProcessorId, Timebase, TimerInterrupt,
     current_processor,
 };
-use helios_hal::boot::{BootMemoryKind, BootMemoryRegion, BootReservedRanges, usable_node_regions};
 use helios_hal::critical_section::ProcessorIdentity;
 use helios_hal::memory::MemoryRegion;
 use helios_hal::numa::{NumaTopology, SingleNode};
@@ -744,13 +744,13 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
     }
     let kernel = helios_kernel::init_with_watchdog(
         helios_kernel::Platform::with_watchdog(console, cpu.clone(), watchdog)
-        .with_topology(
-            ProcessorTopology::start_all_secondaries(bootstrap_processor, hart_count)
-                .with_startup_policy(ProcessorStartupPolicy::BootstrapOnly),
-        )
-        .with_timer_frequency_hz(timebase.frequency())
-        .with_dma_model(DmaModel::Identity)
-        .with_devices(devices),
+            .with_topology(
+                ProcessorTopology::start_all_secondaries(bootstrap_processor, hart_count)
+                    .with_startup_policy(ProcessorStartupPolicy::BootstrapOnly),
+            )
+            .with_timer_frequency_hz(timebase.frequency())
+            .with_dma_model(DmaModel::Identity)
+            .with_devices(devices),
     );
     // The root DRBG is seeded once, on the bootstrap hart, before
     // anything can ask for random bytes. RISC-V has no unprivileged
