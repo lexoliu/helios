@@ -34,10 +34,8 @@ fn bootfs() -> PathBuf {
     )
 }
 
-fn counting_task(done: Arc<AtomicUsize>) -> impl Future<Output = ()> + Send {
-    async move {
-        done.fetch_add(1, Ordering::Release);
-    }
+async fn counting_task(done: Arc<AtomicUsize>) {
+    done.fetch_add(1, Ordering::Release);
 }
 
 /// Runs this processor's tasks until all of them have run, parking when
