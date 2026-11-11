@@ -48,8 +48,7 @@ qemu_version = "8.2.2"
 # KVM boots in seconds; a marker hang should fail fast.
 boot_timeout_seconds = 300
 vcpus = 4
-# Without lazy-commit virtual memory the x86 kernel allocates WASIX
-# shared-memory capacity eagerly, so the shell workloads need more guest RAM.
+# instance-startup-500 wants about 6.1 GiB of guest (docs/benchmarks.md).
 memory = "6G"
 linux_vm_memory = "4G"
 net_backend = "tap"
