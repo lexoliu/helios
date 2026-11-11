@@ -373,11 +373,21 @@ pub(crate) fn discover_plic_context(
     fdt: &Fdt<'_>,
     hart_id: u16,
 ) -> Option<(&'static Plic, PlicContext)> {
-    let node = fdt.find_compatible(&["sifive,plic-1.0.0", "riscv,plic0"])?;
-    let base = node.reg()?.next()?.starting_address as usize;
-    let plic = unsafe { Plic::from_addr(base) };
-    let context = parse_plic_context(fdt, node, hart_id)?;
-    Some((plic, context))
+    // A machine may carry several PLICs (QEMU `virt` gives each socket its
+    // own); the hart's supervisor-external context lives in exactly one.
+    fdt.all_nodes()
+        .filter(|node| {
+            node.compatible().is_some_and(|compatible| {
+                compatible
+                    .all()
+                    .any(|name| matches!(name, "sifive,plic-1.0.0" | "riscv,plic0"))
+            })
+        })
+        .find_map(|node| {
+            let context = parse_plic_context(fdt, node, hart_id)?;
+            let base = node.reg()?.next()?.starting_address as usize;
+            Some((unsafe { Plic::from_addr(base) }, context))
+        })
 }
 
 fn parse_plic_context(fdt: &Fdt<'_>, node: FdtNode<'_, '_>, hart_id: u16) -> Option<PlicContext> {
