@@ -29,6 +29,10 @@ use super::{debugger_wit, program_wit};
 #[derive(ComponentType, Lift)]
 #[component(enum)]
 #[repr(u8)]
+#[expect(
+    dead_code,
+    reason = "the `Lift` derive builds every variant by transmuting the guest's checked discriminant"
+)]
 pub(super) enum LevelView {
     #[component(name = "error")]
     Error,
@@ -46,6 +50,10 @@ pub(super) enum LevelView {
 #[derive(ComponentType, Lift)]
 #[component(enum)]
 #[repr(u8)]
+#[expect(
+    dead_code,
+    reason = "the `Lift` derive builds every variant by transmuting the guest's checked discriminant"
+)]
 pub(super) enum ScopeView {
     #[component(name = "kernel")]
     Kernel,
