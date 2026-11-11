@@ -483,12 +483,10 @@ impl<T: VirtioTransport> VirtioGpuDevice<T> {
             outputs,
         )
         .await?;
-        Ok(
-            await_completion(&self.control_inflight, &self.control, token, || {
-                self.completions.notified()
-            })
-            .await,
-        )
+        await_completion(&self.control_inflight, &self.control, token, || {
+            self.completions.notified()
+        })
+        .await
     }
 
     /// Runs one 2D control command and checks the response header.
@@ -531,7 +529,7 @@ impl<T: VirtioTransport> VirtioGpuDevice<T> {
         await_completion(&self.cursor_inflight, &self.cursor, token, || {
             self.completions.notified()
         })
-        .await;
+        .await?;
         Ok(())
     }
 
@@ -564,7 +562,7 @@ impl<T: VirtioTransport> VirtioGpuDevice<T> {
             &mut [response.as_mut_slice()],
         )?;
         queue.notify(&self.transport);
-        let written = queue.reap_blocking(&self.transport, token);
+        let written = queue.reap_blocking(&self.transport, token)?;
         drop(queue);
         if (written as usize) < CTRL_HEADER_BYTES {
             return Err(IoError::DeviceFault.into());

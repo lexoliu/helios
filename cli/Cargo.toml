@@ -27,5 +27,8 @@ wasmparser = "0.245.0"
 wit-component = "0.245.0"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [lints]
 workspace = true

@@ -293,7 +293,16 @@ class Hardware(BaseModel):
 
 
 class Pins(BaseModel):
-    wasmtime_revision: str
+    wasmtime_revision: str = Field(
+        description="the Wasmtime fork revision the `helios` side was built against"
+    )
+    baseline_wasmtime_revision: str | None = Field(
+        default=None,
+        description=(
+            "the Wasmtime fork revision the `helios_baseline` side and its rebuild were "
+            "built against — the one the baseline commit pins (#486) — when the run was paired"
+        ),
+    )
     wasmtime_linux_release: str
     fedora_image_url: str
     fedora_image_sha256: str

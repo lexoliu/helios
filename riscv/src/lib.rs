@@ -144,7 +144,10 @@ use core::sync::atomic::{AtomicUsize, Ordering, compiler_fence};
 
 use arrayvec::ArrayVec;
 use fdt::Fdt;
-use helios_hal::cpu::{Cpu, Instant, ProcessorId, Timebase, TimerInterrupt, current_processor};
+use helios_hal::cpu::{
+    Cpu, GUEST_STACK_LIMIT_OFFSET, Instant, ProcessorId, Timebase, TimerInterrupt,
+    current_processor,
+};
 use helios_hal::critical_section::ProcessorIdentity;
 use helios_hal::memory::MemoryRegion;
 use helios_hal::serial::ByteSerial;
@@ -329,15 +332,27 @@ unsafe impl critical_section::Impl for SupervisorCriticalSection {
     }
 }
 
+/// The hart's local block, addressed by `tp` once [`HartRuntime::install`]
+/// has run.
+///
+/// The layout is `#[repr(C)]` because compiled guest code reads
+/// `guest_stack_limit` as `GUEST_STACK_LIMIT_OFFSET(tp)`; the offset is
+/// asserted below.
+#[repr(C)]
 struct HartRuntime {
+    /// The stack every trap on this hart is built on once
+    /// [`HartRuntime::install`] has published it through `sscratch`.
+    trap_stack: Range<usize>,
+    /// The stack limit of the guest running on this hart, under
+    /// [`GUEST_STACK_LIMIT_OFFSET`]'s contract: Wasmtime publishes it through
+    /// `wasmtime_processor_stack_limit`, and any hart may store the interrupt
+    /// sentinel into it.
+    guest_stack_limit: AtomicUsize,
     hart_id: ProcessorId,
     timer: Timer<RiscvCpu>,
     wasmtime_tls: WasmtimeTlsSlots,
     external_interrupts: Option<net::ExternalInterrupts>,
     program_service: Option<debug_state::ProgramService>,
-    /// The stack every trap on this hart is built on once
-    /// [`HartRuntime::install`] has published it through `sscratch`.
-    trap_stack: Range<usize>,
     /// The stack a kernel exception the kernel did not resolve is handed
     /// to the runtime from (`trap::hand_over_trap`). It is not the trap
     /// stack because the hand-over gives that back before the runtime's
@@ -346,6 +361,11 @@ struct HartRuntime {
     /// The record of this hart's trap hand-over self-check.
     hand_over_probe: trap::HandOverProbe,
 }
+
+const _: () = assert!(
+    core::mem::offset_of!(HartRuntime, guest_stack_limit) == GUEST_STACK_LIMIT_OFFSET as usize,
+    "compiled guest code would compare its stack pointer against the wrong word"
+);
 
 impl HartRuntime {
     /// Publishes this runtime as the hart's identity.
@@ -527,15 +547,10 @@ impl Cpu for RiscvCpu {
 
     fn publish_executable(&self, ptr: *const u8, len: usize) {
         helios_kernel::runtime_memory::publish_code_memory(ptr, len);
-        // `fence.i` is the only ordering RISC-V defines between a store to an
-        // instruction's memory and a fetch of it, and it is per-hart. The
-        // range is published before any other hart can be steered into it, so
-        // fencing the publishing hart is what the hart that executes next
-        // needs; every other hart reaches this code through a scheduler
-        // handoff that fences on its own side.
-        unsafe {
-            core::arch::asm!("fence.i", options(nostack, preserves_flags));
-        }
+        // Every hart is fenced before the range is handed out. A range is
+        // executable only between this call and `unpublish_executable`, so
+        // a reused range is fenced here again before anything runs it.
+        fence_instruction_streams();
     }
 
     fn unpublish_executable(&self, ptr: *const u8, len: usize) {
@@ -770,10 +785,15 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
         .then(|| entropy::bring_up(&fdt))
         .flatten();
     let root_entropy = (current_hart == bootstrap_processor).then(|| {
+        // No VM generation ID window is discovered on this platform yet,
+        // so the machine generation moves only through `advance`.
+        let generation = helios_kernel::MachineGeneration::new(None);
+        debug_state.install_machine_generation(generation.clone());
         let root = helios_kernel::seed_root_entropy(
             &cpu,
             helios_hal::entropy::device_tree_seed(&fdt),
             entropy_device.as_ref().map(|entropy| &entropy.device),
+            generation,
         );
         debug_state.install_root_entropy(root.clone());
         // The calendar is read once, on the bootstrap hart, before any
@@ -870,12 +890,13 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
          hart {hart_id}; the serial line could only be polled"
     );
     let mut hart_runtime = HartRuntime {
+        trap_stack: trap::allocate_trap_stack(),
+        guest_stack_limit: AtomicUsize::new(usize::MAX),
         hart_id: current_hart,
         timer: kernel.timer(),
         wasmtime_tls: WasmtimeTlsSlots::new(),
         external_interrupts,
         program_service: None,
-        trap_stack: trap::allocate_trap_stack(),
         hand_over_stack: trap::allocate_trap_stack(),
         hand_over_probe: trap::HandOverProbe::new(),
     };
@@ -1082,6 +1103,28 @@ fn mark_hart_online(hart: ProcessorId) {
 
 fn hart_is_online(hart: ProcessorId) -> bool {
     ONLINE_HARTS.load(Ordering::Acquire) & hart_bit(hart) != 0
+}
+
+/// Orders every hart's instruction fetch after the stores made to code memory
+/// so far.
+///
+/// `fence.i` is the only ordering RISC-V defines between a store to an
+/// instruction's memory and a fetch of it, and it affects only the hart that
+/// executes it. The current hart fences itself, then `sbi_remote_fence_i`
+/// (SBI specification, chapter 8 "RFENCE Extension", function 0) has every
+/// hart the firmware runs execute `fence.i`.
+fn fence_instruction_streams() {
+    unsafe {
+        core::arch::asm!("fence.i", options(nostack, preserves_flags));
+    }
+    // A hart mask base of `usize::MAX` addresses all available harts.
+    let ret = sbi_rt::remote_fence_i(sbi_rt::HartMask::from_mask_base(0, usize::MAX));
+    assert!(
+        ret.is_ok(),
+        "SBI remote_fence_i failed: error={} value={}",
+        ret.error,
+        ret.value
+    );
 }
 
 fn release_early_boot_harts() {
@@ -1406,6 +1449,14 @@ fn installed_hart_runtime() -> Option<&'static HartRuntime> {
     // SAFETY: only `HartRuntime::install` publishes a runtime address, and it
     // does so from a `&'static HartRuntime`.
     Some(unsafe { &*(address.get() as *const HartRuntime) })
+}
+
+/// The executing hart's guest stack-limit word, the location the kernel's
+/// engines publish stack limits to
+/// (`helios_hal::cpu::GUEST_STACK_LIMIT_OFFSET`).
+#[unsafe(no_mangle)]
+extern "C" fn wasmtime_processor_stack_limit() -> *mut usize {
+    current_hart_runtime().guest_stack_limit.as_ptr()
 }
 
 #[unsafe(no_mangle)]

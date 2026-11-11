@@ -24,6 +24,7 @@ use triomphe::Arc;
 
 use crate::component::ProviderReceiver;
 use crate::device::{DISPLAY_WINDOW_BYTES, DeviceWindow, test_hooks};
+use crate::process::test_caps;
 use crate::test_support::TestCpu;
 
 use super::owner::{display_channels, serve_control};
@@ -191,7 +192,7 @@ fn claimed(shared: &Arc<DisplayShared>) -> DisplayOwnership {
     let service = DisplayService::from_shared(shared.clone());
     let mut ownership = DisplayOwnership::new();
     ownership
-        .claim(&service, window())
+        .claim(&service, window(), test_caps::display())
         .expect("the display is free");
     ownership
 }
@@ -231,9 +232,11 @@ fn a_second_instance_is_refused_the_display_the_first_holds() {
     let (shared, _control, _cursor) = display_channels();
     let service = DisplayService::from_shared(shared.clone());
 
-    let first = service.claim().expect("the display is free");
+    let first = service
+        .claim(test_caps::display())
+        .expect("the display is free");
     assert_eq!(
-        service.claim().err(),
+        service.claim(test_caps::display()).err(),
         Some(DisplayServiceError::AlreadyClaimed)
     );
 
@@ -243,7 +246,7 @@ fn a_second_instance_is_refused_the_display_the_first_holds() {
     // compositor thinks is blank.
     drop(first);
     assert_eq!(
-        service.claim().err(),
+        service.claim(test_caps::display()).err(),
         Some(DisplayServiceError::AlreadyClaimed)
     );
 }
@@ -258,10 +261,12 @@ fn one_instance_holds_the_display_once() {
     let mut ownership = DisplayOwnership::new();
 
     ownership
-        .claim(&service, window())
+        .claim(&service, window(), test_caps::display())
         .expect("the display is free");
     assert_eq!(
-        ownership.claim(&service, window()).err(),
+        ownership
+            .claim(&service, window(), test_caps::display())
+            .err(),
         Some(DisplayServiceError::AlreadyClaimed)
     );
 }
@@ -429,7 +434,7 @@ fn a_released_claim_blanks_before_it_destroys_and_frees_after() {
 
     let service = DisplayService::from_shared(shared.clone());
     assert!(
-        service.claim().is_ok(),
+        service.claim(test_caps::display()).is_ok(),
         "the display is free once its resources are back"
     );
 }
@@ -479,4 +484,85 @@ fn a_request_that_outlived_its_claim_is_not_served() {
             .any(|call| matches!(call, Call::Create(_, _))),
         "nothing was created for a claim that had ended"
     );
+}
+
+/// What a component sees when it calls `display.claim`: the claim is
+/// answered by the instance's own authority before it reaches the
+/// service.
+#[cfg(feature = "wasmtime-runtime")]
+mod component_host {
+    use super::*;
+    use crate::wasmtime_adapter::bindings::display::bindings::helios::system::display as contract;
+    use crate::wasmtime_adapter::component_host::service::test_store;
+    use crate::{DeviceClassRights, ProcessAuthority};
+
+    fn authority_with(classes: DeviceClassRights) -> ProcessAuthority {
+        let mut authority = ProcessAuthority::empty();
+        authority.grant_device_classes(classes);
+        authority
+    }
+
+    /// A store under `authority` on a machine whose display is
+    /// `service`.
+    fn store_under(
+        authority: ProcessAuthority,
+        service: &DisplayService,
+    ) -> test_store::TestStoreData {
+        let mut data = test_store::store_data_authorized(authority, |runtime_state| {
+            runtime_state.install_display_service(service.clone());
+        });
+        data.device.set_memory(crate::device::LinearMemory {
+            base: VirtAddr::new(MEMORY_BASE),
+            reservation_bytes: RESERVATION_BYTES,
+        });
+        data
+    }
+
+    /// An ordinary program is told what a machine with no display tells
+    /// everyone, and the display stays free for its owner.
+    #[test]
+    fn ordinary_program_is_refused_the_display_as_if_there_were_none() {
+        test_hooks::install();
+        let (shared, _control, _cursor) = display_channels();
+        let service = DisplayService::from_shared(shared.clone());
+
+        for authority in [
+            ProcessAuthority::empty(),
+            ProcessAuthority::root(),
+            authority_with(DeviceClassRights::all() - DeviceClassRights::DISPLAY),
+        ] {
+            let mut data = store_under(authority, &service);
+            let answer = <test_store::TestStoreData as contract::Host>::claim(&mut data)
+                .expect("a refusal is an answer, not a trap");
+            assert_eq!(answer.err(), Some(contract::Error::Unavailable));
+            assert!(!data.device.display().holds_display());
+        }
+        assert!(!service.is_claimed(), "nobody took the display");
+
+        let mut absent = test_store::store_data_authorized(ProcessAuthority::empty(), |_| {});
+        let none = <test_store::TestStoreData as contract::Host>::claim(&mut absent)
+            .expect("a machine with no display answers");
+        assert_eq!(
+            none.err(),
+            Some(contract::Error::Unavailable),
+            "the answer is the one a machine with no display gives"
+        );
+    }
+
+    /// The compositor's provisioning holds the display class, so its
+    /// claim goes through.
+    #[test]
+    fn provisioned_owner_claims_the_display() {
+        test_hooks::install();
+        let (shared, _control, _cursor) = display_channels();
+        let service = DisplayService::from_shared(shared.clone());
+        let mut data = store_under(authority_with(DeviceClassRights::DISPLAY), &service);
+
+        let answer = <test_store::TestStoreData as contract::Host>::claim(&mut data)
+            .expect("the claim is answered");
+
+        assert!(answer.is_ok(), "the owner is given the display");
+        assert!(service.is_claimed());
+        assert!(data.device.display().holds_display());
+    }
 }
