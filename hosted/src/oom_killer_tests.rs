@@ -597,9 +597,9 @@ fn no_swap_reports_unsupported() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .build()
         .expect("tokio runtime");
-    let result = runtime.block_on(backend.swap_out(b"some bytes"));
+    assert!(backend.buffer(16).is_err(), "NoSwap has no staging buffer");
+    let result = runtime.block_on(backend.swap_out([]));
     assert!(result.is_err(), "NoSwap must refuse swap_out");
-    let mut buffer = [0u8; 16];
-    let result = runtime.block_on(backend.swap_in((), &mut buffer));
+    let result = runtime.block_on(backend.swap_in((), []));
     assert!(result.is_err(), "NoSwap must refuse swap_in");
 }

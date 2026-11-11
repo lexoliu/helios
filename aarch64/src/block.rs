@@ -73,7 +73,7 @@ where
     let timer = kernel.timer();
     let swap_cpu = *cpu;
     helios_kernel::install_block_devices(kernel, root, devices, move |service| {
-        state.install_block_service(service.clone());
+        state.install_block_service(service.stats_handle());
         install_swap(&state, service, spawner, timer, swap_cpu);
     });
     for interrupt in &discovered {
@@ -90,7 +90,7 @@ where
 /// the whole extent is handed out fresh every time.
 fn install_swap(
     state: &RuntimeState,
-    service: helios_kernel::BlockService,
+    service: helios_kernel::BlockService<Aarch64VirtioBlockDevice>,
     spawner: helios_kernel::Spawner<Aarch64Cpu>,
     timer: helios_kernel::Timer<Aarch64Cpu>,
     cpu: Aarch64Cpu,
@@ -113,7 +113,7 @@ fn install_swap(
             return;
         }
     };
-    let handle = helios_kernel::install_swap(
+    let handle = match helios_kernel::install_swap(
         spawner,
         timer,
         cpu,
@@ -121,7 +121,18 @@ fn install_swap(
         backend,
         "virtio-blk",
         (swap_blocks * block_bytes) as u64,
-    );
+    ) {
+        Ok(handle) => handle,
+        Err(error) => {
+            tracing::warn!(
+                target: "helios_aarch64::swap",
+                %error,
+                "scratch disk could not supply swap's staging page"
+            );
+            helios_kernel::disable_swap(helios_kernel::SwapDisabled::NoSwapDevice);
+            return;
+        }
+    };
     state.install_swap(handle);
 }
 

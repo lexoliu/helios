@@ -81,6 +81,51 @@ impl helios_netstack::TcpReceiveBuffer for RegisteredTcpReadBuffer<'_> {
     }
 }
 
+/// A TCP write's bytes, produced one piece at a time in memory the
+/// interface transmits from ([`ComponentNetworkService::tcp_payload`]).
+///
+/// Each piece is at most one socket's send buffer
+/// ([`helios_netstack::TCP_TRANSMIT_BUFFER_BYTES`]), so a write drawn
+/// through this iterator holds one piece of transmit memory beyond what
+/// the socket's send queue holds, however long the write.
+/// `fill(offset, piece)` copies bytes `offset..offset + piece.len()` of
+/// the write into `piece`: the one copy the write makes, straight from
+/// the caller's memory. It runs when the
+/// writer asks for the next piece, after the previous one was queued, so
+/// the source has to stay readable for the whole write — a guest call
+/// that blocks its caller, or a stream buffer the guest has lent until
+/// it is marked read.
+pub struct TcpPayloadPieces<'a, Net, Fill> {
+    service: &'a Net,
+    len: usize,
+    offset: usize,
+    fill: Fill,
+}
+
+impl<Net, Fill> Iterator for TcpPayloadPieces<'_, Net, Fill>
+where
+    Net: ComponentNetworkService,
+    Fill: FnMut(usize, &mut [u8]),
+{
+    type Item = Result<Bytes, TcpError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.offset == self.len {
+            return None;
+        }
+        let offset = self.offset;
+        let piece_len = (self.len - offset).min(helios_netstack::TCP_TRANSMIT_BUFFER_BYTES);
+        let fill = &mut self.fill;
+        let piece = self
+            .service
+            .tcp_payload(piece_len, |piece| fill(offset, piece));
+        if piece.is_ok() {
+            self.offset += piece_len;
+        }
+        Some(piece)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ExecOutput {
     pub stdout: Vec<u8>,
@@ -769,20 +814,67 @@ pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
         timeout_nanos: u64,
     ) -> impl Future<Output = Result<TcpAccepted<Self::TcpStream>, TcpError>> + Send + '_;
 
-    fn tcp_write_all<'a>(
+    /// Memory the interface transmits a TCP payload from in place.
+    type TxPayload: AsRef<[u8]> + AsMut<[u8]> + Send + Sync + 'static;
+
+    /// At least `bytes` of memory the interface can transmit from.
+    ///
+    /// Every byte a TCP write queues lives in such memory: the stack
+    /// hands queued payload to the device by reference, so a write
+    /// copies its source here once and never through an intermediate
+    /// buffer. `bytes` is non-zero: an empty write names no memory and
+    /// has nothing to move.
+    fn tcp_transmit_payload(&self, bytes: usize) -> Result<Self::TxPayload, TcpError>;
+
+    /// A `len`-byte payload that `fill` writes, frozen for queuing.
+    fn tcp_payload(&self, len: usize, fill: impl FnOnce(&mut [u8])) -> Result<Bytes, TcpError> {
+        let mut payload = self.tcp_transmit_payload(len)?;
+        fill(&mut payload.as_mut()[..len]);
+        let mut frozen = Bytes::from_owner(payload);
+        frozen.truncate(len);
+        Ok(frozen)
+    }
+
+    /// A `len`-byte write that `fill` copies piece by piece into transmit
+    /// memory, as [`TcpPayloadPieces`] describes.
+    fn tcp_payload_pieces<Fill>(&self, len: usize, fill: Fill) -> TcpPayloadPieces<'_, Self, Fill>
+    where
+        Fill: FnMut(usize, &mut [u8]),
+    {
+        TcpPayloadPieces {
+            service: self,
+            len,
+            offset: 0,
+            fill,
+        }
+    }
+
+    /// Writes every piece `pieces` yields, in order, each one frozen from
+    /// [`tcp_payload`](Self::tcp_payload) memory.
+    ///
+    /// A piece is drawn only once the one before it is queued, so a lazy
+    /// iterator ([`TcpPayloadPieces`]) holds one piece of transmit memory
+    /// beyond the send queue at a time. The timeout covers the whole
+    /// write, not each piece; the first piece that fails to allocate ends
+    /// the write with its error.
+    fn tcp_write_all<'a, Pieces>(
         &'a self,
         stream: Self::TcpStream,
-        bytes: &'a [u8],
+        pieces: Pieces,
         timeout_nanos: u64,
-    ) -> impl Future<Output = Result<(), TcpError>> + Send + 'a;
+    ) -> impl Future<Output = Result<(), TcpError>> + Send + 'a
+    where
+        Pieces: Iterator<Item = Result<Bytes, TcpError>> + Send + 'a;
 
+    /// Writes one payload frozen from [`tcp_payload`](Self::tcp_payload)
+    /// memory.
     fn tcp_write_all_bytes<'a>(
         &'a self,
         stream: Self::TcpStream,
         bytes: Bytes,
         timeout_nanos: u64,
     ) -> impl Future<Output = Result<(), TcpError>> + Send + 'a {
-        async move { self.tcp_write_all(stream, &bytes, timeout_nanos).await }
+        self.tcp_write_all(stream, core::iter::once(Ok(bytes)), timeout_nanos)
     }
 
     fn tcp_read<'a>(

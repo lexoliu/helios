@@ -28,11 +28,12 @@ use crate::{
     largest_servable_user_bytes, machine_memory, monotonic_nanos, user_heap_stats,
 };
 use helios_hal::cpu::Cpu;
+use smallvec::SmallVec;
 use spin::Mutex;
 use thiserror::Error;
 use wasmtime::component::{
     Access, Accessor, Component, Destination, FutureReader, HasSelf, Linker, Resource,
-    ResourceTable, ResourceType, StreamProducer, StreamReader, StreamResult,
+    ResourceTable, ResourceType, StreamProducer, StreamReader, StreamResult, WasmList,
 };
 use wasmtime::{self, Engine, Store, StoreContextMut};
 
@@ -2351,28 +2352,29 @@ where
     instance.func_wrap_concurrent(
         "[method]tcp-stream.write",
         |accessor: &Accessor<StoreData<CpuImpl, Net, HostFs>>,
-         (resource, bytes, timeout): (Resource<SbiTcpStream<Net>>, Vec<u8>, u64)| {
+         (resource, bytes, timeout): (Resource<SbiTcpStream<Net>>, WasmList<u8>, u64)| {
             Box::pin(async move {
-                let (socket, profile) = accessor.with(|mut access| {
+                let (service, stream, profile, payload) = accessor.with(|mut access| {
                     let socket = access.get().table.get(&resource)?;
-                    Ok::<_, wasmtime::Error>((
-                        (
-                            socket.resource.backend.service.clone(),
-                            socket.resource.backend.stream(),
-                        ),
-                        component_host_profile(access.get()),
-                    ))
+                    let service = socket.resource.backend.service.clone();
+                    let stream = socket.resource.backend.stream();
+                    let profile = component_host_profile(access.get());
+                    let payload =
+                        stream.map(|_| sbi_tcp_payload(&service, bytes.as_le_slice(&access)));
+                    Ok::<_, wasmtime::Error>((service, stream, profile, payload))
                 })?;
-                let Some(stream) = socket.1 else {
+                let (Some(stream), Some(payload)) = (stream, payload) else {
                     return Ok::<_, wasmtime::Error>((Err(closed_tcp_error()),));
                 };
                 let written = bytes.len() as u64;
-                let response = socket
-                    .0
-                    .tcp_write_all_bytes(stream, Bytes::from(bytes), timeout)
-                    .await
-                    .map(|()| written)
-                    .map_err(convert_tcp_error);
+                let response = match payload {
+                    Ok(pieces) => service
+                        .tcp_write_all(stream, pieces.into_iter().map(Ok), timeout)
+                        .await
+                        .map(|()| written),
+                    Err(error) => Err(error),
+                }
+                .map_err(convert_tcp_error);
                 record_component_host_kernel_profile(profile, "system-net-tcp-write");
                 Ok::<_, wasmtime::Error>((response,))
             })
@@ -2687,28 +2689,29 @@ where
     instance.func_wrap_concurrent(
         "[method]tcp-stream.write",
         |accessor: &Accessor<StoreData<CpuImpl, Net, HostFs>>,
-         (resource, bytes, timeout): (Resource<SbiTcpStream<Net>>, Vec<u8>, u64)| {
+         (resource, bytes, timeout): (Resource<SbiTcpStream<Net>>, WasmList<u8>, u64)| {
             Box::pin(async move {
-                let (socket, profile) = accessor.with(|mut access| {
+                let (service, stream, profile, payload) = accessor.with(|mut access| {
                     let socket = access.get().table.get(&resource)?;
-                    Ok::<_, wasmtime::Error>((
-                        (
-                            socket.resource.backend.service.clone(),
-                            socket.resource.backend.stream(),
-                        ),
-                        component_host_profile(access.get()),
-                    ))
+                    let service = socket.resource.backend.service.clone();
+                    let stream = socket.resource.backend.stream();
+                    let profile = component_host_profile(access.get());
+                    let payload =
+                        stream.map(|_| sbi_tcp_payload(&service, bytes.as_le_slice(&access)));
+                    Ok::<_, wasmtime::Error>((service, stream, profile, payload))
                 })?;
-                let Some(stream) = socket.1 else {
+                let (Some(stream), Some(payload)) = (stream, payload) else {
                     return Ok::<_, wasmtime::Error>((Err(closed_program_tcp_error()),));
                 };
                 let written = bytes.len() as u64;
-                let response = socket
-                    .0
-                    .tcp_write_all_bytes(stream, Bytes::from(bytes), timeout)
-                    .await
-                    .map(|()| written)
-                    .map_err(convert_program_tcp_error);
+                let response = match payload {
+                    Ok(pieces) => service
+                        .tcp_write_all(stream, pieces.into_iter().map(Ok), timeout)
+                        .await
+                        .map(|()| written),
+                    Err(error) => Err(error),
+                }
+                .map_err(convert_program_tcp_error);
                 record_component_host_kernel_profile(profile, "program-net-tcp-write");
                 Ok::<_, wasmtime::Error>((response,))
             })
@@ -3331,6 +3334,24 @@ fn closed_program_tcp_error() -> program_wit::net::TcpError {
         kind: program_wit::net::TcpErrorKind::Unavailable,
         detail: "TCP stream is closed".to_owned(),
     }
+}
+
+/// A `tcp-stream.write` list copied into transmit memory, one send buffer
+/// per piece.
+///
+/// The whole list is copied on the call's first poll, before it can
+/// yield: a guest that lowered the call asynchronously runs on once that
+/// poll returns and may reuse the list's memory, so nothing may read it
+/// later. This is the copy the lifted `list<u8>` used to make into the
+/// kernel heap, now made into memory the interface transmits from.
+fn sbi_tcp_payload<Net: crate::ComponentNetworkService>(
+    service: &Net,
+    bytes: &[u8],
+) -> Result<SmallVec<[Bytes; 2]>, crate::TcpError> {
+    bytes
+        .chunks(helios_netstack::TCP_TRANSMIT_BUFFER_BYTES)
+        .map(|chunk| service.tcp_payload(chunk.len(), |piece| piece.copy_from_slice(chunk)))
+        .collect()
 }
 
 fn unavailable_tcp_error() -> debugger_wit::net::TcpError {

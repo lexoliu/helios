@@ -20,7 +20,7 @@ use spin::{Mutex, Once};
 
 use crate::memory::BalloonHandle;
 
-use crate::BlockService;
+use crate::BlockStatsHandle;
 use crate::ComponentHostVsockService;
 use crate::component::{ComponentRuntimeState, ProviderSlot};
 use crate::device::DeviceGrantRegistry;
@@ -58,7 +58,7 @@ struct RuntimeStateInner<ProgramService, NetworkService, HostFsService> {
     host_fs_service: Mutex<Option<HostFsService>>,
     /// The scratch disk the platform gave this kernel, once it has been
     /// identified and proved. Empty on a machine with no block device.
-    block_service: Once<BlockService>,
+    block_service: Once<BlockStatsHandle>,
     /// The devices the machine is willing to hand to user-mode drivers,
     /// as discovery published them. Empty on a machine whose backend
     /// found nothing outside the hardware it drives itself.
@@ -939,7 +939,7 @@ where
     /// Called from the task that identified the disk and proved it round
     /// trips, so a service that is visible here is one every consumer may
     /// use without checking it first.
-    pub fn install_block_service(&self, service: BlockService) {
+    pub fn install_block_service(&self, service: BlockStatsHandle) {
         let mut installed = false;
         self.inner.block_service.call_once(|| {
             installed = true;
@@ -948,7 +948,7 @@ where
         assert!(installed, "block service was installed more than once");
     }
 
-    pub fn block_service(&self) -> Option<BlockService> {
+    pub fn block_service(&self) -> Option<BlockStatsHandle> {
         self.inner.block_service.get().cloned()
     }
 
@@ -1061,7 +1061,7 @@ where
             wall_clock: self.wall_clock_nanos(current_ticks),
             configured_processors: self.inner.processor_count,
             online_processors: self.inner.processor_count,
-            block: self.inner.block_service.get().map(BlockService::stats),
+            block: self.inner.block_service.get().map(BlockStatsHandle::stats),
             iommu: self
                 .inner
                 .iommu_report

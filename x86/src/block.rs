@@ -104,7 +104,7 @@ where
         .collect();
     let state = debug_state.clone();
     helios_kernel::install_block_devices(kernel, root, devices, move |service| {
-        state.install_block_service(service);
+        state.install_block_service(service.stats_handle());
     });
     discovered
 }

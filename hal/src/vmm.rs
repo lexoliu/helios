@@ -58,6 +58,7 @@ use core::ptr::NonNull;
 use thiserror::Error;
 
 use crate::device::{DeviceRegion, DmaPlacement};
+use crate::dma::{BufError, BufResult};
 use crate::iommu::PhysicalRange;
 use crate::pmm::PhysFrame;
 
@@ -259,23 +260,43 @@ pub trait SwapBackend: Send + Sync + 'static {
     /// Reasons a swap operation can fail.
     type Error: core::fmt::Display + core::fmt::Debug + Send + Sync + 'static;
 
-    /// Persist `bytes` away from RAM and return a token that can
-    /// later resurrect them via `swap_in`. The implementation owns
-    /// the lifecycle of the storage and decides eviction order on
-    /// its own.
-    fn swap_out<'a>(
-        &'a self,
-        bytes: &'a [u8],
-    ) -> impl Future<Output = Result<Self::Token, Self::Error>> + Send + 'a;
+    /// Memory a page is staged in on its way to and from the storage.
+    ///
+    /// The storage reads and writes the buffer in place, so the backend
+    /// allocates it: a backend on a device that transfers by DMA hands out
+    /// memory the device can reach, one on a file hands out plain memory.
+    type Buffer: AsRef<[u8]> + AsMut<[u8]> + Send + Sync + 'static;
 
-    /// Restore previously swapped-out bytes into `dst`. After this
-    /// returns successfully, the token is no longer valid (the
-    /// storage may be reclaimed).
-    fn swap_in<'a>(
-        &'a self,
+    /// Allocates a zeroed staging buffer able to hold `bytes` bytes.
+    ///
+    /// The buffer may be longer than `bytes` when the storage transfers in
+    /// whole units: the caller uses the first `bytes` bytes and the
+    /// backend stores and restores the whole buffer.
+    fn buffer(&self, bytes: usize) -> Result<Self::Buffer, Self::Error>;
+
+    /// Persist `page` away from RAM and return a token that can
+    /// later resurrect it via `swap_in`, together with `page`. The
+    /// implementation owns the lifecycle of the storage and decides
+    /// eviction order on its own.
+    ///
+    /// The page is the request's until the storage has finished with it
+    /// (see [`crate::dma`]'s "Buffers a request owns"), so a backend on a
+    /// device keeps it while the device reads it, whatever happens to
+    /// this future.
+    fn swap_out(
+        &self,
+        page: Self::Buffer,
+    ) -> impl Future<Output = BufResult<Self::Token, Self::Buffer, Self::Error>> + Send + '_;
+
+    /// Restore previously swapped-out bytes into `page` and hand it
+    /// back. After this returns successfully, the token is no longer
+    /// valid (the storage may be reclaimed). Owned the way `swap_out`'s
+    /// page is.
+    fn swap_in(
+        &self,
         token: Self::Token,
-        dst: &'a mut [u8],
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a;
+        page: Self::Buffer,
+    ) -> impl Future<Output = BufResult<(), Self::Buffer, Self::Error>> + Send + '_;
 
     /// Discard the storage behind `token` without reading it back.
     ///
@@ -303,13 +324,25 @@ pub struct NoSwapError;
 impl SwapBackend for NoSwap {
     type Token = ();
     type Error = NoSwapError;
+    type Buffer = [u8; 0];
 
-    async fn swap_out(&self, _bytes: &[u8]) -> Result<Self::Token, Self::Error> {
+    fn buffer(&self, _bytes: usize) -> Result<Self::Buffer, Self::Error> {
         Err(NoSwapError)
     }
 
-    async fn swap_in(&self, _token: Self::Token, _dst: &mut [u8]) -> Result<(), Self::Error> {
-        Err(NoSwapError)
+    async fn swap_out(
+        &self,
+        page: Self::Buffer,
+    ) -> BufResult<Self::Token, Self::Buffer, Self::Error> {
+        Err(BufError::returned(NoSwapError, page))
+    }
+
+    async fn swap_in(
+        &self,
+        _token: Self::Token,
+        page: Self::Buffer,
+    ) -> BufResult<(), Self::Buffer, Self::Error> {
+        Err(BufError::returned(NoSwapError, page))
     }
 
     async fn release(&self, _token: Self::Token) {}

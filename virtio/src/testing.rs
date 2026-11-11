@@ -689,6 +689,11 @@ const CONFINED_ARENA_BYTES: usize = 4 << 20;
 struct ConfinedArena {
     storage: Vec<u8>,
     next: AtomicUsize,
+    /// Every buffer that was dropped, as `(start, len)`: memory the pool
+    /// would be free to hand out again. The arena never does, so a test
+    /// can ask afterwards whether a device wrote into memory its owner had
+    /// already given back.
+    released: Mutex<Vec<(usize, usize)>>,
 }
 
 /// A DMA pool that reaches only the memory it handed out.
@@ -714,6 +719,17 @@ pub(crate) struct ConfinedDmaPool {
 pub(crate) struct ConfinedDmaBuffer {
     ptr: NonNull<u8>,
     len: usize,
+    /// Where the buffer reports itself released when it drops.
+    arena: Arc<ConfinedArena>,
+}
+
+impl Drop for ConfinedDmaBuffer {
+    fn drop(&mut self) {
+        self.arena
+            .released
+            .lock()
+            .push((self.ptr.as_ptr() as usize, self.len));
+    }
 }
 
 // SAFETY: the buffer names memory owned by the pool's arena, which the
@@ -728,6 +744,7 @@ impl ConfinedDmaPool {
             arena: Arc::new(ConfinedArena {
                 storage: alloc::vec![0; size + PAGE_ALIGNMENT],
                 next: AtomicUsize::new(0),
+                released: Mutex::new(Vec::new()),
             }),
         }
     }
@@ -753,6 +770,44 @@ impl ConfinedDmaPool {
                 .checked_add(bytes.len())
                 .is_some_and(|end| end <= handed_out)
     }
+
+    /// Whether any of the `len` bytes at device address `address` belong
+    /// to a buffer that has been dropped: a write there is a write into
+    /// memory its owner already gave back.
+    pub(crate) fn is_released(&self, address: u64, len: usize) -> bool {
+        let start = address as usize;
+        let end = start + len;
+        self.arena
+            .released
+            .lock()
+            .iter()
+            .any(|&(freed, freed_len)| start < freed + freed_len && freed < end)
+    }
+
+    /// Plays a device that writes `response` into the writable buffers of
+    /// chain `token` of `queue`, after checking that every byte it is
+    /// about to write still belongs to a live buffer.
+    ///
+    /// # Panics
+    ///
+    /// When a writable descriptor names memory that was released: the
+    /// driver let a buffer go while the device could still write it.
+    pub(crate) fn respond_into_live_memory<T: VirtioTransport>(
+        &self,
+        queue: &crate::queue::VirtQueue<T>,
+        token: u16,
+        response: &[u8],
+    ) -> u32 {
+        for (address, len, writable) in queue.device_chain(token) {
+            if writable {
+                assert!(
+                    !self.is_released(address, len as usize),
+                    "the device would write {len} bytes at {address:#x}, memory that was already released"
+                );
+            }
+        }
+        queue.device_respond(token, response)
+    }
 }
 
 impl DmaMemory for ConfinedDmaPool {
@@ -773,6 +828,7 @@ impl DmaMemory for ConfinedDmaPool {
         Ok(ConfinedDmaBuffer {
             ptr,
             len: layout.size(),
+            arena: self.arena.clone(),
         })
     }
 
@@ -853,5 +909,33 @@ impl WindowDmaBuffer {
     /// The buffer as guest memory a driver can be handed.
     pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
         unsafe { core::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+    }
+}
+
+impl AsRef<[u8]> for ConfinedDmaBuffer {
+    fn as_ref(&self) -> &[u8] {
+        // SAFETY: the buffer owns `len` bytes of the pool's arena and
+        // nothing else names them.
+        unsafe { core::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+    }
+}
+
+impl AsMut<[u8]> for ConfinedDmaBuffer {
+    fn as_mut(&mut self) -> &mut [u8] {
+        self.as_mut_slice()
+    }
+}
+
+impl AsRef<[u8]> for WindowDmaBuffer {
+    fn as_ref(&self) -> &[u8] {
+        // SAFETY: the buffer owns `len` bytes of the pool's arena and
+        // nothing else names them.
+        unsafe { core::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+    }
+}
+
+impl AsMut<[u8]> for WindowDmaBuffer {
+    fn as_mut(&mut self) -> &mut [u8] {
+        self.as_mut_slice()
     }
 }

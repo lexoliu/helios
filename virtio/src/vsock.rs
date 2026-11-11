@@ -777,10 +777,14 @@ mod tests {
         );
 
         // A later send gets a slot of its own.
+        let second_token = next_token(&device);
         let mut second = pin!(device.send(header(VsockOp::Reset, 0), &[]));
         assert!(block_on(poll_once(second.as_mut())).is_none());
         let queue = device.tx_queue.try_lock().expect("the sender is parked");
-        assert_ne!(queue.device_chain(0)[0].0, queue.device_chain(1)[0].0);
+        assert_ne!(
+            queue.device_chain(0)[0].0,
+            queue.device_chain(second_token)[0].0
+        );
 
         // The device finishing the dropped packet releases its slot and
         // leaves the second request waiting.
@@ -789,6 +793,34 @@ mod tests {
         device.handle_interrupt();
         assert!(block_on(poll_once(second.as_mut())).is_none());
         assert!(device.tx_inflight.is_idle(0));
+
+        // The queue is not stalled: the second packet completes, and a
+        // third goes through after it.
+        device
+            .tx_queue
+            .try_lock()
+            .expect("the sender is parked")
+            .device_complete(second_token, 0);
+        device.handle_interrupt();
+        assert_eq!(block_on(poll_once(second.as_mut())), Some(Ok(())));
+        let third_token = next_token(&device);
+        let mut third = pin!(device.send(header(VsockOp::Data, 4), b"pong"));
+        assert!(block_on(poll_once(third.as_mut())).is_none());
+        let queue = device.tx_queue.try_lock().expect("the sender is parked");
+        assert_eq!(&queue.device_request(third_token)[HEADER_BYTES..], b"pong");
+        queue.device_complete(third_token, 0);
+        drop(queue);
+        device.handle_interrupt();
+        assert_eq!(block_on(poll_once(third.as_mut())), Some(Ok(())));
+    }
+
+    /// The identifier the next transmitted packet will be headed by.
+    fn next_token(device: &VirtioVsockDevice<ConfinedTransport>) -> u16 {
+        device
+            .tx_queue
+            .try_lock()
+            .expect("no sender holds the transmit lock")
+            .next_free_descriptor()
     }
 
     #[test]

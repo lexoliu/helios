@@ -319,6 +319,50 @@ impl DmaBuffer for OffsetDmaBuffer {
     }
 }
 
+impl AsRef<[u8]> for IdentityDmaBuffer {
+    fn as_ref(&self) -> &[u8] {
+        // SAFETY: the buffer owns `layout.size()` zero-initialised bytes
+        // for as long as it lives.
+        unsafe { core::slice::from_raw_parts(self.ptr.as_ptr(), self.layout.size()) }
+    }
+}
+
+impl AsMut<[u8]> for IdentityDmaBuffer {
+    fn as_mut(&mut self) -> &mut [u8] {
+        // SAFETY: as above, and `&mut self` is the only way to this memory
+        // from the CPU.
+        unsafe { core::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.layout.size()) }
+    }
+}
+
+impl AsRef<[u8]> for OffsetDmaBuffer {
+    fn as_ref(&self) -> &[u8] {
+        // SAFETY: the buffer owns `layout.size()` zero-initialised bytes
+        // for as long as it lives.
+        unsafe { core::slice::from_raw_parts(self.ptr.as_ptr(), self.layout.size()) }
+    }
+}
+
+impl AsMut<[u8]> for OffsetDmaBuffer {
+    fn as_mut(&mut self) -> &mut [u8] {
+        // SAFETY: as above, and `&mut self` is the only way to this memory
+        // from the CPU.
+        unsafe { core::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.layout.size()) }
+    }
+}
+
+impl<B: AsRef<[u8]>> AsRef<[u8]> for PlatformDmaBuffer<B> {
+    fn as_ref(&self) -> &[u8] {
+        self.inner.as_ref()
+    }
+}
+
+impl<B: AsMut<[u8]>> AsMut<[u8]> for PlatformDmaBuffer<B> {
+    fn as_mut(&mut self) -> &mut [u8] {
+        self.inner.as_mut()
+    }
+}
+
 impl Drop for IdentityDmaBuffer {
     fn drop(&mut self) {
         unsafe {

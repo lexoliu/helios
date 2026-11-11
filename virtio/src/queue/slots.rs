@@ -54,6 +54,7 @@
 use core::alloc::Layout;
 use core::marker::PhantomData;
 use core::mem::align_of;
+use core::ops::Range;
 
 use crossbeam_utils::CachePadded;
 use helios_hal::dma::{DmaBuffer, DmaMemory};
@@ -84,9 +85,79 @@ pub(crate) enum Part<'a> {
     Payload(PhysicalRange),
     /// Memory the caller owns and the device writes.
     Write(&'a mut [u8]),
+    /// Bytes `range` of buffer `buffer` of what the request lent the
+    /// device ([`Lend`]), which the device reads.
+    LentRead { buffer: usize, range: Range<usize> },
+    /// Bytes `range` of buffer `buffer` of what the request lent the
+    /// device, which the device writes.
+    LentWrite { buffer: usize, range: Range<usize> },
     /// This many bytes of the slot's response area, which the device
     /// writes and the driver copies out after the completion.
     Response(usize),
+}
+
+/// The buffers a request moves into the device for as long as its chain
+/// is in flight.
+///
+/// A request lends them when it submits, and they park with the chain's
+/// head descriptor in the completion table
+/// ([`InFlight`](crate::inflight::InFlight)): the completed request takes
+/// them back with its reply, and a request dropped mid-flight leaves them
+/// there for the device's completion to free. The chain is described from
+/// them before they move into the table, which is sound because every
+/// implementation holds [`DmaBuffer`]s, whose bytes do not move with the
+/// value.
+pub(crate) trait Lend: Send + 'static {
+    /// Lent buffer `index`, which [`Part::LentRead`] and
+    /// [`Part::LentWrite`] name. `None` when there is no such buffer.
+    fn lent(&mut self, index: usize) -> Option<&mut [u8]>;
+}
+
+/// A request that lends the device nothing: its data is copied through
+/// control slots, or it has none.
+impl Lend for () {
+    fn lent(&mut self, _index: usize) -> Option<&mut [u8]> {
+        None
+    }
+}
+
+/// A request that may carry one data buffer.
+impl<B: DmaBuffer + AsMut<[u8]>> Lend for Option<B> {
+    fn lent(&mut self, index: usize) -> Option<&mut [u8]> {
+        match (index, self) {
+            (0, Some(buffer)) => Some(buffer.as_mut()),
+            _ => None,
+        }
+    }
+}
+
+/// A request that carries `K` data buffers.
+impl<B: DmaBuffer + AsMut<[u8]>, const K: usize> Lend for [B; K] {
+    fn lent(&mut self, index: usize) -> Option<&mut [u8]> {
+        self.get_mut(index).map(AsMut::as_mut)
+    }
+}
+
+/// Bytes `range` of lent buffer `buffer`, or the error that names what the
+/// chain asked for and what was lent.
+fn lent_bytes<'a, L: Lend>(
+    lent: &'a mut L,
+    buffer: usize,
+    range: &Range<usize>,
+) -> Result<&'a [u8], VirtqueueError> {
+    let bytes: &'a [u8] = lent.lent(buffer).ok_or(VirtqueueError::LentOutOfRange {
+        buffer,
+        end: range.end,
+        len: 0,
+    })?;
+    let len = bytes.len();
+    bytes
+        .get(range.clone())
+        .ok_or(VirtqueueError::LentOutOfRange {
+            buffer,
+            end: range.end,
+            len,
+        })
 }
 
 /// Where a chain's response bytes sit inside its slot.
@@ -94,11 +165,6 @@ pub(crate) enum Part<'a> {
 pub(crate) struct ResponseSpan {
     offset: usize,
     len: usize,
-}
-
-impl ResponseSpan {
-    /// A chain with no response area.
-    pub(crate) const NONE: Self = Self { offset: 0, len: 0 };
 }
 
 /// One slot per descriptor identifier of one queue.
@@ -153,11 +219,12 @@ impl<B: DmaBuffer> ControlSlots<B> {
     /// being read, and no other task is staging into it. Holding the queue
     /// lock after the completion table reported `head` idle is exactly
     /// that.
-    pub(super) unsafe fn stage<P: DmaMemory<Buffer = B>>(
+    pub(super) unsafe fn stage<P: DmaMemory<Buffer = B>, L: Lend>(
         &self,
         dma: &P,
         head: u16,
         parts: &[Part<'_>],
+        lent: &mut L,
         chain: &mut [ChainEntry; MAX_CHAIN_BUFFERS],
     ) -> Result<(usize, ResponseSpan), VirtqueueError> {
         if parts.len() > MAX_CHAIN_BUFFERS {
@@ -200,6 +267,12 @@ impl<B: DmaBuffer> ControlSlots<B> {
                 Part::Read(bytes) => (entry(dma, bytes, false)?, false),
                 Part::Payload(run) => (foreign_entry(dma, *run)?, false),
                 Part::Write(bytes) => (entry(dma, bytes, true)?, true),
+                Part::LentRead { buffer, range } => {
+                    (entry(dma, lent_bytes(lent, *buffer, range)?, false)?, false)
+                }
+                Part::LentWrite { buffer, range } => {
+                    (entry(dma, lent_bytes(lent, *buffer, range)?, true)?, true)
+                }
                 Part::Response(len) => {
                     let offset = self.request + response_used;
                     response_used = self.fit(response_used, *len, self.response)?;
@@ -419,7 +492,7 @@ pub(crate) fn exchange_blocking<T: VirtioTransport, const N: usize>(
     }
     // SAFETY: `queue` is held exclusively and the completion table says
     // `head` is idle, so the slot is ours.
-    let (token, span) = unsafe { queue.submit_parts(transport, slots, parts)? };
+    let (token, span) = unsafe { queue.submit_parts(transport, slots, parts, &mut ())? };
     queue.notify(transport);
     let written = queue.reap_blocking(transport, token)?;
     let window = slots.window(token, span);
@@ -439,6 +512,7 @@ mod tests {
     use crate::testing::{ConfinedTransport, FakeTransport, FakeTransportConfig};
     use crate::transport::VirtioFeatures;
     use crate::transport::VirtioTransport;
+    use helios_hal::dma::DmaBuffer;
 
     const REQUEST: usize = 8;
     const RESPONSE: usize = 8;
@@ -473,7 +547,8 @@ mod tests {
             writable: false,
         }; MAX_CHAIN_BUFFERS];
         // SAFETY: the test owns every slot of its own table.
-        unsafe { slots.stage(transport.bus().dma(), head, parts, &mut chain) }.map(|(len, _)| len)
+        unsafe { slots.stage(transport.bus().dma(), head, parts, &mut (), &mut chain) }
+            .map(|(len, _)| len)
     }
 
     #[test]
@@ -544,6 +619,7 @@ mod tests {
                     transport.bus().dma(),
                     head,
                     &[Part::Request(&[head as u8])],
+                    &mut (),
                     &mut chain,
                 )
             }
@@ -554,5 +630,77 @@ mod tests {
         starts.sort_unstable();
         starts.dedup();
         assert_eq!(starts.len(), 8, "no two descriptors share a slot");
+    }
+
+    #[test]
+    fn lent_parts_name_the_lent_buffer_in_place() {
+        let (transport, slots) = table();
+        let buffer = transport.pool().buffer(64);
+        let start = buffer.device_address().get();
+        let mut lent = [buffer];
+        let mut chain = [ChainEntry {
+            addr: 0,
+            len: 0,
+            writable: false,
+        }; MAX_CHAIN_BUFFERS];
+        // SAFETY: the test owns every slot of its own table.
+        let (used, _) = unsafe {
+            slots.stage(
+                transport.bus().dma(),
+                0,
+                &[
+                    Part::LentRead {
+                        buffer: 0,
+                        range: 0..16,
+                    },
+                    Part::LentWrite {
+                        buffer: 0,
+                        range: 16..64,
+                    },
+                ],
+                &mut lent,
+                &mut chain,
+            )
+        }
+        .expect("the lent ranges are inside the buffer");
+        assert_eq!(used, 2);
+        assert_eq!(
+            (chain[0].addr, chain[0].len, chain[0].writable),
+            (start, 16, false)
+        );
+        assert_eq!(
+            (chain[1].addr, chain[1].len, chain[1].writable),
+            (start + 16, 48, true)
+        );
+    }
+
+    #[test]
+    fn a_lent_range_past_its_buffer_is_refused() {
+        let (transport, slots) = table();
+        let mut lent = [transport.pool().buffer(64)];
+        let mut chain = [ChainEntry {
+            addr: 0,
+            len: 0,
+            writable: false,
+        }; MAX_CHAIN_BUFFERS];
+        for (buffer, end, len) in [(0, 65, 64), (1, 8, 0)] {
+            // SAFETY: the test owns every slot of its own table.
+            let refused = unsafe {
+                slots.stage(
+                    transport.bus().dma(),
+                    0,
+                    &[Part::LentWrite {
+                        buffer,
+                        range: 0..end,
+                    }],
+                    &mut lent,
+                    &mut chain,
+                )
+            };
+            assert_eq!(
+                refused.err(),
+                Some(VirtqueueError::LentOutOfRange { buffer, end, len })
+            );
+        }
     }
 }

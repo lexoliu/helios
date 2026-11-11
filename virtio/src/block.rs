@@ -17,15 +17,17 @@
 //! written and the completion is awaited on that same queue.
 
 use alloc::boxed::Box;
-use alloc::vec;
 use alloc::vec::Vec;
 use arrayvec::ArrayVec;
 use async_lock::Mutex;
+use core::alloc::Layout;
 use core::cmp;
 use core::mem::{size_of, size_of_val};
+use core::ops::Range;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use helios_hal::cpu::{Cpu, current_processor};
+use helios_hal::dma::{BufError, BufResult, DmaMemory};
 use helios_hal::fs::{
     BlockDevice, BlockDeviceCapabilities, BlockDeviceRights, BlockGeometry, BlockQueueTopology,
     BlockRange, BlockSerial,
@@ -34,11 +36,12 @@ use helios_hal::io::{IoError, IoResult};
 use helios_hal::resource::KernelResource;
 use helios_hal::vmm::SwapBackend;
 
+use crate::bus::DeviceBus;
 use crate::features::{NegotiatedFeatures, RING_FEATURES, negotiate};
-use crate::inflight::{InFlight, Reply, await_completion, submit_control};
+use crate::inflight::{InFlight, Reply, await_completion, submit_lent};
 use crate::notify::Notify;
 use crate::queue::{
-    ControlSlots, MAX_CHAIN_BUFFERS, Part, TransportBuffer, VirtQueue, control_slots,
+    ControlSlots, Lend, MAX_CHAIN_BUFFERS, Part, TransportBuffer, VirtQueue, control_slots,
 };
 use crate::transport::{DeviceStatus, DeviceType, VirtioTransport};
 
@@ -62,6 +65,11 @@ const BLOCK_QUEUE_SLOTS: usize = BLOCK_MAX_QUEUE_SIZE as usize;
 /// travel in a single read-only buffer, so this bounds a stack array
 /// rather than a descriptor chain.
 const DEALLOCATE_SEGMENTS: usize = 8;
+
+/// Alignment of a data buffer a consumer allocates with
+/// [`BlockDevice::buffer`]: a cache line of the target, so two buffers
+/// never share one.
+const BUFFER_ALIGNMENT: usize = core::mem::align_of::<crossbeam_utils::CachePadded<u8>>();
 
 /// Bytes of the identifier a device reports for `VIRTIO_BLK_T_GET_ID`.
 const BLOCK_ID_BYTES: usize = 20;
@@ -146,7 +154,9 @@ enum ReqType {
 /// chains in flight on it.
 struct BlockQueue<T: VirtioTransport> {
     queue: Mutex<VirtQueue<T>>,
-    inflight: InFlight<BLOCK_QUEUE_SLOTS>,
+    /// Completion slots, each parking the data buffer of the read or
+    /// write it heads until the device returns the chain.
+    inflight: InFlight<BLOCK_QUEUE_SLOTS, Lent<T>>,
     /// The request header, the discard and write-zeroes segment list and
     /// the status byte (and the identifier a `GET_ID` fills in) of every
     /// request in flight, one slot per descriptor.
@@ -164,6 +174,27 @@ const RESPONSE_SLOT_BYTES: usize = BLOCK_ID_BYTES + size_of::<u8>();
 
 /// The response area of a request that reports nothing but its status.
 const STATUS_ONLY: &[usize] = &[size_of::<u8>()];
+
+/// What a request lends the device: the data buffer of a read or a
+/// write, nothing for the requests whose bytes all travel in their
+/// control slot.
+type Lent<T> = Option<TransportBuffer<T>>;
+
+/// The data a chain carries: bytes `range` of the buffer the request
+/// lent, which the device writes for a read and reads for a write.
+struct DataRange {
+    range: Range<usize>,
+    device_writes: bool,
+}
+
+/// A data request's failure with its buffer, which every data request
+/// lends.
+fn data_error<B>(error: BufError<Option<B>>) -> BufError<B> {
+    BufError {
+        error: error.error,
+        buffers: error.buffers.flatten(),
+    }
+}
 
 /// Requests the device has completed, by kind.
 #[derive(Debug, Default)]
@@ -597,71 +628,106 @@ impl<T: VirtioTransport, C: QueueAffinity> VirtioBlockDevice<T, C> {
         (block_id as u64) * self.limits.sectors_per_block as u64
     }
 
-    async fn read_blocks(&self, block_id: usize, buf: &mut [u8]) -> IoResult<()> {
+    /// Reads the whole of `buf` starting at logical block `block_id`, one
+    /// chain per [`RequestLimits::max_transfer_bytes`], and hands `buf`
+    /// back.
+    ///
+    /// The chains run one after another, so at any moment `buf` is lent
+    /// to at most one of them and parks with that chain's head.
+    async fn read_blocks(
+        &self,
+        block_id: usize,
+        buf: TransportBuffer<T>,
+    ) -> BufResult<(), TransportBuffer<T>> {
         let block_bytes = self.geometry.logical_block_bytes;
         let stride = self.limits.max_transfer_bytes(block_bytes);
+        let total = buf.as_ref().len();
+        let mut buf = buf;
         let mut offset = 0;
-        while offset < buf.len() {
-            let len = cmp::min(stride, buf.len() - offset);
+        while offset < total {
+            let len = cmp::min(stride, total - offset);
             let sector = self.sector_of(block_id + offset / block_bytes);
             let request = BlkReq::new(ReqType::In, sector);
-            let mut segments: ArrayVec<&mut [u8], MAX_CHAIN_BUFFERS> = ArrayVec::new();
-            for segment in buf[offset..offset + len].chunks_mut(self.limits.segment_bytes) {
-                segments.push(segment);
-            }
             let reply = self
                 .execute(
                     ReqType::In,
                     &[as_bytes(&request)],
-                    &[],
-                    &mut segments,
+                    Some(DataRange {
+                        range: offset..offset + len,
+                        device_writes: true,
+                    }),
+                    Some(buf),
                     STATUS_ONLY,
                 )
-                .await?;
-            map_block_status(status_of(&reply)?)?;
+                .await
+                .map_err(data_error)?;
+            let status = status_of(&reply);
             let used = reply.written();
+            buf = reply
+                .into_lent()
+                .expect("a read gets back the buffer it lent");
             // The used length counts everything the device wrote into the
             // chain, which is the payload plus the status byte. A short
             // read is a device fault rather than a partial success: the
             // caller asked for whole blocks and the tail would otherwise
             // silently keep whatever was in the buffer.
-            let written = usize::try_from(used)
-                .map_err(|_| IoError::DeviceFault)?
-                .checked_sub(size_of::<u8>())
-                .ok_or(IoError::DeviceFault)?;
-            if written != len {
-                return Err(IoError::DeviceFault);
+            let outcome = status.and_then(map_block_status).and_then(|()| {
+                let written = usize::try_from(used)
+                    .map_err(|_| IoError::DeviceFault)?
+                    .checked_sub(size_of::<u8>())
+                    .ok_or(IoError::DeviceFault)?;
+                if written != len {
+                    return Err(IoError::DeviceFault);
+                }
+                Ok(())
+            });
+            if let Err(error) = outcome {
+                return Err(BufError::returned(error, buf));
             }
             offset += len;
         }
-        Ok(())
+        Ok(((), buf))
     }
 
-    async fn write_blocks(&self, block_id: usize, buf: &[u8]) -> IoResult<()> {
+    /// Writes the whole of `buf` starting at logical block `block_id`,
+    /// and hands `buf` back. Lent the way [`Self::read_blocks`] lends it.
+    async fn write_blocks(
+        &self,
+        block_id: usize,
+        buf: TransportBuffer<T>,
+    ) -> BufResult<(), TransportBuffer<T>> {
         let block_bytes = self.geometry.logical_block_bytes;
         let stride = self.limits.max_transfer_bytes(block_bytes);
+        let total = buf.as_ref().len();
+        let mut buf = buf;
         let mut offset = 0;
-        while offset < buf.len() {
-            let len = cmp::min(stride, buf.len() - offset);
+        while offset < total {
+            let len = cmp::min(stride, total - offset);
             let sector = self.sector_of(block_id + offset / block_bytes);
             let request = BlkReq::new(ReqType::Out, sector);
-            let mut segments: ArrayVec<&[u8], MAX_CHAIN_BUFFERS> = ArrayVec::new();
-            for segment in buf[offset..offset + len].chunks(self.limits.segment_bytes) {
-                segments.push(segment);
-            }
             let reply = self
                 .execute(
                     ReqType::Out,
                     &[as_bytes(&request)],
-                    &segments,
-                    &mut [],
+                    Some(DataRange {
+                        range: offset..offset + len,
+                        device_writes: false,
+                    }),
+                    Some(buf),
                     STATUS_ONLY,
                 )
-                .await?;
-            map_block_status(status_of(&reply)?)?;
+                .await
+                .map_err(data_error)?;
+            let status = status_of(&reply);
+            buf = reply
+                .into_lent()
+                .expect("a write gets back the buffer it lent");
+            if let Err(error) = status.and_then(map_block_status) {
+                return Err(BufError::returned(error, buf));
+            }
             offset += len;
         }
-        Ok(())
+        Ok(((), buf))
     }
 
     async fn flush_cache(&self) -> IoResult<()> {
@@ -676,11 +742,12 @@ impl<T: VirtioTransport, C: QueueAffinity> VirtioBlockDevice<T, C> {
             .execute(
                 ReqType::Flush,
                 &[as_bytes(&request)],
-                &[],
-                &mut [],
+                None,
+                None,
                 STATUS_ONLY,
             )
-            .await?;
+            .await
+            .map_err(BufError::into_error)?;
         map_block_status(status_of(&reply)?)
     }
 
@@ -692,11 +759,12 @@ impl<T: VirtioTransport, C: QueueAffinity> VirtioBlockDevice<T, C> {
             .execute(
                 ReqType::GetId,
                 &[as_bytes(&request)],
-                &[],
-                &mut [],
+                None,
+                None,
                 &[BLOCK_ID_BYTES, size_of::<u8>()],
             )
-            .await?;
+            .await
+            .map_err(BufError::into_error)?;
         map_block_status(status_of(&reply)?)?;
         let reported = usize::try_from(reply.written())
             .map_err(|_| IoError::DeviceFault)?
@@ -747,11 +815,12 @@ impl<T: VirtioTransport, C: QueueAffinity> VirtioBlockDevice<T, C> {
                 .execute(
                     request,
                     &[as_bytes(&header), as_bytes_slice(&segments)],
-                    &[],
-                    &mut [],
+                    None,
+                    None,
                     STATUS_ONLY,
                 )
-                .await?;
+                .await
+                .map_err(BufError::into_error)?;
             map_block_status(status_of(&reply)?)?;
         }
         Ok(())
@@ -762,8 +831,15 @@ impl<T: VirtioTransport, C: QueueAffinity> VirtioBlockDevice<T, C> {
     ///
     /// `request` is copied into the control slot of the chain's head
     /// descriptor, and `response` sizes the device-written slot bytes
-    /// that follow the caller's data buffers. Nothing the device reads or
-    /// writes at the end of the chain lives in this future.
+    /// that follow the data. Nothing the device reads or writes at either
+    /// end of the chain lives in this future.
+    ///
+    /// `data` names the bytes of `lent` the chain carries, cut into
+    /// segments of at most the device's segment size. `lent` parks with
+    /// the chain until the device returns it, and comes back in the
+    /// reply; a request that fails before the chain is published gets it
+    /// back in the error, and one whose queue faulted with the chain in
+    /// flight leaves it with the device.
     ///
     /// The completion is routed by descriptor identifier: whichever task
     /// wins the queue lock after an interrupt drains everything the
@@ -774,34 +850,57 @@ impl<T: VirtioTransport, C: QueueAffinity> VirtioBlockDevice<T, C> {
         &self,
         kind: ReqType,
         request: &[&[u8]],
-        data_in: &[&[u8]],
-        data_out: &mut [&mut [u8]],
+        data: Option<DataRange>,
+        lent: Lent<T>,
         response: &[usize],
-    ) -> IoResult<Reply<'_, BLOCK_QUEUE_SLOTS>> {
+    ) -> Result<Reply<'_, BLOCK_QUEUE_SLOTS, Lent<T>>, BufError<Lent<T>>> {
         let mut parts: ArrayVec<Part<'_>, MAX_CHAIN_BUFFERS> = ArrayVec::new();
         for bytes in request {
             parts.push(Part::Request(bytes));
         }
-        for bytes in data_in {
-            parts.push(Part::Read(bytes));
-        }
-        for bytes in data_out.iter_mut() {
-            parts.push(Part::Write(bytes));
+        if let Some(DataRange {
+            range,
+            device_writes,
+        }) = data
+        {
+            let mut start = range.start;
+            while start < range.end {
+                let end = cmp::min(start + self.limits.segment_bytes, range.end);
+                parts.push(if device_writes {
+                    Part::LentWrite {
+                        buffer: 0,
+                        range: start..end,
+                    }
+                } else {
+                    Part::LentRead {
+                        buffer: 0,
+                        range: start..end,
+                    }
+                });
+                start = end;
+            }
         }
         for len in response {
             parts.push(Part::Response(*len));
         }
 
         let queue = self.queue_for_current_processor();
-        let ticket = submit_control(
+        let ticket = submit_lent(
             &queue.inflight,
             &queue.queue,
             &self.transport,
             &queue.slots,
             &parts,
+            lent,
         )
         .await?;
-        let reply = await_completion(&queue.queue, ticket, || self.interrupts.notified()).await?;
+        // A chain that never comes back keeps what it was lent.
+        let reply = await_completion(&queue.queue, ticket, || self.interrupts.notified())
+            .await
+            .map_err(|error| BufError {
+                error,
+                buffers: None,
+            })?;
         self.counters.count(kind);
         Ok(reply)
     }
@@ -1050,29 +1149,41 @@ impl<T: VirtioTransport, C: QueueAffinity> Clone for VirtioBlockResource<T, C> {
 }
 
 impl<T: VirtioTransport, C: QueueAffinity> BlockDevice for VirtioBlockResource<T, C> {
-    async fn read_block(&self, block_id: usize, buf: &mut [u8]) -> IoResult<()> {
-        validate_request(
+    type Buffer = TransportBuffer<T>;
+
+    fn buffer(&self, bytes: usize) -> IoResult<Self::Buffer> {
+        let layout =
+            Layout::from_size_align(bytes, BUFFER_ALIGNMENT).map_err(|_| IoError::OutOfBounds)?;
+        self.object().transport.bus().dma().allocate_zeroed(layout)
+    }
+
+    async fn read_block(&self, block_id: usize, buf: Self::Buffer) -> BufResult<(), Self::Buffer> {
+        if let Err(error) = validate_request(
             self.rights(),
             self.object().geometry,
             block_id,
-            buf.len(),
+            buf.as_ref().len(),
             BlockDeviceRights::READ,
-        )?;
+        ) {
+            return Err(BufError::returned(error, buf));
+        }
 
         self.object().read_blocks(block_id, buf).await
     }
 
-    async fn write_block(&self, block_id: usize, buf: &[u8]) -> IoResult<()> {
-        validate_request(
+    async fn write_block(&self, block_id: usize, buf: Self::Buffer) -> BufResult<(), Self::Buffer> {
+        if let Err(error) = validate_request(
             self.rights(),
             self.object().geometry,
             block_id,
-            buf.len(),
+            buf.as_ref().len(),
             BlockDeviceRights::WRITE,
-        )?;
+        ) {
+            return Err(BufError::returned(error, buf));
+        }
 
         if self.object().readonly {
-            return Err(IoError::ReadOnly);
+            return Err(BufError::returned(IoError::ReadOnly, buf));
         }
 
         self.object().write_blocks(block_id, buf).await
@@ -1122,92 +1233,76 @@ impl<D: BlockDevice + 'static> SwapBackend for VirtioBlockSwapBackend<D> {
     type Token = VirtioBlockSwapToken;
     type Error = VirtioBlockSwapError;
 
-    /// Writes `bytes` into a freshly allocated extent.
-    ///
-    /// The caller's slice goes to the device as it is: only the tail that
-    /// does not fill a whole block is copied, into a single zero-padded
-    /// block. No flush follows. Swap is scratch storage whose only
-    /// reader is the kernel that wrote it: once the device has taken
-    /// the write it will hand the same bytes back, and nothing in swap
-    /// has to outlive the kernel. A flush per page would buy durability
-    /// nobody wants at the price of a host fsync on every page evicted.
-    async fn swap_out(&self, bytes: &[u8]) -> Result<Self::Token, Self::Error> {
-        let token = self.allocate_token(bytes.len()).await?;
-        if let Err(error) = self.write_extent(token, bytes).await {
-            self.release_token(token).await;
-            return Err(error);
-        }
-        Ok(token)
-    }
+    type Buffer = D::Buffer;
 
-    /// Reads a swapped-out page back into `dst` and frees its extent.
-    ///
-    /// The whole blocks land in the caller's buffer directly; only a
-    /// partial tail block goes through one block of scratch. The extent
-    /// is released only once the page is back: a failed read leaves the
-    /// token valid so the caller can try again rather than losing the
-    /// only copy of the page.
-    async fn swap_in(&self, token: Self::Token, dst: &mut [u8]) -> Result<(), Self::Error> {
-        if dst.len() != token.byte_len {
-            return Err(VirtioBlockSwapError::InvalidDestination {
-                expected: token.byte_len,
-                actual: dst.len(),
-            });
-        }
+    /// The staging buffer is the device's own, rounded up to whole
+    /// blocks: a request carries whole blocks, so the page is stored and
+    /// restored as the buffer and no partial block is ever bounced
+    /// through scratch.
+    fn buffer(&self, bytes: usize) -> Result<Self::Buffer, Self::Error> {
         let block_size = self.device.block_size();
         if block_size == 0 {
             return Err(VirtioBlockSwapError::InvalidBlockSize);
         }
+        Ok(self.device.buffer(bytes.next_multiple_of(block_size))?)
+    }
 
-        let head_bytes = dst.len() - dst.len() % block_size;
-        if head_bytes != 0 {
-            self.device
-                .read_block(token.start_block, &mut dst[..head_bytes])
-                .await?;
+    /// Writes the whole of `page` into a freshly allocated extent.
+    ///
+    /// No flush follows. Swap is scratch storage whose only reader is
+    /// the kernel that wrote it: once the device has taken the write it
+    /// will hand the same bytes back, and nothing in swap has to outlive
+    /// the kernel. A flush per page would buy durability nobody wants at
+    /// the price of a host fsync on every page evicted.
+    async fn swap_out(
+        &self,
+        page: Self::Buffer,
+    ) -> BufResult<Self::Token, Self::Buffer, Self::Error> {
+        let token = match self.allocate_token(page.as_ref().len()).await {
+            Ok(token) => token,
+            Err(error) => return Err(BufError::returned(error, page)),
+        };
+        match self.device.write_block(token.start_block, page).await {
+            Ok(((), page)) => Ok((token, page)),
+            Err(error) => {
+                self.release_token(token).await;
+                Err(error.map_error(VirtioBlockSwapError::Io))
+            }
         }
-        if head_bytes != dst.len() {
-            let mut tail = vec![0_u8; block_size];
-            self.device
-                .read_block(token.start_block + head_bytes / block_size, &mut tail)
-                .await?;
-            let remainder = dst.len() - head_bytes;
-            dst[head_bytes..].copy_from_slice(&tail[..remainder]);
-        }
+    }
 
+    /// Reads a swapped-out page back into `page` and frees its extent.
+    ///
+    /// The extent is released only once the page is back: a failed read
+    /// leaves the token valid so the caller can try again rather than
+    /// losing the only copy of the page.
+    async fn swap_in(
+        &self,
+        token: Self::Token,
+        page: Self::Buffer,
+    ) -> BufResult<(), Self::Buffer, Self::Error> {
+        let actual = page.as_ref().len();
+        if actual != token.byte_len {
+            return Err(BufError::returned(
+                VirtioBlockSwapError::InvalidDestination {
+                    expected: token.byte_len,
+                    actual,
+                },
+                page,
+            ));
+        }
+        let page = self
+            .device
+            .read_block(token.start_block, page)
+            .await
+            .map_err(|error| error.map_error(VirtioBlockSwapError::Io))?
+            .1;
         self.release_token(token).await;
-        Ok(())
+        Ok(((), page))
     }
 
     async fn release(&self, token: Self::Token) {
         self.release_token(token).await;
-    }
-}
-
-impl<D: BlockDevice> VirtioBlockSwapBackend<D> {
-    async fn write_extent(
-        &self,
-        token: VirtioBlockSwapToken,
-        bytes: &[u8],
-    ) -> Result<(), VirtioBlockSwapError> {
-        let block_size = self.device.block_size();
-        if block_size == 0 {
-            return Err(VirtioBlockSwapError::InvalidBlockSize);
-        }
-
-        let head_bytes = bytes.len() - bytes.len() % block_size;
-        if head_bytes != 0 {
-            self.device
-                .write_block(token.start_block, &bytes[..head_bytes])
-                .await?;
-        }
-        if head_bytes != bytes.len() {
-            let mut tail = vec![0_u8; block_size];
-            tail[..bytes.len() - head_bytes].copy_from_slice(&bytes[head_bytes..]);
-            self.device
-                .write_block(token.start_block + head_bytes / block_size, &tail)
-                .await?;
-        }
-        Ok(())
     }
 }
 
@@ -1243,7 +1338,7 @@ fn validate_request(
 
 /// The status byte a request ends with: the last byte the device wrote
 /// to the slot.
-fn status_of(reply: &Reply<'_, BLOCK_QUEUE_SLOTS>) -> IoResult<u8> {
+fn status_of<L: Lend>(reply: &Reply<'_, BLOCK_QUEUE_SLOTS, L>) -> IoResult<u8> {
     reply.response().last().copied().ok_or(IoError::DeviceFault)
 }
 
@@ -1268,12 +1363,16 @@ fn as_bytes_slice<T>(values: &[T]) -> &[u8] {
 mod tests {
     use super::*;
 
+    use alloc::vec;
+
     use crate::testing::{
-        ConfinedDmaBuffer, ConfinedTransport, FakeAffinity, FakeTransport, FakeTransportConfig,
+        ConfinedDmaBuffer, ConfinedDmaPool, ConfinedTransport, FakeAffinity, FakeTransport,
+        FakeTransportConfig,
     };
     use crate::transport::VirtioFeatures;
     use core::pin::pin;
     use futures_lite::future::{block_on, poll_once};
+    use helios_hal::dma::DmaBuffer;
     use spin::Mutex as SpinMutex;
 
     /// A device with 2 MiB of capacity in 512-byte sectors.
@@ -1430,8 +1529,7 @@ mod tests {
             transport.set_config_u32(CFG_BLK_SIZE, 4096);
         });
 
-        let mut buffer = data(&device, 4096);
-        let mut read = pin!(device.read_block(3, buffer.as_mut_slice()));
+        let mut read = pin!(device.read_block(3, data(&device, 4096)));
         assert!(block_on(poll_once(read.as_mut())).is_none());
 
         // Block 3 of a 4 KiB device is sector 24: virtio-blk addresses
@@ -1442,27 +1540,30 @@ mod tests {
     #[test]
     fn a_read_carries_the_payload_and_checks_the_used_length() {
         let device = device();
-        let mut buffer = data(&device, 512);
-        {
-            let mut read = pin!(device.read_block(2, buffer.as_mut_slice()));
+        let mut read = pin!(device.read_block(2, data(&device, 512)));
 
-            assert!(block_on(poll_once(read.as_mut())).is_none());
-            assert_eq!(request_of(&device, 0), header(ReqType::In, 2));
+        assert!(block_on(poll_once(read.as_mut())).is_none());
+        assert_eq!(request_of(&device, 0), header(ReqType::In, 2));
 
-            let mut response = vec![0xa5_u8; 512];
-            response.push(0);
-            complete(&device, 0, &response);
-            assert_eq!(block_on(poll_once(read.as_mut())), Some(Ok(())));
-        }
-        assert_eq!(buffer.as_mut_slice(), [0xa5_u8; 512]);
+        let mut response = vec![0xa5_u8; 512];
+        response.push(0);
+        complete(&device, 0, &response);
+        let ((), buffer) = block_on(poll_once(read.as_mut()))
+            .expect("the read is complete")
+            .expect("the read succeeds");
+        assert_eq!(buffer.as_ref(), [0xa5_u8; 512]);
         assert_eq!(device.request_counts().reads, 1);
+    }
+
+    /// What a finished data request reported, `None` while it is pending.
+    fn outcome(polled: Option<BufResult<(), ConfinedDmaBuffer>>) -> Option<IoResult<()>> {
+        polled.map(|result| result.map(|((), _)| ()).map_err(BufError::into_error))
     }
 
     #[test]
     fn a_short_read_is_a_device_fault() {
         let device = device();
-        let mut buffer = data(&device, 1024);
-        let mut read = pin!(device.read_block(0, buffer.as_mut_slice()));
+        let mut read = pin!(device.read_block(0, data(&device, 1024)));
 
         assert!(block_on(poll_once(read.as_mut())).is_none());
         // The device claims success but only filled half the chain.
@@ -1476,17 +1577,21 @@ mod tests {
         }
         device.handle_interrupt();
 
-        assert_eq!(
-            block_on(poll_once(read.as_mut())),
-            Some(Err(IoError::DeviceFault))
+        let refused = block_on(poll_once(read.as_mut()))
+            .expect("the read is complete")
+            .err()
+            .expect("a short read fails");
+        assert_eq!(refused.error, IoError::DeviceFault);
+        assert!(
+            refused.buffers.is_some(),
+            "the device returned the chain, so the buffer comes back with the error"
         );
     }
 
     #[test]
     fn a_write_puts_the_payload_after_the_header() {
         let device = device();
-        let mut payload = payload(&device, 512, 0x5a);
-        let mut write = pin!(device.write_block(7, payload.as_mut_slice()));
+        let mut write = pin!(device.write_block(7, payload(&device, 512, 0x5a)));
 
         assert!(block_on(poll_once(write.as_mut())).is_none());
         let mut expected = header(ReqType::Out, 7);
@@ -1494,20 +1599,19 @@ mod tests {
         assert_eq!(request_of(&device, 0), expected);
 
         complete(&device, 0, &[0]);
-        assert_eq!(block_on(poll_once(write.as_mut())), Some(Ok(())));
+        assert_eq!(outcome(block_on(poll_once(write.as_mut()))), Some(Ok(())));
         assert_eq!(device.request_counts().writes, 1);
     }
 
     #[test]
     fn a_device_error_status_becomes_a_device_fault() {
         let device = device();
-        let mut payload = payload(&device, 512, 0);
-        let mut write = pin!(device.write_block(0, payload.as_mut_slice()));
+        let mut write = pin!(device.write_block(0, payload(&device, 512, 0)));
 
         assert!(block_on(poll_once(write.as_mut())).is_none());
         complete(&device, 0, &[1]);
         assert_eq!(
-            block_on(poll_once(write.as_mut())),
+            outcome(block_on(poll_once(write.as_mut()))),
             Some(Err(IoError::DeviceFault))
         );
     }
@@ -1672,8 +1776,7 @@ mod tests {
             transport.set_config_u32(CFG_SEG_MAX, 2);
             transport.set_config_u32(CFG_SIZE_MAX, 1024);
         });
-        let mut payload = payload(&device, 4096, 0x11);
-        let mut write = pin!(device.write_block(0, payload.as_mut_slice()));
+        let mut write = pin!(device.write_block(0, payload(&device, 4096, 0x11)));
 
         assert!(block_on(poll_once(write.as_mut())).is_none());
         // Two segments of 1024 bytes each is 2048 bytes per request, so
@@ -1690,44 +1793,49 @@ mod tests {
         assert_eq!(request_of(&device, second), expected);
 
         complete(&device, second, &[0]);
-        assert_eq!(block_on(poll_once(write.as_mut())), Some(Ok(())));
+        assert_eq!(outcome(block_on(poll_once(write.as_mut()))), Some(Ok(())));
         assert_eq!(device.request_counts().writes, 2);
+    }
+
+    /// The buffer a finished read handed back. A pending or failed read
+    /// fails the test.
+    fn read_back(polled: Option<BufResult<(), ConfinedDmaBuffer>>) -> ConfinedDmaBuffer {
+        polled
+            .expect("the read is complete")
+            .expect("the read succeeds")
+            .1
     }
 
     #[test]
     fn requests_are_pipelined_and_completed_out_of_order() {
         let device = device();
-        let mut first = data(&device, 512);
-        let mut second = data(&device, 512);
-        {
-            let first_token = next_token(&device);
-            let mut read_first = pin!(device.read_block(0, first.as_mut_slice()));
-            assert!(block_on(poll_once(read_first.as_mut())).is_none());
-            let second_token = next_token(&device);
-            let mut read_second = pin!(device.read_block(1, second.as_mut_slice()));
-            assert!(block_on(poll_once(read_second.as_mut())).is_none());
-            assert_eq!(request_of(&device, first_token), header(ReqType::In, 0));
-            assert_eq!(request_of(&device, second_token), header(ReqType::In, 1));
+        let first_token = next_token(&device);
+        let mut read_first = pin!(device.read_block(0, data(&device, 512)));
+        assert!(block_on(poll_once(read_first.as_mut())).is_none());
+        let second_token = next_token(&device);
+        let mut read_second = pin!(device.read_block(1, data(&device, 512)));
+        assert!(block_on(poll_once(read_second.as_mut())).is_none());
+        assert_eq!(request_of(&device, first_token), header(ReqType::In, 0));
+        assert_eq!(request_of(&device, second_token), header(ReqType::In, 1));
 
-            // The device answers the second request first. The waiter that
-            // wakes drains the ring for everyone, so the first request must
-            // not take a completion that is not addressed to it.
-            let mut response = vec![0x22_u8; 512];
-            response.push(0);
-            complete(&device, second_token, &response);
-            assert!(
-                block_on(poll_once(read_first.as_mut())).is_none(),
-                "the first request is still outstanding"
-            );
-            assert_eq!(block_on(poll_once(read_second.as_mut())), Some(Ok(())));
+        // The device answers the second request first. The waiter that
+        // wakes drains the ring for everyone, so the first request must
+        // not take a completion that is not addressed to it.
+        let mut response = vec![0x22_u8; 512];
+        response.push(0);
+        complete(&device, second_token, &response);
+        assert!(
+            block_on(poll_once(read_first.as_mut())).is_none(),
+            "the first request is still outstanding"
+        );
+        let second = read_back(block_on(poll_once(read_second.as_mut())));
 
-            let mut response = vec![0x33_u8; 512];
-            response.push(0);
-            complete(&device, first_token, &response);
-            assert_eq!(block_on(poll_once(read_first.as_mut())), Some(Ok(())));
-        }
-        assert_eq!(first.as_mut_slice(), [0x33_u8; 512]);
-        assert_eq!(second.as_mut_slice(), [0x22_u8; 512]);
+        let mut response = vec![0x33_u8; 512];
+        response.push(0);
+        complete(&device, first_token, &response);
+        let first = read_back(block_on(poll_once(read_first.as_mut())));
+        assert_eq!(first.as_ref(), [0x33_u8; 512]);
+        assert_eq!(second.as_ref(), [0x22_u8; 512]);
     }
 
     /// The device address of the first descriptor of chain `token`, which
@@ -1745,8 +1853,7 @@ mod tests {
     fn the_header_and_the_status_travel_in_the_requests_own_slot() {
         let device = device();
         let request = header(ReqType::In, 0);
-        let mut buffer = data(&device, 512);
-        let mut read = pin!(device.read_block(0, buffer.as_mut_slice()));
+        let mut read = pin!(device.read_block(0, data(&device, 512)));
         assert!(block_on(poll_once(read.as_mut())).is_none());
 
         let chain = device.object().queues[0]
@@ -1766,24 +1873,35 @@ mod tests {
     }
 
     #[test]
-    fn a_header_in_the_future_would_be_refused() {
-        // A caller buffer the device cannot reach is refused before any
-        // descriptor is written, which is what a header in this
-        // future's frame would have been.
+    fn a_buffer_another_device_owns_is_refused_and_handed_back() {
+        // Memory the device cannot reach is refused before any
+        // descriptor is written. A buffer from another device's memory
+        // has the right type but not the right provenance, which is what
+        // a header in this future's frame would have had too.
         let device = device();
-        let mut buffer = [0_u8; 512];
-        assert_eq!(
-            block_on(device.read_block(0, &mut buffer)),
-            Err(IoError::DeviceFault)
+        let foreign = ConfinedDmaPool::new(4096).buffer(512);
+        let refused = block_on(device.read_block(0, foreign))
+            .err()
+            .expect("the device cannot reach the buffer");
+        assert_eq!(refused.error, IoError::DeviceFault);
+        assert!(
+            refused.buffers.is_some(),
+            "nothing was published, so the buffer comes straight back"
         );
     }
 
+    /// A read whose future is dropped while the device fills it: the
+    /// buffer stays the device's until the chain comes back, the late
+    /// reply lands in memory nobody reused, and the queue carries the
+    /// requests after it.
     #[test]
-    fn a_dropped_request_keeps_its_slot_until_the_device_completes_it() {
+    fn a_dropped_request_keeps_its_buffer_until_the_device_completes_it() {
         let device = device();
-        let mut abandoned = data(&device, 512);
+        let pool = device.object().transport.pool().clone();
+        let abandoned = data(&device, 512);
+        let abandoned_bytes = (abandoned.device_address().get(), 512);
         {
-            let mut read = pin!(device.read_block(0, abandoned.as_mut_slice()));
+            let mut read = pin!(device.read_block(0, abandoned));
             assert!(block_on(poll_once(read.as_mut())).is_none());
         }
         let first_header = header_address(&device, 0);
@@ -1792,39 +1910,57 @@ mod tests {
             !inflight.is_idle(0),
             "the chain is still with the device, so its slot stays held"
         );
+        assert!(
+            !pool.is_released(abandoned_bytes.0, abandoned_bytes.1),
+            "the buffer of a dropped read is still the device's"
+        );
 
         // A request submitted meanwhile gets a slot of its own.
         let second_token = next_token(&device);
-        let mut buffer = data(&device, 512);
+        let mut read = pin!(device.read_block(1, data(&device, 512)));
+        assert!(block_on(poll_once(read.as_mut())).is_none());
+        assert_ne!(first_header, header_address(&device, second_token));
+
+        // The late answer to the dropped request lands in live memory,
+        // frees its identifier and its buffer, and leaves the live
+        // request alone.
+        let mut response = vec![0x11_u8; 512];
+        response.push(0);
         {
-            let mut read = pin!(device.read_block(1, buffer.as_mut_slice()));
-            assert!(block_on(poll_once(read.as_mut())).is_none());
-            assert_ne!(first_header, header_address(&device, second_token));
-
-            // The late answer to the dropped request frees its
-            // identifier without disturbing the live one.
-            let mut response = vec![0x11_u8; 512];
-            response.push(0);
-            complete(&device, 0, &response);
-            assert!(block_on(poll_once(read.as_mut())).is_none());
-            assert!(inflight.is_idle(0));
-
-            let mut response = vec![0x22_u8; 512];
-            response.push(0);
-            complete(&device, second_token, &response);
-            assert_eq!(block_on(poll_once(read.as_mut())), Some(Ok(())));
+            let queue = device.object().queues[0]
+                .queue
+                .try_lock()
+                .expect("a parked driver does not hold the queue lock");
+            let written = pool.respond_into_live_memory(&queue, 0, &response);
+            queue.device_complete(0, written);
         }
-        assert_eq!(buffer.as_mut_slice(), [0x22_u8; 512]);
+        device.handle_interrupt();
+        assert!(block_on(poll_once(read.as_mut())).is_none());
+        assert!(inflight.is_idle(0));
+        assert!(
+            pool.is_released(abandoned_bytes.0, abandoned_bytes.1),
+            "the device's completion is what frees the dropped read's buffer"
+        );
+
+        let mut response = vec![0x22_u8; 512];
+        response.push(0);
+        complete(&device, second_token, &response);
+        assert_eq!(
+            read_back(block_on(poll_once(read.as_mut()))).as_ref(),
+            [0x22_u8; 512]
+        );
 
         // The queue is not stalled: the next request goes through.
         let third_token = next_token(&device);
-        let mut third = data(&device, 512);
-        let mut read = pin!(device.read_block(2, third.as_mut_slice()));
+        let mut read = pin!(device.read_block(2, data(&device, 512)));
         assert!(block_on(poll_once(read.as_mut())).is_none());
         let mut response = vec![0x33_u8; 512];
         response.push(0);
         complete(&device, third_token, &response);
-        assert_eq!(block_on(poll_once(read.as_mut())), Some(Ok(())));
+        assert_eq!(
+            read_back(block_on(poll_once(read.as_mut()))).as_ref(),
+            [0x33_u8; 512]
+        );
     }
 
     #[test]
@@ -1852,11 +1988,12 @@ mod tests {
     #[test]
     fn a_readonly_device_refuses_writes() {
         let device = device_with(BLK_F_RO, |_| {});
-        let mut payload = payload(&device, 512, 0);
 
         assert_eq!(
-            block_on(device.write_block(0, payload.as_mut_slice())),
-            Err(IoError::ReadOnly)
+            outcome(Some(block_on(
+                device.write_block(0, payload(&device, 512, 0))
+            ))),
+            Some(Err(IoError::ReadOnly))
         );
     }
 
@@ -1985,6 +2122,8 @@ mod tests {
         block_size: usize,
         flushes: AtomicU64,
         fail_reads: bool,
+        /// Where the buffers a consumer allocates come from.
+        pool: ConfinedDmaPool,
     }
 
     impl MemoryBlockDevice {
@@ -1994,6 +2133,7 @@ mod tests {
                 block_size,
                 flushes: AtomicU64::new(0),
                 fail_reads: false,
+                pool: ConfinedDmaPool::new(1 << 20),
             }
         }
 
@@ -2010,19 +2150,35 @@ mod tests {
     }
 
     impl BlockDevice for MemoryBlockDevice {
-        async fn read_block(&self, block_id: usize, buf: &mut [u8]) -> IoResult<()> {
-            if self.fail_reads {
-                return Err(IoError::DeviceFault);
-            }
-            let offset = block_id * self.block_size;
-            buf.copy_from_slice(&self.blocks.lock()[offset..offset + buf.len()]);
-            Ok(())
+        type Buffer = ConfinedDmaBuffer;
+
+        fn buffer(&self, bytes: usize) -> IoResult<Self::Buffer> {
+            Ok(self.pool.buffer(bytes))
         }
 
-        async fn write_block(&self, block_id: usize, buf: &[u8]) -> IoResult<()> {
+        async fn read_block(
+            &self,
+            block_id: usize,
+            mut buf: Self::Buffer,
+        ) -> BufResult<(), Self::Buffer> {
+            if self.fail_reads {
+                return Err(BufError::returned(IoError::DeviceFault, buf));
+            }
+            let bytes = buf.as_mut_slice();
             let offset = block_id * self.block_size;
-            self.blocks.lock()[offset..offset + buf.len()].copy_from_slice(buf);
-            Ok(())
+            bytes.copy_from_slice(&self.blocks.lock()[offset..offset + bytes.len()]);
+            Ok(((), buf))
+        }
+
+        async fn write_block(
+            &self,
+            block_id: usize,
+            buf: Self::Buffer,
+        ) -> BufResult<(), Self::Buffer> {
+            let bytes = buf.as_ref();
+            let offset = block_id * self.block_size;
+            self.blocks.lock()[offset..offset + bytes.len()].copy_from_slice(bytes);
+            Ok(((), buf))
         }
 
         async fn flush(&self) -> IoResult<()> {
@@ -2070,20 +2226,61 @@ mod tests {
     fn a_swapped_out_page_comes_back_unchanged_and_is_committed() {
         let backend = VirtioBlockSwapBackend::from_entire_device(MemoryBlockDevice::new(512, 16))
             .expect("swap backend should initialize");
-        // Deliberately not a whole number of blocks: the tail block is
-        // the only part that goes through a copy.
-        let page: Vec<u8> = (0..1300_u32).map(|byte| byte as u8).collect();
+        // Deliberately not a whole number of blocks: the staging buffer
+        // is rounded up to the next one, and the page rides in its head.
+        let mut page = backend.buffer(1300).expect("staging buffer");
+        assert_eq!(page.as_ref().len(), 1536);
+        for (index, byte) in page.as_mut().iter_mut().enumerate() {
+            *byte = index as u8;
+        }
 
-        let token = block_on(backend.swap_out(&page)).expect("swap-out should succeed");
+        let expected = page.as_ref().to_vec();
+
+        let (token, _page) = block_on(backend.swap_out(page)).expect("swap-out should succeed");
         assert_eq!(
             backend.device.flushes(),
             0,
             "swap is scratch storage; a flush per evicted page buys durability nobody reads"
         );
 
-        let mut restored = vec![0_u8; page.len()];
-        block_on(backend.swap_in(token, &mut restored)).expect("swap-in should succeed");
-        assert_eq!(restored, page);
+        let restored = backend.buffer(1300).expect("staging buffer");
+        let ((), restored) =
+            block_on(backend.swap_in(token, restored)).expect("swap-in should succeed");
+        assert_eq!(restored.as_ref(), expected);
+    }
+
+    /// Swaps `bytes` bytes of `fill` out and returns the token.
+    fn swapped(
+        backend: &VirtioBlockSwapBackend<MemoryBlockDevice>,
+        bytes: usize,
+        fill: u8,
+    ) -> Result<VirtioBlockSwapToken, VirtioBlockSwapError> {
+        block_on(backend.swap_out(staged(backend, bytes, fill)))
+            .map(|(token, _page)| token)
+            .map_err(BufError::into_error)
+    }
+
+    /// Swaps `token` back into a fresh buffer of `bytes` bytes and returns
+    /// the bytes.
+    fn restored(
+        backend: &VirtioBlockSwapBackend<MemoryBlockDevice>,
+        token: VirtioBlockSwapToken,
+        bytes: usize,
+    ) -> Result<Vec<u8>, VirtioBlockSwapError> {
+        block_on(backend.swap_in(token, staged(backend, bytes, 0)))
+            .map(|((), page)| page.as_ref().to_vec())
+            .map_err(BufError::into_error)
+    }
+
+    /// A staging buffer of `bytes` bytes of `fill`.
+    fn staged(
+        backend: &VirtioBlockSwapBackend<MemoryBlockDevice>,
+        bytes: usize,
+        fill: u8,
+    ) -> ConfinedDmaBuffer {
+        let mut buffer = backend.buffer(bytes).expect("staging buffer");
+        buffer.as_mut().fill(fill);
+        buffer
     }
 
     #[test]
@@ -2091,14 +2288,16 @@ mod tests {
         let backend =
             VirtioBlockSwapBackend::from_entire_device(MemoryBlockDevice::failing_reads(512, 4))
                 .expect("swap backend should initialize");
-        let page = vec![7_u8; 1024];
-        let token = block_on(backend.swap_out(&page)).expect("swap-out should succeed");
+        let token = swapped(&backend, 1024, 7).expect("swap-out should succeed");
 
-        let mut restored = vec![0_u8; page.len()];
+        let refused = block_on(backend.swap_in(token, staged(&backend, 1024, 0)))
+            .err()
+            .expect("the read fails");
         assert_eq!(
-            block_on(backend.swap_in(token, &mut restored)),
-            Err(VirtioBlockSwapError::Io(IoError::DeviceFault))
+            refused.error,
+            VirtioBlockSwapError::Io(IoError::DeviceFault)
         );
+        assert!(refused.buffers.is_some(), "the staging page comes back");
         assert_eq!(
             block_on(backend.state.lock()).available_blocks(),
             2,
@@ -2111,21 +2310,20 @@ mod tests {
         let backend = VirtioBlockSwapBackend::from_entire_device(MemoryBlockDevice::new(512, 8))
             .expect("swap backend should initialize");
 
-        let first = block_on(backend.swap_out(&[1_u8; 1024])).expect("first swap-out");
-        let second = block_on(backend.swap_out(&[2_u8; 1024])).expect("second swap-out");
-        let third = block_on(backend.swap_out(&[3_u8; 2048])).expect("third swap-out");
+        let first = swapped(&backend, 1024, 1).expect("first swap-out");
+        let second = swapped(&backend, 1024, 2).expect("second swap-out");
+        let third = swapped(&backend, 2048, 3).expect("third swap-out");
         assert_eq!(block_on(backend.state.lock()).available_blocks(), 0);
         assert_eq!(
-            block_on(backend.swap_out(&[4_u8; 512])),
+            swapped(&backend, 512, 4),
             Err(VirtioBlockSwapError::OutOfSwap {
                 requested_blocks: 1,
                 available_blocks: 0,
             })
         );
 
-        let mut restored = vec![0_u8; 1024];
-        block_on(backend.swap_in(second, &mut restored)).expect("swap-in of the middle extent");
-        block_on(backend.swap_in(first, &mut restored)).expect("swap-in of the first extent");
+        restored(&backend, second, 1024).expect("swap-in of the middle extent");
+        restored(&backend, first, 1024).expect("swap-in of the first extent");
         {
             let state = block_on(backend.state.lock());
             assert_eq!(state.available_blocks(), 4);
@@ -2136,9 +2334,10 @@ mod tests {
             );
         }
 
-        let mut restored = vec![0_u8; 2048];
-        block_on(backend.swap_in(third, &mut restored)).expect("swap-in of the last extent");
-        assert_eq!(restored, vec![3_u8; 2048]);
+        assert_eq!(
+            restored(&backend, third, 2048).expect("swap-in of the last extent"),
+            vec![3_u8; 2048]
+        );
         let state = block_on(backend.state.lock());
         assert_eq!(state.free.len(), 1);
         assert_eq!(state.available_blocks(), 8);

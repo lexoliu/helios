@@ -1,6 +1,7 @@
 use alloc::boxed::Box;
 use pin_project_lite::pin_project;
 
+use wasmtime::AsContextMut;
 use wasmtime_wasi_io::poll::Pollable;
 use wasmtime_wasi_io::streams::{InputStream, OutputStream, StreamError};
 
@@ -848,6 +849,8 @@ impl TcpSocket {
         Ok(())
     }
 
+    /// Writes `bytes`, frozen from the service's transmit memory
+    /// ([`crate::ComponentNetworkService::tcp_payload`]).
     pub(super) async fn write_all_bytes<Net: ComponentHostNetwork>(
         &self,
         service: &Net,
@@ -1122,13 +1125,34 @@ where
                 "TCP output stream write on a socket with no connection",
             ));
         };
-        if self.pending.is_some() {
+        // `check_write` grants at most the send queue's free room, which
+        // never exceeds one socket's send buffer.
+        if self.pending.is_some() || bytes.len() > helios_netstack::TCP_TRANSMIT_BUFFER_BYTES {
             return Err(StreamError::trap(
                 "TCP output stream write exceeded its check-write permit",
             ));
         }
         let handle = NetworkHandle::from_raw(stream);
-        let mut bytes = bytes;
+        // The stack transmits queued bytes in place, so they move into
+        // transmit memory here. `bytes` is the copy of the guest's list
+        // that `wasi:io`'s `write` lifted before calling in; that lift
+        // is the fork's, and this is the one copy the kernel makes. An
+        // empty write names no memory, so it has nothing to move.
+        let mut bytes = if bytes.is_empty() {
+            bytes
+        } else {
+            match self
+                .service
+                .tcp_payload(bytes.len(), |piece| piece.copy_from_slice(&bytes))
+            {
+                Ok(payload) => payload,
+                Err(error) => {
+                    return Err(StreamError::LastOperationFailed(wasmtime::Error::new(
+                        error,
+                    )));
+                }
+            }
+        };
         // One locked pass both queues and classifies a queue that took
         // nothing: `Pending` is a full send queue on a live connection,
         // `Closed` a send side that cannot send again — the answer a
@@ -1441,18 +1465,28 @@ where
         let mut this = self.project();
         loop {
             if this.pending.is_none() {
-                let available = source.remaining(&mut store);
+                // The guest's buffer stays lent to the stream until it is
+                // marked read, so one send buffer of it at a time is
+                // copied straight into transmit memory, and the rest
+                // waits in place for the next pass of this loop.
+                let mut source = source.reborrow().as_direct(store.as_context_mut());
+                let available = source.remaining().len();
                 if available == 0 {
                     complete_socket_transfer(this.completion, Ok(()));
                     return Poll::Ready(Ok(StreamResult::Completed));
                 }
-                let mut bytes = Vec::with_capacity(available);
-                source.read(&mut store, &mut bytes)?;
-                let write = (*this.start)(
-                    this.socket.clone(),
-                    this.service.clone(),
-                    Bytes::from(bytes),
-                );
+                let len = available.min(helios_netstack::TCP_TRANSMIT_BUFFER_BYTES);
+                let piece = match this.service.tcp_payload(len, |piece| {
+                    piece.copy_from_slice(&source.remaining()[..len]);
+                }) {
+                    Ok(piece) => piece,
+                    Err(error) => {
+                        complete_socket_transfer(this.completion, Err(map_p3_tcp_error(error)));
+                        return Poll::Ready(Ok(StreamResult::Dropped));
+                    }
+                };
+                source.mark_read(len);
+                let write = (*this.start)(this.socket.clone(), this.service.clone(), piece);
                 this.pending.set(Some(write));
             }
 

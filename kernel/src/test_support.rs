@@ -584,6 +584,14 @@ impl RecordingInterfaceState {
 }
 
 impl helios_netstack::NetworkInterface for RecordingNetworkInterface {
+    /// The recording interface reads nothing through a device, so a
+    /// payload is plain memory.
+    type TxPayload = alloc::vec::Vec<u8>;
+
+    fn transmit_payload(&self, bytes: usize) -> helios_hal::io::IoResult<Self::TxPayload> {
+        Ok(alloc::vec![0; bytes])
+    }
+
     fn mac_address(&self) -> [u8; 6] {
         [0x02, 0, 0, 0, 0, 1]
     }
@@ -858,6 +866,7 @@ mod network {
         type TcpStream = u64;
         type TcpListener = u64;
         type UdpSocket = u64;
+        type TxPayload = alloc::vec::Vec<u8>;
 
         // The in-memory doubles model an always-ready loopback peer.
         fn tcp_readiness(
@@ -1013,21 +1022,28 @@ mod network {
             }))
         }
 
-        fn tcp_write_all(
-            &self,
+        fn tcp_transmit_payload(&self, bytes: usize) -> Result<Self::TxPayload, crate::TcpError> {
+            Ok(alloc::vec![0; bytes])
+        }
+
+        fn tcp_write_all<'a, Pieces>(
+            &'a self,
             _: Self::TcpStream,
-            bytes: &[u8],
+            pieces: Pieces,
             _: u64,
-        ) -> impl core::future::Future<Output = Result<(), crate::TcpError>> + Send + '_ {
-            let written = bytes.len() as u64;
-            let failure = self.drive_error();
-            core::future::ready(match failure {
+        ) -> impl core::future::Future<Output = Result<(), crate::TcpError>> + Send + 'a
+        where
+            Pieces: Iterator<Item = Result<Bytes, crate::TcpError>> + Send + 'a,
+        {
+            let written: Result<u64, crate::TcpError> = match self.drive_error() {
                 Some(error) => Err(error),
-                None => {
-                    self.bytes_written.fetch_add(written, Ordering::AcqRel);
-                    Ok(())
-                }
-            })
+                None => pieces
+                    .map(|piece| piece.map(|piece| piece.len() as u64))
+                    .sum(),
+            };
+            core::future::ready(written.map(|written: u64| {
+                self.bytes_written.fetch_add(written, Ordering::AcqRel);
+            }))
         }
 
         fn tcp_read(

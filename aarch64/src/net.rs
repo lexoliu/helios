@@ -77,6 +77,12 @@ pub(crate) fn has_network_device(platform: &PlatformDescription) -> bool {
 }
 
 impl NetworkDevice for VirtioNetworkDevice {
+    type TxPayload = helios_virtio::TransportBuffer<Aarch64VirtioNetTransport>;
+
+    fn transmit_payload(&self, bytes: usize) -> Result<Self::TxPayload, IoError> {
+        self.inner.transmit_payload(bytes)
+    }
+
     fn mac_address(&self) -> [u8; 6] {
         self.inner.mac_address()
     }

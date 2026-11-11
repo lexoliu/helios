@@ -931,6 +931,68 @@ fn concurrent_commands_are_routed_by_descriptor_not_by_arrival_order() {
     assert_eq!(list[0].geometry, Rect::new(0, 0, 800, 600));
 }
 
+/// The address of the first descriptor of control chain `token`, which
+/// is where the command was staged.
+fn control_slot_address(device: &VirtioGpuDevice<FakeTransport>, token: u16) -> u64 {
+    device
+        .control
+        .try_lock()
+        .expect("a parked driver does not hold the control queue lock")
+        .device_chain(token)[0]
+        .0
+}
+
+#[test]
+fn a_dropped_control_request_keeps_its_slot_until_the_device_completes_it() {
+    let device = device();
+    let abandoned_token = {
+        let mut abandoned = pin!(DisplayDevice::scanouts(&device));
+        pending_control(&device, abandoned.as_mut())
+    };
+    let abandoned_slot = control_slot_address(&device, abandoned_token);
+    assert!(
+        !device.control_inflight.is_idle(abandoned_token),
+        "the chain is still with the device, so its identifier and slot stay held"
+    );
+
+    // A command submitted meanwhile is given a slot of its own.
+    let mut second = pin!(DisplayDevice::scanouts(&device));
+    let second_token = pending_control(&device, second.as_mut());
+    assert_ne!(abandoned_token, second_token);
+    assert_ne!(
+        abandoned_slot,
+        control_slot_address(&device, second_token),
+        "a later command cannot be staged in the slot the device may still write"
+    );
+
+    // The dropped command's late answer lands in its own slot, frees its
+    // identifier, and is not the second command's reply.
+    answer_control(
+        &device,
+        abandoned_token,
+        &display_info_response(&[(Rect::new(0, 0, 800, 600), true)]),
+    );
+    assert!(
+        block_on(poll_once(second.as_mut())).is_none(),
+        "the late answer does not belong to the second command"
+    );
+    assert!(device.control_inflight.is_idle(abandoned_token));
+
+    answer_control(
+        &device,
+        second_token,
+        &display_info_response(&[(Rect::new(0, 0, 640, 480), true)]),
+    );
+    let list = block_on(poll_once(second.as_mut()))
+        .expect("the second reply is in")
+        .expect("display info");
+    assert_eq!(
+        list[0].geometry,
+        Rect::new(0, 0, 640, 480),
+        "the second command read its own response area"
+    );
+}
+
 #[test]
 fn the_bring_up_round_trip_clears_the_interrupt_it_raised() {
     let device = device();

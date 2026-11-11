@@ -15,8 +15,8 @@ mod poll_registry;
 mod serial;
 
 pub use block::{
-    BlockInstallError, BlockSelfCheckError, BlockService, BlockStats, SCRATCH_DISK_SERIAL,
-    install_block_devices,
+    BlockInstallError, BlockSelfCheckError, BlockService, BlockStats, BlockStatsHandle,
+    SCRATCH_DISK_SERIAL, install_block_devices,
 };
 pub use child::{
     ByteReadWait, ByteReader, ByteWriteWait, ByteWriter, ClosedPeer, TryRead, TryWrite,

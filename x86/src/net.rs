@@ -215,6 +215,12 @@ impl ExternalInterruptHandler for VirtioNetworkDevice {
 }
 
 impl NetworkDevice for VirtioNetworkDevice {
+    type TxPayload = helios_virtio::TransportBuffer<VirtioPciTransport<X86DmaPool>>;
+
+    fn transmit_payload(&self, bytes: usize) -> Result<Self::TxPayload, IoError> {
+        self.inner.transmit_payload(bytes)
+    }
+
     fn mac_address(&self) -> [u8; 6] {
         self.inner.mac_address()
     }

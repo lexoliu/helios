@@ -3,8 +3,40 @@
 //! A device issues addresses in its own address space. These are the value
 //! types and the contract a driver allocates device-visible memory through,
 //! whatever stands between the device and RAM.
+//!
+//! # Buffers a request owns
+//!
+//! A request that transfers data takes its buffers by value and hands them
+//! back with its result ([`BufResult`]). It does not borrow them, because a
+//! borrow ends when the request's future is dropped, and the device does
+//! not stop when the future does: a guest that cancels a read, or an
+//! instance killed in the middle of a host call, drops a future whose chain
+//! the device is still writing. Had the buffer been borrowed, it would go
+//! back to its pool or allocator at that moment and the device's late write
+//! would land in whatever was allocated there next.
+//!
+//! So the device side owns a request's buffers from submission until the
+//! device returns the chain:
+//!
+//! - A request that completes hands its buffers back to the caller with the
+//!   result, error results included.
+//! - A request whose future is dropped after submission leaves its buffers
+//!   parked with the in-flight identifier of its chain. The device's late
+//!   completion drops them, and only then may pooled memory be reused.
+//! - A request whose device stopped answering (the queue faulted) keeps its
+//!   buffers parked until the queue or the device is reset, and its caller
+//!   gets the error without them ([`BufError::buffers`] is `None`).
+//!
+//! This is the completion-based I/O model: tokio-uring's
+//! `IoBuf`/`IoBufMut` and `BufResult`, monoio and glommio take buffers by
+//! value for exactly this cancellation hazard, and Linux blk-mq keeps a
+//! request, and the bio it carries, owned by the driver until the device
+//! completes it. Parking storage is fixed per queue and indexed by the
+//! chain's head descriptor, so a request allocates nothing to be
+//! cancellable.
 
 use core::alloc::Layout;
+use core::fmt;
 
 use thiserror::Error;
 
@@ -63,7 +95,75 @@ impl From<DmaError> for IoError {
     }
 }
 
+/// The outcome of a request that took its buffers by value.
+///
+/// A completed request hands `buffers` back in both arms. See the module
+/// documentation for who owns them in between.
+pub type BufResult<T, B, E = IoError> = Result<(T, B), BufError<B, E>>;
+
+/// A request that failed, with its buffers when the device let them go.
+pub struct BufError<B, E = IoError> {
+    pub error: E,
+    /// The buffers the request was given. `None` only when the device
+    /// still holds them: the request was in flight when its queue stopped
+    /// being driven, so they stay parked with the chain until the queue or
+    /// the device is reset.
+    pub buffers: Option<B>,
+}
+
+impl<B, E> BufError<B, E> {
+    /// A failure the device never saw: the buffers come straight back.
+    pub fn returned(error: E, buffers: B) -> Self {
+        Self {
+            error,
+            buffers: Some(buffers),
+        }
+    }
+
+    /// The error, letting go of the buffers.
+    pub fn into_error(self) -> E {
+        self.error
+    }
+
+    /// The same failure with its buffers rewrapped, for a layer that hands
+    /// back a different shape than the one below it.
+    pub fn map_buffers<C>(self, map: impl FnOnce(B) -> C) -> BufError<C, E> {
+        BufError {
+            error: self.error,
+            buffers: self.buffers.map(map),
+        }
+    }
+
+    /// The same failure with its error converted.
+    pub fn map_error<F>(self, map: impl FnOnce(E) -> F) -> BufError<B, F> {
+        BufError {
+            error: map(self.error),
+            buffers: self.buffers,
+        }
+    }
+}
+
+impl<B, E: fmt::Debug> fmt::Debug for BufError<B, E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BufError")
+            .field("error", &self.error)
+            .field("buffers_returned", &self.buffers.is_some())
+            .finish()
+    }
+}
+
+impl<B, E: fmt::Display> fmt::Display for BufError<B, E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
 /// A buffer a device can reach, owned by the driver that allocated it.
+///
+/// The bytes are not inside the value: moving a buffer does not move the
+/// memory it names, so a chain described from a buffer stays valid after
+/// the buffer moves into the slot that parks it.
 pub trait DmaBuffer: Send + Sync + 'static {
     /// The address the device has to issue to reach the first byte.
     fn device_address(&self) -> DeviceAddress;
@@ -77,7 +177,14 @@ pub trait DmaBuffer: Send + Sync + 'static {
 
 /// Memory a device reaches with no mapping request on the data path.
 pub trait DmaMemory: Send + Sync + 'static {
-    type Buffer: DmaBuffer;
+    /// A buffer the device reaches and the CPU reads and writes as bytes.
+    ///
+    /// The byte view is what lets a consumer fill or read a buffer it
+    /// allocated at its origin without knowing which device it is for. The
+    /// caller upholds the device-side half of the contract: it does not
+    /// touch the bytes of a buffer while a request that names it is in
+    /// flight.
+    type Buffer: DmaBuffer + AsRef<[u8]> + AsMut<[u8]>;
 
     fn allocate_zeroed(&self, layout: Layout) -> IoResult<Self::Buffer>;
 

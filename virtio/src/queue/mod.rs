@@ -23,7 +23,8 @@ mod split;
 mod tests;
 
 pub(crate) use slots::{
-    ControlSlots, Part, ResponseSpan, ResponseWindow, SlotPool, control_slots, exchange_blocking,
+    ControlSlots, Lend, Part, ResponseSpan, ResponseWindow, SlotPool, control_slots,
+    exchange_blocking,
 };
 
 use core::alloc::Layout;
@@ -42,7 +43,7 @@ use packed::PackedRing;
 use split::SplitRing;
 
 /// The DMA buffer type a transport's bus hands out.
-pub(crate) type TransportBuffer<T> =
+pub type TransportBuffer<T> =
     <<<T as VirtioTransport>::Bus as DeviceBus>::DmaPool as DmaMemory>::Buffer;
 
 /// Both ring layouts use 16-byte descriptors, so one indirect table
@@ -81,6 +82,12 @@ pub enum VirtqueueError {
     ControlSlotOverflow { needed: usize, capacity: usize },
     #[error("a descriptor chain lists a readable buffer after a writable one")]
     ReadableAfterWritable,
+    #[error("a chain names bytes up to {end} of lent buffer {buffer}, which holds {len}")]
+    LentOutOfRange {
+        buffer: usize,
+        end: usize,
+        len: usize,
+    },
     #[error("this queue did not negotiate VIRTIO_F_RING_RESET")]
     ResetUnsupported,
     #[error("the device completed descriptor {id}, which is not a chain in flight on this queue")]
@@ -98,9 +105,9 @@ impl From<VirtqueueError> for IoError {
                 Self::Unsupported
             }
             VirtqueueError::EmptyChain => Self::DeviceFault,
-            VirtqueueError::ChainTooLong { .. } | VirtqueueError::ControlSlotOverflow { .. } => {
-                Self::OutOfBounds
-            }
+            VirtqueueError::ChainTooLong { .. }
+            | VirtqueueError::ControlSlotOverflow { .. }
+            | VirtqueueError::LentOutOfRange { .. } => Self::OutOfBounds,
             VirtqueueError::ReadableAfterWritable => Self::DeviceFault,
             VirtqueueError::Full { .. } => Self::DeviceFault,
             VirtqueueError::RingAllocation | VirtqueueError::Unreachable { .. } => {
@@ -779,6 +786,8 @@ impl<T: VirtioTransport> VirtQueue<T> {
     /// available to the device immediately.
     ///
     /// Returns the identifier and where the response bytes will be.
+    /// `lent` is what the [`Part::LentRead`] and [`Part::LentWrite`] parts
+    /// name.
     ///
     /// # Safety
     ///
@@ -786,11 +795,12 @@ impl<T: VirtioTransport> VirtQueue<T> {
     /// no chain headed by it is in flight and no reply of an earlier chain
     /// headed by it is still being read. Under the queue lock that is the
     /// completion table reporting the identifier idle.
-    pub(crate) unsafe fn submit_parts(
+    pub(crate) unsafe fn submit_parts<L: Lend>(
         &mut self,
         transport: &T,
         slots: &ControlSlots<TransportBuffer<T>>,
         parts: &[Part<'_>],
+        lent: &mut L,
     ) -> IoResult<(u16, ResponseSpan)> {
         let mut chain = [ChainEntry {
             addr: 0,
@@ -801,7 +811,8 @@ impl<T: VirtioTransport> VirtQueue<T> {
         let head = self.ring.next_id();
         // SAFETY: the caller owns the slot of the next identifier, which
         // is `head`.
-        let (used, span) = unsafe { slots.stage(transport.bus().dma(), head, parts, &mut chain)? };
+        let (used, span) =
+            unsafe { slots.stage(transport.bus().dma(), head, parts, lent, &mut chain)? };
         let token = self.ring.submit(&chain[..used], true)?;
         assert_eq!(
             token, head,

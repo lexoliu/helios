@@ -2212,8 +2212,12 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    let bytes = match p1_read_iovs_to_bytes(caller, memory, iovs, iovs_len) {
-        Ok(bytes) => bytes,
+    let layout = match p1_read_iovs_with_byte_len(caller, memory, iovs, iovs_len) {
+        Ok(layout) => layout,
+        Err(errno) => return errno,
+    };
+    let ranges = match p1_iovs_memory_ranges(memory, &layout.iovs) {
+        Ok(ranges) => ranges,
         Err(errno) => return errno,
     };
     let descriptor = caller.data().descriptors.get(fd).cloned();
@@ -2227,6 +2231,7 @@ where
     }
     match descriptor {
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(socket))) => {
+            let bytes = preview1_ranges_to_vec(memory.base as *const u8, &ranges, layout.byte_len);
             let (Some(address), port) = (match wasix_read_addr_port(caller, memory, addr) {
                 Ok(addr) => addr,
                 Err(errno) => return errno,
@@ -2306,14 +2311,17 @@ where
                 Err(errno) => return errno,
             };
             let timeout = wasix_effective_socket_timeout(options.send_timeout, fdflags);
-            let written = match u32::try_from(bytes.len()) {
+            let written = match layout.byte_len_u32() {
                 Ok(written) => written,
-                Err(_) => return p1::errno::OVERFLOW,
+                Err(errno) => return errno,
             };
-            if let Err(error) = service
-                .tcp_write_all_bytes(stream.id(), Bytes::from(bytes), timeout)
-                .await
-            {
+            // The guest is parked in this call until it returns, so its
+            // iovecs stay as they are while the write draws them one send
+            // buffer at a time, straight into transmit memory.
+            let pieces = service.tcp_payload_pieces(layout.byte_len, |offset, piece| {
+                copy_preview1_ranges_window(memory.base as *const u8, &ranges, offset, piece);
+            });
+            if let Err(error) = service.tcp_write_all(stream.id(), pieces, timeout).await {
                 return p1_errno_from_tcp_error_for_fdflags(error, fdflags);
             }
             p1_write_u32(caller, memory, ret_size, written)
@@ -2323,14 +2331,15 @@ where
         ))) => p1::errno::INVAL,
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(_))) => p1::errno::INVAL,
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair { writer, .. })) => {
-            let written = match u32::try_from(bytes.len()) {
+            let written = match layout.byte_len_u32() {
                 Ok(written) => written,
-                Err(_) => return p1::errno::OVERFLOW,
+                Err(errno) => return errno,
             };
             let fdflags = match caller.data().descriptors.fdflags(fd) {
                 Ok(fdflags) => fdflags,
                 Err(errno) => return errno,
             };
+            let bytes = preview1_ranges_to_vec(memory.base as *const u8, &ranges, layout.byte_len);
             if let Err(errno) = p1_send_to_socketpair(&writer, bytes, fdflags).await {
                 return errno;
             }
@@ -2439,10 +2448,10 @@ where
                 Err(errno) => return errno,
             };
             let timeout = wasix_effective_socket_timeout(options.send_timeout, fdflags);
-            if let Err(error) = service
-                .tcp_write_all_bytes(stream.id(), bytes, timeout)
-                .await
-            {
+            let pieces = service.tcp_payload_pieces(bytes.len(), |offset, piece| {
+                piece.copy_from_slice(&bytes[offset..][..piece.len()]);
+            });
+            if let Err(error) = service.tcp_write_all(stream.id(), pieces, timeout).await {
                 return p1_errno_from_tcp_error_for_fdflags(error, fdflags);
             }
             p1_write_u64(caller, memory, ret_size, written)

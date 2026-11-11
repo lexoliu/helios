@@ -253,24 +253,29 @@ pub(super) fn p1_read_iovs_to_bytes<T>(
     iovs_len: u32,
 ) -> Result<Vec<u8>, i32> {
     let layout = p1_read_iovs_with_byte_len(caller, memory, iovs, iovs_len)?;
-    let mut bytes: Vec<u8> = Vec::with_capacity(layout.byte_len);
-    let mut written = 0usize;
-    for (ptr, len) in layout.iovs {
-        let len = usize::try_from(len).map_err(|_| p1::errno::OVERFLOW)?;
-        let start = preview1_memory_start(memory, ptr, len).map_err(|_| p1::errno::FAULT)?;
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                (memory.base as *const u8).add(start),
-                bytes.as_mut_ptr().add(written),
-                len,
-            );
-        }
-        written = written.checked_add(len).ok_or(p1::errno::OVERFLOW)?;
+    let ranges = p1_iovs_memory_ranges(memory, &layout.iovs)?;
+    Ok(preview1_ranges_to_vec(
+        memory.base as *const u8,
+        &ranges,
+        layout.byte_len,
+    ))
+}
+
+/// The guest bytes `ranges` names, `byte_len` of them, gathered in order.
+pub(super) fn preview1_ranges_to_vec(
+    memory_base: *const u8,
+    ranges: &[(usize, usize)],
+    byte_len: usize,
+) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(byte_len);
+    for (start, len) in ranges {
+        // SAFETY: `p1_iovs_memory_ranges` validated every range against
+        // the live guest memory, which never shrinks.
+        bytes.extend_from_slice(unsafe {
+            core::slice::from_raw_parts(memory_base.add(*start), *len)
+        });
     }
-    unsafe {
-        bytes.set_len(written);
-    }
-    Ok(bytes)
+    bytes
 }
 
 pub(super) fn p1_iovs_memory_ranges(
@@ -291,27 +296,54 @@ pub(super) fn copy_preview1_ranges_to_slice(
     ranges: &[(usize, usize)],
     destination: &mut [u8],
 ) {
+    let total = ranges.iter().fold(0usize, |total, (_, len)| {
+        total
+            .checked_add(*len)
+            .expect("validated preview1 iov ranges overflowed while copying")
+    });
+    assert_eq!(
+        total,
+        destination.len(),
+        "validated preview1 iov ranges did not fill destination"
+    );
+    copy_preview1_ranges_window(memory_base, ranges, 0, destination);
+}
+
+/// Copies bytes `offset..offset + destination.len()` of the guest bytes
+/// `ranges` names, read in order as one sequence, into `destination`.
+pub(super) fn copy_preview1_ranges_window(
+    memory_base: *const u8,
+    ranges: &[(usize, usize)],
+    mut offset: usize,
+    destination: &mut [u8],
+) {
     let mut copied = 0usize;
     for (start, len) in ranges {
-        let next = copied
-            .checked_add(*len)
-            .expect("validated preview1 iov ranges overflowed while copying");
+        if copied == destination.len() {
+            break;
+        }
+        if offset >= *len {
+            offset -= *len;
+            continue;
+        }
+        let chunk = (*len - offset).min(destination.len() - copied);
         // SAFETY: `p1_iovs_memory_ranges` validated every source range
-        // against the live guest memory, and `destination` was allocated
-        // to the exact summed iov length before this copy.
+        // against the live guest memory, which never shrinks, and the
+        // chunk stays inside both its range and `destination`.
         unsafe {
             core::ptr::copy_nonoverlapping(
-                memory_base.add(*start),
+                memory_base.add(*start + offset),
                 destination.as_mut_ptr().add(copied),
-                *len,
+                chunk,
             );
         }
-        copied = next;
+        copied += chunk;
+        offset = 0;
     }
     assert_eq!(
         copied,
         destination.len(),
-        "validated preview1 iov ranges did not fill destination"
+        "validated preview1 iov ranges ended before the requested window"
     );
 }
 

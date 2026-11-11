@@ -1386,11 +1386,6 @@ where
             }
     }
 
-    pub fn queue_send(&mut self, bytes: &[u8]) -> usize {
-        let mut bytes = Bytes::copy_from_slice(bytes);
-        self.queue_send_bytes(&mut bytes)
-    }
-
     /// Bytes `queue_send_bytes` would accept right now. Zero when the
     /// transmit queue is full, so readiness reporting can avoid claiming
     /// writability that the next write would reject.
@@ -1401,6 +1396,13 @@ where
         )
     }
 
+    /// Queues the head of `bytes` for transmission and returns how many
+    /// bytes it took, leaving the rest in `bytes`.
+    ///
+    /// The segment is queued as the handle it arrives in and is never
+    /// copied, so the caller decides where the bytes live: a payload the
+    /// device transmits from in place has to come from the interface that
+    /// sends it ([`crate::NetworkInterface::transmit_payload`]).
     pub fn queue_send_bytes(&mut self, bytes: &mut Bytes) -> usize {
         if !matches!(self.state, TcpState::Established | TcpState::CloseWait) {
             return 0;
@@ -3586,7 +3588,10 @@ mod tests {
             TCP_INITIAL_RTO_NANOS,
         );
 
-        assert_eq!(socket.queue_send(b"hello"), 5);
+        assert_eq!(
+            socket.queue_send_bytes(&mut Bytes::from_static(b"hello")),
+            5
+        );
         let data = socket
             .take_transmit_segment(
                 TCP_INITIAL_RTO_NANOS,
@@ -3617,7 +3622,10 @@ mod tests {
     #[test]
     fn ack_sample_timing_uses_in_flight_send_timestamp() {
         let mut socket = established_socket();
-        assert_eq!(socket.queue_send(b"hello"), 5);
+        assert_eq!(
+            socket.queue_send_bytes(&mut Bytes::from_static(b"hello")),
+            5
+        );
         let sent_at = TCP_INITIAL_RTO_NANOS + 7;
         let data = socket
             .take_transmit_segment(sent_at, TcpSegmentBudget::wire_segments(usize::MAX))
@@ -3660,7 +3668,10 @@ mod tests {
     #[test]
     fn three_duplicate_acks_queue_fast_retransmit_before_rto() {
         let mut socket = established_socket();
-        assert_eq!(socket.queue_send(b"hello"), 5);
+        assert_eq!(
+            socket.queue_send_bytes(&mut Bytes::from_static(b"hello")),
+            5
+        );
         let sent_at = TCP_INITIAL_RTO_NANOS + 7;
         let data = socket
             .take_transmit_segment(sent_at, TcpSegmentBudget::wire_segments(usize::MAX))
@@ -3694,7 +3705,10 @@ mod tests {
     #[test]
     fn data_carrying_same_ack_does_not_trigger_fast_retransmit() {
         let mut socket = established_socket();
-        assert_eq!(socket.queue_send(b"hello"), 5);
+        assert_eq!(
+            socket.queue_send_bytes(&mut Bytes::from_static(b"hello")),
+            5
+        );
         let sent_at = TCP_INITIAL_RTO_NANOS + 7;
         let data = socket
             .take_transmit_segment(sent_at, TcpSegmentBudget::wire_segments(usize::MAX))
@@ -3725,7 +3739,10 @@ mod tests {
     #[test]
     fn window_update_same_ack_does_not_trigger_fast_retransmit() {
         let mut socket = established_socket();
-        assert_eq!(socket.queue_send(b"hello"), 5);
+        assert_eq!(
+            socket.queue_send_bytes(&mut Bytes::from_static(b"hello")),
+            5
+        );
         let sent_at = TCP_INITIAL_RTO_NANOS + 7;
         let data = socket
             .take_transmit_segment(sent_at, TcpSegmentBudget::wire_segments(usize::MAX))
@@ -3772,7 +3789,10 @@ mod tests {
             TCP_INITIAL_RTO_NANOS,
         );
         socket.mark_ack_queued();
-        assert_eq!(socket.queue_send(b"abcdefgh"), 8);
+        assert_eq!(
+            socket.queue_send_bytes(&mut Bytes::from_static(b"abcdefgh")),
+            8
+        );
         let sent_at = TCP_INITIAL_RTO_NANOS + 7;
         let first = socket
             .take_transmit_segment(sent_at, TcpSegmentBudget::wire_segments(usize::MAX))
@@ -3861,7 +3881,10 @@ mod tests {
             TCP_INITIAL_RTO_NANOS,
         );
         socket.mark_ack_queued();
-        assert_eq!(socket.queue_send(b"abcdefghijkl"), 12);
+        assert_eq!(
+            socket.queue_send_bytes(&mut Bytes::from_static(b"abcdefghijkl")),
+            12
+        );
         let sent_at = TCP_INITIAL_RTO_NANOS + 7;
         let first = socket
             .take_transmit_segment(sent_at, TcpSegmentBudget::wire_segments(usize::MAX))
@@ -3905,7 +3928,10 @@ mod tests {
     fn retransmission_timeout_clears_stale_sack_state() {
         let mut socket = established_socket();
         socket.peer_max_segment_size = 4;
-        assert_eq!(socket.queue_send(b"abcdefgh"), 8);
+        assert_eq!(
+            socket.queue_send_bytes(&mut Bytes::from_static(b"abcdefgh")),
+            8
+        );
         let sent_at = TCP_INITIAL_RTO_NANOS + 7;
         let first = socket
             .take_transmit_segment(sent_at, TcpSegmentBudget::wire_segments(usize::MAX))
@@ -4018,7 +4044,10 @@ mod tests {
             TCP_INITIAL_RTO_NANOS,
         );
         socket.mark_ack_queued();
-        assert_eq!(socket.queue_send(b"abcdefgh"), 8);
+        assert_eq!(
+            socket.queue_send_bytes(&mut Bytes::from_static(b"abcdefgh")),
+            8
+        );
         let sent_at = TCP_INITIAL_RTO_NANOS + 7;
         let first = socket
             .take_transmit_segment(sent_at, TcpSegmentBudget::wire_segments(usize::MAX))
@@ -4122,7 +4151,10 @@ mod tests {
     fn full_in_flight_queue_closes_emission_instead_of_panicking() {
         let mut socket = established_scaled_socket();
         socket.update_peer_receive_window(u16::MAX);
-        assert_eq!(socket.queue_send(b"pending payload"), 15);
+        assert_eq!(
+            socket.queue_send_bytes(&mut Bytes::from_static(b"pending payload")),
+            15
+        );
 
         // Saturate the in-flight queue the way a long bulk upload does
         // once the congestion window has grown past it; before the
@@ -4254,7 +4286,10 @@ mod tests {
         );
 
         assert_eq!(socket.peer_max_segment_size(), 4);
-        assert_eq!(socket.queue_send(b"abcdefghij"), 10);
+        assert_eq!(
+            socket.queue_send_bytes(&mut Bytes::from_static(b"abcdefghij")),
+            10
+        );
         let first = socket
             .take_transmit_segment(
                 TCP_INITIAL_RTO_NANOS + 1,
@@ -4269,7 +4304,10 @@ mod tests {
     fn path_mtu_caps_transmit_segment_size() {
         let mut socket = established_socket();
 
-        assert_eq!(socket.queue_send(b"abcdefghij"), 10);
+        assert_eq!(
+            socket.queue_send_bytes(&mut Bytes::from_static(b"abcdefghij")),
+            10
+        );
         let first = socket
             .take_transmit_segment(
                 TCP_INITIAL_RTO_NANOS + 1,
@@ -4293,7 +4331,10 @@ mod tests {
     #[test]
     fn path_mtu_reduction_queues_eager_retransmission_without_rto() {
         let mut socket = established_socket();
-        assert_eq!(socket.queue_send(b"abcdefgh"), 8);
+        assert_eq!(
+            socket.queue_send_bytes(&mut Bytes::from_static(b"abcdefgh")),
+            8
+        );
         let sent_at = TCP_INITIAL_RTO_NANOS + 7;
         let data = socket
             .take_transmit_segment(sent_at, TcpSegmentBudget::wire_segments(usize::MAX))
@@ -4312,7 +4353,10 @@ mod tests {
     #[test]
     fn path_mtu_reduction_inside_segment_clears_after_retransmission() {
         let mut socket = established_socket();
-        assert_eq!(socket.queue_send(b"abcdefgh"), 8);
+        assert_eq!(
+            socket.queue_send_bytes(&mut Bytes::from_static(b"abcdefgh")),
+            8
+        );
         let sent_at = TCP_INITIAL_RTO_NANOS + 7;
         let data = socket
             .take_transmit_segment(sent_at, TcpSegmentBudget::wire_segments(usize::MAX))
@@ -4334,7 +4378,10 @@ mod tests {
     #[test]
     fn partial_ack_trims_in_flight_retransmission_payload() {
         let mut socket = established_socket();
-        assert_eq!(socket.queue_send(b"abcdefgh"), 8);
+        assert_eq!(
+            socket.queue_send_bytes(&mut Bytes::from_static(b"abcdefgh")),
+            8
+        );
         let data = socket
             .take_transmit_segment(
                 TCP_INITIAL_RTO_NANOS + 1,
@@ -4371,7 +4418,10 @@ mod tests {
     #[test]
     fn ack_above_send_next_is_rejected_without_advancing_send_state() {
         let mut socket = established_socket();
-        assert_eq!(socket.queue_send(b"abcdefgh"), 8);
+        assert_eq!(
+            socket.queue_send_bytes(&mut Bytes::from_static(b"abcdefgh")),
+            8
+        );
         let sent_at = TCP_INITIAL_RTO_NANOS + 1;
         let data = socket
             .take_transmit_segment(sent_at, TcpSegmentBudget::wire_segments(usize::MAX))
@@ -4430,7 +4480,10 @@ mod tests {
     #[test]
     fn ack_above_send_next_preserves_pmtu_retransmission_marker() {
         let mut socket = established_socket();
-        assert_eq!(socket.queue_send(b"abcdefgh"), 8);
+        assert_eq!(
+            socket.queue_send_bytes(&mut Bytes::from_static(b"abcdefgh")),
+            8
+        );
         let sent_at = TCP_INITIAL_RTO_NANOS + 1;
         let data = socket
             .take_transmit_segment(sent_at, TcpSegmentBudget::wire_segments(usize::MAX))
@@ -4665,7 +4718,10 @@ mod tests {
         );
 
         assert_eq!(socket.peer_receive_window(), 32);
-        assert_eq!(socket.queue_send(b"abcdefghijklmnopqrstuvwxyz"), 26);
+        assert_eq!(
+            socket.queue_send_bytes(&mut Bytes::from_static(b"abcdefghijklmnopqrstuvwxyz")),
+            26
+        );
         let segment = socket
             .take_transmit_segment(
                 TCP_INITIAL_RTO_NANOS + 1,
@@ -4792,7 +4848,10 @@ mod tests {
         );
 
         assert_eq!(socket.peer_receive_window(), 4);
-        assert_eq!(socket.queue_send(b"abcdefghij"), 10);
+        assert_eq!(
+            socket.queue_send_bytes(&mut Bytes::from_static(b"abcdefghij")),
+            10
+        );
         let first = socket
             .take_transmit_segment(
                 TCP_INITIAL_RTO_NANOS + 2,
@@ -4828,7 +4887,10 @@ mod tests {
         );
 
         assert_eq!(socket.peer_receive_window(), 0);
-        assert_eq!(socket.queue_send(b"abcdefghij"), 10);
+        assert_eq!(
+            socket.queue_send_bytes(&mut Bytes::from_static(b"abcdefghij")),
+            10
+        );
         assert_eq!(
             socket.take_transmit_segment(
                 TCP_INITIAL_RTO_NANOS + 2,
@@ -4878,7 +4940,7 @@ mod tests {
             },
             TCP_INITIAL_RTO_NANOS + 1,
         );
-        assert_eq!(socket.queue_send(b"abc"), 3);
+        assert_eq!(socket.queue_send_bytes(&mut Bytes::from_static(b"abc")), 3);
 
         let rto = socket.retransmission_timer.timeout_nanos();
         let first_deadline = TCP_INITIAL_RTO_NANOS + 2 + rto;
@@ -4950,7 +5012,7 @@ mod tests {
             },
             TCP_INITIAL_RTO_NANOS + 1,
         );
-        assert_eq!(socket.queue_send(b"abc"), 3);
+        assert_eq!(socket.queue_send_bytes(&mut Bytes::from_static(b"abc")), 3);
         let deadline = TCP_INITIAL_RTO_NANOS + 2 + socket.retransmission_timer.timeout_nanos();
         assert_eq!(
             socket.take_transmit_segment(
@@ -5055,7 +5117,7 @@ mod tests {
             TCP_TRANSMIT_BUFFER_BYTES
         );
         assert_eq!(payload.len(), 1);
-        assert_eq!(socket.queue_send(b"x"), 0);
+        assert_eq!(socket.queue_send_bytes(&mut Bytes::from_static(b"x")), 0);
 
         let segment = socket
             .take_transmit_segment(
@@ -5064,7 +5126,7 @@ mod tests {
             )
             .expect("local transmit buffer should drain through normal send path");
         assert_eq!(segment.payload.len(), TCP_RECEIVE_SEGMENT_BYTES);
-        assert_eq!(socket.queue_send(b"x"), 1);
+        assert_eq!(socket.queue_send_bytes(&mut Bytes::from_static(b"x")), 1);
     }
 
     /// #158: a request/response exchange must be paced by the path, not
@@ -5120,7 +5182,10 @@ mod tests {
         // The exchange itself: request, reply, request. The second
         // request is the one the pacing deadline used to hold.
         let request_at = HANDSHAKE_RTT_NANOS;
-        assert_eq!(socket.queue_send(&REQUEST), REQUEST.len());
+        assert_eq!(
+            socket.queue_send_bytes(&mut Bytes::from_static(&REQUEST)),
+            REQUEST.len()
+        );
         let first = socket
             .take_transmit_segment(request_at, TcpSegmentBudget::wire_segments(usize::MAX))
             .expect("the first request should transmit");
@@ -5142,7 +5207,10 @@ mod tests {
             reply_at,
         );
 
-        assert_eq!(socket.queue_send(&REQUEST), REQUEST.len());
+        assert_eq!(
+            socket.queue_send_bytes(&mut Bytes::from_static(&REQUEST)),
+            REQUEST.len()
+        );
         let second = socket
             .take_transmit_segment(reply_at, TcpSegmentBudget::wire_segments(usize::MAX))
             .expect("the next request must not wait on a pacing deadline of its own");
@@ -5175,7 +5243,10 @@ mod tests {
         socket.mark_ack_queued();
 
         let payload = [9u8; TCP_RECEIVE_SEGMENT_BYTES * 4];
-        assert_eq!(socket.queue_send(&payload), payload.len());
+        assert_eq!(
+            socket.queue_send_bytes(&mut Bytes::copy_from_slice(&payload)),
+            payload.len()
+        );
         let sent_at = HANDSHAKE_RTT_NANOS;
         let segment = socket
             .take_transmit_segment(sent_at, TcpSegmentBudget::wire_segments(usize::MAX))
@@ -5214,7 +5285,10 @@ mod tests {
     #[test]
     fn pacing_rate_delays_next_data_segment() {
         let mut socket = established_fixed_pacing_socket(PacingRate::from_bytes_per_second(1_000));
-        assert_eq!(socket.queue_send(b"abcdefgh"), 8);
+        assert_eq!(
+            socket.queue_send_bytes(&mut Bytes::from_static(b"abcdefgh")),
+            8
+        );
         let first = socket
             .take_transmit_segment(
                 TCP_INITIAL_RTO_NANOS + 1,
@@ -5222,7 +5296,7 @@ mod tests {
             )
             .expect("first paced segment should transmit immediately");
         assert_eq!(first.payload.as_ref(), b"abcdefgh");
-        assert_eq!(socket.queue_send(b"ijkl"), 4);
+        assert_eq!(socket.queue_send_bytes(&mut Bytes::from_static(b"ijkl")), 4);
         assert_eq!(
             socket.next_deadline_nanos(),
             Some(TCP_INITIAL_RTO_NANOS + 1 + 8_000_000)
@@ -5247,7 +5321,10 @@ mod tests {
     #[test]
     fn paced_close_waits_for_queued_data_before_fin() {
         let mut socket = established_fixed_pacing_socket(PacingRate::from_bytes_per_second(1_000));
-        assert_eq!(socket.queue_send(b"abcdefgh"), 8);
+        assert_eq!(
+            socket.queue_send_bytes(&mut Bytes::from_static(b"abcdefgh")),
+            8
+        );
         let first = socket
             .take_transmit_segment(
                 TCP_INITIAL_RTO_NANOS + 1,
@@ -5255,7 +5332,7 @@ mod tests {
             )
             .expect("first paced segment should transmit immediately");
         assert_eq!(first.payload.as_ref(), b"abcdefgh");
-        assert_eq!(socket.queue_send(b"ijkl"), 4);
+        assert_eq!(socket.queue_send_bytes(&mut Bytes::from_static(b"ijkl")), 4);
 
         socket.close_send();
         assert_eq!(socket.state(), TcpState::FinWait1);
@@ -5288,7 +5365,7 @@ mod tests {
     #[test]
     fn active_close_sends_queued_data_before_fin_and_enters_fin_wait2() {
         let mut socket = established_socket();
-        assert_eq!(socket.queue_send(b"hi"), 2);
+        assert_eq!(socket.queue_send_bytes(&mut Bytes::from_static(b"hi")), 2);
         socket.close_send();
         assert_eq!(socket.state(), TcpState::FinWait1);
 
@@ -5520,7 +5597,7 @@ mod tests {
             TCP_INITIAL_RTO_NANOS + 1,
         );
         assert!(socket.pending_ack().is_some());
-        assert_eq!(socket.queue_send(b"w"), 1);
+        assert_eq!(socket.queue_send_bytes(&mut Bytes::from_static(b"w")), 1);
 
         let segment = socket
             .take_transmit_segment(
@@ -5728,7 +5805,10 @@ mod tests {
             Some(received_at + TCP_DELAYED_ACK_NANOS)
         );
 
-        assert_eq!(socket.queue_send(b"reply"), 5);
+        assert_eq!(
+            socket.queue_send_bytes(&mut Bytes::from_static(b"reply")),
+            5
+        );
         let segment = socket
             .take_transmit_segment(received_at + 1, TcpSegmentBudget::wire_segments(usize::MAX))
             .expect("queued data should carry the delayed acknowledgement");

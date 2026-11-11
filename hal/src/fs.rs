@@ -1,5 +1,6 @@
 pub use crate::io::{IoError, IoResult};
 
+use crate::dma::{BufResult, DmaBuffer};
 use crate::resource::{KernelResource, ResourceRights};
 use alloc::vec::Vec;
 use bitflags::bitflags;
@@ -301,14 +302,41 @@ pub struct BlockQueueTopology {
 }
 
 pub trait BlockDevice: Send + Sync {
+    /// A buffer the device transfers to and from in place.
+    ///
+    /// Data reaches a request in memory the device can reach, so the
+    /// consumer allocates the buffer it was going to fill or read anyway
+    /// through [`BlockDevice::buffer`] instead of handing the driver a
+    /// slice of arbitrary kernel memory.
+    type Buffer: DmaBuffer + AsRef<[u8]> + AsMut<[u8]>;
+
+    /// Allocates a zeroed buffer of `bytes` bytes the device can reach.
+    ///
+    /// A request carries a whole number of logical blocks, so a consumer
+    /// asks for a multiple of [`BlockGeometry::logical_block_bytes`].
+    fn buffer(&self, bytes: usize) -> IoResult<Self::Buffer>;
+
+    /// Reads `buf.len()` bytes starting at logical block `block_id` into
+    /// `buf`, and hands `buf` back.
+    ///
+    /// The buffer is the request's until the device has finished with it
+    /// (see [`crate::dma`]'s "Buffers a request owns"): dropping the future
+    /// mid-flight leaves it with the device, which frees it when it
+    /// completes the read.
     fn read_block(
         &self,
         block_id: usize,
-        buf: &mut [u8],
-    ) -> impl Future<Output = IoResult<()>> + Send;
+        buf: Self::Buffer,
+    ) -> impl Future<Output = BufResult<(), Self::Buffer>> + Send;
 
-    fn write_block(&self, block_id: usize, buf: &[u8])
-    -> impl Future<Output = IoResult<()>> + Send;
+    /// Writes `buf.len()` bytes starting at logical block `block_id` from
+    /// `buf`, and hands `buf` back. Owned the way
+    /// [`BlockDevice::read_block`]'s buffer is.
+    fn write_block(
+        &self,
+        block_id: usize,
+        buf: Self::Buffer,
+    ) -> impl Future<Output = BufResult<(), Self::Buffer>> + Send;
 
     /// Commits the device's volatile write cache.
     ///

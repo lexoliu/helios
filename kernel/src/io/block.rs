@@ -21,14 +21,12 @@
 
 extern crate alloc;
 
-use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::future::Future;
-use core::pin::Pin;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use helios_hal::cpu::Cpu;
+use helios_hal::dma::BufResult;
 use helios_hal::fs::{
     BlockDevice, BlockDeviceCapabilities, BlockGeometry, BlockQueueTopology, BlockRange,
     BlockSerial, IoError, IoResult,
@@ -58,6 +56,8 @@ pub enum BlockSelfCheckError {
         capacity_blocks: usize,
         block_bytes: usize,
     },
+    #[error("scratch disk could not provide a self-check buffer: {0}")]
+    Buffer(IoError),
     #[error("scratch disk write failed: {0}")]
     Write(IoError),
     #[error("scratch disk cache flush failed: {0}")]
@@ -102,14 +102,30 @@ pub struct BlockStats {
 
 /// The block device the kernel owns.
 ///
-/// The concrete device is a backend type — a virtio-blk resource behind
-/// whichever transport the platform exposes it on — so the service
-/// stores it behind a trait object rather than making every consumer of
-/// [`crate::RuntimeState`] generic over a device it never names. This is
-/// the same boundary the network service draws for the same reason.
+/// The service is generic over the platform's device. Data buffers are
+/// allocated from the device itself ([`BlockDevice::buffer`]), so the
+/// buffer type is the device's and a consumer of the service names it
+/// through the device it was built on. What [`crate::RuntimeState`]
+/// keeps is the device-independent half, [`BlockStatsHandle`].
+pub struct BlockService<Device: BlockDevice> {
+    device: Arc<Device>,
+    stats: BlockStatsHandle,
+}
+
+impl<Device: BlockDevice> Clone for BlockService<Device> {
+    fn clone(&self) -> Self {
+        Self {
+            device: self.device.clone(),
+            stats: self.stats.clone(),
+        }
+    }
+}
+
+/// What the kernel reports about its disk, independent of the device type
+/// behind it: the device's fixed properties and the requests the service
+/// forwarded.
 #[derive(Clone)]
-pub struct BlockService {
-    device: Arc<dyn DynBlockDevice>,
+pub struct BlockStatsHandle {
     geometry: BlockGeometry,
     capabilities: BlockDeviceCapabilities,
     topology: BlockQueueTopology,
@@ -125,62 +141,7 @@ struct RequestCounters {
     write_zeroes: AtomicU64,
 }
 
-impl BlockService {
-    /// Wraps a platform block device as the kernel's disk.
-    pub fn new<Device>(device: Device) -> Self
-    where
-        Device: BlockDevice + 'static,
-    {
-        Self {
-            geometry: device.geometry(),
-            capabilities: device.capabilities(),
-            topology: device.queue_topology(),
-            device: Arc::new(device),
-            counters: Arc::new(RequestCounters::default()),
-        }
-    }
-
-    pub fn geometry(&self) -> BlockGeometry {
-        self.geometry
-    }
-
-    pub fn capabilities(&self) -> BlockDeviceCapabilities {
-        self.capabilities
-    }
-
-    pub fn queue_topology(&self) -> BlockQueueTopology {
-        self.topology
-    }
-
-    pub async fn read_block(&self, block_id: usize, buf: &mut [u8]) -> IoResult<()> {
-        self.counters.reads.fetch_add(1, Ordering::Relaxed);
-        self.device.read_block(block_id, buf).await
-    }
-
-    pub async fn write_block(&self, block_id: usize, buf: &[u8]) -> IoResult<()> {
-        self.counters.writes.fetch_add(1, Ordering::Relaxed);
-        self.device.write_block(block_id, buf).await
-    }
-
-    pub async fn flush(&self) -> IoResult<()> {
-        self.counters.flushes.fetch_add(1, Ordering::Relaxed);
-        self.device.flush().await
-    }
-
-    pub async fn discard(&self, range: BlockRange) -> IoResult<()> {
-        self.counters.discards.fetch_add(1, Ordering::Relaxed);
-        self.device.discard(range).await
-    }
-
-    pub async fn write_zeroes(&self, range: BlockRange) -> IoResult<()> {
-        self.counters.write_zeroes.fetch_add(1, Ordering::Relaxed);
-        self.device.write_zeroes(range).await
-    }
-
-    pub async fn serial(&self) -> IoResult<BlockSerial> {
-        self.device.serial().await
-    }
-
+impl BlockStatsHandle {
     /// A snapshot of what the disk is and what the kernel has asked of
     /// it, for `helios:system/stats`.
     pub fn stats(&self) -> BlockStats {
@@ -199,17 +160,106 @@ impl BlockService {
             write_zeroes: self.counters.write_zeroes.load(Ordering::Relaxed),
         }
     }
+}
+
+impl<Device: BlockDevice> BlockService<Device> {
+    /// Wraps a platform block device as the kernel's disk.
+    pub fn new(device: Device) -> Self {
+        Self {
+            stats: BlockStatsHandle {
+                geometry: device.geometry(),
+                capabilities: device.capabilities(),
+                topology: device.queue_topology(),
+                counters: Arc::new(RequestCounters::default()),
+            },
+            device: Arc::new(device),
+        }
+    }
+
+    pub fn geometry(&self) -> BlockGeometry {
+        self.stats.geometry
+    }
+
+    pub fn capabilities(&self) -> BlockDeviceCapabilities {
+        self.stats.capabilities
+    }
+
+    pub fn queue_topology(&self) -> BlockQueueTopology {
+        self.stats.topology
+    }
+
+    /// The device-independent view of this disk's properties and counters,
+    /// which the runtime state publishes.
+    pub fn stats_handle(&self) -> BlockStatsHandle {
+        self.stats.clone()
+    }
+
+    /// Allocates a zeroed buffer of `bytes` bytes the device can reach.
+    pub fn buffer(&self, bytes: usize) -> IoResult<Device::Buffer> {
+        self.device.buffer(bytes)
+    }
+
+    /// Reads into `buf` and hands it back. The buffer is the request's
+    /// until the device is done with it ([`BlockDevice::read_block`]).
+    pub async fn read_block(
+        &self,
+        block_id: usize,
+        buf: Device::Buffer,
+    ) -> BufResult<(), Device::Buffer> {
+        self.stats.counters.reads.fetch_add(1, Ordering::Relaxed);
+        self.device.read_block(block_id, buf).await
+    }
+
+    /// Writes from `buf` and hands it back, owned the way
+    /// [`BlockService::read_block`]'s buffer is.
+    pub async fn write_block(
+        &self,
+        block_id: usize,
+        buf: Device::Buffer,
+    ) -> BufResult<(), Device::Buffer> {
+        self.stats.counters.writes.fetch_add(1, Ordering::Relaxed);
+        self.device.write_block(block_id, buf).await
+    }
+
+    pub async fn flush(&self) -> IoResult<()> {
+        self.stats.counters.flushes.fetch_add(1, Ordering::Relaxed);
+        self.device.flush().await
+    }
+
+    pub async fn discard(&self, range: BlockRange) -> IoResult<()> {
+        self.stats.counters.discards.fetch_add(1, Ordering::Relaxed);
+        self.device.discard(range).await
+    }
+
+    pub async fn write_zeroes(&self, range: BlockRange) -> IoResult<()> {
+        self.stats
+            .counters
+            .write_zeroes
+            .fetch_add(1, Ordering::Relaxed);
+        self.device.write_zeroes(range).await
+    }
+
+    pub async fn serial(&self) -> IoResult<BlockSerial> {
+        self.device.serial().await
+    }
+
+    /// A snapshot of what the disk is and what the kernel has asked of
+    /// it, for `helios:system/stats`.
+    pub fn stats(&self) -> BlockStats {
+        self.stats.stats()
+    }
 
     /// Blocks the boot self-check writes to, at the very end of the
     /// disk. Nothing else may be placed there.
     pub fn self_check_blocks(&self) -> usize {
-        SELF_CHECK_BYTES.div_ceil(self.geometry.logical_block_bytes)
+        SELF_CHECK_BYTES.div_ceil(self.stats.geometry.logical_block_bytes)
     }
 
     /// Blocks available to swap: the whole disk except the ones the
     /// self-check owns.
     pub fn swap_blocks(&self) -> usize {
-        self.geometry
+        self.stats
+            .geometry
             .capacity_blocks
             .saturating_sub(self.self_check_blocks())
     }
@@ -222,35 +272,40 @@ impl BlockService {
     /// the read so a volatile cache cannot answer from memory it never
     /// wrote through.
     pub async fn self_check(&self, root: &RootEntropyHandle) -> Result<(), BlockSelfCheckError> {
-        let block_bytes = self.geometry.logical_block_bytes;
+        let block_bytes = self.stats.geometry.logical_block_bytes;
         let blocks = SELF_CHECK_BYTES.div_ceil(block_bytes);
-        if self.geometry.capacity_blocks < blocks {
+        if self.stats.geometry.capacity_blocks < blocks {
             return Err(BlockSelfCheckError::TooSmall {
-                capacity_blocks: self.geometry.capacity_blocks,
+                capacity_blocks: self.stats.geometry.capacity_blocks,
                 block_bytes,
             });
         }
-        let start_block = self.geometry.capacity_blocks - blocks;
+        let start_block = self.stats.geometry.capacity_blocks - blocks;
 
-        let mut pattern = [0_u8; SELF_CHECK_BYTES];
+        // Both buffers come from the device: the pattern and the readback
+        // are what the requests transfer, so they are memory the device
+        // owns rather than locals of this future, and each request holds
+        // its buffer until the device hands it back.
         let bytes = blocks * block_bytes;
-        let pattern = &mut pattern[..bytes];
-        root.fill(pattern);
+        let mut pattern = self.buffer(bytes).map_err(BlockSelfCheckError::Buffer)?;
+        root.fill(pattern.as_mut());
 
-        self.write_block(start_block, pattern)
+        let ((), pattern) = self
+            .write_block(start_block, pattern)
             .await
-            .map_err(BlockSelfCheckError::Write)?;
+            .map_err(|error| BlockSelfCheckError::Write(error.into_error()))?;
         self.flush().await.map_err(BlockSelfCheckError::Flush)?;
 
-        let mut readback = [0_u8; SELF_CHECK_BYTES];
-        let readback = &mut readback[..bytes];
-        self.read_block(start_block, readback)
+        let readback = self.buffer(bytes).map_err(BlockSelfCheckError::Buffer)?;
+        let ((), readback) = self
+            .read_block(start_block, readback)
             .await
-            .map_err(BlockSelfCheckError::Read)?;
-        if readback != pattern {
+            .map_err(|error| BlockSelfCheckError::Read(error.into_error()))?;
+        if readback.as_ref() != pattern.as_ref() {
             let block = readback
+                .as_ref()
                 .chunks(block_bytes)
-                .zip(pattern.chunks(block_bytes))
+                .zip(pattern.as_ref().chunks(block_bytes))
                 .position(|(read, written)| read != written)
                 .unwrap_or(0);
             return Err(BlockSelfCheckError::Mismatch { block });
@@ -260,6 +315,7 @@ impl BlockService {
         // blocks back rather than leaving random bytes behind. A device
         // without the operation simply keeps them.
         if self
+            .stats
             .capabilities
             .contains(BlockDeviceCapabilities::WRITE_ZEROES)
         {
@@ -275,12 +331,18 @@ impl BlockService {
 /// one — the swap backend, in particular — can be built on the service
 /// rather than on the driver behind it, and its requests are counted
 /// like every other.
-impl BlockDevice for BlockService {
-    async fn read_block(&self, block_id: usize, buf: &mut [u8]) -> IoResult<()> {
+impl<Device: BlockDevice> BlockDevice for BlockService<Device> {
+    type Buffer = Device::Buffer;
+
+    fn buffer(&self, bytes: usize) -> IoResult<Self::Buffer> {
+        BlockService::buffer(self, bytes)
+    }
+
+    async fn read_block(&self, block_id: usize, buf: Self::Buffer) -> BufResult<(), Self::Buffer> {
         BlockService::read_block(self, block_id, buf).await
     }
 
-    async fn write_block(&self, block_id: usize, buf: &[u8]) -> IoResult<()> {
+    async fn write_block(&self, block_id: usize, buf: Self::Buffer) -> BufResult<(), Self::Buffer> {
         BlockService::write_block(self, block_id, buf).await
     }
 
@@ -297,7 +359,7 @@ impl BlockDevice for BlockService {
     }
 
     fn geometry(&self) -> BlockGeometry {
-        self.geometry
+        self.stats.geometry
     }
 
     async fn serial(&self) -> IoResult<BlockSerial> {
@@ -305,11 +367,11 @@ impl BlockDevice for BlockService {
     }
 
     fn capabilities(&self) -> BlockDeviceCapabilities {
-        self.capabilities
+        self.stats.capabilities
     }
 
     fn queue_topology(&self) -> BlockQueueTopology {
-        self.topology
+        self.stats.topology
     }
 }
 
@@ -328,7 +390,7 @@ pub fn install_block_devices<CpuImpl, WatchdogImpl, Device, Install>(
     CpuImpl: Cpu + Clone + Send + Sync + 'static,
     WatchdogImpl: Watchdog + Clone,
     Device: BlockDevice + 'static,
-    Install: FnOnce(BlockService) + 'static,
+    Install: FnOnce(BlockService<Device>) + 'static,
 {
     if devices.is_empty() {
         tracing::warn!("no block device was discovered on the platform bus");
@@ -365,7 +427,7 @@ pub fn install_block_devices<CpuImpl, WatchdogImpl, Device, Install>(
 async fn open_scratch_disk<Device>(
     devices: Vec<Device>,
     root: &RootEntropyHandle,
-) -> Result<BlockService, BlockInstallError>
+) -> Result<BlockService<Device>, BlockInstallError>
 where
     Device: BlockDevice + 'static,
 {
@@ -397,76 +459,6 @@ where
     Ok(scratch)
 }
 
-/// The object-safe view of [`BlockDevice`] the service stores.
-trait DynBlockDevice: Send + Sync + 'static {
-    fn read_block<'a>(
-        &'a self,
-        block_id: usize,
-        buf: &'a mut [u8],
-    ) -> Pin<Box<dyn Future<Output = IoResult<()>> + Send + 'a>>;
-
-    fn write_block<'a>(
-        &'a self,
-        block_id: usize,
-        buf: &'a [u8],
-    ) -> Pin<Box<dyn Future<Output = IoResult<()>> + Send + 'a>>;
-
-    fn flush(&self) -> Pin<Box<dyn Future<Output = IoResult<()>> + Send + '_>>;
-
-    fn discard(&self, range: BlockRange)
-    -> Pin<Box<dyn Future<Output = IoResult<()>> + Send + '_>>;
-
-    fn write_zeroes(
-        &self,
-        range: BlockRange,
-    ) -> Pin<Box<dyn Future<Output = IoResult<()>> + Send + '_>>;
-
-    fn serial(&self) -> Pin<Box<dyn Future<Output = IoResult<BlockSerial>> + Send + '_>>;
-}
-
-impl<Device> DynBlockDevice for Device
-where
-    Device: BlockDevice + 'static,
-{
-    fn read_block<'a>(
-        &'a self,
-        block_id: usize,
-        buf: &'a mut [u8],
-    ) -> Pin<Box<dyn Future<Output = IoResult<()>> + Send + 'a>> {
-        Box::pin(BlockDevice::read_block(self, block_id, buf))
-    }
-
-    fn write_block<'a>(
-        &'a self,
-        block_id: usize,
-        buf: &'a [u8],
-    ) -> Pin<Box<dyn Future<Output = IoResult<()>> + Send + 'a>> {
-        Box::pin(BlockDevice::write_block(self, block_id, buf))
-    }
-
-    fn flush(&self) -> Pin<Box<dyn Future<Output = IoResult<()>> + Send + '_>> {
-        Box::pin(BlockDevice::flush(self))
-    }
-
-    fn discard(
-        &self,
-        range: BlockRange,
-    ) -> Pin<Box<dyn Future<Output = IoResult<()>> + Send + '_>> {
-        Box::pin(BlockDevice::discard(self, range))
-    }
-
-    fn write_zeroes(
-        &self,
-        range: BlockRange,
-    ) -> Pin<Box<dyn Future<Output = IoResult<()>> + Send + '_>> {
-        Box::pin(BlockDevice::write_zeroes(self, range))
-    }
-
-    fn serial(&self) -> Pin<Box<dyn Future<Output = IoResult<BlockSerial>> + Send + '_>> {
-        Box::pin(BlockDevice::serial(self))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -474,6 +466,7 @@ mod tests {
     use crate::memory::RootEntropy;
     use crate::test_support::TestCpu;
     use futures_lite::future::block_on;
+    use helios_hal::dma::{DeviceAddress, DmaBuffer};
     use spin::Mutex;
 
     /// A disk in host memory that answers a fixed serial.
@@ -504,20 +497,70 @@ mod tests {
         }
     }
 
-    impl BlockDevice for MemoryDisk {
-        async fn read_block(&self, block_id: usize, buf: &mut [u8]) -> IoResult<()> {
-            let offset = block_id * self.block_bytes;
-            buf.copy_from_slice(&self.blocks.lock()[offset..offset + buf.len()]);
-            if self.corrupt_readback {
-                buf[0] ^= 0xff;
-            }
-            Ok(())
+    /// A transfer buffer in host memory. The test disk never hands its
+    /// address to hardware, so the device address is the host address.
+    struct HostBuffer {
+        bytes: Vec<u8>,
+    }
+
+    impl DmaBuffer for HostBuffer {
+        fn device_address(&self) -> DeviceAddress {
+            DeviceAddress::new(self.bytes.as_ptr() as u64)
         }
 
-        async fn write_block(&self, block_id: usize, buf: &[u8]) -> IoResult<()> {
+        fn as_ptr(&self) -> *mut u8 {
+            self.bytes.as_ptr().cast_mut()
+        }
+
+        fn len(&self) -> usize {
+            self.bytes.len()
+        }
+    }
+
+    impl AsRef<[u8]> for HostBuffer {
+        fn as_ref(&self) -> &[u8] {
+            &self.bytes
+        }
+    }
+
+    impl AsMut<[u8]> for HostBuffer {
+        fn as_mut(&mut self) -> &mut [u8] {
+            &mut self.bytes
+        }
+    }
+
+    impl BlockDevice for MemoryDisk {
+        type Buffer = HostBuffer;
+
+        fn buffer(&self, bytes: usize) -> IoResult<Self::Buffer> {
+            Ok(HostBuffer {
+                bytes: alloc::vec![0_u8; bytes],
+            })
+        }
+
+        async fn read_block(
+            &self,
+            block_id: usize,
+            mut buf: Self::Buffer,
+        ) -> BufResult<(), Self::Buffer> {
+            let bytes = buf.as_mut();
             let offset = block_id * self.block_bytes;
-            self.blocks.lock()[offset..offset + buf.len()].copy_from_slice(buf);
-            Ok(())
+            bytes.copy_from_slice(&self.blocks.lock()[offset..offset + bytes.len()]);
+            if self.corrupt_readback {
+                bytes[0] ^= 0xff;
+            }
+            Ok(((), buf))
+        }
+
+        async fn write_block(
+            &self,
+            block_id: usize,
+            buf: Self::Buffer,
+        ) -> BufResult<(), Self::Buffer> {
+            let bytes = buf.as_ref();
+            let offset = block_id * self.block_bytes;
+            self.blocks.lock()[offset..offset + bytes.len()].copy_from_slice(bytes);
+            Ok(((), buf))
         }
 
         async fn flush(&self) -> IoResult<()> {
@@ -623,8 +666,9 @@ mod tests {
         assert_eq!(stats.block_bytes, 512);
         assert_eq!(stats.queue_depth, 128);
 
-        let mut tail = [0xff_u8; 4096];
-        block_on(service.read_block(56, &mut tail)).expect("read the self-check range");
-        assert_eq!(tail, [0_u8; 4096]);
+        let mut tail = service.buffer(4096).expect("a buffer for the readback");
+        tail.as_mut().fill(0xff);
+        let ((), tail) = block_on(service.read_block(56, tail)).expect("read the self-check range");
+        assert_eq!(tail.as_ref(), [0_u8; 4096]);
     }
 }

@@ -135,14 +135,15 @@ pub use instance::{
     StoreTurns, allow_instance_resource_growth,
 };
 pub use io::{
-    BlockInstallError, BlockSelfCheckError, BlockService, BlockStats, ByteReadWait, ByteReader,
-    ByteWriteWait, ByteWriter, ClosedPeer, DebugConsole, DebugSerialAccess, DebugSerialInterrupt,
-    DebugSerialWriter, ExternalInterruptHandler, ExternalInterruptRoutes, IommuDomains,
-    IommuEndpointStats, IommuReport, IommuStats, MAX_BLOCK_DEVICES, MAX_DEVICE_INTERRUPTS,
-    MAX_INPUT_DEVICES, MAX_IOMMU_ENDPOINTS, MAX_NETWORK_INTERRUPTS, PanicSerial, PollKey,
-    PollRegistration, PollRegistry, PollRegistryError, PollSourceKind, RecordingConsole,
-    SCRATCH_DISK_SERIAL, SerialReader, TryRead, TryWrite, byte_channel, emit_panic_report,
-    install_block_devices, read_debug_serial, read_serial, try_read_serial, wake_queue_owners,
+    BlockInstallError, BlockSelfCheckError, BlockService, BlockStats, BlockStatsHandle,
+    ByteReadWait, ByteReader, ByteWriteWait, ByteWriter, ClosedPeer, DebugConsole,
+    DebugSerialAccess, DebugSerialInterrupt, DebugSerialWriter, ExternalInterruptHandler,
+    ExternalInterruptRoutes, IommuDomains, IommuEndpointStats, IommuReport, IommuStats,
+    MAX_BLOCK_DEVICES, MAX_DEVICE_INTERRUPTS, MAX_INPUT_DEVICES, MAX_IOMMU_ENDPOINTS,
+    MAX_NETWORK_INTERRUPTS, PanicSerial, PollKey, PollRegistration, PollRegistry,
+    PollRegistryError, PollSourceKind, RecordingConsole, SCRATCH_DISK_SERIAL, SerialReader,
+    TryRead, TryWrite, byte_channel, emit_panic_report, install_block_devices, read_debug_serial,
+    read_serial, try_read_serial, wake_queue_owners,
 };
 pub use kernel_exception::{
     KernelException, KernelExceptionCause, KernelExceptionDispatch, KernelNativeTrapHandler,
@@ -206,8 +207,8 @@ pub use runtime::{
     HostFileSystem, HostFsError, HostFsErrorKind, HostMetadata, Ipv4Address, NetworkErrorDetail,
     NetworkHandle, NetworkIpAddress, NetworkPacketPump, ObjectIdentity, PingError, PingErrorKind,
     PingReply, RegisteredTcpReadBuffer, RuntimeState, SocketReadiness, TcpAccepted, TcpError,
-    TcpErrorKind, TcpListener, TcpReadProgress, TcpWriteProgress, UdpBinding, UdpDatagram,
-    UdpError, UdpErrorKind,
+    TcpErrorKind, TcpListener, TcpPayloadPieces, TcpReadProgress, TcpWriteProgress, UdpBinding,
+    UdpDatagram, UdpError, UdpErrorKind,
 };
 pub use surface::{
     MAX_INSTANCE_SURFACES, MAX_LIVE_SURFACES, ReturnedSurfaces, SURFACE_EVENT_QUEUE_DEPTH,

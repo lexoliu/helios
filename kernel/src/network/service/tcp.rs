@@ -175,23 +175,50 @@ where
         self.execute_tcp_accept(listener, timeout_nanos).await
     }
 
-    pub async fn tcp_write_all(
-        &self,
-        stream: TcpStreamId,
-        bytes: &[u8],
-        timeout_nanos: u64,
-    ) -> Result<(), TcpError> {
-        self.execute_tcp_write_all_bytes(stream, Bytes::copy_from_slice(bytes), timeout_nanos)
-            .await
+    /// At least `bytes` of memory the interface transmits from in place.
+    pub fn tcp_transmit_payload(&self, bytes: usize) -> Result<DeviceImpl::TxPayload, TcpError> {
+        self.inner
+            .device
+            .transmit_payload(bytes)
+            .map_err(|_| TcpError {
+                kind: TcpErrorKind::Unavailable,
+                detail: NetworkErrorDetail::TcpWriteQueueFailed,
+            })
     }
 
+    /// Writes every piece `pieces` yields to `stream`, in order; each is
+    /// frozen from [`Self::tcp_transmit_payload`] memory.
+    ///
+    /// A piece is drawn only after the one before it is queued, so a lazy
+    /// iterator holds one piece of transmit memory beyond the send queue
+    /// at a time. The timeout covers the whole write, not each piece.
+    pub async fn tcp_write_all<Pieces>(
+        &self,
+        stream: TcpStreamId,
+        pieces: Pieces,
+        timeout_nanos: u64,
+    ) -> Result<(), TcpError>
+    where
+        Pieces: Iterator<Item = Result<Bytes, TcpError>>,
+    {
+        let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
+        for piece in pieces {
+            self.execute_tcp_write_until(stream, piece?, deadline_nanos)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Writes `bytes`, which the caller froze from memory the interface
+    /// can transmit from ([`Self::tcp_transmit_payload`]).
     pub async fn tcp_write_all_bytes(
         &self,
         stream: TcpStreamId,
         bytes: Bytes,
         timeout_nanos: u64,
     ) -> Result<(), TcpError> {
-        self.execute_tcp_write_all_bytes(stream, bytes, timeout_nanos)
+        let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
+        self.execute_tcp_write_until(stream, bytes, deadline_nanos)
             .await
     }
 
@@ -686,13 +713,14 @@ where
         }
     }
 
-    pub(super) async fn execute_tcp_write_all_bytes(
+    /// Queues all of `bytes` on `stream`, parking on a full send queue
+    /// until `deadline_nanos`.
+    pub(super) async fn execute_tcp_write_until(
         &self,
         stream: TcpStreamId,
         mut bytes: Bytes,
-        timeout_nanos: u64,
+        deadline_nanos: u64,
     ) -> Result<(), TcpError> {
-        let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
         while !bytes.is_empty() {
             // A blocked write is unblocked by the peer's window opening,
             // which arrives as an ACK on this stream's shard.

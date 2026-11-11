@@ -24,6 +24,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use async_lock::Mutex as AsyncMutex;
 use bytes::Bytes;
+use core::alloc::Layout;
 use core::cell::UnsafeCell;
 use core::future::Future;
 use core::mem::size_of;
@@ -32,6 +33,7 @@ use core::ops::Range;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crossbeam_utils::CachePadded;
 
+use helios_hal::dma::DmaMemory;
 use helios_hal::io::{IoError, IoResult};
 use helios_netstack::{
     ChecksumOffload, DEFAULT_POLL_BUDGET, EventDeliveryCapabilities, FlowHash,
@@ -41,9 +43,10 @@ use helios_netstack::{
 };
 use spin::Mutex as SpinMutex;
 
+use crate::bus::DeviceBus;
 use crate::features::{NegotiatedFeatures, RING_FEATURES, negotiate_with};
 use crate::notify::Notify;
-use crate::queue::VirtQueue;
+use crate::queue::{TransportBuffer, VirtQueue};
 use crate::transport::{DeviceStatus, DeviceType, VirtioTransport};
 
 const NET_QUEUE_SIZE: u16 = 256;
@@ -74,13 +77,16 @@ const MAX_RX_REASSEMBLY_BUFFERS: usize = 64;
 ///
 /// Two is the deliberate ceiling, not a placeholder. Everything the
 /// network stack hands the driver is a header prefix plus at most one
-/// refcounted payload buffer, and that buffer is a single kernel-heap
-/// allocation, which every target's DMA pool maps linearly onto one
-/// contiguous physical range. A third descriptor would have no
+/// refcounted payload buffer, and that buffer is a single allocation
+/// from the device's DMA pool, contiguous in the device's address
+/// space. A third descriptor would have no
 /// producer, and with `VIRTIO_F_INDIRECT_DESC` the limit also sizes the
 /// indirect table allocated for every descriptor in the ring, so
 /// widening it speculatively costs memory on every queue pair.
 const TX_CHAIN_LIMIT: u16 = 2;
+/// Alignment of a transmit payload buffer: a cache line of the target,
+/// so two payloads never share one.
+const PAYLOAD_ALIGNMENT: usize = core::mem::align_of::<CachePadded<u8>>();
 /// A control command is a read-only command buffer plus a writable ack.
 const CONTROL_CHAIN_LIMIT: u16 = 2;
 const DESCRIPTOR_BITSET_WORDS: usize = (NET_QUEUE_SIZE as usize).div_ceil(usize::BITS as usize);
@@ -2103,6 +2109,19 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         Ok(Some(Self::drain_tx_completions(&mut state, budget)?))
     }
 
+    /// Allocates a zeroed transmit payload buffer of `bytes` bytes the
+    /// device can reach.
+    ///
+    /// A scatter frame's payload is read in place, so it has to be memory
+    /// the device owns before it is queued: the caller fills the buffer it
+    /// was going to copy into anyway and freezes it with
+    /// `Bytes::from_owner`.
+    pub fn transmit_payload(&self, bytes: usize) -> IoResult<TransportBuffer<T>> {
+        let layout =
+            Layout::from_size_align(bytes, PAYLOAD_ALIGNMENT).map_err(|_| IoError::OutOfBounds)?;
+        self.transport.bus().dma().allocate_zeroed(layout)
+    }
+
     /// Immediate zero-copy TX: headers are copied into the descriptor
     /// slot behind the virtio-net header while the payload is chained
     /// as an external read-only descriptor. The driver holds each
@@ -3458,6 +3477,21 @@ mod tests {
         assert!(bits.get(129));
     }
 
+    /// A transmit payload the way a consumer makes one: allocated from the
+    /// device, filled, and frozen into the refcounted handle the stack
+    /// queues.
+    fn transmit_payload<T: crate::transport::VirtioTransport>(
+        device: &VirtioNetDevice<T>,
+        bytes: usize,
+        fill: u8,
+    ) -> Bytes {
+        let mut buffer = device
+            .transmit_payload(bytes)
+            .expect("the device allocates a payload buffer");
+        buffer.as_mut().fill(fill);
+        Bytes::from_owner(buffer)
+    }
+
     /// A scatter frame reaches the device as two descriptors: the
     /// header prefix out of the driver's own slot, and the payload
     /// pointed at where the caller already had it. The driver keeps the
@@ -3467,7 +3501,7 @@ mod tests {
     fn a_scatter_frame_chains_its_payload_by_reference_until_completion() {
         let harness = NetHarness::new(NET_FEATURE_CSUM);
         let headers = [0x11_u8; 54];
-        let payload = Bytes::from(vec![0xa5_u8; 2048]);
+        let payload = transmit_payload(&harness.device, 2048, 0xa5);
         let payload_address = payload.as_ptr() as u64;
         let token = {
             let state = harness.device.queue_pairs[0]
@@ -3548,8 +3582,8 @@ mod tests {
     fn an_out_of_order_completion_releases_only_its_own_payload() {
         let harness = NetHarness::new(NET_FEATURE_CSUM);
         let headers = [0x22_u8; 54];
-        let first = Bytes::from(vec![0x11_u8; 512]);
-        let second = Bytes::from(vec![0x22_u8; 768]);
+        let first = transmit_payload(&harness.device, 512, 0x11);
+        let second = transmit_payload(&harness.device, 768, 0x22);
         let first_address = first.as_ptr() as u64;
         let second_address = second.as_ptr() as u64;
         let first_token = {

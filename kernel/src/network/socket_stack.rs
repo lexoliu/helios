@@ -84,14 +84,17 @@ where
         self.service.tcp_accept(listener, timeout_nanos)
     }
 
-    pub fn tcp_write_all<'a>(
+    pub fn tcp_write_all<'a, Pieces>(
         &'a self,
         _: TcpCap,
         stream: Service::TcpStream,
-        bytes: &'a [u8],
+        pieces: Pieces,
         timeout_nanos: u64,
-    ) -> impl Future<Output = Result<(), crate::TcpError>> + Send + 'a {
-        self.service.tcp_write_all(stream, bytes, timeout_nanos)
+    ) -> impl Future<Output = Result<(), crate::TcpError>> + Send + 'a
+    where
+        Pieces: Iterator<Item = Result<Bytes, crate::TcpError>> + Send + 'a,
+    {
+        self.service.tcp_write_all(stream, pieces, timeout_nanos)
     }
 
     pub fn tcp_write_all_bytes(
@@ -233,6 +236,7 @@ mod tests {
         type TcpStream = u64;
         type TcpListener = u64;
         type UdpSocket = u64;
+        type TxPayload = Vec<u8>;
 
         // The in-memory doubles model an always-ready loopback peer.
         fn tcp_readiness(
@@ -371,12 +375,19 @@ mod tests {
             }))
         }
 
-        fn tcp_write_all(
-            &self,
+        fn tcp_transmit_payload(&self, bytes: usize) -> Result<Self::TxPayload, TcpError> {
+            Ok(vec![0; bytes])
+        }
+
+        fn tcp_write_all<'a, Pieces>(
+            &'a self,
             _: Self::TcpStream,
-            _: &[u8],
+            _: Pieces,
             _: u64,
-        ) -> impl Future<Output = Result<(), TcpError>> + Send + '_ {
+        ) -> impl Future<Output = Result<(), TcpError>> + Send + 'a
+        where
+            Pieces: Iterator<Item = Result<Bytes, TcpError>> + Send + 'a,
+        {
             core::future::ready(Ok(()))
         }
 

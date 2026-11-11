@@ -589,6 +589,19 @@ pub struct InterfaceEventMark {
 
 /// Multi-core aware network interface contract used by packet stacks.
 pub trait NetworkInterface: Clone + Send + Sync + 'static {
+    /// A buffer the interface transmits from in place.
+    ///
+    /// [`NetworkInterface::try_transmit_scatter_immediate_on`] reads a
+    /// frame's scatter payload where it is, so the payload has to be
+    /// memory the device can reach. The caller allocates it through
+    /// [`NetworkInterface::transmit_payload`], fills the copy it was
+    /// going to make anyway, and freezes it with `Bytes::from_owner`.
+    type TxPayload: AsMut<[u8]> + AsRef<[u8]> + Send + Sync + 'static;
+
+    /// Allocates a zeroed transmit payload buffer of `bytes` bytes the
+    /// device can reach.
+    fn transmit_payload(&self, bytes: usize) -> IoResult<Self::TxPayload>;
+
     /// Returns the hardware MAC address programmed for this interface.
     fn mac_address(&self) -> EthernetAddress;
 

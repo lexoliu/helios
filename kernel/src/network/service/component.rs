@@ -302,6 +302,7 @@ where
     type TcpStream = TcpStreamId;
     type TcpListener = TcpListenerId;
     type UdpSocket = UdpSocketId;
+    type TxPayload = DeviceImpl::TxPayload;
 
     fn hardware_address(&self) -> [u8; 6] {
         NetworkService::hardware_address(self)
@@ -408,13 +409,20 @@ where
         NetworkService::udp_readiness(self, socket).await
     }
 
-    async fn tcp_write_all<'a>(
+    fn tcp_transmit_payload(&self, bytes: usize) -> Result<Self::TxPayload, TcpError> {
+        NetworkService::tcp_transmit_payload(self, bytes)
+    }
+
+    async fn tcp_write_all<'a, Pieces>(
         &'a self,
         stream: Self::TcpStream,
-        bytes: &'a [u8],
+        pieces: Pieces,
         timeout_nanos: u64,
-    ) -> Result<(), TcpError> {
-        NetworkService::tcp_write_all(self, stream, bytes, timeout_nanos).await
+    ) -> Result<(), TcpError>
+    where
+        Pieces: Iterator<Item = Result<Bytes, TcpError>> + Send + 'a,
+    {
+        NetworkService::tcp_write_all(self, stream, pieces, timeout_nanos).await
     }
 
     async fn tcp_write_all_bytes(

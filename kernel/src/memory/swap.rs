@@ -75,9 +75,7 @@
 
 extern crate alloc;
 
-use alloc::boxed::Box;
 use alloc::sync::Arc;
-use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use core::time::Duration;
@@ -466,7 +464,7 @@ pub fn install_swap<CpuImpl, Backend>(
     backend: Backend,
     backend_name: &'static str,
     capacity_bytes: u64,
-) -> SwapHandle
+) -> Result<SwapHandle, Backend::Error>
 where
     CpuImpl: Cpu + Clone + Send + Sync + 'static,
     Backend: SwapBackend,
@@ -474,6 +472,10 @@ where
     let hooks = installed_swap_hooks().unwrap_or_else(|| {
         panic!("swap backend installed before the address space published its swap hooks")
     });
+    // The staging page is the backend's: allocated before anything is
+    // published, so a backend that cannot supply it leaves swap
+    // uninstalled instead of half-installed.
+    let page = backend.buffer(PhysFrame::SIZE)?;
     let handle = SwapHandle::new(backend_name, capacity_bytes);
     let mut published = false;
     HANDLE.call_once(|| {
@@ -489,7 +491,7 @@ where
         registry,
         cpu,
         map: SwapMap::new(),
-        page: vec![0_u8; PhysFrame::SIZE].into_boxed_slice(),
+        page: Some(page),
         report: SwapReport::default(),
     };
     spawner.spawn_local_detached(async move {
@@ -501,7 +503,7 @@ where
         capacity_bytes,
         "swap online"
     );
-    handle
+    Ok(handle)
 }
 
 /// Index → backend token, with a free list so a released index is
@@ -569,8 +571,17 @@ struct SwapService<Backend: SwapBackend, CpuImpl> {
     cpu: CpuImpl,
     map: SwapMap<Backend::Token>,
     /// The one staging buffer every transfer goes through. Owning it
-    /// here is what keeps the fault path allocation-free.
-    page: Box<[u8]>,
+    /// here is what keeps the fault path allocation-free. The backend
+    /// allocated it, so it is memory the storage behind the backend can
+    /// transfer from and to in place; it may be longer than a page when
+    /// the storage works in whole units, and only its first page is the
+    /// page.
+    ///
+    /// A transfer moves it into the backend and gets it back with the
+    /// result. `None` only after a transfer whose device stopped answering
+    /// kept it (see [`helios_hal::dma`]): the next transfer asks the
+    /// backend for a new one ([`SwapService::take_page`]).
+    page: Option<Backend::Buffer>,
     /// What the last summary line reported, so the next one can report
     /// the difference. See [`SWAP_REPORT_INTERVAL`].
     report: SwapReport,
@@ -590,6 +601,16 @@ where
     Backend: SwapBackend,
     CpuImpl: Cpu + Clone,
 {
+    /// The staging buffer, for one transfer. It is back in `self.page`
+    /// once the transfer returns it; a device that kept the last one is
+    /// replaced here rather than at the next allocation-free fault.
+    fn take_page(&mut self) -> Result<Backend::Buffer, Backend::Error> {
+        match self.page.take() {
+            Some(page) => Ok(page),
+            None => self.backend.buffer(PhysFrame::SIZE),
+        }
+    }
+
     async fn run(mut self, timer: Timer<CpuImpl>) -> ! {
         loop {
             // Faults first: a blocked fiber is a guest that has stopped,
@@ -680,23 +701,41 @@ where
 
     async fn swap_in(&mut self, addr: VirtAddr) -> Result<(), SwapFaultError> {
         let handle = (self.hooks.swapped_token)(addr).ok_or(SwapFaultError::NotSwapped)?;
-        let token = self.map.take(handle).ok_or(SwapFaultError::UnknownToken)?;
-        self.backend
-            .swap_in(token, &mut self.page)
-            .await
-            .map_err(|error| {
+        let page = self.take_page().map_err(|error| {
+            tracing::warn!(
+                target: "helios_kernel::swap",
+                addr = addr.raw(),
+                %error,
+                "swap backend could not supply a staging page"
+            );
+            SwapFaultError::Backend
+        })?;
+        let token = match self.map.take(handle) {
+            Some(token) => token,
+            None => {
+                self.page = Some(page);
+                return Err(SwapFaultError::UnknownToken);
+            }
+        };
+        let page = match self.backend.swap_in(token, page).await {
+            Ok(((), page)) => page,
+            Err(failure) => {
                 tracing::warn!(
                     target: "helios_kernel::swap",
                     addr = addr.raw(),
-                    %error,
+                    error = %failure.error,
                     "swap backend could not read a page back"
                 );
-                SwapFaultError::Backend
-            })?;
+                self.page = failure.buffers;
+                return Err(SwapFaultError::Backend);
+            }
+        };
         // The address space reads the flags the page had out of its own
         // bookkeeping, fills a fresh frame from the staging buffer, and
         // only publishes the mapping once the bytes are there.
-        (self.hooks.swap_in_page)(addr, &self.page).map_err(|_| SwapFaultError::AddressSpace)?;
+        let restored = (self.hooks.swap_in_page)(addr, &page.as_ref()[..PhysFrame::SIZE]);
+        self.page = Some(page);
+        restored.map_err(|_| SwapFaultError::AddressSpace)?;
         let counters = &self.handle.shared.counters;
         counters.pages_in.fetch_add(1, Ordering::AcqRel);
         counters
@@ -867,17 +906,33 @@ where
             );
             return Err(());
         };
+        let mut page = match self.take_page() {
+            Ok(page) => page,
+            Err(error) => {
+                tracing::warn!(
+                    target: "helios_kernel::swap",
+                    addr = addr.raw(),
+                    %error,
+                    "swap backend could not supply a staging page"
+                );
+                self.map.abandon(handle);
+                return Err(());
+            }
+        };
         // Detaching copies the page into our buffer, files the entry,
         // hands the frame back and shoots the TLB down, all under the
         // address space's own lock — so nothing can write the page
         // between the copy and the unmapping.
-        if let Err(error) = (self.hooks.swap_out_page)(addr, handle, &mut self.page) {
+        if let Err(error) =
+            (self.hooks.swap_out_page)(addr, handle, &mut page.as_mut()[..PhysFrame::SIZE])
+        {
             tracing::debug!(
                 target: "helios_kernel::swap",
                 addr = addr.raw(),
                 ?error,
                 "page could not be detached for swap-out"
             );
+            self.page = Some(page);
             self.map.abandon(handle);
             return Err(());
         }
@@ -885,16 +940,35 @@ where
         // empty slot. A guest faulting on it in this window queues a
         // request that this same loop serves, and it only gets there
         // after this function returns, so the gap is never observed.
-        match self.backend.swap_out(&self.page).await {
-            Ok(token) => self.map.fill(handle, token),
-            Err(error) => {
-                tracing::warn!(
-                    target: "helios_kernel::swap",
-                    addr = addr.raw(),
-                    %error,
-                    "swap backend refused a page; putting it back"
-                );
-                let _ = (self.hooks.swap_in_page)(addr, &self.page);
+        match self.backend.swap_out(page).await {
+            Ok((token, page)) => {
+                self.page = Some(page);
+                self.map.fill(handle, token);
+            }
+            Err(failure) => {
+                match failure.buffers {
+                    Some(page) => {
+                        tracing::warn!(
+                            target: "helios_kernel::swap",
+                            addr = addr.raw(),
+                            error = %failure.error,
+                            "swap backend refused a page; putting it back"
+                        );
+                        let _ = (self.hooks.swap_in_page)(addr, &page.as_ref()[..PhysFrame::SIZE]);
+                        self.page = Some(page);
+                    }
+                    // The device stopped answering with the page in flight
+                    // and still holds the only copy of it. The entry is
+                    // abandoned, so the owner's next touch of the page
+                    // finds no token and fails rather than reading
+                    // somebody else's bytes.
+                    None => tracing::error!(
+                        target: "helios_kernel::swap",
+                        addr = addr.raw(),
+                        error = %failure.error,
+                        "swap device stopped answering while it held a page; the page is lost"
+                    ),
+                }
                 self.map.abandon(handle);
                 return Err(());
             }
