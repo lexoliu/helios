@@ -7,6 +7,7 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt::Write;
+use core::num::NonZeroU64;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use core::time::Duration;
@@ -2094,6 +2095,7 @@ where
         Ok((snapshot_sample(caller.data()),))
     })?;
     instance.func_wrap("subscribe", |mut caller, (period,): (u64,)| {
+        let period = stats_period(period)?;
         let reader = StreamReader::new(&mut caller, StatsStreamProducer::new(period))?;
         Ok((reader,))
     })?;
@@ -3120,6 +3122,7 @@ where
         Ok((snapshot_program_sample(caller.data()),))
     })?;
     instance.func_wrap("subscribe", |mut caller, (period,): (u64,)| {
+        let period = stats_period(period)?;
         let reader = StreamReader::new(&mut caller, ProgramStatsStreamProducer::new(period))?;
         Ok((reader,))
     })?;
@@ -3865,14 +3868,25 @@ where
     }
 }
 
+/// `stats.subscribe` was called with a period of zero.
+///
+/// The period comes from the guest and the interface has no error to
+/// answer with, so the call traps the instance that made it.
+#[derive(Debug, Error, PartialEq, Eq)]
+#[error("stats.subscribe needs a period above zero")]
+struct ZeroStatsPeriod;
+
+fn stats_period(nanos: u64) -> Result<NonZeroU64, ZeroStatsPeriod> {
+    NonZeroU64::new(nanos).ok_or(ZeroStatsPeriod)
+}
+
 struct StatsStreamProducer {
-    period_nanos: u64,
+    period_nanos: NonZeroU64,
     next_due: Option<u64>,
 }
 
 impl StatsStreamProducer {
-    fn new(period_nanos: u64) -> Self {
-        assert!(period_nanos != 0, "stats subscribe period must be non-zero");
+    fn new(period_nanos: NonZeroU64) -> Self {
         Self {
             period_nanos,
             next_due: None,
@@ -3901,7 +3915,7 @@ where
         }
 
         let now = store.data().now_nanos();
-        let period_nanos = self.period_nanos;
+        let period_nanos = self.period_nanos.get();
         let due = self
             .next_due
             .get_or_insert_with(|| now.saturating_add(period_nanos));
@@ -3916,13 +3930,12 @@ where
 }
 
 struct ProgramStatsStreamProducer {
-    period_nanos: u64,
+    period_nanos: NonZeroU64,
     next_due: Option<u64>,
 }
 
 impl ProgramStatsStreamProducer {
-    fn new(period_nanos: u64) -> Self {
-        assert!(period_nanos != 0, "stats subscribe period must be non-zero");
+    fn new(period_nanos: NonZeroU64) -> Self {
         Self {
             period_nanos,
             next_due: None,
@@ -3952,7 +3965,7 @@ where
         }
 
         let now = store.data().now_nanos();
-        let period_nanos = self.period_nanos;
+        let period_nanos = self.period_nanos.get();
         let due = self
             .next_due
             .get_or_insert_with(|| now.saturating_add(period_nanos));
@@ -4569,9 +4582,18 @@ mod tests {
     use helios_hal::cpu::ProcessorId;
     use helios_hal::watchdog::ProgressCounter;
 
-    use super::{ComponentPhase, ComponentPhaseHeartbeat, spawn_component_phase_heartbeat};
+    use super::{
+        ComponentPhase, ComponentPhaseHeartbeat, ZeroStatsPeriod, spawn_component_phase_heartbeat,
+        stats_period,
+    };
     use crate::test_support::TestCpu;
     use crate::{Executor, InstanceSpawner, TaskCapacityError, TaskFunding, Timer};
+
+    #[test]
+    fn a_zero_stats_period_is_the_callers_error() {
+        assert_eq!(stats_period(0), Err(ZeroStatsPeriod));
+        assert_eq!(stats_period(1).map(|period| period.get()), Ok(1));
+    }
 
     /// One block per 64-byte granule is the most blocks an instance
     /// share can ever hold, so a run this long outlives the share
