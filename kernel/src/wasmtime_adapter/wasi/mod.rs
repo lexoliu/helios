@@ -264,10 +264,13 @@ mod tests {
     use bytes::Bytes;
     use futures_lite::future::block_on;
 
+    use crate::wasmtime_adapter::component_host::ProgramSource;
+    use crate::wasmtime_adapter::cwasm::{self, UntrustedCwasm};
+
     use super::{
         DEFAULT_WASI_TCP_HOP_LIMIT, DEFAULT_WASI_TCP_KEEP_ALIVE_COUNT,
         DEFAULT_WASI_TCP_KEEP_ALIVE_IDLE_NANOS, DEFAULT_WASI_TCP_KEEP_ALIVE_INTERVAL_NANOS,
-        DEFAULT_WASI_TCP_LISTEN_BACKLOG, DebugFileSystem, FsDescriptor, FsNodeKind,
+        DEFAULT_WASI_TCP_LISTEN_BACKLOG, DebugFileSystem, FileContents, FsDescriptor, FsNodeKind,
         P2ResolveAddressStream, TcpSocket, UdpSocket, WasiTcpIpAddress, WasiTcpSocketAddress,
         WasiTcpSocketFamily, WasiUdpSocketAddress, WasiUdpSocketError, WasiUdpSocketFamily,
         format_p3_tcp_socket_address, format_p3_udp_socket_address, fs_types,
@@ -1048,6 +1051,194 @@ mod tests {
             .write_at(&descriptor, 0, b"x", 1)
             .expect_err("readonly bootfs file must reject writes");
         assert!(matches!(error, fs_types::ErrorCode::ReadOnly));
+    }
+
+    /// A cwasm signed by a key the kernel does not trust: it parses as
+    /// an artifact, and only a signature check tells it apart.
+    fn foreign_signed_cwasm() -> &'static [u8] {
+        let signed = helios_artifact::sign_payload_with_secret_key_bytes(b"payload", &[7; 32])
+            .expect("signing a test payload must succeed");
+        Box::leak(signed.into_boxed_slice())
+    }
+
+    /// A filesystem whose bootfs carries `foreign_signed_cwasm` at
+    /// `/bin/prog`.
+    fn filesystem_with_bootfs_cwasm() -> TestFileSystem {
+        let mut filesystem = test_filesystem();
+        let files = Box::leak(Box::new([EmbeddedBootFile::new(
+            "bin/prog",
+            foreign_signed_cwasm(),
+            42,
+        )]));
+        filesystem.seed_bootfs(EmbeddedBootFs::new(&[], files));
+        filesystem
+    }
+
+    fn program_source(filesystem: &TestFileSystem, path: &str) -> ProgramSource {
+        ProgramSource::from_file(
+            filesystem
+                .read_program_file(path)
+                .expect("program file must be readable"),
+        )
+    }
+
+    #[test]
+    fn bootfs_cwasm_loads_without_signature_verification() {
+        let filesystem = filesystem_with_bootfs_cwasm();
+
+        let ProgramSource::BootfsArtifact(bytes) = program_source(&filesystem, "/bin/prog") else {
+            panic!("a bootfs cwasm must classify as a bootfs artifact");
+        };
+        // The signature would not verify, so accepting it proves the
+        // bootfs path pays no verification.
+        assert!(cwasm::verify_signed_artifact(UntrustedCwasm::new(bytes.as_slice())).is_err());
+        let trusted =
+            cwasm::trust_bootfs_artifact(&bytes).expect("a bootfs artifact loads unverified");
+        assert_eq!(trusted.payload(), b"payload");
+    }
+
+    #[test]
+    fn guest_written_cwasm_must_verify() {
+        let mut filesystem = filesystem_with_bootfs_cwasm();
+        let root = filesystem.root_descriptor();
+        filesystem
+            .create_directory_at(&root, "tmp", 1)
+            .expect("creating /tmp must succeed");
+
+        // The bytes of a bootfs artifact, copied by a guest through an
+        // ordinary WASI write: the copy has no bootfs provenance.
+        let copied = filesystem
+            .read_program_file("/bin/prog")
+            .expect("bootfs program must be readable")
+            .as_slice()
+            .to_vec();
+        let descriptor = filesystem
+            .open_at(
+                &root,
+                fs_types::PathFlags::empty(),
+                "tmp/copy",
+                fs_types::OpenFlags::CREATE,
+                fs_types::DescriptorFlags::READ | fs_types::DescriptorFlags::WRITE,
+                2,
+            )
+            .expect("creating a guest file must succeed");
+        filesystem
+            .write_at(&descriptor, 0, &copied, 3)
+            .expect("writing a guest file must succeed");
+        let ProgramSource::SignedArtifact(bytes) = program_source(&filesystem, "/tmp/copy") else {
+            panic!("a guest-written cwasm must classify as a signed artifact");
+        };
+        assert!(matches!(
+            cwasm::verify_signed_artifact(UntrustedCwasm::new(&bytes)),
+            Err(cwasm::ArtifactTrustError::Trailer(
+                helios_artifact::TrailerError::UntrustedSigner
+            ))
+        ));
+
+        // A kernel-signed artifact with one signature byte flipped, as
+        // `write_program_file` would store it, is refused too.
+        let mut tampered = cwasm::sign_trusted_artifact_payload(b"payload")
+            .expect("signing with the trusted root must succeed");
+        let last_signature_byte = tampered.len() - 13;
+        tampered[last_signature_byte] ^= 1;
+        filesystem
+            .write_program_file("/tmp/tampered", &tampered, 4)
+            .expect("writing a program file must succeed");
+        let ProgramSource::SignedArtifact(bytes) = program_source(&filesystem, "/tmp/tampered")
+        else {
+            panic!("a guest-written cwasm must classify as a signed artifact");
+        };
+        assert!(matches!(
+            cwasm::verify_signed_artifact(UntrustedCwasm::new(&bytes)),
+            Err(cwasm::ArtifactTrustError::Trailer(
+                helios_artifact::TrailerError::InvalidPayloadSignature
+            ))
+        ));
+
+        // What the in-kernel compiler writes is signed by the trusted
+        // root, and that is what lets a guest exec it from anywhere.
+        let signed = cwasm::sign_trusted_artifact_payload(b"payload")
+            .expect("signing with the trusted root must succeed");
+        filesystem
+            .write_program_file("/tmp/compiled", &signed, 5)
+            .expect("writing a program file must succeed");
+        let ProgramSource::SignedArtifact(bytes) = program_source(&filesystem, "/tmp/compiled")
+        else {
+            panic!("a guest-written cwasm must classify as a signed artifact");
+        };
+        let trusted = cwasm::verify_signed_artifact(UntrustedCwasm::new(&bytes))
+            .expect("a kernel-signed artifact must verify");
+        assert_eq!(trusted.payload(), b"payload");
+    }
+
+    #[test]
+    fn writing_a_bootfs_node_drops_its_provenance() {
+        let mut filesystem = filesystem_with_bootfs_cwasm();
+        let root = filesystem.root_descriptor();
+        // Bootfs nodes are read-only, so no guest reaches this state;
+        // lifting the flag here shows provenance does not rest on it:
+        // every write path stores written bytes, whatever the node held.
+        let bootfs_bytes = |filesystem: &TestFileSystem| {
+            matches!(
+                filesystem.read_program_file("/bin/prog"),
+                Ok(FileContents::Bootfs(_))
+            )
+        };
+        let make_writable = |filesystem: &TestFileSystem| {
+            let mut state = filesystem.snapshot.inner.lock();
+            let node = state.node_mut("/bin/prog").expect("bootfs node must exist");
+            node.readonly = false;
+        };
+        make_writable(&filesystem);
+        assert!(bootfs_bytes(&filesystem));
+        let descriptor = filesystem
+            .open_at(
+                &root,
+                fs_types::PathFlags::empty(),
+                "bin/prog",
+                fs_types::OpenFlags::empty(),
+                fs_types::DescriptorFlags::READ | fs_types::DescriptorFlags::WRITE,
+                1,
+            )
+            .expect("opening the node for writing must succeed");
+        filesystem
+            .write_at(&descriptor, 0, b"p", 2)
+            .expect("writing the node must succeed");
+        assert!(!bootfs_bytes(&filesystem));
+        assert!(matches!(
+            program_source(&filesystem, "/bin/prog"),
+            ProgramSource::SignedArtifact(_)
+        ));
+
+        let mut replaced = filesystem_with_bootfs_cwasm();
+        make_writable(&replaced);
+        replaced
+            .write_program_file("/bin/prog", foreign_signed_cwasm(), 2)
+            .expect("replacing the node must succeed");
+        assert!(!bootfs_bytes(&replaced));
+
+        let mut resized = filesystem_with_bootfs_cwasm();
+        make_writable(&resized);
+        let root = resized.root_descriptor();
+        let descriptor = resized
+            .open_at(
+                &root,
+                fs_types::PathFlags::empty(),
+                "bin/prog",
+                fs_types::OpenFlags::empty(),
+                fs_types::DescriptorFlags::READ | fs_types::DescriptorFlags::WRITE,
+                1,
+            )
+            .expect("opening the node for writing must succeed");
+        let length = resized
+            .read_program_file("/bin/prog")
+            .expect("bootfs program must be readable")
+            .as_slice()
+            .len() as u64;
+        resized
+            .set_size(&descriptor, length, 2)
+            .expect("resizing the node must succeed");
+        assert!(!bootfs_bytes(&resized));
     }
 
     #[test]

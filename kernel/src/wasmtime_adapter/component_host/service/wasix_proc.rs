@@ -3288,8 +3288,7 @@ where
     HostFs: crate::HostFileSystem,
 {
     let host_path = crate::guest_host_share_path(source_path).map(ToOwned::to_owned);
-    let source_is_host = host_path.is_some();
-    let source = if let Some(host_path) = host_path {
+    if let Some(host_path) = host_path {
         let service = caller
             .data()
             .runtime_state
@@ -3300,38 +3299,25 @@ where
                     detail: ProgramExecErrorDetail::ProgramSourceNotGranted,
                 })
             })?;
-        service
-            .read_file(&host_path)
-            .await
-            .map(Bytes::from)
-            .map_err(|_| {
-                wasmtime::Error::new(ProgramExecError {
-                    kind: ProgramExecErrorKind::PermissionDenied,
-                    detail: ProgramExecErrorDetail::ProgramSourceNotGranted,
-                })
-            })?
-    } else {
-        caller
-            .data()
-            .filesystem
-            .read_program_file_bytes(source_path)
-            .map_err(|_| {
-                wasmtime::Error::new(ProgramExecError {
-                    kind: ProgramExecErrorKind::PermissionDenied,
-                    detail: ProgramExecErrorDetail::ProgramSourceNotGranted,
-                })
-            })?
-    };
-    let source = if cwasm::is_cwasm(&source) {
-        if source_is_host {
-            ProgramSource::SignedArtifact(source)
-        } else {
-            ProgramSource::BootfsArtifact(source)
-        }
-    } else {
-        ProgramSource::RawWasm(source)
-    };
-    Ok(source)
+        let bytes = service.read_file(&host_path).await.map_err(|_| {
+            wasmtime::Error::new(ProgramExecError {
+                kind: ProgramExecErrorKind::PermissionDenied,
+                detail: ProgramExecErrorDetail::ProgramSourceNotGranted,
+            })
+        })?;
+        return Ok(ProgramSource::from_untrusted(Bytes::from(bytes)));
+    }
+    caller
+        .data()
+        .filesystem
+        .read_program_file(source_path)
+        .map(ProgramSource::from_file)
+        .map_err(|_| {
+            wasmtime::Error::new(ProgramExecError {
+                kind: ProgramExecErrorKind::PermissionDenied,
+                detail: ProgramExecErrorDetail::ProgramSourceNotGranted,
+            })
+        })
 }
 
 pub(super) fn wasix_resolve_exec_guest_name<CpuImpl, Net, HostFs>(

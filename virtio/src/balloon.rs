@@ -168,10 +168,10 @@ impl<T: VirtioTransport> BalloonQueue<T> {
         outputs: &mut [&mut [u8]],
     ) -> IoResult<u32> {
         let token = submit_chain(&self.inflight, &self.queue, transport, inputs, outputs).await?;
-        Ok(await_completion(&self.inflight, &self.queue, token, || {
+        await_completion(&self.inflight, &self.queue, token, || {
             self.interrupts.notified()
         })
-        .await)
+        .await
     }
 
     /// Wakes whoever is waiting on this queue.

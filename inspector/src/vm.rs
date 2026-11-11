@@ -594,7 +594,11 @@ const DEFAULT_DATA_DISK_BYTES: u64 = 256 * 1024 * 1024;
 /// The serial the guest kernel identifies its own disk by. Nothing else
 /// on the bus carries it, so the boot image is never mistaken for it.
 const DATA_DISK_SERIAL: &str = "helios-data";
-const DEFAULT_GDB_ENDPOINT: &str = "tcp::1234";
+/// Where `vm --debug` puts the gdbstub. QEMU binds `tcp::1234` on every
+/// interface, and whoever reaches the stub owns the guest's registers and
+/// memory, so the default names the loopback address; a wider bind is
+/// something the developer types with `--gdb`.
+const DEFAULT_GDB_ENDPOINT: &str = "tcp:127.0.0.1:1234";
 /// The QEMU chardev the guest's debug serial line is bound to.
 const DEBUG_SERIAL_CHARDEV: &str = "helios-debug-serial";
 /// The runtime-directory file holding a raw copy of the debug serial
@@ -7676,7 +7680,7 @@ mod tests {
 
         let resolved = resolve(command).expect("VM debug command resolution must succeed");
         assert_eq!(resolved.build.kind, KernelBuildProfile::KernelDebug);
-        assert_eq!(resolved.gdb.as_deref(), Some(DEFAULT_GDB_ENDPOINT));
+        assert_eq!(resolved.gdb.as_deref(), Some("tcp:127.0.0.1:1234"));
         assert!(resolved.gdb_wait);
         assert!(resolved.keep_runtime_dir);
         assert_eq!(

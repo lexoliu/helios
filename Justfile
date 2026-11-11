@@ -119,6 +119,9 @@ test-units:
     # capture check that links it.
     cargo nextest run -p helios-compositor-render -p helios-desktop-text-check
     cargo nextest run -p helios-inspector-protocol --lib
+    # The host tools: QEMU arguments, network plans, the image audit, the
+    # signature trailer, the profile store, the root keypair.
+    cargo nextest run -p helios-inspector -p helios-artifact -p helios-profdata -p helios-cli -p helios-compiler-support
     # The Venus protocol is generated from pinned venus-protocol inputs that
     # the CLI fetches and hash-verifies; the parity test then compares the
     # generated encoders with the pinned Mesa generator's output.

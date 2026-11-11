@@ -282,6 +282,27 @@ mod tests {
         );
     }
 
+    /// With a buffer already pinned, a request sized so that the two
+    /// together pass `u64::MAX` must be refused by the budget rather
+    /// than overflow the sum the budget is tested with.
+    #[test]
+    fn a_request_that_overflows_the_pinned_total_is_over_budget() {
+        const PINNED: u64 = 1 << 16;
+        let registry = registry(&["test:alpha"]);
+        let mut lease = registry
+            .claim("test:alpha", window())
+            .expect("the device is free");
+
+        lease
+            .dma_alloc(PINNED, 4096)
+            .expect("the first buffer fits");
+
+        assert_eq!(
+            lease.dma_alloc(u64::MAX - (PINNED - 1), 4096).err(),
+            Some(GrantError::BudgetExhausted)
+        );
+    }
+
     /// Nothing was refused, so saying the budget was exhausted would
     /// name the wrong fact and send a driver looking at a limit that
     /// had nothing to do with it.
