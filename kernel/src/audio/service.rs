@@ -61,6 +61,7 @@ use triomphe::Arc;
 use crate::component::{ProviderError, ProviderSender};
 use crate::exec::{Notify, NotifyWaiter};
 use crate::pins::PinnedRun;
+use crate::process::AudioClaimCap;
 
 use super::AudioServiceError;
 use super::instance::AudioPins;
@@ -963,7 +964,10 @@ impl AudioService {
     ///
     /// The feedback queue is emptied before the claim is handed back, so
     /// the new owner's stream starts from what happens after it.
-    pub fn claim(&self, id: u32) -> Result<AudioClaim, AudioServiceError> {
+    ///
+    /// `_cap` is the proof that the caller's authority names the audio
+    /// class; the check happened where the cap was derived.
+    pub fn claim(&self, id: u32, _cap: AudioClaimCap) -> Result<AudioClaim, AudioServiceError> {
         if self.shared.playback.is_empty() && self.shared.capture.is_empty() {
             return Err(AudioServiceError::Unavailable);
         }

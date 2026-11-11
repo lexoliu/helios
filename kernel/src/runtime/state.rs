@@ -13,7 +13,7 @@ use crate::{
     PerfMetricSample, PerfSample, ProfileFilter, ProfileScope, ProfileSink, StatsSample,
     TraceEvent, TraceFilter, TraceHistory,
 };
-use crate::{RootEntropy, RootEntropyHandle};
+use crate::{MachineGeneration, MachineGenerationHandle, RootEntropy, RootEntropyHandle};
 use helios_hal::cpu::{HardwarePerfCounterDelta, Timebase};
 use helios_hal::rtc::{RealTimeClock, UnixSeconds};
 use spin::{Mutex, Once};
@@ -47,6 +47,10 @@ struct RuntimeStateInner<ProgramService, NetworkService, HostFsService> {
     /// it, so a kernel that reaches component start-up without one is a
     /// bring-up bug rather than a degraded mode.
     root_entropy: Once<RootEntropyHandle>,
+    /// The machine generation the backend created for this boot, which
+    /// the root DRBG rekeys against and the reactions to a restore wait
+    /// on. Installed before the root entropy.
+    machine_generation: Once<MachineGenerationHandle>,
     /// Nanoseconds between the monotonic clock and wall time, as the
     /// platform's real-time clock set them during bring-up. Empty on a
     /// machine that carries no such clock, where wall time is uptime.
@@ -327,6 +331,7 @@ where
                 network_service: Once::new(),
                 network_service_ready: Notify::new(),
                 root_entropy: Once::new(),
+                machine_generation: Once::new(),
                 wall_clock_offset_nanos: Once::new(),
                 http_client: ProviderSlot::new(),
                 host_fs_service: Mutex::new(None),
@@ -901,6 +906,27 @@ where
 
     pub fn audio_service(&self) -> Option<crate::audio::AudioService> {
         self.inner.audio_service.get().cloned()
+    }
+
+    /// Publishes the machine generation of this boot. The backend does
+    /// this once, before it seeds the root DRBG with the same handle.
+    pub fn install_machine_generation(&self, generation: MachineGenerationHandle) {
+        let mut installed = false;
+        self.inner.machine_generation.call_once(|| {
+            installed = true;
+            generation
+        });
+        assert!(
+            installed,
+            "the machine generation was installed more than once"
+        );
+    }
+
+    /// The machine generation of this boot.
+    pub fn machine_generation(&self) -> &MachineGeneration {
+        self.inner.machine_generation.get().unwrap_or_else(|| {
+            panic!("the machine generation was used before the backend installed it")
+        })
     }
 
     /// Publishes the root DRBG the backend seeded at boot.

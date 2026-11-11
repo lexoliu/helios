@@ -1081,7 +1081,7 @@ impl NetworkShard {
         while let Some(event) = self.stack.take_event() {
             match event {
                 StackEvent::NeighborUpdated(entry) => {
-                    control.update_neighbors(|neighbors| neighbors.learn(entry));
+                    control.learn_neighbor(entry);
                 }
                 StackEvent::DhcpConfigured(_) | StackEvent::Ipv6Autoconfigured(_) => {
                     control.publish_from_shard(self)
@@ -1137,8 +1137,9 @@ impl NetworkShard {
         &mut self,
         cidr: KernelIpv4Cidr,
     ) -> Result<(), NetworkControlError> {
-        self.stack.add_ipv4_address(map_kernel_ipv4_cidr(cidr));
-        Ok(())
+        self.stack
+            .add_ipv4_address(map_kernel_ipv4_cidr(cidr))
+            .map_err(|_| NetworkControlError::InvalidAddress)
     }
 
     pub(super) fn remove_ipv4_address(&mut self, cidr: KernelIpv4Cidr) {

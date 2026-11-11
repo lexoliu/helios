@@ -34,11 +34,11 @@
 
 use core::future::{Future, poll_fn};
 use core::pin::pin;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::task::{Context, Poll, Waker};
 
 use async_lock::Mutex as AsyncMutex;
-use helios_hal::io::IoResult;
+use helios_hal::io::{IoError, IoResult};
 use helios_hal::iommu::PhysicalRange;
 use spin::Mutex;
 
@@ -69,6 +69,10 @@ pub(crate) struct InFlight<const N: usize> {
     /// directly; this means "a chain or a slot was freed" and belongs to
     /// the submitters.
     available: Notify,
+    /// Set, under the slot lock, once the device broke the used-ring
+    /// contract on the queue this table serves. Every parked waiter and
+    /// submitter is woken to see it, and none parks again.
+    faulted: AtomicBool,
 }
 
 impl<const N: usize> InFlight<N> {
@@ -77,6 +81,7 @@ impl<const N: usize> InFlight<N> {
             slots: Mutex::new([const { Slot::Idle }; N]),
             blocked: AtomicUsize::new(0),
             available: Notify::new(),
+            faulted: AtomicBool::new(false),
         }
     }
 
@@ -116,6 +121,35 @@ impl<const N: usize> InFlight<N> {
             return;
         }
         self.available.notify_all();
+    }
+
+    /// Records that the queue faulted and wakes everyone waiting on it.
+    ///
+    /// Completions already delivered stay collectable; a request whose
+    /// completion never arrives fails instead of waiting for a queue that
+    /// is no longer driven.
+    pub(crate) fn fail(&self) {
+        {
+            let _slots = self.slots.lock();
+            self.faulted.store(true, Ordering::SeqCst);
+        }
+        for token in 0..N {
+            let waker = {
+                let mut slots = self.slots.lock();
+                match &mut slots[token] {
+                    Slot::Pending(waker) => waker.take(),
+                    Slot::Idle | Slot::Complete(_) => None,
+                }
+            };
+            if let Some(waker) = waker {
+                waker.wake();
+            }
+        }
+        self.available.notify_all();
+    }
+
+    fn is_faulted(&self) -> bool {
+        self.faulted.load(Ordering::SeqCst)
     }
 
     /// Claims `token` for the caller. Must be called while the queue
@@ -166,9 +200,13 @@ impl<const N: usize> InFlight<N> {
     }
 
     /// Parks `waker` on `token`, reporting whether the completion is
-    /// already there and the caller should not park at all.
+    /// already there, or the queue faulted, and the caller should not park at
+    /// all.
     fn arm(&self, token: u16, waker: &Waker) -> bool {
         let mut slots = self.slots.lock();
+        if self.is_faulted() {
+            return true;
+        }
         let slot = Self::slot(&mut slots, token);
         match slot {
             Slot::Complete(_) => true,
@@ -246,6 +284,9 @@ where
         let notified = inflight.available.notified();
         let drained = {
             let mut queue = queue.lock().await;
+            if inflight.is_faulted() {
+                break Err(IoError::DeviceFault);
+            }
             if queue.has_room_for(buffers) && inflight.is_idle(queue.next_free_descriptor()) {
                 match queue.submit_with_payload(transport, inputs, payload, outputs) {
                     Ok(token) => {
@@ -256,7 +297,13 @@ where
                     Err(error) => break Err(error),
                 }
             }
-            queue.drain_used(|completed, len| inflight.complete(completed, len))
+            match queue.drain_used(|completed, len| inflight.complete(completed, len)) {
+                Ok(drained) => drained,
+                Err(error) => {
+                    inflight.fail();
+                    break Err(error);
+                }
+            }
         };
         inflight.note_released(drained);
         if drained != 0 {
@@ -285,12 +332,15 @@ where
 /// drained the ring first. `wait` is a parameter so callers can park on
 /// something other than the raw interrupt — a deadline, say — without
 /// duplicating the loop.
+///
+/// A device that breaks the used-ring contract fails every waiter on the
+/// queue with [`IoError::DeviceFault`]; the queue is not driven again.
 pub(crate) async fn await_completion<T, Wait, WaitFuture, const N: usize>(
     inflight: &InFlight<N>,
     queue: &AsyncMutex<VirtQueue<T>>,
     token: u16,
     mut wait: Wait,
-) -> u32
+) -> IoResult<u32>
 where
     T: VirtioTransport,
     Wait: FnMut() -> WaitFuture,
@@ -307,13 +357,22 @@ where
             // completion was drained, and its slot is idle again now.
             // A submitter parked on either has nothing else to wake it.
             inflight.note_released(1);
-            return len;
+            return Ok(len);
+        }
+        if inflight.is_faulted() {
+            return Err(IoError::DeviceFault);
         }
 
         let drained = match queue.try_lock() {
-            Some(mut queue) => queue.drain_used(|completed, len| {
+            Some(mut queue) => match queue.drain_used(|completed, len| {
                 inflight.complete(completed, len);
-            }),
+            }) {
+                Ok(drained) => drained,
+                Err(error) => {
+                    inflight.fail();
+                    return Err(error);
+                }
+            },
             None => 0,
         };
         inflight.note_released(drained);
