@@ -347,6 +347,13 @@ pub trait BlockDevice: Send + Sync {
     /// Request queues and pipeline depth this device is driven with.
     fn queue_topology(&self) -> BlockQueueTopology;
 
+    /// Whether the device refuses every write, as a medium the platform
+    /// attached read-only does.
+    ///
+    /// A caller that would only ever fail on its first write — a
+    /// read-write mount, a swap area — asks here instead.
+    fn is_read_only(&self) -> bool;
+
     fn block_size(&self) -> usize {
         self.geometry().logical_block_bytes
     }

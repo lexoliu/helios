@@ -1089,6 +1089,13 @@ impl<T: VirtioTransport, C: QueueAffinity> BlockDevice for VirtioBlockResource<T
             depth: self.object().queue_depth(),
         }
     }
+
+    /// Writes are refused when the device negotiated
+    /// `VIRTIO_BLK_F_RO` or this handle was derived without the write
+    /// right: either way no write through it can succeed.
+    fn is_read_only(&self) -> bool {
+        self.object().readonly || !self.rights().contains(BlockDeviceRights::WRITE)
+    }
 }
 
 impl<D: BlockDevice + 'static> SwapBackend for VirtioBlockSwapBackend<D> {
@@ -1893,6 +1900,10 @@ mod tests {
                 queues: 1,
                 depth: 1,
             }
+        }
+
+        fn is_read_only(&self) -> bool {
+            false
         }
     }
 

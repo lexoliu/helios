@@ -1,8 +1,9 @@
 //! virtio-blk over the platform MMIO bus for the RISC-V backend.
 //!
-//! Every block device the device tree names is brought up here; which of
-//! them the kernel ends up owning is the kernel's decision, taken from
-//! the serials the devices report.
+//! Every block device the device tree names is brought up here, up to
+//! the block interrupt routes the kernel's table holds; what each of
+//! them is for is the kernel's decision, taken from the serials they
+//! report.
 //!
 //! Concurrency contract: the devices are discovered and programmed on
 //! the bootstrap hart before external interrupts are unmasked, and their
@@ -47,7 +48,7 @@ pub(crate) fn count_block_devices(fdt: &Fdt<'_>) -> usize {
 }
 
 /// Brings up every block device on the platform bus and hands them to
-/// the kernel, which keeps the one the platform named as its own.
+/// the kernel, which gives each the role its serial names.
 pub(crate) fn install<WatchdogImpl>(
     cpu: &RiscvCpu,
     kernel: &helios_kernel::Kernel<RiscvCpu, WatchdogImpl>,
@@ -64,7 +65,9 @@ where
         .map(|interrupt| interrupt.device.inner.clone())
         .collect();
     let state = debug_state.clone();
-    helios_kernel::install_block_devices(kernel, root, devices, move |service| {
+    // Swap is not wired on this backend, so the scratch disk is proved
+    // and counted but nothing writes to it yet.
+    helios_kernel::install_block_devices(kernel, root, devices, move |service, _scratch| {
         state.install_block_service(service);
     });
     for interrupt in &discovered {
@@ -74,10 +77,13 @@ where
 }
 
 fn discover_block_devices(cpu: &RiscvCpu, fdt: &Fdt<'_>) -> Vec<BlockInterrupt> {
-    helios_virtio::mmio_candidates(fdt)
+    let candidates = helios_virtio::mmio_candidates(fdt)
         .filter(|candidate| {
             crate::matches_virtio_mmio_device(candidate.base, helios_virtio::DeviceType::Block)
         })
+        .collect();
+    helios_kernel::admit_block_devices(candidates)
+        .into_iter()
         .map(|candidate| {
             let base = candidate.base;
             let header = core::ptr::NonNull::new(base as *mut u8)
