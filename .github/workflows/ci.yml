@@ -588,8 +588,8 @@ jobs:
           # first (#301). This is the only x86-64 KVM boot that carries
           # them; the developer machines have no KVM.
           # Two `--disk` images ride on it too: every disk with a serial
-          # other than the scratch disk's is a mount source, and swap
-          # stays on `helios-data` beside them (#510).
+          # other than the scratch disk's is a mount source, and
+          # `helios-data` stays the scratch disk beside them (#510).
           truncate -s 64M "$runtime/src-a.img" "$runtime/src-b.img"
           ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
             --accel kvm \
@@ -607,10 +607,11 @@ jobs:
           # has, and `debug-serial.log` is the host's raw copy of it.
           grep -F 'virtio-input online' "$runtime/debug-serial.log"
           test "$(grep -cF 'virtio-input online' "$runtime/debug-serial.log")" -eq 3
-          grep -F 'mount source online serial="src-a"' "$runtime/debug-serial.log" | grep -F 'read_only=false'
-          grep -F 'mount source online serial="src-b"' "$runtime/debug-serial.log" | grep -F 'read_only=true'
-          grep -F 'block device identified as the kernel scratch disk serial="helios-data"' "$runtime/debug-serial.log"
-          grep -F 'swap online backend=virtio-blk' "$runtime/debug-serial.log"
+          # The log carries the console's colour escapes, so these read
+          # it as text (`-a`) to print the matching line.
+          grep -aF 'mount source online serial="src-a"' "$runtime/debug-serial.log" | grep -aF 'read_only=false'
+          grep -aF 'mount source online serial="src-b"' "$runtime/debug-serial.log" | grep -aF 'read_only=true'
+          grep -aF 'block device identified as the kernel scratch disk serial="helios-data"' "$runtime/debug-serial.log"
       - name: Run the coreutils applets through dash
         shell: bash
         working-directory: helios
