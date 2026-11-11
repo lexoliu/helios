@@ -12,7 +12,8 @@ use helios_hal::fs::{FileSystem, FsError as VfsError, Metadata, NodeKind, OpenFl
 use pin_project_lite::pin_project;
 
 use crate::{
-    ComponentHostNetwork, FileContents, Follow, MountHold, Namespace, Resolved, object_identity,
+    ComponentHostNetwork, FileContents, Follow, HeldPath, MountHold, Namespace, Resolved,
+    object_identity,
 };
 
 use super::*;
@@ -156,7 +157,10 @@ pub(crate) fn metadata_hash(metadata: &Metadata) -> fs_types::MetadataHashValue 
     )
 }
 
-fn resolve<HostFs>(namespace: &Namespace<HostFs>, absolute: &str) -> FsOpResult<Resolved<HostFs>>
+fn resolve<'a, HostFs>(
+    namespace: &'a Namespace<HostFs>,
+    absolute: &'a str,
+) -> FsOpResult<Resolved<'a, HostFs>>
 where
     HostFs: crate::HostFileSystem,
 {
@@ -358,7 +362,7 @@ where
         fs_types::DescriptorFlags::READ,
         fs_types::ErrorCode::NotPermitted,
     )?;
-    read_resolved(resolve(namespace, &descriptor.path)?, offset, max_bytes).await
+    read_resolved(&resolve(namespace, &descriptor.path)?, offset, max_bytes).await
 }
 
 /// The file a stream reads or writes across polls: `descriptor` must be a
@@ -368,18 +372,17 @@ pub(crate) fn stream_target<HostFs>(
     descriptor: &FsDescriptor,
     right: fs_types::DescriptorFlags,
     refused: fs_types::ErrorCode,
-) -> FsOpResult<Resolved<HostFs>>
+) -> FsOpResult<HeldPath<HostFs>>
 where
     HostFs: crate::HostFileSystem,
 {
     require_file(descriptor, right, refused)?;
-    resolve(namespace, &descriptor.path)
+    resolve(namespace, &descriptor.path).map(|resolved| resolved.held())
 }
 
-/// One positional read through an owned resolution, for a stream that
-/// must own its read across polls.
+/// One positional read through `resolved`.
 pub(crate) async fn read_resolved<HostFs>(
-    resolved: Resolved<HostFs>,
+    resolved: &Resolved<'_, HostFs>,
     offset: u64,
     max_bytes: usize,
 ) -> FsOpResult<Bytes>
@@ -391,6 +394,19 @@ where
         .read_at(resolved.path(), offset, max_bytes)
         .await
         .map_err(fs_error_code)
+}
+
+/// One positional read through a held path, for a stream that must own
+/// its read across polls.
+pub(crate) async fn read_held<HostFs>(
+    held: HeldPath<HostFs>,
+    offset: u64,
+    max_bytes: usize,
+) -> FsOpResult<Bytes>
+where
+    HostFs: crate::HostFileSystem,
+{
+    read_resolved(&held.resolved(), offset, max_bytes).await
 }
 
 /// Where a write lands: at an offset, or at the end of the file as the
@@ -426,7 +442,7 @@ where
 /// sees it when the write arrives, so its end is the filesystem's answer,
 /// never the caller's idea of where the file ended.
 pub(crate) async fn write_resolved<HostFs>(
-    resolved: &Resolved<HostFs>,
+    resolved: &Resolved<'_, HostFs>,
     mode: FileWriteMode,
     bytes: &[u8],
     now: u64,
@@ -530,7 +546,8 @@ where
 {
     require_mutate_directory(base)?;
     require_directory(base)?;
-    let resolved = resolve(namespace, &child_path(base, path)?)?;
+    let absolute = child_path(base, path)?;
+    let resolved = resolve(namespace, &absolute)?;
     if resolved.is_mount_root() {
         return Err(fs_types::ErrorCode::Exist);
     }
@@ -567,7 +584,8 @@ where
     HostFs: crate::HostFileSystem,
 {
     require_mutate_directory(base)?;
-    let resolved = resolve(namespace, &child_below(base, path)?)?;
+    let absolute = child_below(base, path)?;
+    let resolved = resolve(namespace, &absolute)?;
     if resolved.is_mount_root() {
         return Err(fs_types::ErrorCode::IsDirectory);
     }
@@ -662,7 +680,8 @@ where
     HostFs: crate::HostFileSystem,
 {
     require_directory(base)?;
-    let resolved = resolve(namespace, &child_path(base, path)?)?;
+    let absolute = child_path(base, path)?;
+    let resolved = resolve(namespace, &absolute)?;
     let target = resolved
         .fs()
         .read_link(resolved.path())
@@ -746,7 +765,7 @@ type ChunkWriteResult = FsOpResult<usize>;
 
 /// One write of a stream's batch, as a future the consumer owns by value.
 async fn write_chunk<HostFs>(
-    resolved: Resolved<HostFs>,
+    held: HeldPath<HostFs>,
     mode: FileWriteMode,
     bytes: Vec<u8>,
     now: u64,
@@ -754,7 +773,7 @@ async fn write_chunk<HostFs>(
 where
     HostFs: crate::HostFileSystem,
 {
-    write_resolved(&resolved, mode, &bytes, now).await?;
+    write_resolved(&held.resolved(), mode, &bytes, now).await?;
     Ok(bytes.len())
 }
 
@@ -775,14 +794,14 @@ pin_project! {
     /// The `read-via-stream` source for one file.
     ///
     /// The in-flight read is held by value under a `Fut` parameter that
-    /// [`file_read_producer`] infers from [`read_resolved`], and `start`
+    /// [`file_read_producer`] infers from [`read_held`], and `start`
     /// mints the next one: only one chunk is ever in flight, so a stream
     /// over a large file never holds more than one chunk of kernel memory.
     pub(super) struct FileReadStreamProducer<HostFs, Fut> {
-        pub(super) resolved: Resolved<HostFs>,
+        pub(super) held: HeldPath<HostFs>,
         pub(super) offset: u64,
         pub(super) chunk_bytes: usize,
-        pub(super) start: fn(Resolved<HostFs>, u64, usize) -> Fut,
+        pub(super) start: fn(HeldPath<HostFs>, u64, usize) -> Fut,
         #[pin]
         pub(super) pending: Option<Fut>,
         pub(super) result: Option<oneshot::Sender<FsOpResult<()>>>,
@@ -795,9 +814,9 @@ pin_project! {
     }
 }
 
-/// The `read-via-stream` source for `resolved`, from `offset`.
+/// The `read-via-stream` source for `held`, from `offset`.
 pub(super) fn file_read_producer<HostFs>(
-    resolved: Resolved<HostFs>,
+    held: HeldPath<HostFs>,
     offset: u64,
     chunk_bytes: usize,
     result: oneshot::Sender<FsOpResult<()>>,
@@ -806,10 +825,10 @@ where
     HostFs: crate::HostFileSystem,
 {
     FileReadStreamProducer {
-        resolved,
+        held,
         offset,
         chunk_bytes,
-        start: read_resolved::<HostFs>,
+        start: read_held::<HostFs>,
         pending: None,
         result: Some(result),
     }
@@ -841,7 +860,7 @@ where
                 return Poll::Ready(Ok(StreamResult::Completed));
             }
             let request = capacity.unwrap_or(*this.chunk_bytes).min(*this.chunk_bytes);
-            let read = (*this.start)(this.resolved.clone(), *this.offset, request);
+            let read = (*this.start)(this.held.clone(), *this.offset, request);
             this.pending.set(Some(read));
         }
         let bytes = match this.pending.as_mut().as_pin_mut() {
@@ -887,9 +906,9 @@ pin_project! {
         HostFs: crate::HostFileSystem,
     {
         pub(super) getter: fn(&mut T) -> &mut StoreData<CpuImpl, Net, HostFs>,
-        pub(super) resolved: Resolved<HostFs>,
+        pub(super) held: HeldPath<HostFs>,
         pub(super) mode: FileWriteMode,
-        pub(super) start: fn(Resolved<HostFs>, FileWriteMode, Vec<u8>, u64) -> Fut,
+        pub(super) start: fn(HeldPath<HostFs>, FileWriteMode, Vec<u8>, u64) -> Fut,
         #[pin]
         pub(super) pending: Option<Fut>,
         pub(super) result: Option<oneshot::Sender<FsOpResult<()>>>,
@@ -909,10 +928,10 @@ pin_project! {
     }
 }
 
-/// The `write-via-stream` and `append-via-stream` sink for `resolved`.
+/// The `write-via-stream` and `append-via-stream` sink for `held`.
 pub(super) fn file_write_consumer<T, CpuImpl, Net, HostFs>(
     getter: fn(&mut T) -> &mut StoreData<CpuImpl, Net, HostFs>,
-    resolved: Resolved<HostFs>,
+    held: HeldPath<HostFs>,
     mode: FileWriteMode,
     result: oneshot::Sender<FsOpResult<()>>,
 ) -> FileWriteConsumer<
@@ -930,7 +949,7 @@ where
 {
     FileWriteConsumer {
         getter,
-        resolved,
+        held,
         mode,
         start: write_chunk::<HostFs>,
         pending: None,
@@ -964,7 +983,7 @@ where
             let mut bytes = Vec::with_capacity(available);
             source.read(&mut store, &mut bytes)?;
             let now = (*this.getter)(store.data_mut()).now_nanos();
-            let write = (*this.start)(this.resolved.clone(), *this.mode, bytes, now);
+            let write = (*this.start)(this.held.clone(), *this.mode, bytes, now);
             this.pending.set(Some(write));
         }
         let written = match this.pending.as_mut().as_pin_mut() {

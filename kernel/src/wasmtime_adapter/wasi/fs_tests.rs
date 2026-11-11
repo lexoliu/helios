@@ -30,7 +30,7 @@ const IMAGE: EmbeddedBootFs = EmbeddedBootFs::new(
 );
 
 fn namespace() -> TestNamespace {
-    Namespace::new(MountTable::new(BootFs::new(IMAGE, BOOT_DEVICE)))
+    Namespace::new(MountTable::new(BootFs::new(IMAGE, BOOT_DEVICE), 1))
 }
 
 fn root() -> FsDescriptor {
@@ -479,7 +479,7 @@ fn namespace_with_bootfs_cwasm() -> TestNamespace {
     )]));
     const DIRECTORIES: &[EmbeddedBootDirectory] = &[EmbeddedBootDirectory::new("mnt", 0)];
     let image = EmbeddedBootFs::new(DIRECTORIES, files);
-    Namespace::new(MountTable::new(BootFs::new(image, BOOT_DEVICE)))
+    Namespace::new(MountTable::new(BootFs::new(image, BOOT_DEVICE), 1))
 }
 
 fn program_source(namespace: &TestNamespace, absolute: &str) -> ProgramSource {
@@ -811,7 +811,7 @@ fn a_mount_with_a_descriptor_or_stream_open_on_it_is_busy() {
     drop(descriptor);
     assert_eq!(unmount(), Err(crate::MountError::Busy("/mnt".into())));
     assert_eq!(
-        block_on(super::read_resolved(stream.clone(), 0, 64))
+        block_on(super::read_held(stream.clone(), 0, 64))
             .expect("the stream still reads")
             .as_ref(),
         "日本語 한국어".as_bytes()

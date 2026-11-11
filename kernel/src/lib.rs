@@ -218,10 +218,10 @@ pub use surface::{
     SurfaceShared,
 };
 pub use vfs::{
-    BOOT_DEVICE, FileContents, Follow, HostShare, MAX_MOUNTS, MAX_SYMLINK_DEPTH, MemoryFs,
-    MountError, MountHold, MountRequestError, MountSource, MountTable, MountedFs, Namespace,
-    ROOT_LAYER_DEVICE, Resolved, RootFs, object_identity, request_mount, request_unmount,
-    symlink_target, within_directory,
+    BOOT_DEVICE, FileContents, Follow, HeldPath, HostShare, MAX_MOUNTS, MAX_SYMLINK_DEPTH,
+    MemoryFs, MountError, MountHold, MountRequestError, MountSource, MountTable, MountedFs,
+    Namespace, ROOT_LAYER_DEVICE, Resolved, RootFs, object_identity, request_mount,
+    request_unmount, symlink_target, within_directory,
 };
 pub use vsock::{
     ComponentHostVsockService, MAX_VSOCK_BACKLOG, MAX_VSOCK_CONNECTIONS, MAX_VSOCK_LISTENERS,

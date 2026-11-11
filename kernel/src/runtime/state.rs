@@ -353,10 +353,10 @@ where
                 vsock_service: Once::new(),
                 futex_table: Mutex::new(FutexTable::new()),
                 payload,
-                namespace: Namespace::new(MountTable::new(BootFs::new(
-                    payload.bootfs(),
-                    BOOT_DEVICE,
-                ))),
+                namespace: Namespace::new(MountTable::new(
+                    BootFs::new(payload.bootfs(), BOOT_DEVICE),
+                    processor_count,
+                )),
                 tracing: Mutex::new(TraceHistory::new(DEFAULT_TRACE_HISTORY_CAPACITY)),
                 profiles: ProfileSink::new(
                     DEFAULT_PROFILE_STACK_CAPACITY,

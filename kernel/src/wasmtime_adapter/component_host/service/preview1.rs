@@ -4591,10 +4591,10 @@ mod tests {
         use futures_lite::future::block_on;
 
         let namespace: crate::Namespace<crate::UnsupportedHostFileSystem> =
-            crate::Namespace::new(crate::MountTable::new(crate::BootFs::new(
-                crate::EmbeddedBootFs::new(&[], &[]),
-                crate::BOOT_DEVICE,
-            )));
+            crate::Namespace::new(crate::MountTable::new(
+                crate::BootFs::new(crate::EmbeddedBootFs::new(&[], &[]), crate::BOOT_DEVICE),
+                1,
+            ));
         let owner = FsDescriptor {
             path: "/".into(),
             kind: FsNodeKind::Directory,

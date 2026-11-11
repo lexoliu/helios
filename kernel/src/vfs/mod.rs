@@ -3,21 +3,24 @@
 //! # Concurrency contract
 //!
 //! - **Resolution is lock-free.** Turning a guest path into a mount and a
-//!   path inside it ([`Namespace::resolve`]) reads the table's slots with
-//!   atomic loads and a per-slot pin count and takes no lock, so every
+//!   path inside it ([`Namespace::resolve`]) scans the table's slots with
+//!   atomic loads, pins the one it picks, and takes no lock, so every
 //!   processor resolves paths at once. A resolution sees each mount either
 //!   before or after a concurrent mount or unmount of it, never half of one.
+//! - **A resolution writes only its own processor's line.** Pins are
+//!   counted per processor, each processor's counts on a cache line of
+//!   their own, so a mount every processor resolves through (`/host`)
+//!   puts no line under writes from more than one. The resolution borrows
+//!   the mount and the caller's path: it copies and allocates nothing.
 //! - **Mount and unmount take the writer side**, a spin lock that
 //!   serialises writers against each other and is held only to pick and
 //!   publish a slot. [`MountTable::mount`] fills an empty slot and never
 //!   waits for readers. [`MountTable::unmount`] retires a slot, then
 //!   yields to the executor until every resolution that pinned the slot
-//!   before it retired has let go, and only then drops the mount.
-//! - Each slot's pin count is written by every resolving processor, so it
-//!   lives on a cache line of its own.
-//! - A filesystem a resolution returns is an owned handle; operations on
-//!   it run outside the table entirely, under the filesystem's own
-//!   contract ([`MemoryFs`], [`RootFs`], [`HostShare`], [`crate::BootFs`]).
+//!   has let go, and only then drops the mount.
+//! - Operations on a resolved filesystem run outside the table entirely,
+//!   under the filesystem's own contract ([`MemoryFs`], [`RootFs`],
+//!   [`HostShare`], [`crate::BootFs`]).
 //!
 //! # Shape
 //!
@@ -43,7 +46,8 @@ pub use memory::MemoryFs;
 pub use request::{MountRequestError, MountSource, request_mount, request_unmount};
 pub use root::RootFs;
 
-use alloc::borrow::ToOwned;
+use alloc::borrow::{Cow, ToOwned};
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
@@ -52,6 +56,7 @@ use core::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering as AtomicOrd
 
 use bytes::{Bytes, BytesMut};
 use crossbeam_utils::CachePadded;
+use helios_hal::cpu::current_processor;
 use helios_hal::fs::{
     DeviceId, DirCookie, DirEntry, FileSystem, FileSystemRights, FsError, FsPath, FsResult,
     Metadata, NodeKind, OpenFlags,
@@ -65,9 +70,10 @@ use crate::{
 
 /// Mounts one table holds besides its root.
 ///
-/// The bound is kernel memory, not guest data: a slot is a few words and a
-/// cache line of pin count, and a machine with a dozen disks mounted is
-/// already more than the platform attaches.
+/// The bound is kernel memory, not guest data: a slot is a few words, each
+/// processor's pin counts for a table fill a padded block of this many
+/// words, and a machine with a dozen disks mounted is already more than
+/// the platform attaches.
 pub const MAX_MOUNTS: usize = 16;
 
 /// Device id of the boot image.
@@ -266,24 +272,27 @@ impl core::fmt::Debug for MountHold {
     }
 }
 
-/// What a resolution found in the table: the mount that owns a path.
-struct Located<H> {
+/// What a resolution found in one table: the mount that owns a path,
+/// pinned for as long as the resolution looks at it.
+struct Located<'a, H> {
     point_len: usize,
-    rights: FileSystemRights,
-    fs: MountedFs<H>,
-    hold: MountHold,
+    mount: &'a Mount<H>,
+    pin: SlotPin<'a>,
 }
 
 /// One mount's place in the table.
 ///
-/// `mount` is written only by the writer, only while `state` is
-/// [`SLOT_EMPTY`] or [`SLOT_RETIRING`] with `pins` at zero, and read only
-/// by a resolution that pinned the slot and then saw [`SLOT_LIVE`].
+/// `point_len` and `point_hash` summarise the mount point for a resolution
+/// that scans the table without pinning anything: the writer sets them
+/// only while the slot is empty, before it publishes the slot live, and a
+/// resolution confirms its candidate against the mount itself once it has
+/// pinned the slot. `mount` is written only by the writer, only while
+/// `state` is [`SLOT_EMPTY`] or [`SLOT_RETIRING`] with no pins, and read
+/// only by a resolution that pinned the slot and then saw [`SLOT_LIVE`].
 struct Slot<H> {
-    /// Resolutions currently looking at this slot. Written by every
-    /// resolving processor.
-    pins: CachePadded<AtomicUsize>,
     state: AtomicU8,
+    point_len: AtomicUsize,
+    point_hash: AtomicU64,
     mount: UnsafeCell<Option<Mount<H>>>,
 }
 
@@ -297,30 +306,91 @@ unsafe impl<H: Send + Sync> Sync for Slot<H> {}
 impl<H> Slot<H> {
     fn new() -> Self {
         Self {
-            pins: CachePadded::new(AtomicUsize::new(0)),
             state: AtomicU8::new(SLOT_EMPTY),
+            point_len: AtomicUsize::new(0),
+            point_hash: AtomicU64::new(0),
             mount: UnsafeCell::new(None),
         }
     }
+}
 
-    /// Runs `read` on the mount when the slot is live, with the slot
-    /// pinned for the duration.
-    fn read<R>(&self, read: impl FnOnce(&Mount<H>) -> R) -> Option<R> {
-        if self.state.load(AtomicOrdering::Acquire) != SLOT_LIVE {
-            return None;
+/// 64-bit FNV-1a over a mount point: what a scan compares instead of the
+/// point, which it may not read before it pins the slot. The offset basis
+/// and prime are FNV's published 64-bit parameters.
+fn point_hash(point: &[u8]) -> u64 {
+    point.iter().fold(0xcbf2_9ce4_8422_2325, |hash, &byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+/// How many resolutions look at each slot of a table, counted per
+/// processor.
+///
+/// A resolution adds one to the count its processor keeps for the slot
+/// it uses and takes one away from the count of the processor it finishes
+/// on. Each processor's counts share one padded block that only that
+/// processor writes, except once by a task that moved between the two
+/// writes. The counts wrap, and a slot's pins are their wrapping sum.
+///
+/// The sum an unmount reads after marking the slot retiring is zero only
+/// when no pin is live, although it reads the processors one at a time: a
+/// pin taken before the slot retired is counted where it was taken, which
+/// the unmount reads after retiring it; a pin taken after sees the slot
+/// retiring and undoes itself on the same processor in the same call
+/// ([`TableInner::pin_live`]), so no pin's release is ever counted
+/// without its taking, and no pin counts below zero.
+struct Pins {
+    blocks: Box<[CachePadded<[AtomicUsize; MAX_MOUNTS]>]>,
+}
+
+impl Pins {
+    fn new(processors: usize) -> Self {
+        Self {
+            blocks: (0..processors)
+                .map(|_| CachePadded::new(core::array::from_fn(|_| AtomicUsize::new(0))))
+                .collect(),
         }
-        self.pins.fetch_add(1, AtomicOrdering::SeqCst);
-        let result = if self.state.load(AtomicOrdering::SeqCst) == SLOT_LIVE {
-            // SAFETY: the slot is pinned and live, so the writer has
-            // published the mount and will not touch it until this pin is
-            // released (see `Slot`).
-            let mount = unsafe { &*self.mount.get() };
-            Some(read(mount.as_ref().expect("a live slot holds a mount")))
-        } else {
-            None
-        };
-        self.pins.fetch_sub(1, AtomicOrdering::Release);
-        result
+    }
+
+    /// The executing processor's count for `slot`.
+    fn local(&self, slot: usize) -> &AtomicUsize {
+        let processor = usize::from(current_processor().id());
+        let block = self.blocks.get(processor).unwrap_or_else(|| {
+            panic!(
+                "processor {processor} resolves a path but the mount table counts {} processors",
+                self.blocks.len()
+            )
+        });
+        &block[slot]
+    }
+
+    /// The pins on `slot`, summed over every processor.
+    fn total(&self, slot: usize) -> usize {
+        self.blocks.iter().fold(0, |sum, block| {
+            sum.wrapping_add(block[slot].load(AtomicOrdering::SeqCst))
+        })
+    }
+}
+
+/// A resolution's pin on one slot: while it lives, an unmount of the slot
+/// waits.
+struct SlotPin<'a> {
+    pins: &'a Pins,
+    slot: usize,
+}
+
+impl<'a> SlotPin<'a> {
+    fn new(pins: &'a Pins, slot: usize) -> Self {
+        pins.local(slot).fetch_add(1, AtomicOrdering::SeqCst);
+        Self { pins, slot }
+    }
+}
+
+impl Drop for SlotPin<'_> {
+    fn drop(&mut self) {
+        self.pins
+            .local(self.slot)
+            .fetch_sub(1, AtomicOrdering::Release);
     }
 }
 
@@ -332,16 +402,20 @@ impl<H> Slot<H> {
 /// is still in place, and a retiring slot that nothing will ever empty
 /// would hide it from every resolution and refuse every later unmount.
 struct Retiring<'a, H> {
-    writer: &'a spin::Mutex<()>,
-    slot: &'a Slot<H>,
+    table: &'a TableInner<H>,
+    index: usize,
 }
 
 impl<H> Retiring<'_, H> {
+    fn slot(&self) -> &Slot<H> {
+        &self.table.slots[self.index]
+    }
+
     /// Whether a descriptor or stream holds the retiring mount.
     fn held(&self) -> bool {
         // SAFETY: the slot is retiring and its mount stays in place until
         // this guard empties it; only the hold's count is read.
-        unsafe { &*self.slot.mount.get() }
+        unsafe { &*self.slot().mount.get() }
             .as_ref()
             .expect("a retiring slot holds a mount")
             .hold
@@ -351,20 +425,20 @@ impl<H> Retiring<'_, H> {
     /// Takes the mount out of the slot and leaves the slot empty.
     fn retire(self) -> Option<Mount<H>> {
         let this = core::mem::ManuallyDrop::new(self);
-        let _writer = this.writer.lock();
+        let _writer = this.table.writer.lock();
         // SAFETY: the slot is retiring with no pins and the writer lock is
         // held; every resolution that pins it from here on sees it
         // retiring and leaves the mount alone.
-        let retired = unsafe { (*this.slot.mount.get()).take() };
-        this.slot.state.store(SLOT_EMPTY, AtomicOrdering::Release);
+        let retired = unsafe { (*this.slot().mount.get()).take() };
+        this.slot().state.store(SLOT_EMPTY, AtomicOrdering::Release);
         retired
     }
 }
 
 impl<H> Drop for Retiring<'_, H> {
     fn drop(&mut self) {
-        let _writer = self.writer.lock();
-        self.slot.state.store(SLOT_LIVE, AtomicOrdering::SeqCst);
+        let _writer = self.table.writer.lock();
+        self.slot().state.store(SLOT_LIVE, AtomicOrdering::SeqCst);
     }
 }
 
@@ -374,12 +448,105 @@ impl<H> Drop for Retiring<'_, H> {
 struct Machine {
     boot: BootFs,
     next_device: AtomicU64,
+    /// Processors that may resolve a path: one pin block each, in every
+    /// table.
+    processors: usize,
 }
 
 struct TableInner<H> {
     machine: Arc<Machine>,
     slots: [Slot<H>; MAX_MOUNTS],
+    pins: Pins,
     writer: spin::Mutex<()>,
+}
+
+// A resolution remembers the slots it has ruled out in one `u32`.
+const _: () = assert!(MAX_MOUNTS <= u32::BITS as usize);
+
+impl<H> TableInner<H> {
+    /// Pins slot `index` and answers its mount while the slot is live.
+    ///
+    /// The pin is taken and, when the slot turns out not to be live,
+    /// released in this one synchronous call, so a pin that backs off
+    /// never moves to another processor: [`Pins`] relies on it.
+    fn pin_live(&self, index: usize) -> Option<(&Mount<H>, SlotPin<'_>)> {
+        let slot = &self.slots[index];
+        if slot.state.load(AtomicOrdering::Acquire) != SLOT_LIVE {
+            return None;
+        }
+        let pin = SlotPin::new(&self.pins, index);
+        if slot.state.load(AtomicOrdering::SeqCst) != SLOT_LIVE {
+            return None;
+        }
+        // SAFETY: the slot is pinned and live, so the writer has published
+        // the mount and will not touch it until this pin is released (see
+        // `Slot`); the reference goes out only beside the pin.
+        let mount = unsafe { &*slot.mount.get() }
+            .as_ref()
+            .expect("a live slot holds a mount");
+        Some((mount, pin))
+    }
+
+    /// Runs `read` on the mount in slot `index` when it is live, with the
+    /// slot pinned for the duration.
+    fn read<R>(&self, index: usize, read: impl FnOnce(&Mount<H>) -> R) -> Option<R> {
+        self.pin_live(index).map(|(mount, _pin)| read(mount))
+    }
+
+    /// The live mount whose point is the longest prefix of `absolute`,
+    /// among those longer than `longer_than`.
+    ///
+    /// The scan reads each slot's published point length and hash and
+    /// pins nothing; only the winner is pinned, and confirmed against its
+    /// mount under the pin. A winner that does not confirm (a hash that
+    /// collided, or a slot unmounted and filled again since the scan) is
+    /// ruled out and the scan runs again, so each mount is seen whole,
+    /// before or after a concurrent change to it.
+    fn longest_match(&self, absolute: &str, longer_than: usize) -> Option<Located<'_, H>> {
+        let mut ruled_out = 0u32;
+        loop {
+            let mut best: Option<(usize, usize)> = None;
+            for (index, slot) in self.slots.iter().enumerate() {
+                if ruled_out & (1 << index) != 0
+                    || slot.state.load(AtomicOrdering::Acquire) != SLOT_LIVE
+                {
+                    continue;
+                }
+                let len = slot.point_len.load(AtomicOrdering::Relaxed);
+                if len <= best.map_or(longer_than, |(_, best)| best) {
+                    continue;
+                }
+                if prefix_is_point(absolute, len, slot.point_hash.load(AtomicOrdering::Relaxed)) {
+                    best = Some((index, len));
+                }
+            }
+            let (index, point_len) = best?;
+            if let Some((mount, pin)) = self.pin_live(index)
+                && mount.point.len() == point_len
+                && point_covers(&mount.point, absolute)
+            {
+                return Some(Located {
+                    point_len,
+                    mount,
+                    pin,
+                });
+            }
+            ruled_out |= 1 << index;
+        }
+    }
+}
+
+/// Whether the first `len` bytes of `absolute` end at a path boundary and
+/// hash to `hash`: a scan's guess that a mount point of that length and
+/// hash covers `absolute`.
+fn prefix_is_point(absolute: &str, len: usize, hash: u64) -> bool {
+    let bytes = absolute.as_bytes();
+    match bytes.get(len) {
+        None if bytes.len() == len => {}
+        Some(b'/') => {}
+        _ => return false,
+    }
+    point_hash(&bytes[..len]) == hash
 }
 
 /// One namespace's own mounts. Clones share it.
@@ -409,19 +576,22 @@ fn valid_point(point: &str) -> bool {
 
 impl<H: Clone> MountTable<H> {
     /// A kernel's first table: `boot` under each namespace's own layer,
-    /// with nothing mounted.
-    pub fn new(boot: BootFs) -> Self {
+    /// with nothing mounted, for a machine of `processors` processors.
+    pub fn new(boot: BootFs, processors: usize) -> Self {
         Self::on(Arc::new(Machine {
             boot,
             next_device: AtomicU64::new(AuthorityDomain::FIRST_MOUNTED.raw()),
+            processors,
         }))
     }
 
     fn on(machine: Arc<Machine>) -> Self {
+        let pins = Pins::new(machine.processors);
         Self {
             inner: Arc::new(TableInner {
                 machine,
                 slots: core::array::from_fn(|_| Slot::new()),
+                pins,
                 writer: spin::Mutex::new(()),
             }),
         }
@@ -494,6 +664,9 @@ impl<H: Clone> MountTable<H> {
                 hold: MountHold::new(),
             });
         }
+        slot.point_len.store(point.len(), AtomicOrdering::Relaxed);
+        slot.point_hash
+            .store(point_hash(point.as_bytes()), AtomicOrdering::Relaxed);
         slot.state.store(SLOT_LIVE, AtomicOrdering::SeqCst);
         Ok(())
     }
@@ -506,10 +679,10 @@ impl<H: Clone> MountTable<H> {
     /// mount stays as it was.
     pub async fn unmount(&self, point: &str) -> Result<(), MountError> {
         let busy = || MountError::Busy(point.to_owned());
-        let slot = {
+        let index = {
             let _writer = self.inner.writer.lock();
             let mut found = None;
-            for slot in &self.inner.slots {
+            for (index, slot) in self.inner.slots.iter().enumerate() {
                 if slot.state.load(AtomicOrdering::Acquire) != SLOT_LIVE {
                     continue;
                 }
@@ -521,22 +694,24 @@ impl<H: Clone> MountTable<H> {
                     if mounted.hold.is_held() {
                         return Err(busy());
                     }
-                    found = Some(slot);
+                    found = Some(index);
                 } else if point_covers(point, &mounted.point) {
                     return Err(busy());
                 }
             }
-            let slot = found.ok_or_else(|| MountError::NotMounted(point.to_owned()))?;
-            slot.state.store(SLOT_RETIRING, AtomicOrdering::SeqCst);
-            slot
+            let index = found.ok_or_else(|| MountError::NotMounted(point.to_owned()))?;
+            self.inner.slots[index]
+                .state
+                .store(SLOT_RETIRING, AtomicOrdering::SeqCst);
+            index
         };
         // From here the slot is retiring; whatever ends this call, the
         // guard leaves it live or empty, never retiring.
         let retiring = Retiring {
-            writer: &self.inner.writer,
-            slot,
+            table: &self.inner,
+            index,
         };
-        while slot.pins.load(AtomicOrdering::SeqCst) != 0 {
+        while self.inner.pins.total(index) != 0 {
             crate::yield_now().await;
         }
         // Every resolution that could have taken a share has let go, and
@@ -548,32 +723,12 @@ impl<H: Clone> MountTable<H> {
         Ok(())
     }
 
-    /// The mount whose point is the longest prefix of `absolute`.
-    fn longest_match(&self, absolute: &str) -> Option<Located<H>> {
-        let mut best: Option<Located<H>> = None;
-        for slot in &self.inner.slots {
-            let longer = |len: usize| best.as_ref().is_none_or(|best| len > best.point_len);
-            if let Some(found) = slot.read(|mount| {
-                (point_covers(&mount.point, absolute) && longer(mount.point.len())).then(|| {
-                    Located {
-                        point_len: mount.point.len(),
-                        rights: mount.rights,
-                        fs: mount.fs.clone(),
-                        hold: mount.hold.clone(),
-                    }
-                })
-            }) {
-                best = found.or(best);
-            }
-        }
-        best
-    }
-
     /// Whether a mount point lies strictly below `directory`.
     fn points_below(&self, directory: &str) -> bool {
-        self.inner.slots.iter().any(|slot| {
-            slot.read(|mount| mount.point != directory && within_directory(directory, &mount.point))
-                == Some(true)
+        (0..MAX_MOUNTS).any(|index| {
+            self.inner.read(index, |mount| {
+                mount.point != directory && within_directory(directory, &mount.point)
+            }) == Some(true)
         })
     }
 
@@ -581,8 +736,8 @@ impl<H: Clone> MountTable<H> {
     /// `directory`.
     fn points_inside(&self, directory: &str) -> Vec<String> {
         let mut names = Vec::new();
-        for slot in &self.inner.slots {
-            if let Some(Some(name)) = slot.read(|mount| {
+        for index in 0..MAX_MOUNTS {
+            if let Some(Some(name)) = self.inner.read(index, |mount| {
                 let (parent, name) = mount.point.rsplit_once('/')?;
                 let parent = if parent.is_empty() { "/" } else { parent };
                 (parent == directory).then(|| String::from(name))
@@ -595,28 +750,37 @@ impl<H: Clone> MountTable<H> {
 }
 
 /// A guest path resolved to the mount that owns it.
-#[derive(Clone)]
-pub struct Resolved<H> {
-    fs: MountedFs<H>,
+///
+/// It borrows the mount from the table, and the path from the caller
+/// unless a symbolic link was followed: a resolution copies nothing and
+/// writes no line another processor writes. While it lives, the slot it
+/// resolved through stays pinned, so an unmount of that mount waits for
+/// it. An operation that outlives its caller's borrow (a stream across
+/// polls) keeps a [`HeldPath`] instead.
+pub struct Resolved<'a, H> {
+    fs: &'a MountedFs<H>,
     rights: FileSystemRights,
-    absolute: String,
+    absolute: Cow<'a, str>,
     /// Length of the mount point in `absolute`; `0` for the root mount.
     point_len: usize,
-    /// A share of the mount's hold; `None` for the namespace's root, which
-    /// is never unmounted.
-    hold: Option<MountHold>,
+    /// The mount's hold; `None` for the namespace's root, which is never
+    /// unmounted.
+    hold: Option<&'a MountHold>,
+    /// The pin on the mount's slot; `None` for the root, and for a view
+    /// of a [`HeldPath`], which owns what it uses.
+    _pin: Option<SlotPin<'a>>,
 }
 
-impl<H: HostFileSystem> Resolved<H> {
+impl<'a, H: HostFileSystem> Resolved<'a, H> {
     /// The filesystem, for reading.
-    pub fn fs(&self) -> &MountedFs<H> {
-        &self.fs
+    pub fn fs(&self) -> &'a MountedFs<H> {
+        self.fs
     }
 
     /// The filesystem, for changing: refused when the mount is read-only.
-    pub fn writable(&self) -> FsResult<&MountedFs<H>> {
+    pub fn writable(&self) -> FsResult<&'a MountedFs<H>> {
         if self.rights.contains(FileSystemRights::WRITE) {
-            Ok(&self.fs)
+            Ok(self.fs)
         } else {
             Err(FsError::ReadOnly)
         }
@@ -645,7 +809,7 @@ impl<H: HostFileSystem> Resolved<H> {
 
     /// Whether `other` lies on the same mount, so a rename or link between
     /// the two can stay within one filesystem.
-    pub fn same_mount(&self, other: &Self) -> bool {
+    pub fn same_mount(&self, other: &Resolved<'_, H>) -> bool {
         self.mount_point() == other.mount_point()
     }
 
@@ -653,7 +817,7 @@ impl<H: HostFileSystem> Resolved<H> {
     /// descriptor or stream that keeps using it; `None` on the namespace's
     /// root, which is never unmounted.
     pub fn hold(&self) -> Option<MountHold> {
-        self.hold.clone()
+        self.hold.cloned()
     }
 
     /// Whether the path names the root of its mount.
@@ -661,15 +825,62 @@ impl<H: HostFileSystem> Resolved<H> {
         self.path().is_root()
     }
 
+    /// An owned copy of this resolution, for an operation that keeps
+    /// using the file after the caller's borrow ends. It holds the mount
+    /// ([`MountHold`]) rather than pinning its slot.
+    pub fn held(&self) -> HeldPath<H> {
+        HeldPath(Arc::new(HeldInner {
+            fs: self.fs.clone(),
+            rights: self.rights,
+            absolute: String::from(&*self.absolute),
+            point_len: self.point_len,
+            hold: self.hold(),
+        }))
+    }
+
     /// The whole of the regular file at this path, with the provenance of
     /// the layer that produced the bytes.
     pub async fn read_whole(&self) -> FsResult<FileContents> {
         let path = self.path();
-        match &self.fs {
+        match self.fs {
             MountedFs::Root(root) => root.read_whole(path).await,
             MountedFs::Boot(boot) => boot.file_contents(path).map(FileContents::Boot),
             MountedFs::Memory(fs) => read_all(fs, path).await.map(FileContents::Written),
             MountedFs::Host(fs) => read_all(fs, path).await.map(FileContents::Written),
+        }
+    }
+}
+
+/// A resolution a stream keeps across polls: it owns the filesystem
+/// handle and the path, and holds the mount, so an unmount refuses with
+/// [`MountError::Busy`] until it is dropped. Clones share one copy.
+pub struct HeldPath<H>(Arc<HeldInner<H>>);
+
+struct HeldInner<H> {
+    fs: MountedFs<H>,
+    rights: FileSystemRights,
+    absolute: String,
+    point_len: usize,
+    hold: Option<MountHold>,
+}
+
+impl<H> Clone for HeldPath<H> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<H: HostFileSystem> HeldPath<H> {
+    /// The resolution this keeps, to operate through.
+    pub fn resolved(&self) -> Resolved<'_, H> {
+        let held = &*self.0;
+        Resolved {
+            fs: &held.fs,
+            rights: held.rights,
+            absolute: Cow::Borrowed(&held.absolute),
+            point_len: held.point_len,
+            hold: held.hold.as_ref(),
+            _pin: None,
         }
     }
 }
@@ -746,14 +957,19 @@ pub struct Namespace<H> {
     own: MountTable<H>,
     /// The tables of the trees this one descends from, nearest first.
     inherited: Arc<Vec<MountTable<H>>>,
-    root: RootFs,
+    /// The writable layer of the root.
+    layer: MemoryFs,
+    /// The root: `layer` over the boot image, as the filesystem a
+    /// resolution that no mount claims borrows.
+    root: MountedFs<H>,
 }
 
-impl<H> Clone for Namespace<H> {
+impl<H: Clone> Clone for Namespace<H> {
     fn clone(&self) -> Self {
         Self {
             own: self.own.clone(),
             inherited: self.inherited.clone(),
+            layer: self.layer.clone(),
             root: self.root.clone(),
         }
     }
@@ -763,10 +979,19 @@ impl<H: Clone> Namespace<H> {
     /// The root namespace, over `table`: the kernel's own tree, with a
     /// fresh root layer and no ancestors.
     pub fn new(table: MountTable<H>) -> Self {
-        let root = RootFs::new(MemoryFs::new(ROOT_LAYER_DEVICE), table.boot().clone());
+        Self::over(
+            table,
+            Arc::new(Vec::new()),
+            MemoryFs::new(ROOT_LAYER_DEVICE),
+        )
+    }
+
+    fn over(own: MountTable<H>, inherited: Arc<Vec<MountTable<H>>>, layer: MemoryFs) -> Self {
+        let root = MountedFs::Root(RootFs::new(layer.clone(), own.boot().clone()));
         Self {
-            own: table,
-            inherited: Arc::new(Vec::new()),
+            own,
+            inherited,
+            layer,
             root,
         }
     }
@@ -777,11 +1002,11 @@ impl<H: Clone> Namespace<H> {
         let inherited = core::iter::once(self.own.clone())
             .chain(self.inherited.iter().cloned())
             .collect();
-        Self {
-            own: self.own.descendant(),
-            inherited: Arc::new(inherited),
-            root: RootFs::new(MemoryFs::new(ROOT_LAYER_DEVICE), self.own.boot().clone()),
-        }
+        Self::over(
+            self.own.descendant(),
+            Arc::new(inherited),
+            MemoryFs::new(ROOT_LAYER_DEVICE),
+        )
     }
 
     /// Whether `other` is the same tree: shares this one's mounts and root.
@@ -792,13 +1017,14 @@ impl<H: Clone> Namespace<H> {
     /// The writable layer of this tree's root, which a child that ran to
     /// completion hands back to the parent it rejoins.
     pub fn root_layer(&self) -> MemoryFs {
-        self.root.upper().clone()
+        self.layer.clone()
     }
 
     /// Takes `layer` as this tree's root layer: the one a child that ran
     /// to completion hands back. The tree's mounts stay as they are.
     pub fn adopt_root_layer(&mut self, layer: MemoryFs) {
-        self.root = RootFs::new(layer, self.own.boot().clone());
+        self.root = MountedFs::Root(RootFs::new(layer.clone(), self.own.boot().clone()));
+        self.layer = layer;
     }
 
     /// This tree's own mounts.
@@ -818,38 +1044,46 @@ impl<H: HostFileSystem> Namespace<H> {
     ///
     /// The longest mount point wins; between two at the same point, the
     /// nearer tree's, so a tree may mount over what it inherited.
-    pub fn resolve(&self, absolute: &str) -> FsResult<Resolved<H>> {
+    pub fn resolve<'a>(&'a self, absolute: &'a str) -> FsResult<Resolved<'a, H>> {
+        self.resolve_path(Cow::Borrowed(absolute))
+    }
+
+    fn resolve_path<'a>(&'a self, absolute: Cow<'a, str>) -> FsResult<Resolved<'a, H>> {
         if !absolute.starts_with('/') {
             return Err(FsError::Invalid);
         }
-        let mut found: Option<Located<H>> = None;
+        // Nearest table first, and a farther one only for a strictly
+        // longer point: the nearer tree wins a tie.
+        let mut found: Option<Located<'a, H>> = None;
         for table in self.tables() {
-            if let Some(located) = table.longest_match(absolute)
-                && found
-                    .as_ref()
-                    .is_none_or(|best| located.point_len > best.point_len)
-            {
+            let longer_than = found.as_ref().map_or(0, |best| best.point_len);
+            if let Some(located) = table.inner.longest_match(&absolute, longer_than) {
                 found = Some(located);
             }
         }
         let resolved = match found {
-            Some(located) => Resolved {
-                fs: located.fs,
-                rights: located.rights,
-                absolute: absolute.to_owned(),
-                point_len: located.point_len,
-                hold: Some(located.hold),
+            Some(Located {
+                point_len,
+                mount,
+                pin,
+            }) => Resolved {
+                fs: &mount.fs,
+                rights: mount.rights,
+                absolute,
+                point_len,
+                hold: Some(&mount.hold),
+                _pin: Some(pin),
             },
             None => Resolved {
-                fs: MountedFs::Root(self.root.clone()),
+                fs: &self.root,
                 rights: FileSystemRights::READ | FileSystemRights::WRITE,
-                absolute: absolute.to_owned(),
+                absolute,
                 point_len: 0,
                 hold: None,
+                _pin: None,
             },
         };
-        let point_len = resolved.point_len;
-        let inside = &resolved.absolute[point_len..];
+        let inside = &resolved.absolute[resolved.point_len..];
         FsPath::new(inside.strip_prefix('/').unwrap_or(inside)).ok_or(FsError::Invalid)?;
         Ok(resolved)
     }
@@ -860,11 +1094,11 @@ impl<H: HostFileSystem> Namespace<H> {
     /// A followed resolution starts inside its floor and never leaves it:
     /// a link that leads out, a link placed at the floor itself included,
     /// is refused with [`FsError::NotPermitted`].
-    pub async fn resolve_following(
-        &self,
-        absolute: &str,
+    pub async fn resolve_following<'a>(
+        &'a self,
+        absolute: &'a str,
         follow: Follow<'_>,
-    ) -> FsResult<Resolved<H>> {
+    ) -> FsResult<Resolved<'a, H>> {
         let mut resolved = self.resolve(absolute)?;
         let Follow::Within(floor) = follow else {
             return Ok(resolved);
@@ -884,7 +1118,7 @@ impl<H: HostFileSystem> Namespace<H> {
             if !within_directory(floor, &followed) {
                 return Err(FsError::NotPermitted);
             }
-            resolved = self.resolve(&followed)?;
+            resolved = self.resolve_path(Cow::Owned(followed))?;
         }
         Err(FsError::Loop)
     }

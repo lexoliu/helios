@@ -1,8 +1,8 @@
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::sync::atomic::Ordering as AtomicOrdering;
 
 use futures_lite::future::block_on;
+use helios_hal::cpu::ProcessorId;
 use helios_hal::fs::{FileSystem, FileSystemRights, FsError, FsPath, OpenFlags};
 
 use super::{
@@ -23,7 +23,7 @@ const IMAGE: EmbeddedBootFs = EmbeddedBootFs::new(
 const READ_WRITE: FileSystemRights = FileSystemRights::READ.union(FileSystemRights::WRITE);
 
 fn namespace() -> TestNamespace {
-    Namespace::new(MountTable::new(BootFs::new(IMAGE, BOOT_DEVICE)))
+    Namespace::new(MountTable::new(BootFs::new(IMAGE, BOOT_DEVICE), 1))
 }
 
 fn memory(namespace: &TestNamespace) -> MountedFs<UnsupportedHostFileSystem> {
@@ -66,10 +66,11 @@ fn read(namespace: &TestNamespace, absolute: &str) -> Vec<u8> {
 fn the_longest_mount_point_owns_a_path() {
     let namespace = namespace();
     mount_memory(&namespace, "/mnt");
+    let mnt = resolve_child_path("/", "mnt").expect("normalizes");
     block_on(
-        resolve_child_path("/", "mnt")
-            .map(|mnt| namespace.resolve(&mnt).expect("resolves"))
-            .expect("normalizes")
+        namespace
+            .resolve(&mnt)
+            .expect("resolves")
             .writable()
             .expect("writable")
             .create_directory(FsPath::new("data").expect("valid"), 1),
@@ -180,17 +181,10 @@ fn a_cancelled_unmount_leaves_the_mount_live() {
     let namespace = namespace();
     mount_memory(&namespace, "/scratch");
     create(&namespace, "/scratch/f", b"kept");
-    let slot = namespace
-        .table()
-        .inner
-        .slots
-        .iter()
-        .find(|slot| slot.read(|mount| mount.point == "/scratch") == Some(true))
-        .expect("the mount has a slot");
 
     // A resolution that has not let go keeps the unmount waiting; the
     // unmount is dropped while it waits.
-    slot.pins.fetch_add(1, AtomicOrdering::SeqCst);
+    let looking = namespace.resolve("/scratch/f").expect("resolves");
     {
         let mut unmount = core::pin::pin!(namespace.table().unmount("/scratch"));
         assert_eq!(
@@ -199,7 +193,7 @@ fn a_cancelled_unmount_leaves_the_mount_live() {
         );
         assert_eq!(owner(&namespace, "/scratch/f").0, "/");
     }
-    slot.pins.fetch_sub(1, AtomicOrdering::SeqCst);
+    drop(looking);
 
     assert_eq!(
         owner(&namespace, "/scratch/f"),
@@ -207,6 +201,60 @@ fn a_cancelled_unmount_leaves_the_mount_live() {
     );
     assert_eq!(read(&namespace, "/scratch/f"), b"kept");
     block_on(namespace.table().unmount("/scratch")).expect("a later unmount completes");
+}
+
+/// A resolution writes one count: its own processor's, for the slot it
+/// resolves through. A task that moves to another processor before it
+/// lets go releases its pin there, and the unmount it held up completes.
+#[test]
+fn a_resolution_pins_on_its_own_processor_and_may_let_go_on_another() {
+    let namespace: TestNamespace =
+        Namespace::new(MountTable::new(BootFs::new(IMAGE, BOOT_DEVICE), 2));
+    mount_memory(&namespace, "/scratch");
+    mount_memory(&namespace, "/other");
+    let pinned = |processor: usize| {
+        namespace.table().inner.pins.blocks[processor]
+            .iter()
+            .filter(|count| count.load(core::sync::atomic::Ordering::SeqCst) != 0)
+            .count()
+    };
+
+    crate::test_processor_identity::set(ProcessorId::new(1));
+    let looking = namespace.resolve("/scratch/f").expect("resolves");
+    assert_eq!((pinned(0), pinned(1)), (0, 1));
+
+    let mut unmount = core::pin::pin!(namespace.table().unmount("/scratch"));
+    crate::test_processor_identity::set(ProcessorId::new(0));
+    assert_eq!(
+        block_on(futures_lite::future::poll_once(&mut unmount)),
+        None
+    );
+    drop(looking);
+    assert_eq!(block_on(unmount), Ok(()));
+    assert_eq!(owner(&namespace, "/scratch/f").0, "/");
+    assert_eq!(owner(&namespace, "/other/f").0, "/other");
+}
+
+/// A scan picks a mount by its point's published length and hash; a
+/// candidate whose point turns out to differ (a hash that collided) is
+/// ruled out under its pin, and the path resolves past it.
+#[test]
+fn a_colliding_point_hash_is_ruled_out() {
+    let namespace = namespace();
+    mount_memory(&namespace, "/aa");
+    let table = &namespace.table().inner;
+    let index = table
+        .slots
+        .iter()
+        .position(|slot| slot.state.load(core::sync::atomic::Ordering::SeqCst) == super::SLOT_LIVE)
+        .expect("the mount has a slot");
+    table.slots[index].point_hash.store(
+        super::point_hash(b"/bb"),
+        core::sync::atomic::Ordering::SeqCst,
+    );
+
+    assert_eq!(owner(&namespace, "/bb/x"), ("/".into(), "bb/x".into()));
+    assert_eq!(table.pins.total(index), 0, "the ruled-out pin was released");
 }
 
 #[test]
@@ -280,7 +328,7 @@ fn a_mount_point_must_be_a_directory_under_an_existing_one() {
         refused("/mnt"),
         Err(MountError::AlreadyMounted("/mnt".into()))
     );
-    let root = MountedFs::Root(namespace.root.clone());
+    let root = namespace.root.clone();
     assert_eq!(
         namespace.table().mount("/other", root, READ_WRITE),
         Err(MountError::RootKind)

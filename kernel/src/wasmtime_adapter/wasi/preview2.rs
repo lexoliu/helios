@@ -34,8 +34,8 @@ use crate::wasmtime_adapter::store::{
     ChannelInputStream, ChannelOutputStream, SerialOutputStream, StdioOutputStream,
 };
 use crate::{
-    ComponentOutputMode, ComponentOutputRoute, ComponentOutputStreamKind, Namespace, NetworkHandle,
-    ProfileScope, Resolved,
+    ComponentOutputMode, ComponentOutputRoute, ComponentOutputStreamKind, HeldPath, Namespace,
+    NetworkHandle, ProfileScope,
 };
 
 #[cfg(test)]
@@ -318,7 +318,7 @@ struct EmptyInputStream;
 /// ever resident, so streaming a large file never scales kernel memory
 /// with the file's size.
 struct FileInputStream<HostFs> {
-    file: Resolved<HostFs>,
+    file: HeldPath<HostFs>,
     offset: u64,
     buffer: Bytes,
     end_of_file: bool,
@@ -339,7 +339,7 @@ where
 {
     cpu: CpuImpl,
     runtime_state: HostRuntimeState<CpuImpl, Net, HostFs>,
-    file: Resolved<HostFs>,
+    file: HeldPath<HostFs>,
     mode: FileWriteMode,
     pending: Option<Bytes>,
     failure: Option<p2fs::ErrorCode>,
@@ -355,7 +355,7 @@ impl<HostFs> FileInputStream<HostFs>
 where
     HostFs: crate::HostFileSystem,
 {
-    fn new(file: Resolved<HostFs>, offset: u64) -> Self {
+    fn new(file: HeldPath<HostFs>, offset: u64) -> Self {
         Self {
             file,
             offset,
@@ -369,7 +369,12 @@ where
         if !self.buffer.is_empty() || self.end_of_file || self.failure.is_some() {
             return;
         }
-        match super::read_resolved(self.file.clone(), self.offset, P2_FILE_STREAM_CHUNK_BYTES).await
+        match super::read_resolved(
+            &self.file.resolved(),
+            self.offset,
+            P2_FILE_STREAM_CHUNK_BYTES,
+        )
+        .await
         {
             Ok(bytes) if bytes.is_empty() => self.end_of_file = true,
             Ok(bytes) => {
@@ -393,7 +398,7 @@ where
     fn new(
         cpu: CpuImpl,
         runtime_state: HostRuntimeState<CpuImpl, Net, HostFs>,
-        file: Resolved<HostFs>,
+        file: HeldPath<HostFs>,
         mode: FileWriteMode,
     ) -> Self {
         Self {
@@ -421,7 +426,7 @@ where
             return;
         };
         let now = self.now_nanos();
-        match super::write_resolved(&self.file, self.mode, &bytes, now).await {
+        match super::write_resolved(&self.file.resolved(), self.mode, &bytes, now).await {
             Ok(end) => {
                 if let FileWriteMode::At(offset) = &mut self.mode {
                     *offset = end;
@@ -454,7 +459,7 @@ where
         resource: &Resource<FsDescriptor>,
         right: p3fs::DescriptorFlags,
         refused: p3fs::ErrorCode,
-    ) -> core::result::Result<Resolved<HostFs>, p2fs::ErrorCode> {
+    ) -> core::result::Result<HeldPath<HostFs>, p2fs::ErrorCode> {
         let (descriptor, namespace) = self.p2_descriptor(resource)?;
         super::stream_target(&namespace, &descriptor, right, refused).map_err(error_code_from_p3)
     }
