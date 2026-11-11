@@ -4664,23 +4664,17 @@ mod tests {
             self.executor.run_until_stalled_with_stats(&self.timer);
         }
 
-        /// Moves the timer's inbox into its wheel, which is where a
-        /// sleep that was dropped before it fired is discarded. The
-        /// kernel event loop does this every tick; a test that runs
-        /// more phases than the timer inbox holds has to do it too.
-        fn settle_timer(&self) {
-            self.timer.fire_expired();
-        }
-
         /// One phase, started and ended, with its heartbeat parked on
         /// its sleep in between — the shape every instance's run phase
-        /// has.
+        /// has. The cancelled heartbeat's sleep leaves its timer's
+        /// wheel as it is dropped, so nothing is left for a fire to
+        /// clear.
         fn run_phase(&self) -> Result<(), TaskCapacityError> {
             let heartbeat = self.start_phase()?;
             self.drain();
             drop(heartbeat);
             self.drain();
-            self.settle_timer();
+            assert_eq!(self.timer.registered_sleeps(), 0);
             Ok(())
         }
     }
@@ -4726,7 +4720,7 @@ mod tests {
                 "phase {phase} did not reach its error exit",
             );
             fixture.drain();
-            fixture.settle_timer();
+            assert_eq!(fixture.timer.registered_sleeps(), 0);
         }
     }
 }

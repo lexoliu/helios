@@ -1488,7 +1488,7 @@ impl<T> Future for LocalJoinHandle<T> {
 mod tests {
     use core::future::Future as _;
     use core::mem::size_of;
-    use core::pin::Pin;
+    use core::pin::{Pin, pin};
     use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use core::task::{Context, Waker};
 
@@ -1501,6 +1501,7 @@ mod tests {
         TASK_ARENA_KERNEL_RESERVE_BYTES, TASK_ARENA_TOP_BYTES, TaskArena,
         should_wake_global_processor, should_wake_owner_processor, task_arena_bytes,
     };
+    use crate::exec::timer::TIMER_WHEEL_QUANTUM;
     use crate::test_support::RecordingSmpCpu;
     use helios_hal::cpu::{
         Cpu, HardwarePerfCounters, Instant, ProcessorId, Timebase, TimerInterrupt,
@@ -2012,6 +2013,14 @@ mod tests {
         assert_eq!(cpu.woken(), [ProcessorId::new(1)]);
     }
 
+    /// The instant a timer publishes and arms for a sleep due at
+    /// `deadline`: the wheel quantum boundary at or after it, which is
+    /// when the wheel counts the sleep due.
+    fn wheel_due(cpu: &impl Cpu, deadline: u64) -> u64 {
+        let quantum = cpu.timebase().duration_to_ticks(TIMER_WHEEL_QUANTUM);
+        deadline.div_ceil(quantum) * quantum
+    }
+
     /// A sleep registered on processor 0's timer from processor 1
     /// programs no comparator on processor 1 — `set_deadline` reaches
     /// the executing processor, not the timer's owner — and reaches
@@ -2032,8 +2041,8 @@ mod tests {
 
         crate::test_processor_identity::set(ProcessorId::new(1));
         idle.store(IdleState::Parked);
-        let mut while_parked = timer.sleep_until(Instant::new(now + 500));
-        assert!(Pin::new(&mut while_parked).poll(&mut context).is_pending());
+        let mut while_parked = pin!(timer.sleep_until(Instant::new(now + 500)));
+        assert!(while_parked.as_mut().poll(&mut context).is_pending());
         assert_eq!(
             cpu.deadlines(),
             built,
@@ -2046,8 +2055,8 @@ mod tests {
         );
 
         idle.store(IdleState::Running);
-        let mut while_running = timer.sleep_until(Instant::new(now + 400));
-        assert!(Pin::new(&mut while_running).poll(&mut context).is_pending());
+        let mut while_running = pin!(timer.sleep_until(Instant::new(now + 400)));
+        assert!(while_running.as_mut().poll(&mut context).is_pending());
         assert_eq!(
             cpu.deadlines(),
             built,
@@ -2063,7 +2072,7 @@ mod tests {
         timer.arm_published_deadline();
         assert_eq!(
             cpu.deadlines().last(),
-            Some(&(ProcessorId::new(0), now + 400)),
+            Some(&(ProcessorId::new(0), wheel_due(&cpu, now + 400))),
             "the owner arms the earliest published deadline before it parks"
         );
     }
@@ -2073,7 +2082,8 @@ mod tests {
     /// interrupt re-arms a tick on unless it is parked, when it stretches
     /// to the idle interval (100 ms), and the first executor pass that
     /// runs work after a park pulls it back within a tick, once, not on
-    /// every pass.
+    /// every pass. A sleep's deadline is armed at the wheel quantum
+    /// boundary that makes it due.
     #[test]
     fn a_running_processor_is_interrupted_every_tick_and_a_parked_one_keeps_its_long_deadline() {
         let _serialized = super::executor_test_guard();
@@ -2146,27 +2156,34 @@ mod tests {
             "a running processor's interrupt re-arms a tick on"
         );
 
+        // The later sleep first: a cancelled sleep leaves its published
+        // deadline in place until a fire after it passes, and this clock
+        // never moves.
         let mut context = Context::from_waker(Waker::noop());
-        let mut soon = timer.sleep_until(Instant::new(now + tick / 2));
-        assert!(Pin::new(&mut soon).poll(&mut context).is_pending());
-        assert_eq!(
-            armed(),
-            now + tick / 2,
-            "a sleep sooner than the tick is armed"
-        );
-        drop(soon);
-        timer.fire_expired();
-
-        let mut late = timer.sleep_until(Instant::new(now + long / 2));
-        assert!(Pin::new(&mut late).poll(&mut context).is_pending());
+        let mut late = pin!(timer.sleep_until(Instant::new(now + long / 2)));
+        assert!(late.as_mut().poll(&mut context).is_pending());
         idle.store(IdleState::Parked);
         timer.handle_interrupt();
         assert_eq!(
             armed(),
-            now + long / 2,
+            wheel_due(&cpu, now + long / 2),
             "a parked processor wakes for its next sleep inside the idle interval"
         );
+
         idle.store(IdleState::Running);
+        timer.handle_interrupt();
+        assert_eq!(
+            armed(),
+            now + tick,
+            "a running processor's interrupt re-arms a tick on, ahead of a later sleep"
+        );
+        let mut soon = pin!(timer.sleep_until(Instant::new(now + tick / 2)));
+        assert!(soon.as_mut().poll(&mut context).is_pending());
+        assert_eq!(
+            armed(),
+            wheel_due(&cpu, now + tick / 2),
+            "a sleep sooner than the tick is armed"
+        );
     }
 
     #[test]
