@@ -381,6 +381,77 @@ pub struct NeighborEntry {
     pub updated_at: StackInstant,
 }
 
+/// A bounded neighbor cache.
+///
+/// Holds at most [`MAX_NEIGHBORS`] entries and never refuses an
+/// insertion: when full, a new address displaces the entry that is cheapest
+/// to lose. A pinned entry (a next hop the routes depend on) outlasts every
+/// unpinned one, then an in-flight resolution goes before a resolved entry,
+/// a stale one before a live one, and the least recently updated before the
+/// most recent. A resolved entry that is evicted costs one more ARP or
+/// Neighbor Discovery exchange the next time it is needed.
+///
+/// Concurrency: a plain value with no interior mutability. A stack owns one
+/// (so does exactly one shard), and the control plane keeps its own copy
+/// behind a snapshot cell.
+#[derive(Clone, Debug, Default)]
+pub struct NeighborCache {
+    entries: ArrayVec<NeighborEntry, MAX_NEIGHBORS>,
+}
+
+impl NeighborCache {
+    pub const fn new() -> Self {
+        Self {
+            entries: ArrayVec::new_const(),
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = NeighborEntry> + '_ {
+        self.entries.iter().copied()
+    }
+
+    pub fn get(&self, ip: IpAddress) -> Option<NeighborEntry> {
+        self.entries.iter().find(|entry| entry.ip == ip).copied()
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    /// Inserts or replaces the entry for `entry.ip`, evicting when full.
+    /// `pinned` names the addresses that must outlast every other entry.
+    pub fn learn(&mut self, entry: NeighborEntry, pinned: impl Fn(IpAddress) -> bool) {
+        if let Some(existing) = self.entries.iter_mut().find(|e| e.ip == entry.ip) {
+            *existing = entry;
+            return;
+        }
+        let Err(full) = self.entries.try_push(entry) else {
+            return;
+        };
+        let victim = self.entries.iter_mut().min_by_key(|candidate| {
+            let rank = match candidate.state {
+                NeighborState::Incomplete => 0u8,
+                NeighborState::Stale => 1,
+                NeighborState::Probe => 2,
+                NeighborState::Delay => 3,
+                NeighborState::Reachable => 4,
+            };
+            (pinned(candidate.ip), rank, candidate.updated_at)
+        });
+        if let Some(victim) = victim {
+            *victim = full.element();
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Route {
     pub destination: IpCidr,
@@ -446,6 +517,22 @@ impl RouteTable {
 
     pub fn iter(&self) -> impl Iterator<Item = Route> + '_ {
         self.routes.iter().copied()
+    }
+
+    /// Whether some route names `address` as its gateway.
+    pub fn is_gateway(&self, address: IpAddress) -> bool {
+        self.routes
+            .iter()
+            .any(|route| route.gateway == Some(address))
+    }
+
+    /// Whether `address` is reachable without a router: a gateway is by
+    /// definition, and so is any address a connected route covers.
+    pub fn is_on_link(&self, address: IpAddress) -> bool {
+        self.is_gateway(address)
+            || self
+                .resolve(address)
+                .is_some_and(|route| route.gateway.is_none())
     }
 }
 
@@ -2150,7 +2237,7 @@ where
     /// option, the IPv6 counterpart of the DHCPv4 lease's DNS servers.
     ipv6_dns_servers: Ipv6DnsServers,
     ipv4_multicast_memberships: ArrayVec<Ipv4MulticastMembership, MAX_IPV4_MULTICAST_MEMBERSHIPS>,
-    neighbors: ArrayVec<NeighborEntry, MAX_NEIGHBORS>,
+    neighbors: NeighborCache,
     outbound: OutboundFrameQueue,
     events: Deque<StackEvent, MAX_STACK_EVENTS>,
     udp: UdpSocketSlab,
@@ -2542,7 +2629,7 @@ where
             ipv6_discovery: NeighborDiscovery::new(),
             ipv6_dns_servers: Ipv6DnsServers::new(),
             ipv4_multicast_memberships: ArrayVec::new(),
-            neighbors: ArrayVec::new(),
+            neighbors: NeighborCache::new(),
             outbound: OutboundFrameQueue::new(),
             events: Deque::new(),
             udp: UdpSocketSlab::new(),
@@ -2618,30 +2705,25 @@ where
     }
 
     pub fn neighbors(&self) -> impl Iterator<Item = NeighborEntry> + '_ {
-        self.neighbors.iter().copied()
+        self.neighbors.iter()
     }
 
+    /// Replaces the cache with `neighbors`, keeping the entries the cache
+    /// would keep when the list is longer than its capacity. Routes are
+    /// replaced first so a gateway's entry is the one that survives.
     pub fn replace_neighbors(&mut self, neighbors: impl IntoIterator<Item = NeighborEntry>) {
         self.neighbors.clear();
+        let routes = &self.routes;
         for entry in neighbors {
             self.neighbors
-                .try_push(entry)
-                .unwrap_or_else(|_| panic!("neighbor table is full"));
+                .learn(entry, |address| routes.is_gateway(address));
         }
     }
 
     pub fn learn_neighbor(&mut self, entry: NeighborEntry) {
-        if let Some(existing) = self
-            .neighbors
-            .iter_mut()
-            .find(|existing| existing.ip == entry.ip)
-        {
-            *existing = entry;
-        } else {
-            self.neighbors
-                .try_push(entry)
-                .unwrap_or_else(|_| panic!("neighbor table is full"));
-        }
+        let routes = &self.routes;
+        self.neighbors
+            .learn(entry, |address| routes.is_gateway(address));
         Self::push_event_into(&mut self.events, StackEvent::NeighborUpdated(entry));
     }
 
@@ -2649,17 +2731,11 @@ where
     /// cached link-layer address when `override_cache` is set.
     ///
     /// RFC 4861 §7.2.5: an observation that does not carry the override
-    /// bit — a Neighbor Advertisement without it, or a passively
-    /// observed data frame, which carries no NDP flags at all — may
-    /// create a cache entry or refresh a matching one, but must leave a
-    /// resolved entry with a different address alone.
+    /// bit — a Neighbor Advertisement without it — may create a cache
+    /// entry or refresh a matching one, but must leave a resolved entry
+    /// with a different address alone.
     fn learn_neighbor_without_override(&mut self, entry: NeighborEntry, override_cache: bool) {
-        let cached = self
-            .neighbors
-            .iter()
-            .find(|existing| existing.ip == entry.ip)
-            .copied();
-        match cached {
+        match self.neighbors.get(entry.ip) {
             Some(cached)
                 if cached.state != NeighborState::Incomplete
                     && cached.mac != entry.mac
@@ -4529,12 +4605,19 @@ where
         now: StackInstant,
     ) -> Result<bool, StackError> {
         let packet = ArpPacket::parse(bytes).ok_or(StackError::MalformedPacket)?;
-        self.learn_neighbor(NeighborEntry {
-            ip: IpAddress::Ipv4(packet.sender_protocol),
-            mac: packet.sender_hardware,
-            state: NeighborState::Reachable,
-            updated_at: now,
-        });
+        // An ARP sender is a neighbor only when it shares the link; a
+        // sender outside every connected subnet (or the unspecified
+        // address of a probe) is answered but never cached.
+        if !packet.sender_protocol.is_unspecified()
+            && self.is_on_link(IpAddress::Ipv4(packet.sender_protocol))
+        {
+            self.learn_neighbor(NeighborEntry {
+                ip: IpAddress::Ipv4(packet.sender_protocol),
+                mac: packet.sender_hardware,
+                state: NeighborState::Reachable,
+                updated_at: now,
+            });
+        }
         if packet.operation == ArpOperation::Request
             && self
                 .ipv4_addresses
@@ -4554,14 +4637,6 @@ where
         now: StackInstant,
     ) -> Result<bool, StackError> {
         let packet = self.parse_ipv4(frame.as_ref())?;
-        if !packet.source.is_unspecified() {
-            self.learn_neighbor(NeighborEntry {
-                ip: IpAddress::Ipv4(packet.source),
-                mac: source_mac,
-                state: NeighborState::Reachable,
-                updated_at: now,
-            });
-        }
         if packet.is_fragmented() {
             // Nothing not addressed to this host is worth a cache slot, and
             // the cache copies what it keeps: the frame is on loan for this
@@ -4664,22 +4739,6 @@ where
         now: StackInstant,
     ) -> Result<bool, StackError> {
         let packet = Ipv6Packet::parse(frame.as_ref()).ok_or(StackError::MalformedPacket)?;
-        if !packet.source.is_unspecified() {
-            // Passive learning: filling the cache from ordinary traffic
-            // saves a solicitation round trip, but RFC 4861 §7.2.5 only
-            // lets a Neighbor Advertisement carrying the override bit
-            // replace a cached link-layer address, so a data frame must
-            // never do it either.
-            self.learn_neighbor_without_override(
-                NeighborEntry {
-                    ip: IpAddress::Ipv6(packet.source),
-                    mac: source_mac,
-                    state: NeighborState::Reachable,
-                    updated_at: now,
-                },
-                false,
-            );
-        }
         let payload_range = bytes_subrange(frame.as_ref(), packet.payload);
         let offload = offload.advance(payload_range.start);
         let payload_bytes = frame.slice(payload_range);
@@ -4873,15 +4932,24 @@ where
             .and_then(|route| route.gateway)
     }
 
+    /// Whether `address` shares the link with this stack, which is the
+    /// only kind of address ARP and Neighbor Discovery may cache. IPv6
+    /// link-local addresses are on-link by construction.
+    fn is_on_link(&self, address: IpAddress) -> bool {
+        match address {
+            IpAddress::Ipv6(ipv6) if ipv6.is_link_local() => true,
+            _ => self.routes.is_on_link(address),
+        }
+    }
+
     fn neighbor_mac(&self, ip: IpAddress) -> Option<EthernetAddress> {
         self.neighbors
-            .iter()
-            .find(|entry| {
-                entry.ip == ip
-                    && matches!(
-                        entry.state,
-                        NeighborState::Reachable | NeighborState::Stale | NeighborState::Delay
-                    )
+            .get(ip)
+            .filter(|entry| {
+                matches!(
+                    entry.state,
+                    NeighborState::Reachable | NeighborState::Stale | NeighborState::Delay
+                )
             })
             .map(|entry| entry.mac)
     }
@@ -5342,12 +5410,14 @@ where
                 // link-layer option over the Ethernet header, which a
                 // bridge or proxy may have rewritten.
                 let neighbor_mac = options.source_link_layer_address().unwrap_or(source_mac);
-                self.learn_neighbor(NeighborEntry {
-                    ip: IpAddress::Ipv6(packet.source),
-                    mac: neighbor_mac,
-                    state: NeighborState::Reachable,
-                    updated_at: now,
-                });
+                if self.is_on_link(IpAddress::Ipv6(packet.source)) {
+                    self.learn_neighbor(NeighborEntry {
+                        ip: IpAddress::Ipv6(packet.source),
+                        mac: neighbor_mac,
+                        state: NeighborState::Reachable,
+                        updated_at: now,
+                    });
+                }
                 if self
                     .ipv6_addresses
                     .iter()
@@ -5373,15 +5443,17 @@ where
                 let target_mac = options.target_link_layer_address().unwrap_or(source_mac);
                 // §7.2.5: without the override bit an advertisement may
                 // not replace a cached link-layer address that differs.
-                self.learn_neighbor_without_override(
-                    NeighborEntry {
-                        ip: IpAddress::Ipv6(target),
-                        mac: target_mac,
-                        state: NeighborState::Reachable,
-                        updated_at: now,
-                    },
-                    override_cache,
-                );
+                if self.is_on_link(IpAddress::Ipv6(target)) {
+                    self.learn_neighbor_without_override(
+                        NeighborEntry {
+                            ip: IpAddress::Ipv6(target),
+                            mac: target_mac,
+                            state: NeighborState::Reachable,
+                            updated_at: now,
+                        },
+                        override_cache,
+                    );
+                }
             }
             Icmpv6Packet::DestinationUnreachable(unreachable) => {
                 self.receive_icmp_destination_unreachable(IcmpDestinationUnreachable::Ipv6(
@@ -10422,7 +10494,7 @@ mod tests {
     }
 
     #[test]
-    fn ipv4_receive_learns_source_mac_before_tcp_reset() {
+    fn ipv4_receive_does_not_learn_the_source_mac() {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
@@ -10463,12 +10535,9 @@ mod tests {
 
         assert_eq!(
             stack.neighbor_mac(IpAddress::Ipv4(peer)),
-            Some(PEER_MAC),
-            "IPv4 receive path should learn the Ethernet source before replying"
+            None,
+            "an IPv4 data frame must not teach the stack its sender's Ethernet address"
         );
-        let reset = stack.take_outbound().expect("RST frame should be queued");
-        let ethernet = EthernetFrame::parse(reset.as_slice()).expect("Ethernet frame should parse");
-        assert_eq!(ethernet.destination, PEER_MAC);
     }
 
     #[test]
@@ -13364,7 +13433,9 @@ mod tests {
     fn neighbor_advertisement_without_override_keeps_the_cached_address() {
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
         stack.configure_ipv6_link_local();
-        let peer = Ipv6Address::new([0xfe, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9]);
+        // A link-local peer is on-link, so the advertisement reaches the
+        // override rule instead of being dropped as an off-link target.
+        let peer = Ipv6Address::new([0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9]);
         stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv6(peer),
             mac: PEER_MAC,
@@ -13590,5 +13661,206 @@ mod tests {
             IpAddress::Ipv6(ipv6.destination),
             ipv6.payload
         ));
+    }
+
+    const GATEWAY: Ipv4Address = Ipv4Address::new([10, 0, 0, 1]);
+    const LOCAL_V4: Ipv4Address = Ipv4Address::new([10, 0, 0, 2]);
+
+    /// A stack on `10.0.0.0/16` with a resolved default gateway.
+    fn stack_with_resolved_gateway() -> Stack {
+        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        stack.add_ipv4_address(Ipv4Cidr::new(LOCAL_V4, 16));
+        stack
+            .routes_mut()
+            .add(Route {
+                destination: IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address::new([0, 0, 0, 0]), 0)),
+                gateway: Some(IpAddress::Ipv4(GATEWAY)),
+                expires_at: None,
+            })
+            .expect("default route should fit");
+        stack.learn_neighbor(NeighborEntry {
+            ip: IpAddress::Ipv4(GATEWAY),
+            mac: PEER_MAC,
+            state: NeighborState::Reachable,
+            updated_at: StackInstant::from_nanos(0),
+        });
+        stack
+    }
+
+    fn arp_frame(
+        operation: ArpOperation,
+        sender_mac: EthernetAddress,
+        sender: Ipv4Address,
+        target: Ipv4Address,
+    ) -> ([u8; crate::ETHERNET_FRAME_BYTES], usize) {
+        let mut frame = [0u8; crate::ETHERNET_FRAME_BYTES];
+        let mut offset =
+            EthernetFrame::encode_header(&mut frame, [0xff; 6], sender_mac, EthernetProtocol::Arp)
+                .expect("test Ethernet header should fit");
+        offset += ArpPacket {
+            operation,
+            sender_hardware: sender_mac,
+            sender_protocol: sender,
+            target_hardware: [0; 6],
+            target_protocol: target,
+        }
+        .encode(&mut frame[offset..])
+        .expect("test ARP packet should fit");
+        (frame, offset)
+    }
+
+    /// Delivers a UDP datagram claiming `source` from `mac` and drains the
+    /// stack's answer so the output queue never fills.
+    fn deliver_udp_from(stack: &mut Stack, mac: EthernetAddress, source: Ipv4Address, now: u64) {
+        let (mut frame, len) = ipv4_udp_frame(source, 4000, LOCAL_V4, 9, b"x");
+        frame[6..12].copy_from_slice(&mac);
+        stack
+            .receive_frame(&frame[..len], StackInstant::from_nanos(now))
+            .expect("a datagram to a closed port should be handled");
+        while stack.take_outbound().is_some() {}
+        while stack.take_event().is_some() {}
+    }
+
+    #[test]
+    fn more_distinct_sources_than_the_cache_holds_do_not_panic_the_stack() {
+        let mut stack = stack_with_resolved_gateway();
+        // Off-link sources, as a spoofing remote peer would use, and
+        // twice the cache's capacity of them.
+        for index in 0..(2 * MAX_NEIGHBORS as u32) {
+            let source = Ipv4Address::new([198, 51, (index >> 8) as u8, index as u8]);
+            deliver_udp_from(&mut stack, PEER_MAC, source, 1 + u64::from(index));
+        }
+        assert_eq!(
+            stack.neighbors().count(),
+            1,
+            "data frames create no neighbor, so only the gateway is cached"
+        );
+
+        // On-link ARP senders are legitimate neighbors, and a LAN can
+        // hold more of them than the cache: the excess evicts, never
+        // panics, and the gateway keeps its entry.
+        for index in 0..(2 * MAX_NEIGHBORS as u32) {
+            let sender = Ipv4Address::new([10, 0, 1 + (index >> 8) as u8, index as u8]);
+            let (frame, len) = arp_frame(
+                ArpOperation::Reply,
+                [0x02, 0, 0, 1, 0, index as u8],
+                sender,
+                LOCAL_V4,
+            );
+            stack
+                .receive_frame(
+                    &frame[..len],
+                    StackInstant::from_nanos(1_000 + u64::from(index)),
+                )
+                .expect("an ARP reply should be handled");
+            while stack.take_event().is_some() {}
+        }
+        assert_eq!(stack.neighbors().count(), MAX_NEIGHBORS);
+        assert!(
+            stack
+                .neighbors()
+                .any(|entry| entry.ip == IpAddress::Ipv4(GATEWAY) && entry.mac == PEER_MAC),
+            "the gateway outlasts every other entry"
+        );
+
+        // The stack still answers.
+        let (request, len) = arp_frame(
+            ArpOperation::Request,
+            [0x02, 0, 0, 2, 0, 1],
+            Ipv4Address::new([10, 0, 9, 9]),
+            LOCAL_V4,
+        );
+        stack
+            .receive_frame(&request[..len], StackInstant::from_nanos(9_999))
+            .expect("an ARP request should be handled");
+        let reply = stack.take_outbound().expect("the ARP request is answered");
+        let ethernet = EthernetFrame::parse(reply.as_slice()).expect("Ethernet frame should parse");
+        assert_eq!(ethernet.protocol, EthernetProtocol::Arp);
+    }
+
+    #[test]
+    fn an_ipv4_data_frame_cannot_move_a_resolved_gateway_entry() {
+        let mut stack = stack_with_resolved_gateway();
+        let impostor: EthernetAddress = [0x02, 0, 0, 0, 0, 0x99];
+
+        // An on-link sender claims the gateway's address in a data frame.
+        deliver_udp_from(&mut stack, impostor, GATEWAY, 5);
+
+        let entry = stack
+            .neighbors()
+            .find(|entry| entry.ip == IpAddress::Ipv4(GATEWAY))
+            .expect("the gateway stays cached");
+        assert_eq!(entry.mac, PEER_MAC);
+        assert_eq!(
+            stack.neighbor_mac(IpAddress::Ipv4(GATEWAY)),
+            Some(PEER_MAC),
+            "outbound traffic still reaches the real gateway"
+        );
+    }
+
+    #[test]
+    fn an_arp_sender_outside_every_connected_subnet_is_not_cached() {
+        let mut stack = stack_with_resolved_gateway();
+        let (frame, len) = arp_frame(
+            ArpOperation::Request,
+            [0x02, 0, 0, 3, 0, 1],
+            Ipv4Address::new([203, 0, 113, 7]),
+            LOCAL_V4,
+        );
+        stack
+            .receive_frame(&frame[..len], StackInstant::from_nanos(2))
+            .expect("an ARP request should be handled");
+        assert!(
+            stack.take_outbound().is_some(),
+            "the request is still answered"
+        );
+        assert_eq!(stack.neighbors().count(), 1);
+    }
+
+    #[test]
+    fn a_full_cache_evicts_unresolved_and_stale_entries_before_reachable_ones() {
+        let mut cache = NeighborCache::new();
+        let entry = |last: u8, state, at| NeighborEntry {
+            ip: IpAddress::Ipv4(Ipv4Address::new([10, 0, 0, last])),
+            mac: PEER_MAC,
+            state,
+            updated_at: StackInstant::from_nanos(at),
+        };
+        let none = |_| false;
+        cache.learn(entry(0, NeighborState::Incomplete, 50), none);
+        cache.learn(entry(1, NeighborState::Stale, 1), none);
+        for last in 2..MAX_NEIGHBORS as u8 {
+            cache.learn(entry(last, NeighborState::Reachable, 100), none);
+        }
+        assert_eq!(cache.len(), MAX_NEIGHBORS);
+
+        cache.learn(entry(200, NeighborState::Reachable, 200), none);
+        assert!(
+            cache
+                .get(entry(0, NeighborState::Reachable, 0).ip)
+                .is_none()
+        );
+        assert!(
+            cache
+                .get(entry(1, NeighborState::Reachable, 0).ip)
+                .is_some()
+        );
+
+        cache.learn(entry(201, NeighborState::Reachable, 201), none);
+        assert!(
+            cache
+                .get(entry(1, NeighborState::Reachable, 0).ip)
+                .is_none()
+        );
+
+        // A pinned address survives even as the oldest reachable entry.
+        let pinned = entry(2, NeighborState::Reachable, 100).ip;
+        for last in 202..210u8 {
+            cache.learn(entry(last, NeighborState::Reachable, 300), |ip| {
+                ip == pinned
+            });
+        }
+        assert!(cache.get(pinned).is_some());
+        assert_eq!(cache.len(), MAX_NEIGHBORS);
     }
 }
