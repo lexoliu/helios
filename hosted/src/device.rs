@@ -21,7 +21,6 @@
 //! every thread afterwards. `mask` and `unmask` record what a controller
 //! would have been told; there is no controller, so nothing races.
 
-use std::ffi::CString;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -34,7 +33,7 @@ use helios_kernel::{
     GrantInterrupt, install_device_interrupt_hooks, install_device_vm_hooks,
 };
 
-use crate::vmm::{HostedAddressSpace, host_mapping_granule};
+use crate::vmm::{HostedAddressSpace, host_mapping_granule, shared_backing_file};
 
 /// The name the hosted machine publishes its device under.
 pub const HOSTED_DEVICE_NAME: &str = "hosted:device0";
@@ -85,25 +84,8 @@ impl HostedDeviceMemory {
     /// that cannot make a temporary file has no device to publish and no
     /// weaker device worth publishing instead.
     fn new(bytes: usize) -> Self {
-        let template = CString::new("/tmp/helios-hosted-device-XXXXXX")
-            .expect("the template holds no interior nul");
-        let mut path = template.into_bytes_with_nul();
-        // SAFETY: `path` is a nul-terminated, writable buffer holding a
-        // template `mkstemp` accepts.
-        let descriptor = unsafe { libc::mkstemp(path.as_mut_ptr().cast()) };
-        assert!(
-            descriptor >= 0,
-            "the hosted device needs a temporary file for its registers"
-        );
-        // SAFETY: `path` is the nul-terminated name `mkstemp` filled in.
-        let unlinked = unsafe { libc::unlink(path.as_ptr().cast()) };
-        assert!(
-            unlinked == 0,
-            "the hosted device's backing file must not outlive the process"
-        );
-        // SAFETY: `descriptor` is a fresh, empty regular file.
-        let sized = unsafe { libc::ftruncate(descriptor, bytes as libc::off_t) };
-        assert!(sized == 0, "the hosted device's registers must be sizeable");
+        let descriptor = shared_backing_file(bytes)
+            .expect("the hosted device needs a temporary file for its registers");
         // SAFETY: the descriptor names a regular file of exactly
         // `bytes`, and the kernel picks the address.
         let base = unsafe {
@@ -248,6 +230,36 @@ fn release_contiguous(virt: VirtRange, _align: u64) -> Result<(), AddressSpaceEr
     platform().address_space.decommit(virt)
 }
 
+fn allocate_run(bytes: usize, placement: DmaPlacement) -> Result<PhysicalRange, AddressSpaceError> {
+    platform().address_space.allocate_run(bytes, placement)
+}
+
+fn free_run(run: PhysicalRange, align: u64) -> Result<(), AddressSpaceError> {
+    platform().address_space.free_run(run, align)
+}
+
+fn substitute_memory(
+    virt: VirtRange,
+    physical: PhysicalRange,
+    flags: PageFlags,
+) -> Result<(), AddressSpaceError> {
+    platform()
+        .address_space
+        .substitute_memory(virt, physical, flags)
+}
+
+fn substitute_device(virt: VirtRange, region: DeviceRegion) -> Result<(), AddressSpaceError> {
+    platform().address_space.substitute_device(virt, region)
+}
+
+fn restore(virt: VirtRange) -> Result<(), AddressSpaceError> {
+    platform().address_space.restore(virt)
+}
+
+fn withdraw(virt: VirtRange) -> Result<(), AddressSpaceError> {
+    platform().address_space.withdraw(virt)
+}
+
 fn mapping_granule() -> u64 {
     host_mapping_granule()
 }
@@ -276,6 +288,12 @@ static VM_HOOKS: DeviceVmHooks = DeviceVmHooks {
     unmap_shared,
     commit_contiguous,
     release_contiguous,
+    allocate_run,
+    free_run,
+    substitute_memory,
+    substitute_device,
+    restore,
+    withdraw,
     mapping_granule,
     kernel_alias,
 };

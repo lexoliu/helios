@@ -197,6 +197,12 @@ pub enum AddressSpaceError {
     SharedMappingUnsupported,
     #[error("the range is a device mapping, not ordinary memory")]
     DeviceMapped,
+    #[error("this address space cannot substitute the backing of committed memory")]
+    SubstitutionUnsupported,
+    #[error("the range already shows a run or a device region")]
+    Substituted,
+    #[error("the range is not a substituted range")]
+    NotSubstituted,
     #[error("this address space cannot host demand-commit regions")]
     DemandCommitUnsupported,
     #[error("the page is not inside a prepared demand-commit region")]
@@ -455,6 +461,138 @@ pub trait AddressSpace: Send + Sync + 'static {
     /// frames would put it on the wrong free list.
     fn release_contiguous(&self, _virt: VirtRange, _align: u64) -> Result<(), AddressSpaceError> {
         Err(AddressSpaceError::DeviceMappingUnsupported)
+    }
+
+    /// Take a physically contiguous run of `bytes` from this address
+    /// space's frame source, zeroed, and map it nowhere.
+    ///
+    /// This is memory with no address of its own: what a device is told
+    /// to read and what [`Self::substitute_memory`] shows an owner. It
+    /// is one allocation and lives until [`Self::free_run`] is handed
+    /// the same range and alignment, however many times it was mapped
+    /// and unmapped in between.
+    ///
+    /// `placement` bounds the allocation: the run starts on the device's
+    /// required alignment and no byte of it sits above the device's
+    /// highest reachable address. A run the pool can produce but the
+    /// placement refuses is given back before the call reports
+    /// [`AddressSpaceError::OutOfFrames`].
+    ///
+    /// Lock-free with respect to the page tables: no translation
+    /// changes, so there is nothing to shoot down.
+    fn allocate_run(
+        &self,
+        _bytes: usize,
+        _placement: DmaPlacement,
+    ) -> Result<PhysicalRange, AddressSpaceError> {
+        Err(AddressSpaceError::SubstitutionUnsupported)
+    }
+
+    /// Give back a run [`Self::allocate_run`] produced.
+    ///
+    /// `align` is the placement alignment it was made with: a contiguous
+    /// run is a single allocation, and the allocator is owed the layout
+    /// it produced. The caller has already ended every substitution that
+    /// showed the run and told every device to stop reading it; this
+    /// call does not look for either.
+    fn free_run(&self, _run: PhysicalRange, _align: u64) -> Result<(), AddressSpaceError> {
+        Err(AddressSpaceError::SubstitutionUnsupported)
+    }
+
+    /// Show `physical` at `virt` in place of the pages that are there.
+    ///
+    /// Every page of `virt` is anonymous memory of an existing
+    /// reservation that is committed or swapped out, and `virt` is
+    /// exactly as long as `physical`. A program's buffer is ordinary
+    /// memory the swap policy may have evicted, so a swapped-out page
+    /// is substituted like a resident one: its contents are discarded,
+    /// its swap token is given back as a commit over it would, and it
+    /// ends up shown like the rest. Every resident page's own frame goes
+    /// back to this address space's pool and the leaf entries are
+    /// rewritten to the
+    /// run's, with ordinary memory attributes — cacheable, coherent
+    /// between processors — because the bytes are memory and not a
+    /// register file. Nothing is allocated and nothing is charged: the
+    /// run belongs to whoever called [`Self::allocate_run`].
+    ///
+    /// The caller is the one task that runs the range's owner, and
+    /// nothing else is reading the range while the call runs: a
+    /// backend is free to take each leaf through an invalid entry on
+    /// the way, which is what an architecture with a
+    /// break-before-make rule requires. Per the SMP contract every
+    /// other processor that has run in the space is shot down before
+    /// the old frames are reusable and before the call returns.
+    ///
+    /// The range stays part of its reservation's committed extent for
+    /// every other purpose — a later [`Self::protect`] over it applies,
+    /// and it is skipped, not refused, by a scan for pages to swap out.
+    ///
+    /// Fails with [`AddressSpaceError::NotCommitted`] when any page of
+    /// `virt` is neither committed nor swapped out, and with
+    /// [`AddressSpaceError::Substituted`] when any page of it already
+    /// shows something else; in both cases nothing has changed.
+    fn substitute_memory(
+        &self,
+        _virt: VirtRange,
+        _physical: PhysicalRange,
+        _flags: PageFlags,
+    ) -> Result<(), AddressSpaceError> {
+        Err(AddressSpaceError::SubstitutionUnsupported)
+    }
+
+    /// Show `region`'s physical bytes at `virt` in place of the pages
+    /// that are there.
+    ///
+    /// Everything [`Self::substitute_memory`] says holds, except the
+    /// attributes: the leaf entries carry the region's own — a
+    /// [`MemoryKind::Device`](crate::device::MemoryKind::Device) range
+    /// is mapped so that accesses reach the device unmerged,
+    /// unspeculated and in program order, and a region that is not
+    /// writable is mapped read-only.
+    ///
+    /// A backend that cannot express device memory in its page tables
+    /// reports [`AddressSpaceError::DeviceMappingUnsupported`] rather
+    /// than mapping the range as ordinary memory.
+    fn substitute_device(
+        &self,
+        _virt: VirtRange,
+        _region: DeviceRegion,
+    ) -> Result<(), AddressSpaceError> {
+        Err(AddressSpaceError::DeviceMappingUnsupported)
+    }
+
+    /// End a substitution and put anonymous zeroed memory back at
+    /// `virt`, with the permissions the range had before it.
+    ///
+    /// Every page of `virt` is substituted. Fresh frames come from this
+    /// address space's pool, are zeroed through the kernel's own view
+    /// of them, and replace the substituted leaves under the lock, on
+    /// the same terms as the substitution: the caller is the owner's
+    /// one task, and the shootdown is done before the call returns.
+    /// What had been shown there is
+    /// untouched: a run is freed by [`Self::free_run`], and a device
+    /// region was never anyone's to free.
+    ///
+    /// Fails with [`AddressSpaceError::OutOfFrames`] when the pool
+    /// cannot refill the range, leaving the substitution in place, and
+    /// with [`AddressSpaceError::NotSubstituted`] when `virt` is not a
+    /// substituted range.
+    fn restore(&self, _virt: VirtRange) -> Result<(), AddressSpaceError> {
+        Err(AddressSpaceError::SubstitutionUnsupported)
+    }
+
+    /// End a substitution and leave `virt` reserved and uncommitted.
+    ///
+    /// This is the path a dying owner takes: nothing will read the range
+    /// again, so nothing is allocated to refill it and the call cannot
+    /// fail for want of memory. The shootdown happens before the call
+    /// returns, so the owner has provably lost its last path to the
+    /// bytes by the time the kernel reports them released. Afterwards
+    /// the range is an ordinary uncommitted part of its reservation,
+    /// which is what [`Self::release`] and a whole-slot decommit expect
+    /// to find.
+    fn withdraw(&self, _virt: VirtRange) -> Result<(), AddressSpaceError> {
+        Err(AddressSpaceError::SubstitutionUnsupported)
     }
 
     /// Look up the current state of `addr`. Lock-free.

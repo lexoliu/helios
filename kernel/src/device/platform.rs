@@ -51,6 +51,41 @@ pub struct DeviceVmHooks {
     /// is one allocation, not a pile of frames, and an allocator that
     /// was given a size and an alignment has to be given them back.
     pub release_contiguous: fn(VirtRange, u64) -> Result<(), AddressSpaceError>,
+    /// Take a physically contiguous run of `bytes`, zeroed and mapped
+    /// nowhere, placed as the device needs.
+    ///
+    /// Memory with no address of its own: what a device is told to read
+    /// and what [`Self::substitute_memory`] shows an owner. It lives
+    /// until [`Self::free_run`].
+    pub allocate_run: fn(usize, DmaPlacement) -> Result<PhysicalRange, AddressSpaceError>,
+    /// Give back a run [`Self::allocate_run`] produced.
+    ///
+    /// `align` is what the allocation asked for: a run is one
+    /// allocation, and an allocator that was given a size and an
+    /// alignment has to be given them back. Every substitution that
+    /// showed the run has already ended.
+    pub free_run: fn(PhysicalRange, u64) -> Result<(), AddressSpaceError>,
+    /// Show a run at a span of an existing reservation whose pages are
+    /// each committed or swapped out, in place of what is there, with
+    /// the given flags and ordinary memory attributes.
+    ///
+    /// The caller is the one task that touches the span; every
+    /// processor is shot down before the old frames are reusable.
+    /// Nothing is allocated and nothing is charged: the run belongs to
+    /// whoever allocated it.
+    pub substitute_memory: fn(VirtRange, PhysicalRange, PageFlags) -> Result<(), AddressSpaceError>,
+    /// Show a device's own frames at such a span, with the attributes
+    /// the region carries.
+    /// Everything [`Self::substitute_memory`] says holds.
+    pub substitute_device: fn(VirtRange, DeviceRegion) -> Result<(), AddressSpaceError>,
+    /// End a substitution and put zeroed anonymous memory back, with
+    /// the permissions and owner the span had. What had been shown
+    /// there is untouched.
+    pub restore: fn(VirtRange) -> Result<(), AddressSpaceError>,
+    /// End a substitution and leave the span reserved and uncommitted,
+    /// shooting down every processor before returning. Allocates
+    /// nothing, so it cannot fail for want of memory.
+    pub withdraw: fn(VirtRange) -> Result<(), AddressSpaceError>,
     /// Where a physical frame appears in the kernel's own address
     /// space.
     ///
@@ -175,6 +210,10 @@ pub(crate) mod test_hooks {
         Released(VirtRange),
         MapShared(VirtRange, PhysicalRange),
         UnmapShared(VirtRange),
+        SubstituteMemory(VirtRange, PhysicalRange),
+        SubstituteDevice(VirtRange),
+        Restore(VirtRange),
+        Withdraw(VirtRange),
     }
 
     #[derive(Default)]
@@ -193,6 +232,9 @@ pub(crate) mod test_hooks {
         /// period through and what a device is told to read: a test that
         /// drives the sample path dereferences this.
         runs: Vec<(usize, *mut u8, Layout)>,
+        /// Host memory standing in for the runs `allocate_run` hands
+        /// out, keyed by their address.
+        allocated: Vec<(usize, *mut u8, Layout)>,
     }
 
     std::thread_local! {
@@ -286,6 +328,80 @@ pub(crate) mod test_hooks {
         Ok(())
     }
 
+    fn allocate_run(
+        bytes: usize,
+        placement: DmaPlacement,
+    ) -> Result<PhysicalRange, AddressSpaceError> {
+        let align = usize::try_from(placement.align)
+            .unwrap_or(PhysFrame::SIZE)
+            .max(PhysFrame::SIZE);
+        let layout =
+            Layout::from_size_align(bytes, align).map_err(|_| AddressSpaceError::Misaligned)?;
+        // SAFETY: the layout has a non-zero size, because a run of no
+        // bytes is refused before it reaches an address space.
+        let run = unsafe { alloc_zeroed(layout) };
+        if run.is_null() {
+            return Err(AddressSpaceError::OutOfFrames);
+        }
+        if !placement.accepts(run as usize as u64, bytes as u64) {
+            // SAFETY: `run` came from `alloc_zeroed` with this layout
+            // and nothing has been recorded against it.
+            unsafe { dealloc(run, layout) };
+            return Err(AddressSpaceError::OutOfFrames);
+        }
+        RECORDING.with(|recording| {
+            recording
+                .borrow_mut()
+                .allocated
+                .push((run as usize, run, layout));
+        });
+        Ok(PhysicalRange::new(run as usize as u64, bytes as u64))
+    }
+
+    fn free_run(run: PhysicalRange, _align: u64) -> Result<(), AddressSpaceError> {
+        let held = RECORDING.with(|recording| {
+            let mut recording = recording.borrow_mut();
+            let index = recording
+                .allocated
+                .iter()
+                .position(|(start, _, _)| *start as u64 == run.start)?;
+            Some(recording.allocated.remove(index))
+        });
+        let (_, run, layout) = held.ok_or(AddressSpaceError::NotCommitted)?;
+        // SAFETY: `run` came from this module's own `alloc_zeroed` with
+        // `layout`, and it is removed from the list before it is freed,
+        // so nothing frees it twice.
+        unsafe { dealloc(run, layout) };
+        Ok(())
+    }
+
+    fn substitute_memory(
+        virt: VirtRange,
+        physical: PhysicalRange,
+        _flags: PageFlags,
+    ) -> Result<(), AddressSpaceError> {
+        if physical.bytes as usize != virt.byte_len {
+            return Err(AddressSpaceError::Misaligned);
+        }
+        record(MappingChange::SubstituteMemory(virt, physical));
+        Ok(())
+    }
+
+    fn substitute_device(virt: VirtRange, _region: DeviceRegion) -> Result<(), AddressSpaceError> {
+        record(MappingChange::SubstituteDevice(virt));
+        Ok(())
+    }
+
+    fn restore(virt: VirtRange) -> Result<(), AddressSpaceError> {
+        record(MappingChange::Restore(virt));
+        Ok(())
+    }
+
+    fn withdraw(virt: VirtRange) -> Result<(), AddressSpaceError> {
+        record(MappingChange::Withdraw(virt));
+        Ok(())
+    }
+
     fn mask(source: u32) {
         RECORDING.with(|recording| recording.borrow_mut().masked.push(source));
     }
@@ -311,6 +427,12 @@ pub(crate) mod test_hooks {
         unmap_shared,
         commit_contiguous,
         release_contiguous,
+        allocate_run,
+        free_run,
+        substitute_memory,
+        substitute_device,
+        restore,
+        withdraw,
         mapping_granule,
         kernel_alias,
     };

@@ -84,6 +84,34 @@ fn release_contiguous(virt: VirtRange, align: u64) -> Result<(), AddressSpaceErr
     crate::vmm::user_address_space().release_contiguous(virt, align)
 }
 
+fn allocate_run(bytes: usize, placement: DmaPlacement) -> Result<PhysicalRange, AddressSpaceError> {
+    crate::vmm::user_address_space().allocate_run(bytes, placement)
+}
+
+fn free_run(run: PhysicalRange, align: u64) -> Result<(), AddressSpaceError> {
+    crate::vmm::user_address_space().free_run(run, align)
+}
+
+fn substitute_memory(
+    virt: VirtRange,
+    physical: PhysicalRange,
+    flags: PageFlags,
+) -> Result<(), AddressSpaceError> {
+    crate::vmm::user_address_space().substitute_memory(virt, physical, flags)
+}
+
+fn substitute_device(virt: VirtRange, region: DeviceRegion) -> Result<(), AddressSpaceError> {
+    crate::vmm::user_address_space().substitute_device(virt, region)
+}
+
+fn restore(virt: VirtRange) -> Result<(), AddressSpaceError> {
+    crate::vmm::user_address_space().restore(virt)
+}
+
+fn withdraw(virt: VirtRange) -> Result<(), AddressSpaceError> {
+    crate::vmm::user_address_space().withdraw(virt)
+}
+
 /// This backend maps at 4 KiB, the architecture's smallest granule and
 /// the one the kernel's page tables are built with.
 fn mapping_granule() -> u64 {
@@ -101,6 +129,12 @@ static VM_HOOKS: DeviceVmHooks = DeviceVmHooks {
     unmap_shared,
     commit_contiguous,
     release_contiguous,
+    allocate_run,
+    free_run,
+    substitute_memory,
+    substitute_device,
+    restore,
+    withdraw,
     mapping_granule,
     kernel_alias,
 };

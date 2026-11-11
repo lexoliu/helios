@@ -16,6 +16,7 @@ use crate::device::{
     HOSTED_DEVICE_INTERRUPT, HOSTED_DEVICE_NAME, device_address_space, device_registers,
     hosted_device_grants, interrupt_controller_counts,
 };
+use crate::vmm::host_mapping_granule;
 
 /// A linear-memory reservation large enough to carry a device window
 /// and leave the owner room below it.
@@ -256,4 +257,55 @@ fn an_interrupt_reaches_an_owner_that_is_already_parked() {
     );
     assert_eq!(lease.stats().interrupts.forwarded, 1);
     lease.reclaim();
+}
+
+/// A device region shown inside committed memory is the device itself,
+/// below the span's own bounds, and ending the view puts zeroed memory
+/// back without touching the device.
+#[test]
+fn a_substituted_device_region_is_the_device_and_restore_leaves_it_alone() {
+    use helios_hal::device::{DeviceRegion, DeviceRegionAttributes};
+    use helios_hal::iommu::PhysicalRange;
+    use helios_hal::vmm::PageFlags;
+
+    let space = device_address_space();
+    let unit = host_mapping_granule() as usize;
+    let range = space.reserve(2 * unit).expect("the host can reserve");
+    space
+        .commit(range, PageFlags::READ | PageFlags::WRITE)
+        .expect("the host can commit");
+    let registers = device_registers();
+    let region = DeviceRegion::new(
+        PhysicalRange::new(registers.as_ptr() as u64, unit as u64),
+        DeviceRegionAttributes::REGISTERS,
+    );
+    let view = VirtRange::new(range.start, unit);
+
+    space
+        .substitute_device(view, region)
+        .expect("a hosted device's region can be shown");
+
+    let shown = view.start.raw() as *mut u8;
+    // SAFETY: the view is mapped read-write and `unit` bytes long.
+    unsafe { std::ptr::copy_nonoverlapping(b"subst!".as_ptr(), shown, 6) };
+    assert_eq!(&device_registers()[..6], b"subst!", "owner to device");
+    assert_eq!(
+        space.substitute_device(view, region),
+        Err(helios_hal::vmm::AddressSpaceError::Substituted)
+    );
+
+    space.restore(view).expect("the pool can refill the view");
+
+    // SAFETY: the restored view is mapped read-write and `unit` bytes
+    // long.
+    let restored = unsafe { std::slice::from_raw_parts(shown, unit) };
+    assert!(restored.iter().all(|byte| *byte == 0), "zeroed memory");
+    assert_eq!(
+        &device_registers()[..6],
+        b"subst!",
+        "the device is untouched"
+    );
+    space
+        .release(range)
+        .expect("the owner's memory is released");
 }
