@@ -11,6 +11,7 @@ cannot.
 
 from __future__ import annotations
 
+import json
 import os
 import socket
 import subprocess
@@ -21,17 +22,21 @@ import pytest
 from bench_stub import fake_checkout, fake_inspector, records, workload
 
 from helios_bench.baseline import Baseline
+from helios_bench.cli import main as cli_main
 from helios_bench.gate import GateKind, evaluate, evaluate_paired, gate_report
-from helios_bench.manifest import load_manifest
+from helios_bench.manifest import WasmtimePin, load_manifest
 from helios_bench.plots import plot_report
 from helios_bench.render import render_gate, render_pins, render_tables
-from helios_bench.report import Report, Side, load_report, save_report
+from helios_bench.report import InstructionSampling, Report, Side, load_report, save_report
 from helios_bench.runner import (
     GAP_BENCH,
     NetworkOptions,
     RunOptions,
+    UnitOrder,
     kernel_pgo_uncovered,
+    kernel_profiles,
     plan,
+    read_instruction_sampling,
     run_suite,
 )
 from helios_bench.wasi_apps import gap_bench
@@ -44,6 +49,8 @@ WORKLOADS = [
     workload("cpython-json", "compute"),
     workload("hostcall-loop", "hostcall"),
 ]
+
+BASELINE_FORK = WasmtimePin(repository="lexoliu/wasmtime", revision="2fb47b20" + "0" * 32)
 
 
 def boot_order(order_log: Path) -> list[tuple[str, str, str, str]]:
@@ -267,6 +274,122 @@ def test_a_paired_side_boots_the_two_images_back_to_back(driver, tmp_path) -> No
         }
 
 
+def three_images(driver, tmp_path) -> list:
+    """The candidate, the baseline and the baseline's rebuild (#479).
+
+    The rebuild is the baseline commit built against a second profile; a
+    checkout of its own here only so the order log can tell its boots
+    from the baseline's.
+    """
+    fake_checkout(tmp_path / "rebuild")
+    images = images_of(driver, tmp_path, paired=True)
+    rebuild = driver.HeliosImage(
+        name="helios-baseline-rebuild",
+        workspace_root=tmp_path / "rebuild",
+        out_dir=tmp_path / "out" / "helios-baseline-rebuild",
+    )
+    rebuild.out_dir.mkdir(parents=True)
+    return [*images, rebuild]
+
+
+def run_three(driver, tmp_path, images: list, unit_orders: dict[str, str] | None) -> list[str]:
+    driver.run_helios(
+        Path("tools/wasi-apps/workloads.json"),
+        images,
+        1,
+        WORKLOADS,
+        "x86-64",
+        "kvm",
+        driver.HostServices(tmp_path, "10.77.0.1", "10.77.0.1"),
+        timeout_seconds=60,
+        side_timeout_seconds=600,
+        build_timeout_seconds=60,
+        skip_build=False,
+        control_workload=None,
+        keep_going=True,
+        unit_orders=unit_orders,
+    )
+    return [guest for _, guest, _, _ in boot_order(tmp_path / "order")]
+
+
+def test_a_rebuilt_side_boots_three_images_with_the_baseline_in_the_middle(driver, tmp_path) -> None:
+    """Every unit boots all three images back to back, and the order
+    alternates end for end: the baseline is always the middle boot, and
+    the candidate and the rebuild trade the two ends, so whatever a slot
+    does to a boot lands on the candidate's shift and on the build drift
+    alike."""
+    images = three_images(driver, tmp_path)
+    assert run_three(driver, tmp_path, images, None) == [
+        "candidate",
+        "baseline",
+        "rebuild",
+        "rebuild",
+        "baseline",
+        "candidate",
+        "candidate",
+        "baseline",
+        "rebuild",
+    ]
+    for image in images:
+        assert set(records(image.out_dir / "helios.jsonl")) == {
+            "quickjs-loop",
+            "cpython-json",
+            "hostcall-loop",
+        }
+
+
+def test_a_stated_unit_order_is_obeyed(driver, tmp_path) -> None:
+    """A reconfirm states each unit's order — the reverse of the pass it
+    repeats — rather than inheriting whatever the unit's position in its
+    own, smaller selection would give it."""
+    images = three_images(driver, tmp_path)
+    orders = {"quickjs-loop": "reversed", "cpython-json": "reversed", "hostcall-loop": "forward"}
+    assert run_three(driver, tmp_path, images, orders) == [
+        "rebuild",
+        "baseline",
+        "candidate",
+        "rebuild",
+        "baseline",
+        "candidate",
+        "candidate",
+        "baseline",
+        "rebuild",
+    ]
+
+
+def test_a_unit_order_is_stated_for_every_unit_or_none(driver, tmp_path) -> None:
+    images = three_images(driver, tmp_path)
+    with pytest.raises(SystemExit, match="every unit or for none"):
+        run_three(driver, tmp_path, images, {"quickjs-loop": "reversed"})
+    with pytest.raises(SystemExit, match="is not WORKLOAD=forward"):
+        driver.parse_unit_orders(["quickjs-loop=backwards"])
+    with pytest.raises(SystemExit, match="twice"):
+        driver.parse_unit_orders(["quickjs-loop=forward", "quickjs-loop=reversed"])
+    # The runner and the driver spell the two orders the same way.
+    assert {order.value for order in UnitOrder} == {driver.UNIT_ORDER_FORWARD, driver.UNIT_ORDER_REVERSED}
+
+
+def test_the_driver_parses_the_rebuild_flags(tmp_path) -> None:
+    """The rebuild needs the profiled baseline it rebuilds."""
+    parsed = (
+        gap_bench()
+        .build_parser()
+        .parse_args(
+            [
+                "--helios-baseline-rebuild-profile-use",
+                str(tmp_path / "rebuild.profdata"),
+                "--helios-baseline-rebuild-out-dir",
+                str(tmp_path / "out"),
+                "--helios-unit-order",
+                "quickjs-loop=reversed",
+            ]
+        )
+    )
+    assert parsed.helios_baseline_rebuild_profile_use == tmp_path / "rebuild.profdata"
+    assert parsed.helios_baseline_rebuild_out_dir == tmp_path / "out"
+    assert parsed.helios_unit_orders == ["quickjs-loop=reversed"]
+
+
 def test_an_unpaired_side_still_boots_one_guest_per_class(driver, tmp_path) -> None:
     """The ordinary run is untouched: one guest per class, as published."""
     images = images_of(driver, tmp_path, paired=False)
@@ -360,7 +483,13 @@ def test_the_driver_parses_the_baseline_flags_the_plan_emits(tmp_path, reuse) ->
         out_dir=tmp_path,
         advisory=True,
         sides=frozenset({Side.HELIOS, Side.HELIOS_BASELINE}),
-        baseline=Baseline(ref="merge-base", sha="a" * 40, worktree=tmp_path / "worktree"),
+        baseline=Baseline(
+            ref="merge-base",
+            sha="a" * 40,
+            worktree=tmp_path / "worktree",
+            wasmtime=BASELINE_FORK,
+            fork_root="",
+        ),
         network=NetworkOptions(reuse_host_listeners=reuse),
     )
     commands = [
@@ -514,6 +643,35 @@ def test_a_paired_report_names_each_side_tooling_revision(paired_regression_repo
     pins = render_pins(paired_regression_report)
     assert f"| `helios-inspector`/`helios-cli` | `{run.inspector_git_sha}` |" in pins
     assert f"| `helios-inspector`/`helios-cli`, baseline | `{run.baseline_inspector_git_sha}` |" in pins
+
+
+def test_a_paired_report_names_each_columns_wasmtime_fork(paired_regression_report: Report) -> None:
+    """#486: each column is built against the fork its own commit pins,
+    and the header, the pins table and the gate's column labels name it."""
+    candidate_fork = paired_regression_report.pins.wasmtime_revision
+    baseline_fork = "2fb47b20" + "c" * 32
+    report = paired_regression_report.model_copy(
+        update={
+            "pins": paired_regression_report.pins.model_copy(
+                update={"baseline_wasmtime_revision": baseline_fork}
+            )
+        }
+    )
+    tables = render_tables(report)
+    header = next(line for line in tables.splitlines() if line.startswith("Helios `"))
+    assert f"Wasmtime `{candidate_fork[:12]}`" in header
+    assert f"Wasmtime `{baseline_fork[:12]}`" in header
+    pins = render_pins(report)
+    assert f"| Vendored Wasmtime | `{candidate_fork}` |" in pins
+    assert f"| Vendored Wasmtime, baseline | `{baseline_fork}` |" in pins
+    result = evaluate_paired(report)
+    assert result is not None
+    assert f"Wasmtime `{candidate_fork[:12]}`" in result.candidate_label
+    assert f"Wasmtime `{baseline_fork[:12]}`" in result.baseline_label
+    # A report from before the field names no column's fork rather than
+    # the candidate's for both.
+    legacy = evaluate_paired(paired_regression_report)
+    assert legacy is not None and "Wasmtime" not in legacy.baseline_label + legacy.candidate_label
 
 
 def test_an_unpaired_report_keeps_its_three_columns(baseline_report: Report) -> None:
@@ -961,6 +1119,7 @@ def test_a_pgo_run_reports_without_a_linux_side(tmp_path) -> None:
             memory="6G",
             linux_vm_memory="4G",
             net_backend="tap",
+            rpc_transport="serial",
             devices=["virtio-net-pci"],
             wasm_artifacts={},
             bootfs_cwasm={},
@@ -1026,3 +1185,380 @@ def test_a_pgo_pairing_names_the_profile_each_column_read(paired_regression_repo
     assert "release helios-v0.1.0" in result.baseline_label
     assert "target/pgo-candidate/helios-kernel.profdata" in result.candidate_label
     assert result.baseline_label != result.candidate_label
+
+
+def test_a_paired_baseline_can_carry_its_own_profile(tmp_path) -> None:
+    """#384: each column of a paired run builds against a profile
+    collected from the commit it carries.
+
+    The plan asks the driver for the baseline's profile the way it asks
+    for the candidate's, and the driver's parser accepts it — the argv and
+    the parser are edited together.
+    """
+    profile = tmp_path / "helios-kernel.profdata"
+    profile.write_bytes(b"\x00" * 16)
+    rebuild = tmp_path / "rebuild" / "helios-kernel.profdata"
+    rebuild.parent.mkdir()
+    rebuild.write_bytes(b"\x01" * 16)
+    options = RunOptions(
+        lane=load_manifest().lane("x86-64-kvm"),
+        out_dir=tmp_path / "out",
+        advisory=True,
+        sides=frozenset({Side.HELIOS, Side.HELIOS_BASELINE, Side.HELIOS_BASELINE_REBUILD}),
+        baseline=Baseline(
+            ref="dev", sha="b" * 40, worktree=tmp_path / "worktree", wasmtime=BASELINE_FORK, fork_root=""
+        ),
+        baseline_profile_use=profile,
+        baseline_rebuild_profile_use=rebuild,
+    )
+    # The named profile makes the second image a profile-use build of its
+    # own commit wherever the lane's release build is one.
+    assert options.baseline_kernel_build == "profile-use"
+    invocations = [
+        command.argv
+        for command in plan(options, load_manifest(), WORKLOADS)
+        if command.argv[1:2] == [str(GAP_BENCH)]
+    ]
+    assert len(invocations) == 1
+    args = gap_bench().build_parser().parse_args(invocations[0][2:])
+    assert args.helios_baseline_root == tmp_path / "worktree"
+    assert args.helios_baseline_profile_use == profile
+    assert not args.helios_baseline_without_kernel_profile
+    # The rebuild of #479: the same commit once more, against the second
+    # collection, written beside the other two columns.
+    assert args.helios_baseline_rebuild_profile_use == rebuild
+    assert args.helios_baseline_rebuild_out_dir == tmp_path / "out" / "helios-baseline-rebuild"
+    # Every unit's boot order is the runner's statement, alternating.
+    assert args.helios_unit_orders == [
+        "quickjs-loop=forward",
+        "cpython-json=reversed",
+        "hostcall-loop=forward",
+    ]
+
+
+def test_a_per_run_baseline_profile_needs_its_rebuild(tmp_path) -> None:
+    """#479: run 38940834451 paired one commit against an empty commit on
+    top of it, each built from its own collection, and the gate called
+    `fs-smallfiles` 11.2% faster. A baseline built against a per-run
+    collection is measured against a second build of itself or not at all."""
+    profile = tmp_path / "helios-kernel.profdata"
+    profile.write_bytes(b"\x00" * 16)
+    common = {
+        "lane": load_manifest().lane("x86-64-kvm"),
+        "out_dir": tmp_path / "out",
+        "advisory": True,
+        "sides": frozenset({Side.HELIOS, Side.HELIOS_BASELINE, Side.HELIOS_BASELINE_REBUILD}),
+        "baseline": Baseline(
+            ref="dev", sha="b" * 40, worktree=tmp_path / "worktree", wasmtime=BASELINE_FORK, fork_root=""
+        ),
+    }
+    with pytest.raises(SystemExit, match="--baseline-rebuild-profile-use"):
+        RunOptions(**common, baseline_profile_use=profile)
+    with pytest.raises(SystemExit, match="second, independent collection"):
+        RunOptions(**common, baseline_profile_use=profile, baseline_rebuild_profile_use=profile)
+    with pytest.raises(SystemExit, match="which is not set"):
+        RunOptions(**common, baseline_rebuild_profile_use=profile)
+
+
+def test_a_baseline_profile_needs_the_pairing_it_profiles(tmp_path) -> None:
+    """--baseline-profile-use with no --baseline-ref names a profile for
+    an image that does not exist."""
+    profile = tmp_path / "helios-kernel.profdata"
+    profile.write_bytes(b"\x00" * 16)
+    with pytest.raises(SystemExit, match="--baseline-ref"):
+        RunOptions(
+            lane=load_manifest().lane("x86-64-kvm"),
+            out_dir=tmp_path / "out",
+            advisory=True,
+            sides=frozenset({Side.HELIOS, Side.HELIOS_BASELINE}),
+            baseline_profile_use=profile,
+        )
+
+
+def test_the_plain_control_reads_no_profile(tmp_path) -> None:
+    """--baseline-kernel-build release is the PGO-versus-plain control: a
+    profile on it would be a different build wearing the control's name."""
+    profile = tmp_path / "helios-kernel.profdata"
+    profile.write_bytes(b"\x00" * 16)
+    with pytest.raises(SystemExit, match="the plain control reads no profile"):
+        RunOptions(
+            lane=load_manifest().lane("x86-64-kvm"),
+            out_dir=tmp_path / "out",
+            advisory=True,
+            sides=frozenset({Side.HELIOS, Side.HELIOS_BASELINE}),
+            baseline=Baseline(
+                ref="dev", sha="b" * 40, worktree=tmp_path / "worktree", wasmtime=BASELINE_FORK, fork_root=""
+            ),
+            baseline_profile_use=profile,
+            plain_baseline=True,
+        )
+
+
+def test_a_per_column_baseline_profile_names_itself(tmp_path, monkeypatch) -> None:
+    """#384: the baseline column's label is its own collection's path,
+    not the fetched record both columns would otherwise read."""
+    record = tmp_path / "fetched.json"
+    record.write_text(
+        json.dumps(
+            {
+                "source": "collection",
+                "head_branch": "dev",
+                "head_sha": "a" * 40,
+                "run_id": "42",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("helios_bench.runner.KERNEL_PROFILE_RECORD", record)
+    profile = tmp_path / "pgo-baseline" / "helios-kernel.profdata"
+    profile.parent.mkdir(parents=True)
+    profile.write_bytes(b"\x00" * 16)
+    rebuild = tmp_path / "pgo-baseline-rebuild" / "helios-kernel.profdata"
+    options = RunOptions(
+        lane=load_manifest().lane("x86-64-kvm"),
+        out_dir=tmp_path / "out",
+        advisory=True,
+        sides=frozenset({Side.HELIOS, Side.HELIOS_BASELINE, Side.HELIOS_BASELINE_REBUILD}),
+        baseline=Baseline(
+            ref="dev", sha="b" * 40, worktree=tmp_path / "worktree", wasmtime=BASELINE_FORK, fork_root=""
+        ),
+        profile_use=tmp_path / "pgo-candidate" / "helios-kernel.profdata",
+        baseline_profile_use=profile,
+        baseline_rebuild_profile_use=rebuild,
+    )
+    profiles = kernel_profiles(options)
+    assert profiles.baseline == str(profile)
+    assert profiles.baseline != "dev@aaaaaaa run 42", "the fetched record is not this column's profile"
+    assert profiles.candidate == str(tmp_path / "pgo-candidate" / "helios-kernel.profdata")
+    assert profiles.baseline_rebuild == str(rebuild)
+
+
+def test_the_baselines_uncovered_count_reads_its_own_profile_build(tmp_path) -> None:
+    """#384: a per-column baseline profile keys the pgo-kernels directory
+    the uncovered list is read from, the same way the candidate's does.
+
+    The stand-in inspector keys its answer by the workspace root and the
+    flags it is asked with, so the list the count reads is the one the
+    baseline worktree's own profile-use build wrote — the fetched-profile
+    build beside it keeps a different list under a different directory.
+    """
+    lane = load_manifest().lane("x86-64-kvm")
+    checkout = fake_checkout(tmp_path / "baseline")
+    inspector = fake_inspector(checkout / "target" / "release")
+    profile = tmp_path / "helios-kernel.profdata"
+    profile.write_bytes(b"\x00" * 16)
+    answered = subprocess.run(
+        [
+            str(inspector),
+            "vm",
+            "--arch",
+            lane.helios_arch,
+            "--release",
+            "--accel",
+            lane.accelerator,
+            "--profile-use",
+            str(profile),
+            "kernel-path",
+        ],
+        env={**os.environ, "HELIOS_WORKSPACE_ROOT": str(checkout)},
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    listing = Path(answered.stdout.strip() + ".pgo-uncovered.txt")
+    listing.write_text(
+        "# uncovered: 3 of 42 functions (7.1%)\n"
+        "# warnings emitted: 3 in 2 crates\n"
+        "warning: a.1-cgu.0: no profile data available for function _A Hash = 1 up to 0 count discarded\n"
+        "warning: a.1-cgu.0: no profile data available for function _B Hash = 2 up to 0 count discarded\n"
+        "warning: b.2-cgu.3: no profile data available for function _C Hash = 3 up to 0 count discarded\n",
+        encoding="utf-8",
+    )
+    assert kernel_pgo_uncovered(checkout, lane, profile) == (3, 42)
+    # The plain release build beside it kept no list.
+    assert kernel_pgo_uncovered(checkout, lane, None) is None
+
+
+# Instruction sampling in a pairing (#475). Run 38886442613 sampled the
+# candidate alone and reported +4.8-8.5% on compute that was the sampler:
+# every candidate boot ran its timer ten times as often and a drain task
+# besides, and the baseline boots ran neither.
+
+
+def sampled_side(driver, tmp_path, monkeypatch) -> list:
+    monkeypatch.setenv("HELIOS_BENCH_INSTRUCTION_PROFILE", "1")
+    images = images_of(driver, tmp_path, paired=True)
+    run_side(driver, tmp_path, images)
+    return images
+
+
+def test_a_sampled_pairing_samples_both_images_alike(driver, tmp_path, monkeypatch) -> None:
+    """Both columns carry the sampler, so the pair still compares like with like."""
+    images = sampled_side(driver, tmp_path, monkeypatch)
+
+    for image in images:
+        profiles = sorted(path.name for path in image.out_dir.glob("*.pc.folded"))
+        assert profiles == [
+            "helios-cpython-json.pc.folded",
+            "helios-hostcall-loop.pc.folded",
+            "helios-quickjs-loop.pc.folded",
+        ], f"every boot of the {image.name} image writes its instruction profile"
+        record = json.loads((image.out_dir / driver.INSTRUCTION_SAMPLING_RECORD).read_text(encoding="utf-8"))
+        assert record == {"period_nanos": 1_000_000, "boots": 3, "samples": 21, "dropped": 3}
+
+
+def test_an_unsampled_run_writes_no_profile_and_no_record(driver, tmp_path) -> None:
+    images = images_of(driver, tmp_path, paired=True)
+    run_side(driver, tmp_path, images)
+
+    for image in images:
+        assert not list(image.out_dir.glob("*.pc.folded"))
+        assert not (image.out_dir / driver.INSTRUCTION_SAMPLING_RECORD).exists()
+
+
+def test_a_baseline_that_predates_the_sampler_is_refused_before_any_boot(
+    driver, tmp_path, monkeypatch
+) -> None:
+    """Sampling one column alone is the bug, so a baseline whose own
+    inspector cannot sample refuses the run, naming why, before either
+    image boots."""
+    inspector = tmp_path / "baseline" / "target" / "release" / "helios-inspector"
+    monkeypatch.setenv("HELIOS_TEST_SAMPLER_ABSENT", str(inspector))
+    with pytest.raises(driver.AsymmetricInstructionSampling) as error:
+        sampled_side(driver, tmp_path, monkeypatch)
+    assert "helios-baseline image cannot be sampled" in str(error.value)
+    assert str(inspector) in str(error.value)
+    assert "--instruction-profile-output" in str(error.value)
+    assert not (tmp_path / "order").exists(), "no boot of either image ran"
+
+
+def test_columns_whose_guests_sample_at_different_periods_are_refused(driver, tmp_path, monkeypatch) -> None:
+    """Asked alike is not sampled alike: the period is the guest's own."""
+    (tmp_path / "baseline" / "sampling-period").write_text("250000", encoding="utf-8")
+    with pytest.raises(driver.AsymmetricInstructionSampling, match="250000 ns"):
+        sampled_side(driver, tmp_path, monkeypatch)
+
+
+def test_a_boot_that_reports_no_capture_ends_the_run(driver, tmp_path) -> None:
+    """Not a lost boot to record and continue past: the column it belongs
+    to is no longer known to carry the sampler."""
+    images = images_of(driver, tmp_path, paired=True)
+    with pytest.raises(driver.AsymmetricInstructionSampling, match="0 capture reports"):
+        driver.sampled_boot(images[1], images[1].out_dir / "helios-x.pc.folded", ["unrelated"])
+
+
+def sampling(period: int = 1_000_000) -> InstructionSampling:
+    return InstructionSampling(period_nanos=period, boots=3, samples=21, dropped=3)
+
+
+def test_a_pairing_sampled_alike_keeps_its_verdicts_and_says_so(
+    paired_regression_report: Report,
+) -> None:
+    paired_regression_report.run.instruction_sampling = sampling()
+    paired_regression_report.run.baseline_instruction_sampling = sampling()
+
+    result = evaluate_paired(paired_regression_report)
+    assert result.sampling_period_nanos == 1_000_000
+    assert result.blocking and result.headline_regressions
+    text = render_gate(gate_report(paired_regression_report, None), "x86-64-kvm")
+    assert "Both columns were sampled at the instruction level, every 1 ms" in text
+    assert "**regression**" in text
+    tables = render_tables(paired_regression_report)
+    assert "Instruction sampling was on" in tables
+    assert "both images alike" in tables
+    assert "includes the sampler's overhead" in tables
+
+
+@pytest.mark.parametrize(
+    ("candidate", "baseline"),
+    [(sampling(), None), (None, sampling()), (sampling(), sampling(250_000))],
+)
+def test_a_pairing_sampled_unalike_is_refused(paired_regression_report: Report, candidate, baseline) -> None:
+    paired_regression_report.run.instruction_sampling = candidate
+    paired_regression_report.run.baseline_instruction_sampling = baseline
+    with pytest.raises(SystemExit, match="the paired comparison is refused"):
+        evaluate_paired(paired_regression_report)
+
+
+def test_a_sampled_candidate_refuses_the_cross_run_table_and_keeps_the_paired_one(
+    paired_regression_report: Report, baseline_report: Report
+) -> None:
+    """`dev` is never sampled, so a sampled candidate's cross-run shift is
+    partly the sampler; the paired table, sampled alike, still stands."""
+    paired_regression_report.run.instruction_sampling = sampling()
+    paired_regression_report.run.baseline_instruction_sampling = sampling()
+
+    report = gate_report(paired_regression_report, baseline_report)
+    assert report.paired is not None and report.cross_run is None
+    assert report.cross_run_refused is not None
+    assert report.blocking, "the paired half still blocks on its own verdicts"
+    text = render_gate(report, "x86-64-kvm")
+    assert "Refused: the baseline run 1001 was not sampled" in text
+    assert "neither blocks nor passes" in text
+    with pytest.raises(SystemExit, match="cross-run comparison is refused"):
+        evaluate(baseline_report, paired_regression_report)
+
+
+def test_an_unpaired_sampled_run_against_dev_is_refused(
+    regressed_report: Report, baseline_report: Report, tmp_path
+) -> None:
+    regressed_report.run.instruction_sampling = sampling()
+    candidate = tmp_path / "candidate.json"
+    dev = tmp_path / "dev.json"
+    save_report(regressed_report, candidate)
+    save_report(baseline_report, dev)
+    with pytest.raises(SystemExit, match="not paired and the cross-run comparison is refused"):
+        cli_main(["gate", "--candidate", str(candidate), "--baseline", str(dev)])
+
+
+def test_a_sampled_dev_report_refuses_an_unsampled_candidate(
+    regressed_report: Report, baseline_report: Report
+) -> None:
+    """The other direction: a sampled dispatch on `dev` is the newest dev
+    report the next run's gate fetches."""
+    baseline_report.run.instruction_sampling = sampling()
+    report = gate_report(regressed_report, baseline_report)
+    assert report.cross_run is None and report.cross_run_refused is not None
+    assert "sampled every 1 ms on each processor" in report.cross_run_refused.reason
+
+
+def test_the_sampling_record_reaches_the_run_record(tmp_path, monkeypatch) -> None:
+    driver = gap_bench()
+    options = RunOptions(
+        lane=load_manifest().lane("x86-64-kvm"),
+        out_dir=tmp_path,
+        advisory=True,
+        sides=frozenset({Side.HELIOS, Side.HELIOS_BASELINE}),
+        baseline=Baseline(
+            ref="merge-base",
+            sha="a" * 40,
+            worktree=tmp_path / "worktree",
+            wasmtime=BASELINE_FORK,
+            fork_root="",
+        ),
+    )
+    monkeypatch.setenv("HELIOS_BENCH_INSTRUCTION_PROFILE", "1")
+    (tmp_path / "helios").mkdir()
+    (tmp_path / "helios" / driver.INSTRUCTION_SAMPLING_RECORD).write_text(
+        sampling().model_dump_json(), encoding="utf-8"
+    )
+    assert read_instruction_sampling(options, Side.HELIOS) == sampling()
+    with pytest.raises(SystemExit, match="helios_baseline column has no sampling record"):
+        read_instruction_sampling(options, Side.HELIOS_BASELINE)
+    monkeypatch.setenv("HELIOS_BENCH_INSTRUCTION_PROFILE", "0")
+    with pytest.raises(SystemExit, match="does not sample .* helios column has a sampling record"):
+        read_instruction_sampling(options, Side.HELIOS)
+
+
+def test_a_sampled_run_cannot_be_published(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("helios_bench.runner.host_deviations", lambda lane: [])
+    monkeypatch.setenv("HELIOS_BENCH_INSTRUCTION_PROFILE", "1")
+    manifest = load_manifest()
+    options = RunOptions(
+        lane=manifest.lane("x86-64-kvm"),
+        out_dir=tmp_path,
+        advisory=False,
+        sides=frozenset({Side.HELIOS}),
+    )
+    with pytest.raises(SystemExit, match="instruction sampling requested for diagnosis"):
+        run_suite(options, manifest, dry_run=True)

@@ -339,6 +339,10 @@ mod tests {
             fn write_bytes(&self, bytes: &[u8]) {
                 WIRE.write(bytes);
             }
+
+            fn enable_receive_interrupt(&self) {}
+
+            fn disable_receive_interrupt(&self) {}
         }
 
         impl DebugSerialAccess for Port {
@@ -436,6 +440,10 @@ mod tests {
             fn write_bytes(&self, bytes: &[u8]) {
                 WIRE.write(bytes);
             }
+
+            fn enable_receive_interrupt(&self) {}
+
+            fn disable_receive_interrupt(&self) {}
         }
 
         impl DebugSerialAccess for Port {

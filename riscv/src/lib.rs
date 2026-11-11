@@ -32,13 +32,21 @@ mod debug_state {
     >;
 }
 
-use ns16550a::Uart;
+use ns16550a::{Break, DLAB, ParityBit, ParitySelect, StickParity, StopBits, Uart, WordLength};
+
+/// 16550 interrupt-enable register; this port arms only the
+/// received-data condition.
+const UART_IER: usize = 1;
+const UART_IER_RDI: u8 = 1 << 0;
 
 /// Debugger byte transport backed by the machine's boot UART. Kernel tracing
 /// stays in memory so the line remains reserved for RPC traffic after boot.
 #[derive(Clone, Copy)]
 pub(crate) struct DebugTransport {
     uart_base: usize,
+    /// The PLIC source the same device-tree node routes the port's
+    /// interrupt to.
+    plic_source: net::InterruptSourceId,
 }
 
 impl DebugTransport {
@@ -61,8 +69,21 @@ impl DebugTransport {
             .find_node(path)
             .or_else(|| fdt.aliases().and_then(|aliases| aliases.resolve_node(path)))?;
         let region = node.reg()?.next()?;
+        // The PLIC's specifier is a bare source number, the same
+        // one-cell binding the grant walk decodes.
+        let plic_source = helios_virtio::node_interrupt(fdt, &node)
+            .and_then(|interrupt| NonZeroU32::new(interrupt.number))
+            .map(net::InterruptSourceId)
+            .unwrap_or_else(|| {
+                panic!(
+                    "the {} debug UART node declares no PLIC source in its interrupts cell; \
+                     the serial line could only be polled",
+                    node.name
+                )
+            });
         Some(Self {
             uart_base: region.starting_address as usize,
+            plic_source,
         })
     }
 
@@ -88,6 +109,18 @@ impl ByteSerial for DebugTransport {
     fn write_bytes(&self, bytes: &[u8]) {
         DebugTransport::write_bytes(self, bytes);
     }
+
+    /// Received data is the only condition this port arms, so a plain
+    /// write of exactly that bit rather than a read-modify-write.
+    /// Idempotent, and callable from interrupt context: a register
+    /// write, no lock, no allocation.
+    fn enable_receive_interrupt(&self) {
+        unsafe { ((self.uart_base + UART_IER) as *mut u8).write_volatile(UART_IER_RDI) };
+    }
+
+    fn disable_receive_interrupt(&self) {
+        unsafe { ((self.uart_base + UART_IER) as *mut u8).write_volatile(0) };
+    }
 }
 
 use helios_virtio::DeviceType;
@@ -105,13 +138,16 @@ pub(crate) fn count_virtio_mmio_devices(fdt: &Fdt<'_>, expected: DeviceType) -> 
 }
 
 use core::arch::{asm, global_asm};
-use core::num::NonZeroUsize;
+use core::num::{NonZeroU32, NonZeroUsize};
 use core::ops::Range;
 use core::sync::atomic::{AtomicUsize, Ordering, compiler_fence};
 
 use arrayvec::ArrayVec;
 use fdt::Fdt;
-use helios_hal::cpu::{Cpu, Instant, ProcessorId, current_processor};
+use helios_hal::cpu::{
+    Cpu, GUEST_STACK_LIMIT_OFFSET, Instant, ProcessorId, Timebase, TimerInterrupt,
+    current_processor,
+};
 use helios_hal::critical_section::ProcessorIdentity;
 use helios_hal::memory::MemoryRegion;
 use helios_hal::serial::ByteSerial;
@@ -296,16 +332,33 @@ unsafe impl critical_section::Impl for SupervisorCriticalSection {
     }
 }
 
+/// The hart's local block, addressed by `tp` once [`HartRuntime::install`]
+/// has run.
+///
+/// The layout is `#[repr(C)]` because compiled guest code reads
+/// `guest_stack_limit` as `GUEST_STACK_LIMIT_OFFSET(tp)`; the offset is
+/// asserted below.
+#[repr(C)]
 struct HartRuntime {
+    /// The stack every trap on this hart is built on once
+    /// [`HartRuntime::install`] has published it through `sscratch`.
+    trap_stack: Range<usize>,
+    /// The stack limit of the guest running on this hart, under
+    /// [`GUEST_STACK_LIMIT_OFFSET`]'s contract: Wasmtime publishes it through
+    /// `wasmtime_processor_stack_limit`, and any hart may store the interrupt
+    /// sentinel into it.
+    guest_stack_limit: AtomicUsize,
     hart_id: ProcessorId,
     timer: Timer<RiscvCpu>,
     wasmtime_tls: WasmtimeTlsSlots,
     external_interrupts: Option<net::ExternalInterrupts>,
     program_service: Option<debug_state::ProgramService>,
-    /// The stack every trap on this hart is built on once
-    /// [`HartRuntime::install`] has published it through `sscratch`.
-    trap_stack: Range<usize>,
 }
+
+const _: () = assert!(
+    core::mem::offset_of!(HartRuntime, guest_stack_limit) == GUEST_STACK_LIMIT_OFFSET as usize,
+    "compiled guest code would compare its stack pointer against the wrong word"
+);
 
 impl HartRuntime {
     /// Publishes this runtime as the hart's identity.
@@ -360,7 +413,7 @@ fn kernel_console(
 pub struct RiscvCpu {
     bootstrap_hart: ProcessorId,
     hart_count: usize,
-    timebase_frequency: u64,
+    timebase: Timebase,
     fdt_addr: usize,
 }
 
@@ -368,13 +421,13 @@ impl RiscvCpu {
     pub(crate) fn new(
         bootstrap_hart: ProcessorId,
         hart_count: usize,
-        timebase_frequency: u64,
+        timebase: Timebase,
         fdt_addr: usize,
     ) -> Self {
         Self {
             bootstrap_hart,
             hart_count,
-            timebase_frequency,
+            timebase,
             fdt_addr,
         }
     }
@@ -402,6 +455,9 @@ extern "Rust" fn helios_current_processor() -> ProcessorId {
 }
 
 impl Cpu for RiscvCpu {
+    // SBI `set_timer` programs this hart's one-shot comparator.
+    const TIMER_INTERRUPT: TimerInterrupt = TimerInterrupt::Deadline;
+
     fn processor_count(&self) -> usize {
         self.hart_count
     }
@@ -474,8 +530,8 @@ impl Cpu for RiscvCpu {
         Instant::new(riscv::register::time::read64())
     }
 
-    fn timer_frequency(&self) -> u64 {
-        self.timebase_frequency
+    fn timebase(&self) -> Timebase {
+        self.timebase
     }
 
     fn set_deadline(&self, deadline: Instant) {
@@ -484,15 +540,10 @@ impl Cpu for RiscvCpu {
 
     fn publish_executable(&self, ptr: *const u8, len: usize) {
         helios_kernel::runtime_memory::publish_code_memory(ptr, len);
-        // `fence.i` is the only ordering RISC-V defines between a store to an
-        // instruction's memory and a fetch of it, and it is per-hart. The
-        // range is published before any other hart can be steered into it, so
-        // fencing the publishing hart is what the hart that executes next
-        // needs; every other hart reaches this code through a scheduler
-        // handoff that fences on its own side.
-        unsafe {
-            core::arch::asm!("fence.i", options(nostack, preserves_flags));
-        }
+        // Every hart is fenced before the range is handed out. A range is
+        // executable only between this call and `unpublish_executable`, so
+        // a reused range is fenced here again before anything runs it.
+        fence_instruction_streams();
     }
 
     fn unpublish_executable(&self, ptr: *const u8, len: usize) {
@@ -550,8 +601,10 @@ fn trap_dispatch(tf: &mut TrapFrame) {
     }
     match riscv::register::scause::read().cause().try_into() {
         Ok(Trap::Interrupt(Interrupt::SupervisorTimer)) => {
+            // Every hart's timer interrupt ends the slice of every guest
+            // on the machine that has run one.
             if let Some(program_service) = current_hart_runtime().program_service.as_ref() {
-                program_service.increment_epoch();
+                program_service.preempt_overdue_guests();
             }
             current_hart_runtime().timer.handle_interrupt();
         }
@@ -593,9 +646,14 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
         hart_count <= MAX_TRACKED_HARTS,
         "FDT describes {hart_count} harts but this backend tracks at most {MAX_TRACKED_HARTS}"
     );
-    let timebase_frequency = first_cpu.timebase_frequency() as u64;
+    let timebase = Timebase::new(first_cpu.timebase_frequency() as u64);
+    // QEMU delivers the user payload through `-initrd` and publishes its
+    // physical range in `/chosen`; the bytes stay borrowed for the
+    // kernel's lifetime, so the range is carved out of the memory the
+    // allocator is primed with below.
+    let initrd = initrd_range(&fdt);
     let allocator_window = allocator_window();
-    let memory_regions = collect_memory_regions(fdt.memory(), allocator_window.clone());
+    let memory_regions = collect_memory_regions(fdt.memory(), allocator_window.clone(), &initrd);
     let current_hart = ProcessorId::new(hart_id as u16);
     let bootstrap_processor = remember_bootstrap_hart(hart_id);
     mark_hart_online(current_hart);
@@ -633,7 +691,7 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
         helios_kernel::prime_bootstrap_allocator(memory_regions.iter().copied(), hart_count);
     }
 
-    let debug_state = shared_debug_state(timebase_frequency, hart_count);
+    let debug_state = shared_debug_state(timebase, hart_count, initrd.clone());
     let has_debug_transport = publish_debug_transport(DebugTransport::discover(&fdt));
     let watchdog = shared_watchdog(&fdt);
     let has_vsock = vsock::has_vsock_device(&fdt);
@@ -645,14 +703,9 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
     // device tree describes no console has no line to carry it at all.
     let console = kernel_console(
         debug_state.clone(),
-        has_debug_transport && (!helios_kernel::has_embedded_system_component() || has_vsock),
+        has_debug_transport && (!debug_state.has_system_component() || has_vsock),
     );
-    let cpu = RiscvCpu::new(
-        bootstrap_processor,
-        hart_count,
-        timebase_frequency,
-        fdt_addr,
-    );
+    let cpu = RiscvCpu::new(bootstrap_processor, hart_count, timebase, fdt_addr);
     let mut devices = DeviceInventory::new();
     if has_debug_transport {
         devices = devices.with_debug_serial();
@@ -696,7 +749,7 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
             ProcessorTopology::start_all_secondaries(bootstrap_processor, hart_count)
                 .with_startup_policy(ProcessorStartupPolicy::BootstrapOnly),
         )
-        .with_timer_frequency_hz(timebase_frequency)
+        .with_timer_frequency_hz(timebase.frequency())
         .with_dma_model(DmaModel::Identity)
         .with_devices(devices),
     );
@@ -716,10 +769,15 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
         .then(|| entropy::bring_up(&fdt))
         .flatten();
     let root_entropy = (current_hart == bootstrap_processor).then(|| {
+        // No VM generation ID window is discovered on this platform yet,
+        // so the machine generation moves only through `advance`.
+        let generation = helios_kernel::MachineGeneration::new(None);
+        debug_state.install_machine_generation(generation.clone());
         let root = helios_kernel::seed_root_entropy(
             &cpu,
             helios_hal::entropy::device_tree_seed(&fdt),
             entropy_device.as_ref().map(|entropy| &entropy.device),
+            generation,
         );
         debug_state.install_root_entropy(root.clone());
         // The calendar is read once, on the bootstrap hart, before any
@@ -748,6 +806,17 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
             // controller and before any grant is published, which the
             // registry enforces.
             device::install_hooks(plic, context);
+            // The boot UART is a device the kernel drives itself: its
+            // PLIC source is enabled and prioritised like the virtio
+            // devices'. The handler masks the receive line at the port
+            // and raises the debug console's receive signal; the waiter
+            // re-arms the line while it listens.
+            if let Some(transport) = DEBUG_TRANSPORT.get().copied() {
+                interrupts.attach_debug_serial(
+                    transport.plic_source,
+                    DebugTransport::console().interrupt_handler::<DebugTransport>(),
+                );
+            }
             if let Some(network) = net::install_network_service(&cpu, &kernel, &fdt, &debug_state) {
                 interrupts.attach_network(network);
             }
@@ -793,23 +862,43 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
             interrupts
         })
     });
+    // The debug console's readers park on the UART's interrupt, so a
+    // machine that describes the UART but gives this hart no PLIC
+    // context to route it through would hang every serial read; refuse
+    // it here rather than at the first parked reader.
+    assert!(
+        current_hart != bootstrap_processor
+            || external_interrupts.is_some()
+            || DEBUG_TRANSPORT.get().is_none(),
+        "the device tree describes a debug UART but no PLIC supervisor-external context for \
+         hart {hart_id}; the serial line could only be polled"
+    );
     let mut hart_runtime = HartRuntime {
+        trap_stack: trap::allocate_trap_stack(),
+        guest_stack_limit: AtomicUsize::new(usize::MAX),
         hart_id: current_hart,
         timer: kernel.timer(),
         wasmtime_tls: WasmtimeTlsSlots::new(),
         external_interrupts,
         program_service: None,
-        trap_stack: trap::allocate_trap_stack(),
     };
     hart_runtime.install();
+    // Every hart's timer preempts the guest running on it, so every hart
+    // holds the service: the bootstrap hart installs it, and the others,
+    // which it starts only afterwards, take the installed one.
     let program_service = helios_kernel::install_component_host_program_service(
         &kernel,
         &cpu,
         &debug_state,
         read_debug_serial,
         DEBUG_SERIAL_WRITER,
-    );
-    hart_runtime.program_service = program_service;
+    )
+    .unwrap_or_else(|| {
+        debug_state.program_service().unwrap_or_else(|| {
+            panic!("RISC-V hart {hart_id} started before program service installation")
+        })
+    });
+    hart_runtime.program_service = Some(program_service);
     unsafe {
         configure_interrupts();
     }
@@ -829,13 +918,25 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
     );
 }
 
-fn shared_debug_state(timebase_frequency: u64, hart_count: usize) -> debug_state::RuntimeState {
+fn shared_debug_state(
+    timebase: Timebase,
+    hart_count: usize,
+    initrd: Range<usize>,
+) -> debug_state::RuntimeState {
     DEBUG_STATE
         .call_once(|| {
+            // The Sv48 identity map is already active, so the initrd's
+            // physical range reads directly.
+            let bytes =
+                unsafe { core::slice::from_raw_parts(initrd.start as *const u8, initrd.len()) };
+            let payload = helios_kernel::BootPayload::parse(bytes).unwrap_or_else(|error| {
+                panic!("initrd is not a valid helios-bootfs payload: {error}")
+            });
             debug_state::RuntimeState::new(
-                timebase_frequency,
+                timebase,
                 hart_count,
                 riscv::register::time::read64(),
+                payload,
             )
         })
         .clone()
@@ -864,9 +965,39 @@ fn allocator_window() -> Range<usize> {
     start..usize::MAX
 }
 
+/// The physical range QEMU placed the `-initrd` payload in, published
+/// in `/chosen` as `linux,initrd-start`/`linux,initrd-end`.
+///
+/// riscv64 does not boot through Limine — its Limine protocol entry is
+/// a higher-half handoff with paging already enabled, a different
+/// backend contract — so the payload arrives as an initrd instead.
+/// Absent or malformed properties panic: a kernel without the payload
+/// has no init to run.
+fn initrd_range(fdt: &Fdt<'_>) -> Range<usize> {
+    let chosen = fdt
+        .find_node("/chosen")
+        .unwrap_or_else(|| panic!("FDT has no /chosen node to name the initrd"));
+    let property = |name: &str| {
+        chosen
+            .property(name)
+            .and_then(|property| property.as_usize())
+            .unwrap_or_else(|| {
+                panic!("FDT /chosen/{name} is missing or malformed; the payload needs -initrd")
+            })
+    };
+    let start = property("linux,initrd-start");
+    let end = property("linux,initrd-end");
+    assert!(
+        start < end,
+        "FDT /chosen initrd range {start:#x}..{end:#x} is empty or reversed"
+    );
+    start..end
+}
+
 fn collect_memory_regions<'fdt>(
     memory: fdt::standard_nodes::Memory<'fdt, 'fdt>,
     allocator_window: Range<usize>,
+    initrd: &Range<usize>,
 ) -> ArrayVec<MemoryRegion, 8> {
     let mut regions = ArrayVec::new();
 
@@ -880,7 +1011,9 @@ fn collect_memory_regions<'fdt>(
 
             start..end
         })
-        .filter_map(move |region| intersect(region, allocator_window.clone()))
+        .filter_map(|region| intersect(region, allocator_window.clone()))
+        .flat_map(|region| subtract(region, initrd))
+        .flatten()
         .map(range_to_memory_region)
     {
         regions.try_push(region).unwrap_or_else(|_| {
@@ -889,6 +1022,18 @@ fn collect_memory_regions<'fdt>(
     }
 
     regions
+}
+
+/// `region` with `reserved` taken out of it: up to two pieces, either of
+/// which may be empty. The riscv backend's only reservation is the
+/// initrd, a single contiguous range, so a region never splits further.
+fn subtract(region: Range<usize>, reserved: &Range<usize>) -> [Option<Range<usize>>; 2] {
+    if reserved.end <= region.start || reserved.start >= region.end {
+        return [Some(region), None];
+    }
+    let below = (reserved.start > region.start).then_some(region.start..reserved.start);
+    let above = (reserved.end < region.end).then_some(reserved.end..region.end);
+    [below, above]
 }
 
 fn intersect(left: Range<usize>, right: Range<usize>) -> Option<Range<usize>> {
@@ -940,6 +1085,28 @@ fn mark_hart_online(hart: ProcessorId) {
 
 fn hart_is_online(hart: ProcessorId) -> bool {
     ONLINE_HARTS.load(Ordering::Acquire) & hart_bit(hart) != 0
+}
+
+/// Orders every hart's instruction fetch after the stores made to code memory
+/// so far.
+///
+/// `fence.i` is the only ordering RISC-V defines between a store to an
+/// instruction's memory and a fetch of it, and it affects only the hart that
+/// executes it. The current hart fences itself, then `sbi_remote_fence_i`
+/// (SBI specification, chapter 8 "RFENCE Extension", function 0) has every
+/// hart the firmware runs execute `fence.i`.
+fn fence_instruction_streams() {
+    unsafe {
+        core::arch::asm!("fence.i", options(nostack, preserves_flags));
+    }
+    // A hart mask base of `usize::MAX` addresses all available harts.
+    let ret = sbi_rt::remote_fence_i(sbi_rt::HartMask::from_mask_base(0, usize::MAX));
+    assert!(
+        ret.is_ok(),
+        "SBI remote_fence_i failed: error={} value={}",
+        ret.error,
+        ret.value
+    );
 }
 
 fn release_early_boot_harts() {
@@ -996,7 +1163,25 @@ static DEBUG_CONSOLE: helios_kernel::DebugConsole = helios_kernel::DebugConsole:
 /// device tree, so the value is installed once and read afterwards.
 fn publish_debug_transport(discovered: Option<DebugTransport>) -> bool {
     if let Some(transport) = discovered {
-        DEBUG_TRANSPORT.call_once(|| transport);
+        DEBUG_TRANSPORT.call_once(|| {
+            // The interrupt-enable register shares its offset with the
+            // high divisor latch, so the line-control register is set
+            // here — eight data bits, one stop bit, no parity, latch
+            // closed — rather than inherited from whatever the firmware
+            // left: an IER write behind an open latch would corrupt the
+            // divisor and never arm the line. Firmware already picked
+            // the divisor; it is not touched.
+            Uart::new(transport.uart_base).set_lcr(
+                WordLength::EIGHT,
+                StopBits::ONE,
+                ParityBit::DISABLE,
+                ParitySelect::EVEN,
+                StickParity::DISABLE,
+                Break::DISABLE,
+                DLAB::CLEAR,
+            );
+            transport
+        });
     }
     DEBUG_TRANSPORT.get().is_some()
 }
@@ -1266,10 +1451,25 @@ fn installed_hart_runtime() -> Option<&'static HartRuntime> {
     Some(unsafe { &*(address.get() as *const HartRuntime) })
 }
 
+/// The executing hart's guest stack-limit word, the location the kernel's
+/// engines publish stack limits to
+/// (`helios_hal::cpu::GUEST_STACK_LIMIT_OFFSET`).
 #[unsafe(no_mangle)]
-extern "C" fn wasmtime_parking_wait(_timeout_nanos: u64) {
-    riscv::asm::wfi();
+extern "C" fn wasmtime_processor_stack_limit() -> *mut usize {
+    current_hart_runtime().guest_stack_limit.as_ptr()
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn wasmtime_parking_unpark() {}
+extern "C" fn wasmtime_parking_wait(timeout_nanos: u64) -> bool {
+    helios_kernel::park_wasmtime_waiter(&current_hart_runtime().timer, timeout_nanos)
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn wasmtime_parking_unpark() {
+    helios_kernel::unpark_wasmtime_waiters();
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn wasmtime_monotonic_nanos() -> u64 {
+    helios_kernel::wasmtime_monotonic_nanos(&current_hart_runtime().timer)
+}

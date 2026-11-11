@@ -32,13 +32,15 @@ pub enum RetiredNetworkHandle {
 ///
 /// # Concurrency
 ///
-/// Multi-producer, single-consumer and lock-free in both directions.
-/// Any task, any `Drop` and any processor may push through a
+/// Multi-producer and lock-free in both directions. Any task, any
+/// `Drop` and any processor may push through a
 /// [`SocketRetirementSender`], which is why a sender is all a socket
 /// resource holds and why pushing needs no processor index. Draining
 /// belongs to the store that owns the queue and happens on that store's
-/// own turn: at the entry to every host call and when the store is
-/// torn down.
+/// own turn: in a socket's `drop` host call, at the end of each
+/// processor turn (through the handle [`StoreSocketRetirement::turn_queue`]
+/// gives the store's driver), and when the store is torn down. Those
+/// are all the same task, so drains never overlap.
 ///
 /// The queue is unbounded because how many sockets a guest opens is the
 /// guest's decision, and a bounded queue with nowhere to put an id
@@ -65,7 +67,7 @@ impl SocketRetirementQueue {
 
     /// Whether anything is waiting to be retired.
     ///
-    /// The prologue of every host call asks this first, so a call on a
+    /// The end of every processor turn asks this first, so a turn on a
     /// store where nothing has died pays one atomic load.
     pub fn is_empty(&self) -> bool {
         self.handles.is_empty()
@@ -191,12 +193,20 @@ where
     }
 
     /// Retires everything queued since the last drain.
-    ///
-    /// Called from the prologue of every host call, so the delay
-    /// between a socket's death and its connection leaving the netstack
-    /// is one host call rather than unbounded.
     pub fn drain(&self) {
         self.runtime_state.retire_network_handles(&self.queue);
+    }
+
+    /// The queue again, for the code that drives this store's turns.
+    ///
+    /// It drains at the end of each turn, so the delay between a
+    /// socket's death and its connection leaving the netstack is one
+    /// turn rather than unbounded. The driver runs on the store's own
+    /// task, so its drains and this store's never overlap.
+    pub fn turn_queue(&self) -> SocketRetirementQueue {
+        SocketRetirementQueue {
+            handles: self.queue.handles.clone(),
+        }
     }
 }
 

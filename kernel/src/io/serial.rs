@@ -8,8 +8,11 @@ pub type SerialReader = fn(&mut Vec<u8>, u32);
 
 /// Try a non-blocking read into caller-owned storage. Returns whatever bytes
 /// are immediately available up to `max_bytes`. Leaves `buffer` empty when no
-/// byte is ready. Callers that need to wait for a byte should loop with
-/// `yield_now().await` between polls rather than spinning on the port.
+/// byte is ready. Callers that need a byte that has not arrived yet wait on
+/// the debug console's receive signal — arm
+/// `DebugSerialWriter::wait_for_debug_serial_input` before this call and
+/// await it when the buffer comes back empty — rather than polling the port
+/// on a yield.
 pub fn try_read_serial(io: &impl ByteSerial, buffer: &mut Vec<u8>, max_bytes: u32) {
     buffer.clear();
     let max_bytes = max_bytes as usize;
@@ -70,6 +73,10 @@ mod tests {
         }
 
         fn write_bytes(&self, _bytes: &[u8]) {}
+
+        fn enable_receive_interrupt(&self) {}
+
+        fn disable_receive_interrupt(&self) {}
     }
 
     #[test]

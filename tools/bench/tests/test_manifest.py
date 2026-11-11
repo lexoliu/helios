@@ -6,7 +6,7 @@ from helios_bench.manifest import (
     Lane,
     fedora_image,
     load_manifest,
-    vendored_wasmtime_revision,
+    vendored_wasmtime_pin,
     wasmtime_linux_release,
 )
 from helios_bench.report import WorkloadClass
@@ -26,7 +26,9 @@ def test_manifest_lanes_are_complete() -> None:
 
 
 def test_pins_come_from_their_single_sources() -> None:
-    revision = vendored_wasmtime_revision()
+    pin = vendored_wasmtime_pin()
+    revision = pin.revision
+    assert pin.repository == "lexoliu/wasmtime"
     assert len(revision) == 40
     action = (REPO_ROOT / ".github/actions/checkout-wasmtime/action.yml").read_text(encoding="utf-8")
     assert revision in action
@@ -112,5 +114,7 @@ def test_the_suite_measures_one_lane() -> None:
     assert [lane.name for lane in manifest.lanes] == ["x86-64-kvm"]
     lane = manifest.lane("x86-64-kvm")
     assert lane.accelerator == "kvm"
+    assert lane.rpc_transport == "vsock"
+    assert lane.github_matrix_entry()["rpc-transport"] == "vsock"
     assert lane.runs_on(advisory=True) == "ubuntu-24.04"
     assert lane.runs_on(advisory=False) == "helios-bench-x86-kvm"

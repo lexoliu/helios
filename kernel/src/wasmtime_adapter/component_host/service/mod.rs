@@ -1,6 +1,8 @@
 use crate::ComponentHostNetwork;
 mod argv;
 pub(crate) use argv::ProgramArgv;
+mod environment;
+use environment::LaunchEnvironment;
 mod shared_memory;
 use shared_memory::*;
 mod memory;
@@ -46,17 +48,19 @@ use wasix_epoll::*;
 use super::*;
 use crate::process::FreeDescriptorSlots;
 use crate::wasmtime_adapter::artifact_profile::{self, ArtifactProfileError};
+use crate::wasmtime_adapter::code_map::{CodeMap, CodeRegistration};
 use crate::wasmtime_adapter::config::AotCompileHint;
 use crate::wasmtime_adapter::cwasm::{self, ArtifactTrustError, UntrustedCwasm};
+use crate::wasmtime_adapter::preemption::{GuestInterrupts, StoreInterrupts};
 use crate::wasmtime_adapter::{WasmtimeCompiledComponent, WasmtimeCompiledCoreModule};
 use crate::wasmtime_adapter::{
     WasmtimePrecompiledKind,
     wasi::{
-        DebugFileSystem, DebugFileSystemSnapshot, FsDescriptor, FsNodeKind, WasiImportSet,
-        bindings::filesystem::types as fs_types, preview1 as p1,
+        DebugFileSystem, DebugFileSystemSnapshot, FileContents, FsDescriptor, FsNodeKind,
+        WasiImportSet, bindings::filesystem::types as fs_types, preview1 as p1,
     },
 };
-use crate::{ProgramExecErrorDetail, RuntimeMessage};
+use crate::{BootfsBytes, ProgramExecErrorDetail, RuntimeMessage};
 use alloc::borrow::ToOwned;
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -82,7 +86,6 @@ use wasmtime::{
 };
 
 const COMPILER_PLUGIN_PATH: &str = "/bin/compiler.cwasm";
-const HELIOS_PROCESS_ID_ENV: &str = "HELIOS_PROCESS_ID";
 const RAYON_NUM_THREADS_ENV: &[u8] = b"RAYON_NUM_THREADS=";
 const WASM_PAGE_SIZE: usize = 64 * 1024;
 const PROGRAM_SHARED_MEMORY_MAX_PAGES: u32 = 8192;
@@ -113,7 +116,27 @@ const WASIX_STREAM_SECURITY_DOUBLE_ENCRYPTION: u8 = 1 << 3;
 const DEFAULT_WASIX_EXEC_SEARCH_PATHS: &[&str] = &["/usr/local/bin", "/bin", "/usr/bin"];
 type Preview1Iovs = SmallVec<[(u32, u32); 8]>;
 type Preview1IovRanges = SmallVec<[(usize, usize); 8]>;
-type CompilerThreadTasks = SmallVec<[crate::JoinHandle<()>; 8]>;
+type CompilerThreadTasks = SmallVec<[crate::JoinHandle<CompilerThreadReport>; 8]>;
+type CompilerThreadReports = SmallVec<[CompilerThreadReport; 8]>;
+type CompilerPluginHandle<CpuImpl, Net, HostFs> = Arc<CompilerPluginRuntime<CpuImpl, Net, HostFs>>;
+
+#[derive(Clone, Copy, Default)]
+struct CompilerPhaseTimestamps {
+    processor: u16,
+    entered_ns: u64,
+    slot_acquired_ns: u64,
+    plugin_ready_ns: u64,
+    instantiated_ns: u64,
+    input_done_ns: u64,
+    compile_started_ns: u64,
+    compile_returned_ns: u64,
+    diagnostic_done_ns: u64,
+    response_done_ns: u64,
+    tasks_joined_ns: u64,
+    signed_ns: u64,
+    verified_ns: u64,
+    plugin_cached: bool,
+}
 
 const WASIX_PROC_SPAWN_FD_OP_SIZE: u32 = 56;
 const WASIX_PROC_SPAWN_FD_OP_CMD_OFFSET: u32 = 0;
@@ -170,18 +193,24 @@ where
 /// it once it is running.
 pub(super) struct ProgramLaunch<Net: ComponentHostNetwork> {
     argv: ProgramArgv,
-    env: Vec<(String, String)>,
+    env: LaunchEnvironment,
     authority: ProcessAuthority,
     filesystem: Option<DebugFileSystemSnapshot>,
     /// Inherited preview1 descriptors. Only core modules have a
     /// descriptor table; a component ignores one.
     descriptors: Option<Preview1DescriptorTable<Net>>,
     signal_dispositions: Vec<WasixSignalDisposition>,
+    /// The launch's phase timeline: [`phases::Timeline::disabled`]
+    /// when the launch-phase target is off or the launcher is not a
+    /// launch call (plugin loads record nothing).
+    timeline: phases::Timeline,
 }
 
 impl<Net: ComponentHostNetwork> ProgramLaunch<Net> {
     /// A launch that inherits nothing: no descriptors, no signal
-    /// dispositions.
+    /// dispositions. `env` is the caller's environment; the kernel owns
+    /// `HELIOS_PROCESS_ID` and replaces any entry for it (see
+    /// [`LaunchEnvironment`]).
     pub(super) fn new(
         argv: ProgramArgv,
         env: Vec<(String, String)>,
@@ -190,12 +219,22 @@ impl<Net: ComponentHostNetwork> ProgramLaunch<Net> {
     ) -> Self {
         Self {
             argv,
-            env,
+            env: LaunchEnvironment::from_guest(env),
             authority,
             filesystem,
             descriptors: None,
             signal_dispositions: Vec::new(),
+            timeline: phases::Timeline::disabled(),
         }
+    }
+
+    /// The timeline this launch's phases record into. The handle's
+    /// `task_emits` flag decides whether the run task emits the line —
+    /// set by [`phases::Timeline::for_task`] for launches whose line is
+    /// the run task's to write.
+    pub(super) fn with_timeline(mut self, timeline: phases::Timeline) -> Self {
+        self.timeline = timeline;
+        self
     }
 }
 
@@ -232,6 +271,14 @@ where
     pub(crate) fn spawner(&self) -> crate::Spawner<CpuImpl> {
         self.spawner.clone()
     }
+
+    pub(crate) fn cpu(&self) -> CpuImpl {
+        self.cpu.clone()
+    }
+
+    pub(crate) fn write_serial(&self) -> crate::DebugSerialWriter {
+        self.write_serial
+    }
 }
 
 struct UserProgramServiceInner<CpuImpl, Net, HostFs>
@@ -244,7 +291,7 @@ where
     engine: crate::wasmtime_adapter::WasmtimeEngine,
     preview1_core_linker: CoreLinker<Preview1ProgramStore<CpuImpl, Net, HostFs>>,
     shared_memory_pool: Arc<Mutex<SharedMemoryPool>>,
-    component_cache: Mutex<ComponentCache<WasmtimeCompiledComponent>>,
+    component_cache: Mutex<ComponentCache<ProgramComponent>>,
     component_instance_pre_cache:
         Mutex<ComponentCache<ComponentInstancePre<StoreData<CpuImpl, Net, HostFs>>>>,
     core_module_cache: Mutex<ComponentCache<WasmtimeCompiledCoreModule>>,
@@ -252,7 +299,7 @@ where
     // InstancePre moved the median from 53 ms to 50-51 ms. Cache only modules
     // whose imports are independent of per-process shared-memory binding.
     core_module_instance_pre_cache: CoreModuleInstancePreCache<CpuImpl, Net, HostFs>,
-    compiler_artifact: Option<Bytes>,
+    compiler_artifact: Option<BootfsBytes>,
     /// Lazily-built compiler kernel-plugin runtime. The plugin's
     /// `wasmtime::Module`, `InstancePre`, and 512 MiB `SharedMemory` are
     /// allocated on first compile and reused for every subsequent call,
@@ -266,8 +313,18 @@ where
     /// worker pool inside the plugin still parallelises a single
     /// compile across all cores.
     compile_in_progress: AtomicBool,
+    /// Every wasm image this service loaded, by address, for the
+    /// instruction sampler to name.
+    code_map: CodeMap,
     clock_cpu: CpuImpl,
     _marker: core::marker::PhantomData<fn() -> HostFs>,
+}
+
+/// A program component as the cache holds it: the compiled artifact and
+/// the entry that names its code to the instruction sampler while it lives.
+struct ProgramComponent {
+    compiled: WasmtimeCompiledComponent,
+    _code: CodeRegistration,
 }
 
 struct ProgramSpawnRequest<Net: ComponentHostNetwork> {
@@ -280,10 +337,51 @@ struct ProgramSpawnRequest<Net: ComponentHostNetwork> {
     signal_dispositions: Vec<WasixSignalDisposition>,
 }
 
+/// A program's bytes, classified by how far the kernel trusts them.
+///
+/// The trust follows where the bytes came from, never which path or
+/// branch read them: only [`BootfsBytes`] can become a
+/// [`ProgramSource::BootfsArtifact`], which loads without a signature
+/// check. A cwasm from anywhere else, guest-written files and the host
+/// share alike, is a [`ProgramSource::SignedArtifact`] and loads only
+/// if its signature verifies against the kernel's trusted roots.
 pub(crate) enum ProgramSource {
     RawWasm(Bytes),
     SignedArtifact(Bytes),
-    BootfsArtifact(Bytes),
+    BootfsArtifact(BootfsBytes),
+}
+
+impl ProgramSource {
+    /// Classifies a program read from the in-memory filesystem by the
+    /// provenance its node carries.
+    pub(crate) fn from_file(contents: FileContents) -> Self {
+        match contents {
+            FileContents::Bootfs(bytes) if cwasm::is_cwasm(bytes.as_slice()) => {
+                Self::BootfsArtifact(bytes)
+            }
+            FileContents::Bootfs(bytes) => Self::RawWasm(bytes.to_bytes()),
+            FileContents::Written(bytes) => Self::from_untrusted(bytes),
+        }
+    }
+
+    /// Classifies bytes no boot payload vouches for: a file a guest
+    /// wrote, or one read from the host share.
+    pub(crate) fn from_untrusted(bytes: Bytes) -> Self {
+        if cwasm::is_cwasm(&bytes) {
+            Self::SignedArtifact(bytes)
+        } else {
+            Self::RawWasm(bytes)
+        }
+    }
+
+    /// Byte length of the payload the source carries, whichever
+    /// variant it is.
+    pub(crate) fn payload_len(&self) -> usize {
+        match self {
+            Self::RawWasm(bytes) | Self::SignedArtifact(bytes) => bytes.len(),
+            Self::BootfsArtifact(bytes) => bytes.as_slice().len(),
+        }
+    }
 }
 
 /// Handle to a spawned child component as seen by the kernel and its
@@ -421,10 +519,6 @@ where
     let preview1_core_linker = preview1_program_linker(engine.raw())
         .unwrap_or_else(|error| panic!("failed to create preview1 program linker: {error:#}"));
     let compiler_artifact = read_bootfs_artifact(debug_state, COMPILER_PLUGIN_PATH);
-    crate::wasmtime_adapter::register_oom_kick_engine(engine.raw().clone());
-    debug_state
-        .instance_registry()
-        .set_kill_notifier(crate::wasmtime_adapter::bump_user_engine_epoch);
     let service = UserProgramService {
         inner: Arc::new(UserProgramServiceInner {
             runtime,
@@ -440,11 +534,13 @@ where
             compiler_artifact,
             compiler_plugin: Mutex::new(None),
             compile_in_progress: AtomicBool::new(false),
+            code_map: CodeMap::new(),
             clock_cpu: cpu.clone(),
             _marker: core::marker::PhantomData,
         }),
     };
     debug_state.install_program_service(service.clone());
+    spawn_instruction_sample_drain(kernel, &service, debug_state);
     let plugin_context = ProgramExecContext {
         cpu: cpu.clone(),
         timer: kernel.timer(),
@@ -458,6 +554,37 @@ where
     install_http_client_plugin(&service, plugin_context.clone());
     install_compositor_plugin(&service, plugin_context);
     service
+}
+
+/// Attributes the instruction sampler's addresses while sampling runs.
+///
+/// A sample can only be named while the code it landed in is loaded, so
+/// the rings are drained every [`crate::SAMPLE_DRAIN_INTERVAL_MILLIS`]
+/// rather than once when the profile is read. Between profiles the task
+/// parks on the sampler's start signal and costs nothing.
+fn spawn_instruction_sample_drain<CpuImpl, Net, HostFs, WatchdogImpl>(
+    kernel: &crate::Kernel<CpuImpl, WatchdogImpl>,
+    service: &UserProgramService<CpuImpl, Net, HostFs>,
+    debug_state: &HostRuntimeState<CpuImpl, Net, HostFs>,
+) where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    HostFs: crate::HostFileSystem,
+    WatchdogImpl: Watchdog + Clone,
+{
+    let sampler = debug_state.instruction_sampler();
+    let code_map = service.code_map().clone();
+    let timer = kernel.timer();
+    let interval = Duration::from_millis(crate::SAMPLE_DRAIN_INTERVAL_MILLIS);
+    kernel.spawn_detached(async move {
+        loop {
+            sampler.sampling_started().await;
+            while sampler.sampling() {
+                timer.sleep_for(interval).await;
+                sampler.drain(&code_map);
+            }
+        }
+    });
 }
 
 pub fn run_embedded_component_forever<CpuImpl, Net, HostFs, WatchdogImpl>(
@@ -575,10 +702,40 @@ where
     }
 }
 
+/// Starts the packet pump for the queue pair this processor owns, when
+/// it owns one.
+///
+/// A queue pair's interrupt is routed to one processor, so the pump
+/// that drains the pair has to be that processor's own task: this is
+/// called from every processor's run loop, before the role dispatch
+/// decides what else the processor does, and `spawn_local_detached`
+/// pins the task to it. The service is installed by a device-discovery
+/// task that may not have run yet, so the task awaits the install
+/// rather than checking and giving up; `run_packet_pump` then resolves
+/// the pair assignment from the topology and either pumps it or
+/// returns.
+fn spawn_network_packet_pump<CpuImpl, Net, HostFs, WatchdogImpl>(
+    kernel: &crate::Kernel<CpuImpl, WatchdogImpl>,
+    debug_state: &HostRuntimeState<CpuImpl, Net, HostFs>,
+) where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    HostFs: crate::HostFileSystem,
+    WatchdogImpl: Watchdog + Clone,
+{
+    let debug_state = debug_state.clone();
+    kernel.spawn_local_detached(async move {
+        let service = debug_state.wait_for_network_service().await;
+        service
+            .run_packet_pump(helios_hal::cpu::current_processor())
+            .await;
+    });
+}
+
 pub fn run_program_workers_forever<CpuImpl, Net, HostFs, WatchdogImpl>(
     _cpu: CpuImpl,
     kernel: crate::Kernel<CpuImpl, WatchdogImpl>,
-    _debug_state: HostRuntimeState<CpuImpl, Net, HostFs>,
+    debug_state: HostRuntimeState<CpuImpl, Net, HostFs>,
 ) -> !
 where
     CpuImpl: Cpu + Clone,
@@ -586,6 +743,7 @@ where
     HostFs: crate::HostFileSystem,
     WatchdogImpl: Watchdog + Clone,
 {
+    spawn_network_packet_pump(&kernel, &debug_state);
     kernel.run()
 }
 
@@ -602,6 +760,7 @@ where
     HostFs: crate::HostFileSystem,
     WatchdogImpl: Watchdog + Clone,
 {
+    spawn_network_packet_pump(&kernel, &debug_state);
     let topology = kernel.topology();
     match component_host_processor_role(
         helios_hal::cpu::current_processor(),
@@ -612,7 +771,7 @@ where
             run_kernel_processor_forever(cpu, kernel, debug_state);
         }
         ComponentHostProcessorRole::SharedRuntime | ComponentHostProcessorRole::SystemComponent => {
-            match crate::embedded_system_component() {
+            match debug_state.system_component() {
                 Some(component) => run_embedded_component_forever(
                     component,
                     ComponentBindingSet::System,
@@ -708,7 +867,10 @@ where
             continue;
         }
 
-        cpu.park_current();
+        let outcome = kernel.park_until_work();
+        if debug_state.profiling_enabled() {
+            record_executor_idle_metrics(&debug_state, outcome);
+        }
     }
 }
 
@@ -765,6 +927,45 @@ fn record_executor_metrics<CpuImpl, Net, HostFs>(
     );
     record_executor_event_metric(debug_state, "timer-fired", stats.timer_fired_count);
     debug_state.record_kernel_heap_metrics(crate::heap_stats());
+}
+
+/// What one idle park cost: the poll phase under
+/// `kernel;executor;idle-poll`, the parked span under
+/// `kernel;executor;idle-parked`, and a hit/miss event so a profile
+/// can weigh IPI-and-halt-exit wakes against polled ones.
+fn record_executor_idle_metrics<CpuImpl, Net, HostFs>(
+    debug_state: &HostRuntimeState<CpuImpl, Net, HostFs>,
+    outcome: crate::IdleOutcome,
+) where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    HostFs: crate::HostFileSystem,
+{
+    let (polled_ticks, parked_ticks) = match outcome {
+        crate::IdleOutcome::Polled { polled_ticks } => {
+            record_executor_event_metric(debug_state, "idle-poll-hit", 1);
+            (polled_ticks, None)
+        }
+        crate::IdleOutcome::Parked {
+            polled_ticks,
+            parked_ticks,
+        } => {
+            record_executor_event_metric(debug_state, "idle-poll-miss", 1);
+            (polled_ticks, Some(parked_ticks))
+        }
+    };
+    debug_state.record_profile_stack_str(
+        ProfileScope::Kernel,
+        "kernel;executor;idle-poll",
+        polled_ticks,
+    );
+    if let Some(parked_ticks) = parked_ticks {
+        debug_state.record_profile_stack_str(
+            ProfileScope::Kernel,
+            "kernel;executor;idle-parked",
+            parked_ticks,
+        );
+    }
 }
 
 fn record_executor_event_metric<CpuImpl, Net, HostFs>(
@@ -981,8 +1182,29 @@ where
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    pub fn increment_epoch(&self) {
-        self.inner.engine.increment_epoch();
+    /// Preempts every guest, on any processor, that has held its
+    /// processor for at least one [`crate::GUEST_TIME_SLICE`].
+    ///
+    /// Each backend calls this from every processor's timer interrupt,
+    /// whatever the interrupt's period: it takes no lock, allocates
+    /// nothing and sends no IPI.
+    pub fn preempt_overdue_guests(&self) {
+        self.inner
+            .engine
+            .interrupts()
+            .preempt_overdue(self.inner.clock_cpu.now());
+    }
+
+    /// Interrupts every store of `instance`, so a kill whose flag is set
+    /// reaches the guest wherever it is.
+    pub(crate) fn interrupt_instance(&self, instance: crate::InstanceId) {
+        self.inner.engine.interrupts().interrupt_instance(instance);
+    }
+
+    /// The wasm images this service has loaded, which name the
+    /// instruction sampler's addresses.
+    pub(crate) fn code_map(&self) -> &CodeMap {
+        &self.inner.code_map
     }
 
     /// Spawn a new child program. The returned handle gives the caller
@@ -997,7 +1219,14 @@ where
     ) -> Result<ChildHandle, ProgramExecError> {
         super::emit_program_stage_marker(exec_context.write_serial, "program:spawn-begin");
         let executable = self
-            .load_executable(&exec_context, &source, hint, exec_context.write_serial)
+            .load_executable(
+                &exec_context,
+                launch.argv.program_name(),
+                &source,
+                hint,
+                exec_context.write_serial,
+                &launch.timeline,
+            )
             .await?;
         self.spawn_loaded(exec_context, executable, launch)
     }
@@ -1018,7 +1247,14 @@ where
     ) -> Result<ChildHandle, ProgramExecError> {
         super::emit_program_stage_marker(exec_context.write_serial, "program:spawn-begin");
         let executable = self
-            .load_executable(&exec_context, &source, hint, exec_context.write_serial)
+            .load_executable(
+                &exec_context,
+                launch.argv.program_name(),
+                &source,
+                hint,
+                exec_context.write_serial,
+                &launch.timeline,
+            )
             .await?;
         if matches!(executable, ProgramExecutable::Component(_)) {
             launch.descriptors = None;
@@ -1062,11 +1298,12 @@ where
     ) -> Result<ChildHandle, ProgramExecError> {
         let ProgramLaunch {
             argv,
-            mut env,
+            env,
             authority,
             filesystem,
             descriptors,
             signal_dispositions,
+            timeline,
         } = launch;
         let started_at = exec_context
             .runtime_state
@@ -1075,12 +1312,7 @@ where
             .instance_registry
             .register(argv.program_name().to_owned(), started_at);
         let instance_id = launched_instance.id();
-        assert!(
-            !env.iter()
-                .any(|(name, _)| name.as_str() == HELIOS_PROCESS_ID_ENV),
-            "{HELIOS_PROCESS_ID_ENV} is reserved for the kernel program launcher"
-        );
-        env.push((HELIOS_PROCESS_ID_ENV.into(), instance_id.raw().to_string()));
+        let env = env.into_process_env(instance_id);
         let signal_state = WasixSignalState::new();
         let request = ProgramSpawnRequest {
             argv,
@@ -1129,6 +1361,7 @@ where
                 core_module_instance_pre_cache,
                 launched_instance,
                 output_mode,
+                timeline,
             )
             .await;
             let _ = exit_tx.send(result);
@@ -1187,7 +1420,14 @@ where
         launch: ProgramLaunch<Net>,
     ) -> Result<(ExecResult, Option<DebugFileSystemSnapshot>), ProgramExecError> {
         let executable = self
-            .load_executable(&exec_context, &source, hint, exec_context.write_serial)
+            .load_executable(
+                &exec_context,
+                launch.argv.program_name(),
+                &source,
+                hint,
+                exec_context.write_serial,
+                &launch.timeline,
+            )
             .await?;
         self.exec_loaded_buffered(exec_context, executable, stdin, launch)
             .await
@@ -1261,11 +1501,14 @@ where
     async fn load_executable(
         &self,
         exec_context: &ProgramExecContext<CpuImpl, Net, HostFs>,
+        program: &str,
         source: &ProgramSource,
         hint: Option<AotCompileHint>,
         write_serial: crate::DebugSerialWriter,
+        timeline: &phases::Timeline,
     ) -> Result<ProgramExecutable<CpuImpl, Net, HostFs>, ProgramExecError> {
         let started_at = monotonic_nanos(&self.inner.clock_cpu);
+        timeline.record(&self.inner.clock_cpu, LaunchPhase::LoadBegin);
         let payload = match source {
             ProgramSource::SignedArtifact(bytes) => {
                 if hint.is_some() {
@@ -1296,21 +1539,27 @@ where
                 trusted_signed_payload(&signed)?
             }
         };
-        self.load_precompiled_executable(payload, write_serial, started_at)
+        timeline.record(&self.inner.clock_cpu, LaunchPhase::ArtifactTrust);
+        let loaded =
+            self.load_precompiled_executable(program, payload, write_serial, started_at, timeline);
+        timeline.record(&self.inner.clock_cpu, LaunchPhase::LoadComplete);
+        loaded
     }
 
     fn load_precompiled_executable(
         &self,
+        program: &str,
         payload: Bytes,
         write_serial: crate::DebugSerialWriter,
         started_at: u64,
+        timeline: &phases::Timeline,
     ) -> Result<ProgramExecutable<CpuImpl, Net, HostFs>, ProgramExecError> {
         match WasmtimePrecompiledKind::detect(&payload) {
             Some(WasmtimePrecompiledKind::Component) => self
-                .load_precompiled_component(payload, write_serial, started_at)
+                .load_precompiled_component(program, payload, write_serial, started_at, timeline)
                 .map(ProgramExecutable::Component),
             Some(WasmtimePrecompiledKind::CoreModule) => self
-                .load_precompiled_core_module(payload, write_serial, started_at)
+                .load_precompiled_core_module(program, payload, write_serial, started_at, timeline)
                 .map(ProgramExecutable::CoreModule),
             None => Err(ProgramExecError {
                 kind: ProgramExecErrorKind::InvalidBinary,
@@ -1321,11 +1570,19 @@ where
 
     fn load_precompiled_component(
         &self,
+        program: &str,
         payload: Bytes,
         write_serial: crate::DebugSerialWriter,
         started_at: u64,
+        timeline: &phases::Timeline,
     ) -> Result<PreparedComponent<CpuImpl, Net, HostFs>, ProgramExecError> {
-        let component = if let Some(component) = self.inner.component_cache.lock().get(&payload) {
+        let cached = self.inner.component_cache.lock().get(&payload);
+        timeline.record_hit(
+            &self.inner.clock_cpu,
+            LaunchPhase::CacheLookup,
+            cached.is_some(),
+        );
+        let component = if let Some(component) = cached {
             super::emit_program_stage_marker(write_serial, "program:deserialize-cache-hit");
             let now = monotonic_nanos(&self.inner.clock_cpu);
             tracing::debug!(
@@ -1362,8 +1619,16 @@ where
                 }
             }
             let compiled = self.deserialize_component(&payload)?;
+            timeline.record(&self.inner.clock_cpu, LaunchPhase::Deserialize);
             super::emit_program_stage_marker(write_serial, "program:deserialize-end");
-            let component = Arc::new(compiled);
+            let code = self
+                .inner
+                .code_map
+                .register_component(program, &compiled.component);
+            let component = Arc::new(ProgramComponent {
+                compiled,
+                _code: code,
+            });
             let now = monotonic_nanos(&self.inner.clock_cpu);
             tracing::debug!(
                 target: "helios_component_host::program_host",
@@ -1379,38 +1644,49 @@ where
                 .insert_if_missing(payload.clone(), component)
         };
 
-        if let Some(instance_pre) = self.inner.component_instance_pre_cache.lock().get(&payload) {
+        let cached_pre = self.inner.component_instance_pre_cache.lock().get(&payload);
+        let hit = cached_pre.is_some();
+        let instance_pre = if let Some(instance_pre) = cached_pre {
             super::emit_program_stage_marker(write_serial, "program:instantiate-pre-cache-hit");
-            return Ok(instance_pre);
-        }
-
-        super::emit_program_stage_marker(write_serial, "program:instantiate-pre-begin");
-        let linker = super::component_linker(
-            self.inner.engine.raw(),
-            ComponentBindingSet::Program,
-            &component.component,
-        )
-        .map_err(map_program_runtime_error)?;
-        let instance_pre = Arc::new(
-            linker
-                .instantiate_pre(&component.component)
-                .map_err(map_program_runtime_error)?,
-        );
-        super::emit_program_stage_marker(write_serial, "program:instantiate-pre-end");
-        Ok(self
-            .inner
-            .component_instance_pre_cache
-            .lock()
-            .insert_if_missing(payload, instance_pre))
+            instance_pre
+        } else {
+            super::emit_program_stage_marker(write_serial, "program:instantiate-pre-begin");
+            let linker = super::component_linker(
+                self.inner.engine.raw(),
+                ComponentBindingSet::Program,
+                &component.compiled.component,
+            )
+            .map_err(map_program_runtime_error)?;
+            let instance_pre = Arc::new(
+                linker
+                    .instantiate_pre(&component.compiled.component)
+                    .map_err(map_program_runtime_error)?,
+            );
+            super::emit_program_stage_marker(write_serial, "program:instantiate-pre-end");
+            self.inner
+                .component_instance_pre_cache
+                .lock()
+                .insert_if_missing(payload, instance_pre)
+        };
+        timeline.record_hit(&self.inner.clock_cpu, LaunchPhase::InstantiatePre, hit);
+        Ok(instance_pre)
     }
 
     fn load_precompiled_core_module(
         &self,
+        program: &str,
         payload: Bytes,
         write_serial: crate::DebugSerialWriter,
         started_at: u64,
+        timeline: &phases::Timeline,
     ) -> Result<Arc<WasmtimeCompiledCoreModule>, ProgramExecError> {
-        if let Some(module) = self.inner.core_module_cache.lock().get(&payload) {
+        let cached = self.inner.core_module_cache.lock().get(&payload);
+        timeline.record_hit(
+            &self.inner.clock_cpu,
+            LaunchPhase::CacheLookup,
+            cached.is_some(),
+        );
+        if let Some(module) = cached {
             super::emit_program_stage_marker(write_serial, "program:deserialize-core-cache-hit");
             let now = monotonic_nanos(&self.inner.clock_cpu);
             tracing::debug!(
@@ -1429,9 +1705,12 @@ where
             .map_err(map_program_runtime_error)?;
         validate_preview1_program_module_imports(&module)?;
         super::emit_program_stage_marker(write_serial, "program:deserialize-core-end");
+        timeline.record(&self.inner.clock_cpu, LaunchPhase::Deserialize);
+        let code = self.inner.code_map.register_module(program, &module);
         let compiled = Arc::new(WasmtimeCompiledCoreModule {
             cache_key: payload.clone(),
             module,
+            _code: code,
         });
         let now = monotonic_nanos(&self.inner.clock_cpu);
         tracing::debug!(
@@ -1476,15 +1755,53 @@ where
         hint: AotCompileHint,
         profile: bool,
     ) -> Result<Vec<u8>, ProgramExecError> {
+        let mut phases = CompilerPhaseTimestamps {
+            processor: if profile {
+                helios_hal::cpu::current_processor().id()
+            } else {
+                0
+            },
+            entered_ns: if profile {
+                monotonic_nanos(&exec_context.cpu)
+            } else {
+                0
+            },
+            ..CompilerPhaseTimestamps::default()
+        };
         let compiler_artifact = self.read_compiler_plugin_artifact(exec_context)?;
         let compiler_payload = trusted_bootfs_payload(&compiler_artifact)?;
-        let payload = self
-            .invoke_compiler_core_module(exec_context, compiler_payload, wasm, hint, profile)
+        let (payload, thread_reports) = self
+            .invoke_compiler_core_module(
+                exec_context,
+                compiler_payload,
+                wasm,
+                hint,
+                profile,
+                &mut phases,
+            )
             .await?;
         let signed =
             cwasm::sign_trusted_artifact_payload(&payload).map_err(map_artifact_trust_error)?;
+        phases.signed_ns = if profile {
+            monotonic_nanos(&exec_context.cpu)
+        } else {
+            0
+        };
         cwasm::verify_signed_artifact(UntrustedCwasm::new(&signed))
             .map_err(map_artifact_trust_error)?;
+        phases.verified_ns = if profile {
+            monotonic_nanos(&exec_context.cpu)
+        } else {
+            0
+        };
+        if profile {
+            emit_compiler_phase_report(
+                exec_context.write_serial,
+                phases,
+                &thread_reports,
+                signed.len(),
+            );
+        }
         Ok(signed)
     }
 
@@ -1495,11 +1812,23 @@ where
         wasm: &Bytes,
         hint: AotCompileHint,
         profile: bool,
-    ) -> Result<Vec<u8>, ProgramExecError> {
+        phases: &mut CompilerPhaseTimestamps,
+    ) -> Result<(Vec<u8>, CompilerThreadReports), ProgramExecError> {
         let _compile_guard = self.acquire_compiler_compile_slot().await;
-        let result =
-            self.invoke_compiler_inner(exec_context, &compiler_payload, wasm, hint, profile);
-        self.await_compiler_thread_tasks().await;
+        phases.slot_acquired_ns = if profile {
+            monotonic_nanos(&exec_context.cpu)
+        } else {
+            0
+        };
+        let result = self
+            .invoke_compiler_inner(exec_context, &compiler_payload, wasm, hint, profile, phases)
+            .await;
+        let thread_reports = self.await_compiler_thread_tasks().await;
+        phases.tasks_joined_ns = if profile {
+            monotonic_nanos(&exec_context.cpu)
+        } else {
+            0
+        };
         // Plugin supervisor: on a kill or fatal-state error, drop the
         // cached runtime so the next call rebuilds the Module +
         // SharedMemory + InstancePre from scratch. This is the
@@ -1515,7 +1844,7 @@ where
             );
             *self.inner.compiler_plugin.lock() = None;
         }
-        result
+        result.map(|payload| (payload, thread_reports))
     }
 
     async fn acquire_compiler_compile_slot(&self) -> CompilerCompileSlot<'_> {
@@ -1539,7 +1868,8 @@ where
         }
     }
 
-    async fn await_compiler_thread_tasks(&self) {
+    async fn await_compiler_thread_tasks(&self) -> CompilerThreadReports {
+        let mut reports = CompilerThreadReports::new();
         loop {
             let tasks = self
                 .inner
@@ -1559,20 +1889,29 @@ where
                 break;
             }
             for task in tasks {
-                task.await;
+                reports.push(task.await);
             }
         }
+        reports
     }
 
-    fn invoke_compiler_inner(
+    async fn invoke_compiler_inner(
         &self,
         exec_context: &ProgramExecContext<CpuImpl, Net, HostFs>,
         compiler_payload: &Bytes,
         wasm: &Bytes,
         hint: AotCompileHint,
         profile: bool,
+        phases: &mut CompilerPhaseTimestamps,
     ) -> Result<Vec<u8>, ProgramExecError> {
-        let plugin = self.ensure_compiler_plugin(exec_context, compiler_payload)?;
+        let (plugin, plugin_cached) =
+            self.ensure_compiler_plugin(exec_context, compiler_payload)?;
+        phases.plugin_cached = plugin_cached;
+        phases.plugin_ready_ns = if profile {
+            monotonic_nanos(&exec_context.cpu)
+        } else {
+            0
+        };
         let engine = self.inner.engine.raw();
         let started_at = exec_context
             .runtime_state
@@ -1593,16 +1932,19 @@ where
             _marker: core::marker::PhantomData,
         };
         let mut store = wasmtime::Store::new(engine, store_data);
-        configure_compiler_core_store(&mut store);
+        let _interrupts = configure_compiler_core_store(&mut store);
         let instance = plugin
             .instance_pre
-            .instantiate(&mut store)
+            .instantiate_async(&mut store)
+            .await
             .map_err(map_program_runtime_error)?;
-        let tls_base = compiler_tls_base(&mut store, &instance)?;
+        let tls_base = plugin.main_thread_tls_base;
+        set_compiler_tls_base(&mut store, &instance, tls_base)?;
         let pthread_self_offset = instance
             .get_typed_func::<(), i32>(&mut store, HELIOS_COMPILER_PTHREAD_SELF_OFFSET)
             .map_err(map_program_runtime_error)?
-            .call(&mut store, ())
+            .call_async(&mut store, ())
+            .await
             .map_err(map_program_runtime_error)? as u32;
         let thread_pointer = tls_base
             .checked_add(pthread_self_offset)
@@ -1614,7 +1956,8 @@ where
             .get_typed_func::<i32, ()>(&mut store, HELIOS_COMPILER_INITIALIZE)
             .map_err(map_program_runtime_error)?;
         initialize
-            .call(&mut store, thread_pointer as i32)
+            .call_async(&mut store, thread_pointer as i32)
+            .await
             .map_err(map_program_runtime_error)?;
         let alloc = instance
             .get_typed_func::<(i32, i32), i32>(&mut store, HELIOS_COMPILER_ALLOC)
@@ -1622,15 +1965,21 @@ where
         let compile = instance
             .get_typed_func::<(i32, i32), i32>(&mut store, HELIOS_COMPILER_COMPILE)
             .map_err(map_program_runtime_error)?;
+        phases.instantiated_ns = if profile {
+            monotonic_nanos(&exec_context.cpu)
+        } else {
+            0
+        };
         let target = env!("HELIOS_BUILD_TARGET").as_bytes();
-        let wasm_ptr = compiler_alloc(&mut store, &alloc, wasm.len(), 1)?;
-        let target_ptr = compiler_alloc(&mut store, &alloc, target.len(), 1)?;
+        let wasm_ptr = compiler_alloc(&mut store, &alloc, wasm.len(), 1).await?;
+        let target_ptr = compiler_alloc(&mut store, &alloc, target.len(), 1).await?;
         let request_ptr = compiler_alloc(
             &mut store,
             &alloc,
             core::mem::size_of::<CompilerRequestHeader>(),
             core::mem::align_of::<CompilerRequestHeader>(),
-        )?;
+        )
+        .await?;
         write_shared_memory(store.data().memory(), wasm_ptr, wasm)?;
         write_shared_memory(store.data().memory(), target_ptr, target)?;
         let header = CompilerRequestHeader {
@@ -1656,14 +2005,31 @@ where
                 core::mem::size_of::<CompilerRequestHeader>(),
             )
         })?;
+        phases.input_done_ns = if profile {
+            monotonic_nanos(&exec_context.cpu)
+        } else {
+            0
+        };
+        phases.compile_started_ns = if profile {
+            monotonic_nanos(&exec_context.cpu)
+        } else {
+            0
+        };
         let compile_started = store.data().cpu.now().ticks();
-        let response_ptr = compile.call(
-            &mut store,
-            (
-                request_ptr as i32,
-                core::mem::size_of::<CompilerRequestHeader>() as i32,
-            ),
-        );
+        let response_ptr = compile
+            .call_async(
+                &mut store,
+                (
+                    request_ptr as i32,
+                    core::mem::size_of::<CompilerRequestHeader>() as i32,
+                ),
+            )
+            .await;
+        phases.compile_returned_ns = if profile {
+            monotonic_nanos(&exec_context.cpu)
+        } else {
+            0
+        };
         let compile_elapsed = store
             .data()
             .cpu
@@ -1699,20 +2065,30 @@ where
         if !diagnostic.is_empty() {
             store.data().write_serial.emit(&diagnostic);
         }
-        read_shared_memory(
+        phases.diagnostic_done_ns = if profile {
+            monotonic_nanos(&exec_context.cpu)
+        } else {
+            0
+        };
+        let output = read_shared_memory(
             store.data().memory(),
             response.precompiled_ptr,
             response.precompiled_len,
-        )
+        )?;
+        phases.response_done_ns = if profile {
+            monotonic_nanos(&exec_context.cpu)
+        } else {
+            0
+        };
+        Ok(output)
     }
 
     fn read_compiler_plugin_artifact(
         &self,
         exec_context: &ProgramExecContext<CpuImpl, Net, HostFs>,
-    ) -> Result<Bytes, ProgramExecError> {
+    ) -> Result<BootfsBytes, ProgramExecError> {
         self.inner
             .compiler_artifact
-            .clone()
             .or_else(|| read_bootfs_artifact(&exec_context.runtime_state, COMPILER_PLUGIN_PATH))
             .ok_or(ProgramExecError {
                 kind: ProgramExecErrorKind::InvalidPath,
@@ -1728,10 +2104,10 @@ where
         &self,
         exec_context: &ProgramExecContext<CpuImpl, Net, HostFs>,
         compiler_payload: &Bytes,
-    ) -> Result<Arc<CompilerPluginRuntime<CpuImpl, Net, HostFs>>, ProgramExecError> {
+    ) -> Result<(CompilerPluginHandle<CpuImpl, Net, HostFs>, bool), ProgramExecError> {
         let mut slot = self.inner.compiler_plugin.lock();
         if let Some(plugin) = slot.as_ref() {
-            return Ok(plugin.clone());
+            return Ok((plugin.clone(), true));
         }
 
         // The compiler plugin is a precompiled core module; a component
@@ -1755,6 +2131,10 @@ where
         let engine = self.inner.engine.raw();
         let module = unsafe { Module::deserialize(engine, compiler_payload.as_ref()) }
             .map_err(map_program_runtime_error)?;
+        let code = self
+            .inner
+            .code_map
+            .register_module(COMPILER_PLUGIN_PATH, &module);
         let shared_memory = compiler_shared_memory(engine, &module)?;
         let shared = Arc::new(CompilerCoreShared {
             memory: shared_memory.clone(),
@@ -1765,6 +2145,7 @@ where
             instance_pre: spin::Once::new(),
             next_thread_id: AtomicI32::new(0),
             thread_tasks: Mutex::new(Vec::new()),
+            interrupts: self.inner.engine.interrupts().clone(),
         });
         let mut linker: CoreLinker<CompilerCoreStore<CpuImpl, Net, HostFs>> =
             CoreLinker::new(engine);
@@ -1793,24 +2174,87 @@ where
             write_serial: exec_context.write_serial,
             _marker: core::marker::PhantomData,
         };
-        let scratch_store = wasmtime::Store::new(engine, scratch_store_data);
+        let mut scratch_store = wasmtime::Store::new(engine, scratch_store_data);
         define_compiler_shared_memory(&mut linker, &scratch_store, &module, shared_memory)?;
-        drop(scratch_store);
 
         let instance_pre = Arc::new(
             linker
                 .instantiate_pre(&module)
                 .map_err(map_program_runtime_error)?,
         );
+        let scratch_interrupts = configure_compiler_core_store(&mut scratch_store);
+        let scratch_instance = instance_pre
+            .instantiate(&mut scratch_store)
+            .map_err(map_program_runtime_error)?;
+        let main_thread_tls_base = compiler_tls_base(&mut scratch_store, &scratch_instance)?;
+        if main_thread_tls_base == 0 {
+            tracing::error!("compiler plugin start did not publish a static TLS block");
+            return Err(ProgramExecError {
+                kind: ProgramExecErrorKind::InvalidBinary,
+                detail: ProgramExecErrorDetail::CompilerPluginInvalid,
+            });
+        }
+        drop(scratch_interrupts);
+        drop(scratch_store);
         shared.instance_pre.call_once(|| instance_pre.clone());
 
         let _ = module; // InstancePre holds the Module via Arc internally.
         let plugin = Arc::new(CompilerPluginRuntime {
             instance_pre,
             shared,
+            main_thread_tls_base,
+            _code: code,
         });
         *slot = Some(plugin.clone());
-        Ok(plugin)
+        Ok((plugin, false))
+    }
+}
+
+fn emit_compiler_phase_report(
+    write_serial: crate::DebugSerialWriter,
+    phases: CompilerPhaseTimestamps,
+    thread_reports: &CompilerThreadReports,
+    output_bytes: usize,
+) {
+    write_serial.emit_fmt(format_args!(
+        "aot-phases processor={} plugin_cached={} slot_us={} plugin_us={} instantiate_us={} input_us={} compile_us={} diagnostic_us={} output_copy_us={} join_us={} sign_us={} verify_us={} output_bytes={}\n",
+        phases.processor,
+        phases.plugin_cached,
+        phase_us(phases.entered_ns, phases.slot_acquired_ns),
+        phase_us(phases.slot_acquired_ns, phases.plugin_ready_ns),
+        phase_us(phases.plugin_ready_ns, phases.instantiated_ns),
+        phase_us(phases.instantiated_ns, phases.input_done_ns),
+        phase_us(phases.compile_started_ns, phases.compile_returned_ns),
+        phase_us(phases.compile_returned_ns, phases.diagnostic_done_ns),
+        phase_us(phases.diagnostic_done_ns, phases.response_done_ns),
+        phase_us(phases.response_done_ns, phases.tasks_joined_ns),
+        phase_us(phases.tasks_joined_ns, phases.signed_ns),
+        phase_us(phases.signed_ns, phases.verified_ns),
+        output_bytes,
+    ));
+    for report in thread_reports {
+        write_serial.emit_fmt(format_args!(
+            "aot-thread id={} processor={} queued_us={} instantiate_us={} run_us={} start_after_compile_begin_us={} finish_after_compile_end_us={}\n",
+            report.thread_id,
+            report.processor,
+            phase_us(report.spawned_ns, report.started_ns),
+            phase_us(report.started_ns, report.instantiated_ns),
+            phase_us(report.instantiated_ns, report.finished_ns),
+            signed_phase_us(phases.compile_started_ns, report.started_ns),
+            signed_phase_us(phases.compile_returned_ns, report.finished_ns),
+        ));
+    }
+}
+
+fn phase_us(started_ns: u64, finished_ns: u64) -> u64 {
+    finished_ns.saturating_sub(started_ns) / 1_000
+}
+
+fn signed_phase_us(started_ns: u64, finished_ns: u64) -> i64 {
+    if finished_ns >= started_ns {
+        phase_us(started_ns, finished_ns).min(i64::MAX as u64) as i64
+    } else {
+        -(phase_us(finished_ns, started_ns).min(i64::MAX as u64) as i64)
     }
 }
 
@@ -2458,6 +2902,9 @@ mod tests {
         parent.grant_terminal_rights(crate::TerminalAuthorityRights::OUTPUT);
         parent.grant_process_rights(crate::ProcessAuthorityRights::SPAWN);
         parent.grant_link_rights(crate::LinkAuthorityRights::SYMLINK_READ);
+        parent.grant_device_classes(
+            crate::DeviceClassRights::DISPLAY | crate::DeviceClassRights::AUDIO,
+        );
 
         let child = wasix_proc_spawn_inherited_non_directory_authority(&parent);
 
@@ -2476,6 +2923,27 @@ mod tests {
             child.link_rights(),
             crate::LinkAuthorityRights::SYMLINK_READ
         );
+        assert_eq!(
+            child.device_class_rights(),
+            crate::DeviceClassRights::DISPLAY | crate::DeviceClassRights::AUDIO
+        );
+        assert!(parent.contains_authority(&child));
+    }
+
+    #[test]
+    fn proc_spawn_inherits_device_classes_but_not_named_devices() {
+        let mut parent = ProcessAuthority::empty();
+        parent.grant_device_classes(crate::DeviceClassRights::all());
+        parent
+            .grant_device(
+                crate::DeviceName::new("pci:0000:00:04.0").expect("the test name is short"),
+            )
+            .expect("one named device fits");
+
+        let child = wasix_proc_spawn_inherited_non_directory_authority(&parent);
+
+        assert_eq!(child.device_class_rights(), crate::DeviceClassRights::all());
+        assert!(child.granted_devices().is_empty());
         assert!(parent.contains_authority(&child));
     }
 

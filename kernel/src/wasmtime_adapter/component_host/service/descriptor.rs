@@ -8,13 +8,6 @@ pub(super) struct WasixChildProcess {
     pub(super) completed: Option<u32>,
 }
 
-pub(super) struct WasixThread {
-    pub(super) tid: u32,
-    pub(super) signal_state: WasixSignalState,
-    pub(super) exit: Option<futures::channel::oneshot::Receiver<u32>>,
-    pub(super) completed: Option<u32>,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct WasixSignalDisposition {
     pub(super) signal: u8,
@@ -27,27 +20,126 @@ pub(super) enum WasixSignalDispositionAction {
     Ignore,
 }
 
+/// One signal mailbox: a process's, shared by every store of the
+/// process (its threads' included), or one thread's, read only by that
+/// thread's store. It holds the one pending delivery, the interval
+/// timer's generation, the broadcast a raise sends to the turns driving
+/// the stores that read it, and the instance a raise interrupts. A
+/// thread's mailbox also carries the end of its process
+/// ([`Self::end_thread`]), which reaches the thread the way a signal
+/// does and is never taken.
+///
+/// # Concurrency
+///
+/// Any processor may raise (a parent's `proc_raise`, a sibling's
+/// `thread_signal`, the interval timer task) or end the thread (the
+/// process's last turn); one turn at a time takes. The pending signal,
+/// the end and the generation are single atomics and the broadcast is
+/// lock-free; only naming and reaching the interrupt target takes a
+/// spin lock, see [`WasixSignals::target`].
 #[derive(Clone)]
 pub(super) struct WasixSignalState {
-    pub(super) pending: Arc<AtomicU32>,
-    pub(super) interval_generation: Arc<AtomicU64>,
+    shared: Arc<WasixSignals>,
+}
+
+struct WasixSignals {
+    pending: AtomicU32,
+    /// Set once, when the process this thread belongs to has ended. It
+    /// is a stop the thread's store owes its guest at every turn from
+    /// then on, so it is read and never taken.
+    thread_ended: AtomicBool,
+    interval_generation: AtomicU64,
+    /// Broadcast by every raise and by the thread's end, after either is
+    /// stored, so a turn whose guest is suspended in a host call ends the
+    /// call instead of waiting for the host call to resolve.
+    raised: crate::Notify,
+    /// The process a raise interrupts, once a store of it exists.
+    ///
+    /// Raises come from host calls and timer tasks, never from an
+    /// interrupt handler, so a spin lock is enough; it is also what orders
+    /// a raise against [`WasixSignalState::attach`], which see the comment
+    /// there.
+    target: Mutex<Option<SignalTarget>>,
+}
+
+struct SignalTarget {
+    interrupts: Arc<GuestInterrupts>,
+    instance: crate::InstanceId,
 }
 
 impl WasixSignalState {
     pub(super) fn new() -> Self {
         Self {
-            pending: Arc::new(AtomicU32::new(WASIX_NO_PENDING_SIGNAL)),
-            interval_generation: Arc::new(AtomicU64::new(0)),
+            shared: Arc::new(WasixSignals {
+                pending: AtomicU32::new(WASIX_NO_PENDING_SIGNAL),
+                thread_ended: AtomicBool::new(false),
+                interval_generation: AtomicU64::new(0),
+                raised: crate::Notify::new(),
+                target: Mutex::new(None),
+            }),
         }
     }
 
+    /// Marks `signal` pending and brings it to the guest: a running
+    /// guest takes it at its next interrupt check, which interrupting
+    /// every store of the process makes immediate, and a suspended one
+    /// through the turn that waits on `raised`.
     pub(super) fn raise(&self, signal: u32) {
-        self.pending.store(signal, AtomicOrdering::Release);
-        crate::wasmtime_adapter::bump_user_engine_epoch();
+        self.shared.pending.store(signal, AtomicOrdering::Release);
+        self.deliver();
+    }
+
+    /// Ends the thread whose mailbox this is, because its process ended:
+    /// a running thread meets the end at its next interrupt check, which
+    /// interrupting the process's stores makes immediate, and a suspended
+    /// one through the turn that waits on `raised`, which drops the call
+    /// it is suspended in (a parked `memory.atomic.wait` included).
+    pub(super) fn end_thread(&self) {
+        self.shared
+            .thread_ended
+            .store(true, AtomicOrdering::Release);
+        self.deliver();
+    }
+
+    /// Whether [`Self::end_thread`] has ended the thread.
+    pub(super) fn thread_ended(&self) -> bool {
+        self.shared.thread_ended.load(AtomicOrdering::Acquire)
+    }
+
+    /// Brings what was just stored to the stores that read this mailbox:
+    /// wakes the turns whose guests are suspended and interrupts the
+    /// running ones.
+    fn deliver(&self) {
+        self.shared.raised.notify_all();
+        if let Some(target) = &*self.shared.target.lock() {
+            target.interrupts.interrupt_instance(target.instance);
+        }
+    }
+
+    /// Names `instance`, whose stores `interrupts` reaches, as the process
+    /// a raise interrupts. Every store of the process attaches when it is
+    /// created; a replacement image attaches its own instance.
+    ///
+    /// A raise or an end that came before the target was named left its
+    /// mark and interrupted nothing, so this interrupts on its behalf.
+    /// The lock orders the two: one that takes it after this released it
+    /// finds the target, and one that took it before had already stored
+    /// its mark, which the loads below then see.
+    pub(super) fn attach(&self, interrupts: Arc<GuestInterrupts>, instance: crate::InstanceId) {
+        *self.shared.target.lock() = Some(SignalTarget {
+            interrupts: interrupts.clone(),
+            instance,
+        });
+        if self.shared.pending.load(AtomicOrdering::Acquire) != WASIX_NO_PENDING_SIGNAL
+            || self.thread_ended()
+        {
+            interrupts.interrupt_instance(instance);
+        }
     }
 
     pub(super) fn take_pending(&self) -> Option<u32> {
         match self
+            .shared
             .pending
             .swap(WASIX_NO_PENDING_SIGNAL, AtomicOrdering::AcqRel)
         {
@@ -57,7 +149,8 @@ impl WasixSignalState {
     }
 
     pub(super) fn next_interval_generation(&self) -> u64 {
-        self.interval_generation
+        self.shared
+            .interval_generation
             .fetch_add(1, AtomicOrdering::AcqRel)
             .saturating_add(1)
     }
@@ -67,7 +160,10 @@ impl WasixSignalState {
     }
 
     pub(super) fn interval_generation_is_current(&self, generation: u64) -> bool {
-        self.interval_generation.load(AtomicOrdering::Acquire) == generation
+        self.shared
+            .interval_generation
+            .load(AtomicOrdering::Acquire)
+            == generation
     }
 }
 
@@ -169,6 +265,12 @@ pub(super) enum EpollWaitTarget {
         event: EventFd,
         wait: crate::NotifyWaiter,
     },
+    /// Serial-backed stdin: the debug console's receive signal is the
+    /// wakeup source, parked on through the writer handle's poll form.
+    SerialInput {
+        serial: crate::DebugSerialWriter,
+        wait: crate::NotifyWaiter,
+    },
 }
 
 impl EpollWaitTarget {
@@ -177,6 +279,7 @@ impl EpollWaitTarget {
             Self::ByteReader { reader, wait } => reader.poll_readable(cx, wait),
             Self::ByteWriter { writer, wait } => writer.poll_writable(cx, wait),
             Self::Event { event, wait } => event.poll_readable(cx, wait),
+            Self::SerialInput { serial, wait } => serial.poll_debug_serial_input(cx, wait),
         }
     }
 }
@@ -184,10 +287,10 @@ impl EpollWaitTarget {
 /// How long a waiter sleeps between re-probing descriptors that have no
 /// wakeup source of their own.
 ///
-/// Network sockets only advance when the device is driven and the serial
-/// console has no readiness interrupt, so a waiter registered on one of them
-/// has to come back and look. This matches the network service's own
-/// progress cadence; it is a bounded sleep, not a spin.
+/// Network sockets only advance when the device is driven, so a waiter
+/// registered on one of them has to come back and look. This matches the
+/// network service's own progress cadence; it is a bounded sleep, not a
+/// spin.
 pub(super) const P1_READINESS_REPOLL_INTERVAL: Duration = Duration::from_micros(50);
 
 /// Everything a `poll_oneoff`/`epoll_wait` sleep has to watch.
@@ -196,7 +299,7 @@ pub(super) struct P1WaitSet {
     /// eventfds, child stdin).
     pub(super) notified: Vec<EpollWaitTarget>,
     /// Set when at least one descriptor only reveals readiness by being
-    /// re-probed (network sockets, the serial console).
+    /// re-probed (network sockets).
     pub(super) repoll: bool,
 }
 
@@ -278,9 +381,9 @@ pub(super) async fn p1_wait_step<CpuImpl>(
 
 /// Register whatever wakes `fd` into `wait`.
 ///
-/// Descriptors backed by a kernel channel register a real waiter. Network
-/// sockets and the serial console have no wakeup source, so they only set the
-/// re-probe flag.
+/// Descriptors backed by a kernel channel register a real waiter, and
+/// serial-backed stdin parks on the console's receive signal. Network
+/// sockets have no wakeup source, so they only set the re-probe flag.
 pub(super) fn p1_add_wait_target<CpuImpl, Net, HostFs>(
     store: &Preview1ProgramStore<CpuImpl, Net, HostFs>,
     fd: i32,
@@ -329,8 +432,12 @@ pub(super) fn p1_add_wait_target<CpuImpl, Net, HostFs>(
                         wait: stdin_rx.wait_state(),
                     });
                 }
-                // The serial console has no readiness interrupt.
-                OutputMode::Serial => wait.repoll = true,
+                // The serial console's receive signal is the wakeup
+                // source, parked on the same way a channel's is.
+                OutputMode::Serial => wait.notified.push(EpollWaitTarget::SerialInput {
+                    serial: store.write_serial,
+                    wait: store.write_serial.debug_serial_input_waiter(),
+                }),
                 // Trace output never delivers input; the probe reports it as
                 // an immediate hangup, so there is nothing to wait for.
                 OutputMode::Trace => {}
@@ -840,6 +947,186 @@ pub(super) struct EventFdState {
 #[derive(Debug, Error)]
 #[error("guest requested wasi preview1 exit")]
 pub(super) struct Preview1Exit;
+
+/// The guest ended its own thread (`thread_exit`) with the status it
+/// requested. A spawned thread ends alone, as `pthread_exit` does; on
+/// main the image ends with the status, as it does on `proc_exit`.
+/// Every other requested end ([`Preview1Exit`]) ends the whole process,
+/// whichever thread asks for it.
+#[derive(Debug, Error)]
+#[error("guest requested wasix thread exit")]
+pub(super) struct WasixThreadExitRequested;
+
+impl WasixThreadExitRequested {
+    /// Whether `error` is a thread's own exit.
+    pub(super) fn is(error: &wasmtime::Error) -> bool {
+        error.downcast_ref::<Self>().is_some()
+    }
+}
+
+/// A pending WASIX signal raised on the process ended the guest. The
+/// program exits with `128 + signal`, whatever the guest asked for
+/// before it, and on any thread the whole process does.
+#[derive(Debug, Error)]
+#[error("guest ended by wasix signal {signal}")]
+pub(super) struct Preview1SignalExit {
+    pub(super) signal: u32,
+}
+
+impl Preview1SignalExit {
+    pub(super) fn exit_code(&self) -> u32 {
+        128u32.saturating_add(self.signal)
+    }
+}
+
+/// A WASIX signal raised on one thread alone (`thread_signal`) ended
+/// that thread's call. The thread exits with `128 + signal`, whatever it
+/// asked for before; a spawned thread ends alone, so a joiner sees the
+/// status, and main ends the image with it.
+#[derive(Debug, Error)]
+#[error("wasix thread ended by thread-directed signal {signal}")]
+pub(super) struct WasixThreadSignalExit {
+    pub(super) signal: u32,
+}
+
+impl WasixThreadSignalExit {
+    pub(super) fn exit_code(&self) -> u32 {
+        128u32.saturating_add(self.signal)
+    }
+}
+
+/// The process a WASIX thread belongs to ended, and the thread ends with
+/// it ([`WasixSignalState::end_thread`]). On main it means a spawned
+/// thread ended the process ([`WasixProcessThreads::end_from_thread`]),
+/// and main completes the way that thread chose.
+#[derive(Debug, Error)]
+#[error("wasix thread ended with its process")]
+pub(super) struct WasixThreadEnded;
+
+impl WasixThreadEnded {
+    /// The status the ended thread reports: a SIGKILL's, since nothing
+    /// the thread did ended it. Nobody can join it any more, so the
+    /// status is only ever seen by the process's own end.
+    pub(super) const EXIT_CODE: u32 = 128 + 9;
+
+    /// Whether `error` is a thread's end.
+    pub(super) fn is(error: &wasmtime::Error) -> bool {
+        error.downcast_ref::<Self>().is_some()
+    }
+}
+
+/// The exit status of a program whose call ended in `error`, given the
+/// status the guest `requested` before: the signal that ended it, raised
+/// on its process or its thread, otherwise the requested status,
+/// otherwise none, and the error is a failure.
+pub(super) fn preview1_exit_status(error: &wasmtime::Error, requested: Option<u32>) -> Option<u32> {
+    if let Some(exit) = error.downcast_ref::<Preview1SignalExit>() {
+        return Some(exit.exit_code());
+    }
+    if let Some(exit) = error.downcast_ref::<WasixThreadSignalExit>() {
+        return Some(exit.exit_code());
+    }
+    requested
+}
+
+/// How a process ends when one of its calls ended in `error`, given the
+/// status the guest `requested` before: the exit status
+/// [`preview1_exit_status`] finds, otherwise the failure the error is
+/// (a trap, an out-of-memory kill, any other runtime error). Main's own
+/// end and a spawned thread's end of its process both report through
+/// this, so a trap ends the process the same way on any thread.
+pub(super) fn preview1_process_end(
+    error: wasmtime::Error,
+    requested: Option<u32>,
+) -> Result<u32, ProgramExecError> {
+    match preview1_exit_status(&error, requested) {
+        Some(code) => Ok(code),
+        None => Err(map_program_runtime_error(error)),
+    }
+}
+
+/// The signals one store answers to: those raised on its own thread and
+/// those raised on its process. A thread-directed raise reaches only this
+/// store's turn; a process-directed one goes to whichever store of the
+/// process takes it first.
+///
+/// # Concurrency
+///
+/// As [`WasixSignalState`]: either mailbox is raised from any processor,
+/// and one turn of this store at a time takes.
+#[derive(Clone)]
+pub(super) struct WasixStoreSignals {
+    thread: WasixSignalState,
+    process: WasixSignalState,
+}
+
+impl WasixStoreSignals {
+    pub(super) fn new(thread: WasixSignalState, process: WasixSignalState) -> Self {
+        Self { thread, process }
+    }
+
+    /// The stop this store owes its guest, if any: the end of its
+    /// thread's process, which stays owed, then a pending signal, which
+    /// is delivered once. The interrupt callback and the turn both read
+    /// it, so a running guest and a suspended one meet the same stop.
+    pub(super) fn owed_stop(&self) -> Option<wasmtime::Error> {
+        if self.thread.thread_ended() {
+            return Some(wasmtime::Error::new(WasixThreadEnded));
+        }
+        if let Some(signal) = self.thread.take_pending() {
+            return Some(wasmtime::Error::new(WasixThreadSignalExit { signal }));
+        }
+        self.process
+            .take_pending()
+            .map(|signal| wasmtime::Error::new(Preview1SignalExit { signal }))
+    }
+}
+
+/// A raise on either mailbox, and the end of the thread, wakes the turn
+/// driving this store, so a guest suspended in a host call is stopped
+/// without waiting for the call.
+impl crate::component::StopWake for WasixStoreSignals {
+    type Wait = (crate::NotifyWaiter, crate::NotifyWaiter);
+
+    fn arm_stop_wait(&self) -> Self::Wait {
+        (
+            self.thread.shared.raised.waiter(),
+            self.process.shared.raised.waiter(),
+        )
+    }
+
+    fn poll_stop_wait(
+        &self,
+        cx: &mut core::task::Context<'_>,
+        (thread, process): &mut Self::Wait,
+    ) -> core::task::Poll<()> {
+        // Both are polled, so each re-arms on `Ready` as the trait asks
+        // and each registers its listener on `Pending`.
+        let thread = self.thread.shared.raised.poll_notified(cx, thread);
+        let process = self.process.shared.raised.poll_notified(cx, process);
+        if thread.is_ready() || process.is_ready() {
+            core::task::Poll::Ready(())
+        } else {
+            core::task::Poll::Pending
+        }
+    }
+}
+
+/// A WASIX store delivers its thread's end and a pending signal wherever
+/// its turn reads them: before the guest is resumed, when a raise or an
+/// end wakes a suspended call, and when the call completes, which is
+/// where a stop raised in the guest's last host call arrives, the guest
+/// having gone back to the host without meeting the interrupt check that
+/// would otherwise have delivered it.
+impl<RuntimeStateImpl> crate::component::TurnEpilogue<RuntimeStateImpl, wasmtime::Error>
+    for WasixStoreSignals
+{
+    fn end_turn(&self, _: &RuntimeStateImpl) {}
+
+    fn take_stop(&self) -> Option<wasmtime::Error> {
+        self.owed_stop()
+    }
+}
 
 pub(super) fn preview1_cwd_from_authority(authority: &ProcessAuthority) -> Option<Preview1Cwd> {
     authority.cwd().map(|preopen| Preview1Cwd {

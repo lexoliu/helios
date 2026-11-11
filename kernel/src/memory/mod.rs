@@ -44,6 +44,8 @@ pub use fiber_stack::{
     StackFault, claim_fiber_stack, fiber_stack_arena_stats, fiber_stack_demand_commits_on,
     install_fiber_stack_arena, install_fiber_stack_hooks, resolve_stack_fault,
 };
+#[cfg(all(target_os = "none", feature = "wasmtime-bare-metal"))]
+pub(crate) use fiber_stack::{fiber_parking, parked_fibers};
 pub use frame_reserve::reserved_bytes as page_fault_frame_reserve_bytes;
 pub(crate) use frame_reserve::{
     configure_processors as configure_frame_reserve_processors, top_up as top_up_frame_reserve,
@@ -52,7 +54,7 @@ pub(crate) use irq_safe::IrqSafeMutex;
 pub use mapping_cost::user_mapping_kernel_heap_bytes;
 pub use owner::{
     MemoryOwner, UserMemoryOwnerScope, UserMemoryOwners, configure_user_memory_owner_processors,
-    current_user_memory_owner, enter_user_memory_owner, set_user_memory_owner,
+    current_user_memory_owner, enter_user_memory_owner,
 };
 pub use pmm::KernelPhysFrameAllocator;
 pub use policy::{
@@ -62,8 +64,8 @@ pub use policy::{
     USER_POOL_MIN_REGION_BYTES, kernel_reserve_for, task_arena_bytes_for,
 };
 pub use reservations::{
-    AccessibilityPlan, CommittedRegion, ReleasedReservation, ReservationLookup, ReservationTracker,
-    SwapEntry, VaCursor, validate_range,
+    AccessibilityPlan, CommittedRegion, CommittedRemoval, Decommitted, ReleasedReservation,
+    ReservationLookup, ReservationTracker, SwapEntry, VaCursor, ranges_outside, validate_range,
 };
 pub use swap::{
     IDLE_SWAP_AFTER, SWAP_BATCH_BYTES, SWAP_TICK, SwapDisabled, SwapFaultError, SwapHandle,

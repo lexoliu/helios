@@ -12,10 +12,10 @@ use crate::wit_bindgen::{FutureReader, StreamReader};
 use futures_lite::future::zip;
 
 pub use crate::bindings::helios::system::programs::{
-    AotHint, AotRequest, AotResult, CapabilityGrant, ClockGrant, ClockRight, DirectoryGrant,
-    ExecError, ExecErrorKind, ExecOutput, ExecRequest, ExecResult, ExitStatus, FilesystemRight,
-    LinkGrant, LinkRight, NetworkGrant, NetworkRight, ProcessGrant, ProcessRight, SpawnError,
-    SpawnErrorKind, SpawnRequest, TerminalGrant, TerminalRight,
+    AotHint, AotRequest, AotResult, CapabilityGrant, ClockGrant, ClockRight, DeviceClass,
+    DeviceGrant, DirectoryGrant, ExecError, ExecErrorKind, ExecOutput, ExecRequest, ExecResult,
+    ExitStatus, FilesystemRight, LinkGrant, LinkRight, NetworkGrant, NetworkRight, ProcessGrant,
+    ProcessRight, SpawnError, SpawnErrorKind, SpawnRequest, TerminalGrant, TerminalRight,
 };
 
 /// Build a directory capability grant for `helios:system/programs`.
@@ -79,6 +79,23 @@ pub fn root_link_grant() -> CapabilityGrant {
         LinkRight::TargetDirectory,
         LinkRight::SymlinkCreate,
         LinkRight::SymlinkRead,
+    ])
+}
+
+/// Build a device-class grant. A program holds a class only when its
+/// parent granted it, so the classes must be a subset of the caller's.
+pub fn device_grant(classes: Vec<DeviceClass>) -> CapabilityGrant {
+    CapabilityGrant::Device(DeviceGrant { classes })
+}
+
+/// Every device class, for a trusted launcher that runs programs on the
+/// machine owner's behalf.
+pub fn all_device_classes_grant() -> CapabilityGrant {
+    device_grant(vec![
+        DeviceClass::Display,
+        DeviceClass::Input,
+        DeviceClass::Gpu,
+        DeviceClass::Audio,
     ])
 }
 

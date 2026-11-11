@@ -10,6 +10,9 @@ where
     pub(super) timer: crate::Timer<CpuImpl>,
     pub(super) spawner: crate::InstanceSpawner<CpuImpl>,
     pub(super) runtime_state: HostRuntimeState<CpuImpl, Net, HostFs>,
+    /// The interrupt routes of the engine this store runs on, which its
+    /// threads' stores register with too.
+    pub(super) interrupts: Arc<GuestInterrupts>,
     activity: crate::InstanceActivity,
     pub(super) parent_instance_id: Option<crate::InstanceId>,
     pub(super) filesystem: DebugFileSystem<HostRuntimeState<CpuImpl, Net, HostFs>, HostFs>,
@@ -30,6 +33,10 @@ where
     pub(super) tty_state: WasixTtyState,
     pub(super) signal_callback: Option<String>,
     pub(super) signal_state: WasixSignalState,
+    /// Signals raised on this store's thread alone (`thread_signal`),
+    /// and the end of its process. Main's is its process table's
+    /// [`WasixProcessThreads::main_mailbox`].
+    pub(super) thread_signals: WasixSignalState,
     /// The `proc_raise_interval` timer this store asked for, if any.
     ///
     /// A repeating interval sleeps between raises, so nothing but its
@@ -43,8 +50,8 @@ where
     pub(super) asyncify: WasixAsyncifyState<Net>,
     pub(super) children: Vec<WasixChildProcess>,
     pub(super) thread_id: u32,
-    pub(super) next_thread_id: u32,
-    pub(super) threads: Vec<WasixThread>,
+    /// The threads of this store's process, shared by every store of it.
+    pub(super) threads: WasixImageThreads<CpuImpl, Net, HostFs>,
     pub(super) requested_exit: Option<u32>,
     pub(super) exec_replacement: Option<WasixExecReplacement<CpuImpl, Net, HostFs>>,
 }
@@ -61,6 +68,7 @@ where
         timer: crate::Timer<CpuImpl>,
         spawner: crate::InstanceSpawner<CpuImpl>,
         runtime_state: HostRuntimeState<CpuImpl, Net, HostFs>,
+        interrupts: Arc<GuestInterrupts>,
         instance: crate::RegisteredInstance,
         parent_instance_id: Option<crate::InstanceId>,
         arguments: Vec<String>,
@@ -73,9 +81,11 @@ where
         filesystem: Option<DebugFileSystemSnapshot>,
         descriptors: Option<Preview1DescriptorTable<Net>>,
         signal_state: WasixSignalState,
+        thread_signals: WasixSignalState,
         signal_dispositions: Vec<WasixSignalDisposition>,
         current_core_module: Option<Arc<WasmtimeCompiledCoreModule>>,
         wasix_abi: bool,
+        threads: WasixImageThreads<CpuImpl, Net, HostFs>,
     ) -> Self {
         let filesystem = filesystem.map_or_else(
             || DebugFileSystem::new(runtime_state.clone()),
@@ -93,6 +103,7 @@ where
             timer,
             spawner,
             runtime_state,
+            interrupts,
             activity: crate::InstanceActivity::new(
                 instance,
                 crate::store_kernel_heap_bytes(size_of::<Self>()),
@@ -116,14 +127,14 @@ where
             tty_state,
             signal_callback: None,
             signal_state,
+            thread_signals,
             signal_interval: None,
             signal_dispositions,
             descriptors,
             asyncify: WasixAsyncifyState::new(),
             children: Vec::new(),
             thread_id: 0,
-            next_thread_id: 1,
-            threads: Vec::new(),
+            threads,
             requested_exit: None,
             exec_replacement: None,
         }
@@ -274,20 +285,20 @@ where
 
     pub(super) fn set_thread_id(&mut self, thread_id: u32) {
         self.thread_id = thread_id;
-        self.next_thread_id = thread_id.saturating_add(1);
-    }
-
-    pub(super) fn allocate_thread_id(&mut self) -> Result<u32, i32> {
-        let tid = self.next_thread_id;
-        self.next_thread_id = self
-            .next_thread_id
-            .checked_add(1)
-            .ok_or(p1::errno::OVERFLOW)?;
-        Ok(tid)
     }
 
     pub(super) fn take_requested_exit(&mut self) -> Option<u32> {
         self.requested_exit.take()
+    }
+
+    /// How the process ends once this store's call ended in `error`: the
+    /// signal that ended it, otherwise the status the guest asked for,
+    /// otherwise the failure the error is ([`preview1_process_end`]).
+    pub(super) fn take_process_end(
+        &mut self,
+        error: wasmtime::Error,
+    ) -> Result<u32, ProgramExecError> {
+        preview1_process_end(error, self.requested_exit.take())
     }
 
     pub(super) fn exec_context(&self) -> ProgramExecContext<CpuImpl, Net, HostFs> {
@@ -309,84 +320,50 @@ where
         self.activity.instance()
     }
 
-    /// The whole call-hook body for this store.
+    /// The handle the code driving this store accounts its processor
+    /// turns through. Taken before the store is borrowed for the call;
+    /// see [`crate::component::GuestTurns::drive`].
+    pub(super) fn guest_turns(
+        &self,
+    ) -> crate::component::GuestTurns<
+        CpuImpl,
+        HostRuntimeState<CpuImpl, Net, HostFs>,
+        WasixStoreSignals,
+    > {
+        crate::component::GuestTurns::new(
+            self.activity.turns(),
+            self.cpu.clone(),
+            self.runtime_state.clone(),
+            self.signals(),
+        )
+    }
+
+    /// The signals this store answers to: its own thread's, ahead of its
+    /// process's.
+    pub(super) fn signals(&self) -> WasixStoreSignals {
+        WasixStoreSignals::new(self.thread_signals.clone(), self.signal_state.clone())
+    }
+
+    /// The interrupt callback for this store: where the end of the
+    /// thread's process, a pending WASIX signal and a condemnation reach
+    /// a running guest, and where the end of a time slice makes it yield.
     ///
-    /// Every exit that traps goes through [`crate::InstanceActivity`]'s
-    /// terminal state first. Wasmtime pairs its hooks around the call
-    /// it is making, so returning an error from a hook cancels the call
-    /// whose matching hook would have closed the transition just
-    /// recorded — while the `ReturningFromWasm` that unwinds the trap
-    /// still arrives. Ending the activation before the trap is raised
-    /// is what leaves that trailing transition nothing to close (#114).
-    pub(super) fn record_call_hook(
-        &mut self,
-        transition: crate::InstanceExecutionTransition,
-    ) -> wasmtime::Result<()> {
-        let killed = self.record_transition(transition);
-        if let Some(signal) = self.signal_state.take_pending() {
-            self.end_activation();
-            self.request_exit(128u32.saturating_add(signal));
-            return Err(wasmtime::Error::new(Preview1Exit));
+    /// Ending a thread, raising a signal and condemning an instance all
+    /// interrupt every store of the instance, so a guest that is running
+    /// meets this at its next function entry or loop header. One
+    /// suspended in a host call meets none of them here: the turn driving
+    /// the store is woken and ends the call, and a call that returns to
+    /// the host first meets them where it completes (see
+    /// [`crate::component::TurnEpilogue::take_stop`]). The thread's end
+    /// comes first, then a signal, then a kill.
+    fn on_interrupt(&mut self) -> wasmtime::Result<wasmtime::InterruptAction> {
+        if let Some(stop) = self.signals().owed_stop() {
+            return Err(stop);
         }
-        match killed {
-            Some(reason) => Err(wasmtime::Error::from(crate::InstanceKilled { reason })),
-            None => Ok(()),
+        if let Some(reason) = self.activity.pending_kill() {
+            return Err(wasmtime::Error::from(crate::InstanceKilled { reason }));
         }
-    }
-
-    /// Same naming as the component path: while this processor is
-    /// running the program's guest code, pages it commits are the
-    /// program's. See `component::runtime`'s `record_transition`.
-    ///
-    /// Returns the kill reason when the instance has been condemned,
-    /// with the activation already ended.
-    fn record_transition(
-        &mut self,
-        transition: crate::InstanceExecutionTransition,
-    ) -> Option<crate::KillReason> {
-        let now_nanos = self.now_nanos();
-        let step = self.activity.record(transition, now_nanos);
-        self.apply_activity_change(step.change);
-        step.killed
-    }
-
-    /// End this store's activation because a trap the guest never
-    /// returns from is about to be raised.
-    fn end_activation(&mut self) {
-        let now_nanos = self.now_nanos();
-        let change = self.activity.end(now_nanos);
-        self.apply_activity_change(change);
-    }
-
-    /// End the activation and report the condemnation when the instance
-    /// has one, for the epoch callback that traps a CPU-bound guest.
-    pub(super) fn end_on_pending_kill(&mut self) -> Option<crate::KillReason> {
-        let reason = self.activity.pending_kill()?;
-        self.end_activation();
-        Some(reason)
-    }
-
-    fn apply_activity_change(&self, change: crate::ActivityChange) {
-        let owner = match change {
-            crate::ActivityChange::Entered => {
-                crate::MemoryOwner::new(self.activity.instance().id().raw())
-            }
-            crate::ActivityChange::Left { .. } => crate::MemoryOwner::NONE,
-            crate::ActivityChange::Unchanged => return,
-        };
-        crate::set_user_memory_owner(helios_hal::cpu::current_processor(), owner);
-        if let crate::ActivityChange::Left {
-            instance_elapsed: Some(elapsed),
-        } = change
-            && self.runtime_state.profiling_enabled()
-        {
-            self.runtime_state.record_profile_stack_parts_nanos(
-                crate::ProfileScope::User,
-                "user;",
-                self.activity.instance().name(),
-                elapsed,
-            );
-        }
+        Ok(wasmtime::InterruptAction::Yield)
     }
 
     /// Deliver stdout/stderr bytes to a kernel-served sink, or hand
@@ -494,49 +471,6 @@ where
         }
     }
 
-    pub(super) fn insert_thread(
-        &mut self,
-        tid: u32,
-        signal_state: WasixSignalState,
-        exit: futures::channel::oneshot::Receiver<u32>,
-    ) {
-        self.threads.push(WasixThread {
-            tid,
-            signal_state,
-            exit: Some(exit),
-            completed: None,
-        });
-    }
-
-    pub(super) fn poll_thread_exit(&mut self, index: usize) -> Option<u32> {
-        if let Some(code) = self.threads[index].completed {
-            return Some(code);
-        }
-        let Some(exit) = self.threads[index].exit.as_mut() else {
-            return self.threads[index].completed;
-        };
-        let waker = futures::task::noop_waker_ref();
-        let mut context = Context::from_waker(waker);
-        match Pin::new(exit).poll(&mut context) {
-            Poll::Pending => None,
-            Poll::Ready(Ok(code)) => {
-                self.threads[index].completed = Some(code);
-                self.threads[index].exit = None;
-                Some(code)
-            }
-            Poll::Ready(Err(_)) => {
-                let code = u32::from(p1::errno::IO as u16);
-                self.threads[index].completed = Some(code);
-                self.threads[index].exit = None;
-                Some(code)
-            }
-        }
-    }
-
-    pub(super) fn find_thread_index(&self, tid: u32) -> Option<usize> {
-        self.threads.iter().position(|thread| thread.tid == tid)
-    }
-
     pub(super) async fn read_stdin(&mut self, max_bytes: usize) -> Bytes {
         let descriptor = self.descriptors.get_mut(0);
         let Some(Preview1Descriptor::Stdin { carry }) = descriptor else {
@@ -545,6 +479,7 @@ where
         if carry.is_empty() {
             match &self.output_mode {
                 OutputMode::Serial => loop {
+                    let wait = self.write_serial.wait_for_debug_serial_input();
                     (self.read_serial)(
                         &mut self.serial_read_buffer,
                         u32::try_from(max_bytes)
@@ -554,7 +489,7 @@ where
                         *carry = Bytes::copy_from_slice(&self.serial_read_buffer);
                         break;
                     }
-                    crate::yield_now().await;
+                    wait.await;
                 },
                 OutputMode::Trace => {}
                 OutputMode::Child { stdin_rx, .. } | OutputMode::RoutedChild { stdin_rx, .. } => {
@@ -569,11 +504,11 @@ where
 
     /// Probe stdin for `poll_oneoff`/`epoll_wait` without blocking.
     ///
-    /// Serial-backed stdin has no readiness notification, so the probe pulls
-    /// whatever the console already has into the descriptor's carry; a later
-    /// `fd_read` drains that carry, so nothing is lost. A child's stdin is a
-    /// byte channel that answers directly, and trace output never delivers
-    /// input at all.
+    /// Serial-backed stdin waits on the console's receive signal, so the
+    /// probe pulls whatever the console already has into the descriptor's
+    /// carry; a later `fd_read` drains that carry, so nothing is lost. A
+    /// child's stdin is a byte channel that answers directly, and trace
+    /// output never delivers input at all.
     pub(super) fn probe_stdin(&mut self, fd: i32) -> P1Readiness {
         match self.descriptors.get(fd) {
             Some(Preview1Descriptor::Stdin { carry }) if !carry.is_empty() => {
@@ -883,6 +818,7 @@ where
                 fill_random(
                     caller.data().memory(),
                     &caller.data().shared.entropy,
+                    caller.data().runtime_state.root_entropy(),
                     ptr as u32,
                     len as u32,
                 )
@@ -1040,25 +976,53 @@ where
                     .clone();
                 let spawner = store_data.spawner.clone();
                 let shared = store_data.shared.clone();
+                let spawned_ns = crate::monotonic_nanos(&store_data.cpu);
                 let task = spawner.spawn(async move {
+                    let started_ns = crate::monotonic_nanos(&store_data.cpu);
+                    let processor = helios_hal::cpu::current_processor().id();
                     let mut store =
                         wasmtime::Store::new(instance_pre.module().engine(), store_data);
-                    configure_compiler_core_store(&mut store);
-                    let thread_started = store.data().cpu.now().ticks();
-                    let result = instance_pre.instantiate(&mut store).and_then(|instance| {
-                        let start = instance
-                            .get_typed_func::<(i32, i32), ()>(&mut store, "wasi_thread_start")?;
-                        start.call(&mut store, (thread_id, start_arg))
-                    });
+                    let _interrupts = configure_compiler_core_store(&mut store);
+                    let thread_started_ticks = store.data().cpu.now().ticks();
+                    let (result, instantiated_ns) = match instance_pre
+                        .instantiate_async(&mut store)
+                        .await
+                    {
+                        Ok(instance) => {
+                            let start = instance
+                                .get_typed_func::<(i32, i32), ()>(&mut store, "wasi_thread_start");
+                            let instantiated_ns = crate::monotonic_nanos(&store.data().cpu);
+                            let result = match start {
+                                Ok(start) => {
+                                    start.call_async(&mut store, (thread_id, start_arg)).await
+                                }
+                                Err(error) => Err(error),
+                            };
+                            (result, instantiated_ns)
+                        }
+                        Err(error) => {
+                            let instantiated_ns = crate::monotonic_nanos(&store.data().cpu);
+                            (Err(error), instantiated_ns)
+                        }
+                    };
+                    let finished_ns = crate::monotonic_nanos(&store.data().cpu);
                     let thread_elapsed = store
                         .data()
                         .cpu
                         .now()
                         .ticks()
-                        .saturating_sub(thread_started);
+                        .saturating_sub(thread_started_ticks);
                     store.data().record_user_ticks(thread_elapsed);
                     if let Err(error) = result {
                         tracing::error!(thread_id, "compiler plugin thread failed: {error:#}");
+                    }
+                    CompilerThreadReport {
+                        thread_id,
+                        processor,
+                        spawned_ns,
+                        started_ns,
+                        instantiated_ns,
+                        finished_ns,
                     }
                 });
                 shared.thread_tasks.lock().push(task);
@@ -1069,28 +1033,32 @@ where
     Ok(())
 }
 
+/// Installs the store's interrupt callback, registers the store for
+/// kills and makes it the target of its process's signals, for as long as
+/// the returned registration lives.
 pub(super) fn configure_preview1_program_store<CpuImpl, Net, HostFs>(
     store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, HostFs>>,
-) where
+) -> StoreInterrupts<CpuImpl>
+where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    store.call_hook(
-        |mut caller: StoreContextMut<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>, hook| {
-            let transition = crate::wasmtime_adapter::store::translate_call_hook(hook);
-            caller.data_mut().record_call_hook(transition)
-        },
-    );
-    store.set_epoch_deadline(1);
-    // Epoch ticks double as the kill observation point for CPU-bound
-    // guests (see `store_with_state`): check the flag, otherwise yield.
-    store.epoch_deadline_callback(|mut caller| {
-        if let Some(reason) = caller.data_mut().end_on_pending_kill() {
-            return Err(wasmtime::Error::from(crate::InstanceKilled { reason }));
-        }
-        Ok(wasmtime::UpdateDeadline::Yield(1))
-    });
+    // No call hook: see `store_with_state`. Turns are accounted where
+    // the call that drives this store is polled, and signals and kills
+    // reach the guest at its interrupt checks.
+    store.interrupt_callback(|mut caller| caller.data_mut().on_interrupt());
+    let interrupts = store.data().interrupts.clone();
+    let instance = store.data().instance().id();
+    let registration = interrupts.register(instance, store, store.data().cpu.clone());
+    // The thread's mailbox needs a target as well, so a running thread
+    // meets a signal raised on it at its next interrupt check.
+    store
+        .data()
+        .signal_state
+        .attach(interrupts.clone(), instance);
+    store.data().thread_signals.attach(interrupts, instance);
+    registration
 }
 
 pub(super) fn preview1_program_linker<CpuImpl, Net, HostFs>(
@@ -1969,7 +1937,10 @@ where
     HostFs: crate::HostFileSystem,
 {
     let mut bytes = vec![0; len as usize];
-    caller.data_mut().entropy.fill_secure(&mut bytes);
+    let store = caller.data_mut();
+    store
+        .entropy
+        .fill_secure(store.runtime_state.root_entropy(), &mut bytes);
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
@@ -2837,7 +2808,14 @@ where
             Ok(service) => service,
             Err(error) => return p1_errno_from_fs(error),
         };
-        let entries = match service.read_dir(&host_path).await {
+        // The whole listing is mirrored, so the bound is the mirror's.
+        let entries = match service
+            .read_dir(
+                &host_path,
+                crate::wasmtime_adapter::wasi::GUEST_DIRECTORY_MIRROR_LIMIT,
+            )
+            .await
+        {
             Ok(entries) => entries,
             Err(error) => {
                 return p1_errno_from_fs(crate::wasmtime_adapter::wasi::map_host_fs_error(error));
@@ -3288,8 +3266,12 @@ where
                     .map_err(p1_errno_from_fs)?;
             }
             if kind != FsNodeKind::File {
+                // The whole listing is mirrored, so the bound is the mirror's.
                 let entries = service
-                    .read_dir(&host_path)
+                    .read_dir(
+                        &host_path,
+                        crate::wasmtime_adapter::wasi::GUEST_DIRECTORY_MIRROR_LIMIT,
+                    )
                     .await
                     .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
                     .map_err(p1_errno_from_fs)?;
@@ -3994,6 +3976,17 @@ where
     };
 
     let ready = loop {
+        // Arm every subscribed descriptor before testing any of them: a
+        // waiter's notification generation is sampled when it is built,
+        // so a byte landing between a descriptor's probe and its waiter's
+        // creation would be invisible to the parked wait.
+        let mut wait = P1WaitSet::new();
+        for subscription in &parsed {
+            if let P1Subscription::Fd { fd, event_type, .. } = subscription {
+                p1_add_wait_target(caller.data(), *fd, *event_type, &mut wait);
+            }
+        }
+
         let mut ready = Vec::new();
         let mut earliest: Option<Duration> = None;
 
@@ -4047,15 +4040,9 @@ where
             break ready;
         }
 
-        // Nothing is ready and no deadline has expired: register on every
-        // subscribed descriptor and sleep until one of them makes progress
-        // or the earliest deadline arrives.
-        let mut wait = P1WaitSet::new();
-        for subscription in &parsed {
-            if let P1Subscription::Fd { fd, event_type, .. } = subscription {
-                p1_add_wait_target(caller.data(), *fd, *event_type, &mut wait);
-            }
-        }
+        // Nothing is ready and no deadline has expired: sleep until one
+        // of the armed descriptors makes progress or the earliest
+        // deadline arrives.
         let timer = caller.data().timer();
         p1_wait_step(&timer, &mut wait, earliest).await;
     };
@@ -4748,8 +4735,12 @@ where
     HostFs: crate::HostFileSystem,
 {
     let written = u32::try_from(bytes.len()).map_err(|_| p1::errno::OVERFLOW)?;
+    let serial = caller.data().write_serial;
     let mut placed = 0;
     let writer = loop {
+        // Armed before the offer so a transmit release that lands
+        // between the two is not lost.
+        let wait = serial.wait_for_debug_serial_output_ready();
         match caller.data().route_output(stream, &bytes[placed..]) {
             RoutedOutput::Child(writer) => break writer,
             RoutedOutput::Local(taken) => {
@@ -4759,7 +4750,8 @@ where
                 }
                 // The debug UART is owned by another processor right
                 // now. A non-blocking descriptor reports what it did
-                // place; a blocking one yields and offers the rest.
+                // place; a blocking one waits on the console's transmit
+                // signal and offers the rest.
                 if taken == 0 {
                     if nonblocking {
                         // POSIX: a non-blocking write that placed
@@ -4771,7 +4763,7 @@ where
                             u32::try_from(placed).map_err(|_| p1::errno::OVERFLOW)
                         };
                     }
-                    crate::yield_now().await;
+                    wait.await;
                 }
             }
         }
@@ -5659,5 +5651,244 @@ mod tests {
             p1_probe_descriptor(Some(&socket), P1_EVENTTYPE_FD_WRITE),
             Ok(P1Probe::Network(P1NetworkProbe::TcpStream(9)))
         ));
+    }
+
+    /// Drive one call into a WASIX store's guest through its turns, the
+    /// way the program driver does.
+    fn drive_wasix_call(
+        activity: &crate::InstanceActivity,
+        signal_state: &WasixSignalState,
+        call: impl core::future::Future<Output = wasmtime::Result<()>>,
+    ) -> wasmtime::Result<()> {
+        let turns = wasix_turns(activity, store_signals(signal_state));
+        futures_lite::future::block_on(turns.drive(call))
+    }
+
+    /// The signals of a store whose process mailbox is `process`, with a
+    /// thread mailbox of its own.
+    fn store_signals(process: &WasixSignalState) -> WasixStoreSignals {
+        WasixStoreSignals::new(WasixSignalState::new(), process.clone())
+    }
+
+    /// The turns of a WASIX store that answers to `signals`.
+    fn wasix_turns(
+        activity: &crate::InstanceActivity,
+        signals: WasixStoreSignals,
+    ) -> crate::component::GuestTurns<
+        crate::test_support::ManualClockCpu,
+        crate::test_support::TestRuntimeState,
+        WasixStoreSignals,
+    > {
+        crate::component::GuestTurns::new(
+            activity.turns(),
+            crate::test_support::ManualClockCpu::new(),
+            crate::test_support::TestRuntimeState::default(),
+            signals,
+        )
+    }
+
+    /// A signal raised while the guest is in its last host call ends the
+    /// program with `128 + signal`, although the guest then returns from
+    /// its export without meeting another interrupt check. The call meets
+    /// the signal where it completes, and the signal takes precedence
+    /// over the status the guest asked for, as it did when a call hook
+    /// delivered it on the way back from that host call.
+    #[test]
+    fn a_signal_raised_in_the_last_host_call_exits_128_plus_the_signal() {
+        let registry = crate::InstanceRegistry::new();
+        let activity = crate::InstanceActivity::new(registry.register("signalled", 0), 0);
+        let signal_state = WasixSignalState::new();
+        let sender = signal_state.clone();
+        // The last host call is where the program is signalled; it
+        // returns without suspending, and so does the export.
+        let call = core::future::poll_fn(move |_| {
+            sender.raise(15);
+            core::task::Poll::Ready(Ok(()))
+        });
+
+        let error =
+            drive_wasix_call(&activity, &signal_state, call).expect_err("the signal ends the call");
+        assert_eq!(preview1_exit_status(&error, Some(0)), Some(143));
+        assert_eq!(
+            signal_state.take_pending(),
+            None,
+            "the signal is delivered once"
+        );
+    }
+
+    /// Counts the wakes a turn receives.
+    #[derive(Default)]
+    struct CountingWaker {
+        wakes: core::sync::atomic::AtomicUsize,
+    }
+
+    impl std::task::Wake for CountingWaker {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.wakes.fetch_add(1, AtomicOrdering::AcqRel);
+        }
+    }
+
+    /// A signal raised while the guest is suspended in a host call that
+    /// never resolves wakes the turn, which ends the call with
+    /// `128 + signal` instead of waiting for the host call; a
+    /// condemnation raised in the same wait comes second.
+    #[test]
+    fn a_signal_ends_a_call_suspended_in_a_host_call_that_never_resolves() {
+        let registry = crate::InstanceRegistry::new();
+        let instance = registry.register("sleeping", 0);
+        let activity = crate::InstanceActivity::new(instance.clone(), 0);
+        let signal_state = WasixSignalState::new();
+        let turns = wasix_turns(&activity, store_signals(&signal_state));
+        let call = core::future::pending::<wasmtime::Result<()>>();
+        let wakes = Arc::new(CountingWaker::default());
+        let waker = core::task::Waker::from(wakes.clone());
+        let mut cx = core::task::Context::from_waker(&waker);
+        let mut driven = core::pin::pin!(turns.drive(call));
+
+        assert!(driven.as_mut().poll(&mut cx).is_pending());
+        signal_state.raise(9);
+        assert_eq!(
+            registry.request_kill(instance.id(), crate::KillReason::Operator, 0),
+            crate::KillOutcome::Requested
+        );
+        assert!(
+            wakes.wakes.load(AtomicOrdering::Acquire) >= 1,
+            "the raise wakes the turn"
+        );
+        let core::task::Poll::Ready(Err(error)) = driven.as_mut().poll(&mut cx) else {
+            panic!("the signal ends the suspended call");
+        };
+        assert_eq!(preview1_exit_status(&error, None), Some(137));
+        assert_eq!(signal_state.take_pending(), None, "delivered once");
+    }
+
+    /// A signal raised on one thread of a process reaches that thread's
+    /// store alone: it ends the call the thread is suspended in with
+    /// `128 + signal`, and a sibling store of the same process, suspended
+    /// too, is neither woken nor handed the signal.
+    #[test]
+    fn a_thread_signal_ends_only_the_target_threads_suspended_call() {
+        let registry = crate::InstanceRegistry::new();
+        let instance = registry.register("threaded", 0);
+        let process = WasixSignalState::new();
+        let caller_thread = WasixSignalState::new();
+        let target_thread = WasixSignalState::new();
+        let caller_signals = WasixStoreSignals::new(caller_thread.clone(), process.clone());
+        let caller_activity = crate::InstanceActivity::new(instance.clone(), 0);
+        let target_activity = crate::InstanceActivity::new(instance, 0);
+        let caller_turns = wasix_turns(&caller_activity, caller_signals.clone());
+        let target_turns = wasix_turns(
+            &target_activity,
+            WasixStoreSignals::new(target_thread.clone(), process.clone()),
+        );
+        let caller_wakes = Arc::new(CountingWaker::default());
+        let caller_waker = core::task::Waker::from(caller_wakes.clone());
+        let mut caller_cx = core::task::Context::from_waker(&caller_waker);
+        let target_wakes = Arc::new(CountingWaker::default());
+        let target_waker = core::task::Waker::from(target_wakes.clone());
+        let mut target_cx = core::task::Context::from_waker(&target_waker);
+        let mut caller_call =
+            core::pin::pin!(caller_turns.drive(core::future::pending::<wasmtime::Result<()>>()));
+        let mut target_call =
+            core::pin::pin!(target_turns.drive(core::future::pending::<wasmtime::Result<()>>()));
+
+        assert!(caller_call.as_mut().poll(&mut caller_cx).is_pending());
+        assert!(target_call.as_mut().poll(&mut target_cx).is_pending());
+        target_thread.raise(9);
+
+        assert_eq!(
+            caller_wakes.wakes.load(AtomicOrdering::Acquire),
+            0,
+            "the raise does not wake a sibling thread's turn"
+        );
+        assert!(
+            target_wakes.wakes.load(AtomicOrdering::Acquire) >= 1,
+            "the raise wakes the target thread's turn"
+        );
+        assert!(
+            caller_call.as_mut().poll(&mut caller_cx).is_pending(),
+            "the sibling's suspended call goes on"
+        );
+        assert!(
+            caller_signals.owed_stop().is_none(),
+            "the sibling is owed nothing"
+        );
+        let core::task::Poll::Ready(Err(error)) = target_call.as_mut().poll(&mut target_cx) else {
+            panic!("the signal ends the target thread's suspended call");
+        };
+        assert_eq!(preview1_exit_status(&error, None), Some(137));
+        assert_eq!(target_thread.take_pending(), None, "delivered once");
+        assert_eq!(
+            process.take_pending(),
+            None,
+            "the process mailbox is untouched"
+        );
+    }
+
+    /// A store owes its guest a signal raised on its own thread ahead of
+    /// one raised on its process, and the process's after that. The stop
+    /// says which it was: a thread-directed signal ends the thread alone,
+    /// a process-directed one the whole process.
+    #[test]
+    fn a_store_takes_its_threads_signal_before_its_processs() {
+        let process = WasixSignalState::new();
+        let thread = WasixSignalState::new();
+        let signals = WasixStoreSignals::new(thread.clone(), process.clone());
+        process.raise(15);
+        thread.raise(9);
+
+        let stop = signals.owed_stop().expect("a raised thread owes a stop");
+        assert_eq!(
+            stop.downcast_ref::<WasixThreadSignalExit>()
+                .map(|exit| exit.signal),
+            Some(9)
+        );
+        let stop = signals.owed_stop().expect("a raised process owes a stop");
+        assert_eq!(
+            stop.downcast_ref::<Preview1SignalExit>()
+                .map(|exit| exit.signal),
+            Some(15)
+        );
+        assert!(signals.owed_stop().is_none());
+    }
+
+    /// A call that returns with no signal pending keeps its own result.
+    #[test]
+    fn a_call_with_no_signal_pending_keeps_its_result() {
+        let registry = crate::InstanceRegistry::new();
+        let activity = crate::InstanceActivity::new(registry.register("quiet", 0), 0);
+        let signal_state = WasixSignalState::new();
+        let call = core::future::ready(Ok(()));
+
+        assert!(drive_wasix_call(&activity, &signal_state, call).is_ok());
+    }
+
+    /// A signal and a condemnation that both reach the guest in its last
+    /// host call end the call with the signal, the precedence the
+    /// interrupt callback gives them.
+    #[test]
+    fn a_signal_met_at_completion_is_delivered_ahead_of_a_kill() {
+        let registry = crate::InstanceRegistry::new();
+        let instance = registry.register("signalled-and-condemned", 0);
+        let activity = crate::InstanceActivity::new(instance.clone(), 0);
+        let signal_state = WasixSignalState::new();
+        let sender = signal_state.clone();
+        let call = core::future::poll_fn(move |_| {
+            sender.raise(2);
+            assert_eq!(
+                registry.request_kill(instance.id(), crate::KillReason::Operator, 0),
+                crate::KillOutcome::Requested
+            );
+            core::task::Poll::Ready(Ok(()))
+        });
+
+        let error =
+            drive_wasix_call(&activity, &signal_state, call).expect_err("the call is stopped");
+        assert!(error.downcast_ref::<crate::InstanceKilled>().is_none());
+        assert_eq!(preview1_exit_status(&error, None), Some(130));
     }
 }

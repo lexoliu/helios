@@ -4,8 +4,6 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::future::Future as _;
-use core::task::Poll;
 
 use helios_hal::cpu::Cpu;
 use helios_netstack::Ipv6Address;
@@ -22,6 +20,7 @@ use wasmtime_wasi_io::{self};
 use super::bindings::clocks::system_clock::Instant as P3SystemInstant;
 use super::bindings::filesystem::types as p3fs;
 use super::bindings::filesystem::types::{ErrorCode as P3ErrorCode, OpenFlags as P3OpenFlags};
+use super::net::{TcpSocketInputStream, TcpSocketOutputStream};
 use super::{
     DebugFileSystem, FsDescriptor, FsNodeKind, HostFileStreamTarget, P2IncomingDatagramStream,
     P2Network, P2OutgoingDatagramStream, P2ResolveAddressStream, PendingAccept, Preview2GuestExit,
@@ -40,7 +39,7 @@ use crate::wasmtime_adapter::store::{
 use crate::wasmtime_adapter::wasi::map_host_fs_error;
 use crate::{
     ComponentOutputMode, ComponentOutputRoute, ComponentOutputStreamKind, NetworkHandle,
-    PerfSample, ProfileScope,
+    ProfileScope,
 };
 
 #[cfg(test)]
@@ -412,18 +411,25 @@ where
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
+    /// A stream over `descriptor`, opened by `store`.
+    ///
+    /// The stream writes into `store`'s own tree, shared rather than
+    /// copied, so whatever reads the path next through that store, or
+    /// through a process that shares its filesystem, sees the bytes.
     fn new(
-        cpu: CpuImpl,
-        runtime_state: HostRuntimeState<CpuImpl, Net, HostFs>,
+        store: &StoreData<CpuImpl, Net, HostFs>,
         descriptor: FsDescriptor,
         offset: u64,
         append: bool,
         host: Option<HostFileStreamTarget<HostFs>>,
     ) -> Self {
         Self {
-            cpu,
-            runtime_state: runtime_state.clone(),
-            filesystem: DebugFileSystem::new(runtime_state),
+            cpu: store.cpu.clone(),
+            runtime_state: store.runtime_state.clone(),
+            filesystem: DebugFileSystem::from_snapshot(
+                store.runtime_state.clone(),
+                store.filesystem().snapshot(),
+            ),
             descriptor,
             offset,
             append,
@@ -1329,14 +1335,7 @@ where
             Ok(host) => host,
             Err(error) => return Ok(Err(error_code_from_p3(error))),
         };
-        let stream = FileOutputStream::new(
-            self.cpu.clone(),
-            self.runtime_state.clone(),
-            descriptor,
-            offset,
-            false,
-            host,
-        );
+        let stream = FileOutputStream::new(self, descriptor, offset, false, host);
         Ok(Ok(self.table.push(Box::new(stream) as DynOutputStream)?))
     }
 
@@ -1355,14 +1354,7 @@ where
             Ok(host) => host,
             Err(error) => return Ok(Err(error_code_from_p3(error))),
         };
-        let stream = FileOutputStream::new(
-            self.cpu.clone(),
-            self.runtime_state.clone(),
-            descriptor,
-            0,
-            true,
-            host,
-        );
+        let stream = FileOutputStream::new(self, descriptor, 0, true, host);
         Ok(Ok(self.table.push(Box::new(stream) as DynOutputStream)?))
     }
 
@@ -1561,7 +1553,11 @@ where
             && let Ok(service) = self.filesystem().host_service().map_err(error_code_from_p3)
         {
             let host_path = host_path.to_owned();
-            match service.read_dir(&host_path).await {
+            // The whole listing is mirrored, so the bound is the mirror's.
+            match service
+                .read_dir(&host_path, super::GUEST_DIRECTORY_MIRROR_LIMIT)
+                .await
+            {
                 Ok(entries) => {
                     self.filesystem_mut()
                         .seed_host_directory_entries(&descriptor.path, entries);
@@ -1858,7 +1854,11 @@ where
                     // Directory listings still mirror into the embedded view:
                     // `read-directory` walks that node list synchronously.
                     // File contents do not — they stream on demand instead.
-                    let entries = match service.read_dir(&host_path).await {
+                    // The whole listing is mirrored, so the bound is the mirror's.
+                    let entries = match service
+                        .read_dir(&host_path, super::GUEST_DIRECTORY_MIRROR_LIMIT)
+                        .await
+                    {
                         Ok(entries) => entries,
                         Err(err) => {
                             return Ok(Err(error_code_from_p3(map_host_fs_error(err))));
@@ -2957,96 +2957,18 @@ fn p2_record_kernel_profile<CpuImpl, Net, HostFs>(
     }
 }
 
-struct P2KernelProfileStart {
-    ticks: u64,
-    counters: helios_hal::cpu::HardwarePerfCounters,
-}
-
-fn p2_kernel_profile_start<CpuImpl, Net, HostFs>(
-    runtime_state: &HostRuntimeState<CpuImpl, Net, HostFs>,
-    cpu: &CpuImpl,
-) -> Option<P2KernelProfileStart>
-where
-    CpuImpl: Cpu + Clone,
-    Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
-{
-    runtime_state
-        .profiling_enabled()
-        .then(|| P2KernelProfileStart {
-            ticks: cpu.now().ticks(),
-            counters: cpu.hardware_perf_counters(),
-        })
-}
-
-fn p2_record_kernel_profile_events_bytes<CpuImpl, Net, HostFs>(
-    runtime_state: &HostRuntimeState<CpuImpl, Net, HostFs>,
-    cpu: &CpuImpl,
-    phase: &'static str,
-    profile: Option<P2KernelProfileStart>,
-    events: u64,
-    bytes: u64,
-) where
-    CpuImpl: Cpu + Clone,
-    Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
-{
-    let Some(profile) = profile else {
-        return;
-    };
-    let finished_ticks = cpu.now().ticks();
-    let elapsed_ticks = finished_ticks.saturating_sub(profile.ticks);
-    runtime_state.record_profile_stack_parts(
-        ProfileScope::Kernel,
-        "kernel;preview2;",
-        phase,
-        elapsed_ticks,
-    );
-    let elapsed_nanos = runtime_state
-        .uptime_nanos(finished_ticks)
-        .saturating_sub(runtime_state.uptime_nanos(profile.ticks));
-    let counters = cpu.hardware_perf_counters().delta_since(profile.counters);
-    runtime_state.record_perf_metric_parts(
-        ProfileScope::Kernel,
-        "kernel;preview2;",
-        phase,
-        PerfSample {
-            events,
-            elapsed_nanos,
-            counters,
-            bytes,
-        },
-    );
-}
-
-fn p2_usize_to_u64(value: usize, label: &'static str) -> u64 {
-    u64::try_from(value).unwrap_or_else(|_| panic!("{label} does not fit into u64"))
-}
-
-/// One bridge read, raced against the guest half of the channel going
-/// away. `None` means the channel is gone and the bridge is done.
-async fn p2_tcp_bridge_read<Net: ComponentHostNetwork>(
-    socket: &TcpSocket,
-    service: &Net,
-    writer: &crate::ByteWriter,
-    max_bytes: u32,
-) -> Option<core::result::Result<Option<Bytes>, super::socket_types::ErrorCode>> {
-    let read = socket.read(service, max_bytes);
-    let closed = writer.reader_closed();
-    let mut read = core::pin::pin!(read);
-    let mut closed = core::pin::pin!(closed);
-    core::future::poll_fn(|cx| {
-        if let Poll::Ready(read) = read.as_mut().poll(cx) {
-            return Poll::Ready(Some(read));
-        }
-        if closed.as_mut().poll(cx).is_ready() {
-            return Poll::Ready(None);
-        }
-        Poll::Pending
-    })
-    .await
-}
-
+/// The `input-stream`/`output-stream` pair a connected TCP socket hands
+/// the guest.
+///
+/// The streams are the socket: no bridge task and no byte channel stands
+/// between them and the connection. `write` queues onto the send path and
+/// submits it on the guest task's own poll, `read` drains the socket's
+/// receive queue directly, and `ready`/`subscribe` park that same task on
+/// the owning shard's progress signal — see [`TcpSocketInputStream`] for
+/// the concurrency contract. Two fewer tasks per connection is also what
+/// makes teardown trivial: a parked `ready` lives inside the guest's own
+/// task and dies with the store, which is the lifetime the bridge's
+/// channel race had to re-create by hand (#184).
 fn p2_tcp_stream_pair<CpuImpl, Net, HostFs>(
     store: &mut StoreData<CpuImpl, Net, HostFs>,
     socket_resource: &Resource<TcpSocket>,
@@ -3058,146 +2980,23 @@ where
     HostFs: crate::HostFileSystem,
 {
     let started = store.cpu.now().ticks();
-    let (network_writer, guest_reader) = crate::byte_channel();
-    let (guest_writer, network_reader) = crate::byte_channel();
-    let input = store.table.push_child(
-        Box::new(ChannelInputStream::new(guest_reader)) as DynInputStream,
-        socket_resource,
-    )?;
-    let output = store.table.push_child(
-        Box::new(ChannelOutputStream::new(guest_writer)) as DynOutputStream,
-        socket_resource,
-    )?;
-    let read_socket = socket.clone();
-    let read_cpu = store.cpu.clone();
-    let read_runtime_state = store.runtime_state.clone();
-    // Both bridge tasks run without a store, so each carries its own
-    // clone of the concrete service rather than reading one back out of
-    // the socket, which holds none.
-    let Some(read_service) = store.runtime_state.network_service() else {
+    // The streams run without a store, so each carries its own clone of
+    // the concrete service rather than reading one back out of the
+    // socket, which holds none.
+    let Some(service) = store.runtime_state.network_service() else {
         return Err(wasmtime::Error::new(crate::ProgramExecError {
             kind: crate::ProgramExecErrorKind::Internal,
             detail: crate::ProgramExecErrorDetail::InternalInvariant,
         }));
     };
-    let write_service = read_service.clone();
-    store.spawner().try_spawn_detached(async move {
-        loop {
-            let read_started = p2_kernel_profile_start(&read_runtime_state, &read_cpu);
-            // The bridge holds a clone of the socket, so it is the
-            // bridge that decides when the socket's kernel stream can
-            // be retired. A backend read carries no deadline, so left
-            // alone this parks for ever — and when the instance goes
-            // away, taking the guest half of the channel with it, the
-            // bridge stayed parked and the connection stayed in its
-            // shard (#184). Racing the read against the channel's own
-            // close ends the bridge with the store it belongs to; a
-            // cancelled read leaves its bytes in the socket, which is
-            // about to be retired anyway.
-            let Some(read) = p2_tcp_bridge_read(
-                &read_socket,
-                &read_service,
-                &network_writer,
-                super::FILE_READ_CHUNK_BYTES as u32,
-            )
-            .await
-            else {
-                break;
-            };
-            match read {
-                Ok(Some(bytes)) => {
-                    let byte_len = p2_usize_to_u64(bytes.len(), "preview2 tcp bridge byte count");
-                    p2_record_kernel_profile_events_bytes(
-                        &read_runtime_state,
-                        &read_cpu,
-                        "tcp-bridge-read-backend",
-                        read_started,
-                        1,
-                        byte_len,
-                    );
-                    let enqueue_started = p2_kernel_profile_start(&read_runtime_state, &read_cpu);
-                    // Awaiting here is the guest's backpressure: the
-                    // bridge stops pulling from the socket while the
-                    // guest-side channel is full.
-                    if network_writer.write(bytes).await.is_err() {
-                        p2_record_kernel_profile_events_bytes(
-                            &read_runtime_state,
-                            &read_cpu,
-                            "tcp-bridge-read-enqueue-closed",
-                            enqueue_started,
-                            1,
-                            byte_len,
-                        );
-                        break;
-                    }
-                    p2_record_kernel_profile_events_bytes(
-                        &read_runtime_state,
-                        &read_cpu,
-                        "tcp-bridge-read-enqueue",
-                        enqueue_started,
-                        1,
-                        byte_len,
-                    );
-                }
-                Ok(None) => {
-                    let read_started = read_started
-                        .map(|profile| profile.ticks)
-                        .unwrap_or_else(|| read_cpu.now().ticks());
-                    p2_record_kernel_profile(
-                        &read_runtime_state,
-                        &read_cpu,
-                        "tcp-bridge-read-eof",
-                        read_started,
-                    );
-                    break;
-                }
-                Err(error) => {
-                    let read_started = read_started
-                        .map(|profile| profile.ticks)
-                        .unwrap_or_else(|| read_cpu.now().ticks());
-                    p2_record_kernel_profile(
-                        &read_runtime_state,
-                        &read_cpu,
-                        "tcp-bridge-read-error",
-                        read_started,
-                    );
-                    tracing::warn!(
-                        target: "helios_kernel::wasi::preview2::tcp",
-                        ?error,
-                        "tcp input stream bridge stopped after backend read error"
-                    );
-                    break;
-                }
-            }
-        }
-    })?;
-    let write_cpu = store.cpu.clone();
-    let write_runtime_state = store.runtime_state.clone();
-    store.spawner().try_spawn_detached(async move {
-        while let Some(bytes) = network_reader.read().await {
-            let started = write_cpu.now().ticks();
-            if let Err(error) = socket.write_all_bytes(&write_service, bytes).await {
-                p2_record_kernel_profile(
-                    &write_runtime_state,
-                    &write_cpu,
-                    "tcp-bridge-write-error",
-                    started,
-                );
-                tracing::warn!(
-                    target: "helios_kernel::wasi::preview2::tcp",
-                    ?error,
-                    "tcp output stream bridge stopped after backend write error"
-                );
-                break;
-            }
-            p2_record_kernel_profile(
-                &write_runtime_state,
-                &write_cpu,
-                "tcp-bridge-write",
-                started,
-            );
-        }
-    })?;
+    let input = store.table.push_child(
+        Box::new(TcpSocketInputStream::new(socket.clone(), service.clone())) as DynInputStream,
+        socket_resource,
+    )?;
+    let output = store.table.push_child(
+        Box::new(TcpSocketOutputStream::new(socket, service)) as DynOutputStream,
+        socket_resource,
+    )?;
     p2_record_kernel_profile(&store.runtime_state, &store.cpu, "tcp-stream-pair", started);
     Ok((input, output))
 }
@@ -4130,15 +3929,20 @@ mod tests {
     use alloc::string::String;
 
     use futures_lite::future::block_on;
+    use wasmtime::component::Resource;
+    use wasmtime_wasi_io::bytes::Bytes;
     use wasmtime_wasi_io::poll::Pollable;
-    use wasmtime_wasi_io::streams::{InputStream, StreamError};
+    use wasmtime_wasi_io::streams::{DynOutputStream, InputStream, StreamError};
 
+    use crate::wasmtime_adapter::component_host::service::test_store;
+
+    use super::filesystem_bindings::filesystem::types::HostDescriptor;
     use super::{
         EmptyInputStream, PREVIEW2_WIT_PACKAGES, WasiTcpSocketFamily, WasiUdpSocketError,
         WasiUdpSocketFamily, format_p2_tcp_socket_address, format_p2_udp_family,
         format_p2_udp_socket_address, map_p2_tcp_core_error, map_p2_tcp_family,
-        map_p2_tcp_socket_error, p2net, p2tcp, p2tcp_create, p2udp, parse_p2_tcp_socket_address,
-        parse_p2_udp_socket_address,
+        map_p2_tcp_socket_error, p2net, p2tcp, p2tcp_create, p2udp, p3fs,
+        parse_p2_tcp_socket_address, parse_p2_udp_socket_address,
     };
 
     #[test]
@@ -4158,6 +3962,69 @@ mod tests {
                 Err(error) => panic!("empty stdin read failed unexpectedly: {error:?}"),
             }
         }
+    }
+
+    /// What `write-via-stream` and `append-via-stream` write lands in the
+    /// filesystem of the store that opened the descriptor, where the
+    /// next open, read or exec of the path finds it (#487).
+    #[test]
+    fn p2_file_output_stream_writes_into_the_opening_store_filesystem() {
+        let mut store = test_store::store_data_with(|_| {});
+        let root = store.filesystem().root_descriptor();
+        let descriptor = store
+            .filesystem_mut()
+            .open_at(
+                &root,
+                p3fs::PathFlags::empty(),
+                "copy",
+                p3fs::OpenFlags::CREATE | p3fs::OpenFlags::TRUNCATE,
+                p3fs::DescriptorFlags::READ | p3fs::DescriptorFlags::WRITE,
+                1,
+            )
+            .expect("creating a file at the root must succeed");
+        let write = |store: &mut test_store::TestStoreData,
+                     stream: Resource<DynOutputStream>,
+                     bytes: &'static [u8]| {
+            let stream = store
+                .table
+                .get_mut::<DynOutputStream>(&stream)
+                .expect("the stream resource must be live");
+            assert!(
+                stream
+                    .check_write()
+                    .expect("a stream on a writable file must grant a permit")
+                    >= bytes.len()
+            );
+            stream
+                .write(Bytes::from_static(bytes))
+                .expect("writing a file the store holds must succeed");
+            stream
+                .flush()
+                .expect("flushing an embedded file must succeed");
+        };
+
+        let resource = store
+            .table
+            .push(descriptor.clone())
+            .expect("the descriptor must fit in the table");
+        let stream = HostDescriptor::write_via_stream(&mut store, resource, 0)
+            .expect("write-via-stream must not trap")
+            .expect("write-via-stream must open on a writable file");
+        write(&mut store, stream, b"helios ");
+        let resource = store
+            .table
+            .push(descriptor.clone())
+            .expect("the descriptor must fit in the table");
+        let stream = HostDescriptor::append_via_stream(&mut store, resource)
+            .expect("append-via-stream must not trap")
+            .expect("append-via-stream must open on a writable file");
+        write(&mut store, stream, "日本語 한국어".as_bytes());
+
+        let written = store
+            .filesystem()
+            .read_file_chunk(&descriptor, 0, 64)
+            .expect("the written file must be readable");
+        assert_eq!(written.as_ref(), "helios 日本語 한국어".as_bytes());
     }
 
     #[test]

@@ -40,10 +40,15 @@
 //! back in. Both eviction phases below take that bar; the difference
 //! between them is how long the instance has to have been off.
 //!
-//! A fiber stopped in the trampoline is covered by that same bar
-//! without needing its own accounting: blocking there crosses no
-//! call-hook boundary, so the instance is still counted as on a
-//! processor for as long as its page is being read back.
+//! "On a processor" is a store's processor turn (`crate::StoreTurns`):
+//! the poll of the future that drives its guest, synchronous host calls
+//! included. A fiber stopped in the trampoline has suspended, so its
+//! instance is off a processor while the page is read back, and that is
+//! safe without accounting of its own: the policy pass does not run
+//! while a fault is queued, the reinstated page comes back hot, and a
+//! retried instruction that meets another evicted page blocks in the
+//! trampoline again — it is running wasm, which holds no blocking
+//! context.
 //!
 //! Two more properties keep a page that has just come back from being
 //! taken straight out again. A reinstated page is mapped with its
@@ -78,7 +83,7 @@ use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use core::time::Duration;
 
 use concurrent_queue::ConcurrentQueue;
-use helios_hal::cpu::Cpu;
+use helios_hal::cpu::{Cpu, Timebase};
 use helios_hal::pmm::PhysFrame;
 use helios_hal::vmm::{
     AddressSpaceError, PageAge, PageFlags, SwapBackend, SwapToken, VirtAddr, VirtRange,
@@ -145,14 +150,14 @@ pub enum SwapDisabled {
 pub enum SwapFaultError {
     #[error("no swap backend is configured on this platform")]
     NotConfigured,
-    #[error("page is not swapped out")]
-    NotSwapped,
     #[error("swap map has no entry for the token the page table carried")]
     UnknownToken,
     #[error("the swap backend could not read the page back")]
     Backend,
     #[error("the address space refused to reinstate the page")]
     AddressSpace,
+    #[error("the page's contents were lost: neither memory nor the swap backend holds them")]
+    PageLost,
 }
 
 /// What swap is holding, as observers see it.
@@ -206,6 +211,11 @@ pub struct SwapVmHooks {
     /// Take tokens the address space dropped when a range was released,
     /// decommitted, or committed over.
     pub drain_orphaned_swap_tokens: fn(*mut (), OrphanedTokenVisitor) -> usize,
+    /// The platform's monotonic tick counter, the one `Cpu::now` reads.
+    /// A fault is stamped with it where it is issued, which is the
+    /// fault entry and the pre-fault accessor: neither holds a `Cpu`, and
+    /// the handle they reach swap through cannot be generic over one.
+    pub now_ticks: fn() -> u64,
 }
 
 /// What [`SwapVmHooks::scan_committed_pages`] calls for each page it
@@ -237,6 +247,24 @@ struct SwapShared {
     work: Notify,
     counters: SwapCounters,
     backend: &'static str,
+    /// Reads the time a fault is issued and the time it completes, so
+    /// both ends of its latency come from one clock.
+    clock: SwapClock,
+}
+
+/// The clock fault latency is measured on: the platform's tick counter and
+/// the timebase that converts it, the same pair `monotonic_nanos` reads
+/// through a `Cpu`.
+#[derive(Clone, Copy)]
+struct SwapClock {
+    timebase: Timebase,
+    now_ticks: fn() -> u64,
+}
+
+impl SwapClock {
+    fn now_nanos(&self) -> u64 {
+        self.timebase.ticks_to_nanos((self.now_ticks)())
+    }
 }
 
 #[derive(Default)]
@@ -252,14 +280,17 @@ struct SwapCounters {
 struct SwapFaultRequest {
     addr: VirtAddr,
     reply: Arc<SwapFaultReply>,
+    /// When the fault was issued, on [`SwapShared::clock`]. Its latency is
+    /// measured from here, so time spent queued counts.
+    issued_nanos: u64,
 }
 
 const FAULT_PENDING: u8 = 0;
 const FAULT_RESOLVED: u8 = 1;
-const FAULT_NOT_SWAPPED: u8 = 2;
-const FAULT_UNKNOWN_TOKEN: u8 = 3;
-const FAULT_BACKEND: u8 = 4;
-const FAULT_ADDRESS_SPACE: u8 = 5;
+const FAULT_UNKNOWN_TOKEN: u8 = 2;
+const FAULT_BACKEND: u8 = 3;
+const FAULT_ADDRESS_SPACE: u8 = 4;
+const FAULT_PAGE_LOST: u8 = 5;
 
 struct SwapFaultReply {
     ready: Notify,
@@ -290,10 +321,10 @@ impl SwapFaultReply {
         match self.outcome.load(Ordering::Acquire) {
             FAULT_PENDING => None,
             FAULT_RESOLVED => Some(Ok(())),
-            FAULT_NOT_SWAPPED => Some(Err(SwapFaultError::NotSwapped)),
             FAULT_UNKNOWN_TOKEN => Some(Err(SwapFaultError::UnknownToken)),
             FAULT_BACKEND => Some(Err(SwapFaultError::Backend)),
             FAULT_ADDRESS_SPACE => Some(Err(SwapFaultError::AddressSpace)),
+            FAULT_PAGE_LOST => Some(Err(SwapFaultError::PageLost)),
             other => panic!("swap fault reply carried an unknown outcome {other}"),
         }
     }
@@ -305,7 +336,7 @@ impl SwapFaultReply {
 const MAX_INFLIGHT_FAULTS: usize = 256;
 
 impl SwapHandle {
-    fn new(backend: &'static str, capacity_bytes: u64) -> Self {
+    fn new(backend: &'static str, capacity_bytes: u64, clock: SwapClock) -> Self {
         let counters = SwapCounters::default();
         counters
             .capacity_bytes
@@ -316,6 +347,7 @@ impl SwapHandle {
                 work: Notify::new(),
                 counters,
                 backend,
+                clock,
             }),
         }
     }
@@ -341,6 +373,13 @@ impl SwapHandle {
     ///
     /// This is what the page-fault trampoline blocks the faulting fiber
     /// on, and what [`Self::ensure_present`] calls per page.
+    ///
+    /// Callers ask about an address whose entry carried a swap token when
+    /// they looked. Succeeding means the page is present now: it was read
+    /// back for this request, or another request got there first. The
+    /// instruction is retried either way, and if the entry has since been
+    /// released or decommitted the retry takes a fresh fault that the
+    /// fault entry classifies again.
     pub async fn fault_in(&self, addr: VirtAddr) -> Result<(), SwapFaultError> {
         // A fault reports the address the instruction touched, not the
         // page it lives in; everything below this point works in pages.
@@ -349,6 +388,7 @@ impl SwapHandle {
         let request = SwapFaultRequest {
             addr,
             reply: reply.clone(),
+            issued_nanos: self.shared.clock.now_nanos(),
         };
         if self.shared.faults.push(request).is_err() {
             // The queue is full or closed. Either way nothing will ever
@@ -469,7 +509,11 @@ where
     let hooks = installed_swap_hooks().unwrap_or_else(|| {
         panic!("swap backend installed before the address space published its swap hooks")
     });
-    let handle = SwapHandle::new(backend_name, capacity_bytes);
+    let clock = SwapClock {
+        timebase: cpu.timebase(),
+        now_ticks: hooks.now_ticks,
+    };
+    let handle = SwapHandle::new(backend_name, capacity_bytes, clock);
     let mut published = false;
     HANDLE.call_once(|| {
         published = true;
@@ -499,20 +543,47 @@ where
     handle
 }
 
+/// What an index of the swap map holds.
+#[derive(Clone, Copy)]
+enum Slot<Token> {
+    /// On the free list, or reserved and not yet filled, or its token was
+    /// consumed by a read whose page is on its way back into memory.
+    Vacant,
+    /// The page is in the backend under this token.
+    Filled(Token),
+    /// The page's bytes are gone: its address space was refused the
+    /// reinstatement and the backend refused the page back. The index
+    /// stays reserved, because the page-table entry still names it, until
+    /// the address space is torn down.
+    Lost,
+}
+
+/// What the map knows about an index a page-table entry carries.
+enum Lookup<Token> {
+    Filled(Token),
+    Lost,
+    Vacant,
+}
+
 /// Index → backend token, with a free list so a released index is
 /// reused before the map grows.
+///
+/// An index belongs to its page from [`Self::reserve`] until the page is
+/// back in memory ([`Self::free`]) or its address space is torn down
+/// ([`Self::release_for_teardown`]); nothing in between returns it to the
+/// free list, because the page-table entry names it for that whole time.
 ///
 /// Index 0 is never handed out: [`SwapToken`] is non-zero so an all-zero
 /// page-table entry keeps meaning "nothing was ever mapped here".
 struct SwapMap<Token> {
-    slots: Vec<Option<Token>>,
+    slots: Vec<Slot<Token>>,
     free: Vec<u32>,
 }
 
 impl<Token: Copy> SwapMap<Token> {
     fn new() -> Self {
         Self {
-            slots: Vec::from([None]),
+            slots: Vec::from([Slot::Vacant]),
             free: Vec::new(),
         }
     }
@@ -521,7 +592,7 @@ impl<Token: Copy> SwapMap<Token> {
     ///
     /// The index has to exist first: it is what the page-table entry
     /// carries, and the entry has to be in place before the frame goes
-    /// back to the pool. The slot stays empty until [`Self::fill`], and
+    /// back to the pool. The slot stays vacant until [`Self::fill`], and
     /// a fault cannot observe the gap because this task serves faults
     /// and swap-outs from the same loop.
     fn reserve(&mut self) -> Option<SwapToken> {
@@ -529,30 +600,67 @@ impl<Token: Copy> SwapMap<Token> {
             return SwapToken::new(index);
         }
         let index = u32::try_from(self.slots.len()).ok()?;
-        self.slots.push(None);
+        self.slots.push(Slot::Vacant);
         SwapToken::new(index)
     }
 
+    /// Records where the page is. The index keeps its page: filling it
+    /// again after a read consumed its extent is how a page goes back to
+    /// the backend under the index its page-table entry carries.
     fn fill(&mut self, handle: SwapToken, token: Token) {
-        self.slots[handle.raw() as usize] = Some(token);
+        self.slots[handle.raw() as usize] = Slot::Filled(token);
     }
 
-    /// Gives a reserved index back without ever having filled it.
-    fn abandon(&mut self, handle: SwapToken) {
-        self.slots[handle.raw() as usize] = None;
+    fn lookup(&self, handle: SwapToken) -> Lookup<Token> {
+        match self.slots.get(handle.raw() as usize) {
+            Some(Slot::Filled(token)) => Lookup::Filled(*token),
+            Some(Slot::Lost) => Lookup::Lost,
+            Some(Slot::Vacant) | None => Lookup::Vacant,
+        }
+    }
+
+    /// Forgets the token of a page the backend has just handed back and
+    /// freed, so nothing can read a token whose extent is gone. The index
+    /// stays reserved.
+    fn vacate(&mut self, handle: SwapToken) {
+        self.slots[handle.raw() as usize] = Slot::Vacant;
+    }
+
+    /// Records that the page's bytes no longer exist anywhere. The index
+    /// stays reserved.
+    fn mark_lost(&mut self, handle: SwapToken) {
+        self.slots[handle.raw() as usize] = Slot::Lost;
+    }
+
+    /// Gives an index back to the free list once nothing refers to it: the
+    /// page was never detached, or it is resident again.
+    fn free(&mut self, handle: SwapToken) {
+        self.slots[handle.raw() as usize] = Slot::Vacant;
         self.free.push(handle.raw());
     }
 
-    fn take(&mut self, handle: SwapToken) -> Option<Token> {
+    /// Gives back an index whose address space is gone, returning the
+    /// token the backend still holds for it, if any. A lost index holds
+    /// none. An index that is already vacant was either never filled or
+    /// is already free, and is left alone.
+    fn release_for_teardown(&mut self, handle: SwapToken) -> Option<Token> {
         let slot = self.slots.get_mut(handle.raw() as usize)?;
-        let token = slot.take()?;
+        let held = match *slot {
+            Slot::Filled(token) => Some(token),
+            Slot::Lost => None,
+            Slot::Vacant => return None,
+        };
+        *slot = Slot::Vacant;
         self.free.push(handle.raw());
-        Some(token)
+        held
     }
 
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.slots.iter().filter(|slot| slot.is_some()).count()
+        self.slots
+            .iter()
+            .filter(|slot| matches!(slot, Slot::Filled(_)))
+            .count()
     }
 }
 
@@ -604,9 +712,15 @@ where
 
     async fn serve_faults(&mut self) {
         while let Ok(request) = self.handle.shared.faults.pop() {
-            let started = monotonic_nanos(&self.cpu);
             let outcome = self.swap_in(request.addr).await;
-            let elapsed = monotonic_nanos(&self.cpu).saturating_sub(started);
+            // From the fault's issue, not from the moment this loop got
+            // to it: the guest has been stopped the whole time.
+            let elapsed = self
+                .handle
+                .shared
+                .clock
+                .now_nanos()
+                .saturating_sub(request.issued_nanos);
             let counters = &self.handle.shared.counters;
             counters.faults_served.fetch_add(1, Ordering::AcqRel);
             counters
@@ -630,9 +744,9 @@ where
                         "swap in failed"
                     );
                     request.reply.settle(match error {
-                        SwapFaultError::NotSwapped => FAULT_NOT_SWAPPED,
                         SwapFaultError::UnknownToken => FAULT_UNKNOWN_TOKEN,
                         SwapFaultError::AddressSpace => FAULT_ADDRESS_SPACE,
+                        SwapFaultError::PageLost => FAULT_PAGE_LOST,
                         SwapFaultError::NotConfigured | SwapFaultError::Backend => FAULT_BACKEND,
                     });
                 }
@@ -674,8 +788,25 @@ where
     }
 
     async fn swap_in(&mut self, addr: VirtAddr) -> Result<(), SwapFaultError> {
-        let handle = (self.hooks.swapped_token)(addr).ok_or(SwapFaultError::NotSwapped)?;
-        let token = self.map.take(handle).ok_or(SwapFaultError::UnknownToken)?;
+        // A request exists only for an address whose entry carried a token
+        // when the fault was taken (the backend's fault entry checks
+        // `swapped_token` before it enters the trampoline, and
+        // `ensure_present` before it asks). One that carries none now has
+        // changed since: an earlier request reinstated the page, which is
+        // the case of several guest threads or fibers faulting on one
+        // page, or the address space dropped the entry. Either way the
+        // retried instruction takes the fault again and a fresh fault is
+        // classified from scratch, so succeeding cannot loop.
+        let Some(handle) = (self.hooks.swapped_token)(addr) else {
+            return Ok(());
+        };
+        let token = match self.map.lookup(handle) {
+            Lookup::Filled(token) => token,
+            Lookup::Lost => return Err(SwapFaultError::PageLost),
+            Lookup::Vacant => return Err(SwapFaultError::UnknownToken),
+        };
+        // A failed read leaves the extent with the backend and the index
+        // with the page-table entry, exactly as they were.
         self.backend
             .swap_in(token, &mut self.page)
             .await
@@ -688,16 +819,63 @@ where
                 );
                 SwapFaultError::Backend
             })?;
+        // The backend has consumed the extent, so the token is dead and
+        // the staging buffer holds the page's only copy.
+        self.map.vacate(handle);
         // The address space reads the flags the page had out of its own
         // bookkeeping, fills a fresh frame from the staging buffer, and
         // only publishes the mapping once the bytes are there.
-        (self.hooks.swap_in_page)(addr, &self.page).map_err(|_| SwapFaultError::AddressSpace)?;
+        if let Err(error) = (self.hooks.swap_in_page)(addr, &self.page) {
+            tracing::warn!(
+                target: "helios_kernel::swap",
+                addr = addr.raw(),
+                ?error,
+                "the address space refused to reinstate a page; returning it to the swap backend"
+            );
+            if self.rehome(handle, addr).await.is_err() {
+                self.handle
+                    .shared
+                    .counters
+                    .used_bytes
+                    .fetch_sub(PhysFrame::SIZE as u64, Ordering::AcqRel);
+            }
+            return Err(SwapFaultError::AddressSpace);
+        }
+        self.map.free(handle);
         let counters = &self.handle.shared.counters;
         counters.pages_in.fetch_add(1, Ordering::AcqRel);
         counters
             .used_bytes
             .fetch_sub(PhysFrame::SIZE as u64, Ordering::AcqRel);
         Ok(())
+    }
+
+    /// Writes the staging buffer, which holds the only copy of the page
+    /// whose page-table entry carries `handle`, back to the backend under
+    /// that same index.
+    ///
+    /// When the backend refuses too, the page's bytes exist nowhere: the
+    /// index is marked lost and stays reserved, so no other page can be
+    /// handed it and a fault on it fails rather than reading a stale
+    /// token, until the owning address space's teardown releases it.
+    async fn rehome(&mut self, handle: SwapToken, addr: VirtAddr) -> Result<(), ()> {
+        match self.backend.swap_out(&self.page).await {
+            Ok(token) => {
+                self.map.fill(handle, token);
+                Ok(())
+            }
+            Err(error) => {
+                self.map.mark_lost(handle);
+                tracing::error!(
+                    target: "helios_kernel::swap",
+                    addr = addr.raw(),
+                    index = handle.raw(),
+                    %error,
+                    "swapped-out page lost: the swap backend refused it back and no other copy exists"
+                );
+                Err(())
+            }
+        }
     }
 
     async fn release_orphaned_tokens(&mut self) {
@@ -712,7 +890,10 @@ where
             },
         );
         for handle in orphans {
-            let Some(token) = self.map.take(handle) else {
+            // A lost page holds no extent and no `used_bytes`: both were
+            // given up when it was lost, and only its reservation is
+            // released here.
+            let Some(token) = self.map.release_for_teardown(handle) else {
                 continue;
             };
             self.backend.release(token).await;
@@ -873,7 +1054,7 @@ where
                 ?error,
                 "page could not be detached for swap-out"
             );
-            self.map.abandon(handle);
+            self.map.free(handle);
             return Err(());
         }
         // From here the page is not present and its entry points at an
@@ -889,9 +1070,27 @@ where
                     %error,
                     "swap backend refused a page; putting it back"
                 );
-                let _ = (self.hooks.swap_in_page)(addr, &self.page);
-                self.map.abandon(handle);
-                return Err(());
+                // The staging buffer holds the page's only copy. The index
+                // is released only once the page is resident again.
+                match (self.hooks.swap_in_page)(addr, &self.page) {
+                    Ok(_) => {
+                        self.map.free(handle);
+                        return Err(());
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "helios_kernel::swap",
+                            addr = addr.raw(),
+                            ?error,
+                            "the address space refused a page put back after a refused write; \
+                             offering it to the swap backend again"
+                        );
+                        // The backend may have taken the write this time,
+                        // which makes this a completed swap-out; if not,
+                        // the page is lost and says so.
+                        self.rehome(handle, addr).await?;
+                    }
+                }
             }
         }
         let counters = &self.handle.shared.counters;
@@ -956,6 +1155,9 @@ fn current_pressure() -> PressureLevel {
 }
 
 #[cfg(test)]
+mod service_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -973,7 +1175,7 @@ mod tests {
     /// the service loop into a spin inside a single `poll`.
     #[test]
     fn a_poke_releases_one_wait_and_the_next_one_parks() {
-        let handle = SwapHandle::new("test", 0);
+        let handle = SwapHandle::new("test", 0, test_clock());
 
         handle.poke();
         assert!(
@@ -984,6 +1186,13 @@ mod tests {
             !poll_once(core::pin::pin!(handle.shared.work.notified())),
             "the service's next wait has to park, or its loop stops yielding"
         );
+    }
+
+    fn test_clock() -> SwapClock {
+        SwapClock {
+            timebase: Timebase::new(1_000_000_000),
+            now_ticks: || 0,
+        }
     }
 
     fn insert<Token: Copy>(map: &mut SwapMap<Token>, token: Token) -> SwapToken {
@@ -997,7 +1206,7 @@ mod tests {
         let mut map = SwapMap::new();
         let first = insert(&mut map, 11_u32);
         assert_ne!(first.raw(), 0);
-        assert_eq!(map.take(first), Some(11));
+        assert_eq!(map.release_for_teardown(first), Some(11));
     }
 
     #[test]
@@ -1006,7 +1215,7 @@ mod tests {
         let first = insert(&mut map, 1_u32);
         let second = insert(&mut map, 2_u32);
         assert_ne!(first, second);
-        assert_eq!(map.take(first), Some(1));
+        assert_eq!(map.release_for_teardown(first), Some(1));
         let third = insert(&mut map, 3_u32);
         assert_eq!(
             third, first,
@@ -1016,20 +1225,38 @@ mod tests {
     }
 
     #[test]
-    fn taking_an_index_twice_reports_nothing() {
+    fn releasing_an_index_twice_reports_nothing() {
         let mut map = SwapMap::new();
         let handle = insert(&mut map, 5_u32);
-        assert_eq!(map.take(handle), Some(5));
-        assert_eq!(map.take(handle), None);
+        assert_eq!(map.release_for_teardown(handle), Some(5));
+        assert_eq!(map.release_for_teardown(handle), None);
+        assert_eq!(
+            map.free
+                .iter()
+                .filter(|&&index| index == handle.raw())
+                .count(),
+            1,
+            "an index is on the free list once"
+        );
     }
 
     #[test]
-    fn an_abandoned_index_is_never_filled() {
+    fn a_freed_index_is_never_filled() {
         let mut map: SwapMap<u32> = SwapMap::new();
         let handle = map.reserve().expect("index");
-        map.abandon(handle);
-        assert_eq!(map.take(handle), None);
+        map.free(handle);
+        assert_eq!(map.release_for_teardown(handle), None);
         assert_eq!(map.len(), 0);
+    }
+
+    #[test]
+    fn a_lost_index_is_not_reused_until_teardown() {
+        let mut map: SwapMap<u32> = SwapMap::new();
+        let lost = insert(&mut map, 9_u32);
+        map.mark_lost(lost);
+        assert_ne!(map.reserve().expect("index"), lost);
+        assert_eq!(map.release_for_teardown(lost), None);
+        assert_eq!(map.reserve().expect("index"), lost);
     }
 
     #[test]

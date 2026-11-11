@@ -234,6 +234,13 @@ pub(crate) struct TracingCommand {
     /// repeat the flag to allow several prefixes.
     #[arg(long)]
     target_prefix: Vec<String>,
+
+    /// Enable a kernel diagnostic target the kernel holds off by name,
+    /// for the rest of this boot; repeat to enable several. The launch
+    /// phases of `exec` and `spawn` live at `helios_kernel::exec::phases`
+    /// (docs/benchmarks.md).
+    #[arg(long = "enable-target", value_name = "TARGET")]
+    enable_target: Vec<String>,
 }
 
 fn main() -> Result<(), InspectorError> {
@@ -311,12 +318,9 @@ pub(crate) fn run_connected(
             }
             Ok(())
         }),
-        SessionCommand::Tracing(command) => Ok(runtime::block_on(system::run_tracing(
-            client,
-            command.limit,
-            command.min_level.as_deref(),
-            command.target_prefix,
-        ))?),
+        SessionCommand::Tracing(command) => {
+            Ok(runtime::block_on(system::run_tracing(client, &command))?)
+        }
         SessionCommand::Stats => run_interruptible(async move {
             let mut client = client;
             Ok(stats_tui::run(&mut client).await?)

@@ -2,8 +2,9 @@
 
 use crate::bindings::helios::system::profiling as raw;
 pub use crate::bindings::helios::system::profiling::{
-    Filter, FoldedSample, MetricFilter, MetricSample, MonoNanos, ProfileSection, RawProfileError,
-    Scope,
+    Filter, FoldedSample, InstructionProfile, InstructionProfileError, InstructionSample,
+    MetricFilter, MetricSample, MonoNanos, ProfileSection, RawProfileError, SampledCode, Scope,
+    WasmFunction,
 };
 
 /// Turns kernel-side profile sampling on or off for this instance.
@@ -25,6 +26,23 @@ pub fn folded(filter: &Filter, limit: u32) -> Vec<FoldedSample> {
 /// Returns up to `limit` performance-metric samples matching `filter`.
 pub fn metrics(filter: &MetricFilter, limit: u32) -> Vec<MetricSample> {
     raw::metrics(filter, limit)
+}
+
+/// Starts or stops the kernel's instruction-address sampling, independently
+/// of [`set_enabled`]. Sampling shortens every processor's timer period, so
+/// it perturbs timings; starting discards an earlier run's samples.
+///
+/// A backend that does not sample instruction addresses says so.
+pub fn set_instruction_sampling(enabled: bool) -> Result<(), InstructionProfileError> {
+    raw::set_instruction_sampling(enabled)
+}
+
+/// Returns the instruction addresses the kernel sampled since sampling last
+/// started, attributed to the code they executed.
+///
+/// A backend that does not sample instruction addresses says so.
+pub fn instruction_samples() -> Result<InstructionProfile, InstructionProfileError> {
+    raw::instruction_samples()
 }
 
 /// Returns the length in bytes of the kernel's LLVM raw profile.

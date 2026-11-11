@@ -15,6 +15,7 @@ from helios_bench.report import CLASS_LABELS, SIDE_LABELS, Report, Side, Workloa
 SIDE_COLORS = {
     Side.HELIOS: "#d97706",
     Side.HELIOS_BASELINE: "#b45309",
+    Side.HELIOS_BASELINE_REBUILD: "#78350f",
     Side.LINUX_WASMTIME: "#2563eb",
     Side.LINUX_NATIVE: "#6b7280",
 }

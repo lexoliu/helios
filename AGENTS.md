@@ -19,8 +19,8 @@ never depends on anything above it.
 | --- | --- | --- |
 | Hardware contracts | `hal/` | Traits, capability types and value types only. `#![no_std]`. |
 | Device and protocol libraries | `netstack/`, `virtio/`, `i6300esb/` | `#![no_std]` protocol engines and drivers. `virtio/` builds on `netstack/`; all three depend on `hal/` and none on the kernel. |
-| Shared ABIs | `compiler-abi/`, `artifact/` | `#![no_std]` wire formats shared by the kernel and host tools: the compiler plugin's request and response headers, `cwasm` target flags, the signature trailer. |
-| Kernel | `kernel/`, `kernel-macro/` | Every piece of hardware-independent runtime logic: executor, timer, memory and OOM, instance registry, component host, Wasmtime adapter, network service, host-fs client, every WIT service. `#![no_std]`, generic over `Cpu`. `kernel-macro/` embeds wasm and the bootfs at build time. |
+| Shared ABIs | `compiler-abi/`, `artifact/` | `#![no_std]` wire formats shared by the kernel and host tools: the compiler plugin's request and response headers, `cwasm` target flags, the signature trailer, and the `helios-bootfs` payload image the kernel reads at bring-up. |
+| Kernel | `kernel/` | Every piece of hardware-independent runtime logic: executor, timer, memory and OOM, instance registry, component host, Wasmtime adapter, network service, host-fs client, every WIT service. `#![no_std]`, generic over `Cpu`. The user payload is not linked into the kernel: it arrives as a boot module (`docs/boot.md`). |
 | Backends | `aarch64/`, `riscv/`, `x86/`, `hosted/` | Boot, trap, IRQ, timer, MMIO, UART, virtio transport and SMP wiring, and nothing else. `hosted/` runs the same kernel on the host OS under the same restriction. |
 | Kernel image | the root crate `helios` (`src/`) | The binary that links whichever backend the target selects, and runs `hosted` on the host. |
 | User space | `api/`, `api-macro/`, `programs/*` | The userland SDK and the wasm programs, kernel plugins included: `init`, `debugger`, `http-client`, `date`, `ping`, `perf`, `oob-load`. `compiler-plugin/` is the in-kernel compiler, a kernel plugin built by the host tools. |
@@ -186,8 +186,13 @@ maintainer's decision and the fork's revision moves once, per §1.
 - Typed function references, SIMD, relaxed SIMD and target ISA feature
   probing stay correctly enabled wherever the real target supports them.
 - Every Wasmtime performance opt-in the kernel can support stays enabled:
-  pooling instance allocation, signals-based traps, epoch interruption,
-  SIMD, threads, the component model, `async_stack_zeroing(false)`. With a
+  pooling instance allocation, signals-based traps, stack-limit
+  interruption (`Config::stack_limit_interruption`: the end of a
+  processor's guest time slice (`GUEST_TIME_SLICE`), a kill and a signal lower the running store's stack limit, and the
+  resumable check at every function entry and loop header takes them;
+  never epoch interruption, whose per-entry and per-loop checks cost
+  10–29% on compute), SIMD, threads, the component model,
+  `async_stack_zeroing(false)`. With a
   real user VM, `memory_reservation` and `memory_guard_size` eliminate wasm32
   bounds checks, with `memory_init_cow(true)` and `memory_may_move(false)`.
   Disabling any of them needs a same-PR justification of the alternative
@@ -208,8 +213,12 @@ property of every kernel and `hal/` subsystem, never a follow-up.
 - A new abstraction states its concurrency contract before its API: which
   operations are lock-free, which take an async mutex, which fan out to other
   processors. "Add SMP later" is not a design note.
-- Every address-space mutation invalidates the local TLB and sends an IPI
-  shootdown to every other processor that has run in that space.
+- Every address-space mutation invalidates the local TLB. One that removes
+  a translation or narrows its permissions also sends an IPI shootdown to
+  every other processor that has run in that space, and frees nothing it
+  unmapped until every one has acknowledged; making a not-present page
+  present needs no shootdown, because no processor caches a not-present
+  translation.
 - Hot paths use per-CPU storage indexed by the executing processor;
   cross-processor queues prefer atomics and lock-free channels to a mutex.
   Which processor is executing is a property of the hardware, not state the
@@ -412,9 +421,12 @@ does.
 ## 7. Checks and CI
 
 Before a change is complete, run the recipes for every surface it can
-affect. `just check-target` and `just test-units` generate the
-`helios-cli kernel-prebuild` manifest and pass it through
-`HELIOS_KERNEL_PREBUILD_MANIFEST` themselves. The `check-target` set is the
+affect. `just check-target` and `just test-units` run `helios-cli
+kernel-prebuild` themselves and export the two trusted-root key files it
+writes as `HELIOS_KERNEL_ROOT_PUBLIC_KEY` and `HELIOS_KERNEL_ROOT_SECRET_KEY`,
+the only prebuild outputs the kernel build tracks; the `helios-bootfs`
+payload it also writes is loaded at boot, never compiled in, so changing
+the boot programs never relinks the kernel. The `check-target` set is the
 backends the diff can reach: a change in `hal/`, a library crate, a shared
 ABI or `kernel/` runs all three bare-metal targets; a change confined to
 one backend runs that backend's target; a change confined to the host tools
@@ -434,8 +446,8 @@ just test-units
 against `deny.toml`, and `cargo clippy … -D warnings` over the host crates, each
 guest program, and the three bare-metal targets.
 `just test-units` runs the `hal`, `virtio`, `netstack`, `kernel`,
-`inspector-protocol` and `workspace-root` unit tests and the `hal_layering`
-test (`kernel/tests/`) that enforces §1. The recipe names each integration
+`inspector-protocol` and `workspace-root` unit tests, every `hosted` test,
+and the `hal_layering` test (`kernel/tests/`) that enforces §1. The recipe names each integration
 test with `--test <name>`, so a new enforcement test is added to the recipe
 in the same change or it never runs.
 Both recipes run through `cargo nextest run` under `.config/nextest.toml`:
@@ -466,8 +478,9 @@ reason that says why the lint is wrong there. `clippy::manual_async_fn` is
 the gate for §3.2's `async fn` rule.
 
 `dep-check.yml` runs on a schedule and on demand. `kernel-profile.yml`
-collects the x86-64 kernel profile every release build spends, on demand
-and monthly (`docs/pgo.md`); `bench-suite.yml`'s `profile-generate` job
+collects the x86-64 kernel profile every release build spends, on every
+push to `dev` that touches the kernel image's inputs, on demand and
+monthly (`docs/pgo.md`); `bench-suite.yml`'s `profile-generate` job
 calls it. `release.yml` runs `release-plz` on every push to `main`: it
 owns version numbers, the changelog and tags, so commits follow the
 conventional format (`feat:`, `fix:`, `feat!:`, `BREAKING CHANGE:`) and

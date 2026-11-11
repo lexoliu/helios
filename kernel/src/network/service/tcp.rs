@@ -4,15 +4,39 @@ use super::*;
 /// the pair belonging to the polling processor first, then every other
 /// pair once, wrapping.
 ///
-/// Ownership of a pair is a locality preference, not a claim: a frame
-/// the host steered onto another processor's pair still has to be
-/// drained by whoever is polling, so the sweep covers all of them.
-pub(super) fn receive_pair_order(
+/// Ownership of a pair is a locality preference, not a claim: an
+/// operation that polls the device itself still visits every pair,
+/// because the pump that owns a pair may not be scheduled before this
+/// caller's own deadline. The walk is a concrete type so a caller can
+/// hold it beside the pump's single-pair walk in one value.
+pub(super) fn receive_pair_order(local_pair: usize, pair_count: usize) -> ReceivePairOrder {
+    assert!(pair_count != 0, "an interface has at least one queue pair");
+    ReceivePairOrder {
+        offset: 0,
+        local_pair,
+        pair_count,
+    }
+}
+
+/// [`receive_pair_order`]'s iterator, named so [`NetworkPollScope`]
+/// can hold it next to a pump's one-pair walk.
+pub(super) struct ReceivePairOrder {
+    offset: usize,
     local_pair: usize,
     pair_count: usize,
-) -> impl Iterator<Item = usize> {
-    assert!(pair_count != 0, "an interface has at least one queue pair");
-    (0..pair_count).map(move |offset| (local_pair + offset) % pair_count)
+}
+
+impl Iterator for ReceivePairOrder {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<usize> {
+        if self.offset >= self.pair_count {
+            return None;
+        }
+        let pair = (self.local_pair + self.offset) % self.pair_count;
+        self.offset += 1;
+        Some(pair)
+    }
 }
 
 pub(super) struct TcpListenerState {
@@ -24,12 +48,6 @@ pub(super) struct TcpListenerState {
 pub(super) enum TcpConnectProgress {
     Pending,
     Connected,
-}
-
-pub(super) enum TcpReadProgress {
-    Pending,
-    Data(Bytes),
-    Eof,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -237,6 +255,110 @@ where
         })
     }
 
+    /// What `stream`'s send side does with a write right now.
+    ///
+    /// The write permit of a socket-backed output stream: `Room` is the
+    /// byte count a `write` of at most that many never has to park for,
+    /// `Pending` is a full send queue on a live connection, and `Closed`
+    /// is a send side that cannot take bytes again — the answer that
+    /// resolves a parked `ready` instead of letting it sleep through the
+    /// close.
+    pub fn tcp_send_room(&self, stream: TcpStreamId) -> Result<TcpWriteProgress, TcpError> {
+        self.inner
+            .state
+            .with_handle(stream, |state| state.tcp_send_room(stream))
+    }
+
+    /// Queues what `bytes` gives `stream`'s send queue and publishes it
+    /// on the caller's own task: the owning shard's segment production,
+    /// then the egress drain onto the rings and the doorbell.
+    ///
+    /// `Room` is the count the queue took. A queue that took nothing is
+    /// classified under the same lock, so the one pass answers what a
+    /// `tcp_send_room` probe would take a second pass to say: `Pending`
+    /// for a full send window on a live connection, `Closed` for a send
+    /// side that cannot send again.
+    ///
+    /// The drive is the transmit half of a poll. The receive half's
+    /// async device read is unreachable from a `write` that may not
+    /// block — and unneeded: inbound frames keep landing through the
+    /// device's own delivery, and the parked reads and write waits
+    /// consume them as they always have.
+    pub fn tcp_try_write(
+        &self,
+        stream: TcpStreamId,
+        bytes: &mut Bytes,
+    ) -> Result<TcpWriteProgress, TcpError> {
+        let budget = self.inner.poll.budget();
+        // Completions first, so a ring full of used descriptors frees
+        // before the new segment asks it for room — the order the full
+        // poll keeps.
+        let reclaimed = self
+            .reclaim_transmit_completions(budget.tx_completions, NetworkPollScope::Interface)
+            .map_err(|error| TcpError::from_io(error, NetworkErrorDetail::VirtioAdvanceFailed))?;
+        let now = StackInstant::from_nanos(self.now_nanos());
+        let progress = self.inner.state.with_handle(stream, |state| {
+            let progress = state.try_write_tcp_bytes(stream, bytes)?;
+            // What was queued becomes a segment on this shard's egress
+            // while the lock is already held; nothing else has to run
+            // for the write to reach the wire.
+            state.stack.drive_tcp(now).unwrap_or_else(|error| {
+                tracing::debug!(?error, "failed to drive TCP after stream write")
+            });
+            Ok(progress)
+        })?;
+        let (transmitted, _) = self
+            .submit_network_transmit(NetworkPollSource::Tcp, budget, NetworkPollScope::Interface)
+            .map_err(|error| TcpError::from_io(error, NetworkErrorDetail::VirtioAdvanceFailed))?;
+        if transmitted != 0 || reclaimed != 0 {
+            self.inner.poll.complete(NetworkPollProgress {
+                received_frames: 0,
+                reclaimed_tx: reclaimed,
+                transmitted_frames: transmitted,
+            });
+        }
+        Ok(progress)
+    }
+
+    /// Drains up to `max_bytes` of what `stream`'s receive queue already
+    /// holds, without parking.
+    ///
+    /// `with_handle_receive_drain` raises the owning shard's arrival when
+    /// the drain relieved its receive backpressure (#107), so a producer
+    /// parked on this socket wakes without being asked.
+    pub fn tcp_try_read(
+        &self,
+        stream: TcpStreamId,
+        max_bytes: usize,
+    ) -> Result<TcpReadProgress, TcpError> {
+        self.poll_tcp_read_once(stream, max_bytes, TcpReadPhasePrefix::Initial)
+    }
+
+    /// Resolves when `stream`'s send queue has room, when the send side
+    /// can no longer send, or when the stream is gone — a socket-backed
+    /// output stream's readiness wait.
+    ///
+    /// `Closed` resolves the wait rather than propagating its error:
+    /// the pollable's contract is that a dead send side is ready, and
+    /// the accessor that follows reports the state itself. Each round
+    /// samples the shard's wait before the room probe, so an ACK — or a
+    /// reset — another processor drains between the probe and the park
+    /// resolves the wait rather than being slept through. The drive in
+    /// between is what consumes the segments that change the answer.
+    pub async fn tcp_write_ready(&self, stream: TcpStreamId) -> Result<(), TcpError> {
+        loop {
+            let wait = self.shard_wait_for_handle(stream);
+            if !matches!(self.tcp_send_room(stream)?, TcpWriteProgress::Pending) {
+                return Ok(());
+            }
+            self.drive_tcp().await?;
+            if !matches!(self.tcp_send_room(stream)?, TcpWriteProgress::Pending) {
+                return Ok(());
+            }
+            self.wait_for_tcp_progress(wait, u64::MAX).await;
+        }
+    }
+
     /// Probe a listener's accept queue without consuming a connection.
     pub async fn tcp_listener_readiness(
         &self,
@@ -318,7 +440,7 @@ where
         self.inner.state.with_handle(stream, |state| {
             state.remove_tcp_stream(stream, now);
         });
-        self.wake_packet_pump();
+        self.wake_packet_pump(self.inner.state.shard_idx_for_handle(stream));
     }
 
     /// Retires `listener`, freeing its slab slot, its replica on every
@@ -352,7 +474,7 @@ where
             })
             .unwrap_or_else(|infallible| match infallible {});
         self.inner.state.listener_slots.release(slot);
-        self.wake_packet_pump();
+        self.wake_packet_pumps();
     }
 
     pub(super) async fn execute_tcp_connect(
@@ -575,7 +697,7 @@ where
             // A blocked write is unblocked by the peer's window opening,
             // which arrives as an ACK on this stream's shard.
             let wait = self.shard_wait_for_handle(stream);
-            let written = self.inner.state.with_handle(stream, |state| {
+            let progress = self.inner.state.with_handle(stream, |state| {
                 state.try_write_tcp_bytes(stream, &mut bytes)
             })?;
             // Queuing bytes on a socket puts nothing on the wire and
@@ -600,8 +722,15 @@ where
             // sampled before this poll, so a drain that made room here
             // releases the park at once instead of being slept through.
             self.drive_tcp().await?;
-            if written != 0 {
-                continue;
+            match progress {
+                // `Room` queued bytes, so retry what is left. `Pending`
+                // is a full send queue, which the park below waits out;
+                // `Closed` fails the write rather than parking on a send
+                // side that cannot send again — the queue pass answered
+                // which under the lock it already held.
+                TcpWriteProgress::Room(_) => continue,
+                TcpWriteProgress::Pending => {}
+                TcpWriteProgress::Closed(error) => return Err(error),
             }
             if self.now_nanos() >= deadline_nanos {
                 return Err(TcpError {
@@ -757,12 +886,11 @@ where
     ) -> Result<TcpReadProgress, TcpError> {
         let started = self.profile_start();
         let now = StackInstant::from_nanos(self.now_nanos());
-        let read =
-            self.inner
-                .state
-                .with_handle_receive_drain(stream, &self.inner.cpu, |state| {
-                    state.poll_tcp_read(stream, max_bytes, now)
-                })?;
+        let read = self.inner.state.with_handle_receive_drain(
+            stream,
+            self.inner.device.queue_pair_count().max(1),
+            |state| state.poll_tcp_read(stream, max_bytes, now),
+        )?;
         self.record_tcp_read_progress(profile_prefix, started, &read);
         Ok(read)
     }
@@ -775,12 +903,11 @@ where
     ) -> Result<TcpReadIntoProgress, TcpError> {
         let started = self.profile_start();
         let now = StackInstant::from_nanos(self.now_nanos());
-        let read =
-            self.inner
-                .state
-                .with_handle_receive_drain(stream, &self.inner.cpu, |state| {
-                    state.poll_tcp_read_into(stream, buffer, now)
-                })?;
+        let read = self.inner.state.with_handle_receive_drain(
+            stream,
+            self.inner.device.queue_pair_count().max(1),
+            |state| state.poll_tcp_read_into(stream, buffer, now),
+        )?;
         self.record_tcp_read_into_progress(profile_prefix, started, &read);
         Ok(read)
     }
@@ -814,6 +941,8 @@ where
                         profile_prefix: TcpReadPhasePrefix::Polling,
                     }),
                     true,
+                    NetworkPollScope::Interface,
+                    &self.inner.poll,
                 )
                 .await
                 .map_err(|error| {
@@ -967,8 +1096,11 @@ where
                 // `tcp-read-drive-network` work in local AArch64/HVF profiles.
                 let budget = self.inner.poll.budget();
                 let (transmitted, _) = self
-                    .submit_network_transmit(NetworkPollSource::Tcp, budget)
-                    .await
+                    .submit_network_transmit(
+                        NetworkPollSource::Tcp,
+                        budget,
+                        NetworkPollScope::Interface,
+                    )
                     .map_err(|error| {
                         TcpError::from_io(error, NetworkErrorDetail::VirtioAdvanceFailed)
                     })?;
@@ -984,24 +1116,31 @@ where
         Ok(())
     }
 
-    /// Drains finished transmit descriptors on every queue pair, which
-    /// is what frees the scatter payloads the device was reading in
-    /// place.
+    /// Drains finished transmit descriptors on the queue pairs this
+    /// poll scope owns, which is what frees the scatter payloads the
+    /// device was reading in place.
     ///
-    /// Every shard submits to its own queue pair, so a reclaim that
-    /// visited only pair zero would leave the other pairs' rings full.
-    /// A pair another processor currently holds is skipped: that
+    /// An operation sweeps every pair — it is the stack's whole driver
+    /// while it runs — while a pump reclaims only the pair it owns:
+    /// every other pair has a pump of its own parked on it. A pair
+    /// another processor currently holds is skipped either way: that
     /// processor is draining it, and this poll has nothing to add.
-    fn reclaim_transmit_completions(&self, budget: usize) -> Result<usize, IoError> {
+    fn reclaim_transmit_completions(
+        &self,
+        budget: usize,
+        scope: NetworkPollScope,
+    ) -> Result<usize, IoError> {
         let mut reclaimed = 0usize;
-        for shard_idx in 0..self.inner.state.shard_count() {
+        let pair_count = self.inner.device.queue_pair_count().max(1);
+        let local_pair = usize::from(helios_hal::cpu::current_processor().id()) % pair_count;
+        for pair_idx in scope.pairs(local_pair, pair_count) {
             if reclaimed >= budget {
                 break;
             }
             let Some(completed) = self
                 .inner
                 .device
-                .reclaim_transmit_completions_immediate_on(shard_idx, budget - reclaimed)?
+                .reclaim_transmit_completions_immediate_on(pair_idx, budget - reclaimed)?
             else {
                 continue;
             };
@@ -1010,27 +1149,24 @@ where
         Ok(reclaimed)
     }
 
-    /// Drains received frames from every queue pair, which is what puts
-    /// a reply into the shard that is waiting for it.
+    /// Drains received frames from the queue pairs this poll scope
+    /// owns, which is what puts a reply into the shard that is waiting
+    /// for it.
     ///
-    /// Every pair has to be visited, for the receive-side reason the
-    /// reclaim above visits every pair on the transmit side: the device
-    /// delivers a frame on whichever pair *it* steered the flow to, and
-    /// that choice is the host's rather than this processor's. A reply
-    /// to a broadcast exchange — a DHCP offer, an ARP reply — is hashed
-    /// independently of the request that provoked it, so on a
-    /// multi-queue backend it routinely arrives on a pair belonging to
-    /// a processor that is not polling. Nothing else then drains it: a
-    /// packet pump is a backend's own choice to install, and a backend
-    /// without one drives the interface entirely from the operation
-    /// waiting on it, on that operation's processor.
+    /// An operation sweeps every pair, because the device delivers a
+    /// frame on whichever pair *it* steered the flow to and the pump
+    /// that owns the pair may not be scheduled before this caller's own
+    /// deadline: a reply to a broadcast exchange — a DHCP offer, an ARP
+    /// reply — is hashed independently of the request that provoked it.
+    /// A pump visits only the pair it owns; every other pair has a pump
+    /// of its own parked on it, so a frame is never without a drainer.
     ///
     /// The local pair is visited first, so a processor drains its own
     /// ring before it looks at anyone else's, and a pair another
     /// processor already holds is skipped by the device's `try_lock` —
     /// that processor is draining it and this poll has nothing to add.
-    /// `None` means every pair was held, which is the same "come back
-    /// later" a single-pair drain reports.
+    /// `None` means every pair the scope covers was held, which is the
+    /// same "come back later" a single-pair drain reports.
     ///
     /// A pair that refuses ends the sweep, and the refusal travels back
     /// beside the frames the sweep had already collected rather than in
@@ -1040,12 +1176,14 @@ where
     /// the peer retransmit data the guest did receive. The refusal is
     /// counted against the pair that produced it here, because this is
     /// the last place that knows which pair that was.
-    fn receive_frames_immediate(&self, frames: &mut [Option<RxFrame>]) -> Option<RxDrain> {
-        let pair_count = self.inner.device.queue_pair_count().max(1);
-        let local_pair = usize::from(helios_hal::cpu::current_processor().id()) % pair_count;
+    fn receive_frames_immediate(
+        &self,
+        pairs: impl Iterator<Item = usize>,
+        frames: &mut [Option<RxFrame>],
+    ) -> Option<RxDrain> {
         let mut received = 0usize;
         let mut drained_a_pair = false;
-        for pair_idx in receive_pair_order(local_pair, pair_count) {
+        for pair_idx in pairs {
             if received >= frames.len() {
                 break;
             }
@@ -1074,16 +1212,29 @@ where
         source: NetworkPollSource,
         tcp_read_probe: Option<NetworkTcpReadProbe>,
         submit_transmit: bool,
+        scope: NetworkPollScope,
+        poll: &NetworkPollState,
     ) -> Result<NetworkPollOutcome, IoError> {
         // Carrier first: a link that moved invalidates the very
         // configuration the control plane is about to push into the
-        // shards.
-        self.synchronize_link_state();
-        self.synchronize_control_plane();
-        let budget = self.inner.poll.budget();
+        // shards. Both are interface-wide duties — an operation driving
+        // the stack itself keeps them, and of the pumps only the one on
+        // the bootstrap processor's pair does, since a link or
+        // configuration event arrives on no pair. That pump also runs
+        // the configuration state machines themselves, between the link
+        // check that may have restarted them and the publication of
+        // what they learn.
+        if scope.interface_wide() {
+            self.synchronize_link_state();
+            if scope.drives_configuration() {
+                self.drive_interface_configuration();
+            }
+            self.synchronize_control_plane();
+        }
+        let budget = poll.budget();
 
         let reclaim_started = self.profile_start();
-        let reclaimed = self.reclaim_transmit_completions(budget.tx_completions)?;
+        let reclaimed = self.reclaim_transmit_completions(budget.tx_completions, scope)?;
         if reclaimed != 0 {
             self.record_network_profile_events(
                 source.tx_reclaim_phase(),
@@ -1116,6 +1267,8 @@ where
         // shard its flow belongs to, and a shard that will not take one
         // loses that frame and nothing else.
         let stack_rx_budget = self.inner.stack_rx_budget;
+        let pair_count = self.inner.device.queue_pair_count().max(1);
+        let local_pair = usize::from(helios_hal::cpu::current_processor().id()) % pair_count;
         loop {
             let remaining_rx_budget = budget
                 .rx_frames
@@ -1128,23 +1281,57 @@ where
             let receive_limit = remaining_rx_budget.min(NETWORK_RX_BATCH_FRAMES);
             let mut frames: [Option<RxFrame>; NETWORK_RX_BATCH_FRAMES] =
                 core::array::from_fn(|_| None);
+            let ring_started = self.profile_start();
+            let drain = self.receive_frames_immediate(
+                scope.pairs(local_pair, pair_count),
+                &mut frames[..receive_limit],
+            );
+            // Only the immediate path's frames count as ring events: a
+            // fallback's frames come from pair zero's async receive and
+            // belong to `rx-fallback`.
+            let ring_frames = drain.as_ref().map_or(0, |drain| drain.received);
+            self.record_network_profile_events_bytes(
+                source.rx_ring_phase(),
+                ring_started,
+                ring_frames,
+                frames[..ring_frames]
+                    .iter()
+                    .flatten()
+                    .map(RxFrame::len)
+                    .sum(),
+            );
             let RxDrain {
                 received: received_batch,
                 refusal,
-            } = match self.receive_frames_immediate(&mut frames[..receive_limit]) {
+            } = match drain {
                 Some(drain) => drain,
-                None => {
+                // The immediate path found every pair it covers held
+                // mid-drain by somebody else. The pair-agnostic receive
+                // is pair zero's async lock — worth taking only when
+                // this scope owns pair zero; any other held pair is
+                // being drained by its pump and needs nothing from us.
+                None if scope.covers_pair_zero() => {
                     let mut received_batch = 0usize;
                     for frame in &mut frames[..receive_limit] {
                         let Some(received_frame) = self.inner.device.try_receive_frame().await?
                         else {
                             break;
                         };
+                        // The lock wait inside `try_receive_frame` is
+                        // outside this span: only the synchronous
+                        // hand-off of the frame it produced is measured.
+                        let fallback_started = self.profile_start();
                         *frame = Some(received_frame);
                         received_batch += 1;
+                        self.record_network_profile_events(
+                            source.rx_fallback_phase(),
+                            fallback_started,
+                            1,
+                        );
                     }
                     RxDrain::completed(received_batch)
                 }
+                None => break,
             };
             // A refused drain still falls through the demux below, so
             // the frames it did take reach their shards and their
@@ -1168,6 +1355,7 @@ where
             // released, and a batch that lands several frames in the
             // same shard should release its waiters once.
             let mut arrivals = ShardArrivals::new();
+            let dispatch_started = self.profile_start();
             for frame in frames[..received_batch].iter().flatten() {
                 let frame_len = frame.len();
                 match self
@@ -1197,19 +1385,31 @@ where
                     }
                 }
             }
-            // Every shard that took a frame is released here, and the
-            // processor that owns it is pulled out of its idle park when
-            // this is not that processor. Without this a reply demuxed
-            // into a foreign shard would sit there until its waiter's own
-            // deadline expired.
-            self.inner.state.notify_arrivals(&arrivals, &self.inner.cpu);
+            self.record_network_profile_events(
+                source.rx_dispatch_phase(),
+                dispatch_started,
+                received_batch,
+            );
+            // Every shard that took a frame is released here. Without
+            // this a reply demuxed into a foreign shard would sit there
+            // until its waiter's own deadline expired.
+            let signal_started = self.profile_start();
+            self.inner.state.notify_arrivals(&arrivals);
+            self.record_network_profile_events(
+                source.rx_signal_phase(),
+                signal_started,
+                arrivals.len(),
+            );
 
-            if self
+            let repost_started = self.profile_start();
+            let reposted = self
                 .inner
                 .device
-                .repost_rx_frames_immediate(&mut frames[..received_batch])?
-                .is_none()
-            {
+                .repost_rx_frames_immediate(&mut frames[..received_batch])?;
+            // Returning the batch's slots is the same driver receive the
+            // ring phase covers; it records no frames of its own.
+            self.record_network_profile_events(source.rx_ring_phase(), repost_started, 0);
+            if reposted.is_none() {
                 for frame in &mut frames[..received_batch] {
                     drop(frame.take());
                 }
@@ -1235,20 +1435,29 @@ where
         let mut tcp_read = None;
         let mut tcp_read_started = None;
         let mut tcp_read_finished = None;
-        // Each shard owns its own TCP connections, so the timer
-        // drive must hit every shard's Stack.
-        self.inner.state.for_each(|state| {
+        // Each shard owns its own TCP connections, so the timer drive
+        // hits every shard this scope serves: all of them for an
+        // operation driving the interface, the shards that submit on
+        // the pump's pair for a pump.
+        let drive_tcp = |state: &mut NetworkShard| {
             state
                 .stack
                 .drive_tcp(now)
                 .unwrap_or_else(|error| tracing::debug!(?error, "failed to drive TCP control"));
-        });
+        };
+        match scope {
+            NetworkPollScope::Interface => self.inner.state.for_each(drive_tcp),
+            NetworkPollScope::Pair { pair, .. } => self
+                .inner
+                .state
+                .for_each_on_pair(pair, pair_count, drive_tcp),
+        }
         let tcp_finished = self.profile_start();
         if let Some(probe) = tcp_read_probe {
             tcp_read_started = self.profile_start();
             tcp_read = Some(self.inner.state.with_handle_receive_drain(
                 probe.stream,
-                &self.inner.cpu,
+                pair_count,
                 |state| state.poll_tcp_read(probe.stream, probe.max_bytes, now),
             ));
             tcp_read_finished = self.profile_start();
@@ -1270,7 +1479,7 @@ where
         }
 
         let (transmitted, _) = if submit_transmit {
-            self.submit_network_transmit(source, budget).await?
+            self.submit_network_transmit(source, budget, scope)?
         } else {
             (0, 0)
         };
@@ -1279,7 +1488,7 @@ where
             reclaimed_tx: reclaimed,
             transmitted_frames: transmitted,
         };
-        self.inner.poll.complete(progress);
+        poll.complete(progress);
         Ok(NetworkPollOutcome {
             progress,
             budget,
@@ -1552,18 +1761,53 @@ impl NetworkShard {
         }
     }
 
+    /// What `stream`'s send side does with a write right now.
+    ///
+    /// The stack's tri-state with the close kind already folded into the
+    /// error a writer reports: a reset reads as `ConnectionReset`, the
+    /// orderly close as "no longer writable".
+    pub(super) fn tcp_send_room(&self, stream: TcpStreamId) -> Result<TcpWriteProgress, TcpError> {
+        let socket = self.tcp_socket(stream)?;
+        self.stack
+            .tcp_send_room(socket)
+            .map(|state| match state {
+                TcpSendState::Pending => TcpWriteProgress::Pending,
+                TcpSendState::Room(room) => TcpWriteProgress::Room(room),
+                TcpSendState::Closed(close) => {
+                    TcpWriteProgress::Closed(tcp_close_error(close).unwrap_or(TcpError {
+                        kind: TcpErrorKind::Unavailable,
+                        detail: NetworkErrorDetail::TcpNoLongerWritable,
+                    }))
+                }
+            })
+            .map_err(|_| TcpError {
+                kind: TcpErrorKind::Unavailable,
+                detail: NetworkErrorDetail::UnknownTcpStream,
+            })
+    }
+
+    /// Queues what `bytes` gives `stream`'s send queue. `Room` is the
+    /// count queued; a queue that took nothing asks `tcp_send_room`
+    /// while the state the write saw is still held — `Pending` for a
+    /// full send window, `Closed` for a send side that cannot send
+    /// again, and `Room` only for a write that carried no bytes.
     pub(super) fn try_write_tcp_bytes(
         &mut self,
         stream: TcpStreamId,
         bytes: &mut Bytes,
-    ) -> Result<usize, TcpError> {
+    ) -> Result<TcpWriteProgress, TcpError> {
         let socket = self.tcp_socket(stream)?;
-        self.stack
+        let written = self
+            .stack
             .tcp_send_bytes(socket, bytes)
             .map_err(|_| TcpError {
                 kind: TcpErrorKind::Unavailable,
                 detail: NetworkErrorDetail::TcpWriteQueueFailed,
-            })
+            })?;
+        match written {
+            0 => self.tcp_send_room(stream),
+            written => Ok(TcpWriteProgress::Room(written)),
+        }
     }
 
     pub(super) fn shutdown_tcp_send(&mut self, stream: TcpStreamId) -> Result<(), TcpError> {

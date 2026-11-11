@@ -41,7 +41,7 @@ pub use hash::{
 };
 pub use ndp::{
     Ipv6DnsServers, Ipv6RouterConfiguration, MAX_ADVERTISED_PREFIXES, MAX_IPV6_DNS_SERVERS,
-    MAX_ROUTER_SOLICITATIONS, NeighborDiscovery, ROUTER_SOLICITATION_INTERVAL_NANOS,
+    MAX_ROUTER_SOLICITATIONS, NeighborDiscovery, OnLinkPrefix, ROUTER_SOLICITATION_INTERVAL_NANOS,
     SLAAC_PREFIX_LEN, interpret_router_advertisement,
 };
 pub use packet::{
@@ -55,11 +55,11 @@ pub use packet::{
 pub use stack::{
     DEFAULT_TCP_LISTEN_BACKLOG, DhcpLease, DnsQueryId, IcmpEchoKey, IcmpEchoReply,
     Ipv4MulticastMembership, MAX_ICMP_ECHO_REPLIES, MAX_IPV4_MULTICAST_MEMBERSHIPS,
-    MAX_OUTBOUND_FRAMES, MAX_UDP_RX, MAX_UDP_SOCKETS, NeighborEntry, NeighborState,
+    MAX_OUTBOUND_FRAMES, MAX_UDP_RX, MAX_UDP_SOCKETS, NeighborCache, NeighborEntry, NeighborState,
     OutboundBatchStatus, Route, RouteTable, RxChecksumOffload, SocketId, Stack, StackConfig,
     StackEvent, StackInstant, TcpAccept, TcpCloseOutcome, TcpConnectState, TcpConnectTerminalError,
-    TcpListenBacklog, TcpReadIntoState, TcpReadState, TcpStackCounters, UdpEgress, UdpEndpoint,
-    UdpPayload, UdpReceive, UdpSocketBinding, UdpSocketError, UdpSocketId,
+    TcpListenBacklog, TcpReadIntoState, TcpReadState, TcpSendState, TcpStackCounters, UdpEgress,
+    UdpEndpoint, UdpPayload, UdpReceive, UdpSocketBinding, UdpSocketError, UdpSocketId,
 };
 pub use tcp::{TCP_RECEIVE_WINDOW_BYTES, TCP_TRANSMIT_BUFFER_BYTES};
 pub use tcp::{
@@ -566,17 +566,25 @@ impl Default for PacketBuffer {
 ///
 /// Two counters, because an interface reports two kinds of progress.
 /// `queue` counts what one queue pair completed, which is the only
-/// progress an operation pinned to that pair can use; `device` counts
-/// what the interface reported that belongs to no pair — a
-/// configuration change, a control-queue completion, or any event a
-/// transport with one interrupt line cannot attribute to a pair. A
-/// waiter observes an increment of either.
+/// progress an operation pinned to that pair can use; `device`, when
+/// the caller arms it, counts what the interface reported on the
+/// interface-wide channel — a configuration change, a control-queue
+/// completion.
+///
+/// Who clears `device` is the waiter's decision. The per-pair packet
+/// pumps clear it: a pair's completions always have their own listener
+/// in the pump parked on that pair, so the wide channel would only
+/// wake them on interrupts they cannot act on. Socket waiters keep it
+/// armed because a link or configuration event can change what they
+/// are waiting for, and the bootstrap processor's pump keeps it
+/// because it is the one that acts on those events.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct InterfaceEventMark {
     /// Events the sampled queue pair had reported.
     pub queue: u64,
-    /// Events the interface had reported that belong to no queue pair.
-    pub device: u64,
+    /// Events the interface had reported that belong to no queue pair,
+    /// or `None` for a wait that parks on the pair alone.
+    pub device: Option<u64>,
 }
 
 /// Multi-core aware network interface contract used by packet stacks.
@@ -705,7 +713,8 @@ pub trait NetworkInterface: Clone + Send + Sync + 'static {
     fn event_mark(&self, queue_idx: usize) -> InterfaceEventMark;
 
     /// Waits until the interface reports an event past `mark`, on
-    /// `queue_idx` or on the interface as a whole.
+    /// `queue_idx` or — while `mark.device` is armed — on the
+    /// interface as a whole.
     ///
     /// An operation belongs to one shard, which drains one queue pair,
     /// so a completion on another pair is not progress it can use.
@@ -857,4 +866,10 @@ pub enum StackError {
     /// Multicast membership storage was exhausted.
     #[error("network multicast membership table is full")]
     MulticastMembershipTableFull,
+    /// Route storage was exhausted and nothing could be displaced.
+    #[error("network route table is full")]
+    RouteTableFull,
+    /// Interface address storage was exhausted.
+    #[error("network address table is full")]
+    AddressTableFull,
 }

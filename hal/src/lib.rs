@@ -14,6 +14,7 @@ pub mod device;
 pub mod display;
 pub mod entropy;
 pub mod fs;
+pub mod generation;
 pub mod input;
 pub mod interrupt;
 pub mod io;
@@ -232,7 +233,7 @@ where
             cpu.bootstrap_processor(),
             cpu.processor_count(),
         );
-        let timer_frequency_hz = cpu.timer_frequency();
+        let timer_frequency_hz = cpu.timebase().frequency();
         Self {
             console,
             memory_regions,
@@ -299,9 +300,21 @@ mod tests {
     }
 
     #[derive(Clone, Copy)]
-    struct TestCpu;
+    struct TestCpu {
+        timebase: cpu::Timebase,
+    }
+
+    impl TestCpu {
+        fn new() -> Self {
+            Self {
+                timebase: cpu::Timebase::new(24_000_000),
+            }
+        }
+    }
 
     impl cpu::Cpu for TestCpu {
+        const TIMER_INTERRUPT: cpu::TimerInterrupt = cpu::TimerInterrupt::Deadline;
+
         fn processor_count(&self) -> usize {
             4
         }
@@ -326,8 +339,8 @@ mod tests {
             cpu::Instant::new(0)
         }
 
-        fn timer_frequency(&self) -> u64 {
-            24_000_000
+        fn timebase(&self) -> cpu::Timebase {
+            self.timebase
         }
 
         fn set_deadline(&self, _deadline: cpu::Instant) {
@@ -357,7 +370,7 @@ mod tests {
 
     #[test]
     fn platform_new_captures_cpu_defaults() {
-        let platform = Platform::new(TestConsole, empty_regions(), TestCpu);
+        let platform = Platform::new(TestConsole, empty_regions(), TestCpu::new());
 
         assert_eq!(
             platform.topology,
@@ -370,7 +383,7 @@ mod tests {
 
     #[test]
     fn platform_builders_override_platform_facts() {
-        let platform = Platform::new(TestConsole, empty_regions(), TestCpu)
+        let platform = Platform::new(TestConsole, empty_regions(), TestCpu::new())
             .with_topology(
                 ProcessorTopology::start_all_secondaries(ProcessorId::new(1), 4)
                     .with_startup_policy(ProcessorStartupPolicy::BootstrapOnly),

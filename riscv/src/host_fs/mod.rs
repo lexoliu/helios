@@ -44,7 +44,11 @@ pub(crate) fn install(
     };
 
     let transport = HostFsTransportService { device };
-    debug_state.install_host_fs_service(HostFileSystemService::new(transport.clone(), cpu.clone()));
+    debug_state.install_host_fs_service(HostFileSystemService::new(
+        transport.clone(),
+        cpu.clone(),
+        debug_state.profiles(),
+    ));
     tracing::info!(
         "virtio 9p online mount_tag={HOST_MOUNT_TAG} irq={}",
         source.0.get()

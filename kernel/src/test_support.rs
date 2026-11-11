@@ -6,7 +6,7 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use helios_hal::cpu::{Cpu, Instant, ProcessorId};
+use helios_hal::cpu::{Cpu, Instant, ProcessorId, Timebase, TimerInterrupt};
 
 /// The processor-local interrupt mask for the kernel's own unit tests.
 ///
@@ -42,21 +42,28 @@ use triomphe::Arc;
 #[derive(Clone, Copy)]
 pub(crate) struct TestCpu {
     entropy: Option<u8>,
+    timebase: Timebase,
 }
 
 impl TestCpu {
-    pub(crate) const fn with_entropy(fill: u8) -> Self {
+    pub(crate) fn with_entropy(fill: u8) -> Self {
         Self {
             entropy: Some(fill),
+            timebase: Timebase::new(1_000_000),
         }
     }
 
-    pub(crate) const fn without_entropy() -> Self {
-        Self { entropy: None }
+    pub(crate) fn without_entropy() -> Self {
+        Self {
+            entropy: None,
+            timebase: Timebase::new(1_000_000),
+        }
     }
 }
 
 impl Cpu for TestCpu {
+    const TIMER_INTERRUPT: TimerInterrupt = TimerInterrupt::Deadline;
+
     fn has_lazy_commit_virtual_memory(&self) -> bool {
         // The unit tests build on a hosted platform, where the operating
         // system commits a reservation lazily on its own. A test platform
@@ -83,8 +90,8 @@ impl Cpu for TestCpu {
         Instant::new(11)
     }
 
-    fn timer_frequency(&self) -> u64 {
-        1_000_000
+    fn timebase(&self) -> Timebase {
+        self.timebase
     }
 
     fn set_deadline(&self, _: Instant) {}
@@ -112,6 +119,17 @@ impl Cpu for TestCpu {
     }
 }
 
+/// A timer owned by the processor the calling test thread stands for,
+/// as [`crate::Executor::timer`] builds one on every processor.
+pub(crate) fn test_timer<CpuImpl: Cpu + Clone>(cpu: CpuImpl) -> crate::Timer<CpuImpl> {
+    crate::Executor::new(
+        helios_hal::watchdog::ProgressCounter::new(),
+        cpu.processor_count(),
+        helios_hal::cpu::current_processor(),
+    )
+    .timer(cpu)
+}
+
 /// A CPU whose clock a test moves by hand.
 ///
 /// Its timebase is one tick per nanosecond, so a test that wants to
@@ -120,12 +138,14 @@ impl Cpu for TestCpu {
 #[derive(Clone)]
 pub(crate) struct ManualClockCpu {
     nanos: Arc<AtomicU64>,
+    timebase: Timebase,
 }
 
 impl ManualClockCpu {
     pub(crate) fn new() -> Self {
         Self {
             nanos: Arc::new(AtomicU64::new(0)),
+            timebase: Timebase::new(1_000_000_000),
         }
     }
 
@@ -136,6 +156,8 @@ impl ManualClockCpu {
 }
 
 impl Cpu for ManualClockCpu {
+    const TIMER_INTERRUPT: TimerInterrupt = TimerInterrupt::Deadline;
+
     fn processor_count(&self) -> usize {
         1
     }
@@ -154,8 +176,8 @@ impl Cpu for ManualClockCpu {
         Instant::new(self.nanos.load(Ordering::Relaxed))
     }
 
-    fn timer_frequency(&self) -> u64 {
-        1_000_000_000
+    fn timebase(&self) -> Timebase {
+        self.timebase
     }
 
     fn set_deadline(&self, _: Instant) {}
@@ -189,10 +211,16 @@ impl Cpu for ManualClockCpu {
 /// the owning processor out of its idle park. That is invisible to a
 /// single-processor fixture, so this one reports the topology the test
 /// needs and keeps the IPIs for the test to assert on.
+#[derive(Clone)]
 pub(crate) struct RecordingSmpCpu {
     base: TestCpu,
     processors: usize,
-    woken: spin::Mutex<alloc::vec::Vec<ProcessorId>>,
+    /// One machine's wake log: a clone is the same CPU, so it shares
+    /// the record rather than starting a new one.
+    woken: Arc<spin::Mutex<alloc::vec::Vec<ProcessorId>>>,
+    /// Every deadline programmed, with the processor whose comparator
+    /// it reached: the one executing `set_deadline`.
+    deadlines: Arc<spin::Mutex<alloc::vec::Vec<(ProcessorId, u64)>>>,
 }
 
 impl RecordingSmpCpu {
@@ -206,7 +234,8 @@ impl RecordingSmpCpu {
         Self {
             base: TestCpu::without_entropy(),
             processors,
-            woken: spin::Mutex::new(alloc::vec::Vec::new()),
+            woken: Arc::new(spin::Mutex::new(alloc::vec::Vec::new())),
+            deadlines: Arc::new(spin::Mutex::new(alloc::vec::Vec::new())),
         }
     }
 
@@ -214,9 +243,17 @@ impl RecordingSmpCpu {
     pub(crate) fn woken(&self) -> alloc::vec::Vec<ProcessorId> {
         self.woken.lock().clone()
     }
+
+    /// The deadlines programmed so far, in ticks and in order, each
+    /// with the processor whose comparator it reached.
+    pub(crate) fn deadlines(&self) -> alloc::vec::Vec<(ProcessorId, u64)> {
+        self.deadlines.lock().clone()
+    }
 }
 
 impl Cpu for RecordingSmpCpu {
+    const TIMER_INTERRUPT: TimerInterrupt = TimerInterrupt::Deadline;
+
     fn processor_count(&self) -> usize {
         self.processors
     }
@@ -241,12 +278,14 @@ impl Cpu for RecordingSmpCpu {
         self.base.now()
     }
 
-    fn timer_frequency(&self) -> u64 {
-        self.base.timer_frequency()
+    fn timebase(&self) -> Timebase {
+        self.base.timebase()
     }
 
     fn set_deadline(&self, deadline: Instant) {
-        self.base.set_deadline(deadline);
+        self.deadlines
+            .lock()
+            .push((helios_hal::cpu::current_processor(), deadline.ticks()));
     }
 
     fn publish_executable(&self, address: *const u8, len: usize) {
@@ -289,7 +328,7 @@ pub(crate) fn test_profile_sink() -> crate::ProfileSink {
 /// origin is the boot tick, so a tick is a nanosecond and a test can
 /// state deadlines in either.
 pub(crate) fn test_uptime_clock() -> crate::UptimeClock {
-    crate::UptimeClock::new(0, 1_000_000_000)
+    crate::UptimeClock::new(0, Timebase::new(1_000_000_000))
 }
 
 /// Runtime state that answers the few questions a store asks and
@@ -428,10 +467,17 @@ struct RecordingInterfaceState {
     /// order. A test that wants to prove the kernel takes a frame off
     /// the device has to put one there first.
     pending: alloc::vec::Vec<spin::Mutex<alloc::collections::VecDeque<PendingReceive>>>,
-    /// Events reported that belong to no queue pair.
+    /// Wakes whatever is parked on the same pair's counter — a per-queue
+    /// interrupt reaches the pair's listeners and nobody else's, the
+    /// way the real driver's does.
+    queue_signals: alloc::vec::Vec<crate::ProgressSignal>,
+    /// Events reported on the interface-wide channel: the ones that
+    /// belong to no queue pair. A pair's own completions stay on the
+    /// pair's counter — every pair has a packet pump parked on it, so
+    /// the completion has a listener of its own already.
     device: AtomicU64,
-    /// Wakes whatever is parked on either counter.
-    progress: crate::ProgressSignal,
+    /// Wakes whatever armed the interface-wide leg of its wait.
+    device_signal: crate::ProgressSignal,
     /// Whether the transmit ring takes frames. A recording interface
     /// refuses them by default so a test can read what the stack queued;
     /// one built with [`RecordingNetworkInterface::accepting_transmissions`]
@@ -462,8 +508,11 @@ impl RecordingNetworkInterface {
                 pending: (0..queue_pairs)
                     .map(|_| spin::Mutex::new(alloc::collections::VecDeque::new()))
                     .collect(),
+                queue_signals: (0..queue_pairs)
+                    .map(|_| crate::ProgressSignal::new())
+                    .collect(),
                 device: AtomicU64::new(0),
-                progress: crate::ProgressSignal::new(),
+                device_signal: crate::ProgressSignal::new(),
                 accept_transmissions,
                 transmitted: spin::Mutex::new(alloc::vec::Vec::new()),
             }),
@@ -499,18 +548,37 @@ impl RecordingNetworkInterface {
     }
 
     /// Raises the event one queue pair's completions raise, as the
-    /// driver's interrupt handler would.
+    /// driver's per-queue interrupt handler would: the pair's own
+    /// counter and the pair's own signal, and nothing else — a waiter
+    /// parked on another pair learns of the frame from the pump that
+    /// drains it, through that shard's arrival signal.
     pub(crate) fn complete_on(&self, queue_idx: usize) {
         self.inner.queues[queue_idx].fetch_add(1, Ordering::AcqRel);
-        self.inner.progress.signal();
+        self.inner.queue_signals[queue_idx].signal();
+    }
+
+    /// Raises an event that belongs to no queue pair — a link or
+    /// configuration change, as the driver's configuration interrupt
+    /// handler would.
+    pub(crate) fn complete_device(&self) {
+        self.inner.device.fetch_add(1, Ordering::AcqRel);
+        self.inner.device_signal.signal();
     }
 }
 
 impl RecordingInterfaceState {
+    /// Folds a caller's queue index onto the pairs the interface has,
+    /// the way the real driver's `normalize_pair_idx` does: callers
+    /// hand the device a shard-scale index and the device answers for
+    /// the pair that shard submits on.
+    fn pair(&self, queue_idx: usize) -> usize {
+        queue_idx % self.queues.len()
+    }
+
     fn mark(&self, queue_idx: usize) -> helios_netstack::InterfaceEventMark {
         helios_netstack::InterfaceEventMark {
-            queue: self.queues[queue_idx].load(Ordering::Acquire),
-            device: self.device.load(Ordering::Acquire),
+            queue: self.queues[self.pair(queue_idx)].load(Ordering::Acquire),
+            device: Some(self.device.load(Ordering::Acquire)),
         }
     }
 }
@@ -637,16 +705,35 @@ impl helios_netstack::NetworkInterface for RecordingNetworkInterface {
     ) -> impl core::future::Future<Output = ()> + Send + '_ {
         // Armed here, not at the first poll, exactly as a driver must:
         // the wake this races is raised by an interrupt handler that
-        // does not wait to be observed.
-        let progress = self.inner.progress.mark();
+        // does not wait to be observed. The pair's signal is always
+        // armed; the interface-wide one only while the wait asked for
+        // it, the way `mark.device` being `None` says it did not.
+        let pair_idx = self.inner.pair(queue_idx);
+        let queue = self.inner.queue_signals[pair_idx].mark();
+        let device_changed = mark.device.map(|_| {
+            let sampled = self.inner.device_signal.mark();
+            self.inner.device_signal.changed(sampled)
+        });
         async move {
-            let changed = self.inner.progress.changed(progress);
-            let mut changed = core::pin::pin!(changed);
+            let queue_changed = self.inner.queue_signals[pair_idx].changed(queue);
+            let mut queue_changed = core::pin::pin!(queue_changed);
+            let mut device_changed = core::pin::pin!(device_changed);
             core::future::poll_fn(|cx| {
-                if self.inner.mark(queue_idx) != mark {
+                let current = self.inner.mark(queue_idx);
+                if current.queue != mark.queue
+                    || (mark.device.is_some() && current.device != mark.device)
+                {
                     return core::task::Poll::Ready(());
                 }
-                core::future::Future::poll(changed.as_mut(), cx)
+                if core::future::Future::poll(queue_changed.as_mut(), cx).is_ready() {
+                    return core::task::Poll::Ready(());
+                }
+                if let Some(device_changed) = device_changed.as_mut().as_pin_mut()
+                    && core::future::Future::poll(device_changed, cx).is_ready()
+                {
+                    return core::task::Poll::Ready(());
+                }
+                core::task::Poll::Pending
             })
             .await;
         }
@@ -666,7 +753,7 @@ mod network {
 
     use bytes::Bytes;
 
-    use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
     use triomphe::Arc;
 
@@ -703,11 +790,48 @@ mod network {
         closed: Arc<TestClosedStreams>,
         closed_udp: Arc<TestClosedStreams>,
         closed_listeners: Arc<TestClosedStreams>,
+        /// The failure switch a stream test arms: once set, the calls a
+        /// device poll sits behind — `tcp_read`, `tcp_write_all_bytes`,
+        /// `tcp_write_ready` — fail the way a device fault fails them,
+        /// while the synchronous probes keep answering: `tcp_try_read`
+        /// still drains and the send side reports a full queue, since a
+        /// device that cannot be polled also cannot drain one.
+        drive_failure: Arc<AtomicBool>,
+        /// Bytes `tcp_write_all` accepted — the evidence a parked batch
+        /// was retried rather than dropped.
+        bytes_written: Arc<AtomicU64>,
     }
 
     impl TestNetworkService {
         pub(crate) fn new() -> Self {
             Self::default()
+        }
+
+        /// Arm the driving calls to fail — see `drive_failure`.
+        pub(crate) fn fail_drives(&self) {
+            self.drive_failure.store(true, Ordering::Release);
+        }
+
+        /// Disarm the switch, so a retried write can show what a parked
+        /// batch kept.
+        pub(crate) fn heal_drives(&self) {
+            self.drive_failure.store(false, Ordering::Release);
+        }
+
+        /// Total bytes `tcp_write_all` has accepted.
+        pub(crate) fn bytes_written(&self) -> u64 {
+            self.bytes_written.load(Ordering::Acquire)
+        }
+
+        /// The error a real device fault surfaces as from a driving
+        /// call, when the switch is armed.
+        fn drive_error(&self) -> Option<crate::TcpError> {
+            self.drive_failure
+                .load(Ordering::Acquire)
+                .then_some(crate::TcpError {
+                    kind: crate::TcpErrorKind::Internal,
+                    detail: crate::NetworkErrorDetail::VirtioAdvanceFailed,
+                })
         }
 
         /// The TCP retirement log this service writes to, which is
@@ -892,10 +1016,18 @@ mod network {
         fn tcp_write_all(
             &self,
             _: Self::TcpStream,
-            _: &[u8],
+            bytes: &[u8],
             _: u64,
         ) -> impl core::future::Future<Output = Result<(), crate::TcpError>> + Send + '_ {
-            core::future::ready(Ok(()))
+            let written = bytes.len() as u64;
+            let failure = self.drive_error();
+            core::future::ready(match failure {
+                Some(error) => Err(error),
+                None => {
+                    self.bytes_written.fetch_add(written, Ordering::AcqRel);
+                    Ok(())
+                }
+            })
         }
 
         fn tcp_read(
@@ -905,7 +1037,55 @@ mod network {
             _: u64,
         ) -> impl core::future::Future<Output = Result<Option<Bytes>, crate::TcpError>> + Send + '_
         {
-            core::future::ready(Ok(Some(Bytes::from_static(&[4, 2]))))
+            let failure = self.drive_error();
+            core::future::ready(match failure {
+                Some(error) => Err(error),
+                None => Ok(Some(Bytes::from_static(&[4, 2]))),
+            })
+        }
+
+        fn tcp_try_read(
+            &self,
+            _: Self::TcpStream,
+            _: usize,
+        ) -> Result<crate::TcpReadProgress, crate::TcpError> {
+            Ok(crate::TcpReadProgress::Data(Bytes::from_static(&[4, 2])))
+        }
+
+        fn tcp_send_room(
+            &self,
+            _: Self::TcpStream,
+        ) -> Result<crate::TcpWriteProgress, crate::TcpError> {
+            Ok(match self.drive_failure.load(Ordering::Acquire) {
+                // A device whose polls fail drains nothing: the send
+                // queue reads as full.
+                true => crate::TcpWriteProgress::Pending,
+                false => crate::TcpWriteProgress::Room(usize::MAX),
+            })
+        }
+
+        fn tcp_try_write(
+            &self,
+            _: Self::TcpStream,
+            bytes: &mut Bytes,
+        ) -> Result<crate::TcpWriteProgress, crate::TcpError> {
+            if self.drive_failure.load(Ordering::Acquire) {
+                return Ok(crate::TcpWriteProgress::Pending);
+            }
+            let written = bytes.len();
+            bytes.clear();
+            Ok(crate::TcpWriteProgress::Room(written))
+        }
+
+        fn tcp_write_ready(
+            &self,
+            _: Self::TcpStream,
+        ) -> impl core::future::Future<Output = Result<(), crate::TcpError>> + Send + '_ {
+            let failure = self.drive_error();
+            core::future::ready(match failure {
+                Some(error) => Err(error),
+                None => Ok(()),
+            })
         }
 
         fn tcp_shutdown_send(
@@ -1135,6 +1315,13 @@ mod network {
                 crate::Ipv4Address::new([127, 0, 0, 1]),
             )]))
         }
+    }
+
+    impl crate::NetworkPacketPump for TestNetworkService {
+        /// The double has no device and therefore no queue pairs for a
+        /// pump to own — whichever processor calls, the answer is that
+        /// there is nothing to drive.
+        async fn run_packet_pump(&self, _: helios_hal::cpu::ProcessorId) {}
     }
 }
 

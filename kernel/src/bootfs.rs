@@ -4,13 +4,47 @@ use alloc::borrow::ToOwned;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use bytes::Bytes;
 use helios_hal::fs::{
     Directory, DirectoryEntry, DirectoryHandle, DirectoryRights, File, FileHandle, FileRights,
     FileSystem, IoError, IoResult,
 };
 use helios_hal::resource::KernelResource;
 
-/// Single immutable file embedded into the kernel image at compile time.
+/// File bytes exactly as the boot payload supplied them.
+///
+/// Holding one is the proof that the bytes are a view into the payload
+/// the bootloader handed the kernel and that nothing has written them
+/// since: the only constructor takes a `&'static` slice, which the
+/// boot payload views hand out and guest data never is, and no method
+/// mutates the bytes. Trust that rests on where a program came from (an
+/// unverified bootfs artifact) is granted to this type, never to a
+/// `Bytes` read from wherever a path happened to resolve.
+///
+/// It is the bare slice rather than a `Bytes`, so a filesystem node that
+/// holds either this or written `Bytes` is no larger than one holding
+/// `Bytes` alone: every instance seeds one node per bootfs entry.
+#[derive(Clone, Copy, Debug)]
+pub struct BootfsBytes(&'static [u8]);
+
+impl BootfsBytes {
+    /// Wraps a view into the boot payload. Only the payload views
+    /// ([`EmbeddedBootFile`], [`crate::EmbeddedComponent`]) call this.
+    pub(crate) const fn from_image(bytes: &'static [u8]) -> Self {
+        Self(bytes)
+    }
+
+    pub const fn as_slice(&self) -> &'static [u8] {
+        self.0
+    }
+
+    /// The bytes as a zero-copy `Bytes` over the image.
+    pub const fn to_bytes(&self) -> Bytes {
+        Bytes::from_static(self.0)
+    }
+}
+
+/// Single immutable file view into the payload the backend hands the kernel.
 #[derive(Clone, Copy)]
 pub struct EmbeddedBootFile {
     path: &'static str,
@@ -18,7 +52,8 @@ pub struct EmbeddedBootFile {
     modified_nanos: u64,
 }
 
-/// Single immutable directory embedded into the kernel image at compile time.
+/// Single immutable directory view into the payload the backend hands the
+/// kernel.
 #[derive(Clone, Copy)]
 pub struct EmbeddedBootDirectory {
     path: &'static str,
@@ -81,6 +116,11 @@ impl EmbeddedBootFile {
         self.contents
     }
 
+    /// The file's contents, carrying their bootfs provenance.
+    pub const fn bootfs_bytes(&self) -> BootfsBytes {
+        BootfsBytes::from_image(self.contents)
+    }
+
     pub const fn modified_nanos(&self) -> u64 {
         self.modified_nanos
     }
@@ -121,6 +161,16 @@ impl EmbeddedBootFs {
 
     pub const fn is_empty(&self) -> bool {
         self.directories.is_empty() && self.files.is_empty()
+    }
+
+    /// The contents of the file at the absolute guest path `path`
+    /// (`/bin/compiler.cwasm`), read straight from the image.
+    pub fn file_bytes(&self, path: &str) -> Option<BootfsBytes> {
+        let relative = path.strip_prefix('/')?;
+        self.files
+            .iter()
+            .find(|file| file.path == relative)
+            .map(EmbeddedBootFile::bootfs_bytes)
     }
 
     /// Creates the root directory capability for this boot filesystem.
@@ -490,8 +540,10 @@ fn with_trailing_slash(path: &str) -> String {
 mod tests {
     extern crate std;
 
+    use alloc::boxed::Box;
+
     use futures_lite::future::block_on;
-    use helios_kernel_macro::bootfs;
+    use helios_artifact::bootfs::{EntryKind, WriteEntry, write_image};
 
     use super::{BootDirectoryHandleExt, EmbeddedBootDirectory, EmbeddedBootFile, EmbeddedBootFs};
     use helios_hal::fs::{
@@ -507,7 +559,40 @@ mod tests {
             EmbeddedBootFile::new("etc/config.txt", b"config", 0),
         ],
     );
-    const MACRO_IMAGE: EmbeddedBootFs = bootfs!("tests/bootfs_data");
+
+    /// A bootfs read back out of a real `helios-bootfs` image — the same
+    /// parse the kernel applies to the payload a backend hands it.
+    fn payload_image() -> EmbeddedBootFs {
+        let bytes = write_image(&[
+            WriteEntry {
+                kind: EntryKind::InitComponent,
+                path: "init",
+                data: b"init",
+                modified_nanos: 0,
+            },
+            WriteEntry {
+                kind: EntryKind::InitArgv0,
+                path: "init",
+                data: b"",
+                modified_nanos: 0,
+            },
+            WriteEntry {
+                kind: EntryKind::File,
+                path: "bin/init.txt",
+                data: b"boot init\n",
+                modified_nanos: 0,
+            },
+            WriteEntry {
+                kind: EntryKind::File,
+                path: "lib/module.txt",
+                data: b"boot module\n",
+                modified_nanos: 0,
+            },
+        ]);
+        crate::BootPayload::parse(Box::leak(bytes.into_boxed_slice()))
+            .expect("payload image must parse")
+            .bootfs()
+    }
 
     #[test]
     fn lists_root_entries() {
@@ -552,20 +637,20 @@ mod tests {
     }
 
     #[test]
-    fn packs_directory_tree_with_macro() {
-        let root = MACRO_IMAGE.root_directory(DirectoryRights::READ);
+    fn packs_directory_tree_in_payload() {
+        let root = payload_image().root_directory(DirectoryRights::READ);
         let bin = root
             .open_directory("bin", DirectoryRights::READ)
-            .expect("macro-packed bin directory must exist");
+            .expect("payload bin directory must exist");
         let init = bin
             .open_file("init.txt", FileRights::READ)
-            .expect("macro-packed init.txt must exist");
+            .expect("payload init.txt must exist");
         let lib = root
             .open_directory("lib", DirectoryRights::READ)
-            .expect("macro-packed lib directory must exist");
+            .expect("payload lib directory must exist");
         let module = lib
             .open_file("module.txt", FileRights::READ)
-            .expect("macro-packed module.txt must exist");
+            .expect("payload module.txt must exist");
 
         assert_eq!(init.object().contents(), b"boot init\n");
         assert_eq!(module.object().contents(), b"boot module\n");
@@ -573,7 +658,7 @@ mod tests {
 
     #[test]
     fn exposes_read_only_filesystem_trait() {
-        let entry = block_on(MACRO_IMAGE.open("/lib/module.txt"))
+        let entry = block_on(payload_image().open("/lib/module.txt"))
             .expect("bootfs open should succeed")
             .expect("module.txt must exist");
         let mut file = match entry {
@@ -590,7 +675,7 @@ mod tests {
 
     #[test]
     fn lists_directories_via_filesystem_trait() {
-        let entry = block_on(MACRO_IMAGE.open("/"))
+        let entry = block_on(payload_image().open("/"))
             .expect("bootfs open should succeed")
             .expect("bootfs root must exist");
         let directory = match entry {

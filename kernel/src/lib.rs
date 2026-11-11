@@ -8,6 +8,7 @@ extern crate std;
 
 mod audio;
 mod bootfs;
+mod buffer;
 mod component;
 mod device;
 mod display;
@@ -20,9 +21,9 @@ mod instance;
 mod io;
 mod kernel_exception;
 mod log;
+mod machine;
 mod memory;
 mod network;
-mod pins;
 mod process;
 mod profiling;
 mod runtime;
@@ -32,6 +33,10 @@ mod test_support;
 mod vsock;
 #[cfg(feature = "wasmtime-runtime")]
 pub(crate) mod wasmtime_adapter;
+#[cfg(all(target_os = "none", feature = "wasmtime-bare-metal"))]
+pub use wasmtime_adapter::parking::{
+    park_wasmtime_waiter, unpark_wasmtime_waiters, wasmtime_monotonic_nanos,
+};
 #[cfg(feature = "wasmtime-runtime")]
 pub use wasmtime_adapter::swap_fault::resolve_swap_fault_blocking;
 pub use wasmtime_adapter::tls::WasmtimeTlsSlots;
@@ -53,8 +58,12 @@ pub use audio::{
     PERIODS_IN_FLIGHT, PeriodRing, PeriodWriter, PlaybackFormat, install_audio_device,
 };
 pub use bootfs::{
-    BootDirectory, BootDirectoryEntry, BootDirectoryHandleExt, BootFile, EmbeddedBootDirectory,
-    EmbeddedBootFile, EmbeddedBootFs,
+    BootDirectory, BootDirectoryEntry, BootDirectoryHandleExt, BootFile, BootfsBytes,
+    EmbeddedBootDirectory, EmbeddedBootFile, EmbeddedBootFs,
+};
+pub use buffer::{
+    BYTES_PER_PIXEL, Buffer, BufferError, GuestMemory, MAX_VIEWS, Span, ViewError, ViewGroup,
+    ViewId, ViewTable, WASM_PAGE_BYTES,
 };
 pub(crate) use component::ComponentCache;
 pub use component::{
@@ -76,42 +85,36 @@ pub use component::{
     wait_until_runtime_deadline,
 };
 pub use device::{
-    AUDIO_WINDOW_BYTES, DEFAULT_DMA_BUDGET_BYTES, DEVICE_WINDOW_BYTES, DISPLAY_WINDOW_BYTES,
-    DeviceGrant, DeviceGrantRegistry, DeviceInterruptHooks, DeviceInterruptRoute, DeviceName,
-    DeviceOwnership, DeviceVmHooks, DeviceWindow, DmaBudget, DmaBuffer, DmaBufferHandle,
-    GPU_WINDOW_BYTES, GrantError, GrantHandle, GrantInterrupt, GrantLease, GrantStats,
-    GrantedDeviceSnapshot, InterruptEvent, InterruptRelay, InterruptStats, LinearMemory,
-    MAX_DEVICE_NAME, MAX_DMA_BUFFERS, MAX_GRANT_INTERRUPTS, MAX_GRANT_REGIONS, MAX_GRANTS,
-    MappedRegion, PublishedDevice, SURFACE_WINDOW_BYTES, install_device_interrupt_hooks,
-    install_device_vm_hooks,
+    DEFAULT_DMA_BUDGET_BYTES, DeviceGrant, DeviceGrantRegistry, DeviceInterruptHooks,
+    DeviceInterruptRoute, DeviceName, DeviceOwnership, DeviceVmHooks, DmaBudget, DmaBuffer,
+    DmaBufferHandle, GrantError, GrantHandle, GrantInterrupt, GrantLease, GrantStats,
+    GrantedDeviceSnapshot, InterruptEvent, InterruptRelay, InterruptStats, MAX_DEVICE_NAME,
+    MAX_DMA_BUFFERS, MAX_GRANT_INTERRUPTS, MAX_GRANT_REGIONS, MAX_GRANTS, PublishedDevice,
+    install_device_interrupt_hooks, install_device_vm_hooks,
 };
 pub use display::{
-    DisplayClaim, DisplayOwnership, DisplayPins, DisplaySender, DisplayService,
-    DisplayServiceError, FrameToken, MAX_CLAIMED_SCANOUTS, MAX_PINNED_FRAMES, PinnedFrame,
-    REQUEST_QUEUE_DEPTH, SequenceSignal, install_display_device,
+    DisplayClaim, DisplayOwnership, DisplaySender, DisplayService, DisplayServiceError, FrameToken,
+    MAX_CLAIMED_SCANOUTS, MAX_PINNED_FRAMES, REQUEST_QUEUE_DEPTH, SequenceSignal,
+    install_display_device,
 };
-pub use embedded::{
-    EmbeddedComponent, EmbeddedInit, embedded_boot_component, embedded_init,
-    embedded_system_component, has_embedded_system_component,
-};
+pub use embedded::{BootPayload, EmbeddedComponent, EmbeddedInit};
 pub use exec::{
     CompactionBudget, CompactionPolicy, CompactionReport, CompactionTarget, Compactor,
     DEFAULT_PERF_METRIC_CAPACITY, DEFAULT_PROFILE_STACK_CAPACITY, DEFAULT_TRACE_HISTORY_CAPACITY,
-    Executor, ExecutorRunStats, FoldedProfileSample, InstanceSpawner, JoinHandle, KernelClock,
-    LocalJoinHandle, Mutex, MutexGuard, Notified, Notify, NotifyWaiter, OwnedRawMutexLease,
-    OwnedRawRwLockReadLease, OwnedRawRwLockWriteLease, PerfMetricFilter, PerfMetricHistory,
-    PerfMetricSample, PerfSample, PressureLevel, ProfileFilter, ProfileHistory, ProfileScope,
-    ProfileSink, ProgressChanged, ProgressMark, ProgressSignal, RawMutex, RawMutexLease, RawRwLock,
-    RawRwLockReadLease, RawRwLockWriteLease, RwLock, RwLockReadGuard, RwLockWriteGuard, Sleep,
-    Spawner, StatsSample, TaskCapacityError, TaskFunding, Timer, TraceEvent, TraceField,
-    TraceFilter, TraceHistory, TraceLevel, TraceValue, UptimeClock, YieldNow, duration_to_ticks,
-    elapsed_millis, matches_perf_metric_filter, matches_profile_filter, matches_trace_filter,
-    monotonic_nanos, nanos_to_ticks_ceil_saturating, parse_console_text, wall_clock_offset_nanos,
-    yield_now,
+    Executor, ExecutorRunStats, FoldedProfileSample, GUEST_TIME_SLICE, IdleOutcome,
+    InstanceSpawner, JoinHandle, KernelClock, LocalJoinHandle, Mutex, MutexGuard, Notified, Notify,
+    NotifyWaiter, OwnedRawMutexLease, OwnedRawRwLockReadLease, OwnedRawRwLockWriteLease,
+    PerfMetricFilter, PerfMetricHistory, PerfMetricSample, PerfSample, PressureLevel,
+    ProfileFilter, ProfileHistory, ProfileScope, ProfileSink, ProgressChanged, ProgressMark,
+    ProgressSignal, RawMutex, RawMutexLease, RawRwLock, RawRwLockReadLease, RawRwLockWriteLease,
+    RwLock, RwLockReadGuard, RwLockWriteGuard, Sleep, Spawner, StatsSample, TaskCapacityError,
+    TaskFunding, Timer, TraceEvent, TraceField, TraceFilter, TraceHistory, TraceLevel, TraceValue,
+    UptimeClock, YieldNow, elapsed_millis, matches_perf_metric_filter, matches_profile_filter,
+    matches_trace_filter, monotonic_nanos, parse_console_text, wall_clock_offset_nanos, yield_now,
 };
 pub use gpu::{
     ContextRecord, Gpu3dClaim, Gpu3dOwnership, Gpu3dSender, Gpu3dService, Gpu3dServiceError,
-    GpuPins, MAX_GPU_BLOBS, MAX_GPU_CONTEXTS, MAX_GPU_PINS, install_gpu3d_device,
+    MAX_GPU_BLOBS, MAX_GPU_CONTEXTS, MAX_GPU_VIEWS, install_gpu3d_device,
 };
 pub use helios_hal::Platform;
 pub use helios_netstack::{
@@ -129,37 +132,39 @@ pub use input::{
     MAX_REPORT_EVENTS, install_input_devices,
 };
 pub use instance::{
-    ActivityChange, ActivityStep, CondemnedMemory, InstanceActivity, InstanceExecutionTransition,
-    InstanceId, InstanceProfileTotal, InstanceRegistry, InstanceSnapshot, KernelHeapCharge,
-    KillOutcome, KillReason, MemoryPool, OOM_RECLAIM_GRACE, OomKillDecision, OomKillOutcome,
-    OomPolicy, OomVictim, RegisteredInstance, allow_instance_resource_growth,
+    CondemnedMemory, InstanceActivity, InstanceId, InstanceProfileTotal, InstanceRegistry,
+    InstanceSnapshot, KernelHeapCharge, KillOutcome, KillReason, MemoryPool, OOM_RECLAIM_GRACE,
+    OomKillDecision, OomKillOutcome, OomPolicy, OomVictim, ProcessorTurn, RegisteredInstance,
+    StoreTurns, allow_instance_resource_growth,
 };
 pub use io::{
     BlockInstallError, BlockSelfCheckError, BlockService, BlockStats, ByteReadWait, ByteReader,
-    ByteWriteWait, ByteWriter, ClosedPeer, DebugConsole, DebugSerialAccess, DebugSerialWriter,
-    ExternalInterruptHandler, ExternalInterruptRoutes, IommuDomains, IommuEndpointStats,
-    IommuReport, IommuStats, MAX_BLOCK_DEVICES, MAX_DEVICE_INTERRUPTS, MAX_INPUT_DEVICES,
-    MAX_IOMMU_ENDPOINTS, MAX_NETWORK_INTERRUPTS, PanicSerial, PollKey, PollRegistration,
-    PollRegistry, PollRegistryError, PollSourceKind, RecordingConsole, SCRATCH_DISK_SERIAL,
-    SerialReader, TryRead, TryWrite, byte_channel, emit_panic_report, install_block_devices,
-    read_debug_serial, read_serial, try_read_serial, wake_queue_owners,
+    ByteWriteWait, ByteWriter, ClosedPeer, DebugConsole, DebugSerialAccess, DebugSerialInterrupt,
+    DebugSerialWriter, ExternalInterruptHandler, ExternalInterruptRoutes, IommuDomains,
+    IommuEndpointStats, IommuReport, IommuStats, MAX_BLOCK_DEVICES, MAX_DEVICE_INTERRUPTS,
+    MAX_INPUT_DEVICES, MAX_IOMMU_ENDPOINTS, MAX_NETWORK_INTERRUPTS, PanicSerial, PollKey,
+    PollRegistration, PollRegistry, PollRegistryError, PollSourceKind, RecordingConsole,
+    SCRATCH_DISK_SERIAL, SerialReader, TryRead, TryWrite, byte_channel, emit_panic_report,
+    install_block_devices, read_debug_serial, read_serial, try_read_serial, wake_queue_owners,
 };
 pub use kernel_exception::{
     KernelException, KernelExceptionCause, KernelExceptionDispatch, KernelNativeTrapHandler,
     dispatch_native_trap, install_native_trap_handler,
 };
+pub use machine::{AdvanceCause, Generation, MachineGeneration, MachineGenerationHandle};
 pub use memory::{
     AccessibilityPlan, BalloonHandle, BalloonStats, BootMemoryPlan, BootRegionSplitter,
-    CommittedRegion, ENTROPY_RESEED_INTERVAL, EntropyPool, EntropySources, FIBER_STACK_GUARD_BYTES,
-    FREE_PAGE_REPORT_INTERVAL, FiberStack, FiberStackArenaStats, FiberStackError,
-    FiberStackVmHooks, HardwareEntropySource, IDLE_SWAP_AFTER, KERNEL_HEAP_BOOTSTRAP_BYTES,
-    KERNEL_HEAP_GROWTH_CHUNK_BYTES, KERNEL_HEAP_MAX_BOOT_FRACTION, KERNEL_HEAP_MIN_RESERVE_BYTES,
-    KERNEL_HEAP_RESERVE_FRACTION, KernelPhysFrameAllocator, MemoryOwner, NoCryptographicEntropy,
-    NoEntropyDevice, ROOT_ENTROPY_MATERIAL_BYTES, RegionShares, ReleasedReservation,
-    ReservationLookup, ReservationTracker, RootEntropy, RootEntropyHandle, SWAP_BATCH_BYTES,
-    SWAP_TICK, StackFault, SwapDisabled, SwapEntry, SwapFaultError, SwapHandle, SwapStats,
-    SwapVmHooks, TASK_ARENA_FRACTION, TASK_ARENA_MIN_BYTES, USER_POOL_MIN_REGION_BYTES,
-    UserHeapStats, UserMemoryOwnerScope, UserMemoryOwners, UserMemoryPool, VaCursor,
+    CommittedRegion, CommittedRemoval, Decommitted, ENTROPY_RESEED_INTERVAL, EntropyPool,
+    EntropySources, FIBER_STACK_GUARD_BYTES, FREE_PAGE_REPORT_INTERVAL, FiberStack,
+    FiberStackArenaStats, FiberStackError, FiberStackVmHooks, HardwareEntropySource,
+    IDLE_SWAP_AFTER, KERNEL_HEAP_BOOTSTRAP_BYTES, KERNEL_HEAP_GROWTH_CHUNK_BYTES,
+    KERNEL_HEAP_MAX_BOOT_FRACTION, KERNEL_HEAP_MIN_RESERVE_BYTES, KERNEL_HEAP_RESERVE_FRACTION,
+    KernelPhysFrameAllocator, MemoryOwner, NoCryptographicEntropy, NoEntropyDevice,
+    ROOT_ENTROPY_MATERIAL_BYTES, RegionShares, ReleasedReservation, ReservationLookup,
+    ReservationTracker, RootEntropy, RootEntropyHandle, SWAP_BATCH_BYTES, SWAP_TICK, StackFault,
+    SwapDisabled, SwapEntry, SwapFaultError, SwapHandle, SwapStats, SwapVmHooks,
+    TASK_ARENA_FRACTION, TASK_ARENA_MIN_BYTES, USER_POOL_MIN_REGION_BYTES, UserHeapStats,
+    UserMemoryOwnerScope, UserMemoryOwners, UserMemoryPool, VaCursor,
     allocate_user_frame_uninit_on, allocate_user_frame_zeroed, allocate_user_frame_zeroed_on,
     allocate_user_run_zeroed_on, claim_fiber_stack, configure_user_memory_owner_processors,
     current_user_memory_owner, deallocate_user_frame, deallocate_user_frame_on,
@@ -167,7 +172,7 @@ pub use memory::{
     fiber_stack_demand_commits_on, install_entropy_device, install_fiber_stack_arena,
     install_fiber_stack_hooks, install_memory_balloon, install_swap, install_swap_hooks,
     installed_swap_handle, installed_swap_hooks, kernel_reserve_for, largest_servable_user_bytes,
-    page_fault_frame_reserve_bytes, resolve_stack_fault, seed_root_entropy, set_user_memory_owner,
+    page_fault_frame_reserve_bytes, ranges_outside, resolve_stack_fault, seed_root_entropy,
     swapped_token, task_arena_bytes_for, user_heap_stats, user_mapping_kernel_heap_bytes,
     validate_range,
 };
@@ -182,29 +187,34 @@ pub use network::{
     SocketStack, TcpListenerId, TcpStreamId, UdpSocketId, validate_http_authority,
     validate_http_path_with_query, validate_http_status_code,
 };
-pub use pins::{BYTES_PER_PIXEL, PinError, PinnedArena, PinnedRun};
 pub use process::{
-    ClockAuthorityRights, DescriptorEntry, DescriptorId, DescriptorTable, DescriptorTableError,
-    DirectoryAuthorityRights, DirectoryCap, DirectoryPreopen, DnsCap, ExecAuthority, ForkAuthority,
-    FutexKey, FutexTable, FutexWaitRegistration, GuestAddress, JoinAuthority, LinkAuthorityRights,
-    LinkSourceCap, LinkTargetDirectoryCap, MulticastCap, NetworkAdminCap, NetworkAuthorityRights,
-    NetworkCap, PrivilegedBindCap, ProcessAuthority, ProcessAuthorityError, ProcessAuthorityRights,
-    ProcessId, ProcessMemoryIdentity, ProcessRecord, ProcessState, ProcessTable, ProcessTableError,
-    ProgramExecError, ProgramExecErrorDetail, ProgramExecErrorKind, ProgramOutOfMemory,
-    RuntimeMessage, SetWallClockCap, SignalAuthority, SpawnAuthority, SymlinkCreateCap,
-    SymlinkReadCap, TcpCap, TerminalAuthorityRights, TerminalInputCap, TerminalOutputCap, ThreadId,
-    ThreadRecord, ThreadState, ThreadTable, ThreadTableError, TtyControlCap, UdpCap,
+    AudioClaimCap, ClockAuthorityRights, DescriptorEntry, DescriptorId, DescriptorTable,
+    DescriptorTableError, DeviceClassRights, DeviceGrantClaimCap, DirectoryAuthorityRights,
+    DirectoryCap, DirectoryPreopen, DisplayClaimCap, DnsCap, ExecAuthority, ForkAuthority,
+    FutexKey, FutexTable, FutexWaitRegistration, GpuClaimCap, GuestAddress, InputClaimCap,
+    JoinAuthority, LinkAuthorityRights, LinkSourceCap, LinkTargetDirectoryCap, MulticastCap,
+    NetworkAdminCap, NetworkAuthorityRights, NetworkCap, PrivilegedBindCap, ProcessAuthority,
+    ProcessAuthorityError, ProcessAuthorityRights, ProcessId, ProcessMemoryIdentity, ProcessRecord,
+    ProcessState, ProcessTable, ProcessTableError, ProgramExecError, ProgramExecErrorDetail,
+    ProgramExecErrorKind, ProgramOutOfMemory, RuntimeMessage, SetWallClockCap, SignalAuthority,
+    SpawnAuthority, SymlinkCreateCap, SymlinkReadCap, TcpCap, TerminalAuthorityRights,
+    TerminalInputCap, TerminalOutputCap, ThreadId, ThreadRecord, ThreadState, ThreadTable,
+    ThreadTableError, TtyControlCap, UdpCap,
 };
 pub use profiling::{
+    CodeAttribution, InstructionProfile, InstructionProfileError, InstructionSampler,
     KernelLlvmProfile, LlvmProfile, LlvmProfileError, MAX_PROFILE_READ, ProfileSection,
+    SAMPLE_DRAIN_INTERVAL_MILLIS, SAMPLE_RING_CAPACITY, SampleCapture, SampledCode,
+    WasmFunctionSample,
 };
 pub use runtime::{
     AuthorityDomain, ComponentHostFilesystemState, ComponentHostNetwork, ComponentNetworkService,
     ComponentNetworkState, DnsError, DnsErrorKind, ExecOutput, ExecResult, HostDirEntry,
-    HostFileSystem, HostFsError, HostFsErrorKind, HostMetadata, Ipv4Address, NetworkErrorDetail,
-    NetworkHandle, NetworkIpAddress, ObjectIdentity, PingError, PingErrorKind, PingReply,
-    RegisteredTcpReadBuffer, RuntimeState, SocketReadiness, TcpAccepted, TcpError, TcpErrorKind,
-    TcpListener, UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
+    HostDirLimit, HostFileSystem, HostFsError, HostFsErrorKind, HostMetadata, Ipv4Address,
+    NetworkErrorDetail, NetworkHandle, NetworkIpAddress, NetworkPacketPump, ObjectIdentity,
+    PingError, PingErrorKind, PingReply, RegisteredTcpReadBuffer, RuntimeState, SocketReadiness,
+    TcpAccepted, TcpError, TcpErrorKind, TcpListener, TcpReadProgress, TcpWriteProgress,
+    UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
 };
 pub use surface::{
     MAX_INSTANCE_SURFACES, MAX_LIVE_SURFACES, ReturnedSurfaces, SURFACE_EVENT_QUEUE_DEPTH,
@@ -899,7 +909,7 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone> Kernel<CpuImpl, Watch
 
         loop {
             let fired = self.timer.fire_expired();
-            let executor_stats = self.executor.run_until_stalled_with_stats();
+            let executor_stats = self.executor.run_until_stalled_with_stats(&self.timer);
             let ran = executor_stats.runnable_count();
 
             stats.timer_fired_count += fired;
@@ -919,10 +929,18 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone> Kernel<CpuImpl, Watch
         }
     }
 
+    /// Parks this processor until a task or a timer deadline is ready,
+    /// spending the adaptive idle-poll window on the ready queues
+    /// first. The outcome says whether the wake arrived during the
+    /// poll or after the park, for the host-side profile.
+    pub fn park_until_work(&self) -> IdleOutcome {
+        self.executor.park_until_work(&self.timer, || false)
+    }
+
     pub fn run(&self) -> ! {
         loop {
             if self.run_until_stalled() == 0 {
-                self.cpu.park_current();
+                self.park_until_work();
             }
         }
     }
@@ -943,7 +961,14 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone> Kernel<CpuImpl, Watch
                 Poll::Ready(output) => return output,
                 Poll::Pending => {
                     if self.run_until_stalled() == 0 {
-                        parker.park();
+                        // The same idle policy as every other processor:
+                        // this loop is the bootstrap processor's run loop
+                        // for as long as the root future runs, and a
+                        // processor that halts without publishing
+                        // `Parked` is one whose cross-processor wakes
+                        // arrive on the next scheduler tick.
+                        self.executor
+                            .park_until_work(&self.timer, || parker.is_notified());
                     }
                 }
             }
@@ -968,7 +993,7 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone> Kernel<CpuImpl, Watch
             "watchdog check interval computed as zero for timeout {timeout:?}"
         );
 
-        let min_pet_ticks = duration_to_ticks(interval, self.cpu.timer_frequency());
+        let min_pet_ticks = self.cpu.timebase().duration_to_ticks(interval);
         assert!(
             min_pet_ticks != 0,
             "watchdog pet interval {interval:?} converted to zero timer ticks"
@@ -1053,17 +1078,19 @@ impl<CpuImpl: Cpu + Clone> LocalFutureParker<CpuImpl> {
         self.notified.store(false, Ordering::Release);
     }
 
-    fn park(&self) {
-        if self.notified.swap(false, Ordering::AcqRel) {
-            return;
-        }
-        self.cpu.park_current();
+    /// Whether the root future was woken since the last `clear`.
+    /// `SeqCst`: the parker half of the idle handshake, read after the
+    /// executor has published `Parked`.
+    fn is_notified(&self) -> bool {
+        self.notified.load(Ordering::SeqCst)
     }
 }
 
 impl<CpuImpl: Cpu + Clone> Wake for LocalFutureParker<CpuImpl> {
     fn wake(self: Arc<Self>) {
-        self.notified.store(true, Ordering::Release);
+        // `SeqCst`: the publisher half of the idle handshake; the owner
+        // publishes `Parked` and then reads this flag.
+        self.notified.store(true, Ordering::SeqCst);
         if current_processor() != self.owner_processor {
             self.cpu.wake_processor(self.owner_processor);
         }
@@ -1121,10 +1148,10 @@ where
         cpu.processor_count()
     );
     assert!(
-        cpu.timer_frequency() == timer_frequency_hz,
+        cpu.timebase().frequency() == timer_frequency_hz,
         "platform timer frequency {} does not match CPU timer frequency {}",
         timer_frequency_hz,
-        cpu.timer_frequency()
+        cpu.timebase().frequency()
     );
 
     if current_processor == topology.bootstrap_processor {
@@ -1144,10 +1171,11 @@ where
     } else {
         ProgressCounter::new()
     };
+    let executor = Executor::new(progress, topology.configured_processors, current_processor);
     let kernel = Kernel {
-        timer: Timer::new(cpu.clone()),
+        timer: executor.timer(cpu.clone()),
         cpu,
-        executor: Executor::new(progress, topology.configured_processors, current_processor),
+        executor,
         watchdog,
         topology,
         dma_model,

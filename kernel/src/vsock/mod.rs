@@ -24,6 +24,7 @@ use alloc::vec::Vec;
 use core::future::{Future, poll_fn};
 use core::pin::pin;
 use core::task::Poll;
+use core::time::Duration;
 
 use helios_hal::cpu::{Cpu, Instant};
 use helios_hal::vsock::{
@@ -377,12 +378,12 @@ where
     /// for `u64::MAX` nanoseconds means "no deadline", and a truncated
     /// tick count would turn that into an immediate timeout.
     fn deadline(&self, timeout_nanos: u64) -> Instant {
-        let frequency = self.inner.cpu.timer_frequency();
-        let ticks = u128::from(timeout_nanos) * u128::from(frequency) / 1_000_000_000;
-        self.inner
+        let ticks = self
+            .inner
             .cpu
-            .now()
-            .saturating_add(u64::try_from(ticks).unwrap_or(u64::MAX))
+            .timebase()
+            .duration_to_ticks(Duration::from_nanos(timeout_nanos));
+        self.inner.cpu.now().saturating_add(ticks)
     }
 
     fn expired(&self, deadline: Instant) -> bool {

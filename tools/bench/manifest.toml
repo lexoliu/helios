@@ -32,6 +32,12 @@ name = "x86-64-kvm"
 helios_arch = "x86-64"
 guest_arch = "x86_64"
 accelerator = "kvm"
+# The transport the inspector RPC rides. Every Helios row is timed around
+# that RPC, and the serial default is QEMU's 16550 — one I/O-port exit
+# per byte each way and 10–20 ms inside every elapsed (#413). vhost-vsock
+# is the virtio debug transport AGENTS.md names, and the host provisions
+# /dev/vhost-vsock for it (.github/actions/vhost-vsock).
+rpc_transport = "vsock"
 # Dedicated runner: fixed CPU governor, nothing else scheduled
 # (docs/benchmarks.md, "Dedicated runners").
 runner_label = "helios-bench-x86-kvm"

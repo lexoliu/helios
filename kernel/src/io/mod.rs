@@ -23,7 +23,9 @@ pub use child::{
     byte_channel,
 };
 pub use console::RecordingConsole;
-pub use debug_serial::{DebugConsole, DebugSerialAccess, DebugSerialWriter, read_debug_serial};
+pub use debug_serial::{
+    DebugConsole, DebugSerialAccess, DebugSerialInterrupt, DebugSerialWriter, read_debug_serial,
+};
 pub use interrupts::{
     ExternalInterruptHandler, ExternalInterruptRoutes, MAX_BLOCK_DEVICES, MAX_DEVICE_INTERRUPTS,
     MAX_INPUT_DEVICES, MAX_NETWORK_INTERRUPTS, wake_queue_owners,

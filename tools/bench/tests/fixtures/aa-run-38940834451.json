@@ -1,0 +1,1131 @@
+{
+  "run": "38940834451",
+  "note": "Derived from run 38940834451 (A/A: dev 8dacde88 against an empty commit on top of it, each column built against its own kernel-profile collection, EPYC 7763). Each launch is [elapsed_ms, {metric: value}], iteration 1 first; only the workloads that took a significant verdict and the metrics behind those verdicts are kept. `first_pass` is fs-smallfiles' first pair of boots, from the raw per-workload JSONL; the report's cells are the reconfirm's second pair.",
+  "control": {
+    "helios": {
+      "before": [
+        31.411506,
+        24.183071,
+        24.017443999999998,
+        24.01274,
+        24.296908,
+        24.039172,
+        23.633971,
+        24.357779999999998,
+        24.428990000000002,
+        24.189349,
+        23.889674
+      ],
+      "after": [
+        49.206778,
+        23.978859,
+        24.603094,
+        24.412565,
+        24.138547,
+        24.170179,
+        23.713152,
+        23.799504,
+        24.449107,
+        24.468743,
+        24.543270999999997
+      ]
+    },
+    "helios_baseline": {
+      "before": [
+        31.523622,
+        24.248986,
+        24.238857,
+        23.783802,
+        23.703143999999998,
+        23.713926,
+        23.798416,
+        23.570925,
+        24.063779,
+        24.150782999999997,
+        24.138211
+      ],
+      "after": [
+        86.939112,
+        24.089215,
+        24.200111,
+        24.582425,
+        24.227345,
+        24.06625,
+        24.337001,
+        24.305649,
+        24.780677,
+        23.830821,
+        24.477831
+      ]
+    }
+  },
+  "workloads": [
+    {
+      "name": "instance-startup-100",
+      "class": "startup",
+      "headline": true,
+      "cells": {
+        "helios": [
+          [
+            312.47929000000005,
+            {
+              "batch_ms": 268.765,
+              "first_output_p50_us": 222146.833,
+              "first_output_samples": 100.0
+            }
+          ],
+          [
+            159.684961,
+            {
+              "batch_ms": 128.45,
+              "first_output_p50_us": 125985.121,
+              "first_output_samples": 100.0
+            }
+          ],
+          [
+            152.771068,
+            {
+              "batch_ms": 121.712,
+              "first_output_p50_us": 119402.081,
+              "first_output_samples": 100.0
+            }
+          ],
+          [
+            151.864955,
+            {
+              "batch_ms": 120.496,
+              "first_output_p50_us": 118731.581,
+              "first_output_samples": 100.0
+            }
+          ],
+          [
+            151.616973,
+            {
+              "batch_ms": 120.89,
+              "first_output_p50_us": 118991.464,
+              "first_output_samples": 100.0
+            }
+          ],
+          [
+            152.26999,
+            {
+              "batch_ms": 120.864,
+              "first_output_p50_us": 119015.881,
+              "first_output_samples": 100.0
+            }
+          ],
+          [
+            150.575789,
+            {
+              "batch_ms": 118.953,
+              "first_output_p50_us": 117110.926,
+              "first_output_samples": 100.0
+            }
+          ],
+          [
+            151.718682,
+            {
+              "batch_ms": 120.459,
+              "first_output_p50_us": 118582.719,
+              "first_output_samples": 100.0
+            }
+          ],
+          [
+            152.831817,
+            {
+              "batch_ms": 120.902,
+              "first_output_p50_us": 119025.501,
+              "first_output_samples": 100.0
+            }
+          ],
+          [
+            152.80907699999997,
+            {
+              "batch_ms": 121.845,
+              "first_output_p50_us": 119957.146,
+              "first_output_samples": 100.0
+            }
+          ],
+          [
+            150.209608,
+            {
+              "batch_ms": 119.166,
+              "first_output_p50_us": 117162.433,
+              "first_output_samples": 100.0
+            }
+          ]
+        ],
+        "helios_baseline": [
+          [
+            268.07289099999997,
+            {
+              "batch_ms": 217.849,
+              "first_output_p50_us": 151512.588,
+              "first_output_samples": 100.0
+            }
+          ],
+          [
+            157.257104,
+            {
+              "batch_ms": 125.81,
+              "first_output_p50_us": 123777.946,
+              "first_output_samples": 100.0
+            }
+          ],
+          [
+            154.324184,
+            {
+              "batch_ms": 123.043,
+              "first_output_p50_us": 121105.322,
+              "first_output_samples": 100.0
+            }
+          ],
+          [
+            153.874869,
+            {
+              "batch_ms": 122.271,
+              "first_output_p50_us": 120284.463,
+              "first_output_samples": 100.0
+            }
+          ],
+          [
+            154.264114,
+            {
+              "batch_ms": 122.923,
+              "first_output_p50_us": 120948.437,
+              "first_output_samples": 100.0
+            }
+          ],
+          [
+            152.988087,
+            {
+              "batch_ms": 122.34,
+              "first_output_p50_us": 120348.743,
+              "first_output_samples": 100.0
+            }
+          ],
+          [
+            153.954431,
+            {
+              "batch_ms": 122.665,
+              "first_output_p50_us": 120592.609,
+              "first_output_samples": 100.0
+            }
+          ],
+          [
+            153.888045,
+            {
+              "batch_ms": 123.04,
+              "first_output_p50_us": 121082.114,
+              "first_output_samples": 100.0
+            }
+          ],
+          [
+            212.288345,
+            {
+              "batch_ms": 156.78,
+              "first_output_p50_us": 154895.133,
+              "first_output_samples": 100.0
+            }
+          ],
+          [
+            159.369409,
+            {
+              "batch_ms": 124.95,
+              "first_output_p50_us": 122672.068,
+              "first_output_samples": 100.0
+            }
+          ],
+          [
+            154.906225,
+            {
+              "batch_ms": 123.646,
+              "first_output_p50_us": 121675.708,
+              "first_output_samples": 100.0
+            }
+          ]
+        ]
+      },
+      "first_pass": {}
+    },
+    {
+      "name": "instance-startup-500",
+      "class": "startup",
+      "headline": false,
+      "cells": {
+        "helios": [
+          [
+            1122.623306,
+            {
+              "batch_ms": 966.579,
+              "teardown_ms": 136.287
+            }
+          ],
+          [
+            760.313283,
+            {
+              "batch_ms": 610.634,
+              "teardown_ms": 129.566
+            }
+          ],
+          [
+            741.000567,
+            {
+              "batch_ms": 593.127,
+              "teardown_ms": 128.688
+            }
+          ],
+          [
+            751.3558780000001,
+            {
+              "batch_ms": 603.92,
+              "teardown_ms": 128.327
+            }
+          ],
+          [
+            751.799507,
+            {
+              "batch_ms": 603.561,
+              "teardown_ms": 130.358
+            }
+          ],
+          [
+            743.824673,
+            {
+              "batch_ms": 595.49,
+              "teardown_ms": 129.721
+            }
+          ],
+          [
+            748.8555719999999,
+            {
+              "batch_ms": 600.044,
+              "teardown_ms": 130.216
+            }
+          ],
+          [
+            743.990622,
+            {
+              "batch_ms": 595.811,
+              "teardown_ms": 128.746
+            }
+          ],
+          [
+            747.443354,
+            {
+              "batch_ms": 598.367,
+              "teardown_ms": 130.275
+            }
+          ],
+          [
+            746.809979,
+            {
+              "batch_ms": 599.654,
+              "teardown_ms": 128.23
+            }
+          ],
+          [
+            742.191158,
+            {
+              "batch_ms": 595.54,
+              "teardown_ms": 127.651
+            }
+          ]
+        ],
+        "helios_baseline": [
+          [
+            1877.608787,
+            {
+              "batch_ms": 1664.286,
+              "teardown_ms": 187.346
+            }
+          ],
+          [
+            813.8701120000001,
+            {
+              "batch_ms": 661.648,
+              "teardown_ms": 132.146
+            }
+          ],
+          [
+            777.016307,
+            {
+              "batch_ms": 624.099,
+              "teardown_ms": 131.714
+            }
+          ],
+          [
+            767.374125,
+            {
+              "batch_ms": 611.31,
+              "teardown_ms": 135.421
+            }
+          ],
+          [
+            772.744037,
+            {
+              "batch_ms": 615.437,
+              "teardown_ms": 136.959
+            }
+          ],
+          [
+            766.43384,
+            {
+              "batch_ms": 611.607,
+              "teardown_ms": 133.247
+            }
+          ],
+          [
+            776.2737109999999,
+            {
+              "batch_ms": 622.898,
+              "teardown_ms": 133.334
+            }
+          ],
+          [
+            766.846743,
+            {
+              "batch_ms": 612.49,
+              "teardown_ms": 134.077
+            }
+          ],
+          [
+            762.9402739999999,
+            {
+              "batch_ms": 608.497,
+              "teardown_ms": 134.119
+            }
+          ],
+          [
+            766.604509,
+            {
+              "batch_ms": 613.325,
+              "teardown_ms": 133.665
+            }
+          ],
+          [
+            763.240773,
+            {
+              "batch_ms": 610.574,
+              "teardown_ms": 133.728
+            }
+          ]
+        ]
+      },
+      "first_pass": {}
+    },
+    {
+      "name": "hostcall-loop",
+      "class": "hostcall",
+      "headline": true,
+      "cells": {
+        "helios": [
+          [
+            233.602057,
+            {
+              "ns_per_call": 107.94
+            }
+          ],
+          [
+            222.796502,
+            {
+              "ns_per_call": 110.14
+            }
+          ],
+          [
+            219.61834399999998,
+            {
+              "ns_per_call": 108.65
+            }
+          ],
+          [
+            212.215566,
+            {
+              "ns_per_call": 104.84
+            }
+          ],
+          [
+            220.50459,
+            {
+              "ns_per_call": 108.91
+            }
+          ],
+          [
+            212.62351299999997,
+            {
+              "ns_per_call": 105.06
+            }
+          ],
+          [
+            222.352004,
+            {
+              "ns_per_call": 110.02
+            }
+          ],
+          [
+            217.63526,
+            {
+              "ns_per_call": 107.58
+            }
+          ],
+          [
+            219.801353,
+            {
+              "ns_per_call": 108.64
+            }
+          ],
+          [
+            219.937455,
+            {
+              "ns_per_call": 108.73
+            }
+          ],
+          [
+            219.023052,
+            {
+              "ns_per_call": 108.19
+            }
+          ]
+        ],
+        "helios_baseline": [
+          [
+            224.17748600000002,
+            {
+              "ns_per_call": 105.87
+            }
+          ],
+          [
+            215.205494,
+            {
+              "ns_per_call": 106.2
+            }
+          ],
+          [
+            222.507219,
+            {
+              "ns_per_call": 109.89
+            }
+          ],
+          [
+            211.57181699999998,
+            {
+              "ns_per_call": 104.19
+            }
+          ],
+          [
+            214.63368699999998,
+            {
+              "ns_per_call": 106.03
+            }
+          ],
+          [
+            210.42459699999998,
+            {
+              "ns_per_call": 103.98
+            }
+          ],
+          [
+            214.149686,
+            {
+              "ns_per_call": 105.8
+            }
+          ],
+          [
+            211.777037,
+            {
+              "ns_per_call": 104.71
+            }
+          ],
+          [
+            219.163793,
+            {
+              "ns_per_call": 107.86
+            }
+          ],
+          [
+            231.841972,
+            {
+              "ns_per_call": 114.42
+            }
+          ],
+          [
+            214.54199500000001,
+            {
+              "ns_per_call": 105.77
+            }
+          ]
+        ]
+      },
+      "first_pass": {}
+    },
+    {
+      "name": "pipe-pingpong",
+      "class": "ipc",
+      "headline": true,
+      "cells": {
+        "helios": [
+          [
+            183.124639,
+            {
+              "rtt_p50_us": 6.468,
+              "rtt_samples": 20000.0
+            }
+          ],
+          [
+            155.897476,
+            {
+              "rtt_p50_us": 6.328,
+              "rtt_samples": 20000.0
+            }
+          ],
+          [
+            153.792865,
+            {
+              "rtt_p50_us": 6.338,
+              "rtt_samples": 20000.0
+            }
+          ],
+          [
+            155.887912,
+            {
+              "rtt_p50_us": 6.298,
+              "rtt_samples": 20000.0
+            }
+          ],
+          [
+            156.74263,
+            {
+              "rtt_p50_us": 6.337,
+              "rtt_samples": 20000.0
+            }
+          ],
+          [
+            169.309699,
+            {
+              "rtt_p50_us": 6.438,
+              "rtt_samples": 20000.0
+            }
+          ],
+          [
+            157.16992499999998,
+            {
+              "rtt_p50_us": 6.378,
+              "rtt_samples": 20000.0
+            }
+          ],
+          [
+            156.50663,
+            {
+              "rtt_p50_us": 6.348,
+              "rtt_samples": 20000.0
+            }
+          ],
+          [
+            156.882542,
+            {
+              "rtt_p50_us": 6.408,
+              "rtt_samples": 20000.0
+            }
+          ],
+          [
+            155.161113,
+            {
+              "rtt_p50_us": 6.318,
+              "rtt_samples": 20000.0
+            }
+          ],
+          [
+            156.37281,
+            {
+              "rtt_p50_us": 6.328,
+              "rtt_samples": 20000.0
+            }
+          ]
+        ],
+        "helios_baseline": [
+          [
+            168.714109,
+            {
+              "rtt_p50_us": 6.475,
+              "rtt_samples": 20000.0
+            }
+          ],
+          [
+            157.445967,
+            {
+              "rtt_p50_us": 6.435,
+              "rtt_samples": 20000.0
+            }
+          ],
+          [
+            159.185039,
+            {
+              "rtt_p50_us": 6.575,
+              "rtt_samples": 20000.0
+            }
+          ],
+          [
+            158.1686,
+            {
+              "rtt_p50_us": 6.466,
+              "rtt_samples": 20000.0
+            }
+          ],
+          [
+            159.619448,
+            {
+              "rtt_p50_us": 6.456,
+              "rtt_samples": 20000.0
+            }
+          ],
+          [
+            158.520597,
+            {
+              "rtt_p50_us": 6.465,
+              "rtt_samples": 20000.0
+            }
+          ],
+          [
+            157.56655899999998,
+            {
+              "rtt_p50_us": 6.426,
+              "rtt_samples": 20000.0
+            }
+          ],
+          [
+            160.03952199999998,
+            {
+              "rtt_p50_us": 6.555,
+              "rtt_samples": 20000.0
+            }
+          ],
+          [
+            160.21129000000002,
+            {
+              "rtt_p50_us": 6.555,
+              "rtt_samples": 20000.0
+            }
+          ],
+          [
+            155.56410000000002,
+            {
+              "rtt_p50_us": 6.406,
+              "rtt_samples": 20000.0
+            }
+          ],
+          [
+            157.03824899999998,
+            {
+              "rtt_p50_us": 6.395,
+              "rtt_samples": 20000.0
+            }
+          ]
+        ]
+      },
+      "first_pass": {}
+    },
+    {
+      "name": "sched-tasks",
+      "class": "sched",
+      "headline": true,
+      "cells": {
+        "helios": [
+          [
+            110.293989,
+            {
+              "switch_mean_us": 0.62,
+              "switch_p50_us": 0.591,
+              "switch_samples": 128000.0,
+              "switches_per_s": 1292217.0
+            }
+          ],
+          [
+            105.961,
+            {
+              "switch_mean_us": 0.639,
+              "switch_p50_us": 0.61,
+              "switch_samples": 128000.0,
+              "switches_per_s": 1258966.0
+            }
+          ],
+          [
+            106.29201,
+            {
+              "switch_mean_us": 0.643,
+              "switch_p50_us": 0.611,
+              "switch_samples": 128000.0,
+              "switches_per_s": 1258363.0
+            }
+          ],
+          [
+            106.560481,
+            {
+              "switch_mean_us": 0.641,
+              "switch_p50_us": 0.611,
+              "switch_samples": 128000.0,
+              "switches_per_s": 1258245.0
+            }
+          ],
+          [
+            106.045791,
+            {
+              "switch_mean_us": 0.641,
+              "switch_p50_us": 0.611,
+              "switch_samples": 128000.0,
+              "switches_per_s": 1258921.0
+            }
+          ],
+          [
+            106.67793999999999,
+            {
+              "switch_mean_us": 0.642,
+              "switch_p50_us": 0.611,
+              "switch_samples": 128000.0,
+              "switches_per_s": 1254875.0
+            }
+          ],
+          [
+            105.63054299999999,
+            {
+              "switch_mean_us": 0.639,
+              "switch_p50_us": 0.611,
+              "switch_samples": 128000.0,
+              "switches_per_s": 1262868.0
+            }
+          ],
+          [
+            104.41208400000001,
+            {
+              "switch_mean_us": 0.629,
+              "switch_p50_us": 0.601,
+              "switch_samples": 128000.0,
+              "switches_per_s": 1281142.0
+            }
+          ],
+          [
+            106.914171,
+            {
+              "switch_mean_us": 0.639,
+              "switch_p50_us": 0.611,
+              "switch_samples": 128000.0,
+              "switches_per_s": 1246931.0
+            }
+          ],
+          [
+            105.351455,
+            {
+              "switch_mean_us": 0.635,
+              "switch_p50_us": 0.611,
+              "switch_samples": 128000.0,
+              "switches_per_s": 1266550.0
+            }
+          ],
+          [
+            104.934426,
+            {
+              "switch_mean_us": 0.631,
+              "switch_p50_us": 0.601,
+              "switch_samples": 128000.0,
+              "switches_per_s": 1273695.0
+            }
+          ]
+        ],
+        "helios_baseline": [
+          [
+            111.408057,
+            {
+              "switch_mean_us": 0.622,
+              "switch_p50_us": 0.591,
+              "switch_samples": 128000.0,
+              "switches_per_s": 1263338.0
+            }
+          ],
+          [
+            109.62992100000001,
+            {
+              "switch_mean_us": 0.65,
+              "switch_p50_us": 0.621,
+              "switch_samples": 128000.0,
+              "switches_per_s": 1217167.0
+            }
+          ],
+          [
+            105.382803,
+            {
+              "switch_mean_us": 0.628,
+              "switch_p50_us": 0.601,
+              "switch_samples": 128000.0,
+              "switches_per_s": 1268490.0
+            }
+          ],
+          [
+            108.998655,
+            {
+              "switch_mean_us": 0.647,
+              "switch_p50_us": 0.621,
+              "switch_samples": 128000.0,
+              "switches_per_s": 1223725.0
+            }
+          ],
+          [
+            108.381744,
+            {
+              "switch_mean_us": 0.643,
+              "switch_p50_us": 0.621,
+              "switch_samples": 128000.0,
+              "switches_per_s": 1230330.0
+            }
+          ],
+          [
+            108.08954899999999,
+            {
+              "switch_mean_us": 0.639,
+              "switch_p50_us": 0.62,
+              "switch_samples": 128000.0,
+              "switches_per_s": 1241086.0
+            }
+          ],
+          [
+            108.165936,
+            {
+              "switch_mean_us": 0.643,
+              "switch_p50_us": 0.62,
+              "switch_samples": 128000.0,
+              "switches_per_s": 1230922.0
+            }
+          ],
+          [
+            108.784474,
+            {
+              "switch_mean_us": 0.643,
+              "switch_p50_us": 0.611,
+              "switch_samples": 128000.0,
+              "switches_per_s": 1225954.0
+            }
+          ],
+          [
+            108.094199,
+            {
+              "switch_mean_us": 0.64,
+              "switch_p50_us": 0.611,
+              "switch_samples": 128000.0,
+              "switches_per_s": 1236627.0
+            }
+          ],
+          [
+            108.746403,
+            {
+              "switch_mean_us": 0.645,
+              "switch_p50_us": 0.611,
+              "switch_samples": 128000.0,
+              "switches_per_s": 1232543.0
+            }
+          ],
+          [
+            108.91263,
+            {
+              "switch_mean_us": 0.646,
+              "switch_p50_us": 0.62,
+              "switch_samples": 128000.0,
+              "switches_per_s": 1229424.0
+            }
+          ]
+        ]
+      },
+      "first_pass": {}
+    },
+    {
+      "name": "fs-smallfiles",
+      "class": "fs",
+      "headline": true,
+      "cells": {
+        "helios": [
+          [
+            219.168663,
+            {}
+          ],
+          [
+            209.624652,
+            {}
+          ],
+          [
+            206.813018,
+            {}
+          ],
+          [
+            204.283914,
+            {}
+          ],
+          [
+            205.22925899999998,
+            {}
+          ],
+          [
+            206.910857,
+            {}
+          ],
+          [
+            207.720137,
+            {}
+          ],
+          [
+            206.263339,
+            {}
+          ],
+          [
+            213.568524,
+            {}
+          ],
+          [
+            214.339499,
+            {}
+          ],
+          [
+            200.458488,
+            {}
+          ]
+        ],
+        "helios_baseline": [
+          [
+            248.758964,
+            {}
+          ],
+          [
+            224.146794,
+            {}
+          ],
+          [
+            234.840086,
+            {}
+          ],
+          [
+            223.655788,
+            {}
+          ],
+          [
+            233.956162,
+            {}
+          ],
+          [
+            232.83019199999998,
+            {}
+          ],
+          [
+            230.414279,
+            {}
+          ],
+          [
+            233.167954,
+            {}
+          ],
+          [
+            224.022749,
+            {}
+          ],
+          [
+            239.117945,
+            {}
+          ],
+          [
+            233.98243599999998,
+            {}
+          ]
+        ]
+      },
+      "first_pass": {
+        "helios": [
+          [
+            225.691116,
+            {}
+          ],
+          [
+            196.735718,
+            {}
+          ],
+          [
+            203.171718,
+            {}
+          ],
+          [
+            210.29782799999998,
+            {}
+          ],
+          [
+            207.22471000000002,
+            {}
+          ],
+          [
+            198.687589,
+            {}
+          ],
+          [
+            203.114594,
+            {}
+          ],
+          [
+            196.423825,
+            {}
+          ],
+          [
+            197.87007200000002,
+            {}
+          ],
+          [
+            200.132288,
+            {}
+          ],
+          [
+            205.906748,
+            {}
+          ]
+        ],
+        "helios_baseline": [
+          [
+            211.963128,
+            {}
+          ],
+          [
+            192.939864,
+            {}
+          ],
+          [
+            188.185608,
+            {}
+          ],
+          [
+            198.757327,
+            {}
+          ],
+          [
+            187.84014299999998,
+            {}
+          ],
+          [
+            192.645927,
+            {}
+          ],
+          [
+            195.28742499999998,
+            {}
+          ],
+          [
+            196.981072,
+            {}
+          ],
+          [
+            192.413692,
+            {}
+          ],
+          [
+            190.722598,
+            {}
+          ],
+          [
+            195.691306,
+            {}
+          ]
+        ]
+      }
+    }
+  ]
+}

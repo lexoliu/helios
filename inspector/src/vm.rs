@@ -38,10 +38,14 @@ use crate::{
 };
 
 mod input;
+mod instruction_profile;
+mod kernel_image;
 mod network;
 mod qemu;
 mod qmp;
 mod raw_profile;
+mod vcpu_state;
+mod x86_image_audit;
 
 use input::{InputScript, InputScriptError, InputStatement};
 use network::{
@@ -51,6 +55,7 @@ use network::{
 use qemu::QemuOptions;
 use qmp::{QmpClient, QmpError, SizeError};
 use raw_profile::{ProfileCommand, RawProfileCollectError};
+pub(crate) use vcpu_state::VcpuStateCapture;
 
 /// Why a `vm` session did not run.
 ///
@@ -160,6 +165,8 @@ pub(crate) enum VmConfigError {
     Network(#[from] VmNetworkError),
     #[error("{0}")]
     AudioDev(#[from] AudioDevError),
+    #[error("--shared-dir-writable requires --shared-dir (or `shared_dir` in the config file)")]
+    WritableShareWithoutDir,
     #[error("shared directory does not exist: {path}")]
     SharedDirMissing { path: String },
     #[error("aarch64-virt-hvf requires an aarch64 host; pass --accel tcg explicitly for TCG")]
@@ -178,6 +185,8 @@ pub(crate) enum VmBuildError {
     Tool(#[from] ToolDiscoveryError),
     #[error("{0}")]
     WorkspaceRoot(#[from] WorkspaceRootError),
+    #[error("{0}")]
+    X86ImageAudit(#[from] x86_image_audit::X86ImageAuditError),
 }
 
 /// One build or provisioning step run as a child process.
@@ -402,6 +411,11 @@ pub(crate) enum VmSessionError {
     },
     #[error("the {action} command needs a QMP socket; pass --qmp unix:<path>,server=on,wait=off")]
     NeedsQmp { action: &'static str },
+    #[error("failed to enable the session's tracing targets: {source}")]
+    EnableTargets {
+        #[source]
+        source: SystemError,
+    },
     #[error("{0}")]
     Qmp(#[from] QmpError),
     #[error("{0}")]
@@ -486,6 +500,8 @@ pub(crate) enum VmSessionError {
     Interrupt(#[from] InterruptError),
     #[error("{0}")]
     Profiling(#[from] ProfilingStepError),
+    #[error("{0}")]
+    InstructionProfile(#[from] instruction_profile::InstructionProfileOutputError),
 }
 
 /// One profiling RPC around a bench run, named by the step it was for.
@@ -580,7 +596,11 @@ const DEFAULT_DATA_DISK_BYTES: u64 = 256 * 1024 * 1024;
 /// The serial the guest kernel identifies its own disk by. Nothing else
 /// on the bus carries it, so the boot image is never mistaken for it.
 const DATA_DISK_SERIAL: &str = "helios-data";
-const DEFAULT_GDB_ENDPOINT: &str = "tcp::1234";
+/// Where `vm --debug` puts the gdbstub. QEMU binds `tcp::1234` on every
+/// interface, and whoever reaches the stub owns the guest's registers and
+/// memory, so the default names the loopback address; a wider bind is
+/// something the developer types with `--gdb`.
+const DEFAULT_GDB_ENDPOINT: &str = "tcp:127.0.0.1:1234";
 /// The QEMU chardev the guest's debug serial line is bound to.
 const DEBUG_SERIAL_CHARDEV: &str = "helios-debug-serial";
 /// The runtime-directory file holding a raw copy of the debug serial
@@ -668,6 +688,15 @@ enum VmDataDiskProfile {
 enum VmHostShareProfile {
     Virtio9pMmio,
     Virtio9pPci,
+}
+
+/// What the guest may do to the directory `--shared-dir` exports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostShareAccess {
+    /// QEMU refuses every write the guest sends.
+    ReadOnly,
+    /// The guest can create, rewrite and delete files in the host directory.
+    ReadWrite,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -815,12 +844,14 @@ enum KernelBuildProfile {
     Debug,
     /// `kernel-debug`: debuginfo and unstripped symbols for GDB and LLDB.
     KernelDebug,
-    /// `release`.
+    /// `kernel-release`: the optimised image, `release` plus fat LTO and
+    /// one codegen unit (`Cargo.toml`). The host tools built beside it
+    /// stay on `release`; [`Self::host`] is that distinction.
     Release,
-    /// `profile-generate`: release plus `-C profile-generate`, the image a
-    /// PGO collection boots (docs/pgo.md).
+    /// `profile-generate`: `kernel-release` plus `-C profile-generate`,
+    /// the image a PGO collection boots (docs/pgo.md).
     ProfileGenerate,
-    /// `profile-use`: release plus `-C profile-use`, the image a
+    /// `profile-use`: `kernel-release` plus `-C profile-use`, the image a
     /// collected profile optimises (docs/pgo.md). The profile itself is
     /// named by [`KernelBuildSpec::profile_use`]: a build kind says what
     /// kind of build it is, and two PGO kernels from two profiles are the
@@ -834,7 +865,7 @@ impl KernelBuildProfile {
         match self {
             Self::Debug => "debug",
             Self::KernelDebug => "kernel-debug",
-            Self::Release => "release",
+            Self::Release => "kernel-release",
             Self::ProfileGenerate => "profile-generate",
             Self::ProfileUse => "profile-use",
         }
@@ -853,6 +884,15 @@ impl KernelBuildProfile {
         matches!(self, Self::ProfileGenerate)
     }
 
+    /// Whether [`x86_image_audit`] runs on this profile's x86 image: only the
+    /// images the inspector boots for measurement or shipping.
+    fn audited_for_legacy_encoding(self) -> bool {
+        match self {
+            Self::Release | Self::ProfileUse => true,
+            Self::Debug | Self::KernelDebug | Self::ProfileGenerate => false,
+        }
+    }
+
     /// The profile the guest programs of the bootfs are built with.
     ///
     /// `helios-cli kernel-prebuild` knows two: an optimised one and a
@@ -864,15 +904,50 @@ impl KernelBuildProfile {
     }
 
     /// The profile the host tools built alongside the guest use. They are
-    /// never instrumented — nothing profiles the inspector — and they are
-    /// found next to the running binary, so they stay in the two
-    /// directories a host build ever uses.
-    fn host(self) -> Self {
+    /// never instrumented — nothing profiles the inspector — and never
+    /// whole-program optimised — nothing times it — so they stay in the
+    /// two directories a host build ever uses.
+    fn host(self) -> HostBuildProfile {
         if self.optimised() {
-            Self::Release
+            HostBuildProfile::Release
         } else {
-            Self::Debug
+            HostBuildProfile::Debug
         }
+    }
+}
+
+/// Which build of the host tools (`helios-cli`, `helios-inspector`) a
+/// kernel build compiles beside the image.
+///
+/// A type of its own rather than two of [`KernelBuildProfile`]'s variants,
+/// because the two do not share a cargo profile: the kernel's optimised
+/// build is `kernel-release`, and a host tool asked to build under it
+/// would pay a fat-LTO link on every check for no measurement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostBuildProfile {
+    /// Cargo's `dev` profile.
+    Debug,
+    /// Cargo's `release` profile.
+    Release,
+}
+
+impl HostBuildProfile {
+    /// The `target/` subdirectory the tools land in.
+    fn directory(self) -> &'static str {
+        match self {
+            Self::Debug => "debug",
+            Self::Release => "release",
+        }
+    }
+
+    /// The cargo invocation that builds a host tool under this profile.
+    fn cargo_build_command(self, repo_root: &Path) -> Command {
+        let mut command = Command::new("cargo");
+        command.current_dir(repo_root).arg("build");
+        if self == Self::Release {
+            command.arg("--release");
+        }
+        command
     }
 }
 
@@ -1308,6 +1383,8 @@ pub(crate) struct VmConfigFile {
     #[serde(default)]
     pub(crate) kernel: Option<PathBuf>,
     #[serde(default)]
+    pub(crate) bootfs: Option<PathBuf>,
+    #[serde(default)]
     pub(crate) smp: Option<u16>,
     #[serde(default)]
     pub(crate) memory: Option<String>,
@@ -1339,6 +1416,8 @@ pub(crate) struct VmConfigFile {
     pub(crate) qemu_trace_log: Option<PathBuf>,
     #[serde(default)]
     pub(crate) qemu_arg: Vec<String>,
+    #[serde(default)]
+    pub(crate) enable_targets: Vec<String>,
     #[serde(default)]
     pub(crate) boot_programs: Vec<String>,
     #[serde(default)]
@@ -1403,8 +1482,8 @@ pub(crate) struct VmCommand {
     /// Build the `--release` kernel of a target whose release builds read
     /// the fetched kernel profile without one: the plain control of a
     /// profile-guided measurement (docs/pgo.md, #322). It lands in the
-    /// `release` directory, where a plain build of any other target
-    /// lands. Asking for it on a target that reads no profile is refused,
+    /// `kernel-release` directory, where a plain build of any other
+    /// target lands. Asking for it on a target that reads no profile is refused,
     /// because there the control and the candidate are one build.
     #[arg(
         long,
@@ -1426,6 +1505,12 @@ pub(crate) struct VmCommand {
 
     #[arg(long)]
     kernel: Option<PathBuf>,
+
+    /// The `helios-bootfs` payload the boot protocol hands the kernel —
+    /// the file `kernel-prebuild` wrote. Name one explicitly when
+    /// `--no-build --kernel` boots an image from outside this checkout.
+    #[arg(long)]
+    bootfs: Option<PathBuf>,
 
     #[arg(long)]
     socket: Option<PathBuf>,
@@ -1465,8 +1550,15 @@ pub(crate) struct VmCommand {
     #[arg(long)]
     accel: Vec<String>,
 
+    /// Host directory exported to the guest over 9p, read-only unless
+    /// `--shared-dir-writable` is given.
     #[arg(long)]
     shared_dir: Option<PathBuf>,
+
+    /// Let the guest write to `--shared-dir`. Without it the share is
+    /// read-only, so a guest program cannot alter the host directory.
+    #[arg(long, default_value_t = false)]
+    shared_dir_writable: bool,
 
     /// Size in bytes of the scratch disk every profile attaches.
     #[arg(long)]
@@ -1508,6 +1600,13 @@ pub(crate) struct VmCommand {
     /// Extra raw QEMU argument. Repeat for multiple arguments.
     #[arg(long, allow_hyphen_values = true)]
     qemu_arg: Vec<String>,
+
+    /// Enable a kernel diagnostic tracing target for the session, for the
+    /// rest of this boot; repeat to enable several. The launch phases of
+    /// `exec` and `spawn` live at `helios_kernel::exec::phases`
+    /// (docs/benchmarks.md).
+    #[arg(long = "enable-target", value_name = "TARGET")]
+    enable_targets: Vec<String>,
 
     /// Restrict bootfs program prebuilds to a named program. Repeat for multiple programs.
     #[arg(long = "boot-program")]
@@ -1850,6 +1949,13 @@ struct AotBenchCommand {
     #[arg(long)]
     kernel_profile_output: Option<PathBuf>,
 
+    /// Write the instruction addresses the guest's timers sampled during the
+    /// AOT run, as a folded profile of wasm and kernel functions. Sampling
+    /// runs only when this is given: it raises every guest processor's
+    /// timer rate tenfold, so the run's timings are perturbed.
+    #[arg(long)]
+    instruction_profile_output: Option<PathBuf>,
+
     /// Write folded user-only profile samples collected during the AOT run.
     #[arg(long)]
     user_profile_output: Option<PathBuf>,
@@ -1871,6 +1977,7 @@ struct ResolvedVmCommand {
     build: KernelBuildSpec,
     qemu_bin: PathBuf,
     kernel: PathBuf,
+    bootfs: PathBuf,
     socket: Option<PathBuf>,
     serial_stdio: bool,
     serial_pty: bool,
@@ -1882,6 +1989,7 @@ struct ResolvedVmCommand {
     cpu: Option<String>,
     accel: Vec<String>,
     shared_dir: Option<PathBuf>,
+    shared_dir_access: HostShareAccess,
     data_disk_bytes: u64,
     gdb: Option<String>,
     gdb_wait: bool,
@@ -1892,6 +2000,7 @@ struct ResolvedVmCommand {
     qemu_trace: Vec<String>,
     qemu_trace_log: Option<PathBuf>,
     qemu_arg: Vec<String>,
+    enable_targets: Vec<String>,
     runtime_dir: Option<PathBuf>,
     keep_runtime_dir: bool,
     acpi: bool,
@@ -1906,9 +2015,9 @@ struct ResolvedVmCommand {
     network: VmNetwork,
     qemu_net: Option<QemuNetArgs>,
     command: Option<ResolvedVmSessionCommand>,
-    /// Whether the session command drives QEMU's machine protocol and
-    /// therefore needs a socket even when the runtime directory is not
-    /// being kept.
+    /// Whether the session command drives QEMU's machine protocol, or
+    /// captures vCPU state through it, and therefore needs a socket even
+    /// when the runtime directory is not being kept.
     needs_qmp: bool,
 }
 
@@ -1939,6 +2048,16 @@ impl ResolvedVmSessionCommand {
                 None
             }
         }
+    }
+
+    /// Whether the session needs an inspector-owned QMP socket.
+    ///
+    /// The QMP actions drive the machine through it. A bench action does
+    /// not, but a bench guest that stops answering is captured through
+    /// it before QEMU is torn down (`vcpu_state`), and every lane has to
+    /// be able to leave that capture behind.
+    fn needs_qmp(&self) -> bool {
+        self.qmp_action().is_some() || matches!(self, Self::AotBench(_) | Self::WorkloadBench(_))
     }
 }
 
@@ -2285,6 +2404,10 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
         .or(file.qemu_bin)
         .unwrap_or_else(|| PathBuf::from(profile.qemu_bin));
     let kernel = resolve_kernel_path(command.kernel, file.kernel, &build)?;
+    let bootfs = match command.bootfs.or(file.bootfs) {
+        Some(bootfs) => bootfs,
+        None => bootfs_path(&build)?,
+    };
     let smp = command.smp.or(file.smp).unwrap_or(profile.default_smp);
     let memory = command
         .memory
@@ -2310,6 +2433,11 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
         .or(file.cpu)
         .or_else(|| default_cpu(profile, &accel).map(str::to_owned));
     let shared_dir = command.shared_dir.or(file.shared_dir);
+    let shared_dir_access = match (command.shared_dir_writable, &shared_dir) {
+        (false, _) => HostShareAccess::ReadOnly,
+        (true, Some(_)) => HostShareAccess::ReadWrite,
+        (true, None) => return Err(VmConfigError::WritableShareWithoutDir),
+    };
     let data_disk_bytes = command
         .data_disk_size
         .or(file.data_disk_size)
@@ -2357,6 +2485,8 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
     let qemu_trace_log = command.qemu_trace_log.or(file.qemu_trace_log);
     let mut qemu_arg = file.qemu_arg;
     qemu_arg.extend(command.qemu_arg);
+    let mut enable_targets = file.enable_targets;
+    enable_targets.extend(command.enable_targets);
     let runtime_dir = command.runtime_dir.or(file.runtime_dir);
     let keep_runtime_dir =
         debug || command.keep_runtime_dir || file.keep_runtime_dir.unwrap_or(false);
@@ -2410,6 +2540,7 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
         build,
         qemu_bin,
         kernel,
+        bootfs,
         socket: command.socket,
         serial_stdio: command.serial_stdio,
         serial_pty: command.serial_pty,
@@ -2421,6 +2552,7 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
         cpu,
         accel,
         shared_dir,
+        shared_dir_access,
         data_disk_bytes,
         gdb,
         gdb_wait,
@@ -2431,6 +2563,7 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
         qemu_trace,
         qemu_trace_log,
         qemu_arg,
+        enable_targets,
         runtime_dir,
         keep_runtime_dir,
         acpi,
@@ -2446,7 +2579,7 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
         qemu_net,
         needs_qmp: session_command
             .as_ref()
-            .is_some_and(|command| command.qmp_action().is_some()),
+            .is_some_and(ResolvedVmSessionCommand::needs_qmp),
         command: session_command,
     })
 }
@@ -2633,11 +2766,14 @@ fn build_vm(command: &KernelBuildSpec) -> Result<(), VmBuildError> {
     let repo_root = repo_root()?;
     run_step(
         "building helios-cli",
-        cargo_build_command(&repo_root, command.kind.host())
+        command
+            .kind
+            .host()
+            .cargo_build_command(&repo_root)
             .arg("-p")
             .arg("helios-cli"),
     )?;
-    let prebuild_manifest = run_kernel_prebuild(command)?;
+    run_kernel_prebuild(command)?;
     let kernel_label = match &command.profile_use {
         // Which profile a PGO kernel was built from is part of what it
         // is, so the build says it rather than leaving a release build
@@ -2650,8 +2786,16 @@ fn build_vm(command: &KernelBuildSpec) -> Result<(), VmBuildError> {
         None => format!("building {} kernel", arch_label(command.profile.arch)),
     };
     let mut kernel_build = kernel_build_command(&repo_root, command);
+    let prebuild_dir = kernel_prebuild_dir(command)?;
     kernel_build
-        .env("HELIOS_KERNEL_PREBUILD_MANIFEST", &prebuild_manifest)
+        .env(
+            "HELIOS_KERNEL_ROOT_PUBLIC_KEY",
+            prebuild_dir.join("helios-root-public.key"),
+        )
+        .env(
+            "HELIOS_KERNEL_ROOT_SECRET_KEY",
+            prebuild_dir.join("helios-root-secret.key"),
+        )
         .arg("--target")
         .arg(command.profile.cargo_target)
         .arg("--bin")
@@ -2665,9 +2809,15 @@ fn build_vm(command: &KernelBuildSpec) -> Result<(), VmBuildError> {
     } else {
         run_step(&kernel_label, &mut kernel_build)?;
     }
+    if command.profile.arch == VmArch::X86_64 && command.kind.audited_for_legacy_encoding() {
+        x86_image_audit::audit(&command.kernel_path()?)?;
+    }
     run_step(
         "building inspector",
-        cargo_build_command(&repo_root, command.kind.host())
+        command
+            .kind
+            .host()
+            .cargo_build_command(&repo_root)
             .arg("-p")
             .arg("helios-inspector"),
     )?;
@@ -2683,7 +2833,7 @@ fn cargo_build_command(repo_root: &Path, build: KernelBuildProfile) -> Command {
             command.arg("--profile").arg("kernel-debug");
         }
         KernelBuildProfile::Release => {
-            command.arg("--release");
+            command.arg("--profile").arg("kernel-release");
         }
         KernelBuildProfile::ProfileGenerate => {
             command.arg("--profile").arg("profile-generate");
@@ -2711,6 +2861,11 @@ fn kernel_build_command(repo_root: &Path, command: &KernelBuildSpec) -> Command 
     if let Some(target_dir) = command.target_dir(repo_root).cargo_argument() {
         cargo.arg("--target-dir").arg(target_dir);
     }
+    if command.kind.optimised() {
+        cargo
+            .arg("--config")
+            .arg(kernel_debuginfo_rustflags(command.profile));
+    }
     if command.kind.instrumented() {
         cargo
             .arg("--config")
@@ -2722,6 +2877,36 @@ fn kernel_build_command(repo_root: &Path, command: &KernelBuildSpec) -> Command 
             .arg(profile_use_rustflags(command.profile, profile.path()));
     }
     cargo
+}
+
+/// The `--config` override that gives an optimised kernel its DWARF, for
+/// the target this profile boots.
+///
+/// The inspector expands each address of an instruction profile into the
+/// chain of functions inlined at it from the image's DWARF
+/// (docs/benchmarks.md). `limited` is the level that gives every inlined
+/// function its linkage name, and so its full path; `line-tables-only`
+/// names each by its bare identifier. `-C strip=none` overrides the
+/// `strip = "debuginfo"` cargo derives from the profile's `debug = 0`.
+///
+/// The flags are rustflags rather than the cargo profile's `debug` key on
+/// purpose. Cargo folds the profile into every crate's `-C metadata`, so a
+/// profile change renames every symbol of the image, and under fat LTO the
+/// renamed functions merge in another order and some inlining decisions
+/// move: built that way the image's code differs from the image without
+/// DWARF (#451). Rustflags stay out of `-C metadata`, and with them every
+/// function's instructions are what they are without DWARF; only the merge
+/// order of same-named upstream crates, which rustc takes from object
+/// names carrying cargo's per-flags hash, can move, as it can under any
+/// rustflag. The DWARF never reaches the guest: `helios-cli
+/// limine-uefi-image` writes the image without it, and QEMU's `-kernel`
+/// loads only `PT_LOAD` segments.
+fn kernel_debuginfo_rustflags(profile: &VmProfile) -> String {
+    let flags = ["-C", "debuginfo=limited", "-C", "strip=none"];
+    let flags = toml::Value::try_from(flags)
+        .expect("a list of strings is a TOML array")
+        .to_string();
+    format!("target.\"{}\".rustflags={flags}", profile.cargo_target)
 }
 
 /// The `--config` override that turns a kernel build into an instrumented
@@ -2798,14 +2983,28 @@ fn profile_use_rustflags(profile: &VmProfile, used: &Path) -> String {
     format!("target.\"{}\".rustflags={flags}", profile.cargo_target)
 }
 
-fn run_kernel_prebuild(command: &KernelBuildSpec) -> Result<PathBuf, VmBuildError> {
-    let cli = discover_helios_cli(command.kind)?;
-    let repo_root = repo_root()?;
-    let out_dir = repo_root
+/// Where `kernel-prebuild` writes this build's manifest and
+/// `helios-bootfs` payload — the same directory the kernel build reads
+/// its trusted keys out of.
+fn kernel_prebuild_dir(build: &KernelBuildSpec) -> Result<PathBuf, WorkspaceRootError> {
+    Ok(repo_root()?
         .join("target")
         .join("kernel-prebuild")
-        .join(command.profile.cargo_target)
-        .join(command.kind.directory());
+        .join(build.profile.cargo_target)
+        .join(build.kind.directory()))
+}
+
+/// The `helios-bootfs` payload a `kernel-prebuild` run wrote for this
+/// build — the boot module the Limine image and the riscv64 initrd
+/// carry.
+fn bootfs_path(build: &KernelBuildSpec) -> Result<PathBuf, WorkspaceRootError> {
+    Ok(kernel_prebuild_dir(build)?.join("helios-bootfs"))
+}
+
+fn run_kernel_prebuild(command: &KernelBuildSpec) -> Result<(), VmBuildError> {
+    let cli = discover_helios_cli(command.kind)?;
+    let repo_root = repo_root()?;
+    let out_dir = kernel_prebuild_dir(command)?;
     let mut prebuild = Command::new(&cli);
     prebuild
         .current_dir(&repo_root)
@@ -2825,7 +3024,7 @@ fn run_kernel_prebuild(command: &KernelBuildSpec) -> Result<PathBuf, VmBuildErro
         prebuild.arg("--no-compiler-plugin");
     }
     run_step("prebuilding kernel bootfs", &mut prebuild)?;
-    Ok(out_dir.join("kernel-prebuild.json"))
+    Ok(())
 }
 
 fn connect_and_run(
@@ -2833,6 +3032,13 @@ fn connect_and_run(
     runtime: &mut VmRuntime,
 ) -> Result<(), VmSessionError> {
     let qmp_socket = runtime.qmp_socket.clone();
+    let vcpus = VcpuStateCapture::new(
+        command.profile.arch,
+        qmp_socket.clone(),
+        runtime.runtime_dir.path(),
+        runtime.debug_serial_log.clone(),
+        command.kernel.clone(),
+    );
     let client = match runtime.take_transport()? {
         VmTransport::SerialSocket(socket_path) => {
             let socket = socket_path
@@ -2896,8 +3102,20 @@ fn connect_and_run(
             })?
         }
     };
+    // Diagnostic targets open before the session action so its launches
+    // are the ones that get traced; enabling is by name, so a target the
+    // kernel does not gate refuses here rather than streaming nothing.
+    if !command.enable_targets.is_empty() {
+        crate::runtime::block_on(async {
+            system::enable_tracing_targets(&client, &command.enable_targets)
+                .await
+                .map_err(|source| VmSessionError::EnableTargets { source })
+        })?;
+    }
     match command.command.clone() {
-        Some(ResolvedVmSessionCommand::AotBench(command)) => run_aot_bench(client, command),
+        Some(ResolvedVmSessionCommand::AotBench(aot_command)) => {
+            run_aot_bench(client, aot_command, vcpus, command.kernel.clone())
+        }
         Some(ResolvedVmSessionCommand::WorkloadBench(workload_command)) => run_workload_bench(
             client,
             workload_command,
@@ -2908,7 +3126,10 @@ fn connect_and_run(
                 memory: command.memory.clone(),
                 cpu: command.cpu.clone(),
                 accel: command.accel.clone(),
+                rpc_transport: command.rpc_transport,
             },
+            vcpus,
+            command.kernel.clone(),
         ),
         Some(ResolvedVmSessionCommand::Balloon(balloon)) => {
             let socket = qmp_socket.ok_or(VmSessionError::NeedsQmp { action: "balloon" })?;
@@ -3595,6 +3816,8 @@ fn run_workload_bench(
     mut client: RpcClient,
     command: WorkloadBenchCommand,
     provenance: VmProvenance,
+    vcpus: VcpuStateCapture,
+    kernel: PathBuf,
 ) -> Result<(), VmSessionError> {
     crate::run_interruptible(async move {
         let profile_filter = system_profiling::Filter {
@@ -3610,7 +3833,7 @@ fn run_workload_bench(
             || command.perf_metrics_output.is_some();
         let seconds = command.workload_timeout_seconds;
         let before_profile = if collect_profile {
-            guest_step_under_deadline("the profile reset", seconds, async {
+            guest_step_under_deadline("the profile reset", seconds, &vcpus, async {
                 Ok::<_, VmSessionError>(
                     profiling_step(
                         "clear remote profile samples",
@@ -3620,7 +3843,7 @@ fn run_workload_bench(
                 )
             })
             .await?;
-            guest_step_under_deadline("the profiler hand-off", seconds, async {
+            guest_step_under_deadline("the profiler hand-off", seconds, &vcpus, async {
                 Ok::<_, VmSessionError>(
                     profiling_step(
                         "enable remote profiling",
@@ -3630,7 +3853,7 @@ fn run_workload_bench(
                 )
             })
             .await?;
-            guest_step_under_deadline("the initial profile read", seconds, async {
+            guest_step_under_deadline("the initial profile read", seconds, &vcpus, async {
                 Ok::<_, VmSessionError>(
                     profiling_step(
                         "read initial remote profile samples",
@@ -3643,16 +3866,29 @@ fn run_workload_bench(
         } else {
             Vec::new()
         };
+        let instruction_profile_output = command.instruction_profile_output();
+        if instruction_profile_output.is_some() {
+            guest_step_under_deadline("the instruction sampling start", seconds, &vcpus, async {
+                Ok::<_, VmSessionError>(instruction_profile::start(&client).await?)
+            })
+            .await?;
+        }
 
         if let Err(error) =
-            crate::workload_bench::run_inner(&mut client, &command, &provenance).await
+            crate::workload_bench::run_inner(&mut client, &command, &provenance, &vcpus).await
         {
-            print_recent_guest_errors(&mut client, seconds).await;
+            print_recent_guest_errors(&mut client, seconds, &vcpus).await;
             return Err(error.into());
         }
 
+        if instruction_profile_output.is_some() {
+            guest_step_under_deadline("the instruction sampling stop", seconds, &vcpus, async {
+                Ok::<_, VmSessionError>(instruction_profile::stop(&client).await?)
+            })
+            .await?;
+        }
         if collect_profile {
-            guest_step_under_deadline("the profiler stop", seconds, async {
+            guest_step_under_deadline("the profiler stop", seconds, &vcpus, async {
                 Ok::<_, VmSessionError>(
                     profiling_step(
                         "disable remote profiling",
@@ -3663,7 +3899,7 @@ fn run_workload_bench(
             })
             .await?;
             let after_profile =
-                guest_step_under_deadline("the final profile read", seconds, async {
+                guest_step_under_deadline("the final profile read", seconds, &vcpus, async {
                     Ok::<_, VmSessionError>(
                         profiling_step(
                             "read final remote profile samples",
@@ -3673,17 +3909,26 @@ fn run_workload_bench(
                     )
                 })
                 .await?;
-            let metrics = guest_step_under_deadline("the perf metric read", seconds, async {
-                Ok::<_, VmSessionError>(
-                    profiling_step(
-                        "read final remote perf metrics",
-                        system_profiling::metrics(&client, &metric_filter, 0),
+            let metrics =
+                guest_step_under_deadline("the perf metric read", seconds, &vcpus, async {
+                    Ok::<_, VmSessionError>(
+                        profiling_step(
+                            "read final remote perf metrics",
+                            system_profiling::metrics(&client, &metric_filter, 0),
+                        )
+                        .await?,
                     )
-                    .await?,
+                })
+                .await?;
+            write_requested_profile_outputs(&command, &before_profile, &after_profile, &metrics)?;
+        }
+        if let Some(output) = instruction_profile_output {
+            guest_step_under_deadline("the instruction profile read", seconds, &vcpus, async {
+                Ok::<_, VmSessionError>(
+                    instruction_profile::collect(&client, &kernel, output).await?,
                 )
             })
             .await?;
-            write_requested_profile_outputs(&command, &before_profile, &after_profile, &metrics)?;
         }
         if let Some(output) = command.llvm_raw_profile_output() {
             raw_profile::collect_beside(&client, output).await?;
@@ -3713,11 +3958,11 @@ async fn profiling_step<T>(
 /// call that brings us here is often a guest that stopped answering, and
 /// a diagnostic that hangs replaces the failure it was fetched to
 /// explain.
-async fn print_recent_guest_errors(client: &mut RpcClient, seconds: u32) {
+async fn print_recent_guest_errors(client: &mut RpcClient, seconds: u32, vcpus: &VcpuStateCapture) {
     let mut config = crate::system::TracingConfig::new();
     config.limit = 100;
     config.min_level = Some(helios_inspector_protocol::system::tracing::Level::Info);
-    let fetched = guest_step_under_deadline("the tracing fetch", seconds, async {
+    let fetched = guest_step_under_deadline("the tracing fetch", seconds, vcpus, async {
         Ok::<_, WorkloadBenchError>(crate::system::fetch_tracing(client, &config).await?)
     })
     .await;
@@ -3735,7 +3980,12 @@ async fn print_recent_guest_errors(client: &mut RpcClient, seconds: u32) {
     }
 }
 
-fn run_aot_bench(mut client: RpcClient, command: AotBenchCommand) -> Result<(), VmSessionError> {
+fn run_aot_bench(
+    mut client: RpcClient,
+    command: AotBenchCommand,
+    vcpus: VcpuStateCapture,
+    kernel: PathBuf,
+) -> Result<(), VmSessionError> {
     crate::run_interruptible(async move {
         let wasm = fs::read(&command.wasm).map_err(|source| AotBenchError::ReadWasm {
             path: command.wasm.display().to_string(),
@@ -3792,6 +4042,10 @@ fn run_aot_bench(mut client: RpcClient, command: AotBenchCommand) -> Result<(), 
             )
             .map_err(|source| AotBenchError::Report { source })?;
         }
+        let instruction_profile_output = command.instruction_profile_output();
+        if instruction_profile_output.is_some() {
+            instruction_profile::start(&client).await?;
+        }
         for iteration in 1..=command.iterations {
             let started = Instant::now();
             let outcome = system_programs::aot(
@@ -3811,7 +4065,12 @@ fn run_aot_bench(mut client: RpcClient, command: AotBenchCommand) -> Result<(), 
                     // Surface the guest-side error events before failing:
                     // the RPC error kind alone (e.g. `Internal`) does not
                     // say which runtime operation actually failed.
-                    print_recent_guest_errors(&mut client, DEFAULT_WORKLOAD_TIMEOUT_SECONDS).await;
+                    print_recent_guest_errors(
+                        &mut client,
+                        DEFAULT_WORKLOAD_TIMEOUT_SECONDS,
+                        &vcpus,
+                    )
+                    .await;
                     return Err(AotBenchError::Refused {
                         iteration,
                         kind: error.kind,
@@ -3829,6 +4088,9 @@ fn run_aot_bench(mut client: RpcClient, command: AotBenchCommand) -> Result<(), 
                 result.destination_path
             )
             .map_err(|source| AotBenchError::Report { source })?;
+        }
+        if instruction_profile_output.is_some() {
+            instruction_profile::stop(&client).await?;
         }
         if collect_profile {
             profiling_step(
@@ -3848,6 +4110,9 @@ fn run_aot_bench(mut client: RpcClient, command: AotBenchCommand) -> Result<(), 
             .await?;
             write_requested_profile_outputs(&command, &before_profile, &after_profile, &metrics)?;
         }
+        if let Some(output) = instruction_profile_output {
+            instruction_profile::collect(&client, &kernel, output).await?;
+        }
         if let Some(output) = command.llvm_raw_profile_output() {
             raw_profile::collect_beside(&client, output).await?;
         }
@@ -3860,6 +4125,9 @@ trait ProfileOutputRequest {
     fn kernel_profile_output(&self) -> Option<&Path>;
     fn user_profile_output(&self) -> Option<&Path>;
     fn perf_metrics_output(&self) -> Option<&Path>;
+    /// Where the instruction-address samples are written as a folded
+    /// profile, when the run is collecting them.
+    fn instruction_profile_output(&self) -> Option<&Path>;
     /// Where the guest kernel's own LLVM raw profile is written, when the
     /// run is collecting one.
     fn llvm_raw_profile_output(&self) -> Option<&Path>;
@@ -3885,6 +4153,10 @@ impl ProfileOutputRequest for AotBenchCommand {
     fn perf_metrics_output(&self) -> Option<&Path> {
         self.perf_metrics_output.as_deref()
     }
+
+    fn instruction_profile_output(&self) -> Option<&Path> {
+        self.instruction_profile_output.as_deref()
+    }
 }
 
 impl ProfileOutputRequest for WorkloadBenchCommand {
@@ -3906,6 +4178,10 @@ impl ProfileOutputRequest for WorkloadBenchCommand {
 
     fn perf_metrics_output(&self) -> Option<&Path> {
         self.perf_metrics_output.as_deref()
+    }
+
+    fn instruction_profile_output(&self) -> Option<&Path> {
+        self.instruction_profile_output.as_deref()
     }
 }
 
@@ -4033,6 +4309,7 @@ fn prepare_limine_uefi_image(
             path: command.kernel.display().to_string(),
             source,
         })?;
+    let bootfs = command.bootfs.as_path();
     let image = match runtime_dir {
         Some(dir) => dir.join("kernel.uefi.img"),
         None => kernel.with_extension("uefi.img"),
@@ -4046,6 +4323,8 @@ fn prepare_limine_uefi_image(
         .arg("limine-uefi-image")
         .arg("--kernel")
         .arg(&kernel)
+        .arg("--bootfs")
+        .arg(bootfs)
         .arg("--output")
         .arg(&image)
         .arg("--baud")
@@ -4127,7 +4406,7 @@ fn discover_helios_cli(kind: KernelBuildProfile) -> Result<PathBuf, ToolDiscover
 /// Where [`build_vm`] leaves the `helios-cli` a build of `kind` needs.
 ///
 /// One expression, so the build and the lookup cannot disagree about the
-/// profile: `cargo_build_command` compiles it under `kind.host()`, and
+/// profile: [`build_vm`] compiles it under `kind.host()`, and
 /// this names the directory that profile writes into.
 fn workspace_helios_cli(root: &Path, kind: KernelBuildProfile) -> PathBuf {
     root.join("target")
@@ -4325,8 +4604,7 @@ fn filter_pgo_stderr(
 /// missed — so the count is the image's own `STT_FUNC` symbols, the same
 /// population `helios-bench symbols` exports.
 fn kernel_functions(kernel: &Path) -> Result<KernelFunctions, BuildStepError> {
-    use object::{Object as _, ObjectSymbol as _, SymbolKind};
-    let kernel_image = |source: io::Error| BuildStepError::KernelImageRead {
+    let image_read = |source: io::Error| BuildStepError::KernelImageRead {
         path: kernel.display().to_string(),
         source,
     };
@@ -4334,16 +4612,13 @@ fn kernel_functions(kernel: &Path) -> Result<KernelFunctions, BuildStepError> {
         path: kernel.display().to_string(),
         source,
     };
-    let bytes = fs::read(kernel).map_err(kernel_image)?;
+    let bytes = fs::read(kernel).map_err(image_read)?;
     let image = object::File::parse(&*bytes).map_err(image_symbols)?;
     let mut total = 0;
     let mut names = Vec::new();
-    for symbol in image.symbols() {
-        if symbol.kind() != SymbolKind::Text || symbol.is_undefined() {
-            continue;
-        }
+    for symbol in kernel_image::function_symbols(&image) {
         total += 1;
-        names.push(base_name(symbol.name().map_err(image_symbols)?).to_owned());
+        names.push(base_name(symbol.map_err(image_symbols)?.name).to_owned());
     }
     Ok(KernelFunctions { total, names })
 }
@@ -4511,6 +4786,9 @@ struct VmRuntime {
     _serial_pty_slave: Option<fs::File>,
     /// The QMP socket the inspector created, when it owns one.
     qmp_socket: Option<PathBuf>,
+    /// The raw copy of the guest's debug serial line, when the console
+    /// is a socket the chardev can log.
+    debug_serial_log: Option<PathBuf>,
     runtime_dir: VmRuntimeDir,
     /// Held for the life of the VM: dropping it takes the sockets with
     /// it, and QEMU is still bound to them until it exits.
@@ -4694,6 +4972,7 @@ impl VmRuntime {
         } else {
             None
         };
+        let mut debug_serial_log = None;
 
         if !command.serial_stdio && serial_pty.is_none() {
             prepare_socket_path(&socket_path)?;
@@ -4742,17 +5021,18 @@ impl VmRuntime {
             // into a socket it could not write apart from one the
             // inspector's reader lost, and both are otherwise invisible
             // — the guest sees a successful transmit either way.
-            let debug_serial_log = command
+            let log = command
                 .debug_serial_log
                 .clone()
                 .unwrap_or_else(|| runtime_dir.path().join(DEBUG_SERIAL_LOG_NAME));
-            prepare_log_path(&debug_serial_log)?;
+            prepare_log_path(&log)?;
             qemu.arg("-chardev").arg(format!(
                 "socket,id={DEBUG_SERIAL_CHARDEV},path={},server=on,wait=on,\
                  logfile={},logappend=off",
                 qemu_option_value(&socket_path)?,
-                qemu_option_value(&debug_serial_log)?,
+                qemu_option_value(&log)?,
             ));
+            debug_serial_log = Some(log);
             qemu.arg("-serial")
                 .arg(format!("chardev:{DEBUG_SERIAL_CHARDEV}"));
         }
@@ -4831,7 +5111,11 @@ impl VmRuntime {
         configure_firmware(&mut qemu, command, runtime_dir.path())?;
         match command.profile.boot_artifact {
             VmBootArtifactKind::KernelBinary => {
+                // riscv64's `-kernel` boot is the one path without a
+                // bootloader to hand modules over; the payload rides as
+                // the initrd, whose range `/chosen` publishes.
                 qemu.arg("-kernel").arg(&artifact);
+                qemu.arg("-initrd").arg(&command.bootfs);
             }
             VmBootArtifactKind::LimineUefiDiskImage => {}
         }
@@ -4857,7 +5141,13 @@ impl VmRuntime {
         if let Some(host_share) = command.profile.host_share
             && let Some(shared_dir) = &command.shared_dir
         {
-            configure_host_share(&mut qemu, host_share, shared_dir, command.virtio_devices);
+            configure_host_share(
+                &mut qemu,
+                host_share,
+                shared_dir,
+                command.shared_dir_access,
+                command.virtio_devices,
+            );
         }
         if let Some(watchdog) = command.profile.watchdog {
             configure_watchdog(&mut qemu, watchdog);
@@ -4925,6 +5215,7 @@ impl VmRuntime {
             transport: Some(transport),
             _serial_pty_slave: serial_pty_slave,
             qmp_socket: qmp_socket_path(command, socket_dir.path())?,
+            debug_serial_log,
             qemu_log,
             runtime_dir,
             _socket_dir: socket_dir,
@@ -5368,6 +5659,7 @@ fn configure_host_share(
     qemu: &mut Command,
     host_share: VmHostShareProfile,
     shared_dir: &Path,
+    access: HostShareAccess,
     queues: VirtioDeviceProfile,
 ) {
     let mut fsdev = QemuOptions::new("local");
@@ -5375,6 +5667,9 @@ fn configure_host_share(
     fsdev.set("path", shared_dir.display());
     fsdev.set("security_model", "none");
     fsdev.set("multidevs", "remap");
+    if access == HostShareAccess::ReadOnly {
+        fsdev.set("readonly", "on");
+    }
     qemu.arg("-fsdev").arg(fsdev.to_string());
     let mut device = QemuOptions::new(match host_share {
         VmHostShareProfile::Virtio9pMmio => "virtio-9p-device",
@@ -5801,6 +6096,48 @@ mod tests {
             .collect()
     }
 
+    /// The share a developer gets without asking for more: QEMU refuses
+    /// every write, so a guest program cannot alter the host directory.
+    #[test]
+    fn the_host_share_is_read_only_by_default() {
+        let arguments = rendered(|qemu| {
+            configure_host_share(
+                qemu,
+                VmHostShareProfile::Virtio9pPci,
+                Path::new("/scratch"),
+                HostShareAccess::ReadOnly,
+                VirtioDeviceProfile::default(),
+            )
+        });
+        assert_eq!(
+            arguments[..2],
+            [
+                "-fsdev",
+                "local,id=hostfs,path=/scratch,security_model=none,multidevs=remap,readonly=on"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_writable_host_share_carries_no_readonly_option() {
+        let arguments = rendered(|qemu| {
+            configure_host_share(
+                qemu,
+                VmHostShareProfile::Virtio9pPci,
+                Path::new("/scratch"),
+                HostShareAccess::ReadWrite,
+                VirtioDeviceProfile::default(),
+            )
+        });
+        assert_eq!(
+            arguments[..2],
+            [
+                "-fsdev",
+                "local,id=hostfs,path=/scratch,security_model=none,multidevs=remap"
+            ]
+        );
+    }
+
     /// A capture is only evidence if it is a capture of the guest's own
     /// display, so the PCI machine's default VGA adapter goes away with
     /// the same call that attaches the virtio-GPU.
@@ -6144,6 +6481,40 @@ mod tests {
             ResolvedVmSessionCommand::Session(SessionCommand::Stats).qmp_action(),
             None
         );
+    }
+
+    /// A bench guest that stops answering is captured through QMP before
+    /// QEMU is torn down, so every bench session asks for the socket
+    /// although it drives no QMP action of its own.
+    #[test]
+    fn every_bench_action_asks_for_a_socket() {
+        let aot = ResolvedVmSessionCommand::AotBench(AotBenchCommand {
+            wasm: PathBuf::from("artifacts/wasi-tools/curl.wasm"),
+            remote_path: "/aot-bench-input.wasm".to_owned(),
+            destination_path: "/aot-bench-output.cwasm".to_owned(),
+            iterations: 5,
+            compiler_timing: false,
+            profile_output: None,
+            kernel_profile_output: None,
+            instruction_profile_output: None,
+            user_profile_output: None,
+            perf_metrics_output: None,
+            llvm_raw_profile_output: None,
+        });
+        assert_eq!(aot.qmp_action(), None);
+        assert!(aot.needs_qmp());
+        /// The bench command as its own command line resolves it.
+        #[derive(clap::Parser)]
+        struct WorkloadBenchLine {
+            #[command(flatten)]
+            command: WorkloadBenchCommand,
+        }
+        let line = <WorkloadBenchLine as clap::Parser>::try_parse_from(["workload-bench"])
+            .expect("workload-bench takes no required argument");
+        let workload = ResolvedVmSessionCommand::WorkloadBench(line.command);
+        assert_eq!(workload.qmp_action(), None);
+        assert!(workload.needs_qmp());
+        assert!(!ResolvedVmSessionCommand::Session(SessionCommand::Stats).needs_qmp());
     }
 
     /// One input device the way `helios:system/stats` reports it, for
@@ -6572,12 +6943,60 @@ mod tests {
         );
     }
 
+    #[test]
+    fn only_measured_and_shipped_kernel_profiles_are_audited_for_legacy_encoding() {
+        assert!(KernelBuildProfile::Release.audited_for_legacy_encoding());
+        assert!(KernelBuildProfile::ProfileUse.audited_for_legacy_encoding());
+        assert!(!KernelBuildProfile::Debug.audited_for_legacy_encoding());
+        assert!(!KernelBuildProfile::KernelDebug.audited_for_legacy_encoding());
+        assert!(!KernelBuildProfile::ProfileGenerate.audited_for_legacy_encoding());
+    }
+
     /// The arguments a built cargo invocation carries, as strings.
     fn cargo_arguments(command: &Command) -> Vec<String> {
         command
             .get_args()
             .map(|argument| argument.to_string_lossy().into_owned())
             .collect()
+    }
+
+    /// Every optimised kernel carries the DWARF an instruction profile is
+    /// named from, through rustflags so that the build's `-C metadata`,
+    /// and with it the image's code, stays what it is without them; a
+    /// debug kernel is left to its own profile.
+    #[test]
+    fn only_optimised_kernels_take_their_debuginfo_from_rustflags() {
+        let flags = kernel_debuginfo_rustflags(&X86_64_VM_PROFILE);
+        assert_eq!(
+            flags,
+            "target.\"x86_64-unknown-none\".rustflags=\
+             [\"-C\", \"debuginfo=limited\", \"-C\", \"strip=none\"]"
+        );
+        let build = |kind| KernelBuildSpec {
+            profile: &X86_64_VM_PROFILE,
+            kind,
+            profile_use: None,
+            boot_programs: Vec::new(),
+            no_compiler_plugin: true,
+        };
+        let root = Path::new("/checkout");
+        for kind in [
+            KernelBuildProfile::Release,
+            KernelBuildProfile::ProfileGenerate,
+            KernelBuildProfile::ProfileUse,
+        ] {
+            let arguments = cargo_arguments(&kernel_build_command(root, &build(kind)));
+            assert!(
+                arguments
+                    .windows(2)
+                    .any(|pair| pair[0] == "--config" && pair[1] == flags),
+                "{kind:?}: {arguments:?}"
+            );
+        }
+        for kind in [KernelBuildProfile::Debug, KernelBuildProfile::KernelDebug] {
+            let arguments = cargo_arguments(&kernel_build_command(root, &build(kind)));
+            assert!(!arguments.contains(&flags), "{kind:?}: {arguments:?}");
+        }
     }
 
     /// A named profile and the release profile are both `profile-use`
@@ -7096,6 +7515,7 @@ mod tests {
             config: None,
             qemu_bin: None,
             kernel: None,
+            bootfs: None,
             socket: None,
             serial_stdio: false,
             serial_pty: false,
@@ -7109,6 +7529,7 @@ mod tests {
             // host, so they ask for the emulator on purpose.
             accel: vec!["tcg".to_owned()],
             shared_dir: None,
+            shared_dir_writable: false,
             data_disk_size: None,
             gdb: None,
             gdb_wait: false,
@@ -7119,6 +7540,7 @@ mod tests {
             qemu_trace: Vec::new(),
             qemu_trace_log: None,
             qemu_arg: Vec::new(),
+            enable_targets: Vec::new(),
             boot_programs: Vec::new(),
             no_compiler_plugin: false,
             runtime_dir: None,
@@ -7154,6 +7576,7 @@ mod tests {
             config: Some(missing_config),
             qemu_bin: None,
             kernel: None,
+            bootfs: None,
             socket: None,
             serial_stdio: false,
             serial_pty: false,
@@ -7167,6 +7590,7 @@ mod tests {
             // host, so they ask for the emulator on purpose.
             accel: vec!["tcg".to_owned()],
             shared_dir: None,
+            shared_dir_writable: false,
             data_disk_size: None,
             gdb: None,
             gdb_wait: false,
@@ -7177,6 +7601,7 @@ mod tests {
             qemu_trace: Vec::new(),
             qemu_trace_log: None,
             qemu_arg: Vec::new(),
+            enable_targets: Vec::new(),
             boot_programs: Vec::new(),
             no_compiler_plugin: false,
             runtime_dir: None,
@@ -7213,6 +7638,38 @@ mod tests {
     /// virtio-iommu can only confine PCI endpoints, so asking for it on
     /// a machine whose virtio devices are memory-mapped is refused
     /// rather than quietly ignored.
+    #[test]
+    fn a_writable_share_needs_a_directory_to_export() {
+        let tempdir =
+            tempfile::tempdir().expect("temporary directory for VM config resolution must exist");
+        let config = tempdir.path().join("missing-vm.json");
+
+        let error = resolve(VmCommand {
+            shared_dir_writable: true,
+            config: Some(config.clone()),
+            ..minimal_command()
+        })
+        .expect_err("a writable share without a directory names nothing");
+        assert!(matches!(error, VmConfigError::WritableShareWithoutDir));
+
+        let resolved = resolve(VmCommand {
+            shared_dir: Some(tempdir.path().to_path_buf()),
+            config: Some(config.clone()),
+            ..minimal_command()
+        })
+        .expect("a share resolves");
+        assert_eq!(resolved.shared_dir_access, HostShareAccess::ReadOnly);
+
+        let resolved = resolve(VmCommand {
+            shared_dir: Some(tempdir.path().to_path_buf()),
+            shared_dir_writable: true,
+            config: Some(config),
+            ..minimal_command()
+        })
+        .expect("an explicit writable share resolves");
+        assert_eq!(resolved.shared_dir_access, HostShareAccess::ReadWrite);
+    }
+
     #[test]
     fn iommu_is_refused_on_a_memory_mapped_machine() {
         let tempdir =
@@ -7291,6 +7748,7 @@ mod tests {
             config: Some(tempdir.path().join("missing-vm.json")),
             qemu_bin: None,
             kernel: None,
+            bootfs: None,
             socket: None,
             serial_stdio: false,
             serial_pty: false,
@@ -7304,6 +7762,7 @@ mod tests {
             // host, so they ask for the emulator on purpose.
             accel: vec!["tcg".to_owned()],
             shared_dir: None,
+            shared_dir_writable: false,
             data_disk_size: None,
             gdb: None,
             gdb_wait: false,
@@ -7314,6 +7773,7 @@ mod tests {
             qemu_trace: Vec::new(),
             qemu_trace_log: None,
             qemu_arg: Vec::new(),
+            enable_targets: Vec::new(),
             boot_programs: Vec::new(),
             no_compiler_plugin: false,
             runtime_dir: None,
@@ -7332,7 +7792,7 @@ mod tests {
 
         let resolved = resolve(command).expect("VM debug command resolution must succeed");
         assert_eq!(resolved.build.kind, KernelBuildProfile::KernelDebug);
-        assert_eq!(resolved.gdb.as_deref(), Some(DEFAULT_GDB_ENDPOINT));
+        assert_eq!(resolved.gdb.as_deref(), Some("tcp:127.0.0.1:1234"));
         assert!(resolved.gdb_wait);
         assert!(resolved.keep_runtime_dir);
         assert_eq!(
@@ -7371,11 +7831,16 @@ mod tests {
         let command = watchdog_test_command(arch);
         run_step(
             "building helios-cli",
-            cargo_build_command(&repo_root()?, command.build.kind.host())
+            command
+                .build
+                .kind
+                .host()
+                .cargo_build_command(&repo_root()?)
                 .arg("-p")
                 .arg("helios-cli"),
         )?;
-        let prebuild_manifest = run_kernel_prebuild(&command.build)?;
+        run_kernel_prebuild(&command.build)?;
+        let prebuild_dir = kernel_prebuild_dir(&command.build)?;
         let status = std::process::Command::new("cargo")
             .current_dir(repo_root()?)
             .arg("build")
@@ -7383,7 +7848,14 @@ mod tests {
             .arg(arch.profile().cargo_target)
             .arg("--bin")
             .arg(arch.profile().kernel_artifact_name)
-            .env("HELIOS_KERNEL_PREBUILD_MANIFEST", prebuild_manifest)
+            .env(
+                "HELIOS_KERNEL_ROOT_PUBLIC_KEY",
+                prebuild_dir.join("helios-root-public.key"),
+            )
+            .env(
+                "HELIOS_KERNEL_ROOT_SECRET_KEY",
+                prebuild_dir.join("helios-root-secret.key"),
+            )
             .env("HELIOS_WATCHDOG_SELF_TEST", "1")
             .env("HELIOS_WATCHDOG_TIMEOUT_SECS", WATCHDOG_TIMEOUT_SECS)
             .env(
@@ -7412,6 +7884,9 @@ mod tests {
             build: build.clone(),
             qemu_bin: PathBuf::from(profile.qemu_bin),
             kernel: build.kernel_path().expect("workspace root must resolve"),
+            bootfs: kernel_prebuild_dir(&build)
+                .expect("workspace root must resolve")
+                .join("helios-bootfs"),
             socket: None,
             serial_stdio: false,
             serial_pty: false,
@@ -7427,6 +7902,7 @@ mod tests {
                 .map(|value| (*value).to_owned())
                 .collect(),
             shared_dir: None,
+            shared_dir_access: HostShareAccess::ReadOnly,
             data_disk_bytes: DEFAULT_DATA_DISK_BYTES,
             gdb: None,
             gdb_wait: false,
@@ -7437,6 +7913,7 @@ mod tests {
             qemu_trace: Vec::new(),
             qemu_trace_log: None,
             qemu_arg: Vec::new(),
+            enable_targets: Vec::new(),
             runtime_dir: None,
             keep_runtime_dir: false,
             acpi: false,
@@ -7619,6 +8096,9 @@ mod tests {
             build: build.clone(),
             qemu_bin: PathBuf::from(profile.qemu_bin),
             kernel: build.kernel_path().expect("workspace root must resolve"),
+            bootfs: kernel_prebuild_dir(&build)
+                .expect("workspace root must resolve")
+                .join("helios-bootfs"),
             socket: None,
             serial_stdio: false,
             serial_pty: false,
@@ -7634,6 +8114,7 @@ mod tests {
                 .map(|value| (*value).to_owned())
                 .collect(),
             shared_dir: Some(repo_root().expect("workspace root must resolve")),
+            shared_dir_access: HostShareAccess::ReadOnly,
             data_disk_bytes: DEFAULT_DATA_DISK_BYTES,
             gdb: None,
             gdb_wait: false,
@@ -7644,6 +8125,7 @@ mod tests {
             qemu_trace: Vec::new(),
             qemu_trace_log: None,
             qemu_arg: Vec::new(),
+            enable_targets: Vec::new(),
             runtime_dir: None,
             keep_runtime_dir: false,
             acpi: false,

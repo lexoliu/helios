@@ -75,3 +75,16 @@ def test_an_unknown_skip_is_still_refused() -> None:
     driver = gap_bench()
     with pytest.raises(SystemExit):
         driver.selected_workloads(load_workloads(), [], [], ["no-such-workload"])
+
+
+def test_the_helios_side_carries_the_lanes_rpc_transport(options) -> None:
+    """Every Helios row is timed around the inspector RPC, so the transport
+    the lane names in `manifest.toml` reaches the harness that boots the
+    guest (#413), as the environment `workload-bench.sh` reads."""
+    workloads = load_workloads()["workloads"]
+    commands = plan(options, load_manifest(), workloads)
+    helios = [command for command in commands if "--skip-linux" in command.argv]
+    assert helios, "the plan has a Helios invocation"
+    assert options.lane.rpc_transport == "vsock"
+    for command in helios:
+        assert command.env["HELIOS_WORKLOAD_BENCH_RPC_TRANSPORT"] == "vsock"

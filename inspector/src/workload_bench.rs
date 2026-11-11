@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::programs::ProgramError;
 use crate::system::SystemError;
+use crate::vm::VcpuStateCapture;
 
 const HOST_HTTP_LARGE_PAYLOAD_FILE: &str = "payload-64m.bin";
 const WORKLOAD_MANIFEST_SCHEMA_VERSION: u16 = 2;
@@ -411,6 +412,13 @@ pub(crate) struct WorkloadBenchCommand {
     #[arg(long)]
     pub(crate) kernel_profile_output: Option<PathBuf>,
 
+    /// Write the instruction addresses the guest's timers sampled during the
+    /// workload run, as a folded profile of wasm and kernel functions.
+    /// Sampling runs only when this is given: it raises every guest
+    /// processor's timer rate tenfold, so the run's timings are perturbed.
+    #[arg(long)]
+    pub(crate) instruction_profile_output: Option<PathBuf>,
+
     /// Write folded user-only profile samples collected during the workload run.
     #[arg(long)]
     pub(crate) user_profile_output: Option<PathBuf>,
@@ -504,6 +512,11 @@ pub(crate) struct VmProvenance {
     pub(crate) memory: String,
     pub(crate) cpu: Option<String>,
     pub(crate) accel: Vec<String>,
+    /// The transport the inspector RPC that every workload is timed
+    /// around rode: the serial line is QEMU's 16550 on x86-64 and
+    /// costs an exit per byte, so a number without its transport is
+    /// not comparable to one with (#413).
+    pub(crate) rpc_transport: crate::vm::VmRpcTransport,
 }
 
 #[derive(Debug, Serialize)]
@@ -603,6 +616,7 @@ pub(crate) async fn run_inner(
     client: &mut crate::serial::RpcClient,
     command: &WorkloadBenchCommand,
     provenance: &VmProvenance,
+    vcpus: &VcpuStateCapture,
 ) -> Result<(), WorkloadBenchError> {
     if command.iterations == 0 {
         return Err(WorkloadBenchError::ZeroIterations);
@@ -626,7 +640,7 @@ pub(crate) async fn run_inner(
     let mut failed = Vec::new();
     let mut remaining = workloads.into_iter();
     while let Some(workload) = remaining.next() {
-        let elapsed_ms = match measure_workload(client, &workload, command).await {
+        let elapsed_ms = match measure_workload(client, &workload, command, vcpus).await {
             Ok(elapsed_ms) => elapsed_ms,
             Err(error) if error.guest_panic().is_some() => {
                 // The guest kernel is gone: every further workload would
@@ -711,6 +725,7 @@ async fn measure_workload(
     client: &mut crate::serial::RpcClient,
     workload: &Workload,
     command: &WorkloadBenchCommand,
+    vcpus: &VcpuStateCapture,
 ) -> Result<Vec<f64>, WorkloadBenchError> {
     let mut elapsed_ms = Vec::new();
     for iteration in 1..=command.iterations {
@@ -720,6 +735,7 @@ async fn measure_workload(
                     workload,
                     iteration,
                     command,
+                    vcpus,
                     run_shell_workload(client, workload, command),
                 )
                 .await
@@ -729,6 +745,7 @@ async fn measure_workload(
                     workload,
                     iteration,
                     command,
+                    vcpus,
                     run_program_workload(client, workload, command),
                 )
                 .await
@@ -738,6 +755,7 @@ async fn measure_workload(
                     workload,
                     iteration,
                     command,
+                    vcpus,
                     run_aot_workload(client, workload, iteration),
                 )
                 .await
@@ -746,14 +764,14 @@ async fn measure_workload(
         let output = match attempt {
             Ok(output) => output,
             Err(error) => {
-                write_guest_network_counters(client, workload, iteration).await;
+                write_guest_network_counters(client, workload, iteration, vcpus).await;
                 return Err(error);
             }
         };
         let validation = match validate_output(workload, &output.stdout, &output.stderr) {
             Ok(validation) => validation,
             Err(source) => {
-                write_guest_network_counters(client, workload, iteration).await;
+                write_guest_network_counters(client, workload, iteration, vcpus).await;
                 return Err(WorkloadBenchError::Validation {
                     workload: workload.name.clone(),
                     iteration,
@@ -799,22 +817,26 @@ struct WorkloadOutput {
 /// after it had already succeeded four times.
 ///
 /// When it elapses the iteration's future is dropped, which abandons
-/// the outstanding RPC, and the error propagates out of the run — the
-/// caller tears the guest down with it, so nothing is left executing.
+/// the outstanding RPC, `vcpus` records what the guest's processors
+/// were doing, and the error propagates out of the run — the caller
+/// tears the guest down with it, so nothing is left executing.
 async fn under_deadline(
     workload: &Workload,
     iteration: u16,
     command: &WorkloadBenchCommand,
+    vcpus: &VcpuStateCapture,
     run: impl Future<Output = Result<WorkloadOutput, WorkloadBenchError>>,
 ) -> Result<WorkloadOutput, WorkloadBenchError> {
     let seconds = command.workload_timeout_seconds;
     let Some(result) = crate::runtime::timeout(Duration::from_secs(u64::from(seconds)), run).await
     else {
-        return Err(WorkloadBenchError::WorkloadTimedOut {
+        let timed_out = WorkloadBenchError::WorkloadTimedOut {
             workload: workload.name.clone(),
             iteration,
             seconds,
-        });
+        };
+        vcpus.record(&timed_out).await;
+        return Err(timed_out);
     };
     result
 }
@@ -828,9 +850,14 @@ async fn under_deadline(
 /// the run's last words are the last workload's, and the process sits on
 /// a dead VM until something outside it notices: run 33952047436 spent
 /// ninety-five minutes that way, holding QEMU open behind it.
+///
+/// A step that times out has `vcpus` record what the guest's processors
+/// were doing before the error goes back to the caller; the capture
+/// reports its own failures and never stands in for the timeout.
 pub(crate) async fn guest_step_under_deadline<T, E>(
     step: &'static str,
     seconds: u32,
+    vcpus: &VcpuStateCapture,
     run: impl Future<Output = Result<T, E>>,
 ) -> Result<T, E>
 where
@@ -838,7 +865,9 @@ where
 {
     let Some(result) = crate::runtime::timeout(Duration::from_secs(u64::from(seconds)), run).await
     else {
-        return Err(WorkloadBenchError::GuestStepTimedOut { step, seconds }.into());
+        let timed_out = WorkloadBenchError::GuestStepTimedOut { step, seconds };
+        vcpus.record(&timed_out).await;
+        return Err(timed_out.into());
     };
     result
 }
@@ -1367,11 +1396,13 @@ async fn write_guest_network_counters(
     client: &mut crate::serial::RpcClient,
     workload: &Workload,
     iteration: u16,
+    vcpus: &VcpuStateCapture,
 ) {
     use std::io::Write as _;
     let sample = guest_step_under_deadline(
         "network counters",
         NETWORK_COUNTER_DEADLINE_SECONDS,
+        vcpus,
         async { Ok::<_, WorkloadBenchError>(crate::system::fetch_stats(client).await?) },
     )
     .await;
@@ -1549,6 +1580,7 @@ mod tests {
             keep_going: false,
             profile_output: None,
             kernel_profile_output: None,
+            instruction_profile_output: None,
             user_profile_output: None,
             perf_metrics_output: None,
             llvm_raw_profile_output: None,
@@ -1612,6 +1644,7 @@ mod tests {
             keep_going: false,
             profile_output: None,
             kernel_profile_output: None,
+            instruction_profile_output: None,
             user_profile_output: None,
             perf_metrics_output: None,
             llvm_raw_profile_output: None,
@@ -1642,6 +1675,7 @@ mod tests {
             keep_going: false,
             profile_output: None,
             kernel_profile_output: None,
+            instruction_profile_output: None,
             user_profile_output: None,
             perf_metrics_output: None,
             llvm_raw_profile_output: None,
@@ -1705,11 +1739,25 @@ mod tests {
             keep_going: false,
             profile_output: None,
             kernel_profile_output: None,
+            instruction_profile_output: None,
             user_profile_output: None,
             perf_metrics_output: None,
             llvm_raw_profile_output: None,
             workload_timeout_seconds,
         }
+    }
+
+    /// A capture with a QMP socket nobody is listening on: every
+    /// attempt fails to connect, which is the failure that must not
+    /// replace the timeout it was taken for.
+    fn unreachable_vcpu_capture(runtime: &Path) -> VcpuStateCapture {
+        VcpuStateCapture::new(
+            crate::vm::VmArch::X86_64,
+            Some(runtime.join("no-qemu-is-listening.sock")),
+            runtime,
+            None,
+            runtime.join("kernel"),
+        )
     }
 
     fn timeout_test_workload(name: &str) -> Workload {
@@ -1744,10 +1792,14 @@ mod tests {
         let command = timeout_test_command(1);
         let workload = timeout_test_workload("tcp-throughput");
 
+        let runtime = tempfile::tempdir().expect("a scratch runtime directory");
+        let vcpus = unreachable_vcpu_capture(runtime.path());
+
         let timed_out = crate::runtime::block_on(under_deadline(
             &workload,
             3,
             &command,
+            &vcpus,
             std::future::pending(),
         ))
         .expect_err("a workload that never answers must fail rather than hang");
@@ -1771,10 +1823,14 @@ mod tests {
         let command = timeout_test_command(DEFAULT_WORKLOAD_TIMEOUT_SECONDS);
         let workload = timeout_test_workload("process-startup");
 
+        let runtime = tempfile::tempdir().expect("a scratch runtime directory");
+        let vcpus = unreachable_vcpu_capture(runtime.path());
+
         let output = crate::runtime::block_on(under_deadline(
             &workload,
             1,
             &command,
+            &vcpus,
             std::future::ready(Ok(WorkloadOutput {
                 elapsed_ms: 24.375,
                 stdout: b"process-startup:ok\n".to_vec(),
@@ -1850,9 +1906,13 @@ mod tests {
     /// recorded, holding QEMU open behind it.
     #[test]
     fn a_guest_step_that_never_answers_is_failed_by_name() {
+        let runtime = tempfile::tempdir().expect("a scratch runtime directory");
+        let vcpus = unreachable_vcpu_capture(runtime.path());
+
         let timed_out = crate::runtime::block_on(guest_step_under_deadline(
             "the final profile read",
             1,
+            &vcpus,
             std::future::pending::<Result<(), WorkloadBenchError>>(),
         ))
         .expect_err("a guest step that never answers must fail rather than hang");

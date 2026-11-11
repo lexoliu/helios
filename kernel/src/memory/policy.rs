@@ -52,6 +52,8 @@
 
 use core::ops::Range;
 
+use helios_hal::pmm::PhysFrame;
+
 /// Working room the kernel heap holds at boot on top of its reserve.
 ///
 /// All it has to do is carry the kernel from its first allocation to
@@ -225,12 +227,19 @@ const fn align_up_saturating(value: usize, align: usize) -> usize {
     }
 }
 
+/// `value` rounded down to a multiple of `align`, a power of two.
+const fn align_down(value: usize, align: usize) -> usize {
+    value & !(align - 1)
+}
+
 /// One boot memory region as the policy divides it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RegionShares {
     /// The part the kernel heap is seeded with, if any.
     pub kernel: Option<Range<usize>>,
-    /// The part the user pool is seeded with, if any.
+    /// The part the user pool is seeded with, if any. Both ends sit on
+    /// a frame boundary, because the pool hands out whole frames and
+    /// refuses a map that splits one.
     pub user: Option<Range<usize>>,
 }
 
@@ -261,9 +270,14 @@ impl BootRegionSplitter {
         self.kernel_owed_bytes -= kernel_len;
         let kernel = (kernel_len != 0).then(|| start..start + kernel_len);
 
+        // The kernel heap takes byte-granular memory, so its share ends
+        // wherever the owed bytes run out; the pool only takes whole
+        // frames, so its share is trimmed to them at both ends. A
+        // firmware map is free to end a usable region mid-frame.
         let user_start = align_up_saturating(start + kernel_len, USER_POOL_MIN_REGION_BYTES);
-        let user = (user_start < end && end - user_start >= USER_POOL_MIN_REGION_BYTES)
-            .then_some(user_start..end);
+        let user_end = align_down(end, PhysFrame::SIZE);
+        let user = (user_start < user_end && user_end - user_start >= USER_POOL_MIN_REGION_BYTES)
+            .then_some(user_start..user_end);
 
         RegionShares { kernel, user }
     }
@@ -436,13 +450,46 @@ mod tests {
                     assert!(kernel.start == start && kernel.end <= end);
                 }
                 if let Some(user) = &shares.user {
-                    assert!(user.start >= start && user.end == end);
+                    assert!(user.start >= start && user.end <= end);
                     assert!(
                         shares
                             .kernel
                             .as_ref()
                             .is_none_or(|kernel| kernel.end <= user.start),
                         "the two shares overlapped"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The user share is what `FramePool::initialize` is handed, and
+    /// that pool refuses a range that does not start and end on a frame
+    /// boundary (#446). The kernel's boot share is byte-granular and
+    /// lands wherever the plan's arithmetic puts it, and a firmware map
+    /// may end a region mid-frame, so neither end of a region decides
+    /// the user share's alignment.
+    #[test]
+    fn the_user_share_is_whole_frames_whatever_the_region() {
+        for usable in [TWO_GIB_USABLE, SIX_GIB_USABLE] {
+            let plan = BootMemoryPlan::for_usable_bytes(usable);
+            for start_slack in [0_usize, 1, PhysFrame::SIZE - 1] {
+                for end_slack in [0_usize, 1, PhysFrame::SIZE - 1] {
+                    let start = 0x4000_0000 + start_slack;
+                    let end = 0x4000_0000 + usable + end_slack;
+                    let shares = plan.splitter().split(start, end);
+                    let kernel = shares.kernel.expect("the region funds the kernel share");
+                    assert_eq!(kernel.end - kernel.start, plan.kernel_boot_bytes);
+                    let user = shares.user.expect("the region has a user share");
+                    assert!(
+                        user.start.is_multiple_of(PhysFrame::SIZE)
+                            && user.end.is_multiple_of(PhysFrame::SIZE),
+                        "user share {user:#x?} of {start:#x}..{end:#x} splits a frame"
+                    );
+                    assert!(kernel.end <= user.start && user.end <= end);
+                    assert!(
+                        end - user.end < PhysFrame::SIZE,
+                        "the trim took a whole frame"
                     );
                 }
             }

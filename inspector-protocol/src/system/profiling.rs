@@ -1,6 +1,7 @@
 pub use super::bindings::helios::system::profiling::{
-    Filter, FoldedSample, MetricFilter, MetricSample, MonoNanos, ProfileSection, RawProfileError,
-    Scope,
+    Filter, FoldedSample, InstructionProfile, InstructionProfileError, InstructionSample,
+    MetricFilter, MetricSample, MonoNanos, ProfileSection, RawProfileError, SampledCode, Scope,
+    WasmFunction,
 };
 
 #[cfg(feature = "host")]
@@ -8,8 +9,9 @@ mod host {
     use super::*;
     use crate::error::{RpcError, TransportError};
     use crate::system::methods::{
-        PROFILING_CLEAR, PROFILING_FOLDED, PROFILING_INSTANCE, PROFILING_METRICS,
-        PROFILING_RAW_PROFILE_READ, PROFILING_RAW_PROFILE_SIZE, PROFILING_SET_ENABLED,
+        PROFILING_CLEAR, PROFILING_FOLDED, PROFILING_INSTANCE, PROFILING_INSTRUCTION_SAMPLES,
+        PROFILING_METRICS, PROFILING_RAW_PROFILE_READ, PROFILING_RAW_PROFILE_SIZE,
+        PROFILING_SET_ENABLED, PROFILING_SET_INSTRUCTION_SAMPLING,
     };
     use crate::transport::Client;
     use futures_io::{AsyncRead, AsyncWrite};
@@ -107,6 +109,69 @@ mod host {
         postcard::from_bytes(&bytes).map_err(|source| RpcError::Decode {
             instance: PROFILING_INSTANCE,
             func: PROFILING_METRICS,
+            source,
+        })
+    }
+
+    /// Starts or stops the guest kernel's instruction-address sampling,
+    /// independently of [`set_enabled`]. Starting discards an earlier
+    /// run's samples.
+    pub async fn set_instruction_sampling<R, W>(
+        client: &Client<R, W>,
+        enabled: bool,
+    ) -> Result<Result<(), InstructionProfileError>, RpcError>
+    where
+        R: AsyncRead + Send + Unpin + 'static,
+        W: AsyncWrite + Send + Unpin + 'static,
+    {
+        let request = postcard::to_allocvec(&enabled).map_err(|source| RpcError::Encode {
+            instance: PROFILING_INSTANCE,
+            func: PROFILING_SET_INSTRUCTION_SAMPLING,
+            source,
+        })?;
+        let bytes = client
+            .invoke_raw(
+                PROFILING_INSTANCE,
+                PROFILING_SET_INSTRUCTION_SAMPLING,
+                request,
+            )
+            .await
+            .map_err(|source: TransportError| RpcError::Invoke {
+                instance: PROFILING_INSTANCE,
+                func: PROFILING_SET_INSTRUCTION_SAMPLING,
+                source,
+            })?;
+        postcard::from_bytes(&bytes).map_err(|source| RpcError::Decode {
+            instance: PROFILING_INSTANCE,
+            func: PROFILING_SET_INSTRUCTION_SAMPLING,
+            source,
+        })
+    }
+
+    /// Asks the guest for the instruction addresses its kernel sampled
+    /// since sampling last started.
+    pub async fn instruction_samples<R, W>(
+        client: &Client<R, W>,
+    ) -> Result<Result<InstructionProfile, InstructionProfileError>, RpcError>
+    where
+        R: AsyncRead + Send + Unpin + 'static,
+        W: AsyncWrite + Send + Unpin + 'static,
+    {
+        let bytes = client
+            .invoke_raw(
+                PROFILING_INSTANCE,
+                PROFILING_INSTRUCTION_SAMPLES,
+                Vec::new(),
+            )
+            .await
+            .map_err(|source: TransportError| RpcError::Invoke {
+                instance: PROFILING_INSTANCE,
+                func: PROFILING_INSTRUCTION_SAMPLES,
+                source,
+            })?;
+        postcard::from_bytes(&bytes).map_err(|source| RpcError::Decode {
+            instance: PROFILING_INSTANCE,
+            func: PROFILING_INSTRUCTION_SAMPLES,
             source,
         })
     }

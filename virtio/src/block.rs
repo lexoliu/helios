@@ -774,7 +774,7 @@ impl<T: VirtioTransport, C: QueueAffinity> VirtioBlockDevice<T, C> {
         let used = await_completion(&queue.inflight, &queue.queue, token, || {
             self.interrupts.notified()
         })
-        .await;
+        .await?;
         self.counters.count(kind);
         Ok(used)
     }

@@ -55,7 +55,11 @@ pub(crate) fn install(
     let transport = HostFsTransportService {
         device: Arc::new(device),
     };
-    debug_state.install_host_fs_service(HostFileSystemService::new(transport.clone(), cpu.clone()));
+    debug_state.install_host_fs_service(HostFileSystemService::new(
+        transport.clone(),
+        cpu.clone(),
+        debug_state.profiles(),
+    ));
     tracing::info!(
         "virtio 9p online transport=pci function={address} msix_vector={vector:#x} mount_tag={}",
         transport.device.mount_tag()

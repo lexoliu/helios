@@ -1,7 +1,9 @@
 //! Cooperative async execution and time-related primitives.
 //!
 //! `executor` and `task` carry the per-CPU run-queue executor and
-//! its task-spawning surface. `sync` provides async-aware mutex /
+//! its task-spawning surface. `idle` holds the per-processor
+//! haltpoll handshake behind `Executor::park_until_work`. `sync`
+//! provides async-aware mutex /
 //! rwlock / notify primitives. `timer` exposes the timing wheel and
 //! the Sleep future. `time` provides the kernel monotonic clock.
 //! `compaction` runs the periodic memory-pressure scan; `observer`
@@ -9,8 +11,10 @@
 
 mod compaction;
 mod executor;
+mod idle;
 mod in_flight;
 mod observer;
+pub(crate) mod phases;
 mod sync;
 mod task;
 mod time;
@@ -27,6 +31,7 @@ pub use executor::{
     Executor, ExecutorRunStats, InstanceSpawner, JoinHandle, LocalJoinHandle, READY_BATCH_TASKS,
     Spawner, TaskCapacityError, TaskFunding,
 };
+pub use idle::IdleOutcome;
 pub use in_flight::InFlight;
 pub use observer::{
     DEFAULT_PERF_METRIC_CAPACITY, DEFAULT_PROFILE_STACK_CAPACITY, DEFAULT_TRACE_HISTORY_CAPACITY,
@@ -43,7 +48,6 @@ pub use sync::{
 };
 pub use task::{YieldNow, yield_now};
 pub use time::{
-    KernelClock, UptimeClock, duration_to_ticks, elapsed_millis, monotonic_nanos,
-    nanos_to_ticks_ceil_saturating, ticks_to_nanos, wall_clock_offset_nanos,
+    KernelClock, UptimeClock, elapsed_millis, monotonic_nanos, wall_clock_offset_nanos,
 };
-pub use timer::{Sleep, Timer};
+pub use timer::{GUEST_TIME_SLICE, Sleep, Timer};

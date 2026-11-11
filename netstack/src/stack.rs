@@ -52,6 +52,10 @@ const IPV4_MAX_REASSEMBLED_PACKET_LEN: usize = u16::MAX as usize;
 const IPV4_MAX_REASSEMBLED_PAYLOAD_LEN: usize =
     IPV4_MAX_REASSEMBLED_PACKET_LEN - Ipv4Packet::MIN_HEADER_LEN;
 const IPV4_REASSEMBLY_TIMEOUT_NANOS: u64 = 30_000_000_000;
+/// What one cached fragment costs beyond its payload: the record the entry
+/// keeps for it. Charged against [`MAX_IPV4_REASSEMBLY_BYTES`] so a flood of
+/// tiny fragments is bounded by the budget in count as well as in bytes.
+const IPV4_FRAGMENT_BOOKKEEPING_BYTES: usize = core::mem::size_of::<Ipv4Fragment>();
 // Keep common small application datagrams out of the heap without moving a
 // large inline block through the bounded receive queue.
 // The previous path allocated one `Bytes` object per received UDP packet;
@@ -377,6 +381,77 @@ pub struct NeighborEntry {
     pub updated_at: StackInstant,
 }
 
+/// A bounded neighbor cache.
+///
+/// Holds at most [`MAX_NEIGHBORS`] entries and never refuses an
+/// insertion: when full, a new address displaces the entry that is cheapest
+/// to lose. A pinned entry (a next hop the routes depend on) outlasts every
+/// unpinned one, then an in-flight resolution goes before a resolved entry,
+/// a stale one before a live one, and the least recently updated before the
+/// most recent. A resolved entry that is evicted costs one more ARP or
+/// Neighbor Discovery exchange the next time it is needed.
+///
+/// Concurrency: a plain value with no interior mutability. A stack owns one
+/// (so does exactly one shard), and the control plane keeps its own copy
+/// behind a snapshot cell.
+#[derive(Clone, Debug, Default)]
+pub struct NeighborCache {
+    entries: ArrayVec<NeighborEntry, MAX_NEIGHBORS>,
+}
+
+impl NeighborCache {
+    pub const fn new() -> Self {
+        Self {
+            entries: ArrayVec::new_const(),
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = NeighborEntry> + '_ {
+        self.entries.iter().copied()
+    }
+
+    pub fn get(&self, ip: IpAddress) -> Option<NeighborEntry> {
+        self.entries.iter().find(|entry| entry.ip == ip).copied()
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    /// Inserts or replaces the entry for `entry.ip`, evicting when full.
+    /// `pinned` names the addresses that must outlast every other entry.
+    pub fn learn(&mut self, entry: NeighborEntry, pinned: impl Fn(IpAddress) -> bool) {
+        if let Some(existing) = self.entries.iter_mut().find(|e| e.ip == entry.ip) {
+            *existing = entry;
+            return;
+        }
+        let Err(full) = self.entries.try_push(entry) else {
+            return;
+        };
+        let victim = self.entries.iter_mut().min_by_key(|candidate| {
+            let rank = match candidate.state {
+                NeighborState::Incomplete => 0u8,
+                NeighborState::Stale => 1,
+                NeighborState::Probe => 2,
+                NeighborState::Delay => 3,
+                NeighborState::Reachable => 4,
+            };
+            (pinned(candidate.ip), rank, candidate.updated_at)
+        });
+        if let Some(victim) = victim {
+            *victim = full.element();
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Route {
     pub destination: IpCidr,
@@ -384,9 +459,74 @@ pub struct Route {
     pub expires_at: Option<StackInstant>,
 }
 
+/// The instant a lifetime advertised in seconds runs out, or `None` for
+/// the infinite lifetime `0xffff_ffff` (RFC 4861 §4.6.2).
+fn lifetime_deadline(now: StackInstant, seconds: u32) -> Option<StackInstant> {
+    const NANOS_PER_SECOND: u64 = 1_000_000_000;
+    (seconds != u32::MAX).then(|| {
+        StackInstant::from_nanos(
+            now.nanos()
+                .saturating_add(u64::from(seconds) * NANOS_PER_SECOND),
+        )
+    })
+}
+
+/// Routes a Router Advertisement may hold at once. RFC 4861 §6.3.4 lets a
+/// host limit its prefix and default-router lists; half the table keeps
+/// every advertisement a peer can send from displacing the connected
+/// routes of addresses and the static routes the kernel configured.
+pub const MAX_LEARNED_ROUTES: usize = MAX_ROUTES / 2;
+
+/// Where a route came from, which decides who may displace it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RouteOrigin {
+    /// Installed by a local decision: an address the kernel configured, a
+    /// static route. Only another local decision removes it.
+    Local,
+    /// Learned from a Router Advertisement. Bounded by
+    /// [`MAX_LEARNED_ROUTES`], carries the advertised lifetime, and gives
+    /// way to a local route when the table is full.
+    Learned,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RouteEntry {
+    route: Route,
+    origin: RouteOrigin,
+}
+
+impl RouteEntry {
+    fn is_learned(&self) -> bool {
+        self.origin == RouteOrigin::Learned
+    }
+
+    fn same_path(&self, route: &Route) -> bool {
+        self.route.destination == route.destination && self.route.gateway == route.gateway
+    }
+
+    /// Ordering key for displacement: a route with no expiry (an infinite
+    /// lifetime) is the last to go.
+    fn expiry_key(&self) -> u64 {
+        self.route.expires_at.map_or(u64::MAX, StackInstant::nanos)
+    }
+}
+
+/// A bounded route table.
+///
+/// Holds at most [`MAX_ROUTES`] routes. A local route
+/// ([`add`](Self::add)) is refused for lack of room only when no learned
+/// route can be displaced; a learned route ([`learn`](Self::learn)) never
+/// displaces a local one, and at most [`MAX_LEARNED_ROUTES`] of them are
+/// held. When a learned route has to go, the one that expires soonest does
+/// (RFC 4861 §6.3.5 times prefixes and routers out by lifetime), and a new
+/// route that would expire no later than every held one is refused
+/// instead.
+///
+/// Concurrency: a plain value with no interior mutability. A stack owns
+/// one, and the control plane keeps its own copy behind a snapshot cell.
 #[derive(Clone, Debug)]
 pub struct RouteTable {
-    routes: ArrayVec<Route, MAX_ROUTES>,
+    routes: ArrayVec<RouteEntry, MAX_ROUTES>,
 }
 
 impl RouteTable {
@@ -396,39 +536,104 @@ impl RouteTable {
         }
     }
 
+    /// Installs a route from a local decision. When the table is full the
+    /// learned route that expires soonest is displaced; with none to
+    /// displace the route is refused with [`StackError::RouteTableFull`].
+    /// A learned route for the same path becomes local.
     pub fn add(&mut self, route: Route) -> Result<(), StackError> {
-        if self.routes.iter().any(|existing| {
-            existing.destination == route.destination && existing.gateway == route.gateway
-        }) {
+        if let Some(existing) = self.routes.iter_mut().find(|entry| entry.same_path(&route)) {
+            if existing.is_learned() {
+                *existing = RouteEntry {
+                    route,
+                    origin: RouteOrigin::Local,
+                };
+            }
             return Ok(());
         }
+        let entry = RouteEntry {
+            route,
+            origin: RouteOrigin::Local,
+        };
+        let Err(full) = self.routes.try_push(entry) else {
+            return Ok(());
+        };
+        let victim = self
+            .routes
+            .iter_mut()
+            .filter(|candidate| candidate.is_learned())
+            .min_by_key(|candidate| candidate.expiry_key())
+            .ok_or(StackError::RouteTableFull)?;
+        *victim = full.element();
+        Ok(())
+    }
+
+    /// Records a route learned from a Router Advertisement. A route for a
+    /// path that is already held has its lifetime refreshed (RFC 4861
+    /// §6.3.4) unless a local route owns the path.
+    pub fn learn(&mut self, route: Route) -> Result<(), StackError> {
+        if let Some(existing) = self.routes.iter_mut().find(|entry| entry.same_path(&route)) {
+            if existing.is_learned() {
+                existing.route.expires_at = route.expires_at;
+            }
+            return Ok(());
+        }
+        let entry = RouteEntry {
+            route,
+            origin: RouteOrigin::Learned,
+        };
+        let learned = self.routes.iter().filter(|e| e.is_learned()).count();
+        if learned < MAX_LEARNED_ROUTES {
+            return self
+                .routes
+                .try_push(entry)
+                .map_err(|_| StackError::RouteTableFull);
+        }
+        let victim = self
+            .routes
+            .iter_mut()
+            .filter(|candidate| candidate.is_learned())
+            .min_by_key(|candidate| candidate.expiry_key())
+            .ok_or(StackError::RouteTableFull)?;
+        if entry.expiry_key() <= victim.expiry_key() {
+            return Err(StackError::RouteTableFull);
+        }
+        *victim = entry;
+        Ok(())
+    }
+
+    /// Withdraws a route a Router Advertisement announced (a default
+    /// router whose lifetime is zero, RFC 4861 §6.3.4). A local route for
+    /// the same path is not the network's to remove.
+    pub fn withdraw_learned(&mut self, route: Route) {
         self.routes
-            .try_push(route)
-            .map_err(|_| StackError::InconsistentState)
+            .retain(|entry| !(entry.is_learned() && entry.same_path(&route)));
+    }
+
+    /// Drops every learned route whose lifetime has run out at `now`.
+    pub fn expire_learned(&mut self, now: StackInstant) {
+        self.routes.retain(|entry| {
+            !(entry.is_learned() && entry.route.expires_at.is_some_and(|at| at <= now))
+        });
     }
 
     pub fn remove(&mut self, route: Route) {
-        if let Some(index) = self.routes.iter().position(|existing| {
-            existing.destination == route.destination && existing.gateway == route.gateway
-        }) {
+        if let Some(index) = self.routes.iter().position(|entry| entry.same_path(&route)) {
             self.routes.remove(index);
         }
     }
 
     pub fn clear_ipv4(&mut self) {
         self.routes
-            .retain(|route| !matches!(route.destination, IpCidr::Ipv4(_)));
+            .retain(|entry| !matches!(entry.route.destination, IpCidr::Ipv4(_)));
     }
 
     pub fn clear_ipv6(&mut self) {
         self.routes
-            .retain(|route| !matches!(route.destination, IpCidr::Ipv6(_)));
+            .retain(|entry| !matches!(entry.route.destination, IpCidr::Ipv6(_)));
     }
 
     pub fn resolve(&self, destination: IpAddress) -> Option<Route> {
-        self.routes
-            .iter()
-            .copied()
+        self.iter()
             .filter(|route| match (route.destination, destination) {
                 (IpCidr::Ipv4(cidr), IpAddress::Ipv4(address)) => cidr.contains(address),
                 (IpCidr::Ipv6(cidr), IpAddress::Ipv6(address)) => cidr.contains(address),
@@ -441,7 +646,31 @@ impl RouteTable {
     }
 
     pub fn iter(&self) -> impl Iterator<Item = Route> + '_ {
-        self.routes.iter().copied()
+        self.routes.iter().map(|entry| entry.route)
+    }
+
+    pub fn len(&self) -> usize {
+        self.routes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.routes.is_empty()
+    }
+
+    /// Whether some route names `address` as its gateway.
+    pub fn is_gateway(&self, address: IpAddress) -> bool {
+        self.routes
+            .iter()
+            .any(|entry| entry.route.gateway == Some(address))
+    }
+
+    /// Whether `address` is reachable without a router: a gateway is by
+    /// definition, and so is any address a connected route covers.
+    pub fn is_on_link(&self, address: IpAddress) -> bool {
+        self.is_gateway(address)
+            || self
+                .resolve(address)
+                .is_some_and(|route| route.gateway.is_none())
     }
 }
 
@@ -751,7 +980,28 @@ pub enum TcpReadIntoState {
     Closed(TcpCloseKind),
 }
 
+/// The send-side twin of [`TcpReadState`]: what a probe of a socket's
+/// send path found.
+///
+/// `Pending` is the one answer that changes without the connection
+/// ending — the transmit queue is full and the next drain frees it, so
+/// a waiter parks. `Room` carries the bytes a write may queue right
+/// now. `Closed` is every state that can no longer send — including the
+/// FIN this side's `tcp_shutdown_send` queued — and carries how the
+/// connection got there, so a caller reports a reset differently from a
+/// local close.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TcpSendState {
+    Pending,
+    Room(usize),
+    Closed(TcpCloseKind),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "an advertisement's configuration is inline so the event queue stays allocation-free; one is queued per Router Advertisement"
+)]
 pub enum StackEvent {
     DhcpConfigured(DhcpLease),
     /// A Router Advertisement completed stateless autoconfiguration.
@@ -897,10 +1147,13 @@ struct Ipv4ReassemblyKey {
     identification: u16,
 }
 
+/// One cached fragment. It owns a copy of its payload: the frame it arrived
+/// in is the driver's receive buffer on loan for one receive pass, and a
+/// fragment can sit here for [`IPV4_REASSEMBLY_TIMEOUT_NANOS`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Ipv4Fragment {
     offset: usize,
-    bytes: Bytes,
+    bytes: Box<[u8]>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1057,7 +1310,7 @@ impl Ipv4Fragment {
     }
 
     fn range_matches(&self, offset: usize, bytes: &[u8]) -> bool {
-        self.offset == offset && self.bytes.len() == bytes.len() && self.bytes.as_ref() == bytes
+        self.offset == offset && *self.bytes == *bytes
     }
 
     fn overlaps(&self, offset: usize, end: usize) -> bool {
@@ -1090,9 +1343,9 @@ impl Ipv4ReassemblyEntry {
         &mut self,
         packet: Ipv4Packet<'_>,
         packet_bytes: &[u8],
-        payload_bytes: Bytes,
         now: StackInstant,
     ) -> Ipv4FragmentInsert {
+        let payload_bytes = packet.payload;
         let offset = usize::from(packet.fragment_offset_blocks) * IPV4_FRAGMENT_BLOCK_SIZE;
         let end = offset
             .checked_add(payload_bytes.len())
@@ -1100,7 +1353,7 @@ impl Ipv4ReassemblyEntry {
         if self
             .fragments
             .iter()
-            .any(|fragment| fragment.range_matches(offset, payload_bytes.as_ref()))
+            .any(|fragment| fragment.range_matches(offset, payload_bytes))
         {
             if offset == 0
                 && self.has_header()
@@ -1126,7 +1379,10 @@ impl Ipv4ReassemblyEntry {
         {
             return Ipv4FragmentInsert::Invalid;
         }
-        let mut added_bytes = payload_bytes.len();
+        let mut added_bytes = payload_bytes
+            .len()
+            .checked_add(IPV4_FRAGMENT_BOOKKEEPING_BYTES)
+            .unwrap_or_else(|| panic!("IPv4 reassembly cached byte count overflowed"));
         if offset == 0 {
             if self.has_header() {
                 return Ipv4FragmentInsert::Invalid;
@@ -1155,7 +1411,7 @@ impl Ipv4ReassemblyEntry {
         }
         self.fragments.push(Ipv4Fragment {
             offset,
-            bytes: payload_bytes,
+            bytes: Box::from(payload_bytes),
         });
         self.fragments.sort_by_key(|fragment| fragment.offset);
         self.cached_bytes = self
@@ -1198,7 +1454,7 @@ impl Ipv4ReassemblyEntry {
             let end = start
                 .checked_add(fragment.bytes.len())
                 .unwrap_or_else(|| panic!("IPv4 reassembled fragment end overflowed"));
-            packet[start..end].copy_from_slice(fragment.bytes.as_ref());
+            packet[start..end].copy_from_slice(&fragment.bytes);
         }
         packet[2..4].copy_from_slice(&total_len_u16.to_be_bytes());
         packet[6..8].copy_from_slice(&0u16.to_be_bytes());
@@ -1246,7 +1502,6 @@ impl Ipv4ReassemblyCache {
         &mut self,
         packet: Ipv4Packet<'_>,
         packet_bytes: &[u8],
-        payload_bytes: Bytes,
         now: StackInstant,
     ) -> Ipv4ReassemblyResult {
         self.expire(now);
@@ -1257,7 +1512,7 @@ impl Ipv4ReassemblyCache {
         let key = Ipv4ReassemblyKey::new(packet);
         let fragment_offset = usize::from(packet.fragment_offset_blocks) * IPV4_FRAGMENT_BLOCK_SIZE;
         let fragment_end = fragment_offset
-            .checked_add(payload_bytes.len())
+            .checked_add(packet.payload.len())
             .unwrap_or_else(|| panic!("validated IPv4 fragment offset overflowed"));
         if fragment_end > IPV4_MAX_REASSEMBLED_PAYLOAD_LEN {
             self.remove_key(key);
@@ -1272,14 +1527,16 @@ impl Ipv4ReassemblyCache {
             } else {
                 0
             };
-        let expected_added = payload_bytes
+        let expected_added = packet
+            .payload
             .len()
             .checked_add(header_added)
+            .and_then(|bytes| bytes.checked_add(IPV4_FRAGMENT_BOOKKEEPING_BYTES))
             .unwrap_or_else(|| panic!("IPv4 reassembly expected byte count overflowed"));
         if !self.make_room_for(index, expected_added) {
             return Ipv4ReassemblyResult::CacheFull;
         }
-        let insert = self.entries[index].insert_fragment(packet, packet_bytes, payload_bytes, now);
+        let insert = self.entries[index].insert_fragment(packet, packet_bytes, now);
         match insert {
             Ipv4FragmentInsert::Duplicate => Ipv4ReassemblyResult::NeedMoreFragments,
             Ipv4FragmentInsert::Invalid => {
@@ -1314,6 +1571,22 @@ impl Ipv4ReassemblyCache {
                 self.remove_index(index);
             }
         }
+    }
+
+    /// When the entry that expires first does, or `None` with nothing
+    /// cached. The stack's timer path wakes for it, so a fragment never
+    /// outlives its timeout for want of another arrival.
+    fn next_deadline(&self) -> Option<StackInstant> {
+        self.entries
+            .iter()
+            .map(|entry| {
+                entry
+                    .updated_at
+                    .nanos()
+                    .saturating_add(IPV4_REASSEMBLY_TIMEOUT_NANOS)
+            })
+            .min()
+            .map(StackInstant::from_nanos)
     }
 
     fn expire(&mut self, now: StackInstant) {
@@ -2106,7 +2379,7 @@ where
     /// option, the IPv6 counterpart of the DHCPv4 lease's DNS servers.
     ipv6_dns_servers: Ipv6DnsServers,
     ipv4_multicast_memberships: ArrayVec<Ipv4MulticastMembership, MAX_IPV4_MULTICAST_MEMBERSHIPS>,
-    neighbors: ArrayVec<NeighborEntry, MAX_NEIGHBORS>,
+    neighbors: NeighborCache,
     outbound: OutboundFrameQueue,
     events: Deque<StackEvent, MAX_STACK_EVENTS>,
     udp: UdpSocketSlab,
@@ -2498,7 +2771,7 @@ where
             ipv6_discovery: NeighborDiscovery::new(),
             ipv6_dns_servers: Ipv6DnsServers::new(),
             ipv4_multicast_memberships: ArrayVec::new(),
-            neighbors: ArrayVec::new(),
+            neighbors: NeighborCache::new(),
             outbound: OutboundFrameQueue::new(),
             events: Deque::new(),
             udp: UdpSocketSlab::new(),
@@ -2574,30 +2847,25 @@ where
     }
 
     pub fn neighbors(&self) -> impl Iterator<Item = NeighborEntry> + '_ {
-        self.neighbors.iter().copied()
+        self.neighbors.iter()
     }
 
+    /// Replaces the cache with `neighbors`, keeping the entries the cache
+    /// would keep when the list is longer than its capacity. Routes are
+    /// replaced first so a gateway's entry is the one that survives.
     pub fn replace_neighbors(&mut self, neighbors: impl IntoIterator<Item = NeighborEntry>) {
         self.neighbors.clear();
+        let routes = &self.routes;
         for entry in neighbors {
             self.neighbors
-                .try_push(entry)
-                .unwrap_or_else(|_| panic!("neighbor table is full"));
+                .learn(entry, |address| routes.is_gateway(address));
         }
     }
 
     pub fn learn_neighbor(&mut self, entry: NeighborEntry) {
-        if let Some(existing) = self
-            .neighbors
-            .iter_mut()
-            .find(|existing| existing.ip == entry.ip)
-        {
-            *existing = entry;
-        } else {
-            self.neighbors
-                .try_push(entry)
-                .unwrap_or_else(|_| panic!("neighbor table is full"));
-        }
+        let routes = &self.routes;
+        self.neighbors
+            .learn(entry, |address| routes.is_gateway(address));
         Self::push_event_into(&mut self.events, StackEvent::NeighborUpdated(entry));
     }
 
@@ -2605,17 +2873,11 @@ where
     /// cached link-layer address when `override_cache` is set.
     ///
     /// RFC 4861 §7.2.5: an observation that does not carry the override
-    /// bit — a Neighbor Advertisement without it, or a passively
-    /// observed data frame, which carries no NDP flags at all — may
-    /// create a cache entry or refresh a matching one, but must leave a
-    /// resolved entry with a different address alone.
+    /// bit — a Neighbor Advertisement without it — may create a cache
+    /// entry or refresh a matching one, but must leave a resolved entry
+    /// with a different address alone.
     fn learn_neighbor_without_override(&mut self, entry: NeighborEntry, override_cache: bool) {
-        let cached = self
-            .neighbors
-            .iter()
-            .find(|existing| existing.ip == entry.ip)
-            .copied();
-        match cached {
+        match self.neighbors.get(entry.ip) {
             Some(cached)
                 if cached.state != NeighborState::Incomplete
                     && cached.mac != entry.mac
@@ -2624,19 +2886,23 @@ where
         }
     }
 
-    pub fn add_ipv4_address(&mut self, address: Ipv4Cidr) {
-        if !self.ipv4_addresses.contains(&address) {
-            self.ipv4_addresses
-                .try_push(address)
-                .unwrap_or_else(|_| panic!("IPv4 address table is full"));
-            self.routes
-                .add(Route {
-                    destination: IpCidr::Ipv4(address),
-                    gateway: None,
-                    expires_at: None,
-                })
-                .unwrap_or_else(|_| panic!("route table is full"));
+    /// Adds an address and its connected route, or fails without changing
+    /// either table when one is full.
+    pub fn add_ipv4_address(&mut self, address: Ipv4Cidr) -> Result<(), StackError> {
+        if self.ipv4_addresses.contains(&address) {
+            return Ok(());
         }
+        if self.ipv4_addresses.is_full() {
+            return Err(StackError::AddressTableFull);
+        }
+        self.routes.add(Route {
+            destination: IpCidr::Ipv4(address),
+            gateway: None,
+            expires_at: None,
+        })?;
+        self.ipv4_addresses
+            .try_push(address)
+            .map_err(|_| StackError::AddressTableFull)
     }
 
     pub fn remove_ipv4_address(&mut self, address: Ipv4Cidr) {
@@ -2646,13 +2912,27 @@ where
             .position(|existing| *existing == address)
         {
             self.ipv4_addresses.remove(index);
+            self.remove_connected_route(IpCidr::Ipv4(address));
             self.ipv4_multicast_memberships
                 .retain(|membership| membership.interface != address.address());
             self.prune_ipv4_reassembly_destinations();
         }
     }
 
+    /// Removes the connected route an address installed, so that an
+    /// address that comes and goes does not leave its route behind.
+    fn remove_connected_route(&mut self, destination: IpCidr) {
+        self.routes.remove(Route {
+            destination,
+            gateway: None,
+            expires_at: None,
+        });
+    }
+
     pub fn clear_ipv4_addresses(&mut self) {
+        for address in self.ipv4_addresses.clone() {
+            self.remove_connected_route(IpCidr::Ipv4(address));
+        }
         self.ipv4_addresses.clear();
         self.ipv4_multicast_memberships.clear();
         self.ipv4_reassembly.retain_destinations(|_| false);
@@ -2722,19 +3002,23 @@ where
         self.ipv4_multicast_memberships.iter().copied()
     }
 
-    pub fn add_ipv6_address(&mut self, address: Ipv6Cidr) {
-        if !self.ipv6_addresses.contains(&address) {
-            self.ipv6_addresses
-                .try_push(address)
-                .unwrap_or_else(|_| panic!("IPv6 address table is full"));
-            self.routes
-                .add(Route {
-                    destination: IpCidr::Ipv6(address),
-                    gateway: None,
-                    expires_at: None,
-                })
-                .unwrap_or_else(|_| panic!("route table is full"));
+    /// Adds an address and its connected route, or fails without changing
+    /// either table when one is full.
+    pub fn add_ipv6_address(&mut self, address: Ipv6Cidr) -> Result<(), StackError> {
+        if self.ipv6_addresses.contains(&address) {
+            return Ok(());
         }
+        if self.ipv6_addresses.is_full() {
+            return Err(StackError::AddressTableFull);
+        }
+        self.routes.add(Route {
+            destination: IpCidr::Ipv6(address),
+            gateway: None,
+            expires_at: None,
+        })?;
+        self.ipv6_addresses
+            .try_push(address)
+            .map_err(|_| StackError::AddressTableFull)
     }
 
     pub fn remove_ipv6_address(&mut self, address: Ipv6Cidr) {
@@ -2744,10 +3028,14 @@ where
             .position(|existing| *existing == address)
         {
             self.ipv6_addresses.remove(index);
+            self.remove_connected_route(IpCidr::Ipv6(address));
         }
     }
 
     pub fn clear_ipv6_addresses(&mut self) {
+        for address in self.ipv6_addresses.clone() {
+            self.remove_connected_route(IpCidr::Ipv6(address));
+        }
         self.ipv6_addresses.clear();
     }
 
@@ -2796,13 +3084,13 @@ where
     /// Neighbor Discovery: it is the source address of the router
     /// solicitations that start autoconfiguration, so the embedding
     /// kernel calls this once the interface's hardware address is known.
-    pub fn configure_ipv6_link_local(&mut self) -> Ipv6Cidr {
+    pub fn configure_ipv6_link_local(&mut self) -> Result<Ipv6Cidr, StackError> {
         let address = Ipv6Cidr::new(
             Ipv6Address::link_local_from_mac(self.config.mac),
             Ipv6Address::LINK_LOCAL_PREFIX_LEN,
         );
-        self.add_ipv6_address(address);
-        address
+        self.add_ipv6_address(address)?;
+        Ok(address)
     }
 
     /// The interface's link-local address, if one has been configured.
@@ -2851,6 +3139,7 @@ where
     /// Solicitation stops once an advertisement arrives, so steady-state
     /// calls are free.
     pub fn drive_ipv6_autoconfig(&mut self, now: StackInstant) -> Result<(), StackError> {
+        self.routes.expire_learned(now);
         if !self.ipv6_discovery.poll_solicitation(now) {
             return Ok(());
         }
@@ -2920,35 +3209,40 @@ where
             });
         }
 
+        self.routes.expire_learned(now);
+
         for prefix in configuration.on_link_prefixes.iter().copied() {
             // A connected route: on-link destinations resolve through
-            // Neighbor Discovery rather than the router.
-            let _ = self.routes.add(Route {
-                destination: IpCidr::Ipv6(prefix),
+            // Neighbor Discovery rather than the router. It lives for
+            // the prefix's valid lifetime (RFC 4861 §6.3.4).
+            let route = Route {
+                destination: IpCidr::Ipv6(prefix.prefix),
                 gateway: None,
-                expires_at: None,
-            });
+                expires_at: lifetime_deadline(now, prefix.valid_lifetime_seconds),
+            };
+            if let Err(error) = self.routes.learn(route) {
+                tracing::debug!(?route, ?error, "advertised on-link prefix not retained");
+            }
         }
 
         for address in configuration.addresses.iter().copied() {
             // A router that keeps advertising fresh prefixes must not be
             // able to overflow a fixed table, so a full table drops the
             // new address instead of asserting.
-            if self.ipv6_addresses.is_full() && !self.ipv6_addresses.contains(&address) {
-                continue;
+            if let Err(error) = self.add_ipv6_address(address) {
+                tracing::debug!(?address, ?error, "advertised address not configured");
             }
-            self.add_ipv6_address(address);
         }
 
         let default_route = Route {
             destination: IpCidr::Ipv6(Ipv6Cidr::new(Ipv6Address::UNSPECIFIED, 0)),
             gateway: Some(IpAddress::Ipv6(configuration.router)),
-            expires_at: None,
+            expires_at: lifetime_deadline(now, u32::from(configuration.router_lifetime_seconds)),
         };
         if configuration.router_lifetime_seconds == 0 {
-            self.routes.remove(default_route);
-        } else {
-            let _ = self.routes.add(default_route);
+            self.routes.withdraw_learned(default_route);
+        } else if let Err(error) = self.routes.learn(default_route) {
+            tracing::debug!(?default_route, ?error, "advertised router not retained");
         }
 
         if !configuration.dns_servers.is_empty() {
@@ -3334,11 +3628,28 @@ where
     }
 
     pub fn tcp_send_ready(&self, socket: SocketId) -> Result<bool, StackError> {
+        Ok(matches!(self.tcp_send_room(socket)?, TcpSendState::Room(_)))
+    }
+
+    /// What `socket`'s send side does with a write right now.
+    ///
+    /// `Pending` is a live connection whose transmit queue is full —
+    /// the answer a waiter parks behind. `Room` is the byte count the
+    /// queue takes. `Closed` is every state that can no longer send, so
+    /// a caller parked on the answer wakes and reports the close instead
+    /// of sleeping through it: `send_capacity_bytes` alone reports queue
+    /// room on a dead socket and cannot be the probe.
+    pub fn tcp_send_room(&self, socket: SocketId) -> Result<TcpSendState, StackError> {
         let socket = self.tcp_socket(socket)?;
-        Ok(matches!(
-            socket.state(),
-            crate::TcpState::Established | crate::TcpState::CloseWait
-        ) && socket.send_capacity_bytes() != 0)
+        Ok(match socket.state() {
+            crate::TcpState::Established | crate::TcpState::CloseWait => {
+                match socket.send_capacity_bytes() {
+                    0 => TcpSendState::Pending,
+                    room => TcpSendState::Room(room),
+                }
+            }
+            _ => TcpSendState::Closed(tcp_send_termination(socket)),
+        })
     }
 
     /// Report whether `socket` has a datagram waiting, without dequeuing it.
@@ -3350,17 +3661,29 @@ where
         Ok(self.udp_rx_counts[udp_socket_index(socket)] != 0)
     }
 
+    /// The soonest time [`Self::drive_tcp`] owes work: a TCP timer, or the
+    /// expiry of the oldest incomplete IPv4 reassembly.
     pub fn next_tcp_deadline(&mut self) -> Option<StackInstant> {
-        loop {
-            let entry = self.tcp_timers.peek().copied()?;
+        let reassembly = self.ipv4_reassembly.next_deadline();
+        let tcp = loop {
+            let Some(entry) = self.tcp_timers.peek().copied() else {
+                break None;
+            };
             if self.tcp_timer_entry_current(entry) {
-                return Some(StackInstant::from_nanos(entry.deadline_nanos));
+                break Some(StackInstant::from_nanos(entry.deadline_nanos));
             }
             let _ = self.tcp_timers.pop();
+        };
+        match (tcp, reassembly) {
+            (Some(tcp), Some(reassembly)) => Some(tcp.min(reassembly)),
+            (tcp, reassembly) => tcp.or(reassembly),
         }
     }
 
+    /// Runs the stack's timers: every TCP socket's, and the IPv4
+    /// reassembly cache's expiry.
     pub fn drive_tcp(&mut self, now: StackInstant) -> Result<(), StackError> {
+        self.ipv4_reassembly.expire(now);
         let mut pending_syn =
             ArrayVec::<(usize, TcpEndpoint, TcpEndpoint, TcpHeader, TcpHeaderOptions), 16>::new();
         let mut pending_syn_ack =
@@ -4456,12 +4779,19 @@ where
         now: StackInstant,
     ) -> Result<bool, StackError> {
         let packet = ArpPacket::parse(bytes).ok_or(StackError::MalformedPacket)?;
-        self.learn_neighbor(NeighborEntry {
-            ip: IpAddress::Ipv4(packet.sender_protocol),
-            mac: packet.sender_hardware,
-            state: NeighborState::Reachable,
-            updated_at: now,
-        });
+        // An ARP sender is a neighbor only when it shares the link; a
+        // sender outside every connected subnet (or the unspecified
+        // address of a probe) is answered but never cached.
+        if !packet.sender_protocol.is_unspecified()
+            && self.is_on_link(IpAddress::Ipv4(packet.sender_protocol))
+        {
+            self.learn_neighbor(NeighborEntry {
+                ip: IpAddress::Ipv4(packet.sender_protocol),
+                mac: packet.sender_hardware,
+                state: NeighborState::Reachable,
+                updated_at: now,
+            });
+        }
         if packet.operation == ArpOperation::Request
             && self
                 .ipv4_addresses
@@ -4481,22 +4811,17 @@ where
         now: StackInstant,
     ) -> Result<bool, StackError> {
         let packet = self.parse_ipv4(frame.as_ref())?;
-        if !packet.source.is_unspecified() {
-            self.learn_neighbor(NeighborEntry {
-                ip: IpAddress::Ipv4(packet.source),
-                mac: source_mac,
-                state: NeighborState::Reachable,
-                updated_at: now,
-            });
-        }
         if packet.is_fragmented() {
-            let payload_bytes = frame.slice(bytes_subrange(frame.as_ref(), packet.payload));
-            return match self.ipv4_reassembly.process_fragment(
-                packet,
-                frame.as_ref(),
-                payload_bytes,
-                now,
-            ) {
+            // Nothing not addressed to this host is worth a cache slot, and
+            // the cache copies what it keeps: the frame is on loan for this
+            // receive pass only.
+            if !self.accepts_ipv4_destination(packet.protocol, packet.destination) {
+                return Ok(false);
+            }
+            return match self
+                .ipv4_reassembly
+                .process_fragment(packet, frame.as_ref(), now)
+            {
                 Ipv4ReassemblyResult::Complete(packet_bytes) => {
                     let packet = self.parse_ipv4(packet_bytes.as_ref())?;
                     assert!(
@@ -4536,7 +4861,7 @@ where
         let payload_bytes = frame.slice(payload_range);
         match packet.protocol {
             crate::IpProtocol::Tcp => {
-                if !self.owns_ip_address(IpAddress::Ipv4(packet.destination)) {
+                if !self.accepts_ipv4_destination(packet.protocol, packet.destination) {
                     return Ok(false);
                 }
                 self.receive_tcp(
@@ -4548,7 +4873,7 @@ where
                 )
             }
             crate::IpProtocol::Udp => {
-                if !self.accepts_ipv4_udp_destination(packet.destination) {
+                if !self.accepts_ipv4_destination(packet.protocol, packet.destination) {
                     return Ok(false);
                 }
                 let consumed = self.receive_udp(
@@ -4563,7 +4888,7 @@ where
                 Ok(false)
             }
             crate::IpProtocol::Icmp => {
-                if !self.owns_ip_address(IpAddress::Ipv4(packet.destination)) {
+                if !self.accepts_ipv4_destination(packet.protocol, packet.destination) {
                     return Ok(false);
                 }
                 self.receive_icmpv4(packet, now)
@@ -4588,22 +4913,6 @@ where
         now: StackInstant,
     ) -> Result<bool, StackError> {
         let packet = Ipv6Packet::parse(frame.as_ref()).ok_or(StackError::MalformedPacket)?;
-        if !packet.source.is_unspecified() {
-            // Passive learning: filling the cache from ordinary traffic
-            // saves a solicitation round trip, but RFC 4861 §7.2.5 only
-            // lets a Neighbor Advertisement carrying the override bit
-            // replace a cached link-layer address, so a data frame must
-            // never do it either.
-            self.learn_neighbor_without_override(
-                NeighborEntry {
-                    ip: IpAddress::Ipv6(packet.source),
-                    mac: source_mac,
-                    state: NeighborState::Reachable,
-                    updated_at: now,
-                },
-                false,
-            );
-        }
         let payload_range = bytes_subrange(frame.as_ref(), packet.payload);
         let offload = offload.advance(payload_range.start);
         let payload_bytes = frame.slice(payload_range);
@@ -4797,15 +5106,24 @@ where
             .and_then(|route| route.gateway)
     }
 
+    /// Whether `address` shares the link with this stack, which is the
+    /// only kind of address ARP and Neighbor Discovery may cache. IPv6
+    /// link-local addresses are on-link by construction.
+    fn is_on_link(&self, address: IpAddress) -> bool {
+        match address {
+            IpAddress::Ipv6(ipv6) if ipv6.is_link_local() => true,
+            _ => self.routes.is_on_link(address),
+        }
+    }
+
     fn neighbor_mac(&self, ip: IpAddress) -> Option<EthernetAddress> {
         self.neighbors
-            .iter()
-            .find(|entry| {
-                entry.ip == ip
-                    && matches!(
-                        entry.state,
-                        NeighborState::Reachable | NeighborState::Stale | NeighborState::Delay
-                    )
+            .get(ip)
+            .filter(|entry| {
+                matches!(
+                    entry.state,
+                    NeighborState::Reachable | NeighborState::Stale | NeighborState::Delay
+                )
             })
             .map(|entry| entry.mac)
     }
@@ -5266,12 +5584,14 @@ where
                 // link-layer option over the Ethernet header, which a
                 // bridge or proxy may have rewritten.
                 let neighbor_mac = options.source_link_layer_address().unwrap_or(source_mac);
-                self.learn_neighbor(NeighborEntry {
-                    ip: IpAddress::Ipv6(packet.source),
-                    mac: neighbor_mac,
-                    state: NeighborState::Reachable,
-                    updated_at: now,
-                });
+                if self.is_on_link(IpAddress::Ipv6(packet.source)) {
+                    self.learn_neighbor(NeighborEntry {
+                        ip: IpAddress::Ipv6(packet.source),
+                        mac: neighbor_mac,
+                        state: NeighborState::Reachable,
+                        updated_at: now,
+                    });
+                }
                 if self
                     .ipv6_addresses
                     .iter()
@@ -5297,15 +5617,17 @@ where
                 let target_mac = options.target_link_layer_address().unwrap_or(source_mac);
                 // §7.2.5: without the override bit an advertisement may
                 // not replace a cached link-layer address that differs.
-                self.learn_neighbor_without_override(
-                    NeighborEntry {
-                        ip: IpAddress::Ipv6(target),
-                        mac: target_mac,
-                        state: NeighborState::Reachable,
-                        updated_at: now,
-                    },
-                    override_cache,
-                );
+                if self.is_on_link(IpAddress::Ipv6(target)) {
+                    self.learn_neighbor_without_override(
+                        NeighborEntry {
+                            ip: IpAddress::Ipv6(target),
+                            mac: target_mac,
+                            state: NeighborState::Reachable,
+                            updated_at: now,
+                        },
+                        override_cache,
+                    );
+                }
             }
             Icmpv6Packet::DestinationUnreachable(unreachable) => {
                 self.receive_icmp_destination_unreachable(IcmpDestinationUnreachable::Ipv6(
@@ -5795,6 +6117,20 @@ where
                 window_size: 0,
             },
         })
+    }
+
+    /// Whether an IPv4 datagram of `protocol` sent to `destination` is for
+    /// this host: UDP also takes broadcast and the multicast groups
+    /// joined, everything else only an owned address.
+    fn accepts_ipv4_destination(
+        &self,
+        protocol: crate::IpProtocol,
+        destination: Ipv4Address,
+    ) -> bool {
+        match protocol {
+            crate::IpProtocol::Udp => self.accepts_ipv4_udp_destination(destination),
+            _ => self.owns_ip_address(IpAddress::Ipv4(destination)),
+        }
     }
 
     fn accepts_ipv4_udp_destination(&self, destination: Ipv4Address) -> bool {
@@ -6532,6 +6868,37 @@ where
     }
 }
 
+/// The close kind a send-side probe reports, for a socket that can no
+/// longer send.
+///
+/// Unlike [`tcp_read_termination`] this is total: every state outside
+/// `Established`/`CloseWait` answers `Closed` to a write, and the kind
+/// says how it got there. `FinWait1`/`FinWait2`/`Closing`/`LastAck`/
+/// `TimeWait` are the orderly close either side walked; a socket that
+/// never established — `Listen`, `SynSent`, `SynReceived` — has no close
+/// to record and reports `Graceful`, the same end the send side reads
+/// as locally finished.
+fn tcp_send_termination<C>(socket: &TcpSocket<C>) -> TcpCloseKind
+where
+    C: CongestionControl,
+{
+    match socket.state() {
+        crate::TcpState::FinWait1
+        | crate::TcpState::FinWait2
+        | crate::TcpState::Closing
+        | crate::TcpState::LastAck
+        | crate::TcpState::TimeWait => TcpCloseKind::Graceful,
+        crate::TcpState::Closed => socket
+            .close_kind()
+            .unwrap_or_else(|| panic!("TCP socket reached Closed without recording why it closed")),
+        crate::TcpState::Listen
+        | crate::TcpState::SynSent
+        | crate::TcpState::SynReceived
+        | crate::TcpState::Established
+        | crate::TcpState::CloseWait => TcpCloseKind::Graceful,
+    }
+}
+
 fn socket_id(index: usize) -> SocketId {
     let raw = u32::try_from(index + 1).unwrap_or_else(|_| panic!("socket index exceeds u32"));
     SocketId::new(raw)
@@ -6773,7 +7140,9 @@ mod tests {
 
     fn open_established_tcp_stack(local: Ipv4Address, peer: Ipv4Address) -> (Stack, SocketId) {
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
-        stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
         stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv4(peer),
             mac: PEER_MAC,
@@ -7950,7 +8319,9 @@ mod tests {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
-        stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
         stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv4(peer),
             mac: PEER_MAC,
@@ -8012,7 +8383,9 @@ mod tests {
     fn tcp_connect_resets_stale_ack_then_retransmits_syn_and_establishes() {
         let config = StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES);
         let (mut stack, socket, local, peer) = open_pending_tcp_connect_stack(config);
-        stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
         stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv4(peer),
             mac: PEER_MAC,
@@ -8093,7 +8466,9 @@ mod tests {
         let peer = Ipv4Address::new([192, 0, 2, 20]);
         let router = Ipv4Address::new([192, 0, 2, 1]);
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
-        stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
         let local_endpoint = TcpEndpoint {
             address: IpAddress::Ipv4(local),
             port: 49152,
@@ -8138,7 +8513,9 @@ mod tests {
         let peer = Ipv4Address::new([192, 0, 2, 20]);
         let router = Ipv4Address::new([192, 0, 2, 1]);
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
-        stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
         let local_endpoint = TcpEndpoint {
             address: IpAddress::Ipv4(local),
             port: 49152,
@@ -8234,7 +8611,9 @@ mod tests {
         let peer = Ipv4Address::new([192, 0, 2, 20]);
         let router = Ipv4Address::new([192, 0, 2, 1]);
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
-        stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
         let local_endpoint = TcpEndpoint {
             address: IpAddress::Ipv4(local),
             port: 49152,
@@ -8486,7 +8865,9 @@ mod tests {
         let foreign = Ipv4Address::new([192, 0, 2, 11]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
-        stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
         let socket = stack
             .open_udp(UdpSocketBinding::wildcard(4040))
             .expect("wildcard UDP socket should bind");
@@ -8505,7 +8886,9 @@ mod tests {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
-        stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
         let socket = stack
             .open_udp(UdpSocketBinding::wildcard(4040))
             .expect("wildcard UDP socket should bind");
@@ -8533,7 +8916,9 @@ mod tests {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
-        stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
         let socket = stack
             .open_udp(UdpSocketBinding::wildcard(4040))
             .expect("wildcard UDP socket should bind");
@@ -8559,7 +8944,9 @@ mod tests {
         let group = Ipv4Address::new([224, 0, 0, 251]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
-        stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
         stack
             .join_ipv4_multicast(group, local)
             .expect("IPv4 multicast group should join");
@@ -8587,7 +8974,9 @@ mod tests {
         let group = Ipv4Address::new([224, 0, 0, 251]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
-        stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
         let socket = stack
             .open_udp(UdpSocketBinding::wildcard(4040))
             .expect("wildcard UDP socket should bind");
@@ -8607,7 +8996,9 @@ mod tests {
         let group = Ipv4Address::new([224, 0, 0, 251]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
-        stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
         stack
             .join_ipv4_multicast(group, local)
             .expect("first IPv4 multicast join should succeed");
@@ -8672,7 +9063,9 @@ mod tests {
         let group = Ipv4Address::new([224, 0, 0, 251]);
         let unicast = Ipv4Address::new([192, 0, 2, 20]);
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
-        stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
 
         assert_eq!(
             stack.join_ipv4_multicast(unicast, local),
@@ -8695,7 +9088,9 @@ mod tests {
         let group = Ipv4Address::new([224, 0, 0, 251]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
-        stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
         stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv4(peer),
             mac: PEER_MAC,
@@ -8719,7 +9114,9 @@ mod tests {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let group = Ipv4Address::new([224, 0, 0, 251]);
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
-        stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
         let socket = stack
             .open_udp(UdpSocketBinding::wildcard(4040))
             .expect("wildcard UDP socket should bind");
@@ -8762,7 +9159,9 @@ mod tests {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let group = Ipv4Address::new([224, 0, 0, 251]);
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
-        stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
         let socket = stack
             .open_udp(UdpSocketBinding::wildcard(4040))
             .expect("wildcard UDP socket should bind");
@@ -8797,7 +9196,9 @@ mod tests {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
-        stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
         stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv4(peer),
             mac: PEER_MAC,
@@ -8855,7 +9256,9 @@ mod tests {
         let mut stack = Stack::new(
             StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES).with_tx_checksum_offload(true),
         );
-        stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
         let socket = stack
             .open_udp(UdpSocketBinding::wildcard(4040))
             .expect("wildcard UDP socket should bind");
@@ -8927,7 +9330,9 @@ mod tests {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
         let mut stack = Stack::new(config);
-        stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
         stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv4(peer),
             mac: PEER_MAC,
@@ -9194,7 +9599,9 @@ mod tests {
                 .with_tx_checksum_offload(true)
                 .with_direct_tx_dma(true),
         );
-        stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
         stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv4(peer_addr),
             mac: PEER_MAC,
@@ -9265,7 +9672,9 @@ mod tests {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let group = Ipv4Address::new([224, 0, 0, 251]);
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
-        stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
         let socket = stack
             .open_udp(UdpSocketBinding::wildcard(4040))
             .expect("wildcard UDP socket should bind");
@@ -9291,7 +9700,9 @@ mod tests {
             Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]);
         let peer = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
-        stack.add_ipv6_address(Ipv6Cidr::new(local, 64));
+        stack
+            .add_ipv6_address(Ipv6Cidr::new(local, 64))
+            .expect("test address should be accepted");
         let socket = stack
             .open_udp(UdpSocketBinding::wildcard(4040))
             .expect("wildcard UDP socket should bind");
@@ -9311,7 +9722,9 @@ mod tests {
         let peer = Ipv4Address::new([192, 0, 2, 20]);
         let router = Ipv4Address::new([192, 0, 2, 1]);
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
-        stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
         let socket = stack
             .open_udp(UdpSocketBinding::connected(
                 UdpEndpoint {
@@ -9345,7 +9758,9 @@ mod tests {
         let peer = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
         let router = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]);
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
-        stack.add_ipv6_address(Ipv6Cidr::new(local, 64));
+        stack
+            .add_ipv6_address(Ipv6Cidr::new(local, 64))
+            .expect("test address should be accepted");
         let socket = stack
             .open_udp(UdpSocketBinding::connected(
                 UdpEndpoint {
@@ -9379,7 +9794,9 @@ mod tests {
         let peer = Ipv4Address::new([192, 0, 2, 20]);
         let router = Ipv4Address::new([192, 0, 2, 1]);
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
-        stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
         let socket = stack
             .open_udp(UdpSocketBinding::connected(
                 UdpEndpoint {
@@ -9416,7 +9833,9 @@ mod tests {
         let peer = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
         let router = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]);
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
-        stack.add_ipv6_address(Ipv6Cidr::new(local, 64));
+        stack
+            .add_ipv6_address(Ipv6Cidr::new(local, 64))
+            .expect("test address should be accepted");
         let socket = stack
             .open_udp(UdpSocketBinding::connected(
                 UdpEndpoint {
@@ -9454,7 +9873,9 @@ mod tests {
         let other_peer = Ipv4Address::new([192, 0, 2, 30]);
         let router = Ipv4Address::new([192, 0, 2, 1]);
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
-        stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
         let socket = stack
             .open_udp(UdpSocketBinding::connected(
                 UdpEndpoint {
@@ -9602,7 +10023,9 @@ mod tests {
         let config = StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES)
             .with_rx_checksum_offload(RxChecksumOffload::new(true, false, false));
         let mut stack = Stack::new(config);
-        stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
         let socket = stack
             .open_udp(UdpSocketBinding::wildcard(4040))
             .expect("UDP socket should bind");
@@ -9653,7 +10076,9 @@ mod tests {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
-        stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
         let socket = stack
             .open_udp(UdpSocketBinding::wildcard(4040))
             .expect("UDP socket should bind");
@@ -9680,13 +10105,179 @@ mod tests {
         assert_eq!(received.bytes.as_ref(), LARGE_PAYLOAD.as_slice());
     }
 
+    /// A device buffer on loan: `released` counts how many have been
+    /// dropped, so a test can tell which of them the stack still holds.
+    struct LoanedFrame {
+        bytes: Vec<u8>,
+        released: alloc::sync::Arc<core::sync::atomic::AtomicUsize>,
+    }
+
+    impl AsRef<[u8]> for LoanedFrame {
+        fn as_ref(&self) -> &[u8] {
+            &self.bytes
+        }
+    }
+
+    impl Drop for LoanedFrame {
+        fn drop(&mut self) {
+            self.released
+                .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn loan_frame(
+        frame: &([u8; crate::ETHERNET_FRAME_BYTES], usize),
+        released: &alloc::sync::Arc<core::sync::atomic::AtomicUsize>,
+    ) -> Bytes {
+        Bytes::from_owner(LoanedFrame {
+            bytes: frame.0[..frame.1].to_vec(),
+            released: released.clone(),
+        })
+    }
+
+    /// Queues more incomplete fragments than a receive ring has slots
+    /// (256), each in its own loaned buffer, and requires every buffer to
+    /// be back with the driver once its receive pass has returned.
+    #[test]
+    fn ipv4_queued_fragments_do_not_retain_device_buffers() {
+        const FRAGMENTS: usize = 300;
+
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
+        let released = alloc::sync::Arc::new(core::sync::atomic::AtomicUsize::new(0));
+        for index in 1..=FRAGMENTS {
+            let frame = ipv4_fragment_frame(
+                peer,
+                local,
+                crate::IpProtocol::Udp,
+                0x2000,
+                index * IPV4_FRAGMENT_BLOCK_SIZE,
+                true,
+                &[0xa5; IPV4_FRAGMENT_BLOCK_SIZE],
+            );
+            stack
+                .receive_rx_frame(
+                    RxFrame::new(loan_frame(&frame, &released)),
+                    StackInstant::from_nanos(1),
+                )
+                .expect("incomplete fragment should be accepted");
+        }
+        assert!(
+            stack.ipv4_reassembly.cached_bytes >= FRAGMENTS * IPV4_FRAGMENT_BLOCK_SIZE,
+            "the fragments must actually be cached for this test to mean anything"
+        );
+        assert_eq!(
+            released.load(core::sync::atomic::Ordering::SeqCst),
+            FRAGMENTS,
+            "a cached fragment must not hold the device buffer it arrived in"
+        );
+    }
+
+    #[test]
+    fn ipv4_fragment_for_another_host_is_not_cached() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let other = Ipv4Address::new([192, 0, 2, 99]);
+        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
+        let frame = ipv4_fragment_frame(
+            peer,
+            other,
+            crate::IpProtocol::Udp,
+            0x2001,
+            0,
+            true,
+            &[0x5a; 16],
+        );
+        stack
+            .receive_frame(&frame.0[..frame.1], StackInstant::from_nanos(1))
+            .expect("a fragment for another host is dropped, not an error");
+        assert_eq!(stack.ipv4_reassembly.cached_bytes, 0);
+        assert!(stack.ipv4_reassembly.entries.is_empty());
+    }
+
+    #[test]
+    fn ipv4_reassembly_expires_from_the_stack_timer() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
+        let frame = ipv4_fragment_frame(
+            peer,
+            local,
+            crate::IpProtocol::Udp,
+            0x2002,
+            0,
+            true,
+            &[0x5a; 16],
+        );
+        let received_at = 1_000;
+        stack
+            .receive_frame(&frame.0[..frame.1], StackInstant::from_nanos(received_at))
+            .expect("first fragment should be accepted");
+        let expires_at = StackInstant::from_nanos(received_at + IPV4_REASSEMBLY_TIMEOUT_NANOS);
+        assert_eq!(stack.next_tcp_deadline(), Some(expires_at));
+
+        stack
+            .drive_tcp(StackInstant::from_nanos(
+                received_at + IPV4_REASSEMBLY_TIMEOUT_NANOS - 1,
+            ))
+            .expect("early drive should succeed");
+        assert!(stack.ipv4_reassembly.cached_bytes > 0);
+
+        stack
+            .drive_tcp(expires_at)
+            .expect("drive at the deadline should succeed");
+        assert_eq!(stack.ipv4_reassembly.cached_bytes, 0);
+        assert!(stack.ipv4_reassembly.entries.is_empty());
+        assert_eq!(stack.next_tcp_deadline(), None);
+    }
+
+    /// Eight-byte fragments cost far more in bookkeeping than in payload,
+    /// so the budget charges for the bookkeeping too.
+    #[test]
+    fn ipv4_reassembly_budget_counts_fragment_bookkeeping() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
+        let frame = ipv4_fragment_frame(
+            peer,
+            local,
+            crate::IpProtocol::Udp,
+            0x2003,
+            IPV4_FRAGMENT_BLOCK_SIZE,
+            true,
+            &[0x5a; IPV4_FRAGMENT_BLOCK_SIZE],
+        );
+        stack
+            .receive_frame(&frame.0[..frame.1], StackInstant::from_nanos(1))
+            .expect("fragment should be accepted");
+        assert_eq!(
+            stack.ipv4_reassembly.cached_bytes,
+            IPV4_FRAGMENT_BLOCK_SIZE + IPV4_FRAGMENT_BOOKKEEPING_BYTES
+        );
+    }
+
     #[test]
     fn ipv4_udp_fragments_reassemble_and_deliver() {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
         let payload = b"fragmented-udp-payload";
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
-        stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
         let socket = stack
             .open_udp(UdpSocketBinding::wildcard(4040))
             .expect("UDP socket should bind");
@@ -9715,7 +10306,9 @@ mod tests {
         let peer = Ipv4Address::new([192, 0, 2, 20]);
         let payload = b"fragmented-udp-payload";
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
-        stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
         let socket = stack
             .open_udp(UdpSocketBinding::wildcard(4040))
             .expect("UDP socket should bind");
@@ -9742,7 +10335,9 @@ mod tests {
         let peer = Ipv4Address::new([192, 0, 2, 20]);
         let payload = b"fragmented-udp-payload";
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
-        stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
         let socket = stack
             .open_udp(UdpSocketBinding::wildcard(4040))
             .expect("UDP socket should bind");
@@ -9772,7 +10367,9 @@ mod tests {
         let peer = Ipv4Address::new([192, 0, 2, 20]);
         let payload = b"fragmented-udp-payload";
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
-        stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
         let socket = stack
             .open_udp(UdpSocketBinding::wildcard(4040))
             .expect("UDP socket should bind");
@@ -9807,7 +10404,9 @@ mod tests {
         let peer = Ipv4Address::new([192, 0, 2, 20]);
         let payload = b"fragmented-udp-payload";
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
-        stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
         let socket = stack
             .open_udp(UdpSocketBinding::wildcard(4040))
             .expect("UDP socket should bind");
@@ -9867,7 +10466,9 @@ mod tests {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
-        stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
         stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv4(peer),
             mac: PEER_MAC,
@@ -9916,7 +10517,9 @@ mod tests {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
-        stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
         stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv4(peer),
             mac: PEER_MAC,
@@ -9948,7 +10551,9 @@ mod tests {
         let peer = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
         let router = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]);
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
-        stack.add_ipv6_address(Ipv6Cidr::new(local, 64));
+        stack
+            .add_ipv6_address(Ipv6Cidr::new(local, 64))
+            .expect("test address should be accepted");
         stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv6(peer),
             mac: PEER_MAC,
@@ -9999,7 +10604,9 @@ mod tests {
         let local = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         let peer = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
-        stack.add_ipv6_address(Ipv6Cidr::new(local, 64));
+        stack
+            .add_ipv6_address(Ipv6Cidr::new(local, 64))
+            .expect("test address should be accepted");
         stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv6(peer),
             mac: PEER_MAC,
@@ -10145,11 +10752,13 @@ mod tests {
     }
 
     #[test]
-    fn ipv4_receive_learns_source_mac_before_tcp_reset() {
+    fn ipv4_receive_does_not_learn_the_source_mac() {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
-        stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
 
         let (segment, segment_len) = tcp_segment(
             peer,
@@ -10186,12 +10795,9 @@ mod tests {
 
         assert_eq!(
             stack.neighbor_mac(IpAddress::Ipv4(peer)),
-            Some(PEER_MAC),
-            "IPv4 receive path should learn the Ethernet source before replying"
+            None,
+            "an IPv4 data frame must not teach the stack its sender's Ethernet address"
         );
-        let reset = stack.take_outbound().expect("RST frame should be queued");
-        let ethernet = EthernetFrame::parse(reset.as_slice()).expect("Ethernet frame should parse");
-        assert_eq!(ethernet.destination, PEER_MAC);
     }
 
     #[test]
@@ -10199,7 +10805,9 @@ mod tests {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
-        stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
         stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv4(peer),
             mac: PEER_MAC,
@@ -10246,7 +10854,9 @@ mod tests {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
-        stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
         stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv4(peer),
             mac: PEER_MAC,
@@ -10293,7 +10903,9 @@ mod tests {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
-        stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
         stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv4(peer),
             mac: PEER_MAC,
@@ -10332,7 +10944,9 @@ mod tests {
         let foreign = Ipv4Address::new([192, 0, 2, 11]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
-        stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
         let listener = stack
             .open_tcp_listen(
                 TcpEndpoint {
@@ -10657,7 +11271,9 @@ mod tests {
             port: 80,
         };
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
-        stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
         stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv4(peer),
             mac: PEER_MAC,
@@ -11136,7 +11752,9 @@ mod tests {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
-        stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
         stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv4(peer),
             mac: PEER_MAC,
@@ -11223,7 +11841,9 @@ mod tests {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
-        stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
         stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv4(peer),
             mac: PEER_MAC,
@@ -11592,7 +12212,9 @@ mod tests {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
-        stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
         stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv4(peer),
             mac: PEER_MAC,
@@ -11913,7 +12535,9 @@ mod tests {
         let peer = Ipv4Address::new([192, 0, 2, 20]);
         let router = Ipv4Address::new([192, 0, 2, 1]);
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
-        stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
         stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv4(peer),
             mac: PEER_MAC,
@@ -12001,7 +12625,9 @@ mod tests {
         let peer = Ipv4Address::new([192, 0, 2, 20]);
         let router = Ipv4Address::new([192, 0, 2, 1]);
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
-        stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("test address should be accepted");
         stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv4(peer),
             mac: PEER_MAC,
@@ -12152,6 +12778,41 @@ mod tests {
             .take_outbound()
             .expect("handshake ACK frame should be queued");
 
+        // The first TCP_QUICKACK_SEGMENTS inbound data segments are
+        // answered at once; the segment under measurement has to arrive
+        // past that window to belong to the delayed-ACK timer. The owed
+        // acknowledgements collapse into one pure ACK on the next drive.
+        let mut sequence = 101u32;
+        for _ in 0..crate::tcp::TCP_QUICKACK_SEGMENTS {
+            let (segment, segment_len) = tcp_segment_with_payload(
+                peer,
+                local,
+                TcpHeader {
+                    source_port: 80,
+                    destination_port: 49152,
+                    sequence,
+                    acknowledgement: 8,
+                    flags: TcpFlags::ACK,
+                    window_size: u16::MAX,
+                },
+                b"x",
+            );
+            stack
+                .receive_tcp(
+                    IpAddress::Ipv4(peer),
+                    IpAddress::Ipv4(local),
+                    &Bytes::copy_from_slice(&segment[..segment_len]),
+                    RxFrameOffload::none(),
+                    StackInstant::from_nanos(1),
+                )
+                .expect("quick-ack window segment should be accepted");
+            sequence += 1;
+        }
+        stack
+            .drive_tcp(StackInstant::from_nanos(1))
+            .expect("the window's owed ACK should be queued");
+        while stack.take_outbound().is_some() {}
+
         let payload = [0u8; crate::tcp::TCP_RECEIVE_SEGMENT_BYTES];
         let received_at = 2;
         let (request, request_len) = tcp_segment_with_payload(
@@ -12160,7 +12821,7 @@ mod tests {
             TcpHeader {
                 source_port: 80,
                 destination_port: 49152,
-                sequence: 101,
+                sequence,
                 acknowledgement: 8,
                 flags: TcpFlags::ACK,
                 window_size: u16::MAX,
@@ -12796,7 +13457,9 @@ mod tests {
 
     fn autoconfigured_stack() -> Stack {
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
-        stack.configure_ipv6_link_local();
+        stack
+            .configure_ipv6_link_local()
+            .expect("link-local address should be accepted");
         let (frame, len) = router_advertisement_frame(300, 255, ROUTER_LINK_LOCAL);
         stack
             .receive_frame(&frame[..len], StackInstant::from_nanos(1))
@@ -12807,7 +13470,9 @@ mod tests {
     #[test]
     fn ipv6_link_local_is_derived_from_the_interface_mac() {
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
-        let link_local = stack.configure_ipv6_link_local();
+        let link_local = stack
+            .configure_ipv6_link_local()
+            .expect("link-local address should be accepted");
 
         assert_eq!(
             link_local,
@@ -12830,7 +13495,9 @@ mod tests {
     #[test]
     fn ipv6_autoconfig_queues_router_solicitation_from_link_local() {
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
-        stack.configure_ipv6_link_local();
+        stack
+            .configure_ipv6_link_local()
+            .expect("link-local address should be accepted");
 
         stack
             .drive_ipv6_autoconfig(StackInstant::from_nanos(0))
@@ -12923,7 +13590,9 @@ mod tests {
     #[test]
     fn router_advertisement_with_modified_hop_limit_is_rejected() {
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
-        stack.configure_ipv6_link_local();
+        stack
+            .configure_ipv6_link_local()
+            .expect("link-local address should be accepted");
         let (frame, len) = router_advertisement_frame(300, 64, ROUTER_LINK_LOCAL);
 
         stack
@@ -12942,7 +13611,9 @@ mod tests {
     fn router_advertisement_from_global_source_is_rejected() {
         let global = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
-        stack.configure_ipv6_link_local();
+        stack
+            .configure_ipv6_link_local()
+            .expect("link-local address should be accepted");
         let (frame, len) = router_advertisement_frame(300, 255, global);
 
         stack
@@ -12975,6 +13646,361 @@ mod tests {
                 ])))
                 .is_some()
         );
+    }
+
+    const SECOND: u64 = 1_000_000_000;
+
+    fn advertisement(
+        router_lifetime_seconds: u16,
+        prefix: Option<(u16, u32)>,
+        autonomous: bool,
+    ) -> Ipv6RouterConfiguration {
+        let mut configuration = Ipv6RouterConfiguration {
+            router: ROUTER_LINK_LOCAL,
+            router_mac: None,
+            router_lifetime_seconds,
+            on_link_prefixes: Default::default(),
+            addresses: Default::default(),
+            link_mtu: None,
+            hop_limit: None,
+            dns_servers: Default::default(),
+        };
+        if let Some((index, valid_lifetime_seconds)) = prefix {
+            let network = Ipv6Address::new([
+                0x20,
+                0x01,
+                0x0d,
+                0xb8,
+                (index >> 8) as u8,
+                index as u8,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ]);
+            configuration.on_link_prefixes.push(crate::OnLinkPrefix {
+                prefix: Ipv6Cidr::new(network, 64),
+                valid_lifetime_seconds,
+            });
+            if autonomous {
+                configuration.addresses.push(Ipv6Cidr::new(
+                    Ipv6Address::from_prefix_and_eui64(network, LOCAL_MAC),
+                    64,
+                ));
+            }
+        }
+        configuration
+    }
+
+    fn learned_route_count(stack: &Stack) -> usize {
+        stack
+            .routes()
+            .iter()
+            .filter(|route| route.expires_at.is_some())
+            .count()
+    }
+
+    #[test]
+    fn router_advertisements_with_more_prefixes_than_the_table_holds_leave_the_stack_running() {
+        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(local, 24))
+            .expect("address should be accepted");
+        let gateway = Route {
+            destination: IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address::UNSPECIFIED, 0)),
+            gateway: Some(IpAddress::Ipv4(Ipv4Address::new([192, 0, 2, 1]))),
+            expires_at: None,
+        };
+        stack
+            .routes_mut()
+            .add(gateway)
+            .expect("static route should be accepted");
+
+        // Several times the table's capacity, each with a fresh prefix
+        // and a SLAAC address, then one with no room left for either.
+        for index in 0..(4 * MAX_ROUTES as u16) {
+            let now = StackInstant::from_nanos(u64::from(index) * SECOND);
+            stack.apply_ipv6_router_configuration(
+                advertisement(1800, Some((index, 3600 + u32::from(index))), true),
+                now,
+            );
+            assert!(stack.routes().len() <= MAX_ROUTES);
+            // The kernel drains events on every poll.
+            while stack.take_event().is_some() {}
+        }
+
+        assert!(
+            stack
+                .routes()
+                .iter()
+                .any(|route| route.destination == gateway.destination
+                    && route.gateway == gateway.gateway),
+            "the static route outlasts everything the network advertised"
+        );
+        assert!(
+            stack
+                .routes()
+                .resolve(IpAddress::Ipv4(local))
+                .is_some_and(|route| route.gateway.is_none()),
+            "the configured address keeps its connected route"
+        );
+        assert!(learned_route_count(&stack) <= MAX_ROUTES / 2);
+        // The stack still takes frames and still configures addresses.
+        let (frame, len) = router_advertisement_frame(300, 255, ROUTER_LINK_LOCAL);
+        stack
+            .receive_frame(&frame[..len], StackInstant::from_nanos(1))
+            .expect("the stack keeps handling advertisements");
+    }
+
+    #[test]
+    fn an_advertised_prefix_route_expires_with_its_valid_lifetime() {
+        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        stack
+            .configure_ipv6_link_local()
+            .expect("link-local address should be accepted");
+        let advertised = IpAddress::Ipv6(Ipv6Address::new([
+            0x20, 0x01, 0x0d, 0xb8, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+        ]));
+        stack.apply_ipv6_router_configuration(
+            advertisement(0, Some((7, 100)), false),
+            StackInstant::from_nanos(10 * SECOND),
+        );
+        assert!(stack.routes().resolve(advertised).is_some());
+
+        stack
+            .drive_ipv6_autoconfig(StackInstant::from_nanos(109 * SECOND))
+            .expect("autoconfig poll should succeed");
+        assert!(
+            stack.routes().resolve(advertised).is_some(),
+            "the route lives until its lifetime has run out"
+        );
+
+        stack
+            .drive_ipv6_autoconfig(StackInstant::from_nanos(110 * SECOND))
+            .expect("autoconfig poll should succeed");
+        assert!(stack.routes().resolve(advertised).is_none());
+    }
+
+    #[test]
+    fn a_default_router_route_expires_and_is_refreshed_by_a_new_advertisement() {
+        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let off_link = IpAddress::Ipv6(Ipv6Address::new([
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+        ]));
+        stack.apply_ipv6_router_configuration(
+            advertisement(60, None, false),
+            StackInstant::from_nanos(0),
+        );
+        // A refresh at 50 s moves the deadline to 110 s.
+        stack.apply_ipv6_router_configuration(
+            advertisement(60, None, false),
+            StackInstant::from_nanos(50 * SECOND),
+        );
+        stack
+            .drive_ipv6_autoconfig(StackInstant::from_nanos(100 * SECOND))
+            .expect("autoconfig poll should succeed");
+        assert!(stack.routes().resolve(off_link).is_some());
+
+        stack
+            .drive_ipv6_autoconfig(StackInstant::from_nanos(110 * SECOND))
+            .expect("autoconfig poll should succeed");
+        assert!(stack.routes().resolve(off_link).is_none());
+    }
+
+    #[test]
+    fn an_advertisement_cannot_withdraw_a_route_the_kernel_configured() {
+        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let default_route = Route {
+            destination: IpCidr::Ipv6(Ipv6Cidr::new(Ipv6Address::UNSPECIFIED, 0)),
+            gateway: Some(IpAddress::Ipv6(ROUTER_LINK_LOCAL)),
+            expires_at: None,
+        };
+        stack
+            .routes_mut()
+            .add(default_route)
+            .expect("static route should be accepted");
+
+        stack.apply_ipv6_router_configuration(
+            advertisement(0, None, false),
+            StackInstant::from_nanos(SECOND),
+        );
+
+        assert!(stack.routes().iter().any(|route| route == default_route));
+    }
+
+    #[test]
+    fn repeated_dhcp_re_leases_do_not_grow_the_route_table() {
+        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let gateway = Route {
+            destination: IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address::UNSPECIFIED, 0)),
+            gateway: Some(IpAddress::Ipv4(Ipv4Address::new([10, 0, 0, 1]))),
+            expires_at: None,
+        };
+        let baseline = {
+            stack
+                .routes_mut()
+                .add(gateway)
+                .expect("gateway should be accepted");
+            stack.routes().len()
+        };
+
+        // Each NAK-then-ACK cycle hands out a different address.
+        for host in 2..=250u8 {
+            stack.clear_ipv4_addresses();
+            stack
+                .add_ipv4_address(Ipv4Cidr::new(Ipv4Address::new([10, 0, 0, host]), 24))
+                .expect("a re-lease must always fit");
+            assert_eq!(stack.routes().len(), baseline + 1);
+        }
+
+        stack.clear_ipv4_addresses();
+        assert_eq!(stack.routes().len(), baseline);
+    }
+
+    #[test]
+    fn adding_an_address_to_a_full_table_returns_an_error_and_changes_nothing() {
+        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        // Fill the route table with local routes.
+        for index in 0..MAX_ROUTES as u8 {
+            stack
+                .routes_mut()
+                .add(Route {
+                    destination: IpCidr::Ipv4(Ipv4Cidr::new(
+                        Ipv4Address::new([172, 16, index, 0]),
+                        24,
+                    )),
+                    gateway: Some(IpAddress::Ipv4(Ipv4Address::new([192, 0, 2, 1]))),
+                    expires_at: None,
+                })
+                .expect("route should fit");
+        }
+        let address = Ipv4Cidr::new(Ipv4Address::new([192, 0, 2, 10]), 24);
+        assert_eq!(
+            stack.add_ipv4_address(address),
+            Err(StackError::RouteTableFull)
+        );
+        assert_eq!(stack.ipv4_addresses().count(), 0);
+        assert_eq!(stack.routes().len(), MAX_ROUTES);
+
+        // And a full address table.
+        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let mut host = 0u8;
+        while stack
+            .add_ipv6_address(Ipv6Cidr::new(
+                Ipv6Address::new([
+                    0x20, 0x01, 0x0d, 0xb8, 0, host, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                ]),
+                64,
+            ))
+            .is_ok()
+        {
+            host += 1;
+        }
+        let routes = stack.routes().len();
+        assert_eq!(
+            stack.add_ipv6_address(Ipv6Cidr::new(
+                Ipv6Address::new([
+                    0x20, 0x01, 0x0d, 0xb8, 0, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1
+                ]),
+                64,
+            )),
+            Err(StackError::AddressTableFull)
+        );
+        assert_eq!(stack.routes().len(), routes);
+    }
+
+    fn table_route(index: u8, expires_at: Option<u64>) -> Route {
+        Route {
+            destination: IpCidr::Ipv6(Ipv6Cidr::new(
+                Ipv6Address::new([
+                    0x20, 0x01, 0x0d, 0xb8, 0, index, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                ]),
+                64,
+            )),
+            gateway: None,
+            expires_at: expires_at.map(StackInstant::from_nanos),
+        }
+    }
+
+    #[test]
+    fn a_learned_route_never_displaces_a_local_one_and_gives_way_to_it() {
+        let mut table = RouteTable::new();
+        for index in 0..MAX_ROUTES as u8 {
+            table
+                .add(table_route(index, None))
+                .expect("local route should fit");
+        }
+        assert_eq!(
+            table.learn(table_route(200, Some(10))),
+            Err(StackError::RouteTableFull)
+        );
+
+        let mut table = RouteTable::new();
+        for index in 0..MAX_LEARNED_ROUTES as u8 {
+            table
+                .learn(table_route(index, Some(100 + u64::from(index))))
+                .expect("learned route should fit");
+        }
+        for index in 100..(100 + (MAX_ROUTES - MAX_LEARNED_ROUTES) as u8) {
+            table
+                .add(table_route(index, None))
+                .expect("local route should fit");
+        }
+        assert_eq!(table.len(), MAX_ROUTES);
+        // The local route displaces the learned route expiring soonest.
+        table
+            .add(table_route(250, None))
+            .expect("a local route displaces a learned one");
+        assert!(!table.iter().any(|route| route == table_route(0, Some(100))));
+        assert!(table.iter().any(|route| route == table_route(250, None)));
+        assert_eq!(table.len(), MAX_ROUTES);
+    }
+
+    #[test]
+    fn advertisements_never_hold_more_than_half_the_table() {
+        let mut table = RouteTable::new();
+        for index in 0..MAX_ROUTES as u8 {
+            // Each route outlives the one before, so every one is
+            // accepted or replaces one; none may exceed the quota.
+            let _ = table.learn(table_route(index, Some(100 + u64::from(index))));
+            assert!(table.len() <= MAX_ROUTES / 2);
+        }
+        assert_eq!(table.len(), MAX_ROUTES / 2);
+    }
+
+    #[test]
+    fn a_full_learned_set_replaces_the_soonest_expiring_route_only_for_a_longer_one() {
+        let mut table = RouteTable::new();
+        for index in 0..MAX_LEARNED_ROUTES as u8 {
+            table
+                .learn(table_route(index, Some(100 + u64::from(index))))
+                .expect("learned route should fit");
+        }
+        assert_eq!(
+            table.learn(table_route(200, Some(100))),
+            Err(StackError::RouteTableFull)
+        );
+        table
+            .learn(table_route(201, Some(500)))
+            .expect("a longer-lived route replaces the soonest-expiring one");
+        assert!(!table.iter().any(|route| route == table_route(0, Some(100))));
+        assert!(
+            table
+                .iter()
+                .any(|route| route == table_route(201, Some(500)))
+        );
+        // An infinite lifetime outranks every finite one.
+        table
+            .learn(table_route(202, None))
+            .expect("an infinite lifetime is the longest");
+        assert_eq!(table.len(), MAX_LEARNED_ROUTES);
     }
 
     #[test]
@@ -13051,8 +14077,12 @@ mod tests {
     #[test]
     fn neighbor_advertisement_without_override_keeps_the_cached_address() {
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
-        stack.configure_ipv6_link_local();
-        let peer = Ipv6Address::new([0xfe, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9]);
+        stack
+            .configure_ipv6_link_local()
+            .expect("link-local address should be accepted");
+        // A link-local peer is on-link, so the advertisement reaches the
+        // override rule instead of being dropped as an off-link target.
+        let peer = Ipv6Address::new([0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9]);
         stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv6(peer),
             mac: PEER_MAC,
@@ -13278,5 +14308,208 @@ mod tests {
             IpAddress::Ipv6(ipv6.destination),
             ipv6.payload
         ));
+    }
+
+    const GATEWAY: Ipv4Address = Ipv4Address::new([10, 0, 0, 1]);
+    const LOCAL_V4: Ipv4Address = Ipv4Address::new([10, 0, 0, 2]);
+
+    /// A stack on `10.0.0.0/16` with a resolved default gateway.
+    fn stack_with_resolved_gateway() -> Stack {
+        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        stack
+            .add_ipv4_address(Ipv4Cidr::new(LOCAL_V4, 16))
+            .expect("test address should be accepted");
+        stack
+            .routes_mut()
+            .add(Route {
+                destination: IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address::new([0, 0, 0, 0]), 0)),
+                gateway: Some(IpAddress::Ipv4(GATEWAY)),
+                expires_at: None,
+            })
+            .expect("default route should fit");
+        stack.learn_neighbor(NeighborEntry {
+            ip: IpAddress::Ipv4(GATEWAY),
+            mac: PEER_MAC,
+            state: NeighborState::Reachable,
+            updated_at: StackInstant::from_nanos(0),
+        });
+        stack
+    }
+
+    fn arp_frame(
+        operation: ArpOperation,
+        sender_mac: EthernetAddress,
+        sender: Ipv4Address,
+        target: Ipv4Address,
+    ) -> ([u8; crate::ETHERNET_FRAME_BYTES], usize) {
+        let mut frame = [0u8; crate::ETHERNET_FRAME_BYTES];
+        let mut offset =
+            EthernetFrame::encode_header(&mut frame, [0xff; 6], sender_mac, EthernetProtocol::Arp)
+                .expect("test Ethernet header should fit");
+        offset += ArpPacket {
+            operation,
+            sender_hardware: sender_mac,
+            sender_protocol: sender,
+            target_hardware: [0; 6],
+            target_protocol: target,
+        }
+        .encode(&mut frame[offset..])
+        .expect("test ARP packet should fit");
+        (frame, offset)
+    }
+
+    /// Delivers a UDP datagram claiming `source` from `mac` and drains the
+    /// stack's answer so the output queue never fills.
+    fn deliver_udp_from(stack: &mut Stack, mac: EthernetAddress, source: Ipv4Address, now: u64) {
+        let (mut frame, len) = ipv4_udp_frame(source, 4000, LOCAL_V4, 9, b"x");
+        frame[6..12].copy_from_slice(&mac);
+        stack
+            .receive_frame(&frame[..len], StackInstant::from_nanos(now))
+            .expect("a datagram to a closed port should be handled");
+        while stack.take_outbound().is_some() {}
+        while stack.take_event().is_some() {}
+    }
+
+    #[test]
+    fn more_distinct_sources_than_the_cache_holds_do_not_panic_the_stack() {
+        let mut stack = stack_with_resolved_gateway();
+        // Off-link sources, as a spoofing remote peer would use, and
+        // twice the cache's capacity of them.
+        for index in 0..(2 * MAX_NEIGHBORS as u32) {
+            let source = Ipv4Address::new([198, 51, (index >> 8) as u8, index as u8]);
+            deliver_udp_from(&mut stack, PEER_MAC, source, 1 + u64::from(index));
+        }
+        assert_eq!(
+            stack.neighbors().count(),
+            1,
+            "data frames create no neighbor, so only the gateway is cached"
+        );
+
+        // On-link ARP senders are legitimate neighbors, and a LAN can
+        // hold more of them than the cache: the excess evicts, never
+        // panics, and the gateway keeps its entry.
+        for index in 0..(2 * MAX_NEIGHBORS as u32) {
+            let sender = Ipv4Address::new([10, 0, 1 + (index >> 8) as u8, index as u8]);
+            let (frame, len) = arp_frame(
+                ArpOperation::Reply,
+                [0x02, 0, 0, 1, 0, index as u8],
+                sender,
+                LOCAL_V4,
+            );
+            stack
+                .receive_frame(
+                    &frame[..len],
+                    StackInstant::from_nanos(1_000 + u64::from(index)),
+                )
+                .expect("an ARP reply should be handled");
+            while stack.take_event().is_some() {}
+        }
+        assert_eq!(stack.neighbors().count(), MAX_NEIGHBORS);
+        assert!(
+            stack
+                .neighbors()
+                .any(|entry| entry.ip == IpAddress::Ipv4(GATEWAY) && entry.mac == PEER_MAC),
+            "the gateway outlasts every other entry"
+        );
+
+        // The stack still answers.
+        let (request, len) = arp_frame(
+            ArpOperation::Request,
+            [0x02, 0, 0, 2, 0, 1],
+            Ipv4Address::new([10, 0, 9, 9]),
+            LOCAL_V4,
+        );
+        stack
+            .receive_frame(&request[..len], StackInstant::from_nanos(9_999))
+            .expect("an ARP request should be handled");
+        let reply = stack.take_outbound().expect("the ARP request is answered");
+        let ethernet = EthernetFrame::parse(reply.as_slice()).expect("Ethernet frame should parse");
+        assert_eq!(ethernet.protocol, EthernetProtocol::Arp);
+    }
+
+    #[test]
+    fn an_ipv4_data_frame_cannot_move_a_resolved_gateway_entry() {
+        let mut stack = stack_with_resolved_gateway();
+        let impostor: EthernetAddress = [0x02, 0, 0, 0, 0, 0x99];
+
+        // An on-link sender claims the gateway's address in a data frame.
+        deliver_udp_from(&mut stack, impostor, GATEWAY, 5);
+
+        let entry = stack
+            .neighbors()
+            .find(|entry| entry.ip == IpAddress::Ipv4(GATEWAY))
+            .expect("the gateway stays cached");
+        assert_eq!(entry.mac, PEER_MAC);
+        assert_eq!(
+            stack.neighbor_mac(IpAddress::Ipv4(GATEWAY)),
+            Some(PEER_MAC),
+            "outbound traffic still reaches the real gateway"
+        );
+    }
+
+    #[test]
+    fn an_arp_sender_outside_every_connected_subnet_is_not_cached() {
+        let mut stack = stack_with_resolved_gateway();
+        let (frame, len) = arp_frame(
+            ArpOperation::Request,
+            [0x02, 0, 0, 3, 0, 1],
+            Ipv4Address::new([203, 0, 113, 7]),
+            LOCAL_V4,
+        );
+        stack
+            .receive_frame(&frame[..len], StackInstant::from_nanos(2))
+            .expect("an ARP request should be handled");
+        assert!(
+            stack.take_outbound().is_some(),
+            "the request is still answered"
+        );
+        assert_eq!(stack.neighbors().count(), 1);
+    }
+
+    #[test]
+    fn a_full_cache_evicts_unresolved_and_stale_entries_before_reachable_ones() {
+        let mut cache = NeighborCache::new();
+        let entry = |last: u8, state, at| NeighborEntry {
+            ip: IpAddress::Ipv4(Ipv4Address::new([10, 0, 0, last])),
+            mac: PEER_MAC,
+            state,
+            updated_at: StackInstant::from_nanos(at),
+        };
+        let none = |_| false;
+        cache.learn(entry(0, NeighborState::Incomplete, 50), none);
+        cache.learn(entry(1, NeighborState::Stale, 1), none);
+        for last in 2..MAX_NEIGHBORS as u8 {
+            cache.learn(entry(last, NeighborState::Reachable, 100), none);
+        }
+        assert_eq!(cache.len(), MAX_NEIGHBORS);
+
+        cache.learn(entry(200, NeighborState::Reachable, 200), none);
+        assert!(
+            cache
+                .get(entry(0, NeighborState::Reachable, 0).ip)
+                .is_none()
+        );
+        assert!(
+            cache
+                .get(entry(1, NeighborState::Reachable, 0).ip)
+                .is_some()
+        );
+
+        cache.learn(entry(201, NeighborState::Reachable, 201), none);
+        assert!(
+            cache
+                .get(entry(1, NeighborState::Reachable, 0).ip)
+                .is_none()
+        );
+
+        // A pinned address survives even as the oldest reachable entry.
+        let pinned = entry(2, NeighborState::Reachable, 100).ip;
+        for last in 202..210u8 {
+            cache.learn(entry(last, NeighborState::Reachable, 300), |ip| {
+                ip == pinned
+            });
+        }
+        assert!(cache.get(pinned).is_some());
+        assert_eq!(cache.len(), MAX_NEIGHBORS);
     }
 }

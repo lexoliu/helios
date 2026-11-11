@@ -7,6 +7,7 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt::Write;
+use core::num::NonZeroU64;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use core::time::Duration;
@@ -16,8 +17,8 @@ use crate::wasmtime_adapter::wasi::net::ipv6_address_groups;
 use bytes::Bytes;
 
 use crate::{
-    ClockAuthorityRights, DirectoryAuthorityRights, LinkAuthorityRights, NetworkAuthorityRights,
-    ProcessAuthority, ProcessAuthorityError, TerminalAuthorityRights,
+    ClockAuthorityRights, DeviceClassRights, DirectoryAuthorityRights, LinkAuthorityRights,
+    NetworkAuthorityRights, ProcessAuthority, ProcessAuthorityError, TerminalAuthorityRights,
 };
 use crate::{
     ComponentCache, ComponentOutputMode, ComponentOutputRoute, ComponentOutputStreamKind,
@@ -36,11 +37,12 @@ use wasmtime::component::{
 };
 use wasmtime::{self, Engine, Store, StoreContextMut};
 
+use crate::exec::phases::{self, LaunchPhase};
 use crate::runtime::ComponentHostFilesystemState;
 use crate::wasmtime_adapter::bindings::debugger::bindings as debugger_bindings;
 use crate::wasmtime_adapter::bindings::program::bindings as program_bindings;
 use crate::wasmtime_adapter::config::AotCompileHint;
-use crate::wasmtime_adapter::cwasm::{self, ArtifactTrustError, UntrustedCwasm};
+use crate::wasmtime_adapter::cwasm::{self, ArtifactTrustError};
 use crate::wasmtime_adapter::wasi::ChannelStreamProducer;
 use crate::wasmtime_adapter::wasi::bindings::filesystem::types::ErrorCode as FsErrorCode;
 use crate::{
@@ -78,9 +80,13 @@ fn lower_bytes_to_vec(bytes: Bytes) -> Vec<u8> {
 
 mod device;
 pub(crate) use device::record_linear_memory;
+mod pending;
+pub(crate) use pending::PendingReply;
 pub mod service;
 mod topology;
+mod views;
 mod vsock;
+pub(crate) use views::{guest_memory, view_trap};
 
 pub use service::{
     BlobHandle, ChildExit, ChildHandle, ClientSurfaceHandle, CommandBufferHandle, ContextHandle,
@@ -111,6 +117,7 @@ pub type StoreData<CpuImpl, Net, HostFs> = ComponentStoreData<
     HostRuntimeState<CpuImpl, Net, HostFs>,
     crate::wasmtime_adapter::wasi::DebugFileSystem<HostRuntimeState<CpuImpl, Net, HostFs>, HostFs>,
     ResourceTable,
+    wasmtime::Memory,
 >;
 pub type OutputMode = ComponentOutputMode;
 pub type OutputRoute = ComponentOutputRoute;
@@ -406,37 +413,51 @@ macro_rules! impl_program_bindings {
                         access.get().runtime_state.program_service(),
                         ProgramExecContext::from_store(access.get()),
                         access.get().process_authority().clone(),
+                        access.get().cpu.clone(),
                     ))
                 });
                 async move {
-                    let (service, context, caller_authority) = snapshot?;
+                    let (service, context, caller_authority, cpu) = snapshot?;
+                    let mut launch = phases::Trace::begin(cpu, "spawn", &request.path);
                     let Some(service) = service else {
+                        launch.refused(ProgramExecErrorKind::Unavailable);
                         return Ok(Err($bindings::helios::system::programs::SpawnError {
                             kind: $bindings::helios::system::programs::SpawnErrorKind::Unavailable,
                             detail: "program spawn is unavailable on this machine".to_owned(),
                         }));
                     };
                     if let Err(error) = require_spawn_authority(&caller_authority) {
+                        launch.refused(error.kind);
                         return Ok(Err($convert_error(error)));
                     }
                     let child_authority =
                         match $build_authority(&caller_authority, request.capability_grants) {
                             Ok(authority) => authority,
-                            Err(error) => return Ok(Err($convert_error(error))),
+                            Err(error) => {
+                                launch.refused(error.kind);
+                                return Ok(Err($convert_error(error)));
+                            }
                         };
                     let source =
                         match read_program_source(accessor, &request.path, &caller_authority).await
                         {
                             Ok(Ok(source)) => source,
-                            Ok(Err(error)) => return Ok(Err($convert_error(error))),
+                            Ok(Err(error)) => {
+                                launch.exit_error(&error);
+                                return Ok(Err($convert_error(error)));
+                            }
                             Err(error) => {
-                                return Ok(Err($convert_error(map_program_host_error(
+                                let error = map_program_host_error(
                                     ProgramHostOperation::ReadSpawnSource,
                                     error,
-                                ))));
+                                );
+                                launch.exit_error(&error);
+                                return Ok(Err($convert_error(error)));
                             }
                         };
-                    match service
+                    launch.record(LaunchPhase::SourceRead);
+                    launch.record_source_bytes(source.payload_len());
+                    let spawned = match service
                         .spawn(
                             context,
                             source,
@@ -446,11 +467,17 @@ macro_rules! impl_program_bindings {
                                 request.env,
                                 child_authority,
                                 None,
-                            ),
+                            )
+                            .with_timeline(launch.timeline().for_task()),
                         )
                         .await
                     {
                         Ok(child) => {
+                            launch.set_instance(child.instance_id);
+                            // The child's run task owns the line from
+                            // here — even a handle-push failure below is
+                            // the reply's problem, not the launch's.
+                            launch.disarm();
                             let handle = accessor.with(|mut access| {
                                 access
                                     .get()
@@ -460,8 +487,13 @@ macro_rules! impl_program_bindings {
                             })?;
                             Ok(Ok(handle))
                         }
-                        Err(error) => Ok(Err($convert_error(error))),
-                    }
+                        Err(error) => {
+                            launch.exit_error(&error);
+                            Ok(Err($convert_error(error)))
+                        }
+                    };
+                    launch.record(LaunchPhase::Reply);
+                    spawned
                 }
             }
 
@@ -481,36 +513,50 @@ macro_rules! impl_program_bindings {
                         access.get().runtime_state.program_service(),
                         ProgramExecContext::from_store(access.get()),
                         access.get().process_authority().clone(),
+                        access.get().cpu.clone(),
                     ))
                 });
                 async move {
-                    let (service, context, caller_authority) = snapshot?;
+                    let (service, context, caller_authority, cpu) = snapshot?;
+                    let launch = phases::Trace::begin(cpu, "exec", &request.path);
                     let Some(service) = service else {
+                        launch.refused(ProgramExecErrorKind::Unavailable);
                         return Ok(Err($bindings::helios::system::programs::ExecError {
                             kind: $bindings::helios::system::programs::ExecErrorKind::Unavailable,
                             detail: "program exec is unavailable on this machine".to_owned(),
                         }));
                     };
                     if let Err(error) = require_exec_authority(&caller_authority) {
+                        launch.refused(error.kind);
                         return Ok(Err($convert_error(error)));
                     }
                     let child_authority =
                         match $build_authority(&caller_authority, request.capability_grants) {
                             Ok(authority) => authority,
-                            Err(error) => return Ok(Err($convert_error(error))),
+                            Err(error) => {
+                                launch.refused(error.kind);
+                                return Ok(Err($convert_error(error)));
+                            }
                         };
                     let source =
                         match read_program_source(accessor, &request.path, &caller_authority).await
                         {
                             Ok(Ok(source)) => source,
-                            Ok(Err(error)) => return Ok(Err($convert_error(error))),
+                            Ok(Err(error)) => {
+                                launch.exit_error(&error);
+                                return Ok(Err($convert_error(error)));
+                            }
                             Err(error) => {
-                                return Ok(Err($convert_error(map_program_host_error(
+                                let error = map_program_host_error(
                                     ProgramHostOperation::ReadExecSource,
                                     error,
-                                ))));
+                                );
+                                launch.exit_error(&error);
+                                return Ok(Err($convert_error(error)));
                             }
                         };
+                    launch.record(LaunchPhase::SourceRead);
+                    launch.record_source_bytes(source.payload_len());
                     let hint = match request.hint {
                         Some($bindings::helios::system::programs::AotHint::Fast) => {
                             Some(AotCompileHint::Fast)
@@ -523,7 +569,7 @@ macro_rules! impl_program_bindings {
                         }
                         None => None,
                     };
-                    Ok(service
+                    let executed = service
                         .exec_buffered(
                             context,
                             source,
@@ -534,11 +580,23 @@ macro_rules! impl_program_bindings {
                                 request.env,
                                 child_authority,
                                 None,
-                            ),
+                            )
+                            .with_timeline(launch.timeline().clone()),
                         )
-                        .await
-                        .map($convert_result)
-                        .map_err($convert_error))
+                        .await;
+                    match &executed {
+                        Ok(result) => launch.set_instance(result.instance_id),
+                        // The run task already marked the end for a
+                        // failure it produced — a guest trap — and an
+                        // error this task produced, like the load, is
+                        // the mark itself.
+                        Err(error) => launch.exit_error(error),
+                    }
+                    launch.record(LaunchPhase::Reply);
+                    // The guard stays armed: it drops here and emits
+                    // the line — `reply` included — for an exec the
+                    // run task does not own emission.
+                    Ok(executed.map($convert_result).map_err($convert_error))
                 }
             }
 
@@ -621,11 +679,16 @@ macro_rules! impl_program_bindings {
                             }));
                         }
                     };
+                    let write_cpu = context.cpu();
+                    let write_serial = context.write_serial();
                     match write_program_artifact(
                         accessor,
                         &request.destination_path,
                         &artifact,
                         &caller_authority,
+                        &write_cpu,
+                        write_serial,
+                        request.profile,
                     )
                     .await
                     {
@@ -810,6 +873,29 @@ macro_rules! impl_authority_conversion {
                             .map_err(map_process_authority_error)?;
                         authority.grant_link_rights(rights);
                     }
+                    $bindings::helios::system::programs::CapabilityGrant::Device(device) => {
+                        let mut rights = DeviceClassRights::empty();
+                        for class in device.classes {
+                            rights |= match class {
+                                $bindings::helios::system::programs::DeviceClass::Display => {
+                                    DeviceClassRights::DISPLAY
+                                }
+                                $bindings::helios::system::programs::DeviceClass::Input => {
+                                    DeviceClassRights::INPUT
+                                }
+                                $bindings::helios::system::programs::DeviceClass::Gpu => {
+                                    DeviceClassRights::GPU
+                                }
+                                $bindings::helios::system::programs::DeviceClass::Audio => {
+                                    DeviceClassRights::AUDIO
+                                }
+                            };
+                        }
+                        let rights = caller_authority
+                            .derive_device_class_rights(rights)
+                            .map_err(map_process_authority_error)?;
+                        authority.grant_device_classes(rights);
+                    }
                 }
             }
             Ok(authority)
@@ -895,14 +981,15 @@ mod authority_tests {
         require_spawn_authority, tcp_connect_network_rights, udp_bind_network_rights,
     };
     use crate::{
-        ClockAuthorityRights, DirectoryAuthorityRights, DirectoryPreopen, LinkAuthorityRights,
-        NetworkAuthorityRights, ProcessAuthority, ProcessAuthorityRights, TerminalAuthorityRights,
+        ClockAuthorityRights, DeviceClassRights, DirectoryAuthorityRights, DirectoryPreopen,
+        LinkAuthorityRights, NetworkAuthorityRights, ProcessAuthority, ProcessAuthorityRights,
+        TerminalAuthorityRights,
     };
 
     use program_wit::programs::{
-        CapabilityGrant, ClockGrant, ClockRight, DirectoryGrant, FilesystemRight, LinkGrant,
-        LinkRight, NetworkGrant, NetworkRight, ProcessGrant, ProcessRight, TerminalGrant,
-        TerminalRight,
+        CapabilityGrant, ClockGrant, ClockRight, DeviceClass, DeviceGrant, DirectoryGrant,
+        FilesystemRight, LinkGrant, LinkRight, NetworkGrant, NetworkRight, ProcessGrant,
+        ProcessRight, TerminalGrant, TerminalRight,
     };
 
     fn directory_grant(
@@ -937,6 +1024,10 @@ mod authority_tests {
         CapabilityGrant::Link(LinkGrant { rights })
     }
 
+    fn device_grant(classes: Vec<DeviceClass>) -> CapabilityGrant {
+        CapabilityGrant::Device(DeviceGrant { classes })
+    }
+
     #[test]
     fn empty_grants_create_zero_child_authority() {
         let child = build_program_child_authority(&ProcessAuthority::root(), Vec::new())
@@ -948,7 +1039,65 @@ mod authority_tests {
         assert!(child.terminal_rights().is_empty());
         assert!(child.process_rights().is_empty());
         assert!(child.link_rights().is_empty());
+        assert!(child.device_class_rights().is_empty());
+        assert!(child.granted_devices().is_empty());
         assert!(child.cwd().is_none());
+    }
+
+    #[test]
+    fn device_grant_derives_subset_from_caller_authority() {
+        let mut caller = ProcessAuthority::empty();
+        caller.grant_device_classes(DeviceClassRights::DISPLAY | DeviceClassRights::INPUT);
+
+        let child =
+            build_program_child_authority(&caller, vec![device_grant(vec![DeviceClass::Input])])
+                .expect("device child grant may derive a subset");
+
+        assert_eq!(child.device_class_rights(), DeviceClassRights::INPUT);
+        assert!(child.granted_devices().is_empty());
+    }
+
+    /// What the debugger passes down to the programs the inspector runs
+    /// is bounded by what the debugger holds, which is every class and no
+    /// named device.
+    #[test]
+    fn debugger_authority_hands_every_device_class_to_what_it_launches() {
+        let debugger = super::debugger_authority();
+
+        let child = build_program_child_authority(
+            &debugger,
+            vec![device_grant(vec![
+                DeviceClass::Display,
+                DeviceClass::Input,
+                DeviceClass::Gpu,
+                DeviceClass::Audio,
+            ])],
+        )
+        .expect("the debugger holds every device class");
+
+        assert_eq!(child.device_class_rights(), DeviceClassRights::all());
+        assert!(child.granted_devices().is_empty());
+        assert!(debugger.granted_devices().is_empty());
+    }
+
+    #[test]
+    fn device_grant_exceeding_caller_is_refused() {
+        let mut caller = ProcessAuthority::empty();
+        caller.grant_device_classes(DeviceClassRights::DISPLAY);
+
+        let error = build_program_child_authority(
+            &caller,
+            vec![device_grant(vec![DeviceClass::Display, DeviceClass::Gpu])],
+        )
+        .expect_err("GPU must not be created from display-only authority");
+        assert_eq!(error.kind, crate::ProgramExecErrorKind::PermissionDenied);
+
+        let error = build_program_child_authority(
+            &ProcessAuthority::root(),
+            vec![device_grant(vec![DeviceClass::Display])],
+        )
+        .expect_err("root authority holds no device class to hand on");
+        assert_eq!(error.kind, crate::ProgramExecErrorKind::PermissionDenied);
     }
 
     #[test]
@@ -1182,7 +1331,7 @@ async fn read_program_source<T, CpuImpl, Net, HostFs>(
     accessor: &Accessor<T, HasSelf<StoreData<CpuImpl, Net, HostFs>>>,
     path: &str,
     authority: &ProcessAuthority,
-) -> wasmtime::Result<Result<service::ProgramSource, crate::ProgramExecError>>
+) -> wasmtime::Result<Result<ProgramSource, crate::ProgramExecError>>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
@@ -1210,7 +1359,7 @@ where
         return Ok(host_service
             .read_file(&host_path)
             .await
-            .map(|bytes| classify_program_source(bytes::Bytes::from(bytes), false))
+            .map(|bytes| ProgramSource::from_untrusted(bytes::Bytes::from(bytes)))
             .map_err(|error| {
                 tracing::error!(path = %absolute, ?error, "failed to read program source");
                 ProgramExecError {
@@ -1221,17 +1370,12 @@ where
     }
 
     accessor.with(|mut access| {
-        let readonly = access
+        let contents = access
             .get()
             .filesystem()
-            .is_readonly_path(&absolute)
+            .read_program_file(&absolute)
             .map_err(map_fs_error_to_program_exec)?;
-        let bytes = access
-            .get()
-            .filesystem()
-            .read_program_file_bytes(&absolute)
-            .map_err(map_fs_error_to_program_exec)?;
-        Ok::<_, wasmtime::Error>(Ok(classify_program_source(bytes, readonly)))
+        Ok::<_, wasmtime::Error>(Ok(ProgramSource::from_file(contents)))
     })
 }
 
@@ -1240,12 +1384,20 @@ async fn write_program_artifact<T, CpuImpl, Net, HostFs>(
     path: &str,
     bytes: &[u8],
     authority: &ProcessAuthority,
+    cpu: &CpuImpl,
+    write_serial: crate::DebugSerialWriter,
+    profile: bool,
 ) -> wasmtime::Result<Result<(), crate::ProgramExecError>>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
+    let started_ns = if profile {
+        crate::monotonic_nanos(cpu)
+    } else {
+        0
+    };
     let absolute =
         crate::resolve_guest_path("/", path).map_err(map_component_fs_path_error_to_wasmtime)?;
     if !authority.can_create_or_replace_path(&absolute) {
@@ -1292,6 +1444,13 @@ where
                     detail: ProgramExecErrorDetail::FilesystemOperationFailed,
                 }
             })?;
+        if profile {
+            write_serial.emit_fmt(format_args!(
+                "aot-write us={} bytes={}\n",
+                crate::monotonic_nanos(cpu).saturating_sub(started_ns) / 1_000,
+                bytes.len(),
+            ));
+        }
         return Ok(Ok(()));
     }
 
@@ -1302,19 +1461,15 @@ where
             .filesystem_mut()
             .write_program_file(&absolute, bytes, now_nanos)
             .map_err(map_fs_error_to_program_exec)?;
+        if profile {
+            write_serial.emit_fmt(format_args!(
+                "aot-write us={} bytes={}\n",
+                crate::monotonic_nanos(cpu).saturating_sub(started_ns) / 1_000,
+                bytes.len(),
+            ));
+        }
         Ok::<_, wasmtime::Error>(Ok(()))
     })
-}
-
-fn classify_program_source(bytes: bytes::Bytes, readonly: bool) -> ProgramSource {
-    let is_cwasm = cwasm::is_cwasm(&bytes);
-    if is_cwasm {
-        if readonly {
-            return ProgramSource::BootfsArtifact(bytes);
-        }
-        return ProgramSource::SignedArtifact(bytes);
-    }
-    ProgramSource::RawWasm(bytes)
 }
 
 fn map_fs_error_to_program_exec(error: FsErrorCode) -> crate::ProgramExecError {
@@ -1358,7 +1513,12 @@ fn map_process_authority_error(error: ProcessAuthorityError) -> crate::ProgramEx
         | ProcessAuthorityError::TerminalGrantExceedsAuthority(_)
         | ProcessAuthorityError::ProcessGrantExceedsAuthority(_)
         | ProcessAuthorityError::EmptyLinkRights
-        | ProcessAuthorityError::LinkGrantExceedsAuthority(_) => {
+        | ProcessAuthorityError::LinkGrantExceedsAuthority(_)
+        | ProcessAuthorityError::EmptyDeviceClassRights
+        | ProcessAuthorityError::DeviceClassGrantExceedsAuthority(_)
+        | ProcessAuthorityError::DeviceGrantExceedsAuthority(_)
+        | ProcessAuthorityError::DeviceNameTooLong
+        | ProcessAuthorityError::TooManyDeviceGrants => {
             crate::ProgramExecErrorKind::PermissionDenied
         }
     };
@@ -1400,6 +1560,17 @@ where
     pub(super) debug_state: HostRuntimeState<CpuImpl, Net, HostFs>,
     pub(super) read_serial: crate::SerialReader,
     pub(super) write_serial: crate::DebugSerialWriter,
+}
+
+/// The authority the embedded debugger runs with: everything `root`
+/// grants, plus every device class. The debugger claims no device
+/// itself; it holds the classes because a program can be handed only
+/// what its launcher holds, and the inspector session runs desktop,
+/// input and audio programs through it.
+fn debugger_authority() -> ProcessAuthority {
+    let mut authority = ProcessAuthority::root();
+    authority.grant_device_classes(DeviceClassRights::all());
+    authority
 }
 
 async fn run_system_component<CpuImpl, Net, HostFs>(
@@ -1447,8 +1618,8 @@ where
         component = component_name,
         "loading embedded system component artifact"
     );
-    let trusted = cwasm::trust_bootfs_artifact(UntrustedCwasm::new(component.bytes()))
-        .map_err(DebuggerError::TrustComponent)?;
+    let artifact = component.bootfs_bytes();
+    let trusted = cwasm::trust_bootfs_artifact(&artifact).map_err(DebuggerError::TrustComponent)?;
     let compiled = crate::wasmtime_adapter::WasmtimeCompiledComponent {
         component: unsafe {
             wasmtime::component::Component::deserialize(engine.raw(), trusted.payload())
@@ -1488,7 +1659,7 @@ where
         debug_state.clone(),
         Vec::new(),
         Vec::new(),
-        ProcessAuthority::root(),
+        debugger_authority(),
         OutputMode::Serial,
         read_serial,
         write_serial,
@@ -1554,52 +1725,69 @@ where
     Ok(linker)
 }
 
+/// Interrupts every store of `victim`, whose kill flag was just set, so
+/// a guest that is running meets the condemnation at its next function
+/// entry or loop header, and one in host code or suspended meets it the
+/// moment it is back in wasm.
+///
+/// Programs and kernel plugins run on the program service's engine, and
+/// so does every store a kill can interrupt; before that service is
+/// installed there is none. A system component runs on an engine of its
+/// own, which nothing interrupts: it meets a condemnation where its call
+/// completes.
+pub(crate) fn deliver_kill<CpuImpl, Net, HostFs>(
+    runtime_state: &HostRuntimeState<CpuImpl, Net, HostFs>,
+    victim: InstanceId,
+) where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    HostFs: crate::HostFileSystem,
+{
+    if let Some(service) = runtime_state.program_service() {
+        service.interrupt_instance(victim);
+    }
+}
+
+/// A component store on `engine`, with the interrupt route the
+/// end of a time slice, a kill and the drive of its calls go through.
 pub(crate) fn store_with_state<CpuImpl, Net, HostFs>(
-    engine: &Engine,
+    engine: &crate::wasmtime_adapter::WasmtimeEngine,
     state: StoreData<CpuImpl, Net, HostFs>,
-) -> Store<StoreData<CpuImpl, Net, HostFs>>
+) -> (
+    Store<StoreData<CpuImpl, Net, HostFs>>,
+    crate::wasmtime_adapter::preemption::StoreInterrupts<CpuImpl>,
+)
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    let mut store = Store::new(engine, state);
+    let instance = state.instance().id();
+    let mut store = Store::new(engine.raw(), state);
     store.limiter(|state| state);
-    store.call_hook(
-        |mut caller: StoreContextMut<'_, StoreData<CpuImpl, Net, HostFs>>, hook| {
-            // The kill reason comes back from `record_transition`
-            // itself, with the activation already ended: a hook that
-            // recorded a transition and then returned an error would
-            // cancel the call whose matching hook closes it, and the
-            // `ReturningFromWasm` that unwinds the trap would then
-            // arrive against an activation nobody holds (#114).
-            // Entering a host call is this store's own turn, and the
-            // only moment a `wasi:sockets` resource that died with a
-            // stream can have it closed: the resource type holds ids
-            // and a queue sender, never the service (#219). Every host
-            // call pays one atomic load for it, and a call that finds
-            // something queued closes it before it runs.
-            caller.data().retire_sockets();
-            let transition = crate::wasmtime_adapter::store::translate_call_hook(hook);
-            match caller.data_mut().record_transition(transition) {
-                Some(reason) => Err(wasmtime::Error::from(crate::InstanceKilled { reason })),
-                None => Ok(()),
-            }
-        },
-    );
-    store.set_epoch_deadline(1);
-    // The epoch tick is also the only place a CPU-bound instance can
-    // observe a pending kill: host-call hooks never run during long pure
-    // wasm stretches (e.g. an AOT compile), and cancelling the future
-    // instead would surface a bare interrupt trap that loses the kill
-    // reason (OOM vs supervisor restart).
-    store.epoch_deadline_callback(|mut caller| {
-        if let Some(reason) = caller.data_mut().end_on_pending_kill() {
+    // No call hook. A host call that does not suspend changes nothing
+    // the kernel accounts: the processor turn, the user-memory owner and
+    // the socket retirements all change hands where the fiber does,
+    // which is where `GuestTurns::drive` wraps the call that drives
+    // this store.
+    //
+    // An interruption is where a condemned instance traps: a CPU-bound
+    // guest makes no host call at all (an AOT compile, say), and the
+    // kill interrupts every store of its victim, so a guest that is
+    // running meets this at its next function entry or loop header.
+    // Cancelling the future instead would surface a bare interrupt trap
+    // that loses the kill reason (OOM vs supervisor restart). Any other
+    // interruption ends a time slice, and the guest yields.
+    store.interrupt_callback(|caller| {
+        if let Some(reason) = caller.data().pending_kill() {
             return Err(wasmtime::Error::from(crate::InstanceKilled { reason }));
         }
-        Ok(wasmtime::UpdateDeadline::Yield(1))
+        Ok(wasmtime::InterruptAction::Yield)
     });
-    store
+    let interrupts = engine
+        .interrupts()
+        .register(instance, &store, store.data().cpu.clone());
+    (store, interrupts)
 }
 
 fn add_system_to_linker<CpuImpl, Net, HostFs>(
@@ -2014,6 +2202,7 @@ where
         Ok((snapshot_sample(caller.data()),))
     })?;
     instance.func_wrap("subscribe", |mut caller, (period,): (u64,)| {
+        let period = stats_period(period)?;
         let reader = StreamReader::new(&mut caller, StatsStreamProducer::new(period))?;
         Ok((reader,))
     })?;
@@ -2730,6 +2919,15 @@ where
 {
     let mut instance = linker.instance(TRACING_INSTANCE)?;
     instance.func_wrap(
+        "set-target-enabled",
+        |_caller, (target, enabled): (String, bool)| {
+            let result = crate::log::set_gated_target(&target, enabled).map_err(|error| {
+                debugger_wit::tracing::TargetError::UnknownTarget(error.to_string())
+            });
+            Ok((result,))
+        },
+    )?;
+    instance.func_wrap(
         "recent",
         |caller, (filter, limit): (debugger_wit::tracing::Filter, u32)| {
             let filter = convert_filter(filter);
@@ -2818,6 +3016,33 @@ macro_rules! impl_profiling_bindings {
                         Ok((samples,))
                     },
                 )?;
+                instance.func_wrap("set-instruction-sampling", |caller, (enabled,): (bool,)| {
+                    let result = caller
+                        .data()
+                        .runtime_state
+                        .instruction_sampler()
+                        .set_sampling(enabled)
+                        .map_err(convert_instruction_profile_error);
+                    Ok((result,))
+                })?;
+                instance.func_wrap("instruction-samples", |caller, (): ()| {
+                    let runtime_state = &caller.data().runtime_state;
+                    // Only the program service knows the wasm code that
+                    // can run; a read before it exists is a bring-up
+                    // ordering defect, not an empty profile.
+                    let service = runtime_state.program_service().ok_or_else(|| {
+                        wasmtime::Error::msg(
+                            "instruction samples were read before the program service was \
+                             installed",
+                        )
+                    })?;
+                    let profile = runtime_state
+                        .instruction_sampler()
+                        .profile(service.code_map())
+                        .map(convert_instruction_profile)
+                        .map_err(convert_instruction_profile_error);
+                    Ok((profile,))
+                })?;
                 instance.func_wrap("raw-profile-size", |_caller, (): ()| {
                     Ok((crate::KernelLlvmProfile
                         .size()
@@ -2886,6 +3111,50 @@ macro_rules! impl_profiling_bindings {
                 match scope {
                     $wit::profiling::Scope::Kernel => ProfileScope::Kernel,
                     $wit::profiling::Scope::User => ProfileScope::User,
+                }
+            }
+
+            fn convert_instruction_profile(
+                profile: crate::InstructionProfile,
+            ) -> $wit::profiling::InstructionProfile {
+                $wit::profiling::InstructionProfile {
+                    period_nanos: profile.capture.period_nanos,
+                    kernel_image_base: profile.capture.kernel_image_base,
+                    samples: profile
+                        .samples
+                        .into_iter()
+                        .map(|(code, count)| $wit::profiling::InstructionSample {
+                            code: convert_sampled_code(code),
+                            count,
+                        })
+                        .collect(),
+                    dropped: profile.dropped,
+                }
+            }
+
+            fn convert_sampled_code(code: crate::SampledCode) -> $wit::profiling::SampledCode {
+                use crate::SampledCode as Local;
+                use $wit::profiling::SampledCode as Wit;
+
+                match code {
+                    Local::Wasm(function) => Wit::Wasm($wit::profiling::WasmFunction {
+                        module: String::from(&*function.module),
+                        static_module: function.static_module,
+                        index: function.index,
+                        name: function.name.map(|name| String::from(&*name)),
+                    }),
+                    Local::WasmTrampoline { module } => Wit::WasmTrampoline(String::from(&*module)),
+                    Local::Native(address) => Wit::Native(address),
+                }
+            }
+
+            fn convert_instruction_profile_error(
+                error: crate::InstructionProfileError,
+            ) -> $wit::profiling::InstructionProfileError {
+                match error {
+                    crate::InstructionProfileError::NotCaptured => {
+                        $wit::profiling::InstructionProfileError::NotCaptured
+                    }
                 }
             }
 
@@ -2960,6 +3229,7 @@ where
         Ok((snapshot_program_sample(caller.data()),))
     })?;
     instance.func_wrap("subscribe", |mut caller, (period,): (u64,)| {
+        let period = stats_period(period)?;
         let reader = StreamReader::new(&mut caller, ProgramStatsStreamProducer::new(period))?;
         Ok((reader,))
     })?;
@@ -2975,6 +3245,15 @@ where
     HostFs: crate::HostFileSystem,
 {
     let mut instance = linker.instance(TRACING_INSTANCE)?;
+    instance.func_wrap(
+        "set-target-enabled",
+        |_caller, (target, enabled): (String, bool)| {
+            let result = crate::log::set_gated_target(&target, enabled).map_err(|error| {
+                program_wit::tracing::TargetError::UnknownTarget(error.to_string())
+            });
+            Ok((result,))
+        },
+    )?;
     instance.func_wrap(
         "recent",
         |caller, (filter, limit): (program_wit::tracing::Filter, u32)| {
@@ -3340,16 +3619,20 @@ where
     })?;
     instance.func_wrap("kill", |caller, (id,): (u64,)| {
         let now = caller.data().now_nanos();
-        // The flag is all this sets: the victim unwinds at its next
-        // yield point, and whoever owns it — a plugin supervisor, or
-        // nobody — decides what happens after.
-        let outcome = caller.data().instance_registry.request_kill(
-            InstanceId::from_raw(id),
-            KillReason::Operator,
-            now,
-        );
+        let victim = InstanceId::from_raw(id);
+        // The flag and the interruption are all this does: the victim
+        // unwinds at its next check, and whoever owns it — a plugin
+        // supervisor, or nobody — decides what happens after.
+        let outcome =
+            caller
+                .data()
+                .instance_registry
+                .request_kill(victim, KillReason::Operator, now);
         Ok((match outcome {
-            KillOutcome::Requested => Ok(()),
+            KillOutcome::Requested => {
+                deliver_kill(&caller.data().runtime_state, victim);
+                Ok(())
+            }
             KillOutcome::AlreadyStopping => {
                 Err(debugger_wit::instances::KillError::AlreadyStopping)
             }
@@ -3430,19 +3713,20 @@ where
         resource: Resource<SbiSerialPort>,
         max_bytes: u32,
     ) -> wasmtime::Result<Vec<u8>> {
-        accessor.with(|mut access| {
+        let writer = accessor.with(|mut access| {
             let _ = access.get().table.get(&resource)?;
-            Ok::<_, wasmtime::Error>(())
+            Ok::<_, wasmtime::Error>(access.get().serial_writer())
         })?;
-        // Poll the non-blocking serial reader and yield to the kernel
-        // executor between polls so host-fs transport and other tasks keep
-        // making progress while we wait for input.
+        // Arm the console's receive wait before polling the
+        // non-blocking serial reader so a byte that lands between the
+        // two is never lost, then park on it when the port was empty.
         loop {
+            let wait = writer.wait_for_debug_serial_input();
             let bytes = accessor.with(|mut access| access.get().try_read_serial_port(max_bytes));
             if !bytes.is_empty() {
                 return Ok(bytes);
             }
-            crate::yield_now().await;
+            wait.await;
         }
     }
 
@@ -3459,12 +3743,15 @@ where
         // whole RPC frame on the wire with a single write, and the
         // console keeps a segment indivisible, which is what stops a
         // kernel console record from landing inside a frame (#103).
-        // Another processor may own the port, so this yields to the
-        // executor rather than waiting on it.
-        while !writer.try_write(&bytes) {
-            crate::yield_now().await;
+        // Another processor may own the port, so the attempt waits on
+        // the console's transmit signal rather than on the executor.
+        loop {
+            let wait = writer.wait_for_debug_serial_output_ready();
+            if writer.try_write(&bytes) {
+                return Ok(());
+            }
+            wait.await;
         }
-        Ok(())
     }
 
     async fn flush(
@@ -3688,14 +3975,25 @@ where
     }
 }
 
+/// `stats.subscribe` was called with a period of zero.
+///
+/// The period comes from the guest and the interface has no error to
+/// answer with, so the call traps the instance that made it.
+#[derive(Debug, Error, PartialEq, Eq)]
+#[error("stats.subscribe needs a period above zero")]
+struct ZeroStatsPeriod;
+
+fn stats_period(nanos: u64) -> Result<NonZeroU64, ZeroStatsPeriod> {
+    NonZeroU64::new(nanos).ok_or(ZeroStatsPeriod)
+}
+
 struct StatsStreamProducer {
-    period_nanos: u64,
+    period_nanos: NonZeroU64,
     next_due: Option<u64>,
 }
 
 impl StatsStreamProducer {
-    fn new(period_nanos: u64) -> Self {
-        assert!(period_nanos != 0, "stats subscribe period must be non-zero");
+    fn new(period_nanos: NonZeroU64) -> Self {
         Self {
             period_nanos,
             next_due: None,
@@ -3724,7 +4022,7 @@ where
         }
 
         let now = store.data().now_nanos();
-        let period_nanos = self.period_nanos;
+        let period_nanos = self.period_nanos.get();
         let due = self
             .next_due
             .get_or_insert_with(|| now.saturating_add(period_nanos));
@@ -3739,13 +4037,12 @@ where
 }
 
 struct ProgramStatsStreamProducer {
-    period_nanos: u64,
+    period_nanos: NonZeroU64,
     next_due: Option<u64>,
 }
 
 impl ProgramStatsStreamProducer {
-    fn new(period_nanos: u64) -> Self {
-        assert!(period_nanos != 0, "stats subscribe period must be non-zero");
+    fn new(period_nanos: NonZeroU64) -> Self {
         Self {
             period_nanos,
             next_due: None,
@@ -3775,7 +4072,7 @@ where
         }
 
         let now = store.data().now_nanos();
-        let period_nanos = self.period_nanos;
+        let period_nanos = self.period_nanos.get();
         let due = self
             .next_due
             .get_or_insert_with(|| now.saturating_add(period_nanos));
@@ -3901,7 +4198,12 @@ where
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    convert_program_sample(store.runtime_state.snapshot(store.cpu.now().ticks()))
+    // A program sees only the hardware it could claim: `claim` answers
+    // as if the device were absent, and a listed device would say
+    // otherwise.
+    let mut sample = store.runtime_state.snapshot(store.cpu.now().ticks());
+    sample.restrict_to(store.process_authority());
+    convert_program_sample(sample)
 }
 
 /// Maps the kernel's block-device snapshot onto one binding set's
@@ -4371,15 +4673,15 @@ fn emit_program_stage_marker(write_serial: crate::DebugSerialWriter, stage: &str
 
 #[derive(Debug, Error)]
 enum DebuggerError {
-    #[error("failed to initialize Wasmtime engine: {0}")]
+    #[error("failed to initialize Wasmtime engine: {0:#}")]
     CreateEngine(wasmtime::Error),
     #[error("failed to validate embedded debugger artifact: {0}")]
     TrustComponent(ArtifactTrustError),
-    #[error("failed to load embedded debugger component: {0}")]
+    #[error("failed to load embedded debugger component: {0:#}")]
     LoadComponent(wasmtime::Error),
-    #[error("failed to instantiate debugger component: {0}")]
+    #[error("failed to instantiate debugger component: {0:#}")]
     InstantiateComponent(wasmtime::Error),
-    #[error("debugger component trapped: {0}")]
+    #[error("debugger component trapped: {0:#}")]
     RunComponent(wasmtime::Error),
     #[error("debugger component returned a non-zero result")]
     GuestFailed,
@@ -4392,9 +4694,18 @@ mod tests {
     use helios_hal::cpu::ProcessorId;
     use helios_hal::watchdog::ProgressCounter;
 
-    use super::{ComponentPhase, ComponentPhaseHeartbeat, spawn_component_phase_heartbeat};
+    use super::{
+        ComponentPhase, ComponentPhaseHeartbeat, ZeroStatsPeriod, spawn_component_phase_heartbeat,
+        stats_period,
+    };
     use crate::test_support::TestCpu;
     use crate::{Executor, InstanceSpawner, TaskCapacityError, TaskFunding, Timer};
+
+    #[test]
+    fn a_zero_stats_period_is_the_callers_error() {
+        assert_eq!(stats_period(0), Err(ZeroStatsPeriod));
+        assert_eq!(stats_period(1).map(|period| period.get()), Ok(1));
+    }
 
     /// One block per 64-byte granule is the most blocks an instance
     /// share can ever hold, so a run this long outlives the share
@@ -4417,6 +4728,10 @@ mod tests {
         }
 
         fn write_bytes(&self, _bytes: &[u8]) {}
+
+        fn enable_receive_interrupt(&self) {}
+
+        fn disable_receive_interrupt(&self) {}
     }
 
     static DISCARD_CONSOLE: crate::DebugConsole = crate::DebugConsole::new();
@@ -4450,10 +4765,11 @@ mod tests {
             let spawner = executor
                 .spawner(cpu)
                 .instance_spawner(TaskFunding::Instance);
+            let timer = executor.timer(cpu);
             Self {
                 executor,
                 spawner,
-                timer: Timer::new(cpu),
+                timer,
                 progress: ProgressCounter::new(),
                 cpu,
             }
@@ -4479,7 +4795,7 @@ mod tests {
         /// heartbeat whose guard has been dropped is cancelled here —
         /// which is where its arena block goes back.
         fn drain(&self) {
-            self.executor.run_until_stalled_with_stats();
+            self.executor.run_until_stalled_with_stats(&self.timer);
         }
 
         /// Moves the timer's inbox into its wheel, which is where a

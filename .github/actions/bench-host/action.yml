@@ -67,6 +67,12 @@ runs:
         if [ -e /dev/kvm ]; then
           sudo chmod 666 /dev/kvm
         fi
+    # The lane carries the inspector RPC over vsock
+    # (tools/bench/manifest.toml, #413), so the device it asks for is
+    # provisioned with the accelerator. A `uses:` path takes no
+    # expression, so this names the `checkout-path` default rather than
+    # the input; every caller checks out at `helios`.
+    - uses: ./helios/.github/actions/vhost-vsock
     - uses: astral-sh/setup-uv@v6
     - uses: taiki-e/install-action@v2
       with:

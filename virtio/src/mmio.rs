@@ -8,7 +8,7 @@ use crate::block::{QueueAffinity, VirtioBlockDevice, VirtioBlockResource};
 use crate::bus::{DmaPool, IdentityDmaPool, MmioBus};
 use crate::gpu::{VirtioGpuDevice, report_gpu_online};
 use crate::input::{VirtioInputDevice, report_input_online};
-use crate::net::VirtioNetDevice;
+use crate::net::{QueuePairBudget, VirtioNetDevice};
 use crate::p9::Virtio9pDevice;
 use crate::rng::VirtioRngDevice;
 use crate::snd::{VirtioSndDevice, report_snd_online};
@@ -69,6 +69,10 @@ pub unsafe fn block_from_mmio_with_dma<C: QueueAffinity, P: DmaPool>(
 
 /// Builds a VirtIO network device from a permanently mapped MMIO header.
 ///
+/// `pair_budget` caps the queue pairs the device may activate; it is
+/// the machine's processor count, because each pair is drained by the
+/// one packet pump its processor runs.
+///
 /// # Safety
 ///
 /// `header..header+mmio_size` must refer to a valid, permanently mapped VirtIO
@@ -77,14 +81,19 @@ pub unsafe fn block_from_mmio_with_dma<C: QueueAffinity, P: DmaPool>(
 pub unsafe fn net_from_mmio(
     header: NonNull<u8>,
     mmio_size: usize,
+    pair_budget: QueuePairBudget,
 ) -> IoResult<VirtioMmioNetDevice> {
     let bus = unsafe { MmioBus::new(header, mmio_size, IdentityDmaPool) }?;
     let transport = VirtioMmioTransport::new(bus)?;
-    VirtioNetDevice::new(transport)
+    VirtioNetDevice::new(transport, pair_budget)
 }
 
 /// Builds a VirtIO network device from a permanently mapped MMIO
 /// header, with descriptor memory taken from `dma`.
+///
+/// `pair_budget` caps the queue pairs the device may activate; it is
+/// the machine's processor count, because each pair is drained by the
+/// one packet pump its processor runs.
 ///
 /// # Safety
 ///
@@ -95,13 +104,14 @@ pub unsafe fn net_from_mmio_with_dma<P>(
     header: NonNull<u8>,
     mmio_size: usize,
     dma: P,
+    pair_budget: QueuePairBudget,
 ) -> IoResult<VirtioNetDevice<VirtioMmioTransport<MmioBus<P>>>>
 where
     P: DmaPool,
 {
     let bus = unsafe { MmioBus::new(header, mmio_size, dma) }?;
     let transport = VirtioMmioTransport::new(bus)?;
-    VirtioNetDevice::new(transport)
+    VirtioNetDevice::new(transport, pair_budget)
 }
 
 /// Builds a VirtIO 9P device from a permanently mapped MMIO header.

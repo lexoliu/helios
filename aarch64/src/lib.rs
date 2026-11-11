@@ -17,7 +17,10 @@ use helios_hal::boot::{
     BootMemoryRegion, BootModule, BootModules, BootReservedRanges, FirmwareKind,
     usable_region_segments,
 };
-use helios_hal::cpu::{Cpu, HardwarePerfCounters, Instant, ProcessorId};
+use helios_hal::cpu::{
+    Cpu, GUEST_STACK_LIMIT_OFFSET, HardwarePerfCounters, Instant, ProcessorId, Timebase,
+    TimerInterrupt,
+};
 use helios_hal::critical_section::ProcessorIdentity;
 use helios_hal::entropy::{EntropyQuality, EntropyUnavailable};
 use helios_hal::memory::MemoryRegion;
@@ -26,7 +29,8 @@ use helios_hal::{
     DeviceInventory, DmaModel, Platform, ProcessorStartupPolicy, ProcessorTopology, align_up,
 };
 use helios_kernel::{
-    DebugSerialAccess, KernelException, KernelExceptionCause, Timer, WasmtimeTlsSlots,
+    DebugSerialAccess, DebugSerialInterrupt, KernelException, KernelExceptionCause, Timer,
+    WasmtimeTlsSlots,
 };
 use limine::BaseRevision;
 use limine::file::File;
@@ -72,6 +76,13 @@ const PL011_DATA: usize = 0x000;
 const PL011_FLAG: usize = 0x018;
 const PL011_FLAG_RXFE: u32 = 1 << 4;
 const PL011_FLAG_TXFF: u32 = 1 << 5;
+const PL011_IFLS: usize = 0x034;
+const PL011_IMSC: usize = 0x038;
+const PL011_ICR: usize = 0x044;
+/// Receive and receive-timeout interrupt bits, which share their
+/// positions across the mask and clear registers.
+const PL011_INT_RX: u32 = 1 << 4;
+const PL011_INT_RT: u32 = 1 << 6;
 
 #[cfg(target_os = "none")]
 global_asm!(
@@ -199,6 +210,7 @@ pub(crate) type DeviceInterruptRoutes = helios_kernel::ExternalInterruptRoutes<
     input::VirtioInputDevice,
     snd::VirtioSoundDevice,
     block::VirtioBlockDevice,
+    DebugSerialInterrupt<DebugSerial>,
 >;
 
 #[used]
@@ -258,56 +270,67 @@ static MMIO_PAGE_TABLE_0: PageTable = PageTable::new();
 static MMIO_PAGE_TABLE_1: PageTable = PageTable::new();
 static MMIO_PAGE_TABLE_2: PageTable = PageTable::new();
 
+/// The processor's local block, addressed by `tpidr_el1`.
+///
+/// The layout is `#[repr(C)]` because compiled guest code reads
+/// `guest_stack_limit` at `tpidr_el1 + GUEST_STACK_LIMIT_OFFSET`; the offset
+/// is asserted below.
 #[repr(C)]
 struct ProcessorRuntime {
-    exception_stack: ExceptionStack,
     logical_id: u16,
     _reserved: u16,
-    wasmtime_tls: WasmtimeTlsSlots,
+    /// Block size in bytes for the `DC ZVA` cache-line zero
+    /// instruction, cached from `DCZID_EL0` at processor bring-up.
+    /// Zero means DC ZVA is prohibited on this PE (`DCZID_EL0.DZP`
+    /// is set) and callers must fall back to a generic memset.
+    dc_zva_block_bytes: AtomicU32,
     started: AtomicBool,
-    /// This processor's kernel timer, published once its own
-    /// `helios_kernel::init` has run so the timer PPI can advance it.
-    timer: Once<Timer<Aarch64Cpu>>,
-    /// The component-host program service, published on the processor
-    /// that owns it so the timer PPI can drive epoch interruption.
-    program_service: Once<debug_state::ProgramService>,
-    /// Device interrupt routes, installed on the bootstrap processor
-    /// only: every device SPI is routed to it.
-    device_interrupts: Once<DeviceInterruptRoutes>,
     /// Set by `wake_processor` before it sends the wake SGI, cleared by
     /// `park_current` under masked interrupts. It closes the window
     /// between the run loop finding its queue empty and the `wfi` that
     /// parks: a wake published in that window is observed instead of
     /// slept through.
     wake_pending: AtomicBool,
-    /// Block size in bytes for the `DC ZVA` cache-line zero
-    /// instruction, cached from `DCZID_EL0` at processor bring-up.
-    /// Zero means DC ZVA is prohibited on this PE (`DCZID_EL0.DZP`
-    /// is set) and callers must fall back to a generic memset.
-    dc_zva_block_bytes: AtomicU32,
+    /// The stack limit of the guest running on this processor, under
+    /// [`GUEST_STACK_LIMIT_OFFSET`]'s contract: Wasmtime publishes it through
+    /// `wasmtime_processor_stack_limit`, and any processor may store the
+    /// interrupt sentinel into it.
+    guest_stack_limit: AtomicUsize,
+    exception_stack: ExceptionStack,
+    wasmtime_tls: WasmtimeTlsSlots,
+    /// This processor's kernel timer, published once its own
+    /// `helios_kernel::init` has run so the timer PPI can advance it.
+    timer: Once<Timer<Aarch64Cpu>>,
+    /// The component-host program service, published on every processor
+    /// so the timer PPI can preempt the guest running here.
+    program_service: Once<debug_state::ProgramService>,
+    /// Device interrupt routes, installed on the bootstrap processor
+    /// only: every device SPI is routed to it.
+    device_interrupts: Once<DeviceInterruptRoutes>,
 }
 
 impl ProcessorRuntime {
     fn new(logical_id: u16) -> Self {
         Self {
-            exception_stack: ExceptionStack::new(),
             logical_id,
             _reserved: 0,
-            wasmtime_tls: WasmtimeTlsSlots::new(),
+            dc_zva_block_bytes: AtomicU32::new(0),
             started: AtomicBool::new(false),
+            wake_pending: AtomicBool::new(false),
+            guest_stack_limit: AtomicUsize::new(usize::MAX),
+            exception_stack: ExceptionStack::new(),
+            wasmtime_tls: WasmtimeTlsSlots::new(),
             timer: Once::new(),
             program_service: Once::new(),
             device_interrupts: Once::new(),
-            wake_pending: AtomicBool::new(false),
-            dc_zva_block_bytes: AtomicU32::new(0),
         }
     }
 }
 
-/// The exception entries in `entry.S` derive the per-processor
-/// exception stack from `tpidr_el1`, which only holds if the stack is
-/// the first field of the runtime.
-const _: () = assert!(core::mem::offset_of!(ProcessorRuntime, exception_stack) == 0);
+const _: () = assert!(
+    core::mem::offset_of!(ProcessorRuntime, guest_stack_limit) == GUEST_STACK_LIMIT_OFFSET as usize,
+    "compiled guest code would compare its stack pointer against the wrong word"
+);
 
 #[repr(C, align(16))]
 struct ExceptionStack([u8; EXCEPTION_STACK_BYTES]);
@@ -325,13 +348,13 @@ struct Aarch64ProcessorSlot {
 
 struct Aarch64PlatformState {
     processors: Box<[Aarch64ProcessorSlot]>,
-    timer_frequency: u64,
+    timebase: Timebase,
     debug_state: Once<debug_state::RuntimeState>,
     gic: Once<gic::Gic>,
 }
 
 impl Aarch64PlatformState {
-    fn from_limine_mp(timer_frequency: u64) -> &'static Self {
+    fn from_limine_mp(timebase: Timebase) -> &'static Self {
         let response = MP_REQUEST
             .response()
             .unwrap_or_else(|| panic!("Limine did not provide an AArch64 MP response"));
@@ -370,7 +393,7 @@ impl Aarch64PlatformState {
             .into_boxed_slice();
         Box::leak(Box::new(Self {
             processors,
-            timer_frequency,
+            timebase,
             debug_state: Once::new(),
             gic: Once::new(),
         }))
@@ -449,7 +472,7 @@ impl Aarch64PlatformState {
         slot.mp_info
             .bootstrap(aarch64_secondary_entry, self as *const _ as u64);
         let deadline = read_counter()
-            .checked_add(self.timer_frequency / 2)
+            .checked_add(self.timebase.frequency() / 2)
             .unwrap_or_else(|| panic!("AArch64 secondary startup deadline overflow"));
         while !slot.runtime.started.load(Ordering::Acquire) {
             assert!(
@@ -552,22 +575,24 @@ extern "C" fn aarch64_kernel_main() -> ! {
     let reserved_ranges = boot_reserved_ranges(&handoff);
     let memory_regions = boot_memory_regions(&handoff, physical_memory_offset, &reserved_ranges);
     helios_kernel::prime_bootstrap_allocator(memory_regions, processor_count);
+    let payload = helios_kernel::BootPayload::from_boot_modules(&handoff.modules);
     // The rest of the description needs the heap: the ACPI path has to
     // interpret AML to reach a device's `_CRS`.
     let platform = tables
         .describe(console)
         .unwrap_or_else(|error| panic!("AArch64 platform description failed: {error}"));
     vmm::install_user_address_space(physical_memory_offset);
-    let platform_state = Aarch64PlatformState::from_limine_mp(timer_frequency());
+    let platform_state = Aarch64PlatformState::from_limine_mp(timebase());
     activate_processor_runtime(platform_state.bootstrap_runtime());
 
     let cpu = Aarch64Cpu {
         state: platform_state,
     };
     let debug_state = debug_state::RuntimeState::new(
-        cpu.timer_frequency(),
+        cpu.timebase(),
         cpu.processor_count(),
         cpu.now().ticks(),
+        payload,
     );
     platform_state.install_debug_state(debug_state.clone());
     let console = helios_kernel::RecordingConsole::new(
@@ -615,7 +640,7 @@ extern "C" fn aarch64_kernel_main() -> ! {
                 )
                 .with_startup_policy(ProcessorStartupPolicy::BootstrapOnly),
             )
-            .with_timer_frequency_hz(cpu.timer_frequency())
+            .with_timer_frequency_hz(cpu.timebase().frequency())
             .with_dma_model(DmaModel::Translated)
             .with_devices(devices),
     );
@@ -640,10 +665,15 @@ extern "C" fn aarch64_kernel_main() -> ! {
     // the bootloader left behind, and a read of the entropy device.
     // None is a fallback for another. This follows `init` so the source
     // line reaches the log the kernel just installed.
+    // No VM generation ID window is discovered on this platform yet, so
+    // the machine generation moves only through `advance`.
+    let machine_generation = helios_kernel::MachineGeneration::new(None);
+    debug_state.install_machine_generation(machine_generation.clone());
     let root_entropy = helios_kernel::seed_root_entropy(
         &cpu,
         platform.boot_entropy_seed,
         entropy_device.as_ref().map(|entropy| &entropy.device),
+        machine_generation,
     );
     debug_state.install_root_entropy(root_entropy.clone());
     // The calendar is read once, here, before any component can ask
@@ -671,6 +701,20 @@ extern "C" fn aarch64_kernel_main() -> ! {
     device::install_hooks(gic);
 
     let mut routes = DeviceInterruptRoutes::new();
+    // The console UART is a device the kernel drives itself: its SPI is
+    // routed to the bootstrap processor and enabled exactly like the
+    // virtio transports'. The handler masks the receive line at the port
+    // and raises the debug console's receive signal; the waiter re-arms
+    // the line while it listens.
+    gic.enable_device_interrupt(
+        platform.console.interrupt.intid(),
+        platform.console.interrupt.trigger,
+        platform_state.bootstrap_mpidr(),
+    );
+    routes.set_debug_serial(
+        platform.console.interrupt.intid(),
+        DebugSerial::console().interrupt_handler::<DebugSerial>(),
+    );
     if let Some(host_fs) = host_fs::install(
         &cpu,
         &platform,
@@ -853,6 +897,9 @@ extern "Rust" fn helios_current_processor() -> ProcessorId {
 }
 
 impl Cpu for Aarch64Cpu {
+    // `CNTV_CVAL_EL0` is this processor's one-shot comparator.
+    const TIMER_INTERRUPT: TimerInterrupt = TimerInterrupt::Deadline;
+
     fn processor_count(&self) -> usize {
         self.state.processor_count()
     }
@@ -898,8 +945,8 @@ impl Cpu for Aarch64Cpu {
         Instant::new(read_counter())
     }
 
-    fn timer_frequency(&self) -> u64 {
-        self.state.timer_frequency
+    fn timebase(&self) -> Timebase {
+        self.state.timebase
     }
 
     fn hardware_perf_counters(&self) -> HardwarePerfCounters {
@@ -1026,7 +1073,7 @@ impl ProcessorRuntime {
 
 fn activate_processor_runtime(runtime: &'static ProcessorRuntime) {
     let ptr = runtime as *const _ as usize;
-    let exception_stack_top = ptr
+    let exception_stack_top = (&raw const runtime.exception_stack as usize)
         .checked_add(EXCEPTION_STACK_BYTES)
         .unwrap_or_else(|| panic!("AArch64 exception stack top overflow"));
     unsafe {
@@ -1165,21 +1212,19 @@ unsafe extern "C" fn aarch64_secondary_main(mp_info: &MpInfo) -> ! {
     );
     let kernel = helios_kernel::init(
         Platform::new(console, core::iter::empty::<MemoryRegion>(), cpu)
-            .with_timer_frequency_hz(cpu.timer_frequency())
+            .with_timer_frequency_hz(cpu.timebase().frequency())
             .with_dma_model(DmaModel::Translated)
             .with_devices(DeviceInventory::new().with_debug_serial()),
     );
     let runtime = current_processor_runtime();
     runtime.install_timer(kernel.timer());
-    if let Some(program_service) = helios_kernel::install_component_host_program_service(
-        &kernel,
-        &cpu,
-        &debug_state,
-        read_debug_serial,
-        DEBUG_SERIAL_WRITER,
-    ) {
-        runtime.install_program_service(program_service);
-    }
+    // Every processor's timer preempts the guest running on it, so every
+    // processor holds the service the bootstrap processor installed
+    // before it started this one.
+    let program_service = debug_state.program_service().unwrap_or_else(|| {
+        panic!("AArch64 secondary processor started before program service installation")
+    });
+    runtime.install_program_service(program_service);
     // SAFETY: this processor's CPU interface is initialised and its
     // timer is published; device interrupts are routed to the
     // bootstrap processor, so only private interrupts arrive here.
@@ -1389,8 +1434,10 @@ extern "C" fn aarch64_handle_irq() {
             // The wake carries no payload: returning from `wfi` is the
             // whole message, and `park_current` owns the flag.
         } else if intid == gic::VIRTUAL_TIMER_PPI {
+            // Every processor's timer interrupt ends the slice of every
+            // guest on the machine that has run one.
             if let Some(program_service) = runtime.program_service.get() {
-                program_service.increment_epoch();
+                program_service.preempt_overdue_guests();
             }
             runtime
                 .timer
@@ -1619,13 +1666,15 @@ fn read_counter() -> u64 {
     value
 }
 
-fn timer_frequency() -> u64 {
+/// The generic timer's timebase, from the frequency firmware programmed
+/// into `CNTFRQ_EL0`.
+fn timebase() -> Timebase {
     let value: u64;
     unsafe {
         asm!("mrs {value}, cntfrq_el0", value = out(reg) value, options(nomem, nostack, preserves_flags));
     }
     assert!(value != 0, "AArch64 CNTFRQ_EL0 reported zero");
-    value
+    Timebase::new(value)
 }
 
 fn cache_line_bytes() -> usize {
@@ -1878,7 +1927,20 @@ impl DebugSerial {
         }
     }
 
-    fn init(self) {}
+    /// Programs the FIFO triggers the receive interrupt fires on, and
+    /// retires any condition the firmware left latched.
+    ///
+    /// The line itself stays masked — the debug console's first waiter
+    /// arms it. The receive trigger is the lowest the hardware offers —
+    /// one eighth full — so a burst below it still raises the timeout
+    /// interrupt once the line goes quiet.
+    fn init(self) {
+        unsafe {
+            ((self.base + PL011_IMSC) as *mut u32).write_volatile(0);
+            ((self.base + PL011_ICR) as *mut u32).write_volatile(PL011_INT_RX | PL011_INT_RT);
+            ((self.base + PL011_IFLS) as *mut u32).write_volatile(0);
+        }
+    }
 
     fn read_flag(self) -> u32 {
         unsafe { ((self.base + PL011_FLAG) as *const u32).read_volatile() }
@@ -1910,6 +1972,20 @@ impl ByteSerial for DebugSerial {
         for &byte in bytes {
             self.write_byte(byte);
         }
+    }
+
+    /// Receive and receive-timeout are the only mask bits this port
+    /// uses, so a plain write of exactly them rather than a
+    /// read-modify-write. Idempotent, and callable from interrupt
+    /// context: a register write, no lock, no allocation.
+    fn enable_receive_interrupt(&self) {
+        unsafe {
+            ((self.base + PL011_IMSC) as *mut u32).write_volatile(PL011_INT_RX | PL011_INT_RT)
+        };
+    }
+
+    fn disable_receive_interrupt(&self) {
+        unsafe { ((self.base + PL011_IMSC) as *mut u32).write_volatile(0) };
     }
 }
 
@@ -2181,6 +2257,15 @@ extern "C" fn wasmtime_tls_set(slot: usize, ptr: *mut u8) {
     current_processor_runtime().wasmtime_tls.set(slot, ptr);
 }
 
+/// The executing processor's guest stack-limit word, the location the
+/// kernel's engines publish stack limits to
+/// (`helios_hal::cpu::GUEST_STACK_LIMIT_OFFSET`).
+#[cfg(target_os = "none")]
+#[unsafe(no_mangle)]
+extern "C" fn wasmtime_processor_stack_limit() -> *mut usize {
+    current_processor_runtime().guest_stack_limit.as_ptr()
+}
+
 #[cfg(target_os = "none")]
 #[unsafe(no_mangle)]
 extern "C" fn wasmtime_init_traps(handler: helios_kernel::KernelNativeTrapHandler) -> i32 {
@@ -2188,38 +2273,29 @@ extern "C" fn wasmtime_init_traps(handler: helios_kernel::KernelNativeTrapHandle
     0
 }
 
+/// The calling processor's timer, for the Wasmtime parking hooks.
 #[cfg(target_os = "none")]
-#[unsafe(no_mangle)]
-extern "C" fn wasmtime_parking_wait(timeout_nanos: u64) {
-    if timeout_nanos == 0 {
-        return;
-    }
-    if timeout_nanos == u64::MAX {
-        unsafe {
-            asm!("wfe", options(nomem, nostack, preserves_flags));
-        }
-        return;
-    }
-
-    let ticks = ((u128::from(timeout_nanos) * u128::from(timer_frequency())) / 1_000_000_000)
-        .clamp(1, u128::from(u64::MAX)) as u64;
-    let deadline = read_counter().saturating_add(ticks);
-    while read_counter() < deadline {
-        unsafe {
-            asm!("wfe", options(nomem, nostack, preserves_flags));
-        }
-    }
+fn wasmtime_parking_timer() -> &'static Timer<Aarch64Cpu> {
+    current_processor_runtime()
+        .timer
+        .get()
+        .expect("AArch64 processor timer was read before it was installed")
 }
 
-#[inline]
-fn signal_waiting_processors() {
-    unsafe {
-        asm!("sev", options(nomem, nostack, preserves_flags));
-    }
+#[cfg(target_os = "none")]
+#[unsafe(no_mangle)]
+extern "C" fn wasmtime_parking_wait(timeout_nanos: u64) -> bool {
+    helios_kernel::park_wasmtime_waiter(wasmtime_parking_timer(), timeout_nanos)
 }
 
 #[cfg(target_os = "none")]
 #[unsafe(no_mangle)]
 extern "C" fn wasmtime_parking_unpark() {
-    signal_waiting_processors();
+    helios_kernel::unpark_wasmtime_waiters();
+}
+
+#[cfg(target_os = "none")]
+#[unsafe(no_mangle)]
+extern "C" fn wasmtime_monotonic_nanos() -> u64 {
+    helios_kernel::wasmtime_monotonic_nanos(wasmtime_parking_timer())
 }

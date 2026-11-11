@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 use bytes::Bytes;
 use divan::counter::ItemsCount;
 use divan::{AllocProfiler, Bencher, black_box};
-use helios_hal::cpu::{Cpu, HardwarePerfCounters, Instant, ProcessorId};
+use helios_hal::cpu::{Cpu, HardwarePerfCounters, Instant, ProcessorId, Timebase, TimerInterrupt};
 use helios_hal::fs::FileRights;
 use helios_hal::resource::KernelResource;
 use helios_hal::watchdog::ProgressCounter;
@@ -15,8 +15,9 @@ use helios_kernel::{
     FutexKey, FutexTable, GuestAddress, Ipv4Address, Ipv4Cidr, Ipv4Route, MacAddress,
     NetworkAdminBackend, NetworkBridgeRequest, NetworkControlError, NetworkErrorDetail,
     NetworkIpAddress, NetworkPortId, Notify, PingError, PingErrorKind, PingReply,
-    ProcessMemoryIdentity, TcpAccepted, TcpError, TcpErrorKind, TcpListener, Timer, TryRead,
-    TryWrite, UdpBinding, UdpDatagram, UdpError, UdpErrorKind, byte_channel,
+    ProcessMemoryIdentity, TcpAccepted, TcpError, TcpErrorKind, TcpListener, TcpReadProgress,
+    TcpWriteProgress, TryRead, TryWrite, UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
+    byte_channel,
 };
 use spin::{Mutex, Once};
 
@@ -40,11 +41,45 @@ struct OnceNetworkServiceSlot {
 }
 
 #[derive(Clone)]
-struct BenchCpu;
+struct BenchCpu {
+    timebase: Timebase,
+}
+
+impl BenchCpu {
+    fn new() -> Self {
+        Self {
+            timebase: Timebase::new(1_000_000),
+        }
+    }
+}
 
 fn main() {
     divan::main();
 }
+
+/// The executing processor, which every image supplies (see
+/// `helios_hal::cpu::current_processor`). This bench models a
+/// one-processor machine ([`BenchCpu::processor_count`]) and divan runs
+/// it on one thread, so every code path executes on processor 0.
+#[unsafe(no_mangle)]
+extern "Rust" fn helios_current_processor() -> ProcessorId {
+    ProcessorId::new(0)
+}
+
+/// The kernel timer masks local interrupts around its deadline record;
+/// a benchmark runs as a host process, where nothing interrupts a
+/// thread, so there is nothing to mask.
+struct BenchInterruptMask;
+
+impl helios_hal::critical_section::LocalInterruptMask for BenchInterruptMask {
+    fn mask() -> bool {
+        false
+    }
+
+    unsafe fn restore(_was_enabled: bool) {}
+}
+
+helios_hal::critical_section::set_local_interrupt_mask_impl!(BenchInterruptMask);
 
 #[divan::bench(args = [16usize, 64, 256])]
 fn descriptor_insert_close_reuse(bencher: Bencher, count: usize) {
@@ -328,7 +363,8 @@ fn futex_prepare_complete_distinct_keys(bencher: Bencher, count: usize) {
 
 #[divan::bench(args = [1usize, 64, 1024])]
 fn timer_sleep_future_create_drop(bencher: Bencher, count: usize) {
-    let timer = Timer::new(BenchCpu);
+    let timer =
+        Executor::new(ProgressCounter::new(), 1, ProcessorId::new(0)).timer(BenchCpu::new());
     // Created-but-never-polled sleeps model timeout candidates that lose a
     // select/race before the executor parks the task. They must not allocate;
     // pending sleeps still allocate one timer state until the sleep-state pool
@@ -372,7 +408,8 @@ fn notify_coalesced_presignaled_future_wait(bencher: Bencher, count: usize) {
 #[divan::bench(args = [1usize, 64, 1024])]
 fn executor_spawn_detached_run_global(bencher: Bencher, count: usize) {
     let executor = Executor::new(ProgressCounter::new(), 1, ProcessorId::new(0));
-    let spawner = executor.spawner(BenchCpu);
+    let spawner = executor.spawner(BenchCpu::new());
+    let timer = executor.timer(BenchCpu::new());
     // Task allocation includes the scheduler capture stored by async-task. This
     // benchmark keeps the per-task byte count visible while we move toward a
     // pooled task/waker design; removing the runtime progress-mode field moved
@@ -381,7 +418,7 @@ fn executor_spawn_detached_run_global(bencher: Bencher, count: usize) {
         for _ in 0..count {
             spawner.spawn_detached(async {});
         }
-        let stats = executor.run_until_stalled_with_stats();
+        let stats = executor.run_until_stalled_with_stats(&timer);
         assert_eq!(stats.global_runnable_count(), count);
         assert_eq!(stats.local_runnable_count(), 0);
     });
@@ -390,7 +427,8 @@ fn executor_spawn_detached_run_global(bencher: Bencher, count: usize) {
 #[divan::bench(args = [1usize, 64, 1024])]
 fn executor_spawn_detached_run_local(bencher: Bencher, count: usize) {
     let executor = Executor::new(ProgressCounter::new(), 1, ProcessorId::new(0));
-    let spawner = executor.spawner(BenchCpu);
+    let spawner = executor.spawner(BenchCpu::new());
+    let timer = executor.timer(BenchCpu::new());
     // Local tasks still carry owner-processor routing state, so the scheduler
     // capture is slightly larger than the global path: 73 B per no-op task on
     // this host after removing the runtime progress-mode field.
@@ -398,7 +436,7 @@ fn executor_spawn_detached_run_local(bencher: Bencher, count: usize) {
         for _ in 0..count {
             spawner.spawn_local_detached(async {});
         }
-        let stats = executor.run_until_stalled_with_stats();
+        let stats = executor.run_until_stalled_with_stats(&timer);
         assert_eq!(stats.local_runnable_count(), count);
         assert_eq!(stats.global_runnable_count(), 0);
     });
@@ -669,6 +707,32 @@ impl ComponentNetworkService for BenchNetworkService {
         Ok(Some(self.payload.clone()))
     }
 
+    fn tcp_try_read(
+        &self,
+        _stream: Self::TcpStream,
+        _max_bytes: usize,
+    ) -> Result<TcpReadProgress, TcpError> {
+        Ok(TcpReadProgress::Data(self.payload.clone()))
+    }
+
+    fn tcp_send_room(&self, _stream: Self::TcpStream) -> Result<TcpWriteProgress, TcpError> {
+        Ok(TcpWriteProgress::Room(usize::MAX))
+    }
+
+    fn tcp_try_write(
+        &self,
+        _stream: Self::TcpStream,
+        bytes: &mut Bytes,
+    ) -> Result<TcpWriteProgress, TcpError> {
+        let written = bytes.len();
+        bytes.clear();
+        Ok(TcpWriteProgress::Room(written))
+    }
+
+    async fn tcp_write_ready(&self, _stream: Self::TcpStream) -> Result<(), TcpError> {
+        Ok(())
+    }
+
     async fn tcp_shutdown_send(&self, _stream: Self::TcpStream) -> Result<(), TcpError> {
         Ok(())
     }
@@ -735,6 +799,8 @@ impl ComponentNetworkService for BenchNetworkService {
 }
 
 impl Cpu for BenchCpu {
+    const TIMER_INTERRUPT: TimerInterrupt = TimerInterrupt::Deadline;
+
     fn processor_count(&self) -> usize {
         1
     }
@@ -753,8 +819,8 @@ impl Cpu for BenchCpu {
         Instant::new(0)
     }
 
-    fn timer_frequency(&self) -> u64 {
-        1_000_000
+    fn timebase(&self) -> Timebase {
+        self.timebase
     }
 
     fn hardware_perf_counters(&self) -> HardwarePerfCounters {

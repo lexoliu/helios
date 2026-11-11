@@ -257,23 +257,13 @@ jobs:
           grep -Fqx oob-load:before-fault oob-load-smoke.out
           grep -Fqx guest-alive oob-load-smoke.out
           ! grep -Fq 'Kernel panic' oob-load-smoke.out
+      - uses: ./helios/.github/actions/vhost-vsock
       - name: Boot riscv64 guest with the inspector RPC on vsock
         shell: bash
         working-directory: helios
         env:
           HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
         run: |
-          # vsock is the only transport whose host half needs a kernel
-          # module, and the inspector refuses rather than falling back,
-          # so a runner without it fails this step loudly.
-          sudo modprobe vhost_vsock
-          sudo udevadm settle
-          # udev creates the node root:kvm mode 0660 and the runner
-          # account is not in that group, so QEMU's vhost backend cannot
-          # open it. Hand the node to this account before asking for it.
-          sudo chmod 0666 /dev/vhost-vsock
-          ls -l /dev/vhost-vsock
-          id
           ./target/release/helios-inspector vm --arch riscv64 --release --memory 2G \
             --accel tcg \
             --rpc-transport vsock \
@@ -632,6 +622,51 @@ jobs:
           cat coreutils-smoke.out
           grep -Fqx coreutils:ok coreutils-smoke.out
           grep -Fqx bin coreutils-smoke.out
+      - name: Run CPython twice and record its launch phases
+        shell: bash
+        working-directory: helios
+        run: |
+          # Without this the step reports tee's status, not the
+          # command's, and a runner script that fails is invisible.
+          set -o pipefail
+          # Issue #311's fixed per-launch cost lives somewhere in the
+          # exec path; on aarch64/HVF the trace cleared the bootfs read,
+          # the signature check and 9p, leaving the x86-specific memory
+          # path unmeasured (#352). This boot is the KVM measurement:
+          # --enable-target opens helios_kernel::exec::phases on the
+          # kernel console filter and each launch emits one line — every
+          # phase's offset from rpc-arrival, written once after the
+          # guest ran so the UART cost lands outside every interval.
+          # Two python3 launches give one cold and one warm split, and
+          # debug-serial.log is the artifact the orchestrator reads the
+          # split from. docs/benchmarks.md lists the fields.
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/cpython-phases"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+            --accel kvm \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger --boot-program python3 \
+            --no-compiler-plugin \
+            --enable-target helios_kernel::exec::phases \
+            shell -c 'python3 -c "print(1)"; python3 -c "print(2)"' \
+            2>&1 > cpython-phases-smoke.out | tee "$runtime/inspector.log"
+          cat cpython-phases-smoke.out
+          # debug-serial.log carries console escape bytes, so grep reads
+          # it as text with -a. `program` on a launch line is the
+          # launched program's name — the RPC path or the argv name or
+          # the resolved guest path, all of which name python3 here.
+          lines="$(grep -a 'phase_count' "$runtime/debug-serial.log" | grep -a 'python3')"
+          echo "$lines"
+          # Each launch emits exactly one line carrying phase_count.
+          test "$(echo "$lines" | grep -ac 'phase_count')" -eq 2
+          # The cold launch paid a deserialize; the warm launch's
+          # deserialize cache hit means it never reached that phase, so
+          # the field is absent from its line.
+          cold="$(echo "$lines" | grep -a 'cache_hit=false')"
+          warm="$(echo "$lines" | grep -a 'cache_hit=true')"
+          echo "$cold" | grep -aq 'deserialize_ns'
+          test "$(echo "$warm" | grep -ac 'deserialize_ns')" -eq 0
+          echo "$warm" | grep -aq 'cache_hit=true'
       - name: Compile a guest with the in-kernel compiler plugin
         shell: bash
         working-directory: helios
@@ -680,6 +715,222 @@ jobs:
           grep -Fqx oob-load:before-fault oob-load-smoke.out
           grep -Fqx guest-alive oob-load-smoke.out
           ! grep -Fq 'Kernel panic' oob-load-smoke.out
+      - name: Refuse a guest-written cwasm whose signature does not verify
+        shell: bash
+        working-directory: helios
+        run: |
+          # Without this the step reports tee's status, not the
+          # command's, and a runner script that fails is invisible.
+          set -o pipefail
+          # Only bytes that came from the boot payload load without a
+          # signature check; a cwasm a guest writes must verify against
+          # the kernel's trusted roots (#483). CPython copies a bootfs
+          # cwasm to /copy unchanged and to /forged with the last byte
+          # of its payload signature flipped. The copy is still signed
+          # by the trusted root and runs; the forged one must be refused,
+          # so its marker line must not print a second time. A missing
+          # /forged is refused too, so the writes must report success.
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/unsigned-cwasm"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+            --accel kvm \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger --boot-program python3 \
+            --boot-program wasix-atomic-wait-timeout --no-compiler-plugin \
+            shell --trace-log "$runtime/guest-tracing.log" \
+            -c 'python3 -c "import pathlib; b = pathlib.Path(\"/bin/wasix-atomic-wait-timeout\").read_bytes(); pathlib.Path(\"/copy\").write_bytes(b); f = bytearray(b); f[-13] ^= 1; pathlib.Path(\"/forged\").write_bytes(bytes(f))" && echo cwasm:written; /copy && echo copy:ran; /forged && echo forged:ran || echo forged:refused' \
+            2>&1 > unsigned-cwasm-smoke.out | tee "$runtime/inspector.log"
+          cat unsigned-cwasm-smoke.out
+          grep -Fqx cwasm:written unsigned-cwasm-smoke.out
+          grep -Fqx copy:ran unsigned-cwasm-smoke.out
+          grep -Fqx forged:refused unsigned-cwasm-smoke.out
+          test "$(grep -cF forged:ran unsigned-cwasm-smoke.out)" -eq 0
+          test "$(grep -cFx atomic-wait-timeout:ok unsigned-cwasm-smoke.out)" -eq 1
+          ! grep -Fq 'Kernel panic' unsigned-cwasm-smoke.out
+      - name: Time out a memory.atomic.wait nobody notifies
+        # A wait that is never cut short hangs here, not in a later step.
+        timeout-minutes: 5
+        shell: bash
+        working-directory: helios
+        run: |
+          # Without this the step reports tee's status, not the
+          # command's, and a runner script that fails is invisible.
+          set -o pipefail
+          # A timed wait on bare metal used to re-park for its whole
+          # timeout after every wake and never return TimedOut (#455).
+          # The guest waits 20 ms with no notifier and prints its marker
+          # only for result 2 after at least that long; a regression hangs
+          # and the lane's timeout names it.
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/atomic-wait-timeout"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+            --accel kvm \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger \
+            --boot-program wasix-atomic-wait-timeout --no-compiler-plugin \
+            shell --trace-log "$runtime/guest-tracing.log" \
+            -c '/bin/wasix-atomic-wait-timeout' \
+            2>&1 > atomic-wait-timeout-smoke.out | tee "$runtime/inspector.log"
+          cat atomic-wait-timeout-smoke.out
+          grep -Fqx atomic-wait-timeout:ok atomic-wait-timeout-smoke.out
+          ! grep -Fq 'Kernel panic' atomic-wait-timeout-smoke.out
+      - name: Kill a thread parked in memory.atomic.wait
+        # A wait that is never cut short hangs here, not in a later step.
+        timeout-minutes: 5
+        shell: bash
+        working-directory: helios
+        run: |
+          # Without this the step reports tee's status, not the
+          # command's, and a runner script that fails is invisible.
+          set -o pipefail
+          # A thread parked forever in memory.atomic.wait32 used to panic
+          # the kernel when a kill or signal dropped its call (#445). The
+          # parent signals it and prints its marker only after thread_join
+          # returns, which needs the parked fiber to have unwound.
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/atomic-wait-kill"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+            --accel kvm \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger \
+            --boot-program wasix-atomic-wait-kill --no-compiler-plugin \
+            shell --trace-log "$runtime/guest-tracing.log" \
+            -c '/bin/wasix-atomic-wait-kill' \
+            2>&1 > "$runtime/guest.log" | tee "$runtime/inspector.log"
+          cat "$runtime/guest.log"
+          grep -Fqx atomic-wait-kill:ok "$runtime/guest.log"
+          ! grep -Fq 'Kernel panic' "$runtime/guest.log"
+      - name: End a process whose threads are still running
+        # A process that leaves its threads running hangs here, not in a
+        # later step.
+        timeout-minutes: 5
+        shell: bash
+        working-directory: helios
+        run: |
+          # Without this the step reports tee's status, not the
+          # command's, and a runner script that fails is invisible.
+          set -o pipefail
+          # A WASIX process whose main returned left its threads running,
+          # and each kept a clone of the session's stdout open, so the
+          # shell reading it never returned (#462). Main returns with one
+          # thread parked forever in memory.atomic.wait32 and one spinning
+          # in pure wasm; the process must end with main's status, and
+          # the shell's echo after it proves its output closed.
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/orphan-threads"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+            --accel kvm \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger \
+            --boot-program wasix-orphan-threads --no-compiler-plugin \
+            shell --trace-log "$runtime/guest-tracing.log" \
+            -c '/bin/wasix-orphan-threads; echo orphan-threads:exit=$?' \
+            2>&1 > "$runtime/guest.log" | tee "$runtime/inspector.log"
+          cat "$runtime/guest.log"
+          grep -Fqx orphan-threads:ok "$runtime/guest.log"
+          grep -Fqx orphan-threads:exit=0 "$runtime/guest.log"
+          ! grep -Fq 'Kernel panic' "$runtime/guest.log"
+      - name: End a process from proc_exit on a spawned thread
+        # A thread's proc_exit that ends only that thread leaves main
+        # parked and hangs here, not in a later step.
+        timeout-minutes: 5
+        shell: bash
+        working-directory: helios
+        run: |
+          # Without this the step reports tee's status, not the
+          # command's, and a runner script that fails is invisible.
+          set -o pipefail
+          # POSIX exit ends the whole process from any thread (#469).
+          # Main parks forever in memory.atomic.wait32 and a spawned
+          # thread calls proc_exit(7): the process must end with 7, and
+          # the shell's echo after it proves its output closed.
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/thread-proc-exit"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+            --accel kvm \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger \
+            --boot-program wasix-thread-proc-exit --no-compiler-plugin \
+            shell --trace-log "$runtime/guest-tracing.log" \
+            -c '/bin/wasix-thread-proc-exit; echo thread-proc-exit:exit=$?' \
+            2>&1 > "$runtime/guest.log" | tee "$runtime/inspector.log"
+          cat "$runtime/guest.log"
+          grep -Fqx thread-proc-exit:spawned "$runtime/guest.log"
+          grep -Fqx thread-proc-exit:parking "$runtime/guest.log"
+          grep -Fqx thread-proc-exit:exiting "$runtime/guest.log"
+          grep -Fqx thread-proc-exit:exit=7 "$runtime/guest.log"
+          ! grep -Fq 'Kernel panic' "$runtime/guest.log"
+      - name: Replace a process from proc_exec on a spawned thread
+        # An exec on a thread that is dropped leaves main parked and
+        # hangs here, not in a later step.
+        timeout-minutes: 5
+        shell: bash
+        working-directory: helios
+        run: |
+          # Without this the step reports tee's status, not the
+          # command's, and a runner script that fails is invisible.
+          set -o pipefail
+          # POSIX execve replaces the whole process from any thread
+          # (#470). Main parks forever in memory.atomic.wait32 and a
+          # spawned thread execs /bin/dash -c 'echo thread-exec:replaced':
+          # every thread must end, the replacement must run in the
+          # process and exit 0, and the shell's echo after it proves the
+          # output closed.
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/thread-exec"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+            --accel kvm \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger \
+            --boot-program wasix-thread-exec --no-compiler-plugin \
+            shell --trace-log "$runtime/guest-tracing.log" \
+            -c '/bin/wasix-thread-exec; echo thread-exec:exit=$?' \
+            2>&1 > "$runtime/guest.log" | tee "$runtime/inspector.log"
+          cat "$runtime/guest.log"
+          grep -Fqx thread-exec:spawned "$runtime/guest.log"
+          grep -Fqx thread-exec:parking "$runtime/guest.log"
+          grep -Fqx thread-exec:exec "$runtime/guest.log"
+          grep -Fqx thread-exec:replaced "$runtime/guest.log"
+          grep -Fqx thread-exec:exit=0 "$runtime/guest.log"
+          ! grep -Fq 'Kernel panic' "$runtime/guest.log"
+      - name: End a process from a trap on a spawned thread
+        # A trap that ends only its thread leaves main parked and hangs
+        # here, not in a later step.
+        timeout-minutes: 5
+        shell: bash
+        working-directory: helios
+        run: |
+          # Without this the step reports tee's status, not the
+          # command's, and a runner script that fails is invisible.
+          set -o pipefail
+          # A trap ends the whole process from any thread, as SIGSEGV and
+          # SIGILL do (#473). The first run is the control: main traps on
+          # its own. In the second, main parks forever in
+          # memory.atomic.wait32 and a spawned thread traps: the process
+          # must end with the control's status, and the shell's echo
+          # after it proves its output closed.
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/thread-trap"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+            --accel kvm \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger \
+            --boot-program wasix-thread-trap --no-compiler-plugin \
+            shell --trace-log "$runtime/guest-tracing.log" \
+            -c '/bin/wasix-thread-trap main; echo main-trap:exit=$?; /bin/wasix-thread-trap; echo thread-trap:exit=$?' \
+            2>&1 > "$runtime/guest.log" | tee "$runtime/inspector.log"
+          cat "$runtime/guest.log"
+          grep -Fqx thread-trap:main-trapping "$runtime/guest.log"
+          grep -Fqx thread-trap:spawned "$runtime/guest.log"
+          grep -Fqx thread-trap:parking "$runtime/guest.log"
+          grep -Fqx thread-trap:trapping "$runtime/guest.log"
+          main_status="$(sed -n 's/^main-trap:exit=//p' "$runtime/guest.log")"
+          thread_status="$(sed -n 's/^thread-trap:exit=//p' "$runtime/guest.log")"
+          printf 'main trap exit=%s, thread trap exit=%s\n' "$main_status" "$thread_status"
+          # 0 is no trap at all, and 1 is the module's own setup failure.
+          [[ -n "$main_status" && "$main_status" != 0 && "$main_status" != 1 ]]
+          [[ "$thread_status" == "$main_status" ]]
+          ! grep -Fq 'Kernel panic' "$runtime/guest.log"
       - name: Fetch over virtio-net with curl
         shell: bash
         working-directory: helios
@@ -1107,6 +1358,10 @@ jobs:
             # the emulator would be worse than no benchmark (#118), and
             # this runner does publish /dev/kvm (probe run 33944339758).
             accel: kvm
+            # The inspector RPC every row is timed around rides vsock,
+            # not the 16550 (#413); tools/bench/manifest.toml says the
+            # same for the suite's lane.
+            rpc-transport: vsock
             # KVM boots in seconds; a marker hang should fail fast.
             boot-timeout: "300"
             # `instance-startup-100` gates this lane again. Neither
@@ -1224,6 +1479,7 @@ jobs:
           path: kernel-symbols/**/*.symbols.json
           if-no-files-found: error
           retention-days: 7
+      - uses: ./helios/.github/actions/vhost-vsock
       - name: Provision the multi-queue tap network backend
         if: matrix.net-backend == 'tap'
         working-directory: helios
@@ -1251,6 +1507,7 @@ jobs:
           HELIOS_WORKLOAD_BENCH_NET_BACKEND: ${{ matrix.net-backend }}
           HELIOS_WORKLOAD_BENCH_RUNTIME_DIR: ${{ env.BENCH_RUNTIME_DIR }}
           HELIOS_WORKLOAD_BENCH_ACCEL: ${{ matrix.accel }}
+          HELIOS_WORKLOAD_BENCH_RPC_TRANSPORT: ${{ matrix.rpc-transport }}
           # No capture here. The network workloads are the only ones
           # whose failure leaves nothing behind to read, but QEMU's
           # netfilters attach to a single-queue netdev only, and this

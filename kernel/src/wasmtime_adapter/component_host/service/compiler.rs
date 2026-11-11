@@ -13,6 +13,13 @@ where
 {
     pub(super) instance_pre: Arc<InstancePre<CompilerCoreStore<CpuImpl, Net, HostFs>>>,
     pub(super) shared: Arc<CompilerCoreShared<CompilerCoreStore<CpuImpl, Net, HostFs>>>,
+    /// The linker-reserved main-thread TLS block, initialised once by the
+    /// instance that wins the memory-init flag; every per-compile instance
+    /// adopts it because later instances skip that init and see `__tls_base == 0`.
+    pub(super) main_thread_tls_base: u32,
+    /// Names the plugin's code to the instruction sampler while the
+    /// plugin is resident.
+    pub(super) _code: crate::wasmtime_adapter::code_map::CodeRegistration,
 }
 
 pub(super) struct CompilerCompileSlot<'a> {
@@ -84,7 +91,20 @@ pub(super) struct CompilerCoreShared<T> {
     pub(super) entropy: Mutex<crate::EntropyPool>,
     pub(super) instance_pre: spin::Once<Arc<InstancePre<T>>>,
     pub(super) next_thread_id: AtomicI32,
-    pub(super) thread_tasks: Mutex<Vec<crate::JoinHandle<()>>>,
+    pub(super) thread_tasks: Mutex<Vec<crate::JoinHandle<CompilerThreadReport>>>,
+    /// The interrupt routes of the engine every compiler store runs on,
+    /// so a kill reaches each of them, the threads' included.
+    pub(super) interrupts: Arc<crate::wasmtime_adapter::preemption::GuestInterrupts>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct CompilerThreadReport {
+    pub(super) thread_id: i32,
+    pub(super) processor: u16,
+    pub(super) spawned_ns: u64,
+    pub(super) started_ns: u64,
+    pub(super) instantiated_ns: u64,
+    pub(super) finished_ns: u64,
 }
 
 impl<CpuImpl, Net, HostFs> CompilerCoreStore<CpuImpl, Net, HostFs>
@@ -207,27 +227,30 @@ pub(super) fn write_decimal(memory: &SharedMemory, ptr: u32, mut value: u32) -> 
     write_shared_memory(memory, ptr, &digits[..len]).map_or(-1, |_| len as i32)
 }
 
+/// Installs the compiler store's interrupt callback and registers the
+/// store for kills, for as long as the returned registration lives.
+///
+/// The compiler is never preempted: its calls are not driven through
+/// [`crate::wasmtime_adapter::preemption::StoreInterrupts::drive`], so no
+/// processor's running slot ever names it, and what interrupts it is a kill
+/// of its instance. The callback traps that kill, and resumes the compile when it
+/// finds none.
 pub(super) fn configure_compiler_core_store<CpuImpl, Net, HostFs>(
     store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, HostFs>>,
-) where
+) -> crate::wasmtime_adapter::preemption::StoreInterrupts<CpuImpl>
+where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    // The compiler must not be preempted by scheduler epoch ticks, but
-    // epoch bumps are also how the OOM killer wakes a CPU-bound victim,
-    // so extend the deadline tick by tick after checking for a pending
-    // kill. A u64::MAX delta is not "never": wasmtime computes
-    // `deadline = current_epoch + delta`, which wraps into the past as
-    // soon as the engine's epoch has ever advanced and then traps the
-    // very first epoch check with a bare interrupt.
-    store.set_epoch_deadline(1);
-    store.epoch_deadline_callback(|caller| {
+    store.interrupt_callback(|caller| {
         if let Some(reason) = caller.data().instance.pending_kill() {
             return Err(wasmtime::Error::from(crate::InstanceKilled { reason }));
         }
-        Ok(wasmtime::UpdateDeadline::Continue(1))
+        Ok(wasmtime::InterruptAction::Continue)
     });
+    let interrupts = store.data().shared.interrupts.clone();
+    interrupts.register(store.data().instance.id(), store, store.data().cpu.clone())
 }
 
 pub(super) fn compiler_tls_base<CpuImpl, Net, HostFs>(
@@ -257,7 +280,28 @@ where
     }
 }
 
-pub(super) fn compiler_alloc<CpuImpl, Net, HostFs>(
+pub(super) fn set_compiler_tls_base<CpuImpl, Net, HostFs>(
+    store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, HostFs>>,
+    instance: &wasmtime::Instance,
+    tls_base: u32,
+) -> Result<(), ProgramExecError>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    HostFs: crate::HostFileSystem,
+{
+    let global = instance
+        .get_global(&mut *store, "__tls_base")
+        .ok_or(ProgramExecError {
+            kind: ProgramExecErrorKind::InvalidBinary,
+            detail: ProgramExecErrorDetail::CompilerPluginInvalid,
+        })?;
+    global
+        .set(&mut *store, Val::I32(tls_base as i32))
+        .map_err(map_program_runtime_error)
+}
+
+pub(super) async fn compiler_alloc<CpuImpl, Net, HostFs>(
     store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, HostFs>>,
     alloc: &wasmtime::TypedFunc<(i32, i32), i32>,
     len: usize,
@@ -269,7 +313,8 @@ where
     HostFs: crate::HostFileSystem,
 {
     let ptr = alloc
-        .call(&mut *store, (len as i32, align as i32))
+        .call_async(&mut *store, (len as i32, align as i32))
+        .await
         .map_err(map_program_runtime_error)?;
     if ptr == 0 {
         let memory = store.data().memory();

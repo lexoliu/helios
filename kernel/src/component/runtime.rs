@@ -7,13 +7,12 @@ use bytes::Bytes;
 
 use crate::io::{ByteReader, ByteWriter, TryRead};
 use crate::{
-    ActivityChange, EntropyPool, InstanceActivity, InstanceExecutionTransition, InstanceRegistry,
-    KernelClock, KillReason, ProcessAuthority, RegisteredInstance, SetWallClockCap, Sleep, Timer,
-    nanos_to_ticks_ceil_saturating,
+    EntropyPool, InstanceActivity, InstanceRegistry, KernelClock, KillReason, ProcessAuthority,
+    RegisteredInstance, SetWallClockCap, Sleep, Timer,
 };
-use helios_hal::cpu::{Cpu, Instant, current_processor};
+use helios_hal::cpu::{Cpu, Instant};
 
-use crate::memory::{MemoryOwner, set_user_memory_owner, user_mapping_kernel_heap_bytes};
+use crate::memory::user_mapping_kernel_heap_bytes;
 use thiserror::Error;
 
 /// The stack a component instance runs on: both the guest wasm call
@@ -138,10 +137,12 @@ pub fn store_kernel_heap_bytes(store_bytes: usize) -> u64 {
     u64::try_from(bytes).unwrap_or(u64::MAX)
 }
 
-/// Error returned through the runtime call hook when a kill was
-/// requested for the running instance — by the OOM killer or by a
-/// kernel-plugin supervisor. The runtime adapter turns this into a trap and the
-/// component executor surfaces it as a typed `ProgramExecError`.
+/// Error a guest call ends with when a kill was requested for its
+/// instance — by the OOM killer, a kernel-plugin supervisor or an
+/// operator. The runtime adapter raises it as a trap from the store's
+/// interrupt callback, [`super::OnProcessor`] reports it for a call that completes
+/// while condemned, and the component executor surfaces it as a typed
+/// `ProgramExecError`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
 #[error("instance terminated: {reason:?}")]
 pub struct InstanceKilled {
@@ -423,8 +424,19 @@ pub(crate) struct ComponentExecutionContext<FileSystem> {
     output_mode: ComponentOutputMode,
 }
 
-pub struct ComponentStoreData<CpuImpl, RuntimeStateImpl, FileSystem, ResourceTableImpl>
-where
+/// One instance's store data.
+///
+/// `LinearMemoryImpl` is the runtime's handle on the instance's one
+/// unshared linear memory: the kernel never looks inside it, and the
+/// runtime adapter reads the memory's current extent through it each
+/// time a guest names a span.
+pub struct ComponentStoreData<
+    CpuImpl,
+    RuntimeStateImpl,
+    FileSystem,
+    ResourceTableImpl,
+    LinearMemoryImpl,
+> where
     CpuImpl: Cpu + Clone,
     RuntimeStateImpl: ComponentRuntimeState,
 {
@@ -446,9 +458,25 @@ where
     execution_context: ComponentExecutionContext<FileSystem>,
     serial_reader: crate::SerialReader,
     serial_writer: crate::DebugSerialWriter,
-    /// Where this instance's linear memory sits and the device it
-    /// holds, if any. Empty on every instance that never asks for one,
-    /// which is every instance that is not a driver.
+    /// The runtime's handle on this instance's linear memory, once the
+    /// instance is built. Absent when its component lowers through a
+    /// shared memory, or through more than one: nothing is ever shown
+    /// in such a memory.
+    pub linear_memory: Option<LinearMemoryImpl>,
+    /// Every buffer and device region shown in this instance's linear
+    /// memory.
+    ///
+    /// Declared before `device` on purpose: fields drop in order, so a
+    /// dying store withdraws every view before any claim it holds is
+    /// let go, and the claims' owner tasks — which may run on another
+    /// processor the moment a claim drops — never act on a device whose
+    /// memory this instance can still reach. The runtime drops store
+    /// data before it deallocates the instance and resets the memory
+    /// slot, so no view outlives the memory it was shown in.
+    pub views: crate::buffer::ViewTable,
+    /// The devices, display, desktop windows, 3D engine and playback
+    /// stream this instance holds, if any. Empty on every instance that
+    /// never asks for one.
     pub device: crate::device::DeviceOwnership,
     /// The input devices this instance holds, if any. Empty on every
     /// instance that never claims one, which is every instance that is
@@ -495,8 +523,8 @@ impl<FileSystem> ComponentExecutionContext<FileSystem> {
     }
 }
 
-impl<CpuImpl, RuntimeStateImpl, FileSystem, ResourceTableImpl>
-    ComponentStoreData<CpuImpl, RuntimeStateImpl, FileSystem, ResourceTableImpl>
+impl<CpuImpl, RuntimeStateImpl, FileSystem, ResourceTableImpl, LinearMemoryImpl>
+    ComponentStoreData<CpuImpl, RuntimeStateImpl, FileSystem, ResourceTableImpl, LinearMemoryImpl>
 where
     CpuImpl: Cpu + Clone,
     RuntimeStateImpl: ComponentRuntimeState,
@@ -544,6 +572,8 @@ where
             ),
             serial_reader,
             serial_writer,
+            linear_memory: None,
+            views: crate::buffer::ViewTable::new(),
             device: crate::device::DeviceOwnership::new(),
             input: crate::input::InputOwnership::new(),
             requested_exit: None,
@@ -553,11 +583,27 @@ where
     /// Retires every network handle a dying socket resource queued
     /// since the last drain.
     ///
-    /// Called at the entry to every host call, and again right after a
-    /// socket resource is deleted so that the common case — a guest
-    /// closing its own connection — retires on that very call.
+    /// Called right after a socket resource is deleted, so that the
+    /// common case — a guest closing its own connection — retires on
+    /// that very call. Everything else a store's dying sockets queue is
+    /// retired when the store's processor turn ends: see
+    /// [`Self::guest_turns`].
     pub fn retire_sockets(&self) {
         self.retirement.drain();
+    }
+
+    /// The handle the code driving this store accounts its processor
+    /// turns through. Taken before the store is borrowed for the call;
+    /// see [`super::GuestTurns::drive`].
+    pub fn guest_turns(
+        &self,
+    ) -> super::GuestTurns<CpuImpl, RuntimeStateImpl, super::SocketRetirementQueue> {
+        super::GuestTurns::new(
+            self.execution_context.activity.turns(),
+            self.cpu.clone(),
+            self.runtime_state.clone(),
+            self.retirement.turn_queue(),
+        )
     }
 
     /// Record the exit code requested by the runtime exit interface so the
@@ -637,40 +683,46 @@ where
     }
 
     pub(crate) fn fill_secure_random(&mut self, buffer: &mut [u8]) {
-        self.entropy.fill_secure(buffer);
+        self.entropy
+            .fill_secure(self.runtime_state.root_entropy(), buffer);
     }
 
     pub(crate) fn secure_random_u64(&mut self) -> u64 {
-        self.entropy.secure_u64()
+        self.entropy.secure_u64(self.runtime_state.root_entropy())
     }
 
     pub(crate) fn insecure_random_bytes(&mut self, len: usize) -> Vec<u8> {
-        self.entropy.insecure_bytes(len)
+        self.entropy
+            .insecure_bytes(self.runtime_state.root_entropy(), len)
     }
 
     pub(crate) fn insecure_random_u64(&mut self) -> u64 {
-        self.entropy.insecure_u64()
+        self.entropy.insecure_u64(self.runtime_state.root_entropy())
     }
 
     pub(crate) fn insecure_seed(&mut self) -> (u64, u64) {
-        self.entropy.insecure_seed()
+        self.entropy
+            .insecure_seed(self.runtime_state.root_entropy())
     }
 
     /// Deliver an owned stdout/stderr chunk from a synchronous poll
     /// context, honouring child-channel backpressure.
     ///
-    /// Serial, trace, and discard sinks complete immediately. A child pipe
-    /// that is at capacity parks the caller: `pending` keeps the chunk and
-    /// `wait` keeps the registration, so the next poll retries the very
-    /// same bytes once the parent has drained. Nothing is dropped and a
-    /// full pipe is never reported as an error — a vanished reader is
-    /// swallowed like a POSIX write to a closed pipe with SIGPIPE
-    /// suppressed.
+    /// A serial sink parks on the debug console's transmit signal:
+    /// `serial_wait` keeps the registration armed across polls, so the
+    /// UART releasing the port wakes this task into another write
+    /// attempt. A child pipe that is at capacity parks the caller:
+    /// `pending` keeps the chunk and `wait` keeps the registration, so
+    /// the next poll retries the very same bytes once the parent has
+    /// drained. Nothing is dropped and a full pipe is never reported
+    /// as an error — a vanished reader is swallowed like a POSIX write
+    /// to a closed pipe with SIGPIPE suppressed.
     pub fn poll_write_output_bytes(
         &self,
         stream: ComponentOutputStreamKind,
         cx: &mut core::task::Context<'_>,
         wait: &mut Option<crate::ByteWriteWait>,
+        serial_wait: &mut Option<crate::NotifyWaiter>,
         pending: &mut Option<Bytes>,
     ) -> core::task::Poll<()> {
         let Some(bytes) = pending.as_ref() else {
@@ -682,19 +734,30 @@ where
         }
         match self.execution_context.output_mode.sink(stream) {
             ComponentOutputSink::Local(local) => {
-                let chunk = pending.take().expect("the chunk was present a line ago");
-                let taken = local.write(&self.cpu, &self.runtime_state, self.serial_writer, &chunk);
-                if taken == chunk.len() {
-                    return core::task::Poll::Ready(());
+                // The waiter is armed before the port is tried, so a
+                // transmit release that lands between the write and the
+                // poll is not lost.
+                let serial_wait = serial_wait
+                    .get_or_insert_with(|| self.serial_writer.debug_serial_output_waiter());
+                loop {
+                    let chunk = pending.take().expect("the chunk was present a line ago");
+                    let taken =
+                        local.write(&self.cpu, &self.runtime_state, self.serial_writer, &chunk);
+                    if taken == chunk.len() {
+                        return core::task::Poll::Ready(());
+                    }
+                    // The debug UART's owner is another processor. Keep
+                    // what is left and come back for it when the
+                    // console's transmit signal fires.
+                    *pending = Some(chunk.slice(taken..));
+                    match self
+                        .serial_writer
+                        .poll_debug_serial_output_ready(cx, serial_wait)
+                    {
+                        core::task::Poll::Ready(()) => continue,
+                        core::task::Poll::Pending => return core::task::Poll::Pending,
+                    }
                 }
-                // The debug UART's owner is another processor. Keep what
-                // is left and come back for it: there is no readiness
-                // signal to register on a port that is written to, so
-                // the wake is this task's own, which is what
-                // `yield_now` does from a poll context.
-                *pending = Some(chunk.slice(taken..));
-                cx.waker().wake_by_ref();
-                core::task::Poll::Pending
             }
             ComponentOutputSink::Child(writer) => {
                 let wait = wait.get_or_insert_with(|| writer.wait_state());
@@ -704,9 +767,10 @@ where
     }
 
     /// Non-blocking drain of whatever stdin bytes are currently buffered,
-    /// up to `max_bytes`.  Returns an empty `Vec` when the port is idle so
-    /// callers can yield to the kernel executor.  For `Child` mode, the
-    /// reader half of the parent-provided channel is polled once.
+    /// up to `max_bytes`.  Returns an empty `Vec` when the port is idle;
+    /// callers that need bytes arm the console's receive wait before this
+    /// call and park on it.  For `Child` mode, the reader half of the
+    /// parent-provided channel is polled once.
     pub fn try_read_stdin(&self, max_bytes: u32) -> Vec<u8> {
         match &self.execution_context.output_mode {
             ComponentOutputMode::Serial => {
@@ -729,21 +793,23 @@ where
         }
     }
 
-    /// Await the next stdin chunk, yielding the executor between polls.
-    /// Returns `None` on EOF (Child mode after parent closes stdin, or
-    /// for Trace mode which never produces bytes).
+    /// Await the next stdin chunk, parking on the debug console's
+    /// receive signal between polls. Returns `None` on EOF (Child mode
+    /// after parent closes stdin, or for Trace mode which never
+    /// produces bytes).
     pub async fn await_stdin_chunk(&self) -> Option<Vec<u8>> {
         match &self.execution_context.output_mode {
             ComponentOutputMode::Serial => {
-                // Busy-poll with yield_now between polls — the serial
-                // port is a raw hardware reader without async wakeup.
+                // Arm the wait before testing the FIFO so a byte that
+                // lands between the two still completes it.
                 loop {
+                    let wait = self.serial_writer.wait_for_debug_serial_input();
                     let mut bytes = Vec::new();
                     (self.serial_reader)(&mut bytes, u32::MAX);
                     if !bytes.is_empty() {
                         return Some(bytes);
                     }
-                    crate::yield_now().await;
+                    wait.await;
                 }
             }
             ComponentOutputMode::Trace => None,
@@ -763,60 +829,12 @@ where
         bytes
     }
 
-    /// Report the transition wasmtime's call hook delivered, and name
-    /// the instance whose guest code this processor is running so pages
-    /// the runtime commits while it runs — a `memory.grow`, most of all
-    /// — are charged to it.
-    ///
-    /// A call hook cannot hold a scope guard across the stretch of
-    /// guest code it opens; the guard is the store's own
-    /// [`InstanceActivity`], which owns the pairing between the
-    /// transitions and hands back what changed.
-    ///
-    /// Returns the kill reason when the OOM killer or a supervisor has
-    /// condemned this instance — and in that case the activation has
-    /// already been ended, so the caller's only remaining job is to
-    /// raise the `InstanceKilled` trap. The two cannot be separated:
-    /// see [`InstanceActivity::record`].
-    pub fn record_transition(
-        &mut self,
-        transition: InstanceExecutionTransition,
-    ) -> Option<KillReason> {
-        let now_nanos = self.now_nanos();
-        let step = self
-            .execution_context
-            .activity
-            .record(transition, now_nanos);
-        self.apply_activity_change(step.change);
-        step.killed
-    }
-
-    /// End this store's activation and report the condemnation when the
-    /// instance has one. The epoch callback uses this: a CPU-bound
-    /// guest never reaches a call hook, and the trap raised there
-    /// unwinds through the same hooks a call-hook kill does.
-    pub fn end_on_pending_kill(&mut self) -> Option<KillReason> {
-        let reason = self.execution_context.activity.pending_kill()?;
-        let now_nanos = self.now_nanos();
-        let change = self.execution_context.activity.end(now_nanos);
-        self.apply_activity_change(change);
-        Some(reason)
-    }
-
-    fn apply_activity_change(&self, change: ActivityChange) {
-        name_user_memory_owner(self.instance(), change);
-        if let ActivityChange::Left {
-            instance_elapsed: Some(elapsed),
-        } = change
-            && self.runtime_state.profiling_enabled()
-        {
-            self.runtime_state.record_profile_stack_parts_nanos(
-                crate::ProfileScope::User,
-                "user;",
-                self.instance().name(),
-                elapsed,
-            );
-        }
+    /// The condemnation recorded for this instance, if any. The
+    /// interrupt callback reads it: a guest that is running traps with it
+    /// at its next interrupt check, which the kill's interruption of the
+    /// instance's stores makes immediate.
+    pub fn pending_kill(&self) -> Option<KillReason> {
+        self.execution_context.activity.pending_kill()
     }
 }
 
@@ -872,8 +890,10 @@ pub async fn wait_until_runtime_deadline<CpuImpl, RuntimeStateImpl>(
         }
 
         let remaining_nanos = deadline_nanos.saturating_sub(now_nanos);
-        let remaining_ticks =
-            nanos_to_ticks_ceil_saturating(remaining_nanos, cpu.timer_frequency()).max(1);
+        let remaining_ticks = cpu
+            .timebase()
+            .nanos_to_ticks_ceil_saturating(remaining_nanos)
+            .max(1);
         timer
             .sleep_until(Instant::new(now_ticks.saturating_add(remaining_ticks)))
             .await;
@@ -881,14 +901,3 @@ pub async fn wait_until_runtime_deadline<CpuImpl, RuntimeStateImpl>(
 }
 
 // Runtime-adapter trait impls live in the concrete adapter module.
-
-/// Charges pages committed on this processor to `instance` while its
-/// guest code runs, and to nobody once this store leaves it.
-fn name_user_memory_owner(instance: &crate::RegisteredInstance, change: ActivityChange) {
-    let owner = match change {
-        ActivityChange::Entered => MemoryOwner::new(instance.id().raw()),
-        ActivityChange::Left { .. } => MemoryOwner::NONE,
-        ActivityChange::Unchanged => return,
-    };
-    set_user_memory_owner(current_processor(), owner);
-}

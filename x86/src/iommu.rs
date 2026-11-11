@@ -18,7 +18,7 @@ use alloc::sync::Arc;
 use core::time::Duration;
 
 use acpi::sdt::SdtHeader;
-use helios_hal::cpu::Cpu;
+use helios_hal::cpu::{Cpu, Timebase};
 use helios_hal::iommu::{DmaTranslation, EndpointId, PhysicalRange};
 use helios_kernel::{IommuDomains, IommuReport, MAX_IOMMU_ENDPOINTS, Timer};
 use helios_virtio::{
@@ -172,7 +172,7 @@ pub(crate) fn discover(
     let handler = crate::smp::PhysicalOffsetAcpiHandler {
         physical_memory_offset,
         tsc_base: 0,
-        tsc_hz: 1,
+        timebase: Timebase::new(1),
     };
     let tables = unsafe { acpi::AcpiTables::from_rsdp(handler, rsdp_address) }
         .unwrap_or_else(|error| panic!("failed to parse ACPI tables for the VIOT: {error:?}"));

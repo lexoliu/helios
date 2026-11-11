@@ -1,4 +1,4 @@
-/// Trusted precompiled component bytes embedded into the binary.
+/// Trusted precompiled component bytes carried by the boot payload.
 ///
 /// The kernel keeps the payload opaque. Higher layers decide whether the
 /// component is launched as `init`, a driver, or some other user-mode payload,
@@ -20,5 +20,10 @@ impl EmbeddedComponent {
 
     pub const fn bytes(&self) -> &'static [u8] {
         self.bytes
+    }
+
+    /// The component's bytes, carrying their boot-payload provenance.
+    pub const fn bootfs_bytes(&self) -> crate::BootfsBytes {
+        crate::BootfsBytes::from_image(self.bytes)
     }
 }

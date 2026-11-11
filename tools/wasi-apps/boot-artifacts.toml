@@ -162,6 +162,54 @@ bootfs_path = "bin/wasix-continuation"
 source = "artifacts/wasix/continuation/continuation.wasm"
 
 [[artifact]]
+command = "wasix-atomic-wait-timeout"
+package = "helios-wasix-conformance"
+version = "0.1.0"
+source_url = "tools/wasi-apps/wasix-tests"
+bootfs_path = "bin/wasix-atomic-wait-timeout"
+source = "artifacts/wasix/atomic-wait-timeout/atomic-wait-timeout.wasm"
+
+[[artifact]]
+command = "wasix-atomic-wait-kill"
+package = "helios-wasix-conformance"
+version = "0.1.0"
+source_url = "tools/wasi-apps/wasix-tests"
+bootfs_path = "bin/wasix-atomic-wait-kill"
+source = "artifacts/wasix/atomic-wait-kill/atomic-wait-kill.wasm"
+
+[[artifact]]
+command = "wasix-orphan-threads"
+package = "helios-wasix-conformance"
+version = "0.1.0"
+source_url = "tools/wasi-apps/wasix-tests"
+bootfs_path = "bin/wasix-orphan-threads"
+source = "artifacts/wasix/orphan-threads/orphan-threads.wasm"
+
+[[artifact]]
+command = "wasix-thread-proc-exit"
+package = "helios-wasix-conformance"
+version = "0.1.0"
+source_url = "tools/wasi-apps/wasix-tests"
+bootfs_path = "bin/wasix-thread-proc-exit"
+source = "artifacts/wasix/thread-proc-exit/thread-proc-exit.wasm"
+
+[[artifact]]
+command = "wasix-thread-exec"
+package = "helios-wasix-conformance"
+version = "0.1.0"
+source_url = "tools/wasi-apps/wasix-tests"
+bootfs_path = "bin/wasix-thread-exec"
+source = "artifacts/wasix/thread-exec/thread-exec.wasm"
+
+[[artifact]]
+command = "wasix-thread-trap"
+package = "helios-wasix-conformance"
+version = "0.1.0"
+source_url = "tools/wasi-apps/wasix-tests"
+bootfs_path = "bin/wasix-thread-trap"
+source = "artifacts/wasix/thread-trap/thread-trap.wasm"
+
+[[artifact]]
 command = "simd-lanes"
 package = "helios-wasix-conformance"
 version = "0.1.0"

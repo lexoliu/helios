@@ -175,8 +175,16 @@ the instrumented x86-64 kernel, runs the compiler workload and the
 suite's non-network classes on it under KVM and merges every `.profraw`
 into one `helios-kernel.profdata`; the job uploads that as the
 `helios-kernel-profdata` artifact, which is the profile every x86-64
-release build spends (#226). It runs on `workflow_dispatch`, and on the
-first of every month so the artifact never ages past GitHub's ninety-day
+release build spends (#226). It runs on every push to `dev` that touches
+what the image is built from — the kernel crates and the layers below
+them, the backend, the root crate, the guest programs, the workload
+manifest and the WASI apps, the collection sequence, the Wasmtime pin
+(the `paths` list in the workflow) — so the newest collection is at most
+one merge behind the kernel a release build reads it for (#385); a
+burst of merges cancels the in-flight push collection for the newer one,
+so the artifact uploaded last is the last commit's rather than whichever
+run finished last. It also runs on `workflow_dispatch`, and on the first
+of every month so the artifact never ages past GitHub's ninety-day
 retention. `bench-suite.yml`'s `profile-generate` job calls the same
 workflow, so the profile `suite-pgo` measures is collected by the job a
 release build reads from; the collection itself is a composite action
@@ -201,6 +209,23 @@ suite lane times it on and boots the instrumented kernel with it (#315).
 
 `vm --profile-use <file>` is the other half. It is the release build plus
 two rustflags, in the `profile-use` cargo profile.
+
+The release build itself is the `kernel-release` cargo profile
+(`Cargo.toml`): `release` plus `lto = "fat"` and `codegen-units = 1`, the
+profile every kernel image is built with and the one `profile-generate`
+and `profile-use` inherit. The inspector adds `-C debuginfo=limited` to
+all three as a rustflag, which changes no code and never reaches the
+guest; it is there to name the inlined functions of an instruction
+profile (`docs/benchmarks.md`). The image links `hal`, `netstack`, `virtio`,
+the backend, `kernel` and the Wasmtime crates, and every hot path crosses
+those crate boundaries; a per-crate build leaves each of those calls out
+of line, which a profile can weight but never inline, so whole-program
+optimisation is what the counts are worth the most on (#383). The
+counters survive it: instrumentation is inserted per function before the
+link, and the linker-defined `__start_`/`__stop_` bounds the in-kernel
+runtime reads are laid out after. The host tools stay on `release`;
+nothing times the inspector, and a fat-LTO link of it on every check
+would cost every lane and every developer loop.
 
 | Flag | Why |
 | --- | --- |
@@ -256,7 +281,8 @@ without counting against an image it never entered. The percentage is
 the share uncovered, the parenthesised list is the uncovered count per
 crate, and the path is where every warning line went, header first. The
 bench run record carries both figures per column (`kernel_pgo_uncovered`
-and `kernel_pgo_functions`, plus the `baseline_` pair), the paired
+and `kernel_pgo_functions`, plus the `baseline_` and
+`baseline_rebuild_` pairs), the paired
 gate's labels name them, and the lists ride the runtime-directory upload
 — `bench-runtime-<lane>` on the matrix lanes, `bench-pgo-uncovered` on
 `suite-pgo`, where the failure-only log upload would have left a green
@@ -272,7 +298,7 @@ goes:
 | Build | Directory | Image |
 | --- | --- | --- |
 | `--release` on x86-64, reading the fetched profile | `target/x86_64-unknown-none/profile-use/` | `helios` |
-| `--release --without-kernel-profile`, the plain control | `target/x86_64-unknown-none/release/` | `helios` |
+| `--release --without-kernel-profile`, the plain control | `target/x86_64-unknown-none/kernel-release/` | `helios` |
 | `--profile-use <file>` | `target/pgo-kernels/<digest of the profile>/x86_64-unknown-none/profile-use/` | `helios` |
 
 The named build gets a `--target-dir` of its own, keyed by the SHA-256 of
@@ -407,6 +433,34 @@ read the profile. The report is the paired table and the per-workload
 medians; read the headline compute workloads first (`aot-curl`,
 `cpython-json`, `quickjs-loop`), because they are what the profile covers.
 
+A paired run — an advisory `bench-suite.yml` dispatch that names a
+`baseline_ref`, the instrument a kernel change is held to, or a
+pull request labelled `bench`, which the suite pairs against its base
+SHA — cannot spend the fetched profile on both columns: it describes the
+default branch's kernel, so a candidate that renamed or reshaped
+functions would be measured with an unknown negative term beside a
+baseline the profile still matched. That is exactly what the week's
+pairs showed before #384: the candidate at 3,377–4,251 uncovered
+functions against the baseline's 501, the stale profile's cost billed to
+the change. The `profile-columns` job therefore calls
+`kernel-profile.yml` once per column — the candidate's at the run's own
+commit, and the baseline's and the baseline rebuild's both at the ref
+the suite pairs against, so each collection runs the ref's own tooling —
+and `suite` downloads the three artifacts as
+`helios-kernel-profdata-candidate`, `helios-kernel-profdata-baseline`
+and `helios-kernel-profdata-baseline-rebuild`, then passes them to
+`helios-bench run` as `--profile-use`, `--baseline-profile-use` and
+`--baseline-rebuild-profile-use`. The rebuild is the baseline commit
+built a second time against its own, independently collected profile;
+the gate reads how far the two baseline builds move apart as a per-row
+floor (`docs/benchmarks.md`, #479). The collections run in parallel:
+`kernel-profile.yml`'s concurrency group carries the artifact name, so
+the columns of one run neither queue behind nor cancel each other. A `release` baseline collects none: the plain
+control reads no profile. And the paired gate holds each column's
+uncovered share to `UNDERPROFILED_SHARE`: a column past it was not built
+against a profile of its own commit, so the run is inconclusive for that
+named reason, the way a high control CV is, rather than read.
+
 The `net` class is in the profile like every other: the collection
 provisions the tap backend and runs the whole suite on it, so the
 candidate's packet path carries counts from the workloads the table times
@@ -421,8 +475,8 @@ What profile-guided optimisation is worth on the kernel that ships is a
 different question, and it has a control: the same commit built without
 any profile. `helios-inspector vm --release --without-kernel-profile`
 builds it, on the one target whose release builds otherwise read the
-fetched profile, and puts it in the `release` directory where every
-other target's release kernel lands; asking for it elsewhere is refused,
+fetched profile, and puts it in the `kernel-release` directory where
+every other target's release kernel lands; asking for it elsewhere is refused,
 because there the plain build is the only build. `helios-bench run
 --baseline-kernel-build release` pairs the profile-guided kernel against
 that control in one job (`bench-suite.yml`'s `baseline_kernel_build`
@@ -451,10 +505,10 @@ job of `bench-suite.yml` runs and what the release job runs. A profile
 collected two ways would be two profiles wearing one name, and the kernel
 a release ships would not be the kernel `suite-pgo` measured.
 
-The refresh cadence is the on-demand collection above, not the release:
-a profile goes stale in its counts long before it goes stale in its
-hashes, and silently, so `kernel-profile.yml` is dispatched when the
-kernel it describes has moved and runs monthly regardless. A release
+The refresh cadence is the push collection above, not the release: a
+profile goes stale in its counts long before it goes stale in its
+hashes, and silently, so `kernel-profile.yml` collects on every `dev`
+merge that moves the kernel and runs monthly regardless. A release
 attaches the profile its own kernel was built with so that the released
 image can be reproduced, and a release build between releases reads the
 newest collection on the default branch.
@@ -527,13 +581,18 @@ to dispatch.
 
 ### Sample-based alternative already within reach
 
-rustc also has `-Z profile-sample-use=<file>` (AutoFDO). The kernel already
-has a sampling profiler that exports folded stacks with weights
+rustc also has `-Z profile-sample-use=<file>` (AutoFDO). The kernel has
+two profilers. The scoped one exports folded phase stacks with weights
 (`helios:system/profiling.folded`, `workload-bench --kernel-profile-output`).
-AutoFDO needs a per-source-line sample profile, which the folded output
-does not carry (it is symbol-level), so this path needs either
-instruction-address samples with DWARF line mapping from the kernel's
-profiler or LBR-style data, neither of which the profiler records today.
+The instruction-address sampler records the instruction each processor's
+1 kHz sampling timer interrupted, when a run opts in (`helios:system/profiling.instruction-samples`,
+`--instruction-profile-output`, x86-64 only; see `docs/benchmarks.md`).
+The kernel hands back the raw address of every sample outside wasm code,
+but the inspector folds those addresses to function symbols. AutoFDO needs
+a per-source-line profile, so this path still needs the raw kernel
+addresses mapped through the image's DWARF line table. It also needs
+LBR-style branch data for the edge weights that AutoFDO infers best from.
+Neither exists today.
 
 ## (b) Cranelift-level feedback for the AOT compiler plugin
 

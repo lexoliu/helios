@@ -45,6 +45,22 @@ interface tracing {
     target-prefixes: list<string>,
   }
 
+  /// Why `set-target-enabled` refused a name.
+  variant target-error {
+    /// The kernel gates no diagnostic target under the name given.
+    unknown-target(string),
+  }
+
+  /// Enables or disables a kernel diagnostic target by name.
+  ///
+  /// Diagnostic targets are off by default so their events cost
+  /// nothing; enabling one opens the kernel's console filter for the
+  /// rest of the boot. The name is the `tracing` target the kernel
+  /// emits under — `helios_kernel::exec::phases`, for one — and a name
+  /// nothing registered is refused so a typo says so instead of
+  /// producing an empty log.
+  set-target-enabled: func(target: string, enabled: bool) -> result<_, target-error>;
+
   /// Returns at most `limit` newest matching events, ordered oldest to newest.
   recent: func(filter: filter, limit: u32) -> list<event>;
 

@@ -28,50 +28,76 @@ plugin's block, net or serial export back into the kernel are phase 2.
 | Bus-mastering memory | a pinned, physically contiguous buffer, and the address the device has to issue for it | `GrantLease::dma_alloc` |
 | To be killable | every one of the above undone before anyone else is offered the device | `Drop for GrantLease` |
 
+### A claim is a capability
+
+`helios:system/device` is linked into every program, and holding the
+import grants nothing. `claim(name)` succeeds only for an instance whose
+`ProcessAuthority` names that device, and `available()` lists only the
+devices it names. The kernel derives a typed `DeviceGrantClaimCap` from
+the authority and passes it down to `DeviceGrantRegistry::claim`, so the
+registry cannot be reached without one. An instance that holds no grant
+for a device is answered `not-found`, exactly as for a name nobody
+published, so a claim cannot be used to learn what the machine has.
+
+A named device is granted by the kernel at the point it starts the
+driver for it, never through the program-spawn grant list, and a
+WASIX child does not inherit its parent's named devices: the device
+belongs to the driver instance. An instance holds at most `MAX_GRANTS`
+named devices, the number the registry can publish.
+
+The display, the input devices, the 3D engine and audio are separate
+machine-wide resources and are gated by device classes (`display`,
+`input`, `gpu`, `audio`) in the same authority. `ProcessAuthority::root`
+grants none of them. The kernel adds the display and input classes to
+the compositor it starts and every class to the debugger, which can hand
+a child only what it holds; a program a parent spawns receives the
+classes the parent lists, never more than the parent has. Without a
+class, `display.claim`, `gpu.claim` and `audio.claim` answer
+`unavailable`, `input.available` and `audio.available` list nothing, and
+`stats` omits the entries the program could not claim: the answers of a
+machine without that hardware.
+
 ### Registers are memory, not calls
 
 A register access has to cost what a load costs. Helios owns the user
 address space, so the kernel does not have to offer a host call per
-register: it maps the device's own frames *inside* the instance's
-linear-memory reservation, and `map-region` hands back the byte offset
-they landed at. From the driver's side a register is `*(base + offset)`.
+register: it shows the device's own frames *inside* the instance's
+linear memory, at pages the instance chose, and `map-region(index, at)`
+takes the `span` — whole 64 KiB wasm pages of the caller's own memory,
+below `memory.size` — they are to appear at. From the driver's side a
+register is `*(base + offset)`, with `base` the start of a block the
+driver took from its own allocator.
 
-The mappings go in a **device window** at the top of the reservation:
+The span is the region's size rounded up to whole wasm pages. The
+kernel substitutes the backing of those pages with the region's frames
+in one step (`AddressSpace::substitute_device`), carrying the region's
+own memory attributes, and only for an unshared memory, so nothing else
+reads the span while it changes. A span that is not whole pages, reaches
+past `memory.size`, has the wrong length or overlaps a view already
+shown is refused with `bad-span`. A region is shown once: asking again
+is `already-mapped`. The view lasts as long as the grant; when it ends
+the span is ordinary zeroed memory again and the driver may free it.
+The pages are the driver's own, and the driver frees them only after
+the view has ended; freeing them earlier would hand a device's
+registers to its allocator.
 
-```
-0                                          window offset        reservation end
-|-- the instance's linear memory --------- | -- device window -- | -- guard --
-                                             regions, then pinned buffers
-```
-
-`DEVICE_WINDOW_BYTES` is 64 MiB and the window sits at the very top of
-the four-gigabyte reservation every instance gets, so the memory it
-displaces is memory a `wasm32` instance could never address anyway.
-`DeviceWindow::offset` is both where the window starts and the highest
-the instance's memory may grow to: whoever builds the window is
-responsible for capping the instance's growth limit there, so a
-`memory.grow` can never land on a register file.
-
-Regions and buffers are carved out of the window by a bump cursor at the
-address space's own mapping granule, which is what
-`DeviceVmHooks::mapping_granule` reports — the host page on `hosted/`,
-and never smaller than a frame. Carving finer than the granule would put
-two regions in one page, and changing either would change both.
+The wasm page is larger than any frame, so a region that is smaller than
+the span leaves the rest of the span the driver's own memory, and the
+region itself is shown from the span's first byte.
 
 A region that does not start and end on a frame boundary is refused at
 grant construction. The page it shares with its neighbour would carry
 the neighbour's registers into the owner's memory, and the neighbour may
 be a device nobody granted away.
 
-A device can also *publish* a window rather than have one granted. The
+A device can also *publish* a region rather than have one granted. The
 display engine's host-visible aperture — where a 3D blob's host storage
 is placed so the renderer and the guest share it — is the same kind of
-placement: `PinnedFrames::map_device` puts the `DeviceRegion` the device
-named into the claiming instance's own window at `memory-kind = normal`,
-commits nothing against the instance's pool because the bytes are the
-device's, and unmaps it when the claim is released. What changes is only
-who the memory belongs to; the window, the granule and the alignment
-rule are the window, the granule and the alignment rule.
+view: `blob.map-blob(at)` shows the `DeviceRegion` the device named at
+the `span` the claiming instance gave, at `memory-kind = normal`, charges
+nothing against the instance's pool because the bytes are the device's,
+and ends the view on `unmap-blob` or when the claim is released. What
+changes is only who the memory belongs to.
 
 ### Interrupts are masked before they are forwarded
 
@@ -105,13 +131,15 @@ raises nothing, and every source is masked again when an owner dies.
 
 ### DMA buffers are the owner's memory
 
-`dma-alloc` pins a physically contiguous run inside the device window,
-from the *owner's* pool, and reports both the linear-memory offset the
-driver fills it through and the address the device has to issue to reach
-it. The two are different numbers: the device address is a physical
-address on a machine with no translation unit in the path and an I/O
-virtual address on one that confines the device, and `hal`'s
-`DmaTranslation` is what turns one into the other.
+`dma-alloc(align, at)` pins a physically contiguous run from the
+*owner's* pool, as long as the span `at` and aligned to `align`, shows
+it there zeroed (`AddressSpace::substitute_memory`), and reports the
+address the device has to issue to reach it. The driver fills the buffer
+through its own span; `dma-buffer` carries only `physical-address`. The
+two are different numbers: the device address is a physical address on a
+machine with no translation unit in the path and an I/O virtual address
+on one that confines the device, and `hal`'s `DmaTranslation` is what
+turns one into the other.
 
 Two bounds apply. The grant carries a `DmaBudget` — a policy the kernel
 sets, so a driver cannot squeeze every other instance out of the user
@@ -120,19 +148,29 @@ drives 32 address bits cannot reach a buffer above 4 GiB, so the kernel
 allocates under its limit rather than discovering the truncation as
 corruption.
 
-A buffer lives as long as the grant. A driver builds its rings once,
-during its own bring-up; there is no per-request pin, and a driver that
-wants one is a driver that should be reusing a ring.
+A buffer is shown at its span for as long as the grant lives. A driver
+builds its rings once, during its own bring-up; there is no per-request
+pin, and a driver that wants one is a driver that should be reusing a
+ring.
 
 ### Reclaim is what makes the restart cheap
 
-Dropping a lease — explicitly, or because the instance was killed —
-masks every source, unmaps every region and releases every pinned buffer
-*before* the device is offered to anyone else. Every mapping change goes
-through the address space, which invalidates the local translation cache
-and shoots down every other processor that has run in the space before
-it returns, so the dead owner has provably lost its last path to the
-registers by the time the replacement starts.
+A driver letting go ends every view of a region or buffer
+(`GrantLease::end_views`) and then drops the lease; a killed instance
+skips the first step, because its view table withdraws every view when
+the store dies, synchronously, before the runtime resets the instance's
+memory slot, so the slot is reusable at once. Dropping the lease then
+masks every source, drops the device's hold on every pinned buffer and
+returns the device to the registry *before* it is offered to anyone
+else. A buffer whose view is somehow still live keeps its run until that
+view ends. What the drop does not do is stop the device's bus mastering:
+a device left running by a killed driver can still write into buffers
+whose frames have gone back to the pool, which is tracked in #635.
+Every mapping change goes through the address
+space, which invalidates the local translation cache and shoots down
+every other processor that has run in the space before it returns, so
+the dead owner has provably lost its last path to the registers by the
+time the replacement starts.
 
 If the address space refuses to undo a mapping the kernel panics. It
 cannot then prove the device is unreachable, and continuing would hand
@@ -157,8 +195,10 @@ does not provide.
 * `DmaCapability` — how many address bits a bus master drives, whether
   its traffic is coherent, and how its addresses are translated.
 * `IommuDomain` — the confinement a device sits in.
-* `AddressSpace::map_device`, `unmap_device` and `commit_contiguous` —
-  the three primitives an owner outside the kernel needs.
+* `AddressSpace::substitute_device`, `substitute_memory`, `restore` and
+  `withdraw` — show a device region or a pinned run at a range of an
+  instance's own memory, and put ordinary memory back, which is what an
+  owner outside the kernel needs.
 
 `kernel/src/device/` says what the kernel does with it: `DeviceGrant`,
 the registry that gives a device to exactly one owner, the relay, the
@@ -247,14 +287,18 @@ without the other: a commit made against one and checked against the
 other is how a buffer ends up somewhere the hardware silently
 truncates.
 
-The backend tracks device mappings beside its reservation tracker
-rather than inside it. The tracker exists to return frames to the user
-pool when a reservation is released, and neither kind of device mapping
-may go there: a register window was never taken from the pool, and a
-pinned run is owed its own layout. Keeping them separate is also what
-makes `release` total — a store torn down by an OOM kill still has its
-device mapped, and the address space is the last place that can
-guarantee the hardware is unreachable afterwards.
+A substituted range is not the reservation tracker's to free. The
+tracker exists to return frames to the user pool when a reservation is
+released, and neither a device region nor a pinned run belongs there: a
+register file was never taken from the pool, and a pinned run is owed
+its own layout and is freed by whoever allocated it. Ending a view
+(`restore`, or `withdraw` for a store that is dying) never frees what
+had been shown. A store torn down by an OOM kill withdraws every view
+when its view table drops, before the runtime resets the memory slot,
+so by the time the reservation is released nothing is shown in it and
+`release` meets only ordinary uncommitted pages; the shootdown each
+`withdraw` finishes before it returns is what guarantees the hardware is
+unreachable from the dead store.
 
 ## Seeing them
 
@@ -299,9 +343,7 @@ own MSI-X vector-control bit rather than a controller the kernel owns.
 Both deserve their own design and their own review rather than a
 tail-end of this one. It is recorded on #5.
 
-What x86-64 does install is the contiguous half of the memory hooks
-(`x86/src/device.rs`): `commit_contiguous` and `release_contiguous` are
-the user address space's own, so a display frame buffer is pinned under
-an instance's reservation on this backend exactly as on the other two,
-while `map_device` and `unmap_device` answer `DeviceMappingUnsupported`
-because no grant ever names a region here.
+What x86-64 does install is the memory half: a display frame buffer is
+pinned and shown in an instance's memory on this backend exactly as on
+the other two, while `substitute_device` answers
+`DeviceMappingUnsupported` because no grant ever names a region here.

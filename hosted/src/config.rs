@@ -16,6 +16,9 @@ pub struct HostedConfig {
     bootstrap_processor: ProcessorId,
     heap_bytes: usize,
     init_wasi_root: Option<PathBuf>,
+    /// The `helios-bootfs` payload `helios-cli kernel-prebuild` wrote —
+    /// the hosted backend's equivalent of a boot module.
+    bootfs: PathBuf,
 }
 
 impl HostedConfig {
@@ -42,12 +45,14 @@ impl HostedConfig {
         );
 
         let init_wasi_root = env::var_os("HELIOS_HOSTED_INIT_WASI_ROOT").map(PathBuf::from);
+        let bootfs = bootfs_arg();
 
         Self {
             processor_count,
             bootstrap_processor: ProcessorId::new(bootstrap_processor as u16),
             heap_bytes,
             init_wasi_root,
+            bootfs,
         }
     }
 
@@ -65,6 +70,21 @@ impl HostedConfig {
 
     pub fn init_wasi_root(&self) -> Option<&Path> {
         self.init_wasi_root.as_deref()
+    }
+
+    pub fn bootfs(&self) -> &Path {
+        &self.bootfs
+    }
+}
+
+/// The payload path is the hosted backend's one argument — a hosted
+/// kernel without it has no init to run, the same contract the
+/// bare-metal boot paths enforce.
+fn bootfs_arg() -> PathBuf {
+    let mut args = env::args_os().skip(1);
+    match (args.next(), args.next(), args.next()) {
+        (Some(flag), Some(path), None) if flag == "--bootfs" => PathBuf::from(path),
+        _ => panic!("usage: helios --bootfs <path to helios-bootfs>"),
     }
 }
 

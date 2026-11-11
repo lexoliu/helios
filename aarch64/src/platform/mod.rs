@@ -114,10 +114,10 @@ pub(crate) struct GrantableDevice {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ConsoleDescription {
     pub(crate) region: MmioRegion,
-    /// The line the UART raises, when the platform describes one. The
-    /// kernel polls the console rather than driving it from an
-    /// interrupt, so this is recorded and not yet used.
-    pub(crate) interrupt: Option<SpiInterrupt>,
+    /// The line the UART raises. The debug console's readers and
+    /// writers park on the interrupt it reports, so a description that
+    /// cannot name one is refused rather than recorded.
+    pub(crate) interrupt: SpiInterrupt,
 }
 
 /// Which redistributor frame belongs to which processor.

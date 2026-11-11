@@ -6,14 +6,15 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use triomphe::Arc;
 
 use crate::{
-    DEFAULT_PERF_METRIC_CAPACITY, DEFAULT_PROFILE_STACK_CAPACITY, DEFAULT_TRACE_HISTORY_CAPACITY,
-    EmbeddedBootFs, FoldedProfileSample, FutexKey, FutexTable, FutexWaitRegistration,
-    HEAP_SIZE_CLASS_COUNT, HeapStats, InstanceRegistry, Notify, PerfMetricFilter,
-    PerfMetricHistory, PerfMetricSample, PerfSample, ProfileFilter, ProfileScope, ProfileSink,
-    StatsSample, TraceEvent, TraceFilter, TraceHistory, embedded_init,
+    BootPayload, DEFAULT_PERF_METRIC_CAPACITY, DEFAULT_PROFILE_STACK_CAPACITY,
+    DEFAULT_TRACE_HISTORY_CAPACITY, EmbeddedBootFs, EmbeddedComponent, FoldedProfileSample,
+    FutexKey, FutexTable, FutexWaitRegistration, HEAP_SIZE_CLASS_COUNT, HeapStats,
+    InstanceRegistry, InstructionSampler, Notify, PerfMetricFilter, PerfMetricHistory,
+    PerfMetricSample, PerfSample, ProfileFilter, ProfileScope, ProfileSink, StatsSample,
+    TraceEvent, TraceFilter, TraceHistory,
 };
-use crate::{RootEntropy, RootEntropyHandle};
-use helios_hal::cpu::HardwarePerfCounterDelta;
+use crate::{MachineGeneration, MachineGenerationHandle, RootEntropy, RootEntropyHandle};
+use helios_hal::cpu::{HardwarePerfCounterDelta, Timebase};
 use helios_hal::rtc::{RealTimeClock, UnixSeconds};
 use spin::{Mutex, Once};
 
@@ -33,18 +34,23 @@ pub struct RuntimeState<ProgramService, NetworkService, HostFsService> {
 
 struct RuntimeStateInner<ProgramService, NetworkService, HostFsService> {
     boot_ticks: u64,
-    timebase_frequency: u64,
+    timebase: Timebase,
     processor_count: u32,
     instance_registry: InstanceRegistry,
     program_service: Mutex<Option<ProgramService>>,
     program_service_ready: Notify,
     network_service_installed: AtomicBool,
     network_service: Once<NetworkService>,
+    network_service_ready: Notify,
     /// The boot-seeded root DRBG. Installed by the backend before any
     /// component runs; every instance's `EntropyPool` is derived from
     /// it, so a kernel that reaches component start-up without one is a
     /// bring-up bug rather than a degraded mode.
     root_entropy: Once<RootEntropyHandle>,
+    /// The machine generation the backend created for this boot, which
+    /// the root DRBG rekeys against and the reactions to a restore wait
+    /// on. Installed before the root entropy.
+    machine_generation: Once<MachineGenerationHandle>,
     /// Nanoseconds between the monotonic clock and wall time, as the
     /// platform's real-time clock set them during bring-up. Empty on a
     /// machine that carries no such clock, where wall time is uptime.
@@ -102,12 +108,20 @@ struct RuntimeStateInner<ProgramService, NetworkService, HostFsService> {
     /// runtime adapter answers `unavailable` rather than trapping.
     vsock_service: Once<ComponentHostVsockService>,
     futex_table: Mutex<FutexTable>,
+    /// The user payload the backend handed the kernel — init component,
+    /// `argv0`, and the boot filesystem it carries — parsed from the
+    /// boot module at bring-up.
+    payload: BootPayload,
     bootfs: Mutex<Option<EmbeddedBootFs>>,
     tracing: Mutex<TraceHistory>,
     /// The profile and perf histories, held as a handle rather than as
     /// fields so a subsystem this state owns can record into them
     /// without naming the state's own type (see [`ProfileSink`]).
     profiles: ProfileSink,
+    /// Instruction-address samples, with their own start and stop. A
+    /// backend whose timer captures them installs its capture here during
+    /// bring-up.
+    instructions: InstructionSampler,
     heap_perf_snapshot: HeapPerfSnapshot,
 }
 
@@ -299,18 +313,25 @@ where
     NetworkService: Clone,
     HostFsService: Clone,
 {
-    pub fn new(timebase_frequency: u64, processor_count: usize, boot_ticks: u64) -> Self {
+    pub fn new(
+        timebase: Timebase,
+        processor_count: usize,
+        boot_ticks: u64,
+        payload: BootPayload,
+    ) -> Self {
         Self {
             inner: Arc::new(RuntimeStateInner {
                 boot_ticks,
-                timebase_frequency,
+                timebase,
                 processor_count: processor_count as u32,
                 instance_registry: InstanceRegistry::new(),
                 program_service: Mutex::new(None),
                 program_service_ready: Notify::new(),
                 network_service_installed: AtomicBool::new(false),
                 network_service: Once::new(),
+                network_service_ready: Notify::new(),
                 root_entropy: Once::new(),
+                machine_generation: Once::new(),
                 wall_clock_offset_nanos: Once::new(),
                 http_client: ProviderSlot::new(),
                 host_fs_service: Mutex::new(None),
@@ -327,12 +348,14 @@ where
                 audio_service: Once::new(),
                 vsock_service: Once::new(),
                 futex_table: Mutex::new(FutexTable::new()),
-                bootfs: Mutex::new(embedded_init().map(|init| init.bootfs())),
+                payload,
+                bootfs: Mutex::new(Some(payload.bootfs())),
                 tracing: Mutex::new(TraceHistory::new(DEFAULT_TRACE_HISTORY_CAPACITY)),
                 profiles: ProfileSink::new(
                     DEFAULT_PROFILE_STACK_CAPACITY,
                     DEFAULT_PERF_METRIC_CAPACITY,
                 ),
+                instructions: InstructionSampler::new(processor_count),
                 heap_perf_snapshot: HeapPerfSnapshot::new(),
             }),
         }
@@ -360,6 +383,13 @@ where
             self.inner.heap_perf_snapshot.reset(crate::heap_stats());
         }
         self.inner.profiles.set_enabled(enabled);
+    }
+
+    /// The instruction-address sampler. It has its own start and stop
+    /// (`profiling.set-instruction-sampling`), independent of the scoped
+    /// profiler, because sampling shortens every processor's timer period.
+    pub fn instruction_sampler(&self) -> InstructionSampler {
+        self.inner.instructions.clone()
     }
 
     /// The profile and perf histories this state records into.
@@ -622,7 +652,7 @@ where
     }
 
     pub fn ticks_to_nanos(&self, ticks: u64) -> u64 {
-        crate::exec::ticks_to_nanos(ticks, self.inner.timebase_frequency)
+        self.inner.timebase.ticks_to_nanos(ticks)
     }
 
     pub fn uptime_nanos(&self, current_ticks: u64) -> u64 {
@@ -637,7 +667,7 @@ where
     /// runtime state that used to answer for it. Handing it this keeps
     /// one origin for both.
     pub fn uptime_clock(&self) -> crate::UptimeClock {
-        crate::UptimeClock::new(self.inner.boot_ticks, self.inner.timebase_frequency)
+        crate::UptimeClock::new(self.inner.boot_ticks, self.inner.timebase)
     }
 
     /// Places the monotonic clock on the wall, from the platform's
@@ -736,10 +766,32 @@ where
             "network service was installed more than once"
         );
         self.inner.network_service.call_once(|| service);
+        self.inner.network_service_ready.notify_all();
     }
 
     pub fn network_service(&self) -> Option<NetworkService> {
         self.inner.network_service.get().cloned()
+    }
+
+    /// Resolves once the machine's network service is installed.
+    ///
+    /// The service arrives late on every backend — device discovery
+    /// installs it from a task processors may start their run loops
+    /// before — so a caller that needs it waits out the install the
+    /// way [`Self::wait_for_program_service`] waits out its own.
+    pub async fn wait_for_network_service(&self) -> NetworkService {
+        loop {
+            // Armed before the slot is read: installation broadcasts to
+            // every task waiting for the service and banks nothing, so a
+            // wait created after an install it just missed would park
+            // for a second install that never comes.
+            let installed = self.inner.network_service_ready.notified();
+            if let Some(service) = self.network_service() {
+                return service;
+            }
+
+            installed.await;
+        }
     }
 
     /// The hand-off slot for the `http-client` kernel plugin.
@@ -854,6 +906,27 @@ where
 
     pub fn audio_service(&self) -> Option<crate::audio::AudioService> {
         self.inner.audio_service.get().cloned()
+    }
+
+    /// Publishes the machine generation of this boot. The backend does
+    /// this once, before it seeds the root DRBG with the same handle.
+    pub fn install_machine_generation(&self, generation: MachineGenerationHandle) {
+        let mut installed = false;
+        self.inner.machine_generation.call_once(|| {
+            installed = true;
+            generation
+        });
+        assert!(
+            installed,
+            "the machine generation was installed more than once"
+        );
+    }
+
+    /// The machine generation of this boot.
+    pub fn machine_generation(&self) -> &MachineGeneration {
+        self.inner.machine_generation.get().unwrap_or_else(|| {
+            panic!("the machine generation was used before the backend installed it")
+        })
     }
 
     /// Publishes the root DRBG the backend seeded at boot.
@@ -975,6 +1048,18 @@ where
 
     pub fn bootfs(&self) -> Option<EmbeddedBootFs> {
         *self.inner.bootfs.lock()
+    }
+
+    /// The system component this payload carries, when this build would
+    /// autostart one.
+    pub fn system_component(&self) -> Option<EmbeddedComponent> {
+        self.inner.payload.system_component()
+    }
+
+    /// Whether the payload carries a system component this build would
+    /// autostart.
+    pub fn has_system_component(&self) -> bool {
+        self.inner.payload.has_system_component()
     }
 
     pub fn retire_bootfs(&self) {
@@ -1152,7 +1237,12 @@ mod tests {
 
     #[test]
     fn runtime_state_records_kernel_heap_delta_metrics() {
-        let state = RuntimeState::<(), (), ()>::new(1_000_000_000, 1, 0);
+        let state = RuntimeState::<(), (), ()>::new(
+            Timebase::new(1_000_000_000),
+            1,
+            0,
+            BootPayload::for_tests(),
+        );
         let baseline = crate::heap_stats();
         state.inner.heap_perf_snapshot.reset(baseline);
         state.set_profiling_enabled(true);

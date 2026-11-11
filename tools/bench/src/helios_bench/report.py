@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 from enum import StrEnum
 from pathlib import Path
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field
 
@@ -22,6 +23,13 @@ class Side(StrEnum):
     #: `HELIOS` on the same host in the same job. Present only in a paired
     #: run; see `helios_bench.baseline`.
     HELIOS_BASELINE = "helios_baseline"
+    #: The baseline commit built a second time, from a second profile
+    #: collected independently of the one `HELIOS_BASELINE` was built
+    #: against, and timed beside both other images in the same job. How
+    #: far it lands from `HELIOS_BASELINE` is how far a column moves
+    #: between two builds of one commit, which is what a per-run profile
+    #: collection adds to every shift the paired comparison reads (#479).
+    HELIOS_BASELINE_REBUILD = "helios_baseline_rebuild"
     LINUX_WASMTIME = "linux_wasmtime"
     LINUX_NATIVE = "linux_native"
 
@@ -29,14 +37,24 @@ class Side(StrEnum):
 SIDE_LABELS = {
     Side.HELIOS: "Helios",
     Side.HELIOS_BASELINE: "Helios (baseline)",
+    Side.HELIOS_BASELINE_REBUILD: "Helios (baseline rebuild)",
     Side.LINUX_WASMTIME: "Linux + Wasmtime",
     Side.LINUX_NATIVE: "Native Linux",
 }
 
-#: The order a table and a plot put the sides in. The baseline column is
-#: printed only by a run that produced one, so an unpaired report renders
-#: exactly as it did before the paired mode existed.
-TABLE_SIDE_ORDER = [Side.HELIOS, Side.HELIOS_BASELINE, Side.LINUX_WASMTIME, Side.LINUX_NATIVE]
+#: The order a table and a plot put the sides in. The baseline columns
+#: are printed only by a run that produced them, so an unpaired report
+#: renders exactly as it did before the paired mode existed.
+TABLE_SIDE_ORDER = [
+    Side.HELIOS,
+    Side.HELIOS_BASELINE,
+    Side.HELIOS_BASELINE_REBUILD,
+    Side.LINUX_WASMTIME,
+    Side.LINUX_NATIVE,
+]
+
+#: The sides only a paired run measures.
+PAIRED_SIDES = frozenset({Side.HELIOS_BASELINE, Side.HELIOS_BASELINE_REBUILD})
 
 
 class WorkloadClass(StrEnum):
@@ -58,6 +76,67 @@ CLASS_LABELS = {
     WorkloadClass.FS: "File I/O",
     WorkloadClass.COMPUTE: "Compute parity",
 }
+
+
+class RetriedForNoise(BaseModel):
+    """The paired suite was measured once more because the first pass's
+    noise floor crossed the bound (#375): a noisy stretch says something
+    about that hour of the host and nothing about the next, so both
+    floors are kept and the second pass's is the one this report's
+    verdicts read."""
+
+    kind: Literal["retried"] = "retried"
+    first_noise_floor: float = Field(
+        description="the first pass's noise floor — the one that crossed cv_bound"
+    )
+    second_noise_floor: float = Field(
+        description="the retry pass's noise floor — the one this report's verdicts read"
+    )
+
+
+class RetrySkippedForBudget(BaseModel):
+    """The first pass's noise floor crossed the bound but the one retry
+    was not started: a second pass, estimated at the first pass's Helios
+    wall time, would have outlasted what remained of the job's
+    ``--job-timeout-minutes``. The report is the first pass's — still
+    inconclusive — and the two numbers are what the decision was made
+    from."""
+
+    kind: Literal["skipped-for-budget"] = "skipped-for-budget"
+    first_noise_floor: float = Field(
+        description="the first pass's noise floor — the one that crossed cv_bound"
+    )
+    needed_seconds: float = Field(
+        description="the first pass's Helios wall time — what a second pass was sized at"
+    )
+    remaining_seconds: float = Field(
+        description="what remained of the run's --job-timeout-minutes when the retry was weighed"
+    )
+
+
+#: What `RunInfo.noise_retry` carries: the retry either ran or it did
+#: not, and each outcome's shape has exactly the fields it can produce —
+#: an impossible combination has no representation.
+NoiseRetry = Annotated[RetriedForNoise | RetrySkippedForBudget, Field(discriminator="kind")]
+
+
+class InstructionSampling(BaseModel):
+    """How one Helios column's boots were sampled at the instruction level.
+
+    Sampling is a diagnosis that changes what is timed: every processor's
+    timer interrupts at the sampling period instead of the scheduler tick,
+    and a kernel task drains the samples, so every timing of a sampled
+    column carries the sampler's overhead (docs/benchmarks.md). The driver
+    samples every boot of every image of a run alike or refuses the run
+    (#475); this is what the guests said about it.
+    """
+
+    period_nanos: int = Field(
+        description="the interval between two samples on one processor, as every boot's guest reported it"
+    )
+    boots: int = Field(description="boots whose inspector reported a capture")
+    samples: int = Field(description="samples captured over those boots")
+    dropped: int = Field(description="samples the guest's rings refused over those boots")
 
 
 class RunInfo(BaseModel):
@@ -115,6 +194,25 @@ class RunInfo(BaseModel):
         default_factory=list,
         description="headline workloads timed again on both images after the first pair of boots regressed",
     )
+    instruction_sampling: InstructionSampling | None = Field(
+        default=None,
+        description=(
+            "how the `helios` column was sampled at the instruction level; None when it was "
+            "not, which is every run that did not ask for an instruction profile"
+        ),
+    )
+    baseline_instruction_sampling: InstructionSampling | None = Field(
+        default=None,
+        description="how the `helios_baseline` column was sampled, when the run was paired and sampled",
+    )
+    noise_retry: NoiseRetry | None = Field(
+        default=None,
+        description=(
+            "the paired suite was measured once more because the first pass's noise floor "
+            "crossed the bound (#375); None when the first pass was readable or the run "
+            "was not paired"
+        ),
+    )
     kernel_profile: str | None = Field(
         default=None,
         description=(
@@ -152,10 +250,36 @@ class RunInfo(BaseModel):
         default=None,
         description="the denominator for the baseline image, when the run was paired",
     )
+    baseline_rebuild_kernel_profile: str | None = Field(
+        default=None,
+        description=(
+            "the second, independently collected kernel profile the `helios_baseline_rebuild` "
+            "column's kernel was built against: the baseline commit built a second time, so "
+            "the comparison can measure how far two builds of one commit move apart (#479); "
+            "None when the run built no rebuild column"
+        ),
+    )
+    baseline_rebuild_kernel_pgo_uncovered: int | None = Field(
+        default=None,
+        description="the uncovered count for the baseline rebuild image, when the run built one",
+    )
+    baseline_rebuild_kernel_pgo_functions: int | None = Field(
+        default=None,
+        description="the denominator for the baseline rebuild image, when the run built one",
+    )
+    baseline_rebuild_instruction_sampling: InstructionSampling | None = Field(
+        default=None,
+        description="how the `helios_baseline_rebuild` column was sampled, when the run built and sampled it",
+    )
 
     @property
     def paired(self) -> bool:
         return self.baseline_git_sha is not None
+
+    @property
+    def rebuilt(self) -> bool:
+        """Whether the run built the baseline commit twice, from two profiles."""
+        return self.baseline_rebuild_kernel_profile is not None
 
 
 class Hardware(BaseModel):
@@ -169,7 +293,16 @@ class Hardware(BaseModel):
 
 
 class Pins(BaseModel):
-    wasmtime_revision: str
+    wasmtime_revision: str = Field(
+        description="the Wasmtime fork revision the `helios` side was built against"
+    )
+    baseline_wasmtime_revision: str | None = Field(
+        default=None,
+        description=(
+            "the Wasmtime fork revision the `helios_baseline` side and its rebuild were "
+            "built against — the one the baseline commit pins (#486) — when the run was paired"
+        ),
+    )
     wasmtime_linux_release: str
     fedora_image_url: str
     fedora_image_sha256: str
@@ -178,6 +311,14 @@ class Pins(BaseModel):
     memory: str
     linux_vm_memory: str
     net_backend: str
+    rpc_transport: Literal["serial", "vsock"] | None = Field(
+        default=None,
+        description=(
+            "the transport the inspector RPC every Helios row is timed around rode; "
+            "None for a report written before the field existed, which the gate "
+            "still reads as the lane's previous run"
+        ),
+    )
     devices: list[str]
     wasm_artifacts: dict[str, str] = Field(
         description="repo-relative path -> sha256 of every wasm the run used"
@@ -253,6 +394,14 @@ class WorkloadResult(BaseModel):
         description="sides the manifest records as uncompared for this workload, with the reason",
     )
     comparisons: list[Comparison]
+    first_pass: dict[Side, Cell] = Field(
+        default_factory=dict,
+        description=(
+            "the first pair of boots of a workload the reconfirm measured again, one cell per "
+            "Helios image; `cells` holds the second pair, which the verdicts read. How far one "
+            "image moved between its two boots is part of that workload's floor"
+        ),
+    )
     parity_bug: bool = Field(
         description="compared workload where Helios is significantly slower than Linux + Wasmtime, "
         "whatever its class"
@@ -292,7 +441,7 @@ class Report(BaseModel):
     def table_sides(self) -> list[Side]:
         """The columns a table and a plot print, in report order."""
         measured = self.measured_sides()
-        return [side for side in TABLE_SIDE_ORDER if side is not Side.HELIOS_BASELINE or side in measured]
+        return [side for side in TABLE_SIDE_ORDER if side not in PAIRED_SIDES or side in measured]
 
     def headline_workloads(self) -> list[WorkloadResult]:
         return [workload for workload in self.workloads if workload.headline]

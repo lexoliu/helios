@@ -22,6 +22,16 @@ const PAGE_FAULT_VECTOR: u64 = 14;
 /// Interrupt-stack-table slots, as `set_stack_index` counts them.
 const PAGE_FAULT_IST_INDEX: u16 = 0;
 const DOUBLE_FAULT_IST_INDEX: u16 = 1;
+/// The slot every external interrupt is taken on. Delivered with no
+/// IST, an interrupt pushes its frame onto the interrupted stack, and
+/// when that stack is a fiber stack whose next page is still reserved
+/// the push itself faults during delivery: the page fault is delivered
+/// instead, the dispatcher commits the page and returns to the
+/// interrupted instruction, and the interrupt — which the local APIC
+/// already moved from IRR to ISR — never runs and never gets an EOI, so
+/// PPR withholds its whole priority class on that processor, timer and
+/// wake IPI included (#421).
+const INTERRUPT_IST_INDEX: u16 = 2;
 /// One exception stack. The runtime's trap handler and a panic's
 /// formatting both run on it; AArch64 sizes its exception stack the same.
 pub(crate) const EXCEPTION_STACK_BYTES: usize = 64 * 1024;
@@ -31,6 +41,7 @@ const PROBE_RESOLVED: usize = usize::MAX;
 pub(crate) const TIMER_INTERRUPT_VECTOR: u8 = 0x20;
 pub(crate) const WAKE_INTERRUPT_VECTOR: u8 = 0x21;
 pub(crate) const TLB_SHOOTDOWN_INTERRUPT_VECTOR: u8 = 0x22;
+pub(crate) const APIC_ERROR_INTERRUPT_VECTOR: u8 = 0x23;
 /// MSI-X vectors for the PCI devices the kernel drives. One vector per
 /// device keeps dispatch a direct lookup in [`DeviceInterruptRoutes`]
 /// without a shared interrupt-status scan.
@@ -59,6 +70,10 @@ pub(crate) const INPUT_INTERRUPT_VECTORS: [u8; helios_kernel::MAX_INPUT_DEVICES]
 /// The sound device's message. One vector: a machine carries one sound
 /// card, and its four queues share the interrupt the transport delivers.
 pub(crate) const SOUND_INTERRUPT_VECTOR: u8 = 0x3d;
+/// COM1's interrupt, the one device vector that is not an MSI-X
+/// message: the UART raises ISA IRQ 4 and an I/O APIC redirection entry
+/// translates that line into this local-APIC vector.
+pub(crate) const DEBUG_SERIAL_INTERRUPT_VECTOR: u8 = 0x3e;
 /// One vector per block device the routing table can hold: the platform
 /// exposes the boot image and the kernel's own disk as separate
 /// functions, and each of them delivers its completions on its own
@@ -82,6 +97,7 @@ pub(crate) type DeviceInterruptRoutes = helios_kernel::ExternalInterruptRoutes<
     crate::input::VirtioInputFunction,
     crate::snd::VirtioSoundDevice,
     crate::block::VirtioBlockDevice,
+    helios_kernel::DebugSerialInterrupt<crate::DebugSerial>,
 >;
 
 global_asm!(include_str!("exceptions.S"));
@@ -97,6 +113,7 @@ unsafe extern "C" {
     fn helios_x86_exception_simd_floating_point();
     fn helios_x86_interrupt_timer();
     fn helios_x86_interrupt_wake();
+    fn helios_x86_interrupt_apic_error();
     fn helios_x86_interrupt_tlb_shootdown();
     fn helios_x86_interrupt_network();
     fn helios_x86_interrupt_network_queue_0();
@@ -120,6 +137,7 @@ unsafe extern "C" {
     fn helios_x86_interrupt_block_1();
     fn helios_x86_interrupt_block_2();
     fn helios_x86_interrupt_block_3();
+    fn helios_x86_interrupt_debug_serial();
 }
 
 pub(crate) struct ProcessorIdt {
@@ -171,14 +189,23 @@ impl ProcessorIdt {
             table
                 .simd_floating_point
                 .set_handler_addr(handler_address(helios_x86_exception_simd_floating_point));
-            table[TIMER_INTERRUPT_VECTOR]
-                .set_handler_addr(handler_address(helios_x86_interrupt_timer));
-            table[WAKE_INTERRUPT_VECTOR]
-                .set_handler_addr(handler_address(helios_x86_interrupt_wake));
-            table[TLB_SHOOTDOWN_INTERRUPT_VECTOR]
-                .set_handler_addr(handler_address(helios_x86_interrupt_tlb_shootdown));
-            table[NETWORK_INTERRUPT_VECTOR]
-                .set_handler_addr(handler_address(helios_x86_interrupt_network));
+            install_interrupt(table, TIMER_INTERRUPT_VECTOR, helios_x86_interrupt_timer);
+            install_interrupt(table, WAKE_INTERRUPT_VECTOR, helios_x86_interrupt_wake);
+            install_interrupt(
+                table,
+                APIC_ERROR_INTERRUPT_VECTOR,
+                helios_x86_interrupt_apic_error,
+            );
+            install_interrupt(
+                table,
+                TLB_SHOOTDOWN_INTERRUPT_VECTOR,
+                helios_x86_interrupt_tlb_shootdown,
+            );
+            install_interrupt(
+                table,
+                NETWORK_INTERRUPT_VECTOR,
+                helios_x86_interrupt_network,
+            );
             let network_queue_stubs: [unsafe extern "C" fn(); MAX_NETWORK_QUEUE_VECTORS] = [
                 helios_x86_interrupt_network_queue_0,
                 helios_x86_interrupt_network_queue_1,
@@ -193,16 +220,24 @@ impl ProcessorIdt {
                 .iter()
                 .zip(network_queue_stubs)
             {
-                table[*vector].set_handler_addr(handler_address(stub));
+                install_interrupt(table, *vector, stub);
             }
-            table[HOST_FS_INTERRUPT_VECTOR]
-                .set_handler_addr(handler_address(helios_x86_interrupt_host_fs));
-            table[ENTROPY_INTERRUPT_VECTOR]
-                .set_handler_addr(handler_address(helios_x86_interrupt_entropy));
-            table[VSOCK_INTERRUPT_VECTOR]
-                .set_handler_addr(handler_address(helios_x86_interrupt_vsock));
-            table[DISPLAY_INTERRUPT_VECTOR]
-                .set_handler_addr(handler_address(helios_x86_interrupt_display));
+            install_interrupt(
+                table,
+                HOST_FS_INTERRUPT_VECTOR,
+                helios_x86_interrupt_host_fs,
+            );
+            install_interrupt(
+                table,
+                ENTROPY_INTERRUPT_VECTOR,
+                helios_x86_interrupt_entropy,
+            );
+            install_interrupt(table, VSOCK_INTERRUPT_VECTOR, helios_x86_interrupt_vsock);
+            install_interrupt(
+                table,
+                DISPLAY_INTERRUPT_VECTOR,
+                helios_x86_interrupt_display,
+            );
             let input_stubs: [unsafe extern "C" fn(); helios_kernel::MAX_INPUT_DEVICES] = [
                 helios_x86_interrupt_input_0,
                 helios_x86_interrupt_input_1,
@@ -210,10 +245,9 @@ impl ProcessorIdt {
                 helios_x86_interrupt_input_3,
             ];
             for (vector, stub) in INPUT_INTERRUPT_VECTORS.iter().zip(input_stubs) {
-                table[*vector].set_handler_addr(handler_address(stub));
+                install_interrupt(table, *vector, stub);
             }
-            table[SOUND_INTERRUPT_VECTOR]
-                .set_handler_addr(handler_address(helios_x86_interrupt_sound));
+            install_interrupt(table, SOUND_INTERRUPT_VECTOR, helios_x86_interrupt_sound);
             let block_stubs: [unsafe extern "C" fn(); helios_kernel::MAX_BLOCK_DEVICES] = [
                 helios_x86_interrupt_block_0,
                 helios_x86_interrupt_block_1,
@@ -221,8 +255,13 @@ impl ProcessorIdt {
                 helios_x86_interrupt_block_3,
             ];
             for (vector, stub) in BLOCK_INTERRUPT_VECTORS.iter().zip(block_stubs) {
-                table[*vector].set_handler_addr(handler_address(stub));
+                install_interrupt(table, *vector, stub);
             }
+            install_interrupt(
+                table,
+                DEBUG_SERIAL_INTERRUPT_VECTOR,
+                helios_x86_interrupt_debug_serial,
+            );
             table.load_unsafe();
         }
     }
@@ -230,8 +269,9 @@ impl ProcessorIdt {
 
 /// The segment state a processor loads beside its IDT: a GDT of its own
 /// carrying a TSS whose interrupt stack table names the two exception
-/// stacks. Limine hands the kernel a GDT with no TSS, so until this is
-/// loaded no IDT entry can ask for a stack switch.
+/// stacks and the interrupt stack. Limine hands the kernel a GDT with
+/// no TSS, so until this is loaded no IDT entry can ask for a stack
+/// switch.
 ///
 /// Owned by one [`smp::ProcessorRuntime`] and touched only by the
 /// processor it belongs to, during `install_for_current_processor`.
@@ -240,6 +280,7 @@ pub(crate) struct ProcessorSegments {
     tss: UnsafeCell<TaskStateSegment>,
     page_fault_stack: Range<usize>,
     double_fault_stack: Range<usize>,
+    interrupt_stack: Range<usize>,
 }
 
 // SAFETY: the tables are written and loaded by the owning processor only,
@@ -247,24 +288,31 @@ pub(crate) struct ProcessorSegments {
 unsafe impl Sync for ProcessorSegments {}
 
 impl ProcessorSegments {
-    /// `page_fault_stack` and `double_fault_stack` are the byte ranges of
-    /// two stacks allocated for this processor alone; the TSS names their
-    /// upper ends.
+    /// `page_fault_stack`, `double_fault_stack` and `interrupt_stack`
+    /// are the byte ranges of stacks allocated for this processor
+    /// alone; the TSS names their upper ends.
     pub(crate) const fn new(
         page_fault_stack: Range<usize>,
         double_fault_stack: Range<usize>,
+        interrupt_stack: Range<usize>,
     ) -> Self {
         Self {
             gdt: UnsafeCell::new(GlobalDescriptorTable::new()),
             tss: UnsafeCell::new(TaskStateSegment::new()),
             page_fault_stack,
             double_fault_stack,
+            interrupt_stack,
         }
     }
 
     /// The stack every page fault on this processor is taken on.
     pub(crate) fn page_fault_stack(&self) -> Range<usize> {
         self.page_fault_stack.clone()
+    }
+
+    /// The stack every external interrupt on this processor is taken on.
+    pub(crate) fn interrupt_stack(&self) -> Range<usize> {
+        self.interrupt_stack.clone()
     }
 
     /// Builds the TSS and GDT and makes them the processor's own.
@@ -275,8 +323,9 @@ impl ProcessorSegments {
     fn install(&self) {
         assert!(
             self.page_fault_stack.end.is_multiple_of(16)
-                && self.double_fault_stack.end.is_multiple_of(16),
-            "x86 exception stack tops must be 16-byte aligned"
+                && self.double_fault_stack.end.is_multiple_of(16)
+                && self.interrupt_stack.end.is_multiple_of(16),
+            "x86 IST stack tops must be 16-byte aligned"
         );
         // SAFETY: this runs once per processor, on that processor, with
         // interrupts disabled, and nothing else reaches these cells.
@@ -287,6 +336,8 @@ impl ProcessorSegments {
             VirtAddr::new(self.page_fault_stack.end as u64);
         tss.interrupt_stack_table[usize::from(DOUBLE_FAULT_IST_INDEX)] =
             VirtAddr::new(self.double_fault_stack.end as u64);
+        tss.interrupt_stack_table[usize::from(INTERRUPT_IST_INDEX)] =
+            VirtAddr::new(self.interrupt_stack.end as u64);
         *gdt = GlobalDescriptorTable::new();
         let code = gdt.append(Descriptor::kernel_code_segment());
         let data = gdt.append(Descriptor::kernel_data_segment());
@@ -422,6 +473,38 @@ fn assert_frame_on_exception_stack(frame: &ExceptionFrame) {
     );
 }
 
+/// An external interrupt whose frame is not on this processor's
+/// interrupt stack was delivered without the IST, so its frame went
+/// onto the interrupted stack — the delivery that loses the interrupt
+/// when the next page under `rsp` is still reserved (#421).
+fn assert_frame_on_interrupt_stack(frame: &ExceptionFrame) {
+    let stack = smp::current_runtime().segments.interrupt_stack();
+    let address = core::ptr::from_ref(frame) as usize;
+    assert!(
+        stack.contains(&address),
+        "x86 interrupt frame at {address:#x} is not on this processor's interrupt stack \
+         {:#x}..{:#x}: the IST is not in effect",
+        stack.start,
+        stack.end
+    );
+}
+
+/// Points `vector` at `stub` with the interrupt stack named as its
+/// IST. Every external interrupt installs through here so none can be
+/// delivered on the interrupted stack; what that delivery loses is on
+/// [`INTERRUPT_IST_INDEX`].
+unsafe fn install_interrupt(
+    table: &mut InterruptDescriptorTable,
+    vector: u8,
+    stub: unsafe extern "C" fn(),
+) {
+    unsafe {
+        table[vector]
+            .set_handler_addr(handler_address(stub))
+            .set_stack_index(INTERRUPT_IST_INDEX);
+    }
+}
+
 fn handler_address(handler: unsafe extern "C" fn()) -> VirtAddr {
     VirtAddr::new(handler as usize as u64)
 }
@@ -522,15 +605,21 @@ extern "C" fn helios_x86_exception_dispatch(frame: &mut ExceptionFrame) {
 
 #[unsafe(no_mangle)]
 extern "C" fn helios_x86_interrupt_dispatch(frame: &mut ExceptionFrame) {
+    let runtime = smp::current_runtime();
+    assert_frame_on_interrupt_stack(frame);
+    runtime.begin_interrupt_dispatch(frame.vector);
     match u8::try_from(frame.vector) {
         Ok(TIMER_INTERRUPT_VECTOR) => {
-            smp::handle_local_timer_interrupt();
+            smp::handle_local_timer_interrupt(frame.rip as usize);
         }
         Ok(WAKE_INTERRUPT_VECTOR) => {
             // The wake IPI exists solely to drag a HLT-ed processor
             // back into the kernel run loop; receiving it is enough,
             // no work to do beyond ack.
             smp::handle_wake_interrupt();
+        }
+        Ok(APIC_ERROR_INTERRUPT_VECTOR) => {
+            smp::handle_apic_error_interrupt();
         }
         Ok(TLB_SHOOTDOWN_INTERRUPT_VECTOR) => {
             smp::handle_tlb_shootdown_interrupt();
@@ -543,10 +632,12 @@ extern "C" fn helios_x86_interrupt_dispatch(frame: &mut ExceptionFrame) {
              network={NETWORK_INTERRUPT_VECTOR:#x} host-fs={HOST_FS_INTERRUPT_VECTOR:#x} \
              entropy={ENTROPY_INTERRUPT_VECTOR:#x} vsock={VSOCK_INTERRUPT_VECTOR:#x} \
              display={DISPLAY_INTERRUPT_VECTOR:#x} input={INPUT_INTERRUPT_VECTORS:#x?} \
-             sound={SOUND_INTERRUPT_VECTOR:#x} block={BLOCK_INTERRUPT_VECTORS:#x?}",
+             sound={SOUND_INTERRUPT_VECTOR:#x} block={BLOCK_INTERRUPT_VECTORS:#x?} \
+             debug-serial={DEBUG_SERIAL_INTERRUPT_VECTOR:#x}",
             frame.vector, frame.rip
         ),
     }
+    runtime.end_interrupt_dispatch();
 }
 
 /// Whether `vector` belongs to a device route.
@@ -566,6 +657,7 @@ fn is_device_interrupt(vector: u8) -> bool {
             | VSOCK_INTERRUPT_VECTOR
             | DISPLAY_INTERRUPT_VECTOR
             | SOUND_INTERRUPT_VECTOR
+            | DEBUG_SERIAL_INTERRUPT_VECTOR
     ) || BLOCK_INTERRUPT_VECTORS.contains(&vector)
         || INPUT_INTERRUPT_VECTORS.contains(&vector)
         || NETWORK_QUEUE_INTERRUPT_VECTORS.contains(&vector)

@@ -264,10 +264,13 @@ mod tests {
     use bytes::Bytes;
     use futures_lite::future::block_on;
 
+    use crate::wasmtime_adapter::component_host::ProgramSource;
+    use crate::wasmtime_adapter::cwasm::{self, UntrustedCwasm};
+
     use super::{
         DEFAULT_WASI_TCP_HOP_LIMIT, DEFAULT_WASI_TCP_KEEP_ALIVE_COUNT,
         DEFAULT_WASI_TCP_KEEP_ALIVE_IDLE_NANOS, DEFAULT_WASI_TCP_KEEP_ALIVE_INTERVAL_NANOS,
-        DEFAULT_WASI_TCP_LISTEN_BACKLOG, DebugFileSystem, FsDescriptor, FsNodeKind,
+        DEFAULT_WASI_TCP_LISTEN_BACKLOG, DebugFileSystem, FileContents, FsDescriptor, FsNodeKind,
         P2ResolveAddressStream, TcpSocket, UdpSocket, WasiTcpIpAddress, WasiTcpSocketAddress,
         WasiTcpSocketFamily, WasiUdpSocketAddress, WasiUdpSocketError, WasiUdpSocketFamily,
         format_p3_tcp_socket_address, format_p3_udp_socket_address, fs_types,
@@ -1048,6 +1051,194 @@ mod tests {
             .write_at(&descriptor, 0, b"x", 1)
             .expect_err("readonly bootfs file must reject writes");
         assert!(matches!(error, fs_types::ErrorCode::ReadOnly));
+    }
+
+    /// A cwasm signed by a key the kernel does not trust: it parses as
+    /// an artifact, and only a signature check tells it apart.
+    fn foreign_signed_cwasm() -> &'static [u8] {
+        let signed = helios_artifact::sign_payload_with_secret_key_bytes(b"payload", &[7; 32])
+            .expect("signing a test payload must succeed");
+        Box::leak(signed.into_boxed_slice())
+    }
+
+    /// A filesystem whose bootfs carries `foreign_signed_cwasm` at
+    /// `/bin/prog`.
+    fn filesystem_with_bootfs_cwasm() -> TestFileSystem {
+        let mut filesystem = test_filesystem();
+        let files = Box::leak(Box::new([EmbeddedBootFile::new(
+            "bin/prog",
+            foreign_signed_cwasm(),
+            42,
+        )]));
+        filesystem.seed_bootfs(EmbeddedBootFs::new(&[], files));
+        filesystem
+    }
+
+    fn program_source(filesystem: &TestFileSystem, path: &str) -> ProgramSource {
+        ProgramSource::from_file(
+            filesystem
+                .read_program_file(path)
+                .expect("program file must be readable"),
+        )
+    }
+
+    #[test]
+    fn bootfs_cwasm_loads_without_signature_verification() {
+        let filesystem = filesystem_with_bootfs_cwasm();
+
+        let ProgramSource::BootfsArtifact(bytes) = program_source(&filesystem, "/bin/prog") else {
+            panic!("a bootfs cwasm must classify as a bootfs artifact");
+        };
+        // The signature would not verify, so accepting it proves the
+        // bootfs path pays no verification.
+        assert!(cwasm::verify_signed_artifact(UntrustedCwasm::new(bytes.as_slice())).is_err());
+        let trusted =
+            cwasm::trust_bootfs_artifact(&bytes).expect("a bootfs artifact loads unverified");
+        assert_eq!(trusted.payload(), b"payload");
+    }
+
+    #[test]
+    fn guest_written_cwasm_must_verify() {
+        let mut filesystem = filesystem_with_bootfs_cwasm();
+        let root = filesystem.root_descriptor();
+        filesystem
+            .create_directory_at(&root, "tmp", 1)
+            .expect("creating /tmp must succeed");
+
+        // The bytes of a bootfs artifact, copied by a guest through an
+        // ordinary WASI write: the copy has no bootfs provenance.
+        let copied = filesystem
+            .read_program_file("/bin/prog")
+            .expect("bootfs program must be readable")
+            .as_slice()
+            .to_vec();
+        let descriptor = filesystem
+            .open_at(
+                &root,
+                fs_types::PathFlags::empty(),
+                "tmp/copy",
+                fs_types::OpenFlags::CREATE,
+                fs_types::DescriptorFlags::READ | fs_types::DescriptorFlags::WRITE,
+                2,
+            )
+            .expect("creating a guest file must succeed");
+        filesystem
+            .write_at(&descriptor, 0, &copied, 3)
+            .expect("writing a guest file must succeed");
+        let ProgramSource::SignedArtifact(bytes) = program_source(&filesystem, "/tmp/copy") else {
+            panic!("a guest-written cwasm must classify as a signed artifact");
+        };
+        assert!(matches!(
+            cwasm::verify_signed_artifact(UntrustedCwasm::new(&bytes)),
+            Err(cwasm::ArtifactTrustError::Trailer(
+                helios_artifact::TrailerError::UntrustedSigner
+            ))
+        ));
+
+        // A kernel-signed artifact with one signature byte flipped, as
+        // `write_program_file` would store it, is refused too.
+        let mut tampered = cwasm::sign_trusted_artifact_payload(b"payload")
+            .expect("signing with the trusted root must succeed");
+        let last_signature_byte = tampered.len() - 13;
+        tampered[last_signature_byte] ^= 1;
+        filesystem
+            .write_program_file("/tmp/tampered", &tampered, 4)
+            .expect("writing a program file must succeed");
+        let ProgramSource::SignedArtifact(bytes) = program_source(&filesystem, "/tmp/tampered")
+        else {
+            panic!("a guest-written cwasm must classify as a signed artifact");
+        };
+        assert!(matches!(
+            cwasm::verify_signed_artifact(UntrustedCwasm::new(&bytes)),
+            Err(cwasm::ArtifactTrustError::Trailer(
+                helios_artifact::TrailerError::InvalidPayloadSignature
+            ))
+        ));
+
+        // What the in-kernel compiler writes is signed by the trusted
+        // root, and that is what lets a guest exec it from anywhere.
+        let signed = cwasm::sign_trusted_artifact_payload(b"payload")
+            .expect("signing with the trusted root must succeed");
+        filesystem
+            .write_program_file("/tmp/compiled", &signed, 5)
+            .expect("writing a program file must succeed");
+        let ProgramSource::SignedArtifact(bytes) = program_source(&filesystem, "/tmp/compiled")
+        else {
+            panic!("a guest-written cwasm must classify as a signed artifact");
+        };
+        let trusted = cwasm::verify_signed_artifact(UntrustedCwasm::new(&bytes))
+            .expect("a kernel-signed artifact must verify");
+        assert_eq!(trusted.payload(), b"payload");
+    }
+
+    #[test]
+    fn writing_a_bootfs_node_drops_its_provenance() {
+        let mut filesystem = filesystem_with_bootfs_cwasm();
+        let root = filesystem.root_descriptor();
+        // Bootfs nodes are read-only, so no guest reaches this state;
+        // lifting the flag here shows provenance does not rest on it:
+        // every write path stores written bytes, whatever the node held.
+        let bootfs_bytes = |filesystem: &TestFileSystem| {
+            matches!(
+                filesystem.read_program_file("/bin/prog"),
+                Ok(FileContents::Bootfs(_))
+            )
+        };
+        let make_writable = |filesystem: &TestFileSystem| {
+            let mut state = filesystem.snapshot.inner.lock();
+            let node = state.node_mut("/bin/prog").expect("bootfs node must exist");
+            node.readonly = false;
+        };
+        make_writable(&filesystem);
+        assert!(bootfs_bytes(&filesystem));
+        let descriptor = filesystem
+            .open_at(
+                &root,
+                fs_types::PathFlags::empty(),
+                "bin/prog",
+                fs_types::OpenFlags::empty(),
+                fs_types::DescriptorFlags::READ | fs_types::DescriptorFlags::WRITE,
+                1,
+            )
+            .expect("opening the node for writing must succeed");
+        filesystem
+            .write_at(&descriptor, 0, b"p", 2)
+            .expect("writing the node must succeed");
+        assert!(!bootfs_bytes(&filesystem));
+        assert!(matches!(
+            program_source(&filesystem, "/bin/prog"),
+            ProgramSource::SignedArtifact(_)
+        ));
+
+        let mut replaced = filesystem_with_bootfs_cwasm();
+        make_writable(&replaced);
+        replaced
+            .write_program_file("/bin/prog", foreign_signed_cwasm(), 2)
+            .expect("replacing the node must succeed");
+        assert!(!bootfs_bytes(&replaced));
+
+        let mut resized = filesystem_with_bootfs_cwasm();
+        make_writable(&resized);
+        let root = resized.root_descriptor();
+        let descriptor = resized
+            .open_at(
+                &root,
+                fs_types::PathFlags::empty(),
+                "bin/prog",
+                fs_types::OpenFlags::empty(),
+                fs_types::DescriptorFlags::READ | fs_types::DescriptorFlags::WRITE,
+                1,
+            )
+            .expect("opening the node for writing must succeed");
+        let length = resized
+            .read_program_file("/bin/prog")
+            .expect("bootfs program must be readable")
+            .as_slice()
+            .len() as u64;
+        resized
+            .set_size(&descriptor, length, 2)
+            .expect("resizing the node must succeed");
+        assert!(!bootfs_bytes(&resized));
     }
 
     #[test]
@@ -1990,6 +2181,375 @@ mod tests {
         assert!(
             !fin.flags.contains(TcpFlags::RST),
             "a connection with nothing unread is closed, not aborted"
+        );
+    }
+
+    /// The reply a connected socket would read back, as the peer's
+    /// segment header. `acked_len` is how many bytes this side sent —
+    /// the acknowledgement may not outrun it.
+    fn peer_data_segment(acked_len: u32) -> helios_netstack::TcpHeader {
+        use crate::network::EstablishedTcpFixture;
+        use helios_netstack::TcpFlags;
+        helios_netstack::TcpHeader {
+            source_port: EstablishedTcpFixture::PEER_PORT,
+            destination_port: EstablishedTcpFixture::LOCAL_PORT,
+            // The handshake consumed one sequence number on each side;
+            // the peer's next payload rides on `PEER_SEQUENCE + 1`, and
+            // its acknowledgement covers this side's SYN plus what the
+            // test sent.
+            sequence: EstablishedTcpFixture::PEER_SEQUENCE + 1,
+            acknowledgement: EstablishedTcpFixture::LOCAL_SEQUENCE + 1 + acked_len,
+            flags: TcpFlags::ACK.union(TcpFlags::PSH),
+            window_size: u16::MAX,
+        }
+    }
+
+    /// The `wasi:io` streams on a connected TCP socket run the whole
+    /// exchange on the task that polls them (#354).
+    ///
+    /// Both halves prove it the same way: nothing between the stream and
+    /// the socket can run a task — the types hold no spawner — so the
+    /// write's segment reaching the device's transmit ring and the read
+    /// answering from the receive queue happen inside this test's own
+    /// `block_on`. The bridge they replaced needed two detached tasks for
+    /// the same round trip.
+    #[test]
+    fn p2_tcp_socket_streams_run_the_exchange_on_the_calling_task() {
+        use crate::network::EstablishedTcpFixture;
+        use wasmtime_wasi_io::poll::Pollable;
+        use wasmtime_wasi_io::streams::{InputStream, OutputStream};
+
+        let device = crate::test_support::RecordingNetworkInterface::accepting_transmissions(1);
+        let fixture = EstablishedTcpFixture::with_interface(device.clone());
+        let retirement = crate::SocketRetirementQueue::new();
+        let socket = TcpSocket::new(retirement.sender(), WasiTcpSocketFamily::Ipv4);
+        socket.inner.lock().stream = Some(crate::NetworkHandle::into_raw(fixture.stream()));
+        let service = fixture.service();
+        let mut input = super::net::TcpSocketInputStream::new(socket.clone(), service.clone());
+        let mut output = super::net::TcpSocketOutputStream::new(socket, service);
+
+        // `write` is queue, segment, submit and doorbell on this poll —
+        // the frame on the device's ring is the proof.
+        block_on(output.ready());
+        assert!(
+            output
+                .check_write()
+                .expect("a fresh connection has send room")
+                > 0,
+            "the permit must cover at least one byte"
+        );
+        output
+            .write(Bytes::from_static(b"ping"))
+            .expect("the write queues onto the send path");
+        let wire = device.transmitted_frames();
+        assert!(
+            wire.iter()
+                .any(|frame| frame.windows(4).any(|window| window == b"ping")),
+            "the write's payload reached the wire inside the write call"
+        );
+
+        // `read` drains the socket's queue synchronously: the reply the
+        // stack already accepted comes back from the same call.
+        fixture.deliver(peer_data_segment(4), b"pong");
+        let bytes = input.read(4).expect("the queued reply reads back");
+        assert_eq!(&bytes[..], b"pong");
+    }
+
+    /// A segment landing between `ready`'s queue probe and its park
+    /// still wakes the reader — the arm-before-test rule.
+    ///
+    /// The first `poll` finds an empty queue and parks on the shard's
+    /// wait with the signal already armed; `deliver_rx` then puts the
+    /// reply on the device's ring and raises the completion event — the
+    /// arrive-between-test-and-park window, reproduced exactly. The next
+    /// poll must resolve: sleeping through it is the defect §4 exists to
+    /// prevent.
+    #[test]
+    fn p2_tcp_input_stream_wakes_when_a_segment_arrives_between_probe_and_park() {
+        use crate::network::EstablishedTcpFixture;
+        use futures_lite::future::poll_once;
+        use wasmtime_wasi_io::poll::Pollable;
+        use wasmtime_wasi_io::streams::InputStream;
+
+        let fixture = EstablishedTcpFixture::new();
+        let retirement = crate::SocketRetirementQueue::new();
+        let socket = TcpSocket::new(retirement.sender(), WasiTcpSocketFamily::Ipv4);
+        socket.inner.lock().stream = Some(crate::NetworkHandle::into_raw(fixture.stream()));
+        let mut input = super::net::TcpSocketInputStream::new(socket, fixture.service());
+
+        let mut ready = input.ready();
+        assert!(
+            block_on(poll_once(ready.as_mut())).is_none(),
+            "an empty receive queue parks the readiness wait"
+        );
+        fixture.deliver_rx(peer_data_segment(0), b"pong");
+        assert!(
+            block_on(poll_once(ready.as_mut())).is_some(),
+            "the segment that arrived between probe and park resolves the wait"
+        );
+        drop(ready);
+        let bytes = input.read(4).expect("the parked reader's reply reads back");
+        assert_eq!(&bytes[..], b"pong");
+    }
+
+    /// `shutdown(Send)` makes the output stream permanently ready, and
+    /// the accessors that follow report `closed`.
+    ///
+    /// The flag and the stack's FIN are both exercised: the readiness
+    /// wait resolves on the flag, and the send probe reports the socket
+    /// the shutdown left behind — a `FinWait1` connection cannot send
+    /// (#358 review: a zero-room answer conflated this with a full
+    /// queue, and the wait never resolved).
+    #[test]
+    fn p2_tcp_output_stream_reports_closed_after_send_shutdown() {
+        use crate::network::EstablishedTcpFixture;
+        use futures_lite::future::poll_once;
+        use wasmtime_wasi_io::poll::Pollable;
+        use wasmtime_wasi_io::streams::{OutputStream, StreamError};
+
+        let fixture = EstablishedTcpFixture::new();
+        let service = fixture.service();
+        let retirement = crate::SocketRetirementQueue::new();
+        let socket = TcpSocket::new(retirement.sender(), WasiTcpSocketFamily::Ipv4);
+        socket.inner.lock().stream = Some(crate::NetworkHandle::into_raw(fixture.stream()));
+        let mut output = super::net::TcpSocketOutputStream::new(socket.clone(), service.clone());
+
+        socket
+            .shutdown_send_state()
+            .expect("a connected socket shuts its send side");
+        block_on(service.tcp_shutdown_send(fixture.stream())).expect("the shutdown queues the FIN");
+        assert!(
+            matches!(
+                service.tcp_send_room(fixture.stream()),
+                Ok(crate::TcpWriteProgress::Closed(_))
+            ),
+            "the send probe reports the close, not a full queue"
+        );
+
+        assert!(
+            block_on(poll_once(output.ready().as_mut())).is_some(),
+            "a shut-down send side resolves the readiness wait"
+        );
+        assert!(
+            matches!(output.check_write(), Err(StreamError::Closed)),
+            "check-write reports the closed send side"
+        );
+        assert!(
+            matches!(
+                output.write(Bytes::from_static(b"ping")),
+                Err(StreamError::Closed)
+            ),
+            "write reports the closed send side"
+        );
+    }
+
+    /// The peer's reset ends the send side the same way: `ready`
+    /// resolves and `check_write`/`write` answer `closed`.
+    #[test]
+    fn p2_tcp_output_stream_reports_closed_after_peer_reset() {
+        use crate::network::EstablishedTcpFixture;
+        use futures_lite::future::poll_once;
+        use helios_netstack::TcpFlags;
+        use wasmtime_wasi_io::poll::Pollable;
+        use wasmtime_wasi_io::streams::{OutputStream, StreamError};
+
+        let fixture = EstablishedTcpFixture::new();
+        let retirement = crate::SocketRetirementQueue::new();
+        let socket = TcpSocket::new(retirement.sender(), WasiTcpSocketFamily::Ipv4);
+        socket.inner.lock().stream = Some(crate::NetworkHandle::into_raw(fixture.stream()));
+        let mut output = super::net::TcpSocketOutputStream::new(socket, fixture.service());
+
+        fixture.deliver(
+            helios_netstack::TcpHeader {
+                source_port: EstablishedTcpFixture::PEER_PORT,
+                destination_port: EstablishedTcpFixture::LOCAL_PORT,
+                sequence: EstablishedTcpFixture::PEER_SEQUENCE + 1,
+                acknowledgement: EstablishedTcpFixture::LOCAL_SEQUENCE + 1,
+                flags: TcpFlags::RST.union(TcpFlags::ACK),
+                window_size: 0,
+            },
+            &[],
+        );
+
+        assert!(
+            block_on(poll_once(output.ready().as_mut())).is_some(),
+            "a reset send side resolves the readiness wait"
+        );
+        assert!(
+            matches!(output.check_write(), Err(StreamError::Closed)),
+            "check-write reports the reset send side as closed"
+        );
+        assert!(
+            matches!(
+                output.write(Bytes::from_static(b"ping")),
+                Err(StreamError::Closed)
+            ),
+            "write reports the reset send side as closed"
+        );
+    }
+
+    /// A `ready` parked behind a full send queue is woken by the peer's
+    /// ACK — the send half of the arm-before-test rule.
+    ///
+    /// The queue is filled through the service directly so `pending`
+    /// stays empty and the wait is `tcp_write_ready`'s own loop: probe,
+    /// arm, park. The ACK then arrives the way the device delivers one
+    /// — ring plus completion event — and the armed wait resolves.
+    #[test]
+    fn p2_tcp_output_stream_wakes_when_an_ack_arrives_between_probe_and_park() {
+        use crate::network::EstablishedTcpFixture;
+        use futures_lite::future::poll_once;
+        use helios_netstack::TcpFlags;
+        use wasmtime_wasi_io::poll::Pollable;
+        use wasmtime_wasi_io::streams::OutputStream;
+
+        let fixture = EstablishedTcpFixture::new();
+        let service = fixture.service();
+        let retirement = crate::SocketRetirementQueue::new();
+        let socket = TcpSocket::new(retirement.sender(), WasiTcpSocketFamily::Ipv4);
+        socket.inner.lock().stream = Some(crate::NetworkHandle::into_raw(fixture.stream()));
+        let mut output = super::net::TcpSocketOutputStream::new(socket, service.clone());
+
+        // The peer advertised a 64 KiB window and never ACKs, so enough
+        // queued bytes fill it and then the send queue behind it.
+        let mut fill = Bytes::from(vec![0xAB; 2 * 1024 * 1024]);
+        loop {
+            service
+                .tcp_try_write(fixture.stream(), &mut fill)
+                .expect("the fill write queues");
+            match service
+                .tcp_send_room(fixture.stream())
+                .expect("the probe answers")
+            {
+                crate::TcpWriteProgress::Pending => break,
+                crate::TcpWriteProgress::Room(_) => {}
+                crate::TcpWriteProgress::Closed(_) => {
+                    panic!("a live connection cannot report a closed send side")
+                }
+            }
+            assert!(
+                !fill.is_empty(),
+                "the send queue must fill before the fill buffer runs out"
+            );
+        }
+        // How far the send sequence actually ran is what the peer may
+        // acknowledge — the window, the congestion window and the
+        // socket's own segmentation decide it, so read it off the
+        // wire: the refused device's ring kept the segments staged,
+        // and `drive` reports them.
+        let sent = fixture
+            .drive()
+            .iter()
+            .map(|segment| segment.payload_len as u32)
+            .fold(
+                EstablishedTcpFixture::LOCAL_SEQUENCE.wrapping_add(1),
+                u32::wrapping_add,
+            );
+        assert_ne!(
+            sent,
+            EstablishedTcpFixture::LOCAL_SEQUENCE.wrapping_add(1),
+            "the fill's drive put data on the wire"
+        );
+
+        let mut ready = output.ready();
+        assert!(
+            block_on(poll_once(ready.as_mut())).is_none(),
+            "a full send queue parks the readiness wait"
+        );
+        // A full ACK reopens the window; the drive the woken wait runs
+        // then moves queued bytes into flight and frees the queue.
+        fixture.deliver_rx(
+            helios_netstack::TcpHeader {
+                source_port: EstablishedTcpFixture::PEER_PORT,
+                destination_port: EstablishedTcpFixture::LOCAL_PORT,
+                sequence: EstablishedTcpFixture::PEER_SEQUENCE + 1,
+                acknowledgement: sent,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+            },
+            &[],
+        );
+        assert!(
+            block_on(poll_once(ready.as_mut())).is_some(),
+            "the ACK that arrived after the park resolves the wait"
+        );
+        drop(ready);
+        assert!(
+            output
+                .check_write()
+                .expect("the freed send queue reports room")
+                > 0,
+            "the drained queue reopens the write permit"
+        );
+    }
+
+    /// A device fault inside `ready`'s drive is not reproducible by
+    /// `read`'s non-parking probe, so the stream keeps it and the next
+    /// `read` reports it — `last-operation-failed`, not an empty read
+    /// that would spin a `poll` loop forever.
+    #[test]
+    fn p2_tcp_input_stream_reports_the_failure_ready_saw() {
+        use wasmtime_wasi_io::poll::Pollable;
+        use wasmtime_wasi_io::streams::{InputStream, StreamError};
+
+        let service = TestNetworkService::new();
+        service.fail_drives();
+        let retirement = crate::SocketRetirementQueue::new();
+        let socket = TcpSocket::new(retirement.sender(), WasiTcpSocketFamily::Ipv4);
+        socket.inner.lock().stream = Some(7);
+        let mut input = super::net::TcpSocketInputStream::new(socket, service);
+
+        // `ready` resolves — the pollable must, so the accessor can
+        // report what happened — and records the failure it saw.
+        block_on(input.ready());
+        assert!(
+            matches!(input.read(4), Err(StreamError::LastOperationFailed(_))),
+            "the read reports the drive failure"
+        );
+    }
+
+    /// The output half of the same contract: a parked `pending` batch
+    /// whose completion fails is kept, and the failure is what
+    /// `check_write`/`flush`/`write` then report — not a silently
+    /// dropped batch behind a fresh permit.
+    #[test]
+    fn p2_tcp_output_stream_keeps_the_batch_whose_write_failed() {
+        use wasmtime_wasi_io::poll::Pollable;
+        use wasmtime_wasi_io::streams::{OutputStream, StreamError};
+
+        let service = TestNetworkService::new();
+        let retirement = crate::SocketRetirementQueue::new();
+        let socket = TcpSocket::new(retirement.sender(), WasiTcpSocketFamily::Ipv4);
+        socket.inner.lock().stream = Some(7);
+        let mut output = super::net::TcpSocketOutputStream::new(socket, service.clone());
+
+        // With the drive broken the send queue reads as full, so the
+        // write parks its batch in `pending`.
+        service.fail_drives();
+        output
+            .write(Bytes::from_static(b"ping"))
+            .expect("the write parks the batch it cannot queue");
+        block_on(output.ready());
+        assert!(
+            matches!(
+                output.check_write(),
+                Err(StreamError::LastOperationFailed(_))
+            ),
+            "check-write reports the failed batch write"
+        );
+        assert!(
+            matches!(output.flush(), Err(StreamError::LastOperationFailed(_))),
+            "flush reports the failed batch write"
+        );
+
+        // The batch survived: once the drive heals, `ready` retries it
+        // and the service takes the bytes it was never allowed to drop.
+        service.heal_drives();
+        block_on(output.ready());
+        assert_eq!(
+            service.bytes_written(),
+            4,
+            "the parked batch is retried, not dropped"
         );
     }
 

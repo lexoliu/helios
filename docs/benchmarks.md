@@ -69,6 +69,7 @@ reason under the table the cell is missing from.
 | net | `tcp-latency` | 5000 × 16-byte round trip to a host echo server | same wasm | C client with `TCP_NODELAY` |
 | fs | `fs-smallfiles`, `fs-readstream` | coreutils on the embedded filesystem root | `coreutils-wasi.wasm` under `wasmtime run --dir` | ext4 in the guest |
 | compute | `quickjs-loop`, `cpython-json`, `cpython-regex`, `wasm-simd-lanes` | interpreter or SIMD loops | same wasm | native QuickJS/CPython/NEON-or-SSE probe |
+| compute | `cpython-startup`, `cpython-import-json` | the CPython row decomposed — interpreter start-up alone, then start-up plus `import json` over the host share | same wasm | native CPython |
 | compute | `aot-curl` | compiler plugin AOT of `curl.wasm` | `wasmtime compile` of the same input | uncompared (`wasmtime compile` is the native equivalent of the in-guest step) |
 
 `headline: true` marks the rows the README table and the regression gate
@@ -136,8 +137,32 @@ Per cell (workload × side), `iterations` executions (11 by default):
   A floor above `cv_bound` (0.15, the bound a single row's dispersion is
   held to) makes the whole comparison **inconclusive**: the host moved
   by more than any effect a change could show, so no row gets a verdict.
-  The paired gate fails the check and asks for a rerun; the cross-run and
-  profile-use tables carry the banner and block nothing (#292).
+  The cross-run and profile-use tables carry the banner and block
+  nothing (#292); the paired gate fails the check, but not before the
+  one retry below.
+- An inconclusive paired run is measured once more before the job fails:
+  a noisy stretch says something about that hour of the host and nothing
+  about the next, and a redispatch would only hope to draw a quieter
+  machine. The runner boots the control pair and the paired suite again,
+  through the same driver invocation into `retry/` beside the first
+  pass, and the report the gate reads is the second pass's; the retake
+  and reconfirm passes below apply to it as they do to the first. The
+  run record carries both floors (`noise_retry.first_noise_floor` and
+  `noise_retry.second_noise_floor`), and the rendered tables say the run
+  retried and print both. A second pass still past the bound is a host
+  that could not produce a clean control twice: the run stands
+  inconclusive and the check fails as it did without the retry, with
+  both floors named (#375). An unpaired run has no paired verdict to
+  retry and is never measured twice.
+  The retry is sized against the job's budget before it starts:
+  `bench-suite.yml` passes its `timeout-minutes` as
+  `--job-timeout-minutes`, and the runner measures the first pass's
+  Helios wall time so a second pass that would outlast what remains is
+  skipped rather than killed mid-flight — the run stands inconclusive
+  and `noise_retry` records `kind: skipped-for-budget` with the estimate
+  and the remainder it was weighed against. A retry pass that comes back without
+  the control pair it was asked for is a failed pass, not a quiet host:
+  the run stops there, naming the side and the files it expected.
 - A cell whose warm CV is past `cv_bound` is **rejected**: its median
   cannot be trusted to detect a regression, and a headline workload without
   a trustworthy pair blocks as incomplete evidence. Before the gate reads
@@ -148,18 +173,43 @@ Per cell (workload × side), `iterations` executions (11 by default):
   record names them and the gate table says so (#295).
 - A headline regression has to show twice. When the paired gate would
   block on a workload, the runner times that workload again on both
-  images back to back into `reconfirm/`, and the second pair replaces the
-  first: a regression that is the change's own reproduces, a drift
-  between two boots does not. One pass per run, so a host that drifts
-  twice in a row still fails the check; the run record names the
-  reconfirmed workloads and the gate table says so (#297).
+  images back to back into `reconfirm/`, booted in the reverse order of
+  the first pass, and the second pair is the one the gate judges: a
+  regression that is the change's own reproduces, a drift between two
+  boots does not. The first pair stays in the report (`first_pass` on
+  the workload), and how far each image moved between its two boots of
+  the workload is a floor of its own for that row (`boot`, below). One
+  pass per run, so a host that drifts twice in a row still fails the
+  check; the run record names the reconfirmed workloads and the gate
+  table says so (#297, #479).
 - A comparison between Helios and a Linux side is **significant** when
   the two warm bootstrap intervals do not overlap and the ratio of medians
   moves by more than the noise floor; otherwise it prints "within noise".
 - The regression gate makes the same call twice, against two baselines,
   and the difference between them is which one can be trusted to block.
   A headline workload is regressed when the two warm bootstrap intervals
-  are disjoint and the median moved by more than the noise floor.
+  are disjoint and the median moved by more than the row's floor.
+- A row's floor is the largest movement the job measured for it without
+  the change, and the gate table names which one it was. `control` is
+  the noise floor above; `page` is one page, for a footprint; `boot` is
+  how far either image moved between its two boots of the workload, when
+  the reconfirm took a second pair. A paired run whose baseline is a
+  profile-use build also builds the baseline commit a second time,
+  against a second, independently collected kernel profile, and boots it
+  as a third image (`helios_baseline_rebuild`, the Rebuild column), the
+  baseline always the middle boot of the three. The two baseline builds
+  differ only in their profiles, so how far a row moved between them
+  (`build`, the largest movement over the passes that measured both) is
+  what the build alone does to that row. A row whose two builds agree,
+  within its other floor, is judged against the baseline exactly as a
+  run without the rebuild judges it. A row whose builds moved further
+  apart blocks only when the candidate clears that drift against both
+  builds, with disjoint intervals and the same direction against each;
+  one significant only at the lower floor against the baseline is
+  printed `within build drift` and blocks nothing. One compute control
+  cannot speak for a workload whose own spread is wider, and the A/A
+  pair of identical code in run 38940834451 moved `fs-smallfiles` by
+  11.2% and `sched-tasks` by 2.4% (#479).
 - The gate judges every measurement a cell carries, one row each: the
   host-side `elapsed_ms` of the round trip, and each `bench.<name>`
   metric the workload printed from inside the guest. A workload times
@@ -214,6 +264,94 @@ Per cell (workload × side), `iterations` executions (11 by default):
     otherwise it comments the table and enforces nothing.
   The gate comment on a pull request prints the paired table first.
 
+## Reading a launch's phases
+
+`workload-bench` times a launch end to end; when that number needs a
+breakdown the kernel can say where the launch itself went. A launch —
+an `exec`/`spawn` host call, or a guest's own `proc_spawn*`/`proc_exec*`
+syscall — records the kernel monotonic timestamp of every phase
+boundary it crosses into a fixed-capacity in-memory timeline and emits
+one `DEBUG` event under the target `helios_kernel::exec::phases` when
+the launch ends: at completion, or at the failure exit with whichever
+phases it reached. The line's `*_ns` fields are each phase's offset in
+nanoseconds from `rpc-arrival`:
+
+| field | phase boundary |
+| --- | --- |
+| `rpc_arrival_ns` | the launch call entered the kernel; always `0`, the epoch |
+| `source_read_ns` | the program's bytes are read out of their source (`source_bytes` carries the size) |
+| `trust_ns` | artifact trust established — the bootfs trailer parse, the signature check for a signed artifact, or — on a raw-wasm source — the whole in-kernel compile+sign between `load_begin` and here |
+| `cache_lookup_ns` | the deserialize cache answered (`cache_hit` carries its answer) |
+| `deserialize_ns` | the `cwasm` payload deserialized; present only on a cache miss |
+| `instantiate_pre_ns` | the `InstancePre` cache answered or `instantiate_pre` built (`instantiate_pre_hit`) |
+| `load_begin_ns` / `load_complete_ns` | `load_executable` entered / returned |
+| `task_begin_ns` | the run task is live |
+| `shared_memory_ns` | a core module's shared memory is prepared |
+| `store_prepare_ns` | the store and its filesystem snapshot are prepared |
+| `instantiate_ns` | `instantiate_async` returned — memory slot, data segments, imports resolved |
+| `start_ns` | the run function resolved and guest start is dispatching |
+| `guest_begin_ns` / `guest_end_ns` | guest code running / returned |
+| `store_teardown_ns` | a core module's store is torn down |
+| `completion_ns` | the run task finished |
+| `reply_ns` | the launch call's reply — or the syscall's result — is being written |
+
+A phase the launch never reached — the warm launch's `deserialize`, a
+failed launch's tail — leaves no field, and `phase_count` says how many
+the line carries. The phase a launch's duration spent in is the gap
+between one field and the next; the guest's own run is
+`guest_begin_ns` to `guest_end_ns`.
+
+The line emits once, after the guest ran, so the serial write — one
+UART MMIO exit per byte — never lands inside a measured interval. That
+is the whole reason for the single-event shape: an event per boundary
+would price each offset at the ~150-byte serial write it costs.
+
+`op` names the launch call (`exec`/`spawn`). `program`'s provenance
+differs per surface: an RPC launch carries the request's `path`; a
+guest `proc_spawn*` carries `argv[0]`; a guest `proc_exec*` carries
+the decoded `name` operand — which for a PATH-resolving caller like
+dash is the resolved path, so `program=/bin/python3` there and
+`program=dash`-style argv names on the spawn surface. `instance` is
+the id the registry assigned the launch — `0` when it failed before
+registering, and the real id even on a trapped guest, since the run
+task sets it before the guest ran. `end` says which exit the launch
+took — `completed`, `refused`, `failed` — with `error_kind` (a
+`ProgramExecErrorKind` name) or `errno` when the exit carried one.
+The calling task writes `rpc_arrival` through `load_complete` and
+`reply`; the run task writes `task_begin` through `completion`, through
+the same timeline the launch handed it. `reply` is last only on a
+buffered `exec` — on `spawn` and `proc_exec*` the reply boundary is
+recorded while the run task is still starting, so its offset sits
+before `task_begin_ns`.
+
+The target is off by default, so a boot that never asked for it reads
+no timestamp and keeps no timeline — the whole cost is one `enabled`
+check at `rpc-arrival`. Open it for one session with `--enable-target`,
+either on `vm` (before the session action runs) or on `tracing`
+(before the stream starts):
+
+```bash
+helios-inspector vm --arch x86-64 --release --accel kvm \
+    --boot-program dash --boot-program debugger --boot-program python3 \
+    --no-compiler-plugin \
+    --enable-target helios_kernel::exec::phases \
+    shell -c 'python3 -c "print(1)"; python3 -c "print(2)"'
+```
+
+The lines land on the debug serial line, so `<runtime>/debug-serial.log`
+(docs/debug-serial.md) holds them — it carries console escape bytes, so
+grep it with `-a`. The same target streamed live is `helios-inspector
+tracing --enable-target helios_kernel::exec::phases --min-level debug
+--target-prefix helios_kernel::exec::phases`.
+
+Two launches of the same program are the cold/warm pair the launch-cost
+question is usually about: the cold line reads `cache_hit=false` and
+carries `deserialize_ns`; the warm line reads `cache_hit=true` and does
+not. The `smoke-x86-64` step "Run CPython twice and record its launch
+phases" runs exactly this under KVM, so a PR's x86-64 launch-phase split
+is read from that step's `debug-serial.log` artifact rather than
+reproduced locally.
+
 ## Reports and where the numbers come from
 
 One `report.json` per lane per run (schema in
@@ -222,7 +360,132 @@ the SHA256 of every wasm and `cwasm` the run used, every iteration of
 every cell, the statistics above, the comparisons and verdicts, and the
 run's GitHub id. It is uploaded as the `bench-report-<lane>` workflow
 artifact, and on a tag it is attached to the release so a paper can cite
-the tag.
+the tag. The same artifact carries, for the run's own image and for a
+paired baseline, every boot's raw records beside its `helios-*.jsonl`:
+the kernel counters the guest reported (`helios-*.perf.json`, the
+`kernel;network;*` rows the report tabulates only the top of) and the
+scoped kernel profile (`helios-*.kernel.folded`), so a diagnosis that
+needs a counter the table cut, or the baseline's counters at all, reads
+them from the artifact instead of re-running the lane.
+
+On request, each x86-64 boot also writes an instruction-level profile,
+`helios-*.pc.folded`: every boot of the run's own image and, in a paired
+run, every boot of the baseline image beside it, so the artifact carries
+both columns' profiles and a diagnosis can compare them. The scoped profile can
+only name the phases the kernel times, so `kernel;program;run-component`
+stays one opaque row; the instruction-level profile splits it.
+
+The instruction-level profile is opt-in and never a performance measurement.
+While instruction sampling runs, each processor's local-APIC timer
+interrupts at 1 kHz instead of its 100 Hz scheduler tick, and each
+interrupt records the instruction it interrupted. The scheduler's own work
+(watchdog, guest preemption, kernel timer) still runs on every tenth
+interrupt only, so the guest's yield cadence matches an unprofiled run,
+but the extra interrupts (and, under KVM, the extra timer exits) on every
+processor cost time the medians would carry, as does the kernel task that
+drains the samples every 20 ms. Sampling therefore has its own control
+(`helios:system/profiling.set-instruction-sampling`), separate from the
+scoped profiler every lane boot enables. The inspector starts it only when
+`--instruction-profile-output` is given, for the duration of the workload,
+and stops it before reading the samples. `linux-gap-bench.py` passes the
+option only when `HELIOS_BENCH_INSTRUCTION_PROFILE=1`, and `bench-suite.yml`
+sets that from its `instruction_profile` dispatch input (default off). A
+run with it on is a diagnosis: its report carries the deviation, so it is
+never publishable, and a run asked to be publishable with it on is refused.
+
+Sampling is a property of the run, never of one image (#475). When it is
+on, `linux-gap-bench.py` samples every boot of every image, control boots
+included, so both columns of a pairing carry the same timer rate and the
+same drain task, and the comparison between them stays like with like.
+Before the first boot it asks each image's own inspector (`vm
+workload-bench --help`) whether it takes `--instruction-profile-output`;
+a baseline built from a commit that predates the sampler does not, and
+the run is refused naming that image and its inspector rather than
+sampling one side. Each finished boot's `instruction_profile_output=` line
+is read back: a boot that reports no capture, or a period that differs
+from any earlier boot of either image, ends the run. Each image's period,
+boot count, sample total and drop total land in
+`instruction-sampling.json` beside its records and in the report's run
+record (`instruction_sampling`, `baseline_instruction_sampling`).
+
+The report states it in its header: `tables.md` says every Helios timing
+includes the sampler's overhead, on both Helios columns when paired, and
+that a ratio against the unsampled Linux columns is not evidence. The
+gate keeps its verdicts only between columns sampled alike. The paired
+table says both columns carried the sampler and at what period, and
+keeps its verdicts; a report whose two columns disagree is refused. The
+cross-run table compares against a `dev` report that was not sampled, so
+a sampled candidate's cross-run comparison is refused, and so is an
+unsampled candidate's against a sampled `dev` report: the refusal names
+both sides' sampling and neither blocks nor passes, while the paired
+table stands. A sampled run with no paired table has nothing the gate
+can compare and fails naming why.
+
+The kernel names each wasm address after the program
+and function it lies in. The inspector names every other address against
+the exact kernel ELF it booted. Each line is one location and its sample
+count:
+
+- `wasm;<program>;<function>`, or `func[<module>:<index>]` for a function
+  with no name in its name section;
+- `wasm;<program>;[trampoline]`;
+- `kernel;<outermost>;…;<innermost>`;
+- `unknown`.
+
+A kernel location is the chain of functions inlined at the sampled
+instruction, not only the symbol that contains it: a fat-LTO image folds
+most of the host-call path into a few large symbols, and the chain splits
+them. The first frame is the function whose symbol holds the address, each
+next one is a function inlined into the one before, and the last is the
+function the instruction belongs to. The chain comes from the image's DWARF.
+The inspector builds every optimised kernel (`--release`,
+`--profile-generate`, `--profile-use`) with `-C debuginfo=limited`, the
+level that gives every inlined function its linkage name and so its full
+path. It passes it as a rustflag and not as the cargo profile's `debug`
+key, because cargo folds the profile into each crate's `-C metadata`: that
+renames every symbol, and under fat LTO the renamed functions merge in
+another order and move inlining decisions. As a rustflag the debuginfo
+leaves every function's code as it was: with and without it the image has
+the same program headers and allocated-section sizes, and every
+function's instructions are the same once addresses are abstracted
+(#451). A rustflag can still move where a function lands: rustc merges
+the upstream modules of a fat-LTO link in the order of their object names,
+which carry cargo's per-flags hash, so two crates that share a name (the
+image links two `wasmparser` versions) can merge the other way round, as
+they can under any rustflag, the PGO ones included. The inspector reads
+the DWARF from the ELF on the host, and the boot disk carries the image
+without it: `helios-cli limine-uefi-image` drops every `.debug_*` section
+and refuses to write an image whose program headers or allocated sections
+changed, so the guest loads exactly the bytes the host names, and Limine's
+copy of the file, which the kernel keeps reserved, costs no more memory
+than it did. An address in code with no DWARF, such as an assembly
+routine, is the containing symbol alone, `kernel;<symbol>`; one in no
+symbol either is `kernel;[unsymbolized]`. A kernel image without DWARF,
+such as a `dev`-profile build, is refused with the builds that carry it.
+
+Each line is one instruction's own location; the frames that called into
+the outermost function are not in it. Recovering them would need the
+sampling interrupt to record the interrupted stack as well as the
+instruction, and the host to unwind it, which is new code in the measured
+kernel rather than a change to what the host reads.
+
+At the end of each boot, the inspector prints the sample total, the drop
+count and the period on its `instruction_profile_output=` line, which the
+driver reads back as above. The `workload-bench` and `aot-bench` option is
+`--instruction-profile-output`. aarch64 and riscv64 do not sample
+instruction addresses, and their kernels refuse the request rather than
+return an empty profile.
+
+The `kernel;hostfs;*` counters decompose the virtio-9p host share the
+way `kernel;network;*` does the interface:
+
+- `kernel;hostfs;op-*` — one `HostFileSystem` operation end to end;
+  count is calls, nanos is wall time, bytes is payload moved.
+- `kernel;hostfs;msg-*` — one 9p exchange per message type, from
+  submission to a reply matched on the request's tag; nanos is the
+  device round trip plus the waiter's wake latency.
+- `kernel;hostfs;cache-hit` / `kernel;hostfs;cache-miss` — attribute
+  cache outcomes; count only, no interval.
 
 Every number in this repository's documentation is traceable to one run
 id: `helios-bench render readme --run <id>` and `render docs --run <id>`
@@ -299,6 +562,20 @@ what the one below it cannot see.
   its first boot was refused. The Linux side has had the same bound as
   `--side-timeout-seconds` since it lost a side to one hung workload.
 
+A bound says that the guest stopped answering, not what it was doing
+instead. So when an iteration or a guest step times out, the inspector
+first asks QEMU — before anything else is sent to the guest — for every
+vCPU's registers (`info registers -a`) and local APIC (`info lapic`,
+per vCPU), and appends the raw text to `<runtime>/vcpu-state.log`. The
+run log then carries one line per vCPU: its RIP, the kernel function
+containing it, whether interrupts were enabled and whether it was
+halted. The RIP is symbolised against the kernel ELF the session booted,
+shifted by the load base the x86 kernel logs at boot (`kernel image
+loaded virtual_base=…` in `debug-serial.log`). Every bench boot gets
+the inspector's QMP socket for this; the capture is x86-64 only, and a
+capture that cannot be taken says why beside the timeout, which is
+still what the cell records.
+
 The bugs the first runs of this suite found are fixed: the x86 kernel
 refusing a multi-queue `vhost` tap (#91), a user-mode spawn storm
 panicking the kernel through the task arena (#94), the OOM killer
@@ -332,6 +609,22 @@ or a developer's own arm64 box, taken by hand with the same harness
 (`helios-bench run --lane …` against a lane added to `manifest.toml` for
 that machine), never from hosted CI. AGENTS.md §3.5's arm64 baseline is
 that kind of measurement.
+
+### The RPC the numbers are taken around
+
+Every Helios row is timed host-side around the inspector's
+`programs.exec` RPC, so the transport that RPC rides is inside the
+number. The lane names it: `rpc_transport = "vsock"` in `manifest.toml`
+puts the RPC on vhost-vsock, the virtio debug transport AGENTS.md
+prescribes, and `.github/actions/vhost-vsock` provisions the device on
+the runner. The inspector's default, the debug serial line, is QEMU's
+16550 on x86-64 — one I/O-port exit per byte in each direction, and a
+guest reader that yields between polls — and cost 10–20 ms inside every
+elapsed before the lane moved (#413: `instance-startup-1` measured
+22 ms around a 1.4 ms batch). `host-check` reports a host whose
+`/dev/vhost-vsock` is not usable as a deviation, the run record's `vm`
+provenance and the report's pins name the transport, and a lane on a
+host with no vhost-vsock (macOS) says `serial` and is read as such.
 
 ## Dedicated runners
 
@@ -382,22 +675,40 @@ uv run helios-bench run --lane x86-64-kvm --out-dir … --baseline-ref
 
 Given a ref, `--baseline-ref` resolves it; given none, it means the merge
 base with `dev`, the commit the branch is a change to. The suite checks
-that commit out as a git worktree beside the candidate checkout,
-`<candidate dir>-baseline-<sha12>`, and times its guest against the
-candidate's. The checkout is the candidate's sibling so that the kernel's
-`../wasmtime/crates/wasmtime` path dependency resolves to the same
-absolute directory for both images: cargo hashes a path dependency
-outside the workspace by its absolute path, and a baseline that reached
-the vendored checkout through a link of its own compiled every Wasmtime
-crate under another crate hash, so the kernel profile matched none of
-the symbols named through Wasmtime and the pair timed a profile-guided
-candidate against an unprofiled baseline (#359). The baseline's warm
+that commit out as a git worktree, `<candidate dir>-baseline-<sha12>`,
+and times its guest against the candidate's.
+
+Each image builds against the Wasmtime fork its own commit pins in
+`.github/actions/checkout-wasmtime/action.yml`: a pairing across a pin
+bump compares the old fork with the new one, and a baseline built
+against the candidate's fork either hides what the bump changed or does
+not link (run 38968194856, #486). Where the fork lives is constrained by
+the kernel profile: the kernel reaches it through the
+`../wasmtime/crates/wasmtime` path dependency, and cargo hashes a path
+dependency outside the workspace by its absolute path, into the crate
+hash of every crate that depends on it. A baseline that reached its
+fork through a link of its own compiled every crate under another hash,
+so the kernel profile matched none of its symbols and the pair timed a
+profile-guided candidate against an unprofiled baseline (#359). So a
+baseline that pins the candidate's revision is the candidate's sibling
+and shares its `../wasmtime`; one that pins another revision is laid
+out in `wasmtime-fork-<revision12>/` beside the candidate, its checkout
+beside that revision's `wasmtime/`, which the workflow checks out and
+the suite refuses to build without. `helios-bench baseline-fork --sha`
+prints that layout, and `kernel-profile.yml` collects the baseline's
+profiles under the same `root`, so build and profile name one fork
+path. The report names each column's fork: `wasmtime_revision` and
+`baseline_wasmtime_revision` under `pins`. The baseline's warm
 build directory is `target/perf-baselines/worktrees/<sha>/target` under
 the candidate's `target/`, where the runner cache restores it; the
 checkout reaches it through its `target/` link.
 
 The second image is built the way a release build of the lane is, which
-on x86-64 reads the fetched kernel profile (`docs/pgo.md`).
+on x86-64 reads the fetched kernel profile (`docs/pgo.md`) — or, in a
+paired run, the profile its own column's collection produced:
+`--baseline-profile-use` builds it against a named `.profdata` the way
+`--profile-use` does the candidate's, so each commit's kernel is held to
+a profile collected from that commit (#384).
 `--baseline-kernel-build release` builds it without one instead: alone,
 that pairs this commit's profile-guided kernel against its plain one,
 the control of a PGO measurement; with `--baseline-ref`, that commit's
@@ -428,8 +739,8 @@ boot.
 | Host | CPU, load, thermal state, QEMU release, accelerator, vCPUs, memory, network backend and its host servers | — |
 | Harness | `workload-bench.sh`, the workload manifest, the run's iteration count and budgets | — |
 | Tooling | — | `helios-inspector` and `helios-cli`, built from each side's own commit under its own `target/release` |
-| Guest inputs | everything `tools/wasi-apps/build.sh` stages under `artifacts/`, linked into the baseline worktree entry by entry; the vendored Wasmtime checkout, `../wasmtime` of both checkouts at the one absolute path (#359) | — |
-| Guest | — | the kernel image, the bootfs it carries, the compiler plugin, the guest programs the prebuild signs |
+| Guest inputs | everything `tools/wasi-apps/build.sh` stages under `artifacts/`, linked into the baseline worktree entry by entry | — |
+| Guest | — | the kernel image, the bootfs it carries, the compiler plugin, the guest programs the prebuild signs, and the Wasmtime fork its commit pins, at one absolute path per revision (#359, #486) |
 
 Two checkouts that turn out to be one build are refused before the first
 boot: the suite asks the inspector for each image's guest artifact
@@ -454,13 +765,11 @@ QEMU release, the accelerator, the vCPUs and the memory; the network
 backend and the host HTTP, TCP and echo servers on it; the workload
 manifest, read from the candidate checkout for both; everything under
 `artifacts/` that `tools/wasi-apps/build.sh` stages, linked into the
-baseline worktree entry by entry rather than copied; and the vendored
-Wasmtime checkout, which both checkouts reach as `../wasmtime` at the
-one absolute path, so both kernels compile against one revision under
-the same cargo crate hashes (#359). What differs is the kernel image, the
-bootfs it carries (the compiler plugin included) and the
-`helios-inspector`/`helios-cli` that build and boot it — each side's own,
-compiled from the side's own commit.
+baseline worktree entry by entry rather than copied. What differs is the
+kernel image, the bootfs it carries (the compiler plugin included), the
+`helios-inspector`/`helios-cli` that build and boot it and the Wasmtime
+fork they compile against — each side's own, from the side's own
+commit.
 
 The report carries the second column as the `helios_baseline` side, and
 its run record carries both commits (`helios_git_sha` for the candidate,
@@ -469,6 +778,21 @@ its run record carries both commits (`helios_git_sha` for the candidate,
 rendered tables print beside the kernels'. A run that was asked to pair
 and could not build or measure its baseline is a failed run, not a
 report with one column missing.
+
+An inconclusive first pass is not yet a failed run either: the control
+pair and the paired suite run once more in the same job on the same
+host, into `retry/` beside the first pass, and the report and gate
+verdict are the second pass's. The run record's `noise_retry` keeps both
+floors so the report says the host needed two passes; a second pass
+still past the bound stands inconclusive and the check fails naming
+them (#375). The retry runs only when it fits: sized at the first pass's
+Helios wall time against the job's `--job-timeout-minutes`, a second
+pass that would outlast the budget is skipped and the run stays
+inconclusive, the record a `skipped-for-budget` carrying the two numbers
+the decision was made from, rather than losing the whole job to a
+timeout. And a retry pass whose control files never
+landed fails the run at once, naming the side and the expected pair —
+an unmeasured control is not a clean one.
 
 A boot's unix sockets do not live in its runtime directory. That path is
 the caller's, and the paired layout nests it per image and per workload,
@@ -484,7 +808,22 @@ own under `$XDG_RUNTIME_DIR` and links it as `<runtime>/sockets`; see
 revision acceptance: it runs only `helios` and `helios_baseline`, with
 all workloads, warm iterations, before/after compute controls, and the
 same enforced paired gate. It does not run the unrelated Linux
-comparisons or independent profile-generation/PGO experiment. Unpaired
+comparisons or the independent profile-generation/PGO experiment —
+`profile-generate` and `suite-pgo` answer what a fresh profile on the
+default branch buys, and a comparison between a commit and its baseline
+is not that. But the comparison still costs a profile per column: the
+`profile-columns` job runs `kernel-profile.yml` once at the run's own
+commit and twice at the ref the suite pairs against — `baseline_ref`, or
+a labelled pull request's base — and the artifacts feed the columns'
+builds, because a candidate held to a profile of the default branch's
+kernel would bill a stale-profile term to the change (#384). The second
+baseline collection is the rebuild column's: an independent profile of
+the same commit, so the gate can measure what a build alone moves each
+row (#479). The three collections run in parallel. A
+`baseline_kernel_build=release` control collects only the candidate's.
+The paired gate holds each column's uncovered share to a bound and is
+inconclusive for the named reason when either exceeds it, the way it is
+for a noisy host. Unpaired
 dispatches, labelled PR runs, dedicated runs and publication events retain
 the full suite and profiling flow. Mode selection is computed once by the
 tooling job, so profile generation starts only after tooling succeeds.

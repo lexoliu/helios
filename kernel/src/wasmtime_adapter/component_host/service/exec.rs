@@ -64,7 +64,15 @@ where
     pub(super) descriptors: Option<Preview1DescriptorTable<Net>>,
     pub(super) signal_state: WasixSignalState,
     pub(super) signal_dispositions: Vec<WasixSignalDisposition>,
+    /// The replacement launch's phase timeline — the calling task runs
+    /// the new program itself, so the handle emits from that task.
+    pub(super) timeline: phases::Timeline,
 }
+
+/// The thread table of a core-module process, whose spawned threads can
+/// hand main the image an exec of theirs asked for.
+pub(super) type WasixImageThreads<CpuImpl, Net, HostFs> =
+    WasixProcessThreads<Box<WasixExecReplacement<CpuImpl, Net, HostFs>>>;
 
 pub(super) struct CoreModuleReplacementState<CpuImpl, Net, HostFs>
 where
@@ -157,20 +165,18 @@ pub(super) struct WasixProcessSnapshot<Net: ComponentHostNetwork> {
     pub(super) rewind_stack: Vec<u8>,
 }
 
+/// The kernel-provisioned artifact at `path`, read from the boot payload
+/// itself rather than from a filesystem a guest can write to.
 pub(super) fn read_bootfs_artifact<CpuImpl, Net, HostFs>(
     runtime_state: &HostRuntimeState<CpuImpl, Net, HostFs>,
     path: &str,
-) -> Option<Bytes>
+) -> Option<BootfsBytes>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    let filesystem = crate::wasmtime_adapter::wasi::DebugFileSystem::<
-        HostRuntimeState<CpuImpl, Net, HostFs>,
-        HostFs,
-    >::new(runtime_state.clone());
-    filesystem.read_program_file_bytes(path).ok()
+    runtime_state.bootfs()?.file_bytes(path)
 }
 
 impl<Net: ComponentHostNetwork> WasixAsyncifyState<Net> {
@@ -205,13 +211,18 @@ pub(super) async fn run_program_executable<CpuImpl, Net, HostFs>(
     core_module_instance_pre_cache: CoreModuleInstancePreCache<CpuImpl, Net, HostFs>,
     launched_instance: crate::RegisteredInstance,
     output_mode: OutputMode,
+    timeline: phases::Timeline,
 ) -> Result<ChildExit, ProgramExecError>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    match executable {
+    // The line's owner: marks the run's terminal and emits when this
+    // run ends — on any exit — but only when the caller marked the
+    // handle `for_task`.
+    let task_trace = timeline.task_guard(exec_context.cpu.clone());
+    let outcome = match executable {
         ProgramExecutable::Component(compiled) => {
             run_program_component(
                 exec_context,
@@ -227,6 +238,7 @@ where
                 runtime,
                 launched_instance,
                 output_mode,
+                &timeline,
             )
             .await
         }
@@ -250,6 +262,7 @@ where
                 core_module_instance_pre_cache,
                 launched_instance,
                 output_mode,
+                &timeline,
             )
             .await
         }
@@ -272,10 +285,15 @@ where
                 core_module_instance_pre_cache,
                 launched_instance,
                 output_mode,
+                &timeline,
             )
             .await
         }
-    }
+    };
+    // The terminal the line ends with: `completed` on any child exit,
+    // `failed` with the error's kind on a guest trap or host failure.
+    task_trace.finish(&outcome);
+    outcome
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -298,20 +316,30 @@ pub(super) async fn run_program_core_module<CpuImpl, Net, HostFs>(
     core_module_instance_pre_cache: CoreModuleInstancePreCache<CpuImpl, Net, HostFs>,
     launched_instance: crate::RegisteredInstance,
     output_mode: OutputMode,
+    timeline: &phases::Timeline,
 ) -> Result<ChildExit, ProgramExecError>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    let profile_name = argv.program_name().to_owned();
+    // The name feeds only the named kernel-profile records, which are
+    // gated on `profiling_enabled` — the `String` it owns exists only
+    // when that diagnostic is on.
+    let profile_name = if exec_context.runtime_state.profiling_enabled() {
+        argv.program_name().to_owned()
+    } else {
+        String::new()
+    };
     let argv = argv.into_vec();
-    let run_started_at = monotonic_nanos(&exec_context.cpu);
     let run_cpu = exec_context.cpu.clone();
     let run_timer = exec_context.timer.clone();
-    let profile_cpu = exec_context.cpu.clone();
     let profile_runtime_state = exec_context.runtime_state.clone();
+    let write_serial = exec_context.write_serial;
     let instance_id = launched_instance.id();
+    let run_started_at = monotonic_nanos(&exec_context.cpu);
+    timeline.set_instance(instance_id);
+    timeline.record(&run_cpu, LaunchPhase::TaskBegin);
     let wasix_abi = core_module_imports_wasix(&compiled.module);
     let replacement_state = wasix_abi.then(|| CoreModuleReplacementState {
         exec_context: exec_context.clone(),
@@ -319,9 +347,8 @@ where
         output_mode: output_mode.clone(),
         core_linker: preview1_core_linker.clone(),
     });
-    let recycle_spawner = spawner.clone();
     let shared_memory_prepare_profile =
-        start_program_kernel_profile(&profile_runtime_state, &profile_cpu);
+        start_program_kernel_profile(&profile_runtime_state, &run_cpu);
     let imported_memory_spec = imported_shared_memory_spec_with_user_budget(&compiled.module)?;
     let imported_memory = match imported_memory_spec {
         Some(spec) => {
@@ -333,11 +360,11 @@ where
         shared_memory_prepare_profile,
         "core-shared-memory-prepare",
     );
-    let recycle_memory = imported_memory.clone();
-    let store_teardown_profile: Option<ProgramKernelProfile<CpuImpl, Net, HostFs>>;
-    let (completion, recycle_allowed) = {
-        let store_prepare_profile =
-            start_program_kernel_profile(&profile_runtime_state, &profile_cpu);
+    timeline.record(&run_cpu, LaunchPhase::SharedMemory);
+    let recycle = imported_memory_spec.zip(imported_memory.clone());
+    let threads = WasixProcessThreads::new();
+    let image = async {
+        let store_prepare_profile = start_program_kernel_profile(&profile_runtime_state, &run_cpu);
         let mut store = wasmtime::Store::new(
             engine.raw(),
             Preview1ProgramStore::<CpuImpl, Net, HostFs>::new(
@@ -345,6 +372,7 @@ where
                 exec_context.timer,
                 spawner.clone(),
                 exec_context.runtime_state,
+                engine.interrupts().clone(),
                 launched_instance,
                 exec_context.parent_instance_id,
                 argv,
@@ -352,55 +380,55 @@ where
                 authority,
                 output_mode,
                 exec_context.read_serial,
-                exec_context.write_serial,
+                write_serial,
                 imported_memory.clone(),
                 filesystem,
                 descriptors,
                 signal_state,
+                threads.main_mailbox(),
                 signal_dispositions,
                 Some(compiled.clone()),
                 wasix_abi,
+                threads.clone(),
             ),
         );
-        configure_preview1_program_store(&mut store);
+        let interrupts = configure_preview1_program_store(&mut store);
         record_program_kernel_profile_sample(store_prepare_profile, "core-store-prepare");
+        timeline.record(&run_cpu, LaunchPhase::StorePrepare);
 
         let instance = if let Some(memory) = imported_memory {
             let mut linker = preview1_core_linker;
             let imported_memory_define_profile =
-                start_program_kernel_profile(&profile_runtime_state, &profile_cpu);
+                start_program_kernel_profile(&profile_runtime_state, &run_cpu);
             define_imported_shared_memory(&mut linker, &store, &compiled.module, memory)?;
             record_program_kernel_profile_sample(
                 imported_memory_define_profile,
                 "core-shared-memory-define",
             );
 
-            super::emit_program_stage_marker(
-                exec_context.write_serial,
-                "program:instantiate-core-begin",
-            );
-            let instantiate_started = profile_cpu.now().ticks();
-            let instance = {
-                let _owner = own_committed_memory(instance_id);
-                linker.instantiate_async(&mut store, &compiled.module).await
-            };
+            super::emit_program_stage_marker(write_serial, "program:instantiate-core-begin");
+            let instantiate_started = run_cpu.now().ticks();
+            let turns = store.data().guest_turns();
+            let instance = interrupts
+                .drive(turns.drive(linker.instantiate_async(&mut store, &compiled.module)))
+                .await;
             record_named_program_kernel_profile(
                 &profile_runtime_state,
-                &profile_cpu,
+                &run_cpu,
                 "instantiate-core",
                 &profile_name,
                 instantiate_started,
             );
             record_program_kernel_profile(
                 &profile_runtime_state,
-                &profile_cpu,
+                &run_cpu,
                 "instantiate-core",
                 instantiate_started,
             );
             instance
         } else {
             let cache_lookup_profile =
-                start_program_kernel_profile(&profile_runtime_state, &profile_cpu);
+                start_program_kernel_profile(&profile_runtime_state, &run_cpu);
             let cached_instance_pre = core_module_instance_pre_cache
                 .lock()
                 .get(&compiled.cache_key);
@@ -408,19 +436,20 @@ where
                 cache_lookup_profile,
                 "core-instance-pre-cache-lookup",
             );
+            let instance_pre_hit = cached_instance_pre.is_some();
             let instance_pre = if let Some(instance_pre) = cached_instance_pre {
                 super::emit_program_stage_marker(
-                    exec_context.write_serial,
+                    write_serial,
                     "program:instantiate-core-pre-cache-hit",
                 );
                 instance_pre
             } else {
                 super::emit_program_stage_marker(
-                    exec_context.write_serial,
+                    write_serial,
                     "program:instantiate-core-pre-begin",
                 );
                 let instantiate_pre_profile =
-                    start_program_kernel_profile(&profile_runtime_state, &profile_cpu);
+                    start_program_kernel_profile(&profile_runtime_state, &run_cpu);
                 let instance_pre = Arc::new(
                     preview1_core_linker
                         .instantiate_pre(&compiled.module)
@@ -430,12 +459,9 @@ where
                     instantiate_pre_profile,
                     "instantiate-core-pre",
                 );
-                super::emit_program_stage_marker(
-                    exec_context.write_serial,
-                    "program:instantiate-core-pre-end",
-                );
+                super::emit_program_stage_marker(write_serial, "program:instantiate-core-pre-end");
                 let cache_insert_profile =
-                    start_program_kernel_profile(&profile_runtime_state, &profile_cpu);
+                    start_program_kernel_profile(&profile_runtime_state, &run_cpu);
                 let inserted = core_module_instance_pre_cache
                     .lock()
                     .insert_if_missing(compiled.cache_key.clone(), instance_pre);
@@ -445,140 +471,83 @@ where
                 );
                 inserted
             };
+            timeline.record_hit(&run_cpu, LaunchPhase::InstantiatePre, instance_pre_hit);
 
-            super::emit_program_stage_marker(
-                exec_context.write_serial,
-                "program:instantiate-core-begin",
-            );
-            let instantiate_started = profile_cpu.now().ticks();
-            let instance = {
-                let _owner = own_committed_memory(instance_id);
-                instance_pre.instantiate_async(&mut store).await
-            };
+            super::emit_program_stage_marker(write_serial, "program:instantiate-core-begin");
+            let instantiate_started = run_cpu.now().ticks();
+            let turns = store.data().guest_turns();
+            let instance = interrupts
+                .drive(turns.drive(instance_pre.instantiate_async(&mut store)))
+                .await;
             record_named_program_kernel_profile(
                 &profile_runtime_state,
-                &profile_cpu,
+                &run_cpu,
                 "instantiate-core",
                 &profile_name,
                 instantiate_started,
             );
             record_program_kernel_profile(
                 &profile_runtime_state,
-                &profile_cpu,
+                &run_cpu,
                 "instantiate-core",
                 instantiate_started,
             );
             instance
         };
         let instance = instance.map_err(map_program_runtime_error)?;
-        super::emit_program_stage_marker(exec_context.write_serial, "program:instantiate-core-ok");
+        super::emit_program_stage_marker(write_serial, "program:instantiate-core-ok");
+        timeline.record(&run_cpu, LaunchPhase::Instantiate);
 
-        let resolve_start_profile =
-            start_program_kernel_profile(&profile_runtime_state, &profile_cpu);
-        let start = instance
-            .get_typed_func::<(), ()>(&mut store, "_start")
-            .map_err(|_| ProgramExecError {
-                kind: ProgramExecErrorKind::InvalidBinary,
-                detail: ProgramExecErrorDetail::InvalidEntryPoint,
-            })?;
+        let resolve_start_profile = start_program_kernel_profile(&profile_runtime_state, &run_cpu);
+        let start = resolve_core_module_start(&mut store, &instance)?;
         record_program_kernel_profile_sample(resolve_start_profile, "resolve-core-start");
+        timeline.record(&run_cpu, LaunchPhase::Start);
 
-        let run_heartbeat = super::spawn_component_phase_heartbeat(
-            &spawner,
-            &run_cpu,
-            &run_timer,
-            &progress,
-            exec_context.write_serial,
-            super::ComponentPhase {
-                name: "program:run-core",
+        let completion = run_core_module_image(
+            &mut store,
+            &interrupts,
+            &instance,
+            start,
+            CoreModuleImageRun {
+                spawner: &spawner,
+                progress: &progress,
+                cpu: &run_cpu,
+                timer: &run_timer,
+                write_serial,
+                runtime_state: &profile_runtime_state,
+                profile_name: &profile_name,
+                timeline,
                 started_at: run_started_at,
+                instance_id,
+                run_phase: "run-core",
+                complete_phase: "complete-core",
             },
         )
-        .map_err(map_task_capacity_error)?;
-        super::emit_program_stage_marker(exec_context.write_serial, "program:run-core-begin");
-        let run_phase_started = profile_cpu.now().ticks();
-        let result = loop {
-            let result = start.call_async(&mut store, ()).await;
-            if handle_wasix_asyncify_completion(&mut store, &instance).await? {
-                continue;
-            }
-            break result;
-        };
-        record_named_program_kernel_profile(
-            &profile_runtime_state,
-            &profile_cpu,
-            "run-core",
-            &profile_name,
-            run_phase_started,
-        );
-        record_program_kernel_profile(
-            &profile_runtime_state,
-            &profile_cpu,
-            "run-core",
-            run_phase_started,
-        );
-        drop(run_heartbeat);
-        super::emit_program_stage_marker(exec_context.write_serial, "program:run-core-end");
-
-        let completion_profile = start_program_kernel_profile(&profile_runtime_state, &profile_cpu);
-        let completion = match result {
-            Ok(()) => CoreModuleRunCompletion::Exit(Ok(ChildExit {
-                instance_id,
-                exit_code: 0,
-                filesystem: Some(store.data().filesystem.snapshot()),
-            })),
-            Err(error) => {
-                if let Some(replacement) = store.data_mut().take_exec_replacement() {
-                    CoreModuleRunCompletion::Exec(Box::new(replacement))
-                } else {
-                    CoreModuleRunCompletion::Exit(match store.data_mut().take_requested_exit() {
-                        Some(code) => Ok(ChildExit {
-                            instance_id,
-                            exit_code: code,
-                            filesystem: Some(store.data().filesystem.snapshot()),
-                        }),
-                        None => Err(map_program_runtime_error(error)),
-                    })
-                }
-            }
-        };
-        record_program_kernel_profile_sample(completion_profile, "complete-core");
-        store_teardown_profile = start_program_kernel_profile(&profile_runtime_state, &profile_cpu);
-        (completion, store.data().threads.is_empty())
-    };
-    record_program_kernel_profile_sample(store_teardown_profile, "core-store-teardown");
-
-    if recycle_allowed && let (Some(spec), Some(memory)) = (imported_memory_spec, recycle_memory) {
-        spawn_scrubbed_recycle(&recycle_spawner, shared_memory_pool.clone(), spec, memory).await;
+        .await?;
+        Ok::<_, ProgramExecError>(CoreModuleImageEnd {
+            completion,
+            store_teardown_profile: start_program_kernel_profile(&profile_runtime_state, &run_cpu),
+        })
     }
-    match completion {
-        CoreModuleRunCompletion::Exit(result) => result,
-        CoreModuleRunCompletion::Exec(replacement) => {
-            let replacement_state = replacement_state
-                .expect("core module without WASIX imports requested exec replacement");
-            Box::pin(run_program_executable(
-                replacement_state.exec_context,
-                replacement.argv,
-                replacement.env,
-                replacement.authority,
-                replacement.filesystem,
-                replacement.descriptors,
-                replacement.signal_state,
-                replacement.signal_dispositions,
-                spawner,
-                progress,
-                replacement.executable,
-                engine,
-                runtime,
-                replacement_state.core_linker,
-                shared_memory_pool,
-                core_module_instance_pre_cache,
-                replacement_state.instance,
-                replacement_state.output_mode,
-            ))
-            .await
-        }
-    }
+    .await;
+    finish_core_module_process(
+        threads,
+        image,
+        "core-store-teardown",
+        recycle,
+        CoreModuleSuccession {
+            replacement_state,
+            spawner,
+            progress,
+            engine,
+            runtime,
+            shared_memory_pool,
+            core_module_instance_pre_cache,
+        },
+        timeline,
+        &run_cpu,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -600,20 +569,30 @@ pub(super) async fn run_program_core_module_with_restore<CpuImpl, Net, HostFs>(
     core_module_instance_pre_cache: CoreModuleInstancePreCache<CpuImpl, Net, HostFs>,
     launched_instance: crate::RegisteredInstance,
     output_mode: OutputMode,
+    timeline: &phases::Timeline,
 ) -> Result<ChildExit, ProgramExecError>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    let profile_name = argv.program_name().to_owned();
+    // The name feeds only the named kernel-profile records, which are
+    // gated on `profiling_enabled` — the `String` it owns exists only
+    // when that diagnostic is on.
+    let profile_name = if exec_context.runtime_state.profiling_enabled() {
+        argv.program_name().to_owned()
+    } else {
+        String::new()
+    };
     let argv = argv.into_vec();
     let run_started_at = monotonic_nanos(&exec_context.cpu);
     let run_cpu = exec_context.cpu.clone();
     let run_timer = exec_context.timer.clone();
-    let profile_cpu = exec_context.cpu.clone();
     let profile_runtime_state = exec_context.runtime_state.clone();
+    let write_serial = exec_context.write_serial;
     let instance_id = launched_instance.id();
+    timeline.set_instance(instance_id);
+    timeline.record(&run_cpu, LaunchPhase::TaskBegin);
     let wasix_abi = core_module_imports_wasix(&compiled.module);
     let replacement_state = wasix_abi.then(|| CoreModuleReplacementState {
         exec_context: exec_context.clone(),
@@ -621,13 +600,10 @@ where
         output_mode: output_mode.clone(),
         core_linker: preview1_core_linker.clone(),
     });
-    let imported_memory = Some(restore.memory.clone());
-    let recycle_memory = restore.memory.clone();
-    let memory_spec = restore.memory_spec;
-    let store_teardown_profile: Option<ProgramKernelProfile<CpuImpl, Net, HostFs>>;
-    let (completion, recycle_allowed) = {
-        let store_prepare_profile =
-            start_program_kernel_profile(&profile_runtime_state, &profile_cpu);
+    let recycle = Some((restore.memory_spec, restore.memory.clone()));
+    let threads = WasixProcessThreads::new();
+    let image = async {
+        let store_prepare_profile = start_program_kernel_profile(&profile_runtime_state, &run_cpu);
         let mut store = wasmtime::Store::new(
             engine.raw(),
             Preview1ProgramStore::<CpuImpl, Net, HostFs>::new(
@@ -635,6 +611,7 @@ where
                 exec_context.timer,
                 spawner.clone(),
                 exec_context.runtime_state,
+                engine.interrupts().clone(),
                 launched_instance,
                 exec_context.parent_instance_id,
                 argv,
@@ -642,147 +619,332 @@ where
                 authority,
                 output_mode,
                 exec_context.read_serial,
-                exec_context.write_serial,
-                imported_memory.clone(),
+                write_serial,
+                Some(restore.memory.clone()),
                 filesystem,
                 Some(restore.descriptors),
                 signal_state,
+                threads.main_mailbox(),
                 restore.signal_dispositions,
                 Some(compiled.clone()),
                 wasix_abi,
+                threads.clone(),
             ),
         );
-        configure_preview1_program_store(&mut store);
+        let interrupts = configure_preview1_program_store(&mut store);
         record_program_kernel_profile_sample(store_prepare_profile, "core-store-prepare-rewind");
+        timeline.record(&run_cpu, LaunchPhase::StorePrepare);
 
         let mut linker = preview1_core_linker;
         let imported_memory_define_profile =
-            start_program_kernel_profile(&profile_runtime_state, &profile_cpu);
-        define_imported_shared_memory(
-            &mut linker,
-            &store,
-            &compiled.module,
-            restore.memory.clone(),
-        )?;
+            start_program_kernel_profile(&profile_runtime_state, &run_cpu);
+        define_imported_shared_memory(&mut linker, &store, &compiled.module, restore.memory)?;
         record_program_kernel_profile_sample(
             imported_memory_define_profile,
             "core-shared-memory-define-rewind",
         );
+        timeline.record(&run_cpu, LaunchPhase::SharedMemory);
 
-        super::emit_program_stage_marker(
-            exec_context.write_serial,
-            "program:instantiate-core-begin",
-        );
-        let instantiate_started = profile_cpu.now().ticks();
-        let instance = {
-            let _owner = own_committed_memory(instance_id);
-            linker.instantiate_async(&mut store, &compiled.module).await
-        };
+        super::emit_program_stage_marker(write_serial, "program:instantiate-core-begin");
+        let instantiate_started = run_cpu.now().ticks();
+        let turns = store.data().guest_turns();
+        let instance = interrupts
+            .drive(turns.drive(linker.instantiate_async(&mut store, &compiled.module)))
+            .await;
         record_named_program_kernel_profile(
             &profile_runtime_state,
-            &profile_cpu,
+            &run_cpu,
             "instantiate-core-rewind",
             &profile_name,
             instantiate_started,
         );
         record_program_kernel_profile(
             &profile_runtime_state,
-            &profile_cpu,
+            &run_cpu,
             "instantiate-core-rewind",
             instantiate_started,
         );
         let instance = instance.map_err(map_program_runtime_error)?;
-        super::emit_program_stage_marker(exec_context.write_serial, "program:instantiate-core-ok");
+        timeline.record(&run_cpu, LaunchPhase::Instantiate);
+        super::emit_program_stage_marker(write_serial, "program:instantiate-core-ok");
 
-        let rewind_profile = start_program_kernel_profile(&profile_runtime_state, &profile_cpu);
-        wasix_begin_rewind(&mut store, &instance, restore.rewind).await?;
+        let rewind_profile = start_program_kernel_profile(&profile_runtime_state, &run_cpu);
+        wasix_begin_rewind(&mut store, &interrupts, &instance, restore.rewind).await?;
         record_program_kernel_profile_sample(rewind_profile, "core-begin-rewind");
 
-        let resolve_start_profile =
-            start_program_kernel_profile(&profile_runtime_state, &profile_cpu);
-        let start = instance
-            .get_typed_func::<(), ()>(&mut store, "_start")
-            .map_err(|_| ProgramExecError {
-                kind: ProgramExecErrorKind::InvalidBinary,
-                detail: ProgramExecErrorDetail::InvalidEntryPoint,
-            })?;
+        let resolve_start_profile = start_program_kernel_profile(&profile_runtime_state, &run_cpu);
+        let start = resolve_core_module_start(&mut store, &instance)?;
         record_program_kernel_profile_sample(resolve_start_profile, "resolve-core-start-rewind");
+        timeline.record(&run_cpu, LaunchPhase::Start);
 
-        let run_heartbeat = super::spawn_component_phase_heartbeat(
-            &spawner,
-            &run_cpu,
-            &run_timer,
-            &progress,
-            exec_context.write_serial,
-            super::ComponentPhase {
-                name: "program:run-core",
+        let completion = run_core_module_image(
+            &mut store,
+            &interrupts,
+            &instance,
+            start,
+            CoreModuleImageRun {
+                spawner: &spawner,
+                progress: &progress,
+                cpu: &run_cpu,
+                timer: &run_timer,
+                write_serial,
+                runtime_state: &profile_runtime_state,
+                profile_name: &profile_name,
+                timeline,
                 started_at: run_started_at,
+                instance_id,
+                run_phase: "run-core-rewind",
+                complete_phase: "complete-core-rewind",
             },
         )
-        .map_err(map_task_capacity_error)?;
-        super::emit_program_stage_marker(exec_context.write_serial, "program:run-core-begin");
-        let run_phase_started = profile_cpu.now().ticks();
-        let result = loop {
-            let result = start.call_async(&mut store, ()).await;
-            if handle_wasix_asyncify_completion(&mut store, &instance).await? {
-                continue;
-            }
-            break result;
-        };
-        record_named_program_kernel_profile(
-            &profile_runtime_state,
-            &profile_cpu,
-            "run-core-rewind",
-            &profile_name,
-            run_phase_started,
-        );
-        record_program_kernel_profile(
-            &profile_runtime_state,
-            &profile_cpu,
-            "run-core-rewind",
-            run_phase_started,
-        );
-        drop(run_heartbeat);
-        super::emit_program_stage_marker(exec_context.write_serial, "program:run-core-end");
-
-        let completion_profile = start_program_kernel_profile(&profile_runtime_state, &profile_cpu);
-        let completion = match result {
-            Ok(()) => CoreModuleRunCompletion::Exit(Ok(ChildExit {
-                instance_id,
-                exit_code: 0,
-                filesystem: Some(store.data().filesystem.snapshot()),
-            })),
-            Err(error) => {
-                if let Some(replacement) = store.data_mut().take_exec_replacement() {
-                    CoreModuleRunCompletion::Exec(Box::new(replacement))
-                } else {
-                    CoreModuleRunCompletion::Exit(match store.data_mut().take_requested_exit() {
-                        Some(code) => Ok(ChildExit {
-                            instance_id,
-                            exit_code: code,
-                            filesystem: Some(store.data().filesystem.snapshot()),
-                        }),
-                        None => Err(map_program_runtime_error(error)),
-                    })
-                }
-            }
-        };
-        record_program_kernel_profile_sample(completion_profile, "complete-core-rewind");
-        store_teardown_profile = start_program_kernel_profile(&profile_runtime_state, &profile_cpu);
-        (completion, store.data().threads.is_empty())
-    };
-    record_program_kernel_profile_sample(store_teardown_profile, "core-store-teardown-rewind");
-
-    if recycle_allowed {
-        spawn_scrubbed_recycle(
-            &spawner,
-            shared_memory_pool.clone(),
-            memory_spec,
-            recycle_memory,
-        )
-        .await;
+        .await?;
+        Ok::<_, ProgramExecError>(CoreModuleImageEnd {
+            completion,
+            store_teardown_profile: start_program_kernel_profile(&profile_runtime_state, &run_cpu),
+        })
     }
-    match completion {
+    .await;
+    finish_core_module_process(
+        threads,
+        image,
+        "core-store-teardown-rewind",
+        recycle,
+        CoreModuleSuccession {
+            replacement_state,
+            spawner,
+            progress,
+            engine,
+            runtime,
+            shared_memory_pool,
+            core_module_instance_pre_cache,
+        },
+        timeline,
+        &run_cpu,
+    )
+    .await
+}
+
+/// The `_start` export of a core-module image.
+fn resolve_core_module_start<CpuImpl, Net, HostFs>(
+    store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+    instance: &wasmtime::Instance,
+) -> Result<wasmtime::TypedFunc<(), ()>, ProgramExecError>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    HostFs: crate::HostFileSystem,
+{
+    instance
+        .get_typed_func::<(), ()>(store, "_start")
+        .map_err(|_| ProgramExecError {
+            kind: ProgramExecErrorKind::InvalidBinary,
+            detail: ProgramExecErrorDetail::InvalidEntryPoint,
+        })
+}
+
+/// What a core-module image's run reports through, and under which
+/// kernel-profile phases: a fresh image and a rewound fork record under
+/// names of their own.
+struct CoreModuleImageRun<'a, CpuImpl, Net, HostFs>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    HostFs: crate::HostFileSystem,
+{
+    spawner: &'a crate::InstanceSpawner<CpuImpl>,
+    progress: &'a helios_hal::watchdog::ProgressCounter,
+    cpu: &'a CpuImpl,
+    timer: &'a crate::Timer<CpuImpl>,
+    write_serial: crate::DebugSerialWriter,
+    runtime_state: &'a HostRuntimeState<CpuImpl, Net, HostFs>,
+    profile_name: &'a str,
+    timeline: &'a phases::Timeline,
+    started_at: u64,
+    instance_id: crate::InstanceId,
+    run_phase: &'static str,
+    complete_phase: &'static str,
+}
+
+/// Runs an instantiated core-module image's `_start` on the process's
+/// main thread to its end, through every asyncify unwind and rewind, and
+/// turns that end into the image's completion: an exit status, or the
+/// next image an exec asked for.
+async fn run_core_module_image<CpuImpl, Net, HostFs>(
+    store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+    interrupts: &StoreInterrupts<CpuImpl>,
+    instance: &wasmtime::Instance,
+    start: wasmtime::TypedFunc<(), ()>,
+    run: CoreModuleImageRun<'_, CpuImpl, Net, HostFs>,
+) -> Result<CoreModuleRunCompletion<CpuImpl, Net, HostFs>, ProgramExecError>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    HostFs: crate::HostFileSystem,
+{
+    let run_heartbeat = super::spawn_component_phase_heartbeat(
+        run.spawner,
+        run.cpu,
+        run.timer,
+        run.progress,
+        run.write_serial,
+        super::ComponentPhase {
+            name: "program:run-core",
+            started_at: run.started_at,
+        },
+    )
+    .map_err(map_task_capacity_error)?;
+    super::emit_program_stage_marker(run.write_serial, "program:run-core-begin");
+    let run_phase_started = run.cpu.now().ticks();
+    run.timeline.record(run.cpu, LaunchPhase::GuestBegin);
+    let result = loop {
+        let turns = store.data().guest_turns();
+        let result = interrupts
+            .drive(turns.drive(start.call_async(&mut *store, ())))
+            .await;
+        // A spawned thread ended the process: no unwind is completed.
+        if result.as_ref().is_err_and(WasixThreadEnded::is) {
+            break result;
+        }
+        match handle_wasix_asyncify_completion(store, interrupts, instance).await {
+            Ok(true) => continue,
+            Ok(false) => break result,
+            // A spawned thread ended the process while main was between
+            // an unwind and its rewind; the rewind's call met the end.
+            Err(_) if store.data().thread_signals.thread_ended() => {
+                break Err(wasmtime::Error::new(WasixThreadEnded));
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    run.timeline.record(run.cpu, LaunchPhase::GuestEnd);
+    record_named_program_kernel_profile(
+        run.runtime_state,
+        run.cpu,
+        run.run_phase,
+        run.profile_name,
+        run_phase_started,
+    );
+    record_program_kernel_profile(run.runtime_state, run.cpu, run.run_phase, run_phase_started);
+    drop(run_heartbeat);
+    super::emit_program_stage_marker(run.write_serial, "program:run-core-end");
+
+    let completion_profile = start_program_kernel_profile(run.runtime_state, run.cpu);
+    let completion = match result {
+        Ok(()) => CoreModuleRunCompletion::Exit(Ok(ChildExit {
+            instance_id: run.instance_id,
+            exit_code: 0,
+            filesystem: Some(store.data().filesystem.snapshot()),
+        })),
+        // Main's call stopped because a spawned thread ended the process;
+        // the process ends the way that thread's call ended it: it exits
+        // with its status, runs the image its exec asked for, or fails
+        // with the failure a trap on main would have reported.
+        Err(error) if WasixThreadEnded::is(&error) => {
+            match store.data().threads.take_process_end().expect(
+                "main's image is ended only by a spawned thread that recorded the process's end first",
+            ) {
+                WasixProcessEnd::Exit(code) => CoreModuleRunCompletion::Exit(Ok(ChildExit {
+                    instance_id: run.instance_id,
+                    exit_code: code,
+                    filesystem: Some(store.data().filesystem.snapshot()),
+                })),
+                WasixProcessEnd::Exec(replacement) => CoreModuleRunCompletion::Exec(replacement),
+                WasixProcessEnd::Fail(failure) => CoreModuleRunCompletion::Exit(Err(failure)),
+            }
+        }
+        Err(error) => {
+            if let Some(replacement) = store.data_mut().take_exec_replacement() {
+                CoreModuleRunCompletion::Exec(Box::new(replacement))
+            } else {
+                let end = store.data_mut().take_process_end(error);
+                CoreModuleRunCompletion::Exit(end.map(|exit_code| ChildExit {
+                    instance_id: run.instance_id,
+                    exit_code,
+                    filesystem: Some(store.data().filesystem.snapshot()),
+                }))
+            }
+        }
+    };
+    record_program_kernel_profile_sample(completion_profile, run.complete_phase);
+    Ok(completion)
+}
+
+/// How a core-module image ended: its completion, and the kernel-profile
+/// sample that times the teardown of its store, started before the store
+/// drops.
+struct CoreModuleImageEnd<CpuImpl, Net, HostFs>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    HostFs: crate::HostFileSystem,
+{
+    completion: CoreModuleRunCompletion<CpuImpl, Net, HostFs>,
+    store_teardown_profile: Option<ProgramKernelProfile<CpuImpl, Net, HostFs>>,
+}
+
+/// What a core-module process hands on when its image ends: the runtime
+/// an exec's next image launches on, and the pool its memory returns to.
+struct CoreModuleSuccession<'a, CpuImpl, Net, HostFs>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    HostFs: crate::HostFileSystem,
+{
+    replacement_state: Option<CoreModuleReplacementState<CpuImpl, Net, HostFs>>,
+    spawner: crate::InstanceSpawner<CpuImpl>,
+    progress: helios_hal::watchdog::ProgressCounter,
+    engine: &'a crate::wasmtime_adapter::WasmtimeEngine,
+    runtime: &'a crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl>,
+    shared_memory_pool: Arc<Mutex<SharedMemoryPool>>,
+    core_module_instance_pre_cache: CoreModuleInstancePreCache<CpuImpl, Net, HostFs>,
+}
+
+/// Ends a core-module process once its image has: stops every thread the
+/// process still has, then returns its memory to the pool and reports
+/// its completion, or runs the image an exec asked for.
+///
+/// The threads end on every way the image can end, a failure included,
+/// and before anything is reported, so no thread outlives its process:
+/// none keeps a fiber stack, a store, an instance registration or a
+/// clone of the process's stdio, and none still uses the memory the
+/// pool takes back. The image's own completion is decided before the
+/// threads are stopped, so their end never changes the process's exit
+/// status.
+async fn finish_core_module_process<CpuImpl, Net, HostFs>(
+    threads: WasixImageThreads<CpuImpl, Net, HostFs>,
+    image: Result<CoreModuleImageEnd<CpuImpl, Net, HostFs>, ProgramExecError>,
+    teardown_phase: &'static str,
+    recycle: Option<(SharedMemorySpec, SharedMemory)>,
+    succession: CoreModuleSuccession<'_, CpuImpl, Net, HostFs>,
+    timeline: &phases::Timeline,
+    run_cpu: &CpuImpl,
+) -> Result<ChildExit, ProgramExecError>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    HostFs: crate::HostFileSystem,
+{
+    let image = image.map(|end| {
+        record_program_kernel_profile_sample(end.store_teardown_profile, teardown_phase);
+        timeline.record(run_cpu, LaunchPhase::StoreTeardown);
+        end.completion
+    });
+    threads.end().await;
+    let completion = image?;
+
+    let CoreModuleSuccession {
+        replacement_state,
+        spawner,
+        progress,
+        engine,
+        runtime,
+        shared_memory_pool,
+        core_module_instance_pre_cache,
+    } = succession;
+    if let Some((spec, memory)) = recycle {
+        spawn_scrubbed_recycle(&spawner, shared_memory_pool.clone(), spec, memory).await;
+    }
+    let outcome = match completion {
         CoreModuleRunCompletion::Exit(result) => result,
         CoreModuleRunCompletion::Exec(replacement) => {
             let replacement_state = replacement_state
@@ -806,10 +968,13 @@ where
                 core_module_instance_pre_cache,
                 replacement_state.instance,
                 replacement_state.output_mode,
+                replacement.timeline,
             ))
             .await
         }
-    }
+    };
+    timeline.record(run_cpu, LaunchPhase::Completion);
+    outcome
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -827,6 +992,7 @@ pub(super) async fn run_program_component<CpuImpl, Net, HostFs>(
     _runtime: &crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl>,
     launched_instance: crate::RegisteredInstance,
     output_mode: OutputMode,
+    timeline: &phases::Timeline,
 ) -> Result<ChildExit, ProgramExecError>
 where
     CpuImpl: Cpu + Clone,
@@ -843,6 +1009,8 @@ where
     let run_timer = exec_context.timer.clone();
     let profile_cpu = exec_context.cpu.clone();
     let profile_runtime_state = exec_context.runtime_state.clone();
+    timeline.set_instance(instance_id);
+    timeline.record(&run_cpu, LaunchPhase::TaskBegin);
 
     // Use the engine that compiled the component — Wasmtime requires
     // component and store to share the same engine instance.
@@ -857,8 +1025,8 @@ where
         }
         None => DebugFileSystem::new(exec_context.runtime_state.clone()),
     };
-    let mut store = crate::wasmtime_adapter::store_with_state(
-        engine.raw(),
+    let (mut store, interrupts) = crate::wasmtime_adapter::store_with_state(
+        engine,
         StoreData::<CpuImpl, Net, HostFs>::new(
             wasmtime::component::ResourceTable::new(),
             exec_context.cpu,
@@ -888,10 +1056,12 @@ where
     let instantiate_instance_started = profile_runtime_state
         .profiling_enabled()
         .then(|| profile_cpu.now().ticks());
-    let instance = {
-        let _owner = own_committed_memory(instance_id);
-        instance_pre.instantiate_async(&mut store).await
-    };
+    timeline.record(&run_cpu, LaunchPhase::StorePrepare);
+    let turns = store.data().guest_turns();
+    let instance = interrupts
+        .drive(turns.drive(instance_pre.instantiate_async(&mut store)))
+        .await;
+    timeline.record(&run_cpu, LaunchPhase::Instantiate);
     if let Some(instantiate_instance_started) = instantiate_instance_started {
         record_program_kernel_profile(
             &profile_runtime_state,
@@ -901,9 +1071,9 @@ where
         );
     }
     let instance = instance.inspect(|instance| {
-        // The device path needs to know where this instance's linear
-        // memory landed before it can place a device window in it, and
-        // this is the first moment the runtime can say.
+        // Every call that shows a view checks its span against this
+        // instance's linear memory, so the store records the memory's
+        // handle here, the first moment the runtime can name it.
         crate::wasmtime_adapter::component_host::record_linear_memory(&mut store, instance);
     });
     let executor = instance.and_then(|instance| {
@@ -923,7 +1093,11 @@ where
                 resolve_started,
             );
         }
-        resolved.map(|run_func| crate::wasmtime_adapter::WasmtimeExecutor { store, run_func })
+        resolved.map(|run_func| crate::wasmtime_adapter::WasmtimeExecutor {
+            store,
+            interrupts,
+            run_func,
+        })
     });
     record_program_kernel_profile(
         &profile_runtime_state,
@@ -933,6 +1107,7 @@ where
     );
     let executor = executor.map_err(map_program_runtime_error)?;
     super::emit_program_stage_marker(exec_context.write_serial, "program:instantiate-ok");
+    timeline.record(&run_cpu, LaunchPhase::Start);
 
     let run_heartbeat = super::spawn_component_phase_heartbeat(
         &spawner,
@@ -948,7 +1123,9 @@ where
     .map_err(map_task_capacity_error)?;
     super::emit_program_stage_marker(exec_context.write_serial, "program:run-begin");
     let run_phase_started = profile_cpu.now().ticks();
+    timeline.record(&run_cpu, LaunchPhase::GuestBegin);
     let result = executor.run().await;
+    timeline.record(&run_cpu, LaunchPhase::GuestEnd);
     record_program_kernel_profile(
         &profile_runtime_state,
         &profile_cpu,
@@ -958,6 +1135,7 @@ where
     drop(run_heartbeat);
     let result = result.map_err(map_program_runtime_error)?;
     super::emit_program_stage_marker(exec_context.write_serial, "program:run-end");
+    timeline.record(&run_cpu, LaunchPhase::Completion);
 
     Ok(ChildExit {
         instance_id: result.instance_id,
@@ -968,6 +1146,7 @@ where
 
 pub(super) async fn handle_wasix_asyncify_completion<CpuImpl, Net, HostFs>(
     store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+    interrupts: &StoreInterrupts<CpuImpl>,
     instance: &wasmtime::Instance,
 ) -> Result<bool, ProgramExecError>
 where
@@ -1009,7 +1188,7 @@ where
                     }
                 })?;
             let rewind_stack = preview1_read_memory(memory, unwind_stack_begin, unwind_len)?;
-            wasix_call_instance_func0(store, instance, "asyncify_stop_unwind").await?;
+            wasix_call_instance_func0(store, interrupts, instance, "asyncify_stop_unwind").await?;
 
             let hash = wasix_next_stack_hash(store);
             let snapshot_bytes = wasix_stack_snapshot_bytes(ret_value, hash);
@@ -1050,6 +1229,7 @@ where
                 });
             wasix_begin_rewind(
                 store,
+                interrupts,
                 instance,
                 WasixRewind {
                     stack_lower,
@@ -1068,7 +1248,7 @@ where
             value,
             stack_lower,
         } => {
-            wasix_call_instance_func0(store, instance, "asyncify_stop_unwind").await?;
+            wasix_call_instance_func0(store, interrupts, instance, "asyncify_stop_unwind").await?;
             let snapshot = store
                 .data()
                 .asyncify
@@ -1083,6 +1263,7 @@ where
             let stack_upper = wasix_global_u32_from_instance(store, instance, "__heap_base")?;
             wasix_begin_rewind(
                 store,
+                interrupts,
                 instance,
                 WasixRewind {
                     stack_lower,
@@ -1123,7 +1304,7 @@ where
                     }
                 })?;
             let rewind_stack = preview1_read_memory(memory, unwind_stack_begin, unwind_len)?;
-            wasix_call_instance_func0(store, instance, "asyncify_stop_unwind").await?;
+            wasix_call_instance_func0(store, interrupts, instance, "asyncify_stop_unwind").await?;
             let child_pid = spawn_wasix_fork_child(
                 store,
                 stack_lower,
@@ -1158,6 +1339,7 @@ where
             }
             wasix_begin_rewind(
                 store,
+                interrupts,
                 instance,
                 WasixRewind {
                     stack_lower,
@@ -1197,7 +1379,7 @@ where
                     }
                 })?;
             let rewind_stack = preview1_read_memory(memory, unwind_stack_begin, unwind_len)?;
-            wasix_call_instance_func0(store, instance, "asyncify_stop_unwind").await?;
+            wasix_call_instance_func0(store, interrupts, instance, "asyncify_stop_unwind").await?;
             let snapshot = wasix_capture_process_snapshot(
                 store,
                 stack_lower,
@@ -1214,6 +1396,7 @@ where
             store.data_mut().asyncify.process_snapshot_rewinding = true;
             wasix_begin_rewind(
                 store,
+                interrupts,
                 instance,
                 WasixRewind {
                     stack_lower,
@@ -1232,6 +1415,7 @@ where
 
 pub(super) async fn wasix_begin_rewind<CpuImpl, Net, HostFs>(
     store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+    interrupts: &StoreInterrupts<CpuImpl>,
     instance: &wasmtime::Instance,
     rewind: WasixRewind,
 ) -> Result<(), ProgramExecError>
@@ -1307,7 +1491,14 @@ where
         });
     }
     store.data_mut().asyncify.rewind_value = value;
-    wasix_call_instance_func1(store, instance, "asyncify_start_rewind", stack_lower).await?;
+    wasix_call_instance_func1(
+        store,
+        interrupts,
+        instance,
+        "asyncify_start_rewind",
+        stack_lower,
+    )
+    .await?;
     Ok(())
 }
 
@@ -1519,8 +1710,7 @@ where
         kind: ProgramExecErrorKind::InvalidBinary,
         detail: ProgramExecErrorDetail::InvalidEntryPoint,
     })?;
-    let mut environment = store.data().environment.clone();
-    environment.retain(|(name, _)| name.as_str() != HELIOS_PROCESS_ID_ENV);
+    let environment = store.data().environment.clone();
     let (_, stdin_reader) = crate::byte_channel();
     let output_mode = OutputMode::RoutedChild {
         stdin_rx: stdin_reader,
@@ -1568,8 +1758,9 @@ where
     Net: ComponentHostNetwork,
     HostFs: crate::HostFileSystem,
 {
-    let lower = store.data_mut().entropy.insecure_u64();
-    let upper = store.data_mut().entropy.insecure_u64();
+    let data = store.data_mut();
+    let lower = data.entropy.insecure_u64(data.runtime_state.root_entropy());
+    let upper = data.entropy.insecure_u64(data.runtime_state.root_entropy());
     let hash = (u128::from(upper) << 64) | u128::from(lower);
     if hash == 0 { 1 } else { hash }
 }
@@ -1584,6 +1775,7 @@ pub(super) fn wasix_stack_snapshot_bytes(user: u32, hash: u128) -> [u8; WASIX_ST
 
 pub(super) async fn wasix_call_instance_func0<CpuImpl, Net, HostFs>(
     store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+    interrupts: &StoreInterrupts<CpuImpl>,
     instance: &wasmtime::Instance,
     name: &str,
 ) -> Result<(), ProgramExecError>
@@ -1598,14 +1790,16 @@ where
             kind: ProgramExecErrorKind::InvalidBinary,
             detail: ProgramExecErrorDetail::UnwindExportInvalid,
         })?;
-    function
-        .call_async(&mut *store, ())
+    let turns = store.data().guest_turns();
+    interrupts
+        .drive(turns.drive(function.call_async(&mut *store, ())))
         .await
         .map_err(map_program_runtime_error)
 }
 
 pub(super) async fn wasix_call_instance_func1<CpuImpl, Net, HostFs>(
     store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+    interrupts: &StoreInterrupts<CpuImpl>,
     instance: &wasmtime::Instance,
     name: &str,
     value: u32,
@@ -1621,8 +1815,9 @@ where
             kind: ProgramExecErrorKind::InvalidBinary,
             detail: ProgramExecErrorDetail::UnwindExportInvalid,
         })?;
-    function
-        .call_async(&mut *store, value as i32)
+    let turns = store.data().guest_turns();
+    interrupts
+        .drive(turns.drive(function.call_async(&mut *store, value as i32)))
         .await
         .map_err(map_program_runtime_error)
 }
@@ -1811,34 +2006,13 @@ pub(super) fn map_artifact_profile_error(error: ArtifactProfileError) -> Program
     }
 }
 
-pub(super) fn trusted_bootfs_payload(bytes: &Bytes) -> Result<Bytes, ProgramExecError> {
-    let trusted = cwasm::trust_bootfs_artifact(UntrustedCwasm::new(bytes))
-        .map_err(map_artifact_trust_error)?;
-    Ok(bytes.slice(..trusted.payload().len()))
+pub(super) fn trusted_bootfs_payload(bytes: &BootfsBytes) -> Result<Bytes, ProgramExecError> {
+    let trusted = cwasm::trust_bootfs_artifact(bytes).map_err(map_artifact_trust_error)?;
+    Ok(bytes.to_bytes().slice(..trusted.payload().len()))
 }
 
 pub(super) fn trusted_signed_payload(bytes: &Bytes) -> Result<Bytes, ProgramExecError> {
     let trusted = cwasm::verify_signed_artifact(UntrustedCwasm::new(bytes))
         .map_err(map_artifact_trust_error)?;
     Ok(bytes.slice(..trusted.payload().len()))
-}
-
-/// Charges the linear memory an instantiation commits to the instance
-/// being instantiated.
-///
-/// Instantiation is where an instance's memory actually appears — the
-/// pooling allocator makes its slot accessible here, long before any
-/// guest code runs and therefore before any call hook can name an
-/// owner. The scope is held across the `.await` on purpose: this task
-/// is pinned to its processor, and instantiation is the only thing it
-/// is doing. Work that another task interleaves on the same processor
-/// in that window is charged here too, which costs the swap policy some
-/// precision in choosing a victim and costs correctness nothing — the
-/// pages, their flags and their tokens are the address space's, not the
-/// owner tag's.
-fn own_committed_memory(instance: crate::InstanceId) -> crate::UserMemoryOwnerScope<'static> {
-    crate::enter_user_memory_owner(
-        helios_hal::cpu::current_processor(),
-        crate::MemoryOwner::new(instance.raw()),
-    )
 }

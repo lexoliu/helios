@@ -17,7 +17,7 @@ from helios_bench.report import (
     WorkloadClass,
     WorkloadResult,
 )
-from helios_bench.sources import RawSide
+from helios_bench.sources import RawCell, RawSide
 from helios_bench.stats import (
     StatsConfig,
     intervals_overlap,
@@ -135,7 +135,15 @@ def assemble_report(
     hardware: Hardware,
     pins: Pins,
     thresholds: Thresholds,
+    first_pass: dict[Side, dict[str, RawCell]] | None = None,
 ) -> Report:
+    """The report of one pass of the suite.
+
+    ``first_pass`` holds, per Helios image, the cells of the first pair
+    of boots of each workload the reconfirm measured again; ``sides``
+    already carries the second pair. A first-pass cell that failed was
+    never compared, so it is not one.
+    """
     floor = control.noise_floor if control is not None else 0.0
     results = []
     for workload in workloads:
@@ -151,7 +159,12 @@ def assemble_report(
             cells[side] = build_cell(side, raw_cell.iterations, thresholds)
         if not cells and not failures:
             continue
-        results.append(build_workload(workload, cells, floor, failures))
+        result = build_workload(workload, cells, floor, failures)
+        for side, raw_cells in (first_pass or {}).items():
+            raw_cell = raw_cells.get(workload["name"])
+            if raw_cell is not None and raw_cell.failure is None:
+                result.first_pass[side] = build_cell(side, raw_cell.iterations, thresholds)
+        results.append(result)
     return Report(
         run=run,
         hardware=hardware,

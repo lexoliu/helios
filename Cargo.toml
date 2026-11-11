@@ -1,6 +1,6 @@
 [workspace]
 members = [
-    "aarch64", "api", "api-macro", "artifact", "cli", "compiler-abi", "compiler-plugin", "compiler-support", "hal", "i6300esb", "hosted", "kernel", "kernel-macro", "netstack", "profdata", "programs/audio-test", "programs/compositor", "programs/compositor/render", "programs/date", "programs/debugger", "programs/display-test", "programs/gpu-test", "programs/http-client", "programs/init", "programs/input-test", "programs/oob-load", "programs/perf", "programs/ping", "programs/procbench", "programs/sched-tasks", "programs/surface-test", "riscv", "tools/branch-hints", "tools/desktop/check-text", "x86", "inspector", "inspector-protocol", "virtio", "workspace-root",
+    "aarch64", "api", "api-macro", "artifact", "cli", "compiler-abi", "compiler-plugin", "compiler-support", "hal", "i6300esb", "hosted", "kernel", "netstack", "profdata", "programs/audio-test", "programs/compositor", "programs/compositor/render", "programs/date", "programs/debugger", "programs/display-test", "programs/gpu-test", "programs/http-client", "programs/init", "programs/input-test", "programs/oob-load", "programs/perf", "programs/ping", "programs/procbench", "programs/sched-tasks", "programs/surface-test", "riscv", "tools/branch-hints", "tools/desktop/check-text", "x86", "inspector", "inspector-protocol", "virtio", "workspace-root",
 ]
 resolver = "2"
 
@@ -24,7 +24,6 @@ helios-compiler-abi = { path = "compiler-abi" }
 helios-compiler-support = { path = "compiler-support" }
 helios-hosted = { path = "hosted" }
 helios-aarch64 = { path = "aarch64" }
-helios-kernel-macro = { path = "kernel-macro" }
 helios-inspector-protocol = { path = "inspector-protocol" }
 helios-riscv = { path = "riscv" }
 helios-kernel = { path = "kernel", default-features = false }
@@ -106,13 +105,36 @@ debug = 2
 [profile.release]
 panic = "abort"
 
-# The instrumented kernel of docs/pgo.md: an optimised build that also
+# The kernel image's optimised build, the one every release kernel and both
+# PGO kernels below are: `release` plus whole-program optimisation. The
+# image links `hal`, `netstack`, `virtio`, the backend, `kernel` and the
+# Wasmtime crates, and every hot path crosses those boundaries — the
+# executor into the virtio queues, the netstack per segment, a hostcall
+# into a WIT service — so a per-crate build leaves each of those calls out
+# of line for PGO to weight but never inline. Fat LTO with one codegen unit
+# hands the whole image to one optimisation, which is what a collected
+# profile is worth the most on. The host tools keep `release`: nothing
+# times them, and a fat-LTO link of the inspector on every check would
+# be paid by every lane and every developer loop for no measurement.
+#
+# The image's DWARF does not come from this profile's `debug` key: cargo
+# folds the profile into every crate's `-C metadata`, which renames every
+# symbol and, under fat LTO, changes the image's code (#451). The
+# inspector adds `-C debuginfo=limited` as a rustflag instead
+# (`kernel_debuginfo_rustflags`), which leaves every function's code as it
+# was.
+[profile.kernel-release]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+
+# The instrumented kernel of docs/pgo.md: the optimised build that also
 # carries LLVM's counters. The instrumentation itself comes from rustflags,
 # which are not a profile setting; `helios-inspector vm --profile-generate`
 # adds them and this profile keeps the artifacts in a directory of their own,
 # so an instrumented image and a plain one never overwrite each other.
 [profile.profile-generate]
-inherits = "release"
+inherits = "kernel-release"
 
 # The PGO kernel of docs/pgo.md: the same optimised build reading a
 # collected profile. `-C profile-use` is a rustflag rather than a profile
@@ -121,7 +143,7 @@ inherits = "release"
 # one checkout and timed against each other without overwriting each
 # other's artifacts.
 [profile.profile-use]
-inherits = "release"
+inherits = "kernel-release"
 
 [lints]
 workspace = true

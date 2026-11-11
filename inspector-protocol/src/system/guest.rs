@@ -10,9 +10,10 @@ use crate::system::server::{self, Dispatcher};
 use super::bindings::helios::system::{instances, profiling, programs, stats, tracing};
 use super::methods::{
     INSTANCES_INSTANCE, INSTANCES_KILL, INSTANCES_SNAPSHOT, PROFILING_CLEAR, PROFILING_FOLDED,
-    PROFILING_INSTANCE, PROFILING_METRICS, PROFILING_RAW_PROFILE_READ, PROFILING_RAW_PROFILE_SIZE,
-    PROFILING_SET_ENABLED, PROGRAMS_AOT, PROGRAMS_EXEC, PROGRAMS_INSTANCE, STATS_INSTANCE,
-    STATS_SNAPSHOT, TRACING_INSTANCE, TRACING_RECENT,
+    PROFILING_INSTANCE, PROFILING_INSTRUCTION_SAMPLES, PROFILING_METRICS,
+    PROFILING_RAW_PROFILE_READ, PROFILING_RAW_PROFILE_SIZE, PROFILING_SET_ENABLED,
+    PROFILING_SET_INSTRUCTION_SAMPLING, PROGRAMS_AOT, PROGRAMS_EXEC, PROGRAMS_INSTANCE,
+    STATS_INSTANCE, STATS_SNAPSHOT, TRACING_INSTANCE, TRACING_RECENT, TRACING_SET_TARGET_ENABLED,
 };
 use crate::debugger::{filesystem, programs as debugger_programs};
 
@@ -54,10 +55,13 @@ fn supports_request(instance: &str, func: &str) -> bool {
             | (INSTANCES_INSTANCE, INSTANCES_SNAPSHOT)
             | (INSTANCES_INSTANCE, INSTANCES_KILL)
             | (TRACING_INSTANCE, TRACING_RECENT)
+            | (TRACING_INSTANCE, TRACING_SET_TARGET_ENABLED)
             | (PROFILING_INSTANCE, PROFILING_SET_ENABLED)
             | (PROFILING_INSTANCE, PROFILING_CLEAR)
             | (PROFILING_INSTANCE, PROFILING_FOLDED)
             | (PROFILING_INSTANCE, PROFILING_METRICS)
+            | (PROFILING_INSTANCE, PROFILING_SET_INSTRUCTION_SAMPLING)
+            | (PROFILING_INSTANCE, PROFILING_INSTRUCTION_SAMPLES)
             | (PROFILING_INSTANCE, PROFILING_RAW_PROFILE_SIZE)
             | (PROFILING_INSTANCE, PROFILING_RAW_PROFILE_READ)
     ) || filesystem::supports(instance, func)
@@ -170,6 +174,23 @@ async fn dispatch(instance: &str, func: &str, payload: &[u8]) -> Result<Vec<u8>,
                 source,
             })
         }
+        (TRACING_INSTANCE, TRACING_SET_TARGET_ENABLED) => {
+            let (target, enabled): (String, bool) =
+                postcard::from_bytes(payload).map_err(|source| DispatchError::Decode {
+                    operation: "tracing.set-target-enabled",
+                    source,
+                })?;
+            let result =
+                host_tracing::set_target_enabled(&target, enabled).map_err(|error| match error {
+                    host_tracing::TargetError::UnknownTarget(name) => {
+                        tracing::TargetError::UnknownTarget(name)
+                    }
+                });
+            postcard::to_allocvec(&result).map_err(|source| DispatchError::Encode {
+                operation: "tracing.set-target-enabled",
+                source,
+            })
+        }
         (TRACING_INSTANCE, TRACING_RECENT) => {
             let (filter, limit): (tracing::Filter, u32) =
                 postcard::from_bytes(payload).map_err(|source| DispatchError::Decode {
@@ -236,6 +257,33 @@ async fn dispatch(instance: &str, func: &str, payload: &[u8]) -> Result<Vec<u8>,
                 .collect::<Vec<_>>();
             postcard::to_allocvec(&samples).map_err(|source| DispatchError::Encode {
                 operation: "profiling.metrics",
+                source,
+            })
+        }
+        (PROFILING_INSTANCE, PROFILING_SET_INSTRUCTION_SAMPLING) => {
+            let enabled =
+                postcard::from_bytes::<bool>(payload).map_err(|source| DispatchError::Decode {
+                    operation: "profiling.set-instruction-sampling",
+                    source,
+                })?;
+            let result = host_profiling::set_instruction_sampling(enabled)
+                .map_err(convert_instruction_profile_error);
+            postcard::to_allocvec(&result).map_err(|source| DispatchError::Encode {
+                operation: "profiling.set-instruction-sampling",
+                source,
+            })
+        }
+        (PROFILING_INSTANCE, PROFILING_INSTRUCTION_SAMPLES) => {
+            if !payload.is_empty() {
+                return Err(DispatchError::UnexpectedPayload {
+                    operation: "profiling.instruction-samples",
+                });
+            }
+            let profile = host_profiling::instruction_samples()
+                .map(convert_instruction_profile)
+                .map_err(convert_instruction_profile_error);
+            postcard::to_allocvec(&profile).map_err(|source| DispatchError::Encode {
+                operation: "profiling.instruction-samples",
                 source,
             })
         }
@@ -342,6 +390,15 @@ fn map_capability_grants_to_host(
                         .collect(),
                 })
             }
+            programs::CapabilityGrant::Device(grant) => {
+                host_programs::CapabilityGrant::Device(host_programs::DeviceGrant {
+                    classes: grant
+                        .classes
+                        .into_iter()
+                        .map(map_device_class_to_host)
+                        .collect(),
+                })
+            }
         })
         .collect()
 }
@@ -400,6 +457,15 @@ fn map_link_right_to_host(right: programs::LinkRight) -> host_programs::LinkRigh
         programs::LinkRight::TargetDirectory => host_programs::LinkRight::TargetDirectory,
         programs::LinkRight::SymlinkCreate => host_programs::LinkRight::SymlinkCreate,
         programs::LinkRight::SymlinkRead => host_programs::LinkRight::SymlinkRead,
+    }
+}
+
+fn map_device_class_to_host(class: programs::DeviceClass) -> host_programs::DeviceClass {
+    match class {
+        programs::DeviceClass::Display => host_programs::DeviceClass::Display,
+        programs::DeviceClass::Input => host_programs::DeviceClass::Input,
+        programs::DeviceClass::Gpu => host_programs::DeviceClass::Gpu,
+        programs::DeviceClass::Audio => host_programs::DeviceClass::Audio,
     }
 }
 
@@ -635,6 +701,50 @@ fn convert_raw_profile_error(error: host_profiling::RawProfileError) -> profilin
         Host::MalformedSection(section) => Wire::MalformedSection(convert_profile_section(section)),
         Host::OutOfRange(len) => Wire::OutOfRange(len),
         Host::ReadTooLarge(limit) => Wire::ReadTooLarge(limit),
+    }
+}
+
+fn convert_instruction_profile(
+    profile: host_profiling::InstructionProfile,
+) -> profiling::InstructionProfile {
+    profiling::InstructionProfile {
+        period_nanos: profile.period_nanos,
+        kernel_image_base: profile.kernel_image_base,
+        samples: profile
+            .samples
+            .into_iter()
+            .map(|sample| profiling::InstructionSample {
+                code: convert_sampled_code(sample.code),
+                count: sample.count,
+            })
+            .collect(),
+        dropped: profile.dropped,
+    }
+}
+
+fn convert_sampled_code(code: host_profiling::SampledCode) -> profiling::SampledCode {
+    use host_profiling::SampledCode as Host;
+    use profiling::SampledCode as Wire;
+
+    match code {
+        Host::Wasm(function) => Wire::Wasm(profiling::WasmFunction {
+            module: function.module,
+            static_module: function.static_module,
+            index: function.index,
+            name: function.name,
+        }),
+        Host::WasmTrampoline(module) => Wire::WasmTrampoline(module),
+        Host::Native(address) => Wire::Native(address),
+    }
+}
+
+fn convert_instruction_profile_error(
+    error: host_profiling::InstructionProfileError,
+) -> profiling::InstructionProfileError {
+    match error {
+        host_profiling::InstructionProfileError::NotCaptured => {
+            profiling::InstructionProfileError::NotCaptured
+        }
     }
 }
 

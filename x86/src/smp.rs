@@ -10,22 +10,23 @@ use core::num::NonZeroUsize;
 
 use core::ops::Range;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
-use helios_hal::cpu::{ProcessorId, ticks_to_nanos};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
+use helios_hal::cpu::{GUEST_STACK_LIMIT_OFFSET, ProcessorId, Timebase};
 use helios_hal::critical_section::ProcessorIdentity;
 use helios_hal::watchdog::Watchdog;
-use helios_kernel::{Timer, WasmtimeTlsSlots};
+use helios_kernel::{InstructionSampler, SampleCapture, Timer, WasmtimeTlsSlots};
 use pci_types::ConfigRegionAccess;
 use spin::Once;
 use x86::apic::x2apic::X2APIC;
 use x86::apic::xapic::{
-    XAPIC, XAPIC_LVT_TIMER, XAPIC_SVR, XAPIC_TIMER_CURRENT_COUNT, XAPIC_TIMER_DIV_CONF,
-    XAPIC_TIMER_INIT_COUNT,
+    XAPIC, XAPIC_ESR, XAPIC_LVT_ERROR, XAPIC_LVT_TIMER, XAPIC_SVR, XAPIC_TIMER_CURRENT_COUNT,
+    XAPIC_TIMER_DIV_CONF, XAPIC_TIMER_INIT_COUNT,
 };
 use x86::apic::{ApicControl, ApicId};
 use x86::msr::{
-    IA32_APIC_BASE, IA32_FS_BASE, IA32_X2APIC_CUR_COUNT, IA32_X2APIC_DIV_CONF,
-    IA32_X2APIC_INIT_COUNT, IA32_X2APIC_LVT_TIMER, rdmsr, wrmsr,
+    IA32_APIC_BASE, IA32_FS_BASE, IA32_X2APIC_CUR_COUNT, IA32_X2APIC_DIV_CONF, IA32_X2APIC_ESR,
+    IA32_X2APIC_ICR, IA32_X2APIC_INIT_COUNT, IA32_X2APIC_LVT_ERROR, IA32_X2APIC_LVT_TIMER, rdmsr,
+    wrmsr,
 };
 use x86_64::PhysAddr;
 use x86_64::VirtAddr;
@@ -42,6 +43,8 @@ use crate::debug_state;
 use crate::exceptions::{
     DeviceInterruptRoutes, EXCEPTION_STACK_BYTES, ProcessorIdt, ProcessorSegments,
 };
+use crate::extended_state::Xcr0;
+use crate::ioapic::IoApic;
 use crate::pci::LegacyPciConfigAccess;
 use crate::read_tsc;
 use crate::watchdog::X86Watchdog;
@@ -50,7 +53,19 @@ pub(crate) const WAKEUP_PAGE_BYTES: usize = 4096;
 pub(crate) const SIPI_MAX_PHYSICAL_ADDRESS: usize = 0x10_0000;
 const AP_STARTUP_INIT_ASSERT_MICROS: u64 = 10_000;
 const AP_STARTUP_INTER_IPI_MICROS: u64 = 200;
+/// The calibration window, which is also the scheduler tick: the count
+/// the timer runs down in this window is the periodic initial count.
 const APIC_TIMER_CALIBRATION_MICROS: u64 = 10_000;
+/// Timer interrupts per scheduler tick while instruction sampling runs.
+///
+/// The scheduler tick is 10 ms (100 Hz), ten times too coarse to split a
+/// workload's time between functions, and raising it would also raise the
+/// guest preemption rate and change how often guests yield. Sampling
+/// therefore shortens the period by this factor and runs the scheduler's
+/// work — watchdog, guest preemption, kernel timer — on every tenth
+/// interrupt only, so a profiled run keeps the scheduling an unprofiled
+/// one has and is sampled at 1 kHz per processor.
+const SAMPLES_PER_SCHEDULER_TICK: u32 = 10;
 const APIC_TIMER_DIVIDE_BY_ONE: u32 = 0b1011;
 const APIC_TIMER_MASKED: u64 = 1 << 16;
 const APIC_TIMER_PERIODIC: u64 = 1 << 17;
@@ -103,11 +118,7 @@ const BOOTSTRAP_ANCHOR_LOGICAL_ID: u16 = u16::MAX;
 /// runtime's address in `IA32_FS_BASE` before the first compiler-generated
 /// instruction runs on it. This word exists before the allocator that would
 /// otherwise own it, which is the whole of why it is a `static`.
-static BOOTSTRAP_ANCHOR: ProcessorAnchor = ProcessorAnchor {
-    identity: AtomicUsize::new(0),
-    logical_id: BOOTSTRAP_ANCHOR_LOGICAL_ID,
-    _reserved: [0; 3],
-};
+static BOOTSTRAP_ANCHOR: ProcessorAnchor = ProcessorAnchor::new(BOOTSTRAP_ANCHOR_LOGICAL_ID);
 
 /// The words the executing processor answers `fs`-relative loads with.
 ///
@@ -122,11 +133,14 @@ static BOOTSTRAP_ANCHOR: ProcessorAnchor = ProcessorAnchor {
 ///
 /// # Concurrency
 ///
-/// Both words are written once, by the bootstrap processor, before the
-/// processor that reads them runs: `logical_id` when the runtime is
-/// constructed, `identity` when [`build_boot_context`] has settled the
-/// runtimes at their final addresses. Every read is the owning processor
-/// reading its own anchor through its own `IA32_FS_BASE`.
+/// `identity` and `logical_id` are written once, by the bootstrap processor,
+/// before the processor that reads them runs: `logical_id` when the runtime
+/// is constructed, `identity` when [`build_boot_context`] has settled the
+/// runtimes at their final addresses. Every read of them is the owning
+/// processor reading its own anchor through its own `IA32_FS_BASE`.
+/// `guest_stack_limit` follows [`GUEST_STACK_LIMIT_OFFSET`]'s contract: the
+/// owning processor writes and reads it, any processor may store the
+/// interrupt sentinel into it.
 #[repr(C)]
 pub(crate) struct ProcessorAnchor {
     /// Offset 0: the identity this processor answers a critical-section
@@ -138,6 +152,11 @@ pub(crate) struct ProcessorAnchor {
     /// [`BOOTSTRAP_ANCHOR_LOGICAL_ID`] on the bootstrap anchor.
     logical_id: u16,
     _reserved: [u16; 3],
+    /// Offset 16: the stack limit of the guest running on this processor,
+    /// which compiled guest code compares `rsp` against as
+    /// `fs:[GUEST_STACK_LIMIT_OFFSET]`. Wasmtime owns its contents through
+    /// `wasmtime_processor_stack_limit`.
+    guest_stack_limit: AtomicUsize,
 }
 
 /// Byte offset of [`ProcessorAnchor::identity`] from `IA32_FS_BASE`.
@@ -157,17 +176,27 @@ const _: () = assert!(
     core::mem::offset_of!(ProcessorAnchor, logical_id) == ANCHOR_LOGICAL_ID_OFFSET,
     "the fs-relative logical-id load would read the wrong word"
 );
+const _: () = assert!(
+    core::mem::offset_of!(ProcessorAnchor, guest_stack_limit) == GUEST_STACK_LIMIT_OFFSET as usize,
+    "compiled guest code would compare its stack pointer against the wrong word"
+);
 
 #[repr(C)]
 pub(crate) struct ProcessorRuntime {
     anchor: ProcessorAnchor,
     physical_memory_offset: usize,
     tsc_hz: u64,
+    apic_mode: LocalApicMode,
     pub(crate) wasmtime_tls: WasmtimeTlsSlots,
     pub(crate) exception_idt: ProcessorIdt,
-    /// The GDT and TSS this processor loads beside its IDT, and the two
-    /// exception stacks the TSS names.
+    /// The GDT and TSS this processor loads beside its IDT, and the
+    /// exception and interrupt stacks the TSS names.
     pub(crate) segments: ProcessorSegments,
+    /// Whether an external interrupt is being dispatched on this
+    /// processor's interrupt stack, which holds exactly one frame at a
+    /// time. Written by this processor only, from
+    /// `exceptions::helios_x86_interrupt_dispatch`.
+    pub(crate) interrupt_in_progress: AtomicBool,
     /// The page the boot-time page-fault probe in
     /// `exceptions::verify_page_fault_returns` expects to fault on; zero
     /// when no probe is running. Written by this processor only.
@@ -181,6 +210,23 @@ pub(crate) struct ProcessorRuntime {
     program_service: Once<debug_state::ProgramService>,
     device_interrupts: Once<&'static DeviceInterruptRoutes>,
     local_timer_ready: AtomicBool,
+    /// The instruction sampler this processor's timer feeds while
+    /// instruction sampling runs.
+    instruction_sampler: InstructionSampler,
+    /// The periodic count of one scheduler tick, as calibrated when the
+    /// timer was armed. Written by this processor only.
+    scheduler_tick_count: AtomicU32,
+    /// Whether the timer runs at the sampling period. Written by this
+    /// processor only, from its timer interrupt.
+    timer_sampling: AtomicBool,
+    /// Sampling-period interrupts since the last scheduler tick. Written
+    /// by this processor only, from its timer interrupt.
+    samples_since_scheduler_tick: AtomicU32,
+    /// Whether this processor has enabled its local APIC — the base
+    /// MSR's enable bits and the spurious vector — which happens once,
+    /// in [`attach_local_apic`], before the processor sends an IPI or
+    /// ends an interrupt. Written by this processor only.
+    local_apic_attached: AtomicBool,
     started: AtomicBool,
     /// Set by [`X86PlatformState::publish_wake`] on the *target*
     /// processor before the wake IPI goes out, and cleared by
@@ -200,6 +246,7 @@ impl ProcessorAnchor {
             identity: AtomicUsize::new(0),
             logical_id,
             _reserved: [0; 3],
+            guest_stack_limit: AtomicUsize::new(usize::MAX),
         }
     }
 }
@@ -218,18 +265,42 @@ impl ProcessorRuntime {
     pub(crate) fn take_wake_pending(&self) -> bool {
         self.wake_pending.swap(false, Ordering::AcqRel)
     }
+
+    /// Marks an external-interrupt dispatch as running on this
+    /// processor's interrupt stack, asserting that none already is. The
+    /// stack holds one frame at a time and a second dispatch would
+    /// overwrite the first: every external vector arrives through an
+    /// interrupt gate, which clears IF on delivery, and no handler
+    /// re-enables it, so the flag may only be set once at a time. Only
+    /// this processor touches it, which makes `Relaxed` the whole
+    /// ordering it needs.
+    pub(crate) fn begin_interrupt_dispatch(&self, vector: u64) {
+        assert!(
+            !self.interrupt_in_progress.swap(true, Ordering::Relaxed),
+            "x86 interrupt vector {vector:#x} was delivered while an interrupt was already \
+             in progress on this processor's interrupt stack"
+        );
+    }
+
+    /// Marks the interrupt stack free again; see
+    /// [`Self::begin_interrupt_dispatch`].
+    pub(crate) fn end_interrupt_dispatch(&self) {
+        self.interrupt_in_progress.store(false, Ordering::Relaxed);
+    }
 }
 
 pub(crate) struct BootContext {
     platform: Arc<X86PlatformState>,
+    xcr0: Xcr0,
 }
 
 pub(crate) struct X86PlatformState {
     tsc_base: u64,
-    tsc_hz: u64,
+    timebase: Timebase,
     physical_memory_offset: usize,
     debug_state: debug_state::RuntimeState,
     watchdog: X86Watchdog,
+    io_apic: IoApic,
     processors: Box<[ProcessorSlot]>,
     wakeup_page: Option<WakeupPage>,
     boot_context: AtomicPtr<BootContext>,
@@ -250,7 +321,7 @@ struct WakeupPage {
 pub(crate) struct PhysicalOffsetAcpiHandler {
     pub(crate) physical_memory_offset: usize,
     pub(crate) tsc_base: u64,
-    pub(crate) tsc_hz: u64,
+    pub(crate) timebase: Timebase,
 }
 
 pub(crate) fn build_boot_context(
@@ -258,17 +329,23 @@ pub(crate) fn build_boot_context(
     physical_memory_offset: usize,
     wakeup_page: Option<Range<usize>>,
     tsc_base: u64,
-    tsc_hz: u64,
+    timebase: Timebase,
     debug_state: debug_state::RuntimeState,
+    xcr0: Xcr0,
 ) -> &'static BootContext {
+    let tsc_hz = timebase.frequency();
     let handler = PhysicalOffsetAcpiHandler {
         physical_memory_offset,
         tsc_base,
-        tsc_hz,
+        timebase,
     };
     let tables = unsafe { AcpiTables::from_rsdp(handler.clone(), rsdp_address) }
         .unwrap_or_else(|error| panic!("failed to parse ACPI tables: {error:?}"));
     let watchdog = crate::watchdog::discover(&tables, physical_memory_offset);
+    // Probed before the MADT is consumed: the I/O APIC's destination
+    // encoding depends on which local-APIC mode the machine runs.
+    let apic_mode = LocalApicMode::probe();
+    let io_apic = crate::ioapic::discover(&tables, physical_memory_offset, apic_mode);
     let platform = AcpiPlatform::new(tables, handler.clone())
         .unwrap_or_else(|error| panic!("failed to construct ACPI platform info: {error:?}"));
     let processor_info = platform
@@ -284,9 +361,15 @@ pub(crate) fn build_boot_context(
             anchor: ProcessorAnchor::new(0),
             physical_memory_offset,
             tsc_hz,
+            apic_mode,
             wasmtime_tls: WasmtimeTlsSlots::new(),
             exception_idt: ProcessorIdt::new(),
-            segments: ProcessorSegments::new(exception_stack(), exception_stack()),
+            segments: ProcessorSegments::new(
+                exception_stack(),
+                exception_stack(),
+                exception_stack(),
+            ),
+            interrupt_in_progress: AtomicBool::new(false),
             probe_fault: AtomicUsize::new(0),
             probe_frame: AtomicUsize::new(0),
             watchdog: watchdog.clone(),
@@ -294,6 +377,11 @@ pub(crate) fn build_boot_context(
             program_service: Once::new(),
             device_interrupts: Once::new(),
             local_timer_ready: AtomicBool::new(false),
+            instruction_sampler: debug_state.instruction_sampler(),
+            scheduler_tick_count: AtomicU32::new(0),
+            timer_sampling: AtomicBool::new(false),
+            samples_since_scheduler_tick: AtomicU32::new(0),
+            local_apic_attached: AtomicBool::new(false),
             started: AtomicBool::new(false),
             wake_pending: AtomicBool::new(false),
         },
@@ -312,9 +400,15 @@ pub(crate) fn build_boot_context(
                 anchor: ProcessorAnchor::new((index + 1) as u16),
                 physical_memory_offset,
                 tsc_hz,
+                apic_mode,
                 wasmtime_tls: WasmtimeTlsSlots::new(),
                 exception_idt: ProcessorIdt::new(),
-                segments: ProcessorSegments::new(exception_stack(), exception_stack()),
+                segments: ProcessorSegments::new(
+                    exception_stack(),
+                    exception_stack(),
+                    exception_stack(),
+                ),
+                interrupt_in_progress: AtomicBool::new(false),
                 probe_fault: AtomicUsize::new(0),
                 probe_frame: AtomicUsize::new(0),
                 watchdog: watchdog.clone(),
@@ -322,6 +416,11 @@ pub(crate) fn build_boot_context(
                 program_service: Once::new(),
                 device_interrupts: Once::new(),
                 local_timer_ready: AtomicBool::new(false),
+                instruction_sampler: debug_state.instruction_sampler(),
+                scheduler_tick_count: AtomicU32::new(0),
+                timer_sampling: AtomicBool::new(false),
+                samples_since_scheduler_tick: AtomicU32::new(0),
+                local_apic_attached: AtomicBool::new(false),
                 started: AtomicBool::new(false),
                 wake_pending: AtomicBool::new(false),
             },
@@ -345,10 +444,11 @@ pub(crate) fn build_boot_context(
     publish_anchor_identities(&mut processors);
     let platform = Arc::new(X86PlatformState {
         tsc_base,
-        tsc_hz,
+        timebase,
         physical_memory_offset,
         debug_state,
         watchdog,
+        io_apic,
         processors,
         wakeup_page,
         boot_context: AtomicPtr::new(core::ptr::null_mut()),
@@ -356,7 +456,7 @@ pub(crate) fn build_boot_context(
     if let Some(wakeup_page) = platform.wakeup_page.as_ref() {
         prepare_wakeup_page(&platform, wakeup_page);
     }
-    let context = Box::leak(Box::new(BootContext { platform }));
+    let context = Box::leak(Box::new(BootContext { platform, xcr0 }));
     context
         .platform
         .boot_context
@@ -460,6 +560,15 @@ pub(crate) fn current_runtime() -> &'static ProcessorRuntime {
     unsafe { &*(runtime.get() as *const ProcessorRuntime) }
 }
 
+/// The executing processor's guest stack-limit word.
+///
+/// Read through the runtime rather than `fs` because Wasmtime needs the
+/// word's address, which an `fs`-relative load cannot produce. A guest only
+/// runs once this processor's runtime is installed.
+pub(crate) fn current_guest_stack_limit() -> &'static AtomicUsize {
+    &current_runtime().anchor.guest_stack_limit
+}
+
 pub(crate) fn current_processor() -> ProcessorId {
     let logical_id = anchor_logical_id();
     assert!(
@@ -506,6 +615,12 @@ impl ProcessorRuntime {
         self.timer.call_once(|| timer);
     }
 
+    pub(crate) fn timer(&self) -> &Timer<crate::X86Cpu> {
+        self.timer
+            .get()
+            .expect("x86 processor timer was read before it was installed")
+    }
+
     pub(crate) fn install_program_service(&self, service: debug_state::ProgramService) {
         assert!(
             self.program_service.get().is_none(),
@@ -524,14 +639,109 @@ impl ProcessorRuntime {
         }
     }
 
+    /// The instruction-sampling half of a timer interrupt. Answers whether
+    /// the interrupt is also a scheduler tick.
+    ///
+    /// Outside sampling every interrupt is a scheduler tick. A scheduler
+    /// tick that finds sampling started shortens the period to
+    /// [`SAMPLES_PER_SCHEDULER_TICK`] interrupts per tick; from then on
+    /// each interrupt records the interrupted address, and every
+    /// [`SAMPLES_PER_SCHEDULER_TICK`]th is the scheduler tick, which
+    /// restores the period once sampling has stopped. The period changes
+    /// only on a scheduler tick, so the scheduler's cadence never shifts.
+    fn sample_timer_tick(&self, interrupted: usize) -> bool {
+        if !self.timer_sampling.load(Ordering::Relaxed) {
+            if self.instruction_sampler.sampling() {
+                self.samples_since_scheduler_tick
+                    .store(0, Ordering::Relaxed);
+                self.timer_sampling.store(true, Ordering::Relaxed);
+                self.set_timer_count(
+                    self.scheduler_tick_count.load(Ordering::Relaxed) / SAMPLES_PER_SCHEDULER_TICK,
+                );
+            }
+            return true;
+        }
+        self.instruction_sampler.record(interrupted);
+        let samples = self.samples_since_scheduler_tick.load(Ordering::Relaxed) + 1;
+        if samples < SAMPLES_PER_SCHEDULER_TICK {
+            self.samples_since_scheduler_tick
+                .store(samples, Ordering::Relaxed);
+            return false;
+        }
+        self.samples_since_scheduler_tick
+            .store(0, Ordering::Relaxed);
+        if !self.instruction_sampler.sampling() {
+            self.timer_sampling.store(false, Ordering::Relaxed);
+            self.set_timer_count(self.scheduler_tick_count.load(Ordering::Relaxed));
+        }
+        true
+    }
+
+    /// Rewrites this processor's periodic initial count, which restarts
+    /// the countdown at `count`.
+    fn set_timer_count(&self, count: u32) {
+        assert!(count != 0, "x86 local APIC timer period would be zero");
+        match self.apic_mode {
+            LocalApicMode::X2Apic => unsafe {
+                wrmsr(IA32_X2APIC_INIT_COUNT, u64::from(count));
+            },
+            LocalApicMode::XApic { physical_base } => {
+                let apic_region = xapic_mmio_region(physical_base, self.physical_memory_offset);
+                write_xapic_register(apic_region, XAPIC_TIMER_INIT_COUNT, count);
+            }
+        }
+    }
+
     fn platform_tsc_hz(&self) -> u64 {
         self.tsc_hz
+    }
+
+    fn apic_mode(&self) -> LocalApicMode {
+        self.apic_mode
+    }
+
+    /// Enables this processor's local APIC, once. Every later ICR
+    /// write, EOI and timer program assumes it; a processor that sends
+    /// a wake before this ran would write an ICR the hardware has not
+    /// enabled, which is why the entry paths call it before interrupts
+    /// are enabled rather than leaving it to the first timer arm.
+    pub(crate) fn attach_local_apic(&self) {
+        if self
+            .local_apic_attached
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        match self.apic_mode {
+            LocalApicMode::X2Apic => {
+                let mut apic = X2APIC::new();
+                apic.attach();
+                unsafe {
+                    wrmsr(IA32_X2APIC_ESR, 0);
+                    wrmsr(
+                        IA32_X2APIC_LVT_ERROR,
+                        u64::from(crate::exceptions::APIC_ERROR_INTERRUPT_VECTOR),
+                    );
+                }
+            }
+            LocalApicMode::XApic { physical_base } => {
+                let apic_region = xapic_mmio_region(physical_base, self.physical_memory_offset);
+                attach_xapic(apic_region);
+            }
+        }
     }
 }
 
 impl BootContext {
     pub(crate) fn platform(&self) -> Arc<X86PlatformState> {
         self.platform.clone()
+    }
+
+    /// The XCR0 the bootstrap processor programmed; see
+    /// [`crate::extended_state::enable_on_secondary_processor`].
+    pub(crate) fn xcr0(&self) -> Xcr0 {
+        self.xcr0
     }
 
     pub(crate) fn bootstrap_runtime(&self) -> &ProcessorRuntime {
@@ -544,8 +754,8 @@ impl X86PlatformState {
         self.tsc_base
     }
 
-    pub(crate) fn tsc_hz(&self) -> u64 {
-        self.tsc_hz
+    pub(crate) fn timebase(&self) -> Timebase {
+        self.timebase
     }
 
     pub(crate) fn debug_state(&self) -> debug_state::RuntimeState {
@@ -595,6 +805,11 @@ impl X86PlatformState {
             );
             slot.runtime.device_interrupts.call_once(|| routes);
         }
+    }
+
+    /// The I/O APIC carrying COM1's line, located from the MADT at boot.
+    pub(crate) fn io_apic(&self) -> &IoApic {
+        &self.io_apic
     }
 
     pub(crate) fn bootstrap_processor(&self) -> ProcessorId {
@@ -653,7 +868,7 @@ impl X86PlatformState {
                 slot.apic_id,
                 wakeup_page.physical_start,
                 self.physical_memory_offset,
-                self.tsc_hz,
+                self.timebase.frequency(),
             )
             .unwrap_or_else(|message| {
                 panic!(
@@ -665,7 +880,7 @@ impl X86PlatformState {
         }
 
         let deadline = read_tsc()
-            .checked_add(self.tsc_hz / 2)
+            .checked_add(self.timebase.frequency() / 2)
             .unwrap_or_else(|| panic!("x86 AP startup deadline overflow"));
         while !slot.runtime.started.load(Ordering::Acquire) {
             assert!(
@@ -693,9 +908,45 @@ impl X86PlatformState {
     }
 }
 
-enum LocalApicMode {
+/// How this machine's local APICs are addressed.
+///
+/// Decided once, on the bootstrap processor, from CPUID and the APIC
+/// base MSR, and carried in every processor's runtime: both reads are
+/// VM exits under KVM, and the answer cannot change after boot. Every
+/// interrupt end and every wake IPI used to re-ask — a `cpuid`, an MSR
+/// read and, for a send, a full re-attach of the local APIC (two more
+/// MSR writes) — so a cross-processor wake cost five exits where the
+/// ICR write is the one that does anything.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LocalApicMode {
     XApic { physical_base: usize },
     X2Apic,
+}
+
+impl LocalApicMode {
+    /// Probes the mode of the local APIC this processor runs on. The
+    /// mode is a property of the machine, so the bootstrap processor
+    /// probes it once and every runtime carries the answer.
+    fn probe() -> Self {
+        let cpuid = __cpuid(1);
+        if cpuid.ecx & (1 << 21) != 0 {
+            return Self::X2Apic;
+        }
+        let base = unsafe { rdmsr(x86::msr::IA32_APIC_BASE) };
+        if base & (1 << 10) != 0 {
+            return Self::X2Apic;
+        }
+        Self::XApic {
+            physical_base: (base as usize) & 0xffff_f000,
+        }
+    }
+
+    /// The xAPIC destination for `apic_id`, which the 8-bit destination
+    /// field of an xAPIC ICR has to be able to name.
+    pub(crate) fn xapic_target(apic_id: u32) -> u8 {
+        u8::try_from(apic_id)
+            .unwrap_or_else(|_| panic!("x86 target apic id {apic_id} requires x2APIC support"))
+    }
 }
 
 pub(crate) fn ensure_local_scheduler_timer(vector: u8) {
@@ -703,11 +954,28 @@ pub(crate) fn ensure_local_scheduler_timer(vector: u8) {
     runtime.ensure_local_timer(vector);
 }
 
-pub(crate) fn handle_local_timer_interrupt() {
+/// What a processor's timer captures, for the kernel's instruction
+/// sampler: one sample per sampling-period interrupt.
+pub(crate) fn instruction_sample_capture(kernel_image_base: u64) -> SampleCapture {
+    SampleCapture {
+        period_nanos: APIC_TIMER_CALIBRATION_MICROS * 1_000 / u64::from(SAMPLES_PER_SCHEDULER_TICK),
+        kernel_image_base,
+    }
+}
+
+/// Handles this processor's timer interrupt, which interrupted the
+/// instruction at `interrupted`.
+pub(crate) fn handle_local_timer_interrupt(interrupted: usize) {
     let runtime = current_runtime();
+    if !runtime.sample_timer_tick(interrupted) {
+        local_apic_eoi();
+        return;
+    }
     runtime.watchdog.pet();
+    // Every processor's tick ends the slice of every guest on the machine
+    // that has run one, so the slice does not need its own interrupt.
     if let Some(service) = runtime.program_service.get() {
-        service.increment_epoch();
+        service.preempt_overdue_guests();
     }
     runtime
         .timer
@@ -772,15 +1040,50 @@ pub(crate) fn shootdown_tlb_range(start: usize, byte_len: usize) {
     }
 }
 
-pub(crate) fn handle_tlb_shootdown_interrupt() {
-    let start = TLB_SHOOTDOWN_START.load(Ordering::Acquire);
-    let byte_len = TLB_SHOOTDOWN_LEN.load(Ordering::Acquire);
+/// Invalidates `byte_len` bytes from `start` on this processor, one
+/// `INVLPG` per page.
+///
+/// Always per page, never a `CR3` reload: an unmap is one task's
+/// memory going away while the other processors run other tasks, and a
+/// whole-TLB flush on them evicts those tasks' translations too. Under
+/// nested paging a refill is a two-dimensional walk, and the paired
+/// lane priced it — a reload past a 33-page ceiling (Linux's
+/// `tlb_single_page_flush_ceiling`, tuned for native refills on the
+/// same address space) cost `fs-smallfiles` its stability and
+/// `stdio-pipe` 17 % on run 35384279049, while the per-page loop keeps
+/// the cost inside the range being torn down.
+pub(crate) fn flush_tlb_range_local(start: usize, byte_len: usize) {
     for offset in (0..byte_len).step_by(PAGE_BYTES) {
         tlb::flush(VirtAddr::new((start + offset) as u64));
     }
+}
+
+pub(crate) fn handle_tlb_shootdown_interrupt() {
+    let start = TLB_SHOOTDOWN_START.load(Ordering::Acquire);
+    let byte_len = TLB_SHOOTDOWN_LEN.load(Ordering::Acquire);
+    flush_tlb_range_local(start, byte_len);
     let bit = processor_bit(usize::from(current_processor().id()));
     TLB_SHOOTDOWN_ACK_MASK.fetch_or(bit, Ordering::AcqRel);
     local_apic_eoi();
+}
+
+/// Sends `icr` through the x2APIC ICR, which is the whole of an x2APIC
+/// IPI: x2APIC mode has no delivery-status bit to poll, and APIC errors
+/// arrive through the LVT error interrupt
+/// ([`handle_apic_error_interrupt`]) rather than by polling the ESR.
+/// Under a hypervisor every x2APIC MSR write is a VM exit, so the
+/// `x86` crate's `X2APIC::send_ipi`, which writes the ESR twice first,
+/// would triple the cost of each IPI.
+///
+/// A WRMSR to an x2APIC register is not serializing, so the fence makes
+/// the stores the receiver reads (the shootdown range, a woken task)
+/// visible before the interrupt is sent.
+unsafe fn send_x2apic_ipi(icr: x86::apic::Icr) {
+    let value = (u64::from(icr.upper()) << 32) | u64::from(icr.lower());
+    unsafe {
+        core::arch::asm!("mfence", "lfence", options(nostack, preserves_flags));
+        wrmsr(IA32_X2APIC_ICR, value);
+    }
 }
 
 /// Send a wake IPI to the processor with the given local-APIC id.
@@ -796,10 +1099,12 @@ pub(crate) fn send_wake_ipi(target_apic_id: u32) {
         Icr, Level, TriggerMode,
     };
     let runtime = current_runtime();
-    match local_apic_mode(target_apic_id) {
+    debug_assert!(
+        runtime.local_apic_attached.load(Ordering::Acquire),
+        "x86 wake IPI sent before this processor attached its local APIC"
+    );
+    match runtime.apic_mode() {
         LocalApicMode::X2Apic => {
-            let mut apic = X2APIC::new();
-            apic.attach();
             let icr = Icr::for_x2apic(
                 crate::exceptions::WAKE_INTERRUPT_VECTOR,
                 ApicId::X2Apic(target_apic_id),
@@ -810,17 +1115,14 @@ pub(crate) fn send_wake_ipi(target_apic_id: u32) {
                 Level::Assert,
                 TriggerMode::Edge,
             );
-            unsafe { apic.send_ipi(icr) };
+            unsafe { send_x2apic_ipi(icr) };
         }
         LocalApicMode::XApic { physical_base } => {
             let apic_region = xapic_mmio_region(physical_base, runtime.physical_memory_offset);
             let mut apic = XAPIC::new(apic_region);
-            apic.attach();
-            let target = u8::try_from(target_apic_id)
-                .unwrap_or_else(|_| panic!("xAPIC wake target id {target_apic_id} exceeds 8 bits"));
             let icr = Icr::for_xapic(
                 crate::exceptions::WAKE_INTERRUPT_VECTOR,
-                ApicId::XApic(target),
+                ApicId::XApic(LocalApicMode::xapic_target(target_apic_id)),
                 DestinationShorthand::NoShorthand,
                 DeliveryMode::Fixed,
                 DestinationMode::Physical,
@@ -839,10 +1141,8 @@ fn send_tlb_shootdown_ipi_all_excluding_self() {
         Icr, Level, TriggerMode,
     };
     let runtime = current_runtime();
-    match local_apic_mode(0) {
+    match runtime.apic_mode() {
         LocalApicMode::X2Apic => {
-            let mut apic = X2APIC::new();
-            apic.attach();
             let icr = Icr::for_x2apic(
                 crate::exceptions::TLB_SHOOTDOWN_INTERRUPT_VECTOR,
                 ApicId::X2Apic(0),
@@ -853,12 +1153,11 @@ fn send_tlb_shootdown_ipi_all_excluding_self() {
                 Level::Assert,
                 TriggerMode::Edge,
             );
-            unsafe { apic.send_ipi(icr) };
+            unsafe { send_x2apic_ipi(icr) };
         }
         LocalApicMode::XApic { physical_base } => {
             let apic_region = xapic_mmio_region(physical_base, runtime.physical_memory_offset);
             let mut apic = XAPIC::new(apic_region);
-            apic.attach();
             let icr = Icr::for_xapic(
                 crate::exceptions::TLB_SHOOTDOWN_INTERRUPT_VECTOR,
                 ApicId::XApic(0),
@@ -886,17 +1185,21 @@ fn processor_bit(processor: usize) -> usize {
 
 fn enable_local_scheduler_timer(vector: u8) {
     let runtime = current_runtime();
-    match local_apic_mode(0) {
+    runtime.attach_local_apic();
+    match runtime.apic_mode() {
         LocalApicMode::X2Apic => {
-            let mut apic = X2APIC::new();
-            apic.attach();
             let initial_count = calibrate_x2apic_timer(runtime.platform_tsc_hz());
+            runtime
+                .scheduler_tick_count
+                .store(initial_count, Ordering::Relaxed);
             program_x2apic_periodic_timer(vector, initial_count);
         }
         LocalApicMode::XApic { physical_base } => {
             let apic_region = xapic_mmio_region(physical_base, runtime.physical_memory_offset);
-            attach_xapic(apic_region);
             let initial_count = calibrate_xapic_timer(apic_region, runtime.platform_tsc_hz());
+            runtime
+                .scheduler_tick_count
+                .store(initial_count, Ordering::Relaxed);
             program_xapic_periodic_timer(apic_region, vector, initial_count);
         }
     }
@@ -909,6 +1212,12 @@ fn attach_xapic(apic_region: &[u32]) {
         wrmsr(IA32_APIC_BASE, base);
     }
     write_xapic_register(apic_region, XAPIC_SVR, (1 << 8) | 15);
+    write_xapic_register(apic_region, XAPIC_ESR, 0);
+    write_xapic_register(
+        apic_region,
+        XAPIC_LVT_ERROR,
+        u32::from(crate::exceptions::APIC_ERROR_INTERRUPT_VECTOR),
+    );
 }
 
 fn calibrate_x2apic_timer(tsc_hz: u64) -> u32 {
@@ -969,6 +1278,42 @@ fn program_xapic_periodic_timer(apic_region: &[u32], vector: u8, initial_count: 
     write_xapic_register(apic_region, XAPIC_TIMER_INIT_COUNT, initial_count);
 }
 
+bitflags::bitflags! {
+    /// The local APIC error status register.
+    #[derive(Debug, Clone, Copy)]
+    struct ApicErrors: u32 {
+        const SEND_CHECKSUM = 1 << 0;
+        const RECEIVE_CHECKSUM = 1 << 1;
+        const SEND_ACCEPT = 1 << 2;
+        const RECEIVE_ACCEPT = 1 << 3;
+        const REDIRECTABLE_IPI = 1 << 4;
+        const SEND_ILLEGAL_VECTOR = 1 << 5;
+        const RECEIVE_ILLEGAL_VECTOR = 1 << 6;
+        const ILLEGAL_REGISTER_ADDRESS = 1 << 7;
+    }
+}
+
+/// Reports local-APIC errors by latching and reading ESR; IPI sends do not poll it.
+pub(crate) fn handle_apic_error_interrupt() -> ! {
+    let runtime = current_runtime();
+    let esr = match runtime.apic_mode() {
+        LocalApicMode::X2Apic => unsafe {
+            wrmsr(IA32_X2APIC_ESR, 0);
+            rdmsr(IA32_X2APIC_ESR) as u32
+        },
+        LocalApicMode::XApic { physical_base } => {
+            let apic_region = xapic_mmio_region(physical_base, runtime.physical_memory_offset);
+            write_xapic_register(apic_region, XAPIC_ESR, 0);
+            read_xapic_register(apic_region, XAPIC_ESR)
+        }
+    };
+    let id = current_processor().id();
+    panic!(
+        "x86 local APIC error interrupt on processor {id}: ESR={esr:#x} {errors:?}",
+        errors = ApicErrors::from_bits_retain(esr)
+    );
+}
+
 fn read_xapic_register(apic_region: &[u32], offset: u32) -> u32 {
     let index = (offset / 4) as usize;
     unsafe { core::ptr::read_volatile(&apic_region[index]) }
@@ -983,7 +1328,7 @@ fn write_xapic_register(apic_region: &[u32], offset: u32, value: u32) {
 
 fn local_apic_eoi() {
     let runtime = current_runtime();
-    match local_apic_mode(0) {
+    match runtime.apic_mode() {
         LocalApicMode::X2Apic => {
             let mut apic = X2APIC::new();
             apic.eoi();
@@ -1014,39 +1359,22 @@ unsafe fn wake_application_processor(
     let startup_vector = u8::try_from(wakeup_page_physical >> 12)
         .unwrap_or_else(|_| panic!("x86 SIPI vector exceeded 8 bits"));
 
-    match local_apic_mode(apic_id) {
+    let runtime = current_runtime();
+    runtime.attach_local_apic();
+    match runtime.apic_mode() {
         LocalApicMode::X2Apic => {
             let mut apic = X2APIC::new();
-            apic.attach();
             send_startup_ipis(&mut apic, ApicId::X2Apic(apic_id), startup_vector, tsc_hz);
         }
         LocalApicMode::XApic { physical_base } => {
             let apic_region = xapic_mmio_region(physical_base, physical_memory_offset);
             let mut apic = XAPIC::new(apic_region);
-            apic.attach();
             let apic_id = u8::try_from(apic_id).map_err(|_| "xAPIC target id exceeded 8 bits")?;
             send_startup_ipis(&mut apic, ApicId::XApic(apic_id), startup_vector, tsc_hz);
         }
     }
 
     Ok(())
-}
-
-fn local_apic_mode(target_apic_id: u32) -> LocalApicMode {
-    let cpuid = __cpuid(1);
-    if cpuid.ecx & (1 << 21) != 0 {
-        return LocalApicMode::X2Apic;
-    }
-    let base = unsafe { rdmsr(x86::msr::IA32_APIC_BASE) };
-    if base & (1 << 10) != 0 {
-        return LocalApicMode::X2Apic;
-    }
-    if target_apic_id <= u8::MAX.into() {
-        return LocalApicMode::XApic {
-            physical_base: (base as usize) & 0xffff_f000,
-        };
-    }
-    panic!("x86 target apic id {target_apic_id} requires x2APIC support")
 }
 
 fn send_startup_ipis(
@@ -1197,11 +1525,11 @@ impl Handler for PhysicalOffsetAcpiHandler {
 
     fn nanos_since_boot(&self) -> u64 {
         let ticks = read_tsc().saturating_sub(self.tsc_base);
-        ticks_to_nanos(ticks, self.tsc_hz)
+        self.timebase.ticks_to_nanos(ticks)
     }
 
     fn stall(&self, microseconds: u64) {
-        let ticks = self.tsc_hz.saturating_mul(microseconds) / 1_000_000;
+        let ticks = self.timebase.frequency().saturating_mul(microseconds) / 1_000_000;
         let deadline = read_tsc().saturating_add(ticks);
         while read_tsc() < deadline {
             core::hint::spin_loop();
@@ -1617,8 +1945,8 @@ unsafe impl FrameAllocator<Size4KiB> for DirectMappedFrameAllocator {
     }
 }
 
-/// One exception stack for one processor, as the byte range the TSS
-/// names the top of.
+/// One exception or interrupt stack for one processor, as the byte
+/// range the TSS names the top of.
 fn exception_stack() -> Range<usize> {
     let base = allocate_aligned_zeroed(EXCEPTION_STACK_BYTES, 16);
     base..base + EXCEPTION_STACK_BYTES

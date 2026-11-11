@@ -122,6 +122,12 @@ check_wasm_imports \
 
 build_wasix_conformance_artifact thread-futex
 build_wasix_conformance_artifact continuation
+build_wasix_conformance_artifact atomic-wait-timeout
+build_wasix_conformance_artifact atomic-wait-kill
+build_wasix_conformance_artifact orphan-threads
+build_wasix_conformance_artifact thread-proc-exit
+build_wasix_conformance_artifact thread-exec
+build_wasix_conformance_artifact thread-trap
 
 run_smoke() {
     local name="$1"
@@ -300,6 +306,107 @@ run_smoke \
     shell \
     -c \
     '/bin/wasix-continuation'
+
+run_smoke \
+    wasix-atomic-wait-timeout \
+    atomic-wait-timeout:ok \
+    -- \
+    --boot-program dash \
+    --boot-program debugger \
+    --boot-program wasix-atomic-wait-timeout \
+    --no-compiler-plugin \
+    shell \
+    -c \
+    '/bin/wasix-atomic-wait-timeout'
+
+run_smoke \
+    wasix-atomic-wait-kill \
+    atomic-wait-kill:ok \
+    -- \
+    --boot-program dash \
+    --boot-program debugger \
+    --boot-program wasix-atomic-wait-kill \
+    --no-compiler-plugin \
+    shell \
+    -c \
+    '/bin/wasix-atomic-wait-kill'
+
+run_smoke \
+    wasix-orphan-threads \
+    orphan-threads:ok \
+    orphan-threads:exit=0 \
+    -- \
+    --boot-program dash \
+    --boot-program debugger \
+    --boot-program wasix-orphan-threads \
+    --no-compiler-plugin \
+    shell \
+    -c \
+    '/bin/wasix-orphan-threads; echo orphan-threads:exit=$?'
+
+run_smoke \
+    wasix-thread-proc-exit \
+    thread-proc-exit:exiting \
+    thread-proc-exit:exit=7 \
+    -- \
+    --boot-program dash \
+    --boot-program debugger \
+    --boot-program wasix-thread-proc-exit \
+    --no-compiler-plugin \
+    shell \
+    -c \
+    '/bin/wasix-thread-proc-exit; echo thread-proc-exit:exit=$?'
+
+run_smoke \
+    wasix-thread-exec \
+    thread-exec:exec \
+    thread-exec:replaced \
+    thread-exec:exit=0 \
+    -- \
+    --boot-program dash \
+    --boot-program debugger \
+    --boot-program wasix-thread-exec \
+    --no-compiler-plugin \
+    shell \
+    -c \
+    '/bin/wasix-thread-exec; echo thread-exec:exit=$?'
+
+# A trap on main fails the process with `IO` (29); the same trap on a
+# spawned thread must end the process with the same status.
+run_smoke \
+    wasix-thread-trap \
+    thread-trap:main-trapping \
+    main-trap:exit=29 \
+    thread-trap:trapping \
+    thread-trap:exit=29 \
+    -- \
+    --boot-program dash \
+    --boot-program debugger \
+    --boot-program wasix-thread-trap \
+    --no-compiler-plugin \
+    shell \
+    -c \
+    '/bin/wasix-thread-trap main; echo main-trap:exit=$?; /bin/wasix-thread-trap; echo thread-trap:exit=$?'
+
+# Only bytes from the boot payload load without a signature check; a
+# cwasm a guest writes must verify (#483). CPython copies a bootfs cwasm
+# unchanged to /copy, which still verifies and runs, and with one
+# signature byte flipped to /forged, which must be refused. A missing
+# /forged is refused too, so the writes must report success.
+run_smoke \
+    unsigned-cwasm \
+    cwasm:written \
+    copy:ran \
+    forged:refused \
+    -- \
+    --boot-program dash \
+    --boot-program debugger \
+    --boot-program python3 \
+    --boot-program wasix-atomic-wait-timeout \
+    --no-compiler-plugin \
+    shell \
+    -c \
+    'python3 -c "import pathlib; b = pathlib.Path(\"/bin/wasix-atomic-wait-timeout\").read_bytes(); pathlib.Path(\"/copy\").write_bytes(b); f = bytearray(b); f[-13] ^= 1; pathlib.Path(\"/forged\").write_bytes(bytes(f))" && echo cwasm:written; /copy && echo copy:ran; /forged && echo forged:ran || echo forged:refused'
 
 run_smoke \
     cpython \

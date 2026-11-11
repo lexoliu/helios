@@ -5,11 +5,12 @@ use core::num::NonZeroU32;
 
 use fdt::Fdt;
 use fdt::node::FdtNode;
+use helios_hal::cpu::Cpu;
 use helios_hal::io::IoError;
 use helios_hal::watchdog::Watchdog;
 use helios_kernel::{
-    ExternalInterruptHandler, ExternalInterruptRoutes, InterfaceCapabilities, InterfaceEventMark,
-    Kernel, LinkState, NetworkDevice, PacketBuffer,
+    DebugSerialInterrupt, ExternalInterruptHandler, ExternalInterruptRoutes, InterfaceCapabilities,
+    InterfaceEventMark, Kernel, LinkState, NetworkDevice, PacketBuffer,
 };
 use plic::Plic;
 
@@ -33,6 +34,11 @@ pub(crate) struct VirtioNetworkDevice {
     cpu: RiscvCpu,
 }
 
+/// The debug UART's route handler, keyed by the port's access type:
+/// it masks the port's receive interrupt through `DebugTransport` and
+/// raises the debug console's receive signal.
+type DebugSerialHandler = DebugSerialInterrupt<crate::DebugTransport>;
+
 pub(crate) struct ExternalInterrupts {
     plic: &'static Plic,
     context: PlicContext,
@@ -47,6 +53,7 @@ pub(crate) struct ExternalInterrupts {
         crate::input::VirtioInputDevice,
         crate::snd::VirtioSoundDevice,
         crate::block::VirtioBlockDevice,
+        DebugSerialHandler,
     >,
 }
 
@@ -78,12 +85,22 @@ pub(crate) fn install_network_service<WatchdogImpl>(
 where
     WatchdogImpl: Watchdog + Clone,
 {
-    let Some((device, source)) = discover_network_device(cpu, fdt) else {
+    // The pair budget is the processor count: every activated pair is
+    // drained by the one packet pump its owning hart runs, so a device
+    // advertising more pairs than the machine has harts is clamped to
+    // what has a pump rather than left to collect frames nobody drains.
+    let pair_budget = helios_virtio::QueuePairBudget::new(cpu.processor_count());
+    let Some((device, source)) = discover_network_device(cpu, fdt, pair_budget) else {
         tracing::warn!("virtio network device was not discovered on the platform bus");
         return None;
     };
     kernel.install_network_interface(debug_state, device.clone());
-    tracing::info!("virtio network online irq={}", source.0.get());
+    tracing::info!(
+        pair_budget = pair_budget.get(),
+        queue_pairs = device.queue_pair_count(),
+        "virtio network online irq={}",
+        source.0.get()
+    );
     Some(NetworkInterrupt { source, device })
 }
 
@@ -143,6 +160,18 @@ impl ExternalInterrupts {
     pub(crate) fn attach_block(&mut self, interrupt: crate::block::BlockInterrupt) {
         self.enable_source(interrupt.source);
         self.routes.add_block(interrupt.source, interrupt.device);
+    }
+
+    /// Route the debug UART's source; the handler masks the port's
+    /// receive line and raises the debug console's receive signal in
+    /// interrupt context.
+    pub(crate) fn attach_debug_serial(
+        &mut self,
+        source: InterruptSourceId,
+        handler: DebugSerialHandler,
+    ) {
+        self.enable_source(source);
+        self.routes.set_debug_serial(source, handler);
     }
 
     fn enable_source(&self, source: InterruptSourceId) {
@@ -314,6 +343,7 @@ impl plic::InterruptSource for InterruptSourceId {
 fn discover_network_device(
     cpu: &RiscvCpu,
     fdt: &Fdt<'_>,
+    pair_budget: helios_virtio::QueuePairBudget,
 ) -> Option<(VirtioNetworkDevice, InterruptSourceId)> {
     let candidate = helios_virtio::mmio_candidates(fdt).find(|candidate| {
         crate::matches_virtio_mmio_device(candidate.base, helios_virtio::DeviceType::Network)
@@ -326,8 +356,8 @@ fn discover_network_device(
         .and_then(|interrupt| NonZeroU32::new(interrupt.number))
         .map(InterruptSourceId)
         .unwrap_or_else(|| panic!("virtio-net node at {base:#x} has no valid interrupt source"));
-    let device =
-        unsafe { helios_virtio::net_from_mmio(header, candidate.size) }.unwrap_or_else(|error| {
+    let device = unsafe { helios_virtio::net_from_mmio(header, candidate.size, pair_budget) }
+        .unwrap_or_else(|error| {
             panic!("failed to initialize virtio-net device at {base:#x}: {error}")
         });
     Some((

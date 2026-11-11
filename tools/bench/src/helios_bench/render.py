@@ -8,7 +8,15 @@ from pathlib import Path
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
 from helios_bench import PACKAGE_ROOT
-from helios_bench.gate import GATE_TITLES, Direction, GateKind, GateReport
+from helios_bench.gate import (
+    GATE_TITLES,
+    UNDERPROFILED_SHARE,
+    Direction,
+    GateKind,
+    GateReport,
+    GateRow,
+    format_period,
+)
 from helios_bench.report import CLASS_LABELS, SIDE_LABELS, Report, Side, WorkloadClass
 
 TEMPLATES_ROOT = PACKAGE_ROOT / "templates"
@@ -39,6 +47,17 @@ def format_percent(value: float) -> str:
     return f"{value * 100:+.1f}%"
 
 
+def format_floor(row: GateRow) -> str:
+    """The floor a row was judged against, in its own unit, and its source."""
+    amount = f"{row.floor * 100:.1f}%" if row.relative_floor else f"{row.floor:,.0f} B"
+    return f"{amount} {row.floor_source}"
+
+
+def format_seconds(value: float) -> str:
+    """A count of seconds, for the budget the retry was sized against."""
+    return f"{value:.0f} s"
+
+
 def environment() -> Environment:
     env = Environment(
         loader=FileSystemLoader(TEMPLATES_ROOT),
@@ -52,6 +71,9 @@ def environment() -> Environment:
     env.filters["ci"] = format_ci
     env.filters["speedup"] = format_speedup
     env.filters["percent"] = format_percent
+    env.filters["seconds"] = format_seconds
+    env.filters["floor"] = format_floor
+    env.filters["period"] = format_period
     env.globals["Side"] = Side
     env.globals["SIDE_LABELS"] = SIDE_LABELS
     env.globals["CLASS_LABELS"] = CLASS_LABELS
@@ -59,6 +81,7 @@ def environment() -> Environment:
     env.globals["GateKind"] = GateKind
     env.globals["GATE_TITLES"] = GATE_TITLES
     env.globals["Direction"] = Direction
+    env.globals["UNDERPROFILED_SHARE"] = UNDERPROFILED_SHARE
     return env
 
 

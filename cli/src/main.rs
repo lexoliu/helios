@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
@@ -8,6 +9,7 @@ use askama::Template;
 use clap::{Parser, Subcommand, ValueEnum};
 use ed25519_dalek::{SecretKey, SigningKey, VerifyingKey};
 use fatfs::{FatType, FileSystem, FormatVolumeOptions, FsOptions};
+use helios_artifact::bootfs::{self, WriteEntry};
 use helios_artifact::{TrailerError, cwasm_target_supports_wasm_simd, sign_payload_with_key};
 use helios_compiler_support::{AotCompileHint, CompileError, precompile_artifact};
 use helios_profdata::{
@@ -22,6 +24,8 @@ use toml::Value;
 use walkdir::WalkDir;
 use wasmparser::Parser as WasmParser;
 use wit_component::ComponentEncoder;
+
+mod boot_kernel;
 
 /// Why a `helios-cli` invocation did not do what it was asked.
 ///
@@ -128,7 +132,18 @@ enum KeyError {
         #[source]
         source: rand::rngs::SysError,
     },
+    #[error(
+        "{path} is a secret key with mode {mode:03o}; it must be readable by its owner alone (600)"
+    )]
+    SecretKeyExposed { path: String, mode: u32 },
 }
+
+/// The mode a secret key file is created with: its owner reads and writes
+/// it, and nobody else can open it.
+const SECRET_KEY_MODE: u32 = 0o600;
+
+/// The permission bits of everyone but the owner.
+const GROUP_AND_OTHER: u32 = 0o077;
 
 /// Why the kernel-prebuild manifest and the bootfs it describes could
 /// not be produced.
@@ -359,6 +374,14 @@ enum BootfsError {
     },
     #[error("{path} is not valid UTF-8")]
     PathNotUtf8 { path: String },
+    #[error("failed to walk bootfs root {path}: {source}")]
+    WalkBootfsRoot {
+        path: String,
+        #[source]
+        source: walkdir::Error,
+    },
+    #[error("modification time of {path} is not representable as nanoseconds since the epoch")]
+    ModifiedBeforeEpoch { path: String },
     #[error("failed to read directory {path}: {source}")]
     ReadDir {
         path: String,
@@ -372,6 +395,12 @@ enum BootfsError {
 enum LimineError {
     #[error("failed to canonicalize kernel {path}: {source}")]
     CanonicalizeKernel {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to canonicalize bootfs payload {path}: {source}")]
+    CanonicalizeBootfs {
         path: String,
         #[source]
         source: io::Error,
@@ -445,6 +474,8 @@ enum LimineError {
         #[source]
         source: io::Error,
     },
+    #[error(transparent)]
+    BootKernel(#[from] boot_kernel::BootKernelError),
     #[error("failed to write {path}: {source}")]
     WriteFatEntry {
         path: &'static str,
@@ -480,6 +511,9 @@ enum LimineError {
 const ROOT_SECRET_FILE: &str = "helios-root-secret.key";
 const ROOT_PUBLIC_FILE: &str = "helios-root-public.key";
 const PREBUILD_MANIFEST_FILE: &str = "kernel-prebuild.json";
+/// The payload `kernel-prebuild` writes beside the manifest: the whole
+/// user payload the kernel used to link in, delivered as a boot module.
+const BOOTFS_IMAGE_FILE: &str = "helios-bootfs";
 const DEFAULT_INIT_ARGV0: &str = "/init.wasm";
 const DEFAULT_BOOT_ARTIFACTS_MANIFEST: &str = "tools/wasi-apps/boot-artifacts.toml";
 /// Why the kernel profile did not reach the store.
@@ -697,6 +731,10 @@ struct KernelPrebuildCommand {
 struct LimineUefiImageCommand {
     #[arg(long)]
     kernel: PathBuf,
+    /// The `helios-bootfs` payload `kernel-prebuild` wrote; it lands at
+    /// `/boot/helios-bootfs` and the entry names it as a Limine module.
+    #[arg(long)]
+    bootfs: PathBuf,
     #[arg(long)]
     output: PathBuf,
     #[arg(long)]
@@ -748,6 +786,7 @@ struct PrebuildManifest {
     init_component: PathBuf,
     init_argv0: String,
     bootfs_root: PathBuf,
+    bootfs: PathBuf,
     root_public_key: PathBuf,
     root_secret_key: PathBuf,
     bootfs_assets: Vec<BootAsset>,
@@ -942,6 +981,15 @@ fn run_kernel_prebuild(
         &boot_artifacts_manifest,
     )?);
 
+    let bootfs_path = command.out_dir.join(BOOTFS_IMAGE_FILE);
+    write_bootfs_image(
+        &bootfs_path,
+        &bootfs_root,
+        &bootfs_assets,
+        &init_cwasm,
+        &command.init_argv0,
+    )?;
+
     let resolve = |path: &Path| {
         fs::canonicalize(path).map_err(|source| PrebuildError::Resolve {
             path: path.display().to_string(),
@@ -953,6 +1001,7 @@ fn run_kernel_prebuild(
         init_component: resolve(&init_cwasm)?,
         init_argv0: command.init_argv0,
         bootfs_root: resolve(&bootfs_root)?,
+        bootfs: resolve(&bootfs_path)?,
         root_public_key: resolve(&root_public_path)?,
         root_secret_key: resolve(&root_secret_path)?,
         bootfs_assets,
@@ -967,14 +1016,163 @@ fn run_kernel_prebuild(
     Ok(())
 }
 
+/// Serialises the bootfs the kernel used to embed into one
+/// `helios-bootfs` image at `image_path`.
+///
+/// The entry set is the one the manifest lists: every file under
+/// `bootfs_root`, every built asset, and the two distinguished entries —
+/// the init component and its `argv0`. Only empty directories get an
+/// entry; a directory holding a file exists implicitly, which is the
+/// same rule the kernel's bootfs view has always applied.
+fn write_bootfs_image(
+    image_path: &Path,
+    bootfs_root: &Path,
+    assets: &[BootAsset],
+    init_component: &Path,
+    init_argv0: &str,
+) -> Result<(), PrebuildError> {
+    let mut directories = Vec::new();
+    let mut files = Vec::new();
+    for entry in WalkDir::new(bootfs_root).sort_by_file_name() {
+        let entry = entry.map_err(|source| BootfsError::WalkBootfsRoot {
+            path: bootfs_root.display().to_string(),
+            source,
+        })?;
+        let path = entry.path();
+        if path == bootfs_root {
+            continue;
+        }
+        let relative = path
+            .strip_prefix(bootfs_root)
+            .map_err(|_| BootfsError::PathNotUtf8 {
+                path: path.display().to_string(),
+            })?
+            .to_str()
+            .ok_or_else(|| BootfsError::PathNotUtf8 {
+                path: path.display().to_string(),
+            })?
+            .replace('\\', "/");
+        if path.is_dir() {
+            if !is_empty_directory(path)? {
+                continue;
+            }
+            directories.push((relative, file_modified_nanos(path)?));
+        } else if path.is_file() {
+            files.push((relative, path.to_path_buf(), file_modified_nanos(path)?));
+        }
+    }
+    for asset in assets {
+        match asset.kind {
+            BootAssetKind::Directory => {
+                directories.push((asset.path.clone(), file_modified_nanos(&asset.source)?));
+            }
+            BootAssetKind::File => {
+                files.push((
+                    asset.path.clone(),
+                    asset.source.clone(),
+                    file_modified_nanos(&asset.source)?,
+                ));
+            }
+        }
+    }
+    directories.sort_by(|left, right| left.0.cmp(&right.0));
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let init_name = init_component
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| BootfsError::PathNotUtf8 {
+            path: init_component.display().to_string(),
+        })?
+        .to_owned();
+    let read = |path: &Path| {
+        fs::read(path).map_err(|source| BootfsError::Read {
+            path: path.display().to_string(),
+            source,
+        })
+    };
+    let init_bytes = read(init_component)?;
+
+    // Entry payloads are read into memory here rather than streamed:
+    // the writer needs each blob's length before it lays the image out,
+    // and bootfs files are small signed artifacts.
+    let mut contents = Vec::with_capacity(files.len());
+    for (_, source, _) in &files {
+        contents.push(read(source)?);
+    }
+
+    let mut entries = Vec::with_capacity(directories.len() + files.len() + 2);
+    for (path, modified_nanos) in &directories {
+        entries.push(WriteEntry {
+            kind: bootfs::EntryKind::Directory,
+            path,
+            data: b"",
+            modified_nanos: *modified_nanos,
+        });
+    }
+    for ((path, _, modified_nanos), data) in files.iter().zip(&contents) {
+        entries.push(WriteEntry {
+            kind: bootfs::EntryKind::File,
+            path,
+            data,
+            modified_nanos: *modified_nanos,
+        });
+    }
+    entries.push(WriteEntry {
+        kind: bootfs::EntryKind::InitComponent,
+        path: &init_name,
+        data: &init_bytes,
+        modified_nanos: file_modified_nanos(init_component)?,
+    });
+    entries.push(WriteEntry {
+        kind: bootfs::EntryKind::InitArgv0,
+        path: init_argv0,
+        data: b"",
+        modified_nanos: 0,
+    });
+
+    fs::write(image_path, bootfs::write_image(&entries)).map_err(|source| PrebuildError::Write {
+        path: image_path.display().to_string(),
+        source,
+    })
+}
+
+/// Modification time of `path` in nanoseconds since the Unix epoch, the
+/// timestamp a bootfs entry carries.
+fn file_modified_nanos(path: &Path) -> Result<u64, BootfsError> {
+    let modified = fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .map_err(|source| BootfsError::Read {
+            path: path.display().to_string(),
+            source,
+        })?;
+    let duration = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| BootfsError::ModifiedBeforeEpoch {
+            path: path.display().to_string(),
+        })?;
+    duration
+        .as_secs()
+        .checked_mul(1_000_000_000)
+        .and_then(|seconds| seconds.checked_add(u64::from(duration.subsec_nanos())))
+        .ok_or_else(|| BootfsError::ModifiedBeforeEpoch {
+            path: path.display().to_string(),
+        })
+}
+
 fn run_limine_uefi_image(command: LimineUefiImageCommand) -> Result<(), LimineError> {
     let kernel =
         fs::canonicalize(&command.kernel).map_err(|source| LimineError::CanonicalizeKernel {
             path: command.kernel.display().to_string(),
             source,
         })?;
+    let bootfs =
+        fs::canonicalize(&command.bootfs).map_err(|source| LimineError::CanonicalizeBootfs {
+            path: command.bootfs.display().to_string(),
+            source,
+        })?;
     let limine = LimineToolchain::discover(command.efi_arch)?;
-    build_limine_uefi_image(&limine, &kernel, &command.output, command.baud)
+    build_limine_uefi_image(&limine, &kernel, &bootfs, &command.output, command.baud)
 }
 
 struct LimineToolchain {
@@ -1027,10 +1225,14 @@ fn limine_datadir(executable: &Path) -> Option<PathBuf> {
 fn build_limine_uefi_image(
     limine: &LimineToolchain,
     kernel: &Path,
+    bootfs: &Path,
     image: &Path,
     baud: u32,
 ) -> Result<(), LimineError> {
-    let image_bytes = limine_image_bytes(kernel, &limine.efi_bootloader)?;
+    // The disk carries the image without its DWARF; the host keeps the
+    // full file to symbolize against (`boot_kernel`).
+    let kernel = boot_kernel::without_debuginfo(kernel)?;
+    let image_bytes = limine_image_bytes(&kernel, bootfs, &limine.efi_bootloader)?;
     if let Some(parent) = image.parent().filter(|path| !path.as_os_str().is_empty()) {
         fs::create_dir_all(parent).map_err(|source| LimineError::CreateImageDir {
             path: parent.display().to_string(),
@@ -1054,10 +1256,14 @@ fn build_limine_uefi_image(
             source,
         })?;
     write_limine_mbr(&mut image_file, image_bytes)?;
-    write_limine_fat_volume(&mut image_file, image_bytes, kernel, limine, baud)
+    write_limine_fat_volume(&mut image_file, image_bytes, &kernel, bootfs, limine, baud)
 }
 
-fn limine_image_bytes(kernel: &Path, efi_bootloader: &Path) -> Result<u64, LimineError> {
+fn limine_image_bytes(
+    kernel: &[u8],
+    bootfs: &Path,
+    efi_bootloader: &Path,
+) -> Result<u64, LimineError> {
     let inspect = |path: &Path| {
         fs::metadata(path)
             .map(|metadata| metadata.len())
@@ -1066,7 +1272,8 @@ fn limine_image_bytes(kernel: &Path, efi_bootloader: &Path) -> Result<u64, Limin
                 source,
             })
     };
-    let payload_bytes = inspect(kernel)? + inspect(efi_bootloader)?;
+    let kernel = u64::try_from(kernel.len()).expect("a kernel image held in memory fits u64");
+    let payload_bytes = kernel + inspect(bootfs)? + inspect(efi_bootloader)?;
     Ok(LIMINE_IMAGE_BYTES.max(payload_bytes + 128 * 1024 * 1024))
 }
 
@@ -1093,7 +1300,8 @@ fn write_limine_mbr(image: &mut fs::File, image_bytes: u64) -> Result<(), Limine
 fn write_limine_fat_volume(
     image: &mut fs::File,
     image_bytes: u64,
-    kernel: &Path,
+    kernel: &[u8],
+    bootfs: &Path,
     limine: &LimineToolchain,
     baud: u32,
 ) -> Result<(), LimineError> {
@@ -1153,7 +1361,15 @@ fn write_limine_fat_volume(
         file.write_all(config.as_bytes())
             .map_err(|source| LimineError::WriteFatEntry { path, source })?;
     }
-    write_file_to_fat(&boot, "helios", kernel)?;
+    let path = "/boot/helios";
+    let mut file = boot
+        .create_file("helios")
+        .map_err(|source| LimineError::CreateFatEntry { path, source })?;
+    file.write_all(kernel)
+        .map_err(|source| LimineError::WriteFatEntry { path, source })?;
+    // The user payload, handed to the kernel as a Limine module — the
+    // entry's `module_path` names this path.
+    write_file_to_fat(&boot, "helios-bootfs", bootfs)?;
     Ok(())
 }
 
@@ -1919,31 +2135,52 @@ fn ensure_root_keypair(
             .try_fill_bytes(&mut secret)
             .map_err(|source| KeyError::Entropy { source })?;
         let signing_key = SigningKey::from_bytes(&secret);
-        fs::write(root_secret_path, signing_key.to_bytes()).map_err(|source| KeyError::Write {
-            path: root_secret_path.display().to_string(),
-            source,
-        })?;
+        // The mode is set by the call that creates the file, so the secret
+        // is never on disk under the process umask.
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(SECRET_KEY_MODE)
+            .open(root_secret_path)
+            .and_then(|mut file| file.write_all(&signing_key.to_bytes()))
+            .map_err(|source| KeyError::Write {
+                path: root_secret_path.display().to_string(),
+                source,
+            })?;
         signing_key
     };
-    // The public key is rewritten either way: it is the copy the kernel
-    // verifies against, and a secret that outlived its public half would
-    // otherwise sign artifacts nothing can check.
-    fs::write(
-        root_public_path,
-        VerifyingKey::from(&signing_key).to_bytes(),
-    )
-    .map_err(|source| KeyError::Write {
-        path: root_public_path.display().to_string(),
-        source,
-    })?;
+    // The public key always lands next to the secret: it is the copy the
+    // kernel verifies against, and a secret that outlived its public half
+    // would otherwise sign artifacts nothing can check. The write is
+    // skipped when the bytes already match — a kernel build tracks the
+    // file through `cargo:rerun-if-changed`, and an untouched mtime is
+    // what keeps a payload-only prebuild from recompiling it.
+    let public_bytes = VerifyingKey::from(&signing_key).to_bytes();
+    if fs::read(root_public_path).ok().as_deref() != Some(public_bytes.as_slice()) {
+        fs::write(root_public_path, public_bytes).map_err(|source| KeyError::Write {
+            path: root_public_path.display().to_string(),
+            source,
+        })?;
+    }
     Ok(signing_key)
 }
 
 fn read_signing_key(path: &Path) -> Result<SigningKey, KeyError> {
-    let bytes = fs::read(path).map_err(|source| KeyError::Read {
+    let read_error = |source| KeyError::Read {
         path: path.display().to_string(),
         source,
-    })?;
+    };
+    let mut file = fs::File::open(path).map_err(read_error)?;
+    // Judged on the open handle, so the file read is the file checked.
+    let mode = file.metadata().map_err(read_error)?.permissions().mode() & 0o777;
+    if mode & GROUP_AND_OTHER != 0 {
+        return Err(KeyError::SecretKeyExposed {
+            path: path.display().to_string(),
+            mode,
+        });
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(read_error)?;
     let secret_bytes: [u8; 32] =
         bytes
             .as_slice()
@@ -1958,6 +2195,32 @@ fn read_signing_key(path: &Path) -> Result<SigningKey, KeyError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_new_root_secret_is_readable_by_its_owner_alone() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let secret = dir.path().join(ROOT_SECRET_FILE);
+        ensure_root_keypair(&secret, &dir.path().join("root.pub")).expect("a new keypair");
+        let mode = fs::metadata(&secret)
+            .expect("the secret was written")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, SECRET_KEY_MODE);
+    }
+
+    #[test]
+    fn a_root_secret_others_can_read_is_refused_with_its_mode() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let secret = dir.path().join(ROOT_SECRET_FILE);
+        fs::write(&secret, [7_u8; 32]).expect("a key file");
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o644)).expect("a wider mode");
+        let error = ensure_root_keypair(&secret, &dir.path().join("root.pub"))
+            .expect_err("a world-readable secret is refused");
+        assert!(
+            matches!(error, KeyError::SecretKeyExposed { mode: 0o644, .. }),
+            "{error}"
+        );
+    }
 
     #[test]
     fn every_shape_of_github_token_makes_a_header_line() {

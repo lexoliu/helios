@@ -573,19 +573,74 @@ pub struct SocketReadiness {
     pub hangup: bool,
 }
 
+/// What a non-parking poll of a TCP stream's receive queue found.
+///
+/// The tri-state a `read` that must never block resolves to: bytes to
+/// hand the caller, the peer's send side done, or nothing ready — which
+/// is the caller's signal to park on the stream's readiness, not to poll
+/// again.
+pub enum TcpReadProgress {
+    Pending,
+    Data(Bytes),
+    Eof,
+}
+
+/// What a TCP stream's send side answered — the send twin of
+/// [`TcpReadProgress`], reported by the `tcp_send_room` probe and by
+/// `tcp_try_write` itself.
+///
+/// `Pending` is the one answer that changes without the connection
+/// ending: the send queue is full and the next drain frees it, so the
+/// caller parks on the stream's readiness. `Room` carries a byte count
+/// — the capacity a `write` may queue when the probe answered, the
+/// count the write just queued when `tcp_try_write` answered. `Closed`
+/// is a connection that cannot send again — this side's shutdown, the
+/// peer's reset, the retransmission limit — and carries the error its
+/// next write reports, so a waiter resolves and names the state instead
+/// of sleeping through it.
+#[derive(Debug)]
+pub enum TcpWriteProgress {
+    Pending,
+    Room(usize),
+    Closed(TcpError),
+}
+
 /// What the component host needs of the machine's network service.
 ///
 /// The host is generic over this the way it is generic over
 /// [`helios_hal::cpu::Cpu`]: the backend names the one service its
 /// machine has, and every socket call from a component compiles to a
 /// direct call on it. The trait carries nothing of its own — it names
-/// the pair of contracts together so a generic item that only passes
-/// the service along spells one bound instead of two.
-pub trait ComponentHostNetwork: ComponentNetworkService + crate::NetworkAdminBackend {}
+/// the contracts together so a generic item that only passes the
+/// service along spells one bound instead of three.
+pub trait ComponentHostNetwork:
+    ComponentNetworkService + crate::NetworkAdminBackend + NetworkPacketPump
+{
+}
 
 impl<Service> ComponentHostNetwork for Service where
-    Service: ComponentNetworkService + crate::NetworkAdminBackend
+    Service: ComponentNetworkService + crate::NetworkAdminBackend + NetworkPacketPump
 {
+}
+
+/// The queue-pair packet pump a network service runs per processor.
+///
+/// A queue pair's interrupt is routed to one processor, so the pump
+/// that drains the pair is pinned to it: every processor calls this
+/// once from its own run loop through `spawn_local_detached`, and the
+/// service either runs the pump for the pair the processor owns or
+/// returns at once. Which pair a processor owns is decided from the
+/// topology inside the service, never by which task got there first —
+/// with more processors than pairs, only the lowest processor mapped
+/// to each pair runs a pump.
+pub trait NetworkPacketPump {
+    /// Runs the packet pump for the queue pair `processor` owns, for as
+    /// long as the interface lives — or completes immediately when the
+    /// processor owns no pair.
+    fn run_packet_pump(
+        &self,
+        processor: helios_hal::cpu::ProcessorId,
+    ) -> impl Future<Output = ()> + Send + '_;
 }
 
 /// A network handle's stable numeric name.
@@ -737,6 +792,66 @@ pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
         timeout_nanos: u64,
     ) -> impl Future<Output = Result<Option<Bytes>, TcpError>> + Send + 'a;
 
+    /// Drains up to `max_bytes` of what `stream`'s receive queue already
+    /// holds, without parking and without driving the device.
+    ///
+    /// This is the non-blocking `read` of a socket-backed byte stream: it
+    /// runs on the guest task's own poll, so the only bytes it may report
+    /// are the ones already delivered to the shard — anything still in
+    /// the device's rings belongs to the readiness wait that follows a
+    /// `Pending` answer. A drain that relieves receive backpressure
+    /// raises the shard's arrival signal itself.
+    fn tcp_try_read(
+        &self,
+        stream: Self::TcpStream,
+        max_bytes: usize,
+    ) -> Result<TcpReadProgress, TcpError>;
+
+    /// What `stream`'s send side does with a write right now — the
+    /// permit a stream reports.
+    ///
+    /// `Room` is the byte count a `write` may queue without parking,
+    /// `Pending` is a full send queue on a live connection, and `Closed`
+    /// is a connection that cannot send again — so a caller parking on
+    /// the answer does not sleep through a shutdown.
+    fn tcp_send_room(&self, stream: Self::TcpStream) -> Result<TcpWriteProgress, TcpError>;
+
+    /// Queues up to `bytes.len()` on `stream`'s send path and publishes
+    /// it synchronously: the stack's segment production, the egress drain
+    /// onto the rings and the doorbell all run on the caller's own poll.
+    /// `Room` is the count `bytes` gave up; whatever did not fit stays
+    /// in `bytes` for the caller to park or complete later. `Pending`
+    /// and `Closed` are a queue that took nothing, classified under the
+    /// same lock that ran the write: a full send queue on a live
+    /// connection, or a send side that cannot send again — so the one
+    /// call answers what a separate probe would take a second lock to
+    /// say.
+    ///
+    /// Synchronous because a guest stream's `write` may not block:
+    /// everything it touches — the shard lock, the ring's `try_lock`
+    /// submit — is held for the call and released before it returns.
+    fn tcp_try_write(
+        &self,
+        stream: Self::TcpStream,
+        bytes: &mut Bytes,
+    ) -> Result<TcpWriteProgress, TcpError>;
+
+    /// Resolves when `stream`'s send queue has room, when the send side
+    /// can no longer send, or when the stream is gone — a socket-backed
+    /// output stream's readiness wait.
+    ///
+    /// A dead send side resolves the wait rather than failing it: the
+    /// pollable contract is that a closed stream is ready, and the
+    /// accessor that follows reports the state. The implementation
+    /// samples the owning shard's arrival mark and the queue pair's
+    /// event mark before it probes the send queue, so an ACK — or a
+    /// reset — another processor drains between the probe and the park
+    /// resolves the wait rather than being slept through.
+    fn tcp_write_ready(
+        &self,
+        stream: Self::TcpStream,
+    ) -> impl Future<Output = Result<(), TcpError>> + Send + '_;
+
     fn tcp_read_into<'a>(
         &'a self,
         stream: Self::TcpStream,
@@ -860,6 +975,33 @@ pub struct HostDirEntry {
     pub is_directory: bool,
 }
 
+/// How much of one directory the caller of [`HostFileSystem::read_dir`] is
+/// prepared to hold. The host is the source of the listing and decides how
+/// long it is, so the caller states what it can afford; a listing that goes
+/// past either bound fails with [`HostFsError::DirectoryTooLarge`] instead
+/// of being cut short.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostDirLimit {
+    /// Most entries one listing may hold.
+    pub max_entries: usize,
+    /// Most bytes of entry names one listing may hold in total.
+    pub max_name_bytes: usize,
+}
+
+impl HostDirLimit {
+    /// Fails when a listing of `entries` entries whose names total
+    /// `name_bytes` bytes is past either bound.
+    pub fn check(self, entries: usize, name_bytes: usize) -> Result<(), HostFsError> {
+        if entries > self.max_entries || name_bytes > self.max_name_bytes {
+            return Err(HostFsError::DirectoryTooLarge {
+                max_entries: self.max_entries,
+                max_name_bytes: self.max_name_bytes,
+            });
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct AuthorityDomain(u64);
 
@@ -933,6 +1075,14 @@ pub enum HostFsError {
     Server(u32),
     #[error("invalid utf-8")]
     Utf8,
+    #[error(
+        "directory listing exceeds the caller's limit of {max_entries} entries or \
+         {max_name_bytes} name bytes"
+    )]
+    DirectoryTooLarge {
+        max_entries: usize,
+        max_name_bytes: usize,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -963,7 +1113,8 @@ impl HostFsError {
             | HostFsError::Transport(IoError::OutOfBounds)
             | HostFsError::Transport(IoError::DeviceFault)
             | HostFsError::Protocol(_)
-            | HostFsError::Utf8 => HostFsErrorKind::Io,
+            | HostFsError::Utf8
+            | HostFsError::DirectoryTooLarge { .. } => HostFsErrorKind::Io,
             HostFsError::Server(code) => match code {
                 2 => HostFsErrorKind::NoEntry,
                 17 => HostFsErrorKind::Exist,
@@ -985,9 +1136,12 @@ pub trait HostFileSystem: Clone + Send + 'static {
         &'a self,
         path: &'a str,
     ) -> impl Future<Output = Result<HostMetadata, HostFsError>> + Send + 'a;
+    /// Lists `path`, failing with [`HostFsError::DirectoryTooLarge`] when the
+    /// directory is past `limit`.
     fn read_dir<'a>(
         &'a self,
         path: &'a str,
+        limit: HostDirLimit,
     ) -> impl Future<Output = Result<Vec<HostDirEntry>, HostFsError>> + Send + 'a;
     fn read_file<'a>(
         &'a self,

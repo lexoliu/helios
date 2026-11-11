@@ -39,7 +39,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use lru::LruCache;
 use spin::Mutex as SpinMutex;
 
-use crate::{HostDirEntry, HostMetadata};
+use crate::{HostDirEntry, HostMetadata, ProfileSink};
 
 /// How long an answer from the host stays authoritative.
 ///
@@ -181,6 +181,10 @@ pub(super) struct HostFsCache {
     directories: SpinMutex<DirectoryTable>,
     read_fids: SpinMutex<LruCache<String, ReadFidEntry>>,
     counters: Counters,
+    /// The perf history `cache-hit`/`cache-miss` outcomes record into —
+    /// the client's sink, handed in at construction the way the
+    /// network service's is.
+    profiles: ProfileSink,
 }
 
 /// Directory listings, bounded by listing count and by total entries.
@@ -190,7 +194,7 @@ struct DirectoryTable {
 }
 
 impl HostFsCache {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(profiles: ProfileSink) -> Self {
         Self {
             attributes: SpinMutex::new(LruCache::new(capacity(ATTRIBUTE_CACHE_ENTRIES))),
             directories: SpinMutex::new(DirectoryTable {
@@ -199,6 +203,7 @@ impl HostFsCache {
             }),
             read_fids: SpinMutex::new(LruCache::new(capacity(READ_FID_POOL_ENTRIES))),
             counters: Counters::default(),
+            profiles,
         }
     }
 
@@ -207,7 +212,17 @@ impl HostFsCache {
     }
 
     /// Looks up what the host last said about `path`.
+    ///
+    /// The one point every attribute question — a stat, a read's size
+    /// probe — passes through, so it is where the `kernel;hostfs;`
+    /// `cache-hit`/`cache-miss` counters are recorded.
     pub(super) fn attributes(&self, path: &str, now_nanos: u64) -> CachedAttributes {
+        let answer = self.lookup_attributes(path, now_nanos);
+        self.record_lookup(!matches!(answer, CachedAttributes::Unknown));
+        answer
+    }
+
+    fn lookup_attributes(&self, path: &str, now_nanos: u64) -> CachedAttributes {
         let Some(key) = cache_key(path) else {
             Counters::bump(&self.counters.attribute_misses);
             return CachedAttributes::Unknown;
@@ -234,6 +249,23 @@ impl HostFsCache {
                 CachedAttributes::Absent
             }
         }
+    }
+
+    /// Records one attribute-table outcome under `kernel;hostfs;`.
+    ///
+    /// A lookup is a table read with no interval to time, so only the
+    /// count means anything: the sample carries one event and no
+    /// nanos, bytes or counter deltas.
+    fn record_lookup(&self, hit: bool) {
+        self.profiles.record_perf_metric_parts(
+            crate::ProfileScope::Kernel,
+            "kernel;hostfs;",
+            if hit { "cache-hit" } else { "cache-miss" },
+            crate::PerfSample {
+                events: 1,
+                ..crate::PerfSample::default()
+            },
+        );
     }
 
     /// Records what an `Rgetattr` said about `path`.
@@ -516,6 +548,7 @@ impl core::fmt::Display for HostFsCacheStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::test_profile_sink;
     use alloc::string::ToString;
 
     fn metadata(size: u64) -> HostMetadata {
@@ -565,7 +598,7 @@ mod tests {
     /// has to reach the same directory listing a rooted read cached.
     #[test]
     fn an_unrooted_spelling_still_invalidates_the_parent_listing() {
-        let cache = HostFsCache::new();
+        let cache = HostFsCache::new(test_profile_sink());
         cache.insert_directory(
             "/",
             &[HostDirEntry {
@@ -585,7 +618,7 @@ mod tests {
 
     #[test]
     fn an_attribute_entry_expires_with_its_ttl() {
-        let cache = HostFsCache::new();
+        let cache = HostFsCache::new(test_profile_sink());
         cache.insert_attributes("/alpha", &metadata(7), 0);
 
         assert!(matches!(
@@ -600,7 +633,7 @@ mod tests {
 
     #[test]
     fn a_negative_entry_answers_without_asking_the_host() {
-        let cache = HostFsCache::new();
+        let cache = HostFsCache::new(test_profile_sink());
         cache.insert_missing("/alpha", 0);
 
         assert!(matches!(
@@ -613,7 +646,7 @@ mod tests {
 
     #[test]
     fn creating_an_entry_invalidates_the_parent_listing() {
-        let cache = HostFsCache::new();
+        let cache = HostFsCache::new(test_profile_sink());
         cache.insert_directory(
             "/alpha",
             &[HostDirEntry {
@@ -635,7 +668,7 @@ mod tests {
 
     #[test]
     fn writing_a_file_leaves_its_directory_listing_alone() {
-        let cache = HostFsCache::new();
+        let cache = HostFsCache::new(test_profile_sink());
         cache.insert_directory(
             "/alpha",
             &[HostDirEntry {
@@ -660,7 +693,7 @@ mod tests {
 
     #[test]
     fn the_read_fid_pool_hands_a_parked_fid_back_once() {
-        let cache = HostFsCache::new();
+        let cache = HostFsCache::new(test_profile_sink());
 
         assert!(cache.park_read_fid("/alpha", 9, 0).is_none());
 
@@ -676,7 +709,7 @@ mod tests {
 
     #[test]
     fn a_parked_fid_past_its_ttl_is_retired_rather_than_reused() {
-        let cache = HostFsCache::new();
+        let cache = HostFsCache::new(test_profile_sink());
         assert!(cache.park_read_fid("/alpha", 9, 0).is_none());
 
         assert!(matches!(
@@ -687,7 +720,7 @@ mod tests {
 
     #[test]
     fn a_full_read_fid_pool_gives_up_its_least_recent_fid() {
-        let cache = HostFsCache::new();
+        let cache = HostFsCache::new(test_profile_sink());
         let mut path = String::new();
         for index in 0..READ_FID_POOL_ENTRIES {
             path.clear();
@@ -707,14 +740,14 @@ mod tests {
 
     #[test]
     fn an_uncacheable_path_parks_nothing_and_hands_its_fid_back() {
-        let cache = HostFsCache::new();
+        let cache = HostFsCache::new(test_profile_sink());
 
         assert_eq!(cache.park_read_fid("/alpha/../beta", 4, 0), Some(4));
     }
 
     #[test]
     fn the_listing_table_stays_within_its_entry_budget() {
-        let cache = HostFsCache::new();
+        let cache = HostFsCache::new(test_profile_sink());
         let listing: Vec<HostDirEntry> = (0..DIRECTORY_CACHE_ENTRY_BUDGET)
             .map(|index| HostDirEntry {
                 name: index.to_string(),

@@ -38,7 +38,7 @@ use alloc::vec::Vec;
 use bytes::BytesMut;
 use core::future::Future;
 use core::sync::atomic::{AtomicU64, Ordering};
-use helios_hal::cpu::Cpu;
+use helios_hal::cpu::{Cpu, HardwarePerfCounters};
 use helios_hal::io::IoError;
 use objectpool::{Pool, ReusableObject};
 use slab::Slab;
@@ -47,8 +47,8 @@ use triomphe::Arc;
 
 use super::cache::{CachedAttributes, HostFsCache, HostFsCacheStats, PooledReadFid};
 use crate::{
-    AuthorityDomain, HostDirEntry, HostFileSystem, HostFsError, HostFsErrorKind, HostMetadata,
-    ObjectIdentity, RawMutex,
+    AuthorityDomain, HostDirEntry, HostDirLimit, HostFileSystem, HostFsError, HostFsErrorKind,
+    HostMetadata, ObjectIdentity, ProfileSink, RawMutex,
 };
 
 /// The msize this client asks for. The server answers with its own
@@ -124,6 +124,69 @@ const P9_RVERSION_LEN: usize = 64;
 const P9_RWALK_LEN: usize = 4096;
 const P9_RLINK_LEN: usize = 4096;
 const P9_SMALL_REPLY_LEN: usize = 64;
+
+/// A 9P2000.L T-message this client sends, named by the `type` byte
+/// its request frame carries.
+#[derive(Clone, Copy)]
+#[repr(u8)]
+enum P9Message {
+    Version = P9_TVERSION,
+    Attach = P9_TATTACH,
+    Walk = P9_TWALK,
+    Read = P9_TREAD,
+    Write = P9_TWRITE,
+    Clunk = P9_TCLUNK,
+    Lopen = P9_TLOPEN,
+    Lcreate = P9_TLCREATE,
+    Symlink = P9_TSYMLINK,
+    Readlink = P9_TREADLINK,
+    Getattr = P9_TGETATTR,
+    Setattr = P9_TSETATTR,
+    Readdir = P9_TREADDIR,
+    Fsync = P9_TFSYNC,
+    Link = P9_TLINK,
+    Mkdir = P9_TMKDIR,
+    Renameat = P9_TRENAMEAT,
+    Unlinkat = P9_TUNLINKAT,
+}
+
+impl P9Message {
+    /// The request's wire `type` byte.
+    const fn wire(self) -> u8 {
+        self as u8
+    }
+
+    /// The `type` byte the reply to this request carries: the request's
+    /// own type plus one.
+    const fn reply_wire(self) -> u8 {
+        self.wire() + 1
+    }
+
+    /// The `kernel;hostfs;` perf phase one exchange of this message
+    /// records under.
+    const fn phase(self) -> &'static str {
+        match self {
+            Self::Version => "msg-version",
+            Self::Attach => "msg-attach",
+            Self::Walk => "msg-walk",
+            Self::Read => "msg-read",
+            Self::Write => "msg-write",
+            Self::Clunk => "msg-clunk",
+            Self::Lopen => "msg-lopen",
+            Self::Lcreate => "msg-lcreate",
+            Self::Symlink => "msg-symlink",
+            Self::Readlink => "msg-readlink",
+            Self::Getattr => "msg-getattr",
+            Self::Setattr => "msg-setattr",
+            Self::Readdir => "msg-readdir",
+            Self::Fsync => "msg-fsync",
+            Self::Link => "msg-link",
+            Self::Mkdir => "msg-mkdir",
+            Self::Renameat => "msg-renameat",
+            Self::Unlinkat => "msg-unlinkat",
+        }
+    }
+}
 
 pub trait HostFsTransport: Clone + Send + Sync + 'static {
     fn mount_tag(&self) -> &str;
@@ -295,6 +358,14 @@ impl Drop for Handle<'_> {
     }
 }
 
+/// The clock and hardware-counter readings a profiled span is
+/// measured between.
+#[derive(Clone, Copy)]
+struct HostFsPerfStart {
+    nanos: u64,
+    counters: HardwarePerfCounters,
+}
+
 /// State every clone of a client shares.
 struct ClientInner<Transport: HostFsTransport, CpuImpl: Cpu + Clone> {
     transport: Transport,
@@ -302,6 +373,10 @@ struct ClientInner<Transport: HostFsTransport, CpuImpl: Cpu + Clone> {
     /// a hardware capability like any other here, injected by the
     /// backend rather than read from a global.
     cpu: CpuImpl,
+    /// The profile and perf histories the client's `kernel;hostfs;`
+    /// phases record into — the same sink the runtime state hands the
+    /// network service for its `kernel;network;` phases.
+    profiles: ProfileSink,
     session: SessionCell,
     tags: HandleAllocator,
     fids: HandleAllocator,
@@ -323,7 +398,7 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> Clone for HostFsClient<Tr
 }
 
 impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, CpuImpl> {
-    pub fn new(transport: Transport, cpu: CpuImpl) -> Self {
+    pub fn new(transport: Transport, cpu: CpuImpl, profiles: ProfileSink) -> Self {
         let depth = transport.pipeline_depth();
         assert!(
             depth != 0,
@@ -339,11 +414,12 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
                     "9p tag space exhausted",
                 ),
                 fids: HandleAllocator::new(depth, P9_NOFID, "fid", "9p fid space exhausted"),
-                cache: HostFsCache::new(),
+                cache: HostFsCache::new(profiles.clone()),
                 request_buffers: Pool::bounded(depth, BytesMut::new, reset_p9_buffer),
                 response_buffers: Pool::bounded(depth, BytesMut::new, reset_p9_buffer),
                 transport,
                 cpu,
+                profiles,
             }),
         }
     }
@@ -356,6 +432,68 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
     /// The monotonic reading the caches age their entries against.
     fn now_nanos(&self) -> u64 {
         crate::monotonic_nanos(&self.inner.cpu)
+    }
+
+    /// The readings a profiled span is measured from, or `None` when no
+    /// profile is being collected — the disabled path pays the enable
+    /// flag's atomic load and nothing else.
+    fn profile_start(&self) -> Option<HostFsPerfStart> {
+        self.inner.profiles.enabled().then(|| HostFsPerfStart {
+            nanos: self.now_nanos(),
+            counters: self.inner.cpu.hardware_perf_counters(),
+        })
+    }
+
+    /// Records one `kernel;hostfs;<phase>` sample spanning `start` to
+    /// now: `events` units of work taking the wall-clock span and
+    /// moving `bytes` payload bytes. A profile switched off mid-span
+    /// records nothing.
+    fn record_phase(
+        &self,
+        phase: &'static str,
+        start: HostFsPerfStart,
+        events: usize,
+        bytes: usize,
+    ) {
+        let Some(end) = self.profile_start() else {
+            return;
+        };
+        let elapsed_nanos = end.nanos.saturating_sub(start.nanos);
+        self.inner.profiles.record_profile_stack_parts_nanos(
+            crate::ProfileScope::Kernel,
+            "kernel;hostfs;",
+            phase,
+            elapsed_nanos,
+        );
+        self.inner.profiles.record_perf_metric_parts(
+            crate::ProfileScope::Kernel,
+            "kernel;hostfs;",
+            phase,
+            crate::PerfSample {
+                events: crate::usize_to_u64(events, "host-fs profile event count"),
+                elapsed_nanos,
+                counters: end.counters.delta_since(start.counters),
+                bytes: crate::usize_to_u64(bytes, "host-fs profile byte count"),
+            },
+        );
+    }
+
+    /// Runs `operation` under its `kernel;hostfs;<phase>` counter:
+    /// count is the call itself, nanos the whole wall-clock span and
+    /// bytes whatever payload `payload` reads off the result — zero
+    /// for an operation that moves none.
+    async fn profiled<T>(
+        &self,
+        phase: &'static str,
+        operation: impl Future<Output = Result<T, HostFsError>> + Send,
+        payload: impl FnOnce(&T) -> usize + Send,
+    ) -> Result<T, HostFsError> {
+        let start = self.profile_start();
+        let result = operation.await;
+        if let Some(start) = start {
+            self.record_phase(phase, start, 1, result.as_ref().map_or(0, payload));
+        }
+        result
     }
 
     /// The session, establishing it if this is the first use.
@@ -381,7 +519,7 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
         let mount_tag = self.inner.transport.mount_tag().to_owned();
         let root_fid = root.value();
         self.transact(
-            P9_TATTACH,
+            P9Message::Attach,
             move |body| {
                 push_u32(body, root_fid);
                 push_u32(body, P9_NOFID);
@@ -411,7 +549,7 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
         let response = self
             .exchange(
                 P9_NOTAG,
-                P9_TVERSION,
+                P9Message::Version,
                 P9_DEFAULT_REQUEST_BODY_BYTES,
                 |body| {
                     push_u32(body, P9_REQUESTED_MSIZE);
@@ -441,7 +579,7 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
     /// Sends one message under a freshly allocated tag.
     async fn transact(
         &self,
-        ty: u8,
+        ty: P9Message,
         body: impl FnOnce(&mut BytesMut),
         response_len: usize,
     ) -> Result<ReusableObject<BytesMut>, HostFsError> {
@@ -451,7 +589,7 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
 
     async fn transact_with_capacity(
         &self,
-        ty: u8,
+        ty: P9Message,
         body_capacity: usize,
         body: impl FnOnce(&mut BytesMut),
         response_len: usize,
@@ -464,10 +602,16 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
 
     /// Encodes one Tmessage, hands it to the transport and validates the
     /// reply against the request that produced it.
+    ///
+    /// The `msg-*` phase measures from just before the transport is
+    /// handed the frame to just after a reply naming this request's tag
+    /// arrives — the device round trip plus the waiter's wake latency.
+    /// An `Rlerror` reply is still a completed round trip, so it is
+    /// counted before the error is read out of the frame.
     async fn exchange(
         &self,
         tag: u16,
-        ty: u8,
+        ty: P9Message,
         body_capacity: usize,
         body: impl FnOnce(&mut BytesMut),
         response_len: usize,
@@ -477,13 +621,14 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
         request.clear();
         request.reserve(P9_HEADER_LEN + body_capacity);
         request.extend_from_slice(&0_u32.to_le_bytes());
-        request.extend_from_slice(&[ty]);
+        request.extend_from_slice(&[ty.wire()]);
         request.extend_from_slice(&tag.to_le_bytes());
         body(&mut request);
         let size =
             u32::try_from(request.len()).map_err(|_| HostFsError::Protocol("request too large"))?;
         request[..4].copy_from_slice(&size.to_le_bytes());
 
+        let submitted = self.profile_start();
         self.inner
             .transport
             .request(&request, &mut response, response_len)
@@ -511,16 +656,16 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
             );
             return Err(HostFsError::Protocol("9p reply tag did not match"));
         }
+        if let Some(start) = submitted {
+            self.record_phase(ty.phase(), start, 1, 0);
+        }
 
         let response_ty = response[4];
         if response_ty == P9_RLERROR {
             return Err(HostFsError::Server(read_u32_le(&response, P9_HEADER_LEN)?));
         }
 
-        let expected = ty
-            .checked_add(1)
-            .ok_or(HostFsError::Protocol("response type overflowed"))?;
-        if response_ty != expected {
+        if response_ty != ty.reply_wire() {
             return Err(HostFsError::Protocol("unexpected 9p response type"));
         }
 
@@ -540,7 +685,7 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
         let new_fid = target.value();
         let response = self
             .transact(
-                P9_TWALK,
+                P9Message::Walk,
                 |body| {
                     push_u32(body, parent_fid);
                     push_u32(body, new_fid);
@@ -585,7 +730,11 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
     /// operation's stack frame and released here instead.
     async fn clunk_value(&self, fid: u32) {
         if let Err(error) = self
-            .transact(P9_TCLUNK, |body| push_u32(body, fid), P9_SMALL_REPLY_LEN)
+            .transact(
+                P9Message::Clunk,
+                |body| push_u32(body, fid),
+                P9_SMALL_REPLY_LEN,
+            )
             .await
         {
             tracing::warn!(fid, ?error, "9p clunk failed");
@@ -657,7 +806,7 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
     async fn get_attr(&self, fid: u32) -> Result<HostMetadata, HostFsError> {
         let response = self
             .transact(
-                P9_TGETATTR,
+                P9Message::Getattr,
                 |body| {
                     push_u32(body, fid);
                     push_u64(body, P9_STATS_BASIC);
@@ -677,7 +826,7 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
     ) -> Result<Vec<u8>, HostFsError> {
         let response = self
             .transact(
-                P9_TREAD,
+                P9Message::Read,
                 |body| {
                     push_u32(body, fid);
                     push_u64(body, offset);
@@ -701,7 +850,7 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
     ) -> Result<usize, HostFsError> {
         let response = self
             .transact(
-                P9_TREAD,
+                P9Message::Read,
                 |body| {
                     push_u32(body, fid);
                     push_u64(body, offset);
@@ -758,16 +907,18 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
         &self,
         session: Session,
         fid: u32,
+        limit: HostDirLimit,
     ) -> Result<Vec<HostDirEntry>, HostFsError> {
         self.open(fid, P9_DOTL_RDONLY | P9_DOTL_DIRECTORY).await?;
 
         let batch = u32::try_from(session.payload_chunk()).expect("a readdir batch fits in u32");
         let mut entries = Vec::new();
+        let mut name_bytes = 0_usize;
         let mut offset = 0_u64;
         loop {
             let response = self
                 .transact(
-                    P9_TREADDIR,
+                    P9Message::Readdir,
                     |body| {
                         push_u32(body, fid);
                         push_u64(body, offset);
@@ -783,20 +934,42 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
             if count == 0 {
                 break;
             }
-            let end = cursor + count;
+            // The count is the server's: it must lie inside the reply, and
+            // the entries must end exactly on it.
+            let end = cursor
+                .checked_add(count)
+                .filter(|end| *end <= response.len())
+                .ok_or(HostFsError::Protocol(
+                    "readdir payload count exceeds the reply",
+                ))?;
             while cursor < end {
                 let qid_type = read_u8(&response, cursor)?;
                 cursor += 1;
                 cursor += 4;
                 cursor += 8;
-                offset = read_u64_le(&response, cursor)?;
+                // The offset is the cookie the next `Treaddir` resumes from.
+                // One that does not move past the offset this batch was
+                // requested at, or past the entry before it, would have the
+                // server answer the same entries again forever.
+                let entry_offset = read_u64_le(&response, cursor)?;
+                if entry_offset <= offset {
+                    return Err(HostFsError::Protocol(
+                        "readdir offsets did not strictly increase",
+                    ));
+                }
+                offset = entry_offset;
                 cursor += 8;
                 let type_ = read_u8(&response, cursor)?;
                 cursor += 1;
                 let name = read_string(&response, &mut cursor)?;
+                if cursor > end {
+                    return Err(HostFsError::Protocol("readdir entry overran its payload"));
+                }
                 if name == "." || name == ".." {
                     continue;
                 }
+                name_bytes = name_bytes.saturating_add(name.len());
+                limit.check(entries.len() + 1, name_bytes)?;
                 entries.push(HostDirEntry {
                     name,
                     is_directory: qid_type & P9_QTDIR != 0 || type_ == 4,
@@ -808,7 +981,7 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
 
     async fn open(&self, fid: u32, flags: u32) -> Result<(), HostFsError> {
         self.transact(
-            P9_TLOPEN,
+            P9Message::Lopen,
             |body| {
                 push_u32(body, fid);
                 push_u32(body, flags);
@@ -832,7 +1005,7 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
             let payload = &bytes[..count];
             let response = self
                 .transact_with_capacity(
-                    P9_TWRITE,
+                    P9Message::Write,
                     write_request_body_capacity(count),
                     |body| {
                         push_u32(body, fid);
@@ -879,13 +1052,20 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
         metadata
     }
 
-    async fn read_dir_impl(&self, path: &str) -> Result<Vec<HostDirEntry>, HostFsError> {
+    async fn read_dir_impl(
+        &self,
+        path: &str,
+        limit: HostDirLimit,
+    ) -> Result<Vec<HostDirEntry>, HostFsError> {
         if let Some(entries) = self.inner.cache.directory(path, self.now_nanos()) {
+            // A listing cached for an earlier caller may be past this one's limit.
+            let name_bytes: usize = entries.iter().map(|entry| entry.name.len()).sum();
+            limit.check(entries.len(), name_bytes)?;
             return Ok(entries);
         }
         let session = self.session().await?;
         let target = self.walk(session, path).await?;
-        let entries = self.read_dir_entries(session, target.value()).await;
+        let entries = self.read_dir_entries(session, target.value(), limit).await;
         self.clunk(target).await;
         if let Ok(entries) = &entries {
             self.inner
@@ -960,7 +1140,7 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
         let fid = directory.value();
         let result = self
             .transact(
-                P9_TMKDIR,
+                P9Message::Mkdir,
                 |body| {
                     push_u32(body, fid);
                     push_string(body, name);
@@ -983,7 +1163,7 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
         let fid = directory.value();
         let result = self
             .transact(
-                P9_TLCREATE,
+                P9Message::Lcreate,
                 |body| {
                     push_u32(body, fid);
                     push_string(body, name);
@@ -1010,7 +1190,7 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
         let fid = file.value();
         let result = self
             .transact(
-                P9_TSETATTR,
+                P9Message::Setattr,
                 |body| {
                     push_u32(body, fid);
                     push_u32(body, P9_SETATTR_SIZE);
@@ -1050,7 +1230,7 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
         let fid = file.value();
         let result = self
             .transact(
-                P9_TSETATTR,
+                P9Message::Setattr,
                 |body| {
                     push_u32(body, fid);
                     push_u32(body, valid);
@@ -1123,7 +1303,7 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
             // file description, so a read-only open is enough to name it.
             self.open(fid, P9_DOTL_RDONLY).await?;
             self.transact(
-                P9_TFSYNC,
+                P9Message::Fsync,
                 |body| {
                     push_u32(body, fid);
                     push_u32(body, 0);
@@ -1146,7 +1326,7 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
         let flags = if directory { P9_DOTL_AT_REMOVEDIR } else { 0 };
         let result = self
             .transact(
-                P9_TUNLINKAT,
+                P9Message::Unlinkat,
                 |body| {
                     push_u32(body, fid);
                     push_string(body, name);
@@ -1177,7 +1357,7 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
         let destination_fid = destination_dir.value();
         let result = self
             .transact(
-                P9_TRENAMEAT,
+                P9Message::Renameat,
                 |body| {
                     push_u32(body, source_fid);
                     push_string(body, source_name);
@@ -1210,7 +1390,7 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
         let destination_fid = destination_dir.value();
         let result = self
             .transact(
-                P9_TLINK,
+                P9Message::Link,
                 |body| {
                     push_u32(body, destination_fid);
                     push_u32(body, source_fid);
@@ -1237,7 +1417,7 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
         let fid = directory.value();
         let result = self
             .transact(
-                P9_TSYMLINK,
+                P9Message::Symlink,
                 |body| {
                     push_u32(body, fid);
                     push_string(body, name);
@@ -1258,7 +1438,11 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
         let target = self.walk(session, path).await?;
         let fid = target.value();
         let result = self
-            .transact(P9_TREADLINK, |body| push_u32(body, fid), P9_RLINK_LEN)
+            .transact(
+                P9Message::Readlink,
+                |body| push_u32(body, fid),
+                P9_RLINK_LEN,
+            )
             .await
             .and_then(|response| {
                 let mut cursor = P9_HEADER_LEN;
@@ -1277,15 +1461,24 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFileSystem
     }
 
     async fn stat_path<'a>(&'a self, path: &'a str) -> Result<HostMetadata, HostFsError> {
-        self.stat_path_impl(path).await
+        self.profiled("op-stat", self.stat_path_impl(path), |_| 0)
+            .await
     }
 
-    async fn read_dir<'a>(&'a self, path: &'a str) -> Result<Vec<HostDirEntry>, HostFsError> {
-        self.read_dir_impl(path).await
+    async fn read_dir<'a>(
+        &'a self,
+        path: &'a str,
+        limit: HostDirLimit,
+    ) -> Result<Vec<HostDirEntry>, HostFsError> {
+        self.profiled("op-read-dir", self.read_dir_impl(path, limit), |entries| {
+            entries.iter().map(|entry| entry.name.len()).sum()
+        })
+        .await
     }
 
     async fn read_file<'a>(&'a self, path: &'a str) -> Result<Vec<u8>, HostFsError> {
-        self.read_file_impl(path).await
+        self.profiled("op-read-file", self.read_file_impl(path), |data| data.len())
+            .await
     }
 
     async fn read_file_range<'a>(
@@ -1294,7 +1487,12 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFileSystem
         offset: u64,
         max_bytes: u32,
     ) -> Result<Vec<u8>, HostFsError> {
-        self.read_file_range_impl(path, offset, max_bytes).await
+        self.profiled(
+            "op-read-range",
+            self.read_file_range_impl(path, offset, max_bytes),
+            |data| data.len(),
+        )
+        .await
     }
 
     async fn write_file<'a>(
@@ -1303,23 +1501,34 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFileSystem
         offset: u64,
         bytes: &'a [u8],
     ) -> Result<(), HostFsError> {
-        self.write_file_impl(path, offset, bytes).await
+        self.profiled(
+            "op-write",
+            self.write_file_impl(path, offset, bytes),
+            |_| bytes.len(),
+        )
+        .await
     }
 
     async fn append_file<'a>(&'a self, path: &'a str, bytes: &'a [u8]) -> Result<u64, HostFsError> {
-        self.append_file_impl(path, bytes).await
+        self.profiled("op-append", self.append_file_impl(path, bytes), |_| {
+            bytes.len()
+        })
+        .await
     }
 
     async fn sync_file<'a>(&'a self, path: &'a str) -> Result<(), HostFsError> {
-        self.sync_file_impl(path).await
+        self.profiled("op-sync", self.sync_file_impl(path), |_| 0)
+            .await
     }
 
     async fn truncate_file<'a>(&'a self, path: &'a str) -> Result<(), HostFsError> {
-        self.truncate_file_impl(path).await
+        self.profiled("op-truncate", self.truncate_file_impl(path), |_| 0)
+            .await
     }
 
     async fn set_file_size<'a>(&'a self, path: &'a str, size: u64) -> Result<(), HostFsError> {
-        self.set_file_size_impl(path, size).await
+        self.profiled("op-set-size", self.set_file_size_impl(path, size), |_| 0)
+            .await
     }
 
     async fn set_times<'a>(
@@ -1328,20 +1537,27 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFileSystem
         access_nanos: Option<u64>,
         modified_nanos: Option<u64>,
     ) -> Result<(), HostFsError> {
-        self.set_times_impl(path, access_nanos, modified_nanos)
-            .await
+        self.profiled(
+            "op-set-times",
+            self.set_times_impl(path, access_nanos, modified_nanos),
+            |_| 0,
+        )
+        .await
     }
 
     async fn create_file<'a>(&'a self, path: &'a str) -> Result<(), HostFsError> {
-        self.create_file_impl(path).await
+        self.profiled("op-create-file", self.create_file_impl(path), |_| 0)
+            .await
     }
 
     async fn create_directory<'a>(&'a self, path: &'a str) -> Result<(), HostFsError> {
-        self.create_directory_impl(path).await
+        self.profiled("op-create-dir", self.create_directory_impl(path), |_| 0)
+            .await
     }
 
     async fn remove<'a>(&'a self, path: &'a str, directory: bool) -> Result<(), HostFsError> {
-        self.remove_impl(path, directory).await
+        self.profiled("op-remove", self.remove_impl(path, directory), |_| 0)
+            .await
     }
 
     async fn rename<'a>(
@@ -1349,7 +1565,8 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFileSystem
         source: &'a str,
         destination: &'a str,
     ) -> Result<(), HostFsError> {
-        self.rename_impl(source, destination).await
+        self.profiled("op-rename", self.rename_impl(source, destination), |_| 0)
+            .await
     }
 
     async fn hard_link<'a>(
@@ -1357,15 +1574,24 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFileSystem
         source: &'a str,
         destination: &'a str,
     ) -> Result<(), HostFsError> {
-        self.hard_link_impl(source, destination).await
+        self.profiled(
+            "op-hard-link",
+            self.hard_link_impl(source, destination),
+            |_| 0,
+        )
+        .await
     }
 
     async fn symlink<'a>(&'a self, target: &'a str, link_path: &'a str) -> Result<(), HostFsError> {
-        self.symlink_impl(target, link_path).await
+        self.profiled("op-symlink", self.symlink_impl(target, link_path), |_| 0)
+            .await
     }
 
     async fn read_link<'a>(&'a self, path: &'a str) -> Result<String, HostFsError> {
-        self.read_link_impl(path).await
+        self.profiled("op-read-link", self.read_link_impl(path), |target| {
+            target.len()
+        })
+        .await
     }
 }
 
@@ -1699,6 +1925,46 @@ mod tests {
         fail_type: Option<u8>,
         /// Answer every request with a tag nobody asked under.
         corrupt_tag: bool,
+        /// How `Treaddir` is answered, when not with an empty batch.
+        readdir: ReaddirFault,
+    }
+
+    /// A misbehaving answer to `Treaddir`.
+    #[derive(Clone, Copy, Default)]
+    enum ReaddirFault {
+        /// An empty batch: the end of the directory.
+        #[default]
+        None,
+        /// The same one-entry batch every time, whatever offset was asked.
+        RepeatBatch,
+        /// A fresh one-entry batch every time, with offsets that rise, so
+        /// the directory never ends.
+        Endless,
+    }
+
+    /// A limit far above anything the happy-path tests list.
+    const TEST_DIR_LIMIT: HostDirLimit = HostDirLimit {
+        max_entries: 1 << 16,
+        max_name_bytes: 1 << 20,
+    };
+
+    /// One `Treaddir` entry: qid, offset, type, name.
+    fn dirent(offset: u64, name: &str) -> Vec<u8> {
+        let mut entry = Vec::new();
+        entry.extend_from_slice(&qid(0, offset));
+        entry.extend_from_slice(&offset.to_le_bytes());
+        entry.push(8); // DT_REG
+        entry.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        entry.extend_from_slice(name.as_bytes());
+        entry
+    }
+
+    /// An `Rreaddir` body carrying `entries`.
+    fn readdir_body(entries: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        body.extend_from_slice(entries);
+        body
     }
 
     #[derive(Default)]
@@ -1833,7 +2099,22 @@ mod tests {
                     let count = u32::from_le_bytes([body[12], body[13], body[14], body[15]]);
                     reply.extend_from_slice(&count.to_le_bytes());
                 }
-                P9_TREADDIR => reply.extend_from_slice(&0_u32.to_le_bytes()),
+                P9_TREADDIR => match self.inner.fault.readdir {
+                    ReaddirFault::None => reply.extend_from_slice(&0_u32.to_le_bytes()),
+                    ReaddirFault::RepeatBatch => {
+                        reply.extend_from_slice(&readdir_body(&dirent(7, "same")));
+                    }
+                    ReaddirFault::Endless => {
+                        let offset = u64::from_le_bytes([
+                            body[4], body[5], body[6], body[7], body[8], body[9], body[10],
+                            body[11],
+                        ]) + 1;
+                        reply.extend_from_slice(&readdir_body(&dirent(
+                            offset,
+                            &alloc::format!("entry-{offset}"),
+                        )));
+                    }
+                },
                 P9_TCLUNK => {
                     let fid = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
                     self.log().clunked.push(fid);
@@ -1922,7 +2203,11 @@ mod tests {
         let transport = FakeTransport::new(msize, fault);
         let clock = ManualClockCpu::new();
         Fixture {
-            client: HostFsClient::new(transport.clone(), clock.clone()),
+            client: HostFsClient::new(
+                transport.clone(),
+                clock.clone(),
+                crate::test_support::test_profile_sink(),
+            ),
             transport,
             clock,
         }
@@ -2195,9 +2480,12 @@ mod tests {
         } = fixture(P9_REQUESTED_MSIZE, FakeFault::default());
 
         block_on(async {
-            client.read_dir_impl("/alpha").await.expect("first listing");
             client
-                .read_dir_impl("/alpha")
+                .read_dir_impl("/alpha", TEST_DIR_LIMIT)
+                .await
+                .expect("first listing");
+            client
+                .read_dir_impl("/alpha", TEST_DIR_LIMIT)
                 .await
                 .expect("cached listing");
         });
@@ -2207,18 +2495,108 @@ mod tests {
     }
 
     #[test]
+    fn a_repeated_readdir_batch_is_a_protocol_error() {
+        let Fixture {
+            client, transport, ..
+        } = fixture(
+            P9_REQUESTED_MSIZE,
+            FakeFault {
+                readdir: ReaddirFault::RepeatBatch,
+                ..FakeFault::default()
+            },
+        );
+
+        let error = block_on(client.read_dir_impl("/alpha", TEST_DIR_LIMIT))
+            .expect_err("a server that repeats a batch must not loop the client");
+
+        assert!(
+            matches!(error, HostFsError::Protocol(message) if message.contains("strictly increase")),
+            "{error:?}"
+        );
+        assert_eq!(
+            transport.log().readdirs,
+            2,
+            "the second batch repeats the first one's offset and ends the listing"
+        );
+    }
+
+    #[test]
+    fn a_listing_past_the_callers_limit_is_an_error() {
+        let limit = HostDirLimit {
+            max_entries: 10,
+            max_name_bytes: 1 << 20,
+        };
+        let client = client(
+            P9_REQUESTED_MSIZE,
+            FakeFault {
+                readdir: ReaddirFault::Endless,
+                ..FakeFault::default()
+            },
+        );
+
+        let error = block_on(client.read_dir_impl("/alpha", limit))
+            .expect_err("an endless directory must hit the entry bound");
+
+        assert!(
+            matches!(
+                error,
+                HostFsError::DirectoryTooLarge {
+                    max_entries: 10,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn a_listing_past_the_callers_name_byte_limit_is_an_error() {
+        let limit = HostDirLimit {
+            max_entries: 1 << 16,
+            max_name_bytes: 64,
+        };
+        let client = client(
+            P9_REQUESTED_MSIZE,
+            FakeFault {
+                readdir: ReaddirFault::Endless,
+                ..FakeFault::default()
+            },
+        );
+
+        let error = block_on(client.read_dir_impl("/alpha", limit))
+            .expect_err("an endless directory must hit the byte bound");
+
+        assert!(
+            matches!(
+                error,
+                HostFsError::DirectoryTooLarge {
+                    max_name_bytes: 64,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
     fn creating_a_file_invalidates_the_parent_listing() {
         let Fixture {
             client, transport, ..
         } = fixture(P9_REQUESTED_MSIZE, FakeFault::default());
 
         block_on(async {
-            client.read_dir_impl("/alpha").await.expect("first listing");
+            client
+                .read_dir_impl("/alpha", TEST_DIR_LIMIT)
+                .await
+                .expect("first listing");
             client
                 .create_file_impl("/alpha/beta")
                 .await
                 .expect("create the file");
-            client.read_dir_impl("/alpha").await.expect("fresh listing");
+            client
+                .read_dir_impl("/alpha", TEST_DIR_LIMIT)
+                .await
+                .expect("fresh listing");
         });
 
         assert_eq!(
@@ -2289,5 +2667,164 @@ mod tests {
         let error = block_on(client.stat_path_impl("/alpha")).expect_err("the msize is too small");
 
         assert!(matches!(error, HostFsError::Protocol(_)), "{error:?}");
+    }
+
+    /// A client built on a live [`crate::ProfileSink`], so a test can
+    /// read back what the instrumented paths recorded.
+    fn profiled_client(
+        msize: u32,
+        fault: FakeFault,
+    ) -> (
+        HostFsClient<FakeTransport, ManualClockCpu>,
+        crate::ProfileSink,
+    ) {
+        let profiles = crate::test_support::test_profile_sink();
+        profiles.set_enabled(true);
+        let transport = FakeTransport::new(msize, fault);
+        let client = HostFsClient::new(transport, ManualClockCpu::new(), profiles.clone());
+        (client, profiles)
+    }
+
+    /// The `kernel;hostfs;*` samples `profiles` holds, keyed by counter
+    /// name.
+    fn hostfs_samples(
+        profiles: &crate::ProfileSink,
+    ) -> alloc::collections::BTreeMap<String, crate::PerfMetricSample> {
+        profiles
+            .perf_metrics()
+            .lock()
+            .recent(
+                &crate::PerfMetricFilter {
+                    name_prefixes: alloc::vec!["kernel;hostfs;".to_owned()],
+                },
+                u32::MAX,
+            )
+            .into_iter()
+            .map(|sample| (sample.name.clone(), sample))
+            .collect()
+    }
+
+    #[test]
+    fn message_types_name_their_wire_byte_reply_and_phase() {
+        for message in [
+            P9Message::Version,
+            P9Message::Attach,
+            P9Message::Walk,
+            P9Message::Read,
+            P9Message::Write,
+            P9Message::Clunk,
+            P9Message::Lopen,
+            P9Message::Lcreate,
+            P9Message::Symlink,
+            P9Message::Readlink,
+            P9Message::Getattr,
+            P9Message::Setattr,
+            P9Message::Readdir,
+            P9Message::Fsync,
+            P9Message::Link,
+            P9Message::Mkdir,
+            P9Message::Renameat,
+            P9Message::Unlinkat,
+        ] {
+            assert_eq!(message.reply_wire(), message.wire() + 1);
+            assert!(
+                message.phase().starts_with("msg-"),
+                "{:?} has no msg-* phase name",
+                message.wire()
+            );
+        }
+        assert_eq!(P9Message::Version.phase(), "msg-version");
+        assert_eq!(P9Message::Attach.phase(), "msg-attach");
+        assert_eq!(P9Message::Walk.phase(), "msg-walk");
+        assert_eq!(P9Message::Read.phase(), "msg-read");
+        assert_eq!(P9Message::Lopen.phase(), "msg-lopen");
+        assert_eq!(P9Message::Getattr.phase(), "msg-getattr");
+        assert_eq!(P9Message::Readdir.phase(), "msg-readdir");
+        assert_eq!(P9Message::Clunk.phase(), "msg-clunk");
+    }
+
+    #[test]
+    fn a_profiled_client_records_operation_message_and_cache_phases() {
+        let (client, profiles) = profiled_client(P9_REQUESTED_MSIZE, FakeFault::default());
+
+        block_on(async {
+            client.stat_path("/alpha").await.expect("first stat");
+            client.stat_path("/alpha").await.expect("cached stat");
+            client.read_file("/alpha").await.expect("read");
+        });
+
+        let samples = hostfs_samples(&profiles);
+        let metric = |name: &str| {
+            samples
+                .get(name)
+                .unwrap_or_else(|| panic!("{name} missing from {samples:?}"))
+        };
+        // Two stats and one read, each measured end to end.
+        assert_eq!(metric("kernel;hostfs;op-stat").count, 2);
+        assert_eq!(metric("kernel;hostfs;op-read-file").count, 1);
+        assert_eq!(
+            metric("kernel;hostfs;op-read-file").total_bytes,
+            u64::try_from(FILE_CONTENT_LEN).expect("file length fits u64"),
+            "op-read-file carries the payload bytes the read moved"
+        );
+        // The handshake runs once for the session; the first stat and
+        // the read's fid acquisition each walk, the second stat is a
+        // cache hit and walks nothing.
+        for (name, count) in [
+            ("kernel;hostfs;msg-version", 1),
+            ("kernel;hostfs;msg-attach", 1),
+            ("kernel;hostfs;msg-walk", 2),
+            ("kernel;hostfs;msg-getattr", 1),
+            ("kernel;hostfs;msg-lopen", 1),
+            ("kernel;hostfs;msg-read", 1),
+            ("kernel;hostfs;msg-clunk", 1),
+        ] {
+            assert_eq!(metric(name).count, count, "{name}");
+            assert_eq!(
+                metric(name).total_events,
+                count,
+                "{name} counts one event per message"
+            );
+        }
+        // The first stat missed the attribute table; the second stat
+        // and the read's size probe hit it.
+        assert_eq!(metric("kernel;hostfs;cache-miss").total_events, 1);
+        assert_eq!(metric("kernel;hostfs;cache-hit").total_events, 2);
+        assert_eq!(
+            metric("kernel;hostfs;cache-hit").total_nanos,
+            0,
+            "cache counters carry a count and no interval"
+        );
+    }
+
+    #[test]
+    fn an_rlerror_reply_still_records_its_round_trip() {
+        let (client, profiles) = profiled_client(
+            P9_REQUESTED_MSIZE,
+            FakeFault {
+                fail_type: Some(P9_TLOPEN),
+                ..FakeFault::default()
+            },
+        );
+
+        block_on(client.write_file("/alpha", 0, b"payload"))
+            .expect_err("the server refuses to open the file");
+
+        let samples = hostfs_samples(&profiles);
+        let metric = |name: &str| {
+            samples
+                .get(name)
+                .unwrap_or_else(|| panic!("{name} missing from {samples:?}"))
+        };
+        assert_eq!(
+            metric("kernel;hostfs;msg-lopen").count,
+            1,
+            "a refused open is still one completed exchange"
+        );
+        assert_eq!(
+            metric("kernel;hostfs;op-write").count,
+            1,
+            "the failed operation is counted too"
+        );
     }
 }

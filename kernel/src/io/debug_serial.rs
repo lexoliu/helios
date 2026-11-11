@@ -57,11 +57,36 @@
 //!
 //! - **Guest bytes never queue.** [`DebugConsole::try_write`] takes the
 //!   role or reports that the port is busy, and its callers are async
-//!   host functions that `yield_now().await` and try again. The guest
+//!   host functions that await the console's transmit signal and try
+//!   again — see the wait contract on [`DebugSerialWriter`]. The guest
 //!   is therefore throttled by the device exactly as it was before, and
 //!   cannot grow a kernel-owned queue by writing faster than the UART
 //!   drains: kernel memory and user memory stay separate ownership
 //!   domains.
+//!
+//! - **Waiting is signalled, not polled.** The console owns two
+//!   [`Notify`] signals: the receive signal, raised by the UART's
+//!   receive interrupt through [`DebugSerialInterrupt`], and the
+//!   transmit signal, raised by this console on every transmit-role
+//!   release so a writer whose `try_write` lost the race is woken by
+//!   the owner letting go. Writes themselves are synchronous — the port
+//!   drains the holding register at hardware pace — so no transmit
+//!   interrupt is needed. Waiters arm before they test — create the
+//!   `notified()` future, try the FIFO, await only when it came back
+//!   empty — so a byte or a release that lands between the test and
+//!   the park is never lost.
+//!
+//! - **The receive line is masked between the interrupt and the
+//!   drain.** The interrupt handler cannot take the bytes (they belong
+//!   to the waiting task), and a level-triggered line would re-raise on
+//!   every return from the handler until they were taken. So the
+//!   handler disables the UART's receive interrupt
+//!   ([`ByteSerial::disable_receive_interrupt`]) before it signals,
+//!   and the waiter re-enables it ([`ByteSerial::enable_receive_interrupt`])
+//!   as part of arming: a byte already in the FIFO raises the line
+//!   again at once, which is the spurious-looking wake that makes the
+//!   waiter test again and find it. Both calls are idempotent register
+//!   writes.
 //!
 //! - **Order.** Segments leave in the order they were submitted: a
 //!   segment never overtakes one that was already queued when it was
@@ -72,12 +97,16 @@ extern crate alloc;
 use alloc::vec::Vec;
 use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicBool, Ordering};
+use core::task::{Context, Poll};
 
 use concurrent_queue::{ConcurrentQueue, PopError, PushError};
 use helios_hal::serial::ByteSerial;
 use objectpool::{Pool, ReusableObject};
 use spin::Once;
 
+use crate::{Notified, Notify, NotifyWaiter};
+
+use super::interrupts::ExternalInterruptHandler;
 use super::serial::try_read_serial;
 
 /// Bytes of a guest byte stream one segment carries at most.
@@ -159,6 +188,9 @@ pub struct DebugSerialWriter {
     emit: fn(&[u8]),
     emit_arguments: fn(fmt::Arguments<'_>),
     try_write: fn(&[u8]) -> bool,
+    receive_signal: fn() -> &'static Notify,
+    transmit_signal: fn() -> &'static Notify,
+    enable_receive_interrupt: fn(),
 }
 
 impl DebugSerialWriter {
@@ -170,6 +202,9 @@ impl DebugSerialWriter {
             emit: emit_segment::<Access>,
             emit_arguments: emit_arguments_segment::<Access>,
             try_write: try_write_segment::<Access>,
+            receive_signal: receive_signal::<Access>,
+            transmit_signal: transmit_signal::<Access>,
+            enable_receive_interrupt: enable_receive_interrupt::<Access>,
         }
     }
 
@@ -193,7 +228,8 @@ impl DebugSerialWriter {
     /// Writes one whole guest segment, reporting `false` when another
     /// processor owns the port.
     ///
-    /// The caller is an async host function and yields before trying
+    /// The caller is an async host function and waits on
+    /// [`Self::wait_for_debug_serial_output_ready`] before trying
     /// again, so guest bytes are throttled by the device rather than
     /// buffered in kernel memory.
     #[must_use]
@@ -205,9 +241,10 @@ impl DebugSerialWriter {
     /// now, and reports how many bytes that was.
     ///
     /// Zero means another processor owns the port and the caller has to
-    /// yield and try again. A short count means the stream was cut at a
-    /// line boundary, which is the granularity at which a console
-    /// record may reach the wire between the guest's own lines.
+    /// await [`Self::wait_for_debug_serial_output_ready`] and try
+    /// again. A short count means the stream was cut at a line
+    /// boundary, which is the granularity at which a console record
+    /// may reach the wire between the guest's own lines.
     #[must_use]
     pub fn write_stream(&self, bytes: &[u8]) -> usize {
         let segment = stream_segment(bytes);
@@ -216,6 +253,83 @@ impl DebugSerialWriter {
         } else {
             0
         }
+    }
+
+    /// Arms a wait on the console's receive signal and returns it as a
+    /// future.
+    ///
+    /// Create the future *before* testing the FIFO — it is armed on
+    /// creation, so a byte that lands between the test and the `.await`
+    /// still completes the wait. The loop this belongs to is: arm, try
+    /// the read, return its bytes when it produced any, `wait.await`
+    /// otherwise.
+    ///
+    /// Arming re-enables the UART's receive interrupt, which the
+    /// handler masked when it last fired. A byte already waiting raises
+    /// the line at once; whether its interrupt lands before or after the
+    /// signal is sampled does not matter, because the FIFO test that
+    /// follows the arm finds the byte either way — the handler never
+    /// consumes bytes, it only signals. A byte that lands after the test
+    /// is the case the sampled signal covers.
+    pub fn wait_for_debug_serial_input(&self) -> Notified<'static> {
+        (self.enable_receive_interrupt)();
+        (self.receive_signal)().notified()
+    }
+
+    /// Arms a wait on the console's transmit signal and returns it as a
+    /// future.
+    ///
+    /// Same arm-before-test contract as
+    /// [`Self::wait_for_debug_serial_input`]: create it before the
+    /// `try_write`/`write_stream` that may report the port busy, then
+    /// await it only on the busy path.
+    pub fn wait_for_debug_serial_output_ready(&self) -> Notified<'static> {
+        (self.transmit_signal)().notified()
+    }
+
+    /// A reusable waiter on the receive signal, for the poll form.
+    ///
+    /// Kept across polls by the caller — `poll` contexts such as the
+    /// epoll wait targets — so the listener registration survives from
+    /// one `poll_debug_serial_input` to the next instead of being
+    /// dropped and re-armed each time. Re-enables the receive interrupt
+    /// the way [`Self::wait_for_debug_serial_input`] does.
+    pub fn debug_serial_input_waiter(&self) -> NotifyWaiter {
+        (self.enable_receive_interrupt)();
+        (self.receive_signal)().waiter()
+    }
+
+    /// A reusable waiter on the transmit signal, for the poll form.
+    pub fn debug_serial_output_waiter(&self) -> NotifyWaiter {
+        (self.transmit_signal)().waiter()
+    }
+
+    /// Polls the receive wait `waiter` keeps armed, completing when the
+    /// console signals possible input.
+    ///
+    /// The caller arms before it tests — the waiter is built by
+    /// [`Self::debug_serial_input_waiter`] ahead of the FIFO check it
+    /// guards — exactly as the async form requires. Every poll that
+    /// parks re-enables the receive interrupt first, because the handler
+    /// masks it on each delivery and the caller may keep one waiter
+    /// across several wakes.
+    pub fn poll_debug_serial_input(
+        &self,
+        cx: &mut Context<'_>,
+        waiter: &mut NotifyWaiter,
+    ) -> Poll<()> {
+        (self.enable_receive_interrupt)();
+        (self.receive_signal)().poll_notified(cx, waiter)
+    }
+
+    /// Polls the transmit wait `waiter` keeps armed, completing when
+    /// the console signals the port may take a segment.
+    pub fn poll_debug_serial_output_ready(
+        &self,
+        cx: &mut Context<'_>,
+        waiter: &mut NotifyWaiter,
+    ) -> Poll<()> {
+        (self.transmit_signal)().poll_notified(cx, waiter)
     }
 
     /// Writes one `[KDBG …]` stage marker as a single segment.
@@ -288,6 +402,18 @@ fn try_write_segment<Access: DebugSerialAccess>(segment: &[u8]) -> bool {
     Access::console().try_write(&Access::port(), segment)
 }
 
+fn receive_signal<Access: DebugSerialAccess>() -> &'static Notify {
+    Access::console().receive_signal()
+}
+
+fn transmit_signal<Access: DebugSerialAccess>() -> &'static Notify {
+    Access::console().transmit_signal()
+}
+
+fn enable_receive_interrupt<Access: DebugSerialAccess>() {
+    Access::port().enable_receive_interrupt();
+}
+
 /// The piece of a guest byte stream the console takes as one segment.
 fn stream_segment(bytes: &[u8]) -> &[u8] {
     if bytes.len() <= MAX_STREAM_SEGMENT_BYTES {
@@ -313,6 +439,15 @@ pub struct DebugConsole {
     /// Built the first time a processor loses the race for the port; a
     /// machine whose console is never contended never allocates it.
     handoff: Once<Handoff>,
+    /// Raised when the UART's receive path may hold a byte: the
+    /// backend's receive interrupt raises it through
+    /// [`DebugSerialInterrupt`], and input waiters park on it between
+    /// FIFO checks.
+    receive: Notify,
+    /// Raised when the port may take a segment: the console raises it
+    /// on every transmit-role release, which is what wakes a writer
+    /// whose `try_write` lost the race.
+    transmit: Notify,
 }
 
 struct Handoff {
@@ -341,7 +476,43 @@ impl DebugConsole {
         Self {
             transmitting: AtomicBool::new(false),
             handoff: Once::new(),
+            receive: Notify::new(),
+            transmit: Notify::new(),
         }
+    }
+
+    /// The signal raised when the debug UART's receive path may hold a
+    /// byte.
+    ///
+    /// Async callers reach it through
+    /// [`DebugSerialWriter::wait_for_debug_serial_input`], which also
+    /// re-enables the receive interrupt; the accessor exists for a host
+    /// backend whose reader thread stands in for that interrupt.
+    pub fn receive_signal(&self) -> &Notify {
+        &self.receive
+    }
+
+    /// The signal raised when the debug UART may take a segment.
+    ///
+    /// Raised here on every transmit-role release.
+    pub fn transmit_signal(&self) -> &Notify {
+        &self.transmit
+    }
+
+    /// Builds the interrupt handler a backend registers on the UART's
+    /// receive interrupt source through
+    /// [`ExternalInterruptRoutes::set_debug_serial`].
+    ///
+    /// `Access` is the backend's own [`DebugSerialAccess`]: the handler
+    /// masks the port's receive interrupt through it and raises this
+    /// console's receive signal. It allocates nothing and takes no lock
+    /// beyond the ones [`Notify`] already holds.
+    ///
+    /// [`ExternalInterruptRoutes::set_debug_serial`]: super::interrupts::ExternalInterruptRoutes::set_debug_serial
+    pub fn interrupt_handler<Access: DebugSerialAccess>(
+        &'static self,
+    ) -> DebugSerialInterrupt<Access> {
+        DebugSerialInterrupt::new(&self.receive)
     }
 
     /// Hands one whole kernel record to the port without ever waiting.
@@ -392,6 +563,8 @@ impl DebugConsole {
 
     fn release_port(&self) {
         self.transmitting.store(false, Ordering::Release);
+        // A writer parked on the transmit signal may take the port now.
+        self.transmit.notify_all();
     }
 
     fn hand_over(&self, record: &[u8]) {
@@ -450,6 +623,40 @@ impl DebugConsole {
     }
 }
 
+/// The debug-UART receive interrupt handler a backend installs through
+/// [`ExternalInterruptRoutes::set_debug_serial`].
+///
+/// Build it with [`DebugConsole::interrupt_handler`]. It runs in
+/// interrupt context: it masks the port's receive interrupt through
+/// `Access` — the bytes stay in the device for the waiting task, and a
+/// level-triggered line must not re-raise until that task has taken
+/// them — then raises the console's receive signal. The waiter
+/// re-enables the interrupt when it arms. Nothing here allocates or
+/// takes a lock beyond the interrupt-safe ones `Notify::notify_all`
+/// already touches.
+///
+/// [`ExternalInterruptRoutes::set_debug_serial`]: super::interrupts::ExternalInterruptRoutes::set_debug_serial
+pub struct DebugSerialInterrupt<Access> {
+    receive: &'static Notify,
+    access: core::marker::PhantomData<Access>,
+}
+
+impl<Access: DebugSerialAccess> DebugSerialInterrupt<Access> {
+    const fn new(receive: &'static Notify) -> Self {
+        Self {
+            receive,
+            access: core::marker::PhantomData,
+        }
+    }
+}
+
+impl<Access: DebugSerialAccess> ExternalInterruptHandler for DebugSerialInterrupt<Access> {
+    fn handle_interrupt(&self) {
+        Access::port().disable_receive_interrupt();
+        self.receive.notify_all();
+    }
+}
+
 /// A `core::fmt` sink that gathers a whole record before it is emitted.
 struct SegmentWriter<'a> {
     buffer: &'a mut Vec<u8>,
@@ -480,12 +687,15 @@ mod tests {
 
     use alloc::vec;
     use alloc::vec::Vec;
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use core::task::Context;
     use std::sync::{Arc, Mutex};
     use std::thread;
 
     use helios_hal::serial::ByteSerial;
 
     use super::{DebugConsole, MAX_STREAM_SEGMENT_BYTES, stream_segment};
+    use crate::ExternalInterruptHandler;
 
     /// The RPC frame header the inspector scans for, byte for byte as
     /// `helios-inspector-protocol` writes it. The point of the test is
@@ -528,6 +738,10 @@ mod tests {
                 thread::yield_now();
             }
         }
+
+        fn enable_receive_interrupt(&self) {}
+
+        fn disable_receive_interrupt(&self) {}
     }
 
     /// One RPC frame as the guest's transport hands it over: the magic,
@@ -659,5 +873,214 @@ mod tests {
     fn a_long_stream_without_a_line_is_cut_at_the_bound() {
         let bytes = vec![b'a'; MAX_STREAM_SEGMENT_BYTES * 2];
         assert_eq!(stream_segment(&bytes).len(), MAX_STREAM_SEGMENT_BYTES);
+    }
+
+    /// A UART stand-in whose receive FIFO the test drives by hand, the
+    /// way the interrupt handler's status read would find it.
+    struct WaitPort {
+        fifo: Mutex<alloc::collections::VecDeque<u8>>,
+        /// The receive-interrupt mask bit, as the handler and the
+        /// waiters toggle it.
+        receive_interrupt_enabled: AtomicBool,
+    }
+
+    impl WaitPort {
+        const fn new() -> Self {
+            Self {
+                fifo: Mutex::new(alloc::collections::VecDeque::new()),
+                receive_interrupt_enabled: AtomicBool::new(false),
+            }
+        }
+
+        fn receive_interrupt_enabled(&self) -> bool {
+            self.receive_interrupt_enabled.load(Ordering::Acquire)
+        }
+
+        /// A byte the UART received: pushed by the test where the
+        /// interrupt would land it.
+        fn push(&'static self, byte: u8) {
+            self.fifo
+                .lock()
+                .expect("the wait-test FIFO was poisoned")
+                .push_back(byte);
+        }
+    }
+
+    impl ByteSerial for &'static WaitPort {
+        fn try_read_byte(&self) -> Option<u8> {
+            self.fifo
+                .lock()
+                .expect("the wait-test FIFO was poisoned")
+                .pop_front()
+        }
+
+        fn write_bytes(&self, _bytes: &[u8]) {}
+
+        fn enable_receive_interrupt(&self) {
+            self.receive_interrupt_enabled
+                .store(true, Ordering::Release);
+        }
+
+        fn disable_receive_interrupt(&self) {
+            self.receive_interrupt_enabled
+                .store(false, Ordering::Release);
+        }
+    }
+
+    /// The read loop every serial-input caller runs: arm the wait, try
+    /// the port, return its bytes, park on the signal when it was
+    /// empty.
+    async fn read_chunk<Access: super::DebugSerialAccess>(
+        writer: super::DebugSerialWriter,
+    ) -> Vec<u8> {
+        loop {
+            let wait = writer.wait_for_debug_serial_input();
+            let mut bytes = Vec::new();
+            super::read_debug_serial::<Access>(&mut bytes, 16);
+            if !bytes.is_empty() {
+                return bytes;
+            }
+            wait.await;
+        }
+    }
+
+    struct WaitAccessA;
+    static WAIT_CONSOLE_A: DebugConsole = DebugConsole::new();
+    static WAIT_PORT_A: WaitPort = WaitPort::new();
+
+    impl super::DebugSerialAccess for WaitAccessA {
+        type Port = &'static WaitPort;
+
+        fn port() -> &'static WaitPort {
+            &WAIT_PORT_A
+        }
+
+        fn console() -> &'static DebugConsole {
+            &WAIT_CONSOLE_A
+        }
+    }
+
+    /// A byte that lands after the wait was armed but before it was
+    /// awaited is not lost: the armed wait samples the broadcast
+    /// generation at creation, so the interrupt's `notify_all` between
+    /// the empty test and the park still completes it.
+    #[test]
+    fn a_byte_arriving_between_the_test_and_the_park_is_not_lost() {
+        let writer = super::DebugSerialWriter::of::<WaitAccessA>();
+        let wait = writer.wait_for_debug_serial_input();
+        let mut bytes = Vec::new();
+        super::read_debug_serial::<WaitAccessA>(&mut bytes, 16);
+        assert!(bytes.is_empty());
+        // The UART delivers the byte and its interrupt fires here.
+        WAIT_PORT_A.push(b'x');
+        WAIT_CONSOLE_A.receive_signal().notify_all();
+
+        futures_lite::future::block_on(wait);
+
+        assert_eq!(
+            futures_lite::future::block_on(read_chunk::<WaitAccessA>(writer)),
+            b"x"
+        );
+    }
+
+    struct WaitAccessB;
+    static WAIT_CONSOLE_B: DebugConsole = DebugConsole::new();
+    static WAIT_PORT_B: WaitPort = WaitPort::new();
+
+    impl super::DebugSerialAccess for WaitAccessB {
+        type Port = &'static WaitPort;
+
+        fn port() -> &'static WaitPort {
+            &WAIT_PORT_B
+        }
+
+        fn console() -> &'static DebugConsole {
+            &WAIT_CONSOLE_B
+        }
+    }
+
+    /// A `notify_all` that finds an empty FIFO wakes the reader into
+    /// one more test and a fresh park — never an empty-handed return.
+    #[test]
+    fn a_spurious_receive_notify_parks_the_reader_again() {
+        let writer = super::DebugSerialWriter::of::<WaitAccessB>();
+        let mut read = core::pin::pin!(read_chunk::<WaitAccessB>(writer));
+        // FIFO empty: the read parks on the receive signal.
+        assert!(
+            futures_lite::future::block_on(futures_lite::future::poll_once(read.as_mut()))
+                .is_none()
+        );
+        // The stray broadcast: nothing arrived on the UART, so the woken
+        // reader re-tests, finds the FIFO still empty, and parks again.
+        WAIT_CONSOLE_B.receive_signal().notify_all();
+        assert!(
+            futures_lite::future::block_on(futures_lite::future::poll_once(read.as_mut()))
+                .is_none()
+        );
+
+        WAIT_PORT_B.push(b'y');
+        WAIT_CONSOLE_B.receive_signal().notify_all();
+        assert_eq!(futures_lite::future::block_on(read), b"y");
+    }
+
+    struct WaitAccessC;
+    static WAIT_CONSOLE_C: DebugConsole = DebugConsole::new();
+    static WAIT_PORT_C: WaitPort = WaitPort::new();
+
+    impl super::DebugSerialAccess for WaitAccessC {
+        type Port = &'static WaitPort;
+
+        fn port() -> &'static WaitPort {
+            &WAIT_PORT_C
+        }
+
+        fn console() -> &'static DebugConsole {
+            &WAIT_CONSOLE_C
+        }
+    }
+
+    /// The handler masks the port's receive interrupt before it signals,
+    /// and every way of arming a wait — the future, the reusable waiter,
+    /// a parking poll — re-enables it, so a level-triggered line is quiet
+    /// between the interrupt and the drain and live again before the
+    /// reader parks.
+    #[test]
+    fn the_handler_masks_the_receive_line_and_arming_re_enables_it() {
+        let writer = super::DebugSerialWriter::of::<WaitAccessC>();
+        let handler = WAIT_CONSOLE_C.interrupt_handler::<WaitAccessC>();
+
+        let wait = writer.wait_for_debug_serial_input();
+        assert!(WAIT_PORT_C.receive_interrupt_enabled());
+
+        handler.handle_interrupt();
+        assert!(!WAIT_PORT_C.receive_interrupt_enabled());
+        // The signal the handler raised completes the wait that was
+        // armed before it fired.
+        futures_lite::future::block_on(wait);
+
+        let mut waiter = writer.debug_serial_input_waiter();
+        assert!(WAIT_PORT_C.receive_interrupt_enabled());
+
+        handler.handle_interrupt();
+        assert!(!WAIT_PORT_C.receive_interrupt_enabled());
+        // The waiter observes that broadcast, and the poll that parks
+        // afterwards re-arms the line.
+        let waker = futures_lite::future::block_on(async {
+            core::future::poll_fn(|cx| core::task::Poll::Ready(cx.waker().clone())).await
+        });
+        let mut cx = Context::from_waker(&waker);
+        assert!(
+            writer
+                .poll_debug_serial_input(&mut cx, &mut waiter)
+                .is_ready()
+        );
+        assert!(WAIT_PORT_C.receive_interrupt_enabled());
+        (&WAIT_PORT_C).disable_receive_interrupt();
+        assert!(
+            writer
+                .poll_debug_serial_input(&mut cx, &mut waiter)
+                .is_pending()
+        );
+        assert!(WAIT_PORT_C.receive_interrupt_enabled());
     }
 }

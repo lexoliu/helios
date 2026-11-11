@@ -18,6 +18,35 @@ pub(super) enum DhcpClientState {
     Bound,
 }
 
+impl DhcpClientState {
+    /// Whether `message` is a reply to the request this client has
+    /// outstanding.
+    ///
+    /// RFC 2131 §4.3.2 and §4.4.1 (table 4) make DHCPACK and DHCPNAK
+    /// meaningful only in REQUESTING, RENEWING, REBINDING and REBOOTING,
+    /// and require a client to discard a message whose `xid` is not its
+    /// own; §3.1 has the selected server alone answer the REQUEST, and a
+    /// server's NAK carries its server identifier (§4.3.2, table 3).
+    /// This client has no RENEWING, REBINDING or REBOOTING state (a
+    /// lease is never renewed), so `Requesting` is the only state that
+    /// accepts a reply; `Bound` never does. REBINDING would be the one
+    /// state where a server other than the selected one may answer
+    /// (§4.4.4), and would need its own arm here.
+    pub(super) fn accepts_reply(&self, message: &DhcpServerMessage) -> bool {
+        match *self {
+            Self::Requesting {
+                transaction_id,
+                server_identifier,
+                ..
+            } => {
+                message.transaction_id == transaction_id
+                    && message.server_identifier == Some(server_identifier)
+            }
+            Self::Init { .. } | Self::Selecting { .. } | Self::Bound => false,
+        }
+    }
+}
+
 impl<CpuImpl, DeviceImpl> NetworkService<CpuImpl, DeviceImpl>
 where
     CpuImpl: Cpu + Clone,
@@ -435,6 +464,30 @@ where
         NetworkService::tcp_read(self, stream, max_bytes, timeout_nanos).await
     }
 
+    fn tcp_try_read(
+        &self,
+        stream: Self::TcpStream,
+        max_bytes: usize,
+    ) -> Result<crate::TcpReadProgress, TcpError> {
+        NetworkService::tcp_try_read(self, stream, max_bytes)
+    }
+
+    fn tcp_send_room(&self, stream: Self::TcpStream) -> Result<crate::TcpWriteProgress, TcpError> {
+        NetworkService::tcp_send_room(self, stream)
+    }
+
+    fn tcp_try_write(
+        &self,
+        stream: Self::TcpStream,
+        bytes: &mut Bytes,
+    ) -> Result<crate::TcpWriteProgress, TcpError> {
+        NetworkService::tcp_try_write(self, stream, bytes)
+    }
+
+    async fn tcp_write_ready(&self, stream: Self::TcpStream) -> Result<(), TcpError> {
+        NetworkService::tcp_write_ready(self, stream).await
+    }
+
     async fn tcp_read_into<'a>(
         &'a self,
         stream: Self::TcpStream,
@@ -780,8 +833,8 @@ impl NetworkShard {
                         last_sent: now,
                     };
                 }
-                (DhcpClientState::Requesting { transaction_id, .. }, DhcpMessageType::Ack)
-                    if message.transaction_id == transaction_id =>
+                (DhcpClientState::Requesting { .. }, DhcpMessageType::Ack)
+                    if self.dhcp.accepts_reply(&message) =>
                 {
                     let prefix_len = message
                         .subnet_mask
@@ -789,7 +842,8 @@ impl NetworkShard {
                         .transpose()?
                         .ok_or(NetworkControlError::InvalidAddress)?;
                     self.stack
-                        .add_ipv4_address(Ipv4Cidr::new(message.your_ip, prefix_len));
+                        .add_ipv4_address(Ipv4Cidr::new(message.your_ip, prefix_len))
+                        .map_err(|_| NetworkControlError::InvalidAddress)?;
                     if let Some(router) = message.router {
                         self.set_default_ipv4_gateway(map_ipv4_address(router))?;
                     }
@@ -797,13 +851,22 @@ impl NetworkShard {
                     self.dns_servers.extend(message.dns_servers);
                     self.dhcp = DhcpClientState::Bound;
                 }
-                (_, DhcpMessageType::Nak) => {
+                (DhcpClientState::Requesting { .. }, DhcpMessageType::Nak)
+                    if self.dhcp.accepts_reply(&message) =>
+                {
                     self.stack.clear_ipv4_addresses();
                     self.dhcp = DhcpClientState::Init {
                         transaction_id: next_transaction_id(message.transaction_id),
                     };
                 }
-                _ => {}
+                (state, message_type) => {
+                    tracing::debug!(
+                        ?state,
+                        ?message_type,
+                        transaction_id = message.transaction_id,
+                        "dropped DHCP message that is not a reply to the outstanding exchange"
+                    );
+                }
             }
         }
 
@@ -1025,7 +1088,9 @@ impl NetworkShard {
         now: StackInstant,
     ) -> Result<(), NetworkControlError> {
         if self.stack.ipv6_link_local_address().is_none() {
-            self.stack.configure_ipv6_link_local();
+            self.stack
+                .configure_ipv6_link_local()
+                .map_err(|_| NetworkControlError::BackendFault)?;
         }
         self.stack
             .drive_ipv6_autoconfig(now)

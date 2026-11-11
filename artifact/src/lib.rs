@@ -2,10 +2,13 @@
 
 extern crate alloc;
 
+pub mod bootfs;
+
 use alloc::vec::Vec;
 use core::fmt;
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use helios_hal::cpu::GUEST_STACK_LIMIT_OFFSET;
 use serde::{Deserialize, Serialize};
 use serde_big_array::BigArray;
 use thiserror::Error;
@@ -41,6 +44,23 @@ pub fn cwasm_target_supports_wasm_simd(target: &str) -> bool {
     !target.starts_with("riscv64")
 }
 
+/// Where code compiled for `target` finds the stack limit its interruption
+/// checks compare against: `Some(offset)` when it is the word at `offset` in
+/// the executing processor's local block, `None` when it is the store's own
+/// runtime context.
+///
+/// A bare-metal Helios kernel keeps the word in every processor's block at
+/// [`GUEST_STACK_LIMIT_OFFSET`], which makes each check one compare against
+/// a processor-relative address with no register held for it. The hosted
+/// backend runs guests as threads of a host process and keeps the limit in
+/// the store. The compiler and the kernel engine both take the location from
+/// here, and the engine refuses a cwasm compiled for the other one.
+pub fn cwasm_target_guest_stack_limit_offset(target: &str) -> Option<i32> {
+    let os = target.split('-').nth(2);
+    (os == Some("none")).then_some(GUEST_STACK_LIMIT_OFFSET)
+}
+
+/// Returns the ISA flags shared by host prebuilds and in-kernel compilation.
 pub fn cwasm_target_cranelift_flags(target: &str) -> &'static [&'static str] {
     if target.starts_with("aarch64-") {
         return &["has_lse", "has_fp16"];
@@ -56,6 +76,17 @@ pub fn cwasm_target_cranelift_flags(target: &str) -> &'static [&'static str] {
             "has_bmi1",
             "has_bmi2",
             "has_lzcnt",
+            // This is x86-64-v3 (AVX2/FMA/BMI/LZCNT), exposed by every x86
+            // cloud KVM instance type. AVX-512 is excluded because artifacts
+            // are compiled once for host prebuild/bootfs and the in-kernel
+            // compiler plugin with this same set, while much of the x86 KVM
+            // fleet lacks AVX-512. Kernel engines call
+            // Config::detect_host_feature(detect_x86_native_feature), and
+            // Wasmtime rejects unavailable enabled ISA flags before mapping
+            // an artifact's code.
+            "has_avx",
+            "has_avx2",
+            "has_fma",
         ];
     }
     &[]
@@ -259,6 +290,39 @@ impl fmt::Display for SignatureAlgorithm {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SignatureAlgorithm::Ed25519 => f.write_str("ed25519"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GUEST_STACK_LIMIT_OFFSET, cwasm_target_guest_stack_limit_offset};
+
+    /// Every bare-metal kernel target reads the processor's word; a hosted
+    /// target keeps the limit in the store.
+    #[test]
+    fn only_bare_metal_targets_read_the_processor_word() {
+        for target in [
+            "x86_64-unknown-none",
+            "aarch64-unknown-none",
+            "riscv64gc-unknown-none-elf",
+        ] {
+            assert_eq!(
+                cwasm_target_guest_stack_limit_offset(target),
+                Some(GUEST_STACK_LIMIT_OFFSET),
+                "{target}"
+            );
+        }
+        for target in [
+            "x86_64-unknown-linux-gnu",
+            "aarch64-apple-darwin",
+            "aarch64-unknown-linux-gnu",
+        ] {
+            assert_eq!(
+                cwasm_target_guest_stack_limit_offset(target),
+                None,
+                "{target}"
+            );
         }
     }
 }

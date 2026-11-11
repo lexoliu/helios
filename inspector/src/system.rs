@@ -35,6 +35,8 @@ pub enum SystemError {
     NoInstanceNamed { name: String },
     #[error("the guest refused to stop instance {id}: {reason}")]
     KillRefused { id: u64, reason: &'static str },
+    #[error("the guest refused to enable the tracing target {target}: {detail}")]
+    TargetRefused { target: String, detail: String },
     #[error("failed to render a guest tracing event: {source}")]
     Render {
         #[from]
@@ -61,6 +63,7 @@ impl SystemError {
             Self::UnknownLevel { .. }
             | Self::NoInstanceNamed { .. }
             | Self::KillRefused { .. }
+            | Self::TargetRefused { .. }
             | Self::Render { .. }
             | Self::Signals { .. }
             | Self::Write { .. } => None,
@@ -206,11 +209,14 @@ pub async fn fetch_tracing(
 
 pub async fn run_tracing(
     mut client: RpcClient,
-    limit: u32,
-    min_level: Option<&str>,
-    target_prefixes: Vec<String>,
+    command: &TracingCommand,
 ) -> Result<(), SystemError> {
-    let config = tracing_config(limit, min_level, target_prefixes)?;
+    enable_tracing_targets(&client, &command.enable_target).await?;
+    let config = tracing_config(
+        command.limit,
+        command.min_level.as_deref(),
+        command.target_prefix.clone(),
+    )?;
     stream_tracing(&mut client, &config).await
 }
 
@@ -218,12 +224,41 @@ pub async fn stream_tracing_command(
     client: &mut RpcClient,
     command: &TracingCommand,
 ) -> Result<(), SystemError> {
+    enable_tracing_targets(client, &command.enable_target).await?;
     let config = tracing_config(
         command.limit,
         command.min_level.as_deref(),
         command.target_prefix.clone(),
     )?;
     stream_tracing(client, &config).await
+}
+
+/// Turns each kernel diagnostic target in `targets` on for the rest of
+/// the boot. The guest refuses a name no kernel module registered, and
+/// that refusal is the error — a session that asked for a target it
+/// misspelled fails here rather than streaming an empty log.
+pub async fn enable_tracing_targets(
+    client: &RpcClient,
+    targets: &[String],
+) -> Result<(), SystemError> {
+    for target in targets {
+        let refused = remote::call(
+            tracing::set_target_enabled(client, target, true),
+            "remote tracing target enablement",
+        )
+        .await
+        .map_err(|source| SystemError::Fetch {
+            what: "tracing target enablement",
+            source,
+        })?;
+        refused.map_err(|error| SystemError::TargetRefused {
+            target: target.clone(),
+            detail: match error {
+                tracing::TargetError::UnknownTarget(name) => name,
+            },
+        })?;
+    }
+    Ok(())
 }
 
 pub fn tracing_config(

@@ -21,13 +21,16 @@ Advisory: this report is from `{{ report.run.runner_label }}`, not a dedicated r
 | `helios-inspector`/`helios-cli`, baseline | `{{ report.run.baseline_inspector_git_sha }}` |
 {% endif %}
 | Vendored Wasmtime | `{{ report.pins.wasmtime_revision }}` |
+{% if report.pins.baseline_wasmtime_revision %}
+| Vendored Wasmtime, baseline | `{{ report.pins.baseline_wasmtime_revision }}` |
+{% endif %}
 | Wasmtime on Linux | `{{ report.pins.wasmtime_linux_release }}` |
 | Fedora image | `{{ report.pins.fedora_image_sha256[:16] }}…` |
 | QEMU | pinned `{{ report.pins.qemu_version }}`, ran `{{ report.hardware.qemu_version or "unknown" }}` |
 | Guest | {{ report.pins.vcpus }} vCPUs, {{ report.pins.memory }} (Helios) / {{ report.pins.linux_vm_memory }} (Linux), `{{ report.pins.net_backend }}` network, {{ report.pins.devices | join(", ") }} |
 | Host | {{ report.hardware.cpu }}, {{ report.hardware.logical_cpus }} logical CPUs, {{ report.hardware.accelerator }} |
 {% if report.control %}
-| Noise floor | {{ report.control.noise_floor | percent }} from `{{ report.control.workload }}` before and after the suite |
+| Noise floor | {{ report.control.noise_floor | percent }} from `{{ report.control.workload }}` before and after the suite{% if report.run.noise_retry %}{% if report.run.noise_retry.kind == "skipped-for-budget" %}; the retry was skipped — the second pass would need {{ report.run.noise_retry.needed_seconds | seconds }} and {{ report.run.noise_retry.remaining_seconds | seconds }} of the job's budget remain{% else %}; retried once after a first pass at {{ report.run.noise_retry.first_noise_floor | percent }}{% endif %}{% endif %} |
 {% endif %}
 
 {% for workload_class, workloads in report.by_class().items() %}

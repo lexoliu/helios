@@ -333,3 +333,114 @@ def test_a_footprint_moves_in_pages(paired_flat_report: Report) -> None:
     row = next(row for row in result.rows if row.measurement == "memory_per_instance_bytes")
     assert row.beyond_noise and row.regression
     assert result.blocking
+
+
+def test_a_pair_of_freshly_collected_columns_is_not_underprofiled(
+    paired_flat_report: Report,
+) -> None:
+    """478 of 27,615 uncovered is what a collection of the commit itself
+    leaves (run 34737497450): both columns of a paired run sit there."""
+    run = paired_flat_report.run.model_copy(
+        update={
+            "kernel_build": "profile-use",
+            "baseline_kernel_build": "profile-use",
+            "kernel_pgo_uncovered": 478,
+            "kernel_pgo_functions": 27615,
+            "baseline_kernel_pgo_uncovered": 501,
+            "baseline_kernel_pgo_functions": 27500,
+        }
+    )
+    report = paired_flat_report.model_copy(update={"run": run})
+
+    result = evaluate_paired(report)
+    assert result.underprofiled == []
+    assert result.pgo_uncovered == {"baseline": (501, 27500), "candidate": (478, 27615)}
+    assert not result.inconclusive and not result.blocking
+
+
+@pytest.mark.parametrize(
+    ("column", "uncovered_field", "functions_field"),
+    [
+        ("candidate", "kernel_pgo_uncovered", "kernel_pgo_functions"),
+        ("baseline", "baseline_kernel_pgo_uncovered", "baseline_kernel_pgo_functions"),
+    ],
+)
+def test_an_underprofiled_column_is_inconclusive_and_named(
+    paired_flat_report: Report, column: str, uncovered_field: str, functions_field: str
+) -> None:
+    """#384: a column built against a profile collected from another
+    commit is not the profiled image the pairing is between.
+
+    The week's pairs put the candidate at 3,377–4,251 uncovered functions
+    against the baseline's 501; the gate reads that as the profile not
+    describing the commit, and no row takes a verdict.
+    """
+    run = paired_flat_report.run.model_copy(
+        update={
+            "kernel_build": "profile-use",
+            "baseline_kernel_build": "profile-use",
+            "kernel_pgo_uncovered": 478,
+            "kernel_pgo_functions": 27615,
+            "baseline_kernel_pgo_uncovered": 501,
+            "baseline_kernel_pgo_functions": 27500,
+            uncovered_field: 3800,
+            functions_field: 27500,
+        }
+    )
+    report = paired_flat_report.model_copy(update={"run": run})
+
+    result = evaluate_paired(report)
+    assert result.underprofiled == [column]
+    assert result.inconclusive and result.blocking
+    assert result.regressions == [] and result.improvements == []
+
+    text = render_gate(gate_report(report, None), report.run.lane)
+    assert f"`{column}`" in text
+    assert "3,800 of 27,500 functions uncovered" in text
+    assert "5.0%" in text
+    assert "the run is rerun with a profile collected from that commit, not read" in text
+    assert "| inconclusive |" in text
+
+
+def test_a_profile_pairing_of_one_commit_measures_its_stale_column(paired_flat_report: Report) -> None:
+    """`suite-pgo` pairs one commit against itself and varies the profile:
+    the fetched one against this run's collection. The fetched column
+    being under-profiled is what that pairing measures (docs/pgo.md), so
+    the rule for two commits (#384) does not read it as inconclusive."""
+    run = paired_flat_report.run.model_copy(
+        update={
+            "baseline_ref": None,
+            "baseline_git_sha": paired_flat_report.run.helios_git_sha,
+            "kernel_build": "profile-use",
+            "baseline_kernel_build": "profile-use",
+            "kernel_pgo_uncovered": 478,
+            "kernel_pgo_functions": 27615,
+            "baseline_kernel_pgo_uncovered": 3800,
+            "baseline_kernel_pgo_functions": 27500,
+        }
+    )
+    report = paired_flat_report.model_copy(update={"run": run})
+
+    result = evaluate_paired(report)
+    assert result.pgo_uncovered == {"baseline": (3800, 27500), "candidate": (478, 27615)}
+    assert result.underprofiled == []
+    assert not result.inconclusive
+
+
+def test_a_column_with_no_counts_is_not_underprofiled(paired_flat_report: Report) -> None:
+    """A `release` plain control reads no profile and records none: a
+    missing count is a different build, not an under-profiled one."""
+    run = paired_flat_report.run.model_copy(
+        update={
+            "kernel_build": "profile-use",
+            "baseline_kernel_build": "release",
+            "kernel_pgo_uncovered": 478,
+            "kernel_pgo_functions": 27615,
+        }
+    )
+    report = paired_flat_report.model_copy(update={"run": run})
+
+    result = evaluate_paired(report)
+    assert result.pgo_uncovered == {"candidate": (478, 27615)}
+    assert result.underprofiled == []
+    assert not result.inconclusive

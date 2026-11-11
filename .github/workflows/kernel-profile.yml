@@ -5,10 +5,19 @@ name: kernel-profile
 # Every x86-64 release build spends the kernel profile this workflow
 # uploads (#226): one `helios-kernel-profdata` artifact holding the merged
 # `helios-kernel.profdata`, collected on the lane's own machine by
-# `.github/actions/collect-kernel-profile`. It is dispatched by hand when
-# the kernel has moved enough for its counts to have aged, and runs on a
-# schedule so the artifact never ages past GitHub's retention: a lane that
-# fetches an expired profile fails at the fetch, by design.
+# `.github/actions/collect-kernel-profile`. It runs on every push to `dev`
+# that touches what the kernel image is built from (#385): `helios-cli
+# profile-fetch` spends the newest collection on the default branch, and
+# between a monthly collection and the next `dev` merged kernel changes
+# several times a day — `dev` at 9541b9ec built 3,377 of 27,500 functions
+# uncovered against the profile collected at 5fe1df2b, and a release
+# kernel built that way is optimised on the profile of another kernel.
+# A burst of merges collects once, for the newest: an in-flight push
+# collection is cancelled by the next, so the last artifact uploaded is
+# the last commit's rather than whichever run finished last. It can still
+# be dispatched by hand, and runs on a schedule so the artifact never
+# ages past GitHub's retention: a lane that fetches an expired profile
+# fails at the fetch, by design.
 #
 # `bench-suite.yml`'s `profile-generate` job calls this workflow, so the
 # profile `suite-pgo` spends and the one a release build reads come from
@@ -21,15 +30,86 @@ name: kernel-profile
 
 on:
   workflow_dispatch:
+  push:
+    branches: [dev]
+    # What the x86-64 kernel image and the workloads it is profiled on
+    # are built from: the kernel crates and their layers below (§1 of
+    # AGENTS.md), the backend, the root crate, the guest programs the
+    # bootfs embeds, the workload manifest and the WASI apps the
+    # collection boots, the collection sequence itself, and the Wasmtime
+    # pin. A merge that touches none of these leaves the profile as it
+    # was.
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".cargo/**"
+      - "src/**"
+      - "hal/**"
+      - "netstack/**"
+      - "virtio/**"
+      - "i6300esb/**"
+      - "compiler-abi/**"
+      - "artifact/**"
+      - "kernel/**"
+      - "x86/**"
+      - "api/**"
+      - "api-macro/**"
+      - "programs/**"
+      - "compiler-plugin/**"
+      - "wit/**"
+      - "tools/bench/manifest.toml"
+      - "tools/wasi-apps/**"
+      - "docs/wasmtime.md"
+      - ".github/actions/**"
+      - ".github/workflows/kernel-profile.yml"
   schedule:
     # The first of every month. Artifacts live ninety days at most.
     - cron: "17 3 1 * *"
   workflow_call:
+    inputs:
+      ref:
+        description: >-
+          Commit, branch or tag to collect the profile from; the
+          collection runs that ref's own checkout. Empty means the
+          caller's github.sha.
+        type: string
+        default: ""
+      artifact:
+        description: Name the merged profile is uploaded under
+        type: string
+        default: helios-kernel-profdata
+      root:
+        description: >-
+          Directory, relative to the workspace, the collection lays the
+          Helios checkout and the Wasmtime fork its ref pins out in, side
+          by side; empty means the workspace itself. The profile names
+          Wasmtime's crates by the fork's absolute path (#359), so a
+          paired baseline pinning another fork than its candidate's is
+          collected in the directory the suite builds it in (#486).
+        type: string
+        default: ""
 
 jobs:
   kernel-profile:
     name: kernel-profile
     runs-on: ubuntu-24.04
+    # A push collection is superseded by the next push: the newest
+    # commit's profile is the one `profile-fetch` should find newest, so
+    # the older run is cancelled rather than left to finish last. Every
+    # other event gets a group of its own — a dispatch, or a call from
+    # `bench-suite.yml`, whose own concurrency already governs it. Each
+    # call of one run is its own group too, keyed by the artifact it
+    # uploads: the `profile-columns` matrix calls this workflow once per
+    # column within one run, and one group for all of them ran them one
+    # after another (run 38940834451: the baseline's collection started
+    # when the candidate's finished) and would cancel a third that queued
+    # behind a pending second.
+    concurrency:
+      group: >-
+        ${{ github.event_name == 'push'
+            && format('kernel-profile-push-{0}', github.ref)
+            || format('kernel-profile-{0}-{1}-{2}', github.run_id, github.job, inputs.artifact) }}
+      cancel-in-progress: ${{ github.event_name == 'push' }}
     timeout-minutes: 240
     permissions:
       contents: read
@@ -37,24 +117,39 @@ jobs:
       # The lane whose workloads and machine the profile describes: the
       # one benchmark lane of AGENTS.md §3.6.
       BENCH_LANE: x86-64-kvm
+      # Where the build runs: `helios/` and `wasmtime/` in the workspace,
+      # or side by side under `root`. The actions are always read from
+      # `helios/`, because a job's `uses:` cannot be an expression.
+      CHECKOUT_PATH: ${{ inputs.root && format('{0}/helios', inputs.root) || 'helios' }}
+      WASMTIME_PATH: ${{ inputs.root && format('{0}/wasmtime', inputs.root) || 'wasmtime' }}
     steps:
       - uses: actions/checkout@v4
         with:
           path: helios
+          ref: ${{ inputs.ref || github.sha }}
+      - name: Lay the checkout out under the column's root
+        if: inputs.root != ''
+        run: git -C helios worktree add --detach "$GITHUB_WORKSPACE/$CHECKOUT_PATH" HEAD
       - uses: ./helios/.github/actions/checkout-wasmtime
+        with:
+          path: ${{ env.WASMTIME_PATH }}
       - uses: ./helios/.github/actions/bench-host
         with:
+          checkout-path: ${{ env.CHECKOUT_PATH }}
           rust-cache-key: kernel-profile
           network-tools: "true"
           bench-tooling: "true"
       - uses: ./helios/.github/actions/collect-kernel-profile
         with:
+          checkout-path: ${{ env.CHECKOUT_PATH }}
           lane: ${{ env.BENCH_LANE }}
           limine-dir: ${{ github.workspace }}/limine
           output: ${{ github.workspace }}/profiles/helios-kernel.profdata
       - uses: actions/upload-artifact@v4
         with:
-          name: helios-kernel-profdata
+          # Dispatch and schedule runs leave `inputs.artifact` empty; they
+          # publish the fetched profile under its stable name.
+          name: ${{ inputs.artifact || 'helios-kernel-profdata' }}
           path: profiles/helios-kernel.profdata
           if-no-files-found: error
           retention-days: 90

@@ -38,30 +38,37 @@ pub(crate) use service::fixture::EstablishedTcpFixture;
 /// Bringing a discovered interface online: the one place a backend
 /// hands the kernel a network device.
 ///
-/// A backend's job ends at the device. Building the service over it,
-/// publishing it to the component host and giving it a packet pump are
-/// the same three steps on every target, so they live here rather than
-/// being repeated — and, as #131 showed, repeated incompletely — in
-/// `x86/`, `aarch64/` and `riscv/`.
+/// A backend's job ends at the device. Building the service over it
+/// and publishing it are the same two steps on every target, so they
+/// live here rather than being repeated — and, as #131 showed,
+/// repeated incompletely — in `x86/`, `aarch64/` and `riscv/`.
+///
+/// What installs nothing here is the packet pump: a queue pair's
+/// interrupt is routed to one processor, so the pump that drains the
+/// pair is pinned to that processor and is started by its own run
+/// loop, which awaits the install this publishes
+/// ([`crate::RuntimeState::wait_for_network_service`]).
 #[cfg(feature = "wasmtime-runtime")]
 impl<CpuImpl, WatchdogImpl> crate::Kernel<CpuImpl, WatchdogImpl>
 where
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     WatchdogImpl: helios_hal::watchdog::Watchdog + Clone,
 {
-    /// Installs the network service over `device` and starts its packet
-    /// pump.
+    /// Installs the network service over `device`.
     ///
-    /// The pump is not a backend's decision. It is the only task that
-    /// advances the interface when no socket is polling it, and the
-    /// only waiter whose park is bounded by a protocol deadline rather
-    /// than by some application's timeout — so it is what keeps the
-    /// guest answering ARP and acknowledging segments while every
-    /// socket on the machine is parked. An interface installed without
-    /// one falls silent as soon as its last reader parks, which is
-    /// exactly what #131 saw on the x86 tap lane: the host's neighbour
-    /// entry for a live guest went `FAILED` in the middle of a
-    /// transfer.
+    /// The pumps the service drives are not a backend's decision — or
+    /// this call's. One pump per queue pair is what advances the
+    /// interface when no socket is polling it, and the only waiters
+    /// whose park is bounded by a protocol deadline rather than by
+    /// some application's timeout — so they are what keeps the guest
+    /// answering ARP and acknowledging segments while every socket on
+    /// the machine is parked. An interface installed without them
+    /// falls silent as soon as its last reader parks, which is exactly
+    /// what #131 saw on the x86 tap lane: the host's neighbour entry
+    /// for a live guest went `FAILED` in the middle of a transfer.
+    /// Publishing the service is what releases them: each pump is
+    /// pinned to the processor that owns its pair and was already
+    /// parked on this install completing.
     pub fn install_network_interface<ProgramService, HostFsService, DeviceImpl>(
         &self,
         runtime_state: &crate::RuntimeState<
@@ -82,10 +89,6 @@ where
             self.timer(),
             device,
         );
-        let pump = service.clone();
         runtime_state.install_network_service(service);
-        self.spawn_detached(async move {
-            pump.run_packet_pump().await;
-        });
     }
 }

@@ -21,34 +21,40 @@ This script:
    `wasi_snapshot_preview1.command.wasm` adapter.
 2. Wraps the preview1 core module into a WASI P2 component via
    `wasm-tools component new --adapt …`.
-3. Installs `python3.wasm` and `lib/python3.14/` (the CPython stdlib)
-   under `artifacts/python3-root/`.
-4. Downloads and extracts the pinned official Wasmer WEBc images for
+3. Compiles the stdlib to bytecode with the interpreter it just staged
+   (`python.wasm -m compileall --invalidation-mode unchecked-hash`,
+   run under the wasmtime CLI of the same pinned release), so every
+   module carries a `__pycache__` entry that a read-only bootfs can
+   load without validating a source mtime.
+4. Installs `python3.wasm` and `lib/python3.14/` (the CPython stdlib
+   with its bytecode) under `artifacts/python3-root/`.
+5. Downloads and extracts the pinned official Wasmer WEBc images for
    `sharrattj/dash` `1.0.19`, `wasmer/bash` `1.0.25`, and
    `wasmer/coreutils` `1.0.19`; validates their raw wasm atoms with
    `wasm-tools`.
-5. Builds `quickjs-ng/quickjs` `v0.14.0` from source with Zig's
+6. Builds `quickjs-ng/quickjs` `v0.14.0` from source with Zig's
    `wasm32-wasi` C toolchain, `-O3`, and `-msimd128`; the script fails if
    the resulting `qjs.wasm` has no wasm SIMD instructions.
-6. Builds the helios `curl-wasi` program from source with the optimized
+7. Builds the helios `curl-wasi` program from source with the optimized
    release profile into `artifacts/wasi-tools/`, along with
    `wasi-curl.wasm`, the plain-WASI HTTP/1.1 client the curl workloads'
    Linux + Wasmtime cells run under `wasmtime run -S inherit-network`
    (the Helios `curl.wasm` imports `helios:system/programs`, which
    upstream Wasmtime cannot instantiate).
-7. Derives `artifacts/wasix/coreutils/coreutils-wasi.wasm` from the
+8. Derives `artifacts/wasix/coreutils/coreutils-wasi.wasm` from the
    coreutils atom with `tools/wasi-apps/stub-wasix-imports.py`, which
    defines the imported shared `env.memory` locally and replaces every
    `wasix_32v1` import with a stub so upstream Wasmtime loads the same
    module; it is what the `stdio-pipe` and `fs-*` workloads' Linux +
    Wasmtime cells run under `wasmtime run --dir`.
-8. Builds the Helios WASIX conformance WAT modules for thread/futex and
+9. Builds the Helios WASIX conformance WAT modules for thread/futex and
    stack continuation execution into `artifacts/wasix/`.
 
 Artifacts produced:
 
 - `artifacts/python3-root/python3.wasm` — real CPython 3.14 component.
-- `artifacts/python3-root/lib/python3.14/` — CPython standard library.
+- `artifacts/python3-root/lib/python3.14/` — CPython standard library,
+  with unchecked-hash bytecode under every `__pycache__/`.
 - `artifacts/wasix/dash/dash.wasm` — standard WASIX dash raw module.
 - `artifacts/wasix/bash/bash.wasm` — standard Wasmer WASIX Bash raw module.
 - `artifacts/wasix/quickjs/qjs.wasm` — QuickJS-NG WASI raw module built
@@ -67,6 +73,32 @@ Artifacts produced:
 - `artifacts/wasix/continuation/continuation.wasm` — Helios WASIX
   conformance module covering `stack_checkpoint`, `stack_restore`, and
   the asyncify unwind/rewind exports expected by the adapter.
+- `artifacts/wasix/atomic-wait-timeout/atomic-wait-timeout.wasm` — Helios
+  conformance module covering a timed `memory.atomic.wait32` with no
+  notifier: it must return 2 (timed out) once its timeout has elapsed on
+  the monotonic clock.
+- `artifacts/wasix/atomic-wait-kill/atomic-wait-kill.wasm` — Helios
+  conformance module covering a thread parked forever in
+  `memory.atomic.wait32`: signalling it must cancel the wait and unwind the
+  thread, so joining it returns.
+- `artifacts/wasix/orphan-threads/orphan-threads.wasm` — Helios
+  conformance module covering a process whose main returns while one
+  thread is parked forever in `memory.atomic.wait32` and another spins:
+  the process must end with main's status and its output must close.
+- `artifacts/wasix/thread-proc-exit/thread-proc-exit.wasm` — Helios
+  conformance module covering `proc_exit` on a spawned thread while main
+  is parked forever in `memory.atomic.wait32`: the whole process must end
+  with the thread's status (7) and its output must close.
+- `artifacts/wasix/thread-exec/thread-exec.wasm` — Helios conformance
+  module covering `proc_exec` on a spawned thread while main is parked
+  forever in `memory.atomic.wait32`: every thread of the process must
+  end and the replacement (`/bin/dash -c 'echo thread-exec:replaced'`)
+  must run in the process, print its line and exit 0.
+- `artifacts/wasix/thread-trap/thread-trap.wasm` — Helios conformance
+  module covering a trap on a spawned thread while main is parked forever
+  in `memory.atomic.wait32`: the whole process must end with the status a
+  trap on main reports, which the same module run with an argument
+  (main traps on its own) provides.
 - `artifacts/wasi-tools/curl.wasm`
 - `artifacts/wasi-tools/curl-stripped.wasm`
 - `artifacts/wasi-tools/wasi-curl.wasm` — plain-WASI HTTP/1.1 client,
@@ -75,7 +107,9 @@ Artifacts produced:
 The CPython download requires network. To re-stage in an offline
 environment, place a pre-downloaded
 `python-${VERSION}-wasi_sdk-24.zip` somewhere and pass its path via
-`CPYTHON_WASI_ZIP=/path/to/zip tools/wasi-apps/build.sh`.
+`CPYTHON_WASI_ZIP=/path/to/zip tools/wasi-apps/build.sh`. The bytecode
+step downloads the pinned wasmtime CLI the same way; pass a local binary
+via `WASMTIME_BIN=/path/to/wasmtime` to skip that download.
 
 The shell and coreutils artifacts must be official Wasmer package payloads.
 QuickJS is built locally from the matching QuickJS-NG source archive so the
@@ -246,7 +280,11 @@ tools/wasi-apps/smoke.sh
 It runs the AArch64/HVF VM path for standard dash, the wall clock the
 kernel seeded from the platform RTC, Bash plus coreutils
 pipeline/redirection/script/cwd/env/exit-status behavior, QuickJS,
-CPython stdlib imports, and an ICMP echo against the slirp gateway. Set
+CPython stdlib imports, the refusal of a guest-written cwasm whose
+signature does not verify (an unchanged copy of a bootfs cwasm still
+verifies and runs; only boot-payload bytes skip the check), and an ICMP
+echo against the slirp gateway. The `smoke-x86-64` CI lane runs the same
+cwasm refusal step under KVM. Set
 `HELIOS_WASI_SMOKE_RELEASE=1` when the smoke should rebuild and boot
 release artifacts. Set `HELIOS_WASI_SMOKE_CURL=1` to include the networked
 curl smoke (run twice, once by bootfs path and once by bare name, so both
@@ -348,9 +386,10 @@ Wasmtime's cross-platform Firefox-profiler JSON.
 ## Run In Helios (RISC-V VM)
 
 Use inspector `vm` mode when checking RISC-V-specific behavior. Use
-`--release` when the VM command should rebuild the guest kernel plus
-embedded user-space programs (`init`, `debugger`) in release mode before
-boot. CPython needs substantial guest memory; pass `--memory 2G`.
+`--release` when the VM command should rebuild the guest kernel and the
+`helios-bootfs` payload's user-space programs (`init`, `debugger`) in
+release mode before boot. CPython needs substantial guest memory; pass
+`--memory 2G`.
 
 ```bash
 cargo run -p helios-inspector -- vm --arch riscv64 --memory 2G \
@@ -382,7 +421,10 @@ Expected output contains:
 - `artifacts/python3-root/python3.wasm` is the real CPython interpreter
   converted from WASI preview1 to the preview2 component we run. In bootfs
   the stdlib is mounted under `usr/local/lib/python3.14/`, matching the
-  upstream CPython build prefix.
+  upstream CPython build prefix. The tree is read-only in the guest, so
+  the bytecode `build.sh` compiles is the only bytecode CPython will
+  ever have there: without it every run recompiles its import closure
+  from source (#374).
 - `tools/wasi-apps/curl` uses `helios_api::http` (`wasi:http/client`)
   instead of host libc sockets, so it runs correctly inside helios. The
   kernel forwards each request to the `http-client` kernel plugin
@@ -399,14 +441,15 @@ Expected output contains:
 - `tools/wasi-apps/wasix-tests/*.wat` are intentionally small Helios-owned
   conformance modules. They do not replace the real dash/bash/QuickJS/CPython
   smoke tests; they pin adapter execution behavior for WASIX threads,
-  futexes, and stack continuations.
+  futexes, timed and cancelled atomic waits, a process outliving none of
+  its threads, and stack continuations.
 
 ## Contract For Future Agents
 
 - Do not remove `tools/wasi-apps/build.sh` or rename output paths
   (`artifacts/python3-root/…`, `artifacts/wasix/dash/…`,
   `artifacts/wasix/thread-futex/…`, `artifacts/wasix/continuation/…`,
-  `artifacts/wasi-tools/…`) without updating this document and `README.md`.
+  `artifacts/wasix/atomic-wait-timeout/…`, `artifacts/wasix/atomic-wait-kill/…`, `artifacts/wasix/orphan-threads/…`, `artifacts/wasix/thread-proc-exit/…`, `artifacts/wasix/thread-exec/…`, `artifacts/wasix/thread-trap/…`, `artifacts/wasi-tools/…`) without updating this document and `README.md`.
 - Keep runtime behavior verified with the inspector `vm` commands above.
 - Do not reintroduce repo-local shell, coreutils, or language stubs. The
   boot shells, coreutils, and QuickJS are standard Wasmer artifacts

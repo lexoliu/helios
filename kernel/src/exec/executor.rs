@@ -20,7 +20,11 @@ use helios_hal::watchdog::ProgressCounter;
 use spin::Once;
 use triomphe::Arc as NoWeakArc;
 
+use crate::exec::idle::{
+    IDLE_POLL_GROW_START, IDLE_POLL_MAX, IdleOutcome, IdleState, ProcessorIdle,
+};
 use crate::exec::sync::Notify;
+use crate::exec::timer::Timer;
 use crate::memory::task_arena_bytes_for;
 
 type ReadyQueue = ConcurrentQueue<Runnable>;
@@ -97,6 +101,11 @@ const _: () = assert!(align_of::<CachePadded<AtomicUsize>>() >= 64);
 struct ExecutorGroup {
     local_queues: Box<[ReadyQueue]>,
     local_ready_counts: Box<[CachePadded<AtomicUsize>]>,
+    /// One cache line per processor: written only by the owner on its
+    /// way into and out of idle, read by every processor that queues
+    /// work for it. The wake handshake it serves is in `idle`'s
+    /// module docs.
+    idle: Box<[CachePadded<ProcessorIdle>]>,
     task_arenas: Box<[NoWeakArc<TaskArena>]>,
     global_queue: ReadyQueue,
     global_ready_count: CachePadded<AtomicUsize>,
@@ -699,6 +708,31 @@ pub struct Executor {
     progress_notify: NoWeakArc<Notify>,
 }
 
+/// The processor a [`Timer`] belongs to, and the idle state that
+/// processor's executor publishes.
+///
+/// Only the owner programs the timer's hardware deadline; any other
+/// processor that publishes an earlier deadline asks this whether the
+/// owner has stopped looking ([`IdleState::Parked`]) and wakes it if so.
+#[derive(Clone)]
+pub(crate) struct TimerOwner {
+    group: NoWeakArc<ExecutorGroup>,
+    processor: ProcessorId,
+}
+
+impl TimerOwner {
+    pub(crate) fn processor(&self) -> ProcessorId {
+        self.processor
+    }
+
+    /// Whether the owner has published [`IdleState::Parked`]. `SeqCst`:
+    /// the publisher half of the timer's wake handshake, after the
+    /// publisher has lowered the timer's published deadline.
+    pub(crate) fn is_parked(&self) -> bool {
+        self.group.needs_wake(usize::from(self.processor.id()))
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ExecutorRunStats {
     local_runnable_count: usize,
@@ -800,7 +834,33 @@ impl Executor {
         }
     }
 
-    pub fn run_until_stalled_with_stats(&self) -> ExecutorRunStats {
+    /// This processor's kernel timer, built on the processor that runs
+    /// this executor and owned by it.
+    ///
+    /// The timer reads the owner's idle state, the one this executor
+    /// publishes, to decide whether a deadline published from another
+    /// processor needs a wake to reach the owner's comparator.
+    pub fn timer<CpuImpl: Cpu + Clone>(&self, cpu: CpuImpl) -> Timer<CpuImpl> {
+        Timer::new(
+            cpu,
+            TimerOwner {
+                group: self.group.clone(),
+                processor: self.owner_processor,
+            },
+        )
+    }
+
+    /// Runs ready tasks until the queues are empty or a batch has run.
+    ///
+    /// `timer` is this processor's. Before the first task of a pass runs,
+    /// its deadline is pulled to within one scheduler tick
+    /// ([`Timer::arm_scheduler_tick`]): the task may be a guest, which is
+    /// preempted only from a timer interrupt, and a processor that has
+    /// just left a park may have its deadline an idle interval out.
+    pub fn run_until_stalled_with_stats<CpuImpl: Cpu + Clone>(
+        &self,
+        timer: &Timer<CpuImpl>,
+    ) -> ExecutorRunStats {
         let mut stats = ExecutorRunStats::default();
         let local_queue = &self.group.local_queues[self.local_queue_index];
         let local_ready_count = &self.group.local_ready_counts[self.local_queue_index];
@@ -832,6 +892,9 @@ impl Executor {
                 return stats;
             };
 
+            if stats.runnable_count() == 0 {
+                timer.arm_scheduler_tick();
+            }
             runnable.run();
             match source {
                 ReadySource::Local => stats.local_runnable_count += 1,
@@ -840,6 +903,92 @@ impl Executor {
         }
 
         stats
+    }
+
+    /// Parks this processor until work arrives, polling its ready
+    /// queues and its timer for a bounded, adaptive window first.
+    ///
+    /// `core::hint::spin_loop` is allowed here and nowhere else:
+    /// AGENTS.md §4 reserves it for hardware synchronisation, and the
+    /// idle loop of a processor that has no task to run is exactly
+    /// that — it waits on another processor's queue push or an
+    /// interrupt, not on software state inside an async context.
+    ///
+    /// `park_current` returns on any interrupt (the scheduler tick
+    /// included), so a park that returns with no work simply loops
+    /// back through `run_until_stalled` and here again.
+    ///
+    /// `root_ready` is the readiness of whatever the caller polls
+    /// outside the ready queues — the bootstrap processor's root
+    /// future in `Kernel::run_local_future` — and is tested in the
+    /// same two places as the ready counts, so a wake published for
+    /// it takes part in the same handshake: the publisher stores its
+    /// flag, then reads this processor's idle state; this processor
+    /// publishes `Parked`, then reads the flag.
+    pub fn park_until_work<CpuImpl: Cpu + Clone>(
+        &self,
+        timer: &Timer<CpuImpl>,
+        root_ready: impl Fn() -> bool,
+    ) -> IdleOutcome {
+        let cpu = timer.cpu();
+        let idle = &self.group.idle[self.local_queue_index];
+        let limit = idle.poll_limit_ticks();
+        idle.store(IdleState::Polling);
+        let started = cpu.now();
+        if limit != 0 {
+            loop {
+                let now = cpu.now();
+                if self.has_ready_work() || root_ready() || timer.is_due(now) {
+                    idle.store(IdleState::Running);
+                    return IdleOutcome::Polled {
+                        polled_ticks: now.ticks() - started.ticks(),
+                    };
+                }
+                if now.ticks() - started.ticks() >= limit {
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+        }
+        // Publish `Parked`, then re-test: a push that landed between the
+        // last poll and this store already incremented a ready count
+        // this load observes, and the sender of any later push sees
+        // `Parked` and sends the IPI. The SeqCst argument is `idle`'s
+        // module doc.
+        idle.store(IdleState::Parked);
+        let now = cpu.now();
+        if self.has_ready_work() || root_ready() || timer.is_due(now) {
+            idle.store(IdleState::Running);
+            return IdleOutcome::Polled {
+                polled_ticks: now.ticks() - started.ticks(),
+            };
+        }
+        // A sleep another processor registered on this timer while this
+        // one was running or polling lowered its published deadline
+        // without a wake; the same handshake covers it (`Timer`'s
+        // `publish_deadline`), and this arms it before the park.
+        timer.arm_published_deadline();
+        let parked_at = cpu.now();
+        cpu.park_current();
+        idle.store(IdleState::Running);
+        let parked_ticks = cpu.now().ticks() - parked_at.ticks();
+        idle.adapt_poll_limit(
+            parked_ticks,
+            cpu.timebase().duration_to_ticks(IDLE_POLL_GROW_START),
+            cpu.timebase().duration_to_ticks(IDLE_POLL_MAX),
+        );
+        IdleOutcome::Parked {
+            polled_ticks: parked_at.ticks() - started.ticks(),
+            parked_ticks,
+        }
+    }
+
+    /// Whether any queue this processor drains has work waiting.
+    /// `SeqCst`: the parker half of the handshake in `idle`'s module
+    /// docs.
+    fn has_ready_work(&self) -> bool {
+        self.group.local_ready_counts[self.local_queue_index].load(Ordering::SeqCst) != 0
+            || self.group.global_ready_count.load(Ordering::SeqCst) != 0
     }
 }
 
@@ -1140,13 +1289,23 @@ impl<CpuImpl: Cpu + Clone> GlobalScheduler<CpuImpl> {
             .group
             .global_wake_cursor
             .fetch_add(1, Ordering::Relaxed);
+        // The cursor names one processor per push, so consecutive
+        // pushes fan out across the machine; the chosen processor's
+        // published state then decides whether the wake needs an IPI.
+        // A polling processor re-reads `global_ready_count` on every
+        // pass; a running one drains the global queue in its own
+        // `run_until_stalled`, and re-tests the count after publishing
+        // `Parked` on its way out; only an already-parked processor
+        // has stopped looking.
         for offset in 0..self.processor_count {
             let processor = (start + offset) % self.processor_count;
-            let processor = ProcessorId::new(processor as u16);
-            if processor != current_processor {
-                self.cpu.wake_processor(processor);
-                return;
+            if processor == usize::from(current_processor.id()) {
+                continue;
             }
+            if self.group.idle[processor].state() == IdleState::Parked {
+                self.cpu.wake_processor(ProcessorId::new(processor as u16));
+            }
+            return;
         }
     }
 }
@@ -1160,6 +1319,7 @@ impl<CpuImpl: Cpu + Clone> LocalScheduler<CpuImpl> {
         self.progress.record();
         if should_wake_owner_processor(previous_ready)
             && current_processor() != self.owner_processor
+            && self.group.needs_wake(self.local_queue_index)
         {
             self.cpu.wake_processor(self.owner_processor);
         }
@@ -1174,6 +1334,7 @@ impl<CpuImpl: Cpu + Clone> LocalSilentScheduler<CpuImpl> {
         let previous_ready = push_ready(queue, ready_count, runnable);
         if should_wake_owner_processor(previous_ready)
             && current_processor() != self.owner_processor
+            && self.group.needs_wake(self.local_queue_index)
         {
             self.cpu.wake_processor(self.owner_processor);
         }
@@ -1208,15 +1369,18 @@ fn executor_group(configured_processors: usize) -> NoWeakArc<ExecutorGroup> {
             let arena_bytes = task_arena_bytes(crate::machine_usable_bytes());
             let mut local_queues = Vec::with_capacity(configured_processors);
             let mut local_ready_counts = Vec::with_capacity(configured_processors);
+            let mut idle = Vec::with_capacity(configured_processors);
             let mut task_arenas = Vec::with_capacity(configured_processors);
             for _ in 0..configured_processors {
                 local_queues.push(ready_queue());
                 local_ready_counts.push(CachePadded::new(AtomicUsize::new(0)));
+                idle.push(CachePadded::new(ProcessorIdle::new()));
                 task_arenas.push(TaskArena::new_shared(arena_bytes));
             }
             NoWeakArc::new(ExecutorGroup {
                 local_queues: local_queues.into_boxed_slice(),
                 local_ready_counts: local_ready_counts.into_boxed_slice(),
+                idle: idle.into_boxed_slice(),
                 task_arenas: task_arenas.into_boxed_slice(),
                 global_queue: ready_queue(),
                 global_ready_count: CachePadded::new(AtomicUsize::new(0)),
@@ -1226,16 +1390,29 @@ fn executor_group(configured_processors: usize) -> NoWeakArc<ExecutorGroup> {
         .clone()
 }
 
+impl ExecutorGroup {
+    /// Whether `processor` must be sent a wake IPI for work just
+    /// pushed. Called after the push. Returns true only when the
+    /// target has published `Parked`; a `Polling` or `Running`
+    /// processor sees the ready count itself.
+    fn needs_wake(&self, processor_index: usize) -> bool {
+        self.idle[processor_index].state() == IdleState::Parked
+    }
+}
+
 fn ready_queue() -> ReadyQueue {
     ConcurrentQueue::bounded(READY_QUEUE_CAPACITY)
 }
 
 #[inline]
 fn push_ready(queue: &ReadyQueue, ready_count: &AtomicUsize, runnable: Runnable) -> usize {
-    // The queue itself publishes the `Runnable`; this counter only drives
-    // wake heuristics and underflow asserts, so a full fence just taxes the
-    // executor hot path.
-    let previous_ready = ready_count.fetch_add(1, Ordering::Relaxed);
+    // The queue itself publishes the `Runnable`; the counter is also
+    // the sender half of the idle handshake — a parking processor
+    // stores `Parked` then loads it, this increment precedes the load
+    // of the parker's idle state, and both are `SeqCst`, so no wake is
+    // lost. On x86 `lock xadd` is already a full barrier, so this
+    // costs nothing there.
+    let previous_ready = ready_count.fetch_add(1, Ordering::SeqCst);
     match queue.push(runnable) {
         Ok(()) => previous_ready,
         Err(PushError::Full(_)) => {
@@ -1316,23 +1493,44 @@ impl<T> Future for LocalJoinHandle<T> {
 
 #[cfg(test)]
 mod tests {
+    use core::future::Future as _;
     use core::mem::size_of;
+    use core::pin::Pin;
+    use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use core::task::{Context, Waker};
 
+    use alloc::sync::Arc;
     use alloc::vec::Vec;
 
     use super::{
-        Executor, GlobalScheduler, LocalScheduler, LocalSilentScheduler, READY_QUEUE_CAPACITY,
-        Spawner, TASK_ARENA_CLASS_COUNT, TASK_ARENA_KERNEL_RESERVE_BYTES, TASK_ARENA_TOP_BYTES,
-        TaskArena, ready_queue, should_wake_global_processor, should_wake_owner_processor,
+        Executor, GlobalScheduler, IDLE_POLL_GROW_START, IDLE_POLL_MAX, IdleOutcome, IdleState,
+        LocalScheduler, LocalSilentScheduler, READY_QUEUE_CAPACITY, Spawner,
+        TASK_ARENA_CLASS_COUNT, TASK_ARENA_KERNEL_RESERVE_BYTES, TASK_ARENA_TOP_BYTES, TaskArena,
+        pop_ready, ready_queue, should_wake_global_processor, should_wake_owner_processor,
         task_arena_bytes,
     };
-    use helios_hal::cpu::{Cpu, HardwarePerfCounters, Instant, ProcessorId};
+    use crate::test_support::RecordingSmpCpu;
+    use helios_hal::cpu::{
+        Cpu, HardwarePerfCounters, Instant, ProcessorId, Timebase, TimerInterrupt,
+    };
     use helios_hal::watchdog::ProgressCounter;
 
     #[derive(Clone)]
-    struct TestCpu;
+    struct TestCpu {
+        timebase: Timebase,
+    }
+
+    impl TestCpu {
+        fn new() -> Self {
+            Self {
+                timebase: Timebase::new(1_000_000_000),
+            }
+        }
+    }
 
     impl Cpu for TestCpu {
+        const TIMER_INTERRUPT: TimerInterrupt = TimerInterrupt::Deadline;
+
         fn processor_count(&self) -> usize {
             1
         }
@@ -1351,8 +1549,99 @@ mod tests {
             Instant::new(0)
         }
 
-        fn timer_frequency(&self) -> u64 {
-            1_000_000_000
+        fn timebase(&self) -> Timebase {
+            self.timebase
+        }
+
+        fn hardware_perf_counters(&self) -> HardwarePerfCounters {
+            HardwarePerfCounters::default()
+        }
+
+        fn set_deadline(&self, _deadline: Instant) {}
+
+        fn publish_executable(&self, _ptr: *const u8, _len: usize) {}
+
+        fn unpublish_executable(&self, _ptr: *const u8, _len: usize) {}
+
+        fn native_feature_probe(&self) -> Option<fn(&str) -> Option<bool>> {
+            None
+        }
+
+        fn shutdown(&self) -> ! {
+            panic!("test CPU cannot shut down")
+        }
+
+        fn reboot(&self) -> ! {
+            panic!("test CPU cannot reboot")
+        }
+    }
+
+    /// A CPU that moves its own clock: every `now()` steps the
+    /// timebase forward by `step`, and `park_current` sleeps
+    /// `park_advance` ticks, so a test drives the idle loop's poll
+    /// window and park duration deterministically. `forbid_park`
+    /// turns `park_current` into a panic for tests that must prove
+    /// the park was never reached.
+    #[derive(Clone)]
+    struct SteppingClockCpu {
+        nanos: Arc<AtomicU64>,
+        step: u64,
+        park_advance: Arc<AtomicU64>,
+        may_park: Arc<AtomicBool>,
+        timebase: Timebase,
+    }
+
+    impl SteppingClockCpu {
+        fn new(step: u64) -> Self {
+            crate::test_processor_identity::set(ProcessorId::new(0));
+            Self {
+                nanos: Arc::new(AtomicU64::new(0)),
+                step,
+                park_advance: Arc::new(AtomicU64::new(0)),
+                may_park: Arc::new(AtomicBool::new(true)),
+                timebase: Timebase::new(1_000_000_000),
+            }
+        }
+
+        fn set_park_advance(&self, ticks: u64) {
+            self.park_advance.store(ticks, Ordering::Relaxed);
+        }
+
+        fn forbid_park(&self) {
+            self.may_park.store(false, Ordering::Relaxed);
+        }
+    }
+
+    impl Cpu for SteppingClockCpu {
+        const TIMER_INTERRUPT: TimerInterrupt = TimerInterrupt::Deadline;
+
+        fn processor_count(&self) -> usize {
+            2
+        }
+
+        fn bootstrap_processor(&self) -> ProcessorId {
+            ProcessorId::new(0)
+        }
+
+        fn park_current(&self) {
+            assert!(
+                self.may_park.load(Ordering::Relaxed),
+                "park_current reached while work was already queued"
+            );
+            self.nanos
+                .fetch_add(self.park_advance.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+
+        fn start_processor(&self, _processor: ProcessorId) {}
+
+        fn wake_processor(&self, _processor: ProcessorId) {}
+
+        fn now(&self) -> Instant {
+            Instant::new(self.nanos.fetch_add(self.step, Ordering::Relaxed))
+        }
+
+        fn timebase(&self) -> Timebase {
+            self.timebase
         }
 
         fn hardware_perf_counters(&self) -> HardwarePerfCounters {
@@ -1411,12 +1700,13 @@ mod tests {
     fn global_batch_does_not_probe_empty_local_queue_per_task() {
         let _serialized = super::executor_test_guard();
         let executor = Executor::new(ProgressCounter::new(), 1, ProcessorId::new(0));
-        let spawner = executor.spawner(TestCpu);
+        let timer = executor.timer(TestCpu::new());
+        let spawner = executor.spawner(TestCpu::new());
         for _ in 0..8 {
             spawner.spawn_detached(async {});
         }
 
-        let stats = executor.run_until_stalled_with_stats();
+        let stats = executor.run_until_stalled_with_stats(&timer);
 
         assert_eq!(stats.global_runnable_count(), 8);
         assert_eq!(stats.local_runnable_count(), 0);
@@ -1701,5 +1991,273 @@ mod tests {
             256 * 1024
         );
         assert_eq!(TASK_ARENA_TOP_BYTES, 256 * 1024);
+    }
+
+    #[test]
+    fn a_parked_processor_is_woken_and_a_polling_one_is_not() {
+        let _serialized = super::executor_test_guard();
+        // This test thread is processor 0; the executor and its local
+        // queue belong to processor 1.
+        let cpu = RecordingSmpCpu::new(0, 2);
+        let executor = Executor::new(ProgressCounter::new(), 2, ProcessorId::new(1));
+        let spawner = executor.spawner(cpu.clone());
+        let idle = &executor.group.idle[1];
+        let drain = || {
+            pop_ready(
+                &executor.group.local_queues[1],
+                &executor.group.local_ready_counts[1],
+            )
+            .expect("the runnable pushed for processor 1 is still queued")
+            .run();
+        };
+
+        // Parked: the push needs the IPI.
+        idle.store(IdleState::Parked);
+        spawner.spawn_local_detached(async {});
+        assert_eq!(cpu.woken(), [ProcessorId::new(1)]);
+
+        // Polling: the processor sees its own ready count — no IPI.
+        drain();
+        idle.store(IdleState::Polling);
+        spawner.spawn_local_detached(async {});
+        assert_eq!(cpu.woken(), [ProcessorId::new(1)]);
+
+        // Running: the executor drains the queue itself — no IPI.
+        drain();
+        idle.store(IdleState::Running);
+        spawner.spawn_local_detached(async {});
+        assert_eq!(cpu.woken(), [ProcessorId::new(1)]);
+    }
+
+    /// A sleep registered on processor 0's timer from processor 1
+    /// programs no comparator on processor 1 — `set_deadline` reaches
+    /// the executing processor, not the timer's owner — and reaches
+    /// processor 0 through the idle handshake: a wake when it is parked,
+    /// and its own arm before it parks when it was running.
+    #[test]
+    fn a_foreign_sleep_wakes_the_parked_owner_and_programs_no_other_comparator() {
+        let _serialized = super::executor_test_guard();
+        let cpu = RecordingSmpCpu::new(0, 2);
+        let executor = Executor::new(ProgressCounter::new(), 2, ProcessorId::new(0));
+        let timer = executor.timer(cpu.clone());
+        let idle = &executor.group.idle[0];
+        let built = cpu.deadlines();
+        assert_eq!(built.len(), 1);
+        assert_eq!(built[0].0, ProcessorId::new(0));
+        let now = cpu.now().ticks();
+        let mut context = Context::from_waker(Waker::noop());
+
+        crate::test_processor_identity::set(ProcessorId::new(1));
+        idle.store(IdleState::Parked);
+        let mut while_parked = timer.sleep_until(Instant::new(now + 500));
+        assert!(Pin::new(&mut while_parked).poll(&mut context).is_pending());
+        assert_eq!(
+            cpu.deadlines(),
+            built,
+            "a foreign publish programs no comparator"
+        );
+        assert_eq!(
+            cpu.woken(),
+            [ProcessorId::new(0)],
+            "the parked owner is woken"
+        );
+
+        idle.store(IdleState::Running);
+        let mut while_running = timer.sleep_until(Instant::new(now + 400));
+        assert!(Pin::new(&mut while_running).poll(&mut context).is_pending());
+        assert_eq!(
+            cpu.deadlines(),
+            built,
+            "a foreign publish programs no comparator"
+        );
+        assert_eq!(
+            cpu.woken(),
+            [ProcessorId::new(0)],
+            "a running owner reads the deadline itself"
+        );
+
+        crate::test_processor_identity::set(ProcessorId::new(0));
+        timer.arm_published_deadline();
+        assert_eq!(
+            cpu.deadlines().last(),
+            Some(&(ProcessorId::new(0), now + 400)),
+            "the owner arms the earliest published deadline before it parks"
+        );
+    }
+
+    /// A processor's deadline is the earlier of its next sleep and, while
+    /// it is running work, the next scheduler tick (10 ms): its timer
+    /// interrupt re-arms a tick on unless it is parked, when it stretches
+    /// to the idle interval (100 ms), and the first executor pass that
+    /// runs work after a park pulls it back within a tick, once, not on
+    /// every pass.
+    #[test]
+    fn a_running_processor_is_interrupted_every_tick_and_a_parked_one_keeps_its_long_deadline() {
+        let _serialized = super::executor_test_guard();
+        let cpu = RecordingSmpCpu::new(0, 1);
+        let executor = Executor::new(ProgressCounter::new(), 1, ProcessorId::new(0));
+        let timer = executor.timer(cpu.clone());
+        let spawner = executor.spawner(cpu.clone());
+        let idle = &executor.group.idle[0];
+        let now = cpu.now().ticks();
+        let tick = cpu
+            .timebase()
+            .duration_to_ticks(core::time::Duration::from_millis(10));
+        let long = cpu
+            .timebase()
+            .duration_to_ticks(core::time::Duration::from_millis(100));
+        let armed = || cpu.deadlines().last().expect("a deadline was armed").1;
+        let programmed = || cpu.deadlines().len();
+
+        assert_eq!(armed(), now + tick, "a processor builds its timer running");
+
+        idle.store(IdleState::Parked);
+        timer.handle_interrupt();
+        assert_eq!(
+            armed(),
+            now + long,
+            "a parked processor stretches to the idle interval"
+        );
+
+        let parked_programs = programmed();
+        assert_eq!(
+            executor
+                .run_until_stalled_with_stats(&timer)
+                .runnable_count(),
+            0
+        );
+        assert_eq!(
+            programmed(),
+            parked_programs,
+            "a pass with no work keeps the long deadline"
+        );
+
+        idle.store(IdleState::Running);
+        spawner.spawn_local_detached(async {});
+        assert_eq!(
+            executor
+                .run_until_stalled_with_stats(&timer)
+                .runnable_count(),
+            1
+        );
+        assert_eq!(
+            armed(),
+            now + tick,
+            "work after a park is interrupted within a tick"
+        );
+        let running_programs = programmed();
+        for _ in 0..4 {
+            spawner.spawn_local_detached(async {});
+            executor.run_until_stalled_with_stats(&timer);
+        }
+        assert_eq!(
+            programmed(),
+            running_programs,
+            "no arm per pass inside a tick"
+        );
+
+        timer.handle_interrupt();
+        assert_eq!(
+            armed(),
+            now + tick,
+            "a running processor's interrupt re-arms a tick on"
+        );
+
+        let mut context = Context::from_waker(Waker::noop());
+        let mut soon = timer.sleep_until(Instant::new(now + tick / 2));
+        assert!(Pin::new(&mut soon).poll(&mut context).is_pending());
+        assert_eq!(
+            armed(),
+            now + tick / 2,
+            "a sleep sooner than the tick is armed"
+        );
+        drop(soon);
+        timer.fire_expired();
+
+        let mut late = timer.sleep_until(Instant::new(now + long / 2));
+        assert!(Pin::new(&mut late).poll(&mut context).is_pending());
+        idle.store(IdleState::Parked);
+        timer.handle_interrupt();
+        assert_eq!(
+            armed(),
+            now + long / 2,
+            "a parked processor wakes for its next sleep inside the idle interval"
+        );
+        idle.store(IdleState::Running);
+    }
+
+    #[test]
+    fn the_poll_window_grows_after_a_short_park_and_shrinks_after_a_long_one() {
+        let _serialized = super::executor_test_guard();
+        // One tick per nanosecond, and `now()` steps a microsecond a
+        // read, so a poll window of N ticks costs N/1000 loop passes.
+        let cpu = SteppingClockCpu::new(1_000);
+        let executor = Executor::new(ProgressCounter::new(), 2, ProcessorId::new(0));
+        let timer = executor.timer(cpu.clone());
+        let idle = &executor.group.idle[0];
+        let grow_start = cpu.timebase().duration_to_ticks(IDLE_POLL_GROW_START);
+        let max = cpu.timebase().duration_to_ticks(IDLE_POLL_MAX);
+        assert_eq!(idle.poll_limit_ticks(), 0);
+
+        // A park shorter than the maximum window earns a poll window,
+        // which then doubles per short park up to the cap.
+        cpu.set_park_advance(max / 20);
+        assert!(matches!(
+            executor.park_until_work(&timer, || false),
+            IdleOutcome::Parked { .. }
+        ));
+        assert_eq!(idle.poll_limit_ticks(), grow_start);
+        for expected in [grow_start * 2, max, max] {
+            assert!(matches!(
+                executor.park_until_work(&timer, || false),
+                IdleOutcome::Parked { .. }
+            ));
+            assert_eq!(idle.poll_limit_ticks(), expected);
+        }
+
+        // A park longer than the maximum window halves it.
+        cpu.set_park_advance(max * 50);
+        assert!(matches!(
+            executor.park_until_work(&timer, || false),
+            IdleOutcome::Parked { .. }
+        ));
+        assert_eq!(idle.poll_limit_ticks(), max / 2);
+    }
+
+    /// The root future's readiness is tested where the ready counts
+    /// are: a root wake published before the park returns `Polled`
+    /// with nothing in any queue. `park_current` panics if reached.
+    #[test]
+    fn a_ready_root_future_is_seen_before_the_park() {
+        let _serialized = super::executor_test_guard();
+        let cpu = SteppingClockCpu::new(1_000);
+        cpu.forbid_park();
+        let executor = Executor::new(ProgressCounter::new(), 2, ProcessorId::new(0));
+        let timer = executor.timer(cpu.clone());
+        let root_ready = AtomicBool::new(true);
+
+        let outcome = executor.park_until_work(&timer, || root_ready.load(Ordering::SeqCst));
+
+        assert!(matches!(outcome, IdleOutcome::Polled { .. }));
+        assert_eq!(executor.group.idle[0].state(), IdleState::Running);
+    }
+
+    /// The push that lands between the `Parked` store and the park is
+    /// what the post-store re-test exists for: without it this parks
+    /// under queued work. `park_current` panics if it is reached, so
+    /// a `Polled` outcome is the re-test firing.
+    #[test]
+    fn work_pushed_after_parked_is_published_is_seen_before_the_park() {
+        let _serialized = super::executor_test_guard();
+        let cpu = SteppingClockCpu::new(1_000);
+        cpu.forbid_park();
+        let executor = Executor::new(ProgressCounter::new(), 2, ProcessorId::new(0));
+        let timer = executor.timer(cpu.clone());
+        executor.spawner(cpu).spawn_local_detached(async {});
+
+        let outcome = executor.park_until_work(&timer, || false);
+
+        assert!(matches!(outcome, IdleOutcome::Polled { .. }));
+        assert_eq!(executor.group.idle[0].state(), IdleState::Running);
     }
 }

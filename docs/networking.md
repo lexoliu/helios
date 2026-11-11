@@ -34,6 +34,16 @@ can be measured on either ring layout.
 everywhere else; asking any other backend for more than one pair is an
 error rather than a quiet downgrade.
 
+Inside the guest the driver brings up no more pairs than the machine
+has processors: each activated pair is drained by the one packet pump
+its owning processor runs, so a device advertising more pairs than
+`--smp` is clamped to the processor count — which every backend passes
+in as the pair budget — rather than left with rings nobody drains.
+Both numbers land in the boot log: the `virtio-net bring-up` line
+reports `max_virtqueue_pairs` beside `pair_budget` and the clamped
+`queue_pairs`, and each backend's `virtio network online` line repeats
+them where the interface comes up.
+
 ## Reading back what was negotiated
 
 Two `info` lines per device land in the boot log. The generic
@@ -182,8 +192,9 @@ A multi-queue tap device enslaved to a host bridge, driven by
 the QEMU main loop. The tap outlives individual VMs: it is provisioned
 once by the privileged helper and the VM command never elevates by
 itself. The helper also loads `vhost_net`, waits for udev to apply its
-`root:kvm 0660` rule to `/dev/vhost-net`, and then hands the node to
-the invoking account — in that order, because the first open of udev's
+`root:kvm 0660` rule to `/dev/vhost-net`, and then grants the invoking
+account (and only it) read-write access through an ACL entry — in that
+order, because the first open of udev's
 static node autoloads the module and the device event that follows
 resets whatever was done to the node before it. QEMU 8.2 does not fail
 cleanly when `vhost=on` cannot open the node: it warns per queue and
@@ -210,6 +221,13 @@ helios-inspector vm net-teardown \
 command as it would be retyped, and supports `--dry-run` to print the
 plan without touching the host. The plan is:
 
+0. Before anything else, a record of what the plan changes outside the
+   interfaces it creates is written to `/var/run/helios-net-<bridge>.json`
+   (the invoking uid and the uplink's forwarding value as found), and
+   `modprobe vhost_net`, `udevadm settle` and
+   `setfacl -m u:<uid>:rw /dev/vhost-net` run. `setfacl` comes from the
+   `acl` package. Setup refuses to run while a record for the bridge
+   exists, so the values it restores are always the host's own.
 1. `ip link add <bridge> type bridge`, `ip link set <bridge> up`
 2. `ip addr replace <address> dev <bridge>` — `--net-bridge-address`,
    default `10.77.0.1/24`. This address is what the guest reaches the
@@ -221,12 +239,21 @@ plan without touching the host. The plan is:
    the helper itself is run under `sudo`) so an unprivileged QEMU can
    open it.
 4. `ip link set <ifname> master <bridge>`, `ip link set <ifname> up`
-5. unless `--net-no-nat`: `sysctl -w net.ipv4.ip_forward=1` and an
-   nftables `helios-nat` table with a masquerade rule out of
-   `--net-uplink` (defaulting to the interface owning the host default
-   route, read from `ip -json route show default`).
+5. unless `--net-no-nat`: `net.ipv4.conf.<bridge>.forwarding=1` and
+   `net.ipv4.conf.<uplink>.forwarding=1` (IPv4 forwarding is decided by
+   the interface a packet arrives on, so the guest's packets need the
+   bridge and the replies need the uplink; no other interface is
+   touched), and an nftables `helios-nat` table with a masquerade rule
+   out of `--net-uplink` (defaulting to the interface owning the host
+   default route, read from `ip -json route show default`).
 6. with `--net-dhcp`: a `dnsmasq` bound to the bridge alone, serving the
    subnet's host range above the bridge address.
+
+`net-teardown` stops the dnsmasq, deletes the `helios-nat` table, the
+tap and the bridge, writes the uplink's forwarding value back to what the
+record says setup found, removes the ACL entry and deletes the record.
+Without a record it fails naming the file, because the host state it
+would restore is then unknown.
 
 After the plan runs, the helper re-reads
 `/sys/class/net/<ifname>/tun_flags` and fails unless `IFF_MULTI_QUEUE`

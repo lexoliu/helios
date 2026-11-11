@@ -9,7 +9,7 @@ from pathlib import Path
 
 from helios_bench import REPO_ROOT
 from helios_bench.artifacts import RUNS_DIR, committed_reports, fetch_reports, run_dir
-from helios_bench.baseline import MERGE_BASE
+from helios_bench.baseline import MERGE_BASE, fork_root, pinned_wasmtime
 from helios_bench.baseline import resolve as resolve_baseline
 from helios_bench.gate import gate_report
 from helios_bench.manifest import host_deviations, load_manifest
@@ -49,6 +49,8 @@ def command_run(args: argparse.Namespace) -> int:
     plain_baseline = args.baseline_kernel_build == RELEASE_BUILD
     if baseline is not None or args.profile_use is not None or plain_baseline:
         sides |= {Side.HELIOS_BASELINE}
+    if args.baseline_rebuild_profile_use is not None:
+        sides |= {Side.HELIOS_BASELINE_REBUILD}
     options = RunOptions(
         lane=lane,
         out_dir=args.out_dir.resolve(),
@@ -62,6 +64,7 @@ def command_run(args: argparse.Namespace) -> int:
         helios_side_timeout_seconds=args.helios_side_timeout_seconds,
         skip_linux_workloads=tuple(args.skip_linux_workloads),
         linux_setup_timeout_seconds=args.linux_setup_timeout_seconds,
+        job_timeout_minutes=args.job_timeout_minutes,
         network=NetworkOptions(
             ifname=args.net_ifname,
             bridge=args.net_bridge,
@@ -70,6 +73,10 @@ def command_run(args: argparse.Namespace) -> int:
         ),
         baseline=baseline,
         profile_use=args.profile_use.resolve() if args.profile_use else None,
+        baseline_profile_use=(args.baseline_profile_use.resolve() if args.baseline_profile_use else None),
+        baseline_rebuild_profile_use=(
+            args.baseline_rebuild_profile_use.resolve() if args.baseline_rebuild_profile_use else None
+        ),
         plain_baseline=plain_baseline,
     )
     report = run_suite(options, manifest, dry_run=args.dry_run)
@@ -91,6 +98,12 @@ def command_lanes(args: argparse.Namespace) -> int:
     else:
         for lane in lanes:
             print(lane.name)
+    return 0
+
+
+def command_baseline_fork(args: argparse.Namespace) -> int:
+    pin = pinned_wasmtime(args.sha)
+    print(json.dumps({"root": fork_root(pin), "repository": pin.repository, "revision": pin.revision}))
     return 0
 
 
@@ -179,6 +192,13 @@ def command_gate(args: argparse.Namespace) -> int:
     baseline = load_report(args.baseline) if args.baseline else None
     report = gate_report(candidate, baseline)
     if not report.results:
+        if report.cross_run_refused is not None:
+            # The one comparison there was is refused, and an empty gate
+            # would read as a pass.
+            raise SystemExit(
+                f"{args.candidate}: the run was not paired and the cross-run comparison "
+                f"is refused: {report.cross_run_refused.reason}"
+            )
         raise SystemExit(
             f"{args.candidate}: the run was not paired and no --baseline was given, "
             "so there is nothing to compare it against"
@@ -223,6 +243,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--linux-setup-timeout-seconds", type=int, default=5400)
     run.add_argument(
+        "--job-timeout-minutes",
+        type=int,
+        default=None,
+        help=(
+            "the timeout-minutes of the job this run executes inside (bench-suite.yml "
+            "passes its own): the one retry of an inconclusive paired control is "
+            "skipped when a second pass would outlast what remains of it"
+        ),
+    )
+    run.add_argument(
         "--baseline-ref",
         nargs="?",
         const=MERGE_BASE,
@@ -242,6 +272,30 @@ def build_parser() -> argparse.ArgumentParser:
             "against the plain release kernel of this same commit, on this host in this "
             "job (docs/pgo.md); the profile is what bench-suite.yml's profile-generate "
             "job uploads"
+        ),
+    )
+    run.add_argument(
+        "--baseline-profile-use",
+        type=Path,
+        default=None,
+        help=(
+            "build the second image of a --baseline-ref pairing against this merged "
+            ".profdata — the baseline column's own collection, so a paired run holds "
+            "each commit's kernel to a profile collected from that commit "
+            "(docs/pgo.md, #384); refused with --baseline-kernel-build release, the "
+            "plain control that reads no profile"
+        ),
+    )
+    run.add_argument(
+        "--baseline-rebuild-profile-use",
+        type=Path,
+        default=None,
+        help=(
+            "build the baseline commit of a --baseline-profile-use pairing a second time, "
+            "against this second, independently collected .profdata, and time it as a third "
+            "column: how far the two builds of one commit move apart is the build-to-build "
+            "drift every paired row is judged against (#479). Required with "
+            "--baseline-profile-use"
         ),
     )
     run.add_argument(
@@ -282,6 +336,16 @@ def build_parser() -> argparse.ArgumentParser:
     lanes.add_argument("--select", default="all", help="a lane name, or all")
     lanes.add_argument("--format", choices=["names", "github-matrix"], default="names")
     lanes.set_defaults(func=command_lanes)
+
+    baseline_fork = subcommands.add_parser(
+        "baseline-fork",
+        help=(
+            "print, as JSON, the Wasmtime fork a baseline commit pins and the directory "
+            "beside the candidate its checkout and profile collection are laid out in"
+        ),
+    )
+    baseline_fork.add_argument("--sha", required=True, help="the baseline commit, resolved")
+    baseline_fork.set_defaults(func=command_baseline_fork)
 
     host_check = subcommands.add_parser("host-check", help="list how this host deviates from a lane")
     host_check.add_argument("--lane", required=True)

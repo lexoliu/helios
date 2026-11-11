@@ -5,13 +5,177 @@ at `../wasmtime/crates/wasmtime`.
 
 ## Required revision
 
-The local checkout must be at (branch `helios/pooling-host-stack`):
+The local checkout must be at (branch `helios/stack-limit-percpu`):
 
 ```text
-7a17b5375af44664392d2a550e9724be0f1946c4
+1ed7678a8ee4f57cbe4a4e89ade7f7fda6092055
 ```
 
-That revision is `helios/component-instance-memory` at
+That revision is `helios/parking-wait-cancel` at
+`2fb47b20c7ff9a91b6dbc03062d1dd4dddab4969` plus four additive commits,
+which make each stack-limit interruption check one compare against the
+executing processor's own word (#465):
+
+- The resumable check's cold call goes through a `preserve_all`
+  trampoline, so it clobbers no register and a call-free function keeps
+  its values in caller-saved registers across its checks.
+- Cranelift gains `load_processor_local.i64 +offset`, a load from the
+  thread-pointer base (`fs` on x86-64, `tpidr_el1` on AArch64, `tp` on
+  RISC-V 64) that is never merged or hoisted. On x86-64 a stack check
+  against it lowers to `cmp rsp, fs:[offset]; jb`. To get there, a
+  branch may now sink a side-effecting single-use input as any other
+  instruction may, and `get_stack_pointer` is rematerialized per block.
+- `memory.copy` and `memory.fill` no longer expand into a chunk loop with
+  a check between chunks under stack-limit interruption: the libcalls
+  chunk the work and deliver a pending interrupt between chunks
+  themselves, through the same callback as the builtin.
+- `Config::stack_limit_location(StackLimitLocation::PerProcessor { offset })`
+  makes every resumable check read the processor's word instead of
+  `VMStoreContext::stack_limit`. It is a tunable, so a cwasm compiled for
+  one location is refused by an engine set to the other. A `no_std` build
+  with the `custom-processor-stack-limit` feature declares
+  `wasmtime_processor_stack_limit() -> *mut usize`, which returns the
+  executing processor's word; a build without it neither links the hook
+  nor runs per-processor code, though it still compiles it. The runtime publishes the store's limit
+  there when its wasm enters or resumes on a processor, and when it leaves
+  the innermost activation left on the thread publishes its own again. An
+  interrupt request stores the pending flag and raises the sentinel in the
+  word the store was last published to: no lock, no allocation, no IPI.
+- A riscv64 `preserve_all` frame saves the vector registers only when the
+  ISA has V. The builtin trampolines are `preserve_all`, and on a hart
+  without V (QEMU's `rv64imafdch`) their `vsetivli`/`vse8.v` saves were an
+  illegal instruction on the first interrupt.
+
+Helios needs it because the store-context check costs 7-8 instructions
+and a register chain per loop iteration (12-31% on compute against no
+interruption). Every bare-metal backend keeps the word at
+`helios_hal::cpu::GUEST_STACK_LIMIT_OFFSET` in its processor anchor
+block and exports `wasmtime_processor_stack_limit`, which the kernel's
+`wasmtime-bare-metal` feature links through `custom-processor-stack-limit`;
+`hosted` keeps the
+store-context location.
+
+The revision it replaces is `helios/parking-wait-cancel` at
+`2fb47b20c7ff9a91b6dbc03062d1dd4dddab4969`, which is
+`helios/parking-wait-timeout` at
+`3741766da8e691dfa9e642ab9f16cfb30c1fc5a3` plus one additive commit
+(written on that branch's earlier `62bf033a` and merged forward), which
+gives a `no_std` `memory.atomic.wait` a cancellation exit (#445):
+
+- The `no_std` parking hook becomes
+  `wasmtime_parking_wait(timeout_nanos: u64) -> bool`. It returns `true`
+  when the embedder cancelled the wait, so the waiting thread must unwind
+  instead of parking again. `park_current_thread` passes that through, and
+  on `std` it is always `false`.
+- `ParkingSpot::wait` takes the table lock back after a cancelled park and
+  returns a new `WaitResult::Cancelled`, never `Ok`. A waiter that no
+  notify reached is removed from its queue, so no later notify counts it;
+  one that a notify already dequeued stays counted by that notify. Either
+  way every notify count names a waiter that really was queued and woken.
+- The `memory_atomic_wait32/64` libcalls turn `Cancelled` into an
+  `Err(wasmtime::AtomicWaitCancelled)`, so the instruction traps and the
+  fiber unwinds through the normal trap path. The error is not a `Trap`,
+  so an embedder can tell it from a guest fault by downcasting. The public
+  `SharedMemory::atomic_wait32/64` keep their signature and return
+  `WaitResult::Cancelled` as a value.
+
+Helios needs it because a kill or a WASIX signal ends a suspended guest by
+dropping its call, and a guest parked in `memory.atomic.wait` is suspended
+inside `block_on_current_fiber` with no way out: that drop resumed the
+fiber with `Cancelled`, and the kernel's hook could only panic. Each
+bare-metal backend's `wasmtime_parking_wait` now returns
+`park_wasmtime_waiter`'s result, which is `true` exactly when the turn
+dropped the call.
+
+The revision it replaces is `helios/parking-wait-timeout` at
+`3741766da8e691dfa9e642ab9f16cfb30c1fc5a3`, which is
+`helios/stack-limit-interrupt` at
+`9d41e8b3ab259c394c099d62c61600f366ef3017` plus one additive commit
+(written on that branch's earlier `913a5426` and merged forward), which
+makes a timed `memory.atomic.wait` time out on `no_std` (#455):
+
+- A `no_std` build declares a third parking hook,
+  `wasmtime_monotonic_nanos() -> u64`, next to `wasmtime_parking_wait` and
+  `wasmtime_parking_unpark` and under the same `threads` condition. It reads
+  a monotonic clock that every waiting thread shares.
+- `parking_spot::deadline_after` turns a wait's timeout into an absolute
+  deadline for both builds (`Instant` on `std`, a `MonotonicDeadline` of
+  clock nanoseconds on `no_std`), and `SharedMemory::atomic_wait32/64` use
+  it instead of a cfg split. A deadline that does not fit means no timeout,
+  as before.
+- Every pass of the wait loop parks only for the time left until the
+  deadline, and returns `WaitResult::TimedOut` once the clock reaches it.
+  Before, the `no_std` loop carried the relative timeout and re-parked for
+  all of it after every return, so it never timed out.
+
+Helios needs it because a timed `memory.atomic.wait32/64`, and so every
+futex-backed timed wait in a threaded guest (a condvar `wait_timeout`),
+only ended when notified. Each bare-metal backend exports
+`wasmtime_monotonic_nanos` from its processor timer's `Cpu` timebase.
+
+The revision it replaces is `helios/stack-limit-interrupt` at
+`9d41e8b3ab259c394c099d62c61600f366ef3017`, which is
+`helios/parallel-compile-steal` at
+`f5a2d7baf50962ae777c29ecc792f0eed501c75d` plus two additive commits, which
+add resumable stack-limit interruption (#456):
+
+- `Config::stack_limit_interruption(bool)` (a `Tunables` flag that takes part
+  in the cwasm compatibility check) makes Cranelift compare the stack pointer
+  against `VMStoreContext::stack_limit` at every loop header, every
+  bulk-memory chunk and the entry of every function that can call wasm
+  (`call`, `call_indirect`, `call_ref` and their tail forms, found by a
+  pre-scan of the body), and call the `stack_limit_interrupt` builtin when
+  the compare fails instead of trapping. A function that calls no wasm runs
+  for bounded time outside its loops, so it keeps only the ordinary ISA
+  prologue overflow check, made against `VMStoreContext::real_stack_limit`,
+  which never holds the interrupt sentinel; Cranelift omits that check for a
+  leaf with no frame, so such a leaf compiles exactly as with no interruption
+  at all. `Engine::new` refuses the option together with epoch interruption,
+  with stack switching and on Pulley.
+- `Store::interrupt_handle()` returns a `Send + Sync` `StoreInterruptHandle`
+  whose `interrupt()` sets a pending flag and raises the limit to a sentinel,
+  with no lock and no allocation, so an interrupt handler may call it. The
+  `VMStoreContext` lives in an `Arc` the handle keeps alive.
+- Every writer of the limit (entering and leaving wasm, fiber switches)
+  re-raises the sentinel while an interrupt is pending, so an interrupt
+  requested in host code or on a suspended fiber is delivered at the next
+  check in wasm.
+- The builtin clears the flag, restores the real limit, runs the store's
+  `Store::interrupt_callback` (`InterruptAction::Continue`, `Yield`, or an
+  error), and then traps with a stack overflow if the stack pointer is
+  really below the limit.
+
+Helios needs it because the epoch checks it replaces cost 10–29% on every
+compute workload (paired run 38745522065): a full check on every function
+entry, a cached check at every loop header, and two variables live across
+every body. The second commit keeps call-free functions leaf: the first made
+every function entry an explicit check whose cold path is a call, which
+turned every leaf into a non-leaf and left the guest 6–31% slower than an
+interruption-free build (paired run 38821832333), while the loop-header
+checks cost nothing measurable (paired run 38834037272).
+
+The revision it replaces is `helios/parallel-compile-steal` at
+`f5a2d7baf50962ae777c29ecc792f0eed501c75d`, which is
+`helios/pooling-host-stack` at
+`7a17b5375af44664392d2a550e9724be0f1946c4` plus one additive commit, which
+makes every parallel compile input its own stealable job:
+
+- `Engine::run_maybe_parallel` hands Rayon
+  `input.into_par_iter().with_max_len(1)` instead of `into_par_iter()`.
+  An indexed parallel iterator splits its input into a few leaves up front
+  and re-splits a leaf only when another worker steals it, so a leaf that
+  holds one heavy function keeps its worker compiling alone after the
+  others have run dry. With one input per job, an idle worker always has
+  the remaining functions to steal.
+- Results are still collected in input order and the first error is still
+  returned deterministically; `run_maybe_parallel_mut` is unchanged.
+
+Helios needs it because the in-kernel compiler plugin compiles every
+module through this call on a small worker pool: on `curl.wasm` one worker
+held the tail of the compile alone for 53–73 ms of a 245–275 ms compile
+(#430).
+
+The revision it replaces is `helios/component-instance-memory` at
 `39819b1f81f3912dddfdcb25de6d5924aef15783` plus one additive commit, which
 lets the pooling allocator honour `Config::with_host_stack`:
 
@@ -34,7 +198,7 @@ committed, with no guard page. The creator is the one route by which the
 kernel can place fiber stacks in memory it commits on demand
 (`kernel/src/memory/fiber_stack.rs`, #288).
 
-The revision it replaces added
+The revision before that added
 `wasmtime::component::Instance::get_default_memory`, which returns the core
 memory a component instantiated for its own canonical ABI. The kernel's
 device grants (#5) place a device mapping inside a plugin's linear memory

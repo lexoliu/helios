@@ -89,7 +89,7 @@ pub(super) fn install_http_client_plugin<CpuImpl, Net, HostFs>(
 async fn run_http_plugin_supervisor<CpuImpl, Net, HostFs>(
     service: UserProgramService<CpuImpl, Net, HostFs>,
     exec_context: ProgramExecContext<CpuImpl, Net, HostFs>,
-    artifact: Bytes,
+    artifact: BootfsBytes,
     receiver: ProviderReceiver<HttpExchange>,
 ) where
     CpuImpl: Cpu + Clone,
@@ -128,7 +128,7 @@ async fn run_http_plugin_supervisor<CpuImpl, Net, HostFs>(
 async fn run_http_plugin_once<CpuImpl, Net, HostFs>(
     service: &UserProgramService<CpuImpl, Net, HostFs>,
     exec_context: &ProgramExecContext<CpuImpl, Net, HostFs>,
-    artifact: &Bytes,
+    artifact: &BootfsBytes,
     first: HttpExchange,
     receiver: &ProviderReceiver<HttpExchange>,
 ) -> Result<(), ProgramExecError>
@@ -147,11 +147,16 @@ where
     );
 
     let payload = trusted_bootfs_payload(artifact)?;
-    let instance_pre =
-        service.load_precompiled_component(payload, exec_context.write_serial, started_at)?;
+    let instance_pre = service.load_precompiled_component(
+        HTTP_CLIENT_PLUGIN_PATH,
+        payload,
+        exec_context.write_serial,
+        started_at,
+        &phases::Timeline::disabled(),
+    )?;
 
-    let mut store = crate::wasmtime_adapter::store_with_state(
-        service.inner.engine.raw(),
+    let (mut store, interrupts) = crate::wasmtime_adapter::store_with_state(
+        &service.inner.engine,
         StoreData::<CpuImpl, Net, HostFs>::new(
             ResourceTable::new(),
             exec_context.cpu.clone(),
@@ -178,8 +183,9 @@ where
         ),
     );
 
-    let wasm_instance = instance_pre
-        .instantiate_async(&mut store)
+    let turns = store.data().guest_turns();
+    let wasm_instance = interrupts
+        .drive(turns.drive(instance_pre.instantiate_async(&mut store)))
         .await
         .map_err(map_program_runtime_error)?;
     crate::wasmtime_adapter::component_host::record_linear_memory(&mut store, &wasm_instance);
@@ -187,15 +193,16 @@ where
     let guest = handler.wasi_http_handler().clone();
 
     let mut first = Some(first);
-    store
-        .run_concurrent(async move |accessor| {
+    let turns = store.data().guest_turns();
+    interrupts
+        .drive(turns.drive(store.run_concurrent(async move |accessor| {
             let exchange = first.take().expect("the first exchange is dispatched once");
             dispatch_exchange(accessor, &guest, exchange)?;
             while let Some(exchange) = receiver.recv().await {
                 dispatch_exchange(accessor, &guest, exchange)?;
             }
             Ok::<(), wasmtime::Error>(())
-        })
+        })))
         .await
         .and_then(|result| result)
         .map_err(map_program_runtime_error)

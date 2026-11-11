@@ -9,9 +9,11 @@ mod boot;
 mod device;
 mod entropy;
 mod exceptions;
+mod extended_state;
 mod gpu;
 mod host_fs;
 mod input;
+mod ioapic;
 mod iommu;
 mod net;
 mod pci;
@@ -44,7 +46,7 @@ use core::arch::x86_64::{__cpuid, __cpuid_count, _rdrand64_step, _rdtsc};
 use core::ops::Range;
 use core::sync::atomic::{Ordering, compiler_fence};
 use helios_hal::boot::{BootMemoryMap, BootReservedRanges, usable_region_segments};
-use helios_hal::cpu::{Cpu, Instant, ProcessorId, current_processor};
+use helios_hal::cpu::{Cpu, Instant, ProcessorId, Timebase, TimerInterrupt, current_processor};
 use helios_hal::critical_section::ProcessorIdentity;
 use helios_hal::entropy::{EntropyQuality, EntropyUnavailable};
 use helios_hal::memory::MemoryRegion;
@@ -54,8 +56,10 @@ use helios_hal::{
     DeviceInventory, DmaModel, Platform, ProcessorStartupPolicy, ProcessorTopology, align_up,
 };
 use helios_kernel::DebugSerialAccess;
+// Keep the unified kernel libm dependency's soft-float feature active.
+use libm as _;
 use x86_64::instructions::port::{Port, PortReadOnly, PortWriteOnly};
-use x86_64::registers::control::{Cr0Flags, Cr4Flags};
+use x86_64::registers::control::{Cr0, Cr0Flags, Cr4Flags};
 
 const COM1_BASE: u16 = 0x3f8;
 const COM1_DATA: u16 = COM1_BASE;
@@ -66,6 +70,10 @@ const COM1_MODEM_CONTROL: u16 = COM1_BASE + 4;
 const COM1_LINE_STATUS: u16 = COM1_BASE + 5;
 const LSR_DATA_READY: u8 = 0x01;
 const LSR_TX_EMPTY: u8 = 0x20;
+/// Interrupt enable register: received-data-available is the only
+/// source this backend arms. Transmission is synchronous on the line
+/// status register, so no holding-register-empty interrupt is wanted.
+const IER_RECEIVED_DATA: u8 = 0x01;
 const PIT_COMMAND: u16 = 0x43;
 const PIT_CHANNEL2_DATA: u16 = 0x42;
 const PIT_SPEAKER_GATE: u16 = 0x61;
@@ -76,7 +84,26 @@ pub(crate) const KERNEL_STACK_BYTES: usize = 4 * 1024 * 1024;
 static CRITICAL_SECTION_STATE: helios_hal::critical_section::CriticalSectionState =
     helios_hal::critical_section::CriticalSectionState::new();
 
-global_asm!(include_str!("secondary_wakeup.S"));
+/// CR0 bits every processor runs with, set by `_start` on the bootstrap
+/// processor and by the secondary wakeup trampoline: MP (Intel SDM Vol. 3A
+/// §2.5), and WP, so supervisor writes honour read-only mappings (§2.5, and
+/// §4.6.1 for the access rights it enforces).
+const CR0_SET: Cr0Flags = Cr0Flags::MONITOR_COPROCESSOR.union(Cr0Flags::WRITE_PROTECT);
+/// CR0 bits every processor runs with clear: EM and TS (Vol. 3A §2.5, so SSE
+/// does not fault), and CD and NW, because INIT leaves both set (Vol. 3A
+/// Table 10-1) and Helios never runs with caching disabled.
+const CR0_CLEAR: Cr0Flags = Cr0Flags::EMULATE_COPROCESSOR
+    .union(Cr0Flags::TASK_SWITCHED)
+    .union(Cr0Flags::CACHE_DISABLE)
+    .union(Cr0Flags::NOT_WRITE_THROUGH);
+
+// `cr0_set` and `cr0_clear` are the trampoline's mask operands; paging and
+// protected mode are the mode switch itself and stay in the file.
+global_asm!(
+    include_str!("secondary_wakeup.S"),
+    cr0_set = const CR0_SET.bits() as u32,
+    cr0_clear = const !(CR0_CLEAR.bits() as u32),
+);
 
 mod vmm;
 pub use vmm::X86UserAddressSpace;
@@ -124,7 +151,9 @@ unsafe impl critical_section::Impl for X86CriticalSection {
 /// SSE-enabled machine state (the Limine 9 EFI loader hands off with
 /// CR4.OSFXSR clear), so no compiler-generated code may run before the
 /// FPU/SSE control bits are set: LLVM freely emits SSE moves into early
-/// boot code. This naked stub is the only pre-SSE code in the kernel.
+/// boot code. This naked stub is the only pre-SSE code in the kernel;
+/// `x86_kernel_main` enables OSXSAVE and the CPUID-reported XCR0 in Rust
+/// after it has configured COM1.
 #[unsafe(no_mangle)]
 #[unsafe(naked)]
 extern "C" fn _start() -> ! {
@@ -138,10 +167,8 @@ extern "C" fn _start() -> ! {
         "mov cr4, rax",
         "fninit",
         "jmp {main}",
-        // Clear EM and TS, set MP.
-        cr0_clear = const !(Cr0Flags::EMULATE_COPROCESSOR.bits() as u32
-            | Cr0Flags::TASK_SWITCHED.bits() as u32),
-        cr0_set = const Cr0Flags::MONITOR_COPROCESSOR.bits() as u32,
+        cr0_clear = const !(CR0_CLEAR.bits() as u32),
+        cr0_set = const CR0_SET.bits() as u32,
         cr4_set = const (Cr4Flags::OSFXSR.bits() as u32
             | Cr4Flags::OSXMMEXCPT_ENABLE.bits() as u32),
         main = sym x86_kernel_main,
@@ -155,6 +182,7 @@ fn x86_kernel_main() -> ! {
     smp::install_bootstrap_anchor();
     // The one place COM1 is configured; see `serial_uart_init`.
     serial_uart_init();
+    let xcr0 = extended_state::enable_on_bootstrap_processor();
     assert!(
         boot::base_revision_supported(),
         "Limine bootloader does not support the required base protocol revision"
@@ -193,18 +221,29 @@ fn x86_kernel_main() -> ! {
         &reserved_ranges,
         wakeup_page.clone(),
     );
-    let tsc_hz = detect_tsc_frequency_hz();
+    let timebase = Timebase::new(detect_tsc_frequency_hz());
     let tsc_base = read_tsc();
-    let debug_state = debug_state::RuntimeState::new(tsc_hz, processor_count, 0);
+    let payload = helios_kernel::BootPayload::from_boot_modules(&handoff.modules);
+    let debug_state = debug_state::RuntimeState::new(timebase, processor_count, 0, payload);
+    // Every processor's periodic timer samples the instruction it
+    // interrupted while instruction sampling runs
+    // (`smp::handle_local_timer_interrupt`).
+    debug_state
+        .instruction_sampler()
+        .install_capture(smp::instruction_sample_capture(handoff.kernel.virtual_base));
     let boot = smp::build_boot_context(
         rsdp_address,
         physical_memory_offset,
         wakeup_page,
         tsc_base,
-        tsc_hz,
+        timebase,
         debug_state.clone(),
+        xcr0,
     );
     smp::activate_runtime(boot.bootstrap_runtime());
+    // The local APIC is enabled once, here, and never re-attached on the
+    // interrupt or IPI paths (`smp::ProcessorRuntime::attach_local_apic`).
+    smp::current_runtime().attach_local_apic();
     exceptions::install_for_current_processor();
     let console = serial_console(debug_state.clone());
     let cpu = X86Cpu::new(boot.platform());
@@ -258,6 +297,27 @@ fn x86_kernel_main() -> ! {
             .with_devices(devices),
     );
     smp::current_runtime().install_timer(kernel.timer());
+    // The first line the logger can carry. The bootloader decides where
+    // the kernel runs, so a runtime address means nothing against the
+    // image's own symbols until it is shifted by this base; the inspector
+    // reads this exact line out of the debug serial log to symbolise the
+    // vCPUs of a guest that stopped answering.
+    tracing::info!(
+        virtual_base = format_args!("{:#x}", handoff.kernel.virtual_base),
+        physical_base = format_args!("{:#x}", handoff.kernel.physical_base),
+        "kernel image loaded"
+    );
+    let (xsave_standard_bytes, xsave_max_bytes) = extended_state::xsave_sizes();
+    let supervisor_state = extended_state::supervisor_state_support();
+    tracing::info!(
+        xcr0 = format_args!("{:#x}", xcr0.bits()),
+        xsave_standard_bytes,
+        xsave_max_bytes,
+        avx512 = xcr0.bits() & extended_state::AVX512_STATE != 0,
+        xsaves = supervisor_state.xsaves,
+        xss_supported = format_args!("{:#x}", supervisor_state.xss_mask),
+        "x86 extended state enabled"
+    );
     let debug_state = cpu.debug_state();
     // The root DRBG is seeded before any component can ask for random
     // bytes. x86 has no firmware seed to read — the boot protocol here
@@ -271,8 +331,16 @@ fn x86_kernel_main() -> ! {
     // before it is programmed, and that pass also programs the block
     // device, which needs the root DRBG this call produces. It joins
     // through the reseed task once the executor runs.
-    let root_entropy =
-        helios_kernel::seed_root_entropy(&cpu, None, None::<&helios_kernel::NoEntropyDevice>);
+    // No VM generation ID window is discovered on this platform yet, so
+    // the machine generation moves only through `advance`.
+    let machine_generation = helios_kernel::MachineGeneration::new(None);
+    debug_state.install_machine_generation(machine_generation.clone());
+    let root_entropy = helios_kernel::seed_root_entropy(
+        &cpu,
+        None,
+        None::<&helios_kernel::NoEntropyDevice>,
+        machine_generation,
+    );
     debug_state.install_root_entropy(root_entropy.clone());
     // The calendar is read once, here, before any component can ask
     // what time it is. The TSC carries wall time forward from that
@@ -539,12 +607,20 @@ fn install_pci_devices<WatchdogImpl>(
     ) {
         routes.add_block(block.vector, block.device);
     }
+    // COM1 interrupts through the I/O APIC, not MSI-X, but its vector
+    // registers beside the message-signalled routes. The redirection
+    // entry is armed only once the table is installed, so no delivery
+    // can precede its handler.
+    routes.set_debug_serial(
+        exceptions::DEBUG_SERIAL_INTERRUPT_VECTOR,
+        DebugSerial::console().interrupt_handler::<DebugSerial>(),
+    );
     cpu.platform_state().install_device_interrupts(routes);
+    cpu.platform_state().io_apic().program_redirection(
+        exceptions::DEBUG_SERIAL_INTERRUPT_VECTOR,
+        destination_apic_id,
+    );
 }
-
-// TODO(x86-avx): enable OSXSAVE, program XCR0, and preserve XSAVE state
-// (in `_start` and the secondary wakeup trampoline) before advertising
-// AVX/FMA/AVX512 to Wasmtime-generated code.
 
 /// Counts usable processors from the MADT. Runs before the bootstrap
 /// allocator is primed (the count sizes the allocator's per-processor
@@ -560,7 +636,7 @@ fn processor_count(rsdp_address: usize, physical_memory_offset: usize) -> usize 
     let handler = smp::PhysicalOffsetAcpiHandler {
         physical_memory_offset,
         tsc_base: 0,
-        tsc_hz: 1,
+        timebase: Timebase::new(1),
     };
     let tables =
         unsafe { acpi::AcpiTables::from_rsdp(handler, rsdp_address) }.unwrap_or_else(|error| {
@@ -759,6 +835,10 @@ extern "Rust" fn helios_current_processor() -> ProcessorId {
 }
 
 impl Cpu for X86Cpu {
+    // The local APIC timer runs in periodic mode at the scheduler tick;
+    // `set_deadline` only starts it.
+    const TIMER_INTERRUPT: TimerInterrupt = TimerInterrupt::Periodic;
+
     fn processor_count(&self) -> usize {
         self.state.processor_count()
     }
@@ -819,8 +899,8 @@ impl Cpu for X86Cpu {
         Instant::new(read_tsc().saturating_sub(self.state.tsc_base()))
     }
 
-    fn timer_frequency(&self) -> u64 {
-        self.state.tsc_hz()
+    fn timebase(&self) -> Timebase {
+        self.state.timebase()
     }
 
     fn set_deadline(&self, deadline: Instant) {
@@ -927,15 +1007,25 @@ extern "C" fn secondary_start_rust(
     boot: *const smp::BootContext,
     runtime: *const smp::ProcessorRuntime,
 ) -> ! {
-    // FPU/SSE control bits are set by the secondary wakeup trampoline
-    // before any compiler-generated code runs on this processor.
+    let boot = unsafe { &*boot };
+    // CR0 and the FPU/SSE control bits are set by the secondary wakeup
+    // trampoline; this checks the CR0 it left.
+    let cr0 = Cr0::read();
+    assert!(
+        cr0.contains(CR0_SET) && !cr0.intersects(CR0_CLEAR),
+        "x86 secondary processor entered Rust with CR0 {cr0:?}; Helios requires every \
+         processor to run with {CR0_SET:?} set and {CR0_CLEAR:?} clear"
+    );
+    // OSXSAVE and the bootstrap processor's XCR0 are set here, before any
+    // guest code can run on this processor.
     //
     // COM1 is deliberately not configured here: the bootstrap processor
     // configured it before it woke anyone, and configuring it again is
     // destructive rather than idempotent. See `serial_uart_init`.
-    let boot = unsafe { &*boot };
+    extended_state::enable_on_secondary_processor(boot.xcr0());
     let runtime = unsafe { &*runtime };
     smp::activate_runtime(runtime);
+    smp::current_runtime().attach_local_apic();
     exceptions::install_for_current_processor();
     exceptions::verify_page_fault_returns();
 
@@ -990,6 +1080,7 @@ fn detect_x86_native_feature(feature: &str) -> Option<bool> {
         "sse4.2" => Some(leaf1.ecx & (1 << 20) != 0),
         "popcnt" => Some(leaf1.ecx & (1 << 23) != 0),
         "avx" => Some(avx_os_enabled),
+        "avx2" => Some(leaf7.is_some_and(|leaf| leaf.ebx & (1 << 5) != 0) && avx_os_enabled),
         "fma" => Some(leaf1.ecx & (1 << 12) != 0 && avx_os_enabled),
         "bmi1" => Some(leaf7.is_some_and(|leaf| leaf.ebx & (1 << 3) != 0)),
         "bmi2" => Some(leaf7.is_some_and(|leaf| leaf.ebx & (1 << 8) != 0)),
@@ -1106,6 +1197,10 @@ fn serial_uart_init() {
         PortWriteOnly::new(COM1_DATA).write(0x01_u8);
         PortWriteOnly::new(COM1_INTERRUPT_ENABLE).write(0x00_u8);
         PortWriteOnly::new(COM1_LINE_CONTROL).write(0x03_u8);
+        // The divisor latch is closed, so this reaches the real IER. The
+        // receive interrupt stays off until the first input waiter arms
+        // it through `ByteSerial::enable_receive_interrupt`.
+        PortWriteOnly::new(COM1_INTERRUPT_ENABLE).write(0x00_u8);
         PortWriteOnly::new(COM1_FIFO_CONTROL).write(0xc7_u8);
         PortWriteOnly::new(COM1_MODEM_CONTROL).write(0x0b_u8);
     }
@@ -1128,6 +1223,21 @@ impl ByteSerial for DebugSerial {
     fn write_bytes(&self, bytes: &[u8]) {
         for &byte in bytes {
             serial_write_byte(byte);
+        }
+    }
+
+    /// One port write each way. The divisor latch is closed after
+    /// `serial_uart_init`, so the interrupt-enable register is the one
+    /// at this offset; nothing else on the machine writes it.
+    fn enable_receive_interrupt(&self) {
+        unsafe {
+            PortWriteOnly::new(COM1_INTERRUPT_ENABLE).write(IER_RECEIVED_DATA);
+        }
+    }
+
+    fn disable_receive_interrupt(&self) {
+        unsafe {
+            PortWriteOnly::new(COM1_INTERRUPT_ENABLE).write(0x00_u8);
         }
     }
 }
@@ -1210,6 +1320,14 @@ extern "C" fn wasmtime_tls_set(slot: usize, ptr: *mut u8) {
     smp::current_runtime().wasmtime_tls.set(slot, ptr);
 }
 
+/// The executing processor's guest stack-limit word, the location the
+/// kernel's engines publish stack limits to
+/// (`helios_hal::cpu::GUEST_STACK_LIMIT_OFFSET`).
+#[unsafe(no_mangle)]
+extern "C" fn wasmtime_processor_stack_limit() -> *mut usize {
+    smp::current_guest_stack_limit().as_ptr()
+}
+
 #[unsafe(no_mangle)]
 extern "C" fn wasmtime_init_traps(handler: helios_kernel::KernelNativeTrapHandler) -> i32 {
     helios_kernel::install_native_trap_handler(handler);
@@ -1217,9 +1335,16 @@ extern "C" fn wasmtime_init_traps(handler: helios_kernel::KernelNativeTrapHandle
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn wasmtime_parking_wait(_timeout_nanos: u64) {
-    core::hint::spin_loop();
+extern "C" fn wasmtime_parking_wait(timeout_nanos: u64) -> bool {
+    helios_kernel::park_wasmtime_waiter(smp::current_runtime().timer(), timeout_nanos)
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn wasmtime_parking_unpark() {}
+extern "C" fn wasmtime_parking_unpark() {
+    helios_kernel::unpark_wasmtime_waiters();
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn wasmtime_monotonic_nanos() -> u64 {
+    helios_kernel::wasmtime_monotonic_nanos(smp::current_runtime().timer())
+}

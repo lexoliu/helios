@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import os
 import platform
 import re
 import shutil
 import subprocess
 import tomllib
 from pathlib import Path
+from typing import Literal
 
 import yaml
 from pydantic import BaseModel, Field
@@ -17,7 +19,9 @@ from helios_bench.wasi_apps import fedora_baseline
 
 MANIFEST_PATH = TOOLS_BENCH_ROOT / "manifest.toml"
 WORKLOADS_PATH = WASI_APPS_ROOT / "workloads.json"
-WASMTIME_ACTION_PATH = REPO_ROOT / ".github" / "actions" / "checkout-wasmtime" / "action.yml"
+# Where a commit pins its Wasmtime fork, relative to the checkout.
+WASMTIME_ACTION = Path(".github") / "actions" / "checkout-wasmtime" / "action.yml"
+WASMTIME_ACTION_PATH = REPO_ROOT / WASMTIME_ACTION
 MANIFEST_SCHEMA_VERSION = 1
 
 
@@ -35,6 +39,7 @@ class Lane(BaseModel):
     helios_arch: str
     guest_arch: str
     accelerator: str
+    rpc_transport: Literal["serial", "vsock"]
     runner_label: str
     shared_runner: str
     qemu_version: str
@@ -63,6 +68,10 @@ class Lane(BaseModel):
             "helios-arch": self.helios_arch,
             "guest-arch": self.guest_arch,
             "net-backend": self.net_backend,
+            # The inspector RPC transport the lane's numbers are taken
+            # over; a job that boots the lane's workloads outside the
+            # matrix reads it here for the same reason it reads `memory`.
+            "rpc-transport": self.rpc_transport,
             "boot-timeout": str(self.boot_timeout_seconds),
             # The guest RAM the lane's workloads are sized for. A job
             # that boots this lane's workloads outside the matrix — the
@@ -99,15 +108,29 @@ def load_manifest(path: Path = MANIFEST_PATH) -> Manifest:
     return Manifest.model_validate(raw)
 
 
-def vendored_wasmtime_revision(path: Path = WASMTIME_ACTION_PATH) -> str:
-    """The Wasmtime tree every workflow builds against, from its one pin."""
-    with path.open("r", encoding="utf-8") as handle:
-        action = yaml.safe_load(handle)
+class WasmtimePin(BaseModel, frozen=True):
+    """The Wasmtime fork revision a Helios commit builds against."""
+
+    repository: str = Field(description="the GitHub `owner/name` the fork is checked out from")
+    revision: str
+
+
+def wasmtime_pin(action_text: str, source: str) -> WasmtimePin:
+    """The pin `.github/actions/checkout-wasmtime/action.yml` states.
+
+    `source` names where the text came from, for the refusal.
+    """
+    action = yaml.safe_load(action_text)
     for step in action["runs"]["steps"]:
         with_ = step.get("with", {})
         if with_.get("repository", "").endswith("/wasmtime") and "ref" in with_:
-            return str(with_["ref"])
-    raise SystemExit(f"{path}: no checkout step pins a wasmtime ref")
+            return WasmtimePin(repository=str(with_["repository"]), revision=str(with_["ref"]))
+    raise SystemExit(f"{source}: no checkout step pins a wasmtime ref")
+
+
+def vendored_wasmtime_pin(path: Path = WASMTIME_ACTION_PATH) -> WasmtimePin:
+    """The Wasmtime tree this checkout builds against, from its one pin."""
+    return wasmtime_pin(path.read_text(encoding="utf-8"), str(path))
 
 
 def fedora_image(guest_arch: str) -> tuple[str, str]:
@@ -195,6 +218,8 @@ def host_deviations(lane: Lane) -> list[str]:
         deviations.append(f"{lane.qemu_binary} is {version}, lane pins {lane.qemu_version}")
     if not accelerator_available(lane.accelerator):
         deviations.append(f"accelerator {lane.accelerator} is not available on this host")
+    if lane.rpc_transport == "vsock" and not os.access("/dev/vhost-vsock", os.R_OK | os.W_OK):
+        deviations.append("/dev/vhost-vsock is not usable, lane carries the inspector RPC over vsock")
     cpus = platform.os.cpu_count() or 0
     if cpus < lane.vcpus:
         deviations.append(f"host has {cpus} logical CPUs, lane needs {lane.vcpus} vCPUs")
