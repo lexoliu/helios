@@ -520,15 +520,10 @@ impl Cpu for RiscvCpu {
 
     fn publish_executable(&self, ptr: *const u8, len: usize) {
         helios_kernel::runtime_memory::publish_code_memory(ptr, len);
-        // `fence.i` is the only ordering RISC-V defines between a store to an
-        // instruction's memory and a fetch of it, and it is per-hart. The
-        // range is published before any other hart can be steered into it, so
-        // fencing the publishing hart is what the hart that executes next
-        // needs; every other hart reaches this code through a scheduler
-        // handoff that fences on its own side.
-        unsafe {
-            core::arch::asm!("fence.i", options(nostack, preserves_flags));
-        }
+        // Every hart is fenced before the range is handed out. A range is
+        // executable only between this call and `unpublish_executable`, so
+        // a reused range is fenced here again before anything runs it.
+        fence_instruction_streams();
     }
 
     fn unpublish_executable(&self, ptr: *const u8, len: usize) {
@@ -1064,6 +1059,28 @@ fn mark_hart_online(hart: ProcessorId) {
 
 fn hart_is_online(hart: ProcessorId) -> bool {
     ONLINE_HARTS.load(Ordering::Acquire) & hart_bit(hart) != 0
+}
+
+/// Orders every hart's instruction fetch after the stores made to code memory
+/// so far.
+///
+/// `fence.i` is the only ordering RISC-V defines between a store to an
+/// instruction's memory and a fetch of it, and it affects only the hart that
+/// executes it. The current hart fences itself, then `sbi_remote_fence_i`
+/// (SBI specification, chapter 8 "RFENCE Extension", function 0) has every
+/// hart the firmware runs execute `fence.i`.
+fn fence_instruction_streams() {
+    unsafe {
+        core::arch::asm!("fence.i", options(nostack, preserves_flags));
+    }
+    // A hart mask base of `usize::MAX` addresses all available harts.
+    let ret = sbi_rt::remote_fence_i(sbi_rt::HartMask::from_mask_base(0, usize::MAX));
+    assert!(
+        ret.is_ok(),
+        "SBI remote_fence_i failed: error={} value={}",
+        ret.error,
+        ret.value
+    );
 }
 
 fn release_early_boot_harts() {
