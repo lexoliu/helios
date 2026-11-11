@@ -52,6 +52,10 @@ const IPV4_MAX_REASSEMBLED_PACKET_LEN: usize = u16::MAX as usize;
 const IPV4_MAX_REASSEMBLED_PAYLOAD_LEN: usize =
     IPV4_MAX_REASSEMBLED_PACKET_LEN - Ipv4Packet::MIN_HEADER_LEN;
 const IPV4_REASSEMBLY_TIMEOUT_NANOS: u64 = 30_000_000_000;
+/// What one cached fragment costs beyond its payload: the record the entry
+/// keeps for it. Charged against [`MAX_IPV4_REASSEMBLY_BYTES`] so a flood of
+/// tiny fragments is bounded by the budget in count as well as in bytes.
+const IPV4_FRAGMENT_BOOKKEEPING_BYTES: usize = core::mem::size_of::<Ipv4Fragment>();
 // Keep common small application datagrams out of the heap without moving a
 // large inline block through the bounded receive queue.
 // The previous path allocated one `Bytes` object per received UDP packet;
@@ -914,10 +918,13 @@ struct Ipv4ReassemblyKey {
     identification: u16,
 }
 
+/// One cached fragment. It owns a copy of its payload: the frame it arrived
+/// in is the driver's receive buffer on loan for one receive pass, and a
+/// fragment can sit here for [`IPV4_REASSEMBLY_TIMEOUT_NANOS`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Ipv4Fragment {
     offset: usize,
-    bytes: Bytes,
+    bytes: Box<[u8]>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1074,7 +1081,7 @@ impl Ipv4Fragment {
     }
 
     fn range_matches(&self, offset: usize, bytes: &[u8]) -> bool {
-        self.offset == offset && self.bytes.len() == bytes.len() && self.bytes.as_ref() == bytes
+        self.offset == offset && *self.bytes == *bytes
     }
 
     fn overlaps(&self, offset: usize, end: usize) -> bool {
@@ -1107,9 +1114,9 @@ impl Ipv4ReassemblyEntry {
         &mut self,
         packet: Ipv4Packet<'_>,
         packet_bytes: &[u8],
-        payload_bytes: Bytes,
         now: StackInstant,
     ) -> Ipv4FragmentInsert {
+        let payload_bytes = packet.payload;
         let offset = usize::from(packet.fragment_offset_blocks) * IPV4_FRAGMENT_BLOCK_SIZE;
         let end = offset
             .checked_add(payload_bytes.len())
@@ -1117,7 +1124,7 @@ impl Ipv4ReassemblyEntry {
         if self
             .fragments
             .iter()
-            .any(|fragment| fragment.range_matches(offset, payload_bytes.as_ref()))
+            .any(|fragment| fragment.range_matches(offset, payload_bytes))
         {
             if offset == 0
                 && self.has_header()
@@ -1143,7 +1150,10 @@ impl Ipv4ReassemblyEntry {
         {
             return Ipv4FragmentInsert::Invalid;
         }
-        let mut added_bytes = payload_bytes.len();
+        let mut added_bytes = payload_bytes
+            .len()
+            .checked_add(IPV4_FRAGMENT_BOOKKEEPING_BYTES)
+            .unwrap_or_else(|| panic!("IPv4 reassembly cached byte count overflowed"));
         if offset == 0 {
             if self.has_header() {
                 return Ipv4FragmentInsert::Invalid;
@@ -1172,7 +1182,7 @@ impl Ipv4ReassemblyEntry {
         }
         self.fragments.push(Ipv4Fragment {
             offset,
-            bytes: payload_bytes,
+            bytes: Box::from(payload_bytes),
         });
         self.fragments.sort_by_key(|fragment| fragment.offset);
         self.cached_bytes = self
@@ -1215,7 +1225,7 @@ impl Ipv4ReassemblyEntry {
             let end = start
                 .checked_add(fragment.bytes.len())
                 .unwrap_or_else(|| panic!("IPv4 reassembled fragment end overflowed"));
-            packet[start..end].copy_from_slice(fragment.bytes.as_ref());
+            packet[start..end].copy_from_slice(&fragment.bytes);
         }
         packet[2..4].copy_from_slice(&total_len_u16.to_be_bytes());
         packet[6..8].copy_from_slice(&0u16.to_be_bytes());
@@ -1263,7 +1273,6 @@ impl Ipv4ReassemblyCache {
         &mut self,
         packet: Ipv4Packet<'_>,
         packet_bytes: &[u8],
-        payload_bytes: Bytes,
         now: StackInstant,
     ) -> Ipv4ReassemblyResult {
         self.expire(now);
@@ -1274,7 +1283,7 @@ impl Ipv4ReassemblyCache {
         let key = Ipv4ReassemblyKey::new(packet);
         let fragment_offset = usize::from(packet.fragment_offset_blocks) * IPV4_FRAGMENT_BLOCK_SIZE;
         let fragment_end = fragment_offset
-            .checked_add(payload_bytes.len())
+            .checked_add(packet.payload.len())
             .unwrap_or_else(|| panic!("validated IPv4 fragment offset overflowed"));
         if fragment_end > IPV4_MAX_REASSEMBLED_PAYLOAD_LEN {
             self.remove_key(key);
@@ -1289,14 +1298,16 @@ impl Ipv4ReassemblyCache {
             } else {
                 0
             };
-        let expected_added = payload_bytes
+        let expected_added = packet
+            .payload
             .len()
             .checked_add(header_added)
+            .and_then(|bytes| bytes.checked_add(IPV4_FRAGMENT_BOOKKEEPING_BYTES))
             .unwrap_or_else(|| panic!("IPv4 reassembly expected byte count overflowed"));
         if !self.make_room_for(index, expected_added) {
             return Ipv4ReassemblyResult::CacheFull;
         }
-        let insert = self.entries[index].insert_fragment(packet, packet_bytes, payload_bytes, now);
+        let insert = self.entries[index].insert_fragment(packet, packet_bytes, now);
         match insert {
             Ipv4FragmentInsert::Duplicate => Ipv4ReassemblyResult::NeedMoreFragments,
             Ipv4FragmentInsert::Invalid => {
@@ -1331,6 +1342,22 @@ impl Ipv4ReassemblyCache {
                 self.remove_index(index);
             }
         }
+    }
+
+    /// When the entry that expires first does, or `None` with nothing
+    /// cached. The stack's timer path wakes for it, so a fragment never
+    /// outlives its timeout for want of another arrival.
+    fn next_deadline(&self) -> Option<StackInstant> {
+        self.entries
+            .iter()
+            .map(|entry| {
+                entry
+                    .updated_at
+                    .nanos()
+                    .saturating_add(IPV4_REASSEMBLY_TIMEOUT_NANOS)
+            })
+            .min()
+            .map(StackInstant::from_nanos)
     }
 
     fn expire(&mut self, now: StackInstant) {
@@ -3384,17 +3411,29 @@ where
         Ok(self.udp_rx_counts[udp_socket_index(socket)] != 0)
     }
 
+    /// The soonest time [`Self::drive_tcp`] owes work: a TCP timer, or the
+    /// expiry of the oldest incomplete IPv4 reassembly.
     pub fn next_tcp_deadline(&mut self) -> Option<StackInstant> {
-        loop {
-            let entry = self.tcp_timers.peek().copied()?;
+        let reassembly = self.ipv4_reassembly.next_deadline();
+        let tcp = loop {
+            let Some(entry) = self.tcp_timers.peek().copied() else {
+                break None;
+            };
             if self.tcp_timer_entry_current(entry) {
-                return Some(StackInstant::from_nanos(entry.deadline_nanos));
+                break Some(StackInstant::from_nanos(entry.deadline_nanos));
             }
             let _ = self.tcp_timers.pop();
+        };
+        match (tcp, reassembly) {
+            (Some(tcp), Some(reassembly)) => Some(tcp.min(reassembly)),
+            (tcp, reassembly) => tcp.or(reassembly),
         }
     }
 
+    /// Runs the stack's timers: every TCP socket's, and the IPv4
+    /// reassembly cache's expiry.
     pub fn drive_tcp(&mut self, now: StackInstant) -> Result<(), StackError> {
+        self.ipv4_reassembly.expire(now);
         let mut pending_syn =
             ArrayVec::<(usize, TcpEndpoint, TcpEndpoint, TcpHeader, TcpHeaderOptions), 16>::new();
         let mut pending_syn_ack =
@@ -4524,13 +4563,16 @@ where
             });
         }
         if packet.is_fragmented() {
-            let payload_bytes = frame.slice(bytes_subrange(frame.as_ref(), packet.payload));
-            return match self.ipv4_reassembly.process_fragment(
-                packet,
-                frame.as_ref(),
-                payload_bytes,
-                now,
-            ) {
+            // Nothing not addressed to this host is worth a cache slot, and
+            // the cache copies what it keeps: the frame is on loan for this
+            // receive pass only.
+            if !self.accepts_ipv4_destination(packet.protocol, packet.destination) {
+                return Ok(false);
+            }
+            return match self
+                .ipv4_reassembly
+                .process_fragment(packet, frame.as_ref(), now)
+            {
                 Ipv4ReassemblyResult::Complete(packet_bytes) => {
                     let packet = self.parse_ipv4(packet_bytes.as_ref())?;
                     assert!(
@@ -4570,7 +4612,7 @@ where
         let payload_bytes = frame.slice(payload_range);
         match packet.protocol {
             crate::IpProtocol::Tcp => {
-                if !self.owns_ip_address(IpAddress::Ipv4(packet.destination)) {
+                if !self.accepts_ipv4_destination(packet.protocol, packet.destination) {
                     return Ok(false);
                 }
                 self.receive_tcp(
@@ -4582,7 +4624,7 @@ where
                 )
             }
             crate::IpProtocol::Udp => {
-                if !self.accepts_ipv4_udp_destination(packet.destination) {
+                if !self.accepts_ipv4_destination(packet.protocol, packet.destination) {
                     return Ok(false);
                 }
                 let consumed = self.receive_udp(
@@ -4597,7 +4639,7 @@ where
                 Ok(false)
             }
             crate::IpProtocol::Icmp => {
-                if !self.owns_ip_address(IpAddress::Ipv4(packet.destination)) {
+                if !self.accepts_ipv4_destination(packet.protocol, packet.destination) {
                     return Ok(false);
                 }
                 self.receive_icmpv4(packet, now)
@@ -5829,6 +5871,20 @@ where
                 window_size: 0,
             },
         })
+    }
+
+    /// Whether an IPv4 datagram of `protocol` sent to `destination` is for
+    /// this host: UDP also takes broadcast and the multicast groups
+    /// joined, everything else only an owned address.
+    fn accepts_ipv4_destination(
+        &self,
+        protocol: crate::IpProtocol,
+        destination: Ipv4Address,
+    ) -> bool {
+        match protocol {
+            crate::IpProtocol::Udp => self.accepts_ipv4_udp_destination(destination),
+            _ => self.owns_ip_address(IpAddress::Ipv4(destination)),
+        }
     }
 
     fn accepts_ipv4_udp_destination(&self, destination: Ipv4Address) -> bool {
@@ -9743,6 +9799,162 @@ mod tests {
             .expect("UDP socket should exist")
             .expect("large UDP datagram should still be queued");
         assert_eq!(received.bytes.as_ref(), LARGE_PAYLOAD.as_slice());
+    }
+
+    /// A device buffer on loan: `released` counts how many have been
+    /// dropped, so a test can tell which of them the stack still holds.
+    struct LoanedFrame {
+        bytes: Vec<u8>,
+        released: alloc::sync::Arc<core::sync::atomic::AtomicUsize>,
+    }
+
+    impl AsRef<[u8]> for LoanedFrame {
+        fn as_ref(&self) -> &[u8] {
+            &self.bytes
+        }
+    }
+
+    impl Drop for LoanedFrame {
+        fn drop(&mut self) {
+            self.released
+                .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn loan_frame(
+        frame: &([u8; crate::ETHERNET_FRAME_BYTES], usize),
+        released: &alloc::sync::Arc<core::sync::atomic::AtomicUsize>,
+    ) -> Bytes {
+        Bytes::from_owner(LoanedFrame {
+            bytes: frame.0[..frame.1].to_vec(),
+            released: released.clone(),
+        })
+    }
+
+    /// Queues more incomplete fragments than a receive ring has slots
+    /// (256), each in its own loaned buffer, and requires every buffer to
+    /// be back with the driver once its receive pass has returned.
+    #[test]
+    fn ipv4_queued_fragments_do_not_retain_device_buffers() {
+        const FRAGMENTS: usize = 300;
+
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        let released = alloc::sync::Arc::new(core::sync::atomic::AtomicUsize::new(0));
+        for index in 1..=FRAGMENTS {
+            let frame = ipv4_fragment_frame(
+                peer,
+                local,
+                crate::IpProtocol::Udp,
+                0x2000,
+                index * IPV4_FRAGMENT_BLOCK_SIZE,
+                true,
+                &[0xa5; IPV4_FRAGMENT_BLOCK_SIZE],
+            );
+            stack
+                .receive_rx_frame(
+                    RxFrame::new(loan_frame(&frame, &released)),
+                    StackInstant::from_nanos(1),
+                )
+                .expect("incomplete fragment should be accepted");
+        }
+        assert!(
+            stack.ipv4_reassembly.cached_bytes >= FRAGMENTS * IPV4_FRAGMENT_BLOCK_SIZE,
+            "the fragments must actually be cached for this test to mean anything"
+        );
+        assert_eq!(
+            released.load(core::sync::atomic::Ordering::SeqCst),
+            FRAGMENTS,
+            "a cached fragment must not hold the device buffer it arrived in"
+        );
+    }
+
+    #[test]
+    fn ipv4_fragment_for_another_host_is_not_cached() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let other = Ipv4Address::new([192, 0, 2, 99]);
+        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        let frame = ipv4_fragment_frame(
+            peer,
+            other,
+            crate::IpProtocol::Udp,
+            0x2001,
+            0,
+            true,
+            &[0x5a; 16],
+        );
+        stack
+            .receive_frame(&frame.0[..frame.1], StackInstant::from_nanos(1))
+            .expect("a fragment for another host is dropped, not an error");
+        assert_eq!(stack.ipv4_reassembly.cached_bytes, 0);
+        assert!(stack.ipv4_reassembly.entries.is_empty());
+    }
+
+    #[test]
+    fn ipv4_reassembly_expires_from_the_stack_timer() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        let frame = ipv4_fragment_frame(
+            peer,
+            local,
+            crate::IpProtocol::Udp,
+            0x2002,
+            0,
+            true,
+            &[0x5a; 16],
+        );
+        let received_at = 1_000;
+        stack
+            .receive_frame(&frame.0[..frame.1], StackInstant::from_nanos(received_at))
+            .expect("first fragment should be accepted");
+        let expires_at = StackInstant::from_nanos(received_at + IPV4_REASSEMBLY_TIMEOUT_NANOS);
+        assert_eq!(stack.next_tcp_deadline(), Some(expires_at));
+
+        stack
+            .drive_tcp(StackInstant::from_nanos(
+                received_at + IPV4_REASSEMBLY_TIMEOUT_NANOS - 1,
+            ))
+            .expect("early drive should succeed");
+        assert!(stack.ipv4_reassembly.cached_bytes > 0);
+
+        stack
+            .drive_tcp(expires_at)
+            .expect("drive at the deadline should succeed");
+        assert_eq!(stack.ipv4_reassembly.cached_bytes, 0);
+        assert!(stack.ipv4_reassembly.entries.is_empty());
+        assert_eq!(stack.next_tcp_deadline(), None);
+    }
+
+    /// Eight-byte fragments cost far more in bookkeeping than in payload,
+    /// so the budget charges for the bookkeeping too.
+    #[test]
+    fn ipv4_reassembly_budget_counts_fragment_bookkeeping() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        let frame = ipv4_fragment_frame(
+            peer,
+            local,
+            crate::IpProtocol::Udp,
+            0x2003,
+            IPV4_FRAGMENT_BLOCK_SIZE,
+            true,
+            &[0x5a; IPV4_FRAGMENT_BLOCK_SIZE],
+        );
+        stack
+            .receive_frame(&frame.0[..frame.1], StackInstant::from_nanos(1))
+            .expect("fragment should be accepted");
+        assert_eq!(
+            stack.ipv4_reassembly.cached_bytes,
+            IPV4_FRAGMENT_BLOCK_SIZE + IPV4_FRAGMENT_BOOKKEEPING_BYTES
+        );
     }
 
     #[test]
