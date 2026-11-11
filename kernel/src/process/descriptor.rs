@@ -69,7 +69,7 @@ pub struct DescriptorLimit(usize);
 
 impl DescriptorLimit {
     /// 1024 is the soft `RLIMIT_NOFILE` a new process starts with on Linux,
-    /// the host ABI the WASIX guests are written against.
+    /// the system the POSIX guest programs are ported from.
     pub const DEFAULT: Self = Self(1024);
 
     pub const fn new(limit: usize) -> Self {
