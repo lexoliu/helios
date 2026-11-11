@@ -3,7 +3,7 @@ extern crate alloc;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::alloc::Layout;
-use core::cell::UnsafeCell;
+use core::cell::{Cell, UnsafeCell};
 use core::future::Future;
 use core::marker::PhantomData;
 use core::mem::{align_of, size_of};
@@ -26,11 +26,34 @@ use crate::exec::ready::{
     GlobalPop, GlobalReadyQueue, ReadyLink, ReadyRunnable, ReadyShared, RunList,
 };
 use crate::exec::sync::Notify;
-use crate::exec::timer::Timer;
+use crate::exec::timer::{GUEST_TIME_SLICE, Timer};
 use crate::memory::task_arena_bytes_for;
 
 pub type JoinHandle<T> = Task<T, ReadyLink>;
 pub const READY_BATCH_TASKS: usize = 1024;
+/// How many runs the loop may make between two service points: Go's
+/// `schedtick%61` global-queue check (`runtime/proc.go`, `findRunnable`),
+/// the seed of Tokio's tuned global queue interval and its fixed
+/// `event_interval` (tokio `runtime/builder.rs`, `new_multi_thread`).
+/// The other bound is time: a service point is also due once one
+/// [`GUEST_TIME_SLICE`] has passed since the last, because one run here
+/// can be a whole guest slice, and Tokio's own interval is a time budget
+/// (`TARGET_GLOBAL_QUEUE_INTERVAL`, tokio `runtime/scheduler/multi_thread/stats.rs`).
+///
+/// At a service point the loop fires the timer's expired sleeps and pops
+/// the global queue ahead of local work. A local task requeues itself
+/// locally and cannot move to the global queue, so without a service
+/// point a guest that yields every time slice would hold off both for
+/// as long as it lives. A global task queued while the local queue never
+/// empties runs at the first service point after its push: within this
+/// many runs, and no later than the first run boundary after one
+/// [`GUEST_TIME_SLICE`] of clock time, plus one run per global pop that
+/// met another processor's consumer lock. An expired sleep is fired at
+/// the first service point at or after the moment the wheel counts it
+/// due, under the same bound. The bound is measured in runs: the run in
+/// progress is not preempted, so a kernel task that never yields is
+/// outside this policy, and a guest is preempted by its slice.
+const SERVICE_INTERVAL_RUNS: u32 = 61;
 const TASK_ARENA_ALIGN: usize = 64;
 /// Power-of-two block classes from the alignment granule (64 B) up to
 /// the largest future the arena places (256 KiB).
@@ -719,6 +742,32 @@ pub struct Executor {
     progress: ProgressCounter,
     progress_notify: NoWeakArc<Notify>,
     local_run: RunList,
+    service: ServiceClock,
+}
+
+/// When this processor next serves its timer and the global queue ahead
+/// of local work ([`SERVICE_INTERVAL_RUNS`]). Owner only: `Executor` is
+/// already `!Sync` (`local_run`). It persists across passes, so the bound
+/// does not reset when a pass returns early.
+struct ServiceClock {
+    /// Runs since the last service point.
+    runs: Cell<u32>,
+    /// Timer ticks at the last service point.
+    served_at: Cell<u64>,
+    /// That service point's global pop met [`GlobalPop::Contended`], so
+    /// each following run tries global first again until it gets an
+    /// answer.
+    global_owed: Cell<bool>,
+}
+
+impl ServiceClock {
+    const fn new() -> Self {
+        Self {
+            runs: Cell::new(0),
+            served_at: Cell::new(0),
+            global_owed: Cell::new(false),
+        }
+    }
 }
 
 /// The processor a [`Timer`] belongs to, and the idle state that
@@ -752,6 +801,7 @@ pub struct ExecutorRunStats {
     global_runnable_count: usize,
     local_empty_pop_count: usize,
     global_empty_pop_count: usize,
+    timer_fired_count: usize,
 }
 
 struct ProgressSignal {
@@ -806,6 +856,12 @@ impl ExecutorRunStats {
     pub const fn global_empty_pop_count(self) -> usize {
         self.global_empty_pop_count
     }
+
+    /// Sleeps the pass's timer fired: at its start and at each service
+    /// point.
+    pub const fn timer_fired_count(self) -> usize {
+        self.timer_fired_count
+    }
 }
 
 impl Executor {
@@ -832,6 +888,7 @@ impl Executor {
             progress,
             progress_notify: NoWeakArc::new(Notify::new()),
             local_run: RunList::new(),
+            service: ServiceClock::new(),
         }
     }
 
@@ -865,28 +922,52 @@ impl Executor {
 
     /// Runs ready tasks until the queues are empty or a batch has run.
     ///
-    /// `timer` is this processor's. Before the first task of a pass runs,
-    /// its deadline is pulled to within one scheduler tick
-    /// ([`Timer::arm_scheduler_tick`]): the task may be a guest, which is
-    /// preempted only from a timer interrupt, and a processor that has
-    /// just left a park may have its deadline an idle interval out.
+    /// `timer` is this processor's. The pass begins by firing its expired
+    /// sleeps, so the tasks they wake are eligible at once. Before the
+    /// first task of a pass runs, its deadline is pulled to within one
+    /// scheduler tick ([`Timer::arm_scheduler_tick`]): the task may be a
+    /// guest, which is preempted only from a timer interrupt, and a
+    /// processor that has just left a park may have its deadline an idle
+    /// interval out.
+    ///
+    /// Between service points ([`SERVICE_INTERVAL_RUNS`]) a run takes
+    /// local work first when this processor has any, and global work
+    /// first otherwise. At a service point the timer fires again and the
+    /// global queue is popped ahead of local work.
     pub fn run_until_stalled_with_stats<CpuImpl: Cpu + Clone>(
         &self,
         timer: &Timer<CpuImpl>,
     ) -> ExecutorRunStats {
         let mut stats = ExecutorRunStats::default();
         let local_ready = &self.group.local_ready[self.local_queue_index];
+        let service = &self.service;
+        stats.timer_fired_count += timer.fire_expired();
+        let slice_ticks = timer.cpu().timebase().duration_to_ticks(GUEST_TIME_SLICE);
 
         while stats.runnable_count() < READY_BATCH_TASKS {
-            let (first, second) = if local_ready.ready.load(Ordering::Relaxed) != 0 {
-                (ReadySource::Local, ReadySource::Global)
+            let now = timer.now().ticks();
+            if service.runs.get() >= SERVICE_INTERVAL_RUNS
+                || now.saturating_sub(service.served_at.get()) >= slice_ticks
+            {
+                stats.timer_fired_count += timer.fire_expired();
+                service.runs.set(0);
+                service.served_at.set(now);
+                service.global_owed.set(true);
+            }
+
+            let popped = if service.global_owed.get() {
+                self.pop_owed_global(&mut stats)
+                    .or_else(|| self.pop_ready_source(ReadySource::Local, &mut stats))
             } else {
-                (ReadySource::Global, ReadySource::Local)
+                let (first, second) = if local_ready.ready.load(Ordering::Relaxed) != 0 {
+                    (ReadySource::Local, ReadySource::Global)
+                } else {
+                    (ReadySource::Global, ReadySource::Local)
+                };
+                self.pop_ready_source(first, &mut stats)
+                    .or_else(|| self.pop_ready_source(second, &mut stats))
             };
-            let Some((runnable, source)) = self
-                .pop_ready_source(first, &mut stats)
-                .or_else(|| self.pop_ready_source(second, &mut stats))
-            else {
+            let Some((runnable, source)) = popped else {
                 return stats;
             };
 
@@ -894,6 +975,7 @@ impl Executor {
                 timer.arm_scheduler_tick();
             }
             runnable.run();
+            service.runs.set(service.runs.get() + 1);
             match source {
                 ReadySource::Local => stats.local_runnable_count += 1,
                 ReadySource::Global => stats.global_runnable_count += 1,
@@ -901,6 +983,30 @@ impl Executor {
         }
 
         stats
+    }
+
+    /// The global pop a service point owes: one try ahead of local work.
+    /// `Ready` and `Empty` settle it; `Contended` (another processor holds
+    /// the consumer lock) leaves it owed, so the next run tries again.
+    fn pop_owed_global(
+        &self,
+        stats: &mut ExecutorRunStats,
+    ) -> Option<(ReadyRunnable, ReadySource)> {
+        match self.group.global_ready.pop() {
+            GlobalPop::Ready(runnable) => {
+                self.service.global_owed.set(false);
+                Some((runnable, ReadySource::Global))
+            }
+            GlobalPop::Empty => {
+                self.service.global_owed.set(false);
+                stats.global_empty_pop_count += 1;
+                None
+            }
+            GlobalPop::Contended => {
+                stats.global_empty_pop_count += 1;
+                None
+            }
+        }
     }
 
     /// Parks this processor until work arrives, polling its ready
@@ -2472,5 +2578,204 @@ mod tests {
         );
         assert_eq!(run_to_stall(&executor, &timer), (LEFT_OVER, 0));
         assert_eq!(ran.load(Ordering::Relaxed), READY_BATCH_TASKS + LEFT_OVER);
+    }
+
+    use super::{GUEST_TIME_SLICE, SERVICE_INTERVAL_RUNS};
+    use crate::exec::yield_now;
+    use crate::test_support::ManualClockCpu;
+
+    /// A local task that requeues itself every run and counts them, until
+    /// `stop` is set. `each_run` runs once per run, after the count.
+    fn self_rewaking_task(
+        spins: Arc<AtomicUsize>,
+        stop: Arc<AtomicBool>,
+        each_run: impl Fn(usize) + 'static,
+    ) -> impl core::future::Future<Output = ()> + 'static {
+        async move {
+            loop {
+                let run = spins.fetch_add(1, Ordering::Relaxed) + 1;
+                each_run(run);
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                yield_now().await;
+            }
+        }
+    }
+
+    /// #704, count bound: a local task that requeues itself locally on
+    /// every run keeps the local queue non-empty for good, and the global
+    /// task queued behind it still runs within one service interval.
+    /// `TestCpu`'s clock never moves, so only the count rule can fire.
+    #[test]
+    fn a_global_task_runs_within_the_service_interval_behind_a_self_rewaking_local_task() {
+        let _serialized = super::executor_test_guard();
+        crate::test_processor_identity::set(ProcessorId::new(0));
+        let executor = Executor::new(ProgressCounter::new(), 1, ProcessorId::new(0));
+        let timer = executor.timer(TestCpu::new());
+        let spawner = executor.spawner(TestCpu::new());
+        let spins = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        spawner.spawn_local_detached(self_rewaking_task(spins.clone(), stop.clone(), |_| {}));
+
+        // One full pass of spinner runs leaves the interval mid-count.
+        let first = executor.run_until_stalled_with_stats(&timer);
+        assert_eq!(first.local_runnable_count(), READY_BATCH_TASKS);
+        let spins_at_push = spins.load(Ordering::Relaxed);
+
+        let seen_at = Arc::new(AtomicUsize::new(usize::MAX));
+        spawner.spawn_detached({
+            let spins = spins.clone();
+            let stop = stop.clone();
+            let seen_at = seen_at.clone();
+            async move {
+                seen_at.store(spins.load(Ordering::Relaxed), Ordering::Relaxed);
+                stop.store(true, Ordering::Relaxed);
+            }
+        });
+        let second = executor.run_until_stalled_with_stats(&timer);
+
+        assert_eq!(second.global_runnable_count(), 1);
+        let seen_at = seen_at.load(Ordering::Relaxed);
+        assert_ne!(seen_at, usize::MAX, "the global task never ran");
+        assert!(
+            seen_at - spins_at_push <= SERVICE_INTERVAL_RUNS as usize,
+            "the global task waited {} spinner runs",
+            seen_at - spins_at_push
+        );
+    }
+
+    /// #704, time bound: when each run takes a whole guest slice, every
+    /// run boundary is a service point, so the global task runs at the
+    /// first one rather than up to a count interval later.
+    #[test]
+    fn a_global_task_runs_within_one_guest_slice_of_runs_that_each_take_a_slice() {
+        let _serialized = super::executor_test_guard();
+        crate::test_processor_identity::set(ProcessorId::new(0));
+        let cpu = ManualClockCpu::new();
+        let executor = Executor::new(ProgressCounter::new(), 1, ProcessorId::new(0));
+        let timer = executor.timer(cpu.clone());
+        let spawner = executor.spawner(cpu.clone());
+        let slice_nanos = u64::try_from(GUEST_TIME_SLICE.as_nanos())
+            .expect("a guest time slice fits in nanoseconds");
+        let spins = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        spawner.spawn_local_detached(self_rewaking_task(spins.clone(), stop.clone(), {
+            let cpu = cpu.clone();
+            move |_| cpu.advance(slice_nanos)
+        }));
+
+        let first = executor.run_until_stalled_with_stats(&timer);
+        assert_eq!(first.local_runnable_count(), READY_BATCH_TASKS);
+        let spins_at_push = spins.load(Ordering::Relaxed);
+
+        let seen_at = Arc::new(AtomicUsize::new(usize::MAX));
+        spawner.spawn_detached({
+            let spins = spins.clone();
+            let stop = stop.clone();
+            let seen_at = seen_at.clone();
+            async move {
+                seen_at.store(spins.load(Ordering::Relaxed), Ordering::Relaxed);
+                stop.store(true, Ordering::Relaxed);
+            }
+        });
+        let second = executor.run_until_stalled_with_stats(&timer);
+
+        assert_eq!(second.global_runnable_count(), 1);
+        let seen_at = seen_at.load(Ordering::Relaxed);
+        assert_ne!(seen_at, usize::MAX, "the global task never ran");
+        assert!(
+            seen_at - spins_at_push <= 2,
+            "the global task waited {} spinner runs",
+            seen_at - spins_at_push
+        );
+    }
+
+    /// Runs a self-rewaking spinner that moves the clock `step_nanos` per
+    /// run beside a task sleeping 100 us, and returns how many spinner
+    /// runs passed between the first run that took the clock to the
+    /// moment the wheel counts the sleep due and the run before the
+    /// sleeper woke.
+    fn expired_sleep_wake_distance(step_nanos: u64) -> usize {
+        /// The timer wheel's quantum (`TIMER_WHEEL_QUANTUM`, 50 us): a
+        /// sleep is due at its deadline rounded up to it.
+        const WHEEL_QUANTUM_NANOS: u64 = 50_000;
+        const SLEEP_NANOS: u64 = 100_000;
+
+        crate::test_processor_identity::set(ProcessorId::new(0));
+        let cpu = ManualClockCpu::new();
+        let executor = Executor::new(ProgressCounter::new(), 1, ProcessorId::new(0));
+        let timer = executor.timer(cpu.clone());
+        let spawner = executor.spawner(cpu.clone());
+        let spins = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let due_nanos = Arc::new(AtomicU64::new(u64::MAX));
+        let due_at = Arc::new(AtomicUsize::new(usize::MAX));
+        let woke_at = Arc::new(AtomicUsize::new(usize::MAX));
+
+        spawner.spawn_local_detached({
+            let cpu = cpu.clone();
+            let timer = timer.clone();
+            let spins = spins.clone();
+            let stop = stop.clone();
+            let due_nanos = due_nanos.clone();
+            let woke_at = woke_at.clone();
+            async move {
+                let deadline = cpu.now().ticks() + SLEEP_NANOS;
+                due_nanos.store(
+                    deadline.div_ceil(WHEEL_QUANTUM_NANOS) * WHEEL_QUANTUM_NANOS,
+                    Ordering::Relaxed,
+                );
+                timer.sleep_until(Instant::new(deadline)).await;
+                woke_at.store(spins.load(Ordering::Relaxed), Ordering::Relaxed);
+                stop.store(true, Ordering::Relaxed);
+            }
+        });
+        spawner.spawn_local_detached(self_rewaking_task(spins.clone(), stop.clone(), {
+            let cpu = cpu.clone();
+            let due_nanos = due_nanos.clone();
+            let due_at = due_at.clone();
+            move |run| {
+                cpu.advance(step_nanos);
+                if cpu.now().ticks() >= due_nanos.load(Ordering::Relaxed)
+                    && due_at.load(Ordering::Relaxed) == usize::MAX
+                {
+                    due_at.store(run, Ordering::Relaxed);
+                }
+            }
+        }));
+
+        while executor
+            .run_until_stalled_with_stats(&timer)
+            .runnable_count()
+            != 0
+        {}
+
+        let woke_at = woke_at.load(Ordering::Relaxed);
+        let due_at = due_at.load(Ordering::Relaxed);
+        assert_ne!(woke_at, usize::MAX, "the sleeper never woke");
+        assert_ne!(due_at, usize::MAX, "the clock never passed the deadline");
+        woke_at.saturating_sub(due_at)
+    }
+
+    /// #704, timer bound: an expired sleep behind a self-rewaking local
+    /// task is fired at the first service point, whether that comes from
+    /// the run count (1 us per run, so 61 runs stay inside one slice) or
+    /// from the slice (1 ms per run).
+    #[test]
+    fn an_expired_sleep_fires_within_the_service_interval_behind_a_self_rewaking_local_task() {
+        let _serialized = super::executor_test_guard();
+
+        let by_count = expired_sleep_wake_distance(1_000);
+        assert!(
+            by_count <= SERVICE_INTERVAL_RUNS as usize + 1,
+            "the sleep fired {by_count} spinner runs after it was due"
+        );
+
+        let by_slice = expired_sleep_wake_distance(1_000_000);
+        assert!(
+            by_slice <= 3,
+            "the sleep fired {by_slice} spinner runs after it was due"
+        );
     }
 }
