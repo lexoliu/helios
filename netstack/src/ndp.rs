@@ -130,7 +130,7 @@ pub struct Ipv6RouterConfiguration {
     /// Lifetime of the router as a default router. Zero withdraws it.
     pub router_lifetime_seconds: u16,
     /// On-link prefixes to install as connected routes.
-    pub on_link_prefixes: ArrayVec<Ipv6Cidr, MAX_ADVERTISED_PREFIXES>,
+    pub on_link_prefixes: ArrayVec<OnLinkPrefix, MAX_ADVERTISED_PREFIXES>,
     /// Addresses SLAAC derives from autonomous prefixes.
     pub addresses: ArrayVec<Ipv6Cidr, MAX_ADVERTISED_PREFIXES>,
     /// Link MTU option, when present.
@@ -139,6 +139,16 @@ pub struct Ipv6RouterConfiguration {
     pub hop_limit: Option<u8>,
     /// Recursive DNS servers from the RDNSS option.
     pub dns_servers: Ipv6DnsServers,
+}
+
+/// An on-link prefix a Router Advertisement announced, with the valid
+/// lifetime the route it becomes must not outlive (RFC 4861 §6.3.4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OnLinkPrefix {
+    pub prefix: Ipv6Cidr,
+    /// Valid Lifetime in seconds; `0xffff_ffff` is infinity
+    /// (RFC 4861 §4.6.2).
+    pub valid_lifetime_seconds: u32,
 }
 
 /// Prefixes retained from one advertisement. QEMU's user-mode network
@@ -204,9 +214,10 @@ pub fn interpret_router_advertisement(
                     continue;
                 }
                 if prefix.on_link {
-                    let _ = configuration
-                        .on_link_prefixes
-                        .try_push(Ipv6Cidr::new(prefix.prefix, prefix.prefix_len));
+                    let _ = configuration.on_link_prefixes.try_push(OnLinkPrefix {
+                        prefix: Ipv6Cidr::new(prefix.prefix, prefix.prefix_len),
+                        valid_lifetime_seconds: prefix.valid_lifetime_seconds,
+                    });
                 }
                 if prefix.autonomous && prefix.prefix_len == SLAAC_PREFIX_LEN {
                     let address = Ipv6Address::from_prefix_and_eui64(prefix.prefix, mac);
@@ -309,10 +320,13 @@ mod tests {
         );
         assert_eq!(
             configuration.on_link_prefixes.as_slice(),
-            &[Ipv6Cidr::new(
-                Ipv6Address::new([0xfe, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
-                64,
-            )]
+            &[OnLinkPrefix {
+                prefix: Ipv6Cidr::new(
+                    Ipv6Address::new([0xfe, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+                    64,
+                ),
+                valid_lifetime_seconds: 86_400,
+            }]
         );
         assert_eq!(
             configuration.dns_servers.as_slice(),
