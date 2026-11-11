@@ -30,6 +30,10 @@
 //! - The counter and the two words of the identifier last seen share one
 //!   cache-padded block. It is written only by the processor holding the
 //!   advance lock, rarely, and read by every draw.
+//! - [`spawn_generation_probe`] runs one detached task that sleeps
+//!   [`GENERATION_PROBE_INTERVAL`] on the kernel timer between calls to
+//!   [`MachineGeneration::observe`]. It takes no lock of its own, never
+//!   busy-waits, and exists only on a machine that has a window.
 //! - Two [`Notify`]s are fired on every advance, each with a single
 //!   consumer: one for the reactions that follow a restore (wall clock,
 //!   host share, network), one for the entropy reseed task. Both are
@@ -37,13 +41,53 @@
 //!   reads [`MachineGeneration::current`] after waking.
 
 use core::sync::atomic::{AtomicU64, Ordering};
+use core::time::Duration;
 
 use crossbeam_utils::CachePadded;
+use helios_hal::cpu::Cpu;
 use helios_hal::generation::{GenerationIdWindow, VmGenerationId};
+use helios_hal::watchdog::Watchdog;
 use triomphe::Arc;
 
-use crate::Notify;
 use crate::memory::IrqSafeMutex;
+use crate::{Kernel, Notify};
+
+/// How long a restore can go unnoticed by the reactions that do not draw
+/// entropy (wall clock, host share, network). Entropy needs no probe: it
+/// observes the generation on every draw.
+pub const GENERATION_PROBE_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Starts the periodic probe, on a machine whose platform published a
+/// window. A machine with none has nothing the probe could ever see, so it
+/// gets no task.
+///
+/// # Concurrency contract
+///
+/// The probe is one detached task on the kernel executor. Between
+/// observations it sleeps on the kernel timer, so it never busy-waits and
+/// holds no lock across the sleep. Each step is
+/// [`MachineGeneration::observe`], which is lock-free while the identifier
+/// is unchanged and otherwise takes the advance lock, so the task can run
+/// on any processor alongside the entropy draws that observe as well.
+pub fn spawn_generation_probe<CpuImpl, WatchdogImpl>(
+    kernel: &Kernel<CpuImpl, WatchdogImpl>,
+    generation: &MachineGenerationHandle,
+) where
+    CpuImpl: Cpu + Clone,
+    WatchdogImpl: Watchdog + Clone,
+{
+    if !generation.has_window() {
+        return;
+    }
+    let generation = generation.clone();
+    let timer = kernel.timer();
+    kernel.spawn_detached(async move {
+        loop {
+            timer.sleep_for(GENERATION_PROBE_INTERVAL).await;
+            generation.observe();
+        }
+    });
+}
 
 /// The machine generation, shared by everything that has to notice a
 /// restore. There is one per boot and the backend creates it.
@@ -127,6 +171,12 @@ impl MachineGeneration {
             reactions: Notify::new(),
             entropy_wake: Notify::new(),
         })
+    }
+
+    /// Whether the platform published a window, so that observing can
+    /// ever see anything.
+    pub fn has_window(&self) -> bool {
+        self.window.is_some()
     }
 
     /// The generation as of the last observation, without looking at the
@@ -276,6 +326,13 @@ mod tests {
         for _ in 0..4 {
             assert_eq!(generation.observe(), Generation::BOOT);
         }
+    }
+
+    #[test]
+    fn only_a_machine_with_a_window_has_something_to_probe() {
+        assert!(!MachineGeneration::new(None).has_window());
+        let (_window, handle) = TestWindow::new(id(1));
+        assert!(MachineGeneration::new(Some(handle)).has_window());
     }
 
     #[test]
